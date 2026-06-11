@@ -2,7 +2,8 @@ mod libpcap;
 
 use bytes::Bytes;
 use probe_core::{
-    CapabilityKind, CapabilityState, CaptureSource, Direction, FlowContext, Gap, Timestamp,
+    CapabilityKind, CapabilityState, CaptureSource, Direction, FlowContext, Gap, ProcessContext,
+    TcpConnection, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -87,6 +88,21 @@ pub trait CaptureProvider {
     fn capabilities(&self) -> Vec<CapabilityState>;
 
     fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProcess {
+    pub process: ProcessContext,
+    pub confidence: u8,
+}
+
+pub trait ProcessResolver {
+    fn resolve_tcp_process(
+        &mut self,
+        connection: TcpConnection,
+    ) -> Result<Option<ResolvedProcess>, CaptureError>;
+
+    fn invalidate_cached_resolution(&mut self) {}
 }
 
 pub struct ReplayProvider {

@@ -4,7 +4,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use capture::{CaptureError, CaptureProvider, LibpcapConfig, LibpcapProvider, ReplayProvider};
+use attribution::ProcfsSocketResolver;
+use capture::{
+    CaptureError, CaptureProvider, LibpcapConfig, LibpcapProvider, ProcessResolver, ReplayProvider,
+    ResolvedProcess,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use exporter::{CompressionCodec, ReliableExporter, WebhookExporter};
 use parsers::Http1ParserFactory;
@@ -12,8 +16,8 @@ use pipeline::CapturePipeline;
 use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
 use probe_config::{AgentConfig, CaptureBackend};
 use probe_core::{
-    AddressPort, Direction, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, Timestamp,
-    TransportProtocol,
+    AddressPort, Direction, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity,
+    TcpConnection, Timestamp, TransportProtocol,
 };
 use proto::{BatchEnvelope, EVENT_ENVELOPE_JSON_SCHEMA};
 use runtime::{
@@ -243,8 +247,9 @@ fn libpcap_provider_descriptor(config: &LibpcapConfig) -> CaptureProviderDescrip
 fn build_live_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProvider>, AgentError> {
     plan.require_live_capture()?;
     match plan.capture.selected_backend {
-        Some(CaptureBackend::Libpcap) => Ok(Box::new(LibpcapProvider::open(
+        Some(CaptureBackend::Libpcap) => Ok(Box::new(LibpcapProvider::open_with_process_resolver(
             libpcap_config_from_agent(&plan.config),
+            Some(Box::<ProcfsTcpProcessResolver>::default()),
         )?)),
         Some(backend) => Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
             reason: format!("{backend:?} capture provider is selected but has no agent builder"),
@@ -268,6 +273,39 @@ fn libpcap_config_from_agent(config: &AgentConfig) -> LibpcapConfig {
         immediate_mode: config.capture.libpcap.immediate_mode,
         read_timeout_ms: config.capture.libpcap.read_timeout_ms,
         buffer_size: config.capture.libpcap.buffer_size,
+    }
+}
+
+struct ProcfsTcpProcessResolver {
+    resolver: ProcfsSocketResolver,
+}
+
+impl Default for ProcfsTcpProcessResolver {
+    fn default() -> Self {
+        Self {
+            resolver: ProcfsSocketResolver::new(),
+        }
+    }
+}
+
+impl ProcessResolver for ProcfsTcpProcessResolver {
+    fn resolve_tcp_process(
+        &mut self,
+        connection: TcpConnection,
+    ) -> Result<Option<ResolvedProcess>, CaptureError> {
+        self.resolver
+            .resolve_tcp_connection(connection)
+            .map(|resolved| {
+                resolved.map(|resolved| ResolvedProcess {
+                    process: resolved.process,
+                    confidence: resolved.confidence,
+                })
+            })
+            .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
+    }
+
+    fn invalidate_cached_resolution(&mut self) {
+        self.resolver.invalidate_snapshot();
     }
 }
 

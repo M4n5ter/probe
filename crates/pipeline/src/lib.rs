@@ -325,6 +325,44 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn live_pipeline_parses_process_inbound_request_as_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = storage::FjallSpool::open(temp.path())?;
+        let mut parser_factory = Http1ParserFactory::default();
+        let flow = demo_flow_with_ports(80, 50_000, 3);
+        let mut provider = SequenceProvider::new(vec![captured_bytes_with_direction(
+            flow,
+            Direction::Inbound,
+            b"GET /server HTTP/1.1\r\nHost: server.test\r\n\r\n",
+        )]);
+        let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+
+        let summary = pipeline.run_provider(&mut provider)?;
+
+        assert_eq!(summary.ingress_chunks, 1);
+        let exported = spool.read_export_batch("sink", 16)?;
+        let envelopes = exported
+            .iter()
+            .map(|event| serde_json::from_slice::<EventEnvelope>(event.payload.bytes()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(envelopes.iter().any(|envelope| {
+            matches!(
+                &envelope.kind,
+                EventKind::HttpRequestHeaders(headers)
+                    if headers.direction == Direction::Inbound
+                        && headers.target.as_deref() == Some("/server")
+            )
+        }));
+        assert!(
+            !envelopes
+                .iter()
+                .any(|envelope| matches!(envelope.kind, EventKind::ProtocolError(_)))
+        );
+        Ok(())
+    }
+
     struct SequenceProvider {
         events: std::vec::IntoIter<CaptureEvent>,
     }
@@ -360,6 +398,14 @@ mod tests {
     }
 
     fn captured_bytes(flow: FlowContext, bytes: &'static [u8]) -> CaptureEvent {
+        captured_bytes_with_direction(flow, Direction::Outbound, bytes)
+    }
+
+    fn captured_bytes_with_direction(
+        flow: FlowContext,
+        direction: Direction,
+        bytes: &'static [u8],
+    ) -> CaptureEvent {
         CaptureEvent::Bytes(CapturedBytes {
             timestamp: Timestamp {
                 monotonic_ns: 1,
@@ -368,7 +414,7 @@ mod tests {
             flow,
             source: CaptureSource::Replay,
             provider: CaptureProviderKind::Replay,
-            direction: Direction::Outbound,
+            direction,
             stream_offset: 0,
             bytes: bytes.into(),
             attribution_confidence: 0,

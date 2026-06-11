@@ -2,6 +2,7 @@ mod capability;
 mod event;
 mod identity;
 mod selector;
+mod socket;
 mod verdict;
 
 pub use capability::{
@@ -18,4 +19,5 @@ pub use selector::{
     CompiledSelector, ProcessSelector, Selector, SelectorError, SelectorRegistry, SelectorTerm,
     TrafficSelector,
 };
+pub use socket::{TcpConnection, TcpEndpoint};
 pub use verdict::{Action, Verdict, VerdictScope};

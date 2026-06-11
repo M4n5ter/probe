@@ -73,12 +73,14 @@ V1 明确不做：
 当前实现状态：
 
 - 已实现 replay CLI，用单向输入文件驱动 capture provider、ingress journal、parser、policy、export queue 和可选 webhook exporter。
-- 已实现 `capture` crate 的 `CaptureProvider` 抽象、`ReplayProvider` 和基础 `LibpcapProvider`；libpcap provider 可打开设备、安装 BPF filter、解析 Ethernet/Linux cooked/raw IPv4 TCP payload 并输出 degraded `CapturedBytes`。它当前不做 TCP 重组、IPv6、procfs socket 归因或 gap 修复。
-- 已实现 `attribution` crate 的 `ProcfsAttributor`，可从 `/proc/<pid>` 读取进程身份、cmdline hash、starttime、uid/gid、cgroup、systemd service 与 container hint；replay flow 默认使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence，避免把文件输入误归因到 agent 进程。
+- 已实现 `probe-core` 的 `TcpEndpoint`/`TcpConnection` 共享模型，供 capture provider、procfs attribution 和后续 eBPF/socket attribution 复用，避免各层用字符串 endpoint 重复建模。
+- 已实现 `capture` crate 的 `CaptureProvider` 抽象、`ReplayProvider` 和基础 `LibpcapProvider`；libpcap provider 可打开设备、安装 BPF filter、解析 Ethernet/Linux cooked/raw IPv4 TCP segment，接收可插拔 process resolver，并输出 degraded `CapturedBytes`。flow table 会用 SYN reuse、RST、双向 FIN、idle timeout 和容量淘汰清理 4-tuple 缓存；单向 FIN 只标记半关闭，避免把仍在发送的另一方向拆成新 flow；清理 flow 时会发出 `ConnectionClosed`，让 pipeline 释放 parser state。若同一 segment 同时携带 payload 和关闭信号，payload 事件先进入 parser，随后才发 close。它当前不做 TCP 重组、IPv6 或 gap 修复。
+- 已实现 `attribution` crate 的 `ProcfsAttributor` 和 `ProcfsSocketResolver`；前者可从 `/proc/<pid>` 读取进程身份、cmdline hash、starttime、uid/gid、cgroup、systemd service 与 container hint，后者可通过 `/proc/net/tcp` socket inode 和 `/proc/<pid>/fd` best-effort 反查 TCP 连接所属进程。agent 注入的 procfs resolver 使用短 TTL socket snapshot，避免同一批新连接重复全量扫描 `/proc/<pid>/fd`；libpcap provider 在 TCP 生命周期信号后会使 snapshot 失效，降低端口复用拿到旧进程身份的风险。resolver 错误会进入 capture degradation reason，不再静默伪装成未匹配。replay flow 默认使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence，避免把文件输入误归因到 agent 进程。
 - 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、provider-specific nested config、storage、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，基础字段校验不理解 runtime capability。
 - 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
 - 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> export queue 的 replay/shared processing；`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/pipeline 组合和 exporter 命令。
-- 已实现 capability matrix；`procfs_attribution` 按本机 `/proc` 探测结果标记 degraded/unavailable，eBPF/TLS/enforcement 相关能力仍必须标记 unavailable；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 作为 live provider；`run` 在无 live capture provider 时 fail closed，存在 libpcap live provider 时会把 provider 接入 replay 共用的 pipeline；`check` 用于查看 resolved plan。
+- 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。
+- 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF/TLS/enforcement 相关能力仍必须标记 unavailable；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 作为 live provider；`run` 在无 live capture provider 时 fail closed，存在 libpcap live provider 时会把 provider 接入 replay 共用的 pipeline；`check` 用于查看 resolved plan。
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
 - 当前 `FjallSpool` 存储的是带 schema 的 `SpoolPayload`；ingress lane 当前写入 JSON framed `CapturedBytes`，export lane 当前写入 JSON framed `EventEnvelope`。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
 
@@ -249,9 +251,9 @@ fallback 能力边界：
 
 - `capture::LibpcapProvider` 使用 `pcap` crate 2.4 和系统 libpcap。
 - 支持配置 interface、BPF filter、snaplen、promisc、immediate mode、read timeout 和 buffer size。
-- 已支持 Ethernet、Linux cooked v1/v2、raw IPv4 和 loopback IPv4 的基础 IPv4/TCP payload 提取；IPv4 分片和 snaplen 截断包会被跳过，避免把不完整字节伪装成正常 HTTP payload。
-- 当前没有 TCP 重组、乱序处理、重传去重、IPv6 解析和 procfs socket 归因，因此事件必须标记 degraded，进程身份使用 synthetic unknown identity、confidence 为 0，`stream_offset` 不声明为可信重组 offset。
-- `agent` composition root 只在 libpcap provider 能按当前配置打开并安装 filter 时注入 available `Libpcap` descriptor；否则注入 unavailable descriptor 并输出原因，`runtime` 只消费 descriptor 做 plan。
+- 已支持 Ethernet、Linux cooked v1/v2、raw IPv4 和 loopback IPv4 的基础 IPv4/TCP segment 解析；IPv4 分片和 snaplen 截断包会被跳过，避免把不完整字节伪装成正常 HTTP payload。
+- 当前没有 TCP 重组、乱序处理、重传去重和 IPv6 解析，因此事件必须标记 degraded，`stream_offset` 不声明为可信重组 offset。libpcap flow table 只承担方向/归因缓存，不把 packet-level payload 伪装成可靠 stream；SYN 会关闭旧 4-tuple 缓存以处理 missed close 后的端口复用，FIN 按半关闭处理，RST、双向 FIN、SYN reuse、idle timeout 或容量淘汰会释放 flow cache 并排出 `ConnectionClosed`。
+- `agent` composition root 只在 libpcap provider 能按当前配置打开并安装 filter 时注入 available `Libpcap` descriptor；否则注入 unavailable descriptor 并输出原因，`runtime` 只消费 descriptor 做 plan。live `LibpcapProvider` 由 `agent` 注入 procfs TCP process resolver；resolver 通过共享 `TcpConnection`、`/proc/net/tcp` 和 fd socket inode best-effort 归因，短 TTL 复用 socket snapshot，成功时提高 attribution confidence，失败时回退到 synthetic unknown identity。`procfs_socket_attribution` 仍是 degraded capability：hidepid、权限、PID/fd race 和 net namespace 边界会导致 lookup 失败；lookup 错误进入 capture degradation reason，未匹配则以 0 confidence 表达。
 
 ## 11. TLS 与明文来源
 

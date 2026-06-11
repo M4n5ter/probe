@@ -1,4 +1,4 @@
-use attribution::{ProcessAttributor, ProcfsAttributor};
+use attribution::{ProcessAttributor, ProcfsAttributor, ProcfsSocketResolver};
 use probe_config::{
     AgentConfig, CaptureBackend, CaptureSelection, ConfigError, ConfigValidationError,
     ConfigViolation, EnforcementMode, ExporterTransport, LiveCaptureBackend, TlsPlaintextProvider,
@@ -238,9 +238,13 @@ pub struct ProviderRegistry {
 impl ProviderRegistry {
     pub fn with_default_platform(capture_providers: Vec<CaptureProviderDescriptor>) -> Self {
         let procfs = ProcfsAttributor::new();
+        let procfs_socket = ProcfsSocketResolver::new();
         Self::new(
             capture_providers,
-            default_platform_capabilities(procfs).into_iter().collect(),
+            default_platform_capabilities(procfs)
+                .into_iter()
+                .chain(procfs_socket.capabilities())
+                .collect(),
         )
     }
 

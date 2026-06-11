@@ -43,19 +43,21 @@ impl ProtocolParser for Http1Parser {
                     Direction::Inbound => self.inbound.ingest_data(
                         direction,
                         bytes,
-                        Some(&mut self.pending_response_contexts),
+                        &mut self.pending_response_contexts,
                     ),
-                    Direction::Outbound => self.outbound.ingest_data(direction, bytes, None),
+                    Direction::Outbound => self.outbound.ingest_data(
+                        direction,
+                        bytes,
+                        &mut self.pending_response_contexts,
+                    ),
                 };
-                if direction == Direction::Outbound {
-                    self.pending_response_contexts
-                        .extend(events.iter().filter_map(|event| match event {
-                            EventKind::HttpRequestHeaders(headers) => {
-                                Some(ResponseContext::from_request(headers))
-                            }
-                            _ => None,
-                        }));
-                }
+                self.pending_response_contexts
+                    .extend(events.iter().filter_map(|event| match event {
+                        EventKind::HttpRequestHeaders(headers) => {
+                            Some(ResponseContext::from_request(headers))
+                        }
+                        _ => None,
+                    }));
                 if events.iter().any(is_handoff_opaque_event) {
                     self.opaque_handoff = true;
                     self.pending_response_contexts.clear();
@@ -107,7 +109,7 @@ impl DirectionState {
         &mut self,
         direction: Direction,
         bytes: &[u8],
-        mut response_contexts: Option<&mut VecDeque<ResponseContext>>,
+        response_contexts: &mut VecDeque<ResponseContext>,
     ) -> Vec<EventKind> {
         self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
@@ -116,7 +118,7 @@ impl DirectionState {
             let before = Progress::new(self.buffer.len(), &self.state);
             match self.state {
                 HttpState::ReadingHeaders => {
-                    self.read_headers(direction, response_contexts.as_deref_mut(), &mut events)
+                    self.read_headers(direction, response_contexts, &mut events)
                 }
                 HttpState::ReadingFixedBody { remaining } => {
                     self.read_fixed_body(direction, remaining, &mut events)
@@ -150,30 +152,36 @@ impl DirectionState {
     fn read_headers(
         &mut self,
         direction: Direction,
-        response_contexts: Option<&mut VecDeque<ResponseContext>>,
+        response_contexts: &mut VecDeque<ResponseContext>,
         events: &mut Vec<EventKind>,
     ) {
         match parse_headers(direction, &self.buffer) {
-            HeaderParse::Complete { consumed, headers } => {
+            HeaderParse::Complete {
+                consumed,
+                role,
+                headers,
+            } => {
                 self.stream_sequence = self.stream_sequence.saturating_add(1);
                 self.body_offset = 0;
                 self.buffer.advance(consumed);
 
-                let response_context = response_contexts.and_then(|contexts| {
-                    if is_interim_non_switching(headers.status) {
-                        contexts.front().copied()
-                    } else {
-                        contexts.pop_front()
-                    }
-                });
-                let body_plan = BodyPlan::from_headers(direction, &headers, response_context);
+                let response_context = (role == HeaderRole::Response)
+                    .then(|| {
+                        if is_interim_non_switching(headers.status) {
+                            response_contexts.front().copied()
+                        } else {
+                            response_contexts.pop_front()
+                        }
+                    })
+                    .flatten();
+                let body_plan = BodyPlan::from_headers(role, &headers, response_context);
                 self.sse = SseDecoder::new(body_plan.is_sse);
 
                 let mut headers = headers;
                 headers.stream_sequence = self.stream_sequence;
-                events.push(match direction {
-                    Direction::Inbound => EventKind::HttpResponseHeaders(headers),
-                    Direction::Outbound => EventKind::HttpRequestHeaders(headers),
+                events.push(match role {
+                    HeaderRole::Request => EventKind::HttpRequestHeaders(headers),
+                    HeaderRole::Response => EventKind::HttpResponseHeaders(headers),
                 });
 
                 if let Some(reason) = body_plan.opaque_reason {
@@ -412,14 +420,14 @@ struct BodyPlan {
 
 impl BodyPlan {
     fn from_headers(
-        direction: Direction,
+        role: HeaderRole,
         headers: &HttpHeaders,
         response_context: Option<ResponseContext>,
     ) -> Self {
         let is_sse = is_sse(&headers.headers);
-        let opaque_reason = opaque_handoff_reason(direction, headers, response_context);
+        let opaque_reason = opaque_handoff_reason(role, headers, response_context);
         let has_no_body = response_context.is_some_and(ResponseContext::has_no_response_body)
-            || response_status_has_no_body(direction, headers.status);
+            || response_status_has_no_body(role, headers.status);
         let state = if opaque_reason.is_some() {
             HttpState::Opaque
         } else if has_no_body {
@@ -434,7 +442,7 @@ impl BodyPlan {
                     remaining: content_length,
                 }
             }
-        } else if is_sse || direction == Direction::Inbound {
+        } else if is_sse || role == HeaderRole::Response {
             HttpState::StreamingUntilClose
         } else {
             HttpState::ReadingHeaders
@@ -490,8 +498,14 @@ impl RequestMethod {
     }
 }
 
-fn response_status_has_no_body(direction: Direction, status: Option<u16>) -> bool {
-    direction == Direction::Inbound && matches!(status, Some(100..=199) | Some(204) | Some(304))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderRole {
+    Request,
+    Response,
+}
+
+fn response_status_has_no_body(role: HeaderRole, status: Option<u16>) -> bool {
+    role == HeaderRole::Response && matches!(status, Some(100..=199) | Some(204) | Some(304))
 }
 
 fn is_interim_non_switching(status: Option<u16>) -> bool {
@@ -499,11 +513,11 @@ fn is_interim_non_switching(status: Option<u16>) -> bool {
 }
 
 fn opaque_handoff_reason(
-    direction: Direction,
+    role: HeaderRole,
     headers: &HttpHeaders,
     response_context: Option<ResponseContext>,
 ) -> Option<String> {
-    if direction != Direction::Inbound {
+    if role != HeaderRole::Response {
         return None;
     }
     if response_context.is_some_and(ResponseContext::is_connect)
@@ -551,6 +565,7 @@ fn has_upgrade_header(headers: &[(String, String)]) -> bool {
 enum HeaderParse {
     Complete {
         consumed: usize,
+        role: HeaderRole,
         headers: HttpHeaders,
     },
     Partial,
@@ -558,9 +573,10 @@ enum HeaderParse {
 }
 
 fn parse_headers(direction: Direction, bytes: &[u8]) -> HeaderParse {
-    match direction {
-        Direction::Outbound => parse_request_headers(direction, bytes),
-        Direction::Inbound => parse_response_headers(direction, bytes),
+    if looks_like_response_prefix(bytes) {
+        parse_response_headers(direction, bytes)
+    } else {
+        parse_request_headers(direction, bytes)
     }
 }
 
@@ -570,6 +586,7 @@ fn parse_request_headers(direction: Direction, bytes: &[u8]) -> HeaderParse {
     match request.parse(bytes) {
         Ok(httparse::Status::Complete(consumed)) => HeaderParse::Complete {
             consumed,
+            role: HeaderRole::Request,
             headers: HttpHeaders {
                 direction,
                 stream_sequence: 0,
@@ -595,6 +612,7 @@ fn parse_response_headers(direction: Direction, bytes: &[u8]) -> HeaderParse {
     match response.parse(bytes) {
         Ok(httparse::Status::Complete(consumed)) => HeaderParse::Complete {
             consumed,
+            role: HeaderRole::Response,
             headers: HttpHeaders {
                 direction,
                 stream_sequence: 0,
@@ -612,6 +630,11 @@ fn parse_response_headers(direction: Direction, bytes: &[u8]) -> HeaderParse {
         Ok(httparse::Status::Partial) => HeaderParse::Partial,
         Err(error) => HeaderParse::Invalid(error.to_string()),
     }
+}
+
+fn looks_like_response_prefix(bytes: &[u8]) -> bool {
+    const RESPONSE_PREFIX: &[u8] = b"HTTP/";
+    bytes.starts_with(RESPONSE_PREFIX) || RESPONSE_PREFIX.starts_with(bytes)
 }
 
 fn normalize_headers(headers: &[httparse::Header<'_>]) -> Vec<(String, String)> {
@@ -840,6 +863,55 @@ mod tests {
             events.get(1),
             Some(EventKind::HttpBodyChunk(chunk)) if chunk.end_stream && chunk.data.as_ref() == b"hello"
         ));
+    }
+
+    #[test]
+    fn parses_process_inbound_http_request_as_request() {
+        let mut parser = Http1Parser::default();
+        let events = parser.ingest(
+            Direction::Inbound,
+            b"GET /server HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        );
+
+        assert!(matches!(
+            events.first(),
+            Some(EventKind::HttpRequestHeaders(headers))
+                if headers.direction == Direction::Inbound
+                    && headers.target.as_deref() == Some("/server")
+        ));
+    }
+
+    #[test]
+    fn matches_process_outbound_response_to_inbound_head_request() {
+        let mut parser = Http1Parser::default();
+        let request_events = parser.ingest(
+            Direction::Inbound,
+            b"HEAD /server HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        );
+        let response_events = parser.ingest(
+            Direction::Outbound,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n",
+        );
+
+        assert!(matches!(
+            request_events.first(),
+            Some(EventKind::HttpRequestHeaders(headers))
+                if headers.direction == Direction::Inbound
+                    && headers.method.as_deref() == Some("HEAD")
+        ));
+        assert!(matches!(
+            response_events.first(),
+            Some(EventKind::HttpResponseHeaders(headers))
+                if headers.direction == Direction::Outbound
+                    && headers.status == Some(200)
+        ));
+        assert_eq!(
+            response_events
+                .iter()
+                .filter(|event| matches!(event, EventKind::HttpBodyChunk(_)))
+                .count(),
+            0
+        );
     }
 
     #[test]

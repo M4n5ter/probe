@@ -7,6 +7,7 @@ pub enum CapabilityKind {
     Ebpf,
     Libpcap,
     ProcfsAttribution,
+    ProcfsSocketAttribution,
     LibsslUprobe,
     Http1,
     Sse,
