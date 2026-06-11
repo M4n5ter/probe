@@ -445,6 +445,8 @@ fn validate_plaintext_feed_capture(capture: &CaptureConfig, violations: &mut Vec
 }
 
 fn validate_tls(tls: &TlsConfig, capture: &CaptureConfig, violations: &mut Vec<ConfigViolation>) {
+    validate_tls_materials(tls, violations);
+
     if capture.selection == CaptureSelection::PlaintextFeed {
         validate_plaintext_feed_selection(tls, violations);
     }
@@ -455,6 +457,17 @@ fn validate_tls(tls: &TlsConfig, capture: &CaptureConfig, violations: &mut Vec<C
 
     match tls.plaintext.provider {
         TlsPlaintextProvider::LibsslUprobe | TlsPlaintextProvider::Keylog => {}
+    }
+}
+
+fn validate_tls_materials(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
+    for (index, material) in tls.materials.iter().enumerate() {
+        if material.path.as_os_str().is_empty() {
+            violations.push(ConfigViolation {
+                field: format!("tls.materials[{index}].path"),
+                reason: "TLS material path cannot be empty".to_string(),
+            });
+        }
     }
 }
 
@@ -813,6 +826,29 @@ provider = "libssl_uprobe"
             .validate_basic()
             .expect_err("plaintext feed selection must not also enable TLS instrumentation");
         assert!(error.to_string().contains("tls.plaintext.enabled"));
+        Ok(())
+    }
+
+    #[test]
+    fn validation_rejects_empty_tls_material_path() -> Result<(), Box<dyn std::error::Error>> {
+        let config = AgentConfig::from_toml_str(
+            r#"
+[[tls.materials]]
+kind = "trust_anchor"
+path = ""
+"#,
+        )?;
+
+        let error = config
+            .validate_basic()
+            .expect_err("TLS material paths must be explicit");
+
+        assert!(error.to_string().contains("tls.materials[0].path"));
+        assert!(
+            error
+                .to_string()
+                .contains("TLS material path cannot be empty")
+        );
         Ok(())
     }
 

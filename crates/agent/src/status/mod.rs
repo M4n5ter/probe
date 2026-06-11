@@ -7,6 +7,7 @@ use std::{
 mod enforcement;
 mod health;
 mod policy;
+mod tls;
 
 use enforcement::{EnforcementStatusSnapshot, enforcement_status};
 use health::health_snapshot;
@@ -16,11 +17,14 @@ use probe_core::{CapabilityMatrix, RuntimeMode};
 use runtime::{CapturePlanMode, RuntimePlan};
 use serde::Serialize;
 use storage::{FjallSpool, SpoolProbe, SpoolSnapshot};
+use tls::{TlsStatusSnapshot, tls_status};
 
 #[cfg(test)]
 use enforcement::{EnforcementCapabilityStatusSnapshot, EnforcementStatusMode};
 #[cfg(test)]
 use policy::{PolicySourceCheck, PolicyStatusMode};
+#[cfg(test)]
+use tls::{TlsMaterialPurpose, TlsMaterialSourceCheck, TlsPlaintextCapabilityStatusSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentStatusSnapshot {
@@ -31,6 +35,7 @@ pub struct AgentStatusSnapshot {
     pub capture: CaptureStatusSnapshot,
     pub policy: PolicyStatusSnapshot,
     pub enforcement: EnforcementStatusSnapshot,
+    pub tls: TlsStatusSnapshot,
     pub capabilities: CapabilityMatrix,
     pub spool: SpoolStatusSnapshot,
     pub exporters: Vec<ExporterStatusSnapshot>,
@@ -197,6 +202,7 @@ fn build_status_snapshot_at(
     };
     let policy = policy_status(plan);
     let enforcement = enforcement_status(plan);
+    let tls = tls_status(plan);
     let exporters = exporter_statuses(plan, &spool_status, &spool.export_cursors);
     let metrics = metrics_snapshot(&plan.capabilities, &spool_status, &exporters);
     let health = health_snapshot(plan, &spool_status, &exporters, &policy);
@@ -214,6 +220,7 @@ fn build_status_snapshot_at(
         },
         policy,
         enforcement,
+        tls,
         capabilities: plan.capabilities.clone(),
         spool: spool_status,
         exporters,
@@ -400,11 +407,19 @@ mod tests {
             snapshot.enforcement.capability,
             EnforcementCapabilityStatusSnapshot::NotRequired
         );
+        assert_eq!(
+            snapshot.tls.plaintext.capability,
+            TlsPlaintextCapabilityStatusSnapshot::NotRequired
+        );
         let value = serde_json::to_value(&snapshot)?;
         assert_eq!(value["policy"]["mode"], json!("inactive"));
         assert_eq!(value["enforcement"]["status"], json!("audit_only"));
         assert_eq!(
             value["enforcement"]["capability"]["kind"],
+            json!("not_required")
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["capability"]["kind"],
             json!("not_required")
         );
         assert_eq!(snapshot.metrics.export.total_lag, Some(2));
@@ -521,6 +536,72 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("policy: policy source path does not exist"))
         );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn status_snapshot_reports_metadata_only_tls_materials()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-tls-material")?;
+        let material_path = temp.join("ca.pem");
+        fs::write(&material_path, b"test trust anchor")?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.tls.materials = vec![probe_config::TlsMaterialConfig {
+            kind: probe_config::TlsMaterialKind::TrustAnchor,
+            path: material_path.clone(),
+        }];
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+        let spool = available_empty_spool();
+
+        let snapshot = build_status_snapshot_at(&plan, spool, 42);
+
+        assert_eq!(snapshot.tls.materials.len(), 1);
+        let material = &snapshot.tls.materials[0];
+        assert_eq!(material.path, material_path);
+        assert_eq!(material.purpose, TlsMaterialPurpose::TrustOrIdentity);
+        assert_eq!(material.source.mode, RuntimeMode::Available);
+        assert_eq!(material.source.check, TlsMaterialSourceCheck::MetadataOnly);
+        assert_eq!(snapshot.health.mode, RuntimeMode::Available);
+        let value = serde_json::to_value(&snapshot)?;
+        assert_eq!(
+            value["tls"]["materials"][0]["source"]["check"],
+            json!("metadata_only")
+        );
+        assert_eq!(
+            value["tls"]["materials"][0]["purpose"],
+            json!("trust_or_identity")
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_tls_material_is_reported_without_forcing_health()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-missing-tls-material")?;
+        let missing_path = temp.join("missing.keys");
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.tls.materials = vec![probe_config::TlsMaterialConfig {
+            kind: probe_config::TlsMaterialKind::KeyLogFile,
+            path: missing_path,
+        }];
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+        let spool = available_empty_spool();
+
+        let snapshot = build_status_snapshot_at(&plan, spool, 42);
+
+        let material = &snapshot.tls.materials[0];
+        assert_eq!(material.purpose, TlsMaterialPurpose::DecryptHint);
+        assert_eq!(material.source.mode, RuntimeMode::Unavailable);
+        assert!(
+            material
+                .source
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("does not exist"))
+        );
+        assert_eq!(snapshot.health.mode, RuntimeMode::Available);
         fs::remove_dir_all(temp)?;
         Ok(())
     }
