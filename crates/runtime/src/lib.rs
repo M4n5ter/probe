@@ -1,11 +1,15 @@
 use attribution::{ProcessAttributor, ProcfsAttributor, ProcfsSocketResolver};
 use probe_config::{
-    AgentConfig, CaptureBackend, CaptureSelection, ConfigError, ConfigValidationError,
-    ConfigViolation, ExporterTransport, LiveCaptureBackend, TlsPlaintextProvider,
+    AgentConfig, CaptureBackend, CaptureSelection, CompressionCodecName, ConfigError,
+    ConfigValidationError, ConfigViolation, ExporterTransport, LiveCaptureBackend,
+    TlsPlaintextProvider,
 };
 use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub const EXPORT_WORKER_BATCHES_PER_SINK_PER_TICK: u64 = 1;
+pub const EXPORT_WORKER_SINK_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -22,6 +26,7 @@ pub struct RuntimePlan {
     pub config: AgentConfig,
     pub capabilities: CapabilityMatrix,
     pub capture: CapturePlan,
+    pub export: ExportPlan,
 }
 
 impl RuntimePlan {
@@ -30,10 +35,12 @@ impl RuntimePlan {
         validate_runtime_config(&config, registry)?;
         let capabilities = registry.capability_matrix();
         let capture = CapturePlan::resolve(&config, registry);
+        let export = ExportPlan::resolve(&config);
         Ok(Self {
             config,
             capabilities,
             capture,
+            export,
         })
     }
 
@@ -50,6 +57,63 @@ impl RuntimePlan {
             })
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportPlan {
+    pub worker_enabled: bool,
+    pub worker_interval_ms: u64,
+    pub worker_mode: Option<ExportWorkerMode>,
+    pub sinks: Vec<ExportSinkPlan>,
+    pub reason: Option<String>,
+}
+
+impl ExportPlan {
+    fn resolve(config: &AgentConfig) -> Self {
+        let sinks = config
+            .exporters
+            .iter()
+            .map(|exporter| ExportSinkPlan {
+                id: exporter.id.clone(),
+                transport: exporter.transport,
+                codec: exporter.codec,
+            })
+            .collect::<Vec<_>>();
+        let worker_enabled = config.export.worker_enabled && !sinks.is_empty();
+        let worker_mode = worker_enabled.then_some(ExportWorkerMode::FixedIntervalBounded {
+            batches_per_sink_per_tick: EXPORT_WORKER_BATCHES_PER_SINK_PER_TICK,
+            sink_timeout_ms: EXPORT_WORKER_SINK_TIMEOUT_MS,
+        });
+        let reason = match (config.export.worker_enabled, sinks.is_empty()) {
+            (false, _) => Some("export worker disabled by config".to_string()),
+            (true, true) => Some("export worker has no configured sinks".to_string()),
+            (true, false) => None,
+        };
+
+        Self {
+            worker_enabled,
+            worker_interval_ms: config.export.worker_interval_ms,
+            worker_mode,
+            sinks,
+            reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ExportWorkerMode {
+    FixedIntervalBounded {
+        batches_per_sink_per_tick: u64,
+        sink_timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportSinkPlan {
+    pub id: String,
+    pub transport: ExporterTransport,
+    pub codec: CompressionCodecName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -554,6 +618,59 @@ mod tests {
                 .as_ref()
                 .map(|provider| provider.builder),
             Some(CaptureProviderBuilder::Libpcap)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn export_plan_disables_worker_without_sinks() -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(vec![], test_platform_capabilities());
+
+        let plan = RuntimePlan::build(AgentConfig::default(), &registry)?;
+
+        assert!(!plan.export.worker_enabled);
+        assert_eq!(plan.export.worker_interval_ms, 1_000);
+        assert_eq!(plan.export.worker_mode, None);
+        assert_eq!(plan.export.sinks, Vec::<ExportSinkPlan>::new());
+        assert_eq!(
+            plan.export.reason.as_deref(),
+            Some("export worker has no configured sinks")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn export_plan_normalizes_worker_mode_and_sinks() -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(vec![], test_platform_capabilities());
+        let mut config = AgentConfig::default();
+        config.export.worker_interval_ms = 250;
+        config.exporters = vec![probe_config::ExporterConfig {
+            id: "primary".to_string(),
+            transport: ExporterTransport::Webhook,
+            endpoint: "https://collector.example/batches".to_string(),
+            codec: CompressionCodecName::None,
+            headers: Default::default(),
+        }];
+
+        let plan = RuntimePlan::build(config, &registry)?;
+
+        assert!(plan.export.worker_enabled);
+        assert_eq!(plan.export.worker_interval_ms, 250);
+        assert_eq!(plan.export.reason, None);
+        assert_eq!(
+            plan.export.worker_mode,
+            Some(ExportWorkerMode::FixedIntervalBounded {
+                batches_per_sink_per_tick: EXPORT_WORKER_BATCHES_PER_SINK_PER_TICK,
+                sink_timeout_ms: EXPORT_WORKER_SINK_TIMEOUT_MS,
+            })
+        );
+        assert_eq!(
+            plan.export.sinks,
+            vec![ExportSinkPlan {
+                id: "primary".to_string(),
+                transport: ExporterTransport::Webhook,
+                codec: CompressionCodecName::None,
+            }]
         );
         Ok(())
     }

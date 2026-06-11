@@ -9,8 +9,6 @@ use thiserror::Error;
 use tokio::sync::Notify;
 
 const EXPORT_BATCH_LIMIT: usize = 1024;
-const EXPORT_WORKER_BATCHES_PER_SINK_PER_TICK: u64 = 1;
-const EXPORT_WORKER_SINK_TIMEOUT: Duration = Duration::from_secs(10);
 const EXPORT_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLAY_WEBHOOK_SINK: &str = "replay-webhook";
 
@@ -38,6 +36,32 @@ pub struct ExportWorkerHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
+pub struct ExportWorkerConfig {
+    agent_id: String,
+    exporters: Vec<ExporterConfig>,
+    interval: Duration,
+    batches_per_sink_per_tick: u64,
+    sink_timeout: Duration,
+}
+
+impl ExportWorkerConfig {
+    pub fn fixed_interval_bounded(
+        agent_id: String,
+        exporters: Vec<ExporterConfig>,
+        interval: Duration,
+        batches_per_sink_per_tick: u64,
+        sink_timeout: Duration,
+    ) -> Self {
+        Self {
+            agent_id,
+            exporters,
+            interval,
+            batches_per_sink_per_tick,
+            sink_timeout,
+        }
+    }
+}
+
 impl ExportWorkerHandle {
     pub async fn stop(mut self) {
         self.stop_requested.store(true, Ordering::Relaxed);
@@ -62,16 +86,11 @@ impl ExportWorkerHandle {
 
 pub fn spawn_configured_export_worker<S>(
     spool: Arc<S>,
-    config: AgentConfig,
-) -> Option<ExportWorkerHandle>
+    config: ExportWorkerConfig,
+) -> ExportWorkerHandle
 where
     S: DurableSpool + Send + Sync + 'static,
 {
-    if !config.export.worker_enabled || config.exporters.is_empty() {
-        return None;
-    }
-
-    let interval = Duration::from_millis(config.export.worker_interval_ms);
     let stop_requested = Arc::new(AtomicBool::new(false));
     let stop_notify = Arc::new(Notify::new());
     let task_stop_requested = Arc::clone(&stop_requested);
@@ -85,35 +104,42 @@ where
                 break;
             }
             tokio::select! {
-                () = tokio::time::sleep(interval) => {}
+                () = tokio::time::sleep(config.interval) => {}
                 () = task_stop_notify.notified() => {}
             }
         }
     });
-    Some(ExportWorkerHandle {
+    ExportWorkerHandle {
         stop_requested,
         stop_notify,
         task,
-    })
+    }
 }
 
 pub async fn drain_configured_sinks(
     spool: &impl DurableSpool,
     config: &AgentConfig,
 ) -> Result<(), ExportDrainError> {
-    drain_configured_sinks_with_mode(spool, config, SinkDrainMode::UntilEmpty).await
+    drain_configured_sinks_with_mode(
+        spool,
+        &config.agent_id,
+        &config.exporters,
+        SinkDrainMode::UntilEmpty,
+    )
+    .await
 }
 
 async fn drain_configured_sinks_once(
     spool: &impl DurableSpool,
-    config: &AgentConfig,
+    config: &ExportWorkerConfig,
 ) -> Result<(), ExportDrainError> {
     drain_configured_sinks_with_mode(
         spool,
-        config,
+        &config.agent_id,
+        &config.exporters,
         SinkDrainMode::MaxBatches {
-            max_batches: EXPORT_WORKER_BATCHES_PER_SINK_PER_TICK,
-            sink_timeout: EXPORT_WORKER_SINK_TIMEOUT,
+            max_batches: config.batches_per_sink_per_tick,
+            sink_timeout: config.sink_timeout,
         },
     )
     .await
@@ -121,13 +147,14 @@ async fn drain_configured_sinks_once(
 
 async fn drain_configured_sinks_with_mode(
     spool: &impl DurableSpool,
-    config: &AgentConfig,
+    agent_id: &str,
+    exporters: &[ExporterConfig],
     mode: SinkDrainMode,
 ) -> Result<(), ExportDrainError> {
     let mut failures = Vec::new();
-    for exporter in &config.exporters {
+    for exporter in exporters {
         let result = match webhook_export_target_from_config(exporter) {
-            Ok(target) => drain_webhook_sink_with_mode(spool, &config.agent_id, target, mode).await,
+            Ok(target) => drain_webhook_sink_with_mode(spool, agent_id, target, mode).await,
             Err(error) => Err(error),
         };
         if let Err(error) = result {
@@ -377,7 +404,6 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use probe_config::ExportRuntimeConfig;
     use probe_core::{
         AddressPort, CaptureSource, EventEnvelope, EventKind, FlowContext, FlowIdentity,
         ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
@@ -465,25 +491,21 @@ mod tests {
         let spool = Arc::new(FjallSpool::open(&temp)?);
         append_export_event(spool.as_ref(), 1)?;
         let server = TestWebhookServer::spawn_accepting(true, 2)?;
-        let config = AgentConfig {
-            agent_id: "agent-1".to_string(),
-            export: ExportRuntimeConfig {
-                worker_enabled: true,
-                worker_interval_ms: 10,
-            },
-            exporters: vec![ExporterConfig {
+        let config = ExportWorkerConfig::fixed_interval_bounded(
+            "agent-1".to_string(),
+            vec![ExporterConfig {
                 id: "worker".to_string(),
                 transport: ExporterTransport::Webhook,
                 endpoint: server.endpoint(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
             }],
-            ..AgentConfig::default()
-        };
-        config.validate_basic()?;
+            Duration::from_millis(10),
+            1,
+            Duration::from_secs(10),
+        );
 
-        let worker = spawn_configured_export_worker(Arc::clone(&spool), config)
-            .expect("enabled exporter config should spawn a worker");
+        let worker = spawn_configured_export_worker(Arc::clone(&spool), config);
         wait_for_export_cursor(spool.as_ref(), "worker", 1).await?;
         append_export_event(spool.as_ref(), 2)?;
         wait_for_export_cursor(spool.as_ref(), "worker", 2).await?;
