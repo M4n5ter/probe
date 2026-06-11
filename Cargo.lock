@@ -24,6 +24,7 @@ dependencies = [
  "probe-core",
  "proto",
  "runtime",
+ "rustix",
  "serde",
  "serde_json",
  "storage",

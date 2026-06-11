@@ -30,6 +30,7 @@ pub struct AgentConfig {
     pub policies: Vec<PolicyConfig>,
     pub tls: TlsConfig,
     pub enforcement: EnforcementConfig,
+    pub admin: AdminConfig,
 }
 
 impl AgentConfig {
@@ -45,6 +46,7 @@ impl AgentConfig {
         validate_export_runtime(&self.export, &mut violations);
         validate_exporters(&self.exporters, &mut violations);
         validate_policies(&self.policies, &mut violations);
+        validate_admin(&self.admin, &mut violations);
 
         if violations.is_empty() {
             Ok(())
@@ -66,6 +68,7 @@ impl Default for AgentConfig {
             policies: Vec::new(),
             tls: TlsConfig::default(),
             enforcement: EnforcementConfig::default(),
+            admin: AdminConfig::default(),
         }
     }
 }
@@ -328,6 +331,22 @@ impl Default for EnforcementConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminConfig {
+    pub enabled: bool,
+    pub socket_path: PathBuf,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket_path: PathBuf::from("/run/sssa-probe/admin.sock"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigValidationError {
     violations: Vec<ConfigViolation>,
@@ -575,6 +594,23 @@ fn validate_policies(policies: &[PolicyConfig], violations: &mut Vec<ConfigViola
     }
 }
 
+fn validate_admin(admin: &AdminConfig, violations: &mut Vec<ConfigViolation>) {
+    if !admin.enabled {
+        return;
+    }
+    if admin.socket_path.as_os_str().is_empty() {
+        violations.push(ConfigViolation {
+            field: "admin.socket_path".to_string(),
+            reason: "enabled admin socket requires a socket path".to_string(),
+        });
+    } else if !admin.socket_path.is_absolute() {
+        violations.push(ConfigViolation {
+            field: "admin.socket_path".to_string(),
+            reason: "admin socket path must be absolute".to_string(),
+        });
+    }
+}
+
 fn valid_exporter_header_name(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(valid_http_token_byte)
 }
@@ -673,6 +709,10 @@ provider = "libssl_uprobe"
 
 [enforcement]
 mode = "dry_run"
+
+[admin]
+enabled = true
+socket_path = "/run/sssa-probe/admin.sock"
 "#,
         )?;
 
@@ -694,6 +734,11 @@ mode = "dry_run"
         assert!(config.tls.plaintext.enabled);
         assert_eq!(config.capture.plaintext_feed.path, None);
         assert_eq!(config.enforcement.mode, EnforcementMode::DryRun);
+        assert!(config.admin.enabled);
+        assert_eq!(
+            config.admin.socket_path,
+            PathBuf::from("/run/sssa-probe/admin.sock")
+        );
         Ok(())
     }
 
@@ -848,6 +893,42 @@ path = ""
             error
                 .to_string()
                 .contains("TLS material path cannot be empty")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validation_rejects_invalid_admin_socket_path() -> Result<(), Box<dyn std::error::Error>> {
+        let empty = AgentConfig::from_toml_str(
+            r#"
+[admin]
+enabled = true
+socket_path = ""
+"#,
+        )?;
+        let error = empty
+            .validate_basic()
+            .expect_err("enabled admin socket requires a path");
+        assert!(
+            error
+                .to_string()
+                .contains("enabled admin socket requires a socket path")
+        );
+
+        let relative = AgentConfig::from_toml_str(
+            r#"
+[admin]
+enabled = true
+socket_path = "admin.sock"
+"#,
+        )?;
+        let error = relative
+            .validate_basic()
+            .expect_err("admin socket path must be absolute");
+        assert!(
+            error
+                .to_string()
+                .contains("admin socket path must be absolute")
         );
         Ok(())
     }

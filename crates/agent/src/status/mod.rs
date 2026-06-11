@@ -187,6 +187,37 @@ pub fn collect_spool_status(plan: &RuntimePlan) -> SpoolStatusInput {
     }
 }
 
+pub fn collect_running_spool_status(plan: &RuntimePlan, spool: &FjallSpool) -> SpoolStatusInput {
+    let path = plan.config.storage.path.clone();
+    let snapshot = match spool.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return SpoolStatusInput::unavailable(
+                path,
+                format!("failed to inspect running spool: {error}"),
+            );
+        }
+    };
+    let mut export_cursors = BTreeMap::new();
+    for sink in &plan.export.sinks {
+        match spool.export_cursor(&sink.id) {
+            Ok(cursor) => {
+                export_cursors.insert(sink.id.clone(), cursor);
+            }
+            Err(error) => {
+                return SpoolStatusInput::unavailable(
+                    path,
+                    format!(
+                        "failed to inspect export cursor for sink {}: {error}",
+                        sink.id
+                    ),
+                );
+            }
+        }
+    }
+    SpoolStatusInput::available(path, snapshot, export_cursors)
+}
+
 fn build_status_snapshot_at(
     plan: &RuntimePlan,
     spool: SpoolStatusInput,
@@ -769,6 +800,28 @@ mod tests {
         assert_eq!(snapshot.spool.export_last_sequence, Some(2));
         assert_eq!(snapshot.exporters[0].cursor, Some(1));
         assert_eq!(snapshot.exporters[0].lag, Some(1));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn collect_running_spool_status_reads_open_spool_without_probe_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-running-spool")?;
+        let spool = FjallSpool::open(&temp)?;
+        spool.append_export(test_payload(b"one"))?;
+        spool.append_export(test_payload(b"two"))?;
+        spool.ack_export("primary", 1)?;
+        let plan = runtime_plan(temp.clone(), Vec::new())?;
+
+        let status = collect_running_spool_status(&plan, &spool);
+        let snapshot = build_status_snapshot_at(&plan, status, 42);
+
+        assert_eq!(snapshot.spool.mode, RuntimeMode::Available);
+        assert_eq!(snapshot.spool.export_last_sequence, Some(2));
+        assert_eq!(snapshot.exporters[0].cursor, Some(1));
+        assert_eq!(snapshot.exporters[0].lag, Some(1));
+        drop(spool);
         fs::remove_dir_all(temp)?;
         Ok(())
     }

@@ -4,6 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod admin;
 mod check;
 mod configured_enforcement;
 mod configured_policy;
@@ -11,6 +12,7 @@ mod export;
 mod plaintext_feed;
 mod status;
 
+use admin::{AdminServerConfig, spawn_admin_server};
 use attribution::ProcfsSocketResolver;
 use capture::{
     CaptureError, CaptureProvider, LibpcapConfig, LibpcapProvider, ProcessResolver, ReplayProvider,
@@ -70,6 +72,8 @@ enum AgentError {
     Capture(#[from] CaptureError),
     #[error("plaintext feed error: {0}")]
     PlaintextFeed(#[from] plaintext_feed::PlaintextFeedLoadError),
+    #[error("admin error: {0}")]
+    Admin(#[from] admin::AdminError),
     #[error("{0}")]
     Check(#[from] check::CheckError),
     #[error("unsupported run config: {0}")]
@@ -203,6 +207,11 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
             let policy = load_configured_policy(&plan.config)?;
             let mut enforcement = build_configured_enforcement(&plan.config)?;
+            let admin_server = admin_server_config_from_plan(&plan)
+                .map(|config| {
+                    spawn_admin_server(Arc::new(plan.clone()), Arc::clone(&spool), config)
+                })
+                .transpose()?;
             let export_worker = export_worker_config_from_plan(&plan)
                 .map(|config| spawn_export_worker(Arc::clone(&spool), config));
             let mut pipeline = CapturePipeline::new(
@@ -223,6 +232,9 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             );
             let summary_result = pipeline
                 .run_provider_with_options(provider.as_mut(), PipelineRunOptions { max_events });
+            if let Some(server) = admin_server {
+                server.stop().await;
+            }
             if let Some(worker) = export_worker {
                 worker.stop().await;
             }
@@ -300,6 +312,12 @@ fn build_runtime_plan(config: AgentConfig) -> Result<RuntimePlan, AgentError> {
 
 fn export_worker_config_from_plan(plan: &RuntimePlan) -> Option<ExportWorkerConfig> {
     ExportWorkerConfig::from_export_plan(plan.config.agent_id.clone(), &plan.export)
+}
+
+fn admin_server_config_from_plan(plan: &RuntimePlan) -> Option<AdminServerConfig> {
+    plan.config.admin.enabled.then(|| AdminServerConfig {
+        socket_path: plan.config.admin.socket_path.clone(),
+    })
 }
 
 fn default_provider_registry(config: &AgentConfig) -> ProviderRegistry {

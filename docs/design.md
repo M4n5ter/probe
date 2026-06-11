@@ -76,7 +76,7 @@ V1 明确不做：
 - 已实现 `probe-core` 的 `TcpEndpoint`/`TcpConnection` 共享模型，供 capture provider、procfs attribution 和后续 eBPF/socket attribution 复用，避免各层用字符串 endpoint 重复建模。
 - 已实现 `capture` crate 的 `CaptureProvider` 抽象、`ReplayProvider`、`PlaintextFeedProvider` 和基础 `LibpcapProvider`。`PlaintextFeedProvider` 接收外部已解密明文 feed event，输出 `ExternalPlaintextFeed` source 的 `CapturedBytes`/gap/connection lifecycle event，用于把 libssl uprobe、keylog/session decrypt、SDK feed 或 future MITM 等后续 provider 接入同一 pipeline；它本身不执行 TLS 解密。libpcap provider 可打开设备、安装 BPF filter、解析 Ethernet/Linux cooked/raw IPv4 TCP segment，接收可插拔 process resolver，并输出 degraded `CapturedBytes`。flow table 会用 SYN reuse、RST、双向 FIN、idle timeout 和容量淘汰清理 4-tuple 缓存；单向 FIN 只标记半关闭，避免把仍在发送的另一方向拆成新 flow；清理 flow 时会发出 `ConnectionClosed`，让 pipeline 释放 parser state。若同一 segment 同时携带 payload 和关闭信号，payload 事件先进入 parser，随后才发 close。它当前不做 TCP 重组、IPv6 或 gap 修复。
 - 已实现 `attribution` crate 的 `ProcfsAttributor` 和 `ProcfsSocketResolver`；前者可从 `/proc/<pid>` 读取进程身份、cmdline hash、starttime、uid/gid、cgroup、systemd service 与 container hint，后者可通过 `/proc/net/tcp` socket inode 和 `/proc/<pid>/fd` best-effort 反查 TCP 连接所属进程。agent 注入的 procfs resolver 使用短 TTL socket snapshot，避免同一批新连接重复全量扫描 `/proc/<pid>/fd`；libpcap provider 在 TCP 生命周期信号、idle eviction、capacity eviction 和端口复用关闭旧 flow 后会使 snapshot 失效，降低拿到旧进程身份的风险。resolver 错误会进入 capture degradation reason，不再静默伪装成未匹配；但单个 PID 的 fd race 或权限拒绝属于 best-effort skip，不让整批 socket snapshot 失败。replay flow 默认使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence，避免把文件输入误归因到 agent 进程。
-- 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、provider-specific nested config、storage、export runtime worker、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，基础字段校验会拒绝 ambiguous external plaintext feed 配置：当前 external plaintext feed 的 source path 归 `capture.plaintext_feed.path` 所有，不能塞进 TLS material/provider 配置。TLS material 路径不能为空，但文件存在性属于 runtime/admin status 观察面。
+- 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、provider-specific nested config、storage、export runtime worker、exporter、TLS material、policy、enforcement mode 和 admin Unix socket 的第一版结构；配置解析拒绝未知字段，基础字段校验会拒绝 ambiguous external plaintext feed 配置：当前 external plaintext feed 的 source path 归 `capture.plaintext_feed.path` 所有，不能塞进 TLS material/provider 配置。TLS material 路径不能为空，但文件存在性属于 runtime/admin status 观察面。
 - 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection 与 export worker effective plan；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；`plaintext_feed` 是独立 plan mode，不伪装成 replay 或 live capture；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
 - 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；pipeline 支持可选 `max_events` 运行边界，便于对真实 live provider 做有界 smoke。`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合、连续 exporter worker、replay exporter 命令和状态/metrics 快照输出。
 - 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。parser 已识别 WebSocket HTTP Upgrade，输出 `WebSocketHandoff` 后把后续字节转为 opaque stream；它不解析 WebSocket frame/message。
@@ -869,7 +869,7 @@ V1 的 HTTP(S) exporter 是 webhook 风格，但必须定义协议语义。
 
 ## 26. 管理 API 与自观测
 
-本地管理接口使用 root-owned Unix socket。
+本地管理接口使用 owner-constrained private Unix socket。
 
 当前实现状态：
 
@@ -878,7 +878,8 @@ V1 的 HTTP(S) exporter 是 webhook 风格，但必须定义协议语义。
 - policy status 当前只做 metadata-only source check：报告 configured/enabled count、active policy id/path、selector 是否配置、策略源文件是否存在且是 regular file；不会加载或执行 Lua policy source。启用 policy 且源文件 metadata 可见时，offline status 标记 `policy.mode = metadata_only` 并让 health degraded，而不是宣称 policy runtime 已可用。原因是 `PolicyRuntime` 加载阶段会执行 Lua chunk，offline status 不能变成隐式执行外部策略的入口。显式 `check` 会加载并编译启用的 policy，失败则 fail closed。
 - enforcement status 使用 typed enum 报告 configured mode、effective status、selector 是否配置和 capability requirement。`disabled`/`audit_only` 标记 capability `not_required`；`dry_run` 标记需要 `DryRunEnforcement` capability。`enforce` 和缺少 dry-run capability 的配置在 `RuntimePlan` 构建阶段 fail closed，因此 CLI status 对这类配置直接返回 validation error，而不是输出一个伪可用 snapshot。
 - TLS status 报告 plaintext provider 是否启用及其 capability requirement，并对配置的 TLS material 做 metadata-only source check：只判断路径是否存在且是 regular file，同时把 material 标为 `trust_or_identity` 或 `decrypt_hint`。offline status 不读取、不解析、不验证证书/私钥/keylog 内容，也不把证书/私钥误称为通用 TLS 解密能力；当前尚无 active surface 消费这些 material，因此 material 缺失只体现在 `tls.materials[].source.mode`，不直接拉低 health。
-- 尚未实现 root-owned Unix socket server、reload、debug dump 和 Prometheus adapter；这些后续应复用同一 status snapshot 构建器，并承担运行中 agent 的在线状态查询。
+- `run` 可按 `[admin] enabled = true` 启动 owner-constrained private Unix socket server，socket 文件权限设置为 `0600`，当前 JSON-lines 协议支持 `{"command":"status"}` 和 `{"command":"metrics"}`。admin socket parent directory 必须由部署层预创建，且不能是 symlink、不能允许 group/other 访问，owner 必须是 root 或当前 euid；socket 路径已有活跃 listener 时 fail fast，拒绝覆盖非 socket 文件，只清理 connection-refused 的 stale socket。在线 status 直接读取运行中 spool handle，避免把自身 Fjall lock 误报成 offline busy；admin server 在 exporter worker 启动前完成 bind，避免控制面失败后后台 exporter 已产生 side effect。
+- 尚未实现 reload、debug dump 和 Prometheus adapter；这些后续应复用同一 status snapshot 构建器，并承担运行中 agent 的在线状态查询。
 
 能力：
 
@@ -1202,7 +1203,7 @@ enforcement 抽象验收：
 | 压缩 | pluggable codec，默认 zstd，可选 gzip/deflate | 第 24 节 |
 | zlib-rs | 用于 deflate/gzip 方向候选，不是 zstd 实现 | 第 24、32 节 |
 | 脱敏 | policy transform，不放到 exporter 私有逻辑 | 第 25 节 |
-| admin API | root-owned Unix socket | 第 26 节 |
+| admin API | owner-constrained private Unix socket | 第 26 节 |
 | 自观测 | metrics、health、tracing、capability/degraded/gap counters | 第 26 节 |
 | workspace | 短名 crate，使用 xtask 管 eBPF 构建 | 第 27 节 |
 | runtime | 热路径同步，IO 异步，Tokio + 专用热路径线程 | 第 27 节 |

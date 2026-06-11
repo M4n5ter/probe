@@ -18,11 +18,12 @@ probe-core = { path = "../core" }
 probe-config = { path = "../config" }
 proto = { path = "../proto" }
 runtime = { path = "../runtime" }
+rustix = { version = "1.1", features = ["process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 storage = { path = "../storage" }
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "time"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "fs", "io-util", "net", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 
