@@ -288,6 +288,7 @@ mod tests {
     use probe_core::{
         AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
         HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+        WebSocketHandoff,
     };
 
     use crate::{
@@ -356,6 +357,35 @@ mod tests {
         );
         assert!(
             matches!(outcomes.get(1), Some(PolicyOutcome::Verdict(verdict)) if verdict.reason == "dry-run protection")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lua_policy_can_handle_websocket_handoff() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "websocket".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec!["on_websocket_handoff".to_string()],
+            },
+            r#"
+            function on_websocket_handoff(event)
+              return {
+                action = "alert",
+                scope = "flow",
+                reason = event.kind.type .. " " .. event.kind.target .. " " .. event.kind.subprotocol,
+                confidence = 80
+              }
+            end
+            "#,
+        )?;
+
+        let event = websocket_handoff_event();
+        let outcomes = runtime.handle_event(primary_hook_for_event(&event), &event)?;
+
+        assert!(
+            matches!(outcomes.first(), Some(PolicyOutcome::Verdict(verdict)) if verdict.reason == "websocket_handoff /chat chat")
         );
         Ok(())
     }
@@ -515,6 +545,25 @@ mod tests {
                 reason: None,
                 version: "HTTP/1.1".to_string(),
                 headers: vec![("host".to_string(), "example.test".to_string())],
+            }),
+        )
+    }
+
+    fn websocket_handoff_event() -> EventEnvelope {
+        EventEnvelope::new(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            demo_flow(),
+            CaptureSource::Replay,
+            "test",
+            EventKind::WebSocketHandoff(WebSocketHandoff {
+                direction: Direction::Inbound,
+                stream_sequence: 1,
+                target: Some("/chat".to_string()),
+                subprotocol: Some("chat".to_string()),
+                extensions: vec!["permessage-deflate".to_string()],
             }),
         )
     }

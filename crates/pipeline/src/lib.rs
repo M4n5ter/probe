@@ -431,6 +431,106 @@ end
     }
 
     #[test]
+    fn websocket_handoff_reaches_policy_and_export_spool() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let spool = storage::FjallSpool::open(temp.path())?;
+        let policy = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "websocket-policy".to_string(),
+                version: "v1".to_string(),
+                hooks: vec!["on_websocket_handoff".to_string()],
+            },
+            r#"
+function on_websocket_handoff(event)
+  return probe.emit_alert("websocket " .. event.kind.target .. " " .. event.kind.subprotocol)
+end
+"#,
+        )?;
+        let mut parser_factory = Http1ParserFactory::default();
+        let flow = demo_flow_with_ports(50_000, 80, 12);
+        let mut provider = SequenceProvider::new(vec![
+            captured_bytes_with_direction(
+                flow.clone(),
+                Direction::Outbound,
+                b"GET /chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: test\r\n\r\n",
+            ),
+            captured_bytes_with_direction(
+                flow.clone(),
+                Direction::Inbound,
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Protocol: chat\r\n\r\n",
+            ),
+            captured_bytes_with_direction(flow, Direction::Inbound, b"\x81\x02hi"),
+        ]);
+        let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Some(&policy), "test");
+
+        let summary = pipeline.run_provider(&mut provider)?;
+
+        assert_eq!(summary.ingress_chunks, 3);
+        assert!(
+            summary.export_events >= 5,
+            "request, response, handoff, policy alert, and opaque events should be exported"
+        );
+
+        let exported = spool.read_export_batch("sink", 16)?;
+        let envelopes = exported
+            .iter()
+            .map(|event| serde_json::from_slice::<EventEnvelope>(event.payload.bytes()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let values = exported
+            .iter()
+            .map(|event| serde_json::from_slice::<serde_json::Value>(event.payload.bytes()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert!(values.iter().any(|event| {
+            event["kind"]["type"] == "websocket_handoff"
+                && event["kind"]["target"] == "/chat"
+                && event["kind"]["subprotocol"] == "chat"
+        }));
+        let handoff_index = envelopes
+            .iter()
+            .position(|envelope| {
+                matches!(
+                    &envelope.kind,
+                    EventKind::WebSocketHandoff(handoff)
+                        if handoff.direction == Direction::Inbound
+                            && handoff.target.as_deref() == Some("/chat")
+                            && handoff.subprotocol.as_deref() == Some("chat")
+                )
+            })
+            .expect("websocket handoff should be exported");
+        assert!(envelopes.iter().any(|envelope| {
+            matches!(
+                &envelope.kind,
+                EventKind::PolicyAlert(alert)
+                    if alert.message == "websocket /chat chat"
+            )
+        }));
+        let opaque_index = envelopes
+            .iter()
+            .position(|envelope| {
+                matches!(
+                    &envelope.kind,
+                    EventKind::OpaqueStream(opaque) if opaque.direction == Direction::Inbound
+                )
+            })
+            .expect("websocket bytes after handoff should be opaque");
+        assert!(handoff_index < opaque_index);
+        assert!(
+            !envelopes
+                .iter()
+                .skip(handoff_index + 1)
+                .any(|envelope| matches!(envelope.kind, EventKind::HttpBodyChunk(_)))
+        );
+        assert!(
+            !envelopes
+                .iter()
+                .any(|envelope| matches!(envelope.kind, EventKind::ProtocolError(_)))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn connection_close_flushes_close_delimited_http_body() -> Result<(), Box<dyn std::error::Error>>
     {
         let temp = tempdir()?;
