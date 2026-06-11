@@ -78,7 +78,7 @@ V1 明确不做：
 - 已实现 `attribution` crate 的 `ProcfsAttributor` 和 `ProcfsSocketResolver`；前者可从 `/proc/<pid>` 读取进程身份、cmdline hash、starttime、uid/gid、cgroup、systemd service 与 container hint，后者可通过 `/proc/net/tcp` socket inode 和 `/proc/<pid>/fd` best-effort 反查 TCP 连接所属进程。agent 注入的 procfs resolver 使用短 TTL socket snapshot，避免同一批新连接重复全量扫描 `/proc/<pid>/fd`；libpcap provider 在 TCP 生命周期信号、idle eviction、capacity eviction 和端口复用关闭旧 flow 后会使 snapshot 失效，降低拿到旧进程身份的风险。resolver 错误会进入 capture degradation reason，不再静默伪装成未匹配；但单个 PID 的 fd race 或权限拒绝属于 best-effort skip，不让整批 socket snapshot 失败。replay flow 默认使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence，避免把文件输入误归因到 agent 进程。
 - 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、provider-specific nested config、storage、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，基础字段校验不理解 runtime capability。
 - 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
-- 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合和 exporter 命令。
+- 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；pipeline 支持可选 `max_events` 运行边界，便于对真实 live provider 做有界 smoke。`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合和 exporter 命令。
 - 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。
 - 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF/TLS/真实 enforcement 相关能力仍必须标记 unavailable；dry-run enforcement 是可用能力，记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 作为 live provider；`run` 在无 live capture provider 时 fail closed，存在 libpcap live provider 时会把 provider 接入 replay 共用的 pipeline；`check` 用于查看 resolved plan。
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
@@ -977,7 +977,7 @@ benchmark 参数：
 
 V1 CLI 至少提供：
 
-- `run`：启动 agent。
+- `run`：启动 agent；默认持续运行，`--max-events` 用于 smoke/e2e 中对 live provider 做有界采集。`--max-events` 是硬 capture event 数上限，不保证读到 flow close 边界，也不替代完整 close/flush 行为验收。
 - `check`：校验配置和 policy bundle。
 - `replay`：用 pcap/spool 样本跑 parser/policy/exporter。
 - `capabilities`：输出 capability matrix。
@@ -991,6 +991,8 @@ V1 CLI 至少提供：
 - 纯 Rust 单元/属性测试：selector、parser state machine、policy state、spool cursor、codec。
 - pcap/replay 集成测试：HTTP/1.x、SSE、unknown protocol、gap marker、policy verdict、export ack。
 - 特权 eBPF smoke/e2e：Linux 环境下验证 syscall/tracepoint、libssl uprobe、pcap fallback。
+
+当前已验证的特权 fallback smoke：在 WSL2 root 环境下，`sudo target/debug/agent capabilities` 显示 `libpcap` available；使用本机 `127.0.0.1:18080` HTTP server、`capture.selection = "libpcap"`、`capture.libpcap.interface = "any"`、`bpf_filter = "tcp port 18080"` 和 `run --max-events 1`，agent 成功读取 1 个 libpcap capture event、写入 1 条 ingress chunk 和 1 条 export event。普通用户下 `libpcap` 因缺少 raw socket 权限 unavailable，这是预期权限差异。
 
 V1 端到端验收：
 
@@ -1151,5 +1153,5 @@ enforcement 抽象验收：
 | workspace | 短名 crate，使用 xtask 管 eBPF 构建 | 第 27 节 |
 | runtime | 热路径同步，IO 异步，Tokio + 专用热路径线程 | 第 27 节 |
 | 依赖 | 使用当前稳定 crate，不限制 0.x，但通过 trait/adapter 隔离 | 第 27 节 |
-| CLI | run/check/replay/capabilities | 第 30 节 |
+| CLI | run/check/replay/capabilities；`run --max-events` 支持有界 live smoke | 第 30 节 |
 | 验收 | HTTP/SSE demo、libssl TLS demo、pcap fallback、dry-run enforcement | 第 31 节 |

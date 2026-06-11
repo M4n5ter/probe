@@ -27,8 +27,27 @@ pub enum PipelineError {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PipelineSummary {
+    pub capture_events: u64,
     pub ingress_chunks: u64,
     pub export_events: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineRunOptions {
+    pub max_events: Option<u64>,
+}
+
+impl PipelineRunOptions {
+    pub fn max_events(max_events: u64) -> Self {
+        Self {
+            max_events: Some(max_events),
+        }
+    }
+
+    fn should_read_next_event(self, events_read: u64) -> bool {
+        self.max_events
+            .is_none_or(|max_events| events_read < max_events)
+    }
 }
 
 pub struct CapturePipeline<'a, S> {
@@ -72,8 +91,20 @@ where
         &mut self,
         provider: &mut dyn CaptureProvider,
     ) -> Result<PipelineSummary, PipelineError> {
+        self.run_provider_with_options(provider, PipelineRunOptions::default())
+    }
+
+    pub fn run_provider_with_options(
+        &mut self,
+        provider: &mut dyn CaptureProvider,
+        options: PipelineRunOptions,
+    ) -> Result<PipelineSummary, PipelineError> {
         let mut summary = PipelineSummary::default();
-        while let Some(capture_event) = provider.next()? {
+        while options.should_read_next_event(summary.capture_events) {
+            let Some(capture_event) = provider.next()? else {
+                break;
+            };
+            summary.capture_events = summary.capture_events.saturating_add(1);
             self.handle_capture_event(capture_event, &mut summary)?;
         }
         Ok(summary)
@@ -512,6 +543,53 @@ end
     }
 
     #[test]
+    fn run_provider_with_options_stops_after_max_capture_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = storage::FjallSpool::open(temp.path())?;
+        let mut parser_factory = Http1ParserFactory::default();
+        let mut provider = SequenceProvider::new(vec![
+            captured_bytes(
+                demo_flow_with_ports(50_000, 80, 10),
+                b"GET /one HTTP/1.1\r\nHost: one.test\r\n\r\n",
+            ),
+            captured_bytes(
+                demo_flow_with_ports(50_001, 80, 11),
+                b"GET /two HTTP/1.1\r\nHost: two.test\r\n\r\n",
+            ),
+        ]);
+        let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+
+        let summary =
+            pipeline.run_provider_with_options(&mut provider, PipelineRunOptions::max_events(1))?;
+
+        assert_eq!(summary.capture_events, 1);
+        assert_eq!(summary.ingress_chunks, 1);
+        assert_eq!(spool.read_ingress_batch("debug", 10)?.len(), 1);
+        assert_eq!(spool.read_export_batch("sink", 10)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn run_provider_with_zero_max_events_does_not_read_provider()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = storage::FjallSpool::open(temp.path())?;
+        let mut parser_factory = Http1ParserFactory::default();
+        let mut provider = UnreadableProvider;
+        let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+
+        let summary =
+            pipeline.run_provider_with_options(&mut provider, PipelineRunOptions::max_events(0))?;
+
+        assert_eq!(summary.capture_events, 0);
+        assert_eq!(summary.ingress_chunks, 0);
+        assert!(spool.read_ingress_batch("debug", 10)?.is_empty());
+        assert!(spool.read_export_batch("sink", 10)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn live_pipeline_parses_process_inbound_request_as_request()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
@@ -580,6 +658,33 @@ end
 
         fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
             Ok(self.events.next())
+        }
+    }
+
+    struct UnreadableProvider;
+
+    impl CaptureProvider for UnreadableProvider {
+        fn name(&self) -> &'static str {
+            "unreadable"
+        }
+
+        fn kind(&self) -> CaptureProviderKind {
+            CaptureProviderKind::Replay
+        }
+
+        fn source(&self) -> CaptureSource {
+            CaptureSource::Replay
+        }
+
+        fn capabilities(&self) -> Vec<CapabilityState> {
+            Vec::new()
+        }
+
+        fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+            Err(CaptureError::provider(
+                "unreadable",
+                "provider.next must not be called when max_events is zero",
+            ))
         }
     }
 

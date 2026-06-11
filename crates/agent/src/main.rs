@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use enforcement::ScopedEnforcementPlanner;
 use exporter::{CompressionCodec, ReliableExporter, WebhookExporter};
 use parsers::Http1ParserFactory;
-use pipeline::CapturePipeline;
+use pipeline::{CapturePipeline, PipelineRunOptions};
 use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
 use probe_config::{AgentConfig, CaptureBackend};
 use probe_core::{
@@ -73,6 +73,8 @@ enum Command {
     Run {
         #[arg(long)]
         config: Option<PathBuf>,
+        #[arg(long)]
+        max_events: Option<u64>,
     },
     Check {
         #[arg(long)]
@@ -172,7 +174,7 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), AgentError> {
     match cli.command {
-        Command::Run { config } => {
+        Command::Run { config, max_events } => {
             let plan = read_runtime_plan_or_default(config.as_ref())?;
             let mut provider = build_live_capture_provider(&plan)?;
             let mut parser_factory = Http1ParserFactory::default();
@@ -195,10 +197,11 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 plan.capture.mode,
                 plan.capture.selected_backend
             );
-            let summary = pipeline.run_provider(provider.as_mut())?;
+            let summary = pipeline
+                .run_provider_with_options(provider.as_mut(), PipelineRunOptions { max_events })?;
             println!(
-                "agent stopped after journaling {} capture chunks and storing {} export events",
-                summary.ingress_chunks, summary.export_events
+                "agent stopped after reading {} capture events, journaling {} capture chunks, and storing {} export events",
+                summary.capture_events, summary.ingress_chunks, summary.export_events
             );
         }
         Command::Check { config } => {
