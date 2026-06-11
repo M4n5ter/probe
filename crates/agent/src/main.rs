@@ -1,5 +1,6 @@
 use std::{
     path::PathBuf,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -13,7 +14,7 @@ use capture::{
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use enforcement::ScopedEnforcementPlanner;
-use export::{drain_configured_sinks, drain_replay_webhook};
+use export::{drain_configured_sinks, drain_replay_webhook, spawn_configured_export_worker};
 use exporter::CompressionCodec;
 use parsers::Http1ParserFactory;
 use pipeline::{CapturePipeline, PipelineRunOptions};
@@ -181,11 +182,13 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let plan = read_runtime_plan_or_default(config.as_ref())?;
             let mut provider = build_capture_provider(&plan)?;
             let mut parser_factory = Http1ParserFactory::default();
-            let spool = FjallSpool::open(&plan.config.storage.path)?;
+            let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
             let policy = read_configured_policy(&plan.config)?;
             let mut enforcement_planner = build_configured_enforcement_planner(&plan.config)?;
+            let export_worker =
+                spawn_configured_export_worker(Arc::clone(&spool), plan.config.clone());
             let mut pipeline = CapturePipeline::new(
-                &spool,
+                spool.as_ref(),
                 &mut parser_factory,
                 policy.as_ref(),
                 plan.config.config_version.clone(),
@@ -200,13 +203,25 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 plan.capture.mode,
                 plan.capture.selected_backend
             );
-            let summary = pipeline
-                .run_provider_with_options(provider.as_mut(), PipelineRunOptions { max_events })?;
+            let summary_result = pipeline
+                .run_provider_with_options(provider.as_mut(), PipelineRunOptions { max_events });
+            if let Some(worker) = export_worker {
+                worker.stop().await;
+            }
+            let drain_result = drain_configured_sinks(spool.as_ref(), &plan.config).await;
+            let summary = match (summary_result, drain_result) {
+                (Ok(summary), Ok(())) => summary,
+                (Err(error), Ok(())) => return Err(error.into()),
+                (Ok(_), Err(error)) => return Err(error.into()),
+                (Err(pipeline_error), Err(export_error)) => {
+                    eprintln!("tail export drain failed after pipeline error: {export_error}");
+                    return Err(pipeline_error.into());
+                }
+            };
             println!(
                 "agent stopped after reading {} capture events, journaling {} capture chunks, and storing {} export events",
                 summary.capture_events, summary.ingress_chunks, summary.export_events
             );
-            drain_configured_sinks(&spool, &plan.config).await?;
         }
         Command::Check { config } => {
             let plan = read_runtime_plan(&config)?;

@@ -196,13 +196,20 @@ impl FjallSpool {
         consumer: &str,
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let cursor = self.cursor_for_lane(lane, consumer)?;
         let start = cursor.saturating_add(1);
+        let durable_last_sequence = *self.lock_last_sequence(lane)?;
         let mut events = Vec::new();
 
         for item in self.queue(lane).range(sequence_key(start)..) {
             let (key, value) = item.into_inner()?;
             let sequence = decode_sequence_key(key.as_ref());
+            if sequence > durable_last_sequence {
+                break;
+            }
             events.push(StoredEvent {
                 sequence,
                 payload: decode_spool_payload(value.as_ref())?,
@@ -415,7 +422,7 @@ fn decode_spool_payload(bytes: &[u8]) -> Result<SpoolPayload, StorageError> {
 mod tests {
     use tempfile::tempdir;
 
-    use crate::{FjallSpool, SpoolPayload};
+    use crate::{FjallSpool, SpoolPayload, encode_spool_payload, sequence_key};
 
     #[test]
     fn spool_tracks_per_sink_cursors() -> Result<(), Box<dyn std::error::Error>> {
@@ -511,6 +518,35 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(spool.export_cursor("primary")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn read_batch_ignores_queue_entries_above_durable_high_water()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        let payload = test_payload(b"not-yet-durable");
+        let mut batch = spool.database.batch();
+        batch.insert(
+            &spool.export_queue,
+            sequence_key(1),
+            encode_spool_payload(&payload)?,
+        );
+        batch.commit()?;
+
+        assert!(spool.read_export_batch("primary", 10)?.is_empty());
+        assert!(spool.ack_export("primary", 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn read_batch_with_zero_limit_returns_no_events() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        spool.append_export(test_payload(b"one"))?;
+
+        assert!(spool.read_export_batch("primary", 0)?.is_empty());
         Ok(())
     }
 

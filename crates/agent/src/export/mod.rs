@@ -1,12 +1,17 @@
-use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use exporter::{CompressionCodec, ReliableExporter, WebhookExporter};
 use probe_config::{AgentConfig, CompressionCodecName, ExporterConfig, ExporterTransport};
 use proto::{BatchEnvelope, EVENT_ENVELOPE_JSON_SCHEMA};
 use storage::DurableSpool;
 use thiserror::Error;
+use tokio::sync::Notify;
 
 const EXPORT_BATCH_LIMIT: usize = 1024;
+const EXPORT_WORKER_BATCHES_PER_SINK_PER_TICK: u64 = 1;
+const EXPORT_WORKER_SINK_TIMEOUT: Duration = Duration::from_secs(10);
+const EXPORT_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLAY_WEBHOOK_SINK: &str = "replay-webhook";
 
 #[derive(Debug, Error)]
@@ -23,16 +28,106 @@ pub enum ExportDrainError {
     MultipleSinksFailed { failures: String },
     #[error("unsupported spooled payload schema at sequence {sequence}: {schema}")]
     UnsupportedSpoolPayloadSchema { sequence: u64, schema: String },
+    #[error("exporter sink {sink} timed out after {timeout_ms} ms")]
+    SinkTimedOut { sink: String, timeout_ms: u64 },
+}
+
+pub struct ExportWorkerHandle {
+    stop_requested: Arc<AtomicBool>,
+    stop_notify: Arc<Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ExportWorkerHandle {
+    pub async fn stop(mut self) {
+        self.stop_requested.store(true, Ordering::Relaxed);
+        self.stop_notify.notify_one();
+        match tokio::time::timeout(EXPORT_WORKER_SHUTDOWN_TIMEOUT, &mut self.task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if !error.is_cancelled() => {
+                eprintln!("export worker stopped with error: {error}");
+            }
+            Ok(Err(_)) => {}
+            Err(_) => {
+                self.task.abort();
+                if let Err(error) = self.task.await
+                    && !error.is_cancelled()
+                {
+                    eprintln!("export worker stopped with error: {error}");
+                }
+            }
+        }
+    }
+}
+
+pub fn spawn_configured_export_worker<S>(
+    spool: Arc<S>,
+    config: AgentConfig,
+) -> Option<ExportWorkerHandle>
+where
+    S: DurableSpool + Send + Sync + 'static,
+{
+    if !config.export.worker_enabled || config.exporters.is_empty() {
+        return None;
+    }
+
+    let interval = Duration::from_millis(config.export.worker_interval_ms);
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let stop_notify = Arc::new(Notify::new());
+    let task_stop_requested = Arc::clone(&stop_requested);
+    let task_stop_notify = Arc::clone(&stop_notify);
+    let task = tokio::spawn(async move {
+        while !task_stop_requested.load(Ordering::Relaxed) {
+            if let Err(error) = drain_configured_sinks_once(spool.as_ref(), &config).await {
+                eprintln!("export worker drain failed: {error}");
+            }
+            if task_stop_requested.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = task_stop_notify.notified() => {}
+            }
+        }
+    });
+    Some(ExportWorkerHandle {
+        stop_requested,
+        stop_notify,
+        task,
+    })
 }
 
 pub async fn drain_configured_sinks(
     spool: &impl DurableSpool,
     config: &AgentConfig,
 ) -> Result<(), ExportDrainError> {
+    drain_configured_sinks_with_mode(spool, config, SinkDrainMode::UntilEmpty).await
+}
+
+async fn drain_configured_sinks_once(
+    spool: &impl DurableSpool,
+    config: &AgentConfig,
+) -> Result<(), ExportDrainError> {
+    drain_configured_sinks_with_mode(
+        spool,
+        config,
+        SinkDrainMode::MaxBatches {
+            max_batches: EXPORT_WORKER_BATCHES_PER_SINK_PER_TICK,
+            sink_timeout: EXPORT_WORKER_SINK_TIMEOUT,
+        },
+    )
+    .await
+}
+
+async fn drain_configured_sinks_with_mode(
+    spool: &impl DurableSpool,
+    config: &AgentConfig,
+    mode: SinkDrainMode,
+) -> Result<(), ExportDrainError> {
     let mut failures = Vec::new();
     for exporter in &config.exporters {
         let result = match webhook_export_target_from_config(exporter) {
-            Ok(target) => drain_webhook_sink(spool, &config.agent_id, target).await,
+            Ok(target) => drain_webhook_sink_with_mode(spool, &config.agent_id, target, mode).await,
             Err(error) => Err(error),
         };
         if let Err(error) = result {
@@ -49,6 +144,31 @@ pub async fn drain_configured_sinks(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SinkDrainMode {
+    UntilEmpty,
+    MaxBatches {
+        max_batches: u64,
+        sink_timeout: Duration,
+    },
+}
+
+impl SinkDrainMode {
+    fn can_continue_after(self, batches: u64) -> bool {
+        match self {
+            Self::UntilEmpty => true,
+            Self::MaxBatches { max_batches, .. } => batches < max_batches,
+        }
+    }
+
+    fn sink_timeout(self) -> Option<Duration> {
+        match self {
+            Self::UntilEmpty => None,
+            Self::MaxBatches { sink_timeout, .. } => Some(sink_timeout),
+        }
+    }
+}
+
 pub async fn drain_replay_webhook(
     spool: &impl DurableSpool,
     agent_id: &str,
@@ -59,6 +179,7 @@ pub async fn drain_replay_webhook(
         spool,
         agent_id,
         WebhookExportTarget::replay(endpoint, codec),
+        SinkDrainMode::UntilEmpty,
     )
     .await
 }
@@ -119,10 +240,34 @@ struct ExportDrainSummary {
     committed_cursor: Option<u64>,
 }
 
+async fn drain_webhook_sink_with_mode(
+    spool: &impl DurableSpool,
+    agent_id: &str,
+    target: WebhookExportTarget,
+    mode: SinkDrainMode,
+) -> Result<(), ExportDrainError> {
+    let sink = target.sink.clone();
+    match mode.sink_timeout() {
+        Some(timeout) => {
+            match tokio::time::timeout(timeout, drain_webhook_sink(spool, agent_id, target, mode))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(ExportDrainError::SinkTimedOut {
+                    sink,
+                    timeout_ms: duration_millis(timeout),
+                }),
+            }
+        }
+        None => drain_webhook_sink(spool, agent_id, target, mode).await,
+    }
+}
+
 async fn drain_webhook_sink(
     spool: &impl DurableSpool,
     agent_id: &str,
     target: WebhookExportTarget,
+    mode: SinkDrainMode,
 ) -> Result<(), ExportDrainError> {
     let WebhookExportTarget {
         sink,
@@ -131,7 +276,7 @@ async fn drain_webhook_sink(
         headers,
     } = target;
     let exporter = WebhookExporter::with_headers(endpoint, codec, headers)?;
-    drain_export_sink(spool, agent_id, &sink, codec, &exporter)
+    drain_export_sink(spool, agent_id, &sink, codec, mode, &exporter)
         .await
         .map(|_| ())
 }
@@ -141,6 +286,7 @@ async fn drain_export_sink(
     agent_id: &str,
     sink: &str,
     codec: CompressionCodec,
+    mode: SinkDrainMode,
     exporter: &(impl ReliableExporter + ?Sized),
 ) -> Result<ExportDrainSummary, ExportDrainError> {
     let mut summary = ExportDrainSummary {
@@ -151,9 +297,6 @@ async fn drain_export_sink(
     loop {
         let events = spool.read_export_batch(sink, EXPORT_BATCH_LIMIT)?;
         let Some(last_sequence) = events.last().map(|event| event.sequence) else {
-            if summary.batches == 0 {
-                println!("no spooled events to export for sink {sink}");
-            }
             return Ok(summary);
         };
         for event in &events {
@@ -192,7 +335,14 @@ async fn drain_export_sink(
             "exported sink {sink} batch {} and committed cursor {cursor}",
             ack.batch_id
         );
+        if !mode.can_continue_after(summary.batches) {
+            return Ok(summary);
+        }
     }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn contiguous_cursor_from_event_ids(
@@ -224,9 +374,10 @@ mod tests {
         path::PathBuf,
         sync::{Arc, Mutex},
         thread,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
+    use probe_config::ExportRuntimeConfig;
     use probe_core::{
         AddressPort, CaptureSource, EventEnvelope, EventKind, FlowContext, FlowIdentity,
         ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
@@ -303,6 +454,55 @@ mod tests {
             Some("agent-1:successful:1")
         );
         let _ = failing.join()?;
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn configured_export_worker_drains_until_stopped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("configured-export-worker");
+        let spool = Arc::new(FjallSpool::open(&temp)?);
+        append_export_event(spool.as_ref(), 1)?;
+        let server = TestWebhookServer::spawn_accepting(true, 2)?;
+        let config = AgentConfig {
+            agent_id: "agent-1".to_string(),
+            export: ExportRuntimeConfig {
+                worker_enabled: true,
+                worker_interval_ms: 10,
+            },
+            exporters: vec![ExporterConfig {
+                id: "worker".to_string(),
+                transport: ExporterTransport::Webhook,
+                endpoint: server.endpoint(),
+                codec: CompressionCodecName::None,
+                headers: BTreeMap::new(),
+            }],
+            ..AgentConfig::default()
+        };
+        config.validate_basic()?;
+
+        let worker = spawn_configured_export_worker(Arc::clone(&spool), config)
+            .expect("enabled exporter config should spawn a worker");
+        wait_for_export_cursor(spool.as_ref(), "worker", 1).await?;
+        append_export_event(spool.as_ref(), 2)?;
+        wait_for_export_cursor(spool.as_ref(), "worker", 2).await?;
+        worker.stop().await;
+
+        let requests = server.join_requests()?;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            request_header(&requests[0], "x-sssa-codec").as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            request_header(&requests[0], "idempotency-key").as_deref(),
+            Some("agent-1:worker:1")
+        );
+        assert_eq!(
+            request_header(&requests[1], "idempotency-key").as_deref(),
+            Some("agent-1:worker:2")
+        );
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -411,66 +611,96 @@ mod tests {
         std::env::temp_dir().join(format!("sssa-probe-{name}-{}-{nanos}", std::process::id()))
     }
 
+    async fn wait_for_export_cursor(
+        spool: &FjallSpool,
+        sink: &str,
+        expected_cursor: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..50 {
+            let cursor = spool.export_cursor(sink)?;
+            if cursor >= expected_cursor {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Err(format!(
+            "export cursor for sink {sink} did not reach {expected_cursor}; current cursor is {}",
+            spool.export_cursor(sink)?
+        )
+        .into())
+    }
+
     struct TestWebhookServer {
         endpoint: String,
-        request: Arc<Mutex<Option<String>>>,
+        requests: Arc<Mutex<Vec<String>>>,
         handle: thread::JoinHandle<Result<(), String>>,
     }
 
     impl TestWebhookServer {
         fn spawn(accepted: bool) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::spawn_accepting(accepted, 1)
+        }
+
+        fn spawn_accepting(
+            accepted: bool,
+            request_count: usize,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let listener = TcpListener::bind("127.0.0.1:0")?;
             let endpoint = format!("http://{}/batches", listener.local_addr()?);
-            let request = Arc::new(Mutex::new(None));
-            let request_for_thread = Arc::clone(&request);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let requests_for_thread = Arc::clone(&requests);
             let handle = thread::spawn(move || {
-                let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
-                let mut bytes = Vec::new();
-                loop {
-                    let mut buffer = [0; 1024];
-                    let read = stream
-                        .read(&mut buffer)
+                for _ in 0..request_count {
+                    let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut buffer = [0; 1024];
+                        let read = stream
+                            .read(&mut buffer)
+                            .map_err(|error| error.to_string())?;
+                        if read == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&buffer[..read]);
+                        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request_text = String::from_utf8_lossy(&bytes).into_owned();
+                    let batch_id = request_header(&request_text, "idempotency-key")
+                        .unwrap_or_else(|| "missing-batch".to_string());
+                    let acked_cursor = accepted.then(|| cursor_from_batch_id(&batch_id));
+                    let body = serde_json::json!({
+                        "batch_id": batch_id,
+                        "accepted": accepted,
+                        "acked_cursor": acked_cursor,
+                        "acked_event_ids": [],
+                        "retryable_event_ids": [],
+                        "reason": if accepted { None::<String> } else { Some("failed".to_string()) },
+                    })
+                    .to_string();
+                    let status = if accepted {
+                        "200 OK"
+                    } else {
+                        "500 Internal Server Error"
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
                         .map_err(|error| error.to_string())?;
-                    if read == 0 {
-                        break;
-                    }
-                    bytes.extend_from_slice(&buffer[..read]);
-                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
+                    requests_for_thread
+                        .lock()
+                        .map_err(|_| "request lock poisoned".to_string())?
+                        .push(request_text);
                 }
-                let request_text = String::from_utf8_lossy(&bytes).into_owned();
-                let batch_id = request_header(&request_text, "idempotency-key")
-                    .unwrap_or_else(|| "missing-batch".to_string());
-                let body = serde_json::json!({
-                    "batch_id": batch_id,
-                    "accepted": accepted,
-                    "acked_cursor": if accepted { Some(1_u64) } else { None },
-                    "acked_event_ids": [],
-                    "retryable_event_ids": [],
-                    "reason": if accepted { None::<String> } else { Some("failed".to_string()) },
-                })
-                .to_string();
-                let status = if accepted {
-                    "200 OK"
-                } else {
-                    "500 Internal Server Error"
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream
-                    .write_all(response.as_bytes())
-                    .map_err(|error| error.to_string())?;
-                *request_for_thread
-                    .lock()
-                    .map_err(|_| "request lock poisoned".to_string())? = Some(request_text);
                 Ok(())
             });
             Ok(Self {
                 endpoint,
-                request,
+                requests,
                 handle,
             })
         }
@@ -480,16 +710,41 @@ mod tests {
         }
 
         fn join(self) -> Result<String, Box<dyn std::error::Error>> {
+            let mut requests = self.join_requests()?;
+            if requests.len() != 1 {
+                return Err(format!(
+                    "webhook server captured {} requests; expected 1",
+                    requests.len()
+                )
+                .into());
+            }
+            Ok(requests.remove(0))
+        }
+
+        fn join_requests(self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
             self.handle
                 .join()
                 .map_err(|_| "webhook server thread panicked")?
                 .map_err(|error| format!("webhook server failed: {error}"))?;
-            self.request
+            let requests = self
+                .requests
                 .lock()
                 .map_err(|_| "request lock poisoned")?
-                .clone()
-                .ok_or_else(|| "webhook server did not capture a request".into())
+                .clone();
+            if requests.is_empty() {
+                Err("webhook server did not capture a request".into())
+            } else {
+                Ok(requests)
+            }
         }
+    }
+
+    fn cursor_from_batch_id(batch_id: &str) -> u64 {
+        batch_id
+            .rsplit(':')
+            .next()
+            .and_then(|sequence| sequence.parse().ok())
+            .unwrap_or(0)
     }
 
     fn request_header(request: &str, name: &str) -> Option<String> {

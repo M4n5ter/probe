@@ -463,7 +463,7 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::degraded(
             CapabilityKind::WebhookExporter,
-            "webhook transport can drain configured export queues after run/replay, but continuous exporter workers are not implemented",
+            "webhook transport can drain configured export queues during run and replay CLI webhook output during replay, but retry/backoff, per-sink quota, and retention deadline are not implemented",
         ),
         CapabilityState::available(
             CapabilityKind::DryRunEnforcement,

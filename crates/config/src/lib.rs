@@ -25,6 +25,7 @@ pub struct AgentConfig {
     pub config_version: String,
     pub capture: CaptureConfig,
     pub storage: StorageConfig,
+    pub export: ExportRuntimeConfig,
     pub exporters: Vec<ExporterConfig>,
     pub policies: Vec<PolicyConfig>,
     pub tls: TlsConfig,
@@ -41,6 +42,7 @@ impl AgentConfig {
 
         validate_capture(&self.capture, &mut violations);
         validate_tls(&self.tls, &self.capture, &mut violations);
+        validate_export_runtime(&self.export, &mut violations);
         validate_exporters(&self.exporters, &mut violations);
         validate_policies(&self.policies, &mut violations);
 
@@ -59,6 +61,7 @@ impl Default for AgentConfig {
             config_version: "local".to_string(),
             capture: CaptureConfig::default(),
             storage: StorageConfig::default(),
+            export: ExportRuntimeConfig::default(),
             exporters: Vec::new(),
             policies: Vec::new(),
             tls: TlsConfig::default(),
@@ -182,6 +185,22 @@ impl Default for StorageConfig {
             path: PathBuf::from("/var/lib/sssa-probe/spool"),
             ingress_retention_bytes: None,
             export_retention_bytes: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExportRuntimeConfig {
+    pub worker_enabled: bool,
+    pub worker_interval_ms: u64,
+}
+
+impl Default for ExportRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            worker_enabled: true,
+            worker_interval_ms: 1_000,
         }
     }
 }
@@ -451,6 +470,16 @@ fn validate_plaintext_feed_selection(tls: &TlsConfig, violations: &mut Vec<Confi
     });
 }
 
+fn validate_export_runtime(export: &ExportRuntimeConfig, violations: &mut Vec<ConfigViolation>) {
+    if export.worker_enabled && export.worker_interval_ms == 0 {
+        violations.push(ConfigViolation {
+            field: "export.worker_interval_ms".to_string(),
+            reason: "export worker interval must be positive when the worker is enabled"
+                .to_string(),
+        });
+    }
+}
+
 fn validate_exporters(exporters: &[ExporterConfig], violations: &mut Vec<ConfigViolation>) {
     let mut ids = HashSet::new();
     for exporter in exporters {
@@ -578,6 +607,8 @@ mod tests {
         assert!(!config.capture.libpcap.promisc);
         assert!(config.capture.libpcap.immediate_mode);
         assert_eq!(config.capture.libpcap.read_timeout_ms, 1_000);
+        assert!(config.export.worker_enabled);
+        assert_eq!(config.export.worker_interval_ms, 1_000);
         assert_eq!(config.exporters, Vec::<ExporterConfig>::new());
         assert_eq!(config.enforcement.mode, EnforcementMode::AuditOnly);
         config.validate_basic()?;
@@ -607,6 +638,10 @@ buffer_size = 1048576
 [storage]
 path = "/tmp/sssa-spool"
 ingress_retention_bytes = 1048576
+
+[export]
+worker_enabled = true
+worker_interval_ms = 250
 
 [[exporters]]
 id = "primary"
@@ -639,6 +674,8 @@ mode = "dry_run"
         assert_eq!(config.capture.libpcap.read_timeout_ms, 250);
         assert_eq!(config.capture.libpcap.buffer_size, Some(1_048_576));
         assert_eq!(config.storage.path, PathBuf::from("/tmp/sssa-spool"));
+        assert!(config.export.worker_enabled);
+        assert_eq!(config.export.worker_interval_ms, 250);
         assert_eq!(config.exporters[0].codec, CompressionCodecName::Zstd);
         assert_eq!(config.tls.materials[0].kind, TlsMaterialKind::TrustAnchor);
         assert!(config.tls.plaintext.enabled);
@@ -776,6 +813,37 @@ provider = "libssl_uprobe"
             .validate_basic()
             .expect_err("plaintext feed selection must not also enable TLS instrumentation");
         assert!(error.to_string().contains("tls.plaintext.enabled"));
+        Ok(())
+    }
+
+    #[test]
+    fn validation_rejects_zero_enabled_export_worker_interval()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let enabled = AgentConfig::from_toml_str(
+            r#"
+[export]
+worker_enabled = true
+worker_interval_ms = 0
+"#,
+        )?;
+
+        let error = enabled
+            .validate_basic()
+            .expect_err("enabled export worker must have a positive interval");
+        assert!(
+            error
+                .to_string()
+                .contains("export worker interval must be positive")
+        );
+
+        let disabled = AgentConfig::from_toml_str(
+            r#"
+[export]
+worker_enabled = false
+worker_interval_ms = 0
+"#,
+        )?;
+        disabled.validate_basic()?;
         Ok(())
     }
 

@@ -11,7 +11,7 @@
 - 可扩展协议解析：首要支持 HTTP/1.x 和 SSE，后续自然扩展 WebSocket、HTTP/2、HTTP/3 等协议。
 - 策略驱动的检测与防护：V1 先支持观测、告警和 dry-run verdict，后续接入真实拦截执行。
 
-本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、可选压缩 codec 和 HTTP webhook exporter。`run` 与 `replay` 已可按配置/CLI drain export queue 到 webhook sink。已定义 capture provider、procfs process attribution、runtime config、runtime planning 和 dry-run enforcement 的第一版边界，并开始接入真实 libpcap fallback 和外部明文 feed provider。尚未实现 eBPF 主路径、TLS uprobe provider、keylog/session 解密 provider、真实 enforcement、TCP 重组、强进程归因和连续后台 exporter worker。
+本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、可选压缩 codec 和 HTTP webhook exporter。`run` 已可按配置启动连续后台 exporter worker 并在退出前做尾部 drain，`replay` 可通过 CLI drain 到独立 webhook sink。已定义 capture provider、procfs process attribution、runtime config、runtime planning 和 dry-run enforcement 的第一版边界，并开始接入真实 libpcap fallback 和外部明文 feed provider。尚未实现 eBPF 主路径、TLS uprobe provider、keylog/session 解密 provider、真实 enforcement、TCP 重组、强进程归因和完整 exporter retry/backoff/quota 调度。
 
 ## 2. 核心 thesis
 
@@ -76,13 +76,13 @@ V1 明确不做：
 - 已实现 `probe-core` 的 `TcpEndpoint`/`TcpConnection` 共享模型，供 capture provider、procfs attribution 和后续 eBPF/socket attribution 复用，避免各层用字符串 endpoint 重复建模。
 - 已实现 `capture` crate 的 `CaptureProvider` 抽象、`ReplayProvider`、`PlaintextFeedProvider` 和基础 `LibpcapProvider`。`PlaintextFeedProvider` 接收外部已解密明文 feed event，输出 `ExternalPlaintextFeed` source 的 `CapturedBytes`/gap/connection lifecycle event，用于把 libssl uprobe、keylog/session decrypt、SDK feed 或 future MITM 等后续 provider 接入同一 pipeline；它本身不执行 TLS 解密。libpcap provider 可打开设备、安装 BPF filter、解析 Ethernet/Linux cooked/raw IPv4 TCP segment，接收可插拔 process resolver，并输出 degraded `CapturedBytes`。flow table 会用 SYN reuse、RST、双向 FIN、idle timeout 和容量淘汰清理 4-tuple 缓存；单向 FIN 只标记半关闭，避免把仍在发送的另一方向拆成新 flow；清理 flow 时会发出 `ConnectionClosed`，让 pipeline 释放 parser state。若同一 segment 同时携带 payload 和关闭信号，payload 事件先进入 parser，随后才发 close。它当前不做 TCP 重组、IPv6 或 gap 修复。
 - 已实现 `attribution` crate 的 `ProcfsAttributor` 和 `ProcfsSocketResolver`；前者可从 `/proc/<pid>` 读取进程身份、cmdline hash、starttime、uid/gid、cgroup、systemd service 与 container hint，后者可通过 `/proc/net/tcp` socket inode 和 `/proc/<pid>/fd` best-effort 反查 TCP 连接所属进程。agent 注入的 procfs resolver 使用短 TTL socket snapshot，避免同一批新连接重复全量扫描 `/proc/<pid>/fd`；libpcap provider 在 TCP 生命周期信号、idle eviction、capacity eviction 和端口复用关闭旧 flow 后会使 snapshot 失效，降低拿到旧进程身份的风险。resolver 错误会进入 capture degradation reason，不再静默伪装成未匹配；但单个 PID 的 fd race 或权限拒绝属于 best-effort skip，不让整批 socket snapshot 失败。replay flow 默认使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence，避免把文件输入误归因到 agent 进程。
-- 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、provider-specific nested config、storage、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，基础字段校验会拒绝 ambiguous external plaintext feed 配置：当前 external plaintext feed 的 source path 归 `capture.plaintext_feed.path` 所有，不能塞进 TLS material/provider 配置。
+- 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、provider-specific nested config、storage、export runtime worker、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，基础字段校验会拒绝 ambiguous external plaintext feed 配置：当前 external plaintext feed 的 source path 归 `capture.plaintext_feed.path` 所有，不能塞进 TLS material/provider 配置。
 - 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；`plaintext_feed` 是独立 plan mode，不伪装成 replay 或 live capture；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
-- 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；pipeline 支持可选 `max_events` 运行边界，便于对真实 live provider 做有界 smoke。`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合和 exporter 命令。
+- 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；pipeline 支持可选 `max_events` 运行边界，便于对真实 live provider 做有界 smoke。`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合、连续 exporter worker 和 replay exporter 命令。
 - 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。parser 已识别 WebSocket HTTP Upgrade，输出 `WebSocketHandoff` 后把后续字节转为 opaque stream；它不解析 WebSocket frame/message。
-- 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF、libssl uprobe/keylog TLS 解密和真实 enforcement 相关能力仍必须标记 unavailable；`external_plaintext_feed`、HTTP/1、SSE、WebSocket handoff、dry-run enforcement 是可用能力。dry-run enforcement 记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 或 plaintext feed 作为 live provider；`run` 在无 live capture provider 时 fail closed，显式 `plaintext_feed` 会从 JSON-lines feed path 读取已解密明文 event 并接入 replay 共用的 pipeline；`check` 用于查看 resolved plan。
+- 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF、libssl uprobe/keylog TLS 解密和真实 enforcement 相关能力仍必须标记 unavailable；`external_plaintext_feed`、HTTP/1、SSE、WebSocket handoff、dry-run enforcement 是可用能力。webhook exporter 已可在 `run` 中连续 drain configured sinks，但 retry/backoff、per-sink quota 和 retention deadline 尚未实现，因此仍标记 degraded。dry-run enforcement 记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 或 plaintext feed 作为 live provider；`run` 在无 live capture provider 时 fail closed，显式 `plaintext_feed` 会从 JSON-lines feed path 读取已解密明文 event 并接入 replay 共用的 pipeline；`check` 用于查看 resolved plan。
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
-- 当前 `FjallSpool` 存储的是带 schema 的 `SpoolPayload`；ingress lane 当前写入 JSON framed `CapturedBytes`，export lane 当前写入 JSON framed `EventEnvelope`。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
+- 当前 `FjallSpool` 存储的是带 schema 的 `SpoolPayload`；ingress lane 当前写入 JSON framed `CapturedBytes`，export lane 当前写入 JSON framed `EventEnvelope`。reader 只返回已越过 lane durable high-water sequence 的条目，避免并发 exporter 读到已 commit 但尚未 `SyncAll` 持久化完成的事件。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
 
 ## 5. 部署与平台
 
@@ -649,6 +649,12 @@ V1 执行语义：
 - libpcap 运行参数放在 `[capture.libpcap]` 下，包括 `interface`、`bpf_filter`、`snaplen`、`promisc`、`immediate_mode`、`read_timeout_ms` 和 `buffer_size`；这些属于 provider 配置，不进入 parser 或 policy 层。
 - `RuntimePlan` 是配置解析后的事实源，必须输出候选 provider、选中的 provider、capability matrix 和不可用原因；`run` 使用 plan 启动，`check` 输出 plan 供部署前审计。
 
+当前 export runtime 配置语义：
+
+- `[export] worker_enabled = true` 是默认行为；只有存在 configured exporters 时，`run` 才会启动后台 exporter worker。
+- `[export] worker_interval_ms` 控制 worker 两轮有界 drain 之间的固定间隔；worker 开启时该值必须大于 0。当前每轮对每个 sink 最多发送一个 batch，并对单个 worker sink drain 使用固定 timeout，避免把 live worker 变成无界 tail flush 或被单个挂起 sink 永久卡住；这仍不等同于未来的 retry/backoff、per-sink quota 或 retention deadline。
+- `run` 结束时仍会尽力执行一次尾部 drain，使 `--max-events` smoke、plaintext feed 和其它有限运行场景能够把最后一批事件同步推出；即使 pipeline 已返回错误，也会先停止 worker 并尝试 tail drain，再按错误优先级返回。
+
 配置/策略签名：
 
 - V1 预留 verifier trait。
@@ -791,11 +797,12 @@ V1 的 HTTP(S) exporter 是 webhook 风格，但必须定义协议语义。
 - `acked_cursor` 如果存在，必须落在当前 batch 的 sequence 范围内。
 - 如果 ack 只返回 event ids，agent 只在这些 ids 构成当前 batch 的连续前缀时推进 cursor，避免跳过未确认事件。
 - `run` 使用 `config.exporters` 中的 exporter `id` 作为独立 sink cursor；exporter `id` 必须唯一，且不能使用保留的 `replay-webhook`。
-- `run` 在当前 pipeline run 结束后对每个 configured sink 执行 drain，直到该 sink 队列为空或 ack 无法推进 cursor。
+- `run` 默认在后台启动 configured exporter worker，按 `[export].worker_interval_ms` 周期对每个 configured sink 执行有界 drain；没有 configured exporter 或 `[export].worker_enabled = false` 时不启动 worker。
+- `run` 在当前 pipeline run 结束后仍对每个 configured sink 尽力执行一次尾部 drain，直到该 sink 队列为空或 ack 无法推进 cursor；pipeline 错误不会跳过这次 tail drain。
 - 一次 drain 会尝试所有 configured sinks；某个 sink 失败不会阻止后续 sink，但本次命令最终会返回聚合失败，避免静默丢掉外发错误。
 - `replay` CLI 保留独立的 `replay-webhook` sink，便于本地调试不污染配置 sink cursor。
 - webhook 自定义 headers 可配置，但 `content-type`、`x-sssa-codec` 和 `idempotency-key` 属于协议头，配置中禁止覆盖。
-- 连续 exporter worker、retry/backoff 调度、per-sink quota 和 retention deadline 尚未实现。
+- retry/backoff 调度、per-sink quota 和 retention deadline 尚未实现；当前 worker 采用固定间隔、每 sink 每轮有界 batch 和固定 sink timeout 的 best-effort drain，失败只记录错误并等待下一轮。
 
 状态码建议：
 
@@ -1027,6 +1034,8 @@ V1 CLI 至少提供：
 
 当前已验证的 non-privileged plaintext feed 路径：`PlaintextFeedProvider` 单元测试覆盖 event source/kind/confidence/degraded metadata 保真；agent JSON-lines provider 测试覆盖硬编码外部 feed schema、streaming provider、unknown field fail-closed、超长行 fail-closed、缺失 process 强制 0 confidence，以及 confidence 超过 100 的拒绝；pipeline 测试覆盖 external plaintext feed chunk 写入 ingress journal，并由 HTTP/1 parser 产出 `HttpRequestHeaders` export event，`source = external_plaintext_feed`。这只验证“已解密明文进入统一 pipeline”，不等同于 TLS uprobe 或 keylog 解密已完成。
 
+当前已验证的 exporter worker 路径：agent export 测试覆盖 configured exporters 使用独立 sink cursor、某个 sink 失败不阻止其它 sink 尝试、webhook protocol headers 不被配置覆盖，以及后台 worker 能从 Fjall export queue drain 到 webhook receiver、在启动后继续处理新追加事件并推进对应 sink cursor。该验证覆盖连续有界 drain 的最小闭环，不覆盖未来 backoff/quota/retention 调度。
+
 V1 端到端验收：
 
 1. 启动本机 HTTP/SSE 测试服务。
@@ -1174,7 +1183,7 @@ enforcement 抽象验收：
 | durable spool 目标 | ingress journal + export queue 双层 spool | 第 21 节 |
 | durable spool 当前实现 | Fjall ingress journal + export queue + `DurableSpool` trait + schema-aware `SpoolPayload`；两条 lane 独立 sequence/cursor；parser recovery 未实现因此 capability degraded | 第 21 节 |
 | storage backend | Fjall 默认，redb/RocksDB/SlateDB 非默认 | 第 21、32 节 |
-| exporter | 可靠路径 pull from spool，realtime sink best-effort | 第 22 节 |
+| exporter | 可靠路径 pull from spool，realtime sink best-effort；`run` 默认启动 fixed-interval 后台 worker，退出前仍做尾部 drain | 第 22、23 节 |
 | 多 exporter | per-sink cursor 和 retention | 第 22 节 |
 | webhook | 可配置 URL，但有状态码和 JSON structured ack 契约 | 第 23 节 |
 | 编码目标 | protobuf envelope | 第 24 节 |
