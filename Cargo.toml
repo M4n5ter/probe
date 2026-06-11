@@ -1,9 +1,13 @@
 [workspace]
 members = [
     "crates/agent",
+    "crates/attribution",
+    "crates/capture",
+    "crates/config",
     "crates/core",
     "crates/exporter",
     "crates/parsers",
+    "crates/pipeline",
     "crates/policy",
     "crates/proto",
     "crates/storage",

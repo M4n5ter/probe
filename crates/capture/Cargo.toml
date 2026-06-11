@@ -1,0 +1,15 @@
+[package]
+name = "capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { version = "1.11.1", features = ["serde"] }
+probe-core = { path = "../core" }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+
+[lints]
+workspace = true

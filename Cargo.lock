@@ -12,10 +12,14 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "agent"
 version = "0.1.0"
 dependencies = [
+ "attribution",
+ "capture",
  "clap",
  "exporter",
  "parsers",
+ "pipeline",
  "policy",
+ "probe-config",
  "probe-core",
  "proto",
  "serde",
@@ -23,7 +27,6 @@ dependencies = [
  "storage",
  "thiserror",
  "tokio",
- "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -123,6 +126,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "attribution"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "probe-core",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -212,6 +225,16 @@ name = "byteview"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c53ba0f290bfc610084c05582d9c5d421662128fc69f4bf236707af6fd321b9"
+
+[[package]]
+name = "capture"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "probe-core",
+ "serde",
+ "thiserror",
+]
 
 [[package]]
 name = "cc"
@@ -1221,6 +1244,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pipeline"
+version = "0.1.0"
+dependencies = [
+ "capture",
+ "parsers",
+ "policy",
+ "probe-core",
+ "proto",
+ "serde_json",
+ "storage",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1263,6 +1301,16 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn",
+]
+
+[[package]]
+name = "probe-config"
+version = "0.1.0"
+dependencies = [
+ "probe-core",
+ "serde",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

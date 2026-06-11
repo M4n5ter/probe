@@ -4,18 +4,20 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use attribution::{ProcessAttributor, ProcfsAttributor};
+use capture::ReplayProvider;
 use clap::{Parser, Subcommand, ValueEnum};
 use exporter::{CompressionCodec, ReliableExporter, WebhookExporter};
-use parsers::{Http1Parser, ParserInput, ProtocolParser};
-use policy::{POLICY_HOOKS, PolicyManifest, PolicyOutcome, PolicyRuntime, hook_for_event};
+use parsers::Http1Parser;
+use pipeline::CapturePipeline;
+use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
+use probe_config::AgentConfig;
 use probe_core::{
-    AddressPort, CapabilityKind, CapabilityMatrix, CapabilityState, CaptureSource, Direction,
-    EventEnvelope, EventKind, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity,
-    Timestamp, TransportProtocol,
+    AddressPort, CapabilityKind, CapabilityMatrix, CapabilityState, Direction, FlowContext,
+    FlowIdentity, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
 };
 use proto::{BatchEnvelope, EVENT_ENVELOPE_JSON_SCHEMA};
-use serde::{Deserialize, Serialize};
-use storage::{DurableSpool, FjallSpool, SpoolPayload};
+use storage::{DurableSpool, FjallSpool};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -25,10 +27,12 @@ enum AgentError {
         path: String,
         source: std::io::Error,
     },
-    #[error("failed to parse config TOML: {0}")]
-    Config(#[from] toml::de::Error),
+    #[error("config error: {0}")]
+    Config(#[from] probe_config::ConfigError),
     #[error("failed to serialize JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("pipeline error: {0}")]
+    Pipeline(#[from] pipeline::PipelineError),
     #[error("storage error: {0}")]
     Storage(#[from] storage::StorageError),
     #[error("policy error: {0}")]
@@ -112,12 +116,6 @@ impl From<CliCompressionCodec> for CompressionCodec {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct AppConfig {
-    agent_id: String,
-    config_version: String,
-}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -130,18 +128,18 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), AgentError> {
     match cli.command {
         Command::Run { config } => {
-            if let Some(config) = config {
-                let config = read_config(&config)?;
-                println!(
-                    "agent {} ready with config {}",
-                    config.agent_id, config.config_version
-                );
-            } else {
-                println!("agent ready with default in-process configuration");
-            }
+            let capabilities = default_capability_matrix();
+            let config = read_config_or_default(config.as_ref())?;
+            config.validate(&capabilities)?;
+            println!(
+                "agent {} ready with config {} using {:?} capture preference",
+                config.agent_id, config.config_version, config.capture.preferred_backend
+            );
         }
         Command::Check { config } => {
+            let capabilities = default_capability_matrix();
             let config = read_config(&config)?;
+            config.validate(&capabilities)?;
             println!("{}", serde_json::to_string_pretty(&config)?);
         }
         Command::Capabilities => {
@@ -172,16 +170,25 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
     Ok(())
 }
 
-fn read_config(path: &PathBuf) -> Result<AppConfig, AgentError> {
+fn read_config_or_default(path: Option<&PathBuf>) -> Result<AgentConfig, AgentError> {
+    match path {
+        Some(path) => read_config(path),
+        None => Ok(AgentConfig::default()),
+    }
+}
+
+fn read_config(path: &PathBuf) -> Result<AgentConfig, AgentError> {
     let content = std::fs::read_to_string(path).map_err(|source| AgentError::ReadFile {
         path: path.display().to_string(),
         source,
     })?;
-    toml::from_str(&content).map_err(AgentError::Config)
+    AgentConfig::from_toml_str(&content).map_err(AgentError::Config)
 }
 
 fn default_capability_matrix() -> CapabilityMatrix {
-    CapabilityMatrix::new([
+    let procfs = ProcfsAttributor::new();
+    let mut states = vec![
+        CapabilityState::available(CapabilityKind::ReplayCapture),
         CapabilityState::unavailable(
             CapabilityKind::Ebpf,
             "provider not implemented in this build",
@@ -189,10 +196,6 @@ fn default_capability_matrix() -> CapabilityMatrix {
         CapabilityState::unavailable(
             CapabilityKind::Libpcap,
             "provider not implemented in this build",
-        ),
-        CapabilityState::unavailable(
-            CapabilityKind::ProcfsAttribution,
-            "process attribution provider not implemented in this build",
         ),
         CapabilityState::unavailable(
             CapabilityKind::LibsslUprobe,
@@ -210,8 +213,13 @@ fn default_capability_matrix() -> CapabilityMatrix {
         ),
         CapabilityState::degraded(
             CapabilityKind::DurableSpool,
-            "durable export queue is wired into replay; ingress journal is not implemented",
+            "ingress and export lanes exist, but parser recovery from ingress journal is not implemented",
         ),
+        CapabilityState::degraded(
+            CapabilityKind::IngressJournal,
+            "durable ingress lane is wired into replay, but parser recovery is not implemented",
+        ),
+        CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::degraded(
             CapabilityKind::WebhookExporter,
             "webhook transport is wired into replay but not live capture",
@@ -220,7 +228,9 @@ fn default_capability_matrix() -> CapabilityMatrix {
             CapabilityKind::DryRunEnforcement,
             "enforcement provider not implemented in this build",
         ),
-    ])
+    ];
+    states.extend(procfs.capabilities());
+    CapabilityMatrix::new(states)
 }
 
 async fn replay(
@@ -238,48 +248,16 @@ async fn replay(
     })?;
     let policy = policy.as_ref().map(read_policy).transpose()?;
     let mut http_parser = Http1Parser::default();
-    let parser: &mut dyn ProtocolParser = &mut http_parser;
-    let events = parser
-        .ingest(ParserInput::Data {
-            direction,
-            bytes: &bytes,
-        })
-        .into_events();
     let spool = FjallSpool::open(spool)?;
-    let flow = demo_flow();
-    let mut clock = ReplayClock::default();
-
-    for event in events {
-        let envelope = EventEnvelope::new(
-            clock.next_timestamp(),
-            flow.clone(),
-            CaptureSource::Replay,
-            "replay",
-            event,
-        );
-        append_envelope(&spool, &envelope)?;
-
-        if let Some(policy) = policy.as_ref() {
-            let outcomes = policy.handle_event(hook_for_event(&envelope), &envelope)?;
-            for outcome in outcomes {
-                let kind = match outcome {
-                    PolicyOutcome::Alert(alert) => EventKind::PolicyAlert(alert),
-                    PolicyOutcome::Verdict(verdict) => EventKind::PolicyVerdict(verdict),
-                };
-                let policy_version =
-                    format!("{}@{}", policy.manifest().id, policy.manifest().version);
-                let policy_envelope = EventEnvelope::new(
-                    clock.next_timestamp(),
-                    flow.clone(),
-                    CaptureSource::Replay,
-                    "replay",
-                    kind,
-                )
-                .with_policy_version(policy_version);
-                append_envelope(&spool, &policy_envelope)?;
-            }
-        }
-    }
+    let flow = replay_flow();
+    let mut replay_provider =
+        ReplayProvider::new(flow.clone(), direction, bytes, current_timestamp(1));
+    let mut pipeline = CapturePipeline::new(&spool, &mut http_parser, policy.as_ref(), "replay");
+    let summary = pipeline.run_provider(&mut replay_provider)?;
+    println!(
+        "replay pipeline journaled {} capture chunks and stored {} export events",
+        summary.ingress_chunks, summary.export_events
+    );
 
     if let Some(endpoint) = webhook {
         export_once(&spool, &agent_id, endpoint, codec).await?;
@@ -312,17 +290,6 @@ fn read_policy(path: &PathBuf) -> Result<PolicyRuntime, AgentError> {
     .map_err(AgentError::Policy)
 }
 
-fn append_envelope(spool: &impl DurableSpool, envelope: &EventEnvelope) -> Result<(), AgentError> {
-    let payload = serde_json::to_vec(envelope)?;
-    let stored = spool.append(SpoolPayload::new(EVENT_ENVELOPE_JSON_SCHEMA, payload))?;
-    println!(
-        "stored replay event #{}: {}",
-        stored.sequence,
-        envelope.kind.name()
-    );
-    Ok(())
-}
-
 async fn export_once(
     spool: &impl DurableSpool,
     agent_id: &str,
@@ -330,7 +297,7 @@ async fn export_once(
     codec: CompressionCodec,
 ) -> Result<(), AgentError> {
     let sink = "replay-webhook";
-    let events = spool.read_batch(sink, 1024)?;
+    let events = spool.read_export_batch(sink, 1024)?;
     let Some(last_sequence) = events.last().map(|event| event.sequence) else {
         println!("no spooled events to export");
         return Ok(());
@@ -358,7 +325,7 @@ async fn export_once(
         .committed_cursor
         .or_else(|| contiguous_cursor_from_event_ids(&batch, &ack.acked_event_ids));
     if let Some(cursor) = committed_cursor {
-        spool.ack(sink, cursor)?;
+        spool.ack_export(sink, cursor)?;
         println!(
             "exported batch {} and committed cursor {cursor}",
             ack.batch_id
@@ -391,18 +358,10 @@ fn contiguous_cursor_from_event_ids(
     cursor
 }
 
-#[derive(Debug, Default)]
-struct ReplayClock {
-    next_monotonic_ns: u64,
-}
-
-impl ReplayClock {
-    fn next_timestamp(&mut self) -> Timestamp {
-        self.next_monotonic_ns = self.next_monotonic_ns.saturating_add(1);
-        Timestamp {
-            monotonic_ns: self.next_monotonic_ns,
-            wall_time_unix_ns: wall_time_unix_ns(),
-        }
+fn current_timestamp(monotonic_ns: u64) -> Timestamp {
+    Timestamp {
+        monotonic_ns,
+        wall_time_unix_ns: wall_time_unix_ns(),
     }
 }
 
@@ -412,10 +371,39 @@ fn wall_time_unix_ns() -> i128 {
         .map_or(0, |duration| duration.as_nanos() as i128)
 }
 
-fn demo_flow() -> FlowContext {
-    let process = ProcessIdentity {
-        pid: std::process::id(),
-        tgid: std::process::id(),
+fn replay_flow() -> FlowContext {
+    let process = synthetic_replay_process();
+    let local = AddressPort {
+        address: "127.0.0.1".to_string(),
+        port: 50_000,
+    };
+    let remote = AddressPort {
+        address: "127.0.0.1".to_string(),
+        port: 80,
+    };
+    FlowContext {
+        id: FlowIdentity::stable(
+            &process.identity,
+            &local,
+            &remote,
+            TransportProtocol::Tcp,
+            0,
+            None,
+        ),
+        process,
+        local,
+        remote,
+        protocol: TransportProtocol::Tcp,
+        start_monotonic_ns: 0,
+        socket_cookie: None,
+        attribution_confidence: 0,
+    }
+}
+
+fn synthetic_replay_process() -> ProcessContext {
+    let identity = ProcessIdentity {
+        pid: 0,
+        tgid: 0,
         start_time_ticks: 0,
         boot_id: "replay".to_string(),
         exe_path: "replay".to_string(),
@@ -427,27 +415,10 @@ fn demo_flow() -> FlowContext {
         container_id: None,
         runtime_hint: None,
     };
-    let local = AddressPort {
-        address: "127.0.0.1".to_string(),
-        port: 50_000,
-    };
-    let remote = AddressPort {
-        address: "127.0.0.1".to_string(),
-        port: 80,
-    };
-    FlowContext {
-        id: FlowIdentity::stable(&process, &local, &remote, TransportProtocol::Tcp, 0, None),
-        process: ProcessContext {
-            identity: process,
-            name: "replay".to_string(),
-            cmdline: vec!["replay".to_string()],
-        },
-        local,
-        remote,
-        protocol: TransportProtocol::Tcp,
-        start_monotonic_ns: 0,
-        socket_cookie: None,
-        attribution_confidence: 0,
+    ProcessContext {
+        identity,
+        name: "replay".to_string(),
+        cmdline: vec!["replay".to_string()],
     }
 }
 
@@ -469,6 +440,16 @@ mod tests {
             contiguous_cursor_from_event_ids(&batch, &["two".to_string(), "three".to_string()]),
             None
         );
+    }
+
+    #[test]
+    fn replay_flow_uses_synthetic_process_identity() {
+        let flow = replay_flow();
+
+        assert_eq!(flow.process.identity.pid, 0);
+        assert_eq!(flow.process.identity.tgid, 0);
+        assert_eq!(flow.attribution_confidence, 0);
+        assert_eq!(flow.process.identity.boot_id, "replay");
     }
 
     fn batch_with_events<const N: usize>(event_ids: [&str; N]) -> BatchEnvelope {
