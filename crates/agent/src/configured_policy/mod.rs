@@ -29,7 +29,15 @@ pub enum ConfiguredPolicyError {
 pub struct ConfiguredPolicySelection {
     pub configured_count: u64,
     pub enabled_count: u64,
-    pub active: Option<ConfiguredPolicySource>,
+    pub state: ConfiguredPolicySelectionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ConfiguredPolicySelectionState {
+    Inactive,
+    Active { policy: ConfiguredPolicySource },
+    Unsupported { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -53,12 +61,20 @@ pub struct LoadedConfiguredPolicy {
 
 pub fn configured_policy_selection(config: &AgentConfig) -> ConfiguredPolicySelection {
     let enabled = enabled_policies(config);
+    let state = match enabled.as_slice() {
+        [] => ConfiguredPolicySelectionState::Inactive,
+        [policy] => ConfiguredPolicySelectionState::Active {
+            policy: configured_policy_source(policy),
+        },
+        _ => ConfiguredPolicySelectionState::Unsupported {
+            reason: "runtime config currently supports at most one enabled policy bundle"
+                .to_string(),
+        },
+    };
     ConfiguredPolicySelection {
         configured_count: config.policies.len() as u64,
         enabled_count: enabled.len() as u64,
-        active: enabled
-            .first()
-            .map(|policy| configured_policy_source(policy)),
+        state,
     }
 }
 
@@ -199,7 +215,15 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use probe_config::AgentConfig;
+    use capture::ReplayProvider;
+    use parsers::Http1ParserFactory;
+    use pipeline::{CapturePipeline, PipelinePolicy};
+    use probe_config::{AgentConfig, PolicyConfig};
+    use probe_core::{
+        AddressPort, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
+        ProcessContext, ProcessIdentity, ProcessSelector, Selector, Timestamp, TrafficSelector,
+        TransportProtocol,
+    };
 
     use super::*;
 
@@ -241,6 +265,152 @@ mod tests {
         ));
         fs::remove_dir_all(temp)?;
         Ok(())
+    }
+
+    #[test]
+    fn loaded_configured_policy_selector_scopes_pipeline_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("configured-policy-selector")?;
+        let policy_path = temp.join("guard.lua");
+        fs::write(
+            &policy_path,
+            r#"
+function on_http_request_headers(event)
+  return probe.emit_alert("matched " .. event.kind.target)
+end
+"#,
+        )?;
+        let mut config = config_with_policy(&policy_path)?;
+        config.policies[0].selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                ..TrafficSelector::default()
+            },
+        ));
+        let loaded = load_configured_policy(&config)?.expect("configured policy");
+
+        assert_eq!(
+            policy_alert_count(&temp.join("miss-spool"), &loaded, flow_with_remote_port(80))?,
+            0
+        );
+        assert_eq!(
+            policy_alert_count(&temp.join("hit-spool"), &loaded, flow_with_remote_port(443))?,
+            1
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn configured_policy_selection_reports_multiple_enabled_as_unsupported()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("configured-policy-multiple")?;
+        let first_path = temp.join("first.lua");
+        let second_path = temp.join("second.lua");
+        fs::write(
+            &first_path,
+            "function on_http_request_headers(_) return {} end",
+        )?;
+        fs::write(
+            &second_path,
+            "function on_http_request_headers(_) return {} end",
+        )?;
+        let mut config = config_with_policy(&first_path)?;
+        config.policies.push(PolicyConfig {
+            id: "second".to_string(),
+            path: second_path,
+            enabled: true,
+            selector: None,
+        });
+
+        let selection = configured_policy_selection(&config);
+
+        assert_eq!(selection.configured_count, 2);
+        assert_eq!(selection.enabled_count, 2);
+        assert!(matches!(
+            selection.state,
+            ConfiguredPolicySelectionState::Unsupported { .. }
+        ));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    fn policy_alert_count(
+        spool_path: &Path,
+        policy: &LoadedConfiguredPolicy,
+        flow: FlowContext,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let spool = storage::FjallSpool::open(spool_path)?;
+        let mut parser_factory = Http1ParserFactory::default();
+        let mut provider = ReplayProvider::new(
+            flow,
+            Direction::Outbound,
+            b"GET /scoped HTTP/1.1\r\nHost: test\r\n\r\n",
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+        );
+        let mut pipeline = CapturePipeline::new(
+            &spool,
+            &mut parser_factory,
+            Some(PipelinePolicy::new(
+                &policy.runtime,
+                policy.selector.as_ref(),
+            )),
+            "test",
+        );
+
+        pipeline.run_provider(&mut provider)?;
+        let exported = spool.read_export_batch("sink", 16)?;
+        let envelopes = exported
+            .iter()
+            .map(|event| serde_json::from_slice::<EventEnvelope>(event.payload.bytes()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(envelopes
+            .iter()
+            .filter(|envelope| matches!(envelope.kind, EventKind::PolicyAlert(_)))
+            .count())
+    }
+
+    fn flow_with_remote_port(remote_port: u16) -> FlowContext {
+        let process = ProcessIdentity {
+            pid: 1,
+            tgid: 1,
+            start_time_ticks: 1,
+            boot_id: "boot".to_string(),
+            exe_path: "replay".to_string(),
+            cmdline_hash: "hash".to_string(),
+            uid: 0,
+            gid: 0,
+            cgroup: None,
+            systemd_service: None,
+            container_id: None,
+            runtime_hint: None,
+        };
+        let local = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 50_000,
+        };
+        let remote = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: remote_port,
+        };
+        FlowContext {
+            id: FlowIdentity::stable(&process, &local, &remote, TransportProtocol::Tcp, 1, None),
+            process: ProcessContext {
+                identity: process,
+                name: "replay".to_string(),
+                cmdline: vec!["replay".to_string()],
+            },
+            local,
+            remote,
+            protocol: TransportProtocol::Tcp,
+            start_monotonic_ns: 1,
+            socket_cookie: Some(remote_port as u64),
+            attribution_confidence: 0,
+        }
     }
 
     fn config_with_policy(path: &Path) -> Result<AgentConfig, probe_config::ConfigError> {

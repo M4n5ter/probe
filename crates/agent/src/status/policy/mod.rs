@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::configured_policy::{
-    ConfiguredPolicySource, configured_policy_selection, inspect_policy_source,
+    ConfiguredPolicySelectionState, ConfiguredPolicySource, configured_policy_selection,
+    inspect_policy_source,
 };
 use probe_core::RuntimeMode;
 use runtime::RuntimePlan;
@@ -47,14 +48,26 @@ pub enum PolicySourceCheck {
 
 pub(super) fn policy_status(plan: &RuntimePlan) -> PolicyStatusSnapshot {
     let selection = configured_policy_selection(&plan.config);
-    let Some(policy) = selection.active else {
-        return PolicyStatusSnapshot {
-            mode: PolicyStatusMode::Inactive,
-            configured_count: selection.configured_count,
-            enabled_count: selection.enabled_count,
-            active: None,
-            reason: None,
-        };
+    let policy = match selection.state {
+        ConfiguredPolicySelectionState::Inactive => {
+            return PolicyStatusSnapshot {
+                mode: PolicyStatusMode::Inactive,
+                configured_count: selection.configured_count,
+                enabled_count: selection.enabled_count,
+                active: None,
+                reason: None,
+            };
+        }
+        ConfiguredPolicySelectionState::Active { policy } => policy,
+        ConfiguredPolicySelectionState::Unsupported { reason } => {
+            return PolicyStatusSnapshot {
+                mode: PolicyStatusMode::Unavailable,
+                configured_count: selection.configured_count,
+                enabled_count: selection.enabled_count,
+                active: None,
+                reason: Some(reason),
+            };
+        }
     };
 
     let source = policy_source_status(&policy.path);
