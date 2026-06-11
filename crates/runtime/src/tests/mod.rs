@@ -290,6 +290,37 @@ fn dry_run_enforcement_is_a_supported_runtime_capability() -> Result<(), Box<dyn
 }
 
 #[test]
+fn enforcement_plan_preserves_external_policy_source() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = ProviderRegistry::new(
+        vec![capture_provider(
+            CaptureBackend::Replay,
+            CaptureProviderBuilder::Replay,
+            RuntimeMode::Available,
+        )],
+        test_platform_capabilities(),
+    );
+    let mut config = AgentConfig::default();
+    config.capture.selection = CaptureSelection::Replay;
+    config.enforcement.selector = Some(Selector::default());
+    config.enforcement.policy.source = probe_config::EnforcementPolicySourceConfig::Directory {
+        path: "/etc/sssa-probe/enforcement.d".into(),
+    };
+
+    let plan = RuntimePlan::build(config, &registry)?;
+
+    assert_eq!(plan.enforcement.mode, EnforcementMode::AuditOnly);
+    assert!(plan.enforcement.config_selector_configured);
+    assert_eq!(
+        plan.enforcement.policy_source,
+        EnforcementPolicySourcePlan::LocalManifest {
+            source_kind: EnforcementPolicySourceKind::Directory,
+            path: "/etc/sssa-probe/enforcement.d/manifest.toml".into(),
+        }
+    );
+    Ok(())
+}
+
+#[test]
 fn dry_run_enforcement_fails_closed_without_capability() {
     let cases = [
         test_platform_capabilities()

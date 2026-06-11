@@ -23,8 +23,10 @@ use tokio::{
     task::JoinSet,
 };
 
+use crate::configured_enforcement::LoadedEnforcementPolicySource;
 use crate::status::{
-    AgentStatusSnapshot, MetricsSnapshot, build_status_snapshot, collect_running_spool_status,
+    AgentStatusSnapshot, MetricsSnapshot, RuntimeStatusInput, build_status_snapshot_with_runtime,
+    collect_running_spool_status,
 };
 
 const ADMIN_REQUEST_MAX_BYTES: usize = 4 * 1024;
@@ -62,6 +64,11 @@ pub struct AdminServerConfig {
     pub socket_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdminRuntimeState {
+    pub enforcement_policy_source: Option<LoadedEnforcementPolicySource>,
+}
+
 pub struct AdminServerHandle {
     socket_path: PathBuf,
     stop_requested: Arc<AtomicBool>,
@@ -73,14 +80,24 @@ pub fn spawn_admin_server(
     plan: Arc<RuntimePlan>,
     spool: Arc<FjallSpool>,
     config: AdminServerConfig,
+    runtime_state: AdminRuntimeState,
 ) -> Result<AdminServerHandle, AdminError> {
     let listener = bind_admin_socket(&config.socket_path)?;
     let stop_requested = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(Notify::new());
     let task_stop_requested = Arc::clone(&stop_requested);
     let task_shutdown = Arc::clone(&shutdown);
+    let runtime_state = Arc::new(runtime_state);
     let task = tokio::spawn(async move {
-        accept_admin_connections(listener, plan, spool, task_stop_requested, task_shutdown).await;
+        accept_admin_connections(
+            listener,
+            plan,
+            spool,
+            runtime_state,
+            task_stop_requested,
+            task_shutdown,
+        )
+        .await;
     });
 
     Ok(AdminServerHandle {
@@ -246,6 +263,7 @@ async fn accept_admin_connections(
     listener: UnixListener,
     plan: Arc<RuntimePlan>,
     spool: Arc<FjallSpool>,
+    runtime_state: Arc<AdminRuntimeState>,
     stop_requested: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
 ) {
@@ -257,8 +275,9 @@ async fn accept_admin_connections(
                     Ok((stream, _)) => {
                         let plan = Arc::clone(&plan);
                         let spool = Arc::clone(&spool);
+                        let runtime_state = Arc::clone(&runtime_state);
                         handlers.spawn(async move {
-                            if let Err(error) = handle_admin_connection(stream, plan, spool).await {
+                            if let Err(error) = handle_admin_connection(stream, plan, spool, runtime_state).await {
                                 eprintln!("admin connection failed: {error}");
                             }
                         });
@@ -292,10 +311,16 @@ async fn handle_admin_connection(
     mut stream: UnixStream,
     plan: Arc<RuntimePlan>,
     spool: Arc<FjallSpool>,
+    runtime_state: Arc<AdminRuntimeState>,
 ) -> Result<(), std::io::Error> {
     let response =
         match tokio::time::timeout(ADMIN_REQUEST_TIMEOUT, read_admin_request(&mut stream)).await {
-            Ok(Ok(request)) => handle_admin_request(request, plan.as_ref(), spool.as_ref()),
+            Ok(Ok(request)) => handle_admin_request(
+                request,
+                plan.as_ref(),
+                spool.as_ref(),
+                runtime_state.as_ref(),
+            ),
             Ok(Err(error)) => AdminResponse::Error {
                 message: error.to_string(),
             },
@@ -357,8 +382,15 @@ fn handle_admin_request(
     request: AdminRequest,
     plan: &RuntimePlan,
     spool: &FjallSpool,
+    runtime_state: &AdminRuntimeState,
 ) -> AdminResponse {
-    let snapshot = build_status_snapshot(plan, collect_running_spool_status(plan, spool));
+    let snapshot = build_status_snapshot_with_runtime(
+        plan,
+        collect_running_spool_status(plan, spool),
+        RuntimeStatusInput {
+            enforcement_policy_source: runtime_state.enforcement_policy_source.clone(),
+        },
+    );
     match request {
         AdminRequest::Status => AdminResponse::Status {
             snapshot: Box::new(snapshot),
@@ -405,8 +437,13 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use probe_config::{AgentConfig, CaptureBackend, CaptureSelection, ExporterConfig};
-    use probe_core::{CapabilityState, RuntimeMode, SpoolPayloadSchema};
+    use probe_config::{
+        AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicyManifest,
+        EnforcementPolicySourceConfig, ExporterConfig,
+    };
+    use probe_core::{
+        Action, CapabilityState, ProtectiveActionProfile, RuntimeMode, SpoolPayloadSchema,
+    };
     use runtime::{
         CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
     };
@@ -434,6 +471,7 @@ mod tests {
             AdminServerConfig {
                 socket_path: socket_path.clone(),
             },
+            AdminRuntimeState::default(),
         )?;
 
         let response = send_admin_request(&socket_path, json!({ "command": "status" })).await?;
@@ -469,12 +507,66 @@ mod tests {
             AdminServerConfig {
                 socket_path: socket_path.clone(),
             },
+            AdminRuntimeState::default(),
         )?;
 
         let response = send_admin_request(&socket_path, json!({ "command": "metrics" })).await?;
 
         assert_eq!(response["kind"], json!("metrics"));
         assert_eq!(response["metrics"]["export"]["sink_count"], json!(1));
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_status_reports_loaded_enforcement_policy_without_rereading_disk()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-loaded-enforcement-policy")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let manifest_path = temp.join("enforcement.toml");
+        let manifest = EnforcementPolicyManifest {
+            id: "managed-apps".to_string(),
+            version: "v1".to_string(),
+            selector: None,
+            protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
+        };
+        fs::write(&manifest_path, toml::to_string(&manifest)?)?;
+        let mut config = config_with_storage_path(spool_path.clone());
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: manifest_path.clone(),
+        };
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let plan = Arc::new(runtime_plan_from_config(config)?);
+        let runtime_state = AdminRuntimeState {
+            enforcement_policy_source: Some(LoadedEnforcementPolicySource {
+                path: manifest_path.clone(),
+                manifest,
+            }),
+        };
+        fs::remove_file(&manifest_path)?;
+        let server = spawn_admin_server(
+            Arc::clone(&plan),
+            Arc::clone(&spool),
+            AdminServerConfig {
+                socket_path: socket_path.clone(),
+            },
+            runtime_state,
+        )?;
+
+        let response = send_admin_request(&socket_path, json!({ "command": "status" })).await?;
+
+        assert_eq!(
+            response["snapshot"]["enforcement"]["policy"]["source"]["mode"],
+            json!("loaded")
+        );
+        assert_eq!(
+            response["snapshot"]["enforcement"]["policy"]["source"]["manifest"]["protective_actions"],
+            json!(["deny"])
+        );
+        assert_eq!(response["snapshot"]["health"]["mode"], json!("available"));
         server.stop().await;
         drop(spool);
         fs::remove_dir_all(temp)?;
@@ -494,6 +586,7 @@ mod tests {
             AdminServerConfig {
                 socket_path: socket_path.clone(),
             },
+            AdminRuntimeState::default(),
         )?;
 
         let mode = fs::symlink_metadata(&socket_path)?.permissions().mode() & 0o777;
@@ -518,6 +611,7 @@ mod tests {
             Arc::clone(&plan),
             Arc::clone(&spool),
             AdminServerConfig { socket_path },
+            AdminRuntimeState::default(),
         );
 
         assert!(matches!(result, Err(AdminError::UnsafeSocketParent { .. })));
@@ -540,6 +634,7 @@ mod tests {
             Arc::clone(&plan),
             Arc::clone(&spool),
             AdminServerConfig { socket_path },
+            AdminRuntimeState::default(),
         );
 
         assert!(matches!(
@@ -566,6 +661,7 @@ mod tests {
             AdminServerConfig {
                 socket_path: socket_path.clone(),
             },
+            AdminRuntimeState::default(),
         );
 
         assert!(matches!(result, Err(AdminError::SocketAlreadyInUse { .. })));
@@ -591,6 +687,7 @@ mod tests {
             AdminServerConfig {
                 socket_path: socket_path.clone(),
             },
+            AdminRuntimeState::default(),
         )?;
         let response = send_admin_request(&socket_path, json!({ "command": "metrics" })).await?;
 
@@ -614,6 +711,7 @@ mod tests {
             AdminServerConfig {
                 socket_path: socket_path.clone(),
             },
+            AdminRuntimeState::default(),
         )?;
         let mut stream = UnixStream::connect(&socket_path).await?;
         stream.write_all(b"{\"command\":\"status\"").await?;
@@ -659,6 +757,10 @@ mod tests {
     }
 
     fn runtime_plan(storage_path: PathBuf) -> Result<RuntimePlan, runtime::RuntimeError> {
+        runtime_plan_from_config(config_with_storage_path(storage_path))
+    }
+
+    fn runtime_plan_from_config(config: AgentConfig) -> Result<RuntimePlan, runtime::RuntimeError> {
         let registry = ProviderRegistry::new(
             vec![CaptureProviderDescriptor::available(
                 CaptureBackend::Replay,
@@ -666,7 +768,7 @@ mod tests {
             )],
             Vec::<CapabilityState>::new(),
         );
-        RuntimePlan::build(config_with_storage_path(storage_path), &registry)
+        RuntimePlan::build(config, &registry)
     }
 
     fn config_with_storage_path(storage_path: PathBuf) -> AgentConfig {

@@ -21,8 +21,12 @@ use serde::Serialize;
 use storage::{FjallSpool, SpoolProbe, SpoolSnapshot};
 use tls::{TlsStatusSnapshot, tls_status};
 
+use crate::configured_enforcement::LoadedEnforcementPolicySource;
+
 #[cfg(test)]
-use enforcement::{EnforcementCapabilityStatusSnapshot, EnforcementStatusMode};
+use enforcement::{
+    EnforcementCapabilityStatusSnapshot, EnforcementPolicySourceStatusMode, EnforcementStatusMode,
+};
 #[cfg(test)]
 use policy::{PolicySourceCheck, PolicyStatusMode};
 #[cfg(test)]
@@ -95,6 +99,11 @@ pub struct ExportMetricsSnapshot {
     pub total_lag: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeStatusInput {
+    pub enforcement_policy_source: Option<LoadedEnforcementPolicySource>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpoolStatusInput {
     pub path: PathBuf,
@@ -142,6 +151,14 @@ impl SpoolStatusInput {
 
 pub fn build_status_snapshot(plan: &RuntimePlan, spool: SpoolStatusInput) -> AgentStatusSnapshot {
     build_status_snapshot_at(plan, spool, current_unix_time_ns())
+}
+
+pub fn build_status_snapshot_with_runtime(
+    plan: &RuntimePlan,
+    spool: SpoolStatusInput,
+    runtime: RuntimeStatusInput,
+) -> AgentStatusSnapshot {
+    build_status_snapshot_at_with_runtime(plan, spool, current_unix_time_ns(), runtime)
 }
 
 pub fn collect_spool_status(plan: &RuntimePlan) -> SpoolStatusInput {
@@ -214,6 +231,20 @@ fn build_status_snapshot_at(
     spool: SpoolStatusInput,
     generated_unix_ns: u64,
 ) -> AgentStatusSnapshot {
+    build_status_snapshot_at_with_runtime(
+        plan,
+        spool,
+        generated_unix_ns,
+        RuntimeStatusInput::default(),
+    )
+}
+
+fn build_status_snapshot_at_with_runtime(
+    plan: &RuntimePlan,
+    spool: SpoolStatusInput,
+    generated_unix_ns: u64,
+    runtime: RuntimeStatusInput,
+) -> AgentStatusSnapshot {
     let spool_snapshot = spool.snapshot;
     let spool_status = SpoolStatusSnapshot {
         path: spool.path,
@@ -223,11 +254,14 @@ fn build_status_snapshot_at(
         export_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_export_sequence),
     };
     let policy = policy_status(plan);
-    let enforcement = enforcement_status(plan);
+    let enforcement = match runtime.enforcement_policy_source.as_ref() {
+        Some(source) => enforcement::enforcement_status_with_loaded_source(plan, Some(source)),
+        None => enforcement_status(plan),
+    };
     let tls = tls_status(plan);
     let exporters = exporter_statuses(plan, &spool_status, &spool.export_cursors);
     let metrics = metrics_snapshot(&plan.capabilities, &spool_status, &exporters);
-    let health = health_snapshot(plan, &spool_status, &exporters, &policy);
+    let health = health_snapshot(plan, &spool_status, &exporters, &policy, &enforcement);
 
     AgentStatusSnapshot {
         generated_unix_ns,
@@ -314,6 +348,9 @@ mod tests {
     use serde_json::json;
     use storage::SpoolPayload;
 
+    mod enforcement_policy;
+    mod export;
+
     #[test]
     fn status_snapshot_reports_sink_lag_and_health() -> Result<(), Box<dyn std::error::Error>> {
         let plan = runtime_plan_with_exporter()?;
@@ -364,6 +401,10 @@ mod tests {
             EnforcementCapabilityStatusSnapshot::NotRequired
         );
         assert_eq!(
+            snapshot.enforcement.policy.source.mode,
+            EnforcementPolicySourceStatusMode::NotConfigured
+        );
+        assert_eq!(
             snapshot.tls.plaintext.capability,
             TlsPlaintextCapabilityStatusSnapshot::NotRequired
         );
@@ -375,48 +416,14 @@ mod tests {
             json!("not_required")
         );
         assert_eq!(
+            value["enforcement"]["policy"]["source"]["mode"],
+            json!("not_configured")
+        );
+        assert_eq!(
             value["tls"]["plaintext"]["capability"]["kind"],
             json!("not_required")
         );
         assert_eq!(snapshot.metrics.export.total_lag, Some(2));
-        Ok(())
-    }
-
-    #[test]
-    fn status_snapshot_reports_per_sink_exporter_worker_quota()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
-        config.exporters[0].worker.batches_per_tick = Some(2);
-        let plan = runtime_plan_from_config(
-            config,
-            vec![CapabilityState::available(
-                CapabilityKind::DryRunEnforcement,
-            )],
-        )?;
-        let spool = available_empty_spool();
-
-        let snapshot = build_status_snapshot_at(&plan, spool, 42);
-
-        assert_eq!(
-            snapshot.exporters[0].sink_worker.batches_per_tick_override,
-            Some(2)
-        );
-        assert_eq!(
-            snapshot.exporters[0]
-                .sink_worker
-                .effective_batches_per_tick
-                .get(),
-            2
-        );
-        let value = serde_json::to_value(&snapshot)?;
-        assert_eq!(
-            value["exporters"][0]["sink_worker"]["batches_per_tick_override"],
-            json!(2)
-        );
-        assert_eq!(
-            value["exporters"][0]["sink_worker"]["effective_batches_per_tick"],
-            json!(2)
-        );
         Ok(())
     }
 
@@ -459,7 +466,10 @@ mod tests {
             EnforcementMode::DryRun
         );
         assert_eq!(snapshot.enforcement.status, EnforcementStatusMode::DryRun);
-        assert!(snapshot.enforcement.selector_configured);
+        assert_eq!(
+            snapshot.enforcement.effective_selector_configured,
+            Some(true)
+        );
         assert_eq!(
             snapshot.enforcement.capability,
             EnforcementCapabilityStatusSnapshot::Required {

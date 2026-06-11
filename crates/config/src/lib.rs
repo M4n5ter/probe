@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
 };
 
-use probe_core::{EnforcementMode, Selector};
+use probe_core::{EnforcementMode, ProtectiveActionProfile, Selector};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -66,6 +66,7 @@ impl AgentConfig {
         validate_export_runtime(&self.export, &mut violations);
         validate_exporters(&self.exporters, &self.tls, &mut violations);
         validate_policies(&self.policies, &mut violations);
+        validate_enforcement(&self.enforcement, &mut violations);
         validate_admin(&self.admin, &mut violations);
 
         if violations.is_empty() {
@@ -391,6 +392,7 @@ pub enum TlsMaterialKind {
 pub struct EnforcementConfig {
     pub mode: EnforcementMode,
     pub selector: Option<Selector>,
+    pub policy: EnforcementPolicyConfig,
 }
 
 impl Default for EnforcementConfig {
@@ -398,8 +400,40 @@ impl Default for EnforcementConfig {
         Self {
             mode: EnforcementMode::AuditOnly,
             selector: None,
+            policy: EnforcementPolicyConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnforcementPolicyConfig {
+    pub source: EnforcementPolicySourceConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+pub enum EnforcementPolicySourceConfig {
+    #[default]
+    None,
+    File {
+        path: PathBuf,
+    },
+    Directory {
+        path: PathBuf,
+    },
+    Remote {
+        endpoint: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnforcementPolicyManifest {
+    pub id: String,
+    pub version: String,
+    pub selector: Option<Selector>,
+    pub protective_actions: ProtectiveActionProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -829,6 +863,36 @@ fn validate_policies(policies: &[PolicyConfig], violations: &mut Vec<ConfigViola
                 field: format!("policies.{}.path", policy.id),
                 reason: "enabled policy must set a bundle/source path".to_string(),
             });
+        }
+    }
+}
+
+fn validate_enforcement(enforcement: &EnforcementConfig, violations: &mut Vec<ConfigViolation>) {
+    match &enforcement.policy.source {
+        EnforcementPolicySourceConfig::None => {}
+        EnforcementPolicySourceConfig::File { path } => {
+            if path.as_os_str().is_empty() {
+                violations.push(ConfigViolation {
+                    field: "enforcement.policy.source.path".to_string(),
+                    reason: "enforcement policy file path cannot be empty".to_string(),
+                });
+            }
+        }
+        EnforcementPolicySourceConfig::Directory { path } => {
+            if path.as_os_str().is_empty() {
+                violations.push(ConfigViolation {
+                    field: "enforcement.policy.source.path".to_string(),
+                    reason: "enforcement policy directory path cannot be empty".to_string(),
+                });
+            }
+        }
+        EnforcementPolicySourceConfig::Remote { endpoint } => {
+            if endpoint.trim().is_empty() {
+                violations.push(ConfigViolation {
+                    field: "enforcement.policy.source.endpoint".to_string(),
+                    reason: "remote enforcement policy endpoint cannot be empty".to_string(),
+                });
+            }
         }
     }
 }

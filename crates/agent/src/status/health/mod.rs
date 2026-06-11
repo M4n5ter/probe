@@ -2,7 +2,8 @@ use probe_core::RuntimeMode;
 use runtime::{CapturePlanMode, RuntimePlan};
 
 use super::{
-    ExporterStatusSnapshot, HealthSnapshot, SpoolStatusSnapshot,
+    EnforcementStatusSnapshot, ExporterStatusSnapshot, HealthSnapshot, SpoolStatusSnapshot,
+    enforcement::EnforcementPolicySourceStatusMode,
     policy::{PolicyStatusMode, PolicyStatusSnapshot},
 };
 
@@ -11,12 +12,16 @@ pub(super) fn health_snapshot(
     spool: &SpoolStatusSnapshot,
     exporters: &[ExporterStatusSnapshot],
     policy: &PolicyStatusSnapshot,
+    enforcement: &EnforcementStatusSnapshot,
 ) -> HealthSnapshot {
     fold_health_contributions(
         std::iter::once(capture_health_contribution(plan))
             .chain(std::iter::once(spool_health_contribution(spool)))
             .chain(exporters.iter().map(exporter_health_contribution))
-            .chain(std::iter::once(policy_health_contribution(policy))),
+            .chain(std::iter::once(policy_health_contribution(policy)))
+            .chain(std::iter::once(enforcement_health_contribution(
+                enforcement,
+            ))),
     )
 }
 
@@ -81,6 +86,26 @@ fn policy_reason(policy: &PolicyStatusSnapshot, fallback: &str) -> String {
     policy.reason.clone().map_or_else(
         || format!("policy: {fallback}"),
         |reason| format!("policy: {reason}"),
+    )
+}
+
+fn enforcement_health_contribution(enforcement: &EnforcementStatusSnapshot) -> HealthContribution {
+    match enforcement.policy.source.mode {
+        EnforcementPolicySourceStatusMode::NotConfigured
+        | EnforcementPolicySourceStatusMode::Loaded => HealthContribution::available(),
+        EnforcementPolicySourceStatusMode::MetadataOnly => HealthContribution::degraded(
+            enforcement_policy_reason(enforcement, "enforcement policy status is metadata-only"),
+        ),
+        EnforcementPolicySourceStatusMode::Unavailable => HealthContribution::unavailable(
+            enforcement_policy_reason(enforcement, "enforcement policy is unavailable"),
+        ),
+    }
+}
+
+fn enforcement_policy_reason(enforcement: &EnforcementStatusSnapshot, fallback: &str) -> String {
+    enforcement.policy.source.reason.clone().map_or_else(
+        || format!("enforcement policy: {fallback}"),
+        |reason| format!("enforcement policy: {reason}"),
     )
 }
 

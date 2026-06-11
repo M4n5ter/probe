@@ -1,4 +1,5 @@
 use super::*;
+use probe_core::Action;
 
 #[test]
 fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,6 +29,10 @@ fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert_eq!(config.exporters, Vec::<ExporterConfig>::new());
     assert_eq!(config.enforcement.mode, EnforcementMode::AuditOnly);
+    assert_eq!(
+        config.enforcement.policy.source,
+        EnforcementPolicySourceConfig::None
+    );
     config.validate_basic()?;
     Ok(())
 }
@@ -91,6 +96,10 @@ provider = "libssl_uprobe"
 [enforcement]
 mode = "dry_run"
 
+[enforcement.policy.source]
+kind = "file"
+path = "/etc/sssa-probe/enforcement.toml"
+
 [admin]
 enabled = true
 socket_path = "/run/sssa-probe/admin.sock"
@@ -129,10 +138,58 @@ socket_path = "/run/sssa-probe/admin.sock"
     assert!(config.tls.plaintext.enabled);
     assert_eq!(config.capture.plaintext_feed.path, None);
     assert_eq!(config.enforcement.mode, EnforcementMode::DryRun);
+    assert_eq!(
+        config.enforcement.policy.source,
+        EnforcementPolicySourceConfig::File {
+            path: PathBuf::from("/etc/sssa-probe/enforcement.toml"),
+        }
+    );
     assert!(config.admin.enabled);
     assert_eq!(
         config.admin.socket_path,
         PathBuf::from("/run/sssa-probe/admin.sock")
+    );
+    Ok(())
+}
+
+#[test]
+fn parses_enforcement_policy_manifest_defaults() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = toml::from_str::<EnforcementPolicyManifest>(
+        r#"
+id = "managed-apps"
+version = "2026-06-12"
+"#,
+    )?;
+
+    assert_eq!(manifest.id, "managed-apps");
+    assert_eq!(manifest.version, "2026-06-12");
+    assert_eq!(
+        manifest.protective_actions.actions(),
+        &[Action::Deny, Action::Reset, Action::Quarantine]
+    );
+    assert!(manifest.selector.is_none());
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_invalid_enforcement_policy_source_config()
+-> Result<(), Box<dyn std::error::Error>> {
+    let empty_file = AgentConfig::from_toml_str(
+        r#"
+[enforcement.policy.source]
+kind = "file"
+path = ""
+"#,
+    )?;
+
+    let error = empty_file
+        .validate_basic()
+        .expect_err("enforcement policy source path must be validated");
+
+    assert!(
+        error
+            .to_string()
+            .contains("enforcement policy file path cannot be empty")
     );
     Ok(())
 }

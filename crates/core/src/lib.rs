@@ -23,5 +23,6 @@ pub use selector::{
 };
 pub use socket::{TcpConnection, TcpEndpoint};
 pub use verdict::{
-    Action, EnforcementDecision, EnforcementMode, EnforcementOutcome, Verdict, VerdictScope,
+    Action, EnforcementDecision, EnforcementMode, EnforcementOutcome, ProtectiveActionError,
+    ProtectiveActionProfile, Verdict, VerdictScope,
 };

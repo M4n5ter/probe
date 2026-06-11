@@ -13,7 +13,7 @@ mod plaintext_feed;
 mod status;
 mod tls_material;
 
-use admin::{AdminServerConfig, spawn_admin_server};
+use admin::{AdminRuntimeState, AdminServerConfig, spawn_admin_server};
 use attribution::ProcfsSocketResolver;
 use capture::{
     CaptureError, CaptureProvider, EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport,
@@ -21,7 +21,7 @@ use capture::{
 };
 use check::build_check_report;
 use clap::{Parser, Subcommand, ValueEnum};
-use configured_enforcement::build_configured_enforcement;
+use configured_enforcement::{ConfiguredEnforcementError, build_configured_enforcement};
 use configured_policy::{ConfiguredPolicyError, load_configured_policy};
 use enforcement::ScopedEnforcementPlanner;
 use export::{ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook, spawn_export_worker};
@@ -65,6 +65,8 @@ enum AgentError {
     ConfiguredPolicy(#[from] ConfiguredPolicyError),
     #[error("enforcement error: {0}")]
     Enforcement(#[from] enforcement::EnforcementError),
+    #[error("{0}")]
+    ConfiguredEnforcement(#[from] ConfiguredEnforcementError),
     #[error("proto error: {0}")]
     Proto(#[from] proto::ProtoError),
     #[error("export error: {0}")]
@@ -207,10 +209,18 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let mut parser_factory = Http1ParserFactory::default();
             let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
             let policy = load_configured_policy(&plan.config)?;
-            let mut enforcement = build_configured_enforcement(&plan.config)?;
+            let mut enforcement = build_configured_enforcement(&plan)?;
+            let admin_runtime_state = AdminRuntimeState {
+                enforcement_policy_source: enforcement.policy_source.clone(),
+            };
             let admin_server = admin_server_config_from_plan(&plan)
                 .map(|config| {
-                    spawn_admin_server(Arc::new(plan.clone()), Arc::clone(&spool), config)
+                    spawn_admin_server(
+                        Arc::new(plan.clone()),
+                        Arc::clone(&spool),
+                        config,
+                        admin_runtime_state.clone(),
+                    )
                 })
                 .transpose()?;
             let export_worker = export_worker_config_from_plan(&plan)

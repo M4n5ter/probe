@@ -1,6 +1,7 @@
 use probe_core::{
     Action, CompiledSelector, EnforcementDecision, EnforcementMode, EnforcementOutcome,
-    EventEnvelope, Selector, SelectorError, Verdict,
+    EventEnvelope, ProtectiveActionError, ProtectiveActionProfile, Selector, SelectorError,
+    Verdict,
 };
 use thiserror::Error;
 
@@ -8,6 +9,8 @@ use thiserror::Error;
 pub enum EnforcementError {
     #[error("invalid enforcement selector: {0}")]
     Selector(#[from] SelectorError),
+    #[error("invalid enforcement protective action profile: {0}")]
+    ProtectiveActionProfile(#[from] ProtectiveActionError),
 }
 
 pub struct EnforcementPlanRequest<'a> {
@@ -25,6 +28,7 @@ pub trait EnforcementPlanner {
 pub struct ScopedEnforcementPlanner {
     mode: EnforcementMode,
     selector: Option<CompiledSelector>,
+    protective_actions: ProtectiveActionProfile,
 }
 
 impl ScopedEnforcementPlanner {
@@ -32,14 +36,39 @@ impl ScopedEnforcementPlanner {
         mode: EnforcementMode,
         selector: Option<&Selector>,
     ) -> Result<Self, EnforcementError> {
+        Self::with_protective_action_profile(mode, selector, ProtectiveActionProfile::default())
+    }
+
+    pub fn with_protective_actions(
+        mode: EnforcementMode,
+        selector: Option<&Selector>,
+        protective_actions: impl IntoIterator<Item = Action>,
+    ) -> Result<Self, EnforcementError> {
+        Self::with_protective_action_profile(
+            mode,
+            selector,
+            ProtectiveActionProfile::new(protective_actions)?,
+        )
+    }
+
+    pub fn with_protective_action_profile(
+        mode: EnforcementMode,
+        selector: Option<&Selector>,
+        protective_actions: ProtectiveActionProfile,
+    ) -> Result<Self, EnforcementError> {
         Ok(Self {
             mode,
             selector: selector.map(Selector::compile).transpose()?,
+            protective_actions,
         })
     }
 
     pub fn mode(&self) -> EnforcementMode {
         self.mode
+    }
+
+    pub fn protective_actions(&self) -> &[Action] {
+        self.protective_actions.actions()
     }
 
     fn selector_matches(&self, trigger: &EventEnvelope) -> bool {
@@ -70,6 +99,15 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
                 Action::Observe,
                 format!(
                     "policy requested {:?}, but enforcement selector did not match: {}",
+                    request.verdict.action, request.verdict.reason
+                ),
+            )
+        } else if !self.protective_actions.contains(request.verdict.action) {
+            (
+                EnforcementOutcome::Unsupported,
+                Action::Observe,
+                format!(
+                    "policy requested {:?}, but the configured enforcement profile does not allow that protective action: {}",
                     request.verdict.action, request.verdict.reason
                 ),
             )
@@ -130,7 +168,7 @@ fn decision_for_mode(
 }
 
 fn requires_enforcement(action: Action) -> bool {
-    matches!(action, Action::Deny | Action::Reset | Action::Quarantine)
+    action.is_protective()
 }
 
 #[cfg(test)]
@@ -278,6 +316,56 @@ mod tests {
 
         assert!(decision.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn configured_profile_limits_protective_actions() -> Result<(), Box<dyn std::error::Error>> {
+        let planner = ScopedEnforcementPlanner::with_protective_actions(
+            EnforcementMode::DryRun,
+            None,
+            [Action::Deny, Action::Deny],
+        )?;
+        let trigger = request_event(Direction::Outbound);
+        let verdict = Verdict {
+            action: Action::Reset,
+            scope: VerdictScope::Flow,
+            reason: "reset flow".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+
+        assert_eq!(planner.protective_actions(), &[Action::Deny]);
+        let decision = planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })?
+            .expect("protective verdict should produce enforcement audit");
+
+        assert_eq!(decision.outcome, EnforcementOutcome::Unsupported);
+        assert_eq!(decision.requested_action, Action::Reset);
+        assert_eq!(decision.effective_action, Action::Observe);
+        assert!(decision.selector_matched);
+        Ok(())
+    }
+
+    #[test]
+    fn configured_profile_rejects_non_protective_actions() {
+        let result = ScopedEnforcementPlanner::with_protective_actions(
+            EnforcementMode::DryRun,
+            None,
+            [Action::Alert],
+        );
+        let Err(error) = result else {
+            panic!("alert is not an enforcement protective action");
+        };
+
+        assert!(matches!(
+            error,
+            EnforcementError::ProtectiveActionProfile(ProtectiveActionError::Unsupported {
+                action: Action::Alert
+            })
+        ));
     }
 
     fn request_event(direction: Direction) -> EventEnvelope {

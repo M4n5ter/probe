@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::{
-    configured_enforcement::build_configured_enforcement,
+    configured_enforcement::{ConfiguredEnforcementError, build_configured_enforcement},
     configured_policy::{
         ConfiguredPolicyError, LoadedConfiguredPolicy, configured_policy_selection,
         load_configured_policy,
@@ -20,6 +20,8 @@ pub enum CheckError {
     ConfiguredPolicy(#[from] ConfiguredPolicyError),
     #[error("enforcement error: {0}")]
     Enforcement(#[from] enforcement::EnforcementError),
+    #[error("{0}")]
+    ConfiguredEnforcement(#[from] ConfiguredEnforcementError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -56,12 +58,37 @@ pub struct LoadedPolicySnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnforcementCheckSnapshot {
     pub mode: EnforcementMode,
+    pub effective_selector_configured: bool,
+    pub config_selector_configured: bool,
+    pub manifest_selector_configured: Option<bool>,
+    pub policy: EnforcementPolicyCheckSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EnforcementPolicyCheckSnapshot {
+    pub mode: EnforcementPolicyCheckMode,
+    pub active: Option<LoadedEnforcementPolicySnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementPolicyCheckMode {
+    NotConfigured,
+    Loaded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LoadedEnforcementPolicySnapshot {
+    pub id: String,
+    pub version: String,
+    pub path: PathBuf,
     pub selector_configured: bool,
+    pub protective_actions: probe_core::ProtectiveActionProfile,
 }
 
 pub fn build_check_report(plan: RuntimePlan) -> Result<CheckReport, CheckError> {
     let policy = check_policy(&plan.config)?;
-    let enforcement = check_enforcement(&plan.config)?;
+    let enforcement = check_enforcement(&plan)?;
     Ok(CheckReport {
         plan,
         policy,
@@ -89,11 +116,30 @@ fn check_policy(config: &AgentConfig) -> Result<PolicyCheckSnapshot, CheckError>
     })
 }
 
-fn check_enforcement(config: &AgentConfig) -> Result<EnforcementCheckSnapshot, CheckError> {
-    let enforcement = build_configured_enforcement(config)?;
+fn check_enforcement(plan: &RuntimePlan) -> Result<EnforcementCheckSnapshot, CheckError> {
+    let enforcement = build_configured_enforcement(plan)?;
+    let policy = enforcement.policy_source.as_ref().map_or(
+        EnforcementPolicyCheckSnapshot {
+            mode: EnforcementPolicyCheckMode::NotConfigured,
+            active: None,
+        },
+        |source| EnforcementPolicyCheckSnapshot {
+            mode: EnforcementPolicyCheckMode::Loaded,
+            active: Some(LoadedEnforcementPolicySnapshot {
+                id: source.manifest.id.clone(),
+                version: source.manifest.version.clone(),
+                path: source.path.clone(),
+                selector_configured: source.manifest.selector.is_some(),
+                protective_actions: source.manifest.protective_actions.clone(),
+            }),
+        },
+    );
     Ok(EnforcementCheckSnapshot {
         mode: enforcement.mode,
-        selector_configured: enforcement.selector_configured,
+        effective_selector_configured: enforcement.effective_selector_configured,
+        config_selector_configured: enforcement.config_selector_configured,
+        manifest_selector_configured: enforcement.manifest_selector_configured,
+        policy,
     })
 }
 
@@ -116,7 +162,7 @@ mod tests {
     };
 
     use probe_config::{AgentConfig, CaptureBackend};
-    use probe_core::{CapabilityKind, CapabilityState};
+    use probe_core::{Action, CapabilityKind, CapabilityState, ProtectiveActionProfile, Selector};
     use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
     use serde_json::json;
 
@@ -146,6 +192,144 @@ mod tests {
                 .contains(&PolicyHook::HttpRequestHeaders)
         );
         assert_eq!(report.enforcement.mode, EnforcementMode::AuditOnly);
+        assert_eq!(
+            report.enforcement.policy.mode,
+            EnforcementPolicyCheckMode::NotConfigured
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn check_report_loads_enforcement_policy_manifest() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-enforcement-policy")?;
+        let policy_path = temp.join("guard.lua");
+        fs::write(
+            &policy_path,
+            "function on_http_request_headers(_) return {} end",
+        )?;
+        let enforcement_path = temp.join("enforcement.toml");
+        let manifest = probe_config::EnforcementPolicyManifest {
+            id: "managed-apps".to_string(),
+            version: "v1".to_string(),
+            selector: Some(Selector::default()),
+            protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
+        };
+        fs::write(&enforcement_path, toml::to_string(&manifest)?)?;
+        let mut config = config_with_policy(&policy_path)?;
+        config.enforcement.policy.source = probe_config::EnforcementPolicySourceConfig::File {
+            path: enforcement_path.clone(),
+        };
+        let plan = runtime_plan(config)?;
+
+        let report = build_check_report(plan)?;
+
+        assert!(report.enforcement.effective_selector_configured);
+        assert!(!report.enforcement.config_selector_configured);
+        assert_eq!(report.enforcement.manifest_selector_configured, Some(true));
+        assert_eq!(
+            report.enforcement.policy.mode,
+            EnforcementPolicyCheckMode::Loaded
+        );
+        let active = report
+            .enforcement
+            .policy
+            .active
+            .as_ref()
+            .expect("enforcement policy manifest should load");
+        assert_eq!(active.id, "managed-apps");
+        assert_eq!(active.version, "v1");
+        assert_eq!(active.path, enforcement_path);
+        assert!(active.selector_configured);
+        assert_eq!(active.protective_actions.actions(), &[Action::Deny]);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn check_report_rejects_invalid_enforcement_policy_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-invalid-enforcement-policy")?;
+        let policy_path = temp.join("guard.lua");
+        fs::write(
+            &policy_path,
+            "function on_http_request_headers(_) return {} end",
+        )?;
+        let enforcement_path = temp.join("enforcement.toml");
+        fs::write(
+            &enforcement_path,
+            r#"
+id = "managed-apps"
+version = "v1"
+protective_actions = ["alert"]
+"#,
+        )?;
+        let mut config = config_with_policy(&policy_path)?;
+        config.enforcement.policy.source = probe_config::EnforcementPolicySourceConfig::File {
+            path: enforcement_path,
+        };
+        let plan = runtime_plan(config)?;
+
+        let error =
+            build_check_report(plan).expect_err("invalid enforcement manifest must fail check");
+
+        assert!(matches!(error, CheckError::ConfiguredEnforcement(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("not a protective enforcement action")
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn check_report_rejects_missing_enforcement_policy_directory_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-missing-enforcement-manifest")?;
+        let policy_path = temp.join("guard.lua");
+        fs::write(
+            &policy_path,
+            "function on_http_request_headers(_) return {} end",
+        )?;
+        let mut config = config_with_policy(&policy_path)?;
+        config.enforcement.policy.source = probe_config::EnforcementPolicySourceConfig::Directory {
+            path: temp.join("enforcement.d"),
+        };
+        let plan = runtime_plan(config)?;
+
+        let error =
+            build_check_report(plan).expect_err("missing enforcement manifest must fail check");
+
+        assert!(matches!(error, CheckError::ConfiguredEnforcement(_)));
+        assert!(error.to_string().contains("does not exist"));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn check_report_rejects_remote_enforcement_policy_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-remote-enforcement-policy")?;
+        let policy_path = temp.join("guard.lua");
+        fs::write(
+            &policy_path,
+            "function on_http_request_headers(_) return {} end",
+        )?;
+        let mut config = config_with_policy(&policy_path)?;
+        config.enforcement.policy.source = probe_config::EnforcementPolicySourceConfig::Remote {
+            endpoint: "https://control.example/enforcement".to_string(),
+        };
+        let plan = runtime_plan(config)?;
+
+        let error = build_check_report(plan).expect_err("remote source is not implemented");
+
+        assert!(matches!(error, CheckError::ConfiguredEnforcement(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("remote enforcement policy source is reserved")
+        );
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -191,7 +375,22 @@ mod tests {
                 .is_some_and(|hooks| hooks.iter().any(|hook| hook == "on_http_request_headers"))
         );
         assert_eq!(value["enforcement"]["mode"], json!("audit_only"));
-        assert_eq!(value["enforcement"]["selector_configured"], json!(false));
+        assert_eq!(
+            value["enforcement"]["effective_selector_configured"],
+            json!(false)
+        );
+        assert_eq!(
+            value["enforcement"]["config_selector_configured"],
+            json!(false)
+        );
+        assert_eq!(
+            value["enforcement"]["manifest_selector_configured"],
+            json!(null)
+        );
+        assert_eq!(
+            value["enforcement"]["policy"]["mode"],
+            json!("not_configured")
+        );
         assert!(value["enforcement"].get("planner_loaded").is_none());
         fs::remove_dir_all(temp)?;
         Ok(())
