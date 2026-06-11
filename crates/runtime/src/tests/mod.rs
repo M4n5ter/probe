@@ -77,22 +77,26 @@ fn export_plan_disables_worker_without_sinks() -> Result<(), Box<dyn std::error:
 
     let plan = RuntimePlan::build(AgentConfig::default(), &registry)?;
 
-    assert!(!plan.export.worker_enabled);
-    assert_eq!(plan.export.worker_interval_ms, 1_000);
-    assert_eq!(plan.export.worker_mode, None);
-    assert_eq!(plan.export.sinks, Vec::<ExportSinkPlan>::new());
     assert_eq!(
-        plan.export.reason.as_deref(),
-        Some("export worker has no planned sinks")
+        plan.export.worker,
+        ExportWorkerPlan::Disabled {
+            reason: "export worker has no planned sinks".to_string(),
+        }
     );
+    assert_eq!(plan.export.sinks, Vec::<ExportSinkPlan>::new());
     Ok(())
 }
 
 #[test]
-fn export_plan_normalizes_worker_mode_and_sinks() -> Result<(), Box<dyn std::error::Error>> {
+fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::error::Error>> {
     let registry = ProviderRegistry::new(vec![], test_platform_capabilities());
     let mut config = AgentConfig::default();
-    config.export.worker_interval_ms = 250;
+    config.export.worker.schedule =
+        probe_config::ExportWorkerScheduleConfig::FixedIntervalBounded {
+            interval_ms: 250,
+            batches_per_sink_per_tick: 3,
+            sink_timeout_ms: 2_000,
+        };
     config.exporters = vec![probe_config::ExporterConfig {
         id: "primary".to_string(),
         transport: ExporterTransport::Webhook,
@@ -103,15 +107,13 @@ fn export_plan_normalizes_worker_mode_and_sinks() -> Result<(), Box<dyn std::err
 
     let plan = RuntimePlan::build(config, &registry)?;
 
-    assert!(plan.export.worker_enabled);
-    assert_eq!(plan.export.worker_interval_ms, 250);
-    assert_eq!(plan.export.reason, None);
     assert_eq!(
-        plan.export.worker_mode,
-        Some(ExportWorkerMode::FixedIntervalBounded {
-            batches_per_sink_per_tick: EXPORT_WORKER_BATCHES_PER_SINK_PER_TICK,
-            sink_timeout_ms: EXPORT_WORKER_SINK_TIMEOUT_MS,
-        })
+        plan.export.worker,
+        ExportWorkerPlan::FixedIntervalBounded {
+            interval_ms: 250,
+            batches_per_sink_per_tick: 3,
+            sink_timeout_ms: 2_000,
+        }
     );
     assert_eq!(
         plan.export.sinks,

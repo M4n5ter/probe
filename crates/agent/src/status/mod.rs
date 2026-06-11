@@ -14,7 +14,7 @@ use health::health_snapshot;
 use policy::{PolicyStatusSnapshot, policy_status};
 use probe_config::{CaptureBackend, CaptureSelection, CompressionCodecName, ExporterTransport};
 use probe_core::{CapabilityMatrix, RuntimeMode};
-use runtime::{CapturePlanMode, RuntimePlan};
+use runtime::{CapturePlanMode, ExportWorkerPlan, RuntimePlan};
 use serde::Serialize;
 use storage::{FjallSpool, SpoolProbe, SpoolSnapshot};
 use tls::{TlsStatusSnapshot, tls_status};
@@ -70,7 +70,7 @@ pub struct ExporterStatusSnapshot {
     pub id: String,
     pub transport: ExporterTransport,
     pub codec: CompressionCodecName,
-    pub worker_enabled: bool,
+    pub worker: ExportWorkerPlan,
     pub mode: RuntimeMode,
     pub reason: Option<String>,
     pub cursor: Option<u64>,
@@ -287,7 +287,7 @@ fn exporter_statuses(
                 id: sink.id.clone(),
                 transport: sink.transport,
                 codec: sink.codec,
-                worker_enabled: plan.export.worker_enabled,
+                worker: plan.export.worker.clone(),
                 mode,
                 reason,
                 cursor,
@@ -336,14 +336,8 @@ fn exporter_mode(
             );
         }
     }
-    if !plan.export.worker_enabled {
-        return (
-            RuntimeMode::Degraded,
-            plan.export
-                .reason
-                .clone()
-                .or_else(|| Some("export worker is disabled".to_string())),
-        );
+    if let Some(reason) = plan.export.worker.disabled_reason() {
+        return (RuntimeMode::Degraded, Some(reason.to_string()));
     }
     (RuntimeMode::Available, None)
 }
@@ -429,6 +423,14 @@ mod tests {
         assert_eq!(snapshot.exporters.len(), 1);
         assert_eq!(snapshot.exporters[0].cursor, Some(3));
         assert_eq!(snapshot.exporters[0].lag, Some(2));
+        assert_eq!(
+            snapshot.exporters[0].worker,
+            ExportWorkerPlan::FixedIntervalBounded {
+                interval_ms: 1_000,
+                batches_per_sink_per_tick: 1,
+                sink_timeout_ms: 10_000,
+            }
+        );
         assert_eq!(snapshot.policy.mode, PolicyStatusMode::Inactive);
         assert_eq!(
             snapshot.enforcement.status,

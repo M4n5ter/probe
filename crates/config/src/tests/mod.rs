@@ -16,8 +16,15 @@ fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {
     assert!(!config.capture.libpcap.promisc);
     assert!(config.capture.libpcap.immediate_mode);
     assert_eq!(config.capture.libpcap.read_timeout_ms, 1_000);
-    assert!(config.export.worker_enabled);
-    assert_eq!(config.export.worker_interval_ms, 1_000);
+    assert!(config.export.worker.enabled);
+    assert_eq!(
+        config.export.worker.schedule,
+        ExportWorkerScheduleConfig::FixedIntervalBounded {
+            interval_ms: 1_000,
+            batches_per_sink_per_tick: 1,
+            sink_timeout_ms: 10_000,
+        }
+    );
     assert_eq!(config.exporters, Vec::<ExporterConfig>::new());
     assert_eq!(config.enforcement.mode, EnforcementMode::AuditOnly);
     config.validate_basic()?;
@@ -48,9 +55,14 @@ buffer_size = 1048576
 path = "/tmp/sssa-spool"
 ingress_retention_bytes = 1048576
 
-[export]
-worker_enabled = true
-worker_interval_ms = 250
+[export.worker]
+enabled = true
+
+[export.worker.schedule]
+mode = "fixed_interval_bounded"
+interval_ms = 250
+batches_per_sink_per_tick = 3
+sink_timeout_ms = 2000
 
 [[exporters]]
 id = "primary"
@@ -87,8 +99,15 @@ socket_path = "/run/sssa-probe/admin.sock"
     assert_eq!(config.capture.libpcap.read_timeout_ms, 250);
     assert_eq!(config.capture.libpcap.buffer_size, Some(1_048_576));
     assert_eq!(config.storage.path, PathBuf::from("/tmp/sssa-spool"));
-    assert!(config.export.worker_enabled);
-    assert_eq!(config.export.worker_interval_ms, 250);
+    assert!(config.export.worker.enabled);
+    assert_eq!(
+        config.export.worker.schedule,
+        ExportWorkerScheduleConfig::FixedIntervalBounded {
+            interval_ms: 250,
+            batches_per_sink_per_tick: 3,
+            sink_timeout_ms: 2_000,
+        }
+    );
     assert_eq!(config.exporters[0].codec, CompressionCodecName::Zstd);
     assert_eq!(config.tls.materials[0].kind, TlsMaterialKind::TrustAnchor);
     assert!(config.tls.plaintext.enabled);
@@ -292,13 +311,17 @@ socket_path = "admin.sock"
 }
 
 #[test]
-fn validation_rejects_zero_enabled_export_worker_interval() -> Result<(), Box<dyn std::error::Error>>
-{
+fn validation_rejects_zero_enabled_export_worker_knobs() -> Result<(), Box<dyn std::error::Error>> {
     let enabled = AgentConfig::from_toml_str(
         r#"
-[export]
-worker_enabled = true
-worker_interval_ms = 0
+[export.worker]
+enabled = true
+
+[export.worker.schedule]
+mode = "fixed_interval_bounded"
+interval_ms = 0
+batches_per_sink_per_tick = 0
+sink_timeout_ms = 0
 "#,
     )?;
 
@@ -310,12 +333,27 @@ worker_interval_ms = 0
             .to_string()
             .contains("export worker interval must be positive")
     );
+    assert!(
+        error
+            .to_string()
+            .contains("export worker per-sink batch budget must be positive")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("export worker sink timeout must be positive")
+    );
 
     let disabled = AgentConfig::from_toml_str(
         r#"
-[export]
-worker_enabled = false
-worker_interval_ms = 0
+[export.worker]
+enabled = false
+
+[export.worker.schedule]
+mode = "fixed_interval_bounded"
+interval_ms = 0
+batches_per_sink_per_tick = 0
+sink_timeout_ms = 0
 "#,
     )?;
     disabled.validate_basic()?;

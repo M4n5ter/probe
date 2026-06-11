@@ -1,16 +1,13 @@
 use attribution::{ProcessAttributor, ProcfsAttributor, ProcfsSocketResolver};
 use probe_config::{
     AgentConfig, CaptureBackend, CaptureSelection, CompressionCodecName, ConfigError,
-    ConfigValidationError, ConfigViolation, ExporterTransport, LiveCaptureBackend,
-    TlsPlaintextProvider,
+    ConfigValidationError, ConfigViolation, ExportWorkerScheduleConfig, ExporterTransport,
+    LiveCaptureBackend, TlsPlaintextProvider,
 };
 use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
-
-pub const EXPORT_WORKER_BATCHES_PER_SINK_PER_TICK: u64 = 1;
-pub const EXPORT_WORKER_SINK_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -62,11 +59,8 @@ impl RuntimePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportPlan {
-    pub worker_enabled: bool,
-    pub worker_interval_ms: u64,
-    pub worker_mode: Option<ExportWorkerMode>,
+    pub worker: ExportWorkerPlan,
     pub sinks: Vec<ExportSinkPlan>,
-    pub reason: Option<String>,
 }
 
 impl ExportPlan {
@@ -82,34 +76,56 @@ impl ExportPlan {
                 headers: exporter.headers.clone(),
             })
             .collect::<Vec<_>>();
-        let worker_enabled = config.export.worker_enabled && !sinks.is_empty();
-        let worker_mode = worker_enabled.then_some(ExportWorkerMode::FixedIntervalBounded {
-            batches_per_sink_per_tick: EXPORT_WORKER_BATCHES_PER_SINK_PER_TICK,
-            sink_timeout_ms: EXPORT_WORKER_SINK_TIMEOUT_MS,
-        });
-        let reason = match (config.export.worker_enabled, sinks.is_empty()) {
-            (false, _) => Some("export worker disabled by config".to_string()),
-            (true, true) => Some("export worker has no planned sinks".to_string()),
-            (true, false) => None,
+        let worker = match (config.export.worker.enabled, sinks.is_empty()) {
+            (false, _) => ExportWorkerPlan::Disabled {
+                reason: "export worker disabled by config".to_string(),
+            },
+            (true, true) => ExportWorkerPlan::Disabled {
+                reason: "export worker has no planned sinks".to_string(),
+            },
+            (true, false) => ExportWorkerPlan::from(config.export.worker.schedule),
         };
 
-        Self {
-            worker_enabled,
-            worker_interval_ms: config.export.worker_interval_ms,
-            worker_mode,
-            sinks,
-            reason,
+        Self { worker, sinks }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ExportWorkerPlan {
+    Disabled {
+        reason: String,
+    },
+    FixedIntervalBounded {
+        interval_ms: u64,
+        batches_per_sink_per_tick: u64,
+        sink_timeout_ms: u64,
+    },
+}
+
+impl ExportWorkerPlan {
+    pub fn disabled_reason(&self) -> Option<&str> {
+        match self {
+            Self::Disabled { reason } => Some(reason),
+            Self::FixedIntervalBounded { .. } => None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum ExportWorkerMode {
-    FixedIntervalBounded {
-        batches_per_sink_per_tick: u64,
-        sink_timeout_ms: u64,
-    },
+impl From<ExportWorkerScheduleConfig> for ExportWorkerPlan {
+    fn from(value: ExportWorkerScheduleConfig) -> Self {
+        match value {
+            ExportWorkerScheduleConfig::FixedIntervalBounded {
+                interval_ms,
+                batches_per_sink_per_tick,
+                sink_timeout_ms,
+            } => Self::FixedIntervalBounded {
+                interval_ms,
+                batches_per_sink_per_tick,
+                sink_timeout_ms,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -546,7 +562,7 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::degraded(
             CapabilityKind::WebhookExporter,
-            "webhook transport can drain planned export sinks during run and replay CLI webhook output during replay, but retry/backoff, per-sink quota, and retention deadline are not implemented",
+            "webhook transport can drain planned export sinks with configured fixed worker bounds during run and replay CLI webhook output during replay, but adaptive retry/backoff, per-sink rate quota, and retention deadline are not implemented",
         ),
         CapabilityState::available(
             CapabilityKind::DryRunEnforcement,

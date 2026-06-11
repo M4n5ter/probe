@@ -9,6 +9,9 @@ use thiserror::Error;
 
 const RESERVED_EXPORTER_HEADERS: &[&str] = &["content-type", "idempotency-key", "x-sssa-codec"];
 const REPLAY_WEBHOOK_SINK_ID: &str = "replay-webhook";
+pub const DEFAULT_EXPORT_WORKER_INTERVAL_MS: u64 = 1_000;
+pub const DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK: u64 = 1;
+pub const DEFAULT_EXPORT_SINK_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -192,18 +195,44 @@ impl Default for StorageConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExportRuntimeConfig {
-    pub worker_enabled: bool,
-    pub worker_interval_ms: u64,
+    pub worker: ExportWorkerRuntimeConfig,
 }
 
-impl Default for ExportRuntimeConfig {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExportWorkerRuntimeConfig {
+    pub enabled: bool,
+    pub schedule: ExportWorkerScheduleConfig,
+}
+
+impl Default for ExportWorkerRuntimeConfig {
     fn default() -> Self {
         Self {
-            worker_enabled: true,
-            worker_interval_ms: 1_000,
+            enabled: true,
+            schedule: ExportWorkerScheduleConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum ExportWorkerScheduleConfig {
+    FixedIntervalBounded {
+        interval_ms: u64,
+        batches_per_sink_per_tick: u64,
+        sink_timeout_ms: u64,
+    },
+}
+
+impl Default for ExportWorkerScheduleConfig {
+    fn default() -> Self {
+        Self::FixedIntervalBounded {
+            interval_ms: DEFAULT_EXPORT_WORKER_INTERVAL_MS,
+            batches_per_sink_per_tick: DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK,
+            sink_timeout_ms: DEFAULT_EXPORT_SINK_TIMEOUT_MS,
         }
     }
 }
@@ -503,12 +532,37 @@ fn validate_plaintext_feed_selection(tls: &TlsConfig, violations: &mut Vec<Confi
 }
 
 fn validate_export_runtime(export: &ExportRuntimeConfig, violations: &mut Vec<ConfigViolation>) {
-    if export.worker_enabled && export.worker_interval_ms == 0 {
-        violations.push(ConfigViolation {
-            field: "export.worker_interval_ms".to_string(),
-            reason: "export worker interval must be positive when the worker is enabled"
-                .to_string(),
-        });
+    if !export.worker.enabled {
+        return;
+    }
+    let ExportWorkerScheduleConfig::FixedIntervalBounded {
+        interval_ms,
+        batches_per_sink_per_tick,
+        sink_timeout_ms,
+    } = export.worker.schedule;
+    for (field, value, reason) in [
+        (
+            "export.worker.schedule.interval_ms",
+            interval_ms,
+            "export worker interval must be positive when the worker is enabled",
+        ),
+        (
+            "export.worker.schedule.batches_per_sink_per_tick",
+            batches_per_sink_per_tick,
+            "export worker per-sink batch budget must be positive when the worker is enabled",
+        ),
+        (
+            "export.worker.schedule.sink_timeout_ms",
+            sink_timeout_ms,
+            "export worker sink timeout must be positive when the worker is enabled",
+        ),
+    ] {
+        if value == 0 {
+            violations.push(ConfigViolation {
+                field: field.to_string(),
+                reason: reason.to_string(),
+            });
+        }
     }
 }
 

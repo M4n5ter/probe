@@ -4,7 +4,7 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use exporter::{CompressionCodec, ReliableExporter, WebhookExporter};
 use probe_config::{CompressionCodecName, ExporterTransport};
 use proto::{BatchEnvelope, EVENT_ENVELOPE_JSON_SCHEMA};
-use runtime::{ExportPlan, ExportSinkPlan, ExportWorkerMode};
+use runtime::{ExportPlan, ExportSinkPlan, ExportWorkerPlan};
 use storage::DurableSpool;
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -63,20 +63,18 @@ impl ExportWorkerConfig {
     }
 
     pub fn from_export_plan(agent_id: String, plan: &ExportPlan) -> Option<Self> {
-        if !plan.worker_enabled {
-            return None;
-        }
-        let mode = plan.worker_mode?;
-        match mode {
-            ExportWorkerMode::FixedIntervalBounded {
+        match &plan.worker {
+            ExportWorkerPlan::Disabled { .. } => None,
+            ExportWorkerPlan::FixedIntervalBounded {
+                interval_ms,
                 batches_per_sink_per_tick,
                 sink_timeout_ms,
             } => Some(Self::fixed_interval_bounded(
                 agent_id,
                 plan.sinks.clone(),
-                Duration::from_millis(plan.worker_interval_ms),
-                batches_per_sink_per_tick,
-                Duration::from_millis(sink_timeout_ms),
+                Duration::from_millis(*interval_ms),
+                *batches_per_sink_per_tick,
+                Duration::from_millis(*sink_timeout_ms),
             )),
         }
     }
@@ -416,14 +414,14 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use probe_config::{AgentConfig, ExporterConfig};
+    use probe_config::{AgentConfig, ExportWorkerScheduleConfig, ExporterConfig};
     use probe_core::{
         AddressPort, CapabilityKind, CapabilityState, CaptureSource, EventEnvelope, EventKind,
         FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
     };
     use proto::{BATCH_SCHEMA_VERSION, EventRecord, PayloadFormat};
     use runtime::{ProviderRegistry, RuntimePlan};
-    use storage::FjallSpool;
+    use storage::{DurableSpool, FjallSpool, SpoolPayload, StorageError, StoredEvent};
 
     use super::*;
 
@@ -516,7 +514,11 @@ mod tests {
             }],
             ..AgentConfig::default()
         };
-        config.export.worker_interval_ms = 10;
+        config.export.worker.schedule = ExportWorkerScheduleConfig::FixedIntervalBounded {
+            interval_ms: 10,
+            batches_per_sink_per_tick: 1,
+            sink_timeout_ms: 5_000,
+        };
         config.validate_basic()?;
         let plan = runtime_plan(config)?;
         let config =
@@ -544,6 +546,45 @@ mod tests {
             Some("agent-1:worker:2")
         );
         fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn export_worker_uses_configured_per_tick_batch_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let spool = Arc::new(SingleEventBatchSpool::with_export_events(2)?);
+        let server = TestWebhookServer::spawn_accepting(true, 2)?;
+        let plan = ExportPlan {
+            worker: ExportWorkerPlan::FixedIntervalBounded {
+                interval_ms: 60_000,
+                batches_per_sink_per_tick: 2,
+                sink_timeout_ms: 5_000,
+            },
+            sinks: vec![ExportSinkPlan {
+                id: "budget".to_string(),
+                transport: ExporterTransport::Webhook,
+                endpoint: server.endpoint(),
+                codec: CompressionCodecName::None,
+                headers: BTreeMap::new(),
+            }],
+        };
+        let config = ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
+            .expect("worker should be enabled");
+
+        let worker = spawn_export_worker(Arc::clone(&spool), config);
+        wait_for_memory_export_cursor(spool.as_ref(), 2).await?;
+        worker.stop().await;
+
+        let requests = server.join_requests()?;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            request_header(&requests[0], "idempotency-key").as_deref(),
+            Some("agent-1:budget:1")
+        );
+        assert_eq!(
+            request_header(&requests[1], "idempotency-key").as_deref(),
+            Some("agent-1:budget:2")
+        );
         Ok(())
     }
 
@@ -685,6 +726,135 @@ mod tests {
             spool.export_cursor(sink)?
         )
         .into())
+    }
+
+    async fn wait_for_memory_export_cursor(
+        spool: &SingleEventBatchSpool,
+        expected_cursor: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..50 {
+            let cursor = spool.export_cursor("budget")?;
+            if cursor >= expected_cursor {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Err(format!(
+            "memory export cursor did not reach {expected_cursor}; current cursor is {}",
+            spool.export_cursor("budget")?
+        )
+        .into())
+    }
+
+    struct SingleEventBatchSpool {
+        events: Mutex<Vec<StoredEvent>>,
+        cursor: Mutex<u64>,
+    }
+
+    impl SingleEventBatchSpool {
+        fn with_export_events(count: u64) -> Result<Self, serde_json::Error> {
+            let events = (1..=count)
+                .map(|sequence| {
+                    let payload = export_event_payload(sequence)?;
+                    Ok(StoredEvent { sequence, payload })
+                })
+                .collect::<Result<Vec<_>, serde_json::Error>>()?;
+            Ok(Self {
+                events: Mutex::new(events),
+                cursor: Mutex::new(0),
+            })
+        }
+    }
+
+    impl DurableSpool for SingleEventBatchSpool {
+        fn append_ingress(&self, _payload: SpoolPayload) -> Result<StoredEvent, StorageError> {
+            unimplemented!("export worker tests do not append ingress events")
+        }
+
+        fn read_ingress_batch(
+            &self,
+            _consumer: &str,
+            _limit: usize,
+        ) -> Result<Vec<StoredEvent>, StorageError> {
+            unimplemented!("export worker tests do not read ingress events")
+        }
+
+        fn ack_ingress(&self, _consumer: &str, _sequence: u64) -> Result<(), StorageError> {
+            unimplemented!("export worker tests do not ack ingress events")
+        }
+
+        fn ingress_cursor(&self, _consumer: &str) -> Result<u64, StorageError> {
+            unimplemented!("export worker tests do not inspect ingress cursors")
+        }
+
+        fn append_export(&self, _payload: SpoolPayload) -> Result<StoredEvent, StorageError> {
+            unimplemented!("export worker tests seed export events directly")
+        }
+
+        fn read_export_batch(
+            &self,
+            _sink: &str,
+            limit: usize,
+        ) -> Result<Vec<StoredEvent>, StorageError> {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let cursor = *self
+                .cursor
+                .lock()
+                .map_err(|_| StorageError::SequenceLockPoisoned { lane: "export" })?;
+            let events = self
+                .events
+                .lock()
+                .map_err(|_| StorageError::SequenceLockPoisoned { lane: "export" })?;
+            Ok(events
+                .iter()
+                .find(|event| event.sequence > cursor)
+                .cloned()
+                .into_iter()
+                .collect())
+        }
+
+        fn ack_export(&self, _sink: &str, sequence: u64) -> Result<(), StorageError> {
+            let last_sequence = self
+                .events
+                .lock()
+                .map_err(|_| StorageError::SequenceLockPoisoned { lane: "export" })?
+                .last()
+                .map_or(0, |event| event.sequence);
+            if sequence > last_sequence {
+                return Err(StorageError::AckBeyondLastSequence {
+                    sink: "budget".to_string(),
+                    sequence,
+                    last_sequence,
+                });
+            }
+            let mut cursor = self
+                .cursor
+                .lock()
+                .map_err(|_| StorageError::SequenceLockPoisoned { lane: "export" })?;
+            *cursor = (*cursor).max(sequence);
+            Ok(())
+        }
+
+        fn export_cursor(&self, _sink: &str) -> Result<u64, StorageError> {
+            self.cursor
+                .lock()
+                .map(|cursor| *cursor)
+                .map_err(|_| StorageError::SequenceLockPoisoned { lane: "export" })
+        }
+    }
+
+    fn export_event_payload(sequence: u64) -> Result<SpoolPayload, serde_json::Error> {
+        let envelope = EventEnvelope::new(
+            current_timestamp(sequence),
+            replay_flow(),
+            CaptureSource::Replay,
+            "test",
+            EventKind::ConnectionOpened,
+        );
+        serde_json::to_vec(&envelope)
+            .map(|payload| SpoolPayload::new(EVENT_ENVELOPE_JSON_SCHEMA, payload))
     }
 
     struct TestWebhookServer {
