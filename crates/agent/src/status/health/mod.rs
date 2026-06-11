@@ -3,7 +3,7 @@ use runtime::{CapturePlanMode, RuntimePlan};
 
 use super::{
     EnforcementStatusSnapshot, ExporterStatusSnapshot, HealthSnapshot, SpoolStatusSnapshot,
-    enforcement::EnforcementPolicySourceStatusMode,
+    enforcement::EnforcementPolicySourceStatusSnapshot,
     policy::{PolicyStatusMode, PolicyStatusSnapshot},
 };
 
@@ -90,20 +90,34 @@ fn policy_reason(policy: &PolicyStatusSnapshot, fallback: &str) -> String {
 }
 
 fn enforcement_health_contribution(enforcement: &EnforcementStatusSnapshot) -> HealthContribution {
-    match enforcement.policy.source.mode {
-        EnforcementPolicySourceStatusMode::NotConfigured
-        | EnforcementPolicySourceStatusMode::Loaded => HealthContribution::available(),
-        EnforcementPolicySourceStatusMode::MetadataOnly => HealthContribution::degraded(
-            enforcement_policy_reason(enforcement, "enforcement policy status is metadata-only"),
-        ),
-        EnforcementPolicySourceStatusMode::Unavailable => HealthContribution::unavailable(
-            enforcement_policy_reason(enforcement, "enforcement policy is unavailable"),
-        ),
+    match &enforcement.policy.source {
+        EnforcementPolicySourceStatusSnapshot::NotConfigured
+        | EnforcementPolicySourceStatusSnapshot::Loaded { .. } => HealthContribution::available(),
+        EnforcementPolicySourceStatusSnapshot::LocalMetadata { .. }
+        | EnforcementPolicySourceStatusSnapshot::RemoteConfigured { .. } => {
+            HealthContribution::degraded(enforcement_policy_reason(
+                enforcement,
+                "enforcement policy status is metadata-only",
+            ))
+        }
+        EnforcementPolicySourceStatusSnapshot::Unavailable { .. } => {
+            HealthContribution::unavailable(enforcement_policy_reason(
+                enforcement,
+                "enforcement policy is unavailable",
+            ))
+        }
     }
 }
 
 fn enforcement_policy_reason(enforcement: &EnforcementStatusSnapshot, fallback: &str) -> String {
-    enforcement.policy.source.reason.clone().map_or_else(
+    let reason = match &enforcement.policy.source {
+        EnforcementPolicySourceStatusSnapshot::LocalMetadata { reason, .. }
+        | EnforcementPolicySourceStatusSnapshot::RemoteConfigured { reason, .. }
+        | EnforcementPolicySourceStatusSnapshot::Unavailable { reason } => Some(reason.as_str()),
+        EnforcementPolicySourceStatusSnapshot::NotConfigured
+        | EnforcementPolicySourceStatusSnapshot::Loaded { .. } => None,
+    };
+    reason.map_or_else(
         || format!("enforcement policy: {fallback}"),
         |reason| format!("enforcement policy: {reason}"),
     )

@@ -541,10 +541,10 @@ mod tests {
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
         let plan = Arc::new(runtime_plan_from_config(config)?);
         let runtime_state = AdminRuntimeState {
-            enforcement_policy_source: Some(LoadedEnforcementPolicySource {
-                path: manifest_path.clone(),
+            enforcement_policy_source: Some(LoadedEnforcementPolicySource::local(
+                manifest_path.clone(),
                 manifest,
-            }),
+            )),
         };
         fs::remove_file(&manifest_path)?;
         let server = spawn_admin_server(
@@ -561,6 +561,14 @@ mod tests {
         assert_eq!(
             response["snapshot"]["enforcement"]["policy"]["source"]["mode"],
             json!("loaded")
+        );
+        assert_eq!(
+            response["snapshot"]["enforcement"]["policy"]["source"]["source"]["kind"],
+            json!("local")
+        );
+        assert_eq!(
+            response["snapshot"]["enforcement"]["policy"]["source"]["source"]["path"],
+            json!(manifest_path)
         );
         assert_eq!(
             response["snapshot"]["enforcement"]["policy"]["source"]["manifest"]["protective_actions"],

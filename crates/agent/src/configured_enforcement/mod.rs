@@ -1,6 +1,9 @@
 mod source;
 
-pub use source::{LoadedEnforcementPolicySource, inspect_enforcement_policy_source};
+pub use source::{
+    EnforcementPolicySourceInspection, LoadedEnforcementPolicySource,
+    LoadedEnforcementPolicySourceOriginRef, inspect_enforcement_policy_source,
+};
 
 use enforcement::{EnforcementError, ScopedEnforcementPlanner};
 use probe_config::AgentConfig;
@@ -8,7 +11,10 @@ use probe_core::{EnforcementMode, ProtectiveActionProfile, Selector};
 use runtime::{EnforcementPlan, EnforcementPolicySourcePlan, RuntimePlan};
 use thiserror::Error;
 
-use self::source::{EnforcementPolicySourceError, load_enforcement_policy_source};
+use self::source::{
+    EnforcementPolicySourceError, load_enforcement_policy_source,
+    load_enforcement_policy_source_metadata,
+};
 
 #[derive(Debug, Error)]
 pub enum ConfiguredEnforcementError {
@@ -27,7 +33,7 @@ pub struct ConfiguredEnforcement {
     pub policy_source: Option<LoadedEnforcementPolicySource>,
 }
 
-pub fn build_configured_enforcement(
+pub async fn build_configured_enforcement(
     plan: &RuntimePlan,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
     build_configured_enforcement_from_parts(
@@ -36,27 +42,38 @@ pub fn build_configured_enforcement(
         plan.enforcement.config_selector_configured,
         &plan.enforcement.policy_source,
     )
+    .await
 }
 
-pub fn build_configured_enforcement_from_config(
+pub fn validate_configured_enforcement_metadata(
     config: &AgentConfig,
-) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
+) -> Result<(), ConfiguredEnforcementError> {
     let enforcement = EnforcementPlan::resolve(config);
-    build_configured_enforcement_from_parts(
-        enforcement.mode,
+    let manifest = load_enforcement_policy_source_metadata(&enforcement.policy_source)?;
+    let effective_selector = effective_selector(
         config.enforcement.selector.clone(),
-        enforcement.config_selector_configured,
-        &enforcement.policy_source,
-    )
+        manifest
+            .as_ref()
+            .and_then(|manifest| manifest.selector.clone()),
+    );
+    let protective_actions = manifest.map_or_else(ProtectiveActionProfile::default, |manifest| {
+        manifest.protective_actions
+    });
+    ScopedEnforcementPlanner::with_protective_action_profile(
+        enforcement.mode,
+        effective_selector.as_ref(),
+        protective_actions,
+    )?;
+    Ok(())
 }
 
-fn build_configured_enforcement_from_parts(
+async fn build_configured_enforcement_from_parts(
     mode: EnforcementMode,
     config_selector: Option<Selector>,
     config_selector_configured: bool,
     policy_source_plan: &EnforcementPolicySourcePlan,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
-    let policy_source = load_enforcement_policy_source(policy_source_plan)?;
+    let policy_source = load_enforcement_policy_source(policy_source_plan).await?;
     let effective_selector = effective_selector(
         config_selector,
         policy_source

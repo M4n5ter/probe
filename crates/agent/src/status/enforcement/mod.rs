@@ -1,5 +1,8 @@
+use std::path::PathBuf;
+
 use crate::configured_enforcement::{
-    LoadedEnforcementPolicySource, inspect_enforcement_policy_source,
+    EnforcementPolicySourceInspection, LoadedEnforcementPolicySource,
+    LoadedEnforcementPolicySourceOriginRef, inspect_enforcement_policy_source,
 };
 use probe_core::{CapabilityKind, EnforcementMode, ProtectiveActionProfile, RuntimeMode};
 use runtime::RuntimePlan;
@@ -40,19 +43,31 @@ pub struct EnforcementPolicyStatusSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EnforcementPolicySourceStatusSnapshot {
-    pub mode: EnforcementPolicySourceStatusMode,
-    pub reason: Option<String>,
-    pub manifest: Option<EnforcementPolicyManifestStatusSnapshot>,
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum EnforcementPolicySourceStatusSnapshot {
+    NotConfigured,
+    LocalMetadata {
+        reason: String,
+        manifest: EnforcementPolicyManifestStatusSnapshot,
+    },
+    RemoteConfigured {
+        endpoint: String,
+        reason: String,
+    },
+    Loaded {
+        source: LoadedEnforcementPolicySourceStatusSnapshot,
+        manifest: EnforcementPolicyManifestStatusSnapshot,
+    },
+    Unavailable {
+        reason: String,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EnforcementPolicySourceStatusMode {
-    NotConfigured,
-    MetadataOnly,
-    Loaded,
-    Unavailable,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum LoadedEnforcementPolicySourceStatusSnapshot {
+    Local { path: PathBuf },
+    Remote { endpoint: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -80,20 +95,6 @@ fn enforcement_status_with_source(
 ) -> EnforcementStatusSnapshot {
     let configured_mode = plan.enforcement.mode;
     let policy = enforcement_policy_status(plan, source);
-    let manifest_selector_configured = policy
-        .source
-        .manifest
-        .as_ref()
-        .map(|manifest| manifest.selector_configured);
-    let effective_selector_configured = match policy.source.mode {
-        EnforcementPolicySourceStatusMode::Unavailable => None,
-        EnforcementPolicySourceStatusMode::NotConfigured
-        | EnforcementPolicySourceStatusMode::MetadataOnly
-        | EnforcementPolicySourceStatusMode::Loaded => Some(
-            plan.enforcement.config_selector_configured
-                || manifest_selector_configured.unwrap_or(false),
-        ),
-    };
     let (status, capability) = match configured_mode {
         EnforcementMode::Disabled => (
             EnforcementStatusMode::Disabled,
@@ -118,10 +119,10 @@ fn enforcement_status_with_source(
     EnforcementStatusSnapshot {
         configured_mode,
         status,
-        effective_selector_configured,
+        effective_selector_configured: policy.effective_selector_configured,
         config_selector_configured: plan.enforcement.config_selector_configured,
-        manifest_selector_configured,
-        policy,
+        manifest_selector_configured: policy.manifest_selector_configured,
+        policy: policy.snapshot,
         capability,
     }
 }
@@ -134,83 +135,149 @@ enum EnforcementPolicyStatusSource<'a> {
 fn enforcement_policy_status(
     plan: &RuntimePlan,
     source: EnforcementPolicyStatusSource<'_>,
-) -> EnforcementPolicyStatusSnapshot {
+) -> EnforcementPolicyStatus {
     match source {
         EnforcementPolicyStatusSource::Offline => offline_enforcement_policy_status(plan),
-        EnforcementPolicyStatusSource::Loaded(source) => loaded_enforcement_policy_status(source),
+        EnforcementPolicyStatusSource::Loaded(source) => {
+            loaded_enforcement_policy_status(plan, source)
+        }
     }
 }
 
-fn offline_enforcement_policy_status(plan: &RuntimePlan) -> EnforcementPolicyStatusSnapshot {
-    if matches!(
-        plan.enforcement.policy_source,
-        runtime::EnforcementPolicySourcePlan::None
-    ) {
-        return EnforcementPolicyStatusSnapshot {
-            source: EnforcementPolicySourceStatusSnapshot {
-                mode: EnforcementPolicySourceStatusMode::NotConfigured,
-                reason: None,
-                manifest: None,
-            },
-        };
-    }
+struct EnforcementPolicyStatus {
+    snapshot: EnforcementPolicyStatusSnapshot,
+    manifest_selector_configured: Option<bool>,
+    effective_selector_configured: Option<bool>,
+}
 
-    let inspection = inspect_enforcement_policy_source(&plan.enforcement.policy_source);
-    let (mode, reason, manifest) = match inspection.mode {
-        RuntimeMode::Available => (
-            EnforcementPolicySourceStatusMode::MetadataOnly,
-            Some(
+fn offline_enforcement_policy_status(plan: &RuntimePlan) -> EnforcementPolicyStatus {
+    match inspect_enforcement_policy_source(&plan.enforcement.policy_source) {
+        EnforcementPolicySourceInspection::NotConfigured => not_configured_policy_status(plan),
+        EnforcementPolicySourceInspection::LocalMetadata { manifest } => {
+            local_metadata_policy_status(
+                plan,
+                enforcement_policy_manifest_status(manifest),
                 "enforcement policy source metadata is available, but status does not execute enforcement actions"
                     .to_string(),
-            ),
-            inspection.manifest.map(|manifest| {
-                EnforcementPolicyManifestStatusSnapshot {
-                    id: manifest.id,
-                    version: manifest.version,
-                    selector_configured: manifest.selector.is_some(),
-                    protective_actions: manifest.protective_actions,
-                }
-            }),
-        ),
-        RuntimeMode::Degraded | RuntimeMode::Unavailable => (
-            EnforcementPolicySourceStatusMode::Unavailable,
-            inspection.reason,
-            None,
-        ),
-    };
-
-    EnforcementPolicyStatusSnapshot {
-        source: EnforcementPolicySourceStatusSnapshot {
-            mode,
-            reason,
-            manifest,
-        },
+            )
+        }
+        EnforcementPolicySourceInspection::RemoteConfigured { endpoint } => {
+            remote_configured_policy_status(plan, endpoint)
+        }
+        EnforcementPolicySourceInspection::Unavailable { reason } => {
+            unavailable_policy_status(reason)
+        }
     }
 }
 
 fn loaded_enforcement_policy_status(
+    plan: &RuntimePlan,
     source: Option<&LoadedEnforcementPolicySource>,
-) -> EnforcementPolicyStatusSnapshot {
+) -> EnforcementPolicyStatus {
     let Some(source) = source else {
-        return EnforcementPolicyStatusSnapshot {
-            source: EnforcementPolicySourceStatusSnapshot {
-                mode: EnforcementPolicySourceStatusMode::NotConfigured,
-                reason: None,
-                manifest: None,
-            },
-        };
+        return not_configured_policy_status(plan);
     };
 
-    EnforcementPolicyStatusSnapshot {
-        source: EnforcementPolicySourceStatusSnapshot {
-            mode: EnforcementPolicySourceStatusMode::Loaded,
-            reason: None,
-            manifest: Some(EnforcementPolicyManifestStatusSnapshot {
-                id: source.manifest.id.clone(),
-                version: source.manifest.version.clone(),
-                selector_configured: source.manifest.selector.is_some(),
-                protective_actions: source.manifest.protective_actions.clone(),
-            }),
+    let manifest = EnforcementPolicyManifestStatusSnapshot {
+        id: source.manifest.id.clone(),
+        version: source.manifest.version.clone(),
+        selector_configured: source.manifest.selector.is_some(),
+        protective_actions: source.manifest.protective_actions.clone(),
+    };
+    let manifest_selector_configured = Some(manifest.selector_configured);
+    EnforcementPolicyStatus {
+        effective_selector_configured: Some(
+            plan.enforcement.config_selector_configured || manifest.selector_configured,
+        ),
+        manifest_selector_configured,
+        snapshot: EnforcementPolicyStatusSnapshot {
+            source: EnforcementPolicySourceStatusSnapshot::Loaded {
+                source: loaded_enforcement_policy_source_status(source),
+                manifest,
+            },
         },
+    }
+}
+
+fn loaded_enforcement_policy_source_status(
+    source: &LoadedEnforcementPolicySource,
+) -> LoadedEnforcementPolicySourceStatusSnapshot {
+    match source.origin() {
+        LoadedEnforcementPolicySourceOriginRef::LocalPath(path) => {
+            LoadedEnforcementPolicySourceStatusSnapshot::Local {
+                path: path.to_path_buf(),
+            }
+        }
+        LoadedEnforcementPolicySourceOriginRef::RemoteEndpoint(endpoint) => {
+            LoadedEnforcementPolicySourceStatusSnapshot::Remote {
+                endpoint: endpoint.to_string(),
+            }
+        }
+    }
+}
+
+fn not_configured_policy_status(plan: &RuntimePlan) -> EnforcementPolicyStatus {
+    EnforcementPolicyStatus {
+        effective_selector_configured: Some(plan.enforcement.config_selector_configured),
+        manifest_selector_configured: None,
+        snapshot: EnforcementPolicyStatusSnapshot {
+            source: EnforcementPolicySourceStatusSnapshot::NotConfigured,
+        },
+    }
+}
+
+fn local_metadata_policy_status(
+    plan: &RuntimePlan,
+    manifest: EnforcementPolicyManifestStatusSnapshot,
+    reason: String,
+) -> EnforcementPolicyStatus {
+    let manifest_selector_configured = Some(manifest.selector_configured);
+    EnforcementPolicyStatus {
+        effective_selector_configured: Some(
+            plan.enforcement.config_selector_configured || manifest.selector_configured,
+        ),
+        manifest_selector_configured,
+        snapshot: EnforcementPolicyStatusSnapshot {
+            source: EnforcementPolicySourceStatusSnapshot::LocalMetadata { reason, manifest },
+        },
+    }
+}
+
+fn remote_configured_policy_status(
+    plan: &RuntimePlan,
+    endpoint: String,
+) -> EnforcementPolicyStatus {
+    EnforcementPolicyStatus {
+        effective_selector_configured: plan.enforcement.config_selector_configured.then_some(true),
+        manifest_selector_configured: None,
+        snapshot: EnforcementPolicyStatusSnapshot {
+            source: EnforcementPolicySourceStatusSnapshot::RemoteConfigured {
+                reason: format!(
+                    "remote enforcement policy source {endpoint} is configured, but offline status does not fetch remote policy"
+                ),
+                endpoint,
+            },
+        },
+    }
+}
+
+fn unavailable_policy_status(reason: String) -> EnforcementPolicyStatus {
+    EnforcementPolicyStatus {
+        effective_selector_configured: None,
+        manifest_selector_configured: None,
+        snapshot: EnforcementPolicyStatusSnapshot {
+            source: EnforcementPolicySourceStatusSnapshot::Unavailable { reason },
+        },
+    }
+}
+
+fn enforcement_policy_manifest_status(
+    manifest: probe_config::EnforcementPolicyManifest,
+) -> EnforcementPolicyManifestStatusSnapshot {
+    EnforcementPolicyManifestStatusSnapshot {
+        id: manifest.id,
+        version: manifest.version,
+        selector_configured: manifest.selector.is_some(),
+        protective_actions: manifest.protective_actions,
     }
 }

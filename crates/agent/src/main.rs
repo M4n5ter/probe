@@ -11,6 +11,8 @@ mod configured_policy;
 mod export;
 mod plaintext_feed;
 mod status;
+#[cfg(test)]
+mod test_support;
 mod tls_material;
 
 use admin::{AdminRuntimeState, AdminServerConfig, spawn_admin_server};
@@ -22,7 +24,8 @@ use capture::{
 use check::build_check_report;
 use clap::{Parser, Subcommand, ValueEnum};
 use configured_enforcement::{
-    ConfiguredEnforcementError, build_configured_enforcement_from_config,
+    ConfiguredEnforcementError, build_configured_enforcement,
+    validate_configured_enforcement_metadata,
 };
 use configured_policy::{ConfiguredPolicyError, load_configured_policy};
 use enforcement::ScopedEnforcementPlanner;
@@ -210,8 +213,9 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let agent_config = read_config_or_default(config.as_ref())?;
             validate_static_runtime_config(&agent_config)?;
             let policy = load_configured_policy(&agent_config)?;
-            let mut enforcement = build_configured_enforcement_from_config(&agent_config)?;
+            validate_configured_enforcement_metadata(&agent_config)?;
             let plan = build_runtime_plan(agent_config)?;
+            let mut enforcement = build_configured_enforcement(&plan).await?;
             let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
             let mut provider = build_capture_provider(&plan)?;
             let mut parser_factory = Http1ParserFactory::default();
@@ -272,7 +276,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
         }
         Command::Check { config } => {
             let plan = read_runtime_plan(&config)?;
-            let report = build_check_report(plan)?;
+            let report = build_check_report(plan).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Capabilities => {
@@ -733,6 +737,45 @@ protective_actions = ["alert"]
         assert!(
             !spool_path.exists(),
             "spool must not be opened before policy validation passes"
+        );
+
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_validates_runtime_plan_before_fetching_remote_enforcement_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("run-invalid-runtime-before-remote-enforcement")?;
+        let config_path = temp.join("agent.toml");
+        let spool_path = temp.join("spool");
+
+        let mut config = config_with_unopenable_libpcap(spool_path.clone());
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::Remote {
+            endpoint: "http://127.0.0.1:1/enforcement".to_string(),
+        };
+        fs::write(&config_path, toml::to_string(&config)?)?;
+
+        let error = run(Cli {
+            command: Command::Run {
+                config: Some(config_path),
+                max_events: Some(0),
+            },
+        })
+        .await
+        .expect_err("runtime validation must fail before remote enforcement fetch");
+
+        assert!(
+            matches!(&error, AgentError::Runtime(_)),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("capture.selection"),
+            "unexpected error message: {error}"
+        );
+        assert!(
+            !spool_path.exists(),
+            "spool must not be opened before runtime validation passes"
         );
 
         fs::remove_dir_all(temp)?;

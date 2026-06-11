@@ -25,7 +25,8 @@ use crate::configured_enforcement::LoadedEnforcementPolicySource;
 
 #[cfg(test)]
 use enforcement::{
-    EnforcementCapabilityStatusSnapshot, EnforcementPolicySourceStatusMode, EnforcementStatusMode,
+    EnforcementCapabilityStatusSnapshot, EnforcementPolicySourceStatusSnapshot,
+    EnforcementStatusMode, LoadedEnforcementPolicySourceStatusSnapshot,
 };
 #[cfg(test)]
 use policy::{PolicySourceCheck, PolicyStatusMode};
@@ -401,8 +402,8 @@ mod tests {
             EnforcementCapabilityStatusSnapshot::NotRequired
         );
         assert_eq!(
-            snapshot.enforcement.policy.source.mode,
-            EnforcementPolicySourceStatusMode::NotConfigured
+            snapshot.enforcement.policy.source,
+            EnforcementPolicySourceStatusSnapshot::NotConfigured
         );
         assert_eq!(
             snapshot.tls.plaintext.capability,

@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+use crate::configured_enforcement::{
+    LoadedEnforcementPolicySource, LoadedEnforcementPolicySourceOriginRef,
+};
 use crate::{
     configured_enforcement::{ConfiguredEnforcementError, build_configured_enforcement},
     configured_policy::{
@@ -81,14 +84,21 @@ pub enum EnforcementPolicyCheckMode {
 pub struct LoadedEnforcementPolicySnapshot {
     pub id: String,
     pub version: String,
-    pub path: PathBuf,
+    pub source: LoadedEnforcementPolicySourceSnapshot,
     pub selector_configured: bool,
     pub protective_actions: probe_core::ProtectiveActionProfile,
 }
 
-pub fn build_check_report(plan: RuntimePlan) -> Result<CheckReport, CheckError> {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum LoadedEnforcementPolicySourceSnapshot {
+    Local { path: PathBuf },
+    Remote { endpoint: String },
+}
+
+pub async fn build_check_report(plan: RuntimePlan) -> Result<CheckReport, CheckError> {
     let policy = check_policy(&plan.config)?;
-    let enforcement = check_enforcement(&plan)?;
+    let enforcement = check_enforcement(&plan).await?;
     Ok(CheckReport {
         plan,
         policy,
@@ -116,8 +126,8 @@ fn check_policy(config: &AgentConfig) -> Result<PolicyCheckSnapshot, CheckError>
     })
 }
 
-fn check_enforcement(plan: &RuntimePlan) -> Result<EnforcementCheckSnapshot, CheckError> {
-    let enforcement = build_configured_enforcement(plan)?;
+async fn check_enforcement(plan: &RuntimePlan) -> Result<EnforcementCheckSnapshot, CheckError> {
+    let enforcement = build_configured_enforcement(plan).await?;
     let policy = enforcement.policy_source.as_ref().map_or(
         EnforcementPolicyCheckSnapshot {
             mode: EnforcementPolicyCheckMode::NotConfigured,
@@ -128,7 +138,7 @@ fn check_enforcement(plan: &RuntimePlan) -> Result<EnforcementCheckSnapshot, Che
             active: Some(LoadedEnforcementPolicySnapshot {
                 id: source.manifest.id.clone(),
                 version: source.manifest.version.clone(),
-                path: source.path.clone(),
+                source: loaded_enforcement_policy_source_snapshot(source),
                 selector_configured: source.manifest.selector.is_some(),
                 protective_actions: source.manifest.protective_actions.clone(),
             }),
@@ -141,6 +151,23 @@ fn check_enforcement(plan: &RuntimePlan) -> Result<EnforcementCheckSnapshot, Che
         manifest_selector_configured: enforcement.manifest_selector_configured,
         policy,
     })
+}
+
+fn loaded_enforcement_policy_source_snapshot(
+    source: &LoadedEnforcementPolicySource,
+) -> LoadedEnforcementPolicySourceSnapshot {
+    match source.origin() {
+        LoadedEnforcementPolicySourceOriginRef::LocalPath(path) => {
+            LoadedEnforcementPolicySourceSnapshot::Local {
+                path: path.to_path_buf(),
+            }
+        }
+        LoadedEnforcementPolicySourceOriginRef::RemoteEndpoint(endpoint) => {
+            LoadedEnforcementPolicySourceSnapshot::Remote {
+                endpoint: endpoint.to_string(),
+            }
+        }
+    }
 }
 
 fn loaded_policy_snapshot(policy: &LoadedConfiguredPolicy) -> LoadedPolicySnapshot {
@@ -166,10 +193,12 @@ mod tests {
     use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
     use serde_json::json;
 
+    use crate::test_support::SingleResponseHttpServer;
+
     use super::*;
 
-    #[test]
-    fn check_report_loads_enabled_policy_bundle() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn check_report_loads_enabled_policy_bundle() -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-valid-policy")?;
         let policy_path = temp.join("guard.lua");
         fs::write(
@@ -178,7 +207,7 @@ mod tests {
         )?;
         let plan = runtime_plan(config_with_policy(&policy_path)?)?;
 
-        let report = build_check_report(plan)?;
+        let report = build_check_report(plan).await?;
 
         assert_eq!(report.policy.mode, PolicyCheckMode::Loaded);
         let active = report.policy.active.as_ref().expect("loaded policy");
@@ -200,8 +229,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn check_report_loads_enforcement_policy_manifest() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn check_report_loads_enforcement_policy_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-enforcement-policy")?;
         let policy_path = temp.join("guard.lua");
         fs::write(
@@ -222,7 +252,7 @@ mod tests {
         };
         let plan = runtime_plan(config)?;
 
-        let report = build_check_report(plan)?;
+        let report = build_check_report(plan).await?;
 
         assert!(report.enforcement.effective_selector_configured);
         assert!(!report.enforcement.config_selector_configured);
@@ -239,15 +269,20 @@ mod tests {
             .expect("enforcement policy manifest should load");
         assert_eq!(active.id, "managed-apps");
         assert_eq!(active.version, "v1");
-        assert_eq!(active.path, enforcement_path);
+        assert_eq!(
+            active.source,
+            LoadedEnforcementPolicySourceSnapshot::Local {
+                path: enforcement_path
+            }
+        );
         assert!(active.selector_configured);
         assert_eq!(active.protective_actions.actions(), &[Action::Deny]);
         fs::remove_dir_all(temp)?;
         Ok(())
     }
 
-    #[test]
-    fn check_report_rejects_invalid_enforcement_policy_manifest()
+    #[tokio::test]
+    async fn check_report_rejects_invalid_enforcement_policy_manifest()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-invalid-enforcement-policy")?;
         let policy_path = temp.join("guard.lua");
@@ -270,8 +305,9 @@ protective_actions = ["alert"]
         };
         let plan = runtime_plan(config)?;
 
-        let error =
-            build_check_report(plan).expect_err("invalid enforcement manifest must fail check");
+        let error = build_check_report(plan)
+            .await
+            .expect_err("invalid enforcement manifest must fail check");
 
         assert!(matches!(error, CheckError::ConfiguredEnforcement(_)));
         assert!(
@@ -283,8 +319,8 @@ protective_actions = ["alert"]
         Ok(())
     }
 
-    #[test]
-    fn check_report_rejects_missing_enforcement_policy_directory_manifest()
+    #[tokio::test]
+    async fn check_report_rejects_missing_enforcement_policy_directory_manifest()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-missing-enforcement-manifest")?;
         let policy_path = temp.join("guard.lua");
@@ -298,8 +334,9 @@ protective_actions = ["alert"]
         };
         let plan = runtime_plan(config)?;
 
-        let error =
-            build_check_report(plan).expect_err("missing enforcement manifest must fail check");
+        let error = build_check_report(plan)
+            .await
+            .expect_err("missing enforcement manifest must fail check");
 
         assert!(matches!(error, CheckError::ConfiguredEnforcement(_)));
         assert!(error.to_string().contains("does not exist"));
@@ -307,8 +344,8 @@ protective_actions = ["alert"]
         Ok(())
     }
 
-    #[test]
-    fn check_report_rejects_remote_enforcement_policy_source()
+    #[tokio::test]
+    async fn check_report_loads_remote_enforcement_policy_source()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-remote-enforcement-policy")?;
         let policy_path = temp.join("guard.lua");
@@ -316,33 +353,65 @@ protective_actions = ["alert"]
             &policy_path,
             "function on_http_request_headers(_) return {} end",
         )?;
+        let manifest = probe_config::EnforcementPolicyManifest {
+            id: "managed-apps".to_string(),
+            version: "remote-v1".to_string(),
+            selector: None,
+            protective_actions: ProtectiveActionProfile::new([Action::Reset])?,
+        };
+        let server =
+            SingleResponseHttpServer::spawn("/enforcement", "200 OK", toml::to_string(&manifest)?)?;
+        let endpoint = server.endpoint();
         let mut config = config_with_policy(&policy_path)?;
         config.enforcement.policy.source = probe_config::EnforcementPolicySourceConfig::Remote {
-            endpoint: "https://control.example/enforcement".to_string(),
+            endpoint: endpoint.clone(),
         };
         let plan = runtime_plan(config)?;
 
-        let error = build_check_report(plan).expect_err("remote source is not implemented");
+        let report = build_check_report(plan).await?;
 
-        assert!(matches!(error, CheckError::ConfiguredEnforcement(_)));
-        assert!(
-            error
-                .to_string()
-                .contains("remote enforcement policy source is reserved")
+        assert_eq!(
+            report.enforcement.policy.mode,
+            EnforcementPolicyCheckMode::Loaded
         );
+        let active = report
+            .enforcement
+            .policy
+            .active
+            .as_ref()
+            .expect("remote enforcement manifest should load");
+        assert_eq!(active.id, "managed-apps");
+        assert_eq!(active.version, "remote-v1");
+        assert_eq!(
+            active.source,
+            LoadedEnforcementPolicySourceSnapshot::Remote {
+                endpoint: endpoint.clone()
+            }
+        );
+        assert_eq!(active.protective_actions.actions(), &[Action::Reset]);
+        let value = serde_json::to_value(&report)?;
+        assert_eq!(
+            value["enforcement"]["policy"]["active"]["source"]["kind"],
+            json!("remote")
+        );
+        assert_eq!(
+            value["enforcement"]["policy"]["active"]["source"]["endpoint"],
+            json!(endpoint)
+        );
+        server.join()?;
         fs::remove_dir_all(temp)?;
         Ok(())
     }
 
-    #[test]
-    fn check_report_has_stable_json_shape() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn check_report_has_stable_json_shape() -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-json-policy")?;
         let policy_path = temp.join("guard.lua");
         fs::write(
             &policy_path,
             "function on_http_request_headers(_) return {} end",
         )?;
-        let report = build_check_report(runtime_plan(config_with_policy(&policy_path)?)?)?;
+        let report = build_check_report(runtime_plan(config_with_policy(&policy_path)?)?).await?;
 
         let value = serde_json::to_value(report)?;
 
@@ -396,14 +465,17 @@ protective_actions = ["alert"]
         Ok(())
     }
 
-    #[test]
-    fn check_report_rejects_invalid_policy_source() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn check_report_rejects_invalid_policy_source() -> Result<(), Box<dyn std::error::Error>>
+    {
         let temp = test_dir("check-invalid-policy")?;
         let policy_path = temp.join("guard.lua");
         fs::write(&policy_path, "function on_http_request_headers(")?;
         let plan = runtime_plan(config_with_policy(&policy_path)?)?;
 
-        let error = build_check_report(plan).expect_err("invalid Lua must fail explicit check");
+        let error = build_check_report(plan)
+            .await
+            .expect_err("invalid Lua must fail explicit check");
 
         assert!(matches!(
             error,

@@ -23,6 +23,7 @@ dependencies = [
  "probe-config",
  "probe-core",
  "proto",
+ "reqwest",
  "runtime",
  "rustix",
  "serde",
@@ -1380,6 +1381,7 @@ dependencies = [
  "serde",
  "thiserror",
  "toml",
+ "url",
 ]
 
 [[package]]

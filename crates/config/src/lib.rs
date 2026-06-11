@@ -6,6 +6,7 @@ use std::{
 use probe_core::{EnforcementMode, ProtectiveActionProfile, Selector};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 const RESERVED_EXPORTER_HEADERS: &[&str] = &["content-type", "idempotency-key", "x-sssa-codec"];
 const REPLAY_WEBHOOK_SINK_ID: &str = "replay-webhook";
@@ -813,10 +814,7 @@ fn exporter_tls_configured(tls: &ExporterTlsConfig) -> bool {
 
 fn webhook_endpoint_is_https(exporter: &ExporterConfig) -> bool {
     exporter.transport == ExporterTransport::Webhook
-        && exporter
-            .endpoint
-            .to_ascii_lowercase()
-            .starts_with("https://")
+        && Url::parse(&exporter.endpoint).is_ok_and(|url| url.scheme() == "https")
 }
 
 fn validate_tls_material_ref(
@@ -892,9 +890,59 @@ fn validate_enforcement(enforcement: &EnforcementConfig, violations: &mut Vec<Co
                     field: "enforcement.policy.source.endpoint".to_string(),
                     reason: "remote enforcement policy endpoint cannot be empty".to_string(),
                 });
+            } else {
+                validate_remote_enforcement_policy_endpoint(endpoint, violations);
             }
         }
     }
+}
+
+fn validate_remote_enforcement_policy_endpoint(
+    endpoint: &str,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    let Ok(url) = Url::parse(endpoint) else {
+        violations.push(ConfigViolation {
+            field: "enforcement.policy.source.endpoint".to_string(),
+            reason: "remote enforcement policy endpoint must be an absolute URL".to_string(),
+        });
+        return;
+    };
+
+    if !url.username().is_empty() || url.password().is_some() {
+        violations.push(ConfigViolation {
+            field: "enforcement.policy.source.endpoint".to_string(),
+            reason: "remote enforcement policy endpoint must not contain credentials".to_string(),
+        });
+    }
+    if remote_policy_endpoint_uses_allowed_transport(&url) {
+        return;
+    }
+    violations.push(ConfigViolation {
+        field: "enforcement.policy.source.endpoint".to_string(),
+        reason:
+            "remote enforcement policy endpoint must use HTTPS, except loopback HTTP for local testing"
+                .to_string(),
+    });
+}
+
+fn remote_policy_endpoint_uses_allowed_transport(url: &Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => url.host_str().is_some_and(loopback_host),
+        _ => false,
+    }
+}
+
+fn loopback_host(host: &str) -> bool {
+    let normalized = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    normalized.eq_ignore_ascii_case("localhost")
+        || normalized
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn validate_admin(admin: &AdminConfig, violations: &mut Vec<ConfigViolation>) {

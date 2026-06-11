@@ -2,33 +2,73 @@ use std::{
     fs::{self, File, Metadata},
     io::Read,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use probe_config::EnforcementPolicyManifest;
-use probe_core::RuntimeMode;
 use runtime::EnforcementPolicySourcePlan;
 use rustix::fs::{Mode, OFlags, open};
 use thiserror::Error;
 
 pub const MAX_ENFORCEMENT_POLICY_MANIFEST_BYTES: u64 = 64 * 1024;
+const REMOTE_ENFORCEMENT_POLICY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_ENFORCEMENT_POLICY_ACCEPT: &str = "application/toml, text/plain;q=0.9, */*;q=0.1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedEnforcementPolicySource {
-    pub path: PathBuf,
+    origin: LoadedEnforcementPolicySourceOrigin,
     pub manifest: EnforcementPolicyManifest,
 }
 
+impl LoadedEnforcementPolicySource {
+    pub fn local(path: impl Into<PathBuf>, manifest: EnforcementPolicyManifest) -> Self {
+        Self {
+            origin: LoadedEnforcementPolicySourceOrigin::LocalPath(path.into()),
+            manifest,
+        }
+    }
+
+    pub fn remote(endpoint: impl Into<String>, manifest: EnforcementPolicyManifest) -> Self {
+        Self {
+            origin: LoadedEnforcementPolicySourceOrigin::RemoteEndpoint(endpoint.into()),
+            manifest,
+        }
+    }
+
+    pub fn origin(&self) -> LoadedEnforcementPolicySourceOriginRef<'_> {
+        match &self.origin {
+            LoadedEnforcementPolicySourceOrigin::LocalPath(path) => {
+                LoadedEnforcementPolicySourceOriginRef::LocalPath(path)
+            }
+            LoadedEnforcementPolicySourceOrigin::RemoteEndpoint(endpoint) => {
+                LoadedEnforcementPolicySourceOriginRef::RemoteEndpoint(endpoint)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadedEnforcementPolicySourceOriginRef<'a> {
+    LocalPath(&'a Path),
+    RemoteEndpoint(&'a str),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnforcementPolicySourceInspection {
-    pub mode: RuntimeMode,
-    pub reason: Option<String>,
-    pub manifest: Option<EnforcementPolicyManifest>,
+enum LoadedEnforcementPolicySourceOrigin {
+    LocalPath(PathBuf),
+    RemoteEndpoint(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnforcementPolicySourceInspection {
+    NotConfigured,
+    LocalMetadata { manifest: EnforcementPolicyManifest },
+    RemoteConfigured { endpoint: String },
+    Unavailable { reason: String },
 }
 
 #[derive(Debug, Error)]
 pub enum EnforcementPolicySourceError {
-    #[error("remote enforcement policy source is reserved but not implemented: {endpoint}")]
-    RemoteSource { endpoint: String },
     #[error("enforcement policy source path does not exist: {path}")]
     NotFound { path: PathBuf },
     #[error("failed to inspect enforcement policy source {path}: {source}")]
@@ -61,52 +101,95 @@ pub enum EnforcementPolicySourceError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("failed to build remote enforcement policy HTTP client: {source}")]
+    RemoteClient { source: reqwest::Error },
+    #[error("failed to fetch remote enforcement policy source {endpoint}: {source}")]
+    RemoteFetch {
+        endpoint: String,
+        source: reqwest::Error,
+    },
+    #[error("remote enforcement policy source {endpoint} returned HTTP status {status}")]
+    RemoteStatus {
+        endpoint: String,
+        status: reqwest::StatusCode,
+    },
+    #[error("failed to read remote enforcement policy source {endpoint}: {source}")]
+    RemoteRead {
+        endpoint: String,
+        source: reqwest::Error,
+    },
+    #[error(
+        "remote enforcement policy manifest is too large: {endpoint} has at least {size} bytes, limit {limit}"
+    )]
+    RemoteTooLarge {
+        endpoint: String,
+        size: u64,
+        limit: u64,
+    },
+    #[error("remote enforcement policy manifest {endpoint} is not UTF-8: {source}")]
+    RemoteUtf8 {
+        endpoint: String,
+        source: std::string::FromUtf8Error,
+    },
+    #[error("failed to parse remote enforcement policy manifest {endpoint}: {source}")]
+    RemoteManifestToml {
+        endpoint: String,
+        source: toml::de::Error,
+    },
     #[error("invalid enforcement policy manifest: {reason}")]
     InvalidManifest { reason: String },
 }
 
-pub fn load_enforcement_policy_source(
+pub async fn load_enforcement_policy_source(
     source: &EnforcementPolicySourcePlan,
 ) -> Result<Option<LoadedEnforcementPolicySource>, EnforcementPolicySourceError> {
-    let Some(path) = manifest_path_for_source(source)? else {
-        return Ok(None);
-    };
-    let manifest = read_enforcement_policy_manifest(&path)?;
-    Ok(Some(LoadedEnforcementPolicySource { path, manifest }))
+    match source {
+        EnforcementPolicySourcePlan::None => Ok(None),
+        EnforcementPolicySourcePlan::LocalManifest { path, .. } => {
+            let manifest = read_enforcement_policy_manifest(path)?;
+            Ok(Some(LoadedEnforcementPolicySource::local(
+                path.clone(),
+                manifest,
+            )))
+        }
+        EnforcementPolicySourcePlan::Remote { endpoint } => {
+            let manifest = fetch_remote_enforcement_policy_manifest(endpoint).await?;
+            Ok(Some(LoadedEnforcementPolicySource::remote(
+                endpoint.clone(),
+                manifest,
+            )))
+        }
+    }
+}
+
+pub fn load_enforcement_policy_source_metadata(
+    source: &EnforcementPolicySourcePlan,
+) -> Result<Option<EnforcementPolicyManifest>, EnforcementPolicySourceError> {
+    match source {
+        EnforcementPolicySourcePlan::None | EnforcementPolicySourcePlan::Remote { .. } => Ok(None),
+        EnforcementPolicySourcePlan::LocalManifest { path, .. } => {
+            read_enforcement_policy_manifest(path).map(Some)
+        }
+    }
 }
 
 pub fn inspect_enforcement_policy_source(
     source: &EnforcementPolicySourcePlan,
 ) -> EnforcementPolicySourceInspection {
-    match load_enforcement_policy_source(source) {
-        Ok(Some(loaded)) => EnforcementPolicySourceInspection {
-            mode: RuntimeMode::Available,
-            reason: None,
-            manifest: Some(loaded.manifest),
-        },
-        Ok(None) => EnforcementPolicySourceInspection {
-            mode: RuntimeMode::Available,
-            reason: None,
-            manifest: None,
-        },
-        Err(error) => EnforcementPolicySourceInspection {
-            mode: RuntimeMode::Unavailable,
-            reason: Some(error.to_string()),
-            manifest: None,
-        },
-    }
-}
-
-fn manifest_path_for_source(
-    source: &EnforcementPolicySourcePlan,
-) -> Result<Option<PathBuf>, EnforcementPolicySourceError> {
     match source {
-        EnforcementPolicySourcePlan::None => Ok(None),
-        EnforcementPolicySourcePlan::LocalManifest { path, .. } => Ok(Some(path.clone())),
+        EnforcementPolicySourcePlan::None => EnforcementPolicySourceInspection::NotConfigured,
+        EnforcementPolicySourcePlan::LocalManifest { path, .. } => {
+            match read_enforcement_policy_manifest(path) {
+                Ok(manifest) => EnforcementPolicySourceInspection::LocalMetadata { manifest },
+                Err(error) => EnforcementPolicySourceInspection::Unavailable {
+                    reason: error.to_string(),
+                },
+            }
+        }
         EnforcementPolicySourcePlan::Remote { endpoint } => {
-            Err(EnforcementPolicySourceError::RemoteSource {
+            EnforcementPolicySourceInspection::RemoteConfigured {
                 endpoint: endpoint.clone(),
-            })
+            }
         }
     }
 }
@@ -118,6 +201,64 @@ fn read_enforcement_policy_manifest(
     toml::from_str::<EnforcementPolicyManifest>(&content)
         .map_err(|source| EnforcementPolicySourceError::ManifestToml {
             path: path.to_path_buf(),
+            source,
+        })
+        .and_then(validate_enforcement_policy_manifest)
+}
+
+async fn fetch_remote_enforcement_policy_manifest(
+    endpoint: &str,
+) -> Result<EnforcementPolicyManifest, EnforcementPolicySourceError> {
+    let mut response = reqwest::Client::builder()
+        .timeout(REMOTE_ENFORCEMENT_POLICY_FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|source| EnforcementPolicySourceError::RemoteClient { source })?
+        .get(endpoint)
+        .header(reqwest::header::ACCEPT, REMOTE_ENFORCEMENT_POLICY_ACCEPT)
+        .send()
+        .await
+        .map_err(|source| EnforcementPolicySourceError::RemoteFetch {
+            endpoint: endpoint.to_string(),
+            source,
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(EnforcementPolicySourceError::RemoteStatus {
+            endpoint: endpoint.to_string(),
+            status,
+        });
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|source| EnforcementPolicySourceError::RemoteRead {
+                endpoint: endpoint.to_string(),
+                source,
+            })?
+    {
+        let new_size = body.len().saturating_add(chunk.len()) as u64;
+        if new_size > MAX_ENFORCEMENT_POLICY_MANIFEST_BYTES {
+            return Err(EnforcementPolicySourceError::RemoteTooLarge {
+                endpoint: endpoint.to_string(),
+                size: new_size,
+                limit: MAX_ENFORCEMENT_POLICY_MANIFEST_BYTES,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let content =
+        String::from_utf8(body).map_err(|source| EnforcementPolicySourceError::RemoteUtf8 {
+            endpoint: endpoint.to_string(),
+            source,
+        })?;
+    toml::from_str::<EnforcementPolicyManifest>(&content)
+        .map_err(|source| EnforcementPolicySourceError::RemoteManifestToml {
+            endpoint: endpoint.to_string(),
             source,
         })
         .and_then(validate_enforcement_policy_manifest)
@@ -239,5 +380,102 @@ fn reject_symlink(path: &Path) -> Result<(), EnforcementPolicySourceError> {
         })
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::SingleResponseHttpServer;
+    use probe_config::EnforcementPolicyManifest;
+    use probe_core::{Action, ProtectiveActionProfile};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn remote_source_fetches_and_validates_manifest() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let manifest = EnforcementPolicyManifest {
+            id: "managed-apps".to_string(),
+            version: "v1".to_string(),
+            selector: None,
+            protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
+        };
+        let body = toml::to_string(&manifest)?;
+        let server = SingleResponseHttpServer::spawn("/enforcement", "200 OK", body)?;
+        let endpoint = server.endpoint();
+
+        let loaded = load_enforcement_policy_source(&EnforcementPolicySourcePlan::Remote {
+            endpoint: endpoint.clone(),
+        })
+        .await?
+        .expect("remote source should load a manifest");
+
+        assert_eq!(
+            loaded.origin(),
+            LoadedEnforcementPolicySourceOriginRef::RemoteEndpoint(endpoint.as_str())
+        );
+        assert_eq!(loaded.manifest.id, "managed-apps");
+        assert_eq!(
+            loaded.manifest.protective_actions.actions(),
+            &[Action::Deny]
+        );
+        server.join()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_source_rejects_error_status() -> Result<(), Box<dyn std::error::Error>> {
+        let server =
+            SingleResponseHttpServer::spawn("/enforcement", "503 Service Unavailable", "")?;
+        let endpoint = server.endpoint();
+
+        let error = load_enforcement_policy_source(&EnforcementPolicySourcePlan::Remote {
+            endpoint: endpoint.clone(),
+        })
+        .await
+        .expect_err("remote status errors must reject the source");
+
+        assert!(matches!(
+            error,
+            EnforcementPolicySourceError::RemoteStatus { endpoint: actual, status }
+                if actual == endpoint && status.as_u16() == 503
+        ));
+        server.join()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_source_rejects_oversized_manifest() -> Result<(), Box<dyn std::error::Error>> {
+        let body = "x".repeat(MAX_ENFORCEMENT_POLICY_MANIFEST_BYTES as usize + 1);
+        let server = SingleResponseHttpServer::spawn("/enforcement", "200 OK", body)?;
+        let endpoint = server.endpoint();
+
+        let error = load_enforcement_policy_source(&EnforcementPolicySourcePlan::Remote {
+            endpoint: endpoint.clone(),
+        })
+        .await
+        .expect_err("oversized remote manifests must be rejected");
+
+        assert!(matches!(
+            error,
+            EnforcementPolicySourceError::RemoteTooLarge { endpoint: actual, .. }
+                if actual == endpoint
+        ));
+        server.join()?;
+        Ok(())
+    }
+
+    #[test]
+    fn remote_source_inspection_does_not_fetch() {
+        let endpoint = "https://control.example/enforcement".to_string();
+
+        let inspection = inspect_enforcement_policy_source(&EnforcementPolicySourcePlan::Remote {
+            endpoint: endpoint.clone(),
+        });
+
+        assert_eq!(
+            inspection,
+            EnforcementPolicySourceInspection::RemoteConfigured { endpoint }
+        );
     }
 }
