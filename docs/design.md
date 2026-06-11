@@ -11,7 +11,7 @@
 - 可扩展协议解析：首要支持 HTTP/1.x 和 SSE，后续自然扩展 WebSocket、HTTP/2、HTTP/3 等协议。
 - 策略驱动的检测与防护：V1 先支持观测、告警和 dry-run verdict，后续接入真实拦截执行。
 
-本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、可选压缩 codec 和 HTTP webhook exporter。`run` 与 `replay` 已可按配置/CLI drain export queue 到 webhook sink。已定义 capture provider、procfs process attribution、runtime config、runtime planning 和 dry-run enforcement 的第一版边界，并开始接入真实 libpcap fallback。尚未实现 eBPF 主路径、TLS uprobe provider、真实 enforcement、TCP 重组、强进程归因和连续后台 exporter worker。
+本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、可选压缩 codec 和 HTTP webhook exporter。`run` 与 `replay` 已可按配置/CLI drain export queue 到 webhook sink。已定义 capture provider、procfs process attribution、runtime config、runtime planning 和 dry-run enforcement 的第一版边界，并开始接入真实 libpcap fallback 和外部明文 feed provider。尚未实现 eBPF 主路径、TLS uprobe provider、keylog/session 解密 provider、真实 enforcement、TCP 重组、强进程归因和连续后台 exporter worker。
 
 ## 2. 核心 thesis
 
@@ -74,13 +74,13 @@ V1 明确不做：
 
 - 已实现 replay CLI，用单向输入文件驱动 capture provider、ingress journal、parser、policy、export queue 和可选 webhook exporter。
 - 已实现 `probe-core` 的 `TcpEndpoint`/`TcpConnection` 共享模型，供 capture provider、procfs attribution 和后续 eBPF/socket attribution 复用，避免各层用字符串 endpoint 重复建模。
-- 已实现 `capture` crate 的 `CaptureProvider` 抽象、`ReplayProvider` 和基础 `LibpcapProvider`；libpcap provider 可打开设备、安装 BPF filter、解析 Ethernet/Linux cooked/raw IPv4 TCP segment，接收可插拔 process resolver，并输出 degraded `CapturedBytes`。flow table 会用 SYN reuse、RST、双向 FIN、idle timeout 和容量淘汰清理 4-tuple 缓存；单向 FIN 只标记半关闭，避免把仍在发送的另一方向拆成新 flow；清理 flow 时会发出 `ConnectionClosed`，让 pipeline 释放 parser state。若同一 segment 同时携带 payload 和关闭信号，payload 事件先进入 parser，随后才发 close。它当前不做 TCP 重组、IPv6 或 gap 修复。
+- 已实现 `capture` crate 的 `CaptureProvider` 抽象、`ReplayProvider`、`PlaintextFeedProvider` 和基础 `LibpcapProvider`。`PlaintextFeedProvider` 接收外部已解密明文 feed event，输出 `ExternalPlaintextFeed` source 的 `CapturedBytes`/gap/connection lifecycle event，用于把 libssl uprobe、keylog/session decrypt、SDK feed 或 future MITM 等后续 provider 接入同一 pipeline；它本身不执行 TLS 解密。libpcap provider 可打开设备、安装 BPF filter、解析 Ethernet/Linux cooked/raw IPv4 TCP segment，接收可插拔 process resolver，并输出 degraded `CapturedBytes`。flow table 会用 SYN reuse、RST、双向 FIN、idle timeout 和容量淘汰清理 4-tuple 缓存；单向 FIN 只标记半关闭，避免把仍在发送的另一方向拆成新 flow；清理 flow 时会发出 `ConnectionClosed`，让 pipeline 释放 parser state。若同一 segment 同时携带 payload 和关闭信号，payload 事件先进入 parser，随后才发 close。它当前不做 TCP 重组、IPv6 或 gap 修复。
 - 已实现 `attribution` crate 的 `ProcfsAttributor` 和 `ProcfsSocketResolver`；前者可从 `/proc/<pid>` 读取进程身份、cmdline hash、starttime、uid/gid、cgroup、systemd service 与 container hint，后者可通过 `/proc/net/tcp` socket inode 和 `/proc/<pid>/fd` best-effort 反查 TCP 连接所属进程。agent 注入的 procfs resolver 使用短 TTL socket snapshot，避免同一批新连接重复全量扫描 `/proc/<pid>/fd`；libpcap provider 在 TCP 生命周期信号、idle eviction、capacity eviction 和端口复用关闭旧 flow 后会使 snapshot 失效，降低拿到旧进程身份的风险。resolver 错误会进入 capture degradation reason，不再静默伪装成未匹配；但单个 PID 的 fd race 或权限拒绝属于 best-effort skip，不让整批 socket snapshot 失败。replay flow 默认使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence，避免把文件输入误归因到 agent 进程。
-- 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、provider-specific nested config、storage、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，基础字段校验不理解 runtime capability。
-- 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
+- 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、provider-specific nested config、storage、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，基础字段校验会拒绝 ambiguous external plaintext feed 配置：当前 external plaintext feed 的 source path 归 `capture.plaintext_feed.path` 所有，不能塞进 TLS material/provider 配置。
+- 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；`plaintext_feed` 是独立 plan mode，不伪装成 replay 或 live capture；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
 - 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；pipeline 支持可选 `max_events` 运行边界，便于对真实 live provider 做有界 smoke。`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合和 exporter 命令。
 - 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。parser 已识别 WebSocket HTTP Upgrade，输出 `WebSocketHandoff` 后把后续字节转为 opaque stream；它不解析 WebSocket frame/message。
-- 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF/TLS/真实 enforcement 相关能力仍必须标记 unavailable；dry-run enforcement 是可用能力，记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 作为 live provider；`run` 在无 live capture provider 时 fail closed，存在 libpcap live provider 时会把 provider 接入 replay 共用的 pipeline；`check` 用于查看 resolved plan。
+- 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF、libssl uprobe/keylog TLS 解密和真实 enforcement 相关能力仍必须标记 unavailable；`external_plaintext_feed`、HTTP/1、SSE、WebSocket handoff、dry-run enforcement 是可用能力。dry-run enforcement 记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 或 plaintext feed 作为 live provider；`run` 在无 live capture provider 时 fail closed，显式 `plaintext_feed` 会从 JSON-lines feed path 读取已解密明文 event 并接入 replay 共用的 pipeline；`check` 用于查看 resolved plan。
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
 - 当前 `FjallSpool` 存储的是带 schema 的 `SpoolPayload`；ingress lane 当前写入 JSON framed `CapturedBytes`，export lane 当前写入 JSON framed `EventEnvelope`。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
 
@@ -267,6 +267,24 @@ TLS/应用层明文来源抽象为 `PlaintextProvider`，而不是 `TLSDecryptor
 - 来源可能是 uprobe、keylog/session decrypt、future MITM proxy、SDK feed。
 - provider 应输出带 `source`、`confidence`、`capability` 的有序字节 chunk。
 
+当前实现状态：
+
+- 已实现内存型 `PlaintextFeedProvider` 和 agent 文件型 `JsonLinesPlaintextFeedProvider`，二者最终都产生 typed `PlaintextFeedEvent`：`bytes`、`gap`、`connection_opened`、`connection_closed`。
+- `bytes` event 会转为 `CapturedBytes`，`source = external_plaintext_feed`，`provider = plaintext`，随后进入 ingress journal、HTTP parser、policy/enforcement 和 export queue。
+- `agent run` 当前只支持文件型 JSON-lines external feed。文件 provider 是 streaming reader：在 `CaptureProvider::next()` 中逐行解析，`--max-events` 可以限制读取事件数，单行有固定大小上限，未知 JSON 字段 fail closed。合法配置必须显式选择：
+
+```toml
+[capture]
+selection = "plaintext_feed"
+
+[capture.plaintext_feed]
+path = "/var/lib/sssa-probe/plaintext-feed.jsonl"
+```
+
+- 这是非特权、可回放的明文入口边界，用来先验证 TLS 明文字节进入解析/策略/外发闭环；它不代表已经实现 libssl uprobe 或 keylog/session 解密。
+- 文件型 JSON feed 使用 agent 层 DTO，不直接暴露内部 `FlowContext`。外部 record 提供 `connection_id`、endpoints、protocol、process hint、confidence、direction、timestamp 和 bytes；agent adapter 在边界上 hydrate 成内部 `FlowContext`。缺失 process hint 时 agent 使用 synthetic unknown process，并强制 attribution confidence 为 `0`；非零 confidence 需要完整 process hint，且 `attribution_confidence > 100` 会被拒绝。`timestamp.wall_time_unix_ns` 在 JSON 中按 signed 64-bit integer 读取，进入内部 `Timestamp` 后再扩为 `i128`，避免把 `serde_json` 对 `i128` 的限制泄漏给 core 事件模型。
+- 当前没有 provider multiplex：`plaintext_feed` 是显式 capture backend，不能和 `auto` live fallback 同时运行。后续要把 libpcap/eBPF metadata feed 与 plaintext feed 做 flow-level merge 时，应在 pipeline 前增加 capture multiplexer，而不是让某个 provider 内部偷偷调用另一个 provider。
+
 ### V1 TLS 覆盖
 
 V1 优先支持 libssl/OpenSSL/BoringSSL/LibreSSL 风格路径：
@@ -284,6 +302,8 @@ V1 优先支持 libssl/OpenSSL/BoringSSL/LibreSSL 风格路径：
 - 降低全机无关开销。
 
 Go `crypto/tls`、rustls、Java TLS 不进入 V1 正式覆盖，只作为后续 provider。
+
+当前实现状态：上述 libssl uprobe provider 尚未实现，capability matrix 中 `libssl_uprobe` 必须保持 unavailable；`external_plaintext_feed` available 只表示 agent 已能消费外部已解密明文 feed。
 
 ### TLS material
 
@@ -882,7 +902,7 @@ metrics 必须覆盖：
 
 - `agent`：主二进制、生命周期、配置加载、CLI/admin API wiring、provider probe/open 与 runtime composition root。
 - `attribution`：procfs process attribution、future netlink/socket attribution adapter。
-- `capture`：capture provider trait、replay provider、未来 eBPF/libpcap/plaintext provider adapter。
+- `capture`：capture provider trait、replay provider、external plaintext feed provider、libpcap provider、未来 eBPF/libssl/keylog provider adapter。
 - `config`：TOML runtime config schema、validation、future config source abstraction。
 - `core`：领域类型、selector、flow/process identity、pipeline traits。
 - `ebpf`：Aya eBPF 程序和用户态 loader glue。
@@ -990,6 +1010,11 @@ V1 CLI 至少提供：
 
 `replay` 是关键能力，因为 parser、Lua 策略和 exporter schema 都需要可重复验证。
 
+当前 `run` 支持两类 provider 组合方式：
+
+- 默认/显式 live capture：按 `auto`、`ebpf`、`libpcap` 解析 plan；当前实际可构造的是 libpcap，eBPF 仍 unavailable。
+- 显式 `plaintext_feed`：从 `capture.plaintext_feed.path` 指向的 JSON-lines 文件流式读取外部明文 record，用于验证已解密明文路径。该模式不是 live capture fallback，也不自动和 libpcap/eBPF 合并。
+
 ## 31. 测试与验收
 
 测试分三层：
@@ -999,6 +1024,8 @@ V1 CLI 至少提供：
 - 特权 eBPF smoke/e2e：Linux 环境下验证 syscall/tracepoint、libssl uprobe、pcap fallback。
 
 当前已验证的特权 fallback smoke：在 WSL2 root 环境下，`sudo target/debug/agent capabilities` 显示 `libpcap` available；使用本机 `127.0.0.1:18080` HTTP server、`capture.selection = "libpcap"`、`capture.libpcap.interface = "any"`、`bpf_filter = "tcp port 18080"` 和 `run --max-events 1`，agent 成功读取 1 个 libpcap capture event、写入 1 条 ingress chunk 和 1 条 export event。普通用户下 `libpcap` 因缺少 raw socket 权限 unavailable，这是预期权限差异。
+
+当前已验证的 non-privileged plaintext feed 路径：`PlaintextFeedProvider` 单元测试覆盖 event source/kind/confidence/degraded metadata 保真；agent JSON-lines provider 测试覆盖硬编码外部 feed schema、streaming provider、unknown field fail-closed、超长行 fail-closed、缺失 process 强制 0 confidence，以及 confidence 超过 100 的拒绝；pipeline 测试覆盖 external plaintext feed chunk 写入 ingress journal，并由 HTTP/1 parser 产出 `HttpRequestHeaders` export event，`source = external_plaintext_feed`。这只验证“已解密明文进入统一 pipeline”，不等同于 TLS uprobe 或 keylog 解密已完成。
 
 V1 端到端验收：
 
@@ -1124,6 +1151,7 @@ enforcement 抽象验收：
 | 企业旧内核 | RHEL8+/Ubuntu20+ 主支持，RHEL7/CentOS7 fallback | 第 5、9、10 节 |
 | fallback | libpcap + procfs best effort，并标记 degraded | 第 10 节 |
 | TLS 路线 | 非 MITM 优先，V1 libssl uprobe demo | 第 11、31 节 |
+| external plaintext feed | 先实现非特权、可回放的 `PlaintextFeedProvider` 和显式 `plaintext_feed` capture backend，用 typed feed event 验证已解密明文进入统一 pipeline；不声称已经实现 TLS 解密 | 第 11、30、31 节 |
 | 证书语义 | 区分 identity/trust materials 与 decrypt materials | 第 11、20 节 |
 | MITM 预留 | 作为未来 PlaintextProvider 或 EnforcementProvider | 第 11、18 节 |
 | HTTP 范围 | V1 HTTP/1.x 优先 | 第 13 节 |

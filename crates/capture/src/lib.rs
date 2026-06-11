@@ -1,4 +1,5 @@
 mod libpcap;
+mod plaintext;
 
 use bytes::Bytes;
 use probe_core::{
@@ -9,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use libpcap::{LibpcapConfig, LibpcapProvider};
+pub use plaintext::{
+    PlaintextChunk, PlaintextConnection, PlaintextFeedEvent, PlaintextFeedProvider, PlaintextGap,
+};
 
 pub const CAPTURE_BYTES_JSON_SCHEMA: &str = "sssa.probe.capture_bytes.v1.json";
 

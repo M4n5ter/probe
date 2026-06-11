@@ -9,6 +9,7 @@ pub enum CapabilityKind {
     ProcfsAttribution,
     ProcfsSocketAttribution,
     LibsslUprobe,
+    ExternalPlaintextFeed,
     Http1,
     Sse,
     WebSocketHandoff,

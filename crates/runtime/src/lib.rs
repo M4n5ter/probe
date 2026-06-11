@@ -76,6 +76,9 @@ impl CapturePlan {
                 candidate.selectable()
                     && match config.capture.selection {
                         CaptureSelection::Replay => candidate.backend == CaptureBackend::Replay,
+                        CaptureSelection::PlaintextFeed => {
+                            candidate.backend == CaptureBackend::PlaintextFeed
+                        }
                         CaptureSelection::Auto
                         | CaptureSelection::Ebpf
                         | CaptureSelection::Libpcap => candidate.live(),
@@ -88,6 +91,8 @@ impl CapturePlan {
             .map_or(CapturePlanMode::Unavailable, |provider| {
                 if provider.live() {
                     CapturePlanMode::Live
+                } else if provider.plaintext_feed() {
+                    CapturePlanMode::PlaintextFeed
                 } else {
                     CapturePlanMode::Replay
                 }
@@ -97,6 +102,10 @@ impl CapturePlan {
             .then(|| match config.capture.selection {
                 CaptureSelection::Replay => {
                     "replay capture provider is not available in this build/runtime".to_string()
+                }
+                CaptureSelection::PlaintextFeed => {
+                    "plaintext feed capture provider is not available in this build/runtime"
+                        .to_string()
                 }
                 CaptureSelection::Auto | CaptureSelection::Ebpf | CaptureSelection::Libpcap => {
                     "no live capture provider is available in this build/runtime".to_string()
@@ -119,6 +128,7 @@ impl CapturePlan {
 #[serde(rename_all = "snake_case")]
 pub enum CapturePlanMode {
     Live,
+    PlaintextFeed,
     Replay,
     Unavailable,
 }
@@ -175,6 +185,10 @@ impl CaptureProviderDescriptor {
         matches!(self.backend, CaptureBackend::Ebpf | CaptureBackend::Libpcap)
     }
 
+    pub fn plaintext_feed(&self) -> bool {
+        self.backend == CaptureBackend::PlaintextFeed
+    }
+
     pub fn state(&self) -> CapabilityState {
         match self.mode {
             RuntimeMode::Available => CapabilityState::available(self.capability()),
@@ -215,6 +229,7 @@ pub enum CaptureProviderBuilder {
     Replay,
     Ebpf,
     Libpcap,
+    PlaintextFeed,
     Unimplemented,
 }
 
@@ -225,6 +240,7 @@ impl CaptureProviderBuilder {
             (Self::Replay, CaptureBackend::Replay)
                 | (Self::Ebpf, CaptureBackend::Ebpf)
                 | (Self::Libpcap, CaptureBackend::Libpcap)
+                | (Self::PlaintextFeed, CaptureBackend::PlaintextFeed)
         )
     }
 }
@@ -335,7 +351,7 @@ fn validate_tls_config(
             "libssl uprobe plaintext provider is not available in this build/runtime",
             violations,
         ),
-        TlsPlaintextProvider::Keylog | TlsPlaintextProvider::ExternalFeed => {
+        TlsPlaintextProvider::Keylog => {
             violations.push(ConfigViolation {
                 field: "tls.plaintext.provider".to_string(),
                 reason: format!(
@@ -461,6 +477,7 @@ fn capture_backend_capability(backend: CaptureBackend) -> CapabilityKind {
     match backend {
         CaptureBackend::Ebpf => CapabilityKind::Ebpf,
         CaptureBackend::Libpcap => CapabilityKind::Libpcap,
+        CaptureBackend::PlaintextFeed => CapabilityKind::ExternalPlaintextFeed,
         CaptureBackend::Replay => CapabilityKind::ReplayCapture,
     }
 }
@@ -660,6 +677,54 @@ mod tests {
         assert_eq!(
             plan.capabilities.mode(CapabilityKind::WebSocketHandoff),
             RuntimeMode::Available
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_plaintext_feed_resolves_to_feed_mode() -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::PlaintextFeed,
+                CaptureProviderBuilder::PlaintextFeed,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::PlaintextFeed;
+        config.capture.plaintext_feed.path = Some("/tmp/feed.jsonl".into());
+
+        let plan = RuntimePlan::build(config, &registry)?;
+
+        assert_eq!(plan.capture.mode, CapturePlanMode::PlaintextFeed);
+        assert_eq!(
+            plan.capture.selected_backend,
+            Some(CaptureBackend::PlaintextFeed)
+        );
+        assert_eq!(
+            plan.capabilities
+                .mode(CapabilityKind::ExternalPlaintextFeed),
+            RuntimeMode::Available
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_plaintext_feed_fails_closed_without_provider()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(Vec::new(), test_platform_capabilities());
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::PlaintextFeed;
+        config.capture.plaintext_feed.path = Some("/tmp/feed.jsonl".into());
+
+        let error = RuntimePlan::build(config, &registry)
+            .expect_err("external feed must have a provider descriptor");
+
+        assert!(
+            error
+                .to_string()
+                .contains("PlaintextFeed capture provider is not available")
         );
         Ok(())
     }

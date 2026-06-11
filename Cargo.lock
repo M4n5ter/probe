@@ -242,6 +242,7 @@ dependencies = [
  "pcap",
  "probe-core",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

@@ -16,6 +16,7 @@ pub enum CaptureSource {
     EbpfSyscall,
     Libpcap,
     LibsslUprobe,
+    ExternalPlaintextFeed,
     Replay,
     Mock,
 }

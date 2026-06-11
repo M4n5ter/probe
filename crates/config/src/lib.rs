@@ -40,6 +40,7 @@ impl AgentConfig {
         let mut violations = Vec::new();
 
         validate_capture(&self.capture, &mut violations);
+        validate_tls(&self.tls, &self.capture, &mut violations);
         validate_exporters(&self.exporters, &mut violations);
         validate_policies(&self.policies, &mut violations);
 
@@ -72,6 +73,7 @@ pub struct CaptureConfig {
     pub selection: CaptureSelection,
     pub fallback_backends: Vec<LiveCaptureBackend>,
     pub libpcap: LibpcapCaptureConfig,
+    pub plaintext_feed: PlaintextFeedCaptureConfig,
     pub deep_observe_selector: Option<Selector>,
 }
 
@@ -93,6 +95,7 @@ impl Default for CaptureConfig {
             selection: CaptureSelection::Auto,
             fallback_backends: vec![LiveCaptureBackend::Ebpf, LiveCaptureBackend::Libpcap],
             libpcap: LibpcapCaptureConfig::default(),
+            plaintext_feed: PlaintextFeedCaptureConfig::default(),
             deep_observe_selector: None,
         }
     }
@@ -112,12 +115,19 @@ impl Default for LibpcapCaptureConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct PlaintextFeedCaptureConfig {
+    pub path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureSelection {
     Auto,
     Ebpf,
     Libpcap,
+    PlaintextFeed,
     Replay,
 }
 
@@ -127,6 +137,7 @@ impl CaptureSelection {
             Self::Auto => None,
             Self::Ebpf => Some(CaptureBackend::Ebpf),
             Self::Libpcap => Some(CaptureBackend::Libpcap),
+            Self::PlaintextFeed => Some(CaptureBackend::PlaintextFeed),
             Self::Replay => Some(CaptureBackend::Replay),
         }
     }
@@ -137,6 +148,7 @@ impl CaptureSelection {
 pub enum CaptureBackend {
     Ebpf,
     Libpcap,
+    PlaintextFeed,
     Replay,
 }
 
@@ -262,7 +274,6 @@ impl Default for PlaintextTlsConfig {
 pub enum TlsPlaintextProvider {
     LibsslUprobe,
     Keylog,
-    ExternalFeed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,6 +355,7 @@ fn validate_capture(capture: &CaptureConfig, violations: &mut Vec<ConfigViolatio
     if capture_uses_libpcap(capture) {
         validate_libpcap_capture(&capture.libpcap, violations);
     }
+    validate_plaintext_feed_capture(capture, violations);
 }
 
 fn capture_uses_libpcap(capture: &CaptureConfig) -> bool {
@@ -352,7 +364,9 @@ fn capture_uses_libpcap(capture: &CaptureConfig) -> bool {
         CaptureSelection::Auto => capture
             .fallback_backends
             .contains(&LiveCaptureBackend::Libpcap),
-        CaptureSelection::Ebpf | CaptureSelection::Replay => false,
+        CaptureSelection::Ebpf | CaptureSelection::PlaintextFeed | CaptureSelection::Replay => {
+            false
+        }
     }
 }
 
@@ -384,6 +398,57 @@ fn validate_libpcap_capture(libpcap: &LibpcapCaptureConfig, violations: &mut Vec
             reason: "libpcap buffer size must be positive when set".to_string(),
         });
     }
+}
+
+fn validate_plaintext_feed_capture(capture: &CaptureConfig, violations: &mut Vec<ConfigViolation>) {
+    match capture.selection {
+        CaptureSelection::PlaintextFeed => {
+            if capture.plaintext_feed.path.is_none() {
+                violations.push(ConfigViolation {
+                    field: "capture.plaintext_feed.path".to_string(),
+                    reason: "plaintext feed capture requires a JSON-lines feed path".to_string(),
+                });
+            }
+        }
+        CaptureSelection::Auto
+        | CaptureSelection::Ebpf
+        | CaptureSelection::Libpcap
+        | CaptureSelection::Replay => {
+            if capture.plaintext_feed.path.is_some() {
+                violations.push(ConfigViolation {
+                    field: "capture.plaintext_feed.path".to_string(),
+                    reason: "plaintext feed path is only valid when capture.selection = \"plaintext_feed\""
+                        .to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn validate_tls(tls: &TlsConfig, capture: &CaptureConfig, violations: &mut Vec<ConfigViolation>) {
+    if capture.selection == CaptureSelection::PlaintextFeed {
+        validate_plaintext_feed_selection(tls, violations);
+    }
+
+    if !tls.plaintext.enabled {
+        return;
+    }
+
+    match tls.plaintext.provider {
+        TlsPlaintextProvider::LibsslUprobe | TlsPlaintextProvider::Keylog => {}
+    }
+}
+
+fn validate_plaintext_feed_selection(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
+    if !tls.plaintext.enabled {
+        return;
+    }
+
+    violations.push(ConfigViolation {
+        field: "tls.plaintext.enabled".to_string(),
+        reason: "plaintext_feed capture is the external plaintext source; disable tls.plaintext or select a TLS instrumentation backend"
+            .to_string(),
+    });
 }
 
 fn validate_exporters(exporters: &[ExporterConfig], violations: &mut Vec<ConfigViolation>) {
@@ -577,7 +642,29 @@ mode = "dry_run"
         assert_eq!(config.exporters[0].codec, CompressionCodecName::Zstd);
         assert_eq!(config.tls.materials[0].kind, TlsMaterialKind::TrustAnchor);
         assert!(config.tls.plaintext.enabled);
+        assert_eq!(config.capture.plaintext_feed.path, None);
         assert_eq!(config.enforcement.mode, EnforcementMode::DryRun);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_external_plaintext_feed_config() -> Result<(), Box<dyn std::error::Error>> {
+        let config = AgentConfig::from_toml_str(
+            r#"
+[capture]
+selection = "plaintext_feed"
+
+[capture.plaintext_feed]
+path = "/tmp/sssa-plaintext-feed.jsonl"
+"#,
+        )?;
+
+        assert_eq!(config.capture.selection, CaptureSelection::PlaintextFeed);
+        assert_eq!(
+            config.capture.plaintext_feed.path,
+            Some(PathBuf::from("/tmp/sssa-plaintext-feed.jsonl"))
+        );
+        config.validate_basic()?;
         Ok(())
     }
 
@@ -644,6 +731,51 @@ buffer_size = 0
                 .to_string()
                 .contains("libpcap buffer size must be positive")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn validation_rejects_invalid_plaintext_feed_config() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let unused_path = AgentConfig::from_toml_str(
+            r#"
+[capture.plaintext_feed]
+path = "/tmp/feed.jsonl"
+"#,
+        )?;
+        let error = unused_path
+            .validate_basic()
+            .expect_err("plaintext feed path must belong to the selected backend");
+        assert!(error.to_string().contains("capture.plaintext_feed.path"));
+
+        let missing_path = AgentConfig::from_toml_str(
+            r#"
+[capture]
+selection = "plaintext_feed"
+"#,
+        )?;
+        let error = missing_path
+            .validate_basic()
+            .expect_err("external feed must set a path");
+        assert!(error.to_string().contains("capture.plaintext_feed.path"));
+
+        let conflicting_tls_provider = AgentConfig::from_toml_str(
+            r#"
+[capture]
+selection = "plaintext_feed"
+
+[capture.plaintext_feed]
+path = "/tmp/feed.jsonl"
+
+[tls.plaintext]
+enabled = true
+provider = "libssl_uprobe"
+"#,
+        )?;
+        let error = conflicting_tls_provider
+            .validate_basic()
+            .expect_err("plaintext feed selection must not also enable TLS instrumentation");
+        assert!(error.to_string().contains("tls.plaintext.enabled"));
         Ok(())
     }
 

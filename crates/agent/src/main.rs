@@ -4,6 +4,7 @@ use std::{
 };
 
 mod export;
+mod plaintext_feed;
 
 use attribution::ProcfsSocketResolver;
 use capture::{
@@ -16,6 +17,7 @@ use export::{drain_configured_sinks, drain_replay_webhook};
 use exporter::CompressionCodec;
 use parsers::Http1ParserFactory;
 use pipeline::{CapturePipeline, PipelineRunOptions};
+use plaintext_feed::load_plaintext_feed_provider;
 use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
 use probe_config::{AgentConfig, CaptureBackend};
 use probe_core::{
@@ -55,6 +57,8 @@ enum AgentError {
     Export(#[from] export::ExportDrainError),
     #[error("capture provider error: {0}")]
     Capture(#[from] CaptureError),
+    #[error("plaintext feed error: {0}")]
+    PlaintextFeed(#[from] plaintext_feed::PlaintextFeedLoadError),
     #[error("unsupported run config: {0}")]
     UnsupportedRunConfig(String),
 }
@@ -175,7 +179,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
     match cli.command {
         Command::Run { config, max_events } => {
             let plan = read_runtime_plan_or_default(config.as_ref())?;
-            let mut provider = build_live_capture_provider(&plan)?;
+            let mut provider = build_capture_provider(&plan)?;
             let mut parser_factory = Http1ParserFactory::default();
             let spool = FjallSpool::open(&plan.config.storage.path)?;
             let policy = read_configured_policy(&plan.config)?;
@@ -268,6 +272,10 @@ fn default_capture_provider_descriptors(config: &AgentConfig) -> Vec<CaptureProv
             CaptureProviderBuilder::Unimplemented,
             "provider not implemented in this build",
         ),
+        CaptureProviderDescriptor::available(
+            CaptureBackend::PlaintextFeed,
+            CaptureProviderBuilder::PlaintextFeed,
+        ),
         libpcap_provider_descriptor(&libpcap_config_from_agent(config)),
     ]
 }
@@ -283,6 +291,13 @@ fn libpcap_provider_descriptor(config: &LibpcapConfig) -> CaptureProviderDescrip
             CaptureProviderBuilder::Libpcap,
             error.to_string(),
         ),
+    }
+}
+
+fn build_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProvider>, AgentError> {
+    match plan.capture.selected_backend {
+        Some(CaptureBackend::PlaintextFeed) => build_plaintext_feed_provider(plan),
+        _ => build_live_capture_provider(plan),
     }
 }
 
@@ -304,6 +319,23 @@ fn build_live_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProv
                 .unwrap_or_else(|| "capture plan did not select a live backend".to_string()),
         })),
     }
+}
+
+fn build_plaintext_feed_provider(
+    plan: &RuntimePlan,
+) -> Result<Box<dyn CaptureProvider>, AgentError> {
+    let path = plan
+        .config
+        .capture
+        .plaintext_feed
+        .path
+        .as_ref()
+        .ok_or_else(|| {
+            AgentError::UnsupportedRunConfig(
+                "plaintext_feed capture requires capture.plaintext_feed.path".to_string(),
+            )
+        })?;
+    Ok(Box::new(load_plaintext_feed_provider(path)?))
 }
 
 fn procfs_tcp_process_resolver_for_plan(plan: &RuntimePlan) -> Option<Box<dyn ProcessResolver>> {
