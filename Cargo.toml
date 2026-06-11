@@ -5,6 +5,7 @@ members = [
     "crates/capture",
     "crates/config",
     "crates/core",
+    "crates/enforcement",
     "crates/exporter",
     "crates/parsers",
     "crates/pipeline",

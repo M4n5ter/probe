@@ -1,9 +1,9 @@
 use attribution::{ProcessAttributor, ProcfsAttributor, ProcfsSocketResolver};
 use probe_config::{
     AgentConfig, CaptureBackend, CaptureSelection, ConfigError, ConfigValidationError,
-    ConfigViolation, EnforcementMode, ExporterTransport, LiveCaptureBackend, TlsPlaintextProvider,
+    ConfigViolation, ExporterTransport, LiveCaptureBackend, TlsPlaintextProvider,
 };
-use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, RuntimeMode};
+use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -352,6 +352,14 @@ fn validate_enforcement_config(
     registry: &ProviderRegistry,
     violations: &mut Vec<ConfigViolation>,
 ) {
+    if let Some(selector) = &config.enforcement.selector
+        && let Err(error) = selector.compile()
+    {
+        violations.push(ConfigViolation {
+            field: "enforcement.selector".to_string(),
+            reason: error.to_string(),
+        });
+    }
     match config.enforcement.mode {
         EnforcementMode::Disabled | EnforcementMode::AuditOnly => {}
         EnforcementMode::DryRun => require_available(
@@ -444,9 +452,8 @@ fn default_platform_capabilities(
             CapabilityKind::WebhookExporter,
             "webhook transport is wired into replay but not live capture",
         ),
-        CapabilityState::unavailable(
+        CapabilityState::available(
             CapabilityKind::DryRunEnforcement,
-            "enforcement provider not implemented in this build",
         ),
     ]
     .into_iter()
@@ -463,6 +470,8 @@ fn capture_backend_capability(backend: CaptureBackend) -> CapabilityKind {
 
 #[cfg(test)]
 mod tests {
+    use probe_core::Selector;
+
     use super::*;
 
     #[test]
@@ -615,6 +624,52 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_enforcement_is_a_supported_runtime_capability()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+        config.enforcement.mode = EnforcementMode::DryRun;
+
+        let plan = RuntimePlan::build(config, &registry)?;
+
+        assert_eq!(
+            plan.capabilities.mode(CapabilityKind::DryRunEnforcement),
+            RuntimeMode::Available
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enforcement_selector_is_validated_during_plan_build() {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+        config.enforcement.selector = Some(Selector::All {
+            selectors: Vec::new(),
+        });
+
+        let error = RuntimePlan::build(config, &registry)
+            .expect_err("invalid enforcement selector must fail plan build");
+
+        assert!(error.to_string().contains("enforcement.selector"));
+    }
+
+    #[test]
     fn replay_backend_resolves_to_replay_mode() -> Result<(), Box<dyn std::error::Error>> {
         let registry = ProviderRegistry::new(
             vec![capture_provider(
@@ -682,7 +737,7 @@ mod tests {
             CapabilityState::available(CapabilityKind::Http1),
             CapabilityState::available(CapabilityKind::Sse),
             CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
-            CapabilityState::unavailable(CapabilityKind::DryRunEnforcement, "not built"),
+            CapabilityState::available(CapabilityKind::DryRunEnforcement),
         ]
     }
 }

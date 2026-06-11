@@ -108,7 +108,13 @@ pub struct CompiledSelector {
 
 impl CompiledSelector {
     pub fn matches_flow(&self, flow: &FlowContext, direction: Direction) -> bool {
-        self.node.matches_flow(flow, direction)
+        self.node
+            .matches_flow(flow, Some(direction))
+            .unwrap_or(false)
+    }
+
+    pub fn matches_flow_without_direction(&self, flow: &FlowContext) -> bool {
+        self.node.matches_flow(flow, None).unwrap_or(false)
     }
 }
 
@@ -158,16 +164,22 @@ impl CompiledSelectorNode {
         }
     }
 
-    fn matches_flow(&self, flow: &FlowContext, direction: Direction) -> bool {
+    fn matches_flow(&self, flow: &FlowContext, direction: Option<Direction>) -> Option<bool> {
         match self {
             Self::Match(term) => term.matches_flow(flow, direction),
-            Self::All(selectors) => selectors
-                .iter()
-                .all(|selector| selector.matches_flow(flow, direction)),
-            Self::Any(selectors) => selectors
-                .iter()
-                .any(|selector| selector.matches_flow(flow, direction)),
-            Self::Not(selector) => !selector.matches_flow(flow, direction),
+            Self::All(selectors) => all_selector_matches(
+                selectors
+                    .iter()
+                    .map(|selector| selector.matches_flow(flow, direction)),
+            ),
+            Self::Any(selectors) => any_selector_matches(
+                selectors
+                    .iter()
+                    .map(|selector| selector.matches_flow(flow, direction)),
+            ),
+            Self::Not(selector) => selector
+                .matches_flow(flow, direction)
+                .map(|matched| !matched),
         }
     }
 }
@@ -189,8 +201,11 @@ impl CompiledSelectorTerm {
         })
     }
 
-    fn matches_flow(&self, flow: &FlowContext, direction: Direction) -> bool {
-        self.matches_process(flow) && self.matches_traffic(flow, direction)
+    fn matches_flow(&self, flow: &FlowContext, direction: Option<Direction>) -> Option<bool> {
+        if !self.matches_process(flow) {
+            return Some(false);
+        }
+        self.matches_traffic(flow, direction)
     }
 
     fn matches_process(&self, flow: &FlowContext) -> bool {
@@ -221,16 +236,46 @@ impl CompiledSelectorTerm {
         ])
     }
 
-    fn matches_traffic(&self, flow: &FlowContext, direction: Direction) -> bool {
+    fn matches_traffic(&self, flow: &FlowContext, direction: Option<Direction>) -> Option<bool> {
         let spec = &self.term.traffic;
-        all_match([
+        let direction_matches = if spec.directions.is_empty() {
+            Some(true)
+        } else {
+            direction.map(|direction| spec.directions.contains(&direction))
+        };
+
+        Some(all_match([
             spec.local_ports.is_empty() || spec.local_ports.contains(&flow.local.port),
             spec.remote_ports.is_empty() || spec.remote_ports.contains(&flow.remote.port),
-            spec.directions.is_empty() || spec.directions.contains(&direction),
+            direction_matches?,
             spec.remote_addresses.is_empty()
                 || spec.remote_addresses.contains(&flow.remote.address),
-        ])
+        ]))
     }
+}
+
+fn all_selector_matches(matches: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    let mut unknown = false;
+    for matched in matches {
+        match matched {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => unknown = true,
+        }
+    }
+    (!unknown).then_some(true)
+}
+
+fn any_selector_matches(matches: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    let mut unknown = false;
+    for matched in matches {
+        match matched {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => unknown = true,
+        }
+    }
+    (!unknown).then_some(false)
 }
 
 fn compile_globs(patterns: &[String]) -> Result<Option<GlobSet>, SelectorError> {
@@ -297,6 +342,53 @@ mod tests {
         let flow = demo_flow();
         assert!(selector.matches_flow(&flow, Direction::Outbound));
         assert!(!selector.matches_flow(&flow, Direction::Inbound));
+        Ok(())
+    }
+
+    #[test]
+    fn directionless_match_misses_direction_constrained_selector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector {
+                names: vec!["demo".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let inverted = Selector::Not {
+            selector: Box::new(Selector::term(
+                ProcessSelector::default(),
+                TrafficSelector {
+                    directions: vec![Direction::Outbound],
+                    ..TrafficSelector::default()
+                },
+            )),
+        }
+        .compile()?;
+
+        let flow = demo_flow();
+        assert!(!selector.matches_flow_without_direction(&flow));
+        assert!(!inverted.matches_flow_without_direction(&flow));
+        Ok(())
+    }
+
+    #[test]
+    fn directionless_match_still_allows_process_only_selector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector {
+                names: vec!["demo".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+        .compile()?;
+
+        assert!(selector.matches_flow_without_direction(&demo_flow()));
         Ok(())
     }
 

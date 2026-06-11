@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::{Action, FlowContext, Verdict};
+use crate::{Action, EnforcementDecision, FlowContext, Verdict};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,6 +131,7 @@ pub enum EventKind {
     ProtocolError(ProtocolError),
     PolicyAlert(DomainEvent),
     PolicyVerdict(Verdict),
+    EnforcementDecision(EnforcementDecision),
 }
 
 impl EventKind {
@@ -151,6 +152,7 @@ impl EventKind {
             Self::ProtocolError(_) => "protocol_error",
             Self::PolicyAlert(_) => "policy_alert",
             Self::PolicyVerdict(_) => "policy_verdict",
+            Self::EnforcementDecision(_) => "enforcement_decision",
         }
     }
 

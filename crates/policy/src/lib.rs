@@ -11,19 +11,46 @@ use thiserror::Error;
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 100_000;
 const DEFAULT_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const INSTRUCTION_HOOK_INTERVAL: u32 = 1_000;
-pub const POLICY_HOOKS: &[&str] = &[
-    "on_connection_opened",
-    "on_connection_closed",
-    "on_http_request_headers",
-    "on_http_response_headers",
-    "on_http_body_chunk",
-    "on_sse_event",
-    "on_opaque_stream",
-    "on_gap",
-    "on_protocol_error",
-    "on_policy_alert",
-    "on_policy_verdict",
+pub const POLICY_HOOKS: &[PolicyHook] = &[
+    PolicyHook::ConnectionOpened,
+    PolicyHook::ConnectionClosed,
+    PolicyHook::HttpRequestHeaders,
+    PolicyHook::HttpResponseHeaders,
+    PolicyHook::HttpBodyChunk,
+    PolicyHook::SseEvent,
+    PolicyHook::OpaqueStream,
+    PolicyHook::Gap,
+    PolicyHook::ProtocolError,
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyHook {
+    ConnectionOpened,
+    ConnectionClosed,
+    HttpRequestHeaders,
+    HttpResponseHeaders,
+    HttpBodyChunk,
+    SseEvent,
+    OpaqueStream,
+    Gap,
+    ProtocolError,
+}
+
+impl PolicyHook {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectionOpened => "on_connection_opened",
+            Self::ConnectionClosed => "on_connection_closed",
+            Self::HttpRequestHeaders => "on_http_request_headers",
+            Self::HttpResponseHeaders => "on_http_response_headers",
+            Self::HttpBodyChunk => "on_http_body_chunk",
+            Self::SseEvent => "on_sse_event",
+            Self::OpaqueStream => "on_opaque_stream",
+            Self::Gap => "on_gap",
+            Self::ProtocolError => "on_protocol_error",
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum PolicyError {
@@ -101,9 +128,10 @@ impl PolicyRuntime {
 
     pub fn handle_event(
         &self,
-        hook: &str,
+        hook: PolicyHook,
         event: &EventEnvelope,
     ) -> Result<Vec<PolicyOutcome>, PolicyError> {
+        let hook = hook.as_str();
         if !self
             .manifest
             .hooks
@@ -234,19 +262,20 @@ fn table_value_to_outcome(lua: &Lua, value: Value) -> Result<PolicyOutcome, mlua
         .map(PolicyOutcome::Alert)
 }
 
-pub fn hook_for_event(event: &EventEnvelope) -> &'static str {
+pub fn hook_for_event(event: &EventEnvelope) -> Option<PolicyHook> {
     match &event.kind {
-        EventKind::ConnectionOpened => "on_connection_opened",
-        EventKind::ConnectionClosed => "on_connection_closed",
-        EventKind::HttpRequestHeaders(_) => "on_http_request_headers",
-        EventKind::HttpResponseHeaders(_) => "on_http_response_headers",
-        EventKind::HttpBodyChunk(_) => "on_http_body_chunk",
-        EventKind::SseEvent(_) => "on_sse_event",
-        EventKind::OpaqueStream(_) => "on_opaque_stream",
-        EventKind::Gap(_) => "on_gap",
-        EventKind::ProtocolError(_) => "on_protocol_error",
-        EventKind::PolicyAlert(_) => "on_policy_alert",
-        EventKind::PolicyVerdict(_) => "on_policy_verdict",
+        EventKind::ConnectionOpened => Some(PolicyHook::ConnectionOpened),
+        EventKind::ConnectionClosed => Some(PolicyHook::ConnectionClosed),
+        EventKind::HttpRequestHeaders(_) => Some(PolicyHook::HttpRequestHeaders),
+        EventKind::HttpResponseHeaders(_) => Some(PolicyHook::HttpResponseHeaders),
+        EventKind::HttpBodyChunk(_) => Some(PolicyHook::HttpBodyChunk),
+        EventKind::SseEvent(_) => Some(PolicyHook::SseEvent),
+        EventKind::OpaqueStream(_) => Some(PolicyHook::OpaqueStream),
+        EventKind::Gap(_) => Some(PolicyHook::Gap),
+        EventKind::ProtocolError(_) => Some(PolicyHook::ProtocolError),
+        EventKind::PolicyAlert(_)
+        | EventKind::PolicyVerdict(_)
+        | EventKind::EnforcementDecision(_) => None,
     }
 }
 
@@ -257,7 +286,9 @@ mod tests {
         HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
     };
 
-    use crate::{PolicyLimits, PolicyManifest, PolicyOutcome, PolicyRuntime, hook_for_event};
+    use crate::{
+        PolicyHook, PolicyLimits, PolicyManifest, PolicyOutcome, PolicyRuntime, hook_for_event,
+    };
 
     #[test]
     fn lua_policy_can_return_typed_alert_verdict() -> Result<(), Box<dyn std::error::Error>> {
@@ -280,7 +311,7 @@ mod tests {
         )?;
 
         let event = demo_event();
-        let outcomes = runtime.handle_event(hook_for_event(&event), &event)?;
+        let outcomes = runtime.handle_event(primary_hook_for_event(&event), &event)?;
         let PolicyOutcome::Verdict(verdict) = outcomes.first().ok_or("missing outcome")? else {
             return Err("missing verdict".into());
         };
@@ -314,7 +345,7 @@ mod tests {
         )?;
 
         let event = demo_event();
-        let outcomes = runtime.handle_event(hook_for_event(&event), &event)?;
+        let outcomes = runtime.handle_event(primary_hook_for_event(&event), &event)?;
 
         assert!(
             matches!(outcomes.first(), Some(PolicyOutcome::Alert(alert)) if alert.message == "sensitive path")
@@ -341,7 +372,7 @@ mod tests {
         )?;
 
         let event = demo_event();
-        let result = runtime.handle_event(hook_for_event(&event), &event);
+        let result = runtime.handle_event(primary_hook_for_event(&event), &event);
         assert!(result.is_err());
         Ok(())
     }
@@ -375,7 +406,7 @@ mod tests {
         )?;
 
         let event = demo_event();
-        let outcomes = runtime.handle_event(hook_for_event(&event), &event)?;
+        let outcomes = runtime.handle_event(primary_hook_for_event(&event), &event)?;
 
         assert!(
             matches!(outcomes.first(), Some(PolicyOutcome::Verdict(verdict)) if verdict.reason == "sandboxed")
@@ -401,7 +432,7 @@ mod tests {
         )?;
 
         let event = demo_event();
-        let result = runtime.handle_event(hook_for_event(&event), &event);
+        let result = runtime.handle_event(primary_hook_for_event(&event), &event);
         assert!(result.is_err());
         Ok(())
     }
@@ -432,9 +463,34 @@ mod tests {
         )?;
 
         let event = demo_event();
-        let result = runtime.handle_event(hook_for_event(&event), &event);
+        let result = runtime.handle_event(primary_hook_for_event(&event), &event);
         assert!(result.is_err());
         Ok(())
+    }
+
+    #[test]
+    fn secondary_events_do_not_have_policy_hooks() {
+        let policy_alert = EventEnvelope::new(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            demo_flow(),
+            CaptureSource::Replay,
+            "test",
+            EventKind::PolicyAlert(probe_core::DomainEvent {
+                name: "audit".to_string(),
+                severity: probe_core::Action::Alert,
+                message: "secondary".to_string(),
+                metadata: serde_json::Value::Null,
+            }),
+        );
+
+        assert_eq!(hook_for_event(&policy_alert), None);
+    }
+
+    fn primary_hook_for_event(event: &EventEnvelope) -> PolicyHook {
+        hook_for_event(event).expect("demo event should have a primary policy hook")
     }
 
     fn demo_event() -> EventEnvelope {

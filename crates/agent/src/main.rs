@@ -10,14 +10,15 @@ use capture::{
     ResolvedProcess,
 };
 use clap::{Parser, Subcommand, ValueEnum};
+use enforcement::ScopedEnforcementPlanner;
 use exporter::{CompressionCodec, ReliableExporter, WebhookExporter};
 use parsers::Http1ParserFactory;
 use pipeline::CapturePipeline;
 use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
 use probe_config::{AgentConfig, CaptureBackend};
 use probe_core::{
-    AddressPort, Direction, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity,
-    TcpConnection, Timestamp, TransportProtocol,
+    AddressPort, CapabilityKind, Direction, EnforcementMode, FlowContext, FlowIdentity,
+    ProcessContext, ProcessIdentity, RuntimeMode, TcpConnection, Timestamp, TransportProtocol,
 };
 use proto::{BatchEnvelope, EVENT_ENVELOPE_JSON_SCHEMA};
 use runtime::{
@@ -45,6 +46,8 @@ enum AgentError {
     Storage(#[from] storage::StorageError),
     #[error("policy error: {0}")]
     Policy(#[from] policy::PolicyError),
+    #[error("enforcement error: {0}")]
+    Enforcement(#[from] enforcement::EnforcementError),
     #[error("proto error: {0}")]
     Proto(#[from] proto::ProtoError),
     #[error("export error: {0}")]
@@ -91,6 +94,8 @@ enum Command {
         codec: CliCompressionCodec,
         #[arg(long, default_value = "replay-agent")]
         agent_id: String,
+        #[arg(long, default_value = "audit-only")]
+        enforcement_mode: CliEnforcementMode,
     },
 }
 
@@ -117,6 +122,13 @@ enum CliCompressionCodec {
     Deflate,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliEnforcementMode {
+    Disabled,
+    AuditOnly,
+    DryRun,
+}
+
 impl From<CliCompressionCodec> for CompressionCodec {
     fn from(value: CliCompressionCodec) -> Self {
         match value {
@@ -126,6 +138,27 @@ impl From<CliCompressionCodec> for CompressionCodec {
             CliCompressionCodec::Deflate => Self::Deflate,
         }
     }
+}
+
+impl From<CliEnforcementMode> for EnforcementMode {
+    fn from(value: CliEnforcementMode) -> Self {
+        match value {
+            CliEnforcementMode::Disabled => Self::Disabled,
+            CliEnforcementMode::AuditOnly => Self::AuditOnly,
+            CliEnforcementMode::DryRun => Self::DryRun,
+        }
+    }
+}
+
+struct ReplayCommand {
+    input: PathBuf,
+    spool: PathBuf,
+    direction: Direction,
+    policy: Option<PathBuf>,
+    webhook: Option<String>,
+    codec: CompressionCodec,
+    agent_id: String,
+    enforcement_mode: EnforcementMode,
 }
 
 #[tokio::main]
@@ -145,12 +178,16 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let mut parser_factory = Http1ParserFactory::default();
             let spool = FjallSpool::open(&plan.config.storage.path)?;
             let policy = read_configured_policy(&plan.config)?;
+            let mut enforcement_planner = build_configured_enforcement_planner(&plan.config)?;
             let mut pipeline = CapturePipeline::new(
                 &spool,
                 &mut parser_factory,
                 policy.as_ref(),
                 plan.config.config_version.clone(),
             );
+            if let Some(enforcement_planner) = enforcement_planner.as_mut() {
+                pipeline = pipeline.with_enforcement_planner(enforcement_planner);
+            }
             println!(
                 "agent {} running config {} capture {:?} selected {:?}",
                 plan.config.agent_id,
@@ -180,16 +217,18 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             webhook,
             codec,
             agent_id,
+            enforcement_mode,
         } => {
-            replay(
+            replay(ReplayCommand {
                 input,
                 spool,
-                direction.into(),
+                direction: direction.into(),
                 policy,
                 webhook,
-                codec.into(),
+                codec: codec.into(),
                 agent_id,
-            )
+                enforcement_mode: enforcement_mode.into(),
+            })
             .await?;
         }
     }
@@ -249,7 +288,7 @@ fn build_live_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProv
     match plan.capture.selected_backend {
         Some(CaptureBackend::Libpcap) => Ok(Box::new(LibpcapProvider::open_with_process_resolver(
             libpcap_config_from_agent(&plan.config),
-            Some(Box::<ProcfsTcpProcessResolver>::default()),
+            procfs_tcp_process_resolver_for_plan(plan),
         )?)),
         Some(backend) => Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
             reason: format!("{backend:?} capture provider is selected but has no agent builder"),
@@ -262,6 +301,14 @@ fn build_live_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProv
                 .unwrap_or_else(|| "capture plan did not select a live backend".to_string()),
         })),
     }
+}
+
+fn procfs_tcp_process_resolver_for_plan(plan: &RuntimePlan) -> Option<Box<dyn ProcessResolver>> {
+    (plan
+        .capabilities
+        .mode(CapabilityKind::ProcfsSocketAttribution)
+        != RuntimeMode::Unavailable)
+        .then(|| Box::<ProcfsTcpProcessResolver>::default() as Box<dyn ProcessResolver>)
 }
 
 fn libpcap_config_from_agent(config: &AgentConfig) -> LibpcapConfig {
@@ -324,34 +371,28 @@ fn read_config(path: &PathBuf) -> Result<AgentConfig, AgentError> {
     AgentConfig::from_toml_str(&content).map_err(AgentError::Config)
 }
 
-async fn replay(
-    input: PathBuf,
-    spool: PathBuf,
-    direction: Direction,
-    policy: Option<PathBuf>,
-    webhook: Option<String>,
-    codec: CompressionCodec,
-    agent_id: String,
-) -> Result<(), AgentError> {
-    let bytes = std::fs::read(&input).map_err(|source| AgentError::ReadFile {
-        path: input.display().to_string(),
+async fn replay(command: ReplayCommand) -> Result<(), AgentError> {
+    let bytes = std::fs::read(&command.input).map_err(|source| AgentError::ReadFile {
+        path: command.input.display().to_string(),
         source,
     })?;
-    let policy = policy.as_ref().map(read_policy).transpose()?;
+    let policy = command.policy.as_ref().map(read_policy).transpose()?;
     let mut parser_factory = Http1ParserFactory::default();
-    let spool = FjallSpool::open(spool)?;
+    let spool = FjallSpool::open(command.spool)?;
     let flow = replay_flow();
     let mut replay_provider =
-        ReplayProvider::new(flow.clone(), direction, bytes, current_timestamp(1));
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, policy.as_ref(), "replay");
+        ReplayProvider::new(flow.clone(), command.direction, bytes, current_timestamp(1));
+    let mut enforcement_planner = ScopedEnforcementPlanner::new(command.enforcement_mode, None)?;
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, policy.as_ref(), "replay")
+        .with_enforcement_planner(&mut enforcement_planner);
     let summary = pipeline.run_provider(&mut replay_provider)?;
     println!(
         "replay pipeline journaled {} capture chunks and stored {} export events",
         summary.ingress_chunks, summary.export_events
     );
 
-    if let Some(endpoint) = webhook {
-        export_once(&spool, &agent_id, endpoint, codec).await?;
+    if let Some(endpoint) = command.webhook {
+        export_once(&spool, &command.agent_id, endpoint, command.codec).await?;
     }
 
     Ok(())
@@ -373,7 +414,7 @@ fn read_policy(path: &PathBuf) -> Result<PolicyRuntime, AgentError> {
             version: "replay".to_string(),
             hooks: POLICY_HOOKS
                 .iter()
-                .map(|hook| (*hook).to_string())
+                .map(|hook| hook.as_str().to_string())
                 .collect(),
         },
         &source,
@@ -394,6 +435,17 @@ fn read_configured_policy(config: &AgentConfig) -> Result<Option<PolicyRuntime>,
             "live run currently supports at most one enabled policy bundle".to_string(),
         )),
     }
+}
+
+fn build_configured_enforcement_planner(
+    config: &AgentConfig,
+) -> Result<Option<ScopedEnforcementPlanner>, AgentError> {
+    ScopedEnforcementPlanner::new(
+        config.enforcement.mode,
+        config.enforcement.selector.as_ref(),
+    )
+    .map(Some)
+    .map_err(AgentError::Enforcement)
 }
 
 async fn export_once(

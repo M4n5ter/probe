@@ -82,11 +82,21 @@ impl ProtocolParser for Http1Parser {
                     reason,
                 )])
             }
+            ParserInput::ConnectionClosed => ParserOutput::from_events(self.finish_flow()),
         }
     }
 }
 
 impl Http1Parser {
+    fn finish_flow(&mut self) -> Vec<EventKind> {
+        let mut events = Vec::new();
+        if !self.opaque_handoff {
+            self.inbound.finish(Direction::Inbound, &mut events);
+            self.outbound.finish(Direction::Outbound, &mut events);
+        }
+        events
+    }
+
     fn state_mut(&mut self, direction: Direction) -> &mut DirectionState {
         match direction {
             Direction::Inbound => &mut self.inbound,
@@ -370,6 +380,46 @@ impl DirectionState {
         self.state = HttpState::Opaque;
         self.body_offset = 0;
         self.sse = SseDecoder::default();
+    }
+
+    fn finish(&mut self, direction: Direction, events: &mut Vec<EventKind>) {
+        match self.state {
+            HttpState::StreamingUntilClose => {
+                if self.buffer.is_empty() {
+                    self.emit_body(direction, Bytes::new(), true, events);
+                } else {
+                    self.read_available_body(direction, true, events);
+                }
+            }
+            HttpState::ReadingHeaders if !self.buffer.is_empty() => {
+                self.fail(
+                    direction,
+                    "connection closed with partial HTTP headers".to_string(),
+                    events,
+                );
+            }
+            HttpState::ReadingFixedBody { remaining } => {
+                if remaining > 0 {
+                    self.read_available_body(direction, false, events);
+                    self.fail(
+                        direction,
+                        "connection closed before fixed HTTP body completed".to_string(),
+                        events,
+                    );
+                }
+            }
+            HttpState::ReadingChunkSize
+            | HttpState::ReadingChunkData { .. }
+            | HttpState::ReadingChunkTerminator
+            | HttpState::ReadingChunkTrailers => {
+                self.fail(
+                    direction,
+                    "connection closed before chunked HTTP body completed".to_string(),
+                    events,
+                );
+            }
+            HttpState::ReadingHeaders | HttpState::Opaque => {}
+        }
     }
 }
 
@@ -1181,5 +1231,66 @@ mod tests {
         let mut parser = Http1Parser::default();
         let events = parser.ingest(Direction::Outbound, b"GET / HTTP/1.1\r\nHost:");
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn connection_close_reports_partial_headers() {
+        let mut parser = Http1Parser::default();
+        assert!(
+            parser
+                .ingest(Direction::Outbound, b"GET / HTTP/1.1\r\nHost:")
+                .is_empty()
+        );
+
+        let events = close_events(&mut parser);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EventKind::ProtocolError(error)
+                if error.direction == Direction::Outbound
+                    && error.reason == "connection closed with partial HTTP headers"
+        )));
+    }
+
+    #[test]
+    fn connection_close_reports_incomplete_fixed_body() {
+        let mut parser = Http1Parser::default();
+        parser.ingest(
+            Direction::Inbound,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe",
+        );
+
+        let events = close_events(&mut parser);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EventKind::ProtocolError(error)
+                if error.direction == Direction::Inbound
+                    && error.reason
+                        == "connection closed before fixed HTTP body completed"
+        )));
+    }
+
+    #[test]
+    fn connection_close_reports_incomplete_chunked_body() {
+        let mut parser = Http1Parser::default();
+        parser.ingest(
+            Direction::Inbound,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhe",
+        );
+
+        let events = close_events(&mut parser);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EventKind::ProtocolError(error)
+                if error.direction == Direction::Inbound
+                    && error.reason
+                        == "connection closed before chunked HTTP body completed"
+        )));
+    }
+
+    fn close_events(parser: &mut Http1Parser) -> Vec<EventKind> {
+        ProtocolParser::ingest(parser, ParserInput::ConnectionClosed).into_events()
     }
 }

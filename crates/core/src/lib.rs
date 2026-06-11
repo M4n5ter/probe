@@ -20,4 +20,6 @@ pub use selector::{
     TrafficSelector,
 };
 pub use socket::{TcpConnection, TcpEndpoint};
-pub use verdict::{Action, Verdict, VerdictScope};
+pub use verdict::{
+    Action, EnforcementDecision, EnforcementMode, EnforcementOutcome, Verdict, VerdictScope,
+};

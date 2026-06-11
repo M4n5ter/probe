@@ -32,6 +32,9 @@ impl FlowTracker {
         {
             closed_before.push(flow);
         }
+        if !closed_before.is_empty() {
+            invalidate_process_resolution(process_resolver);
+        }
         if let Some(record) = self.flows.get_mut(&key) {
             let direction = if decoded.source_endpoint() == record.local_endpoint {
                 Direction::Outbound
@@ -55,10 +58,14 @@ impl FlowTracker {
             return observation;
         }
 
+        let capacity_closed = self.evict_oldest_if_full();
+        if !capacity_closed.is_empty() {
+            invalidate_process_resolution(process_resolver);
+        }
+        closed_before.extend(capacity_closed);
         let primary = FlowCandidate::from_decoded(decoded, infer_initial_direction(decoded));
         let secondary = FlowCandidate::from_decoded(decoded, opposite_direction(primary.direction));
         let selected = select_flow_candidate(primary, secondary, process_resolver);
-        closed_before.extend(self.evict_oldest_if_full());
         self.order.push_back(key);
         let flow = flow_from_decoded(
             decoded,
@@ -158,6 +165,12 @@ impl FlowTracker {
         let removed = self.flows.remove(key);
         self.order.retain(|existing| existing != key);
         removed.map(|record| record.flow)
+    }
+}
+
+fn invalidate_process_resolution(process_resolver: &mut Option<Box<dyn ProcessResolver>>) {
+    if let Some(process_resolver) = process_resolver.as_deref_mut() {
+        process_resolver.invalidate_cached_resolution();
     }
 }
 
@@ -445,7 +458,7 @@ fn synthetic_libpcap_process() -> ProcessContext {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::{cell::RefCell, net::Ipv4Addr, rc::Rc};
 
     use super::*;
 
@@ -759,6 +772,56 @@ mod tests {
     }
 
     #[test]
+    fn idle_eviction_invalidates_resolver_snapshot_before_re_resolve() {
+        let first = DecodedTcpSegment {
+            source: Ipv4Addr::new(10, 0, 0, 1),
+            destination: Ipv4Addr::new(10, 0, 0, 2),
+            source_port: 50_000,
+            destination_port: 80,
+            sequence: 100,
+            flags: default_flags(),
+            payload: b"GET /first HTTP/1.1\r\n\r\n",
+        };
+        let second = DecodedTcpSegment {
+            sequence: 300,
+            payload: b"GET /second HTTP/1.1\r\n\r\n",
+            ..first
+        };
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let mut resolver: Option<Box<dyn ProcessResolver>> =
+            Some(Box::new(InvalidationTrackingResolver {
+                connection: TcpConnection::new(
+                    TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 1).into(), 50_000),
+                    TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 2).into(), 80),
+                ),
+                responses: VecDeque::from([
+                    ResolvedProcess {
+                        process: demo_process(1, "first"),
+                        confidence: 60,
+                    },
+                    ResolvedProcess {
+                        process: demo_process(2, "second"),
+                        confidence: 60,
+                    },
+                ]),
+                operations: Rc::clone(&operations),
+            }));
+        let mut tracker = FlowTracker::default();
+
+        tracker.observe(&first, timestamp(10, 10), &mut resolver);
+        tracker.observe(
+            &second,
+            timestamp(12, FLOW_IDLE_TIMEOUT_UNIX_NS + 11),
+            &mut resolver,
+        );
+
+        assert_eq!(
+            operations.borrow().as_slice(),
+            ["resolve", "invalidate", "resolve"]
+        );
+    }
+
+    #[test]
     fn syn_reuse_closes_stale_flow_and_re_resolves_four_tuple() {
         let first = DecodedTcpSegment {
             source: Ipv4Addr::new(10, 0, 0, 1),
@@ -811,6 +874,53 @@ mod tests {
         assert_ne!(first_observed.flow.id, second_observed.flow.id);
     }
 
+    #[test]
+    fn full_table_does_not_evict_when_observing_existing_flow() {
+        let first = DecodedTcpSegment {
+            source: Ipv4Addr::new(10, 0, 0, 1),
+            destination: Ipv4Addr::new(10, 0, 0, 2),
+            source_port: 50_000,
+            destination_port: 80,
+            sequence: 100,
+            flags: default_flags(),
+            payload: b"GET /first HTTP/1.1\r\n\r\n",
+        };
+        let first_followup = DecodedTcpSegment {
+            sequence: 101,
+            payload: b"GET /followup HTTP/1.1\r\n\r\n",
+            ..first
+        };
+        let mut resolver = None;
+        let mut tracker = FlowTracker::default();
+
+        let first_observed = tracker.observe(&first, timestamp(1, 1), &mut resolver);
+        for index in 1..MAX_FLOW_TRACKER_CONNECTIONS {
+            let segment = DecodedTcpSegment {
+                source: Ipv4Addr::new(10, 1, (index / 256) as u8, (index % 256) as u8),
+                destination: Ipv4Addr::new(10, 2, (index / 256) as u8, (index % 256) as u8),
+                source_port: 10_000 + (index % 50_000) as u16,
+                destination_port: 80,
+                sequence: index as u32,
+                flags: default_flags(),
+                payload: b"GET /fill HTTP/1.1\r\n\r\n",
+            };
+            tracker.observe(
+                &segment,
+                timestamp(index as u64 + 1, index as i128 + 1),
+                &mut resolver,
+            );
+        }
+
+        let observed = tracker.observe(
+            &first_followup,
+            timestamp((MAX_FLOW_TRACKER_CONNECTIONS + 2) as u64, 10_000_000),
+            &mut resolver,
+        );
+
+        assert!(observed.closed_before.is_empty());
+        assert_eq!(observed.flow.id, first_observed.flow.id);
+    }
+
     struct StaticProcessResolver {
         connection: TcpConnection,
         process: ProcessContext,
@@ -842,6 +952,28 @@ mod tests {
             Ok((connection == self.connection)
                 .then(|| self.responses.pop_front())
                 .flatten())
+        }
+    }
+
+    struct InvalidationTrackingResolver {
+        connection: TcpConnection,
+        responses: VecDeque<ResolvedProcess>,
+        operations: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl ProcessResolver for InvalidationTrackingResolver {
+        fn resolve_tcp_process(
+            &mut self,
+            connection: TcpConnection,
+        ) -> Result<Option<ResolvedProcess>, crate::CaptureError> {
+            self.operations.borrow_mut().push("resolve");
+            Ok((connection == self.connection)
+                .then(|| self.responses.pop_front())
+                .flatten())
+        }
+
+        fn invalidate_cached_resolution(&mut self) {
+            self.operations.borrow_mut().push("invalidate");
         }
     }
 

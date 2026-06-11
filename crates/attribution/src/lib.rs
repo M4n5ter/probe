@@ -526,7 +526,7 @@ fn read_pid_socket_inodes(
 ) -> Result<(), AttributionError> {
     let entries = match fs::read_dir(fd_dir) {
         Ok(entries) => entries,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) if is_skippable_socket_scan_error(&source) => return Ok(()),
         Err(source) => {
             return Err(AttributionError::Read {
                 path: fd_dir.display().to_string(),
@@ -537,7 +537,7 @@ fn read_pid_socket_inodes(
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) if is_skippable_socket_scan_error(&source) => continue,
             Err(source) => {
                 return Err(AttributionError::Read {
                     path: fd_dir.display().to_string(),
@@ -548,7 +548,7 @@ fn read_pid_socket_inodes(
         let link_path = entry.path();
         let target = match fs::read_link(&link_path) {
             Ok(target) => target,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) if is_skippable_socket_scan_error(&source) => continue,
             Err(source) => {
                 return Err(AttributionError::ReadLink {
                     path: link_path.display().to_string(),
@@ -562,6 +562,13 @@ fn read_pid_socket_inodes(
         inodes.entry(inode).or_insert(pid);
     }
     Ok(())
+}
+
+fn is_skippable_socket_scan_error(source: &io::Error) -> bool {
+    matches!(
+        source.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+    )
 }
 
 fn socket_inode_from_link(target: &Path) -> Option<u64> {
@@ -620,7 +627,12 @@ fn read_link_to_string(path: &Path) -> Result<String, AttributionError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, net::Ipv4Addr, os::unix::fs::symlink, time::Duration};
+    use std::{
+        fs,
+        net::Ipv4Addr,
+        os::unix::fs::{PermissionsExt, symlink},
+        time::Duration,
+    };
 
     use tempfile::tempdir;
 
@@ -770,6 +782,29 @@ mod tests {
             error,
             AttributionError::InvalidStatus { pid: 321, .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn procfs_socket_scan_treats_permission_denied_as_best_effort_skip() {
+        let permission_denied = io::Error::from(io::ErrorKind::PermissionDenied);
+
+        assert!(is_skippable_socket_scan_error(&permission_denied));
+    }
+
+    #[test]
+    fn procfs_socket_scan_skips_unreadable_pid_fd_dir() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let fd_dir = temp.path().join("fd");
+        fs::create_dir(&fd_dir)?;
+        fs::set_permissions(&fd_dir, fs::Permissions::from_mode(0o000))?;
+        let mut inodes = HashMap::new();
+
+        let result = read_pid_socket_inodes(&fd_dir, 321, &mut inodes);
+
+        fs::set_permissions(&fd_dir, fs::Permissions::from_mode(0o700))?;
+        result?;
+        assert!(inodes.is_empty());
         Ok(())
     }
 

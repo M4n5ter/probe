@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use probe_core::Selector;
+use probe_core::{EnforcementMode, Selector};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -290,15 +290,6 @@ impl Default for EnforcementConfig {
             selector: None,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EnforcementMode {
-    Disabled,
-    AuditOnly,
-    DryRun,
-    Enforce,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

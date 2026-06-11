@@ -11,7 +11,7 @@
 - 可扩展协议解析：首要支持 HTTP/1.x 和 SSE，后续自然扩展 WebSocket、HTTP/2、HTTP/3 等协议。
 - 策略驱动的检测与防护：V1 先支持观测、告警和 dry-run verdict，后续接入真实拦截执行。
 
-本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、pluggable compression codec 和 HTTP webhook exporter。已定义 capture provider、procfs process attribution、runtime config 和 runtime planning 的第一版边界，并开始接入真实 libpcap fallback。尚未实现 eBPF 主路径、TLS uprobe provider、真实 enforcement、TCP 重组和强进程归因。
+本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、pluggable compression codec 和 HTTP webhook exporter。已定义 capture provider、procfs process attribution、runtime config、runtime planning 和 dry-run enforcement 的第一版边界，并开始接入真实 libpcap fallback。尚未实现 eBPF 主路径、TLS uprobe provider、真实 enforcement、TCP 重组和强进程归因。
 
 ## 2. 核心 thesis
 
@@ -58,7 +58,7 @@ V1 的额外证明点：
 
 - 单 libssl TLS demo：对一个 OpenSSL/libssl 测试进程，通过 `SSL_read`、`SSL_write`、`SSL_read_ex`、`SSL_write_ex` uprobe 获取明文并接入同一 HTTP parser。
 - libpcap fallback demo：eBPF 禁用或不可用时，使用 libpcap 捕获本机明文 HTTP/1.x，procfs best effort 归因，并标记 degraded capability。
-- enforcement dry-run demo：Lua 策略返回 `deny`、`reset`、`quarantine` 等 typed verdict，agent 记录 desired action、capability mismatch 和 audit event，但不执行真实阻断。
+- enforcement dry-run demo：Lua 策略返回 `deny`、`reset`、`quarantine` 等 typed verdict，agent 记录 requested action、effective action、planner outcome 和 audit event，但不执行真实阻断。
 
 V1 明确不做：
 
@@ -75,12 +75,12 @@ V1 明确不做：
 - 已实现 replay CLI，用单向输入文件驱动 capture provider、ingress journal、parser、policy、export queue 和可选 webhook exporter。
 - 已实现 `probe-core` 的 `TcpEndpoint`/`TcpConnection` 共享模型，供 capture provider、procfs attribution 和后续 eBPF/socket attribution 复用，避免各层用字符串 endpoint 重复建模。
 - 已实现 `capture` crate 的 `CaptureProvider` 抽象、`ReplayProvider` 和基础 `LibpcapProvider`；libpcap provider 可打开设备、安装 BPF filter、解析 Ethernet/Linux cooked/raw IPv4 TCP segment，接收可插拔 process resolver，并输出 degraded `CapturedBytes`。flow table 会用 SYN reuse、RST、双向 FIN、idle timeout 和容量淘汰清理 4-tuple 缓存；单向 FIN 只标记半关闭，避免把仍在发送的另一方向拆成新 flow；清理 flow 时会发出 `ConnectionClosed`，让 pipeline 释放 parser state。若同一 segment 同时携带 payload 和关闭信号，payload 事件先进入 parser，随后才发 close。它当前不做 TCP 重组、IPv6 或 gap 修复。
-- 已实现 `attribution` crate 的 `ProcfsAttributor` 和 `ProcfsSocketResolver`；前者可从 `/proc/<pid>` 读取进程身份、cmdline hash、starttime、uid/gid、cgroup、systemd service 与 container hint，后者可通过 `/proc/net/tcp` socket inode 和 `/proc/<pid>/fd` best-effort 反查 TCP 连接所属进程。agent 注入的 procfs resolver 使用短 TTL socket snapshot，避免同一批新连接重复全量扫描 `/proc/<pid>/fd`；libpcap provider 在 TCP 生命周期信号后会使 snapshot 失效，降低端口复用拿到旧进程身份的风险。resolver 错误会进入 capture degradation reason，不再静默伪装成未匹配。replay flow 默认使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence，避免把文件输入误归因到 agent 进程。
+- 已实现 `attribution` crate 的 `ProcfsAttributor` 和 `ProcfsSocketResolver`；前者可从 `/proc/<pid>` 读取进程身份、cmdline hash、starttime、uid/gid、cgroup、systemd service 与 container hint，后者可通过 `/proc/net/tcp` socket inode 和 `/proc/<pid>/fd` best-effort 反查 TCP 连接所属进程。agent 注入的 procfs resolver 使用短 TTL socket snapshot，避免同一批新连接重复全量扫描 `/proc/<pid>/fd`；libpcap provider 在 TCP 生命周期信号、idle eviction、capacity eviction 和端口复用关闭旧 flow 后会使 snapshot 失效，降低拿到旧进程身份的风险。resolver 错误会进入 capture degradation reason，不再静默伪装成未匹配；但单个 PID 的 fd race 或权限拒绝属于 best-effort skip，不让整批 socket snapshot 失败。replay flow 默认使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence，避免把文件输入误归因到 agent 进程。
 - 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、provider-specific nested config、storage、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，基础字段校验不理解 runtime capability。
 - 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
-- 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> export queue 的 replay/shared processing；`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/pipeline 组合和 exporter 命令。
+- 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合和 exporter 命令。
 - 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。
-- 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF/TLS/enforcement 相关能力仍必须标记 unavailable；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 作为 live provider；`run` 在无 live capture provider 时 fail closed，存在 libpcap live provider 时会把 provider 接入 replay 共用的 pipeline；`check` 用于查看 resolved plan。
+- 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF/TLS/真实 enforcement 相关能力仍必须标记 unavailable；dry-run enforcement 是可用能力，记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 作为 live provider；`run` 在无 live capture provider 时 fail closed，存在 libpcap live provider 时会把 provider 接入 replay 共用的 pipeline；`check` 用于查看 resolved plan。
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
 - 当前 `FjallSpool` 存储的是带 schema 的 `SpoolPayload`；ingress lane 当前写入 JSON framed `CapturedBytes`，export lane 当前写入 JSON framed `EventEnvelope`。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
 
@@ -513,7 +513,7 @@ Lua API 采用受控领域 API：
 3. Lua policy bundle 根据 manifest 注册 hook，例如 `on_connection`、`on_http_request_headers`、`on_http_request_body_chunk`、`on_http_response_headers`、`on_http_response_body_chunk`、`on_sse_event`。
 4. 只有声明支持同步动作的阶段才等待 typed verdict。
 5. 观测、告警、tag、metric 等非阻断结果可以异步进入后续 pipeline。
-6. 不支持当前 enforcement capability 的 verdict 记录为 desired action 和 capability mismatch。
+6. 保护型 verdict 进入 enforcement planner，记录 requested action、effective action、selector match、outcome 和 reason。
 
 这样可以同时保留未来拦截能力，又避免把所有观测事件都压进同步阻塞路径。
 
@@ -556,11 +556,15 @@ Lua API 采用受控领域 API：
 
 ## 18. Verdict 与防护抽象
 
-V1 先观测告警，不真实阻断，但必须把拦截抽象做好。
+V1 先观测告警，不真实阻断，但必须把拦截抽象做好。高位目标不是“policy 直接阻断连接”，而是三层分离：
 
-防护抽象使用 `EnforcementProvider + stage capabilities`。
+- `PolicyRuntime` 只产生 typed verdict。
+- `ScopedEnforcementPlanner` 根据 enforcement mode、selector 和 backend capability 把 verdict 解析为执行/不执行决策。
+- pipeline 把原始 `PolicyVerdict` 与 `EnforcementDecision` 都写入 export queue，形成可审计链路。
 
-provider 声明自己支持哪些阶段：
+当前已实现 dry-run/audit enforcement 的第一版：`deny`、`reset`、`quarantine` 会生成 `EnforcementDecision` audit event，但 effective action 仍为 `observe`。`observe`、`alert` 不进入 enforcement executor，继续作为普通策略事件处理。`enforcement.selector` 复用 core typed selector，支持只对某些进程、服务、端口或方向启用防护范围。
+
+未来真实防护后端在当前 planner 后面增加 `EnforcementBackend` 和 provider capability。backend 声明自己支持哪些阶段：
 
 - connection。
 - http headers。
@@ -590,9 +594,11 @@ Lua 策略返回 typed verdict：
 V1 执行语义：
 
 - `observe` 和 `alert` 可以实际执行。
-- `deny`、`reset`、`quarantine` 记录为 desired action。
-- 如果当前 provider 不具备执行能力，记录 capability mismatch。
-- 输出 audit event。
+- `deny`、`reset`、`quarantine` 记录为 requested action。
+- `audit_only` 和 `dry_run` 都不执行真实阻断，区别是运行意图不同：前者用于长期审计，后者用于验证 would-block/would-reset 策略。
+- selector 未命中时输出 `selector_miss`，明确说明策略 verdict 不在当前防护范围内。
+- 真实 `enforce` 模式在 V1 必须 fail closed，因为还没有可执行阻断后端。
+- 每个保护型 verdict 都必须输出 `EnforcementDecision` audit event。
 
 未来第一类真实 enforcement backend 优先做 socket/连接级 eBPF：
 
@@ -1019,10 +1025,10 @@ fallback 验收：
 enforcement 抽象验收：
 
 1. Lua 策略返回 `deny` 或 `reset` typed verdict。
-2. agent 不真实阻断。
-3. 记录 desired action。
-4. 记录 capability mismatch。
-5. 输出 audit event。
+2. pipeline 输出原始 `PolicyVerdict`。
+3. `ScopedEnforcementPlanner` 按 `enforcement.mode` 和 `enforcement.selector` 评估 verdict。
+4. agent 不真实阻断，`effective_action` 仍为 `observe`。
+5. 输出 `EnforcementDecision` audit event，记录 requested action、outcome、selector match 和 reason。
 
 ## 32. 被拒绝或推迟的方案
 
@@ -1124,7 +1130,7 @@ enforcement 抽象验收：
 | 策略 Hook | 分阶段 Hook，selector 先预过滤 | 第 17 节 |
 | policy state | 有界状态 API，跨 worker eventually consistent | 第 17 节 |
 | 热更新 | 新 VM 校验后原子切换，Lua 隐式状态不迁移 | 第 17 节 |
-| 拦截抽象 | EnforcementProvider + stage capabilities | 第 18 节 |
+| 拦截抽象 | PolicyRuntime + ScopedEnforcementPlanner + future EnforcementBackend capabilities | 第 18 节 |
 | V1 拦截验收 | dry-run typed verdict | 第 18、31 节 |
 | 配置 | TOML + 目录热加载，预留 RemoteConfigSource | 第 19 节 |
 | runtime plan | provider descriptor `ProviderRegistry` 生成 capability matrix，`RuntimePlan` 解析 capture backend selection；`auto` 使用有序 live fallback，显式 backend 是 required backend；默认 auto 在无 live provider 时显式 unavailable，`run` fail closed | 第 19、27 节 |

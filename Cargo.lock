@@ -15,6 +15,7 @@ dependencies = [
  "attribution",
  "capture",
  "clap",
+ "enforcement",
  "exporter",
  "parsers",
  "pipeline",
@@ -431,6 +432,14 @@ name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
+
+[[package]]
+name = "enforcement"
+version = "0.1.0"
+dependencies = [
+ "probe-core",
+ "thiserror",
+]
 
 [[package]]
 name = "enum_dispatch"
@@ -1302,6 +1311,7 @@ name = "pipeline"
 version = "0.1.0"
 dependencies = [
  "capture",
+ "enforcement",
  "parsers",
  "policy",
  "probe-core",

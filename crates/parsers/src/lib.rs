@@ -18,6 +18,7 @@ pub enum ParserInput<'a> {
         next_offset: Option<u64>,
         reason: &'a str,
     },
+    ConnectionClosed,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
