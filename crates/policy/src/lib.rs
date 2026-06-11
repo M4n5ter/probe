@@ -1,11 +1,15 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    fmt,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use probe_core::{Action, DomainEvent, EventEnvelope, EventKind, Verdict};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 100_000;
@@ -24,7 +28,7 @@ pub const POLICY_HOOKS: &[PolicyHook] = &[
     PolicyHook::ProtocolError,
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PolicyHook {
     ConnectionOpened,
     ConnectionClosed,
@@ -55,6 +59,52 @@ impl PolicyHook {
     }
 }
 
+impl fmt::Display for PolicyHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PolicyHook {
+    type Err = UnknownPolicyHook;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        POLICY_HOOKS
+            .iter()
+            .copied()
+            .find(|hook| hook.as_str() == value)
+            .ok_or_else(|| UnknownPolicyHook {
+                value: value.to_string(),
+            })
+    }
+}
+
+impl Serialize for PolicyHook {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyHook {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("unknown policy hook: {value}")]
+pub struct UnknownPolicyHook {
+    value: String,
+}
+
 #[derive(Debug, Error)]
 pub enum PolicyError {
     #[error("failed to initialize Lua policy: {0}")]
@@ -67,7 +117,7 @@ pub enum PolicyError {
 pub struct PolicyManifest {
     pub id: String,
     pub version: String,
-    pub hooks: Vec<String>,
+    pub hooks: Vec<PolicyHook>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,16 +184,11 @@ impl PolicyRuntime {
         hook: PolicyHook,
         event: &EventEnvelope,
     ) -> Result<Vec<PolicyOutcome>, PolicyError> {
-        let hook = hook.as_str();
-        if !self
-            .manifest
-            .hooks
-            .iter()
-            .any(|registered| registered == hook)
-        {
+        if !self.manifest.hooks.contains(&hook) {
             return Ok(Vec::new());
         }
 
+        let hook = hook.as_str();
         let globals = self.lua.globals();
         let value = globals.get::<Value>(hook)?;
         let Value::Function(function) = value else {
@@ -301,7 +346,7 @@ mod tests {
             PolicyManifest {
                 id: "demo".to_string(),
                 version: "1.0.0".to_string(),
-                hooks: vec!["on_http_request_headers".to_string()],
+                hooks: vec![PolicyHook::HttpRequestHeaders],
             },
             r#"
             function on_http_request_headers(event)
@@ -332,7 +377,7 @@ mod tests {
             PolicyManifest {
                 id: "demo".to_string(),
                 version: "1.0.0".to_string(),
-                hooks: vec!["on_http_request_headers".to_string()],
+                hooks: vec![PolicyHook::HttpRequestHeaders],
             },
             r#"
             function on_http_request_headers(event)
@@ -367,7 +412,7 @@ mod tests {
             PolicyManifest {
                 id: "websocket".to_string(),
                 version: "1.0.0".to_string(),
-                hooks: vec!["on_websocket_handoff".to_string()],
+                hooks: vec![PolicyHook::WebSocketHandoff],
             },
             r#"
             function on_websocket_handoff(event)
@@ -396,7 +441,7 @@ mod tests {
             PolicyManifest {
                 id: "ffi".to_string(),
                 version: "1.0.0".to_string(),
-                hooks: vec!["on_http_request_headers".to_string()],
+                hooks: vec![PolicyHook::HttpRequestHeaders],
             },
             r#"
             function on_http_request_headers(event)
@@ -417,7 +462,7 @@ mod tests {
             PolicyManifest {
                 id: "host_caps".to_string(),
                 version: "1.0.0".to_string(),
-                hooks: vec!["on_http_request_headers".to_string()],
+                hooks: vec![PolicyHook::HttpRequestHeaders],
             },
             r#"
             function on_http_request_headers(event)
@@ -455,7 +500,7 @@ mod tests {
             PolicyManifest {
                 id: "loop".to_string(),
                 version: "1.0.0".to_string(),
-                hooks: vec!["on_http_request_headers".to_string()],
+                hooks: vec![PolicyHook::HttpRequestHeaders],
             },
             r#"
             function on_http_request_headers(event)
@@ -477,7 +522,7 @@ mod tests {
             PolicyManifest {
                 id: "memory".to_string(),
                 version: "1.0.0".to_string(),
-                hooks: vec!["on_http_request_headers".to_string()],
+                hooks: vec![PolicyHook::HttpRequestHeaders],
             },
             r#"
             function on_http_request_headers(event)
@@ -521,6 +566,34 @@ mod tests {
         );
 
         assert_eq!(hook_for_event(&policy_alert), None);
+    }
+
+    #[test]
+    fn policy_hook_serializes_to_lua_callback_name() -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = PolicyManifest {
+            id: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            hooks: vec![PolicyHook::HttpRequestHeaders, PolicyHook::WebSocketHandoff],
+        };
+
+        let value = serde_json::to_value(&manifest)?;
+        assert_eq!(value["hooks"][0], "on_http_request_headers");
+        assert_eq!(value["hooks"][1], "on_websocket_handoff");
+
+        let parsed = serde_json::from_value::<PolicyManifest>(value)?;
+        assert_eq!(
+            parsed.hooks,
+            vec![PolicyHook::HttpRequestHeaders, PolicyHook::WebSocketHandoff]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn policy_hook_rejects_unknown_lua_callback_name() {
+        let error = serde_json::from_str::<PolicyHook>(r#""on_http2_headers""#)
+            .expect_err("unknown hook names must fail");
+
+        assert!(error.to_string().contains("unknown policy hook"));
     }
 
     fn primary_hook_for_event(event: &EventEnvelope) -> PolicyHook {

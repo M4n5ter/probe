@@ -7,6 +7,7 @@ use crate::{
         load_configured_policy,
     },
 };
+use policy::PolicyHook;
 use probe_config::AgentConfig;
 use probe_core::EnforcementMode;
 use runtime::RuntimePlan;
@@ -49,7 +50,7 @@ pub struct LoadedPolicySnapshot {
     pub version: String,
     pub path: PathBuf,
     pub selector_configured: bool,
-    pub registered_hooks: Vec<String>,
+    pub registered_hooks: Vec<PolicyHook>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -142,8 +143,7 @@ mod tests {
         assert!(
             active
                 .registered_hooks
-                .iter()
-                .any(|hook| hook == "on_http_request_headers")
+                .contains(&PolicyHook::HttpRequestHeaders)
         );
         assert_eq!(report.enforcement.mode, EnforcementMode::AuditOnly);
         fs::remove_dir_all(temp)?;

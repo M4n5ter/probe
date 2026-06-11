@@ -515,10 +515,7 @@ fn read_policy(path: &PathBuf) -> Result<PolicyRuntime, AgentError> {
         PolicyManifest {
             id,
             version: "replay".to_string(),
-            hooks: POLICY_HOOKS
-                .iter()
-                .map(|hook| hook.as_str().to_string())
-                .collect(),
+            hooks: POLICY_HOOKS.to_vec(),
         },
         &source,
     )

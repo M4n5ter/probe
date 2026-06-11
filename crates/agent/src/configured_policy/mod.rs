@@ -118,10 +118,7 @@ fn read_configured_policy(
         PolicyManifest {
             id: policy.id.clone(),
             version: config.config_version.clone(),
-            hooks: POLICY_HOOKS
-                .iter()
-                .map(|hook| hook.as_str().to_string())
-                .collect(),
+            hooks: POLICY_HOOKS.to_vec(),
         },
         &source,
     )?;

@@ -3,7 +3,7 @@ use capture::{
 };
 use enforcement::ScopedEnforcementPlanner;
 use parsers::Http1ParserFactory;
-use policy::{PolicyManifest, PolicyRuntime};
+use policy::{PolicyHook, PolicyManifest, PolicyRuntime};
 use probe_core::{
     Action, AddressPort, CapabilityState, CaptureSource, Direction, EnforcementMode,
     EnforcementOutcome, EventEnvelope, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity,
@@ -91,7 +91,7 @@ fn policy_verdicts_are_evaluated_by_scoped_enforcement_planner()
         PolicyManifest {
             id: "deny-policy".to_string(),
             version: "v1".to_string(),
-            hooks: vec!["on_http_request_headers".to_string()],
+            hooks: vec![PolicyHook::HttpRequestHeaders],
         },
         r#"
 function on_http_request_headers(event)
@@ -154,7 +154,7 @@ fn policy_selector_scopes_policy_execution() -> Result<(), Box<dyn std::error::E
         PolicyManifest {
             id: "scoped-policy".to_string(),
             version: "v1".to_string(),
-            hooks: vec!["on_http_request_headers".to_string()],
+            hooks: vec![PolicyHook::HttpRequestHeaders],
         },
         r#"
 function on_http_request_headers(event)
@@ -216,7 +216,7 @@ fn websocket_handoff_reaches_policy_and_export_spool() -> Result<(), Box<dyn std
         PolicyManifest {
             id: "websocket-policy".to_string(),
             version: "v1".to_string(),
-            hooks: vec!["on_websocket_handoff".to_string()],
+            hooks: vec![PolicyHook::WebSocketHandoff],
         },
         r#"
 function on_websocket_handoff(event)
