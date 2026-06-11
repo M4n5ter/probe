@@ -786,6 +786,49 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_enforcement_fails_closed_without_capability() {
+        let cases = [
+            test_platform_capabilities()
+                .into_iter()
+                .filter(|state| state.kind != CapabilityKind::DryRunEnforcement)
+                .collect::<Vec<_>>(),
+            test_platform_capabilities()
+                .into_iter()
+                .map(|state| {
+                    if state.kind == CapabilityKind::DryRunEnforcement {
+                        CapabilityState::degraded(CapabilityKind::DryRunEnforcement, "degraded")
+                    } else {
+                        state
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ];
+
+        for capabilities in cases {
+            let registry = ProviderRegistry::new(
+                vec![capture_provider(
+                    CaptureBackend::Replay,
+                    CaptureProviderBuilder::Replay,
+                    RuntimeMode::Available,
+                )],
+                capabilities,
+            );
+            let mut config = AgentConfig::default();
+            config.capture.selection = CaptureSelection::Replay;
+            config.enforcement.mode = EnforcementMode::DryRun;
+
+            let error = RuntimePlan::build(config, &registry)
+                .expect_err("dry-run enforcement must require its runtime capability");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("dry-run enforcement provider is not available")
+            );
+        }
+    }
+
+    #[test]
     fn websocket_handoff_is_a_supported_runtime_capability()
     -> Result<(), Box<dyn std::error::Error>> {
         let registry = ProviderRegistry::with_default_platform(vec![capture_provider(

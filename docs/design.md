@@ -873,8 +873,10 @@ V1 的 HTTP(S) exporter 是 webhook 风格，但必须定义协议语义。
 
 当前实现状态：
 
-- 已实现 CLI `status --config <path>`，输出可复用的 JSON snapshot：health、capture status、capability matrix、offline spool high-water、planned exporter sink cursor/lag 和 metrics counters。`health` 表示当前 active capture/spool/exporter 状态；capability matrix 和 capability metrics 保持独立，避免把路线图缺口伪装成当前运行故障。
+- 已实现 CLI `status --config <path>`，输出可复用的 JSON snapshot：health、capture status、policy status、enforcement status、capability matrix、offline spool high-water、planned exporter sink cursor/lag 和 metrics counters。`health` 表示当前 active capture/spool/exporter 状态，并纳入 policy 的已知阻断或 metadata-only 未验证状态；无效 enforcement 配置在 snapshot 前由 `RuntimePlan` fail closed。capability matrix 和 capability metrics 保持独立，避免把路线图缺口伪装成当前运行故障。
 - `status` 对配置/runtime plan 错误 fail fast；对 spool 缺失、尚未初始化或读取失败不伪装成功，也不会为 status 查询创建 spool，而是在 snapshot 中标记 `spool.mode = unavailable`，并把相关 exporter 标记 unavailable。当前 CLI status 是 offline probe：如果 spool 已由正在运行的 agent 持有，会显式标记 `spool.mode = degraded` 和 busy reason，而不是伪装成坏 spool 或在线 admin snapshot。
+- policy status 当前只做 metadata-only source check：报告 configured/enabled count、active policy id/path、selector 是否配置、策略源文件是否存在且是 regular file；不会加载或执行 Lua policy source。启用 policy 且源文件 metadata 可见时，offline status 标记 `policy.mode = metadata_only` 并让 health degraded，而不是宣称 policy runtime 已可用。原因是 `PolicyRuntime` 加载阶段会执行 Lua chunk，offline status 不能变成隐式执行外部策略的入口。后续如需验证 policy 语法/运行时，应作为显式 `check` 或在线 admin snapshot 能力。
+- enforcement status 使用 typed enum 报告 configured mode、effective status、selector 是否配置和 capability requirement。`disabled`/`audit_only` 标记 capability `not_required`；`dry_run` 标记需要 `DryRunEnforcement` capability。`enforce` 和缺少 dry-run capability 的配置在 `RuntimePlan` 构建阶段 fail closed，因此 CLI status 对这类配置直接返回 validation error，而不是输出一个伪可用 snapshot。
 - 尚未实现 root-owned Unix socket server、reload、debug dump 和 Prometheus adapter；这些后续应复用同一 status snapshot 构建器，并承担运行中 agent 的在线状态查询。
 
 能力：

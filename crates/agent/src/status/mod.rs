@@ -4,11 +4,23 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod enforcement;
+mod health;
+mod policy;
+
+use enforcement::{EnforcementStatusSnapshot, enforcement_status};
+use health::health_snapshot;
+use policy::{PolicyStatusSnapshot, policy_status};
 use probe_config::{CaptureBackend, CaptureSelection, CompressionCodecName, ExporterTransport};
 use probe_core::{CapabilityMatrix, RuntimeMode};
 use runtime::{CapturePlanMode, RuntimePlan};
 use serde::Serialize;
 use storage::{FjallSpool, SpoolProbe, SpoolSnapshot};
+
+#[cfg(test)]
+use enforcement::{EnforcementCapabilityStatusSnapshot, EnforcementStatusMode};
+#[cfg(test)]
+use policy::{PolicySourceCheck, PolicyStatusMode};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentStatusSnapshot {
@@ -17,6 +29,8 @@ pub struct AgentStatusSnapshot {
     pub config_version: String,
     pub health: HealthSnapshot,
     pub capture: CaptureStatusSnapshot,
+    pub policy: PolicyStatusSnapshot,
+    pub enforcement: EnforcementStatusSnapshot,
     pub capabilities: CapabilityMatrix,
     pub spool: SpoolStatusSnapshot,
     pub exporters: Vec<ExporterStatusSnapshot>,
@@ -181,9 +195,11 @@ fn build_status_snapshot_at(
         ingress_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_ingress_sequence),
         export_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_export_sequence),
     };
+    let policy = policy_status(plan);
+    let enforcement = enforcement_status(plan);
     let exporters = exporter_statuses(plan, &spool_status, &spool.export_cursors);
     let metrics = metrics_snapshot(&plan.capabilities, &spool_status, &exporters);
-    let health = health_snapshot(plan, &spool_status, &exporters);
+    let health = health_snapshot(plan, &spool_status, &exporters, &policy);
 
     AgentStatusSnapshot {
         generated_unix_ns,
@@ -196,6 +212,8 @@ fn build_status_snapshot_at(
             mode: plan.capture.mode,
             reason: plan.capture.reason.clone(),
         },
+        policy,
+        enforcement,
         capabilities: plan.capabilities.clone(),
         spool: spool_status,
         exporters,
@@ -332,68 +350,6 @@ fn total_export_lag(exporters: &[ExporterStatusSnapshot]) -> Option<u64> {
     })
 }
 
-fn health_snapshot(
-    plan: &RuntimePlan,
-    spool: &SpoolStatusSnapshot,
-    exporters: &[ExporterStatusSnapshot],
-) -> HealthSnapshot {
-    let mut reasons = Vec::new();
-    let mut unavailable = false;
-    let mut degraded = false;
-
-    if plan.capture.mode == CapturePlanMode::Unavailable {
-        unavailable = true;
-        reasons.push(
-            plan.capture
-                .reason
-                .clone()
-                .unwrap_or_else(|| "capture plan is unavailable".to_string()),
-        );
-    }
-    if spool.mode == RuntimeMode::Unavailable {
-        unavailable = true;
-        reasons.push(
-            spool
-                .reason
-                .clone()
-                .unwrap_or_else(|| "spool is unavailable".to_string()),
-        );
-    } else if spool.mode == RuntimeMode::Degraded {
-        degraded = true;
-        if let Some(reason) = &spool.reason {
-            reasons.push(reason.clone());
-        }
-    }
-
-    for exporter in exporters {
-        match exporter.mode {
-            RuntimeMode::Available => {}
-            RuntimeMode::Degraded => {
-                degraded = true;
-                if let Some(reason) = &exporter.reason {
-                    reasons.push(format!("exporter {}: {reason}", exporter.id));
-                }
-            }
-            RuntimeMode::Unavailable => {
-                unavailable = true;
-                if let Some(reason) = &exporter.reason {
-                    reasons.push(format!("exporter {}: {reason}", exporter.id));
-                }
-            }
-        }
-    }
-
-    let mode = if unavailable {
-        RuntimeMode::Unavailable
-    } else if degraded {
-        RuntimeMode::Degraded
-    } else {
-        RuntimeMode::Available
-    };
-
-    HealthSnapshot { mode, reasons }
-}
-
 fn current_unix_time_ns() -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -407,9 +363,12 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::*;
-    use probe_config::{AgentConfig, CaptureBackend, CaptureSelection, ExporterConfig};
-    use probe_core::{CapabilityKind, CapabilityState};
+    use probe_config::{
+        AgentConfig, CaptureBackend, CaptureSelection, ExporterConfig, PolicyConfig,
+    };
+    use probe_core::{CapabilityKind, CapabilityState, EnforcementMode, Selector};
     use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
+    use serde_json::json;
     use storage::SpoolPayload;
 
     #[test]
@@ -432,7 +391,137 @@ mod tests {
         assert_eq!(snapshot.exporters.len(), 1);
         assert_eq!(snapshot.exporters[0].cursor, Some(3));
         assert_eq!(snapshot.exporters[0].lag, Some(2));
+        assert_eq!(snapshot.policy.mode, PolicyStatusMode::Inactive);
+        assert_eq!(
+            snapshot.enforcement.status,
+            EnforcementStatusMode::AuditOnly
+        );
+        assert_eq!(
+            snapshot.enforcement.capability,
+            EnforcementCapabilityStatusSnapshot::NotRequired
+        );
+        let value = serde_json::to_value(&snapshot)?;
+        assert_eq!(value["policy"]["mode"], json!("inactive"));
+        assert_eq!(value["enforcement"]["status"], json!("audit_only"));
+        assert_eq!(
+            value["enforcement"]["capability"]["kind"],
+            json!("not_required")
+        );
         assert_eq!(snapshot.metrics.export.total_lag, Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn status_snapshot_reports_metadata_only_policy_without_loading_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-policy")?;
+        let policy_path = temp.join("guard.lua");
+        fs::write(&policy_path, "function on_http_request(")?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.policies = vec![PolicyConfig {
+            id: "guard".to_string(),
+            path: policy_path.clone(),
+            enabled: true,
+            selector: Some(Selector::default()),
+        }];
+        config.enforcement.mode = EnforcementMode::DryRun;
+        config.enforcement.selector = Some(Selector::default());
+        let plan = runtime_plan_from_config(
+            config,
+            vec![CapabilityState::available(
+                CapabilityKind::DryRunEnforcement,
+            )],
+        )?;
+        let spool = available_empty_spool();
+
+        let snapshot = build_status_snapshot_at(&plan, spool, 42);
+
+        assert_eq!(snapshot.policy.mode, PolicyStatusMode::MetadataOnly);
+        assert_eq!(snapshot.policy.configured_count, 1);
+        assert_eq!(snapshot.policy.enabled_count, 1);
+        let active_policy = snapshot.policy.active.as_ref().expect("active policy");
+        assert_eq!(active_policy.id, "guard");
+        assert_eq!(active_policy.path, policy_path);
+        assert!(active_policy.selector_configured);
+        assert_eq!(active_policy.source.mode, RuntimeMode::Available);
+        assert_eq!(active_policy.source.check, PolicySourceCheck::MetadataOnly);
+        assert_eq!(
+            snapshot.enforcement.configured_mode,
+            EnforcementMode::DryRun
+        );
+        assert_eq!(snapshot.enforcement.status, EnforcementStatusMode::DryRun);
+        assert!(snapshot.enforcement.selector_configured);
+        assert_eq!(
+            snapshot.enforcement.capability,
+            EnforcementCapabilityStatusSnapshot::Required {
+                capability: CapabilityKind::DryRunEnforcement,
+                mode: RuntimeMode::Available,
+            }
+        );
+        let value = serde_json::to_value(&snapshot)?;
+        assert_eq!(value["policy"]["mode"], json!("metadata_only"));
+        assert_eq!(
+            value["policy"]["active"]["source"]["check"],
+            json!("metadata_only")
+        );
+        assert_eq!(value["enforcement"]["status"], json!("dry_run"));
+        assert_eq!(
+            value["enforcement"]["capability"]["kind"],
+            json!("required")
+        );
+        assert_eq!(
+            value["enforcement"]["capability"]["capability"],
+            json!("dry_run_enforcement")
+        );
+        assert_eq!(
+            value["enforcement"]["capability"]["mode"],
+            json!("available")
+        );
+        assert_eq!(snapshot.health.mode, RuntimeMode::Degraded);
+        assert!(
+            snapshot
+                .health
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("offline status does not load or execute"))
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_policy_source_marks_status_unavailable() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-missing-policy")?;
+        let missing_policy = temp.join("missing.lua");
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.policies = vec![PolicyConfig {
+            id: "missing".to_string(),
+            path: missing_policy,
+            enabled: true,
+            selector: None,
+        }];
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+        let spool = available_empty_spool();
+
+        let snapshot = build_status_snapshot_at(&plan, spool, 42);
+
+        assert_eq!(snapshot.policy.mode, PolicyStatusMode::Unavailable);
+        assert!(
+            snapshot
+                .policy
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("does not exist"))
+        );
+        assert_eq!(snapshot.health.mode, RuntimeMode::Unavailable);
+        assert!(
+            snapshot
+                .health
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("policy: policy source path does not exist"))
+        );
+        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
@@ -579,7 +668,25 @@ mod tests {
         storage_path: PathBuf,
         capabilities: Vec<CapabilityState>,
     ) -> Result<RuntimePlan, runtime::RuntimeError> {
-        let config = AgentConfig {
+        runtime_plan_from_config(config_with_storage_path(storage_path), capabilities)
+    }
+
+    fn runtime_plan_from_config(
+        config: AgentConfig,
+        capabilities: Vec<CapabilityState>,
+    ) -> Result<RuntimePlan, runtime::RuntimeError> {
+        let registry = ProviderRegistry::new(
+            vec![CaptureProviderDescriptor::available(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+            )],
+            capabilities,
+        );
+        RuntimePlan::build(config, &registry)
+    }
+
+    fn config_with_storage_path(storage_path: PathBuf) -> AgentConfig {
+        AgentConfig {
             agent_id: "agent-1".to_string(),
             capture: probe_config::CaptureConfig {
                 selection: CaptureSelection::Replay,
@@ -597,15 +704,18 @@ mod tests {
                 headers: BTreeMap::new(),
             }],
             ..AgentConfig::default()
-        };
-        let registry = ProviderRegistry::new(
-            vec![CaptureProviderDescriptor::available(
-                CaptureBackend::Replay,
-                CaptureProviderBuilder::Replay,
-            )],
-            capabilities,
-        );
-        RuntimePlan::build(config, &registry)
+        }
+    }
+
+    fn available_empty_spool() -> SpoolStatusInput {
+        SpoolStatusInput::available(
+            PathBuf::from("/tmp/sssa-spool"),
+            SpoolSnapshot {
+                last_ingress_sequence: 0,
+                last_export_sequence: 0,
+            },
+            BTreeMap::from([("primary".to_string(), 0)]),
+        )
     }
 
     fn test_payload(bytes: &[u8]) -> SpoolPayload {
