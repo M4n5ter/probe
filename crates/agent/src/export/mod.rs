@@ -2,8 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use exporter::{CompressionCodec, ReliableExporter, WebhookExporter};
-use probe_config::{AgentConfig, CompressionCodecName, ExporterConfig, ExporterTransport};
+use probe_config::{CompressionCodecName, ExporterTransport};
 use proto::{BatchEnvelope, EVENT_ENVELOPE_JSON_SCHEMA};
+use runtime::{ExportPlan, ExportSinkPlan, ExportWorkerMode};
 use storage::DurableSpool;
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -38,26 +39,45 @@ pub struct ExportWorkerHandle {
 
 pub struct ExportWorkerConfig {
     agent_id: String,
-    exporters: Vec<ExporterConfig>,
+    sinks: Vec<ExportSinkPlan>,
     interval: Duration,
     batches_per_sink_per_tick: u64,
     sink_timeout: Duration,
 }
 
 impl ExportWorkerConfig {
-    pub fn fixed_interval_bounded(
+    fn fixed_interval_bounded(
         agent_id: String,
-        exporters: Vec<ExporterConfig>,
+        sinks: Vec<ExportSinkPlan>,
         interval: Duration,
         batches_per_sink_per_tick: u64,
         sink_timeout: Duration,
     ) -> Self {
         Self {
             agent_id,
-            exporters,
+            sinks,
             interval,
             batches_per_sink_per_tick,
             sink_timeout,
+        }
+    }
+
+    pub fn from_export_plan(agent_id: String, plan: &ExportPlan) -> Option<Self> {
+        if !plan.worker_enabled {
+            return None;
+        }
+        let mode = plan.worker_mode?;
+        match mode {
+            ExportWorkerMode::FixedIntervalBounded {
+                batches_per_sink_per_tick,
+                sink_timeout_ms,
+            } => Some(Self::fixed_interval_bounded(
+                agent_id,
+                plan.sinks.clone(),
+                Duration::from_millis(plan.worker_interval_ms),
+                batches_per_sink_per_tick,
+                Duration::from_millis(sink_timeout_ms),
+            )),
         }
     }
 }
@@ -84,10 +104,7 @@ impl ExportWorkerHandle {
     }
 }
 
-pub fn spawn_configured_export_worker<S>(
-    spool: Arc<S>,
-    config: ExportWorkerConfig,
-) -> ExportWorkerHandle
+pub fn spawn_export_worker<S>(spool: Arc<S>, config: ExportWorkerConfig) -> ExportWorkerHandle
 where
     S: DurableSpool + Send + Sync + 'static,
 {
@@ -97,7 +114,7 @@ where
     let task_stop_notify = Arc::clone(&stop_notify);
     let task = tokio::spawn(async move {
         while !task_stop_requested.load(Ordering::Relaxed) {
-            if let Err(error) = drain_configured_sinks_once(spool.as_ref(), &config).await {
+            if let Err(error) = drain_export_sinks_once(spool.as_ref(), &config).await {
                 eprintln!("export worker drain failed: {error}");
             }
             if task_stop_requested.load(Ordering::Relaxed) {
@@ -116,27 +133,22 @@ where
     }
 }
 
-pub async fn drain_configured_sinks(
+pub async fn drain_planned_sinks(
     spool: &impl DurableSpool,
-    config: &AgentConfig,
+    agent_id: &str,
+    plan: &ExportPlan,
 ) -> Result<(), ExportDrainError> {
-    drain_configured_sinks_with_mode(
-        spool,
-        &config.agent_id,
-        &config.exporters,
-        SinkDrainMode::UntilEmpty,
-    )
-    .await
+    drain_export_sinks_with_mode(spool, agent_id, &plan.sinks, SinkDrainMode::UntilEmpty).await
 }
 
-async fn drain_configured_sinks_once(
+async fn drain_export_sinks_once(
     spool: &impl DurableSpool,
     config: &ExportWorkerConfig,
 ) -> Result<(), ExportDrainError> {
-    drain_configured_sinks_with_mode(
+    drain_export_sinks_with_mode(
         spool,
         &config.agent_id,
-        &config.exporters,
+        &config.sinks,
         SinkDrainMode::MaxBatches {
             max_batches: config.batches_per_sink_per_tick,
             sink_timeout: config.sink_timeout,
@@ -145,21 +157,21 @@ async fn drain_configured_sinks_once(
     .await
 }
 
-async fn drain_configured_sinks_with_mode(
+async fn drain_export_sinks_with_mode(
     spool: &impl DurableSpool,
     agent_id: &str,
-    exporters: &[ExporterConfig],
+    sinks: &[ExportSinkPlan],
     mode: SinkDrainMode,
 ) -> Result<(), ExportDrainError> {
     let mut failures = Vec::new();
-    for exporter in exporters {
-        let result = match webhook_export_target_from_config(exporter) {
+    for sink in sinks {
+        let result = match webhook_export_target_from_plan_sink(sink) {
             Ok(target) => drain_webhook_sink_with_mode(spool, agent_id, target, mode).await,
             Err(error) => Err(error),
         };
         if let Err(error) = result {
-            eprintln!("exporter sink {} failed: {error}", exporter.id);
-            failures.push(format!("{}: {error}", exporter.id));
+            eprintln!("exporter sink {} failed: {error}", sink.id);
+            failures.push(format!("{}: {error}", sink.id));
         }
     }
     if failures.is_empty() {
@@ -230,15 +242,15 @@ impl WebhookExportTarget {
     }
 }
 
-fn webhook_export_target_from_config(
-    exporter: &ExporterConfig,
+fn webhook_export_target_from_plan_sink(
+    sink: &ExportSinkPlan,
 ) -> Result<WebhookExportTarget, ExportDrainError> {
-    match exporter.transport {
+    match sink.transport {
         ExporterTransport::Webhook => Ok(WebhookExportTarget {
-            sink: exporter.id.clone(),
-            endpoint: exporter.endpoint.clone(),
-            codec: compression_codec_from_config(exporter.codec),
-            headers: exporter
+            sink: sink.id.clone(),
+            endpoint: sink.endpoint.clone(),
+            codec: compression_codec_from_config(sink.codec),
+            headers: sink
                 .headers
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
@@ -246,7 +258,7 @@ fn webhook_export_target_from_config(
         }),
         ExporterTransport::Grpc | ExporterTransport::Kafka | ExporterTransport::Otlp => {
             Err(ExportDrainError::UnsupportedTransport {
-                transport: exporter.transport,
+                transport: sink.transport,
             })
         }
     }
@@ -404,11 +416,13 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
+    use probe_config::{AgentConfig, ExporterConfig};
     use probe_core::{
-        AddressPort, CaptureSource, EventEnvelope, EventKind, FlowContext, FlowIdentity,
-        ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+        AddressPort, CapabilityKind, CapabilityState, CaptureSource, EventEnvelope, EventKind,
+        FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
     };
     use proto::{BATCH_SCHEMA_VERSION, EventRecord, PayloadFormat};
+    use runtime::{ProviderRegistry, RuntimePlan};
     use storage::FjallSpool;
 
     use super::*;
@@ -428,9 +442,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_exporters_use_independent_sinks_and_attempt_all()
+    async fn planned_export_sinks_use_independent_cursors_and_attempt_all()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("configured-exporters");
+        let temp = test_dir("planned-export-sinks");
         let spool = FjallSpool::open(&temp)?;
         append_export_event(&spool, 1)?;
         let failing = TestWebhookServer::spawn(false)?;
@@ -456,8 +470,9 @@ mod tests {
             ..AgentConfig::default()
         };
         config.validate_basic()?;
+        let plan = runtime_plan(config)?;
 
-        let result = drain_configured_sinks(&spool, &config).await;
+        let result = drain_planned_sinks(&spool, &plan.config.agent_id, &plan.export).await;
 
         assert!(matches!(
             result,
@@ -485,27 +500,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_export_worker_drains_until_stopped()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("configured-export-worker");
+    async fn export_worker_drains_until_stopped() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("planned-export-worker");
         let spool = Arc::new(FjallSpool::open(&temp)?);
         append_export_event(spool.as_ref(), 1)?;
         let server = TestWebhookServer::spawn_accepting(true, 2)?;
-        let config = ExportWorkerConfig::fixed_interval_bounded(
-            "agent-1".to_string(),
-            vec![ExporterConfig {
+        let mut config = AgentConfig {
+            agent_id: "agent-1".to_string(),
+            exporters: vec![ExporterConfig {
                 id: "worker".to_string(),
                 transport: ExporterTransport::Webhook,
                 endpoint: server.endpoint(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
             }],
-            Duration::from_millis(10),
-            1,
-            Duration::from_secs(10),
-        );
+            ..AgentConfig::default()
+        };
+        config.export.worker_interval_ms = 10;
+        config.validate_basic()?;
+        let plan = runtime_plan(config)?;
+        let config =
+            ExportWorkerConfig::from_export_plan(plan.config.agent_id.clone(), &plan.export)
+                .expect("worker should be enabled for planned webhook sink");
 
-        let worker = spawn_configured_export_worker(Arc::clone(&spool), config);
+        let worker = spawn_export_worker(Arc::clone(&spool), config);
         wait_for_export_cursor(spool.as_ref(), "worker", 1).await?;
         append_export_event(spool.as_ref(), 2)?;
         wait_for_export_cursor(spool.as_ref(), "worker", 2).await?;
@@ -527,6 +545,23 @@ mod tests {
         );
         fs::remove_dir_all(temp)?;
         Ok(())
+    }
+
+    fn runtime_plan(config: AgentConfig) -> Result<RuntimePlan, runtime::RuntimeError> {
+        RuntimePlan::build(
+            config,
+            &ProviderRegistry::new(Vec::new(), test_capabilities()),
+        )
+    }
+
+    fn test_capabilities() -> Vec<CapabilityState> {
+        vec![
+            CapabilityState::available(CapabilityKind::Http1),
+            CapabilityState::available(CapabilityKind::Sse),
+            CapabilityState::available(CapabilityKind::WebSocketHandoff),
+            CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
+            CapabilityState::available(CapabilityKind::DryRunEnforcement),
+        ]
     }
 
     fn batch_with_events<const N: usize>(event_ids: [&str; N]) -> BatchEnvelope {

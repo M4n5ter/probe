@@ -14,10 +14,7 @@ use capture::{
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use enforcement::ScopedEnforcementPlanner;
-use export::{
-    ExportWorkerConfig, drain_configured_sinks, drain_replay_webhook,
-    spawn_configured_export_worker,
-};
+use export::{ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook, spawn_export_worker};
 use exporter::CompressionCodec;
 use parsers::Http1ParserFactory;
 use pipeline::{CapturePipeline, PipelineRunOptions};
@@ -29,8 +26,7 @@ use probe_core::{
     ProcessContext, ProcessIdentity, RuntimeMode, TcpConnection, Timestamp, TransportProtocol,
 };
 use runtime::{
-    CaptureProviderBuilder, CaptureProviderDescriptor, ExportWorkerMode, ProviderRegistry,
-    RuntimeError, RuntimePlan,
+    CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimeError, RuntimePlan,
 };
 use storage::FjallSpool;
 use thiserror::Error;
@@ -190,7 +186,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let policy = read_configured_policy(&plan.config)?;
             let mut enforcement_planner = build_configured_enforcement_planner(&plan.config)?;
             let export_worker = export_worker_config_from_plan(&plan)
-                .map(|config| spawn_configured_export_worker(Arc::clone(&spool), config));
+                .map(|config| spawn_export_worker(Arc::clone(&spool), config));
             let mut pipeline = CapturePipeline::new(
                 spool.as_ref(),
                 &mut parser_factory,
@@ -212,7 +208,8 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             if let Some(worker) = export_worker {
                 worker.stop().await;
             }
-            let drain_result = drain_configured_sinks(spool.as_ref(), &plan.config).await;
+            let drain_result =
+                drain_planned_sinks(spool.as_ref(), &plan.config.agent_id, &plan.export).await;
             let summary = match (summary_result, drain_result) {
                 (Ok(summary), Ok(())) => summary,
                 (Err(error), Ok(())) => return Err(error.into()),
@@ -277,22 +274,7 @@ fn build_runtime_plan(config: AgentConfig) -> Result<RuntimePlan, AgentError> {
 }
 
 fn export_worker_config_from_plan(plan: &RuntimePlan) -> Option<ExportWorkerConfig> {
-    if !plan.export.worker_enabled {
-        return None;
-    }
-    let mode = plan.export.worker_mode?;
-    match mode {
-        ExportWorkerMode::FixedIntervalBounded {
-            batches_per_sink_per_tick,
-            sink_timeout_ms,
-        } => Some(ExportWorkerConfig::fixed_interval_bounded(
-            plan.config.agent_id.clone(),
-            plan.config.exporters.clone(),
-            std::time::Duration::from_millis(plan.export.worker_interval_ms),
-            batches_per_sink_per_tick,
-            std::time::Duration::from_millis(sink_timeout_ms),
-        )),
-    }
+    ExportWorkerConfig::from_export_plan(plan.config.agent_id.clone(), &plan.export)
 }
 
 fn default_provider_registry(config: &AgentConfig) -> ProviderRegistry {

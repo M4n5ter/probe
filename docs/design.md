@@ -651,9 +651,9 @@ V1 执行语义：
 
 当前 export runtime 配置语义：
 
-- `[export] worker_enabled = true` 是默认行为；只有存在 configured exporters 时，`run` 才会启动后台 exporter worker。
+- `[export] worker_enabled = true` 是默认行为；只有 RuntimePlan 中存在 planned exporter sinks 时，`run` 才会启动后台 exporter worker。
 - `[export] worker_interval_ms` 控制 worker 两轮有界 drain 之间的固定间隔；worker 开启时该值必须大于 0。当前每轮对每个 sink 最多发送一个 batch，并对单个 worker sink drain 使用固定 timeout，避免把 live worker 变成无界 tail flush 或被单个挂起 sink 永久卡住；这仍不等同于未来的 retry/backoff、per-sink quota 或 retention deadline。
-- `RuntimePlan.export` 会规范化 effective worker 状态、sink set 和 fixed bounded worker mode；没有 configured exporter 或显式禁用 worker 时，`check` 会显示 worker disabled 的原因。
+- `RuntimePlan.export` 会规范化 effective worker 状态、worker sink execution spec 和 fixed bounded worker mode；`run` 的后台 worker 和退出前 tail drain 都从该 plan 构造 sink execution config，而不是重新解释 raw exporter config。没有 configured exporter 或显式禁用 worker 时，`check` 会显示 worker disabled 的原因。
 - `run` 结束时仍会尽力执行一次尾部 drain，使 `--max-events` smoke、plaintext feed 和其它有限运行场景能够把最后一批事件同步推出；即使 pipeline 已返回错误，也会先停止 worker 并尝试 tail drain，再按错误优先级返回。
 
 配置/策略签名：
@@ -1035,7 +1035,7 @@ V1 CLI 至少提供：
 
 当前已验证的 non-privileged plaintext feed 路径：`PlaintextFeedProvider` 单元测试覆盖 event source/kind/confidence/degraded metadata 保真；agent JSON-lines provider 测试覆盖硬编码外部 feed schema、streaming provider、unknown field fail-closed、超长行 fail-closed、缺失 process 强制 0 confidence，以及 confidence 超过 100 的拒绝；pipeline 测试覆盖 external plaintext feed chunk 写入 ingress journal，并由 HTTP/1 parser 产出 `HttpRequestHeaders` export event，`source = external_plaintext_feed`。这只验证“已解密明文进入统一 pipeline”，不等同于 TLS uprobe 或 keylog 解密已完成。
 
-当前已验证的 exporter worker 路径：agent export 测试覆盖 configured exporters 使用独立 sink cursor、某个 sink 失败不阻止其它 sink 尝试、webhook protocol headers 不被配置覆盖，以及后台 worker 能从 Fjall export queue drain 到 webhook receiver、在启动后继续处理新追加事件并推进对应 sink cursor。该验证覆盖连续有界 drain 的最小闭环，不覆盖未来 backoff/quota/retention 调度。
+当前已验证的 exporter worker 路径：agent export 测试覆盖 planned exporter sinks 使用独立 sink cursor、某个 sink 失败不阻止其它 sink 尝试、webhook protocol headers 不被配置覆盖，以及后台 worker 能从 Fjall export queue drain 到 webhook receiver、在启动后继续处理新追加事件并推进对应 sink cursor。该验证覆盖连续有界 drain 的最小闭环，不覆盖未来 backoff/quota/retention 调度。
 
 V1 端到端验收：
 

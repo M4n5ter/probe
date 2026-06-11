@@ -6,6 +6,7 @@ use probe_config::{
 };
 use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub const EXPORT_WORKER_BATCHES_PER_SINK_PER_TICK: u64 = 1;
@@ -76,7 +77,9 @@ impl ExportPlan {
             .map(|exporter| ExportSinkPlan {
                 id: exporter.id.clone(),
                 transport: exporter.transport,
+                endpoint: exporter.endpoint.clone(),
                 codec: exporter.codec,
+                headers: exporter.headers.clone(),
             })
             .collect::<Vec<_>>();
         let worker_enabled = config.export.worker_enabled && !sinks.is_empty();
@@ -113,7 +116,9 @@ pub enum ExportWorkerMode {
 pub struct ExportSinkPlan {
     pub id: String,
     pub transport: ExporterTransport,
+    pub endpoint: String,
     pub codec: CompressionCodecName,
+    pub headers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -669,7 +674,9 @@ mod tests {
             vec![ExportSinkPlan {
                 id: "primary".to_string(),
                 transport: ExporterTransport::Webhook,
+                endpoint: "https://collector.example/batches".to_string(),
                 codec: CompressionCodecName::None,
+                headers: Default::default(),
             }]
         );
         Ok(())
