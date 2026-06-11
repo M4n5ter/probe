@@ -1,0 +1,461 @@
+use super::*;
+
+#[test]
+fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str("")?;
+
+    assert_eq!(config.agent_id, "sssa-probe");
+    assert_eq!(config.capture.selection, CaptureSelection::Auto);
+    assert_eq!(
+        config.capture.fallback_backends,
+        vec![LiveCaptureBackend::Ebpf, LiveCaptureBackend::Libpcap]
+    );
+    assert_eq!(config.capture.libpcap.interface, None);
+    assert_eq!(config.capture.libpcap.bpf_filter, "tcp");
+    assert_eq!(config.capture.libpcap.snaplen, 65_535);
+    assert!(!config.capture.libpcap.promisc);
+    assert!(config.capture.libpcap.immediate_mode);
+    assert_eq!(config.capture.libpcap.read_timeout_ms, 1_000);
+    assert!(config.export.worker_enabled);
+    assert_eq!(config.export.worker_interval_ms, 1_000);
+    assert_eq!(config.exporters, Vec::<ExporterConfig>::new());
+    assert_eq!(config.enforcement.mode, EnforcementMode::AuditOnly);
+    config.validate_basic()?;
+    Ok(())
+}
+
+#[test]
+fn parses_runtime_sections() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+agent_id = "node-a"
+config_version = "cfg-1"
+
+[capture]
+selection = "ebpf"
+fallback_backends = ["libpcap"]
+
+[capture.libpcap]
+interface = "lo"
+bpf_filter = "tcp port 8080"
+snaplen = 4096
+promisc = true
+immediate_mode = false
+read_timeout_ms = 250
+buffer_size = 1048576
+
+[storage]
+path = "/tmp/sssa-spool"
+ingress_retention_bytes = 1048576
+
+[export]
+worker_enabled = true
+worker_interval_ms = 250
+
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/batches"
+codec = "zstd"
+headers = { x_probe = "node-a" }
+
+[[tls.materials]]
+kind = "trust_anchor"
+path = "/etc/ssl/certs/ca.pem"
+
+[tls.plaintext]
+enabled = true
+provider = "libssl_uprobe"
+
+[enforcement]
+mode = "dry_run"
+
+[admin]
+enabled = true
+socket_path = "/run/sssa-probe/admin.sock"
+"#,
+    )?;
+
+    assert_eq!(config.agent_id, "node-a");
+    assert_eq!(config.config_version, "cfg-1");
+    assert_eq!(config.capture.selection, CaptureSelection::Ebpf);
+    assert_eq!(config.capture.libpcap.interface.as_deref(), Some("lo"));
+    assert_eq!(config.capture.libpcap.bpf_filter, "tcp port 8080");
+    assert_eq!(config.capture.libpcap.snaplen, 4096);
+    assert!(config.capture.libpcap.promisc);
+    assert!(!config.capture.libpcap.immediate_mode);
+    assert_eq!(config.capture.libpcap.read_timeout_ms, 250);
+    assert_eq!(config.capture.libpcap.buffer_size, Some(1_048_576));
+    assert_eq!(config.storage.path, PathBuf::from("/tmp/sssa-spool"));
+    assert!(config.export.worker_enabled);
+    assert_eq!(config.export.worker_interval_ms, 250);
+    assert_eq!(config.exporters[0].codec, CompressionCodecName::Zstd);
+    assert_eq!(config.tls.materials[0].kind, TlsMaterialKind::TrustAnchor);
+    assert!(config.tls.plaintext.enabled);
+    assert_eq!(config.capture.plaintext_feed.path, None);
+    assert_eq!(config.enforcement.mode, EnforcementMode::DryRun);
+    assert!(config.admin.enabled);
+    assert_eq!(
+        config.admin.socket_path,
+        PathBuf::from("/run/sssa-probe/admin.sock")
+    );
+    Ok(())
+}
+
+#[test]
+fn parses_external_plaintext_feed_config() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[capture]
+selection = "plaintext_feed"
+
+[capture.plaintext_feed]
+path = "/tmp/sssa-plaintext-feed.jsonl"
+"#,
+    )?;
+
+    assert_eq!(config.capture.selection, CaptureSelection::PlaintextFeed);
+    assert_eq!(
+        config.capture.plaintext_feed.path,
+        Some(PathBuf::from("/tmp/sssa-plaintext-feed.jsonl"))
+    );
+    config.validate_basic()?;
+    Ok(())
+}
+
+#[test]
+fn config_rejects_unknown_fields() {
+    let result = AgentConfig::from_toml_str("unknown = true");
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn validation_rejects_invalid_capture_runtime_fields() -> Result<(), Box<dyn std::error::Error>> {
+    let empty_fallback = AgentConfig::from_toml_str(
+        r#"
+[capture]
+fallback_backends = []
+"#,
+    )?;
+
+    let empty_fallback_error = empty_fallback
+        .validate_basic()
+        .expect_err("auto capture requires a live backend");
+    assert!(
+        empty_fallback_error
+            .to_string()
+            .contains("auto capture selection requires at least one live fallback backend")
+    );
+
+    let config = AgentConfig::from_toml_str(
+        r#"
+[capture]
+selection = "libpcap"
+
+[capture.libpcap]
+bpf_filter = " "
+snaplen = 0
+read_timeout_ms = -1
+buffer_size = 0
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("capture fields must be validated");
+
+    assert!(
+        error
+            .to_string()
+            .contains("libpcap BPF filter cannot be empty")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("libpcap snaplen must be positive")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("libpcap read timeout cannot be negative")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("libpcap buffer size must be positive")
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_invalid_plaintext_feed_config() -> Result<(), Box<dyn std::error::Error>> {
+    let unused_path = AgentConfig::from_toml_str(
+        r#"
+[capture.plaintext_feed]
+path = "/tmp/feed.jsonl"
+"#,
+    )?;
+    let error = unused_path
+        .validate_basic()
+        .expect_err("plaintext feed path must belong to the selected backend");
+    assert!(error.to_string().contains("capture.plaintext_feed.path"));
+
+    let missing_path = AgentConfig::from_toml_str(
+        r#"
+[capture]
+selection = "plaintext_feed"
+"#,
+    )?;
+    let error = missing_path
+        .validate_basic()
+        .expect_err("external feed must set a path");
+    assert!(error.to_string().contains("capture.plaintext_feed.path"));
+
+    let conflicting_tls_provider = AgentConfig::from_toml_str(
+        r#"
+[capture]
+selection = "plaintext_feed"
+
+[capture.plaintext_feed]
+path = "/tmp/feed.jsonl"
+
+[tls.plaintext]
+enabled = true
+provider = "libssl_uprobe"
+"#,
+    )?;
+    let error = conflicting_tls_provider
+        .validate_basic()
+        .expect_err("plaintext feed selection must not also enable TLS instrumentation");
+    assert!(error.to_string().contains("tls.plaintext.enabled"));
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_empty_tls_material_path() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[[tls.materials]]
+kind = "trust_anchor"
+path = ""
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("TLS material paths must be explicit");
+
+    assert!(error.to_string().contains("tls.materials[0].path"));
+    assert!(
+        error
+            .to_string()
+            .contains("TLS material path cannot be empty")
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_invalid_admin_socket_path() -> Result<(), Box<dyn std::error::Error>> {
+    let empty = AgentConfig::from_toml_str(
+        r#"
+[admin]
+enabled = true
+socket_path = ""
+"#,
+    )?;
+    let error = empty
+        .validate_basic()
+        .expect_err("enabled admin socket requires a path");
+    assert!(
+        error
+            .to_string()
+            .contains("enabled admin socket requires a socket path")
+    );
+
+    let relative = AgentConfig::from_toml_str(
+        r#"
+[admin]
+enabled = true
+socket_path = "admin.sock"
+"#,
+    )?;
+    let error = relative
+        .validate_basic()
+        .expect_err("admin socket path must be absolute");
+    assert!(
+        error
+            .to_string()
+            .contains("admin socket path must be absolute")
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_zero_enabled_export_worker_interval() -> Result<(), Box<dyn std::error::Error>>
+{
+    let enabled = AgentConfig::from_toml_str(
+        r#"
+[export]
+worker_enabled = true
+worker_interval_ms = 0
+"#,
+    )?;
+
+    let error = enabled
+        .validate_basic()
+        .expect_err("enabled export worker must have a positive interval");
+    assert!(
+        error
+            .to_string()
+            .contains("export worker interval must be positive")
+    );
+
+    let disabled = AgentConfig::from_toml_str(
+        r#"
+[export]
+worker_enabled = false
+worker_interval_ms = 0
+"#,
+    )?;
+    disabled.validate_basic()?;
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_reserved_exporter_headers() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/batches"
+headers = { idempotency-key = "override" }
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("reserved webhook header must be rejected");
+
+    assert!(error.to_string().contains("exporter header is reserved"));
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_duplicate_and_reserved_exporter_ids() -> Result<(), Box<dyn std::error::Error>>
+{
+    let duplicate = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/one"
+
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/two"
+"#,
+    )?;
+    let duplicate_error = duplicate
+        .validate_basic()
+        .expect_err("duplicate exporter ids must be rejected");
+    assert!(
+        duplicate_error
+            .to_string()
+            .contains("exporter id must be unique")
+    );
+
+    let reserved = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "replay-webhook"
+transport = "webhook"
+endpoint = "https://collector.example/replay"
+"#,
+    )?;
+    let reserved_error = reserved
+        .validate_basic()
+        .expect_err("replay-webhook sink id must be reserved");
+    assert!(
+        reserved_error
+            .to_string()
+            .contains("reserved for replay CLI")
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_invalid_exporter_headers() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/batches"
+headers = { "bad header" = "value", good = "bad\nvalue" }
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("invalid webhook headers must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("exporter header name is not a valid HTTP token")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("exporter header value cannot contain CR or LF")
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_ignores_unused_libpcap_fields() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[capture]
+selection = "replay"
+
+[capture.libpcap]
+bpf_filter = " "
+snaplen = 0
+"#,
+    )?;
+
+    config.validate_basic()?;
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_multiple_enabled_policies() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[[policies]]
+id = "a"
+enabled = true
+path = "/tmp/a.lua"
+
+[[policies]]
+id = "b"
+enabled = true
+path = "/tmp/b.lua"
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("multiple enabled policies must be rejected before run");
+
+    assert!(
+        error
+            .to_string()
+            .contains("at most one enabled policy bundle")
+    );
+    Ok(())
+}
