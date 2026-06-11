@@ -458,15 +458,19 @@ fn synthetic_libpcap_process() -> ProcessContext {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, net::Ipv4Addr, rc::Rc};
+    use std::{
+        cell::RefCell,
+        net::{IpAddr, Ipv4Addr},
+        rc::Rc,
+    };
 
     use super::*;
 
     #[test]
     fn builds_stable_flow_for_opposite_http_directions() {
         let request = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 1),
-            destination: Ipv4Addr::new(10, 0, 0, 2),
+            source: ipv4(10, 0, 0, 1),
+            destination: ipv4(10, 0, 0, 2),
             source_port: 50_000,
             destination_port: 80,
             sequence: 100,
@@ -474,8 +478,8 @@ mod tests {
             payload: b"GET / HTTP/1.1\r\n\r\n",
         };
         let response = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 2),
-            destination: Ipv4Addr::new(10, 0, 0, 1),
+            source: ipv4(10, 0, 0, 2),
+            destination: ipv4(10, 0, 0, 1),
             source_port: 80,
             destination_port: 50_000,
             sequence: 200,
@@ -497,8 +501,8 @@ mod tests {
     #[test]
     fn direction_tracker_keeps_response_body_inbound_after_response_headers() {
         let response_headers = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 2),
-            destination: Ipv4Addr::new(10, 0, 0, 1),
+            source: ipv4(10, 0, 0, 2),
+            destination: ipv4(10, 0, 0, 1),
             source_port: 80,
             destination_port: 50_000,
             sequence: 200,
@@ -506,8 +510,8 @@ mod tests {
             payload: b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
         };
         let response_body = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 2),
-            destination: Ipv4Addr::new(10, 0, 0, 1),
+            source: ipv4(10, 0, 0, 2),
+            destination: ipv4(10, 0, 0, 1),
             source_port: 80,
             destination_port: 50_000,
             sequence: 240,
@@ -534,8 +538,8 @@ mod tests {
     #[test]
     fn procfs_resolution_can_select_local_server_for_http_request() {
         let request = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 1),
-            destination: Ipv4Addr::new(10, 0, 0, 2),
+            source: ipv4(10, 0, 0, 1),
+            destination: ipv4(10, 0, 0, 2),
             source_port: 50_000,
             destination_port: 80,
             sequence: 100,
@@ -566,8 +570,8 @@ mod tests {
     #[test]
     fn closed_flow_re_resolves_reused_four_tuple() {
         let first = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 1),
-            destination: Ipv4Addr::new(10, 0, 0, 2),
+            source: ipv4(10, 0, 0, 1),
+            destination: ipv4(10, 0, 0, 2),
             source_port: 50_000,
             destination_port: 80,
             sequence: 100,
@@ -624,8 +628,8 @@ mod tests {
     #[test]
     fn half_closed_flow_keeps_peer_response_on_same_flow() {
         let request = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 1),
-            destination: Ipv4Addr::new(10, 0, 0, 2),
+            source: ipv4(10, 0, 0, 1),
+            destination: ipv4(10, 0, 0, 2),
             source_port: 50_000,
             destination_port: 80,
             sequence: 100,
@@ -638,8 +642,8 @@ mod tests {
             ..request
         };
         let response = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 2),
-            destination: Ipv4Addr::new(10, 0, 0, 1),
+            source: ipv4(10, 0, 0, 2),
+            destination: ipv4(10, 0, 0, 1),
             source_port: 80,
             destination_port: 50_000,
             sequence: 200,
@@ -670,8 +674,8 @@ mod tests {
     #[test]
     fn payload_fin_closes_current_flow_after_bytes() {
         let request = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 1),
-            destination: Ipv4Addr::new(10, 0, 0, 2),
+            source: ipv4(10, 0, 0, 1),
+            destination: ipv4(10, 0, 0, 2),
             source_port: 50_000,
             destination_port: 80,
             sequence: 100,
@@ -684,8 +688,8 @@ mod tests {
             ..request
         };
         let response_fin = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 2),
-            destination: Ipv4Addr::new(10, 0, 0, 1),
+            source: ipv4(10, 0, 0, 2),
+            destination: ipv4(10, 0, 0, 1),
             source_port: 80,
             destination_port: 50_000,
             sequence: 200,
@@ -726,8 +730,8 @@ mod tests {
     #[test]
     fn idle_flow_re_resolves_reused_four_tuple() {
         let first = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 1),
-            destination: Ipv4Addr::new(10, 0, 0, 2),
+            source: ipv4(10, 0, 0, 1),
+            destination: ipv4(10, 0, 0, 2),
             source_port: 50_000,
             destination_port: 80,
             sequence: 100,
@@ -774,8 +778,8 @@ mod tests {
     #[test]
     fn idle_eviction_invalidates_resolver_snapshot_before_re_resolve() {
         let first = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 1),
-            destination: Ipv4Addr::new(10, 0, 0, 2),
+            source: ipv4(10, 0, 0, 1),
+            destination: ipv4(10, 0, 0, 2),
             source_port: 50_000,
             destination_port: 80,
             sequence: 100,
@@ -824,8 +828,8 @@ mod tests {
     #[test]
     fn syn_reuse_closes_stale_flow_and_re_resolves_four_tuple() {
         let first = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 1),
-            destination: Ipv4Addr::new(10, 0, 0, 2),
+            source: ipv4(10, 0, 0, 1),
+            destination: ipv4(10, 0, 0, 2),
             source_port: 50_000,
             destination_port: 80,
             sequence: 100,
@@ -877,8 +881,8 @@ mod tests {
     #[test]
     fn full_table_does_not_evict_when_observing_existing_flow() {
         let first = DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 1),
-            destination: Ipv4Addr::new(10, 0, 0, 2),
+            source: ipv4(10, 0, 0, 1),
+            destination: ipv4(10, 0, 0, 2),
             source_port: 50_000,
             destination_port: 80,
             sequence: 100,
@@ -896,8 +900,8 @@ mod tests {
         let first_observed = tracker.observe(&first, timestamp(1, 1), &mut resolver);
         for index in 1..MAX_FLOW_TRACKER_CONNECTIONS {
             let segment = DecodedTcpSegment {
-                source: Ipv4Addr::new(10, 1, (index / 256) as u8, (index % 256) as u8),
-                destination: Ipv4Addr::new(10, 2, (index / 256) as u8, (index % 256) as u8),
+                source: ipv4(10, 1, (index / 256) as u8, (index % 256) as u8),
+                destination: ipv4(10, 2, (index / 256) as u8, (index % 256) as u8),
                 source_port: 10_000 + (index % 50_000) as u16,
                 destination_port: 80,
                 sequence: index as u32,
@@ -982,6 +986,10 @@ mod tests {
             monotonic_ns,
             wall_time_unix_ns,
         }
+    }
+
+    fn ipv4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
     }
 
     fn default_flags() -> super::super::decoder::TcpFlags {

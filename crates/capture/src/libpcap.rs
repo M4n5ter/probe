@@ -259,7 +259,7 @@ fn degradation_reason(attribution_failure: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use probe_core::{
         AddressPort, Direction, FlowIdentity, ProcessContext, ProcessIdentity, TransportProtocol,
@@ -329,8 +329,8 @@ mod tests {
 
     fn decoded_payload() -> DecodedTcpSegment<'static> {
         DecodedTcpSegment {
-            source: Ipv4Addr::new(10, 0, 0, 1),
-            destination: Ipv4Addr::new(10, 0, 0, 2),
+            source: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            destination: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             source_port: 50_000,
             destination_port: 80,
             sequence: 1,
