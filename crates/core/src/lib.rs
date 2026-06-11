@@ -10,8 +10,9 @@ pub use capability::{
     CapabilityKind, CapabilityMatrix, CapabilityRequirement, CapabilityState, RuntimeMode,
 };
 pub use event::{
-    BodyChunk, CaptureSource, Direction, DomainEvent, EventEnvelope, EventId, EventKind, Gap,
-    HttpHeaders, OpaqueStream, ProtocolError, SseEvent, Timestamp, WebSocketHandoff,
+    BodyChunk, CaptureSource, Direction, DomainEvent, EventEnvelope, EventId, EventKind, EventType,
+    Gap, HttpHeaders, OpaqueStream, ProtocolError, SseEvent, Timestamp, UnknownEventType,
+    WebSocketHandoff,
 };
 pub use identity::{
     AddressPort, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, TransportProtocol,

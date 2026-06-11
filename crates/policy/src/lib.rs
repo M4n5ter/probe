@@ -8,7 +8,7 @@ use std::{
 };
 
 use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
-use probe_core::{Action, DomainEvent, EventEnvelope, EventKind, Verdict};
+use probe_core::{Action, DomainEvent, EventEnvelope, EventType, Verdict};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
@@ -55,6 +55,24 @@ impl PolicyHook {
             Self::OpaqueStream => "on_opaque_stream",
             Self::Gap => "on_gap",
             Self::ProtocolError => "on_protocol_error",
+        }
+    }
+
+    pub fn from_event_type(event_type: EventType) -> Option<Self> {
+        match event_type {
+            EventType::ConnectionOpened => Some(Self::ConnectionOpened),
+            EventType::ConnectionClosed => Some(Self::ConnectionClosed),
+            EventType::HttpRequestHeaders => Some(Self::HttpRequestHeaders),
+            EventType::HttpResponseHeaders => Some(Self::HttpResponseHeaders),
+            EventType::HttpBodyChunk => Some(Self::HttpBodyChunk),
+            EventType::SseEvent => Some(Self::SseEvent),
+            EventType::WebSocketHandoff => Some(Self::WebSocketHandoff),
+            EventType::OpaqueStream => Some(Self::OpaqueStream),
+            EventType::Gap => Some(Self::Gap),
+            EventType::ProtocolError => Some(Self::ProtocolError),
+            EventType::PolicyAlert | EventType::PolicyVerdict | EventType::EnforcementDecision => {
+                None
+            }
         }
     }
 }
@@ -336,33 +354,20 @@ fn table_value_to_outcome(lua: &Lua, value: Value) -> Result<PolicyOutcome, mlua
 }
 
 pub fn hook_for_event(event: &EventEnvelope) -> Option<PolicyHook> {
-    match &event.kind {
-        EventKind::ConnectionOpened => Some(PolicyHook::ConnectionOpened),
-        EventKind::ConnectionClosed => Some(PolicyHook::ConnectionClosed),
-        EventKind::HttpRequestHeaders(_) => Some(PolicyHook::HttpRequestHeaders),
-        EventKind::HttpResponseHeaders(_) => Some(PolicyHook::HttpResponseHeaders),
-        EventKind::HttpBodyChunk(_) => Some(PolicyHook::HttpBodyChunk),
-        EventKind::SseEvent(_) => Some(PolicyHook::SseEvent),
-        EventKind::WebSocketHandoff(_) => Some(PolicyHook::WebSocketHandoff),
-        EventKind::OpaqueStream(_) => Some(PolicyHook::OpaqueStream),
-        EventKind::Gap(_) => Some(PolicyHook::Gap),
-        EventKind::ProtocolError(_) => Some(PolicyHook::ProtocolError),
-        EventKind::PolicyAlert(_)
-        | EventKind::PolicyVerdict(_)
-        | EventKind::EnforcementDecision(_) => None,
-    }
+    PolicyHook::from_event_type(event.kind.event_type())
 }
 
 #[cfg(test)]
 mod tests {
     use probe_core::{
-        AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
-        HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+        AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, EventType, FlowContext,
+        FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
         WebSocketHandoff,
     };
 
     use crate::{
-        PolicyHook, PolicyLimits, PolicyManifest, PolicyOutcome, PolicyRuntime, hook_for_event,
+        POLICY_HOOKS, PolicyHook, PolicyLimits, PolicyManifest, PolicyOutcome, PolicyRuntime,
+        hook_for_event,
     };
 
     #[test]
@@ -594,6 +599,28 @@ mod tests {
     }
 
     #[test]
+    fn policy_hook_maps_from_primary_event_type() {
+        for (event_type, hook) in policy_hook_mapping_cases() {
+            assert_eq!(PolicyHook::from_event_type(event_type), Some(hook));
+            assert!(POLICY_HOOKS.contains(&hook));
+
+            let value = serde_json::to_value(hook).expect("hook must serialize");
+            assert_eq!(
+                serde_json::from_value::<PolicyHook>(value).expect("hook must deserialize"),
+                hook
+            );
+        }
+
+        for event_type in [
+            EventType::PolicyAlert,
+            EventType::PolicyVerdict,
+            EventType::EnforcementDecision,
+        ] {
+            assert_eq!(PolicyHook::from_event_type(event_type), None);
+        }
+    }
+
+    #[test]
     fn policy_hook_serializes_to_lua_callback_name() -> Result<(), Box<dyn std::error::Error>> {
         let manifest = PolicyManifest {
             id: "demo".to_string(),
@@ -623,6 +650,27 @@ mod tests {
 
     fn primary_hook_for_event(event: &EventEnvelope) -> PolicyHook {
         hook_for_event(event).expect("demo event should have a primary policy hook")
+    }
+
+    fn policy_hook_mapping_cases() -> [(EventType, PolicyHook); 10] {
+        [
+            (EventType::ConnectionOpened, PolicyHook::ConnectionOpened),
+            (EventType::ConnectionClosed, PolicyHook::ConnectionClosed),
+            (
+                EventType::HttpRequestHeaders,
+                PolicyHook::HttpRequestHeaders,
+            ),
+            (
+                EventType::HttpResponseHeaders,
+                PolicyHook::HttpResponseHeaders,
+            ),
+            (EventType::HttpBodyChunk, PolicyHook::HttpBodyChunk),
+            (EventType::SseEvent, PolicyHook::SseEvent),
+            (EventType::WebSocketHandoff, PolicyHook::WebSocketHandoff),
+            (EventType::OpaqueStream, PolicyHook::OpaqueStream),
+            (EventType::Gap, PolicyHook::Gap),
+            (EventType::ProtocolError, PolicyHook::ProtocolError),
+        ]
     }
 
     fn demo_event() -> EventEnvelope {

@@ -1,5 +1,8 @@
+use std::{fmt, str::FromStr};
+
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use thiserror::Error;
 
 use crate::{Action, EnforcementDecision, FlowContext, Verdict};
 
@@ -111,7 +114,7 @@ impl EventEnvelope {
             config_version.as_bytes(),
             policy_version.unwrap_or_default().as_bytes(),
             source_fingerprint.as_bytes(),
-            kind.stable_discriminant().as_bytes(),
+            kind.event_type().as_str().as_bytes(),
             monotonic_ns.as_slice(),
             kind_fingerprint.as_slice(),
         ])
@@ -137,9 +140,121 @@ pub enum EventKind {
     EnforcementDecision(EnforcementDecision),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EventType {
+    ConnectionOpened,
+    ConnectionClosed,
+    HttpRequestHeaders,
+    HttpResponseHeaders,
+    HttpBodyChunk,
+    SseEvent,
+    WebSocketHandoff,
+    OpaqueStream,
+    Gap,
+    ProtocolError,
+    PolicyAlert,
+    PolicyVerdict,
+    EnforcementDecision,
+}
+
+impl EventType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectionOpened => "connection_opened",
+            Self::ConnectionClosed => "connection_closed",
+            Self::HttpRequestHeaders => "http_request_headers",
+            Self::HttpResponseHeaders => "http_response_headers",
+            Self::HttpBodyChunk => "http_body_chunk",
+            Self::SseEvent => "sse_event",
+            Self::WebSocketHandoff => "websocket_handoff",
+            Self::OpaqueStream => "opaque_stream",
+            Self::Gap => "gap",
+            Self::ProtocolError => "protocol_error",
+            Self::PolicyAlert => "policy_alert",
+            Self::PolicyVerdict => "policy_verdict",
+            Self::EnforcementDecision => "enforcement_decision",
+        }
+    }
+}
+
+impl fmt::Display for EventType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EventType {
+    type Err = UnknownEventType;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "connection_opened" => Ok(Self::ConnectionOpened),
+            "connection_closed" => Ok(Self::ConnectionClosed),
+            "http_request_headers" => Ok(Self::HttpRequestHeaders),
+            "http_response_headers" => Ok(Self::HttpResponseHeaders),
+            "http_body_chunk" => Ok(Self::HttpBodyChunk),
+            "sse_event" => Ok(Self::SseEvent),
+            "websocket_handoff" => Ok(Self::WebSocketHandoff),
+            "opaque_stream" => Ok(Self::OpaqueStream),
+            "gap" => Ok(Self::Gap),
+            "protocol_error" => Ok(Self::ProtocolError),
+            "policy_alert" => Ok(Self::PolicyAlert),
+            "policy_verdict" => Ok(Self::PolicyVerdict),
+            "enforcement_decision" => Ok(Self::EnforcementDecision),
+            _ => Err(UnknownEventType {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+impl Serialize for EventType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for EventType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("unknown event type: {value}")]
+pub struct UnknownEventType {
+    value: String,
+}
+
 impl EventKind {
     pub fn name(&self) -> &'static str {
-        self.stable_discriminant()
+        self.event_type().as_str()
+    }
+
+    pub fn event_type(&self) -> EventType {
+        match self {
+            Self::ConnectionOpened => EventType::ConnectionOpened,
+            Self::ConnectionClosed => EventType::ConnectionClosed,
+            Self::HttpRequestHeaders(_) => EventType::HttpRequestHeaders,
+            Self::HttpResponseHeaders(_) => EventType::HttpResponseHeaders,
+            Self::HttpBodyChunk(_) => EventType::HttpBodyChunk,
+            Self::SseEvent(_) => EventType::SseEvent,
+            Self::WebSocketHandoff(_) => EventType::WebSocketHandoff,
+            Self::OpaqueStream(_) => EventType::OpaqueStream,
+            Self::Gap(_) => EventType::Gap,
+            Self::ProtocolError(_) => EventType::ProtocolError,
+            Self::PolicyAlert(_) => EventType::PolicyAlert,
+            Self::PolicyVerdict(_) => EventType::PolicyVerdict,
+            Self::EnforcementDecision(_) => EventType::EnforcementDecision,
+        }
     }
 
     pub fn direction(&self) -> Option<Direction> {
@@ -158,24 +273,6 @@ impl EventKind {
             | Self::PolicyAlert(_)
             | Self::PolicyVerdict(_)
             | Self::EnforcementDecision(_) => None,
-        }
-    }
-
-    fn stable_discriminant(&self) -> &'static str {
-        match self {
-            Self::ConnectionOpened => "connection_opened",
-            Self::ConnectionClosed => "connection_closed",
-            Self::HttpRequestHeaders(_) => "http_request_headers",
-            Self::HttpResponseHeaders(_) => "http_response_headers",
-            Self::HttpBodyChunk(_) => "http_body_chunk",
-            Self::SseEvent(_) => "sse_event",
-            Self::WebSocketHandoff(_) => "websocket_handoff",
-            Self::OpaqueStream(_) => "opaque_stream",
-            Self::Gap(_) => "gap",
-            Self::ProtocolError(_) => "protocol_error",
-            Self::PolicyAlert(_) => "policy_alert",
-            Self::PolicyVerdict(_) => "policy_verdict",
-            Self::EnforcementDecision(_) => "enforcement_decision",
         }
     }
 
@@ -256,8 +353,10 @@ pub struct DomainEvent {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
-        HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+        Action, AddressPort, CaptureSource, Direction, DomainEvent, EnforcementDecision,
+        EnforcementMode, EnforcementOutcome, EventEnvelope, EventKind, EventType, FlowContext,
+        FlowIdentity, Gap, HttpHeaders, OpaqueStream, ProcessContext, ProcessIdentity,
+        ProtocolError, SseEvent, Timestamp, TransportProtocol, Verdict, VerdictScope,
         WebSocketHandoff,
     };
 
@@ -287,16 +386,142 @@ mod tests {
 
     #[test]
     fn websocket_handoff_wire_type_matches_stable_event_name() {
-        let value = serde_json::to_value(EventKind::WebSocketHandoff(WebSocketHandoff {
+        let kind = EventKind::WebSocketHandoff(WebSocketHandoff {
             direction: Direction::Inbound,
             stream_sequence: 1,
             target: Some("/chat".to_string()),
             subprotocol: Some("chat".to_string()),
             extensions: Vec::new(),
-        }))
-        .expect("event kind must serialize");
+        });
+        let value = serde_json::to_value(&kind).expect("event kind must serialize");
 
-        assert_eq!(value["type"], "websocket_handoff");
+        assert_eq!(kind.event_type(), EventType::WebSocketHandoff);
+        assert_eq!(kind.name(), EventType::WebSocketHandoff.as_str());
+        assert_eq!(value["type"], EventType::WebSocketHandoff.as_str());
+    }
+
+    #[test]
+    fn event_type_round_trips_wire_name() -> Result<(), Box<dyn std::error::Error>> {
+        for (event_type, expected) in event_type_wire_cases() {
+            let value = serde_json::to_value(event_type)?;
+
+            assert_eq!(value, expected);
+            assert_eq!(serde_json::from_value::<EventType>(value)?, event_type);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn event_kind_wire_type_matches_event_type() {
+        for kind in event_kind_wire_cases() {
+            let value = serde_json::to_value(&kind).expect("event kind must serialize");
+
+            assert_eq!(value["type"], kind.event_type().as_str());
+        }
+    }
+
+    fn event_type_wire_cases() -> [(EventType, &'static str); 13] {
+        [
+            (EventType::ConnectionOpened, "connection_opened"),
+            (EventType::ConnectionClosed, "connection_closed"),
+            (EventType::HttpRequestHeaders, "http_request_headers"),
+            (EventType::HttpResponseHeaders, "http_response_headers"),
+            (EventType::HttpBodyChunk, "http_body_chunk"),
+            (EventType::SseEvent, "sse_event"),
+            (EventType::WebSocketHandoff, "websocket_handoff"),
+            (EventType::OpaqueStream, "opaque_stream"),
+            (EventType::Gap, "gap"),
+            (EventType::ProtocolError, "protocol_error"),
+            (EventType::PolicyAlert, "policy_alert"),
+            (EventType::PolicyVerdict, "policy_verdict"),
+            (EventType::EnforcementDecision, "enforcement_decision"),
+        ]
+    }
+
+    fn event_kind_wire_cases() -> [EventKind; 13] {
+        [
+            EventKind::ConnectionOpened,
+            EventKind::ConnectionClosed,
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some("/".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+            EventKind::HttpResponseHeaders(HttpHeaders {
+                direction: Direction::Inbound,
+                stream_sequence: 1,
+                method: None,
+                target: None,
+                status: Some(200),
+                reason: Some("OK".to_string()),
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+            EventKind::HttpBodyChunk(crate::BodyChunk {
+                direction: Direction::Inbound,
+                stream_sequence: 1,
+                offset: 0,
+                data: bytes::Bytes::from_static(b"hello"),
+                end_stream: true,
+            }),
+            EventKind::SseEvent(SseEvent {
+                direction: Direction::Inbound,
+                stream_sequence: 1,
+                event: None,
+                id: None,
+                retry_ms: None,
+                data: "hello".to_string(),
+            }),
+            EventKind::WebSocketHandoff(WebSocketHandoff {
+                direction: Direction::Inbound,
+                stream_sequence: 1,
+                target: Some("/chat".to_string()),
+                subprotocol: Some("chat".to_string()),
+                extensions: Vec::new(),
+            }),
+            EventKind::OpaqueStream(OpaqueStream {
+                direction: Direction::Inbound,
+                fingerprint: vec![1, 2, 3],
+                reason: "opaque".to_string(),
+            }),
+            EventKind::Gap(Gap {
+                direction: Direction::Inbound,
+                expected_offset: 1,
+                next_offset: Some(2),
+                reason: "gap".to_string(),
+            }),
+            EventKind::ProtocolError(ProtocolError {
+                direction: Direction::Inbound,
+                reason: "bad frame".to_string(),
+            }),
+            EventKind::PolicyAlert(DomainEvent {
+                name: "alert".to_string(),
+                severity: Action::Alert,
+                message: "message".to_string(),
+                metadata: serde_json::Value::Null,
+            }),
+            EventKind::PolicyVerdict(Verdict {
+                action: Action::Alert,
+                scope: VerdictScope::Flow,
+                reason: "matched".to_string(),
+                confidence: 100,
+                ttl_ms: None,
+            }),
+            EventKind::EnforcementDecision(EnforcementDecision {
+                mode: EnforcementMode::DryRun,
+                outcome: EnforcementOutcome::DryRun,
+                requested_action: Action::Deny,
+                effective_action: Action::Observe,
+                scope: VerdictScope::Flow,
+                selector_matched: true,
+                reason: "dry run".to_string(),
+            }),
+        ]
     }
 
     fn request_event(source: CaptureSource, target: &str) -> EventEnvelope {
