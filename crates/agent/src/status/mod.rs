@@ -536,6 +536,54 @@ mod tests {
     }
 
     #[test]
+    fn status_snapshot_reports_metadata_only_policy_bundle_without_loading_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-policy-bundle")?;
+        let policy_path = temp.join("guard.bundle");
+        fs::create_dir_all(&policy_path)?;
+        fs::write(
+            policy_path.join("manifest.toml"),
+            r#"
+id = "guard"
+version = "bundle-v1"
+hooks = ["on_http_request_headers"]
+"#,
+        )?;
+        fs::write(
+            policy_path.join("main.lua"),
+            "function on_http_request_headers(",
+        )?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.policies = vec![PolicyConfig {
+            id: "guard".to_string(),
+            path: policy_path.clone(),
+            enabled: true,
+            selector: Some(Selector::default()),
+        }];
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+        let spool = available_empty_spool();
+
+        let snapshot = build_status_snapshot_at(&plan, spool, 42);
+
+        assert_eq!(snapshot.policy.mode, PolicyStatusMode::MetadataOnly);
+        let active_policy = snapshot.policy.active.as_ref().expect("active policy");
+        assert_eq!(active_policy.id, "guard");
+        assert_eq!(active_policy.path, policy_path);
+        assert!(active_policy.selector_configured);
+        assert_eq!(active_policy.source.mode, RuntimeMode::Available);
+        assert_eq!(active_policy.source.check, PolicySourceCheck::MetadataOnly);
+        assert!(
+            snapshot
+                .health
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("offline status does not load or execute"))
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
     fn missing_policy_source_marks_status_unavailable() -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("status-missing-policy")?;
         let missing_policy = temp.join("missing.lua");

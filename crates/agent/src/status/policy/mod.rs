@@ -70,7 +70,7 @@ pub(super) fn policy_status(plan: &RuntimePlan) -> PolicyStatusSnapshot {
         }
     };
 
-    let source = policy_source_status(&policy.path);
+    let source = policy_source_status(&policy.path, &policy.id);
     let (mode, reason) = match source.mode {
         RuntimeMode::Available => (
             PolicyStatusMode::MetadataOnly,
@@ -105,8 +105,8 @@ fn policy_bundle_status(
     }
 }
 
-fn policy_source_status(path: &Path) -> PolicySourceStatusSnapshot {
-    let inspection = inspect_policy_source(path);
+fn policy_source_status(path: &Path, expected_id: &str) -> PolicySourceStatusSnapshot {
+    let inspection = inspect_policy_source(path, expected_id);
 
     PolicySourceStatusSnapshot {
         check: PolicySourceCheck::MetadataOnly,

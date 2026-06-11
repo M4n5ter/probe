@@ -80,6 +80,7 @@ V1 明确不做：
 - 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection 与 export worker effective plan；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；`plaintext_feed` 是独立 plan mode，不伪装成 replay 或 live capture；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
 - 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；pipeline 支持可选 `max_events` 运行边界，便于对真实 live provider 做有界 smoke。`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合、连续 exporter worker、replay exporter 命令和状态/metrics 快照输出。
 - 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。parser 已识别 WebSocket HTTP Upgrade，输出 `WebSocketHandoff` 后把后续字节转为 opaque stream；它不解析 WebSocket frame/message。
+- 已实现 configured policy loader 的第一版 bundle 入口：`policies[].path` 指向目录时按 `manifest.toml` + `main.lua` 加载，manifest 目前支持 `id`、`version` 和 typed `hooks`，并要求 manifest id 与配置中的 policy id 一致；`status` 只做 bundle metadata/manifest 校验，不执行 Lua；`check` 和 `run` 会显式加载并执行初始化。裸 Lua 文件仍保留为 legacy source，使用配置 id、配置版本和全量 hook 列表，主要用于平滑迁移与本地调试，不代表长期 policy bundle 格式。
 - 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF、libssl uprobe/keylog TLS 解密和真实 enforcement 相关能力仍必须标记 unavailable；`external_plaintext_feed`、HTTP/1、SSE、WebSocket handoff、dry-run enforcement 是可用能力。webhook exporter 已可在 `run` 中连续 drain planned sinks，但 retry/backoff、per-sink quota 和 retention deadline 尚未实现，因此仍标记 degraded。dry-run enforcement 记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 或 plaintext feed 作为 live provider；`run` 在无 live capture provider 时 fail closed，显式 `plaintext_feed` 会从 JSON-lines feed path 读取已解密明文 event 并接入 replay 共用的 pipeline；policy selector 会在 runtime plan / configured policy load 阶段校验，并在 pipeline 中限制 policy 执行范围；`check` 用于查看 resolved plan 并显式加载 policy / enforcement planner，`status` 用于查看 health/spool/exporter/metrics 快照。
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
 - 当前 `FjallSpool` 存储的是带 schema 的 `SpoolPayload`；ingress lane 当前写入 JSON framed `CapturedBytes`，export lane 当前写入 JSON framed `EventEnvelope`。reader 只返回已越过 lane durable high-water sequence 的条目，避免并发 exporter 读到已 commit 但尚未 `SyncAll` 持久化完成的事件；`status` 使用同一 durable high-water 生成 spool/export lag 快照。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
@@ -460,7 +461,7 @@ LuaJIT FFI：
 - 显式移除 `ffi`、`io`、`os`、`package`、`debug`、`jit`、`dofile`、`loadfile`、`load`、`collectgarbage`。
 - `require` 被替换为固定错误函数，不允许访问系统 Lua 路径。
 - runtime 同时设置 instruction budget 和 memory limit；instruction budget 防死循环，memory limit 防少量指令的大分配 OOM。
-- 当前 replay CLI 允许加载裸 Lua 文件作为调试入口，但这只是 `ReplayPolicyLoader` 语义，不能等同于长期 policy bundle 格式。
+- configured policy loader 已支持 bundle directory；当前 replay CLI 和 legacy configured source 仍允许加载裸 Lua 文件作为调试/迁移入口，但这只是 legacy source 语义，不能等同于长期 policy bundle 格式。
 
 ## 16. Policy Bundle
 
@@ -494,6 +495,17 @@ manifest 应声明：
 6. 失败时保留旧策略。
 
 不允许从系统 Lua 路径 require 模块。这样可以保证策略可复现、可审计、可回滚。
+
+当前实现状态：
+
+- `agent` 已支持 `policies[].path` 指向 bundle directory。目录必须包含 `manifest.toml` 和 `main.lua`。
+- 当前 `manifest.toml` 只接受 `id`、`version`、`hooks` 三个字段；未知字段会失败，避免把尚未实现的 capabilities、selector、resource limits 或签名字段静默忽略。
+- `hooks` 使用 typed policy hook enum，TOML/JSON 边界仍表现为 Lua callback name，例如 `on_http_request_headers`、`on_websocket_handoff`。
+- manifest `id` 必须与 runtime config 中的 `policies[].id` 一致，避免配置层和 bundle 层出现两个 policy 身份。
+- `check`/`run` 加载 bundle 后会校验 manifest 声明的每个 hook 都在 Lua VM 中定义为函数；缺失或拼错 hook 会 fail closed，不能报告为 loaded 后静默 no-op。
+- bundle source entry 会拒绝 symlink，并通过 no-follow open、handle metadata 和 capped read 读取 `manifest.toml`/`main.lua`，避免把 bundle 目录外文件静默纳入策略源。
+- `main.lua` 复用现有 sandbox、instruction budget 和 memory limit；bundle-local `lib/`、checksum/signature、bundle 内 selector、capability requirement、state budget 和 hot reload 尚未实现。
+- legacy 裸 Lua 文件仍可作为 `policies[].path`，但会使用配置 id、配置版本和全量 hook 列表；这是迁移/调试路径，不是长期 bundle 目标。
 
 ## 17. Lua API 与状态
 
@@ -875,7 +887,7 @@ V1 的 HTTP(S) exporter 是 webhook 风格，但必须定义协议语义。
 
 - 已实现 CLI `status --config <path>`，输出可复用的 JSON snapshot：health、capture status、policy status、enforcement status、TLS plaintext/material status、capability matrix、offline spool high-water、planned exporter sink cursor/lag 和 metrics counters。`health` 表示当前 active capture/spool/exporter 状态，并纳入 policy 的已知阻断或 metadata-only 未验证状态；无效 enforcement 配置在 snapshot 前由 `RuntimePlan` fail closed。capability matrix 和 capability metrics 保持独立，避免把路线图缺口伪装成当前运行故障。
 - `status` 对配置/runtime plan 错误 fail fast；对 spool 缺失、尚未初始化或读取失败不伪装成功，也不会为 status 查询创建 spool，而是在 snapshot 中标记 `spool.mode = unavailable`，并把相关 exporter 标记 unavailable。当前 CLI status 是 offline probe：如果 spool 已由正在运行的 agent 持有，会显式标记 `spool.mode = degraded` 和 busy reason，而不是伪装成坏 spool 或在线 admin snapshot。
-- policy status 当前只做 metadata-only source check：报告 configured/enabled count、active policy id/path、selector 是否配置、策略源文件是否存在且是 regular file；不会加载或执行 Lua policy source。启用 policy 且源文件 metadata 可见时，offline status 标记 `policy.mode = metadata_only` 并让 health degraded，而不是宣称 policy runtime 已可用。原因是 `PolicyRuntime` 加载阶段会执行 Lua chunk，offline status 不能变成隐式执行外部策略的入口。显式 `check` 会加载并编译启用的 policy，失败则 fail closed。
+- policy status 当前只做 metadata-only source check：报告 configured/enabled count、active policy id/path、selector 是否配置、legacy Lua 文件或 bundle directory 是否具备可加载 metadata；对于 bundle directory 会解析 `manifest.toml` 并检查 `main.lua` metadata，但不会加载或执行 Lua source。启用 policy 且 source metadata 可见时，offline status 标记 `policy.mode = metadata_only` 并让 health degraded，而不是宣称 policy runtime 已可用。原因是 `PolicyRuntime` 加载阶段会执行 Lua chunk，offline status 不能变成隐式执行外部策略的入口。显式 `check` 会加载并编译启用的 policy，失败则 fail closed。
 - enforcement status 使用 typed enum 报告 configured mode、effective status、selector 是否配置和 capability requirement。`disabled`/`audit_only` 标记 capability `not_required`；`dry_run` 标记需要 `DryRunEnforcement` capability。`enforce` 和缺少 dry-run capability 的配置在 `RuntimePlan` 构建阶段 fail closed，因此 CLI status 对这类配置直接返回 validation error，而不是输出一个伪可用 snapshot。
 - TLS status 报告 plaintext provider 是否启用及其 capability requirement，并对配置的 TLS material 做 metadata-only source check：只判断路径是否存在且是 regular file，同时把 material 标为 `trust_or_identity` 或 `decrypt_hint`。offline status 不读取、不解析、不验证证书/私钥/keylog 内容，也不把证书/私钥误称为通用 TLS 解密能力；当前尚无 active surface 消费这些 material，因此 material 缺失只体现在 `tls.materials[].source.mode`，不直接拉低 health。
 - `run` 可按 `[admin] enabled = true` 启动 owner-constrained private Unix socket server，socket 文件权限设置为 `0600`，当前 JSON-lines 协议支持 `{"command":"status"}` 和 `{"command":"metrics"}`。admin socket parent directory 必须由部署层预创建，且不能是 symlink、不能允许 group/other 访问，owner 必须是 root 或当前 euid；socket 路径已有活跃 listener 时 fail fast，拒绝覆盖非 socket 文件，只清理 connection-refused 的 stale socket。在线 status 直接读取运行中 spool handle，避免把自身 Fjall lock 误报成 offline busy；admin server 在 exporter worker 启动前完成 bind，避免控制面失败后后台 exporter 已产生 side effect。

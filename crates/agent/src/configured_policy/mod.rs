@@ -1,12 +1,16 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
+use policy::PolicyRuntime;
 use probe_config::{AgentConfig, PolicyConfig};
-use probe_core::{CompiledSelector, RuntimeMode};
+use probe_core::CompiledSelector;
 use serde::Serialize;
 use thiserror::Error;
 
-pub const MAX_POLICY_SOURCE_BYTES: u64 = 1024 * 1024;
+mod source;
+
+#[cfg(test)]
+pub use source::MAX_POLICY_SOURCE_BYTES;
+pub use source::inspect_policy_source;
 
 #[derive(Debug, Error)]
 pub enum ConfiguredPolicyError {
@@ -47,12 +51,6 @@ pub struct ConfiguredPolicySource {
     pub selector_configured: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PolicySourceInspection {
-    pub mode: RuntimeMode,
-    pub reason: Option<String>,
-}
-
 pub struct LoadedConfiguredPolicy {
     pub runtime: PolicyRuntime,
     pub source: ConfiguredPolicySource,
@@ -91,19 +89,6 @@ pub fn load_configured_policy(
     }
 }
 
-pub fn inspect_policy_source(path: &Path) -> PolicySourceInspection {
-    match validate_policy_source(path) {
-        Ok(()) => PolicySourceInspection {
-            mode: RuntimeMode::Available,
-            reason: None,
-        },
-        Err(error) => PolicySourceInspection {
-            mode: RuntimeMode::Unavailable,
-            reason: Some(error.reason()),
-        },
-    }
-}
-
 fn read_configured_policy(
     config: &AgentConfig,
     policy: &PolicyConfig,
@@ -113,80 +98,18 @@ fn read_configured_policy(
         .as_ref()
         .map(|selector| selector.compile())
         .transpose()?;
-    let source = read_policy_source(&policy.path)?;
-    let runtime = PolicyRuntime::from_source(
-        PolicyManifest {
-            id: policy.id.clone(),
-            version: config.config_version.clone(),
-            hooks: POLICY_HOOKS.to_vec(),
-        },
-        &source,
-    )?;
+    let source = source::load_policy_source(config.config_version.as_str(), policy)?;
+    let runtime = if source.require_declared_hooks {
+        PolicyRuntime::from_source_with_required_hooks(source.manifest, &source.source)?
+    } else {
+        PolicyRuntime::from_source(source.manifest, &source.source)?
+    };
 
     Ok(LoadedConfiguredPolicy {
         runtime,
         source: configured_policy_source(policy),
         selector,
     })
-}
-
-fn read_policy_source(path: &Path) -> Result<String, ConfiguredPolicyError> {
-    validate_policy_source(path).map_err(|error| error.into_configured_error(path))?;
-
-    std::fs::read_to_string(path).map_err(|source| ConfiguredPolicyError::ReadPolicy {
-        path: path.display().to_string(),
-        source,
-    })
-}
-
-fn validate_policy_source(path: &Path) -> Result<(), PolicySourceValidationError> {
-    let metadata = std::fs::metadata(path).map_err(|source| {
-        if source.kind() == std::io::ErrorKind::NotFound {
-            PolicySourceValidationError::NotFound
-        } else {
-            PolicySourceValidationError::Inspect(source)
-        }
-    })?;
-    if !metadata.is_file() {
-        return Err(PolicySourceValidationError::NotRegular);
-    }
-    if metadata.len() > MAX_POLICY_SOURCE_BYTES {
-        return Err(PolicySourceValidationError::TooLarge(metadata.len()));
-    }
-    Ok(())
-}
-
-enum PolicySourceValidationError {
-    NotFound,
-    Inspect(std::io::Error),
-    NotRegular,
-    TooLarge(u64),
-}
-
-impl PolicySourceValidationError {
-    fn reason(&self) -> String {
-        match self {
-            Self::NotFound => "policy source path does not exist".to_string(),
-            Self::Inspect(error) => format!("failed to inspect policy source: {error}"),
-            Self::NotRegular => "policy source path is not a regular file".to_string(),
-            Self::TooLarge(size) => format!(
-                "policy source is {size} bytes, exceeding the {MAX_POLICY_SOURCE_BYTES} byte limit"
-            ),
-        }
-    }
-
-    fn into_configured_error(self, path: &Path) -> ConfiguredPolicyError {
-        match self {
-            Self::Inspect(source) => ConfiguredPolicyError::ReadPolicy {
-                path: path.display().to_string(),
-                source,
-            },
-            error => ConfiguredPolicyError::InvalidPolicySource {
-                path: path.display().to_string(),
-                reason: error.reason(),
-            },
-        }
-    }
 }
 
 fn configured_policy_source(policy: &PolicyConfig) -> ConfiguredPolicySource {
@@ -215,6 +138,7 @@ mod tests {
     use capture::ReplayProvider;
     use parsers::Http1ParserFactory;
     use pipeline::{CapturePipeline, PipelinePolicy};
+    use policy::{PolicyError, PolicyHook};
     use probe_config::{AgentConfig, PolicyConfig};
     use probe_core::{
         AddressPort, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
@@ -225,8 +149,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn load_configured_policy_rejects_non_file_source() -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("configured-policy-directory")?;
+    fn load_configured_policy_rejects_incomplete_bundle_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("configured-policy-incomplete-bundle")?;
         let policy_path = temp.join("policy-dir");
         fs::create_dir_all(&policy_path)?;
         let config = config_with_policy(&policy_path)?;
@@ -239,6 +164,130 @@ mod tests {
             error,
             ConfiguredPolicyError::InvalidPolicySource { .. }
         ));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_configured_policy_loads_bundle_manifest_and_main()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("configured-policy-bundle")?;
+        let policy_path = temp.join("guard.bundle");
+        write_policy_bundle(
+            &policy_path,
+            "guard",
+            "bundle-v1",
+            &["on_http_request_headers"],
+            r#"
+function on_http_request_headers(event)
+  return probe.emit_alert("bundle " .. event.kind.target)
+end
+"#,
+        )?;
+        let config = config_with_policy(&policy_path)?;
+
+        let loaded = load_configured_policy(&config)?.expect("configured policy");
+
+        assert_eq!(loaded.runtime.manifest().id, "guard");
+        assert_eq!(loaded.runtime.manifest().version, "bundle-v1");
+        assert_eq!(
+            loaded.runtime.manifest().hooks,
+            vec![PolicyHook::HttpRequestHeaders]
+        );
+        assert_eq!(
+            policy_alert_count(
+                &temp.join("bundle-spool"),
+                &loaded,
+                flow_with_remote_port(80)
+            )?,
+            1
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_configured_policy_rejects_bundle_id_mismatch() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = test_dir("configured-policy-bundle-id-mismatch")?;
+        let policy_path = temp.join("guard.bundle");
+        write_policy_bundle(
+            &policy_path,
+            "other",
+            "bundle-v1",
+            &["on_http_request_headers"],
+            "function on_http_request_headers(_) return {} end",
+        )?;
+        let config = config_with_policy(&policy_path)?;
+
+        let Err(error) = load_configured_policy(&config) else {
+            panic!("bundle id mismatch must fail configured policy loading");
+        };
+
+        assert!(
+            matches!(error, ConfiguredPolicyError::InvalidPolicySource { reason, .. } if reason.contains("does not match configured policy id guard"))
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_configured_policy_rejects_bundle_missing_declared_hook()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("configured-policy-bundle-missing-hook")?;
+        let policy_path = temp.join("guard.bundle");
+        write_policy_bundle(
+            &policy_path,
+            "guard",
+            "bundle-v1",
+            &["on_http_request_headers"],
+            "function on_sse_event(_) return {} end",
+        )?;
+        let config = config_with_policy(&policy_path)?;
+
+        let Err(error) = load_configured_policy(&config) else {
+            panic!("bundle missing a declared hook must fail configured policy loading");
+        };
+
+        assert!(matches!(
+            error,
+            ConfiguredPolicyError::Policy(PolicyError::MissingHook {
+                hook: PolicyHook::HttpRequestHeaders
+            })
+        ));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_configured_policy_rejects_symlinked_bundle_main()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("configured-policy-bundle-main-symlink")?;
+        let policy_path = temp.join("guard.bundle");
+        let external_source = temp.join("external.lua");
+        write_policy_bundle(
+            &policy_path,
+            "guard",
+            "bundle-v1",
+            &["on_http_request_headers"],
+            "function on_http_request_headers(_) return {} end",
+        )?;
+        fs::write(
+            &external_source,
+            "function on_http_request_headers(_) return {} end",
+        )?;
+        fs::remove_file(policy_path.join("main.lua"))?;
+        std::os::unix::fs::symlink(&external_source, policy_path.join("main.lua"))?;
+        let config = config_with_policy(&policy_path)?;
+
+        let Err(error) = load_configured_policy(&config) else {
+            panic!("bundle symlinked main.lua must fail configured policy loading");
+        };
+
+        assert!(
+            matches!(error, ConfiguredPolicyError::InvalidPolicySource { reason, .. } if reason.contains("must not be a symlink"))
+        );
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -447,5 +496,32 @@ codec = "none"
         }
         fs::create_dir_all(&path)?;
         Ok(path)
+    }
+
+    fn write_policy_bundle(
+        path: &Path,
+        id: &str,
+        version: &str,
+        hooks: &[&str],
+        source: &str,
+    ) -> Result<(), std::io::Error> {
+        fs::create_dir_all(path)?;
+        let hooks = hooks
+            .iter()
+            .map(|hook| format!(r#""{hook}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        fs::write(
+            path.join("manifest.toml"),
+            format!(
+                r#"
+id = "{id}"
+version = "{version}"
+hooks = [{hooks}]
+"#
+            ),
+        )?;
+        fs::write(path.join("main.lua"), source)?;
+        Ok(())
     }
 }

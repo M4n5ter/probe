@@ -109,11 +109,16 @@ pub struct UnknownPolicyHook {
 pub enum PolicyError {
     #[error("failed to initialize Lua policy: {0}")]
     Init(#[from] mlua::Error),
+    #[error(
+        "policy manifest declares hook {hook}, but source does not define a Lua function with that name"
+    )]
+    MissingHook { hook: PolicyHook },
     #[error("policy returned an invalid outcome: {0}")]
     InvalidOutcome(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyManifest {
     pub id: String,
     pub version: String,
@@ -152,6 +157,15 @@ pub struct PolicyRuntime {
 impl PolicyRuntime {
     pub fn from_source(manifest: PolicyManifest, source: &str) -> Result<Self, PolicyError> {
         Self::from_source_with_limits(manifest, source, PolicyLimits::default())
+    }
+
+    pub fn from_source_with_required_hooks(
+        manifest: PolicyManifest,
+        source: &str,
+    ) -> Result<Self, PolicyError> {
+        let runtime = Self::from_source(manifest, source)?;
+        runtime.validate_manifest_hooks()?;
+        Ok(runtime)
     }
 
     pub fn from_source_with_limits(
@@ -200,6 +214,17 @@ impl PolicyRuntime {
         let event_value = self.lua.to_value(event)?;
         let returned: Value = function.call(event_value)?;
         value_to_outcomes(&self.lua, returned)
+    }
+
+    fn validate_manifest_hooks(&self) -> Result<(), PolicyError> {
+        let globals = self.lua.globals();
+        for hook in &self.manifest.hooks {
+            let value = globals.get::<Value>(hook.as_str())?;
+            if !matches!(value, Value::Function(_)) {
+                return Err(PolicyError::MissingHook { hook: *hook });
+            }
+        }
+        Ok(())
     }
 }
 

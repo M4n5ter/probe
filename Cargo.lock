@@ -30,6 +30,7 @@ dependencies = [
  "storage",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
