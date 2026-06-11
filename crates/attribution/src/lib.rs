@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs, io,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -26,6 +26,37 @@ pub enum AttributionError {
     InvalidStatus { pid: u32, reason: String },
     #[error("invalid proc net tcp entry in {path}: {reason}")]
     InvalidNetTcp { path: String, reason: String },
+}
+
+impl Clone for AttributionError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Read { path, source } => Self::Read {
+                path: path.clone(),
+                source: clone_io_error(source),
+            },
+            Self::ReadLink { path, source } => Self::ReadLink {
+                path: path.clone(),
+                source: clone_io_error(source),
+            },
+            Self::InvalidStat { pid, reason } => Self::InvalidStat {
+                pid: *pid,
+                reason: reason.clone(),
+            },
+            Self::InvalidStatus { pid, reason } => Self::InvalidStatus {
+                pid: *pid,
+                reason: reason.clone(),
+            },
+            Self::InvalidNetTcp { path, reason } => Self::InvalidNetTcp {
+                path: path.clone(),
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
+fn clone_io_error(source: &io::Error) -> io::Error {
+    io::Error::new(source.kind(), source.to_string())
 }
 
 pub trait ProcessAttributor {
@@ -70,10 +101,30 @@ pub struct SocketProcessContext {
     pub socket_inode: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct ProcfsSocketSnapshot {
     tcp_inodes: HashMap<TcpConnection, u64>,
     inode_pids: HashMap<u64, u32>,
+    optional_table_errors: HashMap<ProcfsTcpTableFamily, AttributionError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ProcfsTcpTableFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcfsTcpTablePolicy {
+    Required,
+    OptionalBestEffort,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcfsTcpTable {
+    family: ProcfsTcpTableFamily,
+    path: PathBuf,
+    policy: ProcfsTcpTablePolicy,
 }
 
 #[derive(Debug)]
@@ -178,6 +229,14 @@ impl ProcfsSocketAttributor {
         snapshot: &ProcfsSocketSnapshot,
     ) -> Result<Option<SocketProcessContext>, AttributionError> {
         let Some(inode) = snapshot.tcp_inodes.get(&connection).copied() else {
+            if connection_uses_family(connection, ProcfsTcpTableFamily::Ipv6)
+                && let Some(error) = snapshot
+                    .optional_table_errors
+                    .get(&ProcfsTcpTableFamily::Ipv6)
+                    .cloned()
+            {
+                return Err(error);
+            }
             return Ok(None);
         };
         let Some(pid) = snapshot.inode_pids.get(&inode).copied() else {
@@ -207,7 +266,7 @@ impl ProcfsSocketAttributor {
         match self.probe() {
             Ok(()) => vec![CapabilityState::degraded(
                 CapabilityKind::ProcfsSocketAttribution,
-                "procfs socket attribution can read /proc/net/tcp and proc root, but fd races, hidepid, namespace boundaries, and PID reuse remain possible",
+                "procfs socket attribution can read /proc/net/tcp and proc root, and opportunistically reads /proc/net/tcp6 when available; fd races, hidepid, namespace boundaries, and PID reuse remain possible",
             )],
             Err(error) => vec![CapabilityState::unavailable(
                 CapabilityKind::ProcfsSocketAttribution,
@@ -217,8 +276,13 @@ impl ProcfsSocketAttributor {
     }
 
     pub fn probe(&self) -> Result<(), AttributionError> {
-        let tcp_path = self.process_attributor.proc_root.join("net/tcp");
-        read_to_string(&tcp_path)?;
+        for table in procfs_tcp_tables(&self.process_attributor.proc_root) {
+            if let Err(error) = read_tcp_table_to_string(&table)
+                && table.policy == ProcfsTcpTablePolicy::Required
+            {
+                return Err(error);
+            }
+        }
         fs::read_dir(&self.process_attributor.proc_root).map_err(|source| {
             AttributionError::Read {
                 path: self.process_attributor.proc_root.display().to_string(),
@@ -229,10 +293,30 @@ impl ProcfsSocketAttributor {
     }
 
     fn snapshot(&self) -> Result<ProcfsSocketSnapshot, AttributionError> {
-        let path = self.process_attributor.proc_root.join("net/tcp");
+        let mut tcp_inodes = HashMap::new();
+        let mut optional_table_errors = HashMap::new();
+        for table in procfs_tcp_tables(&self.process_attributor.proc_root) {
+            let content = match read_tcp_table_to_string(&table) {
+                Ok(Some(content)) => content,
+                Ok(None) => continue,
+                Err(error) if table.policy == ProcfsTcpTablePolicy::OptionalBestEffort => {
+                    optional_table_errors.insert(table.family, error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match tcp_inode_map_from_table(&table, &content) {
+                Ok(inodes) => tcp_inodes.extend(inodes),
+                Err(error) if table.policy == ProcfsTcpTablePolicy::OptionalBestEffort => {
+                    optional_table_errors.insert(table.family, error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(ProcfsSocketSnapshot {
-            tcp_inodes: tcp_inode_map_from_table(&path, &read_to_string(&path)?)?,
+            tcp_inodes,
             inode_pids: inode_pid_map(&self.process_attributor.proc_root)?,
+            optional_table_errors,
         })
     }
 }
@@ -445,8 +529,35 @@ fn is_hex_id(value: &str, len: usize) -> bool {
     value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn procfs_tcp_tables(proc_root: &Path) -> [ProcfsTcpTable; 2] {
+    [
+        ProcfsTcpTable {
+            family: ProcfsTcpTableFamily::Ipv4,
+            path: proc_root.join("net/tcp"),
+            policy: ProcfsTcpTablePolicy::Required,
+        },
+        ProcfsTcpTable {
+            family: ProcfsTcpTableFamily::Ipv6,
+            path: proc_root.join("net/tcp6"),
+            policy: ProcfsTcpTablePolicy::OptionalBestEffort,
+        },
+    ]
+}
+
+fn connection_uses_family(connection: TcpConnection, family: ProcfsTcpTableFamily) -> bool {
+    endpoint_uses_family(connection.local, family)
+        || endpoint_uses_family(connection.remote, family)
+}
+
+fn endpoint_uses_family(endpoint: TcpEndpoint, family: ProcfsTcpTableFamily) -> bool {
+    matches!(
+        (endpoint.address, family),
+        (IpAddr::V4(_), ProcfsTcpTableFamily::Ipv4) | (IpAddr::V6(_), ProcfsTcpTableFamily::Ipv6)
+    )
+}
+
 fn tcp_inode_map_from_table(
-    path: &Path,
+    table: &ProcfsTcpTable,
     content: &str,
 ) -> Result<HashMap<TcpConnection, u64>, AttributionError> {
     let mut inodes = HashMap::new();
@@ -455,12 +566,12 @@ fn tcp_inode_map_from_table(
         if fields.len() <= 9 {
             continue;
         }
-        let local = parse_tcp_endpoint(path, fields[1])?;
-        let remote = parse_tcp_endpoint(path, fields[2])?;
+        let local = parse_tcp_endpoint(table, fields[1])?;
+        let remote = parse_tcp_endpoint(table, fields[2])?;
         let inode = fields[9]
             .parse::<u64>()
             .map_err(|source| AttributionError::InvalidNetTcp {
-                path: path.display().to_string(),
+                path: table.path.display().to_string(),
                 reason: format!("invalid socket inode: {source}"),
             })?;
         inodes.insert(TcpConnection::new(local, remote), inode);
@@ -468,13 +579,35 @@ fn tcp_inode_map_from_table(
     Ok(inodes)
 }
 
-fn parse_tcp_endpoint(path: &Path, value: &str) -> Result<TcpEndpoint, AttributionError> {
+fn parse_tcp_endpoint(
+    table: &ProcfsTcpTable,
+    value: &str,
+) -> Result<TcpEndpoint, AttributionError> {
     let (address, port) = value
         .split_once(':')
         .ok_or_else(|| AttributionError::InvalidNetTcp {
-            path: path.display().to_string(),
+            path: table.path.display().to_string(),
             reason: format!("invalid endpoint {value:?}"),
         })?;
+    let address = parse_proc_net_tcp_address(table, address)?;
+    let port = u16::from_str_radix(port, 16).map_err(|source| AttributionError::InvalidNetTcp {
+        path: table.path.display().to_string(),
+        reason: format!("invalid TCP endpoint port: {source}"),
+    })?;
+    Ok(TcpEndpoint::new(address, port))
+}
+
+fn parse_proc_net_tcp_address(
+    table: &ProcfsTcpTable,
+    address: &str,
+) -> Result<IpAddr, AttributionError> {
+    match table.family {
+        ProcfsTcpTableFamily::Ipv4 => parse_proc_net_tcp4_address(&table.path, address),
+        ProcfsTcpTableFamily::Ipv6 => parse_proc_net_tcp6_address(&table.path, address),
+    }
+}
+
+fn parse_proc_net_tcp4_address(path: &Path, address: &str) -> Result<IpAddr, AttributionError> {
     if address.len() != 8 {
         return Err(AttributionError::InvalidNetTcp {
             path: path.display().to_string(),
@@ -486,14 +619,36 @@ fn parse_tcp_endpoint(path: &Path, value: &str) -> Result<TcpEndpoint, Attributi
             path: path.display().to_string(),
             reason: format!("invalid IPv4 endpoint address: {source}"),
         })?;
-    let port = u16::from_str_radix(port, 16).map_err(|source| AttributionError::InvalidNetTcp {
-        path: path.display().to_string(),
-        reason: format!("invalid TCP endpoint port: {source}"),
-    })?;
-    Ok(TcpEndpoint::new(
-        IpAddr::V4(Ipv4Addr::from(raw_address.to_le_bytes())),
-        port,
-    ))
+    Ok(IpAddr::V4(Ipv4Addr::from(raw_address.to_le_bytes())))
+}
+
+fn parse_proc_net_tcp6_address(path: &Path, address: &str) -> Result<IpAddr, AttributionError> {
+    if address.len() != 32 {
+        return Err(AttributionError::InvalidNetTcp {
+            path: path.display().to_string(),
+            reason: format!("invalid IPv6 endpoint address {address:?}"),
+        });
+    }
+    let mut bytes = [0u8; 16];
+    for (index, chunk) in address.as_bytes().chunks_exact(8).enumerate() {
+        let chunk =
+            std::str::from_utf8(chunk).map_err(|source| AttributionError::InvalidNetTcp {
+                path: path.display().to_string(),
+                reason: format!("invalid IPv6 endpoint address: {source}"),
+            })?;
+        let word =
+            u32::from_str_radix(chunk, 16).map_err(|source| AttributionError::InvalidNetTcp {
+                path: path.display().to_string(),
+                reason: format!("invalid IPv6 endpoint address: {source}"),
+            })?;
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    if bytes[..10].iter().all(|byte| *byte == 0) && bytes[10] == 0xff && bytes[11] == 0xff {
+        return Ok(IpAddr::V4(Ipv4Addr::new(
+            bytes[12], bytes[13], bytes[14], bytes[15],
+        )));
+    }
+    Ok(IpAddr::V6(Ipv6Addr::from(bytes)))
 }
 
 fn inode_pid_map(proc_root: &Path) -> Result<HashMap<u64, u32>, AttributionError> {
@@ -598,6 +753,22 @@ fn read_to_string(path: &Path) -> Result<String, AttributionError> {
     })
 }
 
+fn read_tcp_table_to_string(table: &ProcfsTcpTable) -> Result<Option<String>, AttributionError> {
+    match fs::read_to_string(&table.path) {
+        Ok(content) => Ok(Some(content)),
+        Err(source) if table.policy == ProcfsTcpTablePolicy::OptionalBestEffort => {
+            Err(AttributionError::Read {
+                path: table.path.display().to_string(),
+                source,
+            })
+        }
+        Err(source) => Err(AttributionError::Read {
+            path: table.path.display().to_string(),
+            source,
+        }),
+    }
+}
+
 fn read_optional_to_string(path: &Path) -> Result<Option<String>, AttributionError> {
     match fs::read_to_string(path) {
         Ok(content) => Ok(Some(content)),
@@ -626,253 +797,4 @@ fn read_link_to_string(path: &Path) -> Result<String, AttributionError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        fs,
-        net::Ipv4Addr,
-        os::unix::fs::{PermissionsExt, symlink},
-        time::Duration,
-    };
-
-    use tempfile::tempdir;
-
-    use super::*;
-
-    #[test]
-    fn procfs_attributor_builds_stable_process_context() -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempdir()?;
-        let proc_root = temp.path().join("proc");
-        let pid_dir = proc_root.join("123");
-        let boot_id_path = proc_root.join("sys/kernel/random/boot_id");
-        fs::create_dir_all(&pid_dir)?;
-        fs::create_dir_all(boot_id_path.parent().expect("boot id parent"))?;
-        fs::write(&boot_id_path, "boot-1\n")?;
-        fs::write(
-            pid_dir.join("stat"),
-            "123 (demo worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 21\n",
-        )?;
-        fs::write(
-            pid_dir.join("status"),
-            "Name:\tdemo\nTgid:\t120\nUid:\t1000\t1000\t1000\t1000\nGid:\t1001\t1001\t1001\t1001\n",
-        )?;
-        fs::write(pid_dir.join("cmdline"), b"/usr/bin/demo\0--serve\0")?;
-        fs::write(
-            pid_dir.join("cgroup"),
-            "0::/system.slice/demo.service/docker-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope\n",
-        )?;
-        symlink("/usr/bin/demo", pid_dir.join("exe"))?;
-
-        let attributor = ProcfsAttributor::with_paths(proc_root, boot_id_path);
-        let process = attributor.identify(123)?;
-
-        assert_eq!(process.name, "demo worker");
-        assert_eq!(process.cmdline, vec!["/usr/bin/demo", "--serve"]);
-        assert_eq!(process.identity.pid, 123);
-        assert_eq!(process.identity.tgid, 120);
-        assert_eq!(process.identity.start_time_ticks, 4242);
-        assert_eq!(process.identity.boot_id, "boot-1");
-        assert_eq!(process.identity.exe_path, "/usr/bin/demo");
-        assert_eq!(process.identity.uid, 1000);
-        assert_eq!(process.identity.gid, 1001);
-        assert_eq!(
-            process.identity.systemd_service.as_deref(),
-            Some("demo.service")
-        );
-        assert_eq!(process.identity.runtime_hint.as_deref(), Some("docker"));
-        assert_eq!(
-            process.identity.container_id.as_deref(),
-            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn parse_stat_handles_comm_with_parenthesis() -> Result<(), Box<dyn std::error::Error>> {
-        let stat = parse_stat(
-            7,
-            "7 (worker) odd) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 99 21",
-        )?;
-
-        assert_eq!(stat.comm, "worker) odd");
-        assert_eq!(stat.start_time_ticks, 99);
-        Ok(())
-    }
-
-    #[test]
-    fn procfs_socket_attributor_maps_tcp_connection_to_process()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempdir()?;
-        let proc_root = temp.path().join("proc");
-        let pid_dir = proc_root.join("321");
-        let fd_dir = pid_dir.join("fd");
-        let net_dir = proc_root.join("net");
-        let boot_id_path = proc_root.join("sys/kernel/random/boot_id");
-        fs::create_dir_all(&fd_dir)?;
-        fs::create_dir_all(&net_dir)?;
-        fs::create_dir_all(boot_id_path.parent().expect("boot id parent"))?;
-        fs::write(&boot_id_path, "boot-2\n")?;
-        fs::write(
-            pid_dir.join("stat"),
-            "321 (server) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 9000 21\n",
-        )?;
-        fs::write(
-            pid_dir.join("status"),
-            "Name:\tserver\nTgid:\t321\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n",
-        )?;
-        fs::write(pid_dir.join("cmdline"), b"/usr/bin/server\0")?;
-        fs::write(pid_dir.join("cgroup"), "0::/system.slice/server.service\n")?;
-        symlink("/usr/bin/server", pid_dir.join("exe"))?;
-        symlink("socket:[424242]", fd_dir.join("7"))?;
-        fs::write(
-            net_dir.join("tcp"),
-            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1F90 0200007F:C350 01 00000000:00000000 00:00000000 00000000 1000 0 424242 1 0000000000000000 100 0 0 10 0\n",
-        )?;
-
-        let mut resolver = ProcfsSocketResolver::with_paths(proc_root, boot_id_path);
-        let process = resolver
-            .resolve_tcp_connection(TcpConnection::new(
-                TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8080),
-                TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000),
-            ))?
-            .expect("expected socket process");
-
-        assert_eq!(process.process.identity.pid, 321);
-        assert_eq!(process.process.name, "server");
-        assert_eq!(process.socket_inode, 424242);
-        assert_eq!(process.confidence, 60);
-        Ok(())
-    }
-
-    #[test]
-    fn procfs_socket_resolver_preserves_process_identity_errors()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempdir()?;
-        let proc_root = temp.path().join("proc");
-        let pid_dir = proc_root.join("321");
-        let fd_dir = pid_dir.join("fd");
-        let net_dir = proc_root.join("net");
-        let boot_id_path = proc_root.join("sys/kernel/random/boot_id");
-        fs::create_dir_all(&fd_dir)?;
-        fs::create_dir_all(&net_dir)?;
-        fs::create_dir_all(boot_id_path.parent().expect("boot id parent"))?;
-        fs::write(&boot_id_path, "boot-2\n")?;
-        fs::write(
-            pid_dir.join("stat"),
-            "321 (server) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 9000 21\n",
-        )?;
-        fs::write(
-            pid_dir.join("status"),
-            "Name:\tserver\nTgid:\t321\nUid:\tnot-a-uid\nGid:\t1000\t1000\t1000\t1000\n",
-        )?;
-        symlink("socket:[424242]", fd_dir.join("7"))?;
-        fs::write(
-            net_dir.join("tcp"),
-            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1F90 0200007F:C350 01 00000000:00000000 00:00000000 00000000 1000 0 424242 1 0000000000000000 100 0 0 10 0\n",
-        )?;
-
-        let mut resolver = ProcfsSocketResolver::with_paths(proc_root, boot_id_path);
-        let error = resolver
-            .resolve_tcp_connection(TcpConnection::new(
-                TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8080),
-                TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000),
-            ))
-            .expect_err("invalid process status must be observable");
-
-        assert!(matches!(
-            error,
-            AttributionError::InvalidStatus { pid: 321, .. }
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn procfs_socket_scan_treats_permission_denied_as_best_effort_skip() {
-        let permission_denied = io::Error::from(io::ErrorKind::PermissionDenied);
-
-        assert!(is_skippable_socket_scan_error(&permission_denied));
-    }
-
-    #[test]
-    fn procfs_socket_scan_skips_unreadable_pid_fd_dir() -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempdir()?;
-        let fd_dir = temp.path().join("fd");
-        fs::create_dir(&fd_dir)?;
-        fs::set_permissions(&fd_dir, fs::Permissions::from_mode(0o000))?;
-        let mut inodes = HashMap::new();
-
-        let result = read_pid_socket_inodes(&fd_dir, 321, &mut inodes);
-
-        fs::set_permissions(&fd_dir, fs::Permissions::from_mode(0o700))?;
-        result?;
-        assert!(inodes.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn procfs_socket_resolver_reuses_snapshot_within_cache_ttl_until_invalidated()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempdir()?;
-        let proc_root = temp.path().join("proc");
-        let pid_dir = proc_root.join("321");
-        let fd_dir = pid_dir.join("fd");
-        let net_dir = proc_root.join("net");
-        let tcp_path = net_dir.join("tcp");
-        let boot_id_path = proc_root.join("sys/kernel/random/boot_id");
-        fs::create_dir_all(&fd_dir)?;
-        fs::create_dir_all(&net_dir)?;
-        fs::create_dir_all(boot_id_path.parent().expect("boot id parent"))?;
-        fs::write(&boot_id_path, "boot-2\n")?;
-        fs::write(
-            pid_dir.join("stat"),
-            "321 (server) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 9000 21\n",
-        )?;
-        fs::write(
-            pid_dir.join("status"),
-            "Name:\tserver\nTgid:\t321\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n",
-        )?;
-        fs::write(pid_dir.join("cmdline"), b"/usr/bin/server\0")?;
-        fs::write(pid_dir.join("cgroup"), "0::/system.slice/server.service\n")?;
-        symlink("/usr/bin/server", pid_dir.join("exe"))?;
-        symlink("socket:[424242]", fd_dir.join("7"))?;
-        fs::write(
-            &tcp_path,
-            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1F90 0200007F:C350 01 00000000:00000000 00:00000000 00000000 1000 0 424242 1 0000000000000000 100 0 0 10 0\n",
-        )?;
-        let connection = TcpConnection::new(
-            TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8080),
-            TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000),
-        );
-        let mut resolver = ProcfsSocketResolver::with_paths(proc_root, boot_id_path)
-            .with_cache_ttl(Duration::from_secs(60));
-
-        let first = resolver
-            .resolve_tcp_connection(connection)?
-            .expect("expected first socket process");
-        fs::write(
-            &tcp_path,
-            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1F90 0200007F:C350 01 00000000:00000000 00:00000000 00000000 1000 0 999999 1 0000000000000000 100 0 0 10 0\n",
-        )?;
-        let second = resolver
-            .resolve_tcp_connection(connection)?
-            .expect("expected cached socket process");
-        resolver.invalidate_snapshot();
-        let refreshed = resolver.resolve_tcp_connection(connection)?;
-
-        assert_eq!(first.socket_inode, 424242);
-        assert_eq!(second.socket_inode, 424242);
-        assert!(refreshed.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn tcp_table_endpoint_parser_uses_procfs_little_endian_ipv4()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let endpoint = parse_tcp_endpoint(Path::new("/proc/net/tcp"), "0100007F:1F90")?;
-
-        assert_eq!(
-            endpoint,
-            TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8080)
-        );
-        Ok(())
-    }
-}
+mod tests;
