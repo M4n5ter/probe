@@ -199,6 +199,16 @@ impl SingleEventBatchSpool {
             cursors: Mutex::new(BTreeMap::new()),
         })
     }
+
+    pub(super) fn with_export_payload(payload: SpoolPayload) -> Self {
+        Self {
+            events: Mutex::new(vec![StoredEvent {
+                sequence: 1,
+                payload,
+            }]),
+            cursors: Mutex::new(BTreeMap::new()),
+        }
+    }
 }
 
 impl DurableSpool for SingleEventBatchSpool {

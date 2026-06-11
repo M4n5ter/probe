@@ -1,12 +1,11 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use probe_config::{TlsMaterialKind, TlsPlaintextProvider};
 use probe_core::{CapabilityKind, RuntimeMode};
 use runtime::RuntimePlan;
 use serde::Serialize;
+
+use crate::tls_material::check_tls_material_source;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TlsStatusSnapshot {
@@ -111,7 +110,7 @@ fn material_purpose(kind: TlsMaterialKind) -> TlsMaterialPurpose {
     }
 }
 
-fn material_source_status(path: &Path) -> TlsMaterialSourceStatusSnapshot {
+pub(super) fn material_source_status(path: &Path) -> TlsMaterialSourceStatusSnapshot {
     let (mode, reason) = inspect_material_source(path);
 
     TlsMaterialSourceStatusSnapshot {
@@ -122,23 +121,8 @@ fn material_source_status(path: &Path) -> TlsMaterialSourceStatusSnapshot {
 }
 
 fn inspect_material_source(path: &Path) -> (RuntimeMode, Option<String>) {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => (RuntimeMode::Available, None),
-        Ok(metadata) if metadata.is_dir() => (
-            RuntimeMode::Unavailable,
-            Some("TLS material path is a directory".to_string()),
-        ),
-        Ok(_) => (
-            RuntimeMode::Unavailable,
-            Some("TLS material path is not a regular file".to_string()),
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
-            RuntimeMode::Unavailable,
-            Some("TLS material path does not exist".to_string()),
-        ),
-        Err(error) => (
-            RuntimeMode::Unavailable,
-            Some(format!("failed to inspect TLS material: {error}")),
-        ),
+    match check_tls_material_source(path) {
+        Ok(()) => (RuntimeMode::Available, None),
+        Err(error) => (RuntimeMode::Unavailable, Some(error.to_string())),
     }
 }

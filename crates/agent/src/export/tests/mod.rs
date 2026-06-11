@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -9,10 +10,11 @@ use probe_config::{
     AgentConfig, CompressionCodecName, ExportWorkerScheduleConfig, ExporterConfig,
     ExporterTransport,
 };
-use runtime::{ExportPlan, ExportSinkPlan, ExportWorkerPlan};
-use storage::FjallSpool;
+use runtime::{ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportWorkerPlan};
+use storage::{FjallSpool, SpoolPayload};
 
 use super::*;
+use crate::tls_material::MAX_TLS_MATERIAL_BYTES;
 
 mod support;
 use support::*;
@@ -43,6 +45,180 @@ fn export_worker_backoff_counts_from_failure_completion() {
     assert!(!backoff.should_skip("slow", failure_completed_at + Duration::from_millis(1_000)));
 }
 
+#[test]
+fn webhook_tls_config_loads_export_materials() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = test_dir("webhook-tls-config");
+    fs::create_dir_all(&temp)?;
+    let trust_anchor = temp.join("ca.pem");
+    let client_certificate = temp.join("client.pem");
+    let client_private_key = temp.join("client.key");
+    fs::write(&trust_anchor, b"ca-pem")?;
+    fs::write(&client_certificate, b"cert-pem")?;
+    fs::write(&client_private_key, b"key-pem")?;
+    let plan = ExportSinkTlsPlan {
+        trust_anchors: vec![trust_anchor],
+        client_certificates: vec![client_certificate],
+        client_private_key: Some(client_private_key),
+    };
+
+    let tls = webhook_tls_config_from_plan(&plan)?;
+
+    assert_eq!(tls.trust_anchor_pems, vec![b"ca-pem".to_vec()]);
+    assert_eq!(tls.identity_pem.as_deref(), Some(&b"cert-pem\nkey-pem"[..]));
+    fs::remove_dir_all(temp)?;
+    Ok(())
+}
+
+#[test]
+fn export_worker_config_does_not_read_tls_materials_without_webhook_sinks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tls = ExportSinkTlsPlan {
+        trust_anchors: vec![PathBuf::from("/missing/ca.pem")],
+        client_certificates: vec![PathBuf::from("/missing/client.pem")],
+        client_private_key: Some(PathBuf::from("/missing/client.key")),
+    };
+    let disabled = ExportPlan {
+        worker: ExportWorkerPlan::Disabled {
+            reason: "test".to_string(),
+        },
+        sinks: Vec::new(),
+    };
+    assert!(ExportWorkerConfig::from_export_plan("agent-1".to_string(), &disabled).is_none());
+    let non_webhook = ExportPlan {
+        worker: ExportWorkerPlan::FixedIntervalBounded {
+            interval_ms: 10,
+            batches_per_sink_per_tick: 1,
+            sink_timeout_ms: 5_000,
+            failure_backoff_ms: 30_000,
+        },
+        sinks: vec![ExportSinkPlan {
+            id: "grpc".to_string(),
+            transport: ExporterTransport::Grpc,
+            endpoint: "https://collector.example".to_string(),
+            codec: CompressionCodecName::None,
+            headers: BTreeMap::new(),
+            tls,
+        }],
+    };
+
+    assert!(ExportWorkerConfig::from_export_plan("agent-1".to_string(), &non_webhook).is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn planned_drain_does_not_read_tls_materials_without_sinks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let spool = SingleEventBatchSpool::with_export_events(0)?;
+    let plan = ExportPlan {
+        worker: ExportWorkerPlan::Disabled {
+            reason: "test".to_string(),
+        },
+        sinks: Vec::new(),
+    };
+
+    drain_planned_sinks(&spool, "agent-1", &plan).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn planned_webhook_drain_fails_when_tls_material_is_missing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let spool = SingleEventBatchSpool::with_export_events(1)?;
+    let plan = ExportPlan {
+        worker: ExportWorkerPlan::Disabled {
+            reason: "test".to_string(),
+        },
+        sinks: vec![ExportSinkPlan {
+            id: "secure".to_string(),
+            transport: ExporterTransport::Webhook,
+            endpoint: "https://collector.example/batches".to_string(),
+            codec: CompressionCodecName::None,
+            headers: BTreeMap::new(),
+            tls: ExportSinkTlsPlan {
+                trust_anchors: vec![PathBuf::from("/missing/collector-ca.pem")],
+                ..Default::default()
+            },
+        }],
+    };
+
+    let error = drain_planned_sinks(&spool, "agent-1", &plan)
+        .await
+        .expect_err("missing TLS material must fail the planned webhook drain");
+
+    assert!(error.to_string().contains("TLS material"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn planned_webhook_drain_skips_tls_materials_without_pending_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let spool = SingleEventBatchSpool::with_export_events(0)?;
+    let plan = ExportPlan {
+        worker: ExportWorkerPlan::Disabled {
+            reason: "test".to_string(),
+        },
+        sinks: vec![ExportSinkPlan {
+            id: "secure".to_string(),
+            transport: ExporterTransport::Webhook,
+            endpoint: "https://collector.example/batches".to_string(),
+            codec: CompressionCodecName::None,
+            headers: BTreeMap::new(),
+            tls: ExportSinkTlsPlan {
+                trust_anchors: vec![PathBuf::from("/missing/collector-ca.pem")],
+                ..Default::default()
+            },
+        }],
+    };
+
+    drain_planned_sinks(&spool, "agent-1", &plan).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn planned_webhook_drain_rejects_unsafe_tls_material_sources()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = test_dir("unsafe-tls-materials");
+    fs::create_dir_all(&temp)?;
+    let oversized = temp.join("oversized-ca.pem");
+    fs::File::create(&oversized)?.set_len(MAX_TLS_MATERIAL_BYTES + 1)?;
+    let oversized_error = drain_planned_sinks(
+        &SingleEventBatchSpool::with_export_events(1)?,
+        "agent-1",
+        &export_plan_with_trust_anchor(oversized),
+    )
+    .await
+    .expect_err("oversized TLS material must fail before unbounded read");
+    assert!(oversized_error.to_string().contains("too large"));
+
+    let directory_error = drain_planned_sinks(
+        &SingleEventBatchSpool::with_export_events(1)?,
+        "agent-1",
+        &export_plan_with_trust_anchor(temp.clone()),
+    )
+    .await
+    .expect_err("directory TLS material must be rejected");
+    assert!(directory_error.to_string().contains("directory"));
+    fs::remove_dir_all(temp)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn planned_webhook_drain_validates_batch_before_reading_tls_materials()
+-> Result<(), Box<dyn std::error::Error>> {
+    let spool =
+        SingleEventBatchSpool::with_export_payload(SpoolPayload::new("bad.schema", b"bad payload"));
+    let plan = export_plan_with_trust_anchor(PathBuf::from("/missing/collector-ca.pem"));
+
+    let error = drain_planned_sinks(&spool, "agent-1", &plan)
+        .await
+        .expect_err("bad local batch must fail before TLS material is read");
+    let rendered = error.to_string();
+
+    assert!(rendered.contains("unsupported spooled payload schema"));
+    assert!(!rendered.contains("TLS material"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn planned_export_sinks_use_independent_cursors_and_attempt_all()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -60,6 +236,7 @@ async fn planned_export_sinks_use_independent_cursors_and_attempt_all()
                 endpoint: failing.endpoint(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
+                tls: Default::default(),
             },
             ExporterConfig {
                 id: "successful".to_string(),
@@ -67,6 +244,7 @@ async fn planned_export_sinks_use_independent_cursors_and_attempt_all()
                 endpoint: successful.endpoint(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::from([("x-probe-node".to_string(), "node-a".to_string())]),
+                tls: Default::default(),
             },
         ],
         ..AgentConfig::default()
@@ -115,6 +293,7 @@ async fn export_worker_drains_until_stopped() -> Result<(), Box<dyn std::error::
             endpoint: server.endpoint(),
             codec: CompressionCodecName::None,
             headers: BTreeMap::new(),
+            tls: Default::default(),
         }],
         ..AgentConfig::default()
     };
@@ -171,6 +350,7 @@ async fn export_worker_uses_configured_per_tick_batch_budget()
             endpoint: server.endpoint(),
             codec: CompressionCodecName::None,
             headers: BTreeMap::new(),
+            tls: ExportSinkTlsPlan::default(),
         }],
     };
     let config = ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
@@ -213,6 +393,7 @@ async fn export_worker_backs_off_failing_sink_without_blocking_healthy_sink()
                 endpoint: failing.endpoint(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
+                tls: ExportSinkTlsPlan::default(),
             },
             ExportSinkPlan {
                 id: "successful".to_string(),
@@ -220,6 +401,7 @@ async fn export_worker_backs_off_failing_sink_without_blocking_healthy_sink()
                 endpoint: successful.endpoint(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
+                tls: ExportSinkTlsPlan::default(),
             },
         ],
     };
@@ -239,4 +421,23 @@ async fn export_worker_backs_off_failing_sink_without_blocking_healthy_sink()
         Some("agent-1:failing:1")
     );
     Ok(())
+}
+
+fn export_plan_with_trust_anchor(path: PathBuf) -> ExportPlan {
+    ExportPlan {
+        worker: ExportWorkerPlan::Disabled {
+            reason: "test".to_string(),
+        },
+        sinks: vec![ExportSinkPlan {
+            id: "secure".to_string(),
+            transport: ExporterTransport::Webhook,
+            endpoint: "https://collector.example/batches".to_string(),
+            codec: CompressionCodecName::None,
+            headers: BTreeMap::new(),
+            tls: ExportSinkTlsPlan {
+                trust_anchors: vec![path],
+                ..Default::default()
+            },
+        }],
+    }
 }

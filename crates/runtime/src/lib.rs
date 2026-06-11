@@ -1,12 +1,14 @@
 use attribution::{ProcessAttributor, ProcfsAttributor, ProcfsSocketResolver};
 use probe_config::{
     AgentConfig, CaptureBackend, CaptureSelection, CompressionCodecName, ConfigError,
-    ConfigValidationError, ConfigViolation, ExportWorkerScheduleConfig, ExporterTransport,
-    LiveCaptureBackend, TlsPlaintextProvider,
+    ConfigValidationError, ConfigViolation, ExportWorkerScheduleConfig, ExporterTlsConfig,
+    ExporterTransport, LiveCaptureBackend, TlsMaterialConfig, TlsMaterialKind,
+    TlsPlaintextProvider,
 };
 use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -65,6 +67,7 @@ pub struct ExportPlan {
 
 impl ExportPlan {
     fn resolve(config: &AgentConfig) -> Self {
+        let materials_by_id = tls_materials_by_id(&config.tls.materials);
         let sinks = config
             .exporters
             .iter()
@@ -74,6 +77,7 @@ impl ExportPlan {
                 endpoint: exporter.endpoint.clone(),
                 codec: exporter.codec,
                 headers: exporter.headers.clone(),
+                tls: ExportSinkTlsPlan::from_config(&exporter.tls, &materials_by_id),
             })
             .collect::<Vec<_>>();
         let worker = match (config.export.worker.enabled, sinks.is_empty()) {
@@ -138,6 +142,56 @@ pub struct ExportSinkPlan {
     pub endpoint: String,
     pub codec: CompressionCodecName,
     pub headers: BTreeMap<String, String>,
+    pub tls: ExportSinkTlsPlan,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportSinkTlsPlan {
+    pub trust_anchors: Vec<PathBuf>,
+    pub client_certificates: Vec<PathBuf>,
+    pub client_private_key: Option<PathBuf>,
+}
+
+impl ExportSinkTlsPlan {
+    fn from_config(
+        config: &ExporterTlsConfig,
+        materials_by_id: &BTreeMap<&str, &TlsMaterialConfig>,
+    ) -> Self {
+        Self {
+            trust_anchors: config
+                .trust_anchor_refs
+                .iter()
+                .filter_map(|reference| materials_by_id.get(reference.as_str()))
+                .map(|material| material.path.clone())
+                .collect(),
+            client_certificates: config
+                .client_certificate_refs
+                .iter()
+                .filter_map(|reference| materials_by_id.get(reference.as_str()))
+                .map(|material| material.path.clone())
+                .collect(),
+            client_private_key: config
+                .client_private_key_ref
+                .as_deref()
+                .and_then(|reference| materials_by_id.get(reference))
+                .map(|material| material.path.clone()),
+        }
+    }
+}
+
+fn tls_materials_by_id(materials: &[TlsMaterialConfig]) -> BTreeMap<&str, &TlsMaterialConfig> {
+    materials
+        .iter()
+        .filter_map(|material| {
+            let id = material.id.as_deref()?;
+            match material.kind {
+                TlsMaterialKind::TrustAnchor
+                | TlsMaterialKind::ClientCertificate
+                | TlsMaterialKind::ClientPrivateKey => Some((id, material)),
+                TlsMaterialKind::KeyLogFile | TlsMaterialKind::SessionSecretFile => None,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

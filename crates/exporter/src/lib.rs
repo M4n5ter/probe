@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     io::{Cursor, Read, Write},
 };
 
@@ -37,6 +38,8 @@ pub enum ExportError {
     },
     #[error("HTTP header {name} is reserved by the webhook protocol")]
     ReservedHeaderName { name: String },
+    #[error("TLS trust anchor PEM bundle contained no certificates")]
+    EmptyTrustAnchorBundle,
     #[error("ack response rejected batch {batch_id}: {reason}")]
     Rejected { batch_id: String, reason: String },
     #[error("ack response batch mismatch: expected {expected}, got {actual}")]
@@ -172,13 +175,65 @@ impl WebhookExporter {
         codec: CompressionCodec,
         headers: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, ExportError> {
+        Self::with_tls_config(endpoint, codec, headers, WebhookTlsConfig::default())
+    }
+
+    pub fn with_tls_config(
+        endpoint: impl Into<String>,
+        codec: CompressionCodec,
+        headers: impl IntoIterator<Item = (String, String)>,
+        tls: WebhookTlsConfig,
+    ) -> Result<Self, ExportError> {
+        let client = webhook_client(tls)?;
         Ok(Self {
-            client: reqwest::Client::new(),
+            client,
             endpoint: endpoint.into(),
             codec,
             headers: parse_headers(headers)?,
         })
     }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct WebhookTlsConfig {
+    pub trust_anchor_pems: Vec<Vec<u8>>,
+    pub identity_pem: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for WebhookTlsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebhookTlsConfig")
+            .field("trust_anchor_count", &self.trust_anchor_pems.len())
+            .field(
+                "identity_pem",
+                &self.identity_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+fn webhook_client(tls: WebhookTlsConfig) -> Result<reqwest::Client, ExportError> {
+    let WebhookTlsConfig {
+        trust_anchor_pems,
+        identity_pem,
+    } = tls;
+    let mut builder = reqwest::Client::builder();
+    let mut trust_anchors = Vec::new();
+    for pem in trust_anchor_pems {
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem)?;
+        if certificates.is_empty() {
+            return Err(ExportError::EmptyTrustAnchorBundle);
+        }
+        trust_anchors.extend(certificates);
+    }
+    if !trust_anchors.is_empty() {
+        builder = builder.tls_certs_merge(trust_anchors);
+    }
+    if let Some(identity_pem) = identity_pem {
+        builder = builder.identity(reqwest::Identity::from_pem(&identity_pem)?);
+    }
+    builder.build().map_err(ExportError::Http)
 }
 
 #[async_trait]
@@ -343,7 +398,7 @@ impl WebhookAck {
 mod tests {
     use proto::{BatchEnvelope, EventRecord, PayloadFormat};
 
-    use crate::{CompressionCodec, ExportError, WebhookAck, WebhookExporter};
+    use crate::{CompressionCodec, ExportError, WebhookAck, WebhookExporter, WebhookTlsConfig};
 
     #[test]
     fn codecs_roundtrip_payload() -> Result<(), Box<dyn std::error::Error>> {
@@ -384,6 +439,36 @@ mod tests {
             result,
             Err(ExportError::ReservedHeaderName { name }) if name == "x-sssa-codec"
         ));
+    }
+
+    #[test]
+    fn webhook_exporter_rejects_empty_trust_anchor_bundle() {
+        let result = WebhookExporter::with_tls_config(
+            "https://collector.example/batches",
+            CompressionCodec::Zstd,
+            [],
+            WebhookTlsConfig {
+                trust_anchor_pems: vec![b"not a certificate".to_vec()],
+                identity_pem: None,
+            },
+        );
+
+        assert!(matches!(result, Err(ExportError::EmptyTrustAnchorBundle)));
+    }
+
+    #[test]
+    fn webhook_tls_config_debug_redacts_identity_material() {
+        let config = WebhookTlsConfig {
+            trust_anchor_pems: vec![b"ca-secret".to_vec()],
+            identity_pem: Some(b"client-secret".to_vec()),
+        };
+
+        let rendered = format!("{config:?}");
+
+        assert!(rendered.contains("trust_anchor_count"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("ca-secret"));
+        assert!(!rendered.contains("client-secret"));
     }
 
     #[test]

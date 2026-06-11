@@ -64,7 +64,7 @@ impl AgentConfig {
         validate_capture(&self.capture, &mut violations);
         validate_tls(&self.tls, &self.capture, &mut violations);
         validate_export_runtime(&self.export, &mut violations);
-        validate_exporters(&self.exporters, &mut violations);
+        validate_exporters(&self.exporters, &self.tls, &mut violations);
         validate_policies(&self.policies, &mut violations);
         validate_admin(&self.admin, &mut violations);
 
@@ -268,6 +268,7 @@ pub struct ExporterConfig {
     pub endpoint: String,
     pub codec: CompressionCodecName,
     pub headers: BTreeMap<String, String>,
+    pub tls: ExporterTlsConfig,
 }
 
 impl Default for ExporterConfig {
@@ -278,8 +279,17 @@ impl Default for ExporterConfig {
             endpoint: String::new(),
             codec: CompressionCodecName::Zstd,
             headers: BTreeMap::new(),
+            tls: ExporterTlsConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExporterTlsConfig {
+    pub trust_anchor_refs: Vec<String>,
+    pub client_certificate_refs: Vec<String>,
+    pub client_private_key_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,6 +363,7 @@ pub enum TlsPlaintextProvider {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsMaterialConfig {
+    pub id: Option<String>,
     pub kind: TlsMaterialKind,
     pub path: PathBuf,
 }
@@ -532,7 +543,21 @@ fn validate_tls(tls: &TlsConfig, capture: &CaptureConfig, violations: &mut Vec<C
 }
 
 fn validate_tls_materials(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
+    let mut ids = HashSet::new();
     for (index, material) in tls.materials.iter().enumerate() {
+        if let Some(id) = &material.id {
+            if id.trim().is_empty() {
+                violations.push(ConfigViolation {
+                    field: format!("tls.materials[{index}].id"),
+                    reason: "TLS material id cannot be empty when set".to_string(),
+                });
+            } else if !ids.insert(id.as_str()) {
+                violations.push(ConfigViolation {
+                    field: format!("tls.materials[{index}].id"),
+                    reason: "TLS material id must be unique".to_string(),
+                });
+            }
+        }
         if material.path.as_os_str().is_empty() {
             violations.push(ConfigViolation {
                 field: format!("tls.materials[{index}].path"),
@@ -595,7 +620,12 @@ fn validate_export_runtime(export: &ExportRuntimeConfig, violations: &mut Vec<Co
     }
 }
 
-fn validate_exporters(exporters: &[ExporterConfig], violations: &mut Vec<ConfigViolation>) {
+fn validate_exporters(
+    exporters: &[ExporterConfig],
+    tls: &TlsConfig,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    let tls_materials_by_id = tls_materials_by_id(tls);
     let mut ids = HashSet::new();
     for exporter in exporters {
         if exporter.id.trim().is_empty() {
@@ -656,6 +686,118 @@ fn validate_exporters(exporters: &[ExporterConfig], violations: &mut Vec<ConfigV
             }
             ExporterTransport::Grpc | ExporterTransport::Kafka | ExporterTransport::Otlp => {}
         }
+        validate_exporter_tls(exporter, &tls_materials_by_id, violations);
+    }
+}
+
+fn tls_materials_by_id(tls: &TlsConfig) -> BTreeMap<&str, TlsMaterialKind> {
+    tls.materials
+        .iter()
+        .filter_map(|material| material.id.as_deref().map(|id| (id, material.kind)))
+        .collect()
+}
+
+fn validate_exporter_tls(
+    exporter: &ExporterConfig,
+    materials_by_id: &BTreeMap<&str, TlsMaterialKind>,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if exporter_tls_configured(&exporter.tls) && !webhook_endpoint_is_https(exporter) {
+        violations.push(ConfigViolation {
+            field: format!("exporters.{}.tls", exporter.id),
+            reason: "exporter TLS material refs require an HTTPS webhook endpoint".to_string(),
+        });
+    }
+    for reference in &exporter.tls.trust_anchor_refs {
+        validate_tls_material_ref(
+            exporter,
+            "tls.trust_anchor_refs",
+            reference,
+            TlsMaterialKind::TrustAnchor,
+            materials_by_id,
+            violations,
+        );
+    }
+    for reference in &exporter.tls.client_certificate_refs {
+        validate_tls_material_ref(
+            exporter,
+            "tls.client_certificate_refs",
+            reference,
+            TlsMaterialKind::ClientCertificate,
+            materials_by_id,
+            violations,
+        );
+    }
+    if let Some(reference) = &exporter.tls.client_private_key_ref {
+        validate_tls_material_ref(
+            exporter,
+            "tls.client_private_key_ref",
+            reference,
+            TlsMaterialKind::ClientPrivateKey,
+            materials_by_id,
+            violations,
+        );
+    }
+    if !exporter.tls.client_certificate_refs.is_empty()
+        && exporter.tls.client_private_key_ref.is_none()
+    {
+        violations.push(ConfigViolation {
+            field: format!("exporters.{}.tls.client_private_key_ref", exporter.id),
+            reason: "client certificate refs require a client private key ref".to_string(),
+        });
+    }
+    if exporter.tls.client_certificate_refs.is_empty()
+        && exporter.tls.client_private_key_ref.is_some()
+    {
+        violations.push(ConfigViolation {
+            field: format!("exporters.{}.tls.client_certificate_refs", exporter.id),
+            reason: "client private key ref requires at least one client certificate ref"
+                .to_string(),
+        });
+    }
+}
+
+fn exporter_tls_configured(tls: &ExporterTlsConfig) -> bool {
+    !tls.trust_anchor_refs.is_empty()
+        || !tls.client_certificate_refs.is_empty()
+        || tls.client_private_key_ref.is_some()
+}
+
+fn webhook_endpoint_is_https(exporter: &ExporterConfig) -> bool {
+    exporter.transport == ExporterTransport::Webhook
+        && exporter
+            .endpoint
+            .to_ascii_lowercase()
+            .starts_with("https://")
+}
+
+fn validate_tls_material_ref(
+    exporter: &ExporterConfig,
+    field: &str,
+    reference: &str,
+    expected_kind: TlsMaterialKind,
+    materials_by_id: &BTreeMap<&str, TlsMaterialKind>,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if reference.trim().is_empty() {
+        violations.push(ConfigViolation {
+            field: format!("exporters.{}.{}", exporter.id, field),
+            reason: "TLS material reference cannot be empty".to_string(),
+        });
+        return;
+    }
+    match materials_by_id.get(reference).copied() {
+        Some(kind) if kind == expected_kind => {}
+        Some(kind) => violations.push(ConfigViolation {
+            field: format!("exporters.{}.{}", exporter.id, field),
+            reason: format!(
+                "TLS material ref {reference} has kind {kind:?}, expected {expected_kind:?}"
+            ),
+        }),
+        None => violations.push(ConfigViolation {
+            field: format!("exporters.{}.{}", exporter.id, field),
+            reason: format!("TLS material ref {reference} does not exist"),
+        }),
     }
 }
 

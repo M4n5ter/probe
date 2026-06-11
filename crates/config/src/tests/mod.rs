@@ -73,7 +73,11 @@ endpoint = "https://collector.example/batches"
 codec = "zstd"
 headers = { x_probe = "node-a" }
 
+[exporters.tls]
+trust_anchor_refs = ["collector-ca"]
+
 [[tls.materials]]
+id = "collector-ca"
 kind = "trust_anchor"
 path = "/etc/ssl/certs/ca.pem"
 
@@ -112,6 +116,11 @@ socket_path = "/run/sssa-probe/admin.sock"
         }
     );
     assert_eq!(config.exporters[0].codec, CompressionCodecName::Zstd);
+    assert_eq!(
+        config.exporters[0].tls.trust_anchor_refs,
+        vec!["collector-ca"]
+    );
+    assert_eq!(config.tls.materials[0].id.as_deref(), Some("collector-ca"));
     assert_eq!(config.tls.materials[0].kind, TlsMaterialKind::TrustAnchor);
     assert!(config.tls.plaintext.enabled);
     assert_eq!(config.capture.plaintext_feed.path, None);
@@ -300,6 +309,157 @@ path = ""
         error
             .to_string()
             .contains("TLS material path cannot be empty")
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_invalid_tls_material_registry_refs() -> Result<(), Box<dyn std::error::Error>>
+{
+    let duplicate_ids = AgentConfig::from_toml_str(
+        r#"
+[[tls.materials]]
+id = "collector-ca"
+kind = "trust_anchor"
+path = "/tmp/ca-1.pem"
+
+[[tls.materials]]
+id = "collector-ca"
+kind = "trust_anchor"
+path = "/tmp/ca-2.pem"
+"#,
+    )?;
+    let duplicate_error = duplicate_ids
+        .validate_basic()
+        .expect_err("TLS material ids must be unique");
+    assert!(
+        duplicate_error
+            .to_string()
+            .contains("TLS material id must be unique")
+    );
+
+    let missing_ref = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/batches"
+
+[exporters.tls]
+trust_anchor_refs = ["missing-ca"]
+"#,
+    )?;
+    let missing_ref_error = missing_ref
+        .validate_basic()
+        .expect_err("exporter TLS refs must point at registered material ids");
+    assert!(
+        missing_ref_error
+            .to_string()
+            .contains("TLS material ref missing-ca does not exist")
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_incomplete_client_tls_identity() -> Result<(), Box<dyn std::error::Error>> {
+    let missing_key = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/batches"
+
+[exporters.tls]
+client_certificate_refs = ["client-cert"]
+
+[[tls.materials]]
+id = "client-cert"
+kind = "client_certificate"
+path = "/tmp/client.pem"
+"#,
+    )?;
+    let missing_key_error = missing_key
+        .validate_basic()
+        .expect_err("client certificate must require a private key");
+    assert!(
+        missing_key_error
+            .to_string()
+            .contains("client certificate refs require a client private key ref")
+    );
+
+    let missing_certificate = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/batches"
+
+[exporters.tls]
+client_private_key_ref = "client-key"
+
+[[tls.materials]]
+id = "client-key"
+kind = "client_private_key"
+path = "/tmp/client.key"
+"#,
+    )?;
+    let missing_certificate_error = missing_certificate
+        .validate_basic()
+        .expect_err("client private key must require a certificate");
+    assert!(
+        missing_certificate_error
+            .to_string()
+            .contains("client private key ref requires at least one client certificate ref")
+    );
+
+    let wrong_kind = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/batches"
+
+[exporters.tls]
+trust_anchor_refs = ["client-cert"]
+
+[[tls.materials]]
+id = "client-cert"
+kind = "client_certificate"
+path = "/tmp/client.pem"
+"#,
+    )?;
+    let wrong_kind_error = wrong_kind
+        .validate_basic()
+        .expect_err("trust anchor ref must point at a trust anchor material");
+    assert!(
+        wrong_kind_error
+            .to_string()
+            .contains("expected TrustAnchor")
+    );
+
+    let http_tls = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "http://collector.example/batches"
+
+[exporters.tls]
+trust_anchor_refs = ["collector-ca"]
+
+[[tls.materials]]
+id = "collector-ca"
+kind = "trust_anchor"
+path = "/tmp/ca.pem"
+"#,
+    )?;
+    let http_tls_error = http_tls
+        .validate_basic()
+        .expect_err("TLS refs on plain HTTP webhook must be rejected");
+    assert!(
+        http_tls_error
+            .to_string()
+            .contains("exporter TLS material refs require an HTTPS webhook endpoint")
     );
     Ok(())
 }

@@ -11,6 +11,7 @@ mod configured_policy;
 mod export;
 mod plaintext_feed;
 mod status;
+mod tls_material;
 
 use admin::{AdminServerConfig, spawn_admin_server};
 use attribution::ProcfsSocketResolver;

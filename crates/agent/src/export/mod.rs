@@ -1,17 +1,20 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
-use exporter::{CompressionCodec, ReliableExporter, WebhookExporter};
+use exporter::{CompressionCodec, ReliableExporter, WebhookExporter, WebhookTlsConfig};
 use probe_config::{CompressionCodecName, ExporterTransport};
 use proto::{BatchEnvelope, EVENT_ENVELOPE_JSON_SCHEMA};
-use runtime::{ExportPlan, ExportSinkPlan, ExportWorkerPlan};
-use storage::DurableSpool;
+use runtime::{ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportWorkerPlan};
+use storage::{DurableSpool, StoredEvent};
 use thiserror::Error;
 use tokio::sync::Notify;
+
+use crate::tls_material::{TlsMaterialFileError, read_tls_material};
 
 const EXPORT_BATCH_LIMIT: usize = 1024;
 const EXPORT_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -33,6 +36,13 @@ pub enum ExportDrainError {
     UnsupportedSpoolPayloadSchema { sequence: u64, schema: String },
     #[error("exporter sink {sink} timed out after {timeout_ms} ms")]
     SinkTimedOut { sink: String, timeout_ms: u64 },
+    #[error("TLS material {path}: {source}")]
+    TlsMaterial {
+        path: PathBuf,
+        source: TlsMaterialFileError,
+    },
+    #[error("client TLS identity requires at least one client certificate and one private key")]
+    IncompleteClientTlsIdentity,
 }
 
 pub struct ExportWorkerHandle {
@@ -307,6 +317,7 @@ struct WebhookExportTarget {
     endpoint: String,
     codec: CompressionCodec,
     headers: Vec<(String, String)>,
+    tls: ExportSinkTlsPlan,
 }
 
 impl WebhookExportTarget {
@@ -316,6 +327,7 @@ impl WebhookExportTarget {
             endpoint,
             codec,
             headers: Vec::new(),
+            tls: ExportSinkTlsPlan::default(),
         }
     }
 }
@@ -333,6 +345,7 @@ fn webhook_export_target_from_plan_sink(
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
+            tls: sink.tls.clone(),
         }),
         ExporterTransport::Grpc | ExporterTransport::Kafka | ExporterTransport::Otlp => {
             Err(ExportDrainError::UnsupportedTransport {
@@ -391,48 +404,87 @@ async fn drain_webhook_sink(
         endpoint,
         codec,
         headers,
+        tls,
     } = target;
-    let exporter = WebhookExporter::with_headers(endpoint, codec, headers)?;
-    drain_export_sink(spool, agent_id, &sink, codec, mode, &exporter)
+    let first_events = spool.read_export_batch(&sink, EXPORT_BATCH_LIMIT)?;
+    if first_events.is_empty() {
+        return Ok(());
+    }
+    let Some(first_batch) = export_batch_from_events(agent_id, &sink, codec, first_events)? else {
+        return Ok(());
+    };
+    let tls = webhook_tls_config_from_plan(&tls)?;
+    let exporter = WebhookExporter::with_tls_config(endpoint, codec, headers, tls)?;
+    drain_export_sink_from_batch(spool, agent_id, &sink, codec, mode, &exporter, first_batch)
         .await
         .map(|_| ())
 }
 
-async fn drain_export_sink(
+fn webhook_tls_config_from_plan(
+    plan: &ExportSinkTlsPlan,
+) -> Result<WebhookTlsConfig, ExportDrainError> {
+    let trust_anchor_pems = plan
+        .trust_anchors
+        .iter()
+        .map(|path| read_tls_material_for_export(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let identity_pem = match (
+        plan.client_certificates.is_empty(),
+        plan.client_private_key.as_ref(),
+    ) {
+        (true, None) => None,
+        (false, Some(private_key)) => {
+            let mut pem = Vec::new();
+            for certificate in &plan.client_certificates {
+                pem.extend(read_tls_material_for_export(certificate)?);
+                pem.push(b'\n');
+            }
+            pem.extend(read_tls_material_for_export(private_key)?);
+            Some(pem)
+        }
+        (true, Some(_)) | (false, None) => {
+            return Err(ExportDrainError::IncompleteClientTlsIdentity);
+        }
+    };
+    Ok(WebhookTlsConfig {
+        trust_anchor_pems,
+        identity_pem,
+    })
+}
+
+fn read_tls_material_for_export(path: &Path) -> Result<Vec<u8>, ExportDrainError> {
+    read_tls_material(path).map_err(|source| ExportDrainError::TlsMaterial {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+async fn drain_export_sink_from_batch(
     spool: &impl DurableSpool,
     agent_id: &str,
     sink: &str,
     codec: CompressionCodec,
     mode: SinkDrainMode,
     exporter: &(impl ReliableExporter + ?Sized),
+    first_batch: BatchEnvelope,
 ) -> Result<ExportDrainSummary, ExportDrainError> {
     let mut summary = ExportDrainSummary {
         batches: 0,
         committed_cursor: None,
     };
+    let mut next_batch = Some(first_batch);
 
     loop {
-        let events = spool.read_export_batch(sink, EXPORT_BATCH_LIMIT)?;
-        let Some(last_sequence) = events.last().map(|event| event.sequence) else {
-            return Ok(summary);
-        };
-        for event in &events {
-            if event.payload.schema() != EVENT_ENVELOPE_JSON_SCHEMA {
-                return Err(ExportDrainError::UnsupportedSpoolPayloadSchema {
-                    sequence: event.sequence,
-                    schema: event.payload.schema().to_string(),
-                });
+        let batch = match next_batch.take() {
+            Some(batch) => batch,
+            None => {
+                let events = spool.read_export_batch(sink, EXPORT_BATCH_LIMIT)?;
+                let Some(batch) = export_batch_from_events(agent_id, sink, codec, events)? else {
+                    return Ok(summary);
+                };
+                batch
             }
-        }
-
-        let batch = BatchEnvelope::from_json_payloads(
-            format!("{agent_id}:{sink}:{last_sequence}"),
-            agent_id,
-            codec.wire_name(),
-            events
-                .iter()
-                .map(|event| (event.sequence, event.payload.bytes())),
-        )?;
+        };
         let ack = exporter.send(&batch).await?;
         summary.batches = summary.batches.saturating_add(1);
         let committed_cursor = ack
@@ -456,6 +508,36 @@ async fn drain_export_sink(
             return Ok(summary);
         }
     }
+}
+
+fn export_batch_from_events(
+    agent_id: &str,
+    sink: &str,
+    codec: CompressionCodec,
+    events: Vec<StoredEvent>,
+) -> Result<Option<BatchEnvelope>, ExportDrainError> {
+    let Some(last_sequence) = events.last().map(|event| event.sequence) else {
+        return Ok(None);
+    };
+    for event in &events {
+        if event.payload.schema() != EVENT_ENVELOPE_JSON_SCHEMA {
+            return Err(ExportDrainError::UnsupportedSpoolPayloadSchema {
+                sequence: event.sequence,
+                schema: event.payload.schema().to_string(),
+            });
+        }
+    }
+
+    BatchEnvelope::from_json_payloads(
+        format!("{agent_id}:{sink}:{last_sequence}"),
+        agent_id,
+        codec.wire_name(),
+        events
+            .iter()
+            .map(|event| (event.sequence, event.payload.bytes())),
+    )
+    .map(Some)
+    .map_err(ExportDrainError::Proto)
 }
 
 fn duration_millis(duration: Duration) -> u64 {

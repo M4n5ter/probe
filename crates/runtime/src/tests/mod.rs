@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use probe_core::Selector;
 
 use super::*;
@@ -104,7 +106,34 @@ fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::err
         endpoint: "https://collector.example/batches".to_string(),
         codec: CompressionCodecName::None,
         headers: Default::default(),
+        tls: probe_config::ExporterTlsConfig {
+            trust_anchor_refs: vec!["collector-ca".to_string()],
+            client_certificate_refs: vec!["client-cert".to_string()],
+            client_private_key_ref: Some("client-key".to_string()),
+        },
     }];
+    config.tls.materials = vec![
+        probe_config::TlsMaterialConfig {
+            id: Some("collector-ca".to_string()),
+            kind: probe_config::TlsMaterialKind::TrustAnchor,
+            path: PathBuf::from("/etc/ssl/private/collector-ca.pem"),
+        },
+        probe_config::TlsMaterialConfig {
+            id: Some("client-cert".to_string()),
+            kind: probe_config::TlsMaterialKind::ClientCertificate,
+            path: PathBuf::from("/etc/sssa/client.pem"),
+        },
+        probe_config::TlsMaterialConfig {
+            id: Some("client-key".to_string()),
+            kind: probe_config::TlsMaterialKind::ClientPrivateKey,
+            path: PathBuf::from("/etc/sssa/client.key"),
+        },
+        probe_config::TlsMaterialConfig {
+            id: Some("keylog".to_string()),
+            kind: probe_config::TlsMaterialKind::KeyLogFile,
+            path: PathBuf::from("/tmp/ssl-keylog.log"),
+        },
+    ];
 
     let plan = RuntimePlan::build(config, &registry)?;
 
@@ -125,6 +154,11 @@ fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::err
             endpoint: "https://collector.example/batches".to_string(),
             codec: CompressionCodecName::None,
             headers: Default::default(),
+            tls: ExportSinkTlsPlan {
+                trust_anchors: vec![PathBuf::from("/etc/ssl/private/collector-ca.pem")],
+                client_certificates: vec![PathBuf::from("/etc/sssa/client.pem")],
+                client_private_key: Some(PathBuf::from("/etc/sssa/client.key")),
+            },
         }]
     );
     Ok(())

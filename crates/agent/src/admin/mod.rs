@@ -682,6 +682,7 @@ mod tests {
                 endpoint: "https://collector.example/batches".to_string(),
                 codec: probe_config::CompressionCodecName::None,
                 headers: BTreeMap::new(),
+                tls: Default::default(),
             }],
             ..AgentConfig::default()
         }

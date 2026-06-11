@@ -5,16 +5,18 @@ use std::{
 };
 
 mod enforcement;
+mod export;
 mod health;
 mod policy;
 mod tls;
 
 use enforcement::{EnforcementStatusSnapshot, enforcement_status};
+use export::{ExporterStatusSnapshot, exporter_statuses};
 use health::health_snapshot;
 use policy::{PolicyStatusSnapshot, policy_status};
-use probe_config::{CaptureBackend, CaptureSelection, CompressionCodecName, ExporterTransport};
+use probe_config::{CaptureBackend, CaptureSelection};
 use probe_core::{CapabilityMatrix, RuntimeMode};
-use runtime::{CapturePlanMode, ExportWorkerPlan, RuntimePlan};
+use runtime::{CapturePlanMode, RuntimePlan};
 use serde::Serialize;
 use storage::{FjallSpool, SpoolProbe, SpoolSnapshot};
 use tls::{TlsStatusSnapshot, tls_status};
@@ -63,19 +65,6 @@ pub struct SpoolStatusSnapshot {
     pub reason: Option<String>,
     pub ingress_last_sequence: Option<u64>,
     pub export_last_sequence: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ExporterStatusSnapshot {
-    pub id: String,
-    pub transport: ExporterTransport,
-    pub codec: CompressionCodecName,
-    pub worker: ExportWorkerPlan,
-    pub mode: RuntimeMode,
-    pub reason: Option<String>,
-    pub cursor: Option<u64>,
-    pub export_last_sequence: Option<u64>,
-    pub lag: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -259,89 +248,6 @@ fn build_status_snapshot_at(
     }
 }
 
-fn exporter_statuses(
-    plan: &RuntimePlan,
-    spool: &SpoolStatusSnapshot,
-    cursors: &BTreeMap<String, u64>,
-) -> Vec<ExporterStatusSnapshot> {
-    plan.export
-        .sinks
-        .iter()
-        .map(|sink| {
-            let cursor = cursors.get(&sink.id).copied();
-            let export_last_sequence = spool.export_last_sequence;
-            let cursor_invariant_error =
-                cursor.zip(export_last_sequence).and_then(|(cursor, last)| {
-                    (cursor > last).then(|| {
-                        format!(
-                            "export cursor {cursor} is beyond export high-water sequence {last}"
-                        )
-                    })
-                });
-            let lag = cursor
-                .zip(export_last_sequence)
-                .and_then(|(cursor, last)| (cursor <= last).then(|| last - cursor));
-            let (mode, reason) = exporter_mode(plan, spool, sink.transport, cursor_invariant_error);
-
-            ExporterStatusSnapshot {
-                id: sink.id.clone(),
-                transport: sink.transport,
-                codec: sink.codec,
-                worker: plan.export.worker.clone(),
-                mode,
-                reason,
-                cursor,
-                export_last_sequence,
-                lag,
-            }
-        })
-        .collect()
-}
-
-fn exporter_mode(
-    plan: &RuntimePlan,
-    spool: &SpoolStatusSnapshot,
-    transport: ExporterTransport,
-    cursor_reason: Option<String>,
-) -> (RuntimeMode, Option<String>) {
-    if spool.mode == RuntimeMode::Unavailable {
-        return (
-            RuntimeMode::Unavailable,
-            spool
-                .reason
-                .clone()
-                .or_else(|| Some("spool is unavailable".to_string())),
-        );
-    }
-    if spool.mode == RuntimeMode::Degraded {
-        return (
-            RuntimeMode::Degraded,
-            spool
-                .reason
-                .clone()
-                .or_else(|| Some("spool status is degraded".to_string())),
-        );
-    }
-    if let Some(reason) = cursor_reason {
-        return (RuntimeMode::Unavailable, Some(reason));
-    }
-    match transport {
-        ExporterTransport::Webhook => {}
-        ExporterTransport::Grpc | ExporterTransport::Kafka | ExporterTransport::Otlp => {
-            return (
-                RuntimeMode::Unavailable,
-                Some(format!(
-                    "{transport:?} exporter is reserved but not implemented"
-                )),
-            );
-        }
-    }
-    if let Some(reason) = plan.export.worker.disabled_reason() {
-        return (RuntimeMode::Degraded, Some(reason.to_string()));
-    }
-    (RuntimeMode::Available, None)
-}
-
 fn metrics_snapshot(
     capabilities: &CapabilityMatrix,
     spool: &SpoolStatusSnapshot,
@@ -396,10 +302,13 @@ mod tests {
 
     use super::*;
     use probe_config::{
-        AgentConfig, CaptureBackend, CaptureSelection, ExporterConfig, PolicyConfig,
+        AgentConfig, CaptureBackend, CaptureSelection, CompressionCodecName, ExporterConfig,
+        ExporterTransport, PolicyConfig,
     };
     use probe_core::{CapabilityKind, CapabilityState, EnforcementMode, Selector};
-    use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
+    use runtime::{
+        CaptureProviderBuilder, CaptureProviderDescriptor, ExportWorkerPlan, ProviderRegistry,
+    };
     use serde_json::json;
     use storage::SpoolPayload;
 
@@ -630,6 +539,7 @@ hooks = ["on_http_request_headers"]
         fs::write(&material_path, b"test trust anchor")?;
         let mut config = config_with_storage_path(temp.join("spool"));
         config.tls.materials = vec![probe_config::TlsMaterialConfig {
+            id: Some("collector-ca".to_string()),
             kind: probe_config::TlsMaterialKind::TrustAnchor,
             path: material_path.clone(),
         }];
@@ -665,6 +575,7 @@ hooks = ["on_http_request_headers"]
         let missing_path = temp.join("missing.keys");
         let mut config = config_with_storage_path(temp.join("spool"));
         config.tls.materials = vec![probe_config::TlsMaterialConfig {
+            id: Some("keylog".to_string()),
             kind: probe_config::TlsMaterialKind::KeyLogFile,
             path: missing_path,
         }];
@@ -684,6 +595,43 @@ hooks = ["on_http_request_headers"]
                 .is_some_and(|reason| reason.contains("does not exist"))
         );
         assert_eq!(snapshot.health.mode, RuntimeMode::Available);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn active_exporter_tls_material_unavailability_forces_health_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-missing-exporter-tls-material")?;
+        let missing_path = temp.join("missing-ca.pem");
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.exporters[0].tls.trust_anchor_refs = vec!["collector-ca".to_string()];
+        config.tls.materials = vec![probe_config::TlsMaterialConfig {
+            id: Some("collector-ca".to_string()),
+            kind: probe_config::TlsMaterialKind::TrustAnchor,
+            path: missing_path,
+        }];
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+        let spool = available_empty_spool();
+
+        let snapshot = build_status_snapshot_at(&plan, spool, 42);
+
+        assert_eq!(snapshot.exporters[0].tls.mode, RuntimeMode::Unavailable);
+        assert_eq!(snapshot.exporters[0].mode, RuntimeMode::Unavailable);
+        assert!(
+            snapshot.exporters[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("TLS material"))
+        );
+        assert_eq!(snapshot.health.mode, RuntimeMode::Unavailable);
+        assert!(
+            snapshot
+                .health
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("exporter primary"))
+        );
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -919,6 +867,7 @@ hooks = ["on_http_request_headers"]
                 endpoint: "https://collector.example/batches".to_string(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
+                tls: Default::default(),
             }],
             ..AgentConfig::default()
         }
