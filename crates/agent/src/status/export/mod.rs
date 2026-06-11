@@ -1,8 +1,8 @@
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 
 use probe_config::{CompressionCodecName, ExporterTransport};
 use probe_core::RuntimeMode;
-use runtime::{ExportSinkPlan, ExportWorkerPlan, RuntimePlan};
+use runtime::{ExportSinkPlan, ExportTlsMaterialPlan, ExportWorkerPlan, RuntimePlan};
 use serde::Serialize;
 
 use super::{
@@ -133,18 +133,18 @@ fn exporter_tls_status(sink: &ExportSinkPlan) -> ExporterTlsStatusSnapshot {
         };
     }
 
-    for path in sink
+    for material in sink
         .tls
         .trust_anchors
         .iter()
         .chain(&sink.tls.client_certificates)
         .chain(sink.tls.client_private_key.iter())
     {
-        let source = tls::material_source_status(path);
+        let source = tls::material_source_status(&material.path);
         if source.mode == RuntimeMode::Unavailable {
             return ExporterTlsStatusSnapshot {
                 mode: RuntimeMode::Unavailable,
-                reason: Some(exporter_tls_reason(path, &source)),
+                reason: Some(exporter_tls_reason(material, &source)),
             };
         }
     }
@@ -154,9 +154,27 @@ fn exporter_tls_status(sink: &ExportSinkPlan) -> ExporterTlsStatusSnapshot {
     }
 }
 
-fn exporter_tls_reason(path: &Path, source: &TlsMaterialSourceStatusSnapshot) -> String {
+fn exporter_tls_reason(
+    material: &ExportTlsMaterialPlan,
+    source: &TlsMaterialSourceStatusSnapshot,
+) -> String {
+    let path = material.path.as_path();
     source.reason.clone().map_or_else(
-        || format!("TLS material {} is unavailable", path.display()),
-        |reason| format!("TLS material {}: {reason}", path.display()),
+        || {
+            format!(
+                "TLS material {} ({:?}) at {} is unavailable",
+                material.id,
+                material.kind,
+                path.display()
+            )
+        },
+        |reason| {
+            format!(
+                "TLS material {} ({:?}) at {}: {reason}",
+                material.id,
+                material.kind,
+                path.display()
+            )
+        },
     )
 }

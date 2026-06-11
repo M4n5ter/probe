@@ -155,9 +155,21 @@ fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::err
             codec: CompressionCodecName::None,
             headers: Default::default(),
             tls: ExportSinkTlsPlan {
-                trust_anchors: vec![PathBuf::from("/etc/ssl/private/collector-ca.pem")],
-                client_certificates: vec![PathBuf::from("/etc/sssa/client.pem")],
-                client_private_key: Some(PathBuf::from("/etc/sssa/client.key")),
+                trust_anchors: vec![export_tls_material(
+                    "collector-ca",
+                    probe_config::TlsMaterialKind::TrustAnchor,
+                    "/etc/ssl/private/collector-ca.pem",
+                )],
+                client_certificates: vec![export_tls_material(
+                    "client-cert",
+                    probe_config::TlsMaterialKind::ClientCertificate,
+                    "/etc/sssa/client.pem",
+                )],
+                client_private_key: Some(export_tls_material(
+                    "client-key",
+                    probe_config::TlsMaterialKind::ClientPrivateKey,
+                    "/etc/sssa/client.key",
+                )),
             },
         }]
     );
@@ -522,4 +534,16 @@ fn test_platform_capabilities() -> Vec<CapabilityState> {
         CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
         CapabilityState::available(CapabilityKind::DryRunEnforcement),
     ]
+}
+
+fn export_tls_material(
+    id: &str,
+    kind: probe_config::TlsMaterialKind,
+    path: impl Into<PathBuf>,
+) -> ExportTlsMaterialPlan {
+    ExportTlsMaterialPlan {
+        id: id.to_string(),
+        kind,
+        path: path.into(),
+    }
 }

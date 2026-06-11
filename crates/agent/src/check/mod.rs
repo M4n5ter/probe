@@ -163,6 +163,18 @@ mod tests {
         let value = serde_json::to_value(report)?;
 
         assert_eq!(value["plan"]["capture"]["mode"], json!("replay"));
+        assert_eq!(
+            value["plan"]["export"]["sinks"][0]["tls"]["trust_anchors"][0]["id"],
+            json!("collector-ca")
+        );
+        assert_eq!(
+            value["plan"]["export"]["sinks"][0]["tls"]["trust_anchors"][0]["kind"],
+            json!("trust_anchor")
+        );
+        assert_eq!(
+            value["plan"]["export"]["sinks"][0]["tls"]["trust_anchors"][0]["path"],
+            json!("/tmp/collector-ca.pem")
+        );
         assert_eq!(value["policy"]["mode"], json!("loaded"));
         assert_eq!(value["policy"]["configured_count"], json!(1));
         assert_eq!(value["policy"]["enabled_count"], json!(1));
@@ -237,6 +249,14 @@ id = "primary"
 transport = "webhook"
 endpoint = "https://collector.example/batches"
 codec = "none"
+
+[exporters.tls]
+trust_anchor_refs = ["collector-ca"]
+
+[[tls.materials]]
+id = "collector-ca"
+kind = "trust_anchor"
+path = "/tmp/collector-ca.pem"
 "#,
             path.display()
         ))

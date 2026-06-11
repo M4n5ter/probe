@@ -8,9 +8,11 @@ use std::{
 
 use probe_config::{
     AgentConfig, CompressionCodecName, ExportWorkerScheduleConfig, ExporterConfig,
-    ExporterTransport,
+    ExporterTransport, TlsMaterialKind,
 };
-use runtime::{ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportWorkerPlan};
+use runtime::{
+    ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportTlsMaterialPlan, ExportWorkerPlan,
+};
 use storage::{FjallSpool, SpoolPayload};
 
 use super::*;
@@ -56,9 +58,21 @@ fn webhook_tls_config_loads_export_materials() -> Result<(), Box<dyn std::error:
     fs::write(&client_certificate, b"cert-pem")?;
     fs::write(&client_private_key, b"key-pem")?;
     let plan = ExportSinkTlsPlan {
-        trust_anchors: vec![trust_anchor],
-        client_certificates: vec![client_certificate],
-        client_private_key: Some(client_private_key),
+        trust_anchors: vec![tls_material(
+            "collector-ca",
+            TlsMaterialKind::TrustAnchor,
+            trust_anchor,
+        )],
+        client_certificates: vec![tls_material(
+            "client-cert",
+            TlsMaterialKind::ClientCertificate,
+            client_certificate,
+        )],
+        client_private_key: Some(tls_material(
+            "client-key",
+            TlsMaterialKind::ClientPrivateKey,
+            client_private_key,
+        )),
     };
 
     let tls = webhook_tls_config_from_plan(&plan)?;
@@ -73,9 +87,21 @@ fn webhook_tls_config_loads_export_materials() -> Result<(), Box<dyn std::error:
 fn export_worker_config_does_not_read_tls_materials_without_webhook_sinks()
 -> Result<(), Box<dyn std::error::Error>> {
     let tls = ExportSinkTlsPlan {
-        trust_anchors: vec![PathBuf::from("/missing/ca.pem")],
-        client_certificates: vec![PathBuf::from("/missing/client.pem")],
-        client_private_key: Some(PathBuf::from("/missing/client.key")),
+        trust_anchors: vec![tls_material(
+            "collector-ca",
+            TlsMaterialKind::TrustAnchor,
+            PathBuf::from("/missing/ca.pem"),
+        )],
+        client_certificates: vec![tls_material(
+            "client-cert",
+            TlsMaterialKind::ClientCertificate,
+            PathBuf::from("/missing/client.pem"),
+        )],
+        client_private_key: Some(tls_material(
+            "client-key",
+            TlsMaterialKind::ClientPrivateKey,
+            PathBuf::from("/missing/client.key"),
+        )),
     };
     let disabled = ExportPlan {
         worker: ExportWorkerPlan::Disabled {
@@ -135,7 +161,11 @@ async fn planned_webhook_drain_fails_when_tls_material_is_missing()
             codec: CompressionCodecName::None,
             headers: BTreeMap::new(),
             tls: ExportSinkTlsPlan {
-                trust_anchors: vec![PathBuf::from("/missing/collector-ca.pem")],
+                trust_anchors: vec![tls_material(
+                    "collector-ca",
+                    TlsMaterialKind::TrustAnchor,
+                    PathBuf::from("/missing/collector-ca.pem"),
+                )],
                 ..Default::default()
             },
         }],
@@ -145,7 +175,10 @@ async fn planned_webhook_drain_fails_when_tls_material_is_missing()
         .await
         .expect_err("missing TLS material must fail the planned webhook drain");
 
-    assert!(error.to_string().contains("TLS material"));
+    let rendered = error.to_string();
+    assert!(rendered.contains("TLS material collector-ca"));
+    assert!(rendered.contains("TrustAnchor"));
+    assert!(rendered.contains("/missing/collector-ca.pem"));
     Ok(())
 }
 
@@ -164,7 +197,11 @@ async fn planned_webhook_drain_skips_tls_materials_without_pending_events()
             codec: CompressionCodecName::None,
             headers: BTreeMap::new(),
             tls: ExportSinkTlsPlan {
-                trust_anchors: vec![PathBuf::from("/missing/collector-ca.pem")],
+                trust_anchors: vec![tls_material(
+                    "collector-ca",
+                    TlsMaterialKind::TrustAnchor,
+                    PathBuf::from("/missing/collector-ca.pem"),
+                )],
                 ..Default::default()
             },
         }],
@@ -437,9 +474,25 @@ fn export_plan_with_trust_anchor(path: PathBuf) -> ExportPlan {
             codec: CompressionCodecName::None,
             headers: BTreeMap::new(),
             tls: ExportSinkTlsPlan {
-                trust_anchors: vec![path],
+                trust_anchors: vec![tls_material(
+                    "collector-ca",
+                    TlsMaterialKind::TrustAnchor,
+                    path,
+                )],
                 ..Default::default()
             },
         }],
+    }
+}
+
+fn tls_material(
+    id: &str,
+    kind: TlsMaterialKind,
+    path: impl Into<PathBuf>,
+) -> ExportTlsMaterialPlan {
+    ExportTlsMaterialPlan {
+        id: id.to_string(),
+        kind,
+        path: path.into(),
     }
 }

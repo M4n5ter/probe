@@ -1,16 +1,18 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
 use exporter::{CompressionCodec, ReliableExporter, WebhookExporter, WebhookTlsConfig};
-use probe_config::{CompressionCodecName, ExporterTransport};
+use probe_config::{CompressionCodecName, ExporterTransport, TlsMaterialKind};
 use probe_core::SpoolPayloadSchema;
 use proto::BatchEnvelope;
-use runtime::{ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportWorkerPlan};
+use runtime::{
+    ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportTlsMaterialPlan, ExportWorkerPlan,
+};
 use storage::{DurableSpool, StoredEvent};
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -37,8 +39,10 @@ pub enum ExportDrainError {
     UnsupportedSpoolPayloadSchema { sequence: u64, schema: String },
     #[error("exporter sink {sink} timed out after {timeout_ms} ms")]
     SinkTimedOut { sink: String, timeout_ms: u64 },
-    #[error("TLS material {path}: {source}")]
+    #[error("TLS material {id} ({kind:?}) at {path}: {source}")]
     TlsMaterial {
+        id: String,
+        kind: TlsMaterialKind,
         path: PathBuf,
         source: TlsMaterialFileError,
     },
@@ -427,7 +431,7 @@ fn webhook_tls_config_from_plan(
     let trust_anchor_pems = plan
         .trust_anchors
         .iter()
-        .map(|path| read_tls_material_for_export(path))
+        .map(read_tls_material_for_export)
         .collect::<Result<Vec<_>, _>>()?;
     let identity_pem = match (
         plan.client_certificates.is_empty(),
@@ -453,9 +457,13 @@ fn webhook_tls_config_from_plan(
     })
 }
 
-fn read_tls_material_for_export(path: &Path) -> Result<Vec<u8>, ExportDrainError> {
-    read_tls_material(path).map_err(|source| ExportDrainError::TlsMaterial {
-        path: path.to_path_buf(),
+fn read_tls_material_for_export(
+    material: &ExportTlsMaterialPlan,
+) -> Result<Vec<u8>, ExportDrainError> {
+    read_tls_material(&material.path).map_err(|source| ExportDrainError::TlsMaterial {
+        id: material.id.clone(),
+        kind: material.kind,
+        path: material.path.clone(),
         source,
     })
 }

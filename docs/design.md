@@ -313,7 +313,7 @@ TLS 材料分为两类：
 - identity/trust materials：CA、client cert、private key，用于 exporter mTLS、控制面连接、TLS 元数据验证。
 - decrypt materials：SSLKEYLOGFILE、session secrets、有限私钥场景，用于明文恢复尝试。
 
-当前实现中，`tls.materials` 是 material registry，不是全局 exporter TLS 开关。planned webhook exporter 通过 `exporters[].tls.trust_anchor_refs`、`exporters[].tls.client_certificate_refs` 和 `exporters[].tls.client_private_key_ref` 显式引用 material id；被引用的 `trust_anchor` 会作为额外 root certificates merge 进该 exporter 的 reqwest/rustls client，`client_certificate` 与 `client_private_key` 会在同一个 exporter 上组合成 client identity，用于 exporter mTLS。未被 exporter 引用的 material 不会影响该 exporter；`key_log_file` 和 `session_secret_file` 不进入 exporter TLS config，只保留给后续 plaintext provider。
+当前实现中，`tls.materials` 是 material registry，不是全局 exporter TLS 开关。planned webhook exporter 通过 `exporters[].tls.trust_anchor_refs`、`exporters[].tls.client_certificate_refs` 和 `exporters[].tls.client_private_key_ref` 显式引用 material id；runtime plan 会把这些 refs 解析成带 `id`、`kind` 和 `path` 的 exporter TLS material plan，而不是只保留裸路径。被引用的 `trust_anchor` 会作为额外 root certificates merge 进该 exporter 的 reqwest/rustls client，`client_certificate` 与 `client_private_key` 会在同一个 exporter 上组合成 client identity，用于 exporter mTLS。未被 exporter 引用的 material 不会影响该 exporter；`key_log_file` 和 `session_secret_file` 不进入 exporter TLS config，只保留给后续 plaintext provider。
 
 必须明确：导入证书不等于能解密现代 TLS。TLS 1.2 ECDHE 和 TLS 1.3 具备前向保密时，单纯导入服务端证书或私钥通常无法解密流量。
 
@@ -694,7 +694,7 @@ V1 使用 filesystem + 权限 + 抽象。
 
 同时定义 `SecretStore` trait，为后续接入 Vault、KMS、TPM 预留。
 
-当前实现只完成第一版 filesystem material plumbing：配置校验保证 material id 唯一、exporter refs 存在且 kind 匹配、client cert/private key 在 exporter 上成对出现，并要求引用 TLS material 的 exporter 使用 HTTPS webhook endpoint。status 对 registry 做 metadata-only 文件检查，拒绝缺失、symlink、目录、非 regular file 和超过当前大小上限的 material；活跃 webhook exporter 引用的 TLS material source 不可用时，会把对应 exporter 和 health 标为 unavailable。planned webhook exporter 在实际 drain 时先确认该 sink 有待发送 batch，再按 per-sink refs 通过同一套 filesystem source 边界读取 trust anchor/client identity PEM 并构造 reqwest/rustls client；读取或 PEM 解析失败会让对应 drain 失败，空队列不会读取 secret bytes。尚未实现 `SecretStore`、权限强校验、路径白名单、热加载和 secret backend。
+当前实现只完成第一版 filesystem material plumbing：配置校验保证 material id 唯一、exporter refs 存在且 kind 匹配、client cert/private key 在 exporter 上成对出现，并要求引用 TLS material 的 exporter 使用 HTTPS webhook endpoint。runtime plan 为每个 exporter 保留 resolved material 的 `id`、`kind` 和 `path`，供 status、exporter drain 和后续 SecretStore 共享同一语义。status 对 registry 做 metadata-only 文件检查，拒绝缺失、symlink、目录、非 regular file 和超过当前大小上限的 material；活跃 webhook exporter 引用的 TLS material source 不可用时，会把对应 exporter 和 health 标为 unavailable，并在原因中带上 material id/kind/path。planned webhook exporter 在实际 drain 时先确认该 sink 有待发送 batch，再按 per-sink refs 通过同一套 filesystem source 边界读取 trust anchor/client identity PEM 并构造 reqwest/rustls client；读取或 PEM 解析失败会让对应 drain 失败，空队列不会读取 secret bytes。尚未实现 `SecretStore`、权限强校验、路径白名单、热加载和 secret backend。
 
 敏感材料包括：
 

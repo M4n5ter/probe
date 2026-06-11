@@ -67,7 +67,7 @@ pub struct ExportPlan {
 
 impl ExportPlan {
     fn resolve(config: &AgentConfig) -> Self {
-        let materials_by_id = tls_materials_by_id(&config.tls.materials);
+        let materials_by_id = export_tls_materials_by_id(&config.tls.materials);
         let sinks = config
             .exporters
             .iter()
@@ -147,49 +147,69 @@ pub struct ExportSinkPlan {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportSinkTlsPlan {
-    pub trust_anchors: Vec<PathBuf>,
-    pub client_certificates: Vec<PathBuf>,
-    pub client_private_key: Option<PathBuf>,
+    pub trust_anchors: Vec<ExportTlsMaterialPlan>,
+    pub client_certificates: Vec<ExportTlsMaterialPlan>,
+    pub client_private_key: Option<ExportTlsMaterialPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportTlsMaterialPlan {
+    pub id: String,
+    pub kind: TlsMaterialKind,
+    pub path: PathBuf,
 }
 
 impl ExportSinkTlsPlan {
     fn from_config(
         config: &ExporterTlsConfig,
-        materials_by_id: &BTreeMap<&str, &TlsMaterialConfig>,
+        materials_by_id: &BTreeMap<&str, ExportTlsMaterialPlan>,
     ) -> Self {
         Self {
             trust_anchors: config
                 .trust_anchor_refs
                 .iter()
                 .filter_map(|reference| materials_by_id.get(reference.as_str()))
-                .map(|material| material.path.clone())
+                .cloned()
                 .collect(),
             client_certificates: config
                 .client_certificate_refs
                 .iter()
                 .filter_map(|reference| materials_by_id.get(reference.as_str()))
-                .map(|material| material.path.clone())
+                .cloned()
                 .collect(),
             client_private_key: config
                 .client_private_key_ref
                 .as_deref()
                 .and_then(|reference| materials_by_id.get(reference))
-                .map(|material| material.path.clone()),
+                .cloned(),
         }
     }
 }
 
-fn tls_materials_by_id(materials: &[TlsMaterialConfig]) -> BTreeMap<&str, &TlsMaterialConfig> {
+impl ExportTlsMaterialPlan {
+    fn from_config(material: &TlsMaterialConfig) -> Option<Self> {
+        let id = material.id.clone()?;
+        match material.kind {
+            TlsMaterialKind::TrustAnchor
+            | TlsMaterialKind::ClientCertificate
+            | TlsMaterialKind::ClientPrivateKey => Some(Self {
+                id,
+                kind: material.kind,
+                path: material.path.clone(),
+            }),
+            TlsMaterialKind::KeyLogFile | TlsMaterialKind::SessionSecretFile => None,
+        }
+    }
+}
+
+fn export_tls_materials_by_id(
+    materials: &[TlsMaterialConfig],
+) -> BTreeMap<&str, ExportTlsMaterialPlan> {
     materials
         .iter()
         .filter_map(|material| {
             let id = material.id.as_deref()?;
-            match material.kind {
-                TlsMaterialKind::TrustAnchor
-                | TlsMaterialKind::ClientCertificate
-                | TlsMaterialKind::ClientPrivateKey => Some((id, material)),
-                TlsMaterialKind::KeyLogFile | TlsMaterialKind::SessionSecretFile => None,
-            }
+            ExportTlsMaterialPlan::from_config(material).map(|plan| (id, plan))
         })
         .collect()
 }

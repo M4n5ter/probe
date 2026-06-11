@@ -620,12 +620,13 @@ hooks = ["on_http_request_headers"]
 
         assert_eq!(snapshot.exporters[0].tls.mode, RuntimeMode::Unavailable);
         assert_eq!(snapshot.exporters[0].mode, RuntimeMode::Unavailable);
-        assert!(
-            snapshot.exporters[0]
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("TLS material"))
-        );
+        let exporter_reason = snapshot.exporters[0]
+            .reason
+            .as_deref()
+            .expect("missing TLS material should explain exporter unavailability");
+        assert!(exporter_reason.contains("TLS material collector-ca"));
+        assert!(exporter_reason.contains("TrustAnchor"));
+        assert!(exporter_reason.contains("missing-ca.pem"));
         assert_eq!(snapshot.health.mode, RuntimeMode::Unavailable);
         assert!(
             snapshot
