@@ -3,8 +3,9 @@ mod source;
 pub use source::{LoadedEnforcementPolicySource, inspect_enforcement_policy_source};
 
 use enforcement::{EnforcementError, ScopedEnforcementPlanner};
+use probe_config::AgentConfig;
 use probe_core::{EnforcementMode, ProtectiveActionProfile, Selector};
-use runtime::RuntimePlan;
+use runtime::{EnforcementPlan, EnforcementPolicySourcePlan, RuntimePlan};
 use thiserror::Error;
 
 use self::source::{EnforcementPolicySourceError, load_enforcement_policy_source};
@@ -29,9 +30,35 @@ pub struct ConfiguredEnforcement {
 pub fn build_configured_enforcement(
     plan: &RuntimePlan,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
-    let policy_source = load_enforcement_policy_source(&plan.enforcement.policy_source)?;
-    let effective_selector = effective_selector(
+    build_configured_enforcement_from_parts(
+        plan.enforcement.mode,
         plan.config.enforcement.selector.clone(),
+        plan.enforcement.config_selector_configured,
+        &plan.enforcement.policy_source,
+    )
+}
+
+pub fn build_configured_enforcement_from_config(
+    config: &AgentConfig,
+) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
+    let enforcement = EnforcementPlan::resolve(config);
+    build_configured_enforcement_from_parts(
+        enforcement.mode,
+        config.enforcement.selector.clone(),
+        enforcement.config_selector_configured,
+        &enforcement.policy_source,
+    )
+}
+
+fn build_configured_enforcement_from_parts(
+    mode: EnforcementMode,
+    config_selector: Option<Selector>,
+    config_selector_configured: bool,
+    policy_source_plan: &EnforcementPolicySourcePlan,
+) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
+    let policy_source = load_enforcement_policy_source(policy_source_plan)?;
+    let effective_selector = effective_selector(
+        config_selector,
         policy_source
             .as_ref()
             .and_then(|source| source.manifest.selector.clone()),
@@ -42,15 +69,15 @@ pub fn build_configured_enforcement(
             source.manifest.protective_actions.clone()
         });
     let planner = ScopedEnforcementPlanner::with_protective_action_profile(
-        plan.enforcement.mode,
+        mode,
         effective_selector.as_ref(),
         protective_actions,
     )?;
     Ok(ConfiguredEnforcement {
         planner,
-        mode: plan.enforcement.mode,
+        mode,
         effective_selector_configured: effective_selector.is_some(),
-        config_selector_configured: plan.enforcement.config_selector_configured,
+        config_selector_configured,
         manifest_selector_configured: policy_source
             .as_ref()
             .map(|source| source.manifest.selector.is_some()),

@@ -21,7 +21,9 @@ use capture::{
 };
 use check::build_check_report;
 use clap::{Parser, Subcommand, ValueEnum};
-use configured_enforcement::{ConfiguredEnforcementError, build_configured_enforcement};
+use configured_enforcement::{
+    ConfiguredEnforcementError, build_configured_enforcement_from_config,
+};
 use configured_policy::{ConfiguredPolicyError, load_configured_policy};
 use enforcement::ScopedEnforcementPlanner;
 use export::{ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook, spawn_export_worker};
@@ -37,6 +39,7 @@ use probe_core::{
 };
 use runtime::{
     CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimeError, RuntimePlan,
+    validate_static_runtime_config,
 };
 use status::{build_status_snapshot, collect_spool_status};
 use storage::FjallSpool;
@@ -204,12 +207,14 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), AgentError> {
     match cli.command {
         Command::Run { config, max_events } => {
-            let plan = read_runtime_plan_or_default(config.as_ref())?;
+            let agent_config = read_config_or_default(config.as_ref())?;
+            validate_static_runtime_config(&agent_config)?;
+            let policy = load_configured_policy(&agent_config)?;
+            let mut enforcement = build_configured_enforcement_from_config(&agent_config)?;
+            let plan = build_runtime_plan(agent_config)?;
+            let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
             let mut provider = build_capture_provider(&plan)?;
             let mut parser_factory = Http1ParserFactory::default();
-            let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
-            let policy = load_configured_policy(&plan.config)?;
-            let mut enforcement = build_configured_enforcement(&plan)?;
             let admin_runtime_state = AdminRuntimeState {
                 enforcement_policy_source: enforcement.policy_source.clone(),
             };
@@ -304,11 +309,6 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
         }
     }
     Ok(())
-}
-
-fn read_runtime_plan_or_default(path: Option<&PathBuf>) -> Result<RuntimePlan, AgentError> {
-    let config = read_config_or_default(path)?;
-    build_runtime_plan(config)
 }
 
 fn read_runtime_plan(path: &PathBuf) -> Result<RuntimePlan, AgentError> {
@@ -606,7 +606,10 @@ fn synthetic_replay_process() -> ProcessContext {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use capture::{EbpfProbeCheck, UnprivilegedBpfStatus};
+    use probe_config::{CaptureSelection, EnforcementPolicySourceConfig, PolicyConfig};
 
     use super::*;
 
@@ -641,5 +644,119 @@ mod tests {
         assert_eq!(flow.process.identity.tgid, 0);
         assert_eq!(flow.attribution_confidence, 0);
         assert_eq!(flow.process.identity.boot_id, "replay");
+    }
+
+    #[tokio::test]
+    async fn run_validates_enforcement_before_probing_capture_provider()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("run-invalid-enforcement")?;
+        let config_path = temp.join("agent.toml");
+        let enforcement_path = temp.join("enforcement.toml");
+        let spool_path = temp.join("spool");
+
+        fs::write(
+            &enforcement_path,
+            r#"
+id = "managed-apps"
+version = "v1"
+protective_actions = ["alert"]
+"#,
+        )?;
+        let mut config = config_with_unopenable_libpcap(spool_path.clone());
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: enforcement_path,
+        };
+        fs::write(&config_path, toml::to_string(&config)?)?;
+
+        let error = run(Cli {
+            command: Command::Run {
+                config: Some(config_path),
+                max_events: Some(0),
+            },
+        })
+        .await
+        .expect_err("invalid enforcement manifest should fail before capture provider probe");
+
+        assert!(
+            matches!(&error, AgentError::ConfiguredEnforcement(_)),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("not a protective enforcement action")
+        );
+        assert!(
+            !spool_path.exists(),
+            "spool must not be opened before enforcement validation passes"
+        );
+
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_validates_policy_before_probing_capture_provider()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("run-invalid-policy")?;
+        let config_path = temp.join("agent.toml");
+        let missing_policy_path = temp.join("missing-policy.lua");
+        let spool_path = temp.join("spool");
+
+        let mut config = config_with_unopenable_libpcap(spool_path.clone());
+        config.policies.push(PolicyConfig {
+            id: "guard".to_string(),
+            path: missing_policy_path,
+            enabled: true,
+            selector: None,
+        });
+        fs::write(&config_path, toml::to_string(&config)?)?;
+
+        let error = run(Cli {
+            command: Command::Run {
+                config: Some(config_path),
+                max_events: Some(0),
+            },
+        })
+        .await
+        .expect_err("invalid policy source should fail before capture provider probe");
+
+        assert!(
+            matches!(&error, AgentError::ConfiguredPolicy(_)),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("policy source path does not exist")
+        );
+        assert!(
+            !spool_path.exists(),
+            "spool must not be opened before policy validation passes"
+        );
+
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    fn config_with_unopenable_libpcap(spool_path: PathBuf) -> AgentConfig {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.capture.libpcap.interface = Some("sssa-probe-missing-test-interface".to_string());
+        config.storage.path = spool_path;
+        config
+    }
+
+    fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {
+        let path = std::env::temp_dir().join(format!(
+            "sssa-probe-main-{name}-{}-{}",
+            std::process::id(),
+            wall_time_unix_ns()
+        ));
+        if path.exists() {
+            fs::remove_dir_all(&path)?;
+        }
+        fs::create_dir_all(&path)?;
+        Ok(path)
     }
 }
