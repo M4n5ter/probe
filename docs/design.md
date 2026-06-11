@@ -11,7 +11,7 @@
 - 可扩展协议解析：首要支持 HTTP/1.x 和 SSE，后续自然扩展 WebSocket、HTTP/2、HTTP/3 等协议。
 - 策略驱动的检测与防护：V1 先支持观测、告警和 dry-run verdict，后续接入真实拦截执行。
 
-本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、可选压缩 codec 和 HTTP webhook exporter。`run` 已可按配置启动连续后台 exporter worker 并在退出前做尾部 drain，`replay` 可通过 CLI drain 到独立 webhook sink。已定义 capture provider、procfs process attribution、runtime config、runtime planning 和 dry-run enforcement 的第一版边界，并开始接入真实 libpcap fallback 和外部明文 feed provider。尚未实现 eBPF 主路径、TLS uprobe provider、keylog/session 解密 provider、真实 enforcement、TCP 重组、强进程归因和完整 exporter retry/backoff/quota 调度。
+本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、可选压缩 codec 和 HTTP webhook exporter。`run` 已可按配置启动连续后台 exporter worker 并在退出前做尾部 drain，`replay` 可通过 CLI drain 到独立 webhook sink，`status` 可输出 runtime/admin/metrics 快照。已定义 capture provider、procfs process attribution、runtime config、runtime planning 和 dry-run enforcement 的第一版边界，并开始接入真实 libpcap fallback 和外部明文 feed provider。尚未实现 eBPF 主路径、TLS uprobe provider、keylog/session 解密 provider、真实 enforcement、TCP 重组、强进程归因和完整 exporter retry/backoff/quota 调度。
 
 ## 2. 核心 thesis
 
@@ -78,11 +78,11 @@ V1 明确不做：
 - 已实现 `attribution` crate 的 `ProcfsAttributor` 和 `ProcfsSocketResolver`；前者可从 `/proc/<pid>` 读取进程身份、cmdline hash、starttime、uid/gid、cgroup、systemd service 与 container hint，后者可通过 `/proc/net/tcp` socket inode 和 `/proc/<pid>/fd` best-effort 反查 TCP 连接所属进程。agent 注入的 procfs resolver 使用短 TTL socket snapshot，避免同一批新连接重复全量扫描 `/proc/<pid>/fd`；libpcap provider 在 TCP 生命周期信号、idle eviction、capacity eviction 和端口复用关闭旧 flow 后会使 snapshot 失效，降低拿到旧进程身份的风险。resolver 错误会进入 capture degradation reason，不再静默伪装成未匹配；但单个 PID 的 fd race 或权限拒绝属于 best-effort skip，不让整批 socket snapshot 失败。replay flow 默认使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence，避免把文件输入误归因到 agent 进程。
 - 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、provider-specific nested config、storage、export runtime worker、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，基础字段校验会拒绝 ambiguous external plaintext feed 配置：当前 external plaintext feed 的 source path 归 `capture.plaintext_feed.path` 所有，不能塞进 TLS material/provider 配置。
 - 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection 与 export worker effective plan；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；`plaintext_feed` 是独立 plan mode，不伪装成 replay 或 live capture；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
-- 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；pipeline 支持可选 `max_events` 运行边界，便于对真实 live provider 做有界 smoke。`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合、连续 exporter worker 和 replay exporter 命令。
+- 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；pipeline 支持可选 `max_events` 运行边界，便于对真实 live provider 做有界 smoke。`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合、连续 exporter worker、replay exporter 命令和状态/metrics 快照输出。
 - 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。parser 已识别 WebSocket HTTP Upgrade，输出 `WebSocketHandoff` 后把后续字节转为 opaque stream；它不解析 WebSocket frame/message。
-- 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF、libssl uprobe/keylog TLS 解密和真实 enforcement 相关能力仍必须标记 unavailable；`external_plaintext_feed`、HTTP/1、SSE、WebSocket handoff、dry-run enforcement 是可用能力。webhook exporter 已可在 `run` 中连续 drain configured sinks，但 retry/backoff、per-sink quota 和 retention deadline 尚未实现，因此仍标记 degraded。dry-run enforcement 记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 或 plaintext feed 作为 live provider；`run` 在无 live capture provider 时 fail closed，显式 `plaintext_feed` 会从 JSON-lines feed path 读取已解密明文 event 并接入 replay 共用的 pipeline；`check` 用于查看 resolved plan。
+- 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF、libssl uprobe/keylog TLS 解密和真实 enforcement 相关能力仍必须标记 unavailable；`external_plaintext_feed`、HTTP/1、SSE、WebSocket handoff、dry-run enforcement 是可用能力。webhook exporter 已可在 `run` 中连续 drain planned sinks，但 retry/backoff、per-sink quota 和 retention deadline 尚未实现，因此仍标记 degraded。dry-run enforcement 记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 或 plaintext feed 作为 live provider；`run` 在无 live capture provider 时 fail closed，显式 `plaintext_feed` 会从 JSON-lines feed path 读取已解密明文 event 并接入 replay 共用的 pipeline；`check` 用于查看 resolved plan，`status` 用于查看 health/spool/exporter/metrics 快照。
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
-- 当前 `FjallSpool` 存储的是带 schema 的 `SpoolPayload`；ingress lane 当前写入 JSON framed `CapturedBytes`，export lane 当前写入 JSON framed `EventEnvelope`。reader 只返回已越过 lane durable high-water sequence 的条目，避免并发 exporter 读到已 commit 但尚未 `SyncAll` 持久化完成的事件。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
+- 当前 `FjallSpool` 存储的是带 schema 的 `SpoolPayload`；ingress lane 当前写入 JSON framed `CapturedBytes`，export lane 当前写入 JSON framed `EventEnvelope`。reader 只返回已越过 lane durable high-water sequence 的条目，避免并发 exporter 读到已 commit 但尚未 `SyncAll` 持久化完成的事件；`status` 使用同一 durable high-water 生成 spool/export lag 快照。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
 
 ## 5. 部署与平台
 
@@ -118,7 +118,7 @@ V1 明确不做：
 - `required_capabilities`：缺失时策略不启用，或 agent 按配置 fail fast。
 - `preferred_capabilities`：缺失时策略降级运行，并产生 degraded 状态。
 
-不允许静默降级。任何能力缺失必须出现在 health、metrics、admin API 和相关事件 envelope 中。
+不允许静默降级。任何能力缺失必须出现在 capability matrix、metrics、admin API 和相关事件 envelope 中；active health 只聚合当前 capture/spool/exporter/policy 执行面的健康度，避免把路线图缺口伪装成运行故障。
 
 ## 7. Selector 模型
 
@@ -444,7 +444,7 @@ LuaJIT 运行策略：
 
 - 默认使用 LuaJIT。
 - 启动时检测 JIT 状态。
-- JIT 不可用时允许解释模式降级，并在 capability/health 中标记。
+- JIT 不可用时允许解释模式降级，并在 capability matrix、policy runtime status 和 metrics 中标记；只有当前启用策略运行面因此实际降级时才进入 active health。
 - 需要额外验证 aarch64 和企业发行版环境，因为 JIT 可能受可执行内存策略、seccomp、SELinux、老 glibc 或容器限制影响。
 
 LuaJIT FFI：
@@ -653,7 +653,7 @@ V1 执行语义：
 
 - `[export] worker_enabled = true` 是默认行为；只有 RuntimePlan 中存在 planned exporter sinks 时，`run` 才会启动后台 exporter worker。
 - `[export] worker_interval_ms` 控制 worker 两轮有界 drain 之间的固定间隔；worker 开启时该值必须大于 0。当前每轮对每个 sink 最多发送一个 batch，并对单个 worker sink drain 使用固定 timeout，避免把 live worker 变成无界 tail flush 或被单个挂起 sink 永久卡住；这仍不等同于未来的 retry/backoff、per-sink quota 或 retention deadline。
-- `RuntimePlan.export` 会规范化 effective worker 状态、worker sink execution spec 和 fixed bounded worker mode；`run` 的后台 worker 和退出前 tail drain 都从该 plan 构造 sink execution config，而不是重新解释 raw exporter config。没有 configured exporter 或显式禁用 worker 时，`check` 会显示 worker disabled 的原因。
+- `RuntimePlan.export` 会规范化 effective worker 状态、worker sink execution spec 和 fixed bounded worker mode；`run` 的后台 worker 和退出前 tail drain 都从该 plan 构造 sink execution config，而不是重新解释 raw exporter config。没有 planned exporter sink 或显式禁用 worker 时，`check` 会显示 worker disabled 的原因。
 - `run` 结束时仍会尽力执行一次尾部 drain，使 `--max-events` smoke、plaintext feed 和其它有限运行场景能够把最后一批事件同步推出；即使 pipeline 已返回错误，也会先停止 worker 并尝试 tail drain，再按错误优先级返回。
 
 配置/策略签名：
@@ -798,9 +798,9 @@ V1 的 HTTP(S) exporter 是 webhook 风格，但必须定义协议语义。
 - `acked_cursor` 如果存在，必须落在当前 batch 的 sequence 范围内。
 - 如果 ack 只返回 event ids，agent 只在这些 ids 构成当前 batch 的连续前缀时推进 cursor，避免跳过未确认事件。
 - `run` 使用 `config.exporters` 中的 exporter `id` 作为独立 sink cursor；exporter `id` 必须唯一，且不能使用保留的 `replay-webhook`。
-- `run` 默认在后台启动 configured exporter worker，按 `[export].worker_interval_ms` 周期对每个 configured sink 执行有界 drain；没有 configured exporter 或 `[export].worker_enabled = false` 时不启动 worker。
-- `run` 在当前 pipeline run 结束后仍对每个 configured sink 尽力执行一次尾部 drain，直到该 sink 队列为空或 ack 无法推进 cursor；pipeline 错误不会跳过这次 tail drain。
-- 一次 drain 会尝试所有 configured sinks；某个 sink 失败不会阻止后续 sink，但本次命令最终会返回聚合失败，避免静默丢掉外发错误。
+- `run` 默认在后台启动 planned exporter worker，按 `[export].worker_interval_ms` 周期对每个 planned sink 执行有界 drain；没有 planned exporter sink 或 `[export].worker_enabled = false` 时不启动 worker。
+- `run` 在当前 pipeline run 结束后仍对每个 planned sink 尽力执行一次尾部 drain，直到该 sink 队列为空或 ack 无法推进 cursor；pipeline 错误不会跳过这次 tail drain。
+- 一次 drain 会尝试所有 planned sinks；某个 sink 失败不会阻止后续 sink，但本次命令最终会返回聚合失败，避免静默丢掉外发错误。
 - `replay` CLI 保留独立的 `replay-webhook` sink，便于本地调试不污染配置 sink cursor。
 - webhook 自定义 headers 可配置，但 `content-type`、`x-sssa-codec` 和 `idempotency-key` 属于协议头，配置中禁止覆盖。
 - retry/backoff 调度、per-sink quota 和 retention deadline 尚未实现；当前 worker 采用固定间隔、每 sink 每轮有界 batch 和固定 sink timeout 的 best-effort drain，失败只记录错误并等待下一轮。
@@ -870,6 +870,12 @@ V1 的 HTTP(S) exporter 是 webhook 风格，但必须定义协议语义。
 ## 26. 管理 API 与自观测
 
 本地管理接口使用 root-owned Unix socket。
+
+当前实现状态：
+
+- 已实现 CLI `status --config <path>`，输出可复用的 JSON snapshot：health、capture status、capability matrix、offline spool high-water、planned exporter sink cursor/lag 和 metrics counters。`health` 表示当前 active capture/spool/exporter 状态；capability matrix 和 capability metrics 保持独立，避免把路线图缺口伪装成当前运行故障。
+- `status` 对配置/runtime plan 错误 fail fast；对 spool 缺失、尚未初始化或读取失败不伪装成功，也不会为 status 查询创建 spool，而是在 snapshot 中标记 `spool.mode = unavailable`，并把相关 exporter 标记 unavailable。当前 CLI status 是 offline probe：如果 spool 已由正在运行的 agent 持有，会显式标记 `spool.mode = degraded` 和 busy reason，而不是伪装成坏 spool 或在线 admin snapshot。
+- 尚未实现 root-owned Unix socket server、reload、debug dump 和 Prometheus adapter；这些后续应复用同一 status snapshot 构建器，并承担运行中 agent 的在线状态查询。
 
 能力：
 
@@ -1013,6 +1019,7 @@ V1 CLI 至少提供：
 
 - `run`：启动 agent；默认持续运行，`--max-events` 用于 smoke/e2e 中对 live provider 做有界采集。`--max-events` 是硬 capture event 数上限，不保证读到 flow close 边界，也不替代完整 close/flush 行为验收。
 - `check`：校验配置和 policy bundle。
+- `status`：输出 runtime/admin/metrics snapshot。
 - `replay`：用 pcap/spool 样本跑 parser/policy/exporter。
 - `capabilities`：输出 capability matrix。
 
@@ -1170,7 +1177,7 @@ enforcement 抽象验收：
 | payload 默认 | selector 命中目标默认完整 payload，不是全机完整 payload | 第 14 节 |
 | 过载语义 | 有界无损 + 显式 degraded/gap | 第 14 节 |
 | 策略语言 | mlua + LuaJIT | 第 15 节 |
-| LuaJIT 降级 | JIT 不可用时解释模式降级并标记 health/capability | 第 15 节 |
+| LuaJIT 降级 | JIT 不可用时解释模式降级并标记 capability matrix、policy runtime status 和 metrics；仅当前策略运行面实际降级时进入 active health | 第 15 节 |
 | LuaJIT FFI | 默认禁用 | 第 15 节 |
 | Policy Bundle | manifest + main.lua + bundle-local modules | 第 16 节 |
 | 策略 Hook | 分阶段 Hook，selector 先预过滤 | 第 17 节 |

@@ -1,4 +1,7 @@
 use std::{
+    collections::BTreeMap,
+    fs,
+    io::ErrorKind,
     path::Path,
     sync::{Mutex, MutexGuard},
 };
@@ -14,11 +17,24 @@ const EXPORT_CURSORS: &str = "export_cursors";
 const METADATA: &str = "metadata";
 const LAST_INGRESS_SEQUENCE: &[u8] = b"last_ingress_sequence";
 const LAST_EXPORT_SEQUENCE: &[u8] = b"last_export_sequence";
+const SPOOL_MARKER_FILE: &str = "sssa-spool-format";
+const SPOOL_MARKER_CONTENT: &[u8] = b"sssa-probe-spool-v1\n";
+const SPOOL_READY_FILE: &str = "sssa-spool-ready";
+const SPOOL_READY_CONTENT: &[u8] = b"ready\n";
 
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("fjall storage error: {0}")]
     Fjall(#[from] fjall::Error),
+    #[error("filesystem error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid spool marker at {path}")]
+    InvalidSpoolMarker { path: String },
+    #[error("invalid cursor sink name utf-8")]
+    InvalidCursorSinkName {
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
     #[error("invalid cursor value for sink {sink}: expected 8 bytes, got {len}")]
     InvalidCursor { sink: String, len: usize },
     #[error("invalid metadata value for key {key}: expected 8 bytes, got {len}")]
@@ -72,6 +88,27 @@ pub struct StoredEvent {
     pub payload: SpoolPayload,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpoolSnapshot {
+    pub last_ingress_sequence: u64,
+    pub last_export_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpoolProbe {
+    Missing,
+    Incomplete {
+        reason: String,
+    },
+    Busy {
+        reason: String,
+    },
+    Available {
+        snapshot: SpoolSnapshot,
+        export_cursors: BTreeMap<String, u64>,
+    },
+}
+
 pub trait DurableSpool {
     fn append_ingress(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError>;
 
@@ -108,7 +145,8 @@ pub struct FjallSpool {
 
 impl FjallSpool {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let database = Database::builder(path.as_ref()).open()?;
+        let path = path.as_ref();
+        let database = Database::builder(path).open()?;
         let ingress_journal = database.keyspace(INGRESS_JOURNAL, KeyspaceCreateOptions::default)?;
         let export_queue = database.keyspace(EXPORT_QUEUE, KeyspaceCreateOptions::default)?;
         let ingress_cursors = database.keyspace(INGRESS_CURSORS, KeyspaceCreateOptions::default)?;
@@ -118,7 +156,7 @@ impl FjallSpool {
             read_last_sequence(&ingress_journal, &metadata, LAST_INGRESS_SEQUENCE)?;
         let last_export_sequence =
             read_last_sequence(&export_queue, &metadata, LAST_EXPORT_SEQUENCE)?;
-        Ok(Self {
+        let spool = Self {
             database,
             ingress_journal,
             export_queue,
@@ -127,7 +165,44 @@ impl FjallSpool {
             metadata,
             last_ingress_sequence: Mutex::new(last_ingress_sequence),
             last_export_sequence: Mutex::new(last_export_sequence),
-        })
+        };
+        ensure_spool_markers(path)?;
+        Ok(spool)
+    }
+
+    pub fn probe(path: impl AsRef<Path>) -> Result<SpoolProbe, StorageError> {
+        let path = path.as_ref();
+        if !path.try_exists()? {
+            return Ok(SpoolProbe::Missing);
+        }
+        if !read_spool_marker(path)? {
+            return Ok(SpoolProbe::Incomplete {
+                reason: "spool marker is missing".to_string(),
+            });
+        }
+        if !read_spool_ready_marker(path)? {
+            return Ok(SpoolProbe::Incomplete {
+                reason: "spool ready marker is missing".to_string(),
+            });
+        }
+
+        match Self::open(path) {
+            Ok(spool) => Ok(SpoolProbe::Available {
+                snapshot: spool.snapshot()?,
+                export_cursors: spool.export_cursor_snapshot()?,
+            }),
+            Err(StorageError::Fjall(fjall::Error::Locked)) => Ok(SpoolProbe::Busy {
+                reason: "spool database is locked by another process".to_string(),
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn is_initialized(path: impl AsRef<Path>) -> Result<bool, StorageError> {
+        Ok(matches!(
+            Self::probe(path)?,
+            SpoolProbe::Available { .. } | SpoolProbe::Busy { .. }
+        ))
     }
 
     pub fn append_ingress(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError> {
@@ -168,6 +243,30 @@ impl FjallSpool {
 
     pub fn export_cursor(&self, sink: &str) -> Result<u64, StorageError> {
         self.cursor_for_lane(SpoolLane::Export, sink)
+    }
+
+    pub fn snapshot(&self) -> Result<SpoolSnapshot, StorageError> {
+        Ok(SpoolSnapshot {
+            last_ingress_sequence: *self.lock_last_sequence(SpoolLane::Ingress)?,
+            last_export_sequence: *self.lock_last_sequence(SpoolLane::Export)?,
+        })
+    }
+
+    fn export_cursor_snapshot(&self) -> Result<BTreeMap<String, u64>, StorageError> {
+        let mut cursors = BTreeMap::new();
+        for item in self.export_cursors.iter() {
+            let (key, value) = item.into_inner()?;
+            let sink = String::from_utf8(key.as_ref().to_vec())
+                .map_err(|source| StorageError::InvalidCursorSinkName { source })?;
+            if value.len() != 8 {
+                return Err(StorageError::InvalidCursor {
+                    sink,
+                    len: value.len(),
+                });
+            }
+            cursors.insert(sink, decode_sequence_key(value.as_ref()));
+        }
+        Ok(cursors)
     }
 
     fn append_payload(
@@ -389,6 +488,40 @@ fn decode_exact_sequence_key(key: &[u8], bytes: &[u8]) -> Result<u64, StorageErr
     Ok(decode_sequence_key(bytes))
 }
 
+fn ensure_spool_markers(path: &Path) -> Result<(), StorageError> {
+    ensure_marker_file(path, SPOOL_MARKER_FILE, SPOOL_MARKER_CONTENT)?;
+    ensure_marker_file(path, SPOOL_READY_FILE, SPOOL_READY_CONTENT)?;
+    Ok(())
+}
+
+fn read_spool_marker(path: &Path) -> Result<bool, StorageError> {
+    read_marker_file(path, SPOOL_MARKER_FILE, SPOOL_MARKER_CONTENT)
+}
+
+fn read_spool_ready_marker(path: &Path) -> Result<bool, StorageError> {
+    read_marker_file(path, SPOOL_READY_FILE, SPOOL_READY_CONTENT)
+}
+
+fn ensure_marker_file(path: &Path, name: &str, content: &[u8]) -> Result<(), StorageError> {
+    if read_marker_file(path, name, content)? {
+        return Ok(());
+    }
+    fs::write(path.join(name), content)?;
+    Ok(())
+}
+
+fn read_marker_file(path: &Path, name: &str, content: &[u8]) -> Result<bool, StorageError> {
+    let marker_path = path.join(name);
+    match fs::read(&marker_path) {
+        Ok(existing_content) if existing_content == content => Ok(true),
+        Ok(_) => Err(StorageError::InvalidSpoolMarker {
+            path: marker_path.display().to_string(),
+        }),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn encode_spool_payload(payload: &SpoolPayload) -> Result<Vec<u8>, StorageError> {
     let schema = payload.schema.as_bytes();
     let schema_len = u32::try_from(schema.len())
@@ -420,9 +553,14 @@ fn decode_spool_payload(bytes: &[u8]) -> Result<SpoolPayload, StorageError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::tempdir;
 
-    use crate::{FjallSpool, SpoolPayload, encode_spool_payload, sequence_key};
+    use crate::{
+        FjallSpool, SPOOL_MARKER_CONTENT, SPOOL_MARKER_FILE, SPOOL_READY_FILE, SpoolPayload,
+        SpoolProbe, encode_spool_payload, sequence_key,
+    };
 
     #[test]
     fn spool_tracks_per_sink_cursors() -> Result<(), Box<dyn std::error::Error>> {
@@ -547,6 +685,77 @@ mod tests {
         spool.append_export(test_payload(b"one"))?;
 
         assert!(spool.read_export_batch("primary", 0)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn initialization_probe_does_not_create_spool() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+
+        assert!(!FjallSpool::is_initialized(temp.path())?);
+        assert!(temp.path().read_dir()?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn initialization_probe_rejects_marker_without_ready_marker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        fs::write(temp.path().join(SPOOL_MARKER_FILE), SPOOL_MARKER_CONTENT)?;
+
+        assert!(!FjallSpool::is_initialized(temp.path())?);
+        assert!(!temp.path().join(SPOOL_READY_FILE).try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn open_writes_spool_markers() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+
+        let _spool = FjallSpool::open(temp.path())?;
+
+        assert!(FjallSpool::is_initialized(temp.path())?);
+        Ok(())
+    }
+
+    #[test]
+    fn status_probe_reports_snapshot_and_export_cursors() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        spool.append_ingress(test_payload(b"raw-one"))?;
+        spool.append_export(test_payload(b"event-one"))?;
+        spool.append_export(test_payload(b"event-two"))?;
+        spool.ack_export("primary", 1)?;
+        drop(spool);
+
+        let probe = FjallSpool::probe(temp.path())?;
+
+        let SpoolProbe::Available {
+            snapshot,
+            export_cursors,
+        } = probe
+        else {
+            panic!("expected available spool probe");
+        };
+        assert_eq!(snapshot.last_ingress_sequence, 1);
+        assert_eq!(snapshot.last_export_sequence, 2);
+        assert_eq!(export_cursors.get("primary"), Some(&1));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_reports_durable_lane_high_water() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        spool.append_ingress(test_payload(b"raw-one"))?;
+        spool.append_ingress(test_payload(b"raw-two"))?;
+        spool.append_export(test_payload(b"event-one"))?;
+
+        let snapshot = spool.snapshot()?;
+
+        assert_eq!(snapshot.last_ingress_sequence, 2);
+        assert_eq!(snapshot.last_export_sequence, 1);
         Ok(())
     }
 

@@ -89,7 +89,7 @@ impl ExportPlan {
         });
         let reason = match (config.export.worker_enabled, sinks.is_empty()) {
             (false, _) => Some("export worker disabled by config".to_string()),
-            (true, true) => Some("export worker has no configured sinks".to_string()),
+            (true, true) => Some("export worker has no planned sinks".to_string()),
             (true, false) => None,
         };
 
@@ -532,7 +532,7 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::degraded(
             CapabilityKind::WebhookExporter,
-            "webhook transport can drain configured export queues during run and replay CLI webhook output during replay, but retry/backoff, per-sink quota, and retention deadline are not implemented",
+            "webhook transport can drain planned export sinks during run and replay CLI webhook output during replay, but retry/backoff, per-sink quota, and retention deadline are not implemented",
         ),
         CapabilityState::available(
             CapabilityKind::DryRunEnforcement,
@@ -639,7 +639,7 @@ mod tests {
         assert_eq!(plan.export.sinks, Vec::<ExportSinkPlan>::new());
         assert_eq!(
             plan.export.reason.as_deref(),
-            Some("export worker has no configured sinks")
+            Some("export worker has no planned sinks")
         );
         Ok(())
     }

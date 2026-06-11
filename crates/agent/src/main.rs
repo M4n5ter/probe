@@ -6,6 +6,7 @@ use std::{
 
 mod export;
 mod plaintext_feed;
+mod status;
 
 use attribution::ProcfsSocketResolver;
 use capture::{
@@ -28,6 +29,7 @@ use probe_core::{
 use runtime::{
     CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimeError, RuntimePlan,
 };
+use status::{build_status_snapshot, collect_spool_status};
 use storage::FjallSpool;
 use thiserror::Error;
 
@@ -85,6 +87,10 @@ enum Command {
         config: PathBuf,
     },
     Capabilities,
+    Status {
+        #[arg(long)]
+        config: PathBuf,
+    },
     Replay {
         #[arg(long)]
         input: PathBuf,
@@ -169,7 +175,9 @@ struct ReplayCommand {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
     if let Err(error) = run(Cli::parse()).await {
         eprintln!("{error}");
         std::process::exit(1);
@@ -231,6 +239,12 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
         Command::Capabilities => {
             let matrix = default_provider_registry(&AgentConfig::default()).capability_matrix();
             println!("{}", serde_json::to_string_pretty(&matrix)?);
+        }
+        Command::Status { config } => {
+            let plan = read_runtime_plan(&config)?;
+            let spool_status = collect_spool_status(&plan);
+            let snapshot = build_status_snapshot(&plan, spool_status);
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
         Command::Replay {
             input,
