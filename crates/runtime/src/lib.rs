@@ -100,6 +100,7 @@ pub enum ExportWorkerPlan {
         interval_ms: u64,
         batches_per_sink_per_tick: u64,
         sink_timeout_ms: u64,
+        failure_backoff_ms: u64,
     },
 }
 
@@ -119,10 +120,12 @@ impl From<ExportWorkerScheduleConfig> for ExportWorkerPlan {
                 interval_ms,
                 batches_per_sink_per_tick,
                 sink_timeout_ms,
+                failure_backoff_ms,
             } => Self::FixedIntervalBounded {
                 interval_ms,
                 batches_per_sink_per_tick,
                 sink_timeout_ms,
+                failure_backoff_ms,
             },
         }
     }
@@ -562,7 +565,7 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::degraded(
             CapabilityKind::WebhookExporter,
-            "webhook transport can drain planned export sinks with configured fixed worker bounds during run and replay CLI webhook output during replay, but adaptive retry/backoff, per-sink rate quota, and retention deadline are not implemented",
+            "webhook transport can drain planned export sinks with configured fixed worker bounds and fixed failure backoff during run and replay CLI webhook output during replay, but adaptive/exponential backoff, per-sink rate quota, and retention deadline are not implemented",
         ),
         CapabilityState::available(
             CapabilityKind::DryRunEnforcement,

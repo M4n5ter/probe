@@ -23,6 +23,7 @@ fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {
             interval_ms: 1_000,
             batches_per_sink_per_tick: 1,
             sink_timeout_ms: 10_000,
+            failure_backoff_ms: 30_000,
         }
     );
     assert_eq!(config.exporters, Vec::<ExporterConfig>::new());
@@ -63,6 +64,7 @@ mode = "fixed_interval_bounded"
 interval_ms = 250
 batches_per_sink_per_tick = 3
 sink_timeout_ms = 2000
+failure_backoff_ms = 5000
 
 [[exporters]]
 id = "primary"
@@ -106,6 +108,7 @@ socket_path = "/run/sssa-probe/admin.sock"
             interval_ms: 250,
             batches_per_sink_per_tick: 3,
             sink_timeout_ms: 2_000,
+            failure_backoff_ms: 5_000,
         }
     );
     assert_eq!(config.exporters[0].codec, CompressionCodecName::Zstd);
@@ -118,6 +121,33 @@ socket_path = "/run/sssa-probe/admin.sock"
         config.admin.socket_path,
         PathBuf::from("/run/sssa-probe/admin.sock")
     );
+    Ok(())
+}
+
+#[test]
+fn export_worker_schedule_uses_defaults_for_omitted_fields()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[export.worker]
+enabled = true
+
+[export.worker.schedule]
+mode = "fixed_interval_bounded"
+interval_ms = 250
+"#,
+    )?;
+
+    assert_eq!(
+        config.export.worker.schedule,
+        ExportWorkerScheduleConfig::FixedIntervalBounded {
+            interval_ms: 250,
+            batches_per_sink_per_tick: 1,
+            sink_timeout_ms: 10_000,
+            failure_backoff_ms: 30_000,
+        }
+    );
+    config.validate_basic()?;
     Ok(())
 }
 
@@ -322,6 +352,7 @@ mode = "fixed_interval_bounded"
 interval_ms = 0
 batches_per_sink_per_tick = 0
 sink_timeout_ms = 0
+failure_backoff_ms = 0
 "#,
     )?;
 
@@ -343,6 +374,11 @@ sink_timeout_ms = 0
             .to_string()
             .contains("export worker sink timeout must be positive")
     );
+    assert!(
+        error
+            .to_string()
+            .contains("export worker failure backoff must be positive")
+    );
 
     let disabled = AgentConfig::from_toml_str(
         r#"
@@ -354,6 +390,7 @@ mode = "fixed_interval_bounded"
 interval_ms = 0
 batches_per_sink_per_tick = 0
 sink_timeout_ms = 0
+failure_backoff_ms = 0
 "#,
     )?;
     disabled.validate_basic()?;

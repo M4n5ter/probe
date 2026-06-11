@@ -1,5 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use exporter::{CompressionCodec, ReliableExporter, WebhookExporter};
 use probe_config::{CompressionCodecName, ExporterTransport};
@@ -43,6 +47,7 @@ pub struct ExportWorkerConfig {
     interval: Duration,
     batches_per_sink_per_tick: u64,
     sink_timeout: Duration,
+    failure_backoff: Duration,
 }
 
 impl ExportWorkerConfig {
@@ -52,6 +57,7 @@ impl ExportWorkerConfig {
         interval: Duration,
         batches_per_sink_per_tick: u64,
         sink_timeout: Duration,
+        failure_backoff: Duration,
     ) -> Self {
         Self {
             agent_id,
@@ -59,6 +65,7 @@ impl ExportWorkerConfig {
             interval,
             batches_per_sink_per_tick,
             sink_timeout,
+            failure_backoff,
         }
     }
 
@@ -69,12 +76,14 @@ impl ExportWorkerConfig {
                 interval_ms,
                 batches_per_sink_per_tick,
                 sink_timeout_ms,
+                failure_backoff_ms,
             } => Some(Self::fixed_interval_bounded(
                 agent_id,
                 plan.sinks.clone(),
                 Duration::from_millis(*interval_ms),
                 *batches_per_sink_per_tick,
                 Duration::from_millis(*sink_timeout_ms),
+                Duration::from_millis(*failure_backoff_ms),
             )),
         }
     }
@@ -111,8 +120,10 @@ where
     let task_stop_requested = Arc::clone(&stop_requested);
     let task_stop_notify = Arc::clone(&stop_notify);
     let task = tokio::spawn(async move {
+        let mut backoff = ExportWorkerBackoff::new(config.failure_backoff);
         while !task_stop_requested.load(Ordering::Relaxed) {
-            if let Err(error) = drain_export_sinks_once(spool.as_ref(), &config).await {
+            if let Err(error) = drain_export_sinks_once(spool.as_ref(), &config, &mut backoff).await
+            {
                 eprintln!("export worker drain failed: {error}");
             }
             if task_stop_requested.load(Ordering::Relaxed) {
@@ -142,17 +153,35 @@ pub async fn drain_planned_sinks(
 async fn drain_export_sinks_once(
     spool: &impl DurableSpool,
     config: &ExportWorkerConfig,
+    backoff: &mut ExportWorkerBackoff,
 ) -> Result<(), ExportDrainError> {
-    drain_export_sinks_with_mode(
-        spool,
-        &config.agent_id,
-        &config.sinks,
-        SinkDrainMode::MaxBatches {
-            max_batches: config.batches_per_sink_per_tick,
-            sink_timeout: config.sink_timeout,
-        },
-    )
-    .await
+    let mode = SinkDrainMode::MaxBatches {
+        max_batches: config.batches_per_sink_per_tick,
+        sink_timeout: config.sink_timeout,
+    };
+    let mut failures = Vec::new();
+    for sink in &config.sinks {
+        let now = Instant::now();
+        if backoff.should_skip(&sink.id, now) {
+            continue;
+        }
+        let result = drain_export_sink_with_mode(spool, &config.agent_id, sink, mode).await;
+        match result {
+            Ok(()) => backoff.record_success(&sink.id),
+            Err(error) => {
+                eprintln!("exporter sink {} failed: {error}", sink.id);
+                backoff.record_failure(&sink.id);
+                failures.push(format!("{}: {error}", sink.id));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ExportDrainError::MultipleSinksFailed {
+            failures: failures.join("; "),
+        })
+    }
 }
 
 async fn drain_export_sinks_with_mode(
@@ -163,10 +192,7 @@ async fn drain_export_sinks_with_mode(
 ) -> Result<(), ExportDrainError> {
     let mut failures = Vec::new();
     for sink in sinks {
-        let result = match webhook_export_target_from_plan_sink(sink) {
-            Ok(target) => drain_webhook_sink_with_mode(spool, agent_id, target, mode).await,
-            Err(error) => Err(error),
-        };
+        let result = drain_export_sink_with_mode(spool, agent_id, sink, mode).await;
         if let Err(error) = result {
             eprintln!("exporter sink {} failed: {error}", sink.id);
             failures.push(format!("{}: {error}", sink.id));
@@ -178,6 +204,60 @@ async fn drain_export_sinks_with_mode(
         Err(ExportDrainError::MultipleSinksFailed {
             failures: failures.join("; "),
         })
+    }
+}
+
+async fn drain_export_sink_with_mode(
+    spool: &impl DurableSpool,
+    agent_id: &str,
+    sink: &ExportSinkPlan,
+    mode: SinkDrainMode,
+) -> Result<(), ExportDrainError> {
+    match webhook_export_target_from_plan_sink(sink) {
+        Ok(target) => drain_webhook_sink_with_mode(spool, agent_id, target, mode).await,
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Debug)]
+struct ExportWorkerBackoff {
+    failure_backoff: Duration,
+    retry_after: HashMap<String, Option<Instant>>,
+}
+
+impl ExportWorkerBackoff {
+    fn new(failure_backoff: Duration) -> Self {
+        Self {
+            failure_backoff,
+            retry_after: HashMap::new(),
+        }
+    }
+
+    fn should_skip(&mut self, sink: &str, now: Instant) -> bool {
+        match self.retry_after.get(sink).copied() {
+            Some(None) => true,
+            Some(Some(retry_after)) if retry_after > now => true,
+            Some(Some(_)) => {
+                self.retry_after.remove(sink);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn record_failure(&mut self, sink: &str) {
+        self.record_failure_at(sink, Instant::now());
+    }
+
+    fn record_failure_at(&mut self, sink: &str, failed_at: Instant) {
+        self.retry_after.insert(
+            sink.to_string(),
+            failed_at.checked_add(self.failure_backoff),
+        );
+    }
+
+    fn record_success(&mut self, sink: &str) {
+        self.retry_after.remove(sink);
     }
 }
 

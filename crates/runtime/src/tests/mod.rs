@@ -96,6 +96,7 @@ fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::err
             interval_ms: 250,
             batches_per_sink_per_tick: 3,
             sink_timeout_ms: 2_000,
+            failure_backoff_ms: 5_000,
         };
     config.exporters = vec![probe_config::ExporterConfig {
         id: "primary".to_string(),
@@ -113,6 +114,7 @@ fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::err
             interval_ms: 250,
             batches_per_sink_per_tick: 3,
             sink_timeout_ms: 2_000,
+            failure_backoff_ms: 5_000,
         }
     );
     assert_eq!(

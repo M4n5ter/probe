@@ -12,6 +12,23 @@ const REPLAY_WEBHOOK_SINK_ID: &str = "replay-webhook";
 pub const DEFAULT_EXPORT_WORKER_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK: u64 = 1;
 pub const DEFAULT_EXPORT_SINK_TIMEOUT_MS: u64 = 10_000;
+pub const DEFAULT_EXPORT_FAILURE_BACKOFF_MS: u64 = 30_000;
+
+fn default_export_worker_interval_ms() -> u64 {
+    DEFAULT_EXPORT_WORKER_INTERVAL_MS
+}
+
+fn default_export_batches_per_sink_per_tick() -> u64 {
+    DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK
+}
+
+fn default_export_sink_timeout_ms() -> u64 {
+    DEFAULT_EXPORT_SINK_TIMEOUT_MS
+}
+
+fn default_export_failure_backoff_ms() -> u64 {
+    DEFAULT_EXPORT_FAILURE_BACKOFF_MS
+}
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -218,12 +235,17 @@ impl Default for ExportWorkerRuntimeConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "mode")]
+#[serde(rename_all = "snake_case", tag = "mode", deny_unknown_fields)]
 pub enum ExportWorkerScheduleConfig {
     FixedIntervalBounded {
+        #[serde(default = "default_export_worker_interval_ms")]
         interval_ms: u64,
+        #[serde(default = "default_export_batches_per_sink_per_tick")]
         batches_per_sink_per_tick: u64,
+        #[serde(default = "default_export_sink_timeout_ms")]
         sink_timeout_ms: u64,
+        #[serde(default = "default_export_failure_backoff_ms")]
+        failure_backoff_ms: u64,
     },
 }
 
@@ -233,6 +255,7 @@ impl Default for ExportWorkerScheduleConfig {
             interval_ms: DEFAULT_EXPORT_WORKER_INTERVAL_MS,
             batches_per_sink_per_tick: DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK,
             sink_timeout_ms: DEFAULT_EXPORT_SINK_TIMEOUT_MS,
+            failure_backoff_ms: DEFAULT_EXPORT_FAILURE_BACKOFF_MS,
         }
     }
 }
@@ -539,6 +562,7 @@ fn validate_export_runtime(export: &ExportRuntimeConfig, violations: &mut Vec<Co
         interval_ms,
         batches_per_sink_per_tick,
         sink_timeout_ms,
+        failure_backoff_ms,
     } = export.worker.schedule;
     for (field, value, reason) in [
         (
@@ -555,6 +579,11 @@ fn validate_export_runtime(export: &ExportRuntimeConfig, violations: &mut Vec<Co
             "export.worker.schedule.sink_timeout_ms",
             sink_timeout_ms,
             "export worker sink timeout must be positive when the worker is enabled",
+        ),
+        (
+            "export.worker.schedule.failure_backoff_ms",
+            failure_backoff_ms,
+            "export worker failure backoff must be positive when the worker is enabled",
         ),
     ] {
         if value == 0 {

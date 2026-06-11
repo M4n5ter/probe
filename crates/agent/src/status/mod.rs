@@ -429,6 +429,7 @@ mod tests {
                 interval_ms: 1_000,
                 batches_per_sink_per_tick: 1,
                 sink_timeout_ms: 10_000,
+                failure_backoff_ms: 30_000,
             }
         );
         assert_eq!(snapshot.policy.mode, PolicyStatusMode::Inactive);
