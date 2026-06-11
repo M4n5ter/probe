@@ -1,0 +1,500 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
+use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
+use probe_core::{Action, DomainEvent, EventEnvelope, EventKind, Verdict};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+const DEFAULT_INSTRUCTION_BUDGET: u64 = 100_000;
+const DEFAULT_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const INSTRUCTION_HOOK_INTERVAL: u32 = 1_000;
+pub const POLICY_HOOKS: &[&str] = &[
+    "on_connection_opened",
+    "on_connection_closed",
+    "on_http_request_headers",
+    "on_http_response_headers",
+    "on_http_body_chunk",
+    "on_sse_event",
+    "on_opaque_stream",
+    "on_gap",
+    "on_protocol_error",
+    "on_policy_alert",
+    "on_policy_verdict",
+];
+
+#[derive(Debug, Error)]
+pub enum PolicyError {
+    #[error("failed to initialize Lua policy: {0}")]
+    Init(#[from] mlua::Error),
+    #[error("policy returned an invalid outcome: {0}")]
+    InvalidOutcome(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyManifest {
+    pub id: String,
+    pub version: String,
+    pub hooks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PolicyOutcome {
+    Alert(DomainEvent),
+    Verdict(Verdict),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyLimits {
+    pub instruction_budget: u64,
+    pub memory_limit_bytes: usize,
+}
+
+impl Default for PolicyLimits {
+    fn default() -> Self {
+        Self {
+            instruction_budget: DEFAULT_INSTRUCTION_BUDGET,
+            memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES,
+        }
+    }
+}
+
+pub struct PolicyRuntime {
+    manifest: PolicyManifest,
+    lua: Lua,
+    limits: PolicyLimits,
+    instruction_budget: Arc<AtomicU64>,
+}
+
+impl PolicyRuntime {
+    pub fn from_source(manifest: PolicyManifest, source: &str) -> Result<Self, PolicyError> {
+        Self::from_source_with_limits(manifest, source, PolicyLimits::default())
+    }
+
+    pub fn from_source_with_limits(
+        manifest: PolicyManifest,
+        source: &str,
+        limits: PolicyLimits,
+    ) -> Result<Self, PolicyError> {
+        let lua = Lua::new_with(policy_stdlibs(), LuaOptions::default())?;
+        lua.set_memory_limit(limits.memory_limit_bytes)?;
+        let instruction_budget = Arc::new(AtomicU64::new(limits.instruction_budget));
+        install_instruction_budget(&lua, Arc::clone(&instruction_budget))?;
+        install_probe_api(&lua)?;
+        remove_host_capabilities(&lua)?;
+        instruction_budget.store(limits.instruction_budget, Ordering::Relaxed);
+        lua.load(source).set_name(&manifest.id).exec()?;
+        Ok(Self {
+            manifest,
+            lua,
+            limits,
+            instruction_budget,
+        })
+    }
+
+    pub fn manifest(&self) -> &PolicyManifest {
+        &self.manifest
+    }
+
+    pub fn handle_event(
+        &self,
+        hook: &str,
+        event: &EventEnvelope,
+    ) -> Result<Vec<PolicyOutcome>, PolicyError> {
+        if !self
+            .manifest
+            .hooks
+            .iter()
+            .any(|registered| registered == hook)
+        {
+            return Ok(Vec::new());
+        }
+
+        let globals = self.lua.globals();
+        let value = globals.get::<Value>(hook)?;
+        let Value::Function(function) = value else {
+            return Ok(Vec::new());
+        };
+
+        self.instruction_budget
+            .store(self.limits.instruction_budget, Ordering::Relaxed);
+        let event_value = self.lua.to_value(event)?;
+        let returned: Value = function.call(event_value)?;
+        value_to_outcomes(&self.lua, returned)
+    }
+}
+
+fn policy_stdlibs() -> StdLib {
+    StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::BIT
+}
+
+fn install_instruction_budget(
+    lua: &Lua,
+    instruction_budget: Arc<AtomicU64>,
+) -> Result<(), mlua::Error> {
+    lua.set_hook(
+        HookTriggers::new().every_nth_instruction(INSTRUCTION_HOOK_INTERVAL),
+        move |_, _| {
+            let remaining = instruction_budget.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |remaining| remaining.checked_sub(u64::from(INSTRUCTION_HOOK_INTERVAL)),
+            );
+            match remaining {
+                Ok(_) => Ok(VmState::Continue),
+                Err(_) => Err(mlua::Error::RuntimeError(
+                    "Lua policy exceeded instruction budget".to_string(),
+                )),
+            }
+        },
+    )
+}
+
+fn install_probe_api(lua: &Lua) -> Result<(), mlua::Error> {
+    let probe = lua.create_table()?;
+    probe.set(
+        "emit_alert",
+        lua.create_function(|lua, message: String| {
+            let event = DomainEvent {
+                name: "policy_alert".to_string(),
+                severity: Action::Alert,
+                message,
+                metadata: serde_json::Value::Null,
+            };
+            lua.to_value(&event)
+        })?,
+    )?;
+    probe.set(
+        "verdict",
+        lua.create_function(|_, table: Table| Ok(Value::Table(table)))?,
+    )?;
+    lua.globals().set("probe", probe)?;
+    Ok(())
+}
+
+fn remove_host_capabilities(lua: &Lua) -> Result<(), mlua::Error> {
+    let require = lua.create_function(|_, module: String| {
+        Err::<Value, _>(mlua::Error::RuntimeError(format!(
+            "Lua module loading is disabled in policy runtime: {module}"
+        )))
+    })?;
+    let globals = lua.globals();
+    for name in [
+        "ffi",
+        "io",
+        "os",
+        "package",
+        "debug",
+        "jit",
+        "dofile",
+        "loadfile",
+        "load",
+        "collectgarbage",
+    ] {
+        globals.set(name, Value::Nil)?;
+    }
+    globals.set("require", require)?;
+    Ok(())
+}
+
+fn value_to_outcomes(lua: &Lua, value: Value) -> Result<Vec<PolicyOutcome>, PolicyError> {
+    match value {
+        Value::Nil => Ok(Vec::new()),
+        Value::Table(table) if table.raw_len() > 0 => table
+            .sequence_values::<Value>()
+            .map(|value| value.and_then(|value| table_value_to_outcome(lua, value)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| PolicyError::InvalidOutcome(error.to_string())),
+        Value::Table(table) => table_value_to_outcome(lua, Value::Table(table))
+            .map(|outcome| vec![outcome])
+            .map_err(|error| PolicyError::InvalidOutcome(error.to_string())),
+        other => Err(PolicyError::InvalidOutcome(format!(
+            "expected nil or table, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn table_value_to_outcome(lua: &Lua, value: Value) -> Result<PolicyOutcome, mlua::Error> {
+    let Value::Table(table) = &value else {
+        return Err(mlua::Error::RuntimeError(format!(
+            "expected table outcome, got {}",
+            value.type_name()
+        )));
+    };
+
+    if table.contains_key("action")? {
+        return lua.from_value::<Verdict>(value).map(PolicyOutcome::Verdict);
+    }
+
+    lua.from_value::<DomainEvent>(value)
+        .map(PolicyOutcome::Alert)
+}
+
+pub fn hook_for_event(event: &EventEnvelope) -> &'static str {
+    match &event.kind {
+        EventKind::ConnectionOpened => "on_connection_opened",
+        EventKind::ConnectionClosed => "on_connection_closed",
+        EventKind::HttpRequestHeaders(_) => "on_http_request_headers",
+        EventKind::HttpResponseHeaders(_) => "on_http_response_headers",
+        EventKind::HttpBodyChunk(_) => "on_http_body_chunk",
+        EventKind::SseEvent(_) => "on_sse_event",
+        EventKind::OpaqueStream(_) => "on_opaque_stream",
+        EventKind::Gap(_) => "on_gap",
+        EventKind::ProtocolError(_) => "on_protocol_error",
+        EventKind::PolicyAlert(_) => "on_policy_alert",
+        EventKind::PolicyVerdict(_) => "on_policy_verdict",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use probe_core::{
+        AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
+        HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+    };
+
+    use crate::{PolicyLimits, PolicyManifest, PolicyOutcome, PolicyRuntime, hook_for_event};
+
+    #[test]
+    fn lua_policy_can_return_typed_alert_verdict() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "demo".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec!["on_http_request_headers".to_string()],
+            },
+            r#"
+            function on_http_request_headers(event)
+              return {
+                action = "alert",
+                scope = "request",
+                reason = "matched " .. event.kind.target,
+                confidence = 90
+              }
+            end
+            "#,
+        )?;
+
+        let event = demo_event();
+        let outcomes = runtime.handle_event(hook_for_event(&event), &event)?;
+        let PolicyOutcome::Verdict(verdict) = outcomes.first().ok_or("missing outcome")? else {
+            return Err("missing verdict".into());
+        };
+
+        assert_eq!(verdict.reason, "matched /v1/chat");
+        assert_eq!(verdict.confidence, 90);
+        Ok(())
+    }
+
+    #[test]
+    fn lua_policy_can_emit_alert_and_verdict() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "demo".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec!["on_http_request_headers".to_string()],
+            },
+            r#"
+            function on_http_request_headers(event)
+              return {
+                probe.emit_alert("sensitive path"),
+                probe.verdict({
+                  action = "deny",
+                  scope = "request",
+                  reason = "dry-run protection",
+                  confidence = 95
+                })
+              }
+            end
+            "#,
+        )?;
+
+        let event = demo_event();
+        let outcomes = runtime.handle_event(hook_for_event(&event), &event)?;
+
+        assert!(
+            matches!(outcomes.first(), Some(PolicyOutcome::Alert(alert)) if alert.message == "sensitive path")
+        );
+        assert!(
+            matches!(outcomes.get(1), Some(PolicyOutcome::Verdict(verdict)) if verdict.reason == "dry-run protection")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lua_policy_cannot_require_ffi() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "ffi".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec!["on_http_request_headers".to_string()],
+            },
+            r#"
+            function on_http_request_headers(event)
+              require("ffi")
+            end
+            "#,
+        )?;
+
+        let event = demo_event();
+        let result = runtime.handle_event(hook_for_event(&event), &event);
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lua_policy_cannot_use_host_libraries() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "host_caps".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec!["on_http_request_headers".to_string()],
+            },
+            r#"
+            function on_http_request_headers(event)
+              if os ~= nil or io ~= nil or package ~= nil or debug ~= nil or jit ~= nil then
+                return {
+                  action = "deny",
+                  scope = "request",
+                  reason = "host capability leaked",
+                  confidence = 100
+                }
+              end
+              return {
+                action = "allow",
+                scope = "request",
+                reason = "sandboxed",
+                confidence = 100
+              }
+            end
+            "#,
+        )?;
+
+        let event = demo_event();
+        let outcomes = runtime.handle_event(hook_for_event(&event), &event)?;
+
+        assert!(
+            matches!(outcomes.first(), Some(PolicyOutcome::Verdict(verdict)) if verdict.reason == "sandboxed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lua_policy_instruction_budget_stops_infinite_loop() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let runtime = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "loop".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec!["on_http_request_headers".to_string()],
+            },
+            r#"
+            function on_http_request_headers(event)
+              while true do
+              end
+            end
+            "#,
+        )?;
+
+        let event = demo_event();
+        let result = runtime.handle_event(hook_for_event(&event), &event);
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lua_policy_memory_budget_stops_large_allocation() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = PolicyRuntime::from_source_with_limits(
+            PolicyManifest {
+                id: "memory".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec!["on_http_request_headers".to_string()],
+            },
+            r#"
+            function on_http_request_headers(event)
+              local value = string.rep("x", 2 * 1024 * 1024)
+              return {
+                action = "allow",
+                scope = "request",
+                reason = value,
+                confidence = 1
+              }
+            end
+            "#,
+            PolicyLimits {
+                instruction_budget: 100_000,
+                memory_limit_bytes: 1024 * 1024,
+            },
+        )?;
+
+        let event = demo_event();
+        let result = runtime.handle_event(hook_for_event(&event), &event);
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    fn demo_event() -> EventEnvelope {
+        EventEnvelope::new(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            demo_flow(),
+            CaptureSource::Replay,
+            "test",
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some("/v1/chat".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: vec![("host".to_string(), "example.test".to_string())],
+            }),
+        )
+    }
+
+    fn demo_flow() -> FlowContext {
+        let process = ProcessIdentity {
+            pid: 1,
+            tgid: 1,
+            start_time_ticks: 1,
+            boot_id: "boot".to_string(),
+            exe_path: "/usr/bin/demo".to_string(),
+            cmdline_hash: "hash".to_string(),
+            uid: 1000,
+            gid: 1000,
+            cgroup: None,
+            systemd_service: None,
+            container_id: None,
+            runtime_hint: None,
+        };
+        let local = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 50_000,
+        };
+        let remote = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 80,
+        };
+        FlowContext {
+            id: FlowIdentity::stable(&process, &local, &remote, TransportProtocol::Tcp, 1, None),
+            process: ProcessContext {
+                identity: process,
+                name: "demo".to_string(),
+                cmdline: vec!["demo".to_string()],
+            },
+            local,
+            remote,
+            protocol: TransportProtocol::Tcp,
+            start_monotonic_ns: 1,
+            socket_cookie: None,
+            attribution_confidence: 100,
+        }
+    }
+}

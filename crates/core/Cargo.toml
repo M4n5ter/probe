@@ -1,0 +1,19 @@
+[package]
+name = "probe-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blake3 = "1.8.5"
+bytes = { version = "1.11.1", features = ["serde"] }
+globset = "0.4.18"
+regex = "1.12.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+uuid = { version = "1.23.3", features = ["serde", "v7"] }
+
+[lints]
+workspace = true
