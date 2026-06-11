@@ -4,7 +4,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use attribution::{ProcessAttributor, ProcfsAttributor};
 use capture::ReplayProvider;
 use clap::{Parser, Subcommand, ValueEnum};
 use exporter::{CompressionCodec, ReliableExporter, WebhookExporter};
@@ -13,10 +12,11 @@ use pipeline::CapturePipeline;
 use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
 use probe_config::AgentConfig;
 use probe_core::{
-    AddressPort, CapabilityKind, CapabilityMatrix, CapabilityState, Direction, FlowContext,
-    FlowIdentity, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+    AddressPort, Direction, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, Timestamp,
+    TransportProtocol,
 };
 use proto::{BatchEnvelope, EVENT_ENVELOPE_JSON_SCHEMA};
+use runtime::{ProviderRegistry, RuntimePlan};
 use storage::{DurableSpool, FjallSpool};
 use thiserror::Error;
 
@@ -29,6 +29,8 @@ enum AgentError {
     },
     #[error("config error: {0}")]
     Config(#[from] probe_config::ConfigError),
+    #[error("runtime error: {0}")]
+    Runtime(#[from] runtime::RuntimeError),
     #[error("failed to serialize JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("pipeline error: {0}")]
@@ -128,22 +130,22 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), AgentError> {
     match cli.command {
         Command::Run { config } => {
-            let capabilities = default_capability_matrix();
-            let config = read_config_or_default(config.as_ref())?;
-            config.validate(&capabilities)?;
+            let plan = read_runtime_plan_or_default(config.as_ref())?;
+            plan.require_live_capture()?;
             println!(
-                "agent {} ready with config {} using {:?} capture preference",
-                config.agent_id, config.config_version, config.capture.preferred_backend
+                "agent {} planned config {} capture {:?} selected {:?}",
+                plan.config.agent_id,
+                plan.config.config_version,
+                plan.capture.mode,
+                plan.capture.selected_backend
             );
         }
         Command::Check { config } => {
-            let capabilities = default_capability_matrix();
-            let config = read_config(&config)?;
-            config.validate(&capabilities)?;
-            println!("{}", serde_json::to_string_pretty(&config)?);
+            let plan = read_runtime_plan(&config)?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
         }
         Command::Capabilities => {
-            let matrix = default_capability_matrix();
+            let matrix = ProviderRegistry::discover().capability_matrix();
             println!("{}", serde_json::to_string_pretty(&matrix)?);
         }
         Command::Replay {
@@ -170,6 +172,21 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
     Ok(())
 }
 
+fn read_runtime_plan_or_default(path: Option<&PathBuf>) -> Result<RuntimePlan, AgentError> {
+    let config = read_config_or_default(path)?;
+    build_runtime_plan(config)
+}
+
+fn read_runtime_plan(path: &PathBuf) -> Result<RuntimePlan, AgentError> {
+    let config = read_config(path)?;
+    build_runtime_plan(config)
+}
+
+fn build_runtime_plan(config: AgentConfig) -> Result<RuntimePlan, AgentError> {
+    let registry = ProviderRegistry::discover();
+    RuntimePlan::build(config, &registry).map_err(AgentError::Runtime)
+}
+
 fn read_config_or_default(path: Option<&PathBuf>) -> Result<AgentConfig, AgentError> {
     match path {
         Some(path) => read_config(path),
@@ -183,54 +200,6 @@ fn read_config(path: &PathBuf) -> Result<AgentConfig, AgentError> {
         source,
     })?;
     AgentConfig::from_toml_str(&content).map_err(AgentError::Config)
-}
-
-fn default_capability_matrix() -> CapabilityMatrix {
-    let procfs = ProcfsAttributor::new();
-    let mut states = vec![
-        CapabilityState::available(CapabilityKind::ReplayCapture),
-        CapabilityState::unavailable(
-            CapabilityKind::Ebpf,
-            "provider not implemented in this build",
-        ),
-        CapabilityState::unavailable(
-            CapabilityKind::Libpcap,
-            "provider not implemented in this build",
-        ),
-        CapabilityState::unavailable(
-            CapabilityKind::LibsslUprobe,
-            "TLS plaintext probe provider not implemented in this build",
-        ),
-        CapabilityState::available(CapabilityKind::Http1),
-        CapabilityState::available(CapabilityKind::Sse),
-        CapabilityState::unavailable(
-            CapabilityKind::WebSocketHandoff,
-            "websocket parser handoff is reserved but not implemented",
-        ),
-        CapabilityState::degraded(
-            CapabilityKind::LuaJit,
-            "policy runtime is wired into replay but not live capture",
-        ),
-        CapabilityState::degraded(
-            CapabilityKind::DurableSpool,
-            "ingress and export lanes exist, but parser recovery from ingress journal is not implemented",
-        ),
-        CapabilityState::degraded(
-            CapabilityKind::IngressJournal,
-            "durable ingress lane is wired into replay, but parser recovery is not implemented",
-        ),
-        CapabilityState::available(CapabilityKind::ExportQueue),
-        CapabilityState::degraded(
-            CapabilityKind::WebhookExporter,
-            "webhook transport is wired into replay but not live capture",
-        ),
-        CapabilityState::unavailable(
-            CapabilityKind::DryRunEnforcement,
-            "enforcement provider not implemented in this build",
-        ),
-    ];
-    states.extend(procfs.capabilities());
-    CapabilityMatrix::new(states)
 }
 
 async fn replay(

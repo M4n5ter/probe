@@ -11,7 +11,7 @@
 - 可扩展协议解析：首要支持 HTTP/1.x 和 SSE，后续自然扩展 WebSocket、HTTP/2、HTTP/3 等协议。
 - 策略驱动的检测与防护：V1 先支持观测、告警和 dry-run verdict，后续接入真实拦截执行。
 
-本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、pluggable compression codec 和 HTTP webhook exporter。已定义 capture provider、procfs process attribution 与 runtime config 的第一版边界。尚未实现真实 live capture backend、libpcap fallback、eBPF 主路径、TLS uprobe provider 和真实 enforcement。
+本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、pluggable compression codec 和 HTTP webhook exporter。已定义 capture provider、procfs process attribution、runtime config 和 runtime planning 的第一版边界。尚未实现真实 live capture backend、libpcap fallback、eBPF 主路径、TLS uprobe provider 和真实 enforcement。
 
 ## 2. 核心 thesis
 
@@ -75,9 +75,10 @@ V1 明确不做：
 - 已实现 replay CLI，用单向输入文件驱动 capture provider、ingress journal、parser、policy、export queue 和可选 webhook exporter。
 - 已实现 `capture` crate 的 `CaptureProvider` 抽象和 `ReplayProvider`，真实 eBPF/libpcap/plaintext provider 尚未实现。
 - 已实现 `attribution` crate 的 `ProcfsAttributor`，可从 `/proc/<pid>` 读取进程身份、cmdline hash、starttime、uid/gid、cgroup、systemd service 与 container hint；replay flow 默认使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence，避免把文件输入误归因到 agent 进程。
-- 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture backend preference、storage、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，validation 对未实现的安全敏感能力 fail closed。
+- 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、storage、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，基础字段校验不理解 runtime capability。
+- 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；`agent` 不再手写 capability matrix。
 - 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> parser -> policy -> export queue 的 replay/shared processing；`agent` binary 只负责 CLI wiring、配置读取和 exporter 命令。
-- 已实现 capability matrix；`procfs_attribution` 按本机 `/proc` 探测结果标记 degraded/unavailable，真实 live capture 相关能力仍必须标记 unavailable；policy/webhook 目前只在 replay pipeline 中可用。
+- 已实现 capability matrix；`procfs_attribution` 按本机 `/proc` 探测结果标记 degraded/unavailable，真实 live capture 相关能力仍必须标记 unavailable；policy/webhook 目前只在 replay pipeline 中可用。默认 `auto` capture 在当前 build 中会生成 `unavailable` live capture plan，不会静默选择 replay 作为 live provider；`run` 在无 live capture provider 时 fail closed，`check` 用于查看 resolved plan。
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
 - 当前 `FjallSpool` 存储的是带 schema 的 `SpoolPayload`；ingress lane 当前写入 JSON framed `CapturedBytes`，export lane 当前写入 JSON framed `EventEnvelope`。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
 
@@ -604,6 +605,13 @@ V1 执行语义：
 - 预留 `RemoteConfigSource` trait。
 - 后续控制面下发进入同一 validation/swap pipeline。
 
+当前 capture 配置语义：
+
+- `capture.selection = "auto"` 是默认生产入口，按 `capture.fallback_backends` 的顺序选择第一个可用 live provider；默认顺序为 `ebpf` 后 `libpcap`。
+- `capture.selection = "ebpf"`、`"libpcap"` 或 `"replay"` 表示 required backend；显式 backend 不自动使用 `fallback_backends`。这是为了让 operator 能表达“缺少该能力就 fail fast”，避免把强能力需求静默降级。
+- `capture.fallback_backends` 只允许 live backend，不包含 replay。replay 是可重复验证入口，不是 live agent 的自动 fallback。
+- `RuntimePlan` 是配置解析后的事实源，必须输出候选 provider、选中的 provider、capability matrix 和不可用原因；`run` 使用 plan 启动，`check` 输出 plan 供部署前审计。
+
 配置/策略签名：
 
 - V1 预留 verifier trait。
@@ -859,6 +867,7 @@ metrics 必须覆盖：
 - `parsers`：协议 detector、HTTP/1.x、SSE、handoff。
 - `pipeline`：capture event 到 ingress journal、parser、policy、export queue 的 shared processing stages。
 - `policy`：mlua/LuaJIT runtime、policy bundle、state API、verdict。
+- `runtime`：provider registry、capability matrix、config validation orchestration、runtime plan。
 - `storage`：Fjall-backed spool、storage traits、retention。
 - `exporter`：HTTP webhook exporter、codec、sink traits。
 - `xtask`：eBPF 构建、代码生成、CI 辅助任务。
@@ -1107,6 +1116,7 @@ enforcement 抽象验收：
 | 拦截抽象 | EnforcementProvider + stage capabilities | 第 18 节 |
 | V1 拦截验收 | dry-run typed verdict | 第 18、31 节 |
 | 配置 | TOML + 目录热加载，预留 RemoteConfigSource | 第 19 节 |
+| runtime plan | provider descriptor `ProviderRegistry` 生成 capability matrix，`RuntimePlan` 解析 capture backend selection；`auto` 使用有序 live fallback，显式 backend 是 required backend；默认 auto 在无 live provider 时显式 unavailable，`run` fail closed | 第 19、27 节 |
 | SecretStore | filesystem 默认，预留 Vault/KMS/TPM | 第 20 节 |
 | durable spool 目标 | ingress journal + export queue 双层 spool | 第 21 节 |
 | durable spool 当前实现 | Fjall ingress journal + export queue + `DurableSpool` trait + schema-aware `SpoolPayload`；两条 lane 独立 sequence/cursor；parser recovery 未实现因此 capability degraded | 第 21 节 |

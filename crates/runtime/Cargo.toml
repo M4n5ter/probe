@@ -1,0 +1,16 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+attribution = { path = "../attribution" }
+probe-config = { path = "../config" }
+probe-core = { path = "../core" }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+
+[lints]
+workspace = true
