@@ -686,6 +686,7 @@ mod tests {
                 codec: probe_config::CompressionCodecName::None,
                 headers: BTreeMap::new(),
                 tls: Default::default(),
+                worker: Default::default(),
             }],
             ..AgentConfig::default()
         }

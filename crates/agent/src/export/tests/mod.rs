@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    num::NonZeroU64,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -11,7 +12,8 @@ use probe_config::{
     ExporterTransport, TlsMaterialKind,
 };
 use runtime::{
-    ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportTlsMaterialPlan, ExportWorkerPlan,
+    ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan, ExportTlsMaterialPlan,
+    ExportWorkerPlan,
 };
 use storage::{FjallSpool, SpoolPayload};
 
@@ -124,6 +126,7 @@ fn export_worker_config_does_not_read_tls_materials_without_webhook_sinks()
             codec: CompressionCodecName::None,
             headers: BTreeMap::new(),
             tls,
+            worker: inherited_worker_quota(1),
         }],
     };
 
@@ -168,6 +171,7 @@ async fn planned_webhook_drain_fails_when_tls_material_is_missing()
                 )],
                 ..Default::default()
             },
+            worker: inherited_worker_quota(1),
         }],
     };
 
@@ -204,6 +208,7 @@ async fn planned_webhook_drain_skips_tls_materials_without_pending_events()
                 )],
                 ..Default::default()
             },
+            worker: inherited_worker_quota(1),
         }],
     };
 
@@ -276,6 +281,7 @@ async fn planned_export_sinks_use_independent_cursors_and_attempt_all()
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
                 tls: Default::default(),
+                worker: Default::default(),
             },
             ExporterConfig {
                 id: "successful".to_string(),
@@ -284,6 +290,7 @@ async fn planned_export_sinks_use_independent_cursors_and_attempt_all()
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::from([("x-probe-node".to_string(), "node-a".to_string())]),
                 tls: Default::default(),
+                worker: Default::default(),
             },
         ],
         ..AgentConfig::default()
@@ -319,6 +326,44 @@ async fn planned_export_sinks_use_independent_cursors_and_attempt_all()
 }
 
 #[tokio::test]
+async fn planned_tail_drain_ignores_worker_batch_quota() -> Result<(), Box<dyn std::error::Error>> {
+    let spool = SingleEventBatchSpool::with_export_events(2)?;
+    let server = TestWebhookServer::spawn_accepting(true, 2)?;
+    let plan = ExportPlan {
+        worker: ExportWorkerPlan::FixedIntervalBounded {
+            interval_ms: 60_000,
+            batches_per_sink_per_tick: 1,
+            sink_timeout_ms: 5_000,
+            failure_backoff_ms: 30_000,
+        },
+        sinks: vec![ExportSinkPlan {
+            id: "tail".to_string(),
+            transport: ExporterTransport::Webhook,
+            endpoint: server.endpoint(),
+            codec: CompressionCodecName::None,
+            headers: BTreeMap::new(),
+            tls: ExportSinkTlsPlan::default(),
+            worker: overridden_worker_quota(1),
+        }],
+    };
+
+    drain_planned_sinks(&spool, "agent-1", &plan).await?;
+
+    assert_eq!(spool.export_cursor("tail")?, 2);
+    let requests = server.join_requests()?;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        request_header(&requests[0], "idempotency-key").as_deref(),
+        Some("agent-1:tail:1")
+    );
+    assert_eq!(
+        request_header(&requests[1], "idempotency-key").as_deref(),
+        Some("agent-1:tail:2")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn export_worker_drains_until_stopped() -> Result<(), Box<dyn std::error::Error>> {
     let temp = test_dir("planned-export-worker");
     let spool = Arc::new(FjallSpool::open(&temp)?);
@@ -333,6 +378,7 @@ async fn export_worker_drains_until_stopped() -> Result<(), Box<dyn std::error::
             codec: CompressionCodecName::None,
             headers: BTreeMap::new(),
             tls: Default::default(),
+            worker: Default::default(),
         }],
         ..AgentConfig::default()
     };
@@ -390,6 +436,7 @@ async fn export_worker_uses_configured_per_tick_batch_budget()
             codec: CompressionCodecName::None,
             headers: BTreeMap::new(),
             tls: ExportSinkTlsPlan::default(),
+            worker: inherited_worker_quota(2),
         }],
     };
     let config = ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
@@ -408,6 +455,44 @@ async fn export_worker_uses_configured_per_tick_batch_budget()
     assert_eq!(
         request_header(&requests[1], "idempotency-key").as_deref(),
         Some("agent-1:budget:2")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn export_worker_uses_per_sink_batch_quota() -> Result<(), Box<dyn std::error::Error>> {
+    let spool = Arc::new(SingleEventBatchSpool::with_export_events(2)?);
+    let server = TestWebhookServer::spawn_recording(true)?;
+    let plan = ExportPlan {
+        worker: ExportWorkerPlan::FixedIntervalBounded {
+            interval_ms: 60_000,
+            batches_per_sink_per_tick: 2,
+            sink_timeout_ms: 5_000,
+            failure_backoff_ms: 30_000,
+        },
+        sinks: vec![ExportSinkPlan {
+            id: "limited".to_string(),
+            transport: ExporterTransport::Webhook,
+            endpoint: server.endpoint(),
+            codec: CompressionCodecName::None,
+            headers: BTreeMap::new(),
+            tls: ExportSinkTlsPlan::default(),
+            worker: overridden_worker_quota(1),
+        }],
+    };
+    let config = ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
+        .expect("worker should be enabled");
+
+    let worker = spawn_export_worker(Arc::clone(&spool), config);
+    wait_for_memory_export_cursor(spool.as_ref(), "limited", 1).await?;
+    worker.stop().await;
+
+    assert_eq!(spool.export_cursor("limited")?, 1);
+    let requests = server.join_requests()?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        request_header(&requests[0], "idempotency-key").as_deref(),
+        Some("agent-1:limited:1")
     );
     Ok(())
 }
@@ -433,6 +518,7 @@ async fn export_worker_backs_off_failing_sink_without_blocking_healthy_sink()
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
                 tls: ExportSinkTlsPlan::default(),
+                worker: inherited_worker_quota(1),
             },
             ExportSinkPlan {
                 id: "successful".to_string(),
@@ -441,6 +527,7 @@ async fn export_worker_backs_off_failing_sink_without_blocking_healthy_sink()
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
                 tls: ExportSinkTlsPlan::default(),
+                worker: inherited_worker_quota(1),
             },
         ],
     };
@@ -481,7 +568,24 @@ fn export_plan_with_trust_anchor(path: PathBuf) -> ExportPlan {
                 )],
                 ..Default::default()
             },
+            worker: inherited_worker_quota(1),
         }],
+    }
+}
+
+fn inherited_worker_quota(effective_batches_per_tick: u64) -> ExportSinkWorkerPlan {
+    ExportSinkWorkerPlan {
+        batches_per_tick_override: None,
+        effective_batches_per_tick: NonZeroU64::new(effective_batches_per_tick)
+            .expect("positive batch quota"),
+    }
+}
+
+fn overridden_worker_quota(effective_batches_per_tick: u64) -> ExportSinkWorkerPlan {
+    ExportSinkWorkerPlan {
+        batches_per_tick_override: Some(effective_batches_per_tick),
+        effective_batches_per_tick: NonZeroU64::new(effective_batches_per_tick)
+            .expect("positive batch quota"),
     }
 }
 

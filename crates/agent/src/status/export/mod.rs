@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use probe_config::{CompressionCodecName, ExporterTransport};
 use probe_core::RuntimeMode;
-use runtime::{ExportSinkPlan, ExportTlsMaterialPlan, ExportWorkerPlan, RuntimePlan};
+use runtime::{
+    ExportSinkPlan, ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan, RuntimePlan,
+};
 use serde::Serialize;
 
 use super::{
@@ -16,6 +18,7 @@ pub struct ExporterStatusSnapshot {
     pub transport: ExporterTransport,
     pub codec: CompressionCodecName,
     pub worker: ExportWorkerPlan,
+    pub sink_worker: ExportSinkWorkerPlan,
     pub tls: ExporterTlsStatusSnapshot,
     pub mode: RuntimeMode,
     pub reason: Option<String>,
@@ -61,6 +64,7 @@ pub(super) fn exporter_statuses(
                 transport: sink.transport,
                 codec: sink.codec,
                 worker: plan.export.worker.clone(),
+                sink_worker: sink.worker.clone(),
                 tls,
                 mode,
                 reason,

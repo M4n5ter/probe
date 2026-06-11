@@ -73,6 +73,9 @@ endpoint = "https://collector.example/batches"
 codec = "zstd"
 headers = { x_probe = "node-a" }
 
+[exporters.worker]
+batches_per_tick = 2
+
 [exporters.tls]
 trust_anchor_refs = ["collector-ca"]
 
@@ -116,6 +119,7 @@ socket_path = "/run/sssa-probe/admin.sock"
         }
     );
     assert_eq!(config.exporters[0].codec, CompressionCodecName::Zstd);
+    assert_eq!(config.exporters[0].worker.batches_per_tick, Some(2));
     assert_eq!(
         config.exporters[0].tls.trust_anchor_refs,
         vec!["collector-ca"]
@@ -554,6 +558,31 @@ failure_backoff_ms = 0
 "#,
     )?;
     disabled.validate_basic()?;
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_zero_exporter_worker_batch_quota() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/batches"
+
+[exporters.worker]
+batches_per_tick = 0
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("per-sink exporter batch quota must be positive");
+    assert!(
+        error
+            .to_string()
+            .contains("exporter worker batches_per_tick must be positive")
+    );
     Ok(())
 }
 

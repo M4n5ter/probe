@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{num::NonZeroU64, path::PathBuf};
 
 use probe_core::Selector;
 
@@ -111,6 +111,9 @@ fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::err
             client_certificate_refs: vec!["client-cert".to_string()],
             client_private_key_ref: Some("client-key".to_string()),
         },
+        worker: probe_config::ExporterWorkerConfig {
+            batches_per_tick: Some(2),
+        },
     }];
     config.tls.materials = vec![
         probe_config::TlsMaterialConfig {
@@ -170,6 +173,10 @@ fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::err
                     probe_config::TlsMaterialKind::ClientPrivateKey,
                     "/etc/sssa/client.key",
                 )),
+            },
+            worker: ExportSinkWorkerPlan {
+                batches_per_tick_override: Some(2),
+                effective_batches_per_tick: NonZeroU64::new(2).expect("positive batch quota"),
             },
         }]
     );

@@ -60,7 +60,6 @@ pub struct ExportWorkerConfig {
     agent_id: String,
     sinks: Vec<ExportSinkPlan>,
     interval: Duration,
-    batches_per_sink_per_tick: u64,
     sink_timeout: Duration,
     failure_backoff: Duration,
 }
@@ -70,7 +69,6 @@ impl ExportWorkerConfig {
         agent_id: String,
         sinks: Vec<ExportSinkPlan>,
         interval: Duration,
-        batches_per_sink_per_tick: u64,
         sink_timeout: Duration,
         failure_backoff: Duration,
     ) -> Self {
@@ -78,7 +76,6 @@ impl ExportWorkerConfig {
             agent_id,
             sinks,
             interval,
-            batches_per_sink_per_tick,
             sink_timeout,
             failure_backoff,
         }
@@ -89,14 +86,13 @@ impl ExportWorkerConfig {
             ExportWorkerPlan::Disabled { .. } => None,
             ExportWorkerPlan::FixedIntervalBounded {
                 interval_ms,
-                batches_per_sink_per_tick,
                 sink_timeout_ms,
                 failure_backoff_ms,
+                ..
             } => Some(Self::fixed_interval_bounded(
                 agent_id,
                 plan.sinks.clone(),
                 Duration::from_millis(*interval_ms),
-                *batches_per_sink_per_tick,
                 Duration::from_millis(*sink_timeout_ms),
                 Duration::from_millis(*failure_backoff_ms),
             )),
@@ -170,16 +166,16 @@ async fn drain_export_sinks_once(
     config: &ExportWorkerConfig,
     backoff: &mut ExportWorkerBackoff,
 ) -> Result<(), ExportDrainError> {
-    let mode = SinkDrainMode::MaxBatches {
-        max_batches: config.batches_per_sink_per_tick,
-        sink_timeout: config.sink_timeout,
-    };
     let mut failures = Vec::new();
     for sink in &config.sinks {
         let now = Instant::now();
         if backoff.should_skip(&sink.id, now) {
             continue;
         }
+        let mode = SinkDrainMode::MaxBatches {
+            max_batches: sink.worker.effective_batches_per_tick.get(),
+            sink_timeout: config.sink_timeout,
+        };
         let result = drain_export_sink_with_mode(spool, &config.agent_id, sink, mode).await;
         match result {
             Ok(()) => backoff.record_success(&sink.id),

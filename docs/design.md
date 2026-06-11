@@ -81,7 +81,7 @@ V1 明确不做：
 - 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；pipeline 支持可选 `max_events` 运行边界，便于对真实 live provider 做有界 smoke。`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合、连续 exporter worker、replay exporter 命令和状态/metrics 快照输出。
 - 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。parser 已识别 WebSocket HTTP Upgrade，输出 `WebSocketHandoff` 后把后续字节转为 opaque stream；它不解析 WebSocket frame/message。
 - 已实现 configured policy loader 的第一版 bundle 入口：`policies[].path` 指向目录时按 `manifest.toml` + `main.lua` 加载，manifest 目前支持 `id`、`version` 和 typed `hooks`，并要求 manifest id 与配置中的 policy id 一致；`status` 只做 bundle metadata/manifest 校验，不执行 Lua；`check` 和 `run` 会显式加载并执行初始化。裸 Lua 文件仍保留为 legacy source，使用配置 id、配置版本和全量 hook 列表，主要用于平滑迁移与本地调试，不代表长期 policy bundle 格式。
-- 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable。eBPF capture provider 仍必须标记 unavailable，因为 agent 还没有可构造的 eBPF builder；但默认 agent descriptor 会执行 host probe，把 Linux/BTF vmlinux、bpffs mount 和 `unprivileged_bpf_disabled` 状态写入 eBPF unavailable reason，避免把宿主前提和未实现 builder 混成一个固定字符串。libssl uprobe/keylog TLS 解密和真实 enforcement 相关能力仍必须标记 unavailable；`external_plaintext_feed`、HTTP/1、SSE、WebSocket handoff、dry-run enforcement 是可用能力。webhook exporter 已可在 `run` 中连续 drain planned sinks，并支持配置固定间隔、每 sink 每轮 batch 预算、单 sink timeout、失败后的 fixed backoff，以及用于 trust anchors 和 client certificate/private key identity 的 per-exporter TLS material refs；但 adaptive/exponential backoff、per-sink rate quota 和 retention deadline 尚未实现，因此仍标记 degraded。dry-run enforcement 记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 或 plaintext feed 作为 live provider；`run` 在无 live capture provider 时 fail closed，显式 `plaintext_feed` 会从 JSON-lines feed path 读取已解密明文 event 并接入 replay 共用的 pipeline；policy selector 会在 runtime plan / configured policy load 阶段校验，并在 pipeline 中限制 policy 执行范围；`check` 用于查看 resolved plan 并显式加载 policy / enforcement planner，`status` 用于查看 health/spool/exporter/metrics 快照。
+- 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable。eBPF capture provider 仍必须标记 unavailable，因为 agent 还没有可构造的 eBPF builder；但默认 agent descriptor 会执行 host probe，把 Linux/BTF vmlinux、bpffs mount 和 `unprivileged_bpf_disabled` 状态写入 eBPF unavailable reason，避免把宿主前提和未实现 builder 混成一个固定字符串。libssl uprobe/keylog TLS 解密和真实 enforcement 相关能力仍必须标记 unavailable；`external_plaintext_feed`、HTTP/1、SSE、WebSocket handoff、dry-run enforcement 是可用能力。webhook exporter 已可在 `run` 中连续 drain planned sinks，并支持配置固定间隔、全局/每 sink 每轮 batch 预算、单 sink timeout、失败后的 fixed backoff，以及用于 trust anchors 和 client certificate/private key identity 的 per-exporter TLS material refs；但 adaptive/exponential backoff 和 retention deadline 尚未实现，因此仍标记 degraded。dry-run enforcement 记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 或 plaintext feed 作为 live provider；`run` 在无 live capture provider 时 fail closed，显式 `plaintext_feed` 会从 JSON-lines feed path 读取已解密明文 event 并接入 replay 共用的 pipeline；policy selector 会在 runtime plan / configured policy load 阶段校验，并在 pipeline 中限制 policy 执行范围；`check` 用于查看 resolved plan 并显式加载 policy / enforcement planner，`status` 用于查看 health/spool/exporter/metrics 快照。
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
 - 当前 `FjallSpool` 存储的是带 typed schema 的 `SpoolPayload`；代码内使用 `SpoolPayloadSchema` enum，落盘和 protobuf `payload_schema` 字段仍写稳定 wire string。ingress lane 当前写入 JSON framed `CapturedBytes`，export lane 当前写入 JSON framed `EventEnvelope`。reader 只返回已越过 lane durable high-water sequence 的条目，避免并发 exporter 读到已 commit 但尚未 `SyncAll` 持久化完成的事件；`status` 使用同一 durable high-water 生成 spool/export lag 快照。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
 
@@ -670,10 +670,10 @@ V1 执行语义：
 - `[export.worker] enabled = true` 是默认行为；只有 RuntimePlan 中存在 planned exporter sinks 时，`run` 才会启动后台 exporter worker。
 - `[export.worker.schedule] mode = "fixed_interval_bounded"` 是当前唯一实现的 worker schedule。
 - `[export.worker.schedule] interval_ms` 控制 worker 两轮有界 drain 之间的固定间隔；worker 开启时该值必须大于 0，默认 `1000`。
-- `[export.worker.schedule] batches_per_sink_per_tick` 控制后台 worker 每轮对每个 sink 最多发送多少个 batch；worker 开启时该值必须大于 0，默认 `1`。
+- `[export.worker.schedule] batches_per_sink_per_tick` 控制后台 worker 每轮对每个 sink 最多发送多少个 batch；worker 开启时该值必须大于 0，默认 `1`。单个 exporter 可用 `[exporters.worker] batches_per_tick` 覆盖本 sink 的每轮 batch quota；未配置时继承全局值。
 - `[export.worker.schedule] sink_timeout_ms` 控制后台 worker 对单个 sink 的 drain timeout；worker 开启时该值必须大于 0，默认 `10000`。
-- `[export.worker.schedule] failure_backoff_ms` 控制后台 worker 在某个 sink 失败后跳过该 sink 的固定时长；worker 开启时该值必须大于 0，默认 `30000`。这四个 schedule 字段共同定义当前 fixed bounded worker mode，避免把 live worker 变成无界 tail flush 或被单个挂起/失败 sink 永久卡住；这仍不等同于未来的 adaptive/exponential backoff、per-sink rate quota 或 retention deadline。
-- `RuntimePlan.export.worker` 是单个 typed worker plan：`disabled` 携带原因，`fixed_interval_bounded` 携带 interval、batch budget、timeout 和 fixed failure backoff。`run` 的后台 worker、`check` 的 plan 输出以及 `status`/admin exporter snapshot 都从该 plan 构造 sink execution config，而不是重新解释 raw exporter config。没有 planned exporter sink 或显式禁用 worker 时，`check` 会显示 worker disabled 的原因。
+- `[export.worker.schedule] failure_backoff_ms` 控制后台 worker 在某个 sink 失败后跳过该 sink 的固定时长；worker 开启时该值必须大于 0，默认 `30000`。这四个 schedule 字段共同定义当前 fixed bounded worker mode，避免把 live worker 变成无界 tail flush 或被单个挂起/失败 sink 永久卡住；这仍不等同于未来的 adaptive/exponential backoff 或 retention deadline。
+- `RuntimePlan.export.worker` 是单个 typed worker plan：`disabled` 携带原因，`fixed_interval_bounded` 携带 interval、全局 batch budget、timeout 和 fixed failure backoff。`RuntimePlan.export.sinks[].worker` 同时保留 per-sink batch quota override 和 resolved effective quota。`run` 的后台 worker、`check` 的 plan 输出以及 `status`/admin exporter snapshot 都从该 plan 构造 sink execution config，而不是重新解释 raw exporter config。没有 planned exporter sink 或显式禁用 worker 时，`check` 会显示 worker disabled 的原因。
 - `run` 结束时仍会尽力执行一次尾部 drain，使 `--max-events` smoke、plaintext feed 和其它有限运行场景能够把最后一批事件同步推出；即使 pipeline 已返回错误，也会先停止 worker 并尝试 tail drain，再按错误优先级返回。
 
 配置/策略签名：
@@ -779,7 +779,7 @@ V1 正式可靠路径：
 多 exporter：
 
 - 每个可靠 sink 维护独立 cursor/ack。
-- 某个 sink 慢或失败时按 per-sink rate quota/retention deadline 标记 failed/degraded。
+- 当前已实现 per-sink cursor、per-sink batch quota 和内存态 fixed backoff，避免某个慢或失败 sink 阻塞其它 sink；未来 retention deadline 和在线 backoff 状态进入 status 后，再把 failed/degraded 语义扩展到这些运行态。
 - 不让单个坏 sink 拖垮采集和其它 exporter。
 
 投递语义：
@@ -820,13 +820,13 @@ V1 的 HTTP(S) exporter 是 webhook 风格，但必须定义协议语义。
 - `acked_cursor` 如果存在，必须落在当前 batch 的 sequence 范围内。
 - 如果 ack 只返回 event ids，agent 只在这些 ids 构成当前 batch 的连续前缀时推进 cursor，避免跳过未确认事件。
 - `run` 使用 `config.exporters` 中的 exporter `id` 作为独立 sink cursor；exporter `id` 必须唯一，且不能使用保留的 `replay-webhook`。
-- `run` 默认在后台启动 planned exporter worker，按 `[export.worker.schedule].interval_ms` 周期对每个 planned sink 执行有界 drain；每轮最多发送 `[export.worker.schedule].batches_per_sink_per_tick` 个 batch，并对单个 sink 使用 `[export.worker.schedule].sink_timeout_ms` timeout。某个 sink 失败后，后台 worker 会按 `[export.worker.schedule].failure_backoff_ms` 对该 sink 做内存态 fixed backoff，期间不影响其它 sink；没有 planned exporter sink 或 `[export.worker].enabled = false` 时不启动 worker。
+- `run` 默认在后台启动 planned exporter worker，按 `[export.worker.schedule].interval_ms` 周期对每个 planned sink 执行有界 drain；每轮默认最多发送 `[export.worker.schedule].batches_per_sink_per_tick` 个 batch，单个 exporter 可用 `[exporters.worker].batches_per_tick` 覆盖本 sink 的 quota，并对单个 sink 使用 `[export.worker.schedule].sink_timeout_ms` timeout。某个 sink 失败后，后台 worker 会按 `[export.worker.schedule].failure_backoff_ms` 对该 sink 做内存态 fixed backoff，期间不影响其它 sink；没有 planned exporter sink 或 `[export.worker].enabled = false` 时不启动 worker。
 - `run` 在当前 pipeline run 结束后仍对每个 planned sink 尽力执行一次尾部 drain，直到该 sink 队列为空或 ack 无法推进 cursor；pipeline 错误不会跳过这次 tail drain。
 - 一次 drain 会尝试所有 planned sinks；某个 sink 失败不会阻止后续 sink，但本次命令最终会返回聚合失败，避免静默丢掉外发错误。
 - planned webhook exporter 只读取该 sink 通过 `exporters[].tls.*_refs` 引用的 TLS material，并且只在该 sink 有待发送 batch 时读取：`trust_anchor` PEM bundle 会 merge 到 reqwest/rustls roots；存在成对的 `client_certificate`/`client_private_key` refs 时会组合为 client identity。证书/key material source 检查、读取或 PEM 解析失败会让对应 exporter drain 失败，而不是降级为无 mTLS 静默发送；未被该 exporter 引用的 material 不会被读取，也不会影响该 sink。
 - `replay` CLI 保留独立的 `replay-webhook` sink，便于本地调试不污染配置 sink cursor。
 - webhook 自定义 headers 可配置，但 `content-type`、`x-sssa-codec` 和 `idempotency-key` 属于协议头，配置中禁止覆盖。
-- adaptive/exponential backoff 调度、per-sink rate quota 和 retention deadline 尚未实现；当前 worker 采用配置化固定间隔、每 sink 每轮 batch budget、配置化 sink timeout 和内存态 fixed failure backoff 的 best-effort drain。tail drain 仍会尽力尝试所有 sink，不使用后台 worker 的 failure backoff。
+- adaptive/exponential backoff 调度和 retention deadline 尚未实现；当前 worker 采用配置化固定间隔、全局/每 sink 每轮 batch budget、配置化 sink timeout 和内存态 fixed failure backoff 的 best-effort drain。tail drain 仍会尽力尝试所有 sink，不使用后台 worker 的 failure backoff。
 
 状态码建议：
 
@@ -1069,7 +1069,7 @@ V1 CLI 至少提供：
 
 当前已验证的 non-privileged plaintext feed 路径：`PlaintextFeedProvider` 单元测试覆盖 event source/kind/confidence/degraded metadata 保真；agent JSON-lines provider 测试覆盖硬编码外部 feed schema、streaming provider、unknown field fail-closed、超长行 fail-closed、缺失 process 强制 0 confidence，以及 confidence 超过 100 的拒绝；pipeline 测试覆盖 external plaintext feed chunk 写入 ingress journal，并由 HTTP/1 parser 产出 `HttpRequestHeaders` export event，`source = external_plaintext_feed`。这只验证“已解密明文进入统一 pipeline”，不等同于 TLS uprobe 或 keylog 解密已完成。
 
-当前已验证的 exporter worker 路径：agent export 测试覆盖 planned exporter sinks 使用独立 sink cursor、某个 sink 失败不阻止其它 sink 尝试、webhook protocol headers 不被配置覆盖、后台 worker 能按配置化 fixed bounded worker mode 从 Fjall export queue drain 到 webhook receiver、在启动后继续处理新追加事件并推进对应 sink cursor，以及失败 sink 进入 fixed backoff 后不阻塞健康 sink 继续推进。该验证覆盖连续有界 drain 与固定失败 backoff 的最小闭环，不覆盖未来 adaptive/exponential backoff、rate quota 或 retention 调度。
+当前已验证的 exporter worker 路径：agent export 测试覆盖 planned exporter sinks 使用独立 sink cursor、某个 sink 失败不阻止其它 sink 尝试、webhook protocol headers 不被配置覆盖、后台 worker 能按配置化 fixed bounded worker mode 从 Fjall export queue drain 到 webhook receiver、在启动后继续处理新追加事件并推进对应 sink cursor、per-sink batch quota 会覆盖全局每轮预算，以及失败 sink 进入 fixed backoff 后不阻塞健康 sink 继续推进。该验证覆盖连续有界 drain、per-sink batch quota 与固定失败 backoff 的最小闭环，不覆盖未来 adaptive/exponential backoff 或 retention 调度。
 
 V1 端到端验收：
 

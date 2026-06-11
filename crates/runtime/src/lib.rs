@@ -8,6 +8,7 @@ use probe_config::{
 use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -68,6 +69,8 @@ pub struct ExportPlan {
 impl ExportPlan {
     fn resolve(config: &AgentConfig) -> Self {
         let materials_by_id = export_tls_materials_by_id(&config.tls.materials);
+        let default_sink_batches_per_tick =
+            export_worker_default_sink_batches_per_tick(config.export.worker.schedule);
         let sinks = config
             .exporters
             .iter()
@@ -78,6 +81,10 @@ impl ExportPlan {
                 codec: exporter.codec,
                 headers: exporter.headers.clone(),
                 tls: ExportSinkTlsPlan::from_config(&exporter.tls, &materials_by_id),
+                worker: ExportSinkWorkerPlan::from_config(
+                    exporter.worker.batches_per_tick,
+                    default_sink_batches_per_tick,
+                ),
             })
             .collect::<Vec<_>>();
         let worker = match (config.export.worker.enabled, sinks.is_empty()) {
@@ -135,6 +142,15 @@ impl From<ExportWorkerScheduleConfig> for ExportWorkerPlan {
     }
 }
 
+fn export_worker_default_sink_batches_per_tick(schedule: ExportWorkerScheduleConfig) -> u64 {
+    match schedule {
+        ExportWorkerScheduleConfig::FixedIntervalBounded {
+            batches_per_sink_per_tick,
+            ..
+        } => batches_per_sink_per_tick.max(1),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportSinkPlan {
     pub id: String,
@@ -143,6 +159,27 @@ pub struct ExportSinkPlan {
     pub codec: CompressionCodecName,
     pub headers: BTreeMap<String, String>,
     pub tls: ExportSinkTlsPlan,
+    pub worker: ExportSinkWorkerPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportSinkWorkerPlan {
+    pub batches_per_tick_override: Option<u64>,
+    pub effective_batches_per_tick: NonZeroU64,
+}
+
+impl ExportSinkWorkerPlan {
+    fn from_config(batches_per_tick_override: Option<u64>, default_batches_per_tick: u64) -> Self {
+        let sanitized_override =
+            batches_per_tick_override.filter(|batches_per_tick| *batches_per_tick > 0);
+        let effective_batches_per_tick =
+            NonZeroU64::new(sanitized_override.unwrap_or(default_batches_per_tick))
+                .unwrap_or(NonZeroU64::MIN);
+        Self {
+            batches_per_tick_override: sanitized_override,
+            effective_batches_per_tick,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,7 +685,7 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::degraded(
             CapabilityKind::WebhookExporter,
-            "webhook transport can drain planned export sinks with configured fixed worker bounds and fixed failure backoff during run and replay CLI webhook output during replay, but adaptive/exponential backoff, per-sink rate quota, and retention deadline are not implemented",
+            "webhook transport can drain planned export sinks with configured fixed worker bounds, per-sink batch quota, and fixed failure backoff during run and replay CLI webhook output during replay, but adaptive/exponential backoff and retention deadline are not implemented",
         ),
         CapabilityState::available(
             CapabilityKind::DryRunEnforcement,

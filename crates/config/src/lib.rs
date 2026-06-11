@@ -269,6 +269,7 @@ pub struct ExporterConfig {
     pub codec: CompressionCodecName,
     pub headers: BTreeMap<String, String>,
     pub tls: ExporterTlsConfig,
+    pub worker: ExporterWorkerConfig,
 }
 
 impl Default for ExporterConfig {
@@ -280,8 +281,15 @@ impl Default for ExporterConfig {
             codec: CompressionCodecName::Zstd,
             headers: BTreeMap::new(),
             tls: ExporterTlsConfig::default(),
+            worker: ExporterWorkerConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExporterWorkerConfig {
+    pub batches_per_tick: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -685,6 +693,12 @@ fn validate_exporters(
                 }
             }
             ExporterTransport::Grpc | ExporterTransport::Kafka | ExporterTransport::Otlp => {}
+        }
+        if exporter.worker.batches_per_tick == Some(0) {
+            violations.push(ConfigViolation {
+                field: format!("exporters.{}.worker.batches_per_tick", exporter.id),
+                reason: "exporter worker batches_per_tick must be positive when set".to_string(),
+            });
         }
         validate_exporter_tls(exporter, &tls_materials_by_id, violations);
     }
