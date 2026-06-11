@@ -1,8 +1,14 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+};
 
 use probe_core::{EnforcementMode, Selector};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+const RESERVED_EXPORTER_HEADERS: &[&str] = &["content-type", "idempotency-key", "x-sssa-codec"];
+const REPLAY_WEBHOOK_SINK_ID: &str = "replay-webhook";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -381,12 +387,54 @@ fn validate_libpcap_capture(libpcap: &LibpcapCaptureConfig, violations: &mut Vec
 }
 
 fn validate_exporters(exporters: &[ExporterConfig], violations: &mut Vec<ConfigViolation>) {
+    let mut ids = HashSet::new();
     for exporter in exporters {
         if exporter.id.trim().is_empty() {
             violations.push(ConfigViolation {
                 field: "exporters.id".to_string(),
                 reason: "exporter id cannot be empty".to_string(),
             });
+        }
+        if exporter.id == REPLAY_WEBHOOK_SINK_ID {
+            violations.push(ConfigViolation {
+                field: format!("exporters.{}.id", exporter.id),
+                reason: "exporter id is reserved for replay CLI webhook output".to_string(),
+            });
+        }
+        if !exporter.id.is_empty() && !ids.insert(exporter.id.as_str()) {
+            violations.push(ConfigViolation {
+                field: format!("exporters.{}.id", exporter.id),
+                reason: "exporter id must be unique because it is used as the sink cursor key"
+                    .to_string(),
+            });
+        }
+        for (name, value) in &exporter.headers {
+            if name.trim().is_empty() {
+                violations.push(ConfigViolation {
+                    field: format!("exporters.{}.headers", exporter.id),
+                    reason: "exporter header name cannot be empty".to_string(),
+                });
+            } else if !valid_exporter_header_name(name) {
+                violations.push(ConfigViolation {
+                    field: format!("exporters.{}.headers.{}", exporter.id, name),
+                    reason: "exporter header name is not a valid HTTP token".to_string(),
+                });
+            }
+            if RESERVED_EXPORTER_HEADERS
+                .iter()
+                .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            {
+                violations.push(ConfigViolation {
+                    field: format!("exporters.{}.headers.{}", exporter.id, name),
+                    reason: "exporter header is reserved by the webhook protocol".to_string(),
+                });
+            }
+            if value.contains(['\r', '\n']) {
+                violations.push(ConfigViolation {
+                    field: format!("exporters.{}.headers.{}", exporter.id, name),
+                    reason: "exporter header value cannot contain CR or LF".to_string(),
+                });
+            }
         }
         match exporter.transport {
             ExporterTransport::Webhook => {
@@ -418,6 +466,31 @@ fn validate_policies(policies: &[PolicyConfig], violations: &mut Vec<ConfigViola
             });
         }
     }
+}
+
+fn valid_exporter_header_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(valid_http_token_byte)
+}
+
+fn valid_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 #[cfg(test)]
@@ -570,6 +643,99 @@ buffer_size = 0
             error
                 .to_string()
                 .contains("libpcap buffer size must be positive")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validation_rejects_reserved_exporter_headers() -> Result<(), Box<dyn std::error::Error>> {
+        let config = AgentConfig::from_toml_str(
+            r#"
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/batches"
+headers = { idempotency-key = "override" }
+"#,
+        )?;
+
+        let error = config
+            .validate_basic()
+            .expect_err("reserved webhook header must be rejected");
+
+        assert!(error.to_string().contains("exporter header is reserved"));
+        Ok(())
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_and_reserved_exporter_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let duplicate = AgentConfig::from_toml_str(
+            r#"
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/one"
+
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/two"
+"#,
+        )?;
+        let duplicate_error = duplicate
+            .validate_basic()
+            .expect_err("duplicate exporter ids must be rejected");
+        assert!(
+            duplicate_error
+                .to_string()
+                .contains("exporter id must be unique")
+        );
+
+        let reserved = AgentConfig::from_toml_str(
+            r#"
+[[exporters]]
+id = "replay-webhook"
+transport = "webhook"
+endpoint = "https://collector.example/replay"
+"#,
+        )?;
+        let reserved_error = reserved
+            .validate_basic()
+            .expect_err("replay-webhook sink id must be reserved");
+        assert!(
+            reserved_error
+                .to_string()
+                .contains("reserved for replay CLI")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validation_rejects_invalid_exporter_headers() -> Result<(), Box<dyn std::error::Error>> {
+        let config = AgentConfig::from_toml_str(
+            r#"
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "https://collector.example/batches"
+headers = { "bad header" = "value", good = "bad\nvalue" }
+"#,
+        )?;
+
+        let error = config
+            .validate_basic()
+            .expect_err("invalid webhook headers must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("exporter header name is not a valid HTTP token")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("exporter header value cannot contain CR or LF")
         );
         Ok(())
     }

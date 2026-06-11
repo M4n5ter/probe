@@ -11,7 +11,7 @@
 - 可扩展协议解析：首要支持 HTTP/1.x 和 SSE，后续自然扩展 WebSocket、HTTP/2、HTTP/3 等协议。
 - 策略驱动的检测与防护：V1 先支持观测、告警和 dry-run verdict，后续接入真实拦截执行。
 
-本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、pluggable compression codec 和 HTTP webhook exporter。已定义 capture provider、procfs process attribution、runtime config、runtime planning 和 dry-run enforcement 的第一版边界，并开始接入真实 libpcap fallback。尚未实现 eBPF 主路径、TLS uprobe provider、真实 enforcement、TCP 重组和强进程归因。
+本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、可选压缩 codec 和 HTTP webhook exporter。`run` 与 `replay` 已可按配置/CLI drain export queue 到 webhook sink。已定义 capture provider、procfs process attribution、runtime config、runtime planning 和 dry-run enforcement 的第一版边界，并开始接入真实 libpcap fallback。尚未实现 eBPF 主路径、TLS uprobe provider、真实 enforcement、TCP 重组、强进程归因和连续后台 exporter worker。
 
 ## 2. 核心 thesis
 
@@ -770,6 +770,12 @@ V1 的 HTTP(S) exporter 是 webhook 风格，但必须定义协议语义。
 - `acked_event_ids` 和 `retryable_event_ids` 必须属于当前 batch。
 - `acked_cursor` 如果存在，必须落在当前 batch 的 sequence 范围内。
 - 如果 ack 只返回 event ids，agent 只在这些 ids 构成当前 batch 的连续前缀时推进 cursor，避免跳过未确认事件。
+- `run` 使用 `config.exporters` 中的 exporter `id` 作为独立 sink cursor；exporter `id` 必须唯一，且不能使用保留的 `replay-webhook`。
+- `run` 在当前 pipeline run 结束后对每个 configured sink 执行 drain，直到该 sink 队列为空或 ack 无法推进 cursor。
+- 一次 drain 会尝试所有 configured sinks；某个 sink 失败不会阻止后续 sink，但本次命令最终会返回聚合失败，避免静默丢掉外发错误。
+- `replay` CLI 保留独立的 `replay-webhook` sink，便于本地调试不污染配置 sink cursor。
+- webhook 自定义 headers 可配置，但 `content-type`、`x-sssa-codec` 和 `idempotency-key` 属于协议头，配置中禁止覆盖。
+- 连续 exporter worker、retry/backoff 调度、per-sink quota 和 retention deadline 尚未实现。
 
 状态码建议：
 
@@ -802,10 +808,10 @@ V1 的 HTTP(S) exporter 是 webhook 风格，但必须定义协议语义。
 
 压缩采用 pluggable codec：
 
-- 定义 `CompressionCodec` trait。
-- wire envelope 声明 codec enum。
+- 当前实现使用 `CompressionCodec` enum，后续 transport 扩展需要保持同一 codec 边界。
+- wire envelope 声明 codec 名称。
 - 默认 codec 为 zstd。
-- V1 可选 gzip/deflate。
+- 当前可选 `none`、`zstd`、`gzip`、`deflate`。
 - endpoint 配置或能力不匹配时 fail fast。
 
 关于 `zlib-rs`：

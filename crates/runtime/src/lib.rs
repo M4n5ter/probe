@@ -447,7 +447,7 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::degraded(
             CapabilityKind::WebhookExporter,
-            "webhook transport is wired into replay but not live capture",
+            "webhook transport can drain configured export queues after run/replay, but continuous exporter workers are not implemented",
         ),
         CapabilityState::available(
             CapabilityKind::DryRunEnforcement,

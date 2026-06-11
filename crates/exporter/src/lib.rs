@@ -11,8 +11,11 @@ use flate2::{
     write::{DeflateEncoder, GzEncoder},
 };
 use proto::BatchEnvelope;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+const RESERVED_WEBHOOK_HEADERS: &[&str] = &["content-type", "idempotency-key", "x-sssa-codec"];
 
 #[derive(Debug, Error)]
 pub enum ExportError {
@@ -22,6 +25,18 @@ pub enum ExportError {
     Zstd(std::io::Error),
     #[error("http transport failed: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("invalid HTTP header name {name}: {source}")]
+    InvalidHeaderName {
+        name: String,
+        source: reqwest::header::InvalidHeaderName,
+    },
+    #[error("invalid HTTP header value for {name}: {source}")]
+    InvalidHeaderValue {
+        name: String,
+        source: reqwest::header::InvalidHeaderValue,
+    },
+    #[error("HTTP header {name} is reserved by the webhook protocol")]
+    ReservedHeaderName { name: String },
     #[error("ack response rejected batch {batch_id}: {reason}")]
     Rejected { batch_id: String, reason: String },
     #[error("ack response batch mismatch: expected {expected}, got {actual}")]
@@ -139,6 +154,7 @@ pub struct WebhookExporter {
     client: reqwest::Client,
     endpoint: String,
     codec: CompressionCodec,
+    headers: HeaderMap,
 }
 
 impl WebhookExporter {
@@ -147,7 +163,21 @@ impl WebhookExporter {
             client: reqwest::Client::new(),
             endpoint: endpoint.into(),
             codec,
+            headers: HeaderMap::new(),
         }
+    }
+
+    pub fn with_headers(
+        endpoint: impl Into<String>,
+        codec: CompressionCodec,
+        headers: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, ExportError> {
+        Ok(Self {
+            client: reqwest::Client::new(),
+            endpoint: endpoint.into(),
+            codec,
+            headers: parse_headers(headers)?,
+        })
     }
 }
 
@@ -164,6 +194,7 @@ impl ReliableExporter for WebhookExporter {
         let response = self
             .client
             .post(&self.endpoint)
+            .headers(self.headers.clone())
             .header("content-type", "application/x-protobuf")
             .header("x-sssa-codec", self.codec.wire_name())
             .header("idempotency-key", &batch.batch_id)
@@ -184,6 +215,33 @@ impl ReliableExporter for WebhookExporter {
             })
         }
     }
+}
+
+fn parse_headers(
+    headers: impl IntoIterator<Item = (String, String)>,
+) -> Result<HeaderMap, ExportError> {
+    let mut parsed = HeaderMap::new();
+    for (name, value) in headers {
+        if reserved_webhook_header(&name) {
+            return Err(ExportError::ReservedHeaderName { name });
+        }
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|source| {
+            ExportError::InvalidHeaderName {
+                name: name.clone(),
+                source,
+            }
+        })?;
+        let header_value = HeaderValue::from_str(&value)
+            .map_err(|source| ExportError::InvalidHeaderValue { name, source })?;
+        parsed.insert(header_name, header_value);
+    }
+    Ok(parsed)
+}
+
+fn reserved_webhook_header(name: &str) -> bool {
+    RESERVED_WEBHOOK_HEADERS
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,7 +343,7 @@ impl WebhookAck {
 mod tests {
     use proto::{BatchEnvelope, EventRecord, PayloadFormat};
 
-    use crate::{CompressionCodec, ExportError, WebhookAck};
+    use crate::{CompressionCodec, ExportError, WebhookAck, WebhookExporter};
 
     #[test]
     fn codecs_roundtrip_payload() -> Result<(), Box<dyn std::error::Error>> {
@@ -301,6 +359,31 @@ mod tests {
             assert_eq!(&decoded[..], payload);
         }
         Ok(())
+    }
+
+    #[test]
+    fn webhook_exporter_rejects_invalid_headers() {
+        let result = WebhookExporter::with_headers(
+            "https://collector.example/batches",
+            CompressionCodec::Zstd,
+            [("bad header".to_string(), "node-a".to_string())],
+        );
+
+        assert!(matches!(result, Err(ExportError::InvalidHeaderName { .. })));
+    }
+
+    #[test]
+    fn webhook_exporter_rejects_reserved_protocol_headers() {
+        let result = WebhookExporter::with_headers(
+            "https://collector.example/batches",
+            CompressionCodec::Zstd,
+            [("x-sssa-codec".to_string(), "none".to_string())],
+        );
+
+        assert!(matches!(
+            result,
+            Err(ExportError::ReservedHeaderName { name }) if name == "x-sssa-codec"
+        ));
     }
 
     #[test]
