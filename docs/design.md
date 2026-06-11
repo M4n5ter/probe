@@ -11,7 +11,7 @@
 - 可扩展协议解析：首要支持 HTTP/1.x 和 SSE，后续自然扩展 WebSocket、HTTP/2、HTTP/3 等协议。
 - 策略驱动的检测与防护：V1 先支持观测、告警和 dry-run verdict，后续接入真实拦截执行。
 
-本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、pluggable compression codec 和 HTTP webhook exporter。已定义 capture provider、procfs process attribution、runtime config 和 runtime planning 的第一版边界。尚未实现真实 live capture backend、libpcap fallback、eBPF 主路径、TLS uprobe provider 和真实 enforcement。
+本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入 V0/V1 骨架实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、pluggable compression codec 和 HTTP webhook exporter。已定义 capture provider、procfs process attribution、runtime config 和 runtime planning 的第一版边界，并开始接入真实 libpcap fallback。尚未实现 eBPF 主路径、TLS uprobe provider、真实 enforcement、TCP 重组和强进程归因。
 
 ## 2. 核心 thesis
 
@@ -73,12 +73,12 @@ V1 明确不做：
 当前实现状态：
 
 - 已实现 replay CLI，用单向输入文件驱动 capture provider、ingress journal、parser、policy、export queue 和可选 webhook exporter。
-- 已实现 `capture` crate 的 `CaptureProvider` 抽象和 `ReplayProvider`，真实 eBPF/libpcap/plaintext provider 尚未实现。
+- 已实现 `capture` crate 的 `CaptureProvider` 抽象、`ReplayProvider` 和基础 `LibpcapProvider`；libpcap provider 可打开设备、安装 BPF filter、解析 Ethernet/Linux cooked/raw IPv4 TCP payload 并输出 degraded `CapturedBytes`。它当前不做 TCP 重组、IPv6、procfs socket 归因或 gap 修复。
 - 已实现 `attribution` crate 的 `ProcfsAttributor`，可从 `/proc/<pid>` 读取进程身份、cmdline hash、starttime、uid/gid、cgroup、systemd service 与 container hint；replay flow 默认使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence，避免把文件输入误归因到 agent 进程。
-- 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、storage、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，基础字段校验不理解 runtime capability。
-- 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；`agent` 不再手写 capability matrix。
-- 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> parser -> policy -> export queue 的 replay/shared processing；`agent` binary 只负责 CLI wiring、配置读取和 exporter 命令。
-- 已实现 capability matrix；`procfs_attribution` 按本机 `/proc` 探测结果标记 degraded/unavailable，真实 live capture 相关能力仍必须标记 unavailable；policy/webhook 目前只在 replay pipeline 中可用。默认 `auto` capture 在当前 build 中会生成 `unavailable` live capture plan，不会静默选择 replay 作为 live provider；`run` 在无 live capture provider 时 fail closed，`check` 用于查看 resolved plan。
+- 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、provider-specific nested config、storage、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，基础字段校验不理解 runtime capability。
+- 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
+- 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> export queue 的 replay/shared processing；`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/pipeline 组合和 exporter 命令。
+- 已实现 capability matrix；`procfs_attribution` 按本机 `/proc` 探测结果标记 degraded/unavailable，eBPF/TLS/enforcement 相关能力仍必须标记 unavailable；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 作为 live provider；`run` 在无 live capture provider 时 fail closed，存在 libpcap live provider 时会把 provider 接入 replay 共用的 pipeline；`check` 用于查看 resolved plan。
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
 - 当前 `FjallSpool` 存储的是带 schema 的 `SpoolPayload`；ingress lane 当前写入 JSON framed `CapturedBytes`，export lane 当前写入 JSON framed `EventEnvelope`。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
 
@@ -244,6 +244,14 @@ fallback 能力边界：
 - 进程归因通过 procfs/netlink 快照 best effort。
 - TLS 明文不承诺 uprobe 等同能力；只依赖可用的 keylog/session material 或其它 PlaintextProvider。
 - 所有事件必须标记 degraded/capability source。
+
+当前实现状态：
+
+- `capture::LibpcapProvider` 使用 `pcap` crate 2.4 和系统 libpcap。
+- 支持配置 interface、BPF filter、snaplen、promisc、immediate mode、read timeout 和 buffer size。
+- 已支持 Ethernet、Linux cooked v1/v2、raw IPv4 和 loopback IPv4 的基础 IPv4/TCP payload 提取；IPv4 分片和 snaplen 截断包会被跳过，避免把不完整字节伪装成正常 HTTP payload。
+- 当前没有 TCP 重组、乱序处理、重传去重、IPv6 解析和 procfs socket 归因，因此事件必须标记 degraded，进程身份使用 synthetic unknown identity、confidence 为 0，`stream_offset` 不声明为可信重组 offset。
+- `agent` composition root 只在 libpcap provider 能按当前配置打开并安装 filter 时注入 available `Libpcap` descriptor；否则注入 unavailable descriptor 并输出原因，`runtime` 只消费 descriptor 做 plan。
 
 ## 11. TLS 与明文来源
 
@@ -610,6 +618,7 @@ V1 执行语义：
 - `capture.selection = "auto"` 是默认生产入口，按 `capture.fallback_backends` 的顺序选择第一个可用 live provider；默认顺序为 `ebpf` 后 `libpcap`。
 - `capture.selection = "ebpf"`、`"libpcap"` 或 `"replay"` 表示 required backend；显式 backend 不自动使用 `fallback_backends`。这是为了让 operator 能表达“缺少该能力就 fail fast”，避免把强能力需求静默降级。
 - `capture.fallback_backends` 只允许 live backend，不包含 replay。replay 是可重复验证入口，不是 live agent 的自动 fallback。
+- libpcap 运行参数放在 `[capture.libpcap]` 下，包括 `interface`、`bpf_filter`、`snaplen`、`promisc`、`immediate_mode`、`read_timeout_ms` 和 `buffer_size`；这些属于 provider 配置，不进入 parser 或 policy 层。
 - `RuntimePlan` 是配置解析后的事实源，必须输出候选 provider、选中的 provider、capability matrix 和不可用原因；`run` 使用 plan 启动，`check` 输出 plan 供部署前审计。
 
 配置/策略签名：
@@ -857,7 +866,7 @@ metrics 必须覆盖：
 
 后续 workspace 使用短名 crate，建议边界：
 
-- `agent`：主二进制、生命周期、配置加载、CLI/admin API wiring。
+- `agent`：主二进制、生命周期、配置加载、CLI/admin API wiring、provider probe/open 与 runtime composition root。
 - `attribution`：procfs process attribution、future netlink/socket attribution adapter。
 - `capture`：capture provider trait、replay provider、未来 eBPF/libpcap/plaintext provider adapter。
 - `config`：TOML runtime config schema、validation、future config source abstraction。
@@ -867,7 +876,7 @@ metrics 必须覆盖：
 - `parsers`：协议 detector、HTTP/1.x、SSE、handoff。
 - `pipeline`：capture event 到 ingress journal、parser、policy、export queue 的 shared processing stages。
 - `policy`：mlua/LuaJIT runtime、policy bundle、state API、verdict。
-- `runtime`：provider registry、capability matrix、config validation orchestration、runtime plan。
+- `runtime`：provider descriptor registry、capability matrix、config validation orchestration、runtime plan；不直接执行 provider IO。
 - `storage`：Fjall-backed spool、storage traits、retention。
 - `exporter`：HTTP webhook exporter、codec、sink traits。
 - `xtask`：eBPF 构建、代码生成、CI 辅助任务。

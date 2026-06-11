@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use capture::{
     CAPTURE_BYTES_JSON_SCHEMA, CaptureError, CaptureEvent, CaptureProvider, CapturedBytes,
 };
-use parsers::{ParserInput, ProtocolParser};
+use parsers::{ParserInput, ProtocolParserFactory};
 use policy::{PolicyOutcome, PolicyRuntime, hook_for_event};
 use probe_core::{EventEnvelope, EventKind, Timestamp};
 use proto::EVENT_ENVELOPE_JSON_SCHEMA;
@@ -30,7 +30,7 @@ pub struct PipelineSummary {
 
 pub struct CapturePipeline<'a, S> {
     spool: &'a S,
-    parser: &'a mut dyn ProtocolParser,
+    parser_factory: &'a mut dyn ProtocolParserFactory,
     policy: Option<&'a PolicyRuntime>,
     config_version: String,
     clock: PipelineClock,
@@ -42,13 +42,13 @@ where
 {
     pub fn new(
         spool: &'a S,
-        parser: &'a mut dyn ProtocolParser,
+        parser_factory: &'a mut dyn ProtocolParserFactory,
         policy: Option<&'a PolicyRuntime>,
         config_version: impl Into<String>,
     ) -> Self {
         Self {
             spool,
-            parser,
+            parser_factory,
             policy,
             config_version: config_version.into(),
             clock: PipelineClock::default(),
@@ -76,7 +76,8 @@ where
                 let capture_sequence = self.append_capture_chunk(&chunk)?;
                 summary.ingress_chunks = summary.ingress_chunks.saturating_add(1);
                 let events = self
-                    .parser
+                    .parser_factory
+                    .parser_for_flow(&chunk.flow.id)
                     .ingest(ParserInput::Data {
                         direction: chunk.direction,
                         bytes: chunk.bytes.as_ref(),
@@ -90,7 +91,8 @@ where
                         chunk.source,
                         self.config_version.clone(),
                         event,
-                    );
+                    )
+                    .with_degraded(chunk.degraded);
                     summary.export_events = summary
                         .export_events
                         .saturating_add(self.append_envelope_and_policy_outcomes(envelope)?);
@@ -98,16 +100,28 @@ where
                 self.spool.ack_ingress("parser", capture_sequence)?;
             }
             CaptureEvent::Gap(gap) => {
-                let envelope = EventEnvelope::new(
-                    gap.timestamp,
-                    gap.flow,
-                    gap.source,
-                    self.config_version.clone(),
-                    EventKind::Gap(gap.gap),
-                );
-                summary.export_events = summary
-                    .export_events
-                    .saturating_add(self.append_envelope_and_policy_outcomes(envelope)?);
+                let parser_events = self
+                    .parser_factory
+                    .parser_for_flow(&gap.flow.id)
+                    .ingest(ParserInput::Gap {
+                        direction: gap.gap.direction,
+                        expected_offset: gap.gap.expected_offset,
+                        next_offset: gap.gap.next_offset,
+                        reason: &gap.gap.reason,
+                    })
+                    .into_events();
+                for event in parser_events {
+                    let envelope = EventEnvelope::new(
+                        gap.timestamp,
+                        gap.flow.clone(),
+                        gap.source,
+                        self.config_version.clone(),
+                        event,
+                    );
+                    summary.export_events = summary
+                        .export_events
+                        .saturating_add(self.append_envelope_and_policy_outcomes(envelope)?);
+                }
             }
             CaptureEvent::ConnectionOpened {
                 timestamp,
@@ -132,6 +146,7 @@ where
                 source,
                 ..
             } => {
+                let flow_id = flow.id.clone();
                 let envelope = EventEnvelope::new(
                     timestamp,
                     flow,
@@ -142,6 +157,7 @@ where
                 summary.export_events = summary
                     .export_events
                     .saturating_add(self.append_envelope_and_policy_outcomes(envelope)?);
+                self.parser_factory.remove_flow(&flow_id);
             }
         }
         Ok(())
@@ -179,7 +195,8 @@ where
                 envelope.config_version.clone(),
                 kind,
             )
-            .with_policy_version(policy_version);
+            .with_policy_version(policy_version)
+            .with_degraded(envelope.degraded);
             self.append_envelope(&policy_envelope)?;
             written += 1;
         }
@@ -218,11 +235,11 @@ fn wall_time_unix_ns() -> i128 {
 
 #[cfg(test)]
 mod tests {
-    use capture::ReplayProvider;
-    use parsers::Http1Parser;
+    use capture::{CaptureProviderKind, CapturedBytes, ReplayProvider};
+    use parsers::Http1ParserFactory;
     use probe_core::{
-        AddressPort, Direction, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity,
-        TransportProtocol,
+        AddressPort, CapabilityState, CaptureSource, Direction, EventEnvelope, FlowContext,
+        FlowIdentity, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
     };
     use tempfile::tempdir;
 
@@ -232,7 +249,7 @@ mod tests {
     fn replay_provider_writes_ingress_and_export_lanes() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let spool = storage::FjallSpool::open(temp.path())?;
-        let mut parser = Http1Parser::default();
+        let mut parser_factory = Http1ParserFactory::default();
         let mut provider = ReplayProvider::new(
             demo_flow(),
             Direction::Inbound,
@@ -242,7 +259,7 @@ mod tests {
                 wall_time_unix_ns: 1,
             },
         );
-        let mut pipeline = CapturePipeline::new(&spool, &mut parser, None, "test");
+        let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
 
         let summary = pipeline.run_provider(&mut provider)?;
 
@@ -254,7 +271,117 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn live_pipeline_isolates_parser_state_per_flow() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = storage::FjallSpool::open(temp.path())?;
+        let mut parser_factory = Http1ParserFactory::default();
+        let flow_a = demo_flow_with_ports(50_000, 80, 1);
+        let flow_b = demo_flow_with_ports(50_001, 80, 2);
+        let mut provider = SequenceProvider::new(vec![
+            captured_bytes(
+                flow_a.clone(),
+                b"POST /a HTTP/1.1\r\nHost: a.test\r\nContent-Length: 5\r\n\r\nhe",
+            ),
+            captured_bytes(
+                flow_b.clone(),
+                b"GET /b HTTP/1.1\r\nHost: b.test\r\nContent-Length: 0\r\n\r\n",
+            ),
+            captured_bytes(flow_a, b"llo"),
+        ]);
+        let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+
+        let summary = pipeline.run_provider(&mut provider)?;
+
+        assert_eq!(summary.ingress_chunks, 3);
+        let exported = spool.read_export_batch("sink", 16)?;
+        let envelopes = exported
+            .iter()
+            .map(|event| serde_json::from_slice::<EventEnvelope>(event.payload.bytes()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(envelopes.iter().any(|envelope| {
+            matches!(
+                &envelope.kind,
+                EventKind::HttpRequestHeaders(headers) if headers.target.as_deref() == Some("/a")
+            )
+        }));
+        assert!(envelopes.iter().any(|envelope| {
+            matches!(
+                &envelope.kind,
+                EventKind::HttpRequestHeaders(headers) if headers.target.as_deref() == Some("/b")
+            )
+        }));
+        assert!(envelopes.iter().any(|envelope| {
+            matches!(
+                &envelope.kind,
+                EventKind::HttpBodyChunk(chunk) if chunk.data.as_ref() == b"llo" && chunk.end_stream
+            )
+        }));
+        assert!(
+            !envelopes
+                .iter()
+                .any(|envelope| matches!(envelope.kind, EventKind::ProtocolError(_)))
+        );
+        Ok(())
+    }
+
+    struct SequenceProvider {
+        events: std::vec::IntoIter<CaptureEvent>,
+    }
+
+    impl SequenceProvider {
+        fn new(events: Vec<CaptureEvent>) -> Self {
+            Self {
+                events: events.into_iter(),
+            }
+        }
+    }
+
+    impl CaptureProvider for SequenceProvider {
+        fn name(&self) -> &'static str {
+            "sequence"
+        }
+
+        fn kind(&self) -> CaptureProviderKind {
+            CaptureProviderKind::Replay
+        }
+
+        fn source(&self) -> CaptureSource {
+            CaptureSource::Replay
+        }
+
+        fn capabilities(&self) -> Vec<CapabilityState> {
+            Vec::new()
+        }
+
+        fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+            Ok(self.events.next())
+        }
+    }
+
+    fn captured_bytes(flow: FlowContext, bytes: &'static [u8]) -> CaptureEvent {
+        CaptureEvent::Bytes(CapturedBytes {
+            timestamp: Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            flow,
+            source: CaptureSource::Replay,
+            provider: CaptureProviderKind::Replay,
+            direction: Direction::Outbound,
+            stream_offset: 0,
+            bytes: bytes.into(),
+            attribution_confidence: 0,
+            degraded: false,
+            degradation_reason: None,
+        })
+    }
+
     fn demo_flow() -> FlowContext {
+        demo_flow_with_ports(50_000, 80, 1)
+    }
+
+    fn demo_flow_with_ports(local_port: u16, remote_port: u16, socket_cookie: u64) -> FlowContext {
         let process = ProcessIdentity {
             pid: 1,
             tgid: 1,
@@ -271,11 +398,11 @@ mod tests {
         };
         let local = AddressPort {
             address: "127.0.0.1".to_string(),
-            port: 50_000,
+            port: local_port,
         };
         let remote = AddressPort {
             address: "127.0.0.1".to_string(),
-            port: 80,
+            port: remote_port,
         };
         FlowContext {
             id: FlowIdentity::stable(&process, &local, &remote, TransportProtocol::Tcp, 1, None),
@@ -288,7 +415,7 @@ mod tests {
             remote,
             protocol: TransportProtocol::Tcp,
             start_monotonic_ns: 1,
-            socket_cookie: None,
+            socket_cookie: Some(socket_cookie),
             attribution_confidence: 0,
         }
     }

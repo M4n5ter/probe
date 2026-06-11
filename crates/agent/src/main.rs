@@ -4,19 +4,21 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use capture::ReplayProvider;
+use capture::{CaptureError, CaptureProvider, LibpcapConfig, LibpcapProvider, ReplayProvider};
 use clap::{Parser, Subcommand, ValueEnum};
 use exporter::{CompressionCodec, ReliableExporter, WebhookExporter};
-use parsers::Http1Parser;
+use parsers::Http1ParserFactory;
 use pipeline::CapturePipeline;
 use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
-use probe_config::AgentConfig;
+use probe_config::{AgentConfig, CaptureBackend};
 use probe_core::{
     AddressPort, Direction, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, Timestamp,
     TransportProtocol,
 };
 use proto::{BatchEnvelope, EVENT_ENVELOPE_JSON_SCHEMA};
-use runtime::{ProviderRegistry, RuntimePlan};
+use runtime::{
+    CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimeError, RuntimePlan,
+};
 use storage::{DurableSpool, FjallSpool};
 use thiserror::Error;
 
@@ -43,6 +45,10 @@ enum AgentError {
     Proto(#[from] proto::ProtoError),
     #[error("export error: {0}")]
     Export(#[from] exporter::ExportError),
+    #[error("capture provider error: {0}")]
+    Capture(#[from] CaptureError),
+    #[error("unsupported run config: {0}")]
+    UnsupportedRunConfig(String),
     #[error("unsupported spooled payload schema at sequence {sequence}: {schema}")]
     UnsupportedSpoolPayloadSchema { sequence: u64, schema: String },
 }
@@ -131,13 +137,27 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
     match cli.command {
         Command::Run { config } => {
             let plan = read_runtime_plan_or_default(config.as_ref())?;
-            plan.require_live_capture()?;
+            let mut provider = build_live_capture_provider(&plan)?;
+            let mut parser_factory = Http1ParserFactory::default();
+            let spool = FjallSpool::open(&plan.config.storage.path)?;
+            let policy = read_configured_policy(&plan.config)?;
+            let mut pipeline = CapturePipeline::new(
+                &spool,
+                &mut parser_factory,
+                policy.as_ref(),
+                plan.config.config_version.clone(),
+            );
             println!(
-                "agent {} planned config {} capture {:?} selected {:?}",
+                "agent {} running config {} capture {:?} selected {:?}",
                 plan.config.agent_id,
                 plan.config.config_version,
                 plan.capture.mode,
                 plan.capture.selected_backend
+            );
+            let summary = pipeline.run_provider(provider.as_mut())?;
+            println!(
+                "agent stopped after journaling {} capture chunks and storing {} export events",
+                summary.ingress_chunks, summary.export_events
             );
         }
         Command::Check { config } => {
@@ -145,7 +165,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             println!("{}", serde_json::to_string_pretty(&plan)?);
         }
         Command::Capabilities => {
-            let matrix = ProviderRegistry::discover().capability_matrix();
+            let matrix = default_provider_registry(&AgentConfig::default()).capability_matrix();
             println!("{}", serde_json::to_string_pretty(&matrix)?);
         }
         Command::Replay {
@@ -183,8 +203,72 @@ fn read_runtime_plan(path: &PathBuf) -> Result<RuntimePlan, AgentError> {
 }
 
 fn build_runtime_plan(config: AgentConfig) -> Result<RuntimePlan, AgentError> {
-    let registry = ProviderRegistry::discover();
+    let registry = default_provider_registry(&config);
     RuntimePlan::build(config, &registry).map_err(AgentError::Runtime)
+}
+
+fn default_provider_registry(config: &AgentConfig) -> ProviderRegistry {
+    ProviderRegistry::with_default_platform(default_capture_provider_descriptors(config))
+}
+
+fn default_capture_provider_descriptors(config: &AgentConfig) -> Vec<CaptureProviderDescriptor> {
+    vec![
+        CaptureProviderDescriptor::available(
+            CaptureBackend::Replay,
+            CaptureProviderBuilder::Replay,
+        ),
+        CaptureProviderDescriptor::unavailable(
+            CaptureBackend::Ebpf,
+            CaptureProviderBuilder::Unimplemented,
+            "provider not implemented in this build",
+        ),
+        libpcap_provider_descriptor(&libpcap_config_from_agent(config)),
+    ]
+}
+
+fn libpcap_provider_descriptor(config: &LibpcapConfig) -> CaptureProviderDescriptor {
+    match LibpcapProvider::probe(config) {
+        Ok(()) => CaptureProviderDescriptor::available(
+            CaptureBackend::Libpcap,
+            CaptureProviderBuilder::Libpcap,
+        ),
+        Err(error) => CaptureProviderDescriptor::unavailable(
+            CaptureBackend::Libpcap,
+            CaptureProviderBuilder::Libpcap,
+            error.to_string(),
+        ),
+    }
+}
+
+fn build_live_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProvider>, AgentError> {
+    plan.require_live_capture()?;
+    match plan.capture.selected_backend {
+        Some(CaptureBackend::Libpcap) => Ok(Box::new(LibpcapProvider::open(
+            libpcap_config_from_agent(&plan.config),
+        )?)),
+        Some(backend) => Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
+            reason: format!("{backend:?} capture provider is selected but has no agent builder"),
+        })),
+        None => Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
+            reason: plan
+                .capture
+                .reason
+                .clone()
+                .unwrap_or_else(|| "capture plan did not select a live backend".to_string()),
+        })),
+    }
+}
+
+fn libpcap_config_from_agent(config: &AgentConfig) -> LibpcapConfig {
+    LibpcapConfig {
+        interface: config.capture.libpcap.interface.clone(),
+        bpf_filter: config.capture.libpcap.bpf_filter.clone(),
+        snaplen: config.capture.libpcap.snaplen,
+        promisc: config.capture.libpcap.promisc,
+        immediate_mode: config.capture.libpcap.immediate_mode,
+        read_timeout_ms: config.capture.libpcap.read_timeout_ms,
+        buffer_size: config.capture.libpcap.buffer_size,
+    }
 }
 
 fn read_config_or_default(path: Option<&PathBuf>) -> Result<AgentConfig, AgentError> {
@@ -216,12 +300,12 @@ async fn replay(
         source,
     })?;
     let policy = policy.as_ref().map(read_policy).transpose()?;
-    let mut http_parser = Http1Parser::default();
+    let mut parser_factory = Http1ParserFactory::default();
     let spool = FjallSpool::open(spool)?;
     let flow = replay_flow();
     let mut replay_provider =
         ReplayProvider::new(flow.clone(), direction, bytes, current_timestamp(1));
-    let mut pipeline = CapturePipeline::new(&spool, &mut http_parser, policy.as_ref(), "replay");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, policy.as_ref(), "replay");
     let summary = pipeline.run_provider(&mut replay_provider)?;
     println!(
         "replay pipeline journaled {} capture chunks and stored {} export events",
@@ -257,6 +341,21 @@ fn read_policy(path: &PathBuf) -> Result<PolicyRuntime, AgentError> {
         &source,
     )
     .map_err(AgentError::Policy)
+}
+
+fn read_configured_policy(config: &AgentConfig) -> Result<Option<PolicyRuntime>, AgentError> {
+    let enabled = config
+        .policies
+        .iter()
+        .filter(|policy| policy.enabled)
+        .collect::<Vec<_>>();
+    match enabled.as_slice() {
+        [] => Ok(None),
+        [policy] => read_policy(&policy.path).map(Some),
+        _ => Err(AgentError::UnsupportedRunConfig(
+            "live run currently supports at most one enabled policy bundle".to_string(),
+        )),
+    }
 }
 
 async fn export_once(

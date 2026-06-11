@@ -88,6 +88,11 @@ impl EventEnvelope {
         self
     }
 
+    pub fn with_degraded(mut self, degraded: bool) -> Self {
+        self.degraded = self.degraded || degraded;
+        self
+    }
+
     fn stable_id(
         timestamp: Timestamp,
         flow: &FlowContext,

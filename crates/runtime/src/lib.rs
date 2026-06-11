@@ -236,10 +236,10 @@ pub struct ProviderRegistry {
 }
 
 impl ProviderRegistry {
-    pub fn discover() -> Self {
+    pub fn with_default_platform(capture_providers: Vec<CaptureProviderDescriptor>) -> Self {
         let procfs = ProcfsAttributor::new();
         Self::new(
-            default_capture_providers(),
+            capture_providers,
             default_platform_capabilities(procfs).into_iter().collect(),
         )
     }
@@ -409,25 +409,6 @@ fn capture_candidates(config: &AgentConfig) -> Vec<CaptureBackend> {
     }
 }
 
-fn default_capture_providers() -> Vec<CaptureProviderDescriptor> {
-    vec![
-        CaptureProviderDescriptor::available(
-            CaptureBackend::Replay,
-            CaptureProviderBuilder::Replay,
-        ),
-        CaptureProviderDescriptor::unavailable(
-            CaptureBackend::Ebpf,
-            CaptureProviderBuilder::Unimplemented,
-            "provider not implemented in this build",
-        ),
-        CaptureProviderDescriptor::unavailable(
-            CaptureBackend::Libpcap,
-            CaptureProviderBuilder::Unimplemented,
-            "provider not implemented in this build",
-        ),
-    ]
-}
-
 fn default_platform_capabilities(
     procfs: impl ProcessAttributor,
 ) -> impl IntoIterator<Item = CapabilityState> {
@@ -444,7 +425,7 @@ fn default_platform_capabilities(
         ),
         CapabilityState::degraded(
             CapabilityKind::LuaJit,
-            "policy runtime is wired into replay but not live capture",
+            "policy runtime is wired into replay and live capture, but hot reload and multiple active bundles are not implemented",
         ),
         CapabilityState::degraded(
             CapabilityKind::DurableSpool,

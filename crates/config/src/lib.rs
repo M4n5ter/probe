@@ -33,6 +33,7 @@ impl AgentConfig {
     pub fn validate_basic(&self) -> Result<(), ConfigError> {
         let mut violations = Vec::new();
 
+        validate_capture(&self.capture, &mut violations);
         validate_exporters(&self.exporters, &mut violations);
         validate_policies(&self.policies, &mut violations);
 
@@ -64,7 +65,20 @@ impl Default for AgentConfig {
 pub struct CaptureConfig {
     pub selection: CaptureSelection,
     pub fallback_backends: Vec<LiveCaptureBackend>,
+    pub libpcap: LibpcapCaptureConfig,
     pub deep_observe_selector: Option<Selector>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LibpcapCaptureConfig {
+    pub interface: Option<String>,
+    pub bpf_filter: String,
+    pub snaplen: i32,
+    pub promisc: bool,
+    pub immediate_mode: bool,
+    pub read_timeout_ms: i32,
+    pub buffer_size: Option<i32>,
 }
 
 impl Default for CaptureConfig {
@@ -72,7 +86,22 @@ impl Default for CaptureConfig {
         Self {
             selection: CaptureSelection::Auto,
             fallback_backends: vec![LiveCaptureBackend::Ebpf, LiveCaptureBackend::Libpcap],
+            libpcap: LibpcapCaptureConfig::default(),
             deep_observe_selector: None,
+        }
+    }
+}
+
+impl Default for LibpcapCaptureConfig {
+    fn default() -> Self {
+        Self {
+            interface: None,
+            bpf_filter: "tcp".to_string(),
+            snaplen: 65_535,
+            promisc: false,
+            immediate_mode: true,
+            read_timeout_ms: 1_000,
+            buffer_size: None,
         }
     }
 }
@@ -307,6 +336,59 @@ pub struct ConfigViolation {
     pub reason: String,
 }
 
+fn validate_capture(capture: &CaptureConfig, violations: &mut Vec<ConfigViolation>) {
+    if capture.selection == CaptureSelection::Auto && capture.fallback_backends.is_empty() {
+        violations.push(ConfigViolation {
+            field: "capture.fallback_backends".to_string(),
+            reason: "auto capture selection requires at least one live fallback backend"
+                .to_string(),
+        });
+    }
+    if capture_uses_libpcap(capture) {
+        validate_libpcap_capture(&capture.libpcap, violations);
+    }
+}
+
+fn capture_uses_libpcap(capture: &CaptureConfig) -> bool {
+    match capture.selection {
+        CaptureSelection::Libpcap => true,
+        CaptureSelection::Auto => capture
+            .fallback_backends
+            .contains(&LiveCaptureBackend::Libpcap),
+        CaptureSelection::Ebpf | CaptureSelection::Replay => false,
+    }
+}
+
+fn validate_libpcap_capture(libpcap: &LibpcapCaptureConfig, violations: &mut Vec<ConfigViolation>) {
+    if libpcap.bpf_filter.trim().is_empty() {
+        violations.push(ConfigViolation {
+            field: "capture.libpcap.bpf_filter".to_string(),
+            reason: "libpcap BPF filter cannot be empty".to_string(),
+        });
+    }
+    if libpcap.snaplen <= 0 {
+        violations.push(ConfigViolation {
+            field: "capture.libpcap.snaplen".to_string(),
+            reason: "libpcap snaplen must be positive".to_string(),
+        });
+    }
+    if libpcap.read_timeout_ms < 0 {
+        violations.push(ConfigViolation {
+            field: "capture.libpcap.read_timeout_ms".to_string(),
+            reason: "libpcap read timeout cannot be negative".to_string(),
+        });
+    }
+    if libpcap
+        .buffer_size
+        .is_some_and(|buffer_size| buffer_size <= 0)
+    {
+        violations.push(ConfigViolation {
+            field: "capture.libpcap.buffer_size".to_string(),
+            reason: "libpcap buffer size must be positive when set".to_string(),
+        });
+    }
+}
+
 fn validate_exporters(exporters: &[ExporterConfig], violations: &mut Vec<ConfigViolation>) {
     for exporter in exporters {
         if exporter.id.trim().is_empty() {
@@ -330,6 +412,13 @@ fn validate_exporters(exporters: &[ExporterConfig], violations: &mut Vec<ConfigV
 }
 
 fn validate_policies(policies: &[PolicyConfig], violations: &mut Vec<ConfigViolation>) {
+    if policies.iter().filter(|policy| policy.enabled).count() > 1 {
+        violations.push(ConfigViolation {
+            field: "policies".to_string(),
+            reason: "runtime config currently supports at most one enabled policy bundle"
+                .to_string(),
+        });
+    }
     for policy in policies {
         if policy.enabled && policy.path.as_os_str().is_empty() {
             violations.push(ConfigViolation {
@@ -354,6 +443,12 @@ mod tests {
             config.capture.fallback_backends,
             vec![LiveCaptureBackend::Ebpf, LiveCaptureBackend::Libpcap]
         );
+        assert_eq!(config.capture.libpcap.interface, None);
+        assert_eq!(config.capture.libpcap.bpf_filter, "tcp");
+        assert_eq!(config.capture.libpcap.snaplen, 65_535);
+        assert!(!config.capture.libpcap.promisc);
+        assert!(config.capture.libpcap.immediate_mode);
+        assert_eq!(config.capture.libpcap.read_timeout_ms, 1_000);
         assert_eq!(config.exporters, Vec::<ExporterConfig>::new());
         assert_eq!(config.enforcement.mode, EnforcementMode::AuditOnly);
         config.validate_basic()?;
@@ -370,6 +465,15 @@ config_version = "cfg-1"
 [capture]
 selection = "ebpf"
 fallback_backends = ["libpcap"]
+
+[capture.libpcap]
+interface = "lo"
+bpf_filter = "tcp port 8080"
+snaplen = 4096
+promisc = true
+immediate_mode = false
+read_timeout_ms = 250
+buffer_size = 1048576
 
 [storage]
 path = "/tmp/sssa-spool"
@@ -398,6 +502,13 @@ mode = "dry_run"
         assert_eq!(config.agent_id, "node-a");
         assert_eq!(config.config_version, "cfg-1");
         assert_eq!(config.capture.selection, CaptureSelection::Ebpf);
+        assert_eq!(config.capture.libpcap.interface.as_deref(), Some("lo"));
+        assert_eq!(config.capture.libpcap.bpf_filter, "tcp port 8080");
+        assert_eq!(config.capture.libpcap.snaplen, 4096);
+        assert!(config.capture.libpcap.promisc);
+        assert!(!config.capture.libpcap.immediate_mode);
+        assert_eq!(config.capture.libpcap.read_timeout_ms, 250);
+        assert_eq!(config.capture.libpcap.buffer_size, Some(1_048_576));
         assert_eq!(config.storage.path, PathBuf::from("/tmp/sssa-spool"));
         assert_eq!(config.exporters[0].codec, CompressionCodecName::Zstd);
         assert_eq!(config.tls.materials[0].kind, TlsMaterialKind::TrustAnchor);
@@ -411,5 +522,109 @@ mode = "dry_run"
         let result = AgentConfig::from_toml_str("unknown = true");
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validation_rejects_invalid_capture_runtime_fields() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let empty_fallback = AgentConfig::from_toml_str(
+            r#"
+[capture]
+fallback_backends = []
+"#,
+        )?;
+
+        let empty_fallback_error = empty_fallback
+            .validate_basic()
+            .expect_err("auto capture requires a live backend");
+        assert!(
+            empty_fallback_error
+                .to_string()
+                .contains("auto capture selection requires at least one live fallback backend")
+        );
+
+        let config = AgentConfig::from_toml_str(
+            r#"
+[capture]
+selection = "libpcap"
+
+[capture.libpcap]
+bpf_filter = " "
+snaplen = 0
+read_timeout_ms = -1
+buffer_size = 0
+"#,
+        )?;
+
+        let error = config
+            .validate_basic()
+            .expect_err("capture fields must be validated");
+
+        assert!(
+            error
+                .to_string()
+                .contains("libpcap BPF filter cannot be empty")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("libpcap snaplen must be positive")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("libpcap read timeout cannot be negative")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("libpcap buffer size must be positive")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validation_ignores_unused_libpcap_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let config = AgentConfig::from_toml_str(
+            r#"
+[capture]
+selection = "replay"
+
+[capture.libpcap]
+bpf_filter = " "
+snaplen = 0
+"#,
+        )?;
+
+        config.validate_basic()?;
+        Ok(())
+    }
+
+    #[test]
+    fn validation_rejects_multiple_enabled_policies() -> Result<(), Box<dyn std::error::Error>> {
+        let config = AgentConfig::from_toml_str(
+            r#"
+[[policies]]
+id = "a"
+enabled = true
+path = "/tmp/a.lua"
+
+[[policies]]
+id = "b"
+enabled = true
+path = "/tmp/b.lua"
+"#,
+        )?;
+
+        let error = config
+            .validate_basic()
+            .expect_err("multiple enabled policies must be rejected before run");
+
+        assert!(
+            error
+                .to_string()
+                .contains("at most one enabled policy bundle")
+        );
+        Ok(())
     }
 }

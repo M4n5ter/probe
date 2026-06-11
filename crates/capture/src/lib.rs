@@ -1,3 +1,5 @@
+mod libpcap;
+
 use bytes::Bytes;
 use probe_core::{
     CapabilityKind, CapabilityState, CaptureSource, Direction, FlowContext, Gap, Timestamp,
@@ -5,12 +7,23 @@ use probe_core::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use libpcap::{LibpcapConfig, LibpcapProvider};
+
 pub const CAPTURE_BYTES_JSON_SCHEMA: &str = "sssa.probe.capture_bytes.v1.json";
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
     #[error("capture provider {provider} failed: {reason}")]
     Provider { provider: String, reason: String },
+}
+
+impl CaptureError {
+    pub fn provider(provider: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::Provider {
+            provider: provider.into(),
+            reason: reason.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
