@@ -10,7 +10,7 @@ pub use capability::{
 };
 pub use event::{
     BodyChunk, CaptureSource, Direction, DomainEvent, EventEnvelope, EventId, EventKind, Gap,
-    HttpHeaders, OpaqueStream, ProtocolError, SseEvent, Timestamp,
+    HttpHeaders, OpaqueStream, ProtocolError, SseEvent, Timestamp, WebSocketHandoff,
 };
 pub use identity::{
     AddressPort, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, TransportProtocol,

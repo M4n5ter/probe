@@ -140,6 +140,7 @@ fn event_direction(kind: &EventKind) -> Option<Direction> {
         }
         EventKind::HttpBodyChunk(chunk) => Some(chunk.direction),
         EventKind::SseEvent(event) => Some(event.direction),
+        EventKind::WebSocketHandoff(handoff) => Some(handoff.direction),
         EventKind::Gap(gap) => Some(gap.direction),
         EventKind::ProtocolError(error) => Some(error.direction),
         EventKind::OpaqueStream(stream) => Some(stream.direction),

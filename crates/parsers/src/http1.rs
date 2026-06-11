@@ -3,12 +3,17 @@ use std::collections::VecDeque;
 use bytes::{Buf, Bytes, BytesMut};
 use probe_core::{
     BodyChunk, Direction, EventKind, HttpHeaders, OpaqueStream, ProtocolError, SseEvent,
+    WebSocketHandoff,
 };
 use thiserror::Error;
 
 use crate::{ParserInput, ParserOutput, ProtocolParser, gap_event};
 
 const MAX_SSE_PENDING_BYTES: usize = 1024 * 1024;
+const CONNECT_HANDOFF_REASON: &str = "CONNECT tunnel established";
+const HTTP_UPGRADE_HANDOFF_REASON: &str = "HTTP upgrade handoff";
+const WEBSOCKET_BYTES_AFTER_HANDOFF_REASON: &str = "websocket bytes after HTTP upgrade handoff";
+const OPAQUE_BYTES_AFTER_HANDOFF_REASON: &str = "opaque stream bytes after HTTP handoff";
 
 #[derive(Debug, Error)]
 pub enum ParserError {
@@ -39,7 +44,7 @@ impl ProtocolParser for Http1Parser {
                 if self.opaque_handoff {
                     return ParserOutput::from_events(opaque_data_events(direction, bytes));
                 }
-                let mut events = match direction {
+                let mut output = match direction {
                     Direction::Inbound => self.inbound.ingest_data(
                         direction,
                         bytes,
@@ -52,19 +57,19 @@ impl ProtocolParser for Http1Parser {
                     ),
                 };
                 self.pending_response_contexts
-                    .extend(events.iter().filter_map(|event| match event {
+                    .extend(output.events.iter().filter_map(|event| match event {
                         EventKind::HttpRequestHeaders(headers) => {
                             Some(ResponseContext::from_request(headers))
                         }
                         _ => None,
                     }));
-                if events.iter().any(is_handoff_opaque_event) {
+                if output.enter_opaque {
                     self.opaque_handoff = true;
                     self.pending_response_contexts.clear();
                     self.inbound.enter_opaque();
                     self.outbound.enter_opaque();
                 }
-                ParserOutput::from_events(std::mem::take(&mut events))
+                ParserOutput::from_events(std::mem::take(&mut output.events))
             }
             ParserInput::Gap {
                 direction,
@@ -120,31 +125,33 @@ impl DirectionState {
         direction: Direction,
         bytes: &[u8],
         response_contexts: &mut VecDeque<ResponseContext>,
-    ) -> Vec<EventKind> {
+    ) -> DirectionIngestOutput {
         self.buffer.extend_from_slice(bytes);
-        let mut events = Vec::new();
+        let mut output = DirectionIngestOutput::default();
 
         loop {
             let before = Progress::new(self.buffer.len(), &self.state);
             match self.state {
                 HttpState::ReadingHeaders => {
-                    self.read_headers(direction, response_contexts, &mut events)
+                    self.read_headers(direction, response_contexts, &mut output)
                 }
                 HttpState::ReadingFixedBody { remaining } => {
-                    self.read_fixed_body(direction, remaining, &mut events)
+                    self.read_fixed_body(direction, remaining, &mut output.events)
                 }
                 HttpState::StreamingUntilClose => {
-                    self.read_available_body(direction, false, &mut events);
+                    self.read_available_body(direction, false, &mut output.events);
                 }
-                HttpState::ReadingChunkSize => self.read_chunk_size(direction, &mut events),
+                HttpState::ReadingChunkSize => self.read_chunk_size(direction, &mut output.events),
                 HttpState::ReadingChunkData { remaining } => {
-                    self.read_chunk_data(direction, remaining, &mut events)
+                    self.read_chunk_data(direction, remaining, &mut output.events)
                 }
                 HttpState::ReadingChunkTerminator => {
-                    self.read_chunk_terminator(direction, &mut events)
+                    self.read_chunk_terminator(direction, &mut output.events)
                 }
-                HttpState::ReadingChunkTrailers => self.read_chunk_trailers(direction, &mut events),
-                HttpState::Opaque => self.read_opaque(direction, &mut events),
+                HttpState::ReadingChunkTrailers => {
+                    self.read_chunk_trailers(direction, &mut output.events)
+                }
+                HttpState::Opaque => self.read_opaque(direction, &mut output.events),
             };
 
             if before == Progress::new(self.buffer.len(), &self.state) {
@@ -156,14 +163,14 @@ impl DirectionState {
             }
         }
 
-        events
+        output
     }
 
     fn read_headers(
         &mut self,
         direction: Direction,
         response_contexts: &mut VecDeque<ResponseContext>,
-        events: &mut Vec<EventKind>,
+        output: &mut DirectionIngestOutput,
     ) {
         match parse_headers(direction, &self.buffer) {
             HeaderParse::Complete {
@@ -178,7 +185,7 @@ impl DirectionState {
                 let response_context = (role == HeaderRole::Response)
                     .then(|| {
                         if is_interim_non_switching(headers.status) {
-                            response_contexts.front().copied()
+                            response_contexts.front().cloned()
                         } else {
                             response_contexts.pop_front()
                         }
@@ -189,23 +196,50 @@ impl DirectionState {
 
                 let mut headers = headers;
                 headers.stream_sequence = self.stream_sequence;
-                events.push(match role {
+                output.events.push(match role {
                     HeaderRole::Request => EventKind::HttpRequestHeaders(headers),
                     HeaderRole::Response => EventKind::HttpResponseHeaders(headers),
                 });
 
-                if let Some(reason) = body_plan.opaque_reason {
-                    events.push(EventKind::OpaqueStream(OpaqueStream {
-                        direction,
-                        fingerprint: opaque_fingerprint(&self.buffer),
-                        reason,
-                    }));
+                if let Some(handoff) = body_plan.handoff {
+                    output.enter_opaque = true;
+                    match handoff {
+                        HandoffPlan::Opaque { reason } => {
+                            output.events.push(EventKind::OpaqueStream(OpaqueStream {
+                                direction,
+                                fingerprint: opaque_fingerprint(&self.buffer),
+                                reason: reason.to_string(),
+                            }));
+                        }
+                        HandoffPlan::WebSocket {
+                            target,
+                            subprotocol,
+                            extensions,
+                        } => {
+                            output
+                                .events
+                                .push(EventKind::WebSocketHandoff(WebSocketHandoff {
+                                    direction,
+                                    stream_sequence: self.stream_sequence,
+                                    target,
+                                    subprotocol,
+                                    extensions,
+                                }));
+                            if !self.buffer.is_empty() {
+                                output.events.push(EventKind::OpaqueStream(OpaqueStream {
+                                    direction,
+                                    fingerprint: opaque_fingerprint(&self.buffer),
+                                    reason: WEBSOCKET_BYTES_AFTER_HANDOFF_REASON.to_string(),
+                                }));
+                            }
+                        }
+                    }
                     self.buffer.clear();
                 }
                 self.state = body_plan.state;
             }
             HeaderParse::Partial => {}
-            HeaderParse::Invalid(reason) => self.fail(direction, reason, events),
+            HeaderParse::Invalid(reason) => self.fail(direction, reason, &mut output.events),
         }
     }
 
@@ -355,7 +389,7 @@ impl DirectionState {
         events.push(EventKind::OpaqueStream(OpaqueStream {
             direction,
             fingerprint: opaque_fingerprint(&self.buffer),
-            reason: "opaque stream bytes after HTTP handoff".to_string(),
+            reason: OPAQUE_BYTES_AFTER_HANDOFF_REASON.to_string(),
         }));
         self.buffer.clear();
     }
@@ -423,6 +457,12 @@ impl DirectionState {
     }
 }
 
+#[derive(Debug, Default)]
+struct DirectionIngestOutput {
+    events: Vec<EventKind>,
+    enter_opaque: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum HttpState {
     #[default]
@@ -465,7 +505,7 @@ impl Progress {
 struct BodyPlan {
     state: HttpState,
     is_sse: bool,
-    opaque_reason: Option<String>,
+    handoff: Option<HandoffPlan>,
 }
 
 impl BodyPlan {
@@ -475,10 +515,12 @@ impl BodyPlan {
         response_context: Option<ResponseContext>,
     ) -> Self {
         let is_sse = is_sse(&headers.headers);
-        let opaque_reason = opaque_handoff_reason(role, headers, response_context);
-        let has_no_body = response_context.is_some_and(ResponseContext::has_no_response_body)
+        let handoff = handoff_plan(role, headers, response_context.clone());
+        let has_no_body = response_context
+            .as_ref()
+            .is_some_and(ResponseContext::has_no_response_body)
             || response_status_has_no_body(role, headers.status);
-        let state = if opaque_reason.is_some() {
+        let state = if handoff.is_some() {
             HttpState::Opaque
         } else if has_no_body {
             HttpState::ReadingHeaders
@@ -500,14 +542,27 @@ impl BodyPlan {
         Self {
             state,
             is_sse,
-            opaque_reason,
+            handoff,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
+enum HandoffPlan {
+    Opaque {
+        reason: &'static str,
+    },
+    WebSocket {
+        target: Option<String>,
+        subprotocol: Option<String>,
+        extensions: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct ResponseContext {
     request_method: RequestMethod,
+    target: Option<String>,
 }
 
 impl ResponseContext {
@@ -517,14 +572,17 @@ impl ResponseContext {
             .as_deref()
             .map(RequestMethod::from_method)
             .unwrap_or(RequestMethod::Other);
-        Self { request_method }
+        Self {
+            request_method,
+            target: headers.target.clone(),
+        }
     }
 
-    fn has_no_response_body(self) -> bool {
+    fn has_no_response_body(&self) -> bool {
         self.request_method == RequestMethod::Head
     }
 
-    fn is_connect(self) -> bool {
+    fn is_connect(&self) -> bool {
         self.request_method == RequestMethod::Connect
     }
 }
@@ -562,34 +620,46 @@ fn is_interim_non_switching(status: Option<u16>) -> bool {
     matches!(status, Some(100..=199)) && status != Some(101)
 }
 
-fn opaque_handoff_reason(
+fn handoff_plan(
     role: HeaderRole,
     headers: &HttpHeaders,
     response_context: Option<ResponseContext>,
-) -> Option<String> {
+) -> Option<HandoffPlan> {
     if role != HeaderRole::Response {
         return None;
     }
-    if response_context.is_some_and(ResponseContext::is_connect)
+    if response_context
+        .as_ref()
+        .is_some_and(ResponseContext::is_connect)
         && headers
             .status
             .is_some_and(|status| (200..=299).contains(&status))
     {
-        return Some("CONNECT tunnel established".to_string());
+        return Some(HandoffPlan::Opaque {
+            reason: CONNECT_HANDOFF_REASON,
+        });
+    }
+    if headers.status == Some(101) && is_websocket_upgrade(&headers.headers) {
+        return Some(HandoffPlan::WebSocket {
+            target: response_context.and_then(|context| context.target),
+            subprotocol: header_value(&headers.headers, "sec-websocket-protocol")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            extensions: header_values(&headers.headers, "sec-websocket-extensions")
+                .flat_map(|value| value.split(','))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect(),
+        });
     }
     if headers.status == Some(101) || has_upgrade_header(&headers.headers) {
-        return Some("HTTP upgrade handoff".to_string());
+        return Some(HandoffPlan::Opaque {
+            reason: HTTP_UPGRADE_HANDOFF_REASON,
+        });
     }
     None
-}
-
-fn is_handoff_opaque_event(event: &EventKind) -> bool {
-    matches!(
-        event,
-        EventKind::OpaqueStream(opaque)
-            if opaque.reason == "CONNECT tunnel established"
-                || opaque.reason == "HTTP upgrade handoff"
-    )
 }
 
 fn opaque_data_events(direction: Direction, bytes: &[u8]) -> Vec<EventKind> {
@@ -599,7 +669,7 @@ fn opaque_data_events(direction: Direction, bytes: &[u8]) -> Vec<EventKind> {
     vec![EventKind::OpaqueStream(OpaqueStream {
         direction,
         fingerprint: opaque_fingerprint(bytes),
-        reason: "opaque stream bytes after HTTP handoff".to_string(),
+        reason: OPAQUE_BYTES_AFTER_HANDOFF_REASON.to_string(),
     })]
 }
 
@@ -610,6 +680,29 @@ fn has_upgrade_header(headers: &[(String, String)]) -> bool {
                 .split(',')
                 .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
     }) || headers.iter().any(|(name, _)| name == "upgrade")
+}
+
+fn is_websocket_upgrade(headers: &[(String, String)]) -> bool {
+    header_values(headers, "upgrade").any(|value| value.trim().eq_ignore_ascii_case("websocket"))
+        && header_values(headers, "connection").any(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+        })
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &'a str) -> Option<&'a str> {
+    header_values(headers, name).next()
+}
+
+fn header_values<'a>(
+    headers: &'a [(String, String)],
+    name: &'a str,
+) -> impl Iterator<Item = &'a str> + 'a {
+    headers
+        .iter()
+        .filter(move |(header_name, _)| header_name == name)
+        .map(|(_, value)| value.as_str())
 }
 
 enum HeaderParse {
@@ -1124,6 +1217,34 @@ mod tests {
             events
                 .iter()
                 .all(|event| !matches!(event, EventKind::ProtocolError(_)))
+        );
+    }
+
+    #[test]
+    fn websocket_upgrade_emits_handoff_and_enters_opaque_stream() {
+        let mut parser = Http1Parser::default();
+        parser.ingest(
+            Direction::Outbound,
+            b"GET /chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: test\r\n\r\n",
+        );
+        let response_events = parser.ingest(
+            Direction::Inbound,
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Protocol: chat\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+        );
+        let websocket_events = parser.ingest(Direction::Inbound, b"\x81\x05hello");
+
+        assert!(response_events.iter().any(|event| matches!(
+            event,
+            EventKind::WebSocketHandoff(handoff)
+                if handoff.direction == Direction::Inbound
+                    && handoff.target.as_deref() == Some("/chat")
+                    && handoff.subprotocol.as_deref() == Some("chat")
+                    && handoff.extensions == ["permessage-deflate"]
+        )));
+        assert!(
+            websocket_events
+                .iter()
+                .any(|event| matches!(event, EventKind::OpaqueStream(opaque) if opaque.direction == Direction::Inbound))
         );
     }
 

@@ -79,7 +79,7 @@ V1 明确不做：
 - 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、provider-specific nested config、storage、exporter、TLS material、policy 和 enforcement mode 的第一版结构；配置解析拒绝未知字段，基础字段校验不理解 runtime capability。
 - 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
 - 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；pipeline 支持可选 `max_events` 运行边界，便于对真实 live provider 做有界 smoke。`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合和 exporter 命令。
-- 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。
+- 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。parser 已识别 WebSocket HTTP Upgrade，输出 `WebSocketHandoff` 后把后续字节转为 opaque stream；它不解析 WebSocket frame/message。
 - 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF/TLS/真实 enforcement 相关能力仍必须标记 unavailable；dry-run enforcement 是可用能力，记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 作为 live provider；`run` 在无 live capture provider 时 fail closed，存在 libpcap live provider 时会把 provider 接入 replay 共用的 pipeline；`check` 用于查看 resolved plan。
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
 - 当前 `FjallSpool` 存储的是带 schema 的 `SpoolPayload`；ingress lane 当前写入 JSON framed `CapturedBytes`，export lane 当前写入 JSON framed `EventEnvelope`。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
@@ -359,8 +359,8 @@ SSE 是 V1 一等语义：
 WebSocket 范围：
 
 - V1 识别 HTTP Upgrade。
-- 记录协议切换。
-- 定义 WebSocket parser 插件接口和 handoff 契约。
+- 记录协议切换，输出 `websocket_handoff` 事件，包含方向、HTTP stream sequence、请求 target、协商 subprotocol 和 extension。
+- handoff 后后续字节以 opaque stream 表达，为未来 WebSocket frame parser 插件提供明确接管点。
 - 不在 V1 完整解析 frame/message。
 
 HTTP/2 和 HTTP/3：
@@ -510,7 +510,7 @@ Lua API 采用受控领域 API：
 
 1. Rust selector 先做热路径预过滤，决定该 flow 是否进入深度观测、策略或未来 enforcement。
 2. agent 将采集和 parser 输出转换为稳定领域事件。
-3. Lua policy bundle 根据 manifest 注册 hook，例如 `on_connection`、`on_http_request_headers`、`on_http_request_body_chunk`、`on_http_response_headers`、`on_http_response_body_chunk`、`on_sse_event`。
+3. Lua policy bundle 根据 manifest 注册 hook，例如 `on_connection`、`on_http_request_headers`、`on_http_request_body_chunk`、`on_http_response_headers`、`on_http_response_body_chunk`、`on_sse_event`、`on_websocket_handoff`。
 4. 只有声明支持同步动作的阶段才等待 typed verdict。
 5. 观测、告警、tag、metric 等非阻断结果可以异步进入后续 pipeline。
 6. 保护型 verdict 进入 enforcement planner，记录 requested action、effective action、selector match、outcome 和 reason。

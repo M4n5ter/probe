@@ -431,10 +431,7 @@ fn default_platform_capabilities(
         ),
         CapabilityState::available(CapabilityKind::Http1),
         CapabilityState::available(CapabilityKind::Sse),
-        CapabilityState::unavailable(
-            CapabilityKind::WebSocketHandoff,
-            "websocket parser handoff is reserved but not implemented",
-        ),
+        CapabilityState::available(CapabilityKind::WebSocketHandoff),
         CapabilityState::degraded(
             CapabilityKind::LuaJit,
             "policy runtime is wired into replay and live capture, but hot reload and multiple active bundles are not implemented",
@@ -648,6 +645,26 @@ mod tests {
     }
 
     #[test]
+    fn websocket_handoff_is_a_supported_runtime_capability()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::with_default_platform(vec![capture_provider(
+            CaptureBackend::Replay,
+            CaptureProviderBuilder::Replay,
+            RuntimeMode::Available,
+        )]);
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+
+        let plan = RuntimePlan::build(config, &registry)?;
+
+        assert_eq!(
+            plan.capabilities.mode(CapabilityKind::WebSocketHandoff),
+            RuntimeMode::Available
+        );
+        Ok(())
+    }
+
+    #[test]
     fn enforcement_selector_is_validated_during_plan_build() {
         let registry = ProviderRegistry::new(
             vec![capture_provider(
@@ -736,6 +753,7 @@ mod tests {
         vec![
             CapabilityState::available(CapabilityKind::Http1),
             CapabilityState::available(CapabilityKind::Sse),
+            CapabilityState::available(CapabilityKind::WebSocketHandoff),
             CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
             CapabilityState::available(CapabilityKind::DryRunEnforcement),
         ]

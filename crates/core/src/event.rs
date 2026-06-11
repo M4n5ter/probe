@@ -126,6 +126,8 @@ pub enum EventKind {
     HttpResponseHeaders(HttpHeaders),
     HttpBodyChunk(BodyChunk),
     SseEvent(SseEvent),
+    #[serde(rename = "websocket_handoff")]
+    WebSocketHandoff(WebSocketHandoff),
     OpaqueStream(OpaqueStream),
     Gap(Gap),
     ProtocolError(ProtocolError),
@@ -147,6 +149,7 @@ impl EventKind {
             Self::HttpResponseHeaders(_) => "http_response_headers",
             Self::HttpBodyChunk(_) => "http_body_chunk",
             Self::SseEvent(_) => "sse_event",
+            Self::WebSocketHandoff(_) => "websocket_handoff",
             Self::OpaqueStream(_) => "opaque_stream",
             Self::Gap(_) => "gap",
             Self::ProtocolError(_) => "protocol_error",
@@ -193,6 +196,15 @@ pub struct SseEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSocketHandoff {
+    pub direction: Direction,
+    pub stream_sequence: u64,
+    pub target: Option<String>,
+    pub subprotocol: Option<String>,
+    pub extensions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpaqueStream {
     pub direction: Direction,
     pub fingerprint: Vec<u8>,
@@ -226,6 +238,7 @@ mod tests {
     use crate::{
         AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
         HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+        WebSocketHandoff,
     };
 
     #[test]
@@ -250,6 +263,20 @@ mod tests {
         let second = request_event(CaptureSource::Replay, "/same").with_policy_version("policy@2");
 
         assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn websocket_handoff_wire_type_matches_stable_event_name() {
+        let value = serde_json::to_value(EventKind::WebSocketHandoff(WebSocketHandoff {
+            direction: Direction::Inbound,
+            stream_sequence: 1,
+            target: Some("/chat".to_string()),
+            subprotocol: Some("chat".to_string()),
+            extensions: Vec::new(),
+        }))
+        .expect("event kind must serialize");
+
+        assert_eq!(value["type"], "websocket_handoff");
     }
 
     fn request_event(source: CaptureSource, target: &str) -> EventEnvelope {
