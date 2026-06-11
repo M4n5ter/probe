@@ -1,9 +1,8 @@
-use probe_core::EventEnvelope;
+use probe_core::{EventEnvelope, SpoolPayloadSchema};
 use prost::{Enumeration, Message};
 use thiserror::Error;
 
 pub const BATCH_SCHEMA_VERSION: u32 = 1;
-pub const EVENT_ENVELOPE_JSON_SCHEMA: &str = "sssa.probe.event_envelope.v1.json";
 
 #[derive(Clone, PartialEq, Message)]
 pub struct BatchEnvelope {
@@ -58,13 +57,8 @@ impl BatchEnvelope {
             .into_iter()
             .map(|(sequence, event)| {
                 let event_id = event.id.0.clone();
-                serde_json::to_vec(&event).map(|payload| EventRecord {
-                    event_id,
-                    sequence,
-                    payload_format: PayloadFormat::Json as i32,
-                    payload_schema: EVENT_ENVELOPE_JSON_SCHEMA.to_string(),
-                    payload,
-                })
+                serde_json::to_vec(&event)
+                    .map(|payload| json_event_envelope_record(sequence, event_id, payload))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -91,13 +85,11 @@ impl BatchEnvelope {
             .map(|(sequence, payload)| {
                 let payload = payload.as_ref();
                 let event = serde_json::from_slice::<EventEnvelope>(payload)?;
-                Ok(EventRecord {
-                    event_id: event.id.0,
+                Ok(json_event_envelope_record(
                     sequence,
-                    payload_format: PayloadFormat::Json as i32,
-                    payload_schema: EVENT_ENVELOPE_JSON_SCHEMA.to_string(),
-                    payload: payload.to_vec(),
-                })
+                    event.id.0,
+                    payload.to_vec(),
+                ))
             })
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
@@ -119,14 +111,25 @@ impl BatchEnvelope {
     }
 }
 
+fn json_event_envelope_record(sequence: u64, event_id: String, payload: Vec<u8>) -> EventRecord {
+    EventRecord {
+        event_id,
+        sequence,
+        payload_format: PayloadFormat::Json as i32,
+        payload_schema: SpoolPayloadSchema::EventEnvelopeJsonV1.to_string(),
+        payload,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use probe_core::{
         AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
-        HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+        HttpHeaders, ProcessContext, ProcessIdentity, SpoolPayloadSchema, Timestamp,
+        TransportProtocol,
     };
 
-    use crate::{BATCH_SCHEMA_VERSION, BatchEnvelope, EVENT_ENVELOPE_JSON_SCHEMA, PayloadFormat};
+    use crate::{BATCH_SCHEMA_VERSION, BatchEnvelope, PayloadFormat};
 
     #[test]
     fn encodes_and_decodes_batch_envelope() -> Result<(), Box<dyn std::error::Error>> {
@@ -137,7 +140,10 @@ mod tests {
         assert_eq!(decoded.schema_version, BATCH_SCHEMA_VERSION);
         assert_eq!(decoded.events.len(), 1);
         assert_eq!(decoded.events[0].payload_format(), PayloadFormat::Json);
-        assert_eq!(decoded.events[0].payload_schema, EVENT_ENVELOPE_JSON_SCHEMA);
+        assert_eq!(
+            decoded.events[0].payload_schema,
+            SpoolPayloadSchema::EventEnvelopeJsonV1.as_str()
+        );
         Ok(())
     }
 
@@ -156,7 +162,10 @@ mod tests {
         assert_eq!(batch.schema_version, BATCH_SCHEMA_VERSION);
         assert_eq!(batch.events[0].sequence, 7);
         assert_eq!(batch.events[0].payload_format(), PayloadFormat::Json);
-        assert_eq!(batch.events[0].payload_schema, EVENT_ENVELOPE_JSON_SCHEMA);
+        assert_eq!(
+            batch.events[0].payload_schema,
+            SpoolPayloadSchema::EventEnvelopeJsonV1.as_str()
+        );
         Ok(())
     }
 

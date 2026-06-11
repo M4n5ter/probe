@@ -1,6 +1,7 @@
 mod capability;
 mod event;
 mod identity;
+mod schema;
 mod selector;
 mod socket;
 mod verdict;
@@ -15,6 +16,7 @@ pub use event::{
 pub use identity::{
     AddressPort, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, TransportProtocol,
 };
+pub use schema::SpoolPayloadSchema;
 pub use selector::{
     CompiledSelector, ProcessSelector, Selector, SelectorError, SelectorRegistry, SelectorTerm,
     TrafficSelector,

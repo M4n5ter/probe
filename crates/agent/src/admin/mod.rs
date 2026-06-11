@@ -406,7 +406,7 @@ mod tests {
     };
 
     use probe_config::{AgentConfig, CaptureBackend, CaptureSelection, ExporterConfig};
-    use probe_core::{CapabilityState, RuntimeMode};
+    use probe_core::{CapabilityState, RuntimeMode, SpoolPayloadSchema};
     use runtime::{
         CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
     };
@@ -423,7 +423,10 @@ mod tests {
         let socket_path = temp.join("admin.sock");
         let spool_path = temp.join("spool");
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
-        spool.append_export(SpoolPayload::new("test.schema", b"one"))?;
+        spool.append_export(SpoolPayload::new(
+            SpoolPayloadSchema::from_wire("test.schema"),
+            b"one",
+        ))?;
         let plan = Arc::new(runtime_plan(spool_path)?);
         let server = spawn_admin_server(
             Arc::clone(&plan),

@@ -26,6 +26,8 @@ use enforcement::{EnforcementCapabilityStatusSnapshot, EnforcementStatusMode};
 #[cfg(test)]
 use policy::{PolicySourceCheck, PolicyStatusMode};
 #[cfg(test)]
+use probe_core::SpoolPayloadSchema;
+#[cfg(test)]
 use tls::{TlsMaterialPurpose, TlsMaterialSourceCheck, TlsPlaintextCapabilityStatusSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -885,7 +887,7 @@ hooks = ["on_http_request_headers"]
     }
 
     fn test_payload(bytes: &[u8]) -> SpoolPayload {
-        SpoolPayload::new("test.schema", bytes)
+        SpoolPayload::new(SpoolPayloadSchema::from_wire("test.schema"), bytes)
     }
 
     fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {

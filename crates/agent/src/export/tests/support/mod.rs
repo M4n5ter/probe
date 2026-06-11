@@ -14,11 +14,10 @@ use std::{
 use probe_config::AgentConfig;
 use probe_core::{
     AddressPort, CapabilityKind, CapabilityState, CaptureSource, EventEnvelope, EventKind,
-    FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+    FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, SpoolPayloadSchema, Timestamp,
+    TransportProtocol,
 };
-use proto::{
-    BATCH_SCHEMA_VERSION, BatchEnvelope, EVENT_ENVELOPE_JSON_SCHEMA, EventRecord, PayloadFormat,
-};
+use proto::{BATCH_SCHEMA_VERSION, BatchEnvelope, EventRecord, PayloadFormat};
 use runtime::{self, ProviderRegistry, RuntimePlan};
 use storage::{DurableSpool, FjallSpool, SpoolPayload, StorageError, StoredEvent};
 
@@ -72,7 +71,7 @@ pub(super) fn append_export_event(
     );
     let payload = serde_json::to_vec(&envelope)?;
     spool.append_export(storage::SpoolPayload::new(
-        EVENT_ENVELOPE_JSON_SCHEMA,
+        SpoolPayloadSchema::EventEnvelopeJsonV1,
         payload,
     ))?;
     Ok(())
@@ -303,7 +302,7 @@ fn export_event_payload(sequence: u64) -> Result<SpoolPayload, serde_json::Error
         EventKind::ConnectionOpened,
     );
     serde_json::to_vec(&envelope)
-        .map(|payload| SpoolPayload::new(EVENT_ENVELOPE_JSON_SCHEMA, payload))
+        .map(|payload| SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeJsonV1, payload))
 }
 
 pub(super) struct TestWebhookServer {

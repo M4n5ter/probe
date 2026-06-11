@@ -205,8 +205,10 @@ async fn planned_webhook_drain_rejects_unsafe_tls_material_sources()
 #[tokio::test]
 async fn planned_webhook_drain_validates_batch_before_reading_tls_materials()
 -> Result<(), Box<dyn std::error::Error>> {
-    let spool =
-        SingleEventBatchSpool::with_export_payload(SpoolPayload::new("bad.schema", b"bad payload"));
+    let spool = SingleEventBatchSpool::with_export_payload(SpoolPayload::new(
+        SpoolPayloadSchema::from_wire("bad.schema"),
+        b"bad payload",
+    ));
     let plan = export_plan_with_trust_anchor(PathBuf::from("/missing/collector-ca.pem"));
 
     let error = drain_planned_sinks(&spool, "agent-1", &plan)

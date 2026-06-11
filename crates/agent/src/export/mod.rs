@@ -8,7 +8,8 @@ use std::{
 
 use exporter::{CompressionCodec, ReliableExporter, WebhookExporter, WebhookTlsConfig};
 use probe_config::{CompressionCodecName, ExporterTransport};
-use proto::{BatchEnvelope, EVENT_ENVELOPE_JSON_SCHEMA};
+use probe_core::SpoolPayloadSchema;
+use proto::BatchEnvelope;
 use runtime::{ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportWorkerPlan};
 use storage::{DurableSpool, StoredEvent};
 use thiserror::Error;
@@ -520,10 +521,10 @@ fn export_batch_from_events(
         return Ok(None);
     };
     for event in &events {
-        if event.payload.schema() != EVENT_ENVELOPE_JSON_SCHEMA {
+        if event.payload.schema() != &SpoolPayloadSchema::EventEnvelopeJsonV1 {
             return Err(ExportDrainError::UnsupportedSpoolPayloadSchema {
                 sequence: event.sequence,
-                schema: event.payload.schema().to_string(),
+                schema: event.payload.schema_wire().to_string(),
             });
         }
     }

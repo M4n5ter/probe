@@ -8,6 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
+use probe_core::SpoolPayloadSchema;
 use thiserror::Error;
 
 const INGRESS_JOURNAL: &str = "ingress_journal";
@@ -61,20 +62,24 @@ pub enum StorageError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpoolPayload {
-    schema: String,
+    schema: SpoolPayloadSchema,
     bytes: Bytes,
 }
 
 impl SpoolPayload {
-    pub fn new(schema: impl Into<String>, bytes: impl AsRef<[u8]>) -> Self {
+    pub fn new(schema: SpoolPayloadSchema, bytes: impl AsRef<[u8]>) -> Self {
         Self {
-            schema: schema.into(),
+            schema,
             bytes: Bytes::copy_from_slice(bytes.as_ref()),
         }
     }
 
-    pub fn schema(&self) -> &str {
+    pub fn schema(&self) -> &SpoolPayloadSchema {
         &self.schema
+    }
+
+    pub fn schema_wire(&self) -> &str {
+        self.schema.as_str()
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -523,7 +528,7 @@ fn read_marker_file(path: &Path, name: &str, content: &[u8]) -> Result<bool, Sto
 }
 
 fn encode_spool_payload(payload: &SpoolPayload) -> Result<Vec<u8>, StorageError> {
-    let schema = payload.schema.as_bytes();
+    let schema = payload.schema.as_str().as_bytes();
     let schema_len = u32::try_from(schema.len())
         .map_err(|_| StorageError::PayloadSchemaTooLarge { len: schema.len() })?;
     let mut encoded = Vec::with_capacity(4 + schema.len() + payload.bytes.len());
@@ -546,7 +551,7 @@ fn decode_spool_payload(bytes: &[u8]) -> Result<SpoolPayload, StorageError> {
     }
     let schema = String::from_utf8(bytes[4..expected_min_len].to_vec())?;
     Ok(SpoolPayload {
-        schema,
+        schema: SpoolPayloadSchema::from_wire(schema),
         bytes: Bytes::copy_from_slice(&bytes[expected_min_len..]),
     })
 }
@@ -555,11 +560,12 @@ fn decode_spool_payload(bytes: &[u8]) -> Result<SpoolPayload, StorageError> {
 mod tests {
     use std::fs;
 
+    use probe_core::SpoolPayloadSchema;
     use tempfile::tempdir;
 
     use crate::{
         FjallSpool, SPOOL_MARKER_CONTENT, SPOOL_MARKER_FILE, SPOOL_READY_FILE, SpoolPayload,
-        SpoolProbe, encode_spool_payload, sequence_key,
+        SpoolProbe, decode_spool_payload, encode_spool_payload, sequence_key,
     };
 
     #[test]
@@ -571,7 +577,7 @@ mod tests {
         let two = spool.append_export(test_payload(b"two"))?;
         assert_eq!(one.sequence, 1);
         assert_eq!(two.sequence, 2);
-        assert_eq!(one.payload.schema(), "test.schema");
+        assert_eq!(one.payload.schema_wire(), "test.schema");
         assert_eq!(one.payload.bytes(), b"one");
 
         let first = spool.read_export_batch("primary", 10)?;
@@ -759,7 +765,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn stored_payload_decodes_known_wire_schema_to_canonical_enum()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut encoded = Vec::new();
+        let schema = SpoolPayloadSchema::EVENT_ENVELOPE_JSON_V1.as_bytes();
+        encoded.extend_from_slice(&(schema.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(schema);
+        encoded.extend_from_slice(b"payload");
+
+        let payload = decode_spool_payload(&encoded)?;
+
+        assert_eq!(payload.schema(), &SpoolPayloadSchema::EventEnvelopeJsonV1);
+        assert_eq!(
+            payload.schema_wire(),
+            SpoolPayloadSchema::EVENT_ENVELOPE_JSON_V1
+        );
+        assert_eq!(payload.bytes(), b"payload");
+        Ok(())
+    }
+
     fn test_payload(bytes: &[u8]) -> SpoolPayload {
-        SpoolPayload::new("test.schema", bytes)
+        SpoolPayload::new(SpoolPayloadSchema::from_wire("test.schema"), bytes)
     }
 }

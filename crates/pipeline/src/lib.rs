@@ -1,13 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use capture::{
-    CAPTURE_BYTES_JSON_SCHEMA, CaptureError, CaptureEvent, CaptureProvider, CapturedBytes,
-};
+use capture::{CaptureError, CaptureEvent, CaptureProvider, CapturedBytes};
 use enforcement::{EnforcementPlanRequest, EnforcementPlanner};
 use parsers::{ParserInput, ProtocolParserFactory};
 use policy::{PolicyOutcome, PolicyRuntime, hook_for_event};
-use probe_core::{CompiledSelector, EventEnvelope, EventKind, Timestamp};
-use proto::EVENT_ENVELOPE_JSON_SCHEMA;
+use probe_core::{CompiledSelector, EventEnvelope, EventKind, SpoolPayloadSchema, Timestamp};
 use storage::{DurableSpool, SpoolPayload};
 use thiserror::Error;
 
@@ -251,9 +248,10 @@ where
 
     fn append_capture_chunk(&self, chunk: &CapturedBytes) -> Result<u64, PipelineError> {
         let payload = serde_json::to_vec(chunk)?;
-        let stored = self
-            .spool
-            .append_ingress(SpoolPayload::new(CAPTURE_BYTES_JSON_SCHEMA, payload))?;
+        let stored = self.spool.append_ingress(SpoolPayload::new(
+            SpoolPayloadSchema::CaptureBytesJsonV1,
+            payload,
+        ))?;
         Ok(stored.sequence)
     }
 
@@ -335,8 +333,10 @@ where
 
     fn append_envelope(&self, envelope: &EventEnvelope) -> Result<(), PipelineError> {
         let payload = serde_json::to_vec(envelope)?;
-        self.spool
-            .append_export(SpoolPayload::new(EVENT_ENVELOPE_JSON_SCHEMA, payload))?;
+        self.spool.append_export(SpoolPayload::new(
+            SpoolPayloadSchema::EventEnvelopeJsonV1,
+            payload,
+        ))?;
         Ok(())
     }
 }

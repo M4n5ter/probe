@@ -14,8 +14,6 @@ pub use plaintext::{
     PlaintextChunk, PlaintextConnection, PlaintextFeedEvent, PlaintextFeedProvider, PlaintextGap,
 };
 
-pub const CAPTURE_BYTES_JSON_SCHEMA: &str = "sssa.probe.capture_bytes.v1.json";
-
 #[derive(Debug, Error)]
 pub enum CaptureError {
     #[error("capture provider {provider} failed: {reason}")]
