@@ -243,8 +243,10 @@ dependencies = [
  "bytes",
  "pcap",
  "probe-core",
+ "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

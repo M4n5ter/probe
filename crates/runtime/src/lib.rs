@@ -373,6 +373,15 @@ impl CaptureProviderDescriptor {
         self.mode == RuntimeMode::Available && self.builder.supports(self.backend)
     }
 
+    fn unselectable_reason(&self) -> String {
+        self.reason.clone().unwrap_or_else(|| {
+            format!(
+                "{:?} capture provider is not available in this build/runtime",
+                self.backend
+            )
+        })
+    }
+
     fn normalized(mut self) -> Self {
         if self.mode != RuntimeMode::Unavailable && !self.builder.supports(self.backend) {
             self.mode = RuntimeMode::Unavailable;
@@ -506,7 +515,7 @@ fn validate_capture_config(
     if !provider.selectable() {
         violations.push(ConfigViolation {
             field: "capture.selection".to_string(),
-            reason: format!("{backend:?} capture provider is not available in this build/runtime"),
+            reason: provider.unselectable_reason(),
         });
     }
 }

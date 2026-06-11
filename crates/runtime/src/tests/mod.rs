@@ -45,10 +45,10 @@ fn default_plan_is_honest_when_live_capture_is_unavailable()
 fn auto_selection_uses_first_available_live_fallback() -> Result<(), Box<dyn std::error::Error>> {
     let registry = ProviderRegistry::new(
         vec![
-            capture_provider(
+            CaptureProviderDescriptor::unavailable(
                 CaptureBackend::Ebpf,
                 CaptureProviderBuilder::Unimplemented,
-                RuntimeMode::Unavailable,
+                "eBPF host probe: bpffs path /sys/fs/bpf does not exist",
             ),
             capture_provider(
                 CaptureBackend::Libpcap,
@@ -180,10 +180,10 @@ fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::err
 fn explicit_unavailable_backend_does_not_fallback() {
     let registry = ProviderRegistry::new(
         vec![
-            capture_provider(
+            CaptureProviderDescriptor::unavailable(
                 CaptureBackend::Ebpf,
                 CaptureProviderBuilder::Unimplemented,
-                RuntimeMode::Unavailable,
+                "eBPF host probe: bpffs path /sys/fs/bpf does not exist",
             ),
             capture_provider(
                 CaptureBackend::Libpcap,
@@ -197,11 +197,15 @@ fn explicit_unavailable_backend_does_not_fallback() {
     config.capture.selection = CaptureSelection::Ebpf;
 
     let error = RuntimePlan::build(config, &registry).expect_err("explicit ebpf is unavailable");
+    let RuntimeError::Validation(error) = error else {
+        panic!("expected runtime validation error");
+    };
+    let violation = error.violations().first().expect("expected one violation");
 
-    assert!(
-        error
-            .to_string()
-            .contains("Ebpf capture provider is not available")
+    assert_eq!(violation.field, "capture.selection");
+    assert_eq!(
+        violation.reason,
+        "eBPF host probe: bpffs path /sys/fs/bpf does not exist"
     );
 }
 
@@ -224,7 +228,7 @@ fn available_provider_requires_matching_executable_builder() {
     assert!(
         error
             .to_string()
-            .contains("Ebpf capture provider is not available")
+            .contains("Unimplemented builder cannot construct Ebpf capture provider")
     );
     assert_eq!(
         registry.capability_matrix().mode(CapabilityKind::Ebpf),
@@ -383,7 +387,7 @@ fn external_plaintext_feed_fails_closed_without_provider() -> Result<(), Box<dyn
     assert!(
         error
             .to_string()
-            .contains("PlaintextFeed capture provider is not available")
+            .contains("capture backend is not registered")
     );
     Ok(())
 }

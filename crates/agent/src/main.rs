@@ -16,8 +16,8 @@ mod tls_material;
 use admin::{AdminServerConfig, spawn_admin_server};
 use attribution::ProcfsSocketResolver;
 use capture::{
-    CaptureError, CaptureProvider, LibpcapConfig, LibpcapProvider, ProcessResolver, ReplayProvider,
-    ResolvedProcess,
+    CaptureError, CaptureProvider, EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport,
+    LibpcapConfig, LibpcapProvider, ProcessResolver, ReplayProvider, ResolvedProcess,
 };
 use check::build_check_report;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -331,17 +331,24 @@ fn default_capture_provider_descriptors(config: &AgentConfig) -> Vec<CaptureProv
             CaptureBackend::Replay,
             CaptureProviderBuilder::Replay,
         ),
-        CaptureProviderDescriptor::unavailable(
-            CaptureBackend::Ebpf,
-            CaptureProviderBuilder::Unimplemented,
-            "provider not implemented in this build",
-        ),
+        ebpf_provider_descriptor(EbpfHostProbe::probe(&EbpfHostProbeConfig::default())),
         CaptureProviderDescriptor::available(
             CaptureBackend::PlaintextFeed,
             CaptureProviderBuilder::PlaintextFeed,
         ),
         libpcap_provider_descriptor(&libpcap_config_from_agent(config)),
     ]
+}
+
+fn ebpf_provider_descriptor(report: EbpfHostProbeReport) -> CaptureProviderDescriptor {
+    CaptureProviderDescriptor::unavailable(
+        CaptureBackend::Ebpf,
+        CaptureProviderBuilder::Unimplemented,
+        format!(
+            "provider not implemented in this build; host probe: {}",
+            report.summary()
+        ),
+    )
 }
 
 fn libpcap_provider_descriptor(config: &LibpcapConfig) -> CaptureProviderDescriptor {
@@ -589,7 +596,32 @@ fn synthetic_replay_process() -> ProcessContext {
 
 #[cfg(test)]
 mod tests {
+    use capture::{EbpfProbeCheck, UnprivilegedBpfStatus};
+
     use super::*;
+
+    #[test]
+    fn ebpf_provider_descriptor_keeps_host_probe_reason() {
+        let descriptor = ebpf_provider_descriptor(EbpfHostProbeReport {
+            linux: true,
+            btf_vmlinux: EbpfProbeCheck::Available,
+            bpffs: EbpfProbeCheck::Unavailable {
+                reason: "bpffs path /sys/fs/bpf does not exist".to_string(),
+            },
+            unprivileged_bpf: UnprivilegedBpfStatus::Disabled,
+        });
+
+        assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
+        assert_eq!(descriptor.builder, CaptureProviderBuilder::Unimplemented);
+        assert_eq!(descriptor.mode, RuntimeMode::Unavailable);
+        let reason = descriptor
+            .reason
+            .expect("eBPF descriptor should explain why it is unavailable");
+        assert!(reason.contains("provider not implemented"));
+        assert!(reason.contains("btf_vmlinux=available"));
+        assert!(reason.contains("bpffs path /sys/fs/bpf does not exist"));
+        assert!(reason.contains("unprivileged_bpf=disabled"));
+    }
 
     #[test]
     fn replay_flow_uses_synthetic_process_identity() {
