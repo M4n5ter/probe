@@ -6,7 +6,7 @@ use capture::{
 use enforcement::{EnforcementPlanRequest, EnforcementPlanner};
 use parsers::{ParserInput, ProtocolParserFactory};
 use policy::{PolicyOutcome, PolicyRuntime, hook_for_event};
-use probe_core::{EventEnvelope, EventKind, Timestamp};
+use probe_core::{CompiledSelector, EventEnvelope, EventKind, Timestamp};
 use proto::EVENT_ENVELOPE_JSON_SCHEMA;
 use storage::{DurableSpool, SpoolPayload};
 use thiserror::Error;
@@ -53,10 +53,35 @@ impl PipelineRunOptions {
 pub struct CapturePipeline<'a, S> {
     spool: &'a S,
     parser_factory: &'a mut dyn ProtocolParserFactory,
-    policy: Option<&'a PolicyRuntime>,
+    policy: Option<PipelinePolicy<'a>>,
     enforcement_planner: Option<&'a mut dyn EnforcementPlanner>,
     config_version: String,
     clock: PipelineClock,
+}
+
+#[derive(Clone, Copy)]
+pub struct PipelinePolicy<'a> {
+    runtime: &'a PolicyRuntime,
+    selector: Option<&'a CompiledSelector>,
+}
+
+impl<'a> PipelinePolicy<'a> {
+    pub fn new(runtime: &'a PolicyRuntime, selector: Option<&'a CompiledSelector>) -> Self {
+        Self { runtime, selector }
+    }
+
+    pub fn unscoped(runtime: &'a PolicyRuntime) -> Self {
+        Self::new(runtime, None)
+    }
+
+    fn matches(&self, envelope: &EventEnvelope) -> bool {
+        self.selector.is_none_or(|selector| {
+            envelope.kind.direction().map_or_else(
+                || selector.matches_flow_without_direction(&envelope.flow),
+                |direction| selector.matches_flow(&envelope.flow, direction),
+            )
+        })
+    }
 }
 
 impl<'a, S> CapturePipeline<'a, S>
@@ -66,7 +91,7 @@ where
     pub fn new(
         spool: &'a S,
         parser_factory: &'a mut dyn ProtocolParserFactory,
-        policy: Option<&'a PolicyRuntime>,
+        policy: Option<PipelinePolicy<'a>>,
         config_version: impl Into<String>,
     ) -> Self {
         Self {
@@ -245,8 +270,15 @@ where
         let Some(hook) = hook_for_event(&envelope) else {
             return Ok(written);
         };
-        let policy_version = format!("{}@{}", policy.manifest().id, policy.manifest().version);
-        let outcomes = policy.handle_event(hook, &envelope)?;
+        if !policy.matches(&envelope) {
+            return Ok(written);
+        }
+        let policy_version = format!(
+            "{}@{}",
+            policy.runtime.manifest().id,
+            policy.runtime.manifest().version
+        );
+        let outcomes = policy.runtime.handle_event(hook, &envelope)?;
         for outcome in outcomes {
             match outcome {
                 PolicyOutcome::Alert(alert) => {
@@ -341,7 +373,7 @@ mod tests {
     use probe_core::{
         Action, AddressPort, CapabilityState, CaptureSource, Direction, EnforcementMode,
         EnforcementOutcome, EventEnvelope, FlowContext, FlowIdentity, ProcessContext,
-        ProcessIdentity, Timestamp, TransportProtocol,
+        ProcessIdentity, ProcessSelector, Selector, Timestamp, TrafficSelector, TransportProtocol,
     };
     use tempfile::tempdir;
 
@@ -445,8 +477,13 @@ end
             flow,
             b"GET /blocked HTTP/1.1\r\nHost: test\r\n\r\n",
         )]);
-        let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Some(&policy), "test")
-            .with_enforcement_planner(&mut enforcement_planner);
+        let mut pipeline = CapturePipeline::new(
+            &spool,
+            &mut parser_factory,
+            Some(PipelinePolicy::unscoped(&policy)),
+            "test",
+        )
+        .with_enforcement_planner(&mut enforcement_planner);
 
         let summary = pipeline.run_provider(&mut provider)?;
 
@@ -472,6 +509,68 @@ end
                         && decision.selector_matched
             )
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn policy_selector_scopes_policy_execution() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = storage::FjallSpool::open(temp.path())?;
+        let policy = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "scoped-policy".to_string(),
+                version: "v1".to_string(),
+                hooks: vec!["on_http_request_headers".to_string()],
+            },
+            r#"
+function on_http_request_headers(event)
+  return probe.emit_alert("matched " .. event.kind.target)
+end
+"#,
+        )?;
+        let selector = Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let mut parser_factory = Http1ParserFactory::default();
+        let mut provider = SequenceProvider::new(vec![
+            captured_bytes(
+                demo_flow_with_ports(50_000, 80, 20),
+                b"GET /miss HTTP/1.1\r\nHost: test\r\n\r\n",
+            ),
+            captured_bytes(
+                demo_flow_with_ports(50_001, 443, 21),
+                b"GET /hit HTTP/1.1\r\nHost: test\r\n\r\n",
+            ),
+        ]);
+        let mut pipeline = CapturePipeline::new(
+            &spool,
+            &mut parser_factory,
+            Some(PipelinePolicy::new(&policy, Some(&selector))),
+            "test",
+        );
+
+        let summary = pipeline.run_provider(&mut provider)?;
+
+        assert_eq!(summary.ingress_chunks, 2);
+        let exported = spool.read_export_batch("sink", 16)?;
+        let envelopes = exported
+            .iter()
+            .map(|event| serde_json::from_slice::<EventEnvelope>(event.payload.bytes()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let alerts = envelopes
+            .iter()
+            .filter(|envelope| matches!(envelope.kind, EventKind::PolicyAlert(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(
+            &alerts[0].kind,
+            EventKind::PolicyAlert(alert) if alert.message == "matched /hit"
+        ));
         Ok(())
     }
 
@@ -507,7 +606,12 @@ end
             ),
             captured_bytes_with_direction(flow, Direction::Inbound, b"\x81\x02hi"),
         ]);
-        let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Some(&policy), "test");
+        let mut pipeline = CapturePipeline::new(
+            &spool,
+            &mut parser_factory,
+            Some(PipelinePolicy::unscoped(&policy)),
+            "test",
+        );
 
         let summary = pipeline.run_provider(&mut provider)?;
 

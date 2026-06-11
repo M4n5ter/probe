@@ -1,6 +1,6 @@
 use probe_core::{
-    Action, CompiledSelector, Direction, EnforcementDecision, EnforcementMode, EnforcementOutcome,
-    EventEnvelope, EventKind, Selector, SelectorError, Verdict,
+    Action, CompiledSelector, EnforcementDecision, EnforcementMode, EnforcementOutcome,
+    EventEnvelope, Selector, SelectorError, Verdict,
 };
 use thiserror::Error;
 
@@ -47,7 +47,7 @@ impl ScopedEnforcementPlanner {
             return true;
         };
 
-        event_direction(&trigger.kind).map_or_else(
+        trigger.kind.direction().map_or_else(
             || selector.matches_flow_without_direction(&trigger.flow),
             |direction| selector.matches_flow(&trigger.flow, direction),
         )
@@ -133,31 +133,12 @@ fn requires_enforcement(action: Action) -> bool {
     matches!(action, Action::Deny | Action::Reset | Action::Quarantine)
 }
 
-fn event_direction(kind: &EventKind) -> Option<Direction> {
-    match kind {
-        EventKind::HttpRequestHeaders(headers) | EventKind::HttpResponseHeaders(headers) => {
-            Some(headers.direction)
-        }
-        EventKind::HttpBodyChunk(chunk) => Some(chunk.direction),
-        EventKind::SseEvent(event) => Some(event.direction),
-        EventKind::WebSocketHandoff(handoff) => Some(handoff.direction),
-        EventKind::Gap(gap) => Some(gap.direction),
-        EventKind::ProtocolError(error) => Some(error.direction),
-        EventKind::OpaqueStream(stream) => Some(stream.direction),
-        EventKind::ConnectionOpened
-        | EventKind::ConnectionClosed
-        | EventKind::PolicyAlert(_)
-        | EventKind::PolicyVerdict(_)
-        | EventKind::EnforcementDecision(_) => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use probe_core::{
-        AddressPort, CaptureSource, FlowContext, FlowIdentity, HttpHeaders, ProcessContext,
-        ProcessIdentity, ProcessSelector, Selector, Timestamp, TrafficSelector, TransportProtocol,
-        VerdictScope,
+        AddressPort, CaptureSource, Direction, EventKind, FlowContext, FlowIdentity, HttpHeaders,
+        ProcessContext, ProcessIdentity, ProcessSelector, Selector, Timestamp, TrafficSelector,
+        TransportProtocol, VerdictScope,
     };
 
     use super::*;

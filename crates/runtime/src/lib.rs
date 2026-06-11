@@ -377,6 +377,7 @@ fn validate_runtime_config(
     let mut violations = Vec::new();
     validate_capture_config(config, registry, &mut violations);
     validate_tls_config(config, registry, &mut violations);
+    validate_policy_config(config, &mut violations);
     validate_enforcement_config(config, registry, &mut violations);
     validate_exporters(config, &mut violations);
 
@@ -384,6 +385,19 @@ fn validate_runtime_config(
         Ok(())
     } else {
         Err(ConfigValidationError::new(violations))
+    }
+}
+
+fn validate_policy_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
+    for policy in config.policies.iter().filter(|policy| policy.enabled) {
+        if let Some(selector) = &policy.selector
+            && let Err(error) = selector.compile()
+        {
+            violations.push(ConfigViolation {
+                field: format!("policies.{}.selector", policy.id),
+                reason: error.to_string(),
+            });
+        }
     }
 }
 
@@ -916,6 +930,61 @@ mod tests {
             .expect_err("invalid enforcement selector must fail plan build");
 
         assert!(error.to_string().contains("enforcement.selector"));
+    }
+
+    #[test]
+    fn policy_selector_is_validated_during_plan_build() {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+        config.policies = vec![probe_config::PolicyConfig {
+            id: "guard".to_string(),
+            path: "/tmp/guard.lua".into(),
+            selector: Some(Selector::All {
+                selectors: Vec::new(),
+            }),
+            ..probe_config::PolicyConfig::default()
+        }];
+
+        let error =
+            RuntimePlan::build(config, &registry).expect_err("invalid policy selector must fail");
+
+        assert!(error.to_string().contains("policies.guard.selector"));
+    }
+
+    #[test]
+    fn disabled_policy_selector_is_not_validated_during_plan_build()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+        config.policies = vec![probe_config::PolicyConfig {
+            id: "draft".to_string(),
+            enabled: false,
+            selector: Some(Selector::All {
+                selectors: Vec::new(),
+            }),
+            ..probe_config::PolicyConfig::default()
+        }];
+
+        let plan = RuntimePlan::build(config, &registry)?;
+
+        assert_eq!(plan.capture.mode, CapturePlanMode::Replay);
+        Ok(())
     }
 
     #[test]

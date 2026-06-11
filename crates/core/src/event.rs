@@ -142,6 +142,25 @@ impl EventKind {
         self.stable_discriminant()
     }
 
+    pub fn direction(&self) -> Option<Direction> {
+        match self {
+            Self::HttpRequestHeaders(headers) | Self::HttpResponseHeaders(headers) => {
+                Some(headers.direction)
+            }
+            Self::HttpBodyChunk(chunk) => Some(chunk.direction),
+            Self::SseEvent(event) => Some(event.direction),
+            Self::WebSocketHandoff(handoff) => Some(handoff.direction),
+            Self::OpaqueStream(stream) => Some(stream.direction),
+            Self::Gap(gap) => Some(gap.direction),
+            Self::ProtocolError(error) => Some(error.direction),
+            Self::ConnectionOpened
+            | Self::ConnectionClosed
+            | Self::PolicyAlert(_)
+            | Self::PolicyVerdict(_)
+            | Self::EnforcementDecision(_) => None,
+        }
+    }
+
     fn stable_discriminant(&self) -> &'static str {
         match self {
             Self::ConnectionOpened => "connection_opened",

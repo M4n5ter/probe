@@ -639,6 +639,38 @@ mod tests {
     }
 
     #[test]
+    fn oversized_policy_source_marks_status_unavailable() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = test_dir("status-oversized-policy")?;
+        let policy_path = temp.join("guard.lua");
+        let file = fs::File::create(&policy_path)?;
+        file.set_len(crate::configured_policy::MAX_POLICY_SOURCE_BYTES + 1)?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.policies = vec![PolicyConfig {
+            id: "guard".to_string(),
+            path: policy_path,
+            enabled: true,
+            selector: None,
+        }];
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+        let spool = available_empty_spool();
+
+        let snapshot = build_status_snapshot_at(&plan, spool, 42);
+
+        assert_eq!(snapshot.policy.mode, PolicyStatusMode::Unavailable);
+        assert!(
+            snapshot
+                .policy
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("exceeding"))
+        );
+        assert_eq!(snapshot.health.mode, RuntimeMode::Unavailable);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
     fn collect_spool_status_reports_initialized_spool_cursor()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("status-initialized-spool")?;

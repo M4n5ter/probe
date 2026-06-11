@@ -4,6 +4,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod check;
+mod configured_enforcement;
+mod configured_policy;
 mod export;
 mod plaintext_feed;
 mod status;
@@ -13,12 +16,15 @@ use capture::{
     CaptureError, CaptureProvider, LibpcapConfig, LibpcapProvider, ProcessResolver, ReplayProvider,
     ResolvedProcess,
 };
+use check::build_check_report;
 use clap::{Parser, Subcommand, ValueEnum};
+use configured_enforcement::build_configured_enforcement;
+use configured_policy::{ConfiguredPolicyError, load_configured_policy};
 use enforcement::ScopedEnforcementPlanner;
 use export::{ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook, spawn_export_worker};
 use exporter::CompressionCodec;
 use parsers::Http1ParserFactory;
-use pipeline::{CapturePipeline, PipelineRunOptions};
+use pipeline::{CapturePipeline, PipelinePolicy, PipelineRunOptions};
 use plaintext_feed::load_plaintext_feed_provider;
 use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
 use probe_config::{AgentConfig, CaptureBackend};
@@ -52,6 +58,8 @@ enum AgentError {
     Storage(#[from] storage::StorageError),
     #[error("policy error: {0}")]
     Policy(#[from] policy::PolicyError),
+    #[error("{0}")]
+    ConfiguredPolicy(#[from] ConfiguredPolicyError),
     #[error("enforcement error: {0}")]
     Enforcement(#[from] enforcement::EnforcementError),
     #[error("proto error: {0}")]
@@ -62,6 +70,8 @@ enum AgentError {
     Capture(#[from] CaptureError),
     #[error("plaintext feed error: {0}")]
     PlaintextFeed(#[from] plaintext_feed::PlaintextFeedLoadError),
+    #[error("{0}")]
+    Check(#[from] check::CheckError),
     #[error("unsupported run config: {0}")]
     UnsupportedRunConfig(String),
 }
@@ -191,19 +201,19 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let mut provider = build_capture_provider(&plan)?;
             let mut parser_factory = Http1ParserFactory::default();
             let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
-            let policy = read_configured_policy(&plan.config)?;
-            let mut enforcement_planner = build_configured_enforcement_planner(&plan.config)?;
+            let policy = load_configured_policy(&plan.config)?;
+            let mut enforcement = build_configured_enforcement(&plan.config)?;
             let export_worker = export_worker_config_from_plan(&plan)
                 .map(|config| spawn_export_worker(Arc::clone(&spool), config));
             let mut pipeline = CapturePipeline::new(
                 spool.as_ref(),
                 &mut parser_factory,
-                policy.as_ref(),
+                policy
+                    .as_ref()
+                    .map(|policy| PipelinePolicy::new(&policy.runtime, policy.selector.as_ref())),
                 plan.config.config_version.clone(),
             );
-            if let Some(enforcement_planner) = enforcement_planner.as_mut() {
-                pipeline = pipeline.with_enforcement_planner(enforcement_planner);
-            }
+            pipeline = pipeline.with_enforcement_planner(&mut enforcement.planner);
             println!(
                 "agent {} running config {} capture {:?} selected {:?}",
                 plan.config.agent_id,
@@ -234,7 +244,8 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
         }
         Command::Check { config } => {
             let plan = read_runtime_plan(&config)?;
-            println!("{}", serde_json::to_string_pretty(&plan)?);
+            let report = build_check_report(plan)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Capabilities => {
             let matrix = default_provider_registry(&AgentConfig::default()).capability_matrix();
@@ -452,8 +463,13 @@ async fn replay(command: ReplayCommand) -> Result<(), AgentError> {
     let mut replay_provider =
         ReplayProvider::new(flow.clone(), command.direction, bytes, current_timestamp(1));
     let mut enforcement_planner = ScopedEnforcementPlanner::new(command.enforcement_mode, None)?;
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, policy.as_ref(), "replay")
-        .with_enforcement_planner(&mut enforcement_planner);
+    let mut pipeline = CapturePipeline::new(
+        &spool,
+        &mut parser_factory,
+        policy.as_ref().map(PipelinePolicy::unscoped),
+        "replay",
+    )
+    .with_enforcement_planner(&mut enforcement_planner);
     let summary = pipeline.run_provider(&mut replay_provider)?;
     println!(
         "replay pipeline journaled {} capture chunks and stored {} export events",
@@ -489,32 +505,6 @@ fn read_policy(path: &PathBuf) -> Result<PolicyRuntime, AgentError> {
         &source,
     )
     .map_err(AgentError::Policy)
-}
-
-fn read_configured_policy(config: &AgentConfig) -> Result<Option<PolicyRuntime>, AgentError> {
-    let enabled = config
-        .policies
-        .iter()
-        .filter(|policy| policy.enabled)
-        .collect::<Vec<_>>();
-    match enabled.as_slice() {
-        [] => Ok(None),
-        [policy] => read_policy(&policy.path).map(Some),
-        _ => Err(AgentError::UnsupportedRunConfig(
-            "live run currently supports at most one enabled policy bundle".to_string(),
-        )),
-    }
-}
-
-fn build_configured_enforcement_planner(
-    config: &AgentConfig,
-) -> Result<Option<ScopedEnforcementPlanner>, AgentError> {
-    ScopedEnforcementPlanner::new(
-        config.enforcement.mode,
-        config.enforcement.selector.as_ref(),
-    )
-    .map(Some)
-    .map_err(AgentError::Enforcement)
 }
 
 fn current_timestamp(monotonic_ns: u64) -> Timestamp {

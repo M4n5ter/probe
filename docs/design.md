@@ -80,7 +80,7 @@ V1 明确不做：
 - 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection 与 export worker effective plan；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；`plaintext_feed` 是独立 plan mode，不伪装成 replay 或 live capture；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
 - 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；pipeline 支持可选 `max_events` 运行边界，便于对真实 live provider 做有界 smoke。`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合、连续 exporter worker、replay exporter 命令和状态/metrics 快照输出。
 - 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。parser 已识别 WebSocket HTTP Upgrade，输出 `WebSocketHandoff` 后把后续字节转为 opaque stream；它不解析 WebSocket frame/message。
-- 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF、libssl uprobe/keylog TLS 解密和真实 enforcement 相关能力仍必须标记 unavailable；`external_plaintext_feed`、HTTP/1、SSE、WebSocket handoff、dry-run enforcement 是可用能力。webhook exporter 已可在 `run` 中连续 drain planned sinks，但 retry/backoff、per-sink quota 和 retention deadline 尚未实现，因此仍标记 degraded。dry-run enforcement 记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 或 plaintext feed 作为 live provider；`run` 在无 live capture provider 时 fail closed，显式 `plaintext_feed` 会从 JSON-lines feed path 读取已解密明文 event 并接入 replay 共用的 pipeline；`check` 用于查看 resolved plan，`status` 用于查看 health/spool/exporter/metrics 快照。
+- 已实现 capability matrix；`procfs_attribution` 和 `procfs_socket_attribution` 分别按本机 `/proc/<pid>` 与 `/proc/net/tcp`/proc root 探测结果标记 degraded/unavailable，eBPF、libssl uprobe/keylog TLS 解密和真实 enforcement 相关能力仍必须标记 unavailable；`external_plaintext_feed`、HTTP/1、SSE、WebSocket handoff、dry-run enforcement 是可用能力。webhook exporter 已可在 `run` 中连续 drain planned sinks，但 retry/backoff、per-sink quota 和 retention deadline 尚未实现，因此仍标记 degraded。dry-run enforcement 记录策略保护意图但不执行真实阻断；libpcap 能力按本机设备和权限探测结果标记 available/unavailable。默认 `auto` capture 不会静默选择 replay 或 plaintext feed 作为 live provider；`run` 在无 live capture provider 时 fail closed，显式 `plaintext_feed` 会从 JSON-lines feed path 读取已解密明文 event 并接入 replay 共用的 pipeline；policy selector 会在 runtime plan / configured policy load 阶段校验，并在 pipeline 中限制 policy 执行范围；`check` 用于查看 resolved plan 并显式加载 policy / enforcement planner，`status` 用于查看 health/spool/exporter/metrics 快照。
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
 - 当前 `FjallSpool` 存储的是带 schema 的 `SpoolPayload`；ingress lane 当前写入 JSON framed `CapturedBytes`，export lane 当前写入 JSON framed `EventEnvelope`。reader 只返回已越过 lane durable high-water sequence 的条目，避免并发 exporter 读到已 commit 但尚未 `SyncAll` 持久化完成的事件；`status` 使用同一 durable high-water 生成 spool/export lag 快照。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
 
@@ -647,7 +647,7 @@ V1 执行语义：
 - `capture.selection = "ebpf"`、`"libpcap"` 或 `"replay"` 表示 required backend；显式 backend 不自动使用 `fallback_backends`。这是为了让 operator 能表达“缺少该能力就 fail fast”，避免把强能力需求静默降级。
 - `capture.fallback_backends` 只允许 live backend，不包含 replay。replay 是可重复验证入口，不是 live agent 的自动 fallback。
 - libpcap 运行参数放在 `[capture.libpcap]` 下，包括 `interface`、`bpf_filter`、`snaplen`、`promisc`、`immediate_mode`、`read_timeout_ms` 和 `buffer_size`；这些属于 provider 配置，不进入 parser 或 policy 层。
-- `RuntimePlan` 是配置解析后的事实源，必须输出候选 provider、选中的 provider、export worker effective plan、capability matrix 和不可用原因；`run` 使用 plan 启动，`check` 输出 plan 供部署前审计。
+- `RuntimePlan` 是配置解析后的事实源，必须输出候选 provider、选中的 provider、export worker effective plan、capability matrix 和不可用原因；`run` 使用 plan 启动，`check` 输出 plan 并执行显式 composition check，供部署前审计。
 
 当前 export runtime 配置语义：
 
@@ -875,7 +875,7 @@ V1 的 HTTP(S) exporter 是 webhook 风格，但必须定义协议语义。
 
 - 已实现 CLI `status --config <path>`，输出可复用的 JSON snapshot：health、capture status、policy status、enforcement status、capability matrix、offline spool high-water、planned exporter sink cursor/lag 和 metrics counters。`health` 表示当前 active capture/spool/exporter 状态，并纳入 policy 的已知阻断或 metadata-only 未验证状态；无效 enforcement 配置在 snapshot 前由 `RuntimePlan` fail closed。capability matrix 和 capability metrics 保持独立，避免把路线图缺口伪装成当前运行故障。
 - `status` 对配置/runtime plan 错误 fail fast；对 spool 缺失、尚未初始化或读取失败不伪装成功，也不会为 status 查询创建 spool，而是在 snapshot 中标记 `spool.mode = unavailable`，并把相关 exporter 标记 unavailable。当前 CLI status 是 offline probe：如果 spool 已由正在运行的 agent 持有，会显式标记 `spool.mode = degraded` 和 busy reason，而不是伪装成坏 spool 或在线 admin snapshot。
-- policy status 当前只做 metadata-only source check：报告 configured/enabled count、active policy id/path、selector 是否配置、策略源文件是否存在且是 regular file；不会加载或执行 Lua policy source。启用 policy 且源文件 metadata 可见时，offline status 标记 `policy.mode = metadata_only` 并让 health degraded，而不是宣称 policy runtime 已可用。原因是 `PolicyRuntime` 加载阶段会执行 Lua chunk，offline status 不能变成隐式执行外部策略的入口。后续如需验证 policy 语法/运行时，应作为显式 `check` 或在线 admin snapshot 能力。
+- policy status 当前只做 metadata-only source check：报告 configured/enabled count、active policy id/path、selector 是否配置、策略源文件是否存在且是 regular file；不会加载或执行 Lua policy source。启用 policy 且源文件 metadata 可见时，offline status 标记 `policy.mode = metadata_only` 并让 health degraded，而不是宣称 policy runtime 已可用。原因是 `PolicyRuntime` 加载阶段会执行 Lua chunk，offline status 不能变成隐式执行外部策略的入口。显式 `check` 会加载并编译启用的 policy，失败则 fail closed。
 - enforcement status 使用 typed enum 报告 configured mode、effective status、selector 是否配置和 capability requirement。`disabled`/`audit_only` 标记 capability `not_required`；`dry_run` 标记需要 `DryRunEnforcement` capability。`enforce` 和缺少 dry-run capability 的配置在 `RuntimePlan` 构建阶段 fail closed，因此 CLI status 对这类配置直接返回 validation error，而不是输出一个伪可用 snapshot。
 - 尚未实现 root-owned Unix socket server、reload、debug dump 和 Prometheus adapter；这些后续应复用同一 status snapshot 构建器，并承担运行中 agent 的在线状态查询。
 
@@ -1020,7 +1020,7 @@ benchmark 参数：
 V1 CLI 至少提供：
 
 - `run`：启动 agent；默认持续运行，`--max-events` 用于 smoke/e2e 中对 live provider 做有界采集。`--max-events` 是硬 capture event 数上限，不保证读到 flow close 边界，也不替代完整 close/flush 行为验收。
-- `check`：校验配置和 policy bundle。
+- `check`：校验配置、resolved runtime plan、启用的 policy bundle 和 enforcement planner，输出 JSON check report；policy 加载/编译失败时 fail closed。`check` 与 `run` 共用中性的 configured policy/enforcement composition helper，避免诊断入口和生产路径各自解释配置。policy snapshot 中的 `registered_hooks` 表示 runtime 注册的支持 hook，不表示 Lua source 中实际定义的函数集合。
 - `status`：输出 runtime/admin/metrics snapshot。
 - `replay`：用 pcap/spool 样本跑 parser/policy/exporter。
 - `capabilities`：输出 capability matrix。
@@ -1206,5 +1206,5 @@ enforcement 抽象验收：
 | workspace | 短名 crate，使用 xtask 管 eBPF 构建 | 第 27 节 |
 | runtime | 热路径同步，IO 异步，Tokio + 专用热路径线程 | 第 27 节 |
 | 依赖 | 使用当前稳定 crate，不限制 0.x，但通过 trait/adapter 隔离 | 第 27 节 |
-| CLI | run/check/replay/capabilities；`run --max-events` 支持有界 live smoke | 第 30 节 |
+| CLI | run/check/status/replay/capabilities；`check` 输出显式 JSON composition report，`status` 输出 metadata-only runtime/admin snapshot，`run --max-events` 支持有界 live smoke | 第 30 节 |
 | 验收 | HTTP/SSE demo、libssl TLS demo、pcap fallback、dry-run enforcement | 第 31 节 |

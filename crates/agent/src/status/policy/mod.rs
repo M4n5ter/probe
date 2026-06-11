@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use probe_config::PolicyConfig;
+use crate::configured_policy::{
+    ConfiguredPolicySource, configured_policy_selection, inspect_policy_source,
+};
 use probe_core::RuntimeMode;
 use runtime::RuntimePlan;
 use serde::Serialize;
@@ -44,19 +46,12 @@ pub enum PolicySourceCheck {
 }
 
 pub(super) fn policy_status(plan: &RuntimePlan) -> PolicyStatusSnapshot {
-    let enabled = plan
-        .config
-        .policies
-        .iter()
-        .filter(|policy| policy.enabled)
-        .collect::<Vec<_>>();
-    let configured_count = plan.config.policies.len() as u64;
-    let enabled_count = enabled.len() as u64;
-    let Some(policy) = enabled.first() else {
+    let selection = configured_policy_selection(&plan.config);
+    let Some(policy) = selection.active else {
         return PolicyStatusSnapshot {
             mode: PolicyStatusMode::Inactive,
-            configured_count,
-            enabled_count,
+            configured_count: selection.configured_count,
+            enabled_count: selection.enabled_count,
             active: None,
             reason: None,
         };
@@ -78,49 +73,31 @@ pub(super) fn policy_status(plan: &RuntimePlan) -> PolicyStatusSnapshot {
 
     PolicyStatusSnapshot {
         mode,
-        configured_count,
-        enabled_count,
+        configured_count: selection.configured_count,
+        enabled_count: selection.enabled_count,
         active: Some(policy_bundle_status(policy, source)),
         reason,
     }
 }
 
 fn policy_bundle_status(
-    policy: &PolicyConfig,
+    policy: ConfiguredPolicySource,
     source: PolicySourceStatusSnapshot,
 ) -> PolicyBundleStatusSnapshot {
     PolicyBundleStatusSnapshot {
-        id: policy.id.clone(),
-        path: policy.path.clone(),
-        selector_configured: policy.selector.is_some(),
+        id: policy.id,
+        path: policy.path,
+        selector_configured: policy.selector_configured,
         source,
     }
 }
 
 fn policy_source_status(path: &Path) -> PolicySourceStatusSnapshot {
-    let (mode, reason) = match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => (RuntimeMode::Available, None),
-        Ok(metadata) if metadata.is_dir() => (
-            RuntimeMode::Unavailable,
-            Some("policy source path is a directory".to_string()),
-        ),
-        Ok(_) => (
-            RuntimeMode::Unavailable,
-            Some("policy source path is not a regular file".to_string()),
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
-            RuntimeMode::Unavailable,
-            Some("policy source path does not exist".to_string()),
-        ),
-        Err(error) => (
-            RuntimeMode::Unavailable,
-            Some(format!("failed to inspect policy source: {error}")),
-        ),
-    };
+    let inspection = inspect_policy_source(path);
 
     PolicySourceStatusSnapshot {
         check: PolicySourceCheck::MetadataOnly,
-        mode,
-        reason,
+        mode: inspection.mode,
+        reason: inspection.reason,
     }
 }
