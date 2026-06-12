@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
+mod tls;
+
 const RESERVED_EXPORTER_HEADERS: &[&str] = &["content-type", "idempotency-key", "x-sssa-codec"];
 const REPLAY_WEBHOOK_SINK_ID: &str = "replay-webhook";
 pub const DEFAULT_EXPORT_WORKER_INTERVAL_MS: u64 = 1_000;
@@ -63,7 +65,7 @@ impl AgentConfig {
         let mut violations = Vec::new();
 
         validate_capture(&self.capture, &mut violations);
-        validate_tls(&self.tls, &self.capture, &mut violations);
+        tls::validate_tls(&self.tls, &self.capture, &mut violations);
         validate_export_runtime(&self.export, &mut violations);
         validate_exporters(&self.exporters, &self.tls, &mut violations);
         validate_policies(&self.policies, &mut violations);
@@ -352,6 +354,9 @@ pub struct TlsConfig {
 pub struct PlaintextTlsConfig {
     pub enabled: bool,
     pub provider: TlsPlaintextProvider,
+    pub selector: Option<Selector>,
+    pub key_log_refs: Vec<String>,
+    pub session_secret_refs: Vec<String>,
 }
 
 impl Default for PlaintextTlsConfig {
@@ -359,6 +364,9 @@ impl Default for PlaintextTlsConfig {
         Self {
             enabled: false,
             provider: TlsPlaintextProvider::LibsslUprobe,
+            selector: None,
+            key_log_refs: Vec::new(),
+            session_secret_refs: Vec::new(),
         }
     }
 }
@@ -569,59 +577,6 @@ fn validate_plaintext_feed_capture(capture: &CaptureConfig, violations: &mut Vec
     }
 }
 
-fn validate_tls(tls: &TlsConfig, capture: &CaptureConfig, violations: &mut Vec<ConfigViolation>) {
-    validate_tls_materials(tls, violations);
-
-    if capture.selection == CaptureSelection::PlaintextFeed {
-        validate_plaintext_feed_selection(tls, violations);
-    }
-
-    if !tls.plaintext.enabled {
-        return;
-    }
-
-    match tls.plaintext.provider {
-        TlsPlaintextProvider::LibsslUprobe | TlsPlaintextProvider::Keylog => {}
-    }
-}
-
-fn validate_tls_materials(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
-    let mut ids = HashSet::new();
-    for (index, material) in tls.materials.iter().enumerate() {
-        if let Some(id) = &material.id {
-            if id.trim().is_empty() {
-                violations.push(ConfigViolation {
-                    field: format!("tls.materials[{index}].id"),
-                    reason: "TLS material id cannot be empty when set".to_string(),
-                });
-            } else if !ids.insert(id.as_str()) {
-                violations.push(ConfigViolation {
-                    field: format!("tls.materials[{index}].id"),
-                    reason: "TLS material id must be unique".to_string(),
-                });
-            }
-        }
-        if material.path.as_os_str().is_empty() {
-            violations.push(ConfigViolation {
-                field: format!("tls.materials[{index}].path"),
-                reason: "TLS material path cannot be empty".to_string(),
-            });
-        }
-    }
-}
-
-fn validate_plaintext_feed_selection(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
-    if !tls.plaintext.enabled {
-        return;
-    }
-
-    violations.push(ConfigViolation {
-        field: "tls.plaintext.enabled".to_string(),
-        reason: "plaintext_feed capture is the external plaintext source; disable tls.plaintext or select a TLS instrumentation backend"
-            .to_string(),
-    });
-}
-
 fn validate_export_runtime(export: &ExportRuntimeConfig, violations: &mut Vec<ConfigViolation>) {
     if !export.worker.enabled {
         return;
@@ -665,10 +620,10 @@ fn validate_export_runtime(export: &ExportRuntimeConfig, violations: &mut Vec<Co
 
 fn validate_exporters(
     exporters: &[ExporterConfig],
-    tls: &TlsConfig,
+    tls_config: &TlsConfig,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    let tls_materials_by_id = tls_materials_by_id(tls);
+    let tls_materials_by_id = tls::materials_by_id(tls_config);
     let mut ids = HashSet::new();
     for exporter in exporters {
         if exporter.id.trim().is_empty() {
@@ -739,13 +694,6 @@ fn validate_exporters(
     }
 }
 
-fn tls_materials_by_id(tls: &TlsConfig) -> BTreeMap<&str, TlsMaterialKind> {
-    tls.materials
-        .iter()
-        .filter_map(|material| material.id.as_deref().map(|id| (id, material.kind)))
-        .collect()
-}
-
 fn validate_exporter_tls(
     exporter: &ExporterConfig,
     materials_by_id: &BTreeMap<&str, TlsMaterialKind>,
@@ -758,33 +706,33 @@ fn validate_exporter_tls(
         });
     }
     for reference in &exporter.tls.trust_anchor_refs {
-        validate_tls_material_ref(
-            exporter,
-            "tls.trust_anchor_refs",
+        tls::validate_material_ref(
+            format!("exporters.{}.tls.trust_anchor_refs", exporter.id),
             reference,
             TlsMaterialKind::TrustAnchor,
             materials_by_id,
             violations,
+            "TLS material",
         );
     }
     for reference in &exporter.tls.client_certificate_refs {
-        validate_tls_material_ref(
-            exporter,
-            "tls.client_certificate_refs",
+        tls::validate_material_ref(
+            format!("exporters.{}.tls.client_certificate_refs", exporter.id),
             reference,
             TlsMaterialKind::ClientCertificate,
             materials_by_id,
             violations,
+            "TLS material",
         );
     }
     if let Some(reference) = &exporter.tls.client_private_key_ref {
-        validate_tls_material_ref(
-            exporter,
-            "tls.client_private_key_ref",
+        tls::validate_material_ref(
+            format!("exporters.{}.tls.client_private_key_ref", exporter.id),
             reference,
             TlsMaterialKind::ClientPrivateKey,
             materials_by_id,
             violations,
+            "TLS material",
         );
     }
     if !exporter.tls.client_certificate_refs.is_empty()
@@ -815,36 +763,6 @@ fn exporter_tls_configured(tls: &ExporterTlsConfig) -> bool {
 fn webhook_endpoint_is_https(exporter: &ExporterConfig) -> bool {
     exporter.transport == ExporterTransport::Webhook
         && Url::parse(&exporter.endpoint).is_ok_and(|url| url.scheme() == "https")
-}
-
-fn validate_tls_material_ref(
-    exporter: &ExporterConfig,
-    field: &str,
-    reference: &str,
-    expected_kind: TlsMaterialKind,
-    materials_by_id: &BTreeMap<&str, TlsMaterialKind>,
-    violations: &mut Vec<ConfigViolation>,
-) {
-    if reference.trim().is_empty() {
-        violations.push(ConfigViolation {
-            field: format!("exporters.{}.{}", exporter.id, field),
-            reason: "TLS material reference cannot be empty".to_string(),
-        });
-        return;
-    }
-    match materials_by_id.get(reference).copied() {
-        Some(kind) if kind == expected_kind => {}
-        Some(kind) => violations.push(ConfigViolation {
-            field: format!("exporters.{}.{}", exporter.id, field),
-            reason: format!(
-                "TLS material ref {reference} has kind {kind:?}, expected {expected_kind:?}"
-            ),
-        }),
-        None => violations.push(ConfigViolation {
-            field: format!("exporters.{}.{}", exporter.id, field),
-            reason: format!("TLS material ref {reference} does not exist"),
-        }),
-    }
 }
 
 fn validate_policies(policies: &[PolicyConfig], violations: &mut Vec<ConfigViolation>) {

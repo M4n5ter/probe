@@ -27,6 +27,7 @@ pub struct RuntimePlan {
     pub config: AgentConfig,
     pub capabilities: CapabilityMatrix,
     pub capture: CapturePlan,
+    pub tls: TlsPlan,
     pub export: ExportPlan,
     pub enforcement: EnforcementPlan,
 }
@@ -37,12 +38,14 @@ impl RuntimePlan {
         validate_runtime_config(&config, registry)?;
         let capabilities = registry.capability_matrix();
         let capture = CapturePlan::resolve(&config, registry);
+        let tls = TlsPlan::resolve(&config, &capabilities);
         let export = ExportPlan::resolve(&config);
         let enforcement = EnforcementPlan::resolve(&config);
         Ok(Self {
             config,
             capabilities,
             capture,
+            tls,
             export,
             enforcement,
         })
@@ -62,6 +65,88 @@ impl RuntimePlan {
         }
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsPlan {
+    pub plaintext: TlsPlaintextPlan,
+}
+
+impl TlsPlan {
+    fn resolve(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
+        Self {
+            plaintext: TlsPlaintextPlan::resolve(config, capabilities),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsPlaintextPlan {
+    pub enabled: bool,
+    pub provider: TlsPlaintextProvider,
+    pub selector_configured: bool,
+    pub capability: TlsPlaintextCapabilityPlan,
+    pub key_logs: Vec<TlsPlaintextMaterialPlan>,
+    pub session_secrets: Vec<TlsPlaintextMaterialPlan>,
+}
+
+impl TlsPlaintextPlan {
+    fn resolve(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
+        let materials_by_id = tls_plaintext_materials_by_id(&config.tls.materials);
+        Self {
+            enabled: config.tls.plaintext.enabled,
+            provider: config.tls.plaintext.provider,
+            selector_configured: config.tls.plaintext.selector.is_some(),
+            capability: TlsPlaintextCapabilityPlan::from_config(config, capabilities),
+            key_logs: tls_plaintext_materials_from_refs(
+                &config.tls.plaintext.key_log_refs,
+                TlsMaterialKind::KeyLogFile,
+                &materials_by_id,
+            ),
+            session_secrets: tls_plaintext_materials_from_refs(
+                &config.tls.plaintext.session_secret_refs,
+                TlsMaterialKind::SessionSecretFile,
+                &materials_by_id,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TlsPlaintextCapabilityPlan {
+    NotRequired,
+    Required {
+        capability: CapabilityKind,
+        mode: RuntimeMode,
+    },
+}
+
+impl TlsPlaintextCapabilityPlan {
+    fn from_config(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
+        if !config.tls.plaintext.enabled {
+            return Self::NotRequired;
+        }
+        match config.tls.plaintext.provider {
+            TlsPlaintextProvider::LibsslUprobe => Self::Required {
+                capability: CapabilityKind::LibsslUprobe,
+                mode: capabilities.mode(CapabilityKind::LibsslUprobe),
+            },
+            TlsPlaintextProvider::Keylog => {
+                unreachable!("runtime validation rejects keylog plaintext provider before planning")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsMaterialPlan {
+    pub id: String,
+    pub kind: TlsMaterialKind,
+    pub path: PathBuf,
+}
+
+pub type TlsPlaintextMaterialPlan = TlsMaterialPlan;
+pub type ExportTlsMaterialPlan = TlsMaterialPlan;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPlan {
@@ -256,13 +341,6 @@ pub struct ExportSinkTlsPlan {
     pub client_private_key: Option<ExportTlsMaterialPlan>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExportTlsMaterialPlan {
-    pub id: String,
-    pub kind: TlsMaterialKind,
-    pub path: PathBuf,
-}
-
 impl ExportSinkTlsPlan {
     fn from_config(
         config: &ExporterTlsConfig,
@@ -290,31 +368,65 @@ impl ExportSinkTlsPlan {
     }
 }
 
-impl ExportTlsMaterialPlan {
-    fn from_config(material: &TlsMaterialConfig) -> Option<Self> {
-        let id = material.id.clone()?;
-        match material.kind {
-            TlsMaterialKind::TrustAnchor
-            | TlsMaterialKind::ClientCertificate
-            | TlsMaterialKind::ClientPrivateKey => Some(Self {
-                id,
-                kind: material.kind,
-                path: material.path.clone(),
-            }),
-            TlsMaterialKind::KeyLogFile | TlsMaterialKind::SessionSecretFile => None,
-        }
-    }
-}
-
 fn export_tls_materials_by_id(
     materials: &[TlsMaterialConfig],
 ) -> BTreeMap<&str, ExportTlsMaterialPlan> {
+    tls_materials_by_id(materials, is_export_tls_material)
+}
+
+fn tls_plaintext_materials_by_id(
+    materials: &[TlsMaterialConfig],
+) -> BTreeMap<&str, TlsPlaintextMaterialPlan> {
+    tls_materials_by_id(materials, is_plaintext_tls_material)
+}
+
+fn tls_materials_by_id(
+    materials: &[TlsMaterialConfig],
+    include: impl Fn(TlsMaterialKind) -> bool,
+) -> BTreeMap<&str, TlsMaterialPlan> {
     materials
         .iter()
         .filter_map(|material| {
             let id = material.id.as_deref()?;
-            ExportTlsMaterialPlan::from_config(material).map(|plan| (id, plan))
+            include(material.kind).then(|| {
+                (
+                    id,
+                    TlsMaterialPlan {
+                        id: id.to_string(),
+                        kind: material.kind,
+                        path: material.path.clone(),
+                    },
+                )
+            })
         })
+        .collect()
+}
+
+fn is_export_tls_material(kind: TlsMaterialKind) -> bool {
+    matches!(
+        kind,
+        TlsMaterialKind::TrustAnchor
+            | TlsMaterialKind::ClientCertificate
+            | TlsMaterialKind::ClientPrivateKey
+    )
+}
+
+fn is_plaintext_tls_material(kind: TlsMaterialKind) -> bool {
+    matches!(
+        kind,
+        TlsMaterialKind::KeyLogFile | TlsMaterialKind::SessionSecretFile
+    )
+}
+
+fn tls_plaintext_materials_from_refs(
+    refs: &[String],
+    expected_kind: TlsMaterialKind,
+    materials_by_id: &BTreeMap<&str, TlsPlaintextMaterialPlan>,
+) -> Vec<TlsPlaintextMaterialPlan> {
+    refs.iter()
+        .filter_map(|reference| materials_by_id.get(reference.as_str()))
+        .filter(|material| material.kind == expected_kind)
+        .cloned()
         .collect()
 }
 
@@ -646,6 +758,14 @@ fn validate_capture_config(
 }
 
 fn validate_static_tls_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
+    if let Some(selector) = &config.tls.plaintext.selector
+        && let Err(error) = selector.compile()
+    {
+        violations.push(ConfigViolation {
+            field: "tls.plaintext.selector".to_string(),
+            reason: error.to_string(),
+        });
+    }
     if !config.tls.plaintext.enabled {
         return;
     }

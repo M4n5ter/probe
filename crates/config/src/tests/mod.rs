@@ -33,6 +33,17 @@ fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {
         config.enforcement.policy.source,
         EnforcementPolicySourceConfig::None
     );
+    assert!(!config.tls.plaintext.enabled);
+    assert_eq!(
+        config.tls.plaintext.provider,
+        TlsPlaintextProvider::LibsslUprobe
+    );
+    assert_eq!(config.tls.plaintext.selector, None);
+    assert_eq!(config.tls.plaintext.key_log_refs, Vec::<String>::new());
+    assert_eq!(
+        config.tls.plaintext.session_secret_refs,
+        Vec::<String>::new()
+    );
     config.validate_basic()?;
     Ok(())
 }
@@ -93,6 +104,23 @@ path = "/etc/ssl/certs/ca.pem"
 enabled = true
 provider = "libssl_uprobe"
 
+[tls.plaintext.selector]
+op = "match"
+
+[tls.plaintext.selector.term.process]
+pids = [4242]
+names = []
+exe_path_globs = []
+cmdline_regexes = []
+systemd_services = []
+container_ids = []
+
+[tls.plaintext.selector.term.traffic]
+local_ports = [443]
+remote_ports = []
+directions = []
+remote_addresses = []
+
 [enforcement]
 mode = "dry_run"
 
@@ -136,6 +164,11 @@ socket_path = "/run/sssa-probe/admin.sock"
     assert_eq!(config.tls.materials[0].id.as_deref(), Some("collector-ca"));
     assert_eq!(config.tls.materials[0].kind, TlsMaterialKind::TrustAnchor);
     assert!(config.tls.plaintext.enabled);
+    assert_eq!(
+        config.tls.plaintext.provider,
+        TlsPlaintextProvider::LibsslUprobe
+    );
+    assert!(config.tls.plaintext.selector.is_some());
     assert_eq!(config.capture.plaintext_feed.path, None);
     assert_eq!(config.enforcement.mode, EnforcementMode::DryRun);
     assert_eq!(
@@ -149,6 +182,38 @@ socket_path = "/run/sssa-probe/admin.sock"
         config.admin.socket_path,
         PathBuf::from("/run/sssa-probe/admin.sock")
     );
+    Ok(())
+}
+
+#[test]
+fn parses_tls_plaintext_material_refs() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[tls.plaintext]
+enabled = true
+provider = "keylog"
+key_log_refs = ["ssl-keys"]
+session_secret_refs = ["session-secrets"]
+
+[[tls.materials]]
+id = "ssl-keys"
+kind = "key_log_file"
+path = "/var/lib/sssa-probe/sslkeylog.log"
+
+[[tls.materials]]
+id = "session-secrets"
+kind = "session_secret_file"
+path = "/var/lib/sssa-probe/session-secrets.jsonl"
+"#,
+    )?;
+
+    assert_eq!(config.tls.plaintext.provider, TlsPlaintextProvider::Keylog);
+    assert_eq!(config.tls.plaintext.key_log_refs, vec!["ssl-keys"]);
+    assert_eq!(
+        config.tls.plaintext.session_secret_refs,
+        vec!["session-secrets"]
+    );
+    config.validate_basic()?;
     Ok(())
 }
 
@@ -467,6 +532,105 @@ trust_anchor_refs = ["missing-ca"]
         missing_ref_error
             .to_string()
             .contains("TLS material ref missing-ca does not exist")
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_invalid_tls_plaintext_material_refs() -> Result<(), Box<dyn std::error::Error>>
+{
+    let missing_ref = AgentConfig::from_toml_str(
+        r#"
+[tls.plaintext]
+enabled = true
+provider = "keylog"
+key_log_refs = ["missing"]
+"#,
+    )?;
+    let missing_ref_error = missing_ref
+        .validate_basic()
+        .expect_err("plaintext material refs must exist");
+    assert!(
+        missing_ref_error
+            .to_string()
+            .contains("TLS plaintext material ref missing does not exist")
+    );
+
+    let wrong_kind = AgentConfig::from_toml_str(
+        r#"
+[tls.plaintext]
+enabled = true
+provider = "keylog"
+key_log_refs = ["session-secret"]
+
+[[tls.materials]]
+id = "session-secret"
+kind = "session_secret_file"
+path = "/tmp/session-secret.jsonl"
+"#,
+    )?;
+    let wrong_kind_error = wrong_kind
+        .validate_basic()
+        .expect_err("plaintext key log refs must point at key log material");
+    assert!(wrong_kind_error.to_string().contains("expected KeyLogFile"));
+
+    let empty_ref = AgentConfig::from_toml_str(
+        r#"
+[tls.plaintext]
+enabled = true
+provider = "keylog"
+session_secret_refs = [""]
+"#,
+    )?;
+    let empty_ref_error = empty_ref
+        .validate_basic()
+        .expect_err("plaintext material refs must not be empty");
+    assert!(
+        empty_ref_error
+            .to_string()
+            .contains("TLS plaintext material reference cannot be empty")
+    );
+
+    let libssl_ref = AgentConfig::from_toml_str(
+        r#"
+[tls.plaintext]
+enabled = true
+provider = "libssl_uprobe"
+key_log_refs = ["ssl-keys"]
+
+[[tls.materials]]
+id = "ssl-keys"
+kind = "key_log_file"
+path = "/tmp/sslkeylog.log"
+"#,
+    )?;
+    let libssl_ref_error = libssl_ref
+        .validate_basic()
+        .expect_err("libssl uprobes must not accept key log refs");
+    assert!(
+        libssl_ref_error
+            .to_string()
+            .contains("libssl_uprobe plaintext provider does not use key log materials")
+    );
+
+    let disabled_libssl_ref = AgentConfig::from_toml_str(
+        r#"
+[tls.plaintext]
+key_log_refs = ["ssl-keys"]
+
+[[tls.materials]]
+id = "ssl-keys"
+kind = "key_log_file"
+path = "/tmp/sslkeylog.log"
+"#,
+    )?;
+    let disabled_libssl_ref_error = disabled_libssl_ref
+        .validate_basic()
+        .expect_err("libssl refs must be rejected even when plaintext is disabled");
+    assert!(
+        disabled_libssl_ref_error
+            .to_string()
+            .contains("libssl_uprobe plaintext provider does not use key log materials")
     );
     Ok(())
 }

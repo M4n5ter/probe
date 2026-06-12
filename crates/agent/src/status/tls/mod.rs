@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use probe_config::{TlsMaterialKind, TlsPlaintextProvider};
 use probe_core::{CapabilityKind, RuntimeMode};
-use runtime::RuntimePlan;
+use runtime::{RuntimePlan, TlsPlaintextCapabilityPlan, TlsPlaintextMaterialPlan};
 use serde::Serialize;
 
 use crate::tls_material::check_tls_material_source;
@@ -13,14 +13,17 @@ pub struct TlsStatusSnapshot {
     pub materials: Vec<TlsMaterialStatusSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TlsPlaintextStatusSnapshot {
     pub enabled: bool,
     pub provider: TlsPlaintextProvider,
+    pub selector_configured: bool,
     pub capability: TlsPlaintextCapabilityStatusSnapshot,
+    pub key_logs: Vec<TlsPlaintextMaterialStatusSnapshot>,
+    pub session_secrets: Vec<TlsPlaintextMaterialStatusSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum TlsPlaintextCapabilityStatusSnapshot {
     NotRequired,
@@ -28,6 +31,14 @@ pub enum TlsPlaintextCapabilityStatusSnapshot {
         capability: CapabilityKind,
         mode: RuntimeMode,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextMaterialStatusSnapshot {
+    pub id: String,
+    pub kind: TlsMaterialKind,
+    pub path: PathBuf,
+    pub source: TlsMaterialSourceStatusSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -77,17 +88,15 @@ pub(super) fn tls_status(plan: &RuntimePlan) -> TlsStatusSnapshot {
 }
 
 fn plaintext_status(plan: &RuntimePlan) -> TlsPlaintextStatusSnapshot {
-    let plaintext = &plan.config.tls.plaintext;
-    let capability = if !plaintext.enabled {
-        TlsPlaintextCapabilityStatusSnapshot::NotRequired
-    } else {
-        match plaintext.provider {
-            TlsPlaintextProvider::LibsslUprobe => TlsPlaintextCapabilityStatusSnapshot::Required {
-                capability: CapabilityKind::LibsslUprobe,
-                mode: plan.capabilities.mode(CapabilityKind::LibsslUprobe),
-            },
-            TlsPlaintextProvider::Keylog => {
-                unreachable!("runtime plan validation rejects keylog plaintext provider")
+    let plaintext = &plan.tls.plaintext;
+    let capability = match &plaintext.capability {
+        TlsPlaintextCapabilityPlan::NotRequired => {
+            TlsPlaintextCapabilityStatusSnapshot::NotRequired
+        }
+        TlsPlaintextCapabilityPlan::Required { capability, mode } => {
+            TlsPlaintextCapabilityStatusSnapshot::Required {
+                capability: *capability,
+                mode: *mode,
             }
         }
     };
@@ -95,8 +104,25 @@ fn plaintext_status(plan: &RuntimePlan) -> TlsPlaintextStatusSnapshot {
     TlsPlaintextStatusSnapshot {
         enabled: plaintext.enabled,
         provider: plaintext.provider,
+        selector_configured: plaintext.selector_configured,
         capability,
+        key_logs: plaintext_material_statuses(&plaintext.key_logs),
+        session_secrets: plaintext_material_statuses(&plaintext.session_secrets),
     }
+}
+
+fn plaintext_material_statuses(
+    materials: &[TlsPlaintextMaterialPlan],
+) -> Vec<TlsPlaintextMaterialStatusSnapshot> {
+    materials
+        .iter()
+        .map(|material| TlsPlaintextMaterialStatusSnapshot {
+            id: material.id.clone(),
+            kind: material.kind,
+            path: material.path.clone(),
+            source: material_source_status(&material.path),
+        })
+        .collect()
 }
 
 fn material_purpose(kind: TlsMaterialKind) -> TlsMaterialPurpose {

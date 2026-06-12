@@ -266,6 +266,119 @@ fn unsupported_security_features_fail_closed() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
+fn tls_plaintext_plan_preserves_selector_and_capability_requirement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let registry = ProviderRegistry::new(
+        vec![capture_provider(
+            CaptureBackend::Replay,
+            CaptureProviderBuilder::Replay,
+            RuntimeMode::Available,
+        )],
+        test_platform_capabilities_with_libssl(RuntimeMode::Available),
+    );
+    let mut config = AgentConfig::default();
+    config.capture.selection = CaptureSelection::Replay;
+    config.tls.plaintext.enabled = true;
+    config.tls.plaintext.provider = TlsPlaintextProvider::LibsslUprobe;
+    config.tls.plaintext.selector = Some(Selector::default());
+
+    let plan = RuntimePlan::build(config, &registry)?;
+
+    assert!(plan.tls.plaintext.enabled);
+    assert_eq!(
+        plan.tls.plaintext.provider,
+        TlsPlaintextProvider::LibsslUprobe
+    );
+    assert!(plan.tls.plaintext.selector_configured);
+    assert_eq!(
+        plan.tls.plaintext.capability,
+        TlsPlaintextCapabilityPlan::Required {
+            capability: CapabilityKind::LibsslUprobe,
+            mode: RuntimeMode::Available,
+        }
+    );
+    assert!(plan.tls.plaintext.key_logs.is_empty());
+    assert!(plan.tls.plaintext.session_secrets.is_empty());
+    Ok(())
+}
+
+#[test]
+fn tls_plaintext_plan_resolves_decrypt_hint_material_refs() -> Result<(), Box<dyn std::error::Error>>
+{
+    let registry = ProviderRegistry::new(
+        vec![capture_provider(
+            CaptureBackend::Replay,
+            CaptureProviderBuilder::Replay,
+            RuntimeMode::Available,
+        )],
+        test_platform_capabilities(),
+    );
+    let mut config = AgentConfig::default();
+    config.capture.selection = CaptureSelection::Replay;
+    config.tls.plaintext.provider = TlsPlaintextProvider::Keylog;
+    config.tls.plaintext.key_log_refs = vec!["ssl-keys".to_string()];
+    config.tls.plaintext.session_secret_refs = vec!["session-secrets".to_string()];
+    config.tls.materials = vec![
+        TlsMaterialConfig {
+            id: Some("ssl-keys".to_string()),
+            kind: TlsMaterialKind::KeyLogFile,
+            path: "/tmp/sslkeylog.log".into(),
+        },
+        TlsMaterialConfig {
+            id: Some("session-secrets".to_string()),
+            kind: TlsMaterialKind::SessionSecretFile,
+            path: "/tmp/session-secrets.jsonl".into(),
+        },
+    ];
+
+    let plan = RuntimePlan::build(config, &registry)?;
+
+    assert_eq!(
+        plan.tls.plaintext.capability,
+        TlsPlaintextCapabilityPlan::NotRequired
+    );
+    assert_eq!(
+        plan.tls.plaintext.key_logs,
+        vec![TlsPlaintextMaterialPlan {
+            id: "ssl-keys".to_string(),
+            kind: TlsMaterialKind::KeyLogFile,
+            path: "/tmp/sslkeylog.log".into(),
+        }]
+    );
+    assert_eq!(
+        plan.tls.plaintext.session_secrets,
+        vec![TlsPlaintextMaterialPlan {
+            id: "session-secrets".to_string(),
+            kind: TlsMaterialKind::SessionSecretFile,
+            path: "/tmp/session-secrets.jsonl".into(),
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn tls_plaintext_selector_is_validated_during_plan_build() {
+    let registry = ProviderRegistry::new(
+        vec![capture_provider(
+            CaptureBackend::Replay,
+            CaptureProviderBuilder::Replay,
+            RuntimeMode::Available,
+        )],
+        test_platform_capabilities(),
+    );
+    let mut config = AgentConfig::default();
+    config.capture.selection = CaptureSelection::Replay;
+    config.tls.plaintext.selector = Some(Selector::All {
+        selectors: Vec::new(),
+    });
+
+    let error = RuntimePlan::build(config, &registry)
+        .expect_err("invalid TLS plaintext selector must fail plan build");
+
+    assert!(error.to_string().contains("tls.plaintext.selector"));
+}
+
+#[test]
 fn dry_run_enforcement_is_a_supported_runtime_capability() -> Result<(), Box<dyn std::error::Error>>
 {
     let registry = ProviderRegistry::new(
@@ -576,6 +689,29 @@ fn test_platform_capabilities() -> Vec<CapabilityState> {
         CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
         CapabilityState::available(CapabilityKind::DryRunEnforcement),
     ]
+}
+
+fn test_platform_capabilities_with_libssl(mode: RuntimeMode) -> Vec<CapabilityState> {
+    test_platform_capabilities()
+        .into_iter()
+        .map(|state| {
+            if state.kind == CapabilityKind::LibsslUprobe {
+                match mode {
+                    RuntimeMode::Available => {
+                        CapabilityState::available(CapabilityKind::LibsslUprobe)
+                    }
+                    RuntimeMode::Degraded => {
+                        CapabilityState::degraded(CapabilityKind::LibsslUprobe, "degraded")
+                    }
+                    RuntimeMode::Unavailable => {
+                        CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "unavailable")
+                    }
+                }
+            } else {
+                state
+            }
+        })
+        .collect()
 }
 
 fn export_tls_material(
