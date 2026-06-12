@@ -6,8 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-aya-obj = "0.2"
 bytes = { version = "1.11.1", features = ["serde"] }
+ebpf-object = { version = "0.1.0", path = "../ebpf-object" }
 object = { version = "0.39", default-features = false, features = ["elf", "read_core", "std"] }
 pcap = "2.4"
 probe-core = { path = "../core" }

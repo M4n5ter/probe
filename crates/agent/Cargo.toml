@@ -9,6 +9,7 @@ repository.workspace = true
 attribution = { path = "../attribution" }
 capture = { path = "../capture" }
 clap = { version = "4.6.1", features = ["derive"] }
+ebpf-object = { path = "../ebpf-object" }
 enforcement = { path = "../enforcement" }
 exporter = { path = "../exporter" }
 parsers = { path = "../parsers" }

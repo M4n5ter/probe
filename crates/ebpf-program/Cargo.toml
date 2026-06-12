@@ -1,0 +1,27 @@
+[package]
+name = "ebpf-program"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://example.invalid/sssa-probe"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.1"
+ebpf-abi = { version = "0.1.0", path = "../ebpf-abi" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"

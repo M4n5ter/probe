@@ -11,11 +11,7 @@ use probe_core::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use ebpf::{
-    AyaEbpfObjectProbe, EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport,
-    EbpfObjectProbeConfig, EbpfObjectProbeReport, EbpfObjectProgram, EbpfObjectProgramKind,
-    EbpfProbeCheck, UnprivilegedBpfStatus,
-};
+pub use ebpf::{EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport, UnprivilegedBpfStatus};
 pub use libpcap::{LibpcapConfig, LibpcapProvider};
 pub use plaintext::{
     PlaintextChunk, PlaintextConnection, PlaintextFeedEvent, PlaintextFeedProvider, PlaintextGap,

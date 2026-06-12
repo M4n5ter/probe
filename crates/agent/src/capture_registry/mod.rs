@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use capture::{
-    AyaEbpfObjectProbe, EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport,
-    EbpfObjectProbeConfig, LibpcapConfig, LibpcapProvider,
+    EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport, LibpcapConfig, LibpcapProvider,
 };
+use ebpf_object::{EbpfObjectProbe, EbpfObjectProbeConfig, EbpfObjectProbeReport};
 use probe_config::{AgentConfig, CaptureBackend};
 use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
 
@@ -64,12 +64,31 @@ fn ebpf_provider_descriptor(
         );
     };
 
-    let object = AyaEbpfObjectProbe::probe(&EbpfObjectProbeConfig::new(object_path.clone()));
+    let object = EbpfObjectProbe::probe(&EbpfObjectProbeConfig::new(object_path.clone()));
+    ebpf_provider_descriptor_from_object_report(object)
+}
+
+fn ebpf_provider_descriptor_from_object_report(
+    object: EbpfObjectProbeReport,
+) -> CaptureProviderDescriptor {
     if !object.object_available() {
         return CaptureProviderDescriptor::unavailable(
             CaptureBackend::Ebpf,
             CaptureProviderBuilder::Unimplemented,
-            format!("Aya object preflight failed: {}", object.summary()),
+            format!(
+                "eBPF object preflight via aya-obj failed: {}",
+                object.summary()
+            ),
+        );
+    }
+    if !object.preflight_available() {
+        return CaptureProviderDescriptor::unavailable(
+            CaptureBackend::Ebpf,
+            CaptureProviderBuilder::Unimplemented,
+            format!(
+                "eBPF object contract preflight via aya-obj failed: {}",
+                object.summary()
+            ),
         );
     }
 
@@ -77,7 +96,7 @@ fn ebpf_provider_descriptor(
         CaptureBackend::Ebpf,
         CaptureProviderBuilder::Unimplemented,
         format!(
-            "Aya object preflight succeeded ({}) but capture program attach and event reader are not implemented",
+            "eBPF object preflight via aya-obj succeeded ({}) but eBPF provider wiring, typed event conversion, and complete kernel capture program are not implemented",
             object.summary()
         ),
     )
@@ -104,7 +123,11 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use capture::{EbpfProbeCheck, UnprivilegedBpfStatus};
+    use capture::UnprivilegedBpfStatus;
+    use ebpf_object::{
+        EbpfObjectContractCheck, EbpfObjectContractReport, EbpfObjectMap, EbpfObjectProbeReport,
+        EbpfObjectProgram, EbpfProbeCheck,
+    };
     use probe_core::RuntimeMode;
 
     use super::*;
@@ -180,10 +203,37 @@ mod tests {
         let reason = descriptor
             .reason
             .expect("eBPF descriptor should explain why it is unavailable");
-        assert!(reason.contains("Aya object preflight failed"));
+        assert!(reason.contains("eBPF object preflight via aya-obj failed"));
         assert!(reason.contains("failed to parse eBPF object"));
         fs::remove_dir_all(temp)?;
         Ok(())
+    }
+
+    #[test]
+    fn ebpf_provider_descriptor_reports_contract_preflight_failure() {
+        let descriptor = ebpf_provider_descriptor_from_object_report(EbpfObjectProbeReport {
+            object_path: PathBuf::from("/tmp/sssa-invalid-contract.bpf.o"),
+            object: EbpfProbeCheck::Available,
+            contract: EbpfObjectContractReport {
+                status: EbpfProbeCheck::Available,
+                maps: vec![EbpfObjectContractCheck {
+                    name: "SSSA_EVENTS".to_string(),
+                    check: EbpfProbeCheck::unavailable("missing eBPF map SSSA_EVENTS"),
+                }],
+                programs: Vec::new(),
+            },
+            programs: Vec::<EbpfObjectProgram>::new(),
+            maps: Vec::<EbpfObjectMap>::new(),
+        });
+
+        assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
+        assert_eq!(descriptor.builder, CaptureProviderBuilder::Unimplemented);
+        assert_eq!(descriptor.mode, RuntimeMode::Unavailable);
+        let reason = descriptor
+            .reason
+            .expect("eBPF descriptor should explain why contract preflight failed");
+        assert!(reason.contains("eBPF object contract preflight via aya-obj failed"));
+        assert!(reason.contains("missing eBPF map SSSA_EVENTS"));
     }
 
     fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {

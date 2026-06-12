@@ -1,0 +1,20 @@
+[package]
+name = "ebpf-object"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aya-obj = "0.2"
+ebpf-abi = { version = "0.1.0", path = "../ebpf-abi" }
+object = { version = "0.39", default-features = false, features = ["elf", "read_core", "std"] }
+rustix = { version = "1.1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+object = { version = "0.39", default-features = false, features = ["elf", "read_core", "std", "write"] }
+tempfile = "3"
+
+[lints]
+workspace = true

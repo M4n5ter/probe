@@ -5,6 +5,8 @@ members = [
     "crates/capture",
     "crates/config",
     "crates/core",
+    "crates/ebpf-abi",
+    "crates/ebpf-object",
     "crates/enforcement",
     "crates/exporter",
     "crates/parsers",
@@ -15,6 +17,7 @@ members = [
     "crates/storage",
     "crates/xtask",
 ]
+exclude = ["crates/ebpf-program"]
 resolver = "3"
 
 [workspace.package]

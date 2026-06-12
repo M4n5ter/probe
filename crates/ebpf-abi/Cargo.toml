@@ -1,12 +1,11 @@
 [package]
-name = "xtask"
+name = "ebpf-abi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-ebpf-object = { version = "0.1.0", path = "../ebpf-object" }
 
 [lints]
 workspace = true
