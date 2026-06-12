@@ -8,6 +8,11 @@ use runtime::{
 };
 use serde::Serialize;
 
+use crate::export::{
+    ExportDrainFailureReason, ExportSinkWorkerRuntimeMode, ExportSinkWorkerRuntimeSnapshot,
+    ExportWorkerRuntimeSnapshot,
+};
+
 use super::super::{
     snapshot::SpoolStatusSnapshot,
     tls::{self, TlsMaterialSourceStatusSnapshot},
@@ -25,12 +30,22 @@ pub struct ExporterStatusSnapshot {
     pub codec: CompressionCodecName,
     pub worker: ExportWorkerPlan,
     pub sink_worker: ExportSinkWorkerPlan,
+    pub runtime: Option<ExporterRuntimeStatusSnapshot>,
     pub tls: ExporterTlsStatusSnapshot,
     pub mode: RuntimeMode,
     pub reason: Option<String>,
     pub cursor: Option<u64>,
     pub export_last_sequence: Option<u64>,
     pub lag: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExporterRuntimeStatusSnapshot {
+    pub mode: ExportSinkWorkerRuntimeMode,
+    pub consecutive_failures: u64,
+    pub backoff_delay_ms: Option<u64>,
+    pub backoff_remaining_ms: Option<u64>,
+    pub last_failure_reason: Option<ExportDrainFailureReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -45,10 +60,11 @@ pub(in crate::status) fn export_status(plan: &RuntimePlan) -> ExportStatusSnapsh
     }
 }
 
-pub(in crate::status) fn exporter_statuses(
+pub(in crate::status) fn exporter_statuses_with_runtime(
     plan: &RuntimePlan,
     spool: &SpoolStatusSnapshot,
     cursors: &BTreeMap<String, u64>,
+    runtime: Option<&ExportWorkerRuntimeSnapshot>,
 ) -> Vec<ExporterStatusSnapshot> {
     plan.export
         .sinks
@@ -77,6 +93,9 @@ pub(in crate::status) fn exporter_statuses(
                 codec: sink.codec,
                 worker: plan.export.worker.clone(),
                 sink_worker: sink.worker.clone(),
+                runtime: runtime
+                    .and_then(|runtime| runtime.sinks.get(&sink.id))
+                    .map(ExporterRuntimeStatusSnapshot::from),
                 tls,
                 mode,
                 reason,
@@ -86,6 +105,30 @@ pub(in crate::status) fn exporter_statuses(
             }
         })
         .collect()
+}
+
+pub(in crate::status) fn backing_off_exporter_count(exporters: &[ExporterStatusSnapshot]) -> u64 {
+    exporters
+        .iter()
+        .filter(|exporter| {
+            exporter
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.mode == ExportSinkWorkerRuntimeMode::BackingOff)
+        })
+        .count() as u64
+}
+
+impl From<&ExportSinkWorkerRuntimeSnapshot> for ExporterRuntimeStatusSnapshot {
+    fn from(value: &ExportSinkWorkerRuntimeSnapshot) -> Self {
+        Self {
+            mode: value.mode,
+            consecutive_failures: value.consecutive_failures,
+            backoff_delay_ms: value.backoff_delay_ms,
+            backoff_remaining_ms: value.backoff_remaining_ms,
+            last_failure_reason: value.last_failure_reason,
+        }
+    }
 }
 
 fn exporter_mode(
@@ -214,8 +257,12 @@ mod tests {
         let plan = runtime_plan_from_config(config, Vec::new())?;
         let spool = available_spool_status(0, 0);
 
-        let exporters =
-            exporter_statuses(&plan, &spool, &BTreeMap::from([("primary".to_string(), 0)]));
+        let exporters = exporter_statuses_with_runtime(
+            &plan,
+            &spool,
+            &BTreeMap::from([("primary".to_string(), 0)]),
+            None,
+        );
 
         assert_eq!(exporters[0].sink_worker.batches_per_tick_override, Some(2));
         assert_eq!(exporters[0].sink_worker.effective_batches_per_tick.get(), 2);
@@ -253,6 +300,51 @@ mod tests {
     }
 
     #[test]
+    fn exporter_status_reports_runtime_backoff_snapshot() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/sssa-spool")),
+            Vec::new(),
+        )?;
+        let spool = available_spool_status(0, 5);
+        let runtime = ExportWorkerRuntimeSnapshot {
+            sinks: BTreeMap::from([(
+                "primary".to_string(),
+                ExportSinkWorkerRuntimeSnapshot {
+                    mode: ExportSinkWorkerRuntimeMode::BackingOff,
+                    consecutive_failures: 2,
+                    backoff_delay_ms: Some(30_000),
+                    backoff_remaining_ms: Some(25_000),
+                    last_failure_reason: Some(ExportDrainFailureReason::RemoteRejectedBatch),
+                },
+            )]),
+        };
+
+        let exporters = exporter_statuses_with_runtime(
+            &plan,
+            &spool,
+            &BTreeMap::from([("primary".to_string(), 3)]),
+            Some(&runtime),
+        );
+
+        assert_eq!(backing_off_exporter_count(&exporters), 1);
+        let runtime = exporters[0]
+            .runtime
+            .as_ref()
+            .expect("online worker status should include sink runtime state");
+        assert_eq!(runtime.mode, ExportSinkWorkerRuntimeMode::BackingOff);
+        assert_eq!(runtime.consecutive_failures, 2);
+        assert_eq!(runtime.backoff_remaining_ms, Some(25_000));
+        let value = serde_json::to_value(&exporters)?;
+        assert_eq!(value[0]["runtime"]["mode"], json!("backing_off"));
+        assert_eq!(
+            value[0]["runtime"]["last_failure_reason"],
+            json!("remote_rejected_batch")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn cursor_beyond_high_water_marks_exporter_unavailable()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = runtime_plan_from_config(
@@ -261,10 +353,11 @@ mod tests {
         )?;
         let spool = available_spool_status(0, 5);
 
-        let exporters = exporter_statuses(
+        let exporters = exporter_statuses_with_runtime(
             &plan,
             &spool,
             &BTreeMap::from([("primary".to_string(), 10)]),
+            None,
         );
 
         assert_eq!(exporters[0].mode, RuntimeMode::Unavailable);
@@ -293,8 +386,12 @@ mod tests {
         let plan = runtime_plan_from_config(config, Vec::new())?;
         let spool = available_spool_status(0, 0);
 
-        let exporters =
-            exporter_statuses(&plan, &spool, &BTreeMap::from([("primary".to_string(), 0)]));
+        let exporters = exporter_statuses_with_runtime(
+            &plan,
+            &spool,
+            &BTreeMap::from([("primary".to_string(), 0)]),
+            None,
+        );
 
         assert_eq!(exporters[0].tls.mode, RuntimeMode::Unavailable);
         assert_eq!(exporters[0].mode, RuntimeMode::Unavailable);

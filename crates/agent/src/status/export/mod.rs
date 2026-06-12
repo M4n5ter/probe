@@ -1,5 +1,6 @@
 mod snapshot;
 
 pub(super) use snapshot::{
-    ExportStatusSnapshot, ExporterStatusSnapshot, export_status, exporter_statuses,
+    ExportStatusSnapshot, ExporterStatusSnapshot, backing_off_exporter_count, export_status,
+    exporter_statuses_with_runtime,
 };

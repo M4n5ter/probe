@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use probe_config::{ExporterTransport, TlsMaterialKind};
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::tls_material::TlsMaterialFileError;
@@ -30,4 +31,104 @@ pub enum ExportDrainError {
     },
     #[error("client TLS identity requires at least one client certificate and one private key")]
     IncompleteClientTlsIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportDrainFailureReason {
+    StorageError,
+    ProtoError,
+    CompressionError,
+    HttpTransportError,
+    InvalidExporterHeader,
+    ReservedExporterHeader,
+    EmptyTlsTrustAnchorBundle,
+    RemoteRejectedBatch,
+    InvalidExportAck,
+    UnsupportedTransport,
+    MultipleSinksFailed,
+    UnsupportedPayloadSchema,
+    SinkTimedOut,
+    TlsMaterialUnavailable,
+    IncompleteClientTlsIdentity,
+}
+
+impl ExportDrainError {
+    pub(crate) fn runtime_failure_reason(&self) -> ExportDrainFailureReason {
+        match self {
+            Self::Storage(_) => ExportDrainFailureReason::StorageError,
+            Self::Proto(_) => ExportDrainFailureReason::ProtoError,
+            Self::Export(error) => export_error_failure_reason(error),
+            Self::UnsupportedTransport { .. } => ExportDrainFailureReason::UnsupportedTransport,
+            Self::MultipleSinksFailed { .. } => ExportDrainFailureReason::MultipleSinksFailed,
+            Self::UnsupportedSpoolPayloadSchema { .. } => {
+                ExportDrainFailureReason::UnsupportedPayloadSchema
+            }
+            Self::SinkTimedOut { .. } => ExportDrainFailureReason::SinkTimedOut,
+            Self::TlsMaterial { .. } => ExportDrainFailureReason::TlsMaterialUnavailable,
+            Self::IncompleteClientTlsIdentity => {
+                ExportDrainFailureReason::IncompleteClientTlsIdentity
+            }
+        }
+    }
+}
+
+fn export_error_failure_reason(error: &exporter::ExportError) -> ExportDrainFailureReason {
+    match error {
+        exporter::ExportError::Compression(_) | exporter::ExportError::Zstd(_) => {
+            ExportDrainFailureReason::CompressionError
+        }
+        exporter::ExportError::Http(_) => ExportDrainFailureReason::HttpTransportError,
+        exporter::ExportError::InvalidHeaderName { .. }
+        | exporter::ExportError::InvalidHeaderValue { .. } => {
+            ExportDrainFailureReason::InvalidExporterHeader
+        }
+        exporter::ExportError::ReservedHeaderName { .. } => {
+            ExportDrainFailureReason::ReservedExporterHeader
+        }
+        exporter::ExportError::EmptyTrustAnchorBundle => {
+            ExportDrainFailureReason::EmptyTlsTrustAnchorBundle
+        }
+        exporter::ExportError::Rejected { .. } => ExportDrainFailureReason::RemoteRejectedBatch,
+        exporter::ExportError::AckBatchMismatch { .. }
+        | exporter::ExportError::AckUnknownEvent { .. }
+        | exporter::ExportError::AckCursorOutOfRange { .. }
+        | exporter::ExportError::AckRetryableBeforeCursor { .. }
+        | exporter::ExportError::AckConflictingEventState { .. } => {
+            ExportDrainFailureReason::InvalidExportAck
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_failure_reason_redacts_error_details() {
+        let error = ExportDrainError::TlsMaterial {
+            id: "client-key".to_string(),
+            kind: TlsMaterialKind::ClientPrivateKey,
+            path: PathBuf::from("/secret/client.key"),
+            source: TlsMaterialFileError::NotRegular,
+        };
+
+        assert_eq!(
+            error.runtime_failure_reason(),
+            ExportDrainFailureReason::TlsMaterialUnavailable
+        );
+    }
+
+    #[test]
+    fn runtime_failure_reason_groups_export_ack_errors() {
+        let error = ExportDrainError::Export(exporter::ExportError::AckUnknownEvent {
+            batch_id: "batch-1".to_string(),
+            event_id: "event-1".to_string(),
+        });
+
+        assert_eq!(
+            error.runtime_failure_reason(),
+            ExportDrainFailureReason::InvalidExportAck
+        );
+    }
 }

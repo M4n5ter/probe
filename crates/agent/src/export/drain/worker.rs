@@ -1,18 +1,21 @@
 use std::{
-    collections::HashMap,
-    sync::Arc,
-    sync::atomic::{AtomicBool, Ordering},
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use runtime::{
     ExportFailureBackoffPlan, ExportPlan, ExportRetentionPlan, ExportSinkPlan, ExportWorkerPlan,
 };
+use serde::Serialize;
 use storage::ExportSpool;
 use tokio::sync::Notify;
 
 use super::{
-    ExportDrainError,
+    ExportDrainError, ExportDrainFailureReason,
     cleanup::prune_export_queue_for_sinks,
     mode::SinkDrainMode,
     target::{drain_export_sink_with_mode, finish_export_sink_drain},
@@ -26,6 +29,11 @@ pub struct ExportWorkerHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
+pub struct ExportWorker {
+    config: ExportWorkerConfig,
+    runtime_state: ExportWorkerRuntimeState,
+}
+
 pub struct ExportWorkerConfig {
     agent_id: String,
     sinks: Vec<ExportSinkPlan>,
@@ -33,6 +41,70 @@ pub struct ExportWorkerConfig {
     interval: Duration,
     sink_timeout: Duration,
     failure_backoff: ExportWorkerBackoffPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportWorkerRuntimeState {
+    inner: Arc<Mutex<ExportWorkerRuntimeInner>>,
+}
+
+#[derive(Debug)]
+struct ExportWorkerRuntimeInner {
+    failure_backoff: ExportWorkerBackoffPolicy,
+    sinks: BTreeMap<String, ExportSinkWorkerRuntime>,
+}
+
+#[derive(Debug)]
+enum ExportSinkWorkerRuntime {
+    Idle,
+    BackingOff {
+        failures: u64,
+        delay: Duration,
+        retry_after: Option<Instant>,
+        last_failure_reason: ExportDrainFailureReason,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExportWorkerRuntimeSnapshot {
+    pub sinks: BTreeMap<String, ExportSinkWorkerRuntimeSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExportSinkWorkerRuntimeSnapshot {
+    pub mode: ExportSinkWorkerRuntimeMode,
+    pub consecutive_failures: u64,
+    pub backoff_delay_ms: Option<u64>,
+    pub backoff_remaining_ms: Option<u64>,
+    pub last_failure_reason: Option<ExportDrainFailureReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportSinkWorkerRuntimeMode {
+    Idle,
+    BackingOff,
+}
+
+impl ExportWorker {
+    pub fn new(config: ExportWorkerConfig) -> Self {
+        let runtime_state = ExportWorkerRuntimeState::from_config(&config);
+        Self {
+            config,
+            runtime_state,
+        }
+    }
+
+    pub fn runtime_state(&self) -> ExportWorkerRuntimeState {
+        self.runtime_state.clone()
+    }
+
+    pub fn spawn<S>(self, spool: Arc<S>) -> ExportWorkerHandle
+    where
+        S: ExportSpool + Send + Sync + 'static,
+    {
+        spawn_export_worker_with_state(spool, self.config, self.runtime_state)
+    }
 }
 
 impl ExportWorkerConfig {
@@ -74,6 +146,118 @@ impl ExportWorkerConfig {
     }
 }
 
+impl ExportWorkerRuntimeState {
+    fn from_config(config: &ExportWorkerConfig) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ExportWorkerRuntimeInner {
+                failure_backoff: config.failure_backoff,
+                sinks: config
+                    .sinks
+                    .iter()
+                    .map(|sink| (sink.id.clone(), ExportSinkWorkerRuntime::Idle))
+                    .collect(),
+            })),
+        }
+    }
+
+    fn should_skip(&self, sink: &str, now: Instant) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match inner.sinks.get(sink) {
+            Some(ExportSinkWorkerRuntime::BackingOff {
+                retry_after: None, ..
+            }) => true,
+            Some(ExportSinkWorkerRuntime::BackingOff {
+                retry_after: Some(retry_after),
+                ..
+            }) => *retry_after > now,
+            Some(ExportSinkWorkerRuntime::Idle) | None => false,
+        }
+    }
+
+    pub fn snapshot(&self) -> ExportWorkerRuntimeSnapshot {
+        let now = Instant::now();
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ExportWorkerRuntimeSnapshot {
+            sinks: inner
+                .sinks
+                .iter()
+                .map(|(sink, state)| (sink.clone(), state.snapshot(now)))
+                .collect(),
+        }
+    }
+
+    fn record_success(&self, sink: &str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .sinks
+            .insert(sink.to_string(), ExportSinkWorkerRuntime::Idle);
+    }
+
+    fn record_failure(&self, sink: &str, reason: ExportDrainFailureReason) {
+        self.record_failure_at(sink, Instant::now(), reason);
+    }
+
+    fn record_failure_at(&self, sink: &str, failed_at: Instant, reason: ExportDrainFailureReason) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let policy = inner.failure_backoff;
+        let current = inner
+            .sinks
+            .entry(sink.to_string())
+            .or_insert(ExportSinkWorkerRuntime::Idle);
+        let (delay, failures) = match current {
+            ExportSinkWorkerRuntime::Idle => (policy.initial, 1),
+            ExportSinkWorkerRuntime::BackingOff {
+                delay, failures, ..
+            } => (policy.next_delay(*delay), failures.saturating_add(1)),
+        };
+        *current = ExportSinkWorkerRuntime::BackingOff {
+            failures,
+            delay,
+            retry_after: failed_at.checked_add(delay),
+            last_failure_reason: reason,
+        };
+    }
+}
+
+impl ExportSinkWorkerRuntime {
+    fn snapshot(&self, now: Instant) -> ExportSinkWorkerRuntimeSnapshot {
+        match self {
+            Self::Idle => ExportSinkWorkerRuntimeSnapshot {
+                mode: ExportSinkWorkerRuntimeMode::Idle,
+                consecutive_failures: 0,
+                backoff_delay_ms: None,
+                backoff_remaining_ms: None,
+                last_failure_reason: None,
+            },
+            Self::BackingOff {
+                failures,
+                delay,
+                retry_after,
+                last_failure_reason,
+            } => ExportSinkWorkerRuntimeSnapshot {
+                mode: ExportSinkWorkerRuntimeMode::BackingOff,
+                consecutive_failures: *failures,
+                backoff_delay_ms: Some(duration_millis(*delay)),
+                backoff_remaining_ms: retry_after
+                    .map(|retry_after| duration_millis(retry_after.saturating_duration_since(now))),
+                last_failure_reason: Some(*last_failure_reason),
+            },
+        }
+    }
+}
+
 impl ExportWorkerHandle {
     pub async fn stop(mut self) {
         self.stop_requested.store(true, Ordering::Relaxed);
@@ -96,7 +280,11 @@ impl ExportWorkerHandle {
     }
 }
 
-pub fn spawn_export_worker<S>(spool: Arc<S>, config: ExportWorkerConfig) -> ExportWorkerHandle
+fn spawn_export_worker_with_state<S>(
+    spool: Arc<S>,
+    config: ExportWorkerConfig,
+    runtime_state: ExportWorkerRuntimeState,
+) -> ExportWorkerHandle
 where
     S: ExportSpool + Send + Sync + 'static,
 {
@@ -104,10 +292,11 @@ where
     let stop_notify = Arc::new(Notify::new());
     let task_stop_requested = Arc::clone(&stop_requested);
     let task_stop_notify = Arc::clone(&stop_notify);
+    let task_runtime_state = runtime_state.clone();
     let task = tokio::spawn(async move {
-        let mut backoff = ExportWorkerBackoff::new(config.failure_backoff);
         while !task_stop_requested.load(Ordering::Relaxed) {
-            if let Err(error) = drain_export_sinks_once(spool.as_ref(), &config, &mut backoff).await
+            if let Err(error) =
+                drain_export_sinks_once(spool.as_ref(), &config, &task_runtime_state).await
             {
                 eprintln!("export worker drain failed: {error}");
             }
@@ -130,12 +319,12 @@ where
 async fn drain_export_sinks_once(
     spool: &impl ExportSpool,
     config: &ExportWorkerConfig,
-    backoff: &mut ExportWorkerBackoff,
+    runtime_state: &ExportWorkerRuntimeState,
 ) -> Result<(), ExportDrainError> {
     let mut failures = Vec::new();
     for sink in &config.sinks {
         let now = Instant::now();
-        if backoff.should_skip(&sink.id, now) {
+        if runtime_state.should_skip(&sink.id, now) {
             continue;
         }
         let mode = SinkDrainMode::MaxBatches {
@@ -144,10 +333,12 @@ async fn drain_export_sinks_once(
         };
         let result = drain_export_sink_with_mode(spool, &config.agent_id, sink, mode).await;
         match result {
-            Ok(()) => backoff.record_success(&sink.id),
+            Ok(()) => {
+                runtime_state.record_success(&sink.id);
+            }
             Err(error) => {
                 eprintln!("exporter sink {} failed: {error}", sink.id);
-                backoff.record_failure(&sink.id);
+                runtime_state.record_failure(&sink.id, error.runtime_failure_reason());
                 failures.push(format!("{}: {error}", sink.id));
             }
         }
@@ -163,55 +354,6 @@ async fn drain_export_sinks_once(
         drain_result,
         prune_export_queue_for_sinks(spool, &config.sinks, &config.retention),
     )
-}
-
-#[derive(Debug)]
-struct ExportWorkerBackoff {
-    policy: ExportWorkerBackoffPolicy,
-    sinks: HashMap<String, SinkBackoffState>,
-}
-
-impl ExportWorkerBackoff {
-    fn new(policy: ExportWorkerBackoffPolicy) -> Self {
-        Self {
-            policy,
-            sinks: HashMap::new(),
-        }
-    }
-
-    fn should_skip(&self, sink: &str, now: Instant) -> bool {
-        match self.sinks.get(sink) {
-            Some(SinkBackoffState {
-                retry_after: None, ..
-            }) => true,
-            Some(SinkBackoffState {
-                retry_after: Some(retry_after),
-                ..
-            }) => *retry_after > now,
-            None => false,
-        }
-    }
-
-    fn record_failure(&mut self, sink: &str) {
-        self.record_failure_at(sink, Instant::now());
-    }
-
-    fn record_failure_at(&mut self, sink: &str, failed_at: Instant) {
-        let delay = self.sinks.get(sink).map_or(self.policy.initial, |state| {
-            self.policy.next_delay(state.delay)
-        });
-        self.sinks.insert(
-            sink.to_string(),
-            SinkBackoffState {
-                delay,
-                retry_after: failed_at.checked_add(delay),
-            },
-        );
-    }
-
-    fn record_success(&mut self, sink: &str) {
-        self.sinks.remove(sink);
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -240,10 +382,8 @@ impl From<ExportFailureBackoffPlan> for ExportWorkerBackoffPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SinkBackoffState {
-    delay: Duration,
-    retry_after: Option<Instant>,
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -280,42 +420,66 @@ mod tests {
     fn export_worker_backoff_counts_from_failure_completion() {
         let tick_started_at = Instant::now();
         let failure_completed_at = tick_started_at + Duration::from_millis(750);
-        let mut backoff = worker_backoff_from_plan(fixed_failure_backoff(1_000));
+        let runtime_state = worker_runtime_from_plan(fixed_failure_backoff(1_000));
 
-        backoff.record_failure_at("slow", failure_completed_at);
+        runtime_state.record_failure_at(
+            "slow",
+            failure_completed_at,
+            ExportDrainFailureReason::HttpTransportError,
+        );
 
-        assert!(backoff.should_skip("slow", failure_completed_at + Duration::from_millis(999)));
-        assert!(!backoff.should_skip("slow", failure_completed_at + Duration::from_millis(1_000)));
+        assert!(
+            runtime_state.should_skip("slow", failure_completed_at + Duration::from_millis(999))
+        );
+        assert!(
+            !runtime_state.should_skip("slow", failure_completed_at + Duration::from_millis(1_000))
+        );
     }
 
     #[test]
     fn export_worker_backoff_grows_until_max_and_resets_after_success() {
         let started_at = Instant::now();
-        let mut backoff = worker_backoff_from_plan(ExportFailureBackoffPlan {
+        let runtime_state = worker_runtime_from_plan(ExportFailureBackoffPlan {
             initial_ms: 100,
             max_ms: 250,
             multiplier: 2,
         });
 
-        backoff.record_failure_at("sink", started_at);
-        assert!(backoff.should_skip("sink", started_at + Duration::from_millis(99)));
-        assert!(!backoff.should_skip("sink", started_at + Duration::from_millis(100)));
+        runtime_state.record_failure_at(
+            "sink",
+            started_at,
+            ExportDrainFailureReason::HttpTransportError,
+        );
+        assert!(runtime_state.should_skip("sink", started_at + Duration::from_millis(99)));
+        assert!(!runtime_state.should_skip("sink", started_at + Duration::from_millis(100)));
 
         let second_failure = started_at + Duration::from_millis(100);
-        backoff.record_failure_at("sink", second_failure);
-        assert!(backoff.should_skip("sink", second_failure + Duration::from_millis(199)));
-        assert!(!backoff.should_skip("sink", second_failure + Duration::from_millis(200)));
+        runtime_state.record_failure_at(
+            "sink",
+            second_failure,
+            ExportDrainFailureReason::HttpTransportError,
+        );
+        assert!(runtime_state.should_skip("sink", second_failure + Duration::from_millis(199)));
+        assert!(!runtime_state.should_skip("sink", second_failure + Duration::from_millis(200)));
 
         let third_failure = second_failure + Duration::from_millis(200);
-        backoff.record_failure_at("sink", third_failure);
-        assert!(backoff.should_skip("sink", third_failure + Duration::from_millis(249)));
-        assert!(!backoff.should_skip("sink", third_failure + Duration::from_millis(250)));
+        runtime_state.record_failure_at(
+            "sink",
+            third_failure,
+            ExportDrainFailureReason::HttpTransportError,
+        );
+        assert!(runtime_state.should_skip("sink", third_failure + Duration::from_millis(249)));
+        assert!(!runtime_state.should_skip("sink", third_failure + Duration::from_millis(250)));
 
-        backoff.record_success("sink");
+        runtime_state.record_success("sink");
         let reset_failure = third_failure + Duration::from_millis(250);
-        backoff.record_failure_at("sink", reset_failure);
-        assert!(backoff.should_skip("sink", reset_failure + Duration::from_millis(99)));
-        assert!(!backoff.should_skip("sink", reset_failure + Duration::from_millis(100)));
+        runtime_state.record_failure_at(
+            "sink",
+            reset_failure,
+            ExportDrainFailureReason::HttpTransportError,
+        );
+        assert!(runtime_state.should_skip("sink", reset_failure + Duration::from_millis(99)));
+        assert!(!runtime_state.should_skip("sink", reset_failure + Duration::from_millis(100)));
     }
 
     #[test]
@@ -406,7 +570,7 @@ mod tests {
             ExportWorkerConfig::from_export_plan(plan.config.agent_id.clone(), &plan.export)
                 .expect("worker should be enabled for planned webhook sink");
 
-        let worker = spawn_export_worker(Arc::clone(&spool), config);
+        let (worker, _) = spawn_test_export_worker(Arc::clone(&spool), config);
         wait_for_export_cursor(spool.as_ref(), "worker", 1).await?;
         append_export_event(spool.as_ref(), 2)?;
         wait_for_export_cursor(spool.as_ref(), "worker", 2).await?;
@@ -460,7 +624,7 @@ mod tests {
         let config = ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
             .expect("worker should be enabled");
 
-        let worker = spawn_export_worker(Arc::clone(&spool), config);
+        let (worker, _) = spawn_test_export_worker(Arc::clone(&spool), config);
         wait_for_export_cursor(spool.as_ref(), "budget", event_count).await?;
         worker.stop().await;
 
@@ -505,7 +669,7 @@ mod tests {
         let config = ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
             .expect("worker should be enabled");
 
-        let worker = spawn_export_worker(Arc::clone(&spool), config);
+        let (worker, _) = spawn_test_export_worker(Arc::clone(&spool), config);
         wait_for_export_cursor(spool.as_ref(), "limited", EXPORT_BATCH_LIMIT as u64).await?;
         worker.stop().await;
 
@@ -561,8 +725,9 @@ mod tests {
         let config = ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
             .expect("worker should be enabled");
 
-        let worker = spawn_export_worker(Arc::clone(&spool), config);
+        let (worker, runtime_state) = spawn_test_export_worker(Arc::clone(&spool), config);
         wait_for_export_cursor(spool.as_ref(), "successful", event_count).await?;
+        let runtime_snapshot = runtime_state.snapshot();
         worker.stop().await;
 
         let successful_requests = successful.join_requests()?;
@@ -577,6 +742,32 @@ mod tests {
         );
         let failing_requests = failing.join_requests()?;
         assert_eq!(failing_requests.len(), 1);
+        let failing_runtime = runtime_snapshot
+            .sinks
+            .get("failing")
+            .expect("failing sink should have runtime state");
+        assert_eq!(
+            failing_runtime.mode,
+            ExportSinkWorkerRuntimeMode::BackingOff
+        );
+        assert_eq!(failing_runtime.consecutive_failures, 1);
+        assert_eq!(failing_runtime.backoff_delay_ms, Some(60_000));
+        assert!(
+            failing_runtime
+                .backoff_remaining_ms
+                .is_some_and(|remaining| remaining <= 60_000)
+        );
+        assert_eq!(
+            failing_runtime.last_failure_reason,
+            Some(ExportDrainFailureReason::RemoteRejectedBatch)
+        );
+        let successful_runtime = runtime_snapshot
+            .sinks
+            .get("successful")
+            .expect("successful sink should have runtime state");
+        assert_eq!(successful_runtime.mode, ExportSinkWorkerRuntimeMode::Idle);
+        assert_eq!(successful_runtime.consecutive_failures, 0);
+        assert_eq!(successful_runtime.last_failure_reason, None);
         assert_eq!(
             request_header(&failing_requests[0], "idempotency-key"),
             Some(batch_id("agent-1", "failing", EXPORT_BATCH_LIMIT as u64))
@@ -669,7 +860,17 @@ mod tests {
         ]
     }
 
-    fn worker_backoff_from_plan(failure_backoff: ExportFailureBackoffPlan) -> ExportWorkerBackoff {
+    fn worker_runtime_from_plan(
+        failure_backoff: ExportFailureBackoffPlan,
+    ) -> ExportWorkerRuntimeState {
+        let config = export_worker_config_with_failure_backoff("sink", failure_backoff);
+        ExportWorkerRuntimeState::from_config(&config)
+    }
+
+    fn export_worker_config_with_failure_backoff(
+        sink: &str,
+        failure_backoff: ExportFailureBackoffPlan,
+    ) -> ExportWorkerConfig {
         let plan = ExportPlan {
             worker: ExportWorkerPlan::FixedIntervalBounded {
                 interval_ms: 1_000,
@@ -679,7 +880,7 @@ mod tests {
             },
             retention: ExportRetentionPlan::default(),
             sinks: vec![ExportSinkPlan {
-                id: "sink".to_string(),
+                id: sink.to_string(),
                 transport: ExporterTransport::Webhook,
                 endpoint: "https://collector.example/batches".to_string(),
                 codec: CompressionCodecName::None,
@@ -688,8 +889,16 @@ mod tests {
                 worker: inherited_worker_quota(1),
             }],
         };
-        let config = ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
-            .expect("fixed interval worker plan should produce worker config");
-        ExportWorkerBackoff::new(config.failure_backoff)
+        ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
+            .expect("fixed interval worker plan should produce worker config")
+    }
+
+    fn spawn_test_export_worker(
+        spool: Arc<FjallSpool>,
+        config: ExportWorkerConfig,
+    ) -> (ExportWorkerHandle, ExportWorkerRuntimeState) {
+        let worker = ExportWorker::new(config);
+        let runtime_state = worker.runtime_state();
+        (worker.spawn(spool), runtime_state)
     }
 }

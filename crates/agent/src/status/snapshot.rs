@@ -11,12 +11,16 @@ use serde::Serialize;
 use storage::{FjallSpool, SpoolProbe, SpoolSnapshot};
 
 use crate::configured_enforcement::LoadedEnforcementPolicySource;
+use crate::export::ExportWorkerRuntimeSnapshot;
 
 use super::{
     enforcement::{
         EnforcementStatusSnapshot, enforcement_status, enforcement_status_with_loaded_source,
     },
-    export::{ExportStatusSnapshot, ExporterStatusSnapshot, export_status, exporter_statuses},
+    export::{
+        ExportStatusSnapshot, ExporterStatusSnapshot, backing_off_exporter_count, export_status,
+        exporter_statuses_with_runtime,
+    },
     health::health_snapshot,
     policy::{PolicyStatusSnapshot, policy_status},
     tls::{TlsStatusSnapshot, tls_status},
@@ -86,11 +90,13 @@ pub struct SpoolMetricsSnapshot {
 pub struct ExportMetricsSnapshot {
     pub sink_count: u64,
     pub total_lag: Option<u64>,
+    pub backing_off_sink_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeStatusInput {
     pub enforcement_policy_source: Option<LoadedEnforcementPolicySource>,
+    pub export_worker: Option<ExportWorkerRuntimeSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,8 +255,18 @@ fn build_status_snapshot_at_with_runtime(
     };
     let tls = tls_status(plan);
     let export = export_status(plan);
-    let exporters = exporter_statuses(plan, &spool_status, &spool.export_cursors);
-    let metrics = metrics_snapshot(&plan.capabilities, &spool_status, &exporters);
+    let exporters = exporter_statuses_with_runtime(
+        plan,
+        &spool_status,
+        &spool.export_cursors,
+        runtime.export_worker.as_ref(),
+    );
+    let metrics = metrics_snapshot(
+        &plan.capabilities,
+        &spool_status,
+        &exporters,
+        runtime.export_worker.as_ref(),
+    );
     let health = health_snapshot(plan, &spool_status, &exporters, &policy, &enforcement);
 
     AgentStatusSnapshot {
@@ -279,6 +295,7 @@ fn metrics_snapshot(
     capabilities: &CapabilityMatrix,
     spool: &SpoolStatusSnapshot,
     exporters: &[ExporterStatusSnapshot],
+    export_worker: Option<&ExportWorkerRuntimeSnapshot>,
 ) -> MetricsSnapshot {
     MetricsSnapshot {
         capabilities: capability_metrics(capabilities),
@@ -289,6 +306,7 @@ fn metrics_snapshot(
         export: ExportMetricsSnapshot {
             sink_count: exporters.len() as u64,
             total_lag: total_export_lag(exporters),
+            backing_off_sink_count: export_worker.map(|_| backing_off_exporter_count(exporters)),
         },
     }
 }
@@ -385,6 +403,7 @@ mod tests {
         assert!(snapshot.policy.active.is_none());
         assert!(snapshot.tls.materials.is_empty());
         let value = serde_json::to_value(&snapshot)?;
+        assert_eq!(snapshot.metrics.export.backing_off_sink_count, None);
         assert_eq!(value["policy"]["mode"], json!("inactive"));
         assert_eq!(value["enforcement"]["status"], json!("audit_only"));
         assert_eq!(
@@ -400,6 +419,60 @@ mod tests {
             json!("not_required")
         );
         assert_eq!(snapshot.metrics.export.total_lag, Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn status_snapshot_reports_export_worker_runtime_metrics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_with_exporter()?;
+        let spool = SpoolStatusInput::available(
+            PathBuf::from("/tmp/sssa-spool"),
+            SpoolSnapshot {
+                last_ingress_sequence: 0,
+                last_export_sequence: 5,
+            },
+            BTreeMap::from([("primary".to_string(), 3)]),
+        );
+        let runtime = RuntimeStatusInput {
+            export_worker: Some(ExportWorkerRuntimeSnapshot {
+                sinks: BTreeMap::from([(
+                    "primary".to_string(),
+                    crate::export::ExportSinkWorkerRuntimeSnapshot {
+                        mode: crate::export::ExportSinkWorkerRuntimeMode::BackingOff,
+                        consecutive_failures: 1,
+                        backoff_delay_ms: Some(30_000),
+                        backoff_remaining_ms: Some(20_000),
+                        last_failure_reason: Some(
+                            crate::export::ExportDrainFailureReason::RemoteRejectedBatch,
+                        ),
+                    },
+                )]),
+            }),
+            ..RuntimeStatusInput::default()
+        };
+
+        let snapshot = build_status_snapshot_at_with_runtime(&plan, spool, 42, runtime);
+
+        assert_eq!(snapshot.metrics.export.total_lag, Some(2));
+        assert_eq!(snapshot.metrics.export.backing_off_sink_count, Some(1));
+        assert_eq!(
+            snapshot.exporters[0]
+                .runtime
+                .as_ref()
+                .expect("online worker runtime should be reported")
+                .mode,
+            crate::export::ExportSinkWorkerRuntimeMode::BackingOff
+        );
+        let value = serde_json::to_value(&snapshot)?;
+        assert_eq!(
+            value["metrics"]["export"]["backing_off_sink_count"],
+            json!(1)
+        );
+        assert_eq!(
+            value["exporters"][0]["runtime"]["mode"],
+            json!("backing_off")
+        );
         Ok(())
     }
 

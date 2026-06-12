@@ -28,8 +28,8 @@ use crate::{
     configured_policy::{LoadedPolicySource, load_configured_policy, load_policy_source},
     error::AgentError,
     export::{
-        ExportRetentionWorkerConfig, ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook,
-        spawn_export_retention_worker, spawn_export_worker,
+        ExportRetentionWorkerConfig, ExportWorker, ExportWorkerConfig, drain_planned_sinks,
+        drain_replay_webhook, spawn_export_retention_worker,
     },
     status::{build_status_snapshot, collect_spool_status},
 };
@@ -160,8 +160,10 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let policy = load_configured_policy(&plan.config)?;
             let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
             let mut parser_factory = Http1ParserFactory::default();
+            let export_worker = export_worker_config_from_plan(&plan).map(ExportWorker::new);
             let admin_runtime_state = AdminRuntimeState {
                 enforcement_policy_source: enforcement.policy_source.clone(),
+                export_worker: export_worker.as_ref().map(ExportWorker::runtime_state),
             };
             let admin_server = admin_server_config_from_plan(&plan)
                 .map(|config| {
@@ -173,8 +175,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                     )
                 })
                 .transpose()?;
-            let export_worker = export_worker_config_from_plan(&plan)
-                .map(|config| spawn_export_worker(Arc::clone(&spool), config));
+            let export_worker = export_worker.map(|worker| worker.spawn(Arc::clone(&spool)));
             let export_retention_worker = export_retention_worker_config_from_plan(&plan)
                 .map(|config| spawn_export_retention_worker(Arc::clone(&spool), config));
             let mut pipeline = CapturePipeline::new(

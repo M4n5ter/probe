@@ -24,6 +24,7 @@ use tokio::{
 };
 
 use crate::configured_enforcement::LoadedEnforcementPolicySource;
+use crate::export::ExportWorkerRuntimeState;
 use crate::status::{
     AgentStatusSnapshot, MetricsSnapshot, RuntimeStatusInput, build_status_snapshot_with_runtime,
     collect_running_spool_status,
@@ -64,9 +65,10 @@ pub struct AdminServerConfig {
     pub socket_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct AdminRuntimeState {
     pub enforcement_policy_source: Option<LoadedEnforcementPolicySource>,
+    pub export_worker: Option<ExportWorkerRuntimeState>,
 }
 
 pub struct AdminServerHandle {
@@ -389,6 +391,10 @@ fn handle_admin_request(
         collect_running_spool_status(plan, spool),
         RuntimeStatusInput {
             enforcement_policy_source: runtime_state.enforcement_policy_source.clone(),
+            export_worker: runtime_state
+                .export_worker
+                .as_ref()
+                .map(ExportWorkerRuntimeState::snapshot),
         },
     );
     match request {
@@ -545,6 +551,7 @@ mod tests {
                 manifest_path.clone(),
                 manifest,
             )),
+            ..AdminRuntimeState::default()
         };
         fs::remove_file(&manifest_path)?;
         let server = spawn_admin_server(

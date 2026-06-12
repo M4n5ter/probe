@@ -113,7 +113,7 @@ flowchart LR
 | `lua_jit` | Degraded | LuaJIT policy runtime 已接入 replay/live pipeline，支持 typed alert/verdict。 | hot reload 和多个 active bundle 未实现。 |
 | `durable_spool` / `ingress_journal` | Degraded | Fjall ingress journal/export queue 可持久化并恢复 bytes、gap、connection opened/closed capture events。 | 恢复是 at-least-once，按当前 config/policy 重新解释旧 ingress；durable parser checkpoint 与 processing provenance 还不完整。 |
 | `export_queue` | Available | export lane、per-sink cursor、schema-aware payload、protobuf batch envelope、record-level `stored_at_unix_ns`，以及按 planned sinks cursor 下界执行的 acked-prefix cleanup 和按 retention deadline 退休过期连续前缀已存在。 | retention 只处理 export queue；ingress journal retention、容量型 retention 和 parser checkpoint 仍未完成。 |
-| `webhook_exporter` | Available | `run` 可连续 drain planned sinks，支持固定间隔、全局/每 sink batch 预算、single sink timeout、per-sink exponential backoff、cursor-safe export queue cleanup、retention deadline、trust anchors 和 client identity refs。 | 在线 backoff 运行态还未进入 status；gRPC/Kafka/OTLP 仍是保留 transport。 |
+| `webhook_exporter` | Available | `run` 可连续 drain planned sinks，支持固定间隔、全局/每 sink batch 预算、single sink timeout、per-sink exponential backoff、cursor-safe export queue cleanup、retention deadline、trust anchors、client identity refs、在线 admin status 中的 per-sink backoff runtime snapshot，以及 metrics 中的 backing-off sink aggregate count。 | gRPC/Kafka/OTLP 仍是保留 transport。 |
 | `dry_run_enforcement` | Available | dry-run enforcement 会记录策略保护意图、requested/effective action 和 audit event。 | 不执行真实连接阻断。 |
 | `connection_enforcement` | Unavailable | `EnforcementBackend` trait、planner delegation boundary 和 `RuntimePlan.enforcement.capability` 已存在。 | 默认 registry 没有可执行阻断 backend；`enforcement.mode = "enforce"` 必须 fail closed。 |
 
@@ -915,7 +915,7 @@ spool retention：
 多 exporter：
 
 - 每个可靠 sink 维护独立 cursor/ack。
-- 当前已实现 per-sink cursor、per-sink batch quota、acked-prefix cleanup、retention deadline 和内存态 exponential backoff，避免某个慢或失败 sink 阻塞其它 sink；未来在线 backoff 状态进入 status 后，再把 failed/degraded 语义扩展到这些运行态。
+- 当前已实现 per-sink cursor、per-sink batch quota、acked-prefix cleanup、retention deadline 和内存态 exponential backoff，避免某个慢或失败 sink 阻塞其它 sink；在线 admin status 会从 exporter worker 的共享 runtime state 读取每个 sink 的 `idle`/`backing_off`、连续失败次数、backoff delay、剩余 backoff 和 typed failure reason。failure reason 不暴露 raw exporter error、URL 或 TLS material path；offline CLI status 不能观测 worker 内存态，因此不伪装 backoff 状态。
 - 不让单个坏 sink 拖垮采集和其它 exporter。
 
 投递语义：
@@ -1034,7 +1034,7 @@ endpoint 配置或能力不匹配时 fail fast。当前实现使用 `Compression
 
 当前实现状态：
 
-- 已实现 CLI `status --config <path>`，输出可复用的 JSON snapshot：health、capture status、policy status、enforcement status、TLS plaintext/material status、capability matrix、offline spool high-water、planned exporter sink cursor/lag 和 metrics counters。`health` 表示当前 active capture/spool/exporter 状态，并纳入 policy/enforcement policy 的已知阻断、source unavailable 或 metadata-only 未验证状态；无效 enforcement 配置在 snapshot 前由 `RuntimePlan` fail closed。capability matrix 和 capability metrics 保持独立，避免把路线图缺口伪装成当前运行故障。
+- 已实现 CLI `status --config <path>`，输出可复用的 JSON snapshot：health、capture status、policy status、enforcement status、TLS plaintext/material status、capability matrix、offline spool high-water、planned exporter sink cursor/lag 和 metrics counters。在线 admin status 复用同一 snapshot builder，并额外注入运行中 exporter worker 的 per-sink backoff runtime snapshot；offline CLI status 不声称知道 worker 内存态。`health` 表示当前 active capture/spool/exporter 状态，并纳入 policy/enforcement policy 的已知阻断、source unavailable 或 metadata-only 未验证状态；无效 enforcement 配置在 snapshot 前由 `RuntimePlan` fail closed。capability matrix 和 capability metrics 保持独立，避免把路线图缺口伪装成当前运行故障。
 - `status` 对配置/runtime plan 错误 fail fast；对 spool 缺失、尚未初始化或读取失败不伪装成功，也不会为 status 查询创建 spool，而是在 snapshot 中标记 `spool.mode = unavailable`，并把相关 exporter 标记 unavailable。当前 CLI status 是 offline probe：如果 spool 已由正在运行的 agent 持有，会显式标记 `spool.mode = degraded` 和 busy reason，而不是伪装成坏 spool 或在线 admin snapshot。
 - policy status 当前只做 metadata-only source check：报告 configured/enabled count、active policy id/path、selector 是否配置、legacy Lua 文件或 bundle directory 是否具备可加载 metadata；对于 bundle directory 会解析 `manifest.toml` 并检查 `main.lua` metadata，但不会加载或执行 Lua source。启用 policy 且 source metadata 可见时，offline status 标记 `policy.mode = metadata_only` 并让 health degraded，而不是宣称 policy runtime 已可用。原因是 `PolicyRuntime` 加载阶段会执行 Lua chunk，offline status 不能变成隐式执行外部策略的入口。显式 `check` 会加载并编译启用的 policy，失败则 fail closed。
 - enforcement status 使用 typed enum 报告 configured mode、effective status、主配置 selector、manifest selector、effective selector、external policy source metadata 和 capability requirement。`disabled`/`audit_only` 标记 capability `not_required`；`dry_run` 标记需要 `dry_run_enforcement` capability；`enforce` 标记需要 `connection_enforcement` capability。外部 enforcement local manifest source 可用时 offline status 解析 TOML manifest metadata，报告 id/version、manifest selector 是否配置和 protective actions，但不执行动作；remote source 在 offline status 中只报告 endpoint metadata，不发网络请求、不声称已加载 manifest。source 缺失或 manifest 非法时 health 为 unavailable，source 可用但只是 metadata-only 时 health degraded。在线 admin status 报告启动时已加载的 manifest 为 `loaded`，并在 loaded snapshot 中保留 local path 或 remote endpoint source origin，不因磁盘 source 后续变化或远程 endpoint 当前状态而误报当前运行保护范围。缺少 required enforcement capability 的配置在 `RuntimePlan` 构建阶段 fail closed，因此 CLI status 对这类配置直接返回 validation error，而不是输出一个伪可用 snapshot。
