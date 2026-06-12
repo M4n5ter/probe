@@ -1,6 +1,7 @@
 mod ebpf;
 mod libpcap;
 mod plaintext;
+mod tls;
 
 use bytes::Bytes;
 use probe_core::{
@@ -16,6 +17,12 @@ pub use ebpf::{
 pub use libpcap::{LibpcapConfig, LibpcapProvider};
 pub use plaintext::{
     PlaintextChunk, PlaintextConnection, PlaintextFeedEvent, PlaintextFeedProvider, PlaintextGap,
+};
+pub use tls::{
+    LibsslExecutableMapping, LibsslLibraryKind, LibsslMappedFileIdentity, LibsslMappedLibrary,
+    LibsslUprobeDegradationReason, LibsslUprobeDiscoveryError, LibsslUprobeSymbol,
+    LibsslUprobeSymbolFailure, LibsslUprobeTarget, LibsslUprobeTargetDiscovery,
+    LibsslUprobeTargetDiscoveryReport,
 };
 
 #[derive(Debug, Error)]

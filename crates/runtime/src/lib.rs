@@ -765,7 +765,7 @@ fn default_platform_capabilities(
     [
         CapabilityState::unavailable(
             CapabilityKind::LibsslUprobe,
-            "TLS plaintext probe provider not implemented in this build",
+            "libssl uprobe attach candidate discovery code exists, but it is not wired into runtime and the uprobe loader and plaintext event provider are not implemented in this build",
         ),
         CapabilityState::available(CapabilityKind::Http1),
         CapabilityState::available(CapabilityKind::Sse),
