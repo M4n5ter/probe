@@ -26,15 +26,16 @@ pub struct ConfiguredEnforcement {
     pub policy_source: Option<LoadedEnforcementPolicySource>,
 }
 
-pub async fn build_configured_enforcement(
+pub async fn build_configured_enforcement_with_backend(
     plan: &RuntimePlan,
+    backend: Option<Box<dyn EnforcementBackend>>,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
     build_configured_enforcement_from_parts(
         plan.enforcement.mode,
         plan.config.enforcement.selector.clone(),
         plan.enforcement.config_selector_configured,
         &plan.enforcement.policy_source,
-        None,
+        backend,
     )
     .await
 }

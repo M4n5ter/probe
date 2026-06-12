@@ -14,8 +14,8 @@ pub use capture::{
     LiveCaptureBackend, PlaintextFeedCaptureConfig,
 };
 pub use enforcement::{
-    EnforcementConfig, EnforcementPolicyConfig, EnforcementPolicyManifest,
-    EnforcementPolicySourceConfig,
+    ConnectionEnforcementBackendConfig, EnforcementConfig, EnforcementPolicyConfig,
+    EnforcementPolicyManifest, EnforcementPolicySourceConfig,
 };
 pub use export::{
     CompressionCodecName, DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK,

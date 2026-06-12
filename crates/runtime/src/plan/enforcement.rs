@@ -1,12 +1,15 @@
 use std::path::PathBuf;
 
-use probe_config::{AgentConfig, EnforcementPolicySourceConfig};
+use probe_config::{
+    AgentConfig, ConnectionEnforcementBackendConfig, EnforcementPolicySourceConfig,
+};
 use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPlan {
     pub mode: EnforcementMode,
+    pub backend: ConnectionEnforcementBackendConfig,
     pub capability: EnforcementCapabilityPlan,
     pub config_selector_configured: bool,
     pub policy_source: EnforcementPolicySourcePlan,
@@ -16,6 +19,7 @@ impl EnforcementPlan {
     pub fn resolve(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
         Self {
             mode: config.enforcement.mode,
+            backend: config.enforcement.backend,
             capability: EnforcementCapabilityPlan::from_mode(config.enforcement.mode, capabilities),
             config_selector_configured: config.enforcement.selector.is_some(),
             policy_source: EnforcementPolicySourcePlan::from_config(

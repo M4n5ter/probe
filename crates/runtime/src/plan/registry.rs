@@ -10,25 +10,49 @@ pub struct ProviderRegistry {
     platform_capabilities: Vec<CapabilityState>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformProbeResults {
+    pub procfs_socket: Vec<CapabilityState>,
+    pub connection_enforcement: CapabilityState,
+}
+
+impl PlatformProbeResults {
+    pub fn from_host_defaults() -> Self {
+        Self {
+            procfs_socket: ProcfsSocketResolver::new().capabilities(),
+            connection_enforcement: default_connection_enforcement_capability(),
+        }
+    }
+
+    pub fn new(
+        procfs_socket: Vec<CapabilityState>,
+        connection_enforcement: CapabilityState,
+    ) -> Self {
+        Self {
+            procfs_socket,
+            connection_enforcement,
+        }
+    }
+}
+
 impl ProviderRegistry {
     pub fn with_default_platform(capture_providers: Vec<CaptureProviderDescriptor>) -> Self {
-        let procfs_socket = ProcfsSocketResolver::new();
-        Self::with_default_platform_and_procfs_socket(
+        Self::with_platform_probes(
             capture_providers,
-            procfs_socket.capabilities(),
+            PlatformProbeResults::from_host_defaults(),
         )
     }
 
-    pub fn with_default_platform_and_procfs_socket(
+    pub fn with_platform_probes(
         capture_providers: Vec<CaptureProviderDescriptor>,
-        procfs_socket_capabilities: Vec<CapabilityState>,
+        platform: PlatformProbeResults,
     ) -> Self {
         let procfs = ProcfsAttributor::new();
         Self::new(
             capture_providers,
-            default_platform_capabilities(procfs)
+            default_platform_capabilities(procfs, platform.connection_enforcement)
                 .into_iter()
-                .chain(procfs_socket_capabilities)
+                .chain(platform.procfs_socket)
                 .collect(),
         )
     }
@@ -72,6 +96,7 @@ impl ProviderRegistry {
 
 fn default_platform_capabilities(
     procfs: impl ProcessAttributor,
+    connection_enforcement_capability: CapabilityState,
 ) -> impl IntoIterator<Item = CapabilityState> {
     [
         CapabilityState::unavailable(
@@ -97,11 +122,15 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::available(CapabilityKind::WebhookExporter),
         CapabilityState::available(CapabilityKind::DryRunEnforcement),
-        CapabilityState::unavailable(
-            CapabilityKind::ConnectionEnforcement,
-            "connection-level enforcement backend abstraction is wired, but no executable blocking backend is available in this build/runtime",
-        ),
+        connection_enforcement_capability,
     ]
     .into_iter()
     .chain(procfs.capabilities())
+}
+
+fn default_connection_enforcement_capability() -> CapabilityState {
+    CapabilityState::unavailable(
+        CapabilityKind::ConnectionEnforcement,
+        "connection-level enforcement backend abstraction is wired, but no executable blocking backend is configured",
+    )
 }

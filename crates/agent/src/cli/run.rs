@@ -24,8 +24,9 @@ use crate::{
     capture_provider::build_capture_provider,
     capture_registry::default_provider_registry,
     check::build_check_report,
-    configured_enforcement::build_configured_enforcement,
+    configured_enforcement::build_configured_enforcement_with_backend,
     configured_policy::{LoadedPolicySource, load_configured_policy, load_policy_source},
+    connection_enforcement::{self, ConnectionEnforcementRuntime},
     error::AgentError,
     export::{
         ExportRetentionWorkerConfig, ExportWorker, ExportWorkerConfig, drain_planned_sinks,
@@ -35,6 +36,11 @@ use crate::{
 };
 
 const INGRESS_RECOVERY_BATCH_SIZE: usize = 1_024;
+
+struct RuntimeComposition {
+    plan: RuntimePlan,
+    connection_enforcement: ConnectionEnforcementRuntime,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "sssa-probe")]
@@ -155,8 +161,11 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
         Command::Run { config, max_events } => {
             let agent_config = read_config_or_default(config.as_ref())?;
             validate_static_runtime_config(&agent_config)?;
-            let plan = build_runtime_plan(agent_config)?;
-            let mut enforcement = build_configured_enforcement(&plan).await?;
+            let runtime = build_runtime_composition(agent_config)?;
+            let plan = runtime.plan;
+            let enforcement_backend = runtime.connection_enforcement.into_backend();
+            let mut enforcement =
+                build_configured_enforcement_with_backend(&plan, enforcement_backend).await?;
             let policy = load_configured_policy(&plan.config)?;
             let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
             let mut parser_factory = Http1ParserFactory::default();
@@ -186,7 +195,6 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                     .map(|policy| PipelinePolicy::new(&policy.runtime, policy.selector.as_ref())),
                 plan.config.config_version.clone(),
             );
-            pipeline = pipeline.with_enforcement_planner(&mut enforcement.planner);
             println!(
                 "agent {} running config {} capture {:?} selected {:?}",
                 plan.config.agent_id,
@@ -197,6 +205,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let summary_result = (|| {
                 let mut summary =
                     pipeline.recover_ingress_journal_until_idle(INGRESS_RECOVERY_BATCH_SIZE)?;
+                let mut pipeline = pipeline.with_enforcement_planner(&mut enforcement.planner);
                 let mut provider = build_capture_provider(&plan)?;
                 let capture_summary = pipeline.run_provider_with_options(
                     provider.as_mut(),
@@ -235,8 +244,10 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             );
         }
         Command::Check { config } => {
-            let plan = read_runtime_plan(&config)?;
-            let report = build_check_report(plan).await?;
+            let runtime = read_runtime_composition(&config)?;
+            let report =
+                build_check_report(runtime.plan, runtime.connection_enforcement.into_backend())
+                    .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Capabilities { config } => {
@@ -244,11 +255,14 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 Some(path) => read_config(&path)?,
                 None => AgentConfig::default(),
             };
-            let matrix = default_provider_registry(&config).capability_matrix();
+            let connection_enforcement =
+                connection_enforcement::resolve(config.enforcement.backend);
+            let matrix = default_provider_registry(&config, connection_enforcement.capability())
+                .capability_matrix();
             println!("{}", serde_json::to_string_pretty(&matrix)?);
         }
         Command::Status { config } => {
-            let plan = read_runtime_plan(&config)?;
+            let plan = read_runtime_composition(&config)?.plan;
             let spool_status = collect_spool_status(&plan);
             let snapshot = build_status_snapshot(&plan, spool_status);
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -279,14 +293,19 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
     Ok(())
 }
 
-fn read_runtime_plan(path: &PathBuf) -> Result<RuntimePlan, AgentError> {
+fn read_runtime_composition(path: &PathBuf) -> Result<RuntimeComposition, AgentError> {
     let config = read_config(path)?;
-    build_runtime_plan(config)
+    build_runtime_composition(config)
 }
 
-fn build_runtime_plan(config: AgentConfig) -> Result<RuntimePlan, AgentError> {
-    let registry = default_provider_registry(&config);
-    RuntimePlan::build(config, &registry).map_err(AgentError::Runtime)
+fn build_runtime_composition(config: AgentConfig) -> Result<RuntimeComposition, AgentError> {
+    let connection_enforcement = connection_enforcement::resolve(config.enforcement.backend);
+    let registry = default_provider_registry(&config, connection_enforcement.capability());
+    let plan = RuntimePlan::build(config, &registry).map_err(AgentError::Runtime)?;
+    Ok(RuntimeComposition {
+        plan,
+        connection_enforcement,
+    })
 }
 
 fn export_worker_config_from_plan(plan: &RuntimePlan) -> Option<ExportWorkerConfig> {
@@ -605,7 +624,7 @@ protective_actions = ["alert"]
         assert!(
             error
                 .to_string()
-                .contains("connection-level enforcement backend is not available")
+                .contains("connection-level enforcement backend is not configured")
         );
         assert!(
             !spool_path.exists(),
@@ -657,7 +676,7 @@ protective_actions = ["alert"]
         assert!(
             error
                 .to_string()
-                .contains("connection-level enforcement backend is not available")
+                .contains("connection-level enforcement backend is not configured")
         );
         assert!(
             !error
@@ -718,6 +737,7 @@ protective_actions = ["alert"]
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("run-ingress-recovery")?;
         let config_path = temp.join("agent.toml");
+        let policy_path = temp.join("deny-recovered.lua");
         let feed_path = temp.join("missing-feed.jsonl");
         let spool_path = temp.join("spool");
         let spool = FjallSpool::open(&spool_path)?;
@@ -741,10 +761,30 @@ protective_actions = ["alert"]
         ))?;
         drop(spool);
 
+        fs::write(
+            &policy_path,
+            r#"
+function on_http_request_headers(_)
+  return probe.verdict({
+    action = "deny",
+    scope = "request",
+    reason = "recovered traffic should not enforce",
+    confidence = 100,
+  })
+end
+"#,
+        )?;
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::PlaintextFeed;
         config.capture.plaintext_feed.path = Some(feed_path);
         config.storage.path = spool_path.clone();
+        config.enforcement.mode = EnforcementMode::DryRun;
+        config.policies.push(PolicyConfig {
+            id: "deny-recovered".to_string(),
+            path: policy_path,
+            enabled: true,
+            selector: None,
+        });
         fs::write(&config_path, toml::to_string(&config)?)?;
 
         let error = run(Cli {
@@ -774,6 +814,22 @@ protective_actions = ["alert"]
                     if headers.target.as_deref() == Some("/recovered-run")
             )
         }));
+        assert!(envelopes.iter().any(|envelope| {
+            matches!(
+                &envelope.kind,
+                probe_core::EventKind::PolicyVerdict(verdict)
+                    if verdict.action == probe_core::Action::Deny
+            )
+        }));
+        assert!(
+            envelopes.iter().all(|envelope| {
+                !matches!(
+                    &envelope.kind,
+                    probe_core::EventKind::EnforcementDecision(_)
+                )
+            }),
+            "ingress recovery must not run the enforcement planner"
+        );
 
         fs::remove_dir_all(temp)?;
         Ok(())

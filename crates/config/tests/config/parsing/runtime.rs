@@ -86,6 +86,7 @@ remote_addresses = []
 
 [enforcement]
 mode = "dry_run"
+backend = "linux_socket_destroy"
 
 [enforcement.policy.source]
 kind = "file"
@@ -141,6 +142,10 @@ socket_path = "/run/sssa-probe/admin.sock"
     assert!(config.tls.plaintext.selector.is_some());
     assert_eq!(config.capture.plaintext_feed.path, None);
     assert_eq!(config.enforcement.mode, EnforcementMode::DryRun);
+    assert_eq!(
+        config.enforcement.backend,
+        ConnectionEnforcementBackendConfig::LinuxSocketDestroy
+    );
     assert_eq!(
         config.enforcement.policy.source,
         EnforcementPolicySourceConfig::File {

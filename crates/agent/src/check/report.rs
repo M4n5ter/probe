@@ -1,17 +1,18 @@
 use std::path::PathBuf;
 
-use crate::configured_enforcement::{
-    LoadedEnforcementPolicySource, LoadedEnforcementPolicySourceOriginRef,
-};
 use crate::{
-    configured_enforcement::{ConfiguredEnforcementError, build_configured_enforcement},
+    configured_enforcement::{
+        ConfiguredEnforcementError, LoadedEnforcementPolicySource,
+        LoadedEnforcementPolicySourceOriginRef, build_configured_enforcement_with_backend,
+    },
     configured_policy::{
         ConfiguredPolicyError, LoadedConfiguredPolicy, configured_policy_selection,
         load_configured_policy,
     },
 };
+use enforcement::EnforcementBackend;
 use policy::PolicyHook;
-use probe_config::AgentConfig;
+use probe_config::{AgentConfig, ConnectionEnforcementBackendConfig};
 use probe_core::EnforcementMode;
 use runtime::RuntimePlan;
 use serde::Serialize;
@@ -61,6 +62,7 @@ pub struct LoadedPolicySnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnforcementCheckSnapshot {
     pub mode: EnforcementMode,
+    pub backend: ConnectionEnforcementBackendConfig,
     pub effective_selector_configured: bool,
     pub config_selector_configured: bool,
     pub manifest_selector_configured: Option<bool>,
@@ -96,8 +98,11 @@ pub enum LoadedEnforcementPolicySourceSnapshot {
     Remote { endpoint: String },
 }
 
-pub async fn build_check_report(plan: RuntimePlan) -> Result<CheckReport, CheckError> {
-    let enforcement = check_enforcement(&plan).await?;
+pub async fn build_check_report(
+    plan: RuntimePlan,
+    backend: Option<Box<dyn EnforcementBackend>>,
+) -> Result<CheckReport, CheckError> {
+    let enforcement = check_enforcement(&plan, backend).await?;
     let policy = check_policy(&plan.config)?;
     Ok(CheckReport {
         plan,
@@ -126,8 +131,11 @@ fn check_policy(config: &AgentConfig) -> Result<PolicyCheckSnapshot, CheckError>
     })
 }
 
-async fn check_enforcement(plan: &RuntimePlan) -> Result<EnforcementCheckSnapshot, CheckError> {
-    let enforcement = build_configured_enforcement(plan).await?;
+async fn check_enforcement(
+    plan: &RuntimePlan,
+    backend: Option<Box<dyn EnforcementBackend>>,
+) -> Result<EnforcementCheckSnapshot, CheckError> {
+    let enforcement = build_configured_enforcement_with_backend(plan, backend).await?;
     let policy = enforcement.policy_source.as_ref().map_or(
         EnforcementPolicyCheckSnapshot {
             mode: EnforcementPolicyCheckMode::NotConfigured,
@@ -146,6 +154,7 @@ async fn check_enforcement(plan: &RuntimePlan) -> Result<EnforcementCheckSnapsho
     );
     Ok(EnforcementCheckSnapshot {
         mode: enforcement.mode,
+        backend: plan.enforcement.backend,
         effective_selector_configured: enforcement.effective_selector_configured,
         config_selector_configured: enforcement.config_selector_configured,
         manifest_selector_configured: enforcement.manifest_selector_configured,
@@ -188,7 +197,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use probe_config::{AgentConfig, CaptureBackend};
+    use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
     use probe_core::{Action, CapabilityKind, CapabilityState, ProtectiveActionProfile, Selector};
     use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
     use serde_json::json;
@@ -207,7 +216,7 @@ mod tests {
         )?;
         let plan = runtime_plan(config_with_policy(&policy_path)?)?;
 
-        let report = build_check_report(plan).await?;
+        let report = build_check_report(plan, None).await?;
 
         assert_eq!(report.policy.mode, PolicyCheckMode::Loaded);
         let active = report.policy.active.as_ref().expect("loaded policy");
@@ -221,6 +230,10 @@ mod tests {
                 .contains(&PolicyHook::HttpRequestHeaders)
         );
         assert_eq!(report.enforcement.mode, EnforcementMode::AuditOnly);
+        assert_eq!(
+            report.enforcement.backend,
+            ConnectionEnforcementBackendConfig::None
+        );
         assert_eq!(
             report.enforcement.policy.mode,
             EnforcementPolicyCheckMode::NotConfigured
@@ -252,7 +265,7 @@ mod tests {
         };
         let plan = runtime_plan(config)?;
 
-        let report = build_check_report(plan).await?;
+        let report = build_check_report(plan, None).await?;
 
         assert!(report.enforcement.effective_selector_configured);
         assert!(!report.enforcement.config_selector_configured);
@@ -305,7 +318,7 @@ protective_actions = ["alert"]
         };
         let plan = runtime_plan(config)?;
 
-        let error = build_check_report(plan)
+        let error = build_check_report(plan, None)
             .await
             .expect_err("invalid enforcement manifest must fail check");
 
@@ -334,7 +347,7 @@ protective_actions = ["alert"]
         };
         let plan = runtime_plan(config)?;
 
-        let error = build_check_report(plan)
+        let error = build_check_report(plan, None)
             .await
             .expect_err("missing enforcement manifest must fail check");
 
@@ -368,7 +381,7 @@ protective_actions = ["alert"]
         };
         let plan = runtime_plan(config)?;
 
-        let report = build_check_report(plan).await?;
+        let report = build_check_report(plan, None).await?;
 
         assert_eq!(
             report.enforcement.policy.mode,
@@ -411,7 +424,8 @@ protective_actions = ["alert"]
             &policy_path,
             "function on_http_request_headers(_) return {} end",
         )?;
-        let report = build_check_report(runtime_plan(config_with_policy(&policy_path)?)?).await?;
+        let report =
+            build_check_report(runtime_plan(config_with_policy(&policy_path)?)?, None).await?;
 
         let value = serde_json::to_value(report)?;
 
@@ -444,6 +458,7 @@ protective_actions = ["alert"]
                 .is_some_and(|hooks| hooks.iter().any(|hook| hook == "on_http_request_headers"))
         );
         assert_eq!(value["enforcement"]["mode"], json!("audit_only"));
+        assert_eq!(value["enforcement"]["backend"], json!("none"));
         assert_eq!(
             value["enforcement"]["effective_selector_configured"],
             json!(false)
@@ -473,7 +488,7 @@ protective_actions = ["alert"]
         fs::write(&policy_path, "function on_http_request_headers(")?;
         let plan = runtime_plan(config_with_policy(&policy_path)?)?;
 
-        let error = build_check_report(plan)
+        let error = build_check_report(plan, None)
             .await
             .expect_err("invalid Lua must fail explicit check");
 
@@ -491,10 +506,11 @@ protective_actions = ["alert"]
         let temp = test_dir("check-enforce-without-backend")?;
         let policy_path = temp.join("missing-policy.lua");
         let mut config = config_with_policy(&policy_path)?;
+        config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
         let plan = runtime_plan_with_connection_enforcement(config)?;
 
-        let error = build_check_report(plan)
+        let error = build_check_report(plan, None)
             .await
             .expect_err("enforce must require an executable backend factory");
 
@@ -523,10 +539,16 @@ protective_actions = ["alert"]
 
     fn runtime_registry(extra_capabilities: Vec<CapabilityState>) -> ProviderRegistry {
         ProviderRegistry::new(
-            vec![CaptureProviderDescriptor::available(
-                CaptureBackend::Replay,
-                CaptureProviderBuilder::Replay,
-            )],
+            vec![
+                CaptureProviderDescriptor::available(
+                    CaptureBackend::Replay,
+                    CaptureProviderBuilder::Replay,
+                ),
+                CaptureProviderDescriptor::available(
+                    CaptureBackend::Libpcap,
+                    CaptureProviderBuilder::Libpcap,
+                ),
+            ],
             vec![
                 CapabilityState::available(CapabilityKind::Http1),
                 CapabilityState::available(CapabilityKind::Sse),

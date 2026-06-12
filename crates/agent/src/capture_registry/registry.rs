@@ -6,15 +6,23 @@ use capture::{
 use ebpf_object::{EbpfObjectProbe, EbpfObjectProbeConfig, EbpfObjectProbeReport};
 use probe_config::{AgentConfig, CaptureBackend};
 use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
-use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
+use runtime::{
+    CaptureProviderBuilder, CaptureProviderDescriptor, PlatformProbeResults, ProviderRegistry,
+};
 
-pub fn default_provider_registry(config: &AgentConfig) -> ProviderRegistry {
+pub fn default_provider_registry(
+    config: &AgentConfig,
+    connection_enforcement_capability: CapabilityState,
+) -> ProviderRegistry {
     let procfs_socket_capabilities = attribution::ProcfsSocketResolver::new().capabilities();
     let procfs_socket_attribution =
         procfs_socket_attribution_capability(&procfs_socket_capabilities);
-    ProviderRegistry::with_default_platform_and_procfs_socket(
+    ProviderRegistry::with_platform_probes(
         default_capture_provider_descriptors(config, procfs_socket_attribution),
-        procfs_socket_capabilities,
+        PlatformProbeResults::new(
+            procfs_socket_capabilities,
+            connection_enforcement_capability,
+        ),
     )
 }
 
@@ -343,6 +351,23 @@ mod tests {
             .expect("eBPF descriptor should explain missing procfs socket attribution");
         assert!(reason.contains("requires procfs_socket_attribution"));
         assert!(reason.contains("unavailable"));
+    }
+
+    #[test]
+    fn default_registry_keeps_connection_enforcement_unavailable_without_backend() {
+        let registry = default_provider_registry(
+            &AgentConfig::default(),
+            CapabilityState::unavailable(
+                CapabilityKind::ConnectionEnforcement,
+                "connection-level enforcement backend is not configured",
+            ),
+        );
+        let capabilities = registry.capability_matrix();
+
+        assert_eq!(
+            capabilities.mode(CapabilityKind::ConnectionEnforcement),
+            RuntimeMode::Unavailable
+        );
     }
 
     fn procfs_socket_attribution_capability_for_test(mode: RuntimeMode) -> CapabilityState {

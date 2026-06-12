@@ -29,10 +29,16 @@ pub(super) fn runtime_plan_from_config(
     capabilities: Vec<CapabilityState>,
 ) -> Result<RuntimePlan, runtime::RuntimeError> {
     let registry = ProviderRegistry::new(
-        vec![CaptureProviderDescriptor::available(
-            CaptureBackend::Replay,
-            CaptureProviderBuilder::Replay,
-        )],
+        vec![
+            CaptureProviderDescriptor::available(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+            ),
+            CaptureProviderDescriptor::available(
+                CaptureBackend::Libpcap,
+                CaptureProviderBuilder::Libpcap,
+            ),
+        ],
         capabilities,
     );
     RuntimePlan::build(config, &registry)

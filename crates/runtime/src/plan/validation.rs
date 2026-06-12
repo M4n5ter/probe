@@ -1,8 +1,9 @@
 use probe_config::{
     AgentConfig, ConfigValidationError, ConfigViolation, ExporterTransport, TlsPlaintextProvider,
 };
-use probe_core::{CapabilityKind, CapabilityMatrix, RuntimeMode};
+use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
 
+use super::capture::{CapturePlan, CapturePlanMode};
 use super::enforcement::EnforcementCapabilityPlan;
 use super::registry::ProviderRegistry;
 
@@ -15,6 +16,7 @@ pub(super) fn validate_runtime_config(
     validate_capture_config(config, registry, &mut violations);
     validate_registry_tls_config(config, registry, &mut violations);
     validate_registry_enforcement_config(config, registry, &mut violations);
+    validate_enforcement_capture_compatibility(config, registry, &mut violations);
 
     if violations.is_empty() {
         Ok(())
@@ -147,6 +149,27 @@ fn validate_registry_enforcement_config(
     }
 }
 
+fn validate_enforcement_capture_compatibility(
+    config: &AgentConfig,
+    registry: &ProviderRegistry,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if config.enforcement.mode != EnforcementMode::Enforce {
+        return;
+    }
+
+    let capture = CapturePlan::resolve(config, registry);
+    if capture.mode != CapturePlanMode::Live {
+        violations.push(ConfigViolation {
+            field: "enforcement.mode".to_string(),
+            reason: format!(
+                "enforce mode requires live host capture; selected capture mode is {:?}",
+                capture.mode
+            ),
+        });
+    }
+}
+
 fn validate_exporters(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
     for exporter in &config.exporters {
         match exporter.transport {
@@ -172,9 +195,15 @@ fn require_available(
     violations: &mut Vec<ConfigViolation>,
 ) {
     if capabilities.mode(capability) != RuntimeMode::Available {
+        let reason = capabilities
+            .states()
+            .iter()
+            .find(|state| state.kind == capability)
+            .and_then(|state| state.reason.clone())
+            .unwrap_or_else(|| reason.into());
         violations.push(ConfigViolation {
             field: field.into(),
-            reason: reason.into(),
+            reason,
         });
     }
 }

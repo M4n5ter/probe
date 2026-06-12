@@ -34,6 +34,10 @@ fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(config.exporters, Vec::<ExporterConfig>::new());
     assert_eq!(config.enforcement.mode, EnforcementMode::AuditOnly);
     assert_eq!(
+        config.enforcement.backend,
+        ConnectionEnforcementBackendConfig::None
+    );
+    assert_eq!(
         config.enforcement.policy.source,
         EnforcementPolicySourceConfig::None
     );

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default, deny_unknown_fields)]
 pub struct EnforcementConfig {
     pub mode: EnforcementMode,
+    pub backend: ConnectionEnforcementBackendConfig,
     pub selector: Option<Selector>,
     pub policy: EnforcementPolicyConfig,
 }
@@ -15,10 +16,19 @@ impl Default for EnforcementConfig {
     fn default() -> Self {
         Self {
             mode: EnforcementMode::AuditOnly,
+            backend: ConnectionEnforcementBackendConfig::None,
             selector: None,
             policy: EnforcementPolicyConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionEnforcementBackendConfig {
+    #[default]
+    None,
+    LinuxSocketDestroy,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

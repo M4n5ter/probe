@@ -19,7 +19,7 @@ pub use export::{
     ExportFailureBackoffPlan, ExportPlan, ExportRetentionPlan, ExportSinkPlan, ExportSinkTlsPlan,
     ExportSinkWorkerPlan, ExportWorkerPlan,
 };
-pub use registry::ProviderRegistry;
+pub use registry::{PlatformProbeResults, ProviderRegistry};
 pub use tls::{
     ExportTlsMaterialPlan, TlsMaterialPlan, TlsPlaintextCapabilityPlan, TlsPlaintextMaterialPlan,
     TlsPlaintextPlan, TlsPlan,

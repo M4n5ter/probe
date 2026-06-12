@@ -24,6 +24,12 @@ pub enum CaptureSource {
     Mock,
 }
 
+impl CaptureSource {
+    pub fn is_live_host_observation(self) -> bool {
+        matches!(self, Self::EbpfSyscall | Self::Libpcap | Self::LibsslUprobe)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Timestamp {
     pub monotonic_ns: u64,
@@ -416,6 +422,16 @@ mod tests {
         let second = request_event(CaptureSource::Replay, "/same").with_policy_version("policy@2");
 
         assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn live_host_observation_sources_exclude_replay_and_external_feeds() {
+        assert!(CaptureSource::EbpfSyscall.is_live_host_observation());
+        assert!(CaptureSource::Libpcap.is_live_host_observation());
+        assert!(CaptureSource::LibsslUprobe.is_live_host_observation());
+        assert!(!CaptureSource::ExternalPlaintextFeed.is_live_host_observation());
+        assert!(!CaptureSource::Replay.is_live_host_observation());
+        assert!(!CaptureSource::Mock.is_live_host_observation());
     }
 
     #[test]

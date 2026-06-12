@@ -4,6 +4,7 @@ use crate::configured_enforcement::{
     EnforcementPolicySourceInspection, LoadedEnforcementPolicySource,
     LoadedEnforcementPolicySourceOriginRef, inspect_enforcement_policy_source,
 };
+use probe_config::ConnectionEnforcementBackendConfig;
 use probe_core::{CapabilityKind, EnforcementMode, ProtectiveActionProfile, RuntimeMode};
 use runtime::{EnforcementCapabilityPlan, RuntimePlan};
 use serde::Serialize;
@@ -11,6 +12,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnforcementStatusSnapshot {
     pub configured_mode: EnforcementMode,
+    pub backend: ConnectionEnforcementBackendConfig,
     pub status: EnforcementStatusMode,
     pub effective_selector_configured: Option<bool>,
     pub config_selector_configured: bool,
@@ -106,6 +108,7 @@ fn enforcement_status_with_source(
 
     EnforcementStatusSnapshot {
         configured_mode,
+        backend: plan.enforcement.backend,
         status,
         effective_selector_configured: policy.effective_selector_configured,
         config_selector_configured: plan.enforcement.config_selector_configured,
@@ -511,7 +514,10 @@ protective_actions = ["alert"]
     fn enforce_status_reports_connection_enforcement_capability()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        config.capture.selection = probe_config::CaptureSelection::Libpcap;
         config.enforcement.mode = probe_core::EnforcementMode::Enforce;
+        config.enforcement.backend =
+            probe_config::ConnectionEnforcementBackendConfig::LinuxSocketDestroy;
         let plan = runtime_plan_from_config(
             config,
             vec![probe_core::CapabilityState::available(
@@ -523,6 +529,10 @@ protective_actions = ["alert"]
 
         assert_eq!(status.status, EnforcementStatusMode::Enforce);
         assert_eq!(
+            status.backend,
+            probe_config::ConnectionEnforcementBackendConfig::LinuxSocketDestroy
+        );
+        assert_eq!(
             status.capability,
             EnforcementCapabilityStatusSnapshot::Required {
                 capability: CapabilityKind::ConnectionEnforcement,
@@ -531,6 +541,7 @@ protective_actions = ["alert"]
         );
         let value = serde_json::to_value(&status)?;
         assert_eq!(value["status"], json!("enforce"));
+        assert_eq!(value["backend"], json!("linux_socket_destroy"));
         assert_eq!(
             value["capability"]["capability"],
             json!("connection_enforcement")

@@ -5,6 +5,7 @@ mod check;
 mod cli;
 mod configured_enforcement;
 mod configured_policy;
+mod connection_enforcement;
 mod error;
 mod export;
 mod plaintext_feed;
