@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use proto::BatchEnvelope;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
-use crate::{CompressionCodec, ExportAck, ExportError, WebhookAck};
+use crate::{BatchExporter, CompressionCodec, ExportAck, ExportError, WebhookAck};
 
 const RESERVED_WEBHOOK_HEADERS: &[&str] = &["content-type", "idempotency-key", "x-sssa-codec"];
 
@@ -93,13 +93,8 @@ fn webhook_client(tls: WebhookTlsConfig) -> Result<reqwest::Client, ExportError>
 }
 
 #[async_trait]
-pub trait ReliableExporter {
-    async fn send(&self, batch: &BatchEnvelope) -> Result<ExportAck, ExportError>;
-}
-
-#[async_trait]
-impl ReliableExporter for WebhookExporter {
-    async fn send(&self, batch: &BatchEnvelope) -> Result<ExportAck, ExportError> {
+impl BatchExporter for WebhookExporter {
+    async fn send_batch(&self, batch: &BatchEnvelope) -> Result<ExportAck, ExportError> {
         let encoded = batch.encode_to_vec();
         let body = self.codec.encode(&encoded)?;
         let response = self

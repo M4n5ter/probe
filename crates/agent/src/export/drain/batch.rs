@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use exporter::{CompressionCodec, ReliableExporter};
+use exporter::{BatchExporter, CompressionCodec};
 use probe_core::SpoolPayloadSchema;
 use proto::BatchEnvelope;
 use storage::{ExportSpool, StoredEvent};
@@ -21,7 +21,7 @@ pub(super) async fn drain_export_sink_from_batch(
     sink: &str,
     codec: CompressionCodec,
     mode: SinkDrainMode,
-    exporter: &(impl ReliableExporter + ?Sized),
+    exporter: &(impl BatchExporter + ?Sized),
     first_batch: BatchEnvelope,
 ) -> Result<ExportDrainSummary, ExportDrainError> {
     let mut summary = ExportDrainSummary {
@@ -41,7 +41,7 @@ pub(super) async fn drain_export_sink_from_batch(
                 batch
             }
         };
-        let ack = exporter.send(&batch).await?;
+        let ack = exporter.send_batch(&batch).await?;
         summary.batches = summary.batches.saturating_add(1);
         let committed_cursor = ack
             .committed_cursor

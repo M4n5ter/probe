@@ -57,3 +57,15 @@ pub trait EnforcementBackend: Send {
         request: EnforcementBackendRequest<'_>,
     ) -> Result<EnforcementBackendDecision, EnforcementError>;
 }
+
+impl<T> EnforcementBackend for Box<T>
+where
+    T: EnforcementBackend + ?Sized,
+{
+    fn apply(
+        &mut self,
+        request: EnforcementBackendRequest<'_>,
+    ) -> Result<EnforcementBackendDecision, EnforcementError> {
+        self.as_mut().apply(request)
+    }
+}
