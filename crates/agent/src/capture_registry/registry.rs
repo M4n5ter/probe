@@ -122,7 +122,7 @@ fn ebpf_provider_descriptor_from_object_report(
         CaptureBackend::Ebpf,
         CaptureProviderBuilder::Ebpf,
         format!(
-            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the connect/close observation provider can emit connect observations and decode descriptor close observations, but payload/lost-event conversion, socket-lifetime close events, and complete kernel traffic capture are not implemented",
+            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the connect/close observation provider can emit connect observations and best-effort descriptor-close lifecycle events, but payload/lost-event conversion and complete kernel traffic capture are not implemented",
             object.summary(),
         ),
     )
@@ -310,7 +310,7 @@ mod tests {
             .expect("eBPF descriptor should explain why capture provider is degraded");
         assert!(reason.contains("complete kernel traffic capture"));
         assert!(reason.contains("payload/lost-event conversion"));
-        assert!(reason.contains("socket-lifetime close events"));
+        assert!(reason.contains("best-effort descriptor-close lifecycle events"));
         assert!(reason.contains("connect/close observation provider"));
         assert!(reason.contains("procfs socket attribution is usable"));
     }
