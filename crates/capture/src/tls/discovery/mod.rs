@@ -1,5 +1,3 @@
-#[cfg(test)]
-mod elf_fixture;
 mod model;
 mod proc_maps;
 mod scanner;
