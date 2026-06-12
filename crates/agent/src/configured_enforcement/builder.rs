@@ -1,12 +1,10 @@
 use enforcement::{EnforcementError, ScopedEnforcementPlanner};
-use probe_config::AgentConfig;
 use probe_core::{EnforcementMode, ProtectiveActionProfile, Selector};
-use runtime::{EnforcementPlan, EnforcementPolicySourcePlan, RuntimePlan};
+use runtime::{EnforcementPolicySourcePlan, RuntimePlan};
 use thiserror::Error;
 
 use super::source::{
     EnforcementPolicySourceError, LoadedEnforcementPolicySource, load_enforcement_policy_source,
-    load_enforcement_policy_source_metadata,
 };
 
 #[derive(Debug, Error)]
@@ -15,6 +13,8 @@ pub enum ConfiguredEnforcementError {
     Planner(#[from] EnforcementError),
     #[error("enforcement policy source error: {0}")]
     Source(#[from] EnforcementPolicySourceError),
+    #[error("connection-level enforcement backend is not available in this build/runtime")]
+    BackendUnavailable,
 }
 
 pub struct ConfiguredEnforcement {
@@ -38,34 +38,16 @@ pub async fn build_configured_enforcement(
     .await
 }
 
-pub fn validate_configured_enforcement_metadata(
-    config: &AgentConfig,
-) -> Result<(), ConfiguredEnforcementError> {
-    let enforcement = EnforcementPlan::resolve(config);
-    let manifest = load_enforcement_policy_source_metadata(&enforcement.policy_source)?;
-    let effective_selector = effective_selector(
-        config.enforcement.selector.clone(),
-        manifest
-            .as_ref()
-            .and_then(|manifest| manifest.selector.clone()),
-    );
-    let protective_actions = manifest.map_or_else(ProtectiveActionProfile::default, |manifest| {
-        manifest.protective_actions
-    });
-    ScopedEnforcementPlanner::with_protective_action_profile(
-        enforcement.mode,
-        effective_selector.as_ref(),
-        protective_actions,
-    )?;
-    Ok(())
-}
-
 async fn build_configured_enforcement_from_parts(
     mode: EnforcementMode,
     config_selector: Option<Selector>,
     config_selector_configured: bool,
     policy_source_plan: &EnforcementPolicySourcePlan,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
+    if mode == EnforcementMode::Enforce {
+        return Err(ConfiguredEnforcementError::BackendUnavailable);
+    }
+
     let policy_source = load_enforcement_policy_source(policy_source_plan).await?;
     let effective_selector = effective_selector(
         config_selector,

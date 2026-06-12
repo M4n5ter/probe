@@ -24,9 +24,7 @@ use crate::{
     capture_provider::build_capture_provider,
     capture_registry::default_provider_registry,
     check::build_check_report,
-    configured_enforcement::{
-        build_configured_enforcement, validate_configured_enforcement_metadata,
-    },
+    configured_enforcement::build_configured_enforcement,
     configured_policy::{LoadedPolicySource, load_configured_policy, load_policy_source},
     error::AgentError,
     export::{
@@ -157,10 +155,9 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
         Command::Run { config, max_events } => {
             let agent_config = read_config_or_default(config.as_ref())?;
             validate_static_runtime_config(&agent_config)?;
-            let policy = load_configured_policy(&agent_config)?;
-            validate_configured_enforcement_metadata(&agent_config)?;
             let plan = build_runtime_plan(agent_config)?;
             let mut enforcement = build_configured_enforcement(&plan).await?;
+            let policy = load_configured_policy(&plan.config)?;
             let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
             let mut parser_factory = Http1ParserFactory::default();
             let admin_runtime_state = AdminRuntimeState {
@@ -477,6 +474,7 @@ mod tests {
         let config_path = temp.join("agent.toml");
         let enforcement_path = temp.join("enforcement.toml");
         let spool_path = temp.join("spool");
+        let missing_feed_path = temp.join("missing-feed.jsonl");
 
         fs::write(
             &enforcement_path,
@@ -486,7 +484,10 @@ version = "v1"
 protective_actions = ["alert"]
 "#,
         )?;
-        let mut config = config_with_unopenable_libpcap(spool_path.clone());
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::PlaintextFeed;
+        config.capture.plaintext_feed.path = Some(missing_feed_path);
+        config.storage.path = spool_path.clone();
         config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
             path: enforcement_path,
         };
@@ -526,8 +527,12 @@ protective_actions = ["alert"]
         let config_path = temp.join("agent.toml");
         let missing_policy_path = temp.join("missing-policy.lua");
         let spool_path = temp.join("spool");
+        let missing_feed_path = temp.join("missing-feed.jsonl");
 
-        let mut config = config_with_unopenable_libpcap(spool_path.clone());
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::PlaintextFeed;
+        config.capture.plaintext_feed.path = Some(missing_feed_path);
+        config.storage.path = spool_path.clone();
         config.policies.push(PolicyConfig {
             id: "guard".to_string(),
             path: missing_policy_path,
@@ -557,6 +562,111 @@ protective_actions = ["alert"]
         assert!(
             !spool_path.exists(),
             "spool must not be opened before policy validation passes"
+        );
+
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_rejects_unsupported_enforce_before_loading_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("run-unsupported-enforce-before-policy")?;
+        let config_path = temp.join("agent.toml");
+        let missing_policy_path = temp.join("missing-policy.lua");
+        let spool_path = temp.join("spool");
+
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+        config.storage.path = spool_path.clone();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.policies.push(PolicyConfig {
+            id: "guard".to_string(),
+            path: missing_policy_path,
+            enabled: true,
+            selector: None,
+        });
+        fs::write(&config_path, toml::to_string(&config)?)?;
+
+        let error = run(Cli {
+            command: Command::Run {
+                config: Some(config_path),
+                max_events: Some(0),
+            },
+        })
+        .await
+        .expect_err("unsupported enforce should fail before Lua policy load");
+
+        assert!(
+            matches!(&error, AgentError::Runtime(_)),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("connection-level enforcement backend is not available")
+        );
+        assert!(
+            !spool_path.exists(),
+            "spool must not be opened before runtime validation passes"
+        );
+
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_rejects_unsupported_enforce_before_reading_local_enforcement_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("run-unsupported-enforce-before-manifest")?;
+        let config_path = temp.join("agent.toml");
+        let enforcement_path = temp.join("enforcement.toml");
+        let spool_path = temp.join("spool");
+
+        fs::write(
+            &enforcement_path,
+            r#"
+id = "managed-apps"
+version = "v1"
+protective_actions = ["alert"]
+"#,
+        )?;
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+        config.storage.path = spool_path.clone();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: enforcement_path,
+        };
+        fs::write(&config_path, toml::to_string(&config)?)?;
+
+        let error = run(Cli {
+            command: Command::Run {
+                config: Some(config_path),
+                max_events: Some(0),
+            },
+        })
+        .await
+        .expect_err("unsupported enforce should fail before local manifest metadata read");
+
+        assert!(
+            matches!(&error, AgentError::Runtime(_)),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("connection-level enforcement backend is not available")
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("not a protective enforcement action"),
+            "runtime capability failure must win over local manifest metadata errors"
+        );
+        assert!(
+            !spool_path.exists(),
+            "spool must not be opened before runtime validation passes"
         );
 
         fs::remove_dir_all(temp)?;

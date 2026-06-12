@@ -97,6 +97,10 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::available(CapabilityKind::WebhookExporter),
         CapabilityState::available(CapabilityKind::DryRunEnforcement),
+        CapabilityState::unavailable(
+            CapabilityKind::ConnectionEnforcement,
+            "connection-level enforcement backend abstraction is wired, but no executable blocking backend is available in this build/runtime",
+        ),
     ]
     .into_iter()
     .chain(procfs.capabilities())

@@ -10,7 +10,10 @@ pub use capture::{
     CapturePlan, CapturePlanMode, CaptureProviderBuilder, CaptureProviderDescriptor,
     CaptureProviderSelectionPolicy,
 };
-pub use enforcement::{EnforcementPlan, EnforcementPolicySourceKind, EnforcementPolicySourcePlan};
+pub use enforcement::{
+    EnforcementCapabilityPlan, EnforcementPlan, EnforcementPolicySourceKind,
+    EnforcementPolicySourcePlan,
+};
 pub use error::RuntimeError;
 pub use export::{
     ExportFailureBackoffPlan, ExportPlan, ExportRetentionPlan, ExportSinkPlan, ExportSinkTlsPlan,
@@ -46,7 +49,7 @@ impl RuntimePlan {
         let capture = CapturePlan::resolve(&config, registry);
         let tls = TlsPlan::resolve(&config, &capabilities);
         let export = ExportPlan::resolve(&config);
-        let enforcement = EnforcementPlan::resolve(&config);
+        let enforcement = EnforcementPlan::resolve(&config, &capabilities);
         Ok(Self {
             config,
             capabilities,

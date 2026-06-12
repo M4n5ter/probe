@@ -5,7 +5,7 @@ use crate::configured_enforcement::{
     LoadedEnforcementPolicySourceOriginRef, inspect_enforcement_policy_source,
 };
 use probe_core::{CapabilityKind, EnforcementMode, ProtectiveActionProfile, RuntimeMode};
-use runtime::RuntimePlan;
+use runtime::{EnforcementCapabilityPlan, RuntimePlan};
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -25,6 +25,7 @@ pub enum EnforcementStatusMode {
     Disabled,
     AuditOnly,
     DryRun,
+    Enforce,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -95,26 +96,13 @@ fn enforcement_status_with_source(
 ) -> EnforcementStatusSnapshot {
     let configured_mode = plan.enforcement.mode;
     let policy = enforcement_policy_status(plan, source);
-    let (status, capability) = match configured_mode {
-        EnforcementMode::Disabled => (
-            EnforcementStatusMode::Disabled,
-            EnforcementCapabilityStatusSnapshot::NotRequired,
-        ),
-        EnforcementMode::AuditOnly => (
-            EnforcementStatusMode::AuditOnly,
-            EnforcementCapabilityStatusSnapshot::NotRequired,
-        ),
-        EnforcementMode::DryRun => (
-            EnforcementStatusMode::DryRun,
-            EnforcementCapabilityStatusSnapshot::Required {
-                capability: CapabilityKind::DryRunEnforcement,
-                mode: plan.capabilities.mode(CapabilityKind::DryRunEnforcement),
-            },
-        ),
-        EnforcementMode::Enforce => {
-            unreachable!("runtime plan validation rejects real enforcement mode")
-        }
+    let status = match configured_mode {
+        EnforcementMode::Disabled => EnforcementStatusMode::Disabled,
+        EnforcementMode::AuditOnly => EnforcementStatusMode::AuditOnly,
+        EnforcementMode::DryRun => EnforcementStatusMode::DryRun,
+        EnforcementMode::Enforce => EnforcementStatusMode::Enforce,
     };
+    let capability = enforcement_capability_status(&plan.enforcement.capability);
 
     EnforcementStatusSnapshot {
         configured_mode,
@@ -124,6 +112,20 @@ fn enforcement_status_with_source(
         manifest_selector_configured: policy.manifest_selector_configured,
         policy: policy.snapshot,
         capability,
+    }
+}
+
+fn enforcement_capability_status(
+    capability: &EnforcementCapabilityPlan,
+) -> EnforcementCapabilityStatusSnapshot {
+    match capability {
+        EnforcementCapabilityPlan::NotRequired => EnforcementCapabilityStatusSnapshot::NotRequired,
+        EnforcementCapabilityPlan::Required { capability, mode } => {
+            EnforcementCapabilityStatusSnapshot::Required {
+                capability: *capability,
+                mode: *mode,
+            }
+        }
     }
 }
 
@@ -501,6 +503,37 @@ protective_actions = ["alert"]
                 capability: CapabilityKind::DryRunEnforcement,
                 mode: RuntimeMode::Available,
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_status_reports_connection_enforcement_capability()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        config.enforcement.mode = probe_core::EnforcementMode::Enforce;
+        let plan = runtime_plan_from_config(
+            config,
+            vec![probe_core::CapabilityState::available(
+                CapabilityKind::ConnectionEnforcement,
+            )],
+        )?;
+
+        let status = enforcement_status(&plan);
+
+        assert_eq!(status.status, EnforcementStatusMode::Enforce);
+        assert_eq!(
+            status.capability,
+            EnforcementCapabilityStatusSnapshot::Required {
+                capability: CapabilityKind::ConnectionEnforcement,
+                mode: RuntimeMode::Available,
+            }
+        );
+        let value = serde_json::to_value(&status)?;
+        assert_eq!(value["status"], json!("enforce"));
+        assert_eq!(
+            value["capability"]["capability"],
+            json!("connection_enforcement")
         );
         Ok(())
     }

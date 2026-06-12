@@ -97,8 +97,8 @@ pub enum LoadedEnforcementPolicySourceSnapshot {
 }
 
 pub async fn build_check_report(plan: RuntimePlan) -> Result<CheckReport, CheckError> {
-    let policy = check_policy(&plan.config)?;
     let enforcement = check_enforcement(&plan).await?;
+    let policy = check_policy(&plan.config)?;
     Ok(CheckReport {
         plan,
         policy,
@@ -485,8 +485,44 @@ protective_actions = ["alert"]
         Ok(())
     }
 
+    #[tokio::test]
+    async fn check_report_rejects_enforce_without_backend_before_loading_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-enforce-without-backend")?;
+        let policy_path = temp.join("missing-policy.lua");
+        let mut config = config_with_policy(&policy_path)?;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        let plan = runtime_plan_with_connection_enforcement(config)?;
+
+        let error = build_check_report(plan)
+            .await
+            .expect_err("enforce must require an executable backend factory");
+
+        assert!(matches!(
+            error,
+            CheckError::ConfiguredEnforcement(ConfiguredEnforcementError::BackendUnavailable)
+        ));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
     fn runtime_plan(config: AgentConfig) -> Result<RuntimePlan, runtime::RuntimeError> {
-        let registry = ProviderRegistry::new(
+        RuntimePlan::build(config, &runtime_registry(Vec::new()))
+    }
+
+    fn runtime_plan_with_connection_enforcement(
+        config: AgentConfig,
+    ) -> Result<RuntimePlan, runtime::RuntimeError> {
+        RuntimePlan::build(
+            config,
+            &runtime_registry(vec![CapabilityState::available(
+                CapabilityKind::ConnectionEnforcement,
+            )]),
+        )
+    }
+
+    fn runtime_registry(extra_capabilities: Vec<CapabilityState>) -> ProviderRegistry {
+        ProviderRegistry::new(
             vec![CaptureProviderDescriptor::available(
                 CaptureBackend::Replay,
                 CaptureProviderBuilder::Replay,
@@ -497,9 +533,11 @@ protective_actions = ["alert"]
                 CapabilityState::available(CapabilityKind::WebSocketHandoff),
                 CapabilityState::available(CapabilityKind::WebSocketFrame),
                 CapabilityState::available(CapabilityKind::DryRunEnforcement),
-            ],
-        );
-        RuntimePlan::build(config, &registry)
+            ]
+            .into_iter()
+            .chain(extra_capabilities)
+            .collect(),
+        )
     }
 
     fn config_with_policy(path: &Path) -> Result<AgentConfig, probe_config::ConfigError> {

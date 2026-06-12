@@ -20,6 +20,7 @@ pub enum CapabilityKind {
     ExportQueue,
     WebhookExporter,
     DryRunEnforcement,
+    ConnectionEnforcement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

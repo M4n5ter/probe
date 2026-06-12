@@ -5,14 +5,21 @@ use probe_core::{
 };
 use thiserror::Error;
 
+use crate::{EnforcementBackend, EnforcementBackendRequest};
+
 #[derive(Debug, Error)]
 pub enum EnforcementError {
     #[error("invalid enforcement selector: {0}")]
     Selector(#[from] SelectorError),
     #[error("invalid enforcement protective action profile: {0}")]
     ProtectiveActionProfile(#[from] ProtectiveActionError),
+    #[error("connection-level enforcement backend is not available in this build/runtime")]
+    BackendUnavailable,
+    #[error("enforcement backend error: {0}")]
+    Backend(String),
 }
 
+#[derive(Clone, Copy)]
 pub struct EnforcementPlanRequest<'a> {
     pub verdict: &'a Verdict,
     pub trigger: &'a EventEnvelope,
@@ -20,7 +27,7 @@ pub struct EnforcementPlanRequest<'a> {
 
 pub trait EnforcementPlanner {
     fn evaluate(
-        &self,
+        &mut self,
         request: EnforcementPlanRequest<'_>,
     ) -> Result<Option<EnforcementDecision>, EnforcementError>;
 }
@@ -29,6 +36,7 @@ pub struct ScopedEnforcementPlanner {
     mode: EnforcementMode,
     selector: Option<CompiledSelector>,
     protective_actions: ProtectiveActionProfile,
+    backend: Option<Box<dyn EnforcementBackend>>,
 }
 
 impl ScopedEnforcementPlanner {
@@ -56,10 +64,27 @@ impl ScopedEnforcementPlanner {
         selector: Option<&Selector>,
         protective_actions: ProtectiveActionProfile,
     ) -> Result<Self, EnforcementError> {
+        if mode == EnforcementMode::Enforce {
+            return Err(EnforcementError::BackendUnavailable);
+        }
         Ok(Self {
             mode,
             selector: selector.map(Selector::compile).transpose()?,
             protective_actions,
+            backend: None,
+        })
+    }
+
+    pub fn with_backend(
+        selector: Option<&Selector>,
+        protective_actions: ProtectiveActionProfile,
+        backend: impl EnforcementBackend + 'static,
+    ) -> Result<Self, EnforcementError> {
+        Ok(Self {
+            mode: EnforcementMode::Enforce,
+            selector: selector.map(Selector::compile).transpose()?,
+            protective_actions,
+            backend: Some(Box::new(backend)),
         })
     }
 
@@ -85,7 +110,7 @@ impl ScopedEnforcementPlanner {
 
 impl EnforcementPlanner for ScopedEnforcementPlanner {
     fn evaluate(
-        &self,
+        &mut self,
         request: EnforcementPlanRequest<'_>,
     ) -> Result<Option<EnforcementDecision>, EnforcementError> {
         if !requires_enforcement(request.verdict.action) {
@@ -112,7 +137,7 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
                 ),
             )
         } else {
-            decision_for_mode(self.mode, request.verdict)
+            self.decision_for_mode(request)?
         };
 
         Ok(Some(EnforcementDecision {
@@ -127,43 +152,50 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
     }
 }
 
-fn decision_for_mode(
-    mode: EnforcementMode,
-    verdict: &Verdict,
-) -> (EnforcementOutcome, Action, String) {
-    match mode {
-        EnforcementMode::Disabled => (
-            EnforcementOutcome::Disabled,
-            Action::Observe,
-            format!(
-                "policy requested {:?}, but enforcement is disabled: {}",
-                verdict.action, verdict.reason
+impl ScopedEnforcementPlanner {
+    fn decision_for_mode(
+        &mut self,
+        request: EnforcementPlanRequest<'_>,
+    ) -> Result<(EnforcementOutcome, Action, String), EnforcementError> {
+        let verdict = request.verdict;
+        let decision = match self.mode {
+            EnforcementMode::Disabled => (
+                EnforcementOutcome::Disabled,
+                Action::Observe,
+                format!(
+                    "policy requested {:?}, but enforcement is disabled: {}",
+                    verdict.action, verdict.reason
+                ),
             ),
-        ),
-        EnforcementMode::AuditOnly => (
-            EnforcementOutcome::AuditOnly,
-            Action::Observe,
-            format!(
-                "policy requested {:?}; audit-only mode recorded the requested action: {}",
-                verdict.action, verdict.reason
+            EnforcementMode::AuditOnly => (
+                EnforcementOutcome::AuditOnly,
+                Action::Observe,
+                format!(
+                    "policy requested {:?}; audit-only mode recorded the requested action: {}",
+                    verdict.action, verdict.reason
+                ),
             ),
-        ),
-        EnforcementMode::DryRun => (
-            EnforcementOutcome::DryRun,
-            Action::Observe,
-            format!(
-                "policy requested {:?}; dry-run mode did not execute the action: {}",
-                verdict.action, verdict.reason
+            EnforcementMode::DryRun => (
+                EnforcementOutcome::DryRun,
+                Action::Observe,
+                format!(
+                    "policy requested {:?}; dry-run mode did not execute the action: {}",
+                    verdict.action, verdict.reason
+                ),
             ),
-        ),
-        EnforcementMode::Enforce => (
-            EnforcementOutcome::Unsupported,
-            Action::Observe,
-            format!(
-                "policy requested {:?}, but real enforcement is not implemented: {}",
-                verdict.action, verdict.reason
-            ),
-        ),
+            EnforcementMode::Enforce => {
+                let backend = self
+                    .backend
+                    .as_deref_mut()
+                    .ok_or(EnforcementError::BackendUnavailable)?;
+                let decision = backend.apply(EnforcementBackendRequest {
+                    verdict,
+                    trigger: request.trigger,
+                })?;
+                decision.into_enforcement_parts(verdict.action)
+            }
+        };
+        Ok(decision)
     }
 }
 
@@ -179,12 +211,14 @@ mod tests {
         TransportProtocol, VerdictScope,
     };
 
+    use crate::EnforcementBackendDecision;
+
     use super::*;
 
     #[test]
     fn dry_run_records_matching_protective_verdict_without_applying_it()
     -> Result<(), Box<dyn std::error::Error>> {
-        let planner = ScopedEnforcementPlanner::new(EnforcementMode::DryRun, None)?;
+        let mut planner = ScopedEnforcementPlanner::new(EnforcementMode::DryRun, None)?;
         let trigger = request_event(Direction::Outbound);
         let verdict = Verdict {
             action: Action::Deny,
@@ -218,7 +252,7 @@ mod tests {
             },
             TrafficSelector::default(),
         );
-        let planner = ScopedEnforcementPlanner::new(EnforcementMode::DryRun, Some(&selector))?;
+        let mut planner = ScopedEnforcementPlanner::new(EnforcementMode::DryRun, Some(&selector))?;
         let trigger = request_event(Direction::Outbound);
         let verdict = Verdict {
             action: Action::Reset,
@@ -254,7 +288,7 @@ mod tests {
                 ..TrafficSelector::default()
             },
         );
-        let planner = ScopedEnforcementPlanner::new(EnforcementMode::DryRun, Some(&selector))?;
+        let mut planner = ScopedEnforcementPlanner::new(EnforcementMode::DryRun, Some(&selector))?;
         let trigger = directionless_event();
         let verdict = Verdict {
             action: Action::Deny,
@@ -279,7 +313,7 @@ mod tests {
     #[test]
     fn disabled_mode_records_that_requested_action_was_not_applied()
     -> Result<(), Box<dyn std::error::Error>> {
-        let planner = ScopedEnforcementPlanner::new(EnforcementMode::Disabled, None)?;
+        let mut planner = ScopedEnforcementPlanner::new(EnforcementMode::Disabled, None)?;
         let trigger = request_event(Direction::Outbound);
         let verdict = Verdict {
             action: Action::Quarantine,
@@ -305,7 +339,7 @@ mod tests {
     #[test]
     fn non_protective_verdicts_are_left_to_policy_events() -> Result<(), Box<dyn std::error::Error>>
     {
-        let planner = ScopedEnforcementPlanner::new(EnforcementMode::AuditOnly, None)?;
+        let mut planner = ScopedEnforcementPlanner::new(EnforcementMode::AuditOnly, None)?;
         let trigger = request_event(Direction::Outbound);
         let verdict = Verdict::alert("alert only");
 
@@ -320,7 +354,7 @@ mod tests {
 
     #[test]
     fn configured_profile_limits_protective_actions() -> Result<(), Box<dyn std::error::Error>> {
-        let planner = ScopedEnforcementPlanner::with_protective_actions(
+        let mut planner = ScopedEnforcementPlanner::with_protective_actions(
             EnforcementMode::DryRun,
             None,
             [Action::Deny, Action::Deny],
@@ -350,6 +384,44 @@ mod tests {
     }
 
     #[test]
+    fn enforce_mode_delegates_to_backend() -> Result<(), Box<dyn std::error::Error>> {
+        let mut planner = ScopedEnforcementPlanner::with_backend(
+            None,
+            ProtectiveActionProfile::default(),
+            ApplyingBackend,
+        )?;
+        let trigger = request_event(Direction::Outbound);
+        let verdict = Verdict {
+            action: Action::Reset,
+            scope: VerdictScope::Flow,
+            reason: "reset flow".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+
+        let decision = planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })?
+            .expect("protective verdict should be delegated to backend");
+
+        assert_eq!(decision.outcome, EnforcementOutcome::Applied);
+        assert_eq!(decision.requested_action, Action::Reset);
+        assert_eq!(decision.effective_action, Action::Reset);
+        assert_eq!(decision.reason, "backend applied Reset");
+        assert!(decision.selector_matched);
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_mode_without_backend_is_rejected() {
+        let result = ScopedEnforcementPlanner::new(EnforcementMode::Enforce, None);
+
+        assert!(matches!(result, Err(EnforcementError::BackendUnavailable)));
+    }
+
+    #[test]
     fn configured_profile_rejects_non_protective_actions() {
         let result = ScopedEnforcementPlanner::with_protective_actions(
             EnforcementMode::DryRun,
@@ -366,6 +438,20 @@ mod tests {
                 action: Action::Alert
             })
         ));
+    }
+
+    struct ApplyingBackend;
+
+    impl EnforcementBackend for ApplyingBackend {
+        fn apply(
+            &mut self,
+            request: EnforcementBackendRequest<'_>,
+        ) -> Result<EnforcementBackendDecision, EnforcementError> {
+            Ok(EnforcementBackendDecision::applied(format!(
+                "backend applied {:?}",
+                request.verdict.action
+            )))
+        }
     }
 
     fn request_event(direction: Direction) -> EventEnvelope {

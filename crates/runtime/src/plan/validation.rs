@@ -1,8 +1,9 @@
 use probe_config::{
     AgentConfig, ConfigValidationError, ConfigViolation, ExporterTransport, TlsPlaintextProvider,
 };
-use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
+use probe_core::{CapabilityKind, CapabilityMatrix, RuntimeMode};
 
+use super::enforcement::EnforcementCapabilityPlan;
 use super::registry::ProviderRegistry;
 
 pub(super) fn validate_runtime_config(
@@ -126,12 +127,6 @@ fn validate_static_enforcement_config(config: &AgentConfig, violations: &mut Vec
             reason: error.to_string(),
         });
     }
-    if config.enforcement.mode == EnforcementMode::Enforce {
-        violations.push(ConfigViolation {
-            field: "enforcement.mode".to_string(),
-            reason: "real enforcement is not implemented in this build/runtime".to_string(),
-        });
-    }
 }
 
 fn validate_registry_enforcement_config(
@@ -139,15 +134,16 @@ fn validate_registry_enforcement_config(
     registry: &ProviderRegistry,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    match config.enforcement.mode {
-        EnforcementMode::Disabled | EnforcementMode::AuditOnly | EnforcementMode::Enforce => {}
-        EnforcementMode::DryRun => require_available(
+    if let Some(requirement) =
+        EnforcementCapabilityPlan::requirement_for_mode(config.enforcement.mode)
+    {
+        require_available(
             &registry.capability_matrix(),
-            CapabilityKind::DryRunEnforcement,
+            requirement.capability,
             "enforcement.mode",
-            "dry-run enforcement provider is not available in this build/runtime",
+            requirement.unavailable_reason,
             violations,
-        ),
+        );
     }
 }
 

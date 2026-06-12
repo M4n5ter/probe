@@ -161,17 +161,6 @@ pub async fn load_enforcement_policy_source(
     }
 }
 
-pub fn load_enforcement_policy_source_metadata(
-    source: &EnforcementPolicySourcePlan,
-) -> Result<Option<EnforcementPolicyManifest>, EnforcementPolicySourceError> {
-    match source {
-        EnforcementPolicySourcePlan::None | EnforcementPolicySourcePlan::Remote { .. } => Ok(None),
-        EnforcementPolicySourcePlan::LocalManifest { path, .. } => {
-            read_enforcement_policy_manifest(path).map(Some)
-        }
-    }
-}
-
 pub fn inspect_enforcement_policy_source(
     source: &EnforcementPolicySourcePlan,
 ) -> EnforcementPolicySourceInspection {

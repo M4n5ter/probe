@@ -11,7 +11,7 @@
 - 可扩展协议解析：首要支持 HTTP/1.x 和 SSE，后续自然扩展 WebSocket、HTTP/2、HTTP/3 等协议。
 - 策略驱动的检测与防护：首个可用闭环先支持观测、告警和 dry-run verdict，后续接入真实拦截执行。
 
-本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入早期实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、可选压缩 codec 和 HTTP webhook exporter。`run` 已可按配置启动连续后台 exporter worker 并在退出前做尾部 drain，`replay` 可通过 CLI drain 到独立 webhook sink，`status` 可输出 runtime/admin/metrics 快照。已定义 capture provider、procfs process attribution、runtime config、runtime planning 和 dry-run enforcement 的第一版边界，并开始接入真实 libpcap fallback、外部明文 feed provider、eBPF build/preflight/contract 边界、外部 enforcement policy manifest 和 exporter retention deadline。尚未实现完整 eBPF live provider、TLS uprobe provider、keylog/session 解密 provider、真实 enforcement backend、TCP 重组和强进程归因。
+本文档是架构事实源，同时记录当前实现状态。当前仓库已经进入早期实现阶段：已建立 Rust workspace，完成 replay 驱动的 HTTP/1.x + SSE parser、LuaJIT policy runtime、Fjall ingress journal/export queue、protobuf batch envelope、可选压缩 codec 和 HTTP webhook exporter。`run` 已可按配置启动连续后台 exporter worker 并在退出前做尾部 drain，`replay` 可通过 CLI drain 到独立 webhook sink，`status` 可输出 runtime/admin/metrics 快照。已定义 capture provider、procfs process attribution、runtime config、runtime planning、dry-run enforcement、外部 enforcement policy manifest 和 `EnforcementBackend` 执行边界，并开始接入真实 libpcap fallback、外部明文 feed provider、eBPF build/preflight/contract 边界和 exporter retention deadline。尚未实现完整 eBPF live provider、TLS uprobe provider、keylog/session 解密 provider、可执行 connection-level enforcement backend、TCP 重组和强进程归因。
 
 ## 2. 核心 thesis
 
@@ -93,7 +93,7 @@ flowchart LR
 - 已实现 `capture` crate 的 `CaptureProvider` 抽象、`ReplayProvider`、`PlaintextFeedProvider` 和基础 `LibpcapProvider`。`PlaintextFeedProvider` 接收外部已解密明文 feed event，输出 `ExternalPlaintextFeed` source 的 `CapturedBytes`/gap/connection lifecycle event，用于把 libssl uprobe、keylog/session decrypt、SDK feed 或 future MITM 等后续 provider 接入同一 pipeline；它本身不执行 TLS 解密。libpcap provider 可打开设备、安装 BPF filter、解析 Ethernet、Linux cooked v1/v2、`RAW`、direct `IPV4`/`IPV6` 和 `NULL`/`LOOP` loopback 上的 IPv4 TCP 与无扩展头 IPv6 TCP segment，接收可插拔 process resolver，并输出 degraded `CapturedBytes`。flow table 会用 SYN reuse、RST、双向 FIN、idle timeout 和容量淘汰清理 4-tuple 缓存；单向 FIN 只标记半关闭，避免把仍在发送的另一方向拆成新 flow；清理 flow 时会发出 `ConnectionClosed`，让 pipeline 释放 parser state。若同一 segment 同时携带 payload 和关闭信号，payload 事件先进入 parser，随后才发 close。它当前不做 TCP 重组、IPv6 extension header/fragment 解析或 gap 修复。
 - 已实现 `attribution` crate 的 `ProcfsAttributor` 和 `ProcfsSocketResolver`；前者可从 `/proc/<pid>` 读取进程身份、cmdline hash、starttime、uid/gid、cgroup、systemd service 与 container hint，后者可通过 `/proc/net/tcp`、可读取且可解析时的 `/proc/net/tcp6`、socket inode 和 `/proc/<pid>/fd` best-effort 反查 TCP 连接所属进程。`ProcfsSocketResolver` 还提供 TGID+thread PID+fd 到 `TcpConnection` 的反向解析入口：先读取 `/proc/<thread_pid>/fd/<fd>` 的 socket inode，连接线程已经消失时回退到 `/proc/<tgid>/fd/<fd>`，再用同一份 tcp/tcp6 snapshot 的 inode -> connection 索引匹配连接，并可用 eBPF connect observation 里带出的 remote endpoint 过滤歧义；进程身份仍按 TGID 读取。tcp6 中的 IPv4-mapped endpoint 会归一化为 IPv4，以匹配 libpcap 看到的 IPv4 packet 和 eBPF 归一化后的 remote endpoint；tcp6 缺失、不可读或 malformed 不会拖垮 IPv4 socket attribution 基线。agent 注入的 procfs resolver 使用短 TTL socket snapshot，避免同一批新连接重复全量扫描 `/proc/<pid>/fd`；libpcap provider 在 TCP 生命周期信号、idle eviction、capacity eviction 和端口复用关闭旧 flow 后会使 snapshot 失效，降低拿到旧进程身份的风险。resolver 错误会进入 capture degradation reason，不再静默伪装成未匹配；但单个 PID 的 fd race 或权限拒绝属于 best-effort skip，不让整批 socket snapshot 失败。replay flow 默认使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence，避免把文件输入误归因到 agent 进程。
 - 已实现 `probe-config` crate 的 TOML runtime config schema，覆盖 capture selection、live capture fallback order、provider-specific nested config、storage、export runtime worker、exporter、TLS material registry、TLS plaintext provider plan 配置、policy、enforcement mode、enforcement policy source 和 admin Unix socket 的第一版结构；配置解析拒绝未知字段，基础字段校验会拒绝 ambiguous external plaintext feed 配置：当前 external plaintext feed 的 source path 归 `capture.plaintext_feed.path` 所有，不能塞进 TLS material/provider 配置。TLS material 路径不能为空；可被 exporter 或 TLS plaintext plan 引用的 material 需要唯一 id，exporter TLS refs 和 `tls.plaintext.key_log_refs` / `tls.plaintext.session_secret_refs` 必须存在并且类型匹配，client certificate refs 与 private key ref 必须在单个 exporter 上成对配置；`libssl_uprobe` plaintext provider 不接受 keylog/session secret refs，因为它依赖运行时 uprobe 事件而不是离线材料。enforcement policy source 支持未配置、文件、目录 manifest 和 remote endpoint。remote endpoint 必须使用 HTTPS，只有 loopback HTTP 可用于本地测试，且 endpoint 中禁止携带 credentials；文件存在性和远程 source 可达性属于 status/check/run 观察面。
-- 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection、TLS plaintext plan、export worker effective plan 与 enforcement source plan；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；`plaintext_feed` 是独立 plan mode，不伪装成 replay 或 live capture；TLS plaintext plan 现在保留 provider、selector 是否配置、capability requirement、keylog/session secret material refs 的 typed 解析结果，但不打开文件、不 attach uprobe；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
+- 已实现 `runtime` crate 的 provider descriptor `ProviderRegistry` 与 `RuntimePlan`，由 registry 生成 capability matrix，并基于配置解析 capture backend selection、TLS plaintext plan、export worker effective plan 与 enforcement capability/source plan；`auto` 使用有序 live fallback 列表，显式 backend 表示 required backend，不自动回退；runtime validation 对未实现的安全敏感能力 fail closed；`plaintext_feed` 是独立 plan mode，不伪装成 replay 或 live capture；TLS plaintext plan 现在保留 provider、selector 是否配置、capability requirement、keylog/session secret material refs 的 typed 解析结果，但不打开文件、不 attach uprobe；runtime 不打开或探测 provider，provider probe/open 留在 `agent` composition root。
 - 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；ingress journal 现在写入完整 `CaptureEvent` JSON payload，而不是只写入 bytes payload，因此 bytes、gap、connection opened/closed 都能按 sequence 恢复；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；pipeline 支持可选 `max_events` 运行边界，便于对真实 live provider 做有界 smoke；`recover_ingress_journal_until_idle` 可从 durable ingress journal 按 sequence 顺序重放 `CaptureEventJson` payload，重新进入 parser/policy/export queue，并且只在 active parser state 已被移除时推进 parser cursor；`agent run` 会在打开 capture provider 之前先执行该恢复，避免 provider 构造失败时 stranded 已落盘输入。该恢复是 best-effort、at-least-once：如果进程在 export 写入之后崩溃，恢复可能重复产出相同语义事件；由于当前 event id 包含新进程内生成的 monotonic timestamp，重复事件不能依赖 event id 自动去重。恢复按当前配置、当前 policy 和当前 enforcement planner 重新解释旧 ingress event；当前 parser cursor 还不是完整 durable parser checkpoint，processing provenance 也还不完整，因此 capability 必须继续标记 degraded。`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合、连续 exporter worker、replay exporter 命令和状态/metrics 快照输出。
 - 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。parser 已识别 WebSocket HTTP Upgrade，输出 `WebSocketHandoff` 后切换到 WebSocket frame parser；后续字节会输出 `WebSocketFrame` metadata，包括方向、HTTP stream sequence、frame sequence、FIN/RSV/opcode/masked/payload length 和 payload fingerprint。frame payload 以增量 BLAKE3 hash 计算 fingerprint，不为了 metadata 缓存完整 payload。当前不聚合完整 WebSocket message，不解压 extension payload。
 - 已实现 configured policy loader 的第一版 bundle 入口：`policies[].path` 指向目录时按 `manifest.toml` + `main.lua` 加载，manifest 目前支持 `id`、`version` 和 typed `hooks`，并要求 manifest id 与配置中的 policy id 一致；`status` 只做 bundle metadata/manifest 校验，不执行 Lua；`check` 和 `run` 会显式加载并执行初始化。裸 Lua 文件仍保留为 legacy source，使用配置 id、配置版本和全量 hook 列表，主要用于平滑迁移与本地调试，不代表长期 policy bundle 格式。
@@ -115,6 +115,7 @@ flowchart LR
 | `export_queue` | Available | export lane、per-sink cursor、schema-aware payload、protobuf batch envelope、record-level `stored_at_unix_ns`，以及按 planned sinks cursor 下界执行的 acked-prefix cleanup 和按 retention deadline 退休过期连续前缀已存在。 | retention 只处理 export queue；ingress journal retention、容量型 retention 和 parser checkpoint 仍未完成。 |
 | `webhook_exporter` | Available | `run` 可连续 drain planned sinks，支持固定间隔、全局/每 sink batch 预算、single sink timeout、per-sink exponential backoff、cursor-safe export queue cleanup、retention deadline、trust anchors 和 client identity refs。 | 在线 backoff 运行态还未进入 status；gRPC/Kafka/OTLP 仍是保留 transport。 |
 | `dry_run_enforcement` | Available | dry-run enforcement 会记录策略保护意图、requested/effective action 和 audit event。 | 不执行真实连接阻断。 |
+| `connection_enforcement` | Unavailable | `EnforcementBackend` trait、planner delegation boundary 和 `RuntimePlan.enforcement.capability` 已存在。 | 默认 registry 没有可执行阻断 backend；`enforcement.mode = "enforce"` 必须 fail closed。 |
 
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
 - 当前 `FjallSpool` 存储的是带 v2 record envelope 的 `SpoolPayload`；record envelope 包含 `stored_at_unix_ns`、typed schema 和 payload bytes，spool marker 显式写 `sssa-probe-spool-v2`，旧 marker 会 fail fast。代码内使用 `SpoolPayloadSchema` enum，落盘和 protobuf `payload_schema` 字段仍写稳定 wire string。`CaptureEvent` 和 `EventEnvelope.kind` 都是 serde tagged payload enum；`EventType` enum 显式镜像稳定 discriminant，用于 event id、`EventKind::name()` 和 policy hook 映射，并用测试锁住它与 serde `type` tag 的一致性。ingress lane 当前写入 JSON framed `CaptureEvent`，export lane 当前写入 JSON framed `EventEnvelope`。reader 只返回已越过 lane durable high-water sequence 的条目，避免并发 exporter 读到已 commit 但尚未 `SyncAll` 持久化完成的事件；`status` 使用同一 durable high-water 生成 spool/export lag 快照。protobuf batch envelope 通过显式 payload schema 标记该格式。这是过渡契约，不等同于最终 protobuf event envelope。当前 replay 不把文件输入归因到 agent 自身，而使用 synthetic replay identity、保留 PID/TGID `0` 和 0 confidence。
@@ -145,7 +146,7 @@ flowchart LR
 - TLS 明文能力：libssl uprobe、keylog/session secret、future MITM provider。
 - 协议能力：HTTP/1.x、SSE、WebSocket upgrade detection、WebSocket frame metadata、opaque stream。
 - 策略能力：LuaJIT、JIT 状态、policy state API、hot reload。
-- 动作能力：dry-run verdict、future connection-level eBPF enforcement。
+- 动作能力：dry-run verdict、connection-level enforcement capability boundary、未来 eBPF backend。
 - 外发能力：spool-backed exporter、best-effort sink、codec 支持、mTLS。
 
 配置和策略可以声明：
@@ -685,23 +686,26 @@ Lua API 采用受控领域 API：
 当前先观测告警，不真实阻断，但必须把拦截抽象做好。高位目标不是“policy 直接阻断连接”，而是三层分离：
 
 - `PolicyRuntime` 只产生 typed verdict。
-- `ScopedEnforcementPlanner` 根据 enforcement mode、selector 和 backend capability 把 verdict 解析为执行/不执行决策。
+- `ScopedEnforcementPlanner` 根据 enforcement mode、selector 和 protection profile 把 verdict 解析为执行/不执行决策；`enforce` 模式只委托 `EnforcementBackend`。
+- `RuntimePlan.enforcement.capability` 是能力事实源：`disabled`/`audit_only` 不需要能力，`dry_run` 需要 `dry_run_enforcement`，`enforce` 需要 `connection_enforcement`。
 - pipeline 把原始 `PolicyVerdict` 与 `EnforcementDecision` 都写入 export queue，形成可审计链路。
 
 ```mermaid
 flowchart LR
     PolicyRuntime[Policy Runtime] --> PolicyVerdict[Policy Verdict]
-    PolicyVerdict --> Planner[Scoped Enforcement Planner]
+    RuntimeCaps[Runtime Capability Plan] --> CompositionGate[Composition Gate]
+    CompositionGate --> Planner[Scoped Enforcement Planner]
+    PolicyVerdict --> Planner
     MainSelector[Main Config Selector] --> Planner
     ManifestSelector[Manifest Selector] --> Planner
     ProtectionProfile[Protection Profile] --> Planner
-    BackendCaps[Backend Capabilities] --> Planner
+    Planner -- enforce only --> Backend[Enforcement Backend]
+    Backend --> Decision
     Planner --> Decision[Enforcement Decision]
     Decision --> Audit[Audit Event]
-    Decision --> FutureBackend[Future Enforcement Backend]
 ```
 
-当前已实现 dry-run/audit enforcement 的第一版：`deny`、`reset`、`quarantine` 会生成 `EnforcementDecision` audit event，但 effective action 仍为 `observe`。`observe`、`alert` 不进入 enforcement executor，继续作为普通策略事件处理。`enforcement.selector` 复用 core typed selector，支持只对某些进程、服务、端口或方向启用防护范围。
+当前已实现 dry-run/audit enforcement 和 backend delegation boundary 的第一版：`deny`、`reset`、`quarantine` 会生成 `EnforcementDecision` audit event；在 `audit_only`/`dry_run` 下 effective action 仍为 `observe`。`observe`、`alert` 不进入 enforcement planner，继续作为普通策略事件处理。`enforcement.selector` 复用 core typed selector，支持只对某些进程、服务、端口或方向启用防护范围。无 backend 的 planner 构造器不会接受 `enforce`，只有显式注入 `EnforcementBackend` 的构造路径才能进入真实 enforce planner；正常 runtime 默认不会启动到这一步，因为 `connection_enforcement` capability 是 unavailable，`enforcement.mode = "enforce"` 在 `RuntimePlan` 构建阶段 fail closed。agent composition root 还会二次要求 executable backend factory；当前没有真实 backend factory，因此即使测试或未来 registry 声明了 `connection_enforcement` available，`check`/`run` 也会在 `build_configured_enforcement` 阶段 fail closed，而不是启动一个实际 `observe` 的假 enforce。
 
 当前也已实现外部 enforcement policy manifest 的第一版装配边界。`enforcement.policy.source` 可以指向单个 TOML manifest 文件、包含 `manifest.toml` 的目录，或一个 remote endpoint；`RuntimePlan.enforcement.policy_source` 会把目录 source 解析为实际 `manifest.toml` 路径并保留 remote endpoint，后续 `check`、`run` 和 offline `status` 都消费 plan，而不是重新解释 raw config。remote source 是启动/检查阶段的一次性 GET source，当前不代表动态控制面、长连接下发或热更新。manifest 当前字段为：
 
@@ -712,9 +716,9 @@ flowchart LR
 | `selector` | 可选 core typed selector。 | 与主配置 `enforcement.selector` 使用 AND 语义合成。 |
 | `protective_actions` | 允许进入 planner 的保护动作集合。 | 当前由 core `ProtectiveActionProfile` 统一校验、去重和序列化，只允许 `deny`、`reset`、`quarantine`。 |
 
-主配置中的 `enforcement.selector` 与 manifest 内的 `selector` 使用 AND 语义合成；因此可以把全局 agent 防护边界和外部下发的应用/服务边界分开管理。manifest 不执行代码，只是声明保护 profile 和作用域；Lua policy 仍负责产生 typed verdict。`check` 和 `run` 会显式读取并校验 manifest，本地 source 从文件读取，remote source 通过异步 HTTP GET 拉取 TOML 并禁止重定向；`run` 在完整 runtime plan validation 通过前只做本地 metadata preflight，不会访问 remote endpoint。offline `status` 只做 metadata-only 检查并把健康状态标为 degraded，remote source 在 offline status 中不发网络请求、不声称 manifest 已加载，避免把 offline status 变成隐式执行或启用防护的入口；在线 admin status 使用 `run` 启动时已加载的 manifest snapshot，报告 `loaded` 并携带 local path 或 remote endpoint source origin，不会重新读取磁盘上可能已变化的 source，也不会重新访问 remote endpoint。
+主配置中的 `enforcement.selector` 与 manifest 内的 `selector` 使用 AND 语义合成；因此可以把全局 agent 防护边界和外部下发的应用/服务边界分开管理。manifest 不执行代码，只是声明保护 profile 和作用域；Lua policy 仍负责产生 typed verdict。`check` 和 `run` 会显式读取并校验 manifest，本地 source 从文件读取，remote source 通过异步 HTTP GET 拉取 TOML 并禁止重定向；`run` 先完成完整 runtime plan validation，再构造 configured enforcement，因此 unsupported capability 不会提前读取本地 manifest，也不会访问 remote endpoint，且无 executable backend factory 时不会继续加载 Lua policy。offline `status` 只做 metadata-only 检查并把健康状态标为 degraded，remote source 在 offline status 中不发网络请求、不声称 manifest 已加载，避免把 offline status 变成隐式执行或启用防护的入口；在线 admin status 使用 `run` 启动时已加载的 manifest snapshot，报告 `loaded` 并携带 local path 或 remote endpoint source origin，不会重新读取磁盘上可能已变化的 source，也不会重新访问 remote endpoint。
 
-未来真实防护后端在当前 planner 后面增加 `EnforcementBackend` 和 provider capability：
+真实防护后端必须实现当前 `EnforcementBackend` 契约，并通过 runtime capability 声明可执行范围。`EnforcementBackendDecision` 只允许 backend 表达 `applied` 或 `unsupported`；effective action 固定为已通过 profile 校验的 requested action，backend 当前不能自行替换为另一种保护动作。`disabled`、`dry_run`、`selector_miss` 这类 planner outcome 也不能由 backend 自行伪造。
 
 | 契约 | 字段 / 能力 | 用途 |
 | --- | --- | --- |
@@ -730,7 +734,10 @@ flowchart LR
 | verdict 为 `deny`、`reset`、`quarantine` 且处于 `audit_only`/`dry_run` | `observe`。 | 记录 requested action、effective action、planner outcome 和 audit event。 |
 | selector 未命中 | `observe`。 | 输出 `selector_miss`，说明 verdict 不在当前防护范围内。 |
 | verdict action 不在 protection profile 中 | `observe`。 | 输出 `unsupported`，不能静默当作已防护。 |
-| 配置真实 `enforce` 模式 | 无运行态。 | 当前必须 fail closed，因为还没有可执行阻断后端。 |
+| `enforce` 且 `connection_enforcement` capability 不可用 | 无运行态。 | `RuntimePlan` 构建阶段 fail closed，不输出伪可用 snapshot。 |
+| `enforce` 且 capability 可用但 composition root 没有 executable backend factory | 无运行态。 | `check`/`run` 在 `build_configured_enforcement` 阶段 fail closed。 |
+| `enforce` 且 backend 返回 `unsupported` | `observe`。 | pipeline 记录 `unsupported` decision；这表示真实 backend 拒绝或无法执行该已请求动作，不存在默认 observe-only 的假 enforce backend。 |
+| `enforce` 且 backend 成功执行 | requested action。 | 输出 `applied` decision；当前不支持 backend action substitution。 |
 
 每个保护型 verdict 都必须输出 `EnforcementDecision` audit event。
 
@@ -773,7 +780,7 @@ flowchart LR
 - `capture.fallback_backends` 只允许 live backend，不包含 replay。replay 是可重复验证入口，不是 live agent 的自动 fallback。
 - eBPF object 路径放在 `[capture.ebpf] object_path` 下。这个字段作为 `aya-obj` object preflight 输入；preflight 校验 required map/program contract、ringbuf map shape 和 tracepoint section，默认不因为未来扩展多出 map/program 而失败。高层用户态 `aya` process observation loader、connect observation 到单个 `ConnectionOpened` `CaptureEvent` 的纯转换 bridge、descriptor close observation decoder、unresolved connect 到 degraded `Gap` 的 provider path 已存在。payload event conversion、socket-lifetime close event 和完整 kernel-side capture program 完成前，host/object/contract/procfs socket attribution preflight 成功仍然是 degraded capability；`auto` 不会选择 degraded eBPF provider，显式 `capture.selection = "ebpf"` 可以运行 connect/descriptor-close observation path。
 - libpcap 运行参数放在 `[capture.libpcap]` 下，包括 `interface`、`bpf_filter`、`snaplen`、`promisc`、`immediate_mode`、`read_timeout_ms` 和 `buffer_size`；这些属于 provider 配置，不进入 parser 或 policy 层。
-- `RuntimePlan` 是配置解析后的事实源，必须输出候选 provider、选中的 provider、export worker effective plan、enforcement source plan、capability matrix 和不可用原因；`run` 使用 plan 启动，`check` 输出 plan 并执行显式 composition check，供部署前审计。
+- `RuntimePlan` 是配置解析后的事实源，必须输出候选 provider、选中的 provider、export worker effective plan、enforcement capability/source plan、capability matrix 和不可用原因；`run` 使用 plan 启动，`check` 输出 plan 并执行显式 composition check，供部署前审计。
 
 当前 export runtime 配置语义：
 
@@ -786,7 +793,7 @@ flowchart LR
 - 这些 schedule 字段共同定义当前 fixed bounded worker mode：worker 以固定 tick 执行有界 drain，但失败 sink 采用 per-sink exponential backoff，避免把 live worker 变成无界 tail flush 或被单个挂起/失败 sink 永久卡住。
 - `[storage.retention.export]` 定义 export queue 的本地生命周期策略，而不是 exporter retry 行为。`max_age_ms` 未配置时不做超时丢弃；配置后必须大于 0，表示超过该年龄的 export queue 连续前缀可以被丢弃。`sweep_interval_ms` 默认 `1000`，必须大于 0，用于独立 retention worker 的周期维护；`prune_batch_limit` 默认 `1024`，必须大于 0，用于限制单轮 retention 删除事务大小。
 - `RuntimePlan.export.worker` 是单个 typed worker plan：`disabled` 携带原因，`fixed_interval_bounded` 携带 interval、全局 batch budget、timeout 和 typed failure backoff。`RuntimePlan.export.retention` 保留 resolved retention policy；`RuntimePlan.export.sinks[].worker` 同时保留 per-sink batch quota override 和 resolved effective quota。`run` 的后台 worker、`check` 的 plan 输出、`status`/admin 的 aggregate export status 和 per-sink exporter snapshot 都从该 plan 构造，而不是重新解释 raw exporter config。没有 planned exporter sink 或显式禁用 worker 时，`check` 会显示 worker disabled 的原因。
-- `RuntimePlan.enforcement` 保留 `mode`、主配置 selector 是否配置、以及 `policy_source` 的 typed plan；目录 source 会在 plan 中解析为 `manifest.toml` 路径，remote source 保留 endpoint。runtime plan 阶段只做配置形状和 capability validation，不打开 manifest 文件、不发网络请求；`run` 在 plan 构建前只做 policy 与本地 enforcement manifest metadata preflight，避免无效本地策略触发 capture/spool side effect，同时保证 remote enforcement fetch 必须发生在完整 runtime plan validation 之后；`check`/`run` 在 composition root 加载 external enforcement manifest，remote source 通过一次 GET 拉取 TOML manifest 并复用同一套校验；offline `status` 只做 metadata-only source inspection，online admin status 报告运行中已加载的 manifest。
+- `RuntimePlan.enforcement` 保留 `mode`、capability requirement、主配置 selector 是否配置、以及 `policy_source` 的 typed plan；目录 source 会在 plan 中解析为 `manifest.toml` 路径，remote source 保留 endpoint。runtime plan 阶段只做配置形状和 capability validation，不打开 manifest 文件、不发网络请求；`run` 先完成 `RuntimePlan` validation，再构造 configured enforcement，之后才加载 Lua policy runtime，避免 unsupported capability 或无 executable backend factory 时先执行 Lua top-level、读取本地 manifest 或触发 remote enforcement fetch；`check` 也先执行 enforcement composition check，再加载 policy bundle，避免无可执行 backend 时输出误导性的 policy-loaded check。remote source 通过一次 GET 拉取 TOML manifest 并复用同一套校验；offline `status` 只做 metadata-only source inspection，online admin status 报告运行中已加载的 manifest。
 - `run` 结束时仍会尽力执行一次尾部 drain，使 `--max-events` smoke、plaintext feed 和其它有限运行场景能够把最后一批事件同步推出；即使 pipeline 已返回错误，也会先停止 worker 并尝试 tail drain，再按错误优先级返回。
 
 配置/策略签名：
@@ -1030,7 +1037,7 @@ endpoint 配置或能力不匹配时 fail fast。当前实现使用 `Compression
 - 已实现 CLI `status --config <path>`，输出可复用的 JSON snapshot：health、capture status、policy status、enforcement status、TLS plaintext/material status、capability matrix、offline spool high-water、planned exporter sink cursor/lag 和 metrics counters。`health` 表示当前 active capture/spool/exporter 状态，并纳入 policy/enforcement policy 的已知阻断、source unavailable 或 metadata-only 未验证状态；无效 enforcement 配置在 snapshot 前由 `RuntimePlan` fail closed。capability matrix 和 capability metrics 保持独立，避免把路线图缺口伪装成当前运行故障。
 - `status` 对配置/runtime plan 错误 fail fast；对 spool 缺失、尚未初始化或读取失败不伪装成功，也不会为 status 查询创建 spool，而是在 snapshot 中标记 `spool.mode = unavailable`，并把相关 exporter 标记 unavailable。当前 CLI status 是 offline probe：如果 spool 已由正在运行的 agent 持有，会显式标记 `spool.mode = degraded` 和 busy reason，而不是伪装成坏 spool 或在线 admin snapshot。
 - policy status 当前只做 metadata-only source check：报告 configured/enabled count、active policy id/path、selector 是否配置、legacy Lua 文件或 bundle directory 是否具备可加载 metadata；对于 bundle directory 会解析 `manifest.toml` 并检查 `main.lua` metadata，但不会加载或执行 Lua source。启用 policy 且 source metadata 可见时，offline status 标记 `policy.mode = metadata_only` 并让 health degraded，而不是宣称 policy runtime 已可用。原因是 `PolicyRuntime` 加载阶段会执行 Lua chunk，offline status 不能变成隐式执行外部策略的入口。显式 `check` 会加载并编译启用的 policy，失败则 fail closed。
-- enforcement status 使用 typed enum 报告 configured mode、effective status、主配置 selector、manifest selector、effective selector、external policy source metadata 和 capability requirement。`disabled`/`audit_only` 标记 capability `not_required`；`dry_run` 标记需要 `DryRunEnforcement` capability。外部 enforcement local manifest source 可用时 offline status 解析 TOML manifest metadata，报告 id/version、manifest selector 是否配置和 protective actions，但不执行动作；remote source 在 offline status 中只报告 endpoint metadata，不发网络请求、不声称已加载 manifest。source 缺失或 manifest 非法时 health 为 unavailable，source 可用但只是 metadata-only 时 health degraded。在线 admin status 报告启动时已加载的 manifest 为 `loaded`，并在 loaded snapshot 中保留 local path 或 remote endpoint source origin，不因磁盘 source 后续变化或远程 endpoint 当前状态而误报当前运行保护范围。`enforce` 和缺少 dry-run capability 的配置在 `RuntimePlan` 构建阶段 fail closed，因此 CLI status 对这类配置直接返回 validation error，而不是输出一个伪可用 snapshot。
+- enforcement status 使用 typed enum 报告 configured mode、effective status、主配置 selector、manifest selector、effective selector、external policy source metadata 和 capability requirement。`disabled`/`audit_only` 标记 capability `not_required`；`dry_run` 标记需要 `dry_run_enforcement` capability；`enforce` 标记需要 `connection_enforcement` capability。外部 enforcement local manifest source 可用时 offline status 解析 TOML manifest metadata，报告 id/version、manifest selector 是否配置和 protective actions，但不执行动作；remote source 在 offline status 中只报告 endpoint metadata，不发网络请求、不声称已加载 manifest。source 缺失或 manifest 非法时 health 为 unavailable，source 可用但只是 metadata-only 时 health degraded。在线 admin status 报告启动时已加载的 manifest 为 `loaded`，并在 loaded snapshot 中保留 local path 或 remote endpoint source origin，不因磁盘 source 后续变化或远程 endpoint 当前状态而误报当前运行保护范围。缺少 required enforcement capability 的配置在 `RuntimePlan` 构建阶段 fail closed，因此 CLI status 对这类配置直接返回 validation error，而不是输出一个伪可用 snapshot。
 - TLS status 报告 plaintext provider 是否启用、selector 是否配置、capability requirement，以及 configured plaintext plan 引用的 keylog/session secret material source 状态；同时对配置的 TLS material registry 做 metadata-only source check：判断路径是否存在、不是 symlink、是 regular file 且不超过当前大小上限，并把 material 标为 `trust_or_identity` 或 `decrypt_hint`。offline status 不读取、不解析、不验证证书/私钥/keylog 内容，也不把证书/私钥误称为通用 TLS 解密能力。registry 中未被 active surface 引用的 material 缺失只体现在 `tls.materials[].source.mode`，不直接拉低 health；被 planned webhook exporter 引用的 trust/client identity material 会同时进入 exporter status，source 不可用时对应 exporter 和 health 为 unavailable。configured plaintext refs 的 source 状态只说明配置引用的文件元数据是否可见，不说明 TLS plaintext provider 已经工作。
 - `run` 可按 `[admin] enabled = true` 启动 owner-constrained private Unix socket server，socket 文件权限设置为 `0600`，当前 JSON-lines 协议支持 `{"command":"status"}` 和 `{"command":"metrics"}`。admin socket parent directory 必须由部署层预创建，且不能是 symlink、不能允许 group/other 访问，owner 必须是 root 或当前 euid；socket 路径已有活跃 listener 时 fail fast，拒绝覆盖非 socket 文件，只清理 connection-refused 的 stale socket。在线 status 直接读取运行中 spool handle，避免把自身 Fjall lock 误报成 offline busy；admin server 在 exporter worker 启动前完成 bind，避免控制面失败后后台 exporter 已产生 side effect。
 - 尚未实现 reload、debug dump 和 Prometheus adapter；这些后续应复用同一 status snapshot 构建器，并承担运行中 agent 的在线状态查询。
@@ -1180,7 +1187,7 @@ benchmark 参数：
 当前 CLI 至少提供：
 
 - `run`：启动 agent；默认持续运行，`--max-events` 用于 smoke/e2e 中对 live provider 做有界采集。`--max-events` 是硬 capture event 数上限，不保证读到 flow close 边界，也不替代完整 close/flush 行为验收。
-- `check`：校验配置、resolved runtime plan、启用的 policy bundle 和 enforcement planner，输出 JSON check report；policy 加载/编译失败时 fail closed。`check` 与 `run` 共用中性的 configured policy/enforcement composition helper，避免诊断入口和生产路径各自解释配置。policy snapshot 中的 `registered_hooks` 表示 runtime 注册的支持 hook，不表示 Lua source 中实际定义的函数集合。
+- `check`：校验配置、resolved runtime plan、enforcement composition 和启用的 policy bundle，输出 JSON check report；缺少可执行 enforcement backend 或 policy 加载/编译失败时 fail closed。`check` 与 `run` 共用中性的 configured policy/enforcement composition helper，避免诊断入口和生产路径各自解释配置。policy snapshot 中的 `registered_hooks` 表示 runtime 注册的支持 hook，不表示 Lua source 中实际定义的函数集合。
 - `status`：输出 runtime/admin/metrics snapshot。
 - `replay`：用 pcap/spool 样本跑 parser/policy/exporter。
 - `capabilities`：输出 capability matrix；可选 `--config` 时按配置中的 provider-specific 输入做能力探测，否则使用默认配置。
@@ -1241,8 +1248,8 @@ enforcement 抽象验收：
 1. Lua 策略返回 `deny` 或 `reset` typed verdict。
 2. pipeline 输出原始 `PolicyVerdict`。
 3. `check`/`run` 显式加载 external enforcement manifest，本地 source 从文件读取，remote source 通过一次 GET 拉取 TOML，随后合成主配置 selector 与 manifest selector。
-4. `ScopedEnforcementPlanner` 按 `enforcement.mode`、effective selector 和 protection profile 评估 verdict。
-5. agent 不真实阻断，`effective_action` 仍为 `observe`。
+4. `ScopedEnforcementPlanner` 按 `enforcement.mode`、effective selector 和 protection profile 评估 verdict；`enforce` 模式委托 `EnforcementBackend`。
+5. 默认 agent 不真实阻断，`audit_only`/`dry_run` 的 `effective_action` 仍为 `observe`，`enforce` 因缺少 `connection_enforcement` capability fail closed。
 6. 输出 `EnforcementDecision` audit event，记录 requested action、outcome、selector match 和 reason。
 
 ## 32. 被拒绝或推迟的方案
@@ -1318,10 +1325,10 @@ enforcement 抽象验收：
 | 策略 Hook | 分阶段 Hook，selector 先预过滤 | 第 17 节 |
 | policy state | 有界状态 API，跨 worker eventually consistent | 第 17 节 |
 | 热更新 | 新 VM 校验后原子切换，Lua 隐式状态不迁移 | 第 17 节 |
-| 拦截抽象 | PolicyRuntime + external enforcement manifest + ScopedEnforcementPlanner + future EnforcementBackend capabilities | 第 18 节 |
+| 拦截抽象 | PolicyRuntime + external enforcement manifest + ScopedEnforcementPlanner + EnforcementBackend boundary + connection_enforcement capability | 第 18 节 |
 | 当前拦截验收 | dry-run typed verdict、external manifest protection profile 和 selector 合成 | 第 18、31 节 |
 | 配置 | TOML + 目录热加载，预留 RemoteConfigSource | 第 19 节 |
-| runtime plan | provider descriptor `ProviderRegistry` 生成 capability matrix，`RuntimePlan` 解析 capture backend selection、export worker effective plan 和 enforcement source plan；`auto` 使用有序 live fallback，显式 backend 是 required backend；默认 auto 在无 live provider 时显式 unavailable，`run` fail closed | 第 19、27 节 |
+| runtime plan | provider descriptor `ProviderRegistry` 生成 capability matrix，`RuntimePlan` 解析 capture backend selection、export worker effective plan、enforcement capability/source plan；`auto` 使用有序 live fallback，显式 backend 是 required backend；默认 auto 在无 live provider 时显式 unavailable，`run` fail closed | 第 19、27 节 |
 | SecretStore | filesystem 默认，预留 Vault/KMS/TPM | 第 20 节 |
 | durable spool 目标 | ingress journal + export queue 双层 spool | 第 21 节 |
 | durable spool 当前实现 | Fjall ingress journal + export queue + `DurableSpool` trait + schema-aware `SpoolPayload`；两条 lane 独立 sequence/cursor；parser recovery 可在打开 provider 前按 sequence 重放 `CaptureEvent`，覆盖 bytes、gap 和 connection lifecycle event，且只在 active parser state 已被移除时推进 parser cursor；语义仍是 at-least-once，且 durable parser checkpoint、processing provenance 未完整，因此 `ingress_journal` 和 `durable_spool` capability 都是 degraded | 第 21 节 |
