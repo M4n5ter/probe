@@ -3,6 +3,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use pcap::Linktype;
 use probe_core::TcpEndpoint;
 
+use super::tcp_seq;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DecodedTcpSegment<'a> {
     pub(super) source: IpAddr,
@@ -45,6 +47,18 @@ impl<'a> DecodedTcpSegment<'a> {
     pub(super) fn has_rst(&self) -> bool {
         self.flags.rst
     }
+
+    pub(super) fn payload_sequence(&self) -> u32 {
+        tcp_seq::advance(
+            self.sequence,
+            usize::from(self.flags.consumes_sequence_before_payload()),
+        )
+    }
+
+    pub(super) fn close_sequence(&self) -> Option<u32> {
+        (self.flags.fin || self.flags.rst)
+            .then(|| tcp_seq::advance(self.payload_sequence(), self.payload.len()))
+    }
 }
 
 enum IpPacket<'a> {
@@ -66,6 +80,10 @@ impl TcpFlags {
             fin: flags & 0x01 != 0,
             rst: flags & 0x04 != 0,
         }
+    }
+
+    fn consumes_sequence_before_payload(&self) -> bool {
+        self.syn
     }
 }
 
@@ -244,6 +262,38 @@ fn decode_tcp_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_and_close_sequences_account_for_tcp_control_bytes() {
+        let syn_data_fin = DecodedTcpSegment {
+            source: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            destination: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            source_port: 50_000,
+            destination_port: 80,
+            sequence: 41,
+            flags: TcpFlags {
+                syn: true,
+                fin: true,
+                rst: false,
+            },
+            payload: b"hi",
+        };
+        let pure_fin = DecodedTcpSegment {
+            sequence: 108,
+            flags: TcpFlags {
+                syn: false,
+                fin: true,
+                rst: false,
+            },
+            payload: b"",
+            ..syn_data_fin
+        };
+
+        assert_eq!(syn_data_fin.payload_sequence(), 42);
+        assert_eq!(syn_data_fin.close_sequence(), Some(44));
+        assert_eq!(pure_fin.payload_sequence(), 108);
+        assert_eq!(pure_fin.close_sequence(), Some(108));
+    }
 
     #[test]
     fn decodes_ethernet_ipv4_tcp_http_request_payload() {

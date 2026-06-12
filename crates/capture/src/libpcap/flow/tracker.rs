@@ -1,66 +1,70 @@
 use std::collections::{HashMap, VecDeque};
 
-use probe_core::{
-    AddressPort, Direction, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity,
-    TcpConnection, TcpEndpoint, Timestamp, TransportProtocol,
+use probe_core::Timestamp;
+
+use crate::ProcessResolver;
+
+use super::super::decoder::DecodedTcpSegment;
+use super::candidate::{
+    FlowCandidate, flow_from_decoded, infer_initial_direction, opposite_direction,
+    select_flow_candidate,
 };
-
-use crate::{CaptureError, ProcessResolver, ResolvedProcess};
-
-use super::decoder::DecodedTcpSegment;
+use super::model::{
+    FlowClosure, FlowEnd, FlowFinalization, FlowLifecycleObservation, FlowPayload,
+    FlowPayloadObservation,
+};
+use super::record::{ConnectionKey, FlowRecord};
 
 const MAX_FLOW_TRACKER_CONNECTIONS: usize = 16_384;
 const FLOW_IDLE_TIMEOUT_UNIX_NS: i64 = 120_000_000_000;
 
 #[derive(Debug, Default)]
-pub(super) struct FlowTracker {
+pub(in crate::libpcap) struct FlowTracker {
     flows: HashMap<ConnectionKey, FlowRecord>,
     order: VecDeque<ConnectionKey>,
 }
 
 impl FlowTracker {
-    pub(super) fn observe(
+    pub(in crate::libpcap) fn observe(
         &mut self,
         decoded: &DecodedTcpSegment<'_>,
         timestamp: Timestamp,
         process_resolver: &mut Option<Box<dyn ProcessResolver>>,
-    ) -> FlowObservation {
+    ) -> FlowPayloadObservation {
+        let mut invalidated_resolution = false;
+        invalidate_for_lifecycle_signal(decoded, process_resolver, &mut invalidated_resolution);
         let mut closed_before = self.evict_idle(timestamp.wall_time_unix_ns);
         let key = ConnectionKey::from_decoded(decoded);
         if decoded.has_syn()
-            && let Some(flow) = self.remove_flow(&key)
+            && !self.is_retransmitted_syn(&key, decoded)
+            && let Some(closure) = self.remove_flow(&key)
         {
-            closed_before.push(flow);
+            closed_before.push(closure);
+        }
+        if let Some(record) = self.flows.get(&key) {
+            let direction = record.direction_for(decoded);
+            if record.payload_starts_after_close(direction, decoded)
+                && let Some(closure) = self.remove_flow(&key)
+            {
+                closed_before.push(closure);
+            }
         }
         if !closed_before.is_empty() {
-            invalidate_process_resolution(process_resolver);
+            invalidate_process_resolution(process_resolver, &mut invalidated_resolution);
         }
         if let Some(record) = self.flows.get_mut(&key) {
-            let direction = if decoded.source_endpoint() == record.local_endpoint {
-                Direction::Outbound
-            } else {
-                Direction::Inbound
-            };
+            let direction = record.direction_for(decoded);
             record.last_seen_wall_time_unix_ns = timestamp.wall_time_unix_ns;
-            let mut observation = FlowObservation::new(
-                decoded,
-                direction,
-                record.process.clone(),
-                record.confidence,
-                record.flow.start_monotonic_ns,
-                None,
-            );
+            let flow = record.flow.clone();
             record.observe_lifecycle(decoded);
-            if record.closed() {
-                observation.closed_after = self.remove_flow(&key);
-            }
-            observation.closed_before = closed_before;
-            return observation;
+            let payload = FlowPayload::new(direction, flow.clone(), record.confidence, None);
+            let after_payload = self.flow_end_after_lifecycle(&key, direction);
+            return FlowPayloadObservation::new(closed_before, payload, after_payload);
         }
 
         let capacity_closed = self.evict_oldest_if_full();
         if !capacity_closed.is_empty() {
-            invalidate_process_resolution(process_resolver);
+            invalidate_process_resolution(process_resolver, &mut invalidated_resolution);
         }
         closed_before.extend(capacity_closed);
         let primary = FlowCandidate::from_decoded(decoded, infer_initial_direction(decoded));
@@ -76,76 +80,94 @@ impl FlowTracker {
         );
         self.flows.insert(
             key,
-            FlowRecord {
-                local_endpoint: selected.local_endpoint,
-                process: selected.process,
-                confidence: selected.confidence,
-                flow: flow.clone(),
-                last_seen_wall_time_unix_ns: timestamp.wall_time_unix_ns,
-                local_fin: false,
-                remote_fin: false,
-                reset: false,
-            },
+            FlowRecord::new(
+                selected.local_endpoint,
+                selected.confidence,
+                flow.clone(),
+                timestamp.wall_time_unix_ns,
+            ),
         );
-        let mut observation = FlowObservation {
-            direction: selected.direction,
-            flow,
-            attribution_confidence: selected.confidence,
-            attribution_failure: selected.attribution_failure,
-            closed_before,
-            closed_after: None,
-        };
+        let payload = FlowPayload::new(
+            selected.direction,
+            flow.clone(),
+            selected.confidence,
+            selected.attribution_failure,
+        );
         if let Some(record) = self.flows.get_mut(&key) {
             record.observe_lifecycle(decoded);
-            if record.closed() {
-                observation.closed_after = self.remove_flow(&key);
-            }
         }
-        if decoded.has_rst() {
-            observation.closed_after = observation.closed_after.or_else(|| self.remove_flow(&key));
-        }
-        observation
+        let after_payload = self.flow_end_after_lifecycle(&key, selected.direction);
+        FlowPayloadObservation::new(closed_before, payload, after_payload)
     }
 
-    pub(super) fn observe_lifecycle(
+    pub(in crate::libpcap) fn observe_lifecycle(
         &mut self,
         decoded: &DecodedTcpSegment<'_>,
         timestamp: Timestamp,
-    ) -> Vec<FlowContext> {
-        let mut closed = self.evict_idle(timestamp.wall_time_unix_ns);
+        process_resolver: &mut Option<Box<dyn ProcessResolver>>,
+    ) -> FlowLifecycleObservation {
+        let mut invalidated_resolution = false;
+        invalidate_for_lifecycle_signal(decoded, process_resolver, &mut invalidated_resolution);
+        let mut closed_before = self.evict_idle(timestamp.wall_time_unix_ns);
         let key = ConnectionKey::from_decoded(decoded);
         if decoded.has_syn() {
-            if let Some(flow) = self.remove_flow(&key) {
-                closed.push(flow);
+            if self.is_retransmitted_syn(&key, decoded) {
+                if let Some(record) = self.flows.get_mut(&key) {
+                    record.last_seen_wall_time_unix_ns = timestamp.wall_time_unix_ns;
+                    record.observe_lifecycle(decoded);
+                }
+            } else if let Some(closure) = self.remove_flow(&key) {
+                closed_before.push(closure);
             }
-            return closed;
+            if !closed_before.is_empty() {
+                invalidate_process_resolution(process_resolver, &mut invalidated_resolution);
+            }
+            return FlowLifecycleObservation::new(closed_before, None);
         }
+        if !closed_before.is_empty() {
+            invalidate_process_resolution(process_resolver, &mut invalidated_resolution);
+        }
+        let mut finalization = None;
+        let mut closed = false;
         if let Some(record) = self.flows.get_mut(&key) {
+            let direction = record.direction_for(decoded);
             record.last_seen_wall_time_unix_ns = timestamp.wall_time_unix_ns;
             record.observe_lifecycle(decoded);
-            if record.closed()
-                && let Some(flow) = self.remove_flow(&key)
-            {
-                closed.push(flow);
+            closed = record.closed();
+            if !closed && let Some(close_sequence) = record.close_sequence_for(direction) {
+                finalization = Some(FlowFinalization::new(record.flow.clone(), close_sequence));
             }
         }
-        closed
+        let after_lifecycle = if closed {
+            self.remove_flow(&key).map(FlowEnd::close)
+        } else {
+            finalization.map(FlowEnd::finalize)
+        };
+        FlowLifecycleObservation::new(closed_before, after_lifecycle)
     }
 
-    fn evict_oldest_if_full(&mut self) -> Vec<FlowContext> {
+    fn is_retransmitted_syn(&self, key: &ConnectionKey, decoded: &DecodedTcpSegment<'_>) -> bool {
+        decoded.has_syn()
+            && self
+                .flows
+                .get(key)
+                .is_some_and(|record| record.syn_sequence_matches(decoded))
+    }
+
+    fn evict_oldest_if_full(&mut self) -> Vec<FlowClosure> {
         let mut closed = Vec::new();
         while self.flows.len() >= MAX_FLOW_TRACKER_CONNECTIONS {
             let Some(oldest) = self.order.pop_front() else {
                 return closed;
             };
-            if let Some(flow) = self.remove_flow(&oldest) {
-                closed.push(flow);
+            if let Some(closure) = self.remove_flow(&oldest) {
+                closed.push(closure);
             }
         }
         closed
     }
 
-    fn evict_idle(&mut self, wall_time_unix_ns: i64) -> Vec<FlowContext> {
+    fn evict_idle(&mut self, wall_time_unix_ns: i64) -> Vec<FlowClosure> {
         let idle_keys = self
             .flows
             .iter()
@@ -161,298 +183,57 @@ impl FlowTracker {
             .collect()
     }
 
-    fn remove_flow(&mut self, key: &ConnectionKey) -> Option<FlowContext> {
+    fn remove_flow(&mut self, key: &ConnectionKey) -> Option<FlowClosure> {
         let removed = self.flows.remove(key);
         self.order.retain(|existing| existing != key);
-        removed.map(|record| record.flow)
+        removed.map(FlowRecord::into_closure)
     }
-}
 
-fn invalidate_process_resolution(process_resolver: &mut Option<Box<dyn ProcessResolver>>) {
-    if let Some(process_resolver) = process_resolver.as_deref_mut() {
-        process_resolver.invalidate_cached_resolution();
-    }
-}
-
-#[derive(Debug, Clone)]
-struct FlowRecord {
-    local_endpoint: TcpEndpoint,
-    process: ProcessContext,
-    confidence: u8,
-    flow: FlowContext,
-    last_seen_wall_time_unix_ns: i64,
-    local_fin: bool,
-    remote_fin: bool,
-    reset: bool,
-}
-
-impl FlowRecord {
-    fn observe_lifecycle(&mut self, decoded: &DecodedTcpSegment<'_>) {
-        if decoded.has_rst() {
-            self.reset = true;
-            return;
-        }
-        if !decoded.has_fin() {
-            return;
-        }
-        if decoded.source_endpoint() == self.local_endpoint {
-            self.local_fin = true;
+    fn flow_end_after_lifecycle(
+        &mut self,
+        key: &ConnectionKey,
+        direction: probe_core::Direction,
+    ) -> Option<FlowEnd> {
+        let (closed, finalization) = self
+            .flows
+            .get(key)
+            .map(|record| {
+                (
+                    record.closed(),
+                    (!record.closed())
+                        .then(|| record.close_sequence_for(direction))
+                        .flatten()
+                        .map(|close_sequence| {
+                            FlowFinalization::new(record.flow.clone(), close_sequence)
+                        }),
+                )
+            })
+            .unwrap_or_default();
+        if closed {
+            self.remove_flow(key).map(FlowEnd::close)
         } else {
-            self.remote_fin = true;
-        }
-    }
-
-    fn closed(&self) -> bool {
-        self.reset || (self.local_fin && self.remote_fin)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct SelectedFlowCandidate {
-    direction: Direction,
-    local_endpoint: TcpEndpoint,
-    process: ProcessContext,
-    confidence: u8,
-    attribution_failure: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct FlowObservation {
-    pub(super) direction: Direction,
-    pub(super) flow: FlowContext,
-    pub(super) attribution_confidence: u8,
-    pub(super) attribution_failure: Option<String>,
-    pub(super) closed_before: Vec<FlowContext>,
-    pub(super) closed_after: Option<FlowContext>,
-}
-
-impl FlowObservation {
-    fn new(
-        decoded: &DecodedTcpSegment<'_>,
-        direction: Direction,
-        process: ProcessContext,
-        attribution_confidence: u8,
-        start_monotonic_ns: u64,
-        attribution_failure: Option<String>,
-    ) -> Self {
-        Self {
-            direction,
-            flow: flow_from_decoded(
-                decoded,
-                direction,
-                process,
-                attribution_confidence,
-                start_monotonic_ns,
-            ),
-            attribution_confidence,
-            attribution_failure,
-            closed_before: Vec::new(),
-            closed_after: None,
+            finalization.map(FlowEnd::finalize)
         }
     }
 }
 
-#[derive(Debug, Clone)]
-struct FlowCandidate {
-    direction: Direction,
-    local_endpoint: TcpEndpoint,
-    remote_endpoint: TcpEndpoint,
-    local: AddressPort,
-    remote: AddressPort,
-}
-
-impl FlowCandidate {
-    fn from_decoded(decoded: &DecodedTcpSegment<'_>, direction: Direction) -> Self {
-        let source = decoded.source_endpoint();
-        let destination = decoded.destination_endpoint();
-        match direction {
-            Direction::Outbound => Self {
-                direction,
-                local_endpoint: source,
-                remote_endpoint: destination,
-                local: source.into(),
-                remote: destination.into(),
-            },
-            Direction::Inbound => Self {
-                direction,
-                local_endpoint: destination,
-                remote_endpoint: source,
-                local: destination.into(),
-                remote: source.into(),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ConnectionKey {
-    lower: TcpEndpoint,
-    higher: TcpEndpoint,
-}
-
-impl ConnectionKey {
-    fn from_decoded(decoded: &DecodedTcpSegment<'_>) -> Self {
-        let source = decoded.source_endpoint();
-        let destination = decoded.destination_endpoint();
-        if source <= destination {
-            Self {
-                lower: source,
-                higher: destination,
-            }
-        } else {
-            Self {
-                lower: destination,
-                higher: source,
-            }
-        }
-    }
-}
-
-fn infer_initial_direction(decoded: &DecodedTcpSegment<'_>) -> Direction {
-    if decoded.payload.starts_with(b"HTTP/") {
-        return Direction::Inbound;
-    }
-    if looks_like_http_request(decoded.payload) {
-        return Direction::Outbound;
-    }
-    if looks_like_server_port(decoded.source_port)
-        && !looks_like_server_port(decoded.destination_port)
-    {
-        return Direction::Inbound;
-    }
-    Direction::Outbound
-}
-
-fn opposite_direction(direction: Direction) -> Direction {
-    match direction {
-        Direction::Inbound => Direction::Outbound,
-        Direction::Outbound => Direction::Inbound,
-    }
-}
-
-fn select_flow_candidate(
-    primary: FlowCandidate,
-    secondary: FlowCandidate,
-    process_resolver: &mut Option<Box<dyn ProcessResolver>>,
-) -> SelectedFlowCandidate {
-    let mut attribution_failure = None;
-    match resolve_candidate_process(&primary, process_resolver) {
-        Ok(Some(process)) => {
-            return SelectedFlowCandidate {
-                direction: primary.direction,
-                local_endpoint: primary.local_endpoint,
-                process: process.process,
-                confidence: process.confidence,
-                attribution_failure: None,
-            };
-        }
-        Ok(None) => {}
-        Err(error) => attribution_failure = Some(error.to_string()),
-    }
-    match resolve_candidate_process(&secondary, process_resolver) {
-        Ok(Some(process)) => {
-            return SelectedFlowCandidate {
-                direction: secondary.direction,
-                local_endpoint: secondary.local_endpoint,
-                process: process.process,
-                confidence: process.confidence,
-                attribution_failure: None,
-            };
-        }
-        Ok(None) => {}
-        Err(error) => {
-            if attribution_failure.is_none() {
-                attribution_failure = Some(error.to_string());
-            }
-        }
-    }
-    SelectedFlowCandidate {
-        direction: primary.direction,
-        local_endpoint: primary.local_endpoint,
-        process: synthetic_libpcap_process(),
-        confidence: 0,
-        attribution_failure,
-    }
-}
-
-fn resolve_candidate_process(
-    candidate: &FlowCandidate,
-    process_resolver: &mut Option<Box<dyn ProcessResolver>>,
-) -> Result<Option<ResolvedProcess>, CaptureError> {
-    let Some(resolver) = process_resolver.as_deref_mut() else {
-        return Ok(None);
-    };
-    resolver.resolve_tcp_process(TcpConnection::new(
-        candidate.local_endpoint,
-        candidate.remote_endpoint,
-    ))
-}
-
-fn looks_like_http_request(payload: &[u8]) -> bool {
-    const METHODS: [&[u8]; 9] = [
-        b"GET ",
-        b"POST ",
-        b"PUT ",
-        b"PATCH ",
-        b"DELETE ",
-        b"HEAD ",
-        b"OPTIONS ",
-        b"CONNECT ",
-        b"TRACE ",
-    ];
-    METHODS.iter().any(|method| payload.starts_with(method))
-}
-
-fn looks_like_server_port(port: u16) -> bool {
-    matches!(port, 80 | 443 | 8000 | 8080 | 8443)
-}
-
-fn flow_from_decoded(
+fn invalidate_for_lifecycle_signal(
     decoded: &DecodedTcpSegment<'_>,
-    direction: Direction,
-    process: ProcessContext,
-    attribution_confidence: u8,
-    start_monotonic_ns: u64,
-) -> FlowContext {
-    let candidate = FlowCandidate::from_decoded(decoded, direction);
-    FlowContext {
-        id: FlowIdentity::stable(
-            &process.identity,
-            &candidate.local,
-            &candidate.remote,
-            TransportProtocol::Tcp,
-            start_monotonic_ns,
-            None,
-        ),
-        process,
-        local: candidate.local,
-        remote: candidate.remote,
-        protocol: TransportProtocol::Tcp,
-        start_monotonic_ns,
-        socket_cookie: None,
-        attribution_confidence,
+    process_resolver: &mut Option<Box<dyn ProcessResolver>>,
+    invalidated: &mut bool,
+) {
+    if decoded.has_lifecycle_signal() {
+        invalidate_process_resolution(process_resolver, invalidated);
     }
 }
 
-fn synthetic_libpcap_process() -> ProcessContext {
-    let identity = ProcessIdentity {
-        pid: 0,
-        tgid: 0,
-        start_time_ticks: 0,
-        boot_id: "libpcap".to_string(),
-        exe_path: "unknown".to_string(),
-        cmdline_hash: "unknown".to_string(),
-        uid: 0,
-        gid: 0,
-        cgroup: None,
-        systemd_service: None,
-        container_id: None,
-        runtime_hint: Some("libpcap_fallback".to_string()),
-    };
-    ProcessContext {
-        identity,
-        name: "unknown".to_string(),
-        cmdline: Vec::new(),
+fn invalidate_process_resolution(
+    process_resolver: &mut Option<Box<dyn ProcessResolver>>,
+    invalidated: &mut bool,
+) {
+    if !*invalidated && let Some(process_resolver) = process_resolver.as_deref_mut() {
+        process_resolver.invalidate_cached_resolution();
+        *invalidated = true;
     }
 }
 
@@ -464,6 +245,12 @@ mod tests {
         rc::Rc,
     };
 
+    use probe_core::{Direction, ProcessContext, ProcessIdentity, TcpConnection, TcpEndpoint};
+
+    use crate::ResolvedProcess;
+
+    use super::super::super::tcp_seq;
+    use super::super::candidate::synthetic_libpcap_process;
     use super::*;
 
     #[test]
@@ -524,12 +311,14 @@ mod tests {
         assert_eq!(
             tracker
                 .observe(&response_headers, timestamp(1, 1), &mut resolver)
+                .payload
                 .direction,
             Direction::Inbound
         );
         assert_eq!(
             tracker
                 .observe(&response_body, timestamp(2, 2), &mut resolver)
+                .payload
                 .direction,
             Direction::Inbound
         );
@@ -557,7 +346,9 @@ mod tests {
         let mut resolver: Option<Box<dyn ProcessResolver>> = Some(Box::new(resolver));
         let mut tracker = FlowTracker::default();
 
-        let observed = tracker.observe(&request, timestamp(1, 1), &mut resolver);
+        let observed = tracker
+            .observe(&request, timestamp(1, 1), &mut resolver)
+            .payload;
 
         assert_eq!(observed.direction, Direction::Inbound);
         assert_eq!(observed.flow.local.address, "10.0.0.2");
@@ -615,10 +406,14 @@ mod tests {
         }));
         let mut tracker = FlowTracker::default();
 
-        let first_observed = tracker.observe(&first, timestamp(10, 10), &mut resolver);
-        tracker.observe_lifecycle(&close, timestamp(11, 11));
-        tracker.observe_lifecycle(&peer_close, timestamp(12, 12));
-        let second_observed = tracker.observe(&second, timestamp(12, 12), &mut resolver);
+        let first_observed = tracker
+            .observe(&first, timestamp(10, 10), &mut resolver)
+            .payload;
+        tracker.observe_lifecycle(&close, timestamp(11, 11), &mut resolver);
+        tracker.observe_lifecycle(&peer_close, timestamp(12, 12), &mut resolver);
+        let second_observed = tracker
+            .observe(&second, timestamp(12, 12), &mut resolver)
+            .payload;
 
         assert_eq!(first_observed.flow.process.identity.pid, 1);
         assert_eq!(second_observed.flow.process.identity.pid, 2);
@@ -662,13 +457,77 @@ mod tests {
         }));
         let mut tracker = FlowTracker::default();
 
-        let request_observed = tracker.observe(&request, timestamp(10, 10), &mut resolver);
-        tracker.observe_lifecycle(&client_fin, timestamp(11, 11));
-        let response_observed = tracker.observe(&response, timestamp(12, 12), &mut resolver);
+        let request_observed = tracker
+            .observe(&request, timestamp(10, 10), &mut resolver)
+            .payload;
+        tracker.observe_lifecycle(&client_fin, timestamp(11, 11), &mut resolver);
+        let response_observed = tracker
+            .observe(&response, timestamp(12, 12), &mut resolver)
+            .payload;
 
         assert_eq!(request_observed.flow.id, response_observed.flow.id);
         assert_eq!(response_observed.flow.process.identity.pid, 1);
         assert_eq!(response_observed.direction, Direction::Inbound);
+    }
+
+    #[test]
+    fn payload_after_same_direction_close_starts_new_observation() {
+        let request = DecodedTcpSegment {
+            source: ipv4(10, 0, 0, 1),
+            destination: ipv4(10, 0, 0, 2),
+            source_port: 50_000,
+            destination_port: 80,
+            sequence: 100,
+            flags: default_flags(),
+            payload: b"GET / HTTP/1.1\r\n\r\n",
+        };
+        let client_fin = DecodedTcpSegment {
+            sequence: tcp_seq::advance(request.sequence, request.payload.len()),
+            flags: closing_flags(),
+            payload: b"",
+            ..request
+        };
+        let late_payload = DecodedTcpSegment {
+            sequence: client_fin.sequence,
+            flags: default_flags(),
+            payload: b"late",
+            ..request
+        };
+        let mut resolver: Option<Box<dyn ProcessResolver>> = Some(Box::new(SequenceResolver {
+            connection: TcpConnection::new(
+                TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 1).into(), 50_000),
+                TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 2).into(), 80),
+            ),
+            responses: VecDeque::from([
+                ResolvedProcess {
+                    process: demo_process(1, "first"),
+                    confidence: 60,
+                },
+                ResolvedProcess {
+                    process: demo_process(2, "second"),
+                    confidence: 60,
+                },
+            ]),
+        }));
+        let mut tracker = FlowTracker::default();
+
+        let request_observed = tracker
+            .observe(&request, timestamp(10, 10), &mut resolver)
+            .payload;
+        let client_lifecycle =
+            tracker.observe_lifecycle(&client_fin, timestamp(11, 11), &mut resolver);
+        let late_transitions = tracker.observe(&late_payload, timestamp(12, 12), &mut resolver);
+        let late_observed = late_transitions.payload.clone();
+        let closed = before_payload_close_from(&late_transitions);
+
+        assert!(matches!(
+            client_lifecycle.after_lifecycle,
+            Some(FlowEnd::Finalize(_))
+        ));
+        assert!(client_lifecycle.before_lifecycle_closures.is_empty());
+        assert_eq!(closed.flow.id, request_observed.flow.id);
+        assert_ne!(late_observed.flow.id, request_observed.flow.id);
+        assert_eq!(late_observed.flow.process.identity.pid, 2);
     }
 
     #[test]
@@ -708,23 +567,22 @@ mod tests {
         }));
         let mut tracker = FlowTracker::default();
 
-        let request_observed = tracker.observe(&request, timestamp(10, 10), &mut resolver);
-        assert!(
-            tracker
-                .observe_lifecycle(&client_fin, timestamp(11, 11))
-                .is_empty()
-        );
-        let response_observed = tracker.observe(&response_fin, timestamp(12, 12), &mut resolver);
+        let request_observed = tracker
+            .observe(&request, timestamp(10, 10), &mut resolver)
+            .payload;
+        let client_lifecycle =
+            tracker.observe_lifecycle(&client_fin, timestamp(11, 11), &mut resolver);
+        assert!(client_lifecycle.before_lifecycle_closures.is_empty());
+        assert!(matches!(
+            client_lifecycle.after_lifecycle,
+            Some(FlowEnd::Finalize(_))
+        ));
+        let response_transitions = tracker.observe(&response_fin, timestamp(12, 12), &mut resolver);
+        let response_observed = response_transitions.payload.clone();
+        let closed = after_payload_close_from(&response_transitions);
 
         assert_eq!(request_observed.flow.id, response_observed.flow.id);
-        assert!(response_observed.closed_before.is_empty());
-        assert_eq!(
-            response_observed
-                .closed_after
-                .as_ref()
-                .map(|flow| flow.id.clone()),
-            Some(request_observed.flow.id)
-        );
+        assert_eq!(closed.flow.id, request_observed.flow.id);
     }
 
     #[test]
@@ -761,16 +619,19 @@ mod tests {
         }));
         let mut tracker = FlowTracker::default();
 
-        let first_observed = tracker.observe(&first, timestamp(10, 10), &mut resolver);
-        let second_observed = tracker.observe(
+        let first_observed = tracker
+            .observe(&first, timestamp(10, 10), &mut resolver)
+            .payload;
+        let second_transitions = tracker.observe(
             &second,
             timestamp(12, FLOW_IDLE_TIMEOUT_UNIX_NS + 11),
             &mut resolver,
         );
+        let second_observed = second_transitions.payload.clone();
+        let closed = before_payload_close_from(&second_transitions);
 
         assert_eq!(first_observed.flow.process.identity.pid, 1);
-        assert_eq!(second_observed.closed_before.len(), 1);
-        assert_eq!(second_observed.closed_before[0].id, first_observed.flow.id);
+        assert_eq!(closed.flow.id, first_observed.flow.id);
         assert_eq!(second_observed.flow.process.identity.pid, 2);
         assert_ne!(first_observed.flow.id, second_observed.flow.id);
     }
@@ -865,17 +726,58 @@ mod tests {
         }));
         let mut tracker = FlowTracker::default();
 
-        let first_observed = tracker.observe(&first, timestamp(10, 10), &mut resolver);
+        let first_observed = tracker
+            .observe(&first, timestamp(10, 10), &mut resolver)
+            .payload;
         let closed = tracker
-            .observe_lifecycle(&reused_syn, timestamp(11, 11))
+            .observe_lifecycle(&reused_syn, timestamp(11, 11), &mut resolver)
+            .before_lifecycle_closures
             .into_iter()
             .next()
             .expect("syn reuse should close stale flow");
-        let second_observed = tracker.observe(&second, timestamp(12, 12), &mut resolver);
+        let second_observed = tracker
+            .observe(&second, timestamp(12, 12), &mut resolver)
+            .payload;
 
-        assert_eq!(closed.id, first_observed.flow.id);
+        assert_eq!(closed.flow.id, first_observed.flow.id);
         assert_eq!(second_observed.flow.process.identity.pid, 2);
         assert_ne!(first_observed.flow.id, second_observed.flow.id);
+    }
+
+    #[test]
+    fn retransmitted_syn_payload_stays_on_existing_flow() {
+        let first = DecodedTcpSegment {
+            source: ipv4(10, 0, 0, 1),
+            destination: ipv4(10, 0, 0, 2),
+            source_port: 50_000,
+            destination_port: 80,
+            sequence: 100,
+            flags: syn_flags(),
+            payload: b"GET /first HTTP/1.1\r\n\r\n",
+        };
+        let retransmitted = first;
+        let mut resolver: Option<Box<dyn ProcessResolver>> = Some(Box::new(SequenceResolver {
+            connection: TcpConnection::new(
+                TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 1).into(), 50_000),
+                TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 2).into(), 80),
+            ),
+            responses: VecDeque::from([ResolvedProcess {
+                process: demo_process(1, "first"),
+                confidence: 60,
+            }]),
+        }));
+        let mut tracker = FlowTracker::default();
+
+        let first_observed = tracker
+            .observe(&first, timestamp(10, 10), &mut resolver)
+            .payload;
+        let retransmitted_transitions =
+            tracker.observe(&retransmitted, timestamp(11, 11), &mut resolver);
+        let retransmitted_observed = retransmitted_transitions.payload.clone();
+
+        assert!(retransmitted_transitions.before_payload_closures.is_empty());
+        assert!(retransmitted_transitions.after_payload.is_none());
+        assert_eq!(first_observed.flow.id, retransmitted_observed.flow.id);
     }
 
     #[test]
@@ -897,7 +799,9 @@ mod tests {
         let mut resolver = None;
         let mut tracker = FlowTracker::default();
 
-        let first_observed = tracker.observe(&first, timestamp(1, 1), &mut resolver);
+        let first_observed = tracker
+            .observe(&first, timestamp(1, 1), &mut resolver)
+            .payload;
         for index in 1..MAX_FLOW_TRACKER_CONNECTIONS {
             let segment = DecodedTcpSegment {
                 source: ipv4(10, 1, (index / 256) as u8, (index % 256) as u8),
@@ -920,9 +824,26 @@ mod tests {
             timestamp((MAX_FLOW_TRACKER_CONNECTIONS + 2) as u64, 10_000_000),
             &mut resolver,
         );
+        let observed_payload = observed.payload.clone();
 
-        assert!(observed.closed_before.is_empty());
-        assert_eq!(observed.flow.id, first_observed.flow.id);
+        assert!(observed.before_payload_closures.is_empty());
+        assert!(observed.after_payload.is_none());
+        assert_eq!(observed_payload.flow.id, first_observed.flow.id);
+    }
+
+    fn before_payload_close_from(observation: &FlowPayloadObservation) -> FlowClosure {
+        observation
+            .before_payload_closures
+            .first()
+            .cloned()
+            .expect("expected before-payload close")
+    }
+
+    fn after_payload_close_from(observation: &FlowPayloadObservation) -> FlowClosure {
+        match observation.after_payload.as_ref() {
+            Some(FlowEnd::Close(closure)) => closure.clone(),
+            Some(FlowEnd::Finalize(_)) | None => panic!("expected after-payload close"),
+        }
     }
 
     struct StaticProcessResolver {
@@ -992,24 +913,24 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
     }
 
-    fn default_flags() -> super::super::decoder::TcpFlags {
-        super::super::decoder::TcpFlags {
+    fn default_flags() -> crate::libpcap::decoder::TcpFlags {
+        crate::libpcap::decoder::TcpFlags {
             syn: false,
             fin: false,
             rst: false,
         }
     }
 
-    fn closing_flags() -> super::super::decoder::TcpFlags {
-        super::super::decoder::TcpFlags {
+    fn closing_flags() -> crate::libpcap::decoder::TcpFlags {
+        crate::libpcap::decoder::TcpFlags {
             syn: false,
             fin: true,
             rst: false,
         }
     }
 
-    fn syn_flags() -> super::super::decoder::TcpFlags {
-        super::super::decoder::TcpFlags {
+    fn syn_flags() -> crate::libpcap::decoder::TcpFlags {
+        crate::libpcap::decoder::TcpFlags {
             syn: true,
             fin: false,
             rst: false,
