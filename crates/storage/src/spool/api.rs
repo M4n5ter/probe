@@ -1,0 +1,78 @@
+use std::collections::BTreeMap;
+
+use super::{
+    error::StorageError,
+    record::{ExportRetentionPrune, SpoolPayload, StoredEvent},
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpoolSnapshot {
+    pub last_ingress_sequence: u64,
+    pub last_export_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpoolProbe {
+    Missing,
+    Incomplete {
+        reason: String,
+    },
+    Busy {
+        reason: String,
+    },
+    Available {
+        snapshot: SpoolSnapshot,
+        export_cursors: BTreeMap<String, u64>,
+    },
+}
+
+pub trait ExportSpool {
+    fn read_export_batch(&self, sink: &str, limit: usize)
+    -> Result<Vec<StoredEvent>, StorageError>;
+
+    fn ack_export(&self, sink: &str, sequence: u64) -> Result<(), StorageError>;
+
+    fn export_cursor(&self, sink: &str) -> Result<u64, StorageError>;
+
+    /// Removes up to `limit` export events with sequence <= `sequence`.
+    ///
+    /// This does not change export cursors or the durable high-water mark. Callers
+    /// must pass a sequence already confirmed by every cursor-owning sink whose
+    /// at-least-once delivery must be preserved.
+    fn prune_export_through(&self, sequence: u64, limit: usize) -> Result<u64, StorageError>;
+
+    /// Removes expired export events from the durable prefix and retires cursor owners.
+    ///
+    /// Only a contiguous prefix older than `cutoff_unix_ns` is removed. This
+    /// keeps cursor retirement from jumping over a newer event if wall time moves
+    /// backwards between appends. Cursor retirement is committed in the same
+    /// storage batch as the prefix deletion.
+    fn prune_expired_export_prefix(
+        &self,
+        cutoff_unix_ns: u64,
+        limit: usize,
+        cursor_owners: &[&str],
+    ) -> Result<ExportRetentionPrune, StorageError>;
+}
+
+pub trait DurableSpool: ExportSpool {
+    fn append_ingress(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError>;
+
+    fn read_ingress_batch(
+        &self,
+        consumer: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StorageError>;
+
+    fn read_ingress_batch_after(
+        &self,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StorageError>;
+
+    fn ack_ingress(&self, consumer: &str, sequence: u64) -> Result<(), StorageError>;
+
+    fn ingress_cursor(&self, consumer: &str) -> Result<u64, StorageError>;
+
+    fn append_export(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError>;
+}

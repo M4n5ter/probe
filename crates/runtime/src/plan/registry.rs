@@ -95,10 +95,7 @@ fn default_platform_capabilities(
             "ingress recovery replays persisted capture events before opening a capture provider and only advances the parser cursor when active parser state has been removed, but durable parser checkpoints and processing provenance are not complete",
         ),
         CapabilityState::available(CapabilityKind::ExportQueue),
-        CapabilityState::degraded(
-            CapabilityKind::WebhookExporter,
-            "webhook transport can drain planned export sinks with configured fixed worker bounds, per-sink batch quota, cursor-safe bounded export queue cleanup, and per-sink exponential failure backoff during run and replay CLI webhook output during replay, but retention deadline is not implemented",
-        ),
+        CapabilityState::available(CapabilityKind::WebhookExporter),
         CapabilityState::available(CapabilityKind::DryRunEnforcement),
     ]
     .into_iter()

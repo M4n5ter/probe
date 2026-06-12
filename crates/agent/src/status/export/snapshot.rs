@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use probe_config::{CompressionCodecName, ExporterTransport};
 use probe_core::RuntimeMode;
 use runtime::{
-    ExportSinkPlan, ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan, RuntimePlan,
+    ExportRetentionPlan, ExportSinkPlan, ExportSinkWorkerPlan, ExportTlsMaterialPlan,
+    ExportWorkerPlan, RuntimePlan,
 };
 use serde::Serialize;
 
@@ -11,6 +12,11 @@ use super::super::{
     snapshot::SpoolStatusSnapshot,
     tls::{self, TlsMaterialSourceStatusSnapshot},
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExportStatusSnapshot {
+    pub retention: ExportRetentionPlan,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExporterStatusSnapshot {
@@ -31,6 +37,12 @@ pub struct ExporterStatusSnapshot {
 pub struct ExporterTlsStatusSnapshot {
     pub mode: RuntimeMode,
     pub reason: Option<String>,
+}
+
+pub(in crate::status) fn export_status(plan: &RuntimePlan) -> ExportStatusSnapshot {
+    ExportStatusSnapshot {
+        retention: plan.export.retention.clone(),
+    }
 }
 
 pub(in crate::status) fn exporter_statuses(
@@ -216,6 +228,27 @@ mod tests {
             value[0]["sink_worker"]["effective_batches_per_tick"],
             json!(2)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn export_status_reports_retention_without_sinks() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
+        config.exporters.clear();
+        config.storage.retention.export.max_age_ms = Some(60_000);
+        config.storage.retention.export.sweep_interval_ms = 5_000;
+        config.storage.retention.export.prune_batch_limit = 128;
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+
+        let status = export_status(&plan);
+
+        assert_eq!(status.retention.max_age_ms, Some(60_000));
+        assert_eq!(status.retention.sweep_interval_ms.get(), 5_000);
+        assert_eq!(status.retention.prune_batch_limit.get(), 128);
+        let value = serde_json::to_value(&status)?;
+        assert_eq!(value["retention"]["max_age_ms"], json!(60_000));
+        assert_eq!(value["retention"]["sweep_interval_ms"], json!(5_000));
+        assert_eq!(value["retention"]["prune_batch_limit"], json!(128));
         Ok(())
     }
 

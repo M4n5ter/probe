@@ -5,14 +5,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use runtime::{ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportWorkerPlan};
+use runtime::{
+    ExportFailureBackoffPlan, ExportPlan, ExportRetentionPlan, ExportSinkPlan, ExportWorkerPlan,
+};
 use storage::ExportSpool;
 use tokio::sync::Notify;
 
 use super::{
     ExportDrainError,
+    cleanup::prune_export_queue_for_sinks,
     mode::SinkDrainMode,
-    target::{drain_export_sink_with_mode, finish_export_sink_drain, prune_export_queue_for_sinks},
+    target::{drain_export_sink_with_mode, finish_export_sink_drain},
 };
 
 const EXPORT_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,6 +29,7 @@ pub struct ExportWorkerHandle {
 pub struct ExportWorkerConfig {
     agent_id: String,
     sinks: Vec<ExportSinkPlan>,
+    retention: ExportRetentionPlan,
     interval: Duration,
     sink_timeout: Duration,
     failure_backoff: ExportWorkerBackoffPolicy,
@@ -35,6 +39,7 @@ impl ExportWorkerConfig {
     fn fixed_interval_bounded(
         agent_id: String,
         sinks: Vec<ExportSinkPlan>,
+        retention: ExportRetentionPlan,
         interval: Duration,
         sink_timeout: Duration,
         failure_backoff: ExportWorkerBackoffPolicy,
@@ -42,6 +47,7 @@ impl ExportWorkerConfig {
         Self {
             agent_id,
             sinks,
+            retention,
             interval,
             sink_timeout,
             failure_backoff,
@@ -59,6 +65,7 @@ impl ExportWorkerConfig {
             } => Some(Self::fixed_interval_bounded(
                 agent_id,
                 plan.sinks.clone(),
+                plan.retention.clone(),
                 Duration::from_millis(*interval_ms),
                 Duration::from_millis(*sink_timeout_ms),
                 ExportWorkerBackoffPolicy::from(*failure_backoff),
@@ -154,7 +161,7 @@ async fn drain_export_sinks_once(
     };
     finish_export_sink_drain(
         drain_result,
-        prune_export_queue_for_sinks(spool, &config.sinks),
+        prune_export_queue_for_sinks(spool, &config.sinks, &config.retention),
     )
 }
 
@@ -256,9 +263,9 @@ mod tests {
     };
     use probe_core::{CapabilityKind, CapabilityState};
     use runtime::{
-        self, ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan,
-        ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan, ProviderRegistry,
-        RuntimePlan,
+        self, ExportFailureBackoffPlan, ExportPlan, ExportRetentionPlan, ExportSinkPlan,
+        ExportSinkTlsPlan, ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan,
+        ProviderRegistry, RuntimePlan,
     };
     use storage::FjallSpool;
 
@@ -335,6 +342,7 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
+            retention: ExportRetentionPlan::default(),
             sinks: Vec::new(),
         };
         assert!(ExportWorkerConfig::from_export_plan("agent-1".to_string(), &disabled).is_none());
@@ -345,6 +353,7 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(30_000),
             },
+            retention: ExportRetentionPlan::default(),
             sinks: vec![ExportSinkPlan {
                 id: "grpc".to_string(),
                 transport: ExporterTransport::Grpc,
@@ -437,6 +446,7 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(30_000),
             },
+            retention: ExportRetentionPlan::default(),
             sinks: vec![ExportSinkPlan {
                 id: "budget".to_string(),
                 transport: ExporterTransport::Webhook,
@@ -481,6 +491,7 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(30_000),
             },
+            retention: ExportRetentionPlan::default(),
             sinks: vec![ExportSinkPlan {
                 id: "limited".to_string(),
                 transport: ExporterTransport::Webhook,
@@ -525,6 +536,7 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(60_000),
             },
+            retention: ExportRetentionPlan::default(),
             sinks: vec![
                 ExportSinkPlan {
                     id: "failing".to_string(),
@@ -665,6 +677,7 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff,
             },
+            retention: ExportRetentionPlan::default(),
             sinks: vec![ExportSinkPlan {
                 id: "sink".to_string(),
                 transport: ExporterTransport::Webhook,

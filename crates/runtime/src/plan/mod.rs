@@ -13,8 +13,8 @@ pub use capture::{
 pub use enforcement::{EnforcementPlan, EnforcementPolicySourceKind, EnforcementPolicySourcePlan};
 pub use error::RuntimeError;
 pub use export::{
-    ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
-    ExportWorkerPlan,
+    ExportFailureBackoffPlan, ExportPlan, ExportRetentionPlan, ExportSinkPlan, ExportSinkTlsPlan,
+    ExportSinkWorkerPlan, ExportWorkerPlan,
 };
 pub use registry::ProviderRegistry;
 pub use tls::{

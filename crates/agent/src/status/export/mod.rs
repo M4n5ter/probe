@@ -1,3 +1,5 @@
 mod snapshot;
 
-pub(super) use snapshot::{ExporterStatusSnapshot, exporter_statuses};
+pub(super) use snapshot::{
+    ExportStatusSnapshot, ExporterStatusSnapshot, export_status, exporter_statuses,
+};

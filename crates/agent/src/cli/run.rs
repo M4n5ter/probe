@@ -29,7 +29,10 @@ use crate::{
     },
     configured_policy::{LoadedPolicySource, load_configured_policy, load_policy_source},
     error::AgentError,
-    export::{ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook, spawn_export_worker},
+    export::{
+        ExportRetentionWorkerConfig, ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook,
+        spawn_export_retention_worker, spawn_export_worker,
+    },
     status::{build_status_snapshot, collect_spool_status},
 };
 
@@ -175,6 +178,8 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 .transpose()?;
             let export_worker = export_worker_config_from_plan(&plan)
                 .map(|config| spawn_export_worker(Arc::clone(&spool), config));
+            let export_retention_worker = export_retention_worker_config_from_plan(&plan)
+                .map(|config| spawn_export_retention_worker(Arc::clone(&spool), config));
             let mut pipeline = CapturePipeline::new(
                 spool.as_ref(),
                 &mut parser_factory,
@@ -206,6 +211,9 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 server.stop().await;
             }
             if let Some(worker) = export_worker {
+                worker.stop().await;
+            }
+            if let Some(worker) = export_retention_worker {
                 worker.stop().await;
             }
             let drain_result =
@@ -285,6 +293,12 @@ fn build_runtime_plan(config: AgentConfig) -> Result<RuntimePlan, AgentError> {
 
 fn export_worker_config_from_plan(plan: &RuntimePlan) -> Option<ExportWorkerConfig> {
     ExportWorkerConfig::from_export_plan(plan.config.agent_id.clone(), &plan.export)
+}
+
+fn export_retention_worker_config_from_plan(
+    plan: &RuntimePlan,
+) -> Option<ExportRetentionWorkerConfig> {
+    ExportRetentionWorkerConfig::from_export_plan(&plan.export)
 }
 
 fn admin_server_config_from_plan(plan: &RuntimePlan) -> Option<AdminServerConfig> {

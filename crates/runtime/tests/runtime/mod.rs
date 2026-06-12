@@ -8,9 +8,9 @@ use probe_core::{CapabilityKind, CapabilityState, EnforcementMode, RuntimeMode, 
 use runtime::{
     CapturePlanMode, CaptureProviderBuilder, CaptureProviderDescriptor,
     EnforcementPolicySourceKind, EnforcementPolicySourcePlan, ExportFailureBackoffPlan,
-    ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan, ExportTlsMaterialPlan,
-    ExportWorkerPlan, ProviderRegistry, RuntimeError, RuntimePlan, TlsPlaintextCapabilityPlan,
-    TlsPlaintextMaterialPlan,
+    ExportRetentionPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
+    ExportTlsMaterialPlan, ExportWorkerPlan, ProviderRegistry, RuntimeError, RuntimePlan,
+    TlsPlaintextCapabilityPlan, TlsPlaintextMaterialPlan,
 };
 
 #[test]
@@ -202,6 +202,9 @@ fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::err
                 multiplier: 3,
             },
         };
+    config.storage.retention.export.max_age_ms = Some(60_000);
+    config.storage.retention.export.sweep_interval_ms = 5_000;
+    config.storage.retention.export.prune_batch_limit = 128;
     config.exporters = vec![probe_config::ExporterConfig {
         id: "primary".to_string(),
         transport: ExporterTransport::Webhook,
@@ -253,6 +256,14 @@ fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::err
                 max_ms: 20_000,
                 multiplier: 3,
             },
+        }
+    );
+    assert_eq!(
+        plan.export.retention,
+        ExportRetentionPlan {
+            max_age_ms: Some(60_000),
+            sweep_interval_ms: NonZeroU64::new(5_000).expect("positive retention sweep interval"),
+            prune_batch_limit: NonZeroU64::new(128).expect("positive retention prune limit"),
         }
     );
     assert_eq!(

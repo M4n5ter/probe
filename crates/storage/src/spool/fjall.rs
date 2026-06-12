@@ -1,157 +1,29 @@
 use std::{
     collections::BTreeMap,
-    fs,
-    io::ErrorKind,
     path::Path,
     sync::{Mutex, MutexGuard},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use bytes::Bytes;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
-use probe_core::SpoolPayloadSchema;
-use thiserror::Error;
+
+use super::{
+    DurableSpool, ExportSpool, SpoolProbe, SpoolSnapshot, StorageError,
+    lane::{LAST_EXPORT_SEQUENCE, LAST_INGRESS_SEQUENCE, SpoolLane},
+    marker::{
+        ensure_spool_markers, read_spool_marker, read_spool_ready_marker,
+        validate_existing_spool_markers,
+    },
+    record::{
+        ExportRetentionPrune, SpoolPayload, StoredEvent, decode_spool_record, encode_spool_record,
+    },
+};
 
 const INGRESS_JOURNAL: &str = "ingress_journal";
 const EXPORT_QUEUE: &str = "export_queue";
 const INGRESS_CURSORS: &str = "ingress_cursors";
 const EXPORT_CURSORS: &str = "export_cursors";
 const METADATA: &str = "metadata";
-const LAST_INGRESS_SEQUENCE: &[u8] = b"last_ingress_sequence";
-const LAST_EXPORT_SEQUENCE: &[u8] = b"last_export_sequence";
-const SPOOL_MARKER_FILE: &str = "sssa-spool-format";
-const SPOOL_MARKER_CONTENT: &[u8] = b"sssa-probe-spool-v1\n";
-const SPOOL_READY_FILE: &str = "sssa-spool-ready";
-const SPOOL_READY_CONTENT: &[u8] = b"ready\n";
-
-#[derive(Debug, Error)]
-pub enum StorageError {
-    #[error("fjall storage error: {0}")]
-    Fjall(#[from] fjall::Error),
-    #[error("filesystem error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("invalid spool marker at {path}")]
-    InvalidSpoolMarker { path: String },
-    #[error("invalid cursor sink name utf-8")]
-    InvalidCursorSinkName {
-        #[source]
-        source: std::string::FromUtf8Error,
-    },
-    #[error("invalid cursor value for sink {sink}: expected 8 bytes, got {len}")]
-    InvalidCursor { sink: String, len: usize },
-    #[error("invalid metadata value for key {key}: expected 8 bytes, got {len}")]
-    InvalidMetadata { key: String, len: usize },
-    #[error("spool sequence overflow")]
-    SequenceOverflow,
-    #[error("{lane} sequence lock poisoned")]
-    SequenceLockPoisoned { lane: &'static str },
-    #[error(
-        "sink {sink} tried to ack sequence {sequence} beyond last stored sequence {last_sequence}"
-    )]
-    AckBeyondLastSequence {
-        sink: String,
-        sequence: u64,
-        last_sequence: u64,
-    },
-    #[error("spool payload schema is too large: {len} bytes")]
-    PayloadSchemaTooLarge { len: usize },
-    #[error("invalid stored payload: expected at least 4 bytes, got {len}")]
-    InvalidStoredPayload { len: usize },
-    #[error("invalid stored payload schema utf-8: {0}")]
-    InvalidStoredPayloadSchema(#[from] std::string::FromUtf8Error),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpoolPayload {
-    schema: SpoolPayloadSchema,
-    bytes: Bytes,
-}
-
-impl SpoolPayload {
-    pub fn new(schema: SpoolPayloadSchema, bytes: impl AsRef<[u8]>) -> Self {
-        Self {
-            schema,
-            bytes: Bytes::copy_from_slice(bytes.as_ref()),
-        }
-    }
-
-    pub fn schema(&self) -> &SpoolPayloadSchema {
-        &self.schema
-    }
-
-    pub fn schema_wire(&self) -> &str {
-        self.schema.as_str()
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredEvent {
-    pub sequence: u64,
-    pub payload: SpoolPayload,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SpoolSnapshot {
-    pub last_ingress_sequence: u64,
-    pub last_export_sequence: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SpoolProbe {
-    Missing,
-    Incomplete {
-        reason: String,
-    },
-    Busy {
-        reason: String,
-    },
-    Available {
-        snapshot: SpoolSnapshot,
-        export_cursors: BTreeMap<String, u64>,
-    },
-}
-
-pub trait ExportSpool {
-    fn read_export_batch(&self, sink: &str, limit: usize)
-    -> Result<Vec<StoredEvent>, StorageError>;
-
-    fn ack_export(&self, sink: &str, sequence: u64) -> Result<(), StorageError>;
-
-    fn export_cursor(&self, sink: &str) -> Result<u64, StorageError>;
-
-    /// Removes up to `limit` export events with sequence <= `sequence`.
-    ///
-    /// This does not change export cursors or the durable high-water mark. Callers
-    /// must pass a sequence already confirmed by every cursor-owning sink whose
-    /// at-least-once delivery must be preserved.
-    fn prune_export_through(&self, sequence: u64, limit: usize) -> Result<u64, StorageError>;
-}
-
-pub trait DurableSpool: ExportSpool {
-    fn append_ingress(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError>;
-
-    fn read_ingress_batch(
-        &self,
-        consumer: &str,
-        limit: usize,
-    ) -> Result<Vec<StoredEvent>, StorageError>;
-
-    fn read_ingress_batch_after(
-        &self,
-        sequence: u64,
-        limit: usize,
-    ) -> Result<Vec<StoredEvent>, StorageError>;
-
-    fn ack_ingress(&self, consumer: &str, sequence: u64) -> Result<(), StorageError>;
-
-    fn ingress_cursor(&self, consumer: &str) -> Result<u64, StorageError>;
-
-    fn append_export(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError>;
-}
-
 pub struct FjallSpool {
     database: Database,
     ingress_journal: Keyspace,
@@ -166,6 +38,7 @@ pub struct FjallSpool {
 impl FjallSpool {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
+        validate_existing_spool_markers(path)?;
         let database = Database::builder(path).open()?;
         let ingress_journal = database.keyspace(INGRESS_JOURNAL, KeyspaceCreateOptions::default)?;
         let export_queue = database.keyspace(EXPORT_QUEUE, KeyspaceCreateOptions::default)?;
@@ -277,6 +150,15 @@ impl FjallSpool {
         self.prune_lane_through(SpoolLane::Export, sequence, limit)
     }
 
+    pub fn prune_expired_export_prefix(
+        &self,
+        cutoff_unix_ns: u64,
+        limit: usize,
+        cursor_owners: &[&str],
+    ) -> Result<ExportRetentionPrune, StorageError> {
+        self.prune_expired_lane_prefix(SpoolLane::Export, cutoff_unix_ns, limit, cursor_owners)
+    }
+
     pub fn snapshot(&self) -> Result<SpoolSnapshot, StorageError> {
         Ok(SpoolSnapshot {
             last_ingress_sequence: *self.lock_last_sequence(SpoolLane::Ingress)?,
@@ -306,19 +188,32 @@ impl FjallSpool {
         lane: SpoolLane,
         payload: SpoolPayload,
     ) -> Result<StoredEvent, StorageError> {
+        self.append_payload_at(lane, payload, current_unix_time_ns())
+    }
+
+    fn append_payload_at(
+        &self,
+        lane: SpoolLane,
+        payload: SpoolPayload,
+        stored_at_unix_ns: u64,
+    ) -> Result<StoredEvent, StorageError> {
         let mut last_sequence = self.lock_last_sequence(lane)?;
         let sequence = last_sequence
             .checked_add(1)
             .ok_or(StorageError::SequenceOverflow)?;
         let key = sequence_key(sequence);
-        let encoded = encode_spool_payload(&payload)?;
+        let encoded = encode_spool_record(stored_at_unix_ns, &payload)?;
         let mut batch = self.database.batch();
         batch.insert(self.queue(lane), key, encoded);
         batch.insert(&self.metadata, lane.last_sequence_key(), key);
         batch.commit()?;
         self.database.persist(PersistMode::SyncAll)?;
         *last_sequence = sequence;
-        Ok(StoredEvent { sequence, payload })
+        Ok(StoredEvent {
+            sequence,
+            stored_at_unix_ns,
+            payload,
+        })
     }
 
     fn read_batch_from_lane(
@@ -352,9 +247,11 @@ impl FjallSpool {
             if sequence > durable_last_sequence {
                 break;
             }
+            let record = decode_spool_record(value.as_ref())?;
             events.push(StoredEvent {
                 sequence,
-                payload: decode_spool_payload(value.as_ref())?,
+                stored_at_unix_ns: record.stored_at_unix_ns,
+                payload: record.payload,
             });
             if events.len() >= limit {
                 break;
@@ -365,14 +262,15 @@ impl FjallSpool {
     }
 
     fn ack_lane(&self, lane: SpoolLane, consumer: &str, sequence: u64) -> Result<(), StorageError> {
+        let last_sequence = self.lock_last_sequence(lane)?;
+        let durable_last_sequence = *last_sequence;
         let current = self.cursor_for_lane(lane, consumer)?;
         if sequence > current {
-            let last_sequence = *self.lock_last_sequence(lane)?;
-            if sequence > last_sequence {
+            if sequence > durable_last_sequence {
                 return Err(StorageError::AckBeyondLastSequence {
                     sink: consumer.to_string(),
                     sequence,
-                    last_sequence,
+                    last_sequence: durable_last_sequence,
                 });
             }
             let mut batch = self.database.batch();
@@ -384,6 +282,7 @@ impl FjallSpool {
             batch.commit()?;
             self.database.persist(PersistMode::SyncAll)?;
         }
+        drop(last_sequence);
         Ok(())
     }
 
@@ -445,6 +344,79 @@ impl FjallSpool {
         Ok(keys.len() as u64)
     }
 
+    fn prune_expired_lane_prefix(
+        &self,
+        lane: SpoolLane,
+        cutoff_unix_ns: u64,
+        limit: usize,
+        cursor_owners: &[&str],
+    ) -> Result<ExportRetentionPrune, StorageError> {
+        if limit == 0 {
+            return Ok(ExportRetentionPrune::default());
+        }
+        let last_sequence = self.lock_last_sequence(lane)?;
+        let durable_last_sequence = *last_sequence;
+        if durable_last_sequence == 0 {
+            return Ok(ExportRetentionPrune::default());
+        }
+
+        let mut keys = Vec::new();
+        let mut retired_through = None;
+        for item in self.queue(lane).range::<[u8; 8], _>(..) {
+            let (key, value) = item.into_inner()?;
+            let sequence = decode_sequence_key(key.as_ref());
+            if sequence > durable_last_sequence {
+                break;
+            }
+            let record = decode_spool_record(value.as_ref())?;
+            if record.stored_at_unix_ns > cutoff_unix_ns {
+                break;
+            }
+            retired_through = Some(sequence);
+            keys.push(key.as_ref().to_vec());
+            if keys.len() >= limit {
+                break;
+            }
+        }
+        if keys.is_empty() {
+            return Ok(ExportRetentionPrune::default());
+        }
+        let retired_through = retired_through.expect("non-empty retention keys have a sequence");
+        let cursor_updates = cursor_owners
+            .iter()
+            .map(|owner| {
+                let current = self.cursor_for_lane(lane, owner)?;
+                Ok((*owner, current))
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+
+        let mut batch = self.database.batch();
+        batch.insert(
+            &self.metadata,
+            lane.last_sequence_key(),
+            sequence_key(durable_last_sequence),
+        );
+        for key in &keys {
+            batch.remove(self.queue(lane), key.as_slice());
+        }
+        for (owner, current) in cursor_updates {
+            if current < retired_through {
+                batch.insert(
+                    self.cursors(lane),
+                    owner.as_bytes(),
+                    sequence_key(retired_through),
+                );
+            }
+        }
+        batch.commit()?;
+        self.database.persist(PersistMode::SyncAll)?;
+        drop(last_sequence);
+        Ok(ExportRetentionPrune {
+            pruned_count: keys.len() as u64,
+            retired_through: Some(retired_through),
+        })
+    }
+
     fn queue(&self, lane: SpoolLane) -> &Keyspace {
         match lane {
             SpoolLane::Ingress => &self.ingress_journal,
@@ -493,6 +465,15 @@ impl ExportSpool for FjallSpool {
     fn prune_export_through(&self, sequence: u64, limit: usize) -> Result<u64, StorageError> {
         FjallSpool::prune_export_through(self, sequence, limit)
     }
+
+    fn prune_expired_export_prefix(
+        &self,
+        cutoff_unix_ns: u64,
+        limit: usize,
+        cursor_owners: &[&str],
+    ) -> Result<ExportRetentionPrune, StorageError> {
+        FjallSpool::prune_expired_export_prefix(self, cutoff_unix_ns, limit, cursor_owners)
+    }
 }
 
 impl DurableSpool for FjallSpool {
@@ -526,28 +507,6 @@ impl DurableSpool for FjallSpool {
 
     fn append_export(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError> {
         FjallSpool::append_export(self, payload)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpoolLane {
-    Ingress,
-    Export,
-}
-
-impl SpoolLane {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Ingress => "ingress",
-            Self::Export => "export",
-        }
-    }
-
-    fn last_sequence_key(self) -> &'static [u8] {
-        match self {
-            Self::Ingress => LAST_INGRESS_SEQUENCE,
-            Self::Export => LAST_EXPORT_SEQUENCE,
-        }
     }
 }
 
@@ -590,67 +549,12 @@ fn decode_exact_sequence_key(key: &[u8], bytes: &[u8]) -> Result<u64, StorageErr
     Ok(decode_sequence_key(bytes))
 }
 
-fn ensure_spool_markers(path: &Path) -> Result<(), StorageError> {
-    ensure_marker_file(path, SPOOL_MARKER_FILE, SPOOL_MARKER_CONTENT)?;
-    ensure_marker_file(path, SPOOL_READY_FILE, SPOOL_READY_CONTENT)?;
-    Ok(())
-}
-
-fn read_spool_marker(path: &Path) -> Result<bool, StorageError> {
-    read_marker_file(path, SPOOL_MARKER_FILE, SPOOL_MARKER_CONTENT)
-}
-
-fn read_spool_ready_marker(path: &Path) -> Result<bool, StorageError> {
-    read_marker_file(path, SPOOL_READY_FILE, SPOOL_READY_CONTENT)
-}
-
-fn ensure_marker_file(path: &Path, name: &str, content: &[u8]) -> Result<(), StorageError> {
-    if read_marker_file(path, name, content)? {
-        return Ok(());
-    }
-    fs::write(path.join(name), content)?;
-    Ok(())
-}
-
-fn read_marker_file(path: &Path, name: &str, content: &[u8]) -> Result<bool, StorageError> {
-    let marker_path = path.join(name);
-    match fs::read(&marker_path) {
-        Ok(existing_content) if existing_content == content => Ok(true),
-        Ok(_) => Err(StorageError::InvalidSpoolMarker {
-            path: marker_path.display().to_string(),
-        }),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn encode_spool_payload(payload: &SpoolPayload) -> Result<Vec<u8>, StorageError> {
-    let schema = payload.schema.as_str().as_bytes();
-    let schema_len = u32::try_from(schema.len())
-        .map_err(|_| StorageError::PayloadSchemaTooLarge { len: schema.len() })?;
-    let mut encoded = Vec::with_capacity(4 + schema.len() + payload.bytes.len());
-    encoded.extend_from_slice(&schema_len.to_be_bytes());
-    encoded.extend_from_slice(schema);
-    encoded.extend_from_slice(&payload.bytes);
-    Ok(encoded)
-}
-
-fn decode_spool_payload(bytes: &[u8]) -> Result<SpoolPayload, StorageError> {
-    if bytes.len() < 4 {
-        return Err(StorageError::InvalidStoredPayload { len: bytes.len() });
-    }
-    let mut len = [0_u8; 4];
-    len.copy_from_slice(&bytes[..4]);
-    let schema_len = u32::from_be_bytes(len) as usize;
-    let expected_min_len = 4 + schema_len;
-    if bytes.len() < expected_min_len {
-        return Err(StorageError::InvalidStoredPayload { len: bytes.len() });
-    }
-    let schema = String::from_utf8(bytes[4..expected_min_len].to_vec())?;
-    Ok(SpoolPayload {
-        schema: SpoolPayloadSchema::from_wire(schema),
-        bytes: Bytes::copy_from_slice(&bytes[expected_min_len..]),
-    })
+fn current_unix_time_ns() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -661,10 +565,13 @@ mod tests {
     use probe_core::SpoolPayloadSchema;
     use tempfile::tempdir;
 
-    use super::{
-        FjallSpool, SPOOL_MARKER_CONTENT, SPOOL_MARKER_FILE, SPOOL_READY_FILE, SpoolPayload,
-        SpoolProbe, decode_spool_payload, encode_spool_payload, sequence_key,
+    use crate::spool::{
+        lane::SpoolLane,
+        marker::{SPOOL_MARKER_CONTENT, SPOOL_MARKER_FILE, SPOOL_READY_FILE},
+        record::encode_spool_record,
     };
+
+    use super::{FjallSpool, SpoolPayload, SpoolProbe, StorageError, sequence_key};
 
     #[test]
     fn spool_tracks_per_sink_cursors() -> Result<(), Box<dyn std::error::Error>> {
@@ -760,8 +667,18 @@ mod tests {
     fn spool_recovers_sequences_after_reopen() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let spool = FjallSpool::open(temp.path())?;
-        assert_eq!(spool.append_ingress(test_payload(b"raw-one"))?.sequence, 1);
-        assert_eq!(spool.append_export(test_payload(b"event-one"))?.sequence, 1);
+        assert_eq!(
+            spool
+                .append_payload_at(SpoolLane::Ingress, test_payload(b"raw-one"), 10)?
+                .sequence,
+            1
+        );
+        assert_eq!(
+            spool
+                .append_payload_at(SpoolLane::Export, test_payload(b"event-one"), 20)?
+                .sequence,
+            1
+        );
         drop(spool);
 
         let reopened = FjallSpool::open(temp.path())?;
@@ -791,6 +708,8 @@ mod tests {
         );
         assert_eq!(ingress[0].payload.bytes(), b"raw-one");
         assert_eq!(events[0].payload.bytes(), b"event-one");
+        assert_eq!(ingress[0].stored_at_unix_ns, 10);
+        assert_eq!(events[0].stored_at_unix_ns, 20);
         Ok(())
     }
 
@@ -817,7 +736,7 @@ mod tests {
         batch.insert(
             &spool.export_queue,
             sequence_key(1),
-            encode_spool_payload(&payload)?,
+            encode_spool_record(42, &payload)?,
         );
         batch.commit()?;
 
@@ -884,12 +803,12 @@ mod tests {
         batch.insert(
             &spool.export_queue,
             sequence_key(1),
-            encode_spool_payload(&test_payload(b"one"))?,
+            encode_spool_record(1, &test_payload(b"one"))?,
         );
         batch.insert(
             &spool.export_queue,
             sequence_key(2),
-            encode_spool_payload(&test_payload(b"two"))?,
+            encode_spool_record(2, &test_payload(b"two"))?,
         );
         batch.commit()?;
         spool.database.persist(PersistMode::SyncAll)?;
@@ -904,6 +823,81 @@ mod tests {
         let reopened = FjallSpool::open(temp.path())?;
         assert_eq!(reopened.snapshot()?.last_export_sequence, 2);
         assert_eq!(reopened.append_export(test_payload(b"three"))?.sequence, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_expired_export_prefix_removes_only_expired_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        spool.append_payload_at(SpoolLane::Export, test_payload(b"old-one"), 10)?;
+        spool.append_payload_at(SpoolLane::Export, test_payload(b"new"), 30)?;
+        spool.append_payload_at(SpoolLane::Export, test_payload(b"old-after-clock-skew"), 5)?;
+
+        let pruned = spool.prune_expired_export_prefix(20, 10, &["slow"])?;
+
+        assert_eq!(pruned.pruned_count, 1);
+        assert_eq!(pruned.retired_through, Some(1));
+        assert_eq!(spool.export_cursor("slow")?, 1);
+        assert_eq!(
+            spool
+                .read_export_batch("late", 10)?
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prune_expired_export_prefix_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        spool.append_payload_at(SpoolLane::Export, test_payload(b"old-one"), 10)?;
+        spool.append_payload_at(SpoolLane::Export, test_payload(b"old-two"), 11)?;
+        spool.append_payload_at(SpoolLane::Export, test_payload(b"old-three"), 12)?;
+
+        let first = spool.prune_expired_export_prefix(20, 2, &[])?;
+        let second = spool.prune_expired_export_prefix(20, 2, &[])?;
+
+        assert_eq!(first.pruned_count, 2);
+        assert_eq!(first.retired_through, Some(2));
+        assert_eq!(second.pruned_count, 1);
+        assert_eq!(second.retired_through, Some(3));
+        assert!(spool.read_export_batch("late", 10)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn prune_expired_export_prefix_does_not_regress_cursor_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        spool.append_payload_at(SpoolLane::Export, test_payload(b"old-one"), 10)?;
+        spool.append_payload_at(SpoolLane::Export, test_payload(b"new"), 30)?;
+        spool.ack_export("ahead", 2)?;
+
+        let pruned = spool.prune_expired_export_prefix(20, 10, &["behind", "ahead"])?;
+
+        assert_eq!(pruned.pruned_count, 1);
+        assert_eq!(spool.export_cursor("behind")?, 1);
+        assert_eq!(spool.export_cursor("ahead")?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn ack_export_does_not_regress_retired_cursor() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        spool.append_payload_at(SpoolLane::Export, test_payload(b"old-one"), 10)?;
+        spool.append_payload_at(SpoolLane::Export, test_payload(b"old-two"), 11)?;
+        spool.prune_expired_export_prefix(20, 10, &["sink"])?;
+
+        spool.ack_export("sink", 1)?;
+
+        assert_eq!(spool.export_cursor("sink")?, 2);
         Ok(())
     }
 
@@ -923,6 +917,39 @@ mod tests {
         fs::write(temp.path().join(SPOOL_MARKER_FILE), SPOOL_MARKER_CONTENT)?;
 
         assert!(!FjallSpool::is_initialized(temp.path())?);
+        assert!(!temp.path().join(SPOOL_READY_FILE).try_exists()?);
+        Ok(())
+    }
+
+    #[test]
+    fn initialization_probe_rejects_older_spool_marker() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        fs::write(
+            temp.path().join(SPOOL_MARKER_FILE),
+            b"sssa-probe-spool-v1\n",
+        )?;
+
+        let error = FjallSpool::probe(temp.path()).expect_err("old marker must fail fast");
+
+        assert!(matches!(error, StorageError::InvalidSpoolMarker { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn open_rejects_older_spool_marker_without_initializing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        fs::write(
+            temp.path().join(SPOOL_MARKER_FILE),
+            b"sssa-probe-spool-v1\n",
+        )?;
+
+        let error = match FjallSpool::open(temp.path()) {
+            Ok(_) => panic!("old marker must fail before DB open"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, StorageError::InvalidSpoolMarker { .. }));
         assert!(!temp.path().join(SPOOL_READY_FILE).try_exists()?);
         Ok(())
     }
@@ -975,26 +1002,6 @@ mod tests {
 
         assert_eq!(snapshot.last_ingress_sequence, 2);
         assert_eq!(snapshot.last_export_sequence, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn stored_payload_decodes_known_wire_schema_to_canonical_enum()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut encoded = Vec::new();
-        let schema = SpoolPayloadSchema::EVENT_ENVELOPE_JSON.as_bytes();
-        encoded.extend_from_slice(&(schema.len() as u32).to_be_bytes());
-        encoded.extend_from_slice(schema);
-        encoded.extend_from_slice(b"payload");
-
-        let payload = decode_spool_payload(&encoded)?;
-
-        assert_eq!(payload.schema(), &SpoolPayloadSchema::EventEnvelopeJson);
-        assert_eq!(
-            payload.schema_wire(),
-            SpoolPayloadSchema::EVENT_ENVELOPE_JSON
-        );
-        assert_eq!(payload.bytes(), b"payload");
         Ok(())
     }
 

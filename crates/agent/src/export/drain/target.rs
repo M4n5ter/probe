@@ -6,12 +6,12 @@ use storage::ExportSpool;
 use super::{
     ExportDrainError,
     batch::{EXPORT_BATCH_LIMIT, drain_export_sink_from_batch, export_batch_from_events},
+    cleanup::prune_export_queue_for_sinks,
     mode::{SinkDrainMode, duration_millis},
 };
 use crate::tls_material::read_tls_material;
 
 const REPLAY_WEBHOOK_SINK: &str = "replay-webhook";
-const EXPORT_PRUNE_BATCH_LIMIT: usize = 1024;
 
 pub async fn drain_planned_sinks(
     spool: &impl ExportSpool,
@@ -20,7 +20,10 @@ pub async fn drain_planned_sinks(
 ) -> Result<(), ExportDrainError> {
     let result =
         drain_export_sinks_with_mode(spool, agent_id, &plan.sinks, SinkDrainMode::UntilEmpty).await;
-    finish_export_sink_drain(result, prune_export_queue_for_sinks(spool, &plan.sinks))
+    finish_export_sink_drain(
+        result,
+        prune_export_queue_for_sinks(spool, &plan.sinks, &plan.retention),
+    )
 }
 
 pub async fn drain_replay_webhook(
@@ -59,21 +62,6 @@ pub(super) async fn drain_export_sinks_with_mode(
             failures: failures.join("; "),
         })
     }
-}
-
-pub(super) fn prune_export_queue_for_sinks(
-    spool: &impl ExportSpool,
-    sinks: &[ExportSinkPlan],
-) -> Result<(), ExportDrainError> {
-    let mut retire_through = None;
-    for sink in sinks {
-        let cursor = spool.export_cursor(&sink.id)?;
-        retire_through = Some(retire_through.map_or(cursor, |sequence: u64| sequence.min(cursor)));
-    }
-    if let Some(sequence) = retire_through {
-        spool.prune_export_through(sequence, EXPORT_PRUNE_BATCH_LIMIT)?;
-    }
-    Ok(())
 }
 
 pub(super) fn finish_export_sink_drain(
@@ -261,14 +249,15 @@ mod tests {
     use probe_config::{AgentConfig, CompressionCodecName, ExporterConfig, TlsMaterialKind};
     use probe_core::{CapabilityKind, CapabilityState, SpoolPayloadSchema};
     use runtime::{
-        self, ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan,
-        ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan, ProviderRegistry,
-        RuntimePlan,
+        self, ExportFailureBackoffPlan, ExportPlan, ExportRetentionPlan, ExportSinkPlan,
+        ExportSinkTlsPlan, ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan,
+        ProviderRegistry, RuntimePlan,
     };
     use storage::{FjallSpool, SpoolPayload};
 
     use super::*;
     use crate::{
+        export::drain::cleanup::prune_export_queue_for_sink_ids_at,
         export::drain::spooled_event::append_export_events,
         export::drain::webhook_server::{WebhookAckServer, request_header},
         tls_material::MAX_TLS_MATERIAL_BYTES,
@@ -319,6 +308,7 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
+            retention: ExportRetentionPlan::default(),
             sinks: Vec::new(),
         };
 
@@ -337,6 +327,7 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
+            retention: ExportRetentionPlan::default(),
             sinks: vec![ExportSinkPlan {
                 id: "secure".to_string(),
                 transport: ExporterTransport::Webhook,
@@ -376,6 +367,7 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
+            retention: ExportRetentionPlan::default(),
             sinks: vec![ExportSinkPlan {
                 id: "secure".to_string(),
                 transport: ExporterTransport::Webhook,
@@ -520,6 +512,45 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn planned_retention_cleanup_retires_expired_export_prefix_for_sink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = temp_path("retention-cleanup");
+        let spool = FjallSpool::open(&temp)?;
+        append_export_events(&spool, 1)?;
+        let plan = ExportPlan {
+            worker: ExportWorkerPlan::Disabled {
+                reason: "test".to_string(),
+            },
+            retention: ExportRetentionPlan {
+                max_age_ms: Some(1),
+                sweep_interval_ms: NonZeroU64::new(1_000).expect("positive sweep interval"),
+                prune_batch_limit: NonZeroU64::new(10).expect("positive prune limit"),
+            },
+            sinks: vec![ExportSinkPlan {
+                id: "failing".to_string(),
+                transport: ExporterTransport::Webhook,
+                endpoint: "https://collector.example/batches".to_string(),
+                codec: CompressionCodecName::None,
+                headers: BTreeMap::new(),
+                tls: ExportSinkTlsPlan::default(),
+                worker: inherited_worker_quota(1),
+            }],
+        };
+
+        let sink_ids = plan
+            .sinks
+            .iter()
+            .map(|sink| sink.id.as_str())
+            .collect::<Vec<_>>();
+        prune_export_queue_for_sink_ids_at(&spool, &sink_ids, &plan.retention, u64::MAX)?;
+
+        assert_eq!(spool.export_cursor("failing")?, 1);
+        assert!(spool.read_export_batch("failing", 10)?.is_empty());
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn planned_tail_drain_ignores_worker_batch_quota_and_runs_bounded_cleanup()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -535,6 +566,7 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(30_000),
             },
+            retention: ExportRetentionPlan::default(),
             sinks: vec![ExportSinkPlan {
                 id: "tail".to_string(),
                 transport: ExporterTransport::Webhook,
@@ -587,6 +619,7 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
+            retention: ExportRetentionPlan::default(),
             sinks: vec![ExportSinkPlan {
                 id: "secure".to_string(),
                 transport: ExporterTransport::Webhook,

@@ -26,7 +26,7 @@ pub use export::{
     ExporterTransport, ExporterWorkerConfig,
 };
 pub use policy::PolicyConfig;
-pub use storage::StorageConfig;
+pub use storage::{ExportQueueRetentionConfig, StorageConfig, StorageRetentionConfig};
 pub use tls::{
     PlaintextTlsConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind, TlsPlaintextProvider,
 };

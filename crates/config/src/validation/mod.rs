@@ -3,6 +3,7 @@ mod capture;
 mod enforcement;
 mod export;
 mod policy;
+mod storage;
 
 use crate::{AgentConfig, ConfigValidationError, tls};
 
@@ -10,6 +11,7 @@ pub(crate) fn validate_config(config: &AgentConfig) -> Result<(), ConfigValidati
     let mut violations = Vec::new();
 
     capture::validate(&config.capture, &mut violations);
+    storage::validate(&config.storage, &mut violations);
     tls::validate_tls(&config.tls, &config.capture, &mut violations);
     export::validate_runtime(&config.export, &mut violations);
     export::validate_exporters(&config.exporters, &config.tls, &mut violations);

@@ -16,7 +16,7 @@ use super::{
     enforcement::{
         EnforcementStatusSnapshot, enforcement_status, enforcement_status_with_loaded_source,
     },
-    export::{ExporterStatusSnapshot, exporter_statuses},
+    export::{ExportStatusSnapshot, ExporterStatusSnapshot, export_status, exporter_statuses},
     health::health_snapshot,
     policy::{PolicyStatusSnapshot, policy_status},
     tls::{TlsStatusSnapshot, tls_status},
@@ -34,6 +34,7 @@ pub struct AgentStatusSnapshot {
     pub tls: TlsStatusSnapshot,
     pub capabilities: CapabilityMatrix,
     pub spool: SpoolStatusSnapshot,
+    pub export: ExportStatusSnapshot,
     pub exporters: Vec<ExporterStatusSnapshot>,
     pub metrics: MetricsSnapshot,
 }
@@ -247,6 +248,7 @@ fn build_status_snapshot_at_with_runtime(
         None => enforcement_status(plan),
     };
     let tls = tls_status(plan);
+    let export = export_status(plan);
     let exporters = exporter_statuses(plan, &spool_status, &spool.export_cursors);
     let metrics = metrics_snapshot(&plan.capabilities, &spool_status, &exporters);
     let health = health_snapshot(plan, &spool_status, &exporters, &policy, &enforcement);
@@ -267,6 +269,7 @@ fn build_status_snapshot_at_with_runtime(
         tls,
         capabilities: plan.capabilities.clone(),
         spool: spool_status,
+        export,
         exporters,
         metrics,
     }
