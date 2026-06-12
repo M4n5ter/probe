@@ -66,6 +66,7 @@ pub(in crate::export::drain) async fn wait_for_memory_export_cursor(
 pub(in crate::export::drain) struct SingleEventBatchSpool {
     events: Mutex<Vec<StoredEvent>>,
     cursors: Mutex<BTreeMap<String, u64>>,
+    last_sequence: u64,
 }
 
 impl SingleEventBatchSpool {
@@ -81,6 +82,7 @@ impl SingleEventBatchSpool {
         Ok(Self {
             events: Mutex::new(events),
             cursors: Mutex::new(BTreeMap::new()),
+            last_sequence: count,
         })
     }
 
@@ -91,6 +93,7 @@ impl SingleEventBatchSpool {
                 payload,
             }]),
             cursors: Mutex::new(BTreeMap::new()),
+            last_sequence: 1,
         }
     }
 }
@@ -124,17 +127,11 @@ impl ExportSpool for SingleEventBatchSpool {
     }
 
     fn ack_export(&self, sink: &str, sequence: u64) -> Result<(), StorageError> {
-        let last_sequence = self
-            .events
-            .lock()
-            .map_err(|_| StorageError::SequenceLockPoisoned { lane: "export" })?
-            .last()
-            .map_or(0, |event| event.sequence);
-        if sequence > last_sequence {
+        if sequence > self.last_sequence {
             return Err(StorageError::AckBeyondLastSequence {
                 sink: sink.to_string(),
                 sequence,
-                last_sequence,
+                last_sequence: self.last_sequence,
             });
         }
         let mut cursors = self
@@ -151,6 +148,23 @@ impl ExportSpool for SingleEventBatchSpool {
             .lock()
             .map(|cursors| cursors.get(sink).copied().unwrap_or(0))
             .map_err(|_| StorageError::SequenceLockPoisoned { lane: "export" })
+    }
+
+    fn prune_export_through(&self, sequence: u64, limit: usize) -> Result<u64, StorageError> {
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| StorageError::SequenceLockPoisoned { lane: "export" })?;
+        let mut removed = 0;
+        events.retain(|event| {
+            if event.sequence <= sequence && removed < limit {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        Ok(removed as u64)
     }
 }
 

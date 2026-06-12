@@ -121,6 +121,13 @@ pub trait ExportSpool {
     fn ack_export(&self, sink: &str, sequence: u64) -> Result<(), StorageError>;
 
     fn export_cursor(&self, sink: &str) -> Result<u64, StorageError>;
+
+    /// Removes up to `limit` export events with sequence <= `sequence`.
+    ///
+    /// This does not change export cursors or the durable high-water mark. Callers
+    /// must pass a sequence already confirmed by every cursor-owning sink whose
+    /// at-least-once delivery must be preserved.
+    fn prune_export_through(&self, sequence: u64, limit: usize) -> Result<u64, StorageError>;
 }
 
 pub trait DurableSpool: ExportSpool {
@@ -266,6 +273,10 @@ impl FjallSpool {
         self.cursor_for_lane(SpoolLane::Export, sink)
     }
 
+    pub fn prune_export_through(&self, sequence: u64, limit: usize) -> Result<u64, StorageError> {
+        self.prune_lane_through(SpoolLane::Export, sequence, limit)
+    }
+
     pub fn snapshot(&self) -> Result<SpoolSnapshot, StorageError> {
         Ok(SpoolSnapshot {
             last_ingress_sequence: *self.lock_last_sequence(SpoolLane::Ingress)?,
@@ -389,6 +400,51 @@ impl FjallSpool {
         Ok(decode_sequence_key(&value))
     }
 
+    fn prune_lane_through(
+        &self,
+        lane: SpoolLane,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<u64, StorageError> {
+        if sequence == 0 || limit == 0 {
+            return Ok(0);
+        }
+        // Keep this guard through commit so cleanup cannot overwrite high-water
+        // metadata written by a concurrent append with this older value.
+        let last_sequence = self.lock_last_sequence(lane)?;
+        let durable_last_sequence = *last_sequence;
+        let cutoff = sequence.min(durable_last_sequence);
+        if cutoff == 0 {
+            return Ok(0);
+        }
+        let keys = self
+            .queue(lane)
+            .range(..=sequence_key(cutoff))
+            .take(limit)
+            .map(|item| {
+                let (key, _) = item.into_inner()?;
+                Ok::<_, fjall::Error>(key.as_ref().to_vec())
+            })
+            .collect::<Result<Vec<_>, fjall::Error>>()?;
+        if keys.is_empty() {
+            return Ok(0);
+        }
+
+        let mut batch = self.database.batch();
+        batch.insert(
+            &self.metadata,
+            lane.last_sequence_key(),
+            sequence_key(durable_last_sequence),
+        );
+        for key in &keys {
+            batch.remove(self.queue(lane), key.as_slice());
+        }
+        batch.commit()?;
+        self.database.persist(PersistMode::SyncAll)?;
+        drop(last_sequence);
+        Ok(keys.len() as u64)
+    }
+
     fn queue(&self, lane: SpoolLane) -> &Keyspace {
         match lane {
             SpoolLane::Ingress => &self.ingress_journal,
@@ -432,6 +488,10 @@ impl ExportSpool for FjallSpool {
 
     fn export_cursor(&self, sink: &str) -> Result<u64, StorageError> {
         FjallSpool::export_cursor(self, sink)
+    }
+
+    fn prune_export_through(&self, sequence: u64, limit: usize) -> Result<u64, StorageError> {
+        FjallSpool::prune_export_through(self, sequence, limit)
     }
 }
 
@@ -597,6 +657,7 @@ fn decode_spool_payload(bytes: &[u8]) -> Result<SpoolPayload, StorageError> {
 mod tests {
     use std::fs;
 
+    use fjall::PersistMode;
     use probe_core::SpoolPayloadSchema;
     use tempfile::tempdir;
 
@@ -772,6 +833,77 @@ mod tests {
         spool.append_export(test_payload(b"one"))?;
 
         assert!(spool.read_export_batch("primary", 0)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn prune_export_through_removes_bounded_prefix_without_moving_high_water()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        spool.append_export(test_payload(b"one"))?;
+        spool.append_export(test_payload(b"two"))?;
+        spool.append_export(test_payload(b"three"))?;
+
+        assert_eq!(spool.prune_export_through(3, 2)?, 2);
+
+        let remaining = spool.read_export_batch("late", 10)?;
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(spool.snapshot()?.last_export_sequence, 3);
+        drop(spool);
+
+        let reopened = FjallSpool::open(temp.path())?;
+        assert_eq!(reopened.snapshot()?.last_export_sequence, 3);
+        assert_eq!(
+            reopened
+                .read_export_batch("late", 10)?
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(reopened.prune_export_through(3, 2)?, 1);
+        assert!(reopened.read_export_batch("late", 10)?.is_empty());
+        reopened.ack_export("primary", 3)?;
+        assert_eq!(reopened.export_cursor("primary")?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_export_through_materializes_high_water_for_metadata_less_spool()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        let mut batch = spool.database.batch();
+        batch.insert(
+            &spool.export_queue,
+            sequence_key(1),
+            encode_spool_payload(&test_payload(b"one"))?,
+        );
+        batch.insert(
+            &spool.export_queue,
+            sequence_key(2),
+            encode_spool_payload(&test_payload(b"two"))?,
+        );
+        batch.commit()?;
+        spool.database.persist(PersistMode::SyncAll)?;
+        drop(spool);
+
+        let recovered = FjallSpool::open(temp.path())?;
+        assert_eq!(recovered.snapshot()?.last_export_sequence, 2);
+        assert_eq!(recovered.prune_export_through(2, 10)?, 2);
+        assert!(recovered.read_export_batch("late", 10)?.is_empty());
+        drop(recovered);
+
+        let reopened = FjallSpool::open(temp.path())?;
+        assert_eq!(reopened.snapshot()?.last_export_sequence, 2);
+        assert_eq!(reopened.append_export(test_payload(b"three"))?.sequence, 3);
         Ok(())
     }
 

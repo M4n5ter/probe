@@ -11,13 +11,16 @@ use super::{
 use crate::tls_material::read_tls_material;
 
 const REPLAY_WEBHOOK_SINK: &str = "replay-webhook";
+const EXPORT_PRUNE_BATCH_LIMIT: usize = 1024;
 
 pub async fn drain_planned_sinks(
     spool: &impl ExportSpool,
     agent_id: &str,
     plan: &ExportPlan,
 ) -> Result<(), ExportDrainError> {
-    drain_export_sinks_with_mode(spool, agent_id, &plan.sinks, SinkDrainMode::UntilEmpty).await
+    let result =
+        drain_export_sinks_with_mode(spool, agent_id, &plan.sinks, SinkDrainMode::UntilEmpty).await;
+    finish_export_sink_drain(result, prune_export_queue_for_sinks(spool, &plan.sinks))
 }
 
 pub async fn drain_replay_webhook(
@@ -55,6 +58,35 @@ pub(super) async fn drain_export_sinks_with_mode(
         Err(ExportDrainError::MultipleSinksFailed {
             failures: failures.join("; "),
         })
+    }
+}
+
+pub(super) fn prune_export_queue_for_sinks(
+    spool: &impl ExportSpool,
+    sinks: &[ExportSinkPlan],
+) -> Result<(), ExportDrainError> {
+    let mut retire_through = None;
+    for sink in sinks {
+        let cursor = spool.export_cursor(&sink.id)?;
+        retire_through = Some(retire_through.map_or(cursor, |sequence: u64| sequence.min(cursor)));
+    }
+    if let Some(sequence) = retire_through {
+        spool.prune_export_through(sequence, EXPORT_PRUNE_BATCH_LIMIT)?;
+    }
+    Ok(())
+}
+
+pub(super) fn finish_export_sink_drain(
+    drain_result: Result<(), ExportDrainError>,
+    cleanup_result: Result<(), ExportDrainError>,
+) -> Result<(), ExportDrainError> {
+    match (drain_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(drain_error), Ok(())) => Err(drain_error),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(drain_error), Err(cleanup_error)) => Err(ExportDrainError::MultipleSinksFailed {
+            failures: format!("{drain_error}; export queue cleanup: {cleanup_error}"),
+        }),
     }
 }
 
@@ -451,6 +483,14 @@ mod tests {
         ));
         assert_eq!(spool.export_cursor("failing")?, 0);
         assert_eq!(spool.export_cursor("successful")?, 1);
+        assert_eq!(
+            spool
+                .read_export_batch("failing", 10)?
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
 
         let request = successful.join()?;
         assert_eq!(
@@ -496,6 +536,7 @@ mod tests {
         drain_planned_sinks(&spool, "agent-1", &plan).await?;
 
         assert_eq!(spool.export_cursor("tail")?, 2);
+        assert!(spool.read_export_batch("late", 10)?.is_empty());
         let requests = server.join_requests()?;
         assert_eq!(requests.len(), 2);
         assert_eq!(

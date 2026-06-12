@@ -9,7 +9,11 @@ use runtime::{ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportWorker
 use storage::ExportSpool;
 use tokio::sync::Notify;
 
-use super::{ExportDrainError, mode::SinkDrainMode, target::drain_export_sink_with_mode};
+use super::{
+    ExportDrainError,
+    mode::SinkDrainMode,
+    target::{drain_export_sink_with_mode, finish_export_sink_drain, prune_export_queue_for_sinks},
+};
 
 const EXPORT_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -141,13 +145,17 @@ async fn drain_export_sinks_once(
             }
         }
     }
-    if failures.is_empty() {
+    let drain_result = if failures.is_empty() {
         Ok(())
     } else {
         Err(ExportDrainError::MultipleSinksFailed {
             failures: failures.join("; "),
         })
-    }
+    };
+    finish_export_sink_drain(
+        drain_result,
+        prune_export_queue_for_sinks(spool, &config.sinks),
+    )
 }
 
 #[derive(Debug)]
@@ -444,6 +452,7 @@ mod tests {
         wait_for_memory_export_cursor(spool.as_ref(), "budget", 2).await?;
         worker.stop().await;
 
+        assert!(spool.read_export_batch("late", 10)?.is_empty());
         let requests = server.join_requests()?;
         assert_eq!(requests.len(), 2);
         assert_eq!(
