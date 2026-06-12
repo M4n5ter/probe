@@ -343,18 +343,20 @@ fn current_unix_time_ns() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::PathBuf};
 
-    use super::super::snapshot_fixture::*;
+    use super::super::fixture::{config_with_storage_path, runtime_plan_from_config, test_dir};
     use super::*;
     use probe_config::{
         EnforcementPolicyManifest, EnforcementPolicySourceConfig, TlsMaterialConfig,
         TlsMaterialKind,
     };
-    use probe_core::{Action, ProtectiveActionProfile};
-    use probe_core::{CapabilityKind, CapabilityState};
+    use probe_core::{
+        Action, CapabilityKind, CapabilityState, ProtectiveActionProfile, SpoolPayloadSchema,
+    };
     use runtime::{ExportFailureBackoffPlan, ExportWorkerPlan};
     use serde_json::json;
+    use storage::SpoolPayload;
 
     #[test]
     fn status_snapshot_reports_sink_lag_and_health() -> Result<(), Box<dyn std::error::Error>> {
@@ -730,5 +732,20 @@ mod tests {
             },
             BTreeMap::from([("primary".to_string(), 0)]),
         )
+    }
+
+    fn runtime_plan_with_exporter() -> Result<RuntimePlan, runtime::RuntimeError> {
+        runtime_plan(PathBuf::from("/tmp/sssa-spool"), Vec::new())
+    }
+
+    fn runtime_plan(
+        storage_path: PathBuf,
+        capabilities: Vec<CapabilityState>,
+    ) -> Result<RuntimePlan, runtime::RuntimeError> {
+        runtime_plan_from_config(config_with_storage_path(storage_path), capabilities)
+    }
+
+    fn test_payload(bytes: &[u8]) -> SpoolPayload {
+        SpoolPayload::new(SpoolPayloadSchema::from_wire("test.schema"), bytes)
     }
 }

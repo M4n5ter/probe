@@ -160,10 +160,10 @@ mod tests {
     use probe_core::{CapabilityKind, CapabilityState, RuntimeMode, Selector};
     use serde_json::json;
 
-    use super::*;
-    use crate::status::snapshot_fixture::{
+    use super::super::super::fixture::{
         config_with_storage_path, runtime_plan_from_config, test_dir,
     };
+    use super::*;
 
     #[test]
     fn tls_status_reports_metadata_only_materials() -> Result<(), Box<dyn std::error::Error>> {

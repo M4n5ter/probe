@@ -1,10 +1,10 @@
 mod enforcement;
 mod export;
+#[cfg(test)]
+mod fixture;
 mod health;
 mod policy;
 mod snapshot;
-#[cfg(test)]
-mod snapshot_fixture;
 mod tls;
 
 pub(crate) use snapshot::{

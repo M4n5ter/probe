@@ -9,22 +9,10 @@ use probe_config::{
     AgentConfig, CaptureBackend, CaptureSelection, CompressionCodecName, ExporterConfig,
     ExporterTransport,
 };
-use probe_core::{CapabilityState, SpoolPayloadSchema};
+use probe_core::CapabilityState;
 use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan};
-use storage::SpoolPayload;
 
-pub(super) fn runtime_plan_with_exporter() -> Result<RuntimePlan, runtime::RuntimeError> {
-    runtime_plan(PathBuf::from("/tmp/sssa-spool"), Vec::new())
-}
-
-pub(super) fn runtime_plan(
-    storage_path: PathBuf,
-    capabilities: Vec<CapabilityState>,
-) -> Result<RuntimePlan, runtime::RuntimeError> {
-    runtime_plan_from_config(config_with_storage_path(storage_path), capabilities)
-}
-
-pub(super) fn runtime_plan_from_config(
+pub(in crate::status) fn runtime_plan_from_config(
     config: AgentConfig,
     capabilities: Vec<CapabilityState>,
 ) -> Result<RuntimePlan, runtime::RuntimeError> {
@@ -44,7 +32,7 @@ pub(super) fn runtime_plan_from_config(
     RuntimePlan::build(config, &registry)
 }
 
-pub(super) fn config_with_storage_path(storage_path: PathBuf) -> AgentConfig {
+pub(in crate::status) fn config_with_storage_path(storage_path: PathBuf) -> AgentConfig {
     AgentConfig {
         agent_id: "agent-1".to_string(),
         capture: probe_config::CaptureConfig {
@@ -68,11 +56,7 @@ pub(super) fn config_with_storage_path(storage_path: PathBuf) -> AgentConfig {
     }
 }
 
-pub(super) fn test_payload(bytes: &[u8]) -> SpoolPayload {
-    SpoolPayload::new(SpoolPayloadSchema::from_wire("test.schema"), bytes)
-}
-
-pub(super) fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {
+pub(in crate::status) fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {
     let path = std::env::temp_dir().join(format!("{name}-{}", current_unix_time_ns()));
     if Path::new(&path).exists() {
         fs::remove_dir_all(&path)?;

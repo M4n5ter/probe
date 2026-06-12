@@ -245,10 +245,10 @@ mod tests {
     use probe_core::RuntimeMode;
     use serde_json::json;
 
-    use super::*;
-    use crate::status::snapshot_fixture::{
+    use super::super::super::fixture::{
         config_with_storage_path, runtime_plan_from_config, test_dir,
     };
+    use super::*;
 
     #[test]
     fn exporter_status_reports_per_sink_worker_quota() -> Result<(), Box<dyn std::error::Error>> {
