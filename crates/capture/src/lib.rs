@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use ebpf::{
-    EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport, EbpfProbeCheck, UnprivilegedBpfStatus,
+    AyaEbpfObjectProbe, EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport,
+    EbpfObjectProbeConfig, EbpfObjectProbeReport, EbpfObjectProgram, EbpfObjectProgramKind,
+    EbpfProbeCheck, UnprivilegedBpfStatus,
 };
 pub use libpcap::{LibpcapConfig, LibpcapProvider};
 pub use plaintext::{

@@ -5,6 +5,7 @@ use std::{
 };
 
 mod admin;
+mod capture_registry;
 mod check;
 mod configured_enforcement;
 mod configured_policy;
@@ -18,9 +19,10 @@ mod tls_material;
 use admin::{AdminRuntimeState, AdminServerConfig, spawn_admin_server};
 use attribution::ProcfsSocketResolver;
 use capture::{
-    CaptureError, CaptureProvider, EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport,
-    LibpcapConfig, LibpcapProvider, ProcessResolver, ReplayProvider, ResolvedProcess,
+    CaptureError, CaptureProvider, LibpcapProvider, ProcessResolver, ReplayProvider,
+    ResolvedProcess,
 };
+use capture_registry::{default_provider_registry, libpcap_config_from_agent};
 use check::build_check_report;
 use clap::{Parser, Subcommand, ValueEnum};
 use configured_enforcement::{
@@ -40,10 +42,7 @@ use probe_core::{
     AddressPort, CapabilityKind, Direction, EnforcementMode, FlowContext, FlowIdentity,
     ProcessContext, ProcessIdentity, RuntimeMode, TcpConnection, Timestamp, TransportProtocol,
 };
-use runtime::{
-    CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimeError, RuntimePlan,
-    validate_static_runtime_config,
-};
+use runtime::{RuntimeError, RuntimePlan, validate_static_runtime_config};
 use status::{build_status_snapshot, collect_spool_status};
 use storage::FjallSpool;
 use thiserror::Error;
@@ -111,7 +110,10 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
-    Capabilities,
+    Capabilities {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     Status {
         #[arg(long)]
         config: PathBuf,
@@ -293,8 +295,12 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let report = build_check_report(plan).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        Command::Capabilities => {
-            let matrix = default_provider_registry(&AgentConfig::default()).capability_matrix();
+        Command::Capabilities { config } => {
+            let config = match config {
+                Some(path) => read_config(&path)?,
+                None => AgentConfig::default(),
+            };
+            let matrix = default_provider_registry(&config).capability_matrix();
             println!("{}", serde_json::to_string_pretty(&matrix)?);
         }
         Command::Status { config } => {
@@ -349,50 +355,6 @@ fn admin_server_config_from_plan(plan: &RuntimePlan) -> Option<AdminServerConfig
     })
 }
 
-fn default_provider_registry(config: &AgentConfig) -> ProviderRegistry {
-    ProviderRegistry::with_default_platform(default_capture_provider_descriptors(config))
-}
-
-fn default_capture_provider_descriptors(config: &AgentConfig) -> Vec<CaptureProviderDescriptor> {
-    vec![
-        CaptureProviderDescriptor::available(
-            CaptureBackend::Replay,
-            CaptureProviderBuilder::Replay,
-        ),
-        ebpf_provider_descriptor(EbpfHostProbe::probe(&EbpfHostProbeConfig::default())),
-        CaptureProviderDescriptor::available(
-            CaptureBackend::PlaintextFeed,
-            CaptureProviderBuilder::PlaintextFeed,
-        ),
-        libpcap_provider_descriptor(&libpcap_config_from_agent(config)),
-    ]
-}
-
-fn ebpf_provider_descriptor(report: EbpfHostProbeReport) -> CaptureProviderDescriptor {
-    CaptureProviderDescriptor::unavailable(
-        CaptureBackend::Ebpf,
-        CaptureProviderBuilder::Unimplemented,
-        format!(
-            "provider not implemented in this build; host probe: {}",
-            report.summary()
-        ),
-    )
-}
-
-fn libpcap_provider_descriptor(config: &LibpcapConfig) -> CaptureProviderDescriptor {
-    match LibpcapProvider::probe(config) {
-        Ok(()) => CaptureProviderDescriptor::available(
-            CaptureBackend::Libpcap,
-            CaptureProviderBuilder::Libpcap,
-        ),
-        Err(error) => CaptureProviderDescriptor::unavailable(
-            CaptureBackend::Libpcap,
-            CaptureProviderBuilder::Libpcap,
-            error.to_string(),
-        ),
-    }
-}
-
 fn build_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProvider>, AgentError> {
     match plan.capture.selected_backend {
         Some(CaptureBackend::PlaintextFeed) => build_plaintext_feed_provider(plan),
@@ -443,18 +405,6 @@ fn procfs_tcp_process_resolver_for_plan(plan: &RuntimePlan) -> Option<Box<dyn Pr
         .mode(CapabilityKind::ProcfsSocketAttribution)
         != RuntimeMode::Unavailable)
         .then(|| Box::<ProcfsTcpProcessResolver>::default() as Box<dyn ProcessResolver>)
-}
-
-fn libpcap_config_from_agent(config: &AgentConfig) -> LibpcapConfig {
-    LibpcapConfig {
-        interface: config.capture.libpcap.interface.clone(),
-        bpf_filter: config.capture.libpcap.bpf_filter.clone(),
-        snaplen: config.capture.libpcap.snaplen,
-        promisc: config.capture.libpcap.promisc,
-        immediate_mode: config.capture.libpcap.immediate_mode,
-        read_timeout_ms: config.capture.libpcap.read_timeout_ms,
-        buffer_size: config.capture.libpcap.buffer_size,
-    }
 }
 
 struct ProcfsTcpProcessResolver {
@@ -630,35 +580,12 @@ fn synthetic_replay_process() -> ProcessContext {
 mod tests {
     use std::fs;
 
-    use capture::{CaptureEvent, CapturedBytes, EbpfProbeCheck, UnprivilegedBpfStatus};
+    use capture::{CaptureEvent, CapturedBytes};
     use probe_config::{CaptureSelection, EnforcementPolicySourceConfig, PolicyConfig};
     use probe_core::SpoolPayloadSchema;
     use storage::SpoolPayload;
 
     use super::*;
-
-    #[test]
-    fn ebpf_provider_descriptor_keeps_host_probe_reason() {
-        let descriptor = ebpf_provider_descriptor(EbpfHostProbeReport {
-            linux: true,
-            btf_vmlinux: EbpfProbeCheck::Available,
-            bpffs: EbpfProbeCheck::Unavailable {
-                reason: "bpffs path /sys/fs/bpf does not exist".to_string(),
-            },
-            unprivileged_bpf: UnprivilegedBpfStatus::Disabled,
-        });
-
-        assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
-        assert_eq!(descriptor.builder, CaptureProviderBuilder::Unimplemented);
-        assert_eq!(descriptor.mode, RuntimeMode::Unavailable);
-        let reason = descriptor
-            .reason
-            .expect("eBPF descriptor should explain why it is unavailable");
-        assert!(reason.contains("provider not implemented"));
-        assert!(reason.contains("btf_vmlinux=available"));
-        assert!(reason.contains("bpffs path /sys/fs/bpf does not exist"));
-        assert!(reason.contains("unprivileged_bpf=disabled"));
-    }
 
     #[test]
     fn replay_flow_uses_synthetic_process_identity() {

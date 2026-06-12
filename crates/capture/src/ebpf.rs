@@ -1,12 +1,18 @@
 use std::{
     fmt,
+    fs::{File, Metadata},
+    io::Read,
     path::{Path, PathBuf},
 };
 
+use aya_obj::{Object, ProgramSection};
+use rustix::fs::{Mode, OFlags, open};
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
 const BPF_FS_MAGIC: u64 = 0xcafe_4a11;
+
+const MAX_EBPF_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EbpfHostProbeConfig {
@@ -33,6 +39,126 @@ pub struct EbpfHostProbeReport {
     pub btf_vmlinux: EbpfProbeCheck,
     pub bpffs: EbpfProbeCheck,
     pub unprivileged_bpf: UnprivilegedBpfStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EbpfObjectProbeConfig {
+    pub object_path: PathBuf,
+}
+
+impl EbpfObjectProbeConfig {
+    pub fn new(object_path: impl Into<PathBuf>) -> Self {
+        Self {
+            object_path: object_path.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EbpfObjectProbeReport {
+    pub object_path: PathBuf,
+    pub object: EbpfProbeCheck,
+    pub programs: Vec<EbpfObjectProgram>,
+    pub maps: Vec<String>,
+}
+
+impl EbpfObjectProbeReport {
+    pub fn object_available(&self) -> bool {
+        self.object.is_available()
+    }
+
+    pub fn summary(&self) -> String {
+        match &self.object {
+            EbpfProbeCheck::Available => format!(
+                "object {} parsed, programs={}, maps={}",
+                self.object_path.display(),
+                named_list_summary(self.programs.iter().map(|program| program.name.as_str())),
+                named_list_summary(self.maps.iter().map(String::as_str))
+            ),
+            EbpfProbeCheck::Unavailable { reason } => {
+                format!(
+                    "object {} unavailable: {reason}",
+                    self.object_path.display()
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EbpfObjectProgram {
+    pub name: String,
+    pub kind: EbpfObjectProgramKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EbpfObjectProgramKind {
+    Kretprobe,
+    Kprobe,
+    Uprobe,
+    Uretprobe,
+    Tracepoint,
+    SocketFilter,
+    Xdp,
+    SkMsg,
+    SkSkbStreamParser,
+    SkSkbStreamVerdict,
+    SockOps,
+    SchedClassifier,
+    CgroupSkb,
+    CgroupSkbIngress,
+    CgroupSkbEgress,
+    CgroupSockAddr,
+    CgroupSysctl,
+    CgroupSockopt,
+    LircMode2,
+    PerfEvent,
+    RawTracepoint,
+    Lsm,
+    BtfTracepoint,
+    Fentry,
+    Fexit,
+    Extension,
+    SkLookup,
+    CgroupSock,
+    CgroupDevice,
+}
+
+impl From<&ProgramSection> for EbpfObjectProgramKind {
+    fn from(section: &ProgramSection) -> Self {
+        match section {
+            ProgramSection::KRetProbe => Self::Kretprobe,
+            ProgramSection::KProbe => Self::Kprobe,
+            ProgramSection::UProbe { .. } => Self::Uprobe,
+            ProgramSection::URetProbe { .. } => Self::Uretprobe,
+            ProgramSection::TracePoint => Self::Tracepoint,
+            ProgramSection::SocketFilter => Self::SocketFilter,
+            ProgramSection::Xdp { .. } => Self::Xdp,
+            ProgramSection::SkMsg => Self::SkMsg,
+            ProgramSection::SkSkbStreamParser => Self::SkSkbStreamParser,
+            ProgramSection::SkSkbStreamVerdict => Self::SkSkbStreamVerdict,
+            ProgramSection::SockOps => Self::SockOps,
+            ProgramSection::SchedClassifier => Self::SchedClassifier,
+            ProgramSection::CgroupSkb => Self::CgroupSkb,
+            ProgramSection::CgroupSkbIngress => Self::CgroupSkbIngress,
+            ProgramSection::CgroupSkbEgress => Self::CgroupSkbEgress,
+            ProgramSection::CgroupSockAddr { .. } => Self::CgroupSockAddr,
+            ProgramSection::CgroupSysctl => Self::CgroupSysctl,
+            ProgramSection::CgroupSockopt { .. } => Self::CgroupSockopt,
+            ProgramSection::LircMode2 => Self::LircMode2,
+            ProgramSection::PerfEvent => Self::PerfEvent,
+            ProgramSection::RawTracePoint => Self::RawTracepoint,
+            ProgramSection::Lsm { .. } => Self::Lsm,
+            ProgramSection::BtfTracePoint => Self::BtfTracepoint,
+            ProgramSection::FEntry { .. } => Self::Fentry,
+            ProgramSection::FExit { .. } => Self::Fexit,
+            ProgramSection::Extension => Self::Extension,
+            ProgramSection::SkLookup => Self::SkLookup,
+            ProgramSection::CgroupSock { .. } => Self::CgroupSock,
+            ProgramSection::CgroupDevice => Self::CgroupDevice,
+        }
+    }
 }
 
 impl EbpfHostProbeReport {
@@ -138,6 +264,121 @@ impl EbpfHostProbe {
     }
 }
 
+pub struct AyaEbpfObjectProbe;
+
+impl AyaEbpfObjectProbe {
+    pub fn probe(config: &EbpfObjectProbeConfig) -> EbpfObjectProbeReport {
+        let object_path = config.object_path.clone();
+        match open_regular_ebpf_object(&object_path)
+            .and_then(|file| read_limited_ebpf_object_bytes(&object_path, file))
+            .and_then(|bytes| {
+                Object::parse(&bytes)
+                    .map_err(|error| format!("failed to parse eBPF object with aya-obj: {error}"))
+            }) {
+            Ok(object) => {
+                let mut programs = object
+                    .programs
+                    .iter()
+                    .map(|(name, program)| EbpfObjectProgram {
+                        name: name.to_string(),
+                        kind: EbpfObjectProgramKind::from(&program.section),
+                    })
+                    .collect::<Vec<_>>();
+                programs.sort_by(|left, right| left.name.cmp(&right.name));
+                let mut maps = object.maps.keys().cloned().collect::<Vec<_>>();
+                maps.sort();
+                EbpfObjectProbeReport {
+                    object_path,
+                    object: EbpfProbeCheck::available(),
+                    programs,
+                    maps,
+                }
+            }
+            Err(error) => EbpfObjectProbeReport {
+                object_path,
+                object: EbpfProbeCheck::unavailable(error),
+                programs: Vec::new(),
+                maps: Vec::new(),
+            },
+        }
+    }
+}
+
+fn open_regular_ebpf_object(path: &Path) -> Result<File, String> {
+    match probe_regular_file(path, "eBPF object") {
+        EbpfProbeCheck::Available => {}
+        EbpfProbeCheck::Unavailable { reason } => return Err(reason),
+    }
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|source| {
+        format!(
+            "failed to open eBPF object path {}: {source}",
+            path.display()
+        )
+    })?;
+    let file = File::from(fd);
+    let metadata = file.metadata().map_err(|source| {
+        format!(
+            "failed to inspect eBPF object path {}: {source}",
+            path.display()
+        )
+    })?;
+    validate_opened_ebpf_object(path, &metadata)?;
+    Ok(file)
+}
+
+fn validate_opened_ebpf_object(path: &Path, metadata: &Metadata) -> Result<(), String> {
+    if !metadata.is_file() {
+        return Err(format!(
+            "eBPF object path {} is not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_EBPF_OBJECT_BYTES {
+        return Err(ebpf_object_too_large_reason(
+            path,
+            metadata.len(),
+            MAX_EBPF_OBJECT_BYTES,
+        ));
+    }
+    Ok(())
+}
+
+fn read_limited_ebpf_object_bytes(path: &Path, file: File) -> Result<Vec<u8>, String> {
+    read_limited_ebpf_object_bytes_with_limit(path, file, MAX_EBPF_OBJECT_BYTES)
+}
+
+fn read_limited_ebpf_object_bytes_with_limit(
+    path: &Path,
+    file: File,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
+    let mut reader = file.take(limit.saturating_add(1));
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).map_err(|source| {
+        format!(
+            "failed to read eBPF object path {}: {source}",
+            path.display()
+        )
+    })?;
+    let size = bytes.len() as u64;
+    if size > limit {
+        return Err(ebpf_object_too_large_reason(path, size, limit));
+    }
+    Ok(bytes)
+}
+
+fn ebpf_object_too_large_reason(path: &Path, size: u64, limit: u64) -> String {
+    format!(
+        "eBPF object path {} is too large: {size} bytes exceeds {limit} bytes",
+        path.display()
+    )
+}
+
 fn probe_regular_file(path: &Path, label: &str) -> EbpfProbeCheck {
     match path.symlink_metadata() {
         Ok(metadata) if metadata.file_type().is_file() => EbpfProbeCheck::available(),
@@ -239,6 +480,14 @@ fn probe_unprivileged_bpf(path: &Path) -> UnprivilegedBpfStatus {
     }
 }
 
+fn named_list_summary<'a>(items: impl Iterator<Item = &'a str>) -> String {
+    let values = items.collect::<Vec<_>>();
+    if values.is_empty() {
+        return "none".to_string();
+    }
+    values.join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -337,5 +586,67 @@ mod tests {
 
         assert!(!report.kernel_prerequisites_available());
         assert_eq!(report.summary(), "eBPF capture requires Linux");
+    }
+
+    #[test]
+    fn object_probe_reports_missing_object() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let config = EbpfObjectProbeConfig::new(temp.path().join("missing.bpf.o"));
+
+        let report = AyaEbpfObjectProbe::probe(&config);
+
+        assert!(!report.object_available());
+        assert!(report.summary().contains("does not exist"));
+        assert!(report.programs.is_empty());
+        assert!(report.maps.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn object_probe_reports_invalid_object() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let object = temp.path().join("invalid.bpf.o");
+        fs::write(&object, b"not an elf object")?;
+        let config = EbpfObjectProbeConfig::new(object);
+
+        let report = AyaEbpfObjectProbe::probe(&config);
+
+        assert!(!report.object_available());
+        assert!(report.summary().contains("failed to parse eBPF object"));
+        assert!(report.programs.is_empty());
+        assert!(report.maps.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn object_probe_rejects_oversized_object_before_parse() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let object = temp.path().join("oversized.bpf.o");
+        fs::File::create(&object)?.set_len(MAX_EBPF_OBJECT_BYTES + 1)?;
+        let config = EbpfObjectProbeConfig::new(object);
+
+        let report = AyaEbpfObjectProbe::probe(&config);
+
+        assert!(!report.object_available());
+        assert!(report.summary().contains("too large"));
+        assert!(report.programs.is_empty());
+        assert!(report.maps.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_object_reader_rejects_file_larger_than_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let object = temp.path().join("bounded.bpf.o");
+        fs::write(&object, b"abcd")?;
+        let file = File::open(&object)?;
+
+        let error = read_limited_ebpf_object_bytes_with_limit(&object, file, 3)
+            .expect_err("bounded reader must reject bytes beyond limit");
+
+        assert!(error.contains("too large"));
+        Ok(())
     }
 }

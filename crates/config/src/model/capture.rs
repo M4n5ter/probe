@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct CaptureConfig {
     pub selection: CaptureSelection,
     pub fallback_backends: Vec<LiveCaptureBackend>,
+    pub ebpf: EbpfCaptureConfig,
     pub libpcap: LibpcapCaptureConfig,
     pub plaintext_feed: PlaintextFeedCaptureConfig,
     pub deep_observe_selector: Option<Selector>,
@@ -18,11 +19,18 @@ impl Default for CaptureConfig {
         Self {
             selection: CaptureSelection::Auto,
             fallback_backends: vec![LiveCaptureBackend::Ebpf, LiveCaptureBackend::Libpcap],
+            ebpf: EbpfCaptureConfig::default(),
             libpcap: LibpcapCaptureConfig::default(),
             plaintext_feed: PlaintextFeedCaptureConfig::default(),
             deep_observe_selector: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct EbpfCaptureConfig {
+    pub object_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

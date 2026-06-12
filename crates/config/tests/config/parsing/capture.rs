@@ -22,3 +22,24 @@ path = "/tmp/sssa-plaintext-feed.jsonl"
     config.validate_basic()?;
     Ok(())
 }
+
+#[test]
+fn parses_ebpf_object_config() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[capture]
+selection = "ebpf"
+
+[capture.ebpf]
+object_path = "/opt/sssa/sssa_probe.bpf.o"
+"#,
+    )?;
+
+    assert_eq!(config.capture.selection, CaptureSelection::Ebpf);
+    assert_eq!(
+        config.capture.ebpf.object_path,
+        Some(PathBuf::from("/opt/sssa/sssa_probe.bpf.o"))
+    );
+    config.validate_basic()?;
+    Ok(())
+}
