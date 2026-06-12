@@ -9,35 +9,40 @@ use std::{
     time::Duration,
 };
 
-pub(in crate::export::drain) struct TestWebhookServer {
+const WEBHOOK_SERVER_IO_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(in crate::export::drain) struct WebhookAckServer {
     endpoint: String,
     requests: Arc<Mutex<Vec<String>>>,
     stop_requested: Arc<AtomicBool>,
     handle: thread::JoinHandle<Result<(), String>>,
 }
 
-impl TestWebhookServer {
-    pub(in crate::export::drain) fn spawn(
-        accepted: bool,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::spawn_accepting(accepted, 1)
-    }
-
-    pub(in crate::export::drain) fn spawn_accepting(
-        accepted: bool,
+impl WebhookAckServer {
+    pub(in crate::export::drain) fn accepting(
         request_count: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::spawn_with_limit(accepted, request_count)
+        Self::spawn_with_limit(WebhookAckBehavior::Accept, request_count)
     }
 
-    pub(in crate::export::drain) fn spawn_recording(
-        accepted: bool,
+    pub(in crate::export::drain) fn rejecting(
+        request_count: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::spawn_with_limit(accepted, usize::MAX)
+        Self::spawn_with_limit(WebhookAckBehavior::Reject, request_count)
+    }
+
+    pub(in crate::export::drain) fn recording_accepting() -> Result<Self, Box<dyn std::error::Error>>
+    {
+        Self::spawn_with_limit(WebhookAckBehavior::Accept, usize::MAX)
+    }
+
+    pub(in crate::export::drain) fn recording_rejecting() -> Result<Self, Box<dyn std::error::Error>>
+    {
+        Self::spawn_with_limit(WebhookAckBehavior::Reject, usize::MAX)
     }
 
     fn spawn_with_limit(
-        accepted: bool,
+        behavior: WebhookAckBehavior,
         request_count: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -65,24 +70,26 @@ impl TestWebhookServer {
                     }
                     Err(error) => return Err(error.to_string()),
                 };
-                let request_text = read_headers(&mut stream)?;
+                stream
+                    .set_read_timeout(Some(WEBHOOK_SERVER_IO_TIMEOUT))
+                    .map_err(|error| error.to_string())?;
+                stream
+                    .set_write_timeout(Some(WEBHOOK_SERVER_IO_TIMEOUT))
+                    .map_err(|error| error.to_string())?;
+                let request_text = read_request(&mut stream)?;
                 let batch_id = request_header(&request_text, "idempotency-key")
                     .unwrap_or_else(|| "missing-batch".to_string());
-                let acked_cursor = accepted.then(|| cursor_from_batch_id(&batch_id));
+                let acked_cursor = behavior.accepted().then(|| cursor_from_batch_id(&batch_id));
                 let body = serde_json::json!({
                     "batch_id": batch_id,
-                    "accepted": accepted,
+                    "accepted": behavior.accepted(),
                     "acked_cursor": acked_cursor,
                     "acked_event_ids": [],
                     "retryable_event_ids": [],
-                    "reason": if accepted { None::<String> } else { Some("failed".to_string()) },
+                    "reason": behavior.rejection_reason(),
                 })
                 .to_string();
-                let status = if accepted {
-                    "200 OK"
-                } else {
-                    "500 Internal Server Error"
-                };
+                let status = behavior.http_status();
                 let response = format!(
                     "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -142,22 +149,70 @@ impl TestWebhookServer {
     }
 }
 
-fn read_headers(stream: &mut std::net::TcpStream) -> Result<String, String> {
+#[derive(Debug, Clone, Copy)]
+enum WebhookAckBehavior {
+    Accept,
+    Reject,
+}
+
+impl WebhookAckBehavior {
+    fn accepted(self) -> bool {
+        matches!(self, Self::Accept)
+    }
+
+    fn http_status(self) -> &'static str {
+        match self {
+            Self::Accept => "200 OK",
+            Self::Reject => "500 Internal Server Error",
+        }
+    }
+
+    fn rejection_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Accept => None,
+            Self::Reject => Some("failed"),
+        }
+    }
+}
+
+fn read_request(stream: &mut std::net::TcpStream) -> Result<String, String> {
     let mut bytes = Vec::new();
-    loop {
+    let header_end = loop {
         let mut buffer = [0; 1024];
         let read = stream
             .read(&mut buffer)
             .map_err(|error| error.to_string())?;
         if read == 0 {
-            break;
+            return Err("connection closed before HTTP headers completed".to_string());
         }
         bytes.extend_from_slice(&buffer[..read]);
-        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
+        if let Some(header_end) = header_end(&bytes) {
+            break header_end;
         }
+    };
+    let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+    let content_length = request_header(&headers, "content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body_bytes_read = bytes.len().saturating_sub(header_end);
+    while body_bytes_read < content_length {
+        let mut buffer = [0; 4096];
+        let read = stream
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Err("connection closed before HTTP body completed".to_string());
+        }
+        body_bytes_read += read;
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(headers)
+}
+
+fn header_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
 }
 
 fn cursor_from_batch_id(batch_id: &str) -> u64 {

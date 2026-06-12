@@ -244,6 +244,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         fs,
+        num::NonZeroU64,
         path::PathBuf,
         sync::Arc,
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -253,22 +254,19 @@ mod tests {
         AgentConfig, CompressionCodecName, ExportWorkerScheduleConfig, ExporterConfig,
         ExporterTransport, TlsMaterialKind,
     };
+    use probe_core::{CapabilityKind, CapabilityState};
     use runtime::{
-        ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportWorkerPlan,
+        self, ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan,
+        ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan, ProviderRegistry,
+        RuntimePlan,
     };
-    use storage::{ExportSpool, FjallSpool};
+    use storage::FjallSpool;
 
     use super::*;
-    use crate::export::drain::fixture::{
-        plan::{
-            fixed_failure_backoff, inherited_worker_quota, overridden_worker_quota, runtime_plan,
-            tls_material,
-        },
-        spool::{
-            SingleEventBatchSpool, append_export_event, wait_for_export_cursor,
-            wait_for_memory_export_cursor,
-        },
-        webhook::{TestWebhookServer, request_header},
+    use crate::export::drain::{
+        batch::EXPORT_BATCH_LIMIT,
+        spooled_event::{append_export_event, append_export_events},
+        webhook_server::{WebhookAckServer, request_header},
     };
 
     #[test]
@@ -369,7 +367,7 @@ mod tests {
         let temp = temp_path("planned-export-worker");
         let spool = Arc::new(FjallSpool::open(&temp)?);
         append_export_event(spool.as_ref(), 1)?;
-        let server = TestWebhookServer::spawn_accepting(true, 2)?;
+        let server = WebhookAckServer::accepting(2)?;
         let mut config = AgentConfig {
             agent_id: "agent-1".to_string(),
             exporters: vec![ExporterConfig {
@@ -419,6 +417,7 @@ mod tests {
             request_header(&requests[1], "idempotency-key").as_deref(),
             Some("agent-1:worker:2")
         );
+        assert!(spool.read_export_batch("late", 10)?.is_empty());
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -426,8 +425,11 @@ mod tests {
     #[tokio::test]
     async fn export_worker_uses_configured_per_tick_batch_budget()
     -> Result<(), Box<dyn std::error::Error>> {
-        let spool = Arc::new(SingleEventBatchSpool::with_export_events(2)?);
-        let server = TestWebhookServer::spawn_accepting(true, 2)?;
+        let temp = temp_path("configured-worker-budget");
+        let spool = Arc::new(FjallSpool::open(&temp)?);
+        let event_count = (EXPORT_BATCH_LIMIT + 1) as u64;
+        append_export_events(spool.as_ref(), event_count)?;
+        let server = WebhookAckServer::accepting(2)?;
         let plan = ExportPlan {
             worker: ExportWorkerPlan::FixedIntervalBounded {
                 interval_ms: 60_000,
@@ -449,27 +451,29 @@ mod tests {
             .expect("worker should be enabled");
 
         let worker = spawn_export_worker(Arc::clone(&spool), config);
-        wait_for_memory_export_cursor(spool.as_ref(), "budget", 2).await?;
+        wait_for_export_cursor(spool.as_ref(), "budget", event_count).await?;
         worker.stop().await;
 
-        assert!(spool.read_export_batch("late", 10)?.is_empty());
         let requests = server.join_requests()?;
         assert_eq!(requests.len(), 2);
         assert_eq!(
-            request_header(&requests[0], "idempotency-key").as_deref(),
-            Some("agent-1:budget:1")
+            request_header(&requests[0], "idempotency-key"),
+            Some(batch_id("agent-1", "budget", EXPORT_BATCH_LIMIT as u64))
         );
         assert_eq!(
-            request_header(&requests[1], "idempotency-key").as_deref(),
-            Some("agent-1:budget:2")
+            request_header(&requests[1], "idempotency-key"),
+            Some(batch_id("agent-1", "budget", event_count))
         );
+        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[tokio::test]
     async fn export_worker_uses_per_sink_batch_quota() -> Result<(), Box<dyn std::error::Error>> {
-        let spool = Arc::new(SingleEventBatchSpool::with_export_events(2)?);
-        let server = TestWebhookServer::spawn_recording(true)?;
+        let temp = temp_path("per-sink-worker-budget");
+        let spool = Arc::new(FjallSpool::open(&temp)?);
+        append_export_events(spool.as_ref(), (EXPORT_BATCH_LIMIT + 1) as u64)?;
+        let server = WebhookAckServer::recording_accepting()?;
         let plan = ExportPlan {
             worker: ExportWorkerPlan::FixedIntervalBounded {
                 interval_ms: 60_000,
@@ -491,25 +495,29 @@ mod tests {
             .expect("worker should be enabled");
 
         let worker = spawn_export_worker(Arc::clone(&spool), config);
-        wait_for_memory_export_cursor(spool.as_ref(), "limited", 1).await?;
+        wait_for_export_cursor(spool.as_ref(), "limited", EXPORT_BATCH_LIMIT as u64).await?;
         worker.stop().await;
 
-        assert_eq!(spool.export_cursor("limited")?, 1);
+        assert_eq!(spool.export_cursor("limited")?, EXPORT_BATCH_LIMIT as u64);
         let requests = server.join_requests()?;
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            request_header(&requests[0], "idempotency-key").as_deref(),
-            Some("agent-1:limited:1")
+            request_header(&requests[0], "idempotency-key"),
+            Some(batch_id("agent-1", "limited", EXPORT_BATCH_LIMIT as u64))
         );
+        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[tokio::test]
     async fn export_worker_backs_off_failing_sink_without_blocking_healthy_sink()
     -> Result<(), Box<dyn std::error::Error>> {
-        let spool = Arc::new(SingleEventBatchSpool::with_export_events(2)?);
-        let failing = TestWebhookServer::spawn_recording(false)?;
-        let successful = TestWebhookServer::spawn_accepting(true, 2)?;
+        let temp = temp_path("failing-sink-backoff");
+        let spool = Arc::new(FjallSpool::open(&temp)?);
+        let event_count = (EXPORT_BATCH_LIMIT + 1) as u64;
+        append_export_events(spool.as_ref(), event_count)?;
+        let failing = WebhookAckServer::recording_rejecting()?;
+        let successful = WebhookAckServer::accepting(2)?;
         let plan = ExportPlan {
             worker: ExportWorkerPlan::FixedIntervalBounded {
                 interval_ms: 10,
@@ -542,17 +550,26 @@ mod tests {
             .expect("worker should be enabled");
 
         let worker = spawn_export_worker(Arc::clone(&spool), config);
-        wait_for_memory_export_cursor(spool.as_ref(), "successful", 2).await?;
+        wait_for_export_cursor(spool.as_ref(), "successful", event_count).await?;
         worker.stop().await;
 
         let successful_requests = successful.join_requests()?;
         assert_eq!(successful_requests.len(), 2);
+        assert_eq!(
+            request_header(&successful_requests[0], "idempotency-key"),
+            Some(batch_id("agent-1", "successful", EXPORT_BATCH_LIMIT as u64))
+        );
+        assert_eq!(
+            request_header(&successful_requests[1], "idempotency-key"),
+            Some(batch_id("agent-1", "successful", event_count))
+        );
         let failing_requests = failing.join_requests()?;
         assert_eq!(failing_requests.len(), 1);
         assert_eq!(
-            request_header(&failing_requests[0], "idempotency-key").as_deref(),
-            Some("agent-1:failing:1")
+            request_header(&failing_requests[0], "idempotency-key"),
+            Some(batch_id("agent-1", "failing", EXPORT_BATCH_LIMIT as u64))
         );
+        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
@@ -561,6 +578,83 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         std::env::temp_dir().join(format!("sssa-probe-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn batch_id(agent_id: &str, sink: &str, sequence: u64) -> String {
+        format!("{agent_id}:{sink}:{sequence}")
+    }
+
+    async fn wait_for_export_cursor(
+        spool: &FjallSpool,
+        sink: &str,
+        expected_cursor: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..50 {
+            let cursor = spool.export_cursor(sink)?;
+            if cursor >= expected_cursor {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Err(format!(
+            "export cursor for sink {sink} did not reach {expected_cursor}; current cursor is {}",
+            spool.export_cursor(sink)?
+        )
+        .into())
+    }
+
+    fn inherited_worker_quota(effective_batches_per_tick: u64) -> ExportSinkWorkerPlan {
+        ExportSinkWorkerPlan {
+            batches_per_tick_override: None,
+            effective_batches_per_tick: NonZeroU64::new(effective_batches_per_tick)
+                .expect("positive batch quota"),
+        }
+    }
+
+    fn overridden_worker_quota(effective_batches_per_tick: u64) -> ExportSinkWorkerPlan {
+        ExportSinkWorkerPlan {
+            batches_per_tick_override: Some(effective_batches_per_tick),
+            effective_batches_per_tick: NonZeroU64::new(effective_batches_per_tick)
+                .expect("positive batch quota"),
+        }
+    }
+
+    fn fixed_failure_backoff(backoff_ms: u64) -> ExportFailureBackoffPlan {
+        ExportFailureBackoffPlan {
+            initial_ms: backoff_ms,
+            max_ms: backoff_ms,
+            multiplier: 1,
+        }
+    }
+
+    fn tls_material(
+        id: &str,
+        kind: TlsMaterialKind,
+        path: impl Into<PathBuf>,
+    ) -> ExportTlsMaterialPlan {
+        ExportTlsMaterialPlan {
+            id: id.to_string(),
+            kind,
+            path: path.into(),
+        }
+    }
+
+    fn runtime_plan(config: AgentConfig) -> Result<RuntimePlan, runtime::RuntimeError> {
+        RuntimePlan::build(
+            config,
+            &ProviderRegistry::new(Vec::new(), test_capabilities()),
+        )
+    }
+
+    fn test_capabilities() -> Vec<CapabilityState> {
+        vec![
+            CapabilityState::available(CapabilityKind::Http1),
+            CapabilityState::available(CapabilityKind::Sse),
+            CapabilityState::available(CapabilityKind::WebSocketHandoff),
+            CapabilityState::available(CapabilityKind::WebSocketFrame),
+            CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
+            CapabilityState::available(CapabilityKind::DryRunEnforcement),
+        ]
     }
 
     fn worker_backoff_from_plan(failure_backoff: ExportFailureBackoffPlan) -> ExportWorkerBackoff {
