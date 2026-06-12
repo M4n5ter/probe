@@ -7,7 +7,7 @@ use probe_core::{
 
 use crate::{CaptureError, CaptureEvent, CaptureProviderKind, CapturedGap};
 
-use super::{EbpfObservedProcess, EbpfProcessObservation};
+use super::{EbpfConnectTracepointObservation, EbpfObservedProcess};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EbpfConnectFlowLookup {
@@ -33,57 +33,49 @@ pub trait EbpfConnectFlowResolver {
     fn invalidate_cached_resolution(&mut self) {}
 }
 
-pub fn connect_opened_event_from_observation(
-    observation: &EbpfProcessObservation,
+pub(crate) fn connect_opened_event_from_observation(
+    connect: &EbpfConnectTracepointObservation,
     timestamp: Timestamp,
     resolver: &mut dyn EbpfConnectFlowResolver,
 ) -> Result<Option<CaptureEvent>, CaptureError> {
-    match observation {
-        EbpfProcessObservation::Connect(connect) => {
-            let resolved = resolver.resolve_connect_flow(EbpfConnectFlowLookup {
-                tgid: connect.process.tgid,
-                thread_pid: connect.process.pid,
-                fd: connect.fd,
-                expected_remote_endpoint: connect.endpoint.remote_endpoint(),
-            })?;
-            Ok(resolved.map(|resolved| CaptureEvent::ConnectionOpened {
-                timestamp,
-                flow: flow_from_resolved_connect(resolved, timestamp.monotonic_ns),
-                source: CaptureSource::EbpfSyscall,
-                provider: CaptureProviderKind::Ebpf,
-            }))
-        }
-    }
+    let resolved = resolver.resolve_connect_flow(EbpfConnectFlowLookup {
+        tgid: connect.process.tgid,
+        thread_pid: connect.process.pid,
+        fd: connect.fd,
+        expected_remote_endpoint: connect.endpoint.remote_endpoint(),
+    })?;
+    Ok(resolved.map(|resolved| CaptureEvent::ConnectionOpened {
+        timestamp,
+        flow: flow_from_resolved_connect(resolved, timestamp.monotonic_ns),
+        source: CaptureSource::EbpfSyscall,
+        provider: CaptureProviderKind::Ebpf,
+    }))
 }
 
 pub(crate) fn unresolved_connect_gap_from_observation(
-    observation: &EbpfProcessObservation,
+    connect: &EbpfConnectTracepointObservation,
     timestamp: Timestamp,
     reason: String,
 ) -> CaptureEvent {
-    match observation {
-        EbpfProcessObservation::Connect(connect) => {
-            let process = process_context_from_observed(&connect.process);
-            let remote = connect
-                .endpoint
-                .remote_endpoint()
-                .unwrap_or_else(unknown_tcp_endpoint);
-            let local = unknown_local_endpoint_for_remote(remote);
-            let flow = flow_from_unresolved_connect(process, local, remote, timestamp.monotonic_ns);
-            CaptureEvent::Gap(CapturedGap {
-                timestamp,
-                flow,
-                source: CaptureSource::EbpfSyscall,
-                provider: CaptureProviderKind::Ebpf,
-                gap: Gap {
-                    direction: Direction::Outbound,
-                    expected_offset: 0,
-                    next_offset: None,
-                    reason,
-                },
-            })
-        }
-    }
+    let process = process_context_from_observed(&connect.process);
+    let remote = connect
+        .endpoint
+        .remote_endpoint()
+        .unwrap_or_else(unknown_tcp_endpoint);
+    let local = unknown_local_endpoint_for_remote(remote);
+    let flow = flow_from_unresolved_connect(process, local, remote, timestamp.monotonic_ns);
+    CaptureEvent::Gap(CapturedGap {
+        timestamp,
+        flow,
+        source: CaptureSource::EbpfSyscall,
+        provider: CaptureProviderKind::Ebpf,
+        gap: Gap {
+            direction: Direction::Outbound,
+            expected_offset: 0,
+            next_offset: None,
+            reason,
+        },
+    })
 }
 
 fn flow_from_resolved_connect(
@@ -183,10 +175,7 @@ mod tests {
 
     use probe_core::{ProcessIdentity, TcpEndpoint};
 
-    use crate::ebpf::{
-        EbpfConnectEndpoint, EbpfConnectTracepointObservation, EbpfObservedProcess,
-        EbpfProcessObservation,
-    };
+    use crate::ebpf::{EbpfConnectEndpoint, EbpfConnectTracepointObservation, EbpfObservedProcess};
 
     use super::*;
 
@@ -194,7 +183,7 @@ mod tests {
     fn connect_observation_builds_connection_opened_event_from_fd_resolution()
     -> Result<(), Box<dyn std::error::Error>> {
         let expected_remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443);
-        let observation = EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
+        let observation = EbpfConnectTracepointObservation {
             process: EbpfObservedProcess {
                 pid: 101,
                 tgid: 100,
@@ -205,7 +194,7 @@ mod tests {
             fd: 7,
             addrlen: 16,
             endpoint: EbpfConnectEndpoint::Remote(expected_remote),
-        });
+        };
         let mut resolver = ExpectedConnectResolver {
             expected: EbpfConnectFlowLookup {
                 tgid: 100,
@@ -258,7 +247,7 @@ mod tests {
     #[test]
     fn connect_observation_without_fd_resolution_yields_no_event()
     -> Result<(), Box<dyn std::error::Error>> {
-        let observation = EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
+        let observation = EbpfConnectTracepointObservation {
             process: EbpfObservedProcess {
                 pid: 101,
                 tgid: 100,
@@ -269,7 +258,7 @@ mod tests {
             fd: 7,
             addrlen: 0,
             endpoint: EbpfConnectEndpoint::SockaddrReadFailed,
-        });
+        };
         let mut resolver = ExpectedConnectResolver {
             expected: EbpfConnectFlowLookup {
                 tgid: 100,

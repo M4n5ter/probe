@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EbpfProcessObservation {
     Connect(EbpfConnectTracepointObservation),
+    Close(EbpfCloseTracepointObservation),
 }
 
 impl EbpfProcessObservation {
@@ -15,6 +16,7 @@ impl EbpfProcessObservation {
     pub fn process(&self) -> &EbpfObservedProcess {
         match self {
             Self::Connect(observation) => &observation.process,
+            Self::Close(observation) => &observation.process,
         }
     }
 }
@@ -45,6 +47,12 @@ pub struct EbpfConnectTracepointObservation {
     pub fd: i32,
     pub addrlen: u32,
     pub endpoint: EbpfConnectEndpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EbpfCloseTracepointObservation {
+    pub process: EbpfObservedProcess,
+    pub fd: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

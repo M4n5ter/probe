@@ -8,9 +8,9 @@ use probe_core::{CapabilityKind, CapabilityState, CaptureSource, Timestamp};
 use crate::{CaptureError, CaptureEvent, CaptureProvider, CaptureProviderKind};
 
 use super::{
-    EbpfConnectFlowResolver, EbpfProcessObservation, EbpfProcessObservationProbe,
-    EbpfProcessObservationProbeConfig, connect_opened_event_from_observation,
-    unresolved_connect_gap_from_observation,
+    EbpfConnectFlowResolver, EbpfConnectTracepointObservation, EbpfProcessObservation,
+    EbpfProcessObservationProbe, EbpfProcessObservationProbeConfig,
+    connect_opened_event_from_observation, unresolved_connect_gap_from_observation,
 };
 
 const DEFAULT_IDLE_SLEEP: Duration = Duration::from_millis(10);
@@ -72,51 +72,60 @@ impl EbpfProcessObservationProvider {
                 thread::sleep(self.idle_sleep);
                 continue;
             };
-            let event = self.connect_event_with_retry(&observation)?;
-            return Ok(Some(event));
+            if let Some(event) = self.event_from_observation(observation)? {
+                return Ok(Some(event));
+            }
+        }
+    }
+
+    fn event_from_observation(
+        &mut self,
+        observation: EbpfProcessObservation,
+    ) -> Result<Option<CaptureEvent>, CaptureError> {
+        match observation {
+            EbpfProcessObservation::Connect(connect) => {
+                self.connect_event_with_retry(&connect).map(Some)
+            }
+            EbpfProcessObservation::Close(_) => Ok(None),
         }
     }
 
     fn connect_event_with_retry(
         &mut self,
-        observation: &EbpfProcessObservation,
+        connect: &EbpfConnectTracepointObservation,
     ) -> Result<CaptureEvent, CaptureError> {
         let timestamp = self.clock.next_timestamp();
         for attempt in 0..=self.resolution_retries {
-            if let Some(event) = connect_opened_event_from_observation(
-                observation,
-                timestamp,
-                self.resolver.as_mut(),
-            )? {
+            if let Some(event) =
+                connect_opened_event_from_observation(connect, timestamp, self.resolver.as_mut())?
+            {
                 return Ok(event);
             }
             if attempt == self.resolution_retries {
                 return Ok(unresolved_connect_gap_from_observation(
-                    observation,
+                    connect,
                     timestamp,
-                    self.unresolved_connect_reason(observation),
+                    self.unresolved_connect_reason(connect),
                 ));
             }
             self.resolver.invalidate_cached_resolution();
             thread::sleep(self.resolution_retry_sleep);
         }
         Ok(unresolved_connect_gap_from_observation(
-            observation,
+            connect,
             timestamp,
-            self.unresolved_connect_reason(observation),
+            self.unresolved_connect_reason(connect),
         ))
     }
 
-    fn unresolved_connect_reason(&self, observation: &EbpfProcessObservation) -> String {
-        match observation {
-            EbpfProcessObservation::Connect(connect) => format!(
-                "eBPF connect observation could not be resolved to a procfs socket after {} attempt(s); tgid={}, thread_pid={}, fd={}",
-                self.resolution_retries.saturating_add(1),
-                connect.process.tgid,
-                connect.process.pid,
-                connect.fd
-            ),
-        }
+    fn unresolved_connect_reason(&self, connect: &EbpfConnectTracepointObservation) -> String {
+        format!(
+            "eBPF connect observation could not be resolved to a procfs socket after {} attempt(s); tgid={}, thread_pid={}, fd={}",
+            self.resolution_retries.saturating_add(1),
+            connect.process.tgid,
+            connect.process.pid,
+            connect.fd
+        )
     }
 }
 
@@ -136,7 +145,7 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider streams connect lifecycle observations only; payload and lost-event capture are not implemented",
+            "eBPF provider emits connect observations and decodes descriptor close observations; payload, lost-event capture, and socket-lifetime close events are not implemented",
         )]
     }
 
@@ -203,8 +212,8 @@ mod tests {
     use probe_core::{Direction, ProcessContext, ProcessIdentity, TcpConnection, TcpEndpoint};
 
     use crate::ebpf::{
-        EbpfConnectEndpoint, EbpfConnectFlowLookup, EbpfConnectTracepointObservation,
-        EbpfObservedProcess, EbpfResolvedConnectFlow,
+        EbpfCloseTracepointObservation, EbpfConnectEndpoint, EbpfConnectFlowLookup,
+        EbpfConnectTracepointObservation, EbpfObservedProcess, EbpfResolvedConnectFlow,
     };
 
     use super::*;
@@ -252,6 +261,169 @@ mod tests {
         assert_eq!(flow.local.port, 50_000);
         assert_eq!(flow.remote.port, 443);
         assert_eq!(flow.attribution_confidence, 90);
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn ebpf_process_observation_provider_does_not_turn_descriptor_close_into_connection_close()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443);
+        let local = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 50_000);
+        let observations = [
+            EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
+                process: EbpfObservedProcess {
+                    pid: 101,
+                    tgid: 100,
+                    uid: 1000,
+                    gid: 1000,
+                    command: [0; 16],
+                },
+                fd: 7,
+                addrlen: 16,
+                endpoint: EbpfConnectEndpoint::Remote(remote),
+            }),
+            EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
+                process: EbpfObservedProcess {
+                    pid: 101,
+                    tgid: 100,
+                    uid: 1000,
+                    gid: 1000,
+                    command: [0; 16],
+                },
+                fd: 7,
+            }),
+        ];
+        let resolver = Box::new(StaticResolver {
+            resolved: Some(EbpfResolvedConnectFlow {
+                process: demo_process(),
+                confidence: 90,
+                connection: TcpConnection::new(local, remote),
+            }),
+        });
+        let mut provider =
+            EbpfProcessObservationProvider::from_observations_for_test(observations, resolver);
+
+        let Some(CaptureEvent::ConnectionOpened { flow, .. }) = provider.next()? else {
+            panic!("expected connection opened event");
+        };
+
+        assert_eq!(flow.local.port, 50_000);
+        assert_eq!(flow.remote.port, 443);
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn ebpf_process_observation_provider_ignores_untracked_close_and_keeps_polling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443);
+        let local = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 50_000);
+        let observations = [
+            EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
+                process: EbpfObservedProcess {
+                    pid: 101,
+                    tgid: 100,
+                    uid: 1000,
+                    gid: 1000,
+                    command: [0; 16],
+                },
+                fd: 7,
+            }),
+            EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
+                process: EbpfObservedProcess {
+                    pid: 101,
+                    tgid: 100,
+                    uid: 1000,
+                    gid: 1000,
+                    command: [0; 16],
+                },
+                fd: 8,
+                addrlen: 16,
+                endpoint: EbpfConnectEndpoint::Remote(remote),
+            }),
+        ];
+        let resolver = Box::new(StaticResolver {
+            resolved: Some(EbpfResolvedConnectFlow {
+                process: demo_process(),
+                confidence: 90,
+                connection: TcpConnection::new(local, remote),
+            }),
+        });
+        let mut provider =
+            EbpfProcessObservationProvider::from_observations_for_test(observations, resolver);
+
+        let Some(CaptureEvent::ConnectionOpened {
+            timestamp, flow, ..
+        }) = provider.next()?
+        else {
+            panic!("expected provider to continue after an untracked close");
+        };
+
+        assert_eq!(timestamp.monotonic_ns, 1);
+        assert_eq!(flow.local.port, 50_000);
+        assert_eq!(flow.remote.port, 443);
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn ebpf_process_observation_provider_keeps_fd_reuse_as_distinct_connect_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443);
+        let local = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 50_000);
+        let process = EbpfObservedProcess {
+            pid: 101,
+            tgid: 100,
+            uid: 1000,
+            gid: 1000,
+            command: [0; 16],
+        };
+        let observations = [
+            EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
+                process: process.clone(),
+                fd: 7,
+                addrlen: 16,
+                endpoint: EbpfConnectEndpoint::Remote(remote),
+            }),
+            EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
+                process: process.clone(),
+                fd: 7,
+            }),
+            EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
+                process,
+                fd: 7,
+                addrlen: 16,
+                endpoint: EbpfConnectEndpoint::Remote(remote),
+            }),
+        ];
+        let resolver = Box::new(StaticResolver {
+            resolved: Some(EbpfResolvedConnectFlow {
+                process: demo_process(),
+                confidence: 90,
+                connection: TcpConnection::new(local, remote),
+            }),
+        });
+        let mut provider =
+            EbpfProcessObservationProvider::from_observations_for_test(observations, resolver);
+
+        let Some(CaptureEvent::ConnectionOpened {
+            timestamp, flow, ..
+        }) = provider.next()?
+        else {
+            panic!("expected first connection opened event");
+        };
+        let first_flow_id = flow.id.clone();
+        assert_eq!(timestamp.monotonic_ns, 1);
+
+        let Some(CaptureEvent::ConnectionOpened {
+            timestamp, flow, ..
+        }) = provider.next()?
+        else {
+            panic!("expected reused fd connection opened event");
+        };
+        assert_eq!(timestamp.monotonic_ns, 2);
+        assert_ne!(flow.id, first_flow_id);
         assert!(provider.next()?.is_none());
         Ok(())
     }

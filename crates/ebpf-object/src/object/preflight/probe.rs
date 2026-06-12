@@ -82,14 +82,14 @@ impl EbpfObjectInspection {
 mod tests {
     use std::fs;
 
-    use ebpf_abi::{EBPF_CONNECT_PROGRAM_NAME, EBPF_EVENTS_MAP_NAME};
+    use ebpf_abi::{EBPF_CLOSE_PROGRAM_NAME, EBPF_CONNECT_PROGRAM_NAME, EBPF_EVENTS_MAP_NAME};
     use tempfile::tempdir;
 
     use super::super::{
-        contract::expected_tracepoint_section,
+        contract::{expected_close_tracepoint_section, expected_connect_tracepoint_section},
         model::{EbpfObjectMapKind, EbpfObjectProbeConfig},
         reader::MAX_EBPF_OBJECT_BYTES,
-        test_support::write_minimal_ebpf_object,
+        test_support::write_process_probe_ebpf_object,
     };
     use super::*;
 
@@ -150,9 +150,10 @@ mod tests {
     fn object_probe_accepts_generated_scaffold_object() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let object = temp.path().join("scaffold.bpf.o");
-        write_minimal_ebpf_object(
+        write_process_probe_ebpf_object(
             &object,
-            &expected_tracepoint_section(),
+            &expected_connect_tracepoint_section(),
+            &expected_close_tracepoint_section(),
             EbpfObjectMapKind::Ringbuf,
         )?;
         let config = EbpfObjectProbeConfig::new(&object);
@@ -164,11 +165,24 @@ mod tests {
         assert_eq!(report.maps.len(), 1);
         assert_eq!(report.maps[0].name, EBPF_EVENTS_MAP_NAME);
         assert_eq!(report.maps[0].kind, EbpfObjectMapKind::Ringbuf);
-        assert_eq!(report.programs.len(), 1);
-        assert_eq!(report.programs[0].name, EBPF_CONNECT_PROGRAM_NAME);
-        assert_eq!(
-            report.programs[0].section.as_deref(),
-            Some(expected_tracepoint_section().as_str())
+        assert_eq!(report.programs.len(), 2);
+        assert!(
+            report.programs.iter().any(|program| {
+                program.name == EBPF_CONNECT_PROGRAM_NAME
+                    && program.section.as_deref()
+                        == Some(expected_connect_tracepoint_section().as_str())
+            }),
+            "{:?}",
+            report.programs
+        );
+        assert!(
+            report.programs.iter().any(|program| {
+                program.name == EBPF_CLOSE_PROGRAM_NAME
+                    && program.section.as_deref()
+                        == Some(expected_close_tracepoint_section().as_str())
+            }),
+            "{:?}",
+            report.programs
         );
         Ok(())
     }
@@ -177,9 +191,10 @@ mod tests {
     fn preflight_returns_same_hardened_object_bytes() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let object = temp.path().join("preflighted-scaffold.bpf.o");
-        write_minimal_ebpf_object(
+        write_process_probe_ebpf_object(
             &object,
-            &expected_tracepoint_section(),
+            &expected_connect_tracepoint_section(),
+            &expected_close_tracepoint_section(),
             EbpfObjectMapKind::Ringbuf,
         )?;
         let config = EbpfObjectProbeConfig::new(&object);
@@ -195,24 +210,36 @@ mod tests {
     #[test]
     fn preflight_returns_report_for_contract_failure() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
-        let object = temp.path().join("invalid-contract.bpf.o");
-        write_minimal_ebpf_object(
-            &object,
-            "tracepoint/syscalls/sys_exit_connect",
-            EbpfObjectMapKind::Ringbuf,
-        )?;
-        let config = EbpfObjectProbeConfig::new(&object);
+        for (name, connect_section, close_section, expected_section) in [
+            (
+                "invalid-connect-contract.bpf.o",
+                "tracepoint/syscalls/sys_exit_connect".to_string(),
+                expected_close_tracepoint_section(),
+                "tracepoint/syscalls/sys_enter_connect",
+            ),
+            (
+                "invalid-close-contract.bpf.o",
+                expected_connect_tracepoint_section(),
+                "tracepoint/syscalls/sys_exit_close".to_string(),
+                "tracepoint/syscalls/sys_enter_close",
+            ),
+        ] {
+            let object = temp.path().join(name);
+            write_process_probe_ebpf_object(
+                &object,
+                &connect_section,
+                &close_section,
+                EbpfObjectMapKind::Ringbuf,
+            )?;
+            let config = EbpfObjectProbeConfig::new(&object);
 
-        let report = EbpfObjectProbe::preflight(&config)
-            .expect_err("wrong tracepoint section should fail contract preflight");
+            let report = EbpfObjectProbe::preflight(&config)
+                .expect_err("wrong tracepoint section should fail contract preflight");
 
-        assert!(report.object_available());
-        assert!(!report.preflight_available());
-        assert!(
-            report
-                .summary()
-                .contains("tracepoint/syscalls/sys_enter_connect")
-        );
+            assert!(report.object_available());
+            assert!(!report.preflight_available());
+            assert!(report.summary().contains(expected_section));
+        }
         Ok(())
     }
 
@@ -220,23 +247,35 @@ mod tests {
     fn object_probe_rejects_generated_object_with_wrong_section()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
-        let object = temp.path().join("wrong-section.bpf.o");
-        write_minimal_ebpf_object(
-            &object,
-            "tracepoint/syscalls/sys_exit_connect",
-            EbpfObjectMapKind::Ringbuf,
-        )?;
-        let config = EbpfObjectProbeConfig::new(&object);
+        for (name, connect_section, close_section, expected_section) in [
+            (
+                "wrong-connect-section.bpf.o",
+                "tracepoint/syscalls/sys_exit_connect".to_string(),
+                expected_close_tracepoint_section(),
+                "tracepoint/syscalls/sys_enter_connect",
+            ),
+            (
+                "wrong-close-section.bpf.o",
+                expected_connect_tracepoint_section(),
+                "tracepoint/syscalls/sys_exit_close".to_string(),
+                "tracepoint/syscalls/sys_enter_close",
+            ),
+        ] {
+            let object = temp.path().join(name);
+            write_process_probe_ebpf_object(
+                &object,
+                &connect_section,
+                &close_section,
+                EbpfObjectMapKind::Ringbuf,
+            )?;
+            let config = EbpfObjectProbeConfig::new(&object);
 
-        let report = EbpfObjectProbe::probe(&config);
+            let report = EbpfObjectProbe::probe(&config);
 
-        assert!(report.object_available(), "{}", report.summary());
-        assert!(!report.preflight_available());
-        assert!(
-            report
-                .summary()
-                .contains("tracepoint/syscalls/sys_enter_connect")
-        );
+            assert!(report.object_available(), "{}", report.summary());
+            assert!(!report.preflight_available());
+            assert!(report.summary().contains(expected_section));
+        }
         Ok(())
     }
 }

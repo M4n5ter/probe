@@ -1,7 +1,8 @@
 pub const EBPF_MAGIC: u32 = 0x4153_5353;
-pub const EBPF_ABI_REVISION: u16 = 2;
+pub const EBPF_ABI_REVISION: u16 = 3;
 pub const EBPF_RING_BUFFER_BYTES: u32 = 256 * 1024;
 pub const EBPF_PROCESS_PROBE_EVENT_BYTES: usize = core::mem::size_of::<EbpfProcessProbeEvent>();
+const EBPF_PROCESS_PROBE_PAYLOAD_BYTES: usize = core::mem::size_of::<EbpfConnectObservation>();
 pub const EBPF_CONNECT_REMOTE_ENDPOINT_VALID: u16 = 1 << 0;
 pub const EBPF_CONNECT_SOCKADDR_READ_FAILED: u16 = 1 << 1;
 pub const EBPF_CONNECT_UNSUPPORTED_ADDRESS_FAMILY: u16 = 1 << 2;
@@ -13,12 +14,14 @@ pub const EBPF_ADDRESS_FAMILY_INET6: u16 = 10;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EbpfEventKind {
     ConnectTracepointObserved = 1,
+    CloseTracepointObserved = 2,
 }
 
 impl EbpfEventKind {
     pub const fn from_wire(value: u16) -> Option<Self> {
         match value {
             1 => Some(Self::ConnectTracepointObserved),
+            2 => Some(Self::CloseTracepointObserved),
             _ => None,
         }
     }
@@ -126,14 +129,27 @@ impl EbpfConnectObservation {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfCloseObservation {
+    pub fd: i32,
+    pub reserved: u32,
+}
+
+impl EbpfCloseObservation {
+    pub const fn observed(fd: i32) -> Self {
+        Self { fd, reserved: 0 }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EbpfProcessProbeEvent {
-    pub header: EbpfEventHeader,
-    pub command: [u8; 16],
-    pub connect: EbpfConnectObservation,
+    header: EbpfEventHeader,
+    command: [u8; 16],
+    payload: [u8; EBPF_PROCESS_PROBE_PAYLOAD_BYTES],
 }
 
 impl EbpfProcessProbeEvent {
-    pub const fn connect_tracepoint_observed(
+    pub fn connect_tracepoint_observed(
         pid: u32,
         tgid: u32,
         uid: u32,
@@ -142,6 +158,8 @@ impl EbpfProcessProbeEvent {
         connect: EbpfConnectObservation,
         flags: u16,
     ) -> Self {
+        let mut payload = [0; EBPF_PROCESS_PROBE_PAYLOAD_BYTES];
+        encode_connect_observation(&mut payload, connect);
         Self {
             header: EbpfEventHeader::new_with_flags(
                 EbpfEventKind::ConnectTracepointObserved,
@@ -153,8 +171,70 @@ impl EbpfProcessProbeEvent {
                 gid,
             ),
             command,
-            connect,
+            payload,
         }
+    }
+
+    pub fn close_tracepoint_observed(
+        pid: u32,
+        tgid: u32,
+        uid: u32,
+        gid: u32,
+        command: [u8; 16],
+        close: EbpfCloseObservation,
+    ) -> Self {
+        let mut payload = [0; EBPF_PROCESS_PROBE_PAYLOAD_BYTES];
+        encode_close_observation(&mut payload, close);
+        Self {
+            header: EbpfEventHeader::new(
+                EbpfEventKind::CloseTracepointObserved,
+                core::mem::size_of::<Self>() as u16,
+                pid,
+                tgid,
+                uid,
+                gid,
+            ),
+            command,
+            payload,
+        }
+    }
+
+    pub fn connect_observation(&self) -> Option<EbpfConnectObservation> {
+        match self.header.kind() {
+            Some(EbpfEventKind::ConnectTracepointObserved) => {
+                Some(decode_connect_observation(&self.payload))
+            }
+            Some(EbpfEventKind::CloseTracepointObserved) | None => None,
+        }
+    }
+
+    pub fn close_observation(&self) -> Option<EbpfCloseObservation> {
+        match self.header.kind() {
+            Some(EbpfEventKind::CloseTracepointObserved) => {
+                Some(decode_close_observation(&self.payload))
+            }
+            Some(EbpfEventKind::ConnectTracepointObserved) | None => None,
+        }
+    }
+
+    pub const fn header(&self) -> &EbpfEventHeader {
+        &self.header
+    }
+
+    pub const fn kind(&self) -> Option<EbpfEventKind> {
+        self.header.kind()
+    }
+
+    pub const fn kind_wire(&self) -> u16 {
+        self.header.kind
+    }
+
+    pub const fn flags(&self) -> u16 {
+        self.header.flags
+    }
+
+    pub const fn command(&self) -> [u8; 16] {
+        self.command
     }
 }
 
@@ -179,8 +259,8 @@ pub fn decode_process_probe_event(
 
     let mut command = [0; 16];
     command.copy_from_slice(&bytes[32..48]);
-    let mut remote_address = [0; 16];
-    remote_address.copy_from_slice(&bytes[60..76]);
+    let mut payload = [0; EBPF_PROCESS_PROBE_PAYLOAD_BYTES];
+    payload.copy_from_slice(&bytes[48..80]);
     let event = EbpfProcessProbeEvent {
         header: EbpfEventHeader {
             magic: read_u32(bytes, 0),
@@ -195,14 +275,7 @@ pub fn decode_process_probe_event(
             gid: read_u32(bytes, 28),
         },
         command,
-        connect: EbpfConnectObservation {
-            fd: read_i32(bytes, 48),
-            addrlen: read_u32(bytes, 52),
-            address_family: read_u16(bytes, 56),
-            remote_port: read_u16(bytes, 58),
-            remote_address,
-            reserved: read_u32(bytes, 76),
-        },
+        payload,
     };
     validate_process_probe_event(event)
 }
@@ -222,12 +295,7 @@ pub fn encode_process_probe_event(
     write_u32(&mut bytes, 24, event.header.uid);
     write_u32(&mut bytes, 28, event.header.gid);
     bytes[32..48].copy_from_slice(&event.command);
-    write_i32(&mut bytes, 48, event.connect.fd);
-    write_u32(&mut bytes, 52, event.connect.addrlen);
-    write_u16(&mut bytes, 56, event.connect.address_family);
-    write_u16(&mut bytes, 58, event.connect.remote_port);
-    bytes[60..76].copy_from_slice(&event.connect.remote_address);
-    write_u32(&mut bytes, 76, event.connect.reserved);
+    bytes[48..80].copy_from_slice(&event.payload);
     bytes
 }
 
@@ -258,6 +326,50 @@ fn validate_process_probe_event(
         });
     }
     Ok(event)
+}
+
+fn decode_connect_observation(
+    bytes: &[u8; EBPF_PROCESS_PROBE_PAYLOAD_BYTES],
+) -> EbpfConnectObservation {
+    let mut remote_address = [0; 16];
+    remote_address.copy_from_slice(&bytes[12..28]);
+    EbpfConnectObservation {
+        fd: read_i32(bytes, 0),
+        addrlen: read_u32(bytes, 4),
+        address_family: read_u16(bytes, 8),
+        remote_port: read_u16(bytes, 10),
+        remote_address,
+        reserved: read_u32(bytes, 28),
+    }
+}
+
+fn encode_connect_observation(
+    bytes: &mut [u8; EBPF_PROCESS_PROBE_PAYLOAD_BYTES],
+    connect: EbpfConnectObservation,
+) {
+    write_i32(bytes, 0, connect.fd);
+    write_u32(bytes, 4, connect.addrlen);
+    write_u16(bytes, 8, connect.address_family);
+    write_u16(bytes, 10, connect.remote_port);
+    bytes[12..28].copy_from_slice(&connect.remote_address);
+    write_u32(bytes, 28, connect.reserved);
+}
+
+fn decode_close_observation(
+    bytes: &[u8; EBPF_PROCESS_PROBE_PAYLOAD_BYTES],
+) -> EbpfCloseObservation {
+    EbpfCloseObservation {
+        fd: read_i32(bytes, 0),
+        reserved: read_u32(bytes, 4),
+    }
+}
+
+fn encode_close_observation(
+    bytes: &mut [u8; EBPF_PROCESS_PROBE_PAYLOAD_BYTES],
+    close: EbpfCloseObservation,
+) {
+    write_i32(bytes, 0, close.fd);
+    write_u32(bytes, 4, close.reserved);
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
@@ -306,7 +418,11 @@ mod tests {
             EbpfEventKind::from_wire(1),
             Some(EbpfEventKind::ConnectTracepointObserved)
         );
-        assert_eq!(EbpfEventKind::from_wire(2), None);
+        assert_eq!(
+            EbpfEventKind::from_wire(2),
+            Some(EbpfEventKind::CloseTracepointObserved)
+        );
+        assert_eq!(EbpfEventKind::from_wire(3), None);
     }
 
     #[test]
@@ -319,6 +435,8 @@ mod tests {
     fn process_event_layout_fits_ringbuf_alignment() {
         assert_eq!(size_of::<EbpfConnectObservation>(), 32);
         assert_eq!(align_of::<EbpfConnectObservation>(), 4);
+        assert_eq!(size_of::<EbpfCloseObservation>(), 8);
+        assert_eq!(align_of::<EbpfCloseObservation>(), 4);
         assert_eq!(size_of::<EbpfProcessProbeEvent>(), 80);
         assert_eq!(align_of::<EbpfProcessProbeEvent>(), 4);
         assert_eq!(8 % align_of::<EbpfProcessProbeEvent>(), 0);
@@ -342,9 +460,11 @@ mod tests {
         assert_eq!(offset_of!(EbpfConnectObservation, remote_port), 10);
         assert_eq!(offset_of!(EbpfConnectObservation, remote_address), 12);
         assert_eq!(offset_of!(EbpfConnectObservation, reserved), 28);
+        assert_eq!(offset_of!(EbpfCloseObservation, fd), 0);
+        assert_eq!(offset_of!(EbpfCloseObservation, reserved), 4);
         assert_eq!(offset_of!(EbpfProcessProbeEvent, header), 0);
         assert_eq!(offset_of!(EbpfProcessProbeEvent, command), 32);
-        assert_eq!(offset_of!(EbpfProcessProbeEvent, connect), 48);
+        assert_eq!(offset_of!(EbpfProcessProbeEvent, payload), 48);
     }
 
     #[test]
@@ -381,11 +501,49 @@ mod tests {
         assert_eq!(event.header.gid, 44);
         assert_eq!(&event.command, b"0123456789abcdef");
         assert_eq!(event.header.flags, EBPF_CONNECT_REMOTE_ENDPOINT_VALID);
-        assert_eq!(event.connect.fd, 7);
-        assert_eq!(event.connect.addrlen, 16);
-        assert_eq!(event.connect.address_family, EBPF_ADDRESS_FAMILY_INET);
-        assert_eq!(event.connect.remote_port, 443);
-        assert_eq!(event.connect.remote_address[0..4], [127, 0, 0, 1]);
+        let connect = event
+            .connect_observation()
+            .expect("connect event should expose connect payload");
+        assert_eq!(connect.fd, 7);
+        assert_eq!(connect.addrlen, 16);
+        assert_eq!(connect.address_family, EBPF_ADDRESS_FAMILY_INET);
+        assert_eq!(connect.remote_port, 443);
+        assert_eq!(connect.remote_address[0..4], [127, 0, 0, 1]);
+        assert!(event.close_observation().is_none());
+    }
+
+    #[test]
+    fn close_tracepoint_observed_populates_header_fields() {
+        let event = EbpfProcessProbeEvent::close_tracepoint_observed(
+            11,
+            22,
+            33,
+            44,
+            *b"0123456789abcdef",
+            EbpfCloseObservation::observed(7),
+        );
+
+        assert_eq!(event.header.magic, EBPF_MAGIC);
+        assert_eq!(event.header.abi_revision, EBPF_ABI_REVISION);
+        assert_eq!(
+            event.header.kind(),
+            Some(EbpfEventKind::CloseTracepointObserved)
+        );
+        assert_eq!(
+            usize::from(event.header.record_len),
+            size_of::<EbpfProcessProbeEvent>()
+        );
+        assert_eq!(event.header.pid, 11);
+        assert_eq!(event.header.tgid, 22);
+        assert_eq!(event.header.uid, 33);
+        assert_eq!(event.header.gid, 44);
+        assert_eq!(&event.command, b"0123456789abcdef");
+        assert_eq!(event.header.flags, 0);
+        let close = event
+            .close_observation()
+            .expect("close event should expose close payload");
+        assert_eq!(close.fd, 7);
+        assert!(event.connect_observation().is_none());
     }
 
     #[test]

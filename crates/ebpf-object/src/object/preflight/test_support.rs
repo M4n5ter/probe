@@ -5,7 +5,10 @@ use ::object::{
     write::{Object as WriteObject, Symbol, SymbolSection},
 };
 use aya_obj::generated::bpf_map_type::BPF_MAP_TYPE_RINGBUF;
-use ebpf_abi::{EBPF_CONNECT_PROGRAM_NAME, EBPF_EVENTS_MAP_NAME, EBPF_RING_BUFFER_BYTES};
+use ebpf_abi::{
+    EBPF_CLOSE_PROGRAM_NAME, EBPF_CONNECT_PROGRAM_NAME, EBPF_EVENTS_MAP_NAME,
+    EBPF_RING_BUFFER_BYTES,
+};
 
 use super::model::{
     EbpfObjectContractCheck, EbpfObjectMap, EbpfObjectMapKind, EbpfObjectMapPinning,
@@ -39,20 +42,26 @@ pub(super) fn contract_reason<'a>(checks: &'a [EbpfObjectContractCheck], name: &
     }
 }
 
-pub(super) fn write_minimal_ebpf_object(
+pub(super) fn write_process_probe_ebpf_object(
     path: &Path,
-    program_section_name: &str,
+    connect_program_section_name: &str,
+    close_program_section_name: &str,
     map_kind: EbpfObjectMapKind,
 ) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,
-        minimal_ebpf_object_bytes(program_section_name, map_kind)?,
+        process_probe_ebpf_object_bytes(
+            connect_program_section_name,
+            close_program_section_name,
+            map_kind,
+        )?,
     )?;
     Ok(())
 }
 
-fn minimal_ebpf_object_bytes(
-    program_section_name: &str,
+fn process_probe_ebpf_object_bytes(
+    connect_program_section_name: &str,
+    close_program_section_name: &str,
     map_kind: EbpfObjectMapKind,
 ) -> Result<Vec<u8>, ::object::write::Error> {
     let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
@@ -70,6 +79,25 @@ fn minimal_ebpf_object_bytes(
         flags: SymbolFlags::None,
     });
 
+    add_program_symbol(
+        &mut object,
+        EBPF_CONNECT_PROGRAM_NAME,
+        connect_program_section_name,
+    );
+    add_program_symbol(
+        &mut object,
+        EBPF_CLOSE_PROGRAM_NAME,
+        close_program_section_name,
+    );
+
+    object.write()
+}
+
+fn add_program_symbol(
+    object: &mut WriteObject<'_>,
+    program_name: &str,
+    program_section_name: &str,
+) {
     let program_section = object.add_section(
         Vec::new(),
         program_section_name.as_bytes().to_vec(),
@@ -77,7 +105,7 @@ fn minimal_ebpf_object_bytes(
     );
     object.set_section_data(program_section, vec![0; 8], 8);
     object.add_symbol(Symbol {
-        name: EBPF_CONNECT_PROGRAM_NAME.as_bytes().to_vec(),
+        name: program_name.as_bytes().to_vec(),
         value: 0,
         size: 8,
         kind: SymbolKind::Text,
@@ -86,8 +114,6 @@ fn minimal_ebpf_object_bytes(
         section: SymbolSection::Section(program_section),
         flags: SymbolFlags::None,
     });
-
-    object.write()
 }
 
 fn legacy_map_def_bytes(kind: EbpfObjectMapKind) -> [u8; 20] {

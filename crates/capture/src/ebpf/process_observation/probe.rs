@@ -9,7 +9,8 @@ use aya::{
     programs::{ProgramError, TracePoint},
 };
 use ebpf_abi::{
-    EBPF_ADDRESS_FAMILY_INET, EBPF_ADDRESS_FAMILY_INET6, EBPF_CONNECT_PROGRAM_NAME,
+    EBPF_ADDRESS_FAMILY_INET, EBPF_ADDRESS_FAMILY_INET6, EBPF_CLOSE_PROGRAM_NAME,
+    EBPF_CLOSE_TRACEPOINT_CATEGORY, EBPF_CLOSE_TRACEPOINT_NAME, EBPF_CONNECT_PROGRAM_NAME,
     EBPF_CONNECT_REMOTE_ENDPOINT_VALID, EBPF_CONNECT_SOCKADDR_READ_FAILED,
     EBPF_CONNECT_TRACEPOINT_CATEGORY, EBPF_CONNECT_TRACEPOINT_NAME,
     EBPF_CONNECT_UNSUPPORTED_ADDRESS_FAMILY, EBPF_EVENTS_MAP_NAME, EbpfConnectObservation,
@@ -22,8 +23,8 @@ use probe_core::TcpEndpoint;
 use thiserror::Error;
 
 use super::{
-    EbpfConnectEndpoint, EbpfConnectTracepointObservation, EbpfObservedProcess,
-    EbpfProcessObservation,
+    EbpfCloseTracepointObservation, EbpfConnectEndpoint, EbpfConnectTracepointObservation,
+    EbpfObservedProcess, EbpfProcessObservation,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +101,18 @@ impl EbpfProcessObservationProbe {
     ) -> Result<Self, EbpfProcessObservationProbeError> {
         let mut ebpf = Ebpf::load(object.bytes())
             .map_err(|source| EbpfProcessObservationProbeError::Load { source })?;
-        load_and_attach_connect_tracepoint(&mut ebpf)?;
+        load_and_attach_tracepoint(
+            &mut ebpf,
+            EBPF_CONNECT_PROGRAM_NAME,
+            EBPF_CONNECT_TRACEPOINT_CATEGORY,
+            EBPF_CONNECT_TRACEPOINT_NAME,
+        )?;
+        load_and_attach_tracepoint(
+            &mut ebpf,
+            EBPF_CLOSE_PROGRAM_NAME,
+            EBPF_CLOSE_TRACEPOINT_CATEGORY,
+            EBPF_CLOSE_TRACEPOINT_NAME,
+        )?;
         let events = open_events_ringbuf(&mut ebpf)?;
         Ok(Self {
             _ebpf: ebpf,
@@ -118,36 +130,34 @@ impl EbpfProcessObservationProbe {
     }
 }
 
-fn load_and_attach_connect_tracepoint(
+fn load_and_attach_tracepoint(
     ebpf: &mut Ebpf,
+    program_name: &'static str,
+    category: &'static str,
+    tracepoint_name: &'static str,
 ) -> Result<(), EbpfProcessObservationProbeError> {
-    let program = ebpf.program_mut(EBPF_CONNECT_PROGRAM_NAME).ok_or(
-        EbpfProcessObservationProbeError::MissingProgram {
-            name: EBPF_CONNECT_PROGRAM_NAME,
-        },
-    )?;
+    let program = ebpf
+        .program_mut(program_name)
+        .ok_or(EbpfProcessObservationProbeError::MissingProgram { name: program_name })?;
     let program: &mut TracePoint =
         program
             .try_into()
             .map_err(|source| EbpfProcessObservationProbeError::Program {
-                name: EBPF_CONNECT_PROGRAM_NAME,
+                name: program_name,
                 action: "cast",
                 source,
             })?;
     program
         .load()
         .map_err(|source| EbpfProcessObservationProbeError::Program {
-            name: EBPF_CONNECT_PROGRAM_NAME,
+            name: program_name,
             action: "load",
             source,
         })?;
     program
-        .attach(
-            EBPF_CONNECT_TRACEPOINT_CATEGORY,
-            EBPF_CONNECT_TRACEPOINT_NAME,
-        )
+        .attach(category, tracepoint_name)
         .map_err(|source| EbpfProcessObservationProbeError::Program {
-            name: EBPF_CONNECT_PROGRAM_NAME,
+            name: program_name,
             action: "attach",
             source,
         })?;
@@ -180,46 +190,76 @@ fn decode_process_observation(
 fn process_observation_from_event(
     event: EbpfProcessProbeEvent,
 ) -> Result<EbpfProcessObservation, EbpfProcessObservationProbeError> {
-    match event.header.kind() {
-        Some(EbpfEventKind::ConnectTracepointObserved) => Ok(EbpfProcessObservation::Connect(
-            EbpfConnectTracepointObservation {
-                process: EbpfObservedProcess {
-                    pid: event.header.pid,
-                    tgid: event.header.tgid,
-                    uid: event.header.uid,
-                    gid: event.header.gid,
-                    command: event.command,
+    match event.kind() {
+        Some(EbpfEventKind::ConnectTracepointObserved) => {
+            let connect = connect_observation_from_event(&event);
+            Ok(EbpfProcessObservation::Connect(
+                EbpfConnectTracepointObservation {
+                    process: observed_process_from_event(&event),
+                    fd: connect.fd,
+                    addrlen: connect.addrlen,
+                    endpoint: connect_endpoint_from_event(&event),
                 },
-                fd: event.connect.fd,
-                addrlen: event.connect.addrlen,
-                endpoint: connect_endpoint_from_event(&event),
-            },
-        )),
+            ))
+        }
+        Some(EbpfEventKind::CloseTracepointObserved) => {
+            let close = close_observation_from_event(&event);
+            Ok(EbpfProcessObservation::Close(
+                EbpfCloseTracepointObservation {
+                    process: observed_process_from_event(&event),
+                    fd: close.fd,
+                },
+            ))
+        }
         None => Err(
             EbpfProcessObservationProbeError::UnsupportedObservationKind {
-                value: event.header.kind,
+                value: event.kind_wire(),
             },
         ),
     }
 }
 
+fn observed_process_from_event(event: &EbpfProcessProbeEvent) -> EbpfObservedProcess {
+    let header = event.header();
+    EbpfObservedProcess {
+        pid: header.pid,
+        tgid: header.tgid,
+        uid: header.uid,
+        gid: header.gid,
+        command: event.command(),
+    }
+}
+
 fn connect_endpoint_from_event(event: &EbpfProcessProbeEvent) -> EbpfConnectEndpoint {
-    if event.header.flags & EBPF_CONNECT_REMOTE_ENDPOINT_VALID != 0 {
-        return remote_endpoint_from_wire(event.connect)
+    let connect = connect_observation_from_event(event);
+    if event.flags() & EBPF_CONNECT_REMOTE_ENDPOINT_VALID != 0 {
+        return remote_endpoint_from_wire(connect)
             .map(EbpfConnectEndpoint::Remote)
             .unwrap_or(EbpfConnectEndpoint::UnsupportedAddressFamily {
-                value: event.connect.address_family,
+                value: connect.address_family,
             });
     }
-    if event.header.flags & EBPF_CONNECT_SOCKADDR_READ_FAILED != 0 {
+    if event.flags() & EBPF_CONNECT_SOCKADDR_READ_FAILED != 0 {
         return EbpfConnectEndpoint::SockaddrReadFailed;
     }
-    if event.header.flags & EBPF_CONNECT_UNSUPPORTED_ADDRESS_FAMILY != 0 {
+    if event.flags() & EBPF_CONNECT_UNSUPPORTED_ADDRESS_FAMILY != 0 {
         return EbpfConnectEndpoint::UnsupportedAddressFamily {
-            value: event.connect.address_family,
+            value: connect.address_family,
         };
     }
     EbpfConnectEndpoint::Missing
+}
+
+fn connect_observation_from_event(event: &EbpfProcessProbeEvent) -> EbpfConnectObservation {
+    event
+        .connect_observation()
+        .expect("connect event kind should expose connect observation")
+}
+
+fn close_observation_from_event(event: &EbpfProcessProbeEvent) -> ebpf_abi::EbpfCloseObservation {
+    event
+        .close_observation()
+        .expect("close event kind should expose close observation")
 }
 
 fn remote_endpoint_from_wire(connect: EbpfConnectObservation) -> Option<TcpEndpoint> {
@@ -253,7 +293,8 @@ mod tests {
 
     use ebpf_abi::{
         EBPF_ADDRESS_FAMILY_INET, EBPF_ADDRESS_FAMILY_INET6, EBPF_CONNECT_REMOTE_ENDPOINT_VALID,
-        EBPF_CONNECT_SOCKADDR_READ_FAILED, EbpfConnectObservation, EbpfProcessProbeEvent,
+        EBPF_CONNECT_SOCKADDR_READ_FAILED, EbpfCloseObservation, EbpfConnectObservation,
+        EbpfProcessProbeEvent,
     };
     use probe_core::TcpEndpoint;
 
@@ -296,6 +337,35 @@ mod tests {
                     ))
                 );
             }
+            observation => panic!("unexpected observation: {observation:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn process_observation_decodes_valid_close_wire_event() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let event = EbpfProcessProbeEvent::close_tracepoint_observed(
+            11,
+            22,
+            33,
+            44,
+            nul_padded_command("curl"),
+            EbpfCloseObservation::observed(7),
+        );
+
+        let observation =
+            decode_process_observation(&ebpf_abi::encode_process_probe_event(&event))?;
+        match observation {
+            EbpfProcessObservation::Close(close) => {
+                assert_eq!(close.process.pid, 11);
+                assert_eq!(close.process.tgid, 22);
+                assert_eq!(close.process.uid, 33);
+                assert_eq!(close.process.gid, 44);
+                assert_eq!(close.process.command_lossy(), "curl");
+                assert_eq!(close.fd, 7);
+            }
+            observation => panic!("unexpected observation: {observation:?}"),
         }
         Ok(())
     }
@@ -331,6 +401,7 @@ mod tests {
                     ))
                 );
             }
+            observation => panic!("unexpected observation: {observation:?}"),
         }
         Ok(())
     }
@@ -355,6 +426,7 @@ mod tests {
             EbpfProcessObservation::Connect(connect) => {
                 assert_eq!(connect.endpoint, EbpfConnectEndpoint::SockaddrReadFailed);
             }
+            observation => panic!("unexpected observation: {observation:?}"),
         }
         Ok(())
     }
@@ -423,6 +495,15 @@ mod tests {
                         observation.process.tgid,
                         observation.process.command_lossy(),
                         observation.endpoint
+                    ));
+                }
+                Some(EbpfProcessObservation::Close(observation)) => {
+                    observed.push(format!(
+                        "pid={},tgid={},command={},closed_fd={}",
+                        observation.process.pid,
+                        observation.process.tgid,
+                        observation.process.command_lossy(),
+                        observation.fd
                     ));
                 }
                 None => {}

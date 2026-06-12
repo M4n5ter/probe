@@ -12,12 +12,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use ebpf::{
-    EbpfConnectEndpoint, EbpfConnectFlowLookup, EbpfConnectFlowResolver,
-    EbpfConnectTracepointObservation, EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport,
-    EbpfObservedProcess, EbpfProcessObservation, EbpfProcessObservationProbe,
+    EbpfCloseTracepointObservation, EbpfConnectEndpoint, EbpfConnectFlowLookup,
+    EbpfConnectFlowResolver, EbpfConnectTracepointObservation, EbpfHostProbe, EbpfHostProbeConfig,
+    EbpfHostProbeReport, EbpfObservedProcess, EbpfProcessObservation, EbpfProcessObservationProbe,
     EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeError,
     EbpfProcessObservationProvider, EbpfResolvedConnectFlow, UnprivilegedBpfStatus,
-    connect_opened_event_from_observation,
 };
 pub use libpcap::{LibpcapConfig, LibpcapProvider};
 pub use plaintext::{

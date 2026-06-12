@@ -109,7 +109,7 @@ fn ebpf_provider_descriptor_from_object_report(
             CaptureBackend::Ebpf,
             CaptureProviderBuilder::Ebpf,
             format!(
-                "eBPF connect observation provider requires procfs_socket_attribution, but {}",
+                "eBPF connect/close observation provider requires procfs_socket_attribution, but {}",
                 procfs_socket_attribution
                     .reason
                     .as_deref()
@@ -122,7 +122,7 @@ fn ebpf_provider_descriptor_from_object_report(
         CaptureBackend::Ebpf,
         CaptureProviderBuilder::Ebpf,
         format!(
-            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the connect observation provider can stream connection lifecycle events, but payload/lost-event conversion and complete kernel traffic capture are not implemented",
+            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the connect/close observation provider can emit connect observations and decode descriptor close observations, but payload/lost-event conversion, socket-lifetime close events, and complete kernel traffic capture are not implemented",
             object.summary(),
         ),
     )
@@ -294,10 +294,7 @@ mod tests {
                         name: "SSSA_EVENTS".to_string(),
                         check: EbpfProbeCheck::Available,
                     }],
-                    programs: vec![EbpfObjectContractCheck {
-                        name: "sssa_sys_enter_connect".to_string(),
-                        check: EbpfProbeCheck::Available,
-                    }],
+                    programs: available_ebpf_lifecycle_program_checks(),
                 },
                 programs: Vec::<EbpfObjectProgram>::new(),
                 maps: Vec::<EbpfObjectMap>::new(),
@@ -313,7 +310,8 @@ mod tests {
             .expect("eBPF descriptor should explain why capture provider is degraded");
         assert!(reason.contains("complete kernel traffic capture"));
         assert!(reason.contains("payload/lost-event conversion"));
-        assert!(reason.contains("connect observation provider"));
+        assert!(reason.contains("socket-lifetime close events"));
+        assert!(reason.contains("connect/close observation provider"));
         assert!(reason.contains("procfs socket attribution is usable"));
     }
 
@@ -329,10 +327,7 @@ mod tests {
                         name: "SSSA_EVENTS".to_string(),
                         check: EbpfProbeCheck::Available,
                     }],
-                    programs: vec![EbpfObjectContractCheck {
-                        name: "sssa_sys_enter_connect".to_string(),
-                        check: EbpfProbeCheck::Available,
-                    }],
+                    programs: available_ebpf_lifecycle_program_checks(),
                 },
                 programs: Vec::<EbpfObjectProgram>::new(),
                 maps: Vec::<EbpfObjectMap>::new(),
@@ -364,6 +359,19 @@ mod tests {
                 "procfs socket attribution is unavailable",
             ),
         }
+    }
+
+    fn available_ebpf_lifecycle_program_checks() -> Vec<EbpfObjectContractCheck> {
+        vec![
+            EbpfObjectContractCheck {
+                name: "sssa_sys_enter_connect".to_string(),
+                check: EbpfProbeCheck::Available,
+            },
+            EbpfObjectContractCheck {
+                name: "sssa_sys_enter_close".to_string(),
+                check: EbpfProbeCheck::Available,
+            },
+        ]
     }
 
     fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {

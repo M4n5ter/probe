@@ -104,7 +104,7 @@ flowchart LR
 | `replay_capture` | Available | replay CLI 和 `ReplayProvider` 可驱动 parser、policy、ingress journal、export queue 和可选 webhook drain。 | 不代表 live capture 能力。 |
 | `libpcap` | Probed available/unavailable | agent composition root 按当前 libpcap 配置实际打开设备并安装 filter 后才注入 available descriptor。 | payload 是 packet-level degraded bytes；没有 TCP 重组、乱序处理、重传去重、IPv6 extension/fragment 解析或 gap 修复。 |
 | `external_plaintext_feed` | Available | `PlaintextFeedProvider` 可消费外部已解密明文 bytes/gap/connection lifecycle event，并进入统一 pipeline。 | 它本身不执行 TLS 解密。 |
-| `ebpf` | Degraded when explicit and procfs socket attribution is usable / unavailable on failed host, object, contract, or procfs preflight | host probe、`aya-obj` object preflight、required map/program contract、shared ABI、kernel connect tracepoint observation、userspace `aya` loader、ringbuf decoder、TGID+thread PID+fd lookup 到 `ConnectionOpened` bridge、unresolved observation 到 degraded `Gap` 的 provider wiring 已存在。 | 还没有 payload/lost-event conversion 和完整 kernel-side traffic capture program；`auto` 会跳过 degraded eBPF observation provider，显式 `capture.selection = "ebpf"` 可用于 connect lifecycle smoke。 |
+| `ebpf` | Degraded when explicit and procfs socket attribution is usable / unavailable on failed host, object, contract, or procfs preflight | host probe、`aya-obj` object preflight、required map/program contract、shared ABI、kernel connect/close tracepoint observation、userspace `aya` loader、ringbuf decoder、TGID+thread PID+fd lookup 到 `ConnectionOpened` bridge、descriptor close observation decode、unresolved connect 到 degraded `Gap` 的 provider wiring 已存在。 | 还没有 payload/lost-event conversion、socket-lifetime close event 和完整 kernel-side traffic capture program；`auto` 会跳过 degraded eBPF observation provider，显式 `capture.selection = "ebpf"` 可用于 connect/descriptor-close observation smoke。 |
 | `procfs_attribution` | Probed degraded/unavailable | 可从 `/proc/<pid>` 读取进程身份、cmdline hash、starttime、uid/gid、cgroup、systemd service 与 container hint。 | hidepid、权限、PID race、namespace 边界会导致 best-effort 降级。 |
 | `procfs_socket_attribution` | Probed degraded/unavailable | 可通过 `/proc/net/tcp`、best-effort `/proc/net/tcp6`、socket inode、`/proc/<pid>/fd` 和 TGID+thread PID+fd lookup 做 TCP 连接归因；fd lookup 读取 thread pid 的 fd symlink，按 TGID 读取进程身份；tcp6 IPv4-mapped endpoint 会归一化。 | snapshot 与 fd symlink 读取不是同一内核时间点，权限/race/namespace 仍会导致漏归因；错误进入 degradation reason，不静默伪装成匹配。 |
 | `libssl_uprobe` | Unavailable | 已实现 attach candidate discovery 和 attach plan：解析 `/proc/<pid>/maps`、校验 mapped file identity、识别 supported libssl/boringssl symbols，生成 PID/library/symbol/entry-or-return/direction 的 attach intent，并输出 typed degraded reasons。 | 尚未实现 Aya uprobe loader、动态 attach lifecycle、SSL fd/socket 关联、ring buffer 和 plaintext event provider。 |
@@ -281,11 +281,11 @@ BTF 或 eBPF 主程序不可用时：
 | 边界 | 当前已实现 | 仍缺失 |
 | --- | --- | --- |
 | host probe | agent 检查 Linux、`/sys/kernel/btf/vmlinux`、`/sys/fs/bpf` bpffs、`/proc/sys/kernel/unprivileged_bpf_disabled`。 | 更细的 kernel feature probing、capability 最小化运行策略。 |
-| object preflight | `ebpf-object` 使用 `aya-obj` 解析 object，校验 required `SSSA_EVENTS` ringbuf map、`sssa_sys_enter_connect` tracepoint program、section、map shape、pinning 和同一次 hardened read bytes；默认允许额外 map/program，保留 strict inventory policy 供需要锁死 artifact 的场景使用。 | 多 required contract、真实 payload program contract。 |
-| shared ABI | `ebpf-abi` 定义 ringbuf event envelope、ABI revision、connect observation decoder。 | payload/lost-event ABI、更多 syscall/socket event record。 |
-| kernel object | `ebpf-program` 使用 `aya-ebpf` 生成 connect tracepoint object，并输出 typed connect observation。 | send/recv/read/write/accept/close、socket cookie、payload chunk、lost event。 |
-| userspace loader/provider | `capture::EbpfProcessObservationProbe` 可从 preflighted bytes load、attach connect tracepoint、打开 ringbuf、解码 typed process observation；`EbpfProcessObservationProvider` 可轮询 ringbuf，把 connect observation 经 TGID+thread PID+fd resolver 转成 `ConnectionOpened`，并在重试耗尽仍无法解析时输出 degraded `Gap`。 | payload/lost-event conversion、完整 eBPF traffic capture 生命周期、provider metrics。 |
-| attribution bridge | `capture` 提供 observation + TGID+thread PID+fd lookup 到单个 `ConnectionOpened` `CaptureEvent` 的纯转换；agent 侧 procfs resolver 已支持读取 `/proc/<thread_pid>/fd/<fd>`，线程 fd 消失时回退到 `/proc/<tgid>/fd/<fd>`，并按 TGID 读取进程身份。 | payload event 与 existing flow state merge、close/error/lost-event conversion。 |
+| object preflight | `ebpf-object` 使用 `aya-obj` 解析 object，校验 required `SSSA_EVENTS` ringbuf map、`sssa_sys_enter_connect` 与 `sssa_sys_enter_close` tracepoint program、section、map shape、pinning 和同一次 hardened read bytes；默认允许额外 map/program，保留 strict inventory policy 供需要锁死 artifact 的场景使用。 | 真实 payload program contract。 |
+| shared ABI | `ebpf-abi` 定义 ringbuf event envelope、ABI revision、connect/close observation decoder。 | payload/lost-event ABI、更多 syscall/socket event record。 |
+| kernel object | `ebpf-program` 使用 `aya-ebpf` 生成 connect/close tracepoint object，并输出 typed lifecycle observation。 | send/recv/read/write/accept、socket cookie、payload chunk、lost event。 |
+| userspace loader/provider | `capture::EbpfProcessObservationProbe` 可从 preflighted bytes load、attach connect/close tracepoint、打开 ringbuf、解码 typed process observation；`EbpfProcessObservationProvider` 可轮询 ringbuf，把 connect observation 经 TGID+thread PID+fd resolver 转成 `ConnectionOpened`，重试耗尽仍无法解析 connect 时输出 degraded `Gap`。close observation 当前只被解码为 descriptor-level signal，不转换成 `ConnectionClosed`：`close(fd)` 不是 socket lifetime，dup/fork/fd passing 都可能让 socket 继续存在。 | payload/lost-event conversion、socket-lifetime close event、完整 eBPF traffic capture 生命周期、provider metrics。 |
+| attribution bridge | `capture` 提供 connect observation + TGID+thread PID+fd lookup 到单个 `ConnectionOpened` `CaptureEvent` 的纯转换；agent 侧 procfs resolver 已支持读取 `/proc/<thread_pid>/fd/<fd>`，线程 fd 消失时回退到 `/proc/<tgid>/fd/<fd>`，并按 TGID 读取进程身份。close observation 不做 post-close procfs fd lookup，也不释放 parser state。 | payload event 与 existing flow state merge、accept/socket-cookie/exit/error/lost-event conversion。 |
 | build gate | `xtask check-ebpf` 执行 eBPF fmt、BPF target clippy、locked release build 和 object contract preflight；`xtask ebpf-build` 执行 locked build 与 preflight。 | CI 环境矩阵和 privileged eBPF e2e。 |
 
 ```mermaid
@@ -297,18 +297,21 @@ sequenceDiagram
     participant Pipeline as capture pipeline
 
     Program->>Abi: ringbuf connect event
-    Abi->>Loader: decoded observation
+    Abi->>Loader: decoded connect observation
     Loader->>Resolver: tgid thread_pid fd remote endpoint
     alt resolved before retry budget is exhausted
         Resolver-->>Loader: tcp connection and process
         Loader->>Pipeline: ConnectionOpened
+        Program->>Abi: ringbuf close event
+        Abi->>Loader: decoded close observation
+        Loader->>Loader: descriptor-level signal only
     else unresolved after retries
         Resolver-->>Loader: no matching procfs socket
         Loader->>Pipeline: Gap with unresolved flow and reason
     end
 ```
 
-payload event conversion 和完整 kernel-side traffic capture program 还没有完成，因此 `ebpf` provider descriptor 在 host、object、contract 和 procfs socket attribution preflight 都通过后仍是 degraded 而不是 available；descriptor 显式声明 `allow_explicit_degraded` selection policy，所以 `auto` 不会选择 degraded eBPF observation provider，只有显式 `capture.selection = "ebpf"` 会选择该 provider，用于验证真实 connect lifecycle 事件链路。host probe、object 解析、contract preflight 或 procfs socket attribution 不可用时仍 fail closed。agent composition root 只探测一次 procfs socket attribution，并把同一份 `CapabilityState` 同时用于 eBPF descriptor 和 capability matrix，避免二者分叉。
+payload event conversion、socket-lifetime close event 和完整 kernel-side traffic capture program 还没有完成，因此 `ebpf` provider descriptor 在 host、object、contract 和 procfs socket attribution preflight 都通过后仍是 degraded 而不是 available；descriptor 显式声明 `allow_explicit_degraded` selection policy，所以 `auto` 不会选择 degraded eBPF observation provider，只有显式 `capture.selection = "ebpf"` 会选择该 provider，用于验证真实 connect 与 descriptor-close observation 链路。host probe、object 解析、contract preflight 或 procfs socket attribution 不可用时仍 fail closed。agent composition root 只探测一次 procfs socket attribution，并把同一份 `CapabilityState` 同时用于 eBPF descriptor 和 capability matrix，避免二者分叉。
 
 ## 10. libpcap fallback
 
@@ -333,7 +336,7 @@ fallback 能力边界：
 - 支持配置 interface、BPF filter、snaplen、promisc、immediate mode、read timeout 和 buffer size。
 - 已支持 Ethernet、Linux cooked v1/v2、`RAW`、direct `IPV4`/`IPV6` 和 `NULL`/`LOOP` loopback 上的基础 IPv4/TCP 与无扩展头 IPv6/TCP segment 解析；IPv4 分片、IPv6 extension header/fragment 和 snaplen 截断包会被跳过，避免把不完整字节伪装成正常 HTTP payload。
 - 当前没有 TCP 重组、乱序处理和重传去重，因此事件必须标记 degraded，`stream_offset` 不声明为可信重组 offset。libpcap flow table 只承担方向/归因缓存，不把 packet-level payload 伪装成可靠 stream；SYN 会关闭旧 4-tuple 缓存以处理 missed close 后的端口复用，FIN 按半关闭处理，RST、双向 FIN、SYN reuse、idle timeout 或容量淘汰会释放 flow cache 并排出 `ConnectionClosed`。
-- `agent` composition root 只在 libpcap provider 能按当前配置打开并安装 filter 时注入 available `Libpcap` descriptor；否则注入 unavailable descriptor 并输出原因，`runtime` 只消费 descriptor 做 plan。live `LibpcapProvider` 由 `agent` 注入 procfs TCP process resolver；resolver 通过共享 `TcpConnection`、`/proc/net/tcp`、可读取且可解析时的 `/proc/net/tcp6` 和 fd socket inode best-effort 归因，短 TTL 复用 socket snapshot，成功时提高 attribution confidence，失败时回退到 synthetic unknown identity。同一个 procfs resolver 也实现 eBPF connect flow bridge 所需的 TGID+thread PID+fd 反向解析：先从 `/proc/<thread_pid>/fd/<fd>` 读取 socket inode，再用 connect observation 的 remote endpoint 过滤 tcp/tcp6 snapshot 中的候选连接，最后按 TGID 读取进程身份。`procfs_socket_attribution` 仍是 degraded capability：hidepid、权限、PID/fd race 和 net namespace 边界会导致 lookup 失败；lookup 错误进入 capture degradation reason，eBPF connect observation 重试耗尽仍未匹配时输出 degraded `Gap`，flow attribution confidence 为 `0`，reason 携带 TGID、thread PID 和 fd。
+- `agent` composition root 只在 libpcap provider 能按当前配置打开并安装 filter 时注入 available `Libpcap` descriptor；否则注入 unavailable descriptor 并输出原因，`runtime` 只消费 descriptor 做 plan。live `LibpcapProvider` 由 `agent` 注入 procfs TCP process resolver；resolver 通过共享 `TcpConnection`、`/proc/net/tcp`、可读取且可解析时的 `/proc/net/tcp6` 和 fd socket inode best-effort 归因，短 TTL 复用 socket snapshot，成功时提高 attribution confidence，失败时回退到 synthetic unknown identity。同一个 procfs resolver 也实现 eBPF connect flow bridge 所需的 TGID+thread PID+fd 反向解析：先从 `/proc/<thread_pid>/fd/<fd>` 读取 socket inode，再用 connect observation 的 remote endpoint 过滤 tcp/tcp6 snapshot 中的候选连接，最后按 TGID 读取进程身份。eBPF close observation 不读取已关闭 fd，也不关闭 flow；socket-lifetime close 需要后续 socket cookie/refcount、FIN/RST 或 process-exit/lost-event 语义。`procfs_socket_attribution` 仍是 degraded capability：hidepid、权限、PID/fd race 和 net namespace 边界会导致 lookup 失败；lookup 错误进入 capture degradation reason，eBPF connect observation 重试耗尽仍未匹配时输出 degraded `Gap`，flow attribution confidence 为 `0`，reason 携带 TGID、thread PID 和 fd。
 
 ## 11. TLS 与明文来源
 
@@ -766,9 +769,9 @@ flowchart LR
 当前 capture 配置语义：
 
 - `capture.selection = "auto"` 是默认生产入口，按 `capture.fallback_backends` 的顺序选择第一个可用 live provider；默认顺序为 `ebpf` 后 `libpcap`。
-- `capture.selection = "ebpf"`、`"libpcap"`、`"plaintext_feed"` 或 `"replay"` 表示 required backend；显式 backend 不自动使用 `fallback_backends`。这是为了让 operator 能表达“缺少该能力就 fail fast”，避免把强能力需求静默降级。provider descriptor 默认只有 available 才可被显式选择；当前 eBPF observation provider 通过 typed selection policy 声明允许 explicit degraded selection，因为它对应有意暴露的 connect lifecycle observation smoke。
+- `capture.selection = "ebpf"`、`"libpcap"`、`"plaintext_feed"` 或 `"replay"` 表示 required backend；显式 backend 不自动使用 `fallback_backends`。这是为了让 operator 能表达“缺少该能力就 fail fast”，避免把强能力需求静默降级。provider descriptor 默认只有 available 才可被显式选择；当前 eBPF observation provider 通过 typed selection policy 声明允许 explicit degraded selection，因为它对应有意暴露的 connect/descriptor-close observation smoke。
 - `capture.fallback_backends` 只允许 live backend，不包含 replay。replay 是可重复验证入口，不是 live agent 的自动 fallback。
-- eBPF object 路径放在 `[capture.ebpf] object_path` 下。这个字段作为 `aya-obj` object preflight 输入；preflight 校验 required map/program contract、ringbuf map shape 和 tracepoint section，默认不因为未来扩展多出 map/program 而失败。高层用户态 `aya` process observation loader、connect observation 到单个 `ConnectionOpened` `CaptureEvent` 的纯转换 bridge、unresolved observation 到 degraded `Gap` 的 provider path 已存在。payload event conversion 和完整 kernel-side capture program 完成前，host/object/contract/procfs socket attribution preflight 成功仍然是 degraded capability；`auto` 不会选择 degraded eBPF provider，显式 `capture.selection = "ebpf"` 可以运行 connect lifecycle observation path。
+- eBPF object 路径放在 `[capture.ebpf] object_path` 下。这个字段作为 `aya-obj` object preflight 输入；preflight 校验 required map/program contract、ringbuf map shape 和 tracepoint section，默认不因为未来扩展多出 map/program 而失败。高层用户态 `aya` process observation loader、connect observation 到单个 `ConnectionOpened` `CaptureEvent` 的纯转换 bridge、descriptor close observation decoder、unresolved connect 到 degraded `Gap` 的 provider path 已存在。payload event conversion、socket-lifetime close event 和完整 kernel-side capture program 完成前，host/object/contract/procfs socket attribution preflight 成功仍然是 degraded capability；`auto` 不会选择 degraded eBPF provider，显式 `capture.selection = "ebpf"` 可以运行 connect/descriptor-close observation path。
 - libpcap 运行参数放在 `[capture.libpcap]` 下，包括 `interface`、`bpf_filter`、`snaplen`、`promisc`、`immediate_mode`、`read_timeout_ms` 和 `buffer_size`；这些属于 provider 配置，不进入 parser 或 policy 层。
 - `RuntimePlan` 是配置解析后的事实源，必须输出候选 provider、选中的 provider、export worker effective plan、enforcement source plan、capability matrix 和不可用原因；`run` 使用 plan 启动，`check` 输出 plan 并执行显式 composition check，供部署前审计。
 
@@ -1070,7 +1073,7 @@ metrics 必须覆盖：
 | --- | --- | --- |
 | `agent` | 主二进制、生命周期、配置加载、CLI/admin API wiring、provider probe/open 与 runtime composition root。 | 核心领域模型、parser 实现、storage backend 细节。 |
 | `attribution` | procfs process attribution、future netlink/socket attribution adapter。 | packet capture、policy verdict、exporter。 |
-| `capture` | capture provider trait、replay provider、external plaintext feed provider、libpcap provider、eBPF host preflight、用户态 `aya` process observation loader、degraded eBPF connect observation provider、connect observation 到 `ConnectionOpened` 的纯转换 bridge、unresolved observation 到 degraded `Gap` 的 provider path、libssl uprobe discovery/attach plan 和 libssl/keylog provider adapter。 | parser/policy/export 语义；payload/lost-event capture 完成前不把 eBPF observation provider 伪装成完整 traffic provider。 |
+| `capture` | capture provider trait、replay provider、external plaintext feed provider、libpcap provider、eBPF host preflight、用户态 `aya` process observation loader、degraded eBPF connect/close observation provider、connect observation 到 `ConnectionOpened` 的纯转换 bridge、descriptor close observation decoder、unresolved connect 到 degraded `Gap` 的 provider path、libssl uprobe discovery/attach plan 和 libssl/keylog provider adapter。 | parser/policy/export 语义；payload/lost-event/socket-lifetime close event 完成前不把 eBPF observation provider 伪装成完整 traffic provider。 |
 | `config` | TOML runtime config schema、validation、future config source abstraction。 | provider IO、policy 执行。 |
 | `core` | 领域类型、selector、flow/process identity、pipeline traits。 | 具体 crate 的 IO adapter。 |
 | `ebpf-abi` | userspace/kernel-space 共享 C ABI event envelope、program/map contract 常量。 | host runtime、object parsing。 |
@@ -1183,7 +1186,7 @@ benchmark 参数：
 
 当前 `run` 支持两类 provider 组合方式：
 
-- 默认/显式 live capture：按 `auto`、`ebpf`、`libpcap` 解析 plan；`auto` 当前会选择 available live provider，例如 libpcap，并跳过 degraded eBPF observation provider。显式 `capture.selection = "ebpf"` 可运行 eBPF connect lifecycle observation provider；它已有 `aya-obj` required contract preflight、shared ABI、最小内核 object scaffold、高层用户态 `aya` loader、ringbuf decoder、procfs socket attribution 依赖检查、connect observation 到 `ConnectionOpened` 的 bridge，以及 unresolved observation 到 degraded `Gap` 的 provider path，但还没有 payload event conversion 和完整 kernel-side capture program。
+- 默认/显式 live capture：按 `auto`、`ebpf`、`libpcap` 解析 plan；`auto` 当前会选择 available live provider，例如 libpcap，并跳过 degraded eBPF observation provider。显式 `capture.selection = "ebpf"` 可运行 eBPF connect/descriptor-close observation provider；它已有 `aya-obj` required contract preflight、shared ABI、最小内核 object scaffold、高层用户态 `aya` loader、ringbuf decoder、procfs socket attribution 依赖检查、connect observation 到 `ConnectionOpened` 的 bridge、descriptor close observation decoder，以及 unresolved connect 到 degraded `Gap` 的 provider path，但还没有 payload event conversion、socket-lifetime close event 和完整 kernel-side capture program。
 - 显式 `plaintext_feed`：从 `capture.plaintext_feed.path` 指向的 JSON-lines 文件流式读取外部明文 record，用于验证已解密明文路径。该模式不是 live capture fallback，也不自动和 libpcap/eBPF 合并。
 
 ## 31. 测试与验收
