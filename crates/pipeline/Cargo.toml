@@ -19,5 +19,9 @@ thiserror = "2.0.18"
 [lints]
 workspace = true
 
+[[test]]
+name = "pipeline"
+path = "tests/pipeline/mod.rs"
+
 [dev-dependencies]
 tempfile = "3.27.0"

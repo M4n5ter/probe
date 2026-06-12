@@ -13,5 +13,9 @@ thiserror = "2.0.18"
 [lints]
 workspace = true
 
+[[test]]
+name = "attribution"
+path = "tests/attribution/mod.rs"
+
 [dev-dependencies]
 tempfile = "3.27.0"

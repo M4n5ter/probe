@@ -1,5 +1,6 @@
-use super::*;
-use probe_core::Action;
+use probe_config::*;
+use probe_core::{Action, EnforcementMode};
+use std::path::PathBuf;
 
 #[test]
 fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {

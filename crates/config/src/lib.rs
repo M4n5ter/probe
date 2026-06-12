@@ -904,6 +904,3 @@ fn valid_http_token_byte(byte: u8) -> bool {
                 | b'~'
         )
 }
-
-#[cfg(test)]
-mod tests;

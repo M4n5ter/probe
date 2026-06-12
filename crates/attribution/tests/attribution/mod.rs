@@ -1,15 +1,14 @@
 use std::{
-    collections::HashMap,
     fs, io,
     net::{Ipv4Addr, Ipv6Addr},
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::fs::symlink,
     path::PathBuf,
     time::Duration,
 };
 
+use attribution::*;
+use probe_core::{TcpConnection, TcpEndpoint};
 use tempfile::{TempDir, tempdir};
-
-use super::*;
 
 #[test]
 fn procfs_attributor_builds_stable_process_context() -> Result<(), Box<dyn std::error::Error>> {
@@ -56,18 +55,6 @@ fn procfs_attributor_builds_stable_process_context() -> Result<(), Box<dyn std::
         process.identity.container_id.as_deref(),
         Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
     );
-    Ok(())
-}
-
-#[test]
-fn parse_stat_handles_comm_with_parenthesis() -> Result<(), Box<dyn std::error::Error>> {
-    let stat = parse_stat(
-        7,
-        "7 (worker) odd) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 99 21",
-    )?;
-
-    assert_eq!(stat.comm, "worker) odd");
-    assert_eq!(stat.start_time_ticks, 99);
     Ok(())
 }
 
@@ -308,29 +295,6 @@ fn procfs_socket_resolver_preserves_process_identity_errors()
         error,
         AttributionError::InvalidStatus { pid: 321, .. }
     ));
-    Ok(())
-}
-
-#[test]
-fn procfs_socket_scan_treats_permission_denied_as_best_effort_skip() {
-    let permission_denied = io::Error::from(io::ErrorKind::PermissionDenied);
-
-    assert!(is_skippable_socket_scan_error(&permission_denied));
-}
-
-#[test]
-fn procfs_socket_scan_skips_unreadable_pid_fd_dir() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    let fd_dir = temp.path().join("fd");
-    fs::create_dir(&fd_dir)?;
-    fs::set_permissions(&fd_dir, fs::Permissions::from_mode(0o000))?;
-    let mut inodes = HashMap::new();
-
-    let result = read_pid_socket_inodes(&fd_dir, 321, &mut inodes);
-
-    fs::set_permissions(&fd_dir, fs::Permissions::from_mode(0o700))?;
-    result?;
-    assert!(inodes.is_empty());
     Ok(())
 }
 

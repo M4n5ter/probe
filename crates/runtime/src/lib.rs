@@ -896,11 +896,11 @@ fn default_platform_capabilities(
         ),
         CapabilityState::degraded(
             CapabilityKind::DurableSpool,
-            "ingress and export lanes exist, but parser recovery from ingress journal is not implemented",
+            "ingress recovery can replay persisted capture bytes and advances the parser cursor only when active parser state has been removed, but recovery is at-least-once, replays under the current config and policy, and durable parser checkpoints plus gap/connection lifecycle replay are not complete",
         ),
         CapabilityState::degraded(
             CapabilityKind::IngressJournal,
-            "durable ingress lane is wired into replay, but parser recovery is not implemented",
+            "ingress recovery replays persisted capture bytes before opening a capture provider and only advances the parser cursor when active parser state has been removed, but durable parser checkpoints, processing provenance, gap replay, and connection lifecycle replay are not complete",
         ),
         CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::degraded(
@@ -923,6 +923,3 @@ fn capture_backend_capability(backend: CaptureBackend) -> CapabilityKind {
         CaptureBackend::Replay => CapabilityKind::ReplayCapture,
     }
 }
-
-#[cfg(test)]
-mod tests;

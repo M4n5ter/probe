@@ -223,6 +223,14 @@ impl DurableSpool for SingleEventBatchSpool {
         unimplemented!("export worker tests do not read ingress events")
     }
 
+    fn read_ingress_batch_after(
+        &self,
+        _sequence: u64,
+        _limit: usize,
+    ) -> Result<Vec<StoredEvent>, StorageError> {
+        unimplemented!("export worker tests do not read ingress events")
+    }
+
     fn ack_ingress(&self, _consumer: &str, _sequence: u64) -> Result<(), StorageError> {
         unimplemented!("export worker tests do not ack ingress events")
     }

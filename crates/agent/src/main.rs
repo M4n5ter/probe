@@ -48,6 +48,8 @@ use status::{build_status_snapshot, collect_spool_status};
 use storage::FjallSpool;
 use thiserror::Error;
 
+const INGRESS_RECOVERY_BATCH_SIZE: usize = 1_024;
+
 #[derive(Debug, Error)]
 enum AgentError {
     #[error("failed to read file {path}: {source}")]
@@ -217,7 +219,6 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let plan = build_runtime_plan(agent_config)?;
             let mut enforcement = build_configured_enforcement(&plan).await?;
             let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
-            let mut provider = build_capture_provider(&plan)?;
             let mut parser_factory = Http1ParserFactory::default();
             let admin_runtime_state = AdminRuntimeState {
                 enforcement_policy_source: enforcement.policy_source.clone(),
@@ -250,8 +251,17 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 plan.capture.mode,
                 plan.capture.selected_backend
             );
-            let summary_result = pipeline
-                .run_provider_with_options(provider.as_mut(), PipelineRunOptions { max_events });
+            let summary_result = (|| {
+                let mut summary = pipeline
+                    .recover_persisted_capture_bytes_until_idle(INGRESS_RECOVERY_BATCH_SIZE)?;
+                let mut provider = build_capture_provider(&plan)?;
+                let capture_summary = pipeline.run_provider_with_options(
+                    provider.as_mut(),
+                    PipelineRunOptions { max_events },
+                )?;
+                summary.merge(capture_summary);
+                Ok::<_, AgentError>(summary)
+            })();
             if let Some(server) = admin_server {
                 server.stop().await;
             }
@@ -262,16 +272,20 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 drain_planned_sinks(spool.as_ref(), &plan.config.agent_id, &plan.export).await;
             let summary = match (summary_result, drain_result) {
                 (Ok(summary), Ok(())) => summary,
-                (Err(error), Ok(())) => return Err(error.into()),
+                (Err(error), Ok(())) => return Err(error),
                 (Ok(_), Err(error)) => return Err(error.into()),
-                (Err(pipeline_error), Err(export_error)) => {
-                    eprintln!("tail export drain failed after pipeline error: {export_error}");
-                    return Err(pipeline_error.into());
+                (Err(run_error), Err(export_error)) => {
+                    eprintln!("tail export drain failed after run error: {export_error}");
+                    return Err(run_error);
                 }
             };
             println!(
-                "agent stopped after reading {} capture events, journaling {} capture chunks, and storing {} export events",
-                summary.capture_events, summary.ingress_chunks, summary.export_events
+                "agent stopped after reading {} capture events, journaling {} ingress records, processing {} ingress records ({} recovered), and storing {} export events",
+                summary.capture_events_read,
+                summary.ingress_records_journaled,
+                summary.ingress_records_processed,
+                summary.ingress_records_recovered,
+                summary.export_events_written
             );
         }
         Command::Check { config } => {
@@ -512,8 +526,10 @@ async fn replay(command: ReplayCommand) -> Result<(), AgentError> {
     .with_enforcement_planner(&mut enforcement_planner);
     let summary = pipeline.run_provider(&mut replay_provider)?;
     println!(
-        "replay pipeline journaled {} capture chunks and stored {} export events",
-        summary.ingress_chunks, summary.export_events
+        "replay pipeline journaled {} ingress records, processed {} ingress records, and stored {} export events",
+        summary.ingress_records_journaled,
+        summary.ingress_records_processed,
+        summary.export_events_written
     );
 
     if let Some(endpoint) = command.webhook {
@@ -612,8 +628,10 @@ fn synthetic_replay_process() -> ProcessContext {
 mod tests {
     use std::fs;
 
-    use capture::{EbpfProbeCheck, UnprivilegedBpfStatus};
+    use capture::{CapturedBytes, EbpfProbeCheck, UnprivilegedBpfStatus};
     use probe_config::{CaptureSelection, EnforcementPolicySourceConfig, PolicyConfig};
+    use probe_core::SpoolPayloadSchema;
+    use storage::SpoolPayload;
 
     use super::*;
 
@@ -777,6 +795,73 @@ protective_actions = ["alert"]
             !spool_path.exists(),
             "spool must not be opened before runtime validation passes"
         );
+
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_recovers_persisted_ingress_before_opening_capture_provider()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("run-ingress-recovery")?;
+        let config_path = temp.join("agent.toml");
+        let feed_path = temp.join("missing-feed.jsonl");
+        let spool_path = temp.join("spool");
+        let spool = FjallSpool::open(&spool_path)?;
+        let chunk = CapturedBytes {
+            timestamp: current_timestamp(1),
+            flow: replay_flow(),
+            source: probe_core::CaptureSource::Replay,
+            provider: capture::CaptureProviderKind::Replay,
+            direction: Direction::Outbound,
+            stream_offset: 0,
+            bytes: b"GET /recovered-run HTTP/1.1\r\nHost: recovery.test\r\n\r\n"
+                .as_slice()
+                .into(),
+            attribution_confidence: 0,
+            degraded: false,
+            degradation_reason: None,
+        };
+        spool.append_ingress(SpoolPayload::new(
+            SpoolPayloadSchema::CaptureBytesJsonV1,
+            serde_json::to_vec(&chunk)?,
+        ))?;
+        drop(spool);
+
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::PlaintextFeed;
+        config.capture.plaintext_feed.path = Some(feed_path);
+        config.storage.path = spool_path.clone();
+        fs::write(&config_path, toml::to_string(&config)?)?;
+
+        let error = run(Cli {
+            command: Command::Run {
+                config: Some(config_path),
+                max_events: Some(0),
+            },
+        })
+        .await
+        .expect_err("missing feed should fail after ingress recovery");
+
+        assert!(
+            matches!(error, AgentError::PlaintextFeed(_)),
+            "unexpected error: {error:?}"
+        );
+
+        let spool = FjallSpool::open(&spool_path)?;
+        assert_eq!(spool.ingress_cursor("parser")?, 0);
+        let exported = spool.read_export_batch("sink", 16)?;
+        let envelopes = exported
+            .iter()
+            .map(|event| serde_json::from_slice::<probe_core::EventEnvelope>(event.payload.bytes()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(envelopes.iter().any(|envelope| {
+            matches!(
+                &envelope.kind,
+                probe_core::EventKind::HttpRequestHeaders(headers)
+                    if headers.target.as_deref() == Some("/recovered-run")
+            )
+        }));
 
         fs::remove_dir_all(temp)?;
         Ok(())

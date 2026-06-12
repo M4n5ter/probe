@@ -18,3 +18,7 @@ url = "2.5"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "config"
+path = "tests/config/mod.rs"

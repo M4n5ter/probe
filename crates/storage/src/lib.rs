@@ -123,6 +123,12 @@ pub trait DurableSpool {
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StorageError>;
 
+    fn read_ingress_batch_after(
+        &self,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StorageError>;
+
     fn ack_ingress(&self, consumer: &str, sequence: u64) -> Result<(), StorageError>;
 
     fn ingress_cursor(&self, consumer: &str) -> Result<u64, StorageError>;
@@ -222,6 +228,14 @@ impl FjallSpool {
         self.read_batch_from_lane(SpoolLane::Ingress, consumer, limit)
     }
 
+    pub fn read_ingress_batch_after(
+        &self,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StorageError> {
+        self.read_batch_from_lane_after(SpoolLane::Ingress, sequence, limit)
+    }
+
     pub fn ack_ingress(&self, consumer: &str, sequence: u64) -> Result<(), StorageError> {
         self.ack_lane(SpoolLane::Ingress, consumer, sequence)
     }
@@ -300,11 +314,22 @@ impl FjallSpool {
         consumer: &str,
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StorageError> {
+        let cursor = self.cursor_for_lane(lane, consumer)?;
+        self.read_batch_from_lane_after(lane, cursor, limit)
+    }
+
+    fn read_batch_from_lane_after(
+        &self,
+        lane: SpoolLane,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StorageError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let cursor = self.cursor_for_lane(lane, consumer)?;
-        let start = cursor.saturating_add(1);
+        let Some(start) = sequence.checked_add(1) else {
+            return Ok(Vec::new());
+        };
         let durable_last_sequence = *self.lock_last_sequence(lane)?;
         let mut events = Vec::new();
 
@@ -401,6 +426,14 @@ impl DurableSpool for FjallSpool {
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StorageError> {
         FjallSpool::read_ingress_batch(self, consumer, limit)
+    }
+
+    fn read_ingress_batch_after(
+        &self,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StorageError> {
+        FjallSpool::read_ingress_batch_after(self, sequence, limit)
     }
 
     fn ack_ingress(&self, consumer: &str, sequence: u64) -> Result<(), StorageError> {
@@ -611,6 +644,50 @@ mod tests {
         spool.ack_ingress("parser", 1)?;
         assert_eq!(spool.ingress_cursor("parser")?, 1);
         assert_eq!(spool.export_cursor("webhook")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn read_ingress_batch_after_scans_without_advancing_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+
+        spool.append_ingress(test_payload(b"raw-one"))?;
+        spool.append_ingress(test_payload(b"raw-two"))?;
+        spool.append_ingress(test_payload(b"raw-three"))?;
+        spool.ack_ingress("parser", 2)?;
+
+        let replay = spool.read_ingress_batch_after(0, 10)?;
+        let suffix = spool.read_ingress_batch_after(1, 10)?;
+
+        assert_eq!(
+            replay
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            suffix
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(spool.ingress_cursor("parser")?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn read_ingress_batch_after_max_sequence_returns_empty_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+
+        spool.append_ingress(test_payload(b"raw"))?;
+
+        assert!(spool.read_ingress_batch_after(u64::MAX, 10)?.is_empty());
         Ok(())
     }
 

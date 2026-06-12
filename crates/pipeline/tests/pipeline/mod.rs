@@ -1,17 +1,19 @@
 use capture::{
-    CaptureProviderKind, CapturedBytes, PlaintextChunk, PlaintextFeedProvider, ReplayProvider,
+    CaptureError, CaptureEvent, CaptureProvider, CaptureProviderKind, CapturedBytes,
+    PlaintextChunk, PlaintextFeedProvider, ReplayProvider,
 };
 use enforcement::ScopedEnforcementPlanner;
 use parsers::Http1ParserFactory;
+use pipeline::{CapturePipeline, PipelineError, PipelinePolicy, PipelineRunOptions};
 use policy::{PolicyHook, PolicyManifest, PolicyRuntime};
 use probe_core::{
     Action, AddressPort, CapabilityState, CaptureSource, Direction, EnforcementMode,
-    EnforcementOutcome, EventEnvelope, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity,
-    ProcessSelector, Selector, Timestamp, TrafficSelector, TransportProtocol,
+    EnforcementOutcome, EventEnvelope, EventKind, FlowContext, FlowIdentity, ProcessContext,
+    ProcessIdentity, ProcessSelector, Selector, SpoolPayloadSchema, Timestamp, TrafficSelector,
+    TransportProtocol,
 };
+use storage::SpoolPayload;
 use tempfile::tempdir;
-
-use super::*;
 
 #[test]
 fn replay_provider_writes_ingress_and_export_lanes() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,11 +33,176 @@ fn replay_provider_writes_ingress_and_export_lanes() -> Result<(), Box<dyn std::
 
     let summary = pipeline.run_provider(&mut provider)?;
 
-    assert_eq!(summary.ingress_chunks, 1);
-    assert_eq!(summary.export_events, 2);
-    assert_eq!(spool.ingress_cursor("parser")?, 1);
+    assert_eq!(summary.ingress_records_journaled, 1);
+    assert_eq!(summary.ingress_records_processed, 1);
+    assert_eq!(summary.export_events_written, 2);
+    assert_eq!(spool.ingress_cursor("parser")?, 0);
     assert_eq!(spool.read_ingress_batch("debug", 10)?.len(), 1);
     assert_eq!(spool.read_export_batch("sink", 10)?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn recover_persisted_capture_bytes_replays_capture_bytes() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let chunk = captured_bytes_chunk(
+        demo_flow_with_ports(50_000, 80, 31),
+        Direction::Outbound,
+        b"GET /recovered HTTP/1.1\r\nHost: recovery.test\r\n\r\n",
+    );
+    spool.append_ingress(SpoolPayload::new(
+        SpoolPayloadSchema::CaptureBytesJsonV1,
+        serde_json::to_vec(&chunk)?,
+    ))?;
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+
+    let summary = pipeline.recover_persisted_capture_bytes_until_idle(16)?;
+
+    assert_eq!(summary.capture_events_read, 0);
+    assert_eq!(summary.ingress_records_journaled, 0);
+    assert_eq!(summary.ingress_records_processed, 1);
+    assert_eq!(summary.ingress_records_recovered, 1);
+    assert_eq!(summary.export_events_written, 1);
+    assert_eq!(spool.ingress_cursor("parser")?, 0);
+    let exported = spool.read_export_batch("sink", 16)?;
+    let envelopes = exported
+        .iter()
+        .map(|event| serde_json::from_slice::<EventEnvelope>(event.payload.bytes()))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(envelopes.iter().any(|envelope| {
+        envelope.source == CaptureSource::Replay
+            && matches!(
+                &envelope.kind,
+                EventKind::HttpRequestHeaders(headers)
+                    if headers.target.as_deref() == Some("/recovered")
+            )
+    }));
+    Ok(())
+}
+
+#[test]
+fn recover_persisted_capture_bytes_replays_persisted_prefix_for_parser_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let flow = demo_flow_with_ports(50_000, 80, 32);
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut provider = SequenceProvider::new(vec![captured_bytes(
+        flow.clone(),
+        b"GET /split-recovered HTTP/1.1\r\nHost: recovery",
+    )]);
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+
+    let summary = pipeline.run_provider(&mut provider)?;
+
+    assert_eq!(summary.ingress_records_journaled, 1);
+    assert_eq!(summary.ingress_records_processed, 1);
+    assert_eq!(summary.export_events_written, 0);
+    assert_eq!(spool.ingress_cursor("parser")?, 0);
+    spool.append_ingress(SpoolPayload::new(
+        SpoolPayloadSchema::CaptureBytesJsonV1,
+        serde_json::to_vec(&captured_bytes_chunk(
+            flow,
+            Direction::Outbound,
+            b".test\r\n\r\n",
+        ))?,
+    ))?;
+    drop(pipeline);
+    drop(parser_factory);
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+
+    let summary = pipeline.recover_persisted_capture_bytes_until_idle(16)?;
+
+    assert_eq!(summary.ingress_records_journaled, 0);
+    assert_eq!(summary.ingress_records_recovered, 2);
+    assert_eq!(summary.ingress_records_processed, 2);
+    assert_eq!(summary.export_events_written, 1);
+    assert_eq!(spool.ingress_cursor("parser")?, 0);
+    let exported = spool.read_export_batch("sink", 16)?;
+    let envelopes = exported
+        .iter()
+        .map(|event| serde_json::from_slice::<EventEnvelope>(event.payload.bytes()))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(envelopes.iter().any(|envelope| {
+        matches!(
+            &envelope.kind,
+            EventKind::HttpRequestHeaders(headers)
+                if headers.target.as_deref() == Some("/split-recovered")
+        )
+    }));
+    Ok(())
+}
+
+#[test]
+fn recover_persisted_capture_bytes_advances_cursor_after_connection_close()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let flow = demo_flow_with_ports(50_000, 80, 33);
+    spool.append_ingress(SpoolPayload::new(
+        SpoolPayloadSchema::CaptureBytesJsonV1,
+        serde_json::to_vec(&captured_bytes_chunk(
+            flow.clone(),
+            Direction::Outbound,
+            b"GET /checkpoint HTTP/1.1\r\nHost: recovery.test\r\n\r\n",
+        ))?,
+    ))?;
+    spool.append_ingress(SpoolPayload::new(
+        SpoolPayloadSchema::CaptureBytesJsonV1,
+        serde_json::to_vec(&captured_bytes_chunk(
+            flow.clone(),
+            Direction::Inbound,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        ))?,
+    ))?;
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+
+    let summary = pipeline.recover_persisted_capture_bytes_until_idle(16)?;
+
+    assert_eq!(summary.ingress_records_recovered, 2);
+    assert_eq!(summary.ingress_records_processed, 2);
+    assert_eq!(summary.export_events_written, 2);
+    assert_eq!(spool.ingress_cursor("parser")?, 0);
+
+    let mut provider = SequenceProvider::new(vec![connection_closed(flow)]);
+    let close_summary = pipeline.run_provider(&mut provider)?;
+
+    assert_eq!(close_summary.capture_events_read, 1);
+    assert_eq!(spool.ingress_cursor("parser")?, 2);
+    Ok(())
+}
+
+#[test]
+fn recover_persisted_capture_bytes_rejects_unexpected_payload_schema()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    spool.append_ingress(SpoolPayload::new(
+        SpoolPayloadSchema::EventEnvelopeJsonV1,
+        b"{}",
+    ))?;
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+
+    let error = pipeline
+        .recover_persisted_capture_bytes_until_idle(16)
+        .expect_err("unexpected ingress schema must fail recovery");
+
+    assert!(matches!(
+        error,
+        PipelineError::UnexpectedIngressSchema {
+            sequence: 1,
+            expected: SpoolPayloadSchema::CAPTURE_BYTES_JSON_V1,
+            actual,
+        } if actual == SpoolPayloadSchema::EVENT_ENVELOPE_JSON_V1
+    ));
+    assert_eq!(spool.ingress_cursor("parser")?, 0);
+    assert!(spool.read_export_batch("sink", 16)?.is_empty());
     Ok(())
 }
 
@@ -59,8 +226,9 @@ fn plaintext_feed_provider_writes_ingress_and_http_export_events()
 
     let summary = pipeline.run_provider(&mut provider)?;
 
-    assert_eq!(summary.capture_events, 1);
-    assert_eq!(summary.ingress_chunks, 1);
+    assert_eq!(summary.capture_events_read, 1);
+    assert_eq!(summary.ingress_records_journaled, 1);
+    assert_eq!(summary.ingress_records_processed, 1);
     let exported = spool.read_export_batch("sink", 16)?;
     let envelopes = exported
         .iter()
@@ -121,7 +289,8 @@ end
 
     let summary = pipeline.run_provider(&mut provider)?;
 
-    assert_eq!(summary.ingress_chunks, 1);
+    assert_eq!(summary.ingress_records_journaled, 1);
+    assert_eq!(summary.ingress_records_processed, 1);
     let exported = spool.read_export_batch("sink", 16)?;
     let envelopes = exported
         .iter()
@@ -190,7 +359,8 @@ end
 
     let summary = pipeline.run_provider(&mut provider)?;
 
-    assert_eq!(summary.ingress_chunks, 2);
+    assert_eq!(summary.ingress_records_journaled, 2);
+    assert_eq!(summary.ingress_records_processed, 2);
     let exported = spool.read_export_batch("sink", 16)?;
     let envelopes = exported
         .iter()
@@ -248,9 +418,10 @@ end
 
     let summary = pipeline.run_provider(&mut provider)?;
 
-    assert_eq!(summary.ingress_chunks, 3);
+    assert_eq!(summary.ingress_records_journaled, 3);
+    assert_eq!(summary.ingress_records_processed, 3);
     assert!(
-        summary.export_events >= 5,
+        summary.export_events_written >= 5,
         "request, response, handoff, policy alert, and opaque events should be exported"
     );
 
@@ -330,7 +501,8 @@ fn connection_close_flushes_close_delimited_http_body() -> Result<(), Box<dyn st
 
     let summary = pipeline.run_provider(&mut provider)?;
 
-    assert_eq!(summary.ingress_chunks, 1);
+    assert_eq!(summary.ingress_records_journaled, 1);
+    assert_eq!(summary.ingress_records_processed, 1);
     let exported = spool.read_export_batch("sink", 16)?;
     let envelopes = exported
         .iter()
@@ -391,7 +563,8 @@ fn live_pipeline_isolates_parser_state_per_flow() -> Result<(), Box<dyn std::err
 
     let summary = pipeline.run_provider(&mut provider)?;
 
-    assert_eq!(summary.ingress_chunks, 3);
+    assert_eq!(summary.ingress_records_journaled, 3);
+    assert_eq!(summary.ingress_records_processed, 3);
     let exported = spool.read_export_batch("sink", 16)?;
     let envelopes = exported
         .iter()
@@ -444,8 +617,9 @@ fn run_provider_with_options_stops_after_max_capture_events()
     let summary =
         pipeline.run_provider_with_options(&mut provider, PipelineRunOptions::max_events(1))?;
 
-    assert_eq!(summary.capture_events, 1);
-    assert_eq!(summary.ingress_chunks, 1);
+    assert_eq!(summary.capture_events_read, 1);
+    assert_eq!(summary.ingress_records_journaled, 1);
+    assert_eq!(summary.ingress_records_processed, 1);
     assert_eq!(spool.read_ingress_batch("debug", 10)?.len(), 1);
     assert_eq!(spool.read_export_batch("sink", 10)?.len(), 1);
     Ok(())
@@ -463,8 +637,9 @@ fn run_provider_with_zero_max_events_does_not_read_provider()
     let summary =
         pipeline.run_provider_with_options(&mut provider, PipelineRunOptions::max_events(0))?;
 
-    assert_eq!(summary.capture_events, 0);
-    assert_eq!(summary.ingress_chunks, 0);
+    assert_eq!(summary.capture_events_read, 0);
+    assert_eq!(summary.ingress_records_journaled, 0);
+    assert_eq!(summary.ingress_records_processed, 0);
     assert!(spool.read_ingress_batch("debug", 10)?.is_empty());
     assert!(spool.read_export_batch("sink", 10)?.is_empty());
     Ok(())
@@ -486,7 +661,8 @@ fn live_pipeline_parses_process_inbound_request_as_request()
 
     let summary = pipeline.run_provider(&mut provider)?;
 
-    assert_eq!(summary.ingress_chunks, 1);
+    assert_eq!(summary.ingress_records_journaled, 1);
+    assert_eq!(summary.ingress_records_processed, 1);
     let exported = spool.read_export_batch("sink", 16)?;
     let envelopes = exported
         .iter()
@@ -578,7 +754,15 @@ fn captured_bytes_with_direction(
     direction: Direction,
     bytes: &'static [u8],
 ) -> CaptureEvent {
-    CaptureEvent::Bytes(CapturedBytes {
+    CaptureEvent::Bytes(captured_bytes_chunk(flow, direction, bytes))
+}
+
+fn captured_bytes_chunk(
+    flow: FlowContext,
+    direction: Direction,
+    bytes: &'static [u8],
+) -> CapturedBytes {
+    CapturedBytes {
         timestamp: Timestamp {
             monotonic_ns: 1,
             wall_time_unix_ns: 1,
@@ -592,7 +776,7 @@ fn captured_bytes_with_direction(
         attribution_confidence: 0,
         degraded: false,
         degradation_reason: None,
-    })
+    }
 }
 
 fn connection_closed(flow: FlowContext) -> CaptureEvent {

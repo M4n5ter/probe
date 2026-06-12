@@ -42,12 +42,18 @@ impl ParserOutput {
 
 pub trait ProtocolParser {
     fn ingest(&mut self, input: ParserInput<'_>) -> ParserOutput;
+
+    fn is_checkpoint_safe(&self) -> bool {
+        false
+    }
 }
 
 pub trait ProtocolParserFactory {
     fn parser_for_flow(&mut self, flow_id: &FlowIdentity) -> &mut dyn ProtocolParser;
 
     fn remove_flow(&mut self, flow_id: &FlowIdentity);
+
+    fn is_checkpoint_safe(&self) -> bool;
 }
 
 #[derive(Debug)]
@@ -73,6 +79,12 @@ where
 
     fn remove_flow(&mut self, flow_id: &FlowIdentity) {
         self.parsers.remove(&flow_id.0);
+    }
+
+    fn is_checkpoint_safe(&self) -> bool {
+        self.parsers
+            .values()
+            .all(ProtocolParser::is_checkpoint_safe)
     }
 }
 

@@ -90,6 +90,13 @@ impl ProtocolParser for Http1Parser {
             ParserInput::ConnectionClosed => ParserOutput::from_events(self.finish_flow()),
         }
     }
+
+    fn is_checkpoint_safe(&self) -> bool {
+        !self.opaque_handoff
+            && self.pending_response_contexts.is_empty()
+            && self.inbound.is_checkpoint_safe()
+            && self.outbound.is_checkpoint_safe()
+    }
 }
 
 impl Http1Parser {
@@ -454,6 +461,14 @@ impl DirectionState {
             }
             HttpState::ReadingHeaders | HttpState::Opaque => {}
         }
+    }
+
+    fn is_checkpoint_safe(&self) -> bool {
+        self.buffer.is_empty()
+            && self.state == HttpState::ReadingHeaders
+            && self.stream_sequence == 0
+            && self.body_offset == 0
+            && self.sse.is_checkpoint_safe()
     }
 }
 
@@ -920,6 +935,10 @@ impl SseDecoder {
             overflowed: false,
         }
     }
+
+    fn is_checkpoint_safe(&self) -> bool {
+        !self.enabled || self.pending.is_empty()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1055,6 +1074,32 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn checkpoint_safety_tracks_pending_and_semantic_http_state() {
+        let mut parser = Http1Parser::default();
+
+        assert!(parser.is_checkpoint_safe());
+        assert!(
+            parser
+                .ingest(Direction::Outbound, b"GET /checkpoint HTTP/1.1\r\nHost:")
+                .is_empty()
+        );
+        assert!(!parser.is_checkpoint_safe());
+
+        let mut parser = Http1Parser::default();
+        parser.ingest(
+            Direction::Outbound,
+            b"GET /checkpoint HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        );
+        assert!(!parser.is_checkpoint_safe());
+
+        parser.ingest(
+            Direction::Inbound,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(!parser.is_checkpoint_safe());
     }
 
     #[test]
@@ -1246,6 +1291,7 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, EventKind::OpaqueStream(opaque) if opaque.direction == Direction::Inbound))
         );
+        assert!(!parser.is_checkpoint_safe());
     }
 
     #[test]
