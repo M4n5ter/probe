@@ -11,7 +11,7 @@ pub(in crate::validation) fn validate_runtime(
         interval_ms,
         batches_per_sink_per_tick,
         sink_timeout_ms,
-        failure_backoff_ms,
+        failure_backoff,
     } = export.worker.schedule;
     for (field, value, reason) in [
         (
@@ -30,9 +30,14 @@ pub(in crate::validation) fn validate_runtime(
             "export worker sink timeout must be positive when the worker is enabled",
         ),
         (
-            "export.worker.schedule.failure_backoff_ms",
-            failure_backoff_ms,
-            "export worker failure backoff must be positive when the worker is enabled",
+            "export.worker.schedule.failure_backoff.initial_ms",
+            failure_backoff.initial_ms,
+            "export worker failure backoff initial delay must be positive when the worker is enabled",
+        ),
+        (
+            "export.worker.schedule.failure_backoff.max_ms",
+            failure_backoff.max_ms,
+            "export worker failure backoff max delay must be positive when the worker is enabled",
         ),
     ] {
         if value == 0 {
@@ -41,5 +46,18 @@ pub(in crate::validation) fn validate_runtime(
                 reason: reason.to_string(),
             });
         }
+    }
+    if failure_backoff.multiplier == 0 {
+        violations.push(ConfigViolation {
+            field: "export.worker.schedule.failure_backoff.multiplier".to_string(),
+            reason: "export worker failure backoff multiplier must be positive when the worker is enabled"
+                .to_string(),
+        });
+    }
+    if failure_backoff.max_ms < failure_backoff.initial_ms {
+        violations.push(ConfigViolation {
+            field: "export.worker.schedule.failure_backoff.max_ms".to_string(),
+            reason: "export worker failure backoff max delay must be greater than or equal to the initial delay".to_string(),
+        });
     }
 }

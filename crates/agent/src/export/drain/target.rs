@@ -234,8 +234,8 @@ mod tests {
     use crate::{
         export::drain::fixture::{
             plan::{
-                export_plan_with_trust_anchor, inherited_worker_quota, overridden_worker_quota,
-                runtime_plan, tls_material,
+                export_plan_with_trust_anchor, fixed_failure_backoff, inherited_worker_quota,
+                overridden_worker_quota, runtime_plan, tls_material,
             },
             spool::{SingleEventBatchSpool, append_export_event},
             webhook::{TestWebhookServer, request_header},
@@ -480,7 +480,7 @@ mod tests {
                 interval_ms: 60_000,
                 batches_per_sink_per_tick: 1,
                 sink_timeout_ms: 5_000,
-                failure_backoff_ms: 30_000,
+                failure_backoff: fixed_failure_backoff(30_000),
             },
             sinks: vec![ExportSinkPlan {
                 id: "tail".to_string(),

@@ -7,9 +7,10 @@ use probe_config::{
 use probe_core::{CapabilityKind, CapabilityState, EnforcementMode, RuntimeMode, Selector};
 use runtime::{
     CapturePlanMode, CaptureProviderBuilder, CaptureProviderDescriptor,
-    EnforcementPolicySourceKind, EnforcementPolicySourcePlan, ExportSinkPlan, ExportSinkTlsPlan,
-    ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan, ProviderRegistry, RuntimeError,
-    RuntimePlan, TlsPlaintextCapabilityPlan, TlsPlaintextMaterialPlan,
+    EnforcementPolicySourceKind, EnforcementPolicySourcePlan, ExportFailureBackoffPlan,
+    ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan, ExportTlsMaterialPlan,
+    ExportWorkerPlan, ProviderRegistry, RuntimeError, RuntimePlan, TlsPlaintextCapabilityPlan,
+    TlsPlaintextMaterialPlan,
 };
 
 #[test]
@@ -195,7 +196,11 @@ fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::err
             interval_ms: 250,
             batches_per_sink_per_tick: 3,
             sink_timeout_ms: 2_000,
-            failure_backoff_ms: 5_000,
+            failure_backoff: probe_config::ExportFailureBackoffConfig {
+                initial_ms: 5_000,
+                max_ms: 20_000,
+                multiplier: 3,
+            },
         };
     config.exporters = vec![probe_config::ExporterConfig {
         id: "primary".to_string(),
@@ -243,7 +248,11 @@ fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::err
             interval_ms: 250,
             batches_per_sink_per_tick: 3,
             sink_timeout_ms: 2_000,
-            failure_backoff_ms: 5_000,
+            failure_backoff: ExportFailureBackoffPlan {
+                initial_ms: 5_000,
+                max_ms: 20_000,
+                multiplier: 3,
+            },
         }
     );
     assert_eq!(

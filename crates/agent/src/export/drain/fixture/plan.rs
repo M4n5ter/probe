@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, num::NonZeroU64, path::PathBuf};
 use probe_config::{AgentConfig, CompressionCodecName, ExporterTransport, TlsMaterialKind};
 use probe_core::{CapabilityKind, CapabilityState};
 use runtime::{
-    self, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
-    ExportTlsMaterialPlan, ExportWorkerPlan, ProviderRegistry, RuntimePlan,
+    self, ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan,
+    ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan, ProviderRegistry, RuntimePlan,
 };
 
 pub(in crate::export::drain) fn export_plan_with_trust_anchor(path: PathBuf) -> ExportPlan {
@@ -48,6 +48,14 @@ pub(in crate::export::drain) fn overridden_worker_quota(
         batches_per_tick_override: Some(effective_batches_per_tick),
         effective_batches_per_tick: NonZeroU64::new(effective_batches_per_tick)
             .expect("positive batch quota"),
+    }
+}
+
+pub(in crate::export::drain) fn fixed_failure_backoff(backoff_ms: u64) -> ExportFailureBackoffPlan {
+    ExportFailureBackoffPlan {
+        initial_ms: backoff_ms,
+        max_ms: backoff_ms,
+        multiplier: 1,
     }
 }
 

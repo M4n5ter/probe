@@ -332,7 +332,7 @@ mod tests {
     };
     use probe_core::{Action, ProtectiveActionProfile};
     use probe_core::{CapabilityKind, CapabilityState};
-    use runtime::ExportWorkerPlan;
+    use runtime::{ExportFailureBackoffPlan, ExportWorkerPlan};
     use serde_json::json;
 
     #[test]
@@ -361,7 +361,11 @@ mod tests {
                 interval_ms: 1_000,
                 batches_per_sink_per_tick: 1,
                 sink_timeout_ms: 10_000,
-                failure_backoff_ms: 30_000,
+                failure_backoff: ExportFailureBackoffPlan {
+                    initial_ms: 30_000,
+                    max_ms: 300_000,
+                    multiplier: 2,
+                },
             }
         );
         assert_eq!(

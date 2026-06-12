@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, num::NonZeroU64};
 
 use probe_config::{
-    AgentConfig, CompressionCodecName, ExportWorkerScheduleConfig, ExporterTlsConfig,
-    ExporterTransport,
+    AgentConfig, CompressionCodecName, ExportFailureBackoffConfig, ExportWorkerScheduleConfig,
+    ExporterTlsConfig, ExporterTransport,
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,7 +59,7 @@ pub enum ExportWorkerPlan {
         interval_ms: u64,
         batches_per_sink_per_tick: u64,
         sink_timeout_ms: u64,
-        failure_backoff_ms: u64,
+        failure_backoff: ExportFailureBackoffPlan,
     },
 }
 
@@ -79,12 +79,12 @@ impl From<ExportWorkerScheduleConfig> for ExportWorkerPlan {
                 interval_ms,
                 batches_per_sink_per_tick,
                 sink_timeout_ms,
-                failure_backoff_ms,
+                failure_backoff,
             } => Self::FixedIntervalBounded {
                 interval_ms,
                 batches_per_sink_per_tick,
                 sink_timeout_ms,
-                failure_backoff_ms,
+                failure_backoff: failure_backoff.into(),
             },
         }
     }
@@ -96,6 +96,29 @@ fn export_worker_default_sink_batches_per_tick(schedule: ExportWorkerScheduleCon
             batches_per_sink_per_tick,
             ..
         } => batches_per_sink_per_tick.max(1),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportFailureBackoffPlan {
+    pub initial_ms: u64,
+    pub max_ms: u64,
+    pub multiplier: u32,
+}
+
+impl Default for ExportFailureBackoffPlan {
+    fn default() -> Self {
+        ExportFailureBackoffConfig::default().into()
+    }
+}
+
+impl From<ExportFailureBackoffConfig> for ExportFailureBackoffPlan {
+    fn from(value: ExportFailureBackoffConfig) -> Self {
+        Self {
+            initial_ms: value.initial_ms,
+            max_ms: value.max_ms,
+            multiplier: value.multiplier,
+        }
     }
 }
 

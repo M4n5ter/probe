@@ -35,7 +35,11 @@ mode = "fixed_interval_bounded"
 interval_ms = 250
 batches_per_sink_per_tick = 3
 sink_timeout_ms = 2000
-failure_backoff_ms = 5000
+
+[export.worker.schedule.failure_backoff]
+initial_ms = 5000
+max_ms = 20000
+multiplier = 3
 
 [[exporters]]
 id = "primary"
@@ -107,7 +111,11 @@ socket_path = "/run/sssa-probe/admin.sock"
             interval_ms: 250,
             batches_per_sink_per_tick: 3,
             sink_timeout_ms: 2_000,
-            failure_backoff_ms: 5_000,
+            failure_backoff: ExportFailureBackoffConfig {
+                initial_ms: 5_000,
+                max_ms: 20_000,
+                multiplier: 3,
+            },
         }
     );
     assert_eq!(config.exporters[0].codec, CompressionCodecName::Zstd);

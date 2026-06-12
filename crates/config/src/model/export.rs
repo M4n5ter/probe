@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_EXPORT_WORKER_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK: u64 = 1;
 pub const DEFAULT_EXPORT_SINK_TIMEOUT_MS: u64 = 10_000;
-pub const DEFAULT_EXPORT_FAILURE_BACKOFF_MS: u64 = 30_000;
+pub const DEFAULT_EXPORT_FAILURE_BACKOFF_INITIAL_MS: u64 = 30_000;
+pub const DEFAULT_EXPORT_FAILURE_BACKOFF_MAX_MS: u64 = 300_000;
+pub const DEFAULT_EXPORT_FAILURE_BACKOFF_MULTIPLIER: u32 = 2;
 
 fn default_export_worker_interval_ms() -> u64 {
     DEFAULT_EXPORT_WORKER_INTERVAL_MS
@@ -17,10 +19,6 @@ fn default_export_batches_per_sink_per_tick() -> u64 {
 
 fn default_export_sink_timeout_ms() -> u64 {
     DEFAULT_EXPORT_SINK_TIMEOUT_MS
-}
-
-fn default_export_failure_backoff_ms() -> u64 {
-    DEFAULT_EXPORT_FAILURE_BACKOFF_MS
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,8 +53,8 @@ pub enum ExportWorkerScheduleConfig {
         batches_per_sink_per_tick: u64,
         #[serde(default = "default_export_sink_timeout_ms")]
         sink_timeout_ms: u64,
-        #[serde(default = "default_export_failure_backoff_ms")]
-        failure_backoff_ms: u64,
+        #[serde(default)]
+        failure_backoff: ExportFailureBackoffConfig,
     },
 }
 
@@ -66,7 +64,25 @@ impl Default for ExportWorkerScheduleConfig {
             interval_ms: DEFAULT_EXPORT_WORKER_INTERVAL_MS,
             batches_per_sink_per_tick: DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK,
             sink_timeout_ms: DEFAULT_EXPORT_SINK_TIMEOUT_MS,
-            failure_backoff_ms: DEFAULT_EXPORT_FAILURE_BACKOFF_MS,
+            failure_backoff: ExportFailureBackoffConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExportFailureBackoffConfig {
+    pub initial_ms: u64,
+    pub max_ms: u64,
+    pub multiplier: u32,
+}
+
+impl Default for ExportFailureBackoffConfig {
+    fn default() -> Self {
+        Self {
+            initial_ms: DEFAULT_EXPORT_FAILURE_BACKOFF_INITIAL_MS,
+            max_ms: DEFAULT_EXPORT_FAILURE_BACKOFF_MAX_MS,
+            multiplier: DEFAULT_EXPORT_FAILURE_BACKOFF_MULTIPLIER,
         }
     }
 }

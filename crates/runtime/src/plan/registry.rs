@@ -97,7 +97,7 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::degraded(
             CapabilityKind::WebhookExporter,
-            "webhook transport can drain planned export sinks with configured fixed worker bounds, per-sink batch quota, and fixed failure backoff during run and replay CLI webhook output during replay, but adaptive/exponential backoff and retention deadline are not implemented",
+            "webhook transport can drain planned export sinks with configured fixed worker bounds, per-sink batch quota, and per-sink exponential failure backoff during run and replay CLI webhook output during replay, but retention deadline is not implemented",
         ),
         CapabilityState::available(CapabilityKind::DryRunEnforcement),
     ]

@@ -113,7 +113,7 @@ flowchart LR
 | `lua_jit` | Degraded | LuaJIT policy runtime 已接入 replay/live pipeline，支持 typed alert/verdict。 | hot reload 和多个 active bundle 未实现。 |
 | `durable_spool` / `ingress_journal` | Degraded | Fjall ingress journal/export queue 可持久化并恢复 bytes、gap、connection opened/closed capture events。 | 恢复是 at-least-once，按当前 config/policy 重新解释旧 ingress；durable parser checkpoint 与 processing provenance 还不完整。 |
 | `export_queue` | Available | export lane、per-sink cursor、schema-aware payload 和 protobuf batch envelope 已存在。 | retention deadline 尚未进入完整运行态。 |
-| `webhook_exporter` | Degraded | `run` 可连续 drain planned sinks，支持固定间隔、全局/每 sink batch 预算、single sink timeout、fixed backoff、trust anchors 和 client identity refs。 | adaptive/exponential backoff 和 retention deadline 尚未实现。 |
+| `webhook_exporter` | Degraded | `run` 可连续 drain planned sinks，支持固定间隔、全局/每 sink batch 预算、single sink timeout、per-sink exponential backoff、trust anchors 和 client identity refs。 | retention deadline 尚未实现。 |
 | `dry_run_enforcement` | Available | dry-run enforcement 会记录策略保护意图、requested/effective action 和 audit event。 | 不执行真实连接阻断。 |
 
 - 已实现 selector AST 的基础形态：`match`、`all`、`any`、`not`、`ref`，命名 selector 通过 registry 编译解析。
@@ -782,8 +782,9 @@ flowchart LR
 - `[export.worker.schedule] interval_ms` 控制 worker 两轮有界 drain 之间的固定间隔；worker 开启时该值必须大于 0，默认 `1000`。
 - `[export.worker.schedule] batches_per_sink_per_tick` 控制后台 worker 每轮对每个 sink 最多发送多少个 batch；worker 开启时该值必须大于 0，默认 `1`。单个 exporter 可用 `[exporters.worker] batches_per_tick` 覆盖本 sink 的每轮 batch quota；未配置时继承全局值。
 - `[export.worker.schedule] sink_timeout_ms` 控制后台 worker 对单个 sink 的 drain timeout；worker 开启时该值必须大于 0，默认 `10000`。
-- `[export.worker.schedule] failure_backoff_ms` 控制后台 worker 在某个 sink 失败后跳过该 sink 的固定时长；worker 开启时该值必须大于 0，默认 `30000`。这四个 schedule 字段共同定义当前 fixed bounded worker mode，避免把 live worker 变成无界 tail flush 或被单个挂起/失败 sink 永久卡住；这仍不等同于未来的 adaptive/exponential backoff 或 retention deadline。
-- `RuntimePlan.export.worker` 是单个 typed worker plan：`disabled` 携带原因，`fixed_interval_bounded` 携带 interval、全局 batch budget、timeout 和 fixed failure backoff。`RuntimePlan.export.sinks[].worker` 同时保留 per-sink batch quota override 和 resolved effective quota。`run` 的后台 worker、`check` 的 plan 输出以及 `status`/admin exporter snapshot 都从该 plan 构造 sink execution config，而不是重新解释 raw exporter config。没有 planned exporter sink 或显式禁用 worker 时，`check` 会显示 worker disabled 的原因。
+- `[export.worker.schedule.failure_backoff]` 控制后台 worker 对单个 sink 失败后的内存态退避策略：`initial_ms` 默认 `30000`，`max_ms` 默认 `300000`，`multiplier` 默认 `2`；worker 开启时三个值必须大于 0，且 `max_ms >= initial_ms`。`multiplier = 1` 自然退化为固定退避，不需要保留第二套 fixed-only 配置字段。
+- 这些 schedule 字段共同定义当前 fixed bounded worker mode：worker 以固定 tick 执行有界 drain，但失败 sink 采用 per-sink exponential backoff，避免把 live worker 变成无界 tail flush 或被单个挂起/失败 sink 永久卡住；这仍不等同于未来的 retention deadline。
+- `RuntimePlan.export.worker` 是单个 typed worker plan：`disabled` 携带原因，`fixed_interval_bounded` 携带 interval、全局 batch budget、timeout 和 typed failure backoff。`RuntimePlan.export.sinks[].worker` 同时保留 per-sink batch quota override 和 resolved effective quota。`run` 的后台 worker、`check` 的 plan 输出以及 `status`/admin exporter snapshot 都从该 plan 构造 sink execution config，而不是重新解释 raw exporter config。没有 planned exporter sink 或显式禁用 worker 时，`check` 会显示 worker disabled 的原因。
 - `RuntimePlan.enforcement` 保留 `mode`、主配置 selector 是否配置、以及 `policy_source` 的 typed plan；目录 source 会在 plan 中解析为 `manifest.toml` 路径，remote source 保留 endpoint。runtime plan 阶段只做配置形状和 capability validation，不打开 manifest 文件、不发网络请求；`run` 在 plan 构建前只做 policy 与本地 enforcement manifest metadata preflight，避免无效本地策略触发 capture/spool side effect，同时保证 remote enforcement fetch 必须发生在完整 runtime plan validation 之后；`check`/`run` 在 composition root 加载 external enforcement manifest，remote source 通过一次 GET 拉取 TOML manifest 并复用同一套校验；offline `status` 只做 metadata-only source inspection，online admin status 报告运行中已加载的 manifest。
 - `run` 结束时仍会尽力执行一次尾部 drain，使 `--max-events` smoke、plaintext feed 和其它有限运行场景能够把最后一批事件同步推出；即使 pipeline 已返回错误，也会先停止 worker 并尝试 tail drain，再按错误优先级返回。
 
@@ -905,7 +906,7 @@ spool retention：
 多 exporter：
 
 - 每个可靠 sink 维护独立 cursor/ack。
-- 当前已实现 per-sink cursor、per-sink batch quota 和内存态 fixed backoff，避免某个慢或失败 sink 阻塞其它 sink；未来 retention deadline 和在线 backoff 状态进入 status 后，再把 failed/degraded 语义扩展到这些运行态。
+- 当前已实现 per-sink cursor、per-sink batch quota 和内存态 exponential backoff，避免某个慢或失败 sink 阻塞其它 sink；未来 retention deadline 和在线 backoff 状态进入 status 后，再把 failed/degraded 语义扩展到这些运行态。
 - 不让单个坏 sink 拖垮采集和其它 exporter。
 
 投递语义：
@@ -945,13 +946,13 @@ spool retention：
 - `acked_cursor` 如果存在，必须落在当前 batch 的 sequence 范围内。
 - 如果 ack 只返回 event ids，agent 只在这些 ids 构成当前 batch 的连续前缀时推进 cursor，避免跳过未确认事件。
 - `run` 使用 `config.exporters` 中的 exporter `id` 作为独立 sink cursor；exporter `id` 必须唯一，且不能使用保留的 `replay-webhook`。
-- `run` 默认在后台启动 planned exporter worker，按 `[export.worker.schedule].interval_ms` 周期对每个 planned sink 执行有界 drain；每轮默认最多发送 `[export.worker.schedule].batches_per_sink_per_tick` 个 batch，单个 exporter 可用 `[exporters.worker].batches_per_tick` 覆盖本 sink 的 quota，并对单个 sink 使用 `[export.worker.schedule].sink_timeout_ms` timeout。某个 sink 失败后，后台 worker 会按 `[export.worker.schedule].failure_backoff_ms` 对该 sink 做内存态 fixed backoff，期间不影响其它 sink；没有 planned exporter sink 或 `[export.worker].enabled = false` 时不启动 worker。
+- `run` 默认在后台启动 planned exporter worker，按 `[export.worker.schedule].interval_ms` 周期对每个 planned sink 执行有界 drain；每轮默认最多发送 `[export.worker.schedule].batches_per_sink_per_tick` 个 batch，单个 exporter 可用 `[exporters.worker].batches_per_tick` 覆盖本 sink 的 quota，并对单个 sink 使用 `[export.worker.schedule].sink_timeout_ms` timeout。某个 sink 失败后，后台 worker 会按 `[export.worker.schedule.failure_backoff]` 对该 sink 做内存态 exponential backoff，期间不影响其它 sink；没有 planned exporter sink 或 `[export.worker].enabled = false` 时不启动 worker。
 - `run` 在当前 pipeline run 结束后仍对每个 planned sink 尽力执行一次尾部 drain，直到该 sink 队列为空或 ack 无法推进 cursor；pipeline 错误不会跳过这次 tail drain。
 - 一次 drain 会尝试所有 planned sinks；某个 sink 失败不会阻止后续 sink，但本次命令最终会返回聚合失败，避免静默丢掉外发错误。
 - planned webhook exporter 只读取该 sink 通过 `exporters[].tls.*_refs` 引用的 TLS material，并且只在该 sink 有待发送 batch 时读取：`trust_anchor` PEM bundle 会 merge 到 reqwest/rustls roots；存在成对的 `client_certificate`/`client_private_key` refs 时会组合为 client identity。证书/key material source 检查、读取或 PEM 解析失败会让对应 exporter drain 失败，而不是降级为无 mTLS 静默发送；未被该 exporter 引用的 material 不会被读取，也不会影响该 sink。
 - `replay` CLI 保留独立的 `replay-webhook` sink，便于本地调试不污染配置 sink cursor。
 - webhook 自定义 headers 可配置，但 `content-type`、`x-sssa-codec` 和 `idempotency-key` 属于协议头，配置中禁止覆盖。
-- adaptive/exponential backoff 调度和 retention deadline 尚未实现；当前 worker 采用配置化固定间隔、全局/每 sink 每轮 batch budget、配置化 sink timeout 和内存态 fixed failure backoff 的 best-effort drain。tail drain 仍会尽力尝试所有 sink，不使用后台 worker 的 failure backoff。
+- retention deadline 尚未实现；当前 worker 采用配置化固定间隔、全局/每 sink 每轮 batch budget、配置化 sink timeout 和内存态 per-sink exponential failure backoff 的 best-effort drain。tail drain 仍会尽力尝试所有 sink，不使用后台 worker 的 failure backoff。
 
 状态码建议：
 
@@ -1201,7 +1202,7 @@ benchmark 参数：
 
 当前已验证的 non-privileged plaintext feed 路径：`PlaintextFeedProvider` 单元测试覆盖 event source/kind/confidence/degraded metadata 保真；agent JSON-lines provider 测试覆盖硬编码外部 feed schema、streaming provider、unknown field fail-closed、超长行 fail-closed、缺失 process 强制 0 confidence，以及 confidence 超过 100 的拒绝；pipeline 测试覆盖 external plaintext feed chunk 写入 ingress journal，并由 HTTP/1 parser 产出 `HttpRequestHeaders` export event，`source = external_plaintext_feed`。这只验证“已解密明文进入统一 pipeline”，不等同于 TLS uprobe 或 keylog 解密已完成。
 
-当前已验证的 exporter worker 路径：agent export 测试覆盖 planned exporter sinks 使用独立 sink cursor、某个 sink 失败不阻止其它 sink 尝试、webhook protocol headers 不被配置覆盖、后台 worker 能按配置化 fixed bounded worker mode 从 Fjall export queue drain 到 webhook receiver、在启动后继续处理新追加事件并推进对应 sink cursor、per-sink batch quota 会覆盖全局每轮预算，以及失败 sink 进入 fixed backoff 后不阻塞健康 sink 继续推进。该验证覆盖连续有界 drain、per-sink batch quota 与固定失败 backoff 的最小闭环，不覆盖未来 adaptive/exponential backoff 或 retention 调度。
+当前已验证的 exporter worker 路径：agent export 测试覆盖 planned exporter sinks 使用独立 sink cursor、某个 sink 失败不阻止其它 sink 尝试、webhook protocol headers 不被配置覆盖、后台 worker 能按配置化 fixed bounded worker mode 从 Fjall export queue drain 到 webhook receiver、在启动后继续处理新追加事件并推进对应 sink cursor、per-sink batch quota 会覆盖全局每轮预算，以及失败 sink backoff 不阻塞健康 sink 继续推进。backoff 单元测试覆盖 runtime plan 到 worker config wiring 后的 failure completion 计时、指数增长、max clamp 和 success reset。该验证覆盖连续有界 drain、per-sink batch quota、失败 sink 隔离与指数失败 backoff 的最小闭环，不覆盖未来 retention 调度。
 
 当前端到端验收：
 

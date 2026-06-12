@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use runtime::{ExportPlan, ExportSinkPlan, ExportWorkerPlan};
+use runtime::{ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportWorkerPlan};
 use storage::ExportSpool;
 use tokio::sync::Notify;
 
@@ -24,7 +24,7 @@ pub struct ExportWorkerConfig {
     sinks: Vec<ExportSinkPlan>,
     interval: Duration,
     sink_timeout: Duration,
-    failure_backoff: Duration,
+    failure_backoff: ExportWorkerBackoffPolicy,
 }
 
 impl ExportWorkerConfig {
@@ -33,7 +33,7 @@ impl ExportWorkerConfig {
         sinks: Vec<ExportSinkPlan>,
         interval: Duration,
         sink_timeout: Duration,
-        failure_backoff: Duration,
+        failure_backoff: ExportWorkerBackoffPolicy,
     ) -> Self {
         Self {
             agent_id,
@@ -50,14 +50,14 @@ impl ExportWorkerConfig {
             ExportWorkerPlan::FixedIntervalBounded {
                 interval_ms,
                 sink_timeout_ms,
-                failure_backoff_ms,
+                failure_backoff,
                 ..
             } => Some(Self::fixed_interval_bounded(
                 agent_id,
                 plan.sinks.clone(),
                 Duration::from_millis(*interval_ms),
                 Duration::from_millis(*sink_timeout_ms),
-                Duration::from_millis(*failure_backoff_ms),
+                ExportWorkerBackoffPolicy::from(*failure_backoff),
             )),
         }
     }
@@ -152,26 +152,27 @@ async fn drain_export_sinks_once(
 
 #[derive(Debug)]
 struct ExportWorkerBackoff {
-    failure_backoff: Duration,
-    retry_after: HashMap<String, Option<Instant>>,
+    policy: ExportWorkerBackoffPolicy,
+    sinks: HashMap<String, SinkBackoffState>,
 }
 
 impl ExportWorkerBackoff {
-    fn new(failure_backoff: Duration) -> Self {
+    fn new(policy: ExportWorkerBackoffPolicy) -> Self {
         Self {
-            failure_backoff,
-            retry_after: HashMap::new(),
+            policy,
+            sinks: HashMap::new(),
         }
     }
 
-    fn should_skip(&mut self, sink: &str, now: Instant) -> bool {
-        match self.retry_after.get(sink).copied() {
-            Some(None) => true,
-            Some(Some(retry_after)) if retry_after > now => true,
-            Some(Some(_)) => {
-                self.retry_after.remove(sink);
-                false
-            }
+    fn should_skip(&self, sink: &str, now: Instant) -> bool {
+        match self.sinks.get(sink) {
+            Some(SinkBackoffState {
+                retry_after: None, ..
+            }) => true,
+            Some(SinkBackoffState {
+                retry_after: Some(retry_after),
+                ..
+            }) => *retry_after > now,
             None => false,
         }
     }
@@ -181,15 +182,53 @@ impl ExportWorkerBackoff {
     }
 
     fn record_failure_at(&mut self, sink: &str, failed_at: Instant) {
-        self.retry_after.insert(
+        let delay = self.sinks.get(sink).map_or(self.policy.initial, |state| {
+            self.policy.next_delay(state.delay)
+        });
+        self.sinks.insert(
             sink.to_string(),
-            failed_at.checked_add(self.failure_backoff),
+            SinkBackoffState {
+                delay,
+                retry_after: failed_at.checked_add(delay),
+            },
         );
     }
 
     fn record_success(&mut self, sink: &str) {
-        self.retry_after.remove(sink);
+        self.sinks.remove(sink);
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExportWorkerBackoffPolicy {
+    initial: Duration,
+    max: Duration,
+    multiplier: u32,
+}
+
+impl ExportWorkerBackoffPolicy {
+    fn next_delay(self, current: Duration) -> Duration {
+        current
+            .checked_mul(self.multiplier)
+            .unwrap_or(self.max)
+            .min(self.max)
+    }
+}
+
+impl From<ExportFailureBackoffPlan> for ExportWorkerBackoffPolicy {
+    fn from(value: ExportFailureBackoffPlan) -> Self {
+        Self {
+            initial: Duration::from_millis(value.initial_ms),
+            max: Duration::from_millis(value.max_ms),
+            multiplier: value.multiplier,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SinkBackoffState {
+    delay: Duration,
+    retry_after: Option<Instant>,
 }
 
 #[cfg(test)]
@@ -206,12 +245,17 @@ mod tests {
         AgentConfig, CompressionCodecName, ExportWorkerScheduleConfig, ExporterConfig,
         ExporterTransport, TlsMaterialKind,
     };
-    use runtime::{ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportWorkerPlan};
+    use runtime::{
+        ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportWorkerPlan,
+    };
     use storage::{ExportSpool, FjallSpool};
 
     use super::*;
     use crate::export::drain::fixture::{
-        plan::{inherited_worker_quota, overridden_worker_quota, runtime_plan, tls_material},
+        plan::{
+            fixed_failure_backoff, inherited_worker_quota, overridden_worker_quota, runtime_plan,
+            tls_material,
+        },
         spool::{
             SingleEventBatchSpool, append_export_event, wait_for_export_cursor,
             wait_for_memory_export_cursor,
@@ -223,12 +267,42 @@ mod tests {
     fn export_worker_backoff_counts_from_failure_completion() {
         let tick_started_at = Instant::now();
         let failure_completed_at = tick_started_at + Duration::from_millis(750);
-        let mut backoff = ExportWorkerBackoff::new(Duration::from_millis(1_000));
+        let mut backoff = worker_backoff_from_plan(fixed_failure_backoff(1_000));
 
         backoff.record_failure_at("slow", failure_completed_at);
 
         assert!(backoff.should_skip("slow", failure_completed_at + Duration::from_millis(999)));
         assert!(!backoff.should_skip("slow", failure_completed_at + Duration::from_millis(1_000)));
+    }
+
+    #[test]
+    fn export_worker_backoff_grows_until_max_and_resets_after_success() {
+        let started_at = Instant::now();
+        let mut backoff = worker_backoff_from_plan(ExportFailureBackoffPlan {
+            initial_ms: 100,
+            max_ms: 250,
+            multiplier: 2,
+        });
+
+        backoff.record_failure_at("sink", started_at);
+        assert!(backoff.should_skip("sink", started_at + Duration::from_millis(99)));
+        assert!(!backoff.should_skip("sink", started_at + Duration::from_millis(100)));
+
+        let second_failure = started_at + Duration::from_millis(100);
+        backoff.record_failure_at("sink", second_failure);
+        assert!(backoff.should_skip("sink", second_failure + Duration::from_millis(199)));
+        assert!(!backoff.should_skip("sink", second_failure + Duration::from_millis(200)));
+
+        let third_failure = second_failure + Duration::from_millis(200);
+        backoff.record_failure_at("sink", third_failure);
+        assert!(backoff.should_skip("sink", third_failure + Duration::from_millis(249)));
+        assert!(!backoff.should_skip("sink", third_failure + Duration::from_millis(250)));
+
+        backoff.record_success("sink");
+        let reset_failure = third_failure + Duration::from_millis(250);
+        backoff.record_failure_at("sink", reset_failure);
+        assert!(backoff.should_skip("sink", reset_failure + Duration::from_millis(99)));
+        assert!(!backoff.should_skip("sink", reset_failure + Duration::from_millis(100)));
     }
 
     #[test]
@@ -263,7 +337,7 @@ mod tests {
                 interval_ms: 10,
                 batches_per_sink_per_tick: 1,
                 sink_timeout_ms: 5_000,
-                failure_backoff_ms: 30_000,
+                failure_backoff: fixed_failure_backoff(30_000),
             },
             sinks: vec![ExportSinkPlan {
                 id: "grpc".to_string(),
@@ -305,7 +379,11 @@ mod tests {
             interval_ms: 10,
             batches_per_sink_per_tick: 1,
             sink_timeout_ms: 5_000,
-            failure_backoff_ms: 30_000,
+            failure_backoff: probe_config::ExportFailureBackoffConfig {
+                initial_ms: 30_000,
+                max_ms: 30_000,
+                multiplier: 1,
+            },
         };
         config.validate_basic()?;
         let plan = runtime_plan(config)?;
@@ -347,7 +425,7 @@ mod tests {
                 interval_ms: 60_000,
                 batches_per_sink_per_tick: 2,
                 sink_timeout_ms: 5_000,
-                failure_backoff_ms: 30_000,
+                failure_backoff: fixed_failure_backoff(30_000),
             },
             sinks: vec![ExportSinkPlan {
                 id: "budget".to_string(),
@@ -388,7 +466,7 @@ mod tests {
                 interval_ms: 60_000,
                 batches_per_sink_per_tick: 2,
                 sink_timeout_ms: 5_000,
-                failure_backoff_ms: 30_000,
+                failure_backoff: fixed_failure_backoff(30_000),
             },
             sinks: vec![ExportSinkPlan {
                 id: "limited".to_string(),
@@ -428,7 +506,7 @@ mod tests {
                 interval_ms: 10,
                 batches_per_sink_per_tick: 1,
                 sink_timeout_ms: 5_000,
-                failure_backoff_ms: 60_000,
+                failure_backoff: fixed_failure_backoff(60_000),
             },
             sinks: vec![
                 ExportSinkPlan {
@@ -474,5 +552,28 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         std::env::temp_dir().join(format!("sssa-probe-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn worker_backoff_from_plan(failure_backoff: ExportFailureBackoffPlan) -> ExportWorkerBackoff {
+        let plan = ExportPlan {
+            worker: ExportWorkerPlan::FixedIntervalBounded {
+                interval_ms: 1_000,
+                batches_per_sink_per_tick: 1,
+                sink_timeout_ms: 5_000,
+                failure_backoff,
+            },
+            sinks: vec![ExportSinkPlan {
+                id: "sink".to_string(),
+                transport: ExporterTransport::Webhook,
+                endpoint: "https://collector.example/batches".to_string(),
+                codec: CompressionCodecName::None,
+                headers: BTreeMap::new(),
+                tls: ExportSinkTlsPlan::default(),
+                worker: inherited_worker_quota(1),
+            }],
+        };
+        let config = ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
+            .expect("fixed interval worker plan should produce worker config");
+        ExportWorkerBackoff::new(config.failure_backoff)
     }
 }
