@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod connect;
+
 use aya_ebpf::{
     EbpfContext,
     helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid},
@@ -9,6 +11,8 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use ebpf_abi::{EBPF_RING_BUFFER_BYTES, EbpfProcessProbeEvent};
+
+use connect::connect_observation_from_tracepoint;
 
 #[map(name = "SSSA_EVENTS")]
 static SSSA_EVENTS: RingBuf = RingBuf::with_byte_size(EBPF_RING_BUFFER_BYTES, 0);
@@ -20,6 +24,7 @@ pub fn sssa_sys_enter_connect(ctx: TracePointContext) -> u32 {
 }
 
 fn emit_connect_attempt(ctx: TracePointContext) {
+    let connect = connect_observation_from_tracepoint(&ctx);
     let pid_tgid = bpf_get_current_pid_tgid();
     let uid_gid = bpf_get_current_uid_gid();
     let command = ctx.command().unwrap_or_default();
@@ -29,6 +34,8 @@ fn emit_connect_attempt(ctx: TracePointContext) {
         uid_gid as u32,
         (uid_gid >> 32) as u32,
         command,
+        connect.observation,
+        connect.flags,
     );
 
     let Some(mut entry) = SSSA_EVENTS.reserve::<EbpfProcessProbeEvent>(0) else {

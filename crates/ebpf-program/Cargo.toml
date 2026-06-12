@@ -11,7 +11,7 @@ aya-ebpf = "0.1"
 ebpf-abi = { version = "0.1.0", path = "../ebpf-abi" }
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "allow"
 
 [lints.clippy]
 dbg_macro = "deny"

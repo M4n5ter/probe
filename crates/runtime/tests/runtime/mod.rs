@@ -82,6 +82,95 @@ fn auto_selection_uses_first_available_live_fallback() -> Result<(), Box<dyn std
 }
 
 #[test]
+fn auto_selection_skips_degraded_ebpf_and_uses_available_libpcap()
+-> Result<(), Box<dyn std::error::Error>> {
+    let registry = ProviderRegistry::new(
+        vec![
+            CaptureProviderDescriptor::degraded(
+                CaptureBackend::Ebpf,
+                CaptureProviderBuilder::Ebpf,
+                "eBPF observation provider does not capture payload",
+            )
+            .allow_explicit_degraded(),
+            capture_provider(
+                CaptureBackend::Libpcap,
+                CaptureProviderBuilder::Libpcap,
+                RuntimeMode::Available,
+            ),
+        ],
+        test_platform_capabilities(),
+    );
+
+    let plan = RuntimePlan::build(AgentConfig::default(), &registry)?;
+
+    assert_eq!(plan.capture.mode, CapturePlanMode::Live);
+    assert_eq!(plan.capture.selected_backend, Some(CaptureBackend::Libpcap));
+    assert_eq!(
+        registry.capability_matrix().mode(CapabilityKind::Ebpf),
+        RuntimeMode::Degraded
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_degraded_provider_with_selection_policy_is_selectable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let registry = ProviderRegistry::new(
+        vec![
+            CaptureProviderDescriptor::degraded(
+                CaptureBackend::Ebpf,
+                CaptureProviderBuilder::Ebpf,
+                "eBPF observation provider does not capture payload",
+            )
+            .allow_explicit_degraded(),
+        ],
+        test_platform_capabilities(),
+    );
+    let mut config = AgentConfig::default();
+    config.capture.selection = CaptureSelection::Ebpf;
+
+    let plan = RuntimePlan::build(config, &registry)?;
+
+    assert_eq!(plan.capture.mode, CapturePlanMode::Live);
+    assert_eq!(plan.capture.selected_backend, Some(CaptureBackend::Ebpf));
+    assert_eq!(
+        plan.capture
+            .selected_provider
+            .as_ref()
+            .map(|provider| provider.mode),
+        Some(RuntimeMode::Degraded)
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_degraded_provider_without_selection_policy_is_rejected() {
+    let registry = ProviderRegistry::new(
+        vec![CaptureProviderDescriptor::degraded(
+            CaptureBackend::Libpcap,
+            CaptureProviderBuilder::Libpcap,
+            "libpcap provider cannot open the configured device",
+        )],
+        test_platform_capabilities(),
+    );
+    let mut config = AgentConfig::default();
+    config.capture.selection = CaptureSelection::Libpcap;
+
+    let error = RuntimePlan::build(config, &registry)
+        .expect_err("degraded provider without explicit policy must not be selectable");
+    let RuntimeError::Validation(error) = error else {
+        panic!("expected runtime validation error");
+    };
+    let violation = error.violations().first().expect("expected one violation");
+
+    assert_eq!(violation.field, "capture.selection");
+    assert_eq!(
+        violation.reason,
+        "libpcap provider cannot open the configured device"
+    );
+}
+
+#[test]
 fn export_plan_disables_worker_without_sinks() -> Result<(), Box<dyn std::error::Error>> {
     let registry = ProviderRegistry::new(vec![], test_platform_capabilities());
 
@@ -485,7 +574,7 @@ fn dry_run_enforcement_fails_closed_without_capability() {
 }
 
 #[test]
-fn websocket_handoff_is_a_supported_runtime_capability() -> Result<(), Box<dyn std::error::Error>> {
+fn websocket_parser_capabilities_are_supported() -> Result<(), Box<dyn std::error::Error>> {
     let registry = ProviderRegistry::with_default_platform(vec![capture_provider(
         CaptureBackend::Replay,
         CaptureProviderBuilder::Replay,
@@ -498,6 +587,10 @@ fn websocket_handoff_is_a_supported_runtime_capability() -> Result<(), Box<dyn s
 
     assert_eq!(
         plan.capabilities.mode(CapabilityKind::WebSocketHandoff),
+        RuntimeMode::Available
+    );
+    assert_eq!(
+        plan.capabilities.mode(CapabilityKind::WebSocketFrame),
         RuntimeMode::Available
     );
     Ok(())
@@ -742,6 +835,7 @@ fn test_platform_capabilities() -> Vec<CapabilityState> {
         CapabilityState::available(CapabilityKind::Http1),
         CapabilityState::available(CapabilityKind::Sse),
         CapabilityState::available(CapabilityKind::WebSocketHandoff),
+        CapabilityState::available(CapabilityKind::WebSocketFrame),
         CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
         CapabilityState::available(CapabilityKind::DryRunEnforcement),
     ]

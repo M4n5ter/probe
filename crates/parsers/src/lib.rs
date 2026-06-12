@@ -1,10 +1,12 @@
 mod http1;
+mod websocket;
 
 use std::collections::HashMap;
 
 use probe_core::{Direction, EventKind, FlowIdentity, Gap};
 
 pub use http1::{Http1Parser, ParserError};
+pub use websocket::WebSocketFrameParser;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ParserInput<'a> {

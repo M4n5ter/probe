@@ -5,10 +5,17 @@ use capture::{
 };
 use ebpf_object::{EbpfObjectProbe, EbpfObjectProbeConfig, EbpfObjectProbeReport};
 use probe_config::{AgentConfig, CaptureBackend};
+use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
 use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
 
 pub fn default_provider_registry(config: &AgentConfig) -> ProviderRegistry {
-    ProviderRegistry::with_default_platform(default_capture_provider_descriptors(config))
+    let procfs_socket_capabilities = attribution::ProcfsSocketResolver::new().capabilities();
+    let procfs_socket_attribution =
+        procfs_socket_attribution_capability(&procfs_socket_capabilities);
+    ProviderRegistry::with_default_platform_and_procfs_socket(
+        default_capture_provider_descriptors(config, procfs_socket_attribution),
+        procfs_socket_capabilities,
+    )
 }
 
 pub fn libpcap_config_from_agent(config: &AgentConfig) -> LibpcapConfig {
@@ -23,7 +30,10 @@ pub fn libpcap_config_from_agent(config: &AgentConfig) -> LibpcapConfig {
     }
 }
 
-fn default_capture_provider_descriptors(config: &AgentConfig) -> Vec<CaptureProviderDescriptor> {
+fn default_capture_provider_descriptors(
+    config: &AgentConfig,
+    procfs_socket_attribution: CapabilityState,
+) -> Vec<CaptureProviderDescriptor> {
     vec![
         CaptureProviderDescriptor::available(
             CaptureBackend::Replay,
@@ -32,6 +42,7 @@ fn default_capture_provider_descriptors(config: &AgentConfig) -> Vec<CaptureProv
         ebpf_provider_descriptor(
             EbpfHostProbe::probe(&EbpfHostProbeConfig::default()),
             config.capture.ebpf.object_path.as_ref(),
+            procfs_socket_attribution,
         ),
         CaptureProviderDescriptor::available(
             CaptureBackend::PlaintextFeed,
@@ -44,6 +55,7 @@ fn default_capture_provider_descriptors(config: &AgentConfig) -> Vec<CaptureProv
 fn ebpf_provider_descriptor(
     host: EbpfHostProbeReport,
     object_path: Option<&PathBuf>,
+    procfs_socket_attribution: CapabilityState,
 ) -> CaptureProviderDescriptor {
     if !host.kernel_prerequisites_available() {
         return CaptureProviderDescriptor::unavailable(
@@ -65,11 +77,12 @@ fn ebpf_provider_descriptor(
     };
 
     let object = EbpfObjectProbe::probe(&EbpfObjectProbeConfig::new(object_path.clone()));
-    ebpf_provider_descriptor_from_object_report(object)
+    ebpf_provider_descriptor_from_object_report(object, procfs_socket_attribution)
 }
 
 fn ebpf_provider_descriptor_from_object_report(
     object: EbpfObjectProbeReport,
+    procfs_socket_attribution: CapabilityState,
 ) -> CaptureProviderDescriptor {
     if !object.object_available() {
         return CaptureProviderDescriptor::unavailable(
@@ -91,15 +104,42 @@ fn ebpf_provider_descriptor_from_object_report(
             ),
         );
     }
+    if procfs_socket_attribution.mode == RuntimeMode::Unavailable {
+        return CaptureProviderDescriptor::unavailable(
+            CaptureBackend::Ebpf,
+            CaptureProviderBuilder::Ebpf,
+            format!(
+                "eBPF connect observation provider requires procfs_socket_attribution, but {}",
+                procfs_socket_attribution
+                    .reason
+                    .as_deref()
+                    .unwrap_or("procfs socket attribution is unavailable")
+            ),
+        );
+    }
 
-    CaptureProviderDescriptor::unavailable(
+    CaptureProviderDescriptor::degraded(
         CaptureBackend::Ebpf,
-        CaptureProviderBuilder::Unimplemented,
+        CaptureProviderBuilder::Ebpf,
         format!(
-            "eBPF object preflight via aya-obj succeeded ({}) but eBPF provider wiring, typed event conversion, and complete kernel capture program are not implemented",
-            object.summary()
+            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the connect observation provider can stream connection lifecycle events, but payload/lost-event conversion and complete kernel traffic capture are not implemented",
+            object.summary(),
         ),
     )
+    .allow_explicit_degraded()
+}
+
+fn procfs_socket_attribution_capability(capabilities: &[CapabilityState]) -> CapabilityState {
+    capabilities
+        .iter()
+        .find(|state| state.kind == CapabilityKind::ProcfsSocketAttribution)
+        .cloned()
+        .unwrap_or_else(|| {
+            CapabilityState::unavailable(
+                CapabilityKind::ProcfsSocketAttribution,
+                "procfs socket attribution probe returned no capability state",
+            )
+        })
 }
 
 fn libpcap_provider_descriptor(config: &LibpcapConfig) -> CaptureProviderDescriptor {
@@ -128,7 +168,7 @@ mod tests {
         EbpfObjectContractCheck, EbpfObjectContractReport, EbpfObjectMap, EbpfObjectProbeReport,
         EbpfObjectProgram, EbpfProbeCheck,
     };
-    use probe_core::RuntimeMode;
+    use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
 
     use super::*;
 
@@ -144,6 +184,7 @@ mod tests {
                 unprivileged_bpf: UnprivilegedBpfStatus::Disabled,
             },
             None,
+            procfs_socket_attribution_capability_for_test(RuntimeMode::Degraded),
         );
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
@@ -168,6 +209,7 @@ mod tests {
                 unprivileged_bpf: UnprivilegedBpfStatus::Disabled,
             },
             None,
+            procfs_socket_attribution_capability_for_test(RuntimeMode::Degraded),
         );
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
@@ -195,6 +237,7 @@ mod tests {
                 unprivileged_bpf: UnprivilegedBpfStatus::Disabled,
             },
             Some(&object),
+            procfs_socket_attribution_capability_for_test(RuntimeMode::Degraded),
         );
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
@@ -211,20 +254,23 @@ mod tests {
 
     #[test]
     fn ebpf_provider_descriptor_reports_contract_preflight_failure() {
-        let descriptor = ebpf_provider_descriptor_from_object_report(EbpfObjectProbeReport {
-            object_path: PathBuf::from("/tmp/sssa-invalid-contract.bpf.o"),
-            object: EbpfProbeCheck::Available,
-            contract: EbpfObjectContractReport {
-                status: EbpfProbeCheck::Available,
-                maps: vec![EbpfObjectContractCheck {
-                    name: "SSSA_EVENTS".to_string(),
-                    check: EbpfProbeCheck::unavailable("missing eBPF map SSSA_EVENTS"),
-                }],
-                programs: Vec::new(),
+        let descriptor = ebpf_provider_descriptor_from_object_report(
+            EbpfObjectProbeReport {
+                object_path: PathBuf::from("/tmp/sssa-invalid-contract.bpf.o"),
+                object: EbpfProbeCheck::Available,
+                contract: EbpfObjectContractReport {
+                    status: EbpfProbeCheck::Available,
+                    maps: vec![EbpfObjectContractCheck {
+                        name: "SSSA_EVENTS".to_string(),
+                        check: EbpfProbeCheck::unavailable("missing eBPF map SSSA_EVENTS"),
+                    }],
+                    programs: Vec::new(),
+                },
+                programs: Vec::<EbpfObjectProgram>::new(),
+                maps: Vec::<EbpfObjectMap>::new(),
             },
-            programs: Vec::<EbpfObjectProgram>::new(),
-            maps: Vec::<EbpfObjectMap>::new(),
-        });
+            procfs_socket_attribution_capability_for_test(RuntimeMode::Degraded),
+        );
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
         assert_eq!(descriptor.builder, CaptureProviderBuilder::Unimplemented);
@@ -234,6 +280,90 @@ mod tests {
             .expect("eBPF descriptor should explain why contract preflight failed");
         assert!(reason.contains("eBPF object contract preflight via aya-obj failed"));
         assert!(reason.contains("missing eBPF map SSSA_EVENTS"));
+    }
+
+    #[test]
+    fn ebpf_provider_descriptor_exposes_degraded_observation_provider_after_object_preflight() {
+        let descriptor = ebpf_provider_descriptor_from_object_report(
+            EbpfObjectProbeReport {
+                object_path: PathBuf::from("/tmp/sssa-valid-contract.bpf.o"),
+                object: EbpfProbeCheck::Available,
+                contract: EbpfObjectContractReport {
+                    status: EbpfProbeCheck::Available,
+                    maps: vec![EbpfObjectContractCheck {
+                        name: "SSSA_EVENTS".to_string(),
+                        check: EbpfProbeCheck::Available,
+                    }],
+                    programs: vec![EbpfObjectContractCheck {
+                        name: "sssa_sys_enter_connect".to_string(),
+                        check: EbpfProbeCheck::Available,
+                    }],
+                },
+                programs: Vec::<EbpfObjectProgram>::new(),
+                maps: Vec::<EbpfObjectMap>::new(),
+            },
+            procfs_socket_attribution_capability_for_test(RuntimeMode::Degraded),
+        );
+
+        assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
+        assert_eq!(descriptor.builder, CaptureProviderBuilder::Ebpf);
+        assert_eq!(descriptor.mode, RuntimeMode::Degraded);
+        let reason = descriptor
+            .reason
+            .expect("eBPF descriptor should explain why capture provider is degraded");
+        assert!(reason.contains("complete kernel traffic capture"));
+        assert!(reason.contains("payload/lost-event conversion"));
+        assert!(reason.contains("connect observation provider"));
+        assert!(reason.contains("procfs socket attribution is usable"));
+    }
+
+    #[test]
+    fn ebpf_provider_descriptor_requires_procfs_socket_attribution_after_object_preflight() {
+        let descriptor = ebpf_provider_descriptor_from_object_report(
+            EbpfObjectProbeReport {
+                object_path: PathBuf::from("/tmp/sssa-valid-contract.bpf.o"),
+                object: EbpfProbeCheck::Available,
+                contract: EbpfObjectContractReport {
+                    status: EbpfProbeCheck::Available,
+                    maps: vec![EbpfObjectContractCheck {
+                        name: "SSSA_EVENTS".to_string(),
+                        check: EbpfProbeCheck::Available,
+                    }],
+                    programs: vec![EbpfObjectContractCheck {
+                        name: "sssa_sys_enter_connect".to_string(),
+                        check: EbpfProbeCheck::Available,
+                    }],
+                },
+                programs: Vec::<EbpfObjectProgram>::new(),
+                maps: Vec::<EbpfObjectMap>::new(),
+            },
+            procfs_socket_attribution_capability_for_test(RuntimeMode::Unavailable),
+        );
+
+        assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
+        assert_eq!(descriptor.builder, CaptureProviderBuilder::Ebpf);
+        assert_eq!(descriptor.mode, RuntimeMode::Unavailable);
+        let reason = descriptor
+            .reason
+            .expect("eBPF descriptor should explain missing procfs socket attribution");
+        assert!(reason.contains("requires procfs_socket_attribution"));
+        assert!(reason.contains("unavailable"));
+    }
+
+    fn procfs_socket_attribution_capability_for_test(mode: RuntimeMode) -> CapabilityState {
+        match mode {
+            RuntimeMode::Available => {
+                CapabilityState::available(CapabilityKind::ProcfsSocketAttribution)
+            }
+            RuntimeMode::Degraded => CapabilityState::degraded(
+                CapabilityKind::ProcfsSocketAttribution,
+                "procfs socket attribution is degraded but usable",
+            ),
+            RuntimeMode::Unavailable => CapabilityState::unavailable(
+                CapabilityKind::ProcfsSocketAttribution,
+                "procfs socket attribution is unavailable",
+            ),
+        }
     }
 
     fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {

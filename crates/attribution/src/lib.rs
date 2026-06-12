@@ -101,9 +101,26 @@ pub struct SocketProcessContext {
     pub socket_inode: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketFdConnectionContext {
+    pub process: ProcessContext,
+    pub confidence: u8,
+    pub socket_inode: u64,
+    pub connection: TcpConnection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketFdLookup {
+    pub tgid: u32,
+    pub thread_pid: u32,
+    pub fd: i32,
+    pub expected_remote_endpoint: Option<TcpEndpoint>,
+}
+
 #[derive(Debug, Clone)]
 struct ProcfsSocketSnapshot {
     tcp_inodes: HashMap<TcpConnection, u64>,
+    connections_by_inode: HashMap<u64, Vec<TcpConnection>>,
     inode_pids: HashMap<u64, u32>,
     optional_table_errors: HashMap<ProcfsTcpTableFamily, AttributionError>,
 }
@@ -178,17 +195,34 @@ impl ProcfsSocketResolver {
         &mut self,
         connection: TcpConnection,
     ) -> Result<Option<SocketProcessContext>, AttributionError> {
+        self.refresh_snapshot_if_needed()?;
+        let Some(snapshot) = self.snapshot.as_ref().map(|cached| &cached.snapshot) else {
+            return Ok(None);
+        };
+        self.attributor
+            .identify_tcp_connection_in_snapshot(connection, snapshot)
+    }
+
+    pub fn resolve_tcp_fd(
+        &mut self,
+        lookup: SocketFdLookup,
+    ) -> Result<Option<SocketFdConnectionContext>, AttributionError> {
+        self.refresh_snapshot_if_needed()?;
+        let Some(snapshot) = self.snapshot.as_ref().map(|cached| &cached.snapshot) else {
+            return Ok(None);
+        };
+        self.attributor
+            .identify_tcp_fd_in_snapshot(lookup, snapshot)
+    }
+
+    fn refresh_snapshot_if_needed(&mut self) -> Result<(), AttributionError> {
         if self.snapshot_needs_refresh() {
             self.snapshot = Some(CachedProcfsSocketSnapshot {
                 loaded_at: Instant::now(),
                 snapshot: self.attributor.snapshot()?,
             });
         }
-        let Some(snapshot) = self.snapshot.as_ref().map(|cached| &cached.snapshot) else {
-            return Ok(None);
-        };
-        self.attributor
-            .identify_tcp_connection_in_snapshot(connection, snapshot)
+        Ok(())
     }
 
     fn snapshot_needs_refresh(&self) -> bool {
@@ -262,6 +296,48 @@ impl ProcfsSocketAttributor {
         }))
     }
 
+    fn identify_tcp_fd_in_snapshot(
+        &self,
+        lookup: SocketFdLookup,
+        snapshot: &ProcfsSocketSnapshot,
+    ) -> Result<Option<SocketFdConnectionContext>, AttributionError> {
+        let Some(inode) =
+            read_socket_inode_for_lookup_fd(&self.process_attributor.proc_root, lookup)?
+        else {
+            if let Some(error) = optional_error_for_expected_remote(snapshot, lookup) {
+                return Err(error);
+            }
+            return Ok(None);
+        };
+        let Some(connection) =
+            tcp_connection_for_inode(snapshot, inode, lookup.expected_remote_endpoint)
+        else {
+            if let Some(error) = optional_error_for_expected_remote(snapshot, lookup) {
+                return Err(error);
+            }
+            return Ok(None);
+        };
+        let process = match self.process_attributor.identify(lookup.tgid) {
+            Ok(process) => process,
+            Err(error)
+                if is_disappearing_process_error(
+                    &error,
+                    &self.process_attributor.proc_root,
+                    lookup.tgid,
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Some(SocketFdConnectionContext {
+            process,
+            confidence: PROCFS_SOCKET_CONFIDENCE,
+            socket_inode: inode,
+            connection,
+        }))
+    }
+
     pub fn capabilities(&self) -> Vec<CapabilityState> {
         match self.probe() {
             Ok(()) => vec![CapabilityState::degraded(
@@ -314,6 +390,7 @@ impl ProcfsSocketAttributor {
             }
         }
         Ok(ProcfsSocketSnapshot {
+            connections_by_inode: connections_by_inode(&tcp_inodes),
             tcp_inodes,
             inode_pids: inode_pid_map(&self.process_attributor.proc_root)?,
             optional_table_errors,
@@ -579,6 +656,16 @@ fn tcp_inode_map_from_table(
     Ok(inodes)
 }
 
+fn connections_by_inode(
+    tcp_inodes: &HashMap<TcpConnection, u64>,
+) -> HashMap<u64, Vec<TcpConnection>> {
+    let mut connections = HashMap::<u64, Vec<TcpConnection>>::new();
+    for (connection, inode) in tcp_inodes {
+        connections.entry(*inode).or_default().push(*connection);
+    }
+    connections
+}
+
 fn parse_tcp_endpoint(
     table: &ProcfsTcpTable,
     value: &str,
@@ -717,6 +804,74 @@ fn read_pid_socket_inodes(
         inodes.entry(inode).or_insert(pid);
     }
     Ok(())
+}
+
+fn read_socket_inode_for_pid_fd(
+    proc_root: &Path,
+    pid: u32,
+    fd: i32,
+) -> Result<Option<u64>, AttributionError> {
+    if fd < 0 {
+        return Ok(None);
+    }
+    let link_path = proc_root
+        .join(pid.to_string())
+        .join("fd")
+        .join(fd.to_string());
+    let target = match fs::read_link(&link_path) {
+        Ok(target) => target,
+        Err(source) if is_skippable_socket_scan_error(&source) => return Ok(None),
+        Err(source) => {
+            return Err(AttributionError::ReadLink {
+                path: link_path.display().to_string(),
+                source,
+            });
+        }
+    };
+    Ok(socket_inode_from_link(&target))
+}
+
+fn read_socket_inode_for_lookup_fd(
+    proc_root: &Path,
+    lookup: SocketFdLookup,
+) -> Result<Option<u64>, AttributionError> {
+    let thread_inode = read_socket_inode_for_pid_fd(proc_root, lookup.thread_pid, lookup.fd)?;
+    if thread_inode.is_some() || lookup.thread_pid == lookup.tgid {
+        return Ok(thread_inode);
+    }
+    read_socket_inode_for_pid_fd(proc_root, lookup.tgid, lookup.fd)
+}
+
+fn tcp_connection_for_inode(
+    snapshot: &ProcfsSocketSnapshot,
+    inode: u64,
+    expected_remote_endpoint: Option<TcpEndpoint>,
+) -> Option<TcpConnection> {
+    snapshot
+        .connections_by_inode
+        .get(&inode)?
+        .iter()
+        .copied()
+        .find(|connection| {
+            expected_remote_endpoint
+                .map(|remote| connection.remote == remote)
+                .unwrap_or(true)
+        })
+}
+
+fn optional_error_for_expected_remote(
+    snapshot: &ProcfsSocketSnapshot,
+    lookup: SocketFdLookup,
+) -> Option<AttributionError> {
+    let remote = lookup.expected_remote_endpoint?;
+    endpoint_uses_family(remote, ProcfsTcpTableFamily::Ipv6)
+        .then(|| {
+            snapshot
+                .optional_table_errors
+                .get(&ProcfsTcpTableFamily::Ipv6)
+                .cloned()
+        })
+        .flatten()
 }
 
 fn is_skippable_socket_scan_error(source: &io::Error) -> bool {

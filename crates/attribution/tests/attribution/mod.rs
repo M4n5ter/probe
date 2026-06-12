@@ -128,12 +128,39 @@ impl ProcfsSocketFixture {
     fn write_status(&self, status: &str) -> io::Result<()> {
         fs::write(self.pid_dir.join("status"), status)
     }
+
+    fn move_socket_fd_to_thread(
+        &self,
+        thread_pid: u32,
+        fd: i32,
+        socket_inode: u64,
+    ) -> io::Result<()> {
+        let tgid_fd = self.pid_dir.join("fd").join(fd.to_string());
+        if tgid_fd.exists() {
+            fs::remove_file(tgid_fd)?;
+        }
+        let thread_fd_dir = self.proc_root.join(thread_pid.to_string()).join("fd");
+        fs::create_dir_all(&thread_fd_dir)?;
+        symlink(
+            format!("socket:[{socket_inode}]"),
+            thread_fd_dir.join(fd.to_string()),
+        )
+    }
 }
 
 fn tcp_table_entry(endpoints: &str, inode: u64) -> String {
     format!(
         "   0: {endpoints} 01 00000000:00000000 00:00000000 00000000 1000 0 {inode} 1 0000000000000000 100 0 0 10 0\n"
     )
+}
+
+fn fd_lookup(expected_remote_endpoint: Option<TcpEndpoint>) -> SocketFdLookup {
+    SocketFdLookup {
+        tgid: 321,
+        thread_pid: 321,
+        fd: 7,
+        expected_remote_endpoint,
+    }
 }
 
 #[test]
@@ -199,6 +226,151 @@ fn procfs_socket_attributor_maps_ipv4_mapped_tcp6_connection_to_ipv4_process()
 
     assert_eq!(process.process.identity.pid, 321);
     assert_eq!(process.socket_inode, 424244);
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_maps_pid_fd_to_tcp_connection() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = ProcfsSocketFixture::new(424245)?;
+    fixture.write_tcp(&tcp_table_entry(TCP4_LOCALHOST_TO_PEER, 424245))?;
+    let expected_remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000);
+
+    let mut resolver = fixture.resolver();
+    let process = resolver
+        .resolve_tcp_fd(fd_lookup(Some(expected_remote)))?
+        .expect("expected fd socket process");
+
+    assert_eq!(process.process.identity.pid, 321);
+    assert_eq!(process.process.name, "server");
+    assert_eq!(process.socket_inode, 424245);
+    assert_eq!(process.confidence, 60);
+    assert_eq!(
+        process.connection,
+        TcpConnection::new(
+            TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8080),
+            expected_remote,
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_reads_fd_from_thread_pid_and_attributes_tgid()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ProcfsSocketFixture::new(424248)?;
+    fixture.move_socket_fd_to_thread(654, 7, 424248)?;
+    fixture.write_tcp(&tcp_table_entry(TCP4_LOCALHOST_TO_PEER, 424248))?;
+    let expected_remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000);
+
+    let mut resolver = fixture.resolver();
+    let process = resolver
+        .resolve_tcp_fd(SocketFdLookup {
+            tgid: 321,
+            thread_pid: 654,
+            fd: 7,
+            expected_remote_endpoint: Some(expected_remote),
+        })?
+        .expect("expected fd socket process from thread pid");
+
+    assert_eq!(process.process.identity.pid, 321);
+    assert_eq!(process.process.identity.tgid, 321);
+    assert_eq!(process.socket_inode, 424248);
+    assert_eq!(
+        process.connection,
+        TcpConnection::new(
+            TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8080),
+            expected_remote,
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_falls_back_to_tgid_fd_when_thread_fd_disappears()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ProcfsSocketFixture::new(424250)?;
+    fixture.write_tcp(&tcp_table_entry(TCP4_LOCALHOST_TO_PEER, 424250))?;
+    let expected_remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000);
+
+    let mut resolver = fixture.resolver();
+    let process = resolver
+        .resolve_tcp_fd(SocketFdLookup {
+            tgid: 321,
+            thread_pid: 654,
+            fd: 7,
+            expected_remote_endpoint: Some(expected_remote),
+        })?
+        .expect("expected fd socket process from tgid fallback");
+
+    assert_eq!(process.process.identity.pid, 321);
+    assert_eq!(process.socket_inode, 424250);
+    assert_eq!(
+        process.connection,
+        TcpConnection::new(
+            TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8080),
+            expected_remote,
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_matches_ipv4_expected_remote_against_mapped_tcp6_fd()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ProcfsSocketFixture::new(424249)?;
+    fixture.write_tcp("")?;
+    fixture.write_tcp6(&tcp_table_entry(TCP6_MAPPED_LOCALHOST_TO_PEER, 424249))?;
+    let expected_remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000);
+
+    let mut resolver = fixture.resolver();
+    let process = resolver
+        .resolve_tcp_fd(fd_lookup(Some(expected_remote)))?
+        .expect("expected mapped tcp6 fd socket process");
+
+    assert_eq!(process.process.identity.pid, 321);
+    assert_eq!(process.socket_inode, 424249);
+    assert_eq!(
+        process.connection,
+        TcpConnection::new(
+            TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8080),
+            expected_remote,
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_filters_pid_fd_by_expected_remote()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ProcfsSocketFixture::new(424246)?;
+    fixture.write_tcp(&tcp_table_entry(TCP4_LOCALHOST_TO_PEER, 424246))?;
+
+    let mut resolver = fixture.resolver();
+    let process = resolver.resolve_tcp_fd(fd_lookup(Some(TcpEndpoint::new(
+        Ipv4Addr::new(127, 0, 0, 3).into(),
+        50_000,
+    ))))?;
+
+    assert!(process.is_none());
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_reports_missing_tcp6_for_ipv6_fd_lookup()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ProcfsSocketFixture::new(424247)?;
+    fixture.write_tcp("")?;
+
+    let mut resolver = fixture.resolver();
+    let error = resolver
+        .resolve_tcp_fd(fd_lookup(Some(TcpEndpoint::new(
+            Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 2).into(),
+            50_000,
+        ))))
+        .expect_err("missing tcp6 should be visible for IPv6 fd lookup");
+
+    assert!(matches!(error, AttributionError::Read { path, .. } if path.ends_with("net/tcp6")));
     Ok(())
 }
 

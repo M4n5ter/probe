@@ -23,6 +23,7 @@ pub const POLICY_HOOKS: &[PolicyHook] = &[
     PolicyHook::HttpBodyChunk,
     PolicyHook::SseEvent,
     PolicyHook::WebSocketHandoff,
+    PolicyHook::WebSocketFrame,
     PolicyHook::OpaqueStream,
     PolicyHook::Gap,
     PolicyHook::ProtocolError,
@@ -37,6 +38,7 @@ pub enum PolicyHook {
     HttpBodyChunk,
     SseEvent,
     WebSocketHandoff,
+    WebSocketFrame,
     OpaqueStream,
     Gap,
     ProtocolError,
@@ -52,6 +54,7 @@ impl PolicyHook {
             Self::HttpBodyChunk => "on_http_body_chunk",
             Self::SseEvent => "on_sse_event",
             Self::WebSocketHandoff => "on_websocket_handoff",
+            Self::WebSocketFrame => "on_websocket_frame",
             Self::OpaqueStream => "on_opaque_stream",
             Self::Gap => "on_gap",
             Self::ProtocolError => "on_protocol_error",
@@ -67,6 +70,7 @@ impl PolicyHook {
             EventType::HttpBodyChunk => Some(Self::HttpBodyChunk),
             EventType::SseEvent => Some(Self::SseEvent),
             EventType::WebSocketHandoff => Some(Self::WebSocketHandoff),
+            EventType::WebSocketFrame => Some(Self::WebSocketFrame),
             EventType::OpaqueStream => Some(Self::OpaqueStream),
             EventType::Gap => Some(Self::Gap),
             EventType::ProtocolError => Some(Self::ProtocolError),
@@ -362,7 +366,7 @@ mod tests {
     use probe_core::{
         AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, EventType, FlowContext,
         FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
-        WebSocketHandoff,
+        WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
     };
 
     use crate::{
@@ -461,6 +465,32 @@ mod tests {
 
         assert!(
             matches!(outcomes.first(), Some(PolicyOutcome::Verdict(verdict)) if verdict.reason == "websocket_handoff /chat chat")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lua_policy_can_handle_websocket_frame() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "websocket-frame".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::WebSocketFrame],
+            },
+            r#"
+            function on_websocket_frame(event)
+              return probe.emit_alert(
+                event.kind.type .. " " .. event.kind.opcode.kind .. " " .. tostring(event.kind.payload_len)
+              )
+            end
+            "#,
+        )?;
+
+        let event = websocket_frame_event();
+        let outcomes = runtime.handle_event(primary_hook_for_event(&event), &event)?;
+
+        assert!(
+            matches!(outcomes.first(), Some(PolicyOutcome::Alert(alert)) if alert.message == "websocket_frame text 5")
         );
         Ok(())
     }
@@ -625,17 +655,26 @@ mod tests {
         let manifest = PolicyManifest {
             id: "demo".to_string(),
             version: "1.0.0".to_string(),
-            hooks: vec![PolicyHook::HttpRequestHeaders, PolicyHook::WebSocketHandoff],
+            hooks: vec![
+                PolicyHook::HttpRequestHeaders,
+                PolicyHook::WebSocketHandoff,
+                PolicyHook::WebSocketFrame,
+            ],
         };
 
         let value = serde_json::to_value(&manifest)?;
         assert_eq!(value["hooks"][0], "on_http_request_headers");
         assert_eq!(value["hooks"][1], "on_websocket_handoff");
+        assert_eq!(value["hooks"][2], "on_websocket_frame");
 
         let parsed = serde_json::from_value::<PolicyManifest>(value)?;
         assert_eq!(
             parsed.hooks,
-            vec![PolicyHook::HttpRequestHeaders, PolicyHook::WebSocketHandoff]
+            vec![
+                PolicyHook::HttpRequestHeaders,
+                PolicyHook::WebSocketHandoff,
+                PolicyHook::WebSocketFrame,
+            ]
         );
         Ok(())
     }
@@ -652,7 +691,7 @@ mod tests {
         hook_for_event(event).expect("demo event should have a primary policy hook")
     }
 
-    fn policy_hook_mapping_cases() -> [(EventType, PolicyHook); 10] {
+    fn policy_hook_mapping_cases() -> [(EventType, PolicyHook); 11] {
         [
             (EventType::ConnectionOpened, PolicyHook::ConnectionOpened),
             (EventType::ConnectionClosed, PolicyHook::ConnectionClosed),
@@ -667,6 +706,7 @@ mod tests {
             (EventType::HttpBodyChunk, PolicyHook::HttpBodyChunk),
             (EventType::SseEvent, PolicyHook::SseEvent),
             (EventType::WebSocketHandoff, PolicyHook::WebSocketHandoff),
+            (EventType::WebSocketFrame, PolicyHook::WebSocketFrame),
             (EventType::OpaqueStream, PolicyHook::OpaqueStream),
             (EventType::Gap, PolicyHook::Gap),
             (EventType::ProtocolError, PolicyHook::ProtocolError),
@@ -710,6 +750,31 @@ mod tests {
                 target: Some("/chat".to_string()),
                 subprotocol: Some("chat".to_string()),
                 extensions: vec!["permessage-deflate".to_string()],
+            }),
+        )
+    }
+
+    fn websocket_frame_event() -> EventEnvelope {
+        EventEnvelope::new(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            demo_flow(),
+            CaptureSource::Replay,
+            "test",
+            EventKind::WebSocketFrame(WebSocketFrame {
+                direction: Direction::Inbound,
+                stream_sequence: 1,
+                frame_sequence: 1,
+                fin: true,
+                rsv1: false,
+                rsv2: false,
+                rsv3: false,
+                opcode: WebSocketOpcode::Text,
+                payload_len: 5,
+                masked: false,
+                payload_fingerprint: vec![1, 2, 3],
             }),
         )
     }

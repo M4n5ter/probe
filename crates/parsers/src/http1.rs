@@ -7,12 +7,11 @@ use probe_core::{
 };
 use thiserror::Error;
 
-use crate::{ParserInput, ParserOutput, ProtocolParser, gap_event};
+use crate::{ParserInput, ParserOutput, ProtocolParser, WebSocketFrameParser, gap_event};
 
 const MAX_SSE_PENDING_BYTES: usize = 1024 * 1024;
 const CONNECT_HANDOFF_REASON: &str = "CONNECT tunnel established";
 const HTTP_UPGRADE_HANDOFF_REASON: &str = "HTTP upgrade handoff";
-const WEBSOCKET_BYTES_AFTER_HANDOFF_REASON: &str = "websocket bytes after HTTP upgrade handoff";
 const OPAQUE_BYTES_AFTER_HANDOFF_REASON: &str = "opaque stream bytes after HTTP handoff";
 
 #[derive(Debug, Error)]
@@ -28,7 +27,7 @@ pub struct Http1Parser {
     inbound: DirectionState,
     outbound: DirectionState,
     pending_response_contexts: VecDeque<ResponseContext>,
-    opaque_handoff: bool,
+    handoff: Option<ActiveHandoff>,
 }
 
 impl Http1Parser {
@@ -41,8 +40,8 @@ impl ProtocolParser for Http1Parser {
     fn ingest(&mut self, input: ParserInput<'_>) -> ParserOutput {
         match input {
             ParserInput::Data { direction, bytes } => {
-                if self.opaque_handoff {
-                    return ParserOutput::from_events(opaque_data_events(direction, bytes));
+                if let Some(handoff) = &mut self.handoff {
+                    return ParserOutput::from_events(handoff.ingest_data(direction, bytes));
                 }
                 let mut output = match direction {
                     Direction::Inbound => self.inbound.ingest_data(
@@ -63,11 +62,9 @@ impl ProtocolParser for Http1Parser {
                         }
                         _ => None,
                     }));
-                if output.enter_opaque {
-                    self.opaque_handoff = true;
+                if let Some(handoff) = output.handoff.take() {
+                    self.handoff = Some(handoff);
                     self.pending_response_contexts.clear();
-                    self.inbound.enter_opaque();
-                    self.outbound.enter_opaque();
                 }
                 ParserOutput::from_events(std::mem::take(&mut output.events))
             }
@@ -77,7 +74,15 @@ impl ProtocolParser for Http1Parser {
                 next_offset,
                 reason,
             } => {
-                if !self.opaque_handoff {
+                if let Some(handoff) = &mut self.handoff {
+                    return ParserOutput::from_events(handoff.ingest(ParserInput::Gap {
+                        direction,
+                        expected_offset,
+                        next_offset,
+                        reason,
+                    }));
+                }
+                if self.handoff.is_none() {
                     self.state_mut(direction).reset();
                 }
                 ParserOutput::from_events(vec![gap_event(
@@ -87,12 +92,19 @@ impl ProtocolParser for Http1Parser {
                     reason,
                 )])
             }
-            ParserInput::ConnectionClosed => ParserOutput::from_events(self.finish_flow()),
+            ParserInput::ConnectionClosed => {
+                if let Some(handoff) = &mut self.handoff {
+                    return ParserOutput::from_events(
+                        handoff.ingest(ParserInput::ConnectionClosed),
+                    );
+                }
+                ParserOutput::from_events(self.finish_flow())
+            }
         }
     }
 
     fn is_checkpoint_safe(&self) -> bool {
-        !self.opaque_handoff
+        self.handoff.is_none()
             && self.pending_response_contexts.is_empty()
             && self.inbound.is_checkpoint_safe()
             && self.outbound.is_checkpoint_safe()
@@ -102,10 +114,8 @@ impl ProtocolParser for Http1Parser {
 impl Http1Parser {
     fn finish_flow(&mut self) -> Vec<EventKind> {
         let mut events = Vec::new();
-        if !self.opaque_handoff {
-            self.inbound.finish(Direction::Inbound, &mut events);
-            self.outbound.finish(Direction::Outbound, &mut events);
-        }
+        self.inbound.finish(Direction::Inbound, &mut events);
+        self.outbound.finish(Direction::Outbound, &mut events);
         events
     }
 
@@ -114,6 +124,34 @@ impl Http1Parser {
             Direction::Inbound => &mut self.inbound,
             Direction::Outbound => &mut self.outbound,
         }
+    }
+}
+
+#[derive(Debug)]
+enum ActiveHandoff {
+    Opaque,
+    WebSocket(Box<WebSocketFrameParser>),
+}
+
+impl ActiveHandoff {
+    fn ingest(&mut self, input: ParserInput<'_>) -> Vec<EventKind> {
+        match self {
+            Self::Opaque => match input {
+                ParserInput::Data { direction, bytes } => opaque_data_events(direction, bytes),
+                ParserInput::Gap {
+                    direction,
+                    expected_offset,
+                    next_offset,
+                    reason,
+                } => vec![gap_event(direction, expected_offset, next_offset, reason)],
+                ParserInput::ConnectionClosed => Vec::new(),
+            },
+            Self::WebSocket(parser) => parser.ingest(input).into_events(),
+        }
+    }
+
+    fn ingest_data(&mut self, direction: Direction, bytes: &[u8]) -> Vec<EventKind> {
+        self.ingest(ParserInput::Data { direction, bytes })
     }
 }
 
@@ -158,7 +196,6 @@ impl DirectionState {
                 HttpState::ReadingChunkTrailers => {
                     self.read_chunk_trailers(direction, &mut output.events)
                 }
-                HttpState::Opaque => self.read_opaque(direction, &mut output.events),
             };
 
             if before == Progress::new(self.buffer.len(), &self.state) {
@@ -209,7 +246,6 @@ impl DirectionState {
                 });
 
                 if let Some(handoff) = body_plan.handoff {
-                    output.enter_opaque = true;
                     match handoff {
                         HandoffPlan::Opaque { reason } => {
                             output.events.push(EventKind::OpaqueStream(OpaqueStream {
@@ -217,6 +253,7 @@ impl DirectionState {
                                 fingerprint: opaque_fingerprint(&self.buffer),
                                 reason: reason.to_string(),
                             }));
+                            output.handoff = Some(ActiveHandoff::Opaque);
                         }
                         HandoffPlan::WebSocket {
                             target,
@@ -233,11 +270,20 @@ impl DirectionState {
                                     extensions,
                                 }));
                             if !self.buffer.is_empty() {
-                                output.events.push(EventKind::OpaqueStream(OpaqueStream {
-                                    direction,
-                                    fingerprint: opaque_fingerprint(&self.buffer),
-                                    reason: WEBSOCKET_BYTES_AFTER_HANDOFF_REASON.to_string(),
-                                }));
+                                let mut parser = WebSocketFrameParser::new(self.stream_sequence);
+                                output.events.extend(
+                                    parser
+                                        .ingest(ParserInput::Data {
+                                            direction,
+                                            bytes: &self.buffer,
+                                        })
+                                        .into_events(),
+                                );
+                                output.handoff = Some(ActiveHandoff::WebSocket(Box::new(parser)));
+                            } else {
+                                output.handoff = Some(ActiveHandoff::WebSocket(Box::new(
+                                    WebSocketFrameParser::new(self.stream_sequence),
+                                )));
                             }
                         }
                     }
@@ -389,18 +435,6 @@ impl DirectionState {
         events.extend(sse.events.into_iter().map(EventKind::SseEvent));
     }
 
-    fn read_opaque(&mut self, direction: Direction, events: &mut Vec<EventKind>) {
-        if self.buffer.is_empty() {
-            return;
-        }
-        events.push(EventKind::OpaqueStream(OpaqueStream {
-            direction,
-            fingerprint: opaque_fingerprint(&self.buffer),
-            reason: OPAQUE_BYTES_AFTER_HANDOFF_REASON.to_string(),
-        }));
-        self.buffer.clear();
-    }
-
     fn fail(&mut self, direction: Direction, reason: String, events: &mut Vec<EventKind>) {
         self.reset();
         events.push(EventKind::ProtocolError(ProtocolError {
@@ -412,13 +446,6 @@ impl DirectionState {
     fn reset(&mut self) {
         self.buffer.clear();
         self.state = HttpState::ReadingHeaders;
-        self.body_offset = 0;
-        self.sse = SseDecoder::default();
-    }
-
-    fn enter_opaque(&mut self) {
-        self.buffer.clear();
-        self.state = HttpState::Opaque;
         self.body_offset = 0;
         self.sse = SseDecoder::default();
     }
@@ -459,7 +486,7 @@ impl DirectionState {
                     events,
                 );
             }
-            HttpState::ReadingHeaders | HttpState::Opaque => {}
+            HttpState::ReadingHeaders => {}
         }
     }
 
@@ -475,7 +502,7 @@ impl DirectionState {
 #[derive(Debug, Default)]
 struct DirectionIngestOutput {
     events: Vec<EventKind>,
-    enter_opaque: bool,
+    handoff: Option<ActiveHandoff>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -492,7 +519,6 @@ enum HttpState {
     },
     ReadingChunkTerminator,
     ReadingChunkTrailers,
-    Opaque,
 }
 
 impl HttpState {
@@ -535,9 +561,7 @@ impl BodyPlan {
             .as_ref()
             .is_some_and(ResponseContext::has_no_response_body)
             || response_status_has_no_body(role, headers.status);
-        let state = if handoff.is_some() {
-            HttpState::Opaque
-        } else if has_no_body {
+        let state = if handoff.is_some() || has_no_body {
             HttpState::ReadingHeaders
         } else if is_chunked(&headers.headers) {
             HttpState::ReadingChunkSize
@@ -1005,7 +1029,7 @@ fn parse_sse_event(direction: Direction, stream_sequence: u64, raw: &str) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use probe_core::{Direction, EventKind};
+    use probe_core::{Direction, EventKind, WebSocketOpcode};
 
     use crate::{Http1Parser, ParserInput, ProtocolParser};
 
@@ -1266,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_upgrade_emits_handoff_and_enters_opaque_stream() {
+    fn websocket_upgrade_emits_handoff_and_parses_frames() {
         let mut parser = Http1Parser::default();
         parser.ingest(
             Direction::Outbound,
@@ -1286,11 +1310,15 @@ mod tests {
                     && handoff.subprotocol.as_deref() == Some("chat")
                     && handoff.extensions == ["permessage-deflate"]
         )));
-        assert!(
-            websocket_events
-                .iter()
-                .any(|event| matches!(event, EventKind::OpaqueStream(opaque) if opaque.direction == Direction::Inbound))
-        );
+        assert!(websocket_events.iter().any(|event| matches!(
+            event,
+            EventKind::WebSocketFrame(frame)
+                if frame.direction == Direction::Inbound
+                    && frame.stream_sequence == 1
+                    && frame.frame_sequence == 1
+                    && frame.opcode == WebSocketOpcode::Text
+                    && frame.payload_len == 5
+        )));
         assert!(!parser.is_checkpoint_safe());
     }
 

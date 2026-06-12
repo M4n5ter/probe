@@ -1,3 +1,5 @@
+mod attach_plan;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -10,6 +12,11 @@ use std::os::unix::fs::MetadataExt;
 
 use object::{Object, ObjectSymbol};
 use thiserror::Error;
+
+pub use attach_plan::{
+    LibsslUprobeAttachKind, LibsslUprobeAttachPlan, LibsslUprobeAttachProbe,
+    LibsslUprobeAttachRecipe, LibsslUprobeAttachTarget,
+};
 
 const PROC_ROOT: &str = "/proc";
 const DELETED_MAPPING_SUFFIX: &str = " (deleted)";

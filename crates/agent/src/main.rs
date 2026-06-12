@@ -5,6 +5,7 @@ use std::{
 };
 
 mod admin;
+mod capture_provider;
 mod capture_registry;
 mod check;
 mod configured_enforcement;
@@ -17,12 +18,9 @@ mod test_support;
 mod tls_material;
 
 use admin::{AdminRuntimeState, AdminServerConfig, spawn_admin_server};
-use attribution::ProcfsSocketResolver;
-use capture::{
-    CaptureError, CaptureProvider, LibpcapProvider, ProcessResolver, ReplayProvider,
-    ResolvedProcess,
-};
-use capture_registry::{default_provider_registry, libpcap_config_from_agent};
+use capture::{CaptureError, ReplayProvider};
+use capture_provider::build_capture_provider;
+use capture_registry::default_provider_registry;
 use check::build_check_report;
 use clap::{Parser, Subcommand, ValueEnum};
 use configured_enforcement::{
@@ -35,14 +33,13 @@ use export::{ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook, spaw
 use exporter::CompressionCodec;
 use parsers::Http1ParserFactory;
 use pipeline::{CapturePipeline, PipelinePolicy, PipelineRunOptions};
-use plaintext_feed::load_plaintext_feed_provider;
 use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
-use probe_config::{AgentConfig, CaptureBackend};
+use probe_config::AgentConfig;
 use probe_core::{
-    AddressPort, CapabilityKind, Direction, EnforcementMode, FlowContext, FlowIdentity,
-    ProcessContext, ProcessIdentity, RuntimeMode, TcpConnection, Timestamp, TransportProtocol,
+    AddressPort, Direction, EnforcementMode, FlowContext, FlowIdentity, ProcessContext,
+    ProcessIdentity, Timestamp, TransportProtocol,
 };
-use runtime::{RuntimeError, RuntimePlan, validate_static_runtime_config};
+use runtime::{RuntimePlan, validate_static_runtime_config};
 use status::{build_status_snapshot, collect_spool_status};
 use storage::FjallSpool;
 use thiserror::Error;
@@ -353,91 +350,6 @@ fn admin_server_config_from_plan(plan: &RuntimePlan) -> Option<AdminServerConfig
     plan.config.admin.enabled.then(|| AdminServerConfig {
         socket_path: plan.config.admin.socket_path.clone(),
     })
-}
-
-fn build_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProvider>, AgentError> {
-    match plan.capture.selected_backend {
-        Some(CaptureBackend::PlaintextFeed) => build_plaintext_feed_provider(plan),
-        _ => build_live_capture_provider(plan),
-    }
-}
-
-fn build_live_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProvider>, AgentError> {
-    plan.require_live_capture()?;
-    match plan.capture.selected_backend {
-        Some(CaptureBackend::Libpcap) => Ok(Box::new(LibpcapProvider::open_with_process_resolver(
-            libpcap_config_from_agent(&plan.config),
-            procfs_tcp_process_resolver_for_plan(plan),
-        )?)),
-        Some(backend) => Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
-            reason: format!("{backend:?} capture provider is selected but has no agent builder"),
-        })),
-        None => Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
-            reason: plan
-                .capture
-                .reason
-                .clone()
-                .unwrap_or_else(|| "capture plan did not select a live backend".to_string()),
-        })),
-    }
-}
-
-fn build_plaintext_feed_provider(
-    plan: &RuntimePlan,
-) -> Result<Box<dyn CaptureProvider>, AgentError> {
-    let path = plan
-        .config
-        .capture
-        .plaintext_feed
-        .path
-        .as_ref()
-        .ok_or_else(|| {
-            AgentError::UnsupportedRunConfig(
-                "plaintext_feed capture requires capture.plaintext_feed.path".to_string(),
-            )
-        })?;
-    Ok(Box::new(load_plaintext_feed_provider(path)?))
-}
-
-fn procfs_tcp_process_resolver_for_plan(plan: &RuntimePlan) -> Option<Box<dyn ProcessResolver>> {
-    (plan
-        .capabilities
-        .mode(CapabilityKind::ProcfsSocketAttribution)
-        != RuntimeMode::Unavailable)
-        .then(|| Box::<ProcfsTcpProcessResolver>::default() as Box<dyn ProcessResolver>)
-}
-
-struct ProcfsTcpProcessResolver {
-    resolver: ProcfsSocketResolver,
-}
-
-impl Default for ProcfsTcpProcessResolver {
-    fn default() -> Self {
-        Self {
-            resolver: ProcfsSocketResolver::new(),
-        }
-    }
-}
-
-impl ProcessResolver for ProcfsTcpProcessResolver {
-    fn resolve_tcp_process(
-        &mut self,
-        connection: TcpConnection,
-    ) -> Result<Option<ResolvedProcess>, CaptureError> {
-        self.resolver
-            .resolve_tcp_connection(connection)
-            .map(|resolved| {
-                resolved.map(|resolved| ResolvedProcess {
-                    process: resolved.process,
-                    confidence: resolved.confidence,
-                })
-            })
-            .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
-    }
-
-    fn invalidate_cached_resolution(&mut self) {
-        self.resolver.invalidate_snapshot();
-    }
 }
 
 fn read_config_or_default(path: Option<&PathBuf>) -> Result<AgentConfig, AgentError> {

@@ -495,6 +495,7 @@ protective_actions = ["alert"]
                 CapabilityState::available(CapabilityKind::Http1),
                 CapabilityState::available(CapabilityKind::Sse),
                 CapabilityState::available(CapabilityKind::WebSocketHandoff),
+                CapabilityState::available(CapabilityKind::WebSocketFrame),
                 CapabilityState::available(CapabilityKind::DryRunEnforcement),
             ],
         );

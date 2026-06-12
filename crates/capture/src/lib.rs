@@ -11,16 +11,24 @@ use probe_core::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use ebpf::{EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport, UnprivilegedBpfStatus};
+pub use ebpf::{
+    EbpfConnectEndpoint, EbpfConnectFlowLookup, EbpfConnectFlowResolver,
+    EbpfConnectTracepointObservation, EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport,
+    EbpfObservedProcess, EbpfProcessObservation, EbpfProcessObservationProbe,
+    EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeError,
+    EbpfProcessObservationProvider, EbpfResolvedConnectFlow, UnprivilegedBpfStatus,
+    connect_opened_event_from_observation,
+};
 pub use libpcap::{LibpcapConfig, LibpcapProvider};
 pub use plaintext::{
     PlaintextChunk, PlaintextConnection, PlaintextFeedEvent, PlaintextFeedProvider, PlaintextGap,
 };
 pub use tls::{
     LibsslExecutableMapping, LibsslLibraryKind, LibsslMappedFileIdentity, LibsslMappedLibrary,
-    LibsslUprobeDegradationReason, LibsslUprobeDiscoveryError, LibsslUprobeSymbol,
-    LibsslUprobeSymbolFailure, LibsslUprobeTarget, LibsslUprobeTargetDiscovery,
-    LibsslUprobeTargetDiscoveryReport,
+    LibsslUprobeAttachKind, LibsslUprobeAttachPlan, LibsslUprobeAttachProbe,
+    LibsslUprobeAttachRecipe, LibsslUprobeAttachTarget, LibsslUprobeDegradationReason,
+    LibsslUprobeDiscoveryError, LibsslUprobeSymbol, LibsslUprobeSymbolFailure, LibsslUprobeTarget,
+    LibsslUprobeTargetDiscovery, LibsslUprobeTargetDiscoveryReport,
 };
 
 #[derive(Debug, Error)]

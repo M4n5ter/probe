@@ -451,7 +451,7 @@ impl CapturePlan {
         let selected_provider = candidates
             .iter()
             .find(|candidate| {
-                candidate.selectable()
+                candidate.selectable_for(config.capture.selection)
                     && match config.capture.selection {
                         CaptureSelection::Replay => candidate.backend == CaptureBackend::Replay,
                         CaptureSelection::PlaintextFeed => {
@@ -516,6 +516,7 @@ pub struct CaptureProviderDescriptor {
     pub backend: CaptureBackend,
     pub builder: CaptureProviderBuilder,
     pub mode: RuntimeMode,
+    pub selection_policy: CaptureProviderSelectionPolicy,
     pub reason: Option<String>,
 }
 
@@ -525,6 +526,7 @@ impl CaptureProviderDescriptor {
             backend,
             builder,
             mode: RuntimeMode::Available,
+            selection_policy: CaptureProviderSelectionPolicy::AvailableOnly,
             reason: None,
         }
     }
@@ -538,6 +540,7 @@ impl CaptureProviderDescriptor {
             backend,
             builder,
             mode: RuntimeMode::Degraded,
+            selection_policy: CaptureProviderSelectionPolicy::AvailableOnly,
             reason: Some(reason.into()),
         }
     }
@@ -551,8 +554,14 @@ impl CaptureProviderDescriptor {
             backend,
             builder,
             mode: RuntimeMode::Unavailable,
+            selection_policy: CaptureProviderSelectionPolicy::AvailableOnly,
             reason: Some(reason.into()),
         }
+    }
+
+    pub fn allow_explicit_degraded(mut self) -> Self {
+        self.selection_policy = CaptureProviderSelectionPolicy::AllowExplicitDegraded;
+        self
     }
 
     pub fn capability(&self) -> CapabilityKind {
@@ -585,8 +594,17 @@ impl CaptureProviderDescriptor {
         }
     }
 
-    fn selectable(&self) -> bool {
-        self.mode == RuntimeMode::Available && self.builder.supports(self.backend)
+    fn selectable_for(&self, selection: CaptureSelection) -> bool {
+        if !self.builder.supports(self.backend) {
+            return false;
+        }
+        match selection {
+            CaptureSelection::Auto => self.selection_policy.auto_selectable(self.mode),
+            CaptureSelection::Ebpf
+            | CaptureSelection::Libpcap
+            | CaptureSelection::PlaintextFeed
+            | CaptureSelection::Replay => self.selection_policy.explicit_selectable(self.mode),
+        }
     }
 
     fn unselectable_reason(&self) -> String {
@@ -607,6 +625,26 @@ impl CaptureProviderDescriptor {
             ));
         }
         self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureProviderSelectionPolicy {
+    AvailableOnly,
+    AllowExplicitDegraded,
+}
+
+impl CaptureProviderSelectionPolicy {
+    fn auto_selectable(self, mode: RuntimeMode) -> bool {
+        mode == RuntimeMode::Available
+    }
+
+    fn explicit_selectable(self, mode: RuntimeMode) -> bool {
+        match self {
+            Self::AvailableOnly => mode == RuntimeMode::Available,
+            Self::AllowExplicitDegraded => mode != RuntimeMode::Unavailable,
+        }
     }
 }
 
@@ -640,13 +678,23 @@ pub struct ProviderRegistry {
 
 impl ProviderRegistry {
     pub fn with_default_platform(capture_providers: Vec<CaptureProviderDescriptor>) -> Self {
-        let procfs = ProcfsAttributor::new();
         let procfs_socket = ProcfsSocketResolver::new();
+        Self::with_default_platform_and_procfs_socket(
+            capture_providers,
+            procfs_socket.capabilities(),
+        )
+    }
+
+    pub fn with_default_platform_and_procfs_socket(
+        capture_providers: Vec<CaptureProviderDescriptor>,
+        procfs_socket_capabilities: Vec<CapabilityState>,
+    ) -> Self {
+        let procfs = ProcfsAttributor::new();
         Self::new(
             capture_providers,
             default_platform_capabilities(procfs)
                 .into_iter()
-                .chain(procfs_socket.capabilities())
+                .chain(procfs_socket_capabilities)
                 .collect(),
         )
     }
@@ -749,7 +797,7 @@ fn validate_capture_config(
         return;
     };
     let provider = registry.capture_provider(backend);
-    if !provider.selectable() {
+    if !provider.selectable_for(config.capture.selection) {
         violations.push(ConfigViolation {
             field: "capture.selection".to_string(),
             reason: provider.unselectable_reason(),
@@ -885,11 +933,12 @@ fn default_platform_capabilities(
     [
         CapabilityState::unavailable(
             CapabilityKind::LibsslUprobe,
-            "libssl uprobe attach candidate discovery code exists, but it is not wired into runtime and the uprobe loader and plaintext event provider are not implemented in this build",
+            "libssl uprobe attach candidate discovery and attach planning code exists, but it is not wired into runtime and the uprobe loader and plaintext event provider are not implemented in this build",
         ),
         CapabilityState::available(CapabilityKind::Http1),
         CapabilityState::available(CapabilityKind::Sse),
         CapabilityState::available(CapabilityKind::WebSocketHandoff),
+        CapabilityState::available(CapabilityKind::WebSocketFrame),
         CapabilityState::degraded(
             CapabilityKind::LuaJit,
             "policy runtime is wired into replay and live capture, but hot reload and multiple active bundles are not implemented",

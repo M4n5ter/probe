@@ -33,6 +33,7 @@ fn test_capabilities() -> Vec<CapabilityState> {
         CapabilityState::available(CapabilityKind::Http1),
         CapabilityState::available(CapabilityKind::Sse),
         CapabilityState::available(CapabilityKind::WebSocketHandoff),
+        CapabilityState::available(CapabilityKind::WebSocketFrame),
         CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
         CapabilityState::available(CapabilityKind::DryRunEnforcement),
     ]

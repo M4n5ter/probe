@@ -132,6 +132,8 @@ pub enum EventKind {
     SseEvent(SseEvent),
     #[serde(rename = "websocket_handoff")]
     WebSocketHandoff(WebSocketHandoff),
+    #[serde(rename = "websocket_frame")]
+    WebSocketFrame(WebSocketFrame),
     OpaqueStream(OpaqueStream),
     Gap(Gap),
     ProtocolError(ProtocolError),
@@ -149,6 +151,7 @@ pub enum EventType {
     HttpBodyChunk,
     SseEvent,
     WebSocketHandoff,
+    WebSocketFrame,
     OpaqueStream,
     Gap,
     ProtocolError,
@@ -167,6 +170,7 @@ impl EventType {
             Self::HttpBodyChunk => "http_body_chunk",
             Self::SseEvent => "sse_event",
             Self::WebSocketHandoff => "websocket_handoff",
+            Self::WebSocketFrame => "websocket_frame",
             Self::OpaqueStream => "opaque_stream",
             Self::Gap => "gap",
             Self::ProtocolError => "protocol_error",
@@ -195,6 +199,7 @@ impl FromStr for EventType {
             "http_body_chunk" => Ok(Self::HttpBodyChunk),
             "sse_event" => Ok(Self::SseEvent),
             "websocket_handoff" => Ok(Self::WebSocketHandoff),
+            "websocket_frame" => Ok(Self::WebSocketFrame),
             "opaque_stream" => Ok(Self::OpaqueStream),
             "gap" => Ok(Self::Gap),
             "protocol_error" => Ok(Self::ProtocolError),
@@ -248,6 +253,7 @@ impl EventKind {
             Self::HttpBodyChunk(_) => EventType::HttpBodyChunk,
             Self::SseEvent(_) => EventType::SseEvent,
             Self::WebSocketHandoff(_) => EventType::WebSocketHandoff,
+            Self::WebSocketFrame(_) => EventType::WebSocketFrame,
             Self::OpaqueStream(_) => EventType::OpaqueStream,
             Self::Gap(_) => EventType::Gap,
             Self::ProtocolError(_) => EventType::ProtocolError,
@@ -265,6 +271,7 @@ impl EventKind {
             Self::HttpBodyChunk(chunk) => Some(chunk.direction),
             Self::SseEvent(event) => Some(event.direction),
             Self::WebSocketHandoff(handoff) => Some(handoff.direction),
+            Self::WebSocketFrame(frame) => Some(frame.direction),
             Self::OpaqueStream(stream) => Some(stream.direction),
             Self::Gap(gap) => Some(gap.direction),
             Self::ProtocolError(error) => Some(error.direction),
@@ -322,6 +329,33 @@ pub struct WebSocketHandoff {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSocketFrame {
+    pub direction: Direction,
+    pub stream_sequence: u64,
+    pub frame_sequence: u64,
+    pub fin: bool,
+    pub rsv1: bool,
+    pub rsv2: bool,
+    pub rsv3: bool,
+    pub opcode: WebSocketOpcode,
+    pub payload_len: u64,
+    pub masked: bool,
+    pub payload_fingerprint: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum WebSocketOpcode {
+    Continuation,
+    Text,
+    Binary,
+    Close,
+    Ping,
+    Pong,
+    Other { code: u8 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpaqueStream {
     pub direction: Direction,
     pub fingerprint: Vec<u8>,
@@ -357,7 +391,7 @@ mod tests {
         EnforcementMode, EnforcementOutcome, EventEnvelope, EventKind, EventType, FlowContext,
         FlowIdentity, Gap, HttpHeaders, OpaqueStream, ProcessContext, ProcessIdentity,
         ProtocolError, SseEvent, Timestamp, TransportProtocol, Verdict, VerdictScope,
-        WebSocketHandoff,
+        WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
     };
 
     #[test]
@@ -401,6 +435,29 @@ mod tests {
     }
 
     #[test]
+    fn websocket_frame_wire_type_matches_stable_event_name() {
+        let kind = EventKind::WebSocketFrame(WebSocketFrame {
+            direction: Direction::Inbound,
+            stream_sequence: 1,
+            frame_sequence: 2,
+            fin: true,
+            rsv1: false,
+            rsv2: false,
+            rsv3: false,
+            opcode: WebSocketOpcode::Text,
+            payload_len: 5,
+            masked: false,
+            payload_fingerprint: vec![1, 2, 3],
+        });
+        let value = serde_json::to_value(&kind).expect("event kind must serialize");
+
+        assert_eq!(kind.event_type(), EventType::WebSocketFrame);
+        assert_eq!(kind.name(), EventType::WebSocketFrame.as_str());
+        assert_eq!(value["type"], EventType::WebSocketFrame.as_str());
+        assert_eq!(value["opcode"]["kind"], "text");
+    }
+
+    #[test]
     fn event_type_round_trips_wire_name() -> Result<(), Box<dyn std::error::Error>> {
         for (event_type, expected) in event_type_wire_cases() {
             let value = serde_json::to_value(event_type)?;
@@ -420,7 +477,7 @@ mod tests {
         }
     }
 
-    fn event_type_wire_cases() -> [(EventType, &'static str); 13] {
+    fn event_type_wire_cases() -> [(EventType, &'static str); 14] {
         [
             (EventType::ConnectionOpened, "connection_opened"),
             (EventType::ConnectionClosed, "connection_closed"),
@@ -429,6 +486,7 @@ mod tests {
             (EventType::HttpBodyChunk, "http_body_chunk"),
             (EventType::SseEvent, "sse_event"),
             (EventType::WebSocketHandoff, "websocket_handoff"),
+            (EventType::WebSocketFrame, "websocket_frame"),
             (EventType::OpaqueStream, "opaque_stream"),
             (EventType::Gap, "gap"),
             (EventType::ProtocolError, "protocol_error"),
@@ -438,7 +496,7 @@ mod tests {
         ]
     }
 
-    fn event_kind_wire_cases() -> [EventKind; 13] {
+    fn event_kind_wire_cases() -> [EventKind; 14] {
         [
             EventKind::ConnectionOpened,
             EventKind::ConnectionClosed,
@@ -483,6 +541,19 @@ mod tests {
                 target: Some("/chat".to_string()),
                 subprotocol: Some("chat".to_string()),
                 extensions: Vec::new(),
+            }),
+            EventKind::WebSocketFrame(WebSocketFrame {
+                direction: Direction::Inbound,
+                stream_sequence: 1,
+                frame_sequence: 1,
+                fin: true,
+                rsv1: false,
+                rsv2: false,
+                rsv3: false,
+                opcode: WebSocketOpcode::Text,
+                payload_len: 5,
+                masked: false,
+                payload_fingerprint: vec![1, 2, 3],
             }),
             EventKind::OpaqueStream(OpaqueStream {
                 direction: Direction::Inbound,

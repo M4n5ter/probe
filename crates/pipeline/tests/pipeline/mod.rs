@@ -445,7 +445,7 @@ end
     assert_eq!(summary.ingress_records_processed, 3);
     assert!(
         summary.export_events_written >= 5,
-        "request, response, handoff, policy alert, and opaque events should be exported"
+        "request, response, handoff, policy alert, and websocket frame events should be exported"
     );
 
     let exported = spool.read_export_batch("sink", 16)?;
@@ -482,16 +482,19 @@ end
                 if alert.message == "websocket /chat chat"
         )
     }));
-    let opaque_index = envelopes
+    let frame_index = envelopes
         .iter()
         .position(|envelope| {
             matches!(
                 &envelope.kind,
-                EventKind::OpaqueStream(opaque) if opaque.direction == Direction::Inbound
+                EventKind::WebSocketFrame(frame)
+                    if frame.direction == Direction::Inbound
+                        && frame.payload_len == 2
+                        && frame.frame_sequence == 1
             )
         })
-        .expect("websocket bytes after handoff should be opaque");
-    assert!(handoff_index < opaque_index);
+        .expect("websocket bytes after handoff should be parsed as frame metadata");
+    assert!(handoff_index < frame_index);
     assert!(
         !envelopes
             .iter()

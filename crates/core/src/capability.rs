@@ -13,6 +13,7 @@ pub enum CapabilityKind {
     Http1,
     Sse,
     WebSocketHandoff,
+    WebSocketFrame,
     LuaJit,
     DurableSpool,
     IngressJournal,
