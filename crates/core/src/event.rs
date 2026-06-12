@@ -27,7 +27,7 @@ pub enum CaptureSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Timestamp {
     pub monotonic_ns: u64,
-    pub wall_time_unix_ns: i128,
+    pub wall_time_unix_ns: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -8,6 +8,8 @@ use probe_core::{CompiledSelector, EventEnvelope, EventKind, SpoolPayloadSchema,
 use storage::{DurableSpool, SpoolPayload};
 use thiserror::Error;
 
+const PARSER_INGRESS_CONSUMER: &str = "parser";
+
 #[derive(Debug, Error)]
 pub enum PipelineError {
     #[error("capture error: {0}")]
@@ -164,18 +166,18 @@ where
         Ok(summary)
     }
 
-    pub fn recover_persisted_capture_bytes_until_idle(
+    pub fn recover_ingress_journal_until_idle(
         &mut self,
         batch_size: usize,
     ) -> Result<PipelineSummary, PipelineError> {
         let mut total = PipelineSummary::default();
-        let mut after_sequence = self.spool.ingress_cursor("parser")?;
+        let mut after_sequence = self.spool.ingress_cursor(PARSER_INGRESS_CONSUMER)?;
         if batch_size == 0 {
             return Ok(total);
         }
         loop {
             let (batch, last_sequence) =
-                self.recover_persisted_capture_bytes_after(after_sequence, batch_size)?;
+                self.recover_ingress_journal_after(after_sequence, batch_size)?;
             let recovered = batch.ingress_records_recovered;
             if let Some(sequence) = last_sequence {
                 after_sequence = sequence;
@@ -187,7 +189,7 @@ where
         }
     }
 
-    fn recover_persisted_capture_bytes_after(
+    fn recover_ingress_journal_after(
         &mut self,
         after_sequence: u64,
         limit: usize,
@@ -196,17 +198,13 @@ where
         let mut last_sequence = None;
         let stored_events = self.spool.read_ingress_batch_after(after_sequence, limit)?;
         for stored_event in stored_events {
-            if stored_event.payload.schema() != &SpoolPayloadSchema::CaptureBytesJsonV1 {
-                return Err(PipelineError::UnexpectedIngressSchema {
-                    sequence: stored_event.sequence,
-                    expected: SpoolPayloadSchema::CAPTURE_BYTES_JSON_V1,
-                    actual: stored_event.payload.schema().to_string(),
-                });
-            }
-            let chunk = serde_json::from_slice::<CapturedBytes>(stored_event.payload.bytes())?;
+            let capture_event = decode_ingress_capture_event(&stored_event)?;
             summary.ingress_records_recovered = summary.ingress_records_recovered.saturating_add(1);
-            self.process_captured_bytes(chunk, stored_event.sequence, &mut summary)?;
-            self.ack_parser_checkpoint_if_safe()?;
+            self.process_journaled_capture_event(
+                capture_event,
+                stored_event.sequence,
+                &mut summary,
+            )?;
             last_sequence = Some(stored_event.sequence);
         }
         Ok((summary, last_sequence))
@@ -217,12 +215,20 @@ where
         capture_event: CaptureEvent,
         summary: &mut PipelineSummary,
     ) -> Result<(), PipelineError> {
+        let ingress_sequence = self.append_capture_event(&capture_event)?;
+        summary.ingress_records_journaled = summary.ingress_records_journaled.saturating_add(1);
+        self.process_journaled_capture_event(capture_event, ingress_sequence, summary)
+    }
+
+    fn process_journaled_capture_event(
+        &mut self,
+        capture_event: CaptureEvent,
+        ingress_sequence: u64,
+        summary: &mut PipelineSummary,
+    ) -> Result<(), PipelineError> {
         match capture_event {
             CaptureEvent::Bytes(chunk) => {
-                let ingress_sequence = self.append_capture_chunk(&chunk)?;
-                summary.ingress_records_journaled =
-                    summary.ingress_records_journaled.saturating_add(1);
-                self.process_captured_bytes(chunk, ingress_sequence, summary)?;
+                self.process_captured_bytes(chunk, summary)?;
             }
             CaptureEvent::Gap(gap) => {
                 let parser_events = self
@@ -302,6 +308,8 @@ where
                 self.parser_factory.remove_flow(&flow_id);
             }
         }
+        summary.ingress_records_processed = summary.ingress_records_processed.saturating_add(1);
+        self.last_processed_ingress_sequence = Some(ingress_sequence);
         self.ack_parser_checkpoint_if_safe()?;
         Ok(())
     }
@@ -309,10 +317,8 @@ where
     fn process_captured_bytes(
         &mut self,
         chunk: CapturedBytes,
-        ingress_sequence: u64,
         summary: &mut PipelineSummary,
     ) -> Result<(), PipelineError> {
-        summary.ingress_records_processed = summary.ingress_records_processed.saturating_add(1);
         let events = self
             .parser_factory
             .parser_for_flow(&chunk.flow.id)
@@ -335,14 +341,13 @@ where
                 .export_events_written
                 .saturating_add(self.append_envelope_and_policy_outcomes(envelope)?);
         }
-        self.last_processed_ingress_sequence = Some(ingress_sequence);
         Ok(())
     }
 
-    fn append_capture_chunk(&self, chunk: &CapturedBytes) -> Result<u64, PipelineError> {
-        let payload = serde_json::to_vec(chunk)?;
+    fn append_capture_event(&self, capture_event: &CaptureEvent) -> Result<u64, PipelineError> {
+        let payload = serde_json::to_vec(capture_event)?;
         let stored = self.spool.append_ingress(SpoolPayload::new(
-            SpoolPayloadSchema::CaptureBytesJsonV1,
+            SpoolPayloadSchema::CaptureEventJson,
             payload,
         ))?;
         Ok(stored.sequence)
@@ -352,7 +357,7 @@ where
         if let Some(sequence) = self.last_processed_ingress_sequence
             && self.parser_factory.is_checkpoint_safe()
         {
-            self.spool.ack_ingress("parser", sequence)?;
+            self.spool.ack_ingress(PARSER_INGRESS_CONSUMER, sequence)?;
         }
         Ok(())
     }
@@ -436,7 +441,7 @@ where
     fn append_envelope(&self, envelope: &EventEnvelope) -> Result<(), PipelineError> {
         let payload = serde_json::to_vec(envelope)?;
         self.spool.append_export(SpoolPayload::new(
-            SpoolPayloadSchema::EventEnvelopeJsonV1,
+            SpoolPayloadSchema::EventEnvelopeJson,
             payload,
         ))?;
         Ok(())
@@ -458,8 +463,25 @@ impl PipelineClock {
     }
 }
 
-fn wall_time_unix_ns() -> i128 {
+fn wall_time_unix_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as i128)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
+        })
+}
+
+fn decode_ingress_capture_event(
+    stored_event: &storage::StoredEvent,
+) -> Result<CaptureEvent, PipelineError> {
+    match stored_event.payload.schema() {
+        SpoolPayloadSchema::CaptureEventJson => Ok(serde_json::from_slice::<CaptureEvent>(
+            stored_event.payload.bytes(),
+        )?),
+        schema => Err(PipelineError::UnexpectedIngressSchema {
+            sequence: stored_event.sequence,
+            expected: SpoolPayloadSchema::CAPTURE_EVENT_JSON,
+            actual: schema.to_string(),
+        }),
+    }
 }

@@ -130,9 +130,11 @@ impl LibpcapProvider {
 
     fn next_timestamp(&mut self, header: &PacketHeader) -> Timestamp {
         self.packet_sequence = self.packet_sequence.saturating_add(1);
-        let wall_time_unix_ns = (header.ts.tv_sec as i128)
+        let wall_time_unix_ns = header
+            .ts
+            .tv_sec
             .saturating_mul(1_000_000_000)
-            .saturating_add((header.ts.tv_usec as i128).saturating_mul(1_000));
+            .saturating_add(header.ts.tv_usec.saturating_mul(1_000));
         Timestamp {
             monotonic_ns: self.packet_sequence,
             wall_time_unix_ns,
@@ -346,7 +348,7 @@ mod tests {
     fn timestamp(monotonic_ns: u64) -> Timestamp {
         Timestamp {
             monotonic_ns,
-            wall_time_unix_ns: i128::from(monotonic_ns),
+            wall_time_unix_ns: monotonic_ns as i64,
         }
     }
 

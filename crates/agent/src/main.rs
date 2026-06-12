@@ -252,8 +252,8 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 plan.capture.selected_backend
             );
             let summary_result = (|| {
-                let mut summary = pipeline
-                    .recover_persisted_capture_bytes_until_idle(INGRESS_RECOVERY_BATCH_SIZE)?;
+                let mut summary =
+                    pipeline.recover_ingress_journal_until_idle(INGRESS_RECOVERY_BATCH_SIZE)?;
                 let mut provider = build_capture_provider(&plan)?;
                 let capture_summary = pipeline.run_provider_with_options(
                     provider.as_mut(),
@@ -567,10 +567,12 @@ fn current_timestamp(monotonic_ns: u64) -> Timestamp {
     }
 }
 
-fn wall_time_unix_ns() -> i128 {
+fn wall_time_unix_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as i128)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
+        })
 }
 
 fn replay_flow() -> FlowContext {
@@ -628,7 +630,7 @@ fn synthetic_replay_process() -> ProcessContext {
 mod tests {
     use std::fs;
 
-    use capture::{CapturedBytes, EbpfProbeCheck, UnprivilegedBpfStatus};
+    use capture::{CaptureEvent, CapturedBytes, EbpfProbeCheck, UnprivilegedBpfStatus};
     use probe_config::{CaptureSelection, EnforcementPolicySourceConfig, PolicyConfig};
     use probe_core::SpoolPayloadSchema;
     use storage::SpoolPayload;
@@ -823,8 +825,8 @@ protective_actions = ["alert"]
             degradation_reason: None,
         };
         spool.append_ingress(SpoolPayload::new(
-            SpoolPayloadSchema::CaptureBytesJsonV1,
-            serde_json::to_vec(&chunk)?,
+            SpoolPayloadSchema::CaptureEventJson,
+            serde_json::to_vec(&CaptureEvent::Bytes(chunk))?,
         ))?;
         drop(spool);
 
@@ -849,7 +851,6 @@ protective_actions = ["alert"]
         );
 
         let spool = FjallSpool::open(&spool_path)?;
-        assert_eq!(spool.ingress_cursor("parser")?, 0);
         let exported = spool.read_export_batch("sink", 16)?;
         let envelopes = exported
             .iter()

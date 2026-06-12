@@ -116,7 +116,7 @@ fn json_event_envelope_record(sequence: u64, event_id: String, payload: Vec<u8>)
         event_id,
         sequence,
         payload_format: PayloadFormat::Json as i32,
-        payload_schema: SpoolPayloadSchema::EventEnvelopeJsonV1.to_string(),
+        payload_schema: SpoolPayloadSchema::EventEnvelopeJson.to_string(),
         payload,
     }
 }
@@ -142,7 +142,7 @@ mod tests {
         assert_eq!(decoded.events[0].payload_format(), PayloadFormat::Json);
         assert_eq!(
             decoded.events[0].payload_schema,
-            SpoolPayloadSchema::EventEnvelopeJsonV1.as_str()
+            SpoolPayloadSchema::EventEnvelopeJson.as_str()
         );
         Ok(())
     }
@@ -164,7 +164,7 @@ mod tests {
         assert_eq!(batch.events[0].payload_format(), PayloadFormat::Json);
         assert_eq!(
             batch.events[0].payload_schema,
-            SpoolPayloadSchema::EventEnvelopeJsonV1.as_str()
+            SpoolPayloadSchema::EventEnvelopeJson.as_str()
         );
         Ok(())
     }

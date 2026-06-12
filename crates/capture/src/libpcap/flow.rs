@@ -10,7 +10,7 @@ use crate::{CaptureError, ProcessResolver, ResolvedProcess};
 use super::decoder::DecodedTcpSegment;
 
 const MAX_FLOW_TRACKER_CONNECTIONS: usize = 16_384;
-const FLOW_IDLE_TIMEOUT_UNIX_NS: i128 = 120_000_000_000;
+const FLOW_IDLE_TIMEOUT_UNIX_NS: i64 = 120_000_000_000;
 
 #[derive(Debug, Default)]
 pub(super) struct FlowTracker {
@@ -145,7 +145,7 @@ impl FlowTracker {
         closed
     }
 
-    fn evict_idle(&mut self, wall_time_unix_ns: i128) -> Vec<FlowContext> {
+    fn evict_idle(&mut self, wall_time_unix_ns: i64) -> Vec<FlowContext> {
         let idle_keys = self
             .flows
             .iter()
@@ -180,7 +180,7 @@ struct FlowRecord {
     process: ProcessContext,
     confidence: u8,
     flow: FlowContext,
-    last_seen_wall_time_unix_ns: i128,
+    last_seen_wall_time_unix_ns: i64,
     local_fin: bool,
     remote_fin: bool,
     reset: bool,
@@ -910,7 +910,7 @@ mod tests {
             };
             tracker.observe(
                 &segment,
-                timestamp(index as u64 + 1, index as i128 + 1),
+                timestamp(index as u64 + 1, index as i64 + 1),
                 &mut resolver,
             );
         }
@@ -981,7 +981,7 @@ mod tests {
         }
     }
 
-    fn timestamp(monotonic_ns: u64, wall_time_unix_ns: i128) -> Timestamp {
+    fn timestamp(monotonic_ns: u64, wall_time_unix_ns: i64) -> Timestamp {
         Timestamp {
             monotonic_ns,
             wall_time_unix_ns,

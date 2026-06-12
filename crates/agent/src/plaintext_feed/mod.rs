@@ -409,7 +409,7 @@ impl From<PlaintextFeedJsonTimestamp> for Timestamp {
     fn from(value: PlaintextFeedJsonTimestamp) -> Self {
         Self {
             monotonic_ns: value.monotonic_ns,
-            wall_time_unix_ns: i128::from(value.wall_time_unix_ns),
+            wall_time_unix_ns: value.wall_time_unix_ns,
         }
     }
 }

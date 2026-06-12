@@ -846,17 +846,17 @@ mod tests {
     fn stored_payload_decodes_known_wire_schema_to_canonical_enum()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut encoded = Vec::new();
-        let schema = SpoolPayloadSchema::EVENT_ENVELOPE_JSON_V1.as_bytes();
+        let schema = SpoolPayloadSchema::EVENT_ENVELOPE_JSON.as_bytes();
         encoded.extend_from_slice(&(schema.len() as u32).to_be_bytes());
         encoded.extend_from_slice(schema);
         encoded.extend_from_slice(b"payload");
 
         let payload = decode_spool_payload(&encoded)?;
 
-        assert_eq!(payload.schema(), &SpoolPayloadSchema::EventEnvelopeJsonV1);
+        assert_eq!(payload.schema(), &SpoolPayloadSchema::EventEnvelopeJson);
         assert_eq!(
             payload.schema_wire(),
-            SpoolPayloadSchema::EVENT_ENVELOPE_JSON_V1
+            SpoolPayloadSchema::EVENT_ENVELOPE_JSON
         );
         assert_eq!(payload.bytes(), b"payload");
         Ok(())

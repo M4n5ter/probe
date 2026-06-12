@@ -525,7 +525,7 @@ fn export_batch_from_events(
         return Ok(None);
     };
     for event in &events {
-        if event.payload.schema() != &SpoolPayloadSchema::EventEnvelopeJsonV1 {
+        if event.payload.schema() != &SpoolPayloadSchema::EventEnvelopeJson {
             return Err(ExportDrainError::UnsupportedSpoolPayloadSchema {
                 sequence: event.sequence,
                 schema: event.payload.schema_wire().to_string(),

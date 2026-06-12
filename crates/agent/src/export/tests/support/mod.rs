@@ -71,7 +71,7 @@ pub(super) fn append_export_event(
     );
     let payload = serde_json::to_vec(&envelope)?;
     spool.append_export(storage::SpoolPayload::new(
-        SpoolPayloadSchema::EventEnvelopeJsonV1,
+        SpoolPayloadSchema::EventEnvelopeJson,
         payload,
     ))?;
     Ok(())
@@ -310,7 +310,7 @@ fn export_event_payload(sequence: u64) -> Result<SpoolPayload, serde_json::Error
         EventKind::ConnectionOpened,
     );
     serde_json::to_vec(&envelope)
-        .map(|payload| SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeJsonV1, payload))
+        .map(|payload| SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeJson, payload))
 }
 
 pub(super) struct TestWebhookServer {

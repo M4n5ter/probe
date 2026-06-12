@@ -2,8 +2,8 @@ use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SpoolPayloadSchema {
-    CaptureBytesJsonV1,
-    EventEnvelopeJsonV1,
+    CaptureEventJson,
+    EventEnvelopeJson,
     Other(UnknownSpoolPayloadSchema),
 }
 
@@ -17,22 +17,22 @@ impl UnknownSpoolPayloadSchema {
 }
 
 impl SpoolPayloadSchema {
-    pub const CAPTURE_BYTES_JSON_V1: &'static str = "sssa.probe.capture_bytes.v1.json";
-    pub const EVENT_ENVELOPE_JSON_V1: &'static str = "sssa.probe.event_envelope.v1.json";
+    pub const CAPTURE_EVENT_JSON: &'static str = "sssa.probe.capture_event.json";
+    pub const EVENT_ENVELOPE_JSON: &'static str = "sssa.probe.event_envelope.json";
 
     pub fn from_wire(value: impl AsRef<str>) -> Self {
         let value = value.as_ref();
         match value {
-            Self::CAPTURE_BYTES_JSON_V1 => Self::CaptureBytesJsonV1,
-            Self::EVENT_ENVELOPE_JSON_V1 => Self::EventEnvelopeJsonV1,
+            Self::CAPTURE_EVENT_JSON => Self::CaptureEventJson,
+            Self::EVENT_ENVELOPE_JSON => Self::EventEnvelopeJson,
             _ => Self::Other(UnknownSpoolPayloadSchema(value.to_string())),
         }
     }
 
     pub fn as_str(&self) -> &str {
         match self {
-            Self::CaptureBytesJsonV1 => Self::CAPTURE_BYTES_JSON_V1,
-            Self::EventEnvelopeJsonV1 => Self::EVENT_ENVELOPE_JSON_V1,
+            Self::CaptureEventJson => Self::CAPTURE_EVENT_JSON,
+            Self::EventEnvelopeJson => Self::EVENT_ENVELOPE_JSON,
             Self::Other(value) => value.as_str(),
         }
     }
@@ -51,20 +51,20 @@ mod tests {
     #[test]
     fn known_schema_round_trips_to_wire_name() {
         assert_eq!(
-            SpoolPayloadSchema::from_wire(SpoolPayloadSchema::CAPTURE_BYTES_JSON_V1),
-            SpoolPayloadSchema::CaptureBytesJsonV1
+            SpoolPayloadSchema::from_wire(SpoolPayloadSchema::CAPTURE_EVENT_JSON),
+            SpoolPayloadSchema::CaptureEventJson
         );
         assert_eq!(
-            SpoolPayloadSchema::CaptureBytesJsonV1.as_str(),
-            SpoolPayloadSchema::CAPTURE_BYTES_JSON_V1
+            SpoolPayloadSchema::CaptureEventJson.as_str(),
+            SpoolPayloadSchema::CAPTURE_EVENT_JSON
         );
         assert_eq!(
-            SpoolPayloadSchema::from_wire(SpoolPayloadSchema::EVENT_ENVELOPE_JSON_V1),
-            SpoolPayloadSchema::EventEnvelopeJsonV1
+            SpoolPayloadSchema::from_wire(SpoolPayloadSchema::EVENT_ENVELOPE_JSON),
+            SpoolPayloadSchema::EventEnvelopeJson
         );
         assert_eq!(
-            SpoolPayloadSchema::EventEnvelopeJsonV1.as_str(),
-            SpoolPayloadSchema::EVENT_ENVELOPE_JSON_V1
+            SpoolPayloadSchema::EventEnvelopeJson.as_str(),
+            SpoolPayloadSchema::EVENT_ENVELOPE_JSON
         );
     }
 
