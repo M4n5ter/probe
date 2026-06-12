@@ -7,11 +7,25 @@ mod policy;
 mod storage;
 mod tls;
 
-pub use admin::*;
-pub use agent::*;
-pub use capture::*;
-pub use enforcement::*;
-pub use export::*;
-pub use policy::*;
-pub use storage::*;
-pub use tls::*;
+pub use admin::AdminConfig;
+pub use agent::AgentConfig;
+pub use capture::{
+    CaptureBackend, CaptureConfig, CaptureSelection, EbpfCaptureConfig, LibpcapCaptureConfig,
+    LiveCaptureBackend, PlaintextFeedCaptureConfig,
+};
+pub use enforcement::{
+    EnforcementConfig, EnforcementPolicyConfig, EnforcementPolicyManifest,
+    EnforcementPolicySourceConfig,
+};
+pub use export::{
+    CompressionCodecName, DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK,
+    DEFAULT_EXPORT_FAILURE_BACKOFF_MS, DEFAULT_EXPORT_SINK_TIMEOUT_MS,
+    DEFAULT_EXPORT_WORKER_INTERVAL_MS, ExportRuntimeConfig, ExportWorkerRuntimeConfig,
+    ExportWorkerScheduleConfig, ExporterConfig, ExporterTlsConfig, ExporterTransport,
+    ExporterWorkerConfig,
+};
+pub use policy::PolicyConfig;
+pub use storage::StorageConfig;
+pub use tls::{
+    PlaintextTlsConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind, TlsPlaintextProvider,
+};

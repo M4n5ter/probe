@@ -1,0 +1,184 @@
+use probe_config::{
+    AgentConfig, ConfigValidationError, ConfigViolation, ExporterTransport, TlsPlaintextProvider,
+};
+use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
+
+use super::registry::ProviderRegistry;
+
+pub(super) fn validate_runtime_config(
+    config: &AgentConfig,
+    registry: &ProviderRegistry,
+) -> Result<(), ConfigValidationError> {
+    let mut violations = Vec::new();
+    collect_static_runtime_config_violations(config, &mut violations);
+    validate_capture_config(config, registry, &mut violations);
+    validate_registry_tls_config(config, registry, &mut violations);
+    validate_registry_enforcement_config(config, registry, &mut violations);
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigValidationError::new(violations))
+    }
+}
+
+pub(super) fn validate_static_runtime_config_fields(
+    config: &AgentConfig,
+) -> Result<(), ConfigValidationError> {
+    let mut violations = Vec::new();
+    collect_static_runtime_config_violations(config, &mut violations);
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigValidationError::new(violations))
+    }
+}
+
+fn collect_static_runtime_config_violations(
+    config: &AgentConfig,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    validate_static_tls_config(config, violations);
+    validate_policy_config(config, violations);
+    validate_static_enforcement_config(config, violations);
+    validate_exporters(config, violations);
+}
+
+fn validate_policy_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
+    for policy in config.policies.iter().filter(|policy| policy.enabled) {
+        if let Some(selector) = &policy.selector
+            && let Err(error) = selector.compile()
+        {
+            violations.push(ConfigViolation {
+                field: format!("policies.{}.selector", policy.id),
+                reason: error.to_string(),
+            });
+        }
+    }
+}
+
+fn validate_capture_config(
+    config: &AgentConfig,
+    registry: &ProviderRegistry,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    let Some(backend) = config.capture.selection.explicit_backend() else {
+        return;
+    };
+    let provider = registry.capture_provider(backend);
+    if !provider.selectable_for(config.capture.selection) {
+        violations.push(ConfigViolation {
+            field: "capture.selection".to_string(),
+            reason: provider.unselectable_reason(),
+        });
+    }
+}
+
+fn validate_static_tls_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
+    if let Some(selector) = &config.tls.plaintext.selector
+        && let Err(error) = selector.compile()
+    {
+        violations.push(ConfigViolation {
+            field: "tls.plaintext.selector".to_string(),
+            reason: error.to_string(),
+        });
+    }
+    if !config.tls.plaintext.enabled {
+        return;
+    }
+    if matches!(config.tls.plaintext.provider, TlsPlaintextProvider::Keylog) {
+        violations.push(ConfigViolation {
+            field: "tls.plaintext.provider".to_string(),
+            reason: format!(
+                "{:?} plaintext provider is reserved but not implemented",
+                config.tls.plaintext.provider
+            ),
+        });
+    }
+}
+
+fn validate_registry_tls_config(
+    config: &AgentConfig,
+    registry: &ProviderRegistry,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if !config.tls.plaintext.enabled {
+        return;
+    }
+    match config.tls.plaintext.provider {
+        TlsPlaintextProvider::LibsslUprobe => require_available(
+            &registry.capability_matrix(),
+            CapabilityKind::LibsslUprobe,
+            "tls.plaintext.enabled",
+            "libssl uprobe plaintext provider is not available in this build/runtime",
+            violations,
+        ),
+        TlsPlaintextProvider::Keylog => {}
+    }
+}
+
+fn validate_static_enforcement_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
+    if let Some(selector) = &config.enforcement.selector
+        && let Err(error) = selector.compile()
+    {
+        violations.push(ConfigViolation {
+            field: "enforcement.selector".to_string(),
+            reason: error.to_string(),
+        });
+    }
+    if config.enforcement.mode == EnforcementMode::Enforce {
+        violations.push(ConfigViolation {
+            field: "enforcement.mode".to_string(),
+            reason: "real enforcement is not implemented in this build/runtime".to_string(),
+        });
+    }
+}
+
+fn validate_registry_enforcement_config(
+    config: &AgentConfig,
+    registry: &ProviderRegistry,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    match config.enforcement.mode {
+        EnforcementMode::Disabled | EnforcementMode::AuditOnly | EnforcementMode::Enforce => {}
+        EnforcementMode::DryRun => require_available(
+            &registry.capability_matrix(),
+            CapabilityKind::DryRunEnforcement,
+            "enforcement.mode",
+            "dry-run enforcement provider is not available in this build/runtime",
+            violations,
+        ),
+    }
+}
+
+fn validate_exporters(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
+    for exporter in &config.exporters {
+        match exporter.transport {
+            ExporterTransport::Webhook => {}
+            ExporterTransport::Grpc | ExporterTransport::Kafka | ExporterTransport::Otlp => {
+                violations.push(ConfigViolation {
+                    field: format!("exporters.{}.transport", exporter.id),
+                    reason: format!(
+                        "{:?} exporter is reserved but not implemented",
+                        exporter.transport
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn require_available(
+    capabilities: &CapabilityMatrix,
+    capability: CapabilityKind,
+    field: impl Into<String>,
+    reason: impl Into<String>,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if capabilities.mode(capability) != RuntimeMode::Available {
+        violations.push(ConfigViolation {
+            field: field.into(),
+            reason: reason.into(),
+        });
+    }
+}

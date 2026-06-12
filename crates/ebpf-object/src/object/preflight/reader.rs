@@ -1,85 +1,13 @@
-use std::{
-    fs::{File, Metadata},
-    io::Read,
-    path::Path,
-};
+use std::path::Path;
 
-use rustix::fs::{Mode, OFlags, open};
-
-use super::model::EbpfProbeCheck;
+use probe_io::{BoundedFileError, BoundedFileErrorKind, read_bounded_regular_file};
 
 pub(super) const MAX_EBPF_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) fn read_ebpf_object_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    open_regular_ebpf_object(path).and_then(|file| read_limited_ebpf_object_bytes(path, file))
-}
-
-fn open_regular_ebpf_object(path: &Path) -> Result<File, String> {
-    match probe_regular_file(path, "eBPF object") {
-        EbpfProbeCheck::Available => {}
-        EbpfProbeCheck::Unavailable { reason } => return Err(reason),
-    }
-    let fd = open(
-        path,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-        Mode::empty(),
-    )
-    .map_err(|source| {
-        format!(
-            "failed to open eBPF object path {}: {source}",
-            path.display()
-        )
-    })?;
-    let file = File::from(fd);
-    let metadata = file.metadata().map_err(|source| {
-        format!(
-            "failed to inspect eBPF object path {}: {source}",
-            path.display()
-        )
-    })?;
-    validate_opened_ebpf_object(path, &metadata)?;
-    Ok(file)
-}
-
-fn validate_opened_ebpf_object(path: &Path, metadata: &Metadata) -> Result<(), String> {
-    if !metadata.is_file() {
-        return Err(format!(
-            "eBPF object path {} is not a regular file",
-            path.display()
-        ));
-    }
-    if metadata.len() > MAX_EBPF_OBJECT_BYTES {
-        return Err(ebpf_object_too_large_reason(
-            path,
-            metadata.len(),
-            MAX_EBPF_OBJECT_BYTES,
-        ));
-    }
-    Ok(())
-}
-
-fn read_limited_ebpf_object_bytes(path: &Path, file: File) -> Result<Vec<u8>, String> {
-    read_limited_ebpf_object_bytes_with_limit(path, file, MAX_EBPF_OBJECT_BYTES)
-}
-
-fn read_limited_ebpf_object_bytes_with_limit(
-    path: &Path,
-    file: File,
-    limit: u64,
-) -> Result<Vec<u8>, String> {
-    let mut reader = file.take(limit.saturating_add(1));
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).map_err(|source| {
-        format!(
-            "failed to read eBPF object path {}: {source}",
-            path.display()
-        )
-    })?;
-    let size = bytes.len() as u64;
-    if size > limit {
-        return Err(ebpf_object_too_large_reason(path, size, limit));
-    }
-    Ok(bytes)
+    read_bounded_regular_file(path, MAX_EBPF_OBJECT_BYTES)
+        .map(|read| read.into_bytes())
+        .map_err(ebpf_object_file_reason)
 }
 
 fn ebpf_object_too_large_reason(path: &Path, size: u64, limit: u64) -> String {
@@ -89,47 +17,68 @@ fn ebpf_object_too_large_reason(path: &Path, size: u64, limit: u64) -> String {
     )
 }
 
-fn probe_regular_file(path: &Path, label: &str) -> EbpfProbeCheck {
-    match path.symlink_metadata() {
-        Ok(metadata) if metadata.file_type().is_file() => EbpfProbeCheck::available(),
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            EbpfProbeCheck::unavailable(format!("{label} path {} is a symlink", path.display()))
+fn ebpf_object_file_reason(error: BoundedFileError) -> String {
+    let mut parts = error.into_parts();
+    match parts.kind {
+        BoundedFileErrorKind::NotFound => {
+            format!("eBPF object path {} does not exist", parts.path.display())
         }
-        Ok(metadata) if metadata.is_dir() => {
-            EbpfProbeCheck::unavailable(format!("{label} path {} is a directory", path.display()))
+        BoundedFileErrorKind::Inspect => {
+            let source = parts.expect_source();
+            format!(
+                "failed to inspect eBPF object path {}: {source}",
+                parts.path.display()
+            )
         }
-        Ok(_) => EbpfProbeCheck::unavailable(format!(
-            "{label} path {} is not a regular file",
-            path.display()
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            EbpfProbeCheck::unavailable(format!("{label} path {} does not exist", path.display()))
+        BoundedFileErrorKind::Open => {
+            let source = parts.expect_source();
+            format!(
+                "failed to open eBPF object path {}: {source}",
+                parts.path.display()
+            )
         }
-        Err(error) => EbpfProbeCheck::unavailable(format!(
-            "failed to inspect {label} path {}: {error}",
-            path.display()
-        )),
+        BoundedFileErrorKind::Read => {
+            let source = parts.expect_source();
+            format!(
+                "failed to read eBPF object path {}: {source}",
+                parts.path.display()
+            )
+        }
+        BoundedFileErrorKind::Symlink => {
+            format!("eBPF object path {} is a symlink", parts.path.display())
+        }
+        BoundedFileErrorKind::Directory => {
+            format!("eBPF object path {} is a directory", parts.path.display())
+        }
+        BoundedFileErrorKind::NotRegular => {
+            format!(
+                "eBPF object path {} is not a regular file",
+                parts.path.display()
+            )
+        }
+        BoundedFileErrorKind::TooLarge => {
+            let size_limit = parts.expect_size_limit();
+            ebpf_object_too_large_reason(&parts.path, size_limit.size, size_limit.limit)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, File};
+    use std::fs;
 
     use tempfile::tempdir;
 
     use super::*;
 
     #[test]
-    fn bounded_object_reader_rejects_file_larger_than_limit()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn object_reader_rejects_file_larger_than_limit() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let object = temp.path().join("bounded.bpf.o");
-        fs::write(&object, b"abcd")?;
-        let file = File::open(&object)?;
+        fs::File::create(&object)?.set_len(MAX_EBPF_OBJECT_BYTES + 1)?;
 
-        let error = read_limited_ebpf_object_bytes_with_limit(&object, file, 3)
-            .expect_err("bounded reader must reject bytes beyond limit");
+        let error =
+            read_ebpf_object_bytes(&object).expect_err("oversized eBPF object must be rejected");
 
         assert!(error.contains("too large"));
         Ok(())

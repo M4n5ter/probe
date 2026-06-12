@@ -23,6 +23,7 @@ dependencies = [
  "policy",
  "probe-config",
  "probe-core",
+ "probe-io",
  "proto",
  "reqwest",
  "runtime",
@@ -292,6 +293,7 @@ dependencies = [
  "object 0.39.1",
  "pcap",
  "probe-core",
+ "probe-io",
  "rustix",
  "serde",
  "serde_json",
@@ -510,7 +512,7 @@ dependencies = [
  "aya-obj",
  "ebpf-abi",
  "object 0.39.1",
- "rustix",
+ "probe-io",
  "serde",
  "tempfile",
 ]
@@ -1514,6 +1516,15 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "uuid",
+]
+
+[[package]]
+name = "probe-io"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

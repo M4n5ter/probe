@@ -13,6 +13,7 @@ ebpf-object = { version = "0.1.0", path = "../ebpf-object" }
 object = { version = "0.39", default-features = false, features = ["elf", "read_core", "std"] }
 pcap = "2.4"
 probe-core = { path = "../core" }
+probe-io = { path = "../probe-io" }
 rustix = { version = "1.1.4", features = ["fs"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"

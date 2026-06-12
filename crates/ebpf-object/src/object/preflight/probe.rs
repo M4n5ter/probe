@@ -88,8 +88,8 @@ mod tests {
     use super::super::{
         contract::{expected_close_tracepoint_section, expected_connect_tracepoint_section},
         model::{EbpfObjectMapKind, EbpfObjectProbeConfig},
+        object_fixture::write_process_probe_ebpf_object,
         reader::MAX_EBPF_OBJECT_BYTES,
-        test_support::write_process_probe_ebpf_object,
     };
     use super::*;
 

@@ -9,7 +9,7 @@ repository.workspace = true
 aya-obj = "0.2"
 ebpf-abi = { version = "0.1.0", path = "../ebpf-abi" }
 object = { version = "0.39", default-features = false, features = ["elf", "read_core", "std"] }
-rustix = { version = "1.1", features = ["fs"] }
+probe-io = { path = "../probe-io" }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

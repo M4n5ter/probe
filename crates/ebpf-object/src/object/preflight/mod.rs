@@ -5,7 +5,7 @@ mod probe;
 mod reader;
 
 #[cfg(test)]
-mod test_support;
+mod object_fixture;
 
 pub use model::{
     EbpfExpectedMap, EbpfExpectedProgram, EbpfObjectContract, EbpfObjectContractCheck,

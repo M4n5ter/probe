@@ -284,7 +284,7 @@ pub(super) fn expected_close_tracepoint_section() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{
+    use super::super::object_fixture::{
         contract_reason, contract_ringbuf_map, contract_tracepoint_program,
     };
     use super::*;
