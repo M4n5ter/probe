@@ -5,7 +5,7 @@ use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{Direction, FlowContext};
+use crate::{Direction, FlowContext, ProcessContext};
 
 #[derive(Debug, Error)]
 pub enum SelectorError {
@@ -116,6 +116,14 @@ impl CompiledSelector {
     pub fn matches_flow_without_direction(&self, flow: &FlowContext) -> bool {
         self.node.matches_flow(flow, None).unwrap_or(false)
     }
+
+    /// Returns false only when `process` can be ruled out before flow attribution.
+    ///
+    /// This is a conservative prefilter for process-scoped setup. A true result keeps a candidate;
+    /// final decisions must use a full flow and direction.
+    pub fn may_match_process(&self, process: &ProcessContext) -> bool {
+        self.node.may_match_process(process)
+    }
 }
 
 enum CompiledSelectorNode {
@@ -182,6 +190,21 @@ impl CompiledSelectorNode {
                 .map(|matched| !matched),
         }
     }
+
+    fn may_match_process(&self, process: &ProcessContext) -> bool {
+        match self {
+            Self::Match(term) => term.may_match_process(process),
+            Self::All(selectors) => selectors
+                .iter()
+                .all(|selector| selector.may_match_process(process)),
+            Self::Any(selectors) => selectors
+                .iter()
+                .any(|selector| selector.may_match_process(process)),
+            // Negated subtrees can depend on traffic dimensions that are unknown before a flow
+            // exists, so process-scoped pruning must not treat them as definitive misses.
+            Self::Not(_) => true,
+        }
+    }
 }
 
 struct CompiledSelectorTerm {
@@ -202,14 +225,13 @@ impl CompiledSelectorTerm {
     }
 
     fn matches_flow(&self, flow: &FlowContext, direction: Option<Direction>) -> Option<bool> {
-        if !self.matches_process(flow) {
+        if !self.matches_process(&flow.process) {
             return Some(false);
         }
         self.matches_traffic(flow, direction)
     }
 
-    fn matches_process(&self, flow: &FlowContext) -> bool {
-        let process = &flow.process;
+    fn matches_process(&self, process: &ProcessContext) -> bool {
         let spec = &self.term.process;
         all_match([
             spec.pids.is_empty() || spec.pids.contains(&process.identity.pid),
@@ -232,6 +254,40 @@ impl CompiledSelectorTerm {
             self.cmdline_regexes.as_ref().is_none_or(|regexes| {
                 let cmdline = process.cmdline.join(" ");
                 regexes.is_match(&cmdline)
+            }),
+        ])
+    }
+
+    fn may_match_process(&self, process: &ProcessContext) -> bool {
+        let spec = &self.term.process;
+        all_match([
+            spec.pids.is_empty()
+                || process.identity.pid == 0
+                || spec.pids.contains(&process.identity.pid),
+            spec.names.is_empty()
+                || unknown_process_string(&process.name)
+                || spec.names.iter().any(|name| name == &process.name),
+            spec.systemd_services.is_empty()
+                || process
+                    .identity
+                    .systemd_service
+                    .as_ref()
+                    .is_none_or(|service| spec.systemd_services.contains(service)),
+            spec.container_ids.is_empty()
+                || process
+                    .identity
+                    .container_id
+                    .as_ref()
+                    .is_none_or(|container_id| spec.container_ids.contains(container_id)),
+            self.exe_path_globs.as_ref().is_none_or(|globs| {
+                unknown_process_string(&process.identity.exe_path)
+                    || globs.is_match(&process.identity.exe_path)
+            }),
+            self.cmdline_regexes.as_ref().is_none_or(|regexes| {
+                unknown_cmdline(process) || {
+                    let cmdline = process.cmdline.join(" ");
+                    regexes.is_match(&cmdline)
+                }
             }),
         ])
     }
@@ -316,6 +372,14 @@ fn non_empty_composite<T>(name: &'static str, values: Vec<T>) -> Result<Vec<T>, 
     }
 }
 
+fn unknown_process_string(value: &str) -> bool {
+    value.is_empty() || value == "unknown"
+}
+
+fn unknown_cmdline(process: &ProcessContext) -> bool {
+    unknown_process_string(&process.identity.cmdline_hash) || process.cmdline.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -389,6 +453,78 @@ mod tests {
         .compile()?;
 
         assert!(selector.matches_flow_without_direction(&demo_flow()));
+        Ok(())
+    }
+
+    #[test]
+    fn process_scope_projection_prunes_only_process_mismatches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector {
+                names: vec!["demo".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                remote_ports: vec![443],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let matching = demo_flow().process;
+        let mut non_matching = matching.clone();
+        non_matching.name = "other".to_string();
+
+        assert!(selector.may_match_process(&matching));
+        assert!(!selector.may_match_process(&non_matching));
+        Ok(())
+    }
+
+    #[test]
+    fn process_scope_projection_keeps_traffic_and_negative_unknowns_conservative()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let traffic_only = Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let negated_process = Selector::Not {
+            selector: Box::new(Selector::term(
+                ProcessSelector {
+                    names: vec!["demo".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            )),
+        }
+        .compile()?;
+        let process = demo_flow().process;
+
+        assert!(traffic_only.may_match_process(&process));
+        assert!(negated_process.may_match_process(&process));
+        Ok(())
+    }
+
+    #[test]
+    fn process_scope_projection_keeps_partial_identity_fields_conservative()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector {
+                names: vec!["demo".to_string()],
+                exe_path_globs: vec!["/opt/demo/*".to_string()],
+                cmdline_regexes: vec!["--tenant managed".to_string()],
+                systemd_services: vec!["demo.service".to_string()],
+                container_ids: vec!["container-a".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+        .compile()?;
+        let partial = partial_process();
+
+        assert!(selector.may_match_process(&partial));
         Ok(())
     }
 
@@ -519,6 +655,27 @@ mod tests {
             start_monotonic_ns: 1,
             socket_cookie: Some(7),
             attribution_confidence: 100,
+        }
+    }
+
+    fn partial_process() -> ProcessContext {
+        ProcessContext {
+            identity: ProcessIdentity {
+                pid: 42,
+                tgid: 42,
+                start_time_ticks: 0,
+                boot_id: String::new(),
+                exe_path: String::new(),
+                cmdline_hash: String::new(),
+                uid: 1000,
+                gid: 1000,
+                cgroup: None,
+                systemd_service: None,
+                container_id: None,
+                runtime_hint: None,
+            },
+            name: "demo".to_string(),
+            cmdline: vec!["demo".to_string()],
         }
     }
 }
