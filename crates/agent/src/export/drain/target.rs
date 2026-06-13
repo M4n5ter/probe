@@ -9,7 +9,7 @@ use super::{
     cleanup::prune_export_queue_for_sinks,
     mode::{SinkDrainMode, duration_millis},
 };
-use crate::tls_material::read_tls_material;
+use crate::tls_material::{FilesystemTlsMaterialStore, TlsMaterialFileStore};
 
 const REPLAY_WEBHOOK_SINK: &str = "replay-webhook";
 
@@ -196,10 +196,17 @@ async fn drain_webhook_sink(
 fn webhook_tls_config_from_plan(
     plan: &ExportSinkTlsPlan,
 ) -> Result<WebhookTlsConfig, ExportDrainError> {
+    webhook_tls_config_from_plan_with_file_store(plan, &FilesystemTlsMaterialStore)
+}
+
+fn webhook_tls_config_from_plan_with_file_store(
+    plan: &ExportSinkTlsPlan,
+    file_store: &impl TlsMaterialFileStore,
+) -> Result<WebhookTlsConfig, ExportDrainError> {
     let trust_anchor_pems = plan
         .trust_anchors
         .iter()
-        .map(read_tls_material_for_export)
+        .map(|material| read_tls_material_for_export(material, file_store))
         .collect::<Result<Vec<_>, _>>()?;
     let identity_pem = match (
         plan.client_certificates.is_empty(),
@@ -209,10 +216,10 @@ fn webhook_tls_config_from_plan(
         (false, Some(private_key)) => {
             let mut pem = Vec::new();
             for certificate in &plan.client_certificates {
-                pem.extend(read_tls_material_for_export(certificate)?);
+                pem.extend(read_tls_material_for_export(certificate, file_store)?);
                 pem.push(b'\n');
             }
-            pem.extend(read_tls_material_for_export(private_key)?);
+            pem.extend(read_tls_material_for_export(private_key, file_store)?);
             Some(pem)
         }
         (true, Some(_)) | (false, None) => {
@@ -227,13 +234,16 @@ fn webhook_tls_config_from_plan(
 
 fn read_tls_material_for_export(
     material: &ExportTlsMaterialPlan,
+    file_store: &impl TlsMaterialFileStore,
 ) -> Result<Vec<u8>, ExportDrainError> {
-    read_tls_material(&material.path).map_err(|source| ExportDrainError::TlsMaterial {
-        id: material.id.clone(),
-        kind: material.kind,
-        path: material.path.clone(),
-        source,
-    })
+    file_store
+        .read_tls_material(&material.path)
+        .map_err(|source| ExportDrainError::TlsMaterial {
+            id: material.id.clone(),
+            kind: material.kind,
+            path: material.path.clone(),
+            source,
+        })
 }
 
 #[cfg(test)]

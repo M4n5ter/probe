@@ -6,7 +6,7 @@ use runtime::{RuntimePlan, TlsPlaintextMaterialPlan};
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::tls_material::read_tls_material;
+use crate::tls_material::{FilesystemTlsMaterialStore, TlsMaterialFileStore};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct TlsCheckSnapshot {
@@ -48,24 +48,35 @@ pub(crate) enum TlsCheckError {
 }
 
 pub(super) fn check_tls(plan: &RuntimePlan) -> Result<TlsCheckSnapshot, TlsCheckError> {
+    check_tls_with_file_store(plan, &FilesystemTlsMaterialStore)
+}
+
+fn check_tls_with_file_store(
+    plan: &RuntimePlan,
+    file_store: &impl TlsMaterialFileStore,
+) -> Result<TlsCheckSnapshot, TlsCheckError> {
     let plaintext = &plan.tls.plaintext;
     Ok(TlsCheckSnapshot {
         plaintext: TlsPlaintextCheckSnapshot {
             enabled: plaintext.enabled,
             provider: plaintext.provider,
-            key_logs: check_key_log_materials(&plaintext.key_logs)?,
-            session_secrets: check_session_secret_materials(&plaintext.session_secrets)?,
+            key_logs: check_key_log_materials(&plaintext.key_logs, file_store)?,
+            session_secrets: check_session_secret_materials(
+                &plaintext.session_secrets,
+                file_store,
+            )?,
         },
     })
 }
 
 fn check_key_log_materials(
     materials: &[TlsPlaintextMaterialPlan],
+    file_store: &impl TlsMaterialFileStore,
 ) -> Result<Vec<TlsPlaintextMaterialCheckSnapshot>, TlsCheckError> {
     materials
         .iter()
         .map(|material| {
-            let bytes = read_plaintext_material(material)?;
+            let bytes = read_plaintext_material(material, file_store)?;
             let summary = TlsKeyLogSummary::parse(&bytes)
                 .map_err(|source| tls_plaintext_material_error(material, source))?;
             Ok(TlsPlaintextMaterialCheckSnapshot {
@@ -80,11 +91,12 @@ fn check_key_log_materials(
 
 fn check_session_secret_materials(
     materials: &[TlsPlaintextMaterialPlan],
+    file_store: &impl TlsMaterialFileStore,
 ) -> Result<Vec<TlsPlaintextMaterialCheckSnapshot>, TlsCheckError> {
     materials
         .iter()
         .map(|material| {
-            let bytes = read_plaintext_material(material)?;
+            let bytes = read_plaintext_material(material, file_store)?;
             Ok(TlsPlaintextMaterialCheckSnapshot {
                 id: material.id.clone(),
                 kind: material.kind,
@@ -97,8 +109,12 @@ fn check_session_secret_materials(
         .collect()
 }
 
-fn read_plaintext_material(material: &TlsPlaintextMaterialPlan) -> Result<Vec<u8>, TlsCheckError> {
-    read_tls_material(&material.path)
+fn read_plaintext_material(
+    material: &TlsPlaintextMaterialPlan,
+    file_store: &impl TlsMaterialFileStore,
+) -> Result<Vec<u8>, TlsCheckError> {
+    file_store
+        .read_tls_material(&material.path)
         .map_err(|source| tls_plaintext_material_error(material, source))
 }
 

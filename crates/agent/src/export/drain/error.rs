@@ -4,7 +4,7 @@ use probe_config::{ExporterTransport, TlsMaterialKind};
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::tls_material::TlsMaterialFileError;
+use crate::tls_material::TlsMaterialFileStoreError;
 
 #[derive(Debug, Error)]
 pub enum ExportDrainError {
@@ -27,7 +27,7 @@ pub enum ExportDrainError {
         id: String,
         kind: TlsMaterialKind,
         path: PathBuf,
-        source: TlsMaterialFileError,
+        source: TlsMaterialFileStoreError,
     },
     #[error("client TLS identity requires at least one client certificate and one private key")]
     IncompleteClientTlsIdentity,
@@ -110,7 +110,7 @@ mod tests {
             id: "client-key".to_string(),
             kind: TlsMaterialKind::ClientPrivateKey,
             path: PathBuf::from("/secret/client.key"),
-            source: TlsMaterialFileError::NotRegular,
+            source: TlsMaterialFileStoreError::NotRegular,
         };
 
         assert_eq!(

@@ -5,7 +5,7 @@ use probe_core::{CapabilityKind, RuntimeMode};
 use runtime::{RuntimePlan, TlsPlaintextCapabilityPlan, TlsPlaintextMaterialPlan};
 use serde::Serialize;
 
-use crate::tls_material::check_tls_material_source;
+use crate::tls_material::{FilesystemTlsMaterialStore, TlsMaterialFileStore};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TlsStatusSnapshot {
@@ -137,7 +137,7 @@ fn material_purpose(kind: TlsMaterialKind) -> TlsMaterialPurpose {
 }
 
 pub(in crate::status) fn material_source_status(path: &Path) -> TlsMaterialSourceStatusSnapshot {
-    let (mode, reason) = inspect_material_source(path);
+    let (mode, reason) = inspect_material_source(path, &FilesystemTlsMaterialStore);
 
     TlsMaterialSourceStatusSnapshot {
         check: TlsMaterialSourceCheck::MetadataOnly,
@@ -146,8 +146,11 @@ pub(in crate::status) fn material_source_status(path: &Path) -> TlsMaterialSourc
     }
 }
 
-fn inspect_material_source(path: &Path) -> (RuntimeMode, Option<String>) {
-    match check_tls_material_source(path) {
+fn inspect_material_source(
+    path: &Path,
+    file_store: &impl TlsMaterialFileStore,
+) -> (RuntimeMode, Option<String>) {
+    match file_store.inspect_tls_material(path) {
         Ok(()) => (RuntimeMode::Available, None),
         Err(error) => (RuntimeMode::Unavailable, Some(error.to_string())),
     }
