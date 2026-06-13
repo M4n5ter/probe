@@ -101,7 +101,7 @@ fn default_platform_capabilities(
     [
         CapabilityState::unavailable(
             CapabilityKind::LibsslUprobe,
-            "libssl uprobe attach candidate discovery and attach planning code exists, but it is not wired into runtime and the uprobe loader and plaintext event provider are not implemented in this build",
+            "libssl uprobe discovery, attach planning, ABI, capture adapter, and eBPF producer exist, but the userspace uprobe loader and ringbuf-to-plaintext runtime wiring are not implemented in this build",
         ),
         CapabilityState::available(CapabilityKind::Http1),
         CapabilityState::available(CapabilityKind::Sse),

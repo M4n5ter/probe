@@ -6,21 +6,5 @@ extern crate std;
 pub mod contract;
 pub mod event;
 
-pub use contract::{
-    EBPF_CLOSE_PROGRAM_NAME, EBPF_CLOSE_TRACEPOINT_CATEGORY, EBPF_CLOSE_TRACEPOINT_NAME,
-    EBPF_CONNECT_PROGRAM_NAME, EBPF_CONNECT_TRACEPOINT_CATEGORY, EBPF_CONNECT_TRACEPOINT_NAME,
-    EBPF_EVENTS_MAP_NAME,
-};
-pub use event::{
-    EBPF_ABI_REVISION, EBPF_ADDRESS_FAMILY_INET, EBPF_ADDRESS_FAMILY_INET6,
-    EBPF_ADDRESS_FAMILY_UNSPEC, EBPF_CONNECT_REMOTE_ENDPOINT_VALID,
-    EBPF_CONNECT_SOCKADDR_READ_FAILED, EBPF_CONNECT_UNSUPPORTED_ADDRESS_FAMILY,
-    EBPF_EVENT_HEADER_BYTES, EBPF_MAGIC, EBPF_PROCESS_PROBE_EVENT_BYTES, EBPF_RING_BUFFER_BYTES,
-    EBPF_TLS_DIRECTION_INBOUND, EBPF_TLS_DIRECTION_OUTBOUND, EBPF_TLS_PLAINTEXT_EVENT_BYTES,
-    EBPF_TLS_PLAINTEXT_FD_VALID, EBPF_TLS_PLAINTEXT_READ_FAILED, EBPF_TLS_PLAINTEXT_SAMPLE_BYTES,
-    EBPF_TLS_PLAINTEXT_TRUNCATED, EbpfCloseObservation, EbpfConnectObservation,
-    EbpfEventDecodeError, EbpfEventHeader, EbpfEventKind, EbpfProcessProbeEvent,
-    EbpfTlsPlaintextEvent, EbpfTlsPlaintextObservation, decode_event_header,
-    decode_process_probe_event, decode_tls_plaintext_event, encode_process_probe_event,
-    encode_tls_plaintext_event,
-};
+pub use contract::*;
+pub use event::*;

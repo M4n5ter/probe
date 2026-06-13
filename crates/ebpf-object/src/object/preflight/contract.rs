@@ -1,7 +1,8 @@
 use ebpf_abi::{
     EBPF_CLOSE_PROGRAM_NAME, EBPF_CLOSE_TRACEPOINT_CATEGORY, EBPF_CLOSE_TRACEPOINT_NAME,
     EBPF_CONNECT_PROGRAM_NAME, EBPF_CONNECT_TRACEPOINT_CATEGORY, EBPF_CONNECT_TRACEPOINT_NAME,
-    EBPF_EVENTS_MAP_NAME, EBPF_RING_BUFFER_BYTES,
+    EBPF_EVENTS_MAP_NAME, EBPF_RING_BUFFER_BYTES, EBPF_TLS_LIBSSL_UPROBE_SPECS, EBPF_TLS_MAP_SPECS,
+    EBPF_UPROBE_SECTION_NAME, EBPF_URETPROBE_SECTION_NAME,
 };
 
 use super::model::{
@@ -106,6 +107,17 @@ impl EbpfObjectContract {
             inventory_policy: EbpfObjectContractInventoryPolicy::RequiredOnly,
         }
     }
+
+    pub fn tls_plaintext_uprobe() -> Self {
+        Self {
+            maps: EBPF_TLS_MAP_SPECS
+                .iter()
+                .map(EbpfExpectedMap::from_abi_spec)
+                .collect(),
+            programs: expected_tls_plaintext_programs(),
+            inventory_policy: EbpfObjectContractInventoryPolicy::RequiredOnly,
+        }
+    }
 }
 
 impl EbpfExpectedMap {
@@ -120,6 +132,45 @@ impl EbpfExpectedMap {
             pinning: EbpfObjectMapPinning::None,
         }
     }
+
+    fn from_abi_spec(spec: &ebpf_abi::EbpfMapSpec) -> Self {
+        Self {
+            name: spec.name.to_string(),
+            kind: spec.kind.into(),
+            key_size: spec.key_size,
+            value_size: spec.value_size,
+            max_entries: spec.max_entries,
+            map_flags: spec.map_flags,
+            pinning: EbpfObjectMapPinning::None,
+        }
+    }
+}
+
+fn expected_uprobe_program(name: &str) -> EbpfExpectedProgram {
+    EbpfExpectedProgram {
+        name: name.to_string(),
+        kind: EbpfObjectProgramKind::Uprobe,
+        section: Some(EBPF_UPROBE_SECTION_NAME.to_string()),
+    }
+}
+
+fn expected_uretprobe_program(name: &str) -> EbpfExpectedProgram {
+    EbpfExpectedProgram {
+        name: name.to_string(),
+        kind: EbpfObjectProgramKind::Uretprobe,
+        section: Some(EBPF_URETPROBE_SECTION_NAME.to_string()),
+    }
+}
+
+fn expected_tls_plaintext_programs() -> Vec<EbpfExpectedProgram> {
+    let mut programs = Vec::new();
+    for spec in EBPF_TLS_LIBSSL_UPROBE_SPECS {
+        programs.push(expected_uprobe_program(spec.entry_program_name));
+        if let Some(program_name) = spec.return_program_name {
+            programs.push(expected_uretprobe_program(program_name));
+        }
+    }
+    programs
 }
 
 fn expected_map_check(
@@ -284,6 +335,8 @@ pub(super) fn expected_close_tracepoint_section() -> String {
 
 #[cfg(test)]
 mod tests {
+    use ebpf_abi::EBPF_TLS_CALLS_MAP_NAME;
+
     use super::super::object_fixture::{
         contract_reason, contract_ringbuf_map, contract_tracepoint_program,
     };
@@ -355,6 +408,32 @@ mod tests {
         );
 
         assert!(report.is_available());
+    }
+
+    #[test]
+    fn tls_plaintext_contract_requires_uprobe_programs_and_state_maps() {
+        let report = EbpfObjectContractReport::from_inventory(
+            &EbpfObjectContract::tls_plaintext_uprobe(),
+            &required_tls_plaintext_programs(),
+            &required_tls_plaintext_maps(),
+        );
+
+        assert!(report.is_available(), "{}", report.summary());
+        assert_eq!(report.summary(), "available");
+    }
+
+    #[test]
+    fn tls_plaintext_contract_reports_missing_state_map() {
+        let mut maps = required_tls_plaintext_maps();
+        maps.retain(|map| map.name != EBPF_TLS_CALLS_MAP_NAME);
+        let report = EbpfObjectContractReport::from_inventory(
+            &EbpfObjectContract::tls_plaintext_uprobe(),
+            &required_tls_plaintext_programs(),
+            &maps,
+        );
+
+        assert!(!report.is_available());
+        assert!(contract_reason(&report.maps, EBPF_TLS_CALLS_MAP_NAME).contains("missing"));
     }
 
     #[test]
@@ -491,6 +570,42 @@ mod tests {
                 &expected_close_tracepoint_section(),
             ),
         ]
+    }
+
+    fn required_tls_plaintext_programs() -> Vec<EbpfObjectProgram> {
+        EbpfObjectContract::tls_plaintext_uprobe()
+            .programs
+            .iter()
+            .map(contract_program_from_expected)
+            .collect()
+    }
+
+    fn required_tls_plaintext_maps() -> Vec<EbpfObjectMap> {
+        EbpfObjectContract::tls_plaintext_uprobe()
+            .maps
+            .iter()
+            .map(contract_map_from_expected)
+            .collect()
+    }
+
+    fn contract_map_from_expected(expected: &EbpfExpectedMap) -> EbpfObjectMap {
+        EbpfObjectMap {
+            name: expected.name.clone(),
+            kind: expected.kind,
+            key_size: expected.key_size,
+            value_size: expected.value_size,
+            max_entries: expected.max_entries,
+            map_flags: expected.map_flags,
+            pinning: expected.pinning,
+        }
+    }
+
+    fn contract_program_from_expected(expected: &EbpfExpectedProgram) -> EbpfObjectProgram {
+        EbpfObjectProgram {
+            name: expected.name.clone(),
+            kind: expected.kind,
+            section: expected.section.clone(),
+        }
     }
 
     fn replace_required_program(

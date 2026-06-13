@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 
 use aya_obj::{
-    Object, ProgramSection, generated::bpf_map_type::BPF_MAP_TYPE_RINGBUF, maps::PinningType,
+    Object, ProgramSection,
+    generated::bpf_map_type::{
+        BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_LRU_HASH, BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_RINGBUF,
+    },
+    maps::PinningType,
 };
 use object::{Object as ObjectFile, ObjectSection};
 
@@ -50,6 +54,8 @@ impl From<&ProgramSection> for EbpfObjectProgramKind {
     fn from(section: &ProgramSection) -> Self {
         match section {
             ProgramSection::TracePoint => Self::Tracepoint,
+            ProgramSection::UProbe { .. } => Self::Uprobe,
+            ProgramSection::URetProbe { .. } => Self::Uretprobe,
             _ => Self::Unsupported,
         }
     }
@@ -57,10 +63,12 @@ impl From<&ProgramSection> for EbpfObjectProgramKind {
 
 impl From<u32> for EbpfObjectMapKind {
     fn from(map_type: u32) -> Self {
-        if map_type == BPF_MAP_TYPE_RINGBUF as u32 {
-            Self::Ringbuf
-        } else {
-            Self::Other { value: map_type }
+        match map_type {
+            value if value == BPF_MAP_TYPE_RINGBUF as u32 => Self::Ringbuf,
+            value if value == BPF_MAP_TYPE_HASH as u32 => Self::Hash,
+            value if value == BPF_MAP_TYPE_LRU_HASH as u32 => Self::LruHash,
+            value if value == BPF_MAP_TYPE_PERCPU_ARRAY as u32 => Self::PerCpuArray,
+            value => Self::Other { value },
         }
     }
 }

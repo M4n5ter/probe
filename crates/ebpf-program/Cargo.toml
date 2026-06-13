@@ -10,6 +10,14 @@ publish = false
 aya-ebpf = "0.1"
 ebpf-abi = { version = "0.1.0", path = "../ebpf-abi" }
 
+[[bin]]
+name = "ebpf-program"
+path = "src/main.rs"
+
+[[bin]]
+name = "ebpf-tls-plaintext"
+path = "src/tls_plaintext.rs"
+
 [lints.rust]
 unsafe_code = "allow"
 

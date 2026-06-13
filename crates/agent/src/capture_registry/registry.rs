@@ -84,7 +84,9 @@ fn ebpf_provider_descriptor(
         );
     };
 
-    let object = EbpfObjectProbe::probe(&EbpfObjectProbeConfig::new(object_path.clone()));
+    let object = EbpfObjectProbe::probe(&EbpfObjectProbeConfig::process_observation(
+        object_path.clone(),
+    ));
     ebpf_provider_descriptor_from_object_report(object, procfs_socket_attribution)
 }
 

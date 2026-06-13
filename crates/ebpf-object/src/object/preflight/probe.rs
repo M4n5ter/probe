@@ -82,13 +82,20 @@ impl EbpfObjectInspection {
 mod tests {
     use std::fs;
 
-    use ebpf_abi::{EBPF_CLOSE_PROGRAM_NAME, EBPF_CONNECT_PROGRAM_NAME, EBPF_EVENTS_MAP_NAME};
+    use ebpf_abi::{
+        EBPF_CLOSE_PROGRAM_NAME, EBPF_CONNECT_PROGRAM_NAME, EBPF_EVENTS_MAP_NAME,
+        EBPF_TLS_EVENT_SCRATCH_MAP_NAME, EBPF_TLS_SSL_CLEAR_EXIT_PROGRAM_NAME,
+        EBPF_TLS_SSL_SET_FD_PROGRAM_NAME,
+    };
     use tempfile::tempdir;
 
     use super::super::{
         contract::{expected_close_tracepoint_section, expected_connect_tracepoint_section},
-        model::{EbpfObjectMapKind, EbpfObjectProbeConfig},
-        object_fixture::write_process_probe_ebpf_object,
+        model::{
+            EbpfObjectArtifact, EbpfObjectContract, EbpfObjectMapKind, EbpfObjectProbeConfig,
+            EbpfObjectProgramKind,
+        },
+        object_fixture::{write_process_probe_ebpf_object, write_tls_plaintext_probe_ebpf_object},
         reader::MAX_EBPF_OBJECT_BYTES,
     };
     use super::*;
@@ -96,7 +103,7 @@ mod tests {
     #[test]
     fn object_probe_reports_missing_object() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
-        let config = EbpfObjectProbeConfig::new(temp.path().join("missing.bpf.o"));
+        let config = process_scaffold_config(temp.path().join("missing.bpf.o"));
 
         let report = EbpfObjectProbe::probe(&config);
 
@@ -114,7 +121,7 @@ mod tests {
         let temp = tempdir()?;
         let object = temp.path().join("invalid.bpf.o");
         fs::write(&object, b"not an elf object")?;
-        let config = EbpfObjectProbeConfig::new(object);
+        let config = process_scaffold_config(object);
 
         let report = EbpfObjectProbe::probe(&config);
 
@@ -133,7 +140,7 @@ mod tests {
         let temp = tempdir()?;
         let object = temp.path().join("oversized.bpf.o");
         fs::File::create(&object)?.set_len(MAX_EBPF_OBJECT_BYTES + 1)?;
-        let config = EbpfObjectProbeConfig::new(object);
+        let config = process_scaffold_config(object);
 
         let report = EbpfObjectProbe::probe(&config);
 
@@ -156,7 +163,7 @@ mod tests {
             &expected_close_tracepoint_section(),
             EbpfObjectMapKind::Ringbuf,
         )?;
-        let config = EbpfObjectProbeConfig::new(&object);
+        let config = EbpfObjectProbeConfig::process_observation(&object);
 
         let report = EbpfObjectProbe::probe(&config);
 
@@ -188,6 +195,64 @@ mod tests {
     }
 
     #[test]
+    fn object_probe_accepts_generated_tls_plaintext_object()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let object = temp.path().join("tls-plaintext.bpf.o");
+        write_tls_plaintext_probe_ebpf_object(&object)?;
+        let config = EbpfObjectArtifact::TlsPlaintext.probe_config(&object);
+
+        let report = EbpfObjectProbe::probe(&config);
+
+        assert!(report.object_available(), "{}", report.summary());
+        assert!(report.preflight_available(), "{}", report.summary());
+        assert_eq!(report.maps.len(), 5);
+        assert_eq!(report.programs.len(), 13);
+        assert!(
+            report.maps.iter().any(|map| {
+                map.name == EBPF_TLS_EVENT_SCRATCH_MAP_NAME
+                    && map.kind == EbpfObjectMapKind::PerCpuArray
+            }),
+            "{:?}",
+            report.maps
+        );
+        assert!(
+            report.programs.iter().any(|program| {
+                program.name == EBPF_TLS_SSL_SET_FD_PROGRAM_NAME
+                    && program.kind == EbpfObjectProgramKind::Uprobe
+            }),
+            "{:?}",
+            report.programs
+        );
+        assert!(
+            report.programs.iter().any(|program| {
+                program.name == EBPF_TLS_SSL_CLEAR_EXIT_PROGRAM_NAME
+                    && program.kind == EbpfObjectProgramKind::Uretprobe
+            }),
+            "{:?}",
+            report.programs
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_observation_config_rejects_tls_plaintext_object()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let object = temp.path().join("tls-plaintext.bpf.o");
+        write_tls_plaintext_probe_ebpf_object(&object)?;
+        let config = EbpfObjectProbeConfig::process_observation(&object);
+
+        let report = EbpfObjectProbe::probe(&config);
+
+        assert!(report.object_available(), "{}", report.summary());
+        assert!(!report.preflight_available());
+        assert!(report.summary().contains("unexpected eBPF map"));
+        assert!(report.summary().contains("unexpected eBPF program"));
+        Ok(())
+    }
+
+    #[test]
     fn preflight_returns_same_hardened_object_bytes() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let object = temp.path().join("preflighted-scaffold.bpf.o");
@@ -197,7 +262,7 @@ mod tests {
             &expected_close_tracepoint_section(),
             EbpfObjectMapKind::Ringbuf,
         )?;
-        let config = EbpfObjectProbeConfig::new(&object);
+        let config = EbpfObjectProbeConfig::process_observation(&object);
 
         let preflighted = EbpfObjectProbe::preflight(&config)
             .expect("generated scaffold object should pass contract preflight");
@@ -231,7 +296,7 @@ mod tests {
                 &close_section,
                 EbpfObjectMapKind::Ringbuf,
             )?;
-            let config = EbpfObjectProbeConfig::new(&object);
+            let config = process_scaffold_config(&object);
 
             let report = EbpfObjectProbe::preflight(&config)
                 .expect_err("wrong tracepoint section should fail contract preflight");
@@ -268,7 +333,7 @@ mod tests {
                 &close_section,
                 EbpfObjectMapKind::Ringbuf,
             )?;
-            let config = EbpfObjectProbeConfig::new(&object);
+            let config = process_scaffold_config(&object);
 
             let report = EbpfObjectProbe::probe(&config);
 
@@ -277,5 +342,14 @@ mod tests {
             assert!(report.summary().contains(expected_section));
         }
         Ok(())
+    }
+
+    fn process_scaffold_config(
+        object_path: impl Into<std::path::PathBuf>,
+    ) -> EbpfObjectProbeConfig {
+        EbpfObjectProbeConfig::with_contract(
+            object_path,
+            EbpfObjectContract::process_probe_scaffold(),
+        )
     }
 }

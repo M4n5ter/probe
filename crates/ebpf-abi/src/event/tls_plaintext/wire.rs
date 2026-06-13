@@ -117,6 +117,59 @@ impl EbpfTlsPlaintextEvent {
     pub const fn observation(&self) -> &EbpfTlsPlaintextObservation {
         &self.observation
     }
+
+    pub fn overwrite_libssl_plaintext_sampled_metadata(
+        &mut self,
+        metadata: EbpfTlsPlaintextEventMetadata,
+    ) {
+        self.header = EbpfEventHeader::new_with_flags(
+            EbpfEventKind::LibsslPlaintextSampled,
+            core::mem::size_of::<Self>() as u16,
+            metadata.flags,
+            metadata.pid,
+            metadata.tgid,
+            metadata.uid,
+            metadata.gid,
+        );
+        self.command = metadata.command;
+        self.observation.ssl_pointer = metadata.observation.ssl_pointer;
+        self.observation.stream_offset = metadata.observation.stream_offset;
+        self.observation.original_len = metadata.observation.original_len;
+        self.observation.fd = metadata.observation.fd;
+        self.observation.captured_len = metadata.observation.captured_len;
+        self.observation.direction = metadata.observation.direction;
+        self.observation.reserved0 = 0;
+        self.observation.reserved1 = 0;
+    }
+
+    pub fn clear_payload(&mut self) {
+        self.observation.payload.fill(0);
+    }
+
+    pub fn payload_mut(&mut self) -> &mut [u8; EBPF_TLS_PLAINTEXT_SAMPLE_BYTES] {
+        &mut self.observation.payload
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfTlsPlaintextEventMetadata {
+    pub pid: u32,
+    pub tgid: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub command: [u8; 16],
+    pub flags: u16,
+    pub observation: EbpfTlsPlaintextMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfTlsPlaintextMetadata {
+    pub ssl_pointer: u64,
+    pub fd: i32,
+    pub direction: u8,
+    pub stream_offset: u64,
+    pub original_len: u32,
+    pub captured_len: u16,
 }
 
 pub fn decode_tls_plaintext_event(

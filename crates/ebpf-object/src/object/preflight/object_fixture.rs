@@ -4,10 +4,13 @@ use ::object::{
     Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope,
     write::{Object as WriteObject, Symbol, SymbolSection},
 };
-use aya_obj::generated::bpf_map_type::BPF_MAP_TYPE_RINGBUF;
+use aya_obj::generated::bpf_map_type::{
+    BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_LRU_HASH, BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_RINGBUF,
+};
 use ebpf_abi::{
     EBPF_CLOSE_PROGRAM_NAME, EBPF_CONNECT_PROGRAM_NAME, EBPF_EVENTS_MAP_NAME,
-    EBPF_RING_BUFFER_BYTES,
+    EBPF_RING_BUFFER_BYTES, EBPF_TLS_LIBSSL_UPROBE_SPECS, EBPF_TLS_MAP_SPECS,
+    EBPF_UPROBE_SECTION_NAME, EBPF_URETPROBE_SECTION_NAME, EbpfMapSpec,
 };
 
 use super::model::{
@@ -59,6 +62,13 @@ pub(super) fn write_process_probe_ebpf_object(
     Ok(())
 }
 
+pub(super) fn write_tls_plaintext_probe_ebpf_object(
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::write(path, tls_plaintext_probe_ebpf_object_bytes()?)?;
+    Ok(())
+}
+
 fn process_probe_ebpf_object_bytes(
     connect_program_section_name: &str,
     close_program_section_name: &str,
@@ -66,18 +76,18 @@ fn process_probe_ebpf_object_bytes(
 ) -> Result<Vec<u8>, ::object::write::Error> {
     let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
     let maps_section = object.add_section(Vec::new(), b"maps".to_vec(), SectionKind::Data);
-    let map_def = legacy_map_def_bytes(map_kind);
-    object.set_section_data(maps_section, map_def.to_vec(), 4);
-    object.add_symbol(Symbol {
-        name: EBPF_EVENTS_MAP_NAME.as_bytes().to_vec(),
-        value: 0,
-        size: 20,
-        kind: SymbolKind::Data,
-        scope: SymbolScope::Linkage,
-        weak: false,
-        section: SymbolSection::Section(maps_section),
-        flags: SymbolFlags::None,
-    });
+    add_map_symbols(
+        &mut object,
+        maps_section,
+        &[FixtureMap {
+            name: EBPF_EVENTS_MAP_NAME.to_string(),
+            kind: map_kind,
+            key_size: 0,
+            value_size: 0,
+            max_entries: EBPF_RING_BUFFER_BYTES,
+            map_flags: 0,
+        }],
+    );
 
     add_program_symbol(
         &mut object,
@@ -91,6 +101,81 @@ fn process_probe_ebpf_object_bytes(
     );
 
     object.write()
+}
+
+fn tls_plaintext_probe_ebpf_object_bytes() -> Result<Vec<u8>, ::object::write::Error> {
+    let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
+    let maps_section = object.add_section(Vec::new(), b"maps".to_vec(), SectionKind::Data);
+    let maps = EBPF_TLS_MAP_SPECS
+        .iter()
+        .map(FixtureMap::from_abi_spec)
+        .collect::<Vec<_>>();
+    add_map_symbols(&mut object, maps_section, &maps);
+
+    for spec in EBPF_TLS_LIBSSL_UPROBE_SPECS {
+        add_program_symbol(
+            &mut object,
+            spec.entry_program_name,
+            EBPF_UPROBE_SECTION_NAME,
+        );
+        if let Some(program_name) = spec.return_program_name {
+            add_program_symbol(&mut object, program_name, EBPF_URETPROBE_SECTION_NAME);
+        }
+    }
+
+    object.write()
+}
+
+#[derive(Debug, Clone)]
+struct FixtureMap {
+    name: String,
+    kind: EbpfObjectMapKind,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+    map_flags: u32,
+}
+
+impl FixtureMap {
+    fn from_abi_spec(spec: &EbpfMapSpec) -> Self {
+        Self {
+            name: spec.name.to_string(),
+            kind: spec.kind.into(),
+            key_size: spec.key_size,
+            value_size: spec.value_size,
+            max_entries: spec.max_entries,
+            map_flags: spec.map_flags,
+        }
+    }
+}
+
+fn add_map_symbols(
+    object: &mut WriteObject<'_>,
+    maps_section: ::object::write::SectionId,
+    maps: &[FixtureMap],
+) {
+    let mut data = Vec::with_capacity(maps.len() * 20);
+    for map in maps {
+        let offset = data.len() as u64;
+        data.extend_from_slice(&legacy_map_def_bytes(
+            map.kind,
+            map.key_size,
+            map.value_size,
+            map.max_entries,
+            map.map_flags,
+        ));
+        object.add_symbol(Symbol {
+            name: map.name.as_bytes().to_vec(),
+            value: offset,
+            size: 20,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(maps_section),
+            flags: SymbolFlags::None,
+        });
+    }
+    object.set_section_data(maps_section, data, 4);
 }
 
 fn add_program_symbol(
@@ -116,12 +201,21 @@ fn add_program_symbol(
     });
 }
 
-fn legacy_map_def_bytes(kind: EbpfObjectMapKind) -> [u8; 20] {
+fn legacy_map_def_bytes(
+    kind: EbpfObjectMapKind,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+    map_flags: u32,
+) -> [u8; 20] {
     let map_type = match kind {
         EbpfObjectMapKind::Ringbuf => BPF_MAP_TYPE_RINGBUF as u32,
+        EbpfObjectMapKind::Hash => BPF_MAP_TYPE_HASH as u32,
+        EbpfObjectMapKind::LruHash => BPF_MAP_TYPE_LRU_HASH as u32,
+        EbpfObjectMapKind::PerCpuArray => BPF_MAP_TYPE_PERCPU_ARRAY as u32,
         EbpfObjectMapKind::Other { value } => value,
     };
-    let fields = [map_type, 0, 0, EBPF_RING_BUFFER_BYTES, 0];
+    let fields = [map_type, key_size, value_size, max_entries, map_flags];
     let mut bytes = [0; 20];
     for (index, field) in fields.into_iter().enumerate() {
         let start = index * 4;

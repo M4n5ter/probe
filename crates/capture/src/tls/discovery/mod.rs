@@ -6,6 +6,7 @@ mod symbol;
 pub use model::{
     LibsslExecutableMapping, LibsslLibraryKind, LibsslMappedFileIdentity, LibsslMappedLibrary,
     LibsslUprobeDegradationReason, LibsslUprobeDiscoveryError, LibsslUprobeSymbol,
-    LibsslUprobeSymbolFailure, LibsslUprobeTarget, LibsslUprobeTargetDiscoveryReport,
+    LibsslUprobeSymbolFailure, LibsslUprobeSymbolRole, LibsslUprobeTarget,
+    LibsslUprobeTargetDiscoveryReport,
 };
 pub use scanner::LibsslUprobeTargetDiscovery;

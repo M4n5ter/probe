@@ -1,8 +1,6 @@
-use probe_core::Direction;
-
 use super::{
     LibsslExecutableMapping, LibsslLibraryKind, LibsslMappedLibrary, LibsslUprobeDegradationReason,
-    LibsslUprobeSymbol, LibsslUprobeTargetDiscoveryReport,
+    LibsslUprobeSymbol, LibsslUprobeSymbolRole, LibsslUprobeTargetDiscoveryReport,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +38,7 @@ impl LibsslUprobeAttachPlan {
         self.targets
             .iter()
             .flat_map(|target| target.recipes.iter())
-            .map(|recipe| recipe.probes.len())
+            .map(LibsslUprobeAttachRecipe::attach_point_count)
             .sum()
     }
 
@@ -74,44 +72,62 @@ impl From<super::LibsslUprobeTarget> for LibsslUprobeAttachTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibsslUprobeAttachRecipe {
     pub symbol: LibsslUprobeSymbol,
-    pub direction: Direction,
-    pub probes: [LibsslUprobeAttachProbe; 2],
 }
 
 impl LibsslUprobeAttachRecipe {
     pub fn from_symbol(symbol: LibsslUprobeSymbol) -> Self {
-        let direction = match symbol {
-            LibsslUprobeSymbol::SslRead | LibsslUprobeSymbol::SslReadEx => Direction::Inbound,
-            LibsslUprobeSymbol::SslWrite | LibsslUprobeSymbol::SslWriteEx => Direction::Outbound,
-        };
-        Self {
-            symbol,
-            direction,
-            probes: [
-                LibsslUprobeAttachProbe::new(LibsslUprobeAttachKind::Entry),
-                LibsslUprobeAttachProbe::new(LibsslUprobeAttachKind::Return),
-            ],
-        }
+        Self { symbol }
     }
 
-    pub fn function_name(self) -> &'static str {
+    pub fn function_name(&self) -> &'static str {
         self.symbol.as_str()
+    }
+
+    pub fn semantic(&self) -> LibsslUprobeSymbolRole {
+        LibsslUprobeSymbolRole::from_ebpf_role(self.symbol.role())
+    }
+
+    pub fn attach_points(&self) -> Vec<LibsslUprobeAttachPoint> {
+        let mut points = Vec::with_capacity(self.attach_point_count());
+        points.push(self.attach_point(
+            LibsslUprobeAttachKind::Entry,
+            self.symbol.entry_program_name(),
+        ));
+        if let Some(program_name) = self.symbol.return_program_name() {
+            points.push(self.attach_point(LibsslUprobeAttachKind::Return, program_name));
+        }
+        points
+    }
+
+    pub fn attach_point_count(&self) -> usize {
+        1 + usize::from(self.symbol.return_program_name().is_some())
+    }
+
+    fn attach_point(
+        &self,
+        kind: LibsslUprobeAttachKind,
+        program_name: &'static str,
+    ) -> LibsslUprobeAttachPoint {
+        LibsslUprobeAttachPoint {
+            library_symbol: self.symbol.as_str(),
+            program_name,
+            kind,
+            semantic: self.semantic(),
+            offset: 0,
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LibsslUprobeAttachProbe {
+pub struct LibsslUprobeAttachPoint {
+    pub library_symbol: &'static str,
+    pub program_name: &'static str,
     pub kind: LibsslUprobeAttachKind,
+    pub semantic: LibsslUprobeSymbolRole,
     pub offset: u64,
-}
-
-impl LibsslUprobeAttachProbe {
-    pub fn new(kind: LibsslUprobeAttachKind) -> Self {
-        Self { kind, offset: 0 }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +139,15 @@ pub enum LibsslUprobeAttachKind {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    use ebpf_abi::{
+        EBPF_TLS_SSL_CLEAR_EXIT_PROGRAM_NAME, EBPF_TLS_SSL_CLEAR_PROGRAM_NAME,
+        EBPF_TLS_SSL_FREE_PROGRAM_NAME, EBPF_TLS_SSL_READ_ENTER_PROGRAM_NAME,
+        EBPF_TLS_SSL_READ_EXIT_PROGRAM_NAME, EBPF_TLS_SSL_SET_FD_EXIT_PROGRAM_NAME,
+        EBPF_TLS_SSL_SET_FD_PROGRAM_NAME, EBPF_TLS_SSL_WRITE_EX_ENTER_PROGRAM_NAME,
+        EBPF_TLS_SSL_WRITE_EX_EXIT_PROGRAM_NAME,
+    };
+    use probe_core::Direction;
 
     use super::*;
     use crate::{
@@ -144,6 +169,9 @@ mod tests {
                     file_offset: 0,
                 }],
                 symbols: vec![
+                    LibsslUprobeSymbol::SslSetFd,
+                    LibsslUprobeSymbol::SslClear,
+                    LibsslUprobeSymbol::SslFree,
                     LibsslUprobeSymbol::SslRead,
                     LibsslUprobeSymbol::SslWrite,
                     LibsslUprobeSymbol::SslReadEx,
@@ -156,36 +184,119 @@ mod tests {
         let plan = LibsslUprobeAttachPlan::from_discovery_report(report);
 
         assert!(plan.has_attachable_probes());
-        assert_eq!(plan.probe_count(), 8);
+        assert_eq!(plan.probe_count(), 13);
         assert_eq!(plan.targets.len(), 1);
         assert_eq!(plan.targets[0].pid, 42);
         assert_eq!(
             plan.targets[0].recipes,
             vec![
                 LibsslUprobeAttachRecipe {
+                    symbol: LibsslUprobeSymbol::SslSetFd,
+                },
+                LibsslUprobeAttachRecipe {
+                    symbol: LibsslUprobeSymbol::SslClear,
+                },
+                LibsslUprobeAttachRecipe {
+                    symbol: LibsslUprobeSymbol::SslFree,
+                },
+                LibsslUprobeAttachRecipe {
                     symbol: LibsslUprobeSymbol::SslRead,
-                    direction: Direction::Inbound,
-                    probes: entry_and_return_probes(),
                 },
                 LibsslUprobeAttachRecipe {
                     symbol: LibsslUprobeSymbol::SslWrite,
-                    direction: Direction::Outbound,
-                    probes: entry_and_return_probes(),
                 },
                 LibsslUprobeAttachRecipe {
                     symbol: LibsslUprobeSymbol::SslReadEx,
-                    direction: Direction::Inbound,
-                    probes: entry_and_return_probes(),
                 },
                 LibsslUprobeAttachRecipe {
                     symbol: LibsslUprobeSymbol::SslWriteEx,
-                    direction: Direction::Outbound,
-                    probes: entry_and_return_probes(),
                 },
             ]
         );
-        assert_eq!(plan.targets[0].recipes[0].function_name(), "SSL_read");
-        assert_eq!(plan.targets[0].recipes[3].function_name(), "SSL_write_ex");
+        assert_eq!(plan.targets[0].recipes[0].function_name(), "SSL_set_fd");
+        assert_eq!(plan.targets[0].recipes[6].function_name(), "SSL_write_ex");
+        assert_recipe(
+            &plan.targets[0].recipes[0],
+            LibsslUprobeSymbolRole::FdAssociation,
+            &[
+                attach_point(
+                    "SSL_set_fd",
+                    EBPF_TLS_SSL_SET_FD_PROGRAM_NAME,
+                    LibsslUprobeAttachKind::Entry,
+                    LibsslUprobeSymbolRole::FdAssociation,
+                ),
+                attach_point(
+                    "SSL_set_fd",
+                    EBPF_TLS_SSL_SET_FD_EXIT_PROGRAM_NAME,
+                    LibsslUprobeAttachKind::Return,
+                    LibsslUprobeSymbolRole::FdAssociation,
+                ),
+            ],
+        );
+        assert_recipe(
+            &plan.targets[0].recipes[1],
+            LibsslUprobeSymbolRole::StateReset,
+            &[
+                attach_point(
+                    "SSL_clear",
+                    EBPF_TLS_SSL_CLEAR_PROGRAM_NAME,
+                    LibsslUprobeAttachKind::Entry,
+                    LibsslUprobeSymbolRole::StateReset,
+                ),
+                attach_point(
+                    "SSL_clear",
+                    EBPF_TLS_SSL_CLEAR_EXIT_PROGRAM_NAME,
+                    LibsslUprobeAttachKind::Return,
+                    LibsslUprobeSymbolRole::StateReset,
+                ),
+            ],
+        );
+        assert_recipe(
+            &plan.targets[0].recipes[2],
+            LibsslUprobeSymbolRole::StateCleanup,
+            &[attach_point(
+                "SSL_free",
+                EBPF_TLS_SSL_FREE_PROGRAM_NAME,
+                LibsslUprobeAttachKind::Entry,
+                LibsslUprobeSymbolRole::StateCleanup,
+            )],
+        );
+        assert_recipe(
+            &plan.targets[0].recipes[3],
+            plaintext(Direction::Inbound),
+            &[
+                attach_point(
+                    "SSL_read",
+                    EBPF_TLS_SSL_READ_ENTER_PROGRAM_NAME,
+                    LibsslUprobeAttachKind::Entry,
+                    plaintext(Direction::Inbound),
+                ),
+                attach_point(
+                    "SSL_read",
+                    EBPF_TLS_SSL_READ_EXIT_PROGRAM_NAME,
+                    LibsslUprobeAttachKind::Return,
+                    plaintext(Direction::Inbound),
+                ),
+            ],
+        );
+        assert_recipe(
+            &plan.targets[0].recipes[6],
+            plaintext(Direction::Outbound),
+            &[
+                attach_point(
+                    "SSL_write_ex",
+                    EBPF_TLS_SSL_WRITE_EX_ENTER_PROGRAM_NAME,
+                    LibsslUprobeAttachKind::Entry,
+                    plaintext(Direction::Outbound),
+                ),
+                attach_point(
+                    "SSL_write_ex",
+                    EBPF_TLS_SSL_WRITE_EX_EXIT_PROGRAM_NAME,
+                    LibsslUprobeAttachKind::Return,
+                    plaintext(Direction::Outbound),
+                ),
+            ],
+        );
     }
 
     #[test]
@@ -222,10 +333,31 @@ mod tests {
         }
     }
 
-    fn entry_and_return_probes() -> [LibsslUprobeAttachProbe; 2] {
-        [
-            LibsslUprobeAttachProbe::new(LibsslUprobeAttachKind::Entry),
-            LibsslUprobeAttachProbe::new(LibsslUprobeAttachKind::Return),
-        ]
+    fn plaintext(direction: Direction) -> LibsslUprobeSymbolRole {
+        LibsslUprobeSymbolRole::Plaintext { direction }
+    }
+
+    fn attach_point(
+        library_symbol: &'static str,
+        program_name: &'static str,
+        kind: LibsslUprobeAttachKind,
+        semantic: LibsslUprobeSymbolRole,
+    ) -> LibsslUprobeAttachPoint {
+        LibsslUprobeAttachPoint {
+            library_symbol,
+            program_name,
+            kind,
+            semantic,
+            offset: 0,
+        }
+    }
+
+    fn assert_recipe(
+        recipe: &LibsslUprobeAttachRecipe,
+        semantic: LibsslUprobeSymbolRole,
+        attach_points: &[LibsslUprobeAttachPoint],
+    ) {
+        assert_eq!(recipe.semantic(), semantic);
+        assert_eq!(recipe.attach_points(), attach_points);
     }
 }

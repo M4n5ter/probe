@@ -1,13 +1,10 @@
 use std::path::PathBuf;
 
+use ebpf_abi::{EbpfTlsDirection, EbpfTlsLibsslSymbol, EbpfTlsUprobeRole};
+use probe_core::Direction;
 use thiserror::Error;
 
-pub(super) const SUPPORTED_LIBSSL_SYMBOLS: [LibsslUprobeSymbol; 4] = [
-    LibsslUprobeSymbol::SslRead,
-    LibsslUprobeSymbol::SslWrite,
-    LibsslUprobeSymbol::SslReadEx,
-    LibsslUprobeSymbol::SslWriteEx,
-];
+pub type LibsslUprobeSymbol = EbpfTlsLibsslSymbol;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibsslUprobeTargetDiscoveryReport {
@@ -63,29 +60,31 @@ pub enum LibsslLibraryKind {
     BoringSslLike,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum LibsslUprobeSymbol {
-    SslRead,
-    SslWrite,
-    SslReadEx,
-    SslWriteEx,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibsslUprobeSymbolRole {
+    Plaintext { direction: Direction },
+    FdAssociation,
+    StateReset,
+    StateCleanup,
 }
 
-impl LibsslUprobeSymbol {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SslRead => "SSL_read",
-            Self::SslWrite => "SSL_write",
-            Self::SslReadEx => "SSL_read_ex",
-            Self::SslWriteEx => "SSL_write_ex",
+impl LibsslUprobeSymbolRole {
+    pub(crate) fn from_ebpf_role(role: EbpfTlsUprobeRole) -> Self {
+        match role {
+            EbpfTlsUprobeRole::Plaintext { direction } => Self::Plaintext {
+                direction: direction_from_ebpf_contract(direction),
+            },
+            EbpfTlsUprobeRole::FdAssociation => Self::FdAssociation,
+            EbpfTlsUprobeRole::StateReset => Self::StateReset,
+            EbpfTlsUprobeRole::StateCleanup => Self::StateCleanup,
         }
     }
+}
 
-    pub(super) fn from_name(name: &str) -> Option<Self> {
-        let stable_name = name.split('@').next().unwrap_or(name);
-        SUPPORTED_LIBSSL_SYMBOLS
-            .into_iter()
-            .find(|symbol| symbol.as_str() == stable_name)
+fn direction_from_ebpf_contract(direction: EbpfTlsDirection) -> Direction {
+    match direction {
+        EbpfTlsDirection::Inbound => Direction::Inbound,
+        EbpfTlsDirection::Outbound => Direction::Outbound,
     }
 }
 
@@ -95,7 +94,7 @@ pub enum LibsslUprobeDegradationReason {
         "TLS library mapping {mapped_path} for pid {pid} is deleted; refusing to plan uprobes against a possibly replaced path"
     )]
     DeletedMapping { pid: u32, mapped_path: PathBuf },
-    #[error("TLS library {mapped_path} has no supported SSL_read/write symbols")]
+    #[error("TLS library {mapped_path} has no supported SSL_read/write plaintext symbols")]
     UnsupportedSymbols { mapped_path: PathBuf },
     #[error("failed to resolve symbols for TLS library {mapped_path}: {reason}")]
     SymbolResolutionFailed {

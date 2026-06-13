@@ -8,9 +8,7 @@ use probe_io::{BoundedFileError, BoundedFileErrorKind, read_bounded_regular_file
 
 #[cfg(target_os = "linux")]
 use super::model::LibsslMappedFileIdentity;
-use super::model::{
-    LibsslMappedLibrary, LibsslUprobeSymbol, LibsslUprobeSymbolFailure, SUPPORTED_LIBSSL_SYMBOLS,
-};
+use super::model::{LibsslMappedLibrary, LibsslUprobeSymbol, LibsslUprobeSymbolFailure};
 
 const MAX_LIBSSL_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -49,8 +47,7 @@ impl LibsslSymbolResolver for ObjectLibsslSymbolResolver {
                 symbols.insert(symbol);
             }
         }
-        Ok(SUPPORTED_LIBSSL_SYMBOLS
-            .into_iter()
+        Ok(LibsslUprobeSymbol::supported_symbols()
             .filter(|symbol| symbols.contains(symbol))
             .collect())
     }
@@ -58,8 +55,7 @@ impl LibsslSymbolResolver for ObjectLibsslSymbolResolver {
 
 pub(super) fn stable_symbol_order(symbols: Vec<LibsslUprobeSymbol>) -> Vec<LibsslUprobeSymbol> {
     let symbols = symbols.into_iter().collect::<BTreeSet<_>>();
-    SUPPORTED_LIBSSL_SYMBOLS
-        .into_iter()
+    LibsslUprobeSymbol::supported_symbols()
         .filter(|symbol| symbols.contains(symbol))
         .collect()
 }

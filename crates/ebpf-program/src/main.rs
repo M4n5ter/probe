@@ -45,7 +45,7 @@ fn emit_connect_attempt(ctx: TracePointContext) {
         connect.observation,
         connect.flags,
     );
-    submit_event(event);
+    submit_process_event(event);
 }
 
 fn emit_close_attempt(ctx: TracePointContext) {
@@ -63,10 +63,10 @@ fn emit_close_attempt(ctx: TracePointContext) {
         command,
         close,
     );
-    submit_event(event);
+    submit_process_event(event);
 }
 
-fn submit_event(event: EbpfProcessProbeEvent) {
+fn submit_process_event(event: EbpfProcessProbeEvent) {
     let Some(mut entry) = SSSA_EVENTS.reserve::<EbpfProcessProbeEvent>(0) else {
         return;
     };

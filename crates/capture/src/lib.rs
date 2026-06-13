@@ -25,9 +25,10 @@ pub use provider::{
 pub use replay::ReplayProvider;
 pub use tls::{
     LibsslExecutableMapping, LibsslLibraryKind, LibsslMappedFileIdentity, LibsslMappedLibrary,
-    LibsslUprobeAttachKind, LibsslUprobeAttachPlan, LibsslUprobeAttachProbe,
+    LibsslUprobeAttachKind, LibsslUprobeAttachPlan, LibsslUprobeAttachPoint,
     LibsslUprobeAttachRecipe, LibsslUprobeAttachTarget, LibsslUprobeDegradationReason,
-    LibsslUprobeDiscoveryError, LibsslUprobeSymbol, LibsslUprobeSymbolFailure, LibsslUprobeTarget,
-    LibsslUprobeTargetDiscovery, LibsslUprobeTargetDiscoveryReport, TlsKeyLogField,
-    TlsKeyLogLabelCount, TlsKeyLogParseError, TlsKeyLogSummary,
+    LibsslUprobeDiscoveryError, LibsslUprobeSymbol, LibsslUprobeSymbolFailure,
+    LibsslUprobeSymbolRole, LibsslUprobeTarget, LibsslUprobeTargetDiscovery,
+    LibsslUprobeTargetDiscoveryReport, TlsKeyLogField, TlsKeyLogLabelCount, TlsKeyLogParseError,
+    TlsKeyLogSummary,
 };

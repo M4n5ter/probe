@@ -4,13 +4,14 @@ use std::{
     process::{Command, ExitCode},
 };
 
-use ebpf_object::{EbpfObjectProbe, EbpfObjectProbeConfig};
+use ebpf_object::{EbpfObjectArtifact, EbpfObjectContract, EbpfObjectProbe, EbpfObjectProbeConfig};
 
 const BPF_TARGET: &str = "bpfel-unknown-none";
 const BPF_LINKER: &str = "bpf-linker";
 const EBPF_MANIFEST: &str = "crates/ebpf-program/Cargo.toml";
 const EBPF_TARGET_DIR: &str = "target/ebpf";
-const EBPF_ARTIFACT: &str = "bpfel-unknown-none/release/ebpf-program";
+const EBPF_PROCESS_ARTIFACT: &str = "bpfel-unknown-none/release/ebpf-program";
+const EBPF_TLS_PLAINTEXT_ARTIFACT: &str = "bpfel-unknown-none/release/ebpf-tls-plaintext";
 
 pub fn run_build() -> ExitCode {
     let config = EbpfBuildConfig::from_xtask_manifest_dir(env!("CARGO_MANIFEST_DIR"));
@@ -46,7 +47,8 @@ struct EbpfBuildConfig {
     repo_root: PathBuf,
     manifest_path: PathBuf,
     target_dir: PathBuf,
-    artifact_path: PathBuf,
+    process_artifact_path: PathBuf,
+    tls_plaintext_artifact_path: PathBuf,
 }
 
 impl EbpfBuildConfig {
@@ -58,12 +60,14 @@ impl EbpfBuildConfig {
             .to_path_buf();
         let manifest_path = repo_root.join(EBPF_MANIFEST);
         let target_dir = repo_root.join(EBPF_TARGET_DIR);
-        let artifact_path = target_dir.join(EBPF_ARTIFACT);
+        let process_artifact_path = target_dir.join(EBPF_PROCESS_ARTIFACT);
+        let tls_plaintext_artifact_path = target_dir.join(EBPF_TLS_PLAINTEXT_ARTIFACT);
         Self {
             repo_root,
             manifest_path,
             target_dir,
-            artifact_path,
+            process_artifact_path,
+            tls_plaintext_artifact_path,
         }
     }
 }
@@ -133,7 +137,7 @@ fn build_ebpf_program(config: &EbpfBuildConfig) -> ExitCode {
         .env("RUSTFLAGS", "-C debuginfo=2 -C link-arg=--btf");
 
     match command.status() {
-        Ok(status) if status.success() => verify_ebpf_object_contract(&config.artifact_path),
+        Ok(status) if status.success() => verify_ebpf_object_contracts(config),
         Ok(_) => ExitCode::FAILURE,
         Err(error) => {
             eprintln!("failed to run eBPF cargo build: {error}");
@@ -195,8 +199,32 @@ fn run_named_command(name: &str, command: &mut Command) -> ExitCode {
     }
 }
 
-fn verify_ebpf_object_contract(path: &Path) -> ExitCode {
-    let report = EbpfObjectProbe::probe(&EbpfObjectProbeConfig::new(path));
+fn verify_ebpf_object_contracts(config: &EbpfBuildConfig) -> ExitCode {
+    for (artifact, path) in [
+        (
+            EbpfObjectArtifact::ProcessObservation,
+            config.process_artifact_path.as_path(),
+        ),
+        (
+            EbpfObjectArtifact::TlsPlaintext,
+            config.tls_plaintext_artifact_path.as_path(),
+        ),
+    ] {
+        if verify_named_ebpf_object_contract(path, artifact.label(), artifact.strict_contract())
+            != ExitCode::SUCCESS
+        {
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn verify_named_ebpf_object_contract(
+    path: &Path,
+    label: &str,
+    contract: EbpfObjectContract,
+) -> ExitCode {
+    let report = EbpfObjectProbe::probe(&EbpfObjectProbeConfig::with_contract(path, contract));
     if !report.preflight_available() {
         let failed_stage = if report.object_available() {
             "contract"
@@ -204,12 +232,15 @@ fn verify_ebpf_object_contract(path: &Path) -> ExitCode {
             "object"
         };
         eprintln!(
-            "built eBPF object failed {failed_stage} preflight: {}",
+            "built eBPF object failed {label} {failed_stage} preflight: {}",
             report.summary()
         );
         return ExitCode::FAILURE;
     }
-    println!("verified built eBPF object contract: {}", report.summary());
+    println!(
+        "verified built eBPF object {label} contract: {}",
+        report.summary()
+    );
     ExitCode::SUCCESS
 }
 

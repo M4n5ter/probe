@@ -86,15 +86,17 @@ impl EbpfProcessObservationProbe {
     pub fn load(
         config: EbpfProcessObservationProbeConfig,
     ) -> Result<Self, EbpfProcessObservationProbeError> {
-        let object = EbpfObjectProbe::preflight(&EbpfObjectProbeConfig::new(config.object_path))
-            .map_err(|report| EbpfProcessObservationProbeError::ObjectPreflight {
-                summary: report.summary(),
-                report,
-            })?;
+        let object = EbpfObjectProbe::preflight(&EbpfObjectProbeConfig::process_observation(
+            config.object_path,
+        ))
+        .map_err(|report| EbpfProcessObservationProbeError::ObjectPreflight {
+            summary: report.summary(),
+            report,
+        })?;
         Self::load_preflighted(object)
     }
 
-    pub fn load_preflighted(
+    fn load_preflighted(
         object: EbpfPreflightedObject,
     ) -> Result<Self, EbpfProcessObservationProbeError> {
         let mut ebpf = Ebpf::load(object.bytes())

@@ -8,9 +8,10 @@ mod reader;
 mod object_fixture;
 
 pub use model::{
-    EbpfExpectedMap, EbpfExpectedProgram, EbpfObjectContract, EbpfObjectContractCheck,
-    EbpfObjectContractInventoryPolicy, EbpfObjectContractReport, EbpfObjectMap, EbpfObjectMapKind,
-    EbpfObjectMapPinning, EbpfObjectProbeConfig, EbpfObjectProbeReport, EbpfObjectProgram,
-    EbpfObjectProgramKind, EbpfPreflightedObject, EbpfProbeCheck,
+    EbpfExpectedMap, EbpfExpectedProgram, EbpfObjectArtifact, EbpfObjectContract,
+    EbpfObjectContractCheck, EbpfObjectContractInventoryPolicy, EbpfObjectContractReport,
+    EbpfObjectMap, EbpfObjectMapKind, EbpfObjectMapPinning, EbpfObjectProbeConfig,
+    EbpfObjectProbeReport, EbpfObjectProgram, EbpfObjectProgramKind, EbpfPreflightedObject,
+    EbpfProbeCheck,
 };
 pub use probe::EbpfObjectProbe;

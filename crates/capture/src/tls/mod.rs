@@ -11,13 +11,13 @@ mod keylog;
 pub(crate) mod plaintext;
 
 pub use attach_plan::{
-    LibsslUprobeAttachKind, LibsslUprobeAttachPlan, LibsslUprobeAttachProbe,
+    LibsslUprobeAttachKind, LibsslUprobeAttachPlan, LibsslUprobeAttachPoint,
     LibsslUprobeAttachRecipe, LibsslUprobeAttachTarget,
 };
 pub use discovery::{
     LibsslExecutableMapping, LibsslLibraryKind, LibsslMappedFileIdentity, LibsslMappedLibrary,
     LibsslUprobeDegradationReason, LibsslUprobeDiscoveryError, LibsslUprobeSymbol,
-    LibsslUprobeSymbolFailure, LibsslUprobeTarget, LibsslUprobeTargetDiscovery,
-    LibsslUprobeTargetDiscoveryReport,
+    LibsslUprobeSymbolFailure, LibsslUprobeSymbolRole, LibsslUprobeTarget,
+    LibsslUprobeTargetDiscovery, LibsslUprobeTargetDiscoveryReport,
 };
 pub use keylog::{TlsKeyLogField, TlsKeyLogLabelCount, TlsKeyLogParseError, TlsKeyLogSummary};

@@ -7,8 +7,8 @@ use std::{
 use super::{
     model::{
         LibsslExecutableMapping, LibsslLibraryKind, LibsslMappedLibrary,
-        LibsslUprobeDegradationReason, LibsslUprobeDiscoveryError, LibsslUprobeTarget,
-        LibsslUprobeTargetDiscoveryReport,
+        LibsslUprobeDegradationReason, LibsslUprobeDiscoveryError, LibsslUprobeSymbol,
+        LibsslUprobeTarget, LibsslUprobeTargetDiscoveryReport,
     },
     proc_maps::{classify_libssl_path, parse_proc_maps_entry, strip_root},
     symbol::{LibsslSymbolResolver, ObjectLibsslSymbolResolver, stable_symbol_order},
@@ -136,7 +136,7 @@ fn discover_targets(
             .resolve_symbols(&candidate.library)
             .map(stable_symbol_order)
         {
-            Ok(symbols) if !symbols.is_empty() => targets.push(LibsslUprobeTarget {
+            Ok(symbols) if has_plaintext_symbol(&symbols) => targets.push(LibsslUprobeTarget {
                 pid,
                 library: candidate.library,
                 library_kind: candidate.library_kind,
@@ -160,6 +160,10 @@ fn discover_targets(
         targets,
         degraded_reasons,
     })
+}
+
+fn has_plaintext_symbol(symbols: &[LibsslUprobeSymbol]) -> bool {
+    symbols.iter().any(|symbol| symbol.captures_plaintext())
 }
 
 #[cfg(test)]
@@ -339,6 +343,39 @@ mod tests {
                 mapped_path,
                 reason: LibsslUprobeSymbolFailure::ParseLibrary { reason, .. },
             } if mapped_path == &PathBuf::from("/usr/lib/libssl.so.3") && reason == "not an ELF object"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_rejects_library_with_lifecycle_symbols_but_no_plaintext_symbol()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = tempdir()?;
+        let pid = 10;
+        let pid_dir = proc.path().join(pid.to_string());
+        fs::create_dir_all(&pid_dir)?;
+        fs::write(
+            pid_dir.join("maps"),
+            "7f0000001000-7f0000010000 r-xp 00001000 08:01 1 /usr/lib/libssl.so.3\n",
+        )?;
+        let resolver = FakeSymbolResolver::new([(
+            PathBuf::from("/usr/lib/libssl.so.3"),
+            FakeSymbolResponse::Symbols(vec![
+                LibsslUprobeSymbol::SslSetFd,
+                LibsslUprobeSymbol::SslClear,
+                LibsslUprobeSymbol::SslFree,
+            ]),
+        )]);
+        let discovery = LibsslUprobeTargetDiscovery::with_proc_root(proc.path());
+
+        let report = discovery.discover_for_pid_with_symbol_resolver(pid, &resolver)?;
+
+        assert!(report.targets.is_empty());
+        assert_eq!(report.degraded_reasons.len(), 1);
+        assert!(matches!(
+            &report.degraded_reasons[0],
+            LibsslUprobeDegradationReason::UnsupportedSymbols { mapped_path }
+                if mapped_path == &PathBuf::from("/usr/lib/libssl.so.3")
         ));
         Ok(())
     }

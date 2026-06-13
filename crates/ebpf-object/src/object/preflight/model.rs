@@ -9,17 +9,45 @@ pub struct EbpfObjectProbeConfig {
 }
 
 impl EbpfObjectProbeConfig {
-    pub fn new(object_path: impl Into<PathBuf>) -> Self {
-        Self {
-            object_path: object_path.into(),
-            contract: EbpfObjectContract::process_probe_scaffold(),
-        }
+    pub fn process_observation(object_path: impl Into<PathBuf>) -> Self {
+        EbpfObjectArtifact::ProcessObservation.probe_config(object_path)
     }
 
     pub fn with_contract(object_path: impl Into<PathBuf>, contract: EbpfObjectContract) -> Self {
         Self {
             object_path: object_path.into(),
             contract,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EbpfObjectArtifact {
+    ProcessObservation,
+    TlsPlaintext,
+}
+
+impl EbpfObjectArtifact {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ProcessObservation => "process",
+            Self::TlsPlaintext => "tls_plaintext",
+        }
+    }
+
+    pub fn strict_contract(self) -> EbpfObjectContract {
+        self.contract()
+            .with_inventory_policy(EbpfObjectContractInventoryPolicy::Strict)
+    }
+
+    pub fn probe_config(self, object_path: impl Into<PathBuf>) -> EbpfObjectProbeConfig {
+        EbpfObjectProbeConfig::with_contract(object_path, self.strict_contract())
+    }
+
+    fn contract(self) -> EbpfObjectContract {
+        match self {
+            Self::ProcessObservation => EbpfObjectContract::process_probe_scaffold(),
+            Self::TlsPlaintext => EbpfObjectContract::tls_plaintext_uprobe(),
         }
     }
 }
@@ -139,6 +167,8 @@ pub struct EbpfObjectProgram {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum EbpfObjectProgramKind {
     Tracepoint,
+    Uprobe,
+    Uretprobe,
     Unsupported,
 }
 
@@ -157,7 +187,21 @@ pub struct EbpfObjectMap {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum EbpfObjectMapKind {
     Ringbuf,
+    Hash,
+    LruHash,
+    PerCpuArray,
     Other { value: u32 },
+}
+
+impl From<ebpf_abi::EbpfMapKind> for EbpfObjectMapKind {
+    fn from(kind: ebpf_abi::EbpfMapKind) -> Self {
+        match kind {
+            ebpf_abi::EbpfMapKind::Ringbuf => Self::Ringbuf,
+            ebpf_abi::EbpfMapKind::Hash => Self::Hash,
+            ebpf_abi::EbpfMapKind::LruHash => Self::LruHash,
+            ebpf_abi::EbpfMapKind::PerCpuArray => Self::PerCpuArray,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
