@@ -15,7 +15,7 @@ use crate::{CaptureError, tls::LibsslUprobeAttachPlan};
 use super::{
     attach::{
         AttachFailurePolicy, LibsslUprobeAttachError, LibsslUprobeAttachRecipeRequest,
-        attach_recipes_from_plan, attach_uprobes,
+        LibsslUprobeAttachedLinks, attach_recipes_from_plan, attach_uprobes,
     },
     provider::LibsslUprobePlaintextSampleSource,
     record::LibsslUprobePlaintextSample,
@@ -65,6 +65,7 @@ pub(in crate::tls::plaintext) enum LibsslUprobePlaintextProbeError {
 
 pub(in crate::tls::plaintext) struct LibsslUprobePlaintextProbe {
     _ebpf: Ebpf,
+    _attached_links: LibsslUprobeAttachedLinks,
     events: RingBuf<MapData>,
 }
 
@@ -110,10 +111,12 @@ impl LibsslUprobePlaintextProbe {
             Ebpf::load(object.bytes()).map_err(|source| LibsslUprobePlaintextProbeError::Load {
                 source: Box::new(source),
             })?;
-        attach_uprobes(&mut ebpf, attach_recipes, AttachFailurePolicy::Strict)?;
+        let attach_outcome =
+            attach_uprobes(&mut ebpf, attach_recipes, AttachFailurePolicy::Strict)?;
         let events = open_events_ringbuf(&mut ebpf)?;
         Ok(Self {
             _ebpf: ebpf,
+            _attached_links: attach_outcome.into_attached_links(),
             events,
         })
     }
@@ -126,16 +129,17 @@ impl LibsslUprobePlaintextProbe {
             Ebpf::load(object.bytes()).map_err(|source| LibsslUprobePlaintextProbeError::Load {
                 source: Box::new(source),
             })?;
-        let attach_summary =
+        let attach_outcome =
             attach_uprobes(&mut ebpf, attach_recipes, AttachFailurePolicy::BestEffort)?;
-        if !attach_summary.has_resolvable_plaintext_recipe() {
+        if !attach_outcome.summary().has_resolvable_plaintext_recipe() {
             return Ok(LibsslUprobePlaintextProbeLoad::Disabled {
-                reason: attach_summary.unresolvable_plaintext_reason(),
+                reason: attach_outcome.summary().unresolvable_plaintext_reason(),
             });
         }
         let events = open_events_ringbuf(&mut ebpf)?;
         Ok(LibsslUprobePlaintextProbeLoad::Enabled(Box::new(Self {
             _ebpf: ebpf,
+            _attached_links: attach_outcome.into_attached_links(),
             events,
         })))
     }

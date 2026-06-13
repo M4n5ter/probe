@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use aya::{
     Ebpf,
@@ -79,6 +82,32 @@ struct LibsslUprobeAttachPointRequest {
     kind: LibsslUprobeAttachKind,
 }
 
+impl LibsslUprobeAttachRecipeRequest {
+    fn target_id(&self) -> LibsslUprobeAttachTargetId {
+        LibsslUprobeAttachTargetId::new(self.process, self.library.clone())
+    }
+}
+
+pub(in crate::tls::plaintext) struct LibsslUprobeAttachedLinks {
+    _links_by_target: BTreeMap<LibsslUprobeAttachTargetId, Vec<AttachedLibsslUprobe>>,
+}
+
+impl LibsslUprobeAttachedLinks {
+    fn push_recipe_links(
+        &mut self,
+        target: LibsslUprobeAttachTargetId,
+        mut links: Vec<AttachedLibsslUprobe>,
+    ) {
+        if links.is_empty() {
+            return;
+        }
+        self._links_by_target
+            .entry(target)
+            .or_default()
+            .append(&mut links);
+    }
+}
+
 struct AttachedLibsslUprobe {
     program_name: &'static str,
     link_id: UProbeLinkId,
@@ -153,23 +182,22 @@ pub(in crate::tls::plaintext) fn attach_uprobes(
     ebpf: &mut Ebpf,
     recipes: &[LibsslUprobeAttachRecipeRequest],
     policy: AttachFailurePolicy,
-) -> Result<LibsslUprobeAttachSummary, LibsslUprobeAttachError> {
+) -> Result<LibsslUprobeAttachOutcome, LibsslUprobeAttachError> {
     let mut loaded_programs = BTreeSet::new();
-    let mut attach_summary = LibsslUprobeAttachSummary::from_recipes(recipes);
+    let mut outcome = LibsslUprobeAttachOutcome::from_recipes(recipes);
     for (recipe_index, recipe) in recipes.iter().enumerate() {
-        if let Err(error) = attach_recipe_uprobes(ebpf, &mut loaded_programs, recipe) {
-            match policy {
+        match attach_recipe_uprobes(ebpf, &mut loaded_programs, recipe) {
+            Ok(links) => outcome.record_recipe_attached(recipe_index, links),
+            Err(error) => match policy {
                 AttachFailurePolicy::Strict => return Err(error),
                 AttachFailurePolicy::BestEffort if is_best_effort_attach_failure(&error) => {
-                    attach_summary.record_failure(&error);
+                    outcome.record_failure(&error);
                 }
                 AttachFailurePolicy::BestEffort => return Err(error),
-            }
-        } else {
-            attach_summary.record_recipe_attached(recipe_index);
+            },
         }
     }
-    Ok(attach_summary)
+    Ok(outcome)
 }
 
 fn is_best_effort_attach_failure(error: &LibsslUprobeAttachError) -> bool {
@@ -185,7 +213,7 @@ fn attach_recipe_uprobes(
     ebpf: &mut Ebpf,
     loaded_programs: &mut BTreeSet<&'static str>,
     recipe: &LibsslUprobeAttachRecipeRequest,
-) -> Result<(), LibsslUprobeAttachError> {
+) -> Result<Vec<AttachedLibsslUprobe>, LibsslUprobeAttachError> {
     attach_target_is_current(recipe)?;
 
     let mut attached = Vec::new();
@@ -197,7 +225,7 @@ fn attach_recipe_uprobes(
             return Err(error);
         }
     }
-    Ok(())
+    Ok(attached)
 }
 
 fn attach_single_uprobe(
@@ -309,12 +337,45 @@ pub(in crate::tls::plaintext) struct LibsslUprobeAttachSummary {
     failure_count: usize,
 }
 
+pub(in crate::tls::plaintext) struct LibsslUprobeAttachOutcome {
+    summary: LibsslUprobeAttachSummary,
+    attached_links: LibsslUprobeAttachedLinks,
+}
+
+impl LibsslUprobeAttachOutcome {
+    fn from_recipes(recipes: &[LibsslUprobeAttachRecipeRequest]) -> Self {
+        Self {
+            summary: LibsslUprobeAttachSummary::from_recipes(recipes),
+            attached_links: LibsslUprobeAttachedLinks {
+                _links_by_target: BTreeMap::new(),
+            },
+        }
+    }
+
+    fn record_recipe_attached(&mut self, recipe_index: usize, links: Vec<AttachedLibsslUprobe>) {
+        let target = self.summary.record_recipe_attached(recipe_index);
+        self.attached_links.push_recipe_links(target, links);
+    }
+
+    fn record_failure(&mut self, error: &LibsslUprobeAttachError) {
+        self.summary.record_failure(error);
+    }
+
+    pub fn summary(&self) -> &LibsslUprobeAttachSummary {
+        &self.summary
+    }
+
+    pub fn into_attached_links(self) -> LibsslUprobeAttachedLinks {
+        self.attached_links
+    }
+}
+
 impl LibsslUprobeAttachSummary {
     fn from_recipes(recipes: &[LibsslUprobeAttachRecipeRequest]) -> Self {
         let recipes = recipes
             .iter()
             .map(|recipe| LibsslUprobeRecipeAttachProgress {
-                target: LibsslUprobeAttachTargetId::new(recipe.process, recipe.library.clone()),
+                target: recipe.target_id(),
                 semantic: recipe.semantic,
                 complete: false,
             })
@@ -326,10 +387,13 @@ impl LibsslUprobeAttachSummary {
         }
     }
 
-    fn record_recipe_attached(&mut self, recipe_index: usize) {
-        if let Some(recipe) = self.recipes.get_mut(recipe_index) {
-            recipe.complete = true;
-        }
+    fn record_recipe_attached(&mut self, recipe_index: usize) -> LibsslUprobeAttachTargetId {
+        let recipe = self
+            .recipes
+            .get_mut(recipe_index)
+            .expect("recipe index should come from the attach recipe list");
+        recipe.complete = true;
+        recipe.target.clone()
     }
 
     fn record_failure(&mut self, error: &LibsslUprobeAttachError) {
@@ -484,13 +548,13 @@ mod tests {
             .iter()
             .position(|recipe| matches!(recipe.semantic, LibsslUprobeSymbolRole::Plaintext { .. }))
             .expect("fixture should include plaintext recipe");
-        let mut summary = LibsslUprobeAttachSummary::from_recipes(&recipes);
+        let mut outcome = LibsslUprobeAttachOutcome::from_recipes(&recipes);
 
-        summary.record_recipe_attached(lifecycle_recipe);
-        assert!(!summary.has_resolvable_plaintext_recipe());
+        outcome.record_recipe_attached(lifecycle_recipe, Vec::new());
+        assert!(!outcome.summary().has_resolvable_plaintext_recipe());
 
-        summary.record_recipe_attached(plaintext_recipe);
-        assert!(summary.has_resolvable_plaintext_recipe());
+        outcome.record_recipe_attached(plaintext_recipe, Vec::new());
+        assert!(outcome.summary().has_resolvable_plaintext_recipe());
         Ok(())
     }
 
@@ -511,13 +575,14 @@ mod tests {
             .iter()
             .position(|recipe| matches!(recipe.semantic, LibsslUprobeSymbolRole::Plaintext { .. }))
             .expect("fixture should include plaintext recipe");
-        let mut summary = LibsslUprobeAttachSummary::from_recipes(&recipes);
+        let mut outcome = LibsslUprobeAttachOutcome::from_recipes(&recipes);
 
-        summary.record_recipe_attached(plaintext_recipe);
+        outcome.record_recipe_attached(plaintext_recipe, Vec::new());
 
-        assert!(!summary.has_resolvable_plaintext_recipe());
+        assert!(!outcome.summary().has_resolvable_plaintext_recipe());
         assert!(
-            summary
+            outcome
+                .summary()
                 .unresolvable_plaintext_reason()
                 .contains("same-target fd association plus plaintext recipe set")
         );
@@ -537,9 +602,9 @@ mod tests {
             }],
         ));
         let recipes = attach_recipes_from_plan(&plan)?;
-        let mut summary = LibsslUprobeAttachSummary::from_recipes(&recipes);
+        let mut outcome = LibsslUprobeAttachOutcome::from_recipes(&recipes);
 
-        summary.record_failure(&LibsslUprobeAttachError::AttachProcess {
+        outcome.record_failure(&LibsslUprobeAttachError::AttachProcess {
             pid: 42,
             source: Box::new(LibsslUprobeProcessGenerationFailure::Changed {
                 path: PathBuf::from("/proc/42/stat"),
@@ -548,7 +613,7 @@ mod tests {
             }),
         });
 
-        let reason = summary.unresolvable_plaintext_reason();
+        let reason = outcome.summary().unresolvable_plaintext_reason();
         assert!(reason.contains("did not complete any same-target fd association"));
         assert!(reason.contains("first attach failure"));
         assert!(reason.contains("process stat /proc/42/stat no longer matches expected starttime"));
