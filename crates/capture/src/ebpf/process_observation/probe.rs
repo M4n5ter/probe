@@ -14,7 +14,7 @@ use ebpf_abi::{
     EBPF_CONNECT_REMOTE_ENDPOINT_VALID, EBPF_CONNECT_SOCKADDR_READ_FAILED,
     EBPF_CONNECT_TRACEPOINT_CATEGORY, EBPF_CONNECT_TRACEPOINT_NAME,
     EBPF_CONNECT_UNSUPPORTED_ADDRESS_FAMILY, EBPF_EVENTS_MAP_NAME, EbpfConnectObservation,
-    EbpfEventDecodeError, EbpfEventKind, EbpfProcessProbeEvent, decode_process_probe_event,
+    EbpfEventDecodeError, EbpfProcessProbeEvent, decode_process_probe_event,
 };
 use ebpf_object::{
     EbpfObjectProbe, EbpfObjectProbeConfig, EbpfObjectProbeReport, EbpfPreflightedObject,
@@ -66,8 +66,6 @@ pub enum EbpfProcessObservationProbeError {
     },
     #[error("failed to decode eBPF process observation: {error:?}")]
     Decode { error: EbpfEventDecodeError },
-    #[error("decoded eBPF event kind {value} is not a process observation")]
-    UnsupportedObservationKind { value: u16 },
 }
 
 impl EbpfProcessObservationProbeError {
@@ -191,7 +189,7 @@ fn process_observation_from_event(
     event: EbpfProcessProbeEvent,
 ) -> Result<EbpfProcessObservation, EbpfProcessObservationProbeError> {
     match event.kind() {
-        Some(EbpfEventKind::ConnectTracepointObserved) => {
+        Some(ebpf_abi::EbpfEventKind::ConnectTracepointObserved) => {
             let connect = connect_observation_from_event(&event);
             Ok(EbpfProcessObservation::Connect(
                 EbpfConnectTracepointObservation {
@@ -202,7 +200,7 @@ fn process_observation_from_event(
                 },
             ))
         }
-        Some(EbpfEventKind::CloseTracepointObserved) => {
+        Some(ebpf_abi::EbpfEventKind::CloseTracepointObserved) => {
             let close = close_observation_from_event(&event);
             Ok(EbpfProcessObservation::Close(
                 EbpfCloseTracepointObservation {
@@ -211,11 +209,7 @@ fn process_observation_from_event(
                 },
             ))
         }
-        None => Err(
-            EbpfProcessObservationProbeError::UnsupportedObservationKind {
-                value: event.kind_wire(),
-            },
-        ),
+        _ => unreachable!("decode_process_probe_event only accepts process observation events"),
     }
 }
 
