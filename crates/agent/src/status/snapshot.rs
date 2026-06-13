@@ -388,7 +388,6 @@ mod tests {
         config_with_storage_path, runtime_plan_from_config, test_dir,
     };
     use super::*;
-    use capture::LibsslUprobePlaintextReconcile;
     use probe_config::{
         EnforcementPolicyManifest, EnforcementPolicySourceConfig, TlsMaterialConfig,
         TlsMaterialKind,
@@ -400,7 +399,9 @@ mod tests {
     use serde_json::json;
     use storage::SpoolPayload;
 
-    use crate::tls_plaintext::{TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot};
+    use crate::tls_plaintext::{
+        TlsPlaintextReconcileRuntimeSnapshot, TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot,
+    };
 
     #[test]
     fn status_snapshot_reports_sink_lag_and_health() -> Result<(), Box<dyn std::error::Error>> {
@@ -654,16 +655,19 @@ mod tests {
             BTreeMap::new(),
         );
         let runtime = RuntimeStatusInput {
-            tls_plaintext: Some(
-                TlsPlaintextRuntimeSnapshot::disabled(
-                    "libssl uprobe attach planning produced no attachable targets",
-                )
-                .with_reconcile_success(LibsslUprobePlaintextReconcile {
+            tls_plaintext: Some(TlsPlaintextRuntimeSnapshot {
+                mode: TlsPlaintextRuntimeMode::Disabled,
+                reason: Some(
+                    "libssl uprobe attach planning produced no attachable targets".to_string(),
+                ),
+                last_reconcile: Some(TlsPlaintextReconcileRuntimeSnapshot {
+                    sequence: 7,
+                    observed_unix_ns: 99,
                     attached_targets: 1,
                     detached_targets: 0,
                     active_targets: 1,
                 }),
-            ),
+            }),
             ..RuntimeStatusInput::default()
         };
 
@@ -695,6 +699,14 @@ mod tests {
         assert_eq!(
             value["tls"]["plaintext"]["runtime"]["last_reconcile"]["active_targets"],
             json!(1)
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["runtime"]["last_reconcile"]["sequence"],
+            json!(7)
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["runtime"]["last_reconcile"]["observed_unix_ns"],
+            json!(99)
         );
         assert_eq!(snapshot.metrics.capabilities.unavailable, 1);
         assert_eq!(snapshot.health.mode, RuntimeMode::Degraded);

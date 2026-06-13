@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use attribution::ProcfsSocketResolver;
@@ -60,18 +60,31 @@ impl TlsPlaintextRuntimeSnapshot {
             last_reconcile: None,
         }
     }
-
-    pub(crate) fn with_reconcile_success(mut self, result: LibsslUprobePlaintextReconcile) -> Self {
-        self.last_reconcile = Some(TlsPlaintextReconcileRuntimeSnapshot::from(result));
-        self
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct TlsPlaintextReconcileRuntimeSnapshot {
+    pub sequence: u64,
+    pub observed_unix_ns: u64,
     pub attached_targets: u64,
     pub detached_targets: u64,
     pub active_targets: u64,
+}
+
+impl TlsPlaintextReconcileRuntimeSnapshot {
+    fn from_reconcile_success(
+        result: LibsslUprobePlaintextReconcile,
+        sequence: u64,
+        observed_unix_ns: u64,
+    ) -> Self {
+        Self {
+            sequence,
+            observed_unix_ns,
+            attached_targets: result.attached_targets as u64,
+            detached_targets: result.detached_targets as u64,
+            active_targets: result.active_targets as u64,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -132,11 +145,32 @@ impl TlsPlaintextRuntimeState {
     }
 
     fn record_reconcile_success(&self, result: LibsslUprobePlaintextReconcile) {
+        self.record_reconcile_success_at(result, current_unix_time_ns());
+    }
+
+    fn record_reconcile_success_at(
+        &self,
+        result: LibsslUprobePlaintextReconcile,
+        observed_unix_ns: u64,
+    ) {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *inner = TlsPlaintextRuntimeSnapshot::enabled().with_reconcile_success(result);
+        let sequence = inner
+            .last_reconcile
+            .map_or(1, |last| last.sequence.saturating_add(1));
+        *inner = TlsPlaintextRuntimeSnapshot {
+            mode: TlsPlaintextRuntimeMode::Enabled,
+            reason: None,
+            last_reconcile: Some(
+                TlsPlaintextReconcileRuntimeSnapshot::from_reconcile_success(
+                    result,
+                    sequence,
+                    observed_unix_ns,
+                ),
+            ),
+        };
     }
 
     pub(crate) fn snapshot(&self) -> TlsPlaintextRuntimeSnapshot {
@@ -254,20 +288,18 @@ impl TlsPlaintextProviderBuild {
     }
 }
 
-impl From<LibsslUprobePlaintextReconcile> for TlsPlaintextReconcileRuntimeSnapshot {
-    fn from(value: LibsslUprobePlaintextReconcile) -> Self {
-        Self {
-            attached_targets: value.attached_targets as u64,
-            detached_targets: value.detached_targets as u64,
-            active_targets: value.active_targets as u64,
-        }
-    }
-}
-
 impl LibsslUprobePlaintextReconcileObserver for TlsPlaintextRuntimeState {
     fn record_reconcile_success(&self, result: LibsslUprobePlaintextReconcile) {
         TlsPlaintextRuntimeState::record_reconcile_success(self, result);
     }
+}
+
+fn current_unix_time_ns() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
 #[derive(Default)]
@@ -450,11 +482,22 @@ mod tests {
         )));
 
         assert_eq!(runtime.snapshot().mode, TlsPlaintextRuntimeMode::Enabled);
-        runtime.record_reconcile_success(LibsslUprobePlaintextReconcile {
-            attached_targets: 2,
-            detached_targets: 1,
-            active_targets: 3,
-        });
+        runtime.record_reconcile_success_at(
+            LibsslUprobePlaintextReconcile {
+                attached_targets: 2,
+                detached_targets: 1,
+                active_targets: 3,
+            },
+            100,
+        );
+        runtime.record_reconcile_success_at(
+            LibsslUprobePlaintextReconcile {
+                attached_targets: 4,
+                detached_targets: 2,
+                active_targets: 5,
+            },
+            200,
+        );
 
         runtime.record_provider_disabled(
             "best-effort capture provider libssl_uprobe_plaintext disabled after error: boom",
@@ -469,9 +512,11 @@ mod tests {
         let reconcile = snapshot
             .last_reconcile
             .expect("last successful reconcile should be retained after disable");
-        assert_eq!(reconcile.attached_targets, 2);
-        assert_eq!(reconcile.detached_targets, 1);
-        assert_eq!(reconcile.active_targets, 3);
+        assert_eq!(reconcile.sequence, 2);
+        assert_eq!(reconcile.observed_unix_ns, 200);
+        assert_eq!(reconcile.attached_targets, 4);
+        assert_eq!(reconcile.detached_targets, 2);
+        assert_eq!(reconcile.active_targets, 5);
     }
 
     struct NoopCaptureProvider;
