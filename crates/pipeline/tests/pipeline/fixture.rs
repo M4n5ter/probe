@@ -1,4 +1,6 @@
-use capture::{CaptureError, CaptureEvent, CaptureProvider, CaptureProviderKind, CapturedBytes};
+use capture::{
+    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind, CapturedBytes,
+};
 use probe_core::{
     AddressPort, CapabilityState, CaptureSource, Direction, EventEnvelope, FlowContext,
     FlowIdentity, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
@@ -25,16 +27,16 @@ impl CaptureProvider for SequenceProvider {
         CaptureProviderKind::Replay
     }
 
-    fn source(&self) -> CaptureSource {
-        CaptureSource::Replay
-    }
-
     fn capabilities(&self) -> Vec<CapabilityState> {
         Vec::new()
     }
 
-    fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
-        Ok(self.events.next())
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+        Ok(self
+            .events
+            .next()
+            .map(CapturePoll::event)
+            .unwrap_or(CapturePoll::Finished))
     }
 }
 

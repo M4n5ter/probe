@@ -74,7 +74,7 @@ fn capability_from_object_report(
     CapabilityState::degraded(
         CapabilityKind::LibsslUprobe,
         format!(
-            "eBPF TLS plaintext object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the capture loader exists, but agent dynamic attach lifecycle and flow resolver runtime wiring are not implemented",
+            "eBPF TLS plaintext object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and agent startup attach wiring can build a plaintext sidecar provider, but dynamic process reconcile, detach lifecycle, strong fd ownership, and low-latency provider multiplexing remain best-effort",
             object.summary()
         ),
     )
@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_stays_degraded_until_runtime_wiring_exists() {
+    fn capability_stays_degraded_until_dynamic_lifecycle_exists() {
         let capability = capability_from_object_report(
             available_tls_plaintext_object_report(),
             &procfs_socket_attribution_capability(RuntimeMode::Degraded),
@@ -148,11 +148,12 @@ mod tests {
         assert_eq!(capability.mode, RuntimeMode::Degraded);
         let reason = capability
             .reason
-            .expect("degraded TLS capability must explain the remaining runtime gap");
+            .expect("degraded TLS capability must explain the remaining lifecycle gap");
         assert!(reason.contains("eBPF TLS plaintext object preflight via aya-obj succeeded"));
         assert!(reason.contains("procfs socket attribution is usable"));
-        assert!(reason.contains("dynamic attach lifecycle"));
-        assert!(reason.contains("flow resolver runtime wiring"));
+        assert!(reason.contains("startup attach wiring"));
+        assert!(reason.contains("dynamic process reconcile"));
+        assert!(reason.contains("provider multiplexing"));
     }
 
     #[test]

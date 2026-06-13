@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pcap::{Active, Capture, Device, Linktype, PacketHeader};
 use probe_core::{CapabilityKind, CapabilityState, CaptureSource, Timestamp};
 
 use crate::ProcessResolver;
-use crate::{CaptureError, CaptureEvent, CaptureProvider, CaptureProviderKind};
+use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind};
 
 use super::decoder::DecodedTcpSegment;
 use super::flow::{
@@ -45,7 +45,40 @@ pub struct LibpcapProvider {
     streams: StreamTracker,
     process_resolver: Option<Box<dyn ProcessResolver>>,
     pending_events: VecDeque<CaptureEvent>,
+    pending_flush: PendingStreamFlush,
     packet_sequence: u64,
+}
+
+struct PendingStreamFlush {
+    interval: Duration,
+    deadline: Option<Instant>,
+}
+
+impl PendingStreamFlush {
+    fn from_read_timeout_ms(read_timeout_ms: i32) -> Self {
+        Self {
+            interval: Duration::from_millis(read_timeout_ms.max(0) as u64),
+            deadline: None,
+        }
+    }
+
+    fn observe(&mut self, has_pending: bool, now: Instant) {
+        if has_pending {
+            self.deadline.get_or_insert(now + self.interval);
+        } else {
+            self.deadline = None;
+        }
+    }
+
+    fn should_flush(&mut self, has_pending: bool, now: Instant) -> bool {
+        self.observe(has_pending, now);
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    fn after_flush(&mut self, has_pending: bool, now: Instant) {
+        self.deadline = None;
+        self.observe(has_pending, now);
+    }
 }
 
 impl LibpcapProvider {
@@ -57,6 +90,7 @@ impl LibpcapProvider {
         config: LibpcapConfig,
         process_resolver: Option<Box<dyn ProcessResolver>>,
     ) -> Result<Self, CaptureError> {
+        let pending_flush = PendingStreamFlush::from_read_timeout_ms(config.read_timeout_ms);
         let device = resolve_device(config.interface.as_deref())?;
         let mut inactive = Capture::from_device(device)
             .map_err(|error| pcap_error("create capture", error))?
@@ -75,6 +109,9 @@ impl LibpcapProvider {
                 .filter(&config.bpf_filter, true)
                 .map_err(|error| pcap_error("install BPF filter", error))?;
         }
+        let capture = capture
+            .setnonblock()
+            .map_err(|error| pcap_error("set nonblocking mode", error))?;
         let datalink = capture.get_datalink();
         Ok(Self {
             capture,
@@ -83,6 +120,7 @@ impl LibpcapProvider {
             streams: StreamTracker::default(),
             process_resolver,
             pending_events: VecDeque::new(),
+            pending_flush,
             packet_sequence: 0,
         })
     }
@@ -91,53 +129,79 @@ impl LibpcapProvider {
         Self::open(config.clone()).map(|_| ())
     }
 
-    fn next_decoded(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
-        loop {
-            if let Some(event) = self.pending_events.pop_front() {
-                return Ok(Some(event));
-            }
-            let (header, data) = match self.capture.next_packet() {
-                Ok(packet) => (*packet.header, packet.data.to_vec()),
-                Err(pcap::Error::TimeoutExpired) => {
-                    if self.streams.has_pending() {
-                        let timestamp = self.timeout_timestamp();
-                        self.pending_events
-                            .extend(self.streams.flush_pending(timestamp));
-                        if let Some(event) = self.pending_events.pop_front() {
-                            return Ok(Some(event));
-                        }
-                    }
-                    continue;
-                }
-                Err(error) => return Err(pcap_error("read packet", error)),
-            };
-            let Some(decoded) = DecodedTcpSegment::decode(self.datalink, &data) else {
-                continue;
-            };
-            let timestamp = self.next_timestamp(&header);
-            if decoded.payload.is_empty() {
-                if decoded.has_lifecycle_signal() {
-                    let observation = self.observe_lifecycle(&decoded, timestamp);
-                    self.pending_events
-                        .extend(event_sequence_from_lifecycle_observation(
-                            &mut self.streams,
-                            timestamp,
-                            observation,
-                        ));
-                    if let Some(event) = self.pending_events.pop_front() {
-                        return Ok(Some(event));
-                    }
-                }
-                continue;
-            }
-            let observation = self.observe_flow(&decoded, timestamp);
-            let events =
-                self.event_sequence_from_payload_observation(timestamp, decoded, observation);
-            self.pending_events.extend(events);
-            if let Some(event) = self.pending_events.pop_front() {
-                return Ok(Some(event));
-            }
+    fn poll_decoded(&mut self) -> Result<CapturePoll, CaptureError> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(CapturePoll::event(event));
         }
+        if let Some(poll) = self.flush_pending_if_due() {
+            return Ok(poll);
+        }
+        let (header, data) = match self.capture.next_packet() {
+            Ok(packet) => (*packet.header, packet.data.to_vec()),
+            Err(pcap::Error::TimeoutExpired) => {
+                return Ok(self.flush_pending_or_idle());
+            }
+            Err(error) => return Err(pcap_error("read packet", error)),
+        };
+        let Some(decoded) = DecodedTcpSegment::decode(self.datalink, &data) else {
+            self.refresh_pending_flush_deadline();
+            return Ok(CapturePoll::Progress);
+        };
+        let timestamp = self.next_timestamp(&header);
+        if decoded.payload.is_empty() {
+            if decoded.has_lifecycle_signal() {
+                let observation = self.observe_lifecycle(&decoded, timestamp);
+                self.pending_events
+                    .extend(event_sequence_from_lifecycle_observation(
+                        &mut self.streams,
+                        timestamp,
+                        observation,
+                    ));
+                if let Some(event) = self.pending_events.pop_front() {
+                    self.refresh_pending_flush_deadline();
+                    return Ok(CapturePoll::event(event));
+                }
+            }
+            self.refresh_pending_flush_deadline();
+            return Ok(CapturePoll::Progress);
+        }
+        let observation = self.observe_flow(&decoded, timestamp);
+        let events = self.event_sequence_from_payload_observation(timestamp, decoded, observation);
+        self.pending_events.extend(events);
+        let poll = self
+            .pending_events
+            .pop_front()
+            .map(CapturePoll::event)
+            .unwrap_or(CapturePoll::Progress);
+        self.refresh_pending_flush_deadline();
+        Ok(poll)
+    }
+
+    fn flush_pending_or_idle(&mut self) -> CapturePoll {
+        self.flush_pending_if_due().unwrap_or(CapturePoll::Idle)
+    }
+
+    fn flush_pending_if_due(&mut self) -> Option<CapturePoll> {
+        if self
+            .pending_flush
+            .should_flush(self.streams.has_pending(), Instant::now())
+        {
+            let timestamp = self.timeout_timestamp();
+            self.pending_events
+                .extend(self.streams.flush_pending(timestamp));
+            self.pending_flush
+                .after_flush(self.streams.has_pending(), Instant::now());
+            if let Some(event) = self.pending_events.pop_front() {
+                return Some(CapturePoll::event(event));
+            }
+            return Some(CapturePoll::Progress);
+        }
+        None
+    }
+
+    fn refresh_pending_flush_deadline(&mut self) {
+        self.pending_flush
+            .observe(self.streams.has_pending(), Instant::now());
     }
 
     fn next_timestamp(&mut self, header: &PacketHeader) -> Timestamp {
@@ -261,16 +325,12 @@ impl CaptureProvider for LibpcapProvider {
         CaptureProviderKind::Libpcap
     }
 
-    fn source(&self) -> CaptureSource {
-        CaptureSource::Libpcap
-    }
-
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::available(CapabilityKind::Libpcap)]
     }
 
-    fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
-        self.next_decoded()
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_decoded()
     }
 }
 
@@ -311,6 +371,30 @@ mod tests {
     };
     use super::*;
     use crate::libpcap::decoder::TcpFlags;
+
+    #[test]
+    fn pending_stream_flush_waits_until_read_timeout_elapses() {
+        let start = Instant::now();
+        let mut pending_flush = PendingStreamFlush::from_read_timeout_ms(1_000);
+
+        pending_flush.observe(true, start);
+
+        assert!(!pending_flush.should_flush(true, start + Duration::from_millis(999)));
+        assert!(pending_flush.should_flush(true, start + Duration::from_millis(1_000)));
+    }
+
+    #[test]
+    fn pending_stream_flush_clears_deadline_when_streams_resolve() {
+        let start = Instant::now();
+        let mut pending_flush = PendingStreamFlush::from_read_timeout_ms(1_000);
+
+        pending_flush.observe(true, start);
+        pending_flush.observe(false, start + Duration::from_millis(500));
+        pending_flush.observe(true, start + Duration::from_millis(600));
+
+        assert!(!pending_flush.should_flush(true, start + Duration::from_millis(1_500)));
+        assert!(pending_flush.should_flush(true, start + Duration::from_millis(1_600)));
+    }
 
     #[test]
     fn event_sequence_places_stale_close_before_new_bytes() {

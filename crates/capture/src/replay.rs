@@ -6,7 +6,7 @@ use probe_core::{
 use crate::{
     CapturedBytes,
     event::CaptureEvent,
-    provider::{CaptureError, CaptureProvider, CaptureProviderKind},
+    provider::{CaptureError, CapturePoll, CaptureProvider, CaptureProviderKind},
 };
 
 pub struct ReplayProvider {
@@ -41,22 +41,18 @@ impl CaptureProvider for ReplayProvider {
         CaptureProviderKind::Replay
     }
 
-    fn source(&self) -> CaptureSource {
-        CaptureSource::Replay
-    }
-
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::available(CapabilityKind::ReplayCapture)]
     }
 
-    fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
         let Some(bytes) = self.bytes.take() else {
-            return Ok(None);
+            return Ok(CapturePoll::Finished);
         };
-        Ok(Some(CaptureEvent::Bytes(CapturedBytes {
+        Ok(CapturePoll::event(CaptureEvent::Bytes(CapturedBytes {
             timestamp: self.timestamp,
             flow: self.flow.clone(),
-            source: self.source(),
+            source: CaptureSource::Replay,
             provider: self.kind(),
             direction: self.direction,
             stream_offset: 0,

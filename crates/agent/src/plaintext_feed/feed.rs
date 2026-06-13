@@ -5,12 +5,12 @@ use std::{
 };
 
 use capture::{
-    CaptureError, CaptureEvent, CaptureProvider, CaptureProviderKind, PlaintextChunk,
+    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind, PlaintextChunk,
     PlaintextConnection, PlaintextEvent, PlaintextGap, PlaintextSource,
 };
 use probe_core::{
-    AddressPort, CapabilityKind, CapabilityState, CaptureSource, Direction, FlowContext,
-    FlowIdentity, Gap, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+    AddressPort, CapabilityKind, CapabilityState, Direction, FlowContext, FlowIdentity, Gap,
+    ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -105,19 +105,20 @@ where
         CaptureProviderKind::Plaintext
     }
 
-    fn source(&self) -> CaptureSource {
-        CaptureSource::ExternalPlaintextFeed
-    }
-
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::available(
             CapabilityKind::ExternalPlaintextFeed,
         )]
     }
 
-    fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
         self.read_next_event()
-            .map(|event| event.map(CaptureEvent::from))
+            .map(|event| {
+                event
+                    .map(CaptureEvent::from)
+                    .map(CapturePoll::event)
+                    .unwrap_or(CapturePoll::Finished)
+            })
             .map_err(|error| CaptureError::provider(PROVIDER_NAME, error.to_string()))
     }
 }
@@ -466,6 +467,8 @@ mod tests {
         io::Cursor,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    use probe_core::CaptureSource;
 
     use super::*;
 

@@ -33,6 +33,7 @@ use crate::{
         drain_replay_webhook, spawn_export_retention_worker,
     },
     status::{build_status_snapshot, collect_spool_status},
+    tls_plaintext::TlsPlaintextRuntimeState,
 };
 
 const INGRESS_RECOVERY_BATCH_SIZE: usize = 1_024;
@@ -171,10 +172,12 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let mut parser_factory = Http1ParserFactory::default();
             let export_worker = export_worker_config_from_plan(&plan).map(ExportWorker::new);
             let pipeline_metrics = PipelineRuntimeMetrics::default();
+            let tls_plaintext_runtime = TlsPlaintextRuntimeState::for_plan(&plan);
             let admin_runtime_state = AdminRuntimeState {
                 enforcement_policy_source: enforcement.policy_source.clone(),
                 export_worker: export_worker.as_ref().map(ExportWorker::runtime_state),
                 pipeline: Some(pipeline_metrics.clone()),
+                tls_plaintext: Some(tls_plaintext_runtime.clone()),
             };
             let admin_server = admin_server_config_from_plan(&plan)
                 .map(|config| {
@@ -209,7 +212,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 let mut summary =
                     pipeline.recover_ingress_journal_until_idle(INGRESS_RECOVERY_BATCH_SIZE)?;
                 let mut pipeline = pipeline.with_enforcement_planner(&mut enforcement.planner);
-                let mut provider = build_capture_provider(&plan)?;
+                let mut provider = build_capture_provider(&plan, Some(&tls_plaintext_runtime))?;
                 let capture_summary = pipeline.run_provider_with_options(
                     provider.as_mut(),
                     PipelineRunOptions { max_events },

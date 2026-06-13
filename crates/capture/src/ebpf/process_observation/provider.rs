@@ -1,12 +1,11 @@
 use std::{
     collections::{HashMap, VecDeque},
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use probe_core::{CapabilityKind, CapabilityState, CaptureSource, FlowContext, Timestamp};
 
-use crate::{CaptureError, CaptureEvent, CaptureProvider, CaptureProviderKind};
+use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind};
 
 use super::{
     EbpfCloseTracepointObservation, EbpfConnectFlowResolver, EbpfConnectTracepointObservation,
@@ -14,7 +13,6 @@ use super::{
     connect_opened_event_from_observation, unresolved_connect_gap_from_observation,
 };
 
-const DEFAULT_IDLE_SLEEP: Duration = Duration::from_millis(10);
 const DEFAULT_RESOLUTION_RETRIES: u32 = 20;
 const DEFAULT_RESOLUTION_RETRY_SLEEP: Duration = Duration::from_millis(5);
 const MAX_TRACKED_EBPF_FLOWS: usize = 8192;
@@ -23,11 +21,11 @@ pub struct EbpfProcessObservationProvider {
     observations: Box<dyn EbpfObservationSource>,
     resolver: Box<dyn EbpfConnectFlowResolver>,
     clock: EbpfObservationClock,
-    idle_sleep: Duration,
     resolution_retries: u32,
     resolution_retry_sleep: Duration,
     stop_when_idle: bool,
     tracked_flows: TrackedEbpfFlows,
+    pending_connect: Option<PendingEbpfConnectResolution>,
 }
 
 impl EbpfProcessObservationProvider {
@@ -41,11 +39,11 @@ impl EbpfProcessObservationProvider {
             observations: Box::new(ProbeObservationSource { probe }),
             resolver,
             clock: EbpfObservationClock::default(),
-            idle_sleep: DEFAULT_IDLE_SLEEP,
             resolution_retries: DEFAULT_RESOLUTION_RETRIES,
             resolution_retry_sleep: DEFAULT_RESOLUTION_RETRY_SLEEP,
             stop_when_idle: false,
             tracked_flows: TrackedEbpfFlows::bounded(MAX_TRACKED_EBPF_FLOWS),
+            pending_connect: None,
         })
     }
 
@@ -60,11 +58,11 @@ impl EbpfProcessObservationProvider {
             }),
             resolver,
             clock: EbpfObservationClock::default(),
-            idle_sleep: Duration::ZERO,
             resolution_retries: 0,
             resolution_retry_sleep: Duration::ZERO,
             stop_when_idle: true,
             tracked_flows: TrackedEbpfFlows::bounded(MAX_TRACKED_EBPF_FLOWS),
+            pending_connect: None,
         }
     }
 
@@ -74,41 +72,80 @@ impl EbpfProcessObservationProvider {
         self
     }
 
-    fn next_event(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
-        loop {
-            let Some(observation) = self.observations.next_observation()? else {
-                if self.stop_when_idle {
-                    return Ok(None);
-                }
-                thread::sleep(self.idle_sleep);
-                continue;
-            };
-            if let Some(event) = self.event_from_observation(observation)? {
-                return Ok(Some(event));
-            }
+    fn poll_event(&mut self) -> Result<CapturePoll, CaptureError> {
+        if self.pending_connect.is_some() {
+            return self.poll_pending_connect_resolution();
         }
+        let Some(observation) = self.observations.next_observation()? else {
+            return Ok(if self.stop_when_idle {
+                CapturePoll::Finished
+            } else {
+                CapturePoll::Idle
+            });
+        };
+        self.poll_observation(observation)
     }
 
-    fn event_from_observation(
+    fn poll_observation(
         &mut self,
         observation: EbpfProcessObservation,
-    ) -> Result<Option<CaptureEvent>, CaptureError> {
+    ) -> Result<CapturePoll, CaptureError> {
         match observation {
-            EbpfProcessObservation::Connect(connect) => self.connect_event(&connect).map(Some),
-            EbpfProcessObservation::Close(close) => Ok(self.close_event(&close)),
+            EbpfProcessObservation::Connect(connect) => {
+                self.pending_connect = Some(PendingEbpfConnectResolution::new(
+                    connect,
+                    self.clock.next_timestamp(),
+                ));
+                self.poll_pending_connect_resolution()
+            }
+            EbpfProcessObservation::Close(close) => Ok(self
+                .close_event(&close)
+                .map(CapturePoll::event)
+                .unwrap_or(CapturePoll::Progress)),
         }
     }
 
-    fn connect_event(
+    fn poll_pending_connect_resolution(&mut self) -> Result<CapturePoll, CaptureError> {
+        let Some(mut pending) = self.pending_connect.take() else {
+            return Ok(CapturePoll::Idle);
+        };
+        if let Some(retry_at) = pending.retry_at
+            && Instant::now() < retry_at
+        {
+            self.pending_connect = Some(pending);
+            return Ok(CapturePoll::Idle);
+        }
+        if let Some(event) = connect_opened_event_from_observation(
+            &pending.connect,
+            pending.timestamp,
+            self.resolver.as_mut(),
+        )? {
+            self.track_connect_event(&pending.connect, &event);
+            return Ok(CapturePoll::event(event));
+        }
+        if pending.attempts_completed >= self.resolution_retries {
+            return Ok(CapturePoll::event(unresolved_connect_gap_from_observation(
+                &pending.connect,
+                pending.timestamp,
+                self.unresolved_connect_reason(&pending.connect),
+            )));
+        }
+        pending.attempts_completed = pending.attempts_completed.saturating_add(1);
+        pending.retry_at = Some(Instant::now() + self.resolution_retry_sleep);
+        self.resolver.invalidate_cached_resolution();
+        self.pending_connect = Some(pending);
+        Ok(CapturePoll::Progress)
+    }
+
+    fn track_connect_event(
         &mut self,
         connect: &EbpfConnectTracepointObservation,
-    ) -> Result<CaptureEvent, CaptureError> {
-        let event = self.connect_event_with_retry(connect)?;
+        event: &CaptureEvent,
+    ) {
         if let CaptureEvent::ConnectionOpened { flow, .. } = &event {
             self.tracked_flows
                 .insert(EbpfDescriptorKey::from_connect(connect), flow.clone());
         }
-        Ok(event)
     }
 
     fn close_event(&mut self, close: &EbpfCloseTracepointObservation) -> Option<CaptureEvent> {
@@ -121,34 +158,6 @@ impl EbpfProcessObservationProvider {
             source: CaptureSource::EbpfSyscall,
             provider: CaptureProviderKind::Ebpf,
         })
-    }
-
-    fn connect_event_with_retry(
-        &mut self,
-        connect: &EbpfConnectTracepointObservation,
-    ) -> Result<CaptureEvent, CaptureError> {
-        let timestamp = self.clock.next_timestamp();
-        for attempt in 0..=self.resolution_retries {
-            if let Some(event) =
-                connect_opened_event_from_observation(connect, timestamp, self.resolver.as_mut())?
-            {
-                return Ok(event);
-            }
-            if attempt == self.resolution_retries {
-                return Ok(unresolved_connect_gap_from_observation(
-                    connect,
-                    timestamp,
-                    self.unresolved_connect_reason(connect),
-                ));
-            }
-            self.resolver.invalidate_cached_resolution();
-            thread::sleep(self.resolution_retry_sleep);
-        }
-        Ok(unresolved_connect_gap_from_observation(
-            connect,
-            timestamp,
-            self.unresolved_connect_reason(connect),
-        ))
     }
 
     fn unresolved_connect_reason(&self, connect: &EbpfConnectTracepointObservation) -> String {
@@ -171,10 +180,6 @@ impl CaptureProvider for EbpfProcessObservationProvider {
         CaptureProviderKind::Ebpf
     }
 
-    fn source(&self) -> CaptureSource {
-        CaptureSource::EbpfSyscall
-    }
-
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
@@ -182,8 +187,26 @@ impl CaptureProvider for EbpfProcessObservationProvider {
         )]
     }
 
-    fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
-        self.next_event()
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_event()
+    }
+}
+
+struct PendingEbpfConnectResolution {
+    connect: EbpfConnectTracepointObservation,
+    timestamp: Timestamp,
+    attempts_completed: u32,
+    retry_at: Option<Instant>,
+}
+
+impl PendingEbpfConnectResolution {
+    fn new(connect: EbpfConnectTracepointObservation, timestamp: Timestamp) -> Self {
+        Self {
+            connect,
+            timestamp,
+            attempts_completed: 0,
+            retry_at: None,
+        }
     }
 }
 

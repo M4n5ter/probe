@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use probe_config::{TlsMaterialKind, TlsPlaintextProvider};
-use probe_core::{CapabilityKind, RuntimeMode};
+use probe_core::{CapabilityKind, CapabilityMatrix, RuntimeMode};
 use runtime::{RuntimePlan, TlsPlaintextCapabilityPlan, TlsPlaintextMaterialPlan};
 use serde::Serialize;
 
 use crate::tls_material::{FilesystemTlsMaterialStore, TlsMaterialFileStore};
+use crate::tls_plaintext::TlsPlaintextRuntimeSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TlsStatusSnapshot {
@@ -20,6 +21,7 @@ pub struct TlsPlaintextStatusSnapshot {
     pub selector_configured: bool,
     pub libssl_uprobe_object_path: Option<PathBuf>,
     pub capability: TlsPlaintextCapabilityStatusSnapshot,
+    pub runtime: Option<TlsPlaintextRuntimeSnapshot>,
     pub key_logs: Vec<TlsPlaintextMaterialStatusSnapshot>,
     pub session_secrets: Vec<TlsPlaintextMaterialStatusSnapshot>,
 }
@@ -70,9 +72,13 @@ pub enum TlsMaterialSourceCheck {
     MetadataOnly,
 }
 
-pub(in crate::status) fn tls_status(plan: &RuntimePlan) -> TlsStatusSnapshot {
+pub(in crate::status) fn tls_status(
+    plan: &RuntimePlan,
+    capabilities: &CapabilityMatrix,
+    runtime: Option<TlsPlaintextRuntimeSnapshot>,
+) -> TlsStatusSnapshot {
     TlsStatusSnapshot {
-        plaintext: plaintext_status(plan),
+        plaintext: plaintext_status(plan, capabilities, runtime),
         materials: plan
             .config
             .tls
@@ -88,16 +94,20 @@ pub(in crate::status) fn tls_status(plan: &RuntimePlan) -> TlsStatusSnapshot {
     }
 }
 
-fn plaintext_status(plan: &RuntimePlan) -> TlsPlaintextStatusSnapshot {
+fn plaintext_status(
+    plan: &RuntimePlan,
+    capabilities: &CapabilityMatrix,
+    runtime: Option<TlsPlaintextRuntimeSnapshot>,
+) -> TlsPlaintextStatusSnapshot {
     let plaintext = &plan.tls.plaintext;
     let capability = match &plaintext.capability {
         TlsPlaintextCapabilityPlan::NotRequired => {
             TlsPlaintextCapabilityStatusSnapshot::NotRequired
         }
-        TlsPlaintextCapabilityPlan::Required { capability, mode } => {
+        TlsPlaintextCapabilityPlan::Required { capability, .. } => {
             TlsPlaintextCapabilityStatusSnapshot::Required {
                 capability: *capability,
-                mode: *mode,
+                mode: capabilities.mode(*capability),
             }
         }
     };
@@ -108,6 +118,7 @@ fn plaintext_status(plan: &RuntimePlan) -> TlsPlaintextStatusSnapshot {
         selector_configured: plaintext.selector_configured,
         libssl_uprobe_object_path: plaintext.libssl_uprobe_object_path.clone(),
         capability,
+        runtime,
         key_logs: plaintext_material_statuses(&plaintext.key_logs),
         session_secrets: plaintext_material_statuses(&plaintext.session_secrets),
     }
@@ -183,7 +194,7 @@ mod tests {
         }];
         let plan = runtime_plan_from_config(config, Vec::new())?;
 
-        let status = tls_status(&plan);
+        let status = tls_status(&plan, &plan.capabilities, None);
 
         assert_eq!(status.materials.len(), 1);
         let material = &status.materials[0];
@@ -205,6 +216,7 @@ mod tests {
     fn tls_status_reports_plaintext_capability() -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("status-tls-plaintext-capability")?;
         let mut config = config_with_storage_path(temp.join("spool"));
+        config.capture.selection = probe_config::CaptureSelection::Libpcap;
         config.tls.plaintext.enabled = true;
         config.tls.plaintext.provider = probe_config::TlsPlaintextProvider::LibsslUprobe;
         config.tls.plaintext.selector = Some(Selector::default());
@@ -215,7 +227,7 @@ mod tests {
             vec![CapabilityState::available(CapabilityKind::LibsslUprobe)],
         )?;
 
-        let status = tls_status(&plan);
+        let status = tls_status(&plan, &plan.capabilities, None);
 
         assert!(status.plaintext.enabled);
         assert_eq!(
@@ -276,7 +288,7 @@ mod tests {
         ];
         let plan = runtime_plan_from_config(config, Vec::new())?;
 
-        let status = tls_status(&plan);
+        let status = tls_status(&plan, &plan.capabilities, None);
 
         assert_eq!(
             status.plaintext.capability,
@@ -320,7 +332,7 @@ mod tests {
         }];
         let plan = runtime_plan_from_config(config, Vec::new())?;
 
-        let status = tls_status(&plan);
+        let status = tls_status(&plan, &plan.capabilities, None);
 
         let material = &status.materials[0];
         assert_eq!(material.purpose, TlsMaterialPurpose::DecryptHint);

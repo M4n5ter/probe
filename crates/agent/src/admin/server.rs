@@ -31,6 +31,7 @@ use crate::status::{
     AgentStatusSnapshot, MetricsSnapshot, RuntimeStatusInput, build_status_snapshot_with_runtime,
     collect_running_spool_status,
 };
+use crate::tls_plaintext::TlsPlaintextRuntimeState;
 
 const ADMIN_REQUEST_MAX_BYTES: usize = 4 * 1024;
 const ADMIN_SOCKET_MODE: u32 = 0o600;
@@ -72,6 +73,7 @@ pub struct AdminRuntimeState {
     pub enforcement_policy_source: Option<LoadedEnforcementPolicySource>,
     pub export_worker: Option<ExportWorkerRuntimeState>,
     pub pipeline: Option<PipelineRuntimeMetrics>,
+    pub tls_plaintext: Option<TlsPlaintextRuntimeState>,
 }
 
 pub struct AdminServerHandle {
@@ -402,6 +404,10 @@ fn handle_admin_request(
                 .pipeline
                 .as_ref()
                 .map(PipelineRuntimeMetrics::snapshot),
+            tls_plaintext: runtime_state
+                .tls_plaintext
+                .as_ref()
+                .map(TlsPlaintextRuntimeState::snapshot),
         },
     );
     match request {

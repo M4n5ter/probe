@@ -37,6 +37,8 @@ pub(crate) enum AgentError {
     Export(#[from] ExportDrainError),
     #[error("capture provider error: {0}")]
     Capture(#[from] capture::CaptureError),
+    #[error("attribution error: {0}")]
+    Attribution(#[from] attribution::AttributionError),
     #[error("plaintext feed error: {0}")]
     PlaintextFeed(#[from] PlaintextFeedLoadError),
     #[error("admin error: {0}")]

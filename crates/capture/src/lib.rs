@@ -1,6 +1,7 @@
 mod ebpf;
 mod event;
 mod libpcap;
+mod multiplex;
 mod plaintext;
 mod provider;
 mod replay;
@@ -15,12 +16,14 @@ pub use ebpf::{
 };
 pub use event::{CaptureEvent, CapturedBytes, CapturedGap};
 pub use libpcap::{LibpcapConfig, LibpcapProvider};
+pub use multiplex::{CaptureMultiplexer, MultiplexedProvider};
 pub use plaintext::{
     PlaintextChunk, PlaintextConnection, PlaintextEvent, PlaintextEventKind,
     PlaintextEventProvider, PlaintextEventProviderError, PlaintextGap, PlaintextSource,
 };
 pub use provider::{
-    CaptureError, CaptureProvider, CaptureProviderKind, ProcessResolver, ResolvedProcess,
+    CaptureError, CapturePoll, CaptureProvider, CaptureProviderKind, ProcessResolver,
+    ResolvedProcess,
 };
 pub use replay::ReplayProvider;
 pub use tls::{
@@ -29,9 +32,9 @@ pub use tls::{
     LibsslUprobeAttachPlanningError, LibsslUprobeAttachPlanningReport, LibsslUprobeAttachPoint,
     LibsslUprobeAttachProcess, LibsslUprobeAttachRecipe, LibsslUprobeAttachTarget,
     LibsslUprobeDegradationReason, LibsslUprobeDiscoveryError, LibsslUprobeFlowLookup,
-    LibsslUprobeFlowResolver, LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
-    LibsslUprobeProcessGenerationFailure, LibsslUprobeSymbol, LibsslUprobeSymbolFailure,
-    LibsslUprobeSymbolRole, LibsslUprobeTarget, LibsslUprobeTargetDiscovery,
-    LibsslUprobeTargetDiscoveryReport, TlsKeyLogField, TlsKeyLogLabelCount, TlsKeyLogParseError,
-    TlsKeyLogSummary, plan_libssl_uprobes_for_processes,
+    LibsslUprobeFlowResolver, LibsslUprobePlaintextOpen, LibsslUprobePlaintextProbeConfig,
+    LibsslUprobePlaintextProvider, LibsslUprobeProcessGenerationFailure, LibsslUprobeSymbol,
+    LibsslUprobeSymbolFailure, LibsslUprobeSymbolRole, LibsslUprobeTarget,
+    LibsslUprobeTargetDiscovery, LibsslUprobeTargetDiscoveryReport, TlsKeyLogField,
+    TlsKeyLogLabelCount, TlsKeyLogParseError, TlsKeyLogSummary, plan_libssl_uprobes_for_processes,
 };

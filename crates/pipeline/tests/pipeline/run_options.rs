@@ -1,7 +1,7 @@
-use capture::{CaptureError, CaptureEvent, CaptureProvider, CaptureProviderKind};
+use capture::{CaptureError, CapturePoll, CaptureProvider, CaptureProviderKind};
 use parsers::Http1ParserFactory;
 use pipeline::{CapturePipeline, PipelineRunOptions};
-use probe_core::{CapabilityState, CaptureSource};
+use probe_core::CapabilityState;
 use tempfile::tempdir;
 
 use super::fixture::{SequenceProvider, captured_bytes, demo_flow_with_ports};
@@ -66,18 +66,14 @@ impl CaptureProvider for UnreadableProvider {
         CaptureProviderKind::Replay
     }
 
-    fn source(&self) -> CaptureSource {
-        CaptureSource::Replay
-    }
-
     fn capabilities(&self) -> Vec<CapabilityState> {
         Vec::new()
     }
 
-    fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
         Err(CaptureError::provider(
             "unreadable",
-            "provider.next must not be called when max_events is zero",
+            "provider.poll_next must not be called when max_events is zero",
         ))
     }
 }

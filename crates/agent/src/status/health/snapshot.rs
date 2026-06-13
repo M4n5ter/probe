@@ -6,6 +6,7 @@ use super::super::{
     export::ExporterStatusSnapshot,
     policy::{PolicyStatusMode, PolicyStatusSnapshot},
     snapshot::{HealthSnapshot, SpoolStatusSnapshot},
+    tls::TlsStatusSnapshot,
 };
 
 pub(in crate::status) fn health_snapshot(
@@ -14,6 +15,7 @@ pub(in crate::status) fn health_snapshot(
     exporters: &[ExporterStatusSnapshot],
     policy: &PolicyStatusSnapshot,
     enforcement: &EnforcementStatusSnapshot,
+    tls: &TlsStatusSnapshot,
 ) -> HealthSnapshot {
     fold_health_contributions(
         std::iter::once(capture_health_contribution(plan))
@@ -22,7 +24,8 @@ pub(in crate::status) fn health_snapshot(
             .chain(std::iter::once(policy_health_contribution(policy)))
             .chain(std::iter::once(enforcement_health_contribution(
                 enforcement,
-            ))),
+            )))
+            .chain(std::iter::once(tls_health_contribution(tls))),
     )
 }
 
@@ -122,6 +125,27 @@ fn enforcement_policy_reason(enforcement: &EnforcementStatusSnapshot, fallback: 
         || format!("enforcement policy: {fallback}"),
         |reason| format!("enforcement policy: {reason}"),
     )
+}
+
+fn tls_health_contribution(tls: &TlsStatusSnapshot) -> HealthContribution {
+    let Some(runtime) = &tls.plaintext.runtime else {
+        return HealthContribution::available();
+    };
+    match runtime.mode {
+        crate::tls_plaintext::TlsPlaintextRuntimeMode::Disabled => HealthContribution::degraded(
+            runtime
+                .reason
+                .clone()
+                .unwrap_or_else(|| "TLS plaintext runtime provider is disabled".to_string()),
+        ),
+        crate::tls_plaintext::TlsPlaintextRuntimeMode::Pending => {
+            HealthContribution::degraded(runtime.reason.clone().unwrap_or_else(|| {
+                "TLS plaintext runtime provider has not been built yet".to_string()
+            }))
+        }
+        crate::tls_plaintext::TlsPlaintextRuntimeMode::NotConfigured
+        | crate::tls_plaintext::TlsPlaintextRuntimeMode::Enabled => HealthContribution::available(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

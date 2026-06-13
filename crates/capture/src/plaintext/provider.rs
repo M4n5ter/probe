@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 
-use probe_core::{CapabilityKind, CapabilityState, CaptureSource};
+use probe_core::{CapabilityKind, CapabilityState};
 use thiserror::Error;
 
-use crate::{CaptureError, CaptureEvent, CaptureProvider, CaptureProviderKind};
+use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind};
 
 use super::{PlaintextChunk, PlaintextEvent, PlaintextSource};
 
@@ -70,10 +70,6 @@ impl CaptureProvider for PlaintextEventProvider {
         CaptureProviderKind::Plaintext
     }
 
-    fn source(&self) -> CaptureSource {
-        self.source.capture_source()
-    }
-
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::available(match self.source {
             PlaintextSource::ExternalPlaintextFeed => CapabilityKind::ExternalPlaintextFeed,
@@ -81,16 +77,21 @@ impl CaptureProvider for PlaintextEventProvider {
         })]
     }
 
-    fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
-        Ok(self.events.pop_front().map(CaptureEvent::from))
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+        Ok(self
+            .events
+            .pop_front()
+            .map(CaptureEvent::from)
+            .map(CapturePoll::event)
+            .unwrap_or(CapturePoll::Finished))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use probe_core::{
-        AddressPort, Direction, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity,
-        Timestamp, TransportProtocol,
+        AddressPort, CaptureSource, Direction, FlowContext, FlowIdentity, ProcessContext,
+        ProcessIdentity, Timestamp, TransportProtocol,
     };
 
     use super::*;
@@ -114,7 +115,6 @@ mod tests {
             panic!("expected plaintext bytes");
         };
 
-        assert_eq!(provider.source(), CaptureSource::LibsslUprobe);
         assert_eq!(bytes.source, CaptureSource::LibsslUprobe);
         assert_eq!(
             provider.capabilities(),

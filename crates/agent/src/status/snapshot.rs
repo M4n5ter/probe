@@ -6,13 +6,14 @@ use std::{
 
 use pipeline::PipelineRuntimeMetricsSnapshot;
 use probe_config::{CaptureBackend, CaptureSelection};
-use probe_core::{CapabilityMatrix, RuntimeMode};
+use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, RuntimeMode};
 use runtime::{CapturePlanMode, RuntimePlan};
 use serde::Serialize;
 use storage::{FjallSpool, SpoolProbe, SpoolSnapshot};
 
 use crate::configured_enforcement::LoadedEnforcementPolicySource;
 use crate::export::ExportWorkerRuntimeSnapshot;
+use crate::tls_plaintext::{TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot};
 
 use super::{
     enforcement::{
@@ -100,6 +101,7 @@ pub struct RuntimeStatusInput {
     pub enforcement_policy_source: Option<LoadedEnforcementPolicySource>,
     pub export_worker: Option<ExportWorkerRuntimeSnapshot>,
     pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
+    pub tls_plaintext: Option<TlsPlaintextRuntimeSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,7 +258,8 @@ fn build_status_snapshot_at_with_runtime(
         Some(source) => enforcement_status_with_loaded_source(plan, Some(source)),
         None => enforcement_status(plan),
     };
-    let tls = tls_status(plan);
+    let capabilities = capabilities_with_runtime(plan, runtime.tls_plaintext.as_ref());
+    let tls = tls_status(plan, &capabilities, runtime.tls_plaintext.clone());
     let export = export_status(plan);
     let exporters = exporter_statuses_with_runtime(
         plan,
@@ -265,13 +268,13 @@ fn build_status_snapshot_at_with_runtime(
         runtime.export_worker.as_ref(),
     );
     let metrics = metrics_snapshot(
-        &plan.capabilities,
+        &capabilities,
         &spool_status,
         &exporters,
         runtime.export_worker.as_ref(),
         runtime.pipeline,
     );
-    let health = health_snapshot(plan, &spool_status, &exporters, &policy, &enforcement);
+    let health = health_snapshot(plan, &spool_status, &exporters, &policy, &enforcement, &tls);
 
     AgentStatusSnapshot {
         generated_unix_ns,
@@ -287,12 +290,42 @@ fn build_status_snapshot_at_with_runtime(
         policy,
         enforcement,
         tls,
-        capabilities: plan.capabilities.clone(),
+        capabilities,
         spool: spool_status,
         export,
         exporters,
         metrics,
     }
+}
+
+fn capabilities_with_runtime(
+    plan: &RuntimePlan,
+    tls_plaintext: Option<&TlsPlaintextRuntimeSnapshot>,
+) -> CapabilityMatrix {
+    let Some(runtime) = tls_plaintext else {
+        return plan.capabilities.clone();
+    };
+    if runtime.mode != TlsPlaintextRuntimeMode::Disabled {
+        return plan.capabilities.clone();
+    }
+    CapabilityMatrix::new(
+        plan.capabilities
+            .states()
+            .iter()
+            .cloned()
+            .map(|capability| {
+                if capability.kind == CapabilityKind::LibsslUprobe {
+                    CapabilityState::unavailable(
+                        CapabilityKind::LibsslUprobe,
+                        runtime.reason.clone().unwrap_or_else(|| {
+                            "TLS plaintext runtime provider is disabled".to_string()
+                        }),
+                    )
+                } else {
+                    capability
+                }
+            }),
+    )
 }
 
 fn metrics_snapshot(
@@ -365,6 +398,8 @@ mod tests {
     use runtime::{ExportFailureBackoffPlan, ExportWorkerPlan};
     use serde_json::json;
     use storage::SpoolPayload;
+
+    use crate::tls_plaintext::{TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot};
 
     #[test]
     fn status_snapshot_reports_sink_lag_and_health() -> Result<(), Box<dyn std::error::Error>> {
@@ -589,6 +624,107 @@ mod tests {
 
         assert_eq!(snapshot.health.mode, RuntimeMode::Available);
         assert_eq!(snapshot.metrics.capabilities.degraded, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn tls_plaintext_runtime_disabled_degrades_status_capability_and_health()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.tls.plaintext.enabled = true;
+        config.tls.plaintext.provider = probe_config::TlsPlaintextProvider::LibsslUprobe;
+        config.tls.plaintext.libssl_uprobe_object_path =
+            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        let plan = runtime_plan_from_config(
+            config,
+            vec![CapabilityState::degraded(
+                CapabilityKind::LibsslUprobe,
+                "libssl uprobe preflight passed but runtime remains best-effort",
+            )],
+        )?;
+        let spool = SpoolStatusInput::available(
+            PathBuf::from("/tmp/sssa-spool"),
+            SpoolSnapshot {
+                last_ingress_sequence: 0,
+                last_export_sequence: 0,
+            },
+            BTreeMap::new(),
+        );
+        let runtime = RuntimeStatusInput {
+            tls_plaintext: Some(TlsPlaintextRuntimeSnapshot {
+                mode: TlsPlaintextRuntimeMode::Disabled,
+                reason: Some("startup scan found no attachable libssl processes".to_string()),
+            }),
+            ..RuntimeStatusInput::default()
+        };
+
+        let snapshot = build_status_snapshot_at_with_runtime(&plan, spool, 42, runtime);
+
+        assert_eq!(
+            snapshot
+                .tls
+                .plaintext
+                .runtime
+                .as_ref()
+                .expect("TLS plaintext runtime should be reported")
+                .mode,
+            TlsPlaintextRuntimeMode::Disabled
+        );
+        assert_eq!(
+            snapshot.capabilities.mode(CapabilityKind::LibsslUprobe),
+            RuntimeMode::Unavailable
+        );
+        let value = serde_json::to_value(&snapshot)?;
+        assert_eq!(
+            value["tls"]["plaintext"]["capability"]["mode"],
+            json!("unavailable")
+        );
+        assert_eq!(snapshot.metrics.capabilities.unavailable, 1);
+        assert_eq!(snapshot.health.mode, RuntimeMode::Degraded);
+        assert!(
+            snapshot
+                .health
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("startup scan found no attachable"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tls_plaintext_runtime_not_configured_does_not_degrade_health()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/sssa-spool")),
+            Vec::new(),
+        )?;
+        let spool = SpoolStatusInput::available(
+            PathBuf::from("/tmp/sssa-spool"),
+            SpoolSnapshot {
+                last_ingress_sequence: 0,
+                last_export_sequence: 0,
+            },
+            BTreeMap::new(),
+        );
+        let runtime = RuntimeStatusInput {
+            tls_plaintext: Some(TlsPlaintextRuntimeSnapshot {
+                mode: TlsPlaintextRuntimeMode::NotConfigured,
+                reason: None,
+            }),
+            ..RuntimeStatusInput::default()
+        };
+
+        let snapshot = build_status_snapshot_at_with_runtime(&plan, spool, 42, runtime);
+
+        assert_eq!(snapshot.health.mode, RuntimeMode::Available);
+        assert!(
+            snapshot
+                .health
+                .reasons
+                .iter()
+                .all(|reason| !reason.contains("TLS plaintext runtime provider"))
+        );
         Ok(())
     }
 

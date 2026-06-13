@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{io::ErrorKind, path::PathBuf};
 
 use probe_core::{
     CapabilityKind, CapabilityState, LinuxProcStat, ProcessContext, ProcessIdentity,
@@ -17,6 +17,10 @@ pub trait ProcessAttributor {
     fn capabilities(&self) -> Vec<CapabilityState>;
 
     fn identify(&self, pid: u32) -> Result<ProcessContext, AttributionError>;
+
+    fn identify_if_present(&self, pid: u32) -> Result<Option<ProcessContext>, AttributionError> {
+        self.identify(pid).map(Some)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +53,10 @@ impl ProcfsAttributor {
         numeric_pid_dirs(&self.proc_root)
             .map(|entries| entries.into_iter().map(|entry| entry.pid).collect())
     }
+
+    fn process_root(&self, pid: u32) -> PathBuf {
+        self.proc_root.join(pid.to_string())
+    }
 }
 
 impl Default for ProcfsAttributor {
@@ -76,7 +84,7 @@ impl ProcessAttributor for ProcfsAttributor {
     }
 
     fn identify(&self, pid: u32) -> Result<ProcessContext, AttributionError> {
-        let pid_dir = self.proc_root.join(pid.to_string());
+        let pid_dir = self.process_root(pid);
         let stat = parse_stat(pid, &read_to_string(&pid_dir.join("stat"))?)?;
         let status = parse_status(pid, &read_to_string(&pid_dir.join("status"))?)?;
         let cmdline_bytes = read_bytes(&pid_dir.join("cmdline"))?;
@@ -112,6 +120,32 @@ impl ProcessAttributor for ProcfsAttributor {
             name: stat.comm,
             cmdline,
         })
+    }
+
+    fn identify_if_present(&self, pid: u32) -> Result<Option<ProcessContext>, AttributionError> {
+        match self.identify(pid) {
+            Ok(process) => Ok(Some(process)),
+            Err(error) if self.is_skippable_process_identity_race(pid, &error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl ProcfsAttributor {
+    fn is_skippable_process_identity_race(&self, pid: u32, error: &AttributionError) -> bool {
+        match error {
+            AttributionError::Read { path, source }
+            | AttributionError::ReadLink { path, source } => {
+                PathBuf::from(path).starts_with(self.process_root(pid))
+                    && matches!(
+                        source.kind(),
+                        ErrorKind::NotFound | ErrorKind::PermissionDenied
+                    )
+            }
+            AttributionError::InvalidStat { pid: error_pid, .. }
+            | AttributionError::InvalidStatus { pid: error_pid, .. } => *error_pid == pid,
+            AttributionError::InvalidNetTcp { .. } => false,
+        }
     }
 }
 

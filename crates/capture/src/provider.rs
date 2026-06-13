@@ -1,8 +1,12 @@
-use probe_core::{CapabilityState, CaptureSource, ProcessContext, TcpConnection};
+use std::{thread, time::Duration};
+
+use probe_core::{CapabilityState, ProcessContext, TcpConnection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::event::CaptureEvent;
+
+const DEFAULT_IDLE_SLEEP: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -26,6 +30,21 @@ pub enum CaptureProviderKind {
     Ebpf,
     Libpcap,
     Plaintext,
+    Multiplex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapturePoll {
+    Event(Box<CaptureEvent>),
+    Progress,
+    Idle,
+    Finished,
+}
+
+impl CapturePoll {
+    pub fn event(event: CaptureEvent) -> Self {
+        Self::Event(Box::new(event))
+    }
 }
 
 pub trait CaptureProvider {
@@ -33,11 +52,20 @@ pub trait CaptureProvider {
 
     fn kind(&self) -> CaptureProviderKind;
 
-    fn source(&self) -> CaptureSource;
-
     fn capabilities(&self) -> Vec<CapabilityState>;
 
-    fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError>;
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError>;
+
+    fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+        loop {
+            match self.poll_next()? {
+                CapturePoll::Event(event) => return Ok(Some(*event)),
+                CapturePoll::Progress => {}
+                CapturePoll::Idle => thread::sleep(DEFAULT_IDLE_SLEEP),
+                CapturePoll::Finished => return Ok(None),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

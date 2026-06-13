@@ -1,35 +1,44 @@
 use attribution::ProcfsSocketResolver;
 use capture::{
-    CaptureError, CaptureProvider, EbpfConnectFlowLookup, EbpfConnectFlowResolver,
-    EbpfProcessObservationProbeConfig, EbpfProcessObservationProvider, EbpfResolvedConnectFlow,
-    LibpcapProvider, ProcessResolver, ResolvedProcess,
+    CaptureError, CaptureMultiplexer, CaptureProvider, EbpfConnectFlowLookup,
+    EbpfConnectFlowResolver, EbpfProcessObservationProbeConfig, EbpfProcessObservationProvider,
+    EbpfResolvedConnectFlow, LibpcapProvider, MultiplexedProvider, ProcessResolver,
+    ResolvedProcess,
 };
 use probe_config::CaptureBackend;
 use probe_core::{CapabilityKind, RuntimeMode, TcpConnection};
 use runtime::{RuntimeError, RuntimePlan};
 
 use crate::{
-    capture_registry::libpcap_config_from_agent, error::AgentError,
+    capture_registry::libpcap_config_from_agent,
+    error::AgentError,
     plaintext_feed::load_plaintext_feed_provider,
+    tls_plaintext::{
+        TlsPlaintextProviderBuild, TlsPlaintextRuntimeState, build_tls_plaintext_provider,
+    },
 };
 
 pub(crate) fn build_capture_provider(
     plan: &RuntimePlan,
+    tls_plaintext_runtime: Option<&TlsPlaintextRuntimeState>,
 ) -> Result<Box<dyn CaptureProvider>, AgentError> {
     match plan.capture.selected_backend {
         Some(CaptureBackend::PlaintextFeed) => build_plaintext_feed_provider(plan),
-        _ => build_live_capture_provider(plan),
+        _ => build_live_capture_provider(plan, tls_plaintext_runtime),
     }
 }
 
-fn build_live_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProvider>, AgentError> {
+fn build_live_capture_provider(
+    plan: &RuntimePlan,
+    tls_plaintext_runtime: Option<&TlsPlaintextRuntimeState>,
+) -> Result<Box<dyn CaptureProvider>, AgentError> {
     plan.require_live_capture()?;
-    match plan.capture.selected_backend {
+    let primary = match plan.capture.selected_backend {
         Some(CaptureBackend::Ebpf) => build_ebpf_capture_provider(plan),
         Some(CaptureBackend::Libpcap) => Ok(Box::new(LibpcapProvider::open_with_process_resolver(
             libpcap_config_from_agent(&plan.config),
             procfs_tcp_process_resolver_for_plan(plan),
-        )?)),
+        )?) as Box<dyn CaptureProvider>),
         Some(backend) => Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
             reason: format!("{backend:?} capture provider is selected but has no agent builder"),
         })),
@@ -40,6 +49,40 @@ fn build_live_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProv
                 .clone()
                 .unwrap_or_else(|| "capture plan did not select a live backend".to_string()),
         })),
+    }?;
+    with_tls_plaintext_provider(plan, primary, tls_plaintext_runtime)
+}
+
+fn with_tls_plaintext_provider(
+    plan: &RuntimePlan,
+    primary: Box<dyn CaptureProvider>,
+    tls_plaintext_runtime: Option<&TlsPlaintextRuntimeState>,
+) -> Result<Box<dyn CaptureProvider>, AgentError> {
+    let plaintext_build = build_tls_plaintext_provider(plan)?;
+    if let Some(runtime) = tls_plaintext_runtime {
+        runtime.record_provider_build(&plaintext_build);
+    }
+    match plaintext_build {
+        TlsPlaintextProviderBuild::NotConfigured => Ok(primary),
+        TlsPlaintextProviderBuild::Enabled(plaintext) => {
+            let plaintext = match tls_plaintext_runtime {
+                Some(runtime) => {
+                    let runtime = runtime.clone();
+                    MultiplexedProvider::best_effort_with_disable_handler(
+                        plaintext,
+                        move |reason| {
+                            runtime.record_provider_disabled(reason);
+                        },
+                    )
+                }
+                None => MultiplexedProvider::best_effort(plaintext),
+            };
+            Ok(Box::new(CaptureMultiplexer::from_providers([
+                MultiplexedProvider::required(primary),
+                plaintext,
+            ])))
+        }
+        TlsPlaintextProviderBuild::Disabled { .. } => Ok(primary),
     }
 }
 

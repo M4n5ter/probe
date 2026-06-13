@@ -1,20 +1,22 @@
 use std::{
     collections::VecDeque,
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use probe_core::{CapabilityKind, CapabilityState, CaptureSource, Timestamp};
+use probe_core::{CapabilityKind, CapabilityState, Timestamp};
 
-use crate::{CaptureError, CaptureEvent, CaptureProvider, CaptureProviderKind, PlaintextEvent};
+use crate::{
+    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind, PlaintextEvent,
+};
 
 use super::{
     bridge::{LibsslUprobeFlowResolver, libssl_plaintext_events_from_sample},
-    probe::{LibsslUprobePlaintextProbe, LibsslUprobePlaintextProbeConfig},
+    probe::{
+        LibsslUprobePlaintextProbe, LibsslUprobePlaintextProbeConfig,
+        LibsslUprobePlaintextProbeLoad,
+    },
     record::LibsslUprobePlaintextSample,
 };
-
-const DEFAULT_IDLE_SLEEP: Duration = Duration::from_millis(10);
 
 pub(in crate::tls::plaintext) trait LibsslUprobePlaintextSampleSource {
     fn next_tls_plaintext_sample(
@@ -30,6 +32,11 @@ pub struct LibsslUprobePlaintextProvider {
     idle_policy: LibsslUprobePlaintextIdlePolicy,
 }
 
+pub enum LibsslUprobePlaintextOpen {
+    Enabled(Box<LibsslUprobePlaintextProvider>),
+    Disabled { reason: String },
+}
+
 impl LibsslUprobePlaintextProvider {
     pub fn open(
         config: LibsslUprobePlaintextProbeConfig,
@@ -41,15 +48,29 @@ impl LibsslUprobePlaintextProvider {
         Ok(Self::from_live_source(Box::new(probe), resolver))
     }
 
+    pub fn open_best_effort(
+        config: LibsslUprobePlaintextProbeConfig,
+        resolver: Box<dyn LibsslUprobeFlowResolver>,
+    ) -> Result<LibsslUprobePlaintextOpen, CaptureError> {
+        match LibsslUprobePlaintextProbe::load_best_effort(config)
+            .map_err(|error| CaptureError::provider("libssl_uprobe_plaintext", error.to_string()))?
+        {
+            LibsslUprobePlaintextProbeLoad::Enabled(probe) => {
+                Ok(LibsslUprobePlaintextOpen::Enabled(Box::new(
+                    Self::from_live_source(probe, resolver),
+                )))
+            }
+            LibsslUprobePlaintextProbeLoad::Disabled { reason } => {
+                Ok(LibsslUprobePlaintextOpen::Disabled { reason })
+            }
+        }
+    }
+
     fn from_live_source(
         source: Box<dyn LibsslUprobePlaintextSampleSource>,
         resolver: Box<dyn LibsslUprobeFlowResolver>,
     ) -> Self {
-        Self::with_idle_policy(
-            source,
-            resolver,
-            LibsslUprobePlaintextIdlePolicy::Wait(DEFAULT_IDLE_SLEEP),
-        )
+        Self::with_idle_policy(source, resolver, LibsslUprobePlaintextIdlePolicy::Wait)
     }
 
     #[cfg(test)]
@@ -74,28 +95,29 @@ impl LibsslUprobePlaintextProvider {
         }
     }
 
-    fn next_event(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
-        loop {
-            if let Some(event) = self.pending_events.pop_front() {
-                return Ok(Some(CaptureEvent::from(event)));
-            }
-            let Some(sample) = self.source.next_tls_plaintext_sample()? else {
-                match self.idle_policy {
-                    #[cfg(test)]
-                    LibsslUprobePlaintextIdlePolicy::Stop => return Ok(None),
-                    LibsslUprobePlaintextIdlePolicy::Wait(duration) => {
-                        thread::sleep(duration);
-                        continue;
-                    }
-                }
-            };
-            let events = libssl_plaintext_events_from_sample(
-                &sample,
-                self.clock.next_timestamp(),
-                self.resolver.as_mut(),
-            )?;
-            self.pending_events.extend(events);
+    fn poll_event(&mut self) -> Result<CapturePoll, CaptureError> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(CapturePoll::event(CaptureEvent::from(event)));
         }
+        let Some(sample) = self.source.next_tls_plaintext_sample()? else {
+            return Ok(match self.idle_policy {
+                #[cfg(test)]
+                LibsslUprobePlaintextIdlePolicy::Stop => CapturePoll::Finished,
+                LibsslUprobePlaintextIdlePolicy::Wait => CapturePoll::Idle,
+            });
+        };
+        let events = libssl_plaintext_events_from_sample(
+            &sample,
+            self.clock.next_timestamp(),
+            self.resolver.as_mut(),
+        )?;
+        self.pending_events.extend(events);
+        Ok(self
+            .pending_events
+            .pop_front()
+            .map(CaptureEvent::from)
+            .map(CapturePoll::event)
+            .unwrap_or(CapturePoll::Progress))
     }
 }
 
@@ -108,10 +130,6 @@ impl CaptureProvider for LibsslUprobePlaintextProvider {
         CaptureProviderKind::Plaintext
     }
 
-    fn source(&self) -> CaptureSource {
-        CaptureSource::LibsslUprobe
-    }
-
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::LibsslUprobe,
@@ -119,8 +137,8 @@ impl CaptureProvider for LibsslUprobePlaintextProvider {
         )]
     }
 
-    fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
-        self.next_event()
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_event()
     }
 }
 
@@ -128,7 +146,7 @@ impl CaptureProvider for LibsslUprobePlaintextProvider {
 enum LibsslUprobePlaintextIdlePolicy {
     #[cfg(test)]
     Stop,
-    Wait(Duration),
+    Wait,
 }
 
 #[derive(Default)]
@@ -197,7 +215,6 @@ mod tests {
         };
 
         assert_eq!(provider.name(), "libssl_uprobe_plaintext");
-        assert_eq!(provider.source(), CaptureSource::LibsslUprobe);
         assert_eq!(bytes.source, CaptureSource::LibsslUprobe);
         assert_eq!(bytes.provider, CaptureProviderKind::Plaintext);
         assert_eq!(bytes.stream_offset, 100);
@@ -226,7 +243,7 @@ mod tests {
                 samples: VecTlsPlaintextSource::new([sample_event()]),
             }),
             resolver,
-            LibsslUprobePlaintextIdlePolicy::Wait(Duration::ZERO),
+            LibsslUprobePlaintextIdlePolicy::Wait,
         );
 
         let Some(crate::CaptureEvent::Bytes(bytes)) = provider.next()? else {

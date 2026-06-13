@@ -12,9 +12,10 @@ use ebpf_abi::{
     EBPF_TLS_CALL_KIND_CLEAR, EBPF_TLS_CALL_KIND_LEN_RETURN, EBPF_TLS_CALL_KIND_SET_FD,
     EBPF_TLS_CALL_KIND_SIZE_POINTER, EBPF_TLS_CALLS_MAX_ENTRIES,
     EBPF_TLS_EVENT_SCRATCH_MAX_ENTRIES, EBPF_TLS_FDS_MAX_ENTRIES, EBPF_TLS_OFFSETS_MAX_ENTRIES,
-    EBPF_TLS_PLAINTEXT_READ_FAILED, EBPF_TLS_PLAINTEXT_SAMPLE_BYTES, EBPF_TLS_PLAINTEXT_TRUNCATED,
-    EbpfTlsCallKey, EbpfTlsCallState, EbpfTlsDirection, EbpfTlsFdKey, EbpfTlsOffsetKey,
-    EbpfTlsPlaintextEvent, EbpfTlsPlaintextEventMetadata, EbpfTlsPlaintextMetadata,
+    EBPF_TLS_PLAINTEXT_FD_VALID, EBPF_TLS_PLAINTEXT_READ_FAILED, EBPF_TLS_PLAINTEXT_SAMPLE_BYTES,
+    EBPF_TLS_PLAINTEXT_TRUNCATED, EbpfTlsCallKey, EbpfTlsCallState, EbpfTlsDirection, EbpfTlsFdKey,
+    EbpfTlsOffsetKey, EbpfTlsPlaintextEvent, EbpfTlsPlaintextEventMetadata,
+    EbpfTlsPlaintextMetadata,
 };
 
 #[map(name = "SSSA_TLS_CALLS")]
@@ -441,8 +442,7 @@ fn scratch_event() -> Option<&'static mut EbpfTlsPlaintextEvent> {
 fn fd_for(tgid: u32, ssl_pointer: u64) -> (i32, u16) {
     let key = EbpfTlsFdKey::new(tgid, ssl_pointer);
     match unsafe { SSSA_TLS_FDS.get(&key) } {
-        // Userspace must not trust this fd until the loader owns process-generation cleanup.
-        Some(fd) => (*fd, 0),
+        Some(fd) => (*fd, EBPF_TLS_PLAINTEXT_FD_VALID),
         None => (-1, 0),
     }
 }

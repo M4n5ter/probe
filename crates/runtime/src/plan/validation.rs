@@ -15,6 +15,7 @@ pub(super) fn validate_runtime_config(
     collect_static_runtime_config_violations(config, &mut violations);
     validate_capture_config(config, registry, &mut violations);
     validate_registry_tls_config(config, registry, &mut violations);
+    validate_tls_capture_compatibility(config, registry, &mut violations);
     validate_registry_enforcement_config(config, registry, &mut violations);
     validate_enforcement_capture_compatibility(config, registry, &mut violations);
 
@@ -105,11 +106,13 @@ fn validate_registry_tls_config(
     registry: &ProviderRegistry,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    if !config.tls.plaintext.enabled {
+    if !config.tls.plaintext.enabled
+        || config.tls.plaintext.provider != TlsPlaintextProvider::LibsslUprobe
+    {
         return;
     }
     match config.tls.plaintext.provider {
-        TlsPlaintextProvider::LibsslUprobe => require_available(
+        TlsPlaintextProvider::LibsslUprobe => require_usable(
             &registry.capability_matrix(),
             CapabilityKind::LibsslUprobe,
             "tls.plaintext.enabled",
@@ -117,6 +120,29 @@ fn validate_registry_tls_config(
             violations,
         ),
         TlsPlaintextProvider::Keylog => {}
+    }
+}
+
+fn validate_tls_capture_compatibility(
+    config: &AgentConfig,
+    registry: &ProviderRegistry,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if !config.tls.plaintext.enabled
+        || config.tls.plaintext.provider != TlsPlaintextProvider::LibsslUprobe
+    {
+        return;
+    }
+
+    let capture = CapturePlan::resolve(config, registry);
+    if capture.mode != CapturePlanMode::Live {
+        violations.push(ConfigViolation {
+            field: "tls.plaintext.enabled".to_string(),
+            reason: format!(
+                "libssl uprobe TLS plaintext requires live host capture; selected capture mode is {:?}",
+                capture.mode
+            ),
+        });
     }
 }
 
@@ -195,6 +221,27 @@ fn require_available(
     violations: &mut Vec<ConfigViolation>,
 ) {
     if capabilities.mode(capability) != RuntimeMode::Available {
+        let reason = capabilities
+            .states()
+            .iter()
+            .find(|state| state.kind == capability)
+            .and_then(|state| state.reason.clone())
+            .unwrap_or_else(|| reason.into());
+        violations.push(ConfigViolation {
+            field: field.into(),
+            reason,
+        });
+    }
+}
+
+fn require_usable(
+    capabilities: &CapabilityMatrix,
+    capability: CapabilityKind,
+    field: impl Into<String>,
+    reason: impl Into<String>,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if capabilities.mode(capability) == RuntimeMode::Unavailable {
         let reason = capabilities
             .states()
             .iter()

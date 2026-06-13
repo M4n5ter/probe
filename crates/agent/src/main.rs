@@ -13,6 +13,7 @@ mod plaintext_feed;
 mod single_response_http_server;
 mod status;
 mod tls_material;
+mod tls_plaintext;
 
 #[tokio::main]
 async fn main() {

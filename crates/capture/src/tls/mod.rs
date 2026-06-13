@@ -23,5 +23,5 @@ pub use discovery::{
 pub use keylog::{TlsKeyLogField, TlsKeyLogLabelCount, TlsKeyLogParseError, TlsKeyLogSummary};
 pub use plaintext::{
     LibsslResolvedFlow, LibsslUprobeFlowLookup, LibsslUprobeFlowResolver,
-    LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
+    LibsslUprobePlaintextOpen, LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
 };

@@ -7,6 +7,8 @@ use crate::{CaptureError, PlaintextChunk, PlaintextEvent, PlaintextGap, Plaintex
 
 use super::record::LibsslUprobePlaintextSample;
 
+const LIBSSL_UPROBE_FLOW_ATTRIBUTION_REASON: &str = "libssl uprobe fd-to-flow attribution is best-effort until SSL fd lifecycle cleanup is generation-bound";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LibsslUprobeFlowLookup {
     pub tgid: u32,
@@ -67,9 +69,7 @@ fn resolved_plaintext_events(
             sample.captured_bytes.as_ref(),
         )
         .with_stream_offset(sample.stream_offset);
-        if let Some(reason) = degradation_reason(sample) {
-            chunk = chunk.with_degradation(reason);
-        }
+        chunk = chunk.with_degradation(bytes_degradation_reason(sample));
         events.push(PlaintextEvent::bytes(PlaintextSource::LibsslUprobe, chunk));
     }
     if should_emit_gap(sample) {
@@ -157,6 +157,13 @@ fn degradation_reason(sample: &LibsslUprobePlaintextSample) -> Option<String> {
         return Some("libssl uprobe reported a truncated plaintext sample".to_string());
     }
     None
+}
+
+fn bytes_degradation_reason(sample: &LibsslUprobePlaintextSample) -> String {
+    match degradation_reason(sample) {
+        Some(reason) => format!("{LIBSSL_UPROBE_FLOW_ATTRIBUTION_REASON}; {reason}"),
+        None => LIBSSL_UPROBE_FLOW_ATTRIBUTION_REASON.to_string(),
+    }
 }
 
 fn missing_plaintext_bytes(sample: &LibsslUprobePlaintextSample) -> bool {
@@ -276,7 +283,11 @@ mod tests {
         assert_eq!(bytes.direction, Direction::Outbound);
         assert_eq!(bytes.stream_offset, 100);
         assert_eq!(bytes.bytes.as_ref(), b"GET /");
-        assert!(!bytes.degraded);
+        assert!(bytes.degraded);
+        assert_eq!(
+            bytes.degradation_reason.as_deref(),
+            Some(LIBSSL_UPROBE_FLOW_ATTRIBUTION_REASON)
+        );
         Ok(())
     }
 
@@ -323,7 +334,12 @@ mod tests {
         assert!(bytes.degraded);
         assert_eq!(
             bytes.degradation_reason.as_deref(),
-            Some("libssl uprobe reported a truncated plaintext sample")
+            Some(
+                expected_bytes_degradation_reason(
+                    "libssl uprobe reported a truncated plaintext sample"
+                )
+                .as_str()
+            )
         );
         Ok(())
     }
@@ -345,7 +361,12 @@ mod tests {
         assert!(bytes.degraded);
         assert_eq!(
             bytes.degradation_reason.as_deref(),
-            Some("libssl uprobe plaintext sample truncated: captured 5 of 9 byte(s)")
+            Some(
+                expected_bytes_degradation_reason(
+                    "libssl uprobe plaintext sample truncated: captured 5 of 9 byte(s)"
+                )
+                .as_str()
+            )
         );
         let CaptureEvent::Gap(CapturedGap { gap, source, .. }) =
             CaptureEvent::from(events[1].clone())
@@ -472,6 +493,10 @@ mod tests {
             truncated,
             read_failed,
         }
+    }
+
+    fn expected_bytes_degradation_reason(sample_reason: &str) -> String {
+        format!("{LIBSSL_UPROBE_FLOW_ATTRIBUTION_REASON}; {sample_reason}")
     }
 
     fn lookup_for_sample(sample: &LibsslUprobePlaintextSample) -> LibsslUprobeFlowLookup {
