@@ -27,5 +27,6 @@ pub use tls::{
     LibsslUprobeAttachKind, LibsslUprobeAttachPlan, LibsslUprobeAttachProbe,
     LibsslUprobeAttachRecipe, LibsslUprobeAttachTarget, LibsslUprobeDegradationReason,
     LibsslUprobeDiscoveryError, LibsslUprobeSymbol, LibsslUprobeSymbolFailure, LibsslUprobeTarget,
-    LibsslUprobeTargetDiscovery, LibsslUprobeTargetDiscoveryReport,
+    LibsslUprobeTargetDiscovery, LibsslUprobeTargetDiscoveryReport, TlsKeyLogField,
+    TlsKeyLogLabelCount, TlsKeyLogParseError, TlsKeyLogSummary,
 };

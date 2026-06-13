@@ -18,6 +18,8 @@ use runtime::RuntimePlan;
 use serde::Serialize;
 use thiserror::Error;
 
+use super::tls::{TlsCheckError, TlsCheckSnapshot, check_tls};
+
 #[derive(Debug, Error)]
 pub enum CheckError {
     #[error("{0}")]
@@ -26,11 +28,14 @@ pub enum CheckError {
     Enforcement(#[from] enforcement::EnforcementError),
     #[error("{0}")]
     ConfiguredEnforcement(#[from] ConfiguredEnforcementError),
+    #[error("{0}")]
+    Tls(#[from] TlsCheckError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CheckReport {
     pub plan: RuntimePlan,
+    pub tls: TlsCheckSnapshot,
     pub policy: PolicyCheckSnapshot,
     pub enforcement: EnforcementCheckSnapshot,
 }
@@ -103,9 +108,11 @@ pub async fn build_check_report(
     backend: Option<Box<dyn EnforcementBackend>>,
 ) -> Result<CheckReport, CheckError> {
     let enforcement = check_enforcement(&plan, backend).await?;
+    let tls = check_tls(&plan)?;
     let policy = check_policy(&plan.config)?;
     Ok(CheckReport {
         plan,
+        tls,
         policy,
         enforcement,
     })
@@ -442,6 +449,13 @@ protective_actions = ["alert"]
             value["plan"]["export"]["sinks"][0]["tls"]["trust_anchors"][0]["path"],
             json!("/tmp/collector-ca.pem")
         );
+        assert_eq!(value["tls"]["plaintext"]["enabled"], json!(false));
+        assert_eq!(
+            value["tls"]["plaintext"]["provider"],
+            json!("libssl_uprobe")
+        );
+        assert_eq!(value["tls"]["plaintext"]["key_logs"], json!([]));
+        assert_eq!(value["tls"]["plaintext"]["session_secrets"], json!([]));
         assert_eq!(value["policy"]["mode"], json!("loaded"));
         assert_eq!(value["policy"]["configured_count"], json!(1));
         assert_eq!(value["policy"]["enabled_count"], json!(1));

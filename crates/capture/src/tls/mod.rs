@@ -1,5 +1,6 @@
 mod attach_plan;
 mod discovery;
+mod keylog;
 
 pub use attach_plan::{
     LibsslUprobeAttachKind, LibsslUprobeAttachPlan, LibsslUprobeAttachProbe,
@@ -11,3 +12,4 @@ pub use discovery::{
     LibsslUprobeSymbolFailure, LibsslUprobeTarget, LibsslUprobeTargetDiscovery,
     LibsslUprobeTargetDiscoveryReport,
 };
+pub use keylog::{TlsKeyLogField, TlsKeyLogLabelCount, TlsKeyLogParseError, TlsKeyLogSummary};
