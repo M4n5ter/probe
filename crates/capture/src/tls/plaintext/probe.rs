@@ -1,10 +1,13 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, thread};
 
 use aya::{
     Ebpf, EbpfError,
     maps::{MapData, RingBuf},
 };
-use ebpf_abi::{EBPF_EVENTS_MAP_NAME, EbpfEventDecodeError, decode_tls_plaintext_event};
+use ebpf_abi::{
+    EBPF_EVENTS_MAP_NAME, EBPF_RING_BUFFER_BYTES, EbpfEventDecodeError, EbpfTlsPlaintextEvent,
+    decode_tls_plaintext_event,
+};
 use ebpf_object::{
     EbpfObjectArtifact, EbpfObjectProbe, EbpfObjectProbeReport, EbpfPreflightedObject,
 };
@@ -20,6 +23,10 @@ use super::{
     provider::LibsslUprobePlaintextSampleSource,
     record::LibsslUprobePlaintextSample,
 };
+
+const STARTUP_BACKLOG_DRAIN_RECORD_LIMIT: usize =
+    (EBPF_RING_BUFFER_BYTES as usize / std::mem::size_of::<EbpfTlsPlaintextEvent>()) + 1;
+const STARTUP_BACKLOG_DRAIN_IDLE_PASSES: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibsslUprobePlaintextProbeConfig {
@@ -113,7 +120,7 @@ impl LibsslUprobePlaintextProbe {
             })?;
         let mut attach_session = LibsslUprobeAttachSession::default();
         attach_session.attach_uprobes(&mut ebpf, attach_recipes, AttachFailurePolicy::Strict)?;
-        let events = open_events_ringbuf(&mut ebpf)?;
+        let events = open_events_ringbuf_or_detach(&mut ebpf, &mut attach_session)?;
         Ok(Self {
             ebpf,
             attach_session,
@@ -135,12 +142,15 @@ impl LibsslUprobePlaintextProbe {
             attach_recipes,
             AttachFailurePolicy::BestEffort,
         )?;
-        if !attach_summary.has_resolvable_plaintext_recipe() {
+        let resolvable_targets = attach_summary.resolvable_targets();
+        if resolvable_targets.is_empty() {
+            attach_session.detach_all_best_effort(&mut ebpf)?;
             return Ok(LibsslUprobePlaintextProbeLoad::Disabled {
                 reason: attach_summary.unresolvable_plaintext_reason(),
             });
         }
-        let events = open_events_ringbuf(&mut ebpf)?;
+        attach_session.retain_targets_or_detach_all_best_effort(&mut ebpf, &resolvable_targets)?;
+        let events = open_drained_events_ringbuf_or_detach(&mut ebpf, &mut attach_session)?;
         Ok(LibsslUprobePlaintextProbeLoad::Enabled(Box::new(Self {
             ebpf,
             attach_session,
@@ -185,6 +195,42 @@ fn open_events_ringbuf(
         name: EBPF_EVENTS_MAP_NAME,
         source: Box::new(source),
     })
+}
+
+fn open_drained_events_ringbuf_or_detach(
+    ebpf: &mut Ebpf,
+    attach_session: &mut LibsslUprobeAttachSession,
+) -> Result<RingBuf<MapData>, LibsslUprobePlaintextProbeError> {
+    let mut events = open_events_ringbuf_or_detach(ebpf, attach_session)?;
+    drain_startup_backlog(&mut events);
+    Ok(events)
+}
+
+fn open_events_ringbuf_or_detach(
+    ebpf: &mut Ebpf,
+    attach_session: &mut LibsslUprobeAttachSession,
+) -> Result<RingBuf<MapData>, LibsslUprobePlaintextProbeError> {
+    match open_events_ringbuf(ebpf) {
+        Ok(events) => Ok(events),
+        Err(error) => {
+            let _ = attach_session.detach_all_best_effort(ebpf);
+            Err(error)
+        }
+    }
+}
+
+fn drain_startup_backlog(events: &mut RingBuf<MapData>) {
+    let mut idle_passes = 0;
+    for _ in 0..STARTUP_BACKLOG_DRAIN_RECORD_LIMIT {
+        match events.next() {
+            Some(_) => idle_passes = 0,
+            None if idle_passes + 1 < STARTUP_BACKLOG_DRAIN_IDLE_PASSES => {
+                idle_passes += 1;
+                thread::yield_now();
+            }
+            None => break,
+        }
+    }
 }
 
 fn plaintext_sample_from_ringbuf_record(

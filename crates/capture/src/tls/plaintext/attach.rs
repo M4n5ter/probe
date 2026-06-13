@@ -135,6 +135,15 @@ impl LibsslUprobeAttachSession {
     ) -> Result<(), LibsslUprobeAttachError> {
         self.attached_links.detach_all_best_effort(ebpf)
     }
+
+    pub(in crate::tls::plaintext) fn retain_targets_or_detach_all_best_effort(
+        &mut self,
+        ebpf: &mut Ebpf,
+        retained_targets: &BTreeSet<LibsslUprobeAttachTargetId>,
+    ) -> Result<(), LibsslUprobeAttachError> {
+        self.attached_links
+            .retain_targets_or_detach_all_best_effort(ebpf, retained_targets)
+    }
 }
 
 #[derive(Default)]
@@ -157,6 +166,33 @@ impl LibsslUprobeAttachedLinks {
         if let Some(error) = first_error {
             return Err(error);
         }
+        Ok(())
+    }
+
+    fn retain_targets_or_detach_all_best_effort(
+        &mut self,
+        ebpf: &mut Ebpf,
+        retained_targets: &BTreeSet<LibsslUprobeAttachTargetId>,
+    ) -> Result<(), LibsslUprobeAttachError> {
+        let links_by_target = std::mem::take(&mut self.links_by_target);
+        let mut retained_links = BTreeMap::new();
+        let mut first_error = None;
+        for (target, links) in links_by_target.into_iter().rev() {
+            if retained_targets.contains(&target) {
+                retained_links.insert(target, links);
+            } else if let Err(error) = detach_attached_uprobes_for_target(ebpf, &target, links) {
+                record_first_detach_error(&mut first_error, error);
+            }
+        }
+        if first_error.is_some() {
+            for (target, links) in retained_links.into_iter().rev() {
+                if let Err(error) = detach_attached_uprobes_for_target(ebpf, &target, links) {
+                    record_first_detach_error(&mut first_error, error);
+                }
+            }
+            return Err(first_error.expect("detach failure should be recorded"));
+        }
+        self.links_by_target = retained_links;
         Ok(())
     }
 
@@ -453,12 +489,18 @@ impl LibsslUprobeAttachSummary {
             .get_or_insert_with(|| error.to_string());
     }
 
-    pub(in crate::tls::plaintext) fn has_resolvable_plaintext_recipe(&self) -> bool {
-        self.recipes.iter().any(|recipe| {
-            recipe.complete
-                && matches!(recipe.semantic, LibsslUprobeSymbolRole::Plaintext { .. })
-                && self.has_complete_fd_association_for(&recipe.target)
-        })
+    pub(in crate::tls::plaintext) fn resolvable_targets(
+        &self,
+    ) -> BTreeSet<LibsslUprobeAttachTargetId> {
+        self.recipes
+            .iter()
+            .filter(|recipe| {
+                recipe.complete
+                    && matches!(recipe.semantic, LibsslUprobeSymbolRole::Plaintext { .. })
+                    && self.has_complete_fd_association_for(&recipe.target)
+            })
+            .map(|recipe| recipe.target.clone())
+            .collect()
     }
 
     fn has_complete_fd_association_for(&self, target: &LibsslUprobeAttachTargetId) -> bool {
@@ -602,10 +644,57 @@ mod tests {
         let mut summary = LibsslUprobeAttachSummary::from_recipes(&recipes);
 
         summary.record_recipe_attached(lifecycle_recipe);
-        assert!(!summary.has_resolvable_plaintext_recipe());
+        assert!(summary.resolvable_targets().is_empty());
 
         summary.record_recipe_attached(plaintext_recipe);
-        assert!(summary.has_resolvable_plaintext_recipe());
+        assert_eq!(
+            summary.resolvable_targets(),
+            [recipes[plaintext_recipe].target_id()].into()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attach_summary_reports_only_targets_with_complete_fd_association_and_plaintext()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ready_library = mapped_library("/usr/lib/libssl-ready.so.3");
+        let plaintext_only_library = mapped_library("/usr/lib/libssl-plaintext-only.so.3");
+        let plan = LibsslUprobeAttachPlan::from_discovery_report(discovery_report(
+            42,
+            vec![
+                LibsslUprobeTarget {
+                    library: ready_library.clone(),
+                    library_kind: LibsslLibraryKind::OpenSslLike,
+                    executable_mappings: Vec::new(),
+                    symbols: vec![LibsslUprobeSymbol::SslSetFd, LibsslUprobeSymbol::SslRead],
+                },
+                LibsslUprobeTarget {
+                    library: plaintext_only_library,
+                    library_kind: LibsslLibraryKind::OpenSslLike,
+                    executable_mappings: Vec::new(),
+                    symbols: vec![LibsslUprobeSymbol::SslRead],
+                },
+            ],
+        ));
+        let recipes = attach_recipes_from_plan(&plan)?;
+        let ready_plaintext_target = recipes
+            .iter()
+            .find(|recipe| {
+                recipe.library == ready_library
+                    && matches!(recipe.semantic, LibsslUprobeSymbolRole::Plaintext { .. })
+            })
+            .expect("fixture should include ready plaintext recipe")
+            .target_id();
+        let mut summary = LibsslUprobeAttachSummary::from_recipes(&recipes);
+
+        for recipe_index in 0..recipes.len() {
+            summary.record_recipe_attached(recipe_index);
+        }
+
+        assert_eq!(
+            summary.resolvable_targets(),
+            [ready_plaintext_target].into()
+        );
         Ok(())
     }
 
@@ -630,7 +719,7 @@ mod tests {
 
         summary.record_recipe_attached(plaintext_recipe);
 
-        assert!(!summary.has_resolvable_plaintext_recipe());
+        assert!(summary.resolvable_targets().is_empty());
         assert!(
             summary
                 .unresolvable_plaintext_reason()
