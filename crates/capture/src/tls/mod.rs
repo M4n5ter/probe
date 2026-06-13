@@ -1,5 +1,6 @@
 mod attach_inventory;
 mod attach_plan;
+mod attach_reconcile;
 mod discovery;
 mod keylog;
 mod plaintext;
@@ -11,7 +12,9 @@ pub use attach_inventory::{
 pub use attach_plan::{
     LibsslUprobeAttachKind, LibsslUprobeAttachPlan, LibsslUprobeAttachPoint,
     LibsslUprobeAttachProcess, LibsslUprobeAttachRecipe, LibsslUprobeAttachTarget,
+    LibsslUprobeAttachTargetId,
 };
+pub use attach_reconcile::{LibsslUprobeAttachState, LibsslUprobeReconcileReport};
 pub(in crate::tls) use discovery::LibsslUprobeProcessVerifier;
 pub use discovery::{
     LibsslExecutableMapping, LibsslLibraryKind, LibsslMappedFileIdentity, LibsslMappedLibrary,

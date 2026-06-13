@@ -59,6 +59,60 @@ impl LibsslUprobeAttachPlan {
     pub fn degraded_reasons(&self) -> &[LibsslUprobeDegradationReason] {
         &self.degraded_reasons
     }
+
+    pub(in crate::tls) fn target_ids(
+        &self,
+    ) -> impl Iterator<Item = LibsslUprobeAttachTargetId> + '_ {
+        self.processes.iter().flat_map(|process| {
+            process.targets.iter().map(|target| {
+                LibsslUprobeAttachTargetId::new(process.process, target.library.clone())
+            })
+        })
+    }
+
+    pub(in crate::tls) fn filter_targets(
+        &self,
+        mut include: impl FnMut(&LibsslUprobeAttachTargetId) -> bool,
+    ) -> Self {
+        let processes = self
+            .processes
+            .iter()
+            .filter_map(|process| {
+                let targets = process
+                    .targets
+                    .iter()
+                    .filter(|target| {
+                        include(&LibsslUprobeAttachTargetId::new(
+                            process.process,
+                            target.library.clone(),
+                        ))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!targets.is_empty()).then(|| LibsslUprobeAttachProcess {
+                    process: process.process,
+                    targets,
+                    process_verifier: process.process_verifier.clone(),
+                })
+            })
+            .collect();
+        Self {
+            processes,
+            degraded_reasons: self.degraded_reasons.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LibsslUprobeAttachTargetId {
+    pub process: ProcessGeneration,
+    pub library: LibsslMappedLibrary,
+}
+
+impl LibsslUprobeAttachTargetId {
+    pub(in crate::tls) fn new(process: ProcessGeneration, library: LibsslMappedLibrary) -> Self {
+        Self { process, library }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

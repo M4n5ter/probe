@@ -16,8 +16,8 @@ use crate::{
     CaptureError,
     tls::{
         LibsslMappedLibrary, LibsslUprobeAttachKind, LibsslUprobeAttachPlan,
-        LibsslUprobeAttachPoint, LibsslUprobeProcessGenerationFailure, LibsslUprobeProcessVerifier,
-        LibsslUprobeSymbolFailure, LibsslUprobeSymbolRole,
+        LibsslUprobeAttachPoint, LibsslUprobeAttachTargetId, LibsslUprobeProcessGenerationFailure,
+        LibsslUprobeProcessVerifier, LibsslUprobeSymbolFailure, LibsslUprobeSymbolRole,
         discovery::{verify_current_mapped_library_identity, verify_current_process_generation},
     },
 };
@@ -453,10 +453,7 @@ impl LibsslUprobeAttachSummary {
         let recipes = recipes
             .iter()
             .map(|recipe| LibsslUprobeRecipeAttachProgress {
-                target: LibsslUprobeAttachTargetKey {
-                    process: recipe.process,
-                    library: recipe.library.clone(),
-                },
+                target: LibsslUprobeAttachTargetId::new(recipe.process, recipe.library.clone()),
                 semantic: recipe.semantic,
                 complete: false,
             })
@@ -488,7 +485,7 @@ impl LibsslUprobeAttachSummary {
         })
     }
 
-    fn has_complete_fd_association_for(&self, target: &LibsslUprobeAttachTargetKey) -> bool {
+    fn has_complete_fd_association_for(&self, target: &LibsslUprobeAttachTargetId) -> bool {
         self.recipes.iter().any(|recipe| {
             recipe.complete
                 && recipe.target == *target
@@ -520,14 +517,8 @@ impl LibsslUprobeAttachSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LibsslUprobeAttachTargetKey {
-    process: ProcessGeneration,
-    library: LibsslMappedLibrary,
-}
-
 struct LibsslUprobeRecipeAttachProgress {
-    target: LibsslUprobeAttachTargetKey,
+    target: LibsslUprobeAttachTargetId,
     semantic: LibsslUprobeSymbolRole,
     complete: bool,
 }
