@@ -38,6 +38,12 @@ impl LibsslUprobeAttachSummary {
         !self.committed_targets.is_empty()
     }
 
+    pub(in crate::tls::plaintext) fn committed_targets(
+        &self,
+    ) -> impl Iterator<Item = LibsslUprobeAttachTargetId> + '_ {
+        self.committed_targets.iter().cloned()
+    }
+
     pub(in crate::tls::plaintext) fn unresolvable_plaintext_reason(&self) -> String {
         if self.has_plaintext_recipe {
             let mut reason =

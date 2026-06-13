@@ -15,6 +15,34 @@ pub(super) struct LibsslUprobeAttachedLinks {
 }
 
 impl LibsslUprobeAttachedLinks {
+    pub(super) fn targets(&self) -> impl Iterator<Item = LibsslUprobeAttachTargetId> + '_ {
+        self.links_by_target.keys().cloned()
+    }
+
+    pub(super) fn target_count(&self) -> usize {
+        self.links_by_target.len()
+    }
+
+    pub(super) fn detach_targets_best_effort(
+        &mut self,
+        ebpf: &mut Ebpf,
+        targets: impl IntoIterator<Item = LibsslUprobeAttachTargetId>,
+    ) -> Result<(), LibsslUprobeAttachError> {
+        let mut first_error = None;
+        for target in targets {
+            let Some(links) = self.links_by_target.remove(&target) else {
+                continue;
+            };
+            if let Err(error) = detach_attached_uprobes_for_target(ebpf, &target, links) {
+                record_first_detach_error(&mut first_error, error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(super) fn detach_all_best_effort(
         &mut self,
         ebpf: &mut Ebpf,

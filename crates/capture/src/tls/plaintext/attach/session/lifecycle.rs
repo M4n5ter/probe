@@ -22,6 +22,16 @@ pub(in crate::tls::plaintext) struct LibsslUprobeAttachSession {
 }
 
 impl LibsslUprobeAttachSession {
+    pub(in crate::tls::plaintext) fn attached_targets(
+        &self,
+    ) -> impl Iterator<Item = crate::tls::LibsslUprobeAttachTargetId> + '_ {
+        self.attached_links.targets()
+    }
+
+    pub(in crate::tls::plaintext) fn attached_target_count(&self) -> usize {
+        self.attached_links.target_count()
+    }
+
     pub(in crate::tls::plaintext) fn attach_uprobes(
         &mut self,
         ebpf: &mut Ebpf,
@@ -101,6 +111,15 @@ impl LibsslUprobeAttachSession {
         ebpf: &mut Ebpf,
     ) -> Result<(), LibsslUprobeAttachError> {
         self.attached_links.detach_all_best_effort(ebpf)
+    }
+
+    pub(in crate::tls::plaintext) fn detach_targets_best_effort(
+        &mut self,
+        ebpf: &mut Ebpf,
+        targets: impl IntoIterator<Item = crate::tls::LibsslUprobeAttachTargetId>,
+    ) -> Result<(), LibsslUprobeAttachError> {
+        self.attached_links
+            .detach_targets_best_effort(ebpf, targets)
     }
 }
 

@@ -3,22 +3,23 @@ use std::collections::BTreeSet;
 use super::{LibsslUprobeAttachPlan, LibsslUprobeAttachTargetId};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LibsslUprobeAttachState {
+pub(in crate::tls) struct LibsslUprobeAttachState {
     targets: BTreeSet<LibsslUprobeAttachTargetId>,
 }
 
 impl LibsslUprobeAttachState {
-    pub fn from_plan(plan: &LibsslUprobeAttachPlan) -> Self {
+    pub(in crate::tls) fn from_targets(
+        targets: impl IntoIterator<Item = LibsslUprobeAttachTargetId>,
+    ) -> Self {
         Self {
-            targets: plan.target_ids().collect(),
+            targets: targets.into_iter().collect(),
         }
     }
 
-    pub fn target_count(&self) -> usize {
-        self.targets.len()
-    }
-
-    pub fn reconcile(&self, next_plan: &LibsslUprobeAttachPlan) -> LibsslUprobeReconcileReport {
+    pub(in crate::tls) fn reconcile(
+        &self,
+        next_plan: &LibsslUprobeAttachPlan,
+    ) -> LibsslUprobeReconcileReport {
         let next_targets = next_plan.target_ids().collect::<BTreeSet<_>>();
         let new_targets = next_targets
             .difference(&self.targets)
@@ -41,27 +42,16 @@ impl LibsslUprobeAttachState {
             new_targets,
             retained_targets,
             stale_targets,
-            state_after_successful_reconcile: Self {
-                targets: next_targets,
-            },
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LibsslUprobeReconcileReport {
-    pub attach_plan: LibsslUprobeAttachPlan,
-    pub new_targets: Vec<LibsslUprobeAttachTargetId>,
-    pub retained_targets: Vec<LibsslUprobeAttachTargetId>,
-    pub stale_targets: Vec<LibsslUprobeAttachTargetId>,
-    state_after_successful_reconcile: LibsslUprobeAttachState,
-}
-
-impl LibsslUprobeReconcileReport {
-    /// Returns the state that may be committed after every attach/detach side effect succeeds.
-    pub fn state_after_successful_reconcile(&self) -> &LibsslUprobeAttachState {
-        &self.state_after_successful_reconcile
-    }
+pub(in crate::tls) struct LibsslUprobeReconcileReport {
+    pub(in crate::tls) attach_plan: LibsslUprobeAttachPlan,
+    pub(in crate::tls) new_targets: Vec<LibsslUprobeAttachTargetId>,
+    pub(in crate::tls) retained_targets: Vec<LibsslUprobeAttachTargetId>,
+    pub(in crate::tls) stale_targets: Vec<LibsslUprobeAttachTargetId>,
 }
 
 #[cfg(test)]
@@ -87,12 +77,11 @@ mod tests {
         assert!(report.retained_targets.is_empty());
         assert!(report.stale_targets.is_empty());
         assert_eq!(plan_pids(&report.attach_plan), vec![7, 8]);
-        assert_eq!(report.state_after_successful_reconcile().target_count(), 2);
     }
 
     #[test]
     fn reconcile_attaches_only_new_targets_and_retains_existing_targets() {
-        let current = LibsslUprobeAttachState::from_plan(&attach_plan([7]));
+        let current = attach_state(&attach_plan([7]));
         let next_plan = attach_plan([7, 8]);
 
         let report = current.reconcile(&next_plan);
@@ -101,12 +90,11 @@ mod tests {
         assert_eq!(target_pids(&report.retained_targets), vec![7]);
         assert!(report.stale_targets.is_empty());
         assert_eq!(plan_pids(&report.attach_plan), vec![8]);
-        assert_eq!(report.state_after_successful_reconcile().target_count(), 2);
     }
 
     #[test]
     fn reconcile_reports_stale_targets_without_reattaching_retained_targets() {
-        let current = LibsslUprobeAttachState::from_plan(&attach_plan([7, 9]));
+        let current = attach_state(&attach_plan([7, 9]));
         let next_plan = attach_plan([7]);
 
         let report = current.reconcile(&next_plan);
@@ -115,12 +103,11 @@ mod tests {
         assert_eq!(target_pids(&report.retained_targets), vec![7]);
         assert_eq!(target_pids(&report.stale_targets), vec![9]);
         assert!(report.attach_plan.processes().is_empty());
-        assert_eq!(report.state_after_successful_reconcile().target_count(), 1);
     }
 
     #[test]
     fn reconcile_treats_changed_library_identity_as_stale_and_new() {
-        let current = LibsslUprobeAttachState::from_plan(&attach_plan_for_process(7, [100]));
+        let current = attach_state(&attach_plan_for_process(7, [100]));
         let next_plan = attach_plan_for_process(7, [200]);
 
         let report = current.reconcile(&next_plan);
@@ -133,7 +120,7 @@ mod tests {
 
     #[test]
     fn reconcile_attaches_new_library_without_reattaching_retained_library() {
-        let current = LibsslUprobeAttachState::from_plan(&attach_plan_for_process(7, [100]));
+        let current = attach_state(&attach_plan_for_process(7, [100]));
         let next_plan = attach_plan_for_process(7, [100, 200]);
 
         let report = current.reconcile(&next_plan);
@@ -146,6 +133,10 @@ mod tests {
 
     fn attach_plan(pids: impl IntoIterator<Item = u32>) -> LibsslUprobeAttachPlan {
         LibsslUprobeAttachPlan::from_discovery_reports(pids.into_iter().map(discovery_report))
+    }
+
+    fn attach_state(plan: &LibsslUprobeAttachPlan) -> LibsslUprobeAttachState {
+        LibsslUprobeAttachState::from_targets(plan.target_ids())
     }
 
     fn attach_plan_for_process(

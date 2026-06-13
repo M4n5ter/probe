@@ -5,10 +5,10 @@ use std::{
 
 use attribution::{AttributionError, ProcessAttributor, ProcfsAttributor, ProcfsSocketResolver};
 use capture::{
-    CaptureError, CaptureProvider, LibsslResolvedFlow, LibsslUprobeAttachState,
+    CaptureError, CaptureProvider, LibsslResolvedFlow, LibsslUprobeAttachPlan,
     LibsslUprobeFlowLookup, LibsslUprobeFlowResolver, LibsslUprobePlaintextOpen,
-    LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider, LibsslUprobeReconcileReport,
-    LibsslUprobeTargetDiscovery, plan_libssl_uprobes_for_processes,
+    LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider, LibsslUprobeTargetDiscovery,
+    plan_libssl_uprobes_for_processes,
 };
 use probe_config::TlsPlaintextProvider;
 use probe_core::{CompiledSelector, TcpConnection};
@@ -139,15 +139,15 @@ fn build_libssl_uprobe_plaintext_provider(
                 "invalid tls.plaintext.selector during runtime build: {source}"
             ))
         })?;
-    let reconcile = reconcile_startup_libssl_uprobes(selector.as_ref())?;
-    if reconcile.attach_plan.processes().is_empty() {
+    let attach_plan = build_startup_libssl_uprobe_attach_plan(selector.as_ref())?;
+    if attach_plan.processes().is_empty() {
         return Ok(TlsPlaintextProviderBuild::disabled(
             "libssl uprobe TLS plaintext sidecar disabled: startup scan found no attachable libssl processes",
         ));
     }
 
     match LibsslUprobePlaintextProvider::open_best_effort(
-        LibsslUprobePlaintextProbeConfig::new(object_path, reconcile.attach_plan),
+        LibsslUprobePlaintextProbeConfig::new(object_path, attach_plan),
         Box::<ProcfsLibsslFlowResolver>::default(),
     )? {
         LibsslUprobePlaintextOpen::Enabled(provider) => {
@@ -159,9 +159,9 @@ fn build_libssl_uprobe_plaintext_provider(
     }
 }
 
-fn reconcile_startup_libssl_uprobes(
+fn build_startup_libssl_uprobe_attach_plan(
     selector: Option<&CompiledSelector>,
-) -> Result<LibsslUprobeReconcileReport, AgentError> {
+) -> Result<LibsslUprobeAttachPlan, AgentError> {
     let attributor = ProcfsAttributor::new();
     attributor.probe()?;
     let processes = attributor
@@ -174,7 +174,7 @@ fn reconcile_startup_libssl_uprobes(
         selector,
         &LibsslUprobeTargetDiscovery::default(),
     );
-    Ok(LibsslUprobeAttachState::default().reconcile(&planning_report.attach_plan))
+    Ok(planning_report.attach_plan)
 }
 
 fn identify_startup_process(

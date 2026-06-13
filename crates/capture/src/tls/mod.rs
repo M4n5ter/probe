@@ -14,7 +14,7 @@ pub use attach_plan::{
     LibsslUprobeAttachProcess, LibsslUprobeAttachRecipe, LibsslUprobeAttachTarget,
     LibsslUprobeAttachTargetId,
 };
-pub use attach_reconcile::{LibsslUprobeAttachState, LibsslUprobeReconcileReport};
+pub(in crate::tls) use attach_reconcile::{LibsslUprobeAttachState, LibsslUprobeReconcileReport};
 pub(in crate::tls) use discovery::LibsslUprobeProcessVerifier;
 pub use discovery::{
     LibsslExecutableMapping, LibsslLibraryKind, LibsslMappedFileIdentity, LibsslMappedLibrary,
@@ -27,4 +27,5 @@ pub use keylog::{TlsKeyLogField, TlsKeyLogLabelCount, TlsKeyLogParseError, TlsKe
 pub use plaintext::{
     LibsslResolvedFlow, LibsslUprobeFlowLookup, LibsslUprobeFlowResolver,
     LibsslUprobePlaintextOpen, LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
+    LibsslUprobePlaintextReconcile,
 };

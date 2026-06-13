@@ -74,7 +74,7 @@ fn capability_from_object_report(
     CapabilityState::degraded(
         CapabilityKind::LibsslUprobe,
         format!(
-            "eBPF TLS plaintext object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and agent startup attach wiring can build a plaintext sidecar provider, but dynamic process reconcile, detach lifecycle, strong fd ownership, and low-latency provider multiplexing remain best-effort",
+            "eBPF TLS plaintext object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and agent startup attach wiring can build a plaintext sidecar provider, but agent dynamic process scan/reconcile scheduling, agent-side provider control handle retention, process-exit cleanup, strong fd ownership, and low-latency provider multiplexing remain best-effort",
             object.summary()
         ),
     )
@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_stays_degraded_until_dynamic_lifecycle_exists() {
+    fn capability_stays_degraded_until_agent_dynamic_lifecycle_exists() {
         let capability = capability_from_object_report(
             available_tls_plaintext_object_report(),
             &procfs_socket_attribution_capability(RuntimeMode::Degraded),
@@ -152,7 +152,9 @@ mod tests {
         assert!(reason.contains("eBPF TLS plaintext object preflight via aya-obj succeeded"));
         assert!(reason.contains("procfs socket attribution is usable"));
         assert!(reason.contains("startup attach wiring"));
-        assert!(reason.contains("dynamic process reconcile"));
+        assert!(reason.contains("agent dynamic process scan/reconcile scheduling"));
+        assert!(reason.contains("agent-side provider control handle retention"));
+        assert!(reason.contains("process-exit cleanup"));
         assert!(reason.contains("provider multiplexing"));
     }
 

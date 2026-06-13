@@ -7,18 +7,30 @@ use probe_core::{CapabilityKind, CapabilityState, Timestamp};
 
 use crate::{
     CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind, PlaintextEvent,
+    tls::LibsslUprobeAttachPlan,
 };
 
 use super::{
     bridge::{LibsslUprobeFlowResolver, libssl_plaintext_events_from_sample},
     probe::{
         LibsslUprobePlaintextProbe, LibsslUprobePlaintextProbeConfig,
-        LibsslUprobePlaintextProbeLoad,
+        LibsslUprobePlaintextProbeLoad, LibsslUprobePlaintextReconcile,
     },
     record::LibsslUprobePlaintextSample,
 };
 
 pub(in crate::tls::plaintext) trait LibsslUprobePlaintextSampleSource {
+    fn reconcile_libssl_uprobes(
+        &mut self,
+        next_plan: LibsslUprobeAttachPlan,
+    ) -> Result<LibsslUprobePlaintextReconcile, CaptureError> {
+        let _ = next_plan;
+        Err(CaptureError::provider(
+            "libssl_uprobe_plaintext",
+            "TLS plaintext sample source does not support dynamic libssl uprobe reconcile",
+        ))
+    }
+
     fn next_tls_plaintext_sample(
         &mut self,
     ) -> Result<Option<LibsslUprobePlaintextSample>, CaptureError>;
@@ -30,6 +42,7 @@ pub struct LibsslUprobePlaintextProvider {
     pending_events: VecDeque<PlaintextEvent>,
     clock: LibsslUprobePlaintextClock,
     idle_policy: LibsslUprobePlaintextIdlePolicy,
+    poisoned_reason: Option<String>,
 }
 
 pub enum LibsslUprobePlaintextOpen {
@@ -66,6 +79,17 @@ impl LibsslUprobePlaintextProvider {
         }
     }
 
+    pub fn reconcile_libssl_uprobes(
+        &mut self,
+        next_plan: LibsslUprobeAttachPlan,
+    ) -> Result<LibsslUprobePlaintextReconcile, CaptureError> {
+        self.ensure_not_poisoned()?;
+        match self.source.reconcile_libssl_uprobes(next_plan) {
+            Ok(result) => Ok(result),
+            Err(error) => Err(self.poison_after_reconcile_error(error)),
+        }
+    }
+
     fn from_live_source(
         source: Box<dyn LibsslUprobePlaintextSampleSource>,
         resolver: Box<dyn LibsslUprobeFlowResolver>,
@@ -92,10 +116,12 @@ impl LibsslUprobePlaintextProvider {
             pending_events: VecDeque::new(),
             clock: LibsslUprobePlaintextClock::default(),
             idle_policy,
+            poisoned_reason: None,
         }
     }
 
     fn poll_event(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.ensure_not_poisoned()?;
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(CapturePoll::event(CaptureEvent::from(event)));
         }
@@ -118,6 +144,30 @@ impl LibsslUprobePlaintextProvider {
             .map(CaptureEvent::from)
             .map(CapturePoll::event)
             .unwrap_or(CapturePoll::Progress))
+    }
+
+    fn ensure_not_poisoned(&self) -> Result<(), CaptureError> {
+        match &self.poisoned_reason {
+            Some(reason) => Err(CaptureError::provider(
+                "libssl_uprobe_plaintext",
+                reason.clone(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn poison_after_reconcile_error(&mut self, error: CaptureError) -> CaptureError {
+        let reason = match error {
+            CaptureError::Provider { provider, reason }
+                if provider == "libssl_uprobe_plaintext" =>
+            {
+                reason
+            }
+            other => other.to_string(),
+        };
+        self.pending_events.clear();
+        self.poisoned_reason = Some(reason.clone());
+        CaptureError::provider("libssl_uprobe_plaintext", reason)
     }
 }
 
@@ -178,7 +228,7 @@ mod tests {
 
     use ebpf_abi::{
         EBPF_TLS_DIRECTION_OUTBOUND, EBPF_TLS_PLAINTEXT_FD_VALID, EBPF_TLS_PLAINTEXT_SAMPLE_BYTES,
-        EbpfTlsPlaintextEvent, EbpfTlsPlaintextObservation,
+        EBPF_TLS_PLAINTEXT_TRUNCATED, EbpfTlsPlaintextEvent, EbpfTlsPlaintextObservation,
     };
     use probe_core::{
         CaptureSource, Direction, ProcessContext, ProcessIdentity, TcpConnection, TcpEndpoint,
@@ -254,6 +304,50 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn reconcile_failure_poisons_provider_before_pending_events_are_drained()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let resolver = Box::new(StaticFlowResolver {
+            expected: LibsslUprobeFlowLookup {
+                tgid: 22,
+                thread_pid: 11,
+                ssl_pointer: 0xfeed,
+                fd: Some(7),
+                direction: Direction::Outbound,
+            },
+            resolved: Some(demo_resolved_flow()),
+            seen: false,
+        });
+        let mut provider = LibsslUprobePlaintextProvider::new(
+            Box::new(FailingReconcileTlsPlaintextSource {
+                samples: VecTlsPlaintextSource::new([truncated_sample_event()]),
+            }),
+            resolver,
+        );
+
+        let CapturePoll::Event(first_event) = provider.poll_next()? else {
+            panic!("expected first truncated sample event");
+        };
+        assert!(matches!(*first_event, crate::CaptureEvent::Bytes(_)));
+
+        let error = provider
+            .reconcile_libssl_uprobes(empty_attach_plan())
+            .expect_err("reconcile failure must poison provider");
+        assert!(error.to_string().contains("reconcile failed"));
+
+        let error = provider
+            .poll_next()
+            .expect_err("poisoned provider must not drain pending gap events");
+        assert!(error.to_string().contains("reconcile failed"));
+        Ok(())
+    }
+
+    fn empty_attach_plan() -> LibsslUprobeAttachPlan {
+        LibsslUprobeAttachPlan::from_discovery_reports(std::iter::empty::<
+            crate::tls::LibsslUprobeTargetDiscoveryReport,
+        >())
+    }
+
     fn sample_event() -> EbpfTlsPlaintextEvent {
         let mut payload = [0; EBPF_TLS_PLAINTEXT_SAMPLE_BYTES];
         payload[..5].copy_from_slice(b"GET /");
@@ -273,6 +367,28 @@ mod tests {
                 payload,
             ),
             EBPF_TLS_PLAINTEXT_FD_VALID,
+        )
+    }
+
+    fn truncated_sample_event() -> EbpfTlsPlaintextEvent {
+        let mut payload = [0; EBPF_TLS_PLAINTEXT_SAMPLE_BYTES];
+        payload[..5].copy_from_slice(b"GET /");
+        EbpfTlsPlaintextEvent::libssl_plaintext_sampled(
+            11,
+            22,
+            33,
+            44,
+            nul_padded_command("curl"),
+            EbpfTlsPlaintextObservation::new(
+                0xfeed,
+                7,
+                EBPF_TLS_DIRECTION_OUTBOUND,
+                100,
+                9,
+                5,
+                payload,
+            ),
+            EBPF_TLS_PLAINTEXT_FD_VALID | EBPF_TLS_PLAINTEXT_TRUNCATED,
         )
     }
 
@@ -370,6 +486,29 @@ mod tests {
                 self.idle_before_samples -= 1;
                 return Ok(None);
             }
+            self.samples.next_tls_plaintext_sample()
+        }
+    }
+
+    struct FailingReconcileTlsPlaintextSource {
+        samples: VecTlsPlaintextSource,
+    }
+
+    impl LibsslUprobePlaintextSampleSource for FailingReconcileTlsPlaintextSource {
+        fn reconcile_libssl_uprobes(
+            &mut self,
+            next_plan: LibsslUprobeAttachPlan,
+        ) -> Result<LibsslUprobePlaintextReconcile, CaptureError> {
+            assert!(next_plan.processes().is_empty());
+            Err(CaptureError::provider(
+                "libssl_uprobe_plaintext",
+                "reconcile failed",
+            ))
+        }
+
+        fn next_tls_plaintext_sample(
+            &mut self,
+        ) -> Result<Option<LibsslUprobePlaintextSample>, CaptureError> {
             self.samples.next_tls_plaintext_sample()
         }
     }
