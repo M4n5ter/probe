@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ProcessGeneration {
+    pub pid: u32,
+    pub start_time_ticks: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -17,6 +23,13 @@ pub struct ProcessIdentity {
 }
 
 impl ProcessIdentity {
+    pub fn generation(&self) -> ProcessGeneration {
+        ProcessGeneration {
+            pid: self.pid,
+            start_time_ticks: self.start_time_ticks,
+        }
+    }
+
     pub fn stable_key(&self) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.boot_id.as_bytes());

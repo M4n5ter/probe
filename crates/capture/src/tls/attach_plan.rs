@@ -1,12 +1,15 @@
+use probe_core::ProcessGeneration;
+
 use super::{
     LibsslExecutableMapping, LibsslLibraryKind, LibsslMappedLibrary, LibsslUprobeDegradationReason,
-    LibsslUprobeSymbol, LibsslUprobeSymbolRole, LibsslUprobeTargetDiscoveryReport,
+    LibsslUprobeProcessVerifier, LibsslUprobeSymbol, LibsslUprobeSymbolRole,
+    LibsslUprobeTargetDiscoveryReport,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibsslUprobeAttachPlan {
-    pub targets: Vec<LibsslUprobeAttachTarget>,
-    pub degraded_reasons: Vec<LibsslUprobeDegradationReason>,
+    processes: Vec<LibsslUprobeAttachProcess>,
+    degraded_reasons: Vec<LibsslUprobeDegradationReason>,
 }
 
 impl LibsslUprobeAttachPlan {
@@ -17,26 +20,29 @@ impl LibsslUprobeAttachPlan {
     pub fn from_discovery_reports(
         reports: impl IntoIterator<Item = LibsslUprobeTargetDiscoveryReport>,
     ) -> Self {
-        let mut targets = Vec::new();
+        let mut processes = Vec::new();
         let mut degraded_reasons = Vec::new();
         for report in reports {
-            degraded_reasons.extend(report.degraded_reasons);
-            targets.extend(
-                report
-                    .targets
-                    .into_iter()
-                    .map(LibsslUprobeAttachTarget::from),
-            );
+            let (process, process_verifier, targets, reasons) = report.into_attach_parts();
+            degraded_reasons.extend(reasons);
+            if !targets.is_empty() {
+                processes.push(LibsslUprobeAttachProcess::from_discovered(
+                    process,
+                    process_verifier,
+                    targets,
+                ));
+            }
         }
         Self {
-            targets,
+            processes,
             degraded_reasons,
         }
     }
 
     pub fn probe_count(&self) -> usize {
-        self.targets
+        self.processes
             .iter()
+            .flat_map(|process| process.targets.iter())
             .flat_map(|target| target.recipes.iter())
             .map(LibsslUprobeAttachRecipe::attach_point_count)
             .sum()
@@ -45,21 +51,67 @@ impl LibsslUprobeAttachPlan {
     pub fn has_attachable_probes(&self) -> bool {
         self.probe_count() > 0
     }
+
+    pub fn processes(&self) -> &[LibsslUprobeAttachProcess] {
+        &self.processes
+    }
+
+    pub fn degraded_reasons(&self) -> &[LibsslUprobeDegradationReason] {
+        &self.degraded_reasons
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibsslUprobeAttachProcess {
+    process: ProcessGeneration,
+    targets: Vec<LibsslUprobeAttachTarget>,
+    process_verifier: LibsslUprobeProcessVerifier,
+}
+
+impl LibsslUprobeAttachProcess {
+    fn from_discovered(
+        process: ProcessGeneration,
+        process_verifier: LibsslUprobeProcessVerifier,
+        targets: Vec<super::LibsslUprobeTarget>,
+    ) -> Self {
+        Self {
+            process,
+            process_verifier,
+            targets: targets
+                .into_iter()
+                .map(LibsslUprobeAttachTarget::from_discovered)
+                .collect(),
+        }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.process.pid
+    }
+
+    pub fn process(&self) -> ProcessGeneration {
+        self.process
+    }
+
+    pub fn targets(&self) -> &[LibsslUprobeAttachTarget] {
+        &self.targets
+    }
+
+    pub(in crate::tls) fn process_verifier(&self) -> &LibsslUprobeProcessVerifier {
+        &self.process_verifier
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibsslUprobeAttachTarget {
-    pub pid: u32,
     pub library: LibsslMappedLibrary,
     pub library_kind: LibsslLibraryKind,
     pub executable_mappings: Vec<LibsslExecutableMapping>,
     pub recipes: Vec<LibsslUprobeAttachRecipe>,
 }
 
-impl From<super::LibsslUprobeTarget> for LibsslUprobeAttachTarget {
-    fn from(target: super::LibsslUprobeTarget) -> Self {
+impl LibsslUprobeAttachTarget {
+    fn from_discovered(target: super::LibsslUprobeTarget) -> Self {
         Self {
-            pid: target.pid,
             library: target.library,
             library_kind: target.library_kind,
             executable_mappings: target.executable_mappings,
@@ -147,7 +199,7 @@ mod tests {
         EBPF_TLS_SSL_SET_FD_PROGRAM_NAME, EBPF_TLS_SSL_WRITE_EX_ENTER_PROGRAM_NAME,
         EBPF_TLS_SSL_WRITE_EX_EXIT_PROGRAM_NAME,
     };
-    use probe_core::Direction;
+    use probe_core::{Direction, ProcessGeneration};
 
     use super::*;
     use crate::{
@@ -157,10 +209,9 @@ mod tests {
 
     #[test]
     fn attach_plan_maps_libssl_symbols_to_probe_kind_and_direction() {
-        let report = LibsslUprobeTargetDiscoveryReport {
-            pid: 42,
-            targets: vec![LibsslUprobeTarget {
-                pid: 42,
+        let report = discovery_report(
+            42,
+            vec![LibsslUprobeTarget {
                 library: mapped_library("/usr/lib/libssl.so.3"),
                 library_kind: LibsslLibraryKind::OpenSslLike,
                 executable_mappings: vec![LibsslExecutableMapping {
@@ -178,17 +229,21 @@ mod tests {
                     LibsslUprobeSymbol::SslWriteEx,
                 ],
             }],
-            degraded_reasons: Vec::new(),
-        };
+            Vec::new(),
+        );
 
         let plan = LibsslUprobeAttachPlan::from_discovery_report(report);
 
         assert!(plan.has_attachable_probes());
         assert_eq!(plan.probe_count(), 13);
-        assert_eq!(plan.targets.len(), 1);
-        assert_eq!(plan.targets[0].pid, 42);
+        assert_eq!(plan.processes().len(), 1);
+        let planned_process = &plan.processes()[0];
+        assert_eq!(planned_process.pid(), 42);
+        assert_eq!(planned_process.process(), process_generation(42));
+        assert_eq!(planned_process.targets().len(), 1);
+        let target = &planned_process.targets()[0];
         assert_eq!(
-            plan.targets[0].recipes,
+            target.recipes,
             vec![
                 LibsslUprobeAttachRecipe {
                     symbol: LibsslUprobeSymbol::SslSetFd,
@@ -213,10 +268,10 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(plan.targets[0].recipes[0].function_name(), "SSL_set_fd");
-        assert_eq!(plan.targets[0].recipes[6].function_name(), "SSL_write_ex");
+        assert_eq!(target.recipes[0].function_name(), "SSL_set_fd");
+        assert_eq!(target.recipes[6].function_name(), "SSL_write_ex");
         assert_recipe(
-            &plan.targets[0].recipes[0],
+            &target.recipes[0],
             LibsslUprobeSymbolRole::FdAssociation,
             &[
                 attach_point(
@@ -234,7 +289,7 @@ mod tests {
             ],
         );
         assert_recipe(
-            &plan.targets[0].recipes[1],
+            &target.recipes[1],
             LibsslUprobeSymbolRole::StateReset,
             &[
                 attach_point(
@@ -252,7 +307,7 @@ mod tests {
             ],
         );
         assert_recipe(
-            &plan.targets[0].recipes[2],
+            &target.recipes[2],
             LibsslUprobeSymbolRole::StateCleanup,
             &[attach_point(
                 "SSL_free",
@@ -262,7 +317,7 @@ mod tests {
             )],
         );
         assert_recipe(
-            &plan.targets[0].recipes[3],
+            &target.recipes[3],
             plaintext(Direction::Inbound),
             &[
                 attach_point(
@@ -280,7 +335,7 @@ mod tests {
             ],
         );
         assert_recipe(
-            &plan.targets[0].recipes[6],
+            &target.recipes[6],
             plaintext(Direction::Outbound),
             &[
                 attach_point(
@@ -308,16 +363,25 @@ mod tests {
                 reason: "bad elf".to_string(),
             },
         };
-        let report = LibsslUprobeTargetDiscoveryReport {
-            pid: 7,
-            targets: Vec::new(),
-            degraded_reasons: vec![reason.clone()],
-        };
+        let report = discovery_report(7, Vec::new(), vec![reason.clone()]);
 
         let plan = LibsslUprobeAttachPlan::from_discovery_report(report);
 
         assert!(!plan.has_attachable_probes());
-        assert_eq!(plan.degraded_reasons, vec![reason]);
+        assert_eq!(plan.degraded_reasons(), &[reason]);
+    }
+
+    fn discovery_report(
+        pid: u32,
+        targets: Vec<LibsslUprobeTarget>,
+        degraded_reasons: Vec<LibsslUprobeDegradationReason>,
+    ) -> LibsslUprobeTargetDiscoveryReport {
+        LibsslUprobeTargetDiscoveryReport::new(
+            process_generation(pid),
+            process_verifier(),
+            targets,
+            degraded_reasons,
+        )
     }
 
     fn mapped_library(path: &str) -> LibsslMappedLibrary {
@@ -331,6 +395,17 @@ mod tests {
             },
             deleted: false,
         }
+    }
+
+    fn process_generation(pid: u32) -> ProcessGeneration {
+        ProcessGeneration {
+            pid,
+            start_time_ticks: u64::from(pid) * 100,
+        }
+    }
+
+    fn process_verifier() -> LibsslUprobeProcessVerifier {
+        LibsslUprobeProcessVerifier::new("/proc")
     }
 
     fn plaintext(direction: Direction) -> LibsslUprobeSymbolRole {

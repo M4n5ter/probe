@@ -1,21 +1,82 @@
 use std::path::PathBuf;
 
 use ebpf_abi::{EbpfTlsDirection, EbpfTlsLibsslSymbol, EbpfTlsUprobeRole};
-use probe_core::Direction;
+use probe_core::{Direction, ProcessGeneration};
 use thiserror::Error;
 
 pub type LibsslUprobeSymbol = EbpfTlsLibsslSymbol;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibsslUprobeTargetDiscoveryReport {
-    pub pid: u32,
-    pub targets: Vec<LibsslUprobeTarget>,
-    pub degraded_reasons: Vec<LibsslUprobeDegradationReason>,
+    process: ProcessGeneration,
+    targets: Vec<LibsslUprobeTarget>,
+    degraded_reasons: Vec<LibsslUprobeDegradationReason>,
+    process_verifier: LibsslUprobeProcessVerifier,
+}
+
+impl LibsslUprobeTargetDiscoveryReport {
+    pub(in crate::tls) fn new(
+        process: ProcessGeneration,
+        process_verifier: LibsslUprobeProcessVerifier,
+        targets: Vec<LibsslUprobeTarget>,
+        degraded_reasons: Vec<LibsslUprobeDegradationReason>,
+    ) -> Self {
+        Self {
+            process,
+            targets,
+            degraded_reasons,
+            process_verifier,
+        }
+    }
+
+    pub fn process(&self) -> ProcessGeneration {
+        self.process
+    }
+
+    pub fn targets(&self) -> &[LibsslUprobeTarget] {
+        &self.targets
+    }
+
+    pub fn degraded_reasons(&self) -> &[LibsslUprobeDegradationReason] {
+        &self.degraded_reasons
+    }
+
+    pub(in crate::tls) fn into_attach_parts(
+        self,
+    ) -> (
+        ProcessGeneration,
+        LibsslUprobeProcessVerifier,
+        Vec<LibsslUprobeTarget>,
+        Vec<LibsslUprobeDegradationReason>,
+    ) {
+        (
+            self.process,
+            self.process_verifier,
+            self.targets,
+            self.degraded_reasons,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::tls) struct LibsslUprobeProcessVerifier {
+    proc_root: PathBuf,
+}
+
+impl LibsslUprobeProcessVerifier {
+    pub(in crate::tls) fn new(proc_root: impl Into<PathBuf>) -> Self {
+        Self {
+            proc_root: proc_root.into(),
+        }
+    }
+
+    pub(in crate::tls) fn stat_path(&self, pid: u32) -> PathBuf {
+        self.proc_root.join(pid.to_string()).join("stat")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibsslUprobeTarget {
-    pub pid: u32,
     pub library: LibsslMappedLibrary,
     pub library_kind: LibsslLibraryKind,
     pub executable_mappings: Vec<LibsslExecutableMapping>,
@@ -130,6 +191,22 @@ pub enum LibsslUprobeSymbolFailure {
     ParseLibrary { path: PathBuf, reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum LibsslUprobeProcessGenerationFailure {
+    #[error("failed to read process stat {path}: {reason}")]
+    ReadStat { path: PathBuf, reason: String },
+    #[error("invalid process stat {path}: {reason}")]
+    InvalidStat { path: PathBuf, reason: String },
+    #[error(
+        "process stat {path} no longer matches expected starttime: expected {expected_start_time_ticks}, got {actual_start_time_ticks}"
+    )]
+    Changed {
+        path: PathBuf,
+        expected_start_time_ticks: u64,
+        actual_start_time_ticks: u64,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum LibsslUprobeDiscoveryError {
     #[error("failed to read proc maps for pid {pid} at {path}: {source}")]
@@ -143,5 +220,10 @@ pub enum LibsslUprobeDiscoveryError {
         pid: u32,
         line_number: usize,
         reason: String,
+    },
+    #[error("failed to verify process generation for pid {pid}: {reason}")]
+    ProcessGeneration {
+        pid: u32,
+        reason: LibsslUprobeProcessGenerationFailure,
     },
 }

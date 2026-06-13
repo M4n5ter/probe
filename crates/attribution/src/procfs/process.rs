@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use probe_core::{CapabilityKind, CapabilityState, ProcessContext, ProcessIdentity};
+use probe_core::{
+    CapabilityKind, CapabilityState, LinuxProcStat, ProcessContext, ProcessIdentity,
+    parse_linux_proc_stat,
+};
 
 use super::{
     AttributionError,
@@ -112,12 +115,6 @@ impl ProcessAttributor for ProcfsAttributor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedStat {
-    comm: String,
-    start_time_ticks: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ParsedStatus {
     tgid: Option<u32>,
@@ -125,42 +122,10 @@ struct ParsedStatus {
     gid: Option<u32>,
 }
 
-fn parse_stat(pid: u32, content: &str) -> Result<ParsedStat, AttributionError> {
-    let open = content
-        .find('(')
-        .ok_or_else(|| AttributionError::InvalidStat {
-            pid,
-            reason: "missing opening comm delimiter".to_string(),
-        })?;
-    let close = content
-        .rfind(')')
-        .ok_or_else(|| AttributionError::InvalidStat {
-            pid,
-            reason: "missing closing comm delimiter".to_string(),
-        })?;
-    if close <= open {
-        return Err(AttributionError::InvalidStat {
-            pid,
-            reason: "invalid comm delimiters".to_string(),
-        });
-    }
-    let comm = content[open + 1..close].to_string();
-    let rest = content[close + 1..].trim();
-    let start_time = rest
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| AttributionError::InvalidStat {
-            pid,
-            reason: "missing starttime field".to_string(),
-        })?
-        .parse::<u64>()
-        .map_err(|source| AttributionError::InvalidStat {
-            pid,
-            reason: format!("invalid starttime field: {source}"),
-        })?;
-    Ok(ParsedStat {
-        comm,
-        start_time_ticks: start_time,
+fn parse_stat(pid: u32, content: &str) -> Result<LinuxProcStat, AttributionError> {
+    parse_linux_proc_stat(content).map_err(|source| AttributionError::InvalidStat {
+        pid,
+        reason: source.to_string(),
     })
 }
 
@@ -248,21 +213,4 @@ fn strip_container_suffix(segment: &str) -> &str {
 
 fn is_hex_id(value: &str, len: usize) -> bool {
     value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_stat_handles_comm_with_parenthesis() -> Result<(), Box<dyn std::error::Error>> {
-        let stat = parse_stat(
-            7,
-            "7 (worker) odd) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 99 21",
-        )?;
-
-        assert_eq!(stat.comm, "worker) odd");
-        assert_eq!(stat.start_time_ticks, 99);
-        Ok(())
-    }
 }

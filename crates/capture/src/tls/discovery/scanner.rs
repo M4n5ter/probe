@@ -4,10 +4,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use probe_core::{ProcessGeneration, parse_linux_proc_stat};
+
 use super::{
     model::{
         LibsslExecutableMapping, LibsslLibraryKind, LibsslMappedLibrary,
-        LibsslUprobeDegradationReason, LibsslUprobeDiscoveryError, LibsslUprobeSymbol,
+        LibsslUprobeDegradationReason, LibsslUprobeDiscoveryError,
+        LibsslUprobeProcessGenerationFailure, LibsslUprobeProcessVerifier, LibsslUprobeSymbol,
         LibsslUprobeTarget, LibsslUprobeTargetDiscoveryReport,
     },
     proc_maps::{classify_libssl_path, parse_proc_maps_entry, strip_root},
@@ -46,6 +49,9 @@ impl LibsslUprobeTargetDiscovery {
         pid: u32,
         symbol_resolver: &impl LibsslSymbolResolver,
     ) -> Result<LibsslUprobeTargetDiscoveryReport, LibsslUprobeDiscoveryError> {
+        let process_verifier = LibsslUprobeProcessVerifier::new(self.proc_root.clone());
+        let process = read_process_generation(pid, &process_verifier)
+            .map_err(|reason| LibsslUprobeDiscoveryError::ProcessGeneration { pid, reason })?;
         let maps_path = self.proc_root.join(pid.to_string()).join("maps");
         let maps = fs::read_to_string(&maps_path).map_err(|source| {
             LibsslUprobeDiscoveryError::ReadMaps {
@@ -54,7 +60,17 @@ impl LibsslUprobeTargetDiscovery {
                 source,
             }
         })?;
-        discover_targets(pid, &self.proc_root, &maps, symbol_resolver)
+        let report = discover_targets(
+            pid,
+            process,
+            process_verifier.clone(),
+            &self.proc_root,
+            &maps,
+            symbol_resolver,
+        )?;
+        verify_current_process_generation(process, &process_verifier)
+            .map_err(|reason| LibsslUprobeDiscoveryError::ProcessGeneration { pid, reason })?;
+        Ok(report)
     }
 }
 
@@ -73,6 +89,8 @@ struct CandidateLibrary {
 
 fn discover_targets(
     pid: u32,
+    process: ProcessGeneration,
+    process_verifier: LibsslUprobeProcessVerifier,
     proc_root: &Path,
     maps: &str,
     symbol_resolver: &impl LibsslSymbolResolver,
@@ -137,7 +155,6 @@ fn discover_targets(
             .map(stable_symbol_order)
         {
             Ok(symbols) if has_plaintext_symbol(&symbols) => targets.push(LibsslUprobeTarget {
-                pid,
                 library: candidate.library,
                 library_kind: candidate.library_kind,
                 executable_mappings: candidate.mappings,
@@ -155,10 +172,50 @@ fn discover_targets(
         }
     }
 
-    Ok(LibsslUprobeTargetDiscoveryReport {
-        pid,
+    Ok(LibsslUprobeTargetDiscoveryReport::new(
+        process,
+        process_verifier,
         targets,
         degraded_reasons,
+    ))
+}
+
+pub(in crate::tls) fn verify_current_process_generation(
+    process: ProcessGeneration,
+    process_verifier: &LibsslUprobeProcessVerifier,
+) -> Result<(), LibsslUprobeProcessGenerationFailure> {
+    let current = read_process_generation(process.pid, process_verifier)?;
+    if current.start_time_ticks != process.start_time_ticks {
+        let path = process_verifier.stat_path(process.pid);
+        return Err(LibsslUprobeProcessGenerationFailure::Changed {
+            path,
+            expected_start_time_ticks: process.start_time_ticks,
+            actual_start_time_ticks: current.start_time_ticks,
+        });
+    }
+    Ok(())
+}
+
+fn read_process_generation(
+    pid: u32,
+    process_verifier: &LibsslUprobeProcessVerifier,
+) -> Result<ProcessGeneration, LibsslUprobeProcessGenerationFailure> {
+    let stat_path = process_verifier.stat_path(pid);
+    let stat = fs::read_to_string(&stat_path).map_err(|source| {
+        LibsslUprobeProcessGenerationFailure::ReadStat {
+            path: stat_path.clone(),
+            reason: source.to_string(),
+        }
+    })?;
+    let start_time_ticks = parse_linux_proc_stat(&stat)
+        .map(|stat| stat.start_time_ticks)
+        .map_err(|source| LibsslUprobeProcessGenerationFailure::InvalidStat {
+            path: stat_path.clone(),
+            reason: source.to_string(),
+        })?;
+    Ok(ProcessGeneration {
+        pid,
+        start_time_ticks,
     })
 }
 
@@ -168,7 +225,7 @@ fn has_plaintext_symbol(symbols: &[LibsslUprobeSymbol]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, path::Path};
 
     use tempfile::tempdir;
 
@@ -184,6 +241,7 @@ mod tests {
         let pid = 4242;
         let pid_dir = proc.path().join(pid.to_string());
         fs::create_dir_all(&pid_dir)?;
+        write_stat(&pid_dir, 424242)?;
         fs::write(
             pid_dir.join("maps"),
             r#"
@@ -210,64 +268,56 @@ mod tests {
         let discovery = LibsslUprobeTargetDiscovery::with_proc_root(proc.path());
 
         let report = discovery.discover_for_pid_with_symbol_resolver(pid, &resolver)?;
+        let targets = report.targets();
 
-        assert_eq!(report.pid, pid);
-        assert!(report.degraded_reasons.is_empty());
-        assert_eq!(report.targets.len(), 2);
+        assert_eq!(report.process().pid, pid);
+        assert!(report.degraded_reasons().is_empty());
+        assert_eq!(targets.len(), 2);
         assert_eq!(
-            report.targets[0].library.mapped_path,
+            targets[0].library.mapped_path,
             PathBuf::from("/opt/boringssl/libboringssl.so")
         );
         assert_eq!(
-            report.targets[0].library.read_path,
+            targets[0].library.read_path,
             proc.path()
                 .join(pid.to_string())
                 .join("root")
                 .join("opt/boringssl/libboringssl.so")
         );
         assert_eq!(
-            report.targets[0].library.identity,
+            targets[0].library.identity,
             LibsslMappedFileIdentity {
                 device_major: 0x08,
                 device_minor: 0x01,
                 inode: 3,
             }
         );
-        assert!(!report.targets[0].library.deleted);
+        assert!(!targets[0].library.deleted);
+        assert_eq!(targets[0].library_kind, LibsslLibraryKind::BoringSslLike);
+        assert_eq!(targets[0].symbols, vec![LibsslUprobeSymbol::SslWriteEx]);
         assert_eq!(
-            report.targets[0].library_kind,
-            LibsslLibraryKind::BoringSslLike
-        );
-        assert_eq!(
-            report.targets[0].symbols,
-            vec![LibsslUprobeSymbol::SslWriteEx]
-        );
-        assert_eq!(
-            report.targets[1].library.mapped_path,
+            targets[1].library.mapped_path,
             PathBuf::from("/usr/lib/libssl.so.3")
         );
         assert_eq!(
-            report.targets[1].library.read_path,
+            targets[1].library.read_path,
             proc.path()
                 .join(pid.to_string())
                 .join("root")
                 .join("usr/lib/libssl.so.3")
         );
         assert_eq!(
-            report.targets[1].library.identity,
+            targets[1].library.identity,
             LibsslMappedFileIdentity {
                 device_major: 0x08,
                 device_minor: 0x01,
                 inode: 1,
             }
         );
-        assert!(!report.targets[1].library.deleted);
+        assert!(!targets[1].library.deleted);
+        assert_eq!(targets[1].library_kind, LibsslLibraryKind::OpenSslLike);
         assert_eq!(
-            report.targets[1].library_kind,
-            LibsslLibraryKind::OpenSslLike
-        );
-        assert_eq!(
-            report.targets[1].symbols,
+            targets[1].symbols,
             vec![
                 LibsslUprobeSymbol::SslRead,
                 LibsslUprobeSymbol::SslWrite,
@@ -275,7 +325,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            report.targets[1].executable_mappings,
+            targets[1].executable_mappings,
             vec![LibsslExecutableMapping {
                 start_address: 0x7f0000001000,
                 end_address: 0x7f0000010000,
@@ -292,6 +342,7 @@ mod tests {
         let pid = 7;
         let pid_dir = proc.path().join(pid.to_string());
         fs::create_dir_all(&pid_dir)?;
+        write_stat(&pid_dir, 700)?;
         fs::write(
             pid_dir.join("maps"),
             "7f0000001000-7f0000010000 r-xp 00001000 08:01 1 /opt/my app/libssl custom.so (deleted)\n",
@@ -304,10 +355,10 @@ mod tests {
 
         let report = discovery.discover_for_pid_with_symbol_resolver(pid, &resolver)?;
 
-        assert!(report.targets.is_empty());
-        assert_eq!(report.degraded_reasons.len(), 1);
+        assert!(report.targets().is_empty());
+        assert_eq!(report.degraded_reasons().len(), 1);
         assert!(matches!(
-            &report.degraded_reasons[0],
+            &report.degraded_reasons()[0],
             LibsslUprobeDegradationReason::DeletedMapping {
                 pid: actual_pid,
                 mapped_path,
@@ -323,6 +374,7 @@ mod tests {
         let pid = 8;
         let pid_dir = proc.path().join(pid.to_string());
         fs::create_dir_all(&pid_dir)?;
+        write_stat(&pid_dir, 800)?;
         fs::write(
             pid_dir.join("maps"),
             "7f0000001000-7f0000010000 r-xp 00001000 08:01 1 /usr/lib/libssl.so.3\n",
@@ -335,10 +387,10 @@ mod tests {
 
         let report = discovery.discover_for_pid_with_symbol_resolver(pid, &resolver)?;
 
-        assert!(report.targets.is_empty());
-        assert_eq!(report.degraded_reasons.len(), 1);
+        assert!(report.targets().is_empty());
+        assert_eq!(report.degraded_reasons().len(), 1);
         assert!(matches!(
-            &report.degraded_reasons[0],
+            &report.degraded_reasons()[0],
             LibsslUprobeDegradationReason::SymbolResolutionFailed {
                 mapped_path,
                 reason: LibsslUprobeSymbolFailure::ParseLibrary { reason, .. },
@@ -354,6 +406,7 @@ mod tests {
         let pid = 10;
         let pid_dir = proc.path().join(pid.to_string());
         fs::create_dir_all(&pid_dir)?;
+        write_stat(&pid_dir, 1000)?;
         fs::write(
             pid_dir.join("maps"),
             "7f0000001000-7f0000010000 r-xp 00001000 08:01 1 /usr/lib/libssl.so.3\n",
@@ -370,10 +423,10 @@ mod tests {
 
         let report = discovery.discover_for_pid_with_symbol_resolver(pid, &resolver)?;
 
-        assert!(report.targets.is_empty());
-        assert_eq!(report.degraded_reasons.len(), 1);
+        assert!(report.targets().is_empty());
+        assert_eq!(report.degraded_reasons().len(), 1);
         assert!(matches!(
-            &report.degraded_reasons[0],
+            &report.degraded_reasons()[0],
             LibsslUprobeDegradationReason::UnsupportedSymbols { mapped_path }
                 if mapped_path == &PathBuf::from("/usr/lib/libssl.so.3")
         ));
@@ -386,6 +439,7 @@ mod tests {
         let pid = 9;
         let pid_dir = proc.path().join(pid.to_string());
         fs::create_dir_all(&pid_dir)?;
+        write_stat(&pid_dir, 900)?;
         fs::write(pid_dir.join("maps"), "not-a-map-line\n")?;
         let resolver = FakeSymbolResolver::new([]);
         let discovery = LibsslUprobeTargetDiscovery::with_proc_root(proc.path());
@@ -402,9 +456,47 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn discovery_rejects_pid_reuse_during_target_resolution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = tempdir()?;
+        let pid = 11;
+        let pid_dir = proc.path().join(pid.to_string());
+        fs::create_dir_all(&pid_dir)?;
+        write_stat(&pid_dir, 1100)?;
+        fs::write(
+            pid_dir.join("maps"),
+            "7f0000001000-7f0000010000 r-xp 00001000 08:01 1 /usr/lib/libssl.so.3\n",
+        )?;
+        let resolver = FakeSymbolResolver::new([(
+            PathBuf::from("/usr/lib/libssl.so.3"),
+            FakeSymbolResponse::Symbols(vec![LibsslUprobeSymbol::SslRead]),
+        )])
+        .with_stat_rewrite(pid_dir.clone(), 1101);
+        let discovery = LibsslUprobeTargetDiscovery::with_proc_root(proc.path());
+
+        let error = discovery
+            .discover_for_pid_with_symbol_resolver(pid, &resolver)
+            .expect_err("changed process starttime must reject discovery");
+
+        assert!(matches!(
+            error,
+            LibsslUprobeDiscoveryError::ProcessGeneration {
+                reason: LibsslUprobeProcessGenerationFailure::Changed {
+                    expected_start_time_ticks: 1100,
+                    actual_start_time_ticks: 1101,
+                    ..
+                },
+                ..
+            }
+        ));
+        Ok(())
+    }
+
     #[derive(Debug, Clone)]
     struct FakeSymbolResolver {
         responses: BTreeMap<PathBuf, FakeSymbolResponse>,
+        stat_rewrite: Option<(PathBuf, u64)>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,7 +509,13 @@ mod tests {
         fn new(responses: impl IntoIterator<Item = (PathBuf, FakeSymbolResponse)>) -> Self {
             Self {
                 responses: responses.into_iter().collect(),
+                stat_rewrite: None,
             }
+        }
+
+        fn with_stat_rewrite(mut self, pid_dir: PathBuf, start_time_ticks: u64) -> Self {
+            self.stat_rewrite = Some((pid_dir, start_time_ticks));
+            self
         }
     }
 
@@ -426,6 +524,14 @@ mod tests {
             &self,
             library: &LibsslMappedLibrary,
         ) -> Result<Vec<LibsslUprobeSymbol>, LibsslUprobeSymbolFailure> {
+            if let Some((pid_dir, start_time_ticks)) = &self.stat_rewrite {
+                write_stat(pid_dir, *start_time_ticks).map_err(|source| {
+                    LibsslUprobeSymbolFailure::ReadLibrary {
+                        path: pid_dir.join("stat"),
+                        reason: source.to_string(),
+                    }
+                })?;
+            }
             match self.responses.get(&library.mapped_path) {
                 Some(FakeSymbolResponse::Symbols(symbols)) => Ok(symbols.clone()),
                 Some(FakeSymbolResponse::ParseError(reason)) => {
@@ -437,5 +543,13 @@ mod tests {
                 None => Ok(Vec::new()),
             }
         }
+    }
+
+    fn write_stat(pid_dir: &Path, start_time_ticks: u64) -> std::io::Result<()> {
+        let fields = std::iter::repeat_n("0", 18).collect::<Vec<_>>().join(" ");
+        fs::write(
+            pid_dir.join("stat"),
+            format!("1 (openssl) S {fields} {start_time_ticks}\n"),
+        )
     }
 }

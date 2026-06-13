@@ -25,11 +25,13 @@ pub use provider::{
 pub use replay::ReplayProvider;
 pub use tls::{
     LibsslExecutableMapping, LibsslLibraryKind, LibsslMappedFileIdentity, LibsslMappedLibrary,
-    LibsslResolvedFlow, LibsslUprobeAttachKind, LibsslUprobeAttachPlan, LibsslUprobeAttachPoint,
-    LibsslUprobeAttachRecipe, LibsslUprobeAttachTarget, LibsslUprobeDegradationReason,
-    LibsslUprobeDiscoveryError, LibsslUprobeFlowLookup, LibsslUprobeFlowResolver,
-    LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider, LibsslUprobeSymbol,
-    LibsslUprobeSymbolFailure, LibsslUprobeSymbolRole, LibsslUprobeTarget,
-    LibsslUprobeTargetDiscovery, LibsslUprobeTargetDiscoveryReport, TlsKeyLogField,
-    TlsKeyLogLabelCount, TlsKeyLogParseError, TlsKeyLogSummary,
+    LibsslResolvedFlow, LibsslUprobeAttachKind, LibsslUprobeAttachPlan,
+    LibsslUprobeAttachPlanningError, LibsslUprobeAttachPlanningReport, LibsslUprobeAttachPoint,
+    LibsslUprobeAttachProcess, LibsslUprobeAttachRecipe, LibsslUprobeAttachTarget,
+    LibsslUprobeDegradationReason, LibsslUprobeDiscoveryError, LibsslUprobeFlowLookup,
+    LibsslUprobeFlowResolver, LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
+    LibsslUprobeProcessGenerationFailure, LibsslUprobeSymbol, LibsslUprobeSymbolFailure,
+    LibsslUprobeSymbolRole, LibsslUprobeTarget, LibsslUprobeTargetDiscovery,
+    LibsslUprobeTargetDiscoveryReport, TlsKeyLogField, TlsKeyLogLabelCount, TlsKeyLogParseError,
+    TlsKeyLogSummary, plan_libssl_uprobes_for_processes,
 };

@@ -9,14 +9,16 @@ use ebpf_abi::{EBPF_EVENTS_MAP_NAME, EbpfEventDecodeError, decode_tls_plaintext_
 use ebpf_object::{
     EbpfObjectArtifact, EbpfObjectProbe, EbpfObjectProbeReport, EbpfPreflightedObject,
 };
+use probe_core::ProcessGeneration;
 use thiserror::Error;
 
 use crate::{
     CaptureError,
     tls::{
         LibsslMappedLibrary, LibsslUprobeAttachKind, LibsslUprobeAttachPlan,
-        LibsslUprobeAttachPoint, LibsslUprobeSymbolFailure,
-        discovery::verify_current_mapped_library_identity,
+        LibsslUprobeAttachPoint, LibsslUprobeProcessGenerationFailure, LibsslUprobeProcessVerifier,
+        LibsslUprobeSymbolFailure,
+        discovery::{verify_current_mapped_library_identity, verify_current_process_generation},
     },
 };
 
@@ -78,6 +80,11 @@ pub(in crate::tls::plaintext) enum LibsslUprobePlaintextProbeError {
     AttachTarget {
         pid: u32,
         source: Box<LibsslUprobeSymbolFailure>,
+    },
+    #[error("libssl uprobe attach target process for pid {pid} is no longer valid: {source}")]
+    AttachProcess {
+        pid: u32,
+        source: Box<LibsslUprobeProcessGenerationFailure>,
     },
     #[error("eBPF TLS plaintext object is missing map {name}")]
     MissingMap { name: &'static str },
@@ -152,8 +159,9 @@ struct LibsslUprobeAttachRequest {
     program_name: &'static str,
     library_symbol: &'static str,
     library: LibsslMappedLibrary,
+    process: ProcessGeneration,
+    process_verifier: LibsslUprobeProcessVerifier,
     pid: i32,
-    raw_pid: u32,
     offset: u64,
     kind: LibsslUprobeAttachKind,
 }
@@ -162,13 +170,20 @@ fn attach_requests_from_plan(
     plan: &LibsslUprobeAttachPlan,
 ) -> Result<Vec<LibsslUprobeAttachRequest>, LibsslUprobePlaintextProbeError> {
     let mut requests = Vec::new();
-    for target in &plan.targets {
-        let pid = i32::try_from(target.pid)
-            .map_err(|_| LibsslUprobePlaintextProbeError::InvalidTargetPid { pid: target.pid })?;
-        for recipe in &target.recipes {
-            requests.extend(recipe.attach_points().into_iter().map(|point| {
-                attach_request_from_point(point, target.library.clone(), pid, target.pid)
-            }));
+    for process in plan.processes() {
+        let pid = attachable_pid(process.pid())?;
+        for target in process.targets() {
+            for recipe in &target.recipes {
+                requests.extend(recipe.attach_points().into_iter().map(|point| {
+                    attach_request_from_point(
+                        point,
+                        target.library.clone(),
+                        process.process(),
+                        process.process_verifier().clone(),
+                        pid,
+                    )
+                }));
+            }
         }
     }
     if requests.is_empty() {
@@ -177,18 +192,27 @@ fn attach_requests_from_plan(
     Ok(requests)
 }
 
+fn attachable_pid(pid: u32) -> Result<i32, LibsslUprobePlaintextProbeError> {
+    if pid == 0 {
+        return Err(LibsslUprobePlaintextProbeError::InvalidTargetPid { pid });
+    }
+    i32::try_from(pid).map_err(|_| LibsslUprobePlaintextProbeError::InvalidTargetPid { pid })
+}
+
 fn attach_request_from_point(
     point: LibsslUprobeAttachPoint,
     library: LibsslMappedLibrary,
+    process: ProcessGeneration,
+    process_verifier: LibsslUprobeProcessVerifier,
     pid: i32,
-    raw_pid: u32,
 ) -> LibsslUprobeAttachRequest {
     LibsslUprobeAttachRequest {
         program_name: point.program_name,
         library_symbol: point.library_symbol,
         library,
+        process,
+        process_verifier,
         pid,
-        raw_pid,
         offset: point.offset,
         kind: point.kind,
     }
@@ -199,16 +223,7 @@ fn attach_uprobes(
     requests: &[LibsslUprobeAttachRequest],
 ) -> Result<(), LibsslUprobePlaintextProbeError> {
     let mut loaded_programs = BTreeSet::new();
-    let mut verified_libraries = BTreeSet::new();
     for request in requests {
-        if verified_libraries.insert((request.raw_pid, request.library.clone())) {
-            verify_current_mapped_library_identity(&request.library).map_err(|source| {
-                LibsslUprobePlaintextProbeError::AttachTarget {
-                    pid: request.raw_pid,
-                    source: Box::new(source),
-                }
-            })?;
-        }
         let program = ebpf.program_mut(request.program_name).ok_or(
             LibsslUprobePlaintextProbeError::MissingProgram {
                 name: request.program_name,
@@ -238,6 +253,18 @@ fn attach_uprobes(
                     source: Box::new(source),
                 })?;
         }
+        verify_current_process_generation(request.process, &request.process_verifier).map_err(
+            |source| LibsslUprobePlaintextProbeError::AttachProcess {
+                pid: request.process.pid,
+                source: Box::new(source),
+            },
+        )?;
+        verify_current_mapped_library_identity(&request.library).map_err(|source| {
+            LibsslUprobePlaintextProbeError::AttachTarget {
+                pid: request.process.pid,
+                source: Box::new(source),
+            }
+        })?;
         program
             .attach(
                 Some(request.library_symbol),
@@ -248,7 +275,7 @@ fn attach_uprobes(
             .map_err(|source| LibsslUprobePlaintextProbeError::Attach {
                 program_name: request.program_name,
                 library_symbol: request.library_symbol,
-                pid: request.raw_pid,
+                pid: request.process.pid,
                 target_path: request.library.read_path.clone(),
                 source: Box::new(source),
             })?;
@@ -320,22 +347,19 @@ mod tests {
     #[test]
     fn attach_requests_preserve_plan_pid_path_symbol_and_kind()
     -> Result<(), Box<dyn std::error::Error>> {
-        let plan =
-            LibsslUprobeAttachPlan::from_discovery_report(LibsslUprobeTargetDiscoveryReport {
-                pid: 42,
-                targets: vec![LibsslUprobeTarget {
-                    pid: 42,
-                    library: mapped_library("/usr/lib/libssl.so.3"),
-                    library_kind: LibsslLibraryKind::OpenSslLike,
-                    executable_mappings: vec![LibsslExecutableMapping {
-                        start_address: 0x1000,
-                        end_address: 0x2000,
-                        file_offset: 0,
-                    }],
-                    symbols: vec![LibsslUprobeSymbol::SslRead],
+        let plan = LibsslUprobeAttachPlan::from_discovery_report(discovery_report(
+            42,
+            vec![LibsslUprobeTarget {
+                library: mapped_library("/usr/lib/libssl.so.3"),
+                library_kind: LibsslLibraryKind::OpenSslLike,
+                executable_mappings: vec![LibsslExecutableMapping {
+                    start_address: 0x1000,
+                    end_address: 0x2000,
+                    file_offset: 0,
                 }],
-                degraded_reasons: Vec::new(),
-            });
+                symbols: vec![LibsslUprobeSymbol::SslRead],
+            }],
+        ));
 
         let requests = attach_requests_from_plan(&plan)?;
 
@@ -346,8 +370,9 @@ mod tests {
                     program_name: LibsslUprobeSymbol::SslRead.entry_program_name(),
                     library_symbol: "SSL_read",
                     library: mapped_library("/usr/lib/libssl.so.3"),
+                    process: process_generation(42),
+                    process_verifier: process_verifier(),
                     pid: 42,
-                    raw_pid: 42,
                     offset: 0,
                     kind: LibsslUprobeAttachKind::Entry,
                 },
@@ -357,8 +382,9 @@ mod tests {
                         .expect("SSL_read should have a return probe"),
                     library_symbol: "SSL_read",
                     library: mapped_library("/usr/lib/libssl.so.3"),
+                    process: process_generation(42),
+                    process_verifier: process_verifier(),
                     pid: 42,
-                    raw_pid: 42,
                     offset: 0,
                     kind: LibsslUprobeAttachKind::Return,
                 },
@@ -369,11 +395,8 @@ mod tests {
 
     #[test]
     fn attach_requests_reject_empty_plan() {
-        let error = attach_requests_from_plan(&LibsslUprobeAttachPlan {
-            targets: Vec::new(),
-            degraded_reasons: Vec::new(),
-        })
-        .expect_err("empty plan must not load a TLS uprobe probe");
+        let error = attach_requests_from_plan(&LibsslUprobeAttachPlan::from_discovery_reports([]))
+            .expect_err("empty plan must not load a TLS uprobe probe");
 
         assert!(matches!(
             error,
@@ -383,18 +406,15 @@ mod tests {
 
     #[test]
     fn attach_requests_reject_pid_that_cannot_fit_pid_t() {
-        let plan =
-            LibsslUprobeAttachPlan::from_discovery_report(LibsslUprobeTargetDiscoveryReport {
-                pid: i32::MAX as u32 + 1,
-                targets: vec![LibsslUprobeTarget {
-                    pid: i32::MAX as u32 + 1,
-                    library: mapped_library("/usr/lib/libssl.so.3"),
-                    library_kind: LibsslLibraryKind::OpenSslLike,
-                    executable_mappings: Vec::new(),
-                    symbols: vec![LibsslUprobeSymbol::SslRead],
-                }],
-                degraded_reasons: Vec::new(),
-            });
+        let plan = LibsslUprobeAttachPlan::from_discovery_report(discovery_report(
+            i32::MAX as u32 + 1,
+            vec![LibsslUprobeTarget {
+                library: mapped_library("/usr/lib/libssl.so.3"),
+                library_kind: LibsslLibraryKind::OpenSslLike,
+                executable_mappings: Vec::new(),
+                symbols: vec![LibsslUprobeSymbol::SslRead],
+            }],
+        ));
 
         let error = attach_requests_from_plan(&plan)
             .expect_err("pid outside pid_t range must fail before aya attach");
@@ -403,6 +423,27 @@ mod tests {
             error,
             LibsslUprobePlaintextProbeError::InvalidTargetPid { pid }
                 if pid == i32::MAX as u32 + 1
+        ));
+    }
+
+    #[test]
+    fn attach_requests_reject_pid_zero() {
+        let plan = LibsslUprobeAttachPlan::from_discovery_report(discovery_report(
+            0,
+            vec![LibsslUprobeTarget {
+                library: mapped_library("/usr/lib/libssl.so.3"),
+                library_kind: LibsslLibraryKind::OpenSslLike,
+                executable_mappings: Vec::new(),
+                symbols: vec![LibsslUprobeSymbol::SslRead],
+            }],
+        ));
+
+        let error =
+            attach_requests_from_plan(&plan).expect_err("pid zero must not reach aya attach");
+
+        assert!(matches!(
+            error,
+            LibsslUprobePlaintextProbeError::InvalidTargetPid { pid: 0 }
         ));
     }
 
@@ -445,17 +486,15 @@ mod tests {
         let temp = tempdir()?;
         let config = LibsslUprobePlaintextProbeConfig::new(
             temp.path().join("missing.o"),
-            LibsslUprobeAttachPlan::from_discovery_report(LibsslUprobeTargetDiscoveryReport {
-                pid: 42,
-                targets: vec![LibsslUprobeTarget {
-                    pid: 42,
+            LibsslUprobeAttachPlan::from_discovery_report(discovery_report(
+                42,
+                vec![LibsslUprobeTarget {
                     library: mapped_library("/usr/lib/libssl.so.3"),
                     library_kind: LibsslLibraryKind::OpenSslLike,
                     executable_mappings: Vec::new(),
                     symbols: vec![LibsslUprobeSymbol::SslRead],
                 }],
-                degraded_reasons: Vec::new(),
-            }),
+            )),
         );
 
         let error = match LibsslUprobePlaintextProbe::load(config) {
@@ -482,6 +521,29 @@ mod tests {
             },
             deleted: false,
         }
+    }
+
+    fn discovery_report(
+        pid: u32,
+        targets: Vec<LibsslUprobeTarget>,
+    ) -> LibsslUprobeTargetDiscoveryReport {
+        LibsslUprobeTargetDiscoveryReport::new(
+            process_generation(pid),
+            process_verifier(),
+            targets,
+            Vec::new(),
+        )
+    }
+
+    fn process_generation(pid: u32) -> ProcessGeneration {
+        ProcessGeneration {
+            pid,
+            start_time_ticks: u64::from(pid) * 100,
+        }
+    }
+
+    fn process_verifier() -> LibsslUprobeProcessVerifier {
+        LibsslUprobeProcessVerifier::new("/proc")
     }
 
     fn sample_event() -> EbpfTlsPlaintextEvent {

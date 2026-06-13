@@ -1,6 +1,7 @@
 mod capability;
 mod event;
 mod identity;
+mod procfs;
 mod schema;
 mod selector;
 mod socket;
@@ -15,8 +16,10 @@ pub use event::{
     WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
 };
 pub use identity::{
-    AddressPort, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, TransportProtocol,
+    AddressPort, FlowContext, FlowIdentity, ProcessContext, ProcessGeneration, ProcessIdentity,
+    TransportProtocol,
 };
+pub use procfs::{LinuxProcStat, LinuxProcStatParseError, parse_linux_proc_stat};
 pub use schema::SpoolPayloadSchema;
 pub use selector::{
     CompiledSelector, ProcessSelector, Selector, SelectorError, SelectorRegistry, SelectorTerm,
