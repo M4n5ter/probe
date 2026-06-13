@@ -5,6 +5,7 @@ use probe_core::{CapabilityKind, CapabilityState, ProcessContext, ProcessIdentit
 use super::{
     AttributionError,
     io::{read_bytes, read_link_to_string, read_optional_to_string, read_to_string},
+    pid_scan::numeric_pid_dirs,
 };
 
 pub trait ProcessAttributor {
@@ -39,6 +40,11 @@ impl ProcfsAttributor {
     pub fn probe(&self) -> Result<(), AttributionError> {
         read_to_string(&self.boot_id_path)?;
         Ok(())
+    }
+
+    pub fn process_ids(&self) -> Result<Vec<u32>, AttributionError> {
+        numeric_pid_dirs(&self.proc_root)
+            .map(|entries| entries.into_iter().map(|entry| entry.pid).collect())
     }
 }
 

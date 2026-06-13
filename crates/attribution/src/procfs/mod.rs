@@ -1,6 +1,7 @@
 mod error;
 mod inode_scan;
 mod io;
+mod pid_scan;
 mod process;
 mod socket;
 mod tcp_table;

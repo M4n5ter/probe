@@ -1,26 +1,15 @@
 use std::{collections::HashMap, fs, io, path::Path};
 
-use super::{AttributionError, socket::SocketFdLookup};
+use super::{
+    AttributionError,
+    pid_scan::{ProcfsPidEntry, numeric_pid_dirs},
+    socket::SocketFdLookup,
+};
 
 pub(super) fn inode_pid_map(proc_root: &Path) -> Result<HashMap<u64, u32>, AttributionError> {
     let mut inodes = HashMap::new();
-    let entries = fs::read_dir(proc_root).map_err(|source| AttributionError::Read {
-        path: proc_root.display().to_string(),
-        source,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| AttributionError::Read {
-            path: proc_root.display().to_string(),
-            source,
-        })?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        read_pid_socket_inodes(&entry.path().join("fd"), pid, &mut inodes)?;
+    for ProcfsPidEntry { pid, path } in numeric_pid_dirs(proc_root)? {
+        read_pid_socket_inodes(&path.join("fd"), pid, &mut inodes)?;
     }
     Ok(inodes)
 }
