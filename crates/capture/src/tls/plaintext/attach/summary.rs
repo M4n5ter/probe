@@ -15,7 +15,9 @@ pub(in crate::tls::plaintext) struct LibsslUprobeAttachSummary {
 }
 
 impl LibsslUprobeAttachSummary {
-    pub(super) fn from_recipes(recipes: &[LibsslUprobeAttachRecipeRequest]) -> Self {
+    pub(in crate::tls::plaintext) fn from_recipes(
+        recipes: &[LibsslUprobeAttachRecipeRequest],
+    ) -> Self {
         Self {
             has_plaintext_recipe: recipes.iter().any(is_plaintext),
             committed_targets: BTreeSet::new(),

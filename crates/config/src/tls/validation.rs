@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::{
-    CaptureConfig, CaptureSelection, ConfigViolation, TlsConfig, TlsMaterialKind,
-    TlsPlaintextProvider,
+    CaptureConfig, CaptureSelection, ConfigViolation, MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS,
+    TlsConfig, TlsMaterialKind, TlsPlaintextProvider,
 };
 
 pub(crate) fn validate_tls(
@@ -128,6 +128,21 @@ fn validate_plaintext_tls_provider_refs(tls: &TlsConfig, violations: &mut Vec<Co
 }
 
 fn validate_plaintext_tls_provider_config(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
+    if tls.plaintext.reconcile_interval_ms == 0 {
+        violations.push(ConfigViolation {
+            field: "tls.plaintext.reconcile_interval_ms".to_string(),
+            reason: "TLS plaintext reconcile interval must be positive".to_string(),
+        });
+    }
+    if tls.plaintext.reconcile_interval_ms > MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS {
+        violations.push(ConfigViolation {
+            field: "tls.plaintext.reconcile_interval_ms".to_string(),
+            reason: format!(
+                "TLS plaintext reconcile interval must be at most {MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS} ms"
+            ),
+        });
+    }
+
     let Some(path) = &tls.plaintext.libssl_uprobe_object_path else {
         return;
     };

@@ -1,21 +1,23 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
-use attribution::{AttributionError, ProcessAttributor, ProcfsAttributor, ProcfsSocketResolver};
+use attribution::ProcfsSocketResolver;
 use capture::{
-    CaptureError, CaptureProvider, LibsslResolvedFlow, LibsslUprobeAttachPlan,
-    LibsslUprobeFlowLookup, LibsslUprobeFlowResolver, LibsslUprobePlaintextOpen,
-    LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider, LibsslUprobeTargetDiscovery,
-    plan_libssl_uprobes_for_processes,
+    CaptureError, CaptureProvider, LibsslResolvedFlow, LibsslUprobeFlowLookup,
+    LibsslUprobeFlowResolver, LibsslUprobePlaintextOpen, LibsslUprobePlaintextProbeConfig,
+    LibsslUprobePlaintextProvider,
 };
 use probe_config::TlsPlaintextProvider;
-use probe_core::{CompiledSelector, TcpConnection};
+use probe_core::TcpConnection;
 use runtime::RuntimePlan;
 use serde::Serialize;
 
 use crate::error::AgentError;
+
+use super::{planning::LibsslUprobeAttachPlanner, sidecar::LibsslUprobePlaintextSidecar};
 
 const MAX_TRACKED_LIBSSL_FLOWS: usize = 8192;
 
@@ -139,49 +141,25 @@ fn build_libssl_uprobe_plaintext_provider(
                 "invalid tls.plaintext.selector during runtime build: {source}"
             ))
         })?;
-    let attach_plan = build_startup_libssl_uprobe_attach_plan(selector.as_ref())?;
-    if attach_plan.processes().is_empty() {
-        return Ok(TlsPlaintextProviderBuild::disabled(
-            "libssl uprobe TLS plaintext sidecar disabled: startup scan found no attachable libssl processes",
-        ));
-    }
+    let attach_planner = LibsslUprobeAttachPlanner::new(selector);
+    let attach_plan = match attach_planner.plan()? {
+        Ok(plan) => plan,
+        Err(blocked) => return Ok(TlsPlaintextProviderBuild::disabled(blocked.into_reason())),
+    };
 
     match LibsslUprobePlaintextProvider::open_best_effort(
         LibsslUprobePlaintextProbeConfig::new(object_path, attach_plan),
         Box::<ProcfsLibsslFlowResolver>::default(),
-    )? {
-        LibsslUprobePlaintextOpen::Enabled(provider) => {
-            Ok(TlsPlaintextProviderBuild::enabled(provider))
-        }
+    ) {
+        LibsslUprobePlaintextOpen::Enabled(provider) => Ok(TlsPlaintextProviderBuild::enabled(
+            provider,
+            attach_planner,
+            Duration::from_millis(plan.tls.plaintext.reconcile_interval_ms),
+        )),
         LibsslUprobePlaintextOpen::Disabled { reason } => {
             Ok(TlsPlaintextProviderBuild::disabled(reason))
         }
     }
-}
-
-fn build_startup_libssl_uprobe_attach_plan(
-    selector: Option<&CompiledSelector>,
-) -> Result<LibsslUprobeAttachPlan, AgentError> {
-    let attributor = ProcfsAttributor::new();
-    attributor.probe()?;
-    let processes = attributor
-        .process_ids()?
-        .into_iter()
-        .filter_map(|pid| identify_startup_process(&attributor, pid).transpose())
-        .collect::<Result<Vec<_>, _>>()?;
-    let planning_report = plan_libssl_uprobes_for_processes(
-        processes,
-        selector,
-        &LibsslUprobeTargetDiscovery::default(),
-    );
-    Ok(planning_report.attach_plan)
-}
-
-fn identify_startup_process(
-    attributor: &ProcfsAttributor,
-    pid: u32,
-) -> Result<Option<probe_core::ProcessContext>, AttributionError> {
-    attributor.identify_if_present(pid)
 }
 
 pub(crate) enum TlsPlaintextProviderBuild {
@@ -191,8 +169,16 @@ pub(crate) enum TlsPlaintextProviderBuild {
 }
 
 impl TlsPlaintextProviderBuild {
-    fn enabled(provider: Box<LibsslUprobePlaintextProvider>) -> Self {
-        Self::Enabled(provider)
+    fn enabled(
+        provider: LibsslUprobePlaintextProvider,
+        attach_planner: LibsslUprobeAttachPlanner,
+        reconcile_interval: Duration,
+    ) -> Self {
+        Self::Enabled(Box::new(LibsslUprobePlaintextSidecar::after(
+            provider,
+            attach_planner,
+            reconcile_interval,
+        )))
     }
 
     fn disabled(reason: impl Into<String>) -> Self {
@@ -326,8 +312,6 @@ impl TrackedLibsslFlowStarts {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use capture::{CapturePoll, CaptureProviderKind};
     use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
     use probe_core::{CapabilityState, TcpEndpoint};
@@ -336,73 +320,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn startup_process_scan_skips_disappearing_processes() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let proc = tempfile::tempdir()?;
-        let boot = proc.path().join("boot_id");
-        fs::write(&boot, "boot\n")?;
-        fs::create_dir(proc.path().join("7"))?;
-        let attributor = ProcfsAttributor::with_paths(proc.path(), &boot);
-
-        let process = identify_startup_process(&attributor, 7)?;
-
-        assert!(process.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn startup_process_scan_skips_invalid_process_metadata()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let proc = tempfile::tempdir()?;
-        let boot = proc.path().join("boot_id");
-        fs::write(&boot, "boot\n")?;
-        fs::create_dir(proc.path().join("7"))?;
-        fs::write(proc.path().join("7/stat"), "invalid stat\n")?;
-        let attributor = ProcfsAttributor::with_paths(proc.path(), &boot);
-
-        let process = identify_startup_process(&attributor, 7)?;
-
-        assert!(process.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn startup_process_scan_preserves_global_procfs_dependency_errors()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let proc = tempfile::tempdir()?;
-        let boot = proc.path().join("missing_boot_id");
-        let pid_dir = proc.path().join("7");
-        fs::create_dir(&pid_dir)?;
-        fs::write(
-            pid_dir.join("stat"),
-            "7 (curl) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 12345 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        )?;
-        fs::write(pid_dir.join("status"), "Tgid:\t7\nUid:\t1000\nGid:\t1000\n")?;
-        fs::write(pid_dir.join("cmdline"), b"curl\0")?;
-        fs::write(pid_dir.join("cgroup"), "0::/user.slice\n")?;
-        std::os::unix::fs::symlink("/usr/bin/curl", pid_dir.join("exe"))?;
-        let attributor = ProcfsAttributor::with_paths(proc.path(), &boot);
-
-        let error = identify_startup_process(&attributor, 7)
-            .expect_err("global boot id read failure must not be treated as a per-pid race");
-
-        assert!(matches!(
-            error,
-            AttributionError::Read { path, .. } if path.ends_with("missing_boot_id")
-        ));
-        Ok(())
-    }
-
-    #[test]
     fn disabled_tls_plaintext_build_records_unavailable_runtime_reason() {
-        let build = TlsPlaintextProviderBuild::disabled("startup scan found no attachable target");
+        let build = TlsPlaintextProviderBuild::disabled(
+            "libssl uprobe attach planning produced no attachable targets",
+        );
 
         let snapshot = build.runtime_snapshot();
 
         assert_eq!(snapshot.mode, TlsPlaintextRuntimeMode::Disabled);
         assert_eq!(
             snapshot.reason.as_deref(),
-            Some("startup scan found no attachable target")
+            Some("libssl uprobe attach planning produced no attachable targets")
         );
     }
 

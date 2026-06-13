@@ -18,6 +18,7 @@ struct TlsPlaintextCheckSnapshot {
     enabled: bool,
     provider: TlsPlaintextProvider,
     libssl_uprobe_object_path: Option<PathBuf>,
+    reconcile_interval_ms: u64,
     key_logs: Vec<TlsPlaintextMaterialCheckSnapshot>,
     session_secrets: Vec<TlsPlaintextMaterialCheckSnapshot>,
 }
@@ -62,6 +63,7 @@ fn check_tls_with_file_store(
             enabled: plaintext.enabled,
             provider: plaintext.provider,
             libssl_uprobe_object_path: plaintext.libssl_uprobe_object_path.clone(),
+            reconcile_interval_ms: plaintext.reconcile_interval_ms,
             key_logs: check_key_log_materials(&plaintext.key_logs, file_store)?,
             session_secrets: check_session_secret_materials(
                 &plaintext.session_secrets,
@@ -209,11 +211,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_report_reports_libssl_uprobe_object_path_metadata()
+    async fn check_report_reports_libssl_uprobe_runtime_metadata()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut config = AgentConfig::default();
         config.tls.plaintext.libssl_uprobe_object_path =
             Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        config.tls.plaintext.reconcile_interval_ms = 2_500;
         let plan = runtime_plan(config)?;
 
         let report = build_check_report(plan, None).await?;
@@ -222,6 +225,10 @@ mod tests {
         assert_eq!(
             value["tls"]["plaintext"]["libssl_uprobe_object_path"],
             json!("/opt/sssa/ebpf-tls-plaintext.bpf.o")
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["reconcile_interval_ms"],
+            json!(2500)
         );
         Ok(())
     }

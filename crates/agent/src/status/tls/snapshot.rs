@@ -20,6 +20,7 @@ pub struct TlsPlaintextStatusSnapshot {
     pub provider: TlsPlaintextProvider,
     pub selector_configured: bool,
     pub libssl_uprobe_object_path: Option<PathBuf>,
+    pub reconcile_interval_ms: u64,
     pub capability: TlsPlaintextCapabilityStatusSnapshot,
     pub runtime: Option<TlsPlaintextRuntimeSnapshot>,
     pub key_logs: Vec<TlsPlaintextMaterialStatusSnapshot>,
@@ -117,6 +118,7 @@ fn plaintext_status(
         provider: plaintext.provider,
         selector_configured: plaintext.selector_configured,
         libssl_uprobe_object_path: plaintext.libssl_uprobe_object_path.clone(),
+        reconcile_interval_ms: plaintext.reconcile_interval_ms,
         capability,
         runtime,
         key_logs: plaintext_material_statuses(&plaintext.key_logs),
@@ -222,6 +224,7 @@ mod tests {
         config.tls.plaintext.selector = Some(Selector::default());
         config.tls.plaintext.libssl_uprobe_object_path =
             Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        config.tls.plaintext.reconcile_interval_ms = 2_500;
         let plan = runtime_plan_from_config(
             config,
             vec![CapabilityState::available(CapabilityKind::LibsslUprobe)],
@@ -239,6 +242,7 @@ mod tests {
             status.plaintext.libssl_uprobe_object_path,
             Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into())
         );
+        assert_eq!(status.plaintext.reconcile_interval_ms, 2_500);
         assert_eq!(
             status.plaintext.capability,
             TlsPlaintextCapabilityStatusSnapshot::Required {
@@ -258,6 +262,7 @@ mod tests {
             value["plaintext"]["libssl_uprobe_object_path"],
             json!("/opt/sssa/ebpf-tls-plaintext.bpf.o")
         );
+        assert_eq!(value["plaintext"]["reconcile_interval_ms"], json!(2500));
         fs::remove_dir_all(temp)?;
         Ok(())
     }

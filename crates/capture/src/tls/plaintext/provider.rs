@@ -46,7 +46,7 @@ pub struct LibsslUprobePlaintextProvider {
 }
 
 pub enum LibsslUprobePlaintextOpen {
-    Enabled(Box<LibsslUprobePlaintextProvider>),
+    Enabled(LibsslUprobePlaintextProvider),
     Disabled { reason: String },
 }
 
@@ -64,18 +64,17 @@ impl LibsslUprobePlaintextProvider {
     pub fn open_best_effort(
         config: LibsslUprobePlaintextProbeConfig,
         resolver: Box<dyn LibsslUprobeFlowResolver>,
-    ) -> Result<LibsslUprobePlaintextOpen, CaptureError> {
-        match LibsslUprobePlaintextProbe::load_best_effort(config)
-            .map_err(|error| CaptureError::provider("libssl_uprobe_plaintext", error.to_string()))?
-        {
-            LibsslUprobePlaintextProbeLoad::Enabled(probe) => {
-                Ok(LibsslUprobePlaintextOpen::Enabled(Box::new(
-                    Self::from_live_source(probe, resolver),
-                )))
+    ) -> LibsslUprobePlaintextOpen {
+        match LibsslUprobePlaintextProbe::load_best_effort(config) {
+            Ok(LibsslUprobePlaintextProbeLoad::Enabled(probe)) => {
+                LibsslUprobePlaintextOpen::Enabled(Self::from_live_source(probe, resolver))
             }
-            LibsslUprobePlaintextProbeLoad::Disabled { reason } => {
-                Ok(LibsslUprobePlaintextOpen::Disabled { reason })
+            Ok(LibsslUprobePlaintextProbeLoad::Disabled { reason }) => {
+                LibsslUprobePlaintextOpen::Disabled { reason }
             }
+            Err(error) => LibsslUprobePlaintextOpen::Disabled {
+                reason: error.to_string(),
+            },
         }
     }
 
@@ -233,6 +232,7 @@ mod tests {
     use probe_core::{
         CaptureSource, Direction, ProcessContext, ProcessIdentity, TcpConnection, TcpEndpoint,
     };
+    use tempfile::tempdir;
 
     use crate::CaptureProviderKind;
 
@@ -339,6 +339,37 @@ mod tests {
             .poll_next()
             .expect_err("poisoned provider must not drain pending gap events");
         assert!(error.to_string().contains("reconcile failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn best_effort_open_disables_sidecar_for_runtime_load_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let resolver = Box::new(StaticFlowResolver {
+            expected: LibsslUprobeFlowLookup {
+                tgid: 22,
+                thread_pid: 11,
+                ssl_pointer: 0xfeed,
+                fd: Some(7),
+                direction: Direction::Outbound,
+            },
+            resolved: None,
+            seen: false,
+        });
+
+        let open = LibsslUprobePlaintextProvider::open_best_effort(
+            LibsslUprobePlaintextProbeConfig::new(
+                temp.path().join("missing.o"),
+                empty_attach_plan(),
+            ),
+            resolver,
+        );
+
+        let LibsslUprobePlaintextOpen::Disabled { reason } = open else {
+            panic!("best-effort sidecar load failures should disable the sidecar");
+        };
+        assert!(reason.contains("missing.o"));
         Ok(())
     }
 

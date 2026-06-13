@@ -135,3 +135,48 @@ libssl_uprobe_object_path = "/opt/sssa/ebpf-tls-plaintext.bpf.o"
     );
     Ok(())
 }
+
+#[test]
+fn validation_rejects_zero_tls_plaintext_reconcile_interval()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[tls.plaintext]
+reconcile_interval_ms = 0
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("TLS plaintext reconcile interval must be positive");
+
+    assert!(
+        error
+            .to_string()
+            .contains("TLS plaintext reconcile interval must be positive")
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_oversized_tls_plaintext_reconcile_interval()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(&format!(
+        r#"
+[tls.plaintext]
+reconcile_interval_ms = {}
+"#,
+        MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS + 1
+    ))?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("TLS plaintext reconcile interval must stay within the supported bound");
+
+    assert!(
+        error
+            .to_string()
+            .contains("TLS plaintext reconcile interval must be at most 3600000 ms")
+    );
+    Ok(())
+}

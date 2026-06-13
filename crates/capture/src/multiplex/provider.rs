@@ -36,11 +36,11 @@ impl CaptureMultiplexer {
             if !provider.is_active() {
                 continue;
             }
-            match provider.provider.poll_next() {
+            match provider.poll_next() {
                 Ok(CapturePoll::Event(event)) => return Ok(CapturePoll::Event(event)),
                 Ok(CapturePoll::Progress) => made_progress = true,
                 Ok(CapturePoll::Idle) => {}
-                Ok(CapturePoll::Finished) => provider.state = MultiplexedProviderState::Finished,
+                Ok(CapturePoll::Finished) => provider.finish(),
                 Err(error) => match provider.failure_policy {
                     MultiplexFailurePolicy::Required => return Err(error),
                     MultiplexFailurePolicy::BestEffort => {
@@ -83,7 +83,6 @@ impl CaptureProvider for CaptureMultiplexer {
 }
 
 pub struct MultiplexedProvider {
-    provider: Box<dyn CaptureProvider>,
     failure_policy: MultiplexFailurePolicy,
     state: MultiplexedProviderState,
     disable_handler: Option<DisableHandler>,
@@ -108,9 +107,8 @@ impl MultiplexedProvider {
 
     fn new(provider: Box<dyn CaptureProvider>, failure_policy: MultiplexFailurePolicy) -> Self {
         Self {
-            provider,
             failure_policy,
-            state: MultiplexedProviderState::Active,
+            state: MultiplexedProviderState::Active { provider },
             disable_handler: None,
         }
     }
@@ -121,29 +119,63 @@ impl MultiplexedProvider {
     }
 
     fn is_active(&self) -> bool {
-        matches!(self.state, MultiplexedProviderState::Active)
+        matches!(self.state, MultiplexedProviderState::Active { .. })
+    }
+
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+        match &mut self.state {
+            MultiplexedProviderState::Active { provider } => provider.poll_next(),
+            _ => Ok(CapturePoll::Finished),
+        }
+    }
+
+    fn finish(&mut self) {
+        let state = self.take_state();
+        let MultiplexedProviderState::Active { provider } = state else {
+            self.state = state;
+            return;
+        };
+        let capabilities = provider.capabilities();
+        drop(provider);
+        self.state = MultiplexedProviderState::Finished { capabilities };
     }
 
     fn disable_after_error(&mut self, error: CaptureError) {
-        let reason = format!(
-            "best-effort capture provider {} disabled after error: {error}",
-            self.provider.name()
-        );
+        let state = self.take_state();
+        let MultiplexedProviderState::Active { provider } = state else {
+            self.state = state;
+            return;
+        };
+        let provider_name = provider.name();
+        let reason =
+            format!("best-effort capture provider {provider_name} disabled after error: {error}");
+        let capabilities = provider
+            .capabilities()
+            .into_iter()
+            .map(|capability| CapabilityState::unavailable(capability.kind, reason.clone()))
+            .collect();
+        drop(provider);
         if let Some(handler) = &self.disable_handler {
             handler(&reason);
         }
-        self.state = MultiplexedProviderState::Disabled { reason };
+        self.state = MultiplexedProviderState::Disabled { capabilities };
     }
 
     fn capabilities(&self) -> Vec<CapabilityState> {
-        let capabilities = self.provider.capabilities();
-        let MultiplexedProviderState::Disabled { reason } = &self.state else {
-            return capabilities;
-        };
-        capabilities
-            .into_iter()
-            .map(|capability| CapabilityState::unavailable(capability.kind, reason.clone()))
-            .collect()
+        match &self.state {
+            MultiplexedProviderState::Active { provider } => provider.capabilities(),
+            MultiplexedProviderState::Finished { capabilities } => capabilities.clone(),
+            MultiplexedProviderState::Disabled { capabilities, .. } => capabilities.clone(),
+        }
+    }
+
+    fn take_state(&mut self) -> MultiplexedProviderState {
+        std::mem::replace(
+            &mut self.state,
+            MultiplexedProviderState::Finished {
+                capabilities: Vec::new(),
+            },
+        )
     }
 }
 
@@ -153,16 +185,19 @@ enum MultiplexFailurePolicy {
     BestEffort,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum MultiplexedProviderState {
-    Active,
-    Finished,
-    Disabled { reason: String },
+    Active { provider: Box<dyn CaptureProvider> },
+    Finished { capabilities: Vec<CapabilityState> },
+    Disabled { capabilities: Vec<CapabilityState> },
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+        rc::Rc,
+    };
 
     use bytes::Bytes;
     use probe_core::{
@@ -282,6 +317,25 @@ mod tests {
             reason,
             "best-effort capture provider error disabled after error: capture provider error failed: boom"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn multiplexer_drops_best_effort_source_after_error() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dropped = Rc::new(Cell::new(false));
+        let primary = VecProvider::new([captured_bytes("primary")]);
+        let sidecar = DropNotifyErrorProvider {
+            dropped: Rc::clone(&dropped),
+        };
+        let mut provider = CaptureMultiplexer::from_providers([
+            MultiplexedProvider::best_effort(Box::new(sidecar)),
+            MultiplexedProvider::required(Box::new(primary)),
+        ]);
+
+        assert_bytes_payload(provider.next()?, b"primary");
+
+        assert!(dropped.get());
         Ok(())
     }
 
@@ -417,6 +471,37 @@ mod tests {
 
         fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
             Err(CaptureError::provider("error", "boom"))
+        }
+    }
+
+    struct DropNotifyErrorProvider {
+        dropped: Rc<Cell<bool>>,
+    }
+
+    impl CaptureProvider for DropNotifyErrorProvider {
+        fn name(&self) -> &'static str {
+            "drop_notify_error"
+        }
+
+        fn kind(&self) -> CaptureProviderKind {
+            CaptureProviderKind::Replay
+        }
+
+        fn capabilities(&self) -> Vec<CapabilityState> {
+            vec![CapabilityState::degraded(
+                CapabilityKind::LibsslUprobe,
+                "test sidecar starts degraded",
+            )]
+        }
+
+        fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+            Err(CaptureError::provider("drop_notify_error", "boom"))
+        }
+    }
+
+    impl Drop for DropNotifyErrorProvider {
+        fn drop(&mut self) {
+            self.dropped.set(true);
         }
     }
 

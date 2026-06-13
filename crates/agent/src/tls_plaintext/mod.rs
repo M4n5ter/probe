@@ -1,4 +1,6 @@
+mod planning;
 mod runtime;
+mod sidecar;
 
 pub(crate) use runtime::{
     TlsPlaintextProviderBuild, TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot,

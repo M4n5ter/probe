@@ -18,7 +18,8 @@ use crate::{
 use super::{
     attach::{
         AttachFailurePolicy, LibsslUprobeAttachError, LibsslUprobeAttachRecipeRequest,
-        LibsslUprobeAttachSession, attach_recipes_from_plan,
+        LibsslUprobeAttachSession, LibsslUprobeAttachSummary, LibsslUprobeAttachWork,
+        best_effort_attach_work_from_plan, strict_attach_work_from_plan,
     },
     provider::LibsslUprobePlaintextSampleSource,
     record::LibsslUprobePlaintextSample,
@@ -64,6 +65,8 @@ pub(in crate::tls::plaintext) enum LibsslUprobePlaintextProbeError {
     Decode { error: EbpfEventDecodeError },
     #[error("failed to normalize eBPF TLS plaintext sample: {reason}")]
     Sample { reason: String },
+    #[error("eBPF TLS plaintext reconcile did not produce a ready target: {reason}")]
+    UnresolvableAttach { reason: String },
     #[error("eBPF TLS plaintext provider is disabled after reconcile failure: {reason}")]
     Poisoned { reason: String },
 }
@@ -85,7 +88,7 @@ impl LibsslUprobePlaintextProbe {
         config: LibsslUprobePlaintextProbeConfig,
     ) -> Result<Self, LibsslUprobePlaintextProbeError> {
         let attach_plan = config.attach_plan;
-        let attach_recipes = attach_recipes_from_plan(&attach_plan)?;
+        let attach_work = strict_attach_work_from_plan(&attach_plan)?;
         let object = EbpfObjectProbe::preflight(
             &EbpfObjectArtifact::TlsPlaintext.probe_config(config.object_path),
         )
@@ -93,14 +96,14 @@ impl LibsslUprobePlaintextProbe {
             summary: report.summary(),
             report,
         })?;
-        Self::load_preflighted(object, &attach_recipes)
+        Self::load_preflighted(object, attach_work.as_recipes())
     }
 
     pub(in crate::tls::plaintext) fn load_best_effort(
         config: LibsslUprobePlaintextProbeConfig,
     ) -> Result<LibsslUprobePlaintextProbeLoad, LibsslUprobePlaintextProbeError> {
         let attach_plan = config.attach_plan;
-        let attach_recipes = attach_recipes_from_plan(&attach_plan)?;
+        let attach_work = best_effort_attach_work_from_plan(&attach_plan)?;
         let object = EbpfObjectProbe::preflight(
             &EbpfObjectArtifact::TlsPlaintext.probe_config(config.object_path),
         )
@@ -108,7 +111,7 @@ impl LibsslUprobePlaintextProbe {
             summary: report.summary(),
             report,
         })?;
-        Self::load_preflighted_best_effort(object, &attach_recipes)
+        Self::load_preflighted_best_effort(object, &attach_work)
     }
 
     fn load_preflighted(
@@ -132,16 +135,25 @@ impl LibsslUprobePlaintextProbe {
 
     fn load_preflighted_best_effort(
         object: EbpfPreflightedObject,
-        attach_recipes: &[LibsslUprobeAttachRecipeRequest],
+        attach_work: &LibsslUprobeAttachWork,
     ) -> Result<LibsslUprobePlaintextProbeLoad, LibsslUprobePlaintextProbeError> {
         let mut ebpf =
             Ebpf::load(object.bytes()).map_err(|source| LibsslUprobePlaintextProbeError::Load {
                 source: Box::new(source),
             })?;
         let mut attach_session = LibsslUprobeAttachSession::default();
+        if attach_work.is_empty() {
+            let events = open_events_ringbuf_or_detach(&mut ebpf, &mut attach_session)?;
+            return Ok(LibsslUprobePlaintextProbeLoad::Enabled(Box::new(Self {
+                ebpf,
+                attach_session,
+                events,
+                poisoned_reason: None,
+            })));
+        }
         let attach_summary = attach_session.attach_uprobes(
             &mut ebpf,
-            attach_recipes,
+            attach_work.as_recipes(),
             AttachFailurePolicy::BestEffort,
         )?;
         if !attach_summary.has_committed_targets() {
@@ -165,8 +177,8 @@ impl LibsslUprobePlaintextProbe {
     ) -> Result<LibsslUprobePlaintextReconcile, LibsslUprobePlaintextProbeError> {
         self.ensure_not_poisoned()?;
         let report = self.current_attach_state().reconcile(&next_plan);
-        let attach_recipes = reconcile_attach_recipes(&report.attach_plan)?;
-        match self.execute_reconcile_report(report, attach_recipes.as_deref().unwrap_or_default()) {
+        let attach_work = best_effort_attach_work_from_plan(&report.attach_plan)?;
+        match self.execute_reconcile_report(report, attach_work.as_recipes()) {
             Ok(result) => Ok(result),
             Err(error) => Err(self.poison_after_reconcile_error(error)),
         }
@@ -182,19 +194,27 @@ impl LibsslUprobePlaintextProbe {
             .detach_targets_best_effort(&mut self.ebpf, report.stale_targets.iter().cloned())?;
 
         let mut attached_targets = 0;
+        let mut attach_summary = None;
         if !attach_recipes.is_empty() {
-            let attach_summary = self.attach_session.attach_uprobes(
+            let summary = self.attach_session.attach_uprobes(
                 &mut self.ebpf,
                 attach_recipes,
                 AttachFailurePolicy::BestEffort,
             )?;
-            attached_targets = attach_summary.committed_targets().count();
+            attached_targets = summary.committed_targets().count();
+            attach_summary = Some(summary);
+        }
+        let active_targets = self.attach_session.attached_target_count();
+        if let Some(reason) = attach_summary.as_ref().and_then(|summary| {
+            unresolvable_reconcile_attach_reason(summary, attached_targets, active_targets)
+        }) {
+            return Err(LibsslUprobePlaintextProbeError::UnresolvableAttach { reason });
         }
 
         Ok(LibsslUprobePlaintextReconcile {
             attached_targets,
             detached_targets,
-            active_targets: self.attach_session.attached_target_count(),
+            active_targets,
         })
     }
 
@@ -248,6 +268,18 @@ impl Drop for LibsslUprobePlaintextProbe {
     }
 }
 
+fn unresolvable_reconcile_attach_reason(
+    attach_summary: &LibsslUprobeAttachSummary,
+    attached_targets: usize,
+    active_targets: usize,
+) -> Option<String> {
+    if attached_targets == 0 && active_targets == 0 {
+        Some(attach_summary.unresolvable_plaintext_reason())
+    } else {
+        None
+    }
+}
+
 impl LibsslUprobePlaintextSampleSource for LibsslUprobePlaintextProbe {
     fn reconcile_libssl_uprobes(
         &mut self,
@@ -290,15 +322,6 @@ fn open_events_ringbuf_or_detach(
             Err(error)
         }
     }
-}
-
-fn reconcile_attach_recipes(
-    attach_plan: &LibsslUprobeAttachPlan,
-) -> Result<Option<Vec<LibsslUprobeAttachRecipeRequest>>, LibsslUprobePlaintextProbeError> {
-    if attach_plan.processes().is_empty() {
-        return Ok(None);
-    }
-    Ok(attach_recipes_from_plan(attach_plan).map(Some)?)
 }
 
 fn plaintext_sample_from_ringbuf_record(
@@ -371,6 +394,30 @@ mod tests {
             panic!("expected object preflight error");
         };
         assert!(report.summary().contains("missing.o"));
+        Ok(())
+    }
+
+    #[test]
+    fn reconcile_attach_requires_committed_or_active_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = LibsslUprobeAttachPlan::from_discovery_report(discovery_report(
+            42,
+            vec![LibsslUprobeTarget {
+                library: mapped_library("/usr/lib/libssl.so.3"),
+                library_kind: LibsslLibraryKind::OpenSslLike,
+                executable_mappings: Vec::new(),
+                symbols: vec![LibsslUprobeSymbol::SslRead],
+            }],
+        ));
+        let attach_work = best_effort_attach_work_from_plan(&plan)?;
+        let summary = LibsslUprobeAttachSummary::from_recipes(attach_work.as_recipes());
+
+        let reason = unresolvable_reconcile_attach_reason(&summary, 0, 0)
+            .expect("uncommitted reconcile with no active targets must be unresolvable");
+
+        assert!(reason.contains("did not commit any ready target"));
+        assert!(unresolvable_reconcile_attach_reason(&summary, 0, 1).is_none());
+        assert!(unresolvable_reconcile_attach_reason(&summary, 1, 1).is_none());
         Ok(())
     }
 

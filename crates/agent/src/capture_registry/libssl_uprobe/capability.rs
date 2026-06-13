@@ -74,7 +74,7 @@ fn capability_from_object_report(
     CapabilityState::degraded(
         CapabilityKind::LibsslUprobe,
         format!(
-            "eBPF TLS plaintext object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and agent startup attach wiring can build a plaintext sidecar provider, but agent dynamic process scan/reconcile scheduling, agent-side provider control handle retention, process-exit cleanup, strong fd ownership, and low-latency provider multiplexing remain best-effort",
+            "eBPF TLS plaintext object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and agent libssl plaintext sidecar wiring can run startup attach plus periodic process scan/reconcile, but provider health reporting, strong fd ownership, low-latency provider multiplexing, and privileged dynamic lifecycle e2e coverage remain best-effort",
             object.summary()
         ),
     )
@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_stays_degraded_until_agent_dynamic_lifecycle_exists() {
+    fn capability_stays_degraded_until_stronger_lifecycle_guarantees_exist() {
         let capability = capability_from_object_report(
             available_tls_plaintext_object_report(),
             &procfs_socket_attribution_capability(RuntimeMode::Degraded),
@@ -151,10 +151,10 @@ mod tests {
             .expect("degraded TLS capability must explain the remaining lifecycle gap");
         assert!(reason.contains("eBPF TLS plaintext object preflight via aya-obj succeeded"));
         assert!(reason.contains("procfs socket attribution is usable"));
-        assert!(reason.contains("startup attach wiring"));
-        assert!(reason.contains("agent dynamic process scan/reconcile scheduling"));
-        assert!(reason.contains("agent-side provider control handle retention"));
-        assert!(reason.contains("process-exit cleanup"));
+        assert!(reason.contains("startup attach plus periodic process scan/reconcile"));
+        assert!(reason.contains("provider health reporting"));
+        assert!(reason.contains("strong fd ownership"));
+        assert!(reason.contains("privileged dynamic lifecycle e2e coverage"));
         assert!(reason.contains("provider multiplexing"));
     }
 

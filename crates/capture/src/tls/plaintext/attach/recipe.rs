@@ -31,6 +31,42 @@ impl LibsslUprobeAttachRecipeRequest {
     }
 }
 
+pub(in crate::tls::plaintext) enum LibsslUprobeAttachWork {
+    None,
+    Recipes(Vec<LibsslUprobeAttachRecipeRequest>),
+}
+
+impl LibsslUprobeAttachWork {
+    pub(in crate::tls::plaintext) fn as_recipes(&self) -> &[LibsslUprobeAttachRecipeRequest] {
+        match self {
+            Self::None => &[],
+            Self::Recipes(recipes) => recipes,
+        }
+    }
+
+    pub(in crate::tls::plaintext) fn is_empty(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+pub(in crate::tls::plaintext) fn strict_attach_work_from_plan(
+    plan: &LibsslUprobeAttachPlan,
+) -> Result<LibsslUprobeAttachWork, LibsslUprobeAttachError> {
+    Ok(LibsslUprobeAttachWork::Recipes(attach_recipes_from_plan(
+        plan,
+    )?))
+}
+
+pub(in crate::tls::plaintext) fn best_effort_attach_work_from_plan(
+    plan: &LibsslUprobeAttachPlan,
+) -> Result<LibsslUprobeAttachWork, LibsslUprobeAttachError> {
+    match attach_recipes_from_plan(plan) {
+        Ok(recipes) => Ok(LibsslUprobeAttachWork::Recipes(recipes)),
+        Err(LibsslUprobeAttachError::EmptyAttachPlan) => Ok(LibsslUprobeAttachWork::None),
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn best_effort_attach_rank(recipe: &LibsslUprobeAttachRecipeRequest) -> u8 {
     match recipe.semantic {
         LibsslUprobeSymbolRole::FdAssociation => 0,
@@ -181,6 +217,16 @@ mod tests {
             .expect_err("empty plan must not load a TLS uprobe probe");
 
         assert!(matches!(error, LibsslUprobeAttachError::EmptyAttachPlan));
+    }
+
+    #[test]
+    fn best_effort_attach_work_allows_empty_plan() -> Result<(), Box<dyn std::error::Error>> {
+        let work =
+            best_effort_attach_work_from_plan(&LibsslUprobeAttachPlan::from_discovery_reports([]))?;
+
+        assert!(work.is_empty());
+        assert!(work.as_recipes().is_empty());
+        Ok(())
     }
 
     #[test]

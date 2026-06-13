@@ -28,5 +28,6 @@ pub use export::{
 pub use policy::PolicyConfig;
 pub use storage::{ExportQueueRetentionConfig, StorageConfig, StorageRetentionConfig};
 pub use tls::{
+    DEFAULT_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS, MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS,
     PlaintextTlsConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind, TlsPlaintextProvider,
 };

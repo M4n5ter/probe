@@ -636,6 +636,7 @@ mod tests {
         config.tls.plaintext.provider = probe_config::TlsPlaintextProvider::LibsslUprobe;
         config.tls.plaintext.libssl_uprobe_object_path =
             Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        config.tls.plaintext.reconcile_interval_ms = 2_500;
         let plan = runtime_plan_from_config(
             config,
             vec![CapabilityState::degraded(
@@ -654,7 +655,9 @@ mod tests {
         let runtime = RuntimeStatusInput {
             tls_plaintext: Some(TlsPlaintextRuntimeSnapshot {
                 mode: TlsPlaintextRuntimeMode::Disabled,
-                reason: Some("startup scan found no attachable libssl processes".to_string()),
+                reason: Some(
+                    "libssl uprobe attach planning produced no attachable targets".to_string(),
+                ),
             }),
             ..RuntimeStatusInput::default()
         };
@@ -680,6 +683,10 @@ mod tests {
             value["tls"]["plaintext"]["capability"]["mode"],
             json!("unavailable")
         );
+        assert_eq!(
+            value["tls"]["plaintext"]["reconcile_interval_ms"],
+            json!(2500)
+        );
         assert_eq!(snapshot.metrics.capabilities.unavailable, 1);
         assert_eq!(snapshot.health.mode, RuntimeMode::Degraded);
         assert!(
@@ -687,7 +694,7 @@ mod tests {
                 .health
                 .reasons
                 .iter()
-                .any(|reason| reason.contains("startup scan found no attachable"))
+                .any(|reason| reason.contains("produced no attachable targets"))
         );
         Ok(())
     }

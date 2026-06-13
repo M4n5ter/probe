@@ -30,6 +30,7 @@ fn tls_plaintext_plan_preserves_selector_and_capability_requirement()
     config.tls.plaintext.selector = Some(Selector::default());
     config.tls.plaintext.libssl_uprobe_object_path =
         Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+    config.tls.plaintext.reconcile_interval_ms = 2500;
 
     let plan = RuntimePlan::build(config, &registry)?;
 
@@ -43,6 +44,7 @@ fn tls_plaintext_plan_preserves_selector_and_capability_requirement()
         plan.tls.plaintext.libssl_uprobe_object_path,
         Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into())
     );
+    assert_eq!(plan.tls.plaintext.reconcile_interval_ms, 2500);
     assert_eq!(
         plan.tls.plaintext.capability,
         TlsPlaintextCapabilityPlan::Required {
