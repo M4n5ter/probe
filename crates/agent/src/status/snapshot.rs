@@ -388,6 +388,7 @@ mod tests {
         config_with_storage_path, runtime_plan_from_config, test_dir,
     };
     use super::*;
+    use capture::LibsslUprobePlaintextReconcile;
     use probe_config::{
         EnforcementPolicyManifest, EnforcementPolicySourceConfig, TlsMaterialConfig,
         TlsMaterialKind,
@@ -653,12 +654,16 @@ mod tests {
             BTreeMap::new(),
         );
         let runtime = RuntimeStatusInput {
-            tls_plaintext: Some(TlsPlaintextRuntimeSnapshot {
-                mode: TlsPlaintextRuntimeMode::Disabled,
-                reason: Some(
-                    "libssl uprobe attach planning produced no attachable targets".to_string(),
-                ),
-            }),
+            tls_plaintext: Some(
+                TlsPlaintextRuntimeSnapshot::disabled(
+                    "libssl uprobe attach planning produced no attachable targets",
+                )
+                .with_reconcile_success(LibsslUprobePlaintextReconcile {
+                    attached_targets: 1,
+                    detached_targets: 0,
+                    active_targets: 1,
+                }),
+            ),
             ..RuntimeStatusInput::default()
         };
 
@@ -686,6 +691,10 @@ mod tests {
         assert_eq!(
             value["tls"]["plaintext"]["reconcile_interval_ms"],
             json!(2500)
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["runtime"]["last_reconcile"]["active_targets"],
+            json!(1)
         );
         assert_eq!(snapshot.metrics.capabilities.unavailable, 1);
         assert_eq!(snapshot.health.mode, RuntimeMode::Degraded);
@@ -715,10 +724,7 @@ mod tests {
             BTreeMap::new(),
         );
         let runtime = RuntimeStatusInput {
-            tls_plaintext: Some(TlsPlaintextRuntimeSnapshot {
-                mode: TlsPlaintextRuntimeMode::NotConfigured,
-                reason: None,
-            }),
+            tls_plaintext: Some(TlsPlaintextRuntimeSnapshot::not_configured()),
             ..RuntimeStatusInput::default()
         };
 

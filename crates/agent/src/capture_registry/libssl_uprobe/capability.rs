@@ -74,7 +74,7 @@ fn capability_from_object_report(
     CapabilityState::degraded(
         CapabilityKind::LibsslUprobe,
         format!(
-            "eBPF TLS plaintext object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and agent libssl plaintext sidecar wiring can run startup attach plus periodic process scan/reconcile, but provider health reporting, strong fd ownership, low-latency provider multiplexing, and privileged dynamic lifecycle e2e coverage remain best-effort",
+            "eBPF TLS plaintext object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and agent libssl plaintext sidecar wiring can run startup attach plus periodic process scan/reconcile with last-reconcile counters, but per-target provider health, strong fd ownership, low-latency provider multiplexing, and privileged dynamic lifecycle e2e coverage remain best-effort",
             object.summary()
         ),
     )
@@ -152,7 +152,8 @@ mod tests {
         assert!(reason.contains("eBPF TLS plaintext object preflight via aya-obj succeeded"));
         assert!(reason.contains("procfs socket attribution is usable"));
         assert!(reason.contains("startup attach plus periodic process scan/reconcile"));
-        assert!(reason.contains("provider health reporting"));
+        assert!(reason.contains("last-reconcile counters"));
+        assert!(reason.contains("per-target provider health"));
         assert!(reason.contains("strong fd ownership"));
         assert!(reason.contains("privileged dynamic lifecycle e2e coverage"));
         assert!(reason.contains("provider multiplexing"));

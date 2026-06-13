@@ -58,7 +58,7 @@ fn with_tls_plaintext_provider(
     primary: Box<dyn CaptureProvider>,
     tls_plaintext_runtime: Option<&TlsPlaintextRuntimeState>,
 ) -> Result<Box<dyn CaptureProvider>, AgentError> {
-    let plaintext_build = build_tls_plaintext_provider(plan)?;
+    let plaintext_build = build_tls_plaintext_provider(plan, tls_plaintext_runtime)?;
     if let Some(runtime) = tls_plaintext_runtime {
         runtime.record_provider_build(&plaintext_build);
     }

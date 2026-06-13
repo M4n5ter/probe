@@ -8,7 +8,7 @@ use attribution::ProcfsSocketResolver;
 use capture::{
     CaptureError, CaptureProvider, LibsslResolvedFlow, LibsslUprobeFlowLookup,
     LibsslUprobeFlowResolver, LibsslUprobePlaintextOpen, LibsslUprobePlaintextProbeConfig,
-    LibsslUprobePlaintextProvider,
+    LibsslUprobePlaintextProvider, LibsslUprobePlaintextReconcile,
 };
 use probe_config::TlsPlaintextProvider;
 use probe_core::TcpConnection;
@@ -17,7 +17,10 @@ use serde::Serialize;
 
 use crate::error::AgentError;
 
-use super::{planning::LibsslUprobeAttachPlanner, sidecar::LibsslUprobePlaintextSidecar};
+use super::{
+    planning::LibsslUprobeAttachPlanner,
+    sidecar::{LibsslUprobePlaintextReconcileObserver, LibsslUprobePlaintextSidecar},
+};
 
 const MAX_TRACKED_LIBSSL_FLOWS: usize = 8192;
 
@@ -30,6 +33,45 @@ pub(crate) struct TlsPlaintextRuntimeState {
 pub struct TlsPlaintextRuntimeSnapshot {
     pub mode: TlsPlaintextRuntimeMode,
     pub reason: Option<String>,
+    pub last_reconcile: Option<TlsPlaintextReconcileRuntimeSnapshot>,
+}
+
+impl TlsPlaintextRuntimeSnapshot {
+    pub(crate) fn not_configured() -> Self {
+        Self {
+            mode: TlsPlaintextRuntimeMode::NotConfigured,
+            reason: None,
+            last_reconcile: None,
+        }
+    }
+
+    pub(crate) fn enabled() -> Self {
+        Self {
+            mode: TlsPlaintextRuntimeMode::Enabled,
+            reason: None,
+            last_reconcile: None,
+        }
+    }
+
+    pub(crate) fn disabled(reason: impl Into<String>) -> Self {
+        Self {
+            mode: TlsPlaintextRuntimeMode::Disabled,
+            reason: Some(reason.into()),
+            last_reconcile: None,
+        }
+    }
+
+    pub(crate) fn with_reconcile_success(mut self, result: LibsslUprobePlaintextReconcile) -> Self {
+        self.last_reconcile = Some(TlsPlaintextReconcileRuntimeSnapshot::from(result));
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextReconcileRuntimeSnapshot {
+    pub attached_targets: u64,
+    pub detached_targets: u64,
+    pub active_targets: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -55,14 +97,12 @@ impl TlsPlaintextRuntimeState {
         Self::from_snapshot(TlsPlaintextRuntimeSnapshot {
             mode: TlsPlaintextRuntimeMode::Pending,
             reason: Some("TLS plaintext runtime provider has not been built yet".to_string()),
+            last_reconcile: None,
         })
     }
 
     fn not_configured() -> Self {
-        Self::from_snapshot(TlsPlaintextRuntimeSnapshot {
-            mode: TlsPlaintextRuntimeMode::NotConfigured,
-            reason: None,
-        })
+        Self::from_snapshot(TlsPlaintextRuntimeSnapshot::not_configured())
     }
 
     fn from_snapshot(snapshot: TlsPlaintextRuntimeSnapshot) -> Self {
@@ -87,7 +127,16 @@ impl TlsPlaintextRuntimeState {
         *inner = TlsPlaintextRuntimeSnapshot {
             mode: TlsPlaintextRuntimeMode::Disabled,
             reason: Some(reason.into()),
+            last_reconcile: inner.last_reconcile,
         };
+    }
+
+    fn record_reconcile_success(&self, result: LibsslUprobePlaintextReconcile) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *inner = TlsPlaintextRuntimeSnapshot::enabled().with_reconcile_success(result);
     }
 
     pub(crate) fn snapshot(&self) -> TlsPlaintextRuntimeSnapshot {
@@ -100,13 +149,16 @@ impl TlsPlaintextRuntimeState {
 
 pub(crate) fn build_tls_plaintext_provider(
     plan: &RuntimePlan,
+    runtime_state: Option<&TlsPlaintextRuntimeState>,
 ) -> Result<TlsPlaintextProviderBuild, AgentError> {
     if !plan.tls.plaintext.enabled {
         return Ok(TlsPlaintextProviderBuild::NotConfigured);
     }
 
     match plan.tls.plaintext.provider {
-        TlsPlaintextProvider::LibsslUprobe => build_libssl_uprobe_plaintext_provider(plan),
+        TlsPlaintextProvider::LibsslUprobe => {
+            build_libssl_uprobe_plaintext_provider(plan, runtime_state)
+        }
         TlsPlaintextProvider::Keylog => Err(AgentError::UnsupportedRunConfig(
             "keylog TLS plaintext provider is reserved but not implemented".to_string(),
         )),
@@ -115,6 +167,7 @@ pub(crate) fn build_tls_plaintext_provider(
 
 fn build_libssl_uprobe_plaintext_provider(
     plan: &RuntimePlan,
+    runtime_state: Option<&TlsPlaintextRuntimeState>,
 ) -> Result<TlsPlaintextProviderBuild, AgentError> {
     plan.require_live_capture()?;
     let object_path = plan
@@ -155,6 +208,9 @@ fn build_libssl_uprobe_plaintext_provider(
             provider,
             attach_planner,
             Duration::from_millis(plan.tls.plaintext.reconcile_interval_ms),
+            runtime_state
+                .cloned()
+                .map(|state| Box::new(state) as Box<dyn LibsslUprobePlaintextReconcileObserver>),
         )),
         LibsslUprobePlaintextOpen::Disabled { reason } => {
             Ok(TlsPlaintextProviderBuild::disabled(reason))
@@ -173,11 +229,13 @@ impl TlsPlaintextProviderBuild {
         provider: LibsslUprobePlaintextProvider,
         attach_planner: LibsslUprobeAttachPlanner,
         reconcile_interval: Duration,
+        reconcile_observer: Option<Box<dyn LibsslUprobePlaintextReconcileObserver>>,
     ) -> Self {
         Self::Enabled(Box::new(LibsslUprobePlaintextSidecar::after(
             provider,
             attach_planner,
             reconcile_interval,
+            reconcile_observer,
         )))
     }
 
@@ -189,19 +247,26 @@ impl TlsPlaintextProviderBuild {
 
     fn runtime_snapshot(&self) -> TlsPlaintextRuntimeSnapshot {
         match self {
-            Self::NotConfigured => TlsPlaintextRuntimeSnapshot {
-                mode: TlsPlaintextRuntimeMode::NotConfigured,
-                reason: None,
-            },
-            Self::Enabled(_) => TlsPlaintextRuntimeSnapshot {
-                mode: TlsPlaintextRuntimeMode::Enabled,
-                reason: None,
-            },
-            Self::Disabled { reason } => TlsPlaintextRuntimeSnapshot {
-                mode: TlsPlaintextRuntimeMode::Disabled,
-                reason: Some(reason.clone()),
-            },
+            Self::NotConfigured => TlsPlaintextRuntimeSnapshot::not_configured(),
+            Self::Enabled(_) => TlsPlaintextRuntimeSnapshot::enabled(),
+            Self::Disabled { reason } => TlsPlaintextRuntimeSnapshot::disabled(reason.clone()),
         }
+    }
+}
+
+impl From<LibsslUprobePlaintextReconcile> for TlsPlaintextReconcileRuntimeSnapshot {
+    fn from(value: LibsslUprobePlaintextReconcile) -> Self {
+        Self {
+            attached_targets: value.attached_targets as u64,
+            detached_targets: value.detached_targets as u64,
+            active_targets: value.active_targets as u64,
+        }
+    }
+}
+
+impl LibsslUprobePlaintextReconcileObserver for TlsPlaintextRuntimeState {
+    fn record_reconcile_success(&self, result: LibsslUprobePlaintextReconcile) {
+        TlsPlaintextRuntimeState::record_reconcile_success(self, result);
     }
 }
 
@@ -385,6 +450,11 @@ mod tests {
         )));
 
         assert_eq!(runtime.snapshot().mode, TlsPlaintextRuntimeMode::Enabled);
+        runtime.record_reconcile_success(LibsslUprobePlaintextReconcile {
+            attached_targets: 2,
+            detached_targets: 1,
+            active_targets: 3,
+        });
 
         runtime.record_provider_disabled(
             "best-effort capture provider libssl_uprobe_plaintext disabled after error: boom",
@@ -396,6 +466,12 @@ mod tests {
             snapshot.reason.as_deref(),
             Some("best-effort capture provider libssl_uprobe_plaintext disabled after error: boom")
         );
+        let reconcile = snapshot
+            .last_reconcile
+            .expect("last successful reconcile should be retained after disable");
+        assert_eq!(reconcile.attached_targets, 2);
+        assert_eq!(reconcile.detached_targets, 1);
+        assert_eq!(reconcile.active_targets, 3);
     }
 
     struct NoopCaptureProvider;
