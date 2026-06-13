@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use enforcement::ScopedEnforcementPlanner;
 use exporter::CompressionCodec;
 use parsers::Http1ParserFactory;
-use pipeline::{CapturePipeline, PipelinePolicy, PipelineRunOptions};
+use pipeline::{CapturePipeline, PipelinePolicy, PipelineRunOptions, PipelineRuntimeMetrics};
 use policy::PolicyRuntime;
 use probe_config::{AgentConfig, PolicyConfig};
 use probe_core::{
@@ -170,9 +170,11 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
             let mut parser_factory = Http1ParserFactory::default();
             let export_worker = export_worker_config_from_plan(&plan).map(ExportWorker::new);
+            let pipeline_metrics = PipelineRuntimeMetrics::default();
             let admin_runtime_state = AdminRuntimeState {
                 enforcement_policy_source: enforcement.policy_source.clone(),
                 export_worker: export_worker.as_ref().map(ExportWorker::runtime_state),
+                pipeline: Some(pipeline_metrics.clone()),
             };
             let admin_server = admin_server_config_from_plan(&plan)
                 .map(|config| {
@@ -194,7 +196,8 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                     .as_ref()
                     .map(|policy| PipelinePolicy::new(&policy.runtime, policy.selector.as_ref())),
                 plan.config.config_version.clone(),
-            );
+            )
+            .with_runtime_metrics(pipeline_metrics);
             println!(
                 "agent {} running config {} capture {:?} selected {:?}",
                 plan.config.agent_id,

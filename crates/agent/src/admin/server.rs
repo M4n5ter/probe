@@ -23,6 +23,8 @@ use tokio::{
     task::JoinSet,
 };
 
+use pipeline::PipelineRuntimeMetrics;
+
 use crate::configured_enforcement::LoadedEnforcementPolicySource;
 use crate::export::ExportWorkerRuntimeState;
 use crate::status::{
@@ -69,6 +71,7 @@ pub struct AdminServerConfig {
 pub struct AdminRuntimeState {
     pub enforcement_policy_source: Option<LoadedEnforcementPolicySource>,
     pub export_worker: Option<ExportWorkerRuntimeState>,
+    pub pipeline: Option<PipelineRuntimeMetrics>,
 }
 
 pub struct AdminServerHandle {
@@ -395,6 +398,10 @@ fn handle_admin_request(
                 .export_worker
                 .as_ref()
                 .map(ExportWorkerRuntimeState::snapshot),
+            pipeline: runtime_state
+                .pipeline
+                .as_ref()
+                .map(PipelineRuntimeMetrics::snapshot),
         },
     );
     match request {
@@ -402,7 +409,7 @@ fn handle_admin_request(
             snapshot: Box::new(snapshot),
         },
         AdminRequest::Metrics => AdminResponse::Metrics {
-            metrics: snapshot.metrics,
+            metrics: Box::new(snapshot.metrics),
         },
     }
 }
@@ -418,7 +425,7 @@ enum AdminRequest {
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum AdminResponse {
     Status { snapshot: Box<AgentStatusSnapshot> },
-    Metrics { metrics: MetricsSnapshot },
+    Metrics { metrics: Box<MetricsSnapshot> },
     Error { message: String },
 }
 
@@ -443,12 +450,17 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use capture::ReplayProvider;
+    use parsers::Http1ParserFactory;
+    use pipeline::{CapturePipeline, PipelineRuntimeMetrics};
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicyManifest,
         EnforcementPolicySourceConfig, ExporterConfig,
     };
     use probe_core::{
-        Action, CapabilityState, ProtectiveActionProfile, RuntimeMode, SpoolPayloadSchema,
+        Action, AddressPort, CapabilityState, Direction, FlowContext, FlowIdentity, ProcessContext,
+        ProcessIdentity, ProtectiveActionProfile, RuntimeMode, SpoolPayloadSchema, Timestamp,
+        TransportProtocol,
     };
     use runtime::{
         CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
@@ -506,6 +518,23 @@ mod tests {
         let socket_path = temp.join("admin.sock");
         let spool_path = temp.join("spool");
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let pipeline_metrics = PipelineRuntimeMetrics::default();
+        {
+            let mut parser_factory = Http1ParserFactory::default();
+            let mut provider = ReplayProvider::new(
+                demo_flow(),
+                Direction::Outbound,
+                b"GET /metrics HTTP/1.1\r\nHost: test\r\n\r\n",
+                Timestamp {
+                    monotonic_ns: 1,
+                    wall_time_unix_ns: 1,
+                },
+            );
+            let mut pipeline =
+                CapturePipeline::new(spool.as_ref(), &mut parser_factory, None, "test")
+                    .with_runtime_metrics(pipeline_metrics.clone());
+            pipeline.run_provider(&mut provider)?;
+        }
         let plan = Arc::new(runtime_plan(spool_path)?);
         let server = spawn_admin_server(
             Arc::clone(&plan),
@@ -513,13 +542,24 @@ mod tests {
             AdminServerConfig {
                 socket_path: socket_path.clone(),
             },
-            AdminRuntimeState::default(),
+            AdminRuntimeState {
+                pipeline: Some(pipeline_metrics),
+                ..AdminRuntimeState::default()
+            },
         )?;
 
         let response = send_admin_request(&socket_path, json!({ "command": "metrics" })).await?;
 
         assert_eq!(response["kind"], json!("metrics"));
         assert_eq!(response["metrics"]["export"]["sink_count"], json!(1));
+        assert_eq!(
+            response["metrics"]["pipeline"]["capture_events_read"],
+            json!(1)
+        );
+        assert_eq!(
+            response["metrics"]["pipeline"]["export_events_written"],
+            json!(1)
+        );
         server.stop().await;
         drop(spool);
         fs::remove_dir_all(temp)?;
@@ -806,6 +846,45 @@ mod tests {
                 worker: Default::default(),
             }],
             ..AgentConfig::default()
+        }
+    }
+
+    fn demo_flow() -> FlowContext {
+        let process = ProcessIdentity {
+            pid: 1,
+            tgid: 1,
+            start_time_ticks: 1,
+            boot_id: "boot".to_string(),
+            exe_path: "replay".to_string(),
+            cmdline_hash: "hash".to_string(),
+            uid: 0,
+            gid: 0,
+            cgroup: None,
+            systemd_service: None,
+            container_id: None,
+            runtime_hint: None,
+        };
+        let local = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 50_000,
+        };
+        let remote = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 80,
+        };
+        FlowContext {
+            id: FlowIdentity::stable(&process, &local, &remote, TransportProtocol::Tcp, 1, None),
+            process: ProcessContext {
+                identity: process,
+                name: "replay".to_string(),
+                cmdline: vec!["replay".to_string()],
+            },
+            local,
+            remote,
+            protocol: TransportProtocol::Tcp,
+            start_monotonic_ns: 1,
+            socket_cookie: None,
+            attribution_confidence: 0,
         }
     }
 

@@ -8,6 +8,8 @@ use probe_core::{CompiledSelector, EventEnvelope, EventKind, SpoolPayloadSchema,
 use storage::{DurableSpool, SpoolPayload};
 use thiserror::Error;
 
+use crate::runtime_metrics::PipelineRuntimeMetrics;
+
 const PARSER_INGRESS_CONSUMER: &str = "parser";
 
 #[derive(Debug, Error)]
@@ -87,6 +89,7 @@ pub struct CapturePipeline<'a, S> {
     config_version: String,
     clock: PipelineClock,
     last_processed_ingress_sequence: Option<u64>,
+    runtime_metrics: Option<PipelineRuntimeMetrics>,
 }
 
 #[derive(Clone, Copy)]
@@ -132,7 +135,13 @@ where
             config_version: config_version.into(),
             clock: PipelineClock::default(),
             last_processed_ingress_sequence: None,
+            runtime_metrics: None,
         }
+    }
+
+    pub fn with_runtime_metrics(mut self, runtime_metrics: PipelineRuntimeMetrics) -> Self {
+        self.runtime_metrics = Some(runtime_metrics);
+        self
     }
 
     pub fn with_enforcement_planner(
@@ -161,6 +170,9 @@ where
                 break;
             };
             summary.capture_events_read = summary.capture_events_read.saturating_add(1);
+            if let Some(metrics) = &self.runtime_metrics {
+                metrics.record_capture_event_read();
+            }
             self.handle_capture_event(capture_event, &mut summary)?;
         }
         Ok(summary)
@@ -200,6 +212,9 @@ where
         for stored_event in stored_events {
             let capture_event = decode_ingress_capture_event(&stored_event)?;
             summary.ingress_records_recovered = summary.ingress_records_recovered.saturating_add(1);
+            if let Some(metrics) = &self.runtime_metrics {
+                metrics.record_ingress_record_recovered();
+            }
             self.process_journaled_capture_event(
                 capture_event,
                 stored_event.sequence,
@@ -217,6 +232,9 @@ where
     ) -> Result<(), PipelineError> {
         let ingress_sequence = self.append_capture_event(&capture_event)?;
         summary.ingress_records_journaled = summary.ingress_records_journaled.saturating_add(1);
+        if let Some(metrics) = &self.runtime_metrics {
+            metrics.record_ingress_record_journaled();
+        }
         self.process_journaled_capture_event(capture_event, ingress_sequence, summary)
     }
 
@@ -249,9 +267,8 @@ where
                         self.config_version.clone(),
                         event,
                     );
-                    summary.export_events_written = summary
-                        .export_events_written
-                        .saturating_add(self.append_envelope_and_policy_outcomes(envelope)?);
+                    let written = self.append_envelope_and_policy_outcomes(envelope)?;
+                    add_export_events_to_summary(summary, written);
                 }
             }
             CaptureEvent::ConnectionOpened {
@@ -267,9 +284,8 @@ where
                     self.config_version.clone(),
                     EventKind::ConnectionOpened,
                 );
-                summary.export_events_written = summary
-                    .export_events_written
-                    .saturating_add(self.append_envelope_and_policy_outcomes(envelope)?);
+                let written = self.append_envelope_and_policy_outcomes(envelope)?;
+                add_export_events_to_summary(summary, written);
             }
             CaptureEvent::ConnectionClosed {
                 timestamp,
@@ -291,9 +307,8 @@ where
                         self.config_version.clone(),
                         event,
                     );
-                    summary.export_events_written = summary
-                        .export_events_written
-                        .saturating_add(self.append_envelope_and_policy_outcomes(envelope)?);
+                    let written = self.append_envelope_and_policy_outcomes(envelope)?;
+                    add_export_events_to_summary(summary, written);
                 }
                 let envelope = EventEnvelope::new(
                     timestamp,
@@ -302,13 +317,15 @@ where
                     self.config_version.clone(),
                     EventKind::ConnectionClosed,
                 );
-                summary.export_events_written = summary
-                    .export_events_written
-                    .saturating_add(self.append_envelope_and_policy_outcomes(envelope)?);
+                let written = self.append_envelope_and_policy_outcomes(envelope)?;
+                add_export_events_to_summary(summary, written);
                 self.parser_factory.remove_flow(&flow_id);
             }
         }
         summary.ingress_records_processed = summary.ingress_records_processed.saturating_add(1);
+        if let Some(metrics) = &self.runtime_metrics {
+            metrics.record_ingress_record_processed();
+        }
         self.last_processed_ingress_sequence = Some(ingress_sequence);
         self.ack_parser_checkpoint_if_safe()?;
         Ok(())
@@ -337,9 +354,8 @@ where
                 event,
             )
             .with_degraded(chunk.degraded);
-            summary.export_events_written = summary
-                .export_events_written
-                .saturating_add(self.append_envelope_and_policy_outcomes(envelope)?);
+            let written = self.append_envelope_and_policy_outcomes(envelope)?;
+            add_export_events_to_summary(summary, written);
         }
         Ok(())
     }
@@ -376,6 +392,9 @@ where
             return Ok(written);
         };
         if !policy.matches(&envelope) {
+            if let Some(metrics) = &self.runtime_metrics {
+                metrics.record_policy_selector_miss();
+            }
             return Ok(written);
         }
         let policy_version = format!(
@@ -384,6 +403,9 @@ where
             policy.runtime.manifest().version
         );
         let outcomes = policy.runtime.handle_event(hook, &envelope)?;
+        if let Some(metrics) = &self.runtime_metrics {
+            metrics.record_policy_evaluation();
+        }
         for outcome in outcomes {
             match outcome {
                 PolicyOutcome::Alert(alert) => {
@@ -397,6 +419,9 @@ where
                     .with_policy_version(policy_version.clone())
                     .with_degraded(envelope.degraded);
                     self.append_envelope(&policy_envelope)?;
+                    if let Some(metrics) = &self.runtime_metrics {
+                        metrics.record_policy_alert();
+                    }
                     written += 1;
                 }
                 PolicyOutcome::Verdict(verdict) => {
@@ -410,6 +435,9 @@ where
                     .with_policy_version(policy_version.clone())
                     .with_degraded(envelope.degraded);
                     self.append_envelope(&policy_envelope)?;
+                    if let Some(metrics) = &self.runtime_metrics {
+                        metrics.record_policy_verdict();
+                    }
                     written += 1;
 
                     if let Some(enforcement_planner) = self.enforcement_planner.as_deref_mut()
@@ -419,6 +447,7 @@ where
                                 trigger: &envelope,
                             })?
                     {
+                        let outcome = decision.outcome;
                         let enforcement_envelope = EventEnvelope::new(
                             self.clock.next_timestamp(),
                             envelope.flow.clone(),
@@ -429,6 +458,9 @@ where
                         .with_policy_version(policy_version.clone())
                         .with_degraded(envelope.degraded);
                         self.append_envelope(&enforcement_envelope)?;
+                        if let Some(metrics) = &self.runtime_metrics {
+                            metrics.record_enforcement_decision(outcome);
+                        }
                         written += 1;
                     }
                 }
@@ -444,8 +476,15 @@ where
             SpoolPayloadSchema::EventEnvelopeJson,
             payload,
         ))?;
+        if let Some(metrics) = &self.runtime_metrics {
+            metrics.record_export_event_written();
+        }
         Ok(())
     }
+}
+
+fn add_export_events_to_summary(summary: &mut PipelineSummary, written: u64) {
+    summary.export_events_written = summary.export_events_written.saturating_add(written);
 }
 
 #[derive(Debug, Default)]

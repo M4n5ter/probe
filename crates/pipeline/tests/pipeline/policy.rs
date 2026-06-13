@@ -1,6 +1,6 @@
 use enforcement::ScopedEnforcementPlanner;
 use parsers::Http1ParserFactory;
-use pipeline::{CapturePipeline, PipelinePolicy};
+use pipeline::{CapturePipeline, PipelinePolicy, PipelineRuntimeMetrics};
 use policy::{PolicyHook, PolicyManifest, PolicyRuntime};
 use probe_core::{
     Action, EnforcementMode, EnforcementOutcome, EventKind, ProcessSelector, Selector,
@@ -39,12 +39,14 @@ end
         flow,
         b"GET /blocked HTTP/1.1\r\nHost: test\r\n\r\n",
     )]);
+    let metrics = PipelineRuntimeMetrics::default();
     let mut pipeline = CapturePipeline::new(
         &spool,
         &mut parser_factory,
         Some(PipelinePolicy::unscoped(&policy)),
         "test",
     )
+    .with_runtime_metrics(metrics.clone())
     .with_enforcement_planner(&mut enforcement_planner);
 
     let summary = pipeline.run_provider(&mut provider)?;
@@ -65,9 +67,24 @@ end
                 if decision.outcome == EnforcementOutcome::DryRun
                     && decision.requested_action == Action::Deny
                     && decision.effective_action == Action::Observe
-                    && decision.selector_matched
+            && decision.selector_matched
         )
     }));
+    let metrics = metrics.snapshot();
+    assert_eq!(metrics.capture_events_read, summary.capture_events_read);
+    assert_eq!(
+        metrics.ingress_records_journaled,
+        summary.ingress_records_journaled
+    );
+    assert_eq!(
+        metrics.ingress_records_processed,
+        summary.ingress_records_processed
+    );
+    assert_eq!(metrics.export_events_written, summary.export_events_written);
+    assert_eq!(metrics.policy.evaluations, 1);
+    assert_eq!(metrics.policy.verdicts, 1);
+    assert_eq!(metrics.enforcement.decisions, 1);
+    assert_eq!(metrics.enforcement.dry_run, 1);
     Ok(())
 }
 
@@ -96,6 +113,7 @@ end
     )
     .compile()?;
     let mut parser_factory = Http1ParserFactory::default();
+    let metrics = PipelineRuntimeMetrics::default();
     let mut provider = SequenceProvider::new(vec![
         captured_bytes(
             demo_flow_with_ports(50_000, 80, 20),
@@ -111,7 +129,8 @@ end
         &mut parser_factory,
         Some(PipelinePolicy::new(&policy, Some(&selector))),
         "test",
-    );
+    )
+    .with_runtime_metrics(metrics.clone());
 
     let summary = pipeline.run_provider(&mut provider)?;
 
@@ -127,5 +146,11 @@ end
         &alerts[0].kind,
         EventKind::PolicyAlert(alert) if alert.message == "matched /hit"
     ));
+    let metrics = metrics.snapshot();
+    assert_eq!(metrics.policy.evaluations, 1);
+    assert_eq!(metrics.policy.selector_misses, 1);
+    assert_eq!(metrics.policy.alerts, 1);
+    assert_eq!(metrics.policy.verdicts, 0);
+    assert_eq!(metrics.enforcement.decisions, 0);
     Ok(())
 }

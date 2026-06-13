@@ -4,6 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use pipeline::PipelineRuntimeMetricsSnapshot;
 use probe_config::{CaptureBackend, CaptureSelection};
 use probe_core::{CapabilityMatrix, RuntimeMode};
 use runtime::{CapturePlanMode, RuntimePlan};
@@ -71,6 +72,7 @@ pub struct MetricsSnapshot {
     pub capabilities: CapabilityMetricsSnapshot,
     pub spool: SpoolMetricsSnapshot,
     pub export: ExportMetricsSnapshot,
+    pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -97,6 +99,7 @@ pub struct ExportMetricsSnapshot {
 pub struct RuntimeStatusInput {
     pub enforcement_policy_source: Option<LoadedEnforcementPolicySource>,
     pub export_worker: Option<ExportWorkerRuntimeSnapshot>,
+    pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +269,7 @@ fn build_status_snapshot_at_with_runtime(
         &spool_status,
         &exporters,
         runtime.export_worker.as_ref(),
+        runtime.pipeline,
     );
     let health = health_snapshot(plan, &spool_status, &exporters, &policy, &enforcement);
 
@@ -296,6 +300,7 @@ fn metrics_snapshot(
     spool: &SpoolStatusSnapshot,
     exporters: &[ExporterStatusSnapshot],
     export_worker: Option<&ExportWorkerRuntimeSnapshot>,
+    pipeline: Option<PipelineRuntimeMetricsSnapshot>,
 ) -> MetricsSnapshot {
     MetricsSnapshot {
         capabilities: capability_metrics(capabilities),
@@ -308,6 +313,7 @@ fn metrics_snapshot(
             total_lag: total_export_lag(exporters),
             backing_off_sink_count: export_worker.map(|_| backing_off_exporter_count(exporters)),
         },
+        pipeline,
     }
 }
 
@@ -406,8 +412,10 @@ mod tests {
         assert!(snapshot.tls.materials.is_empty());
         let value = serde_json::to_value(&snapshot)?;
         assert_eq!(snapshot.metrics.export.backing_off_sink_count, None);
+        assert!(snapshot.metrics.pipeline.is_none());
         assert_eq!(value["policy"]["mode"], json!("inactive"));
         assert_eq!(value["enforcement"]["status"], json!("audit_only"));
+        assert_eq!(value["metrics"]["pipeline"], json!(null));
         assert_eq!(
             value["enforcement"]["capability"]["kind"],
             json!("not_required")
@@ -451,6 +459,28 @@ mod tests {
                     },
                 )]),
             }),
+            pipeline: Some(PipelineRuntimeMetricsSnapshot {
+                capture_events_read: 2,
+                ingress_records_journaled: 2,
+                ingress_records_recovered: 1,
+                ingress_records_processed: 3,
+                export_events_written: 7,
+                policy: pipeline::PolicyRuntimeMetricsSnapshot {
+                    evaluations: 2,
+                    selector_misses: 1,
+                    alerts: 1,
+                    verdicts: 1,
+                },
+                enforcement: pipeline::EnforcementRuntimeMetricsSnapshot {
+                    decisions: 1,
+                    disabled: 0,
+                    audit_only: 0,
+                    dry_run: 1,
+                    selector_miss: 0,
+                    unsupported: 0,
+                    applied: 0,
+                },
+            }),
             ..RuntimeStatusInput::default()
         };
 
@@ -458,6 +488,14 @@ mod tests {
 
         assert_eq!(snapshot.metrics.export.total_lag, Some(2));
         assert_eq!(snapshot.metrics.export.backing_off_sink_count, Some(1));
+        let pipeline_metrics = snapshot
+            .metrics
+            .pipeline
+            .as_ref()
+            .expect("runtime pipeline metrics should be reported");
+        assert_eq!(pipeline_metrics.export_events_written, 7);
+        assert_eq!(pipeline_metrics.policy.selector_misses, 1);
+        assert_eq!(pipeline_metrics.enforcement.dry_run, 1);
         assert_eq!(
             snapshot.exporters[0]
                 .runtime
@@ -469,6 +507,14 @@ mod tests {
         let value = serde_json::to_value(&snapshot)?;
         assert_eq!(
             value["metrics"]["export"]["backing_off_sink_count"],
+            json!(1)
+        );
+        assert_eq!(
+            value["metrics"]["pipeline"]["policy"]["selector_misses"],
+            json!(1)
+        );
+        assert_eq!(
+            value["metrics"]["pipeline"]["enforcement"]["dry_run"],
             json!(1)
         );
         assert_eq!(
