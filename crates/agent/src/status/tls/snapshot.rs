@@ -18,6 +18,7 @@ pub struct TlsPlaintextStatusSnapshot {
     pub enabled: bool,
     pub provider: TlsPlaintextProvider,
     pub selector_configured: bool,
+    pub libssl_uprobe_object_path: Option<PathBuf>,
     pub capability: TlsPlaintextCapabilityStatusSnapshot,
     pub key_logs: Vec<TlsPlaintextMaterialStatusSnapshot>,
     pub session_secrets: Vec<TlsPlaintextMaterialStatusSnapshot>,
@@ -105,6 +106,7 @@ fn plaintext_status(plan: &RuntimePlan) -> TlsPlaintextStatusSnapshot {
         enabled: plaintext.enabled,
         provider: plaintext.provider,
         selector_configured: plaintext.selector_configured,
+        libssl_uprobe_object_path: plaintext.libssl_uprobe_object_path.clone(),
         capability,
         key_logs: plaintext_material_statuses(&plaintext.key_logs),
         session_secrets: plaintext_material_statuses(&plaintext.session_secrets),
@@ -206,6 +208,8 @@ mod tests {
         config.tls.plaintext.enabled = true;
         config.tls.plaintext.provider = probe_config::TlsPlaintextProvider::LibsslUprobe;
         config.tls.plaintext.selector = Some(Selector::default());
+        config.tls.plaintext.libssl_uprobe_object_path =
+            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
         let plan = runtime_plan_from_config(
             config,
             vec![CapabilityState::available(CapabilityKind::LibsslUprobe)],
@@ -220,6 +224,10 @@ mod tests {
         );
         assert!(status.plaintext.selector_configured);
         assert_eq!(
+            status.plaintext.libssl_uprobe_object_path,
+            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into())
+        );
+        assert_eq!(
             status.plaintext.capability,
             TlsPlaintextCapabilityStatusSnapshot::Required {
                 capability: CapabilityKind::LibsslUprobe,
@@ -233,6 +241,10 @@ mod tests {
         assert_eq!(
             value["plaintext"]["capability"]["capability"],
             json!("libssl_uprobe")
+        );
+        assert_eq!(
+            value["plaintext"]["libssl_uprobe_object_path"],
+            json!("/opt/sssa/ebpf-tls-plaintext.bpf.o")
         );
         fs::remove_dir_all(temp)?;
         Ok(())

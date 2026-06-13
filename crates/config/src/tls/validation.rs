@@ -12,6 +12,7 @@ pub(crate) fn validate_tls(
 ) {
     validate_tls_materials(tls, violations);
     validate_plaintext_tls_material_refs(tls, violations);
+    validate_plaintext_tls_provider_config(tls, violations);
 
     if capture.selection == CaptureSelection::PlaintextFeed {
         validate_plaintext_feed_selection(tls, violations);
@@ -123,6 +124,25 @@ fn validate_plaintext_tls_provider_refs(tls: &TlsConfig, violations: &mut Vec<Co
                     .to_string(),
             });
         }
+    }
+}
+
+fn validate_plaintext_tls_provider_config(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
+    let Some(path) = &tls.plaintext.libssl_uprobe_object_path else {
+        return;
+    };
+    if path.as_os_str().is_empty() {
+        violations.push(ConfigViolation {
+            field: "tls.plaintext.libssl_uprobe_object_path".to_string(),
+            reason: "libssl uprobe eBPF object path cannot be empty".to_string(),
+        });
+    }
+    if !matches!(tls.plaintext.provider, TlsPlaintextProvider::LibsslUprobe) {
+        violations.push(ConfigViolation {
+            field: "tls.plaintext.libssl_uprobe_object_path".to_string(),
+            reason: "libssl uprobe eBPF object path is only valid when tls.plaintext.provider = \"libssl_uprobe\""
+                .to_string(),
+        });
     }
 }
 

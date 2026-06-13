@@ -17,6 +17,7 @@ pub(crate) struct TlsCheckSnapshot {
 struct TlsPlaintextCheckSnapshot {
     enabled: bool,
     provider: TlsPlaintextProvider,
+    libssl_uprobe_object_path: Option<PathBuf>,
     key_logs: Vec<TlsPlaintextMaterialCheckSnapshot>,
     session_secrets: Vec<TlsPlaintextMaterialCheckSnapshot>,
 }
@@ -60,6 +61,7 @@ fn check_tls_with_file_store(
         plaintext: TlsPlaintextCheckSnapshot {
             enabled: plaintext.enabled,
             provider: plaintext.provider,
+            libssl_uprobe_object_path: plaintext.libssl_uprobe_object_path.clone(),
             key_logs: check_key_log_materials(&plaintext.key_logs, file_store)?,
             session_secrets: check_session_secret_materials(
                 &plaintext.session_secrets,
@@ -203,6 +205,24 @@ mod tests {
             json!(23)
         );
         fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_reports_libssl_uprobe_object_path_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.libssl_uprobe_object_path =
+            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        let plan = runtime_plan(config)?;
+
+        let report = build_check_report(plan, None).await?;
+
+        let value = serde_json::to_value(report)?;
+        assert_eq!(
+            value["tls"]["plaintext"]["libssl_uprobe_object_path"],
+            json!("/opt/sssa/ebpf-tls-plaintext.bpf.o")
+        );
         Ok(())
     }
 

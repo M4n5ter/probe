@@ -66,6 +66,7 @@ path = "/etc/ssl/certs/ca.pem"
 [tls.plaintext]
 enabled = true
 provider = "libssl_uprobe"
+libssl_uprobe_object_path = "/opt/sssa/ebpf-tls-plaintext.bpf.o"
 
 [tls.plaintext.selector]
 op = "match"
@@ -138,6 +139,10 @@ socket_path = "/run/sssa-probe/admin.sock"
     assert_eq!(
         config.tls.plaintext.provider,
         TlsPlaintextProvider::LibsslUprobe
+    );
+    assert_eq!(
+        config.tls.plaintext.libssl_uprobe_object_path,
+        Some(PathBuf::from("/opt/sssa/ebpf-tls-plaintext.bpf.o"))
     );
     assert!(config.tls.plaintext.selector.is_some());
     assert_eq!(config.capture.plaintext_feed.path, None);

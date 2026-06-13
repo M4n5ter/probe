@@ -14,6 +14,7 @@ pub struct ProviderRegistry {
 pub struct PlatformProbeResults {
     pub procfs_socket: Vec<CapabilityState>,
     pub connection_enforcement: CapabilityState,
+    pub libssl_uprobe: CapabilityState,
 }
 
 impl PlatformProbeResults {
@@ -21,16 +22,7 @@ impl PlatformProbeResults {
         Self {
             procfs_socket: ProcfsSocketResolver::new().capabilities(),
             connection_enforcement: default_connection_enforcement_capability(),
-        }
-    }
-
-    pub fn new(
-        procfs_socket: Vec<CapabilityState>,
-        connection_enforcement: CapabilityState,
-    ) -> Self {
-        Self {
-            procfs_socket,
-            connection_enforcement,
+            libssl_uprobe: default_libssl_uprobe_capability(),
         }
     }
 }
@@ -50,10 +42,14 @@ impl ProviderRegistry {
         let procfs = ProcfsAttributor::new();
         Self::new(
             capture_providers,
-            default_platform_capabilities(procfs, platform.connection_enforcement)
-                .into_iter()
-                .chain(platform.procfs_socket)
-                .collect(),
+            default_platform_capabilities(
+                procfs,
+                platform.connection_enforcement,
+                platform.libssl_uprobe,
+            )
+            .into_iter()
+            .chain(platform.procfs_socket)
+            .collect(),
         )
     }
 
@@ -97,12 +93,10 @@ impl ProviderRegistry {
 fn default_platform_capabilities(
     procfs: impl ProcessAttributor,
     connection_enforcement_capability: CapabilityState,
+    libssl_uprobe_capability: CapabilityState,
 ) -> impl IntoIterator<Item = CapabilityState> {
     [
-        CapabilityState::unavailable(
-            CapabilityKind::LibsslUprobe,
-            "libssl uprobe discovery, attach planning, ABI, capture adapter, userspace uprobe loader, and eBPF producer exist, but agent dynamic attach lifecycle and flow resolver runtime wiring are not implemented in this build",
-        ),
+        libssl_uprobe_capability,
         CapabilityState::available(CapabilityKind::Http1),
         CapabilityState::available(CapabilityKind::Sse),
         CapabilityState::available(CapabilityKind::WebSocketHandoff),
@@ -132,5 +126,12 @@ fn default_connection_enforcement_capability() -> CapabilityState {
     CapabilityState::unavailable(
         CapabilityKind::ConnectionEnforcement,
         "connection-level enforcement backend abstraction is wired, but no executable blocking backend is configured",
+    )
+}
+
+fn default_libssl_uprobe_capability() -> CapabilityState {
+    CapabilityState::unavailable(
+        CapabilityKind::LibsslUprobe,
+        "libssl uprobe discovery, attach planning, ABI, capture adapter, userspace uprobe loader, and eBPF producer exist, but agent dynamic attach lifecycle and flow resolver runtime wiring are not implemented in this build",
     )
 }

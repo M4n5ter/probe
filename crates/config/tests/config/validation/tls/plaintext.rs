@@ -98,3 +98,40 @@ path = "/tmp/sslkeylog.log"
     );
     Ok(())
 }
+
+#[test]
+fn validation_rejects_invalid_libssl_uprobe_object_path_config()
+-> Result<(), Box<dyn std::error::Error>> {
+    let empty_object_path = AgentConfig::from_toml_str(
+        r#"
+[tls.plaintext]
+provider = "libssl_uprobe"
+libssl_uprobe_object_path = ""
+"#,
+    )?;
+    let error = empty_object_path
+        .validate_basic()
+        .expect_err("libssl uprobe object path must not be empty");
+    assert!(
+        error
+            .to_string()
+            .contains("libssl uprobe eBPF object path cannot be empty")
+    );
+
+    let keylog_object_path = AgentConfig::from_toml_str(
+        r#"
+[tls.plaintext]
+provider = "keylog"
+libssl_uprobe_object_path = "/opt/sssa/ebpf-tls-plaintext.bpf.o"
+"#,
+    )?;
+    let error = keylog_object_path
+        .validate_basic()
+        .expect_err("libssl uprobe object path belongs to the libssl provider");
+    assert!(
+        error
+            .to_string()
+            .contains("only valid when tls.plaintext.provider = \"libssl_uprobe\"")
+    );
+    Ok(())
+}

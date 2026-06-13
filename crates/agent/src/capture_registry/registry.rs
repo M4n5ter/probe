@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use super::libssl_uprobe;
 use capture::{
     EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport, LibpcapConfig, LibpcapProvider,
 };
@@ -14,15 +15,18 @@ pub fn default_provider_registry(
     config: &AgentConfig,
     connection_enforcement_capability: CapabilityState,
 ) -> ProviderRegistry {
+    let ebpf_host = EbpfHostProbe::probe(&EbpfHostProbeConfig::default());
     let procfs_socket_capabilities = attribution::ProcfsSocketResolver::new().capabilities();
     let procfs_socket_attribution =
         procfs_socket_attribution_capability(&procfs_socket_capabilities);
+    let libssl_uprobe = libssl_uprobe::capability(config, &ebpf_host, &procfs_socket_attribution);
     ProviderRegistry::with_platform_probes(
-        default_capture_provider_descriptors(config, procfs_socket_attribution),
-        PlatformProbeResults::new(
-            procfs_socket_capabilities,
-            connection_enforcement_capability,
-        ),
+        default_capture_provider_descriptors(config, ebpf_host, procfs_socket_attribution),
+        PlatformProbeResults {
+            procfs_socket: procfs_socket_capabilities,
+            connection_enforcement: connection_enforcement_capability,
+            libssl_uprobe,
+        },
     )
 }
 
@@ -40,6 +44,7 @@ pub fn libpcap_config_from_agent(config: &AgentConfig) -> LibpcapConfig {
 
 fn default_capture_provider_descriptors(
     config: &AgentConfig,
+    ebpf_host: EbpfHostProbeReport,
     procfs_socket_attribution: CapabilityState,
 ) -> Vec<CaptureProviderDescriptor> {
     vec![
@@ -48,7 +53,7 @@ fn default_capture_provider_descriptors(
             CaptureProviderBuilder::Replay,
         ),
         ebpf_provider_descriptor(
-            EbpfHostProbe::probe(&EbpfHostProbeConfig::default()),
+            ebpf_host,
             config.capture.ebpf.object_path.as_ref(),
             procfs_socket_attribution,
         ),

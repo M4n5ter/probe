@@ -16,6 +16,7 @@ pub struct PlaintextTlsConfig {
     pub enabled: bool,
     pub provider: TlsPlaintextProvider,
     pub selector: Option<Selector>,
+    pub libssl_uprobe_object_path: Option<PathBuf>,
     pub key_log_refs: Vec<String>,
     pub session_secret_refs: Vec<String>,
 }
@@ -26,6 +27,7 @@ impl Default for PlaintextTlsConfig {
             enabled: false,
             provider: TlsPlaintextProvider::LibsslUprobe,
             selector: None,
+            libssl_uprobe_object_path: None,
             key_log_refs: Vec::new(),
             session_secret_refs: Vec::new(),
         }

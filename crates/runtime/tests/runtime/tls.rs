@@ -28,6 +28,8 @@ fn tls_plaintext_plan_preserves_selector_and_capability_requirement()
     config.tls.plaintext.enabled = true;
     config.tls.plaintext.provider = TlsPlaintextProvider::LibsslUprobe;
     config.tls.plaintext.selector = Some(Selector::default());
+    config.tls.plaintext.libssl_uprobe_object_path =
+        Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
 
     let plan = RuntimePlan::build(config, &registry)?;
 
@@ -37,6 +39,10 @@ fn tls_plaintext_plan_preserves_selector_and_capability_requirement()
         TlsPlaintextProvider::LibsslUprobe
     );
     assert!(plan.tls.plaintext.selector_configured);
+    assert_eq!(
+        plan.tls.plaintext.libssl_uprobe_object_path,
+        Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into())
+    );
     assert_eq!(
         plan.tls.plaintext.capability,
         TlsPlaintextCapabilityPlan::Required {

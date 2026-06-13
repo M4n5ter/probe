@@ -22,6 +22,7 @@ pub struct TlsPlaintextPlan {
     pub enabled: bool,
     pub provider: TlsPlaintextProvider,
     pub selector_configured: bool,
+    pub libssl_uprobe_object_path: Option<PathBuf>,
     pub capability: TlsPlaintextCapabilityPlan,
     pub key_logs: Vec<TlsPlaintextMaterialPlan>,
     pub session_secrets: Vec<TlsPlaintextMaterialPlan>,
@@ -34,6 +35,7 @@ impl TlsPlaintextPlan {
             enabled: config.tls.plaintext.enabled,
             provider: config.tls.plaintext.provider,
             selector_configured: config.tls.plaintext.selector.is_some(),
+            libssl_uprobe_object_path: config.tls.plaintext.libssl_uprobe_object_path.clone(),
             capability: TlsPlaintextCapabilityPlan::from_config(config, capabilities),
             key_logs: tls_plaintext_materials_from_refs(
                 &config.tls.plaintext.key_log_refs,
