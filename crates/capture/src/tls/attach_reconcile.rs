@@ -41,7 +41,7 @@ impl LibsslUprobeAttachState {
             new_targets,
             retained_targets,
             stale_targets,
-            next_state: Self {
+            state_after_successful_reconcile: Self {
                 targets: next_targets,
             },
         }
@@ -54,7 +54,14 @@ pub struct LibsslUprobeReconcileReport {
     pub new_targets: Vec<LibsslUprobeAttachTargetId>,
     pub retained_targets: Vec<LibsslUprobeAttachTargetId>,
     pub stale_targets: Vec<LibsslUprobeAttachTargetId>,
-    pub next_state: LibsslUprobeAttachState,
+    state_after_successful_reconcile: LibsslUprobeAttachState,
+}
+
+impl LibsslUprobeReconcileReport {
+    /// Returns the state that may be committed after every attach/detach side effect succeeds.
+    pub fn state_after_successful_reconcile(&self) -> &LibsslUprobeAttachState {
+        &self.state_after_successful_reconcile
+    }
 }
 
 #[cfg(test)]
@@ -80,7 +87,7 @@ mod tests {
         assert!(report.retained_targets.is_empty());
         assert!(report.stale_targets.is_empty());
         assert_eq!(plan_pids(&report.attach_plan), vec![7, 8]);
-        assert_eq!(report.next_state.target_count(), 2);
+        assert_eq!(report.state_after_successful_reconcile().target_count(), 2);
     }
 
     #[test]
@@ -94,7 +101,7 @@ mod tests {
         assert_eq!(target_pids(&report.retained_targets), vec![7]);
         assert!(report.stale_targets.is_empty());
         assert_eq!(plan_pids(&report.attach_plan), vec![8]);
-        assert_eq!(report.next_state.target_count(), 2);
+        assert_eq!(report.state_after_successful_reconcile().target_count(), 2);
     }
 
     #[test]
@@ -108,7 +115,7 @@ mod tests {
         assert_eq!(target_pids(&report.retained_targets), vec![7]);
         assert_eq!(target_pids(&report.stale_targets), vec![9]);
         assert!(report.attach_plan.processes().is_empty());
-        assert_eq!(report.next_state.target_count(), 1);
+        assert_eq!(report.state_after_successful_reconcile().target_count(), 1);
     }
 
     #[test]
