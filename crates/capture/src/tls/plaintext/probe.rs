@@ -64,8 +64,8 @@ pub(in crate::tls::plaintext) enum LibsslUprobePlaintextProbeError {
 }
 
 pub(in crate::tls::plaintext) struct LibsslUprobePlaintextProbe {
-    _ebpf: Ebpf,
-    _attached_links: LibsslUprobeAttachedLinks,
+    ebpf: Ebpf,
+    attached_links: LibsslUprobeAttachedLinks,
     events: RingBuf<MapData>,
 }
 
@@ -115,8 +115,8 @@ impl LibsslUprobePlaintextProbe {
             attach_uprobes(&mut ebpf, attach_recipes, AttachFailurePolicy::Strict)?;
         let events = open_events_ringbuf(&mut ebpf)?;
         Ok(Self {
-            _ebpf: ebpf,
-            _attached_links: attach_outcome.into_attached_links(),
+            ebpf,
+            attached_links: attach_outcome.into_attached_links(),
             events,
         })
     }
@@ -138,8 +138,8 @@ impl LibsslUprobePlaintextProbe {
         }
         let events = open_events_ringbuf(&mut ebpf)?;
         Ok(LibsslUprobePlaintextProbeLoad::Enabled(Box::new(Self {
-            _ebpf: ebpf,
-            _attached_links: attach_outcome.into_attached_links(),
+            ebpf,
+            attached_links: attach_outcome.into_attached_links(),
             events,
         })))
     }
@@ -151,6 +151,12 @@ impl LibsslUprobePlaintextProbe {
             return Ok(None);
         };
         plaintext_sample_from_ringbuf_record(&item).map(Some)
+    }
+}
+
+impl Drop for LibsslUprobePlaintextProbe {
+    fn drop(&mut self) {
+        let _ = self.attached_links.detach_all_best_effort(&mut self.ebpf);
     }
 }
 

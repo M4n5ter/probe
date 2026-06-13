@@ -52,6 +52,15 @@ pub(in crate::tls::plaintext) enum LibsslUprobeAttachError {
         program_name: &'static str,
         source: Box<ProgramError>,
     },
+    #[error(
+        "failed to detach eBPF TLS plaintext program {program_name} from pid {pid} at {target_path}: {source}"
+    )]
+    Detach {
+        program_name: &'static str,
+        pid: u32,
+        target_path: PathBuf,
+        source: Box<ProgramError>,
+    },
     #[error("libssl uprobe attach target for pid {pid} is no longer valid: {source}")]
     AttachTarget {
         pid: u32,
@@ -89,10 +98,27 @@ impl LibsslUprobeAttachRecipeRequest {
 }
 
 pub(in crate::tls::plaintext) struct LibsslUprobeAttachedLinks {
-    _links_by_target: BTreeMap<LibsslUprobeAttachTargetId, Vec<AttachedLibsslUprobe>>,
+    links_by_target: BTreeMap<LibsslUprobeAttachTargetId, Vec<AttachedLibsslUprobe>>,
 }
 
 impl LibsslUprobeAttachedLinks {
+    pub(in crate::tls::plaintext) fn detach_all_best_effort(
+        &mut self,
+        ebpf: &mut Ebpf,
+    ) -> Result<(), LibsslUprobeAttachError> {
+        let links_by_target = std::mem::take(&mut self.links_by_target);
+        let mut first_error = None;
+        for (target, links) in links_by_target.into_iter().rev() {
+            if let Err(error) = detach_attached_uprobes_for_target(ebpf, &target, links) {
+                record_first_detach_error(&mut first_error, error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn push_recipe_links(
         &mut self,
         target: LibsslUprobeAttachTargetId,
@@ -101,7 +127,7 @@ impl LibsslUprobeAttachedLinks {
         if links.is_empty() {
             return;
         }
-        self._links_by_target
+        self.links_by_target
             .entry(target)
             .or_default()
             .append(&mut links);
@@ -288,6 +314,44 @@ fn rollback_attached_uprobes(
     Ok(())
 }
 
+fn detach_attached_uprobes_for_target(
+    ebpf: &mut Ebpf,
+    target: &LibsslUprobeAttachTargetId,
+    attached: Vec<AttachedLibsslUprobe>,
+) -> Result<(), LibsslUprobeAttachError> {
+    let mut first_error = None;
+    for attached in attached.into_iter().rev() {
+        let result =
+            match uprobe_program_mut(ebpf, attached.program_name) {
+                Ok(program) => program.detach(attached.link_id).map_err(|source| {
+                    LibsslUprobeAttachError::Detach {
+                        program_name: attached.program_name,
+                        pid: target.process.pid,
+                        target_path: target.library.read_path.clone(),
+                        source: Box::new(source),
+                    }
+                }),
+                Err(error) => Err(error),
+            };
+        if let Err(error) = result {
+            record_first_detach_error(&mut first_error, error);
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn record_first_detach_error(
+    first_error: &mut Option<LibsslUprobeAttachError>,
+    error: LibsslUprobeAttachError,
+) {
+    if first_error.is_none() {
+        *first_error = Some(error);
+    }
+}
+
 fn uprobe_program_mut<'a>(
     ebpf: &'a mut Ebpf,
     program_name: &'static str,
@@ -347,7 +411,7 @@ impl LibsslUprobeAttachOutcome {
         Self {
             summary: LibsslUprobeAttachSummary::from_recipes(recipes),
             attached_links: LibsslUprobeAttachedLinks {
-                _links_by_target: BTreeMap::new(),
+                links_by_target: BTreeMap::new(),
             },
         }
     }
