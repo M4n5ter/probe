@@ -16,7 +16,8 @@ pub use ebpf::{
 pub use event::{CaptureEvent, CapturedBytes, CapturedGap};
 pub use libpcap::{LibpcapConfig, LibpcapProvider};
 pub use plaintext::{
-    PlaintextChunk, PlaintextConnection, PlaintextFeedEvent, PlaintextFeedProvider, PlaintextGap,
+    PlaintextChunk, PlaintextConnection, PlaintextEvent, PlaintextEventKind,
+    PlaintextEventProvider, PlaintextEventProviderError, PlaintextGap, PlaintextSource,
 };
 pub use provider::{
     CaptureError, CaptureProvider, CaptureProviderKind, ProcessResolver, ResolvedProcess,

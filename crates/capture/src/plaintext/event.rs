@@ -1,14 +1,24 @@
-use std::collections::VecDeque;
-
 use bytes::Bytes;
-use probe_core::{
-    CapabilityKind, CapabilityState, CaptureSource, Direction, FlowContext, Gap, Timestamp,
-};
+use probe_core::{CaptureSource, Direction, FlowContext, Gap, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    CaptureError, CaptureEvent, CaptureProvider, CaptureProviderKind, CapturedBytes, CapturedGap,
-};
+use crate::{CaptureEvent, CaptureProviderKind, CapturedBytes, CapturedGap};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaintextSource {
+    ExternalPlaintextFeed,
+    LibsslUprobe,
+}
+
+impl PlaintextSource {
+    pub fn capture_source(self) -> CaptureSource {
+        match self {
+            Self::ExternalPlaintextFeed => CaptureSource::ExternalPlaintextFeed,
+            Self::LibsslUprobe => CaptureSource::LibsslUprobe,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaintextChunk {
@@ -84,27 +94,51 @@ impl PlaintextGap {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaintextEvent {
+    pub source: PlaintextSource,
+    #[serde(flatten)]
+    pub kind: PlaintextEventKind,
+}
+
+impl PlaintextEvent {
+    pub fn new(source: PlaintextSource, kind: PlaintextEventKind) -> Self {
+        Self { source, kind }
+    }
+
+    pub fn bytes(source: PlaintextSource, chunk: PlaintextChunk) -> Self {
+        Self::new(source, PlaintextEventKind::Bytes(chunk))
+    }
+
+    pub fn gap(source: PlaintextSource, gap: PlaintextGap) -> Self {
+        Self::new(source, PlaintextEventKind::Gap(gap))
+    }
+
+    pub fn connection_opened(source: PlaintextSource, connection: PlaintextConnection) -> Self {
+        Self::new(source, PlaintextEventKind::ConnectionOpened(connection))
+    }
+
+    pub fn connection_closed(source: PlaintextSource, connection: PlaintextConnection) -> Self {
+        Self::new(source, PlaintextEventKind::ConnectionClosed(connection))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum PlaintextFeedEvent {
+pub enum PlaintextEventKind {
     Bytes(PlaintextChunk),
     Gap(PlaintextGap),
     ConnectionOpened(PlaintextConnection),
     ConnectionClosed(PlaintextConnection),
 }
 
-impl From<PlaintextChunk> for PlaintextFeedEvent {
-    fn from(value: PlaintextChunk) -> Self {
-        Self::Bytes(value)
-    }
-}
-
-impl From<PlaintextFeedEvent> for CaptureEvent {
-    fn from(value: PlaintextFeedEvent) -> Self {
-        match value {
-            PlaintextFeedEvent::Bytes(chunk) => CaptureEvent::Bytes(CapturedBytes {
+impl From<PlaintextEvent> for CaptureEvent {
+    fn from(value: PlaintextEvent) -> Self {
+        let source = value.source.capture_source();
+        match value.kind {
+            PlaintextEventKind::Bytes(chunk) => CaptureEvent::Bytes(CapturedBytes {
                 timestamp: chunk.timestamp,
                 flow: chunk.flow,
-                source: CaptureSource::ExternalPlaintextFeed,
+                source,
                 provider: CaptureProviderKind::Plaintext,
                 direction: chunk.direction,
                 stream_offset: chunk.stream_offset,
@@ -113,67 +147,26 @@ impl From<PlaintextFeedEvent> for CaptureEvent {
                 degraded: chunk.degraded,
                 degradation_reason: chunk.degradation_reason,
             }),
-            PlaintextFeedEvent::Gap(gap) => CaptureEvent::Gap(CapturedGap {
+            PlaintextEventKind::Gap(gap) => CaptureEvent::Gap(CapturedGap {
                 timestamp: gap.timestamp,
                 flow: gap.flow,
-                source: CaptureSource::ExternalPlaintextFeed,
+                source,
                 provider: CaptureProviderKind::Plaintext,
                 gap: gap.gap,
             }),
-            PlaintextFeedEvent::ConnectionOpened(connection) => CaptureEvent::ConnectionOpened {
+            PlaintextEventKind::ConnectionOpened(connection) => CaptureEvent::ConnectionOpened {
                 timestamp: connection.timestamp,
                 flow: connection.flow,
-                source: CaptureSource::ExternalPlaintextFeed,
+                source,
                 provider: CaptureProviderKind::Plaintext,
             },
-            PlaintextFeedEvent::ConnectionClosed(connection) => CaptureEvent::ConnectionClosed {
+            PlaintextEventKind::ConnectionClosed(connection) => CaptureEvent::ConnectionClosed {
                 timestamp: connection.timestamp,
                 flow: connection.flow,
-                source: CaptureSource::ExternalPlaintextFeed,
+                source,
                 provider: CaptureProviderKind::Plaintext,
             },
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaintextFeedProvider {
-    events: VecDeque<PlaintextFeedEvent>,
-}
-
-impl PlaintextFeedProvider {
-    pub fn new(events: impl IntoIterator<Item = PlaintextFeedEvent>) -> Self {
-        Self {
-            events: events.into_iter().collect(),
-        }
-    }
-
-    pub fn from_chunks(chunks: impl IntoIterator<Item = PlaintextChunk>) -> Self {
-        Self::new(chunks.into_iter().map(PlaintextFeedEvent::from))
-    }
-}
-
-impl CaptureProvider for PlaintextFeedProvider {
-    fn name(&self) -> &'static str {
-        "plaintext_feed"
-    }
-
-    fn kind(&self) -> CaptureProviderKind {
-        CaptureProviderKind::Plaintext
-    }
-
-    fn source(&self) -> CaptureSource {
-        CaptureSource::ExternalPlaintextFeed
-    }
-
-    fn capabilities(&self) -> Vec<CapabilityState> {
-        vec![CapabilityState::available(
-            CapabilityKind::ExternalPlaintextFeed,
-        )]
-    }
-
-    fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
-        Ok(self.events.pop_front().map(CaptureEvent::from))
     }
 }
 
@@ -186,8 +179,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plaintext_feed_provider_preserves_chunk_metadata() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn plaintext_event_preserves_chunk_metadata() {
         let timestamp = Timestamp {
             monotonic_ns: 7,
             wall_time_unix_ns: 11,
@@ -201,9 +193,10 @@ mod tests {
         )
         .with_stream_offset(5)
         .with_degradation("source reported a partial plaintext stream");
-        let mut provider = PlaintextFeedProvider::from_chunks([chunk]);
-
-        let Some(CaptureEvent::Bytes(bytes)) = provider.next()? else {
+        let CaptureEvent::Bytes(bytes) = CaptureEvent::from(PlaintextEvent::bytes(
+            PlaintextSource::ExternalPlaintextFeed,
+            chunk,
+        )) else {
             panic!("expected plaintext bytes");
         };
 
@@ -220,24 +213,48 @@ mod tests {
             bytes.degradation_reason.as_deref(),
             Some("source reported a partial plaintext stream")
         );
-        assert!(provider.next()?.is_none());
-        Ok(())
     }
 
     #[test]
-    fn plaintext_feed_event_wire_type_is_stable() {
-        let value = serde_json::to_value(PlaintextFeedEvent::Bytes(PlaintextChunk::new(
-            Timestamp {
-                monotonic_ns: 1,
-                wall_time_unix_ns: 1,
-            },
-            demo_flow(),
-            Direction::Outbound,
-            b"GET / HTTP/1.1\r\n\r\n",
-        )))
-        .expect("plaintext feed event must serialize");
+    fn plaintext_event_wire_type_is_stable() {
+        let value = serde_json::to_value(PlaintextEvent::bytes(
+            PlaintextSource::ExternalPlaintextFeed,
+            PlaintextChunk::new(
+                Timestamp {
+                    monotonic_ns: 1,
+                    wall_time_unix_ns: 1,
+                },
+                demo_flow(),
+                Direction::Outbound,
+                b"GET / HTTP/1.1\r\n\r\n",
+            ),
+        ))
+        .expect("plaintext event must serialize");
 
         assert_eq!(value["type"], "bytes");
+        assert_eq!(value["source"], "external_plaintext_feed");
+    }
+
+    #[test]
+    fn plaintext_event_source_controls_capture_source() {
+        let event = PlaintextEvent::bytes(
+            PlaintextSource::LibsslUprobe,
+            PlaintextChunk::new(
+                Timestamp {
+                    monotonic_ns: 1,
+                    wall_time_unix_ns: 1,
+                },
+                demo_flow(),
+                Direction::Outbound,
+                b"GET / HTTP/1.1\r\n\r\n",
+            ),
+        );
+
+        let CaptureEvent::Bytes(bytes) = CaptureEvent::from(event) else {
+            panic!("expected plaintext bytes");
+        };
+
+        assert_eq!(bytes.source, CaptureSource::LibsslUprobe);
     }
 
     fn demo_flow() -> FlowContext {

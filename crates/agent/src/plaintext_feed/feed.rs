@@ -6,7 +6,7 @@ use std::{
 
 use capture::{
     CaptureError, CaptureEvent, CaptureProvider, CaptureProviderKind, PlaintextChunk,
-    PlaintextConnection, PlaintextFeedEvent, PlaintextGap,
+    PlaintextConnection, PlaintextEvent, PlaintextGap, PlaintextSource,
 };
 use probe_core::{
     AddressPort, CapabilityKind, CapabilityState, CaptureSource, Direction, FlowContext,
@@ -61,7 +61,7 @@ where
         }
     }
 
-    fn read_next_event(&mut self) -> Result<Option<PlaintextFeedEvent>, PlaintextFeedReadError> {
+    fn read_next_event(&mut self) -> Result<Option<PlaintextEvent>, PlaintextFeedReadError> {
         loop {
             self.line_buffer.clear();
             let bytes_read = read_bounded_line(
@@ -147,16 +147,20 @@ enum PlaintextFeedJsonEvent {
     ConnectionClosed(PlaintextFeedJsonConnectionLifecycle),
 }
 
-impl From<PlaintextFeedJsonEvent> for PlaintextFeedEvent {
+impl From<PlaintextFeedJsonEvent> for PlaintextEvent {
     fn from(value: PlaintextFeedJsonEvent) -> Self {
         match value {
-            PlaintextFeedJsonEvent::Bytes(bytes) => Self::Bytes(bytes.into()),
-            PlaintextFeedJsonEvent::Gap(gap) => Self::Gap(gap.into()),
+            PlaintextFeedJsonEvent::Bytes(bytes) => {
+                Self::bytes(PlaintextSource::ExternalPlaintextFeed, bytes.into())
+            }
+            PlaintextFeedJsonEvent::Gap(gap) => {
+                Self::gap(PlaintextSource::ExternalPlaintextFeed, gap.into())
+            }
             PlaintextFeedJsonEvent::ConnectionOpened(connection) => {
-                Self::ConnectionOpened(connection.into())
+                Self::connection_opened(PlaintextSource::ExternalPlaintextFeed, connection.into())
             }
             PlaintextFeedJsonEvent::ConnectionClosed(connection) => {
-                Self::ConnectionClosed(connection.into())
+                Self::connection_closed(PlaintextSource::ExternalPlaintextFeed, connection.into())
             }
         }
     }
@@ -483,6 +487,7 @@ mod tests {
         let CaptureEvent::Bytes(chunk) = event else {
             panic!("expected plaintext bytes");
         };
+        assert_eq!(chunk.source, CaptureSource::ExternalPlaintextFeed);
         assert_eq!(chunk.timestamp.wall_time_unix_ns, 1);
         assert_eq!(chunk.flow.id.0, "external_plaintext_feed:fixture-conn");
         assert_eq!(chunk.flow.local.address, "127.0.0.1");

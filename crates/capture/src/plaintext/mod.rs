@@ -1,5 +1,8 @@
-mod feed;
+mod event;
+mod provider;
 
-pub use feed::{
-    PlaintextChunk, PlaintextConnection, PlaintextFeedEvent, PlaintextFeedProvider, PlaintextGap,
+pub use event::{
+    PlaintextChunk, PlaintextConnection, PlaintextEvent, PlaintextEventKind, PlaintextGap,
+    PlaintextSource,
 };
+pub use provider::{PlaintextEventProvider, PlaintextEventProviderError};
