@@ -1,3 +1,4 @@
+mod attach;
 mod bridge;
 mod probe;
 mod provider;
