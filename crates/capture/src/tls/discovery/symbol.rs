@@ -1,10 +1,14 @@
-use std::{collections::BTreeSet, fs};
+use std::{
+    collections::BTreeSet,
+    fs::{self, File},
+};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 
 use object::{Object, ObjectSymbol};
 use probe_io::{BoundedFileError, BoundedFileErrorKind, read_bounded_regular_file};
+use rustix::fs::{Mode, OFlags, open};
 
 #[cfg(target_os = "linux")]
 use super::model::LibsslMappedFileIdentity;
@@ -58,6 +62,33 @@ pub(super) fn stable_symbol_order(symbols: Vec<LibsslUprobeSymbol>) -> Vec<Libss
     LibsslUprobeSymbol::supported_symbols()
         .filter(|symbol| symbols.contains(symbol))
         .collect()
+}
+
+pub(in crate::tls) fn verify_current_mapped_library_identity(
+    library: &LibsslMappedLibrary,
+) -> Result<(), LibsslUprobeSymbolFailure> {
+    let fd = open(
+        &library.read_path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|source| LibsslUprobeSymbolFailure::InspectLibrary {
+        path: library.read_path.clone(),
+        reason: std::io::Error::from(source).to_string(),
+    })?;
+    let file = File::from(fd);
+    let metadata = file
+        .metadata()
+        .map_err(|source| LibsslUprobeSymbolFailure::InspectLibrary {
+            path: library.read_path.clone(),
+            reason: source.to_string(),
+        })?;
+    if !metadata.is_file() {
+        return Err(LibsslUprobeSymbolFailure::NotRegular {
+            path: library.read_path.clone(),
+        });
+    }
+    ensure_mapped_library_identity(&metadata, library)
 }
 
 #[cfg(target_os = "linux")]
@@ -210,6 +241,30 @@ mod tests {
         let error = ObjectLibsslSymbolResolver
             .resolve_symbols(&library)
             .expect_err("library identity mismatch must be rejected before parsing");
+
+        assert!(matches!(
+            error,
+            LibsslUprobeSymbolFailure::MappedLibraryChanged {
+                read_path: actual_path,
+                expected_identity,
+                ..
+            } if actual_path == path && expected_identity == library.identity
+        ));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn current_library_identity_verifier_rejects_stale_attach_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let path = temp.path().join("libssl.so");
+        fs::write(&path, b"not an object")?;
+        let mut library = mapped_library(&path)?;
+        library.identity.inode += 1;
+
+        let error = verify_current_mapped_library_identity(&library)
+            .expect_err("stale attach target must be rejected before aya attach");
 
         assert!(matches!(
             error,

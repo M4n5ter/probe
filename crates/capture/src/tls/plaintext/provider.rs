@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use probe_core::{CapabilityKind, CapabilityState, CaptureSource, Timestamp};
@@ -9,8 +10,11 @@ use crate::{CaptureError, CaptureEvent, CaptureProvider, CaptureProviderKind, Pl
 
 use super::{
     bridge::{LibsslUprobeFlowResolver, libssl_plaintext_events_from_sample},
+    probe::{LibsslUprobePlaintextProbe, LibsslUprobePlaintextProbeConfig},
     record::LibsslUprobePlaintextSample,
 };
+
+const DEFAULT_IDLE_SLEEP: Duration = Duration::from_millis(10);
 
 pub(in crate::tls::plaintext) trait LibsslUprobePlaintextSampleSource {
     fn next_tls_plaintext_sample(
@@ -18,23 +22,55 @@ pub(in crate::tls::plaintext) trait LibsslUprobePlaintextSampleSource {
     ) -> Result<Option<LibsslUprobePlaintextSample>, CaptureError>;
 }
 
-pub(in crate::tls::plaintext) struct LibsslUprobePlaintextProvider {
+pub struct LibsslUprobePlaintextProvider {
     source: Box<dyn LibsslUprobePlaintextSampleSource>,
     resolver: Box<dyn LibsslUprobeFlowResolver>,
     pending_events: VecDeque<PlaintextEvent>,
     clock: LibsslUprobePlaintextClock,
+    idle_policy: LibsslUprobePlaintextIdlePolicy,
 }
 
 impl LibsslUprobePlaintextProvider {
+    pub fn open(
+        config: LibsslUprobePlaintextProbeConfig,
+        resolver: Box<dyn LibsslUprobeFlowResolver>,
+    ) -> Result<Self, CaptureError> {
+        let probe = LibsslUprobePlaintextProbe::load(config).map_err(|error| {
+            CaptureError::provider("libssl_uprobe_plaintext", error.to_string())
+        })?;
+        Ok(Self::from_live_source(Box::new(probe), resolver))
+    }
+
+    fn from_live_source(
+        source: Box<dyn LibsslUprobePlaintextSampleSource>,
+        resolver: Box<dyn LibsslUprobeFlowResolver>,
+    ) -> Self {
+        Self::with_idle_policy(
+            source,
+            resolver,
+            LibsslUprobePlaintextIdlePolicy::Wait(DEFAULT_IDLE_SLEEP),
+        )
+    }
+
+    #[cfg(test)]
     pub(in crate::tls::plaintext) fn new(
         source: Box<dyn LibsslUprobePlaintextSampleSource>,
         resolver: Box<dyn LibsslUprobeFlowResolver>,
+    ) -> Self {
+        Self::with_idle_policy(source, resolver, LibsslUprobePlaintextIdlePolicy::Stop)
+    }
+
+    fn with_idle_policy(
+        source: Box<dyn LibsslUprobePlaintextSampleSource>,
+        resolver: Box<dyn LibsslUprobeFlowResolver>,
+        idle_policy: LibsslUprobePlaintextIdlePolicy,
     ) -> Self {
         Self {
             source,
             resolver,
             pending_events: VecDeque::new(),
             clock: LibsslUprobePlaintextClock::default(),
+            idle_policy,
         }
     }
 
@@ -44,7 +80,14 @@ impl LibsslUprobePlaintextProvider {
                 return Ok(Some(CaptureEvent::from(event)));
             }
             let Some(sample) = self.source.next_tls_plaintext_sample()? else {
-                return Ok(None);
+                match self.idle_policy {
+                    #[cfg(test)]
+                    LibsslUprobePlaintextIdlePolicy::Stop => return Ok(None),
+                    LibsslUprobePlaintextIdlePolicy::Wait(duration) => {
+                        thread::sleep(duration);
+                        continue;
+                    }
+                }
             };
             let events = libssl_plaintext_events_from_sample(
                 &sample,
@@ -72,13 +115,20 @@ impl CaptureProvider for LibsslUprobePlaintextProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::LibsslUprobe,
-            "libssl uprobe plaintext provider consumes supplied samples; uprobe attachment is not wired here",
+            "libssl uprobe plaintext provider can attach configured uprobes and read bounded TLS plaintext samples; flow lifecycle and fd-valid ownership remain best-effort",
         )]
     }
 
     fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
         self.next_event()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibsslUprobePlaintextIdlePolicy {
+    #[cfg(test)]
+    Stop,
+    Wait(Duration),
 }
 
 #[derive(Default)]
@@ -153,6 +203,37 @@ mod tests {
         assert_eq!(bytes.stream_offset, 100);
         assert_eq!(bytes.bytes.as_ref(), b"GET /");
         assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn live_provider_waits_on_idle_source_instead_of_reporting_eof()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let resolver = Box::new(StaticFlowResolver {
+            expected: LibsslUprobeFlowLookup {
+                tgid: 22,
+                thread_pid: 11,
+                ssl_pointer: 0xfeed,
+                fd: Some(7),
+                direction: Direction::Outbound,
+            },
+            resolved: Some(demo_resolved_flow()),
+            seen: false,
+        });
+        let mut provider = LibsslUprobePlaintextProvider::with_idle_policy(
+            Box::new(IdleThenTlsPlaintextSource {
+                idle_before_samples: 1,
+                samples: VecTlsPlaintextSource::new([sample_event()]),
+            }),
+            resolver,
+            LibsslUprobePlaintextIdlePolicy::Wait(Duration::ZERO),
+        );
+
+        let Some(crate::CaptureEvent::Bytes(bytes)) = provider.next()? else {
+            panic!("live provider must wait through idle ringbuf polls");
+        };
+
+        assert_eq!(bytes.bytes.as_ref(), b"GET /");
         Ok(())
     }
 
@@ -256,6 +337,23 @@ mod tests {
             &mut self,
         ) -> Result<Option<LibsslUprobePlaintextSample>, CaptureError> {
             Ok(self.samples.pop_front())
+        }
+    }
+
+    struct IdleThenTlsPlaintextSource {
+        idle_before_samples: u32,
+        samples: VecTlsPlaintextSource,
+    }
+
+    impl LibsslUprobePlaintextSampleSource for IdleThenTlsPlaintextSource {
+        fn next_tls_plaintext_sample(
+            &mut self,
+        ) -> Result<Option<LibsslUprobePlaintextSample>, CaptureError> {
+            if self.idle_before_samples > 0 {
+                self.idle_before_samples -= 1;
+                return Ok(None);
+            }
+            self.samples.next_tls_plaintext_sample()
         }
     }
 }

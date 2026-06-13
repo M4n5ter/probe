@@ -10,3 +10,4 @@ pub use model::{
     LibsslUprobeTargetDiscoveryReport,
 };
 pub use scanner::LibsslUprobeTargetDiscovery;
+pub(in crate::tls) use symbol::verify_current_mapped_library_identity;

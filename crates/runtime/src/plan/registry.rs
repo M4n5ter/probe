@@ -101,7 +101,7 @@ fn default_platform_capabilities(
     [
         CapabilityState::unavailable(
             CapabilityKind::LibsslUprobe,
-            "libssl uprobe discovery, attach planning, ABI, capture adapter, and eBPF producer exist, but the userspace uprobe loader and ringbuf-to-plaintext runtime wiring are not implemented in this build",
+            "libssl uprobe discovery, attach planning, ABI, capture adapter, userspace uprobe loader, and eBPF producer exist, but agent dynamic attach lifecycle and flow resolver runtime wiring are not implemented in this build",
         ),
         CapabilityState::available(CapabilityKind::Http1),
         CapabilityState::available(CapabilityKind::Sse),

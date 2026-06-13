@@ -8,7 +8,7 @@ use crate::{CaptureError, PlaintextChunk, PlaintextEvent, PlaintextGap, Plaintex
 use super::record::LibsslUprobePlaintextSample;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::tls::plaintext) struct LibsslUprobeFlowLookup {
+pub struct LibsslUprobeFlowLookup {
     pub tgid: u32,
     pub thread_pid: u32,
     pub ssl_pointer: u64,
@@ -17,14 +17,14 @@ pub(in crate::tls::plaintext) struct LibsslUprobeFlowLookup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::tls::plaintext) struct LibsslResolvedFlow {
+pub struct LibsslResolvedFlow {
     pub process: ProcessContext,
     pub confidence: u8,
     pub connection: TcpConnection,
     pub start_monotonic_ns: u64,
 }
 
-pub(in crate::tls::plaintext) trait LibsslUprobeFlowResolver {
+pub trait LibsslUprobeFlowResolver {
     fn resolve_libssl_uprobe_flow(
         &mut self,
         lookup: LibsslUprobeFlowLookup,
