@@ -324,9 +324,12 @@ fn enforcement_policy_file_error(error: BoundedFileError) -> EnforcementPolicySo
 
 #[cfg(test)]
 mod tests {
-    use crate::single_response_http_server::SingleResponseHttpServer;
     use probe_config::EnforcementPolicyManifest;
     use probe_core::{Action, ProtectiveActionProfile};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     use super::*;
 
@@ -340,8 +343,7 @@ mod tests {
             protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
         };
         let body = toml::to_string(&manifest)?;
-        let server = SingleResponseHttpServer::spawn("/enforcement", "200 OK", body)?;
-        let endpoint = server.endpoint();
+        let (_server, endpoint) = remote_enforcement_source(200, body).await;
 
         let loaded = load_enforcement_policy_source(&EnforcementPolicySourcePlan::Remote {
             endpoint: endpoint.clone(),
@@ -358,15 +360,12 @@ mod tests {
             loaded.manifest.protective_actions.actions(),
             &[Action::Deny]
         );
-        server.join()?;
         Ok(())
     }
 
     #[tokio::test]
     async fn remote_source_rejects_error_status() -> Result<(), Box<dyn std::error::Error>> {
-        let server =
-            SingleResponseHttpServer::spawn("/enforcement", "503 Service Unavailable", "")?;
-        let endpoint = server.endpoint();
+        let (_server, endpoint) = remote_enforcement_source(503, "").await;
 
         let error = load_enforcement_policy_source(&EnforcementPolicySourcePlan::Remote {
             endpoint: endpoint.clone(),
@@ -379,15 +378,13 @@ mod tests {
             EnforcementPolicySourceError::RemoteStatus { endpoint: actual, status }
                 if actual == endpoint && status.as_u16() == 503
         ));
-        server.join()?;
         Ok(())
     }
 
     #[tokio::test]
     async fn remote_source_rejects_oversized_manifest() -> Result<(), Box<dyn std::error::Error>> {
         let body = "x".repeat(MAX_ENFORCEMENT_POLICY_MANIFEST_BYTES as usize + 1);
-        let server = SingleResponseHttpServer::spawn("/enforcement", "200 OK", body)?;
-        let endpoint = server.endpoint();
+        let (_server, endpoint) = remote_enforcement_source(200, body).await;
 
         let error = load_enforcement_policy_source(&EnforcementPolicySourcePlan::Remote {
             endpoint: endpoint.clone(),
@@ -400,7 +397,6 @@ mod tests {
             EnforcementPolicySourceError::RemoteTooLarge { endpoint: actual, .. }
                 if actual == endpoint
         ));
-        server.join()?;
         Ok(())
     }
 
@@ -416,5 +412,20 @@ mod tests {
             inspection,
             EnforcementPolicySourceInspection::RemoteConfigured { endpoint }
         );
+    }
+
+    async fn remote_enforcement_source(
+        status: u16,
+        body: impl Into<String>,
+    ) -> (MockServer, String) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/enforcement"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body.into()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let endpoint = format!("{}/enforcement", server.uri());
+        (server, endpoint)
     }
 }

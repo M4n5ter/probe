@@ -9,8 +9,6 @@ mod connection_enforcement;
 mod error;
 mod export;
 mod plaintext_feed;
-#[cfg(test)]
-mod single_response_http_server;
 mod status;
 mod tls_material;
 mod tls_plaintext;

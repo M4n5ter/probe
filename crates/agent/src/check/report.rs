@@ -209,9 +209,11 @@ mod tests {
     use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
     use serde_json::json;
 
-    use crate::single_response_http_server::SingleResponseHttpServer;
-
     use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     #[tokio::test]
     async fn check_report_loads_enabled_policy_bundle() -> Result<(), Box<dyn std::error::Error>> {
@@ -379,9 +381,14 @@ protective_actions = ["alert"]
             selector: None,
             protective_actions: ProtectiveActionProfile::new([Action::Reset])?,
         };
-        let server =
-            SingleResponseHttpServer::spawn("/enforcement", "200 OK", toml::to_string(&manifest)?)?;
-        let endpoint = server.endpoint();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/enforcement"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(toml::to_string(&manifest)?))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let endpoint = format!("{}/enforcement", server.uri());
         let mut config = config_with_policy(&policy_path)?;
         config.enforcement.policy.source = probe_config::EnforcementPolicySourceConfig::Remote {
             endpoint: endpoint.clone(),
@@ -418,7 +425,6 @@ protective_actions = ["alert"]
             value["enforcement"]["policy"]["active"]["source"]["endpoint"],
             json!(endpoint)
         );
-        server.join()?;
         fs::remove_dir_all(temp)?;
         Ok(())
     }
