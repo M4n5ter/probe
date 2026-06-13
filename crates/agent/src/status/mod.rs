@@ -1,8 +1,8 @@
 mod enforcement;
 mod export;
-#[cfg(test)]
-mod fixture;
 mod health;
+#[cfg(test)]
+mod plan_fixture;
 mod policy;
 mod snapshot;
 mod tls;

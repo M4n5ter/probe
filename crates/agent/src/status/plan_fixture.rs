@@ -1,8 +1,7 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    ops::Deref,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use probe_config::{
@@ -11,6 +10,23 @@ use probe_config::{
 };
 use probe_core::CapabilityState;
 use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan};
+
+#[derive(Debug)]
+pub(in crate::status) struct TestDir(tempfile::TempDir);
+
+impl Deref for TestDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.path()
+    }
+}
+
+impl AsRef<Path> for TestDir {
+    fn as_ref(&self) -> &Path {
+        self.0.path()
+    }
+}
 
 pub(in crate::status) fn runtime_plan_from_config(
     config: AgentConfig,
@@ -56,19 +72,9 @@ pub(in crate::status) fn config_with_storage_path(storage_path: PathBuf) -> Agen
     }
 }
 
-pub(in crate::status) fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {
-    let path = std::env::temp_dir().join(format!("{name}-{}", current_unix_time_ns()));
-    if Path::new(&path).exists() {
-        fs::remove_dir_all(&path)?;
-    }
-    fs::create_dir_all(&path)?;
-    Ok(path)
-}
-
-fn current_unix_time_ns() -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    u64::try_from(nanos).unwrap_or(u64::MAX)
+pub(in crate::status) fn test_dir(name: &str) -> Result<TestDir, std::io::Error> {
+    tempfile::Builder::new()
+        .prefix(&format!("{name}-"))
+        .tempdir()
+        .map(TestDir)
 }

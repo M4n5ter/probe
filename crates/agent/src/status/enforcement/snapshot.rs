@@ -295,7 +295,7 @@ mod tests {
     use probe_core::{Action, ProtectiveActionProfile, RuntimeMode, Selector};
     use serde_json::json;
 
-    use super::super::super::fixture::{
+    use super::super::super::plan_fixture::{
         config_with_storage_path, runtime_plan_from_config, test_dir,
     };
     use super::*;

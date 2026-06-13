@@ -351,7 +351,9 @@ fn current_unix_time_ns() -> u64 {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use super::super::fixture::{config_with_storage_path, runtime_plan_from_config, test_dir};
+    use super::super::plan_fixture::{
+        config_with_storage_path, runtime_plan_from_config, test_dir,
+    };
     use super::*;
     use probe_config::{
         EnforcementPolicyManifest, EnforcementPolicySourceConfig, TlsMaterialConfig,
@@ -709,7 +711,7 @@ mod tests {
     fn collect_spool_status_does_not_initialize_empty_directory()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("status-empty-spool")?;
-        let plan = runtime_plan(temp.clone(), Vec::new())?;
+        let plan = runtime_plan(temp.to_path_buf(), Vec::new())?;
 
         let spool = collect_spool_status(&plan);
 
@@ -734,7 +736,7 @@ mod tests {
         spool.append_export(test_payload(b"two"))?;
         spool.ack_export("primary", 1)?;
         drop(spool);
-        let plan = runtime_plan(temp.clone(), Vec::new())?;
+        let plan = runtime_plan(temp.to_path_buf(), Vec::new())?;
 
         let status = collect_spool_status(&plan);
         let snapshot = build_status_snapshot_at(&plan, status, 42);
@@ -755,7 +757,7 @@ mod tests {
         spool.append_export(test_payload(b"one"))?;
         spool.append_export(test_payload(b"two"))?;
         spool.ack_export("primary", 1)?;
-        let plan = runtime_plan(temp.clone(), Vec::new())?;
+        let plan = runtime_plan(temp.to_path_buf(), Vec::new())?;
 
         let status = collect_running_spool_status(&plan, &spool);
         let snapshot = build_status_snapshot_at(&plan, status, 42);
