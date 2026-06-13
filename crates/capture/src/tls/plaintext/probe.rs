@@ -15,7 +15,7 @@ use crate::{CaptureError, tls::LibsslUprobeAttachPlan};
 use super::{
     attach::{
         AttachFailurePolicy, LibsslUprobeAttachError, LibsslUprobeAttachRecipeRequest,
-        LibsslUprobeAttachedLinks, attach_recipes_from_plan, attach_uprobes,
+        LibsslUprobeAttachSession, attach_recipes_from_plan,
     },
     provider::LibsslUprobePlaintextSampleSource,
     record::LibsslUprobePlaintextSample,
@@ -65,7 +65,7 @@ pub(in crate::tls::plaintext) enum LibsslUprobePlaintextProbeError {
 
 pub(in crate::tls::plaintext) struct LibsslUprobePlaintextProbe {
     ebpf: Ebpf,
-    attached_links: LibsslUprobeAttachedLinks,
+    attach_session: LibsslUprobeAttachSession,
     events: RingBuf<MapData>,
 }
 
@@ -111,12 +111,12 @@ impl LibsslUprobePlaintextProbe {
             Ebpf::load(object.bytes()).map_err(|source| LibsslUprobePlaintextProbeError::Load {
                 source: Box::new(source),
             })?;
-        let attach_outcome =
-            attach_uprobes(&mut ebpf, attach_recipes, AttachFailurePolicy::Strict)?;
+        let mut attach_session = LibsslUprobeAttachSession::default();
+        attach_session.attach_uprobes(&mut ebpf, attach_recipes, AttachFailurePolicy::Strict)?;
         let events = open_events_ringbuf(&mut ebpf)?;
         Ok(Self {
             ebpf,
-            attached_links: attach_outcome.into_attached_links(),
+            attach_session,
             events,
         })
     }
@@ -129,17 +129,21 @@ impl LibsslUprobePlaintextProbe {
             Ebpf::load(object.bytes()).map_err(|source| LibsslUprobePlaintextProbeError::Load {
                 source: Box::new(source),
             })?;
-        let attach_outcome =
-            attach_uprobes(&mut ebpf, attach_recipes, AttachFailurePolicy::BestEffort)?;
-        if !attach_outcome.summary().has_resolvable_plaintext_recipe() {
+        let mut attach_session = LibsslUprobeAttachSession::default();
+        let attach_summary = attach_session.attach_uprobes(
+            &mut ebpf,
+            attach_recipes,
+            AttachFailurePolicy::BestEffort,
+        )?;
+        if !attach_summary.has_resolvable_plaintext_recipe() {
             return Ok(LibsslUprobePlaintextProbeLoad::Disabled {
-                reason: attach_outcome.summary().unresolvable_plaintext_reason(),
+                reason: attach_summary.unresolvable_plaintext_reason(),
             });
         }
         let events = open_events_ringbuf(&mut ebpf)?;
         Ok(LibsslUprobePlaintextProbeLoad::Enabled(Box::new(Self {
             ebpf,
-            attached_links: attach_outcome.into_attached_links(),
+            attach_session,
             events,
         })))
     }
@@ -156,7 +160,7 @@ impl LibsslUprobePlaintextProbe {
 
 impl Drop for LibsslUprobePlaintextProbe {
     fn drop(&mut self) {
-        let _ = self.attached_links.detach_all_best_effort(&mut self.ebpf);
+        let _ = self.attach_session.detach_all_best_effort(&mut self.ebpf);
     }
 }
 
