@@ -129,7 +129,6 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use super::super::source::MAX_POLICY_SOURCE_BYTES;
     use capture::ReplayProvider;
     use parsers::Http1ParserFactory;
     use pipeline::{CapturePipeline, PipelinePolicy};
@@ -142,6 +141,8 @@ mod tests {
     };
 
     use super::*;
+
+    const OVERSIZED_TEST_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
     #[test]
     fn load_configured_policy_rejects_incomplete_bundle_source()
@@ -293,7 +294,7 @@ end
         let temp = test_dir("configured-policy-too-large")?;
         let policy_path = temp.join("guard.lua");
         let file = fs::File::create(&policy_path)?;
-        file.set_len(MAX_POLICY_SOURCE_BYTES + 1)?;
+        file.set_len(OVERSIZED_TEST_FILE_BYTES)?;
         let config = config_with_policy(&policy_path)?;
 
         let Err(error) = load_configured_policy(&config) else {

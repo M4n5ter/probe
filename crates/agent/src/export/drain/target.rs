@@ -270,8 +270,9 @@ mod tests {
         export::drain::cleanup::prune_export_queue_for_sink_ids_at,
         export::drain::spooled_event::append_export_events,
         export::drain::webhook_server::{WebhookAckServer, request_header},
-        tls_material::MAX_TLS_MATERIAL_BYTES,
     };
+
+    const OVERSIZED_TEST_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
     #[test]
     fn webhook_tls_config_loads_export_materials() -> Result<(), Box<dyn std::error::Error>> {
@@ -410,7 +411,7 @@ mod tests {
         let spool = FjallSpool::open(&spool_temp)?;
         append_export_events(&spool, 1)?;
         let oversized = temp.join("oversized-ca.pem");
-        fs::File::create(&oversized)?.set_len(MAX_TLS_MATERIAL_BYTES + 1)?;
+        fs::File::create(&oversized)?.set_len(OVERSIZED_TEST_FILE_BYTES)?;
         let oversized_error =
             drain_planned_sinks(&spool, "agent-1", &export_plan_with_trust_anchor(oversized))
                 .await

@@ -128,6 +128,8 @@ mod tests {
     };
     use super::*;
 
+    const OVERSIZED_TEST_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
     #[test]
     fn policy_status_reports_metadata_only_file_without_loading_source()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -246,7 +248,7 @@ hooks = ["on_http_request_headers"]
         let temp = test_dir("status-oversized-policy")?;
         let policy_path = temp.join("guard.lua");
         let file = fs::File::create(&policy_path)?;
-        file.set_len(crate::configured_policy::MAX_POLICY_SOURCE_BYTES + 1)?;
+        file.set_len(OVERSIZED_TEST_FILE_BYTES)?;
         let mut config = config_with_storage_path(temp.join("spool"));
         config.policies = vec![PolicyConfig {
             id: "guard".to_string(),
