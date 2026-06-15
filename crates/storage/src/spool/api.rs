@@ -2,8 +2,23 @@ use std::collections::BTreeMap;
 
 use super::{
     error::StorageError,
-    record::{ExportRetentionPrune, SpoolPayload, StoredEvent},
+    record::{RetentionPrune, SpoolPayload, StoredEvent},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngressCursorOwner {
+    name: &'static str,
+}
+
+impl IngressCursorOwner {
+    pub const fn new(name: &'static str) -> Self {
+        Self { name }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.name
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpoolSnapshot {
@@ -52,7 +67,7 @@ pub trait ExportSpool {
         cutoff_unix_ns: u64,
         limit: usize,
         cursor_owners: &[&str],
-    ) -> Result<ExportRetentionPrune, StorageError>;
+    ) -> Result<RetentionPrune, StorageError>;
 }
 
 pub trait DurableSpool: ExportSpool {
@@ -60,7 +75,7 @@ pub trait DurableSpool: ExportSpool {
 
     fn read_ingress_batch(
         &self,
-        consumer: &str,
+        consumer: IngressCursorOwner,
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StorageError>;
 
@@ -70,9 +85,21 @@ pub trait DurableSpool: ExportSpool {
         limit: usize,
     ) -> Result<Vec<StoredEvent>, StorageError>;
 
-    fn ack_ingress(&self, consumer: &str, sequence: u64) -> Result<(), StorageError>;
+    fn ack_ingress(&self, consumer: IngressCursorOwner, sequence: u64) -> Result<(), StorageError>;
 
-    fn ingress_cursor(&self, consumer: &str) -> Result<u64, StorageError>;
+    fn ingress_cursor(&self, consumer: IngressCursorOwner) -> Result<u64, StorageError>;
 
     fn append_export(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError>;
+
+    /// Removes expired ingress journal records from the durable prefix.
+    ///
+    /// The typed cursor owners are advanced through the retired prefix in the same
+    /// storage batch. This is an explicit retention tradeoff: records older than
+    /// the deadline are no longer recoverable.
+    fn prune_expired_ingress_prefix(
+        &self,
+        cutoff_unix_ns: u64,
+        limit: usize,
+        consumers: &[IngressCursorOwner],
+    ) -> Result<RetentionPrune, StorageError>;
 }

@@ -4,6 +4,7 @@ mod error;
 mod export;
 mod registry;
 mod runtime_plan;
+mod storage;
 mod tls;
 mod validation;
 
@@ -17,11 +18,12 @@ pub use enforcement::{
 };
 pub use error::RuntimeError;
 pub use export::{
-    ExportFailureBackoffPlan, ExportPlan, ExportRetentionPlan, ExportSinkPlan, ExportSinkTlsPlan,
-    ExportSinkWorkerPlan, ExportWorkerPlan,
+    ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
+    ExportWorkerPlan,
 };
 pub use registry::{PlatformProbeResults, ProviderRegistry};
 pub use runtime_plan::{RuntimePlan, validate_static_runtime_config};
+pub use storage::{ExportRetentionPlan, IngressRetentionPlan, StoragePlan, StorageRetentionPlan};
 pub use tls::{
     ExportTlsMaterialPlan, TlsMaterialPlan, TlsPlaintextCapabilityPlan, TlsPlaintextMaterialPlan,
     TlsPlaintextPlan, TlsPlan,

@@ -56,7 +56,7 @@ pub struct ExporterTlsStatusSnapshot {
 
 pub(in crate::status) fn export_status(plan: &RuntimePlan) -> ExportStatusSnapshot {
     ExportStatusSnapshot {
-        retention: plan.export.retention.clone(),
+        retention: plan.storage.retention.export.clone(),
     }
 }
 
@@ -414,6 +414,7 @@ mod tests {
             path: PathBuf::from("/tmp/sssa-spool"),
             mode: RuntimeMode::Available,
             reason: None,
+            ingress_retention: Default::default(),
             ingress_last_sequence: Some(ingress_last_sequence),
             export_last_sequence: Some(export_last_sequence),
         }

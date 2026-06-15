@@ -27,7 +27,7 @@ fn replay_provider_writes_ingress_and_export_lanes() -> Result<(), Box<dyn std::
     assert_eq!(summary.ingress_records_journaled, 1);
     assert_eq!(summary.ingress_records_processed, 1);
     assert_eq!(summary.export_events_written, 2);
-    assert_eq!(spool.read_ingress_batch("debug", 10)?.len(), 1);
+    assert_eq!(spool.read_ingress_batch_after(0, 10)?.len(), 1);
     assert_eq!(spool.read_export_batch("sink", 10)?.len(), 2);
     Ok(())
 }

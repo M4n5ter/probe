@@ -155,11 +155,12 @@ fn next_due_after(now: Instant, interval: Duration) -> Instant {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::Cell,
+        cell::{Cell, RefCell},
         rc::Rc,
         time::{Duration, Instant},
     };
 
+    use capture::{LibsslUprobeAttachTargetSnapshot, LibsslUprobeReconcileTargetBucket};
     use probe_core::CapabilityState;
 
     use super::super::planning::{LibsslUprobeAttachPlanBlocked, empty_attach_plan};
@@ -229,16 +230,12 @@ mod tests {
     #[test]
     fn sidecar_reports_successful_reconcile_to_observer() -> Result<(), Box<dyn std::error::Error>>
     {
-        let observed = Rc::new(Cell::new(None));
+        let observed = Rc::new(RefCell::new(None));
         let mut sidecar = LibsslUprobePlaintextSidecar::with_schedule(
             FakeSidecarProvider {
                 reconciled: Rc::new(Cell::new(false)),
                 polled: Rc::new(Cell::new(false)),
-                reconcile_result: LibsslUprobePlaintextReconcile {
-                    attached_targets: 2,
-                    detached_targets: 1,
-                    active_targets: 3,
-                },
+                reconcile_result: reconcile_result(2, 1, 3),
             },
             LibsslUprobeAttachPlanner::from_results([Ok(empty_attach_plan())]),
             FixedIntervalSchedule::due_at(Duration::from_millis(10), Instant::now()),
@@ -251,11 +248,12 @@ mod tests {
 
         assert_eq!(poll, CapturePoll::Idle);
         let reconcile = observed
-            .get()
+            .borrow()
+            .clone()
             .expect("successful reconcile counters should be reported");
-        assert_eq!(reconcile.attached_targets, 2);
-        assert_eq!(reconcile.detached_targets, 1);
-        assert_eq!(reconcile.active_targets, 3);
+        assert_eq!(reconcile.attached_target_count(), 2);
+        assert_eq!(reconcile.detached_target_count(), 1);
+        assert_eq!(reconcile.active_target_count(), 3);
         Ok(())
     }
 
@@ -266,12 +264,12 @@ mod tests {
     }
 
     struct FakeReconcileObserver {
-        observed: Rc<Cell<Option<LibsslUprobePlaintextReconcile>>>,
+        observed: Rc<RefCell<Option<LibsslUprobePlaintextReconcile>>>,
     }
 
     impl LibsslUprobePlaintextReconcileObserver for FakeReconcileObserver {
         fn record_reconcile_success(&self, result: LibsslUprobePlaintextReconcile) {
-            self.observed.set(Some(result));
+            *self.observed.borrow_mut() = Some(result);
         }
     }
 
@@ -281,7 +279,7 @@ mod tests {
             _next_plan: LibsslUprobeAttachPlan,
         ) -> Result<LibsslUprobePlaintextReconcile, CaptureError> {
             self.reconciled.set(true);
-            Ok(self.reconcile_result)
+            Ok(self.reconcile_result.clone())
         }
     }
 
@@ -305,10 +303,34 @@ mod tests {
     }
 
     fn empty_reconcile_result() -> LibsslUprobePlaintextReconcile {
+        reconcile_result(0, 0, 0)
+    }
+
+    fn reconcile_result(
+        attached: usize,
+        detached: usize,
+        active: usize,
+    ) -> LibsslUprobePlaintextReconcile {
         LibsslUprobePlaintextReconcile {
-            attached_targets: 0,
-            detached_targets: 0,
-            active_targets: 0,
+            attached_targets: target_snapshots("attached", attached),
+            detached_targets: target_snapshots("detached", detached),
+            active_targets: target_snapshots("active", active),
         }
+    }
+
+    fn target_snapshots(kind: &str, count: usize) -> LibsslUprobeReconcileTargetBucket {
+        let targets = (0..count)
+            .map(|index| LibsslUprobeAttachTargetSnapshot {
+                pid: 1_000 + index as u32,
+                start_time_ticks: 10_000 + index as u64,
+                mapped_path: format!("/usr/lib/{kind}-{index}.so").into(),
+                read_path: format!("/proc/1/root/usr/lib/{kind}-{index}.so").into(),
+                device_major: 8,
+                device_minor: 1,
+                inode: index as u64 + 1,
+                deleted: false,
+            })
+            .collect::<Vec<_>>();
+        LibsslUprobeReconcileTargetBucket::new(targets)
     }
 }

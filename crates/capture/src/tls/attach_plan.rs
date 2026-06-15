@@ -116,6 +116,33 @@ impl LibsslUprobeAttachTargetId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibsslUprobeAttachTargetSnapshot {
+    pub pid: u32,
+    pub start_time_ticks: u64,
+    pub mapped_path: std::path::PathBuf,
+    pub read_path: std::path::PathBuf,
+    pub device_major: u32,
+    pub device_minor: u32,
+    pub inode: u64,
+    pub deleted: bool,
+}
+
+impl From<LibsslUprobeAttachTargetId> for LibsslUprobeAttachTargetSnapshot {
+    fn from(target: LibsslUprobeAttachTargetId) -> Self {
+        Self {
+            pid: target.process.pid,
+            start_time_ticks: target.process.start_time_ticks,
+            mapped_path: target.library.mapped_path,
+            read_path: target.library.read_path,
+            device_major: target.library.identity.device_major,
+            device_minor: target.library.identity.device_minor,
+            inode: target.library.identity.inode,
+            deleted: target.library.deleted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibsslUprobeAttachProcess {
     process: ProcessGeneration,
     targets: Vec<LibsslUprobeAttachTarget>,

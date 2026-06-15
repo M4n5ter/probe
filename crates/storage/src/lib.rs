@@ -1,6 +1,6 @@
 mod spool;
 
 pub use spool::{
-    DurableSpool, ExportRetentionPrune, ExportSpool, FjallSpool, SpoolPayload, SpoolProbe,
-    SpoolSnapshot, StorageError, StoredEvent,
+    DurableSpool, ExportSpool, FjallSpool, IngressCursorOwner, RetentionPrune, SpoolPayload,
+    SpoolProbe, SpoolSnapshot, StorageError, StoredEvent,
 };

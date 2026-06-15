@@ -19,10 +19,6 @@ impl LibsslUprobeAttachedLinks {
         self.links_by_target.keys().cloned()
     }
 
-    pub(super) fn target_count(&self) -> usize {
-        self.links_by_target.len()
-    }
-
     pub(super) fn detach_targets_best_effort(
         &mut self,
         ebpf: &mut Ebpf,

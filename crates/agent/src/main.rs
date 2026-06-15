@@ -8,8 +8,10 @@ mod configured_policy;
 mod connection_enforcement;
 mod error;
 mod export;
+mod periodic_worker;
 mod plaintext_feed;
 mod status;
+mod storage_retention;
 mod tls_material;
 mod tls_plaintext;
 

@@ -26,7 +26,12 @@ pub use export::{
     ExporterTransport, ExporterWorkerConfig,
 };
 pub use policy::PolicyConfig;
-pub use storage::{ExportQueueRetentionConfig, StorageConfig, StorageRetentionConfig};
+pub use storage::{
+    DEFAULT_EXPORT_RETENTION_PRUNE_BATCH_LIMIT, DEFAULT_EXPORT_RETENTION_SWEEP_INTERVAL_MS,
+    DEFAULT_INGRESS_RETENTION_PRUNE_BATCH_LIMIT, DEFAULT_INGRESS_RETENTION_SWEEP_INTERVAL_MS,
+    ExportQueueRetentionConfig, IngressJournalRetentionConfig, StorageConfig,
+    StorageRetentionConfig,
+};
 pub use tls::{
     DEFAULT_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS, MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS,
     PlaintextTlsConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind, TlsPlaintextProvider,

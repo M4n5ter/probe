@@ -12,7 +12,10 @@ use thiserror::Error;
 
 use crate::{
     CaptureError,
-    tls::{LibsslUprobeAttachPlan, LibsslUprobeAttachState, LibsslUprobeReconcileReport},
+    tls::{
+        LibsslUprobeAttachPlan, LibsslUprobeAttachState, LibsslUprobeAttachTargetId,
+        LibsslUprobeAttachTargetSnapshot, LibsslUprobeReconcileReport,
+    },
 };
 
 use super::{
@@ -24,6 +27,8 @@ use super::{
     provider::LibsslUprobePlaintextSampleSource,
     record::LibsslUprobePlaintextSample,
 };
+
+pub const MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibsslUprobePlaintextProbeConfig {
@@ -189,11 +194,13 @@ impl LibsslUprobePlaintextProbe {
         report: LibsslUprobeReconcileReport,
         attach_recipes: &[LibsslUprobeAttachRecipeRequest],
     ) -> Result<LibsslUprobePlaintextReconcile, LibsslUprobePlaintextProbeError> {
-        let detached_targets = report.stale_targets.len();
+        let detached_target_ids = report.stale_targets.to_vec();
+        let detached_targets = reconcile_target_bucket(detached_target_ids.iter().cloned());
         self.attach_session
-            .detach_targets_best_effort(&mut self.ebpf, report.stale_targets.iter().cloned())?;
+            .detach_targets_best_effort(&mut self.ebpf, detached_target_ids)?;
 
-        let mut attached_targets = 0;
+        let mut attached_count = 0;
+        let mut attached_targets = LibsslUprobeReconcileTargetBucket::default();
         let mut attach_summary = None;
         if !attach_recipes.is_empty() {
             let summary = self.attach_session.attach_uprobes(
@@ -201,12 +208,16 @@ impl LibsslUprobePlaintextProbe {
                 attach_recipes,
                 AttachFailurePolicy::BestEffort,
             )?;
-            attached_targets = summary.committed_targets().count();
+            let committed_targets = summary.committed_targets().collect::<Vec<_>>();
+            attached_count = committed_targets.len();
+            attached_targets = reconcile_target_bucket(committed_targets);
             attach_summary = Some(summary);
         }
-        let active_targets = self.attach_session.attached_target_count();
+        let active_target_ids = self.attach_session.attached_targets().collect::<Vec<_>>();
+        let active_count = active_target_ids.len();
+        let active_targets = reconcile_target_bucket(active_target_ids);
         if let Some(reason) = attach_summary.as_ref().and_then(|summary| {
-            unresolvable_reconcile_attach_reason(summary, attached_targets, active_targets)
+            unresolvable_reconcile_attach_reason(summary, attached_count, active_count)
         }) {
             return Err(LibsslUprobePlaintextProbeError::UnresolvableAttach { reason });
         }
@@ -255,11 +266,64 @@ impl LibsslUprobePlaintextProbe {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibsslUprobePlaintextReconcile {
-    pub attached_targets: usize,
-    pub detached_targets: usize,
-    pub active_targets: usize,
+    pub attached_targets: LibsslUprobeReconcileTargetBucket,
+    pub detached_targets: LibsslUprobeReconcileTargetBucket,
+    pub active_targets: LibsslUprobeReconcileTargetBucket,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibsslUprobeReconcileTargetBucket {
+    total_count: usize,
+    targets: Vec<LibsslUprobeAttachTargetSnapshot>,
+}
+
+impl LibsslUprobeReconcileTargetBucket {
+    pub fn new(targets: impl IntoIterator<Item = LibsslUprobeAttachTargetSnapshot>) -> Self {
+        let mut total_count = 0;
+        let mut snapshots = Vec::new();
+        for target in targets {
+            total_count += 1;
+            if snapshots.len() < MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET {
+                snapshots.push(target);
+            }
+        }
+        Self {
+            total_count,
+            targets: snapshots,
+        }
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.total_count
+    }
+
+    pub fn targets(&self) -> &[LibsslUprobeAttachTargetSnapshot] {
+        &self.targets
+    }
+
+    pub fn into_targets(self) -> Vec<LibsslUprobeAttachTargetSnapshot> {
+        self.targets
+    }
+
+    pub fn omitted_count(&self) -> usize {
+        self.total_count - self.targets.len()
+    }
+}
+
+impl LibsslUprobePlaintextReconcile {
+    pub fn attached_target_count(&self) -> usize {
+        self.attached_targets.total_count()
+    }
+
+    pub fn detached_target_count(&self) -> usize {
+        self.detached_targets.total_count()
+    }
+
+    pub fn active_target_count(&self) -> usize {
+        self.active_targets.total_count()
+    }
 }
 
 impl Drop for LibsslUprobePlaintextProbe {
@@ -278,6 +342,16 @@ fn unresolvable_reconcile_attach_reason(
     } else {
         None
     }
+}
+
+fn reconcile_target_bucket(
+    targets: impl IntoIterator<Item = LibsslUprobeAttachTargetId>,
+) -> LibsslUprobeReconcileTargetBucket {
+    LibsslUprobeReconcileTargetBucket::new(
+        targets
+            .into_iter()
+            .map(LibsslUprobeAttachTargetSnapshot::from),
+    )
 }
 
 impl LibsslUprobePlaintextSampleSource for LibsslUprobePlaintextProbe {

@@ -7,7 +7,7 @@ use std::{
 use pipeline::PipelineRuntimeMetricsSnapshot;
 use probe_config::{CaptureBackend, CaptureSelection};
 use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, RuntimeMode};
-use runtime::{CapturePlanMode, RuntimePlan};
+use runtime::{CapturePlanMode, IngressRetentionPlan, RuntimePlan};
 use serde::Serialize;
 use storage::{FjallSpool, SpoolProbe, SpoolSnapshot};
 
@@ -64,6 +64,7 @@ pub struct SpoolStatusSnapshot {
     pub path: PathBuf,
     pub mode: RuntimeMode,
     pub reason: Option<String>,
+    pub ingress_retention: IngressRetentionPlan,
     pub ingress_last_sequence: Option<u64>,
     pub export_last_sequence: Option<u64>,
 }
@@ -250,6 +251,7 @@ fn build_status_snapshot_at_with_runtime(
         path: spool.path,
         mode: spool.mode,
         reason: spool.reason,
+        ingress_retention: plan.storage.retention.ingress.clone(),
         ingress_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_ingress_sequence),
         export_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_export_sequence),
     };
@@ -403,7 +405,11 @@ mod tests {
 
     #[test]
     fn status_snapshot_reports_sink_lag_and_health() -> Result<(), Box<dyn std::error::Error>> {
-        let plan = runtime_plan_with_exporter()?;
+        let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
+        config.storage.retention.ingress.max_age_ms = Some(120_000);
+        config.storage.retention.ingress.sweep_interval_ms = 7_000;
+        config.storage.retention.ingress.prune_batch_limit = 256;
+        let plan = runtime_plan_from_config(config, Vec::new())?;
         let spool = SpoolStatusInput::available(
             PathBuf::from("/tmp/sssa-spool"),
             SpoolSnapshot {
@@ -418,6 +424,15 @@ mod tests {
         assert_eq!(snapshot.generated_unix_ns, 42);
         assert_eq!(snapshot.health.mode, RuntimeMode::Available);
         assert_eq!(snapshot.spool.export_last_sequence, Some(5));
+        assert_eq!(snapshot.spool.ingress_retention.max_age_ms, Some(120_000));
+        assert_eq!(
+            snapshot.spool.ingress_retention.sweep_interval_ms.get(),
+            7_000
+        );
+        assert_eq!(
+            snapshot.spool.ingress_retention.prune_batch_limit.get(),
+            256
+        );
         assert_eq!(snapshot.exporters.len(), 1);
         assert_eq!(snapshot.exporters[0].cursor, Some(3));
         assert_eq!(snapshot.exporters[0].lag, Some(2));
@@ -464,6 +479,18 @@ mod tests {
         assert_eq!(
             value["tls"]["plaintext"]["capability"]["kind"],
             json!("not_required")
+        );
+        assert_eq!(
+            value["spool"]["ingress_retention"]["max_age_ms"],
+            json!(120_000)
+        );
+        assert_eq!(
+            value["spool"]["ingress_retention"]["sweep_interval_ms"],
+            json!(7_000)
+        );
+        assert_eq!(
+            value["spool"]["ingress_retention"]["prune_batch_limit"],
+            json!(256)
         );
         assert_eq!(snapshot.metrics.export.total_lag, Some(2));
         Ok(())

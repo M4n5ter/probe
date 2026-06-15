@@ -5,7 +5,7 @@ mod lane;
 mod marker;
 mod record;
 
-pub use api::{DurableSpool, ExportSpool, SpoolProbe, SpoolSnapshot};
+pub use api::{DurableSpool, ExportSpool, IngressCursorOwner, SpoolProbe, SpoolSnapshot};
 pub use error::StorageError;
 pub use fjall::FjallSpool;
-pub use record::{ExportRetentionPrune, SpoolPayload, StoredEvent};
+pub use record::{RetentionPrune, SpoolPayload, StoredEvent};

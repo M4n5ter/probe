@@ -30,7 +30,7 @@ fn run_provider_with_options_stops_after_max_capture_events()
     assert_eq!(summary.capture_events_read, 1);
     assert_eq!(summary.ingress_records_journaled, 1);
     assert_eq!(summary.ingress_records_processed, 1);
-    assert_eq!(spool.read_ingress_batch("debug", 10)?.len(), 1);
+    assert_eq!(spool.read_ingress_batch_after(0, 10)?.len(), 1);
     assert_eq!(spool.read_export_batch("sink", 10)?.len(), 1);
     Ok(())
 }
@@ -50,7 +50,7 @@ fn run_provider_with_zero_max_events_does_not_read_provider()
     assert_eq!(summary.capture_events_read, 0);
     assert_eq!(summary.ingress_records_journaled, 0);
     assert_eq!(summary.ingress_records_processed, 0);
-    assert!(spool.read_ingress_batch("debug", 10)?.is_empty());
+    assert!(spool.read_ingress_batch_after(0, 10)?.is_empty());
     assert!(spool.read_export_batch("sink", 10)?.is_empty());
     Ok(())
 }

@@ -38,7 +38,7 @@ pub struct StoredEvent {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ExportRetentionPrune {
+pub struct RetentionPrune {
     pub pruned_count: u64,
     pub retired_through: Option<u64>,
 }

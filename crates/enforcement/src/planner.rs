@@ -1,11 +1,11 @@
 use probe_core::{
-    Action, CompiledSelector, EnforcementDecision, EnforcementMode, EnforcementOutcome,
-    EventEnvelope, ProtectiveActionError, ProtectiveActionProfile, Selector, SelectorError,
+    Action, EnforcementDecision, EnforcementMode, EnforcementOutcome, EventEnvelope,
+    ProcessContext, ProtectiveActionError, ProtectiveActionProfile, Selector, SelectorError,
     Verdict,
 };
 use thiserror::Error;
 
-use crate::{EnforcementBackend, EnforcementBackendRequest};
+use crate::{EnforcementBackend, EnforcementBackendRequest, TargetScope};
 
 #[derive(Debug, Error)]
 pub enum EnforcementError {
@@ -34,7 +34,7 @@ pub trait EnforcementPlanner {
 
 pub struct ScopedEnforcementPlanner {
     mode: EnforcementMode,
-    selector: Option<CompiledSelector>,
+    scope: TargetScope,
     protective_actions: ProtectiveActionProfile,
     backend: Option<Box<dyn EnforcementBackend>>,
 }
@@ -69,7 +69,7 @@ impl ScopedEnforcementPlanner {
         }
         Ok(Self {
             mode,
-            selector: selector.map(Selector::compile).transpose()?,
+            scope: TargetScope::compile(selector)?,
             protective_actions,
             backend: None,
         })
@@ -82,7 +82,7 @@ impl ScopedEnforcementPlanner {
     ) -> Result<Self, EnforcementError> {
         Ok(Self {
             mode: EnforcementMode::Enforce,
-            selector: selector.map(Selector::compile).transpose()?,
+            scope: TargetScope::compile(selector)?,
             protective_actions,
             backend: Some(Box::new(backend)),
         })
@@ -96,15 +96,12 @@ impl ScopedEnforcementPlanner {
         self.protective_actions.actions()
     }
 
-    fn selector_matches(&self, trigger: &EventEnvelope) -> bool {
-        let Some(selector) = &self.selector else {
-            return true;
-        };
+    pub fn target_scope(&self) -> &TargetScope {
+        &self.scope
+    }
 
-        trigger.kind.direction().map_or_else(
-            || selector.matches_flow_without_direction(&trigger.flow),
-            |direction| selector.matches_flow(&trigger.flow, direction),
-        )
+    pub fn may_include_process(&self, process: &ProcessContext) -> bool {
+        self.scope.may_include_process(process)
     }
 }
 
@@ -117,7 +114,7 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
             return Ok(None);
         }
 
-        let selector_matched = self.selector_matches(request.trigger);
+        let selector_matched = self.scope.matches_trigger(request.trigger);
         let (outcome, effective_action, reason) = if !selector_matched {
             (
                 EnforcementOutcome::SelectorMiss,

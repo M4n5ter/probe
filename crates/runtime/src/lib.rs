@@ -5,7 +5,8 @@ pub use plan::{
     CaptureProviderSelectionPolicy, EnforcementCapabilityPlan, EnforcementPlan,
     EnforcementPolicySourceKind, EnforcementPolicySourcePlan, ExportFailureBackoffPlan, ExportPlan,
     ExportRetentionPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
-    ExportTlsMaterialPlan, ExportWorkerPlan, PlatformProbeResults, ProviderRegistry, RuntimeError,
-    RuntimePlan, TlsMaterialPlan, TlsPlaintextCapabilityPlan, TlsPlaintextMaterialPlan,
-    TlsPlaintextPlan, TlsPlan, validate_static_runtime_config,
+    ExportTlsMaterialPlan, ExportWorkerPlan, IngressRetentionPlan, PlatformProbeResults,
+    ProviderRegistry, RuntimeError, RuntimePlan, StoragePlan, StorageRetentionPlan,
+    TlsMaterialPlan, TlsPlaintextCapabilityPlan, TlsPlaintextMaterialPlan, TlsPlaintextPlan,
+    TlsPlan, validate_static_runtime_config,
 };

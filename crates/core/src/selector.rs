@@ -5,7 +5,7 @@ use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{Direction, FlowContext, ProcessContext};
+use crate::{Direction, EventEnvelope, FlowContext, ProcessContext};
 
 #[derive(Debug, Error)]
 pub enum SelectorError {
@@ -115,6 +115,13 @@ impl CompiledSelector {
 
     pub fn matches_flow_without_direction(&self, flow: &FlowContext) -> bool {
         self.node.matches_flow(flow, None).unwrap_or(false)
+    }
+
+    pub fn matches_event(&self, event: &EventEnvelope) -> bool {
+        event.kind.direction().map_or_else(
+            || self.matches_flow_without_direction(&event.flow),
+            |direction| self.matches_flow(&event.flow, direction),
+        )
     }
 
     /// Returns false only when `process` can be ruled out before flow attribution.
@@ -383,8 +390,9 @@ fn unknown_cmdline(process: &ProcessContext) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AddressPort, Direction, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity,
-        ProcessSelector, Selector, SelectorRegistry, TrafficSelector, TransportProtocol,
+        AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
+        HttpHeaders, ProcessContext, ProcessIdentity, ProcessSelector, Selector, SelectorRegistry,
+        Timestamp, TrafficSelector, TransportProtocol,
     };
 
     #[test]
@@ -406,6 +414,26 @@ mod tests {
         let flow = demo_flow();
         assert!(selector.matches_flow(&flow, Direction::Outbound));
         assert!(!selector.matches_flow(&flow, Direction::Inbound));
+        Ok(())
+    }
+
+    #[test]
+    fn selector_matches_event_with_event_direction() -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector {
+                names: vec!["demo".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                remote_ports: vec![80],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+
+        assert!(selector.matches_event(&http_event(Direction::Outbound)));
+        assert!(!selector.matches_event(&http_event(Direction::Inbound)));
         Ok(())
     }
 
@@ -656,6 +684,28 @@ mod tests {
             socket_cookie: Some(7),
             attribution_confidence: 100,
         }
+    }
+
+    fn http_event(direction: Direction) -> EventEnvelope {
+        EventEnvelope::new(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            demo_flow(),
+            CaptureSource::Replay,
+            "test",
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some("/".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        )
     }
 
     fn partial_process() -> ProcessContext {

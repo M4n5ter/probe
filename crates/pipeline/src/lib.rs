@@ -2,7 +2,8 @@ mod pipeline;
 mod runtime_metrics;
 
 pub use pipeline::{
-    CapturePipeline, PipelineError, PipelinePolicy, PipelineRunOptions, PipelineSummary,
+    CapturePipeline, PARSER_INGRESS_CURSOR_OWNER, PipelineError, PipelinePolicy,
+    PipelineRunOptions, PipelineSummary,
 };
 pub use runtime_metrics::{
     EnforcementRuntimeMetricsSnapshot, PipelineRuntimeMetrics, PipelineRuntimeMetricsSnapshot,

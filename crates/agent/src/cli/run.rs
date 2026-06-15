@@ -28,11 +28,9 @@ use crate::{
     configured_policy::{LoadedPolicySource, load_configured_policy, load_policy_source},
     connection_enforcement::{self, ConnectionEnforcementRuntime},
     error::AgentError,
-    export::{
-        ExportRetentionWorkerConfig, ExportWorker, ExportWorkerConfig, drain_planned_sinks,
-        drain_replay_webhook, spawn_export_retention_worker,
-    },
+    export::{ExportWorker, ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook},
     status::{build_status_snapshot, collect_spool_status},
+    storage_retention::{StorageRetentionWorkerConfig, spawn_storage_retention_workers},
     tls_plaintext::TlsPlaintextRuntimeState,
 };
 
@@ -190,8 +188,8 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 })
                 .transpose()?;
             let export_worker = export_worker.map(|worker| worker.spawn(Arc::clone(&spool)));
-            let export_retention_worker = export_retention_worker_config_from_plan(&plan)
-                .map(|config| spawn_export_retention_worker(Arc::clone(&spool), config));
+            let mut storage_retention_config = storage_retention_worker_config_from_plan(&plan);
+            let mut storage_retention_worker = None;
             let mut pipeline = CapturePipeline::new(
                 spool.as_ref(),
                 &mut parser_factory,
@@ -211,6 +209,9 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let summary_result = (|| {
                 let mut summary =
                     pipeline.recover_ingress_journal_until_idle(INGRESS_RECOVERY_BATCH_SIZE)?;
+                storage_retention_worker = storage_retention_config
+                    .take()
+                    .map(|config| spawn_storage_retention_workers(Arc::clone(&spool), config));
                 let mut pipeline = pipeline.with_enforcement_planner(&mut enforcement.planner);
                 let mut provider = build_capture_provider(&plan, Some(&tls_plaintext_runtime))?;
                 let capture_summary = pipeline.run_provider_with_options(
@@ -226,7 +227,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             if let Some(worker) = export_worker {
                 worker.stop().await;
             }
-            if let Some(worker) = export_retention_worker {
+            if let Some(worker) = storage_retention_worker {
                 worker.stop().await;
             }
             let drain_result =
@@ -315,13 +316,13 @@ fn build_runtime_composition(config: AgentConfig) -> Result<RuntimeComposition, 
 }
 
 fn export_worker_config_from_plan(plan: &RuntimePlan) -> Option<ExportWorkerConfig> {
-    ExportWorkerConfig::from_export_plan(plan.config.agent_id.clone(), &plan.export)
+    ExportWorkerConfig::from_plans(plan.config.agent_id.clone(), &plan.export)
 }
 
-fn export_retention_worker_config_from_plan(
+fn storage_retention_worker_config_from_plan(
     plan: &RuntimePlan,
-) -> Option<ExportRetentionWorkerConfig> {
-    ExportRetentionWorkerConfig::from_export_plan(&plan.export)
+) -> Option<StorageRetentionWorkerConfig> {
+    StorageRetentionWorkerConfig::from_plans(&plan.export, &plan.storage)
 }
 
 fn admin_server_config_from_plan(plan: &RuntimePlan) -> Option<AdminServerConfig> {

@@ -12,7 +12,7 @@ pub use attach_inventory::{
 pub use attach_plan::{
     LibsslUprobeAttachKind, LibsslUprobeAttachPlan, LibsslUprobeAttachPoint,
     LibsslUprobeAttachProcess, LibsslUprobeAttachRecipe, LibsslUprobeAttachTarget,
-    LibsslUprobeAttachTargetId,
+    LibsslUprobeAttachTargetId, LibsslUprobeAttachTargetSnapshot,
 };
 pub(in crate::tls) use attach_reconcile::{LibsslUprobeAttachState, LibsslUprobeReconcileReport};
 pub(in crate::tls) use discovery::LibsslUprobeProcessVerifier;
@@ -27,5 +27,6 @@ pub use keylog::{TlsKeyLogField, TlsKeyLogLabelCount, TlsKeyLogParseError, TlsKe
 pub use plaintext::{
     LibsslResolvedFlow, LibsslUprobeFlowLookup, LibsslUprobeFlowResolver,
     LibsslUprobePlaintextOpen, LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
-    LibsslUprobePlaintextReconcile,
+    LibsslUprobePlaintextReconcile, LibsslUprobeReconcileTargetBucket,
+    MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET,
 };

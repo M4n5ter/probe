@@ -7,16 +7,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use runtime::{
-    ExportFailureBackoffPlan, ExportPlan, ExportRetentionPlan, ExportSinkPlan, ExportWorkerPlan,
-};
+use runtime::{ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportWorkerPlan};
 use serde::Serialize;
 use storage::ExportSpool;
 use tokio::sync::Notify;
 
 use super::{
     ExportDrainError, ExportDrainFailureReason,
-    cleanup::prune_export_queue_for_sinks,
+    cleanup::prune_export_acknowledged_prefix_for_sinks,
     mode::SinkDrainMode,
     target::{drain_export_sink_with_mode, finish_export_sink_drain},
 };
@@ -37,7 +35,6 @@ pub struct ExportWorker {
 pub struct ExportWorkerConfig {
     agent_id: String,
     sinks: Vec<ExportSinkPlan>,
-    retention: ExportRetentionPlan,
     interval: Duration,
     sink_timeout: Duration,
     failure_backoff: ExportWorkerBackoffPolicy,
@@ -111,7 +108,6 @@ impl ExportWorkerConfig {
     fn fixed_interval_bounded(
         agent_id: String,
         sinks: Vec<ExportSinkPlan>,
-        retention: ExportRetentionPlan,
         interval: Duration,
         sink_timeout: Duration,
         failure_backoff: ExportWorkerBackoffPolicy,
@@ -119,15 +115,14 @@ impl ExportWorkerConfig {
         Self {
             agent_id,
             sinks,
-            retention,
             interval,
             sink_timeout,
             failure_backoff,
         }
     }
 
-    pub fn from_export_plan(agent_id: String, plan: &ExportPlan) -> Option<Self> {
-        match &plan.worker {
+    pub fn from_plans(agent_id: String, export: &ExportPlan) -> Option<Self> {
+        match &export.worker {
             ExportWorkerPlan::Disabled { .. } => None,
             ExportWorkerPlan::FixedIntervalBounded {
                 interval_ms,
@@ -136,8 +131,7 @@ impl ExportWorkerConfig {
                 ..
             } => Some(Self::fixed_interval_bounded(
                 agent_id,
-                plan.sinks.clone(),
-                plan.retention.clone(),
+                export.sinks.clone(),
                 Duration::from_millis(*interval_ms),
                 Duration::from_millis(*sink_timeout_ms),
                 ExportWorkerBackoffPolicy::from(*failure_backoff),
@@ -352,7 +346,7 @@ async fn drain_export_sinks_once(
     };
     finish_export_sink_drain(
         drain_result,
-        prune_export_queue_for_sinks(spool, &config.sinks, &config.retention),
+        prune_export_acknowledged_prefix_for_sinks(spool, &config.sinks),
     )
 }
 
@@ -403,9 +397,9 @@ mod tests {
     };
     use probe_core::{CapabilityKind, CapabilityState};
     use runtime::{
-        self, ExportFailureBackoffPlan, ExportPlan, ExportRetentionPlan, ExportSinkPlan,
-        ExportSinkTlsPlan, ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan,
-        ProviderRegistry, RuntimePlan,
+        self, ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan,
+        ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan, ProviderRegistry,
+        RuntimePlan,
     };
     use storage::FjallSpool;
 
@@ -506,10 +500,9 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
-            retention: ExportRetentionPlan::default(),
             sinks: Vec::new(),
         };
-        assert!(ExportWorkerConfig::from_export_plan("agent-1".to_string(), &disabled).is_none());
+        assert!(ExportWorkerConfig::from_plans("agent-1".to_string(), &disabled).is_none());
         let non_webhook = ExportPlan {
             worker: ExportWorkerPlan::FixedIntervalBounded {
                 interval_ms: 10,
@@ -517,7 +510,6 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(30_000),
             },
-            retention: ExportRetentionPlan::default(),
             sinks: vec![ExportSinkPlan {
                 id: "grpc".to_string(),
                 transport: ExporterTransport::Grpc,
@@ -529,9 +521,7 @@ mod tests {
             }],
         };
 
-        assert!(
-            ExportWorkerConfig::from_export_plan("agent-1".to_string(), &non_webhook).is_some()
-        );
+        assert!(ExportWorkerConfig::from_plans("agent-1".to_string(), &non_webhook).is_some());
         Ok(())
     }
 
@@ -566,9 +556,8 @@ mod tests {
         };
         config.validate_basic()?;
         let plan = runtime_plan(config)?;
-        let config =
-            ExportWorkerConfig::from_export_plan(plan.config.agent_id.clone(), &plan.export)
-                .expect("worker should be enabled for planned webhook sink");
+        let config = ExportWorkerConfig::from_plans(plan.config.agent_id.clone(), &plan.export)
+            .expect("worker should be enabled for planned webhook sink");
 
         let (worker, _) = spawn_test_export_worker(Arc::clone(&spool), config);
         wait_for_export_cursor(spool.as_ref(), "worker", 1).await?;
@@ -610,7 +599,6 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(30_000),
             },
-            retention: ExportRetentionPlan::default(),
             sinks: vec![ExportSinkPlan {
                 id: "budget".to_string(),
                 transport: ExporterTransport::Webhook,
@@ -621,7 +609,7 @@ mod tests {
                 worker: inherited_worker_quota(2),
             }],
         };
-        let config = ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
+        let config = ExportWorkerConfig::from_plans("agent-1".to_string(), &plan)
             .expect("worker should be enabled");
 
         let (worker, _) = spawn_test_export_worker(Arc::clone(&spool), config);
@@ -655,7 +643,6 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(30_000),
             },
-            retention: ExportRetentionPlan::default(),
             sinks: vec![ExportSinkPlan {
                 id: "limited".to_string(),
                 transport: ExporterTransport::Webhook,
@@ -666,7 +653,7 @@ mod tests {
                 worker: overridden_worker_quota(1),
             }],
         };
-        let config = ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
+        let config = ExportWorkerConfig::from_plans("agent-1".to_string(), &plan)
             .expect("worker should be enabled");
 
         let (worker, _) = spawn_test_export_worker(Arc::clone(&spool), config);
@@ -700,7 +687,6 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(60_000),
             },
-            retention: ExportRetentionPlan::default(),
             sinks: vec![
                 ExportSinkPlan {
                     id: "failing".to_string(),
@@ -722,7 +708,7 @@ mod tests {
                 },
             ],
         };
-        let config = ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
+        let config = ExportWorkerConfig::from_plans("agent-1".to_string(), &plan)
             .expect("worker should be enabled");
 
         let (worker, runtime_state) = spawn_test_export_worker(Arc::clone(&spool), config);
@@ -878,7 +864,6 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff,
             },
-            retention: ExportRetentionPlan::default(),
             sinks: vec![ExportSinkPlan {
                 id: sink.to_string(),
                 transport: ExporterTransport::Webhook,
@@ -889,7 +874,7 @@ mod tests {
                 worker: inherited_worker_quota(1),
             }],
         };
-        ExportWorkerConfig::from_export_plan("agent-1".to_string(), &plan)
+        ExportWorkerConfig::from_plans("agent-1".to_string(), &plan)
             .expect("fixed interval worker plan should produce worker config")
     }
 

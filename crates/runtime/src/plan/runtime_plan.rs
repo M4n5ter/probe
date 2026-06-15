@@ -8,6 +8,7 @@ use super::{
     error::RuntimeError,
     export::ExportPlan,
     registry::ProviderRegistry,
+    storage::StoragePlan,
     tls::TlsPlan,
     validation::{validate_runtime_config, validate_static_runtime_config_fields},
 };
@@ -18,6 +19,7 @@ pub struct RuntimePlan {
     pub capabilities: CapabilityMatrix,
     pub capture: CapturePlan,
     pub tls: TlsPlan,
+    pub storage: StoragePlan,
     pub export: ExportPlan,
     pub enforcement: EnforcementPlan,
 }
@@ -29,6 +31,7 @@ impl RuntimePlan {
         let capabilities = registry.capability_matrix();
         let capture = CapturePlan::resolve(&config, registry);
         let tls = TlsPlan::resolve(&config, &capabilities);
+        let storage = StoragePlan::resolve(&config);
         let export = ExportPlan::resolve(&config);
         let enforcement = EnforcementPlan::resolve(&config, &capabilities);
         Ok(Self {
@@ -36,6 +39,7 @@ impl RuntimePlan {
             capabilities,
             capture,
             tls,
+            storage,
             export,
             enforcement,
         })

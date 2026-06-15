@@ -1,26 +1,67 @@
-use crate::{ConfigViolation, StorageConfig};
+use crate::{
+    ConfigViolation, ExportQueueRetentionConfig, IngressJournalRetentionConfig, StorageConfig,
+};
 
 pub(in crate::validation) fn validate(
     storage: &StorageConfig,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    let retention = &storage.retention.export;
-    if matches!(retention.max_age_ms, Some(0)) {
+    validate_ingress_retention(&storage.retention.ingress, violations);
+    validate_export_retention(&storage.retention.export, violations);
+}
+
+fn validate_ingress_retention(
+    retention: &IngressJournalRetentionConfig,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    validate_retention_knobs(
+        "storage.retention.ingress",
+        "ingress retention",
+        retention.max_age_ms,
+        retention.sweep_interval_ms,
+        retention.prune_batch_limit,
+        violations,
+    );
+}
+
+fn validate_export_retention(
+    retention: &ExportQueueRetentionConfig,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    validate_retention_knobs(
+        "storage.retention.export",
+        "export retention",
+        retention.max_age_ms,
+        retention.sweep_interval_ms,
+        retention.prune_batch_limit,
+        violations,
+    );
+}
+
+fn validate_retention_knobs(
+    field_prefix: &str,
+    label: &str,
+    max_age_ms: Option<u64>,
+    sweep_interval_ms: u64,
+    prune_batch_limit: u64,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if matches!(max_age_ms, Some(0)) {
         violations.push(ConfigViolation {
-            field: "storage.retention.export.max_age_ms".to_string(),
-            reason: "export retention max age must be positive when configured".to_string(),
+            field: format!("{field_prefix}.max_age_ms"),
+            reason: format!("{label} max age must be positive when configured"),
         });
     }
-    if retention.sweep_interval_ms == 0 {
+    if sweep_interval_ms == 0 {
         violations.push(ConfigViolation {
-            field: "storage.retention.export.sweep_interval_ms".to_string(),
-            reason: "export retention sweep interval must be positive".to_string(),
+            field: format!("{field_prefix}.sweep_interval_ms"),
+            reason: format!("{label} sweep interval must be positive"),
         });
     }
-    if retention.prune_batch_limit == 0 {
+    if prune_batch_limit == 0 {
         violations.push(ConfigViolation {
-            field: "storage.retention.export.prune_batch_limit".to_string(),
-            reason: "export retention prune batch limit must be positive".to_string(),
+            field: format!("{field_prefix}.prune_batch_limit"),
+            reason: format!("{label} prune batch limit must be positive"),
         });
     }
 }

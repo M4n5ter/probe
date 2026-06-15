@@ -5,12 +5,12 @@ use enforcement::{EnforcementPlanRequest, EnforcementPlanner};
 use parsers::{ParserInput, ProtocolParserFactory};
 use policy::{PolicyOutcome, PolicyRuntime, hook_for_event};
 use probe_core::{CompiledSelector, EventEnvelope, EventKind, SpoolPayloadSchema, Timestamp};
-use storage::{DurableSpool, SpoolPayload};
+use storage::{DurableSpool, IngressCursorOwner, SpoolPayload};
 use thiserror::Error;
 
 use crate::runtime_metrics::PipelineRuntimeMetrics;
 
-const PARSER_INGRESS_CONSUMER: &str = "parser";
+pub const PARSER_INGRESS_CURSOR_OWNER: IngressCursorOwner = IngressCursorOwner::new("parser");
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
@@ -108,12 +108,8 @@ impl<'a> PipelinePolicy<'a> {
     }
 
     fn matches(&self, envelope: &EventEnvelope) -> bool {
-        self.selector.is_none_or(|selector| {
-            envelope.kind.direction().map_or_else(
-                || selector.matches_flow_without_direction(&envelope.flow),
-                |direction| selector.matches_flow(&envelope.flow, direction),
-            )
-        })
+        self.selector
+            .is_none_or(|selector| selector.matches_event(envelope))
     }
 }
 
@@ -183,7 +179,7 @@ where
         batch_size: usize,
     ) -> Result<PipelineSummary, PipelineError> {
         let mut total = PipelineSummary::default();
-        let mut after_sequence = self.spool.ingress_cursor(PARSER_INGRESS_CONSUMER)?;
+        let mut after_sequence = self.spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?;
         if batch_size == 0 {
             return Ok(total);
         }
@@ -373,7 +369,8 @@ where
         if let Some(sequence) = self.last_processed_ingress_sequence
             && self.parser_factory.is_checkpoint_safe()
         {
-            self.spool.ack_ingress(PARSER_INGRESS_CONSUMER, sequence)?;
+            self.spool
+                .ack_ingress(PARSER_INGRESS_CURSOR_OWNER, sequence)?;
         }
         Ok(())
     }

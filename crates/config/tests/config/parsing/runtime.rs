@@ -31,6 +31,11 @@ max_age_ms = 60000
 sweep_interval_ms = 5000
 prune_batch_limit = 128
 
+[storage.retention.ingress]
+max_age_ms = 120000
+sweep_interval_ms = 7000
+prune_batch_limit = 256
+
 [export.worker]
 enabled = true
 
@@ -110,6 +115,9 @@ socket_path = "/run/sssa-probe/admin.sock"
     assert_eq!(config.capture.libpcap.read_timeout_ms, 250);
     assert_eq!(config.capture.libpcap.buffer_size, Some(1_048_576));
     assert_eq!(config.storage.path, PathBuf::from("/tmp/sssa-spool"));
+    assert_eq!(config.storage.retention.ingress.max_age_ms, Some(120_000));
+    assert_eq!(config.storage.retention.ingress.sweep_interval_ms, 7_000);
+    assert_eq!(config.storage.retention.ingress.prune_batch_limit, 256);
     assert_eq!(config.storage.retention.export.max_age_ms, Some(60_000));
     assert_eq!(config.storage.retention.export.sweep_interval_ms, 5_000);
     assert_eq!(config.storage.retention.export.prune_batch_limit, 128);

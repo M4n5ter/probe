@@ -28,10 +28,6 @@ impl LibsslUprobeAttachSession {
         self.attached_links.targets()
     }
 
-    pub(in crate::tls::plaintext) fn attached_target_count(&self) -> usize {
-        self.attached_links.target_count()
-    }
-
     pub(in crate::tls::plaintext) fn attach_uprobes(
         &mut self,
         ebpf: &mut Ebpf,

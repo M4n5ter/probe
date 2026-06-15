@@ -96,7 +96,7 @@ fn export_plan_normalizes_worker_plan_and_sinks() -> Result<(), Box<dyn std::err
         }
     );
     assert_eq!(
-        plan.export.retention,
+        plan.storage.retention.export,
         ExportRetentionPlan {
             max_age_ms: Some(60_000),
             sweep_interval_ms: NonZeroU64::new(5_000).expect("positive retention sweep interval"),

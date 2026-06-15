@@ -6,9 +6,10 @@ use std::{
 
 use attribution::ProcfsSocketResolver;
 use capture::{
-    CaptureError, CaptureProvider, LibsslResolvedFlow, LibsslUprobeFlowLookup,
-    LibsslUprobeFlowResolver, LibsslUprobePlaintextOpen, LibsslUprobePlaintextProbeConfig,
-    LibsslUprobePlaintextProvider, LibsslUprobePlaintextReconcile,
+    CaptureError, CaptureProvider, LibsslResolvedFlow, LibsslUprobeAttachTargetSnapshot,
+    LibsslUprobeFlowLookup, LibsslUprobeFlowResolver, LibsslUprobePlaintextOpen,
+    LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
+    LibsslUprobePlaintextReconcile, LibsslUprobeReconcileTargetBucket,
 };
 use probe_config::TlsPlaintextProvider;
 use probe_core::TcpConnection;
@@ -62,13 +63,44 @@ impl TlsPlaintextRuntimeSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TlsPlaintextReconcileRuntimeSnapshot {
     pub sequence: u64,
     pub observed_unix_ns: u64,
-    pub attached_targets: u64,
-    pub detached_targets: u64,
-    pub active_targets: u64,
+    pub target_counts: TlsPlaintextReconcileTargetCountsRuntimeSnapshot,
+    pub targets: TlsPlaintextReconcileTargetsRuntimeSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextReconcileTargetCountsRuntimeSnapshot {
+    pub attached: u64,
+    pub detached: u64,
+    pub active: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextReconcileTargetsRuntimeSnapshot {
+    pub attached: TlsPlaintextReconcileTargetBucketRuntimeSnapshot,
+    pub detached: TlsPlaintextReconcileTargetBucketRuntimeSnapshot,
+    pub active: TlsPlaintextReconcileTargetBucketRuntimeSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextReconcileTargetBucketRuntimeSnapshot {
+    pub targets: Vec<TlsPlaintextReconcileTargetRuntimeSnapshot>,
+    pub omitted: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextReconcileTargetRuntimeSnapshot {
+    pub pid: u32,
+    pub start_time_ticks: u64,
+    pub mapped_path: std::path::PathBuf,
+    pub read_path: std::path::PathBuf,
+    pub device_major: u32,
+    pub device_minor: u32,
+    pub inode: u64,
+    pub deleted: bool,
 }
 
 impl TlsPlaintextReconcileRuntimeSnapshot {
@@ -80,9 +112,46 @@ impl TlsPlaintextReconcileRuntimeSnapshot {
         Self {
             sequence,
             observed_unix_ns,
-            attached_targets: result.attached_targets as u64,
-            detached_targets: result.detached_targets as u64,
-            active_targets: result.active_targets as u64,
+            target_counts: TlsPlaintextReconcileTargetCountsRuntimeSnapshot {
+                attached: result.attached_target_count() as u64,
+                detached: result.detached_target_count() as u64,
+                active: result.active_target_count() as u64,
+            },
+            targets: TlsPlaintextReconcileTargetsRuntimeSnapshot {
+                attached: target_bucket(result.attached_targets),
+                detached: target_bucket(result.detached_targets),
+                active: target_bucket(result.active_targets),
+            },
+        }
+    }
+}
+
+fn target_bucket(
+    bucket: LibsslUprobeReconcileTargetBucket,
+) -> TlsPlaintextReconcileTargetBucketRuntimeSnapshot {
+    let omitted = bucket.omitted_count();
+    let targets = bucket
+        .into_targets()
+        .into_iter()
+        .map(TlsPlaintextReconcileTargetRuntimeSnapshot::from)
+        .collect::<Vec<_>>();
+    TlsPlaintextReconcileTargetBucketRuntimeSnapshot {
+        omitted: omitted as u64,
+        targets,
+    }
+}
+
+impl From<LibsslUprobeAttachTargetSnapshot> for TlsPlaintextReconcileTargetRuntimeSnapshot {
+    fn from(target: LibsslUprobeAttachTargetSnapshot) -> Self {
+        Self {
+            pid: target.pid,
+            start_time_ticks: target.start_time_ticks,
+            mapped_path: target.mapped_path,
+            read_path: target.read_path,
+            device_major: target.device_major,
+            device_minor: target.device_minor,
+            inode: target.inode,
+            deleted: target.deleted,
         }
     }
 }
@@ -140,7 +209,7 @@ impl TlsPlaintextRuntimeState {
         *inner = TlsPlaintextRuntimeSnapshot {
             mode: TlsPlaintextRuntimeMode::Disabled,
             reason: Some(reason.into()),
-            last_reconcile: inner.last_reconcile,
+            last_reconcile: inner.last_reconcile.clone(),
         };
     }
 
@@ -159,6 +228,7 @@ impl TlsPlaintextRuntimeState {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let sequence = inner
             .last_reconcile
+            .as_ref()
             .map_or(1, |last| last.sequence.saturating_add(1));
         *inner = TlsPlaintextRuntimeSnapshot {
             mode: TlsPlaintextRuntimeMode::Enabled,
@@ -409,7 +479,10 @@ impl TrackedLibsslFlowStarts {
 
 #[cfg(test)]
 mod tests {
-    use capture::{CapturePoll, CaptureProviderKind};
+    use capture::{
+        CapturePoll, CaptureProviderKind, LibsslUprobeAttachTargetSnapshot,
+        LibsslUprobeReconcileTargetBucket, MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET,
+    };
     use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
     use probe_core::{CapabilityState, TcpEndpoint};
     use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
@@ -482,22 +555,8 @@ mod tests {
         )));
 
         assert_eq!(runtime.snapshot().mode, TlsPlaintextRuntimeMode::Enabled);
-        runtime.record_reconcile_success_at(
-            LibsslUprobePlaintextReconcile {
-                attached_targets: 2,
-                detached_targets: 1,
-                active_targets: 3,
-            },
-            100,
-        );
-        runtime.record_reconcile_success_at(
-            LibsslUprobePlaintextReconcile {
-                attached_targets: 4,
-                detached_targets: 2,
-                active_targets: 5,
-            },
-            200,
-        );
+        runtime.record_reconcile_success_at(reconcile_result(2, 1, 3), 100);
+        runtime.record_reconcile_success_at(reconcile_result(4, 2, 5), 200);
 
         runtime.record_provider_disabled(
             "best-effort capture provider libssl_uprobe_plaintext disabled after error: boom",
@@ -514,9 +573,70 @@ mod tests {
             .expect("last successful reconcile should be retained after disable");
         assert_eq!(reconcile.sequence, 2);
         assert_eq!(reconcile.observed_unix_ns, 200);
-        assert_eq!(reconcile.attached_targets, 4);
-        assert_eq!(reconcile.detached_targets, 2);
-        assert_eq!(reconcile.active_targets, 5);
+        assert_eq!(
+            reconcile.target_counts,
+            TlsPlaintextReconcileTargetCountsRuntimeSnapshot {
+                attached: 4,
+                detached: 2,
+                active: 5,
+            }
+        );
+        assert_eq!(reconcile.targets.attached.targets.len(), 4);
+        assert_eq!(reconcile.targets.detached.targets.len(), 2);
+        assert_eq!(reconcile.targets.active.targets.len(), 5);
+        assert_eq!(reconcile.targets.active.omitted, 0);
+        assert_eq!(reconcile.targets.active.targets[0].pid, 3_000);
+    }
+
+    #[test]
+    fn reconcile_runtime_snapshot_serializes_target_facts() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let snapshot = TlsPlaintextReconcileRuntimeSnapshot::from_reconcile_success(
+            reconcile_result(1, 0, 1),
+            7,
+            900,
+        );
+
+        let value = serde_json::to_value(snapshot)?;
+
+        assert_eq!(value["sequence"], serde_json::json!(7));
+        assert_eq!(value["observed_unix_ns"], serde_json::json!(900));
+        assert_eq!(value["target_counts"]["attached"], serde_json::json!(1));
+        assert_eq!(value["target_counts"]["detached"], serde_json::json!(0));
+        assert_eq!(value["target_counts"]["active"], serde_json::json!(1));
+        assert_eq!(
+            value["targets"]["active"]["targets"][0]["pid"],
+            serde_json::json!(3000)
+        );
+        assert_eq!(
+            value["targets"]["active"]["targets"][0]["mapped_path"],
+            serde_json::json!("/usr/lib/active-3000.so")
+        );
+        assert_eq!(
+            value["targets"]["active"]["targets"][0]["inode"],
+            serde_json::json!(3000)
+        );
+        assert_eq!(value["targets"]["active"]["omitted"], serde_json::json!(0));
+        Ok(())
+    }
+
+    #[test]
+    fn reconcile_runtime_snapshot_preserves_capture_bucket_counts_and_samples() {
+        let snapshot = TlsPlaintextReconcileRuntimeSnapshot::from_reconcile_success(
+            reconcile_result(MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET + 2, 0, 0),
+            1,
+            100,
+        );
+
+        assert_eq!(
+            snapshot.target_counts.attached,
+            (MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET + 2) as u64
+        );
+        assert_eq!(
+            snapshot.targets.attached.targets.len(),
+            MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET
+        );
+        assert_eq!(snapshot.targets.attached.omitted, 2);
     }
 
     struct NoopCaptureProvider;
@@ -598,5 +718,40 @@ mod tests {
                 remote_port,
             ),
         )
+    }
+
+    fn reconcile_result(
+        attached: usize,
+        detached: usize,
+        active: usize,
+    ) -> LibsslUprobePlaintextReconcile {
+        LibsslUprobePlaintextReconcile {
+            attached_targets: target_snapshots("attached", 1_000, attached),
+            detached_targets: target_snapshots("detached", 2_000, detached),
+            active_targets: target_snapshots("active", 3_000, active),
+        }
+    }
+
+    fn target_snapshots(
+        kind: &str,
+        first_pid: u32,
+        count: usize,
+    ) -> LibsslUprobeReconcileTargetBucket {
+        let targets = (0..count)
+            .map(|index| {
+                let pid = first_pid + index as u32;
+                LibsslUprobeAttachTargetSnapshot {
+                    pid,
+                    start_time_ticks: u64::from(pid) * 100,
+                    mapped_path: format!("/usr/lib/{kind}-{pid}.so").into(),
+                    read_path: format!("/proc/{pid}/root/usr/lib/{kind}.so").into(),
+                    device_major: 8,
+                    device_minor: 1,
+                    inode: u64::from(pid),
+                    deleted: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        LibsslUprobeReconcileTargetBucket::new(targets)
     }
 }
