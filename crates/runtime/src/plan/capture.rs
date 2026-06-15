@@ -265,3 +265,216 @@ fn capture_backend_capability(backend: CaptureBackend) -> CapabilityKind {
         CaptureBackend::Replay => CapabilityKind::ReplayCapture,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
+    use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
+
+    use crate::plan::registry::ProviderRegistry;
+
+    use super::*;
+
+    #[test]
+    fn default_plan_is_honest_when_live_capture_is_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![
+                capture_provider(
+                    CaptureBackend::Replay,
+                    CaptureProviderBuilder::Replay,
+                    RuntimeMode::Available,
+                ),
+                capture_provider(
+                    CaptureBackend::Ebpf,
+                    CaptureProviderBuilder::Unimplemented,
+                    RuntimeMode::Unavailable,
+                ),
+                capture_provider(
+                    CaptureBackend::Libpcap,
+                    CaptureProviderBuilder::Unimplemented,
+                    RuntimeMode::Unavailable,
+                ),
+            ],
+            test_platform_capabilities(),
+        );
+
+        let config = AgentConfig::default();
+        let plan = CapturePlan::resolve(&config, &registry);
+
+        assert_eq!(plan.mode, CapturePlanMode::Unavailable);
+        assert_eq!(plan.selected_backend, None);
+        assert!(
+            plan.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no live capture provider"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auto_selection_uses_first_available_live_fallback() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let registry = ProviderRegistry::new(
+            vec![
+                CaptureProviderDescriptor::unavailable(
+                    CaptureBackend::Ebpf,
+                    CaptureProviderBuilder::Unimplemented,
+                    "eBPF host probe: bpffs path /sys/fs/bpf does not exist",
+                ),
+                capture_provider(
+                    CaptureBackend::Libpcap,
+                    CaptureProviderBuilder::Libpcap,
+                    RuntimeMode::Available,
+                ),
+            ],
+            test_platform_capabilities(),
+        );
+
+        let config = AgentConfig::default();
+        let plan = CapturePlan::resolve(&config, &registry);
+
+        assert_eq!(plan.mode, CapturePlanMode::Live);
+        assert_eq!(plan.selected_backend, Some(CaptureBackend::Libpcap));
+        assert_eq!(
+            plan.selected_provider
+                .as_ref()
+                .map(|provider| provider.builder),
+            Some(CaptureProviderBuilder::Libpcap)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auto_selection_skips_degraded_ebpf_and_uses_available_libpcap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![
+                CaptureProviderDescriptor::degraded(
+                    CaptureBackend::Ebpf,
+                    CaptureProviderBuilder::Ebpf,
+                    "eBPF observation provider does not capture payload",
+                )
+                .allow_explicit_degraded(),
+                capture_provider(
+                    CaptureBackend::Libpcap,
+                    CaptureProviderBuilder::Libpcap,
+                    RuntimeMode::Available,
+                ),
+            ],
+            test_platform_capabilities(),
+        );
+
+        let config = AgentConfig::default();
+        let plan = CapturePlan::resolve(&config, &registry);
+
+        assert_eq!(plan.mode, CapturePlanMode::Live);
+        assert_eq!(plan.selected_backend, Some(CaptureBackend::Libpcap));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_degraded_provider_with_selection_policy_is_selectable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![
+                CaptureProviderDescriptor::degraded(
+                    CaptureBackend::Ebpf,
+                    CaptureProviderBuilder::Ebpf,
+                    "eBPF observation provider does not capture payload",
+                )
+                .allow_explicit_degraded(),
+            ],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Ebpf;
+
+        let plan = CapturePlan::resolve(&config, &registry);
+
+        assert_eq!(plan.mode, CapturePlanMode::Live);
+        assert_eq!(plan.selected_backend, Some(CaptureBackend::Ebpf));
+        assert_eq!(
+            plan.selected_provider
+                .as_ref()
+                .map(|provider| provider.mode),
+            Some(RuntimeMode::Degraded)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_plaintext_feed_resolves_to_feed_mode() -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::PlaintextFeed,
+                CaptureProviderBuilder::PlaintextFeed,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::PlaintextFeed;
+        config.capture.plaintext_feed.path = Some("/tmp/feed.jsonl".into());
+
+        let plan = CapturePlan::resolve(&config, &registry);
+
+        assert_eq!(plan.mode, CapturePlanMode::PlaintextFeed);
+        assert_eq!(plan.selected_backend, Some(CaptureBackend::PlaintextFeed));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_backend_resolves_to_replay_mode() -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+
+        let plan = CapturePlan::resolve(&config, &registry);
+
+        assert_eq!(plan.mode, CapturePlanMode::Replay);
+        assert_eq!(plan.selected_backend, Some(CaptureBackend::Replay));
+        assert_eq!(
+            plan.selected_provider
+                .as_ref()
+                .map(|provider| provider.builder),
+            Some(CaptureProviderBuilder::Replay)
+        );
+        Ok(())
+    }
+
+    fn capture_provider(
+        backend: CaptureBackend,
+        builder: CaptureProviderBuilder,
+        mode: RuntimeMode,
+    ) -> CaptureProviderDescriptor {
+        match mode {
+            RuntimeMode::Available => CaptureProviderDescriptor::available(backend, builder),
+            RuntimeMode::Degraded => {
+                CaptureProviderDescriptor::degraded(backend, builder, "degraded")
+            }
+            RuntimeMode::Unavailable => {
+                CaptureProviderDescriptor::unavailable(backend, builder, "unavailable")
+            }
+        }
+    }
+
+    fn test_platform_capabilities() -> Vec<CapabilityState> {
+        vec![
+            CapabilityState::available(CapabilityKind::Http1),
+            CapabilityState::available(CapabilityKind::Sse),
+            CapabilityState::available(CapabilityKind::WebSocketHandoff),
+            CapabilityState::available(CapabilityKind::WebSocketFrame),
+            CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
+            CapabilityState::available(CapabilityKind::DryRunEnforcement),
+            CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
+        ]
+    }
+}

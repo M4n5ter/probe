@@ -135,3 +135,106 @@ fn default_libssl_uprobe_capability() -> CapabilityState {
         "libssl uprobe discovery, attach planning, ABI, capture adapter, userspace uprobe loader, and eBPF producer exist, but no agent runtime composition root supplied a TLS plaintext provider capability",
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use probe_core::RuntimeMode;
+
+    use super::*;
+
+    #[test]
+    fn available_provider_requires_matching_executable_builder() {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Ebpf,
+                CaptureProviderBuilder::Unimplemented,
+                RuntimeMode::Available,
+            )],
+            Vec::new(),
+        );
+
+        let provider = registry.capture_provider(CaptureBackend::Ebpf);
+
+        assert_eq!(provider.mode, RuntimeMode::Unavailable);
+        assert!(
+            provider
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Unimplemented builder"))
+        );
+        assert_eq!(
+            registry.capability_matrix().mode(CapabilityKind::Ebpf),
+            RuntimeMode::Unavailable
+        );
+    }
+
+    #[test]
+    fn ingress_journal_recovery_is_degraded_until_parser_checkpoints_are_durable() {
+        let registry = ProviderRegistry::with_default_platform(vec![capture_provider(
+            CaptureBackend::Replay,
+            CaptureProviderBuilder::Replay,
+            RuntimeMode::Available,
+        )]);
+        let matrix = registry.capability_matrix();
+
+        assert_eq!(
+            matrix.mode(CapabilityKind::IngressJournal),
+            RuntimeMode::Degraded
+        );
+        assert_eq!(
+            matrix.mode(CapabilityKind::DurableSpool),
+            RuntimeMode::Degraded
+        );
+        assert!(
+            matrix
+                .states()
+                .iter()
+                .find(|state| state.kind == CapabilityKind::DurableSpool)
+                .and_then(|state| state.reason.as_deref())
+                .is_some_and(|reason| reason.contains("at-least-once"))
+        );
+        assert!(
+            matrix
+                .states()
+                .iter()
+                .find(|state| state.kind == CapabilityKind::IngressJournal)
+                .and_then(|state| state.reason.as_deref())
+                .is_some_and(|reason| reason.contains("parser checkpoints"))
+        );
+    }
+
+    #[test]
+    fn websocket_parser_capabilities_are_supported() {
+        let registry = ProviderRegistry::with_default_platform(vec![capture_provider(
+            CaptureBackend::Replay,
+            CaptureProviderBuilder::Replay,
+            RuntimeMode::Available,
+        )]);
+        let matrix = registry.capability_matrix();
+
+        assert_eq!(
+            matrix.mode(CapabilityKind::WebSocketHandoff),
+            RuntimeMode::Available
+        );
+        assert_eq!(
+            matrix.mode(CapabilityKind::WebSocketFrame),
+            RuntimeMode::Available
+        );
+    }
+
+    fn capture_provider(
+        backend: CaptureBackend,
+        builder: CaptureProviderBuilder,
+        mode: RuntimeMode,
+    ) -> CaptureProviderDescriptor {
+        match mode {
+            RuntimeMode::Available => CaptureProviderDescriptor::available(backend, builder),
+            RuntimeMode::Degraded => {
+                CaptureProviderDescriptor::degraded(backend, builder, "degraded")
+            }
+            RuntimeMode::Unavailable => {
+                CaptureProviderDescriptor::unavailable(backend, builder, "unavailable")
+            }
+        }
+    }
+}

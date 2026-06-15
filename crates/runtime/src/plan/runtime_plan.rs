@@ -65,3 +65,64 @@ pub fn validate_static_runtime_config(config: &AgentConfig) -> Result<(), Runtim
     validate_static_runtime_config_fields(config)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use probe_config::{AgentConfig, CaptureBackend};
+    use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
+
+    use crate::plan::{
+        capture::{CaptureProviderBuilder, CaptureProviderDescriptor},
+        registry::ProviderRegistry,
+    };
+
+    use super::*;
+
+    #[test]
+    fn run_requirement_fails_without_live_capture() -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Ebpf,
+                CaptureProviderBuilder::Unimplemented,
+                RuntimeMode::Unavailable,
+            )],
+            test_platform_capabilities(),
+        );
+        let plan = RuntimePlan::build(AgentConfig::default(), &registry)?;
+
+        let error = plan
+            .require_live_capture()
+            .expect_err("run must fail closed");
+
+        assert!(error.to_string().contains("no live capture provider"));
+        Ok(())
+    }
+
+    fn capture_provider(
+        backend: CaptureBackend,
+        builder: CaptureProviderBuilder,
+        mode: RuntimeMode,
+    ) -> CaptureProviderDescriptor {
+        match mode {
+            RuntimeMode::Available => CaptureProviderDescriptor::available(backend, builder),
+            RuntimeMode::Degraded => {
+                CaptureProviderDescriptor::degraded(backend, builder, "degraded")
+            }
+            RuntimeMode::Unavailable => {
+                CaptureProviderDescriptor::unavailable(backend, builder, "unavailable")
+            }
+        }
+    }
+
+    fn test_platform_capabilities() -> Vec<CapabilityState> {
+        vec![
+            CapabilityState::available(CapabilityKind::Http1),
+            CapabilityState::available(CapabilityKind::Sse),
+            CapabilityState::available(CapabilityKind::WebSocketHandoff),
+            CapabilityState::available(CapabilityKind::WebSocketFrame),
+            CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
+            CapabilityState::available(CapabilityKind::DryRunEnforcement),
+            CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
+        ]
+    }
+}

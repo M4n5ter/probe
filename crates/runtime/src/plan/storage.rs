@@ -94,3 +94,50 @@ impl Default for ExportRetentionPlan {
         Self::from_config(&StorageRetentionConfig::default())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_plan_normalizes_ingress_retention() {
+        let mut config = AgentConfig::default();
+        config.storage.retention.ingress.max_age_ms = Some(120_000);
+        config.storage.retention.ingress.sweep_interval_ms = 5_000;
+        config.storage.retention.ingress.prune_batch_limit = 128;
+
+        let plan = StoragePlan::resolve(&config);
+
+        assert_eq!(
+            plan.retention.ingress,
+            IngressRetentionPlan {
+                max_age_ms: Some(120_000),
+                sweep_interval_ms: NonZeroU64::new(5_000)
+                    .expect("positive ingress retention sweep interval"),
+                prune_batch_limit: NonZeroU64::new(128)
+                    .expect("positive ingress retention prune limit"),
+            }
+        );
+    }
+
+    #[test]
+    fn storage_plan_normalizes_export_retention() {
+        let mut config = AgentConfig::default();
+        config.storage.retention.export.max_age_ms = Some(60_000);
+        config.storage.retention.export.sweep_interval_ms = 5_000;
+        config.storage.retention.export.prune_batch_limit = 128;
+
+        let plan = StoragePlan::resolve(&config);
+
+        assert_eq!(
+            plan.retention.export,
+            ExportRetentionPlan {
+                max_age_ms: Some(60_000),
+                sweep_interval_ms: NonZeroU64::new(5_000)
+                    .expect("positive export retention sweep interval"),
+                prune_batch_limit: NonZeroU64::new(128)
+                    .expect("positive export retention prune limit"),
+            }
+        );
+    }
+}

@@ -151,3 +151,126 @@ fn tls_plaintext_materials_from_refs(
         .cloned()
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use probe_core::{CapabilityState, Selector};
+
+    use super::*;
+
+    #[test]
+    fn tls_plaintext_plan_preserves_selector_and_capability_requirement() {
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.enabled = true;
+        config.tls.plaintext.provider = TlsPlaintextProvider::LibsslUprobe;
+        config.tls.plaintext.selector = Some(Selector::default());
+        config.tls.plaintext.libssl_uprobe_object_path =
+            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        config.tls.plaintext.reconcile_interval_ms = 2500;
+        let capabilities = capability_matrix_with_libssl(RuntimeMode::Available);
+
+        let plan = TlsPlan::resolve(&config, &capabilities);
+
+        assert!(plan.plaintext.enabled);
+        assert_eq!(plan.plaintext.provider, TlsPlaintextProvider::LibsslUprobe);
+        assert!(plan.plaintext.selector_configured);
+        assert_eq!(
+            plan.plaintext.libssl_uprobe_object_path,
+            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into())
+        );
+        assert_eq!(plan.plaintext.reconcile_interval_ms, 2500);
+        assert_eq!(
+            plan.plaintext.capability,
+            TlsPlaintextCapabilityPlan::Required {
+                capability: CapabilityKind::LibsslUprobe,
+                mode: RuntimeMode::Available,
+            }
+        );
+        assert!(plan.plaintext.key_logs.is_empty());
+        assert!(plan.plaintext.session_secrets.is_empty());
+    }
+
+    #[test]
+    fn tls_plaintext_plan_allows_degraded_libssl_capability_for_best_effort_instrumentation() {
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.enabled = true;
+        config.tls.plaintext.provider = TlsPlaintextProvider::LibsslUprobe;
+        config.tls.plaintext.libssl_uprobe_object_path =
+            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        let capabilities = capability_matrix_with_libssl(RuntimeMode::Degraded);
+
+        let plan = TlsPlan::resolve(&config, &capabilities);
+
+        assert_eq!(
+            plan.plaintext.capability,
+            TlsPlaintextCapabilityPlan::Required {
+                capability: CapabilityKind::LibsslUprobe,
+                mode: RuntimeMode::Degraded,
+            }
+        );
+    }
+
+    #[test]
+    fn tls_plaintext_plan_resolves_decrypt_hint_material_refs() {
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.provider = TlsPlaintextProvider::Keylog;
+        config.tls.plaintext.key_log_refs = vec!["ssl-keys".to_string()];
+        config.tls.plaintext.session_secret_refs = vec!["session-secrets".to_string()];
+        config.tls.materials = vec![
+            TlsMaterialConfig {
+                id: Some("ssl-keys".to_string()),
+                kind: TlsMaterialKind::KeyLogFile,
+                path: "/tmp/sslkeylog.log".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("session-secrets".to_string()),
+                kind: TlsMaterialKind::SessionSecretFile,
+                path: "/tmp/session-secrets.jsonl".into(),
+            },
+        ];
+        let capabilities = capability_matrix_with_libssl(RuntimeMode::Unavailable);
+
+        let plan = TlsPlan::resolve(&config, &capabilities);
+
+        assert_eq!(
+            plan.plaintext.capability,
+            TlsPlaintextCapabilityPlan::NotRequired
+        );
+        assert_eq!(
+            plan.plaintext.key_logs,
+            vec![TlsPlaintextMaterialPlan {
+                id: "ssl-keys".to_string(),
+                kind: TlsMaterialKind::KeyLogFile,
+                path: "/tmp/sslkeylog.log".into(),
+            }]
+        );
+        assert_eq!(
+            plan.plaintext.session_secrets,
+            vec![TlsPlaintextMaterialPlan {
+                id: "session-secrets".to_string(),
+                kind: TlsMaterialKind::SessionSecretFile,
+                path: "/tmp/session-secrets.jsonl".into(),
+            }]
+        );
+    }
+
+    fn capability_matrix_with_libssl(mode: RuntimeMode) -> CapabilityMatrix {
+        CapabilityMatrix::new([
+            CapabilityState::available(CapabilityKind::Http1),
+            CapabilityState::available(CapabilityKind::Sse),
+            CapabilityState::available(CapabilityKind::WebSocketHandoff),
+            CapabilityState::available(CapabilityKind::WebSocketFrame),
+            match mode {
+                RuntimeMode::Available => CapabilityState::available(CapabilityKind::LibsslUprobe),
+                RuntimeMode::Degraded => {
+                    CapabilityState::degraded(CapabilityKind::LibsslUprobe, "degraded")
+                }
+                RuntimeMode::Unavailable => {
+                    CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built")
+                }
+            },
+            CapabilityState::available(CapabilityKind::DryRunEnforcement),
+            CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
+        ])
+    }
+}

@@ -185,3 +185,136 @@ impl ExportSinkTlsPlan {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use probe_config::{ExporterConfig, ExporterWorkerConfig, TlsMaterialConfig, TlsMaterialKind};
+
+    use super::*;
+
+    #[test]
+    fn export_plan_disables_worker_without_sinks() {
+        let plan = ExportPlan::resolve(&AgentConfig::default());
+
+        assert_eq!(
+            plan.worker,
+            ExportWorkerPlan::Disabled {
+                reason: "export worker has no planned sinks".to_string(),
+            }
+        );
+        assert_eq!(plan.sinks, Vec::<ExportSinkPlan>::new());
+    }
+
+    #[test]
+    fn export_plan_normalizes_worker_plan_and_sinks() {
+        let mut config = AgentConfig::default();
+        config.export.worker.schedule = ExportWorkerScheduleConfig::FixedIntervalBounded {
+            interval_ms: 250,
+            batches_per_sink_per_tick: 3,
+            sink_timeout_ms: 2_000,
+            failure_backoff: ExportFailureBackoffConfig {
+                initial_ms: 5_000,
+                max_ms: 20_000,
+                multiplier: 3,
+            },
+        };
+        config.exporters = vec![ExporterConfig {
+            id: "primary".to_string(),
+            transport: ExporterTransport::Webhook,
+            endpoint: "https://collector.example/batches".to_string(),
+            codec: CompressionCodecName::None,
+            headers: Default::default(),
+            tls: ExporterTlsConfig {
+                trust_anchor_refs: vec!["collector-ca".to_string()],
+                client_certificate_refs: vec!["client-cert".to_string()],
+                client_private_key_ref: Some("client-key".to_string()),
+            },
+            worker: ExporterWorkerConfig {
+                batches_per_tick: Some(2),
+            },
+        }];
+        config.tls.materials = vec![
+            TlsMaterialConfig {
+                id: Some("collector-ca".to_string()),
+                kind: TlsMaterialKind::TrustAnchor,
+                path: PathBuf::from("/etc/ssl/private/collector-ca.pem"),
+            },
+            TlsMaterialConfig {
+                id: Some("client-cert".to_string()),
+                kind: TlsMaterialKind::ClientCertificate,
+                path: PathBuf::from("/etc/sssa/client.pem"),
+            },
+            TlsMaterialConfig {
+                id: Some("client-key".to_string()),
+                kind: TlsMaterialKind::ClientPrivateKey,
+                path: PathBuf::from("/etc/sssa/client.key"),
+            },
+            TlsMaterialConfig {
+                id: Some("keylog".to_string()),
+                kind: TlsMaterialKind::KeyLogFile,
+                path: PathBuf::from("/tmp/ssl-keylog.log"),
+            },
+        ];
+
+        let plan = ExportPlan::resolve(&config);
+
+        assert_eq!(
+            plan.worker,
+            ExportWorkerPlan::FixedIntervalBounded {
+                interval_ms: 250,
+                batches_per_sink_per_tick: 3,
+                sink_timeout_ms: 2_000,
+                failure_backoff: ExportFailureBackoffPlan {
+                    initial_ms: 5_000,
+                    max_ms: 20_000,
+                    multiplier: 3,
+                },
+            }
+        );
+        assert_eq!(
+            plan.sinks,
+            vec![ExportSinkPlan {
+                id: "primary".to_string(),
+                transport: ExporterTransport::Webhook,
+                endpoint: "https://collector.example/batches".to_string(),
+                codec: CompressionCodecName::None,
+                headers: Default::default(),
+                tls: ExportSinkTlsPlan {
+                    trust_anchors: vec![export_tls_material(
+                        "collector-ca",
+                        TlsMaterialKind::TrustAnchor,
+                        "/etc/ssl/private/collector-ca.pem",
+                    )],
+                    client_certificates: vec![export_tls_material(
+                        "client-cert",
+                        TlsMaterialKind::ClientCertificate,
+                        "/etc/sssa/client.pem",
+                    )],
+                    client_private_key: Some(export_tls_material(
+                        "client-key",
+                        TlsMaterialKind::ClientPrivateKey,
+                        "/etc/sssa/client.key",
+                    )),
+                },
+                worker: ExportSinkWorkerPlan {
+                    batches_per_tick_override: Some(2),
+                    effective_batches_per_tick: NonZeroU64::new(2).expect("positive batch quota"),
+                },
+            }]
+        );
+    }
+
+    fn export_tls_material(
+        id: &str,
+        kind: TlsMaterialKind,
+        path: impl Into<PathBuf>,
+    ) -> ExportTlsMaterialPlan {
+        ExportTlsMaterialPlan {
+            id: id.to_string(),
+            kind,
+            path: path.into(),
+        }
+    }
+}

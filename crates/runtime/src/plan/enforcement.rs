@@ -114,3 +114,100 @@ impl EnforcementPolicySourcePlan {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use probe_config::{AgentConfig, ConnectionEnforcementBackendConfig};
+    use probe_core::{CapabilityMatrix, CapabilityState, Selector};
+
+    use super::*;
+
+    #[test]
+    fn dry_run_enforcement_is_a_supported_runtime_capability() {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::DryRun;
+        let capabilities = CapabilityMatrix::new(test_platform_capabilities());
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        assert_eq!(
+            plan.capability,
+            EnforcementCapabilityPlan::Required {
+                capability: CapabilityKind::DryRunEnforcement,
+                mode: RuntimeMode::Available,
+            }
+        );
+    }
+
+    #[test]
+    fn enforce_enforcement_plan_records_connection_capability() {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.backend = ConnectionEnforcementBackendConfig::LinuxSocketDestroy;
+        let capabilities = CapabilityMatrix::new(test_platform_capabilities_with_connection(
+            RuntimeMode::Available,
+        ));
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        assert_eq!(
+            plan.backend,
+            ConnectionEnforcementBackendConfig::LinuxSocketDestroy
+        );
+        assert_eq!(
+            plan.capability,
+            EnforcementCapabilityPlan::Required {
+                capability: CapabilityKind::ConnectionEnforcement,
+                mode: RuntimeMode::Available,
+            }
+        );
+    }
+
+    #[test]
+    fn enforcement_plan_preserves_external_policy_source() {
+        let mut config = AgentConfig::default();
+        config.enforcement.selector = Some(Selector::default());
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::Directory {
+            path: "/etc/sssa-probe/enforcement.d".into(),
+        };
+        let capabilities = CapabilityMatrix::new(test_platform_capabilities());
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        assert_eq!(plan.mode, EnforcementMode::AuditOnly);
+        assert!(plan.config_selector_configured);
+        assert_eq!(
+            plan.policy_source,
+            EnforcementPolicySourcePlan::LocalManifest {
+                source_kind: EnforcementPolicySourceKind::Directory,
+                path: "/etc/sssa-probe/enforcement.d/manifest.toml".into(),
+            }
+        );
+    }
+
+    fn test_platform_capabilities() -> Vec<CapabilityState> {
+        test_platform_capabilities_with_connection(RuntimeMode::Unavailable)
+    }
+
+    fn test_platform_capabilities_with_connection(mode: RuntimeMode) -> Vec<CapabilityState> {
+        vec![
+            CapabilityState::available(CapabilityKind::Http1),
+            CapabilityState::available(CapabilityKind::Sse),
+            CapabilityState::available(CapabilityKind::WebSocketHandoff),
+            CapabilityState::available(CapabilityKind::WebSocketFrame),
+            CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
+            CapabilityState::available(CapabilityKind::DryRunEnforcement),
+            match mode {
+                RuntimeMode::Available => {
+                    CapabilityState::available(CapabilityKind::ConnectionEnforcement)
+                }
+                RuntimeMode::Degraded => {
+                    CapabilityState::degraded(CapabilityKind::ConnectionEnforcement, "degraded")
+                }
+                RuntimeMode::Unavailable => {
+                    CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built")
+                }
+            },
+        ]
+    }
+}
