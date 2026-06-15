@@ -398,7 +398,7 @@ pub struct DomainEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyRuntimeError {
-    pub hook: String,
+    pub event_type: EventType,
     pub reason: String,
 }
 
@@ -613,7 +613,7 @@ mod tests {
                 ttl_ms: None,
             }),
             EventKind::PolicyRuntimeError(PolicyRuntimeError {
-                hook: "on_http_request_headers".to_string(),
+                event_type: EventType::HttpRequestHeaders,
                 reason: "policy failed".to_string(),
             }),
             EventKind::EnforcementDecision(EnforcementDecision {

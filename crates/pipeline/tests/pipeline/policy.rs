@@ -6,7 +6,7 @@ use parsers::Http1ParserFactory;
 use pipeline::{CapturePipeline, PipelinePolicy, PipelineRuntimeMetrics};
 use policy::{PolicyHook, PolicyManifest, PolicyRuntime};
 use probe_core::{
-    Action, EnforcementMode, EnforcementOutcome, EventKind, ProcessSelector,
+    Action, EnforcementMode, EnforcementOutcome, EventKind, EventType, ProcessSelector,
     ProtectiveActionProfile, Selector, TrafficSelector,
 };
 use tempfile::tempdir;
@@ -391,7 +391,7 @@ end
     assert!(matches!(
         &policy_outputs[2].kind,
         EventKind::PolicyRuntimeError(error)
-            if error.hook == "on_http_request_headers"
+            if error.event_type == EventType::HttpRequestHeaders
                 && error.reason.contains("invalid outcome")
     ));
     assert!(matches!(

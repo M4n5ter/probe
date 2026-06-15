@@ -415,7 +415,7 @@ where
         let outcomes = match policy.runtime.handle_event(hook, envelope) {
             Ok(outcomes) => outcomes,
             Err(source) => {
-                self.append_policy_runtime_error(envelope, &policy_version, hook, &source)?;
+                self.append_policy_runtime_error(envelope, &policy_version, &source)?;
                 if let Some(metrics) = &self.runtime_metrics {
                     metrics.record_policy_error();
                 }
@@ -433,14 +433,13 @@ where
         &mut self,
         envelope: &EventEnvelope,
         policy_version: &str,
-        hook: PolicyHook,
         source: &policy::PolicyError,
     ) -> Result<(), PipelineError> {
         self.append_policy_event(
             envelope,
             policy_version,
             EventKind::PolicyRuntimeError(PolicyRuntimeError {
-                hook: hook.as_str().to_string(),
+                event_type: envelope.kind.event_type(),
                 reason: source.to_string(),
             }),
         )
