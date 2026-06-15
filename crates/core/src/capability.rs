@@ -12,7 +12,9 @@ pub enum CapabilityKind {
     ExternalPlaintextFeed,
     Http1,
     Sse,
+    #[serde(rename = "websocket_handoff")]
     WebSocketHandoff,
+    #[serde(rename = "websocket_frame")]
     WebSocketFrame,
     LuaJit,
     DurableSpool,
@@ -24,12 +26,48 @@ pub enum CapabilityKind {
     TransparentInterception,
 }
 
+impl CapabilityKind {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::ReplayCapture => "replay_capture",
+            Self::Ebpf => "ebpf",
+            Self::Libpcap => "libpcap",
+            Self::ProcfsAttribution => "procfs_attribution",
+            Self::ProcfsSocketAttribution => "procfs_socket_attribution",
+            Self::LibsslUprobe => "libssl_uprobe",
+            Self::ExternalPlaintextFeed => "external_plaintext_feed",
+            Self::Http1 => "http1",
+            Self::Sse => "sse",
+            Self::WebSocketHandoff => "websocket_handoff",
+            Self::WebSocketFrame => "websocket_frame",
+            Self::LuaJit => "lua_jit",
+            Self::DurableSpool => "durable_spool",
+            Self::IngressJournal => "ingress_journal",
+            Self::ExportQueue => "export_queue",
+            Self::WebhookExporter => "webhook_exporter",
+            Self::DryRunEnforcement => "dry_run_enforcement",
+            Self::ConnectionEnforcement => "connection_enforcement",
+            Self::TransparentInterception => "transparent_interception",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeMode {
     Available,
     Degraded,
     Unavailable,
+}
+
+impl RuntimeMode {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Degraded => "degraded",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,5 +137,50 @@ impl CapabilityMatrix {
             .required
             .iter()
             .all(|kind| self.mode(*kind) != RuntimeMode::Unavailable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_kind_wire_name_matches_json_name() -> Result<(), serde_json::Error> {
+        for kind in [
+            CapabilityKind::ReplayCapture,
+            CapabilityKind::Ebpf,
+            CapabilityKind::Libpcap,
+            CapabilityKind::ProcfsAttribution,
+            CapabilityKind::ProcfsSocketAttribution,
+            CapabilityKind::LibsslUprobe,
+            CapabilityKind::ExternalPlaintextFeed,
+            CapabilityKind::Http1,
+            CapabilityKind::Sse,
+            CapabilityKind::WebSocketHandoff,
+            CapabilityKind::WebSocketFrame,
+            CapabilityKind::LuaJit,
+            CapabilityKind::DurableSpool,
+            CapabilityKind::IngressJournal,
+            CapabilityKind::ExportQueue,
+            CapabilityKind::WebhookExporter,
+            CapabilityKind::DryRunEnforcement,
+            CapabilityKind::ConnectionEnforcement,
+            CapabilityKind::TransparentInterception,
+        ] {
+            assert_eq!(serde_json::to_value(kind)?, kind.wire_name());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_mode_wire_name_matches_json_name() -> Result<(), serde_json::Error> {
+        for mode in [
+            RuntimeMode::Available,
+            RuntimeMode::Degraded,
+            RuntimeMode::Unavailable,
+        ] {
+            assert_eq!(serde_json::to_value(mode)?, mode.wire_name());
+        }
+        Ok(())
     }
 }

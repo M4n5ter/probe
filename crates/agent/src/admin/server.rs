@@ -28,8 +28,8 @@ use pipeline::PipelineRuntimeMetrics;
 use crate::configured_enforcement::LoadedEnforcementPolicySource;
 use crate::export::ExportWorkerRuntimeState;
 use crate::status::{
-    AgentStatusSnapshot, MetricsSnapshot, RuntimeStatusInput, build_status_snapshot_with_runtime,
-    collect_running_spool_status,
+    AgentStatusSnapshot, MetricsSnapshot, PROMETHEUS_TEXT_CONTENT_TYPE, RuntimeStatusInput,
+    build_status_snapshot_with_runtime, collect_running_spool_status, render_prometheus_metrics,
 };
 use crate::tls_plaintext::TlsPlaintextRuntimeState;
 
@@ -417,6 +417,10 @@ fn handle_admin_request(
         AdminRequest::Metrics => AdminResponse::Metrics {
             metrics: Box::new(snapshot.metrics),
         },
+        AdminRequest::PrometheusMetrics => AdminResponse::PrometheusMetrics {
+            content_type: PROMETHEUS_TEXT_CONTENT_TYPE,
+            metrics: render_prometheus_metrics(&snapshot),
+        },
     }
 }
 
@@ -425,14 +429,25 @@ fn handle_admin_request(
 enum AdminRequest {
     Status,
     Metrics,
+    PrometheusMetrics,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum AdminResponse {
-    Status { snapshot: Box<AgentStatusSnapshot> },
-    Metrics { metrics: Box<MetricsSnapshot> },
-    Error { message: String },
+    Status {
+        snapshot: Box<AgentStatusSnapshot>,
+    },
+    Metrics {
+        metrics: Box<MetricsSnapshot>,
+    },
+    PrometheusMetrics {
+        content_type: &'static str,
+        metrics: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -518,7 +533,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_metrics_request_returns_metrics_envelope()
+    async fn admin_metrics_requests_return_json_and_prometheus_views()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("admin-metrics")?;
         let socket_path = temp.join("admin.sock");
@@ -566,6 +581,25 @@ mod tests {
             response["metrics"]["pipeline"]["export_events_written"],
             json!(1)
         );
+
+        let response =
+            send_admin_request(&socket_path, json!({ "command": "prometheus_metrics" })).await?;
+
+        assert_eq!(response["kind"], json!("prometheus_metrics"));
+        assert_eq!(
+            response["content_type"],
+            json!(PROMETHEUS_TEXT_CONTENT_TYPE)
+        );
+        let metrics = response["metrics"]
+            .as_str()
+            .expect("prometheus metrics should be returned as text");
+        assert!(metrics.contains("sssa_pipeline_metrics_available 1\n"));
+        assert!(metrics.contains("sssa_pipeline_capture_events_read_total 1\n"));
+        assert!(metrics.contains("sssa_pipeline_export_events_written_total 1\n"));
+        assert!(metrics.contains("sssa_export_sink_lag{sink=\"primary\"} 1\n"));
+        assert!(metrics.contains(
+            "sssa_capability_state{capability=\"replay_capture\",mode=\"available\"} 1\n"
+        ));
         server.stop().await;
         drop(spool);
         fs::remove_dir_all(temp)?;
