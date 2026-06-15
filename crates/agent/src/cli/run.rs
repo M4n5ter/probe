@@ -188,8 +188,8 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 spool.as_ref(),
                 &mut parser_factory,
                 policies
-                    .iter()
-                    .map(|policy| PipelinePolicy::new(&policy.runtime, policy.selector.as_ref()))
+                    .into_iter()
+                    .map(|policy| PipelinePolicy::new(policy.runtime, policy.selector))
                     .collect(),
                 plan.config.config_version.clone(),
             )
@@ -344,11 +344,7 @@ async fn replay(command: ReplayCommand) -> Result<(), AgentError> {
     let mut pipeline = CapturePipeline::new(
         &spool,
         &mut parser_factory,
-        policy
-            .as_ref()
-            .map(PipelinePolicy::unscoped)
-            .into_iter()
-            .collect(),
+        policy.map(PipelinePolicy::unscoped).into_iter().collect(),
         "replay",
     )
     .with_enforcement_planner(&mut enforcement_planner);

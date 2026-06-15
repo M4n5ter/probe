@@ -185,18 +185,18 @@ end
         let config = config_with_policy(&policy_path)?;
 
         let loaded = load_configured_policies(&config)?;
-        let loaded = loaded.first().expect("configured policy");
+        let loaded_policy = loaded.first().expect("configured policy");
 
-        assert_eq!(loaded.runtime.manifest().id, "guard");
-        assert_eq!(loaded.runtime.manifest().version, "bundle-test");
+        assert_eq!(loaded_policy.runtime.manifest().id, "guard");
+        assert_eq!(loaded_policy.runtime.manifest().version, "bundle-test");
         assert_eq!(
-            loaded.runtime.manifest().hooks,
+            loaded_policy.runtime.manifest().hooks,
             vec![PolicyHook::HttpRequestHeaders]
         );
         assert_eq!(
             policy_alert_versions(
                 &temp.join("bundle-spool"),
-                std::slice::from_ref(loaded),
+                loaded,
                 flow_with_remote_port(80)
             )?,
             vec!["guard@bundle-test"]
@@ -348,13 +348,11 @@ end
                 ..TrafficSelector::default()
             },
         ));
-        let loaded = load_configured_policies(&config)?;
-        let loaded = loaded.first().expect("configured policy");
 
         assert_eq!(
             policy_alert_versions(
                 &temp.join("miss-spool"),
-                std::slice::from_ref(loaded),
+                load_configured_policies(&config)?,
                 flow_with_remote_port(80)
             )?,
             Vec::<String>::new()
@@ -362,7 +360,7 @@ end
         assert_eq!(
             policy_alert_versions(
                 &temp.join("hit-spool"),
-                std::slice::from_ref(loaded),
+                load_configured_policies(&config)?,
                 flow_with_remote_port(443)
             )?,
             vec!["guard@bundle-test"]
@@ -411,7 +409,7 @@ end
         let loaded = load_configured_policies(&config)?;
 
         assert_eq!(
-            policy_alert_versions(&temp.join("spool"), &loaded, flow_with_remote_port(80))?,
+            policy_alert_versions(&temp.join("spool"), loaded, flow_with_remote_port(80))?,
             vec!["first@one", "second@two"]
         );
         fs::remove_dir_all(temp)?;
@@ -444,7 +442,7 @@ end
 
     fn policy_alert_versions(
         spool_path: &Path,
-        policies: &[LoadedConfiguredPolicy],
+        policies: Vec<LoadedConfiguredPolicy>,
         flow: FlowContext,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let spool = storage::FjallSpool::open(spool_path)?;
@@ -462,8 +460,8 @@ end
             &spool,
             &mut parser_factory,
             policies
-                .iter()
-                .map(|policy| PipelinePolicy::new(&policy.runtime, policy.selector.as_ref()))
+                .into_iter()
+                .map(|policy| PipelinePolicy::new(policy.runtime, policy.selector))
                 .collect(),
             "test",
         );

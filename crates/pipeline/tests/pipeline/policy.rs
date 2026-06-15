@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use enforcement::{
     EnforcementBackend, EnforcementBackendDecision, EnforcementBackendRequest, EnforcementError,
     ScopedEnforcementPlanner,
@@ -46,7 +48,7 @@ end
     let mut pipeline = CapturePipeline::new(
         &spool,
         &mut parser_factory,
-        vec![PipelinePolicy::unscoped(&policy)],
+        vec![PipelinePolicy::unscoped(policy)],
         "test",
     )
     .with_runtime_metrics(metrics.clone())
@@ -154,7 +156,7 @@ end
     let mut pipeline = CapturePipeline::new(
         &spool,
         &mut parser_factory,
-        vec![PipelinePolicy::new(&policy, Some(&selector))],
+        vec![PipelinePolicy::new(policy, Some(selector))],
         "test",
     )
     .with_runtime_metrics(metrics.clone());
@@ -212,7 +214,7 @@ end
     let mut pipeline = CapturePipeline::new(
         &spool,
         &mut parser_factory,
-        vec![PipelinePolicy::unscoped(&policy)],
+        vec![PipelinePolicy::unscoped(policy)],
         "test",
     );
 
@@ -357,9 +359,9 @@ end
         &spool,
         &mut parser_factory,
         vec![
-            PipelinePolicy::new(&first, Some(&matching_selector)),
-            PipelinePolicy::new(&second, Some(&missing_selector)),
-            PipelinePolicy::unscoped(&verdict),
+            PipelinePolicy::new(first, Some(matching_selector)),
+            PipelinePolicy::new(second, Some(missing_selector)),
+            PipelinePolicy::unscoped(verdict),
         ],
         "test",
     )
@@ -466,9 +468,9 @@ end
         &spool,
         &mut parser_factory,
         vec![
-            PipelinePolicy::unscoped(&verdict),
-            PipelinePolicy::unscoped(&invalid),
-            PipelinePolicy::unscoped(&later),
+            PipelinePolicy::unscoped(verdict),
+            PipelinePolicy::unscoped(invalid),
+            PipelinePolicy::unscoped(later),
         ],
         "test",
     )
@@ -535,6 +537,51 @@ end
 }
 
 #[test]
+fn policy_error_metric_counts_only_persisted_runtime_errors()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = ExportFailureAfterFirstSpool::new(storage::FjallSpool::open(temp.path())?);
+    let policy = PolicyRuntime::from_source(
+        PolicyManifest {
+            id: "invalid-policy".to_string(),
+            version: "one".to_string(),
+            hooks: vec![PolicyHook::HttpRequestHeaders],
+        },
+        r#"
+function on_http_request_headers(_)
+  return "not a policy outcome"
+end
+"#,
+    )?;
+    let metrics = PipelineRuntimeMetrics::default();
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut provider = SequenceProvider::new(vec![captured_bytes(
+        demo_flow_with_ports(50_000, 80, 33),
+        b"GET /bad-metric HTTP/1.1\r\nHost: test\r\n\r\n",
+    )]);
+    let mut pipeline = CapturePipeline::new(
+        &spool,
+        &mut parser_factory,
+        vec![PipelinePolicy::unscoped(policy)],
+        "test",
+    )
+    .with_runtime_metrics(metrics.clone());
+
+    let error = pipeline
+        .run_provider(&mut provider)
+        .expect_err("policy runtime error append should fail");
+
+    assert!(matches!(
+        error,
+        pipeline::PipelineError::Storage(storage::StorageError::Io(_))
+    ));
+    let metrics = metrics.snapshot();
+    assert_eq!(metrics.policy.evaluations, 1);
+    assert_eq!(metrics.policy.errors, 0);
+    Ok(())
+}
+
+#[test]
 fn enforcement_error_is_exported_after_verdict_audit() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let spool = storage::FjallSpool::open(temp.path())?;
@@ -569,7 +616,7 @@ end
     let mut pipeline = CapturePipeline::new(
         &spool,
         &mut parser_factory,
-        vec![PipelinePolicy::unscoped(&policy)],
+        vec![PipelinePolicy::unscoped(policy)],
         "test",
     )
     .with_runtime_metrics(metrics.clone())
@@ -615,5 +662,139 @@ impl EnforcementBackend for FailingBackend {
         _request: EnforcementBackendRequest<'_>,
     ) -> Result<EnforcementBackendDecision, EnforcementError> {
         Err(EnforcementError::Backend("planned failure".to_string()))
+    }
+}
+
+struct ExportFailureAfterFirstSpool {
+    inner: storage::FjallSpool,
+    successful_export_appends: Cell<usize>,
+}
+
+impl ExportFailureAfterFirstSpool {
+    fn new(inner: storage::FjallSpool) -> Self {
+        Self {
+            inner,
+            successful_export_appends: Cell::new(1),
+        }
+    }
+}
+
+impl storage::ExportSpool for ExportFailureAfterFirstSpool {
+    fn read_export_batch(
+        &self,
+        sink: &str,
+        limit: usize,
+    ) -> Result<Vec<storage::StoredEvent>, storage::StorageError> {
+        self.inner.read_export_batch(sink, limit)
+    }
+
+    fn ack_export(&self, sink: &str, sequence: u64) -> Result<(), storage::StorageError> {
+        self.inner.ack_export(sink, sequence)
+    }
+
+    fn export_cursor(&self, sink: &str) -> Result<u64, storage::StorageError> {
+        self.inner.export_cursor(sink)
+    }
+
+    fn prune_export_through(
+        &self,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<u64, storage::StorageError> {
+        self.inner.prune_export_through(sequence, limit)
+    }
+
+    fn prune_expired_export_prefix(
+        &self,
+        cutoff_unix_ns: u64,
+        limit: usize,
+        cursor_owners: &[&str],
+    ) -> Result<storage::RetentionPrune, storage::StorageError> {
+        self.inner
+            .prune_expired_export_prefix(cutoff_unix_ns, limit, cursor_owners)
+    }
+
+    fn prune_export_to_max_records(
+        &self,
+        max_records: u64,
+        limit: usize,
+        cursor_owners: &[&str],
+    ) -> Result<storage::RetentionPrune, storage::StorageError> {
+        self.inner
+            .prune_export_to_max_records(max_records, limit, cursor_owners)
+    }
+}
+
+impl storage::DurableSpool for ExportFailureAfterFirstSpool {
+    fn append_ingress(
+        &self,
+        payload: storage::SpoolPayload,
+    ) -> Result<storage::StoredEvent, storage::StorageError> {
+        self.inner.append_ingress(payload)
+    }
+
+    fn read_ingress_batch(
+        &self,
+        consumer: storage::IngressCursorOwner,
+        limit: usize,
+    ) -> Result<Vec<storage::StoredEvent>, storage::StorageError> {
+        self.inner.read_ingress_batch(consumer, limit)
+    }
+
+    fn read_ingress_batch_after(
+        &self,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<storage::StoredEvent>, storage::StorageError> {
+        self.inner.read_ingress_batch_after(sequence, limit)
+    }
+
+    fn ack_ingress(
+        &self,
+        consumer: storage::IngressCursorOwner,
+        sequence: u64,
+    ) -> Result<(), storage::StorageError> {
+        self.inner.ack_ingress(consumer, sequence)
+    }
+
+    fn ingress_cursor(
+        &self,
+        consumer: storage::IngressCursorOwner,
+    ) -> Result<u64, storage::StorageError> {
+        self.inner.ingress_cursor(consumer)
+    }
+
+    fn append_export(
+        &self,
+        payload: storage::SpoolPayload,
+    ) -> Result<storage::StoredEvent, storage::StorageError> {
+        let remaining = self.successful_export_appends.get();
+        if remaining == 0 {
+            return Err(storage::StorageError::Io(std::io::Error::other(
+                "planned export failure",
+            )));
+        }
+        self.successful_export_appends.set(remaining - 1);
+        self.inner.append_export(payload)
+    }
+
+    fn prune_expired_ingress_prefix(
+        &self,
+        cutoff_unix_ns: u64,
+        limit: usize,
+        consumers: &[storage::IngressCursorOwner],
+    ) -> Result<storage::RetentionPrune, storage::StorageError> {
+        self.inner
+            .prune_expired_ingress_prefix(cutoff_unix_ns, limit, consumers)
+    }
+
+    fn prune_ingress_to_max_records(
+        &self,
+        max_records: u64,
+        limit: usize,
+        consumers: &[storage::IngressCursorOwner],
+    ) -> Result<storage::RetentionPrune, storage::StorageError> {
+        self.inner
+            .prune_ingress_to_max_records(max_records, limit, consumers)
     }
 }

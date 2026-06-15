@@ -43,7 +43,7 @@ end
     let mut pipeline = CapturePipeline::new(
         &spool,
         &mut parser_factory,
-        vec![PipelinePolicy::unscoped(&policy)],
+        vec![PipelinePolicy::unscoped(policy)],
         "test",
     );
 

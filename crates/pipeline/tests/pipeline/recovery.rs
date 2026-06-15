@@ -69,20 +69,7 @@ fn recover_ingress_journal_replays_policy_outputs_with_stable_event_id()
         b"GET /policy-recovered HTTP/1.1\r\nHost: recovery.test\r\n\r\n",
     );
     spool.append_ingress(capture_event_payload(&event)?)?;
-    let policy = PolicyRuntime::from_source(
-        PolicyManifest {
-            id: "recovery-policy".to_string(),
-            version: "one".to_string(),
-            hooks: vec![PolicyHook::HttpRequestHeaders],
-        },
-        r#"
-function on_http_request_headers(event)
-  return probe.emit_alert("recovered " .. event.kind.target)
-end
-"#,
-    )?;
-
-    let first = recover_with_policy(&spool, &policy)?;
+    let first = recover_with_policy(&spool, recovery_policy()?)?;
 
     assert_eq!(first.ingress_records_recovered, 1);
     assert_eq!(first.export_events_written, 2);
@@ -90,7 +77,7 @@ end
         .into_iter()
         .next()
         .expect("first recovery should export policy alert");
-    let repeated = recover_with_policy(&spool, &policy)?;
+    let repeated = recover_with_policy(&spool, recovery_policy()?)?;
     assert_eq!(repeated.ingress_records_recovered, 1);
     assert_eq!(repeated.export_events_written, 2);
     assert_eq!(policy_alert_ids(&spool)?, vec![first_id.clone(), first_id]);
@@ -341,7 +328,7 @@ fn recover_without_policy(spool: &storage::FjallSpool) -> Result<PipelineSummary
 
 fn recover_with_policy(
     spool: &storage::FjallSpool,
-    policy: &PolicyRuntime,
+    policy: PolicyRuntime,
 ) -> Result<PipelineSummary, PipelineError> {
     let mut parser_factory = Http1ParserFactory::default();
     let mut pipeline = CapturePipeline::new(
@@ -351,6 +338,21 @@ fn recover_with_policy(
         "test",
     );
     pipeline.recover_ingress_journal_until_idle(16)
+}
+
+fn recovery_policy() -> Result<PolicyRuntime, policy::PolicyError> {
+    PolicyRuntime::from_source(
+        PolicyManifest {
+            id: "recovery-policy".to_string(),
+            version: "one".to_string(),
+            hooks: vec![PolicyHook::HttpRequestHeaders],
+        },
+        r#"
+function on_http_request_headers(event)
+  return probe.emit_alert("recovered " .. event.kind.target)
+end
+"#,
+    )
 }
 
 fn count_request_targets(

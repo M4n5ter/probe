@@ -83,7 +83,7 @@ impl PipelineRunOptions {
 pub struct CapturePipeline<'a, S> {
     spool: &'a S,
     parser_factory: &'a mut dyn ProtocolParserFactory,
-    policies: Vec<PipelinePolicy<'a>>,
+    policies: Vec<PipelinePolicy>,
     enforcement_planner: Option<&'a mut dyn EnforcementPlanner>,
     config_version: String,
     clock: PipelineClock,
@@ -91,23 +91,23 @@ pub struct CapturePipeline<'a, S> {
     runtime_metrics: Option<PipelineRuntimeMetrics>,
 }
 
-#[derive(Clone, Copy)]
-pub struct PipelinePolicy<'a> {
-    runtime: &'a PolicyRuntime,
-    selector: Option<&'a CompiledSelector>,
+pub struct PipelinePolicy {
+    runtime: PolicyRuntime,
+    selector: Option<CompiledSelector>,
 }
 
-impl<'a> PipelinePolicy<'a> {
-    pub fn new(runtime: &'a PolicyRuntime, selector: Option<&'a CompiledSelector>) -> Self {
+impl PipelinePolicy {
+    pub fn new(runtime: PolicyRuntime, selector: Option<CompiledSelector>) -> Self {
         Self { runtime, selector }
     }
 
-    pub fn unscoped(runtime: &'a PolicyRuntime) -> Self {
+    pub fn unscoped(runtime: PolicyRuntime) -> Self {
         Self::new(runtime, None)
     }
 
     fn matches(&self, envelope: &EventEnvelope) -> bool {
         self.selector
+            .as_ref()
             .is_none_or(|selector| selector.matches_event(envelope))
     }
 }
@@ -119,7 +119,7 @@ where
     pub fn new(
         spool: &'a S,
         parser_factory: &'a mut dyn ProtocolParserFactory,
-        policies: Vec<PipelinePolicy<'a>>,
+        policies: Vec<PipelinePolicy>,
         config_version: impl Into<String>,
     ) -> Self {
         Self {
@@ -389,13 +389,7 @@ where
 
         if let Some(hook) = hook_for_event(&envelope) {
             for policy_index in 0..self.policies.len() {
-                let policy = self.policies[policy_index];
-                written += self.append_matching_policy_outputs(
-                    &envelope,
-                    policy,
-                    policy_index as u64,
-                    hook,
-                )?;
+                written += self.append_matching_policy_outputs(&envelope, policy_index, hook)?;
             }
         }
         Ok(written)
@@ -404,15 +398,57 @@ where
     fn append_matching_policy_outputs(
         &mut self,
         envelope: &EventEnvelope,
-        policy: PipelinePolicy<'a>,
-        policy_index: u64,
+        policy_index: usize,
         hook: PolicyHook,
     ) -> Result<u64, PipelineError> {
+        match self.evaluate_policy(policy_index, envelope, hook) {
+            PolicyEvaluation::SelectorMiss => Ok(0),
+            PolicyEvaluation::RuntimeError {
+                policy_version,
+                reason,
+            } => {
+                self.append_policy_runtime_error(
+                    envelope,
+                    &policy_version,
+                    policy_index as u64,
+                    reason,
+                )?;
+                if let Some(metrics) = &self.runtime_metrics {
+                    metrics.record_policy_error();
+                }
+                Ok(1)
+            }
+            PolicyEvaluation::Outcomes {
+                policy_version,
+                outcomes,
+            } => {
+                let mut written = 0;
+                for (output_index, outcome) in outcomes.into_iter().enumerate() {
+                    written += self.append_policy_outcome(
+                        envelope,
+                        &policy_version,
+                        policy_index as u64,
+                        output_index as u64,
+                        outcome,
+                    )?;
+                }
+                Ok(written)
+            }
+        }
+    }
+
+    fn evaluate_policy(
+        &self,
+        policy_index: usize,
+        envelope: &EventEnvelope,
+        hook: PolicyHook,
+    ) -> PolicyEvaluation {
+        let policy = &self.policies[policy_index];
         if !policy.matches(envelope) {
             if let Some(metrics) = &self.runtime_metrics {
                 metrics.record_policy_selector_miss();
             }
-            return Ok(0);
+            return PolicyEvaluation::SelectorMiss;
         }
 
         let policy_version = format!(
@@ -424,27 +460,16 @@ where
             metrics.record_policy_evaluation();
         }
 
-        let outcomes = match policy.runtime.handle_event(hook, envelope) {
-            Ok(outcomes) => outcomes,
-            Err(source) => {
-                self.append_policy_runtime_error(envelope, &policy_version, policy_index, &source)?;
-                if let Some(metrics) = &self.runtime_metrics {
-                    metrics.record_policy_error();
-                }
-                return Ok(1);
-            }
-        };
-        let mut written = 0;
-        for (output_index, outcome) in outcomes.into_iter().enumerate() {
-            written += self.append_policy_outcome(
-                envelope,
-                &policy_version,
-                policy_index,
-                output_index as u64,
-                outcome,
-            )?;
+        match policy.runtime.handle_event(hook, envelope) {
+            Ok(outcomes) => PolicyEvaluation::Outcomes {
+                policy_version,
+                outcomes,
+            },
+            Err(source) => PolicyEvaluation::RuntimeError {
+                policy_version,
+                reason: source.to_string(),
+            },
         }
-        Ok(written)
     }
 
     fn append_policy_runtime_error(
@@ -452,7 +477,7 @@ where
         envelope: &EventEnvelope,
         policy_version: &str,
         policy_index: u64,
-        source: &policy::PolicyError,
+        reason: String,
     ) -> Result<(), PipelineError> {
         self.append_policy_event(
             envelope,
@@ -462,7 +487,7 @@ where
             PolicyEmissionStage::RuntimeError,
             EventKind::PolicyRuntimeError(PolicyRuntimeError {
                 event_type: envelope.kind.event_type(),
-                reason: source.to_string(),
+                reason,
             }),
         )
     }
@@ -575,6 +600,18 @@ where
         }
         Ok(())
     }
+}
+
+enum PolicyEvaluation {
+    SelectorMiss,
+    RuntimeError {
+        policy_version: String,
+        reason: String,
+    },
+    Outcomes {
+        policy_version: String,
+        outcomes: Vec<PolicyOutcome>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]

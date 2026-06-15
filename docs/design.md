@@ -103,6 +103,7 @@ flowchart LR
 - 已实现 crate-local `TlsMaterialFileStore` 边界和 filesystem backend；exporter mTLS material 读取、TLS plaintext material `check` 和 status metadata source check 都通过同一路 path-based file store abstraction，而不是各自直接访问文件系统。当前 backend 只支持有界 regular file。
 - 已实现 `check` 的 TLS plaintext material 内容核验：对显式引用的 `key_log_file` 通过 `TlsMaterialFileStore` 读取有界 regular file，并按 NSS/SSLKEYLOGFILE 三字段语法解析 label、context 和 secret hex；解析结果和 check report 只输出 entries 与 label counts，不保留 secret bytes，也不在错误中泄漏 secret 字段值。`session_secret_file` 当前只做同一 bounded source read，并以 byte 摘要出现在 check report 中，等待后续 session secret schema 定义。
 - 已实现 `pipeline` crate 的 `CapturePipeline`，负责 capture event -> ingress journal -> per-flow parser -> policy -> enforcement audit -> export queue 的 replay/shared processing；ingress journal 现在写入完整 `CaptureEvent` JSON payload，而不是只写入 bytes payload，因此 bytes、gap、connection opened/closed 都能按 sequence 恢复；`ConnectionClosed` 会先进入 parser 以 flush close-delimited HTTP/1 body，再释放 per-flow parser state；pipeline 支持可选 `max_events` 运行边界，便于对真实 live provider 做有界运行验证；`PipelineRuntimeMetrics` 是 pipeline 运行态计数的 owner，当前覆盖 capture read、ingress journal/recovery/processed、export event writes、policy evaluation/selector miss/alert/verdict/error 和 enforcement decision outcome counters。policy runtime error 会作为带 `policy_version` 和 typed `event_type` 的 `policy_runtime_error` audit event 写入 export queue，并且不阻止同一原始事件上的其它 policy 继续运行。pipeline 生成的 export event 带 typed `EventProvenance`：primary parser event 使用 `ingress_sequence + primary index`，policy/enforcement 派生事件使用 trigger primary index、policy index、policy output index 和 `stage`；event id 在存在 provenance 时基于该 provenance 而不是进程本地 monotonic timestamp，因此同一 ingress replay 重放出的同一语义事件具有稳定 id，且后续 primary event 不会因前面 policy 输出数量变化而改变 provenance。`recover_ingress_journal_until_idle` 可从 durable ingress journal 按 sequence 顺序重放 `CaptureEventJson` payload，重新进入 parser/policy/export queue，并且只在所有 per-flow parser state 都处于 checkpoint-safe 状态时推进 durable parser safe-prefix cursor；`agent run` 会在打开 capture provider 之前先执行该恢复，避免 provider 构造失败时 stranded 已落盘输入；配置了 storage retention 时，统一 worker 会在本轮启动恢复完成后再开始清理过期 ingress/export 连续前缀，避免 ingress 恢复输入被抢先删除。该恢复仍是 best-effort、at-least-once：如果进程在 export 写入之后崩溃，恢复可能重复写入相同 event id 的同一语义事件，当前 export queue 不在写入端去重。恢复按当前配置和当前 policy 重新解释旧 ingress event，但不挂载 enforcement planner，避免历史 ingress 触发真实或 dry-run enforcement decision；当前不会把 active parser 内存状态序列化落盘，因此崩溃后仍可能从 safe-prefix cursor 之后重放 ingress 来重建半包/半消息状态。`agent` binary 负责 CLI wiring、配置读取、provider 探测/构造、spool/policy/parser/enforcement planner/pipeline 组合、storage retention worker、连续 exporter worker、replay exporter 命令和状态/metrics 快照输出。
+- `CapturePipeline` 现在持有加载后的 `PipelinePolicy` runtime set，而不是借用 agent composition root 里的临时 policy runtime。这个 ownership 边界是后续实现 policy reload/atomic swap 的前提：reload 需要替换 pipeline 正在使用的 active policy set，而不是只让 admin/check 路径加载出一份新的策略。当前仍未实现在线热切换或后台 reload worker。
 - 已实现 HTTP/1 parser 的 message-role 识别：`Direction` 表示相对归因进程的 inbound/outbound，而 request/response 由 header 语法决定。这样本机服务端收到的 inbound request 会产生 `HttpRequestHeaders`，本机服务端发出的 outbound response 会产生 `HttpResponseHeaders`，不会把进程方向误当 HTTP 角色。parser 已识别 WebSocket HTTP Upgrade，输出 `WebSocketHandoff` 后切换到 WebSocket frame parser；后续字节会输出 `WebSocketFrame` metadata，包括方向、HTTP stream sequence、frame sequence、FIN/RSV/opcode/masked/payload length 和 payload fingerprint。frame payload 以增量 BLAKE3 hash 计算 fingerprint，不为了 metadata 缓存完整 payload。当前不聚合完整 WebSocket message，不解压 extension payload。
 - 已实现 configured policy loader 的 bundle 入口：`policies[].path` 必须指向目录，policy id 必须唯一，并按 `manifest.toml` + `main.lua` 加载。manifest 目前支持 `id`、`version` 和 typed `hooks`，并要求 manifest id 与配置中的 policy id 一致；多个 enabled bundle 会按配置顺序进入同一 pipeline，各自应用自己的 selector 并产出带 `policy_version` 的 alert/verdict/enforcement audit event；`status` 只做 bundle metadata/manifest 校验，不执行 Lua；`check` 和 `run` 会显式加载并执行初始化。`replay --policy` 仍可直接读取单个 Lua 文件作为本地调试入口，但它不参与 configured policy source 抽象。
 - 已实现 capability matrix，当前状态按下表维护；具体实现细节和验证路径分散在后续对应章节，避免一条段落同时承担所有能力声明。
@@ -154,7 +155,7 @@ flowchart LR
 - 采集能力：eBPF syscall/tracepoint、libpcap fallback、procfs attribution。
 - TLS 明文能力：libssl uprobe、keylog/session secret、future MITM provider。
 - 协议能力：HTTP/1.x、SSE、WebSocket upgrade detection、WebSocket frame metadata、opaque stream。
-- 策略能力：LuaJIT、JIT 状态、policy state API、hot reload。
+- 策略能力：LuaJIT、JIT 状态、policy state API、future hot reload。
 - 动作能力：dry-run verdict、connection-level enforcement capability boundary、未来 eBPF backend。
 - 外发能力：spool-backed exporter、best-effort sink、codec 支持、mTLS。
 
@@ -207,7 +208,7 @@ flowchart TD
 
 当前实现还提供 process-scope projection：`CompiledSelector::may_match_process(process)` 只保证 `false` 表示该进程可在 flow attribution 前安全排除，`true` 只是保留候选而不是证明未来一定存在匹配 flow。它会用 process selector 做可验证剪枝，但不会因为 attach 前未知的 traffic 维度误杀候选进程；traffic-only selector 保持候选，`not` 也按保守语义处理。对于 partial process context，空/`unknown` 进程名、空 exe path、空 cmdline hash、缺失 systemd service 或缺失 container id 都按未知处理，只能保留候选，不能排除候选。最终是否命中仍由完整 flow + direction selector 决定。`TargetScope` 是 enforcement 层的一等目标边界：它只提供 `may_include_process` 供 future process-scoped interception setup 预筛，并提供 `matches_trigger` 供 per-flow verdict 决策；`ProtectiveActionProfile` 由 `ScopedEnforcementPlanner` 单独持有和校验。现有 libssl uprobe 动态 attach 和深度 payload 开关复用同一 `CompiledSelector` process projection 语义，但还没有通过 `TargetScope` 统一生命周期 owner。
 
-selector 热更新语义：
+selector reload 目标语义：
 
 - 新连接按新 selector。
 - 已有 flow 在下一个事件阶段重新评估 capability。
@@ -662,6 +663,7 @@ manifest 应声明：
 - `check`/`run` 加载 bundle 后会校验 manifest 声明的每个 hook 都在 Lua VM 中定义为函数；缺失或拼错 hook 会 fail closed，不能报告为 loaded 后静默 no-op。
 - bundle source entry 会拒绝 symlink，并通过 no-follow open、handle metadata 和 capped read 读取 `manifest.toml`/`main.lua`，避免把 bundle 目录外文件静默纳入策略源。
 - `main.lua` 复用现有 sandbox、instruction budget 和 memory limit；bundle-local `lib/`、checksum/signature、bundle 内 selector、capability requirement、state budget 和 hot reload 尚未实现。
+- 运行中的 pipeline 已经拥有 loaded policy runtime set，这消除了后续 reload/atomic swap 的外部借用障碍；但当前没有动态替换 active policy set，也没有后台 reload worker。
 - `policies[].path` 只接受 policy bundle directory。`replay --policy` 可直接读取单个 Lua 文件用于本地调试，但该入口不生成 configured policy source metadata，也不参与 `status`/`check` 的 bundle source contract。
 
 ## 17. Lua API 与状态
@@ -716,7 +718,7 @@ Lua API 采用受控领域 API：
 - 事件按 `flow_id` 分片，保证同一 flow 有序。
 - 跨 worker 共享状态只能通过有界 state API。
 
-热更新模型：
+热更新目标模型：
 
 - 新 policy bundle 在独立 Lua VM 中加载和校验。
 - 校验通过后原子切换到新 VM。
@@ -828,9 +830,10 @@ live processing path 中每个保护型 verdict 都必须输出 `EnforcementDeci
 配置形态：
 
 - 主配置使用 TOML。
-- 支持目录化拆分，例如 `policies.d`、`exporters.d`、`selectors.d`。
-- 文件变更触发 validate-then-swap。
-- 新配置验证失败时不切换当前 active config，并输出错误。
+- 当前实现从单个 TOML 文件读取主配置，并通过 `policies[].path` 指向 policy bundle directory。
+- 目录化拆分（例如 `policies.d`、`exporters.d`、`selectors.d`）是目标形态，尚未实现。
+- 文件变更触发 validate-then-swap 是后续 hot reload 目标；当前没有后台 config watcher，也不会动态切换 active config。
+- 目标形态中，新配置验证失败时不切换当前 active config，并输出错误。
 
 配置源抽象：
 
@@ -1132,11 +1135,11 @@ endpoint 配置或能力不匹配时 fail fast。当前实现使用 `Compression
 
 - health。
 - capabilities。
-- reload。
-- debug dump。
 - metrics snapshot。
 - policy status。
 - spool status。
+- future reload。
+- future debug dump。
 - exporter status。
 
 默认不监听 TCP，降低攻击面。Prometheus metrics 当前通过 admin socket adapter 导出；可选 localhost listener 后续只应作为同一 text renderer 的监听器外壳。
@@ -1329,7 +1332,7 @@ Runtime/config/status 验证覆盖：
 
 当前已验证的 exporter worker 和 storage retention 路径：agent export 测试覆盖 planned exporter sinks 使用独立 sink cursor、某个 sink 失败不阻止其它 sink 尝试、失败 sink 未确认时 acked-prefix cleanup 不会清理其待投递事件、webhook protocol headers 不被配置覆盖、后台 worker 能按配置化 fixed bounded worker mode 从 Fjall export queue drain 到 webhook receiver、在启动后继续处理新追加事件并推进对应 sink cursor、per-sink batch quota 会覆盖全局每轮预算，以及失败 sink backoff 不阻塞健康 sink 继续推进。agent storage retention 测试覆盖统一 retention config 同时生成 ingress/export lane policy、无 retention limit 时不启动 worker、ingress 过期前缀与容量前缀退休 pipeline parser cursor、export 过期前缀与容量前缀退休 planned sink cursor。pipeline 集成测试覆盖 export event 携带 ingress provenance、同一 ingress 内 primary index 递增且不被 policy 输出数量扰动、policy verdict 与 enforcement decision 使用不同 provenance stage，recovery 重放同一 ingress 时 primary 和 policy-derived event 都产出稳定 event id，未 checkpoint-safe 的 parser state 和 active WebSocket handoff state 不推进 cursor，以及 live/recovery 在 flow checkpoint-safe 后推进 durable safe-prefix cursor；exporter 单元测试覆盖重复 semantic event id 仍通过 cursor ACK 推进、event-id based ACK 字段 fail closed、accepted ACK 缺 cursor fail closed、rejected ACK 不会提交 cursor。backoff 单元测试覆盖 runtime plan 到 worker config wiring 后的 failure completion 计时、指数增长、max clamp 和 success reset；storage 单元测试覆盖 export queue/ingress journal 前缀 prune 不改变 durable high-water 或 ack 上限、stored record timestamp reopen 后保留、retention prune 有界且只删除连续前缀、max-records 保留最新真实 record 后缀、retired cursor 不会被低位 ack 回退；config/runtime 测试覆盖 `[storage.retention.ingress]` / `[storage.retention.export]` 的 `max_age_ms`、`max_records` 解析、校验和 plan；agent status 测试覆盖 spool/export status 暴露 retention plan。该验证覆盖连续有界 drain、per-sink batch quota、失败 sink 隔离、acked-prefix cleanup、retention deadline、max-records retention、ingress provenance、parser safe-prefix cursor 与指数失败 backoff 的最小闭环；不代表 active parser state snapshot 已完成。
 
-当前已验证的 pipeline runtime metrics 路径：pipeline 集成测试覆盖 capture read、ingress journal/process、export writes 与 summary 对齐；policy selector miss、policy alert/verdict/runtime error 和 dry-run/failed enforcement decision outcome 会进入 `PipelineRuntimeMetrics`。status 测试覆盖 runtime snapshot 注入到 `metrics.pipeline` JSON，以及 offline/unknown 时保持 `null`；admin 测试通过真实 pipeline 产生非零计数后，覆盖 metrics envelope 和 Prometheus text exposition 都从共享 runtime state 读取在线 pipeline metrics。当前 metrics 是进程内计数，不是 durable counter；崩溃恢复会重新开始计数，但 ingress/export spool 仍是事实源。
+当前已验证的 pipeline runtime metrics 路径：pipeline 集成测试覆盖 capture read、ingress journal/process、export writes 与 summary 对齐；policy selector miss、policy alert/verdict/runtime error 和 dry-run/failed enforcement decision outcome 会进入 `PipelineRuntimeMetrics`。configured policy 测试覆盖加载后的 bundle runtime/selector 以 owned policy set 进入 pipeline 后仍保持命中、未命中和多 bundle 顺序语义。status 测试覆盖 runtime snapshot 注入到 `metrics.pipeline` JSON，以及 offline/unknown 时保持 `null`；admin 测试通过真实 pipeline 产生非零计数后，覆盖 metrics envelope 和 Prometheus text exposition 都从共享 runtime state 读取在线 pipeline metrics。当前 metrics 是进程内计数，不是 durable counter；崩溃恢复会重新开始计数，但 ingress/export spool 仍是事实源。
 
 当前端到端验收：
 
@@ -1456,10 +1459,10 @@ enforcement 抽象验收：
 | Policy Bundle | manifest + main.lua + bundle-local modules | 第 16 节 |
 | 策略 Hook | 分阶段 Hook，selector 先预过滤 | 第 17 节 |
 | policy state | 有界状态 API，跨 worker eventually consistent | 第 17 节 |
-| 热更新 | 新 VM 校验后原子切换，Lua 隐式状态不跨切换保留 | 第 17 节 |
+| 热更新目标 | 后续应以新 VM 校验后原子切换，Lua 隐式状态不跨切换保留；当前未实现 | 第 17 节 |
 | 拦截抽象 | PolicyRuntime + external enforcement manifest + TargetScope + ScopedEnforcementPlanner + EnforcementBackend boundary + 显式 linux socket destroy backend + connection_enforcement capability + transparent_interception strategy plan/capability | 第 18 节 |
 | 当前拦截验收 | dry-run typed verdict、external manifest protection profile、selector 合成，以及显式 backend 下的 owner-verified TCP socket destroy audit decision | 第 18、31 节 |
-| 配置 | TOML + 目录热加载，预留 RemoteConfigSource | 第 19 节 |
+| 配置 | 当前为单 TOML 主配置 + policy bundle directory；目录化拆分、目录热加载和 RemoteConfigSource 仍是目标态 | 第 19 节 |
 | runtime plan | provider descriptor `ProviderRegistry` 生成 capability matrix，`RuntimePlan` 解析 capture backend selection、export worker effective plan、enforcement capability/source plan；`auto` 使用有序 live fallback，显式 backend 是 required backend；默认 auto 在无 live provider 时显式 unavailable，`run` fail closed | 第 19、27 节 |
 | TLS material file store | 已有 crate-local `TlsMaterialFileStore` + filesystem backend；路径白名单和权限强校验可以在该 file store 内演进；Vault/KMS/TPM 需要先引入 typed material source enum | 第 20 节 |
 | durable spool 目标 | ingress journal + export queue 双层 spool | 第 21 节 |
