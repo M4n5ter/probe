@@ -1,4 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use capture::{CaptureError, CaptureEvent, CaptureProvider, CapturedBytes};
 use enforcement::{EnforcementPlanRequest, EnforcementPlanner};
@@ -83,7 +86,7 @@ impl PipelineRunOptions {
 pub struct CapturePipeline<'a, S> {
     spool: &'a S,
     parser_factory: &'a mut dyn ProtocolParserFactory,
-    policies: Vec<PipelinePolicy>,
+    policies: PipelinePolicySet,
     enforcement_planner: Option<&'a mut dyn EnforcementPlanner>,
     config_version: String,
     clock: PipelineClock,
@@ -91,14 +94,18 @@ pub struct CapturePipeline<'a, S> {
     runtime_metrics: Option<PipelineRuntimeMetrics>,
 }
 
+#[derive(Clone)]
 pub struct PipelinePolicy {
-    runtime: PolicyRuntime,
-    selector: Option<CompiledSelector>,
+    runtime: Arc<Mutex<PolicyRuntime>>,
+    selector: Option<Arc<CompiledSelector>>,
 }
 
 impl PipelinePolicy {
     pub fn new(runtime: PolicyRuntime, selector: Option<CompiledSelector>) -> Self {
-        Self { runtime, selector }
+        Self {
+            runtime: Arc::new(Mutex::new(runtime)),
+            selector: selector.map(Arc::new),
+        }
     }
 
     pub fn unscoped(runtime: PolicyRuntime) -> Self {
@@ -112,6 +119,46 @@ impl PipelinePolicy {
     }
 }
 
+#[derive(Clone)]
+pub struct PipelinePolicySet {
+    inner: Arc<Mutex<Vec<PipelinePolicy>>>,
+}
+
+impl Default for PipelinePolicySet {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+impl PipelinePolicySet {
+    pub fn new(policies: Vec<PipelinePolicy>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(policies)),
+        }
+    }
+
+    pub fn replace(&self, policies: Vec<PipelinePolicy>) {
+        let mut current = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = policies;
+    }
+
+    fn snapshot(&self) -> Vec<PipelinePolicy> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl From<Vec<PipelinePolicy>> for PipelinePolicySet {
+    fn from(policies: Vec<PipelinePolicy>) -> Self {
+        Self::new(policies)
+    }
+}
+
 impl<'a, S> CapturePipeline<'a, S>
 where
     S: DurableSpool,
@@ -119,13 +166,13 @@ where
     pub fn new(
         spool: &'a S,
         parser_factory: &'a mut dyn ProtocolParserFactory,
-        policies: Vec<PipelinePolicy>,
+        policies: impl Into<PipelinePolicySet>,
         config_version: impl Into<String>,
     ) -> Self {
         Self {
             spool,
             parser_factory,
-            policies,
+            policies: policies.into(),
             enforcement_planner: None,
             config_version: config_version.into(),
             clock: PipelineClock::default(),
@@ -388,31 +435,30 @@ where
         let mut written = 1;
 
         if let Some(hook) = hook_for_event(&envelope) {
-            for policy_index in 0..self.policies.len() {
-                written += self.append_matching_policy_outputs(&envelope, policy_index, hook)?;
+            let active_policies = self.policies.snapshot();
+            for (policy_index, policy) in active_policies.iter().enumerate() {
+                let evaluation =
+                    evaluate_policy(policy, &envelope, hook, self.runtime_metrics.as_ref());
+                written += self.append_policy_evaluation(&envelope, policy_index, evaluation)?;
             }
         }
         Ok(written)
     }
 
-    fn append_matching_policy_outputs(
+    fn append_policy_evaluation(
         &mut self,
         envelope: &EventEnvelope,
         policy_index: usize,
-        hook: PolicyHook,
+        evaluation: PolicyEvaluation,
     ) -> Result<u64, PipelineError> {
-        match self.evaluate_policy(policy_index, envelope, hook) {
+        let policy_index = policy_index as u64;
+        match evaluation {
             PolicyEvaluation::SelectorMiss => Ok(0),
             PolicyEvaluation::RuntimeError {
                 policy_version,
                 reason,
             } => {
-                self.append_policy_runtime_error(
-                    envelope,
-                    &policy_version,
-                    policy_index as u64,
-                    reason,
-                )?;
+                self.append_policy_runtime_error(envelope, &policy_version, policy_index, reason)?;
                 if let Some(metrics) = &self.runtime_metrics {
                     metrics.record_policy_error();
                 }
@@ -427,48 +473,13 @@ where
                     written += self.append_policy_outcome(
                         envelope,
                         &policy_version,
-                        policy_index as u64,
+                        policy_index,
                         output_index as u64,
                         outcome,
                     )?;
                 }
                 Ok(written)
             }
-        }
-    }
-
-    fn evaluate_policy(
-        &self,
-        policy_index: usize,
-        envelope: &EventEnvelope,
-        hook: PolicyHook,
-    ) -> PolicyEvaluation {
-        let policy = &self.policies[policy_index];
-        if !policy.matches(envelope) {
-            if let Some(metrics) = &self.runtime_metrics {
-                metrics.record_policy_selector_miss();
-            }
-            return PolicyEvaluation::SelectorMiss;
-        }
-
-        let policy_version = format!(
-            "{}@{}",
-            policy.runtime.manifest().id,
-            policy.runtime.manifest().version
-        );
-        if let Some(metrics) = &self.runtime_metrics {
-            metrics.record_policy_evaluation();
-        }
-
-        match policy.runtime.handle_event(hook, envelope) {
-            Ok(outcomes) => PolicyEvaluation::Outcomes {
-                policy_version,
-                outcomes,
-            },
-            Err(source) => PolicyEvaluation::RuntimeError {
-                policy_version,
-                reason: source.to_string(),
-            },
         }
     }
 
@@ -612,6 +623,40 @@ enum PolicyEvaluation {
         policy_version: String,
         outcomes: Vec<PolicyOutcome>,
     },
+}
+
+fn evaluate_policy(
+    policy: &PipelinePolicy,
+    envelope: &EventEnvelope,
+    hook: PolicyHook,
+    metrics: Option<&PipelineRuntimeMetrics>,
+) -> PolicyEvaluation {
+    if !policy.matches(envelope) {
+        if let Some(metrics) = metrics {
+            metrics.record_policy_selector_miss();
+        }
+        return PolicyEvaluation::SelectorMiss;
+    }
+
+    let runtime = policy
+        .runtime
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let policy_version = format!("{}@{}", runtime.manifest().id, runtime.manifest().version);
+    if let Some(metrics) = metrics {
+        metrics.record_policy_evaluation();
+    }
+
+    match runtime.handle_event(hook, envelope) {
+        Ok(outcomes) => PolicyEvaluation::Outcomes {
+            policy_version,
+            outcomes,
+        },
+        Err(source) => PolicyEvaluation::RuntimeError {
+            policy_version,
+            reason: source.to_string(),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

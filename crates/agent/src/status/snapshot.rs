@@ -643,7 +643,7 @@ mod tests {
             PathBuf::from("/tmp/sssa-spool"),
             vec![CapabilityState::degraded(
                 CapabilityKind::LuaJit,
-                "hot reload is not implemented",
+                "config reload is not implemented",
             )],
         )?;
         let spool = SpoolStatusInput::available(

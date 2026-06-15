@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use pipeline::{PipelinePolicy, PipelinePolicySet};
 use policy::PolicyRuntime;
 use probe_config::{AgentConfig, PolicyConfig};
 use probe_core::CompiledSelector;
@@ -55,6 +56,23 @@ pub struct LoadedConfiguredPolicy {
     pub selector: Option<CompiledSelector>,
 }
 
+impl LoadedConfiguredPolicy {
+    pub fn into_pipeline_policy(self) -> PipelinePolicy {
+        PipelinePolicy::new(self.runtime, self.selector)
+    }
+}
+
+pub struct LoadedPipelinePolicies {
+    pub policies: Vec<PipelinePolicy>,
+    pub sources: Vec<ConfiguredPolicySource>,
+}
+
+impl LoadedPipelinePolicies {
+    pub fn into_policy_set(self) -> PipelinePolicySet {
+        PipelinePolicySet::new(self.policies)
+    }
+}
+
 pub fn configured_policy_selection(config: &AgentConfig) -> ConfiguredPolicySelection {
     let enabled = enabled_policies(config);
     ConfiguredPolicySelection {
@@ -74,6 +92,21 @@ pub fn load_configured_policies(
         .into_iter()
         .map(read_configured_policy)
         .collect()
+}
+
+pub fn load_configured_pipeline_policies(
+    config: &AgentConfig,
+) -> Result<LoadedPipelinePolicies, ConfiguredPolicyError> {
+    let policies = load_configured_policies(config)?;
+    let sources = policies
+        .iter()
+        .map(|policy| policy.source.clone())
+        .collect::<Vec<_>>();
+    let policies = policies
+        .into_iter()
+        .map(LoadedConfiguredPolicy::into_pipeline_policy)
+        .collect::<Vec<_>>();
+    Ok(LoadedPipelinePolicies { policies, sources })
 }
 
 fn read_configured_policy(
@@ -132,7 +165,7 @@ mod tests {
 
     use capture::ReplayProvider;
     use parsers::Http1ParserFactory;
-    use pipeline::{CapturePipeline, PipelinePolicy};
+    use pipeline::CapturePipeline;
     use policy::{PolicyError, PolicyHook};
     use probe_config::{AgentConfig, PolicyConfig};
     use probe_core::{
@@ -461,8 +494,8 @@ end
             &mut parser_factory,
             policies
                 .into_iter()
-                .map(|policy| PipelinePolicy::new(policy.runtime, policy.selector))
-                .collect(),
+                .map(LoadedConfiguredPolicy::into_pipeline_policy)
+                .collect::<Vec<_>>(),
             "test",
         );
 

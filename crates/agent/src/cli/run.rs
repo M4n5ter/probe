@@ -24,7 +24,7 @@ use crate::{
     capture_provider::build_capture_provider,
     check::build_check_report,
     configured_enforcement::build_configured_enforcement_with_backend,
-    configured_policy::load_configured_policies,
+    configured_policy::load_configured_pipeline_policies,
     error::AgentError,
     export::{ExportWorker, ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook},
     runtime_composition::{build_runtime_composition, capability_matrix_for_config},
@@ -159,17 +159,20 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let (plan, enforcement_backend) = runtime.into_enforcement_parts();
             let mut enforcement =
                 build_configured_enforcement_with_backend(&plan, enforcement_backend).await?;
-            let policies = load_configured_policies(&plan.config)?;
+            let policies = load_configured_pipeline_policies(&plan.config)?;
             let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
             let mut parser_factory = Http1ParserFactory::default();
             let export_worker = export_worker_config_from_plan(&plan).map(ExportWorker::new);
             let pipeline_metrics = PipelineRuntimeMetrics::default();
+            let policy_set = policies.into_policy_set();
             let tls_plaintext_runtime = TlsPlaintextRuntimeState::for_plan(&plan);
             let admin_runtime_state = AdminRuntimeState {
                 enforcement_policy_source: enforcement.policy_source.clone(),
                 export_worker: export_worker.as_ref().map(ExportWorker::runtime_state),
                 pipeline: Some(pipeline_metrics.clone()),
+                policy_set: policy_set.clone(),
                 tls_plaintext: Some(tls_plaintext_runtime.clone()),
+                ..AdminRuntimeState::default()
             };
             let admin_server = admin_server_config_from_plan(&plan)
                 .map(|config| {
@@ -187,10 +190,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let mut pipeline = CapturePipeline::new(
                 spool.as_ref(),
                 &mut parser_factory,
-                policies
-                    .into_iter()
-                    .map(|policy| PipelinePolicy::new(policy.runtime, policy.selector))
-                    .collect(),
+                policy_set,
                 plan.config.config_version.clone(),
             )
             .with_runtime_metrics(pipeline_metrics);
@@ -344,7 +344,10 @@ async fn replay(command: ReplayCommand) -> Result<(), AgentError> {
     let mut pipeline = CapturePipeline::new(
         &spool,
         &mut parser_factory,
-        policy.map(PipelinePolicy::unscoped).into_iter().collect(),
+        policy
+            .map(PipelinePolicy::unscoped)
+            .into_iter()
+            .collect::<Vec<_>>(),
         "replay",
     )
     .with_enforcement_planner(&mut enforcement_planner);

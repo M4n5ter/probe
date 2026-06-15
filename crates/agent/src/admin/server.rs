@@ -23,9 +23,11 @@ use tokio::{
     task::JoinSet,
 };
 
-use pipeline::PipelineRuntimeMetrics;
+use pipeline::{PipelinePolicySet, PipelineRuntimeMetrics};
 
+use super::policy_reload::{PolicyReloadGate, reload_policies};
 use crate::configured_enforcement::LoadedEnforcementPolicySource;
+use crate::configured_policy::ConfiguredPolicySource;
 use crate::export::ExportWorkerRuntimeState;
 use crate::status::{
     AgentStatusSnapshot, MetricsSnapshot, PROMETHEUS_TEXT_CONTENT_TYPE, RuntimeStatusInput,
@@ -68,11 +70,13 @@ pub struct AdminServerConfig {
     pub socket_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AdminRuntimeState {
     pub enforcement_policy_source: Option<LoadedEnforcementPolicySource>,
     pub export_worker: Option<ExportWorkerRuntimeState>,
     pub pipeline: Option<PipelineRuntimeMetrics>,
+    pub policy_reload_gate: PolicyReloadGate,
+    pub policy_set: PipelinePolicySet,
     pub tls_plaintext: Option<TlsPlaintextRuntimeState>,
 }
 
@@ -322,12 +326,15 @@ async fn handle_admin_connection(
 ) -> Result<(), std::io::Error> {
     let response =
         match tokio::time::timeout(ADMIN_REQUEST_TIMEOUT, read_admin_request(&mut stream)).await {
-            Ok(Ok(request)) => handle_admin_request(
-                request,
-                plan.as_ref(),
-                spool.as_ref(),
-                runtime_state.as_ref(),
-            ),
+            Ok(Ok(request)) => {
+                handle_admin_request(
+                    request,
+                    plan.as_ref(),
+                    spool.as_ref(),
+                    runtime_state.as_ref(),
+                )
+                .await
+            }
             Ok(Err(error)) => AdminResponse::Error {
                 message: error.to_string(),
             },
@@ -385,13 +392,58 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
-fn handle_admin_request(
+async fn handle_admin_request(
     request: AdminRequest,
     plan: &RuntimePlan,
     spool: &FjallSpool,
     runtime_state: &AdminRuntimeState,
 ) -> AdminResponse {
-    let snapshot = build_status_snapshot_with_runtime(
+    match request {
+        AdminRequest::ReloadPolicies => {
+            match reload_policies(
+                &plan.config,
+                &runtime_state.policy_set,
+                &runtime_state.policy_reload_gate,
+            )
+            .await
+            {
+                Ok(summary) => AdminResponse::PolicyReload {
+                    loaded_count: summary.loaded_count,
+                    policies: summary.policies,
+                },
+                Err(source) => AdminResponse::Error {
+                    message: format!("failed to reload policies: {source}"),
+                },
+            }
+        }
+        AdminRequest::Status => {
+            let snapshot = build_admin_status_snapshot(plan, spool, runtime_state);
+            AdminResponse::Status {
+                snapshot: Box::new(snapshot),
+            }
+        }
+        AdminRequest::Metrics => {
+            let snapshot = build_admin_status_snapshot(plan, spool, runtime_state);
+            AdminResponse::Metrics {
+                metrics: Box::new(snapshot.metrics),
+            }
+        }
+        AdminRequest::PrometheusMetrics => {
+            let snapshot = build_admin_status_snapshot(plan, spool, runtime_state);
+            AdminResponse::PrometheusMetrics {
+                content_type: PROMETHEUS_TEXT_CONTENT_TYPE,
+                metrics: render_prometheus_metrics(&snapshot),
+            }
+        }
+    }
+}
+
+fn build_admin_status_snapshot(
+    plan: &RuntimePlan,
+    spool: &FjallSpool,
+    runtime_state: &AdminRuntimeState,
+) -> AgentStatusSnapshot {
+    build_status_snapshot_with_runtime(
         plan,
         collect_running_spool_status(plan, spool),
         RuntimeStatusInput {
@@ -409,19 +461,7 @@ fn handle_admin_request(
                 .as_ref()
                 .map(TlsPlaintextRuntimeState::snapshot),
         },
-    );
-    match request {
-        AdminRequest::Status => AdminResponse::Status {
-            snapshot: Box::new(snapshot),
-        },
-        AdminRequest::Metrics => AdminResponse::Metrics {
-            metrics: Box::new(snapshot.metrics),
-        },
-        AdminRequest::PrometheusMetrics => AdminResponse::PrometheusMetrics {
-            content_type: PROMETHEUS_TEXT_CONTENT_TYPE,
-            metrics: render_prometheus_metrics(&snapshot),
-        },
-    }
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -430,6 +470,7 @@ enum AdminRequest {
     Status,
     Metrics,
     PrometheusMetrics,
+    ReloadPolicies,
 }
 
 #[derive(Debug, Serialize)]
@@ -444,6 +485,10 @@ enum AdminResponse {
     PrometheusMetrics {
         content_type: &'static str,
         metrics: String,
+    },
+    PolicyReload {
+        loaded_count: u64,
+        policies: Vec<ConfiguredPolicySource>,
     },
     Error {
         message: String,

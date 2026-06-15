@@ -553,6 +553,18 @@ function on_http_request_headers(_)
 end
 "#,
     )?;
+    let later = PolicyRuntime::from_source(
+        PolicyManifest {
+            id: "later-policy".to_string(),
+            version: "two".to_string(),
+            hooks: vec![PolicyHook::HttpRequestHeaders],
+        },
+        r#"
+function on_http_request_headers(event)
+  return probe.emit_alert("later " .. event.kind.target)
+end
+"#,
+    )?;
     let metrics = PipelineRuntimeMetrics::default();
     let mut parser_factory = Http1ParserFactory::default();
     let mut provider = SequenceProvider::new(vec![captured_bytes(
@@ -562,7 +574,10 @@ end
     let mut pipeline = CapturePipeline::new(
         &spool,
         &mut parser_factory,
-        vec![PipelinePolicy::unscoped(policy)],
+        vec![
+            PipelinePolicy::unscoped(policy),
+            PipelinePolicy::unscoped(later),
+        ],
         "test",
     )
     .with_runtime_metrics(metrics.clone());
