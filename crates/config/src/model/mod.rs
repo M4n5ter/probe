@@ -35,4 +35,5 @@ pub use storage::{
 pub use tls::{
     DEFAULT_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS, MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS,
     PlaintextTlsConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind,
+    TlsPlaintextDecryptHintConfig, TlsPlaintextInstrumentationConfig,
 };

@@ -44,10 +44,15 @@ pub struct TlsPlaintextInstrumentationPlan {
 impl TlsPlaintextInstrumentationPlan {
     fn resolve(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
         Self {
-            enabled: config.tls.plaintext.enabled,
-            selector_configured: config.tls.plaintext.selector.is_some(),
-            libssl_uprobe_object_path: config.tls.plaintext.libssl_uprobe_object_path.clone(),
-            reconcile_interval_ms: config.tls.plaintext.reconcile_interval_ms,
+            enabled: config.tls.plaintext.instrumentation.enabled,
+            selector_configured: config.tls.plaintext.instrumentation.selector.is_some(),
+            libssl_uprobe_object_path: config
+                .tls
+                .plaintext
+                .instrumentation
+                .libssl_uprobe_object_path
+                .clone(),
+            reconcile_interval_ms: config.tls.plaintext.instrumentation.reconcile_interval_ms,
             capability: TlsPlaintextCapabilityPlan::from_config(config, capabilities),
         }
     }
@@ -64,12 +69,12 @@ impl TlsDecryptHintPlan {
         let materials_by_id = tls_plaintext_materials_by_id(&config.tls.materials);
         Self {
             key_logs: tls_plaintext_materials_from_refs(
-                &config.tls.plaintext.key_log_refs,
+                &config.tls.plaintext.decrypt_hints.key_log_refs,
                 TlsMaterialKind::KeyLogFile,
                 &materials_by_id,
             ),
             session_secrets: tls_plaintext_materials_from_refs(
-                &config.tls.plaintext.session_secret_refs,
+                &config.tls.plaintext.decrypt_hints.session_secret_refs,
                 TlsMaterialKind::SessionSecretFile,
                 &materials_by_id,
             ),
@@ -89,7 +94,7 @@ pub enum TlsPlaintextCapabilityPlan {
 
 impl TlsPlaintextCapabilityPlan {
     fn from_config(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
-        if !config.tls.plaintext.enabled {
+        if !config.tls.plaintext.instrumentation.enabled {
             return Self::NotRequired;
         }
         Self::Required {
@@ -180,11 +185,14 @@ mod tests {
     #[test]
     fn tls_plaintext_plan_preserves_selector_and_capability_requirement() {
         let mut config = AgentConfig::default();
-        config.tls.plaintext.enabled = true;
-        config.tls.plaintext.selector = Some(Selector::default());
-        config.tls.plaintext.libssl_uprobe_object_path =
-            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
-        config.tls.plaintext.reconcile_interval_ms = 2500;
+        config.tls.plaintext.instrumentation.enabled = true;
+        config.tls.plaintext.instrumentation.selector = Some(Selector::default());
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        config.tls.plaintext.instrumentation.reconcile_interval_ms = 2500;
         let capabilities = capability_matrix_with_libssl(RuntimeMode::Available);
 
         let plan = TlsPlan::resolve(&config, &capabilities);
@@ -210,9 +218,12 @@ mod tests {
     #[test]
     fn tls_plaintext_plan_allows_degraded_libssl_capability_for_best_effort_instrumentation() {
         let mut config = AgentConfig::default();
-        config.tls.plaintext.enabled = true;
-        config.tls.plaintext.libssl_uprobe_object_path =
-            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        config.tls.plaintext.instrumentation.enabled = true;
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
         let capabilities = capability_matrix_with_libssl(RuntimeMode::Degraded);
 
         let plan = TlsPlan::resolve(&config, &capabilities);
@@ -229,8 +240,9 @@ mod tests {
     #[test]
     fn tls_plaintext_plan_resolves_decrypt_hint_material_refs() {
         let mut config = AgentConfig::default();
-        config.tls.plaintext.key_log_refs = vec!["ssl-keys".to_string()];
-        config.tls.plaintext.session_secret_refs = vec!["session-secrets".to_string()];
+        config.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-keys".to_string()];
+        config.tls.plaintext.decrypt_hints.session_secret_refs =
+            vec!["session-secrets".to_string()];
         config.tls.materials = vec![
             TlsMaterialConfig {
                 id: Some("ssl-keys".to_string()),

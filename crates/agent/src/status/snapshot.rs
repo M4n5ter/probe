@@ -659,10 +659,13 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
         config.capture.selection = CaptureSelection::Libpcap;
-        config.tls.plaintext.enabled = true;
-        config.tls.plaintext.libssl_uprobe_object_path =
-            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
-        config.tls.plaintext.reconcile_interval_ms = 2_500;
+        config.tls.plaintext.instrumentation.enabled = true;
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        config.tls.plaintext.instrumentation.reconcile_interval_ms = 2_500;
         let plan = runtime_plan_from_config(
             config,
             vec![CapabilityState::degraded(

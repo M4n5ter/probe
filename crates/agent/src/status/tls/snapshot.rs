@@ -232,11 +232,14 @@ mod tests {
         let temp = test_dir("status-tls-plaintext-capability")?;
         let mut config = config_with_storage_path(temp.join("spool"));
         config.capture.selection = probe_config::CaptureSelection::Libpcap;
-        config.tls.plaintext.enabled = true;
-        config.tls.plaintext.selector = Some(Selector::default());
-        config.tls.plaintext.libssl_uprobe_object_path =
-            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
-        config.tls.plaintext.reconcile_interval_ms = 2_500;
+        config.tls.plaintext.instrumentation.enabled = true;
+        config.tls.plaintext.instrumentation.selector = Some(Selector::default());
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        config.tls.plaintext.instrumentation.reconcile_interval_ms = 2_500;
         let plan = runtime_plan_from_config(
             config,
             vec![CapabilityState::available(CapabilityKind::LibsslUprobe)],
@@ -291,8 +294,9 @@ mod tests {
         fs::write(&key_log_path, b"client random")?;
         fs::write(&session_secret_path, b"{\"secret\":\"test\"}\n")?;
         let mut config = config_with_storage_path(temp.join("spool"));
-        config.tls.plaintext.key_log_refs = vec!["ssl-keys".to_string()];
-        config.tls.plaintext.session_secret_refs = vec!["session-secrets".to_string()];
+        config.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-keys".to_string()];
+        config.tls.plaintext.decrypt_hints.session_secret_refs =
+            vec!["session-secrets".to_string()];
         config.tls.materials = vec![
             probe_config::TlsMaterialConfig {
                 id: Some("ssl-keys".to_string()),

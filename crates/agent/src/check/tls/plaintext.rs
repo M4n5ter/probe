@@ -172,8 +172,9 @@ mod tests {
         )?;
         fs::write(&session_secret_path, b"reserved-session-secret")?;
         let mut config = AgentConfig::default();
-        config.tls.plaintext.key_log_refs = vec!["ssl-keys".to_string()];
-        config.tls.plaintext.session_secret_refs = vec!["session-secrets".to_string()];
+        config.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-keys".to_string()];
+        config.tls.plaintext.decrypt_hints.session_secret_refs =
+            vec!["session-secrets".to_string()];
         config.tls.materials.extend([
             TlsMaterialConfig {
                 id: Some("ssl-keys".to_string()),
@@ -228,9 +229,12 @@ mod tests {
     async fn check_report_reports_libssl_uprobe_runtime_metadata()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut config = AgentConfig::default();
-        config.tls.plaintext.libssl_uprobe_object_path =
-            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
-        config.tls.plaintext.reconcile_interval_ms = 2_500;
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        config.tls.plaintext.instrumentation.reconcile_interval_ms = 2_500;
         let plan = runtime_plan(config)?;
 
         let report = build_check_report(plan, None).await?;
@@ -257,7 +261,7 @@ mod tests {
             b"CLIENT_RANDOM 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f not-a-secret\n",
         )?;
         let mut config = AgentConfig::default();
-        config.tls.plaintext.key_log_refs = vec!["ssl-keys".to_string()];
+        config.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-keys".to_string()];
         config.tls.materials.push(TlsMaterialConfig {
             id: Some("ssl-keys".to_string()),
             kind: TlsMaterialKind::KeyLogFile,

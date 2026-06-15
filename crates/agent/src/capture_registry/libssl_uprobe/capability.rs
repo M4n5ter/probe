@@ -17,11 +17,17 @@ pub(in crate::capture_registry) fn capability(
             ),
         );
     }
-    let Some(object_path) = config.tls.plaintext.libssl_uprobe_object_path.as_ref() else {
+    let Some(object_path) = config
+        .tls
+        .plaintext
+        .instrumentation
+        .libssl_uprobe_object_path
+        .as_ref()
+    else {
         return CapabilityState::unavailable(
             CapabilityKind::LibsslUprobe,
             format!(
-                "tls.plaintext.libssl_uprobe_object_path is not configured; host probe: {}",
+                "tls.plaintext.instrumentation.libssl_uprobe_object_path is not configured; host probe: {}",
                 host.summary()
             ),
         );
@@ -101,7 +107,11 @@ mod tests {
         let reason = capability
             .reason
             .expect("missing TLS object path must explain the unavailable capability");
-        assert!(reason.contains("tls.plaintext.libssl_uprobe_object_path is not configured"));
+        assert!(
+            reason.contains(
+                "tls.plaintext.instrumentation.libssl_uprobe_object_path is not configured"
+            )
+        );
         assert!(reason.contains("btf_vmlinux=available"));
         assert!(reason.contains("bpffs=available"));
     }
@@ -112,7 +122,11 @@ mod tests {
         let object = temp.join("invalid-tls.bpf.o");
         fs::write(&object, b"not an elf object")?;
         let mut config = AgentConfig::default();
-        config.tls.plaintext.libssl_uprobe_object_path = Some(object);
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path = Some(object);
 
         let capability = capability(
             &config,

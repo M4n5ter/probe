@@ -5,8 +5,10 @@ fn validation_rejects_invalid_tls_plaintext_material_refs() -> Result<(), Box<dy
 {
     let missing_ref = AgentConfig::from_toml_str(
         r#"
-[tls.plaintext]
+[tls.plaintext.instrumentation]
 enabled = true
+
+[tls.plaintext.decrypt_hints]
 key_log_refs = ["missing"]
 "#,
     )?;
@@ -21,8 +23,10 @@ key_log_refs = ["missing"]
 
     let wrong_kind = AgentConfig::from_toml_str(
         r#"
-[tls.plaintext]
+[tls.plaintext.instrumentation]
 enabled = true
+
+[tls.plaintext.decrypt_hints]
 key_log_refs = ["session-secret"]
 
 [[tls.materials]]
@@ -38,8 +42,10 @@ path = "/tmp/session-secret.jsonl"
 
     let empty_ref = AgentConfig::from_toml_str(
         r#"
-[tls.plaintext]
+[tls.plaintext.instrumentation]
 enabled = true
+
+[tls.plaintext.decrypt_hints]
 session_secret_refs = [""]
 "#,
     )?;
@@ -54,8 +60,10 @@ session_secret_refs = [""]
 
     let valid_refs = AgentConfig::from_toml_str(
         r#"
-[tls.plaintext]
+[tls.plaintext.instrumentation]
 enabled = true
+
+[tls.plaintext.decrypt_hints]
 key_log_refs = ["ssl-keys"]
 
 [[tls.materials]]
@@ -68,7 +76,7 @@ path = "/tmp/sslkeylog.log"
 
     let disabled_refs = AgentConfig::from_toml_str(
         r#"
-[tls.plaintext]
+[tls.plaintext.decrypt_hints]
 key_log_refs = ["ssl-keys"]
 
 [[tls.materials]]
@@ -86,7 +94,7 @@ fn validation_rejects_invalid_libssl_uprobe_object_path_config()
 -> Result<(), Box<dyn std::error::Error>> {
     let empty_object_path = AgentConfig::from_toml_str(
         r#"
-[tls.plaintext]
+[tls.plaintext.instrumentation]
 libssl_uprobe_object_path = ""
 "#,
     )?;
@@ -107,7 +115,7 @@ fn validation_rejects_zero_tls_plaintext_reconcile_interval()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
         r#"
-[tls.plaintext]
+[tls.plaintext.instrumentation]
 reconcile_interval_ms = 0
 "#,
     )?;
@@ -129,7 +137,7 @@ fn validation_rejects_oversized_tls_plaintext_reconcile_interval()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(&format!(
         r#"
-[tls.plaintext]
+[tls.plaintext.instrumentation]
 reconcile_interval_ms = {}
 "#,
         MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS + 1

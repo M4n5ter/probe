@@ -41,11 +41,14 @@ fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {
         config.enforcement.policy.source,
         EnforcementPolicySourceConfig::None
     );
-    assert!(!config.tls.plaintext.enabled);
-    assert_eq!(config.tls.plaintext.selector, None);
-    assert_eq!(config.tls.plaintext.key_log_refs, Vec::<String>::new());
+    assert!(!config.tls.plaintext.instrumentation.enabled);
+    assert_eq!(config.tls.plaintext.instrumentation.selector, None);
     assert_eq!(
-        config.tls.plaintext.session_secret_refs,
+        config.tls.plaintext.decrypt_hints.key_log_refs,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        config.tls.plaintext.decrypt_hints.session_secret_refs,
         Vec::<String>::new()
     );
     config.validate_basic()?;

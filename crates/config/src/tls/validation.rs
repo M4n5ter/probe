@@ -84,9 +84,9 @@ fn validate_tls_materials(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>
 
 fn validate_plaintext_tls_material_refs(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
     let materials_by_id = materials_by_id(tls);
-    for reference in &tls.plaintext.key_log_refs {
+    for reference in &tls.plaintext.decrypt_hints.key_log_refs {
         validate_material_ref(
-            "tls.plaintext.key_log_refs",
+            "tls.plaintext.decrypt_hints.key_log_refs",
             reference,
             TlsMaterialKind::KeyLogFile,
             &materials_by_id,
@@ -94,9 +94,9 @@ fn validate_plaintext_tls_material_refs(tls: &TlsConfig, violations: &mut Vec<Co
             "TLS plaintext material",
         );
     }
-    for reference in &tls.plaintext.session_secret_refs {
+    for reference in &tls.plaintext.decrypt_hints.session_secret_refs {
         validate_material_ref(
-            "tls.plaintext.session_secret_refs",
+            "tls.plaintext.decrypt_hints.session_secret_refs",
             reference,
             TlsMaterialKind::SessionSecretFile,
             &materials_by_id,
@@ -107,40 +107,41 @@ fn validate_plaintext_tls_material_refs(tls: &TlsConfig, violations: &mut Vec<Co
 }
 
 fn validate_plaintext_tls_provider_config(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
-    if tls.plaintext.reconcile_interval_ms == 0 {
+    if tls.plaintext.instrumentation.reconcile_interval_ms == 0 {
         violations.push(ConfigViolation {
-            field: "tls.plaintext.reconcile_interval_ms".to_string(),
+            field: "tls.plaintext.instrumentation.reconcile_interval_ms".to_string(),
             reason: "TLS plaintext reconcile interval must be positive".to_string(),
         });
     }
-    if tls.plaintext.reconcile_interval_ms > MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS {
+    if tls.plaintext.instrumentation.reconcile_interval_ms > MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS
+    {
         violations.push(ConfigViolation {
-            field: "tls.plaintext.reconcile_interval_ms".to_string(),
+            field: "tls.plaintext.instrumentation.reconcile_interval_ms".to_string(),
             reason: format!(
                 "TLS plaintext reconcile interval must be at most {MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS} ms"
             ),
         });
     }
 
-    let Some(path) = &tls.plaintext.libssl_uprobe_object_path else {
+    let Some(path) = &tls.plaintext.instrumentation.libssl_uprobe_object_path else {
         return;
     };
     if path.as_os_str().is_empty() {
         violations.push(ConfigViolation {
-            field: "tls.plaintext.libssl_uprobe_object_path".to_string(),
+            field: "tls.plaintext.instrumentation.libssl_uprobe_object_path".to_string(),
             reason: "libssl uprobe eBPF object path cannot be empty".to_string(),
         });
     }
 }
 
 fn validate_plaintext_feed_selection(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
-    if !tls.plaintext.enabled {
+    if !tls.plaintext.instrumentation.enabled {
         return;
     }
 
     violations.push(ConfigViolation {
-        field: "tls.plaintext.enabled".to_string(),
-        reason: "plaintext_feed capture is the external plaintext source; disable tls.plaintext or select a TLS instrumentation backend"
+        field: "tls.plaintext.instrumentation.enabled".to_string(),
+        reason: "plaintext_feed capture is the external plaintext source; disable tls.plaintext.instrumentation or select a TLS instrumentation backend"
             .to_string(),
     });
 }

@@ -68,14 +68,14 @@ id = "collector-ca"
 kind = "trust_anchor"
 path = "/etc/ssl/certs/ca.pem"
 
-[tls.plaintext]
+[tls.plaintext.instrumentation]
 enabled = true
 libssl_uprobe_object_path = "/opt/sssa/ebpf-tls-plaintext.bpf.o"
 
-[tls.plaintext.selector]
+[tls.plaintext.instrumentation.selector]
 op = "match"
 
-[tls.plaintext.selector.term.process]
+[tls.plaintext.instrumentation.selector.term.process]
 pids = [4242]
 names = []
 exe_path_globs = []
@@ -83,7 +83,7 @@ cmdline_regexes = []
 systemd_services = []
 container_ids = []
 
-[tls.plaintext.selector.term.traffic]
+[tls.plaintext.instrumentation.selector.term.traffic]
 local_ports = [443]
 remote_ports = []
 directions = []
@@ -142,12 +142,16 @@ socket_path = "/run/sssa-probe/admin.sock"
     );
     assert_eq!(config.tls.materials[0].id.as_deref(), Some("collector-ca"));
     assert_eq!(config.tls.materials[0].kind, TlsMaterialKind::TrustAnchor);
-    assert!(config.tls.plaintext.enabled);
+    assert!(config.tls.plaintext.instrumentation.enabled);
     assert_eq!(
-        config.tls.plaintext.libssl_uprobe_object_path,
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path,
         Some(PathBuf::from("/opt/sssa/ebpf-tls-plaintext.bpf.o"))
     );
-    assert!(config.tls.plaintext.selector.is_some());
+    assert!(config.tls.plaintext.instrumentation.selector.is_some());
     assert_eq!(config.capture.plaintext_feed.path, None);
     assert_eq!(config.enforcement.mode, EnforcementMode::DryRun);
     assert_eq!(

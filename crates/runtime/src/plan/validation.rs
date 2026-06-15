@@ -76,11 +76,11 @@ fn validate_capture_config(
 }
 
 fn validate_static_tls_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
-    if let Some(selector) = &config.tls.plaintext.selector
+    if let Some(selector) = &config.tls.plaintext.instrumentation.selector
         && let Err(error) = selector.compile()
     {
         violations.push(ConfigViolation {
-            field: "tls.plaintext.selector".to_string(),
+            field: "tls.plaintext.instrumentation.selector".to_string(),
             reason: error.to_string(),
         });
     }
@@ -91,13 +91,13 @@ fn validate_registry_tls_config(
     registry: &ProviderRegistry,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    if !config.tls.plaintext.enabled {
+    if !config.tls.plaintext.instrumentation.enabled {
         return;
     }
     require_usable(
         &registry.capability_matrix(),
         CapabilityKind::LibsslUprobe,
-        "tls.plaintext.enabled",
+        "tls.plaintext.instrumentation.enabled",
         "libssl uprobe plaintext provider is not available in this build/runtime",
         violations,
     );
@@ -108,14 +108,14 @@ fn validate_tls_capture_constraints(
     registry: &ProviderRegistry,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    if !config.tls.plaintext.enabled {
+    if !config.tls.plaintext.instrumentation.enabled {
         return;
     }
 
     let capture = CapturePlan::resolve(config, registry);
     if capture.mode != CapturePlanMode::Live {
         violations.push(ConfigViolation {
-            field: "tls.plaintext.enabled".to_string(),
+            field: "tls.plaintext.instrumentation.enabled".to_string(),
             reason: format!(
                 "libssl uprobe TLS plaintext requires live host capture; selected capture mode is {:?}",
                 capture.mode
@@ -232,12 +232,16 @@ mod tests {
     fn unsupported_security_features_fail_closed() {
         let registry = ProviderRegistry::new(vec![], test_platform_capabilities());
         let mut config = AgentConfig::default();
-        config.tls.plaintext.enabled = true;
+        config.tls.plaintext.instrumentation.enabled = true;
         config.enforcement.mode = EnforcementMode::Enforce;
 
         let error = validation_error(config, &registry);
 
-        assert_violation(&error, "tls.plaintext.enabled", "unavailable");
+        assert_violation(
+            &error,
+            "tls.plaintext.instrumentation.enabled",
+            "unavailable",
+        );
         assert_violation(&error, "enforcement.mode", "not built");
     }
 
@@ -316,13 +320,20 @@ mod tests {
         );
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
-        config.tls.plaintext.enabled = true;
-        config.tls.plaintext.libssl_uprobe_object_path =
-            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        config.tls.plaintext.instrumentation.enabled = true;
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
 
         let error = validation_error(config, &registry);
 
-        assert_violation(&error, "tls.plaintext.enabled", "unavailable");
+        assert_violation(
+            &error,
+            "tls.plaintext.instrumentation.enabled",
+            "unavailable",
+        );
     }
 
     #[test]
@@ -337,15 +348,18 @@ mod tests {
         );
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Replay;
-        config.tls.plaintext.enabled = true;
-        config.tls.plaintext.libssl_uprobe_object_path =
-            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        config.tls.plaintext.instrumentation.enabled = true;
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
 
         let error = validation_error(config, &registry);
 
         assert_violation(
             &error,
-            "tls.plaintext.enabled",
+            "tls.plaintext.instrumentation.enabled",
             "requires live host capture",
         );
     }
@@ -362,13 +376,17 @@ mod tests {
         );
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Replay;
-        config.tls.plaintext.selector = Some(Selector::All {
+        config.tls.plaintext.instrumentation.selector = Some(Selector::All {
             selectors: Vec::new(),
         });
 
         let error = validation_error(config, &registry);
 
-        assert_violation(&error, "tls.plaintext.selector", "at least one child");
+        assert_violation(
+            &error,
+            "tls.plaintext.instrumentation.selector",
+            "at least one child",
+        );
     }
 
     #[test]

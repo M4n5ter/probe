@@ -272,7 +272,7 @@ fn build_libssl_uprobe_plaintext_provider(
         .clone()
         .ok_or_else(|| {
             AgentError::UnsupportedRunConfig(
-                "libssl uprobe TLS plaintext requires tls.plaintext.libssl_uprobe_object_path"
+                "libssl uprobe TLS plaintext requires tls.plaintext.instrumentation.libssl_uprobe_object_path"
                     .to_string(),
             )
         })?;
@@ -280,13 +280,14 @@ fn build_libssl_uprobe_plaintext_provider(
         .config
         .tls
         .plaintext
+        .instrumentation
         .selector
         .as_ref()
         .map(|selector| selector.compile())
         .transpose()
         .map_err(|source| {
             AgentError::UnsupportedRunConfig(format!(
-                "invalid tls.plaintext.selector during runtime build: {source}"
+                "invalid tls.plaintext.instrumentation.selector during runtime build: {source}"
             ))
         })?;
     let attach_planner = LibsslUprobeAttachPlanner::new(selector);
@@ -519,9 +520,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
-        config.tls.plaintext.enabled = true;
-        config.tls.plaintext.libssl_uprobe_object_path =
-            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+        config.tls.plaintext.instrumentation.enabled = true;
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
         let plan = runtime_plan_from_config(
             config,
             vec![CapabilityState::degraded(

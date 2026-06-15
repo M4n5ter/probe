@@ -90,14 +90,18 @@ selection = "plaintext_feed"
 [capture.plaintext_feed]
 path = "/tmp/feed.jsonl"
 
-[tls.plaintext]
+[tls.plaintext.instrumentation]
 enabled = true
 "#,
     )?;
     let error = conflicting_tls_instrumentation
         .validate_basic()
         .expect_err("plaintext feed selection must not also enable TLS instrumentation");
-    assert!(error.to_string().contains("tls.plaintext.enabled"));
+    assert!(
+        error
+            .to_string()
+            .contains("tls.plaintext.instrumentation.enabled")
+    );
     Ok(())
 }
 

@@ -17,29 +17,39 @@ pub struct TlsConfig {
     pub materials: Vec<TlsMaterialConfig>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlaintextTlsConfig {
+    pub instrumentation: TlsPlaintextInstrumentationConfig,
+    pub decrypt_hints: TlsPlaintextDecryptHintConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsPlaintextInstrumentationConfig {
     pub enabled: bool,
     pub selector: Option<Selector>,
     pub libssl_uprobe_object_path: Option<PathBuf>,
     #[serde(default = "default_tls_plaintext_reconcile_interval_ms")]
     pub reconcile_interval_ms: u64,
-    pub key_log_refs: Vec<String>,
-    pub session_secret_refs: Vec<String>,
 }
 
-impl Default for PlaintextTlsConfig {
+impl Default for TlsPlaintextInstrumentationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             selector: None,
             libssl_uprobe_object_path: None,
             reconcile_interval_ms: DEFAULT_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS,
-            key_log_refs: Vec::new(),
-            session_secret_refs: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsPlaintextDecryptHintConfig {
+    pub key_log_refs: Vec<String>,
+    pub session_secret_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
