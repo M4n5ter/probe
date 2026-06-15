@@ -1,6 +1,8 @@
 use capture::CaptureEvent;
 use parsers::Http1ParserFactory;
-use pipeline::{CapturePipeline, PipelineError, PipelinePolicy, PipelineSummary};
+use pipeline::{
+    CapturePipeline, PARSER_INGRESS_CURSOR_OWNER, PipelineError, PipelinePolicy, PipelineSummary,
+};
 use policy::{PolicyHook, PolicyManifest, PolicyRuntime};
 use probe_core::{CaptureSource, Direction, EventKind, Gap, SpoolPayloadSchema, Timestamp};
 use storage::SpoolPayload;
@@ -47,6 +49,7 @@ fn recover_ingress_journal_replays_capture_bytes() -> Result<(), Box<dyn std::er
     let repeated = recover_without_policy(&spool)?;
     assert_eq!(repeated.ingress_records_recovered, 1);
     assert_eq!(repeated.export_events_written, 1);
+    assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 0);
     assert_eq!(count_request_targets(&spool, "/recovered")?, 2);
     assert_eq!(
         request_ids_for_target(&spool, "/recovered")?,
@@ -112,6 +115,7 @@ fn recover_ingress_journal_replays_persisted_prefix_for_parser_state()
     assert_eq!(summary.ingress_records_journaled, 1);
     assert_eq!(summary.ingress_records_processed, 1);
     assert_eq!(summary.export_events_written, 0);
+    assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 0);
     let event = captured_bytes_with_direction(flow, Direction::Outbound, b".test\r\n\r\n");
     spool.append_ingress(capture_event_payload(&event)?)?;
     drop(pipeline);
@@ -165,6 +169,91 @@ fn recover_ingress_journal_advances_cursor_after_recovered_connection_close()
     assert_eq!(summary.ingress_records_recovered, 3);
     assert_eq!(summary.ingress_records_processed, 3);
     assert_eq!(summary.export_events_written, 3);
+    assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 3);
+    let repeated = recover_without_policy(&spool)?;
+    assert_eq!(repeated.ingress_records_recovered, 0);
+    assert_eq!(repeated.export_events_written, 0);
+    Ok(())
+}
+
+#[test]
+fn run_provider_advances_parser_cursor_after_flow_becomes_checkpoint_safe()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let flow = demo_flow_with_ports(50_000, 80, 36);
+    let mut provider = SequenceProvider::new(vec![
+        captured_bytes_with_direction(
+            flow.clone(),
+            Direction::Outbound,
+            b"GET /live-checkpoint HTTP/1.1\r\nHost: recovery.test\r\n\r\n",
+        ),
+        captured_bytes_with_direction(
+            flow.clone(),
+            Direction::Inbound,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        ),
+        connection_closed(flow),
+    ]);
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
+
+    let summary = pipeline.run_provider(&mut provider)?;
+
+    assert_eq!(summary.ingress_records_journaled, 3);
+    assert_eq!(summary.ingress_records_processed, 3);
+    assert_eq!(summary.export_events_written, 3);
+    assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 3);
+    let repeated = recover_without_policy(&spool)?;
+    assert_eq!(repeated.ingress_records_recovered, 0);
+    assert_eq!(repeated.export_events_written, 0);
+    Ok(())
+}
+
+#[test]
+fn parser_cursor_waits_until_every_flow_is_checkpoint_safe()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let unsafe_flow = demo_flow_with_ports(50_000, 80, 37);
+    let closing_flow = demo_flow_with_ports(50_001, 80, 38);
+    let mut first_provider = SequenceProvider::new(vec![
+        captured_bytes_with_direction(
+            unsafe_flow.clone(),
+            Direction::Outbound,
+            b"GET /blocked-checkpoint HTTP/1.1\r\nHost: recovery",
+        ),
+        captured_bytes_with_direction(
+            closing_flow.clone(),
+            Direction::Outbound,
+            b"GET /closed-flow HTTP/1.1\r\nHost: recovery.test\r\n\r\n",
+        ),
+        captured_bytes_with_direction(
+            closing_flow.clone(),
+            Direction::Inbound,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        ),
+        connection_closed(closing_flow),
+    ]);
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
+
+    let summary = pipeline.run_provider(&mut first_provider)?;
+
+    assert_eq!(summary.ingress_records_journaled, 4);
+    assert_eq!(summary.ingress_records_processed, 4);
+    assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 0);
+
+    let mut second_provider = SequenceProvider::new(vec![
+        captured_bytes_with_direction(unsafe_flow.clone(), Direction::Outbound, b".test\r\n\r\n"),
+        connection_closed(unsafe_flow),
+    ]);
+
+    let summary = pipeline.run_provider(&mut second_provider)?;
+
+    assert_eq!(summary.ingress_records_journaled, 2);
+    assert_eq!(summary.ingress_records_processed, 2);
+    assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 6);
     let repeated = recover_without_policy(&spool)?;
     assert_eq!(repeated.ingress_records_recovered, 0);
     assert_eq!(repeated.export_events_written, 0);

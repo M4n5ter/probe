@@ -111,11 +111,11 @@ fn default_platform_capabilities(
         ),
         CapabilityState::degraded(
             CapabilityKind::DurableSpool,
-            "ingress recovery can replay persisted capture events, including bytes, gaps, and connection lifecycle events, and pipeline export events carry ingress provenance for stable replay ids, but recovery is at-least-once, replays under the current config and policy, and durable parser checkpoints are not complete",
+            "ingress recovery can replay persisted capture events, including bytes, gaps, and connection lifecycle events, pipeline export events carry ingress provenance for stable replay ids, and parser recovery advances a durable safe-prefix cursor, but recovery is at-least-once, replays under the current config and policy, active parser state is not serialized, and export queue writes are not deduplicated by event id",
         ),
         CapabilityState::degraded(
             CapabilityKind::IngressJournal,
-            "ingress recovery replays persisted capture events before opening a capture provider, pipeline export events carry ingress provenance, and the parser cursor advances only when active parser state has been removed, but durable parser checkpoints are not complete",
+            "ingress recovery replays persisted capture events before opening a capture provider, pipeline export events carry ingress provenance, and the parser cursor advances only when every flow is checkpoint-safe, but active parser state is not serialized",
         ),
         CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::available(CapabilityKind::WebhookExporter),
@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn ingress_journal_recovery_is_degraded_until_parser_checkpoints_are_durable() {
+    fn ingress_journal_recovery_is_degraded_until_active_parser_state_is_durable() {
         let registry = ProviderRegistry::with_default_platform(vec![capture_provider(
             CaptureBackend::Replay,
             CaptureProviderBuilder::Replay,
@@ -211,7 +211,7 @@ mod tests {
                 .iter()
                 .find(|state| state.kind == CapabilityKind::IngressJournal)
                 .and_then(|state| state.reason.as_deref())
-                .is_some_and(|reason| reason.contains("parser checkpoints"))
+                .is_some_and(|reason| reason.contains("checkpoint-safe"))
         );
     }
 

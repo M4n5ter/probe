@@ -95,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn webhook_ack_rejects_legacy_event_id_fields() {
+    fn webhook_ack_rejects_event_id_cursor_substitutes() {
         let source = r#"{
             "batch_id": "batch-1",
             "accepted": true,
