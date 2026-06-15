@@ -103,7 +103,7 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::WebSocketFrame),
         CapabilityState::degraded(
             CapabilityKind::LuaJit,
-            "policy runtime is wired into replay and live capture, but hot reload and multiple active bundles are not implemented",
+            "policy runtime is wired into replay and live capture, including multiple active bundles and runtime error audit, but hot reload is not implemented",
         ),
         CapabilityState::degraded(
             CapabilityKind::DurableSpool,

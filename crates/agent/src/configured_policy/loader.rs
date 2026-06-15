@@ -8,34 +8,38 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ConfiguredPolicyError {
-    #[error("invalid policy source {path}: {reason}")]
-    InvalidPolicySource { path: String, reason: String },
-    #[error("failed to read policy file {path}: {source}")]
+    #[error("invalid policy source for {id} at {path}: {reason}")]
+    InvalidPolicySource {
+        id: String,
+        path: String,
+        reason: String,
+    },
+    #[error("failed to read policy file for {id} at {path}: {source}")]
     ReadPolicy {
+        id: String,
         path: String,
         source: std::io::Error,
     },
-    #[error("policy error: {0}")]
-    Policy(#[from] policy::PolicyError),
-    #[error("invalid policy selector: {0}")]
-    Selector(#[from] probe_core::SelectorError),
-    #[error("unsupported policy config: {0}")]
-    UnsupportedConfig(String),
+    #[error("failed to initialize policy {id} at {path}: {source}")]
+    PolicyLoad {
+        id: String,
+        path: String,
+        #[source]
+        source: policy::PolicyError,
+    },
+    #[error("invalid policy selector for {id} at {path}: {source}")]
+    Selector {
+        id: String,
+        path: String,
+        #[source]
+        source: probe_core::SelectorError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConfiguredPolicySelection {
     pub configured_count: u64,
-    pub enabled_count: u64,
-    pub state: ConfiguredPolicySelectionState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum ConfiguredPolicySelectionState {
-    Inactive,
-    Active { policy: ConfiguredPolicySource },
-    Unsupported { reason: String },
+    pub enabled: Vec<ConfiguredPolicySource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -53,34 +57,23 @@ pub struct LoadedConfiguredPolicy {
 
 pub fn configured_policy_selection(config: &AgentConfig) -> ConfiguredPolicySelection {
     let enabled = enabled_policies(config);
-    let state = match enabled.as_slice() {
-        [] => ConfiguredPolicySelectionState::Inactive,
-        [policy] => ConfiguredPolicySelectionState::Active {
-            policy: configured_policy_source(policy),
-        },
-        _ => ConfiguredPolicySelectionState::Unsupported {
-            reason: "runtime config currently supports at most one enabled policy bundle"
-                .to_string(),
-        },
-    };
     ConfiguredPolicySelection {
         configured_count: config.policies.len() as u64,
-        enabled_count: enabled.len() as u64,
-        state,
+        enabled: enabled
+            .iter()
+            .copied()
+            .map(configured_policy_source)
+            .collect(),
     }
 }
 
-pub fn load_configured_policy(
+pub fn load_configured_policies(
     config: &AgentConfig,
-) -> Result<Option<LoadedConfiguredPolicy>, ConfiguredPolicyError> {
-    let enabled = enabled_policies(config);
-    match enabled.as_slice() {
-        [] => Ok(None),
-        [policy] => read_configured_policy(policy).map(Some),
-        _ => Err(ConfiguredPolicyError::UnsupportedConfig(
-            "live run currently supports at most one enabled policy bundle".to_string(),
-        )),
-    }
+) -> Result<Vec<LoadedConfiguredPolicy>, ConfiguredPolicyError> {
+    enabled_policies(config)
+        .into_iter()
+        .map(read_configured_policy)
+        .collect()
 }
 
 fn read_configured_policy(
@@ -89,10 +82,23 @@ fn read_configured_policy(
     let selector = policy
         .selector
         .as_ref()
-        .map(|selector| selector.compile())
+        .map(|selector| {
+            selector
+                .compile()
+                .map_err(|source| ConfiguredPolicyError::Selector {
+                    id: policy.id.clone(),
+                    path: policy.path.display().to_string(),
+                    source,
+                })
+        })
         .transpose()?;
     let source = super::source::load_policy_source(policy)?;
-    let runtime = PolicyRuntime::from_source_with_required_hooks(source.manifest, &source.source)?;
+    let runtime = PolicyRuntime::from_source_with_required_hooks(source.manifest, &source.source)
+        .map_err(|source| ConfiguredPolicyError::PolicyLoad {
+        id: policy.id.clone(),
+        path: policy.path.display().to_string(),
+        source,
+    })?;
 
     Ok(LoadedConfiguredPolicy {
         runtime,
@@ -140,27 +146,28 @@ mod tests {
     const OVERSIZED_TEST_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
     #[test]
-    fn load_configured_policy_rejects_incomplete_bundle_source()
+    fn load_configured_policies_rejects_incomplete_bundle_source()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-incomplete-bundle")?;
         let policy_path = temp.join("policy-dir");
         fs::create_dir_all(&policy_path)?;
         let config = config_with_policy(&policy_path)?;
 
-        let Err(error) = load_configured_policy(&config) else {
+        let Err(error) = load_configured_policies(&config) else {
             panic!("directory policy source must fail");
         };
 
         assert!(matches!(
             error,
-            ConfiguredPolicyError::InvalidPolicySource { .. }
+            ConfiguredPolicyError::InvalidPolicySource { id, path, .. }
+                if id == "guard" && path == policy_path.display().to_string()
         ));
         fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[test]
-    fn load_configured_policy_loads_bundle_manifest_and_main()
+    fn load_configured_policies_loads_bundle_manifest_and_main()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-bundle")?;
         let policy_path = temp.join("guard.bundle");
@@ -177,7 +184,8 @@ end
         )?;
         let config = config_with_policy(&policy_path)?;
 
-        let loaded = load_configured_policy(&config)?.expect("configured policy");
+        let loaded = load_configured_policies(&config)?;
+        let loaded = loaded.first().expect("configured policy");
 
         assert_eq!(loaded.runtime.manifest().id, "guard");
         assert_eq!(loaded.runtime.manifest().version, "bundle-test");
@@ -186,20 +194,20 @@ end
             vec![PolicyHook::HttpRequestHeaders]
         );
         assert_eq!(
-            policy_alert_count(
+            policy_alert_versions(
                 &temp.join("bundle-spool"),
-                &loaded,
+                std::slice::from_ref(loaded),
                 flow_with_remote_port(80)
             )?,
-            1
+            vec!["guard@bundle-test"]
         );
         fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[test]
-    fn load_configured_policy_rejects_bundle_id_mismatch() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn load_configured_policies_rejects_bundle_id_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-bundle-id-mismatch")?;
         let policy_path = temp.join("guard.bundle");
         write_policy_bundle(
@@ -211,7 +219,7 @@ end
         )?;
         let config = config_with_policy(&policy_path)?;
 
-        let Err(error) = load_configured_policy(&config) else {
+        let Err(error) = load_configured_policies(&config) else {
             panic!("bundle id mismatch must fail configured policy loading");
         };
 
@@ -223,7 +231,7 @@ end
     }
 
     #[test]
-    fn load_configured_policy_rejects_bundle_missing_declared_hook()
+    fn load_configured_policies_rejects_bundle_missing_declared_hook()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-bundle-missing-hook")?;
         let policy_path = temp.join("guard.bundle");
@@ -236,15 +244,18 @@ end
         )?;
         let config = config_with_policy(&policy_path)?;
 
-        let Err(error) = load_configured_policy(&config) else {
+        let Err(error) = load_configured_policies(&config) else {
             panic!("bundle missing a declared hook must fail configured policy loading");
         };
 
         assert!(matches!(
             error,
-            ConfiguredPolicyError::Policy(PolicyError::MissingHook {
-                hook: PolicyHook::HttpRequestHeaders
-            })
+            ConfiguredPolicyError::PolicyLoad {
+                source: PolicyError::MissingHook {
+                    hook: PolicyHook::HttpRequestHeaders
+                },
+                ..
+            }
         ));
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -252,7 +263,7 @@ end
 
     #[cfg(unix)]
     #[test]
-    fn load_configured_policy_rejects_symlinked_bundle_main()
+    fn load_configured_policies_rejects_symlinked_bundle_main()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-bundle-main-symlink")?;
         let policy_path = temp.join("guard.bundle");
@@ -272,7 +283,7 @@ end
         std::os::unix::fs::symlink(&external_source, policy_path.join("main.lua"))?;
         let config = config_with_policy(&policy_path)?;
 
-        let Err(error) = load_configured_policy(&config) else {
+        let Err(error) = load_configured_policies(&config) else {
             panic!("bundle symlinked main.lua must fail configured policy loading");
         };
 
@@ -284,7 +295,7 @@ end
     }
 
     #[test]
-    fn load_configured_policy_rejects_source_above_size_limit()
+    fn load_configured_policies_rejects_source_above_size_limit()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-too-large")?;
         let policy_path = temp.join("guard.bundle");
@@ -301,7 +312,7 @@ hooks = ["on_http_request_headers"]
         file.set_len(OVERSIZED_TEST_FILE_BYTES)?;
         let config = config_with_policy(&policy_path)?;
 
-        let Err(error) = load_configured_policy(&config) else {
+        let Err(error) = load_configured_policies(&config) else {
             panic!("oversized policy source must fail");
         };
 
@@ -337,22 +348,78 @@ end
                 ..TrafficSelector::default()
             },
         ));
-        let loaded = load_configured_policy(&config)?.expect("configured policy");
+        let loaded = load_configured_policies(&config)?;
+        let loaded = loaded.first().expect("configured policy");
 
         assert_eq!(
-            policy_alert_count(&temp.join("miss-spool"), &loaded, flow_with_remote_port(80))?,
-            0
+            policy_alert_versions(
+                &temp.join("miss-spool"),
+                std::slice::from_ref(loaded),
+                flow_with_remote_port(80)
+            )?,
+            Vec::<String>::new()
         );
         assert_eq!(
-            policy_alert_count(&temp.join("hit-spool"), &loaded, flow_with_remote_port(443))?,
-            1
+            policy_alert_versions(
+                &temp.join("hit-spool"),
+                std::slice::from_ref(loaded),
+                flow_with_remote_port(443)
+            )?,
+            vec!["guard@bundle-test"]
         );
         fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[test]
-    fn configured_policy_selection_reports_multiple_enabled_as_unsupported()
+    fn load_configured_policies_runs_multiple_enabled_bundles_in_config_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("configured-policy-multiple-run")?;
+        let first_path = temp.join("first.bundle");
+        let second_path = temp.join("second.bundle");
+        write_policy_bundle(
+            &first_path,
+            "first",
+            "one",
+            &["on_http_request_headers"],
+            r#"
+function on_http_request_headers(event)
+  return probe.emit_alert("first " .. event.kind.target)
+end
+"#,
+        )?;
+        write_policy_bundle(
+            &second_path,
+            "second",
+            "two",
+            &["on_http_request_headers"],
+            r#"
+function on_http_request_headers(event)
+  return probe.emit_alert("second " .. event.kind.target)
+end
+"#,
+        )?;
+        let mut config = config_with_policy(&first_path)?;
+        config.policies[0].id = "first".to_string();
+        config.policies.push(PolicyConfig {
+            id: "second".to_string(),
+            path: second_path,
+            enabled: true,
+            selector: None,
+        });
+
+        let loaded = load_configured_policies(&config)?;
+
+        assert_eq!(
+            policy_alert_versions(&temp.join("spool"), &loaded, flow_with_remote_port(80))?,
+            vec!["first@one", "second@two"]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn configured_policy_selection_reports_multiple_enabled_as_active()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-multiple")?;
         let first_path = temp.join("first.bundle");
@@ -368,20 +435,18 @@ end
         let selection = configured_policy_selection(&config);
 
         assert_eq!(selection.configured_count, 2);
-        assert_eq!(selection.enabled_count, 2);
-        assert!(matches!(
-            selection.state,
-            ConfiguredPolicySelectionState::Unsupported { .. }
-        ));
+        assert_eq!(selection.enabled.len(), 2);
+        assert_eq!(selection.enabled[0].id, "guard");
+        assert_eq!(selection.enabled[1].id, "second");
         fs::remove_dir_all(temp)?;
         Ok(())
     }
 
-    fn policy_alert_count(
+    fn policy_alert_versions(
         spool_path: &Path,
-        policy: &LoadedConfiguredPolicy,
+        policies: &[LoadedConfiguredPolicy],
         flow: FlowContext,
-    ) -> Result<usize, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let spool = storage::FjallSpool::open(spool_path)?;
         let mut parser_factory = Http1ParserFactory::default();
         let mut provider = ReplayProvider::new(
@@ -396,10 +461,10 @@ end
         let mut pipeline = CapturePipeline::new(
             &spool,
             &mut parser_factory,
-            Some(PipelinePolicy::new(
-                &policy.runtime,
-                policy.selector.as_ref(),
-            )),
+            policies
+                .iter()
+                .map(|policy| PipelinePolicy::new(&policy.runtime, policy.selector.as_ref()))
+                .collect(),
             "test",
         );
 
@@ -411,8 +476,12 @@ end
             .collect::<Result<Vec<_>, _>>()?;
         Ok(envelopes
             .iter()
-            .filter(|envelope| matches!(envelope.kind, EventKind::PolicyAlert(_)))
-            .count())
+            .filter_map(|envelope| {
+                matches!(envelope.kind, EventKind::PolicyAlert(_))
+                    .then(|| envelope.policy_version.clone())
+                    .flatten()
+            })
+            .collect())
     }
 
     fn flow_with_remote_port(remote_port: u16) -> FlowContext {

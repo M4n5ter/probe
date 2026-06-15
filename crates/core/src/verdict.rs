@@ -114,6 +114,7 @@ pub enum EnforcementOutcome {
     DryRun,
     SelectorMiss,
     Unsupported,
+    Failed,
     Applied,
 }
 

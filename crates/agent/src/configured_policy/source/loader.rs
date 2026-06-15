@@ -24,7 +24,14 @@ const BUNDLE_MAIN_FILE: &str = "main.lua";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicySourceInspection {
     pub mode: RuntimeMode,
+    pub manifest: Option<PolicyManifestMetadata>,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyManifestMetadata {
+    pub id: String,
+    pub version: String,
 }
 
 pub struct LoadedPolicySource {
@@ -36,17 +43,22 @@ pub fn load_policy_source(
     policy: &PolicyConfig,
 ) -> Result<LoadedPolicySource, ConfiguredPolicyError> {
     read_policy_bundle_directory(&policy.path, policy.id.as_str())
-        .map_err(|error| error.into_configured_error(&policy.path))
+        .map_err(|error| error.into_configured_error(policy))
 }
 
 pub fn inspect_policy_source(path: &Path, expected_id: &str) -> PolicySourceInspection {
     match inspect_policy_bundle_directory(path, expected_id) {
-        Ok(()) => PolicySourceInspection {
+        Ok(manifest) => PolicySourceInspection {
             mode: RuntimeMode::Available,
+            manifest: Some(PolicyManifestMetadata {
+                id: manifest.id,
+                version: manifest.version,
+            }),
             reason: None,
         },
         Err(error) => PolicySourceInspection {
             mode: RuntimeMode::Unavailable,
+            manifest: None,
             reason: Some(error.reason()),
         },
     }
@@ -77,11 +89,12 @@ fn read_policy_bundle_directory(
 fn inspect_policy_bundle_directory(
     root: &Path,
     expected_id: &str,
-) -> Result<(), PolicySourceValidationError> {
+) -> Result<PolicyManifest, PolicySourceValidationError> {
     ensure_policy_bundle_directory(root)?;
     let manifest = read_policy_manifest(&manifest_path(root))?;
-    validate_policy_manifest(manifest, expected_id)?;
-    check_regular_policy_file(&main_path(root), MAX_POLICY_SOURCE_BYTES, "source")
+    let manifest = validate_policy_manifest(manifest, expected_id)?;
+    check_regular_policy_file(&main_path(root), MAX_POLICY_SOURCE_BYTES, "source")?;
+    Ok(manifest)
 }
 
 fn read_policy_manifest(path: &Path) -> Result<PolicyManifest, PolicySourceValidationError> {
@@ -340,16 +353,18 @@ impl PolicySourceValidationError {
         }
     }
 
-    fn into_configured_error(self, policy_path: &Path) -> ConfiguredPolicyError {
+    fn into_configured_error(self, policy: &PolicyConfig) -> ConfiguredPolicyError {
         match self {
             Self::Inspect { path, source }
             | Self::Open { path, source }
             | Self::Read { path, source } => ConfiguredPolicyError::ReadPolicy {
+                id: policy.id.clone(),
                 path: path.display().to_string(),
                 source,
             },
             error => ConfiguredPolicyError::InvalidPolicySource {
-                path: policy_path.display().to_string(),
+                id: policy.id.clone(),
+                path: policy.path.display().to_string(),
                 reason: error.reason(),
             },
         }

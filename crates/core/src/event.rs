@@ -145,6 +145,7 @@ pub enum EventKind {
     ProtocolError(ProtocolError),
     PolicyAlert(DomainEvent),
     PolicyVerdict(Verdict),
+    PolicyRuntimeError(PolicyRuntimeError),
     EnforcementDecision(EnforcementDecision),
 }
 
@@ -163,6 +164,7 @@ pub enum EventType {
     ProtocolError,
     PolicyAlert,
     PolicyVerdict,
+    PolicyRuntimeError,
     EnforcementDecision,
 }
 
@@ -182,6 +184,7 @@ impl EventType {
             Self::ProtocolError => "protocol_error",
             Self::PolicyAlert => "policy_alert",
             Self::PolicyVerdict => "policy_verdict",
+            Self::PolicyRuntimeError => "policy_runtime_error",
             Self::EnforcementDecision => "enforcement_decision",
         }
     }
@@ -211,6 +214,7 @@ impl FromStr for EventType {
             "protocol_error" => Ok(Self::ProtocolError),
             "policy_alert" => Ok(Self::PolicyAlert),
             "policy_verdict" => Ok(Self::PolicyVerdict),
+            "policy_runtime_error" => Ok(Self::PolicyRuntimeError),
             "enforcement_decision" => Ok(Self::EnforcementDecision),
             _ => Err(UnknownEventType {
                 value: value.to_string(),
@@ -265,6 +269,7 @@ impl EventKind {
             Self::ProtocolError(_) => EventType::ProtocolError,
             Self::PolicyAlert(_) => EventType::PolicyAlert,
             Self::PolicyVerdict(_) => EventType::PolicyVerdict,
+            Self::PolicyRuntimeError(_) => EventType::PolicyRuntimeError,
             Self::EnforcementDecision(_) => EventType::EnforcementDecision,
         }
     }
@@ -285,6 +290,7 @@ impl EventKind {
             | Self::ConnectionClosed
             | Self::PolicyAlert(_)
             | Self::PolicyVerdict(_)
+            | Self::PolicyRuntimeError(_)
             | Self::EnforcementDecision(_) => None,
         }
     }
@@ -390,14 +396,20 @@ pub struct DomainEvent {
     pub metadata: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyRuntimeError {
+    pub hook: String,
+    pub reason: String,
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
         Action, AddressPort, CaptureSource, Direction, DomainEvent, EnforcementDecision,
         EnforcementMode, EnforcementOutcome, EventEnvelope, EventKind, EventType, FlowContext,
-        FlowIdentity, Gap, HttpHeaders, OpaqueStream, ProcessContext, ProcessIdentity,
-        ProtocolError, SseEvent, Timestamp, TransportProtocol, Verdict, VerdictScope,
-        WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
+        FlowIdentity, Gap, HttpHeaders, OpaqueStream, PolicyRuntimeError, ProcessContext,
+        ProcessIdentity, ProtocolError, SseEvent, Timestamp, TransportProtocol, Verdict,
+        VerdictScope, WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
     };
 
     #[test]
@@ -493,7 +505,7 @@ mod tests {
         }
     }
 
-    fn event_type_wire_cases() -> [(EventType, &'static str); 14] {
+    fn event_type_wire_cases() -> [(EventType, &'static str); 15] {
         [
             (EventType::ConnectionOpened, "connection_opened"),
             (EventType::ConnectionClosed, "connection_closed"),
@@ -508,11 +520,12 @@ mod tests {
             (EventType::ProtocolError, "protocol_error"),
             (EventType::PolicyAlert, "policy_alert"),
             (EventType::PolicyVerdict, "policy_verdict"),
+            (EventType::PolicyRuntimeError, "policy_runtime_error"),
             (EventType::EnforcementDecision, "enforcement_decision"),
         ]
     }
 
-    fn event_kind_wire_cases() -> [EventKind; 14] {
+    fn event_kind_wire_cases() -> [EventKind; 15] {
         [
             EventKind::ConnectionOpened,
             EventKind::ConnectionClosed,
@@ -598,6 +611,10 @@ mod tests {
                 reason: "matched".to_string(),
                 confidence: 100,
                 ttl_ms: None,
+            }),
+            EventKind::PolicyRuntimeError(PolicyRuntimeError {
+                hook: "on_http_request_headers".to_string(),
+                reason: "policy failed".to_string(),
             }),
             EventKind::EnforcementDecision(EnforcementDecision {
                 mode: EnforcementMode::DryRun,

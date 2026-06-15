@@ -26,10 +26,7 @@ pub struct EnforcementPlanRequest<'a> {
 }
 
 pub trait EnforcementPlanner {
-    fn evaluate(
-        &mut self,
-        request: EnforcementPlanRequest<'_>,
-    ) -> Result<Option<EnforcementDecision>, EnforcementError>;
+    fn evaluate(&mut self, request: EnforcementPlanRequest<'_>) -> Option<EnforcementDecision>;
 }
 
 pub struct ScopedEnforcementPlanner {
@@ -106,12 +103,9 @@ impl ScopedEnforcementPlanner {
 }
 
 impl EnforcementPlanner for ScopedEnforcementPlanner {
-    fn evaluate(
-        &mut self,
-        request: EnforcementPlanRequest<'_>,
-    ) -> Result<Option<EnforcementDecision>, EnforcementError> {
+    fn evaluate(&mut self, request: EnforcementPlanRequest<'_>) -> Option<EnforcementDecision> {
         if !requires_enforcement(request.verdict.action) {
-            return Ok(None);
+            return None;
         }
 
         let selector_matched = self.scope.matches_trigger(request.trigger);
@@ -134,10 +128,10 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
                 ),
             )
         } else {
-            self.decision_for_mode(request)?
+            self.decision_for_mode(request)
         };
 
-        Ok(Some(EnforcementDecision {
+        Some(EnforcementDecision {
             mode: self.mode,
             outcome,
             requested_action: request.verdict.action,
@@ -145,7 +139,7 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
             scope: request.verdict.scope.clone(),
             selector_matched,
             reason,
-        }))
+        })
     }
 }
 
@@ -153,9 +147,9 @@ impl ScopedEnforcementPlanner {
     fn decision_for_mode(
         &mut self,
         request: EnforcementPlanRequest<'_>,
-    ) -> Result<(EnforcementOutcome, Action, String), EnforcementError> {
+    ) -> (EnforcementOutcome, Action, String) {
         let verdict = request.verdict;
-        let decision = match self.mode {
+        match self.mode {
             EnforcementMode::Disabled => (
                 EnforcementOutcome::Disabled,
                 Action::Observe,
@@ -181,23 +175,37 @@ impl ScopedEnforcementPlanner {
                 ),
             ),
             EnforcementMode::Enforce => {
-                let backend = self
-                    .backend
-                    .as_deref_mut()
-                    .ok_or(EnforcementError::BackendUnavailable)?;
-                let decision = backend.apply(EnforcementBackendRequest {
+                let Some(backend) = self.backend.as_deref_mut() else {
+                    return failed_decision_parts(verdict, &EnforcementError::BackendUnavailable);
+                };
+                match backend.apply(EnforcementBackendRequest {
                     verdict,
                     trigger: request.trigger,
-                })?;
-                decision.into_enforcement_parts(verdict.action)
+                }) {
+                    Ok(decision) => decision.into_enforcement_parts(verdict.action),
+                    Err(error) => failed_decision_parts(verdict, &error),
+                }
             }
-        };
-        Ok(decision)
+        }
     }
 }
 
 fn requires_enforcement(action: Action) -> bool {
     action.is_protective()
+}
+
+fn failed_decision_parts(
+    verdict: &Verdict,
+    error: &EnforcementError,
+) -> (EnforcementOutcome, Action, String) {
+    (
+        EnforcementOutcome::Failed,
+        Action::Observe,
+        format!(
+            "policy requested {:?}, but enforcement failed: {error}: {}",
+            verdict.action, verdict.reason
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -229,7 +237,7 @@ mod tests {
             .evaluate(EnforcementPlanRequest {
                 verdict: &verdict,
                 trigger: &trigger,
-            })?
+            })
             .expect("deny verdict should produce enforcement audit");
 
         assert_eq!(decision.outcome, EnforcementOutcome::DryRun);
@@ -263,7 +271,7 @@ mod tests {
             .evaluate(EnforcementPlanRequest {
                 verdict: &verdict,
                 trigger: &trigger,
-            })?
+            })
             .expect("protective verdict should produce enforcement audit");
 
         assert_eq!(decision.outcome, EnforcementOutcome::SelectorMiss);
@@ -299,7 +307,7 @@ mod tests {
             .evaluate(EnforcementPlanRequest {
                 verdict: &verdict,
                 trigger: &trigger,
-            })?
+            })
             .expect("protective verdict should produce enforcement audit");
 
         assert_eq!(decision.outcome, EnforcementOutcome::SelectorMiss);
@@ -324,7 +332,7 @@ mod tests {
             .evaluate(EnforcementPlanRequest {
                 verdict: &verdict,
                 trigger: &trigger,
-            })?
+            })
             .expect("protective verdict should produce disabled audit");
 
         assert_eq!(decision.outcome, EnforcementOutcome::Disabled);
@@ -343,7 +351,7 @@ mod tests {
         let decision = planner.evaluate(EnforcementPlanRequest {
             verdict: &verdict,
             trigger: &trigger,
-        })?;
+        });
 
         assert!(decision.is_none());
         Ok(())
@@ -370,7 +378,7 @@ mod tests {
             .evaluate(EnforcementPlanRequest {
                 verdict: &verdict,
                 trigger: &trigger,
-            })?
+            })
             .expect("protective verdict should produce enforcement audit");
 
         assert_eq!(decision.outcome, EnforcementOutcome::Unsupported);
@@ -400,13 +408,45 @@ mod tests {
             .evaluate(EnforcementPlanRequest {
                 verdict: &verdict,
                 trigger: &trigger,
-            })?
+            })
             .expect("protective verdict should be delegated to backend");
 
         assert_eq!(decision.outcome, EnforcementOutcome::Applied);
         assert_eq!(decision.requested_action, Action::Reset);
         assert_eq!(decision.effective_action, Action::Reset);
         assert_eq!(decision.reason, "backend applied Reset");
+        assert!(decision.selector_matched);
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_mode_records_backend_error_as_failed_decision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut planner = ScopedEnforcementPlanner::with_backend(
+            None,
+            ProtectiveActionProfile::default(),
+            FailingBackend,
+        )?;
+        let trigger = request_event(Direction::Outbound);
+        let verdict = Verdict {
+            action: Action::Reset,
+            scope: VerdictScope::Flow,
+            reason: "reset flow".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+
+        let decision = planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("protective verdict should produce failure audit");
+
+        assert_eq!(decision.outcome, EnforcementOutcome::Failed);
+        assert_eq!(decision.requested_action, Action::Reset);
+        assert_eq!(decision.effective_action, Action::Observe);
+        assert!(decision.reason.contains("planned backend failure"));
         assert!(decision.selector_matched);
         Ok(())
     }
@@ -448,6 +488,19 @@ mod tests {
                 "backend applied {:?}",
                 request.verdict.action
             )))
+        }
+    }
+
+    struct FailingBackend;
+
+    impl EnforcementBackend for FailingBackend {
+        fn apply(
+            &mut self,
+            _request: EnforcementBackendRequest<'_>,
+        ) -> Result<EnforcementBackendDecision, EnforcementError> {
+            Err(EnforcementError::Backend(
+                "planned backend failure".to_string(),
+            ))
         }
     }
 

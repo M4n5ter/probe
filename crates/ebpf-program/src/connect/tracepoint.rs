@@ -42,7 +42,7 @@ fn connect_tracepoint_args(ctx: &TracePointContext) -> ConnectTracepointArgs {
 }
 
 fn tracepoint_u64(ctx: &TracePointContext, offset: usize) -> u64 {
-    // Offsets are read from tracefs sys_enter_connect format and covered by userspace smoke tests.
+    // Offsets must match tracefs sys_enter_connect format; privileged e2e validation is required.
     unsafe { ctx.read_at::<u64>(offset) }.unwrap_or_default()
 }
 

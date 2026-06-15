@@ -22,7 +22,7 @@ fn run_provider_with_options_stops_after_max_capture_events()
             b"GET /two HTTP/1.1\r\nHost: two.test\r\n\r\n",
         ),
     ]);
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let summary =
         pipeline.run_provider_with_options(&mut provider, PipelineRunOptions::max_events(1))?;
@@ -42,7 +42,7 @@ fn run_provider_with_zero_max_events_does_not_read_provider()
     let spool = storage::FjallSpool::open(temp.path())?;
     let mut parser_factory = Http1ParserFactory::default();
     let mut provider = UnreadableProvider;
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let summary =
         pipeline.run_provider_with_options(&mut provider, PipelineRunOptions::max_events(0))?;

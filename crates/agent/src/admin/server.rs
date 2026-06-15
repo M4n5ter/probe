@@ -537,7 +537,7 @@ mod tests {
                 },
             );
             let mut pipeline =
-                CapturePipeline::new(spool.as_ref(), &mut parser_factory, None, "test")
+                CapturePipeline::new(spool.as_ref(), &mut parser_factory, Vec::new(), "test")
                     .with_runtime_metrics(pipeline_metrics.clone());
             pipeline.run_provider(&mut provider)?;
         }

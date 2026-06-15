@@ -341,7 +341,7 @@ mod tests {
             .evaluate(EnforcementPlanRequest {
                 verdict: &verdict,
                 trigger,
-            })?
+            })
             .expect("protective verdict should produce enforcement decision"))
     }
 

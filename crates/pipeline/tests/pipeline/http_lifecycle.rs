@@ -43,7 +43,7 @@ end
     let mut pipeline = CapturePipeline::new(
         &spool,
         &mut parser_factory,
-        Some(PipelinePolicy::unscoped(&policy)),
+        vec![PipelinePolicy::unscoped(&policy)],
         "test",
     );
 
@@ -128,7 +128,7 @@ fn connection_close_flushes_close_delimited_http_body() -> Result<(), Box<dyn st
         ),
         connection_closed(flow),
     ]);
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let summary = pipeline.run_provider(&mut provider)?;
 
@@ -186,7 +186,7 @@ fn live_pipeline_isolates_parser_state_per_flow() -> Result<(), Box<dyn std::err
         ),
         captured_bytes(flow_a, b"llo"),
     ]);
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let summary = pipeline.run_provider(&mut provider)?;
 
@@ -231,7 +231,7 @@ fn live_pipeline_parses_process_inbound_request_as_request()
         Direction::Inbound,
         b"GET /server HTTP/1.1\r\nHost: server.test\r\n\r\n",
     )]);
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let summary = pipeline.run_provider(&mut provider)?;
 

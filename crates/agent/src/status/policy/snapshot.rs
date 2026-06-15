@@ -1,8 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::configured_policy::{
-    ConfiguredPolicySelectionState, ConfiguredPolicySource, configured_policy_selection,
-    inspect_policy_source,
+    ConfiguredPolicySource, configured_policy_selection, inspect_policy_source,
 };
 use probe_core::RuntimeMode;
 use runtime::RuntimePlan;
@@ -13,7 +12,7 @@ pub struct PolicyStatusSnapshot {
     pub mode: PolicyStatusMode,
     pub configured_count: u64,
     pub enabled_count: u64,
-    pub active: Option<PolicyBundleStatusSnapshot>,
+    pub active: Vec<PolicyBundleStatusSnapshot>,
     pub reason: Option<String>,
 }
 
@@ -30,6 +29,7 @@ pub struct PolicyBundleStatusSnapshot {
     pub id: String,
     pub path: PathBuf,
     pub selector_configured: bool,
+    pub policy_version: Option<String>,
     pub source: PolicySourceStatusSnapshot,
 }
 
@@ -48,70 +48,95 @@ pub enum PolicySourceCheck {
 
 pub(in crate::status) fn policy_status(plan: &RuntimePlan) -> PolicyStatusSnapshot {
     let selection = configured_policy_selection(&plan.config);
-    let policy = match selection.state {
-        ConfiguredPolicySelectionState::Inactive => {
-            return PolicyStatusSnapshot {
-                mode: PolicyStatusMode::Inactive,
-                configured_count: selection.configured_count,
-                enabled_count: selection.enabled_count,
-                active: None,
-                reason: None,
-            };
-        }
-        ConfiguredPolicySelectionState::Active { policy } => policy,
-        ConfiguredPolicySelectionState::Unsupported { reason } => {
-            return PolicyStatusSnapshot {
-                mode: PolicyStatusMode::Unavailable,
-                configured_count: selection.configured_count,
-                enabled_count: selection.enabled_count,
-                active: None,
-                reason: Some(reason),
-            };
-        }
-    };
+    let enabled_count = selection.enabled.len() as u64;
+    if selection.enabled.is_empty() {
+        return PolicyStatusSnapshot {
+            mode: PolicyStatusMode::Inactive,
+            configured_count: selection.configured_count,
+            enabled_count,
+            active: Vec::new(),
+            reason: None,
+        };
+    }
 
-    let source = policy_source_status(&policy.path, &policy.id);
-    let (mode, reason) = match source.mode {
-        RuntimeMode::Available => (
+    let active = selection
+        .enabled
+        .into_iter()
+        .map(|policy| {
+            let source = policy_source_status(&policy.path, &policy.id);
+            policy_bundle_status(policy, source)
+        })
+        .collect::<Vec<_>>();
+    let unavailable_reasons = active
+        .iter()
+        .filter(|policy| policy.source.mode != RuntimeMode::Available)
+        .map(|policy| {
+            format!(
+                "{}: {}",
+                policy.id,
+                policy
+                    .source
+                    .reason
+                    .as_deref()
+                    .unwrap_or("policy source metadata is unavailable")
+            )
+        })
+        .collect::<Vec<_>>();
+    let (mode, reason) = if unavailable_reasons.is_empty() {
+        (
             PolicyStatusMode::MetadataOnly,
             Some(
                 "policy source metadata is available, but offline status does not load or execute policy source"
                     .to_string(),
             ),
-        ),
-        RuntimeMode::Degraded | RuntimeMode::Unavailable => {
-            (PolicyStatusMode::Unavailable, source.reason.clone())
-        }
+        )
+    } else {
+        (
+            PolicyStatusMode::Unavailable,
+            Some(unavailable_reasons.join("; ")),
+        )
     };
 
     PolicyStatusSnapshot {
         mode,
         configured_count: selection.configured_count,
-        enabled_count: selection.enabled_count,
-        active: Some(policy_bundle_status(policy, source)),
+        enabled_count,
+        active,
         reason,
     }
 }
 
 fn policy_bundle_status(
     policy: ConfiguredPolicySource,
-    source: PolicySourceStatusSnapshot,
+    source: PolicySourceStatus,
 ) -> PolicyBundleStatusSnapshot {
     PolicyBundleStatusSnapshot {
         id: policy.id,
         path: policy.path,
         selector_configured: policy.selector_configured,
-        source,
+        policy_version: source.policy_version,
+        source: source.snapshot,
     }
 }
 
-fn policy_source_status(path: &Path, expected_id: &str) -> PolicySourceStatusSnapshot {
-    let inspection = inspect_policy_source(path, expected_id);
+struct PolicySourceStatus {
+    snapshot: PolicySourceStatusSnapshot,
+    policy_version: Option<String>,
+}
 
-    PolicySourceStatusSnapshot {
-        check: PolicySourceCheck::MetadataOnly,
-        mode: inspection.mode,
-        reason: inspection.reason,
+fn policy_source_status(path: &Path, expected_id: &str) -> PolicySourceStatus {
+    let inspection = inspect_policy_source(path, expected_id);
+    let policy_version = inspection
+        .manifest
+        .map(|manifest| format!("{}@{}", manifest.id, manifest.version));
+
+    PolicySourceStatus {
+        snapshot: PolicySourceStatusSnapshot {
+            check: PolicySourceCheck::MetadataOnly,
+            mode: inspection.mode,
+            reason: inspection.reason,
+        },
+        policy_version,
     }
 }
 
@@ -191,17 +216,76 @@ hooks = ["on_http_request_headers"]
         let status = policy_status(&plan);
 
         assert_eq!(status.mode, PolicyStatusMode::MetadataOnly);
-        let active_policy = status.active.as_ref().expect("active policy");
-        assert_eq!(active_policy.id, "guard");
-        assert_eq!(active_policy.path, policy_path);
-        assert!(active_policy.selector_configured);
-        assert_eq!(active_policy.source.mode, RuntimeMode::Available);
-        assert_eq!(active_policy.source.check, PolicySourceCheck::MetadataOnly);
+        let active_bundle = status.active.first().expect("active bundle");
+        assert_eq!(active_bundle.id, "guard");
+        assert_eq!(active_bundle.path, policy_path);
+        assert!(active_bundle.selector_configured);
+        assert_eq!(
+            active_bundle.policy_version.as_deref(),
+            Some("guard@bundle-test")
+        );
+        assert_eq!(active_bundle.source.mode, RuntimeMode::Available);
+        assert_eq!(active_bundle.source.check, PolicySourceCheck::MetadataOnly);
         assert!(
             status
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("offline status does not load or execute"))
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn policy_status_reports_multiple_metadata_only_bundles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-multiple-policy-bundles")?;
+        let first_path = temp.join("first.bundle");
+        let second_path = temp.join("second.bundle");
+        write_policy_bundle(&first_path, "first")?;
+        write_policy_bundle(&second_path, "second")?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.policies = vec![
+            PolicyConfig {
+                id: "first".to_string(),
+                path: first_path.clone(),
+                enabled: true,
+                selector: Some(Selector::default()),
+            },
+            PolicyConfig {
+                id: "second".to_string(),
+                path: second_path.clone(),
+                enabled: true,
+                selector: None,
+            },
+        ];
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+
+        let status = policy_status(&plan);
+
+        assert_eq!(status.mode, PolicyStatusMode::MetadataOnly);
+        assert_eq!(status.configured_count, 2);
+        assert_eq!(status.enabled_count, 2);
+        assert_eq!(status.active.len(), 2);
+        assert_eq!(status.active[0].id, "first");
+        assert_eq!(status.active[0].path, first_path);
+        assert_eq!(
+            status.active[0].policy_version.as_deref(),
+            Some("first@bundle-test")
+        );
+        assert!(status.active[0].selector_configured);
+        assert_eq!(status.active[1].id, "second");
+        assert_eq!(status.active[1].path, second_path);
+        assert_eq!(
+            status.active[1].policy_version.as_deref(),
+            Some("second@bundle-test")
+        );
+        assert!(!status.active[1].selector_configured);
+        assert!(
+            status
+                .active
+                .iter()
+                .all(|policy| policy.source.mode == RuntimeMode::Available)
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -269,6 +353,22 @@ hooks = ["on_http_request_headers"]
                 .is_some_and(|reason| reason.contains("exceeding"))
         );
         fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    fn write_policy_bundle(path: &std::path::Path, id: &str) -> Result<(), std::io::Error> {
+        fs::create_dir_all(path)?;
+        fs::write(
+            path.join("manifest.toml"),
+            format!(
+                r#"
+id = "{id}"
+version = "bundle-test"
+hooks = ["on_http_request_headers"]
+"#
+            ),
+        )?;
+        fs::write(path.join("main.lua"), "function on_http_request_headers(")?;
         Ok(())
     }
 }

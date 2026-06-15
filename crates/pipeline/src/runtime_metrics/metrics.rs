@@ -22,11 +22,13 @@ struct PipelineRuntimeMetricsInner {
     policy_selector_misses: AtomicCounter,
     policy_alerts: AtomicCounter,
     policy_verdicts: AtomicCounter,
+    policy_errors: AtomicCounter,
     enforcement_disabled: AtomicCounter,
     enforcement_audit_only: AtomicCounter,
     enforcement_dry_run: AtomicCounter,
     enforcement_selector_miss: AtomicCounter,
     enforcement_unsupported: AtomicCounter,
+    enforcement_failed: AtomicCounter,
     enforcement_applied: AtomicCounter,
 }
 
@@ -47,6 +49,7 @@ pub struct PolicyRuntimeMetricsSnapshot {
     pub selector_misses: u64,
     pub alerts: u64,
     pub verdicts: u64,
+    pub errors: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -57,6 +60,7 @@ pub struct EnforcementRuntimeMetricsSnapshot {
     pub dry_run: u64,
     pub selector_miss: u64,
     pub unsupported: u64,
+    pub failed: u64,
     pub applied: u64,
 }
 
@@ -74,6 +78,7 @@ impl PipelineRuntimeMetrics {
                 selector_misses: self.inner.policy_selector_misses.load(),
                 alerts: self.inner.policy_alerts.load(),
                 verdicts: self.inner.policy_verdicts.load(),
+                errors: self.inner.policy_errors.load(),
             },
             enforcement,
         }
@@ -85,6 +90,7 @@ impl PipelineRuntimeMetrics {
         let dry_run = self.inner.enforcement_dry_run.load();
         let selector_miss = self.inner.enforcement_selector_miss.load();
         let unsupported = self.inner.enforcement_unsupported.load();
+        let failed = self.inner.enforcement_failed.load();
         let applied = self.inner.enforcement_applied.load();
         EnforcementRuntimeMetricsSnapshot {
             decisions: [
@@ -93,6 +99,7 @@ impl PipelineRuntimeMetrics {
                 dry_run,
                 selector_miss,
                 unsupported,
+                failed,
                 applied,
             ]
             .into_iter()
@@ -102,6 +109,7 @@ impl PipelineRuntimeMetrics {
             dry_run,
             selector_miss,
             unsupported,
+            failed,
             applied,
         }
     }
@@ -142,6 +150,10 @@ impl PipelineRuntimeMetrics {
         self.inner.policy_verdicts.increment();
     }
 
+    pub(crate) fn record_policy_error(&self) {
+        self.inner.policy_errors.increment();
+    }
+
     pub(crate) fn record_enforcement_decision(&self, outcome: EnforcementOutcome) {
         match outcome {
             EnforcementOutcome::Disabled => self.inner.enforcement_disabled.increment(),
@@ -149,6 +161,7 @@ impl PipelineRuntimeMetrics {
             EnforcementOutcome::DryRun => self.inner.enforcement_dry_run.increment(),
             EnforcementOutcome::SelectorMiss => self.inner.enforcement_selector_miss.increment(),
             EnforcementOutcome::Unsupported => self.inner.enforcement_unsupported.increment(),
+            EnforcementOutcome::Failed => self.inner.enforcement_failed.increment(),
             EnforcementOutcome::Applied => self.inner.enforcement_applied.increment(),
         }
     }
@@ -188,6 +201,7 @@ mod tests {
         metrics.record_enforcement_decision(EnforcementOutcome::DryRun);
         metrics.record_enforcement_decision(EnforcementOutcome::SelectorMiss);
         metrics.record_enforcement_decision(EnforcementOutcome::Unsupported);
+        metrics.record_enforcement_decision(EnforcementOutcome::Failed);
         metrics.record_enforcement_decision(EnforcementOutcome::Applied);
 
         let enforcement = metrics.snapshot().enforcement;
@@ -199,8 +213,9 @@ mod tests {
                 + enforcement.dry_run
                 + enforcement.selector_miss
                 + enforcement.unsupported
+                + enforcement.failed
                 + enforcement.applied
         );
-        assert_eq!(enforcement.decisions, 6);
+        assert_eq!(enforcement.decisions, 7);
     }
 }

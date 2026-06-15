@@ -12,11 +12,10 @@ fn main() -> ExitCode {
         Some("check-host") => run_host_check(),
         Some("check-all") => run_check_all(),
         Some("check-ebpf") => ebpf::run_check(),
-        Some("check-privileged-ebpf") => ebpf::run_privileged_smoke(),
         Some("ebpf-build") => ebpf::run_build(),
         _ => {
             eprintln!(
-                "usage: cargo run -p xtask -- <check|check-host|check-ebpf|check-privileged-ebpf|check-all|ebpf-build>"
+                "usage: cargo run -p xtask -- <check|check-host|check-ebpf|check-all|ebpf-build>"
             );
             ExitCode::FAILURE
         }

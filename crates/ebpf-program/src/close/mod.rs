@@ -10,6 +10,6 @@ pub fn close_observation_from_tracepoint(ctx: &TracePointContext) -> Option<Ebpf
 }
 
 fn tracepoint_u64(ctx: &TracePointContext, offset: usize) -> Option<u64> {
-    // Offsets are read from tracefs sys_enter_close format and covered by userspace smoke tests.
+    // Offsets must match tracefs sys_enter_close format; privileged e2e validation is required.
     unsafe { ctx.read_at::<u64>(offset) }.ok()
 }

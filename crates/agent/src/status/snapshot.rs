@@ -460,7 +460,7 @@ mod tests {
                 .get(),
             1
         );
-        assert!(snapshot.policy.active.is_none());
+        assert!(snapshot.policy.active.is_empty());
         assert!(snapshot.tls.materials.is_empty());
         let value = serde_json::to_value(&snapshot)?;
         assert_eq!(snapshot.metrics.export.backing_off_sink_count, None);
@@ -534,6 +534,7 @@ mod tests {
                     selector_misses: 1,
                     alerts: 1,
                     verdicts: 1,
+                    errors: 0,
                 },
                 enforcement: pipeline::EnforcementRuntimeMetricsSnapshot {
                     decisions: 1,
@@ -542,6 +543,7 @@ mod tests {
                     dry_run: 1,
                     selector_miss: 0,
                     unsupported: 0,
+                    failed: 0,
                     applied: 0,
                 },
             }),

@@ -21,7 +21,7 @@ fn recover_ingress_journal_replays_capture_bytes() -> Result<(), Box<dyn std::er
     );
     spool.append_ingress(capture_event_payload(&event)?)?;
     let mut parser_factory = Http1ParserFactory::default();
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let summary = pipeline.recover_ingress_journal_until_idle(16)?;
 
@@ -57,7 +57,7 @@ fn recover_ingress_journal_replays_persisted_prefix_for_parser_state()
         flow.clone(),
         b"GET /split-recovered HTTP/1.1\r\nHost: recovery",
     )]);
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let summary = pipeline.run_provider(&mut provider)?;
 
@@ -69,7 +69,7 @@ fn recover_ingress_journal_replays_persisted_prefix_for_parser_state()
     drop(pipeline);
     drop(parser_factory);
     let mut parser_factory = Http1ParserFactory::default();
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let summary = pipeline.recover_ingress_journal_until_idle(16)?;
 
@@ -110,7 +110,7 @@ fn recover_ingress_journal_advances_cursor_after_recovered_connection_close()
     ))?)?;
     spool.append_ingress(capture_event_payload(&connection_closed(flow))?)?;
     let mut parser_factory = Http1ParserFactory::default();
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let summary = pipeline.recover_ingress_journal_until_idle(16)?;
 
@@ -156,7 +156,7 @@ fn capture_event_payload(event: &CaptureEvent) -> Result<SpoolPayload, serde_jso
 
 fn recover_without_policy(spool: &storage::FjallSpool) -> Result<PipelineSummary, PipelineError> {
     let mut parser_factory = Http1ParserFactory::default();
-    let mut pipeline = CapturePipeline::new(spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(spool, &mut parser_factory, Vec::new(), "test");
     pipeline.recover_ingress_journal_until_idle(16)
 }
 
@@ -189,7 +189,7 @@ fn recover_ingress_journal_replays_persisted_gap() -> Result<(), Box<dyn std::er
         "dropped packets",
     ))?)?;
     let mut parser_factory = Http1ParserFactory::default();
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let summary = pipeline.recover_ingress_journal_until_idle(16)?;
 
@@ -223,7 +223,7 @@ fn recover_ingress_journal_rejects_unexpected_payload_schema()
         b"{}",
     ))?;
     let mut parser_factory = Http1ParserFactory::default();
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let error = pipeline
         .recover_ingress_journal_until_idle(16)

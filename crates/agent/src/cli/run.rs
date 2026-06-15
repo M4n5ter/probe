@@ -25,7 +25,7 @@ use crate::{
     capture_registry::default_provider_registry,
     check::build_check_report,
     configured_enforcement::build_configured_enforcement_with_backend,
-    configured_policy::load_configured_policy,
+    configured_policy::load_configured_policies,
     connection_enforcement::{self, ConnectionEnforcementRuntime},
     error::AgentError,
     export::{ExportWorker, ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook},
@@ -166,7 +166,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let enforcement_backend = runtime.connection_enforcement.into_backend();
             let mut enforcement =
                 build_configured_enforcement_with_backend(&plan, enforcement_backend).await?;
-            let policy = load_configured_policy(&plan.config)?;
+            let policies = load_configured_policies(&plan.config)?;
             let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
             let mut parser_factory = Http1ParserFactory::default();
             let export_worker = export_worker_config_from_plan(&plan).map(ExportWorker::new);
@@ -194,9 +194,10 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let mut pipeline = CapturePipeline::new(
                 spool.as_ref(),
                 &mut parser_factory,
-                policy
-                    .as_ref()
-                    .map(|policy| PipelinePolicy::new(&policy.runtime, policy.selector.as_ref())),
+                policies
+                    .iter()
+                    .map(|policy| PipelinePolicy::new(&policy.runtime, policy.selector.as_ref()))
+                    .collect(),
                 plan.config.config_version.clone(),
             )
             .with_runtime_metrics(pipeline_metrics);
@@ -362,7 +363,11 @@ async fn replay(command: ReplayCommand) -> Result<(), AgentError> {
     let mut pipeline = CapturePipeline::new(
         &spool,
         &mut parser_factory,
-        policy.as_ref().map(PipelinePolicy::unscoped),
+        policy
+            .as_ref()
+            .map(PipelinePolicy::unscoped)
+            .into_iter()
+            .collect(),
         "replay",
     )
     .with_enforcement_planner(&mut enforcement_planner);
@@ -584,6 +589,85 @@ protective_actions = ["alert"]
             "spool must not be opened before policy validation passes"
         );
 
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_applies_multiple_configured_policies_in_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("run-multiple-policies")?;
+        let config_path = temp.join("agent.toml");
+        let feed_path = temp.join("feed.jsonl");
+        let spool_path = temp.join("spool");
+        let first_policy_path = temp.join("first.bundle");
+        let second_policy_path = temp.join("second.bundle");
+        fs::write(
+            &feed_path,
+            r#"
+{"type":"bytes","timestamp":{"monotonic_ns":1,"wall_time_unix_ns":1},"connection":{"connection_id":"fixture-conn","local":{"address":"127.0.0.1","port":50000},"remote":{"address":"127.0.0.1","port":80},"protocol":"tcp","start_monotonic_ns":1,"attribution_confidence":42,"process":{"pid":123,"tgid":123,"start_time_ticks":456,"boot_id":"boot","exe_path":"/usr/bin/feed","cmdline_hash":"hash","uid":1000,"gid":1000,"name":"feed","cmdline":["feed"]}},"direction":"outbound","stream_offset":0,"bytes":[71,69,84,32,47,109,117,108,116,105,32,72,84,84,80,47,49,46,49,13,10,72,111,115,116,58,32,116,101,115,116,13,10,13,10]}
+"#,
+        )?;
+        write_policy_bundle(
+            &first_policy_path,
+            "first",
+            r#"
+function on_http_request_headers(event)
+  return probe.emit_alert("first " .. event.kind.target)
+end
+"#,
+        )?;
+        write_policy_bundle(
+            &second_policy_path,
+            "second",
+            r#"
+function on_http_request_headers(event)
+  return probe.emit_alert("second " .. event.kind.target)
+end
+"#,
+        )?;
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::PlaintextFeed;
+        config.capture.plaintext_feed.path = Some(feed_path);
+        config.storage.path = spool_path.clone();
+        config.policies = vec![
+            PolicyConfig {
+                id: "first".to_string(),
+                path: first_policy_path,
+                enabled: true,
+                selector: None,
+            },
+            PolicyConfig {
+                id: "second".to_string(),
+                path: second_policy_path,
+                enabled: true,
+                selector: None,
+            },
+        ];
+        fs::write(&config_path, toml::to_string(&config)?)?;
+
+        run(Cli {
+            command: Command::Run {
+                config: Some(config_path),
+                max_events: Some(1),
+            },
+        })
+        .await?;
+
+        let spool = FjallSpool::open(&spool_path)?;
+        let exported = spool.read_export_batch("sink", 16)?;
+        let policy_versions = exported
+            .iter()
+            .map(|event| serde_json::from_slice::<probe_core::EventEnvelope>(event.payload.bytes()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|envelope| matches!(envelope.kind, probe_core::EventKind::PolicyAlert(_)))
+            .filter_map(|envelope| envelope.policy_version)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            policy_versions,
+            vec!["first@bundle-test", "second@bundle-test"]
+        );
         fs::remove_dir_all(temp)?;
         Ok(())
     }

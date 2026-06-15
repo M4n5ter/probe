@@ -74,9 +74,10 @@ impl PolicyHook {
             EventType::OpaqueStream => Some(Self::OpaqueStream),
             EventType::Gap => Some(Self::Gap),
             EventType::ProtocolError => Some(Self::ProtocolError),
-            EventType::PolicyAlert | EventType::PolicyVerdict | EventType::EnforcementDecision => {
-                None
-            }
+            EventType::PolicyAlert
+            | EventType::PolicyVerdict
+            | EventType::PolicyRuntimeError
+            | EventType::EnforcementDecision => None,
         }
     }
 }
@@ -644,6 +645,7 @@ mod tests {
         for event_type in [
             EventType::PolicyAlert,
             EventType::PolicyVerdict,
+            EventType::PolicyRuntimeError,
             EventType::EnforcementDecision,
         ] {
             assert_eq!(PolicyHook::from_event_type(event_type), None);

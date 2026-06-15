@@ -7,7 +7,7 @@ use crate::{
     },
     configured_policy::{
         ConfiguredPolicyError, LoadedConfiguredPolicy, configured_policy_selection,
-        load_configured_policy,
+        load_configured_policies,
     },
 };
 use enforcement::EnforcementBackend;
@@ -45,7 +45,7 @@ pub struct PolicyCheckSnapshot {
     pub mode: PolicyCheckMode,
     pub configured_count: u64,
     pub enabled_count: u64,
-    pub active: Option<LoadedPolicySnapshot>,
+    pub active: Vec<LoadedPolicySnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -120,21 +120,22 @@ pub async fn build_check_report(
 
 fn check_policy(config: &AgentConfig) -> Result<PolicyCheckSnapshot, CheckError> {
     let selection = configured_policy_selection(config);
-    let policy = load_configured_policy(config)?;
-    let Some(policy) = policy else {
+    let enabled_count = selection.enabled.len() as u64;
+    let policies = load_configured_policies(config)?;
+    if policies.is_empty() {
         return Ok(PolicyCheckSnapshot {
             mode: PolicyCheckMode::Inactive,
             configured_count: selection.configured_count,
-            enabled_count: selection.enabled_count,
-            active: None,
+            enabled_count,
+            active: Vec::new(),
         });
-    };
+    }
 
     Ok(PolicyCheckSnapshot {
         mode: PolicyCheckMode::Loaded,
         configured_count: selection.configured_count,
-        enabled_count: selection.enabled_count,
-        active: Some(loaded_policy_snapshot(&policy)),
+        enabled_count,
+        active: policies.iter().map(loaded_policy_snapshot).collect(),
     })
 }
 
@@ -225,7 +226,8 @@ mod tests {
         let report = build_check_report(plan, None).await?;
 
         assert_eq!(report.policy.mode, PolicyCheckMode::Loaded);
-        let active = report.policy.active.as_ref().expect("loaded policy");
+        assert_eq!(report.policy.active.len(), 1);
+        let active = report.policy.active.first().expect("loaded policy");
         assert_eq!(active.id, "guard");
         assert_eq!(active.version, "bundle-test");
         assert_eq!(active.path, policy_path);
@@ -244,6 +246,51 @@ mod tests {
             report.enforcement.policy.mode,
             EnforcementPolicyCheckMode::NotConfigured
         );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_loads_multiple_enabled_policy_bundles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-multiple-policy-bundles")?;
+        let first_path = write_policy_bundle_with_id(
+            &temp,
+            "first",
+            "function on_http_request_headers(_) return {} end",
+        )?;
+        let second_path = write_policy_bundle_with_id(
+            &temp,
+            "second",
+            "function on_http_request_headers(_) return {} end",
+        )?;
+        let mut config = config_with_policy(&first_path)?;
+        config.policies[0].id = "first".to_string();
+        config.policies.push(probe_config::PolicyConfig {
+            id: "second".to_string(),
+            path: second_path.clone(),
+            enabled: true,
+            selector: Some(Selector::default()),
+        });
+        let plan = runtime_plan(config)?;
+
+        let report = build_check_report(plan, None).await?;
+
+        assert_eq!(report.policy.mode, PolicyCheckMode::Loaded);
+        assert_eq!(report.policy.enabled_count, 2);
+        assert_eq!(
+            report
+                .policy
+                .active
+                .iter()
+                .map(|policy| policy.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(report.policy.active[0].path, first_path);
+        assert_eq!(report.policy.active[1].path, second_path);
+        assert!(!report.policy.active[0].selector_configured);
+        assert!(report.policy.active[1].selector_configured);
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -452,15 +499,19 @@ protective_actions = ["alert"]
         assert_eq!(value["policy"]["mode"], json!("loaded"));
         assert_eq!(value["policy"]["configured_count"], json!(1));
         assert_eq!(value["policy"]["enabled_count"], json!(1));
-        assert_eq!(value["policy"]["active"]["id"], json!("guard"));
-        assert_eq!(value["policy"]["active"]["version"], json!("bundle-test"));
+        assert_eq!(value["policy"]["active"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["policy"]["active"][0]["id"], json!("guard"));
         assert_eq!(
-            value["policy"]["active"]["selector_configured"],
+            value["policy"]["active"][0]["version"],
+            json!("bundle-test")
+        );
+        assert_eq!(
+            value["policy"]["active"][0]["selector_configured"],
             json!(false)
         );
-        assert!(value["policy"]["active"].get("hooks").is_none());
+        assert!(value["policy"]["active"][0].get("hooks").is_none());
         assert!(
-            value["policy"]["active"]["registered_hooks"]
+            value["policy"]["active"][0]["registered_hooks"]
                 .as_array()
                 .is_some_and(|hooks| hooks.iter().any(|hook| hook == "on_http_request_headers"))
         );
@@ -500,7 +551,7 @@ protective_actions = ["alert"]
 
         assert!(matches!(
             error,
-            CheckError::ConfiguredPolicy(ConfiguredPolicyError::Policy(_))
+            CheckError::ConfiguredPolicy(ConfiguredPolicyError::PolicyLoad { .. })
         ));
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -604,15 +655,25 @@ path = "/tmp/collector-ca.pem"
         temp: &Path,
         source: &str,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let policy_path = temp.join("guard.bundle");
+        write_policy_bundle_with_id(temp, "guard", source)
+    }
+
+    fn write_policy_bundle_with_id(
+        temp: &Path,
+        id: &str,
+        source: &str,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let policy_path = temp.join(format!("{id}.bundle"));
         fs::create_dir_all(&policy_path)?;
         fs::write(
             policy_path.join("manifest.toml"),
-            r#"
-id = "guard"
+            format!(
+                r#"
+id = "{id}"
 version = "bundle-test"
 hooks = ["on_http_request_headers"]
-"#,
+"#
+            ),
         )?;
         fs::write(policy_path.join("main.lua"), source)?;
         Ok(policy_path)

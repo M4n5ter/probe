@@ -171,7 +171,7 @@ mod tests {
             .evaluate(EnforcementPlanRequest {
                 verdict: &verdict,
                 trigger: &trigger,
-            })?
+            })
             .expect("protective verdict must produce an enforcement decision");
 
         assert_eq!(configured.planner.mode(), EnforcementMode::Enforce);

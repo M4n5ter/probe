@@ -3,8 +3,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use capture::{CaptureError, CaptureEvent, CaptureProvider, CapturedBytes};
 use enforcement::{EnforcementPlanRequest, EnforcementPlanner};
 use parsers::{ParserInput, ProtocolParserFactory};
-use policy::{PolicyOutcome, PolicyRuntime, hook_for_event};
-use probe_core::{CompiledSelector, EventEnvelope, EventKind, SpoolPayloadSchema, Timestamp};
+use policy::{PolicyHook, PolicyOutcome, PolicyRuntime, hook_for_event};
+use probe_core::{
+    CompiledSelector, EnforcementDecision, EventEnvelope, EventKind, PolicyRuntimeError,
+    SpoolPayloadSchema, Timestamp, Verdict,
+};
 use storage::{DurableSpool, IngressCursorOwner, SpoolPayload};
 use thiserror::Error;
 
@@ -20,10 +23,6 @@ pub enum PipelineError {
     Json(#[from] serde_json::Error),
     #[error("storage error: {0}")]
     Storage(#[from] storage::StorageError),
-    #[error("policy error: {0}")]
-    Policy(#[from] policy::PolicyError),
-    #[error("enforcement error: {0}")]
-    Enforcement(#[from] enforcement::EnforcementError),
     #[error(
         "unexpected ingress payload schema at sequence {sequence}: expected {expected}, got {actual}"
     )]
@@ -84,7 +83,7 @@ impl PipelineRunOptions {
 pub struct CapturePipeline<'a, S> {
     spool: &'a S,
     parser_factory: &'a mut dyn ProtocolParserFactory,
-    policy: Option<PipelinePolicy<'a>>,
+    policies: Vec<PipelinePolicy<'a>>,
     enforcement_planner: Option<&'a mut dyn EnforcementPlanner>,
     config_version: String,
     clock: PipelineClock,
@@ -120,13 +119,13 @@ where
     pub fn new(
         spool: &'a S,
         parser_factory: &'a mut dyn ProtocolParserFactory,
-        policy: Option<PipelinePolicy<'a>>,
+        policies: Vec<PipelinePolicy<'a>>,
         config_version: impl Into<String>,
     ) -> Self {
         Self {
             spool,
             parser_factory,
-            policy,
+            policies,
             enforcement_planner: None,
             config_version: config_version.into(),
             clock: PipelineClock::default(),
@@ -382,89 +381,138 @@ where
         self.append_envelope(&envelope)?;
         let mut written = 1;
 
-        let Some(policy) = self.policy else {
-            return Ok(written);
-        };
-        let Some(hook) = hook_for_event(&envelope) else {
-            return Ok(written);
-        };
-        if !policy.matches(&envelope) {
+        if let Some(hook) = hook_for_event(&envelope) {
+            for policy_index in 0..self.policies.len() {
+                let policy = self.policies[policy_index];
+                written += self.append_matching_policy_outputs(&envelope, policy, hook)?;
+            }
+        }
+        Ok(written)
+    }
+
+    fn append_matching_policy_outputs(
+        &mut self,
+        envelope: &EventEnvelope,
+        policy: PipelinePolicy<'a>,
+        hook: PolicyHook,
+    ) -> Result<u64, PipelineError> {
+        if !policy.matches(envelope) {
             if let Some(metrics) = &self.runtime_metrics {
                 metrics.record_policy_selector_miss();
             }
-            return Ok(written);
+            return Ok(0);
         }
+
         let policy_version = format!(
             "{}@{}",
             policy.runtime.manifest().id,
             policy.runtime.manifest().version
         );
-        let outcomes = policy.runtime.handle_event(hook, &envelope)?;
         if let Some(metrics) = &self.runtime_metrics {
             metrics.record_policy_evaluation();
         }
+
+        let outcomes = match policy.runtime.handle_event(hook, envelope) {
+            Ok(outcomes) => outcomes,
+            Err(source) => {
+                self.append_policy_runtime_error(envelope, &policy_version, hook, &source)?;
+                if let Some(metrics) = &self.runtime_metrics {
+                    metrics.record_policy_error();
+                }
+                return Ok(1);
+            }
+        };
+        let mut written = 0;
         for outcome in outcomes {
-            match outcome {
-                PolicyOutcome::Alert(alert) => {
-                    let policy_envelope = EventEnvelope::new(
-                        self.clock.next_timestamp(),
-                        envelope.flow.clone(),
-                        envelope.source,
-                        envelope.config_version.clone(),
-                        EventKind::PolicyAlert(alert),
-                    )
-                    .with_policy_version(policy_version.clone())
-                    .with_degraded(envelope.degraded);
-                    self.append_envelope(&policy_envelope)?;
-                    if let Some(metrics) = &self.runtime_metrics {
-                        metrics.record_policy_alert();
-                    }
-                    written += 1;
-                }
-                PolicyOutcome::Verdict(verdict) => {
-                    let policy_envelope = EventEnvelope::new(
-                        self.clock.next_timestamp(),
-                        envelope.flow.clone(),
-                        envelope.source,
-                        envelope.config_version.clone(),
-                        EventKind::PolicyVerdict(verdict.clone()),
-                    )
-                    .with_policy_version(policy_version.clone())
-                    .with_degraded(envelope.degraded);
-                    self.append_envelope(&policy_envelope)?;
-                    if let Some(metrics) = &self.runtime_metrics {
-                        metrics.record_policy_verdict();
-                    }
-                    written += 1;
-
-                    if let Some(enforcement_planner) = self.enforcement_planner.as_deref_mut()
-                        && let Some(decision) =
-                            enforcement_planner.evaluate(EnforcementPlanRequest {
-                                verdict: &verdict,
-                                trigger: &envelope,
-                            })?
-                    {
-                        let outcome = decision.outcome;
-                        let enforcement_envelope = EventEnvelope::new(
-                            self.clock.next_timestamp(),
-                            envelope.flow.clone(),
-                            envelope.source,
-                            envelope.config_version.clone(),
-                            EventKind::EnforcementDecision(decision),
-                        )
-                        .with_policy_version(policy_version.clone())
-                        .with_degraded(envelope.degraded);
-                        self.append_envelope(&enforcement_envelope)?;
-                        if let Some(metrics) = &self.runtime_metrics {
-                            metrics.record_enforcement_decision(outcome);
-                        }
-                        written += 1;
-                    }
-                }
-            };
+            written += self.append_policy_outcome(envelope, &policy_version, outcome)?;
         }
-
         Ok(written)
+    }
+
+    fn append_policy_runtime_error(
+        &mut self,
+        envelope: &EventEnvelope,
+        policy_version: &str,
+        hook: PolicyHook,
+        source: &policy::PolicyError,
+    ) -> Result<(), PipelineError> {
+        self.append_policy_event(
+            envelope,
+            policy_version,
+            EventKind::PolicyRuntimeError(PolicyRuntimeError {
+                hook: hook.as_str().to_string(),
+                reason: source.to_string(),
+            }),
+        )
+    }
+
+    fn append_policy_outcome(
+        &mut self,
+        envelope: &EventEnvelope,
+        policy_version: &str,
+        outcome: PolicyOutcome,
+    ) -> Result<u64, PipelineError> {
+        match outcome {
+            PolicyOutcome::Alert(alert) => {
+                self.append_policy_event(envelope, policy_version, EventKind::PolicyAlert(alert))?;
+                if let Some(metrics) = &self.runtime_metrics {
+                    metrics.record_policy_alert();
+                }
+                Ok(1)
+            }
+            PolicyOutcome::Verdict(verdict) => {
+                self.append_policy_event(
+                    envelope,
+                    policy_version,
+                    EventKind::PolicyVerdict(verdict.clone()),
+                )?;
+                if let Some(metrics) = &self.runtime_metrics {
+                    metrics.record_policy_verdict();
+                }
+
+                let Some(decision) = self.evaluate_enforcement_decision(envelope, &verdict) else {
+                    return Ok(1);
+                };
+                let decision_outcome = decision.outcome;
+                self.append_policy_event(
+                    envelope,
+                    policy_version,
+                    EventKind::EnforcementDecision(decision),
+                )?;
+                if let Some(metrics) = &self.runtime_metrics {
+                    metrics.record_enforcement_decision(decision_outcome);
+                }
+                Ok(2)
+            }
+        }
+    }
+
+    fn evaluate_enforcement_decision(
+        &mut self,
+        trigger: &EventEnvelope,
+        verdict: &Verdict,
+    ) -> Option<EnforcementDecision> {
+        let enforcement_planner = self.enforcement_planner.as_deref_mut()?;
+        enforcement_planner.evaluate(EnforcementPlanRequest { verdict, trigger })
+    }
+
+    fn append_policy_event(
+        &mut self,
+        envelope: &EventEnvelope,
+        policy_version: &str,
+        kind: EventKind,
+    ) -> Result<(), PipelineError> {
+        let policy_envelope = EventEnvelope::new(
+            self.clock.next_timestamp(),
+            envelope.flow.clone(),
+            envelope.source,
+            envelope.config_version.clone(),
+            kind,
+        )
+        .with_policy_version(policy_version)
+        .with_degraded(envelope.degraded);
+        self.append_envelope(&policy_envelope)?;
+        Ok(())
     }
 
     fn append_envelope(&self, envelope: &EventEnvelope) -> Result<(), PipelineError> {

@@ -20,7 +20,7 @@ fn replay_provider_writes_ingress_and_export_lanes() -> Result<(), Box<dyn std::
             wall_time_unix_ns: 1,
         },
     );
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let summary = pipeline.run_provider(&mut provider)?;
 
@@ -55,7 +55,7 @@ fn plaintext_event_provider_writes_ingress_and_http_export_events()
             b"GET /plaintext HTTP/1.1\r\nHost: tls.example\r\n\r\n",
         )],
     );
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, None, "test");
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let summary = pipeline.run_provider(&mut provider)?;
 

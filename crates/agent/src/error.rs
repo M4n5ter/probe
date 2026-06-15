@@ -46,7 +46,13 @@ pub(crate) enum AgentError {
     #[error("admin error: {0}")]
     Admin(#[from] crate::admin::AdminError),
     #[error("{0}")]
-    Check(#[from] CheckError),
+    Check(#[source] Box<CheckError>),
     #[error("unsupported run config: {0}")]
     UnsupportedRunConfig(String),
+}
+
+impl From<CheckError> for AgentError {
+    fn from(error: CheckError) -> Self {
+        Self::Check(Box::new(error))
+    }
 }
