@@ -12,9 +12,11 @@ use crate::{
 };
 use enforcement::EnforcementBackend;
 use policy::PolicyHook;
-use probe_config::{AgentConfig, ConnectionEnforcementBackendConfig};
+use probe_config::{
+    AgentConfig, ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig,
+};
 use probe_core::EnforcementMode;
-use runtime::RuntimePlan;
+use runtime::{EnforcementCapabilityPlan, RuntimePlan};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -67,11 +69,25 @@ pub struct LoadedPolicySnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnforcementCheckSnapshot {
     pub mode: EnforcementMode,
-    pub backend: ConnectionEnforcementBackendConfig,
+    pub connection: EnforcementConnectionCheckSnapshot,
+    pub interception: EnforcementInterceptionCheckSnapshot,
     pub effective_selector_configured: bool,
     pub config_selector_configured: bool,
     pub manifest_selector_configured: Option<bool>,
     pub policy: EnforcementPolicyCheckSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EnforcementConnectionCheckSnapshot {
+    pub backend: ConnectionEnforcementBackendConfig,
+    pub capability: EnforcementCapabilityPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EnforcementInterceptionCheckSnapshot {
+    pub strategy: TransparentInterceptionStrategyConfig,
+    pub selector_configured: bool,
+    pub capability: EnforcementCapabilityPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -162,7 +178,15 @@ async fn check_enforcement(
     );
     Ok(EnforcementCheckSnapshot {
         mode: enforcement.mode,
-        backend: plan.enforcement.backend,
+        connection: EnforcementConnectionCheckSnapshot {
+            backend: plan.enforcement.connection.backend,
+            capability: plan.enforcement.connection.capability.clone(),
+        },
+        interception: EnforcementInterceptionCheckSnapshot {
+            strategy: plan.enforcement.interception.strategy,
+            selector_configured: plan.enforcement.interception.selector_configured,
+            capability: plan.enforcement.interception.capability.clone(),
+        },
         effective_selector_configured: enforcement.effective_selector_configured,
         config_selector_configured: enforcement.config_selector_configured,
         manifest_selector_configured: enforcement.manifest_selector_configured,
@@ -239,7 +263,7 @@ mod tests {
         );
         assert_eq!(report.enforcement.mode, EnforcementMode::AuditOnly);
         assert_eq!(
-            report.enforcement.backend,
+            report.enforcement.connection.backend,
             ConnectionEnforcementBackendConfig::None
         );
         assert_eq!(
@@ -516,7 +540,19 @@ protective_actions = ["alert"]
                 .is_some_and(|hooks| hooks.iter().any(|hook| hook == "on_http_request_headers"))
         );
         assert_eq!(value["enforcement"]["mode"], json!("audit_only"));
-        assert_eq!(value["enforcement"]["backend"], json!("none"));
+        assert_eq!(value["enforcement"]["connection"]["backend"], json!("none"));
+        assert_eq!(
+            value["enforcement"]["connection"]["capability"]["kind"],
+            json!("not_required")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["strategy"],
+            json!("none")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["capability"]["kind"],
+            json!("not_required")
+        );
         assert_eq!(
             value["enforcement"]["effective_selector_configured"],
             json!(false)
@@ -558,13 +594,14 @@ protective_actions = ["alert"]
     }
 
     #[tokio::test]
-    async fn check_report_rejects_enforce_without_backend_before_loading_policy()
+    async fn check_report_rejects_enforce_without_backend_factory_before_loading_policy()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-enforce-without-backend")?;
         let policy_path = temp.join("missing-policy.bundle");
         let mut config = config_with_policy(&policy_path)?;
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.backend = ConnectionEnforcementBackendConfig::LinuxSocketDestroy;
         let plan = runtime_plan_with_connection_enforcement(config)?;
 
         let error = build_check_report(plan, None)
@@ -573,7 +610,9 @@ protective_actions = ["alert"]
 
         assert!(matches!(
             error,
-            CheckError::ConfiguredEnforcement(ConfiguredEnforcementError::BackendUnavailable)
+            CheckError::ConfiguredEnforcement(
+                ConfiguredEnforcementError::ExecutionBackendUnavailable
+            )
         ));
         fs::remove_dir_all(temp)?;
         Ok(())

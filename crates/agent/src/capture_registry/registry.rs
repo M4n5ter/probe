@@ -14,6 +14,7 @@ use runtime::{
 pub fn default_provider_registry(
     config: &AgentConfig,
     connection_enforcement_capability: CapabilityState,
+    transparent_interception_capability: CapabilityState,
 ) -> ProviderRegistry {
     let ebpf_host = EbpfHostProbe::probe(&EbpfHostProbeConfig::default());
     let procfs_socket_capabilities = attribution::ProcfsSocketResolver::new().capabilities();
@@ -25,6 +26,7 @@ pub fn default_provider_registry(
         PlatformProbeResults {
             procfs_socket: procfs_socket_capabilities,
             connection_enforcement: connection_enforcement_capability,
+            transparent_interception: transparent_interception_capability,
             libssl_uprobe,
         },
     )
@@ -368,11 +370,36 @@ mod tests {
                 CapabilityKind::ConnectionEnforcement,
                 "connection-level enforcement backend is not configured",
             ),
+            CapabilityState::unavailable(
+                CapabilityKind::TransparentInterception,
+                "transparent interception backend is not configured",
+            ),
         );
         let capabilities = registry.capability_matrix();
 
         assert_eq!(
             capabilities.mode(CapabilityKind::ConnectionEnforcement),
+            RuntimeMode::Unavailable
+        );
+    }
+
+    #[test]
+    fn default_registry_keeps_transparent_interception_unavailable_without_backend() {
+        let registry = default_provider_registry(
+            &AgentConfig::default(),
+            CapabilityState::unavailable(
+                CapabilityKind::ConnectionEnforcement,
+                "connection-level enforcement backend is not configured",
+            ),
+            CapabilityState::unavailable(
+                CapabilityKind::TransparentInterception,
+                "transparent interception backend is not configured",
+            ),
+        );
+        let capabilities = registry.capability_matrix();
+
+        assert_eq!(
+            capabilities.mode(CapabilityKind::TransparentInterception),
             RuntimeMode::Unavailable
         );
     }

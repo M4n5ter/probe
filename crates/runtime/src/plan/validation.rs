@@ -2,7 +2,9 @@ use probe_config::{AgentConfig, ConfigValidationError, ConfigViolation};
 use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
 
 use super::capture::{CapturePlan, CapturePlanMode};
-use super::enforcement::EnforcementCapabilityPlan;
+use super::enforcement::{
+    EnforcementCapabilityPlan, EnforcementCapabilityRequirement, enabled_execution_surfaces,
+};
 use super::registry::ProviderRegistry;
 
 pub(super) fn validate_runtime_config(
@@ -133,6 +135,36 @@ fn validate_static_enforcement_config(config: &AgentConfig, violations: &mut Vec
             reason: error.to_string(),
         });
     }
+    if let Some(selector) = &config.enforcement.interception.selector
+        && let Err(error) = selector.compile()
+    {
+        violations.push(ConfigViolation {
+            field: "enforcement.interception.selector".to_string(),
+            reason: error.to_string(),
+        });
+    }
+    if config.enforcement.interception.strategy.is_enabled()
+        && config.enforcement.mode != EnforcementMode::Enforce
+    {
+        violations.push(ConfigViolation {
+            field: "enforcement.interception.strategy".to_string(),
+            reason: "transparent interception strategy requires enforcement.mode = enforce"
+                .to_string(),
+        });
+    }
+    if config.enforcement.mode == EnforcementMode::Enforce {
+        match enabled_execution_surfaces(config).len() {
+            0 => violations.push(ConfigViolation {
+                field: "enforcement.mode".to_string(),
+                reason: "enforce mode requires at least one enforcement execution surface: connection backend or transparent interception strategy".to_string(),
+            }),
+            1 => {}
+            _ => violations.push(ConfigViolation {
+                field: "enforcement.mode".to_string(),
+                reason: "enforce mode supports exactly one enforcement execution surface until composite enforcement execution is implemented".to_string(),
+            }),
+        }
+    }
 }
 
 fn validate_registry_enforcement_config(
@@ -140,17 +172,51 @@ fn validate_registry_enforcement_config(
     registry: &ProviderRegistry,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    if let Some(requirement) =
-        EnforcementCapabilityPlan::requirement_for_mode(config.enforcement.mode)
-    {
+    for check in enforcement_capability_checks(config) {
         require_available(
             &registry.capability_matrix(),
-            requirement.capability,
-            "enforcement.mode",
-            requirement.unavailable_reason,
+            check.requirement.capability,
+            check.field,
+            check.requirement.unavailable_reason,
             violations,
         );
     }
+}
+
+fn enforcement_capability_checks(config: &AgentConfig) -> Vec<EnforcementCapabilityCheck> {
+    let mut checks = Vec::new();
+    if let Some(requirement) =
+        EnforcementCapabilityPlan::requirement_for_mode(config.enforcement.mode)
+    {
+        checks.push(EnforcementCapabilityCheck {
+            field: "enforcement.mode",
+            requirement,
+        });
+    }
+    if config.enforcement.mode == EnforcementMode::Enforce
+        && let Some(requirement) = EnforcementCapabilityPlan::requirement_for_connection_backend(
+            config.enforcement.backend,
+        )
+    {
+        checks.push(EnforcementCapabilityCheck {
+            field: "enforcement.backend",
+            requirement,
+        });
+    }
+    if let Some(requirement) = EnforcementCapabilityPlan::requirement_for_interception_strategy(
+        config.enforcement.interception.strategy,
+    ) {
+        checks.push(EnforcementCapabilityCheck {
+            field: "enforcement.interception.strategy",
+            requirement,
+        });
+    }
+    checks
+}
+
+struct EnforcementCapabilityCheck {
+    field: &'static str,
+    requirement: EnforcementCapabilityRequirement,
 }
 
 fn validate_enforcement_capture_constraints(
@@ -167,7 +233,7 @@ fn validate_enforcement_capture_constraints(
         violations.push(ConfigViolation {
             field: "enforcement.mode".to_string(),
             reason: format!(
-                "enforce mode requires live host capture; selected capture mode is {:?}",
+                "enforcement execution requires live host capture; selected capture mode is {:?}",
                 capture.mode
             ),
         });
@@ -218,7 +284,10 @@ fn require_usable(
 
 #[cfg(test)]
 mod tests {
-    use probe_config::{CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig};
+    use probe_config::{
+        CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig,
+        TransparentInterceptionStrategyConfig,
+    };
     use probe_core::{CapabilityState, Selector};
 
     use crate::plan::{
@@ -234,6 +303,7 @@ mod tests {
         let mut config = AgentConfig::default();
         config.tls.plaintext.instrumentation.enabled = true;
         config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.backend = ConnectionEnforcementBackendConfig::LinuxSocketDestroy;
 
         let error = validation_error(config, &registry);
 
@@ -242,7 +312,7 @@ mod tests {
             "tls.plaintext.instrumentation.enabled",
             "unavailable",
         );
-        assert_violation(&error, "enforcement.mode", "not built");
+        assert_violation(&error, "enforcement.backend", "not built");
     }
 
     #[test]
@@ -441,7 +511,24 @@ mod tests {
     }
 
     #[test]
-    fn enforce_enforcement_requires_connection_capability() {
+    fn enforce_enforcement_requires_execution_surface() {
+        let registry =
+            ProviderRegistry::new(vec![live_capture_provider()], test_platform_capabilities());
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(
+            &error,
+            "enforcement.mode",
+            "at least one enforcement execution surface",
+        );
+    }
+
+    #[test]
+    fn configured_connection_backend_requires_connection_capability() {
         let cases = [
             (
                 test_platform_capabilities()
@@ -469,21 +556,15 @@ mod tests {
         ];
 
         for (capabilities, expected_reason) in cases {
-            let registry = ProviderRegistry::new(
-                vec![capture_provider(
-                    CaptureBackend::Replay,
-                    CaptureProviderBuilder::Replay,
-                    RuntimeMode::Available,
-                )],
-                capabilities,
-            );
+            let registry = ProviderRegistry::new(vec![live_capture_provider()], capabilities);
             let mut config = AgentConfig::default();
-            config.capture.selection = CaptureSelection::Replay;
+            config.capture.selection = CaptureSelection::Libpcap;
             config.enforcement.mode = EnforcementMode::Enforce;
+            config.enforcement.backend = ConnectionEnforcementBackendConfig::LinuxSocketDestroy;
 
             let error = validation_error(config, &registry);
 
-            assert_violation(&error, "enforcement.mode", expected_reason);
+            assert_violation(&error, "enforcement.backend", expected_reason);
         }
     }
 
@@ -514,7 +595,7 @@ mod tests {
 
         assert_violation(
             &error,
-            "enforcement.mode",
+            "enforcement.backend",
             "linux socket destroy enforcement requires root",
         );
     }
@@ -558,6 +639,126 @@ mod tests {
                 "error {error} should report {mode}"
             );
         }
+    }
+
+    #[test]
+    fn transparent_interception_strategy_requires_enforce_mode() {
+        let registry = ProviderRegistry::new(
+            vec![live_capture_provider()],
+            transparent_interception_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(
+            &error,
+            "enforcement.interception.strategy",
+            "requires enforcement.mode = enforce",
+        );
+    }
+
+    #[test]
+    fn transparent_interception_requires_available_capability() {
+        let registry = ProviderRegistry::new(
+            vec![live_capture_provider()],
+            test_platform_capabilities_with_connection_enforcement(RuntimeMode::Available),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundMitm;
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(&error, "enforcement.interception.strategy", "not built");
+    }
+
+    #[test]
+    fn transparent_interception_requires_live_capture_mode() {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+                RuntimeMode::Available,
+            )],
+            transparent_interception_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(&error, "enforcement.mode", "requires live host capture");
+    }
+
+    #[test]
+    fn transparent_interception_can_be_the_only_enforce_execution_surface() {
+        let registry = ProviderRegistry::new(
+            vec![live_capture_provider()],
+            transparent_interception_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundMitm;
+
+        validate_runtime_config(&config, &registry)
+            .expect("transparent interception should not require a connection backend");
+    }
+
+    #[test]
+    fn enforce_enforcement_rejects_multiple_execution_surfaces() {
+        let registry = ProviderRegistry::new(
+            vec![live_capture_provider()],
+            connection_and_transparent_interception_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.backend = ConnectionEnforcementBackendConfig::LinuxSocketDestroy;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(
+            &error,
+            "enforcement.mode",
+            "composite enforcement execution is implemented",
+        );
+    }
+
+    #[test]
+    fn transparent_interception_selector_is_validated_by_runtime_validation() {
+        let registry = ProviderRegistry::new(
+            vec![live_capture_provider()],
+            transparent_interception_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.selector = Some(Selector::All {
+            selectors: Vec::new(),
+        });
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(
+            &error,
+            "enforcement.interception.selector",
+            "at least one child",
+        );
     }
 
     #[test]
@@ -687,6 +888,7 @@ mod tests {
             },
             CapabilityState::available(CapabilityKind::DryRunEnforcement),
             CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
+            CapabilityState::unavailable(CapabilityKind::TransparentInterception, "not built"),
         ]
     }
 
@@ -710,6 +912,32 @@ mod tests {
                             "unavailable",
                         ),
                     }
+                } else {
+                    state
+                }
+            })
+            .collect()
+    }
+
+    fn transparent_interception_capabilities() -> Vec<CapabilityState> {
+        test_platform_capabilities()
+            .into_iter()
+            .map(|state| {
+                if state.kind == CapabilityKind::TransparentInterception {
+                    CapabilityState::available(CapabilityKind::TransparentInterception)
+                } else {
+                    state
+                }
+            })
+            .collect()
+    }
+
+    fn connection_and_transparent_interception_capabilities() -> Vec<CapabilityState> {
+        test_platform_capabilities_with_connection_enforcement(RuntimeMode::Available)
+            .into_iter()
+            .map(|state| {
+                if state.kind == CapabilityKind::TransparentInterception {
+                    CapabilityState::available(CapabilityKind::TransparentInterception)
                 } else {
                     state
                 }

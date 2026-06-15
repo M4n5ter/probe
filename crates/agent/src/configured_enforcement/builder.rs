@@ -13,8 +13,12 @@ pub enum ConfiguredEnforcementError {
     Planner(#[from] EnforcementError),
     #[error("enforcement policy source error: {0}")]
     Source(#[from] EnforcementPolicySourceError),
-    #[error("connection-level enforcement backend is not available in this build/runtime")]
-    BackendUnavailable,
+    #[error("enforcement execution backend is not available in this build/runtime")]
+    ExecutionBackendUnavailable,
+    #[error(
+        "multiple executable enforcement backends are configured; composite enforcement execution is not implemented"
+    )]
+    MultipleExecutableBackends,
 }
 
 pub struct ConfiguredEnforcement {
@@ -48,7 +52,7 @@ async fn build_configured_enforcement_from_parts(
     backend: Option<Box<dyn EnforcementBackend>>,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
     if mode == EnforcementMode::Enforce && backend.is_none() {
-        return Err(ConfiguredEnforcementError::BackendUnavailable);
+        return Err(ConfiguredEnforcementError::ExecutionBackendUnavailable);
     }
 
     let policy_source = load_enforcement_policy_source(policy_source_plan).await?;
@@ -88,7 +92,7 @@ fn scoped_enforcement_planner(
     backend: Option<Box<dyn EnforcementBackend>>,
 ) -> Result<ScopedEnforcementPlanner, ConfiguredEnforcementError> {
     if mode == EnforcementMode::Enforce {
-        let backend = backend.ok_or(ConfiguredEnforcementError::BackendUnavailable)?;
+        let backend = backend.ok_or(ConfiguredEnforcementError::ExecutionBackendUnavailable)?;
         return ScopedEnforcementPlanner::with_backend(selector, protective_actions, backend)
             .map_err(ConfiguredEnforcementError::Planner);
     }
@@ -143,7 +147,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ConfiguredEnforcementError::BackendUnavailable
+            ConfiguredEnforcementError::ExecutionBackendUnavailable
         ));
     }
 

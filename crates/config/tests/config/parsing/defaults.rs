@@ -38,6 +38,11 @@ fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {
         ConnectionEnforcementBackendConfig::None
     );
     assert_eq!(
+        config.enforcement.interception.strategy,
+        TransparentInterceptionStrategyConfig::None
+    );
+    assert_eq!(config.enforcement.interception.selector, None);
+    assert_eq!(
         config.enforcement.policy.source,
         EnforcementPolicySourceConfig::None
     );

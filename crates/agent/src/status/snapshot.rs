@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(value["enforcement"]["status"], json!("audit_only"));
         assert_eq!(value["metrics"]["pipeline"], json!(null));
         assert_eq!(
-            value["enforcement"]["capability"]["kind"],
+            value["enforcement"]["mode_capability"]["kind"],
             json!("not_required")
         );
         assert_eq!(

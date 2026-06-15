@@ -9,6 +9,7 @@ pub struct EnforcementConfig {
     pub mode: EnforcementMode,
     pub backend: ConnectionEnforcementBackendConfig,
     pub selector: Option<Selector>,
+    pub interception: EnforcementInterceptionConfig,
     pub policy: EnforcementPolicyConfig,
 }
 
@@ -18,6 +19,7 @@ impl Default for EnforcementConfig {
             mode: EnforcementMode::AuditOnly,
             backend: ConnectionEnforcementBackendConfig::None,
             selector: None,
+            interception: EnforcementInterceptionConfig::default(),
             policy: EnforcementPolicyConfig::default(),
         }
     }
@@ -29,6 +31,28 @@ pub enum ConnectionEnforcementBackendConfig {
     #[default]
     None,
     LinuxSocketDestroy,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnforcementInterceptionConfig {
+    pub strategy: TransparentInterceptionStrategyConfig,
+    pub selector: Option<Selector>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparentInterceptionStrategyConfig {
+    #[default]
+    None,
+    InboundTproxy,
+    OutboundMitm,
+}
+
+impl TransparentInterceptionStrategyConfig {
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

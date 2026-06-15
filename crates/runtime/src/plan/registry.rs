@@ -14,6 +14,7 @@ pub struct ProviderRegistry {
 pub struct PlatformProbeResults {
     pub procfs_socket: Vec<CapabilityState>,
     pub connection_enforcement: CapabilityState,
+    pub transparent_interception: CapabilityState,
     pub libssl_uprobe: CapabilityState,
 }
 
@@ -22,6 +23,7 @@ impl PlatformProbeResults {
         Self {
             procfs_socket: ProcfsSocketResolver::new().capabilities(),
             connection_enforcement: default_connection_enforcement_capability(),
+            transparent_interception: default_transparent_interception_capability(),
             libssl_uprobe: default_libssl_uprobe_capability(),
         }
     }
@@ -45,6 +47,7 @@ impl ProviderRegistry {
             default_platform_capabilities(
                 procfs,
                 platform.connection_enforcement,
+                platform.transparent_interception,
                 platform.libssl_uprobe,
             )
             .into_iter()
@@ -93,6 +96,7 @@ impl ProviderRegistry {
 fn default_platform_capabilities(
     procfs: impl ProcessAttributor,
     connection_enforcement_capability: CapabilityState,
+    transparent_interception_capability: CapabilityState,
     libssl_uprobe_capability: CapabilityState,
 ) -> impl IntoIterator<Item = CapabilityState> {
     [
@@ -117,6 +121,7 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::WebhookExporter),
         CapabilityState::available(CapabilityKind::DryRunEnforcement),
         connection_enforcement_capability,
+        transparent_interception_capability,
     ]
     .into_iter()
     .chain(procfs.capabilities())
@@ -126,6 +131,13 @@ fn default_connection_enforcement_capability() -> CapabilityState {
     CapabilityState::unavailable(
         CapabilityKind::ConnectionEnforcement,
         "connection-level enforcement backend abstraction is wired, but no executable blocking backend is configured",
+    )
+}
+
+fn default_transparent_interception_capability() -> CapabilityState {
+    CapabilityState::unavailable(
+        CapabilityKind::TransparentInterception,
+        "transparent interception backends such as inbound TPROXY and outbound MITM are modeled but no executable backend is configured",
     )
 }
 

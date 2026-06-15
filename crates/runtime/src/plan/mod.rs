@@ -13,7 +13,8 @@ pub use capture::{
     CaptureProviderSelectionPolicy,
 };
 pub use enforcement::{
-    EnforcementCapabilityPlan, EnforcementPlan, EnforcementPolicySourceKind,
+    EnforcementCapabilityPlan, EnforcementConnectionPlan, EnforcementExecutionSurface,
+    EnforcementInterceptionPlan, EnforcementPlan, EnforcementPolicySourceKind,
     EnforcementPolicySourcePlan,
 };
 pub use error::RuntimeError;

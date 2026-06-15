@@ -22,13 +22,12 @@ use storage::FjallSpool;
 use crate::{
     admin::{AdminRuntimeState, AdminServerConfig, spawn_admin_server},
     capture_provider::build_capture_provider,
-    capture_registry::default_provider_registry,
     check::build_check_report,
     configured_enforcement::build_configured_enforcement_with_backend,
     configured_policy::load_configured_policies,
-    connection_enforcement::{self, ConnectionEnforcementRuntime},
     error::AgentError,
     export::{ExportWorker, ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook},
+    runtime_composition::{build_runtime_composition, capability_matrix_for_config},
     status::{build_status_snapshot, collect_spool_status},
     storage_retention::{StorageRetentionWorkerConfig, spawn_storage_retention_workers},
     tls_plaintext::TlsPlaintextRuntimeState,
@@ -36,11 +35,6 @@ use crate::{
 
 const INGRESS_RECOVERY_BATCH_SIZE: usize = 1_024;
 const REPLAY_POLICY_SOURCE_BYTES: u64 = 1024 * 1024;
-
-struct RuntimeComposition {
-    plan: RuntimePlan,
-    connection_enforcement: ConnectionEnforcementRuntime,
-}
 
 #[derive(Debug, Parser)]
 #[command(name = "sssa-probe")]
@@ -162,8 +156,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let agent_config = read_config_or_default(config.as_ref())?;
             validate_static_runtime_config(&agent_config)?;
             let runtime = build_runtime_composition(agent_config)?;
-            let plan = runtime.plan;
-            let enforcement_backend = runtime.connection_enforcement.into_backend();
+            let (plan, enforcement_backend) = runtime.into_enforcement_parts()?;
             let mut enforcement =
                 build_configured_enforcement_with_backend(&plan, enforcement_backend).await?;
             let policies = load_configured_policies(&plan.config)?;
@@ -254,9 +247,8 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
         }
         Command::Check { config } => {
             let runtime = read_runtime_composition(&config)?;
-            let report =
-                build_check_report(runtime.plan, runtime.connection_enforcement.into_backend())
-                    .await?;
+            let (plan, enforcement_backend) = runtime.into_enforcement_parts()?;
+            let report = build_check_report(plan, enforcement_backend).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Capabilities { config } => {
@@ -264,14 +256,11 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 Some(path) => read_config(&path)?,
                 None => AgentConfig::default(),
             };
-            let connection_enforcement =
-                connection_enforcement::resolve(config.enforcement.backend);
-            let matrix = default_provider_registry(&config, connection_enforcement.capability())
-                .capability_matrix();
+            let matrix = capability_matrix_for_config(&config);
             println!("{}", serde_json::to_string_pretty(&matrix)?);
         }
         Command::Status { config } => {
-            let plan = read_runtime_composition(&config)?.plan;
+            let plan = read_runtime_composition(&config)?.into_plan();
             let spool_status = collect_spool_status(&plan);
             let snapshot = build_status_snapshot(&plan, spool_status);
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -302,19 +291,11 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
     Ok(())
 }
 
-fn read_runtime_composition(path: &PathBuf) -> Result<RuntimeComposition, AgentError> {
+fn read_runtime_composition(
+    path: &PathBuf,
+) -> Result<crate::runtime_composition::RuntimeComposition, AgentError> {
     let config = read_config(path)?;
     build_runtime_composition(config)
-}
-
-fn build_runtime_composition(config: AgentConfig) -> Result<RuntimeComposition, AgentError> {
-    let connection_enforcement = connection_enforcement::resolve(config.enforcement.backend);
-    let registry = default_provider_registry(&config, connection_enforcement.capability());
-    let plan = RuntimePlan::build(config, &registry).map_err(AgentError::Runtime)?;
-    Ok(RuntimeComposition {
-        plan,
-        connection_enforcement,
-    })
 }
 
 fn export_worker_config_from_plan(plan: &RuntimePlan) -> Option<ExportWorkerConfig> {
@@ -708,7 +689,7 @@ end
         assert!(
             error
                 .to_string()
-                .contains("connection-level enforcement backend is not configured")
+                .contains("at least one enforcement execution surface")
         );
         assert!(
             !spool_path.exists(),
@@ -760,7 +741,7 @@ protective_actions = ["alert"]
         assert!(
             error
                 .to_string()
-                .contains("connection-level enforcement backend is not configured")
+                .contains("at least one enforcement execution surface")
         );
         assert!(
             !error

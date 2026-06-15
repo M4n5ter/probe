@@ -10,10 +10,12 @@ mod error;
 mod export;
 mod periodic_worker;
 mod plaintext_feed;
+mod runtime_composition;
 mod status;
 mod storage_retention;
 mod tls_material;
 mod tls_plaintext;
+mod transparent_interception;
 
 #[tokio::main]
 async fn main() {

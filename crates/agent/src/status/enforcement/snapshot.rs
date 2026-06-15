@@ -4,7 +4,7 @@ use crate::configured_enforcement::{
     EnforcementPolicySourceInspection, LoadedEnforcementPolicySource,
     LoadedEnforcementPolicySourceOriginRef, inspect_enforcement_policy_source,
 };
-use probe_config::ConnectionEnforcementBackendConfig;
+use probe_config::{ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig};
 use probe_core::{CapabilityKind, EnforcementMode, ProtectiveActionProfile, RuntimeMode};
 use runtime::{EnforcementCapabilityPlan, RuntimePlan};
 use serde::Serialize;
@@ -12,12 +12,26 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnforcementStatusSnapshot {
     pub configured_mode: EnforcementMode,
-    pub backend: ConnectionEnforcementBackendConfig,
     pub status: EnforcementStatusMode,
     pub effective_selector_configured: Option<bool>,
     pub config_selector_configured: bool,
     pub manifest_selector_configured: Option<bool>,
+    pub connection: EnforcementConnectionStatusSnapshot,
+    pub interception: EnforcementInterceptionStatusSnapshot,
     pub policy: EnforcementPolicyStatusSnapshot,
+    pub mode_capability: EnforcementCapabilityStatusSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EnforcementConnectionStatusSnapshot {
+    pub backend: ConnectionEnforcementBackendConfig,
+    pub capability: EnforcementCapabilityStatusSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EnforcementInterceptionStatusSnapshot {
+    pub strategy: TransparentInterceptionStrategyConfig,
+    pub selector_configured: bool,
     pub capability: EnforcementCapabilityStatusSnapshot,
 }
 
@@ -104,17 +118,25 @@ fn enforcement_status_with_source(
         EnforcementMode::DryRun => EnforcementStatusMode::DryRun,
         EnforcementMode::Enforce => EnforcementStatusMode::Enforce,
     };
-    let capability = enforcement_capability_status(&plan.enforcement.capability);
+    let mode_capability = enforcement_capability_status(&plan.enforcement.mode_capability);
 
     EnforcementStatusSnapshot {
         configured_mode,
-        backend: plan.enforcement.backend,
         status,
         effective_selector_configured: policy.effective_selector_configured,
         config_selector_configured: plan.enforcement.config_selector_configured,
         manifest_selector_configured: policy.manifest_selector_configured,
+        connection: EnforcementConnectionStatusSnapshot {
+            backend: plan.enforcement.connection.backend,
+            capability: enforcement_capability_status(&plan.enforcement.connection.capability),
+        },
+        interception: EnforcementInterceptionStatusSnapshot {
+            strategy: plan.enforcement.interception.strategy,
+            selector_configured: plan.enforcement.interception.selector_configured,
+            capability: enforcement_capability_status(&plan.enforcement.interception.capability),
+        },
         policy: policy.snapshot,
-        capability,
+        mode_capability,
     }
 }
 
@@ -501,7 +523,7 @@ protective_actions = ["alert"]
 
         assert_eq!(status.status, EnforcementStatusMode::DryRun);
         assert_eq!(
-            status.capability,
+            status.mode_capability,
             EnforcementCapabilityStatusSnapshot::Required {
                 capability: CapabilityKind::DryRunEnforcement,
                 mode: RuntimeMode::Available,
@@ -529,11 +551,11 @@ protective_actions = ["alert"]
 
         assert_eq!(status.status, EnforcementStatusMode::Enforce);
         assert_eq!(
-            status.backend,
+            status.connection.backend,
             probe_config::ConnectionEnforcementBackendConfig::LinuxSocketDestroy
         );
         assert_eq!(
-            status.capability,
+            status.connection.capability,
             EnforcementCapabilityStatusSnapshot::Required {
                 capability: CapabilityKind::ConnectionEnforcement,
                 mode: RuntimeMode::Available,
@@ -541,10 +563,56 @@ protective_actions = ["alert"]
         );
         let value = serde_json::to_value(&status)?;
         assert_eq!(value["status"], json!("enforce"));
-        assert_eq!(value["backend"], json!("linux_socket_destroy"));
         assert_eq!(
-            value["capability"]["capability"],
+            value["connection"]["backend"],
+            json!("linux_socket_destroy")
+        );
+        assert_eq!(
+            value["connection"]["capability"]["capability"],
             json!("connection_enforcement")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_status_reports_transparent_interception_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        config.capture.selection = probe_config::CaptureSelection::Libpcap;
+        config.enforcement.mode = probe_core::EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            probe_config::TransparentInterceptionStrategyConfig::OutboundMitm;
+        config.enforcement.interception.selector = Some(Selector::default());
+        let plan = runtime_plan_from_config(
+            config,
+            vec![probe_core::CapabilityState::available(
+                CapabilityKind::TransparentInterception,
+            )],
+        )?;
+
+        let status = enforcement_status(&plan);
+
+        assert_eq!(
+            status.connection.capability,
+            EnforcementCapabilityStatusSnapshot::NotRequired
+        );
+        assert_eq!(
+            status.interception.strategy,
+            probe_config::TransparentInterceptionStrategyConfig::OutboundMitm
+        );
+        assert!(status.interception.selector_configured);
+        assert_eq!(
+            status.interception.capability,
+            EnforcementCapabilityStatusSnapshot::Required {
+                capability: CapabilityKind::TransparentInterception,
+                mode: RuntimeMode::Available,
+            }
+        );
+        let value = serde_json::to_value(&status)?;
+        assert_eq!(value["interception"]["strategy"], json!("outbound_mitm"));
+        assert_eq!(
+            value["interception"]["capability"]["capability"],
+            json!("transparent_interception")
         );
         Ok(())
     }

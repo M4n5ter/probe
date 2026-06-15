@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use probe_config::{
     AgentConfig, ConnectionEnforcementBackendConfig, EnforcementPolicySourceConfig,
+    TransparentInterceptionStrategyConfig,
 };
 use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
@@ -9,8 +10,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPlan {
     pub mode: EnforcementMode,
-    pub backend: ConnectionEnforcementBackendConfig,
-    pub capability: EnforcementCapabilityPlan,
+    pub execution_surfaces: Vec<EnforcementExecutionSurface>,
+    pub mode_capability: EnforcementCapabilityPlan,
+    pub connection: EnforcementConnectionPlan,
+    pub interception: EnforcementInterceptionPlan,
     pub config_selector_configured: bool,
     pub policy_source: EnforcementPolicySourcePlan,
 }
@@ -19,12 +22,80 @@ impl EnforcementPlan {
     pub fn resolve(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
         Self {
             mode: config.enforcement.mode,
-            backend: config.enforcement.backend,
-            capability: EnforcementCapabilityPlan::from_mode(config.enforcement.mode, capabilities),
+            execution_surfaces: enabled_execution_surfaces(config),
+            mode_capability: EnforcementCapabilityPlan::from_mode(
+                config.enforcement.mode,
+                capabilities,
+            ),
+            connection: EnforcementConnectionPlan::from_config(config, capabilities),
+            interception: EnforcementInterceptionPlan::from_config(config, capabilities),
             config_selector_configured: config.enforcement.selector.is_some(),
             policy_source: EnforcementPolicySourcePlan::from_config(
                 &config.enforcement.policy.source,
             ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementExecutionSurface {
+    Connection,
+    TransparentInterception,
+}
+
+pub(super) fn enabled_execution_surfaces(config: &AgentConfig) -> Vec<EnforcementExecutionSurface> {
+    if config.enforcement.mode != EnforcementMode::Enforce {
+        return Vec::new();
+    }
+
+    let mut surfaces = Vec::new();
+    if config.enforcement.backend != ConnectionEnforcementBackendConfig::None {
+        surfaces.push(EnforcementExecutionSurface::Connection);
+    }
+    if config.enforcement.interception.strategy.is_enabled() {
+        surfaces.push(EnforcementExecutionSurface::TransparentInterception);
+    }
+    surfaces
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnforcementConnectionPlan {
+    pub backend: ConnectionEnforcementBackendConfig,
+    pub capability: EnforcementCapabilityPlan,
+}
+
+impl EnforcementConnectionPlan {
+    fn from_config(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
+        let backend = config.enforcement.backend;
+        Self {
+            backend,
+            capability: EnforcementCapabilityPlan::from_connection_backend(
+                config.enforcement.mode,
+                backend,
+                capabilities,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnforcementInterceptionPlan {
+    pub strategy: TransparentInterceptionStrategyConfig,
+    pub capability: EnforcementCapabilityPlan,
+    pub selector_configured: bool,
+}
+
+impl EnforcementInterceptionPlan {
+    fn from_config(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
+        let strategy = config.enforcement.interception.strategy;
+        Self {
+            strategy,
+            capability: EnforcementCapabilityPlan::from_interception_strategy(
+                strategy,
+                capabilities,
+            ),
+            selector_configured: config.enforcement.interception.selector.is_some(),
         }
     }
 }
@@ -49,11 +120,31 @@ impl EnforcementCapabilityPlan {
                 capability: CapabilityKind::DryRunEnforcement,
                 unavailable_reason: "dry-run enforcement provider is not available in this build/runtime",
             }),
-            EnforcementMode::Enforce => Some(EnforcementCapabilityRequirement {
-                capability: CapabilityKind::ConnectionEnforcement,
-                unavailable_reason: "connection-level enforcement backend is not available in this build/runtime",
-            }),
+            EnforcementMode::Enforce => None,
         }
+    }
+
+    pub(super) fn requirement_for_connection_backend(
+        backend: ConnectionEnforcementBackendConfig,
+    ) -> Option<EnforcementCapabilityRequirement> {
+        match backend {
+            ConnectionEnforcementBackendConfig::None => None,
+            ConnectionEnforcementBackendConfig::LinuxSocketDestroy => {
+                Some(EnforcementCapabilityRequirement {
+                    capability: CapabilityKind::ConnectionEnforcement,
+                    unavailable_reason: "connection-level enforcement backend is not available in this build/runtime",
+                })
+            }
+        }
+    }
+
+    pub(super) fn requirement_for_interception_strategy(
+        strategy: TransparentInterceptionStrategyConfig,
+    ) -> Option<EnforcementCapabilityRequirement> {
+        strategy.is_enabled().then_some(EnforcementCapabilityRequirement {
+            capability: CapabilityKind::TransparentInterception,
+            unavailable_reason: "transparent interception backend is not available in this build/runtime",
+        })
     }
 
     fn from_mode(mode: EnforcementMode, capabilities: &CapabilityMatrix) -> Self {
@@ -63,6 +154,37 @@ impl EnforcementCapabilityPlan {
                 capabilities.mode(requirement.capability),
             )
         })
+    }
+
+    fn from_connection_backend(
+        mode: EnforcementMode,
+        backend: ConnectionEnforcementBackendConfig,
+        capabilities: &CapabilityMatrix,
+    ) -> Self {
+        if mode != EnforcementMode::Enforce {
+            return Self::NotRequired;
+        }
+        Self::requirement_for_connection_backend(backend).map_or(Self::NotRequired, |requirement| {
+            Self::required(
+                requirement.capability,
+                capabilities.mode(requirement.capability),
+            )
+        })
+    }
+
+    fn from_interception_strategy(
+        strategy: TransparentInterceptionStrategyConfig,
+        capabilities: &CapabilityMatrix,
+    ) -> Self {
+        Self::requirement_for_interception_strategy(strategy).map_or(
+            Self::NotRequired,
+            |requirement| {
+                Self::required(
+                    requirement.capability,
+                    capabilities.mode(requirement.capability),
+                )
+            },
+        )
     }
 
     fn required(capability: CapabilityKind, mode: RuntimeMode) -> Self {
@@ -117,7 +239,9 @@ impl EnforcementPolicySourcePlan {
 
 #[cfg(test)]
 mod tests {
-    use probe_config::{AgentConfig, ConnectionEnforcementBackendConfig};
+    use probe_config::{
+        AgentConfig, ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig,
+    };
     use probe_core::{CapabilityMatrix, CapabilityState, Selector};
 
     use super::*;
@@ -131,7 +255,7 @@ mod tests {
         let plan = EnforcementPlan::resolve(&config, &capabilities);
 
         assert_eq!(
-            plan.capability,
+            plan.mode_capability,
             EnforcementCapabilityPlan::Required {
                 capability: CapabilityKind::DryRunEnforcement,
                 mode: RuntimeMode::Available,
@@ -151,11 +275,15 @@ mod tests {
         let plan = EnforcementPlan::resolve(&config, &capabilities);
 
         assert_eq!(
-            plan.backend,
+            plan.connection.backend,
             ConnectionEnforcementBackendConfig::LinuxSocketDestroy
         );
         assert_eq!(
-            plan.capability,
+            plan.execution_surfaces,
+            vec![EnforcementExecutionSurface::Connection]
+        );
+        assert_eq!(
+            plan.connection.capability,
             EnforcementCapabilityPlan::Required {
                 capability: CapabilityKind::ConnectionEnforcement,
                 mode: RuntimeMode::Available,
@@ -185,6 +313,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn enforcement_plan_preserves_transparent_interception_strategy() {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.selector = Some(Selector::default());
+        let capabilities = CapabilityMatrix::new(test_platform_capabilities_with_interception(
+            RuntimeMode::Available,
+        ));
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        assert_eq!(
+            plan.interception.strategy,
+            TransparentInterceptionStrategyConfig::InboundTproxy
+        );
+        assert_eq!(
+            plan.execution_surfaces,
+            vec![EnforcementExecutionSurface::TransparentInterception]
+        );
+        assert!(plan.interception.selector_configured);
+        assert_eq!(
+            plan.interception.capability,
+            EnforcementCapabilityPlan::Required {
+                capability: CapabilityKind::TransparentInterception,
+                mode: RuntimeMode::Available,
+            }
+        );
+    }
+
     fn test_platform_capabilities() -> Vec<CapabilityState> {
         test_platform_capabilities_with_connection(RuntimeMode::Unavailable)
     }
@@ -208,6 +367,32 @@ mod tests {
                     CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built")
                 }
             },
+            CapabilityState::unavailable(CapabilityKind::TransparentInterception, "not built"),
         ]
+    }
+
+    fn test_platform_capabilities_with_interception(mode: RuntimeMode) -> Vec<CapabilityState> {
+        test_platform_capabilities_with_connection(RuntimeMode::Unavailable)
+            .into_iter()
+            .map(|state| {
+                if state.kind == CapabilityKind::TransparentInterception {
+                    match mode {
+                        RuntimeMode::Available => {
+                            CapabilityState::available(CapabilityKind::TransparentInterception)
+                        }
+                        RuntimeMode::Degraded => CapabilityState::degraded(
+                            CapabilityKind::TransparentInterception,
+                            "degraded",
+                        ),
+                        RuntimeMode::Unavailable => CapabilityState::unavailable(
+                            CapabilityKind::TransparentInterception,
+                            "unavailable",
+                        ),
+                    }
+                } else {
+                    state
+                }
+            })
+            .collect()
     }
 }
