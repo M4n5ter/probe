@@ -6,6 +6,7 @@ fn validation_rejects_zero_export_retention_knobs() -> Result<(), Box<dyn std::e
         r#"
 [storage.retention.export]
 max_age_ms = 0
+max_records = 0
 sweep_interval_ms = 0
 prune_batch_limit = 0
 "#,
@@ -19,6 +20,11 @@ prune_batch_limit = 0
         &error,
         "storage.retention.export.max_age_ms",
         "export retention max age must be positive when configured",
+    );
+    assert_violation(
+        &error,
+        "storage.retention.export.max_records",
+        "export retention max records must be positive when configured",
     );
     assert_violation(
         &error,
@@ -39,6 +45,7 @@ fn validation_rejects_zero_ingress_retention_knobs() -> Result<(), Box<dyn std::
         r#"
 [storage.retention.ingress]
 max_age_ms = 0
+max_records = 0
 sweep_interval_ms = 0
 prune_batch_limit = 0
 "#,
@@ -52,6 +59,11 @@ prune_batch_limit = 0
         &error,
         "storage.retention.ingress.max_age_ms",
         "ingress retention max age must be positive when configured",
+    );
+    assert_violation(
+        &error,
+        "storage.retention.ingress.max_records",
+        "ingress retention max records must be positive when configured",
     );
     assert_violation(
         &error,

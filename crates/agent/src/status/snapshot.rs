@@ -407,6 +407,7 @@ mod tests {
     fn status_snapshot_reports_sink_lag_and_health() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
         config.storage.retention.ingress.max_age_ms = Some(120_000);
+        config.storage.retention.ingress.max_records = Some(10_000);
         config.storage.retention.ingress.sweep_interval_ms = 7_000;
         config.storage.retention.ingress.prune_batch_limit = 256;
         let plan = runtime_plan_from_config(config, Vec::new())?;
@@ -425,6 +426,7 @@ mod tests {
         assert_eq!(snapshot.health.mode, RuntimeMode::Available);
         assert_eq!(snapshot.spool.export_last_sequence, Some(5));
         assert_eq!(snapshot.spool.ingress_retention.max_age_ms, Some(120_000));
+        assert_eq!(snapshot.spool.ingress_retention.max_records, Some(10_000));
         assert_eq!(
             snapshot.spool.ingress_retention.sweep_interval_ms.get(),
             7_000
@@ -483,6 +485,10 @@ mod tests {
         assert_eq!(
             value["spool"]["ingress_retention"]["max_age_ms"],
             json!(120_000)
+        );
+        assert_eq!(
+            value["spool"]["ingress_retention"]["max_records"],
+            json!(10_000)
         );
         assert_eq!(
             value["spool"]["ingress_retention"]["sweep_interval_ms"],

@@ -81,14 +81,24 @@ impl FjallSpool {
         let sequence = last_sequence
             .checked_add(1)
             .ok_or(StorageError::SequenceOverflow)?;
+        let mut live_records = self.lock_live_records(lane)?;
+        let next_live_records = live_records
+            .checked_add(1)
+            .ok_or(StorageError::SequenceOverflow)?;
         let key = sequence_key(sequence);
         let encoded = encode_spool_record(stored_at_unix_ns, &payload)?;
         let mut batch = self.database.batch();
         batch.insert(self.queue(lane), key, encoded);
         batch.insert(&self.metadata, lane.last_sequence_key(), key);
+        batch.insert(
+            &self.metadata,
+            lane.live_records_key(),
+            sequence_key(next_live_records),
+        );
         batch.commit()?;
         self.database.persist(PersistMode::SyncAll)?;
         *last_sequence = sequence;
+        *live_records = next_live_records;
         Ok(StoredEvent {
             sequence,
             stored_at_unix_ns,

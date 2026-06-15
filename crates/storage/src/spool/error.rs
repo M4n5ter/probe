@@ -21,6 +21,16 @@ pub enum StorageError {
     SequenceOverflow,
     #[error("{lane} sequence lock poisoned")]
     SequenceLockPoisoned { lane: &'static str },
+    #[error("{lane} live-record count lock poisoned")]
+    LiveRecordCountLockPoisoned { lane: &'static str },
+    #[error(
+        "{lane} live-record count invariant violated: tried to prune {pruned_count} records from {live_records} live records"
+    )]
+    LiveRecordCountUnderflow {
+        lane: &'static str,
+        live_records: u64,
+        pruned_count: u64,
+    },
     #[error(
         "sink {sink} tried to ack sequence {sequence} beyond last stored sequence {last_sequence}"
     )]

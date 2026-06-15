@@ -50,6 +50,7 @@ pub struct StorageRetentionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct IngressJournalRetentionConfig {
     pub max_age_ms: Option<u64>,
+    pub max_records: Option<u64>,
     #[serde(default = "default_ingress_retention_sweep_interval_ms")]
     pub sweep_interval_ms: u64,
     #[serde(default = "default_ingress_retention_prune_batch_limit")]
@@ -60,6 +61,7 @@ impl Default for IngressJournalRetentionConfig {
     fn default() -> Self {
         Self {
             max_age_ms: None,
+            max_records: None,
             sweep_interval_ms: DEFAULT_INGRESS_RETENTION_SWEEP_INTERVAL_MS,
             prune_batch_limit: DEFAULT_INGRESS_RETENTION_PRUNE_BATCH_LIMIT,
         }
@@ -70,6 +72,7 @@ impl Default for IngressJournalRetentionConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ExportQueueRetentionConfig {
     pub max_age_ms: Option<u64>,
+    pub max_records: Option<u64>,
     #[serde(default = "default_export_retention_sweep_interval_ms")]
     pub sweep_interval_ms: u64,
     #[serde(default = "default_export_retention_prune_batch_limit")]
@@ -80,6 +83,7 @@ impl Default for ExportQueueRetentionConfig {
     fn default() -> Self {
         Self {
             max_age_ms: None,
+            max_records: None,
             sweep_interval_ms: DEFAULT_EXPORT_RETENTION_SWEEP_INTERVAL_MS,
             prune_batch_limit: DEFAULT_EXPORT_RETENTION_PRUNE_BATCH_LIMIT,
         }

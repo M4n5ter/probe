@@ -18,6 +18,7 @@ fn validate_ingress_retention(
         "storage.retention.ingress",
         "ingress retention",
         retention.max_age_ms,
+        retention.max_records,
         retention.sweep_interval_ms,
         retention.prune_batch_limit,
         violations,
@@ -32,6 +33,7 @@ fn validate_export_retention(
         "storage.retention.export",
         "export retention",
         retention.max_age_ms,
+        retention.max_records,
         retention.sweep_interval_ms,
         retention.prune_batch_limit,
         violations,
@@ -42,6 +44,7 @@ fn validate_retention_knobs(
     field_prefix: &str,
     label: &str,
     max_age_ms: Option<u64>,
+    max_records: Option<u64>,
     sweep_interval_ms: u64,
     prune_batch_limit: u64,
     violations: &mut Vec<ConfigViolation>,
@@ -50,6 +53,12 @@ fn validate_retention_knobs(
         violations.push(ConfigViolation {
             field: format!("{field_prefix}.max_age_ms"),
             reason: format!("{label} max age must be positive when configured"),
+        });
+    }
+    if matches!(max_records, Some(0)) {
+        violations.push(ConfigViolation {
+            field: format!("{field_prefix}.max_records"),
+            reason: format!("{label} max records must be positive when configured"),
         });
     }
     if sweep_interval_ms == 0 {

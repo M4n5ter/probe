@@ -7,7 +7,10 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 
 use crate::spool::{
     DurableSpool, ExportSpool, IngressCursorOwner, SpoolSnapshot, StorageError,
-    lane::{LAST_EXPORT_SEQUENCE, LAST_INGRESS_SEQUENCE, SpoolLane},
+    lane::{
+        LAST_EXPORT_SEQUENCE, LAST_INGRESS_SEQUENCE, LIVE_EXPORT_RECORDS, LIVE_INGRESS_RECORDS,
+        SpoolLane,
+    },
     marker::{ensure_spool_markers, validate_existing_spool_markers},
     record::{RetentionPrune, SpoolPayload, StoredEvent},
 };
@@ -26,6 +29,8 @@ pub struct FjallSpool {
     pub(super) metadata: Keyspace,
     last_ingress_sequence: Mutex<u64>,
     last_export_sequence: Mutex<u64>,
+    live_ingress_records: Mutex<u64>,
+    live_export_records: Mutex<u64>,
 }
 
 impl FjallSpool {
@@ -42,6 +47,18 @@ impl FjallSpool {
             read_last_sequence(&ingress_journal, &metadata, LAST_INGRESS_SEQUENCE)?;
         let last_export_sequence =
             read_last_sequence(&export_queue, &metadata, LAST_EXPORT_SEQUENCE)?;
+        let live_ingress_records = read_live_records(
+            &ingress_journal,
+            &metadata,
+            LIVE_INGRESS_RECORDS,
+            last_ingress_sequence,
+        )?;
+        let live_export_records = read_live_records(
+            &export_queue,
+            &metadata,
+            LIVE_EXPORT_RECORDS,
+            last_export_sequence,
+        )?;
         let spool = Self {
             database,
             ingress_journal,
@@ -51,6 +68,8 @@ impl FjallSpool {
             metadata,
             last_ingress_sequence: Mutex::new(last_ingress_sequence),
             last_export_sequence: Mutex::new(last_export_sequence),
+            live_ingress_records: Mutex::new(live_ingress_records),
+            live_export_records: Mutex::new(live_export_records),
         };
         ensure_spool_markers(path)?;
         Ok(spool)
@@ -92,6 +111,22 @@ impl FjallSpool {
                 .map_err(|_| StorageError::SequenceLockPoisoned { lane: lane.name() }),
         }
     }
+
+    pub(super) fn lock_live_records(
+        &self,
+        lane: SpoolLane,
+    ) -> Result<MutexGuard<'_, u64>, StorageError> {
+        match lane {
+            SpoolLane::Ingress => self
+                .live_ingress_records
+                .lock()
+                .map_err(|_| StorageError::LiveRecordCountLockPoisoned { lane: lane.name() }),
+            SpoolLane::Export => self
+                .live_export_records
+                .lock()
+                .map_err(|_| StorageError::LiveRecordCountLockPoisoned { lane: lane.name() }),
+        }
+    }
 }
 
 impl ExportSpool for FjallSpool {
@@ -122,6 +157,15 @@ impl ExportSpool for FjallSpool {
         cursor_owners: &[&str],
     ) -> Result<RetentionPrune, StorageError> {
         FjallSpool::prune_expired_export_prefix(self, cutoff_unix_ns, limit, cursor_owners)
+    }
+
+    fn prune_export_to_max_records(
+        &self,
+        max_records: u64,
+        limit: usize,
+        cursor_owners: &[&str],
+    ) -> Result<RetentionPrune, StorageError> {
+        FjallSpool::prune_export_to_max_records(self, max_records, limit, cursor_owners)
     }
 }
 
@@ -166,6 +210,15 @@ impl DurableSpool for FjallSpool {
     ) -> Result<RetentionPrune, StorageError> {
         FjallSpool::prune_expired_ingress_prefix(self, cutoff_unix_ns, limit, consumers)
     }
+
+    fn prune_ingress_to_max_records(
+        &self,
+        max_records: u64,
+        limit: usize,
+        consumers: &[IngressCursorOwner],
+    ) -> Result<RetentionPrune, StorageError> {
+        FjallSpool::prune_ingress_to_max_records(self, max_records, limit, consumers)
+    }
 }
 
 fn read_last_sequence(
@@ -185,6 +238,23 @@ fn read_last_sequence(
         })
         .transpose()?
         .unwrap_or(0))
+}
+
+fn read_live_records(
+    queue: &Keyspace,
+    metadata: &Keyspace,
+    metadata_key: &[u8],
+    durable_last_sequence: u64,
+) -> Result<u64, StorageError> {
+    if let Some(value) = metadata.get(metadata_key)? {
+        return decode_exact_sequence_key(metadata_key, &value);
+    }
+    queue
+        .range(..=sequence_key(durable_last_sequence))
+        .try_fold(0_u64, |count, item| {
+            item.into_inner()?;
+            count.checked_add(1).ok_or(StorageError::SequenceOverflow)
+        })
 }
 
 pub(super) fn sequence_key(sequence: u64) -> [u8; 8] {

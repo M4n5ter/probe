@@ -261,6 +261,7 @@ mod tests {
         let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
         config.exporters.clear();
         config.storage.retention.export.max_age_ms = Some(60_000);
+        config.storage.retention.export.max_records = Some(50_000);
         config.storage.retention.export.sweep_interval_ms = 5_000;
         config.storage.retention.export.prune_batch_limit = 128;
         let plan = runtime_plan_from_config(config, Vec::new())?;
@@ -268,10 +269,12 @@ mod tests {
         let status = export_status(&plan);
 
         assert_eq!(status.retention.max_age_ms, Some(60_000));
+        assert_eq!(status.retention.max_records, Some(50_000));
         assert_eq!(status.retention.sweep_interval_ms.get(), 5_000);
         assert_eq!(status.retention.prune_batch_limit.get(), 128);
         let value = serde_json::to_value(&status)?;
         assert_eq!(value["retention"]["max_age_ms"], json!(60_000));
+        assert_eq!(value["retention"]["max_records"], json!(50_000));
         assert_eq!(value["retention"]["sweep_interval_ms"], json!(5_000));
         assert_eq!(value["retention"]["prune_batch_limit"], json!(128));
         Ok(())

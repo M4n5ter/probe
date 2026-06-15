@@ -68,6 +68,20 @@ pub trait ExportSpool {
         limit: usize,
         cursor_owners: &[&str],
     ) -> Result<RetentionPrune, StorageError>;
+
+    /// Prunes toward `max_records` newest export events.
+    ///
+    /// Removes up to `limit` durable records older than the newest
+    /// `max_records` record suffix. Cursor retirement is committed in the same
+    /// storage batch as the prefix deletion, so one call is not guaranteed to
+    /// reach the configured record count when more than `limit` records are
+    /// eligible.
+    fn prune_export_to_max_records(
+        &self,
+        max_records: u64,
+        limit: usize,
+        cursor_owners: &[&str],
+    ) -> Result<RetentionPrune, StorageError>;
 }
 
 pub trait DurableSpool: ExportSpool {
@@ -99,6 +113,20 @@ pub trait DurableSpool: ExportSpool {
     fn prune_expired_ingress_prefix(
         &self,
         cutoff_unix_ns: u64,
+        limit: usize,
+        consumers: &[IngressCursorOwner],
+    ) -> Result<RetentionPrune, StorageError>;
+
+    /// Prunes toward `max_records` newest ingress journal records.
+    ///
+    /// Removes up to `limit` durable records older than the newest
+    /// `max_records` record suffix. The typed cursor owners are advanced through
+    /// the retired prefix in the same storage batch. This is an explicit
+    /// retention tradeoff: retired records are no longer available for startup
+    /// recovery.
+    fn prune_ingress_to_max_records(
+        &self,
+        max_records: u64,
         limit: usize,
         consumers: &[IngressCursorOwner],
     ) -> Result<RetentionPrune, StorageError>;
