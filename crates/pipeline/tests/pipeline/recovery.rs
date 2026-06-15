@@ -260,6 +260,48 @@ fn parser_cursor_waits_until_every_flow_is_checkpoint_safe()
     Ok(())
 }
 
+#[test]
+fn parser_cursor_waits_for_websocket_handoff_state_to_close()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let flow = demo_flow_with_ports(50_000, 80, 39);
+    let mut first_provider = SequenceProvider::new(vec![
+        captured_bytes_with_direction(
+            flow.clone(),
+            Direction::Outbound,
+            b"GET /chat HTTP/1.1\r\nHost: recovery.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: test\r\n\r\n",
+        ),
+        captured_bytes_with_direction(
+            flow.clone(),
+            Direction::Inbound,
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Protocol: chat\r\n\r\n",
+        ),
+        captured_bytes_with_direction(flow.clone(), Direction::Inbound, b"\x81\x02hi"),
+    ]);
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
+
+    let summary = pipeline.run_provider(&mut first_provider)?;
+
+    assert_eq!(summary.ingress_records_journaled, 3);
+    assert_eq!(summary.ingress_records_processed, 3);
+    assert_eq!(summary.export_events_written, 4);
+    assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 0);
+
+    let mut second_provider = SequenceProvider::new(vec![connection_closed(flow)]);
+
+    let summary = pipeline.run_provider(&mut second_provider)?;
+
+    assert_eq!(summary.ingress_records_journaled, 1);
+    assert_eq!(summary.ingress_records_processed, 1);
+    assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 4);
+    let repeated = recover_without_policy(&spool)?;
+    assert_eq!(repeated.ingress_records_recovered, 0);
+    assert_eq!(repeated.export_events_written, 0);
+    Ok(())
+}
+
 fn captured_gap(
     flow: probe_core::FlowContext,
     direction: Direction,
