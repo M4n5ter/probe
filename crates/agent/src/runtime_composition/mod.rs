@@ -5,7 +5,6 @@ use runtime::{ProviderRegistry, RuntimePlan};
 
 use crate::{
     capture_registry::default_provider_registry,
-    configured_enforcement::ConfiguredEnforcementError,
     connection_enforcement::{self, ConnectionEnforcementRuntime},
     error::AgentError,
     transparent_interception::{self, TransparentInterceptionRuntime},
@@ -14,7 +13,6 @@ use crate::{
 pub(crate) struct RuntimeComposition {
     plan: RuntimePlan,
     connection_enforcement: ConnectionEnforcementRuntime,
-    transparent_interception: TransparentInterceptionRuntime,
 }
 
 impl RuntimeComposition {
@@ -24,11 +22,8 @@ impl RuntimeComposition {
 
     pub(crate) fn into_enforcement_parts(
         self,
-    ) -> Result<(RuntimePlan, Option<Box<dyn EnforcementBackend>>), ConfiguredEnforcementError>
-    {
-        let backend =
-            select_enforcement_backend(self.connection_enforcement, self.transparent_interception)?;
-        Ok((self.plan, backend))
+    ) -> (RuntimePlan, Option<Box<dyn EnforcementBackend>>) {
+        (self.plan, self.connection_enforcement.into_backend())
     }
 }
 
@@ -42,7 +37,6 @@ pub(crate) fn build_runtime_composition(
     Ok(RuntimeComposition {
         plan,
         connection_enforcement,
-        transparent_interception,
     })
 }
 
@@ -73,58 +67,38 @@ fn provider_registry_for_runtimes(
     )
 }
 
-fn select_enforcement_backend(
-    connection: ConnectionEnforcementRuntime,
-    transparent_interception: TransparentInterceptionRuntime,
-) -> Result<Option<Box<dyn EnforcementBackend>>, ConfiguredEnforcementError> {
-    select_single_enforcement_backend([
-        connection.into_backend(),
-        transparent_interception.into_backend(),
-    ])
-}
-
-fn select_single_enforcement_backend(
-    backends: impl IntoIterator<Item = Option<Box<dyn EnforcementBackend>>>,
-) -> Result<Option<Box<dyn EnforcementBackend>>, ConfiguredEnforcementError> {
-    let mut selected = None;
-    for backend in backends.into_iter().flatten() {
-        if selected.replace(backend).is_some() {
-            return Err(ConfiguredEnforcementError::MultipleExecutableBackends);
-        }
-    }
-    Ok(selected)
-}
-
 #[cfg(test)]
 mod tests {
-    use enforcement::{EnforcementBackendDecision, EnforcementBackendRequest, EnforcementError};
+    use probe_config::{CaptureSelection, TransparentInterceptionStrategyConfig};
+    use probe_core::EnforcementMode;
 
     use super::*;
 
     #[test]
-    fn multiple_executable_enforcement_backends_fail_closed() {
-        let error = match select_single_enforcement_backend([
-            Some(Box::new(RejectingBackend) as Box<dyn EnforcementBackend>),
-            Some(Box::new(RejectingBackend) as Box<dyn EnforcementBackend>),
-        ]) {
-            Ok(_) => panic!("multiple executable surfaces must not be silently collapsed"),
+    fn default_composition_has_no_executable_enforcement_backend() {
+        let composition = build_runtime_composition(AgentConfig::default())
+            .expect("default composition should build");
+        let (_plan, backend) = composition.into_enforcement_parts();
+
+        assert!(backend.is_none());
+    }
+
+    #[test]
+    fn transparent_interception_surface_has_no_executable_backend() {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+        let error = match build_runtime_composition(config) {
+            Ok(_) => panic!("transparent interception should be unavailable"),
             Err(error) => error,
         };
 
-        assert!(matches!(
-            error,
-            ConfiguredEnforcementError::MultipleExecutableBackends
-        ));
-    }
-
-    struct RejectingBackend;
-
-    impl EnforcementBackend for RejectingBackend {
-        fn apply(
-            &mut self,
-            _request: EnforcementBackendRequest<'_>,
-        ) -> Result<EnforcementBackendDecision, EnforcementError> {
-            Ok(EnforcementBackendDecision::unsupported("not used"))
-        }
+        assert!(
+            error
+                .to_string()
+                .contains("no executable backend is configured")
+        );
     }
 }

@@ -15,10 +15,6 @@ pub enum ConfiguredEnforcementError {
     Source(#[from] EnforcementPolicySourceError),
     #[error("enforcement execution backend is not available in this build/runtime")]
     ExecutionBackendUnavailable,
-    #[error(
-        "multiple executable enforcement backends are configured; composite enforcement execution is not implemented"
-    )]
-    MultipleExecutableBackends,
 }
 
 pub struct ConfiguredEnforcement {

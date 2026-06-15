@@ -156,7 +156,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let agent_config = read_config_or_default(config.as_ref())?;
             validate_static_runtime_config(&agent_config)?;
             let runtime = build_runtime_composition(agent_config)?;
-            let (plan, enforcement_backend) = runtime.into_enforcement_parts()?;
+            let (plan, enforcement_backend) = runtime.into_enforcement_parts();
             let mut enforcement =
                 build_configured_enforcement_with_backend(&plan, enforcement_backend).await?;
             let policies = load_configured_policies(&plan.config)?;
@@ -247,7 +247,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
         }
         Command::Check { config } => {
             let runtime = read_runtime_composition(&config)?;
-            let (plan, enforcement_backend) = runtime.into_enforcement_parts()?;
+            let (plan, enforcement_backend) = runtime.into_enforcement_parts();
             let report = build_check_report(plan, enforcement_backend).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
