@@ -107,11 +107,11 @@ fn default_platform_capabilities(
         ),
         CapabilityState::degraded(
             CapabilityKind::DurableSpool,
-            "ingress recovery can replay persisted capture events, including bytes, gaps, and connection lifecycle events, and advances the parser cursor only when active parser state has been removed, but recovery is at-least-once, replays under the current config and policy, and durable parser checkpoints plus processing provenance are not complete",
+            "ingress recovery can replay persisted capture events, including bytes, gaps, and connection lifecycle events, and pipeline export events carry ingress provenance for stable replay ids, but recovery is at-least-once, replays under the current config and policy, and durable parser checkpoints are not complete",
         ),
         CapabilityState::degraded(
             CapabilityKind::IngressJournal,
-            "ingress recovery replays persisted capture events before opening a capture provider and only advances the parser cursor when active parser state has been removed, but durable parser checkpoints and processing provenance are not complete",
+            "ingress recovery replays persisted capture events before opening a capture provider, pipeline export events carry ingress provenance, and the parser cursor advances only when active parser state has been removed, but durable parser checkpoints are not complete",
         ),
         CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::available(CapabilityKind::WebhookExporter),

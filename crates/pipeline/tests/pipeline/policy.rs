@@ -6,8 +6,8 @@ use parsers::Http1ParserFactory;
 use pipeline::{CapturePipeline, PipelinePolicy, PipelineRuntimeMetrics};
 use policy::{PolicyHook, PolicyManifest, PolicyRuntime};
 use probe_core::{
-    Action, EnforcementMode, EnforcementOutcome, EventKind, EventType, ProcessSelector,
-    ProtectiveActionProfile, Selector, TrafficSelector,
+    Action, EnforcementMode, EnforcementOutcome, EventEmission, EventKind, EventType,
+    PolicyEmissionStage, ProcessSelector, ProtectiveActionProfile, Selector, TrafficSelector,
 };
 use tempfile::tempdir;
 
@@ -73,6 +73,30 @@ end
             && decision.selector_matched
         )
     }));
+    let policy_coordinates = envelopes
+        .iter()
+        .filter_map(|envelope| match (&envelope.kind, envelope.provenance) {
+            (EventKind::PolicyVerdict(_) | EventKind::EnforcementDecision(_), Some(provenance)) => {
+                match provenance.emission {
+                    EventEmission::Policy {
+                        trigger_index,
+                        policy_index,
+                        output_index,
+                        stage,
+                    } => Some((trigger_index, policy_index, output_index, stage)),
+                    EventEmission::Primary { .. } => None,
+                }
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        policy_coordinates,
+        vec![
+            (0, 0, 0, PolicyEmissionStage::Output),
+            (0, 0, 0, PolicyEmissionStage::EnforcementDecision),
+        ]
+    );
     let metrics = metrics.snapshot();
     assert_eq!(metrics.capture_events_read, summary.capture_events_read);
     assert_eq!(
@@ -155,6 +179,108 @@ end
     assert_eq!(metrics.policy.alerts, 1);
     assert_eq!(metrics.policy.verdicts, 0);
     assert_eq!(metrics.enforcement.decisions, 0);
+    Ok(())
+}
+
+#[test]
+fn policy_outputs_do_not_shift_later_primary_event_provenance()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let policy = PolicyRuntime::from_source(
+        PolicyManifest {
+            id: "multi-output-policy".to_string(),
+            version: "test-version".to_string(),
+            hooks: vec![PolicyHook::HttpRequestHeaders],
+        },
+        r#"
+function on_http_request_headers(event)
+  if event.kind.target == "/first" then
+    return {
+      probe.emit_alert("first one"),
+      probe.emit_alert("first two"),
+    }
+  end
+end
+"#,
+    )?;
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut provider = SequenceProvider::new(vec![captured_bytes(
+        demo_flow_with_ports(50_000, 80, 22),
+        b"GET /first HTTP/1.1\r\nHost: test\r\n\r\nGET /second HTTP/1.1\r\nHost: test\r\n\r\n",
+    )]);
+    let mut pipeline = CapturePipeline::new(
+        &spool,
+        &mut parser_factory,
+        vec![PipelinePolicy::unscoped(&policy)],
+        "test",
+    );
+
+    let summary = pipeline.run_provider(&mut provider)?;
+
+    assert_eq!(summary.ingress_records_journaled, 1);
+    assert_eq!(summary.ingress_records_processed, 1);
+    assert_eq!(summary.export_events_written, 4);
+    let envelopes = exported_envelopes(&spool)?;
+    let policy_alerts = envelopes
+        .iter()
+        .filter_map(|envelope| match (&envelope.kind, envelope.provenance) {
+            (EventKind::PolicyAlert(alert), Some(provenance)) => match provenance.emission {
+                EventEmission::Policy {
+                    trigger_index,
+                    policy_index,
+                    output_index,
+                    stage,
+                } => Some((
+                    alert.message.clone(),
+                    trigger_index,
+                    policy_index,
+                    output_index,
+                    stage,
+                )),
+                EventEmission::Primary { .. } => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let primary_targets = envelopes
+        .into_iter()
+        .filter_map(|envelope| match (envelope.kind, envelope.provenance) {
+            (EventKind::HttpRequestHeaders(headers), Some(provenance)) => match provenance.emission
+            {
+                EventEmission::Primary { index } => Some((headers.target, index)),
+                EventEmission::Policy { .. } => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        policy_alerts,
+        vec![
+            (
+                "first one".to_string(),
+                0,
+                0,
+                0,
+                PolicyEmissionStage::Output
+            ),
+            (
+                "first two".to_string(),
+                0,
+                0,
+                1,
+                PolicyEmissionStage::Output
+            ),
+        ]
+    );
+    assert_eq!(
+        primary_targets,
+        vec![
+            (Some("/first".to_string()), 0),
+            (Some("/second".to_string()), 1)
+        ]
+    );
     Ok(())
 }
 

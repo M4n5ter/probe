@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use exporter::{BatchExporter, CompressionCodec};
 use probe_core::SpoolPayloadSchema;
 use proto::BatchEnvelope;
@@ -43,16 +41,7 @@ pub(super) async fn drain_export_sink_from_batch(
         };
         let ack = exporter.send_batch(&batch).await?;
         summary.batches = summary.batches.saturating_add(1);
-        let committed_cursor = ack
-            .committed_cursor
-            .or_else(|| contiguous_cursor_from_event_ids(&batch, &ack.acked_event_ids));
-        let Some(cursor) = committed_cursor else {
-            println!(
-                "exported sink {sink} batch {} without committed cursor; spool cursor unchanged",
-                ack.batch_id
-            );
-            return Ok(summary);
-        };
+        let cursor = ack.committed_cursor;
 
         spool.ack_export(sink, cursor)?;
         summary.committed_cursor = Some(cursor);
@@ -72,9 +61,13 @@ pub(super) fn export_batch_from_events(
     codec: CompressionCodec,
     events: Vec<StoredEvent>,
 ) -> Result<Option<BatchEnvelope>, ExportDrainError> {
-    let Some(last_sequence) = events.last().map(|event| event.sequence) else {
+    let Some(first_sequence) = events.first().map(|event| event.sequence) else {
         return Ok(None);
     };
+    let last_sequence = events
+        .last()
+        .map(|event| event.sequence)
+        .expect("non-empty event batch has a last sequence");
     for event in &events {
         if event.payload.schema() != &SpoolPayloadSchema::EventEnvelopeJson {
             return Err(ExportDrainError::UnsupportedSpoolPayloadSchema {
@@ -85,7 +78,7 @@ pub(super) fn export_batch_from_events(
     }
 
     BatchEnvelope::from_json_payloads(
-        format!("{agent_id}:{sink}:{last_sequence}"),
+        export_batch_id(agent_id, sink, first_sequence, last_sequence),
         agent_id,
         codec.wire_name(),
         events
@@ -96,61 +89,128 @@ pub(super) fn export_batch_from_events(
     .map_err(ExportDrainError::Proto)
 }
 
-fn contiguous_cursor_from_event_ids(
-    batch: &BatchEnvelope,
-    acked_event_ids: &[String],
-) -> Option<u64> {
-    let acked_event_ids = acked_event_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let mut cursor = None;
-    for event in &batch.events {
-        if acked_event_ids.contains(event.event_id.as_str()) {
-            cursor = Some(event.sequence);
-        } else {
-            break;
-        }
-    }
-    cursor
+pub(in crate::export::drain) fn export_batch_id(
+    agent_id: &str,
+    sink: &str,
+    first_sequence: u64,
+    last_sequence: u64,
+) -> String {
+    format!("{agent_id}:{sink}:{first_sequence}-{last_sequence}")
+}
+
+#[cfg(test)]
+pub(in crate::export::drain) fn batch_id_last_sequence(batch_id: &str) -> Option<u64> {
+    batch_id
+        .rsplit(':')
+        .next()
+        .and_then(|range| range.rsplit('-').next())
+        .and_then(|sequence| sequence.parse().ok())
 }
 
 #[cfg(test)]
 mod tests {
-    use proto::{EventRecord, PayloadFormat};
+    use probe_core::{
+        AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
+        HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+    };
+    use storage::{FjallSpool, SpoolPayload};
+    use tempfile::tempdir;
 
     use super::*;
 
     #[test]
-    fn acked_event_ids_advance_only_contiguous_cursor_prefix() {
-        let batch = batch_with_events(["one", "two", "three"]);
+    fn partial_cursor_ack_changes_retry_batch_identity() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        append_export_event(&spool, "/one")?;
+        append_export_event(&spool, "/two")?;
+        let events = spool.read_export_batch("sink", EXPORT_BATCH_LIMIT)?;
+        let first_batch =
+            export_batch_from_events("agent-1", "sink", CompressionCodec::None, events)?
+                .expect("initial batch");
 
-        assert_eq!(
-            contiguous_cursor_from_event_ids(&batch, &["one".to_string(), "two".to_string()]),
-            Some(2)
-        );
-        assert_eq!(
-            contiguous_cursor_from_event_ids(&batch, &["two".to_string(), "three".to_string()]),
-            None
-        );
+        spool.ack_export("sink", 1)?;
+
+        let retry_batch = export_batch_from_events(
+            "agent-1",
+            "sink",
+            CompressionCodec::None,
+            spool.read_export_batch("sink", EXPORT_BATCH_LIMIT)?,
+        )?
+        .expect("retry batch");
+
+        assert_eq!(first_batch.batch_id, "agent-1:sink:1-2");
+        assert_eq!(retry_batch.batch_id, "agent-1:sink:2-2");
+        Ok(())
     }
 
-    fn batch_with_events<const N: usize>(event_ids: [&str; N]) -> BatchEnvelope {
-        BatchEnvelope {
-            batch_id: "batch-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            codec: "none".to_string(),
-            events: event_ids
-                .into_iter()
-                .enumerate()
-                .map(|(index, event_id)| EventRecord {
-                    event_id: event_id.to_string(),
-                    sequence: (index + 1) as u64,
-                    payload_format: PayloadFormat::Json as i32,
-                    payload: Vec::new(),
-                    payload_schema: "test.schema".to_string(),
-                })
-                .collect(),
+    fn append_export_event(
+        spool: &FjallSpool,
+        target: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let envelope = EventEnvelope::new(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            demo_flow(),
+            CaptureSource::Replay,
+            "test",
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some(target.to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        );
+        let payload = serde_json::to_vec(&envelope)?;
+        spool.append_export(SpoolPayload::new(
+            SpoolPayloadSchema::EventEnvelopeJson,
+            payload,
+        ))?;
+        Ok(())
+    }
+
+    fn demo_flow() -> FlowContext {
+        let process = ProcessIdentity {
+            pid: 1,
+            tgid: 1,
+            start_time_ticks: 1,
+            boot_id: "boot".to_string(),
+            exe_path: "agent-test".to_string(),
+            cmdline_hash: "hash".to_string(),
+            uid: 0,
+            gid: 0,
+            cgroup: None,
+            systemd_service: None,
+            container_id: None,
+            runtime_hint: None,
+        };
+        let local = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 50_000,
+        };
+        let remote = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 80,
+        };
+        FlowContext {
+            id: FlowIdentity::stable(&process, &local, &remote, TransportProtocol::Tcp, 1, None),
+            process: ProcessContext {
+                identity: process,
+                name: "agent-test".to_string(),
+                cmdline: vec!["agent-test".to_string()],
+            },
+            local,
+            remote,
+            protocol: TransportProtocol::Tcp,
+            start_monotonic_ns: 1,
+            socket_cookie: Some(1),
+            attribution_confidence: 100,
         }
     }
 }

@@ -9,6 +9,8 @@ use std::{
     time::Duration,
 };
 
+use super::batch::batch_id_last_sequence;
+
 const WEBHOOK_SERVER_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(in crate::export::drain) struct WebhookAckServer {
@@ -84,8 +86,6 @@ impl WebhookAckServer {
                     "batch_id": batch_id,
                     "accepted": behavior.accepted(),
                     "acked_cursor": acked_cursor,
-                    "acked_event_ids": [],
-                    "retryable_event_ids": [],
                     "reason": behavior.rejection_reason(),
                 })
                 .to_string();
@@ -216,11 +216,7 @@ fn header_end(bytes: &[u8]) -> Option<usize> {
 }
 
 fn cursor_from_batch_id(batch_id: &str) -> u64 {
-    batch_id
-        .rsplit(':')
-        .next()
-        .and_then(|sequence| sequence.parse().ok())
-        .unwrap_or(0)
+    batch_id_last_sequence(batch_id).unwrap_or(0)
 }
 
 pub(in crate::export::drain) fn request_header(request: &str, name: &str) -> Option<String> {

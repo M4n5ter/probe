@@ -6,6 +6,8 @@ pub enum ExportError {
     Zstd(std::io::Error),
     #[error("http transport failed: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("invalid ack response body: {source}")]
+    InvalidAckResponse { source: serde_json::Error },
     #[error("invalid HTTP header name {name}: {source}")]
     InvalidHeaderName {
         name: String,
@@ -24,8 +26,8 @@ pub enum ExportError {
     Rejected { batch_id: String, reason: String },
     #[error("ack response batch mismatch: expected {expected}, got {actual}")]
     AckBatchMismatch { expected: String, actual: String },
-    #[error("ack response referenced event {event_id} outside batch {batch_id}")]
-    AckUnknownEvent { batch_id: String, event_id: String },
+    #[error("ack response for accepted batch {batch_id} did not include acked_cursor")]
+    AckMissingCursor { batch_id: String },
     #[error(
         "ack response cursor {cursor} is outside batch {batch_id} range {min_sequence}..={max_sequence}"
     )]
@@ -35,15 +37,5 @@ pub enum ExportError {
         min_sequence: u64,
         max_sequence: u64,
     },
-    #[error(
-        "ack response marked event {event_id} at sequence {sequence} retryable before committed cursor {cursor}"
-    )]
-    AckRetryableBeforeCursor {
-        event_id: String,
-        sequence: u64,
-        cursor: u64,
-    },
-    #[error("ack response marked event {event_id} in batch {batch_id} as both acked and retryable")]
-    AckConflictingEventState { batch_id: String, event_id: String },
 }
 use thiserror::Error;

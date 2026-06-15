@@ -109,17 +109,12 @@ impl BatchExporter for WebhookExporter {
             .await?;
 
         let status = response.status();
-        let ack = response.json::<WebhookAck>().await?;
-        if status.is_success() && ack.accepted {
-            ack.into_export_ack(batch)
-        } else {
-            Err(ExportError::Rejected {
-                batch_id: ack.batch_id,
-                reason: ack
-                    .reason
-                    .unwrap_or_else(|| format!("HTTP status {status}")),
-            })
-        }
+        let body = response.text().await?;
+        let ack = serde_json::from_str::<WebhookAck>(&body)
+            .map_err(|source| ExportError::InvalidAckResponse { source })?;
+        ack.into_export_ack(batch, status.is_success(), || {
+            format!("HTTP status {status}")
+        })
     }
 }
 

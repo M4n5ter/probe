@@ -1,7 +1,7 @@
 use capture::{PlaintextChunk, PlaintextEventProvider, PlaintextSource, ReplayProvider};
 use parsers::Http1ParserFactory;
 use pipeline::CapturePipeline;
-use probe_core::{CaptureSource, Direction, EventKind, Timestamp};
+use probe_core::{CaptureSource, Direction, EventEmission, EventKind, Timestamp};
 use tempfile::tempdir;
 
 use super::fixture::{demo_flow_with_ports, exported_envelopes};
@@ -28,7 +28,19 @@ fn replay_provider_writes_ingress_and_export_lanes() -> Result<(), Box<dyn std::
     assert_eq!(summary.ingress_records_processed, 1);
     assert_eq!(summary.export_events_written, 2);
     assert_eq!(spool.read_ingress_batch_after(0, 10)?.len(), 1);
-    assert_eq!(spool.read_export_batch("sink", 10)?.len(), 2);
+    let envelopes = exported_envelopes(&spool)?;
+    assert_eq!(envelopes.len(), 2);
+    assert_eq!(
+        envelopes
+            .iter()
+            .filter_map(|envelope| envelope.provenance)
+            .map(|provenance| match provenance.emission {
+                EventEmission::Primary { index } => (provenance.ingress_sequence, index),
+                EventEmission::Policy { .. } => panic!("expected primary event provenance"),
+            })
+            .collect::<Vec<_>>(),
+        vec![(1, 0), (1, 1)]
+    );
     Ok(())
 }
 

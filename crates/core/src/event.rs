@@ -56,10 +56,73 @@ pub struct EventEnvelope {
     pub timestamp: Timestamp,
     pub flow: FlowContext,
     pub source: CaptureSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<EventProvenance>,
     pub config_version: String,
     pub policy_version: Option<String>,
     pub degraded: bool,
     pub kind: EventKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EventProvenance {
+    pub ingress_sequence: u64,
+    pub emission: EventEmission,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventEmission {
+    Primary {
+        index: u64,
+    },
+    Policy {
+        trigger_index: u64,
+        policy_index: u64,
+        output_index: u64,
+        stage: PolicyEmissionStage,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyEmissionStage {
+    RuntimeError,
+    Output,
+    EnforcementDecision,
+}
+
+impl EventProvenance {
+    pub fn primary(ingress_sequence: u64, index: u64) -> Self {
+        Self {
+            ingress_sequence,
+            emission: EventEmission::Primary { index },
+        }
+    }
+
+    pub fn policy(
+        trigger: &Self,
+        policy_index: u64,
+        output_index: u64,
+        stage: PolicyEmissionStage,
+    ) -> Self {
+        Self {
+            ingress_sequence: trigger.ingress_sequence,
+            emission: EventEmission::Policy {
+                trigger_index: trigger.primary_index(),
+                policy_index,
+                output_index,
+                stage,
+            },
+        }
+    }
+
+    pub fn primary_index(&self) -> u64 {
+        match self.emission {
+            EventEmission::Primary { index } => index,
+            EventEmission::Policy { trigger_index, .. } => trigger_index,
+        }
+    }
 }
 
 impl EventEnvelope {
@@ -72,12 +135,13 @@ impl EventEnvelope {
     ) -> Self {
         let config_version = config_version.into();
         let degraded = kind.is_degraded();
-        let id = Self::stable_id(timestamp, &flow, source, &config_version, None, &kind);
+        let id = Self::stable_id(timestamp, &flow, source, None, &config_version, None, &kind);
         Self {
             id,
             timestamp,
             flow,
             source,
+            provenance: None,
             config_version,
             policy_version: None,
             degraded,
@@ -87,14 +151,13 @@ impl EventEnvelope {
 
     pub fn with_policy_version(mut self, policy_version: impl Into<String>) -> Self {
         self.policy_version = Some(policy_version.into());
-        self.id = Self::stable_id(
-            self.timestamp,
-            &self.flow,
-            self.source,
-            &self.config_version,
-            self.policy_version.as_deref(),
-            &self.kind,
-        );
+        self.recompute_id();
+        self
+    }
+
+    pub fn with_provenance(mut self, provenance: EventProvenance) -> Self {
+        self.provenance = Some(provenance);
+        self.recompute_id();
         self
     }
 
@@ -103,16 +166,39 @@ impl EventEnvelope {
         self
     }
 
+    fn recompute_id(&mut self) {
+        self.id = Self::stable_id(
+            self.timestamp,
+            &self.flow,
+            self.source,
+            self.provenance.as_ref(),
+            &self.config_version,
+            self.policy_version.as_deref(),
+            &self.kind,
+        );
+    }
+
     fn stable_id(
         timestamp: Timestamp,
         flow: &FlowContext,
         source: CaptureSource,
+        provenance: Option<&EventProvenance>,
         config_version: &str,
         policy_version: Option<&str>,
         kind: &EventKind,
     ) -> EventId {
         let source_fingerprint = format!("{source:?}");
-        let monotonic_ns = timestamp.monotonic_ns.to_be_bytes();
+        let monotonic_ns = provenance
+            .map_or(timestamp.monotonic_ns, |_| 0)
+            .to_be_bytes();
+        let provenance_fingerprint = provenance
+            .map(|value| serde_json::to_vec(value).unwrap_or_else(|_| format!("{value:?}").into()))
+            .unwrap_or_default();
+        let identity_mode = if provenance.is_some() {
+            b"ingress_provenance".as_slice()
+        } else {
+            b"timestamp".as_slice()
+        };
         let kind_fingerprint =
             serde_json::to_vec(kind).unwrap_or_else(|_| format!("{kind:?}").into_bytes());
         EventId::stable([
@@ -121,7 +207,9 @@ impl EventEnvelope {
             policy_version.unwrap_or_default().as_bytes(),
             source_fingerprint.as_bytes(),
             kind.event_type().as_str().as_bytes(),
+            identity_mode,
             monotonic_ns.as_slice(),
+            provenance_fingerprint.as_slice(),
             kind_fingerprint.as_slice(),
         ])
     }
@@ -406,10 +494,10 @@ pub struct PolicyRuntimeError {
 mod tests {
     use crate::{
         Action, AddressPort, CaptureSource, Direction, DomainEvent, EnforcementDecision,
-        EnforcementMode, EnforcementOutcome, EventEnvelope, EventKind, EventType, FlowContext,
-        FlowIdentity, Gap, HttpHeaders, OpaqueStream, PolicyRuntimeError, ProcessContext,
-        ProcessIdentity, ProtocolError, SseEvent, Timestamp, TransportProtocol, Verdict,
-        VerdictScope, WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
+        EnforcementMode, EnforcementOutcome, EventEnvelope, EventKind, EventProvenance, EventType,
+        FlowContext, FlowIdentity, Gap, HttpHeaders, OpaqueStream, PolicyRuntimeError,
+        ProcessContext, ProcessIdentity, ProtocolError, SseEvent, Timestamp, TransportProtocol,
+        Verdict, VerdictScope, WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
     };
 
     #[test]
@@ -432,6 +520,26 @@ mod tests {
     fn event_id_changes_when_policy_version_changes() {
         let first = request_event(CaptureSource::Replay, "/same").with_policy_version("policy@1");
         let second = request_event(CaptureSource::Replay, "/same").with_policy_version("policy@2");
+
+        assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn event_id_uses_provenance_instead_of_timestamp_when_present() {
+        let first = request_event_at(CaptureSource::Replay, "/same", 1)
+            .with_provenance(EventProvenance::primary(42, 3));
+        let second = request_event_at(CaptureSource::Replay, "/same", 99)
+            .with_provenance(EventProvenance::primary(42, 3));
+
+        assert_eq!(first.id, second.id);
+    }
+
+    #[test]
+    fn event_id_changes_when_provenance_primary_index_changes() {
+        let first = request_event(CaptureSource::Replay, "/same")
+            .with_provenance(EventProvenance::primary(42, 3));
+        let second = request_event(CaptureSource::Replay, "/same")
+            .with_provenance(EventProvenance::primary(42, 4));
 
         assert_ne!(first.id, second.id);
     }
@@ -629,9 +737,13 @@ mod tests {
     }
 
     fn request_event(source: CaptureSource, target: &str) -> EventEnvelope {
+        request_event_at(source, target, 1)
+    }
+
+    fn request_event_at(source: CaptureSource, target: &str, monotonic_ns: u64) -> EventEnvelope {
         EventEnvelope::new(
             Timestamp {
-                monotonic_ns: 1,
+                monotonic_ns,
                 wall_time_unix_ns: 1,
             },
             demo_flow(),

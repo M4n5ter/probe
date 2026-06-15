@@ -404,7 +404,7 @@ mod tests {
 
     use super::*;
     use crate::export::drain::{
-        batch::EXPORT_BATCH_LIMIT,
+        batch::{EXPORT_BATCH_LIMIT, export_batch_id},
         spooled_event::{append_export_event, append_export_events},
         webhook_server::{WebhookAckServer, request_header},
     };
@@ -522,12 +522,12 @@ mod tests {
             Some("none")
         );
         assert_eq!(
-            request_header(&requests[0], "idempotency-key").as_deref(),
-            Some("agent-1:worker:1")
+            request_header(&requests[0], "idempotency-key"),
+            Some(export_batch_id("agent-1", "worker", 1, 1))
         );
         assert_eq!(
-            request_header(&requests[1], "idempotency-key").as_deref(),
-            Some("agent-1:worker:2")
+            request_header(&requests[1], "idempotency-key"),
+            Some(export_batch_id("agent-1", "worker", 2, 2))
         );
         assert!(spool.read_export_batch("late", 10)?.is_empty());
         fs::remove_dir_all(temp)?;
@@ -569,11 +569,21 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(
             request_header(&requests[0], "idempotency-key"),
-            Some(batch_id("agent-1", "budget", EXPORT_BATCH_LIMIT as u64))
+            Some(export_batch_id(
+                "agent-1",
+                "budget",
+                1,
+                EXPORT_BATCH_LIMIT as u64
+            ))
         );
         assert_eq!(
             request_header(&requests[1], "idempotency-key"),
-            Some(batch_id("agent-1", "budget", event_count))
+            Some(export_batch_id(
+                "agent-1",
+                "budget",
+                EXPORT_BATCH_LIMIT as u64 + 1,
+                event_count,
+            ))
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -613,7 +623,12 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             request_header(&requests[0], "idempotency-key"),
-            Some(batch_id("agent-1", "limited", EXPORT_BATCH_LIMIT as u64))
+            Some(export_batch_id(
+                "agent-1",
+                "limited",
+                1,
+                EXPORT_BATCH_LIMIT as u64
+            ))
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -666,11 +681,21 @@ mod tests {
         assert_eq!(successful_requests.len(), 2);
         assert_eq!(
             request_header(&successful_requests[0], "idempotency-key"),
-            Some(batch_id("agent-1", "successful", EXPORT_BATCH_LIMIT as u64))
+            Some(export_batch_id(
+                "agent-1",
+                "successful",
+                1,
+                EXPORT_BATCH_LIMIT as u64,
+            ))
         );
         assert_eq!(
             request_header(&successful_requests[1], "idempotency-key"),
-            Some(batch_id("agent-1", "successful", event_count))
+            Some(export_batch_id(
+                "agent-1",
+                "successful",
+                EXPORT_BATCH_LIMIT as u64 + 1,
+                event_count,
+            ))
         );
         let failing_requests = failing.join_requests()?;
         assert_eq!(failing_requests.len(), 1);
@@ -702,7 +727,12 @@ mod tests {
         assert_eq!(successful_runtime.last_failure_reason, None);
         assert_eq!(
             request_header(&failing_requests[0], "idempotency-key"),
-            Some(batch_id("agent-1", "failing", EXPORT_BATCH_LIMIT as u64))
+            Some(export_batch_id(
+                "agent-1",
+                "failing",
+                1,
+                EXPORT_BATCH_LIMIT as u64
+            ))
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -713,10 +743,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         std::env::temp_dir().join(format!("sssa-probe-{name}-{}-{nanos}", std::process::id()))
-    }
-
-    fn batch_id(agent_id: &str, sink: &str, sequence: u64) -> String {
-        format!("{agent_id}:{sink}:{sequence}")
     }
 
     async fn wait_for_export_cursor(

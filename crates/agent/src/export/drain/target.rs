@@ -263,9 +263,10 @@ mod tests {
     use storage::{FjallSpool, SpoolPayload};
 
     use super::*;
-    use crate::{
-        export::drain::spooled_event::append_export_events,
-        export::drain::webhook_server::{WebhookAckServer, request_header},
+    use crate::export::drain::{
+        batch::export_batch_id,
+        spooled_event::append_export_events,
+        webhook_server::{WebhookAckServer, request_header},
     };
 
     const OVERSIZED_TEST_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -506,8 +507,8 @@ mod tests {
             Some("none")
         );
         assert_eq!(
-            request_header(&request, "idempotency-key").as_deref(),
-            Some("agent-1:successful:1")
+            request_header(&request, "idempotency-key"),
+            Some(export_batch_id("agent-1", "successful", 1, 1))
         );
         let _ = failing.join()?;
         fs::remove_dir_all(temp)?;
@@ -554,11 +555,21 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(
             request_header(&requests[0], "idempotency-key"),
-            Some(batch_id("agent-1", "tail", EXPORT_BATCH_LIMIT as u64))
+            Some(export_batch_id(
+                "agent-1",
+                "tail",
+                1,
+                EXPORT_BATCH_LIMIT as u64
+            ))
         );
         assert_eq!(
             request_header(&requests[1], "idempotency-key"),
-            Some(batch_id("agent-1", "tail", event_count))
+            Some(export_batch_id(
+                "agent-1",
+                "tail",
+                EXPORT_BATCH_LIMIT as u64 + 1,
+                event_count,
+            ))
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -569,10 +580,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         std::env::temp_dir().join(format!("sssa-probe-{name}-{}-{nanos}", std::process::id()))
-    }
-
-    fn batch_id(agent_id: &str, sink: &str, sequence: u64) -> String {
-        format!("{agent_id}:{sink}:{sequence}")
     }
 
     fn export_plan_with_trust_anchor(path: PathBuf) -> ExportPlan {

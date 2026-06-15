@@ -1,5 +1,3 @@
-use std::collections::{HashMap, HashSet};
-
 use proto::BatchEnvelope;
 use serde::{Deserialize, Serialize};
 
@@ -8,23 +6,25 @@ use crate::ExportError;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportAck {
     pub batch_id: String,
-    pub committed_cursor: Option<u64>,
-    pub acked_event_ids: Vec<String>,
-    pub retryable_event_ids: Vec<String>,
+    pub committed_cursor: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebhookAck {
     pub batch_id: String,
     pub accepted: bool,
     pub acked_cursor: Option<u64>,
-    pub acked_event_ids: Vec<String>,
-    pub retryable_event_ids: Vec<String>,
     pub reason: Option<String>,
 }
 
 impl WebhookAck {
-    pub fn into_export_ack(self, batch: &BatchEnvelope) -> Result<ExportAck, ExportError> {
+    pub fn into_export_ack(
+        self,
+        batch: &BatchEnvelope,
+        transport_success: bool,
+        transport_reason: impl FnOnce() -> String,
+    ) -> Result<ExportAck, ExportError> {
         if self.batch_id != batch.batch_id {
             return Err(ExportError::AckBatchMismatch {
                 expected: batch.batch_id.clone(),
@@ -32,70 +32,41 @@ impl WebhookAck {
             });
         }
 
-        let event_ids = batch
-            .events
-            .iter()
-            .map(|event| event.event_id.as_str())
-            .collect::<HashSet<_>>();
-        let event_sequences = batch
-            .events
-            .iter()
-            .map(|event| (event.event_id.as_str(), event.sequence))
-            .collect::<HashMap<_, _>>();
+        if !transport_success || !self.accepted {
+            let reason = self.reason.unwrap_or_else(|| {
+                if transport_success {
+                    "receiver rejected batch".to_string()
+                } else {
+                    transport_reason()
+                }
+            });
+            return Err(ExportError::Rejected {
+                batch_id: self.batch_id,
+                reason,
+            });
+        }
+
         let min_sequence = batch.events.iter().map(|event| event.sequence).min();
         let max_sequence = batch.events.iter().map(|event| event.sequence).max();
-        for event_id in self.acked_event_ids.iter().chain(&self.retryable_event_ids) {
-            if !event_ids.contains(event_id.as_str()) {
-                return Err(ExportError::AckUnknownEvent {
-                    batch_id: batch.batch_id.clone(),
-                    event_id: event_id.clone(),
-                });
-            }
-        }
-        let acked_event_ids = self
-            .acked_event_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        for event_id in &self.retryable_event_ids {
-            if acked_event_ids.contains(event_id.as_str()) {
-                return Err(ExportError::AckConflictingEventState {
-                    batch_id: batch.batch_id.clone(),
-                    event_id: event_id.clone(),
-                });
-            }
-        }
-        if let (Some(cursor), Some(min_sequence), Some(max_sequence)) =
-            (self.acked_cursor, min_sequence, max_sequence)
-            && (cursor < min_sequence || cursor > max_sequence)
+        let Some(committed_cursor) = self.acked_cursor else {
+            return Err(ExportError::AckMissingCursor {
+                batch_id: batch.batch_id.clone(),
+            });
+        };
+        if let (Some(min_sequence), Some(max_sequence)) = (min_sequence, max_sequence)
+            && (committed_cursor < min_sequence || committed_cursor > max_sequence)
         {
             return Err(ExportError::AckCursorOutOfRange {
                 batch_id: batch.batch_id.clone(),
-                cursor,
+                cursor: committed_cursor,
                 min_sequence,
                 max_sequence,
             });
         }
-        if let Some(cursor) = self.acked_cursor {
-            for event_id in &self.retryable_event_ids {
-                let Some(sequence) = event_sequences.get(event_id.as_str()).copied() else {
-                    continue;
-                };
-                if sequence <= cursor {
-                    return Err(ExportError::AckRetryableBeforeCursor {
-                        event_id: event_id.clone(),
-                        sequence,
-                        cursor,
-                    });
-                }
-            }
-        }
 
         Ok(ExportAck {
             batch_id: self.batch_id,
-            committed_cursor: self.acked_cursor,
-            acked_event_ids: self.acked_event_ids,
-            retryable_event_ids: self.retryable_event_ids,
+            committed_cursor,
         })
     }
 }
@@ -113,53 +84,42 @@ mod tests {
             batch_id: "batch-2".to_string(),
             accepted: true,
             acked_cursor: Some(1),
-            acked_event_ids: vec!["event-1".to_string()],
-            retryable_event_ids: Vec::new(),
             reason: None,
         };
 
         assert!(matches!(
-            ack.into_export_ack(&batch),
+            accept(ack, &batch),
             Err(ExportError::AckBatchMismatch { expected, actual })
                 if expected == "batch-1" && actual == "batch-2"
         ));
     }
 
     #[test]
-    fn webhook_ack_rejects_unknown_event_ids() {
-        let batch = test_batch("batch-1", ["event-1"]);
-        let ack = WebhookAck {
-            batch_id: "batch-1".to_string(),
-            accepted: true,
-            acked_cursor: Some(1),
-            acked_event_ids: vec!["event-2".to_string()],
-            retryable_event_ids: Vec::new(),
-            reason: None,
-        };
+    fn webhook_ack_rejects_legacy_event_id_fields() {
+        let source = r#"{
+            "batch_id": "batch-1",
+            "accepted": true,
+            "acked_cursor": 1,
+            "retryable_event_ids": ["event-1"],
+            "reason": null
+        }"#;
 
-        assert!(matches!(
-            ack.into_export_ack(&batch),
-            Err(ExportError::AckUnknownEvent { batch_id, event_id })
-                if batch_id == "batch-1" && event_id == "event-2"
-        ));
+        assert!(serde_json::from_str::<WebhookAck>(source).is_err());
     }
 
     #[test]
-    fn webhook_ack_rejects_conflicting_event_state() {
+    fn webhook_ack_rejects_missing_cursor_for_accepted_batch() {
         let batch = test_batch("batch-1", ["event-1"]);
         let ack = WebhookAck {
             batch_id: "batch-1".to_string(),
             accepted: true,
             acked_cursor: None,
-            acked_event_ids: vec!["event-1".to_string()],
-            retryable_event_ids: vec!["event-1".to_string()],
             reason: None,
         };
 
         assert!(matches!(
-            ack.into_export_ack(&batch),
-            Err(ExportError::AckConflictingEventState { batch_id, event_id })
-                if batch_id == "batch-1" && event_id == "event-1"
+            accept(ack, &batch),
+            Err(ExportError::AckMissingCursor { batch_id }) if batch_id == "batch-1"
         ));
     }
 
@@ -170,13 +130,11 @@ mod tests {
             batch_id: "batch-1".to_string(),
             accepted: true,
             acked_cursor: Some(2),
-            acked_event_ids: vec!["event-1".to_string()],
-            retryable_event_ids: Vec::new(),
             reason: None,
         };
 
         assert!(matches!(
-            ack.into_export_ack(&batch),
+            accept(ack, &batch),
             Err(ExportError::AckCursorOutOfRange {
                 batch_id,
                 cursor: 2,
@@ -193,13 +151,11 @@ mod tests {
             batch_id: "batch-1".to_string(),
             accepted: true,
             acked_cursor: Some(1),
-            acked_event_ids: Vec::new(),
-            retryable_event_ids: vec!["event-1".to_string()],
             reason: None,
         };
 
         assert!(matches!(
-            ack.into_export_ack(&batch),
+            accept(ack, &batch),
             Err(ExportError::AckCursorOutOfRange {
                 batch_id,
                 cursor: 1,
@@ -210,25 +166,75 @@ mod tests {
     }
 
     #[test]
-    fn webhook_ack_rejects_retryable_events_before_cursor() {
-        let batch = test_batch("batch-1", ["event-1", "event-2"]);
+    fn webhook_ack_rejects_unaccepted_ack_before_committing_cursor() {
+        let batch = test_batch("batch-1", ["event-1"]);
+        let ack = WebhookAck {
+            batch_id: "batch-1".to_string(),
+            accepted: false,
+            acked_cursor: Some(1),
+            reason: Some("receiver throttled".to_string()),
+        };
+
+        assert!(matches!(
+            accept(ack, &batch),
+            Err(ExportError::Rejected { batch_id, reason })
+                if batch_id == "batch-1" && reason == "receiver throttled"
+        ));
+    }
+
+    #[test]
+    fn webhook_ack_rejects_failed_transport_before_committing_cursor() {
+        let batch = test_batch("batch-1", ["event-1"]);
         let ack = WebhookAck {
             batch_id: "batch-1".to_string(),
             accepted: true,
-            acked_cursor: Some(2),
-            acked_event_ids: vec!["event-1".to_string()],
-            retryable_event_ids: vec!["event-2".to_string()],
+            acked_cursor: Some(1),
             reason: None,
         };
 
         assert!(matches!(
-            ack.into_export_ack(&batch),
-            Err(ExportError::AckRetryableBeforeCursor {
-                event_id,
-                sequence: 2,
-                cursor: 2,
-            }) if event_id == "event-2"
+            ack.into_export_ack(&batch, false, || {
+                "HTTP status 500 Internal Server Error".to_string()
+            }),
+            Err(ExportError::Rejected { batch_id, reason })
+                if batch_id == "batch-1" && reason == "HTTP status 500 Internal Server Error"
         ));
+    }
+
+    #[test]
+    fn webhook_ack_validates_batch_mismatch_before_rejection() {
+        let batch = test_batch("batch-1", ["event-1"]);
+        let ack = WebhookAck {
+            batch_id: "batch-2".to_string(),
+            accepted: false,
+            acked_cursor: Some(1),
+            reason: Some("receiver rejected".to_string()),
+        };
+
+        assert!(matches!(
+            accept(ack, &batch),
+            Err(ExportError::AckBatchMismatch { expected, actual })
+                if expected == "batch-1" && actual == "batch-2"
+        ));
+    }
+
+    #[test]
+    fn webhook_ack_allows_duplicate_event_ids_with_cursor_ack() {
+        let batch = test_batch("batch-1", ["event-1", "event-1"]);
+        let ack = WebhookAck {
+            batch_id: "batch-1".to_string(),
+            accepted: true,
+            acked_cursor: Some(2),
+            reason: None,
+        };
+
+        let ack = accept(ack, &batch).expect("cursor ack is valid");
+
+        assert_eq!(ack.committed_cursor, 2);
+    }
+
+    fn accept(ack: WebhookAck, batch: &BatchEnvelope) -> Result<ExportAck, ExportError> {
+        ack.into_export_ack(batch, true, || "HTTP status 200 OK".to_string())
     }
 
     fn test_batch<const N: usize>(batch_id: &str, event_ids: [&str; N]) -> BatchEnvelope {

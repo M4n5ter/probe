@@ -86,11 +86,10 @@ fn export_error_failure_reason(error: &exporter::ExportError) -> ExportDrainFail
             ExportDrainFailureReason::EmptyTlsTrustAnchorBundle
         }
         exporter::ExportError::Rejected { .. } => ExportDrainFailureReason::RemoteRejectedBatch,
-        exporter::ExportError::AckBatchMismatch { .. }
-        | exporter::ExportError::AckUnknownEvent { .. }
-        | exporter::ExportError::AckCursorOutOfRange { .. }
-        | exporter::ExportError::AckRetryableBeforeCursor { .. }
-        | exporter::ExportError::AckConflictingEventState { .. } => {
+        exporter::ExportError::InvalidAckResponse { .. }
+        | exporter::ExportError::AckBatchMismatch { .. }
+        | exporter::ExportError::AckMissingCursor { .. }
+        | exporter::ExportError::AckCursorOutOfRange { .. } => {
             ExportDrainFailureReason::InvalidExportAck
         }
     }
@@ -117,9 +116,11 @@ mod tests {
 
     #[test]
     fn runtime_failure_reason_groups_export_ack_errors() {
-        let error = ExportDrainError::Export(exporter::ExportError::AckUnknownEvent {
+        let error = ExportDrainError::Export(exporter::ExportError::AckCursorOutOfRange {
             batch_id: "batch-1".to_string(),
-            event_id: "event-1".to_string(),
+            cursor: 10,
+            min_sequence: 1,
+            max_sequence: 2,
         });
 
         assert_eq!(

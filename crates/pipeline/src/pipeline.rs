@@ -5,8 +5,8 @@ use enforcement::{EnforcementPlanRequest, EnforcementPlanner};
 use parsers::{ParserInput, ProtocolParserFactory};
 use policy::{PolicyHook, PolicyOutcome, PolicyRuntime, hook_for_event};
 use probe_core::{
-    CompiledSelector, EnforcementDecision, EventEnvelope, EventKind, PolicyRuntimeError,
-    SpoolPayloadSchema, Timestamp, Verdict,
+    CompiledSelector, EnforcementDecision, EventEnvelope, EventKind, EventProvenance,
+    PolicyEmissionStage, PolicyRuntimeError, SpoolPayloadSchema, Timestamp, Verdict,
 };
 use storage::{DurableSpool, IngressCursorOwner, SpoolPayload};
 use thiserror::Error;
@@ -239,9 +239,10 @@ where
         ingress_sequence: u64,
         summary: &mut PipelineSummary,
     ) -> Result<(), PipelineError> {
+        let mut emissions = IngressEmissions::new(ingress_sequence);
         match capture_event {
             CaptureEvent::Bytes(chunk) => {
-                self.process_captured_bytes(chunk, summary)?;
+                self.process_captured_bytes(chunk, summary, &mut emissions)?;
             }
             CaptureEvent::Gap(gap) => {
                 let parser_events = self
@@ -262,7 +263,8 @@ where
                         self.config_version.clone(),
                         event,
                     );
-                    let written = self.append_envelope_and_policy_outcomes(envelope)?;
+                    let written =
+                        self.append_envelope_and_policy_outcomes(envelope, &mut emissions)?;
                     add_export_events_to_summary(summary, written);
                 }
             }
@@ -279,7 +281,7 @@ where
                     self.config_version.clone(),
                     EventKind::ConnectionOpened,
                 );
-                let written = self.append_envelope_and_policy_outcomes(envelope)?;
+                let written = self.append_envelope_and_policy_outcomes(envelope, &mut emissions)?;
                 add_export_events_to_summary(summary, written);
             }
             CaptureEvent::ConnectionClosed {
@@ -302,7 +304,8 @@ where
                         self.config_version.clone(),
                         event,
                     );
-                    let written = self.append_envelope_and_policy_outcomes(envelope)?;
+                    let written =
+                        self.append_envelope_and_policy_outcomes(envelope, &mut emissions)?;
                     add_export_events_to_summary(summary, written);
                 }
                 let envelope = EventEnvelope::new(
@@ -312,7 +315,7 @@ where
                     self.config_version.clone(),
                     EventKind::ConnectionClosed,
                 );
-                let written = self.append_envelope_and_policy_outcomes(envelope)?;
+                let written = self.append_envelope_and_policy_outcomes(envelope, &mut emissions)?;
                 add_export_events_to_summary(summary, written);
                 self.parser_factory.remove_flow(&flow_id);
             }
@@ -330,6 +333,7 @@ where
         &mut self,
         chunk: CapturedBytes,
         summary: &mut PipelineSummary,
+        emissions: &mut IngressEmissions,
     ) -> Result<(), PipelineError> {
         let events = self
             .parser_factory
@@ -349,7 +353,7 @@ where
                 event,
             )
             .with_degraded(chunk.degraded);
-            let written = self.append_envelope_and_policy_outcomes(envelope)?;
+            let written = self.append_envelope_and_policy_outcomes(envelope, emissions)?;
             add_export_events_to_summary(summary, written);
         }
         Ok(())
@@ -377,14 +381,21 @@ where
     fn append_envelope_and_policy_outcomes(
         &mut self,
         envelope: EventEnvelope,
+        emissions: &mut IngressEmissions,
     ) -> Result<u64, PipelineError> {
+        let envelope = envelope.with_provenance(emissions.next_primary());
         self.append_envelope(&envelope)?;
         let mut written = 1;
 
         if let Some(hook) = hook_for_event(&envelope) {
             for policy_index in 0..self.policies.len() {
                 let policy = self.policies[policy_index];
-                written += self.append_matching_policy_outputs(&envelope, policy, hook)?;
+                written += self.append_matching_policy_outputs(
+                    &envelope,
+                    policy,
+                    policy_index as u64,
+                    hook,
+                )?;
             }
         }
         Ok(written)
@@ -394,6 +405,7 @@ where
         &mut self,
         envelope: &EventEnvelope,
         policy: PipelinePolicy<'a>,
+        policy_index: u64,
         hook: PolicyHook,
     ) -> Result<u64, PipelineError> {
         if !policy.matches(envelope) {
@@ -415,7 +427,7 @@ where
         let outcomes = match policy.runtime.handle_event(hook, envelope) {
             Ok(outcomes) => outcomes,
             Err(source) => {
-                self.append_policy_runtime_error(envelope, &policy_version, &source)?;
+                self.append_policy_runtime_error(envelope, &policy_version, policy_index, &source)?;
                 if let Some(metrics) = &self.runtime_metrics {
                     metrics.record_policy_error();
                 }
@@ -423,8 +435,14 @@ where
             }
         };
         let mut written = 0;
-        for outcome in outcomes {
-            written += self.append_policy_outcome(envelope, &policy_version, outcome)?;
+        for (output_index, outcome) in outcomes.into_iter().enumerate() {
+            written += self.append_policy_outcome(
+                envelope,
+                &policy_version,
+                policy_index,
+                output_index as u64,
+                outcome,
+            )?;
         }
         Ok(written)
     }
@@ -433,11 +451,15 @@ where
         &mut self,
         envelope: &EventEnvelope,
         policy_version: &str,
+        policy_index: u64,
         source: &policy::PolicyError,
     ) -> Result<(), PipelineError> {
         self.append_policy_event(
             envelope,
             policy_version,
+            policy_index,
+            0,
+            PolicyEmissionStage::RuntimeError,
             EventKind::PolicyRuntimeError(PolicyRuntimeError {
                 event_type: envelope.kind.event_type(),
                 reason: source.to_string(),
@@ -449,11 +471,20 @@ where
         &mut self,
         envelope: &EventEnvelope,
         policy_version: &str,
+        policy_index: u64,
+        output_index: u64,
         outcome: PolicyOutcome,
     ) -> Result<u64, PipelineError> {
         match outcome {
             PolicyOutcome::Alert(alert) => {
-                self.append_policy_event(envelope, policy_version, EventKind::PolicyAlert(alert))?;
+                self.append_policy_event(
+                    envelope,
+                    policy_version,
+                    policy_index,
+                    output_index,
+                    PolicyEmissionStage::Output,
+                    EventKind::PolicyAlert(alert),
+                )?;
                 if let Some(metrics) = &self.runtime_metrics {
                     metrics.record_policy_alert();
                 }
@@ -463,6 +494,9 @@ where
                 self.append_policy_event(
                     envelope,
                     policy_version,
+                    policy_index,
+                    output_index,
+                    PolicyEmissionStage::Output,
                     EventKind::PolicyVerdict(verdict.clone()),
                 )?;
                 if let Some(metrics) = &self.runtime_metrics {
@@ -476,6 +510,9 @@ where
                 self.append_policy_event(
                     envelope,
                     policy_version,
+                    policy_index,
+                    output_index,
+                    PolicyEmissionStage::EnforcementDecision,
                     EventKind::EnforcementDecision(decision),
                 )?;
                 if let Some(metrics) = &self.runtime_metrics {
@@ -499,8 +536,15 @@ where
         &mut self,
         envelope: &EventEnvelope,
         policy_version: &str,
+        policy_index: u64,
+        output_index: u64,
+        stage: PolicyEmissionStage,
         kind: EventKind,
     ) -> Result<(), PipelineError> {
+        let trigger_provenance = envelope
+            .provenance
+            .as_ref()
+            .expect("primary pipeline event must carry provenance before policy evaluation");
         let policy_envelope = EventEnvelope::new(
             self.clock.next_timestamp(),
             envelope.flow.clone(),
@@ -509,7 +553,13 @@ where
             kind,
         )
         .with_policy_version(policy_version)
-        .with_degraded(envelope.degraded);
+        .with_degraded(envelope.degraded)
+        .with_provenance(EventProvenance::policy(
+            trigger_provenance,
+            policy_index,
+            output_index,
+            stage,
+        ));
         self.append_envelope(&policy_envelope)?;
         Ok(())
     }
@@ -524,6 +574,30 @@ where
             metrics.record_export_event_written();
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IngressEmissions {
+    ingress_sequence: u64,
+    next_primary_index: u64,
+}
+
+impl IngressEmissions {
+    fn new(ingress_sequence: u64) -> Self {
+        Self {
+            ingress_sequence,
+            next_primary_index: 0,
+        }
+    }
+
+    fn next_primary(&mut self) -> EventProvenance {
+        let primary_index = self.next_primary_index;
+        self.next_primary_index = self
+            .next_primary_index
+            .checked_add(1)
+            .expect("ingress primary emission index overflowed");
+        EventProvenance::primary(self.ingress_sequence, primary_index)
     }
 }
 
