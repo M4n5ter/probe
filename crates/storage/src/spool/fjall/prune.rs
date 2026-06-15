@@ -4,7 +4,7 @@ use crate::spool::{
     IngressCursorOwner, RetentionPrune, StorageError, lane::SpoolLane, record::decode_spool_record,
 };
 
-use super::{FjallSpool, decode_sequence_key, sequence_key};
+use super::store::{FjallSpool, decode_sequence_key, sequence_key};
 
 impl FjallSpool {
     pub fn prune_export_through(&self, sequence: u64, limit: usize) -> Result<u64, StorageError> {

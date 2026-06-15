@@ -5,7 +5,7 @@ use crate::spool::{
     marker::{read_spool_marker, read_spool_ready_marker},
 };
 
-use super::{FjallSpool, decode_sequence_key};
+use super::store::{FjallSpool, decode_sequence_key};
 
 impl FjallSpool {
     pub fn probe(path: impl AsRef<std::path::Path>) -> Result<SpoolProbe, StorageError> {
