@@ -434,7 +434,7 @@ mod tests {
         let temp = temp_path("bad-webhook-batch");
         let spool = FjallSpool::open(&temp)?;
         spool.append_export(SpoolPayload::new(
-            SpoolPayloadSchema::from_wire("bad.schema"),
+            SpoolPayloadSchema::CaptureEventJson,
             b"bad payload",
         ))?;
         let plan = export_plan_with_trust_anchor(PathBuf::from("/missing/collector-ca.pem"));

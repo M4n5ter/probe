@@ -131,8 +131,7 @@ mod tests {
     const OVERSIZED_TEST_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
     #[test]
-    fn policy_status_reports_metadata_only_file_without_loading_source()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn policy_status_rejects_file_policy_source() -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("status-policy")?;
         let policy_path = temp.join("guard.lua");
         fs::write(&policy_path, "function on_http_request(")?;
@@ -147,24 +146,17 @@ mod tests {
 
         let status = policy_status(&plan);
 
-        assert_eq!(status.mode, PolicyStatusMode::MetadataOnly);
+        assert_eq!(status.mode, PolicyStatusMode::Unavailable);
         assert_eq!(status.configured_count, 1);
         assert_eq!(status.enabled_count, 1);
-        let active_policy = status.active.as_ref().expect("active policy");
-        assert_eq!(active_policy.id, "guard");
-        assert_eq!(active_policy.path, policy_path);
-        assert!(active_policy.selector_configured);
-        assert_eq!(active_policy.source.mode, RuntimeMode::Available);
-        assert_eq!(active_policy.source.check, PolicySourceCheck::MetadataOnly);
         assert!(
             status
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("offline status does not load or execute"))
+                .is_some_and(|reason| reason.contains("must be a policy bundle directory"))
         );
         let value = serde_json::to_value(&status)?;
-        assert_eq!(value["mode"], json!("metadata_only"));
-        assert_eq!(value["active"]["source"]["check"], json!("metadata_only"));
+        assert_eq!(value["mode"], json!("unavailable"));
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -179,7 +171,7 @@ mod tests {
             policy_path.join("manifest.toml"),
             r#"
 id = "guard"
-version = "bundle-v1"
+version = "bundle-test"
 hooks = ["on_http_request_headers"]
 "#,
         )?;
@@ -246,8 +238,17 @@ hooks = ["on_http_request_headers"]
     fn oversized_policy_source_marks_policy_status_unavailable()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("status-oversized-policy")?;
-        let policy_path = temp.join("guard.lua");
-        let file = fs::File::create(&policy_path)?;
+        let policy_path = temp.join("guard.bundle");
+        fs::create_dir_all(&policy_path)?;
+        fs::write(
+            policy_path.join("manifest.toml"),
+            r#"
+id = "guard"
+version = "bundle-test"
+hooks = ["on_http_request_headers"]
+"#,
+        )?;
+        let file = fs::File::create(policy_path.join("main.lua"))?;
         file.set_len(OVERSIZED_TEST_FILE_BYTES)?;
         let mut config = config_with_storage_path(temp.join("spool"));
         config.policies = vec![PolicyConfig {

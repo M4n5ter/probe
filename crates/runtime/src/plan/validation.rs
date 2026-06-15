@@ -15,9 +15,9 @@ pub(super) fn validate_runtime_config(
     collect_static_runtime_config_violations(config, &mut violations);
     validate_capture_config(config, registry, &mut violations);
     validate_registry_tls_config(config, registry, &mut violations);
-    validate_tls_capture_compatibility(config, registry, &mut violations);
+    validate_tls_capture_constraints(config, registry, &mut violations);
     validate_registry_enforcement_config(config, registry, &mut violations);
-    validate_enforcement_capture_compatibility(config, registry, &mut violations);
+    validate_enforcement_capture_constraints(config, registry, &mut violations);
 
     if violations.is_empty() {
         Ok(())
@@ -123,7 +123,7 @@ fn validate_registry_tls_config(
     }
 }
 
-fn validate_tls_capture_compatibility(
+fn validate_tls_capture_constraints(
     config: &AgentConfig,
     registry: &ProviderRegistry,
     violations: &mut Vec<ConfigViolation>,
@@ -175,7 +175,7 @@ fn validate_registry_enforcement_config(
     }
 }
 
-fn validate_enforcement_capture_compatibility(
+fn validate_enforcement_capture_constraints(
     config: &AgentConfig,
     registry: &ProviderRegistry,
     violations: &mut Vec<ConfigViolation>,
@@ -417,7 +417,7 @@ mod tests {
         );
         assert!(
             !error.to_string().contains("requires live host capture"),
-            "keylog provider rejection should happen before live capture compatibility"
+            "keylog provider rejection should happen before live capture constraints"
         );
     }
 

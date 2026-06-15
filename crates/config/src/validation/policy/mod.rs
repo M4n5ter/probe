@@ -12,7 +12,7 @@ pub(super) fn validate(policies: &[PolicyConfig], violations: &mut Vec<ConfigVio
         if policy.enabled && policy.path.as_os_str().is_empty() {
             violations.push(ConfigViolation {
                 field: format!("policies.{}.path", policy.id),
-                reason: "enabled policy must set a bundle/source path".to_string(),
+                reason: "enabled policy must set a policy bundle directory path".to_string(),
             });
         }
     }

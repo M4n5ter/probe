@@ -789,7 +789,7 @@ mod tests {
         let manifest_path = temp.join("enforcement.toml");
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
-            version: "v1".to_string(),
+            version: "test-version".to_string(),
             selector: None,
             protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
         };
@@ -958,6 +958,6 @@ mod tests {
     }
 
     fn test_payload(bytes: &[u8]) -> SpoolPayload {
-        SpoolPayload::new(SpoolPayloadSchema::from_wire("test.schema"), bytes)
+        SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeJson, bytes)
     }
 }

@@ -10,8 +10,8 @@ use enforcement::ScopedEnforcementPlanner;
 use exporter::CompressionCodec;
 use parsers::Http1ParserFactory;
 use pipeline::{CapturePipeline, PipelinePolicy, PipelineRunOptions, PipelineRuntimeMetrics};
-use policy::PolicyRuntime;
-use probe_config::{AgentConfig, PolicyConfig};
+use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
+use probe_config::AgentConfig;
 use probe_core::{
     AddressPort, Direction, EnforcementMode, FlowContext, FlowIdentity, ProcessContext,
     ProcessIdentity, Timestamp, TransportProtocol,
@@ -25,7 +25,7 @@ use crate::{
     capture_registry::default_provider_registry,
     check::build_check_report,
     configured_enforcement::build_configured_enforcement_with_backend,
-    configured_policy::{LoadedPolicySource, load_configured_policy, load_policy_source},
+    configured_policy::load_configured_policy,
     connection_enforcement::{self, ConnectionEnforcementRuntime},
     error::AgentError,
     export::{ExportWorker, ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook},
@@ -35,6 +35,7 @@ use crate::{
 };
 
 const INGRESS_RECOVERY_BATCH_SIZE: usize = 1_024;
+const REPLAY_POLICY_SOURCE_BYTES: u64 = 1024 * 1024;
 
 struct RuntimeComposition {
     plan: RuntimePlan,
@@ -381,30 +382,22 @@ async fn replay(command: ReplayCommand) -> Result<(), AgentError> {
 }
 
 fn read_policy(path: &Path) -> Result<PolicyRuntime, AgentError> {
-    let source = load_policy_source("replay", &replay_policy_config(path))?;
-    replay_policy_runtime(source).map_err(AgentError::Policy)
-}
-
-fn replay_policy_runtime(source: LoadedPolicySource) -> Result<PolicyRuntime, policy::PolicyError> {
-    if source.require_declared_hooks {
-        PolicyRuntime::from_source_with_required_hooks(source.manifest, &source.source)
-    } else {
-        PolicyRuntime::from_source(source.manifest, &source.source)
-    }
-}
-
-fn replay_policy_config(path: &Path) -> PolicyConfig {
+    let source = probe_io::read_bounded_regular_file_to_string(path, REPLAY_POLICY_SOURCE_BYTES)
+        .map_err(AgentError::ReplayPolicyFile)?;
     let id = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("replay-policy")
         .to_string();
-    PolicyConfig {
-        id,
-        path: path.to_path_buf(),
-        enabled: true,
-        selector: None,
-    }
+    PolicyRuntime::from_source(
+        PolicyManifest {
+            id,
+            version: "replay".to_string(),
+            hooks: POLICY_HOOKS.to_vec(),
+        },
+        &source,
+    )
+    .map_err(AgentError::Policy)
 }
 
 fn current_timestamp(monotonic_ns: u64) -> Timestamp {
@@ -507,7 +500,7 @@ mod tests {
             &enforcement_path,
             r#"
 id = "managed-apps"
-version = "v1"
+version = "test-version"
 protective_actions = ["alert"]
 "#,
         )?;
@@ -552,7 +545,7 @@ protective_actions = ["alert"]
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("run-invalid-policy")?;
         let config_path = temp.join("agent.toml");
-        let missing_policy_path = temp.join("missing-policy.lua");
+        let missing_policy_path = temp.join("missing-policy.bundle");
         let spool_path = temp.join("spool");
         let missing_feed_path = temp.join("missing-feed.jsonl");
 
@@ -600,7 +593,7 @@ protective_actions = ["alert"]
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("run-unsupported-enforce-before-policy")?;
         let config_path = temp.join("agent.toml");
-        let missing_policy_path = temp.join("missing-policy.lua");
+        let missing_policy_path = temp.join("missing-policy.bundle");
         let spool_path = temp.join("spool");
 
         let mut config = AgentConfig::default();
@@ -654,7 +647,7 @@ protective_actions = ["alert"]
             &enforcement_path,
             r#"
 id = "managed-apps"
-version = "v1"
+version = "test-version"
 protective_actions = ["alert"]
 "#,
         )?;
@@ -744,7 +737,7 @@ protective_actions = ["alert"]
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("run-ingress-recovery")?;
         let config_path = temp.join("agent.toml");
-        let policy_path = temp.join("deny-recovered.lua");
+        let policy_path = temp.join("deny-recovered.bundle");
         let feed_path = temp.join("missing-feed.jsonl");
         let spool_path = temp.join("spool");
         let spool = FjallSpool::open(&spool_path)?;
@@ -768,8 +761,9 @@ protective_actions = ["alert"]
         ))?;
         drop(spool);
 
-        fs::write(
+        write_policy_bundle(
             &policy_path,
+            "deny-recovered",
             r#"
 function on_http_request_headers(_)
   return probe.verdict({
@@ -861,5 +855,21 @@ end
         }
         fs::create_dir_all(&path)?;
         Ok(path)
+    }
+
+    fn write_policy_bundle(path: &Path, id: &str, source: &str) -> Result<(), std::io::Error> {
+        fs::create_dir_all(path)?;
+        fs::write(
+            path.join("manifest.toml"),
+            format!(
+                r#"
+id = "{id}"
+version = "bundle-test"
+hooks = ["on_http_request_headers"]
+"#
+            ),
+        )?;
+        fs::write(path.join("main.lua"), source)?;
+        Ok(())
     }
 }

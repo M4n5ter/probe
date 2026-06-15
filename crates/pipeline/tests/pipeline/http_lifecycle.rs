@@ -16,7 +16,7 @@ fn websocket_handoff_reaches_policy_and_export_spool() -> Result<(), Box<dyn std
     let policy = PolicyRuntime::from_source(
         PolicyManifest {
             id: "websocket-policy".to_string(),
-            version: "v1".to_string(),
+            version: "test-version".to_string(),
             hooks: vec![PolicyHook::WebSocketHandoff],
         },
         r#"

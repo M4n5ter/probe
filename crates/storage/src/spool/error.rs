@@ -34,5 +34,7 @@ pub enum StorageError {
     #[error("invalid stored record: expected at least 12 bytes, got {len}")]
     InvalidStoredRecord { len: usize },
     #[error("invalid stored record schema utf-8: {0}")]
-    InvalidStoredRecordSchema(#[from] std::string::FromUtf8Error),
+    InvalidStoredRecordSchemaUtf8(#[from] std::string::FromUtf8Error),
+    #[error("invalid stored record schema: {0}")]
+    InvalidStoredRecordSchema(#[from] probe_core::SpoolPayloadSchemaError),
 }

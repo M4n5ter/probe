@@ -2,8 +2,6 @@ use probe_core::{EventEnvelope, SpoolPayloadSchema};
 use prost::{Enumeration, Message};
 use thiserror::Error;
 
-pub const BATCH_SCHEMA_VERSION: u32 = 1;
-
 #[derive(Clone, PartialEq, Message)]
 pub struct BatchEnvelope {
     #[prost(string, tag = "1")]
@@ -14,8 +12,6 @@ pub struct BatchEnvelope {
     pub codec: String,
     #[prost(message, repeated, tag = "4")]
     pub events: Vec<EventRecord>,
-    #[prost(uint32, tag = "5")]
-    pub schema_version: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -67,7 +63,6 @@ impl BatchEnvelope {
             agent_id: agent_id.into(),
             codec: codec.into(),
             events: records,
-            schema_version: BATCH_SCHEMA_VERSION,
         })
     }
 
@@ -98,7 +93,6 @@ impl BatchEnvelope {
             agent_id: agent_id.into(),
             codec: codec.into(),
             events: records,
-            schema_version: BATCH_SCHEMA_VERSION,
         })
     }
 
@@ -129,7 +123,7 @@ mod tests {
         TransportProtocol,
     };
 
-    use crate::{BATCH_SCHEMA_VERSION, BatchEnvelope, PayloadFormat};
+    use crate::{BatchEnvelope, PayloadFormat};
 
     #[test]
     fn encodes_and_decodes_batch_envelope() -> Result<(), Box<dyn std::error::Error>> {
@@ -137,7 +131,6 @@ mod tests {
         let encoded = batch.encode_to_vec();
         let decoded = BatchEnvelope::decode_from_slice(&encoded)?;
         assert_eq!(decoded.batch_id, "batch-1");
-        assert_eq!(decoded.schema_version, BATCH_SCHEMA_VERSION);
         assert_eq!(decoded.events.len(), 1);
         assert_eq!(decoded.events[0].payload_format(), PayloadFormat::Json);
         assert_eq!(
@@ -159,7 +152,6 @@ mod tests {
         )?;
 
         assert_eq!(batch.events[0].event_id, event.id.0);
-        assert_eq!(batch.schema_version, BATCH_SCHEMA_VERSION);
         assert_eq!(batch.events[0].sequence, 7);
         assert_eq!(batch.events[0].payload_format(), PayloadFormat::Json);
         assert_eq!(

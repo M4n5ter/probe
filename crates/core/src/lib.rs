@@ -20,7 +20,7 @@ pub use identity::{
     TransportProtocol,
 };
 pub use procfs::{LinuxProcStat, LinuxProcStatParseError, parse_linux_proc_stat};
-pub use schema::SpoolPayloadSchema;
+pub use schema::{SpoolPayloadSchema, SpoolPayloadSchemaError};
 pub use selector::{
     CompiledSelector, ProcessSelector, Selector, SelectorError, SelectorRegistry, SelectorTerm,
     TrafficSelector,

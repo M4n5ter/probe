@@ -76,7 +76,7 @@ pub fn load_configured_policy(
     let enabled = enabled_policies(config);
     match enabled.as_slice() {
         [] => Ok(None),
-        [policy] => read_configured_policy(config, policy).map(Some),
+        [policy] => read_configured_policy(policy).map(Some),
         _ => Err(ConfiguredPolicyError::UnsupportedConfig(
             "live run currently supports at most one enabled policy bundle".to_string(),
         )),
@@ -84,7 +84,6 @@ pub fn load_configured_policy(
 }
 
 fn read_configured_policy(
-    config: &AgentConfig,
     policy: &PolicyConfig,
 ) -> Result<LoadedConfiguredPolicy, ConfiguredPolicyError> {
     let selector = policy
@@ -92,12 +91,8 @@ fn read_configured_policy(
         .as_ref()
         .map(|selector| selector.compile())
         .transpose()?;
-    let source = super::source::load_policy_source(config.config_version.as_str(), policy)?;
-    let runtime = if source.require_declared_hooks {
-        PolicyRuntime::from_source_with_required_hooks(source.manifest, &source.source)?
-    } else {
-        PolicyRuntime::from_source(source.manifest, &source.source)?
-    };
+    let source = super::source::load_policy_source(policy)?;
+    let runtime = PolicyRuntime::from_source_with_required_hooks(source.manifest, &source.source)?;
 
     Ok(LoadedConfiguredPolicy {
         runtime,
@@ -172,7 +167,7 @@ mod tests {
         write_policy_bundle(
             &policy_path,
             "guard",
-            "bundle-v1",
+            "bundle-test",
             &["on_http_request_headers"],
             r#"
 function on_http_request_headers(event)
@@ -185,7 +180,7 @@ end
         let loaded = load_configured_policy(&config)?.expect("configured policy");
 
         assert_eq!(loaded.runtime.manifest().id, "guard");
-        assert_eq!(loaded.runtime.manifest().version, "bundle-v1");
+        assert_eq!(loaded.runtime.manifest().version, "bundle-test");
         assert_eq!(
             loaded.runtime.manifest().hooks,
             vec![PolicyHook::HttpRequestHeaders]
@@ -210,7 +205,7 @@ end
         write_policy_bundle(
             &policy_path,
             "other",
-            "bundle-v1",
+            "bundle-test",
             &["on_http_request_headers"],
             "function on_http_request_headers(_) return {} end",
         )?;
@@ -235,7 +230,7 @@ end
         write_policy_bundle(
             &policy_path,
             "guard",
-            "bundle-v1",
+            "bundle-test",
             &["on_http_request_headers"],
             "function on_sse_event(_) return {} end",
         )?;
@@ -265,7 +260,7 @@ end
         write_policy_bundle(
             &policy_path,
             "guard",
-            "bundle-v1",
+            "bundle-test",
             &["on_http_request_headers"],
             "function on_http_request_headers(_) return {} end",
         )?;
@@ -292,8 +287,17 @@ end
     fn load_configured_policy_rejects_source_above_size_limit()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-too-large")?;
-        let policy_path = temp.join("guard.lua");
-        let file = fs::File::create(&policy_path)?;
+        let policy_path = temp.join("guard.bundle");
+        fs::create_dir_all(&policy_path)?;
+        fs::write(
+            policy_path.join("manifest.toml"),
+            r#"
+id = "guard"
+version = "bundle-test"
+hooks = ["on_http_request_headers"]
+"#,
+        )?;
+        let file = fs::File::create(policy_path.join("main.lua"))?;
         file.set_len(OVERSIZED_TEST_FILE_BYTES)?;
         let config = config_with_policy(&policy_path)?;
 
@@ -313,9 +317,12 @@ end
     fn loaded_configured_policy_selector_scopes_pipeline_execution()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-selector")?;
-        let policy_path = temp.join("guard.lua");
-        fs::write(
+        let policy_path = temp.join("guard.bundle");
+        write_policy_bundle(
             &policy_path,
+            "guard",
+            "bundle-test",
+            &["on_http_request_headers"],
             r#"
 function on_http_request_headers(event)
   return probe.emit_alert("matched " .. event.kind.target)
@@ -348,16 +355,8 @@ end
     fn configured_policy_selection_reports_multiple_enabled_as_unsupported()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-multiple")?;
-        let first_path = temp.join("first.lua");
-        let second_path = temp.join("second.lua");
-        fs::write(
-            &first_path,
-            "function on_http_request_headers(_) return {} end",
-        )?;
-        fs::write(
-            &second_path,
-            "function on_http_request_headers(_) return {} end",
-        )?;
+        let first_path = temp.join("first.bundle");
+        let second_path = temp.join("second.bundle");
         let mut config = config_with_policy(&first_path)?;
         config.policies.push(PolicyConfig {
             id: "second".to_string(),

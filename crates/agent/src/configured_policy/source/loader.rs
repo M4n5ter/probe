@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use policy::{POLICY_HOOKS, PolicyHook, PolicyManifest};
+use policy::{PolicyHook, PolicyManifest};
 use probe_config::PolicyConfig;
 use probe_core::RuntimeMode;
 use serde::Serialize;
@@ -30,20 +30,17 @@ pub struct PolicySourceInspection {
 pub struct LoadedPolicySource {
     pub manifest: PolicyManifest,
     pub source: String,
-    pub require_declared_hooks: bool,
 }
 
 pub fn load_policy_source(
-    config_version: &str,
     policy: &PolicyConfig,
 ) -> Result<LoadedPolicySource, ConfiguredPolicyError> {
-    discover_policy_source(&policy.path)
-        .and_then(|location| location.load(config_version, policy))
+    read_policy_bundle_directory(&policy.path, policy.id.as_str())
         .map_err(|error| error.into_configured_error(&policy.path))
 }
 
 pub fn inspect_policy_source(path: &Path, expected_id: &str) -> PolicySourceInspection {
-    match discover_policy_source(path).and_then(|location| location.inspect(expected_id)) {
+    match inspect_policy_bundle_directory(path, expected_id) {
         Ok(()) => PolicySourceInspection {
             mode: RuntimeMode::Available,
             reason: None,
@@ -55,90 +52,36 @@ pub fn inspect_policy_source(path: &Path, expected_id: &str) -> PolicySourceInsp
     }
 }
 
-enum PolicySourceLocation {
-    LegacyFile { path: PathBuf },
-    BundleDirectory { root: PathBuf },
-}
-
-impl PolicySourceLocation {
-    fn load(
-        self,
-        config_version: &str,
-        policy: &PolicyConfig,
-    ) -> Result<LoadedPolicySource, PolicySourceValidationError> {
-        match self {
-            Self::LegacyFile { path } => read_legacy_policy_file(&path, config_version, policy),
-            Self::BundleDirectory { root } => {
-                read_policy_bundle_directory(&root, policy.id.as_str())
-            }
-        }
-    }
-
-    fn inspect(self, expected_id: &str) -> Result<(), PolicySourceValidationError> {
-        match self {
-            Self::LegacyFile { path } => {
-                check_regular_policy_file(&path, MAX_POLICY_SOURCE_BYTES, "source")
-            }
-            Self::BundleDirectory { root } => {
-                let manifest = read_policy_manifest(&manifest_path(&root))?;
-                validate_policy_manifest(manifest, expected_id)?;
-                check_regular_policy_file(&main_path(&root), MAX_POLICY_SOURCE_BYTES, "source")
-            }
-        }
-    }
-}
-
-fn discover_policy_source(
-    path: &Path,
-) -> Result<PolicySourceLocation, PolicySourceValidationError> {
+fn ensure_policy_bundle_directory(path: &Path) -> Result<(), PolicySourceValidationError> {
     let metadata = symlink_safe_metadata(path)?;
-    if metadata.is_file() {
-        return Ok(PolicySourceLocation::LegacyFile {
+    if !metadata.is_dir() {
+        return Err(PolicySourceValidationError::UnsupportedPathKind {
             path: path.to_path_buf(),
         });
     }
-    if metadata.is_dir() {
-        return Ok(PolicySourceLocation::BundleDirectory {
-            root: path.to_path_buf(),
-        });
-    }
-
-    Err(PolicySourceValidationError::UnsupportedPathKind {
-        path: path.to_path_buf(),
-    })
-}
-
-fn read_legacy_policy_file(
-    path: &Path,
-    config_version: &str,
-    policy: &PolicyConfig,
-) -> Result<LoadedPolicySource, PolicySourceValidationError> {
-    let source = read_regular_policy_file(path, MAX_POLICY_SOURCE_BYTES, "source")?;
-
-    Ok(LoadedPolicySource {
-        manifest: PolicyManifest {
-            id: policy.id.clone(),
-            version: config_version.to_string(),
-            hooks: POLICY_HOOKS.to_vec(),
-        },
-        source,
-        require_declared_hooks: false,
-    })
+    Ok(())
 }
 
 fn read_policy_bundle_directory(
     root: &Path,
     expected_id: &str,
 ) -> Result<LoadedPolicySource, PolicySourceValidationError> {
+    ensure_policy_bundle_directory(root)?;
     let manifest = read_policy_manifest(&manifest_path(root))
         .and_then(|manifest| validate_policy_manifest(manifest, expected_id))?;
     let source = read_regular_policy_file(&main_path(root), MAX_POLICY_SOURCE_BYTES, "source")?;
 
-    Ok(LoadedPolicySource {
-        manifest,
-        source,
-        require_declared_hooks: true,
-    })
+    Ok(LoadedPolicySource { manifest, source })
+}
+
+fn inspect_policy_bundle_directory(
+    root: &Path,
+    expected_id: &str,
+) -> Result<(), PolicySourceValidationError> {
+    ensure_policy_bundle_directory(root)?;
+    let manifest = read_policy_manifest(&manifest_path(root))?;
+    validate_policy_manifest(manifest, expected_id)?;
+    check_regular_policy_file(&main_path(root), MAX_POLICY_SOURCE_BYTES, "source")
 }
 
 fn read_policy_manifest(path: &Path) -> Result<PolicyManifest, PolicySourceValidationError> {
@@ -372,7 +315,7 @@ impl PolicySourceValidationError {
                 )
             }
             Self::UnsupportedPathKind { path } => format!(
-                "policy source path {} must be a legacy Lua file or bundle directory",
+                "policy source path {} must be a policy bundle directory",
                 path.display()
             ),
             Self::TooLarge {

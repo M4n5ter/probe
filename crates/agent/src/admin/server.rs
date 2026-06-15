@@ -485,7 +485,7 @@ mod tests {
         let spool_path = temp.join("spool");
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
         spool.append_export(SpoolPayload::new(
-            SpoolPayloadSchema::from_wire("test.schema"),
+            SpoolPayloadSchema::EventEnvelopeJson,
             b"one",
         ))?;
         let plan = Arc::new(runtime_plan(spool_path)?);
@@ -581,7 +581,7 @@ mod tests {
         let manifest_path = temp.join("enforcement.toml");
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
-            version: "v1".to_string(),
+            version: "test-version".to_string(),
             selector: None,
             protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
         };

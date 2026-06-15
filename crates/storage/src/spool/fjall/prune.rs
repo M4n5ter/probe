@@ -339,6 +339,6 @@ mod tests {
     }
 
     fn test_payload(bytes: &[u8]) -> SpoolPayload {
-        SpoolPayload::new(SpoolPayloadSchema::from_wire("test.schema"), bytes)
+        SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeJson, bytes)
     }
 }

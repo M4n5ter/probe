@@ -96,30 +96,31 @@ mod tests {
     }
 
     #[test]
-    fn initialization_probe_rejects_older_spool_marker() -> Result<(), Box<dyn std::error::Error>> {
+    fn initialization_probe_rejects_invalid_spool_marker() -> Result<(), Box<dyn std::error::Error>>
+    {
         let temp = tempdir()?;
         fs::write(
             temp.path().join(SPOOL_MARKER_FILE),
-            b"sssa-probe-spool-v1\n",
+            b"not-an-sssa-probe-spool\n",
         )?;
 
-        let error = FjallSpool::probe(temp.path()).expect_err("old marker must fail fast");
+        let error = FjallSpool::probe(temp.path()).expect_err("invalid marker must fail fast");
 
         assert!(matches!(error, StorageError::InvalidSpoolMarker { .. }));
         Ok(())
     }
 
     #[test]
-    fn open_rejects_older_spool_marker_without_initializing()
+    fn open_rejects_invalid_spool_marker_without_initializing()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         fs::write(
             temp.path().join(SPOOL_MARKER_FILE),
-            b"sssa-probe-spool-v1\n",
+            b"not-an-sssa-probe-spool\n",
         )?;
 
         let error = match FjallSpool::open(temp.path()) {
-            Ok(_) => panic!("old marker must fail before DB open"),
+            Ok(_) => panic!("invalid marker must fail before DB open"),
             Err(error) => error,
         };
 
@@ -165,6 +166,6 @@ mod tests {
     }
 
     fn test_payload(bytes: &[u8]) -> SpoolPayload {
-        SpoolPayload::new(SpoolPayloadSchema::from_wire("test.schema"), bytes)
+        SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeJson, bytes)
     }
 }

@@ -307,7 +307,7 @@ mod tests {
         let manifest_path = temp.join("enforcement.toml");
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
-            version: "v1".to_string(),
+            version: "test-version".to_string(),
             selector: Some(Selector::default()),
             protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
         };
@@ -332,7 +332,7 @@ mod tests {
         };
         assert!(reason.contains("status does not execute enforcement actions"));
         assert_eq!(manifest_status.id, "managed-apps");
-        assert_eq!(manifest_status.version, "v1");
+        assert_eq!(manifest_status.version, "test-version");
         assert!(manifest_status.selector_configured);
         assert_eq!(
             manifest_status.protective_actions.actions(),
@@ -378,7 +378,7 @@ mod tests {
             &manifest_path,
             r#"
 id = "managed-apps"
-version = "v1"
+version = "test-version"
 protective_actions = ["alert"]
 "#,
         )?;
@@ -452,7 +452,7 @@ protective_actions = ["alert"]
         let plan = runtime_plan_from_config(config, Vec::new())?;
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
-            version: "remote-v1".to_string(),
+            version: "remote-test".to_string(),
             selector: None,
             protective_actions: ProtectiveActionProfile::new([Action::Reset])?,
         };
@@ -474,7 +474,7 @@ protective_actions = ["alert"]
         };
         assert_eq!(actual, &endpoint);
         assert_eq!(manifest.id, "managed-apps");
-        assert_eq!(manifest.version, "remote-v1");
+        assert_eq!(manifest.version, "remote-test");
         assert_eq!(manifest.protective_actions.actions(), &[Action::Reset]);
         let value = serde_json::to_value(&status)?;
         assert_eq!(value["policy"]["source"]["mode"], json!("loaded"));

@@ -400,7 +400,7 @@ mod tests {
             return Err("missing verdict".into());
         };
 
-        assert_eq!(verdict.reason, "matched /v1/chat");
+        assert_eq!(verdict.reason, "matched /chat");
         assert_eq!(verdict.confidence, 90);
         Ok(())
     }
@@ -726,7 +726,7 @@ mod tests {
                 direction: Direction::Outbound,
                 stream_sequence: 1,
                 method: Some("GET".to_string()),
-                target: Some("/v1/chat".to_string()),
+                target: Some("/chat".to_string()),
                 status: None,
                 reason: None,
                 version: "HTTP/1.1".to_string(),

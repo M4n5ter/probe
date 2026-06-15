@@ -255,7 +255,6 @@ mod tests {
                     payload_schema: "test.schema".to_string(),
                 })
                 .collect(),
-            schema_version: proto::BATCH_SCHEMA_VERSION,
         }
     }
 }

@@ -218,11 +218,8 @@ mod tests {
     #[tokio::test]
     async fn check_report_loads_enabled_policy_bundle() -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-valid-policy")?;
-        let policy_path = temp.join("guard.lua");
-        fs::write(
-            &policy_path,
-            "function on_http_request_headers(_) return {} end",
-        )?;
+        let policy_path =
+            write_policy_bundle(&temp, "function on_http_request_headers(_) return {} end")?;
         let plan = runtime_plan(config_with_policy(&policy_path)?)?;
 
         let report = build_check_report(plan, None).await?;
@@ -230,7 +227,7 @@ mod tests {
         assert_eq!(report.policy.mode, PolicyCheckMode::Loaded);
         let active = report.policy.active.as_ref().expect("loaded policy");
         assert_eq!(active.id, "guard");
-        assert_eq!(active.version, "cfg-test");
+        assert_eq!(active.version, "bundle-test");
         assert_eq!(active.path, policy_path);
         assert!(!active.selector_configured);
         assert!(
@@ -255,15 +252,12 @@ mod tests {
     async fn check_report_loads_enforcement_policy_manifest()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-enforcement-policy")?;
-        let policy_path = temp.join("guard.lua");
-        fs::write(
-            &policy_path,
-            "function on_http_request_headers(_) return {} end",
-        )?;
+        let policy_path =
+            write_policy_bundle(&temp, "function on_http_request_headers(_) return {} end")?;
         let enforcement_path = temp.join("enforcement.toml");
         let manifest = probe_config::EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
-            version: "v1".to_string(),
+            version: "test-version".to_string(),
             selector: Some(Selector::default()),
             protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
         };
@@ -290,7 +284,7 @@ mod tests {
             .as_ref()
             .expect("enforcement policy manifest should load");
         assert_eq!(active.id, "managed-apps");
-        assert_eq!(active.version, "v1");
+        assert_eq!(active.version, "test-version");
         assert_eq!(
             active.source,
             LoadedEnforcementPolicySourceSnapshot::Local {
@@ -307,17 +301,14 @@ mod tests {
     async fn check_report_rejects_invalid_enforcement_policy_manifest()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-invalid-enforcement-policy")?;
-        let policy_path = temp.join("guard.lua");
-        fs::write(
-            &policy_path,
-            "function on_http_request_headers(_) return {} end",
-        )?;
+        let policy_path =
+            write_policy_bundle(&temp, "function on_http_request_headers(_) return {} end")?;
         let enforcement_path = temp.join("enforcement.toml");
         fs::write(
             &enforcement_path,
             r#"
 id = "managed-apps"
-version = "v1"
+version = "test-version"
 protective_actions = ["alert"]
 "#,
         )?;
@@ -345,11 +336,8 @@ protective_actions = ["alert"]
     async fn check_report_rejects_missing_enforcement_policy_directory_manifest()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-missing-enforcement-manifest")?;
-        let policy_path = temp.join("guard.lua");
-        fs::write(
-            &policy_path,
-            "function on_http_request_headers(_) return {} end",
-        )?;
+        let policy_path =
+            write_policy_bundle(&temp, "function on_http_request_headers(_) return {} end")?;
         let mut config = config_with_policy(&policy_path)?;
         config.enforcement.policy.source = probe_config::EnforcementPolicySourceConfig::Directory {
             path: temp.join("enforcement.d"),
@@ -370,14 +358,11 @@ protective_actions = ["alert"]
     async fn check_report_loads_remote_enforcement_policy_source()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-remote-enforcement-policy")?;
-        let policy_path = temp.join("guard.lua");
-        fs::write(
-            &policy_path,
-            "function on_http_request_headers(_) return {} end",
-        )?;
+        let policy_path =
+            write_policy_bundle(&temp, "function on_http_request_headers(_) return {} end")?;
         let manifest = probe_config::EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
-            version: "remote-v1".to_string(),
+            version: "remote-test".to_string(),
             selector: None,
             protective_actions: ProtectiveActionProfile::new([Action::Reset])?,
         };
@@ -408,7 +393,7 @@ protective_actions = ["alert"]
             .as_ref()
             .expect("remote enforcement manifest should load");
         assert_eq!(active.id, "managed-apps");
-        assert_eq!(active.version, "remote-v1");
+        assert_eq!(active.version, "remote-test");
         assert_eq!(
             active.source,
             LoadedEnforcementPolicySourceSnapshot::Remote {
@@ -432,11 +417,8 @@ protective_actions = ["alert"]
     #[tokio::test]
     async fn check_report_has_stable_json_shape() -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-json-policy")?;
-        let policy_path = temp.join("guard.lua");
-        fs::write(
-            &policy_path,
-            "function on_http_request_headers(_) return {} end",
-        )?;
+        let policy_path =
+            write_policy_bundle(&temp, "function on_http_request_headers(_) return {} end")?;
         let report =
             build_check_report(runtime_plan(config_with_policy(&policy_path)?)?, None).await?;
 
@@ -466,7 +448,7 @@ protective_actions = ["alert"]
         assert_eq!(value["policy"]["configured_count"], json!(1));
         assert_eq!(value["policy"]["enabled_count"], json!(1));
         assert_eq!(value["policy"]["active"]["id"], json!("guard"));
-        assert_eq!(value["policy"]["active"]["version"], json!("cfg-test"));
+        assert_eq!(value["policy"]["active"]["version"], json!("bundle-test"));
         assert_eq!(
             value["policy"]["active"]["selector_configured"],
             json!(false)
@@ -504,8 +486,7 @@ protective_actions = ["alert"]
     async fn check_report_rejects_invalid_policy_source() -> Result<(), Box<dyn std::error::Error>>
     {
         let temp = test_dir("check-invalid-policy")?;
-        let policy_path = temp.join("guard.lua");
-        fs::write(&policy_path, "function on_http_request_headers(")?;
+        let policy_path = write_policy_bundle(&temp, "function on_http_request_headers(")?;
         let plan = runtime_plan(config_with_policy(&policy_path)?)?;
 
         let error = build_check_report(plan, None)
@@ -524,7 +505,7 @@ protective_actions = ["alert"]
     async fn check_report_rejects_enforce_without_backend_before_loading_policy()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-enforce-without-backend")?;
-        let policy_path = temp.join("missing-policy.lua");
+        let policy_path = temp.join("missing-policy.bundle");
         let mut config = config_with_policy(&policy_path)?;
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -612,6 +593,24 @@ path = "/tmp/collector-ca.pem"
 "#,
             path.display()
         ))
+    }
+
+    fn write_policy_bundle(
+        temp: &Path,
+        source: &str,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let policy_path = temp.join("guard.bundle");
+        fs::create_dir_all(&policy_path)?;
+        fs::write(
+            policy_path.join("manifest.toml"),
+            r#"
+id = "guard"
+version = "bundle-test"
+hooks = ["on_http_request_headers"]
+"#,
+        )?;
+        fs::write(policy_path.join("main.lua"), source)?;
+        Ok(policy_path)
     }
 
     fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {

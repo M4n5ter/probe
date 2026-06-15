@@ -117,7 +117,7 @@ fn contiguous_cursor_from_event_ids(
 
 #[cfg(test)]
 mod tests {
-    use proto::{BATCH_SCHEMA_VERSION, EventRecord, PayloadFormat};
+    use proto::{EventRecord, PayloadFormat};
 
     use super::*;
 
@@ -151,7 +151,6 @@ mod tests {
                     payload_schema: "test.schema".to_string(),
                 })
                 .collect(),
-            schema_version: BATCH_SCHEMA_VERSION,
         }
     }
 }

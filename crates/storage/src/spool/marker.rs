@@ -3,7 +3,7 @@ use std::{fs, io::ErrorKind, path::Path};
 use super::StorageError;
 
 pub(super) const SPOOL_MARKER_FILE: &str = "sssa-spool-format";
-pub(super) const SPOOL_MARKER_CONTENT: &[u8] = b"sssa-probe-spool-v2\n";
+pub(super) const SPOOL_MARKER_CONTENT: &[u8] = b"sssa-probe-spool\n";
 pub(super) const SPOOL_READY_FILE: &str = "sssa-spool-ready";
 const SPOOL_READY_CONTENT: &[u8] = b"ready\n";
 

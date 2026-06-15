@@ -13,6 +13,8 @@ pub(crate) enum AgentError {
         path: String,
         source: std::io::Error,
     },
+    #[error("invalid replay policy file: {0}")]
+    ReplayPolicyFile(#[from] probe_io::BoundedFileError),
     #[error("config error: {0}")]
     Config(#[from] probe_config::ConfigError),
     #[error("runtime error: {0}")]

@@ -338,7 +338,7 @@ mod tests {
     {
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
-            version: "v1".to_string(),
+            version: "test-version".to_string(),
             selector: None,
             protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
         };

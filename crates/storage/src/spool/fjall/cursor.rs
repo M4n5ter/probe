@@ -214,7 +214,10 @@ mod tests {
         let two = spool.append_export(test_payload(b"two"))?;
         assert_eq!(one.sequence, 1);
         assert_eq!(two.sequence, 2);
-        assert_eq!(one.payload.schema_wire(), "test.schema");
+        assert_eq!(
+            one.payload.schema_wire(),
+            SpoolPayloadSchema::EVENT_ENVELOPE_JSON
+        );
         assert_eq!(one.payload.bytes(), b"one");
 
         let first = spool.read_export_batch("primary", 10)?;
@@ -408,6 +411,6 @@ mod tests {
     }
 
     fn test_payload(bytes: &[u8]) -> SpoolPayload {
-        SpoolPayload::new(SpoolPayloadSchema::from_wire("test.schema"), bytes)
+        SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeJson, bytes)
     }
 }

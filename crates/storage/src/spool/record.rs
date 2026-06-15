@@ -78,10 +78,11 @@ pub(super) fn decode_spool_record(bytes: &[u8]) -> Result<SpoolRecord, StorageEr
         return Err(StorageError::InvalidStoredRecord { len: bytes.len() });
     }
     let schema = String::from_utf8(bytes[12..expected_min_len].to_vec())?;
+    let schema = SpoolPayloadSchema::from_wire(schema)?;
     Ok(SpoolRecord {
         stored_at_unix_ns: u64::from_be_bytes(stored_at),
         payload: SpoolPayload {
-            schema: SpoolPayloadSchema::from_wire(schema),
+            schema,
             bytes: Bytes::copy_from_slice(&bytes[expected_min_len..]),
         },
     })
@@ -115,6 +116,21 @@ mod tests {
             SpoolPayloadSchema::EVENT_ENVELOPE_JSON
         );
         assert_eq!(record.payload.bytes(), b"payload");
+        Ok(())
+    }
+
+    #[test]
+    fn stored_record_rejects_unknown_schema() -> Result<(), Box<dyn std::error::Error>> {
+        let mut encoded = Vec::new();
+        let schema = b"test.schema";
+        encoded.extend_from_slice(&42_u64.to_be_bytes());
+        encoded.extend_from_slice(&(schema.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(schema);
+        encoded.extend_from_slice(b"payload");
+
+        let error = decode_spool_record(&encoded).expect_err("unknown schema must fail");
+
+        assert!(matches!(error, StorageError::InvalidStoredRecordSchema(_)));
         Ok(())
     }
 }

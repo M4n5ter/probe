@@ -1038,7 +1038,7 @@ mod tests {
         let mut parser = Http1Parser::default();
         let events = parser.ingest(
             Direction::Outbound,
-            b"POST /v1/chat HTTP/1.1\r\nHost: example.test\r\nContent-Length: 5\r\n\r\nhello",
+            b"POST /chat HTTP/1.1\r\nHost: example.test\r\nContent-Length: 5\r\n\r\nhello",
         );
 
         assert!(matches!(

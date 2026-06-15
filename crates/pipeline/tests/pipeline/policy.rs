@@ -18,7 +18,7 @@ fn policy_verdicts_are_evaluated_by_scoped_enforcement_planner()
     let policy = PolicyRuntime::from_source(
         PolicyManifest {
             id: "deny-policy".to_string(),
-            version: "v1".to_string(),
+            version: "test-version".to_string(),
             hooks: vec![PolicyHook::HttpRequestHeaders],
         },
         r#"
@@ -95,7 +95,7 @@ fn policy_selector_scopes_policy_execution() -> Result<(), Box<dyn std::error::E
     let policy = PolicyRuntime::from_source(
         PolicyManifest {
             id: "scoped-policy".to_string(),
-            version: "v1".to_string(),
+            version: "test-version".to_string(),
             hooks: vec![PolicyHook::HttpRequestHeaders],
         },
         r#"
