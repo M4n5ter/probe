@@ -7,7 +7,6 @@ fn validation_rejects_invalid_tls_plaintext_material_refs() -> Result<(), Box<dy
         r#"
 [tls.plaintext]
 enabled = true
-provider = "keylog"
 key_log_refs = ["missing"]
 "#,
     )?;
@@ -24,7 +23,6 @@ key_log_refs = ["missing"]
         r#"
 [tls.plaintext]
 enabled = true
-provider = "keylog"
 key_log_refs = ["session-secret"]
 
 [[tls.materials]]
@@ -42,7 +40,6 @@ path = "/tmp/session-secret.jsonl"
         r#"
 [tls.plaintext]
 enabled = true
-provider = "keylog"
 session_secret_refs = [""]
 "#,
     )?;
@@ -55,11 +52,10 @@ session_secret_refs = [""]
             .contains("TLS plaintext material reference cannot be empty")
     );
 
-    let libssl_ref = AgentConfig::from_toml_str(
+    let valid_refs = AgentConfig::from_toml_str(
         r#"
 [tls.plaintext]
 enabled = true
-provider = "libssl_uprobe"
 key_log_refs = ["ssl-keys"]
 
 [[tls.materials]]
@@ -68,16 +64,9 @@ kind = "key_log_file"
 path = "/tmp/sslkeylog.log"
 "#,
     )?;
-    let libssl_ref_error = libssl_ref
-        .validate_basic()
-        .expect_err("libssl uprobes must not accept key log refs");
-    assert!(
-        libssl_ref_error
-            .to_string()
-            .contains("libssl_uprobe plaintext provider does not use key log materials")
-    );
+    valid_refs.validate_basic()?;
 
-    let disabled_libssl_ref = AgentConfig::from_toml_str(
+    let disabled_refs = AgentConfig::from_toml_str(
         r#"
 [tls.plaintext]
 key_log_refs = ["ssl-keys"]
@@ -88,14 +77,7 @@ kind = "key_log_file"
 path = "/tmp/sslkeylog.log"
 "#,
     )?;
-    let disabled_libssl_ref_error = disabled_libssl_ref
-        .validate_basic()
-        .expect_err("libssl refs must be rejected even when plaintext is disabled");
-    assert!(
-        disabled_libssl_ref_error
-            .to_string()
-            .contains("libssl_uprobe plaintext provider does not use key log materials")
-    );
+    disabled_refs.validate_basic()?;
     Ok(())
 }
 
@@ -105,7 +87,6 @@ fn validation_rejects_invalid_libssl_uprobe_object_path_config()
     let empty_object_path = AgentConfig::from_toml_str(
         r#"
 [tls.plaintext]
-provider = "libssl_uprobe"
 libssl_uprobe_object_path = ""
 "#,
     )?;
@@ -118,21 +99,6 @@ libssl_uprobe_object_path = ""
             .contains("libssl uprobe eBPF object path cannot be empty")
     );
 
-    let keylog_object_path = AgentConfig::from_toml_str(
-        r#"
-[tls.plaintext]
-provider = "keylog"
-libssl_uprobe_object_path = "/opt/sssa/ebpf-tls-plaintext.bpf.o"
-"#,
-    )?;
-    let error = keylog_object_path
-        .validate_basic()
-        .expect_err("libssl uprobe object path belongs to the libssl provider");
-    assert!(
-        error
-            .to_string()
-            .contains("only valid when tls.plaintext.provider = \"libssl_uprobe\"")
-    );
     Ok(())
 }
 

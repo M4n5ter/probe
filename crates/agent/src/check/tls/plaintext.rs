@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use capture::TlsKeyLogSummary;
-use probe_config::{TlsMaterialKind, TlsPlaintextProvider};
+use probe_config::TlsMaterialKind;
 use runtime::{RuntimePlan, TlsPlaintextMaterialPlan};
 use serde::Serialize;
 use thiserror::Error;
@@ -15,10 +15,19 @@ pub(crate) struct TlsCheckSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct TlsPlaintextCheckSnapshot {
+    instrumentation: TlsPlaintextInstrumentationCheckSnapshot,
+    decrypt_hints: TlsDecryptHintCheckSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TlsPlaintextInstrumentationCheckSnapshot {
     enabled: bool,
-    provider: TlsPlaintextProvider,
     libssl_uprobe_object_path: Option<PathBuf>,
     reconcile_interval_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TlsDecryptHintCheckSnapshot {
     key_logs: Vec<TlsPlaintextMaterialCheckSnapshot>,
     session_secrets: Vec<TlsPlaintextMaterialCheckSnapshot>,
 }
@@ -35,7 +44,7 @@ struct TlsPlaintextMaterialCheckSnapshot {
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum TlsPlaintextMaterialContentCheck {
     SslKeyLog { summary: TlsKeyLogSummary },
-    ReservedSessionSecret { bytes: u64 },
+    SessionSecretFile { bytes: u64 },
 }
 
 #[derive(Debug, Error)]
@@ -58,17 +67,22 @@ fn check_tls_with_file_store(
     file_store: &impl TlsMaterialFileStore,
 ) -> Result<TlsCheckSnapshot, TlsCheckError> {
     let plaintext = &plan.tls.plaintext;
+    let instrumentation = &plaintext.instrumentation;
+    let decrypt_hints = &plaintext.decrypt_hints;
     Ok(TlsCheckSnapshot {
         plaintext: TlsPlaintextCheckSnapshot {
-            enabled: plaintext.enabled,
-            provider: plaintext.provider,
-            libssl_uprobe_object_path: plaintext.libssl_uprobe_object_path.clone(),
-            reconcile_interval_ms: plaintext.reconcile_interval_ms,
-            key_logs: check_key_log_materials(&plaintext.key_logs, file_store)?,
-            session_secrets: check_session_secret_materials(
-                &plaintext.session_secrets,
-                file_store,
-            )?,
+            instrumentation: TlsPlaintextInstrumentationCheckSnapshot {
+                enabled: instrumentation.enabled,
+                libssl_uprobe_object_path: instrumentation.libssl_uprobe_object_path.clone(),
+                reconcile_interval_ms: instrumentation.reconcile_interval_ms,
+            },
+            decrypt_hints: TlsDecryptHintCheckSnapshot {
+                key_logs: check_key_log_materials(&decrypt_hints.key_logs, file_store)?,
+                session_secrets: check_session_secret_materials(
+                    &decrypt_hints.session_secrets,
+                    file_store,
+                )?,
+            },
         },
     })
 }
@@ -105,7 +119,7 @@ fn check_session_secret_materials(
                 id: material.id.clone(),
                 kind: material.kind,
                 path: material.path.clone(),
-                check: TlsPlaintextMaterialContentCheck::ReservedSessionSecret {
+                check: TlsPlaintextMaterialContentCheck::SessionSecretFile {
                     bytes: bytes.len() as u64,
                 },
             })
@@ -138,9 +152,7 @@ fn tls_plaintext_material_error(
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use probe_config::{
-        AgentConfig, CaptureBackend, TlsMaterialConfig, TlsMaterialKind, TlsPlaintextProvider,
-    };
+    use probe_config::{AgentConfig, CaptureBackend, TlsMaterialConfig, TlsMaterialKind};
     use probe_core::{CapabilityKind, CapabilityState};
     use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
     use serde_json::json;
@@ -160,7 +172,6 @@ mod tests {
         )?;
         fs::write(&session_secret_path, b"reserved-session-secret")?;
         let mut config = AgentConfig::default();
-        config.tls.plaintext.provider = TlsPlaintextProvider::Keylog;
         config.tls.plaintext.key_log_refs = vec!["ssl-keys".to_string()];
         config.tls.plaintext.session_secret_refs = vec!["session-secrets".to_string()];
         config.tls.materials.extend([
@@ -180,30 +191,33 @@ mod tests {
         let report = build_check_report(plan, None).await?;
 
         let value = serde_json::to_value(report)?;
-        assert_eq!(value["tls"]["plaintext"]["enabled"], json!(false));
-        assert_eq!(value["tls"]["plaintext"]["provider"], json!("keylog"));
         assert_eq!(
-            value["tls"]["plaintext"]["key_logs"][0]["id"],
+            value["tls"]["plaintext"]["instrumentation"]["enabled"],
+            json!(false)
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["key_logs"][0]["id"],
             json!("ssl-keys")
         );
         assert_eq!(
-            value["tls"]["plaintext"]["key_logs"][0]["check"]["kind"],
+            value["tls"]["plaintext"]["decrypt_hints"]["key_logs"][0]["check"]["kind"],
             json!("ssl_key_log")
         );
         assert_eq!(
-            value["tls"]["plaintext"]["key_logs"][0]["check"]["summary"]["entries"],
+            value["tls"]["plaintext"]["decrypt_hints"]["key_logs"][0]["check"]["summary"]["entries"],
             json!(1)
         );
         assert_eq!(
-            value["tls"]["plaintext"]["key_logs"][0]["check"]["summary"]["labels"][0]["label"],
+            value["tls"]["plaintext"]["decrypt_hints"]["key_logs"][0]["check"]["summary"]["labels"]
+                [0]["label"],
             json!("CLIENT_RANDOM")
         );
         assert_eq!(
-            value["tls"]["plaintext"]["session_secrets"][0]["check"]["kind"],
-            json!("reserved_session_secret")
+            value["tls"]["plaintext"]["decrypt_hints"]["session_secrets"][0]["check"]["kind"],
+            json!("session_secret_file")
         );
         assert_eq!(
-            value["tls"]["plaintext"]["session_secrets"][0]["check"]["bytes"],
+            value["tls"]["plaintext"]["decrypt_hints"]["session_secrets"][0]["check"]["bytes"],
             json!(23)
         );
         fs::remove_dir_all(temp)?;
@@ -223,11 +237,11 @@ mod tests {
 
         let value = serde_json::to_value(report)?;
         assert_eq!(
-            value["tls"]["plaintext"]["libssl_uprobe_object_path"],
+            value["tls"]["plaintext"]["instrumentation"]["libssl_uprobe_object_path"],
             json!("/opt/sssa/ebpf-tls-plaintext.bpf.o")
         );
         assert_eq!(
-            value["tls"]["plaintext"]["reconcile_interval_ms"],
+            value["tls"]["plaintext"]["instrumentation"]["reconcile_interval_ms"],
             json!(2500)
         );
         Ok(())
@@ -243,7 +257,6 @@ mod tests {
             b"CLIENT_RANDOM 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f not-a-secret\n",
         )?;
         let mut config = AgentConfig::default();
-        config.tls.plaintext.provider = TlsPlaintextProvider::Keylog;
         config.tls.plaintext.key_log_refs = vec!["ssl-keys".to_string()];
         config.tls.materials.push(TlsMaterialConfig {
             id: Some("ssl-keys".to_string()),

@@ -82,7 +82,7 @@ selection = "plaintext_feed"
         .expect_err("external feed must set a path");
     assert!(error.to_string().contains("capture.plaintext_feed.path"));
 
-    let conflicting_tls_provider = AgentConfig::from_toml_str(
+    let conflicting_tls_instrumentation = AgentConfig::from_toml_str(
         r#"
 [capture]
 selection = "plaintext_feed"
@@ -92,10 +92,9 @@ path = "/tmp/feed.jsonl"
 
 [tls.plaintext]
 enabled = true
-provider = "libssl_uprobe"
 "#,
     )?;
-    let error = conflicting_tls_provider
+    let error = conflicting_tls_instrumentation
         .validate_basic()
         .expect_err("plaintext feed selection must not also enable TLS instrumentation");
     assert!(error.to_string().contains("tls.plaintext.enabled"));

@@ -14,7 +14,8 @@ use crate::{
     error::AgentError,
     plaintext_feed::load_plaintext_feed_provider,
     tls_plaintext::{
-        TlsPlaintextProviderBuild, TlsPlaintextRuntimeState, build_tls_plaintext_provider,
+        TlsPlaintextInstrumentationBuild, TlsPlaintextRuntimeState,
+        build_tls_plaintext_instrumentation,
     },
 };
 
@@ -58,20 +59,20 @@ fn with_tls_plaintext_provider(
     primary: Box<dyn CaptureProvider>,
     tls_plaintext_runtime: Option<&TlsPlaintextRuntimeState>,
 ) -> Result<Box<dyn CaptureProvider>, AgentError> {
-    let plaintext_build = build_tls_plaintext_provider(plan, tls_plaintext_runtime)?;
+    let instrumentation_build = build_tls_plaintext_instrumentation(plan, tls_plaintext_runtime)?;
     if let Some(runtime) = tls_plaintext_runtime {
-        runtime.record_provider_build(&plaintext_build);
+        runtime.record_instrumentation_build(&instrumentation_build);
     }
-    match plaintext_build {
-        TlsPlaintextProviderBuild::NotConfigured => Ok(primary),
-        TlsPlaintextProviderBuild::Enabled(plaintext) => {
+    match instrumentation_build {
+        TlsPlaintextInstrumentationBuild::NotConfigured => Ok(primary),
+        TlsPlaintextInstrumentationBuild::Enabled(plaintext) => {
             let plaintext = match tls_plaintext_runtime {
                 Some(runtime) => {
                     let runtime = runtime.clone();
                     MultiplexedProvider::best_effort_with_disable_handler(
                         plaintext,
                         move |reason| {
-                            runtime.record_provider_disabled(reason);
+                            runtime.record_instrumentation_disabled(reason);
                         },
                     )
                 }
@@ -82,7 +83,7 @@ fn with_tls_plaintext_provider(
                 plaintext,
             ])))
         }
-        TlsPlaintextProviderBuild::Disabled { .. } => Ok(primary),
+        TlsPlaintextInstrumentationBuild::Disabled { .. } => Ok(primary),
     }
 }
 

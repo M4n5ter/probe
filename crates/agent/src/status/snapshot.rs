@@ -320,7 +320,7 @@ fn capabilities_with_runtime(
                     CapabilityState::unavailable(
                         CapabilityKind::LibsslUprobe,
                         runtime.reason.clone().unwrap_or_else(|| {
-                            "TLS plaintext runtime provider is disabled".to_string()
+                            "TLS plaintext instrumentation is disabled".to_string()
                         }),
                     )
                 } else {
@@ -477,7 +477,7 @@ mod tests {
             json!("not_configured")
         );
         assert_eq!(
-            value["tls"]["plaintext"]["capability"]["kind"],
+            value["tls"]["plaintext"]["instrumentation"]["capability"]["kind"],
             json!("not_required")
         );
         assert_eq!(
@@ -660,7 +660,6 @@ mod tests {
         let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
         config.capture.selection = CaptureSelection::Libpcap;
         config.tls.plaintext.enabled = true;
-        config.tls.plaintext.provider = probe_config::TlsPlaintextProvider::LibsslUprobe;
         config.tls.plaintext.libssl_uprobe_object_path =
             Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
         config.tls.plaintext.reconcile_interval_ms = 2_500;
@@ -692,6 +691,7 @@ mod tests {
             snapshot
                 .tls
                 .plaintext
+                .instrumentation
                 .runtime
                 .as_ref()
                 .expect("TLS plaintext runtime should be reported")
@@ -704,11 +704,11 @@ mod tests {
         );
         let value = serde_json::to_value(&snapshot)?;
         assert_eq!(
-            value["tls"]["plaintext"]["capability"]["mode"],
+            value["tls"]["plaintext"]["instrumentation"]["capability"]["mode"],
             json!("unavailable")
         );
         assert_eq!(
-            value["tls"]["plaintext"]["reconcile_interval_ms"],
+            value["tls"]["plaintext"]["instrumentation"]["reconcile_interval_ms"],
             json!(2500)
         );
         assert_eq!(snapshot.metrics.capabilities.unavailable, 1);
@@ -751,7 +751,7 @@ mod tests {
                 .health
                 .reasons
                 .iter()
-                .all(|reason| !reason.contains("TLS plaintext runtime provider"))
+                .all(|reason| !reason.contains("TLS plaintext instrumentation"))
         );
         Ok(())
     }

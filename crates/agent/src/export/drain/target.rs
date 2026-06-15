@@ -1,6 +1,6 @@
 use exporter::{CompressionCodec, WebhookExporter, WebhookTlsConfig};
-use probe_config::{CompressionCodecName, ExporterTransport};
-use runtime::{ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportTlsMaterialPlan};
+use probe_config::CompressionCodecName;
+use runtime::{ExportPlan, ExportSinkTlsPlan, ExportTlsMaterialPlan, WebhookExportSinkPlan};
 use storage::ExportSpool;
 
 use super::{
@@ -45,7 +45,7 @@ pub async fn drain_replay_webhook(
 pub(super) async fn drain_export_sinks_with_mode(
     spool: &impl ExportSpool,
     agent_id: &str,
-    sinks: &[ExportSinkPlan],
+    sinks: &[WebhookExportSinkPlan],
     mode: SinkDrainMode,
 ) -> Result<(), ExportDrainError> {
     let mut failures = Vec::new();
@@ -82,13 +82,16 @@ pub(super) fn finish_export_sink_drain(
 pub(super) async fn drain_export_sink_with_mode(
     spool: &impl ExportSpool,
     agent_id: &str,
-    sink: &ExportSinkPlan,
+    sink: &WebhookExportSinkPlan,
     mode: SinkDrainMode,
 ) -> Result<(), ExportDrainError> {
-    match webhook_export_target_from_plan_sink(sink) {
-        Ok(target) => drain_webhook_sink_with_mode(spool, agent_id, target, mode).await,
-        Err(error) => Err(error),
-    }
+    drain_webhook_sink_with_mode(
+        spool,
+        agent_id,
+        webhook_export_target_from_plan_sink(sink),
+        mode,
+    )
+    .await
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,26 +115,17 @@ impl WebhookExportTarget {
     }
 }
 
-fn webhook_export_target_from_plan_sink(
-    sink: &ExportSinkPlan,
-) -> Result<WebhookExportTarget, ExportDrainError> {
-    match sink.transport {
-        ExporterTransport::Webhook => Ok(WebhookExportTarget {
-            sink: sink.id.clone(),
-            endpoint: sink.endpoint.clone(),
-            codec: compression_codec_from_config(sink.codec),
-            headers: sink
-                .headers
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect(),
-            tls: sink.tls.clone(),
-        }),
-        ExporterTransport::Grpc | ExporterTransport::Kafka | ExporterTransport::Otlp => {
-            Err(ExportDrainError::UnsupportedTransport {
-                transport: sink.transport,
-            })
-        }
+fn webhook_export_target_from_plan_sink(sink: &WebhookExportSinkPlan) -> WebhookExportTarget {
+    WebhookExportTarget {
+        sink: sink.id.clone(),
+        endpoint: sink.endpoint.clone(),
+        codec: compression_codec_from_config(sink.codec),
+        headers: sink
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        tls: sink.tls.clone(),
     }
 }
 
@@ -257,12 +251,14 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use probe_config::{AgentConfig, CompressionCodecName, ExporterConfig, TlsMaterialKind};
+    use probe_config::{
+        AgentConfig, CompressionCodecName, ExporterConfig, ExporterTransport, TlsMaterialKind,
+    };
     use probe_core::{CapabilityKind, CapabilityState, SpoolPayloadSchema};
     use runtime::{
-        self, ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan,
-        ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan, ProviderRegistry,
-        RuntimePlan,
+        self, ExportFailureBackoffPlan, ExportPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
+        ExportTlsMaterialPlan, ExportWorkerPlan, ProviderRegistry, RuntimePlan,
+        WebhookExportSinkPlan,
     };
     use storage::{FjallSpool, SpoolPayload};
 
@@ -337,9 +333,8 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
-            sinks: vec![ExportSinkPlan {
+            sinks: vec![WebhookExportSinkPlan {
                 id: "secure".to_string(),
-                transport: ExporterTransport::Webhook,
                 endpoint: "https://collector.example/batches".to_string(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
@@ -376,9 +371,8 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
-            sinks: vec![ExportSinkPlan {
+            sinks: vec![WebhookExportSinkPlan {
                 id: "secure".to_string(),
-                transport: ExporterTransport::Webhook,
                 endpoint: "https://collector.example/batches".to_string(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
@@ -535,9 +529,8 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(30_000),
             },
-            sinks: vec![ExportSinkPlan {
+            sinks: vec![WebhookExportSinkPlan {
                 id: "tail".to_string(),
-                transport: ExporterTransport::Webhook,
                 endpoint: server.endpoint(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
@@ -587,9 +580,8 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
-            sinks: vec![ExportSinkPlan {
+            sinks: vec![WebhookExportSinkPlan {
                 id: "secure".to_string(),
-                transport: ExporterTransport::Webhook,
                 endpoint: "https://collector.example/batches".to_string(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::{
     CaptureConfig, CaptureSelection, ConfigViolation, MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS,
-    TlsConfig, TlsMaterialKind, TlsPlaintextProvider,
+    TlsConfig, TlsMaterialKind,
 };
 
 pub(crate) fn validate_tls(
@@ -17,8 +17,6 @@ pub(crate) fn validate_tls(
     if capture.selection == CaptureSelection::PlaintextFeed {
         validate_plaintext_feed_selection(tls, violations);
     }
-
-    validate_plaintext_tls_provider_refs(tls, violations);
 }
 
 pub(crate) fn materials_by_id(tls: &TlsConfig) -> BTreeMap<&str, TlsMaterialKind> {
@@ -108,25 +106,6 @@ fn validate_plaintext_tls_material_refs(tls: &TlsConfig, violations: &mut Vec<Co
     }
 }
 
-fn validate_plaintext_tls_provider_refs(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
-    if matches!(tls.plaintext.provider, TlsPlaintextProvider::LibsslUprobe) {
-        if !tls.plaintext.key_log_refs.is_empty() {
-            violations.push(ConfigViolation {
-                field: "tls.plaintext.key_log_refs".to_string(),
-                reason: "libssl_uprobe plaintext provider does not use key log materials"
-                    .to_string(),
-            });
-        }
-        if !tls.plaintext.session_secret_refs.is_empty() {
-            violations.push(ConfigViolation {
-                field: "tls.plaintext.session_secret_refs".to_string(),
-                reason: "libssl_uprobe plaintext provider does not use session secret materials"
-                    .to_string(),
-            });
-        }
-    }
-}
-
 fn validate_plaintext_tls_provider_config(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
     if tls.plaintext.reconcile_interval_ms == 0 {
         violations.push(ConfigViolation {
@@ -150,13 +129,6 @@ fn validate_plaintext_tls_provider_config(tls: &TlsConfig, violations: &mut Vec<
         violations.push(ConfigViolation {
             field: "tls.plaintext.libssl_uprobe_object_path".to_string(),
             reason: "libssl uprobe eBPF object path cannot be empty".to_string(),
-        });
-    }
-    if !matches!(tls.plaintext.provider, TlsPlaintextProvider::LibsslUprobe) {
-        violations.push(ConfigViolation {
-            field: "tls.plaintext.libssl_uprobe_object_path".to_string(),
-            reason: "libssl uprobe eBPF object path is only valid when tls.plaintext.provider = \"libssl_uprobe\""
-                .to_string(),
         });
     }
 }

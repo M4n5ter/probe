@@ -1,6 +1,4 @@
-use probe_config::{
-    AgentConfig, ConfigValidationError, ConfigViolation, ExporterTransport, TlsPlaintextProvider,
-};
+use probe_config::{AgentConfig, ConfigValidationError, ConfigViolation};
 use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
 
 use super::capture::{CapturePlan, CapturePlanMode};
@@ -45,7 +43,6 @@ fn collect_static_runtime_config_violations(
     validate_static_tls_config(config, violations);
     validate_policy_config(config, violations);
     validate_static_enforcement_config(config, violations);
-    validate_exporters(config, violations);
 }
 
 fn validate_policy_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
@@ -87,18 +84,6 @@ fn validate_static_tls_config(config: &AgentConfig, violations: &mut Vec<ConfigV
             reason: error.to_string(),
         });
     }
-    if !config.tls.plaintext.enabled {
-        return;
-    }
-    if matches!(config.tls.plaintext.provider, TlsPlaintextProvider::Keylog) {
-        violations.push(ConfigViolation {
-            field: "tls.plaintext.provider".to_string(),
-            reason: format!(
-                "{:?} plaintext provider is reserved but not implemented",
-                config.tls.plaintext.provider
-            ),
-        });
-    }
 }
 
 fn validate_registry_tls_config(
@@ -106,21 +91,16 @@ fn validate_registry_tls_config(
     registry: &ProviderRegistry,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    if !config.tls.plaintext.enabled
-        || config.tls.plaintext.provider != TlsPlaintextProvider::LibsslUprobe
-    {
+    if !config.tls.plaintext.enabled {
         return;
     }
-    match config.tls.plaintext.provider {
-        TlsPlaintextProvider::LibsslUprobe => require_usable(
-            &registry.capability_matrix(),
-            CapabilityKind::LibsslUprobe,
-            "tls.plaintext.enabled",
-            "libssl uprobe plaintext provider is not available in this build/runtime",
-            violations,
-        ),
-        TlsPlaintextProvider::Keylog => {}
-    }
+    require_usable(
+        &registry.capability_matrix(),
+        CapabilityKind::LibsslUprobe,
+        "tls.plaintext.enabled",
+        "libssl uprobe plaintext provider is not available in this build/runtime",
+        violations,
+    );
 }
 
 fn validate_tls_capture_constraints(
@@ -128,9 +108,7 @@ fn validate_tls_capture_constraints(
     registry: &ProviderRegistry,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    if !config.tls.plaintext.enabled
-        || config.tls.plaintext.provider != TlsPlaintextProvider::LibsslUprobe
-    {
+    if !config.tls.plaintext.enabled {
         return;
     }
 
@@ -196,23 +174,6 @@ fn validate_enforcement_capture_constraints(
     }
 }
 
-fn validate_exporters(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
-    for exporter in &config.exporters {
-        match exporter.transport {
-            ExporterTransport::Webhook => {}
-            ExporterTransport::Grpc | ExporterTransport::Kafka | ExporterTransport::Otlp => {
-                violations.push(ConfigViolation {
-                    field: format!("exporters.{}.transport", exporter.id),
-                    reason: format!(
-                        "{:?} exporter is reserved but not implemented",
-                        exporter.transport
-                    ),
-                });
-            }
-        }
-    }
-}
-
 fn require_available(
     capabilities: &CapabilityMatrix,
     capability: CapabilityKind,
@@ -257,9 +218,7 @@ fn require_usable(
 
 #[cfg(test)]
 mod tests {
-    use probe_config::{
-        CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig, TlsPlaintextProvider,
-    };
+    use probe_config::{CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig};
     use probe_core::{CapabilityState, Selector};
 
     use crate::plan::{
@@ -358,7 +317,6 @@ mod tests {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.tls.plaintext.enabled = true;
-        config.tls.plaintext.provider = TlsPlaintextProvider::LibsslUprobe;
         config.tls.plaintext.libssl_uprobe_object_path =
             Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
 
@@ -380,7 +338,6 @@ mod tests {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Replay;
         config.tls.plaintext.enabled = true;
-        config.tls.plaintext.provider = TlsPlaintextProvider::LibsslUprobe;
         config.tls.plaintext.libssl_uprobe_object_path =
             Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
 
@@ -390,34 +347,6 @@ mod tests {
             &error,
             "tls.plaintext.enabled",
             "requires live host capture",
-        );
-    }
-
-    #[test]
-    fn tls_plaintext_plan_rejects_enabled_keylog_provider() {
-        let registry = ProviderRegistry::new(
-            vec![capture_provider(
-                CaptureBackend::Replay,
-                CaptureProviderBuilder::Replay,
-                RuntimeMode::Available,
-            )],
-            test_platform_capabilities(),
-        );
-        let mut config = AgentConfig::default();
-        config.capture.selection = CaptureSelection::Replay;
-        config.tls.plaintext.enabled = true;
-        config.tls.plaintext.provider = TlsPlaintextProvider::Keylog;
-
-        let error = validation_error(config, &registry);
-
-        assert_violation(
-            &error,
-            "tls.plaintext.provider",
-            "reserved but not implemented",
-        );
-        assert!(
-            !error.to_string().contains("requires live host capture"),
-            "keylog provider rejection should happen before live capture constraints"
         );
     }
 

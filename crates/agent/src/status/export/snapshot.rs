@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
-use probe_config::{CompressionCodecName, ExporterTransport};
+use probe_config::CompressionCodecName;
 use probe_core::RuntimeMode;
 use runtime::{
-    ExportRetentionPlan, ExportSinkPlan, ExportSinkWorkerPlan, ExportTlsMaterialPlan,
-    ExportWorkerPlan, RuntimePlan,
+    ExportRetentionPlan, ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan,
+    RuntimePlan, WebhookExportSinkPlan,
 };
 use serde::Serialize;
 
@@ -26,7 +26,6 @@ pub struct ExportStatusSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExporterStatusSnapshot {
     pub id: String,
-    pub transport: ExporterTransport,
     pub codec: CompressionCodecName,
     pub worker: ExportWorkerPlan,
     pub sink_worker: ExportSinkWorkerPlan,
@@ -84,12 +83,10 @@ pub(in crate::status) fn exporter_statuses_with_runtime(
                 .zip(export_last_sequence)
                 .and_then(|(cursor, last)| (cursor <= last).then(|| last - cursor));
             let tls = exporter_tls_status(sink);
-            let (mode, reason) =
-                exporter_mode(plan, spool, sink.transport, &tls, cursor_invariant_error);
+            let (mode, reason) = exporter_mode(plan, spool, &tls, cursor_invariant_error);
 
             ExporterStatusSnapshot {
                 id: sink.id.clone(),
-                transport: sink.transport,
                 codec: sink.codec,
                 worker: plan.export.worker.clone(),
                 sink_worker: sink.worker.clone(),
@@ -134,7 +131,6 @@ impl From<&ExportSinkWorkerRuntimeSnapshot> for ExporterRuntimeStatusSnapshot {
 fn exporter_mode(
     plan: &RuntimePlan,
     spool: &SpoolStatusSnapshot,
-    transport: ExporterTransport,
     tls: &ExporterTlsStatusSnapshot,
     cursor_reason: Option<String>,
 ) -> (RuntimeMode, Option<String>) {
@@ -167,31 +163,13 @@ fn exporter_mode(
                 .or_else(|| Some("exporter TLS material is unavailable".to_string())),
         );
     }
-    match transport {
-        ExporterTransport::Webhook => {}
-        ExporterTransport::Grpc | ExporterTransport::Kafka | ExporterTransport::Otlp => {
-            return (
-                RuntimeMode::Unavailable,
-                Some(format!(
-                    "{transport:?} exporter is reserved but not implemented"
-                )),
-            );
-        }
-    }
     if let Some(reason) = plan.export.worker.disabled_reason() {
         return (RuntimeMode::Degraded, Some(reason.to_string()));
     }
     (RuntimeMode::Available, None)
 }
 
-fn exporter_tls_status(sink: &ExportSinkPlan) -> ExporterTlsStatusSnapshot {
-    if sink.transport != ExporterTransport::Webhook {
-        return ExporterTlsStatusSnapshot {
-            mode: RuntimeMode::Available,
-            reason: None,
-        };
-    }
-
+fn exporter_tls_status(sink: &WebhookExportSinkPlan) -> ExporterTlsStatusSnapshot {
     for material in sink
         .tls
         .trust_anchors

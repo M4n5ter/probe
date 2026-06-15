@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use probe_config::{ExporterTransport, TlsMaterialKind};
+use probe_config::TlsMaterialKind;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -14,8 +14,6 @@ pub enum ExportDrainError {
     Proto(#[from] proto::ProtoError),
     #[error("export error: {0}")]
     Export(#[from] exporter::ExportError),
-    #[error("{transport:?} exporter is reserved but not implemented")]
-    UnsupportedTransport { transport: ExporterTransport },
     #[error("one or more exporters failed: {failures}")]
     MultipleSinksFailed { failures: String },
     #[error("unsupported spooled payload schema at sequence {sequence}: {schema}")]
@@ -45,7 +43,6 @@ pub enum ExportDrainFailureReason {
     EmptyTlsTrustAnchorBundle,
     RemoteRejectedBatch,
     InvalidExportAck,
-    UnsupportedTransport,
     MultipleSinksFailed,
     UnsupportedPayloadSchema,
     SinkTimedOut,
@@ -59,7 +56,6 @@ impl ExportDrainError {
             Self::Storage(_) => ExportDrainFailureReason::StorageError,
             Self::Proto(_) => ExportDrainFailureReason::ProtoError,
             Self::Export(error) => export_error_failure_reason(error),
-            Self::UnsupportedTransport { .. } => ExportDrainFailureReason::UnsupportedTransport,
             Self::MultipleSinksFailed { .. } => ExportDrainFailureReason::MultipleSinksFailed,
             Self::UnsupportedSpoolPayloadSchema { .. } => {
                 ExportDrainFailureReason::UnsupportedPayloadSchema

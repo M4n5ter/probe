@@ -1,6 +1,20 @@
 use probe_config::*;
 
 #[test]
+fn parsing_rejects_unimplemented_exporter_transport() {
+    let result = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "primary"
+transport = "grpc"
+endpoint = "https://collector.example/batches"
+"#,
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
 fn validation_rejects_reserved_exporter_headers() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
         r#"

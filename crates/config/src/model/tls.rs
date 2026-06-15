@@ -21,7 +21,6 @@ pub struct TlsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct PlaintextTlsConfig {
     pub enabled: bool,
-    pub provider: TlsPlaintextProvider,
     pub selector: Option<Selector>,
     pub libssl_uprobe_object_path: Option<PathBuf>,
     #[serde(default = "default_tls_plaintext_reconcile_interval_ms")]
@@ -34,7 +33,6 @@ impl Default for PlaintextTlsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: TlsPlaintextProvider::LibsslUprobe,
             selector: None,
             libssl_uprobe_object_path: None,
             reconcile_interval_ms: DEFAULT_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS,
@@ -42,13 +40,6 @@ impl Default for PlaintextTlsConfig {
             session_secret_refs: Vec::new(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TlsPlaintextProvider {
-    LibsslUprobe,
-    Keylog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

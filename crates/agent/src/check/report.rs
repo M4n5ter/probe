@@ -437,13 +437,18 @@ protective_actions = ["alert"]
             value["plan"]["export"]["sinks"][0]["tls"]["trust_anchors"][0]["path"],
             json!("/tmp/collector-ca.pem")
         );
-        assert_eq!(value["tls"]["plaintext"]["enabled"], json!(false));
         assert_eq!(
-            value["tls"]["plaintext"]["provider"],
-            json!("libssl_uprobe")
+            value["tls"]["plaintext"]["instrumentation"]["enabled"],
+            json!(false)
         );
-        assert_eq!(value["tls"]["plaintext"]["key_logs"], json!([]));
-        assert_eq!(value["tls"]["plaintext"]["session_secrets"], json!([]));
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["key_logs"],
+            json!([])
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["session_secrets"],
+            json!([])
+        );
         assert_eq!(value["policy"]["mode"], json!("loaded"));
         assert_eq!(value["policy"]["configured_count"], json!(1));
         assert_eq!(value["policy"]["enabled_count"], json!(1));

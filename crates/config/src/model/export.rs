@@ -131,9 +131,6 @@ pub struct ExporterTlsConfig {
 #[serde(rename_all = "snake_case")]
 pub enum ExporterTransport {
     Webhook,
-    Grpc,
-    Kafka,
-    Otlp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

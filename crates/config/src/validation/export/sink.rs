@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    ConfigViolation, ExporterConfig, ExporterTransport, TlsConfig,
+    ConfigViolation, ExporterConfig, TlsConfig,
     validation::export::{headers, tls},
 };
 
@@ -37,16 +37,11 @@ pub(in crate::validation) fn validate_exporters(
         for (name, value) in &exporter.headers {
             headers::validate_header(exporter, name, value, violations);
         }
-        match exporter.transport {
-            ExporterTransport::Webhook => {
-                if exporter.endpoint.trim().is_empty() {
-                    violations.push(ConfigViolation {
-                        field: format!("exporters.{}.endpoint", exporter.id),
-                        reason: "webhook endpoint cannot be empty".to_string(),
-                    });
-                }
-            }
-            ExporterTransport::Grpc | ExporterTransport::Kafka | ExporterTransport::Otlp => {}
+        if exporter.endpoint.trim().is_empty() {
+            violations.push(ConfigViolation {
+                field: format!("exporters.{}.endpoint", exporter.id),
+                reason: "webhook endpoint cannot be empty".to_string(),
+            });
         }
         if exporter.worker.batches_per_tick == Some(0) {
             violations.push(ConfigViolation {

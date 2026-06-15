@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use probe_config::{TlsMaterialKind, TlsPlaintextProvider};
+use probe_config::TlsMaterialKind;
 use probe_core::{CapabilityKind, CapabilityMatrix, RuntimeMode};
 use runtime::{RuntimePlan, TlsPlaintextCapabilityPlan, TlsPlaintextMaterialPlan};
 use serde::Serialize;
@@ -16,13 +16,22 @@ pub struct TlsStatusSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TlsPlaintextStatusSnapshot {
+    pub instrumentation: TlsPlaintextInstrumentationStatusSnapshot,
+    pub decrypt_hints: TlsDecryptHintStatusSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextInstrumentationStatusSnapshot {
     pub enabled: bool,
-    pub provider: TlsPlaintextProvider,
     pub selector_configured: bool,
     pub libssl_uprobe_object_path: Option<PathBuf>,
     pub reconcile_interval_ms: u64,
     pub capability: TlsPlaintextCapabilityStatusSnapshot,
     pub runtime: Option<TlsPlaintextRuntimeSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TlsDecryptHintStatusSnapshot {
     pub key_logs: Vec<TlsPlaintextMaterialStatusSnapshot>,
     pub session_secrets: Vec<TlsPlaintextMaterialStatusSnapshot>,
 }
@@ -101,7 +110,8 @@ fn plaintext_status(
     runtime: Option<TlsPlaintextRuntimeSnapshot>,
 ) -> TlsPlaintextStatusSnapshot {
     let plaintext = &plan.tls.plaintext;
-    let capability = match &plaintext.capability {
+    let instrumentation = &plaintext.instrumentation;
+    let capability = match &instrumentation.capability {
         TlsPlaintextCapabilityPlan::NotRequired => {
             TlsPlaintextCapabilityStatusSnapshot::NotRequired
         }
@@ -114,15 +124,18 @@ fn plaintext_status(
     };
 
     TlsPlaintextStatusSnapshot {
-        enabled: plaintext.enabled,
-        provider: plaintext.provider,
-        selector_configured: plaintext.selector_configured,
-        libssl_uprobe_object_path: plaintext.libssl_uprobe_object_path.clone(),
-        reconcile_interval_ms: plaintext.reconcile_interval_ms,
-        capability,
-        runtime,
-        key_logs: plaintext_material_statuses(&plaintext.key_logs),
-        session_secrets: plaintext_material_statuses(&plaintext.session_secrets),
+        instrumentation: TlsPlaintextInstrumentationStatusSnapshot {
+            enabled: instrumentation.enabled,
+            selector_configured: instrumentation.selector_configured,
+            libssl_uprobe_object_path: instrumentation.libssl_uprobe_object_path.clone(),
+            reconcile_interval_ms: instrumentation.reconcile_interval_ms,
+            capability,
+            runtime,
+        },
+        decrypt_hints: TlsDecryptHintStatusSnapshot {
+            key_logs: plaintext_material_statuses(&plaintext.decrypt_hints.key_logs),
+            session_secrets: plaintext_material_statuses(&plaintext.decrypt_hints.session_secrets),
+        },
     }
 }
 
@@ -220,7 +233,6 @@ mod tests {
         let mut config = config_with_storage_path(temp.join("spool"));
         config.capture.selection = probe_config::CaptureSelection::Libpcap;
         config.tls.plaintext.enabled = true;
-        config.tls.plaintext.provider = probe_config::TlsPlaintextProvider::LibsslUprobe;
         config.tls.plaintext.selector = Some(Selector::default());
         config.tls.plaintext.libssl_uprobe_object_path =
             Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
@@ -232,37 +244,40 @@ mod tests {
 
         let status = tls_status(&plan, &plan.capabilities, None);
 
-        assert!(status.plaintext.enabled);
+        let instrumentation = &status.plaintext.instrumentation;
+        assert!(instrumentation.enabled);
+        assert!(instrumentation.selector_configured);
         assert_eq!(
-            status.plaintext.provider,
-            probe_config::TlsPlaintextProvider::LibsslUprobe
-        );
-        assert!(status.plaintext.selector_configured);
-        assert_eq!(
-            status.plaintext.libssl_uprobe_object_path,
+            instrumentation.libssl_uprobe_object_path,
             Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into())
         );
-        assert_eq!(status.plaintext.reconcile_interval_ms, 2_500);
+        assert_eq!(instrumentation.reconcile_interval_ms, 2_500);
         assert_eq!(
-            status.plaintext.capability,
+            instrumentation.capability,
             TlsPlaintextCapabilityStatusSnapshot::Required {
                 capability: CapabilityKind::LibsslUprobe,
                 mode: RuntimeMode::Available,
             }
         );
-        assert!(status.plaintext.key_logs.is_empty());
-        assert!(status.plaintext.session_secrets.is_empty());
+        assert!(status.plaintext.decrypt_hints.key_logs.is_empty());
+        assert!(status.plaintext.decrypt_hints.session_secrets.is_empty());
         let value = serde_json::to_value(&status)?;
-        assert_eq!(value["plaintext"]["capability"]["kind"], json!("required"));
         assert_eq!(
-            value["plaintext"]["capability"]["capability"],
+            value["plaintext"]["instrumentation"]["capability"]["kind"],
+            json!("required")
+        );
+        assert_eq!(
+            value["plaintext"]["instrumentation"]["capability"]["capability"],
             json!("libssl_uprobe")
         );
         assert_eq!(
-            value["plaintext"]["libssl_uprobe_object_path"],
+            value["plaintext"]["instrumentation"]["libssl_uprobe_object_path"],
             json!("/opt/sssa/ebpf-tls-plaintext.bpf.o")
         );
-        assert_eq!(value["plaintext"]["reconcile_interval_ms"], json!(2500));
+        assert_eq!(
+            value["plaintext"]["instrumentation"]["reconcile_interval_ms"],
+            json!(2500)
+        );
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -276,7 +291,6 @@ mod tests {
         fs::write(&key_log_path, b"client random")?;
         fs::write(&session_secret_path, b"{\"secret\":\"test\"}\n")?;
         let mut config = config_with_storage_path(temp.join("spool"));
-        config.tls.plaintext.provider = probe_config::TlsPlaintextProvider::Keylog;
         config.tls.plaintext.key_log_refs = vec!["ssl-keys".to_string()];
         config.tls.plaintext.session_secret_refs = vec!["session-secrets".to_string()];
         config.tls.materials = vec![
@@ -296,28 +310,23 @@ mod tests {
         let status = tls_status(&plan, &plan.capabilities, None);
 
         assert_eq!(
-            status.plaintext.capability,
+            status.plaintext.instrumentation.capability,
             TlsPlaintextCapabilityStatusSnapshot::NotRequired
         );
-        assert_eq!(status.plaintext.key_logs.len(), 1);
-        assert_eq!(status.plaintext.key_logs[0].id, "ssl-keys");
+        let hints = &status.plaintext.decrypt_hints;
+        assert_eq!(hints.key_logs.len(), 1);
+        assert_eq!(hints.key_logs[0].id, "ssl-keys");
         assert_eq!(
-            status.plaintext.key_logs[0].kind,
+            hints.key_logs[0].kind,
             probe_config::TlsMaterialKind::KeyLogFile
         );
-        assert_eq!(status.plaintext.key_logs[0].path, key_log_path);
+        assert_eq!(hints.key_logs[0].path, key_log_path);
+        assert_eq!(hints.key_logs[0].source.mode, RuntimeMode::Available);
+        assert_eq!(hints.session_secrets.len(), 1);
+        assert_eq!(hints.session_secrets[0].id, "session-secrets");
+        assert_eq!(hints.session_secrets[0].path, session_secret_path);
         assert_eq!(
-            status.plaintext.key_logs[0].source.mode,
-            RuntimeMode::Available
-        );
-        assert_eq!(status.plaintext.session_secrets.len(), 1);
-        assert_eq!(status.plaintext.session_secrets[0].id, "session-secrets");
-        assert_eq!(
-            status.plaintext.session_secrets[0].path,
-            session_secret_path
-        );
-        assert_eq!(
-            status.plaintext.session_secrets[0].source.check,
+            hints.session_secrets[0].source.check,
             TlsMaterialSourceCheck::MetadataOnly
         );
         fs::remove_dir_all(temp)?;

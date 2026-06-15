@@ -177,10 +177,11 @@ fn current_unix_time_ns() -> u64 {
 mod tests {
     use std::num::NonZeroU64;
 
-    use probe_config::{CompressionCodecName, ExporterTransport};
+    use probe_config::CompressionCodecName;
     use probe_core::SpoolPayloadSchema;
     use runtime::{
-        ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportWorkerPlan, StorageRetentionPlan,
+        ExportPlan, ExportSinkTlsPlan, ExportWorkerPlan, StorageRetentionPlan,
+        WebhookExportSinkPlan,
     };
     use storage::{FjallSpool, SpoolPayload};
     use tempfile::tempdir;
@@ -193,9 +194,8 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
-            sinks: vec![ExportSinkPlan {
+            sinks: vec![WebhookExportSinkPlan {
                 id: "collector".to_string(),
-                transport: ExporterTransport::Webhook,
                 endpoint: "https://collector.example/batches".to_string(),
                 codec: CompressionCodecName::None,
                 headers: Default::default(),

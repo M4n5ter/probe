@@ -11,7 +11,6 @@ use capture::{
     LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
     LibsslUprobePlaintextReconcile, LibsslUprobeReconcileTargetBucket,
 };
-use probe_config::TlsPlaintextProvider;
 use probe_core::TcpConnection;
 use runtime::RuntimePlan;
 use serde::Serialize;
@@ -167,9 +166,7 @@ pub enum TlsPlaintextRuntimeMode {
 
 impl TlsPlaintextRuntimeState {
     pub(crate) fn for_plan(plan: &RuntimePlan) -> Self {
-        if plan.tls.plaintext.enabled
-            && plan.tls.plaintext.provider == TlsPlaintextProvider::LibsslUprobe
-        {
+        if plan.tls.plaintext.instrumentation.enabled {
             return Self::pending();
         }
         Self::not_configured()
@@ -178,7 +175,7 @@ impl TlsPlaintextRuntimeState {
     fn pending() -> Self {
         Self::from_snapshot(TlsPlaintextRuntimeSnapshot {
             mode: TlsPlaintextRuntimeMode::Pending,
-            reason: Some("TLS plaintext runtime provider has not been built yet".to_string()),
+            reason: Some("TLS plaintext instrumentation has not been built yet".to_string()),
             last_reconcile: None,
         })
     }
@@ -193,7 +190,7 @@ impl TlsPlaintextRuntimeState {
         }
     }
 
-    pub(crate) fn record_provider_build(&self, build: &TlsPlaintextProviderBuild) {
+    pub(crate) fn record_instrumentation_build(&self, build: &TlsPlaintextInstrumentationBuild) {
         let mut inner = self
             .inner
             .lock()
@@ -201,7 +198,7 @@ impl TlsPlaintextRuntimeState {
         *inner = build.runtime_snapshot();
     }
 
-    pub(crate) fn record_provider_disabled(&self, reason: impl Into<String>) {
+    pub(crate) fn record_instrumentation_disabled(&self, reason: impl Into<String>) {
         let mut inner = self
             .inner
             .lock()
@@ -251,32 +248,26 @@ impl TlsPlaintextRuntimeState {
     }
 }
 
-pub(crate) fn build_tls_plaintext_provider(
+pub(crate) fn build_tls_plaintext_instrumentation(
     plan: &RuntimePlan,
     runtime_state: Option<&TlsPlaintextRuntimeState>,
-) -> Result<TlsPlaintextProviderBuild, AgentError> {
-    if !plan.tls.plaintext.enabled {
-        return Ok(TlsPlaintextProviderBuild::NotConfigured);
+) -> Result<TlsPlaintextInstrumentationBuild, AgentError> {
+    if !plan.tls.plaintext.instrumentation.enabled {
+        return Ok(TlsPlaintextInstrumentationBuild::NotConfigured);
     }
 
-    match plan.tls.plaintext.provider {
-        TlsPlaintextProvider::LibsslUprobe => {
-            build_libssl_uprobe_plaintext_provider(plan, runtime_state)
-        }
-        TlsPlaintextProvider::Keylog => Err(AgentError::UnsupportedRunConfig(
-            "keylog TLS plaintext provider is reserved but not implemented".to_string(),
-        )),
-    }
+    build_libssl_uprobe_plaintext_provider(plan, runtime_state)
 }
 
 fn build_libssl_uprobe_plaintext_provider(
     plan: &RuntimePlan,
     runtime_state: Option<&TlsPlaintextRuntimeState>,
-) -> Result<TlsPlaintextProviderBuild, AgentError> {
+) -> Result<TlsPlaintextInstrumentationBuild, AgentError> {
     plan.require_live_capture()?;
     let object_path = plan
         .tls
         .plaintext
+        .instrumentation
         .libssl_uprobe_object_path
         .clone()
         .ok_or_else(|| {
@@ -301,34 +292,40 @@ fn build_libssl_uprobe_plaintext_provider(
     let attach_planner = LibsslUprobeAttachPlanner::new(selector);
     let attach_plan = match attach_planner.plan()? {
         Ok(plan) => plan,
-        Err(blocked) => return Ok(TlsPlaintextProviderBuild::disabled(blocked.into_reason())),
+        Err(blocked) => {
+            return Ok(TlsPlaintextInstrumentationBuild::disabled(
+                blocked.into_reason(),
+            ));
+        }
     };
 
     match LibsslUprobePlaintextProvider::open_best_effort(
         LibsslUprobePlaintextProbeConfig::new(object_path, attach_plan),
         Box::<ProcfsLibsslFlowResolver>::default(),
     ) {
-        LibsslUprobePlaintextOpen::Enabled(provider) => Ok(TlsPlaintextProviderBuild::enabled(
-            provider,
-            attach_planner,
-            Duration::from_millis(plan.tls.plaintext.reconcile_interval_ms),
-            runtime_state
-                .cloned()
-                .map(|state| Box::new(state) as Box<dyn LibsslUprobePlaintextReconcileObserver>),
-        )),
+        LibsslUprobePlaintextOpen::Enabled(provider) => {
+            Ok(TlsPlaintextInstrumentationBuild::enabled(
+                provider,
+                attach_planner,
+                Duration::from_millis(plan.tls.plaintext.instrumentation.reconcile_interval_ms),
+                runtime_state.cloned().map(|state| {
+                    Box::new(state) as Box<dyn LibsslUprobePlaintextReconcileObserver>
+                }),
+            ))
+        }
         LibsslUprobePlaintextOpen::Disabled { reason } => {
-            Ok(TlsPlaintextProviderBuild::disabled(reason))
+            Ok(TlsPlaintextInstrumentationBuild::disabled(reason))
         }
     }
 }
 
-pub(crate) enum TlsPlaintextProviderBuild {
+pub(crate) enum TlsPlaintextInstrumentationBuild {
     NotConfigured,
     Enabled(Box<dyn CaptureProvider>),
     Disabled { reason: String },
 }
 
-impl TlsPlaintextProviderBuild {
+impl TlsPlaintextInstrumentationBuild {
     fn enabled(
         provider: LibsslUprobePlaintextProvider,
         attach_planner: LibsslUprobeAttachPlanner,
@@ -490,8 +487,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disabled_tls_plaintext_build_records_unavailable_runtime_reason() {
-        let build = TlsPlaintextProviderBuild::disabled(
+    fn disabled_tls_instrumentation_build_records_unavailable_runtime_reason() {
+        let build = TlsPlaintextInstrumentationBuild::disabled(
             "libssl uprobe attach planning produced no attachable targets",
         );
 
@@ -523,7 +520,6 @@ mod tests {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.tls.plaintext.enabled = true;
-        config.tls.plaintext.provider = TlsPlaintextProvider::LibsslUprobe;
         config.tls.plaintext.libssl_uprobe_object_path =
             Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
         let plan = runtime_plan_from_config(
@@ -550,7 +546,7 @@ mod tests {
     #[test]
     fn tls_plaintext_runtime_state_records_poll_time_disable() {
         let runtime = TlsPlaintextRuntimeState::pending();
-        runtime.record_provider_build(&TlsPlaintextProviderBuild::Enabled(Box::new(
+        runtime.record_instrumentation_build(&TlsPlaintextInstrumentationBuild::Enabled(Box::new(
             NoopCaptureProvider,
         )));
 
@@ -558,7 +554,7 @@ mod tests {
         runtime.record_reconcile_success_at(reconcile_result(2, 1, 3), 100);
         runtime.record_reconcile_success_at(reconcile_result(4, 2, 5), 200);
 
-        runtime.record_provider_disabled(
+        runtime.record_instrumentation_disabled(
             "best-effort capture provider libssl_uprobe_plaintext disabled after error: boom",
         );
 

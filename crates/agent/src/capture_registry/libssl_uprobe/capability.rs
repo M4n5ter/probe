@@ -1,6 +1,6 @@
 use capture::EbpfHostProbeReport;
 use ebpf_object::{EbpfObjectArtifact, EbpfObjectProbe, EbpfObjectProbeReport};
-use probe_config::{AgentConfig, TlsPlaintextProvider};
+use probe_config::AgentConfig;
 use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
 
 pub(in crate::capture_registry) fn capability(
@@ -8,12 +8,6 @@ pub(in crate::capture_registry) fn capability(
     host: &EbpfHostProbeReport,
     procfs_socket_attribution: &CapabilityState,
 ) -> CapabilityState {
-    if config.tls.plaintext.provider != TlsPlaintextProvider::LibsslUprobe {
-        return CapabilityState::unavailable(
-            CapabilityKind::LibsslUprobe,
-            "libssl_uprobe plaintext provider is not selected",
-        );
-    }
     if !host.kernel_prerequisites_available() {
         return CapabilityState::unavailable(
             CapabilityKind::LibsslUprobe,

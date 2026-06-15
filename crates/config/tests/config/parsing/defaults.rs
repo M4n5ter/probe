@@ -42,10 +42,6 @@ fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {
         EnforcementPolicySourceConfig::None
     );
     assert!(!config.tls.plaintext.enabled);
-    assert_eq!(
-        config.tls.plaintext.provider,
-        TlsPlaintextProvider::LibsslUprobe
-    );
     assert_eq!(config.tls.plaintext.selector, None);
     assert_eq!(config.tls.plaintext.key_log_refs, Vec::<String>::new());
     assert_eq!(

@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use probe_config::{AgentConfig, TlsMaterialConfig, TlsMaterialKind, TlsPlaintextProvider};
+use probe_config::{AgentConfig, TlsMaterialConfig, TlsMaterialKind};
 use probe_core::{CapabilityKind, CapabilityMatrix, RuntimeMode};
 use serde::{Deserialize, Serialize};
 
@@ -19,26 +19,50 @@ impl TlsPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsPlaintextPlan {
-    pub enabled: bool,
-    pub provider: TlsPlaintextProvider,
-    pub selector_configured: bool,
-    pub libssl_uprobe_object_path: Option<PathBuf>,
-    pub reconcile_interval_ms: u64,
-    pub capability: TlsPlaintextCapabilityPlan,
-    pub key_logs: Vec<TlsPlaintextMaterialPlan>,
-    pub session_secrets: Vec<TlsPlaintextMaterialPlan>,
+    pub instrumentation: TlsPlaintextInstrumentationPlan,
+    pub decrypt_hints: TlsDecryptHintPlan,
 }
 
 impl TlsPlaintextPlan {
     fn resolve(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
-        let materials_by_id = tls_plaintext_materials_by_id(&config.tls.materials);
+        Self {
+            instrumentation: TlsPlaintextInstrumentationPlan::resolve(config, capabilities),
+            decrypt_hints: TlsDecryptHintPlan::resolve(config),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsPlaintextInstrumentationPlan {
+    pub enabled: bool,
+    pub selector_configured: bool,
+    pub libssl_uprobe_object_path: Option<PathBuf>,
+    pub reconcile_interval_ms: u64,
+    pub capability: TlsPlaintextCapabilityPlan,
+}
+
+impl TlsPlaintextInstrumentationPlan {
+    fn resolve(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
         Self {
             enabled: config.tls.plaintext.enabled,
-            provider: config.tls.plaintext.provider,
             selector_configured: config.tls.plaintext.selector.is_some(),
             libssl_uprobe_object_path: config.tls.plaintext.libssl_uprobe_object_path.clone(),
             reconcile_interval_ms: config.tls.plaintext.reconcile_interval_ms,
             capability: TlsPlaintextCapabilityPlan::from_config(config, capabilities),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsDecryptHintPlan {
+    pub key_logs: Vec<TlsPlaintextMaterialPlan>,
+    pub session_secrets: Vec<TlsPlaintextMaterialPlan>,
+}
+
+impl TlsDecryptHintPlan {
+    fn resolve(config: &AgentConfig) -> Self {
+        let materials_by_id = tls_plaintext_materials_by_id(&config.tls.materials);
+        Self {
             key_logs: tls_plaintext_materials_from_refs(
                 &config.tls.plaintext.key_log_refs,
                 TlsMaterialKind::KeyLogFile,
@@ -68,14 +92,9 @@ impl TlsPlaintextCapabilityPlan {
         if !config.tls.plaintext.enabled {
             return Self::NotRequired;
         }
-        match config.tls.plaintext.provider {
-            TlsPlaintextProvider::LibsslUprobe => Self::Required {
-                capability: CapabilityKind::LibsslUprobe,
-                mode: capabilities.mode(CapabilityKind::LibsslUprobe),
-            },
-            TlsPlaintextProvider::Keylog => {
-                unreachable!("runtime validation rejects keylog plaintext provider before planning")
-            }
+        Self::Required {
+            capability: CapabilityKind::LibsslUprobe,
+            mode: capabilities.mode(CapabilityKind::LibsslUprobe),
         }
     }
 }
@@ -162,7 +181,6 @@ mod tests {
     fn tls_plaintext_plan_preserves_selector_and_capability_requirement() {
         let mut config = AgentConfig::default();
         config.tls.plaintext.enabled = true;
-        config.tls.plaintext.provider = TlsPlaintextProvider::LibsslUprobe;
         config.tls.plaintext.selector = Some(Selector::default());
         config.tls.plaintext.libssl_uprobe_object_path =
             Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
@@ -171,30 +189,28 @@ mod tests {
 
         let plan = TlsPlan::resolve(&config, &capabilities);
 
-        assert!(plan.plaintext.enabled);
-        assert_eq!(plan.plaintext.provider, TlsPlaintextProvider::LibsslUprobe);
-        assert!(plan.plaintext.selector_configured);
+        assert!(plan.plaintext.instrumentation.enabled);
+        assert!(plan.plaintext.instrumentation.selector_configured);
         assert_eq!(
-            plan.plaintext.libssl_uprobe_object_path,
+            plan.plaintext.instrumentation.libssl_uprobe_object_path,
             Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into())
         );
-        assert_eq!(plan.plaintext.reconcile_interval_ms, 2500);
+        assert_eq!(plan.plaintext.instrumentation.reconcile_interval_ms, 2500);
         assert_eq!(
-            plan.plaintext.capability,
+            plan.plaintext.instrumentation.capability,
             TlsPlaintextCapabilityPlan::Required {
                 capability: CapabilityKind::LibsslUprobe,
                 mode: RuntimeMode::Available,
             }
         );
-        assert!(plan.plaintext.key_logs.is_empty());
-        assert!(plan.plaintext.session_secrets.is_empty());
+        assert!(plan.plaintext.decrypt_hints.key_logs.is_empty());
+        assert!(plan.plaintext.decrypt_hints.session_secrets.is_empty());
     }
 
     #[test]
     fn tls_plaintext_plan_allows_degraded_libssl_capability_for_best_effort_instrumentation() {
         let mut config = AgentConfig::default();
         config.tls.plaintext.enabled = true;
-        config.tls.plaintext.provider = TlsPlaintextProvider::LibsslUprobe;
         config.tls.plaintext.libssl_uprobe_object_path =
             Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
         let capabilities = capability_matrix_with_libssl(RuntimeMode::Degraded);
@@ -202,7 +218,7 @@ mod tests {
         let plan = TlsPlan::resolve(&config, &capabilities);
 
         assert_eq!(
-            plan.plaintext.capability,
+            plan.plaintext.instrumentation.capability,
             TlsPlaintextCapabilityPlan::Required {
                 capability: CapabilityKind::LibsslUprobe,
                 mode: RuntimeMode::Degraded,
@@ -213,7 +229,6 @@ mod tests {
     #[test]
     fn tls_plaintext_plan_resolves_decrypt_hint_material_refs() {
         let mut config = AgentConfig::default();
-        config.tls.plaintext.provider = TlsPlaintextProvider::Keylog;
         config.tls.plaintext.key_log_refs = vec!["ssl-keys".to_string()];
         config.tls.plaintext.session_secret_refs = vec!["session-secrets".to_string()];
         config.tls.materials = vec![
@@ -233,11 +248,11 @@ mod tests {
         let plan = TlsPlan::resolve(&config, &capabilities);
 
         assert_eq!(
-            plan.plaintext.capability,
+            plan.plaintext.instrumentation.capability,
             TlsPlaintextCapabilityPlan::NotRequired
         );
         assert_eq!(
-            plan.plaintext.key_logs,
+            plan.plaintext.decrypt_hints.key_logs,
             vec![TlsPlaintextMaterialPlan {
                 id: "ssl-keys".to_string(),
                 kind: TlsMaterialKind::KeyLogFile,
@@ -245,7 +260,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            plan.plaintext.session_secrets,
+            plan.plaintext.decrypt_hints.session_secrets,
             vec![TlsPlaintextMaterialPlan {
                 id: "session-secrets".to_string(),
                 kind: TlsMaterialKind::SessionSecretFile,

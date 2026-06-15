@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use runtime::{ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportWorkerPlan};
+use runtime::{ExportFailureBackoffPlan, ExportPlan, ExportWorkerPlan, WebhookExportSinkPlan};
 use serde::Serialize;
 use storage::ExportSpool;
 use tokio::sync::Notify;
@@ -34,7 +34,7 @@ pub struct ExportWorker {
 
 pub struct ExportWorkerConfig {
     agent_id: String,
-    sinks: Vec<ExportSinkPlan>,
+    sinks: Vec<WebhookExportSinkPlan>,
     interval: Duration,
     sink_timeout: Duration,
     failure_backoff: ExportWorkerBackoffPolicy,
@@ -107,7 +107,7 @@ impl ExportWorker {
 impl ExportWorkerConfig {
     fn fixed_interval_bounded(
         agent_id: String,
-        sinks: Vec<ExportSinkPlan>,
+        sinks: Vec<WebhookExportSinkPlan>,
         interval: Duration,
         sink_timeout: Duration,
         failure_backoff: ExportWorkerBackoffPolicy,
@@ -393,13 +393,12 @@ mod tests {
 
     use probe_config::{
         AgentConfig, CompressionCodecName, ExportWorkerScheduleConfig, ExporterConfig,
-        ExporterTransport, TlsMaterialKind,
+        ExporterTransport,
     };
     use probe_core::{CapabilityKind, CapabilityState};
     use runtime::{
-        self, ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan,
-        ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan, ProviderRegistry,
-        RuntimePlan,
+        self, ExportFailureBackoffPlan, ExportPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
+        ExportWorkerPlan, ProviderRegistry, RuntimePlan, WebhookExportSinkPlan,
     };
     use storage::FjallSpool;
 
@@ -476,55 +475,6 @@ mod tests {
         assert!(!runtime_state.should_skip("sink", reset_failure + Duration::from_millis(100)));
     }
 
-    #[test]
-    fn export_worker_config_does_not_read_tls_materials_without_webhook_sinks()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let tls = ExportSinkTlsPlan {
-            trust_anchors: vec![tls_material(
-                "collector-ca",
-                TlsMaterialKind::TrustAnchor,
-                PathBuf::from("/missing/ca.pem"),
-            )],
-            client_certificates: vec![tls_material(
-                "client-cert",
-                TlsMaterialKind::ClientCertificate,
-                PathBuf::from("/missing/client.pem"),
-            )],
-            client_private_key: Some(tls_material(
-                "client-key",
-                TlsMaterialKind::ClientPrivateKey,
-                PathBuf::from("/missing/client.key"),
-            )),
-        };
-        let disabled = ExportPlan {
-            worker: ExportWorkerPlan::Disabled {
-                reason: "test".to_string(),
-            },
-            sinks: Vec::new(),
-        };
-        assert!(ExportWorkerConfig::from_plans("agent-1".to_string(), &disabled).is_none());
-        let non_webhook = ExportPlan {
-            worker: ExportWorkerPlan::FixedIntervalBounded {
-                interval_ms: 10,
-                batches_per_sink_per_tick: 1,
-                sink_timeout_ms: 5_000,
-                failure_backoff: fixed_failure_backoff(30_000),
-            },
-            sinks: vec![ExportSinkPlan {
-                id: "grpc".to_string(),
-                transport: ExporterTransport::Grpc,
-                endpoint: "https://collector.example".to_string(),
-                codec: CompressionCodecName::None,
-                headers: BTreeMap::new(),
-                tls,
-                worker: inherited_worker_quota(1),
-            }],
-        };
-
-        assert!(ExportWorkerConfig::from_plans("agent-1".to_string(), &non_webhook).is_some());
-        Ok(())
-    }
-
     #[tokio::test]
     async fn export_worker_drains_until_stopped() -> Result<(), Box<dyn std::error::Error>> {
         let temp = temp_path("planned-export-worker");
@@ -599,9 +549,8 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(30_000),
             },
-            sinks: vec![ExportSinkPlan {
+            sinks: vec![WebhookExportSinkPlan {
                 id: "budget".to_string(),
-                transport: ExporterTransport::Webhook,
                 endpoint: server.endpoint(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
@@ -643,9 +592,8 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(30_000),
             },
-            sinks: vec![ExportSinkPlan {
+            sinks: vec![WebhookExportSinkPlan {
                 id: "limited".to_string(),
-                transport: ExporterTransport::Webhook,
                 endpoint: server.endpoint(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),
@@ -688,18 +636,16 @@ mod tests {
                 failure_backoff: fixed_failure_backoff(60_000),
             },
             sinks: vec![
-                ExportSinkPlan {
+                WebhookExportSinkPlan {
                     id: "failing".to_string(),
-                    transport: ExporterTransport::Webhook,
                     endpoint: failing.endpoint(),
                     codec: CompressionCodecName::None,
                     headers: BTreeMap::new(),
                     tls: ExportSinkTlsPlan::default(),
                     worker: inherited_worker_quota(1),
                 },
-                ExportSinkPlan {
+                WebhookExportSinkPlan {
                     id: "successful".to_string(),
-                    transport: ExporterTransport::Webhook,
                     endpoint: successful.endpoint(),
                     codec: CompressionCodecName::None,
                     headers: BTreeMap::new(),
@@ -816,18 +762,6 @@ mod tests {
         }
     }
 
-    fn tls_material(
-        id: &str,
-        kind: TlsMaterialKind,
-        path: impl Into<PathBuf>,
-    ) -> ExportTlsMaterialPlan {
-        ExportTlsMaterialPlan {
-            id: id.to_string(),
-            kind,
-            path: path.into(),
-        }
-    }
-
     fn runtime_plan(config: AgentConfig) -> Result<RuntimePlan, runtime::RuntimeError> {
         RuntimePlan::build(
             config,
@@ -864,9 +798,8 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff,
             },
-            sinks: vec![ExportSinkPlan {
+            sinks: vec![WebhookExportSinkPlan {
                 id: sink.to_string(),
-                transport: ExporterTransport::Webhook,
                 endpoint: "https://collector.example/batches".to_string(),
                 codec: CompressionCodecName::None,
                 headers: BTreeMap::new(),

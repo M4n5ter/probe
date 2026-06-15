@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, num::NonZeroU64};
 
 use probe_config::{
     AgentConfig, CompressionCodecName, ExportFailureBackoffConfig, ExportWorkerScheduleConfig,
-    ExporterTlsConfig, ExporterTransport,
+    ExporterTlsConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +11,7 @@ use super::tls::{ExportTlsMaterialPlan, export_tls_materials_by_id};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportPlan {
     pub worker: ExportWorkerPlan,
-    pub sinks: Vec<ExportSinkPlan>,
+    pub sinks: Vec<WebhookExportSinkPlan>,
 }
 
 impl ExportPlan {
@@ -22,9 +22,8 @@ impl ExportPlan {
         let sinks = config
             .exporters
             .iter()
-            .map(|exporter| ExportSinkPlan {
+            .map(|exporter| WebhookExportSinkPlan {
                 id: exporter.id.clone(),
-                transport: exporter.transport,
                 endpoint: exporter.endpoint.clone(),
                 codec: exporter.codec,
                 headers: exporter.headers.clone(),
@@ -122,9 +121,8 @@ impl From<ExportFailureBackoffConfig> for ExportFailureBackoffPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExportSinkPlan {
+pub struct WebhookExportSinkPlan {
     pub id: String,
-    pub transport: ExporterTransport,
     pub endpoint: String,
     pub codec: CompressionCodecName,
     pub headers: BTreeMap<String, String>,
@@ -190,7 +188,9 @@ impl ExportSinkTlsPlan {
 mod tests {
     use std::path::PathBuf;
 
-    use probe_config::{ExporterConfig, ExporterWorkerConfig, TlsMaterialConfig, TlsMaterialKind};
+    use probe_config::{
+        ExporterConfig, ExporterTransport, ExporterWorkerConfig, TlsMaterialConfig, TlsMaterialKind,
+    };
 
     use super::*;
 
@@ -204,7 +204,7 @@ mod tests {
                 reason: "export worker has no planned sinks".to_string(),
             }
         );
-        assert_eq!(plan.sinks, Vec::<ExportSinkPlan>::new());
+        assert_eq!(plan.sinks, Vec::<WebhookExportSinkPlan>::new());
     }
 
     #[test]
@@ -275,9 +275,8 @@ mod tests {
         );
         assert_eq!(
             plan.sinks,
-            vec![ExportSinkPlan {
+            vec![WebhookExportSinkPlan {
                 id: "primary".to_string(),
-                transport: ExporterTransport::Webhook,
                 endpoint: "https://collector.example/batches".to_string(),
                 codec: CompressionCodecName::None,
                 headers: Default::default(),

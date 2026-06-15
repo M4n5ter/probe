@@ -128,7 +128,7 @@ fn enforcement_policy_reason(enforcement: &EnforcementStatusSnapshot, fallback: 
 }
 
 fn tls_health_contribution(tls: &TlsStatusSnapshot) -> HealthContribution {
-    let Some(runtime) = &tls.plaintext.runtime else {
+    let Some(runtime) = &tls.plaintext.instrumentation.runtime else {
         return HealthContribution::available();
     };
     match runtime.mode {
@@ -136,11 +136,11 @@ fn tls_health_contribution(tls: &TlsStatusSnapshot) -> HealthContribution {
             runtime
                 .reason
                 .clone()
-                .unwrap_or_else(|| "TLS plaintext runtime provider is disabled".to_string()),
+                .unwrap_or_else(|| "TLS plaintext instrumentation is disabled".to_string()),
         ),
         crate::tls_plaintext::TlsPlaintextRuntimeMode::Pending => {
             HealthContribution::degraded(runtime.reason.clone().unwrap_or_else(|| {
-                "TLS plaintext runtime provider has not been built yet".to_string()
+                "TLS plaintext instrumentation has not been built yet".to_string()
             }))
         }
         crate::tls_plaintext::TlsPlaintextRuntimeMode::NotConfigured

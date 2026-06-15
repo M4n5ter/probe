@@ -2,9 +2,7 @@ use std::collections::BTreeMap;
 
 use url::Url;
 
-use crate::{
-    ConfigViolation, ExporterConfig, ExporterTlsConfig, ExporterTransport, TlsMaterialKind,
-};
+use crate::{ConfigViolation, ExporterConfig, ExporterTlsConfig, TlsMaterialKind};
 
 pub(super) fn validate_exporter_tls(
     exporter: &ExporterConfig,
@@ -73,6 +71,5 @@ fn exporter_tls_configured(tls: &ExporterTlsConfig) -> bool {
 }
 
 fn webhook_endpoint_is_https(exporter: &ExporterConfig) -> bool {
-    exporter.transport == ExporterTransport::Webhook
-        && Url::parse(&exporter.endpoint).is_ok_and(|url| url.scheme() == "https")
+    Url::parse(&exporter.endpoint).is_ok_and(|url| url.scheme() == "https")
 }
