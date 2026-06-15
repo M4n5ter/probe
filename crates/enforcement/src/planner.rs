@@ -30,10 +30,9 @@ pub trait EnforcementPlanner {
 }
 
 pub struct ScopedEnforcementPlanner {
-    mode: EnforcementMode,
+    execution: EnforcementExecution,
     scope: TargetScope,
     protective_actions: ProtectiveActionProfile,
-    backend: Option<Box<dyn EnforcementBackend>>,
 }
 
 impl ScopedEnforcementPlanner {
@@ -61,14 +60,10 @@ impl ScopedEnforcementPlanner {
         selector: Option<&Selector>,
         protective_actions: ProtectiveActionProfile,
     ) -> Result<Self, EnforcementError> {
-        if mode == EnforcementMode::Enforce {
-            return Err(EnforcementError::BackendUnavailable);
-        }
         Ok(Self {
-            mode,
+            execution: EnforcementExecution::without_backend(mode)?,
             scope: TargetScope::compile(selector)?,
             protective_actions,
-            backend: None,
         })
     }
 
@@ -78,15 +73,14 @@ impl ScopedEnforcementPlanner {
         backend: impl EnforcementBackend + 'static,
     ) -> Result<Self, EnforcementError> {
         Ok(Self {
-            mode: EnforcementMode::Enforce,
+            execution: EnforcementExecution::Enforce(Box::new(backend)),
             scope: TargetScope::compile(selector)?,
             protective_actions,
-            backend: Some(Box::new(backend)),
         })
     }
 
     pub fn mode(&self) -> EnforcementMode {
-        self.mode
+        self.execution.mode()
     }
 
     pub fn protective_actions(&self) -> &[Action] {
@@ -132,7 +126,7 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
         };
 
         Some(EnforcementDecision {
-            mode: self.mode,
+            mode: self.mode(),
             outcome,
             requested_action: request.verdict.action,
             effective_action,
@@ -149,8 +143,8 @@ impl ScopedEnforcementPlanner {
         request: EnforcementPlanRequest<'_>,
     ) -> (EnforcementOutcome, Action, String) {
         let verdict = request.verdict;
-        match self.mode {
-            EnforcementMode::Disabled => (
+        match &mut self.execution {
+            EnforcementExecution::Disabled => (
                 EnforcementOutcome::Disabled,
                 Action::Observe,
                 format!(
@@ -158,7 +152,7 @@ impl ScopedEnforcementPlanner {
                     verdict.action, verdict.reason
                 ),
             ),
-            EnforcementMode::AuditOnly => (
+            EnforcementExecution::AuditOnly => (
                 EnforcementOutcome::AuditOnly,
                 Action::Observe,
                 format!(
@@ -166,7 +160,7 @@ impl ScopedEnforcementPlanner {
                     verdict.action, verdict.reason
                 ),
             ),
-            EnforcementMode::DryRun => (
+            EnforcementExecution::DryRun => (
                 EnforcementOutcome::DryRun,
                 Action::Observe,
                 format!(
@@ -174,10 +168,7 @@ impl ScopedEnforcementPlanner {
                     verdict.action, verdict.reason
                 ),
             ),
-            EnforcementMode::Enforce => {
-                let Some(backend) = self.backend.as_deref_mut() else {
-                    return failed_decision_parts(verdict, &EnforcementError::BackendUnavailable);
-                };
+            EnforcementExecution::Enforce(backend) => {
                 match backend.apply(EnforcementBackendRequest {
                     verdict,
                     trigger: request.trigger,
@@ -186,6 +177,33 @@ impl ScopedEnforcementPlanner {
                     Err(error) => failed_decision_parts(verdict, &error),
                 }
             }
+        }
+    }
+}
+
+enum EnforcementExecution {
+    Disabled,
+    AuditOnly,
+    DryRun,
+    Enforce(Box<dyn EnforcementBackend>),
+}
+
+impl EnforcementExecution {
+    fn without_backend(mode: EnforcementMode) -> Result<Self, EnforcementError> {
+        Ok(match mode {
+            EnforcementMode::Disabled => Self::Disabled,
+            EnforcementMode::AuditOnly => Self::AuditOnly,
+            EnforcementMode::DryRun => Self::DryRun,
+            EnforcementMode::Enforce => return Err(EnforcementError::BackendUnavailable),
+        })
+    }
+
+    fn mode(&self) -> EnforcementMode {
+        match self {
+            Self::Disabled => EnforcementMode::Disabled,
+            Self::AuditOnly => EnforcementMode::AuditOnly,
+            Self::DryRun => EnforcementMode::DryRun,
+            Self::Enforce(_) => EnforcementMode::Enforce,
         }
     }
 }
