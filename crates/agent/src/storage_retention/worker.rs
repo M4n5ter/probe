@@ -72,7 +72,11 @@ impl ExportRetentionLaneConfig {
     fn from_plans(export: &ExportPlan, storage: &StoragePlan) -> Option<Self> {
         let retention = &storage.retention.export;
         retention.enabled().then(|| Self {
-            cursor_owners: export.sinks.iter().map(|sink| sink.id.clone()).collect(),
+            cursor_owners: export
+                .sinks
+                .iter()
+                .map(|sink| sink.id().to_string())
+                .collect(),
             interval: Duration::from_millis(retention.sweep_interval_ms.get()),
             retention: retention.clone(),
         })
@@ -259,17 +263,20 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
-            sinks: vec![WebhookExportSinkPlan {
-                id: "collector".to_string(),
-                endpoint: "https://collector.example/batches".to_string(),
-                codec: CompressionCodecName::None,
-                headers: Default::default(),
-                tls: ExportSinkTlsPlan::default(),
-                worker: runtime::ExportSinkWorkerPlan {
-                    batches_per_tick_override: None,
-                    effective_batches_per_tick: NonZeroU64::new(1).expect("positive quota"),
-                },
-            }],
+            sinks: vec![
+                WebhookExportSinkPlan {
+                    id: "collector".to_string(),
+                    endpoint: "https://collector.example/batches".to_string(),
+                    codec: CompressionCodecName::None,
+                    headers: Default::default(),
+                    tls: ExportSinkTlsPlan::default(),
+                    worker: runtime::ExportSinkWorkerPlan {
+                        batches_per_tick_override: None,
+                        effective_batches_per_tick: NonZeroU64::new(1).expect("positive quota"),
+                    },
+                }
+                .into(),
+            ],
         };
         let storage = StoragePlan {
             retention: StorageRetentionPlan {
@@ -323,17 +330,20 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
-            sinks: vec![WebhookExportSinkPlan {
-                id: "collector".to_string(),
-                endpoint: "https://collector.example/batches".to_string(),
-                codec: CompressionCodecName::None,
-                headers: Default::default(),
-                tls: ExportSinkTlsPlan::default(),
-                worker: runtime::ExportSinkWorkerPlan {
-                    batches_per_tick_override: None,
-                    effective_batches_per_tick: NonZeroU64::new(1).expect("positive quota"),
-                },
-            }],
+            sinks: vec![
+                WebhookExportSinkPlan {
+                    id: "collector".to_string(),
+                    endpoint: "https://collector.example/batches".to_string(),
+                    codec: CompressionCodecName::None,
+                    headers: Default::default(),
+                    tls: ExportSinkTlsPlan::default(),
+                    worker: runtime::ExportSinkWorkerPlan {
+                        batches_per_tick_override: None,
+                        effective_batches_per_tick: NonZeroU64::new(1).expect("positive quota"),
+                    },
+                }
+                .into(),
+            ],
         };
         let storage = StoragePlan {
             retention: StorageRetentionPlan {

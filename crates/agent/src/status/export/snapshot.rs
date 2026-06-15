@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use probe_config::CompressionCodecName;
 use probe_core::RuntimeMode;
 use runtime::{
-    ExportRetentionPlan, ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan,
-    RuntimePlan, WebhookExportSinkPlan,
+    ExportRetentionPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
+    ExportTlsMaterialPlan, ExportWorkerPlan, RuntimePlan,
 };
 use serde::Serialize;
 
@@ -26,16 +26,27 @@ pub struct ExportStatusSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExporterStatusSnapshot {
     pub id: String,
-    pub codec: CompressionCodecName,
     pub worker: ExportWorkerPlan,
     pub sink_worker: ExportSinkWorkerPlan,
     pub runtime: Option<ExporterRuntimeStatusSnapshot>,
-    pub tls: ExporterTlsStatusSnapshot,
+    pub target: ExporterTargetStatusSnapshot,
     pub mode: RuntimeMode,
     pub reason: Option<String>,
     pub cursor: Option<u64>,
     pub export_last_sequence: Option<u64>,
     pub lag: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "transport")]
+pub enum ExporterTargetStatusSnapshot {
+    Webhook(WebhookExporterTargetStatusSnapshot),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WebhookExporterTargetStatusSnapshot {
+    pub codec: CompressionCodecName,
+    pub tls: ExporterTlsStatusSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -69,7 +80,8 @@ pub(in crate::status) fn exporter_statuses_with_runtime(
         .sinks
         .iter()
         .map(|sink| {
-            let cursor = cursors.get(&sink.id).copied();
+            let sink_id = sink.id();
+            let cursor = cursors.get(sink_id).copied();
             let export_last_sequence = spool.export_last_sequence;
             let cursor_invariant_error =
                 cursor.zip(export_last_sequence).and_then(|(cursor, last)| {
@@ -82,18 +94,17 @@ pub(in crate::status) fn exporter_statuses_with_runtime(
             let lag = cursor
                 .zip(export_last_sequence)
                 .and_then(|(cursor, last)| (cursor <= last).then(|| last - cursor));
-            let tls = exporter_tls_status(sink);
-            let (mode, reason) = exporter_mode(plan, spool, &tls, cursor_invariant_error);
+            let target = exporter_target_status(sink);
+            let (mode, reason) = exporter_mode(plan, spool, &target, cursor_invariant_error);
 
             ExporterStatusSnapshot {
-                id: sink.id.clone(),
-                codec: sink.codec,
+                id: sink_id.to_string(),
                 worker: plan.export.worker.clone(),
-                sink_worker: sink.worker.clone(),
+                sink_worker: sink.worker().clone(),
                 runtime: runtime
-                    .and_then(|runtime| runtime.sinks.get(&sink.id))
+                    .and_then(|runtime| runtime.sinks.get(sink_id))
                     .map(ExporterRuntimeStatusSnapshot::from),
-                tls,
+                target: target.snapshot,
                 mode,
                 reason,
                 cursor,
@@ -131,7 +142,7 @@ impl From<&ExportSinkWorkerRuntimeSnapshot> for ExporterRuntimeStatusSnapshot {
 fn exporter_mode(
     plan: &RuntimePlan,
     spool: &SpoolStatusSnapshot,
-    tls: &ExporterTlsStatusSnapshot,
+    target: &ExporterTargetStatus,
     cursor_reason: Option<String>,
 ) -> (RuntimeMode, Option<String>) {
     if spool.mode == RuntimeMode::Unavailable {
@@ -155,13 +166,8 @@ fn exporter_mode(
     if let Some(reason) = cursor_reason {
         return (RuntimeMode::Unavailable, Some(reason));
     }
-    if tls.mode == RuntimeMode::Unavailable {
-        return (
-            RuntimeMode::Unavailable,
-            tls.reason
-                .clone()
-                .or_else(|| Some("exporter TLS material is unavailable".to_string())),
-        );
+    if target.mode != RuntimeMode::Available {
+        return (target.mode, target.reason.clone());
     }
     if let Some(reason) = plan.export.worker.disabled_reason() {
         return (RuntimeMode::Degraded, Some(reason.to_string()));
@@ -169,13 +175,42 @@ fn exporter_mode(
     (RuntimeMode::Available, None)
 }
 
-fn exporter_tls_status(sink: &WebhookExportSinkPlan) -> ExporterTlsStatusSnapshot {
-    for material in sink
-        .tls
+struct ExporterTargetStatus {
+    snapshot: ExporterTargetStatusSnapshot,
+    mode: RuntimeMode,
+    reason: Option<String>,
+}
+
+fn exporter_target_status(sink: &ExportSinkPlan) -> ExporterTargetStatus {
+    match sink {
+        ExportSinkPlan::Webhook(sink) => {
+            let tls = exporter_tls_status(&sink.tls);
+            let mode = tls.mode;
+            let reason = (tls.mode == RuntimeMode::Unavailable).then(|| {
+                tls.reason
+                    .clone()
+                    .unwrap_or_else(|| "webhook exporter TLS material is unavailable".to_string())
+            });
+            ExporterTargetStatus {
+                snapshot: ExporterTargetStatusSnapshot::Webhook(
+                    WebhookExporterTargetStatusSnapshot {
+                        codec: sink.codec,
+                        tls,
+                    },
+                ),
+                mode,
+                reason,
+            }
+        }
+    }
+}
+
+fn exporter_tls_status(tls: &ExportSinkTlsPlan) -> ExporterTlsStatusSnapshot {
+    for material in tls
         .trust_anchors
         .iter()
-        .chain(&sink.tls.client_certificates)
-        .chain(sink.tls.client_private_key.iter())
+        .chain(&tls.client_certificates)
+        .chain(tls.client_private_key.iter())
     {
         let source = tls::material_source_status(&material.path);
         if source.mode == RuntimeMode::Unavailable {
@@ -253,6 +288,16 @@ mod tests {
             value[0]["sink_worker"]["effective_batches_per_tick"],
             json!(2)
         );
+        let exporter = value[0]
+            .as_object()
+            .expect("exporter status should serialize to an object");
+        assert!(!exporter.contains_key("codec"));
+        assert!(!exporter.contains_key("tls"));
+        let target = exporter.get("target").expect("target status");
+        assert_eq!(target["transport"], json!("webhook"));
+        assert_eq!(target["codec"], json!("none"));
+        assert_eq!(target["tls"]["mode"], json!("available"));
+        assert_eq!(target["tls"]["reason"], json!(null));
         Ok(())
     }
 
@@ -374,7 +419,8 @@ mod tests {
             None,
         );
 
-        assert_eq!(exporters[0].tls.mode, RuntimeMode::Unavailable);
+        let target = webhook_target(&exporters[0]);
+        assert_eq!(target.tls.mode, RuntimeMode::Unavailable);
         assert_eq!(exporters[0].mode, RuntimeMode::Unavailable);
         let exporter_reason = exporters[0]
             .reason
@@ -383,6 +429,16 @@ mod tests {
         assert!(exporter_reason.contains("TLS material collector-ca"));
         assert!(exporter_reason.contains("TrustAnchor"));
         assert!(exporter_reason.contains("missing-ca.pem"));
+        let value = serde_json::to_value(&exporters)?;
+        let target = &value[0]["target"];
+        assert_eq!(target["transport"], json!("webhook"));
+        assert_eq!(target["tls"]["mode"], json!("unavailable"));
+        let target_reason = target["tls"]["reason"]
+            .as_str()
+            .expect("missing TLS material should serialize target TLS reason");
+        assert!(target_reason.contains("TLS material collector-ca"));
+        assert!(target_reason.contains("TrustAnchor"));
+        assert!(target_reason.contains("missing-ca.pem"));
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -398,6 +454,12 @@ mod tests {
             ingress_retention: Default::default(),
             ingress_last_sequence: Some(ingress_last_sequence),
             export_last_sequence: Some(export_last_sequence),
+        }
+    }
+
+    fn webhook_target(exporter: &ExporterStatusSnapshot) -> &WebhookExporterTargetStatusSnapshot {
+        match &exporter.target {
+            ExporterTargetStatusSnapshot::Webhook(target) => target,
         }
     }
 }

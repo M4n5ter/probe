@@ -19,7 +19,7 @@ pub use enforcement::{
 };
 pub use error::RuntimeError;
 pub use export::{
-    ExportFailureBackoffPlan, ExportPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
+    ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
     ExportWorkerPlan, WebhookExportSinkPlan,
 };
 pub use registry::{PlatformProbeResults, ProviderRegistry};

@@ -184,8 +184,8 @@ pub fn collect_spool_status(plan: &RuntimePlan) -> SpoolStatusInput {
                 .sinks
                 .iter()
                 .map(|sink| {
-                    let cursor = export_cursors.get(&sink.id).copied().unwrap_or(0);
-                    (sink.id.clone(), cursor)
+                    let cursor = export_cursors.get(sink.id()).copied().unwrap_or(0);
+                    (sink.id().to_string(), cursor)
                 })
                 .collect::<BTreeMap<_, _>>();
             SpoolStatusInput::available(path, snapshot, export_cursors)
@@ -209,16 +209,16 @@ pub fn collect_running_spool_status(plan: &RuntimePlan, spool: &FjallSpool) -> S
     };
     let mut export_cursors = BTreeMap::new();
     for sink in &plan.export.sinks {
-        match spool.export_cursor(&sink.id) {
+        match spool.export_cursor(sink.id()) {
             Ok(cursor) => {
-                export_cursors.insert(sink.id.clone(), cursor);
+                export_cursors.insert(sink.id().to_string(), cursor);
             }
             Err(error) => {
                 return SpoolStatusInput::unavailable(
                     path,
                     format!(
                         "failed to inspect export cursor for sink {}: {error}",
-                        sink.id
+                        sink.id()
                     ),
                 );
             }

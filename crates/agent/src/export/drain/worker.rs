@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use runtime::{ExportFailureBackoffPlan, ExportPlan, ExportWorkerPlan, WebhookExportSinkPlan};
+use runtime::{ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportWorkerPlan};
 use serde::Serialize;
 use storage::ExportSpool;
 use tokio::sync::Notify;
@@ -34,7 +34,7 @@ pub struct ExportWorker {
 
 pub struct ExportWorkerConfig {
     agent_id: String,
-    sinks: Vec<WebhookExportSinkPlan>,
+    sinks: Vec<ExportSinkPlan>,
     interval: Duration,
     sink_timeout: Duration,
     failure_backoff: ExportWorkerBackoffPolicy,
@@ -107,7 +107,7 @@ impl ExportWorker {
 impl ExportWorkerConfig {
     fn fixed_interval_bounded(
         agent_id: String,
-        sinks: Vec<WebhookExportSinkPlan>,
+        sinks: Vec<ExportSinkPlan>,
         interval: Duration,
         sink_timeout: Duration,
         failure_backoff: ExportWorkerBackoffPolicy,
@@ -148,7 +148,7 @@ impl ExportWorkerRuntimeState {
                 sinks: config
                     .sinks
                     .iter()
-                    .map(|sink| (sink.id.clone(), ExportSinkWorkerRuntime::Idle))
+                    .map(|sink| (sink.id().to_string(), ExportSinkWorkerRuntime::Idle))
                     .collect(),
             })),
         }
@@ -317,23 +317,24 @@ async fn drain_export_sinks_once(
 ) -> Result<(), ExportDrainError> {
     let mut failures = Vec::new();
     for sink in &config.sinks {
+        let sink_id = sink.id();
         let now = Instant::now();
-        if runtime_state.should_skip(&sink.id, now) {
+        if runtime_state.should_skip(sink_id, now) {
             continue;
         }
         let mode = SinkDrainMode::MaxBatches {
-            max_batches: sink.worker.effective_batches_per_tick.get(),
+            max_batches: sink.worker().effective_batches_per_tick.get(),
             sink_timeout: config.sink_timeout,
         };
         let result = drain_export_sink_with_mode(spool, &config.agent_id, sink, mode).await;
         match result {
             Ok(()) => {
-                runtime_state.record_success(&sink.id);
+                runtime_state.record_success(sink_id);
             }
             Err(error) => {
-                eprintln!("exporter sink {} failed: {error}", sink.id);
-                runtime_state.record_failure(&sink.id, error.runtime_failure_reason());
-                failures.push(format!("{}: {error}", sink.id));
+                eprintln!("exporter sink {sink_id} failed: {error}");
+                runtime_state.record_failure(sink_id, error.runtime_failure_reason());
+                failures.push(format!("{sink_id}: {error}"));
             }
         }
     }
@@ -549,14 +550,17 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(30_000),
             },
-            sinks: vec![WebhookExportSinkPlan {
-                id: "budget".to_string(),
-                endpoint: server.endpoint(),
-                codec: CompressionCodecName::None,
-                headers: BTreeMap::new(),
-                tls: ExportSinkTlsPlan::default(),
-                worker: inherited_worker_quota(2),
-            }],
+            sinks: vec![
+                WebhookExportSinkPlan {
+                    id: "budget".to_string(),
+                    endpoint: server.endpoint(),
+                    codec: CompressionCodecName::None,
+                    headers: BTreeMap::new(),
+                    tls: ExportSinkTlsPlan::default(),
+                    worker: inherited_worker_quota(2),
+                }
+                .into(),
+            ],
         };
         let config = ExportWorkerConfig::from_plans("agent-1".to_string(), &plan)
             .expect("worker should be enabled");
@@ -602,14 +606,17 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(30_000),
             },
-            sinks: vec![WebhookExportSinkPlan {
-                id: "limited".to_string(),
-                endpoint: server.endpoint(),
-                codec: CompressionCodecName::None,
-                headers: BTreeMap::new(),
-                tls: ExportSinkTlsPlan::default(),
-                worker: overridden_worker_quota(1),
-            }],
+            sinks: vec![
+                WebhookExportSinkPlan {
+                    id: "limited".to_string(),
+                    endpoint: server.endpoint(),
+                    codec: CompressionCodecName::None,
+                    headers: BTreeMap::new(),
+                    tls: ExportSinkTlsPlan::default(),
+                    worker: overridden_worker_quota(1),
+                }
+                .into(),
+            ],
         };
         let config = ExportWorkerConfig::from_plans("agent-1".to_string(), &plan)
             .expect("worker should be enabled");
@@ -658,7 +665,8 @@ mod tests {
                     headers: BTreeMap::new(),
                     tls: ExportSinkTlsPlan::default(),
                     worker: inherited_worker_quota(1),
-                },
+                }
+                .into(),
                 WebhookExportSinkPlan {
                     id: "successful".to_string(),
                     endpoint: successful.endpoint(),
@@ -666,7 +674,8 @@ mod tests {
                     headers: BTreeMap::new(),
                     tls: ExportSinkTlsPlan::default(),
                     worker: inherited_worker_quota(1),
-                },
+                }
+                .into(),
             ],
         };
         let config = ExportWorkerConfig::from_plans("agent-1".to_string(), &plan)
@@ -824,14 +833,17 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff,
             },
-            sinks: vec![WebhookExportSinkPlan {
-                id: sink.to_string(),
-                endpoint: "https://collector.example/batches".to_string(),
-                codec: CompressionCodecName::None,
-                headers: BTreeMap::new(),
-                tls: ExportSinkTlsPlan::default(),
-                worker: inherited_worker_quota(1),
-            }],
+            sinks: vec![
+                WebhookExportSinkPlan {
+                    id: sink.to_string(),
+                    endpoint: "https://collector.example/batches".to_string(),
+                    codec: CompressionCodecName::None,
+                    headers: BTreeMap::new(),
+                    tls: ExportSinkTlsPlan::default(),
+                    worker: inherited_worker_quota(1),
+                }
+                .into(),
+            ],
         };
         ExportWorkerConfig::from_plans("agent-1".to_string(), &plan)
             .expect("fixed interval worker plan should produce worker config")

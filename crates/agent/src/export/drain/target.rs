@@ -1,6 +1,8 @@
 use exporter::{CompressionCodec, WebhookExporter, WebhookTlsConfig};
 use probe_config::CompressionCodecName;
-use runtime::{ExportPlan, ExportSinkTlsPlan, ExportTlsMaterialPlan, WebhookExportSinkPlan};
+use runtime::{
+    ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportTlsMaterialPlan, WebhookExportSinkPlan,
+};
 use storage::ExportSpool;
 
 use super::{
@@ -45,15 +47,15 @@ pub async fn drain_replay_webhook(
 pub(super) async fn drain_export_sinks_with_mode(
     spool: &impl ExportSpool,
     agent_id: &str,
-    sinks: &[WebhookExportSinkPlan],
+    sinks: &[ExportSinkPlan],
     mode: SinkDrainMode,
 ) -> Result<(), ExportDrainError> {
     let mut failures = Vec::new();
     for sink in sinks {
         let result = drain_export_sink_with_mode(spool, agent_id, sink, mode).await;
         if let Err(error) = result {
-            eprintln!("exporter sink {} failed: {error}", sink.id);
-            failures.push(format!("{}: {error}", sink.id));
+            eprintln!("exporter sink {} failed: {error}", sink.id());
+            failures.push(format!("{}: {error}", sink.id()));
         }
     }
     if failures.is_empty() {
@@ -82,16 +84,20 @@ pub(super) fn finish_export_sink_drain(
 pub(super) async fn drain_export_sink_with_mode(
     spool: &impl ExportSpool,
     agent_id: &str,
-    sink: &WebhookExportSinkPlan,
+    sink: &ExportSinkPlan,
     mode: SinkDrainMode,
 ) -> Result<(), ExportDrainError> {
-    drain_webhook_sink_with_mode(
-        spool,
-        agent_id,
-        webhook_export_target_from_plan_sink(sink),
-        mode,
-    )
-    .await
+    match sink {
+        ExportSinkPlan::Webhook(sink) => {
+            drain_webhook_sink_with_mode(
+                spool,
+                agent_id,
+                webhook_export_target_from_plan_sink(sink),
+                mode,
+            )
+            .await
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -334,21 +340,24 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
-            sinks: vec![WebhookExportSinkPlan {
-                id: "secure".to_string(),
-                endpoint: "https://collector.example/batches".to_string(),
-                codec: CompressionCodecName::None,
-                headers: BTreeMap::new(),
-                tls: ExportSinkTlsPlan {
-                    trust_anchors: vec![tls_material(
-                        "collector-ca",
-                        TlsMaterialKind::TrustAnchor,
-                        PathBuf::from("/missing/collector-ca.pem"),
-                    )],
-                    ..Default::default()
-                },
-                worker: inherited_worker_quota(1),
-            }],
+            sinks: vec![
+                WebhookExportSinkPlan {
+                    id: "secure".to_string(),
+                    endpoint: "https://collector.example/batches".to_string(),
+                    codec: CompressionCodecName::None,
+                    headers: BTreeMap::new(),
+                    tls: ExportSinkTlsPlan {
+                        trust_anchors: vec![tls_material(
+                            "collector-ca",
+                            TlsMaterialKind::TrustAnchor,
+                            PathBuf::from("/missing/collector-ca.pem"),
+                        )],
+                        ..Default::default()
+                    },
+                    worker: inherited_worker_quota(1),
+                }
+                .into(),
+            ],
         };
 
         let error = drain_planned_sinks(&spool, "agent-1", &plan)
@@ -372,21 +381,24 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
-            sinks: vec![WebhookExportSinkPlan {
-                id: "secure".to_string(),
-                endpoint: "https://collector.example/batches".to_string(),
-                codec: CompressionCodecName::None,
-                headers: BTreeMap::new(),
-                tls: ExportSinkTlsPlan {
-                    trust_anchors: vec![tls_material(
-                        "collector-ca",
-                        TlsMaterialKind::TrustAnchor,
-                        PathBuf::from("/missing/collector-ca.pem"),
-                    )],
-                    ..Default::default()
-                },
-                worker: inherited_worker_quota(1),
-            }],
+            sinks: vec![
+                WebhookExportSinkPlan {
+                    id: "secure".to_string(),
+                    endpoint: "https://collector.example/batches".to_string(),
+                    codec: CompressionCodecName::None,
+                    headers: BTreeMap::new(),
+                    tls: ExportSinkTlsPlan {
+                        trust_anchors: vec![tls_material(
+                            "collector-ca",
+                            TlsMaterialKind::TrustAnchor,
+                            PathBuf::from("/missing/collector-ca.pem"),
+                        )],
+                        ..Default::default()
+                    },
+                    worker: inherited_worker_quota(1),
+                }
+                .into(),
+            ],
         };
 
         drain_planned_sinks(&spool, "agent-1", &plan).await?;
@@ -530,14 +542,17 @@ mod tests {
                 sink_timeout_ms: 5_000,
                 failure_backoff: fixed_failure_backoff(30_000),
             },
-            sinks: vec![WebhookExportSinkPlan {
-                id: "tail".to_string(),
-                endpoint: server.endpoint(),
-                codec: CompressionCodecName::None,
-                headers: BTreeMap::new(),
-                tls: ExportSinkTlsPlan::default(),
-                worker: overridden_worker_quota(1),
-            }],
+            sinks: vec![
+                WebhookExportSinkPlan {
+                    id: "tail".to_string(),
+                    endpoint: server.endpoint(),
+                    codec: CompressionCodecName::None,
+                    headers: BTreeMap::new(),
+                    tls: ExportSinkTlsPlan::default(),
+                    worker: overridden_worker_quota(1),
+                }
+                .into(),
+            ],
         };
 
         drain_planned_sinks(&spool, "agent-1", &plan).await?;
@@ -587,21 +602,24 @@ mod tests {
             worker: ExportWorkerPlan::Disabled {
                 reason: "test".to_string(),
             },
-            sinks: vec![WebhookExportSinkPlan {
-                id: "secure".to_string(),
-                endpoint: "https://collector.example/batches".to_string(),
-                codec: CompressionCodecName::None,
-                headers: BTreeMap::new(),
-                tls: ExportSinkTlsPlan {
-                    trust_anchors: vec![tls_material(
-                        "collector-ca",
-                        TlsMaterialKind::TrustAnchor,
-                        path,
-                    )],
-                    ..Default::default()
-                },
-                worker: inherited_worker_quota(1),
-            }],
+            sinks: vec![
+                WebhookExportSinkPlan {
+                    id: "secure".to_string(),
+                    endpoint: "https://collector.example/batches".to_string(),
+                    codec: CompressionCodecName::None,
+                    headers: BTreeMap::new(),
+                    tls: ExportSinkTlsPlan {
+                        trust_anchors: vec![tls_material(
+                            "collector-ca",
+                            TlsMaterialKind::TrustAnchor,
+                            path,
+                        )],
+                        ..Default::default()
+                    },
+                    worker: inherited_worker_quota(1),
+                }
+                .into(),
+            ],
         }
     }
 

@@ -1,4 +1,4 @@
-use runtime::WebhookExportSinkPlan;
+use runtime::ExportSinkPlan;
 use storage::ExportSpool;
 
 use super::ExportDrainError;
@@ -7,12 +7,9 @@ const EXPORT_PRUNE_BATCH_LIMIT: usize = 1024;
 
 pub(super) fn prune_export_acknowledged_prefix_for_sinks(
     spool: &impl ExportSpool,
-    sinks: &[WebhookExportSinkPlan],
+    sinks: &[ExportSinkPlan],
 ) -> Result<(), ExportDrainError> {
-    let sink_ids = sinks
-        .iter()
-        .map(|sink| sink.id.as_str())
-        .collect::<Vec<_>>();
+    let sink_ids = sinks.iter().map(ExportSinkPlan::id).collect::<Vec<_>>();
     prune_export_acknowledged_prefix(spool, &sink_ids)
 }
 

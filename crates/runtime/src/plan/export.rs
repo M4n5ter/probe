@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, num::NonZeroU64};
 
 use probe_config::{
     AgentConfig, CompressionCodecName, ExportFailureBackoffConfig, ExportWorkerScheduleConfig,
-    ExporterTlsConfig,
+    ExporterTlsConfig, ExporterTransport,
 };
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +11,7 @@ use super::tls::{ExportTlsMaterialPlan, export_tls_materials_by_id};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportPlan {
     pub worker: ExportWorkerPlan,
-    pub sinks: Vec<WebhookExportSinkPlan>,
+    pub sinks: Vec<ExportSinkPlan>,
 }
 
 impl ExportPlan {
@@ -22,16 +22,18 @@ impl ExportPlan {
         let sinks = config
             .exporters
             .iter()
-            .map(|exporter| WebhookExportSinkPlan {
-                id: exporter.id.clone(),
-                endpoint: exporter.endpoint.clone(),
-                codec: exporter.codec,
-                headers: exporter.headers.clone(),
-                tls: ExportSinkTlsPlan::from_config(&exporter.tls, &materials_by_id),
-                worker: ExportSinkWorkerPlan::from_config(
-                    exporter.worker.batches_per_tick,
-                    default_sink_batches_per_tick,
-                ),
+            .map(|exporter| match exporter.transport {
+                ExporterTransport::Webhook => ExportSinkPlan::Webhook(WebhookExportSinkPlan {
+                    id: exporter.id.clone(),
+                    endpoint: exporter.endpoint.clone(),
+                    codec: exporter.codec,
+                    headers: exporter.headers.clone(),
+                    tls: ExportSinkTlsPlan::from_config(&exporter.tls, &materials_by_id),
+                    worker: ExportSinkWorkerPlan::from_config(
+                        exporter.worker.batches_per_tick,
+                        default_sink_batches_per_tick,
+                    ),
+                }),
             })
             .collect::<Vec<_>>();
         let worker = match (config.export.worker.enabled, sinks.is_empty()) {
@@ -121,6 +123,32 @@ impl From<ExportFailureBackoffConfig> for ExportFailureBackoffPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "transport")]
+pub enum ExportSinkPlan {
+    Webhook(WebhookExportSinkPlan),
+}
+
+impl ExportSinkPlan {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Webhook(sink) => &sink.id,
+        }
+    }
+
+    pub fn worker(&self) -> &ExportSinkWorkerPlan {
+        match self {
+            Self::Webhook(sink) => &sink.worker,
+        }
+    }
+}
+
+impl From<WebhookExportSinkPlan> for ExportSinkPlan {
+    fn from(value: WebhookExportSinkPlan) -> Self {
+        Self::Webhook(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookExportSinkPlan {
     pub id: String,
     pub endpoint: String,
@@ -204,7 +232,7 @@ mod tests {
                 reason: "export worker has no planned sinks".to_string(),
             }
         );
-        assert_eq!(plan.sinks, Vec::<WebhookExportSinkPlan>::new());
+        assert_eq!(plan.sinks, Vec::<ExportSinkPlan>::new());
     }
 
     #[test]
@@ -275,7 +303,7 @@ mod tests {
         );
         assert_eq!(
             plan.sinks,
-            vec![WebhookExportSinkPlan {
+            vec![ExportSinkPlan::Webhook(WebhookExportSinkPlan {
                 id: "primary".to_string(),
                 endpoint: "https://collector.example/batches".to_string(),
                 codec: CompressionCodecName::None,
@@ -301,7 +329,7 @@ mod tests {
                     batches_per_tick_override: Some(2),
                     effective_batches_per_tick: NonZeroU64::new(2).expect("positive batch quota"),
                 },
-            }]
+            })]
         );
     }
 
