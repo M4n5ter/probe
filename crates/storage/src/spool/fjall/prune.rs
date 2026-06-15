@@ -239,6 +239,9 @@ impl FjallSpool {
             sequence_key(next_live_records),
         );
         for key in &keys {
+            if lane == SpoolLane::Export {
+                self.remove_export_dedup_for_sequence_key(&mut batch, key.as_slice())?;
+            }
             batch.remove(self.queue(lane), key.as_slice());
         }
         if let Some((retired_through, cursor_updates)) = &cursor_retirement {
@@ -271,7 +274,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::spool::{
-        IngressCursorOwner, SpoolPayload,
+        AppendOutcome, IngressCursorOwner, SpoolPayload,
         lane::{LAST_EXPORT_SEQUENCE, LIVE_EXPORT_RECORDS, SpoolLane},
         record::encode_spool_record,
     };
@@ -316,6 +319,38 @@ mod tests {
         assert!(reopened.read_export_batch("late", 10)?.is_empty());
         reopened.ack_export("primary", 3)?;
         assert_eq!(reopened.export_cursor("primary")?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_export_through_removes_dedup_index_for_deleted_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        assert!(matches!(
+            spool.append_export_once("event-1", test_payload(b"one"))?,
+            AppendOutcome::Appended(_)
+        ));
+        assert!(matches!(
+            spool.append_export_once("event-2", test_payload(b"two"))?,
+            AppendOutcome::Appended(_)
+        ));
+
+        assert_eq!(spool.prune_export_through(1, 1)?, 1);
+        let reappended = spool.append_export_once("event-1", test_payload(b"one-again"))?;
+
+        let AppendOutcome::Appended(reappended) = reappended else {
+            panic!("pruned dedup key should be reusable");
+        };
+        assert_eq!(reappended.sequence, 3);
+        let events = spool.read_export_batch("late", 10)?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.sequence, event.payload.bytes().to_vec()))
+                .collect::<Vec<_>>(),
+            vec![(2, b"two".to_vec()), (3, b"one-again".to_vec())]
+        );
         Ok(())
     }
 

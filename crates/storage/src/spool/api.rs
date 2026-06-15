@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use super::{
     error::StorageError,
-    record::{RetentionPrune, SpoolPayload, StoredEvent},
+    record::{AppendOutcome, RetentionPrune, SpoolPayload, StoredEvent},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +103,22 @@ pub trait DurableSpool: ExportSpool {
 
     fn ingress_cursor(&self, consumer: IngressCursorOwner) -> Result<u64, StorageError>;
 
+    /// Appends a new export record without idempotency.
+    ///
+    /// Callers that own stable semantic event IDs should prefer
+    /// [`Self::append_export_once`].
     fn append_export(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError>;
+
+    /// Appends an export record unless `dedup_key` already points to a retained
+    /// durable export record.
+    ///
+    /// The dedup key lives with the export queue record. Pruning or retention
+    /// removes the key, making a later append with the same key valid again.
+    fn append_export_once(
+        &self,
+        dedup_key: &str,
+        payload: SpoolPayload,
+    ) -> Result<AppendOutcome, StorageError>;
 
     /// Removes expired ingress journal records from the durable prefix.
     ///

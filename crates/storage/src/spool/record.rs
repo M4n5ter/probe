@@ -37,6 +37,17 @@ pub struct StoredEvent {
     pub payload: SpoolPayload,
 }
 
+/// Result of an idempotent export append.
+///
+/// `Duplicate` means the dedup key already points to a retained, durable export
+/// record. It is not a permanent tombstone: pruning or retention can make the key
+/// appendable again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppendOutcome {
+    Appended(StoredEvent),
+    Duplicate { sequence: u64 },
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RetentionPrune {
     pub pruned_count: u64,

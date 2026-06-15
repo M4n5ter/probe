@@ -11,7 +11,7 @@ use probe_core::{
     CompiledSelector, EnforcementDecision, EventEnvelope, EventKind, EventProvenance,
     PolicyEmissionStage, PolicyRuntimeError, SpoolPayloadSchema, Timestamp, Verdict,
 };
-use storage::{DurableSpool, IngressCursorOwner, SpoolPayload};
+use storage::{AppendOutcome, DurableSpool, IngressCursorOwner, SpoolPayload};
 use thiserror::Error;
 
 use crate::runtime_metrics::PipelineRuntimeMetrics;
@@ -431,8 +431,7 @@ where
         emissions: &mut IngressEmissions,
     ) -> Result<u64, PipelineError> {
         let envelope = envelope.with_provenance(emissions.next_primary());
-        self.append_envelope(&envelope)?;
-        let mut written = 1;
+        let mut written = u64::from(self.append_envelope(&envelope)?);
 
         if let Some(hook) = hook_for_event(&envelope) {
             let active_policies = self.policies.snapshot();
@@ -458,11 +457,18 @@ where
                 policy_version,
                 reason,
             } => {
-                self.append_policy_runtime_error(envelope, &policy_version, policy_index, reason)?;
-                if let Some(metrics) = &self.runtime_metrics {
+                let written = self.append_policy_runtime_error(
+                    envelope,
+                    &policy_version,
+                    policy_index,
+                    reason,
+                )?;
+                if written > 0
+                    && let Some(metrics) = &self.runtime_metrics
+                {
                     metrics.record_policy_error();
                 }
-                Ok(1)
+                Ok(written)
             }
             PolicyEvaluation::Outcomes {
                 policy_version,
@@ -489,7 +495,7 @@ where
         policy_version: &str,
         policy_index: u64,
         reason: String,
-    ) -> Result<(), PipelineError> {
+    ) -> Result<u64, PipelineError> {
         self.append_policy_event(
             envelope,
             policy_version,
@@ -501,6 +507,7 @@ where
                 reason,
             }),
         )
+        .map(u64::from)
     }
 
     fn append_policy_outcome(
@@ -513,7 +520,7 @@ where
     ) -> Result<u64, PipelineError> {
         match outcome {
             PolicyOutcome::Alert(alert) => {
-                self.append_policy_event(
+                let written = self.append_policy_event(
                     envelope,
                     policy_version,
                     policy_index,
@@ -521,13 +528,13 @@ where
                     PolicyEmissionStage::Output,
                     EventKind::PolicyAlert(alert),
                 )?;
-                if let Some(metrics) = &self.runtime_metrics {
+                if written && let Some(metrics) = &self.runtime_metrics {
                     metrics.record_policy_alert();
                 }
-                Ok(1)
+                Ok(u64::from(written))
             }
             PolicyOutcome::Verdict(verdict) => {
-                self.append_policy_event(
+                let verdict_written = self.append_policy_event(
                     envelope,
                     policy_version,
                     policy_index,
@@ -535,15 +542,16 @@ where
                     PolicyEmissionStage::Output,
                     EventKind::PolicyVerdict(verdict.clone()),
                 )?;
-                if let Some(metrics) = &self.runtime_metrics {
+                let mut written = u64::from(verdict_written);
+                if verdict_written && let Some(metrics) = &self.runtime_metrics {
                     metrics.record_policy_verdict();
                 }
 
                 let Some(decision) = self.evaluate_enforcement_decision(envelope, &verdict) else {
-                    return Ok(1);
+                    return Ok(written);
                 };
                 let decision_outcome = decision.outcome;
-                self.append_policy_event(
+                let decision_written = self.append_policy_event(
                     envelope,
                     policy_version,
                     policy_index,
@@ -551,10 +559,11 @@ where
                     PolicyEmissionStage::EnforcementDecision,
                     EventKind::EnforcementDecision(decision),
                 )?;
-                if let Some(metrics) = &self.runtime_metrics {
+                written += u64::from(decision_written);
+                if decision_written && let Some(metrics) = &self.runtime_metrics {
                     metrics.record_enforcement_decision(decision_outcome);
                 }
-                Ok(2)
+                Ok(written)
             }
         }
     }
@@ -576,7 +585,7 @@ where
         output_index: u64,
         stage: PolicyEmissionStage,
         kind: EventKind,
-    ) -> Result<(), PipelineError> {
+    ) -> Result<bool, PipelineError> {
         let trigger_provenance = envelope
             .provenance
             .as_ref()
@@ -596,20 +605,20 @@ where
             output_index,
             stage,
         ));
-        self.append_envelope(&policy_envelope)?;
-        Ok(())
+        self.append_envelope(&policy_envelope)
     }
 
-    fn append_envelope(&self, envelope: &EventEnvelope) -> Result<(), PipelineError> {
+    fn append_envelope(&self, envelope: &EventEnvelope) -> Result<bool, PipelineError> {
         let payload = serde_json::to_vec(envelope)?;
-        self.spool.append_export(SpoolPayload::new(
-            SpoolPayloadSchema::EventEnvelopeJson,
-            payload,
-        ))?;
-        if let Some(metrics) = &self.runtime_metrics {
+        let outcome = self.spool.append_export_once(
+            &envelope.id.0,
+            SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeJson, payload),
+        )?;
+        let appended = matches!(outcome, AppendOutcome::Appended(_));
+        if appended && let Some(metrics) = &self.runtime_metrics {
             metrics.record_export_event_written();
         }
-        Ok(())
+        Ok(appended)
     }
 }
 

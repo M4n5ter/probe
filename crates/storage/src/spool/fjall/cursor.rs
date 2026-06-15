@@ -5,10 +5,13 @@ use fjall::PersistMode;
 use crate::spool::{
     IngressCursorOwner, SpoolPayload, StorageError, StoredEvent,
     lane::SpoolLane,
-    record::{decode_spool_record, encode_spool_record},
+    record::{AppendOutcome, decode_spool_record, encode_spool_record},
 };
 
-use super::store::{FjallSpool, decode_sequence_key, sequence_key};
+use super::{
+    dedup::ExportDedupLookup,
+    store::{FjallSpool, decode_sequence_key, sequence_key},
+};
 
 impl FjallSpool {
     pub fn append_ingress(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError> {
@@ -45,6 +48,14 @@ impl FjallSpool {
 
     pub fn append_export(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError> {
         self.append_payload(SpoolLane::Export, payload)
+    }
+
+    pub fn append_export_once(
+        &self,
+        dedup_key: &str,
+        payload: SpoolPayload,
+    ) -> Result<AppendOutcome, StorageError> {
+        self.append_export_once_at(dedup_key, payload, current_unix_time_ns())
     }
 
     pub fn read_export_batch(
@@ -104,6 +115,59 @@ impl FjallSpool {
             stored_at_unix_ns,
             payload,
         })
+    }
+
+    pub(super) fn append_export_once_at(
+        &self,
+        dedup_key: &str,
+        payload: SpoolPayload,
+        stored_at_unix_ns: u64,
+    ) -> Result<AppendOutcome, StorageError> {
+        if dedup_key.is_empty() {
+            return Err(StorageError::EmptyExportDedupKey);
+        }
+
+        let lane = SpoolLane::Export;
+        let mut last_sequence = self.lock_last_sequence(lane)?;
+        let dedup_lookup = self.lookup_export_dedup(dedup_key, *last_sequence)?;
+        let stale_sequence = match dedup_lookup {
+            ExportDedupLookup::None => None,
+            ExportDedupLookup::DurableDuplicate { sequence } => {
+                return Ok(AppendOutcome::Duplicate { sequence });
+            }
+            ExportDedupLookup::Stale { sequence } => Some(sequence),
+        };
+
+        let sequence = last_sequence
+            .checked_add(1)
+            .ok_or(StorageError::SequenceOverflow)?;
+        let mut live_records = self.lock_live_records(lane)?;
+        let next_live_records = live_records
+            .checked_add(1)
+            .ok_or(StorageError::SequenceOverflow)?;
+        let key = sequence_key(sequence);
+        let encoded = encode_spool_record(stored_at_unix_ns, &payload)?;
+        let mut batch = self.database.batch();
+        if let Some(sequence) = stale_sequence {
+            self.remove_export_dedup_entry(&mut batch, dedup_key, sequence)?;
+        }
+        batch.insert(&self.export_queue, key, encoded);
+        self.insert_export_dedup_indexes(&mut batch, dedup_key, key);
+        batch.insert(&self.metadata, lane.last_sequence_key(), key);
+        batch.insert(
+            &self.metadata,
+            lane.live_records_key(),
+            sequence_key(next_live_records),
+        );
+        batch.commit()?;
+        self.database.persist(PersistMode::SyncAll)?;
+        *last_sequence = sequence;
+        *live_records = next_live_records;
+        Ok(AppendOutcome::Appended(StoredEvent {
+            sequence,
+            stored_at_unix_ns,
+            payload,
+        }))
     }
 
     fn read_batch_from_lane(
@@ -240,6 +304,150 @@ mod tests {
 
         let secondary = spool.read_export_batch("secondary", 10)?;
         assert_eq!(secondary.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn append_export_once_deduplicates_event_key() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+
+        let first = spool.append_export_once("event-1", test_payload(b"one"))?;
+        let duplicate = spool.append_export_once("event-1", test_payload(b"duplicate"))?;
+
+        let AppendOutcome::Appended(first) = first else {
+            panic!("first append should store a new export event");
+        };
+        assert_eq!(first.sequence, 1);
+        assert_eq!(duplicate, AppendOutcome::Duplicate { sequence: 1 });
+        assert_eq!(spool.snapshot()?.last_export_sequence, 1);
+        let events = spool.read_export_batch("primary", 10)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload.bytes(), b"one");
+        Ok(())
+    }
+
+    #[test]
+    fn append_export_once_recovers_dedup_index_after_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        assert!(matches!(
+            spool.append_export_once("event-1", test_payload(b"one"))?,
+            AppendOutcome::Appended(_)
+        ));
+        drop(spool);
+
+        let reopened = FjallSpool::open(temp.path())?;
+        let duplicate = reopened.append_export_once("event-1", test_payload(b"duplicate"))?;
+
+        assert_eq!(duplicate, AppendOutcome::Duplicate { sequence: 1 });
+        assert_eq!(reopened.snapshot()?.last_export_sequence, 1);
+        let events = reopened.read_export_batch("primary", 10)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload.bytes(), b"one");
+        Ok(())
+    }
+
+    #[test]
+    fn append_export_once_ignores_dedup_records_above_durable_high_water()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        let future_key = sequence_key(1);
+        let mut batch = spool.database.batch();
+        batch.insert(
+            &spool.export_queue,
+            future_key,
+            encode_spool_record(42, &test_payload(b"future"))?,
+        );
+        batch.insert(&spool.export_dedup, b"event-1".as_slice(), future_key);
+        batch.insert(
+            &spool.export_dedup_by_sequence,
+            future_key,
+            b"event-1".as_slice(),
+        );
+        batch.commit()?;
+
+        let outcome = spool.append_export_once("event-1", test_payload(b"durable"))?;
+
+        let AppendOutcome::Appended(stored) = outcome else {
+            panic!("dedup index above durable high-water must not suppress append");
+        };
+        assert_eq!(stored.sequence, 1);
+        assert_eq!(spool.snapshot()?.last_export_sequence, 1);
+        let events = spool.read_export_batch("primary", 10)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload.bytes(), b"durable");
+        Ok(())
+    }
+
+    #[test]
+    fn append_export_once_requires_matching_reverse_dedup_index()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        let reused_key = sequence_key(1);
+        let mut batch = spool.database.batch();
+        batch.insert(
+            &spool.export_queue,
+            reused_key,
+            encode_spool_record(42, &test_payload(b"new-owner"))?,
+        );
+        batch.insert(&spool.export_dedup, b"old-id".as_slice(), reused_key);
+        batch.insert(&spool.export_dedup, b"new-id".as_slice(), reused_key);
+        batch.insert(
+            &spool.export_dedup_by_sequence,
+            reused_key,
+            b"new-id".as_slice(),
+        );
+        batch.insert(
+            &spool.metadata,
+            SpoolLane::Export.last_sequence_key(),
+            reused_key,
+        );
+        batch.insert(
+            &spool.metadata,
+            SpoolLane::Export.live_records_key(),
+            reused_key,
+        );
+        batch.commit()?;
+        spool.database.persist(PersistMode::SyncAll)?;
+        drop(spool);
+
+        let spool = FjallSpool::open(temp.path())?;
+        let outcome = spool.append_export_once("old-id", test_payload(b"old-owner"))?;
+
+        let AppendOutcome::Appended(stored) = outcome else {
+            panic!("mismatched reverse dedup index must not suppress append");
+        };
+        assert_eq!(stored.sequence, 2);
+        let duplicate_old = spool.append_export_once("old-id", test_payload(b"old-duplicate"))?;
+        let duplicate_new = spool.append_export_once("new-id", test_payload(b"new-duplicate"))?;
+        assert_eq!(duplicate_old, AppendOutcome::Duplicate { sequence: 2 });
+        assert_eq!(duplicate_new, AppendOutcome::Duplicate { sequence: 1 });
+        let events = spool.read_export_batch("primary", 10)?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.payload.bytes().to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"new-owner".to_vec(), b"old-owner".to_vec()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn append_export_once_rejects_empty_dedup_key() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+
+        let error = spool
+            .append_export_once("", test_payload(b"one"))
+            .expect_err("empty export dedup key must fail");
+
+        assert!(matches!(error, StorageError::EmptyExportDedupKey));
+        assert_eq!(spool.snapshot()?.last_export_sequence, 0);
         Ok(())
     }
 

@@ -783,14 +783,15 @@ impl storage::DurableSpool for ExportFailureAfterFirstSpool {
         &self,
         payload: storage::SpoolPayload,
     ) -> Result<storage::StoredEvent, storage::StorageError> {
-        let remaining = self.successful_export_appends.get();
-        if remaining == 0 {
-            return Err(storage::StorageError::Io(std::io::Error::other(
-                "planned export failure",
-            )));
-        }
-        self.successful_export_appends.set(remaining - 1);
-        self.inner.append_export(payload)
+        self.append_export_with_failure(|| self.inner.append_export(payload))
+    }
+
+    fn append_export_once(
+        &self,
+        dedup_key: &str,
+        payload: storage::SpoolPayload,
+    ) -> Result<storage::AppendOutcome, storage::StorageError> {
+        self.append_export_with_failure(|| self.inner.append_export_once(dedup_key, payload))
     }
 
     fn prune_expired_ingress_prefix(
@@ -811,5 +812,21 @@ impl storage::DurableSpool for ExportFailureAfterFirstSpool {
     ) -> Result<storage::RetentionPrune, storage::StorageError> {
         self.inner
             .prune_ingress_to_max_records(max_records, limit, consumers)
+    }
+}
+
+impl ExportFailureAfterFirstSpool {
+    fn append_export_with_failure<T>(
+        &self,
+        append: impl FnOnce() -> Result<T, storage::StorageError>,
+    ) -> Result<T, storage::StorageError> {
+        let remaining = self.successful_export_appends.get();
+        if remaining == 0 {
+            return Err(storage::StorageError::Io(std::io::Error::other(
+                "planned export failure",
+            )));
+        }
+        self.successful_export_appends.set(remaining - 1);
+        append()
     }
 }

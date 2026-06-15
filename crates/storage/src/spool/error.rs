@@ -19,6 +19,10 @@ pub enum StorageError {
     InvalidMetadata { key: String, len: usize },
     #[error("spool sequence overflow")]
     SequenceOverflow,
+    #[error("export dedup key must not be empty")]
+    EmptyExportDedupKey,
+    #[error("invalid export dedup index value for key {key}: expected 8 bytes, got {len}")]
+    InvalidExportDedupIndex { key: String, len: usize },
     #[error("{lane} sequence lock poisoned")]
     SequenceLockPoisoned { lane: &'static str },
     #[error("{lane} live-record count lock poisoned")]

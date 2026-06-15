@@ -111,7 +111,7 @@ fn default_platform_capabilities(
         ),
         CapabilityState::degraded(
             CapabilityKind::DurableSpool,
-            "ingress recovery can replay persisted capture events, including bytes, gaps, and connection lifecycle events, pipeline export events carry ingress provenance for stable replay ids, and parser recovery advances a durable safe-prefix cursor, but recovery is at-least-once, replays under the current config and policy, active parser state is not serialized, and export queue writes are not deduplicated by event id",
+            "ingress recovery can replay persisted capture events, including bytes, gaps, and connection lifecycle events, pipeline export events carry ingress provenance for stable replay ids, pipeline-generated retained export records are deduplicated by event id, and parser recovery advances a durable safe-prefix cursor, but recovery replays under the current config and policy and active parser state is not serialized",
         ),
         CapabilityState::degraded(
             CapabilityKind::IngressJournal,
@@ -203,7 +203,7 @@ mod tests {
                 .iter()
                 .find(|state| state.kind == CapabilityKind::DurableSpool)
                 .and_then(|state| state.reason.as_deref())
-                .is_some_and(|reason| reason.contains("at-least-once"))
+                .is_some_and(|reason| reason.contains("active parser state is not serialized"))
         );
         assert!(
             matrix

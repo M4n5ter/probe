@@ -1,7 +1,8 @@
 use capture::CaptureEvent;
 use parsers::Http1ParserFactory;
 use pipeline::{
-    CapturePipeline, PARSER_INGRESS_CURSOR_OWNER, PipelineError, PipelinePolicy, PipelineSummary,
+    CapturePipeline, PARSER_INGRESS_CURSOR_OWNER, PipelineError, PipelinePolicy,
+    PipelineRuntimeMetrics, PipelineSummary,
 };
 use policy::{PolicyHook, PolicyManifest, PolicyRuntime};
 use probe_core::{CaptureSource, Direction, EventKind, Gap, SpoolPayloadSchema, Timestamp};
@@ -48,12 +49,12 @@ fn recover_ingress_journal_replays_capture_bytes() -> Result<(), Box<dyn std::er
         .expect("first recovery should export request");
     let repeated = recover_without_policy(&spool)?;
     assert_eq!(repeated.ingress_records_recovered, 1);
-    assert_eq!(repeated.export_events_written, 1);
+    assert_eq!(repeated.export_events_written, 0);
     assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 0);
-    assert_eq!(count_request_targets(&spool, "/recovered")?, 2);
+    assert_eq!(count_request_targets(&spool, "/recovered")?, 1);
     assert_eq!(
         request_ids_for_target(&spool, "/recovered")?,
-        vec![first_id.clone(), first_id]
+        vec![first_id]
     );
     Ok(())
 }
@@ -79,8 +80,60 @@ fn recover_ingress_journal_replays_policy_outputs_with_stable_event_id()
         .expect("first recovery should export policy alert");
     let repeated = recover_with_policy(&spool, recovery_policy()?)?;
     assert_eq!(repeated.ingress_records_recovered, 1);
-    assert_eq!(repeated.export_events_written, 2);
-    assert_eq!(policy_alert_ids(&spool)?, vec![first_id.clone(), first_id]);
+    assert_eq!(repeated.export_events_written, 0);
+    assert_eq!(policy_alert_ids(&spool)?, vec![first_id]);
+    Ok(())
+}
+
+#[test]
+fn recover_ingress_journal_counts_duplicate_policy_replay_as_evaluation_not_persisted_output()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let event = captured_bytes_with_direction(
+        demo_flow_with_ports(50_000, 80, 36),
+        Direction::Outbound,
+        b"GET /metric-recovered HTTP/1.1\r\nHost: recovery.test\r\n\r\n",
+    );
+    spool.append_ingress(capture_event_payload(&event)?)?;
+    let metrics = PipelineRuntimeMetrics::default();
+
+    let first = recover_with_policy_and_metrics(&spool, recovery_policy()?, metrics.clone())?;
+    let repeated = recover_with_policy_and_metrics(&spool, recovery_policy()?, metrics.clone())?;
+
+    assert_eq!(first.export_events_written, 2);
+    assert_eq!(repeated.export_events_written, 0);
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.policy.evaluations, 2);
+    assert_eq!(snapshot.policy.alerts, 1);
+    assert_eq!(snapshot.export_events_written, 2);
+    Ok(())
+}
+
+#[test]
+fn recover_ingress_journal_adds_missing_policy_output_for_existing_primary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let event = captured_bytes_with_direction(
+        demo_flow_with_ports(50_000, 80, 40),
+        Direction::Outbound,
+        b"GET /late-policy HTTP/1.1\r\nHost: recovery.test\r\n\r\n",
+    );
+    spool.append_ingress(capture_event_payload(&event)?)?;
+
+    let primary_only = recover_without_policy(&spool)?;
+    assert_eq!(primary_only.export_events_written, 1);
+    let with_policy = recover_with_policy(&spool, recovery_policy()?)?;
+
+    assert_eq!(with_policy.ingress_records_recovered, 1);
+    assert_eq!(with_policy.export_events_written, 1);
+    assert_eq!(count_request_targets(&spool, "/late-policy")?, 1);
+    assert_eq!(policy_alert_ids(&spool)?.len(), 1);
+    let repeated = recover_with_policy(&spool, recovery_policy()?)?;
+    assert_eq!(repeated.export_events_written, 0);
+    assert_eq!(count_request_targets(&spool, "/late-policy")?, 1);
+    assert_eq!(policy_alert_ids(&spool)?.len(), 1);
     Ok(())
 }
 
@@ -126,8 +179,8 @@ fn recover_ingress_journal_replays_persisted_prefix_for_parser_state()
     }));
     let repeated = recover_without_policy(&spool)?;
     assert_eq!(repeated.ingress_records_recovered, 2);
-    assert_eq!(repeated.export_events_written, 1);
-    assert_eq!(count_request_targets(&spool, "/split-recovered")?, 2);
+    assert_eq!(repeated.export_events_written, 0);
+    assert_eq!(count_request_targets(&spool, "/split-recovered")?, 1);
     Ok(())
 }
 
@@ -330,13 +383,22 @@ fn recover_with_policy(
     spool: &storage::FjallSpool,
     policy: PolicyRuntime,
 ) -> Result<PipelineSummary, PipelineError> {
+    recover_with_policy_and_metrics(spool, policy, PipelineRuntimeMetrics::default())
+}
+
+fn recover_with_policy_and_metrics(
+    spool: &storage::FjallSpool,
+    policy: PolicyRuntime,
+    metrics: PipelineRuntimeMetrics,
+) -> Result<PipelineSummary, PipelineError> {
     let mut parser_factory = Http1ParserFactory::default();
     let mut pipeline = CapturePipeline::new(
         spool,
         &mut parser_factory,
         vec![PipelinePolicy::unscoped(policy)],
         "test",
-    );
+    )
+    .with_runtime_metrics(metrics);
     pipeline.recover_ingress_journal_until_idle(16)
 }
 

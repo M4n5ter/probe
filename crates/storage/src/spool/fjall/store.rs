@@ -12,13 +12,15 @@ use crate::spool::{
         SpoolLane,
     },
     marker::{ensure_spool_markers, validate_existing_spool_markers},
-    record::{RetentionPrune, SpoolPayload, StoredEvent},
+    record::{AppendOutcome, RetentionPrune, SpoolPayload, StoredEvent},
 };
 
 const INGRESS_JOURNAL: &str = "ingress_journal";
 const EXPORT_QUEUE: &str = "export_queue";
 const INGRESS_CURSORS: &str = "ingress_cursors";
 const EXPORT_CURSORS: &str = "export_cursors";
+const EXPORT_DEDUP: &str = "export_dedup";
+const EXPORT_DEDUP_BY_SEQUENCE: &str = "export_dedup_by_sequence";
 const METADATA: &str = "metadata";
 pub struct FjallSpool {
     pub(super) database: Database,
@@ -26,6 +28,8 @@ pub struct FjallSpool {
     pub(super) export_queue: Keyspace,
     ingress_cursors: Keyspace,
     pub(super) export_cursors: Keyspace,
+    pub(super) export_dedup: Keyspace,
+    pub(super) export_dedup_by_sequence: Keyspace,
     pub(super) metadata: Keyspace,
     last_ingress_sequence: Mutex<u64>,
     last_export_sequence: Mutex<u64>,
@@ -42,6 +46,9 @@ impl FjallSpool {
         let export_queue = database.keyspace(EXPORT_QUEUE, KeyspaceCreateOptions::default)?;
         let ingress_cursors = database.keyspace(INGRESS_CURSORS, KeyspaceCreateOptions::default)?;
         let export_cursors = database.keyspace(EXPORT_CURSORS, KeyspaceCreateOptions::default)?;
+        let export_dedup = database.keyspace(EXPORT_DEDUP, KeyspaceCreateOptions::default)?;
+        let export_dedup_by_sequence =
+            database.keyspace(EXPORT_DEDUP_BY_SEQUENCE, KeyspaceCreateOptions::default)?;
         let metadata = database.keyspace(METADATA, KeyspaceCreateOptions::default)?;
         let last_ingress_sequence =
             read_last_sequence(&ingress_journal, &metadata, LAST_INGRESS_SEQUENCE)?;
@@ -65,6 +72,8 @@ impl FjallSpool {
             export_queue,
             ingress_cursors,
             export_cursors,
+            export_dedup,
+            export_dedup_by_sequence,
             metadata,
             last_ingress_sequence: Mutex::new(last_ingress_sequence),
             last_export_sequence: Mutex::new(last_export_sequence),
@@ -200,6 +209,14 @@ impl DurableSpool for FjallSpool {
 
     fn append_export(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError> {
         FjallSpool::append_export(self, payload)
+    }
+
+    fn append_export_once(
+        &self,
+        dedup_key: &str,
+        payload: SpoolPayload,
+    ) -> Result<AppendOutcome, StorageError> {
+        FjallSpool::append_export_once(self, dedup_key, payload)
     }
 
     fn prune_expired_ingress_prefix(
