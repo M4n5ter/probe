@@ -43,16 +43,16 @@ pub fn run_check() -> ExitCode {
     build_ebpf_program(&config)
 }
 
-struct EbpfBuildConfig {
-    repo_root: PathBuf,
+pub(super) struct EbpfBuildConfig {
+    pub(super) repo_root: PathBuf,
     manifest_path: PathBuf,
     target_dir: PathBuf,
-    process_artifact_path: PathBuf,
+    pub(super) process_artifact_path: PathBuf,
     tls_plaintext_artifact_path: PathBuf,
 }
 
 impl EbpfBuildConfig {
-    fn from_xtask_manifest_dir(manifest_dir: &str) -> Self {
+    pub(super) fn from_xtask_manifest_dir(manifest_dir: &str) -> Self {
         let repo_root = Path::new(manifest_dir)
             .ancestors()
             .nth(2)
@@ -219,7 +219,7 @@ fn verify_ebpf_object_contracts(config: &EbpfBuildConfig) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn verify_named_ebpf_object_contract(
+pub(super) fn verify_named_ebpf_object_contract(
     path: &Path,
     label: &str,
     contract: EbpfObjectContract,

@@ -280,12 +280,7 @@ fn remote_endpoint_from_wire(connect: EbpfConnectObservation) -> Option<TcpEndpo
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::{Ipv4Addr, TcpStream},
-        path::PathBuf,
-        thread,
-        time::{Duration, Instant},
-    };
+    use std::net::Ipv4Addr;
 
     use ebpf_abi::{
         EBPF_ADDRESS_FAMILY_INET, EBPF_ADDRESS_FAMILY_INET6, EBPF_CONNECT_REMOTE_ENDPOINT_VALID,
@@ -445,80 +440,6 @@ mod tests {
         assert!(!report.preflight_available());
         assert!(report.summary().contains("does not exist"));
         Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires root or CAP_BPF/CAP_PERFMON and a built eBPF artifact"]
-    fn process_observation_probe_loads_built_object_and_observes_connect_tracepoint()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let object_path = smoke_object_path();
-        if !object_path.exists() {
-            return Err(format!(
-                "missing eBPF artifact {}; run `cargo run -p xtask -- ebpf-build` first",
-                object_path.display()
-            )
-            .into());
-        }
-
-        let mut probe =
-            EbpfProcessObservationProbe::load(EbpfProcessObservationProbeConfig::new(object_path))?;
-        while probe.next_observation()?.is_some() {}
-
-        let expected_command = "sssa-smoke";
-        let expected_endpoint = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 9);
-        thread::Builder::new()
-            .name(expected_command.to_string())
-            .spawn(|| {
-                let _ = TcpStream::connect(("127.0.0.1", 9));
-            })?
-            .join()
-            .map_err(|_| "connect trigger thread panicked")?;
-
-        let mut observed = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            match probe.next_observation()? {
-                Some(EbpfProcessObservation::Connect(observation))
-                    if observation.process.command_lossy() == expected_command
-                        && observation.endpoint.remote_endpoint() == Some(expected_endpoint) =>
-                {
-                    return Ok(());
-                }
-                Some(EbpfProcessObservation::Connect(observation)) => {
-                    observed.push(format!(
-                        "pid={},tgid={},command={},endpoint={:?}",
-                        observation.process.pid,
-                        observation.process.tgid,
-                        observation.process.command_lossy(),
-                        observation.endpoint
-                    ));
-                }
-                Some(EbpfProcessObservation::Close(observation)) => {
-                    observed.push(format!(
-                        "pid={},tgid={},command={},closed_fd={}",
-                        observation.process.pid,
-                        observation.process.tgid,
-                        observation.process.command_lossy(),
-                        observation.fd
-                    ));
-                }
-                None => {}
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-
-        Err(format!(
-            "did not observe connect tracepoint for command {expected_command}; observed={}",
-            observed.join(";")
-        )
-        .into())
-    }
-
-    fn smoke_object_path() -> PathBuf {
-        std::env::var_os("SSSA_EBPF_OBJECT").map_or_else(
-            || PathBuf::from("target/ebpf/bpfel-unknown-none/release/ebpf-program"),
-            PathBuf::from,
-        )
     }
 
     fn nul_padded_command(command: &str) -> [u8; 16] {
