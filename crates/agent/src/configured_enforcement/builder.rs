@@ -1,7 +1,11 @@
-use enforcement::{EnforcementBackend, EnforcementError, ScopedEnforcementPlanner};
+use enforcement::{
+    EnforcementBackend, EnforcementError, ScopedEnforcementPlanner, SetupTimeEnforcementSurface,
+};
 use probe_core::{EnforcementMode, ProtectiveActionProfile, Selector};
-use runtime::{EnforcementPolicySourcePlan, RuntimePlan};
+use runtime::{EnforcementExecutionSurface, EnforcementPolicySourcePlan, RuntimePlan};
 use thiserror::Error;
+
+use crate::transparent_interception::TransparentInterceptionError;
 
 use super::source::{
     EnforcementPolicySourceError, LoadedEnforcementPolicySource, load_enforcement_policy_source,
@@ -13,6 +17,8 @@ pub enum ConfiguredEnforcementError {
     Planner(#[from] EnforcementError),
     #[error("enforcement policy source error: {0}")]
     Source(#[from] EnforcementPolicySourceError),
+    #[error("{0}")]
+    TransparentInterception(#[from] TransparentInterceptionError),
     #[error("enforcement execution backend is not available in this build/runtime")]
     ExecutionBackendUnavailable,
 }
@@ -23,6 +29,7 @@ pub struct ConfiguredEnforcement {
     pub effective_selector_configured: bool,
     pub config_selector_configured: bool,
     pub manifest_selector_configured: Option<bool>,
+    pub effective_selector: Option<Selector>,
     pub policy_source: Option<LoadedEnforcementPolicySource>,
 }
 
@@ -30,14 +37,20 @@ pub async fn build_configured_enforcement_with_backend(
     plan: &RuntimePlan,
     backend: Option<Box<dyn EnforcementBackend>>,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
-    build_configured_enforcement_from_parts(
+    let configured = build_configured_enforcement_from_parts(
         plan.enforcement.mode,
         plan.config.enforcement.selector.clone(),
         plan.enforcement.config_selector_configured,
         &plan.enforcement.policy_source,
+        &plan.enforcement.execution_surfaces,
         backend,
     )
-    .await
+    .await?;
+    crate::transparent_interception::validate_setup_scope(
+        &plan.config.enforcement.interception,
+        configured.effective_selector.as_ref(),
+    )?;
+    Ok(configured)
 }
 
 async fn build_configured_enforcement_from_parts(
@@ -45,11 +58,10 @@ async fn build_configured_enforcement_from_parts(
     config_selector: Option<Selector>,
     config_selector_configured: bool,
     policy_source_plan: &EnforcementPolicySourcePlan,
+    execution_surfaces: &[EnforcementExecutionSurface],
     backend: Option<Box<dyn EnforcementBackend>>,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
-    if mode == EnforcementMode::Enforce && backend.is_none() {
-        return Err(ConfiguredEnforcementError::ExecutionBackendUnavailable);
-    }
+    validate_enforcement_execution(mode, execution_surfaces, backend.is_some())?;
 
     let policy_source = load_enforcement_policy_source(policy_source_plan).await?;
     let effective_selector = effective_selector(
@@ -67,6 +79,7 @@ async fn build_configured_enforcement_from_parts(
         mode,
         effective_selector.as_ref(),
         protective_actions,
+        execution_surfaces,
         backend,
     )?;
     Ok(ConfiguredEnforcement {
@@ -77,6 +90,7 @@ async fn build_configured_enforcement_from_parts(
         manifest_selector_configured: policy_source
             .as_ref()
             .map(|source| source.manifest.selector.is_some()),
+        effective_selector,
         policy_source,
     })
 }
@@ -85,16 +99,47 @@ fn scoped_enforcement_planner(
     mode: EnforcementMode,
     selector: Option<&Selector>,
     protective_actions: ProtectiveActionProfile,
+    execution_surfaces: &[EnforcementExecutionSurface],
     backend: Option<Box<dyn EnforcementBackend>>,
 ) -> Result<ScopedEnforcementPlanner, ConfiguredEnforcementError> {
-    if mode == EnforcementMode::Enforce {
-        let backend = backend.ok_or(ConfiguredEnforcementError::ExecutionBackendUnavailable)?;
+    if mode != EnforcementMode::Enforce {
+        return ScopedEnforcementPlanner::with_protective_action_profile(
+            mode,
+            selector,
+            protective_actions,
+        )
+        .map_err(ConfiguredEnforcementError::Planner);
+    }
+
+    if let Some(backend) = backend {
         return ScopedEnforcementPlanner::with_backend(selector, protective_actions, backend)
             .map_err(ConfiguredEnforcementError::Planner);
     }
 
-    ScopedEnforcementPlanner::with_protective_action_profile(mode, selector, protective_actions)
-        .map_err(ConfiguredEnforcementError::Planner)
+    if execution_surfaces == [EnforcementExecutionSurface::TransparentInterception] {
+        return ScopedEnforcementPlanner::with_setup_time_execution(
+            selector,
+            protective_actions,
+            SetupTimeEnforcementSurface::TransparentInterception,
+        )
+        .map_err(ConfiguredEnforcementError::Planner);
+    }
+
+    Err(ConfiguredEnforcementError::ExecutionBackendUnavailable)
+}
+
+fn validate_enforcement_execution(
+    mode: EnforcementMode,
+    execution_surfaces: &[EnforcementExecutionSurface],
+    backend_present: bool,
+) -> Result<(), ConfiguredEnforcementError> {
+    if mode != EnforcementMode::Enforce || backend_present {
+        return Ok(());
+    }
+    if execution_surfaces == [EnforcementExecutionSurface::TransparentInterception] {
+        return Ok(());
+    }
+    Err(ConfiguredEnforcementError::ExecutionBackendUnavailable)
 }
 
 fn effective_selector(
@@ -133,6 +178,7 @@ mod tests {
             &EnforcementPolicySourcePlan::Remote {
                 endpoint: "http://127.0.0.1:9/enforcement".to_string(),
             },
+            &[EnforcementExecutionSurface::Connection],
             None,
         )
         .await
@@ -154,6 +200,7 @@ mod tests {
             None,
             false,
             &EnforcementPolicySourcePlan::None,
+            &[EnforcementExecutionSurface::Connection],
             Some(Box::new(ApplyingBackend)),
         )
         .await?;
@@ -178,6 +225,42 @@ mod tests {
         assert_eq!(decision.outcome, EnforcementOutcome::Applied);
         assert_eq!(decision.effective_action, Action::Deny);
         assert_eq!(decision.reason, "backend applied Deny");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transparent_interception_enforce_records_per_flow_verdicts_as_setup_time_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut configured = build_configured_enforcement_from_parts(
+            EnforcementMode::Enforce,
+            None,
+            false,
+            &EnforcementPolicySourcePlan::None,
+            &[EnforcementExecutionSurface::TransparentInterception],
+            None,
+        )
+        .await?;
+        let trigger = outbound_event();
+        let verdict = Verdict {
+            action: Action::Deny,
+            scope: VerdictScope::Flow,
+            reason: "managed policy".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+
+        let decision = configured
+            .planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("protective verdict must produce an enforcement decision");
+
+        assert_eq!(configured.planner.mode(), EnforcementMode::Enforce);
+        assert_eq!(decision.outcome, EnforcementOutcome::Unsupported);
+        assert_eq!(decision.effective_action, Action::Observe);
+        assert!(decision.reason.contains("setup-time enforcement surface"));
         Ok(())
     }
 

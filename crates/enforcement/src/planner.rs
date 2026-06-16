@@ -79,6 +79,18 @@ impl ScopedEnforcementPlanner {
         })
     }
 
+    pub fn with_setup_time_execution(
+        selector: Option<&Selector>,
+        protective_actions: ProtectiveActionProfile,
+        surface: SetupTimeEnforcementSurface,
+    ) -> Result<Self, EnforcementError> {
+        Ok(Self {
+            execution: EnforcementExecution::SetupTimeOnly(surface),
+            scope: TargetScope::compile(selector)?,
+            protective_actions,
+        })
+    }
+
     pub fn mode(&self) -> EnforcementMode {
         self.execution.mode()
     }
@@ -177,6 +189,16 @@ impl ScopedEnforcementPlanner {
                     Err(error) => failed_decision_parts(verdict, &error),
                 }
             }
+            EnforcementExecution::SetupTimeOnly(surface) => (
+                EnforcementOutcome::Unsupported,
+                Action::Observe,
+                format!(
+                    "policy requested {:?}, but {} is a setup-time enforcement surface and no per-flow connection backend is configured: {}",
+                    verdict.action,
+                    surface.description(),
+                    verdict.reason
+                ),
+            ),
         }
     }
 }
@@ -186,6 +208,7 @@ enum EnforcementExecution {
     AuditOnly,
     DryRun,
     Enforce(Box<dyn EnforcementBackend>),
+    SetupTimeOnly(SetupTimeEnforcementSurface),
 }
 
 impl EnforcementExecution {
@@ -203,7 +226,20 @@ impl EnforcementExecution {
             Self::Disabled => EnforcementMode::Disabled,
             Self::AuditOnly => EnforcementMode::AuditOnly,
             Self::DryRun => EnforcementMode::DryRun,
-            Self::Enforce(_) => EnforcementMode::Enforce,
+            Self::Enforce(_) | Self::SetupTimeOnly(_) => EnforcementMode::Enforce,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupTimeEnforcementSurface {
+    TransparentInterception,
+}
+
+impl SetupTimeEnforcementSurface {
+    fn description(self) -> &'static str {
+        match self {
+            Self::TransparentInterception => "transparent interception",
         }
     }
 }
@@ -434,6 +470,36 @@ mod tests {
         assert_eq!(decision.effective_action, Action::Reset);
         assert_eq!(decision.reason, "backend applied Reset");
         assert!(decision.selector_matched);
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_mode_can_record_setup_time_only_surface() -> Result<(), Box<dyn std::error::Error>> {
+        let mut planner = ScopedEnforcementPlanner::with_setup_time_execution(
+            None,
+            ProtectiveActionProfile::default(),
+            SetupTimeEnforcementSurface::TransparentInterception,
+        )?;
+        let trigger = request_event(Direction::Inbound);
+        let verdict = Verdict {
+            action: Action::Deny,
+            scope: VerdictScope::Flow,
+            reason: "host rule already redirected matching traffic".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+
+        let decision = planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("protective verdict should produce setup-time enforcement audit");
+
+        assert_eq!(decision.mode, EnforcementMode::Enforce);
+        assert_eq!(decision.outcome, EnforcementOutcome::Unsupported);
+        assert_eq!(decision.effective_action, Action::Observe);
+        assert!(decision.reason.contains("setup-time enforcement surface"));
         Ok(())
     }
 

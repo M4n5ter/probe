@@ -13,6 +13,7 @@ use crate::{
 pub(crate) struct RuntimeComposition {
     plan: RuntimePlan,
     connection_enforcement: ConnectionEnforcementRuntime,
+    transparent_interception: TransparentInterceptionRuntime,
 }
 
 impl RuntimeComposition {
@@ -24,6 +25,20 @@ impl RuntimeComposition {
         self,
     ) -> (RuntimePlan, Option<Box<dyn EnforcementBackend>>) {
         (self.plan, self.connection_enforcement.into_backend())
+    }
+
+    pub(crate) fn into_run_parts(
+        self,
+    ) -> (
+        RuntimePlan,
+        Option<Box<dyn EnforcementBackend>>,
+        TransparentInterceptionRuntime,
+    ) {
+        (
+            self.plan,
+            self.connection_enforcement.into_backend(),
+            self.transparent_interception,
+        )
     }
 }
 
@@ -37,6 +52,7 @@ pub(crate) fn build_runtime_composition(
     Ok(RuntimeComposition {
         plan,
         connection_enforcement,
+        transparent_interception,
     })
 }
 
@@ -51,7 +67,10 @@ fn execution_runtimes_for_config(
 ) -> (ConnectionEnforcementRuntime, TransparentInterceptionRuntime) {
     (
         connection_enforcement::resolve(config.enforcement.backend),
-        transparent_interception::resolve(&config.enforcement.interception),
+        transparent_interception::resolve(
+            &config.enforcement.interception,
+            config.enforcement.selector.as_ref(),
+        ),
     )
 }
 
@@ -70,7 +89,7 @@ fn provider_registry_for_runtimes(
 #[cfg(test)]
 mod tests {
     use probe_config::{CaptureSelection, TransparentInterceptionStrategyConfig};
-    use probe_core::EnforcementMode;
+    use probe_core::{EnforcementMode, ProcessSelector, Selector, TrafficSelector};
 
     use super::*;
 
@@ -90,6 +109,14 @@ mod tests {
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
             TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector {
+                names: vec!["curl".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        ));
         let error = match build_runtime_composition(config) {
             Ok(_) => panic!("transparent interception should be unavailable"),
             Err(error) => error,
@@ -98,7 +125,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("no executable backend is configured")
+                .contains("process constraints cannot be represented")
         );
     }
 }

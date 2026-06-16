@@ -1,3 +1,8 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use capture::{CaptureError, CapturePoll, CaptureProvider, CaptureProviderKind};
 use parsers::Http1ParserFactory;
 use pipeline::{CapturePipeline, PipelineRunOptions};
@@ -52,6 +57,28 @@ fn run_provider_with_zero_max_events_does_not_read_provider()
     assert_eq!(summary.ingress_records_processed, 0);
     assert!(spool.read_ingress_batch_after(0, 10)?.is_empty());
     assert!(spool.read_export_batch("sink", 10)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn run_provider_stops_when_shutdown_is_requested_before_poll()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut provider = UnreadableProvider;
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
+    let shutdown = Arc::new(AtomicBool::new(true));
+
+    let summary = pipeline.run_provider_with_options(
+        &mut provider,
+        PipelineRunOptions::default().with_shutdown_signal(Arc::clone(&shutdown)),
+    )?;
+
+    assert!(shutdown.load(Ordering::SeqCst));
+    assert_eq!(summary.capture_events_read, 0);
+    assert_eq!(summary.ingress_records_journaled, 0);
+    assert_eq!(summary.ingress_records_processed, 0);
     Ok(())
 }
 

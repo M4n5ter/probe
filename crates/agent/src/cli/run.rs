@@ -9,7 +9,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use enforcement::ScopedEnforcementPlanner;
 use exporter::CompressionCodec;
 use parsers::Http1ParserFactory;
-use pipeline::{CapturePipeline, PipelinePolicy, PipelineRunOptions, PipelineRuntimeMetrics};
+use pipeline::{
+    CapturePipeline, PipelinePolicy, PipelineRunOptions, PipelineRuntimeMetrics, PipelineSummary,
+};
 use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
 use probe_config::AgentConfig;
 use probe_core::{
@@ -26,8 +28,12 @@ use crate::{
     configured_enforcement::build_configured_enforcement_with_backend,
     configured_policy::load_configured_pipeline_policies,
     error::AgentError,
-    export::{ExportWorker, ExportWorkerConfig, drain_planned_sinks, drain_replay_webhook},
+    export::{
+        ExportDrainError, ExportWorker, ExportWorkerConfig, drain_planned_sinks,
+        drain_replay_webhook,
+    },
     runtime_composition::{build_runtime_composition, capability_matrix_for_config},
+    shutdown,
     status::{build_status_snapshot, collect_spool_status},
     storage_retention::{StorageRetentionWorkerConfig, spawn_storage_retention_workers},
     tls_plaintext::TlsPlaintextRuntimeState,
@@ -156,7 +162,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let agent_config = read_config_or_default(config.as_ref())?;
             validate_static_runtime_config(&agent_config)?;
             let runtime = build_runtime_composition(agent_config)?;
-            let (plan, enforcement_backend) = runtime.into_enforcement_parts();
+            let (plan, enforcement_backend, transparent_interception) = runtime.into_run_parts();
             let mut enforcement =
                 build_configured_enforcement_with_backend(&plan, enforcement_backend).await?;
             let policies = load_configured_pipeline_policies(&plan.config)?;
@@ -201,21 +207,33 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 plan.capture.mode,
                 plan.capture.selected_backend
             );
+            let mut transparent_interception_guard = None;
+            let shutdown_requested = shutdown::new_flag();
+            let shutdown_signal_task = shutdown::spawn_signal_task(Arc::clone(&shutdown_requested));
             let summary_result = (|| {
                 let mut summary =
                     pipeline.recover_ingress_journal_until_idle(INGRESS_RECOVERY_BATCH_SIZE)?;
+                if shutdown::requested(&shutdown_requested) {
+                    return Ok(summary);
+                }
                 storage_retention_worker = storage_retention_config
                     .take()
                     .map(|config| spawn_storage_retention_workers(Arc::clone(&spool), config));
                 let mut pipeline = pipeline.with_enforcement_planner(&mut enforcement.planner);
+                transparent_interception_guard =
+                    transparent_interception.activate(enforcement.effective_selector.as_ref())?;
                 let mut provider = build_capture_provider(&plan, Some(&tls_plaintext_runtime))?;
                 let capture_summary = pipeline.run_provider_with_options(
                     provider.as_mut(),
-                    PipelineRunOptions { max_events },
+                    PipelineRunOptions {
+                        max_events,
+                        shutdown_requested: Some(Arc::clone(&shutdown_requested)),
+                    },
                 )?;
                 summary.merge(capture_summary);
                 Ok::<_, AgentError>(summary)
             })();
+            shutdown_signal_task.abort();
             if let Some(server) = admin_server {
                 server.stop().await;
             }
@@ -225,17 +243,14 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             if let Some(worker) = storage_retention_worker {
                 worker.stop().await;
             }
+            let interception_cleanup_result = match transparent_interception_guard {
+                Some(guard) => guard.deactivate(),
+                None => Ok(()),
+            };
             let drain_result =
                 drain_planned_sinks(spool.as_ref(), &plan.config.agent_id, &plan.export).await;
-            let summary = match (summary_result, drain_result) {
-                (Ok(summary), Ok(())) => summary,
-                (Err(error), Ok(())) => return Err(error),
-                (Ok(_), Err(error)) => return Err(error.into()),
-                (Err(run_error), Err(export_error)) => {
-                    eprintln!("tail export drain failed after run error: {export_error}");
-                    return Err(run_error);
-                }
-            };
+            let summary =
+                merge_run_results(summary_result, interception_cleanup_result, drain_result)?;
             println!(
                 "agent stopped after reading {} capture events, journaling {} ingress records, processing {} ingress records ({} recovered), and storing {} export events",
                 summary.capture_events_read,
@@ -289,6 +304,41 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
         }
     }
     Ok(())
+}
+
+fn merge_run_results(
+    summary_result: Result<PipelineSummary, AgentError>,
+    interception_cleanup_result: Result<
+        (),
+        crate::transparent_interception::TransparentInterceptionError,
+    >,
+    drain_result: Result<(), ExportDrainError>,
+) -> Result<PipelineSummary, AgentError> {
+    match (summary_result, interception_cleanup_result, drain_result) {
+        (Ok(summary), Ok(()), Ok(())) => Ok(summary),
+        (Err(error), Ok(()), Ok(())) => Err(error),
+        (Ok(_), Err(error), Ok(())) => Err(error.into()),
+        (Ok(_), Ok(()), Err(error)) => Err(error.into()),
+        (Err(run_error), Err(cleanup_error), Ok(())) => {
+            eprintln!("transparent interception cleanup failed after run error: {cleanup_error}");
+            Err(run_error)
+        }
+        (Err(run_error), Ok(()), Err(export_error)) => {
+            eprintln!("tail export drain failed after run error: {export_error}");
+            Err(run_error)
+        }
+        (Ok(_), Err(cleanup_error), Err(export_error)) => {
+            eprintln!(
+                "tail export drain failed after transparent interception cleanup error: {export_error}"
+            );
+            Err(cleanup_error.into())
+        }
+        (Err(run_error), Err(cleanup_error), Err(export_error)) => {
+            eprintln!("transparent interception cleanup failed after run error: {cleanup_error}");
+            eprintln!("tail export drain failed after run error: {export_error}");
+            Err(run_error)
+        }
+    }
 }
 
 fn read_runtime_composition(

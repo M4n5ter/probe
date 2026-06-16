@@ -137,7 +137,7 @@ fn default_connection_enforcement_capability() -> CapabilityState {
 fn default_transparent_interception_capability() -> CapabilityState {
     CapabilityState::unavailable(
         CapabilityKind::TransparentInterception,
-        "transparent interception backends such as inbound TPROXY and outbound MITM are modeled but no executable backend is configured",
+        "transparent interception is not configured; Linux nftables lifecycle is resolved by the agent composition root when a transparent strategy is explicitly enabled",
     )
 }
 

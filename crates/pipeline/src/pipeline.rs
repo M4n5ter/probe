@@ -1,9 +1,13 @@
 use std::{
-    sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use capture::{CaptureError, CaptureEvent, CaptureProvider, CapturedBytes};
+use capture::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CapturedBytes};
 use enforcement::{EnforcementPlanRequest, EnforcementPlanner};
 use parsers::{ParserInput, ProtocolParserFactory};
 use policy::{PolicyHook, PolicyOutcome, PolicyRuntime, hook_for_event};
@@ -65,21 +69,34 @@ impl PipelineSummary {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+const PROVIDER_IDLE_SLEEP: Duration = Duration::from_millis(10);
+
+#[derive(Default, Clone)]
 pub struct PipelineRunOptions {
     pub max_events: Option<u64>,
+    pub shutdown_requested: Option<Arc<AtomicBool>>,
 }
 
 impl PipelineRunOptions {
     pub fn max_events(max_events: u64) -> Self {
         Self {
             max_events: Some(max_events),
+            shutdown_requested: None,
         }
     }
 
-    fn should_read_next_event(self, events_read: u64) -> bool {
+    pub fn with_shutdown_signal(mut self, shutdown_requested: Arc<AtomicBool>) -> Self {
+        self.shutdown_requested = Some(shutdown_requested);
+        self
+    }
+
+    fn should_poll_next_event(&self, events_read: u64) -> bool {
         self.max_events
             .is_none_or(|max_events| events_read < max_events)
+            && !self
+                .shutdown_requested
+                .as_ref()
+                .is_some_and(|shutdown| shutdown.load(Ordering::SeqCst))
     }
 }
 
@@ -207,15 +224,19 @@ where
         options: PipelineRunOptions,
     ) -> Result<PipelineSummary, PipelineError> {
         let mut summary = PipelineSummary::default();
-        while options.should_read_next_event(summary.capture_events_read) {
-            let Some(capture_event) = provider.next()? else {
-                break;
-            };
-            summary.capture_events_read = summary.capture_events_read.saturating_add(1);
-            if let Some(metrics) = &self.runtime_metrics {
-                metrics.record_capture_event_read();
+        while options.should_poll_next_event(summary.capture_events_read) {
+            match provider.poll_next()? {
+                CapturePoll::Event(capture_event) => {
+                    summary.capture_events_read = summary.capture_events_read.saturating_add(1);
+                    if let Some(metrics) = &self.runtime_metrics {
+                        metrics.record_capture_event_read();
+                    }
+                    self.handle_capture_event(*capture_event, &mut summary)?;
+                }
+                CapturePoll::Progress => {}
+                CapturePoll::Idle => thread::sleep(PROVIDER_IDLE_SLEEP),
+                CapturePoll::Finished => break,
             }
-            self.handle_capture_event(capture_event, &mut summary)?;
         }
         Ok(summary)
     }

@@ -3,7 +3,7 @@ use thiserror::Error;
 use crate::{
     check::CheckError, configured_enforcement::ConfiguredEnforcementError,
     configured_policy::ConfiguredPolicyError, export::ExportDrainError,
-    plaintext_feed::PlaintextFeedLoadError,
+    plaintext_feed::PlaintextFeedLoadError, transparent_interception::TransparentInterceptionError,
 };
 
 #[derive(Debug, Error)]
@@ -33,6 +33,8 @@ pub(crate) enum AgentError {
     Enforcement(#[from] enforcement::EnforcementError),
     #[error("{0}")]
     ConfiguredEnforcement(#[from] ConfiguredEnforcementError),
+    #[error("{0}")]
+    TransparentInterception(#[from] TransparentInterceptionError),
     #[error("proto error: {0}")]
     Proto(#[from] proto::ProtoError),
     #[error("export error: {0}")]

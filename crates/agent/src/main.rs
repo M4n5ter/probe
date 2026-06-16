@@ -11,6 +11,7 @@ mod export;
 mod periodic_worker;
 mod plaintext_feed;
 mod runtime_composition;
+mod shutdown;
 mod status;
 mod storage_retention;
 mod tls_material;

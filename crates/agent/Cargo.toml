@@ -21,12 +21,12 @@ probe-io = { path = "../probe-io" }
 proto = { path = "../proto" }
 runtime = { path = "../runtime" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-rustix = { version = "1.1", features = ["process"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 storage = { path = "../storage" }
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "fs", "io-util", "net", "sync", "time"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "fs", "io-util", "net", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 toml = "1.1"

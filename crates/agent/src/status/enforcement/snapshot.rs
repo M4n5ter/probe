@@ -6,7 +6,10 @@ use crate::configured_enforcement::{
 };
 use probe_config::{ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig};
 use probe_core::{CapabilityKind, EnforcementMode, ProtectiveActionProfile, RuntimeMode};
-use runtime::{EnforcementCapabilityPlan, RuntimePlan};
+use runtime::{
+    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionNftablesPlan,
+    TransparentInterceptionProxyPlan,
+};
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -31,6 +34,8 @@ pub struct EnforcementConnectionStatusSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnforcementInterceptionStatusSnapshot {
     pub strategy: TransparentInterceptionStrategyConfig,
+    pub proxy: TransparentInterceptionProxyPlan,
+    pub nftables: TransparentInterceptionNftablesPlan,
     pub selector_configured: bool,
     pub capability: EnforcementCapabilityStatusSnapshot,
 }
@@ -132,6 +137,8 @@ fn enforcement_status_with_source(
         },
         interception: EnforcementInterceptionStatusSnapshot {
             strategy: plan.enforcement.interception.strategy,
+            proxy: plan.enforcement.interception.proxy,
+            nftables: plan.enforcement.interception.nftables.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,
             capability: enforcement_capability_status(&plan.enforcement.interception.capability),
         },
@@ -314,7 +321,10 @@ mod tests {
     use std::fs;
 
     use probe_config::{EnforcementPolicyManifest, EnforcementPolicySourceConfig};
-    use probe_core::{Action, ProtectiveActionProfile, RuntimeMode, Selector};
+    use probe_core::{
+        Action, Direction, ProcessSelector, ProtectiveActionProfile, RuntimeMode, Selector,
+        TrafficSelector,
+    };
     use serde_json::json;
 
     use super::super::super::plan_fixture::{
@@ -582,7 +592,15 @@ protective_actions = ["alert"]
         config.enforcement.mode = probe_core::EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
             probe_config::TransparentInterceptionStrategyConfig::OutboundMitm;
-        config.enforcement.interception.selector = Some(Selector::default());
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
         let plan = runtime_plan_from_config(
             config,
             vec![probe_core::CapabilityState::available(
@@ -600,6 +618,9 @@ protective_actions = ["alert"]
             status.interception.strategy,
             probe_config::TransparentInterceptionStrategyConfig::OutboundMitm
         );
+        assert_eq!(status.interception.proxy.listen_port, Some(15001));
+        assert_eq!(status.interception.nftables.table_name, "sssa_probe");
+        assert_eq!(status.interception.nftables.route_table, 53_534);
         assert!(status.interception.selector_configured);
         assert_eq!(
             status.interception.capability,
@@ -610,6 +631,11 @@ protective_actions = ["alert"]
         );
         let value = serde_json::to_value(&status)?;
         assert_eq!(value["interception"]["strategy"], json!("outbound_mitm"));
+        assert_eq!(value["interception"]["proxy"]["listen_port"], json!(15001));
+        assert_eq!(
+            value["interception"]["nftables"]["table_name"],
+            json!("sssa_probe")
+        );
         assert_eq!(
             value["interception"]["capability"]["capability"],
             json!("transparent_interception")

@@ -1,132 +1,17 @@
-use probe_config::{AgentConfig, ConfigValidationError, ConfigViolation};
-use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
+use probe_config::{AgentConfig, ConfigViolation};
+use probe_core::EnforcementMode;
 
-use super::capture::{CapturePlan, CapturePlanMode};
-use super::enforcement::{
-    EnforcementCapabilityPlan, EnforcementCapabilityRequirement, enabled_execution_surfaces,
+use crate::plan::{
+    capture::{CapturePlan, CapturePlanMode},
+    enforcement::{
+        EnforcementCapabilityPlan, EnforcementCapabilityRequirement, enabled_execution_surfaces,
+    },
+    registry::ProviderRegistry,
 };
-use super::registry::ProviderRegistry;
 
-pub(super) fn validate_runtime_config(
-    config: &AgentConfig,
-    registry: &ProviderRegistry,
-) -> Result<(), ConfigValidationError> {
-    let mut violations = Vec::new();
-    collect_static_runtime_config_violations(config, &mut violations);
-    validate_capture_config(config, registry, &mut violations);
-    validate_registry_tls_config(config, registry, &mut violations);
-    validate_tls_capture_constraints(config, registry, &mut violations);
-    validate_registry_enforcement_config(config, registry, &mut violations);
-    validate_enforcement_capture_constraints(config, registry, &mut violations);
+use super::require_available;
 
-    if violations.is_empty() {
-        Ok(())
-    } else {
-        Err(ConfigValidationError::new(violations))
-    }
-}
-
-pub(super) fn validate_static_runtime_config_fields(
-    config: &AgentConfig,
-) -> Result<(), ConfigValidationError> {
-    let mut violations = Vec::new();
-    collect_static_runtime_config_violations(config, &mut violations);
-    if violations.is_empty() {
-        Ok(())
-    } else {
-        Err(ConfigValidationError::new(violations))
-    }
-}
-
-fn collect_static_runtime_config_violations(
-    config: &AgentConfig,
-    violations: &mut Vec<ConfigViolation>,
-) {
-    validate_static_tls_config(config, violations);
-    validate_policy_config(config, violations);
-    validate_static_enforcement_config(config, violations);
-}
-
-fn validate_policy_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
-    for policy in config.policies.iter().filter(|policy| policy.enabled) {
-        if let Some(selector) = &policy.selector
-            && let Err(error) = selector.compile()
-        {
-            violations.push(ConfigViolation {
-                field: format!("policies.{}.selector", policy.id),
-                reason: error.to_string(),
-            });
-        }
-    }
-}
-
-fn validate_capture_config(
-    config: &AgentConfig,
-    registry: &ProviderRegistry,
-    violations: &mut Vec<ConfigViolation>,
-) {
-    let Some(backend) = config.capture.selection.explicit_backend() else {
-        return;
-    };
-    let provider = registry.capture_provider(backend);
-    if !provider.selectable_for(config.capture.selection) {
-        violations.push(ConfigViolation {
-            field: "capture.selection".to_string(),
-            reason: provider.unselectable_reason(),
-        });
-    }
-}
-
-fn validate_static_tls_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
-    if let Some(selector) = &config.tls.plaintext.instrumentation.selector
-        && let Err(error) = selector.compile()
-    {
-        violations.push(ConfigViolation {
-            field: "tls.plaintext.instrumentation.selector".to_string(),
-            reason: error.to_string(),
-        });
-    }
-}
-
-fn validate_registry_tls_config(
-    config: &AgentConfig,
-    registry: &ProviderRegistry,
-    violations: &mut Vec<ConfigViolation>,
-) {
-    if !config.tls.plaintext.instrumentation.enabled {
-        return;
-    }
-    require_usable(
-        &registry.capability_matrix(),
-        CapabilityKind::LibsslUprobe,
-        "tls.plaintext.instrumentation.enabled",
-        "libssl uprobe plaintext provider is not available in this build/runtime",
-        violations,
-    );
-}
-
-fn validate_tls_capture_constraints(
-    config: &AgentConfig,
-    registry: &ProviderRegistry,
-    violations: &mut Vec<ConfigViolation>,
-) {
-    if !config.tls.plaintext.instrumentation.enabled {
-        return;
-    }
-
-    let capture = CapturePlan::resolve(config, registry);
-    if capture.mode != CapturePlanMode::Live {
-        violations.push(ConfigViolation {
-            field: "tls.plaintext.instrumentation.enabled".to_string(),
-            reason: format!(
-                "libssl uprobe TLS plaintext requires live host capture; selected capture mode is {:?}",
-                capture.mode
-            ),
-        });
-    }
-}
-
-fn validate_static_enforcement_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
+pub(super) fn validate_static_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
     if let Some(selector) = &config.enforcement.selector
         && let Err(error) = selector.compile()
     {
@@ -152,6 +37,15 @@ fn validate_static_enforcement_config(config: &AgentConfig, violations: &mut Vec
                 .to_string(),
         });
     }
+    if config.enforcement.interception.strategy.is_enabled()
+        && config.enforcement.selector.is_none()
+        && config.enforcement.interception.selector.is_none()
+    {
+        violations.push(ConfigViolation {
+            field: "enforcement.interception.selector".to_string(),
+            reason: "transparent interception requires an explicit local selector before setup-time host rules can be installed".to_string(),
+        });
+    }
     if config.enforcement.mode == EnforcementMode::Enforce {
         match enabled_execution_surfaces(config).len() {
             0 => violations.push(ConfigViolation {
@@ -167,7 +61,7 @@ fn validate_static_enforcement_config(config: &AgentConfig, violations: &mut Vec
     }
 }
 
-fn validate_registry_enforcement_config(
+pub(super) fn validate_registry_config(
     config: &AgentConfig,
     registry: &ProviderRegistry,
     violations: &mut Vec<ConfigViolation>,
@@ -180,6 +74,27 @@ fn validate_registry_enforcement_config(
             check.requirement.unavailable_reason,
             violations,
         );
+    }
+}
+
+pub(super) fn validate_capture_constraints(
+    config: &AgentConfig,
+    registry: &ProviderRegistry,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if config.enforcement.mode != EnforcementMode::Enforce {
+        return;
+    }
+
+    let capture = CapturePlan::resolve(config, registry);
+    if capture.mode != CapturePlanMode::Live {
+        violations.push(ConfigViolation {
+            field: "enforcement.mode".to_string(),
+            reason: format!(
+                "enforcement execution requires live host capture; selected capture mode is {:?}",
+                capture.mode
+            ),
+        });
     }
 }
 
@@ -219,82 +134,20 @@ struct EnforcementCapabilityCheck {
     requirement: EnforcementCapabilityRequirement,
 }
 
-fn validate_enforcement_capture_constraints(
-    config: &AgentConfig,
-    registry: &ProviderRegistry,
-    violations: &mut Vec<ConfigViolation>,
-) {
-    if config.enforcement.mode != EnforcementMode::Enforce {
-        return;
-    }
-
-    let capture = CapturePlan::resolve(config, registry);
-    if capture.mode != CapturePlanMode::Live {
-        violations.push(ConfigViolation {
-            field: "enforcement.mode".to_string(),
-            reason: format!(
-                "enforcement execution requires live host capture; selected capture mode is {:?}",
-                capture.mode
-            ),
-        });
-    }
-}
-
-fn require_available(
-    capabilities: &CapabilityMatrix,
-    capability: CapabilityKind,
-    field: impl Into<String>,
-    reason: impl Into<String>,
-    violations: &mut Vec<ConfigViolation>,
-) {
-    if capabilities.mode(capability) != RuntimeMode::Available {
-        let reason = capabilities
-            .states()
-            .iter()
-            .find(|state| state.kind == capability)
-            .and_then(|state| state.reason.clone())
-            .unwrap_or_else(|| reason.into());
-        violations.push(ConfigViolation {
-            field: field.into(),
-            reason,
-        });
-    }
-}
-
-fn require_usable(
-    capabilities: &CapabilityMatrix,
-    capability: CapabilityKind,
-    field: impl Into<String>,
-    reason: impl Into<String>,
-    violations: &mut Vec<ConfigViolation>,
-) {
-    if capabilities.mode(capability) == RuntimeMode::Unavailable {
-        let reason = capabilities
-            .states()
-            .iter()
-            .find(|state| state.kind == capability)
-            .and_then(|state| state.reason.clone())
-            .unwrap_or_else(|| reason.into());
-        violations.push(ConfigViolation {
-            field: field.into(),
-            reason,
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use probe_config::{
-        CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig,
-        TransparentInterceptionStrategyConfig,
+        CaptureBackend, CaptureSelection, ConfigValidationError,
+        ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig,
     };
-    use probe_core::{CapabilityState, Selector};
-
-    use crate::plan::{
-        capture::{CaptureProviderBuilder, CaptureProviderDescriptor},
-        registry::ProviderRegistry,
+    use probe_core::{
+        CapabilityKind, CapabilityState, Direction, ProcessSelector, RuntimeMode, Selector,
+        TrafficSelector,
     };
 
+    use crate::plan::capture::{CaptureProviderBuilder, CaptureProviderDescriptor};
+
+    use super::super::validate_runtime_config;
     use super::*;
 
     #[test]
@@ -313,201 +166,6 @@ mod tests {
             "unavailable",
         );
         assert_violation(&error, "enforcement.backend", "not built");
-    }
-
-    #[test]
-    fn explicit_degraded_provider_without_selection_policy_is_rejected() {
-        let registry = ProviderRegistry::new(
-            vec![CaptureProviderDescriptor::degraded(
-                CaptureBackend::Libpcap,
-                CaptureProviderBuilder::Libpcap,
-                "libpcap provider cannot open the configured device",
-            )],
-            test_platform_capabilities(),
-        );
-        let mut config = AgentConfig::default();
-        config.capture.selection = CaptureSelection::Libpcap;
-
-        let error = validation_error(config, &registry);
-
-        assert_violation(
-            &error,
-            "capture.selection",
-            "libpcap provider cannot open the configured device",
-        );
-    }
-
-    #[test]
-    fn explicit_unavailable_backend_does_not_fallback() {
-        let registry = ProviderRegistry::new(
-            vec![
-                CaptureProviderDescriptor::unavailable(
-                    CaptureBackend::Ebpf,
-                    CaptureProviderBuilder::Unimplemented,
-                    "eBPF host probe: bpffs path /sys/fs/bpf does not exist",
-                ),
-                capture_provider(
-                    CaptureBackend::Libpcap,
-                    CaptureProviderBuilder::Libpcap,
-                    RuntimeMode::Available,
-                ),
-            ],
-            test_platform_capabilities(),
-        );
-        let mut config = AgentConfig::default();
-        config.capture.selection = CaptureSelection::Ebpf;
-
-        let error = validation_error(config, &registry);
-
-        assert_violation(
-            &error,
-            "capture.selection",
-            "eBPF host probe: bpffs path /sys/fs/bpf does not exist",
-        );
-    }
-
-    #[test]
-    fn external_plaintext_feed_fails_closed_without_provider() {
-        let registry = ProviderRegistry::new(Vec::new(), test_platform_capabilities());
-        let mut config = AgentConfig::default();
-        config.capture.selection = CaptureSelection::PlaintextFeed;
-        config.capture.plaintext_feed.path = Some("/tmp/feed.jsonl".into());
-
-        let error = validation_error(config, &registry);
-
-        assert_violation(
-            &error,
-            "capture.selection",
-            "capture backend is not registered",
-        );
-    }
-
-    #[test]
-    fn tls_plaintext_plan_rejects_unavailable_libssl_capability() {
-        let registry = ProviderRegistry::new(
-            vec![live_capture_provider()],
-            test_platform_capabilities_with_libssl(RuntimeMode::Unavailable),
-        );
-        let mut config = AgentConfig::default();
-        config.capture.selection = CaptureSelection::Libpcap;
-        config.tls.plaintext.instrumentation.enabled = true;
-        config
-            .tls
-            .plaintext
-            .instrumentation
-            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
-
-        let error = validation_error(config, &registry);
-
-        assert_violation(
-            &error,
-            "tls.plaintext.instrumentation.enabled",
-            "unavailable",
-        );
-    }
-
-    #[test]
-    fn tls_plaintext_plan_rejects_non_live_capture_selection() {
-        let registry = ProviderRegistry::new(
-            vec![capture_provider(
-                CaptureBackend::Replay,
-                CaptureProviderBuilder::Replay,
-                RuntimeMode::Available,
-            )],
-            test_platform_capabilities_with_libssl(RuntimeMode::Degraded),
-        );
-        let mut config = AgentConfig::default();
-        config.capture.selection = CaptureSelection::Replay;
-        config.tls.plaintext.instrumentation.enabled = true;
-        config
-            .tls
-            .plaintext
-            .instrumentation
-            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
-
-        let error = validation_error(config, &registry);
-
-        assert_violation(
-            &error,
-            "tls.plaintext.instrumentation.enabled",
-            "requires live host capture",
-        );
-    }
-
-    #[test]
-    fn tls_plaintext_selector_is_validated_by_runtime_validation() {
-        let registry = ProviderRegistry::new(
-            vec![capture_provider(
-                CaptureBackend::Replay,
-                CaptureProviderBuilder::Replay,
-                RuntimeMode::Available,
-            )],
-            test_platform_capabilities(),
-        );
-        let mut config = AgentConfig::default();
-        config.capture.selection = CaptureSelection::Replay;
-        config.tls.plaintext.instrumentation.selector = Some(Selector::All {
-            selectors: Vec::new(),
-        });
-
-        let error = validation_error(config, &registry);
-
-        assert_violation(
-            &error,
-            "tls.plaintext.instrumentation.selector",
-            "at least one child",
-        );
-    }
-
-    #[test]
-    fn policy_selector_is_validated_by_runtime_validation() {
-        let registry = ProviderRegistry::new(
-            vec![capture_provider(
-                CaptureBackend::Replay,
-                CaptureProviderBuilder::Replay,
-                RuntimeMode::Available,
-            )],
-            test_platform_capabilities(),
-        );
-        let mut config = AgentConfig::default();
-        config.capture.selection = CaptureSelection::Replay;
-        config.policies = vec![probe_config::PolicyConfig {
-            id: "guard".to_string(),
-            path: "/tmp/guard.lua".into(),
-            selector: Some(Selector::All {
-                selectors: Vec::new(),
-            }),
-            ..probe_config::PolicyConfig::default()
-        }];
-
-        let error = validation_error(config, &registry);
-
-        assert_violation(&error, "policies.guard.selector", "at least one child");
-    }
-
-    #[test]
-    fn disabled_policy_selector_is_not_validated_by_runtime_validation() {
-        let registry = ProviderRegistry::new(
-            vec![capture_provider(
-                CaptureBackend::Replay,
-                CaptureProviderBuilder::Replay,
-                RuntimeMode::Available,
-            )],
-            test_platform_capabilities(),
-        );
-        let mut config = AgentConfig::default();
-        config.capture.selection = CaptureSelection::Replay;
-        config.policies = vec![probe_config::PolicyConfig {
-            id: "draft".to_string(),
-            enabled: false,
-            selector: Some(Selector::All {
-                selectors: Vec::new(),
-            }),
-            ..probe_config::PolicyConfig::default()
-        }];
-
-        validate_runtime_config(&config, &registry)
-            .expect("disabled policy selector should not be validated");
     }
 
     #[test]
@@ -649,8 +307,10 @@ mod tests {
         );
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
-        config.enforcement.interception.strategy =
-            TransparentInterceptionStrategyConfig::InboundTproxy;
+        enable_transparent_interception(
+            &mut config,
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+        );
 
         let error = validation_error(config, &registry);
 
@@ -670,8 +330,10 @@ mod tests {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
-        config.enforcement.interception.strategy =
-            TransparentInterceptionStrategyConfig::OutboundMitm;
+        enable_transparent_interception(
+            &mut config,
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+        );
 
         let error = validation_error(config, &registry);
 
@@ -691,8 +353,10 @@ mod tests {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Replay;
         config.enforcement.mode = EnforcementMode::Enforce;
-        config.enforcement.interception.strategy =
-            TransparentInterceptionStrategyConfig::InboundTproxy;
+        enable_transparent_interception(
+            &mut config,
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+        );
 
         let error = validation_error(config, &registry);
 
@@ -708,11 +372,35 @@ mod tests {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
-        config.enforcement.interception.strategy =
-            TransparentInterceptionStrategyConfig::OutboundMitm;
+        enable_transparent_interception(
+            &mut config,
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+        );
 
         validate_runtime_config(&config, &registry)
             .expect("transparent interception should not require a connection backend");
+    }
+
+    #[test]
+    fn transparent_interception_requires_local_setup_selector() {
+        let registry = ProviderRegistry::new(
+            vec![live_capture_provider()],
+            transparent_interception_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(
+            &error,
+            "enforcement.interception.selector",
+            "requires an explicit local selector",
+        );
     }
 
     #[test]
@@ -725,8 +413,10 @@ mod tests {
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.backend = ConnectionEnforcementBackendConfig::LinuxSocketDestroy;
-        config.enforcement.interception.strategy =
-            TransparentInterceptionStrategyConfig::InboundTproxy;
+        enable_transparent_interception(
+            &mut config,
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+        );
 
         let error = validation_error(config, &registry);
 
@@ -746,8 +436,10 @@ mod tests {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
-        config.enforcement.interception.strategy =
-            TransparentInterceptionStrategyConfig::InboundTproxy;
+        enable_transparent_interception(
+            &mut config,
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+        );
         config.enforcement.interception.selector = Some(Selector::All {
             selectors: Vec::new(),
         });
@@ -943,5 +635,21 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    fn enable_transparent_interception(
+        config: &mut AgentConfig,
+        strategy: TransparentInterceptionStrategyConfig,
+    ) {
+        config.enforcement.interception.strategy = strategy;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
     }
 }

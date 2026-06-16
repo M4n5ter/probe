@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use probe_config::{
     AgentConfig, ConnectionEnforcementBackendConfig, EnforcementPolicySourceConfig,
+    TransparentInterceptionNftablesConfig, TransparentInterceptionProxyConfig,
     TransparentInterceptionStrategyConfig,
 };
 use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
@@ -82,6 +83,8 @@ impl EnforcementConnectionPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementInterceptionPlan {
     pub strategy: TransparentInterceptionStrategyConfig,
+    pub proxy: TransparentInterceptionProxyPlan,
+    pub nftables: TransparentInterceptionNftablesPlan,
     pub capability: EnforcementCapabilityPlan,
     pub selector_configured: bool,
 }
@@ -91,11 +94,47 @@ impl EnforcementInterceptionPlan {
         let strategy = config.enforcement.interception.strategy;
         Self {
             strategy,
+            proxy: TransparentInterceptionProxyPlan::from_config(
+                &config.enforcement.interception.proxy,
+            ),
+            nftables: TransparentInterceptionNftablesPlan::from_config(
+                &config.enforcement.interception.nftables,
+            ),
             capability: EnforcementCapabilityPlan::from_interception_strategy(
                 strategy,
                 capabilities,
             ),
             selector_configured: config.enforcement.interception.selector.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionProxyPlan {
+    pub listen_port: Option<u16>,
+}
+
+impl TransparentInterceptionProxyPlan {
+    fn from_config(config: &TransparentInterceptionProxyConfig) -> Self {
+        Self {
+            listen_port: config.listen_port,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionNftablesPlan {
+    pub table_name: String,
+    pub mark: u32,
+    pub route_table: u32,
+}
+
+impl TransparentInterceptionNftablesPlan {
+    fn from_config(config: &TransparentInterceptionNftablesConfig) -> Self {
+        Self {
+            table_name: config.table_name.clone(),
+            mark: config.mark,
+            route_table: config.route_table,
         }
     }
 }
@@ -319,6 +358,7 @@ mod tests {
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
             TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
         config.enforcement.interception.selector = Some(Selector::default());
         let capabilities = CapabilityMatrix::new(test_platform_capabilities_with_interception(
             RuntimeMode::Available,
@@ -335,6 +375,10 @@ mod tests {
             vec![EnforcementExecutionSurface::TransparentInterception]
         );
         assert!(plan.interception.selector_configured);
+        assert_eq!(plan.interception.proxy.listen_port, Some(15001));
+        assert_eq!(plan.interception.nftables.table_name, "sssa_probe");
+        assert_eq!(plan.interception.nftables.mark, 0x5353_4101);
+        assert_eq!(plan.interception.nftables.route_table, 53_534);
         assert_eq!(
             plan.interception.capability,
             EnforcementCapabilityPlan::Required {

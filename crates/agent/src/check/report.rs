@@ -16,7 +16,10 @@ use probe_config::{
     AgentConfig, ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig,
 };
 use probe_core::EnforcementMode;
-use runtime::{EnforcementCapabilityPlan, RuntimePlan};
+use runtime::{
+    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionNftablesPlan,
+    TransparentInterceptionProxyPlan,
+};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -86,6 +89,8 @@ pub struct EnforcementConnectionCheckSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnforcementInterceptionCheckSnapshot {
     pub strategy: TransparentInterceptionStrategyConfig,
+    pub proxy: TransparentInterceptionProxyPlan,
+    pub nftables: TransparentInterceptionNftablesPlan,
     pub selector_configured: bool,
     pub capability: EnforcementCapabilityPlan,
 }
@@ -184,6 +189,8 @@ async fn check_enforcement(
         },
         interception: EnforcementInterceptionCheckSnapshot {
             strategy: plan.enforcement.interception.strategy,
+            proxy: plan.enforcement.interception.proxy,
+            nftables: plan.enforcement.interception.nftables.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,
             capability: plan.enforcement.interception.capability.clone(),
         },
@@ -548,6 +555,14 @@ protective_actions = ["alert"]
         assert_eq!(
             value["enforcement"]["interception"]["strategy"],
             json!("none")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["proxy"]["listen_port"],
+            json!(null)
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["nftables"]["table_name"],
+            json!("sssa_probe")
         );
         assert_eq!(
             value["enforcement"]["interception"]["capability"]["kind"],
