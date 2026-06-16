@@ -103,6 +103,7 @@ fn run_at(root: &Path, tls_object_path: &Path) -> Result<(), Box<dyn std::error:
 
 fn fixture_config() -> Http1LoopbackFixtureConfig {
     Http1LoopbackFixtureConfig {
+        listen_port: None,
         requests: REQUESTS,
         request_body_bytes: REQUEST_BODY_BYTES,
         response_body_bytes: RESPONSE_BODY_BYTES,

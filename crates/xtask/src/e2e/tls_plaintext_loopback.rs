@@ -2,8 +2,9 @@ use std::{
     collections::BTreeSet,
     fs,
     io::{BufRead, BufReader, Write},
+    net::{Ipv4Addr, TcpListener},
     os::unix::net::UnixStream,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, ExitCode},
     thread,
     time::{Duration, Instant},
@@ -23,9 +24,10 @@ use super::{
     },
     loopback::{
         Http1LoopbackFixtureConfig, assert_no_policy_runtime_errors, is_fixture_process,
-        merge_run_results, spawn_agent, spawn_tls_http1_loopback_fixture,
-        start_http1_loopback_fixture, wait_for_agent_policy_progress, wait_for_agent_ready,
-        wait_for_http1_loopback_fixture_exit, wait_for_http1_loopback_fixture_ready,
+        merge_labeled_run_results, merge_run_results, spawn_agent,
+        spawn_tls_http1_loopback_fixture, start_http1_loopback_fixture,
+        wait_for_agent_policy_progress, wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
+        wait_for_http1_loopback_fixture_ready,
     },
 };
 
@@ -39,12 +41,13 @@ const REQUEST_BODY_BYTES: usize = 48;
 const RESPONSE_BODY_BYTES: usize = 24;
 const WRITE_CHUNKS: usize = 1;
 const POST_EXCHANGE_DELAY_MS: u64 = 500;
+const FIXTURE_EXE_GLOB: &str = "**/sssa-e2e-fixture";
 const TLS_RECONCILE_INTERVAL_MS: u64 = 100;
 const TLS_ATTACH_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const TLS_ATTACH_READY_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) fn run() -> ExitCode {
-    match run_inner() {
+    match run_inner(Scenario::Startup) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("e2e TLS plaintext loopback failed: {error}");
@@ -53,15 +56,96 @@ pub(crate) fn run() -> ExitCode {
     }
 }
 
-fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run_dynamic() -> ExitCode {
+    match run_inner(Scenario::Dynamic) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("e2e TLS plaintext dynamic loopback failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scenario {
+    Startup,
+    Dynamic,
+}
+
+impl Scenario {
+    fn temp_name(self) -> &'static str {
+        match self {
+            Self::Startup => "tls-plaintext-loopback",
+            Self::Dynamic => "tls-plaintext-dynamic-loopback",
+        }
+    }
+
+    fn success_message(self) -> &'static str {
+        match self {
+            Self::Startup => "e2e TLS plaintext loopback passed",
+            Self::Dynamic => "e2e TLS plaintext dynamic loopback passed",
+        }
+    }
+
+    fn agent_id(self) -> &'static str {
+        match self {
+            Self::Startup => "e2e-tls-plaintext-agent",
+            Self::Dynamic => "e2e-tls-plaintext-dynamic-agent",
+        }
+    }
+
+    fn config_version(self) -> &'static str {
+        match self {
+            Self::Startup => "e2e-tls-plaintext-loopback",
+            Self::Dynamic => "e2e-tls-plaintext-dynamic-loopback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachSelector {
+    ProcessId(u32),
+    FixtureExecutable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TlsLoopbackPaths {
+    fixture_ready: PathBuf,
+    fixture_start: PathBuf,
+    agent_ready_socket: PathBuf,
+    admin_socket: PathBuf,
+    policy: PathBuf,
+    config: PathBuf,
+    spool: PathBuf,
+}
+
+impl TlsLoopbackPaths {
+    fn new(root: &Path) -> Self {
+        Self {
+            fixture_ready: root.join("fixture.ready"),
+            fixture_start: root.join("fixture.start"),
+            agent_ready_socket: root.join("agent.ready.sock"),
+            admin_socket: root.join("admin.sock"),
+            policy: root.join("tls-plaintext-e2e-policy.bundle"),
+            config: root.join("agent.toml"),
+            spool: root.join("spool"),
+        }
+    }
+}
+
+fn run_inner(scenario: Scenario) -> Result<(), Box<dyn std::error::Error>> {
     ensure_e2e_packages_built(["agent", "e2e-fixture"])?;
     let tls_object_path = crate::ebpf::ensure_tls_plaintext_artifact_ready().map_err(e2e_error)?;
 
-    let root = create_temp_root("tls-plaintext-loopback")?;
-    match run_at(&root, &tls_object_path) {
+    let root = create_temp_root(scenario.temp_name())?;
+    let result = match scenario {
+        Scenario::Startup => run_at(&root, &tls_object_path),
+        Scenario::Dynamic => run_dynamic_at(&root, &tls_object_path),
+    };
+    match result {
         Ok(()) => {
             fs::remove_dir_all(&root)?;
-            println!("e2e TLS plaintext loopback passed");
+            println!("{}", scenario.success_message());
             Ok(())
         }
         Err(error) => {
@@ -73,46 +157,42 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_at(root: &Path, tls_object_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(root)?;
-    let fixture_ready_path = root.join("fixture.ready");
-    let fixture_start_path = root.join("fixture.start");
-    let agent_ready_socket_path = root.join("agent.ready.sock");
-    let admin_socket_path = root.join("admin.sock");
-    let policy_path = root.join("tls-plaintext-e2e-policy.bundle");
-    let config_path = root.join("agent.toml");
-    let spool_path = root.join("spool");
+    let paths = TlsLoopbackPaths::new(root);
 
     let supervisor = ChildSupervisor::new()?;
-    write_policy_bundle(&policy_path)?;
+    write_policy_bundle(&paths.policy)?;
     let mut fixture = supervisor.watch(
         spawn_tls_http1_loopback_fixture(
-            &fixture_ready_path,
-            &fixture_start_path,
+            &paths.fixture_ready,
+            &paths.fixture_start,
             fixture_config(),
         )?,
         "fixture",
     );
     let fixture_ready =
-        wait_for_http1_loopback_fixture_ready(fixture.child_mut(), &fixture_ready_path)?;
+        wait_for_http1_loopback_fixture_ready(fixture.child_mut(), &paths.fixture_ready)?;
     write_agent_config(
-        &config_path,
+        &paths,
         tls_object_path,
-        &policy_path,
-        &spool_path,
-        &admin_socket_path,
-        fixture_ready.pid,
         fixture_ready.listen_port,
+        Scenario::Startup,
+        AttachSelector::ProcessId(fixture_ready.pid),
     )?;
-    let mut ready_signal = UnixSocketReadySignal::bind(agent_ready_socket_path)?;
-    let mut agent = supervisor.watch(spawn_agent(&config_path, &ready_signal)?, "agent");
+    let mut ready_signal = UnixSocketReadySignal::bind(paths.agent_ready_socket.clone())?;
+    let mut agent = supervisor.watch(spawn_agent(&paths.config, &ready_signal)?, "agent");
     wait_for_agent_ready(agent.child_mut(), &mut ready_signal)?;
-    wait_for_tls_plaintext_active_target(agent.child_mut(), &admin_socket_path, fixture_ready.pid)?;
-    start_http1_loopback_fixture(&fixture_start_path, &fixture_ready.start_nonce)?;
+    wait_for_tls_plaintext_active_target(
+        agent.child_mut(),
+        &paths.admin_socket,
+        fixture_ready.pid,
+    )?;
+    start_http1_loopback_fixture(&paths.fixture_start, &fixture_ready.start_nonce)?;
     let fixture_result = wait_for_http1_loopback_fixture_exit(fixture.child_mut());
     fixture.unwatch();
     let progress_result = match &fixture_result {
         Ok(()) => wait_for_agent_policy_progress(
             agent.child_mut(),
-            &admin_socket_path,
+            &paths.admin_socket,
             expected_policy_alert_messages().len() as u64,
         ),
         Err(_) => Ok(()),
@@ -120,7 +200,7 @@ fn run_at(root: &Path, tls_object_path: &Path) -> Result<(), Box<dyn std::error:
     let agent_result = stop_running_child(agent.child_mut(), "agent");
     agent.unwatch();
     let spool_result = match (&fixture_result, &agent_result) {
-        (Ok(()), Ok(())) => assert_spool_outputs(&spool_path, fixture_ready.listen_port),
+        (Ok(()), Ok(())) => assert_spool_outputs(&paths.spool, fixture_ready.listen_port),
         _ => Ok(()),
     };
     merge_run_results(fixture_result, progress_result, agent_result, spool_result)?;
@@ -128,8 +208,79 @@ fn run_at(root: &Path, tls_object_path: &Path) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+fn run_dynamic_at(root: &Path, tls_object_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(root)?;
+    let paths = TlsLoopbackPaths::new(root);
+    let listen_port = available_loopback_port()?;
+
+    let supervisor = ChildSupervisor::new()?;
+    write_policy_bundle(&paths.policy)?;
+    write_agent_config(
+        &paths,
+        tls_object_path,
+        listen_port,
+        Scenario::Dynamic,
+        AttachSelector::FixtureExecutable,
+    )?;
+    let mut ready_signal = UnixSocketReadySignal::bind(paths.agent_ready_socket.clone())?;
+    let mut agent = supervisor.watch(spawn_agent(&paths.config, &ready_signal)?, "agent");
+    wait_for_agent_ready(agent.child_mut(), &mut ready_signal)?;
+
+    let mut fixture = supervisor.watch(
+        spawn_tls_http1_loopback_fixture(
+            &paths.fixture_ready,
+            &paths.fixture_start,
+            dynamic_fixture_config(listen_port),
+        )?,
+        "fixture",
+    );
+    let fixture_ready =
+        wait_for_http1_loopback_fixture_ready(fixture.child_mut(), &paths.fixture_ready)?;
+    let active_status = wait_for_tls_plaintext_active_target(
+        agent.child_mut(),
+        &paths.admin_socket,
+        fixture_ready.pid,
+    )?;
+    start_http1_loopback_fixture(&paths.fixture_start, &fixture_ready.start_nonce)?;
+    let fixture_result = wait_for_http1_loopback_fixture_exit(fixture.child_mut());
+    fixture.unwatch();
+    let detach_result = match &fixture_result {
+        Ok(()) => wait_for_tls_plaintext_detached_target(
+            agent.child_mut(),
+            &paths.admin_socket,
+            fixture_ready.pid,
+            active_status.sequence,
+        ),
+        Err(_) => Ok(()),
+    };
+    let progress_result = match &fixture_result {
+        Ok(()) => wait_for_agent_policy_progress(
+            agent.child_mut(),
+            &paths.admin_socket,
+            expected_policy_alert_messages().len() as u64,
+        ),
+        Err(_) => Ok(()),
+    };
+    let agent_result = stop_running_child(agent.child_mut(), "agent");
+    agent.unwatch();
+    let spool_result = match (&fixture_result, &agent_result) {
+        (Ok(()), Ok(())) => assert_spool_outputs(&paths.spool, fixture_ready.listen_port),
+        _ => Ok(()),
+    };
+    merge_labeled_run_results([
+        ("fixture", fixture_result),
+        ("TLS plaintext detach", detach_result),
+        ("agent policy progress", progress_result),
+        ("agent", agent_result),
+        ("spool assertion", spool_result),
+    ])?;
+
+    Ok(())
+}
+
 fn fixture_config() -> Http1LoopbackFixtureConfig {
     Http1LoopbackFixtureConfig {
+        listen_port: None,
         requests: REQUESTS,
         request_body_bytes: REQUEST_BODY_BYTES,
         response_body_bytes: RESPONSE_BODY_BYTES,
@@ -137,6 +288,18 @@ fn fixture_config() -> Http1LoopbackFixtureConfig {
         connect_write_delay_ms: 0,
         post_exchange_delay_ms: POST_EXCHANGE_DELAY_MS,
     }
+}
+
+fn dynamic_fixture_config(listen_port: u16) -> Http1LoopbackFixtureConfig {
+    Http1LoopbackFixtureConfig {
+        listen_port: Some(listen_port),
+        ..fixture_config()
+    }
+}
+
+fn available_loopback_port() -> Result<u16, std::io::Error> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    Ok(listener.local_addr()?.port())
 }
 
 fn write_policy_bundle(path: &Path) -> Result<(), std::io::Error> {
@@ -165,17 +328,15 @@ end
 }
 
 fn write_agent_config(
-    path: &Path,
+    paths: &TlsLoopbackPaths,
     tls_object_path: &Path,
-    policy_path: &Path,
-    spool_path: &Path,
-    admin_socket_path: &Path,
-    fixture_pid: u32,
     listen_port: u16,
+    scenario: Scenario,
+    attach_selector: AttachSelector,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = AgentConfig {
-        agent_id: "e2e-tls-plaintext-agent".to_string(),
-        config_version: "e2e-tls-plaintext-loopback".to_string(),
+        agent_id: scenario.agent_id().to_string(),
+        config_version: scenario.config_version().to_string(),
         ..AgentConfig::default()
     };
     config.capture.selection = CaptureSelection::Libpcap;
@@ -189,28 +350,35 @@ fn write_agent_config(
         .instrumentation
         .libssl_uprobe_object_path = Some(tls_object_path.to_path_buf());
     config.tls.plaintext.instrumentation.reconcile_interval_ms = TLS_RECONCILE_INTERVAL_MS;
-    config.tls.plaintext.instrumentation.selector = Some(Selector::term(
-        ProcessSelector {
-            pids: vec![fixture_pid],
+    let process = match attach_selector {
+        AttachSelector::ProcessId(pid) => ProcessSelector {
+            pids: vec![pid],
             ..ProcessSelector::default()
         },
+        AttachSelector::FixtureExecutable => ProcessSelector {
+            exe_path_globs: vec![FIXTURE_EXE_GLOB.to_string()],
+            ..ProcessSelector::default()
+        },
+    };
+    config.tls.plaintext.instrumentation.selector = Some(Selector::term(
+        process,
         TrafficSelector {
             remote_ports: vec![listen_port],
             directions: vec![Direction::Outbound],
             ..TrafficSelector::default()
         },
     ));
-    config.storage.path = spool_path.to_path_buf();
+    config.storage.path = paths.spool.clone();
     config.export.worker.enabled = false;
     config.admin.enabled = true;
-    config.admin.socket_path = admin_socket_path.to_path_buf();
+    config.admin.socket_path = paths.admin_socket.clone();
     config.policies.push(PolicyConfig {
         id: POLICY_ID.to_string(),
-        path: policy_path.to_path_buf(),
+        path: paths.policy.clone(),
         enabled: true,
         selector: None,
     });
-    fs::write(path, toml::to_string(&config)?)?;
+    fs::write(&paths.config, toml::to_string(&config)?)?;
     Ok(())
 }
 
@@ -246,11 +414,11 @@ fn wait_for_tls_plaintext_active_target(
     agent: &mut Child,
     admin_socket_path: &Path,
     fixture_pid: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<TlsPlaintextAttachStatus, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + TLS_ATTACH_READY_TIMEOUT;
     loop {
         let status = match read_tls_plaintext_status(admin_socket_path) {
-            Ok(status) if status.has_active_target(fixture_pid) => return Ok(()),
+            Ok(status) if status.has_active_target(fixture_pid) => return Ok(status),
             Ok(status) => status,
             Err(error) => {
                 if let Some(status) = agent.try_wait()? {
@@ -273,12 +441,53 @@ fn wait_for_tls_plaintext_active_target(
     }
 }
 
+fn wait_for_tls_plaintext_detached_target(
+    agent: &mut Child,
+    admin_socket_path: &Path,
+    fixture_pid: u32,
+    active_sequence: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + TLS_ATTACH_READY_TIMEOUT;
+    loop {
+        let status = match read_tls_plaintext_status(admin_socket_path) {
+            Ok(status)
+                if status.sequence > active_sequence
+                    && (status.has_detached_target(fixture_pid)
+                        || (status.active == 0 && !status.has_active_target(fixture_pid))) =>
+            {
+                return Ok(());
+            }
+            Ok(status) => status,
+            Err(error) => {
+                if let Some(status) = agent.try_wait()? {
+                    return Err(e2e_error(format!(
+                        "agent exited with {status} before TLS plaintext detached fixture pid {fixture_pid}: {error}"
+                    ))
+                    .into());
+                }
+                TlsPlaintextAttachStatus::error(error.to_string())
+            }
+        };
+        if Instant::now() >= deadline {
+            return Err(e2e_error(format!(
+                "timed out waiting for TLS plaintext detach of fixture pid {fixture_pid}; last status: {}",
+                status.summary()
+            ))
+            .into());
+        }
+        thread::sleep(TLS_ATTACH_READY_INTERVAL);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TlsPlaintextAttachStatus {
     mode: Option<String>,
     reason: Option<String>,
+    sequence: u64,
     active: u64,
+    detached: u64,
     active_pids: BTreeSet<u32>,
+    detached_pids: BTreeSet<u32>,
     error: Option<String>,
 }
 
@@ -287,8 +496,11 @@ impl TlsPlaintextAttachStatus {
         Self {
             mode: None,
             reason: None,
+            sequence: 0,
             active: 0,
+            detached: 0,
             active_pids: BTreeSet::new(),
+            detached_pids: BTreeSet::new(),
             error: Some(error),
         }
     }
@@ -297,13 +509,23 @@ impl TlsPlaintextAttachStatus {
         self.active_pids.contains(&fixture_pid)
     }
 
+    fn has_detached_target(&self, fixture_pid: u32) -> bool {
+        self.detached_pids.contains(&fixture_pid)
+    }
+
     fn summary(&self) -> String {
         if let Some(error) = &self.error {
             return format!("admin error: {error}");
         }
         format!(
-            "mode={:?} reason={:?} active={} active_pids={:?}",
-            self.mode, self.reason, self.active, self.active_pids
+            "mode={:?} reason={:?} sequence={} active={} detached={} active_pids={:?} detached_pids={:?}",
+            self.mode,
+            self.reason,
+            self.sequence,
+            self.active,
+            self.detached,
+            self.active_pids,
+            self.detached_pids
         )
     }
 }
@@ -320,7 +542,13 @@ fn read_tls_plaintext_status(
     BufReader::new(stream).read_line(&mut line)?;
     let value = serde_json::from_str::<serde_json::Value>(&line)?;
     let runtime = &value["snapshot"]["tls"]["plaintext"]["instrumentation"]["runtime"];
+    let sequence = runtime["last_reconcile"]["sequence"]
+        .as_u64()
+        .unwrap_or_default();
     let active = runtime["last_reconcile"]["target_counts"]["active"]
+        .as_u64()
+        .unwrap_or_default();
+    let detached = runtime["last_reconcile"]["target_counts"]["detached"]
         .as_u64()
         .unwrap_or_default();
     let active_pids = runtime["last_reconcile"]["targets"]["active"]["targets"]
@@ -330,11 +558,21 @@ fn read_tls_plaintext_status(
         .filter_map(|target| target["pid"].as_u64())
         .filter_map(|pid| u32::try_from(pid).ok())
         .collect::<BTreeSet<_>>();
+    let detached_pids = runtime["last_reconcile"]["targets"]["detached"]["targets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|target| target["pid"].as_u64())
+        .filter_map(|pid| u32::try_from(pid).ok())
+        .collect::<BTreeSet<_>>();
     Ok(TlsPlaintextAttachStatus {
         mode: runtime["mode"].as_str().map(ToOwned::to_owned),
         reason: runtime["reason"].as_str().map(ToOwned::to_owned),
+        sequence,
         active,
+        detached,
         active_pids,
+        detached_pids,
         error: None,
     })
 }

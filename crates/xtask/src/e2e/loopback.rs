@@ -27,6 +27,7 @@ pub(crate) const AGENT_READY_SOCKET_ENV: &str = "SSSA_PROBE_READY_SOCKET";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Http1LoopbackFixtureConfig {
+    pub(crate) listen_port: Option<u16>,
     pub(crate) requests: usize,
     pub(crate) request_body_bytes: usize,
     pub(crate) response_body_bytes: usize,
@@ -41,6 +42,9 @@ pub(crate) struct Http1LoopbackFixtureReady {
     pub(crate) listen_port: u16,
     pub(crate) start_nonce: String,
 }
+
+pub(crate) type RunResult = Result<(), Box<dyn std::error::Error>>;
+pub(crate) type LabeledRunResult = (&'static str, RunResult);
 
 pub(crate) fn spawn_http1_loopback_fixture(
     ready_path: &Path,
@@ -65,8 +69,11 @@ fn spawn_loopback_fixture(
     config: Http1LoopbackFixtureConfig,
 ) -> Result<Child, Box<dyn std::error::Error>> {
     let mut command = Command::new(debug_binary("sssa-e2e-fixture")?);
-    let child = run_in_own_process_group(&mut command)
-        .arg(scenario)
+    let command = run_in_own_process_group(&mut command).arg(scenario);
+    if let Some(listen_port) = config.listen_port {
+        command.arg("--listen-port").arg(listen_port.to_string());
+    }
+    let child = command
         .arg("--requests")
         .arg(config.requests.to_string())
         .arg("--request-body-bytes")
@@ -205,15 +212,21 @@ pub(crate) fn merge_run_results(
     agent_result: Result<(), Box<dyn std::error::Error>>,
     spool_result: Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let errors = [
+    merge_labeled_run_results([
         ("fixture", fixture_result),
         ("agent policy progress", metrics_result),
         ("agent", agent_result),
         ("spool assertion", spool_result),
-    ]
-    .into_iter()
-    .filter_map(|(label, result)| result.err().map(|error| format!("{label} failed: {error}")))
-    .collect::<Vec<_>>();
+    ])
+}
+
+pub(crate) fn merge_labeled_run_results<const N: usize>(
+    results: [LabeledRunResult; N],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let errors = results
+        .into_iter()
+        .filter_map(|(label, result)| result.err().map(|error| format!("{label} failed: {error}")))
+        .collect::<Vec<_>>();
     if errors.is_empty() {
         Ok(())
     } else {

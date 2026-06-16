@@ -17,12 +17,13 @@ fn main() -> ExitCode {
         Some("e2e-ebpf-process-loopback") => e2e::run_ebpf_process_loopback(),
         Some("e2e-libpcap-loopback") => e2e::run_libpcap_loopback(),
         Some("e2e-plaintext-feed") => e2e::run_plaintext_feed(),
+        Some("e2e-tls-plaintext-dynamic-loopback") => e2e::run_tls_plaintext_dynamic_loopback(),
         Some("e2e-tls-plaintext-loopback") => e2e::run_tls_plaintext_loopback(),
         Some("e2e-tls-plaintext-provider-loopback") => e2e::run_tls_plaintext_provider_loopback(),
         Some("e2e-transparent-tproxy-loopback") => e2e::run_transparent_tproxy_loopback(),
         _ => {
             eprintln!(
-                "usage: cargo run -p xtask -- <check|check-host|check-ebpf|check-all|ebpf-build|e2e-plaintext-feed|e2e-libpcap-loopback|e2e-ebpf-process-loopback|e2e-tls-plaintext-provider-loopback|e2e-tls-plaintext-loopback|e2e-transparent-tproxy-loopback>"
+                "usage: cargo run -p xtask -- <check|check-host|check-ebpf|check-all|ebpf-build|e2e-plaintext-feed|e2e-libpcap-loopback|e2e-ebpf-process-loopback|e2e-tls-plaintext-provider-loopback|e2e-tls-plaintext-loopback|e2e-tls-plaintext-dynamic-loopback|e2e-transparent-tproxy-loopback>"
             );
             ExitCode::FAILURE
         }
