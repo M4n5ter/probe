@@ -1,9 +1,11 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, path::PathBuf};
 
-use super::http1::{Http1LoopbackConfig, Http1LoopbackError, Http1LoopbackReport};
+use super::http1::{
+    Http1LoopbackConfig, Http1LoopbackCoordination, Http1LoopbackError, Http1LoopbackReport,
+};
 
 const USAGE: &str = "\
-usage: sssa-e2e-fixture http1-loopback [--requests N] [--request-body-bytes N] [--response-body-bytes N] [--write-chunks N]
+usage: sssa-e2e-fixture http1-loopback [--listen-port PORT] [--ready-file PATH] [--start-file PATH] [--requests N] [--request-body-bytes N] [--response-body-bytes N] [--write-chunks N]
 
 Scenarios:
   http1-loopback    Start a local TCP server and client in this process, then exchange deterministic HTTP/1 traffic.
@@ -90,6 +92,8 @@ fn parse_http1_loopback(
     args: impl IntoIterator<Item = String>,
 ) -> Result<Http1LoopbackConfig, FixtureError> {
     let mut config = Http1LoopbackConfig::default();
+    let mut ready_file = None;
+    let mut start_file = None;
     let mut args = args.into_iter();
     while let Some(option) = args.next() {
         if option == "--help" || option == "-h" {
@@ -100,12 +104,18 @@ fn parse_http1_loopback(
                 "missing value for {option}\n\n{USAGE}"
             )));
         };
-        let parsed = parse_usize(&option, &value)?;
         match option.as_str() {
-            "--requests" => config.requests = parsed,
-            "--request-body-bytes" => config.request_body_bytes = parsed,
-            "--response-body-bytes" => config.response_body_bytes = parsed,
-            "--write-chunks" => config.write_chunks = parsed,
+            "--listen-port" => config.run.listen_port = parse_u16(&option, &value)?,
+            "--ready-file" => ready_file = Some(PathBuf::from(value)),
+            "--start-file" => start_file = Some(PathBuf::from(value)),
+            "--requests" => config.traffic.requests = parse_usize(&option, &value)?,
+            "--request-body-bytes" => {
+                config.traffic.request_body_bytes = parse_usize(&option, &value)?;
+            }
+            "--response-body-bytes" => {
+                config.traffic.response_body_bytes = parse_usize(&option, &value)?;
+            }
+            "--write-chunks" => config.traffic.write_chunks = parse_usize(&option, &value)?,
             _ => {
                 return Err(FixtureError::usage(format!(
                     "unknown option {option}\n\n{USAGE}"
@@ -113,11 +123,41 @@ fn parse_http1_loopback(
             }
         }
     }
+    config.run.coordination = parse_coordination(ready_file, start_file)?;
     Ok(config)
+}
+
+fn parse_coordination(
+    ready_file: Option<PathBuf>,
+    start_file: Option<PathBuf>,
+) -> Result<Http1LoopbackCoordination, FixtureError> {
+    match (ready_file, start_file) {
+        (None, None) => Ok(Http1LoopbackCoordination::Immediate),
+        (Some(ready_file), Some(start_file)) if ready_file == start_file => {
+            Err(FixtureError::usage(format!(
+                "--ready-file and --start-file must be different paths\n\n{USAGE}"
+            )))
+        }
+        (Some(ready_file), Some(start_file)) => Ok(Http1LoopbackCoordination::TwoPhase {
+            ready_file,
+            start_file,
+        }),
+        (Some(_), None) | (None, Some(_)) => Err(FixtureError::usage(format!(
+            "--ready-file and --start-file must be supplied together\n\n{USAGE}"
+        ))),
+    }
 }
 
 fn parse_usize(option: &str, value: &str) -> Result<usize, FixtureError> {
     value.parse::<usize>().map_err(|error| {
+        FixtureError::usage(format!(
+            "invalid value for {option}: {value}: {error}\n\n{USAGE}"
+        ))
+    })
+}
+
+fn parse_u16(option: &str, value: &str) -> Result<u16, FixtureError> {
+    value.parse::<u16>().map_err(|error| {
         FixtureError::usage(format!(
             "invalid value for {option}: {value}: {error}\n\n{USAGE}"
         ))
@@ -131,6 +171,12 @@ mod tests {
     #[test]
     fn cli_parses_http1_loopback_options() -> Result<(), Box<dyn Error>> {
         let config = parse_http1_loopback([
+            "--listen-port".to_string(),
+            "0".to_string(),
+            "--ready-file".to_string(),
+            "/tmp/ready".to_string(),
+            "--start-file".to_string(),
+            "/tmp/start".to_string(),
             "--requests".to_string(),
             "2".to_string(),
             "--request-body-bytes".to_string(),
@@ -141,11 +187,48 @@ mod tests {
             "3".to_string(),
         ])?;
 
-        assert_eq!(config.requests, 2);
-        assert_eq!(config.request_body_bytes, 128);
-        assert_eq!(config.response_body_bytes, 64);
-        assert_eq!(config.write_chunks, 3);
+        assert_eq!(config.run.listen_port, 0);
+        assert_eq!(
+            config.run.coordination,
+            Http1LoopbackCoordination::TwoPhase {
+                ready_file: PathBuf::from("/tmp/ready"),
+                start_file: PathBuf::from("/tmp/start")
+            }
+        );
+        assert_eq!(config.traffic.requests, 2);
+        assert_eq!(config.traffic.request_body_bytes, 128);
+        assert_eq!(config.traffic.response_body_bytes, 64);
+        assert_eq!(config.traffic.write_chunks, 3);
         Ok(())
+    }
+
+    #[test]
+    fn cli_rejects_incomplete_two_phase_coordination() {
+        let error = parse_http1_loopback(["--ready-file".to_string(), "/tmp/ready".to_string()])
+            .expect_err("incomplete coordination must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--ready-file and --start-file must be supplied together")
+        );
+    }
+
+    #[test]
+    fn cli_rejects_same_two_phase_paths() {
+        let error = parse_http1_loopback([
+            "--ready-file".to_string(),
+            "/tmp/coord".to_string(),
+            "--start-file".to_string(),
+            "/tmp/coord".to_string(),
+        ])
+        .expect_err("same coordination path must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--ready-file and --start-file must be different paths")
+        );
     }
 
     #[test]

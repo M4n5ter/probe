@@ -1,16 +1,18 @@
 use std::{
-    env,
-    ffi::OsString,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, ExitCode},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use capture::CaptureEvent;
 use probe_config::{AgentConfig, CaptureSelection, PolicyConfig};
-use probe_core::{CaptureSource, EventEnvelope, EventKind, SpoolPayloadSchema};
+use probe_core::{CaptureSource, EventEnvelope, EventKind};
 use storage::{FjallSpool, StoredEvent};
+
+use super::harness::{
+    cargo_executable, create_temp_root, decode_capture_event, decode_envelope, e2e_error,
+    workspace_root,
+};
 
 const CONNECTION_ID: &str = "xtask-e2e-conn";
 const E2E_EXPORT_CURSOR_OWNER: &str = "e2e";
@@ -62,19 +64,6 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     assert_spool_outputs(&spool_path)?;
 
     Ok(())
-}
-
-fn create_temp_root(name: &str) -> Result<PathBuf, std::io::Error> {
-    let path = env::temp_dir().join(format!(
-        "sssa-probe-e2e-{name}-{}-{}",
-        std::process::id(),
-        wall_time_unix_ns()
-    ));
-    if path.exists() {
-        fs::remove_dir_all(&path)?;
-    }
-    fs::create_dir_all(&path)?;
-    Ok(path)
 }
 
 fn write_plaintext_feed(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -309,52 +298,4 @@ fn assert_ingress_events(events: &[StoredEvent]) -> Result<(), Box<dyn std::erro
 fn is_expected_feed_flow(envelope: &EventEnvelope) -> bool {
     envelope.source == CaptureSource::ExternalPlaintextFeed
         && envelope.flow.id.0 == EXPECTED_FLOW_ID
-}
-
-fn decode_capture_event(event: &StoredEvent) -> Result<CaptureEvent, Box<dyn std::error::Error>> {
-    if event.payload.schema() != &SpoolPayloadSchema::CaptureEventJson {
-        return Err(e2e_error(format!(
-            "ingress record {} used unexpected schema {}",
-            event.sequence,
-            event.payload.schema_wire()
-        ))
-        .into());
-    }
-    serde_json::from_slice::<CaptureEvent>(event.payload.bytes()).map_err(Into::into)
-}
-
-fn decode_envelope(event: &StoredEvent) -> Result<EventEnvelope, Box<dyn std::error::Error>> {
-    if event.payload.schema() != &SpoolPayloadSchema::EventEnvelopeJson {
-        return Err(e2e_error(format!(
-            "export record {} used unexpected schema {}",
-            event.sequence,
-            event.payload.schema_wire()
-        ))
-        .into());
-    }
-    serde_json::from_slice::<EventEnvelope>(event.payload.bytes()).map_err(Into::into)
-}
-
-fn cargo_executable() -> OsString {
-    env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"))
-}
-
-fn workspace_root() -> Result<PathBuf, std::io::Error> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|crates_dir| crates_dir.parent())
-        .map(Path::to_path_buf)
-        .ok_or_else(|| e2e_error("failed to resolve workspace root"))
-}
-
-fn wall_time_unix_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
-        })
-}
-
-fn e2e_error(message: impl Into<String>) -> std::io::Error {
-    std::io::Error::other(message.into())
 }

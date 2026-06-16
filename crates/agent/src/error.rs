@@ -13,6 +13,13 @@ pub(crate) enum AgentError {
         path: String,
         source: std::io::Error,
     },
+    #[error("failed to signal readiness through {target}: {source}")]
+    SignalReadiness {
+        target: String,
+        source: std::io::Error,
+    },
+    #[error("invalid readiness socket in {name}: {value}")]
+    InvalidReadinessSocket { name: &'static str, value: String },
     #[error("invalid replay policy file: {0}")]
     ReplayPolicyFile(#[from] probe_io::BoundedFileError),
     #[error("config error: {0}")]
@@ -41,6 +48,8 @@ pub(crate) enum AgentError {
     Export(#[from] ExportDrainError),
     #[error("capture provider error: {0}")]
     Capture(#[from] capture::CaptureError),
+    #[error("capture task failed to join: {0}")]
+    CaptureTaskJoin(String),
     #[error("attribution error: {0}")]
     Attribution(#[from] attribution::AttributionError),
     #[error("plaintext feed error: {0}")]

@@ -14,10 +14,11 @@ fn main() -> ExitCode {
         Some("check-all") => run_check_all(),
         Some("check-ebpf") => ebpf::run_check(),
         Some("ebpf-build") => ebpf::run_build(),
-        Some("e2e-plaintext-feed") => e2e::run(),
+        Some("e2e-libpcap-loopback") => e2e::run_libpcap_loopback(),
+        Some("e2e-plaintext-feed") => e2e::run_plaintext_feed(),
         _ => {
             eprintln!(
-                "usage: cargo run -p xtask -- <check|check-host|check-ebpf|check-all|ebpf-build|e2e-plaintext-feed>"
+                "usage: cargo run -p xtask -- <check|check-host|check-ebpf|check-all|ebpf-build|e2e-plaintext-feed|e2e-libpcap-loopback>"
             );
             ExitCode::FAILURE
         }

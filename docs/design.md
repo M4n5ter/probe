@@ -1231,7 +1231,7 @@ trait async/sync 边界：
 
 eBPF 构建：
 
-- 使用 `xtask` 统一构建 eBPF target、校验 artifacts、再构建用户态；`xtask check` 与 `xtask check-host` 跑稳定 host workspace 质量门，`xtask check-ebpf` 跑 nightly/rust-src/`bpf-linker` 前提下的 eBPF fmt、BPF target clippy、locked build 与 preflight contract 校验，`xtask check-all` 组合两者作为完整提交前质量门，避免 kernel/userspace contract 漂移。`xtask e2e-plaintext-feed` 是第一条 agent 侧端到端断言 harness：它生成临时 JSON-lines plaintext feed、policy bundle 和 agent TOML，运行真实 `agent run`，再打开 Fjall spool 断言 ingress journal、HTTP parser output、configured policy output 和 connection lifecycle export event。特权 process observation、outbound write argument sample、lost-event feedback 和 TLS lifecycle 仍需要真正的 privileged/e2e 验收，不保留弱信号的单独入口。
+- 使用 `xtask` 统一构建 eBPF target、校验 artifacts、再构建用户态；`xtask check` 与 `xtask check-host` 跑稳定 host workspace 质量门，`xtask check-ebpf` 跑 nightly/rust-src/`bpf-linker` 前提下的 eBPF fmt、BPF target clippy、locked build 与 preflight contract 校验，`xtask check-all` 组合两者作为完整提交前质量门，避免 kernel/userspace contract 漂移。`xtask e2e-plaintext-feed` 是第一条 agent 侧端到端断言 harness：它生成临时 JSON-lines plaintext feed、policy bundle 和 agent TOML，运行真实 `agent run`，再打开 Fjall spool 断言 ingress journal、HTTP parser output、configured policy output 和 connection lifecycle export event。`xtask e2e-libpcap-loopback` 复用同一 fixture 形态，在 root/CAP_NET_RAW 环境下启动真实 libpcap agent、生成 loopback HTTP/1 traffic，再断言 libpcap degraded ingress bytes、HTTP request parser output 和 configured policy alert。特权 process observation、outbound write argument sample、lost-event feedback 和 TLS lifecycle 仍需要真正的 privileged/e2e 验收，不保留弱信号的单独入口。
 - 不把复杂构建逻辑藏进 `build.rs`。
 
 依赖策略：
@@ -1331,12 +1331,13 @@ benchmark 参数：
 
 当前端到端目标程序：
 
-- `cargo run -p e2e-fixture -- http1-loopback --requests 1 --request-body-bytes 64 --response-body-bytes 32 --write-chunks 2` 会在同一进程内启动 loopback TCP server/client，发送 deterministic HTTP/1 POST request 和 response，并输出 key=value 报告。请求端按 chunk 通过 `rustix::io::write` 强制执行一次 Linux `write(2)` syscall，partial chunk write 会失败，便于后续验证 syscall argument sample 边界，不再依赖 `TcpStream::write` 在标准库内部选择 `send` 还是 `write`。默认请求总字节小于当前 eBPF write sample 上限；真实 eBPF 验收还必须配置 `capture.deep_observe_selector` 命中该 fixture flow，才能验证 selector-authorized outbound `write(2)` sample 的授权、裁剪、degraded 标记和 gap 语义。调大 request body 可制造截断路径。该 fixture 只生成流量和报告，不替代 agent 侧断言 harness。
-- `cargo run -p xtask -- e2e-plaintext-feed` 会创建临时 feed/policy/config，执行真实 `agent run --config ... --max-events 3`，并从 Fjall spool 读回断言 3 条 ingress record、`source = external_plaintext_feed` 的 `/e2e` HTTP request headers、`e2e-policy@e2e` policy alert 以及 connection opened/closed export event。该入口不需要特权，作为后续 libpcap/eBPF/TLS/MITM privileged harness 的共同验收形态：外部世界只负责产生输入，断言必须回到 agent durable output。
-
-当前已手工验证的特权 fallback 路径：在 WSL2 root 环境下，`sudo target/debug/agent capabilities` 显示 `libpcap` available；使用本机 `127.0.0.1:18080` HTTP server、`capture.selection = "libpcap"`、`capture.libpcap.interface = "any"`、`bpf_filter = "tcp port 18080"` 和 `run --max-events 1`，agent 成功读取 1 个 libpcap capture event、写入 1 条 ingress record 和 1 条 export event。普通用户下 `libpcap` 因缺少 raw socket 权限 unavailable，这是预期权限差异。
+- `cargo run -p e2e-fixture --locked -- http1-loopback --requests 1 --request-body-bytes 64 --response-body-bytes 32 --write-chunks 2` 会在同一进程内启动 loopback TCP server/client，发送 deterministic HTTP/1 POST request 和 response，并输出 key=value 报告。请求端按 chunk 通过 `rustix::io::write` 强制执行一次 Linux `write(2)` syscall，partial chunk write 会失败，便于后续验证 syscall argument sample 边界，不再依赖 `TcpStream::write` 在标准库内部选择 `send` 还是 `write`。`--listen-port` 可指定监听端口；`--ready-file`/`--start-file` 必须成对出现并启用两阶段 E2E：fixture 先持有 listener，原子发布真实 `listen_addr` 和一次性 `start_nonce`，xtask 启动 agent 并确认 provider ready 后把同一 nonce 写回 start file，再触发 client 发流量；同路径或预置 stale start file 都会 fail-fast。默认请求总字节小于当前 eBPF write sample 上限；真实 eBPF 验收还必须配置 `capture.deep_observe_selector` 命中该 fixture flow，才能验证 selector-authorized outbound `write(2)` sample 的授权、裁剪、degraded 标记和 gap 语义。调大 request body 可制造截断路径。该 fixture 只生成流量和报告，不替代 agent 侧断言 harness。
+- `cargo run -p xtask --locked -- e2e-plaintext-feed` 会创建临时 feed/policy/config，执行真实 `agent run --config ... --max-events 3`，并从 Fjall spool 读回断言 3 条 ingress record、`source = external_plaintext_feed` 的 `/e2e` HTTP request headers、`e2e-policy@e2e` policy alert 以及 connection opened/closed export event。该入口不需要特权，作为后续 libpcap/eBPF/TLS/MITM privileged harness 的共同验收形态：外部世界只负责产生输入，断言必须回到 agent durable output。
+- `e2e-libpcap-loopback` 必须先用普通用户运行 `cargo build -p agent -p e2e-fixture -p xtask --locked`，再以 root/CAP_NET_RAW 运行 `sudo target/debug/xtask e2e-libpcap-loopback`。该入口创建临时 policy/config/admin socket、让 fixture 先绑定 loopback listener 并报告真实端口与 `start_nonce`、选择 `capture.selection = "libpcap"`、使用 Linux `any` 伪设备与该端口 BPF filter、启动已构建且不旧于 Cargo dep-info 所列输入和相关 crate manifest 的 agent 二进制，并通过 xtask 私有 Unix readiness socket 等待 provider open 后的 `ready` 信号，随后以 temp+rename 原子写回 `start_nonce` 触发 fixture 产生本机 HTTP/1 traffic；fixture 完成后，xtask 通过 agent admin metrics 等待 policy alert 计数达到预期下界并短暂稳定，这只是停机前的运行中进度门，最终语义仍由 graceful stop 后的 Fjall spool 断言负责：必须存在 `source = libpcap` 的 degraded ingress bytes、fixture request targets、`libpcap-e2e-policy@e2e` policy alerts，并且没有 policy runtime error。该入口不在特权路径执行 Cargo 或 build script；supervised fixture/agent 子进程都在独立 process group 中运行，正常 cleanup 可以回收并必要时 kill 自己拥有的 group，signal cleanup 只向这些 group 发送 SIGTERM，不做 PID-only 延迟 SIGKILL；该入口不进入默认 `check-host`，它证明 libpcap fallback 真实流量可进入统一 pipeline，但不声称具备完整 TCP 栈恢复或强进程归因。
 
 当前已验证的 non-privileged plaintext feed 路径：`PlaintextEvent` 单元测试覆盖 event kind、source provenance、confidence/degraded metadata 保真，并证明 `libssl_uprobe` provenance 可转换为对应 `CaptureSource`；`PlaintextEventProvider` 单元测试覆盖单一 source 对 event/capability 的保真和 mismatched source fail-fast；agent JSON-lines provider 测试覆盖硬编码外部 feed schema、streaming provider、unknown field fail-closed、超长行 fail-closed、缺失 process 强制 0 confidence，以及 confidence 超过 100 的拒绝；pipeline 测试覆盖 external plaintext feed chunk 写入 ingress journal，并由 HTTP/1 parser 产出 `HttpRequestHeaders` export event，`source = external_plaintext_feed`；`xtask e2e-plaintext-feed` 通过真实 agent config、configured policy bundle、agent run 和 Fjall spool readback 覆盖非特权端到端闭环。这只验证“已解密明文进入统一 pipeline”，不等同于 TLS uprobe 或 keylog 解密已完成。
+
+当前 libpcap fallback 验证边界：`xtask e2e-libpcap-loopback` 已成为 agent 侧特权验收入口，覆盖真实 libpcap provider、nonce 两阶段 loopback HTTP/1 fixture、agent provider readiness socket、Fjall ingress/export readback、degraded bytes 语义、HTTP request parser output 和 configured policy alert。`agent run` 的同步 capture provider/pipeline 主循环运行在 dedicated blocking task 中，admin server、signal task、export worker 等 async 任务不会因为 provider poll 阻塞而被饿死。普通用户下 libpcap 可能因缺少 raw socket 权限失败，这是 host capability 事实，不应被隐藏；root/CAP_NET_RAW 环境下该入口才是 fallback demo 的通过标准。它仍不证明完整 TCP window/SACK 恢复、内核 lost-event 反馈、IPv6 extension/fragment 解析或强进程归因。
 
 当前已验证的 libssl plaintext ABI/adapter/loader/runtime 路径按层拆分：
 
@@ -1369,17 +1370,11 @@ Runtime/config/status 验证覆盖：
 
 当前端到端验收：
 
-1. 运行 `cargo run -p xtask -- e2e-plaintext-feed`，验证非特权 plaintext feed 到 agent durable output 的闭环。
-2. 启动 `e2e-fixture` 或本机 HTTP/SSE 测试服务。
-3. 配置 selector 命中该进程。
-4. agent 捕获 HTTP/1.x request/response。
-5. agent 识别 SSE streaming response。
-6. Lua 策略产出 alert。
-7. 事件写入 Fjall spool。
-8. HTTP webhook batch exporter 发送 protobuf batch。
-9. 测试 receiver 返回 JSON structured ack。
-10. exporter cursor 前进。
-11. metrics 中无静默 gap；如人为制造过载，则出现明确 degraded/gap。
+1. 运行 `cargo run -p xtask --locked -- e2e-plaintext-feed`，验证非特权 plaintext feed 到 agent durable output 的闭环。
+2. 普通用户先运行 `cargo build -p agent -p e2e-fixture -p xtask --locked`，再以 root/CAP_NET_RAW 运行 `sudo target/debug/xtask e2e-libpcap-loopback`，验证真实 libpcap fallback 捕获 loopback HTTP/1 traffic 后进入 agent durable output。
+3. 后续 privileged eBPF E2E 复用 `e2e-fixture`，配置 selector 命中该进程，并验证 connect lifecycle、selector-authorized outbound `write(2)` sample、degraded/gap 和 allow-map 语义。
+4. 后续 exporter E2E 覆盖 HTTP webhook batch exporter 发送 protobuf batch、测试 receiver 返回 JSON structured ack、exporter cursor 前进。
+5. 后续 SSE/overload E2E 覆盖 streaming response、metrics 中无静默 gap；如人为制造过载，则出现明确 degraded/gap。
 
 当前 TLS 已验证边界：
 

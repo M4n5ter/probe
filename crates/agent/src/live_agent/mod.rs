@@ -1,3 +1,3 @@
 mod run;
 
-pub(crate) use run::run_live_agent;
+pub(crate) use run::{ReadinessSignal, RunOptions, run_live_agent};

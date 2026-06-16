@@ -10,7 +10,9 @@ capture = { version = "0.1.0", path = "../capture" }
 ebpf-object = { version = "0.1.0", path = "../ebpf-object" }
 probe-config = { version = "0.1.0", path = "../config" }
 probe-core = { version = "0.1.0", path = "../core" }
+rustix = { version = "1.1.4", features = ["process"] }
 serde_json = "1.0.150"
+signal-hook = "0.4.4"
 storage = { version = "0.1.0", path = "../storage" }
 toml = "1.1"
 

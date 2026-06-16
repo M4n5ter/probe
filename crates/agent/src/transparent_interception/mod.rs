@@ -6,7 +6,7 @@ use probe_config::{EnforcementInterceptionConfig, TransparentInterceptionStrateg
 use probe_core::Selector;
 
 pub(crate) use error::TransparentInterceptionError;
-pub(crate) use runtime::TransparentInterceptionRuntime;
+pub(crate) use runtime::{TransparentInterceptionGuard, TransparentInterceptionRuntime};
 
 pub(crate) fn resolve(
     config: &EnforcementInterceptionConfig,

@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -21,12 +22,13 @@ use crate::{
     check::build_check_report,
     error::AgentError,
     export::drain_replay_webhook,
-    live_agent::run_live_agent,
+    live_agent::{ReadinessSignal, RunOptions, run_live_agent},
     runtime_composition::{build_runtime_composition, capability_matrix_for_config},
     status::{build_status_snapshot, collect_spool_status},
 };
 
 const REPLAY_POLICY_SOURCE_BYTES: u64 = 1024 * 1024;
+const READY_SOCKET_ENV: &str = "SSSA_PROBE_READY_SOCKET";
 
 #[derive(Debug, Parser)]
 #[command(name = "sssa-probe")]
@@ -146,7 +148,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
     match cli.command {
         Command::Run { config, max_events } => {
             let agent_config = read_config_or_default(config.as_ref())?;
-            run_live_agent(agent_config, max_events).await?;
+            run_live_agent(agent_config, run_options_from_env(max_events)?).await?;
         }
         Command::Check { config } => {
             let runtime = read_runtime_composition(&config)?;
@@ -192,6 +194,31 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
         }
     }
     Ok(())
+}
+
+fn run_options_from_env(max_events: Option<u64>) -> Result<RunOptions, AgentError> {
+    Ok(RunOptions {
+        max_events,
+        readiness: readiness_from_env()?,
+    })
+}
+
+fn readiness_from_env() -> Result<ReadinessSignal, AgentError> {
+    let Some(value) = std::env::var_os(READY_SOCKET_ENV) else {
+        return Ok(ReadinessSignal::None);
+    };
+    parse_ready_socket(value).map(ReadinessSignal::UnixSocket)
+}
+
+fn parse_ready_socket(value: OsString) -> Result<PathBuf, AgentError> {
+    let path = PathBuf::from(value);
+    if path.as_os_str().is_empty() {
+        return Err(AgentError::InvalidReadinessSocket {
+            name: READY_SOCKET_ENV,
+            value: path.display().to_string(),
+        });
+    }
+    Ok(path)
 }
 
 fn read_runtime_composition(
@@ -349,6 +376,23 @@ mod tests {
 
     use super::*;
 
+    fn run_cli(config: PathBuf, max_events: Option<u64>) -> Cli {
+        Cli {
+            command: Command::Run {
+                config: Some(config),
+                max_events,
+            },
+        }
+    }
+
+    #[test]
+    fn ready_socket_env_rejects_empty_value() {
+        assert!(matches!(
+            parse_ready_socket(OsString::from("")),
+            Err(AgentError::InvalidReadinessSocket { .. })
+        ));
+    }
+
     #[test]
     fn replay_flow_uses_synthetic_process_identity() {
         let flow = replay_flow();
@@ -385,14 +429,9 @@ protective_actions = ["alert"]
         };
         fs::write(&config_path, toml::to_string(&config)?)?;
 
-        let error = run(Cli {
-            command: Command::Run {
-                config: Some(config_path),
-                max_events: Some(0),
-            },
-        })
-        .await
-        .expect_err("invalid enforcement manifest should fail before capture provider probe");
+        let error = run(run_cli(config_path, Some(0)))
+            .await
+            .expect_err("invalid enforcement manifest should fail before capture provider probe");
 
         assert!(
             matches!(&error, AgentError::ConfiguredEnforcement(_)),
@@ -433,14 +472,9 @@ protective_actions = ["alert"]
         });
         fs::write(&config_path, toml::to_string(&config)?)?;
 
-        let error = run(Cli {
-            command: Command::Run {
-                config: Some(config_path),
-                max_events: Some(0),
-            },
-        })
-        .await
-        .expect_err("invalid policy source should fail before capture provider probe");
+        let error = run(run_cli(config_path, Some(0)))
+            .await
+            .expect_err("invalid policy source should fail before capture provider probe");
 
         assert!(
             matches!(&error, AgentError::ConfiguredPolicy(_)),
@@ -513,13 +547,7 @@ end
         ];
         fs::write(&config_path, toml::to_string(&config)?)?;
 
-        run(Cli {
-            command: Command::Run {
-                config: Some(config_path),
-                max_events: Some(1),
-            },
-        })
-        .await?;
+        run(run_cli(config_path, Some(1))).await?;
 
         let spool = FjallSpool::open(&spool_path)?;
         let exported = spool.read_export_batch("sink", 16)?;
@@ -559,14 +587,9 @@ end
         });
         fs::write(&config_path, toml::to_string(&config)?)?;
 
-        let error = run(Cli {
-            command: Command::Run {
-                config: Some(config_path),
-                max_events: Some(0),
-            },
-        })
-        .await
-        .expect_err("unsupported enforce should fail before Lua policy load");
+        let error = run(run_cli(config_path, Some(0)))
+            .await
+            .expect_err("unsupported enforce should fail before Lua policy load");
 
         assert!(
             matches!(&error, AgentError::Runtime(_)),
@@ -611,14 +634,9 @@ protective_actions = ["alert"]
         };
         fs::write(&config_path, toml::to_string(&config)?)?;
 
-        let error = run(Cli {
-            command: Command::Run {
-                config: Some(config_path),
-                max_events: Some(0),
-            },
-        })
-        .await
-        .expect_err("unsupported enforce should fail before local manifest metadata read");
+        let error = run(run_cli(config_path, Some(0)))
+            .await
+            .expect_err("unsupported enforce should fail before local manifest metadata read");
 
         assert!(
             matches!(&error, AgentError::Runtime(_)),
@@ -657,14 +675,9 @@ protective_actions = ["alert"]
         };
         fs::write(&config_path, toml::to_string(&config)?)?;
 
-        let error = run(Cli {
-            command: Command::Run {
-                config: Some(config_path),
-                max_events: Some(0),
-            },
-        })
-        .await
-        .expect_err("runtime validation must fail before remote enforcement fetch");
+        let error = run(run_cli(config_path, Some(0)))
+            .await
+            .expect_err("runtime validation must fail before remote enforcement fetch");
 
         assert!(
             matches!(&error, AgentError::Runtime(_)),
@@ -741,14 +754,9 @@ end
         });
         fs::write(&config_path, toml::to_string(&config)?)?;
 
-        let error = run(Cli {
-            command: Command::Run {
-                config: Some(config_path),
-                max_events: Some(0),
-            },
-        })
-        .await
-        .expect_err("missing feed should fail after ingress recovery");
+        let error = run(run_cli(config_path, Some(0)))
+            .await
+            .expect_err("missing feed should fail after ingress recovery");
 
         assert!(
             matches!(error, AgentError::PlaintextFeed(_)),
