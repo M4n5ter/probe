@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum EbpfProcessObservation {
     Connect(EbpfConnectTracepointObservation),
     Close(EbpfCloseTracepointObservation),
+    Write(EbpfSocketWriteObservation),
 }
 
 impl EbpfProcessObservation {
@@ -17,6 +18,7 @@ impl EbpfProcessObservation {
         match self {
             Self::Connect(observation) => &observation.process,
             Self::Close(observation) => &observation.process,
+            Self::Write(observation) => &observation.process,
         }
     }
 }
@@ -46,6 +48,7 @@ pub struct EbpfConnectTracepointObservation {
     pub process: EbpfObservedProcess,
     pub fd: i32,
     pub addrlen: u32,
+    pub fd_table_epoch: u64,
     pub endpoint: EbpfConnectEndpoint,
 }
 
@@ -53,6 +56,16 @@ pub struct EbpfConnectTracepointObservation {
 pub struct EbpfCloseTracepointObservation {
     pub process: EbpfObservedProcess,
     pub fd: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EbpfSocketWriteObservation {
+    pub process: EbpfObservedProcess,
+    pub fd: i32,
+    pub original_len: u32,
+    pub buffer: Vec<u8>,
+    pub truncated: bool,
+    pub read_failed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,8 +1,7 @@
 use ebpf_abi::{
-    EBPF_CLOSE_PROGRAM_NAME, EBPF_CLOSE_TRACEPOINT_CATEGORY, EBPF_CLOSE_TRACEPOINT_NAME,
-    EBPF_CONNECT_PROGRAM_NAME, EBPF_CONNECT_TRACEPOINT_CATEGORY, EBPF_CONNECT_TRACEPOINT_NAME,
-    EBPF_EVENTS_MAP_NAME, EBPF_RING_BUFFER_BYTES, EBPF_TLS_LIBSSL_UPROBE_SPECS, EBPF_TLS_MAP_SPECS,
-    EBPF_UPROBE_SECTION_NAME, EBPF_URETPROBE_SECTION_NAME,
+    EBPF_PROCESS_MAP_SPECS, EBPF_PROCESS_TRACEPOINT_SPECS, EBPF_TLS_LIBSSL_UPROBE_SPECS,
+    EBPF_TLS_MAP_SPECS, EBPF_UPROBE_SECTION_NAME, EBPF_URETPROBE_SECTION_NAME,
+    EbpfProcessTracepointSpec,
 };
 
 use super::model::{
@@ -88,22 +87,14 @@ impl EbpfObjectContract {
 
     pub fn process_probe_scaffold() -> Self {
         Self {
-            maps: vec![EbpfExpectedMap::ringbuf(
-                EBPF_EVENTS_MAP_NAME,
-                EBPF_RING_BUFFER_BYTES,
-            )],
-            programs: vec![
-                EbpfExpectedProgram {
-                    name: EBPF_CONNECT_PROGRAM_NAME.to_string(),
-                    kind: EbpfObjectProgramKind::Tracepoint,
-                    section: Some(expected_connect_tracepoint_section()),
-                },
-                EbpfExpectedProgram {
-                    name: EBPF_CLOSE_PROGRAM_NAME.to_string(),
-                    kind: EbpfObjectProgramKind::Tracepoint,
-                    section: Some(expected_close_tracepoint_section()),
-                },
-            ],
+            maps: EBPF_PROCESS_MAP_SPECS
+                .iter()
+                .map(EbpfExpectedMap::from_abi_spec)
+                .collect(),
+            programs: EBPF_PROCESS_TRACEPOINT_SPECS
+                .iter()
+                .map(expected_process_tracepoint_program)
+                .collect(),
             inventory_policy: EbpfObjectContractInventoryPolicy::RequiredOnly,
         }
     }
@@ -325,17 +316,25 @@ fn contract_check_summary(
     format!("{label}={}", unavailable.join(","))
 }
 
+#[cfg(test)]
 pub(super) fn expected_connect_tracepoint_section() -> String {
-    format!("tracepoint/{EBPF_CONNECT_TRACEPOINT_CATEGORY}/{EBPF_CONNECT_TRACEPOINT_NAME}")
+    ebpf_abi::EbpfProcessTracepointRole::ConnectEnter
+        .spec()
+        .section_name()
+        .to_string()
 }
 
-pub(super) fn expected_close_tracepoint_section() -> String {
-    format!("tracepoint/{EBPF_CLOSE_TRACEPOINT_CATEGORY}/{EBPF_CLOSE_TRACEPOINT_NAME}")
+fn expected_process_tracepoint_program(spec: &EbpfProcessTracepointSpec) -> EbpfExpectedProgram {
+    EbpfExpectedProgram {
+        name: spec.program_name.to_string(),
+        kind: EbpfObjectProgramKind::Tracepoint,
+        section: Some(spec.section_name().to_string()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use ebpf_abi::EBPF_TLS_CALLS_MAP_NAME;
+    use ebpf_abi::{EBPF_EVENTS_MAP_NAME, EBPF_RING_BUFFER_BYTES, EBPF_TLS_CALLS_MAP_NAME};
 
     use super::super::object_fixture::{
         contract_reason, contract_ringbuf_map, contract_tracepoint_program,
@@ -343,10 +342,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn object_contract_requires_ringbuf_map_and_lifecycle_tracepoint_programs() {
+    fn object_contract_requires_process_probe_maps_and_tracepoint_programs() {
         let report = process_probe_contract_report(
             &required_process_probe_programs(),
-            &[contract_ringbuf_map(EBPF_EVENTS_MAP_NAME)],
+            &required_process_probe_maps(),
         );
 
         assert!(report.is_available());
@@ -364,16 +363,31 @@ mod tests {
         );
 
         assert!(!report.is_available());
-        assert!(report.summary().contains(EBPF_EVENTS_MAP_NAME));
-        assert!(report.summary().contains(EBPF_CONNECT_PROGRAM_NAME));
-        assert!(report.summary().contains(EBPF_CLOSE_PROGRAM_NAME));
+        let summary = report.summary();
+        let contract = EbpfObjectContract::process_probe_scaffold();
+        for expected in &contract.maps {
+            assert!(
+                summary.contains(&expected.name),
+                "summary {summary} should mention missing map {}",
+                expected.name
+            );
+        }
+        for expected in &contract.programs {
+            assert!(
+                summary.contains(&expected.name),
+                "summary {summary} should mention missing program {}",
+                expected.name
+            );
+        }
     }
 
     #[test]
     fn object_contract_rejects_wrong_map_kind() {
         let mut map = contract_ringbuf_map(EBPF_EVENTS_MAP_NAME);
         map.kind = EbpfObjectMapKind::Other { value: 1 };
-        let report = process_probe_contract_report(&required_process_probe_programs(), &[map]);
+        let mut maps = required_process_probe_maps();
+        replace_required_map(&mut maps, map);
+        let report = process_probe_contract_report(&required_process_probe_programs(), &maps);
 
         assert!(!report.is_available());
         assert!(contract_reason(&report.maps, EBPF_EVENTS_MAP_NAME).contains("expected Ringbuf"));
@@ -384,7 +398,9 @@ mod tests {
         let mut map = contract_ringbuf_map(EBPF_EVENTS_MAP_NAME);
         map.max_entries = EBPF_RING_BUFFER_BYTES / 2;
         map.pinning = EbpfObjectMapPinning::ByName;
-        let report = process_probe_contract_report(&required_process_probe_programs(), &[map]);
+        let mut maps = required_process_probe_maps();
+        replace_required_map(&mut maps, map);
+        let report = process_probe_contract_report(&required_process_probe_programs(), &maps);
 
         let reason = contract_reason(&report.maps, EBPF_EVENTS_MAP_NAME);
         assert!(!report.is_available());
@@ -399,13 +415,9 @@ mod tests {
             "unexpected_tracepoint",
             "tracepoint/syscalls/sys_exit",
         ));
-        let report = process_probe_contract_report(
-            &programs,
-            &[
-                contract_ringbuf_map(EBPF_EVENTS_MAP_NAME),
-                contract_ringbuf_map("EXTRA_EVENTS"),
-            ],
-        );
+        let mut maps = required_process_probe_maps();
+        maps.push(contract_ringbuf_map("EXTRA_EVENTS"));
+        let report = process_probe_contract_report(&programs, &maps);
 
         assert!(report.is_available());
     }
@@ -445,14 +457,9 @@ mod tests {
             "unexpected_tracepoint",
             "tracepoint/syscalls/sys_exit",
         ));
-        let report = EbpfObjectContractReport::from_inventory(
-            &contract,
-            &programs,
-            &[
-                contract_ringbuf_map(EBPF_EVENTS_MAP_NAME),
-                contract_ringbuf_map("EXTRA_EVENTS"),
-            ],
-        );
+        let mut maps = required_process_probe_maps();
+        maps.push(contract_ringbuf_map("EXTRA_EVENTS"));
+        let report = EbpfObjectContractReport::from_inventory(&contract, &programs, &maps);
 
         assert!(!report.is_available());
         assert!(
@@ -469,57 +476,40 @@ mod tests {
 
     #[test]
     fn object_contract_rejects_wrong_program_kind() {
-        for (program_name, section) in [
-            (EBPF_CONNECT_PROGRAM_NAME, "kprobe/sssa_sys_enter_connect"),
-            (EBPF_CLOSE_PROGRAM_NAME, "kprobe/sssa_sys_enter_close"),
-        ] {
+        for expected in EbpfObjectContract::process_probe_scaffold().programs {
             let mut programs = required_process_probe_programs();
             replace_required_program(
                 &mut programs,
                 EbpfObjectProgram {
-                    name: program_name.to_string(),
+                    name: expected.name.clone(),
                     kind: EbpfObjectProgramKind::Unsupported,
-                    section: Some(section.to_string()),
+                    section: expected.section.clone(),
                 },
             );
-            let report = process_probe_contract_report(
-                &programs,
-                &[contract_ringbuf_map(EBPF_EVENTS_MAP_NAME)],
-            );
+            let report = process_probe_contract_report(&programs, &required_process_probe_maps());
 
             assert!(!report.is_available());
             assert!(
-                contract_reason(&report.programs, program_name).contains("expected Tracepoint")
+                contract_reason(&report.programs, &expected.name).contains("expected Tracepoint")
             );
         }
     }
 
     #[test]
     fn object_contract_rejects_wrong_tracepoint_section() {
-        for (program_name, wrong_section, expected_section) in [
-            (
-                EBPF_CONNECT_PROGRAM_NAME,
-                "tracepoint/syscalls/sys_exit_connect",
-                "tracepoint/syscalls/sys_enter_connect",
-            ),
-            (
-                EBPF_CLOSE_PROGRAM_NAME,
-                "tracepoint/syscalls/sys_exit_close",
-                "tracepoint/syscalls/sys_enter_close",
-            ),
-        ] {
+        for expected in EbpfObjectContract::process_probe_scaffold().programs {
             let mut programs = required_process_probe_programs();
             replace_required_program(
                 &mut programs,
-                contract_tracepoint_program(program_name, wrong_section),
+                contract_tracepoint_program(&expected.name, "tracepoint/wrong/event"),
             );
-            let report = process_probe_contract_report(
-                &programs,
-                &[contract_ringbuf_map(EBPF_EVENTS_MAP_NAME)],
-            );
+            let report = process_probe_contract_report(&programs, &required_process_probe_maps());
 
             assert!(!report.is_available());
-            assert!(contract_reason(&report.programs, program_name).contains(expected_section));
+            assert!(
+                contract_reason(&report.programs, &expected.name)
+                    .contains(expected.section.as_deref().expect("tracepoint section"))
+            );
         }
     }
 
@@ -560,16 +550,19 @@ mod tests {
     }
 
     fn required_process_probe_programs() -> Vec<EbpfObjectProgram> {
-        vec![
-            contract_tracepoint_program(
-                EBPF_CONNECT_PROGRAM_NAME,
-                &expected_connect_tracepoint_section(),
-            ),
-            contract_tracepoint_program(
-                EBPF_CLOSE_PROGRAM_NAME,
-                &expected_close_tracepoint_section(),
-            ),
-        ]
+        EbpfObjectContract::process_probe_scaffold()
+            .programs
+            .iter()
+            .map(contract_program_from_expected)
+            .collect()
+    }
+
+    fn required_process_probe_maps() -> Vec<EbpfObjectMap> {
+        EbpfObjectContract::process_probe_scaffold()
+            .maps
+            .iter()
+            .map(contract_map_from_expected)
+            .collect()
     }
 
     fn required_tls_plaintext_programs() -> Vec<EbpfObjectProgram> {
@@ -617,5 +610,13 @@ mod tests {
             .find(|program| program.name == replacement.name)
             .expect("required program should exist in test fixture");
         *program = replacement;
+    }
+
+    fn replace_required_map(maps: &mut [EbpfObjectMap], replacement: EbpfObjectMap) {
+        let map = maps
+            .iter_mut()
+            .find(|map| map.name == replacement.name)
+            .expect("required map should exist in test fixture");
+        *map = replacement;
     }
 }

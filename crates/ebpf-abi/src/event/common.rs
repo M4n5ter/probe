@@ -1,5 +1,5 @@
 pub const EBPF_MAGIC: u32 = 0x4153_5353;
-pub const EBPF_ABI_REVISION: u16 = 4;
+pub const EBPF_ABI_REVISION: u16 = 6;
 pub const EBPF_RING_BUFFER_BYTES: u32 = 256 * 1024;
 pub const EBPF_EVENT_HEADER_BYTES: usize = core::mem::size_of::<EbpfEventHeader>();
 
@@ -9,6 +9,7 @@ pub enum EbpfEventKind {
     ConnectTracepointObserved = 1,
     CloseTracepointObserved = 2,
     LibsslPlaintextSampled = 3,
+    SocketWriteSampled = 4,
 }
 
 impl EbpfEventKind {
@@ -17,6 +18,7 @@ impl EbpfEventKind {
             1 => Some(Self::ConnectTracepointObserved),
             2 => Some(Self::CloseTracepointObserved),
             3 => Some(Self::LibsslPlaintextSampled),
+            4 => Some(Self::SocketWriteSampled),
             _ => None,
         }
     }
@@ -93,6 +95,10 @@ pub enum EbpfEventDecodeError {
     InvalidTlsPlaintextCapturedLength { captured: u16, capacity: usize },
     InvalidTlsPlaintextOriginalLength { captured: u16, original: u32 },
     InvalidTlsPlaintextReadFailure { captured: u16 },
+    InvalidSocketWriteCapturedLength { captured: u16, capacity: usize },
+    InvalidSocketWriteOriginalLength { captured: u16, original: u32 },
+    InvalidSocketWriteIncompleteSample { captured: u16, original: u32 },
+    InvalidSocketWriteReadFailure { captured: u16 },
 }
 
 pub fn decode_event_header(bytes: &[u8]) -> Result<EbpfEventHeader, EbpfEventDecodeError> {
@@ -270,7 +276,11 @@ mod tests {
             EbpfEventKind::from_wire(3),
             Some(EbpfEventKind::LibsslPlaintextSampled)
         );
-        assert_eq!(EbpfEventKind::from_wire(4), None);
+        assert_eq!(
+            EbpfEventKind::from_wire(4),
+            Some(EbpfEventKind::SocketWriteSampled)
+        );
+        assert_eq!(EbpfEventKind::from_wire(5), None);
     }
 
     #[test]

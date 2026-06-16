@@ -99,9 +99,23 @@ fn build_ebpf_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProv
                 "ebpf capture requires capture.ebpf.object_path".to_string(),
             )
         })?;
+    let deep_observe_selector = plan
+        .config
+        .capture
+        .deep_observe_selector
+        .as_ref()
+        .map(|selector| {
+            selector.compile().map_err(|source| {
+                AgentError::UnsupportedRunConfig(format!(
+                    "invalid capture.deep_observe_selector: {source}"
+                ))
+            })
+        })
+        .transpose()?;
     Ok(Box::new(EbpfProcessObservationProvider::open(
         EbpfProcessObservationProbeConfig::new(object_path),
         Box::<ProcfsTcpProcessResolver>::default(),
+        deep_observe_selector,
     )?))
 }
 

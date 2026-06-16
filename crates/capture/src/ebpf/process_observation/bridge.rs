@@ -193,6 +193,7 @@ mod tests {
             },
             fd: 7,
             addrlen: 16,
+            fd_table_epoch: 0,
             endpoint: EbpfConnectEndpoint::Remote(expected_remote),
         };
         let mut resolver = ExpectedConnectResolver {
@@ -257,6 +258,7 @@ mod tests {
             },
             fd: 7,
             addrlen: 0,
+            fd_table_epoch: 0,
             endpoint: EbpfConnectEndpoint::SockaddrReadFailed,
         };
         let mut resolver = ExpectedConnectResolver {

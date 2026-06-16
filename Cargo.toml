@@ -7,6 +7,7 @@ members = [
     "crates/core",
     "crates/ebpf-abi",
     "crates/ebpf-object",
+    "crates/e2e-fixture",
     "crates/enforcement",
     "crates/exporter",
     "crates/parsers",

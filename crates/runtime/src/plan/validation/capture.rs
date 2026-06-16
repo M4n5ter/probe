@@ -7,6 +7,14 @@ pub(super) fn validate_config(
     registry: &ProviderRegistry,
     violations: &mut Vec<ConfigViolation>,
 ) {
+    if let Some(selector) = &config.capture.deep_observe_selector
+        && let Err(error) = selector.compile()
+    {
+        violations.push(ConfigViolation {
+            field: "capture.deep_observe_selector".to_string(),
+            reason: error.to_string(),
+        });
+    }
     let Some(backend) = config.capture.selection.explicit_backend() else {
         return;
     };
@@ -93,6 +101,31 @@ mod tests {
             &error,
             "capture.selection",
             "capture backend is not registered",
+        );
+    }
+
+    #[test]
+    fn capture_deep_observe_selector_is_validated() {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+        config.capture.deep_observe_selector = Some(probe_core::Selector::All {
+            selectors: Vec::new(),
+        });
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(
+            &error,
+            "capture.deep_observe_selector",
+            "at least one child",
         );
     }
 

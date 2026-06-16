@@ -8,9 +8,9 @@ use aya_obj::generated::bpf_map_type::{
     BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_LRU_HASH, BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_RINGBUF,
 };
 use ebpf_abi::{
-    EBPF_CLOSE_PROGRAM_NAME, EBPF_CONNECT_PROGRAM_NAME, EBPF_EVENTS_MAP_NAME,
+    EBPF_EVENTS_MAP_NAME, EBPF_PROCESS_MAP_SPECS, EBPF_PROCESS_TRACEPOINT_SPECS,
     EBPF_RING_BUFFER_BYTES, EBPF_TLS_LIBSSL_UPROBE_SPECS, EBPF_TLS_MAP_SPECS,
-    EBPF_UPROBE_SECTION_NAME, EBPF_URETPROBE_SECTION_NAME, EbpfMapSpec,
+    EBPF_UPROBE_SECTION_NAME, EBPF_URETPROBE_SECTION_NAME, EbpfMapSpec, EbpfProcessTracepointRole,
 };
 
 use super::model::{
@@ -47,17 +47,12 @@ pub(super) fn contract_reason<'a>(checks: &'a [EbpfObjectContractCheck], name: &
 
 pub(super) fn write_process_probe_ebpf_object(
     path: &Path,
-    connect_program_section_name: &str,
-    close_program_section_name: &str,
+    program_section_override: Option<(EbpfProcessTracepointRole, &str)>,
     map_kind: EbpfObjectMapKind,
 ) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,
-        process_probe_ebpf_object_bytes(
-            connect_program_section_name,
-            close_program_section_name,
-            map_kind,
-        )?,
+        process_probe_ebpf_object_bytes(program_section_override, map_kind)?,
     )?;
     Ok(())
 }
@@ -70,35 +65,30 @@ pub(super) fn write_tls_plaintext_probe_ebpf_object(
 }
 
 fn process_probe_ebpf_object_bytes(
-    connect_program_section_name: &str,
-    close_program_section_name: &str,
+    program_section_override: Option<(EbpfProcessTracepointRole, &str)>,
     map_kind: EbpfObjectMapKind,
 ) -> Result<Vec<u8>, ::object::write::Error> {
     let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
     let maps_section = object.add_section(Vec::new(), b"maps".to_vec(), SectionKind::Data);
-    add_map_symbols(
-        &mut object,
-        maps_section,
-        &[FixtureMap {
-            name: EBPF_EVENTS_MAP_NAME.to_string(),
-            kind: map_kind,
-            key_size: 0,
-            value_size: 0,
-            max_entries: EBPF_RING_BUFFER_BYTES,
-            map_flags: 0,
-        }],
-    );
+    let maps = EBPF_PROCESS_MAP_SPECS
+        .iter()
+        .map(|spec| {
+            let mut map = FixtureMap::from_abi_spec(spec);
+            if map.name == EBPF_EVENTS_MAP_NAME {
+                map.kind = map_kind;
+            }
+            map
+        })
+        .collect::<Vec<_>>();
+    add_map_symbols(&mut object, maps_section, &maps);
 
-    add_program_symbol(
-        &mut object,
-        EBPF_CONNECT_PROGRAM_NAME,
-        connect_program_section_name,
-    );
-    add_program_symbol(
-        &mut object,
-        EBPF_CLOSE_PROGRAM_NAME,
-        close_program_section_name,
-    );
+    for spec in EBPF_PROCESS_TRACEPOINT_SPECS {
+        let section = program_section_override
+            .and_then(|(role, section)| (role == spec.role).then_some(section))
+            .map(str::to_string)
+            .unwrap_or_else(|| spec.section_name().to_string());
+        add_program_symbol(&mut object, spec.program_name, &section);
+    }
 
     object.write()
 }

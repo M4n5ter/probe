@@ -1,0 +1,16 @@
+[package]
+name = "e2e-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sssa-e2e-fixture"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+rustix = "1.1"

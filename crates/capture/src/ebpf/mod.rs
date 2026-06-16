@@ -7,4 +7,5 @@ pub use process_observation::{
     EbpfConnectFlowResolver, EbpfConnectTracepointObservation, EbpfObservedProcess,
     EbpfProcessObservation, EbpfProcessObservationProbe, EbpfProcessObservationProbeConfig,
     EbpfProcessObservationProbeError, EbpfProcessObservationProvider, EbpfResolvedConnectFlow,
+    EbpfSocketWriteObservation,
 };

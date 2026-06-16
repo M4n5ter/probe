@@ -126,7 +126,7 @@ fn ebpf_provider_descriptor_from_object_report(
             CaptureBackend::Ebpf,
             CaptureProviderBuilder::Ebpf,
             format!(
-                "eBPF connect/close observation provider requires procfs_socket_attribution, but {}",
+                "eBPF process observation provider requires procfs_socket_attribution, but {}",
                 procfs_socket_attribution
                     .reason
                     .as_deref()
@@ -139,7 +139,7 @@ fn ebpf_provider_descriptor_from_object_report(
         CaptureBackend::Ebpf,
         CaptureProviderBuilder::Ebpf,
         format!(
-            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the connect/close observation provider can emit connect observations and best-effort descriptor-close lifecycle events, but payload/lost-event conversion and complete kernel traffic capture are not implemented",
+            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the process observation provider can emit connect observations, selector-authorized bounded outbound write payload samples, and best-effort descriptor-close lifecycle events, but inbound payload, sendmsg/writev, lost-event conversion, and complete kernel traffic capture are not implemented",
             object.summary(),
         ),
     )
@@ -182,8 +182,8 @@ mod tests {
 
     use capture::UnprivilegedBpfStatus;
     use ebpf_object::{
-        EbpfObjectContractCheck, EbpfObjectContractReport, EbpfObjectMap, EbpfObjectProbeReport,
-        EbpfObjectProgram, EbpfProbeCheck,
+        EbpfObjectContract, EbpfObjectContractCheck, EbpfObjectContractReport, EbpfObjectMap,
+        EbpfObjectProbeReport, EbpfObjectProgram, EbpfProbeCheck,
     };
     use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
 
@@ -305,14 +305,7 @@ mod tests {
             EbpfObjectProbeReport {
                 object_path: PathBuf::from("/tmp/sssa-valid-contract.bpf.o"),
                 object: EbpfProbeCheck::Available,
-                contract: EbpfObjectContractReport {
-                    status: EbpfProbeCheck::Available,
-                    maps: vec![EbpfObjectContractCheck {
-                        name: "SSSA_EVENTS".to_string(),
-                        check: EbpfProbeCheck::Available,
-                    }],
-                    programs: available_ebpf_lifecycle_program_checks(),
-                },
+                contract: available_process_probe_contract_report(),
                 programs: Vec::<EbpfObjectProgram>::new(),
                 maps: Vec::<EbpfObjectMap>::new(),
             },
@@ -326,9 +319,11 @@ mod tests {
             .reason
             .expect("eBPF descriptor should explain why capture provider is degraded");
         assert!(reason.contains("complete kernel traffic capture"));
-        assert!(reason.contains("payload/lost-event conversion"));
+        assert!(reason.contains("selector-authorized"));
+        assert!(reason.contains("bounded outbound write payload samples"));
+        assert!(reason.contains("lost-event conversion"));
         assert!(reason.contains("best-effort descriptor-close lifecycle events"));
-        assert!(reason.contains("connect/close observation provider"));
+        assert!(reason.contains("process observation provider"));
         assert!(reason.contains("procfs socket attribution is usable"));
     }
 
@@ -338,14 +333,7 @@ mod tests {
             EbpfObjectProbeReport {
                 object_path: PathBuf::from("/tmp/sssa-valid-contract.bpf.o"),
                 object: EbpfProbeCheck::Available,
-                contract: EbpfObjectContractReport {
-                    status: EbpfProbeCheck::Available,
-                    maps: vec![EbpfObjectContractCheck {
-                        name: "SSSA_EVENTS".to_string(),
-                        check: EbpfProbeCheck::Available,
-                    }],
-                    programs: available_ebpf_lifecycle_program_checks(),
-                },
+                contract: available_process_probe_contract_report(),
                 programs: Vec::<EbpfObjectProgram>::new(),
                 maps: Vec::<EbpfObjectMap>::new(),
             },
@@ -420,17 +408,44 @@ mod tests {
         }
     }
 
-    fn available_ebpf_lifecycle_program_checks() -> Vec<EbpfObjectContractCheck> {
-        vec![
-            EbpfObjectContractCheck {
-                name: "sssa_sys_enter_connect".to_string(),
-                check: EbpfProbeCheck::Available,
-            },
-            EbpfObjectContractCheck {
-                name: "sssa_sys_enter_close".to_string(),
-                check: EbpfProbeCheck::Available,
-            },
-        ]
+    fn available_process_probe_contract_report() -> EbpfObjectContractReport {
+        let contract = EbpfObjectContract::process_probe_scaffold();
+        EbpfObjectContractReport {
+            status: EbpfProbeCheck::Available,
+            maps: contract
+                .maps
+                .into_iter()
+                .map(available_contract_check)
+                .collect(),
+            programs: contract
+                .programs
+                .into_iter()
+                .map(available_contract_check)
+                .collect(),
+        }
+    }
+
+    fn available_contract_check(named: impl ContractName) -> EbpfObjectContractCheck {
+        EbpfObjectContractCheck {
+            name: named.contract_name(),
+            check: EbpfProbeCheck::Available,
+        }
+    }
+
+    trait ContractName {
+        fn contract_name(self) -> String;
+    }
+
+    impl ContractName for ebpf_object::EbpfExpectedMap {
+        fn contract_name(self) -> String {
+            self.name
+        }
+    }
+
+    impl ContractName for ebpf_object::EbpfExpectedProgram {
+        fn contract_name(self) -> String {
+            self.name
+        }
     }
 
     fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {
