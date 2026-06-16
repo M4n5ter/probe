@@ -10,7 +10,8 @@ use pipeline::{
 };
 use policy::{PolicyHook, PolicyManifest, PolicyRuntime};
 use probe_core::{
-    Action, Direction, EnforcementOutcome, EventEnvelope, EventKind, ProtectiveActionProfile,
+    Action, Direction, EnforcementEvidence, EnforcementOutcome, EventEnvelope, EventKind,
+    ObservationOnlyReason, ProtectiveActionProfile,
 };
 use tempfile::tempdir;
 
@@ -61,6 +62,16 @@ end
 }
 
 #[test]
+fn observation_detail_does_not_change_enforcement_decision_event_id()
+-> Result<(), Box<dyn std::error::Error>> {
+    let first = unsupported_reset_decision_id_for_observation_detail("first diagnostic detail")?;
+    let second = unsupported_reset_decision_id_for_observation_detail("second diagnostic detail")?;
+
+    assert_eq!(first, second);
+    Ok(())
+}
+
+#[test]
 fn observation_only_ebpf_syscall_gap_cannot_apply_connection_enforcement()
 -> Result<(), Box<dyn std::error::Error>> {
     let (envelopes, metrics) = run_reset_policy(
@@ -87,11 +98,11 @@ end
                 if envelope
                     .enforcement_evidence
                     .destructive_enforcement_rejection_reason()
-                    .is_some_and(|reason| reason.contains("eBPF syscall gap"))
+                    .is_some_and(|reason| reason.contains("eBPF syscall argument snapshot"))
                     && gap.reason.contains("eBPF syscall gap")
         )
     }));
-    assert_unsupported_reset(&envelopes, "eBPF syscall gap");
+    assert_unsupported_reset(&envelopes, "eBPF syscall argument snapshot");
     assert_no_apply(metrics);
     Ok(())
 }
@@ -156,7 +167,10 @@ fn observation_only_flow_evidence_blocks_parser_cursor_until_close()
     assert_eq!(summary.ingress_records_recovered, 1);
     assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 0);
 
-    run_without_policy(&spool, vec![connection_closed(flow)])?;
+    let mut close_provider = SequenceProvider::new(vec![connection_closed(flow)]);
+    let close_summary = recovery.run_provider(&mut close_provider)?;
+    assert_eq!(close_summary.ingress_records_journaled, 1);
+    assert_eq!(close_summary.ingress_records_processed, 1);
     assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 2);
     Ok(())
 }
@@ -228,6 +242,54 @@ fn run_reset_policy(
         "all supplied events should be journaled and processed"
     );
     Ok((exported_envelopes(&spool)?, metrics.snapshot()))
+}
+
+fn unsupported_reset_decision_id_for_observation_detail(
+    detail: &str,
+) -> Result<probe_core::EventId, Box<dyn std::error::Error>> {
+    let mut event = observation_only_ebpf_syscall_bytes_with_direction(
+        demo_flow_with_ports(50_000, 80, 46),
+        Direction::Outbound,
+        b"GET /blocked HTTP/1.1\r\nHost: test\r\n\r\n",
+    );
+    let CaptureEvent::Bytes(chunk) = &mut event else {
+        panic!("observation helper must produce bytes");
+    };
+    chunk.degradation_reason = Some(detail.to_string());
+    chunk.enforcement_evidence = EnforcementEvidence::observation_only_with_detail(
+        ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+        detail,
+    );
+
+    let (envelopes, _metrics) = run_reset_policy(
+        vec![event],
+        PolicyHook::HttpRequestHeaders,
+        r#"
+function on_http_request_headers(_)
+  return probe.verdict({
+action = "reset",
+scope = "flow",
+reason = "matched observation-only eBPF syscall sample",
+confidence = 100,
+  })
+end
+"#,
+    )?;
+    let decision = envelopes
+        .iter()
+        .find(|envelope| {
+            matches!(
+                &envelope.kind,
+                EventKind::EnforcementDecision(decision)
+                    if decision.outcome == EnforcementOutcome::Unsupported
+            )
+        })
+        .expect("observation-only reset must emit an unsupported enforcement decision");
+    assert!(!matches!(
+        &decision.kind,
+        EventKind::EnforcementDecision(value) if value.reason.contains(detail)
+    ));
+    Ok(decision.id.clone())
 }
 
 fn run_without_policy(

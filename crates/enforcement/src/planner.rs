@@ -276,7 +276,7 @@ fn failed_decision_parts(
 
 fn destructive_enforcement_evidence_rejection_reason(
     trigger: &EventEnvelope,
-) -> Option<std::borrow::Cow<'_, str>> {
+) -> Option<&'static str> {
     trigger
         .enforcement_evidence
         .destructive_enforcement_rejection_reason()
@@ -531,6 +531,11 @@ mod tests {
         assert!(decision.reason.contains("cannot prove bytes copied"));
         assert!(
             decision
+                .reason
+                .contains("eBPF syscall argument snapshot cannot prove")
+        );
+        assert!(
+            !decision
                 .reason
                 .contains("test eBPF syscall argument snapshot")
         );

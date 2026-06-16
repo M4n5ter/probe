@@ -189,8 +189,15 @@ mod tests {
             bytes
                 .enforcement_evidence
                 .destructive_enforcement_rejection_reason()
-                .is_some_and(|reason| reason.contains("captured 5 of 10"))
+                .is_some_and(|reason| reason.contains("syscall argument snapshot"))
         );
+        assert!(matches!(
+            &bytes.enforcement_evidence,
+            EnforcementEvidence::ObservationOnly {
+                detail: Some(detail),
+                ..
+            } if detail.contains("captured 5 of 10")
+        ));
         assert_eq!(gap.gap.direction, Direction::Outbound);
         assert_eq!(gap.gap.expected_offset, 5);
         assert_eq!(gap.gap.next_offset, Some(10));

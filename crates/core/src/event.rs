@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt, str::FromStr};
+use std::{fmt, str::FromStr};
 
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -103,13 +103,10 @@ impl EnforcementEvidence {
         }
     }
 
-    pub fn destructive_enforcement_rejection_reason(&self) -> Option<Cow<'_, str>> {
+    pub fn destructive_enforcement_rejection_reason(&self) -> Option<&'static str> {
         match self {
             Self::DestructiveAllowed => None,
-            Self::ObservationOnly { reason, detail } => match detail {
-                Some(detail) => Some(Cow::Owned(format!("{}: {detail}", reason.description()))),
-                None => Some(Cow::Borrowed(reason.description())),
-            },
+            Self::ObservationOnly { reason, .. } => Some(reason.description()),
         }
     }
 
@@ -658,6 +655,12 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_ne!(first.id, third.id);
+        assert!(
+            !first
+                .enforcement_evidence
+                .destructive_enforcement_rejection_reason()
+                .is_some_and(|reason| reason.contains("first detail"))
+        );
     }
 
     #[test]
