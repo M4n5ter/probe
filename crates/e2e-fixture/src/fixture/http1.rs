@@ -35,6 +35,7 @@ pub(crate) struct Http1TrafficConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Http1LoopbackRunOptions {
     pub listen_port: u16,
+    pub connect_write_delay_ms: u64,
     pub coordination: Http1LoopbackCoordination,
 }
 
@@ -62,6 +63,7 @@ impl Default for Http1LoopbackRunOptions {
     fn default() -> Self {
         Self {
             listen_port: 0,
+            connect_write_delay_ms: 0,
             coordination: Http1LoopbackCoordination::Immediate,
         }
     }
@@ -158,7 +160,12 @@ pub(crate) fn run_http1_loopback(
     let mut client_bytes_written = 0usize;
     let mut client_bytes_read = 0usize;
     for request_index in 0..traffic.requests {
-        let exchange = run_client_exchange(listen_addr, request_index, &traffic)?;
+        let exchange = run_client_exchange(
+            listen_addr,
+            request_index,
+            &traffic,
+            config.run.connect_write_delay_ms,
+        )?;
         client_bytes_written = client_bytes_written.saturating_add(exchange.bytes_written);
         client_bytes_read = client_bytes_read.saturating_add(exchange.bytes_read);
     }
@@ -299,10 +306,14 @@ fn run_client_exchange(
     listen_addr: SocketAddr,
     request_index: usize,
     config: &Http1TrafficConfig,
+    connect_write_delay_ms: u64,
 ) -> Result<ExchangeReport, Http1LoopbackError> {
     let mut stream = TcpStream::connect(listen_addr)
         .map_err(|source| io_error("connect to loopback fixture server", source))?;
     configure_stream(&stream)?;
+    if connect_write_delay_ms > 0 {
+        thread::sleep(Duration::from_millis(connect_write_delay_ms));
+    }
     let request = http_request(request_index, config.request_body_bytes);
     write_in_chunks(&mut stream, &request, config.write_chunks)?;
     stream
@@ -581,6 +592,7 @@ mod tests {
             },
             run: Http1LoopbackRunOptions {
                 listen_port: 0,
+                connect_write_delay_ms: 0,
                 coordination: Http1LoopbackCoordination::TwoPhase {
                     ready_file: ready_path.clone(),
                     start_file: start_path.clone(),
@@ -622,6 +634,7 @@ mod tests {
             traffic: Http1TrafficConfig::default(),
             run: Http1LoopbackRunOptions {
                 listen_port: 0,
+                connect_write_delay_ms: 0,
                 coordination: Http1LoopbackCoordination::TwoPhase {
                     ready_file: ready_path,
                     start_file: start_path,

@@ -11,12 +11,20 @@ use crate::{
 
 use super::{EbpfConnectTracepointObservation, EbpfObservedProcess};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EbpfConnectFlowLookup {
     pub tgid: u32,
     pub thread_pid: u32,
     pub fd: i32,
     pub expected_remote_endpoint: Option<TcpEndpoint>,
+    pub process_hint: Option<EbpfProcessHint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EbpfProcessHint {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +53,7 @@ pub(crate) fn connect_opened_event_from_observation(
         thread_pid: connect.process.pid,
         fd: connect.fd,
         expected_remote_endpoint: connect.endpoint.remote_endpoint(),
+        process_hint: process_hint_from_observed(&connect.process),
     })?;
     Ok(resolved.map(|resolved| CaptureEvent::ConnectionOpened {
         timestamp,
@@ -165,6 +174,15 @@ fn process_context_from_observed(process: &EbpfObservedProcess) -> ProcessContex
     }
 }
 
+fn process_hint_from_observed(process: &EbpfObservedProcess) -> Option<EbpfProcessHint> {
+    let name = process.command_lossy();
+    (!name.is_empty()).then_some(EbpfProcessHint {
+        name,
+        uid: process.uid,
+        gid: process.gid,
+    })
+}
+
 fn unknown_local_endpoint_for_remote(remote: TcpEndpoint) -> TcpEndpoint {
     let address = match remote.address {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -197,7 +215,7 @@ mod tests {
                 tgid: 100,
                 uid: 1000,
                 gid: 1000,
-                command: [0; 16],
+                command: nul_padded_command("curl"),
             },
             fd: 7,
             addrlen: 16,
@@ -210,6 +228,11 @@ mod tests {
                 thread_pid: 101,
                 fd: 7,
                 expected_remote_endpoint: Some(expected_remote),
+                process_hint: Some(EbpfProcessHint {
+                    name: String::from("curl"),
+                    uid: 1000,
+                    gid: 1000,
+                }),
             },
             seen: false,
             resolved: Some(EbpfResolvedConnectFlow {
@@ -275,6 +298,7 @@ mod tests {
                 thread_pid: 101,
                 fd: 7,
                 expected_remote_endpoint: None,
+                process_hint: None,
             },
             seen: false,
             resolved: None,
@@ -330,5 +354,13 @@ mod tests {
             name: "curl".to_string(),
             cmdline: vec!["curl".to_string()],
         }
+    }
+
+    fn nul_padded_command(command: &str) -> [u8; 16] {
+        let mut bytes = [0; 16];
+        for (target, source) in bytes.iter_mut().zip(command.as_bytes()) {
+            *target = *source;
+        }
+        bytes
     }
 }

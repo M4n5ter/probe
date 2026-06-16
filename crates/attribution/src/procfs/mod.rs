@@ -10,4 +10,5 @@ pub use error::AttributionError;
 pub use process::{ProcessAttributor, ProcfsAttributor};
 pub use socket::{
     ProcfsSocketResolver, SocketFdConnectionContext, SocketFdLookup, SocketProcessContext,
+    SocketProcessHint,
 };

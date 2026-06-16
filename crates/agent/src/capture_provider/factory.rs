@@ -188,6 +188,13 @@ impl EbpfConnectFlowResolver for ProcfsTcpProcessResolver {
                 thread_pid: lookup.thread_pid,
                 fd: lookup.fd,
                 expected_remote_endpoint: lookup.expected_remote_endpoint,
+                process_hint: lookup
+                    .process_hint
+                    .map(|hint| attribution::SocketProcessHint {
+                        name: hint.name,
+                        uid: hint.uid,
+                        gid: hint.gid,
+                    }),
             })
             .map(|resolved| {
                 resolved.map(|resolved| EbpfResolvedConnectFlow {

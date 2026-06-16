@@ -390,6 +390,7 @@ impl LibsslUprobeFlowResolver for ProcfsLibsslFlowResolver {
                 thread_pid: lookup.thread_pid,
                 fd,
                 expected_remote_endpoint: None,
+                process_hint: None,
             })
             .map(|resolved| {
                 resolved.map(|resolved| {

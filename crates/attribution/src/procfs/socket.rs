@@ -9,7 +9,10 @@ use probe_core::{CapabilityKind, CapabilityState, ProcessContext, TcpConnection,
 
 use super::{
     AttributionError,
-    inode_scan::{inode_pid_map, read_socket_inode_for_lookup_fd},
+    inode_scan::{
+        SocketFdInode, SocketFdInodeSource, hinted_socket_fd_candidates, inode_pid_map,
+        socket_fd_candidates_for_lookup,
+    },
     io::read_tcp_table_to_string,
     process::{ProcessAttributor, ProcfsAttributor},
     tcp_table::{
@@ -19,6 +22,7 @@ use super::{
 };
 
 const PROCFS_SOCKET_CONFIDENCE: u8 = 60;
+const PROCFS_HINTED_FD_CONFIDENCE: u8 = 50;
 const DEFAULT_PROCFS_SOCKET_SNAPSHOT_TTL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,12 +40,20 @@ pub struct SocketFdConnectionContext {
     pub connection: TcpConnection,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketFdLookup {
     pub tgid: u32,
     pub thread_pid: u32,
     pub fd: i32,
     pub expected_remote_endpoint: Option<TcpEndpoint>,
+    pub process_hint: Option<SocketProcessHint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketProcessHint {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -215,48 +227,114 @@ impl ProcfsSocketAttributor {
         lookup: SocketFdLookup,
         snapshot: &ProcfsSocketSnapshot,
     ) -> Result<Option<SocketFdConnectionContext>, AttributionError> {
-        let Some(inode) =
-            read_socket_inode_for_lookup_fd(&self.process_attributor.proc_root, lookup)?
-        else {
-            if let Some(error) = optional_error_for_expected_remote(snapshot, lookup) {
+        let candidate_scan =
+            socket_fd_candidates_for_lookup(&self.process_attributor.proc_root, &lookup)?;
+        if candidate_scan.complete
+            && let Some(resolved) = self.identify_fd_candidates_in_snapshot(
+                &candidate_scan.candidates,
+                &lookup,
+                snapshot,
+            )?
+        {
+            return Ok(Some(resolved));
+        }
+        if !candidate_scan.candidates.is_empty() {
+            if let Some(error) = optional_error_for_expected_remote(snapshot, &lookup) {
                 return Err(error);
             }
             return Ok(None);
-        };
-        let Some(connection) =
-            tcp_connection_for_inode(snapshot, inode, lookup.expected_remote_endpoint)
-        else {
-            if let Some(error) = optional_error_for_expected_remote(snapshot, lookup) {
-                return Err(error);
-            }
-            return Ok(None);
-        };
-        let process = match self.process_attributor.identify(lookup.tgid) {
-            Ok(process) => process,
-            Err(error)
-                if is_disappearing_process_error(
-                    &error,
-                    &self.process_attributor.proc_root,
-                    lookup.tgid,
-                ) =>
+        }
+        if let Some(error) = optional_error_for_expected_remote(snapshot, &lookup) {
+            return Err(error);
+        }
+        self.identify_hinted_fd_in_snapshot(&lookup, snapshot)
+    }
+
+    fn identify_fd_candidates_in_snapshot(
+        &self,
+        candidates: &[SocketFdInode],
+        lookup: &SocketFdLookup,
+        snapshot: &ProcfsSocketSnapshot,
+    ) -> Result<Option<SocketFdConnectionContext>, AttributionError> {
+        let mut matched = None;
+        for candidate in candidates {
+            if candidate.source != SocketFdInodeSource::Direct
+                && lookup.expected_remote_endpoint.is_none()
             {
+                continue;
+            }
+            let Some(connection) = tcp_connection_for_inode(
+                snapshot,
+                candidate.inode,
+                lookup.expected_remote_endpoint,
+            ) else {
+                continue;
+            };
+            let process = match self.process_attributor.identify(candidate.process_pid) {
+                Ok(process) => process,
+                Err(error)
+                    if is_disappearing_process_error(
+                        &error,
+                        &self.process_attributor.proc_root,
+                        candidate.process_pid,
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if candidate.source == SocketFdInodeSource::ProcessHint
+                && !lookup
+                    .process_hint
+                    .as_ref()
+                    .is_some_and(|hint| process_matches_hint(&process, hint))
+            {
+                continue;
+            }
+            let resolved = SocketFdConnectionContext {
+                process,
+                confidence: fd_candidate_confidence(candidate.source),
+                socket_inode: candidate.inode,
+                connection,
+            };
+            if matched.replace(resolved).is_some() {
                 return Ok(None);
             }
-            Err(error) => return Err(error),
-        };
-        Ok(Some(SocketFdConnectionContext {
-            process,
-            confidence: PROCFS_SOCKET_CONFIDENCE,
-            socket_inode: inode,
-            connection,
-        }))
+        }
+        Ok(matched)
+    }
+
+    fn identify_hinted_fd_in_snapshot(
+        &self,
+        lookup: &SocketFdLookup,
+        snapshot: &ProcfsSocketSnapshot,
+    ) -> Result<Option<SocketFdConnectionContext>, AttributionError> {
+        if lookup.process_hint.is_none() || lookup.expected_remote_endpoint.is_none() {
+            return Ok(None);
+        }
+        let candidate_scan =
+            hinted_socket_fd_candidates(&self.process_attributor.proc_root, lookup)?;
+        if !candidate_scan.complete {
+            return Ok(None);
+        }
+        if let Some(resolved) =
+            self.identify_fd_candidates_in_snapshot(&candidate_scan.candidates, lookup, snapshot)?
+        {
+            return Ok(Some(resolved));
+        }
+        if !candidate_scan.candidates.is_empty()
+            && let Some(error) = optional_error_for_expected_remote(snapshot, lookup)
+        {
+            return Err(error);
+        }
+        Ok(None)
     }
 
     fn capabilities(&self) -> Vec<CapabilityState> {
         match self.probe() {
             Ok(()) => vec![CapabilityState::degraded(
                 CapabilityKind::ProcfsSocketAttribution,
-                "procfs socket attribution can read /proc/net/tcp and proc root, and opportunistically reads /proc/net/tcp6 when available; fd races, hidepid, namespace boundaries, and PID reuse remain possible",
+                "procfs socket attribution can read /proc/net/tcp and proc root, opportunistically reads /proc/net/tcp6, resolves fd lookups through procfs PID namespace aliases, and can use unique fd/process-hint candidates when kernel PIDs are hidden; fd races, hidepid, namespace boundaries, and PID reuse remain possible",
             )],
             Err(error) => vec![CapabilityState::unavailable(
                 CapabilityKind::ProcfsSocketAttribution,
@@ -334,9 +412,24 @@ fn tcp_connection_for_inode(
         })
 }
 
+fn process_matches_hint(process: &ProcessContext, hint: &SocketProcessHint) -> bool {
+    process.identity.uid == hint.uid
+        && process.identity.gid == hint.gid
+        && process.name == hint.name
+}
+
+fn fd_candidate_confidence(source: SocketFdInodeSource) -> u8 {
+    match source {
+        SocketFdInodeSource::Direct => PROCFS_SOCKET_CONFIDENCE,
+        SocketFdInodeSource::NamespaceAlias | SocketFdInodeSource::ProcessHint => {
+            PROCFS_HINTED_FD_CONFIDENCE
+        }
+    }
+}
+
 fn optional_error_for_expected_remote(
     snapshot: &ProcfsSocketSnapshot,
-    lookup: SocketFdLookup,
+    lookup: &SocketFdLookup,
 ) -> Option<AttributionError> {
     let remote = lookup.expected_remote_endpoint?;
     endpoint_uses_family(remote, ProcfsTcpTableFamily::Ipv6)

@@ -5,7 +5,7 @@ use super::http1::{
 };
 
 const USAGE: &str = "\
-usage: sssa-e2e-fixture http1-loopback [--listen-port PORT] [--ready-file PATH] [--start-file PATH] [--requests N] [--request-body-bytes N] [--response-body-bytes N] [--write-chunks N]
+usage: sssa-e2e-fixture http1-loopback [--listen-port PORT] [--ready-file PATH] [--start-file PATH] [--requests N] [--request-body-bytes N] [--response-body-bytes N] [--write-chunks N] [--connect-write-delay-ms N]
 
 Scenarios:
   http1-loopback    Start a local TCP server and client in this process, then exchange deterministic HTTP/1 traffic.
@@ -106,6 +106,9 @@ fn parse_http1_loopback(
         };
         match option.as_str() {
             "--listen-port" => config.run.listen_port = parse_u16(&option, &value)?,
+            "--connect-write-delay-ms" => {
+                config.run.connect_write_delay_ms = parse_u64(&option, &value)?;
+            }
             "--ready-file" => ready_file = Some(PathBuf::from(value)),
             "--start-file" => start_file = Some(PathBuf::from(value)),
             "--requests" => config.traffic.requests = parse_usize(&option, &value)?,
@@ -164,6 +167,14 @@ fn parse_u16(option: &str, value: &str) -> Result<u16, FixtureError> {
     })
 }
 
+fn parse_u64(option: &str, value: &str) -> Result<u64, FixtureError> {
+    value.parse::<u64>().map_err(|error| {
+        FixtureError::usage(format!(
+            "invalid value for {option}: {value}: {error}\n\n{USAGE}"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +196,8 @@ mod tests {
             "64".to_string(),
             "--write-chunks".to_string(),
             "3".to_string(),
+            "--connect-write-delay-ms".to_string(),
+            "250".to_string(),
         ])?;
 
         assert_eq!(config.run.listen_port, 0);
@@ -199,6 +212,7 @@ mod tests {
         assert_eq!(config.traffic.request_body_bytes, 128);
         assert_eq!(config.traffic.response_body_bytes, 64);
         assert_eq!(config.traffic.write_chunks, 3);
+        assert_eq!(config.run.connect_write_delay_ms, 250);
         Ok(())
     }
 

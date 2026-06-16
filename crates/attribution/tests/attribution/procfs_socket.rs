@@ -1,12 +1,12 @@
 use std::{
     fs, io,
     net::{Ipv4Addr, Ipv6Addr},
-    os::unix::fs::symlink,
+    os::unix::fs::{PermissionsExt, symlink},
     path::PathBuf,
     time::Duration,
 };
 
-use attribution::{AttributionError, ProcfsSocketResolver, SocketFdLookup};
+use attribution::{AttributionError, ProcfsSocketResolver, SocketFdLookup, SocketProcessHint};
 use probe_core::{TcpConnection, TcpEndpoint};
 use tempfile::{TempDir, tempdir};
 
@@ -98,6 +98,56 @@ impl ProcfsSocketFixture {
             thread_fd_dir.join(fd.to_string()),
         )
     }
+
+    fn create_process(
+        &self,
+        pid: u32,
+        name: &str,
+        socket_inode: Option<u64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pid_dir = self.proc_root.join(pid.to_string());
+        let fd_dir = pid_dir.join("fd");
+        fs::create_dir_all(&fd_dir)?;
+        fs::write(
+            pid_dir.join("stat"),
+            format!("{pid} ({name}) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 9000 21\n"),
+        )?;
+        fs::write(
+            pid_dir.join("status"),
+            format!(
+                "Name:\t{name}\nTgid:\t{pid}\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n"
+            ),
+        )?;
+        fs::write(
+            pid_dir.join("cmdline"),
+            format!("/usr/bin/{name}\0").as_bytes(),
+        )?;
+        fs::write(
+            pid_dir.join("cgroup"),
+            format!("0::/system.slice/{name}.service\n"),
+        )?;
+        symlink(format!("/usr/bin/{name}"), pid_dir.join("exe"))?;
+        if let Some(socket_inode) = socket_inode {
+            symlink(format!("socket:[{socket_inode}]"), fd_dir.join("7"))?;
+        }
+        Ok(())
+    }
+
+    fn create_namespace_alias_process(
+        &self,
+        visible_pid: u32,
+        observed_tgid: u32,
+        socket_inode: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.create_process(visible_pid, "server", Some(socket_inode))?;
+        fs::write(
+            self.proc_root.join(visible_pid.to_string()).join("status"),
+            format!(
+                "Name:\tserver\nTgid:\t{visible_pid}\nPid:\t{visible_pid}\nNStgid:\t{observed_tgid}\t{visible_pid}\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n"
+            ),
+        )?;
+        Ok(())
+    }
 }
 
 fn tcp_table_entry(endpoints: &str, inode: u64) -> String {
@@ -112,6 +162,7 @@ fn fd_lookup(expected_remote_endpoint: Option<TcpEndpoint>) -> SocketFdLookup {
         thread_pid: 321,
         fd: 7,
         expected_remote_endpoint,
+        process_hint: None,
     }
 }
 
@@ -222,6 +273,7 @@ fn procfs_socket_resolver_reads_fd_from_thread_pid_and_attributes_tgid()
             thread_pid: 654,
             fd: 7,
             expected_remote_endpoint: Some(expected_remote),
+            process_hint: None,
         })?
         .expect("expected fd socket process from thread pid");
 
@@ -252,6 +304,7 @@ fn procfs_socket_resolver_falls_back_to_tgid_fd_when_thread_fd_disappears()
             thread_pid: 654,
             fd: 7,
             expected_remote_endpoint: Some(expected_remote),
+            process_hint: None,
         })?
         .expect("expected fd socket process from tgid fallback");
 
@@ -264,6 +317,213 @@ fn procfs_socket_resolver_falls_back_to_tgid_fd_when_thread_fd_disappears()
             expected_remote,
         )
     );
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_uses_namespace_alias_only_when_observed_tgid_is_not_visible()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ProcfsSocketFixture::new(424251)?;
+    fixture.create_namespace_alias_process(7, 101, 424251)?;
+    fixture.write_tcp(&tcp_table_entry(TCP4_LOCALHOST_TO_PEER, 424251))?;
+    let expected_remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000);
+
+    let mut resolver = fixture.resolver();
+    let process = resolver
+        .resolve_tcp_fd(SocketFdLookup {
+            tgid: 101,
+            thread_pid: 101,
+            fd: 7,
+            expected_remote_endpoint: Some(expected_remote),
+            process_hint: None,
+        })?
+        .expect("expected hidden observed tgid to resolve through namespace alias");
+
+    assert_eq!(process.process.identity.pid, 7);
+    assert_eq!(process.socket_inode, 424251);
+    assert_eq!(process.confidence, 50);
+    assert_eq!(
+        process.connection,
+        TcpConnection::new(
+            TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8080),
+            expected_remote,
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_does_not_alias_visible_tgid_with_missing_fd()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ProcfsSocketFixture::new(424252)?;
+    fixture.create_process(101, "server", None)?;
+    fixture.create_namespace_alias_process(7, 101, 424252)?;
+    fixture.write_tcp(&tcp_table_entry(TCP4_LOCALHOST_TO_PEER, 424252))?;
+    let expected_remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000);
+
+    let mut resolver = fixture.resolver();
+    let process = resolver.resolve_tcp_fd(SocketFdLookup {
+        tgid: 101,
+        thread_pid: 101,
+        fd: 7,
+        expected_remote_endpoint: Some(expected_remote),
+        process_hint: None,
+    })?;
+
+    assert!(process.is_none());
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_rejects_namespace_alias_when_status_scan_is_incomplete()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ProcfsSocketFixture::new(424257)?;
+    fixture.create_namespace_alias_process(7, 101, 424257)?;
+    fixture.create_process(8, "server", None)?;
+    let unreadable_status = fixture.proc_root.join("8/status");
+    fs::set_permissions(&unreadable_status, fs::Permissions::from_mode(0o000))?;
+    fixture.write_tcp(&tcp_table_entry(TCP4_LOCALHOST_TO_PEER, 424257))?;
+    let expected_remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000);
+
+    let mut resolver = fixture.resolver();
+    let process = resolver.resolve_tcp_fd(SocketFdLookup {
+        tgid: 101,
+        thread_pid: 101,
+        fd: 7,
+        expected_remote_endpoint: Some(expected_remote),
+        process_hint: None,
+    });
+    fs::set_permissions(&unreadable_status, fs::Permissions::from_mode(0o600))?;
+
+    assert!(process?.is_none());
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_uses_unique_fd_process_hint_when_kernel_pid_is_hidden()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ProcfsSocketFixture::new(424253)?;
+    fixture.write_tcp(&tcp_table_entry(TCP4_LOCALHOST_TO_PEER, 424253))?;
+    let expected_remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000);
+
+    let mut resolver = fixture.resolver();
+    let process = resolver
+        .resolve_tcp_fd(SocketFdLookup {
+            tgid: 999,
+            thread_pid: 999,
+            fd: 7,
+            expected_remote_endpoint: Some(expected_remote),
+            process_hint: Some(SocketProcessHint {
+                name: "server".to_string(),
+                uid: 1000,
+                gid: 1000,
+            }),
+        })?
+        .expect("expected unique fd/process hint candidate");
+
+    assert_eq!(process.process.identity.pid, 321);
+    assert_eq!(process.socket_inode, 424253);
+    assert_eq!(process.confidence, 50);
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_rejects_fd_process_hint_when_candidate_scan_is_incomplete()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ProcfsSocketFixture::new(424258)?;
+    fixture.create_process(654, "server", None)?;
+    let unreadable_fd_dir = fixture.proc_root.join("654/fd");
+    fs::set_permissions(&unreadable_fd_dir, fs::Permissions::from_mode(0o000))?;
+    fixture.write_tcp(&tcp_table_entry(TCP4_LOCALHOST_TO_PEER, 424258))?;
+    let expected_remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000);
+
+    let mut resolver = fixture.resolver();
+    let process = resolver.resolve_tcp_fd(SocketFdLookup {
+        tgid: 999,
+        thread_pid: 999,
+        fd: 7,
+        expected_remote_endpoint: Some(expected_remote),
+        process_hint: Some(SocketProcessHint {
+            name: "server".to_string(),
+            uid: 1000,
+            gid: 1000,
+        }),
+    });
+    fs::set_permissions(&unreadable_fd_dir, fs::Permissions::from_mode(0o700))?;
+
+    assert!(process?.is_none());
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_rejects_fd_process_hint_name_mismatch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ProcfsSocketFixture::new(424255)?;
+    fixture.write_tcp(&tcp_table_entry(TCP4_LOCALHOST_TO_PEER, 424255))?;
+    let expected_remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000);
+
+    let mut resolver = fixture.resolver();
+    let process = resolver.resolve_tcp_fd(SocketFdLookup {
+        tgid: 999,
+        thread_pid: 999,
+        fd: 7,
+        expected_remote_endpoint: Some(expected_remote),
+        process_hint: Some(SocketProcessHint {
+            name: "curl".to_string(),
+            uid: 1000,
+            gid: 1000,
+        }),
+    })?;
+
+    assert!(process.is_none());
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_requires_expected_remote_for_fd_process_hint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ProcfsSocketFixture::new(424256)?;
+    fixture.write_tcp(&tcp_table_entry(TCP4_LOCALHOST_TO_PEER, 424256))?;
+
+    let mut resolver = fixture.resolver();
+    let process = resolver.resolve_tcp_fd(SocketFdLookup {
+        tgid: 999,
+        thread_pid: 999,
+        fd: 7,
+        expected_remote_endpoint: None,
+        process_hint: Some(SocketProcessHint {
+            name: "server".to_string(),
+            uid: 1000,
+            gid: 1000,
+        }),
+    })?;
+
+    assert!(process.is_none());
+    Ok(())
+}
+
+#[test]
+fn procfs_socket_resolver_rejects_ambiguous_fd_process_hint_candidates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ProcfsSocketFixture::new(424254)?;
+    fixture.create_process(654, "server", Some(424254))?;
+    fixture.write_tcp(&tcp_table_entry(TCP4_LOCALHOST_TO_PEER, 424254))?;
+    let expected_remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 2).into(), 50_000);
+
+    let mut resolver = fixture.resolver();
+    let process = resolver.resolve_tcp_fd(SocketFdLookup {
+        tgid: 999,
+        thread_pid: 999,
+        fd: 7,
+        expected_remote_endpoint: Some(expected_remote),
+        process_hint: Some(SocketProcessHint {
+            name: "server".to_string(),
+            uid: 1000,
+            gid: 1000,
+        }),
+    })?;
+
+    assert!(process.is_none());
     Ok(())
 }
 

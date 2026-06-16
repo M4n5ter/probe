@@ -2,5 +2,5 @@ mod procfs;
 
 pub use procfs::{
     AttributionError, ProcessAttributor, ProcfsAttributor, ProcfsSocketResolver,
-    SocketFdConnectionContext, SocketFdLookup, SocketProcessContext,
+    SocketFdConnectionContext, SocketFdLookup, SocketProcessContext, SocketProcessHint,
 };
