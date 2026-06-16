@@ -1,11 +1,8 @@
 use std::net::IpAddr;
 
-use probe_config::{
-    DEFAULT_TRANSPARENT_INTERCEPTION_NFTABLES_MARK, DEFAULT_TRANSPARENT_INTERCEPTION_ROUTE_TABLE,
-    EnforcementInterceptionConfig, TransparentInterceptionNftablesConfig,
-    TransparentInterceptionStrategyConfig,
-};
+use probe_config::{EnforcementInterceptionConfig, TransparentInterceptionStrategyConfig};
 use probe_core::{Direction, ProcessSelector, Selector, SelectorTerm, TrafficSelector};
+use runtime::TransparentInterceptionNftablesPlan;
 use thiserror::Error;
 
 const INBOUND_TPROXY_OWNER_LOCK: &str = "inbound_tproxy";
@@ -14,14 +11,6 @@ const INBOUND_TPROXY_OWNER_LOCK: &str = "inbound_tproxy";
 pub(super) enum NftablesPlanError {
     #[error("transparent interception requires a proxy listen port")]
     MissingProxyPort,
-    #[error("transparent interception nftables mark must be the reserved sssa_probe mark 0x{0:x}")]
-    InvalidMark(u32),
-    #[error(
-        "transparent interception policy route table must be the reserved sssa_probe table {0}"
-    )]
-    InvalidRouteTable(u32),
-    #[error("transparent interception nftables table name must be the reserved sssa_probe table")]
-    InvalidTableName,
     #[error("transparent interception nftables lifecycle currently supports inbound TPROXY only")]
     UnsupportedStrategy,
     #[error("transparent interception requires an explicit selector for setup-time rules")]
@@ -54,28 +43,14 @@ impl NftablesInterceptionPlan {
         let Some(proxy_port @ 1..) = config.proxy.listen_port else {
             return Err(NftablesPlanError::MissingProxyPort);
         };
-        if !TransparentInterceptionNftablesConfig::is_owned_mark(config.nftables.mark) {
-            return Err(NftablesPlanError::InvalidMark(
-                DEFAULT_TRANSPARENT_INTERCEPTION_NFTABLES_MARK,
-            ));
-        }
-        if !TransparentInterceptionNftablesConfig::is_owned_route_table(config.nftables.route_table)
-        {
-            return Err(NftablesPlanError::InvalidRouteTable(
-                DEFAULT_TRANSPARENT_INTERCEPTION_ROUTE_TABLE,
-            ));
-        }
-        if !TransparentInterceptionNftablesConfig::is_owned_table_name(&config.nftables.table_name)
-        {
-            return Err(NftablesPlanError::InvalidTableName);
-        }
 
         let projection = NftSelectorProjection::from_selector(setup_selector)?;
+        let host_resources = TransparentInterceptionNftablesPlan::reserved();
         Ok(Self {
-            table_name: config.nftables.table_name.clone(),
+            table_name: host_resources.table_name,
             proxy_port,
-            mark: config.nftables.mark,
-            route_table: config.nftables.route_table,
+            mark: host_resources.mark,
+            route_table: host_resources.route_table,
             rules: projection.rules,
         })
     }
@@ -555,10 +530,7 @@ fn hex_mark(mark: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use probe_config::{
-        EnforcementInterceptionConfig, TransparentInterceptionNftablesConfig,
-        TransparentInterceptionProxyConfig,
-    };
+    use probe_config::{EnforcementInterceptionConfig, TransparentInterceptionProxyConfig};
 
     use super::*;
 
@@ -777,43 +749,6 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_host_resource_names_fail_closed_before_generating_commands() {
-        let mut config = interception_config(
-            TransparentInterceptionStrategyConfig::InboundTproxy,
-            Some(Selector::term(
-                ProcessSelector::default(),
-                TrafficSelector {
-                    local_ports: vec![8443],
-                    directions: vec![Direction::Inbound],
-                    ..TrafficSelector::default()
-                },
-            )),
-        );
-        config.nftables.table_name = "filter".to_string();
-        let error =
-            NftablesInterceptionPlan::from_config_and_scope(&config, config.selector.as_ref())
-                .expect_err("foreign nftables tables must not be destroyed");
-
-        assert!(matches!(error, NftablesPlanError::InvalidTableName));
-
-        config.nftables.table_name = "sssa_probe".to_string();
-        config.nftables.mark = 0x5353_4102;
-        let error =
-            NftablesInterceptionPlan::from_config_and_scope(&config, config.selector.as_ref())
-                .expect_err("foreign marks must not be mutated");
-
-        assert!(matches!(error, NftablesPlanError::InvalidMark(0x5353_4101)));
-
-        config.nftables.mark = 0x5353_4101;
-        config.nftables.route_table = 53_535;
-        let error =
-            NftablesInterceptionPlan::from_config_and_scope(&config, config.selector.as_ref())
-                .expect_err("foreign route tables must not be mutated");
-
-        assert!(matches!(error, NftablesPlanError::InvalidRouteTable(53534)));
-    }
-
-    #[test]
     fn owner_lock_is_coarse_for_the_single_supported_host_lifecycle() {
         let first = interception_config(
             TransparentInterceptionStrategyConfig::InboundTproxy,
@@ -849,7 +784,6 @@ mod tests {
             proxy: TransparentInterceptionProxyConfig {
                 listen_port: Some(15001),
             },
-            nftables: TransparentInterceptionNftablesConfig::default(),
         }
     }
 }

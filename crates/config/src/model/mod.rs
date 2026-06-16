@@ -14,12 +14,9 @@ pub use capture::{
     LiveCaptureBackend, PlaintextFeedCaptureConfig,
 };
 pub use enforcement::{
-    ConnectionEnforcementBackendConfig, DEFAULT_TRANSPARENT_INTERCEPTION_NFTABLES_MARK,
-    DEFAULT_TRANSPARENT_INTERCEPTION_NFTABLES_TABLE, DEFAULT_TRANSPARENT_INTERCEPTION_ROUTE_TABLE,
-    EnforcementConfig, EnforcementInterceptionConfig, EnforcementPolicyConfig,
-    EnforcementPolicyManifest, EnforcementPolicySourceConfig,
-    TransparentInterceptionNftablesConfig, TransparentInterceptionProxyConfig,
-    TransparentInterceptionStrategyConfig,
+    ConnectionEnforcementBackendConfig, EnforcementConfig, EnforcementInterceptionConfig,
+    EnforcementPolicyConfig, EnforcementPolicyManifest, EnforcementPolicySourceConfig,
+    TransparentInterceptionProxyConfig, TransparentInterceptionStrategyConfig,
 };
 pub use export::{
     CompressionCodecName, DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK,

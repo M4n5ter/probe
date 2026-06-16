@@ -220,8 +220,8 @@ mod tests {
     };
 
     use probe_config::{
-        EnforcementInterceptionConfig, TransparentInterceptionNftablesConfig,
-        TransparentInterceptionProxyConfig, TransparentInterceptionStrategyConfig,
+        EnforcementInterceptionConfig, TransparentInterceptionProxyConfig,
+        TransparentInterceptionStrategyConfig,
     };
     use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
 
@@ -447,7 +447,6 @@ mod tests {
             proxy: TransparentInterceptionProxyConfig {
                 listen_port: Some(15001),
             },
-            nftables: TransparentInterceptionNftablesConfig::default(),
         }
     }
 

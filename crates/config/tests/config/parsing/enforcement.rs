@@ -11,11 +11,6 @@ strategy = "outbound_mitm"
 [enforcement.interception.proxy]
 listen_port = 15001
 
-[enforcement.interception.nftables]
-table_name = "sssa_probe"
-mark = 1397965057
-route_table = 53534
-
 [enforcement.interception.selector]
 op = "match"
 
@@ -43,14 +38,29 @@ remote_addresses = []
         config.enforcement.interception.proxy.listen_port,
         Some(15001)
     );
-    assert_eq!(
-        config.enforcement.interception.nftables.table_name,
-        "sssa_probe"
-    );
-    assert_eq!(config.enforcement.interception.nftables.mark, 1_397_965_057);
-    assert_eq!(config.enforcement.interception.nftables.route_table, 53_534);
     assert!(config.enforcement.interception.selector.is_some());
     Ok(())
+}
+
+#[test]
+fn rejects_transparent_interception_host_resource_overrides() {
+    let error = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy"
+
+[enforcement.interception.proxy]
+listen_port = 15001
+
+[enforcement.interception.nftables]
+table_name = "filter"
+mark = 0
+route_table = 0
+"#,
+    )
+    .expect_err("transparent interception host resources are internal reserved resources");
+
+    assert!(error.to_string().contains("nftables"));
 }
 
 #[test]

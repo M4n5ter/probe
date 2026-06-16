@@ -2,11 +2,14 @@ use std::path::PathBuf;
 
 use probe_config::{
     AgentConfig, ConnectionEnforcementBackendConfig, EnforcementPolicySourceConfig,
-    TransparentInterceptionNftablesConfig, TransparentInterceptionProxyConfig,
-    TransparentInterceptionStrategyConfig,
+    TransparentInterceptionProxyConfig, TransparentInterceptionStrategyConfig,
 };
 use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
+
+const RESERVED_TRANSPARENT_INTERCEPTION_NFTABLES_TABLE: &str = "sssa_probe";
+const RESERVED_TRANSPARENT_INTERCEPTION_NFTABLES_MARK: u32 = 0x5353_4101;
+const RESERVED_TRANSPARENT_INTERCEPTION_ROUTE_TABLE: u32 = 53_534;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPlan {
@@ -97,9 +100,7 @@ impl EnforcementInterceptionPlan {
             proxy: TransparentInterceptionProxyPlan::from_config(
                 &config.enforcement.interception.proxy,
             ),
-            nftables: TransparentInterceptionNftablesPlan::from_config(
-                &config.enforcement.interception.nftables,
-            ),
+            nftables: TransparentInterceptionNftablesPlan::reserved(),
             capability: EnforcementCapabilityPlan::from_interception_strategy(
                 strategy,
                 capabilities,
@@ -130,11 +131,11 @@ pub struct TransparentInterceptionNftablesPlan {
 }
 
 impl TransparentInterceptionNftablesPlan {
-    fn from_config(config: &TransparentInterceptionNftablesConfig) -> Self {
+    pub fn reserved() -> Self {
         Self {
-            table_name: config.table_name.clone(),
-            mark: config.mark,
-            route_table: config.route_table,
+            table_name: RESERVED_TRANSPARENT_INTERCEPTION_NFTABLES_TABLE.to_string(),
+            mark: RESERVED_TRANSPARENT_INTERCEPTION_NFTABLES_MARK,
+            route_table: RESERVED_TRANSPARENT_INTERCEPTION_ROUTE_TABLE,
         }
     }
 }
