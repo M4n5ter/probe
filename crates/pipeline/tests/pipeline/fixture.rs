@@ -2,8 +2,9 @@ use capture::{
     CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind, CapturedBytes,
 };
 use probe_core::{
-    AddressPort, CapabilityState, CaptureSource, Direction, EventEnvelope, FlowContext,
-    FlowIdentity, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+    AddressPort, CapabilityState, CaptureSource, Direction, EnforcementEvidence, EventEnvelope,
+    FlowContext, FlowIdentity, Gap, ObservationOnlyReason, ProcessContext, ProcessIdentity,
+    Timestamp, TransportProtocol,
 };
 
 pub(super) struct SequenceProvider {
@@ -44,6 +45,72 @@ pub(super) fn captured_bytes(flow: FlowContext, bytes: &'static [u8]) -> Capture
     captured_bytes_with_direction(flow, Direction::Outbound, bytes)
 }
 
+pub(super) fn observation_only_ebpf_syscall_bytes_with_direction(
+    flow: FlowContext,
+    direction: Direction,
+    bytes: &'static [u8],
+) -> CaptureEvent {
+    let mut chunk = captured_bytes_chunk(flow, direction, bytes);
+    chunk.source = CaptureSource::EbpfSyscall;
+    chunk.provider = CaptureProviderKind::Ebpf;
+    chunk.degraded = true;
+    chunk.degradation_reason = Some("test eBPF syscall argument snapshot".to_string());
+    chunk.enforcement_evidence = EnforcementEvidence::observation_only_with_detail(
+        ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+        "test eBPF syscall argument snapshot",
+    );
+    chunk.enforcement_evidence_propagation = capture::EnforcementEvidencePropagation::Flow;
+    CaptureEvent::Bytes(chunk)
+}
+
+pub(super) fn flow_carried_observation_only_ebpf_syscall_gap(flow: FlowContext) -> CaptureEvent {
+    let reason = "test eBPF syscall gap";
+    CaptureEvent::Gap(capture::CapturedGap {
+        timestamp: Timestamp {
+            monotonic_ns: 1,
+            wall_time_unix_ns: 1,
+        },
+        flow,
+        source: CaptureSource::EbpfSyscall,
+        provider: CaptureProviderKind::Ebpf,
+        enforcement_evidence: EnforcementEvidence::observation_only_with_detail(
+            ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+            reason,
+        ),
+        enforcement_evidence_propagation: capture::EnforcementEvidencePropagation::Flow,
+        gap: Gap {
+            direction: Direction::Outbound,
+            expected_offset: 0,
+            next_offset: Some(5),
+            reason: reason.to_string(),
+        },
+    })
+}
+
+pub(super) fn event_local_observation_only_ebpf_unresolved_gap(flow: FlowContext) -> CaptureEvent {
+    let reason = "test eBPF unresolved flow gap";
+    CaptureEvent::Gap(capture::CapturedGap {
+        timestamp: Timestamp {
+            monotonic_ns: 1,
+            wall_time_unix_ns: 1,
+        },
+        flow,
+        source: CaptureSource::EbpfSyscall,
+        provider: CaptureProviderKind::Ebpf,
+        enforcement_evidence: EnforcementEvidence::observation_only_with_detail(
+            ObservationOnlyReason::EbpfUnresolvedFlow,
+            reason,
+        ),
+        enforcement_evidence_propagation: capture::EnforcementEvidencePropagation::Event,
+        gap: Gap {
+            direction: Direction::Outbound,
+            expected_offset: 0,
+            next_offset: None,
+            reason: reason.to_string(),
+        },
+    })
+}
+
 pub(super) fn captured_bytes_with_direction(
     flow: FlowContext,
     direction: Direction,
@@ -71,6 +138,8 @@ fn captured_bytes_chunk(
         attribution_confidence: 0,
         degraded: false,
         degradation_reason: None,
+        enforcement_evidence: EnforcementEvidence::default(),
+        enforcement_evidence_propagation: capture::EnforcementEvidencePropagation::Event,
     }
 }
 

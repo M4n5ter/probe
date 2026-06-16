@@ -398,6 +398,7 @@ mod tests {
             source,
             provider,
             gap,
+            ..
         }) = CaptureEvent::from(events[0].clone())
         else {
             panic!("expected unresolved flow gap");

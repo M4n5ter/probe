@@ -186,7 +186,7 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider emits connect observations, selector-authorized bounded outbound write payload samples, and best-effort descriptor-close lifecycle events; inbound payload, accept-side flows, sendmsg/writev, partial-write retry semantics, and lost-event capture are not implemented",
+            "eBPF provider emits connect observations, selector-authorized always-degraded outbound write argument samples, and best-effort descriptor-close lifecycle events; inbound payload, accept-side flows, sendmsg/writev, partial-write retry semantics, and lost-event capture are not implemented",
         )]
     }
 

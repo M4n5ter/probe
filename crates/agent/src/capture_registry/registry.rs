@@ -139,7 +139,7 @@ fn ebpf_provider_descriptor_from_object_report(
         CaptureBackend::Ebpf,
         CaptureProviderBuilder::Ebpf,
         format!(
-            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the process observation provider can emit connect observations, selector-authorized bounded outbound write payload samples, and best-effort descriptor-close lifecycle events, but inbound payload, sendmsg/writev, lost-event conversion, and complete kernel traffic capture are not implemented",
+            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the process observation provider can emit connect observations, selector-authorized always-degraded outbound write argument samples, and best-effort descriptor-close lifecycle events, but inbound payload, sendmsg/writev, lost-event conversion, and complete kernel traffic capture are not implemented",
             object.summary(),
         ),
     )
@@ -320,7 +320,7 @@ mod tests {
             .expect("eBPF descriptor should explain why capture provider is degraded");
         assert!(reason.contains("complete kernel traffic capture"));
         assert!(reason.contains("selector-authorized"));
-        assert!(reason.contains("bounded outbound write payload samples"));
+        assert!(reason.contains("always-degraded outbound write argument samples"));
         assert!(reason.contains("lost-event conversion"));
         assert!(reason.contains("best-effort descriptor-close lifecycle events"));
         assert!(reason.contains("process observation provider"));

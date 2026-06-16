@@ -230,6 +230,8 @@ fn stream_piece_event(
             attribution_confidence,
             degraded: true,
             degradation_reason: Some(degradation_reason),
+            enforcement_evidence: probe_core::EnforcementEvidence::default(),
+            enforcement_evidence_propagation: crate::EnforcementEvidencePropagation::Event,
         }),
         StreamPiece::Gap {
             expected_offset,
@@ -240,6 +242,8 @@ fn stream_piece_event(
             flow,
             source: probe_core::CaptureSource::Libpcap,
             provider: CaptureProviderKind::Libpcap,
+            enforcement_evidence: probe_core::EnforcementEvidence::default(),
+            enforcement_evidence_propagation: crate::EnforcementEvidencePropagation::Event,
             gap: Gap {
                 direction,
                 expected_offset,

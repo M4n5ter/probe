@@ -1,5 +1,5 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 
 mod close;
 mod connect;
@@ -14,14 +14,18 @@ use aya_ebpf::{
 };
 use ebpf_abi::{
     EBPF_ALLOWED_SOCKET_FDS_MAX_ENTRIES, EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES,
-    EBPF_PENDING_WRITES_MAX_ENTRIES, EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES,
-    EBPF_RING_BUFFER_BYTES, EbpfCloseTracepointRecord, EbpfConnectTracepointRecord,
-    EbpfPendingWrite, EbpfProcessProbeMetadata, EbpfSocketFdKey, EbpfSocketWriteSampleRecord,
+    EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES, EBPF_PENDING_WRITES_MAX_ENTRIES,
+    EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES, EBPF_RING_BUFFER_BYTES, EbpfCloseTracepointRecord,
+    EbpfConnectTracepointRecord, EbpfPendingSocketWriteSample, EbpfProcessProbeMetadata,
+    EbpfSocketFdKey, EbpfSocketWriteSampleRecord,
 };
 
 use close::close_observation_from_tracepoint;
 use connect::connect_observation_from_tracepoint;
-use write::{pending_write_from_tracepoint, socket_write_sample_from_tracepoint};
+use write::{
+    capture_write_sample_from_attempt, pending_write_metadata, trim_write_sample_to_result,
+    write_attempt_from_tracepoint,
+};
 
 #[map(name = "SSSA_EVENTS")]
 static SSSA_EVENTS: RingBuf = RingBuf::with_byte_size(EBPF_RING_BUFFER_BYTES, 0);
@@ -35,8 +39,12 @@ static SSSA_FD_TABLE_EPOCHS: HashMap<u32, u64> =
     HashMap::with_max_entries(EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES, 0);
 
 #[map(name = "SSSA_PENDING_WRITES")]
-static SSSA_PENDING_WRITES: HashMap<u64, EbpfPendingWrite> =
+static SSSA_PENDING_WRITES: HashMap<u64, EbpfPendingSocketWriteSample> =
     HashMap::with_max_entries(EBPF_PENDING_WRITES_MAX_ENTRIES, 0);
+
+#[map(name = "SSSA_PENDING_WRITE_SCRATCH")]
+static SSSA_PENDING_WRITE_SCRATCH: PerCpuArray<EbpfPendingSocketWriteSample> =
+    PerCpuArray::with_max_entries(EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES, 0);
 
 #[map(name = "SSSA_PROCESS_EVENT_SCRATCH")]
 static SSSA_PROCESS_EVENT_SCRATCH: PerCpuArray<EbpfSocketWriteSampleRecord> =
@@ -141,45 +149,75 @@ fn emit_close_attempt(ctx: TracePointContext) {
 }
 
 fn record_write_attempt(ctx: TracePointContext) {
-    let Some(pending) = pending_write_from_tracepoint(&ctx) else {
+    let Some(attempt) = write_attempt_from_tracepoint(&ctx) else {
         return;
     };
-    if !is_allowed_socket_fd(pending.fd) {
+    if !is_allowed_socket_fd(attempt.fd) {
         return;
     }
+    let Some(pending) = pending_write_scratch() else {
+        return;
+    };
+    capture_write_sample_from_attempt(attempt, pending);
     let key = bpf_get_current_pid_tgid();
-    let _ = SSSA_PENDING_WRITES.insert(&key, &pending, 0);
+    let _ = SSSA_PENDING_WRITES.insert(&key, pending, 0);
 }
 
 fn emit_write_sample(ctx: TracePointContext) {
     let key = bpf_get_current_pid_tgid();
-    let Some(pending) = (unsafe { SSSA_PENDING_WRITES.get(&key).copied() }) else {
+    let Some(pending_ptr) = SSSA_PENDING_WRITES.get_ptr_mut(&key) else {
         return;
     };
-    let _ = SSSA_PENDING_WRITES.remove(&key);
+    let pending = unsafe { &mut *pending_ptr };
     if !is_allowed_socket_fd(pending.fd) {
+        let _ = SSSA_PENDING_WRITES.remove(&key);
         return;
     }
+    if trim_write_sample_to_result(&ctx, pending).is_none() {
+        let _ = SSSA_PENDING_WRITES.remove(&key);
+        return;
+    };
     let Some(event) = scratch_event() else {
+        let _ = SSSA_PENDING_WRITES.remove(&key);
         return;
     };
     event.clear_sample();
-    let Some(sample) =
-        socket_write_sample_from_tracepoint(&ctx, pending, event.socket_write_buffer_mut())
-    else {
+    if !copy_captured_write_prefix(event, pending) {
+        let _ = SSSA_PENDING_WRITES.remove(&key);
         return;
-    };
+    }
     event.overwrite_socket_write_sampled_metadata(
         process_metadata(&ctx),
-        sample.metadata,
-        sample.flags,
+        pending_write_metadata(pending),
+        pending.flags,
     );
     let _ = SSSA_EVENTS.output(event, 0);
+    let _ = SSSA_PENDING_WRITES.remove(&key);
+}
+
+fn pending_write_scratch() -> Option<&'static mut EbpfPendingSocketWriteSample> {
+    let ptr = SSSA_PENDING_WRITE_SCRATCH.get_ptr_mut(0)?;
+    Some(unsafe { &mut *ptr })
 }
 
 fn scratch_event() -> Option<&'static mut EbpfSocketWriteSampleRecord> {
     let ptr = SSSA_PROCESS_EVENT_SCRATCH.get_ptr_mut(0)?;
     Some(unsafe { &mut *ptr })
+}
+
+fn copy_captured_write_prefix(
+    event: &mut EbpfSocketWriteSampleRecord,
+    pending: &EbpfPendingSocketWriteSample,
+) -> bool {
+    let captured_len = usize::from(pending.captured_len);
+    let Some(output) = event.socket_write_buffer_mut().get_mut(..captured_len) else {
+        return false;
+    };
+    let Some(input) = pending.buffer.get(..captured_len) else {
+        return false;
+    };
+    output.copy_from_slice(input);
+    true
 }
 
 fn process_metadata(ctx: &impl EbpfContext) -> EbpfProcessProbeMetadata {
@@ -252,6 +290,42 @@ fn current_tgid() -> u32 {
     (bpf_get_current_pid_tgid() >> 32) as u32
 }
 
+#[cfg(test)]
+mod tests {
+    use ebpf_abi::{EBPF_SOCKET_WRITE_SAMPLE_BYTES, EbpfSocketWriteSample};
+
+    use super::*;
+
+    #[test]
+    fn copy_captured_write_prefix_leaves_raw_record_tail_zeroed() {
+        let mut event = EbpfSocketWriteSampleRecord::socket_write_sampled(
+            1,
+            1,
+            0,
+            0,
+            [0; 16],
+            EbpfSocketWriteSample::new(0, 0, 0, [0x7f; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
+            0,
+        );
+        let mut pending = EbpfPendingSocketWriteSample {
+            fd: 7,
+            original_len: 3,
+            captured_len: 3,
+            flags: 0,
+            buffer: [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES],
+        };
+        pending.buffer[..5].copy_from_slice(b"GET /");
+
+        event.clear_sample();
+        assert!(copy_captured_write_prefix(&mut event, &pending));
+
+        let buffer = event.socket_write_buffer_mut();
+        assert_eq!(&buffer[..3], b"GET");
+        assert!(buffer[3..].iter().all(|byte| *byte == 0));
+    }
+}
+
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
     loop {}

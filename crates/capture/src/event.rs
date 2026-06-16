@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use probe_core::{CaptureSource, Direction, FlowContext, Gap, Timestamp};
+use probe_core::{CaptureSource, Direction, EnforcementEvidence, FlowContext, Gap, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::provider::CaptureProviderKind;
@@ -16,6 +16,8 @@ pub struct CapturedBytes {
     pub attribution_confidence: u8,
     pub degraded: bool,
     pub degradation_reason: Option<String>,
+    pub enforcement_evidence: EnforcementEvidence,
+    pub enforcement_evidence_propagation: EnforcementEvidencePropagation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,5 +45,20 @@ pub struct CapturedGap {
     pub flow: FlowContext,
     pub source: CaptureSource,
     pub provider: CaptureProviderKind,
+    pub enforcement_evidence: EnforcementEvidence,
+    pub enforcement_evidence_propagation: EnforcementEvidencePropagation,
     pub gap: Gap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementEvidencePropagation {
+    Event,
+    Flow,
+}
+
+impl EnforcementEvidencePropagation {
+    pub fn is_flow_carried(self) -> bool {
+        matches!(self, Self::Flow)
+    }
 }

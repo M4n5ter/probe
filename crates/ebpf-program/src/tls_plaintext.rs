@@ -1,5 +1,5 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 
 mod tls;
 
@@ -19,6 +19,7 @@ pub(crate) unsafe fn submit_tls_plaintext_event(event: *const EbpfTlsPlaintextEv
     entry.submit(0);
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
     loop {}

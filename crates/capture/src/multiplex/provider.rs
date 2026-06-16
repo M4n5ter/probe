@@ -375,6 +375,8 @@ mod tests {
             attribution_confidence: 100,
             degraded: false,
             degradation_reason: None,
+            enforcement_evidence: probe_core::EnforcementEvidence::default(),
+            enforcement_evidence_propagation: crate::EnforcementEvidencePropagation::Event,
         })
     }
 

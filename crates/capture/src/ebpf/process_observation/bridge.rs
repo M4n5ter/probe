@@ -1,11 +1,13 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use probe_core::{
-    AddressPort, CaptureSource, Direction, FlowContext, FlowIdentity, Gap, ProcessContext,
-    ProcessIdentity, TcpConnection, TcpEndpoint, Timestamp, TransportProtocol,
+    AddressPort, CaptureSource, Direction, EnforcementEvidence, FlowContext, FlowIdentity, Gap,
+    ProcessContext, ProcessIdentity, TcpConnection, TcpEndpoint, Timestamp, TransportProtocol,
 };
 
-use crate::{CaptureError, CaptureEvent, CaptureProviderKind, CapturedGap};
+use crate::{
+    CaptureError, CaptureEvent, CaptureProviderKind, CapturedGap, EnforcementEvidencePropagation,
+};
 
 use super::{EbpfConnectTracepointObservation, EbpfObservedProcess};
 
@@ -64,11 +66,17 @@ pub(crate) fn unresolved_connect_gap_from_observation(
         .unwrap_or_else(unknown_tcp_endpoint);
     let local = unknown_local_endpoint_for_remote(remote);
     let flow = flow_from_unresolved_connect(process, local, remote, timestamp.monotonic_ns);
+    let evidence = EnforcementEvidence::observation_only_with_detail(
+        probe_core::ObservationOnlyReason::EbpfUnresolvedFlow,
+        reason.clone(),
+    );
     CaptureEvent::Gap(CapturedGap {
         timestamp,
         flow,
         source: CaptureSource::EbpfSyscall,
         provider: CaptureProviderKind::Ebpf,
+        enforcement_evidence: evidence,
+        enforcement_evidence_propagation: EnforcementEvidencePropagation::Event,
         gap: Gap {
             direction: Direction::Outbound,
             expected_offset: 0,

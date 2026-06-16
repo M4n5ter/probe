@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use probe_core::{CaptureSource, Direction, FlowContext, Gap, Timestamp};
+use probe_core::{CaptureSource, Direction, EnforcementEvidence, FlowContext, Gap, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{CaptureEvent, CaptureProviderKind, CapturedBytes, CapturedGap};
@@ -146,12 +146,16 @@ impl From<PlaintextEvent> for CaptureEvent {
                 attribution_confidence: chunk.attribution_confidence,
                 degraded: chunk.degraded,
                 degradation_reason: chunk.degradation_reason,
+                enforcement_evidence: EnforcementEvidence::default(),
+                enforcement_evidence_propagation: crate::EnforcementEvidencePropagation::Event,
             }),
             PlaintextEventKind::Gap(gap) => CaptureEvent::Gap(CapturedGap {
                 timestamp: gap.timestamp,
                 flow: gap.flow,
                 source,
                 provider: CaptureProviderKind::Plaintext,
+                enforcement_evidence: EnforcementEvidence::default(),
+                enforcement_evidence_propagation: crate::EnforcementEvidencePropagation::Event,
                 gap: gap.gap,
             }),
             PlaintextEventKind::ConnectionOpened(connection) => CaptureEvent::ConnectionOpened {

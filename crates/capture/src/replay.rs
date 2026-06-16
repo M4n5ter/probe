@@ -1,10 +1,11 @@
 use bytes::Bytes;
 use probe_core::{
-    CapabilityKind, CapabilityState, CaptureSource, Direction, FlowContext, Timestamp,
+    CapabilityKind, CapabilityState, CaptureSource, Direction, EnforcementEvidence, FlowContext,
+    Timestamp,
 };
 
 use crate::{
-    CapturedBytes,
+    CapturedBytes, EnforcementEvidencePropagation,
     event::CaptureEvent,
     provider::{CaptureError, CapturePoll, CaptureProvider, CaptureProviderKind},
 };
@@ -60,6 +61,8 @@ impl CaptureProvider for ReplayProvider {
             attribution_confidence: self.flow.attribution_confidence,
             degraded: false,
             degradation_reason: None,
+            enforcement_evidence: EnforcementEvidence::default(),
+            enforcement_evidence_propagation: EnforcementEvidencePropagation::Event,
         })))
     }
 }

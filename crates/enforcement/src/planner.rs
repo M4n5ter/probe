@@ -181,6 +181,18 @@ impl ScopedEnforcementPlanner {
                 ),
             ),
             EnforcementExecution::Enforce(backend) => {
+                if let Some(reason) =
+                    destructive_enforcement_evidence_rejection_reason(request.trigger)
+                {
+                    return (
+                        EnforcementOutcome::Unsupported,
+                        Action::Observe,
+                        format!(
+                            "policy requested {:?}, but trigger evidence cannot safely drive destructive enforcement: {reason}: {}",
+                            verdict.action, verdict.reason
+                        ),
+                    );
+                }
                 match backend.apply(EnforcementBackendRequest {
                     verdict,
                     trigger: request.trigger,
@@ -262,12 +274,22 @@ fn failed_decision_parts(
     )
 }
 
+fn destructive_enforcement_evidence_rejection_reason(
+    trigger: &EventEnvelope,
+) -> Option<std::borrow::Cow<'_, str>> {
+    trigger
+        .enforcement_evidence
+        .destructive_enforcement_rejection_reason()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use probe_core::{
-        AddressPort, CaptureSource, Direction, EventKind, FlowContext, FlowIdentity, HttpHeaders,
-        ProcessContext, ProcessIdentity, ProcessSelector, Selector, Timestamp, TrafficSelector,
-        TransportProtocol, VerdictScope,
+        AddressPort, CaptureSource, Direction, EnforcementEvidence, EventKind, FlowContext,
+        FlowIdentity, HttpHeaders, ObservationOnlyReason, ProcessContext, ProcessIdentity,
+        ProcessSelector, Selector, Timestamp, TrafficSelector, TransportProtocol, VerdictScope,
     };
 
     use crate::EnforcementBackendDecision;
@@ -474,6 +496,49 @@ mod tests {
     }
 
     #[test]
+    fn enforce_mode_rejects_observation_only_evidence_before_backend()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let backend = CountingBackend::default();
+        let mut planner = ScopedEnforcementPlanner::with_backend(
+            None,
+            ProtectiveActionProfile::default(),
+            backend.clone(),
+        )?;
+        let trigger = request_event(Direction::Outbound)
+            .with_degraded(true)
+            .with_enforcement_evidence(EnforcementEvidence::observation_only_with_detail(
+                ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+                "test eBPF syscall argument snapshot",
+            ));
+        let verdict = Verdict {
+            action: Action::Reset,
+            scope: VerdictScope::Flow,
+            reason: "reset flow".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+
+        let decision = planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("protective verdict should produce unsupported audit");
+
+        assert_eq!(decision.outcome, EnforcementOutcome::Unsupported);
+        assert_eq!(decision.requested_action, Action::Reset);
+        assert_eq!(decision.effective_action, Action::Observe);
+        assert!(decision.reason.contains("cannot prove bytes copied"));
+        assert!(
+            decision
+                .reason
+                .contains("test eBPF syscall argument snapshot")
+        );
+        assert_eq!(backend.calls(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn enforce_mode_can_record_setup_time_only_surface() -> Result<(), Box<dyn std::error::Error>> {
         let mut planner = ScopedEnforcementPlanner::with_setup_time_execution(
             None,
@@ -575,6 +640,30 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct CountingBackend {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl CountingBackend {
+        fn calls(&self) -> usize {
+            *self.calls.lock().expect("fake backend state poisoned")
+        }
+    }
+
+    impl EnforcementBackend for CountingBackend {
+        fn apply(
+            &mut self,
+            request: EnforcementBackendRequest<'_>,
+        ) -> Result<EnforcementBackendDecision, EnforcementError> {
+            *self.calls.lock().expect("fake backend state poisoned") += 1;
+            Ok(EnforcementBackendDecision::applied(format!(
+                "backend applied {:?}",
+                request.verdict.action
+            )))
+        }
+    }
+
     struct FailingBackend;
 
     impl EnforcementBackend for FailingBackend {
@@ -589,13 +678,17 @@ mod tests {
     }
 
     fn request_event(direction: Direction) -> EventEnvelope {
+        request_event_from_source(direction, CaptureSource::Replay)
+    }
+
+    fn request_event_from_source(direction: Direction, source: CaptureSource) -> EventEnvelope {
         EventEnvelope::new(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
             demo_flow(),
-            CaptureSource::Replay,
+            source,
             "test",
             EventKind::HttpRequestHeaders(HttpHeaders {
                 direction,

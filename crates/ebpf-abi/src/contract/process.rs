@@ -1,7 +1,9 @@
 use core::fmt;
 
 use super::common::{EBPF_EVENTS_MAP_NAME, EbpfMapKind, EbpfMapSpec};
-use crate::event::{EBPF_RING_BUFFER_BYTES, EbpfSocketWriteSampleRecord};
+use crate::event::{
+    EBPF_RING_BUFFER_BYTES, EBPF_SOCKET_WRITE_SAMPLE_BYTES, EbpfSocketWriteSampleRecord,
+};
 
 pub const EBPF_CONNECT_PROGRAM_NAME: &str = "sssa_sys_enter_connect";
 pub const EBPF_CONNECT_TRACEPOINT_CATEGORY: &str = "syscalls";
@@ -44,7 +46,13 @@ pub const EBPF_FD_TABLE_EPOCH_VALUE_BYTES: u32 = core::mem::size_of::<u64>() as 
 pub const EBPF_PENDING_WRITES_MAP_NAME: &str = "SSSA_PENDING_WRITES";
 pub const EBPF_PENDING_WRITES_MAX_ENTRIES: u32 = 8192;
 pub const EBPF_PENDING_WRITE_KEY_BYTES: u32 = core::mem::size_of::<u64>() as u32;
-pub const EBPF_PENDING_WRITE_VALUE_BYTES: u32 = core::mem::size_of::<EbpfPendingWrite>() as u32;
+pub const EBPF_PENDING_WRITE_VALUE_BYTES: u32 =
+    core::mem::size_of::<EbpfPendingSocketWriteSample>() as u32;
+pub const EBPF_PENDING_WRITE_SCRATCH_MAP_NAME: &str = "SSSA_PENDING_WRITE_SCRATCH";
+pub const EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES: u32 = 1;
+pub const EBPF_PENDING_WRITE_SCRATCH_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
+pub const EBPF_PENDING_WRITE_SCRATCH_VALUE_BYTES: u32 =
+    core::mem::size_of::<EbpfPendingSocketWriteSample>() as u32;
 pub const EBPF_PROCESS_EVENT_SCRATCH_MAP_NAME: &str = "SSSA_PROCESS_EVENT_SCRATCH";
 pub const EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES: u32 = 1;
 pub const EBPF_PROCESS_EVENT_SCRATCH_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
@@ -114,7 +122,7 @@ pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 10] = [
     },
 ];
 
-pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 5] = [
+pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 6] = [
     EbpfMapSpec {
         name: EBPF_EVENTS_MAP_NAME,
         kind: EbpfMapKind::Ringbuf,
@@ -145,6 +153,14 @@ pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 5] = [
         key_size: EBPF_PENDING_WRITE_KEY_BYTES,
         value_size: EBPF_PENDING_WRITE_VALUE_BYTES,
         max_entries: EBPF_PENDING_WRITES_MAX_ENTRIES,
+        map_flags: 0,
+    },
+    EbpfMapSpec {
+        name: EBPF_PENDING_WRITE_SCRATCH_MAP_NAME,
+        kind: EbpfMapKind::PerCpuArray,
+        key_size: EBPF_PENDING_WRITE_SCRATCH_KEY_BYTES,
+        value_size: EBPF_PENDING_WRITE_SCRATCH_VALUE_BYTES,
+        max_entries: EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES,
         map_flags: 0,
     },
     EbpfMapSpec {
@@ -234,33 +250,24 @@ impl EbpfSocketFdKey {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EbpfPendingWrite {
+pub struct EbpfPendingSocketWriteSample {
     pub fd: i32,
-    pub reserved: u32,
-    pub user_buffer: u64,
-    pub requested_len: u64,
-}
-
-impl EbpfPendingWrite {
-    pub const fn new(fd: i32, user_buffer: u64, requested_len: u64) -> Self {
-        Self {
-            fd,
-            reserved: 0,
-            user_buffer,
-            requested_len,
-        }
-    }
+    pub original_len: u32,
+    pub captured_len: u16,
+    pub flags: u16,
+    pub buffer: [u8; EBPF_SOCKET_WRITE_SAMPLE_BYTES],
 }
 
 #[cfg(test)]
 mod tests {
+    use core::mem::{align_of, offset_of, size_of};
     use std::{collections::BTreeSet, string::ToString};
 
     use super::*;
 
     #[test]
     fn process_map_specs_are_unique_and_layout_complete() {
-        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 5);
+        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 6);
         assert_unique(EBPF_PROCESS_MAP_SPECS.map(|spec| spec.name));
 
         let allow_map = process_map(EBPF_ALLOWED_SOCKET_FDS_MAP_NAME);
@@ -272,6 +279,20 @@ mod tests {
         assert_eq!(epoch_map.kind, EbpfMapKind::Hash);
         assert_eq!(epoch_map.key_size, EBPF_FD_TABLE_EPOCH_KEY_BYTES);
         assert_eq!(epoch_map.value_size, EBPF_FD_TABLE_EPOCH_VALUE_BYTES);
+
+        let pending_map = process_map(EBPF_PENDING_WRITES_MAP_NAME);
+        assert_eq!(pending_map.kind, EbpfMapKind::Hash);
+        assert_eq!(
+            pending_map.value_size,
+            size_of::<EbpfPendingSocketWriteSample>() as u32
+        );
+
+        let pending_scratch = process_map(EBPF_PENDING_WRITE_SCRATCH_MAP_NAME);
+        assert_eq!(pending_scratch.kind, EbpfMapKind::PerCpuArray);
+        assert_eq!(
+            pending_scratch.value_size,
+            size_of::<EbpfPendingSocketWriteSample>() as u32
+        );
 
         assert_eq!(
             EbpfSocketFdKey::new(0x0102_0304, -2).to_bpfel_bytes(),
@@ -292,6 +313,17 @@ mod tests {
                 std::format!("tracepoint/{}/{}", spec.category, spec.tracepoint_name)
             );
         }
+    }
+
+    #[test]
+    fn pending_socket_write_sample_layout_is_stable() {
+        assert_eq!(size_of::<EbpfPendingSocketWriteSample>(), 268);
+        assert_eq!(align_of::<EbpfPendingSocketWriteSample>(), 4);
+        assert_eq!(offset_of!(EbpfPendingSocketWriteSample, fd), 0);
+        assert_eq!(offset_of!(EbpfPendingSocketWriteSample, original_len), 4);
+        assert_eq!(offset_of!(EbpfPendingSocketWriteSample, captured_len), 8);
+        assert_eq!(offset_of!(EbpfPendingSocketWriteSample, flags), 10);
+        assert_eq!(offset_of!(EbpfPendingSocketWriteSample, buffer), 12);
     }
 
     fn process_map(name: &'static str) -> EbpfMapSpec {

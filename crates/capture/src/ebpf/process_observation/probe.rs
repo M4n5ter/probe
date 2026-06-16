@@ -441,6 +441,34 @@ mod tests {
     }
 
     #[test]
+    fn process_observation_decodes_empty_truncated_socket_write_sample()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let event = EbpfProcessProbeEvent::socket_write_sampled(
+            11,
+            22,
+            33,
+            44,
+            nul_padded_command("curl"),
+            EbpfSocketWriteSample::new(7, 10, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
+            EBPF_SOCKET_WRITE_TRUNCATED,
+        );
+
+        let observation =
+            decode_process_observation(&ebpf_abi::encode_process_probe_event(&event))?;
+        match observation {
+            EbpfProcessObservation::Write(write) => {
+                assert_eq!(write.fd, 7);
+                assert_eq!(write.original_len, 10);
+                assert!(write.buffer.is_empty());
+                assert!(write.truncated);
+                assert!(!write.read_failed);
+            }
+            observation => panic!("unexpected observation: {observation:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn process_observation_normalizes_ipv4_mapped_ipv6_remote_endpoint()
     -> Result<(), Box<dyn std::error::Error>> {
         let event = EbpfProcessProbeEvent::connect_tracepoint_observed(

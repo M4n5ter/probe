@@ -11,10 +11,10 @@ pub use capability::{
     CapabilityKind, CapabilityMatrix, CapabilityRequirement, CapabilityState, RuntimeMode,
 };
 pub use event::{
-    BodyChunk, CaptureSource, Direction, DomainEvent, EventEmission, EventEnvelope, EventId,
-    EventKind, EventProvenance, EventType, Gap, HttpHeaders, OpaqueStream, PolicyEmissionStage,
-    PolicyRuntimeError, ProtocolError, SseEvent, Timestamp, UnknownEventType, WebSocketFrame,
-    WebSocketHandoff, WebSocketOpcode,
+    BodyChunk, CaptureSource, Direction, DomainEvent, EnforcementEvidence, EventEmission,
+    EventEnvelope, EventId, EventKind, EventProvenance, EventType, Gap, HttpHeaders,
+    ObservationOnlyReason, OpaqueStream, PolicyEmissionStage, PolicyRuntimeError, ProtocolError,
+    SseEvent, Timestamp, UnknownEventType, WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
 };
 pub use identity::{
     AddressPort, FlowContext, FlowIdentity, ProcessContext, ProcessGeneration, ProcessIdentity,

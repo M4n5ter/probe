@@ -5,7 +5,9 @@ use pipeline::{
     PipelineRuntimeMetrics, PipelineSummary,
 };
 use policy::{PolicyHook, PolicyManifest, PolicyRuntime};
-use probe_core::{CaptureSource, Direction, EventKind, Gap, SpoolPayloadSchema, Timestamp};
+use probe_core::{
+    CaptureSource, Direction, EnforcementEvidence, EventKind, Gap, SpoolPayloadSchema, Timestamp,
+};
 use storage::SpoolPayload;
 use tempfile::tempdir;
 
@@ -357,6 +359,8 @@ fn captured_gap(
         flow,
         source: CaptureSource::Replay,
         provider: capture::CaptureProviderKind::Replay,
+        enforcement_evidence: EnforcementEvidence::default(),
+        enforcement_evidence_propagation: capture::EnforcementEvidencePropagation::Event,
         gap: Gap {
             direction,
             expected_offset,

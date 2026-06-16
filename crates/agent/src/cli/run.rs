@@ -705,6 +705,8 @@ protective_actions = ["alert"]
             attribution_confidence: 0,
             degraded: false,
             degradation_reason: None,
+            enforcement_evidence: probe_core::EnforcementEvidence::default(),
+            enforcement_evidence_propagation: capture::EnforcementEvidencePropagation::Event,
         };
         spool.append_ingress(SpoolPayload::new(
             SpoolPayloadSchema::CaptureEventJson,

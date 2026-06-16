@@ -15,7 +15,7 @@ pub use ebpf::{
     EbpfProcessObservationProvider, EbpfResolvedConnectFlow, EbpfSocketWriteObservation,
     UnprivilegedBpfStatus,
 };
-pub use event::{CaptureEvent, CapturedBytes, CapturedGap};
+pub use event::{CaptureEvent, CapturedBytes, CapturedGap, EnforcementEvidencePropagation};
 pub use libpcap::{LibpcapConfig, LibpcapProvider};
 pub use multiplex::{CaptureMultiplexer, MultiplexedProvider};
 pub use plaintext::{

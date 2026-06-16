@@ -1,9 +1,16 @@
 use bytes::Bytes;
-use probe_core::{CaptureSource, Direction, FlowContext, Gap, Timestamp};
+use probe_core::{
+    CaptureSource, Direction, EnforcementEvidence, FlowContext, Gap, ObservationOnlyReason,
+    Timestamp,
+};
 
-use crate::{CaptureEvent, CaptureProviderKind, CapturedBytes, CapturedGap};
+use crate::{
+    CaptureEvent, CaptureProviderKind, CapturedBytes, CapturedGap, EnforcementEvidencePropagation,
+};
 
 use super::{EbpfSocketWriteObservation, tracked_flow::TrackedEbpfFlows};
+
+const EBPF_WRITE_ARGUMENT_SAMPLE_REASON: &str = "eBPF write sample is a syscall argument snapshot captured before the kernel copies bytes; contents are best-effort and may differ from bytes actually sent";
 
 pub(super) fn write_events(
     tracked_flows: &mut TrackedEbpfFlows,
@@ -22,13 +29,14 @@ pub(super) fn write_events(
             tracked.flow.clone(),
             start,
             Some(end),
-            "eBPF write sample could not read userspace payload buffer".to_string(),
+            "eBPF write argument sample could not read userspace payload buffer".to_string(),
         )];
     }
     let captured_bytes = write.buffer.as_slice();
     let captured_len = captured_bytes.len() as u64;
     let mut events = Vec::new();
     if !captured_bytes.is_empty() {
+        let degradation_reason = write_degradation_reason(write, captured_len);
         events.push(CaptureEvent::Bytes(CapturedBytes {
             timestamp,
             flow: tracked.flow.clone(),
@@ -38,13 +46,13 @@ pub(super) fn write_events(
             stream_offset: start,
             bytes: Bytes::copy_from_slice(captured_bytes),
             attribution_confidence: tracked.flow.attribution_confidence,
-            degraded: write.truncated,
-            degradation_reason: write.truncated.then(|| {
-                format!(
-                    "eBPF write sample truncated payload: captured {} of {} byte(s)",
-                    captured_len, write.original_len
-                )
-            }),
+            degraded: true,
+            degradation_reason: Some(degradation_reason.clone()),
+            enforcement_evidence: EnforcementEvidence::observation_only_with_detail(
+                ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+                degradation_reason,
+            ),
+            enforcement_evidence_propagation: EnforcementEvidencePropagation::Flow,
         }));
     }
     if write.truncated && captured_len < u64::from(write.original_len) {
@@ -79,11 +87,17 @@ fn ebpf_write_gap(
     next_offset: Option<u64>,
     reason: String,
 ) -> CaptureEvent {
+    let enforcement_evidence = EnforcementEvidence::observation_only_with_detail(
+        ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+        reason.clone(),
+    );
     CaptureEvent::Gap(CapturedGap {
         timestamp,
         flow,
         source: CaptureSource::EbpfSyscall,
         provider: CaptureProviderKind::Ebpf,
+        enforcement_evidence,
+        enforcement_evidence_propagation: EnforcementEvidencePropagation::Flow,
         gap: Gap {
             direction: Direction::Outbound,
             expected_offset,
@@ -91,6 +105,16 @@ fn ebpf_write_gap(
             reason,
         },
     })
+}
+
+fn write_degradation_reason(write: &EbpfSocketWriteObservation, captured_len: u64) -> String {
+    if write.truncated {
+        return format!(
+            "{EBPF_WRITE_ARGUMENT_SAMPLE_REASON}; truncated payload: captured {} of {} byte(s)",
+            captured_len, write.original_len
+        );
+    }
+    EBPF_WRITE_ARGUMENT_SAMPLE_REASON.to_string()
 }
 
 #[cfg(test)]
@@ -125,8 +149,19 @@ mod tests {
         assert_eq!(bytes.stream_offset, 0);
         assert_eq!(bytes.bytes.as_ref(), b"GET /");
         assert_eq!(bytes.attribution_confidence, 90);
-        assert!(!bytes.degraded);
-        assert!(bytes.degradation_reason.is_none());
+        assert!(bytes.degraded);
+        assert!(
+            bytes
+                .degradation_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("syscall argument snapshot"))
+        );
+        assert!(
+            bytes
+                .enforcement_evidence
+                .destructive_enforcement_rejection_reason()
+                .is_some_and(|reason| reason.contains("syscall argument snapshot"))
+        );
     }
 
     #[test]
@@ -148,6 +183,12 @@ mod tests {
             bytes
                 .degradation_reason
                 .as_deref()
+                .is_some_and(|reason| reason.contains("captured 5 of 10"))
+        );
+        assert!(
+            bytes
+                .enforcement_evidence
+                .destructive_enforcement_rejection_reason()
                 .is_some_and(|reason| reason.contains("captured 5 of 10"))
         );
         assert_eq!(gap.gap.direction, Direction::Outbound);
@@ -175,6 +216,24 @@ mod tests {
         assert_eq!(gap.gap.expected_offset, 0);
         assert_eq!(gap.gap.next_offset, Some(5));
         assert!(gap.gap.reason.contains("could not read"));
+    }
+
+    #[test]
+    fn write_bridge_emits_gap_for_truncated_empty_payload() {
+        let mut tracked = tracked_flow(7);
+        let events = write_events(
+            &mut tracked,
+            &write_observation(7, 5, b"", true, false),
+            timestamp(1),
+        );
+
+        let [CaptureEvent::Gap(gap)] = events.as_slice() else {
+            panic!("expected a single gap event: {events:?}");
+        };
+        assert_eq!(gap.gap.direction, Direction::Outbound);
+        assert_eq!(gap.gap.expected_offset, 0);
+        assert_eq!(gap.gap.next_offset, Some(5));
+        assert!(gap.gap.reason.contains("truncated payload"));
     }
 
     #[test]

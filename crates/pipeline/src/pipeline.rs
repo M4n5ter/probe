@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -7,13 +8,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use capture::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CapturedBytes};
+use capture::{
+    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CapturedBytes,
+    EnforcementEvidencePropagation,
+};
 use enforcement::{EnforcementPlanRequest, EnforcementPlanner};
 use parsers::{ParserInput, ProtocolParserFactory};
 use policy::{PolicyHook, PolicyOutcome, PolicyRuntime, hook_for_event};
 use probe_core::{
-    CompiledSelector, EnforcementDecision, EventEnvelope, EventKind, EventProvenance,
-    PolicyEmissionStage, PolicyRuntimeError, SpoolPayloadSchema, Timestamp, Verdict,
+    CompiledSelector, EnforcementDecision, EnforcementEvidence, EventEnvelope, EventKind,
+    EventProvenance, FlowIdentity, PolicyEmissionStage, PolicyRuntimeError, SpoolPayloadSchema,
+    Timestamp, Verdict,
 };
 use storage::{AppendOutcome, DurableSpool, IngressCursorOwner, SpoolPayload};
 use thiserror::Error;
@@ -109,6 +114,58 @@ pub struct CapturePipeline<'a, S> {
     clock: PipelineClock,
     last_processed_ingress_sequence: Option<u64>,
     runtime_metrics: Option<PipelineRuntimeMetrics>,
+    flow_enforcement_evidence: FlowEvidenceTracker,
+}
+
+#[derive(Debug, Default)]
+struct FlowEvidenceTracker {
+    checkpoint_blockers: HashMap<FlowIdentity, EnforcementEvidence>,
+}
+
+impl FlowEvidenceTracker {
+    fn effective_for_event(
+        &mut self,
+        flow_id: &FlowIdentity,
+        evidence: &EnforcementEvidence,
+        propagation: EnforcementEvidencePropagation,
+    ) -> EnforcementEvidence {
+        if propagation.is_flow_carried()
+            && matches!(evidence, EnforcementEvidence::ObservationOnly { .. })
+        {
+            return self
+                .checkpoint_blockers
+                .entry(flow_id.clone())
+                .or_insert_with(|| evidence.clone())
+                .clone();
+        }
+        strongest_enforcement_evidence(self.current(flow_id), evidence)
+    }
+
+    fn current(&self, flow_id: &FlowIdentity) -> EnforcementEvidence {
+        self.checkpoint_blockers
+            .get(flow_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn release(&mut self, flow_id: &FlowIdentity) {
+        self.checkpoint_blockers.remove(flow_id);
+    }
+
+    fn is_checkpoint_safe(&self) -> bool {
+        self.checkpoint_blockers.is_empty()
+    }
+}
+
+fn strongest_enforcement_evidence(
+    current: EnforcementEvidence,
+    incoming: &EnforcementEvidence,
+) -> EnforcementEvidence {
+    if matches!(current, EnforcementEvidence::ObservationOnly { .. }) {
+        current
+    } else {
+        incoming.clone()
+    }
 }
 
 #[derive(Clone)]
@@ -195,6 +252,7 @@ where
             clock: PipelineClock::default(),
             last_processed_ingress_sequence: None,
             runtime_metrics: None,
+            flow_enforcement_evidence: FlowEvidenceTracker::default(),
         }
     }
 
@@ -313,6 +371,11 @@ where
                 self.process_captured_bytes(chunk, summary, &mut emissions)?;
             }
             CaptureEvent::Gap(gap) => {
+                let enforcement_evidence = self.flow_enforcement_evidence.effective_for_event(
+                    &gap.flow.id,
+                    &gap.enforcement_evidence,
+                    gap.enforcement_evidence_propagation,
+                );
                 let parser_events = self
                     .parser_factory
                     .parser_for_flow(&gap.flow.id)
@@ -330,7 +393,8 @@ where
                         gap.source,
                         self.config_version.clone(),
                         event,
-                    );
+                    )
+                    .with_enforcement_evidence(enforcement_evidence.clone());
                     let written =
                         self.append_envelope_and_policy_outcomes(envelope, &mut emissions)?;
                     add_export_events_to_summary(summary, written);
@@ -359,6 +423,7 @@ where
                 ..
             } => {
                 let flow_id = flow.id.clone();
+                let enforcement_evidence = self.current_flow_enforcement_evidence(&flow_id);
                 let parser_events = self
                     .parser_factory
                     .parser_for_flow(&flow_id)
@@ -371,7 +436,8 @@ where
                         source,
                         self.config_version.clone(),
                         event,
-                    );
+                    )
+                    .with_enforcement_evidence(enforcement_evidence.clone());
                     let written =
                         self.append_envelope_and_policy_outcomes(envelope, &mut emissions)?;
                     add_export_events_to_summary(summary, written);
@@ -382,10 +448,12 @@ where
                     source,
                     self.config_version.clone(),
                     EventKind::ConnectionClosed,
-                );
+                )
+                .with_enforcement_evidence(enforcement_evidence);
                 let written = self.append_envelope_and_policy_outcomes(envelope, &mut emissions)?;
                 add_export_events_to_summary(summary, written);
                 self.parser_factory.remove_flow(&flow_id);
+                self.flow_enforcement_evidence.release(&flow_id);
             }
         }
         summary.ingress_records_processed = summary.ingress_records_processed.saturating_add(1);
@@ -403,6 +471,11 @@ where
         summary: &mut PipelineSummary,
         emissions: &mut IngressEmissions,
     ) -> Result<(), PipelineError> {
+        let enforcement_evidence = self.flow_enforcement_evidence.effective_for_event(
+            &chunk.flow.id,
+            &chunk.enforcement_evidence,
+            chunk.enforcement_evidence_propagation,
+        );
         let events = self
             .parser_factory
             .parser_for_flow(&chunk.flow.id)
@@ -420,11 +493,16 @@ where
                 self.config_version.clone(),
                 event,
             )
-            .with_degraded(chunk.degraded);
+            .with_degraded(chunk.degraded)
+            .with_enforcement_evidence(enforcement_evidence.clone());
             let written = self.append_envelope_and_policy_outcomes(envelope, emissions)?;
             add_export_events_to_summary(summary, written);
         }
         Ok(())
+    }
+
+    fn current_flow_enforcement_evidence(&self, flow_id: &FlowIdentity) -> EnforcementEvidence {
+        self.flow_enforcement_evidence.current(flow_id)
     }
 
     fn append_capture_event(&self, capture_event: &CaptureEvent) -> Result<u64, PipelineError> {
@@ -439,6 +517,7 @@ where
     fn ack_parser_checkpoint_if_safe(&self) -> Result<(), PipelineError> {
         if let Some(sequence) = self.last_processed_ingress_sequence
             && self.parser_factory.is_checkpoint_safe()
+            && self.flow_enforcement_evidence.is_checkpoint_safe()
         {
             self.spool
                 .ack_ingress(PARSER_INGRESS_CURSOR_OWNER, sequence)?;
@@ -620,6 +699,7 @@ where
         )
         .with_policy_version(policy_version)
         .with_degraded(envelope.degraded)
+        .with_enforcement_evidence(envelope.enforcement_evidence.clone())
         .with_provenance(EventProvenance::policy(
             trigger_provenance,
             policy_index,

@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr};
+use std::{borrow::Cow, fmt, str::FromStr};
 
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -61,7 +61,84 @@ pub struct EventEnvelope {
     pub config_version: String,
     pub policy_version: Option<String>,
     pub degraded: bool,
+    pub enforcement_evidence: EnforcementEvidence,
     pub kind: EventKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EnforcementEvidence {
+    #[default]
+    DestructiveAllowed,
+    ObservationOnly {
+        reason: ObservationOnlyReason,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationOnlyReason {
+    EbpfSyscallArgumentSnapshot,
+    EbpfUnresolvedFlow,
+}
+
+impl EnforcementEvidence {
+    pub fn observation_only(reason: ObservationOnlyReason) -> Self {
+        Self::ObservationOnly {
+            reason,
+            detail: None,
+        }
+    }
+
+    pub fn observation_only_with_detail(
+        reason: ObservationOnlyReason,
+        detail: impl Into<String>,
+    ) -> Self {
+        let detail = detail.into();
+        Self::ObservationOnly {
+            reason,
+            detail: (!detail.is_empty()).then_some(detail),
+        }
+    }
+
+    pub fn destructive_enforcement_rejection_reason(&self) -> Option<Cow<'_, str>> {
+        match self {
+            Self::DestructiveAllowed => None,
+            Self::ObservationOnly { reason, detail } => match detail {
+                Some(detail) => Some(Cow::Owned(format!("{}: {detail}", reason.description()))),
+                None => Some(Cow::Borrowed(reason.description())),
+            },
+        }
+    }
+
+    fn stable_identity_bytes(&self) -> &'static [u8] {
+        match self {
+            Self::DestructiveAllowed => b"destructive_allowed",
+            Self::ObservationOnly { reason, .. } => reason.wire_name().as_bytes(),
+        }
+    }
+}
+
+impl ObservationOnlyReason {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::EbpfSyscallArgumentSnapshot => {
+                "eBPF syscall argument snapshot cannot prove bytes copied by the kernel"
+            }
+            Self::EbpfUnresolvedFlow => {
+                "eBPF observation could not be resolved to a strong flow identity"
+            }
+        }
+    }
+
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::EbpfSyscallArgumentSnapshot => "ebpf_syscall_argument_snapshot",
+            Self::EbpfUnresolvedFlow => "ebpf_unresolved_flow",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -135,7 +212,17 @@ impl EventEnvelope {
     ) -> Self {
         let config_version = config_version.into();
         let degraded = kind.is_degraded();
-        let id = Self::stable_id(timestamp, &flow, source, None, &config_version, None, &kind);
+        let enforcement_evidence = EnforcementEvidence::default();
+        let id = Self::stable_id(EventIdentityParts {
+            timestamp,
+            flow: &flow,
+            source,
+            provenance: None,
+            config_version: &config_version,
+            policy_version: None,
+            enforcement_evidence: &enforcement_evidence,
+            kind: &kind,
+        });
         Self {
             id,
             timestamp,
@@ -145,6 +232,7 @@ impl EventEnvelope {
             config_version,
             policy_version: None,
             degraded,
+            enforcement_evidence,
             kind,
         }
     }
@@ -166,53 +254,66 @@ impl EventEnvelope {
         self
     }
 
-    fn recompute_id(&mut self) {
-        self.id = Self::stable_id(
-            self.timestamp,
-            &self.flow,
-            self.source,
-            self.provenance.as_ref(),
-            &self.config_version,
-            self.policy_version.as_deref(),
-            &self.kind,
-        );
+    pub fn with_enforcement_evidence(mut self, evidence: EnforcementEvidence) -> Self {
+        self.enforcement_evidence = evidence;
+        self.recompute_id();
+        self
     }
 
-    fn stable_id(
-        timestamp: Timestamp,
-        flow: &FlowContext,
-        source: CaptureSource,
-        provenance: Option<&EventProvenance>,
-        config_version: &str,
-        policy_version: Option<&str>,
-        kind: &EventKind,
-    ) -> EventId {
-        let source_fingerprint = format!("{source:?}");
-        let monotonic_ns = provenance
-            .map_or(timestamp.monotonic_ns, |_| 0)
+    fn recompute_id(&mut self) {
+        self.id = Self::stable_id(EventIdentityParts {
+            timestamp: self.timestamp,
+            flow: &self.flow,
+            source: self.source,
+            provenance: self.provenance.as_ref(),
+            config_version: &self.config_version,
+            policy_version: self.policy_version.as_deref(),
+            enforcement_evidence: &self.enforcement_evidence,
+            kind: &self.kind,
+        });
+    }
+
+    fn stable_id(parts: EventIdentityParts<'_>) -> EventId {
+        let source_fingerprint = format!("{:?}", parts.source);
+        let monotonic_ns = parts
+            .provenance
+            .map_or(parts.timestamp.monotonic_ns, |_| 0)
             .to_be_bytes();
-        let provenance_fingerprint = provenance
+        let provenance_fingerprint = parts
+            .provenance
             .map(|value| serde_json::to_vec(value).unwrap_or_else(|_| format!("{value:?}").into()))
             .unwrap_or_default();
-        let identity_mode = if provenance.is_some() {
+        let identity_mode = if parts.provenance.is_some() {
             b"ingress_provenance".as_slice()
         } else {
             b"timestamp".as_slice()
         };
-        let kind_fingerprint =
-            serde_json::to_vec(kind).unwrap_or_else(|_| format!("{kind:?}").into_bytes());
+        let kind_fingerprint = serde_json::to_vec(parts.kind)
+            .unwrap_or_else(|_| format!("{:?}", parts.kind).into_bytes());
         EventId::stable([
-            flow.id.0.as_bytes(),
-            config_version.as_bytes(),
-            policy_version.unwrap_or_default().as_bytes(),
+            parts.flow.id.0.as_bytes(),
+            parts.config_version.as_bytes(),
+            parts.policy_version.unwrap_or_default().as_bytes(),
             source_fingerprint.as_bytes(),
-            kind.event_type().as_str().as_bytes(),
+            parts.kind.event_type().as_str().as_bytes(),
             identity_mode,
             monotonic_ns.as_slice(),
             provenance_fingerprint.as_slice(),
+            parts.enforcement_evidence.stable_identity_bytes(),
             kind_fingerprint.as_slice(),
         ])
     }
+}
+
+struct EventIdentityParts<'a> {
+    timestamp: Timestamp,
+    flow: &'a FlowContext,
+    source: CaptureSource,
+    provenance: Option<&'a EventProvenance>,
+    config_version: &'a str,
+    policy_version: Option<&'a str>,
+    enforcement_evidence: &'a EnforcementEvidence,
+    kind: &'a EventKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -494,10 +595,11 @@ pub struct PolicyRuntimeError {
 mod tests {
     use crate::{
         Action, AddressPort, CaptureSource, Direction, DomainEvent, EnforcementDecision,
-        EnforcementMode, EnforcementOutcome, EventEnvelope, EventKind, EventProvenance, EventType,
-        FlowContext, FlowIdentity, Gap, HttpHeaders, OpaqueStream, PolicyRuntimeError,
-        ProcessContext, ProcessIdentity, ProtocolError, SseEvent, Timestamp, TransportProtocol,
-        Verdict, VerdictScope, WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
+        EnforcementEvidence, EnforcementMode, EnforcementOutcome, EventEnvelope, EventKind,
+        EventProvenance, EventType, FlowContext, FlowIdentity, Gap, HttpHeaders,
+        ObservationOnlyReason, OpaqueStream, PolicyRuntimeError, ProcessContext, ProcessIdentity,
+        ProtocolError, SseEvent, Timestamp, TransportProtocol, Verdict, VerdictScope,
+        WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
     };
 
     #[test]
@@ -522,6 +624,40 @@ mod tests {
         let second = request_event(CaptureSource::Replay, "/same").with_policy_version("policy@2");
 
         assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn event_id_changes_when_enforcement_evidence_changes() {
+        let first = request_event(CaptureSource::Replay, "/same");
+        let second = request_event(CaptureSource::Replay, "/same").with_enforcement_evidence(
+            EnforcementEvidence::observation_only(
+                ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+            ),
+        );
+
+        assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn event_id_uses_stable_enforcement_evidence_reason_not_detail() {
+        let first = request_event(CaptureSource::Replay, "/same").with_enforcement_evidence(
+            EnforcementEvidence::observation_only_with_detail(
+                ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+                "first detail",
+            ),
+        );
+        let second = request_event(CaptureSource::Replay, "/same").with_enforcement_evidence(
+            EnforcementEvidence::observation_only_with_detail(
+                ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+                "second detail",
+            ),
+        );
+        let third = request_event(CaptureSource::Replay, "/same").with_enforcement_evidence(
+            EnforcementEvidence::observation_only(ObservationOnlyReason::EbpfUnresolvedFlow),
+        );
+
+        assert_eq!(first.id, second.id);
+        assert_ne!(first.id, third.id);
     }
 
     #[test]
@@ -552,6 +688,36 @@ mod tests {
         assert!(!CaptureSource::ExternalPlaintextFeed.is_live_host_observation());
         assert!(!CaptureSource::Replay.is_live_host_observation());
         assert!(!CaptureSource::Mock.is_live_host_observation());
+    }
+
+    #[test]
+    fn event_envelope_defaults_to_destructive_allowed_evidence() {
+        let event = request_event(CaptureSource::Replay, "/same");
+
+        assert_eq!(
+            event.enforcement_evidence,
+            EnforcementEvidence::DestructiveAllowed
+        );
+        assert!(
+            event
+                .enforcement_evidence
+                .destructive_enforcement_rejection_reason()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn event_envelope_rejects_missing_enforcement_evidence() {
+        let mut value = serde_json::to_value(request_event(CaptureSource::Replay, "/same"))
+            .expect("event envelope must serialize");
+        value
+            .as_object_mut()
+            .expect("event envelope must serialize as an object")
+            .remove("enforcement_evidence");
+
+        let result = serde_json::from_value::<EventEnvelope>(value);
+
+        assert!(result.is_err());
     }
 
     #[test]
