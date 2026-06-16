@@ -1,6 +1,6 @@
 use probe_core::{
-    AddressPort, Direction, FlowContext, FlowIdentity, Gap, ProcessContext, ProcessIdentity,
-    TcpConnection, Timestamp, TransportProtocol,
+    AddressPort, Direction, EventId, FlowContext, FlowIdentity, Gap, ProcessContext,
+    ProcessIdentity, TcpConnection, Timestamp, TransportProtocol,
 };
 
 use crate::{CaptureError, PlaintextChunk, PlaintextEvent, PlaintextGap, PlaintextSource};
@@ -9,10 +9,13 @@ use super::record::LibsslUprobePlaintextSample;
 
 const LIBSSL_UPROBE_FLOW_ATTRIBUTION_REASON: &str = "libssl uprobe fd-to-flow attribution is best-effort until SSL fd lifecycle cleanup is generation-bound";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibsslUprobeFlowLookup {
     pub tgid: u32,
     pub thread_pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub command: String,
     pub ssl_pointer: u64,
     pub fd: Option<i32>,
     pub direction: Direction,
@@ -41,12 +44,15 @@ pub(super) fn libssl_plaintext_events_from_sample(
     let resolved = resolver.resolve_libssl_uprobe_flow(LibsslUprobeFlowLookup {
         tgid: sample.tgid,
         thread_pid: sample.pid,
+        uid: sample.uid,
+        gid: sample.gid,
+        command: sample.command_lossy(),
         ssl_pointer: sample.ssl_pointer,
         fd: sample.fd,
         direction: sample.direction,
     })?;
     let Some(flow) = resolved else {
-        return Ok(unresolved_gap_events(sample, timestamp));
+        return Ok(unresolved_plaintext_events(sample, timestamp));
     };
     Ok(resolved_plaintext_events(
         sample,
@@ -69,7 +75,7 @@ fn resolved_plaintext_events(
             sample.captured_bytes.as_ref(),
         )
         .with_stream_offset(sample.stream_offset);
-        chunk = chunk.with_degradation(bytes_degradation_reason(sample));
+        chunk = chunk.with_degradation(resolved_bytes_degradation_reason(sample));
         events.push(PlaintextEvent::bytes(PlaintextSource::LibsslUprobe, chunk));
     }
     if should_emit_gap(sample) {
@@ -81,29 +87,39 @@ fn resolved_plaintext_events(
     events
 }
 
-fn unresolved_gap_events(
+fn unresolved_plaintext_events(
     sample: &LibsslUprobePlaintextSample,
     timestamp: Timestamp,
 ) -> Vec<PlaintextEvent> {
-    if sample.original_len == 0 && !sample.read_failed {
-        return Vec::new();
-    }
-    vec![PlaintextEvent::gap(
-        PlaintextSource::LibsslUprobe,
-        PlaintextGap::new(
+    let flow = unresolved_flow(sample, timestamp);
+    let mut events = Vec::new();
+    if !sample.read_failed && !sample.captured_bytes.is_empty() {
+        let chunk = PlaintextChunk::new(
             timestamp,
-            unresolved_flow(sample, timestamp.monotonic_ns),
-            Gap {
-                direction: sample.direction,
-                expected_offset: sample.stream_offset,
-                next_offset: known_end_offset(sample),
-                reason: format!(
-                    "libssl uprobe plaintext sample could not be resolved to a TCP flow; tgid={}, thread_pid={}, fd={:?}",
-                    sample.tgid, sample.pid, sample.fd
-                ),
-            },
-        ),
-    )]
+            flow.clone(),
+            sample.direction,
+            sample.captured_bytes.as_ref(),
+        )
+        .with_stream_offset(sample.stream_offset)
+        .with_degradation(unresolved_bytes_degradation_reason(sample));
+        events.push(PlaintextEvent::bytes(PlaintextSource::LibsslUprobe, chunk));
+    }
+    if should_emit_gap(sample) {
+        events.push(PlaintextEvent::gap(
+            PlaintextSource::LibsslUprobe,
+            PlaintextGap::new(
+                timestamp,
+                flow,
+                Gap {
+                    direction: sample.direction,
+                    expected_offset: gap_start(sample),
+                    next_offset: known_end_offset(sample),
+                    reason: unresolved_gap_reason(sample),
+                },
+            ),
+        ));
+    }
+    events
 }
 
 fn gap_from_sample(sample: &LibsslUprobePlaintextSample, expected_offset: u64) -> Gap {
@@ -159,30 +175,53 @@ fn degradation_reason(sample: &LibsslUprobePlaintextSample) -> Option<String> {
     None
 }
 
-fn bytes_degradation_reason(sample: &LibsslUprobePlaintextSample) -> String {
+fn resolved_bytes_degradation_reason(sample: &LibsslUprobePlaintextSample) -> String {
     match degradation_reason(sample) {
         Some(reason) => format!("{LIBSSL_UPROBE_FLOW_ATTRIBUTION_REASON}; {reason}"),
         None => LIBSSL_UPROBE_FLOW_ATTRIBUTION_REASON.to_string(),
     }
 }
 
+fn unresolved_bytes_degradation_reason(sample: &LibsslUprobePlaintextSample) -> String {
+    match degradation_reason(sample) {
+        Some(reason) => format!("{}; {reason}", unresolved_flow_reason(sample)),
+        None => unresolved_flow_reason(sample),
+    }
+}
+
+fn unresolved_gap_reason(sample: &LibsslUprobePlaintextSample) -> String {
+    match degradation_reason(sample) {
+        Some(reason) => format!("{}; {reason}", unresolved_flow_reason(sample)),
+        None => unresolved_flow_reason(sample),
+    }
+}
+
+fn unresolved_flow_reason(sample: &LibsslUprobePlaintextSample) -> String {
+    format!(
+        "libssl uprobe plaintext sample could not be resolved to a TCP flow; tgid={}, thread_pid={}, fd={:?}",
+        sample.tgid, sample.pid, sample.fd
+    )
+}
+
 fn missing_plaintext_bytes(sample: &LibsslUprobePlaintextSample) -> bool {
     sample.captured_bytes.len() < sample.original_len as usize
 }
 
-fn unresolved_flow(sample: &LibsslUprobePlaintextSample, start_monotonic_ns: u64) -> FlowContext {
+fn unresolved_flow(sample: &LibsslUprobePlaintextSample, timestamp: Timestamp) -> FlowContext {
     let process = process_context_from_sample(sample);
     let local = unknown_endpoint();
     let remote = unknown_endpoint();
+    let start_monotonic_ns = 0;
+    let id = unresolved_flow_id(
+        sample,
+        &process,
+        &local,
+        &remote,
+        start_monotonic_ns,
+        timestamp.monotonic_ns,
+    );
     FlowContext {
-        id: FlowIdentity::stable(
-            &process.identity,
-            &local,
-            &remote,
-            TransportProtocol::Tcp,
-            start_monotonic_ns,
-            None,
-        ),
+        id,
         process,
         local,
         remote,
@@ -191,6 +230,39 @@ fn unresolved_flow(sample: &LibsslUprobePlaintextSample, start_monotonic_ns: u64
         socket_cookie: None,
         attribution_confidence: 0,
     }
+}
+
+fn unresolved_flow_id(
+    sample: &LibsslUprobePlaintextSample,
+    process: &ProcessContext,
+    local: &AddressPort,
+    remote: &AddressPort,
+    start_monotonic_ns: u64,
+    sample_monotonic_ns: u64,
+) -> FlowIdentity {
+    FlowIdentity(
+        EventId::stable([
+            b"libssl-unresolved-flow".as_slice(),
+            process.identity.stable_key().as_bytes(),
+            local.address.as_bytes(),
+            &local.port.to_be_bytes(),
+            remote.address.as_bytes(),
+            &remote.port.to_be_bytes(),
+            b"tcp".as_slice(),
+            &start_monotonic_ns.to_be_bytes(),
+            &sample_monotonic_ns.to_be_bytes(),
+            &sample.ssl_pointer.to_be_bytes(),
+        ])
+        .0,
+    )
+}
+
+pub(in crate::tls::plaintext) fn is_unresolved_libssl_flow(flow: &FlowContext) -> bool {
+    flow.attribution_confidence == 0
+        && flow.local.port == 0
+        && flow.remote.port == 0
+        && flow.local.address == "0.0.0.0"
+        && flow.remote.address == "0.0.0.0"
 }
 
 pub(in crate::tls::plaintext) fn flow_from_resolved(resolved: LibsslResolvedFlow) -> FlowContext {
@@ -381,9 +453,87 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_sample_emits_gap_without_plaintext_bytes()
+    fn unresolved_sample_emits_degraded_bytes_with_unknown_flow()
     -> Result<(), Box<dyn std::error::Error>> {
         let sample = plaintext_sample(b"GET /", 5, false, false, None);
+        let mut resolver = StaticFlowResolver {
+            resolved: None,
+            last_lookup: None,
+        };
+
+        let events = libssl_plaintext_events_from_sample(&sample, demo_timestamp(), &mut resolver)?;
+
+        assert_eq!(events.len(), 1);
+        let CaptureEvent::Bytes(bytes) = CaptureEvent::from(events[0].clone()) else {
+            panic!("expected unresolved plaintext bytes");
+        };
+        assert_eq!(bytes.timestamp, demo_timestamp());
+        assert_eq!(bytes.flow.process.identity.pid, 22);
+        assert_eq!(bytes.flow.process.name, "curl");
+        assert_eq!(bytes.flow.attribution_confidence, 0);
+        assert_eq!(bytes.flow.local.port, 0);
+        assert_eq!(bytes.flow.remote.port, 0);
+        assert_eq!(bytes.flow.socket_cookie, None);
+        assert_eq!(bytes.source, CaptureSource::LibsslUprobe);
+        assert_eq!(bytes.provider, CaptureProviderKind::Plaintext);
+        assert_eq!(bytes.direction, Direction::Outbound);
+        assert_eq!(bytes.stream_offset, 100);
+        assert_eq!(bytes.bytes.as_ref(), b"GET /");
+        assert!(bytes.degraded);
+        assert!(bytes.degradation_reason.as_deref().is_some_and(|reason| {
+            reason.contains("libssl uprobe plaintext sample could not be resolved")
+        }));
+        assert!(
+            !bytes
+                .degradation_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("0xfeed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_samples_on_same_ssl_pointer_do_not_share_flow_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut first_resolver = StaticFlowResolver {
+            resolved: None,
+            last_lookup: None,
+        };
+        let mut second_resolver = StaticFlowResolver {
+            resolved: None,
+            last_lookup: None,
+        };
+
+        let first = libssl_plaintext_events_from_sample(
+            &plaintext_sample(b"GET /", 5, false, false, Some(7)),
+            Timestamp {
+                monotonic_ns: 10,
+                wall_time_unix_ns: 100,
+            },
+            &mut first_resolver,
+        )?;
+        let second = libssl_plaintext_events_from_sample(
+            &plaintext_sample(b" HTTP", 5, false, false, Some(7)),
+            Timestamp {
+                monotonic_ns: 11,
+                wall_time_unix_ns: 101,
+            },
+            &mut second_resolver,
+        )?;
+
+        let first_flow = bytes_flow(&first[0]);
+        let second_flow = bytes_flow(&second[0]);
+        assert_ne!(first_flow.id, second_flow.id);
+        assert_eq!(first_flow.socket_cookie, None);
+        assert_eq!(second_flow.socket_cookie, None);
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_read_failed_sample_emits_gap_without_plaintext_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sample = plaintext_sample(b"", 5, false, true, None);
         let mut resolver = StaticFlowResolver {
             resolved: None,
             last_lookup: None,
@@ -414,6 +564,10 @@ mod tests {
         assert!(
             gap.reason
                 .contains("libssl uprobe plaintext sample could not be resolved")
+        );
+        assert!(
+            gap.reason
+                .contains("libssl uprobe could not read the plaintext buffer")
         );
         assert!(!gap.reason.contains("0xfeed"));
         Ok(())
@@ -504,6 +658,9 @@ mod tests {
         LibsslUprobeFlowLookup {
             tgid: sample.tgid,
             thread_pid: sample.pid,
+            uid: sample.uid,
+            gid: sample.gid,
+            command: sample.command_lossy(),
             ssl_pointer: sample.ssl_pointer,
             fd: sample.fd,
             direction: sample.direction,

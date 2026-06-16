@@ -1,28 +1,23 @@
 use std::{
-    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use attribution::ProcfsSocketResolver;
 use capture::{
-    CaptureError, CaptureProvider, LibsslResolvedFlow, LibsslUprobeAttachTargetSnapshot,
-    LibsslUprobeFlowLookup, LibsslUprobeFlowResolver, LibsslUprobePlaintextOpen,
+    CaptureProvider, LibsslUprobeAttachTargetSnapshot, LibsslUprobePlaintextOpen,
     LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
     LibsslUprobePlaintextReconcile, LibsslUprobeReconcileTargetBucket,
 };
-use probe_core::TcpConnection;
 use runtime::RuntimePlan;
 use serde::Serialize;
 
 use crate::error::AgentError;
 
 use super::{
+    flow_resolver::{AttachedLibsslProcessRegistry, ProcfsLibsslFlowResolver},
     planning::LibsslUprobeAttachPlanner,
     sidecar::{LibsslUprobePlaintextReconcileObserver, LibsslUprobePlaintextSidecar},
 };
-
-const MAX_TRACKED_LIBSSL_FLOWS: usize = 8192;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TlsPlaintextRuntimeState {
@@ -276,8 +271,45 @@ fn build_libssl_uprobe_plaintext_provider(
                     .to_string(),
             )
         })?;
-    let selector = plan
-        .config
+    let attach_selector = compile_libssl_uprobe_selector(plan)?;
+    let output_selector = compile_libssl_uprobe_selector(plan)?;
+    let attach_planner = LibsslUprobeAttachPlanner::new(attach_selector);
+    let attach_plan = match attach_planner.plan()? {
+        Ok(plan) => plan,
+        Err(blocked) => {
+            return Ok(TlsPlaintextInstrumentationBuild::disabled(
+                blocked.into_reason(),
+            ));
+        }
+    };
+
+    let attached_processes = AttachedLibsslProcessRegistry::default();
+
+    match LibsslUprobePlaintextProvider::open_best_effort(
+        LibsslUprobePlaintextProbeConfig::new(object_path, attach_plan),
+        Box::new(ProcfsLibsslFlowResolver::new(attached_processes.clone())),
+    ) {
+        LibsslUprobePlaintextOpen::Enabled(provider) => {
+            Ok(TlsPlaintextInstrumentationBuild::enabled(
+                provider.with_output_selector(output_selector),
+                attach_planner,
+                Duration::from_millis(plan.tls.plaintext.instrumentation.reconcile_interval_ms),
+                Some(Box::new(LibsslRuntimeReconcileObserver {
+                    runtime_state: runtime_state.cloned(),
+                    attached_processes,
+                })),
+            ))
+        }
+        LibsslUprobePlaintextOpen::Disabled { reason } => {
+            Ok(TlsPlaintextInstrumentationBuild::disabled(reason))
+        }
+    }
+}
+
+fn compile_libssl_uprobe_selector(
+    plan: &RuntimePlan,
+) -> Result<Option<probe_core::CompiledSelector>, AgentError> {
+    plan.config
         .tls
         .plaintext
         .instrumentation
@@ -289,35 +321,7 @@ fn build_libssl_uprobe_plaintext_provider(
             AgentError::UnsupportedRunConfig(format!(
                 "invalid tls.plaintext.instrumentation.selector during runtime build: {source}"
             ))
-        })?;
-    let attach_planner = LibsslUprobeAttachPlanner::new(selector);
-    let attach_plan = match attach_planner.plan()? {
-        Ok(plan) => plan,
-        Err(blocked) => {
-            return Ok(TlsPlaintextInstrumentationBuild::disabled(
-                blocked.into_reason(),
-            ));
-        }
-    };
-
-    match LibsslUprobePlaintextProvider::open_best_effort(
-        LibsslUprobePlaintextProbeConfig::new(object_path, attach_plan),
-        Box::<ProcfsLibsslFlowResolver>::default(),
-    ) {
-        LibsslUprobePlaintextOpen::Enabled(provider) => {
-            Ok(TlsPlaintextInstrumentationBuild::enabled(
-                provider,
-                attach_planner,
-                Duration::from_millis(plan.tls.plaintext.instrumentation.reconcile_interval_ms),
-                runtime_state.cloned().map(|state| {
-                    Box::new(state) as Box<dyn LibsslUprobePlaintextReconcileObserver>
-                }),
-            ))
-        }
-        LibsslUprobePlaintextOpen::Disabled { reason } => {
-            Ok(TlsPlaintextInstrumentationBuild::disabled(reason))
-        }
-    }
+        })
 }
 
 pub(crate) enum TlsPlaintextInstrumentationBuild {
@@ -357,8 +361,8 @@ impl TlsPlaintextInstrumentationBuild {
 }
 
 impl LibsslUprobePlaintextReconcileObserver for TlsPlaintextRuntimeState {
-    fn record_reconcile_success(&self, result: LibsslUprobePlaintextReconcile) {
-        TlsPlaintextRuntimeState::record_reconcile_success(self, result);
+    fn record_reconcile_success(&self, result: &LibsslUprobePlaintextReconcile) {
+        TlsPlaintextRuntimeState::record_reconcile_success(self, result.clone());
     }
 }
 
@@ -370,108 +374,16 @@ fn current_unix_time_ns() -> u64 {
     u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
-#[derive(Default)]
-struct ProcfsLibsslFlowResolver {
-    resolver: ProcfsSocketResolver,
-    starts: TrackedLibsslFlowStarts,
+struct LibsslRuntimeReconcileObserver {
+    runtime_state: Option<TlsPlaintextRuntimeState>,
+    attached_processes: AttachedLibsslProcessRegistry,
 }
 
-impl LibsslUprobeFlowResolver for ProcfsLibsslFlowResolver {
-    fn resolve_libssl_uprobe_flow(
-        &mut self,
-        lookup: LibsslUprobeFlowLookup,
-    ) -> Result<Option<LibsslResolvedFlow>, CaptureError> {
-        let Some(fd) = lookup.fd else {
-            return Ok(None);
-        };
-        self.resolver
-            .resolve_tcp_fd(attribution::SocketFdLookup {
-                tgid: lookup.tgid,
-                thread_pid: lookup.thread_pid,
-                fd,
-                expected_remote_endpoint: None,
-                process_hint: None,
-            })
-            .map(|resolved| {
-                resolved.map(|resolved| {
-                    let key = LibsslFlowStartKey {
-                        pid: resolved.process.identity.pid,
-                        start_time_ticks: resolved.process.identity.start_time_ticks,
-                        ssl_pointer: lookup.ssl_pointer,
-                        connection: resolved.connection,
-                    };
-                    LibsslResolvedFlow {
-                        process: resolved.process,
-                        confidence: resolved.confidence,
-                        connection: resolved.connection,
-                        start_monotonic_ns: self.starts.start_for(key),
-                    }
-                })
-            })
-            .map_err(|error| {
-                CaptureError::provider("libssl_uprobe_flow_resolver", error.to_string())
-            })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct LibsslFlowStartKey {
-    pid: u32,
-    start_time_ticks: u64,
-    ssl_pointer: u64,
-    connection: TcpConnection,
-}
-
-struct TrackedLibsslFlowStarts {
-    by_key: HashMap<LibsslFlowStartKey, u64>,
-    recency: VecDeque<LibsslFlowStartKey>,
-    next_start_monotonic_ns: u64,
-    max_tracked_flows: usize,
-}
-
-impl Default for TrackedLibsslFlowStarts {
-    fn default() -> Self {
-        Self {
-            by_key: HashMap::new(),
-            recency: VecDeque::new(),
-            next_start_monotonic_ns: 0,
-            max_tracked_flows: MAX_TRACKED_LIBSSL_FLOWS,
-        }
-    }
-}
-
-impl TrackedLibsslFlowStarts {
-    fn start_for(&mut self, key: LibsslFlowStartKey) -> u64 {
-        if let Some(start) = self.by_key.get(&key).copied() {
-            self.refresh(key);
-            return start;
-        }
-        self.next_start_monotonic_ns = self.next_start_monotonic_ns.saturating_add(1);
-        self.evict_until_available();
-        self.recency.push_back(key);
-        self.by_key.insert(key, self.next_start_monotonic_ns);
-        self.next_start_monotonic_ns
-    }
-
-    fn refresh(&mut self, key: LibsslFlowStartKey) {
-        self.recency.retain(|tracked| *tracked != key);
-        self.recency.push_back(key);
-    }
-
-    fn evict_until_available(&mut self) {
-        if self.max_tracked_flows == 0 {
-            self.by_key.clear();
-            self.recency.clear();
-            return;
-        }
-        while self.by_key.len() >= self.max_tracked_flows {
-            let Some(evicted) = self.recency.pop_front() else {
-                self.by_key.clear();
-                break;
-            };
-            if self.by_key.remove(&evicted).is_some() {
-                break;
-            }
+impl LibsslUprobePlaintextReconcileObserver for LibsslRuntimeReconcileObserver {
+    fn record_reconcile_success(&self, result: &LibsslUprobePlaintextReconcile) {
+        self.attached_processes.replace_from_reconcile(result);
+        if let Some(runtime_state) = &self.runtime_state {
+            runtime_state.record_reconcile_success(result.clone());
         }
     }
 }
@@ -479,11 +391,11 @@ impl TrackedLibsslFlowStarts {
 #[cfg(test)]
 mod tests {
     use capture::{
-        CapturePoll, CaptureProviderKind, LibsslUprobeAttachTargetSnapshot,
+        CaptureError, CapturePoll, CaptureProviderKind, LibsslUprobeAttachTargetSnapshot,
         LibsslUprobeReconcileTargetBucket, MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET,
     };
     use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
-    use probe_core::{CapabilityState, TcpEndpoint};
+    use probe_core::CapabilityState;
     use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
 
     use super::*;
@@ -660,30 +572,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tracked_flow_starts_keep_identity_stable_for_same_ssl_connection() {
-        let mut starts = TrackedLibsslFlowStarts::default();
-        let key = flow_key(1, 0xfeed, connection(443));
-
-        let first = starts.start_for(key);
-        let second = starts.start_for(key);
-        let other = starts.start_for(flow_key(1, 0xbeef, connection(443)));
-
-        assert_eq!(first, second);
-        assert_ne!(first, other);
-    }
-
-    #[test]
-    fn tracked_flow_starts_include_process_generation_and_connection() {
-        let mut starts = TrackedLibsslFlowStarts::default();
-        let first = starts.start_for(flow_key(1, 0xfeed, connection(443)));
-        let reused_pid = starts.start_for(flow_key(2, 0xfeed, connection(443)));
-        let reused_ssl = starts.start_for(flow_key(1, 0xfeed, connection(8443)));
-
-        assert_ne!(first, reused_pid);
-        assert_ne!(first, reused_ssl);
-    }
-
     fn runtime_plan_from_config(
         config: AgentConfig,
         platform_capabilities: Vec<CapabilityState>,
@@ -696,29 +584,6 @@ mod tests {
             platform_capabilities,
         );
         RuntimePlan::build(config, &registry)
-    }
-
-    fn flow_key(
-        start_time_ticks: u64,
-        ssl_pointer: u64,
-        connection: TcpConnection,
-    ) -> LibsslFlowStartKey {
-        LibsslFlowStartKey {
-            pid: 7,
-            start_time_ticks,
-            ssl_pointer,
-            connection,
-        }
-    }
-
-    fn connection(remote_port: u16) -> TcpConnection {
-        TcpConnection::new(
-            TcpEndpoint::new("127.0.0.1".parse().expect("valid local address"), 50_000),
-            TcpEndpoint::new(
-                "127.0.0.1".parse().expect("valid remote address"),
-                remote_port,
-            ),
-        )
     }
 
     fn reconcile_result(

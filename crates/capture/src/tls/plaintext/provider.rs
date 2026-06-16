@@ -3,7 +3,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use probe_core::{CapabilityKind, CapabilityState, Timestamp};
+use probe_core::{CapabilityKind, CapabilityState, CompiledSelector, FlowContext, Timestamp};
 
 use crate::{
     CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind, PlaintextEvent,
@@ -11,7 +11,9 @@ use crate::{
 };
 
 use super::{
-    bridge::{LibsslUprobeFlowResolver, libssl_plaintext_events_from_sample},
+    bridge::{
+        LibsslUprobeFlowResolver, is_unresolved_libssl_flow, libssl_plaintext_events_from_sample,
+    },
     probe::{
         LibsslUprobePlaintextProbe, LibsslUprobePlaintextProbeConfig,
         LibsslUprobePlaintextProbeLoad, LibsslUprobePlaintextReconcile,
@@ -40,6 +42,7 @@ pub struct LibsslUprobePlaintextProvider {
     source: Box<dyn LibsslUprobePlaintextSampleSource>,
     resolver: Box<dyn LibsslUprobeFlowResolver>,
     pending_events: VecDeque<PlaintextEvent>,
+    output_selector: Option<CompiledSelector>,
     clock: LibsslUprobePlaintextClock,
     idle_policy: LibsslUprobePlaintextIdlePolicy,
     poisoned_reason: Option<String>,
@@ -89,6 +92,11 @@ impl LibsslUprobePlaintextProvider {
         }
     }
 
+    pub fn with_output_selector(mut self, selector: Option<CompiledSelector>) -> Self {
+        self.output_selector = selector;
+        self
+    }
+
     fn from_live_source(
         source: Box<dyn LibsslUprobePlaintextSampleSource>,
         resolver: Box<dyn LibsslUprobeFlowResolver>,
@@ -113,6 +121,7 @@ impl LibsslUprobePlaintextProvider {
             source,
             resolver,
             pending_events: VecDeque::new(),
+            output_selector: None,
             clock: LibsslUprobePlaintextClock::default(),
             idle_policy,
             poisoned_reason: None,
@@ -136,6 +145,10 @@ impl LibsslUprobePlaintextProvider {
             self.clock.next_timestamp(),
             self.resolver.as_mut(),
         )?;
+        let events = events
+            .into_iter()
+            .filter(|event| self.allows_event(event))
+            .collect::<Vec<_>>();
         self.pending_events.extend(events);
         Ok(self
             .pending_events
@@ -155,6 +168,24 @@ impl LibsslUprobePlaintextProvider {
         }
     }
 
+    fn allows_event(&self, event: &PlaintextEvent) -> bool {
+        let Some(selector) = &self.output_selector else {
+            return true;
+        };
+        match &event.kind {
+            crate::PlaintextEventKind::Bytes(chunk) => {
+                selector_allows_flow(selector, &chunk.flow, Some(chunk.direction))
+            }
+            crate::PlaintextEventKind::Gap(gap) => {
+                selector_allows_flow(selector, &gap.flow, Some(gap.gap.direction))
+            }
+            crate::PlaintextEventKind::ConnectionOpened(connection)
+            | crate::PlaintextEventKind::ConnectionClosed(connection) => {
+                selector.matches_flow_without_direction(&connection.flow)
+            }
+        }
+    }
+
     fn poison_after_reconcile_error(&mut self, error: CaptureError) -> CaptureError {
         let reason = match error {
             CaptureError::Provider { provider, reason }
@@ -167,6 +198,20 @@ impl LibsslUprobePlaintextProvider {
         self.pending_events.clear();
         self.poisoned_reason = Some(reason.clone());
         CaptureError::provider("libssl_uprobe_plaintext", reason)
+    }
+}
+
+fn selector_allows_flow(
+    selector: &CompiledSelector,
+    flow: &FlowContext,
+    direction: Option<probe_core::Direction>,
+) -> bool {
+    match direction {
+        Some(direction) if is_unresolved_libssl_flow(flow) => {
+            selector.matches_unattributed_flow(&flow.process, direction)
+        }
+        Some(direction) => selector.matches_flow(flow, direction),
+        None => selector.matches_flow_without_direction(flow),
     }
 }
 
@@ -230,7 +275,8 @@ mod tests {
         EBPF_TLS_PLAINTEXT_TRUNCATED, EbpfTlsPlaintextEvent, EbpfTlsPlaintextObservation,
     };
     use probe_core::{
-        CaptureSource, Direction, ProcessContext, ProcessIdentity, TcpConnection, TcpEndpoint,
+        CaptureSource, Direction, ProcessContext, ProcessIdentity, ProcessSelector, Selector,
+        TcpConnection, TcpEndpoint, TrafficSelector,
     };
     use tempfile::tempdir;
 
@@ -245,13 +291,7 @@ mod tests {
     fn provider_decodes_tls_plaintext_source_samples() -> Result<(), Box<dyn std::error::Error>> {
         let event = sample_event();
         let resolver = Box::new(StaticFlowResolver {
-            expected: LibsslUprobeFlowLookup {
-                tgid: 22,
-                thread_pid: 11,
-                ssl_pointer: 0xfeed,
-                fd: Some(7),
-                direction: Direction::Outbound,
-            },
+            expected: lookup_for_sample_event(),
             resolved: Some(demo_resolved_flow()),
             seen: false,
         });
@@ -274,16 +314,69 @@ mod tests {
     }
 
     #[test]
+    fn output_selector_allows_resolved_matching_flow() -> Result<(), Box<dyn std::error::Error>> {
+        let mut provider = provider_with_flow(
+            Some(demo_resolved_flow()),
+            Some(remote_port_selector(443)),
+            [sample_event()],
+        );
+
+        let Some(crate::CaptureEvent::Bytes(bytes)) = provider.next()? else {
+            panic!("matching resolved flow should pass selector");
+        };
+
+        assert_eq!(bytes.flow.remote.port, 443);
+        assert_eq!(bytes.bytes.as_ref(), b"GET /");
+        Ok(())
+    }
+
+    #[test]
+    fn output_selector_filters_resolved_mismatched_flow() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut provider = provider_with_flow(
+            Some(demo_resolved_flow()),
+            Some(remote_port_selector(8443)),
+            [sample_event()],
+        );
+
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn output_selector_fails_closed_for_unresolved_unknown_remote_port()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut provider =
+            provider_with_flow(None, Some(remote_port_selector(443)), [sample_event()]);
+
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn output_selector_allows_unresolved_direction_only_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut provider = provider_with_flow(
+            None,
+            Some(direction_selector(Direction::Outbound)),
+            [sample_event()],
+        );
+
+        let Some(crate::CaptureEvent::Bytes(bytes)) = provider.next()? else {
+            panic!("unresolved flow with known matching direction should pass selector");
+        };
+
+        assert_eq!(bytes.flow.remote.port, 0);
+        assert_eq!(bytes.flow.attribution_confidence, 0);
+        assert_eq!(bytes.bytes.as_ref(), b"GET /");
+        Ok(())
+    }
+
+    #[test]
     fn live_provider_waits_on_idle_source_instead_of_reporting_eof()
     -> Result<(), Box<dyn std::error::Error>> {
         let resolver = Box::new(StaticFlowResolver {
-            expected: LibsslUprobeFlowLookup {
-                tgid: 22,
-                thread_pid: 11,
-                ssl_pointer: 0xfeed,
-                fd: Some(7),
-                direction: Direction::Outbound,
-            },
+            expected: lookup_for_sample_event(),
             resolved: Some(demo_resolved_flow()),
             seen: false,
         });
@@ -308,13 +401,7 @@ mod tests {
     fn reconcile_failure_poisons_provider_before_pending_events_are_drained()
     -> Result<(), Box<dyn std::error::Error>> {
         let resolver = Box::new(StaticFlowResolver {
-            expected: LibsslUprobeFlowLookup {
-                tgid: 22,
-                thread_pid: 11,
-                ssl_pointer: 0xfeed,
-                fd: Some(7),
-                direction: Direction::Outbound,
-            },
+            expected: lookup_for_sample_event(),
             resolved: Some(demo_resolved_flow()),
             seen: false,
         });
@@ -347,13 +434,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let resolver = Box::new(StaticFlowResolver {
-            expected: LibsslUprobeFlowLookup {
-                tgid: 22,
-                thread_pid: 11,
-                ssl_pointer: 0xfeed,
-                fd: Some(7),
-                direction: Direction::Outbound,
-            },
+            expected: lookup_for_sample_event(),
             resolved: None,
             seen: false,
         });
@@ -379,6 +460,50 @@ mod tests {
         >())
     }
 
+    fn provider_with_flow(
+        resolved: Option<LibsslResolvedFlow>,
+        selector: Option<probe_core::CompiledSelector>,
+        events: impl IntoIterator<Item = EbpfTlsPlaintextEvent>,
+    ) -> LibsslUprobePlaintextProvider {
+        let resolver = Box::new(StaticFlowResolver {
+            expected: lookup_for_sample_event(),
+            resolved,
+            seen: false,
+        });
+        LibsslUprobePlaintextProvider::new(Box::new(VecTlsPlaintextSource::new(events)), resolver)
+            .with_output_selector(selector)
+    }
+
+    fn remote_port_selector(port: u16) -> probe_core::CompiledSelector {
+        Selector::term(
+            ProcessSelector {
+                names: vec!["curl".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                remote_ports: vec![port],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()
+        .expect("test selector must compile")
+    }
+
+    fn direction_selector(direction: Direction) -> probe_core::CompiledSelector {
+        Selector::term(
+            ProcessSelector {
+                names: vec!["curl".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                directions: vec![direction],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()
+        .expect("test selector must compile")
+    }
+
     fn sample_event() -> EbpfTlsPlaintextEvent {
         let mut payload = [0; EBPF_TLS_PLAINTEXT_SAMPLE_BYTES];
         payload[..5].copy_from_slice(b"GET /");
@@ -399,6 +524,19 @@ mod tests {
             ),
             EBPF_TLS_PLAINTEXT_FD_VALID,
         )
+    }
+
+    fn lookup_for_sample_event() -> LibsslUprobeFlowLookup {
+        LibsslUprobeFlowLookup {
+            tgid: 22,
+            thread_pid: 11,
+            uid: 33,
+            gid: 44,
+            command: "curl".to_string(),
+            ssl_pointer: 0xfeed,
+            fd: Some(7),
+            direction: Direction::Outbound,
+        }
     }
 
     fn truncated_sample_event() -> EbpfTlsPlaintextEvent {

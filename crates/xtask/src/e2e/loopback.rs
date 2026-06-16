@@ -13,13 +13,15 @@ use super::harness::{
     UnixSocketReadySignal, debug_binary, e2e_error, publish_atomic_file, run_in_own_process_group,
     wait_for_child_exit, wait_for_file_or_child_exit, wait_for_ready_signal_or_child_exit,
 };
-use probe_core::{EventEnvelope, EventKind};
+use probe_core::{EventEnvelope, EventKind, ProcessContext};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
 const AGENT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const AGENT_PROGRESS_STABLE_POLLS: u8 = 3;
+const FIXTURE_PROCESS_NAME_PREFIX: &str = "sssa-e2e";
+const FIXTURE_BINARY_NAME: &str = "sssa-e2e-fixture";
 
 pub(crate) const AGENT_READY_SOCKET_ENV: &str = "SSSA_PROBE_READY_SOCKET";
 
@@ -30,10 +32,12 @@ pub(crate) struct Http1LoopbackFixtureConfig {
     pub(crate) response_body_bytes: usize,
     pub(crate) write_chunks: usize,
     pub(crate) connect_write_delay_ms: u64,
+    pub(crate) post_exchange_delay_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Http1LoopbackFixtureReady {
+    pub(crate) pid: u32,
     pub(crate) listen_port: u16,
     pub(crate) start_nonce: String,
 }
@@ -43,9 +47,26 @@ pub(crate) fn spawn_http1_loopback_fixture(
     start_path: &Path,
     config: Http1LoopbackFixtureConfig,
 ) -> Result<Child, Box<dyn std::error::Error>> {
+    spawn_loopback_fixture("http1-loopback", ready_path, start_path, config)
+}
+
+pub(crate) fn spawn_tls_http1_loopback_fixture(
+    ready_path: &Path,
+    start_path: &Path,
+    config: Http1LoopbackFixtureConfig,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    spawn_loopback_fixture("tls-http1-loopback", ready_path, start_path, config)
+}
+
+fn spawn_loopback_fixture(
+    scenario: &'static str,
+    ready_path: &Path,
+    start_path: &Path,
+    config: Http1LoopbackFixtureConfig,
+) -> Result<Child, Box<dyn std::error::Error>> {
     let mut command = Command::new(debug_binary("sssa-e2e-fixture")?);
     let child = run_in_own_process_group(&mut command)
-        .arg("http1-loopback")
+        .arg(scenario)
         .arg("--requests")
         .arg(config.requests.to_string())
         .arg("--request-body-bytes")
@@ -56,6 +77,8 @@ pub(crate) fn spawn_http1_loopback_fixture(
         .arg(config.write_chunks.to_string())
         .arg("--connect-write-delay-ms")
         .arg(config.connect_write_delay_ms.to_string())
+        .arg("--post-exchange-delay-ms")
+        .arg(config.post_exchange_delay_ms.to_string())
         .arg("--ready-file")
         .arg(ready_path)
         .arg("--start-file")
@@ -215,6 +238,21 @@ pub(crate) fn assert_no_policy_runtime_errors(
     .into())
 }
 
+pub(crate) fn is_fixture_process(process: &ProcessContext) -> bool {
+    process.identity.pid > 0
+        && (process.name.starts_with(FIXTURE_PROCESS_NAME_PREFIX)
+            || process
+                .identity
+                .exe_path
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name == FIXTURE_BINARY_NAME)
+            || process
+                .cmdline
+                .iter()
+                .any(|arg| arg.contains(FIXTURE_BINARY_NAME)))
+}
+
 fn parse_fixture_ready(
     path: &Path,
 ) -> Result<Http1LoopbackFixtureReady, Box<dyn std::error::Error>> {
@@ -222,6 +260,13 @@ fn parse_fixture_ready(
     let Some(listen_addr) = ready_value(&content, "listen_addr") else {
         return Err(e2e_error(format!(
             "fixture ready file {} did not contain listen_addr",
+            path.display()
+        ))
+        .into());
+    };
+    let Some(pid) = ready_value(&content, "pid") else {
+        return Err(e2e_error(format!(
+            "fixture ready file {} did not contain pid",
             path.display()
         ))
         .into());
@@ -234,7 +279,9 @@ fn parse_fixture_ready(
         .into());
     };
     let address = listen_addr.parse::<SocketAddr>()?;
+    let pid = pid.parse::<u32>()?;
     Ok(Http1LoopbackFixtureReady {
+        pid,
         listen_port: address.port(),
         start_nonce,
     })

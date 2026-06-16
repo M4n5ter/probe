@@ -25,7 +25,7 @@ impl LibsslUprobePlaintextSidecarProvider for LibsslUprobePlaintextProvider {
 }
 
 pub(super) trait LibsslUprobePlaintextReconcileObserver {
-    fn record_reconcile_success(&self, result: LibsslUprobePlaintextReconcile);
+    fn record_reconcile_success(&self, result: &LibsslUprobePlaintextReconcile);
 }
 
 pub(super) struct LibsslUprobePlaintextSidecar<P = LibsslUprobePlaintextProvider>
@@ -91,7 +91,7 @@ where
             })?;
         let result = self.provider.reconcile_libssl_uprobes(next_plan)?;
         if let Some(observer) = &self.reconcile_observer {
-            observer.record_reconcile_success(result);
+            observer.record_reconcile_success(&result);
         }
         Ok(())
     }
@@ -268,8 +268,8 @@ mod tests {
     }
 
     impl LibsslUprobePlaintextReconcileObserver for FakeReconcileObserver {
-        fn record_reconcile_success(&self, result: LibsslUprobePlaintextReconcile) {
-            *self.observed.borrow_mut() = Some(result);
+        fn record_reconcile_success(&self, result: &LibsslUprobePlaintextReconcile) {
+            *self.observed.borrow_mut() = Some(result.clone());
         }
     }
 

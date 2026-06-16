@@ -117,6 +117,21 @@ impl CompiledSelector {
         self.node.matches_flow(flow, None).unwrap_or(false)
     }
 
+    /// Matches a flow candidate when only process identity and direction are known.
+    ///
+    /// This is intentionally fail-closed for selectors that require local/remote ports or remote
+    /// addresses. It is useful for plaintext sources that can observe payload before they can prove
+    /// a concrete socket flow.
+    pub fn matches_unattributed_flow(
+        &self,
+        process: &ProcessContext,
+        direction: Direction,
+    ) -> bool {
+        self.node
+            .matches_unattributed_flow(process, direction)
+            .unwrap_or(false)
+    }
+
     pub fn matches_event(&self, event: &EventEnvelope) -> bool {
         event.kind.direction().map_or_else(
             || self.matches_flow_without_direction(&event.flow),
@@ -198,6 +213,29 @@ impl CompiledSelectorNode {
         }
     }
 
+    fn matches_unattributed_flow(
+        &self,
+        process: &ProcessContext,
+        direction: Direction,
+    ) -> Option<bool> {
+        match self {
+            Self::Match(term) => term.matches_unattributed_flow(process, direction),
+            Self::All(selectors) => all_selector_matches(
+                selectors
+                    .iter()
+                    .map(|selector| selector.matches_unattributed_flow(process, direction)),
+            ),
+            Self::Any(selectors) => any_selector_matches(
+                selectors
+                    .iter()
+                    .map(|selector| selector.matches_unattributed_flow(process, direction)),
+            ),
+            Self::Not(selector) => selector
+                .matches_unattributed_flow(process, direction)
+                .map(|matched| !matched),
+        }
+    }
+
     fn may_match_process(&self, process: &ProcessContext) -> bool {
         match self {
             Self::Match(term) => term.may_match_process(process),
@@ -239,64 +277,40 @@ impl CompiledSelectorTerm {
     }
 
     fn matches_process(&self, process: &ProcessContext) -> bool {
-        let spec = &self.term.process;
-        all_match([
-            spec.pids.is_empty() || spec.pids.contains(&process.identity.pid),
-            spec.names.is_empty() || spec.names.iter().any(|name| name == &process.name),
-            spec.systemd_services.is_empty()
-                || process
-                    .identity
-                    .systemd_service
-                    .as_ref()
-                    .is_some_and(|service| spec.systemd_services.contains(service)),
-            spec.container_ids.is_empty()
-                || process
-                    .identity
-                    .container_id
-                    .as_ref()
-                    .is_some_and(|container_id| spec.container_ids.contains(container_id)),
-            self.exe_path_globs
-                .as_ref()
-                .is_none_or(|globs| globs.is_match(&process.identity.exe_path)),
-            self.cmdline_regexes.as_ref().is_none_or(|regexes| {
-                let cmdline = process.cmdline.join(" ");
-                regexes.is_match(&cmdline)
-            }),
-        ])
+        self.matches_process_with_unknowns(process).unwrap_or(false)
     }
 
     fn may_match_process(&self, process: &ProcessContext) -> bool {
+        self.matches_process_with_unknowns(process).unwrap_or(true)
+    }
+
+    fn matches_process_with_unknowns(&self, process: &ProcessContext) -> Option<bool> {
         let spec = &self.term.process;
-        all_match([
-            spec.pids.is_empty()
-                || process.identity.pid == 0
-                || spec.pids.contains(&process.identity.pid),
-            spec.names.is_empty()
-                || unknown_process_string(&process.name)
-                || spec.names.iter().any(|name| name == &process.name),
-            spec.systemd_services.is_empty()
-                || process
-                    .identity
-                    .systemd_service
-                    .as_ref()
-                    .is_none_or(|service| spec.systemd_services.contains(service)),
-            spec.container_ids.is_empty()
-                || process
-                    .identity
-                    .container_id
-                    .as_ref()
-                    .is_none_or(|container_id| spec.container_ids.contains(container_id)),
-            self.exe_path_globs.as_ref().is_none_or(|globs| {
-                unknown_process_string(&process.identity.exe_path)
-                    || globs.is_match(&process.identity.exe_path)
-            }),
-            self.cmdline_regexes.as_ref().is_none_or(|regexes| {
-                unknown_cmdline(process) || {
-                    let cmdline = process.cmdline.join(" ");
-                    regexes.is_match(&cmdline)
-                }
-            }),
-        ])
+        all_selector_matches(
+            [
+                match_u32_list(&spec.pids, process.identity.pid, process.identity.pid == 0),
+                match_string_list(
+                    &spec.names,
+                    &process.name,
+                    unknown_process_string(&process.name),
+                ),
+                match_optional_string_list(
+                    &spec.systemd_services,
+                    process.identity.systemd_service.as_ref(),
+                ),
+                match_optional_string_list(
+                    &spec.container_ids,
+                    process.identity.container_id.as_ref(),
+                ),
+                match_globs(
+                    self.exe_path_globs.as_ref(),
+                    &process.identity.exe_path,
+                    unknown_process_string(&process.identity.exe_path),
+                ),
+                match_regexes(self.cmdline_regexes.as_ref(), process),
+            ]
+            .into_iter(),
+        )
     }
 
     fn matches_traffic(&self, flow: &FlowContext, direction: Option<Direction>) -> Option<bool> {
@@ -314,6 +328,70 @@ impl CompiledSelectorTerm {
             spec.remote_addresses.is_empty()
                 || spec.remote_addresses.contains(&flow.remote.address),
         ]))
+    }
+
+    fn matches_unattributed_flow(
+        &self,
+        process: &ProcessContext,
+        direction: Direction,
+    ) -> Option<bool> {
+        if !self.matches_process_with_unknowns(process)? {
+            return Some(false);
+        }
+        let spec = &self.term.traffic;
+        if !spec.local_ports.is_empty()
+            || !spec.remote_ports.is_empty()
+            || !spec.remote_addresses.is_empty()
+        {
+            return None;
+        }
+        Some(spec.directions.is_empty() || spec.directions.contains(&direction))
+    }
+}
+
+fn match_u32_list(values: &[u32], value: u32, unknown: bool) -> Option<bool> {
+    if values.is_empty() {
+        Some(true)
+    } else if unknown {
+        None
+    } else {
+        Some(values.contains(&value))
+    }
+}
+
+fn match_string_list(values: &[String], value: &str, unknown: bool) -> Option<bool> {
+    if values.is_empty() {
+        Some(true)
+    } else if unknown {
+        None
+    } else {
+        Some(values.iter().any(|candidate| candidate == value))
+    }
+}
+
+fn match_optional_string_list(values: &[String], value: Option<&String>) -> Option<bool> {
+    if values.is_empty() {
+        return Some(true);
+    }
+    value.map(|value| values.contains(value))
+}
+
+fn match_globs(globs: Option<&GlobSet>, value: &str, unknown: bool) -> Option<bool> {
+    match globs {
+        None => Some(true),
+        Some(_) if unknown => None,
+        Some(globs) => Some(globs.is_match(value)),
+    }
+}
+
+fn match_regexes(regexes: Option<&RegexSet>, process: &ProcessContext) -> Option<bool> {
+    match regexes {
+        None => Some(true),
+        Some(_) if unknown_cmdline(process) => None,
+        Some(regexes) => {
+            let cmdline = process.cmdline.join(" ");
+            Some(regexes.is_match(&cmdline))
+        }
     }
 }
 
@@ -504,6 +582,138 @@ mod tests {
 
         assert!(selector.may_match_process(&matching));
         assert!(!selector.may_match_process(&non_matching));
+        Ok(())
+    }
+
+    #[test]
+    fn unattributed_flow_match_allows_process_and_direction_only_selectors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector {
+                names: vec!["demo".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let process = demo_flow().process;
+
+        assert!(selector.matches_unattributed_flow(&process, Direction::Outbound));
+        assert!(!selector.matches_unattributed_flow(&process, Direction::Inbound));
+        Ok(())
+    }
+
+    #[test]
+    fn unattributed_flow_match_fails_closed_for_unknown_traffic_dimensions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector {
+                names: vec!["demo".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                remote_ports: vec![443],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let negated = Selector::Not {
+            selector: Box::new(Selector::term(
+                ProcessSelector::default(),
+                TrafficSelector {
+                    remote_ports: vec![443],
+                    ..TrafficSelector::default()
+                },
+            )),
+        }
+        .compile()?;
+        let process = demo_flow().process;
+
+        assert!(!selector.matches_unattributed_flow(&process, Direction::Outbound));
+        assert!(!negated.matches_unattributed_flow(&process, Direction::Outbound));
+        Ok(())
+    }
+
+    #[test]
+    fn unattributed_flow_match_fails_closed_for_unknown_process_dimensions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let process = partial_process();
+        for selector in unknown_process_dimension_selectors() {
+            let positive = selector.clone().compile()?;
+            let negated = Selector::Not {
+                selector: Box::new(selector),
+            }
+            .compile()?;
+
+            assert!(!positive.matches_unattributed_flow(&process, Direction::Outbound));
+            assert!(!negated.matches_unattributed_flow(&process, Direction::Outbound));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unattributed_flow_match_keeps_unknown_process_dimensions_through_composites()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let unknown_exe = Selector::term(
+            ProcessSelector {
+                exe_path_globs: vec!["/usr/bin/demo".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        );
+        let matching_name = Selector::term(
+            ProcessSelector {
+                names: vec!["demo".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        );
+        let unknown_remote = Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                ..TrafficSelector::default()
+            },
+        );
+        let all = Selector::All {
+            selectors: vec![
+                matching_name.clone(),
+                Selector::Not {
+                    selector: Box::new(unknown_exe.clone()),
+                },
+            ],
+        }
+        .compile()?;
+        let any = Selector::Any {
+            selectors: vec![
+                Selector::Not {
+                    selector: Box::new(unknown_exe),
+                },
+                unknown_remote,
+            ],
+        }
+        .compile()?;
+        let known_any = Selector::Any {
+            selectors: vec![
+                matching_name,
+                Selector::term(
+                    ProcessSelector::default(),
+                    TrafficSelector {
+                        remote_ports: vec![443],
+                        ..TrafficSelector::default()
+                    },
+                ),
+            ],
+        }
+        .compile()?;
+        let process = partial_process();
+
+        assert!(!all.matches_unattributed_flow(&process, Direction::Outbound));
+        assert!(!any.matches_unattributed_flow(&process, Direction::Outbound));
+        assert!(known_any.matches_unattributed_flow(&process, Direction::Outbound));
         Ok(())
     }
 
@@ -727,5 +937,38 @@ mod tests {
             name: "demo".to_string(),
             cmdline: vec!["demo".to_string()],
         }
+    }
+
+    fn unknown_process_dimension_selectors() -> Vec<Selector> {
+        vec![
+            Selector::term(
+                ProcessSelector {
+                    exe_path_globs: vec!["/usr/bin/demo".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+            Selector::term(
+                ProcessSelector {
+                    cmdline_regexes: vec!["--tenant managed".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+            Selector::term(
+                ProcessSelector {
+                    systemd_services: vec!["demo.service".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+            Selector::term(
+                ProcessSelector {
+                    container_ids: vec!["container-a".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        ]
     }
 }

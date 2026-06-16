@@ -1,0 +1,19 @@
+[package]
+name = "e2e-libssl-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+foreign-types = "0.3"
+openssl = "0.10"
+openssl-sys = "0.9"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"

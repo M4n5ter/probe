@@ -13,4 +13,6 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+e2e-libssl-ffi = { version = "0.1.0", path = "../e2e-libssl-ffi" }
+openssl = "0.10"
 rustix = "1.1"

@@ -53,9 +53,21 @@ pub(crate) fn ensure_process_artifact_ready() -> Result<PathBuf, String> {
         EbpfObjectArtifact::ProcessObservation.label(),
         EbpfObjectArtifact::ProcessObservation.strict_contract(),
         &config.build_stamp_path,
-        &process_artifact_freshness_inputs(&config)?,
+        &ebpf_artifact_freshness_inputs(&config)?,
     )?;
     Ok(config.process_artifact_path)
+}
+
+pub(crate) fn ensure_tls_plaintext_artifact_ready() -> Result<PathBuf, String> {
+    let config = EbpfBuildConfig::from_xtask_manifest_dir(env!("CARGO_MANIFEST_DIR"));
+    ensure_named_ebpf_object_ready(
+        &config.tls_plaintext_artifact_path,
+        EbpfObjectArtifact::TlsPlaintext.label(),
+        EbpfObjectArtifact::TlsPlaintext.strict_contract(),
+        &config.build_stamp_path,
+        &ebpf_artifact_freshness_inputs(&config)?,
+    )?;
+    Ok(config.tls_plaintext_artifact_path)
 }
 
 pub(super) struct EbpfBuildConfig {
@@ -292,7 +304,7 @@ fn ensure_named_ebpf_object_contract(
     Ok(report.summary())
 }
 
-fn process_artifact_freshness_inputs(config: &EbpfBuildConfig) -> Result<Vec<PathBuf>, String> {
+fn ebpf_artifact_freshness_inputs(config: &EbpfBuildConfig) -> Result<Vec<PathBuf>, String> {
     let mut inputs = vec![
         config.repo_root.join("Cargo.lock"),
         config.manifest_path.clone(),

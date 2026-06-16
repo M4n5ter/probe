@@ -1,3 +1,4 @@
+mod flow_resolver;
 mod planning;
 mod runtime;
 mod sidecar;

@@ -9,7 +9,7 @@ use capture::{CaptureEvent, CaptureProviderKind};
 use probe_config::{AgentConfig, CaptureSelection, PolicyConfig};
 use probe_core::{
     CaptureSource, Direction, EnforcementEvidence, EventEnvelope, EventKind, ObservationOnlyReason,
-    ProcessContext, ProcessSelector, Selector, TrafficSelector,
+    ProcessSelector, Selector, TrafficSelector,
 };
 use storage::{FjallSpool, StoredEvent};
 
@@ -19,8 +19,8 @@ use super::{
         decode_envelope, e2e_error, stop_running_child,
     },
     loopback::{
-        Http1LoopbackFixtureConfig, assert_no_policy_runtime_errors, merge_run_results,
-        spawn_agent, spawn_http1_loopback_fixture, start_http1_loopback_fixture,
+        Http1LoopbackFixtureConfig, assert_no_policy_runtime_errors, is_fixture_process,
+        merge_run_results, spawn_agent, spawn_http1_loopback_fixture, start_http1_loopback_fixture,
         wait_for_agent_policy_progress, wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
         wait_for_http1_loopback_fixture_ready,
     },
@@ -35,8 +35,6 @@ const REQUEST_BODY_BYTES: usize = 64;
 const RESPONSE_BODY_BYTES: usize = 32;
 const WRITE_CHUNKS: usize = 1;
 const CONNECT_WRITE_DELAY_MS: u64 = 2_000;
-const FIXTURE_PROCESS_NAME_PREFIX: &str = "sssa-e2e";
-const FIXTURE_BINARY_NAME: &str = "sssa-e2e-fixture";
 
 pub(crate) fn run() -> ExitCode {
     match run_inner() {
@@ -123,6 +121,7 @@ fn fixture_config() -> Http1LoopbackFixtureConfig {
         response_body_bytes: RESPONSE_BODY_BYTES,
         write_chunks: WRITE_CHUNKS,
         connect_write_delay_ms: CONNECT_WRITE_DELAY_MS,
+        post_exchange_delay_ms: 0,
     }
 }
 
@@ -515,21 +514,6 @@ fn assert_expected_policy_alerts(
         expected, observed
     ))
     .into())
-}
-
-fn is_fixture_process(process: &ProcessContext) -> bool {
-    process.identity.pid > 0
-        && (process.name.starts_with(FIXTURE_PROCESS_NAME_PREFIX)
-            || process
-                .identity
-                .exe_path
-                .rsplit('/')
-                .next()
-                .is_some_and(|name| name == FIXTURE_BINARY_NAME)
-            || process
-                .cmdline
-                .iter()
-                .any(|arg| arg.contains(FIXTURE_BINARY_NAME)))
 }
 
 fn expected_targets() -> BTreeSet<String> {

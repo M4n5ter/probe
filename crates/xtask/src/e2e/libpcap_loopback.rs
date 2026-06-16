@@ -110,6 +110,7 @@ fn fixture_config() -> Http1LoopbackFixtureConfig {
         response_body_bytes: RESPONSE_BODY_BYTES,
         write_chunks: WRITE_CHUNKS,
         connect_write_delay_ms: 0,
+        post_exchange_delay_ms: 0,
     }
 }
 
