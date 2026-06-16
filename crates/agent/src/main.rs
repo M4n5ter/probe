@@ -8,6 +8,7 @@ mod configured_policy;
 mod connection_enforcement;
 mod error;
 mod export;
+mod live_agent;
 mod periodic_worker;
 mod plaintext_feed;
 mod runtime_composition;
