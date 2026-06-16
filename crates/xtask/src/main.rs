@@ -4,6 +4,7 @@ use std::{
     process::{Command, ExitCode},
 };
 
+mod e2e;
 mod ebpf;
 
 fn main() -> ExitCode {
@@ -13,9 +14,10 @@ fn main() -> ExitCode {
         Some("check-all") => run_check_all(),
         Some("check-ebpf") => ebpf::run_check(),
         Some("ebpf-build") => ebpf::run_build(),
+        Some("e2e-plaintext-feed") => e2e::run(),
         _ => {
             eprintln!(
-                "usage: cargo run -p xtask -- <check|check-host|check-ebpf|check-all|ebpf-build>"
+                "usage: cargo run -p xtask -- <check|check-host|check-ebpf|check-all|ebpf-build|e2e-plaintext-feed>"
             );
             ExitCode::FAILURE
         }

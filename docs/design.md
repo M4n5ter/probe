@@ -1214,7 +1214,7 @@ metrics 必须覆盖：
 | `runtime` | provider descriptor registry、capability matrix、config validation orchestration、runtime plan。 | 直接执行 provider IO。 |
 | `storage` | Fjall-backed spool、storage traits、retention。 | parser/policy 语义。 |
 | `exporter` | HTTP webhook exporter、codec、sink traits。 | 脱敏、policy transform。 |
-| `xtask` | eBPF 构建、代码生成、CI 辅助任务。 | 运行时业务逻辑。 |
+| `xtask` | eBPF 构建、代码生成、CI 辅助任务、端到端断言 harness。 | 运行时业务逻辑。 |
 
 trait async/sync 边界：
 
@@ -1231,7 +1231,7 @@ trait async/sync 边界：
 
 eBPF 构建：
 
-- 使用 `xtask` 统一构建 eBPF target、校验 artifacts、再构建用户态；`xtask check` 与 `xtask check-host` 跑稳定 host workspace 质量门，`xtask check-ebpf` 跑 nightly/rust-src/`bpf-linker` 前提下的 eBPF fmt、BPF target clippy、locked build 与 preflight contract 校验，`xtask check-all` 组合两者作为完整提交前质量门，避免 kernel/userspace contract 漂移。特权 process observation、outbound write argument sample、lost-event feedback 和 TLS lifecycle 需要真正的 privileged/e2e 验收，不保留弱信号的单独入口。
+- 使用 `xtask` 统一构建 eBPF target、校验 artifacts、再构建用户态；`xtask check` 与 `xtask check-host` 跑稳定 host workspace 质量门，`xtask check-ebpf` 跑 nightly/rust-src/`bpf-linker` 前提下的 eBPF fmt、BPF target clippy、locked build 与 preflight contract 校验，`xtask check-all` 组合两者作为完整提交前质量门，避免 kernel/userspace contract 漂移。`xtask e2e-plaintext-feed` 是第一条 agent 侧端到端断言 harness：它生成临时 JSON-lines plaintext feed、policy bundle 和 agent TOML，运行真实 `agent run`，再打开 Fjall spool 断言 ingress journal、HTTP parser output、configured policy output 和 connection lifecycle export event。特权 process observation、outbound write argument sample、lost-event feedback 和 TLS lifecycle 仍需要真正的 privileged/e2e 验收，不保留弱信号的单独入口。
 - 不把复杂构建逻辑藏进 `build.rs`。
 
 依赖策略：
@@ -1332,10 +1332,11 @@ benchmark 参数：
 当前端到端目标程序：
 
 - `cargo run -p e2e-fixture -- http1-loopback --requests 1 --request-body-bytes 64 --response-body-bytes 32 --write-chunks 2` 会在同一进程内启动 loopback TCP server/client，发送 deterministic HTTP/1 POST request 和 response，并输出 key=value 报告。请求端按 chunk 通过 `rustix::io::write` 强制执行一次 Linux `write(2)` syscall，partial chunk write 会失败，便于后续验证 syscall argument sample 边界，不再依赖 `TcpStream::write` 在标准库内部选择 `send` 还是 `write`。默认请求总字节小于当前 eBPF write sample 上限；真实 eBPF 验收还必须配置 `capture.deep_observe_selector` 命中该 fixture flow，才能验证 selector-authorized outbound `write(2)` sample 的授权、裁剪、degraded 标记和 gap 语义。调大 request body 可制造截断路径。该 fixture 只生成流量和报告，不替代 agent 侧断言 harness。
+- `cargo run -p xtask -- e2e-plaintext-feed` 会创建临时 feed/policy/config，执行真实 `agent run --config ... --max-events 3`，并从 Fjall spool 读回断言 3 条 ingress record、`source = external_plaintext_feed` 的 `/e2e` HTTP request headers、`e2e-policy@e2e` policy alert 以及 connection opened/closed export event。该入口不需要特权，作为后续 libpcap/eBPF/TLS/MITM privileged harness 的共同验收形态：外部世界只负责产生输入，断言必须回到 agent durable output。
 
 当前已手工验证的特权 fallback 路径：在 WSL2 root 环境下，`sudo target/debug/agent capabilities` 显示 `libpcap` available；使用本机 `127.0.0.1:18080` HTTP server、`capture.selection = "libpcap"`、`capture.libpcap.interface = "any"`、`bpf_filter = "tcp port 18080"` 和 `run --max-events 1`，agent 成功读取 1 个 libpcap capture event、写入 1 条 ingress record 和 1 条 export event。普通用户下 `libpcap` 因缺少 raw socket 权限 unavailable，这是预期权限差异。
 
-当前已验证的 non-privileged plaintext feed 路径：`PlaintextEvent` 单元测试覆盖 event kind、source provenance、confidence/degraded metadata 保真，并证明 `libssl_uprobe` provenance 可转换为对应 `CaptureSource`；`PlaintextEventProvider` 单元测试覆盖单一 source 对 event/capability 的保真和 mismatched source fail-fast；agent JSON-lines provider 测试覆盖硬编码外部 feed schema、streaming provider、unknown field fail-closed、超长行 fail-closed、缺失 process 强制 0 confidence，以及 confidence 超过 100 的拒绝；pipeline 测试覆盖 external plaintext feed chunk 写入 ingress journal，并由 HTTP/1 parser 产出 `HttpRequestHeaders` export event，`source = external_plaintext_feed`。这只验证“已解密明文进入统一 pipeline”，不等同于 TLS uprobe 或 keylog 解密已完成。
+当前已验证的 non-privileged plaintext feed 路径：`PlaintextEvent` 单元测试覆盖 event kind、source provenance、confidence/degraded metadata 保真，并证明 `libssl_uprobe` provenance 可转换为对应 `CaptureSource`；`PlaintextEventProvider` 单元测试覆盖单一 source 对 event/capability 的保真和 mismatched source fail-fast；agent JSON-lines provider 测试覆盖硬编码外部 feed schema、streaming provider、unknown field fail-closed、超长行 fail-closed、缺失 process 强制 0 confidence，以及 confidence 超过 100 的拒绝；pipeline 测试覆盖 external plaintext feed chunk 写入 ingress journal，并由 HTTP/1 parser 产出 `HttpRequestHeaders` export event，`source = external_plaintext_feed`；`xtask e2e-plaintext-feed` 通过真实 agent config、configured policy bundle、agent run 和 Fjall spool readback 覆盖非特权端到端闭环。这只验证“已解密明文进入统一 pipeline”，不等同于 TLS uprobe 或 keylog 解密已完成。
 
 当前已验证的 libssl plaintext ABI/adapter/loader/runtime 路径按层拆分：
 
@@ -1368,16 +1369,17 @@ Runtime/config/status 验证覆盖：
 
 当前端到端验收：
 
-1. 启动 `e2e-fixture` 或本机 HTTP/SSE 测试服务。
-2. 配置 selector 命中该进程。
-3. agent 捕获 HTTP/1.x request/response。
-4. agent 识别 SSE streaming response。
-5. Lua 策略产出 alert。
-6. 事件写入 Fjall spool。
-7. HTTP webhook batch exporter 发送 protobuf batch。
-8. 测试 receiver 返回 JSON structured ack。
-9. exporter cursor 前进。
-10. metrics 中无静默 gap；如人为制造过载，则出现明确 degraded/gap。
+1. 运行 `cargo run -p xtask -- e2e-plaintext-feed`，验证非特权 plaintext feed 到 agent durable output 的闭环。
+2. 启动 `e2e-fixture` 或本机 HTTP/SSE 测试服务。
+3. 配置 selector 命中该进程。
+4. agent 捕获 HTTP/1.x request/response。
+5. agent 识别 SSE streaming response。
+6. Lua 策略产出 alert。
+7. 事件写入 Fjall spool。
+8. HTTP webhook batch exporter 发送 protobuf batch。
+9. 测试 receiver 返回 JSON structured ack。
+10. exporter cursor 前进。
+11. metrics 中无静默 gap；如人为制造过载，则出现明确 degraded/gap。
 
 当前 TLS 已验证边界：
 
