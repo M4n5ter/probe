@@ -13,6 +13,7 @@ probe-core = { version = "0.1.0", path = "../core" }
 rustix = { version = "1.1.4", features = ["process"] }
 serde_json = "1.0.150"
 signal-hook = "0.4.4"
+socket2 = { version = "0.6.4", features = ["all"] }
 storage = { version = "0.1.0", path = "../storage" }
 toml = "1.1"
 

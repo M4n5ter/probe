@@ -19,7 +19,7 @@ use storage::{FjallSpool, StoredEvent};
 use super::{
     harness::{
         ChildSupervisor, UnixSocketReadySignal, create_temp_root, decode_capture_event,
-        decode_envelope, e2e_error, stop_running_child,
+        decode_envelope, e2e_error, ensure_e2e_packages_built, stop_running_child,
     },
     loopback::{
         Http1LoopbackFixtureConfig, assert_no_policy_runtime_errors, is_fixture_process,
@@ -54,6 +54,7 @@ pub(crate) fn run() -> ExitCode {
 }
 
 fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
+    ensure_e2e_packages_built(["agent", "e2e-fixture"])?;
     let tls_object_path = crate::ebpf::ensure_tls_plaintext_artifact_ready().map_err(e2e_error)?;
 
     let root = create_temp_root("tls-plaintext-loopback")?;

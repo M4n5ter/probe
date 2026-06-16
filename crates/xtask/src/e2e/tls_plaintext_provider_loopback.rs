@@ -17,7 +17,7 @@ use probe_core::{
 };
 
 use super::{
-    harness::{ChildSupervisor, create_temp_root, e2e_error},
+    harness::{ChildSupervisor, create_temp_root, e2e_error, ensure_e2e_packages_built},
     loopback::{
         Http1LoopbackFixtureConfig, spawn_tls_http1_loopback_fixture, start_http1_loopback_fixture,
         wait_for_http1_loopback_fixture_exit, wait_for_http1_loopback_fixture_ready,
@@ -44,6 +44,7 @@ pub(crate) fn run() -> ExitCode {
 }
 
 fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
+    ensure_e2e_packages_built(["e2e-fixture"])?;
     let tls_object_path = crate::ebpf::ensure_tls_plaintext_artifact_ready().map_err(e2e_error)?;
 
     let root = create_temp_root("tls-plaintext-provider-loopback")?;

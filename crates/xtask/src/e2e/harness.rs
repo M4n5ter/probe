@@ -6,7 +6,7 @@ use std::{
     io::{Read, Write},
     os::unix::{fs::DirBuilderExt, net::UnixListener},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     thread,
     thread::JoinHandle,
@@ -82,6 +82,120 @@ pub(crate) fn debug_binary(binary: &str) -> Result<PathBuf, std::io::Error> {
         "missing debug binary {}; run `cargo build -p agent -p e2e-fixture -p xtask --locked` before privileged e2e",
         path.display()
     )))
+}
+
+pub(crate) fn ensure_e2e_packages_built<const N: usize>(
+    packages: [&str; N],
+) -> Result<(), io::Error> {
+    for package in packages {
+        ensure_e2e_package_built(package)?;
+    }
+    Ok(())
+}
+
+fn ensure_e2e_package_built(package: &str) -> Result<(), io::Error> {
+    let mut command = cargo_build_command_for_package(package)?;
+    let status = command.status().map_err(|source| {
+        e2e_error(format!(
+            "failed to run `cargo build -p {package} --locked --quiet` before privileged e2e: {source}"
+        ))
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(e2e_error(format!(
+            "`cargo build -p {package} --locked --quiet` failed with {status}; rebuild before privileged e2e"
+        )))
+    }
+}
+
+fn cargo_build_command_for_package(package: &str) -> Result<Command, io::Error> {
+    let mut command = match sudo_invoking_user()? {
+        Some(user) => {
+            let cargo = cargo_executable_for_user(&user)?;
+            let mut command = Command::new(setpriv_command()?);
+            command
+                .arg("--reuid")
+                .arg(user.uid.to_string())
+                .arg("--regid")
+                .arg(user.gid.to_string())
+                .arg("--clear-groups")
+                .arg("--")
+                .arg(cargo)
+                .env("HOME", &user.home);
+            command
+        }
+        None => Command::new(cargo_executable()),
+    };
+    command
+        .args(["build", "-p", package, "--locked", "--quiet"])
+        .stdin(Stdio::null());
+    Ok(command)
+}
+
+struct InvokingUser {
+    uid: u32,
+    gid: u32,
+    home: PathBuf,
+}
+
+fn sudo_invoking_user() -> Result<Option<InvokingUser>, io::Error> {
+    if rustix::process::geteuid().as_raw() != 0 || env::var_os("SUDO_USER").is_none() {
+        return Ok(None);
+    }
+    let user =
+        env::var("SUDO_USER").map_err(|_| e2e_error("root e2e process is missing SUDO_USER"))?;
+    let uid = parse_sudo_id("SUDO_UID")?;
+    let gid = parse_sudo_id("SUDO_GID")?;
+    let home = passwd_home_for_user(&user)
+        .ok_or_else(|| e2e_error(format!("failed to resolve home directory for {user}")))?;
+    Ok(Some(InvokingUser { uid, gid, home }))
+}
+
+fn parse_sudo_id(name: &'static str) -> Result<u32, io::Error> {
+    env::var(name)
+        .map_err(|_| e2e_error(format!("root e2e process is missing {name}")))?
+        .parse::<u32>()
+        .map_err(|source| e2e_error(format!("invalid {name}: {source}")))
+}
+
+fn cargo_executable_for_user(user: &InvokingUser) -> Result<OsString, io::Error> {
+    let path = user.home.join(".cargo/bin/cargo");
+    if path.is_file() {
+        Ok(path.into_os_string())
+    } else {
+        Err(e2e_error(format!(
+            "failed to find cargo for sudo user at {}; run privileged e2e via the developer account that owns the Rust toolchain",
+            path.display()
+        )))
+    }
+}
+
+fn passwd_home_for_user(user: &str) -> Option<PathBuf> {
+    let passwd = fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let fields = line.split(':').collect::<Vec<_>>();
+        if fields.len() >= 6 && fields[0] == user {
+            Some(PathBuf::from(fields[5]))
+        } else {
+            None
+        }
+    })
+}
+
+fn setpriv_command() -> Result<PathBuf, io::Error> {
+    first_existing_system_command(["/usr/bin/setpriv", "/bin/setpriv"], "setpriv")
+}
+
+fn first_existing_system_command<const N: usize>(
+    candidates: [&str; N],
+    name: &str,
+) -> Result<PathBuf, io::Error> {
+    candidates
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .ok_or_else(|| e2e_error(format!("missing trusted system command {name}")))
 }
 
 pub(crate) fn run_in_own_process_group(command: &mut Command) -> &mut Command {
@@ -409,7 +523,6 @@ fn cargo_dep_info_build_inputs(binary_path: &Path) -> Result<Vec<PathBuf>, io::E
             binary_path.display()
         )));
     }
-    inputs.insert(root.join("Cargo.lock"));
     inputs.insert(root.join("Cargo.toml"));
     for input in inputs.clone() {
         add_scoped_manifest_inputs(&root, &input, &mut inputs);
