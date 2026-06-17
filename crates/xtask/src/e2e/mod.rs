@@ -11,6 +11,7 @@ mod tls_plaintext_provider_loopback;
 mod transparent_tproxy_loopback;
 mod webhook_exporter;
 mod webhook_receiver;
+mod websocket_plaintext_feed;
 
 pub(crate) use ebpf_process_loopback::run as run_ebpf_process_loopback;
 pub(crate) use file_exporter::run as run_file_exporter;
@@ -21,3 +22,4 @@ pub(crate) use tls_plaintext_loopback::run_dynamic as run_tls_plaintext_dynamic_
 pub(crate) use tls_plaintext_provider_loopback::run as run_tls_plaintext_provider_loopback;
 pub(crate) use transparent_tproxy_loopback::run as run_transparent_tproxy_loopback;
 pub(crate) use webhook_exporter::run as run_webhook_exporter;
+pub(crate) use websocket_plaintext_feed::run as run_websocket_plaintext_feed;

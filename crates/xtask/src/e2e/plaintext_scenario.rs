@@ -4,6 +4,7 @@ use std::{
 };
 
 use probe_config::{AgentConfig, CaptureSelection, PolicyConfig};
+use probe_core::Direction;
 
 pub(crate) const PLAINTEXT_FEED_EVENT_COUNT: usize = 3;
 pub(crate) const PLAINTEXT_FEED_EXPORT_EVENT_COUNT: usize = 4;
@@ -43,30 +44,29 @@ impl PlaintextFeedScenario {
     }
 
     pub(crate) fn write_feed(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let connection = self.connection_json();
         let request_bytes = self.request_bytes();
-        let records = [
-            serde_json::json!({
-                "type": "connection_opened",
-                "timestamp": feed_timestamp(1),
-                "connection": connection.clone(),
-            }),
-            serde_json::json!({
-                "type": "bytes",
-                "timestamp": feed_timestamp(2),
-                "connection": connection.clone(),
-                "direction": "outbound",
-                "stream_offset": 0,
-                "bytes": request_bytes,
-            }),
-            serde_json::json!({
-                "type": "connection_closed",
-                "timestamp": feed_timestamp(3),
-                "connection": connection,
-            }),
-        ];
+        self.write_feed_records(
+            path,
+            [
+                PlaintextFeedRecord::connection_opened(),
+                PlaintextFeedRecord::bytes(Direction::Outbound, 0, request_bytes),
+                PlaintextFeedRecord::connection_closed(),
+            ],
+        )
+    }
+
+    pub(crate) fn write_feed_records(
+        &self,
+        path: &Path,
+        records: impl IntoIterator<Item = PlaintextFeedRecord>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let connection = self.connection_json();
         let mut content = String::new();
-        for record in records {
+        for (index, record) in records.into_iter().enumerate() {
+            let monotonic_ns = u64::try_from(index)
+                .unwrap_or(u64::MAX - 1)
+                .saturating_add(1);
+            let record = self.feed_record_json(&connection, monotonic_ns, record);
             content.push_str(&serde_json::to_string(&record)?);
             content.push('\n');
         }
@@ -147,6 +147,38 @@ end
         format!("{}@{}", self.policy_id, self.policy_version)
     }
 
+    fn feed_record_json(
+        &self,
+        connection: &serde_json::Value,
+        monotonic_ns: u64,
+        record: PlaintextFeedRecord,
+    ) -> serde_json::Value {
+        match record {
+            PlaintextFeedRecord::ConnectionOpened => serde_json::json!({
+                "type": "connection_opened",
+                "timestamp": feed_timestamp(monotonic_ns),
+                "connection": connection,
+            }),
+            PlaintextFeedRecord::Bytes {
+                direction,
+                stream_offset,
+                bytes,
+            } => serde_json::json!({
+                "type": "bytes",
+                "timestamp": feed_timestamp(monotonic_ns),
+                "connection": connection,
+                "direction": direction,
+                "stream_offset": stream_offset,
+                "bytes": bytes,
+            }),
+            PlaintextFeedRecord::ConnectionClosed => serde_json::json!({
+                "type": "connection_closed",
+                "timestamp": feed_timestamp(monotonic_ns),
+                "connection": connection,
+            }),
+        }
+    }
+
     fn connection_json(&self) -> serde_json::Value {
         serde_json::json!({
             "connection_id": self.connection_id,
@@ -175,6 +207,34 @@ end
                 "cmdline": [self.flow.process.name],
             },
         })
+    }
+}
+
+pub(crate) enum PlaintextFeedRecord {
+    ConnectionOpened,
+    Bytes {
+        direction: Direction,
+        stream_offset: u64,
+        bytes: Vec<u8>,
+    },
+    ConnectionClosed,
+}
+
+impl PlaintextFeedRecord {
+    pub(crate) fn connection_opened() -> Self {
+        Self::ConnectionOpened
+    }
+
+    pub(crate) fn bytes(direction: Direction, stream_offset: u64, bytes: Vec<u8>) -> Self {
+        Self::Bytes {
+            direction,
+            stream_offset,
+            bytes,
+        }
+    }
+
+    pub(crate) fn connection_closed() -> Self {
+        Self::ConnectionClosed
     }
 }
 
