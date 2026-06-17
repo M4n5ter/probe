@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use capture::{
-    CaptureError, CapturePoll, CaptureProvider, CaptureProviderKind, LibsslUprobeAttachPlan,
+    CaptureError, CapturePoll, CaptureProvider, LibsslUprobeAttachPlan,
     LibsslUprobePlaintextProvider, LibsslUprobePlaintextReconcile,
 };
 use probe_core::CapabilityState;
@@ -103,10 +103,6 @@ where
 {
     fn name(&self) -> &'static str {
         self.provider.name()
-    }
-
-    fn kind(&self) -> CaptureProviderKind {
-        self.provider.kind()
     }
 
     fn capabilities(&self) -> Vec<CapabilityState> {
@@ -286,10 +282,6 @@ mod tests {
     impl CaptureProvider for FakeSidecarProvider {
         fn name(&self) -> &'static str {
             "fake_tls_sidecar"
-        }
-
-        fn kind(&self) -> CaptureProviderKind {
-            CaptureProviderKind::Plaintext
         }
 
         fn capabilities(&self) -> Vec<CapabilityState> {

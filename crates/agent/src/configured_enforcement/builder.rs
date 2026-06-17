@@ -162,9 +162,9 @@ mod tests {
         EnforcementPlanRequest, EnforcementPlanner,
     };
     use probe_core::{
-        Action, AddressPort, CaptureSource, Direction, EnforcementMode, EnforcementOutcome,
-        EventEnvelope, EventKind, FlowContext, FlowIdentity, OpaqueStream, ProcessContext,
-        ProcessIdentity, Timestamp, TransportProtocol, Verdict, VerdictScope,
+        Action, AddressPort, CaptureOrigin, CaptureSource, Direction, EnforcementMode,
+        EnforcementOutcome, EventEnvelope, EventKind, FlowContext, FlowIdentity, OpaqueStream,
+        ProcessContext, ProcessIdentity, Timestamp, TransportProtocol, Verdict, VerdictScope,
     };
 
     use super::*;
@@ -279,13 +279,13 @@ mod tests {
     }
 
     fn outbound_event() -> EventEnvelope {
-        EventEnvelope::new(
+        EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1_700_000_000,
             },
             flow_context(),
-            CaptureSource::Replay,
+            CaptureOrigin::from_source(CaptureSource::Replay),
             "test-config",
             EventKind::OpaqueStream(OpaqueStream {
                 direction: Direction::Outbound,

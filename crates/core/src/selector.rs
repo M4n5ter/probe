@@ -133,9 +133,12 @@ impl CompiledSelector {
     }
 
     pub fn matches_event(&self, event: &EventEnvelope) -> bool {
-        event.kind.direction().map_or_else(
-            || self.matches_flow_without_direction(&event.flow),
-            |direction| self.matches_flow(&event.flow, direction),
+        let Some(flow) = event.flow() else {
+            return false;
+        };
+        event.kind().direction().map_or_else(
+            || self.matches_flow_without_direction(flow),
+            |direction| self.matches_flow(flow, direction),
         )
     }
 
@@ -468,9 +471,9 @@ fn unknown_cmdline(process: &ProcessContext) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
-        HttpHeaders, ProcessContext, ProcessIdentity, ProcessSelector, Selector, SelectorRegistry,
-        Timestamp, TrafficSelector, TransportProtocol,
+        AddressPort, CaptureOrigin, CaptureSource, Direction, EventEnvelope, EventKind,
+        FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity, ProcessSelector,
+        Selector, SelectorRegistry, Timestamp, TrafficSelector, TransportProtocol,
     };
 
     #[test]
@@ -496,7 +499,8 @@ mod tests {
     }
 
     #[test]
-    fn selector_matches_event_with_event_direction() -> Result<(), Box<dyn std::error::Error>> {
+    fn selector_matches_flow_events_with_event_direction() -> Result<(), Box<dyn std::error::Error>>
+    {
         let selector = Selector::term(
             ProcessSelector {
                 names: vec!["demo".to_string()],
@@ -512,6 +516,18 @@ mod tests {
 
         assert!(selector.matches_event(&http_event(Direction::Outbound)));
         assert!(!selector.matches_event(&http_event(Direction::Inbound)));
+        assert!(!selector.matches_event(&EventEnvelope::from_provider(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
+            "test",
+            EventKind::CaptureLoss(crate::CaptureLoss {
+                lost_events: 1,
+                reason: "lost".to_string(),
+            }),
+        )));
         Ok(())
     }
 
@@ -897,13 +913,13 @@ mod tests {
     }
 
     fn http_event(direction: Direction) -> EventEnvelope {
-        EventEnvelope::new(
+        EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
             demo_flow(),
-            CaptureSource::Replay,
+            CaptureOrigin::from_source(CaptureSource::Replay),
             "test",
             EventKind::HttpRequestHeaders(HttpHeaders {
                 direction,

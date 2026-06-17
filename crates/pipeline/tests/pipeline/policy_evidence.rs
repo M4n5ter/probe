@@ -46,11 +46,11 @@ end
 
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::HttpRequestHeaders(headers)
-                if envelope.degraded
+                if envelope.degraded()
                     && envelope
-                        .enforcement_evidence
+                        .enforcement_evidence()
                         .destructive_enforcement_rejection_reason()
                         .is_some_and(|reason| reason.contains("eBPF syscall payload snapshot"))
                     && headers.target.as_deref() == Some("/blocked")
@@ -93,10 +93,10 @@ end
 
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::Gap(gap)
                 if envelope
-                    .enforcement_evidence
+                    .enforcement_evidence()
                     .destructive_enforcement_rejection_reason()
                     .is_some_and(|reason| reason.contains("eBPF syscall payload snapshot"))
                     && gap.reason.contains("eBPF syscall gap")
@@ -135,11 +135,11 @@ end
 
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::ProtocolError(error)
                 if error.reason.contains("connection closed before fixed HTTP body completed")
                     && envelope
-                    .enforcement_evidence
+                    .enforcement_evidence()
                     .destructive_enforcement_rejection_reason()
                     .is_some_and(|reason| reason.contains("eBPF syscall payload snapshot"))
         )
@@ -190,11 +190,11 @@ fn event_local_observation_only_gap_does_not_block_parser_cursor_without_close()
     let envelopes = exported_envelopes(&spool)?;
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::Gap(gap)
                 if gap.reason.contains("eBPF unresolved flow")
                     && envelope
-                        .enforcement_evidence
+                        .enforcement_evidence()
                         .destructive_enforcement_rejection_reason()
                         .is_some_and(|reason| reason.contains("strong flow identity"))
         )
@@ -279,17 +279,17 @@ end
         .iter()
         .find(|envelope| {
             matches!(
-                &envelope.kind,
+                envelope.kind(),
                 EventKind::EnforcementDecision(decision)
                     if decision.outcome == EnforcementOutcome::Unsupported
             )
         })
         .expect("observation-only reset must emit an unsupported enforcement decision");
     assert!(!matches!(
-        &decision.kind,
+        decision.kind(),
         EventKind::EnforcementDecision(value) if value.reason.contains(detail)
     ));
-    Ok(decision.id.clone())
+    Ok(decision.id().clone())
 }
 
 fn run_without_policy(
@@ -306,13 +306,13 @@ fn run_without_policy(
 fn assert_unsupported_reset(envelopes: &[EventEnvelope], expected_reason: &str) {
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::PolicyVerdict(verdict) if verdict.action == Action::Reset
         )
     }));
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::EnforcementDecision(decision)
                 if decision.outcome == EnforcementOutcome::Unsupported
                     && decision.requested_action == Action::Reset

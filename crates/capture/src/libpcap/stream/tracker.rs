@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use probe_core::{Direction, FlowContext, Gap, Timestamp};
 
-use crate::{CaptureEvent, CaptureProviderKind, CapturedBytes, CapturedGap};
+use crate::{CaptureEvent, CapturedBytes, CapturedGap};
 
 use super::super::decoder::DecodedTcpSegment;
 use super::super::flow::{FlowCloseSequence, FlowClosure, FlowFinalization, FlowPayload};
@@ -222,8 +222,7 @@ fn stream_piece_event(
         } => CaptureEvent::Bytes(CapturedBytes {
             timestamp,
             flow,
-            source: probe_core::CaptureSource::Libpcap,
-            provider: CaptureProviderKind::Libpcap,
+            origin: probe_core::CaptureOrigin::from_source(probe_core::CaptureSource::Libpcap),
             direction,
             stream_offset,
             bytes,
@@ -240,8 +239,7 @@ fn stream_piece_event(
         } => CaptureEvent::Gap(CapturedGap {
             timestamp,
             flow,
-            source: probe_core::CaptureSource::Libpcap,
-            provider: CaptureProviderKind::Libpcap,
+            origin: probe_core::CaptureOrigin::from_source(probe_core::CaptureSource::Libpcap),
             enforcement_evidence: probe_core::EnforcementEvidence::default(),
             enforcement_evidence_propagation: crate::EnforcementEvidencePropagation::Event,
             gap: Gap {

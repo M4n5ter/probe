@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use probe_core::EventEnvelope;
+use probe_core::FlowContext;
 
 const SS_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -24,12 +24,12 @@ pub(super) struct SsKillRequest {
 }
 
 impl SsKillRequest {
-    pub(super) fn from_event(event: &EventEnvelope) -> Self {
+    pub(super) fn from_flow(flow: &FlowContext) -> Self {
         Self {
-            local_address: event.flow.local.address.clone(),
-            local_port: event.flow.local.port,
-            remote_address: event.flow.remote.address.clone(),
-            remote_port: event.flow.remote.port,
+            local_address: flow.local.address.clone(),
+            local_port: flow.local.port,
+            remote_address: flow.remote.address.clone(),
+            remote_port: flow.remote.port,
         }
     }
 

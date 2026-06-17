@@ -46,7 +46,12 @@ where
     R: CurrentSocketOwnerResolver,
 {
     fn verify(&mut self, event: &EventEnvelope) -> FlowOwnerVerification {
-        let connection = match tcp_connection_from_event(event) {
+        let Some(flow) = event.flow() else {
+            return FlowOwnerVerification::unsupported(
+                "procfs owner verification requires a flow-scoped trigger event",
+            );
+        };
+        let connection = match tcp_connection_from_flow(flow) {
             Ok(connection) => connection,
             Err(reason) => return FlowOwnerVerification::unsupported(reason),
         };
@@ -57,18 +62,18 @@ where
             Ok(None) => {
                 return FlowOwnerVerification::unsupported(format!(
                     "procfs owner verification could not find a current socket owner for flow {}",
-                    event.flow.id.0
+                    flow.id.0
                 ));
             }
             Err(error) => {
                 return FlowOwnerVerification::unsupported(format!(
                     "procfs owner verification failed for flow {}: {error}",
-                    event.flow.id.0
+                    flow.id.0
                 ));
             }
         };
 
-        if same_process_identity(&event.flow.process.identity, &resolved.process.identity) {
+        if same_process_identity(&flow.process.identity, &resolved.process.identity) {
             FlowOwnerVerification::Matched {
                 socket_inode: resolved.socket_inode,
                 confidence: resolved.confidence,
@@ -76,9 +81,9 @@ where
         } else {
             FlowOwnerVerification::unsupported(format!(
                 "procfs owner verification rejected flow {} because current socket owner {} does not match trigger process {}",
-                event.flow.id.0,
+                flow.id.0,
                 process_identity_summary(&resolved.process.identity),
-                process_identity_summary(&event.flow.process.identity),
+                process_identity_summary(&flow.process.identity),
             ))
         }
     }
@@ -111,10 +116,10 @@ impl CurrentSocketOwnerResolver for ProcfsSocketOwnerResolver {
     }
 }
 
-fn tcp_connection_from_event(event: &EventEnvelope) -> Result<TcpConnection, String> {
+fn tcp_connection_from_flow(flow: &probe_core::FlowContext) -> Result<TcpConnection, String> {
     Ok(TcpConnection::new(
-        tcp_endpoint_from_address_port(&event.flow.local, "local")?,
-        tcp_endpoint_from_address_port(&event.flow.remote, "remote")?,
+        tcp_endpoint_from_address_port(&flow.local, "local")?,
+        tcp_endpoint_from_address_port(&flow.remote, "remote")?,
     ))
 }
 
@@ -152,8 +157,8 @@ mod tests {
     };
 
     use probe_core::{
-        AddressPort, CaptureSource, Direction, EventKind, FlowContext, FlowIdentity, OpaqueStream,
-        ProcessContext, Timestamp, TransportProtocol,
+        AddressPort, CaptureOrigin, CaptureSource, Direction, EventKind, FlowContext, FlowIdentity,
+        OpaqueStream, ProcessContext, Timestamp, TransportProtocol,
     };
 
     use super::*;
@@ -162,7 +167,11 @@ mod tests {
     fn procfs_owner_verifier_matches_current_socket_owner() {
         let event = event_with_process(process_context(42, 42, 7, "/usr/bin/app", "hash"));
         let resolver = FakeSocketOwnerResolver::with_results([Ok(Some(socket_owner(
-            event.flow.process.clone(),
+            event
+                .flow()
+                .expect("test event is flow scoped")
+                .process
+                .clone(),
             123,
             60,
         )))]);
@@ -208,8 +217,16 @@ mod tests {
 
     #[test]
     fn procfs_owner_verifier_rejects_unparseable_flow_without_resolver_lookup() {
-        let mut event = event_with_process(process_context(42, 42, 7, "/usr/bin/app", "hash"));
-        event.flow.local.address = "not-an-ip".to_string();
+        let event = event_with_process(process_context(42, 42, 7, "/usr/bin/app", "hash"));
+        let mut flow = event.flow().expect("test event is flow scoped").clone();
+        flow.local.address = "not-an-ip".to_string();
+        let event = EventEnvelope::from_flow(
+            event.timestamp(),
+            flow,
+            event.origin(),
+            event.config_version().to_string(),
+            event.kind().clone(),
+        );
         let resolver = FakeSocketOwnerResolver::with_results([]);
         let mut verifier = ProcfsFlowOwnerVerifier::new(resolver.clone());
 
@@ -321,7 +338,7 @@ mod tests {
     }
 
     fn event_with_process(process: ProcessContext) -> EventEnvelope {
-        EventEnvelope::new(
+        EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
@@ -342,7 +359,7 @@ mod tests {
                 socket_cookie: None,
                 attribution_confidence: 100,
             },
-            CaptureSource::Libpcap,
+            CaptureOrigin::from_source(CaptureSource::Libpcap),
             "test-config",
             EventKind::OpaqueStream(OpaqueStream {
                 direction: Direction::Outbound,

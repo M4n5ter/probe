@@ -5,8 +5,8 @@ use std::{
 };
 
 use capture::{
-    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind, PlaintextChunk,
-    PlaintextConnection, PlaintextEvent, PlaintextGap, PlaintextSource,
+    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, PlaintextChunk, PlaintextConnection,
+    PlaintextEvent, PlaintextGap, PlaintextSource,
 };
 use probe_core::{
     AddressPort, CapabilityKind, CapabilityState, Direction, FlowContext, FlowIdentity, Gap,
@@ -99,10 +99,6 @@ where
 {
     fn name(&self) -> &'static str {
         PROVIDER_NAME
-    }
-
-    fn kind(&self) -> CaptureProviderKind {
-        CaptureProviderKind::Plaintext
     }
 
     fn capabilities(&self) -> Vec<CapabilityState> {
@@ -490,7 +486,7 @@ mod tests {
         let CaptureEvent::Bytes(chunk) = event else {
             panic!("expected plaintext bytes");
         };
-        assert_eq!(chunk.source, CaptureSource::ExternalPlaintextFeed);
+        assert_eq!(chunk.origin.source(), CaptureSource::ExternalPlaintextFeed);
         assert_eq!(chunk.timestamp.wall_time_unix_ns, 1);
         assert_eq!(chunk.flow.id.0, "external_plaintext_feed:fixture-conn");
         assert_eq!(chunk.flow.local.address, "127.0.0.1");

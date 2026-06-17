@@ -5,7 +5,7 @@ use pcap::{Active, Capture, Device, Linktype, PacketHeader};
 use probe_core::{CapabilityKind, CapabilityState, CaptureSource, Timestamp};
 
 use crate::ProcessResolver;
-use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind};
+use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider};
 
 use super::decoder::DecodedTcpSegment;
 use super::flow::{
@@ -321,10 +321,6 @@ impl CaptureProvider for LibpcapProvider {
         "libpcap"
     }
 
-    fn kind(&self) -> CaptureProviderKind {
-        CaptureProviderKind::Libpcap
-    }
-
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::available(CapabilityKind::Libpcap)]
     }
@@ -351,8 +347,7 @@ fn connection_closed_event(timestamp: Timestamp, flow: probe_core::FlowContext) 
     CaptureEvent::ConnectionClosed {
         timestamp,
         flow,
-        source: CaptureSource::Libpcap,
-        provider: CaptureProviderKind::Libpcap,
+        origin: probe_core::CaptureOrigin::from_source(CaptureSource::Libpcap),
     }
 }
 

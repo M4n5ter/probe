@@ -364,20 +364,11 @@ fn ingress_summary(events: &[CaptureEvent], listen_port: u16) -> String {
 
 fn event_summary(event: &CaptureEvent, listen_port: u16) -> Option<String> {
     match event {
-        CaptureEvent::ConnectionOpened {
-            source,
-            provider,
-            flow,
-            ..
-        }
-        | CaptureEvent::ConnectionClosed {
-            source,
-            provider,
-            flow,
-            ..
-        } if *source == CaptureSource::EbpfSyscall
-            && *provider == CaptureProviderKind::Ebpf
-            && (flow.local.port == listen_port || flow.remote.port == listen_port) =>
+        CaptureEvent::ConnectionOpened { origin, flow, .. }
+        | CaptureEvent::ConnectionClosed { origin, flow, .. }
+            if origin.source() == CaptureSource::EbpfSyscall
+                && origin.provider() == CaptureProviderKind::Ebpf
+                && (flow.local.port == listen_port || flow.remote.port == listen_port) =>
         {
             Some(format!(
                 "{} local={}:{} remote={}:{} pid={} name={} confidence={} fixture={}",
@@ -397,8 +388,8 @@ fn event_summary(event: &CaptureEvent, listen_port: u16) -> Option<String> {
             ))
         }
         CaptureEvent::Bytes(bytes)
-            if bytes.source == CaptureSource::EbpfSyscall
-                && bytes.provider == CaptureProviderKind::Ebpf
+            if bytes.origin.source() == CaptureSource::EbpfSyscall
+                && bytes.origin.provider() == CaptureProviderKind::Ebpf
                 && (bytes.flow.local.port == listen_port
                     || bytes.flow.remote.port == listen_port) =>
         {
@@ -418,8 +409,8 @@ fn event_summary(event: &CaptureEvent, listen_port: u16) -> Option<String> {
             ))
         }
         CaptureEvent::Gap(gap)
-            if gap.source == CaptureSource::EbpfSyscall
-                && gap.provider == CaptureProviderKind::Ebpf
+            if gap.origin.source() == CaptureSource::EbpfSyscall
+                && gap.origin.provider() == CaptureProviderKind::Ebpf
                 && (gap.flow.local.port == listen_port || gap.flow.remote.port == listen_port) =>
         {
             Some(format!(
@@ -458,26 +449,10 @@ fn is_expected_connection_event(
     lifecycle: ConnectionLifecycle,
 ) -> bool {
     match (lifecycle, event) {
-        (
-            ConnectionLifecycle::Opened,
-            CaptureEvent::ConnectionOpened {
-                source,
-                provider,
-                flow,
-                ..
-            },
-        )
-        | (
-            ConnectionLifecycle::Closed,
-            CaptureEvent::ConnectionClosed {
-                source,
-                provider,
-                flow,
-                ..
-            },
-        ) => {
-            *source == CaptureSource::EbpfSyscall
-                && *provider == CaptureProviderKind::Ebpf
+        (ConnectionLifecycle::Opened, CaptureEvent::ConnectionOpened { origin, flow, .. })
+        | (ConnectionLifecycle::Closed, CaptureEvent::ConnectionClosed { origin, flow, .. }) => {
+            origin.source() == CaptureSource::EbpfSyscall
+                && origin.provider() == CaptureProviderKind::Ebpf
                 && matches_expected_side(flow.local.port, flow.remote.port, listen_port, side)
                 && flow.attribution_confidence > 0
                 && is_fixture_process(&flow.process)
@@ -495,8 +470,8 @@ fn is_expected_degraded_payload_event(
     let CaptureEvent::Bytes(bytes) = event else {
         return false;
     };
-    bytes.source == CaptureSource::EbpfSyscall
-        && bytes.provider == CaptureProviderKind::Ebpf
+    bytes.origin.source() == CaptureSource::EbpfSyscall
+        && bytes.origin.provider() == CaptureProviderKind::Ebpf
         && bytes.direction == direction
         && matches_expected_side(
             bytes.flow.local.port,
@@ -529,8 +504,8 @@ fn is_expected_gap_event(
     let CaptureEvent::Gap(gap) = event else {
         return false;
     };
-    gap.source == CaptureSource::EbpfSyscall
-        && gap.provider == CaptureProviderKind::Ebpf
+    gap.origin.source() == CaptureSource::EbpfSyscall
+        && gap.origin.provider() == CaptureProviderKind::Ebpf
         && gap.gap.direction == direction
         && matches_expected_side(gap.flow.local.port, gap.flow.remote.port, listen_port, side)
         && gap.flow.attribution_confidence > 0
@@ -595,16 +570,14 @@ fn is_expected_lifecycle_envelope(
         ConnectionLifecycle::Opened => EventKind::ConnectionOpened,
         ConnectionLifecycle::Closed => EventKind::ConnectionClosed,
     };
-    envelope.source == CaptureSource::EbpfSyscall
-        && matches_expected_side(
-            envelope.flow.local.port,
-            envelope.flow.remote.port,
-            listen_port,
-            side,
-        )
-        && envelope.flow.attribution_confidence > 0
-        && is_fixture_process(&envelope.flow.process)
-        && envelope.kind == expected_kind
+    let Some(flow) = envelope.flow() else {
+        return false;
+    };
+    envelope.origin().source() == CaptureSource::EbpfSyscall
+        && matches_expected_side(flow.local.port, flow.remote.port, listen_port, side)
+        && flow.attribution_confidence > 0
+        && is_fixture_process(&flow.process)
+        && envelope.kind() == &expected_kind
 }
 
 fn assert_expected_requests(envelopes: &[EventEnvelope]) -> Result<(), Box<dyn std::error::Error>> {
@@ -618,12 +591,13 @@ fn assert_expected_request_direction(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let observed = envelopes
         .iter()
-        .filter_map(|envelope| match &envelope.kind {
+        .filter_map(|envelope| match envelope.kind() {
             EventKind::HttpRequestHeaders(headers)
-                if envelope.source == CaptureSource::EbpfSyscall
-                    && envelope.degraded
+                if envelope.origin().source() == CaptureSource::EbpfSyscall
+                    && envelope.origin().provider() == CaptureProviderKind::Ebpf
+                    && envelope.degraded()
                     && matches!(
-                        &envelope.enforcement_evidence,
+                        &envelope.enforcement_evidence(),
                         EnforcementEvidence::ObservationOnly {
                             reason: ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
                             ..
@@ -664,12 +638,13 @@ fn assert_expected_response_direction(
         .iter()
         .filter(|envelope| {
             matches!(
-                &envelope.kind,
+                envelope.kind(),
                 EventKind::HttpResponseHeaders(headers)
-                if envelope.source == CaptureSource::EbpfSyscall
-                    && envelope.degraded
+                if envelope.origin().source() == CaptureSource::EbpfSyscall
+                    && envelope.origin().provider() == CaptureProviderKind::Ebpf
+                    && envelope.degraded()
                     && matches!(
-                        &envelope.enforcement_evidence,
+                        &envelope.enforcement_evidence(),
                         EnforcementEvidence::ObservationOnly {
                             reason: ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
                             ..
@@ -695,13 +670,14 @@ fn assert_expected_policy_alerts(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let observed = envelopes
         .iter()
-        .filter_map(|envelope| match &envelope.kind {
+        .filter_map(|envelope| match envelope.kind() {
             EventKind::PolicyAlert(alert)
-                if envelope.source == CaptureSource::EbpfSyscall
-                    && envelope.policy_version.as_deref() == Some(EXPECTED_POLICY_VERSION)
-                    && envelope.degraded
+                if envelope.origin().source() == CaptureSource::EbpfSyscall
+                    && envelope.origin().provider() == CaptureProviderKind::Ebpf
+                    && envelope.policy_version() == Some(EXPECTED_POLICY_VERSION)
+                    && envelope.degraded()
                     && matches!(
-                        &envelope.enforcement_evidence,
+                        &envelope.enforcement_evidence(),
                         EnforcementEvidence::ObservationOnly {
                             reason: ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
                             ..

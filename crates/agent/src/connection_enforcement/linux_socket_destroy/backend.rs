@@ -29,17 +29,23 @@ where
         &mut self,
         request: EnforcementBackendRequest<'_>,
     ) -> Result<EnforcementBackendDecision, enforcement::EnforcementError> {
-        if !request.trigger.source.is_live_host_observation() {
+        if !request.trigger.origin().source().is_live_host_observation() {
             return Ok(EnforcementBackendDecision::unsupported(format!(
                 "linux socket destroy enforcement requires a live host capture event; requested source {:?}",
-                request.trigger.source
+                request.trigger.origin().source()
             )));
         }
 
-        if request.trigger.flow.protocol != TransportProtocol::Tcp {
+        let Some(flow) = request.trigger.flow() else {
+            return Ok(EnforcementBackendDecision::unsupported(
+                "linux socket destroy enforcement requires a flow-scoped trigger event".to_string(),
+            ));
+        };
+
+        if flow.protocol != TransportProtocol::Tcp {
             return Ok(EnforcementBackendDecision::unsupported(format!(
                 "linux socket destroy enforcement only supports TCP flows; requested {:?}",
-                request.trigger.flow.protocol
+                flow.protocol
             )));
         }
 
@@ -53,7 +59,7 @@ where
             }
         };
 
-        let command = SsKillRequest::from_event(request.trigger);
+        let command = SsKillRequest::from_flow(flow);
         let result = self
             .runner
             .kill(&command)
@@ -66,13 +72,13 @@ where
         if !result.closed_any_socket() {
             return Ok(EnforcementBackendDecision::unsupported(format!(
                 "ss -K did not close a socket for flow {}",
-                request.trigger.flow.id.0
+                flow.id.0
             )));
         }
 
         Ok(EnforcementBackendDecision::applied(format!(
             "ss -K destroyed TCP socket for flow {} using {:?} after procfs owner verification matched inode {} with confidence {}",
-            request.trigger.flow.id.0, request.verdict.action, socket_inode, confidence
+            flow.id.0, request.verdict.action, socket_inode, confidence
         )))
     }
 }
@@ -87,9 +93,9 @@ mod tests {
 
     use enforcement::{EnforcementPlanRequest, EnforcementPlanner, ScopedEnforcementPlanner};
     use probe_core::{
-        Action, AddressPort, CaptureSource, Direction, EnforcementDecision, EventEnvelope,
-        EventKind, FlowContext, FlowIdentity, OpaqueStream, ProcessContext, ProcessIdentity,
-        ProtectiveActionProfile, Timestamp, Verdict, VerdictScope,
+        Action, AddressPort, CaptureOrigin, CaptureSource, Direction, EnforcementDecision,
+        EventEnvelope, EventKind, FlowContext, FlowIdentity, OpaqueStream, ProcessContext,
+        ProcessIdentity, ProtectiveActionProfile, Timestamp, Verdict, VerdictScope,
     };
 
     use super::super::ss::SsKillResult;
@@ -119,7 +125,17 @@ mod tests {
                 remote_port: 8080,
             }]
         );
-        assert_eq!(verifier.verified_flows(), vec![trigger.flow.id.0.clone()]);
+        assert_eq!(
+            verifier.verified_flows(),
+            vec![
+                trigger
+                    .flow()
+                    .expect("test trigger is flow scoped")
+                    .id
+                    .0
+                    .clone()
+            ]
+        );
         assert_eq!(decision.outcome, probe_core::EnforcementOutcome::Applied);
         assert_eq!(decision.effective_action, Action::Reset);
         Ok(())
@@ -161,7 +177,17 @@ mod tests {
             probe_core::EnforcementOutcome::Unsupported
         );
         assert_eq!(decision.effective_action, Action::Observe);
-        assert_eq!(verifier.verified_flows(), vec![trigger.flow.id.0]);
+        assert_eq!(
+            verifier.verified_flows(),
+            vec![
+                trigger
+                    .flow()
+                    .expect("test trigger is flow scoped")
+                    .id
+                    .0
+                    .clone()
+            ]
+        );
         assert!(
             runner.requests().is_empty(),
             "owner verification failure must not invoke ss -K"
@@ -306,7 +332,8 @@ mod tests {
                 .state
                 .lock()
                 .expect("fake owner verifier state poisoned");
-            state.verified_flows.push(event.flow.id.0.clone());
+            let flow = event.flow().expect("test trigger is flow scoped");
+            state.verified_flows.push(flow.id.0.clone());
             state
                 .results
                 .pop_front()
@@ -363,7 +390,7 @@ mod tests {
         protocol: TransportProtocol,
         source: CaptureSource,
     ) -> EventEnvelope {
-        EventEnvelope::new(
+        EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
@@ -401,7 +428,7 @@ mod tests {
                 socket_cookie: None,
                 attribution_confidence: 100,
             },
-            source,
+            CaptureOrigin::from_source(source),
             "test-config",
             EventKind::OpaqueStream(OpaqueStream {
                 direction: Direction::Outbound,

@@ -1,9 +1,9 @@
 use probe_core::{
-    AddressPort, CaptureLoss, CaptureSource, EnforcementEvidence, FlowContext, FlowIdentity,
-    ObservationOnlyReason, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+    CaptureLoss, CaptureOrigin, CaptureSource, EnforcementEvidence, ObservationOnlyReason,
+    Timestamp,
 };
 
-use crate::{CaptureEvent, CaptureProviderKind, CapturedLoss};
+use crate::{CaptureEvent, CapturedLoss};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OutputLossTracker {
@@ -53,16 +53,13 @@ pub(crate) fn provider_output_loss_event(
     timestamp: Timestamp,
     lost_events: u64,
     source: CaptureSource,
-    provider: CaptureProviderKind,
     reason: String,
 ) -> CaptureEvent {
     CaptureEvent::Loss(CapturedLoss {
         timestamp,
-        flow: unknown_provider_loss_flow(timestamp.monotonic_ns),
-        source,
-        provider,
+        origin: CaptureOrigin::from_source(source),
         enforcement_evidence: EnforcementEvidence::observation_only_with_detail(
-            ObservationOnlyReason::EbpfCaptureLoss,
+            ObservationOnlyReason::ProviderCaptureLoss,
             reason.clone(),
         ),
         loss: CaptureLoss {
@@ -70,53 +67,6 @@ pub(crate) fn provider_output_loss_event(
             reason,
         },
     })
-}
-
-fn unknown_provider_loss_flow(start_monotonic_ns: u64) -> FlowContext {
-    let process = ProcessContext {
-        identity: ProcessIdentity {
-            pid: 0,
-            tgid: 0,
-            start_time_ticks: 0,
-            boot_id: String::new(),
-            exe_path: String::new(),
-            cmdline_hash: String::new(),
-            uid: 0,
-            gid: 0,
-            cgroup: None,
-            systemd_service: None,
-            container_id: None,
-            runtime_hint: None,
-        },
-        name: "unknown".to_string(),
-        cmdline: Vec::new(),
-    };
-    let local = unknown_endpoint();
-    let remote = unknown_endpoint();
-    FlowContext {
-        id: FlowIdentity::stable(
-            &process.identity,
-            &local,
-            &remote,
-            TransportProtocol::Tcp,
-            start_monotonic_ns,
-            None,
-        ),
-        process,
-        local,
-        remote,
-        protocol: TransportProtocol::Tcp,
-        start_monotonic_ns,
-        socket_cookie: None,
-        attribution_confidence: 0,
-    }
-}
-
-fn unknown_endpoint() -> AddressPort {
-    AddressPort {
-        address: "0.0.0.0".to_string(),
-        port: 0,
-    }
 }
 
 #[cfg(test)]

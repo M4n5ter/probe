@@ -9,7 +9,7 @@ use probe_core::{
 
 use crate::output_loss::{OutputLossTracker, provider_output_loss_event};
 use crate::{
-    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind, PlaintextEvent,
+    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, PlaintextEvent,
     tls::LibsslUprobeAttachPlan,
 };
 
@@ -251,22 +251,12 @@ fn output_loss_event(timestamp: Timestamp, lost_events: u64) -> CaptureEvent {
     let reason = format!(
         "eBPF libssl uprobe plaintext output ring buffer could not accept {lost_events} event(s); TLS plaintext parser state may have missed encrypted stream observations"
     );
-    provider_output_loss_event(
-        timestamp,
-        lost_events,
-        CaptureSource::LibsslUprobe,
-        CaptureProviderKind::Plaintext,
-        reason,
-    )
+    provider_output_loss_event(timestamp, lost_events, CaptureSource::LibsslUprobe, reason)
 }
 
 impl CaptureProvider for LibsslUprobePlaintextProvider {
     fn name(&self) -> &'static str {
         "libssl_uprobe_plaintext"
-    }
-
-    fn kind(&self) -> CaptureProviderKind {
-        CaptureProviderKind::Plaintext
     }
 
     fn capabilities(&self) -> Vec<CapabilityState> {
@@ -350,8 +340,8 @@ mod tests {
         };
 
         assert_eq!(provider.name(), "libssl_uprobe_plaintext");
-        assert_eq!(bytes.source, CaptureSource::LibsslUprobe);
-        assert_eq!(bytes.provider, CaptureProviderKind::Plaintext);
+        assert_eq!(bytes.origin.source(), CaptureSource::LibsslUprobe);
+        assert_eq!(bytes.origin.provider(), CaptureProviderKind::Plaintext);
         assert_eq!(bytes.stream_offset, 100);
         assert_eq!(bytes.bytes.as_ref(), b"GET /");
         assert!(provider.next()?.is_none());
@@ -459,9 +449,8 @@ mod tests {
         );
 
         let first = expect_output_loss(provider.poll_next()?);
-        assert_eq!(first.source, CaptureSource::LibsslUprobe);
-        assert_eq!(first.provider, CaptureProviderKind::Plaintext);
-        assert_eq!(first.flow.attribution_confidence, 0);
+        assert_eq!(first.origin.source(), CaptureSource::LibsslUprobe);
+        assert_eq!(first.origin.provider(), CaptureProviderKind::Plaintext);
         assert_eq!(first.loss.lost_events, 2);
         assert!(
             first

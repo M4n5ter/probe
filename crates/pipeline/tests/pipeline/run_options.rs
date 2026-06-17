@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use capture::{CaptureError, CapturePoll, CaptureProvider, CaptureProviderKind};
+use capture::{CaptureError, CapturePoll, CaptureProvider};
 use parsers::Http1ParserFactory;
 use pipeline::{CapturePipeline, PipelineRunOptions};
 use probe_core::CapabilityState;
@@ -87,10 +87,6 @@ struct UnreadableProvider;
 impl CaptureProvider for UnreadableProvider {
     fn name(&self) -> &'static str {
         "unreadable"
-    }
-
-    fn kind(&self) -> CaptureProviderKind {
-        CaptureProviderKind::Replay
     }
 
     fn capabilities(&self) -> Vec<CapabilityState> {

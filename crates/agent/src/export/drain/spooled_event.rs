@@ -1,5 +1,5 @@
 use probe_core::{
-    AddressPort, CaptureSource, EventEnvelope, EventKind, FlowContext, FlowIdentity,
+    AddressPort, CaptureOrigin, CaptureSource, EventEnvelope, EventKind, FlowContext, FlowIdentity,
     ProcessContext, ProcessIdentity, SpoolPayloadSchema, Timestamp, TransportProtocol,
 };
 use storage::{FjallSpool, SpoolPayload};
@@ -18,16 +18,16 @@ pub(in crate::export::drain) fn append_export_event(
     spool: &FjallSpool,
     monotonic_ns: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let envelope = EventEnvelope::new(
+    let envelope = EventEnvelope::from_flow(
         current_timestamp(monotonic_ns),
         replay_flow(),
-        CaptureSource::Replay,
+        CaptureOrigin::from_source(CaptureSource::Replay),
         "test",
         EventKind::ConnectionOpened,
     );
     let payload = serde_json::to_vec(&envelope)?;
     spool.append_export(SpoolPayload::new(
-        SpoolPayloadSchema::EventEnvelopeJson,
+        SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
         payload,
     ))?;
     Ok(())

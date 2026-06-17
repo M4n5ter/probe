@@ -545,7 +545,7 @@ mod tests {
         let spool_path = temp.join("spool");
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
         spool.append_export(SpoolPayload::new(
-            SpoolPayloadSchema::EventEnvelopeJson,
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
             b"one",
         ))?;
         let plan = Arc::new(runtime_plan(spool_path)?);

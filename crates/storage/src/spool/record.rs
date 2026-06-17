@@ -109,7 +109,7 @@ mod tests {
     fn stored_record_decodes_known_wire_schema_to_canonical_enum()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut encoded = Vec::new();
-        let schema = SpoolPayloadSchema::EVENT_ENVELOPE_JSON.as_bytes();
+        let schema = SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.as_bytes();
         encoded.extend_from_slice(&42_u64.to_be_bytes());
         encoded.extend_from_slice(&(schema.len() as u32).to_be_bytes());
         encoded.extend_from_slice(schema);
@@ -120,11 +120,11 @@ mod tests {
         assert_eq!(record.stored_at_unix_ns, 42);
         assert_eq!(
             record.payload.schema(),
-            &SpoolPayloadSchema::EventEnvelopeJson
+            &SpoolPayloadSchema::EventEnvelopeSubjectOriginJson
         );
         assert_eq!(
             record.payload.schema_wire(),
-            SpoolPayloadSchema::EVENT_ENVELOPE_JSON
+            SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON
         );
         assert_eq!(record.payload.bytes(), b"payload");
         Ok(())

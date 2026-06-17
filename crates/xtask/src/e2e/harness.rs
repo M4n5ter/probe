@@ -754,7 +754,7 @@ fn wait_for_exit(
 pub(crate) fn decode_capture_event(
     event: &StoredEvent,
 ) -> Result<CaptureEvent, Box<dyn std::error::Error>> {
-    if event.payload.schema() != &SpoolPayloadSchema::CaptureEventJson {
+    if event.payload.schema() != &SpoolPayloadSchema::CaptureEventOriginJson {
         return Err(e2e_error(format!(
             "ingress record {} used unexpected schema {}",
             event.sequence,
@@ -768,7 +768,7 @@ pub(crate) fn decode_capture_event(
 pub(crate) fn decode_envelope(
     event: &StoredEvent,
 ) -> Result<EventEnvelope, Box<dyn std::error::Error>> {
-    if event.payload.schema() != &SpoolPayloadSchema::EventEnvelopeJson {
+    if event.payload.schema() != &SpoolPayloadSchema::EventEnvelopeSubjectOriginJson {
         return Err(e2e_error(format!(
             "export record {} used unexpected schema {}",
             event.sequence,

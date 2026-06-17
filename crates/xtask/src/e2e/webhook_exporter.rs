@@ -7,7 +7,9 @@ use std::{
 
 use exporter::CompressionCodec;
 use probe_config::{CompressionCodecName, ExporterConfig, ExporterTransport};
-use probe_core::{CaptureSource, EventEnvelope, EventKind, SpoolPayloadSchema};
+use probe_core::{
+    CaptureProviderKind, CaptureSource, EventEnvelope, EventKind, SpoolPayloadSchema,
+};
 use proto::PayloadFormat;
 use storage::FjallSpool;
 
@@ -199,7 +201,7 @@ fn assert_batch_sequence_contract(
                 ))
                 .into());
             }
-            if event.payload_schema != SpoolPayloadSchema::EventEnvelopeJson.as_str() {
+            if event.payload_schema != SpoolPayloadSchema::EventEnvelopeSubjectOriginJson.as_str() {
                 return Err(e2e_error(format!(
                     "batch {} carried unexpected payload schema {} at sequence {}",
                     batch.batch.batch_id, event.payload_schema, event.sequence
@@ -260,10 +262,12 @@ fn decode_and_assert_event_records(
         })
         .map(|(batch, record)| {
             let envelope = serde_json::from_slice::<EventEnvelope>(&record.payload)?;
-            if record.event_id != envelope.id.0 {
+            if record.event_id != envelope.id().as_str() {
                 return Err(e2e_error(format!(
                     "batch {} record event id {} did not match payload envelope id {}",
-                    batch.batch_id, record.event_id, envelope.id.0
+                    batch.batch_id,
+                    record.event_id,
+                    envelope.id().as_str()
                 ))
                 .into());
             }
@@ -285,8 +289,11 @@ fn assert_expected_export_set(
     }
     let expected_flow_id = scenario.expected_flow_id();
     if !envelopes.iter().all(|envelope| {
-        envelope.source == CaptureSource::ExternalPlaintextFeed
-            && envelope.flow.id.0 == expected_flow_id
+        envelope.origin().source() == CaptureSource::ExternalPlaintextFeed
+            && envelope.origin().provider() == CaptureProviderKind::Plaintext
+            && envelope
+                .flow()
+                .is_some_and(|flow| flow.id.0 == expected_flow_id)
     }) {
         return Err(e2e_error("webhook batch carried an unexpected source or flow").into());
     }
@@ -295,7 +302,7 @@ fn assert_expected_export_set(
         .iter()
         .filter(|envelope| {
             matches!(
-                &envelope.kind,
+                envelope.kind(),
                 EventKind::HttpRequestHeaders(headers)
                     if headers.method.as_deref() == Some("GET")
                         && headers.target.as_deref() == Some(scenario.request_target())
@@ -307,20 +314,20 @@ fn assert_expected_export_set(
     let policy_alert_count = envelopes
         .iter()
         .filter(|envelope| {
-            envelope.policy_version.as_deref() == Some(expected_policy_version.as_str())
+            envelope.policy_version() == Some(expected_policy_version.as_str())
                 && matches!(
-                    &envelope.kind,
+                    envelope.kind(),
                     EventKind::PolicyAlert(alert) if alert.message == expected_alert
                 )
         })
         .count();
     let opened_count = envelopes
         .iter()
-        .filter(|envelope| matches!(envelope.kind, EventKind::ConnectionOpened))
+        .filter(|envelope| matches!(envelope.kind(), EventKind::ConnectionOpened))
         .count();
     let closed_count = envelopes
         .iter()
-        .filter(|envelope| matches!(envelope.kind, EventKind::ConnectionClosed))
+        .filter(|envelope| matches!(envelope.kind(), EventKind::ConnectionClosed))
         .count();
 
     if (

@@ -352,8 +352,8 @@ mod tests {
         };
         assert_eq!(bytes.timestamp, demo_timestamp());
         assert_eq!(bytes.flow, flow);
-        assert_eq!(bytes.source, CaptureSource::LibsslUprobe);
-        assert_eq!(bytes.provider, CaptureProviderKind::Plaintext);
+        assert_eq!(bytes.origin.source(), CaptureSource::LibsslUprobe);
+        assert_eq!(bytes.origin.provider(), CaptureProviderKind::Plaintext);
         assert_eq!(bytes.direction, Direction::Outbound);
         assert_eq!(bytes.stream_offset, 100);
         assert_eq!(bytes.bytes.as_ref(), b"GET /");
@@ -442,12 +442,13 @@ mod tests {
                 .as_str()
             )
         );
-        let CaptureEvent::Gap(CapturedGap { gap, source, .. }) =
+        let CaptureEvent::Gap(CapturedGap { gap, origin, .. }) =
             CaptureEvent::from(events[1].clone())
         else {
             panic!("expected gap event");
         };
-        assert_eq!(source, CaptureSource::LibsslUprobe);
+        assert_eq!(origin.source(), CaptureSource::LibsslUprobe);
+        assert_eq!(origin.provider(), CaptureProviderKind::Plaintext);
         assert_eq!(gap.direction, Direction::Outbound);
         assert_eq!(gap.expected_offset, 105);
         assert_eq!(gap.next_offset, Some(109));
@@ -476,8 +477,8 @@ mod tests {
         assert_eq!(bytes.flow.local.port, 0);
         assert_eq!(bytes.flow.remote.port, 0);
         assert_eq!(bytes.flow.socket_cookie, None);
-        assert_eq!(bytes.source, CaptureSource::LibsslUprobe);
-        assert_eq!(bytes.provider, CaptureProviderKind::Plaintext);
+        assert_eq!(bytes.origin.source(), CaptureSource::LibsslUprobe);
+        assert_eq!(bytes.origin.provider(), CaptureProviderKind::Plaintext);
         assert_eq!(bytes.direction, Direction::Outbound);
         assert_eq!(bytes.stream_offset, 100);
         assert_eq!(bytes.bytes.as_ref(), b"GET /");
@@ -547,8 +548,7 @@ mod tests {
         let CaptureEvent::Gap(CapturedGap {
             timestamp,
             flow,
-            source,
-            provider,
+            origin,
             gap,
             ..
         }) = CaptureEvent::from(events[0].clone())
@@ -559,8 +559,8 @@ mod tests {
         assert_eq!(flow.process.identity.pid, 22);
         assert_eq!(flow.process.name, "curl");
         assert_eq!(flow.attribution_confidence, 0);
-        assert_eq!(source, CaptureSource::LibsslUprobe);
-        assert_eq!(provider, CaptureProviderKind::Plaintext);
+        assert_eq!(origin.source(), CaptureSource::LibsslUprobe);
+        assert_eq!(origin.provider(), CaptureProviderKind::Plaintext);
         assert_eq!(gap.expected_offset, 100);
         assert_eq!(gap.next_offset, Some(105));
         assert!(

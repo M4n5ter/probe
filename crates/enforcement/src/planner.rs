@@ -114,6 +114,21 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
             return None;
         }
 
+        if request.trigger.flow().is_none() {
+            return Some(EnforcementDecision {
+                mode: self.mode(),
+                outcome: EnforcementOutcome::Unsupported,
+                requested_action: request.verdict.action,
+                effective_action: Action::Observe,
+                scope: request.verdict.scope.clone(),
+                selector_matched: false,
+                reason: format!(
+                    "policy requested {:?}, but trigger event is not flow-scoped and cannot drive connection-level enforcement: {}",
+                    request.verdict.action, request.verdict.reason
+                ),
+            });
+        }
+
         let selector_matched = self.scope.matches_trigger(request.trigger);
         let (outcome, effective_action, reason) = if !selector_matched {
             (
@@ -278,7 +293,7 @@ fn destructive_enforcement_evidence_rejection_reason(
     trigger: &EventEnvelope,
 ) -> Option<&'static str> {
     trigger
-        .enforcement_evidence
+        .enforcement_evidence()
         .destructive_enforcement_rejection_reason()
 }
 
@@ -287,9 +302,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use probe_core::{
-        AddressPort, CaptureSource, Direction, EnforcementEvidence, EventKind, FlowContext,
-        FlowIdentity, HttpHeaders, ObservationOnlyReason, ProcessContext, ProcessIdentity,
-        ProcessSelector, Selector, Timestamp, TrafficSelector, TransportProtocol, VerdictScope,
+        AddressPort, CaptureLoss, CaptureOrigin, CaptureSource, Direction, EnforcementEvidence,
+        EventKind, FlowContext, FlowIdentity, HttpHeaders, ObservationOnlyReason, ProcessContext,
+        ProcessIdentity, ProcessSelector, Selector, Timestamp, TrafficSelector, TransportProtocol,
+        VerdictScope,
     };
 
     use crate::EnforcementBackendDecision;
@@ -353,6 +369,44 @@ mod tests {
         assert_eq!(decision.outcome, EnforcementOutcome::SelectorMiss);
         assert_eq!(decision.effective_action, Action::Observe);
         assert!(!decision.selector_matched);
+        Ok(())
+    }
+
+    #[test]
+    fn non_flow_trigger_records_unsupported_without_matching_selector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut planner = ScopedEnforcementPlanner::new(EnforcementMode::DryRun, None)?;
+        let trigger = EventEnvelope::from_provider(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
+            "test",
+            EventKind::CaptureLoss(CaptureLoss {
+                lost_events: 1,
+                reason: "lost".to_string(),
+            }),
+        );
+        let verdict = Verdict {
+            action: Action::Reset,
+            scope: VerdictScope::Flow,
+            reason: "reset flow".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+
+        let decision = planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("protective verdict should produce enforcement audit");
+
+        assert_eq!(decision.outcome, EnforcementOutcome::Unsupported);
+        assert_eq!(decision.effective_action, Action::Observe);
+        assert!(!decision.selector_matched);
+        assert!(decision.reason.contains("not flow-scoped"));
         Ok(())
     }
 
@@ -691,13 +745,13 @@ mod tests {
     }
 
     fn request_event_from_source(direction: Direction, source: CaptureSource) -> EventEnvelope {
-        EventEnvelope::new(
+        EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
             demo_flow(),
-            source,
+            CaptureOrigin::from_source(source),
             "test",
             EventKind::HttpRequestHeaders(HttpHeaders {
                 direction,
@@ -713,13 +767,13 @@ mod tests {
     }
 
     fn directionless_event() -> EventEnvelope {
-        EventEnvelope::new(
+        EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
             demo_flow(),
-            CaptureSource::Replay,
+            CaptureOrigin::from_source(CaptureSource::Replay),
             "test",
             EventKind::ConnectionClosed,
         )

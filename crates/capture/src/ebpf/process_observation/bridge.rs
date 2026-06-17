@@ -1,12 +1,13 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use probe_core::{
-    AddressPort, CaptureSource, Direction, EnforcementEvidence, FlowContext, FlowIdentity, Gap,
-    ProcessContext, ProcessIdentity, TcpConnection, TcpEndpoint, Timestamp, TransportProtocol,
+    AddressPort, CaptureOrigin, CaptureSource, Direction, EnforcementEvidence, FlowContext,
+    FlowIdentity, Gap, ProcessContext, ProcessIdentity, TcpConnection, TcpEndpoint, Timestamp,
+    TransportProtocol,
 };
 
 use crate::{
-    CaptureError, CaptureEvent, CaptureProviderKind, CapturedGap, EnforcementEvidencePropagation,
+    CaptureError, CaptureEvent, CapturedGap, EnforcementEvidencePropagation,
     output_loss::provider_output_loss_event,
 };
 
@@ -92,8 +93,7 @@ fn opened_event_from_lookup(
     Ok(resolved.map(|resolved| CaptureEvent::ConnectionOpened {
         timestamp,
         flow: flow_from_resolved_socket(resolved, timestamp.monotonic_ns),
-        source: CaptureSource::EbpfSyscall,
-        provider: CaptureProviderKind::Ebpf,
+        origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
     }))
 }
 
@@ -129,13 +129,7 @@ pub(crate) fn output_loss_event(timestamp: Timestamp, lost_events: u64) -> Captu
     let reason = format!(
         "eBPF process observation output ring buffer could not accept {lost_events} event(s); parser state may have missed connection or payload observations"
     );
-    provider_output_loss_event(
-        timestamp,
-        lost_events,
-        CaptureSource::EbpfSyscall,
-        CaptureProviderKind::Ebpf,
-        reason,
-    )
+    provider_output_loss_event(timestamp, lost_events, CaptureSource::EbpfSyscall, reason)
 }
 
 fn unresolved_flow_gap(
@@ -156,8 +150,7 @@ fn unresolved_flow_gap(
     CaptureEvent::Gap(CapturedGap {
         timestamp,
         flow,
-        source: CaptureSource::EbpfSyscall,
-        provider: CaptureProviderKind::Ebpf,
+        origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
         enforcement_evidence: evidence,
         enforcement_evidence_propagation: EnforcementEvidencePropagation::Event,
         gap: Gap {
@@ -271,6 +264,8 @@ fn unknown_tcp_endpoint() -> TcpEndpoint {
 
 #[cfg(test)]
 mod tests {
+    use crate::CaptureProviderKind;
+
     use std::net::Ipv4Addr;
 
     use probe_core::{ProcessIdentity, TcpEndpoint};
@@ -338,12 +333,11 @@ mod tests {
             CaptureEvent::ConnectionOpened {
                 timestamp,
                 flow,
-                source,
-                provider,
+                origin,
             } => {
                 assert_eq!(timestamp.monotonic_ns, 42);
-                assert_eq!(source, CaptureSource::EbpfSyscall);
-                assert_eq!(provider, CaptureProviderKind::Ebpf);
+                assert_eq!(origin.source(), CaptureSource::EbpfSyscall);
+                assert_eq!(origin.provider(), CaptureProviderKind::Ebpf);
                 assert_eq!(flow.process.identity.pid, 100);
                 assert_eq!(flow.local.port, 50_000);
                 assert_eq!(flow.remote.port, 443);

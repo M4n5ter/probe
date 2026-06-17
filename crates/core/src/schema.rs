@@ -4,8 +4,8 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SpoolPayloadSchema {
-    CaptureEventJson,
-    EventEnvelopeJson,
+    CaptureEventOriginJson,
+    EventEnvelopeSubjectOriginJson,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -21,14 +21,15 @@ impl SpoolPayloadSchemaError {
 }
 
 impl SpoolPayloadSchema {
-    pub const CAPTURE_EVENT_JSON: &'static str = "sssa.probe.capture_event.json";
-    pub const EVENT_ENVELOPE_JSON: &'static str = "sssa.probe.event_envelope.json";
+    pub const CAPTURE_EVENT_ORIGIN_JSON: &'static str = "sssa.probe.capture_event.origin.json";
+    pub const EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON: &'static str =
+        "sssa.probe.event_envelope.subject_origin.json";
 
     pub fn from_wire(value: impl AsRef<str>) -> Result<Self, SpoolPayloadSchemaError> {
         let value = value.as_ref();
         match value {
-            Self::CAPTURE_EVENT_JSON => Ok(Self::CaptureEventJson),
-            Self::EVENT_ENVELOPE_JSON => Ok(Self::EventEnvelopeJson),
+            Self::CAPTURE_EVENT_ORIGIN_JSON => Ok(Self::CaptureEventOriginJson),
+            Self::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON => Ok(Self::EventEnvelopeSubjectOriginJson),
             _ => Err(SpoolPayloadSchemaError {
                 value: value.to_string(),
             }),
@@ -37,8 +38,8 @@ impl SpoolPayloadSchema {
 
     pub fn as_str(&self) -> &str {
         match self {
-            Self::CaptureEventJson => Self::CAPTURE_EVENT_JSON,
-            Self::EventEnvelopeJson => Self::EVENT_ENVELOPE_JSON,
+            Self::CaptureEventOriginJson => Self::CAPTURE_EVENT_ORIGIN_JSON,
+            Self::EventEnvelopeSubjectOriginJson => Self::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON,
         }
     }
 }
@@ -56,20 +57,20 @@ mod tests {
     #[test]
     fn known_schema_round_trips_to_wire_name() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
-            SpoolPayloadSchema::from_wire(SpoolPayloadSchema::CAPTURE_EVENT_JSON)?,
-            SpoolPayloadSchema::CaptureEventJson
+            SpoolPayloadSchema::from_wire(SpoolPayloadSchema::CAPTURE_EVENT_ORIGIN_JSON)?,
+            SpoolPayloadSchema::CaptureEventOriginJson
         );
         assert_eq!(
-            SpoolPayloadSchema::CaptureEventJson.as_str(),
-            SpoolPayloadSchema::CAPTURE_EVENT_JSON
+            SpoolPayloadSchema::CaptureEventOriginJson.as_str(),
+            SpoolPayloadSchema::CAPTURE_EVENT_ORIGIN_JSON
         );
         assert_eq!(
-            SpoolPayloadSchema::from_wire(SpoolPayloadSchema::EVENT_ENVELOPE_JSON)?,
-            SpoolPayloadSchema::EventEnvelopeJson
+            SpoolPayloadSchema::from_wire(SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON)?,
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson
         );
         assert_eq!(
-            SpoolPayloadSchema::EventEnvelopeJson.as_str(),
-            SpoolPayloadSchema::EVENT_ENVELOPE_JSON
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson.as_str(),
+            SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON
         );
 
         Ok(())
@@ -81,5 +82,13 @@ mod tests {
             .expect_err("unknown spool payload schema must fail");
 
         assert_eq!(error.value(), "custom.schema.extra");
+    }
+
+    #[test]
+    fn old_capture_event_schema_name_is_rejected() {
+        let error = SpoolPayloadSchema::from_wire("sssa.probe.capture_event.json")
+            .expect_err("old capture event schema name must fail");
+
+        assert_eq!(error.value(), "sssa.probe.capture_event.json");
     }
 }

@@ -52,7 +52,7 @@ impl BatchEnvelope {
         let records = events
             .into_iter()
             .map(|(sequence, event)| {
-                let event_id = event.id.0.clone();
+                let event_id = event.id().as_str().to_string();
                 serde_json::to_vec(&event)
                     .map(|payload| json_event_envelope_record(sequence, event_id, payload))
             })
@@ -82,7 +82,7 @@ impl BatchEnvelope {
                 let event = serde_json::from_slice::<EventEnvelope>(payload)?;
                 Ok(json_event_envelope_record(
                     sequence,
-                    event.id.0,
+                    event.id().as_str().to_string(),
                     payload.to_vec(),
                 ))
             })
@@ -110,7 +110,7 @@ fn json_event_envelope_record(sequence: u64, event_id: String, payload: Vec<u8>)
         event_id,
         sequence,
         payload_format: PayloadFormat::Json as i32,
-        payload_schema: SpoolPayloadSchema::EventEnvelopeJson.to_string(),
+        payload_schema: SpoolPayloadSchema::EventEnvelopeSubjectOriginJson.to_string(),
         payload,
     }
 }
@@ -118,9 +118,9 @@ fn json_event_envelope_record(sequence: u64, event_id: String, payload: Vec<u8>)
 #[cfg(test)]
 mod tests {
     use probe_core::{
-        AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
-        HttpHeaders, ProcessContext, ProcessIdentity, SpoolPayloadSchema, Timestamp,
-        TransportProtocol,
+        AddressPort, CaptureOrigin, CaptureSource, Direction, EventEnvelope, EventKind,
+        FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity,
+        SpoolPayloadSchema, Timestamp, TransportProtocol,
     };
 
     use crate::{BatchEnvelope, PayloadFormat};
@@ -135,7 +135,7 @@ mod tests {
         assert_eq!(decoded.events[0].payload_format(), PayloadFormat::Json);
         assert_eq!(
             decoded.events[0].payload_schema,
-            SpoolPayloadSchema::EventEnvelopeJson.as_str()
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson.as_str()
         );
         Ok(())
     }
@@ -151,12 +151,12 @@ mod tests {
             [(7, payload.as_slice())],
         )?;
 
-        assert_eq!(batch.events[0].event_id, event.id.0);
+        assert_eq!(batch.events[0].event_id, event.id().as_str());
         assert_eq!(batch.events[0].sequence, 7);
         assert_eq!(batch.events[0].payload_format(), PayloadFormat::Json);
         assert_eq!(
             batch.events[0].payload_schema,
-            SpoolPayloadSchema::EventEnvelopeJson.as_str()
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson.as_str()
         );
         Ok(())
     }
@@ -198,13 +198,13 @@ mod tests {
             socket_cookie: None,
             attribution_confidence: 100,
         };
-        EventEnvelope::new(
+        EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
             flow,
-            CaptureSource::Replay,
+            CaptureOrigin::from_source(CaptureSource::Replay),
             "test",
             EventKind::HttpRequestHeaders(HttpHeaders {
                 direction: Direction::Outbound,

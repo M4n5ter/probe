@@ -1,13 +1,13 @@
 use bytes::Bytes;
 use probe_core::{
-    CapabilityKind, CapabilityState, CaptureSource, Direction, EnforcementEvidence, FlowContext,
-    Timestamp,
+    CapabilityKind, CapabilityState, CaptureOrigin, CaptureSource, Direction, EnforcementEvidence,
+    FlowContext, Timestamp,
 };
 
 use crate::{
     CapturedBytes, EnforcementEvidencePropagation,
     event::CaptureEvent,
-    provider::{CaptureError, CapturePoll, CaptureProvider, CaptureProviderKind},
+    provider::{CaptureError, CapturePoll, CaptureProvider},
 };
 
 pub struct ReplayProvider {
@@ -38,10 +38,6 @@ impl CaptureProvider for ReplayProvider {
         "replay"
     }
 
-    fn kind(&self) -> CaptureProviderKind {
-        CaptureProviderKind::Replay
-    }
-
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::available(CapabilityKind::ReplayCapture)]
     }
@@ -53,8 +49,7 @@ impl CaptureProvider for ReplayProvider {
         Ok(CapturePoll::event(CaptureEvent::Bytes(CapturedBytes {
             timestamp: self.timestamp,
             flow: self.flow.clone(),
-            source: CaptureSource::Replay,
-            provider: self.kind(),
+            origin: CaptureOrigin::from_source(CaptureSource::Replay),
             direction: self.direction,
             stream_offset: 0,
             bytes,
@@ -69,6 +64,8 @@ impl CaptureProvider for ReplayProvider {
 
 #[cfg(test)]
 mod tests {
+    use crate::CaptureProviderKind;
+
     use probe_core::{
         AddressPort, FlowIdentity, ProcessContext, ProcessIdentity, TransportProtocol,
     };
@@ -92,8 +89,8 @@ mod tests {
             panic!("expected replay bytes");
         };
         assert_eq!(chunk.timestamp, timestamp);
-        assert_eq!(chunk.source, CaptureSource::Replay);
-        assert_eq!(chunk.provider, CaptureProviderKind::Replay);
+        assert_eq!(chunk.origin.source(), CaptureSource::Replay);
+        assert_eq!(chunk.origin.provider(), CaptureProviderKind::Replay);
         assert_eq!(chunk.bytes.as_ref(), b"GET / HTTP/1.1\r\n\r\n");
         assert!(provider.next()?.is_none());
         Ok(())

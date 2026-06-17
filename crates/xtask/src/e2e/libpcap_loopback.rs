@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fs, path::Path, process::ExitCode};
 
 use capture::CaptureEvent;
 use probe_config::{AgentConfig, CaptureSelection, PolicyConfig};
-use probe_core::{CaptureSource, Direction, EventEnvelope, EventKind};
+use probe_core::{CaptureProviderKind, CaptureSource, Direction, EventEnvelope, EventKind};
 use storage::{FjallSpool, StoredEvent};
 
 use super::{
@@ -211,7 +211,7 @@ fn assert_libpcap_ingress(events: &[StoredEvent]) -> Result<(), Box<dyn std::err
             matches!(
                 event,
                 CaptureEvent::Bytes(bytes)
-                    if bytes.source == CaptureSource::Libpcap
+                    if bytes.origin.source() == CaptureSource::Libpcap
                         && bytes.degraded
                         && bytes
                             .degradation_reason
@@ -229,9 +229,10 @@ fn assert_libpcap_ingress(events: &[StoredEvent]) -> Result<(), Box<dyn std::err
 fn assert_expected_requests(envelopes: &[EventEnvelope]) -> Result<(), Box<dyn std::error::Error>> {
     let observed = envelopes
         .iter()
-        .filter_map(|envelope| match &envelope.kind {
+        .filter_map(|envelope| match envelope.kind() {
             EventKind::HttpRequestHeaders(headers)
-                if envelope.source == CaptureSource::Libpcap
+                if envelope.origin().source() == CaptureSource::Libpcap
+                    && envelope.origin().provider() == CaptureProviderKind::Libpcap
                     && headers.direction == Direction::Outbound
                     && headers.method.as_deref() == Some("POST") =>
             {
@@ -257,10 +258,11 @@ fn assert_expected_policy_alerts(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let observed = envelopes
         .iter()
-        .filter_map(|envelope| match &envelope.kind {
+        .filter_map(|envelope| match envelope.kind() {
             EventKind::PolicyAlert(alert)
-                if envelope.source == CaptureSource::Libpcap
-                    && envelope.policy_version.as_deref() == Some(EXPECTED_POLICY_VERSION) =>
+                if envelope.origin().source() == CaptureSource::Libpcap
+                    && envelope.origin().provider() == CaptureProviderKind::Libpcap
+                    && envelope.policy_version() == Some(EXPECTED_POLICY_VERSION) =>
             {
                 Some(alert.message.clone())
             }

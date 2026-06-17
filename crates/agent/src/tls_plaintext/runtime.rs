@@ -391,7 +391,7 @@ impl LibsslUprobePlaintextReconcileObserver for LibsslRuntimeReconcileObserver {
 #[cfg(test)]
 mod tests {
     use capture::{
-        CaptureError, CapturePoll, CaptureProviderKind, LibsslUprobeAttachTargetSnapshot,
+        CaptureError, CapturePoll, LibsslUprobeAttachTargetSnapshot,
         LibsslUprobeReconcileTargetBucket, MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET,
     };
     use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
@@ -557,10 +557,6 @@ mod tests {
     impl CaptureProvider for NoopCaptureProvider {
         fn name(&self) -> &'static str {
             "noop"
-        }
-
-        fn kind(&self) -> CaptureProviderKind {
-            CaptureProviderKind::Plaintext
         }
 
         fn capabilities(&self) -> Vec<CapabilityState> {

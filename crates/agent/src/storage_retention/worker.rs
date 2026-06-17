@@ -457,7 +457,7 @@ mod tests {
         let temp = tempdir()?;
         let spool = FjallSpool::open(temp.path())?;
         spool.append_ingress(SpoolPayload::new(
-            SpoolPayloadSchema::CaptureEventJson,
+            SpoolPayloadSchema::CaptureEventOriginJson,
             b"one",
         ))?;
         let config = IngressRetentionLaneConfig {
@@ -483,7 +483,7 @@ mod tests {
         let temp = tempdir()?;
         let spool = FjallSpool::open(temp.path())?;
         spool.append_export(SpoolPayload::new(
-            SpoolPayloadSchema::EventEnvelopeJson,
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
             b"one",
         ))?;
         let config = ExportRetentionLaneConfig {
@@ -510,15 +510,15 @@ mod tests {
         let temp = tempdir()?;
         let spool = FjallSpool::open(temp.path())?;
         spool.append_ingress(SpoolPayload::new(
-            SpoolPayloadSchema::CaptureEventJson,
+            SpoolPayloadSchema::CaptureEventOriginJson,
             b"one",
         ))?;
         spool.append_ingress(SpoolPayload::new(
-            SpoolPayloadSchema::CaptureEventJson,
+            SpoolPayloadSchema::CaptureEventOriginJson,
             b"two",
         ))?;
         spool.append_ingress(SpoolPayload::new(
-            SpoolPayloadSchema::CaptureEventJson,
+            SpoolPayloadSchema::CaptureEventOriginJson,
             b"three",
         ))?;
         let config = IngressRetentionLaneConfig {
@@ -551,15 +551,15 @@ mod tests {
         let temp = tempdir()?;
         let spool = FjallSpool::open(temp.path())?;
         spool.append_export(SpoolPayload::new(
-            SpoolPayloadSchema::EventEnvelopeJson,
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
             b"one",
         ))?;
         spool.append_export(SpoolPayload::new(
-            SpoolPayloadSchema::EventEnvelopeJson,
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
             b"two",
         ))?;
         spool.append_export(SpoolPayload::new(
-            SpoolPayloadSchema::EventEnvelopeJson,
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
             b"three",
         ))?;
         let config = ExportRetentionLaneConfig {

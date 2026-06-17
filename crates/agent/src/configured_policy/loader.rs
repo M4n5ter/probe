@@ -508,8 +508,8 @@ end
         Ok(envelopes
             .iter()
             .filter_map(|envelope| {
-                matches!(envelope.kind, EventKind::PolicyAlert(_))
-                    .then(|| envelope.policy_version.clone())
+                matches!(envelope.kind(), EventKind::PolicyAlert(_))
+                    .then(|| envelope.policy_version().map(str::to_string))
                     .flatten()
             })
             .collect())

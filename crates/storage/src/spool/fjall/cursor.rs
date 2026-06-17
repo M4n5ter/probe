@@ -290,7 +290,7 @@ mod tests {
         assert_eq!(two.sequence, 2);
         assert_eq!(
             one.payload.schema_wire(),
-            SpoolPayloadSchema::EVENT_ENVELOPE_JSON
+            SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON
         );
         assert_eq!(one.payload.bytes(), b"one");
 
@@ -629,6 +629,6 @@ mod tests {
     }
 
     fn test_payload(bytes: &[u8]) -> SpoolPayload {
-        SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeJson, bytes)
+        SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeSubjectOriginJson, bytes)
     }
 }

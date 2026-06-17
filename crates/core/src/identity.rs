@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessGeneration {
     pub pid: u32,
     pub start_time_ticks: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessIdentity {
     pub pid: u32,
     pub tgid: u32,
@@ -42,6 +44,7 @@ impl ProcessIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessContext {
     pub identity: ProcessIdentity,
     pub name: String,
@@ -49,6 +52,7 @@ pub struct ProcessContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddressPort {
     pub address: String,
     pub port: u16,
@@ -89,6 +93,7 @@ impl FlowIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlowContext {
     pub id: FlowIdentity,
     pub process: ProcessContext,

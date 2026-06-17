@@ -61,13 +61,13 @@ end
     let envelopes = exported_envelopes(&spool)?;
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::PolicyVerdict(verdict) if verdict.action == Action::Deny
         )
     }));
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::EnforcementDecision(decision)
                 if decision.outcome == EnforcementOutcome::DryRun
                     && decision.requested_action == Action::Deny
@@ -77,7 +77,7 @@ end
     }));
     let policy_coordinates = envelopes
         .iter()
-        .filter_map(|envelope| match (&envelope.kind, envelope.provenance) {
+        .filter_map(|envelope| match (envelope.kind(), envelope.provenance()) {
             (EventKind::PolicyVerdict(_) | EventKind::EnforcementDecision(_), Some(provenance)) => {
                 match provenance.emission {
                     EventEmission::Policy {
@@ -168,11 +168,11 @@ end
     let envelopes = exported_envelopes(&spool)?;
     let alerts = envelopes
         .iter()
-        .filter(|envelope| matches!(envelope.kind, EventKind::PolicyAlert(_)))
+        .filter(|envelope| matches!(envelope.kind(), EventKind::PolicyAlert(_)))
         .collect::<Vec<_>>();
     assert_eq!(alerts.len(), 1);
     assert!(matches!(
-        &alerts[0].kind,
+        alerts[0].kind(),
         EventKind::PolicyAlert(alert) if alert.message == "matched /hit"
     ));
     let metrics = metrics.snapshot();
@@ -226,7 +226,7 @@ end
     let envelopes = exported_envelopes(&spool)?;
     let policy_alerts = envelopes
         .iter()
-        .filter_map(|envelope| match (&envelope.kind, envelope.provenance) {
+        .filter_map(|envelope| match (envelope.kind(), envelope.provenance()) {
             (EventKind::PolicyAlert(alert), Some(provenance)) => match provenance.emission {
                 EventEmission::Policy {
                     trigger_index,
@@ -247,10 +247,10 @@ end
         .collect::<Vec<_>>();
     let primary_targets = envelopes
         .into_iter()
-        .filter_map(|envelope| match (envelope.kind, envelope.provenance) {
+        .filter_map(|envelope| match (envelope.kind(), envelope.provenance()) {
             (EventKind::HttpRequestHeaders(headers), Some(provenance)) => match provenance.emission
             {
-                EventEmission::Primary { index } => Some((headers.target, index)),
+                EventEmission::Primary { index } => Some((headers.target.clone(), index)),
                 EventEmission::Policy { .. } => None,
             },
             _ => None,
@@ -377,13 +377,13 @@ end
         .iter()
         .filter(|envelope| {
             matches!(
-                envelope.kind,
+                envelope.kind(),
                 EventKind::PolicyAlert(_)
                     | EventKind::PolicyVerdict(_)
                     | EventKind::EnforcementDecision(_)
             )
         })
-        .filter_map(|envelope| envelope.policy_version.as_deref())
+        .filter_map(|envelope| envelope.policy_version())
         .collect::<Vec<_>>();
     assert_eq!(
         outcome_policy_versions,
@@ -395,7 +395,7 @@ end
     );
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::EnforcementDecision(decision)
                 if decision.outcome == EnforcementOutcome::DryRun
                     && decision.requested_action == Action::Deny
@@ -485,7 +485,7 @@ end
         .iter()
         .filter(|envelope| {
             matches!(
-                envelope.kind,
+                envelope.kind(),
                 EventKind::PolicyAlert(_)
                     | EventKind::PolicyVerdict(_)
                     | EventKind::PolicyRuntimeError(_)
@@ -495,7 +495,7 @@ end
         .collect::<Vec<_>>();
     let policy_versions = policy_outputs
         .iter()
-        .filter_map(|envelope| envelope.policy_version.as_deref())
+        .filter_map(|envelope| envelope.policy_version())
         .collect::<Vec<_>>();
     assert_eq!(
         policy_versions,
@@ -507,23 +507,23 @@ end
         ]
     );
     assert!(matches!(
-        &policy_outputs[0].kind,
+        policy_outputs[0].kind(),
         EventKind::PolicyVerdict(verdict) if verdict.action == Action::Deny
     ));
     assert!(matches!(
-        &policy_outputs[1].kind,
+        policy_outputs[1].kind(),
         EventKind::EnforcementDecision(decision)
             if decision.outcome == EnforcementOutcome::DryRun
                 && decision.requested_action == Action::Deny
     ));
     assert!(matches!(
-        &policy_outputs[2].kind,
+        policy_outputs[2].kind(),
         EventKind::PolicyRuntimeError(error)
             if error.event_type == EventType::HttpRequestHeaders
                 && error.reason.contains("invalid outcome")
     ));
     assert!(matches!(
-        &policy_outputs[3].kind,
+        policy_outputs[3].kind(),
         EventKind::PolicyAlert(alert) if alert.message == "later /bad"
     ));
     let metrics = metrics.snapshot();
@@ -645,18 +645,18 @@ end
         .iter()
         .filter(|envelope| {
             matches!(
-                envelope.kind,
+                envelope.kind(),
                 EventKind::PolicyVerdict(_) | EventKind::EnforcementDecision(_)
             )
         })
         .collect::<Vec<_>>();
     assert_eq!(policy_outputs.len(), 2);
     assert!(matches!(
-        &policy_outputs[0].kind,
+        policy_outputs[0].kind(),
         EventKind::PolicyVerdict(verdict) if verdict.action == Action::Deny
     ));
     assert!(matches!(
-        &policy_outputs[1].kind,
+        policy_outputs[1].kind(),
         EventKind::EnforcementDecision(decision)
             if decision.outcome == EnforcementOutcome::Failed
                 && decision.effective_action == Action::Observe

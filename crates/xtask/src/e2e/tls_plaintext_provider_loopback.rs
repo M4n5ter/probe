@@ -162,8 +162,8 @@ fn is_expected_tls_plaintext_request_bytes(event: &CaptureEvent, listen_port: u1
     let CaptureEvent::Bytes(bytes) = event else {
         return false;
     };
-    bytes.source == CaptureSource::LibsslUprobe
-        && bytes.provider == CaptureProviderKind::Plaintext
+    bytes.origin.source() == CaptureSource::LibsslUprobe
+        && bytes.origin.provider() == CaptureProviderKind::Plaintext
         && bytes.direction == Direction::Outbound
         && bytes.flow.remote.port == listen_port
         && bytes.flow.attribution_confidence == DIRECT_FLOW_CONFIDENCE
@@ -205,8 +205,8 @@ fn event_summary(event: &CaptureEvent, listen_port: u16) -> Option<String> {
         {
             Some(format!(
                 "bytes source={:?} provider={:?} direction={:?} local={}:{} remote={}:{} confidence={} len={} degraded={}",
-                bytes.source,
-                bytes.provider,
+                bytes.origin.source(),
+                bytes.origin.provider(),
                 bytes.direction,
                 bytes.flow.local.address,
                 bytes.flow.local.port,
@@ -222,8 +222,8 @@ fn event_summary(event: &CaptureEvent, listen_port: u16) -> Option<String> {
         {
             Some(format!(
                 "gap source={:?} provider={:?} direction={:?} local={}:{} remote={}:{} confidence={} reason={}",
-                gap.source,
-                gap.provider,
+                gap.origin.source(),
+                gap.origin.provider(),
                 gap.gap.direction,
                 gap.flow.local.address,
                 gap.flow.local.port,
@@ -239,24 +239,28 @@ fn event_summary(event: &CaptureEvent, listen_port: u16) -> Option<String> {
 
 fn unrelated_event_summary(event: &CaptureEvent) -> Option<String> {
     match event {
-        CaptureEvent::Bytes(bytes) if bytes.source == CaptureSource::LibsslUprobe => Some(format!(
-            "bytes pid={} command={} direction={:?} confidence={} len={} degraded={} reason={}",
-            bytes.flow.process.identity.pid,
-            bytes.flow.process.name,
-            bytes.direction,
-            bytes.flow.attribution_confidence,
-            bytes.bytes.len(),
-            bytes.degraded,
-            bytes.degradation_reason.as_deref().unwrap_or("")
-        )),
-        CaptureEvent::Gap(gap) if gap.source == CaptureSource::LibsslUprobe => Some(format!(
-            "gap pid={} command={} direction={:?} confidence={} reason={}",
-            gap.flow.process.identity.pid,
-            gap.flow.process.name,
-            gap.gap.direction,
-            gap.flow.attribution_confidence,
-            gap.gap.reason
-        )),
+        CaptureEvent::Bytes(bytes) if bytes.origin.source() == CaptureSource::LibsslUprobe => {
+            Some(format!(
+                "bytes pid={} command={} direction={:?} confidence={} len={} degraded={} reason={}",
+                bytes.flow.process.identity.pid,
+                bytes.flow.process.name,
+                bytes.direction,
+                bytes.flow.attribution_confidence,
+                bytes.bytes.len(),
+                bytes.degraded,
+                bytes.degradation_reason.as_deref().unwrap_or("")
+            ))
+        }
+        CaptureEvent::Gap(gap) if gap.origin.source() == CaptureSource::LibsslUprobe => {
+            Some(format!(
+                "gap pid={} command={} direction={:?} confidence={} reason={}",
+                gap.flow.process.identity.pid,
+                gap.flow.process.name,
+                gap.gap.direction,
+                gap.flow.attribution_confidence,
+                gap.gap.reason
+            ))
+        }
         _ => None,
     }
 }

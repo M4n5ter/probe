@@ -1,7 +1,7 @@
 use std::{thread, time::Duration};
 
+pub use probe_core::CaptureProviderKind;
 use probe_core::{CapabilityState, ProcessContext, TcpConnection};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::event::CaptureEvent;
@@ -23,16 +23,6 @@ impl CaptureError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CaptureProviderKind {
-    Replay,
-    Ebpf,
-    Libpcap,
-    Plaintext,
-    Multiplex,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapturePoll {
     Event(Box<CaptureEvent>),
@@ -49,8 +39,6 @@ impl CapturePoll {
 
 pub trait CaptureProvider {
     fn name(&self) -> &'static str;
-
-    fn kind(&self) -> CaptureProviderKind;
 
     fn capabilities(&self) -> Vec<CapabilityState>;
 

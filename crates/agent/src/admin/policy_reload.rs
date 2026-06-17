@@ -291,12 +291,12 @@ end
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let mut messages = Vec::new();
         for stored in spool.read_export_batch("sink", 64)? {
-            if stored.payload.schema() != &SpoolPayloadSchema::EventEnvelopeJson {
+            if stored.payload.schema() != &SpoolPayloadSchema::EventEnvelopeSubjectOriginJson {
                 continue;
             }
             let envelope: EventEnvelope = serde_json::from_slice(stored.payload.bytes())?;
-            if let EventKind::PolicyAlert(alert) = envelope.kind {
-                messages.push(alert.message);
+            if let EventKind::PolicyAlert(alert) = envelope.kind() {
+                messages.push(alert.message.clone());
             }
         }
         Ok(messages)

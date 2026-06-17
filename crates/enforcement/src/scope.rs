@@ -27,8 +27,9 @@ impl TargetScope {
 #[cfg(test)]
 mod tests {
     use probe_core::{
-        AddressPort, CaptureSource, Direction, EventKind, FlowContext, FlowIdentity, HttpHeaders,
-        ProcessIdentity, ProcessSelector, Selector, Timestamp, TrafficSelector, TransportProtocol,
+        AddressPort, CaptureOrigin, CaptureSource, Direction, EventKind, FlowContext, FlowIdentity,
+        HttpHeaders, ProcessIdentity, ProcessSelector, Selector, Timestamp, TrafficSelector,
+        TransportProtocol,
     };
 
     use super::*;
@@ -87,13 +88,13 @@ mod tests {
     }
 
     fn request_event(direction: Direction) -> EventEnvelope {
-        EventEnvelope::new(
+        EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
             demo_flow(),
-            CaptureSource::Replay,
+            CaptureOrigin::from_source(CaptureSource::Replay),
             "test",
             EventKind::HttpRequestHeaders(HttpHeaders {
                 direction,

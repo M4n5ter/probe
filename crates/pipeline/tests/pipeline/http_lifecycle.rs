@@ -72,7 +72,7 @@ end
         .iter()
         .position(|envelope| {
             matches!(
-                &envelope.kind,
+                envelope.kind(),
                 EventKind::WebSocketHandoff(handoff)
                     if handoff.direction == Direction::Inbound
                         && handoff.target.as_deref() == Some("/chat")
@@ -82,7 +82,7 @@ end
         .expect("websocket handoff should be exported");
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::PolicyAlert(alert)
                 if alert.message == "websocket /chat chat"
         )
@@ -91,7 +91,7 @@ end
         .iter()
         .position(|envelope| {
             matches!(
-                &envelope.kind,
+                envelope.kind(),
                 EventKind::WebSocketFrame(frame)
                     if frame.direction == Direction::Inbound
                         && frame.payload_len == 2
@@ -104,12 +104,12 @@ end
         !envelopes
             .iter()
             .skip(handoff_index + 1)
-            .any(|envelope| matches!(envelope.kind, EventKind::HttpBodyChunk(_)))
+            .any(|envelope| matches!(envelope.kind(), EventKind::HttpBodyChunk(_)))
     );
     assert!(
         !envelopes
             .iter()
-            .any(|envelope| matches!(envelope.kind, EventKind::ProtocolError(_)))
+            .any(|envelope| matches!(envelope.kind(), EventKind::ProtocolError(_)))
     );
     Ok(())
 }
@@ -139,7 +139,7 @@ fn connection_close_flushes_close_delimited_http_body() -> Result<(), Box<dyn st
         .iter()
         .position(|envelope| {
             matches!(
-                &envelope.kind,
+                envelope.kind(),
                 EventKind::HttpBodyChunk(chunk)
                     if chunk.direction == Direction::Inbound
                         && chunk.data.as_ref() == b"hello"
@@ -151,7 +151,7 @@ fn connection_close_flushes_close_delimited_http_body() -> Result<(), Box<dyn st
         .iter()
         .position(|envelope| {
             matches!(
-                &envelope.kind,
+                envelope.kind(),
                 EventKind::HttpBodyChunk(chunk)
                     if chunk.direction == Direction::Inbound
                         && chunk.data.is_empty()
@@ -161,7 +161,7 @@ fn connection_close_flushes_close_delimited_http_body() -> Result<(), Box<dyn st
         .expect("connection close should flush end_stream marker");
     let close_index = envelopes
         .iter()
-        .position(|envelope| matches!(envelope.kind, EventKind::ConnectionClosed))
+        .position(|envelope| matches!(envelope.kind(), EventKind::ConnectionClosed))
         .expect("connection close should be exported");
     assert!(body_chunk_index < end_stream_index);
     assert!(end_stream_index < close_index);
@@ -195,26 +195,26 @@ fn live_pipeline_isolates_parser_state_per_flow() -> Result<(), Box<dyn std::err
     let envelopes = exported_envelopes(&spool)?;
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::HttpRequestHeaders(headers) if headers.target.as_deref() == Some("/a")
         )
     }));
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::HttpRequestHeaders(headers) if headers.target.as_deref() == Some("/b")
         )
     }));
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::HttpBodyChunk(chunk) if chunk.data.as_ref() == b"llo" && chunk.end_stream
         )
     }));
     assert!(
         !envelopes
             .iter()
-            .any(|envelope| matches!(envelope.kind, EventKind::ProtocolError(_)))
+            .any(|envelope| matches!(envelope.kind(), EventKind::ProtocolError(_)))
     );
     Ok(())
 }
@@ -240,7 +240,7 @@ fn live_pipeline_parses_process_inbound_request_as_request()
     let envelopes = exported_envelopes(&spool)?;
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::HttpRequestHeaders(headers)
                 if headers.direction == Direction::Inbound
                     && headers.target.as_deref() == Some("/server")
@@ -249,7 +249,7 @@ fn live_pipeline_parses_process_inbound_request_as_request()
     assert!(
         !envelopes
             .iter()
-            .any(|envelope| matches!(envelope.kind, EventKind::ProtocolError(_)))
+            .any(|envelope| matches!(envelope.kind(), EventKind::ProtocolError(_)))
     );
     Ok(())
 }

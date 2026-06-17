@@ -1,7 +1,9 @@
 use capture::{PlaintextChunk, PlaintextEventProvider, PlaintextSource, ReplayProvider};
 use parsers::Http1ParserFactory;
 use pipeline::CapturePipeline;
-use probe_core::{CaptureSource, Direction, EventEmission, EventKind, Timestamp};
+use probe_core::{
+    CaptureProviderKind, CaptureSource, Direction, EventEmission, EventKind, Timestamp,
+};
 use tempfile::tempdir;
 
 use super::fixture::{SequenceProvider, capture_loss, demo_flow_with_ports, exported_envelopes};
@@ -33,7 +35,7 @@ fn replay_provider_writes_ingress_and_export_lanes() -> Result<(), Box<dyn std::
     assert_eq!(
         envelopes
             .iter()
-            .filter_map(|envelope| envelope.provenance)
+            .filter_map(|envelope| envelope.provenance())
             .map(|provenance| match provenance.emission {
                 EventEmission::Primary { index } => (provenance.ingress_sequence, index),
                 EventEmission::Policy { .. } => panic!("expected primary event provenance"),
@@ -76,9 +78,10 @@ fn plaintext_event_provider_writes_ingress_and_http_export_events()
     assert_eq!(summary.ingress_records_processed, 1);
     let envelopes = exported_envelopes(&spool)?;
     assert!(envelopes.iter().any(|envelope| {
-        envelope.source == CaptureSource::ExternalPlaintextFeed
+        envelope.origin().source() == CaptureSource::ExternalPlaintextFeed
+            && envelope.origin().provider() == CaptureProviderKind::Plaintext
             && matches!(
-                &envelope.kind,
+                envelope.kind(),
                 EventKind::HttpRequestHeaders(headers)
                     if headers.target.as_deref() == Some("/plaintext")
             )
@@ -86,7 +89,7 @@ fn plaintext_event_provider_writes_ingress_and_http_export_events()
     assert!(
         !envelopes
             .iter()
-            .any(|envelope| matches!(envelope.kind, EventKind::ProtocolError(_)))
+            .any(|envelope| matches!(envelope.kind(), EventKind::ProtocolError(_)))
     );
     Ok(())
 }
@@ -97,7 +100,7 @@ fn capture_loss_writes_degraded_export_without_parser_events()
     let temp = tempdir()?;
     let spool = storage::FjallSpool::open(temp.path())?;
     let mut parser_factory = Http1ParserFactory::default();
-    let mut provider = SequenceProvider::new(vec![capture_loss(demo_flow(), 7)]);
+    let mut provider = SequenceProvider::new(vec![capture_loss(7)]);
     let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
 
     let summary = pipeline.run_provider(&mut provider)?;
@@ -110,15 +113,17 @@ fn capture_loss_writes_degraded_export_without_parser_events()
     let [loss] = envelopes.as_slice() else {
         panic!("expected one capture loss envelope: {envelopes:?}");
     };
-    assert!(loss.degraded);
+    assert!(loss.degraded());
     assert!(matches!(
-        &loss.kind,
+        loss.kind(),
         EventKind::CaptureLoss(loss) if loss.lost_events == 7
     ));
+    assert_eq!(loss.subject(), &probe_core::EventSubject::Provider);
+    assert_eq!(loss.origin().provider(), CaptureProviderKind::Ebpf);
     assert!(
-        loss.enforcement_evidence
+        loss.enforcement_evidence()
             .destructive_enforcement_rejection_reason()
-            .is_some_and(|reason| reason.contains("lost capture observations"))
+            .is_some_and(|reason| reason.contains("lost observations"))
     );
     Ok(())
 }

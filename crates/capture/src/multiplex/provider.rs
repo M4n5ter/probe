@@ -1,6 +1,6 @@
 use probe_core::CapabilityState;
 
-use crate::{CaptureError, CapturePoll, CaptureProvider, CaptureProviderKind};
+use crate::{CaptureError, CapturePoll, CaptureProvider};
 
 type DisableHandler = Box<dyn Fn(&str)>;
 
@@ -64,10 +64,6 @@ impl CaptureMultiplexer {
 impl CaptureProvider for CaptureMultiplexer {
     fn name(&self) -> &'static str {
         "multiplex"
-    }
-
-    fn kind(&self) -> CaptureProviderKind {
-        CaptureProviderKind::Multiplex
     }
 
     fn capabilities(&self) -> Vec<CapabilityState> {
@@ -367,8 +363,7 @@ mod tests {
                 wall_time_unix_ns: 1,
             },
             flow: demo_flow(),
-            source: CaptureSource::Replay,
-            provider: CaptureProviderKind::Replay,
+            origin: probe_core::CaptureOrigin::from_source(CaptureSource::Replay),
             direction: Direction::Outbound,
             stream_offset: 0,
             bytes: Bytes::from_static(payload.as_bytes()),
@@ -436,10 +431,6 @@ mod tests {
             "vec"
         }
 
-        fn kind(&self) -> CaptureProviderKind {
-            CaptureProviderKind::Replay
-        }
-
         fn capabilities(&self) -> Vec<CapabilityState> {
             Vec::new()
         }
@@ -458,10 +449,6 @@ mod tests {
     impl CaptureProvider for ErrorProvider {
         fn name(&self) -> &'static str {
             "error"
-        }
-
-        fn kind(&self) -> CaptureProviderKind {
-            CaptureProviderKind::Replay
         }
 
         fn capabilities(&self) -> Vec<CapabilityState> {
@@ -483,10 +470,6 @@ mod tests {
     impl CaptureProvider for DropNotifyErrorProvider {
         fn name(&self) -> &'static str {
             "drop_notify_error"
-        }
-
-        fn kind(&self) -> CaptureProviderKind {
-            CaptureProviderKind::Replay
         }
 
         fn capabilities(&self) -> Vec<CapabilityState> {
@@ -517,10 +500,6 @@ mod tests {
             "idle_then"
         }
 
-        fn kind(&self) -> CaptureProviderKind {
-            CaptureProviderKind::Replay
-        }
-
         fn capabilities(&self) -> Vec<CapabilityState> {
             Vec::new()
         }
@@ -546,10 +525,6 @@ mod tests {
     impl CaptureProvider for ProgressThenProvider {
         fn name(&self) -> &'static str {
             "progress_then"
-        }
-
-        fn kind(&self) -> CaptureProviderKind {
-            CaptureProviderKind::Replay
         }
 
         fn capabilities(&self) -> Vec<CapabilityState> {

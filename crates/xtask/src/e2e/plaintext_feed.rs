@@ -1,7 +1,7 @@
 use std::{fs, path::Path, process::ExitCode};
 
 use capture::CaptureEvent;
-use probe_core::{CaptureSource, EventEnvelope, EventKind};
+use probe_core::{CaptureProviderKind, CaptureSource, EventEnvelope, EventKind};
 use storage::{FjallSpool, StoredEvent};
 
 use super::harness::{
@@ -90,7 +90,7 @@ fn assert_spool_outputs(
     let request_found = envelopes.iter().any(|envelope| {
         is_expected_feed_flow(envelope, scenario)
             && matches!(
-                &envelope.kind,
+                envelope.kind(),
                 EventKind::HttpRequestHeaders(headers)
                     if headers.method.as_deref() == Some("GET")
                         && headers.target.as_deref() == Some(scenario.request_target())
@@ -104,9 +104,9 @@ fn assert_spool_outputs(
     let expected_alert = scenario.expected_policy_alert_message();
     let policy_alert_found = envelopes.iter().any(|envelope| {
         is_expected_feed_flow(envelope, scenario)
-            && envelope.policy_version.as_deref() == Some(expected_policy_version.as_str())
+            && envelope.policy_version() == Some(expected_policy_version.as_str())
             && matches!(
-                &envelope.kind,
+                envelope.kind(),
                 EventKind::PolicyAlert(alert)
                     if alert.message == expected_alert
             )
@@ -117,10 +117,10 @@ fn assert_spool_outputs(
 
     let lifecycle_found = envelopes.iter().any(|envelope| {
         is_expected_feed_flow(envelope, scenario)
-            && matches!(envelope.kind, EventKind::ConnectionOpened)
+            && matches!(envelope.kind(), EventKind::ConnectionOpened)
     }) && envelopes.iter().any(|envelope| {
         is_expected_feed_flow(envelope, scenario)
-            && matches!(envelope.kind, EventKind::ConnectionClosed)
+            && matches!(envelope.kind(), EventKind::ConnectionClosed)
     });
     if !lifecycle_found {
         return Err(e2e_error("missing connection lifecycle events").into());
@@ -152,8 +152,9 @@ fn assert_ingress_events(
 
     if !matches!(
         opened,
-        CaptureEvent::ConnectionOpened { source, flow, .. }
-            if *source == CaptureSource::ExternalPlaintextFeed
+        CaptureEvent::ConnectionOpened { origin, flow, .. }
+            if origin.source() == CaptureSource::ExternalPlaintextFeed
+                && origin.provider() == CaptureProviderKind::Plaintext
                 && flow.id.0 == scenario.expected_flow_id()
     ) {
         return Err(e2e_error("missing expected ingress connection_opened event").into());
@@ -161,7 +162,8 @@ fn assert_ingress_events(
     if !matches!(
         bytes,
         CaptureEvent::Bytes(bytes)
-            if bytes.source == CaptureSource::ExternalPlaintextFeed
+            if bytes.origin.source() == CaptureSource::ExternalPlaintextFeed
+                && bytes.origin.provider() == CaptureProviderKind::Plaintext
                 && bytes.flow.id.0 == scenario.expected_flow_id()
                 && bytes.bytes.as_ref() == scenario.request_bytes().as_slice()
     ) {
@@ -169,8 +171,9 @@ fn assert_ingress_events(
     }
     if !matches!(
         closed,
-        CaptureEvent::ConnectionClosed { source, flow, .. }
-            if *source == CaptureSource::ExternalPlaintextFeed
+        CaptureEvent::ConnectionClosed { origin, flow, .. }
+            if origin.source() == CaptureSource::ExternalPlaintextFeed
+                && origin.provider() == CaptureProviderKind::Plaintext
                 && flow.id.0 == scenario.expected_flow_id()
     ) {
         return Err(e2e_error("missing expected ingress connection_closed event").into());
@@ -179,6 +182,9 @@ fn assert_ingress_events(
 }
 
 fn is_expected_feed_flow(envelope: &EventEnvelope, scenario: &PlaintextFeedScenario) -> bool {
-    envelope.source == CaptureSource::ExternalPlaintextFeed
-        && envelope.flow.id.0 == scenario.expected_flow_id()
+    envelope.origin().source() == CaptureSource::ExternalPlaintextFeed
+        && envelope.origin().provider() == CaptureProviderKind::Plaintext
+        && envelope
+            .flow()
+            .is_some_and(|flow| flow.id.0 == scenario.expected_flow_id())
 }

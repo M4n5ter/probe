@@ -8,7 +8,7 @@ use probe_core::{
 };
 
 use crate::output_loss::OutputLossTracker;
-use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind};
+use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider};
 
 use super::super::{
     EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfProcessObservation,
@@ -238,18 +238,13 @@ fn connection_closed_event(timestamp: Timestamp, flow: FlowContext) -> CaptureEv
     CaptureEvent::ConnectionClosed {
         timestamp,
         flow,
-        source: CaptureSource::EbpfSyscall,
-        provider: CaptureProviderKind::Ebpf,
+        origin: probe_core::CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
     }
 }
 
 impl CaptureProvider for EbpfProcessObservationProvider {
     fn name(&self) -> &'static str {
         "ebpf"
-    }
-
-    fn kind(&self) -> CaptureProviderKind {
-        CaptureProviderKind::Ebpf
     }
 
     fn capabilities(&self) -> Vec<CapabilityState> {
@@ -267,6 +262,8 @@ impl CaptureProvider for EbpfProcessObservationProvider {
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+
+    use crate::CaptureProviderKind;
 
     use probe_core::{
         Direction, ProcessContext, ProcessIdentity, ProcessSelector, Selector, TcpConnection,
@@ -404,8 +401,8 @@ mod tests {
         expect_connection_opened(&mut provider)?;
         let bytes = expect_bytes(&mut provider)?;
 
-        assert_eq!(bytes.source, CaptureSource::EbpfSyscall);
-        assert_eq!(bytes.provider, CaptureProviderKind::Ebpf);
+        assert_eq!(bytes.origin.source(), CaptureSource::EbpfSyscall);
+        assert_eq!(bytes.origin.provider(), CaptureProviderKind::Ebpf);
         assert_eq!(bytes.direction, Direction::Inbound);
         assert_eq!(bytes.stream_offset, 0);
         assert_eq!(bytes.bytes.as_ref(), b"HTTP/");
@@ -629,8 +626,8 @@ mod tests {
             panic!("expected degraded gap event");
         };
 
-        assert_eq!(gap.source, CaptureSource::EbpfSyscall);
-        assert_eq!(gap.provider, CaptureProviderKind::Ebpf);
+        assert_eq!(gap.origin.source(), CaptureSource::EbpfSyscall);
+        assert_eq!(gap.origin.provider(), CaptureProviderKind::Ebpf);
         assert_eq!(gap.gap.direction, Direction::Outbound);
         assert_eq!(gap.gap.expected_offset, 0);
         assert_eq!(gap.gap.next_offset, None);
@@ -676,9 +673,8 @@ mod tests {
         provider.stop_when_idle = false;
 
         let first = expect_output_loss(provider.poll_next()?);
-        assert_eq!(first.source, CaptureSource::EbpfSyscall);
-        assert_eq!(first.provider, CaptureProviderKind::Ebpf);
-        assert_eq!(first.flow.attribution_confidence, 0);
+        assert_eq!(first.origin.source(), CaptureSource::EbpfSyscall);
+        assert_eq!(first.origin.provider(), CaptureProviderKind::Ebpf);
         assert_eq!(first.loss.lost_events, 2);
         assert!(
             first
@@ -842,11 +838,10 @@ mod tests {
             Some(CaptureEvent::ConnectionOpened {
                 timestamp,
                 flow,
-                source,
-                provider: provider_kind,
+                origin,
             }) => {
                 assert_eq!(
-                    (source, provider_kind),
+                    (origin.source(), origin.provider()),
                     (CaptureSource::EbpfSyscall, CaptureProviderKind::Ebpf)
                 );
                 Ok((timestamp, flow))
@@ -862,11 +857,10 @@ mod tests {
             Some(CaptureEvent::ConnectionClosed {
                 timestamp,
                 flow,
-                source,
-                provider: provider_kind,
+                origin,
             }) => {
                 assert_eq!(
-                    (source, provider_kind),
+                    (origin.source(), origin.provider()),
                     (CaptureSource::EbpfSyscall, CaptureProviderKind::Ebpf)
                 );
                 Ok((timestamp, flow))

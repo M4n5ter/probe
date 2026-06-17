@@ -1,12 +1,10 @@
 use bytes::Bytes;
 use probe_core::{
-    CaptureSource, Direction, EnforcementEvidence, FlowContext, Gap, ObservationOnlyReason,
-    Timestamp,
+    CaptureOrigin, CaptureSource, Direction, EnforcementEvidence, FlowContext, Gap,
+    ObservationOnlyReason, Timestamp,
 };
 
-use crate::{
-    CaptureEvent, CaptureProviderKind, CapturedBytes, CapturedGap, EnforcementEvidencePropagation,
-};
+use crate::{CaptureEvent, CapturedBytes, CapturedGap, EnforcementEvidencePropagation};
 
 use super::{
     EbpfSocketReadObservation, EbpfSocketWriteObservation,
@@ -100,8 +98,7 @@ fn payload_events(tracked: &mut TrackedEbpfFlow, sample: PayloadSample<'_>) -> V
         events.push(CaptureEvent::Bytes(CapturedBytes {
             timestamp: sample.timestamp,
             flow: tracked.flow.clone(),
-            source: CaptureSource::EbpfSyscall,
-            provider: CaptureProviderKind::Ebpf,
+            origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
             direction: sample.direction,
             stream_offset: start,
             bytes: Bytes::copy_from_slice(sample.buffer),
@@ -171,8 +168,7 @@ fn ebpf_payload_gap(
     CaptureEvent::Gap(CapturedGap {
         timestamp,
         flow,
-        source: CaptureSource::EbpfSyscall,
-        provider: CaptureProviderKind::Ebpf,
+        origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
         enforcement_evidence,
         enforcement_evidence_propagation: EnforcementEvidencePropagation::Flow,
         gap: Gap {
@@ -196,6 +192,8 @@ fn payload_degradation_reason(sample: &PayloadSample<'_>, captured_len: u64) -> 
 
 #[cfg(test)]
 mod tests {
+    use crate::CaptureProviderKind;
+
     use probe_core::{
         AddressPort, FlowIdentity, ProcessContext, ProcessIdentity, TransportProtocol,
     };
@@ -216,8 +214,8 @@ mod tests {
             panic!("expected a single bytes event: {events:?}");
         };
         assert_eq!(bytes.flow.id, flow("flow-7").id);
-        assert_eq!(bytes.source, CaptureSource::EbpfSyscall);
-        assert_eq!(bytes.provider, CaptureProviderKind::Ebpf);
+        assert_eq!(bytes.origin.source(), CaptureSource::EbpfSyscall);
+        assert_eq!(bytes.origin.provider(), CaptureProviderKind::Ebpf);
         assert_eq!(bytes.direction, Direction::Outbound);
         assert_eq!(bytes.stream_offset, 0);
         assert_eq!(bytes.bytes.as_ref(), b"GET /");
@@ -250,8 +248,8 @@ mod tests {
             panic!("expected a single bytes event: {events:?}");
         };
         assert_eq!(bytes.flow.id, flow("flow-7").id);
-        assert_eq!(bytes.source, CaptureSource::EbpfSyscall);
-        assert_eq!(bytes.provider, CaptureProviderKind::Ebpf);
+        assert_eq!(bytes.origin.source(), CaptureSource::EbpfSyscall);
+        assert_eq!(bytes.origin.provider(), CaptureProviderKind::Ebpf);
         assert_eq!(bytes.direction, Direction::Inbound);
         assert_eq!(bytes.stream_offset, 0);
         assert_eq!(bytes.bytes.as_ref(), b"HTTP/");
@@ -350,8 +348,8 @@ mod tests {
             panic!("expected a single gap event: {events:?}");
         };
         assert_eq!(gap.timestamp.monotonic_ns, 1);
-        assert_eq!(gap.source, CaptureSource::EbpfSyscall);
-        assert_eq!(gap.provider, CaptureProviderKind::Ebpf);
+        assert_eq!(gap.origin.source(), CaptureSource::EbpfSyscall);
+        assert_eq!(gap.origin.provider(), CaptureProviderKind::Ebpf);
         assert_eq!(gap.gap.direction, Direction::Outbound);
         assert_eq!(gap.gap.expected_offset, 0);
         assert_eq!(gap.gap.next_offset, Some(5));

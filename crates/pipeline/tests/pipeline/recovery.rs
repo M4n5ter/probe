@@ -6,7 +6,8 @@ use pipeline::{
 };
 use policy::{PolicyHook, PolicyManifest, PolicyRuntime};
 use probe_core::{
-    CaptureSource, Direction, EnforcementEvidence, EventKind, Gap, SpoolPayloadSchema, Timestamp,
+    CaptureOrigin, CaptureProviderKind, CaptureSource, Direction, EnforcementEvidence, EventKind,
+    Gap, SpoolPayloadSchema, Timestamp,
 };
 use storage::SpoolPayload;
 use tempfile::tempdir;
@@ -38,9 +39,10 @@ fn recover_ingress_journal_replays_capture_bytes() -> Result<(), Box<dyn std::er
     assert_eq!(summary.export_events_written, 1);
     let envelopes = exported_envelopes(&spool)?;
     assert!(envelopes.iter().any(|envelope| {
-        envelope.source == CaptureSource::Replay
+        envelope.origin().source() == CaptureSource::Replay
+            && envelope.origin().provider() == CaptureProviderKind::Replay
             && matches!(
-                &envelope.kind,
+                envelope.kind(),
                 EventKind::HttpRequestHeaders(headers)
                     if headers.target.as_deref() == Some("/recovered")
             )
@@ -174,7 +176,7 @@ fn recover_ingress_journal_replays_persisted_prefix_for_parser_state()
     let envelopes = exported_envelopes(&spool)?;
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::HttpRequestHeaders(headers)
                 if headers.target.as_deref() == Some("/split-recovered")
         )
@@ -357,8 +359,7 @@ fn captured_gap(
             wall_time_unix_ns: 2,
         },
         flow,
-        source: CaptureSource::Replay,
-        provider: capture::CaptureProviderKind::Replay,
+        origin: CaptureOrigin::from_source(CaptureSource::Replay),
         enforcement_evidence: EnforcementEvidence::default(),
         enforcement_evidence_propagation: capture::EnforcementEvidencePropagation::Event,
         gap: Gap {
@@ -372,7 +373,7 @@ fn captured_gap(
 
 fn capture_event_payload(event: &CaptureEvent) -> Result<SpoolPayload, serde_json::Error> {
     Ok(SpoolPayload::new(
-        SpoolPayloadSchema::CaptureEventJson,
+        SpoolPayloadSchema::CaptureEventOriginJson,
         serde_json::to_vec(event)?,
     ))
 }
@@ -429,7 +430,7 @@ fn count_request_targets(
         .iter()
         .filter(|envelope| {
             matches!(
-                &envelope.kind,
+                envelope.kind(),
                 EventKind::HttpRequestHeaders(headers)
                     if headers.target.as_deref() == Some(target)
             )
@@ -445,12 +446,12 @@ fn request_ids_for_target(
         .into_iter()
         .filter(|envelope| {
             matches!(
-                &envelope.kind,
+                envelope.kind(),
                 EventKind::HttpRequestHeaders(headers)
                     if headers.target.as_deref() == Some(target)
             )
         })
-        .map(|envelope| envelope.id)
+        .map(|envelope| envelope.id().clone())
         .collect())
 }
 
@@ -459,8 +460,8 @@ fn policy_alert_ids(
 ) -> Result<Vec<probe_core::EventId>, Box<dyn std::error::Error>> {
     Ok(exported_envelopes(spool)?
         .into_iter()
-        .filter(|envelope| matches!(envelope.kind, EventKind::PolicyAlert(_)))
-        .map(|envelope| envelope.id)
+        .filter(|envelope| matches!(envelope.kind(), EventKind::PolicyAlert(_)))
+        .map(|envelope| envelope.id().clone())
         .collect())
 }
 
@@ -490,7 +491,7 @@ fn recover_ingress_journal_replays_persisted_gap() -> Result<(), Box<dyn std::er
     let envelopes = exported_envelopes(&spool)?;
     assert!(envelopes.iter().any(|envelope| {
         matches!(
-            &envelope.kind,
+            envelope.kind(),
             EventKind::Gap(gap)
                 if gap.direction == Direction::Outbound
                     && gap.expected_offset == 12
@@ -507,7 +508,7 @@ fn recover_ingress_journal_rejects_unexpected_payload_schema()
     let temp = tempdir()?;
     let spool = storage::FjallSpool::open(temp.path())?;
     spool.append_ingress(SpoolPayload::new(
-        SpoolPayloadSchema::EventEnvelopeJson,
+        SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
         b"{}",
     ))?;
     let mut parser_factory = Http1ParserFactory::default();
@@ -521,9 +522,9 @@ fn recover_ingress_journal_rejects_unexpected_payload_schema()
         error,
         PipelineError::UnexpectedIngressSchema {
             sequence: 1,
-            expected: SpoolPayloadSchema::CAPTURE_EVENT_JSON,
+            expected: SpoolPayloadSchema::CAPTURE_EVENT_ORIGIN_JSON,
             actual,
-        } if actual == SpoolPayloadSchema::EVENT_ENVELOPE_JSON
+        } if actual == SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON
     ));
     assert!(spool.read_export_batch("sink", 16)?.is_empty());
     Ok(())

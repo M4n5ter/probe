@@ -1,17 +1,15 @@
 use bytes::Bytes;
 use probe_core::{
-    CaptureLoss, CaptureSource, Direction, EnforcementEvidence, FlowContext, Gap, Timestamp,
+    CaptureLoss, CaptureOrigin, Direction, EnforcementEvidence, FlowContext, Gap, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::provider::CaptureProviderKind;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapturedBytes {
     pub timestamp: Timestamp,
     pub flow: FlowContext,
-    pub source: CaptureSource,
-    pub provider: CaptureProviderKind,
+    pub origin: CaptureOrigin,
     pub direction: Direction,
     pub stream_offset: u64,
     pub bytes: Bytes,
@@ -23,7 +21,7 @@ pub struct CapturedBytes {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CaptureEvent {
     Bytes(CapturedBytes),
     Gap(CapturedGap),
@@ -31,34 +29,31 @@ pub enum CaptureEvent {
     ConnectionOpened {
         timestamp: Timestamp,
         flow: FlowContext,
-        source: CaptureSource,
-        provider: CaptureProviderKind,
+        origin: CaptureOrigin,
     },
     ConnectionClosed {
         timestamp: Timestamp,
         flow: FlowContext,
-        source: CaptureSource,
-        provider: CaptureProviderKind,
+        origin: CaptureOrigin,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapturedGap {
     pub timestamp: Timestamp,
     pub flow: FlowContext,
-    pub source: CaptureSource,
-    pub provider: CaptureProviderKind,
+    pub origin: CaptureOrigin,
     pub enforcement_evidence: EnforcementEvidence,
     pub enforcement_evidence_propagation: EnforcementEvidencePropagation,
     pub gap: Gap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapturedLoss {
     pub timestamp: Timestamp,
-    pub flow: FlowContext,
-    pub source: CaptureSource,
-    pub provider: CaptureProviderKind,
+    pub origin: CaptureOrigin,
     pub enforcement_evidence: EnforcementEvidence,
     pub loss: CaptureLoss,
 }

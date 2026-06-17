@@ -69,7 +69,7 @@ pub(super) fn export_batch_from_events(
         .map(|event| event.sequence)
         .expect("non-empty event batch has a last sequence");
     for event in &events {
-        if event.payload.schema() != &SpoolPayloadSchema::EventEnvelopeJson {
+        if event.payload.schema() != &SpoolPayloadSchema::EventEnvelopeSubjectOriginJson {
             return Err(ExportDrainError::UnsupportedSpoolPayloadSchema {
                 sequence: event.sequence,
                 schema: event.payload.schema_wire().to_string(),
@@ -110,8 +110,9 @@ pub(in crate::export::drain) fn batch_id_last_sequence(batch_id: &str) -> Option
 #[cfg(test)]
 mod tests {
     use probe_core::{
-        AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
-        HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+        AddressPort, CaptureOrigin, CaptureSource, Direction, EventEnvelope, EventKind,
+        FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity, Timestamp,
+        TransportProtocol,
     };
     use storage::{FjallSpool, SpoolPayload};
     use tempfile::tempdir;
@@ -148,13 +149,13 @@ mod tests {
         spool: &FjallSpool,
         target: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let envelope = EventEnvelope::new(
+        let envelope = EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
             demo_flow(),
-            CaptureSource::Replay,
+            CaptureOrigin::from_source(CaptureSource::Replay),
             "test",
             EventKind::HttpRequestHeaders(HttpHeaders {
                 direction: Direction::Outbound,
@@ -169,7 +170,7 @@ mod tests {
         );
         let payload = serde_json::to_vec(&envelope)?;
         spool.append_export(SpoolPayload::new(
-            SpoolPayloadSchema::EventEnvelopeJson,
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
             payload,
         ))?;
         Ok(())

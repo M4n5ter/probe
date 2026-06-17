@@ -8,7 +8,11 @@ use std::{
 };
 
 use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
-use probe_core::{Action, DomainEvent, EventEnvelope, EventType, Verdict};
+use probe_core::{
+    Action, CaptureOrigin, CaptureProviderKind, CaptureSource, Direction, DomainEvent,
+    EnforcementEvidence, EventEnvelope, EventId, EventKind, EventType, FlowContext, Timestamp,
+    Verdict,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
@@ -139,6 +143,8 @@ pub enum PolicyError {
     MissingHook { hook: PolicyHook },
     #[error("policy returned an invalid outcome: {0}")]
     InvalidOutcome(String),
+    #[error("policy hook for {event_type} requires a flow-scoped event")]
+    NonFlowEvent { event_type: EventType },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,7 +241,8 @@ impl PolicyRuntime {
 
         self.instruction_budget
             .store(self.limits.instruction_budget, Ordering::Relaxed);
-        let event_value = self.lua.to_value(event)?;
+        let event_view = PolicyEventView::from_envelope(event)?;
+        let event_value = self.lua.to_value(&event_view)?;
         let returned: Value = function.call(event_value)?;
         value_to_outcomes(&self.lua, returned)
     }
@@ -359,16 +366,59 @@ fn table_value_to_outcome(lua: &Lua, value: Value) -> Result<PolicyOutcome, mlua
         .map(PolicyOutcome::Alert)
 }
 
+#[derive(Serialize)]
+struct PolicyEventView<'a> {
+    id: &'a EventId,
+    timestamp: Timestamp,
+    flow: &'a FlowContext,
+    source: CaptureSource,
+    provider: CaptureProviderKind,
+    origin: CaptureOrigin,
+    config_version: &'a str,
+    policy_version: Option<&'a str>,
+    degraded: bool,
+    enforcement_evidence: &'a EnforcementEvidence,
+    event_type: EventType,
+    direction: Option<Direction>,
+    kind: &'a EventKind,
+}
+
+impl<'a> PolicyEventView<'a> {
+    fn from_envelope(event: &'a EventEnvelope) -> Result<Self, PolicyError> {
+        let Some(flow) = event.flow() else {
+            return Err(PolicyError::NonFlowEvent {
+                event_type: event.kind().event_type(),
+            });
+        };
+        Ok(Self {
+            id: event.id(),
+            timestamp: event.timestamp(),
+            flow,
+            source: event.origin().source(),
+            provider: event.origin().provider(),
+            origin: event.origin(),
+            config_version: event.config_version(),
+            policy_version: event.policy_version(),
+            degraded: event.degraded(),
+            enforcement_evidence: event.enforcement_evidence(),
+            event_type: event.kind().event_type(),
+            direction: event.kind().direction(),
+            kind: event.kind(),
+        })
+    }
+}
+
 pub fn hook_for_event(event: &EventEnvelope) -> Option<PolicyHook> {
-    PolicyHook::from_event_type(event.kind.event_type())
+    PolicyHook::from_event_type(event.kind().event_type())
 }
 
 #[cfg(test)]
 mod tests {
     use probe_core::{
-        AddressPort, CaptureSource, Direction, EventEnvelope, EventKind, EventType, FlowContext,
-        FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
-        WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
+        AddressPort, CaptureOrigin, CaptureSource, Direction, EventEnvelope, EventKind,
+        EventProvenance, EventType, FlowContext, FlowIdentity, HttpHeaders, PolicyEmissionStage,
+        ProcessContext, ProcessIdentity, Timestamp, TransportProtocol, WebSocketFrame,
+        WebSocketHandoff, WebSocketOpcode,
     };
 
     use crate::{
@@ -404,6 +454,39 @@ mod tests {
 
         assert_eq!(verdict.reason, "matched /chat");
         assert_eq!(verdict.confidence, 90);
+        Ok(())
+    }
+
+    #[test]
+    fn lua_policy_receives_explicit_event_view() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "demo".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::HttpRequestHeaders],
+            },
+            r#"
+            function on_http_request_headers(event)
+              return probe.emit_alert(
+                event.flow.process.name .. " " ..
+                event.source .. " " ..
+                event.provider .. " " ..
+                event.event_type .. " " ..
+                event.kind.target
+              )
+            end
+            "#,
+        )?;
+        let event = demo_event();
+        let outcomes = runtime.handle_event(PolicyHook::HttpRequestHeaders, &event)?;
+
+        let [PolicyOutcome::Alert(alert)] = outcomes.as_slice() else {
+            panic!("expected one alert outcome: {outcomes:?}");
+        };
+        assert_eq!(
+            alert.message,
+            "demo replay replay http_request_headers /chat"
+        );
         Ok(())
     }
 
@@ -611,14 +694,17 @@ mod tests {
 
     #[test]
     fn secondary_events_do_not_have_policy_hooks() {
-        let policy_alert = EventEnvelope::new(
+        let trigger = demo_event().with_provenance(EventProvenance::primary(1, 0));
+        let policy_alert = EventEnvelope::from_policy_emission(
             Timestamp {
-                monotonic_ns: 1,
+                monotonic_ns: 2,
                 wall_time_unix_ns: 1,
             },
-            demo_flow(),
-            CaptureSource::Replay,
-            "test",
+            &trigger,
+            "test-policy@1",
+            0,
+            0,
+            PolicyEmissionStage::Output,
             EventKind::PolicyAlert(probe_core::DomainEvent {
                 name: "audit".to_string(),
                 severity: probe_core::Action::Alert,
@@ -718,13 +804,13 @@ mod tests {
     }
 
     fn demo_event() -> EventEnvelope {
-        EventEnvelope::new(
+        EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
             demo_flow(),
-            CaptureSource::Replay,
+            replay_origin(),
             "test",
             EventKind::HttpRequestHeaders(HttpHeaders {
                 direction: Direction::Outbound,
@@ -740,13 +826,13 @@ mod tests {
     }
 
     fn websocket_handoff_event() -> EventEnvelope {
-        EventEnvelope::new(
+        EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
             demo_flow(),
-            CaptureSource::Replay,
+            replay_origin(),
             "test",
             EventKind::WebSocketHandoff(WebSocketHandoff {
                 direction: Direction::Inbound,
@@ -759,13 +845,13 @@ mod tests {
     }
 
     fn websocket_frame_event() -> EventEnvelope {
-        EventEnvelope::new(
+        EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
             demo_flow(),
-            CaptureSource::Replay,
+            replay_origin(),
             "test",
             EventKind::WebSocketFrame(WebSocketFrame {
                 direction: Direction::Inbound,
@@ -781,6 +867,10 @@ mod tests {
                 payload_fingerprint: vec![1, 2, 3],
             }),
         )
+    }
+
+    fn replay_origin() -> CaptureOrigin {
+        CaptureOrigin::from_source(CaptureSource::Replay)
     }
 
     fn demo_flow() -> FlowContext {

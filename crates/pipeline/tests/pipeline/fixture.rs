@@ -1,10 +1,8 @@
-use capture::{
-    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind, CapturedBytes,
-};
+use capture::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CapturedBytes};
 use probe_core::{
-    AddressPort, CapabilityState, CaptureLoss, CaptureSource, Direction, EnforcementEvidence,
-    EventEnvelope, FlowContext, FlowIdentity, Gap, ObservationOnlyReason, ProcessContext,
-    ProcessIdentity, Timestamp, TransportProtocol,
+    AddressPort, CapabilityState, CaptureLoss, CaptureOrigin, CaptureSource, Direction,
+    EnforcementEvidence, EventEnvelope, FlowContext, FlowIdentity, Gap, ObservationOnlyReason,
+    ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
 };
 
 pub(super) struct SequenceProvider {
@@ -22,10 +20,6 @@ impl SequenceProvider {
 impl CaptureProvider for SequenceProvider {
     fn name(&self) -> &'static str {
         "sequence"
-    }
-
-    fn kind(&self) -> CaptureProviderKind {
-        CaptureProviderKind::Replay
     }
 
     fn capabilities(&self) -> Vec<CapabilityState> {
@@ -51,8 +45,7 @@ pub(super) fn observation_only_ebpf_syscall_bytes_with_direction(
     bytes: &'static [u8],
 ) -> CaptureEvent {
     let mut chunk = captured_bytes_chunk(flow, direction, bytes);
-    chunk.source = CaptureSource::EbpfSyscall;
-    chunk.provider = CaptureProviderKind::Ebpf;
+    chunk.origin = CaptureOrigin::from_source(CaptureSource::EbpfSyscall);
     chunk.degraded = true;
     chunk.degradation_reason = Some("test eBPF syscall payload snapshot".to_string());
     chunk.enforcement_evidence = EnforcementEvidence::observation_only_with_detail(
@@ -71,8 +64,7 @@ pub(super) fn flow_carried_observation_only_ebpf_syscall_gap(flow: FlowContext) 
             wall_time_unix_ns: 1,
         },
         flow,
-        source: CaptureSource::EbpfSyscall,
-        provider: CaptureProviderKind::Ebpf,
+        origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
         enforcement_evidence: EnforcementEvidence::observation_only_with_detail(
             ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
             reason,
@@ -95,8 +87,7 @@ pub(super) fn event_local_observation_only_ebpf_unresolved_gap(flow: FlowContext
             wall_time_unix_ns: 1,
         },
         flow,
-        source: CaptureSource::EbpfSyscall,
-        provider: CaptureProviderKind::Ebpf,
+        origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
         enforcement_evidence: EnforcementEvidence::observation_only_with_detail(
             ObservationOnlyReason::EbpfUnresolvedFlow,
             reason,
@@ -111,18 +102,16 @@ pub(super) fn event_local_observation_only_ebpf_unresolved_gap(flow: FlowContext
     })
 }
 
-pub(super) fn capture_loss(flow: FlowContext, lost_events: u64) -> CaptureEvent {
+pub(super) fn capture_loss(lost_events: u64) -> CaptureEvent {
     let reason = format!("test capture lost {lost_events} event(s)");
     CaptureEvent::Loss(capture::CapturedLoss {
         timestamp: Timestamp {
             monotonic_ns: 1,
             wall_time_unix_ns: 1,
         },
-        flow,
-        source: CaptureSource::EbpfSyscall,
-        provider: CaptureProviderKind::Ebpf,
+        origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
         enforcement_evidence: EnforcementEvidence::observation_only_with_detail(
-            ObservationOnlyReason::EbpfCaptureLoss,
+            ObservationOnlyReason::ProviderCaptureLoss,
             reason.clone(),
         ),
         loss: CaptureLoss {
@@ -151,8 +140,7 @@ fn captured_bytes_chunk(
             wall_time_unix_ns: 1,
         },
         flow,
-        source: CaptureSource::Replay,
-        provider: CaptureProviderKind::Replay,
+        origin: CaptureOrigin::from_source(CaptureSource::Replay),
         direction,
         stream_offset: 0,
         bytes: bytes.into(),
@@ -171,8 +159,7 @@ pub(super) fn connection_closed(flow: FlowContext) -> CaptureEvent {
             wall_time_unix_ns: 2,
         },
         flow,
-        source: CaptureSource::Replay,
-        provider: CaptureProviderKind::Replay,
+        origin: CaptureOrigin::from_source(CaptureSource::Replay),
     }
 }
 

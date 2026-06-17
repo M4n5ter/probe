@@ -1,8 +1,10 @@
 use bytes::Bytes;
-use probe_core::{CaptureSource, Direction, EnforcementEvidence, FlowContext, Gap, Timestamp};
+use probe_core::{
+    CaptureOrigin, CaptureSource, Direction, EnforcementEvidence, FlowContext, Gap, Timestamp,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::{CaptureEvent, CaptureProviderKind, CapturedBytes, CapturedGap};
+use crate::{CaptureEvent, CapturedBytes, CapturedGap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,8 +140,7 @@ impl From<PlaintextEvent> for CaptureEvent {
             PlaintextEventKind::Bytes(chunk) => CaptureEvent::Bytes(CapturedBytes {
                 timestamp: chunk.timestamp,
                 flow: chunk.flow,
-                source,
-                provider: CaptureProviderKind::Plaintext,
+                origin: CaptureOrigin::from_source(source),
                 direction: chunk.direction,
                 stream_offset: chunk.stream_offset,
                 bytes: chunk.bytes,
@@ -152,8 +153,7 @@ impl From<PlaintextEvent> for CaptureEvent {
             PlaintextEventKind::Gap(gap) => CaptureEvent::Gap(CapturedGap {
                 timestamp: gap.timestamp,
                 flow: gap.flow,
-                source,
-                provider: CaptureProviderKind::Plaintext,
+                origin: CaptureOrigin::from_source(source),
                 enforcement_evidence: EnforcementEvidence::default(),
                 enforcement_evidence_propagation: crate::EnforcementEvidencePropagation::Event,
                 gap: gap.gap,
@@ -161,14 +161,12 @@ impl From<PlaintextEvent> for CaptureEvent {
             PlaintextEventKind::ConnectionOpened(connection) => CaptureEvent::ConnectionOpened {
                 timestamp: connection.timestamp,
                 flow: connection.flow,
-                source,
-                provider: CaptureProviderKind::Plaintext,
+                origin: CaptureOrigin::from_source(source),
             },
             PlaintextEventKind::ConnectionClosed(connection) => CaptureEvent::ConnectionClosed {
                 timestamp: connection.timestamp,
                 flow: connection.flow,
-                source,
-                provider: CaptureProviderKind::Plaintext,
+                origin: CaptureOrigin::from_source(source),
             },
         }
     }
@@ -176,6 +174,8 @@ impl From<PlaintextEvent> for CaptureEvent {
 
 #[cfg(test)]
 mod tests {
+    use crate::CaptureProviderKind;
+
     use probe_core::{
         AddressPort, FlowIdentity, ProcessContext, ProcessIdentity, TransportProtocol,
     };
@@ -206,8 +206,8 @@ mod tests {
 
         assert_eq!(bytes.timestamp, timestamp);
         assert_eq!(bytes.flow, flow);
-        assert_eq!(bytes.source, CaptureSource::ExternalPlaintextFeed);
-        assert_eq!(bytes.provider, CaptureProviderKind::Plaintext);
+        assert_eq!(bytes.origin.source(), CaptureSource::ExternalPlaintextFeed);
+        assert_eq!(bytes.origin.provider(), CaptureProviderKind::Plaintext);
         assert_eq!(bytes.direction, Direction::Outbound);
         assert_eq!(bytes.stream_offset, 5);
         assert_eq!(bytes.bytes.as_ref(), b"GET / HTTP/1.1\r\n\r\n");
@@ -258,7 +258,7 @@ mod tests {
             panic!("expected plaintext bytes");
         };
 
-        assert_eq!(bytes.source, CaptureSource::LibsslUprobe);
+        assert_eq!(bytes.origin.source(), CaptureSource::LibsslUprobe);
     }
 
     fn demo_flow() -> FlowContext {

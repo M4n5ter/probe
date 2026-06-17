@@ -119,6 +119,7 @@ pub enum EnforcementOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Verdict {
     pub action: Action,
     pub scope: VerdictScope,
@@ -140,6 +141,7 @@ impl Verdict {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnforcementDecision {
     pub mode: EnforcementMode,
     pub outcome: EnforcementOutcome,

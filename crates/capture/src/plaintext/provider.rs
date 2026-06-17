@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use probe_core::{CapabilityKind, CapabilityState};
 use thiserror::Error;
 
-use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind};
+use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider};
 
 use super::{PlaintextChunk, PlaintextEvent, PlaintextSource};
 
@@ -66,10 +66,6 @@ impl CaptureProvider for PlaintextEventProvider {
         }
     }
 
-    fn kind(&self) -> CaptureProviderKind {
-        CaptureProviderKind::Plaintext
-    }
-
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::available(match self.source {
             PlaintextSource::ExternalPlaintextFeed => CapabilityKind::ExternalPlaintextFeed,
@@ -115,7 +111,7 @@ mod tests {
             panic!("expected plaintext bytes");
         };
 
-        assert_eq!(bytes.source, CaptureSource::LibsslUprobe);
+        assert_eq!(bytes.origin.source(), CaptureSource::LibsslUprobe);
         assert_eq!(
             provider.capabilities(),
             vec![CapabilityState::available(CapabilityKind::LibsslUprobe)]

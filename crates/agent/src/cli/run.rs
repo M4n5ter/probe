@@ -556,8 +556,8 @@ end
             .map(|event| serde_json::from_slice::<probe_core::EventEnvelope>(event.payload.bytes()))
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .filter(|envelope| matches!(envelope.kind, probe_core::EventKind::PolicyAlert(_)))
-            .filter_map(|envelope| envelope.policy_version)
+            .filter(|envelope| matches!(envelope.kind(), probe_core::EventKind::PolicyAlert(_)))
+            .filter_map(|envelope| envelope.policy_version().map(str::to_string))
             .collect::<Vec<_>>();
         assert_eq!(
             policy_versions,
@@ -708,8 +708,7 @@ protective_actions = ["alert"]
         let chunk = CapturedBytes {
             timestamp: current_timestamp(1),
             flow: replay_flow(),
-            source: probe_core::CaptureSource::Replay,
-            provider: capture::CaptureProviderKind::Replay,
+            origin: probe_core::CaptureOrigin::from_source(probe_core::CaptureSource::Replay),
             direction: Direction::Outbound,
             stream_offset: 0,
             bytes: b"GET /recovered-run HTTP/1.1\r\nHost: recovery.test\r\n\r\n"
@@ -722,7 +721,7 @@ protective_actions = ["alert"]
             enforcement_evidence_propagation: capture::EnforcementEvidencePropagation::Event,
         };
         spool.append_ingress(SpoolPayload::new(
-            SpoolPayloadSchema::CaptureEventJson,
+            SpoolPayloadSchema::CaptureEventOriginJson,
             serde_json::to_vec(&CaptureEvent::Bytes(chunk))?,
         ))?;
         drop(spool);
@@ -771,14 +770,14 @@ end
             .collect::<Result<Vec<_>, _>>()?;
         assert!(envelopes.iter().any(|envelope| {
             matches!(
-                &envelope.kind,
+                envelope.kind(),
                 probe_core::EventKind::HttpRequestHeaders(headers)
                     if headers.target.as_deref() == Some("/recovered-run")
             )
         }));
         assert!(envelopes.iter().any(|envelope| {
             matches!(
-                &envelope.kind,
+                envelope.kind(),
                 probe_core::EventKind::PolicyVerdict(verdict)
                     if verdict.action == probe_core::Action::Deny
             )
@@ -786,7 +785,7 @@ end
         assert!(
             envelopes.iter().all(|envelope| {
                 !matches!(
-                    &envelope.kind,
+                    envelope.kind(),
                     probe_core::EventKind::EnforcementDecision(_)
                 )
             }),

@@ -339,7 +339,7 @@ pub(crate) fn assert_no_policy_runtime_errors(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let runtime_errors = envelopes
         .iter()
-        .filter(|envelope| matches!(envelope.kind, EventKind::PolicyRuntimeError(_)))
+        .filter(|envelope| matches!(envelope.kind(), EventKind::PolicyRuntimeError(_)))
         .count();
     if runtime_errors == 0 {
         return Ok(());

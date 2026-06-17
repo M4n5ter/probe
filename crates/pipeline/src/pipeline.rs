@@ -387,10 +387,10 @@ where
                     })
                     .into_events();
                 for event in parser_events {
-                    let envelope = EventEnvelope::new(
+                    let envelope = EventEnvelope::from_flow(
                         gap.timestamp,
                         gap.flow.clone(),
-                        gap.source,
+                        gap.origin,
                         self.config_version.clone(),
                         event,
                     )
@@ -401,10 +401,9 @@ where
                 }
             }
             CaptureEvent::Loss(loss) => {
-                let envelope = EventEnvelope::new(
+                let envelope = EventEnvelope::from_provider(
                     loss.timestamp,
-                    loss.flow,
-                    loss.source,
+                    loss.origin,
                     self.config_version.clone(),
                     EventKind::CaptureLoss(loss.loss),
                 )
@@ -415,13 +414,12 @@ where
             CaptureEvent::ConnectionOpened {
                 timestamp,
                 flow,
-                source,
-                ..
+                origin,
             } => {
-                let envelope = EventEnvelope::new(
+                let envelope = EventEnvelope::from_flow(
                     timestamp,
                     flow,
-                    source,
+                    origin,
                     self.config_version.clone(),
                     EventKind::ConnectionOpened,
                 );
@@ -431,8 +429,7 @@ where
             CaptureEvent::ConnectionClosed {
                 timestamp,
                 flow,
-                source,
-                ..
+                origin,
             } => {
                 let flow_id = flow.id.clone();
                 let enforcement_evidence = self.current_flow_enforcement_evidence(&flow_id);
@@ -442,10 +439,10 @@ where
                     .ingest(ParserInput::ConnectionClosed)
                     .into_events();
                 for event in parser_events {
-                    let envelope = EventEnvelope::new(
+                    let envelope = EventEnvelope::from_flow(
                         timestamp,
                         flow.clone(),
-                        source,
+                        origin,
                         self.config_version.clone(),
                         event,
                     )
@@ -454,10 +451,10 @@ where
                         self.append_envelope_and_policy_outcomes(envelope, &mut emissions)?;
                     add_export_events_to_summary(summary, written);
                 }
-                let envelope = EventEnvelope::new(
+                let envelope = EventEnvelope::from_flow(
                     timestamp,
                     flow,
-                    source,
+                    origin,
                     self.config_version.clone(),
                     EventKind::ConnectionClosed,
                 )
@@ -498,10 +495,10 @@ where
             .into_events();
 
         for event in events {
-            let envelope = EventEnvelope::new(
+            let envelope = EventEnvelope::from_flow(
                 self.clock.next_timestamp(),
                 chunk.flow.clone(),
-                chunk.source,
+                chunk.origin,
                 self.config_version.clone(),
                 event,
             )
@@ -520,7 +517,7 @@ where
     fn append_capture_event(&self, capture_event: &CaptureEvent) -> Result<u64, PipelineError> {
         let payload = serde_json::to_vec(capture_event)?;
         let stored = self.spool.append_ingress(SpoolPayload::new(
-            SpoolPayloadSchema::CaptureEventJson,
+            SpoolPayloadSchema::CaptureEventOriginJson,
             payload,
         ))?;
         Ok(stored.sequence)
@@ -615,7 +612,7 @@ where
             0,
             PolicyEmissionStage::RuntimeError,
             EventKind::PolicyRuntimeError(PolicyRuntimeError {
-                event_type: envelope.kind.event_type(),
+                event_type: envelope.kind().event_type(),
                 reason,
             }),
         )
@@ -698,34 +695,23 @@ where
         stage: PolicyEmissionStage,
         kind: EventKind,
     ) -> Result<bool, PipelineError> {
-        let trigger_provenance = envelope
-            .provenance
-            .as_ref()
-            .expect("primary pipeline event must carry provenance before policy evaluation");
-        let policy_envelope = EventEnvelope::new(
+        let policy_envelope = EventEnvelope::from_policy_emission(
             self.clock.next_timestamp(),
-            envelope.flow.clone(),
-            envelope.source,
-            envelope.config_version.clone(),
-            kind,
-        )
-        .with_policy_version(policy_version)
-        .with_degraded(envelope.degraded)
-        .with_enforcement_evidence(envelope.enforcement_evidence.clone())
-        .with_provenance(EventProvenance::policy(
-            trigger_provenance,
+            envelope,
+            policy_version,
             policy_index,
             output_index,
             stage,
-        ));
+            kind,
+        );
         self.append_envelope(&policy_envelope)
     }
 
     fn append_envelope(&self, envelope: &EventEnvelope) -> Result<bool, PipelineError> {
         let payload = serde_json::to_vec(envelope)?;
         let outcome = self.spool.append_export_once(
-            &envelope.id.0,
-            SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeJson, payload),
+            &envelope.id().0,
+            SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeSubjectOriginJson, payload),
         )?;
         let appended = matches!(outcome, AppendOutcome::Appended(_));
         if appended && let Some(metrics) = &self.runtime_metrics {
@@ -836,12 +822,12 @@ fn decode_ingress_capture_event(
     stored_event: &storage::StoredEvent,
 ) -> Result<CaptureEvent, PipelineError> {
     match stored_event.payload.schema() {
-        SpoolPayloadSchema::CaptureEventJson => Ok(serde_json::from_slice::<CaptureEvent>(
+        SpoolPayloadSchema::CaptureEventOriginJson => Ok(serde_json::from_slice::<CaptureEvent>(
             stored_event.payload.bytes(),
         )?),
         schema => Err(PipelineError::UnexpectedIngressSchema {
             sequence: stored_event.sequence,
-            expected: SpoolPayloadSchema::CAPTURE_EVENT_JSON,
+            expected: SpoolPayloadSchema::CAPTURE_EVENT_ORIGIN_JSON,
             actual: schema.to_string(),
         }),
     }

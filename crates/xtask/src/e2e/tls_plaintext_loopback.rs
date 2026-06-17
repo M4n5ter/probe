@@ -615,8 +615,8 @@ fn is_expected_tls_plaintext_request_bytes(event: &CaptureEvent, listen_port: u1
     let CaptureEvent::Bytes(bytes) = event else {
         return false;
     };
-    bytes.source == CaptureSource::LibsslUprobe
-        && bytes.provider == CaptureProviderKind::Plaintext
+    bytes.origin.source() == CaptureSource::LibsslUprobe
+        && bytes.origin.provider() == CaptureProviderKind::Plaintext
         && bytes.direction == Direction::Outbound
         && bytes.flow.remote.port == listen_port
         && bytes.flow.attribution_confidence > 0
@@ -637,8 +637,8 @@ fn is_unresolved_tls_plaintext_bytes(event: &CaptureEvent) -> bool {
     let CaptureEvent::Bytes(bytes) = event else {
         return false;
     };
-    bytes.source == CaptureSource::LibsslUprobe
-        && bytes.provider == CaptureProviderKind::Plaintext
+    bytes.origin.source() == CaptureSource::LibsslUprobe
+        && bytes.origin.provider() == CaptureProviderKind::Plaintext
         && bytes.flow.attribution_confidence == 0
         && bytes.flow.local.port == 0
         && bytes.flow.remote.port == 0
@@ -661,8 +661,8 @@ fn event_summary(event: &CaptureEvent, listen_port: u16) -> Option<String> {
         CaptureEvent::Bytes(bytes) if is_summary_relevant_bytes(bytes, listen_port) => {
             Some(format!(
                 "bytes source={:?} provider={:?} direction={:?} local={}:{} remote={}:{} pid={} name={} confidence={} len={} degraded={} fixture={}",
-                bytes.source,
-                bytes.provider,
+                bytes.origin.source(),
+                bytes.origin.provider(),
                 bytes.direction,
                 bytes.flow.local.address,
                 bytes.flow.local.port,
@@ -678,8 +678,8 @@ fn event_summary(event: &CaptureEvent, listen_port: u16) -> Option<String> {
         }
         CaptureEvent::Gap(gap) if is_summary_relevant_gap(gap, listen_port) => Some(format!(
             "gap source={:?} provider={:?} direction={:?} local={}:{} remote={}:{} pid={} name={} confidence={} reason={}",
-            gap.source,
-            gap.provider,
+            gap.origin.source(),
+            gap.origin.provider(),
             gap.gap.direction,
             gap.flow.local.address,
             gap.flow.local.port,
@@ -695,13 +695,13 @@ fn event_summary(event: &CaptureEvent, listen_port: u16) -> Option<String> {
 }
 
 fn is_summary_relevant_bytes(bytes: &capture::CapturedBytes, listen_port: u16) -> bool {
-    bytes.source == CaptureSource::LibsslUprobe
+    bytes.origin.source() == CaptureSource::LibsslUprobe
         || bytes.flow.local.port == listen_port
         || bytes.flow.remote.port == listen_port
 }
 
 fn is_summary_relevant_gap(gap: &capture::CapturedGap, listen_port: u16) -> bool {
-    gap.source == CaptureSource::LibsslUprobe
+    gap.origin.source() == CaptureSource::LibsslUprobe
         || gap.flow.local.port == listen_port
         || gap.flow.remote.port == listen_port
 }
@@ -709,10 +709,11 @@ fn is_summary_relevant_gap(gap: &capture::CapturedGap, listen_port: u16) -> bool
 fn assert_expected_requests(envelopes: &[EventEnvelope]) -> Result<(), Box<dyn std::error::Error>> {
     let observed = envelopes
         .iter()
-        .filter_map(|envelope| match &envelope.kind {
+        .filter_map(|envelope| match envelope.kind() {
             EventKind::HttpRequestHeaders(headers)
-                if envelope.source == CaptureSource::LibsslUprobe
-                    && envelope.degraded
+                if envelope.origin().source() == CaptureSource::LibsslUprobe
+                    && envelope.origin().provider() == CaptureProviderKind::Plaintext
+                    && envelope.degraded()
                     && headers.direction == Direction::Outbound
                     && headers.method.as_deref() == Some("POST") =>
             {
@@ -738,11 +739,12 @@ fn assert_expected_policy_alerts(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let observed = envelopes
         .iter()
-        .filter_map(|envelope| match &envelope.kind {
+        .filter_map(|envelope| match envelope.kind() {
             EventKind::PolicyAlert(alert)
-                if envelope.source == CaptureSource::LibsslUprobe
-                    && envelope.policy_version.as_deref() == Some(EXPECTED_POLICY_VERSION)
-                    && envelope.degraded =>
+                if envelope.origin().source() == CaptureSource::LibsslUprobe
+                    && envelope.origin().provider() == CaptureProviderKind::Plaintext
+                    && envelope.policy_version() == Some(EXPECTED_POLICY_VERSION)
+                    && envelope.degraded() =>
             {
                 Some(alert.message.clone())
             }
