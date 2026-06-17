@@ -620,6 +620,10 @@ protective_actions = ["alert"]
             status.interception.strategy,
             probe_config::TransparentInterceptionStrategyConfig::OutboundMitm
         );
+        assert_eq!(
+            status.interception.proxy.mode,
+            probe_config::TransparentInterceptionProxyModeConfig::External
+        );
         assert_eq!(status.interception.proxy.listen_port, Some(15001));
         assert_eq!(status.interception.nftables.table_name, "sssa_probe");
         assert_eq!(status.interception.nftables.route_table, 53_534);
@@ -637,6 +641,7 @@ protective_actions = ["alert"]
         );
         let value = serde_json::to_value(&status)?;
         assert_eq!(value["interception"]["strategy"], json!("outbound_mitm"));
+        assert_eq!(value["interception"]["proxy"]["mode"], json!("external"));
         assert_eq!(value["interception"]["proxy"]["listen_port"], json!(15001));
         assert_eq!(
             value["interception"]["nftables"]["table_name"],

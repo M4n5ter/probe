@@ -1,24 +1,13 @@
 use std::{
     env,
     io::{Read, Write},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
+    net::{Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Child, Command, ExitCode, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
-
-use probe_config::{
-    AgentConfig, CaptureSelection, TransparentInterceptionProxyConfig,
-    TransparentInterceptionStrategyConfig,
-};
-use probe_core::{Direction, EnforcementMode, ProcessSelector, Selector, TrafficSelector};
-use signal_hook::{
-    consts::signal::{SIGINT, SIGTERM},
-    iterator::Signals,
-};
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use super::{
     harness::{
@@ -27,6 +16,15 @@ use super::{
     },
     loopback::{spawn_agent, wait_for_agent_ready},
 };
+use probe_config::{
+    AgentConfig, CaptureSelection, TransparentInterceptionProxyConfig,
+    TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
+};
+use probe_core::{Direction, EnforcementMode, ProcessSelector, Selector, TrafficSelector};
+use signal_hook::{
+    consts::signal::{SIGINT, SIGTERM},
+    iterator::Signals,
+};
 
 const IN_NETNS_ENV: &str = "SSSA_PROBE_E2E_TRANSPARENT_TPROXY_NETNS";
 const CLIENT_OWNER_ENV: &str = "SSSA_PROBE_E2E_TRANSPARENT_TPROXY_CLIENT_OWNER";
@@ -34,15 +32,31 @@ const HOST_IFACE: &str = "sssa0h";
 const CLIENT_IFACE: &str = "sssa0c";
 const HOST_ADDR: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 1);
 const CLIENT_ADDR: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 2);
-const SERVER_PORT: u16 = 18080;
 const PROXY_PORT: u16 = 15001;
 const TPROXY_MARK: &str = "0x53534101";
 const TPROXY_ROUTE_TABLE: &str = "53534";
-const CLIENT_PAYLOAD: &[u8] = b"GET /transparent-tproxy-e2e HTTP/1.1\r\nHost: tproxy.test\r\n\r\n";
-const PROXY_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ntproxy\n";
+const UPSTREAM_SCENARIOS: [UpstreamScenario; 2] = [
+    UpstreamScenario {
+        port: 18080,
+        client_payload: b"GET /transparent-tproxy-e2e-a HTTP/1.1\r\nHost: tproxy-a.test\r\n\r\n",
+        server_response: b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ntproxy-a\n",
+    },
+    UpstreamScenario {
+        port: 18081,
+        client_payload: b"GET /transparent-tproxy-e2e-b HTTP/1.1\r\nHost: tproxy-b.test\r\n\r\n",
+        server_response: b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ntproxy-b\n",
+    },
+];
 const CLIENT_NAMESPACE_READY_TIMEOUT: Duration = Duration::from_secs(5);
-const PROXY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVER_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UpstreamScenario {
+    port: u16,
+    client_payload: &'static [u8],
+    server_response: &'static [u8],
+}
 
 pub(crate) fn run() -> ExitCode {
     match run_outer() {
@@ -116,13 +130,23 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let client_pid = client_namespace.child_mut().id();
     wait_for_client_namespace_ready(client_namespace.child_mut())?;
     let _network = IsolatedNetwork::setup(client_pid)?;
-    let proxy = TransparentProxy::spawn(PROXY_PORT)?;
+    let upstreams = UPSTREAM_SCENARIOS
+        .iter()
+        .copied()
+        .map(UpstreamServer::spawn)
+        .collect::<Result<Vec<_>, _>>()?;
     let mut ready_signal = UnixSocketReadySignal::bind(ready_socket_path)?;
     let mut agent = supervisor.watch(spawn_agent(&config_path, &ready_signal)?, "agent");
     wait_for_agent_ready(agent.child_mut(), &mut ready_signal)?;
 
-    let client_response = run_client(client_pid);
-    let proxy_report = proxy.join();
+    let client_responses = UPSTREAM_SCENARIOS
+        .iter()
+        .map(|scenario| run_client(client_pid, scenario))
+        .collect::<Vec<_>>();
+    let upstream_reports = upstreams
+        .into_iter()
+        .map(UpstreamServer::join)
+        .collect::<Vec<_>>();
     let agent_result = stop_running_child(agent.child_mut(), "agent");
     agent.unwatch();
     let client_namespace_result =
@@ -131,8 +155,8 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cleanup_result = assert_transparent_interception_cleanup();
 
     merge_run_results(
-        client_response,
-        proxy_report,
+        client_responses,
+        upstream_reports,
         agent_result,
         client_namespace_result,
         cleanup_result,
@@ -147,19 +171,28 @@ fn write_agent_config(path: &Path, spool_path: &Path) -> Result<(), Box<dyn std:
     };
     config.capture.selection = CaptureSelection::Libpcap;
     config.capture.libpcap.interface = Some(HOST_IFACE.to_string());
-    config.capture.libpcap.bpf_filter = format!("tcp and port {SERVER_PORT}");
+    let bpf_ports = UPSTREAM_SCENARIOS
+        .iter()
+        .map(|scenario| format!("port {}", scenario.port))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    config.capture.libpcap.bpf_filter = format!("tcp and ({bpf_ports})");
     config.capture.libpcap.read_timeout_ms = 100;
     config.storage.path = spool_path.to_path_buf();
     config.export.worker.enabled = false;
     config.enforcement.mode = EnforcementMode::Enforce;
     config.enforcement.interception.strategy = TransparentInterceptionStrategyConfig::InboundTproxy;
     config.enforcement.interception.proxy = TransparentInterceptionProxyConfig {
+        mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
         listen_port: Some(PROXY_PORT),
     };
     config.enforcement.interception.selector = Some(Selector::term(
         ProcessSelector::default(),
         TrafficSelector {
-            local_ports: vec![SERVER_PORT],
+            local_ports: UPSTREAM_SCENARIOS
+                .iter()
+                .map(|scenario| scenario.port)
+                .collect(),
             directions: vec![Direction::Inbound],
             remote_addresses: vec![CLIENT_ADDR.to_string()],
             ..TrafficSelector::default()
@@ -261,58 +294,48 @@ impl Drop for IsolatedNetwork {
     }
 }
 
-struct TransparentProxy {
-    report: mpsc::Receiver<Result<ProxyReport, String>>,
+struct UpstreamServer {
+    report: mpsc::Receiver<Result<UpstreamReport, String>>,
     thread: thread::JoinHandle<()>,
 }
 
-impl TransparentProxy {
-    fn spawn(port: u16) -> Result<Self, Box<dyn std::error::Error>> {
-        let listener = transparent_listener(port)?;
+impl UpstreamServer {
+    fn spawn(scenario: UpstreamScenario) -> Result<Self, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind((HOST_ADDR, scenario.port))?;
+        listener.set_nonblocking(true)?;
         let (sender, report) = mpsc::channel();
         let thread = thread::spawn(move || {
-            let result = run_proxy(listener).map_err(|error| error.to_string());
+            let result = run_upstream_server(listener, scenario).map_err(|error| error.to_string());
             let _ = sender.send(result);
         });
         Ok(Self { report, thread })
     }
 
-    fn join(self) -> Result<ProxyReport, Box<dyn std::error::Error>> {
+    fn join(self) -> Result<UpstreamReport, Box<dyn std::error::Error>> {
         let result = self
             .report
-            .recv_timeout(PROXY_ACCEPT_TIMEOUT + Duration::from_secs(1))
-            .map_err(|error| e2e_error(format!("transparent proxy did not report: {error}")))?;
+            .recv_timeout(SERVER_ACCEPT_TIMEOUT + Duration::from_secs(1))
+            .map_err(|error| e2e_error(format!("upstream server did not report: {error}")))?;
         self.thread
             .join()
-            .map_err(|_| e2e_error("transparent proxy thread panicked"))?;
+            .map_err(|_| e2e_error("upstream server thread panicked"))?;
         result.map_err(|error| e2e_error(error).into())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProxyReport {
+struct UpstreamReport {
+    port: u16,
     peer_addr: SocketAddr,
-    local_addr: SocketAddr,
-    original_dst: Option<SocketAddr>,
     request: Vec<u8>,
 }
 
-fn transparent_listener(port: u16) -> Result<Socket, Box<dyn std::error::Error>> {
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
-    socket.set_ip_transparent_v4(true)?;
-    socket.bind(&SockAddr::from(SocketAddrV4::new(
-        Ipv4Addr::UNSPECIFIED,
-        port,
-    )))?;
-    socket.listen(16)?;
-    socket.set_nonblocking(true)?;
-    Ok(socket)
-}
-
-fn run_proxy(listener: Socket) -> Result<ProxyReport, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + PROXY_ACCEPT_TIMEOUT;
-    let (accepted, peer) = loop {
+fn run_upstream_server(
+    listener: TcpListener,
+    scenario: UpstreamScenario,
+) -> Result<UpstreamReport, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + SERVER_ACCEPT_TIMEOUT;
+    let (mut stream, peer_addr) = loop {
         match listener.accept() {
             Ok(accepted) => break accepted,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -320,41 +343,34 @@ fn run_proxy(listener: Socket) -> Result<ProxyReport, Box<dyn std::error::Error>
             Err(error) => return Err(error.into()),
         }
         if Instant::now() >= deadline {
-            return Err(
-                e2e_error("transparent proxy timed out waiting for intercepted client").into(),
-            );
+            return Err(e2e_error("upstream server timed out waiting for relayed client").into());
         }
         thread::sleep(Duration::from_millis(20));
     };
-    accepted.set_read_timeout(Some(Duration::from_secs(2)))?;
-    accepted.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let original_dst = accepted
-        .original_dst_v4()
-        .ok()
-        .and_then(|address| address.as_socket());
-    let mut stream = TcpStream::from(accepted);
-    let peer_addr = peer
-        .as_socket()
-        .ok_or_else(|| e2e_error("transparent proxy accepted non-IP peer address"))?;
-    let local_addr = stream.local_addr()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1024];
     let read = stream.read(&mut buffer)?;
     request.extend_from_slice(&buffer[..read]);
-    stream.write_all(PROXY_RESPONSE)?;
-    Ok(ProxyReport {
+    stream.write_all(scenario.server_response)?;
+    Ok(UpstreamReport {
+        port: scenario.port,
         peer_addr,
-        local_addr,
-        original_dst,
         request,
     })
 }
 
-fn run_client(client_pid: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn run_client(
+    client_pid: u32,
+    scenario: &UpstreamScenario,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let host = HOST_ADDR.to_string();
+    let port = scenario.port.to_string();
     let mut child = Command::new(nsenter_command()?)
         .args(["--target", &client_pid.to_string(), "--net", "--"])
         .arg(nc_command()?)
-        .args(["-w", "2", &HOST_ADDR.to_string(), &SERVER_PORT.to_string()])
+        .args(["-w", "2", &host, &port])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -363,7 +379,7 @@ fn run_client(client_pid: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         .stdin
         .take()
         .ok_or_else(|| e2e_error("failed to open nc stdin"))?
-        .write_all(CLIENT_PAYLOAD)?;
+        .write_all(scenario.client_payload)?;
     let output = wait_with_timeout(child, CLIENT_TIMEOUT)?;
     if output.status.success() {
         Ok(output.stdout)
@@ -377,46 +393,49 @@ fn run_client(client_pid: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     }
 }
 
-fn assert_proxy_observed_intercepted_request(
-    report: &ProxyReport,
+fn assert_upstream_observed_relayed_request(
+    report: &UpstreamReport,
+    scenario: &UpstreamScenario,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let expected_local = SocketAddr::V4(SocketAddrV4::new(HOST_ADDR, SERVER_PORT));
-    if report.peer_addr.ip() != CLIENT_ADDR {
+    if report.port != scenario.port {
         return Err(e2e_error(format!(
-            "transparent proxy peer mismatch: expected {CLIENT_ADDR}, got {}",
-            report.peer_addr
+            "upstream report port mismatch: expected {}, got {}",
+            scenario.port, report.port
         ))
         .into());
     }
-    if report.local_addr != expected_local {
+    if report.peer_addr.ip() != HOST_ADDR {
         return Err(e2e_error(format!(
-            "transparent proxy local destination mismatch: expected {expected_local}, got {}",
-            report.local_addr
+            "upstream server on port {} peer mismatch: expected relay host address {HOST_ADDR}, got {}",
+            scenario.port, report.peer_addr
         ))
         .into());
     }
-    if !report.request.starts_with(CLIENT_PAYLOAD) {
+    if !report.request.starts_with(scenario.client_payload) {
         return Err(e2e_error(format!(
-            "transparent proxy received unexpected payload: {:?}",
+            "upstream server on port {} received unexpected payload: {:?}",
+            scenario.port,
             String::from_utf8_lossy(&report.request)
         ))
         .into());
     }
     println!(
-        "transparent proxy accepted peer={} local={} original_dst={:?}",
-        report.peer_addr, report.local_addr, report.original_dst
+        "upstream server on port {} accepted relayed request from peer={}",
+        scenario.port, report.peer_addr
     );
     Ok(())
 }
 
-fn assert_client_received_proxy_response(
+fn assert_client_received_server_response(
     response: &[u8],
+    scenario: &UpstreamScenario,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if response == PROXY_RESPONSE {
+    if response == scenario.server_response {
         Ok(())
     } else {
         Err(e2e_error(format!(
-            "client did not receive proxy response: {:?}",
+            "client did not receive server response for port {} through managed relay: {:?}",
+            scenario.port,
             String::from_utf8_lossy(response)
         ))
         .into())
@@ -430,28 +449,40 @@ fn assert_transparent_interception_cleanup() -> Result<(), Box<dyn std::error::E
 }
 
 fn merge_run_results(
-    client_response: Result<Vec<u8>, Box<dyn std::error::Error>>,
-    proxy_report: Result<ProxyReport, Box<dyn std::error::Error>>,
+    client_responses: Vec<Result<Vec<u8>, Box<dyn std::error::Error>>>,
+    upstream_reports: Vec<Result<UpstreamReport, Box<dyn std::error::Error>>>,
     agent_result: Result<(), Box<dyn std::error::Error>>,
     client_namespace_result: Result<(), Box<dyn std::error::Error>>,
     cleanup_result: Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut errors = Vec::new();
-    let client_response = collect_result("client", client_response, &mut errors);
-    let proxy_report = collect_result("transparent proxy", proxy_report, &mut errors);
-    if let Some(report) = proxy_report.as_ref() {
-        record_result(
-            "transparent proxy assertion",
-            assert_proxy_observed_intercepted_request(report),
+    record_result_count("client responses", client_responses.len(), &mut errors);
+    record_result_count("upstream reports", upstream_reports.len(), &mut errors);
+    for (scenario, client_response) in UPSTREAM_SCENARIOS.iter().zip(client_responses) {
+        if let Some(response) = collect_result(
+            format!("client for port {}", scenario.port),
+            client_response,
             &mut errors,
-        );
+        ) {
+            record_result(
+                format!("client response assertion for port {}", scenario.port),
+                assert_client_received_server_response(&response, scenario),
+                &mut errors,
+            );
+        }
     }
-    if let Some(response) = client_response.as_ref() {
-        record_result(
-            "client response assertion",
-            assert_client_received_proxy_response(response),
+    for (scenario, upstream_report) in UPSTREAM_SCENARIOS.iter().zip(upstream_reports) {
+        if let Some(report) = collect_result(
+            format!("upstream server for port {}", scenario.port),
+            upstream_report,
             &mut errors,
-        );
+        ) {
+            record_result(
+                format!("upstream server assertion for port {}", scenario.port),
+                assert_upstream_observed_relayed_request(&report, scenario),
+                &mut errors,
+            );
+        }
     }
     record_result("agent shutdown", agent_result, &mut errors);
     record_result(
@@ -471,11 +502,21 @@ fn merge_run_results(
     }
 }
 
+fn record_result_count(label: &'static str, actual: usize, errors: &mut Vec<String>) {
+    if actual != UPSTREAM_SCENARIOS.len() {
+        errors.push(format!(
+            "{label} count mismatch: expected {}, got {actual}",
+            UPSTREAM_SCENARIOS.len()
+        ));
+    }
+}
+
 fn collect_result<T>(
-    label: &'static str,
+    label: impl Into<String>,
     result: Result<T, Box<dyn std::error::Error>>,
     errors: &mut Vec<String>,
 ) -> Option<T> {
+    let label = label.into();
     match result {
         Ok(value) => Some(value),
         Err(error) => {
@@ -486,10 +527,11 @@ fn collect_result<T>(
 }
 
 fn record_result(
-    label: &'static str,
+    label: impl Into<String>,
     result: Result<(), Box<dyn std::error::Error>>,
     errors: &mut Vec<String>,
 ) {
+    let label = label.into();
     if let Err(error) = result {
         errors.push(format!("{label} failed: {error}"));
     }

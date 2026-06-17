@@ -6,8 +6,8 @@ use super::{
     INBOUND_TPROXY_OWNER_LOCK, NftablesPlanError, hex_mark,
     projection::{NftFamily, NftRule, NftSelectorProjection},
     proxy_port_from_config,
-    route::PolicyRouteFamily,
 };
+use crate::transparent_interception::TransparentInterceptionIpFamily;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::transparent_interception::nftables) struct InboundTproxyLifecyclePlan {
@@ -30,6 +30,12 @@ impl InboundTproxyLifecyclePlan {
         }
 
         let proxy_port = proxy_port_from_config(config)?;
+        if setup_scope.local_ports().is_any() {
+            return Err(NftablesPlanError::WildcardLocalPortsRequireProxyBypass { proxy_port });
+        }
+        if setup_scope.local_ports().contains(proxy_port) {
+            return Err(NftablesPlanError::ProxyPortInInterceptedLocalPorts { proxy_port });
+        }
         let projection = NftSelectorProjection::from_host_rule_scope(setup_scope);
         let host_resources = TransparentInterceptionNftablesPlan::reserved();
         Ok(Self {
@@ -86,7 +92,7 @@ impl InboundTproxyLifecyclePlan {
     pub(in crate::transparent_interception::nftables) fn cleanup_all_ip_commands(
         &self,
     ) -> Vec<Vec<String>> {
-        PolicyRouteFamily::all()
+        TransparentInterceptionIpFamily::all()
             .into_iter()
             .flat_map(|family| {
                 [
@@ -101,21 +107,27 @@ impl InboundTproxyLifecyclePlan {
         INBOUND_TPROXY_OWNER_LOCK
     }
 
-    fn policy_route_families(&self) -> Vec<PolicyRouteFamily> {
+    pub(in crate::transparent_interception) fn listener_families(
+        &self,
+    ) -> Vec<TransparentInterceptionIpFamily> {
+        self.policy_route_families()
+    }
+
+    fn policy_route_families(&self) -> Vec<TransparentInterceptionIpFamily> {
         let mut families = Vec::new();
         if self
             .rules
             .iter()
             .any(|rule| rule.family() == NftFamily::Ipv4)
         {
-            families.push(PolicyRouteFamily::Ipv4);
+            families.push(TransparentInterceptionIpFamily::Ipv4);
         }
         if self
             .rules
             .iter()
             .any(|rule| rule.family() == NftFamily::Ipv6)
         {
-            families.push(PolicyRouteFamily::Ipv6);
+            families.push(TransparentInterceptionIpFamily::Ipv6);
         }
         families
     }
@@ -262,6 +274,7 @@ mod tests {
             )),
             proxy: TransparentInterceptionProxyConfig {
                 listen_port: Some(15001),
+                ..TransparentInterceptionProxyConfig::default()
             },
         };
 
@@ -283,12 +296,59 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn proxy_port_cannot_be_in_intercepted_local_ports() {
+        let config = interception_config(Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![15001],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        )));
+
+        let error = InboundTproxyLifecyclePlan::from_config_and_scope(
+            &config,
+            setup_scope(config.selector.as_ref().expect("selector should be set")),
+        )
+        .expect_err("proxy port should not be intercepted by its own TPROXY plan");
+
+        assert!(matches!(
+            error,
+            NftablesPlanError::ProxyPortInInterceptedLocalPorts { proxy_port: 15001 }
+        ));
+    }
+
+    #[test]
+    fn wildcard_local_ports_require_proxy_bypass() {
+        let config = interception_config(Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        )));
+
+        let error = InboundTproxyLifecyclePlan::from_config_and_scope(
+            &config,
+            setup_scope(config.selector.as_ref().expect("selector should be set")),
+        )
+        .expect_err("wildcard local ports would intercept the proxy itself");
+
+        assert!(matches!(
+            error,
+            NftablesPlanError::WildcardLocalPortsRequireProxyBypass { proxy_port: 15001 }
+        ));
+    }
+
     fn interception_config(selector: Option<Selector>) -> EnforcementInterceptionConfig {
         EnforcementInterceptionConfig {
             strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
             selector,
             proxy: TransparentInterceptionProxyConfig {
                 listen_port: Some(15001),
+                ..TransparentInterceptionProxyConfig::default()
             },
         }
     }

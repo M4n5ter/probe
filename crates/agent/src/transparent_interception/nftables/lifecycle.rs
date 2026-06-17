@@ -3,7 +3,9 @@ use super::{
     owner_lock::{NftablesOwnerLock, NftablesOwnerLockGuard, SystemNftablesOwnerLock},
     plan::InboundTproxyLifecyclePlan,
 };
-use crate::transparent_interception::TransparentInterceptionError;
+use crate::transparent_interception::{
+    ManagedTransparentProxyGuard, TransparentInterceptionError, start_managed_proxy,
+};
 use interception::TransparentInterceptionHostRuleScope;
 use probe_config::EnforcementInterceptionConfig;
 
@@ -61,17 +63,21 @@ impl NftablesTransparentInterception {
         check_nft_script(self.nft.as_mut(), &setup_script)?;
         let owner_lock = self.owner_lock.acquire(plan.owner_name())?;
         self.cleanup_previous_owned_state_best_effort(&plan);
+        let managed_proxy = start_managed_proxy(&self.config, plan.listener_families())?;
         if let Err(error) = self.install_policy_routes(&plan) {
             self.cleanup_active_plan_best_effort(&plan);
+            let _ = stop_managed_proxy_best_effort(managed_proxy);
             return Err(error);
         }
         if let Err(error) = apply_nft_script(self.nft.as_mut(), &setup_script, "nft setup") {
             self.cleanup_active_plan_best_effort(&plan);
+            let _ = stop_managed_proxy_best_effort(managed_proxy);
             return Err(error);
         }
         Ok(NftablesTransparentInterceptionGuard {
             inner: Some(self),
             plan,
+            managed_proxy,
             owner_lock: Some(owner_lock),
         })
     }
@@ -117,6 +123,7 @@ impl NftablesTransparentInterception {
 pub(in crate::transparent_interception) struct NftablesTransparentInterceptionGuard {
     inner: Option<NftablesTransparentInterception>,
     plan: InboundTproxyLifecyclePlan,
+    managed_proxy: Option<ManagedTransparentProxyGuard>,
     owner_lock: Option<NftablesOwnerLockGuard>,
 }
 
@@ -135,19 +142,17 @@ impl NftablesTransparentInterceptionGuard {
             "nft cleanup",
         );
         let mut route_result = Ok(());
-        let Some(ip) = inner.ip.as_mut() else {
-            self.inner = None;
-            self.owner_lock = None;
-            return nft_result;
-        };
-        for command in self.plan.cleanup_ip_commands() {
-            if let Err(error) = apply_ip_command(ip.as_mut(), &command, "ip cleanup") {
-                route_result = Err(error);
+        if let Some(ip) = inner.ip.as_mut() {
+            for command in self.plan.cleanup_ip_commands() {
+                if let Err(error) = apply_ip_command(ip.as_mut(), &command, "ip cleanup") {
+                    route_result = Err(error);
+                }
             }
         }
         self.inner = None;
+        let proxy_result = stop_managed_proxy_best_effort(self.managed_proxy.take());
         self.owner_lock = None;
-        nft_result.and(route_result)
+        nft_result.and(route_result).and(proxy_result)
     }
 }
 
@@ -170,6 +175,15 @@ fn apply_nft_script(
         .apply(script)
         .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
     command_success(result, command_name)
+}
+
+fn stop_managed_proxy_best_effort(
+    proxy: Option<ManagedTransparentProxyGuard>,
+) -> Result<(), TransparentInterceptionError> {
+    match proxy {
+        Some(proxy) => proxy.stop(),
+        None => Ok(()),
+    }
 }
 
 fn check_nft_script(
@@ -467,6 +481,7 @@ mod tests {
             selector: None,
             proxy: TransparentInterceptionProxyConfig {
                 listen_port: Some(15001),
+                ..TransparentInterceptionProxyConfig::default()
             },
         }
     }
@@ -477,6 +492,7 @@ mod tests {
             selector: None,
             proxy: TransparentInterceptionProxyConfig {
                 listen_port: Some(15001),
+                ..TransparentInterceptionProxyConfig::default()
             },
         }
     }

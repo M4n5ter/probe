@@ -563,6 +563,10 @@ protective_actions = ["alert"]
             json!(null)
         );
         assert_eq!(
+            value["enforcement"]["interception"]["proxy"]["mode"],
+            json!("external")
+        );
+        assert_eq!(
             value["enforcement"]["interception"]["nftables"]["table_name"],
             json!("sssa_probe")
         );

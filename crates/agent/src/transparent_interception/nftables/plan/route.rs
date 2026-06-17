@@ -1,12 +1,7 @@
 use super::hex_mark;
+use crate::transparent_interception::TransparentInterceptionIpFamily;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PolicyRouteFamily {
-    Ipv4,
-    Ipv6,
-}
-
-impl PolicyRouteFamily {
+impl TransparentInterceptionIpFamily {
     pub(super) fn all() -> [Self; 2] {
         [Self::Ipv4, Self::Ipv6]
     }

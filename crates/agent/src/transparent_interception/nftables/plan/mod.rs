@@ -19,6 +19,14 @@ pub(super) enum NftablesPlanError {
     UnsupportedExecutableStrategy {
         strategy: TransparentInterceptionStrategyConfig,
     },
+    #[error(
+        "transparent interception proxy listen port {proxy_port} must not be part of setup-time local port interception scope"
+    )]
+    ProxyPortInInterceptedLocalPorts { proxy_port: u16 },
+    #[error(
+        "transparent interception requires an explicit local port scope for proxy listen port {proxy_port}; wildcard local port interception needs proxy self-bypass first"
+    )]
+    WildcardLocalPortsRequireProxyBypass { proxy_port: u16 },
 }
 
 fn proxy_port_from_config(

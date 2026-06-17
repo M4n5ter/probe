@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use probe_config::{
     AgentConfig, ConnectionEnforcementBackendConfig, EnforcementPolicySourceConfig,
-    TransparentInterceptionProxyConfig, TransparentInterceptionStrategyConfig,
+    TransparentInterceptionProxyConfig, TransparentInterceptionProxyModeConfig,
+    TransparentInterceptionStrategyConfig,
 };
 use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
@@ -121,12 +122,14 @@ impl EnforcementInterceptionPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransparentInterceptionProxyPlan {
+    pub mode: TransparentInterceptionProxyModeConfig,
     pub listen_port: Option<u16>,
 }
 
 impl TransparentInterceptionProxyPlan {
     fn from_config(config: &TransparentInterceptionProxyConfig) -> Self {
         Self {
+            mode: config.mode,
             listen_port: config.listen_port,
         }
     }
@@ -389,6 +392,10 @@ mod tests {
             plan.interception.local_setup_scope,
             TransparentInterceptionLocalSetupScopePlan::Unsupported { .. }
         ));
+        assert_eq!(
+            plan.interception.proxy.mode,
+            TransparentInterceptionProxyModeConfig::External
+        );
         assert_eq!(plan.interception.proxy.listen_port, Some(15001));
         assert_eq!(plan.interception.nftables.table_name, "sssa_probe");
         assert_eq!(plan.interception.nftables.mark, 0x5353_4101);

@@ -1,4 +1,4 @@
-use interception::TransparentInterceptionHostRuleScope;
+use interception::{TransparentInterceptionHostRuleScope, TransparentInterceptionPortScope};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NftSelectorProjection {
@@ -42,8 +42,8 @@ impl NftSelectorProjection {
 struct NftTrafficProjection {
     local_port_field: &'static str,
     remote_port_field: &'static str,
-    local_ports: Vec<u16>,
-    remote_ports: Vec<u16>,
+    local_ports: TransparentInterceptionPortScope,
+    remote_ports: TransparentInterceptionPortScope,
 }
 
 impl NftTrafficProjection {
@@ -51,8 +51,8 @@ impl NftTrafficProjection {
         Self {
             local_port_field: "tcp dport",
             remote_port_field: "tcp sport",
-            local_ports: scope.local_ports().to_vec(),
-            remote_ports: scope.remote_ports().to_vec(),
+            local_ports: scope.local_ports().clone(),
+            remote_ports: scope.remote_ports().clone(),
         }
     }
 
@@ -80,17 +80,11 @@ impl NftRule {
     pub(super) fn match_expression(&self) -> String {
         let mut clauses = vec!["meta l4proto tcp".to_string()];
         clauses.push(format!("meta nfproto {}", self.family.nfproto_name()));
-        if !self.traffic.local_ports.is_empty() {
-            clauses.push(port_match(
-                self.traffic.local_port_field,
-                &self.traffic.local_ports,
-            ));
+        if let Some(ports) = self.traffic.local_ports.only_values() {
+            clauses.push(port_match(self.traffic.local_port_field, ports));
         }
-        if !self.traffic.remote_ports.is_empty() {
-            clauses.push(port_match(
-                self.traffic.remote_port_field,
-                &self.traffic.remote_ports,
-            ));
+        if let Some(ports) = self.traffic.remote_ports.only_values() {
+            clauses.push(port_match(self.traffic.remote_port_field, ports));
         }
         if let Some(addresses) = &self.remote_addresses {
             clauses.push(self.remote_address_match_expression(addresses));
@@ -156,7 +150,9 @@ where
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use interception::TransparentInterceptionRemoteAddressScope;
+    use interception::{
+        TransparentInterceptionPortScope, TransparentInterceptionRemoteAddressScope,
+    };
 
     use super::*;
 
@@ -232,8 +228,8 @@ mod tests {
             }
         }
         TransparentInterceptionHostRuleScope::new(
-            vec![8443, 9443],
-            vec![443],
+            TransparentInterceptionPortScope::only(vec![8443, 9443]),
+            TransparentInterceptionPortScope::only(vec![443]),
             TransparentInterceptionRemoteAddressScope::new(ipv4, ipv6),
         )
         .expect("test scope should contain host-rule constraints")

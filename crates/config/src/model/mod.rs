@@ -16,7 +16,8 @@ pub use capture::{
 pub use enforcement::{
     ConnectionEnforcementBackendConfig, EnforcementConfig, EnforcementInterceptionConfig,
     EnforcementPolicyConfig, EnforcementPolicyManifest, EnforcementPolicySourceConfig,
-    TransparentInterceptionProxyConfig, TransparentInterceptionStrategyConfig,
+    TransparentInterceptionProxyConfig, TransparentInterceptionProxyModeConfig,
+    TransparentInterceptionStrategyConfig,
 };
 pub use export::{
     CompressionCodecName, DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK,

@@ -43,6 +43,30 @@ remote_addresses = []
 }
 
 #[test]
+fn parses_managed_transparent_interception_proxy_mode() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy"
+
+[enforcement.interception.proxy]
+mode = "managed_tcp_relay"
+listen_port = 15001
+"#,
+    )?;
+
+    assert_eq!(
+        config.enforcement.interception.proxy.mode,
+        TransparentInterceptionProxyModeConfig::ManagedTcpRelay
+    );
+    assert_eq!(
+        config.enforcement.interception.proxy.listen_port,
+        Some(15001)
+    );
+    Ok(())
+}
+
+#[test]
 fn rejects_transparent_interception_host_resource_overrides() {
     let error = AgentConfig::from_toml_str(
         r#"

@@ -5,18 +5,18 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentInterceptionHostRuleScope {
-    local_ports: Vec<u16>,
-    remote_ports: Vec<u16>,
+    local_ports: TransparentInterceptionPortScope,
+    remote_ports: TransparentInterceptionPortScope,
     remote_addresses: TransparentInterceptionRemoteAddressScope,
 }
 
 impl TransparentInterceptionHostRuleScope {
     pub fn new(
-        local_ports: Vec<u16>,
-        remote_ports: Vec<u16>,
+        local_ports: TransparentInterceptionPortScope,
+        remote_ports: TransparentInterceptionPortScope,
         remote_addresses: TransparentInterceptionRemoteAddressScope,
     ) -> Result<Self, TransparentInterceptionSetupProjectionError> {
-        if local_ports.is_empty() && remote_ports.is_empty() && remote_addresses.is_empty() {
+        if local_ports.is_any() && remote_ports.is_any() && remote_addresses.is_empty() {
             return Err(TransparentInterceptionSetupProjectionError::UnconstrainedSelector);
         }
         Ok(Self {
@@ -48,22 +48,84 @@ impl TransparentInterceptionHostRuleScope {
         }
         validate_direction_projection(&term.traffic)?;
         Self::new(
-            term.traffic.local_ports,
-            term.traffic.remote_ports,
+            TransparentInterceptionPortScope::from_values(term.traffic.local_ports),
+            TransparentInterceptionPortScope::from_values(term.traffic.remote_ports),
             parse_remote_addresses(&term.traffic.remote_addresses)?,
         )
     }
 
-    pub fn local_ports(&self) -> &[u16] {
+    pub fn local_ports(&self) -> &TransparentInterceptionPortScope {
         &self.local_ports
     }
 
-    pub fn remote_ports(&self) -> &[u16] {
+    pub fn remote_ports(&self) -> &TransparentInterceptionPortScope {
         &self.remote_ports
     }
 
     pub fn remote_addresses(&self) -> &TransparentInterceptionRemoteAddressScope {
         &self.remote_addresses
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransparentInterceptionPortScope {
+    kind: TransparentInterceptionPortScopeKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransparentInterceptionPortScopeKind {
+    Any,
+    Only(Vec<u16>),
+}
+
+impl TransparentInterceptionPortScope {
+    pub fn any() -> Self {
+        Self {
+            kind: TransparentInterceptionPortScopeKind::Any,
+        }
+    }
+
+    pub fn only(ports: Vec<u16>) -> Self {
+        assert!(
+            !ports.is_empty(),
+            "explicit transparent interception port scope cannot be empty"
+        );
+        Self {
+            kind: TransparentInterceptionPortScopeKind::Only(ports),
+        }
+    }
+
+    fn from_values(ports: Vec<u16>) -> Self {
+        if ports.is_empty() {
+            Self::any()
+        } else {
+            Self::only(ports)
+        }
+    }
+
+    pub fn is_any(&self) -> bool {
+        matches!(self.kind, TransparentInterceptionPortScopeKind::Any)
+    }
+
+    pub fn values(&self) -> &[u16] {
+        match &self.kind {
+            TransparentInterceptionPortScopeKind::Any => &[],
+            TransparentInterceptionPortScopeKind::Only(ports) => ports,
+        }
+    }
+
+    pub fn only_values(&self) -> Option<&[u16]> {
+        match &self.kind {
+            TransparentInterceptionPortScopeKind::Any => None,
+            TransparentInterceptionPortScopeKind::Only(ports) => Some(ports),
+        }
+    }
+
+    pub fn contains(&self, port: u16) -> bool {
+        match &self.kind {
+            TransparentInterceptionPortScopeKind::Any => true,
+            TransparentInterceptionPortScopeKind::Only(ports) => ports.contains(&port),
+        }
     }
 }
 
@@ -412,7 +474,7 @@ mod tests {
         ))
         .expect("selector should project");
 
-        assert_eq!(scope.local_ports(), &[8443]);
+        assert_eq!(scope.local_ports().values(), &[8443]);
         assert_eq!(
             scope.remote_addresses().ipv4(),
             &[Ipv4Addr::new(203, 0, 113, 10)]
@@ -565,8 +627,8 @@ mod tests {
     #[test]
     fn checked_constructor_rejects_empty_host_rule_scope() {
         let error = TransparentInterceptionHostRuleScope::new(
-            Vec::new(),
-            Vec::new(),
+            TransparentInterceptionPortScope::any(),
+            TransparentInterceptionPortScope::any(),
             TransparentInterceptionRemoteAddressScope::empty(),
         )
         .expect_err("empty host-rule scope would render broad host rules");

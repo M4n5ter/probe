@@ -21,5 +21,6 @@ pub use model::{
     MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS, PlaintextFeedCaptureConfig, PlaintextTlsConfig,
     PolicyConfig, StorageConfig, StorageRetentionConfig, TlsConfig, TlsMaterialConfig,
     TlsMaterialKind, TlsPlaintextDecryptHintConfig, TlsPlaintextInstrumentationConfig,
-    TransparentInterceptionProxyConfig, TransparentInterceptionStrategyConfig,
+    TransparentInterceptionProxyConfig, TransparentInterceptionProxyModeConfig,
+    TransparentInterceptionStrategyConfig,
 };

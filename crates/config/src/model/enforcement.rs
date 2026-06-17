@@ -59,7 +59,16 @@ impl TransparentInterceptionStrategyConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TransparentInterceptionProxyConfig {
+    pub mode: TransparentInterceptionProxyModeConfig,
     pub listen_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparentInterceptionProxyModeConfig {
+    #[default]
+    External,
+    ManagedTcpRelay,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

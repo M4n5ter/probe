@@ -1,11 +1,15 @@
 mod error;
+mod ip_family;
 mod nftables;
+mod proxy;
 mod runtime;
 
 use interception::{TransparentInterceptionHostRuleScope, TransparentInterceptionSetupSelectors};
 use probe_config::{EnforcementInterceptionConfig, TransparentInterceptionStrategyConfig};
 
 pub(crate) use error::TransparentInterceptionError;
+pub(crate) use ip_family::TransparentInterceptionIpFamily;
+pub(crate) use proxy::{ManagedTransparentProxyGuard, start_managed_proxy};
 pub(crate) use runtime::{TransparentInterceptionGuard, TransparentInterceptionRuntime};
 
 const OUTBOUND_MITM_UNAVAILABLE: &str = "outbound transparent MITM requires proxy self-bypass and MITM lifecycle before rules can be installed";
@@ -66,6 +70,7 @@ mod tests {
             selector: None,
             proxy: TransparentInterceptionProxyConfig {
                 listen_port: Some(15001),
+                ..TransparentInterceptionProxyConfig::default()
             },
         };
         let manifest_selector = Selector::term(
