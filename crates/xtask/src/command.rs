@@ -62,6 +62,10 @@ const COMMANDS: &[XtaskCommand] = &[
         run: e2e::run_plaintext_feed,
     },
     XtaskCommand {
+        name: "e2e-remote-enforcement-policy",
+        run: e2e::run_remote_enforcement_policy,
+    },
+    XtaskCommand {
         name: "e2e-tls-plaintext-dynamic-loopback",
         run: e2e::run_tls_plaintext_dynamic_loopback,
     },

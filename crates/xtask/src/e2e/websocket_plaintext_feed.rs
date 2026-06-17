@@ -10,8 +10,7 @@ use super::harness::{
     decode_capture_event, decode_envelope, e2e_error, run_agent_with_max_events, run_with_temp_root,
 };
 use super::plaintext_scenario::{
-    PlaintextFeedRecord, PlaintextFeedScenario, PlaintextFlow, PlaintextHttpRequest,
-    PlaintextPolicy, PlaintextProcess, PlaintextScenarioIds,
+    PlaintextFeedCase, PlaintextFeedRecord, PlaintextFlow, PlaintextProcess,
 };
 
 const WEBSOCKET_FEED_EVENT_COUNT: usize = 5;
@@ -59,7 +58,8 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let scenario = scenario();
     write_feed(&scenario, &feed_path)?;
     write_policy_bundle(&policy_path)?;
-    let mut config = scenario.agent_config(feed_path, policy_path, spool_path.clone());
+    let mut config =
+        scenario.agent_config_with_policy(feed_path, policy_path, spool_path.clone(), POLICY_ID);
     config.export.worker.enabled = false;
     fs::write(&config_path, toml::to_string(&config)?)?;
     run_agent_with_max_events(&config_path, WEBSOCKET_FEED_EVENT_COUNT)?;
@@ -68,36 +68,27 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn scenario() -> PlaintextFeedScenario {
-    PlaintextFeedScenario::new(
-        PlaintextScenarioIds::new(
-            AGENT_ID,
-            CONFIG_VERSION,
-            POLICY_ID,
-            POLICY_VERSION,
-            CONNECTION_ID,
+fn scenario() -> PlaintextFeedCase {
+    PlaintextFeedCase::new(
+        AGENT_ID,
+        CONFIG_VERSION,
+        CONNECTION_ID,
+        PlaintextFlow::new(
+            52_100,
+            8_080,
+            2003,
+            PlaintextProcess::new(
+                422,
+                755,
+                "sssa-e2e-websocket",
+                "/usr/bin/sssa-e2e-websocket",
+                "websocket-hash",
+            ),
         ),
-        PlaintextHttpRequest::get(REQUEST_TARGET, "websocket.e2e.test"),
-        PlaintextPolicy::alerting("websocket policy observed "),
     )
-    .with_flow(PlaintextFlow::new(
-        52_100,
-        8_080,
-        2003,
-        PlaintextProcess::new(
-            422,
-            755,
-            "sssa-e2e-websocket",
-            "/usr/bin/sssa-e2e-websocket",
-            "websocket-hash",
-        ),
-    ))
 }
 
-fn write_feed(
-    scenario: &PlaintextFeedScenario,
-    path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn write_feed(scenario: &PlaintextFeedCase, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let request = websocket_upgrade_request();
     let response = websocket_upgrade_response();
     let frame = websocket_text_frame(FRAME_PAYLOAD);
@@ -171,7 +162,7 @@ end
 
 fn assert_spool_outputs(
     spool_path: &Path,
-    scenario: &PlaintextFeedScenario,
+    scenario: &PlaintextFeedCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let spool = FjallSpool::open(spool_path)?;
     let ingress = spool.read_ingress_batch_after(0, 16)?;
@@ -207,7 +198,7 @@ fn assert_spool_outputs(
 }
 fn assert_ingress_events(
     events: &[StoredEvent],
-    scenario: &PlaintextFeedScenario,
+    scenario: &PlaintextFeedCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let capture_events = events
         .iter()
@@ -269,7 +260,7 @@ fn assert_ingress_events(
 
 fn assert_bytes_event(
     event: &CaptureEvent,
-    scenario: &PlaintextFeedScenario,
+    scenario: &PlaintextFeedCase,
     direction: Direction,
     stream_offset: u64,
     expected: &[u8],
@@ -295,7 +286,7 @@ fn assert_bytes_event(
 
 fn assert_websocket_exports(
     envelopes: &[EventEnvelope],
-    scenario: &PlaintextFeedScenario,
+    scenario: &PlaintextFeedCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let request_index =
         single_event_position(envelopes, scenario, "HTTP upgrade request", |kind| {
@@ -362,7 +353,7 @@ fn assert_websocket_exports(
 
 fn single_event_position(
     envelopes: &[EventEnvelope],
-    scenario: &PlaintextFeedScenario,
+    scenario: &PlaintextFeedCase,
     label: &str,
     matches_kind: impl Fn(&EventKind) -> bool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
@@ -392,10 +383,10 @@ fn has_header(headers: &[(String, String)], name: &str, value: &str) -> bool {
 
 fn assert_policy_alert(
     envelopes: &[EventEnvelope],
-    scenario: &PlaintextFeedScenario,
+    scenario: &PlaintextFeedCase,
     message: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let expected_policy_version = scenario.expected_policy_version();
+    let expected_policy_version = expected_policy_version();
     let matching_alerts = envelopes
         .iter()
         .filter(|envelope| {
@@ -425,7 +416,7 @@ fn assert_policy_alert(
 
 fn assert_lifecycle_exports(
     envelopes: &[EventEnvelope],
-    scenario: &PlaintextFeedScenario,
+    scenario: &PlaintextFeedCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let opened = envelopes
         .iter()
@@ -470,10 +461,10 @@ fn assert_no_protocol_errors_after_handoff(
     Ok(())
 }
 
-fn is_expected_feed_flow(envelope: &EventEnvelope, scenario: &PlaintextFeedScenario) -> bool {
-    envelope.origin().source() == CaptureSource::ExternalPlaintextFeed
-        && envelope.origin().provider() == CaptureProviderKind::Plaintext
-        && envelope
-            .flow()
-            .is_some_and(|flow| flow.id.0 == scenario.expected_flow_id())
+fn expected_policy_version() -> String {
+    format!("{POLICY_ID}@{POLICY_VERSION}")
+}
+
+fn is_expected_feed_flow(envelope: &EventEnvelope, scenario: &PlaintextFeedCase) -> bool {
+    scenario.matches_export_flow(envelope)
 }
