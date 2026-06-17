@@ -7,10 +7,13 @@ use crate::event::{
 pub const EBPF_TLS_CALLS_MAP_NAME: &str = "SSSA_TLS_CALLS";
 pub const EBPF_TLS_FDS_MAP_NAME: &str = "SSSA_TLS_FDS";
 pub const EBPF_TLS_OFFSETS_MAP_NAME: &str = "SSSA_TLS_OFFSETS";
+pub const EBPF_TLS_STATE_EPOCHS_MAP_NAME: &str = "SSSA_TLS_STATE_EPOCHS";
+pub const EBPF_TLS_STATE_EPOCH_KEY: u32 = 0;
 pub const EBPF_TLS_EVENT_SCRATCH_MAP_NAME: &str = "SSSA_TLS_EVENT_SCRATCH";
 pub const EBPF_TLS_CALLS_MAX_ENTRIES: u32 = 16_384;
 pub const EBPF_TLS_FDS_MAX_ENTRIES: u32 = 65_536;
 pub const EBPF_TLS_OFFSETS_MAX_ENTRIES: u32 = 131_072;
+pub const EBPF_TLS_STATE_EPOCHS_MAX_ENTRIES: u32 = 1;
 pub const EBPF_TLS_EVENT_SCRATCH_MAX_ENTRIES: u32 = 1;
 pub const EBPF_TLS_SSL_SET_FD_PROGRAM_NAME: &str = "sssa_ssl_set_fd";
 pub const EBPF_TLS_SSL_SET_FD_EXIT_PROGRAM_NAME: &str = "sssa_ssl_set_fd_exit";
@@ -218,6 +221,7 @@ impl EbpfTlsCallKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EbpfTlsCallState {
     pub ssl_pointer: u64,
+    pub state_epoch: u64,
     pub buffer_pointer: u64,
     pub length_pointer: u64,
     pub requested_len: u32,
@@ -264,6 +268,7 @@ impl EbpfTlsCallState {
     pub const fn fd_association(ssl_pointer: u64, fd: i32) -> Self {
         Self {
             ssl_pointer,
+            state_epoch: 0,
             buffer_pointer: 0,
             length_pointer: 0,
             requested_len: 0,
@@ -277,6 +282,7 @@ impl EbpfTlsCallState {
     pub const fn clear(ssl_pointer: u64) -> Self {
         Self {
             ssl_pointer,
+            state_epoch: 0,
             buffer_pointer: 0,
             length_pointer: 0,
             requested_len: 0,
@@ -297,6 +303,7 @@ impl EbpfTlsCallState {
     ) -> Self {
         Self {
             ssl_pointer,
+            state_epoch: 0,
             buffer_pointer,
             length_pointer,
             requested_len,
@@ -313,14 +320,16 @@ impl EbpfTlsCallState {
 pub struct EbpfTlsFdKey {
     pub tgid: u32,
     pub reserved0: u32,
+    pub state_epoch: u64,
     pub ssl_pointer: u64,
 }
 
 impl EbpfTlsFdKey {
-    pub const fn new(tgid: u32, ssl_pointer: u64) -> Self {
+    pub const fn new(tgid: u32, state_epoch: u64, ssl_pointer: u64) -> Self {
         Self {
             tgid,
             reserved0: 0,
+            state_epoch,
             ssl_pointer,
         }
     }
@@ -332,21 +341,23 @@ pub struct EbpfTlsOffsetKey {
     pub tgid: u32,
     pub direction: u8,
     pub reserved0: [u8; 3],
+    pub state_epoch: u64,
     pub ssl_pointer: u64,
 }
 
 impl EbpfTlsOffsetKey {
-    pub const fn new(tgid: u32, direction: u8, ssl_pointer: u64) -> Self {
+    pub const fn new(tgid: u32, direction: u8, state_epoch: u64, ssl_pointer: u64) -> Self {
         Self {
             tgid,
             direction,
             reserved0: [0; 3],
+            state_epoch,
             ssl_pointer,
         }
     }
 }
 
-pub const EBPF_TLS_MAP_SPECS: [EbpfMapSpec; 5] = [
+pub const EBPF_TLS_MAP_SPECS: [EbpfMapSpec; 6] = [
     EbpfMapSpec {
         name: EBPF_EVENTS_MAP_NAME,
         kind: EbpfMapKind::Ringbuf,
@@ -380,6 +391,14 @@ pub const EBPF_TLS_MAP_SPECS: [EbpfMapSpec; 5] = [
         map_flags: 0,
     },
     EbpfMapSpec {
+        name: EBPF_TLS_STATE_EPOCHS_MAP_NAME,
+        kind: EbpfMapKind::Hash,
+        key_size: size_of_u32::<u32>(),
+        value_size: size_of_u32::<u64>(),
+        max_entries: EBPF_TLS_STATE_EPOCHS_MAX_ENTRIES,
+        map_flags: 0,
+    },
+    EbpfMapSpec {
         name: EBPF_TLS_EVENT_SCRATCH_MAP_NAME,
         kind: EbpfMapKind::PerCpuArray,
         key_size: size_of_u32::<u32>(),
@@ -395,7 +414,7 @@ const fn size_of_u32<T>() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use core::mem::{align_of, size_of};
+    use core::mem::{align_of, offset_of, size_of};
     use std::collections::BTreeSet;
 
     use super::*;
@@ -440,13 +459,22 @@ mod tests {
             assert_eq!(spec.map_flags, 0);
         }
 
-        assert_eq!(EBPF_TLS_MAP_SPECS.len(), 5);
+        assert_eq!(EBPF_TLS_MAP_SPECS.len(), 6);
+        assert_eq!(EBPF_TLS_STATE_EPOCH_KEY, 0);
         assert!(EBPF_TLS_MAP_SPECS.contains(&EbpfMapSpec {
             name: EBPF_TLS_CALLS_MAP_NAME,
             kind: EbpfMapKind::Hash,
             key_size: size_of_u32::<EbpfTlsCallKey>(),
             value_size: size_of_u32::<EbpfTlsCallState>(),
             max_entries: EBPF_TLS_CALLS_MAX_ENTRIES,
+            map_flags: 0,
+        }));
+        assert!(EBPF_TLS_MAP_SPECS.contains(&EbpfMapSpec {
+            name: EBPF_TLS_STATE_EPOCHS_MAP_NAME,
+            kind: EbpfMapKind::Hash,
+            key_size: size_of_u32::<u32>(),
+            value_size: size_of_u32::<u64>(),
+            max_entries: EBPF_TLS_STATE_EPOCHS_MAX_ENTRIES,
             map_flags: 0,
         }));
         assert!(EBPF_TLS_MAP_SPECS.contains(&EbpfMapSpec {
@@ -463,13 +491,31 @@ mod tests {
     fn tls_state_map_contract_layout_is_stable() {
         assert_eq!(size_of::<EbpfTlsCallKey>(), 8);
         assert_eq!(align_of::<EbpfTlsCallKey>(), 8);
-        assert_eq!(size_of::<EbpfTlsCallState>(), 40);
+        assert_eq!(size_of::<EbpfTlsCallState>(), 48);
         assert_eq!(align_of::<EbpfTlsCallState>(), 8);
-        assert_eq!(size_of::<EbpfTlsFdKey>(), 16);
+        assert_eq!(offset_of!(EbpfTlsCallState, ssl_pointer), 0);
+        assert_eq!(offset_of!(EbpfTlsCallState, state_epoch), 8);
+        assert_eq!(offset_of!(EbpfTlsCallState, buffer_pointer), 16);
+        assert_eq!(offset_of!(EbpfTlsCallState, length_pointer), 24);
+        assert_eq!(offset_of!(EbpfTlsCallState, requested_len), 32);
+        assert_eq!(offset_of!(EbpfTlsCallState, fd), 36);
+        assert_eq!(offset_of!(EbpfTlsCallState, direction), 40);
+        assert_eq!(offset_of!(EbpfTlsCallState, call_kind), 41);
+        assert_eq!(offset_of!(EbpfTlsCallState, reserved0), 42);
+        assert_eq!(size_of::<EbpfTlsFdKey>(), 24);
         assert_eq!(align_of::<EbpfTlsFdKey>(), 8);
+        assert_eq!(offset_of!(EbpfTlsFdKey, tgid), 0);
+        assert_eq!(offset_of!(EbpfTlsFdKey, reserved0), 4);
+        assert_eq!(offset_of!(EbpfTlsFdKey, state_epoch), 8);
+        assert_eq!(offset_of!(EbpfTlsFdKey, ssl_pointer), 16);
         assert_eq!(size_of::<i32>(), 4);
-        assert_eq!(size_of::<EbpfTlsOffsetKey>(), 16);
+        assert_eq!(size_of::<EbpfTlsOffsetKey>(), 24);
         assert_eq!(align_of::<EbpfTlsOffsetKey>(), 8);
+        assert_eq!(offset_of!(EbpfTlsOffsetKey, tgid), 0);
+        assert_eq!(offset_of!(EbpfTlsOffsetKey, direction), 4);
+        assert_eq!(offset_of!(EbpfTlsOffsetKey, reserved0), 5);
+        assert_eq!(offset_of!(EbpfTlsOffsetKey, state_epoch), 8);
+        assert_eq!(offset_of!(EbpfTlsOffsetKey, ssl_pointer), 16);
         assert_eq!(size_of::<u64>(), 8);
     }
 }

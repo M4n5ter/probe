@@ -84,7 +84,8 @@ mod tests {
 
     use ebpf_abi::{
         EBPF_PROCESS_MAP_SPECS, EBPF_PROCESS_TRACEPOINT_SPECS, EBPF_TLS_EVENT_SCRATCH_MAP_NAME,
-        EBPF_TLS_SSL_CLEAR_EXIT_PROGRAM_NAME, EBPF_TLS_SSL_SET_FD_PROGRAM_NAME,
+        EBPF_TLS_MAP_SPECS, EBPF_TLS_SSL_CLEAR_EXIT_PROGRAM_NAME, EBPF_TLS_SSL_SET_FD_PROGRAM_NAME,
+        EBPF_TLS_STATE_EPOCHS_MAP_NAME,
     };
     use tempfile::tempdir;
 
@@ -201,8 +202,23 @@ mod tests {
 
         assert!(report.object_available(), "{}", report.summary());
         assert!(report.preflight_available(), "{}", report.summary());
-        assert_eq!(report.maps.len(), 5);
+        assert_eq!(report.maps.len(), EBPF_TLS_MAP_SPECS.len());
         assert_eq!(report.programs.len(), 13);
+        let expected_epoch_map = EBPF_TLS_MAP_SPECS
+            .iter()
+            .find(|spec| spec.name == EBPF_TLS_STATE_EPOCHS_MAP_NAME)
+            .expect("TLS map specs should include state epochs");
+        assert!(
+            report.maps.iter().any(|map| {
+                map.name == EBPF_TLS_STATE_EPOCHS_MAP_NAME
+                    && map.kind == EbpfObjectMapKind::Hash
+                    && map.key_size == expected_epoch_map.key_size
+                    && map.value_size == expected_epoch_map.value_size
+                    && map.max_entries == expected_epoch_map.max_entries
+            }),
+            "{:?}",
+            report.maps
+        );
         assert!(
             report.maps.iter().any(|map| {
                 map.name == EBPF_TLS_EVENT_SCRATCH_MAP_NAME

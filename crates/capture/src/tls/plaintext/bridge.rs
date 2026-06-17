@@ -7,7 +7,8 @@ use crate::{CaptureError, PlaintextChunk, PlaintextEvent, PlaintextGap, Plaintex
 
 use super::record::LibsslUprobePlaintextSample;
 
-const LIBSSL_UPROBE_FLOW_ATTRIBUTION_REASON: &str = "libssl uprobe fd-to-flow attribution is best-effort until SSL fd lifecycle cleanup is generation-bound";
+const LIBSSL_UPROBE_FLOW_ATTRIBUTION_REASON: &str =
+    "libssl uprobe fd-to-flow attribution is best-effort without strong socket ownership proof";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibsslUprobeFlowLookup {

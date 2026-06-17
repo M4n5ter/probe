@@ -13,9 +13,9 @@ use ebpf_abi::{
     EBPF_TLS_CALL_KIND_SIZE_POINTER, EBPF_TLS_CALLS_MAX_ENTRIES,
     EBPF_TLS_EVENT_SCRATCH_MAX_ENTRIES, EBPF_TLS_FDS_MAX_ENTRIES, EBPF_TLS_OFFSETS_MAX_ENTRIES,
     EBPF_TLS_PLAINTEXT_FD_VALID, EBPF_TLS_PLAINTEXT_READ_FAILED, EBPF_TLS_PLAINTEXT_SAMPLE_BYTES,
-    EBPF_TLS_PLAINTEXT_TRUNCATED, EbpfTlsCallKey, EbpfTlsCallState, EbpfTlsDirection, EbpfTlsFdKey,
-    EbpfTlsOffsetKey, EbpfTlsPlaintextEvent, EbpfTlsPlaintextEventMetadata,
-    EbpfTlsPlaintextMetadata,
+    EBPF_TLS_PLAINTEXT_TRUNCATED, EBPF_TLS_STATE_EPOCH_KEY, EBPF_TLS_STATE_EPOCHS_MAX_ENTRIES,
+    EbpfTlsCallKey, EbpfTlsCallState, EbpfTlsDirection, EbpfTlsFdKey, EbpfTlsOffsetKey,
+    EbpfTlsPlaintextEvent, EbpfTlsPlaintextEventMetadata, EbpfTlsPlaintextMetadata,
 };
 
 #[map(name = "SSSA_TLS_CALLS")]
@@ -29,6 +29,10 @@ static SSSA_TLS_FDS: LruHashMap<EbpfTlsFdKey, i32> =
 #[map(name = "SSSA_TLS_OFFSETS")]
 static SSSA_TLS_OFFSETS: LruHashMap<EbpfTlsOffsetKey, u64> =
     LruHashMap::with_max_entries(EBPF_TLS_OFFSETS_MAX_ENTRIES, 0);
+
+#[map(name = "SSSA_TLS_STATE_EPOCHS")]
+static SSSA_TLS_STATE_EPOCHS: HashMap<u32, u64> =
+    HashMap::with_max_entries(EBPF_TLS_STATE_EPOCHS_MAX_ENTRIES, 0);
 
 #[map(name = "SSSA_TLS_EVENT_SCRATCH")]
 static SSSA_TLS_EVENT_SCRATCH: PerCpuArray<EbpfTlsPlaintextEvent> =
@@ -135,7 +139,11 @@ fn ssl_set_fd_exit(ctx: RetProbeContext) {
     if success != 1 || state.fd < 0 {
         return;
     }
-    associate_fd(current_tgid(), state.ssl_pointer, state.fd);
+    let tgid = current_tgid();
+    if !state_epoch_is_current(state.state_epoch) {
+        return;
+    }
+    associate_fd(tgid, state.state_epoch, state.ssl_pointer, state.fd);
 }
 
 fn ssl_clear_enter(ctx: ProbeContext) {
@@ -153,7 +161,11 @@ fn ssl_clear_exit(ctx: RetProbeContext) {
         return;
     };
     if success == 1 {
-        reset_offsets(current_tgid(), state.ssl_pointer);
+        let tgid = current_tgid();
+        if !state_epoch_is_current(state.state_epoch) {
+            return;
+        }
+        reset_offsets(tgid, state.state_epoch, state.ssl_pointer);
     }
 }
 
@@ -161,7 +173,11 @@ fn ssl_free(ctx: ProbeContext) {
     let Some(ssl_pointer) = non_null_arg(&ctx, 0) else {
         return;
     };
-    cleanup_tls_state(current_tgid(), ssl_pointer);
+    let tgid = current_tgid();
+    let Some(state_epoch) = current_state_epoch() else {
+        return;
+    };
+    cleanup_tls_state(tgid, state_epoch, ssl_pointer);
 }
 
 fn ssl_read_enter(ctx: ProbeContext) {
@@ -246,6 +262,9 @@ fn complete_len_return_call(ctx: RetProbeContext) {
     if returned_len <= 0 {
         return;
     }
+    if !state_epoch_is_current(state.state_epoch) {
+        return;
+    }
     emit_plaintext_event(&ctx, state, state.bounded_len(returned_len as u32));
 }
 
@@ -257,6 +276,9 @@ fn complete_size_pointer_call(ctx: RetProbeContext) {
         return;
     };
     if success != 1 {
+        return;
+    }
+    if !state_epoch_is_current(state.state_epoch) {
         return;
     }
     let Some(returned_len) = read_size_pointer(state.length_pointer) else {
@@ -274,17 +296,20 @@ fn complete_size_pointer_call(ctx: RetProbeContext) {
 #[derive(Clone, Copy)]
 struct FdAssociationCall {
     ssl_pointer: u64,
+    state_epoch: u64,
     fd: i32,
 }
 
 #[derive(Clone, Copy)]
 struct ClearCall {
     ssl_pointer: u64,
+    state_epoch: u64,
 }
 
 #[derive(Clone, Copy)]
 struct PlaintextCall {
     ssl_pointer: u64,
+    state_epoch: u64,
     buffer_pointer: u64,
     length_pointer: u64,
     requested_len: u32,
@@ -295,6 +320,7 @@ impl FdAssociationCall {
     fn from_state(state: EbpfTlsCallState) -> Option<Self> {
         (state.call_kind == EBPF_TLS_CALL_KIND_SET_FD).then_some(Self {
             ssl_pointer: state.ssl_pointer,
+            state_epoch: state.state_epoch,
             fd: state.fd,
         })
     }
@@ -304,6 +330,7 @@ impl ClearCall {
     fn from_state(state: EbpfTlsCallState) -> Option<Self> {
         (state.call_kind == EBPF_TLS_CALL_KIND_CLEAR).then_some(Self {
             ssl_pointer: state.ssl_pointer,
+            state_epoch: state.state_epoch,
         })
     }
 }
@@ -315,6 +342,7 @@ impl PlaintextCall {
         }
         Some(Self {
             ssl_pointer: state.ssl_pointer,
+            state_epoch: state.state_epoch,
             buffer_pointer: state.buffer_pointer,
             length_pointer: state.length_pointer,
             requested_len: state.requested_len,
@@ -327,8 +355,13 @@ impl PlaintextCall {
     }
 }
 
-fn store_call(state: EbpfTlsCallState) {
-    let key = EbpfTlsCallKey::new(bpf_get_current_pid_tgid());
+fn store_call(mut state: EbpfTlsCallState) {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let Some(state_epoch) = current_state_epoch() else {
+        return;
+    };
+    state.state_epoch = state_epoch;
+    let key = EbpfTlsCallKey::new(pid_tgid);
     let _ = SSSA_TLS_CALLS.insert(&key, &state, 0);
 }
 
@@ -385,9 +418,18 @@ fn emit_event(
     let pid_tgid = bpf_get_current_pid_tgid();
     let uid_gid = bpf_get_current_uid_gid();
     let tgid = (pid_tgid >> 32) as u32;
-    let (fd, fd_flags) = fd_for(tgid, state.ssl_pointer);
+    if !state_epoch_is_current(state.state_epoch) {
+        return;
+    }
+    let (fd, fd_flags) = fd_for(tgid, state.state_epoch, state.ssl_pointer);
     flags |= fd_flags;
-    let stream_offset = next_stream_offset(tgid, state.ssl_pointer, state.direction, original_len);
+    let stream_offset = next_stream_offset(
+        tgid,
+        state.state_epoch,
+        state.ssl_pointer,
+        state.direction,
+        original_len,
+    );
     let direction = state.direction.wire_value();
     event.overwrite_libssl_plaintext_sampled_metadata(EbpfTlsPlaintextEventMetadata {
         pid: pid_tgid as u32,
@@ -439,8 +481,8 @@ fn scratch_event() -> Option<&'static mut EbpfTlsPlaintextEvent> {
     Some(unsafe { &mut *ptr })
 }
 
-fn fd_for(tgid: u32, ssl_pointer: u64) -> (i32, u16) {
-    let key = EbpfTlsFdKey::new(tgid, ssl_pointer);
+fn fd_for(tgid: u32, state_epoch: u64, ssl_pointer: u64) -> (i32, u16) {
+    let key = EbpfTlsFdKey::new(tgid, state_epoch, ssl_pointer);
     match unsafe { SSSA_TLS_FDS.get(&key) } {
         Some(fd) => (*fd, EBPF_TLS_PLAINTEXT_FD_VALID),
         None => (-1, 0),
@@ -449,37 +491,51 @@ fn fd_for(tgid: u32, ssl_pointer: u64) -> (i32, u16) {
 
 fn next_stream_offset(
     tgid: u32,
+    state_epoch: u64,
     ssl_pointer: u64,
     direction: EbpfTlsDirection,
     original_len: u32,
 ) -> u64 {
-    let key = EbpfTlsOffsetKey::new(tgid, direction.wire_value(), ssl_pointer);
+    let key = EbpfTlsOffsetKey::new(tgid, direction.wire_value(), state_epoch, ssl_pointer);
     let current = unsafe { SSSA_TLS_OFFSETS.get(&key).copied().unwrap_or(0) };
     let next = current.saturating_add(u64::from(original_len));
     let _ = SSSA_TLS_OFFSETS.insert(&key, &next, 0);
     current
 }
 
-fn associate_fd(tgid: u32, ssl_pointer: u64, fd: i32) {
-    reset_offsets(tgid, ssl_pointer);
-    let key = EbpfTlsFdKey::new(tgid, ssl_pointer);
+fn associate_fd(tgid: u32, state_epoch: u64, ssl_pointer: u64, fd: i32) {
+    reset_offsets(tgid, state_epoch, ssl_pointer);
+    let key = EbpfTlsFdKey::new(tgid, state_epoch, ssl_pointer);
     let _ = SSSA_TLS_FDS.insert(&key, &fd, 0);
 }
 
-fn cleanup_tls_state(tgid: u32, ssl_pointer: u64) {
-    reset_offsets(tgid, ssl_pointer);
-    let key = EbpfTlsFdKey::new(tgid, ssl_pointer);
+fn cleanup_tls_state(tgid: u32, state_epoch: u64, ssl_pointer: u64) {
+    reset_offsets(tgid, state_epoch, ssl_pointer);
+    let key = EbpfTlsFdKey::new(tgid, state_epoch, ssl_pointer);
     let _ = SSSA_TLS_FDS.remove(&key);
 }
 
-fn reset_offsets(tgid: u32, ssl_pointer: u64) {
-    remove_offset(tgid, ssl_pointer, EbpfTlsDirection::Inbound);
-    remove_offset(tgid, ssl_pointer, EbpfTlsDirection::Outbound);
+fn reset_offsets(tgid: u32, state_epoch: u64, ssl_pointer: u64) {
+    remove_offset(tgid, state_epoch, ssl_pointer, EbpfTlsDirection::Inbound);
+    remove_offset(tgid, state_epoch, ssl_pointer, EbpfTlsDirection::Outbound);
 }
 
-fn remove_offset(tgid: u32, ssl_pointer: u64, direction: EbpfTlsDirection) {
-    let key = EbpfTlsOffsetKey::new(tgid, direction.wire_value(), ssl_pointer);
+fn remove_offset(tgid: u32, state_epoch: u64, ssl_pointer: u64, direction: EbpfTlsDirection) {
+    let key = EbpfTlsOffsetKey::new(tgid, direction.wire_value(), state_epoch, ssl_pointer);
     let _ = SSSA_TLS_OFFSETS.remove(&key);
+}
+
+fn current_state_epoch() -> Option<u64> {
+    let key = EBPF_TLS_STATE_EPOCH_KEY;
+    let epoch = unsafe { SSSA_TLS_STATE_EPOCHS.get(&key).copied()? };
+    (epoch != 0).then_some(epoch)
+}
+
+fn state_epoch_is_current(state_epoch: u64) -> bool {
+    match current_state_epoch() {
+        Some(current_epoch) => current_epoch == state_epoch,
+        None => false,
+    }
 }
 
 fn read_size_pointer(length_pointer: u64) -> Option<usize> {
