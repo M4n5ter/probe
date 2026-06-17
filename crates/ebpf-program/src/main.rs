@@ -3,6 +3,7 @@
 
 mod close;
 mod connect;
+mod payload;
 mod read;
 mod write;
 
@@ -137,6 +138,18 @@ pub fn sssa_sys_exit_write(ctx: TracePointContext) -> u32 {
     0
 }
 
+#[tracepoint(name = "sys_enter_sendto", category = "syscalls")]
+pub fn sssa_sys_enter_sendto(ctx: TracePointContext) -> u32 {
+    record_write_attempt(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_exit_sendto", category = "syscalls")]
+pub fn sssa_sys_exit_sendto(ctx: TracePointContext) -> u32 {
+    emit_write_sample(ctx);
+    0
+}
+
 #[tracepoint(name = "sys_enter_read", category = "syscalls")]
 pub fn sssa_sys_enter_read(ctx: TracePointContext) -> u32 {
     record_read_attempt(ctx);
@@ -145,6 +158,18 @@ pub fn sssa_sys_enter_read(ctx: TracePointContext) -> u32 {
 
 #[tracepoint(name = "sys_exit_read", category = "syscalls")]
 pub fn sssa_sys_exit_read(ctx: TracePointContext) -> u32 {
+    emit_read_sample(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_enter_recvfrom", category = "syscalls")]
+pub fn sssa_sys_enter_recvfrom(ctx: TracePointContext) -> u32 {
+    record_read_attempt(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_exit_recvfrom", category = "syscalls")]
+pub fn sssa_sys_exit_recvfrom(ctx: TracePointContext) -> u32 {
     emit_read_sample(ctx);
     0
 }

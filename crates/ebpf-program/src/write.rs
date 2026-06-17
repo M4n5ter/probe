@@ -1,52 +1,34 @@
-use aya_ebpf::{helpers::bpf_probe_read_user_buf, programs::TracePointContext};
+use aya_ebpf::programs::TracePointContext;
 use ebpf_abi::{
     EBPF_SOCKET_WRITE_READ_FAILED, EBPF_SOCKET_WRITE_SAMPLE_BYTES, EBPF_SOCKET_WRITE_TRUNCATED,
     EbpfPendingSocketWriteSample, EbpfSocketWriteMetadata,
 };
 
-const WRITE_FD_OFFSET: usize = 16;
-const WRITE_USER_BUFFER_OFFSET: usize = 24;
-const WRITE_COUNT_OFFSET: usize = 32;
-const WRITE_EXIT_RETURN_OFFSET: usize = 16;
+use super::payload::{
+    SingleBufferPayloadAttempt, clamp_u64_to_u32, read_user_payload_prefix,
+    single_buffer_payload_attempt_from_tracepoint, syscall_result_from_tracepoint,
+};
 
-pub(crate) struct WriteAttempt {
-    pub fd: i32,
-    user_buffer: u64,
-    requested_len: u64,
-}
-
-pub(crate) fn write_attempt_from_tracepoint(ctx: &TracePointContext) -> Option<WriteAttempt> {
-    let fd = tracepoint_u64(ctx, WRITE_FD_OFFSET)? as i32;
-    if fd < 0 {
-        return None;
-    }
-    let user_buffer = tracepoint_u64(ctx, WRITE_USER_BUFFER_OFFSET)?;
-    if user_buffer == 0 {
-        return None;
-    }
-    let requested_len = tracepoint_u64(ctx, WRITE_COUNT_OFFSET)?;
-    if requested_len == 0 {
-        return None;
-    }
-    Some(WriteAttempt {
-        fd,
-        user_buffer,
-        requested_len,
-    })
+pub(crate) fn write_attempt_from_tracepoint(
+    ctx: &TracePointContext,
+) -> Option<SingleBufferPayloadAttempt> {
+    single_buffer_payload_attempt_from_tracepoint(ctx)
 }
 
 pub(crate) fn capture_write_sample_from_attempt(
-    attempt: WriteAttempt,
+    attempt: SingleBufferPayloadAttempt,
     pending: &mut EbpfPendingSocketWriteSample,
 ) {
     let original_len = clamp_u64_to_u32(attempt.requested_len);
     let mut flags = 0;
     reset_pending_write_sample(pending, attempt.fd, original_len, 0, flags);
-    pending.captured_len = read_write_sample(
+    pending.captured_len = read_user_payload_prefix(
         attempt.user_buffer,
         original_len,
         &mut pending.buffer,
         &mut flags,
+        EBPF_SOCKET_WRITE_TRUNCATED,
+        EBPF_SOCKET_WRITE_READ_FAILED,
     );
     pending.flags = flags;
 }
@@ -55,7 +37,7 @@ pub(crate) fn trim_write_sample_to_result(
     ctx: &TracePointContext,
     pending: &mut EbpfPendingSocketWriteSample,
 ) -> Option<()> {
-    let returned_len = tracepoint_i64(ctx, WRITE_EXIT_RETURN_OFFSET)?;
+    let returned_len = syscall_result_from_tracepoint(ctx)?;
     trim_write_sample_to_returned_len(pending, returned_len)
 }
 
@@ -90,41 +72,6 @@ fn trim_write_sample_to_returned_len(
     }
     pending.flags = flags;
     Some(())
-}
-
-fn read_write_sample(
-    user_buffer: u64,
-    original_len: u32,
-    buffer: &mut [u8],
-    flags: &mut u16,
-) -> u16 {
-    if original_len > EBPF_SOCKET_WRITE_SAMPLE_BYTES as u32 {
-        *flags |= EBPF_SOCKET_WRITE_TRUNCATED;
-    }
-    let captured_len = core::cmp::min(original_len, EBPF_SOCKET_WRITE_SAMPLE_BYTES as u32) as u16;
-    let Some(sample) = buffer.get_mut(..usize::from(captured_len)) else {
-        *flags |= EBPF_SOCKET_WRITE_READ_FAILED;
-        return 0;
-    };
-    if unsafe { bpf_probe_read_user_buf(user_buffer as *const u8, sample) }.is_err() {
-        *flags |= EBPF_SOCKET_WRITE_READ_FAILED;
-        return 0;
-    }
-    captured_len
-}
-
-fn tracepoint_u64(ctx: &TracePointContext, offset: usize) -> Option<u64> {
-    // Offsets must match tracefs sys_enter_write/sys_exit_write format; privileged e2e validation is required.
-    unsafe { ctx.read_at::<u64>(offset) }.ok()
-}
-
-fn tracepoint_i64(ctx: &TracePointContext, offset: usize) -> Option<i64> {
-    // Offsets must match tracefs sys_enter_write/sys_exit_write format; privileged e2e validation is required.
-    unsafe { ctx.read_at::<i64>(offset) }.ok()
-}
-
-fn clamp_u64_to_u32(value: u64) -> u32 {
-    core::cmp::min(value, u64::from(u32::MAX)) as u32
 }
 
 pub(crate) fn pending_write_metadata(

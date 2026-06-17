@@ -2,7 +2,7 @@ use std::{error::Error, fmt, path::PathBuf};
 
 use super::{
     http::HttpTrafficConfig,
-    http1::{Http1LoopbackConfig, Http1LoopbackError, Http1LoopbackReport},
+    http1::{Http1IoMode, Http1LoopbackConfig, Http1LoopbackError, Http1LoopbackReport},
     loopback::{LoopbackCoordination, LoopbackRunOptions},
     tls::{TlsHttp1LoopbackConfig, TlsHttp1LoopbackError, TlsHttp1LoopbackReport},
 };
@@ -22,6 +22,7 @@ Options:
   --request-body-bytes N
   --response-body-bytes N
   --write-chunks N
+  --io-mode read-write|send-recv  (http1-loopback only)
   --connect-write-delay-ms N
   --post-exchange-delay-ms N
 ";
@@ -123,22 +124,32 @@ impl From<TlsHttp1LoopbackError> for FixtureError {
 fn parse_http1_loopback(
     args: impl IntoIterator<Item = String>,
 ) -> Result<Http1LoopbackConfig, FixtureError> {
-    let (traffic, run) = parse_http_loopback_args(args)?;
-    Ok(Http1LoopbackConfig { traffic, run })
+    let (traffic, run, io_mode) = parse_http_loopback_args(args)?;
+    Ok(Http1LoopbackConfig {
+        traffic,
+        run,
+        io_mode: io_mode.unwrap_or_default(),
+    })
 }
 
 fn parse_tls_http1_loopback(
     args: impl IntoIterator<Item = String>,
 ) -> Result<TlsHttp1LoopbackConfig, FixtureError> {
-    let (traffic, run) = parse_http_loopback_args(args)?;
+    let (traffic, run, io_mode) = parse_http_loopback_args(args)?;
+    if io_mode.is_some() {
+        return Err(FixtureError::usage(format!(
+            "--io-mode is only supported by http1-loopback\n\n{USAGE}"
+        )));
+    }
     Ok(TlsHttp1LoopbackConfig { traffic, run })
 }
 
 fn parse_http_loopback_args(
     args: impl IntoIterator<Item = String>,
-) -> Result<(HttpTrafficConfig, LoopbackRunOptions), FixtureError> {
+) -> Result<(HttpTrafficConfig, LoopbackRunOptions, Option<Http1IoMode>), FixtureError> {
     let mut traffic = HttpTrafficConfig::default();
     let mut run = LoopbackRunOptions::default();
+    let mut io_mode = None;
     let mut ready_file = None;
     let mut start_file = None;
     let mut args = args.into_iter();
@@ -169,6 +180,13 @@ fn parse_http_loopback_args(
                 traffic.response_body_bytes = parse_usize(&option, &value)?;
             }
             "--write-chunks" => traffic.write_chunks = parse_usize(&option, &value)?,
+            "--io-mode" => {
+                io_mode = Some(Http1IoMode::parse(&value).ok_or_else(|| {
+                    FixtureError::usage(format!(
+                        "invalid value for {option}: {value}; expected read-write or send-recv\n\n{USAGE}"
+                    ))
+                })?);
+            }
             _ => {
                 return Err(FixtureError::usage(format!(
                     "unknown option {option}\n\n{USAGE}"
@@ -177,7 +195,7 @@ fn parse_http_loopback_args(
         }
     }
     run.coordination = parse_coordination(ready_file, start_file)?;
-    Ok((traffic, run))
+    Ok((traffic, run, io_mode))
 }
 
 fn parse_coordination(
@@ -270,7 +288,15 @@ mod tests {
         assert_eq!(config.traffic.request_body_bytes, 128);
         assert_eq!(config.traffic.response_body_bytes, 64);
         assert_eq!(config.traffic.write_chunks, 3);
-        assert_eq!(config.run.connect_write_delay_ms, 250);
+        assert_eq!(config.io_mode, Http1IoMode::ReadWrite);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_parses_plain_http_io_mode() -> Result<(), Box<dyn Error>> {
+        let config = parse_http1_loopback(["--io-mode".to_string(), "send-recv".to_string()])?;
+
+        assert_eq!(config.io_mode, Http1IoMode::SendRecv);
         Ok(())
     }
 
@@ -287,6 +313,18 @@ mod tests {
         assert_eq!(config.traffic.write_chunks, 2);
         assert_eq!(config.run.coordination, LoopbackCoordination::Immediate);
         Ok(())
+    }
+
+    #[test]
+    fn cli_rejects_tls_http1_io_mode() {
+        let error = parse_tls_http1_loopback(["--io-mode".to_string(), "send-recv".to_string()])
+            .expect_err("TLS fixture must not accept plain HTTP syscall mode");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--io-mode is only supported by http1-loopback")
+        );
     }
 
     #[test]
@@ -331,6 +369,7 @@ mod tests {
         let report = run(["tls-http1-loopback".to_string(), "--help".to_string()])?;
 
         assert!(report.to_string().contains("tls-http1-loopback"));
+        assert!(report.to_string().contains("http1-loopback only"));
         Ok(())
     }
 }

@@ -202,7 +202,7 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider emits connect observations, selector-authorized always-degraded outbound write argument samples and inbound read result samples, plus best-effort descriptor-close lifecycle events; accept-side flows, recv/recvmsg/readv/sendmsg/writev, partial-write retry semantics, and lost-event capture are not implemented",
+            "eBPF provider emits connect observations, selector-authorized always-degraded outbound single-buffer syscall argument samples and inbound single-buffer syscall result samples, plus best-effort descriptor-close lifecycle events; accept-side flows, readv/writev/recvmsg/sendmsg, partial-write retry semantics, and lost-event capture are not implemented",
         )]
     }
 
@@ -464,12 +464,13 @@ mod tests {
         assert_eq!(bytes.stream_offset, 0);
         assert_eq!(bytes.bytes.as_ref(), b"HTTP/");
         assert!(bytes.degraded);
-        assert!(
-            bytes
-                .degradation_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("syscall result buffer snapshot"))
-        );
+        let degradation_reason = bytes
+            .degradation_reason
+            .as_deref()
+            .expect("inbound eBPF bytes must include degradation reason");
+        assert!(degradation_reason.contains("inbound syscall sample"));
+        assert!(degradation_reason.contains("after the kernel returns"));
+        assert!(degradation_reason.contains("best-effort"));
         Ok(())
     }
 

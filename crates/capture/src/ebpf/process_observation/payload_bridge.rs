@@ -13,8 +13,8 @@ use super::{
     tracked_flow::{TrackedEbpfFlow, TrackedEbpfFlows},
 };
 
-const EBPF_WRITE_ARGUMENT_SAMPLE_REASON: &str = "eBPF write sample is a syscall argument snapshot captured before the kernel copies bytes; contents are best-effort and may differ from bytes actually sent";
-const EBPF_READ_RESULT_SAMPLE_REASON: &str = "eBPF read sample is a syscall result buffer snapshot captured after the kernel returns; contents are best-effort and may omit bytes when truncated";
+const EBPF_WRITE_ARGUMENT_SAMPLE_REASON: &str = "eBPF outbound syscall sample is an argument snapshot captured before the kernel copies bytes; contents are best-effort and may differ from bytes actually sent";
+const EBPF_READ_RESULT_SAMPLE_REASON: &str = "eBPF inbound syscall sample is a result buffer snapshot captured after the kernel returns; contents are best-effort and may omit bytes when truncated";
 
 pub(super) fn write_events(
     tracked_flows: &mut TrackedEbpfFlows,
@@ -34,9 +34,9 @@ pub(super) fn write_events(
             truncated: write.truncated,
             read_failed: write.read_failed,
             base_reason: EBPF_WRITE_ARGUMENT_SAMPLE_REASON,
-            read_failed_reason: "eBPF write argument sample could not read userspace payload buffer",
-            empty_reason: "eBPF write sample did not contain captured payload bytes",
-            truncated_prefix: "eBPF write sample truncated payload",
+            read_failed_reason: "eBPF outbound syscall argument sample could not read userspace payload buffer",
+            empty_reason: "eBPF outbound syscall sample did not contain captured payload bytes",
+            truncated_prefix: "eBPF outbound syscall sample truncated payload",
         },
     )
 }
@@ -59,9 +59,9 @@ pub(super) fn read_events(
             truncated: read.truncated,
             read_failed: read.read_failed,
             base_reason: EBPF_READ_RESULT_SAMPLE_REASON,
-            read_failed_reason: "eBPF read result sample could not read userspace payload buffer",
-            empty_reason: "eBPF read sample did not contain captured payload bytes",
-            truncated_prefix: "eBPF read sample truncated payload",
+            read_failed_reason: "eBPF inbound syscall result sample could not read userspace payload buffer",
+            empty_reason: "eBPF inbound syscall sample did not contain captured payload bytes",
+            truncated_prefix: "eBPF inbound syscall sample truncated payload",
         },
     )
 }
@@ -228,11 +228,11 @@ mod tests {
         assert_eq!(bytes.bytes.as_ref(), b"GET /");
         assert_eq!(bytes.attribution_confidence, 90);
         assert!(bytes.degraded);
-        assert!(
+        assert_outbound_argument_reason(
             bytes
                 .degradation_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("syscall argument snapshot"))
+                .expect("outbound eBPF bytes must include degradation reason"),
         );
         assert!(
             bytes
@@ -262,11 +262,11 @@ mod tests {
         assert_eq!(bytes.bytes.as_ref(), b"HTTP/");
         assert_eq!(bytes.attribution_confidence, 90);
         assert!(bytes.degraded);
-        assert!(
+        assert_inbound_result_reason(
             bytes
                 .degradation_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("syscall result buffer snapshot"))
+                .expect("inbound eBPF bytes must include degradation reason"),
         );
         assert!(
             bytes
@@ -317,12 +317,12 @@ mod tests {
         assert_eq!(bytes.stream_offset, 0);
         assert_eq!(bytes.bytes.as_ref(), b"GET /");
         assert!(bytes.degraded);
-        assert!(
-            bytes
-                .degradation_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("captured 5 of 10"))
-        );
+        let degradation_reason = bytes
+            .degradation_reason
+            .as_deref()
+            .expect("truncated bytes must include degradation reason");
+        assert_outbound_argument_reason(degradation_reason);
+        assert!(degradation_reason.contains("captured 5 of 10"));
         assert!(
             bytes
                 .enforcement_evidence
@@ -526,5 +526,17 @@ mod tests {
             monotonic_ns,
             wall_time_unix_ns: 0,
         }
+    }
+
+    fn assert_outbound_argument_reason(reason: &str) {
+        assert!(reason.contains("outbound syscall sample"));
+        assert!(reason.contains("before the kernel copies bytes"));
+        assert!(reason.contains("best-effort"));
+    }
+
+    fn assert_inbound_result_reason(reason: &str) {
+        assert!(reason.contains("inbound syscall sample"));
+        assert!(reason.contains("after the kernel returns"));
+        assert!(reason.contains("best-effort"));
     }
 }

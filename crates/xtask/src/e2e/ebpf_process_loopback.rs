@@ -19,8 +19,9 @@ use super::{
         decode_envelope, e2e_error, ensure_e2e_packages_built, stop_running_child,
     },
     loopback::{
-        Http1LoopbackFixtureConfig, assert_no_policy_runtime_errors, is_fixture_process,
-        merge_run_results, spawn_agent, spawn_http1_loopback_fixture, start_http1_loopback_fixture,
+        Http1FixtureIoMode, Http1LoopbackFixtureConfig, assert_no_policy_runtime_errors,
+        is_fixture_process, merge_run_results, spawn_agent,
+        spawn_http1_loopback_fixture_with_io_mode, start_http1_loopback_fixture,
         wait_for_agent_policy_progress, wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
         wait_for_http1_loopback_fixture_ready,
     },
@@ -50,21 +51,35 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     ensure_e2e_packages_built(["agent", "e2e-fixture"])?;
     let ebpf_object_path = crate::ebpf::ensure_process_artifact_ready().map_err(e2e_error)?;
 
-    let root = create_temp_root("ebpf-process-loopback")?;
-    match run_at(&root, &ebpf_object_path) {
-        Ok(()) => {
-            fs::remove_dir_all(&root)?;
-            println!("e2e eBPF process loopback passed");
-            Ok(())
+    for io_mode in [Http1FixtureIoMode::ReadWrite, Http1FixtureIoMode::SendRecv] {
+        let root = create_temp_root(io_mode_temp_name(io_mode))?;
+        match run_at(&root, &ebpf_object_path, io_mode) {
+            Ok(()) => {
+                fs::remove_dir_all(&root)?;
+                println!("e2e eBPF process loopback {} passed", io_mode.cli_value());
+            }
+            Err(error) => {
+                eprintln!("e2e artifacts retained at {}", root.display());
+                return Err(error);
+            }
         }
-        Err(error) => {
-            eprintln!("e2e artifacts retained at {}", root.display());
-            Err(error)
-        }
+    }
+    println!("e2e eBPF process loopback passed");
+    Ok(())
+}
+
+fn io_mode_temp_name(io_mode: Http1FixtureIoMode) -> &'static str {
+    match io_mode {
+        Http1FixtureIoMode::ReadWrite => "ebpf-process-loopback-read-write",
+        Http1FixtureIoMode::SendRecv => "ebpf-process-loopback-send-recv",
     }
 }
 
-fn run_at(root: &Path, ebpf_object_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn run_at(
+    root: &Path,
+    ebpf_object_path: &Path,
+    io_mode: Http1FixtureIoMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(root)?;
     let fixture_ready_path = root.join("fixture.ready");
     let fixture_start_path = root.join("fixture.start");
@@ -77,7 +92,12 @@ fn run_at(root: &Path, ebpf_object_path: &Path) -> Result<(), Box<dyn std::error
     let supervisor = ChildSupervisor::new()?;
     write_policy_bundle(&policy_path)?;
     let mut fixture = supervisor.watch(
-        spawn_http1_loopback_fixture(&fixture_ready_path, &fixture_start_path, fixture_config())?,
+        spawn_http1_loopback_fixture_with_io_mode(
+            &fixture_ready_path,
+            &fixture_start_path,
+            fixture_config(),
+            io_mode,
+        )?,
         "fixture",
     );
     let fixture_ready =
@@ -253,7 +273,7 @@ fn assert_ebpf_ingress(
         .any(|event| is_expected_degraded_payload_event(event, listen_port, Direction::Outbound))
     {
         return Err(e2e_error(format!(
-            "missing selector-authorized eBPF outbound write sample; observed {}",
+            "missing selector-authorized eBPF outbound syscall payload sample; observed {}",
             ingress_summary(&capture_events, listen_port)
         ))
         .into());
@@ -263,7 +283,7 @@ fn assert_ebpf_ingress(
         .any(|event| is_expected_degraded_payload_event(event, listen_port, Direction::Inbound))
     {
         return Err(e2e_error(format!(
-            "missing selector-authorized eBPF inbound read sample; observed {}",
+            "missing selector-authorized eBPF inbound syscall payload sample; observed {}",
             ingress_summary(&capture_events, listen_port)
         ))
         .into());
@@ -431,8 +451,16 @@ fn is_expected_degraded_payload_event(
 
 fn expected_payload_reason(reason: &str, direction: Direction) -> bool {
     match direction {
-        Direction::Outbound => reason.contains("syscall argument snapshot"),
-        Direction::Inbound => reason.contains("syscall result buffer snapshot"),
+        Direction::Outbound => {
+            reason.contains("outbound syscall sample")
+                && reason.contains("before the kernel copies bytes")
+                && reason.contains("best-effort")
+        }
+        Direction::Inbound => {
+            reason.contains("inbound syscall sample")
+                && reason.contains("after the kernel returns")
+                && reason.contains("best-effort")
+        }
     }
 }
 

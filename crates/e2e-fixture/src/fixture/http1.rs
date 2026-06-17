@@ -1,7 +1,6 @@
 use std::{
     error::Error,
-    fmt,
-    io::{self, Write},
+    fmt, io,
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     thread,
     time::Duration,
@@ -21,6 +20,31 @@ const SCENARIO: &str = "http1-loopback";
 pub(crate) struct Http1LoopbackConfig {
     pub traffic: HttpTrafficConfig,
     pub run: LoopbackRunOptions,
+    pub io_mode: Http1IoMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Http1IoMode {
+    #[default]
+    ReadWrite,
+    SendRecv,
+}
+
+impl Http1IoMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadWrite => "read-write",
+            Self::SendRecv => "send-recv",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "read-write" => Some(Self::ReadWrite),
+            "send-recv" => Some(Self::SendRecv),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +53,7 @@ pub(crate) struct Http1LoopbackReport {
     pub listen_addr: SocketAddr,
     pub requests: usize,
     pub write_chunks: usize,
+    pub io_mode: Http1IoMode,
     pub client_bytes_written: usize,
     pub client_bytes_read: usize,
     pub server_bytes_read: usize,
@@ -42,6 +67,7 @@ impl fmt::Display for Http1LoopbackReport {
         writeln!(formatter, "listen_addr={}", self.listen_addr)?;
         writeln!(formatter, "requests={}", self.requests)?;
         writeln!(formatter, "write_chunks={}", self.write_chunks)?;
+        writeln!(formatter, "io_mode={}", self.io_mode.as_str())?;
         writeln!(
             formatter,
             "client_bytes_written={}",
@@ -115,8 +141,10 @@ pub(crate) fn run_http1_loopback(
         .map_err(|source| io_error("read listener address", source))?;
     coordinate_start(&config.run.coordination, listen_addr)?;
     let traffic = config.traffic;
+    let io_mode = config.io_mode;
     let post_exchange_delay_ms = config.run.post_exchange_delay_ms;
-    let server = thread::spawn(move || serve_http1(listener, traffic, post_exchange_delay_ms));
+    let server =
+        thread::spawn(move || serve_http1(listener, traffic, io_mode, post_exchange_delay_ms));
 
     let mut client_bytes_written = 0usize;
     let mut client_bytes_read = 0usize;
@@ -125,6 +153,7 @@ pub(crate) fn run_http1_loopback(
             listen_addr,
             request_index,
             &traffic,
+            io_mode,
             config.run.connect_write_delay_ms,
             config.run.post_exchange_delay_ms,
         )?;
@@ -140,6 +169,7 @@ pub(crate) fn run_http1_loopback(
         listen_addr,
         requests: traffic.requests,
         write_chunks: traffic.write_chunks,
+        io_mode,
         client_bytes_written,
         client_bytes_read,
         server_bytes_read: server_report.bytes_read,
@@ -151,6 +181,7 @@ fn run_client_exchange(
     listen_addr: SocketAddr,
     request_index: usize,
     config: &HttpTrafficConfig,
+    io_mode: Http1IoMode,
     connect_write_delay_ms: u64,
     post_exchange_delay_ms: u64,
 ) -> Result<ExchangeReport, Http1LoopbackError> {
@@ -161,11 +192,17 @@ fn run_client_exchange(
         thread::sleep(Duration::from_millis(connect_write_delay_ms));
     }
     let request = http::request(request_index, config.request_body_bytes);
-    write_in_chunks(&stream, &request, config.write_chunks)?;
+    write_in_chunks(
+        &stream,
+        &request,
+        config.write_chunks,
+        io_mode,
+        "write HTTP fixture request chunk",
+    )?;
     stream
         .shutdown(Shutdown::Write)
         .map_err(|source| io_error("half-close client write side", source))?;
-    let response = read_to_end_with_read_syscall(&stream)
+    let response = read_to_end(&stream, io_mode)
         .map_err(|source| io_error("read HTTP fixture response", source))?;
     http::validate_response(&response, request_index, config.response_body_bytes)?;
     delay_after_exchange(post_exchange_delay_ms);
@@ -178,20 +215,25 @@ fn run_client_exchange(
 fn serve_http1(
     listener: TcpListener,
     config: HttpTrafficConfig,
+    io_mode: Http1IoMode,
     post_exchange_delay_ms: u64,
 ) -> Result<ExchangeReport, Http1LoopbackError> {
     let mut bytes_read = 0usize;
     let mut bytes_written = 0usize;
     for request_index in 0..config.requests {
-        let (mut stream, _) = accept_with_timeout(&listener)?;
+        let (stream, _) = accept_with_timeout(&listener)?;
         configure_stream(&stream)?;
-        let request = read_to_end_with_read_syscall(&stream)
+        let request = read_to_end(&stream, io_mode)
             .map_err(|source| io_error("read HTTP fixture request", source))?;
         http::validate_request(&request, request_index, config.request_body_bytes)?;
         let response = http::response(request_index, config.response_body_bytes);
-        stream
-            .write_all(&response)
-            .map_err(|source| io_error("write HTTP fixture response", source))?;
+        write_in_chunks(
+            &stream,
+            &response,
+            1,
+            io_mode,
+            "write HTTP fixture response chunk",
+        )?;
         delay_after_exchange(post_exchange_delay_ms);
         bytes_read = bytes_read.saturating_add(request.len());
         bytes_written = bytes_written.saturating_add(response.len());
@@ -206,11 +248,13 @@ fn write_in_chunks(
     stream: &TcpStream,
     bytes: &[u8],
     chunks: usize,
+    io_mode: Http1IoMode,
+    action: &'static str,
 ) -> Result<(), Http1LoopbackError> {
     let chunk_size = http::chunk_size(bytes.len(), chunks);
     for chunk in bytes.chunks(chunk_size) {
-        let written = write_chunk_with_write_syscall(stream, chunk)
-            .map_err(|source| io_error("write HTTP fixture request chunk", source))?;
+        let written =
+            write_chunk(stream, chunk, io_mode).map_err(|source| io_error(action, source))?;
         if written != chunk.len() {
             return Err(HttpMessageError::InvalidMessage(format!(
                 "partial fixture request chunk write: wrote {written} of {} bytes",
@@ -222,19 +266,35 @@ fn write_in_chunks(
     Ok(())
 }
 
-fn write_chunk_with_write_syscall(stream: &TcpStream, chunk: &[u8]) -> io::Result<usize> {
-    rustix::io::write(stream, chunk).map_err(Into::into)
+fn write_chunk(stream: &TcpStream, chunk: &[u8], io_mode: Http1IoMode) -> io::Result<usize> {
+    match io_mode {
+        Http1IoMode::ReadWrite => rustix::io::write(stream, chunk).map_err(Into::into),
+        Http1IoMode::SendRecv => {
+            rustix::net::send(stream, chunk, rustix::net::SendFlags::empty()).map_err(Into::into)
+        }
+    }
 }
 
-fn read_to_end_with_read_syscall(stream: &TcpStream) -> io::Result<Vec<u8>> {
+fn read_to_end(stream: &TcpStream, io_mode: Http1IoMode) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
-        let read = rustix::io::read(stream, &mut buffer).map_err(io::Error::from)?;
+        let read = read_chunk(stream, &mut buffer, io_mode)?;
         if read == 0 {
             return Ok(bytes);
         }
         bytes.extend_from_slice(&buffer[..read]);
+    }
+}
+
+fn read_chunk(stream: &TcpStream, buffer: &mut [u8], io_mode: Http1IoMode) -> io::Result<usize> {
+    match io_mode {
+        Http1IoMode::ReadWrite => rustix::io::read(stream, buffer).map_err(io::Error::from),
+        Http1IoMode::SendRecv => {
+            let (read, _) = rustix::net::recv(stream, buffer, rustix::net::RecvFlags::empty())
+                .map_err(io::Error::from)?;
+            Ok(read)
+        }
     }
 }
 
@@ -264,10 +324,12 @@ mod tests {
                 write_chunks: 3,
             },
             run: LoopbackRunOptions::default(),
+            io_mode: Http1IoMode::ReadWrite,
         })?;
 
         assert_eq!(report.requests, 2);
         assert_eq!(report.write_chunks, 3);
+        assert_eq!(report.io_mode, Http1IoMode::ReadWrite);
         assert_eq!(report.client_bytes_written, report.server_bytes_read);
         assert_eq!(report.client_bytes_read, report.server_bytes_written);
         assert!(report.client_bytes_written > 0);
@@ -297,6 +359,7 @@ mod tests {
                     start_file: start_path.clone(),
                 },
             },
+            io_mode: Http1IoMode::ReadWrite,
         };
         let handle = thread::spawn(move || {
             let report = run_http1_loopback(config);
@@ -341,12 +404,32 @@ mod tests {
                     start_file: start_path,
                 },
             },
+            io_mode: Http1IoMode::ReadWrite,
         };
 
         let error = run_http1_loopback(config).expect_err("stale start file must fail");
 
         assert!(error.to_string().contains("did not contain expected nonce"));
         fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn http1_loopback_runs_with_send_recv_syscalls() -> Result<(), Box<dyn Error>> {
+        let report = run_http1_loopback(Http1LoopbackConfig {
+            traffic: HttpTrafficConfig {
+                requests: 1,
+                request_body_bytes: 64,
+                response_body_bytes: 32,
+                write_chunks: 2,
+            },
+            run: LoopbackRunOptions::default(),
+            io_mode: Http1IoMode::SendRecv,
+        })?;
+
+        assert_eq!(report.io_mode, Http1IoMode::SendRecv);
+        assert_eq!(report.client_bytes_written, report.server_bytes_read);
+        assert_eq!(report.client_bytes_read, report.server_bytes_written);
         Ok(())
     }
 
