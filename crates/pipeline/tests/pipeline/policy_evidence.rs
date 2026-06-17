@@ -52,11 +52,11 @@ end
                     && envelope
                         .enforcement_evidence
                         .destructive_enforcement_rejection_reason()
-                        .is_some_and(|reason| reason.contains("eBPF syscall argument snapshot"))
+                        .is_some_and(|reason| reason.contains("eBPF syscall payload snapshot"))
                     && headers.target.as_deref() == Some("/blocked")
         )
     }));
-    assert_unsupported_reset(&envelopes, "eBPF syscall argument snapshot");
+    assert_unsupported_reset(&envelopes, "eBPF syscall payload snapshot");
     assert_no_apply(metrics);
     Ok(())
 }
@@ -98,11 +98,11 @@ end
                 if envelope
                     .enforcement_evidence
                     .destructive_enforcement_rejection_reason()
-                    .is_some_and(|reason| reason.contains("eBPF syscall argument snapshot"))
+                    .is_some_and(|reason| reason.contains("eBPF syscall payload snapshot"))
                     && gap.reason.contains("eBPF syscall gap")
         )
     }));
-    assert_unsupported_reset(&envelopes, "eBPF syscall argument snapshot");
+    assert_unsupported_reset(&envelopes, "eBPF syscall payload snapshot");
     assert_no_apply(metrics);
     Ok(())
 }
@@ -141,10 +141,10 @@ end
                     && envelope
                     .enforcement_evidence
                     .destructive_enforcement_rejection_reason()
-                    .is_some_and(|reason| reason.contains("eBPF syscall argument snapshot"))
+                    .is_some_and(|reason| reason.contains("eBPF syscall payload snapshot"))
         )
     }));
-    assert_unsupported_reset(&envelopes, "eBPF syscall argument snapshot");
+    assert_unsupported_reset(&envelopes, "eBPF syscall payload snapshot");
     assert_no_apply(metrics);
     Ok(())
 }
@@ -257,7 +257,7 @@ fn unsupported_reset_decision_id_for_observation_detail(
     };
     chunk.degradation_reason = Some(detail.to_string());
     chunk.enforcement_evidence = EnforcementEvidence::observation_only_with_detail(
-        ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+        ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
         detail,
     );
 

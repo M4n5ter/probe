@@ -507,8 +507,8 @@ mod tests {
         let trigger = request_event(Direction::Outbound)
             .with_degraded(true)
             .with_enforcement_evidence(EnforcementEvidence::observation_only_with_detail(
-                ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
-                "test eBPF syscall argument snapshot",
+                ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
+                "test eBPF syscall payload snapshot",
             ));
         let verdict = Verdict {
             action: Action::Reset,
@@ -528,16 +528,20 @@ mod tests {
         assert_eq!(decision.outcome, EnforcementOutcome::Unsupported);
         assert_eq!(decision.requested_action, Action::Reset);
         assert_eq!(decision.effective_action, Action::Observe);
-        assert!(decision.reason.contains("cannot prove bytes copied"));
         assert!(
             decision
                 .reason
-                .contains("eBPF syscall argument snapshot cannot prove")
+                .contains("cannot prove complete socket payload")
+        );
+        assert!(
+            decision
+                .reason
+                .contains("eBPF syscall payload snapshot cannot prove")
         );
         assert!(
             !decision
                 .reason
-                .contains("test eBPF syscall argument snapshot")
+                .contains("test eBPF syscall payload snapshot")
         );
         assert_eq!(backend.calls(), 0);
         Ok(())

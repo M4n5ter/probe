@@ -171,7 +171,7 @@ fn write_agent_config(
         ProcessSelector::default(),
         TrafficSelector {
             remote_ports: vec![listen_port],
-            directions: vec![Direction::Outbound],
+            directions: vec![Direction::Outbound, Direction::Inbound],
             ..TrafficSelector::default()
         },
     ));
@@ -208,6 +208,7 @@ fn assert_spool_outputs(
     assert_no_policy_runtime_errors(&envelopes)?;
     assert_expected_lifecycle_exports(&envelopes, listen_port)?;
     assert_expected_requests(&envelopes)?;
+    assert_expected_responses(&envelopes)?;
     assert_expected_policy_alerts(&envelopes)?;
 
     println!(
@@ -249,10 +250,20 @@ fn assert_ebpf_ingress(
     }
     if !capture_events
         .iter()
-        .any(|event| is_expected_degraded_bytes_event(event, listen_port))
+        .any(|event| is_expected_degraded_payload_event(event, listen_port, Direction::Outbound))
     {
         return Err(e2e_error(format!(
             "missing selector-authorized eBPF outbound write sample; observed {}",
+            ingress_summary(&capture_events, listen_port)
+        ))
+        .into());
+    }
+    if !capture_events
+        .iter()
+        .any(|event| is_expected_degraded_payload_event(event, listen_port, Direction::Inbound))
+    {
+        return Err(e2e_error(format!(
+            "missing selector-authorized eBPF inbound read sample; observed {}",
             ingress_summary(&capture_events, listen_port)
         ))
         .into());
@@ -390,13 +401,17 @@ fn is_expected_connection_event(
     }
 }
 
-fn is_expected_degraded_bytes_event(event: &CaptureEvent, listen_port: u16) -> bool {
+fn is_expected_degraded_payload_event(
+    event: &CaptureEvent,
+    listen_port: u16,
+    direction: Direction,
+) -> bool {
     let CaptureEvent::Bytes(bytes) = event else {
         return false;
     };
     bytes.source == CaptureSource::EbpfSyscall
         && bytes.provider == CaptureProviderKind::Ebpf
-        && bytes.direction == Direction::Outbound
+        && bytes.direction == direction
         && bytes.flow.remote.port == listen_port
         && bytes.flow.attribution_confidence > 0
         && is_fixture_process(&bytes.flow.process)
@@ -404,14 +419,21 @@ fn is_expected_degraded_bytes_event(event: &CaptureEvent, listen_port: u16) -> b
         && bytes
             .degradation_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("syscall argument snapshot"))
+            .is_some_and(|reason| expected_payload_reason(reason, direction))
         && matches!(
             &bytes.enforcement_evidence,
             EnforcementEvidence::ObservationOnly {
-                reason: ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+                reason: ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
                 ..
             }
         )
+}
+
+fn expected_payload_reason(reason: &str, direction: Direction) -> bool {
+    match direction {
+        Direction::Outbound => reason.contains("syscall argument snapshot"),
+        Direction::Inbound => reason.contains("syscall result buffer snapshot"),
+    }
 }
 
 fn assert_expected_lifecycle_exports(
@@ -459,7 +481,7 @@ fn assert_expected_requests(envelopes: &[EventEnvelope]) -> Result<(), Box<dyn s
                     && matches!(
                         &envelope.enforcement_evidence,
                         EnforcementEvidence::ObservationOnly {
-                            reason: ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+                            reason: ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
                             ..
                         }
                     )
@@ -483,6 +505,39 @@ fn assert_expected_requests(envelopes: &[EventEnvelope]) -> Result<(), Box<dyn s
     .into())
 }
 
+fn assert_expected_responses(
+    envelopes: &[EventEnvelope],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let observed = envelopes
+        .iter()
+        .filter(|envelope| {
+            matches!(
+                &envelope.kind,
+                EventKind::HttpResponseHeaders(headers)
+                if envelope.source == CaptureSource::EbpfSyscall
+                    && envelope.degraded
+                    && matches!(
+                        &envelope.enforcement_evidence,
+                        EnforcementEvidence::ObservationOnly {
+                            reason: ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
+                            ..
+                        }
+                    )
+                    && headers.direction == Direction::Inbound
+                    && headers.status == Some(200)
+            )
+        })
+        .count();
+    if observed >= REQUESTS {
+        return Ok(());
+    }
+
+    Err(e2e_error(format!(
+        "missing eBPF HTTP response headers; expected at least {REQUESTS}, observed {observed}",
+    ))
+    .into())
+}
+
 fn assert_expected_policy_alerts(
     envelopes: &[EventEnvelope],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -496,7 +551,7 @@ fn assert_expected_policy_alerts(
                     && matches!(
                         &envelope.enforcement_evidence,
                         EnforcementEvidence::ObservationOnly {
-                            reason: ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+                            reason: ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
                             ..
                         }
                     ) =>

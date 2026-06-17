@@ -2,7 +2,8 @@ use core::fmt;
 
 use super::common::{EBPF_EVENTS_MAP_NAME, EbpfMapKind, EbpfMapSpec};
 use crate::event::{
-    EBPF_RING_BUFFER_BYTES, EBPF_SOCKET_WRITE_SAMPLE_BYTES, EbpfSocketWriteSampleRecord,
+    EBPF_RING_BUFFER_BYTES, EBPF_SOCKET_WRITE_SAMPLE_BYTES, EbpfSocketReadSampleRecord,
+    EbpfSocketWriteSampleRecord,
 };
 
 pub const EBPF_CONNECT_PROGRAM_NAME: &str = "sssa_sys_enter_connect";
@@ -29,16 +30,28 @@ pub const EBPF_CLOSE_RANGE_TRACEPOINT_NAME: &str = "sys_enter_close_range";
 pub const EBPF_PROCESS_EXIT_PROGRAM_NAME: &str = "sssa_sched_process_exit";
 pub const EBPF_PROCESS_EXIT_TRACEPOINT_CATEGORY: &str = "sched";
 pub const EBPF_PROCESS_EXIT_TRACEPOINT_NAME: &str = "sched_process_exit";
+pub const EBPF_PROCESS_EXEC_PROGRAM_NAME: &str = "sssa_sched_process_exec";
+pub const EBPF_PROCESS_EXEC_TRACEPOINT_CATEGORY: &str = "sched";
+pub const EBPF_PROCESS_EXEC_TRACEPOINT_NAME: &str = "sched_process_exec";
 pub const EBPF_WRITE_ENTER_PROGRAM_NAME: &str = "sssa_sys_enter_write";
 pub const EBPF_WRITE_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
 pub const EBPF_WRITE_ENTER_TRACEPOINT_NAME: &str = "sys_enter_write";
 pub const EBPF_WRITE_EXIT_PROGRAM_NAME: &str = "sssa_sys_exit_write";
 pub const EBPF_WRITE_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
 pub const EBPF_WRITE_EXIT_TRACEPOINT_NAME: &str = "sys_exit_write";
+pub const EBPF_READ_ENTER_PROGRAM_NAME: &str = "sssa_sys_enter_read";
+pub const EBPF_READ_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_READ_ENTER_TRACEPOINT_NAME: &str = "sys_enter_read";
+pub const EBPF_READ_EXIT_PROGRAM_NAME: &str = "sssa_sys_exit_read";
+pub const EBPF_READ_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_READ_EXIT_TRACEPOINT_NAME: &str = "sys_exit_read";
 pub const EBPF_ALLOWED_SOCKET_FDS_MAP_NAME: &str = "SSSA_ALLOWED_SOCKET_FDS";
 pub const EBPF_ALLOWED_SOCKET_FDS_MAX_ENTRIES: u32 = 8192;
 pub const EBPF_ALLOWED_SOCKET_FD_KEY_BYTES: u32 = core::mem::size_of::<EbpfSocketFdKey>() as u32;
-pub const EBPF_ALLOWED_SOCKET_FD_VALUE_BYTES: u32 = core::mem::size_of::<u64>() as u32;
+pub const EBPF_ALLOWED_SOCKET_FD_VALUE_BYTES: u32 =
+    core::mem::size_of::<EbpfSocketPayloadAllowance>() as u32;
+pub const EBPF_SOCKET_PAYLOAD_ALLOW_WRITE: u8 = 1 << 0;
+pub const EBPF_SOCKET_PAYLOAD_ALLOW_READ: u8 = 1 << 1;
 pub const EBPF_FD_TABLE_EPOCHS_MAP_NAME: &str = "SSSA_FD_TABLE_EPOCHS";
 pub const EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES: u32 = 8192;
 pub const EBPF_FD_TABLE_EPOCH_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
@@ -53,13 +66,23 @@ pub const EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES: u32 = 1;
 pub const EBPF_PENDING_WRITE_SCRATCH_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
 pub const EBPF_PENDING_WRITE_SCRATCH_VALUE_BYTES: u32 =
     core::mem::size_of::<EbpfPendingSocketWriteSample>() as u32;
+pub const EBPF_PENDING_READS_MAP_NAME: &str = "SSSA_PENDING_READS";
+pub const EBPF_PENDING_READS_MAX_ENTRIES: u32 = 8192;
+pub const EBPF_PENDING_READ_KEY_BYTES: u32 = core::mem::size_of::<u64>() as u32;
+pub const EBPF_PENDING_READ_VALUE_BYTES: u32 =
+    core::mem::size_of::<EbpfPendingSocketReadAttempt>() as u32;
 pub const EBPF_PROCESS_EVENT_SCRATCH_MAP_NAME: &str = "SSSA_PROCESS_EVENT_SCRATCH";
 pub const EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES: u32 = 1;
 pub const EBPF_PROCESS_EVENT_SCRATCH_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
 pub const EBPF_PROCESS_EVENT_SCRATCH_VALUE_BYTES: u32 =
     core::mem::size_of::<EbpfSocketWriteSampleRecord>() as u32;
+pub const EBPF_PROCESS_READ_EVENT_SCRATCH_MAP_NAME: &str = "SSSA_PROCESS_READ_EVENT_SCRATCH";
+pub const EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES: u32 = 1;
+pub const EBPF_PROCESS_READ_EVENT_SCRATCH_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
+pub const EBPF_PROCESS_READ_EVENT_SCRATCH_VALUE_BYTES: u32 =
+    core::mem::size_of::<EbpfSocketReadSampleRecord>() as u32;
 
-pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 10] = [
+pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 13] = [
     EbpfProcessTracepointSpec {
         role: EbpfProcessTracepointRole::ConnectEnter,
         program_name: EBPF_CONNECT_PROGRAM_NAME,
@@ -109,6 +132,12 @@ pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 10] = [
         tracepoint_name: EBPF_PROCESS_EXIT_TRACEPOINT_NAME,
     },
     EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::ProcessExec,
+        program_name: EBPF_PROCESS_EXEC_PROGRAM_NAME,
+        category: EBPF_PROCESS_EXEC_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_PROCESS_EXEC_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
         role: EbpfProcessTracepointRole::WriteEnter,
         program_name: EBPF_WRITE_ENTER_PROGRAM_NAME,
         category: EBPF_WRITE_ENTER_TRACEPOINT_CATEGORY,
@@ -120,9 +149,21 @@ pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 10] = [
         category: EBPF_WRITE_EXIT_TRACEPOINT_CATEGORY,
         tracepoint_name: EBPF_WRITE_EXIT_TRACEPOINT_NAME,
     },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::ReadEnter,
+        program_name: EBPF_READ_ENTER_PROGRAM_NAME,
+        category: EBPF_READ_ENTER_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_READ_ENTER_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::ReadExit,
+        program_name: EBPF_READ_EXIT_PROGRAM_NAME,
+        category: EBPF_READ_EXIT_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_READ_EXIT_TRACEPOINT_NAME,
+    },
 ];
 
-pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 6] = [
+pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 8] = [
     EbpfMapSpec {
         name: EBPF_EVENTS_MAP_NAME,
         kind: EbpfMapKind::Ringbuf,
@@ -164,11 +205,27 @@ pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 6] = [
         map_flags: 0,
     },
     EbpfMapSpec {
+        name: EBPF_PENDING_READS_MAP_NAME,
+        kind: EbpfMapKind::Hash,
+        key_size: EBPF_PENDING_READ_KEY_BYTES,
+        value_size: EBPF_PENDING_READ_VALUE_BYTES,
+        max_entries: EBPF_PENDING_READS_MAX_ENTRIES,
+        map_flags: 0,
+    },
+    EbpfMapSpec {
         name: EBPF_PROCESS_EVENT_SCRATCH_MAP_NAME,
         kind: EbpfMapKind::PerCpuArray,
         key_size: EBPF_PROCESS_EVENT_SCRATCH_KEY_BYTES,
         value_size: EBPF_PROCESS_EVENT_SCRATCH_VALUE_BYTES,
         max_entries: EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES,
+        map_flags: 0,
+    },
+    EbpfMapSpec {
+        name: EBPF_PROCESS_READ_EVENT_SCRATCH_MAP_NAME,
+        kind: EbpfMapKind::PerCpuArray,
+        key_size: EBPF_PROCESS_READ_EVENT_SCRATCH_KEY_BYTES,
+        value_size: EBPF_PROCESS_READ_EVENT_SCRATCH_VALUE_BYTES,
+        max_entries: EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES,
         map_flags: 0,
     },
 ];
@@ -216,8 +273,11 @@ pub enum EbpfProcessTracepointRole {
     FcntlEnter,
     CloseRangeEnter,
     ProcessExit,
+    ProcessExec,
     WriteEnter,
     WriteExit,
+    ReadEnter,
+    ReadExit,
 }
 
 impl EbpfProcessTracepointRole {
@@ -232,19 +292,65 @@ impl EbpfProcessTracepointRole {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EbpfSocketFdKey {
-    pub pid: u32,
+    pub tgid: u32,
     pub fd: i32,
 }
 
 impl EbpfSocketFdKey {
-    pub const fn new(pid: u32, fd: i32) -> Self {
-        Self { pid, fd }
+    pub const fn new(tgid: u32, fd: i32) -> Self {
+        Self { tgid, fd }
     }
 
     pub fn to_bpfel_bytes(self) -> [u8; core::mem::size_of::<Self>()] {
-        let pid = self.pid.to_le_bytes();
+        let tgid = self.tgid.to_le_bytes();
         let fd = self.fd.to_le_bytes();
-        [pid[0], pid[1], pid[2], pid[3], fd[0], fd[1], fd[2], fd[3]]
+        [
+            tgid[0], tgid[1], tgid[2], tgid[3], fd[0], fd[1], fd[2], fd[3],
+        ]
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfSocketPayloadAllowance {
+    pub fd_table_epoch: u64,
+    pub direction_mask: u8,
+    pub _reserved: [u8; 7],
+}
+
+impl EbpfSocketPayloadAllowance {
+    pub const fn new(fd_table_epoch: u64, direction_mask: u8) -> Self {
+        Self {
+            fd_table_epoch,
+            direction_mask,
+            _reserved: [0; 7],
+        }
+    }
+
+    pub fn to_bpfel_bytes(self) -> [u8; core::mem::size_of::<Self>()] {
+        let epoch = self.fd_table_epoch.to_le_bytes();
+        [
+            epoch[0],
+            epoch[1],
+            epoch[2],
+            epoch[3],
+            epoch[4],
+            epoch[5],
+            epoch[6],
+            epoch[7],
+            self.direction_mask,
+            self._reserved[0],
+            self._reserved[1],
+            self._reserved[2],
+            self._reserved[3],
+            self._reserved[4],
+            self._reserved[5],
+            self._reserved[6],
+        ]
+    }
+
+    pub fn allows(self, direction: u8) -> bool {
+        self.direction_mask & direction != 0
     }
 }
 
@@ -258,6 +364,14 @@ pub struct EbpfPendingSocketWriteSample {
     pub buffer: [u8; EBPF_SOCKET_WRITE_SAMPLE_BYTES],
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfPendingSocketReadAttempt {
+    pub fd: i32,
+    pub requested_len: u32,
+    pub user_buffer: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use core::mem::{align_of, offset_of, size_of};
@@ -267,7 +381,7 @@ mod tests {
 
     #[test]
     fn process_map_specs_are_unique_and_layout_complete() {
-        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 6);
+        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 8);
         assert_unique(EBPF_PROCESS_MAP_SPECS.map(|spec| spec.name));
 
         let allow_map = process_map(EBPF_ALLOWED_SOCKET_FDS_MAP_NAME);
@@ -294,15 +408,51 @@ mod tests {
             size_of::<EbpfPendingSocketWriteSample>() as u32
         );
 
+        let pending_reads = process_map(EBPF_PENDING_READS_MAP_NAME);
+        assert_eq!(pending_reads.kind, EbpfMapKind::Hash);
+        assert_eq!(
+            pending_reads.value_size,
+            size_of::<EbpfPendingSocketReadAttempt>() as u32
+        );
+
+        let read_scratch = process_map(EBPF_PROCESS_READ_EVENT_SCRATCH_MAP_NAME);
+        assert_eq!(read_scratch.kind, EbpfMapKind::PerCpuArray);
+        assert_eq!(
+            read_scratch.value_size,
+            size_of::<EbpfSocketReadSampleRecord>() as u32
+        );
+
         assert_eq!(
             EbpfSocketFdKey::new(0x0102_0304, -2).to_bpfel_bytes(),
             [0x04, 0x03, 0x02, 0x01, 0xfe, 0xff, 0xff, 0xff]
+        );
+        assert_eq!(
+            EbpfSocketPayloadAllowance::new(0x0102_0304_0506_0708, EBPF_SOCKET_PAYLOAD_ALLOW_READ)
+                .to_bpfel_bytes(),
+            [
+                0x08,
+                0x07,
+                0x06,
+                0x05,
+                0x04,
+                0x03,
+                0x02,
+                0x01,
+                EBPF_SOCKET_PAYLOAD_ALLOW_READ,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            ]
         );
     }
 
     #[test]
     fn process_tracepoint_specs_are_complete() {
-        assert_eq!(EBPF_PROCESS_TRACEPOINT_SPECS.len(), 10);
+        assert_eq!(EBPF_PROCESS_TRACEPOINT_SPECS.len(), 13);
         assert_unique(EBPF_PROCESS_TRACEPOINT_SPECS.map(|spec| spec.program_name));
         assert_unique(EBPF_PROCESS_TRACEPOINT_SPECS.map(|spec| spec.tracepoint_name));
 
@@ -324,6 +474,31 @@ mod tests {
         assert_eq!(offset_of!(EbpfPendingSocketWriteSample, captured_len), 8);
         assert_eq!(offset_of!(EbpfPendingSocketWriteSample, flags), 10);
         assert_eq!(offset_of!(EbpfPendingSocketWriteSample, buffer), 12);
+    }
+
+    #[test]
+    fn socket_payload_allowance_layout_is_stable() {
+        assert_eq!(size_of::<EbpfSocketPayloadAllowance>(), 16);
+        assert_eq!(align_of::<EbpfSocketPayloadAllowance>(), 8);
+        assert_eq!(offset_of!(EbpfSocketPayloadAllowance, fd_table_epoch), 0);
+        assert_eq!(offset_of!(EbpfSocketPayloadAllowance, direction_mask), 8);
+        assert_eq!(offset_of!(EbpfSocketPayloadAllowance, _reserved), 9);
+        let allowance = EbpfSocketPayloadAllowance::new(
+            9,
+            EBPF_SOCKET_PAYLOAD_ALLOW_READ | EBPF_SOCKET_PAYLOAD_ALLOW_WRITE,
+        );
+        assert!(allowance.allows(EBPF_SOCKET_PAYLOAD_ALLOW_READ));
+        assert!(allowance.allows(EBPF_SOCKET_PAYLOAD_ALLOW_WRITE));
+        assert!(!allowance.allows(1 << 7));
+    }
+
+    #[test]
+    fn pending_socket_read_attempt_layout_is_stable() {
+        assert_eq!(size_of::<EbpfPendingSocketReadAttempt>(), 16);
+        assert_eq!(align_of::<EbpfPendingSocketReadAttempt>(), 8);
+        assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, fd), 0);
+        assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, requested_len), 4);
+        assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, user_buffer), 8);
     }
 
     fn process_map(name: &'static str) -> EbpfMapSpec {

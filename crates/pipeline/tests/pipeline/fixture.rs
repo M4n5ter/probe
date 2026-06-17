@@ -54,10 +54,10 @@ pub(super) fn observation_only_ebpf_syscall_bytes_with_direction(
     chunk.source = CaptureSource::EbpfSyscall;
     chunk.provider = CaptureProviderKind::Ebpf;
     chunk.degraded = true;
-    chunk.degradation_reason = Some("test eBPF syscall argument snapshot".to_string());
+    chunk.degradation_reason = Some("test eBPF syscall payload snapshot".to_string());
     chunk.enforcement_evidence = EnforcementEvidence::observation_only_with_detail(
-        ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
-        "test eBPF syscall argument snapshot",
+        ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
+        "test eBPF syscall payload snapshot",
     );
     chunk.enforcement_evidence_propagation = capture::EnforcementEvidencePropagation::Flow;
     CaptureEvent::Bytes(chunk)
@@ -74,7 +74,7 @@ pub(super) fn flow_carried_observation_only_ebpf_syscall_gap(flow: FlowContext) 
         source: CaptureSource::EbpfSyscall,
         provider: CaptureProviderKind::Ebpf,
         enforcement_evidence: EnforcementEvidence::observation_only_with_detail(
-            ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+            ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
             reason,
         ),
         enforcement_evidence_propagation: capture::EnforcementEvidencePropagation::Flow,

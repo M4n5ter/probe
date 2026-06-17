@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_write_sample_preserves_read_failure_without_payload() {
+    fn trim_write_sample_preserves_buffer_read_failure_without_payload() {
         let mut pending = pending_write(10, b"", EBPF_SOCKET_WRITE_READ_FAILED);
 
         trim_write_sample_to_returned_len(&mut pending, 4).expect("positive write finalizes");

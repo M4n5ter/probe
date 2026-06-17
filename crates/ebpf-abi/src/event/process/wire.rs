@@ -5,8 +5,12 @@ use super::super::common::{
     write_u32, write_u64,
 };
 
-pub const EBPF_PROCESS_PROBE_MAX_RECORD_BYTES: usize =
-    core::mem::size_of::<EbpfSocketWriteSampleRecord>();
+pub const EBPF_PROCESS_PROBE_MAX_RECORD_BYTES: usize = max_record_bytes([
+    core::mem::size_of::<EbpfConnectTracepointRecord>(),
+    core::mem::size_of::<EbpfCloseTracepointRecord>(),
+    core::mem::size_of::<EbpfSocketWriteSampleRecord>(),
+    core::mem::size_of::<EbpfSocketReadSampleRecord>(),
+]);
 pub const EBPF_CONNECT_TRACEPOINT_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfConnectTracepointRecord>();
 pub const EBPF_CLOSE_TRACEPOINT_RECORD_BYTES: usize =
@@ -14,6 +18,9 @@ pub const EBPF_CLOSE_TRACEPOINT_RECORD_BYTES: usize =
 pub const EBPF_SOCKET_WRITE_SAMPLE_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfSocketWriteSampleRecord>();
 pub const EBPF_SOCKET_WRITE_SAMPLE_BYTES: usize = 256;
+pub const EBPF_SOCKET_READ_SAMPLE_RECORD_BYTES: usize =
+    core::mem::size_of::<EbpfSocketReadSampleRecord>();
+pub const EBPF_SOCKET_READ_SAMPLE_BYTES: usize = EBPF_SOCKET_WRITE_SAMPLE_BYTES;
 const EBPF_PROCESS_COMMAND_OFFSET: usize = EBPF_EVENT_HEADER_BYTES;
 const EBPF_PROCESS_COMMAND_BYTES: usize = 16;
 const EBPF_PROCESS_PROBE_PAYLOAD_OFFSET: usize =
@@ -23,9 +30,23 @@ pub const EBPF_CONNECT_SOCKADDR_READ_FAILED: u16 = 1 << 1;
 pub const EBPF_CONNECT_UNSUPPORTED_ADDRESS_FAMILY: u16 = 1 << 2;
 pub const EBPF_SOCKET_WRITE_TRUNCATED: u16 = 1 << 0;
 pub const EBPF_SOCKET_WRITE_READ_FAILED: u16 = 1 << 1;
+pub const EBPF_SOCKET_READ_TRUNCATED: u16 = 1 << 0;
+pub const EBPF_SOCKET_READ_READ_FAILED: u16 = 1 << 1;
 pub const EBPF_ADDRESS_FAMILY_UNSPEC: u16 = 0;
 pub const EBPF_ADDRESS_FAMILY_INET: u16 = 2;
 pub const EBPF_ADDRESS_FAMILY_INET6: u16 = 10;
+
+const fn max_record_bytes(record_bytes: [usize; 4]) -> usize {
+    let mut max = 0;
+    let mut index = 0;
+    while index < record_bytes.len() {
+        if record_bytes[index] > max {
+            max = record_bytes[index];
+        }
+        index += 1;
+    }
+    max
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +120,33 @@ pub struct EbpfSocketWriteSample {
     pub captured_len: u16,
     pub reserved: u16,
     pub buffer: [u8; EBPF_SOCKET_WRITE_SAMPLE_BYTES],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfSocketReadSample {
+    pub fd: i32,
+    pub original_len: u32,
+    pub captured_len: u16,
+    pub reserved: u16,
+    pub buffer: [u8; EBPF_SOCKET_READ_SAMPLE_BYTES],
+}
+
+impl EbpfSocketReadSample {
+    pub const fn new(
+        fd: i32,
+        original_len: u32,
+        captured_len: u16,
+        buffer: [u8; EBPF_SOCKET_READ_SAMPLE_BYTES],
+    ) -> Self {
+        Self {
+            fd,
+            original_len,
+            captured_len,
+            reserved: 0,
+            buffer,
+        }
+    }
 }
 
 impl EbpfSocketWriteSample {
@@ -192,6 +240,70 @@ pub struct EbpfSocketWriteSampleRecord {
     sample: EbpfSocketWriteSample,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfSocketReadSampleRecord {
+    header: EbpfEventHeader,
+    command: [u8; 16],
+    sample: EbpfSocketReadSample,
+}
+
+impl EbpfSocketReadSampleRecord {
+    pub fn socket_read_sampled(
+        pid: u32,
+        tgid: u32,
+        uid: u32,
+        gid: u32,
+        command: [u8; 16],
+        sample: EbpfSocketReadSample,
+        flags: u16,
+    ) -> Self {
+        Self {
+            header: EbpfEventHeader::new_with_flags(
+                EbpfEventKind::SocketReadSampled,
+                EBPF_SOCKET_READ_SAMPLE_RECORD_BYTES as u16,
+                flags,
+                pid,
+                tgid,
+                uid,
+                gid,
+            ),
+            command,
+            sample,
+        }
+    }
+
+    pub fn clear_sample(&mut self) {
+        self.sample = EbpfSocketReadSample::new(0, 0, 0, [0; EBPF_SOCKET_READ_SAMPLE_BYTES]);
+    }
+
+    pub fn socket_read_buffer_mut(&mut self) -> &mut [u8] {
+        &mut self.sample.buffer
+    }
+
+    pub fn overwrite_socket_read_sampled_metadata(
+        &mut self,
+        metadata: EbpfProcessProbeMetadata,
+        sample: EbpfSocketReadMetadata,
+        flags: u16,
+    ) {
+        self.header = EbpfEventHeader::new_with_flags(
+            EbpfEventKind::SocketReadSampled,
+            EBPF_SOCKET_READ_SAMPLE_RECORD_BYTES as u16,
+            flags,
+            metadata.pid,
+            metadata.tgid,
+            metadata.uid,
+            metadata.gid,
+        );
+        self.command = metadata.command;
+        self.sample.fd = sample.fd;
+        self.sample.original_len = sample.original_len;
+        self.sample.captured_len = sample.captured_len;
+        self.sample.reserved = 0;
+    }
+}
+
 impl EbpfSocketWriteSampleRecord {
     pub fn socket_write_sampled(
         pid: u32,
@@ -255,6 +367,7 @@ pub struct EbpfProcessProbeEvent {
     connect: EbpfConnectObservation,
     close: EbpfCloseObservation,
     socket_write: EbpfSocketWriteSample,
+    socket_read: EbpfSocketReadSample,
 }
 
 impl EbpfProcessProbeEvent {
@@ -271,6 +384,19 @@ impl EbpfProcessProbeEvent {
             pid, tgid, uid, gid, command, connect, flags,
         )
         .into()
+    }
+
+    pub fn socket_read_sampled(
+        pid: u32,
+        tgid: u32,
+        uid: u32,
+        gid: u32,
+        command: [u8; 16],
+        sample: EbpfSocketReadSample,
+        flags: u16,
+    ) -> Self {
+        EbpfSocketReadSampleRecord::socket_read_sampled(pid, tgid, uid, gid, command, sample, flags)
+            .into()
     }
 
     pub fn close_tracepoint_observed(
@@ -310,6 +436,13 @@ impl EbpfProcessProbeEvent {
     pub fn socket_write_sample(&self) -> Option<EbpfSocketWriteSample> {
         match self.kind() {
             Some(EbpfEventKind::SocketWriteSampled) => Some(self.socket_write),
+            _ => None,
+        }
+    }
+
+    pub fn socket_read_sample(&self) -> Option<EbpfSocketReadSample> {
+        match self.kind() {
+            Some(EbpfEventKind::SocketReadSampled) => Some(self.socket_read),
             _ => None,
         }
     }
@@ -366,6 +499,14 @@ impl From<EbpfSocketWriteSampleRecord> for EbpfProcessProbeEvent {
     }
 }
 
+impl From<EbpfSocketReadSampleRecord> for EbpfProcessProbeEvent {
+    fn from(record: EbpfSocketReadSampleRecord) -> Self {
+        let mut event = empty_process_probe_event(record.header, record.command);
+        event.socket_read = record.sample;
+        event
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EbpfProcessProbeMetadata {
     pub pid: u32,
@@ -377,6 +518,13 @@ pub struct EbpfProcessProbeMetadata {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EbpfSocketWriteMetadata {
+    pub fd: i32,
+    pub original_len: u32,
+    pub captured_len: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfSocketReadMetadata {
     pub fd: i32,
     pub original_len: u32,
     pub captured_len: u16,
@@ -451,6 +599,12 @@ pub fn encode_process_probe_event(event: &EbpfProcessProbeEvent) -> EncodedProce
                 event.socket_write,
             );
         }
+        Some(EbpfEventKind::SocketReadSampled) => {
+            encode_socket_read_sample(
+                &mut bytes[EBPF_PROCESS_PROBE_PAYLOAD_OFFSET..],
+                event.socket_read,
+            );
+        }
         Some(EbpfEventKind::LibsslPlaintextSampled) | None => {
             unreachable!("process probe event constructor should set a known process kind")
         }
@@ -474,6 +628,9 @@ fn validate_process_probe_event(
     if event.kind() == Some(EbpfEventKind::SocketWriteSampled) {
         validate_socket_write_sample(event)?;
     }
+    if event.kind() == Some(EbpfEventKind::SocketReadSampled) {
+        validate_socket_read_sample(event)?;
+    }
     Ok(event)
 }
 
@@ -483,6 +640,7 @@ fn is_process_probe_kind(kind: EbpfEventKind) -> bool {
         EbpfEventKind::ConnectTracepointObserved
             | EbpfEventKind::CloseTracepointObserved
             | EbpfEventKind::SocketWriteSampled
+            | EbpfEventKind::SocketReadSampled
     )
 }
 
@@ -491,6 +649,7 @@ fn process_record_len(kind: EbpfEventKind) -> usize {
         EbpfEventKind::ConnectTracepointObserved => EBPF_CONNECT_TRACEPOINT_RECORD_BYTES,
         EbpfEventKind::CloseTracepointObserved => EBPF_CLOSE_TRACEPOINT_RECORD_BYTES,
         EbpfEventKind::SocketWriteSampled => EBPF_SOCKET_WRITE_SAMPLE_RECORD_BYTES,
+        EbpfEventKind::SocketReadSampled => EBPF_SOCKET_READ_SAMPLE_RECORD_BYTES,
         EbpfEventKind::LibsslPlaintextSampled => unreachable!("not a process probe kind"),
     }
 }
@@ -513,6 +672,9 @@ fn decode_process_probe_payload(
         EbpfEventKind::SocketWriteSampled => {
             event.socket_write = decode_socket_write_sample(payload);
         }
+        EbpfEventKind::SocketReadSampled => {
+            event.socket_read = decode_socket_read_sample(payload);
+        }
         EbpfEventKind::LibsslPlaintextSampled => unreachable!("not a process probe kind"),
     }
     event
@@ -525,6 +687,7 @@ fn empty_process_probe_event(header: EbpfEventHeader, command: [u8; 16]) -> Ebpf
         connect: EbpfConnectObservation::unavailable(0, 0),
         close: EbpfCloseObservation::observed(0),
         socket_write: EbpfSocketWriteSample::new(0, 0, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
+        socket_read: EbpfSocketReadSample::new(0, 0, 0, [0; EBPF_SOCKET_READ_SAMPLE_BYTES]),
     }
 }
 
@@ -584,6 +747,26 @@ fn encode_socket_write_sample(bytes: &mut [u8], sample: EbpfSocketWriteSample) {
     bytes[12..12 + EBPF_SOCKET_WRITE_SAMPLE_BYTES].copy_from_slice(&sample.buffer);
 }
 
+fn decode_socket_read_sample(bytes: &[u8]) -> EbpfSocketReadSample {
+    let mut buffer = [0; EBPF_SOCKET_READ_SAMPLE_BYTES];
+    buffer.copy_from_slice(&bytes[12..12 + EBPF_SOCKET_READ_SAMPLE_BYTES]);
+    EbpfSocketReadSample {
+        fd: read_i32(bytes, 0),
+        original_len: read_u32(bytes, 4),
+        captured_len: read_u16(bytes, 8),
+        reserved: read_u16(bytes, 10),
+        buffer,
+    }
+}
+
+fn encode_socket_read_sample(bytes: &mut [u8], sample: EbpfSocketReadSample) {
+    write_i32(bytes, 0, sample.fd);
+    write_u32(bytes, 4, sample.original_len);
+    write_u16(bytes, 8, sample.captured_len);
+    write_u16(bytes, 10, sample.reserved);
+    bytes[12..12 + EBPF_SOCKET_READ_SAMPLE_BYTES].copy_from_slice(&sample.buffer);
+}
+
 fn validate_socket_write_sample(event: EbpfProcessProbeEvent) -> Result<(), EbpfEventDecodeError> {
     let Some(sample) = event.socket_write_sample() else {
         return Ok(());
@@ -617,6 +800,39 @@ fn validate_socket_write_sample(event: EbpfProcessProbeEvent) -> Result<(), Ebpf
     Ok(())
 }
 
+fn validate_socket_read_sample(event: EbpfProcessProbeEvent) -> Result<(), EbpfEventDecodeError> {
+    let Some(sample) = event.socket_read_sample() else {
+        return Ok(());
+    };
+    let captured = usize::from(sample.captured_len);
+    if captured > EBPF_SOCKET_READ_SAMPLE_BYTES {
+        return Err(EbpfEventDecodeError::InvalidSocketReadCapturedLength {
+            captured: sample.captured_len,
+            capacity: EBPF_SOCKET_READ_SAMPLE_BYTES,
+        });
+    }
+    if u32::from(sample.captured_len) > sample.original_len {
+        return Err(EbpfEventDecodeError::InvalidSocketReadOriginalLength {
+            captured: sample.captured_len,
+            original: sample.original_len,
+        });
+    }
+    if u32::from(sample.captured_len) < sample.original_len
+        && event.header.flags & (EBPF_SOCKET_READ_TRUNCATED | EBPF_SOCKET_READ_READ_FAILED) == 0
+    {
+        return Err(EbpfEventDecodeError::InvalidSocketReadIncompleteSample {
+            captured: sample.captured_len,
+            original: sample.original_len,
+        });
+    }
+    if event.header.flags & EBPF_SOCKET_READ_READ_FAILED != 0 && sample.captured_len > 0 {
+        return Err(EbpfEventDecodeError::InvalidSocketReadReadFailure {
+            captured: sample.captured_len,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use core::mem::{align_of, offset_of, size_of};
@@ -633,13 +849,18 @@ mod tests {
         assert_eq!(align_of::<EbpfCloseObservation>(), 4);
         assert_eq!(size_of::<EbpfSocketWriteSample>(), 268);
         assert_eq!(align_of::<EbpfSocketWriteSample>(), 4);
+        assert_eq!(size_of::<EbpfSocketReadSample>(), 268);
+        assert_eq!(align_of::<EbpfSocketReadSample>(), 4);
         assert_eq!(size_of::<EbpfConnectTracepointRecord>(), 88);
         assert_eq!(align_of::<EbpfConnectTracepointRecord>(), 8);
         assert_eq!(size_of::<EbpfCloseTracepointRecord>(), 56);
         assert_eq!(align_of::<EbpfCloseTracepointRecord>(), 4);
         assert_eq!(size_of::<EbpfSocketWriteSampleRecord>(), 316);
         assert_eq!(align_of::<EbpfSocketWriteSampleRecord>(), 4);
+        assert_eq!(size_of::<EbpfSocketReadSampleRecord>(), 316);
+        assert_eq!(align_of::<EbpfSocketReadSampleRecord>(), 4);
         assert_eq!(8 % align_of::<EbpfSocketWriteSampleRecord>(), 0);
+        assert_eq!(8 % align_of::<EbpfSocketReadSampleRecord>(), 0);
     }
 
     #[test]
@@ -668,6 +889,11 @@ mod tests {
         assert_eq!(offset_of!(EbpfSocketWriteSample, captured_len), 8);
         assert_eq!(offset_of!(EbpfSocketWriteSample, reserved), 10);
         assert_eq!(offset_of!(EbpfSocketWriteSample, buffer), 12);
+        assert_eq!(offset_of!(EbpfSocketReadSample, fd), 0);
+        assert_eq!(offset_of!(EbpfSocketReadSample, original_len), 4);
+        assert_eq!(offset_of!(EbpfSocketReadSample, captured_len), 8);
+        assert_eq!(offset_of!(EbpfSocketReadSample, reserved), 10);
+        assert_eq!(offset_of!(EbpfSocketReadSample, buffer), 12);
         assert_eq!(offset_of!(EbpfConnectTracepointRecord, header), 0);
         assert_eq!(offset_of!(EbpfConnectTracepointRecord, command), 32);
         assert_eq!(offset_of!(EbpfConnectTracepointRecord, connect), 48);
@@ -677,6 +903,9 @@ mod tests {
         assert_eq!(offset_of!(EbpfSocketWriteSampleRecord, header), 0);
         assert_eq!(offset_of!(EbpfSocketWriteSampleRecord, command), 32);
         assert_eq!(offset_of!(EbpfSocketWriteSampleRecord, sample), 48);
+        assert_eq!(offset_of!(EbpfSocketReadSampleRecord, header), 0);
+        assert_eq!(offset_of!(EbpfSocketReadSampleRecord, command), 32);
+        assert_eq!(offset_of!(EbpfSocketReadSampleRecord, sample), 48);
     }
 
     #[test]
@@ -822,6 +1051,67 @@ mod tests {
     }
 
     #[test]
+    fn socket_read_sampled_populates_header_fields() {
+        let event = sample_read_event(5, 5, 0);
+
+        assert_eq!(event.header.magic, EBPF_MAGIC);
+        assert_eq!(event.header.abi_revision, EBPF_ABI_REVISION);
+        assert_eq!(event.header.kind(), Some(EbpfEventKind::SocketReadSampled));
+        assert_eq!(
+            usize::from(event.header.record_len),
+            EBPF_SOCKET_READ_SAMPLE_RECORD_BYTES
+        );
+        assert_eq!(event.header.pid, 11);
+        assert_eq!(event.header.tgid, 22);
+        assert_eq!(event.header.uid, 33);
+        assert_eq!(event.header.gid, 44);
+        assert_eq!(&event.command, b"0123456789abcdef");
+        assert_eq!(event.header.flags, 0);
+        let sample = event
+            .socket_read_sample()
+            .expect("read event should expose read sample");
+        assert_eq!(sample.fd, 7);
+        assert_eq!(sample.original_len, 5);
+        assert_eq!(sample.captured_len, 5);
+        assert_eq!(&sample.buffer[..5], b"HTTP/");
+        assert!(event.connect_observation().is_none());
+        assert!(event.close_observation().is_none());
+    }
+
+    #[test]
+    fn socket_read_sampled_metadata_can_be_overwritten_in_place() {
+        let expected = sample_read_record(5, 5, 0);
+        let mut event = EbpfSocketReadSampleRecord::socket_read_sampled(
+            0,
+            0,
+            0,
+            0,
+            [0; 16],
+            EbpfSocketReadSample::new(-1, 0, 0, [0; EBPF_SOCKET_READ_SAMPLE_BYTES]),
+            0,
+        );
+        event.clear_sample();
+        event.socket_read_buffer_mut()[..5].copy_from_slice(b"HTTP/");
+        event.overwrite_socket_read_sampled_metadata(
+            EbpfProcessProbeMetadata {
+                pid: 11,
+                tgid: 22,
+                uid: 33,
+                gid: 44,
+                command: *b"0123456789abcdef",
+            },
+            EbpfSocketReadMetadata {
+                fd: 7,
+                original_len: 5,
+                captured_len: 5,
+            },
+            0,
+        );
+
+        assert_eq!(event, expected);
+    }
+
+    #[test]
     fn process_event_decodes_from_wire_bytes() {
         let event = EbpfProcessProbeEvent::connect_tracepoint_observed(
             11,
@@ -889,6 +1179,51 @@ mod tests {
         assert_eq!(
             error,
             EbpfEventDecodeError::InvalidSocketWriteReadFailure { captured: 1 }
+        );
+    }
+
+    #[test]
+    fn process_event_rejects_invalid_read_sample_lengths() {
+        let error = match decode_process_probe_event(&encode_process_probe_event(
+            &sample_read_event(5, 6, 0),
+        )) {
+            Ok(_) => panic!("captured bytes beyond original read must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            EbpfEventDecodeError::InvalidSocketReadOriginalLength {
+                captured: 6,
+                original: 5
+            }
+        );
+
+        let error = match decode_process_probe_event(&encode_process_probe_event(
+            &sample_read_event(10, 5, 0),
+        )) {
+            Ok(_) => panic!("incomplete read sample without a gap flag must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            EbpfEventDecodeError::InvalidSocketReadIncompleteSample {
+                captured: 5,
+                original: 10
+            }
+        );
+
+        let error = match decode_process_probe_event(&encode_process_probe_event(
+            &sample_read_event(5, 1, EBPF_SOCKET_READ_READ_FAILED),
+        )) {
+            Ok(_) => panic!("read failure with captured bytes must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            EbpfEventDecodeError::InvalidSocketReadReadFailure { captured: 1 }
         );
     }
 
@@ -982,6 +1317,32 @@ mod tests {
             44,
             *b"0123456789abcdef",
             EbpfSocketWriteSample::new(7, original_len, captured_len, buffer),
+            flags,
+        )
+    }
+
+    fn sample_read_event(
+        original_len: u32,
+        captured_len: u16,
+        flags: u16,
+    ) -> EbpfProcessProbeEvent {
+        sample_read_record(original_len, captured_len, flags).into()
+    }
+
+    fn sample_read_record(
+        original_len: u32,
+        captured_len: u16,
+        flags: u16,
+    ) -> EbpfSocketReadSampleRecord {
+        let mut buffer = [0; EBPF_SOCKET_READ_SAMPLE_BYTES];
+        buffer[..5].copy_from_slice(b"HTTP/");
+        EbpfSocketReadSampleRecord::socket_read_sampled(
+            11,
+            22,
+            33,
+            44,
+            *b"0123456789abcdef",
+            EbpfSocketReadSample::new(7, original_len, captured_len, buffer),
             flags,
         )
     }

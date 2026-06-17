@@ -1,9 +1,11 @@
 mod bridge;
+mod payload_authorization;
+mod payload_bridge;
+mod payload_direction;
 mod probe;
 mod provider;
 mod tracked_flow;
 mod types;
-mod write_bridge;
 
 pub use bridge::{EbpfConnectFlowLookup, EbpfConnectFlowResolver, EbpfResolvedConnectFlow};
 pub(crate) use bridge::{
@@ -16,5 +18,6 @@ pub use probe::{
 pub use provider::EbpfProcessObservationProvider;
 pub use types::{
     EbpfCloseTracepointObservation, EbpfConnectEndpoint, EbpfConnectTracepointObservation,
-    EbpfObservedProcess, EbpfProcessObservation, EbpfSocketWriteObservation,
+    EbpfObservedProcess, EbpfProcessObservation, EbpfSocketReadObservation,
+    EbpfSocketWriteObservation,
 };

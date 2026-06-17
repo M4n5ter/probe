@@ -12,9 +12,10 @@ use ebpf_abi::{
     EBPF_ADDRESS_FAMILY_INET, EBPF_ADDRESS_FAMILY_INET6, EBPF_ALLOWED_SOCKET_FDS_MAP_NAME,
     EBPF_CONNECT_REMOTE_ENDPOINT_VALID, EBPF_CONNECT_SOCKADDR_READ_FAILED,
     EBPF_CONNECT_UNSUPPORTED_ADDRESS_FAMILY, EBPF_EVENTS_MAP_NAME, EBPF_PROCESS_TRACEPOINT_SPECS,
-    EBPF_SOCKET_WRITE_READ_FAILED, EBPF_SOCKET_WRITE_TRUNCATED, EbpfConnectObservation,
-    EbpfEventDecodeError, EbpfProcessProbeEvent, EbpfProcessTracepointSpec, EbpfSocketFdKey,
-    EbpfSocketWriteSample, decode_process_probe_event,
+    EBPF_SOCKET_READ_READ_FAILED, EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_WRITE_READ_FAILED,
+    EBPF_SOCKET_WRITE_TRUNCATED, EbpfConnectObservation, EbpfEventDecodeError,
+    EbpfProcessProbeEvent, EbpfProcessTracepointSpec, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
+    EbpfSocketReadSample, EbpfSocketWriteSample, decode_process_probe_event,
 };
 use ebpf_object::{
     EbpfObjectProbe, EbpfObjectProbeConfig, EbpfObjectProbeReport, EbpfPreflightedObject,
@@ -24,7 +25,8 @@ use thiserror::Error;
 
 use super::{
     EbpfCloseTracepointObservation, EbpfConnectEndpoint, EbpfConnectTracepointObservation,
-    EbpfObservedProcess, EbpfProcessObservation, EbpfSocketWriteObservation,
+    EbpfObservedProcess, EbpfProcessObservation, EbpfSocketReadObservation,
+    EbpfSocketWriteObservation,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,15 +125,17 @@ impl EbpfProcessObservationProbe {
         decode_process_observation(&item).map(Some)
     }
 
-    pub fn allow_socket_write_sample(
+    pub fn allow_socket_payload_sample(
         &mut self,
-        pid: u32,
+        tgid: u32,
         fd: i32,
         fd_table_epoch: u64,
+        direction_mask: u8,
     ) -> Result<(), EbpfProcessObservationProbeError> {
-        let key = EbpfSocketFdKey::new(pid, fd).to_bpfel_bytes();
+        let key = EbpfSocketFdKey::new(tgid, fd).to_bpfel_bytes();
+        let allowance = EbpfSocketPayloadAllowance::new(fd_table_epoch, direction_mask);
         self.allowed_socket_fds
-            .insert(key, fd_table_epoch, 0)
+            .insert(key, allowance.to_bpfel_bytes(), 0)
             .map_err(|source| EbpfProcessObservationProbeError::Map {
                 name: EBPF_ALLOWED_SOCKET_FDS_MAP_NAME,
                 source,
@@ -139,7 +143,11 @@ impl EbpfProcessObservationProbe {
     }
 }
 
-type SocketAllowMap = AyaHashMap<MapData, [u8; 8], u64>;
+type SocketAllowMap = AyaHashMap<
+    MapData,
+    [u8; core::mem::size_of::<EbpfSocketFdKey>()],
+    [u8; core::mem::size_of::<EbpfSocketPayloadAllowance>()],
+>;
 
 fn load_and_attach_tracepoint(
     ebpf: &mut Ebpf,
@@ -247,6 +255,17 @@ fn process_observation_from_event(
                 read_failed: event.flags() & EBPF_SOCKET_WRITE_READ_FAILED != 0,
             }))
         }
+        Some(ebpf_abi::EbpfEventKind::SocketReadSampled) => {
+            let sample = socket_read_sample_from_event(&event);
+            Ok(EbpfProcessObservation::Read(EbpfSocketReadObservation {
+                process: observed_process_from_event(&event),
+                fd: sample.fd,
+                original_len: sample.original_len,
+                buffer: sample.buffer[..usize::from(sample.captured_len)].to_vec(),
+                truncated: event.flags() & EBPF_SOCKET_READ_TRUNCATED != 0,
+                read_failed: event.flags() & EBPF_SOCKET_READ_READ_FAILED != 0,
+            }))
+        }
         _ => unreachable!("decode_process_probe_event only accepts process observation events"),
     }
 }
@@ -300,6 +319,12 @@ fn socket_write_sample_from_event(event: &EbpfProcessProbeEvent) -> EbpfSocketWr
         .expect("write event kind should expose socket write sample")
 }
 
+fn socket_read_sample_from_event(event: &EbpfProcessProbeEvent) -> EbpfSocketReadSample {
+    event
+        .socket_read_sample()
+        .expect("read event kind should expose socket read sample")
+}
+
 fn remote_endpoint_from_wire(connect: EbpfConnectObservation) -> Option<TcpEndpoint> {
     let address = match connect.address_family {
         EBPF_ADDRESS_FAMILY_INET => IpAddr::V4(Ipv4Addr::new(
@@ -326,9 +351,10 @@ mod tests {
 
     use ebpf_abi::{
         EBPF_ADDRESS_FAMILY_INET, EBPF_ADDRESS_FAMILY_INET6, EBPF_CONNECT_REMOTE_ENDPOINT_VALID,
-        EBPF_CONNECT_SOCKADDR_READ_FAILED, EBPF_SOCKET_WRITE_SAMPLE_BYTES,
-        EBPF_SOCKET_WRITE_TRUNCATED, EbpfCloseObservation, EbpfConnectObservation,
-        EbpfProcessProbeEvent, EbpfSocketWriteSample,
+        EBPF_CONNECT_SOCKADDR_READ_FAILED, EBPF_SOCKET_READ_SAMPLE_BYTES,
+        EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_WRITE_SAMPLE_BYTES, EBPF_SOCKET_WRITE_TRUNCATED,
+        EbpfCloseObservation, EbpfConnectObservation, EbpfProcessProbeEvent, EbpfSocketReadSample,
+        EbpfSocketWriteSample,
     };
     use probe_core::TcpEndpoint;
 
@@ -434,6 +460,40 @@ mod tests {
                 assert_eq!(write.buffer, b"GET /");
                 assert!(write.truncated);
                 assert!(!write.read_failed);
+            }
+            observation => panic!("unexpected observation: {observation:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn process_observation_decodes_socket_read_sample() -> Result<(), Box<dyn std::error::Error>> {
+        let mut buffer = [0; EBPF_SOCKET_READ_SAMPLE_BYTES];
+        buffer[..5].copy_from_slice(b"HTTP/");
+        let event = EbpfProcessProbeEvent::socket_read_sampled(
+            11,
+            22,
+            33,
+            44,
+            nul_padded_command("curl"),
+            EbpfSocketReadSample::new(7, 10, 5, buffer),
+            EBPF_SOCKET_READ_TRUNCATED,
+        );
+
+        let observation =
+            decode_process_observation(&ebpf_abi::encode_process_probe_event(&event))?;
+        match observation {
+            EbpfProcessObservation::Read(read) => {
+                assert_eq!(read.process.pid, 11);
+                assert_eq!(read.process.tgid, 22);
+                assert_eq!(read.process.uid, 33);
+                assert_eq!(read.process.gid, 44);
+                assert_eq!(read.process.command_lossy(), "curl");
+                assert_eq!(read.fd, 7);
+                assert_eq!(read.original_len, 10);
+                assert_eq!(read.buffer, b"HTTP/");
+                assert!(read.truncated);
+                assert!(!read.read_failed);
             }
             observation => panic!("unexpected observation: {observation:?}"),
         }

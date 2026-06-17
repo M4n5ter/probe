@@ -1,7 +1,7 @@
 use std::{
     error::Error,
     fmt,
-    io::{self, Read, Write},
+    io::{self, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     thread,
     time::Duration,
@@ -154,7 +154,7 @@ fn run_client_exchange(
     connect_write_delay_ms: u64,
     post_exchange_delay_ms: u64,
 ) -> Result<ExchangeReport, Http1LoopbackError> {
-    let mut stream = TcpStream::connect(listen_addr)
+    let stream = TcpStream::connect(listen_addr)
         .map_err(|source| io_error("connect to loopback fixture server", source))?;
     configure_stream(&stream)?;
     if connect_write_delay_ms > 0 {
@@ -165,9 +165,7 @@ fn run_client_exchange(
     stream
         .shutdown(Shutdown::Write)
         .map_err(|source| io_error("half-close client write side", source))?;
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
+    let response = read_to_end_with_read_syscall(&stream)
         .map_err(|source| io_error("read HTTP fixture response", source))?;
     http::validate_response(&response, request_index, config.response_body_bytes)?;
     delay_after_exchange(post_exchange_delay_ms);
@@ -187,9 +185,7 @@ fn serve_http1(
     for request_index in 0..config.requests {
         let (mut stream, _) = accept_with_timeout(&listener)?;
         configure_stream(&stream)?;
-        let mut request = Vec::new();
-        stream
-            .read_to_end(&mut request)
+        let request = read_to_end_with_read_syscall(&stream)
             .map_err(|source| io_error("read HTTP fixture request", source))?;
         http::validate_request(&request, request_index, config.request_body_bytes)?;
         let response = http::response(request_index, config.response_body_bytes);
@@ -228,6 +224,18 @@ fn write_in_chunks(
 
 fn write_chunk_with_write_syscall(stream: &TcpStream, chunk: &[u8]) -> io::Result<usize> {
     rustix::io::write(stream, chunk).map_err(Into::into)
+}
+
+fn read_to_end_with_read_syscall(stream: &TcpStream) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = rustix::io::read(stream, &mut buffer).map_err(io::Error::from)?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
 }
 
 fn io_error(action: &'static str, source: io::Error) -> Http1LoopbackError {

@@ -7,6 +7,7 @@ pub enum EbpfProcessObservation {
     Connect(EbpfConnectTracepointObservation),
     Close(EbpfCloseTracepointObservation),
     Write(EbpfSocketWriteObservation),
+    Read(EbpfSocketReadObservation),
 }
 
 impl EbpfProcessObservation {
@@ -19,6 +20,7 @@ impl EbpfProcessObservation {
             Self::Connect(observation) => &observation.process,
             Self::Close(observation) => &observation.process,
             Self::Write(observation) => &observation.process,
+            Self::Read(observation) => &observation.process,
         }
     }
 }
@@ -60,6 +62,16 @@ pub struct EbpfCloseTracepointObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EbpfSocketWriteObservation {
+    pub process: EbpfObservedProcess,
+    pub fd: i32,
+    pub original_len: u32,
+    pub buffer: Vec<u8>,
+    pub truncated: bool,
+    pub read_failed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EbpfSocketReadObservation {
     pub process: EbpfObservedProcess,
     pub fd: i32,
     pub original_len: u32,

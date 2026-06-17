@@ -12,8 +12,8 @@ pub use ebpf::{
     EbpfConnectFlowResolver, EbpfConnectTracepointObservation, EbpfHostProbe, EbpfHostProbeConfig,
     EbpfHostProbeReport, EbpfObservedProcess, EbpfProcessObservation, EbpfProcessObservationProbe,
     EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeError,
-    EbpfProcessObservationProvider, EbpfResolvedConnectFlow, EbpfSocketWriteObservation,
-    UnprivilegedBpfStatus,
+    EbpfProcessObservationProvider, EbpfResolvedConnectFlow, EbpfSocketReadObservation,
+    EbpfSocketWriteObservation, UnprivilegedBpfStatus,
 };
 pub use event::{CaptureEvent, CapturedBytes, CapturedGap, EnforcementEvidencePropagation};
 pub use libpcap::{LibpcapConfig, LibpcapProvider};

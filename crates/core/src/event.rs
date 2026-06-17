@@ -80,7 +80,7 @@ pub enum EnforcementEvidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationOnlyReason {
-    EbpfSyscallArgumentSnapshot,
+    EbpfSyscallPayloadSnapshot,
     EbpfUnresolvedFlow,
 }
 
@@ -121,8 +121,8 @@ impl EnforcementEvidence {
 impl ObservationOnlyReason {
     pub fn description(self) -> &'static str {
         match self {
-            Self::EbpfSyscallArgumentSnapshot => {
-                "eBPF syscall argument snapshot cannot prove bytes copied by the kernel"
+            Self::EbpfSyscallPayloadSnapshot => {
+                "eBPF syscall payload snapshot cannot prove complete socket payload or application consumption"
             }
             Self::EbpfUnresolvedFlow => {
                 "eBPF observation could not be resolved to a strong flow identity"
@@ -132,7 +132,7 @@ impl ObservationOnlyReason {
 
     fn wire_name(self) -> &'static str {
         match self {
-            Self::EbpfSyscallArgumentSnapshot => "ebpf_syscall_argument_snapshot",
+            Self::EbpfSyscallPayloadSnapshot => "ebpf_syscall_payload_snapshot",
             Self::EbpfUnresolvedFlow => "ebpf_unresolved_flow",
         }
     }
@@ -628,7 +628,7 @@ mod tests {
         let first = request_event(CaptureSource::Replay, "/same");
         let second = request_event(CaptureSource::Replay, "/same").with_enforcement_evidence(
             EnforcementEvidence::observation_only(
-                ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+                ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
             ),
         );
 
@@ -639,13 +639,13 @@ mod tests {
     fn event_id_uses_stable_enforcement_evidence_reason_not_detail() {
         let first = request_event(CaptureSource::Replay, "/same").with_enforcement_evidence(
             EnforcementEvidence::observation_only_with_detail(
-                ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+                ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
                 "first detail",
             ),
         );
         let second = request_event(CaptureSource::Replay, "/same").with_enforcement_evidence(
             EnforcementEvidence::observation_only_with_detail(
-                ObservationOnlyReason::EbpfSyscallArgumentSnapshot,
+                ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
                 "second detail",
             ),
         );
