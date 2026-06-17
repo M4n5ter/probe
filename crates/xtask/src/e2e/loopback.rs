@@ -46,6 +46,8 @@ pub(crate) struct PlainHttp1LoopbackFixtureConfig {
 pub(crate) enum Http1FixtureIoMode {
     ReadWrite,
     SendRecv,
+    ReadvWritev,
+    SendmsgRecvmsg,
 }
 
 impl Http1FixtureIoMode {
@@ -53,6 +55,8 @@ impl Http1FixtureIoMode {
         match self {
             Self::ReadWrite => "read-write",
             Self::SendRecv => "send-recv",
+            Self::ReadvWritev => "readv-writev",
+            Self::SendmsgRecvmsg => "sendmsg-recvmsg",
         }
     }
 }

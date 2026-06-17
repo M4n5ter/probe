@@ -31,10 +31,13 @@ use ebpf_abi::{
 use accept::{accept_attempt_from_tracepoint, accept_observation_from_result};
 use close::close_observation_from_tracepoint;
 use connect::connect_observation_from_tracepoint;
-use read::{capture_read_sample_from_result, read_attempt_from_tracepoint};
+use read::{
+    capture_read_sample_from_result, pending_read_attempt_from_source, read_source_from_tracepoint,
+    readv_source_from_tracepoint, recvmsg_source_from_tracepoint,
+};
 use write::{
-    capture_write_sample_from_attempt, pending_write_metadata, trim_write_sample_to_result,
-    write_attempt_from_tracepoint,
+    capture_write_sample_from_source, pending_write_metadata, sendmsg_source_from_tracepoint,
+    trim_write_sample_to_result, write_source_from_tracepoint, writev_source_from_tracepoint,
 };
 
 const FCNTL_CMD_OFFSET: usize = 24;
@@ -182,6 +185,30 @@ pub fn sssa_sys_exit_sendto(ctx: TracePointContext) -> u32 {
     0
 }
 
+#[tracepoint(name = "sys_enter_writev", category = "syscalls")]
+pub fn sssa_sys_enter_writev(ctx: TracePointContext) -> u32 {
+    record_writev_attempt(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_exit_writev", category = "syscalls")]
+pub fn sssa_sys_exit_writev(ctx: TracePointContext) -> u32 {
+    emit_write_sample(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_enter_sendmsg", category = "syscalls")]
+pub fn sssa_sys_enter_sendmsg(ctx: TracePointContext) -> u32 {
+    record_sendmsg_attempt(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_exit_sendmsg", category = "syscalls")]
+pub fn sssa_sys_exit_sendmsg(ctx: TracePointContext) -> u32 {
+    emit_write_sample(ctx);
+    0
+}
+
 #[tracepoint(name = "sys_enter_read", category = "syscalls")]
 pub fn sssa_sys_enter_read(ctx: TracePointContext) -> u32 {
     record_read_attempt(ctx);
@@ -202,6 +229,30 @@ pub fn sssa_sys_enter_recvfrom(ctx: TracePointContext) -> u32 {
 
 #[tracepoint(name = "sys_exit_recvfrom", category = "syscalls")]
 pub fn sssa_sys_exit_recvfrom(ctx: TracePointContext) -> u32 {
+    emit_read_sample(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_enter_readv", category = "syscalls")]
+pub fn sssa_sys_enter_readv(ctx: TracePointContext) -> u32 {
+    record_readv_attempt(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_exit_readv", category = "syscalls")]
+pub fn sssa_sys_exit_readv(ctx: TracePointContext) -> u32 {
+    emit_read_sample(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_enter_recvmsg", category = "syscalls")]
+pub fn sssa_sys_enter_recvmsg(ctx: TracePointContext) -> u32 {
+    record_recvmsg_attempt(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_exit_recvmsg", category = "syscalls")]
+pub fn sssa_sys_exit_recvmsg(ctx: TracePointContext) -> u32 {
     emit_read_sample(ctx);
     0
 }
@@ -275,16 +326,36 @@ fn emit_close_attempt(ctx: TracePointContext) {
 }
 
 fn record_write_attempt(ctx: TracePointContext) {
-    let Some(attempt) = write_attempt_from_tracepoint(&ctx) else {
+    let Some(source) = write_source_from_tracepoint(&ctx) else {
         return;
     };
-    if !is_allowed_socket_payload(attempt.fd, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE) {
+    record_write_payload_attempt(source);
+}
+
+fn record_writev_attempt(ctx: TracePointContext) {
+    let Some(source) = writev_source_from_tracepoint(&ctx) else {
+        return;
+    };
+    record_write_payload_attempt(source);
+}
+
+fn record_sendmsg_attempt(ctx: TracePointContext) {
+    let Some(source) = sendmsg_source_from_tracepoint(&ctx) else {
+        return;
+    };
+    record_write_payload_attempt(source);
+}
+
+fn record_write_payload_attempt(source: payload::PayloadAttemptSource) {
+    if !is_allowed_socket_payload(source.fd, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE) {
         return;
     }
     let Some(pending) = pending_write_scratch() else {
         return;
     };
-    capture_write_sample_from_attempt(attempt, pending);
+    if capture_write_sample_from_source(source, pending).is_none() {
+        return;
+    }
     let key = bpf_get_current_pid_tgid();
     let _ = SSSA_PENDING_WRITES.insert(&key, pending, 0);
 }
@@ -322,12 +393,33 @@ fn emit_write_sample(ctx: TracePointContext) {
 }
 
 fn record_read_attempt(ctx: TracePointContext) {
-    let Some(attempt) = read_attempt_from_tracepoint(&ctx) else {
+    let Some(source) = read_source_from_tracepoint(&ctx) else {
         return;
     };
-    if !is_allowed_socket_payload(attempt.fd, EBPF_SOCKET_PAYLOAD_ALLOW_READ) {
+    record_read_payload_attempt(source);
+}
+
+fn record_readv_attempt(ctx: TracePointContext) {
+    let Some(source) = readv_source_from_tracepoint(&ctx) else {
+        return;
+    };
+    record_read_payload_attempt(source);
+}
+
+fn record_recvmsg_attempt(ctx: TracePointContext) {
+    let Some(source) = recvmsg_source_from_tracepoint(&ctx) else {
+        return;
+    };
+    record_read_payload_attempt(source);
+}
+
+fn record_read_payload_attempt(source: payload::PayloadAttemptSource) {
+    if !is_allowed_socket_payload(source.fd, EBPF_SOCKET_PAYLOAD_ALLOW_READ) {
         return;
     }
+    let Some(attempt) = pending_read_attempt_from_source(source) else {
+        return;
+    };
     let key = bpf_get_current_pid_tgid();
     let _ = SSSA_PENDING_READS.insert(&key, &attempt, 0);
 }

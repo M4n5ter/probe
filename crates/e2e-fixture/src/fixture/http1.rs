@@ -1,6 +1,8 @@
 use std::{
     error::Error,
     fmt, io,
+    io::{IoSlice, IoSliceMut},
+    mem::MaybeUninit,
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     thread,
     time::Duration,
@@ -29,6 +31,8 @@ pub(crate) enum Http1IoMode {
     #[default]
     ReadWrite,
     SendRecv,
+    ReadvWritev,
+    SendmsgRecvmsg,
 }
 
 impl Http1IoMode {
@@ -36,6 +40,8 @@ impl Http1IoMode {
         match self {
             Self::ReadWrite => "read-write",
             Self::SendRecv => "send-recv",
+            Self::ReadvWritev => "readv-writev",
+            Self::SendmsgRecvmsg => "sendmsg-recvmsg",
         }
     }
 
@@ -43,6 +49,8 @@ impl Http1IoMode {
         match value {
             "read-write" => Some(Self::ReadWrite),
             "send-recv" => Some(Self::SendRecv),
+            "readv-writev" => Some(Self::ReadvWritev),
+            "sendmsg-recvmsg" => Some(Self::SendmsgRecvmsg),
             _ => None,
         }
     }
@@ -280,8 +288,21 @@ fn write_in_chunks(
 fn write_chunk(stream: &TcpStream, chunk: &[u8], io_mode: Http1IoMode) -> io::Result<usize> {
     match io_mode {
         Http1IoMode::ReadWrite => rustix::io::write(stream, chunk).map_err(Into::into),
+        Http1IoMode::ReadvWritev => {
+            rustix::io::writev(stream, &[IoSlice::new(chunk)]).map_err(Into::into)
+        }
         Http1IoMode::SendRecv => {
             rustix::net::send(stream, chunk, rustix::net::SendFlags::empty()).map_err(Into::into)
+        }
+        Http1IoMode::SendmsgRecvmsg => {
+            let mut control = rustix::net::SendAncillaryBuffer::default();
+            rustix::net::sendmsg(
+                stream,
+                &[IoSlice::new(chunk)],
+                &mut control,
+                rustix::net::SendFlags::empty(),
+            )
+            .map_err(Into::into)
         }
     }
 }
@@ -301,10 +322,25 @@ fn read_to_end(stream: &TcpStream, io_mode: Http1IoMode) -> io::Result<Vec<u8>> 
 fn read_chunk(stream: &TcpStream, buffer: &mut [u8], io_mode: Http1IoMode) -> io::Result<usize> {
     match io_mode {
         Http1IoMode::ReadWrite => rustix::io::read(stream, buffer).map_err(io::Error::from),
+        Http1IoMode::ReadvWritev => {
+            rustix::io::readv(stream, &mut [IoSliceMut::new(buffer)]).map_err(io::Error::from)
+        }
         Http1IoMode::SendRecv => {
             let (read, _) = rustix::net::recv(stream, buffer, rustix::net::RecvFlags::empty())
                 .map_err(io::Error::from)?;
             Ok(read)
+        }
+        Http1IoMode::SendmsgRecvmsg => {
+            let mut control_space: [MaybeUninit<u8>; 0] = [];
+            let mut control = rustix::net::RecvAncillaryBuffer::new(&mut control_space);
+            let received = rustix::net::recvmsg(
+                stream,
+                &mut [IoSliceMut::new(buffer)],
+                &mut control,
+                rustix::net::RecvFlags::empty(),
+            )
+            .map_err(io::Error::from)?;
+            Ok(received.bytes)
         }
     }
 }
@@ -445,6 +481,28 @@ mod tests {
         assert_eq!(report.io_mode, Http1IoMode::SendRecv);
         assert_eq!(report.client_bytes_written, report.server_bytes_read);
         assert_eq!(report.client_bytes_read, report.server_bytes_written);
+        Ok(())
+    }
+
+    #[test]
+    fn http1_loopback_runs_with_vector_syscalls() -> Result<(), Box<dyn Error>> {
+        for io_mode in [Http1IoMode::ReadvWritev, Http1IoMode::SendmsgRecvmsg] {
+            let report = run_http1_loopback(Http1LoopbackConfig {
+                traffic: HttpTrafficConfig {
+                    requests: 1,
+                    request_body_bytes: 64,
+                    response_body_bytes: 32,
+                    write_chunks: 2,
+                },
+                run: LoopbackRunOptions::default(),
+                io_mode,
+                accept_read_delay_ms: 0,
+            })?;
+
+            assert_eq!(report.io_mode, io_mode);
+            assert_eq!(report.client_bytes_written, report.server_bytes_read);
+            assert_eq!(report.client_bytes_read, report.server_bytes_written);
+        }
         Ok(())
     }
 

@@ -52,7 +52,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     ensure_e2e_packages_built(["agent", "e2e-fixture"])?;
     let ebpf_object_path = crate::ebpf::ensure_process_artifact_ready().map_err(e2e_error)?;
 
-    for io_mode in [Http1FixtureIoMode::ReadWrite, Http1FixtureIoMode::SendRecv] {
+    for io_mode in [
+        Http1FixtureIoMode::ReadWrite,
+        Http1FixtureIoMode::SendRecv,
+        Http1FixtureIoMode::ReadvWritev,
+        Http1FixtureIoMode::SendmsgRecvmsg,
+    ] {
         let root = create_temp_root(io_mode_temp_name(io_mode))?;
         match run_at(&root, &ebpf_object_path, io_mode) {
             Ok(()) => {
@@ -73,6 +78,8 @@ fn io_mode_temp_name(io_mode: Http1FixtureIoMode) -> &'static str {
     match io_mode {
         Http1FixtureIoMode::ReadWrite => "ebpf-process-loopback-read-write",
         Http1FixtureIoMode::SendRecv => "ebpf-process-loopback-send-recv",
+        Http1FixtureIoMode::ReadvWritev => "ebpf-process-loopback-readv-writev",
+        Http1FixtureIoMode::SendmsgRecvmsg => "ebpf-process-loopback-sendmsg-recvmsg",
     }
 }
 

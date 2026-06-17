@@ -5,26 +5,61 @@ use ebpf_abi::{
 };
 
 use super::payload::{
-    SingleBufferPayloadAttempt, clamp_u64_to_u32, read_user_payload_prefix,
-    single_buffer_payload_attempt_from_tracepoint, syscall_result_from_tracepoint,
+    PayloadAttemptSource, PayloadBufferAttempt, PayloadLogicalLen, clamp_u64_to_u32,
+    iovec_payload_source_from_tracepoint, msghdr_payload_source_from_tracepoint,
+    payload_attempt_from_source, read_user_payload_prefix,
+    single_buffer_payload_source_from_tracepoint, syscall_result_from_tracepoint,
 };
 
-pub(crate) fn write_attempt_from_tracepoint(
+pub(crate) fn write_source_from_tracepoint(
     ctx: &TracePointContext,
-) -> Option<SingleBufferPayloadAttempt> {
-    single_buffer_payload_attempt_from_tracepoint(ctx)
+) -> Option<PayloadAttemptSource> {
+    single_buffer_payload_source_from_tracepoint(ctx)
 }
 
-pub(crate) fn capture_write_sample_from_attempt(
-    attempt: SingleBufferPayloadAttempt,
+pub(crate) fn writev_source_from_tracepoint(
+    ctx: &TracePointContext,
+) -> Option<PayloadAttemptSource> {
+    iovec_payload_source_from_tracepoint(ctx)
+}
+
+pub(crate) fn sendmsg_source_from_tracepoint(
+    ctx: &TracePointContext,
+) -> Option<PayloadAttemptSource> {
+    msghdr_payload_source_from_tracepoint(ctx)
+}
+
+pub(crate) fn capture_write_sample_from_source(
+    source: PayloadAttemptSource,
+    pending: &mut EbpfPendingSocketWriteSample,
+) -> Option<()> {
+    let attempt = payload_attempt_from_source(source)?;
+    capture_write_sample_from_attempt(attempt, pending);
+    Some(())
+}
+
+fn capture_write_sample_from_attempt(
+    attempt: PayloadBufferAttempt,
     pending: &mut EbpfPendingSocketWriteSample,
 ) {
-    let original_len = clamp_u64_to_u32(attempt.requested_len);
+    let readable_len = clamp_u64_to_u32(attempt.readable_len);
     let mut flags = 0;
-    reset_pending_write_sample(pending, attempt.fd, original_len, 0, flags);
+    let pending_original_len = match attempt.logical_len {
+        PayloadLogicalLen::Known(logical_len) => clamp_u64_to_u32(logical_len),
+        PayloadLogicalLen::UnknownUntilExit => {
+            flags |= EBPF_SOCKET_WRITE_TRUNCATED;
+            0
+        }
+    };
+    let capture_logical_len = match attempt.logical_len {
+        PayloadLogicalLen::Known(logical_len) => clamp_u64_to_u32(logical_len),
+        PayloadLogicalLen::UnknownUntilExit => readable_len,
+    };
+    reset_pending_write_sample(pending, attempt.fd, pending_original_len, 0, flags);
     pending.captured_len = read_user_payload_prefix(
         attempt.user_buffer,
-        original_len,
+        readable_len,
+        capture_logical_len,
         &mut pending.buffer,
         &mut flags,
         EBPF_SOCKET_WRITE_TRUNCATED,
@@ -50,7 +85,11 @@ fn trim_write_sample_to_returned_len(
     }
     let read_failed = pending.flags & EBPF_SOCKET_WRITE_READ_FAILED != 0;
     let previous = pending_write_metadata(pending);
-    let written_len = core::cmp::min(returned_len as u64, u64::from(previous.original_len));
+    let written_len = if previous.original_len == 0 {
+        returned_len as u64
+    } else {
+        core::cmp::min(returned_len as u64, u64::from(previous.original_len))
+    };
     let original_len = clamp_u64_to_u32(written_len);
     if original_len == 0 {
         return None;
@@ -145,6 +184,17 @@ mod tests {
         assert_eq!(pending.captured_len, 0);
         assert!(pending.buffer.iter().all(|byte| *byte == 0));
         assert_eq!(pending.flags, EBPF_SOCKET_WRITE_READ_FAILED);
+    }
+
+    #[test]
+    fn trim_write_sample_keeps_vector_gap_when_no_prefix_was_read() {
+        let mut pending = pending_write(0, b"", EBPF_SOCKET_WRITE_TRUNCATED);
+
+        trim_write_sample_to_returned_len(&mut pending, 9).expect("positive write finalizes");
+
+        assert_eq!(pending.original_len, 9);
+        assert_eq!(pending.captured_len, 0);
+        assert_eq!(pending.flags, EBPF_SOCKET_WRITE_TRUNCATED);
     }
 
     #[test]

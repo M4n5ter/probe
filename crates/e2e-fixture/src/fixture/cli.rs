@@ -22,7 +22,7 @@ Options:
   --request-body-bytes N
   --response-body-bytes N
   --write-chunks N
-  --io-mode read-write|send-recv  (http1-loopback only)
+  --io-mode read-write|send-recv|readv-writev|sendmsg-recvmsg  (http1-loopback only)
   --connect-write-delay-ms N
   --accept-read-delay-ms N       (http1-loopback only)
   --post-exchange-delay-ms N
@@ -203,7 +203,7 @@ fn parse_http_loopback_args(
                 reject_plain_http_option(plain_http_options, &option)?;
                 io_mode = Some(Http1IoMode::parse(&value).ok_or_else(|| {
                     FixtureError::usage(format!(
-                        "invalid value for {option}: {value}; expected read-write or send-recv\n\n{USAGE}"
+                        "invalid value for {option}: {value}; expected read-write, send-recv, readv-writev, or sendmsg-recvmsg\n\n{USAGE}"
                     ))
                 })?);
             }
@@ -337,6 +337,17 @@ mod tests {
         let config = parse_http1_loopback(["--io-mode".to_string(), "send-recv".to_string()])?;
 
         assert_eq!(config.io_mode, Http1IoMode::SendRecv);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_parses_vector_http_io_modes() -> Result<(), Box<dyn Error>> {
+        let readv = parse_http1_loopback(["--io-mode".to_string(), "readv-writev".to_string()])?;
+        let sendmsg =
+            parse_http1_loopback(["--io-mode".to_string(), "sendmsg-recvmsg".to_string()])?;
+
+        assert_eq!(readv.io_mode, Http1IoMode::ReadvWritev);
+        assert_eq!(sendmsg.io_mode, Http1IoMode::SendmsgRecvmsg);
         Ok(())
     }
 

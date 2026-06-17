@@ -51,24 +51,48 @@ pub const EBPF_WRITE_ENTER_TRACEPOINT_NAME: &str = "sys_enter_write";
 pub const EBPF_WRITE_EXIT_PROGRAM_NAME: &str = "sssa_sys_exit_write";
 pub const EBPF_WRITE_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
 pub const EBPF_WRITE_EXIT_TRACEPOINT_NAME: &str = "sys_exit_write";
+pub const EBPF_WRITEV_ENTER_PROGRAM_NAME: &str = "sssa_sys_enter_writev";
+pub const EBPF_WRITEV_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_WRITEV_ENTER_TRACEPOINT_NAME: &str = "sys_enter_writev";
+pub const EBPF_WRITEV_EXIT_PROGRAM_NAME: &str = "sssa_sys_exit_writev";
+pub const EBPF_WRITEV_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_WRITEV_EXIT_TRACEPOINT_NAME: &str = "sys_exit_writev";
 pub const EBPF_SENDTO_ENTER_PROGRAM_NAME: &str = "sssa_sys_enter_sendto";
 pub const EBPF_SENDTO_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
 pub const EBPF_SENDTO_ENTER_TRACEPOINT_NAME: &str = "sys_enter_sendto";
 pub const EBPF_SENDTO_EXIT_PROGRAM_NAME: &str = "sssa_sys_exit_sendto";
 pub const EBPF_SENDTO_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
 pub const EBPF_SENDTO_EXIT_TRACEPOINT_NAME: &str = "sys_exit_sendto";
+pub const EBPF_SENDMSG_ENTER_PROGRAM_NAME: &str = "sssa_sys_enter_sendmsg";
+pub const EBPF_SENDMSG_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_SENDMSG_ENTER_TRACEPOINT_NAME: &str = "sys_enter_sendmsg";
+pub const EBPF_SENDMSG_EXIT_PROGRAM_NAME: &str = "sssa_sys_exit_sendmsg";
+pub const EBPF_SENDMSG_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_SENDMSG_EXIT_TRACEPOINT_NAME: &str = "sys_exit_sendmsg";
 pub const EBPF_READ_ENTER_PROGRAM_NAME: &str = "sssa_sys_enter_read";
 pub const EBPF_READ_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
 pub const EBPF_READ_ENTER_TRACEPOINT_NAME: &str = "sys_enter_read";
 pub const EBPF_READ_EXIT_PROGRAM_NAME: &str = "sssa_sys_exit_read";
 pub const EBPF_READ_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
 pub const EBPF_READ_EXIT_TRACEPOINT_NAME: &str = "sys_exit_read";
+pub const EBPF_READV_ENTER_PROGRAM_NAME: &str = "sssa_sys_enter_readv";
+pub const EBPF_READV_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_READV_ENTER_TRACEPOINT_NAME: &str = "sys_enter_readv";
+pub const EBPF_READV_EXIT_PROGRAM_NAME: &str = "sssa_sys_exit_readv";
+pub const EBPF_READV_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_READV_EXIT_TRACEPOINT_NAME: &str = "sys_exit_readv";
 pub const EBPF_RECVFROM_ENTER_PROGRAM_NAME: &str = "sssa_sys_enter_recvfrom";
 pub const EBPF_RECVFROM_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
 pub const EBPF_RECVFROM_ENTER_TRACEPOINT_NAME: &str = "sys_enter_recvfrom";
 pub const EBPF_RECVFROM_EXIT_PROGRAM_NAME: &str = "sssa_sys_exit_recvfrom";
 pub const EBPF_RECVFROM_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
 pub const EBPF_RECVFROM_EXIT_TRACEPOINT_NAME: &str = "sys_exit_recvfrom";
+pub const EBPF_RECVMSG_ENTER_PROGRAM_NAME: &str = "sssa_sys_enter_recvmsg";
+pub const EBPF_RECVMSG_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_RECVMSG_ENTER_TRACEPOINT_NAME: &str = "sys_enter_recvmsg";
+pub const EBPF_RECVMSG_EXIT_PROGRAM_NAME: &str = "sssa_sys_exit_recvmsg";
+pub const EBPF_RECVMSG_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_RECVMSG_EXIT_TRACEPOINT_NAME: &str = "sys_exit_recvmsg";
 pub const EBPF_ALLOWED_SOCKET_FDS_MAP_NAME: &str = "SSSA_ALLOWED_SOCKET_FDS";
 pub const EBPF_ALLOWED_SOCKET_FDS_MAX_ENTRIES: u32 = 8192;
 pub const EBPF_ALLOWED_SOCKET_FD_KEY_BYTES: u32 = core::mem::size_of::<EbpfSocketFdKey>() as u32;
@@ -110,8 +134,9 @@ pub const EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES: u32 = 1;
 pub const EBPF_PROCESS_READ_EVENT_SCRATCH_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
 pub const EBPF_PROCESS_READ_EVENT_SCRATCH_VALUE_BYTES: u32 =
     core::mem::size_of::<EbpfSocketReadSampleRecord>() as u32;
+pub const EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN: u32 = 1;
 
-pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 21] = [
+pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 29] = [
     EbpfProcessTracepointSpec {
         role: EbpfProcessTracepointRole::ConnectEnter,
         program_name: EBPF_CONNECT_PROGRAM_NAME,
@@ -203,6 +228,18 @@ pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 21] = [
         tracepoint_name: EBPF_WRITE_EXIT_TRACEPOINT_NAME,
     },
     EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::WritevEnter,
+        program_name: EBPF_WRITEV_ENTER_PROGRAM_NAME,
+        category: EBPF_WRITEV_ENTER_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_WRITEV_ENTER_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::WritevExit,
+        program_name: EBPF_WRITEV_EXIT_PROGRAM_NAME,
+        category: EBPF_WRITEV_EXIT_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_WRITEV_EXIT_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
         role: EbpfProcessTracepointRole::SendtoEnter,
         program_name: EBPF_SENDTO_ENTER_PROGRAM_NAME,
         category: EBPF_SENDTO_ENTER_TRACEPOINT_CATEGORY,
@@ -213,6 +250,18 @@ pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 21] = [
         program_name: EBPF_SENDTO_EXIT_PROGRAM_NAME,
         category: EBPF_SENDTO_EXIT_TRACEPOINT_CATEGORY,
         tracepoint_name: EBPF_SENDTO_EXIT_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::SendmsgEnter,
+        program_name: EBPF_SENDMSG_ENTER_PROGRAM_NAME,
+        category: EBPF_SENDMSG_ENTER_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_SENDMSG_ENTER_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::SendmsgExit,
+        program_name: EBPF_SENDMSG_EXIT_PROGRAM_NAME,
+        category: EBPF_SENDMSG_EXIT_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_SENDMSG_EXIT_TRACEPOINT_NAME,
     },
     EbpfProcessTracepointSpec {
         role: EbpfProcessTracepointRole::ReadEnter,
@@ -227,6 +276,18 @@ pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 21] = [
         tracepoint_name: EBPF_READ_EXIT_TRACEPOINT_NAME,
     },
     EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::ReadvEnter,
+        program_name: EBPF_READV_ENTER_PROGRAM_NAME,
+        category: EBPF_READV_ENTER_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_READV_ENTER_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::ReadvExit,
+        program_name: EBPF_READV_EXIT_PROGRAM_NAME,
+        category: EBPF_READV_EXIT_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_READV_EXIT_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
         role: EbpfProcessTracepointRole::RecvfromEnter,
         program_name: EBPF_RECVFROM_ENTER_PROGRAM_NAME,
         category: EBPF_RECVFROM_ENTER_TRACEPOINT_CATEGORY,
@@ -237,6 +298,18 @@ pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 21] = [
         program_name: EBPF_RECVFROM_EXIT_PROGRAM_NAME,
         category: EBPF_RECVFROM_EXIT_TRACEPOINT_CATEGORY,
         tracepoint_name: EBPF_RECVFROM_EXIT_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::RecvmsgEnter,
+        program_name: EBPF_RECVMSG_ENTER_PROGRAM_NAME,
+        category: EBPF_RECVMSG_ENTER_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_RECVMSG_ENTER_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::RecvmsgExit,
+        program_name: EBPF_RECVMSG_EXIT_PROGRAM_NAME,
+        category: EBPF_RECVMSG_EXIT_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_RECVMSG_EXIT_TRACEPOINT_NAME,
     },
 ];
 
@@ -365,12 +438,20 @@ pub enum EbpfProcessTracepointRole {
     ProcessExec,
     WriteEnter,
     WriteExit,
+    WritevEnter,
+    WritevExit,
     SendtoEnter,
     SendtoExit,
+    SendmsgEnter,
+    SendmsgExit,
     ReadEnter,
     ReadExit,
+    ReadvEnter,
+    ReadvExit,
     RecvfromEnter,
     RecvfromExit,
+    RecvmsgEnter,
+    RecvmsgExit,
 }
 
 impl EbpfProcessTracepointRole {
@@ -471,6 +552,8 @@ pub struct EbpfPendingSocketWriteSample {
 pub struct EbpfPendingSocketReadAttempt {
     pub fd: i32,
     pub requested_len: u32,
+    pub readable_len: u32,
+    pub logical_len_flags: u32,
     pub user_buffer: u64,
 }
 
@@ -561,7 +644,7 @@ mod tests {
 
     #[test]
     fn process_tracepoint_specs_are_complete() {
-        assert_eq!(EBPF_PROCESS_TRACEPOINT_SPECS.len(), 21);
+        assert_eq!(EBPF_PROCESS_TRACEPOINT_SPECS.len(), 29);
         assert_unique(EBPF_PROCESS_TRACEPOINT_SPECS.map(|spec| spec.program_name));
         assert_unique(EBPF_PROCESS_TRACEPOINT_SPECS.map(|spec| spec.tracepoint_name));
 
@@ -616,11 +699,16 @@ mod tests {
 
     #[test]
     fn pending_socket_read_attempt_layout_is_stable() {
-        assert_eq!(size_of::<EbpfPendingSocketReadAttempt>(), 16);
+        assert_eq!(size_of::<EbpfPendingSocketReadAttempt>(), 24);
         assert_eq!(align_of::<EbpfPendingSocketReadAttempt>(), 8);
         assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, fd), 0);
         assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, requested_len), 4);
-        assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, user_buffer), 8);
+        assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, readable_len), 8);
+        assert_eq!(
+            offset_of!(EbpfPendingSocketReadAttempt, logical_len_flags),
+            12
+        );
+        assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, user_buffer), 16);
     }
 
     fn process_map(name: &'static str) -> EbpfMapSpec {
