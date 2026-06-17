@@ -89,7 +89,7 @@ fn provider_registry_for_runtimes(
 #[cfg(test)]
 mod tests {
     use probe_config::{CaptureSelection, TransparentInterceptionStrategyConfig};
-    use probe_core::{EnforcementMode, ProcessSelector, Selector, TrafficSelector};
+    use probe_core::{Direction, EnforcementMode, ProcessSelector, Selector, TrafficSelector};
 
     use super::*;
 
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn transparent_interception_surface_has_no_executable_backend() {
+    fn process_scoped_transparent_interception_setup_fails_closed() {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -127,5 +127,29 @@ mod tests {
                 .to_string()
                 .contains("process constraints cannot be represented")
         );
+    }
+
+    #[test]
+    fn outbound_mitm_runtime_fails_closed_until_proxy_lifecycle_exists() {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let error = match build_runtime_composition(config) {
+            Ok(_) => panic!("outbound MITM must not be executable without proxy lifecycle"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("proxy self-bypass"));
     }
 }

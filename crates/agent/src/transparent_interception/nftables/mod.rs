@@ -9,7 +9,7 @@ use probe_core::Selector;
 
 use self::{
     command::{SystemIp, SystemNft},
-    plan::NftablesInterceptionPlan,
+    plan::InboundTproxyLifecyclePlan,
     probe::{NftablesInterceptionProbe, NftablesInterceptionProbeResult},
 };
 use super::TransparentInterceptionRuntime;
@@ -20,7 +20,7 @@ pub(super) fn resolve(
     config: &EnforcementInterceptionConfig,
     setup_selector: Option<&Selector>,
 ) -> TransparentInterceptionRuntime {
-    match NftablesInterceptionPlan::from_config_and_scope(config, setup_selector) {
+    match InboundTproxyLifecyclePlan::from_config_and_scope(config, setup_selector) {
         Ok(_) => {}
         Err(error) => return TransparentInterceptionRuntime::unavailable(error.to_string()),
     }
@@ -50,7 +50,7 @@ pub(super) fn validate_setup_scope(
     config: &EnforcementInterceptionConfig,
     setup_selector: Option<&Selector>,
 ) -> Result<(), super::TransparentInterceptionError> {
-    NftablesInterceptionPlan::from_config_and_scope(config, setup_selector)
+    InboundTproxyLifecyclePlan::from_config_and_scope(config, setup_selector)
         .map(|_| ())
         .map_err(|error| super::TransparentInterceptionError::Nftables(error.to_string()))
 }

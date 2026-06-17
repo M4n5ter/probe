@@ -1,7 +1,7 @@
 use super::{
     command::{CommandResult, IpCommand, NftCommand},
     owner_lock::{NftablesOwnerLock, NftablesOwnerLockGuard, SystemNftablesOwnerLock},
-    plan::NftablesInterceptionPlan,
+    plan::InboundTproxyLifecyclePlan,
 };
 use crate::transparent_interception::TransparentInterceptionError;
 use probe_config::EnforcementInterceptionConfig;
@@ -59,9 +59,11 @@ impl NftablesTransparentInterception {
             effective_enforcement_selector,
             self.config.selector.as_ref(),
         );
-        let plan =
-            NftablesInterceptionPlan::from_config_and_scope(&self.config, setup_selector.as_ref())
-                .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
+        let plan = InboundTproxyLifecyclePlan::from_config_and_scope(
+            &self.config,
+            setup_selector.as_ref(),
+        )
+        .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
         let setup_script = plan.setup_nft_script();
         check_nft_script(self.nft.as_mut(), &setup_script)?;
         let owner_lock = self.owner_lock.acquire(plan.owner_name())?;
@@ -83,7 +85,7 @@ impl NftablesTransparentInterception {
 
     fn install_policy_routes(
         &mut self,
-        plan: &NftablesInterceptionPlan,
+        plan: &InboundTproxyLifecyclePlan,
     ) -> Result<(), TransparentInterceptionError> {
         if plan.setup_ip_commands().is_empty() {
             return Ok(());
@@ -99,12 +101,12 @@ impl NftablesTransparentInterception {
         Ok(())
     }
 
-    fn cleanup_previous_owned_state_best_effort(&mut self, plan: &NftablesInterceptionPlan) {
+    fn cleanup_previous_owned_state_best_effort(&mut self, plan: &InboundTproxyLifecyclePlan) {
         let _ = apply_nft_script(self.nft.as_mut(), &plan.cleanup_nft_script(), "nft cleanup");
         self.cleanup_ip_commands_best_effort(plan.cleanup_all_ip_commands());
     }
 
-    fn cleanup_active_plan_best_effort(&mut self, plan: &NftablesInterceptionPlan) {
+    fn cleanup_active_plan_best_effort(&mut self, plan: &InboundTproxyLifecyclePlan) {
         let _ = apply_nft_script(self.nft.as_mut(), &plan.cleanup_nft_script(), "nft cleanup");
         self.cleanup_ip_commands_best_effort(plan.cleanup_ip_commands());
     }
@@ -121,7 +123,7 @@ impl NftablesTransparentInterception {
 
 pub(in crate::transparent_interception) struct NftablesTransparentInterceptionGuard {
     inner: Option<NftablesTransparentInterception>,
-    plan: NftablesInterceptionPlan,
+    plan: InboundTproxyLifecyclePlan,
     owner_lock: Option<NftablesOwnerLockGuard>,
 }
 
@@ -289,6 +291,32 @@ mod tests {
     }
 
     #[test]
+    fn outbound_mitm_activation_fails_before_host_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nft = FakeNft::succeeding();
+        let ip = FakeIp::succeeding();
+        let config = outbound_config();
+        let selector = outbound_selector();
+
+        let error = match NftablesTransparentInterception::new_for_test(
+            config,
+            nft.clone(),
+            Some(ip.clone()),
+        )
+        .activate(Some(&selector))
+        {
+            Ok(_) => panic!("outbound MITM lifecycle must fail closed before host mutation"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("supports inbound TPROXY only"));
+        assert!(nft.checked_scripts().is_empty());
+        assert!(nft.scripts().is_empty());
+        assert!(ip.args().is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn guard_drop_attempts_cleanup_when_deactivate_is_not_called()
     -> Result<(), Box<dyn std::error::Error>> {
         let nft = FakeNft::succeeding();
@@ -450,12 +478,33 @@ mod tests {
         }
     }
 
+    fn outbound_config() -> EnforcementInterceptionConfig {
+        EnforcementInterceptionConfig {
+            strategy: TransparentInterceptionStrategyConfig::OutboundMitm,
+            selector: None,
+            proxy: TransparentInterceptionProxyConfig {
+                listen_port: Some(15001),
+            },
+        }
+    }
+
     fn setup_selector() -> Selector {
         Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
                 local_ports: vec![8443],
                 directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        )
+    }
+
+    fn outbound_selector() -> Selector {
+        Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
                 ..TrafficSelector::default()
             },
         )

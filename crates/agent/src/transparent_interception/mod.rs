@@ -8,6 +8,8 @@ use probe_core::Selector;
 pub(crate) use error::TransparentInterceptionError;
 pub(crate) use runtime::{TransparentInterceptionGuard, TransparentInterceptionRuntime};
 
+const OUTBOUND_MITM_UNAVAILABLE: &str = "outbound transparent MITM requires proxy self-bypass and MITM lifecycle before rules can be installed";
+
 pub(crate) fn resolve(
     config: &EnforcementInterceptionConfig,
     enforcement_selector: Option<&Selector>,
@@ -21,9 +23,7 @@ pub(crate) fn resolve(
             effective_setup_selector(enforcement_selector, config.selector.as_ref()).as_ref(),
         ),
         TransparentInterceptionStrategyConfig::OutboundMitm => {
-            TransparentInterceptionRuntime::unavailable(
-                "outbound transparent MITM requires proxy self-bypass and MITM lifecycle before rules can be installed",
-            )
+            TransparentInterceptionRuntime::unavailable(OUTBOUND_MITM_UNAVAILABLE)
         }
     }
 }
@@ -37,7 +37,7 @@ pub(crate) fn validate_setup_scope(
     }
     if config.strategy == TransparentInterceptionStrategyConfig::OutboundMitm {
         return Err(TransparentInterceptionError::Nftables(
-            "outbound transparent MITM requires proxy self-bypass and MITM lifecycle before rules can be installed".to_string(),
+            OUTBOUND_MITM_UNAVAILABLE.to_string(),
         ));
     }
     nftables::validate_setup_scope(
