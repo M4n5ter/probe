@@ -134,6 +134,10 @@ pub const EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES: u32 = 1;
 pub const EBPF_PROCESS_READ_EVENT_SCRATCH_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
 pub const EBPF_PROCESS_READ_EVENT_SCRATCH_VALUE_BYTES: u32 =
     core::mem::size_of::<EbpfSocketReadSampleRecord>() as u32;
+pub const EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME: &str = "SSSA_PROCESS_OUTPUT_LOSSES";
+pub const EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES: u32 = 1;
+pub const EBPF_PROCESS_OUTPUT_LOSS_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
+pub const EBPF_PROCESS_OUTPUT_LOSS_VALUE_BYTES: u32 = core::mem::size_of::<u64>() as u32;
 pub const EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN: u32 = 1;
 
 pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 29] = [
@@ -313,7 +317,7 @@ pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 29] = [
     },
 ];
 
-pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 9] = [
+pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 10] = [
     EbpfMapSpec {
         name: EBPF_EVENTS_MAP_NAME,
         kind: EbpfMapKind::Ringbuf,
@@ -384,6 +388,14 @@ pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 9] = [
         key_size: EBPF_PROCESS_READ_EVENT_SCRATCH_KEY_BYTES,
         value_size: EBPF_PROCESS_READ_EVENT_SCRATCH_VALUE_BYTES,
         max_entries: EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES,
+        map_flags: 0,
+    },
+    EbpfMapSpec {
+        name: EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME,
+        kind: EbpfMapKind::PerCpuArray,
+        key_size: EBPF_PROCESS_OUTPUT_LOSS_KEY_BYTES,
+        value_size: EBPF_PROCESS_OUTPUT_LOSS_VALUE_BYTES,
+        max_entries: EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES,
         map_flags: 0,
     },
 ];
@@ -566,7 +578,7 @@ mod tests {
 
     #[test]
     fn process_map_specs_are_unique_and_layout_complete() {
-        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 9);
+        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 10);
         assert_unique(EBPF_PROCESS_MAP_SPECS.map(|spec| spec.name));
 
         let allow_map = process_map(EBPF_ALLOWED_SOCKET_FDS_MAP_NAME);
@@ -612,6 +624,15 @@ mod tests {
         assert_eq!(
             read_scratch.value_size,
             size_of::<EbpfSocketReadSampleRecord>() as u32
+        );
+
+        let output_losses = process_map(EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME);
+        assert_eq!(output_losses.kind, EbpfMapKind::PerCpuArray);
+        assert_eq!(output_losses.key_size, EBPF_PROCESS_OUTPUT_LOSS_KEY_BYTES);
+        assert_eq!(output_losses.value_size, size_of::<u64>() as u32);
+        assert_eq!(
+            output_losses.max_entries,
+            EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES
         );
 
         assert_eq!(

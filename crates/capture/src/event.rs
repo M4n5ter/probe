@@ -1,5 +1,7 @@
 use bytes::Bytes;
-use probe_core::{CaptureSource, Direction, EnforcementEvidence, FlowContext, Gap, Timestamp};
+use probe_core::{
+    CaptureLoss, CaptureSource, Direction, EnforcementEvidence, FlowContext, Gap, Timestamp,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::provider::CaptureProviderKind;
@@ -25,6 +27,7 @@ pub struct CapturedBytes {
 pub enum CaptureEvent {
     Bytes(CapturedBytes),
     Gap(CapturedGap),
+    Loss(CapturedLoss),
     ConnectionOpened {
         timestamp: Timestamp,
         flow: FlowContext,
@@ -48,6 +51,16 @@ pub struct CapturedGap {
     pub enforcement_evidence: EnforcementEvidence,
     pub enforcement_evidence_propagation: EnforcementEvidencePropagation,
     pub gap: Gap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedLoss {
+    pub timestamp: Timestamp,
+    pub flow: FlowContext,
+    pub source: CaptureSource,
+    pub provider: CaptureProviderKind,
+    pub enforcement_evidence: EnforcementEvidence,
+    pub loss: CaptureLoss,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

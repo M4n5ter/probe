@@ -12,6 +12,10 @@ pub(super) trait EbpfObservationSource {
         &mut self,
         authorization: SocketPayloadSampleAuthorization,
     ) -> Result<(), CaptureError>;
+
+    fn process_output_loss_count(&mut self) -> Result<u64, CaptureError> {
+        Ok(0)
+    }
 }
 
 pub(super) struct ProbeObservationSource {
@@ -36,6 +40,12 @@ impl EbpfObservationSource for ProbeObservationSource {
                 authorization.fd_table_epoch(),
                 authorization.payload_directions().to_abi_mask(),
             )
+            .map_err(|error| CaptureError::provider("ebpf", error.to_string()))
+    }
+
+    fn process_output_loss_count(&mut self) -> Result<u64, CaptureError> {
+        self.probe
+            .process_output_loss_count()
             .map_err(|error| CaptureError::provider("ebpf", error.to_string()))
     }
 }

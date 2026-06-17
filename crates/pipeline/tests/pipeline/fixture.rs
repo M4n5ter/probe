@@ -2,9 +2,9 @@ use capture::{
     CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind, CapturedBytes,
 };
 use probe_core::{
-    AddressPort, CapabilityState, CaptureSource, Direction, EnforcementEvidence, EventEnvelope,
-    FlowContext, FlowIdentity, Gap, ObservationOnlyReason, ProcessContext, ProcessIdentity,
-    Timestamp, TransportProtocol,
+    AddressPort, CapabilityState, CaptureLoss, CaptureSource, Direction, EnforcementEvidence,
+    EventEnvelope, FlowContext, FlowIdentity, Gap, ObservationOnlyReason, ProcessContext,
+    ProcessIdentity, Timestamp, TransportProtocol,
 };
 
 pub(super) struct SequenceProvider {
@@ -107,6 +107,27 @@ pub(super) fn event_local_observation_only_ebpf_unresolved_gap(flow: FlowContext
             expected_offset: 0,
             next_offset: None,
             reason: reason.to_string(),
+        },
+    })
+}
+
+pub(super) fn capture_loss(flow: FlowContext, lost_events: u64) -> CaptureEvent {
+    let reason = format!("test capture lost {lost_events} event(s)");
+    CaptureEvent::Loss(capture::CapturedLoss {
+        timestamp: Timestamp {
+            monotonic_ns: 1,
+            wall_time_unix_ns: 1,
+        },
+        flow,
+        source: CaptureSource::EbpfSyscall,
+        provider: CaptureProviderKind::Ebpf,
+        enforcement_evidence: EnforcementEvidence::observation_only_with_detail(
+            ObservationOnlyReason::EbpfCaptureLoss,
+            reason.clone(),
+        ),
+        loss: CaptureLoss {
+            lost_events,
+            reason,
         },
     })
 }

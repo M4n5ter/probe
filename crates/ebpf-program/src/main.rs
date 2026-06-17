@@ -20,12 +20,13 @@ use ebpf_abi::{
     EBPF_ALLOWED_SOCKET_FDS_MAX_ENTRIES, EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES,
     EBPF_PENDING_ACCEPTS_MAX_ENTRIES, EBPF_PENDING_READS_MAX_ENTRIES,
     EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES, EBPF_PENDING_WRITES_MAX_ENTRIES,
-    EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES, EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES,
-    EBPF_RING_BUFFER_BYTES, EBPF_SOCKET_PAYLOAD_ALLOW_READ, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE,
-    EbpfAcceptTracepointRecord, EbpfCloseTracepointRecord, EbpfConnectTracepointRecord,
-    EbpfPendingSocketAcceptAttempt, EbpfPendingSocketReadAttempt, EbpfPendingSocketWriteSample,
-    EbpfProcessProbeMetadata, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
-    EbpfSocketReadSampleRecord, EbpfSocketWriteSampleRecord,
+    EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES, EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES,
+    EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES, EBPF_RING_BUFFER_BYTES,
+    EBPF_SOCKET_PAYLOAD_ALLOW_READ, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE, EbpfAcceptTracepointRecord,
+    EbpfCloseTracepointRecord, EbpfConnectTracepointRecord, EbpfPendingSocketAcceptAttempt,
+    EbpfPendingSocketReadAttempt, EbpfPendingSocketWriteSample, EbpfProcessProbeMetadata,
+    EbpfSocketFdKey, EbpfSocketPayloadAllowance, EbpfSocketReadSampleRecord,
+    EbpfSocketWriteSampleRecord,
 };
 
 use accept::{accept_attempt_from_tracepoint, accept_observation_from_result};
@@ -78,6 +79,10 @@ static SSSA_PROCESS_EVENT_SCRATCH: PerCpuArray<EbpfSocketWriteSampleRecord> =
 #[map(name = "SSSA_PROCESS_READ_EVENT_SCRATCH")]
 static SSSA_PROCESS_READ_EVENT_SCRATCH: PerCpuArray<EbpfSocketReadSampleRecord> =
     PerCpuArray::with_max_entries(EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES, 0);
+
+#[map(name = "SSSA_PROCESS_OUTPUT_LOSSES")]
+static SSSA_PROCESS_OUTPUT_LOSSES: PerCpuArray<u64> =
+    PerCpuArray::with_max_entries(EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES, 0);
 
 #[tracepoint(name = "sys_enter_connect", category = "syscalls")]
 pub fn sssa_sys_enter_connect(ctx: TracePointContext) -> u32 {
@@ -272,7 +277,7 @@ fn emit_connect_attempt(ctx: TracePointContext) {
         observation,
         connect.flags,
     );
-    let _ = SSSA_EVENTS.output(&event, 0);
+    submit_process_event(&event);
 }
 
 fn record_accept_attempt(ctx: TracePointContext) {
@@ -305,7 +310,7 @@ fn emit_accept_observation(ctx: TracePointContext) {
         observation,
         accept.flags,
     );
-    let _ = SSSA_EVENTS.output(&event, 0);
+    submit_process_event(&event);
 }
 
 fn emit_close_attempt(ctx: TracePointContext) {
@@ -322,7 +327,7 @@ fn emit_close_attempt(ctx: TracePointContext) {
         metadata.command,
         close,
     );
-    let _ = SSSA_EVENTS.output(&event, 0);
+    submit_process_event(&event);
 }
 
 fn record_write_attempt(ctx: TracePointContext) {
@@ -388,7 +393,7 @@ fn emit_write_sample(ctx: TracePointContext) {
         pending_write_metadata(pending),
         pending.flags,
     );
-    let _ = SSSA_EVENTS.output(event, 0);
+    submit_process_event(event);
     let _ = SSSA_PENDING_WRITES.remove(&key);
 }
 
@@ -441,8 +446,23 @@ fn emit_read_sample(ctx: TracePointContext) {
         let _ = SSSA_PENDING_READS.remove(&key);
         return;
     }
-    let _ = SSSA_EVENTS.output(event, 0);
+    submit_process_event(event);
     let _ = SSSA_PENDING_READS.remove(&key);
+}
+
+fn submit_process_event<T>(event: &T) {
+    if SSSA_EVENTS.output(event, 0).is_err() {
+        record_process_output_loss();
+    }
+}
+
+fn record_process_output_loss() {
+    let Some(losses) = SSSA_PROCESS_OUTPUT_LOSSES.get_ptr_mut(0) else {
+        return;
+    };
+    unsafe {
+        *losses = (*losses).saturating_add(1);
+    }
 }
 
 fn pending_write_scratch() -> Option<&'static mut EbpfPendingSocketWriteSample> {

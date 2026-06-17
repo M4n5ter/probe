@@ -400,6 +400,18 @@ where
                     add_export_events_to_summary(summary, written);
                 }
             }
+            CaptureEvent::Loss(loss) => {
+                let envelope = EventEnvelope::new(
+                    loss.timestamp,
+                    loss.flow,
+                    loss.source,
+                    self.config_version.clone(),
+                    EventKind::CaptureLoss(loss.loss),
+                )
+                .with_enforcement_evidence(loss.enforcement_evidence);
+                let written = self.append_envelope_and_policy_outcomes(envelope, &mut emissions)?;
+                add_export_events_to_summary(summary, written);
+            }
             CaptureEvent::ConnectionOpened {
                 timestamp,
                 flow,

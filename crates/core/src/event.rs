@@ -82,6 +82,7 @@ pub enum EnforcementEvidence {
 pub enum ObservationOnlyReason {
     EbpfSyscallPayloadSnapshot,
     EbpfUnresolvedFlow,
+    EbpfCaptureLoss,
 }
 
 impl EnforcementEvidence {
@@ -127,6 +128,9 @@ impl ObservationOnlyReason {
             Self::EbpfUnresolvedFlow => {
                 "eBPF observation could not be resolved to a strong flow identity"
             }
+            Self::EbpfCaptureLoss => {
+                "eBPF provider reported lost capture observations; destructive enforcement cannot rely on this event"
+            }
         }
     }
 
@@ -134,6 +138,7 @@ impl ObservationOnlyReason {
         match self {
             Self::EbpfSyscallPayloadSnapshot => "ebpf_syscall_payload_snapshot",
             Self::EbpfUnresolvedFlow => "ebpf_unresolved_flow",
+            Self::EbpfCaptureLoss => "ebpf_capture_loss",
         }
     }
 }
@@ -327,6 +332,7 @@ pub enum EventKind {
     #[serde(rename = "websocket_frame")]
     WebSocketFrame(WebSocketFrame),
     OpaqueStream(OpaqueStream),
+    CaptureLoss(CaptureLoss),
     Gap(Gap),
     ProtocolError(ProtocolError),
     PolicyAlert(DomainEvent),
@@ -346,6 +352,7 @@ pub enum EventType {
     WebSocketHandoff,
     WebSocketFrame,
     OpaqueStream,
+    CaptureLoss,
     Gap,
     ProtocolError,
     PolicyAlert,
@@ -366,6 +373,7 @@ impl EventType {
             Self::WebSocketHandoff => "websocket_handoff",
             Self::WebSocketFrame => "websocket_frame",
             Self::OpaqueStream => "opaque_stream",
+            Self::CaptureLoss => "capture_loss",
             Self::Gap => "gap",
             Self::ProtocolError => "protocol_error",
             Self::PolicyAlert => "policy_alert",
@@ -396,6 +404,7 @@ impl FromStr for EventType {
             "websocket_handoff" => Ok(Self::WebSocketHandoff),
             "websocket_frame" => Ok(Self::WebSocketFrame),
             "opaque_stream" => Ok(Self::OpaqueStream),
+            "capture_loss" => Ok(Self::CaptureLoss),
             "gap" => Ok(Self::Gap),
             "protocol_error" => Ok(Self::ProtocolError),
             "policy_alert" => Ok(Self::PolicyAlert),
@@ -451,6 +460,7 @@ impl EventKind {
             Self::WebSocketHandoff(_) => EventType::WebSocketHandoff,
             Self::WebSocketFrame(_) => EventType::WebSocketFrame,
             Self::OpaqueStream(_) => EventType::OpaqueStream,
+            Self::CaptureLoss(_) => EventType::CaptureLoss,
             Self::Gap(_) => EventType::Gap,
             Self::ProtocolError(_) => EventType::ProtocolError,
             Self::PolicyAlert(_) => EventType::PolicyAlert,
@@ -470,6 +480,7 @@ impl EventKind {
             Self::WebSocketHandoff(handoff) => Some(handoff.direction),
             Self::WebSocketFrame(frame) => Some(frame.direction),
             Self::OpaqueStream(stream) => Some(stream.direction),
+            Self::CaptureLoss(_) => None,
             Self::Gap(gap) => Some(gap.direction),
             Self::ProtocolError(error) => Some(error.direction),
             Self::ConnectionOpened
@@ -482,7 +493,10 @@ impl EventKind {
     }
 
     fn is_degraded(&self) -> bool {
-        matches!(self, Self::Gap(_) | Self::ProtocolError(_))
+        matches!(
+            self,
+            Self::CaptureLoss(_) | Self::Gap(_) | Self::ProtocolError(_)
+        )
     }
 }
 
@@ -561,6 +575,12 @@ pub struct OpaqueStream {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureLoss {
+    pub lost_events: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gap {
     pub direction: Direction,
     pub expected_offset: u64,
@@ -591,12 +611,12 @@ pub struct PolicyRuntimeError {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Action, AddressPort, CaptureSource, Direction, DomainEvent, EnforcementDecision,
-        EnforcementEvidence, EnforcementMode, EnforcementOutcome, EventEnvelope, EventKind,
-        EventProvenance, EventType, FlowContext, FlowIdentity, Gap, HttpHeaders,
-        ObservationOnlyReason, OpaqueStream, PolicyRuntimeError, ProcessContext, ProcessIdentity,
-        ProtocolError, SseEvent, Timestamp, TransportProtocol, Verdict, VerdictScope,
-        WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
+        Action, AddressPort, CaptureLoss, CaptureSource, Direction, DomainEvent,
+        EnforcementDecision, EnforcementEvidence, EnforcementMode, EnforcementOutcome,
+        EventEnvelope, EventKind, EventProvenance, EventType, FlowContext, FlowIdentity, Gap,
+        HttpHeaders, ObservationOnlyReason, OpaqueStream, PolicyRuntimeError, ProcessContext,
+        ProcessIdentity, ProtocolError, SseEvent, Timestamp, TransportProtocol, Verdict,
+        VerdictScope, WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
     };
 
     #[test]
@@ -782,7 +802,7 @@ mod tests {
         }
     }
 
-    fn event_type_wire_cases() -> [(EventType, &'static str); 15] {
+    fn event_type_wire_cases() -> [(EventType, &'static str); 16] {
         [
             (EventType::ConnectionOpened, "connection_opened"),
             (EventType::ConnectionClosed, "connection_closed"),
@@ -793,6 +813,7 @@ mod tests {
             (EventType::WebSocketHandoff, "websocket_handoff"),
             (EventType::WebSocketFrame, "websocket_frame"),
             (EventType::OpaqueStream, "opaque_stream"),
+            (EventType::CaptureLoss, "capture_loss"),
             (EventType::Gap, "gap"),
             (EventType::ProtocolError, "protocol_error"),
             (EventType::PolicyAlert, "policy_alert"),
@@ -802,7 +823,7 @@ mod tests {
         ]
     }
 
-    fn event_kind_wire_cases() -> [EventKind; 15] {
+    fn event_kind_wire_cases() -> [EventKind; 16] {
         [
             EventKind::ConnectionOpened,
             EventKind::ConnectionClosed,
@@ -865,6 +886,10 @@ mod tests {
                 direction: Direction::Inbound,
                 fingerprint: vec![1, 2, 3],
                 reason: "opaque".to_string(),
+            }),
+            EventKind::CaptureLoss(CaptureLoss {
+                lost_events: 3,
+                reason: "eBPF output ring buffer could not accept 3 event(s)".to_string(),
             }),
             EventKind::Gap(Gap {
                 direction: Direction::Inbound,

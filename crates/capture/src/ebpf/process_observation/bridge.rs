@@ -1,12 +1,14 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use probe_core::{
-    AddressPort, CaptureSource, Direction, EnforcementEvidence, FlowContext, FlowIdentity, Gap,
-    ProcessContext, ProcessIdentity, TcpConnection, TcpEndpoint, Timestamp, TransportProtocol,
+    AddressPort, CaptureLoss, CaptureSource, Direction, EnforcementEvidence, FlowContext,
+    FlowIdentity, Gap, ObservationOnlyReason, ProcessContext, ProcessIdentity, TcpConnection,
+    TcpEndpoint, Timestamp, TransportProtocol,
 };
 
 use crate::{
-    CaptureError, CaptureEvent, CaptureProviderKind, CapturedGap, EnforcementEvidencePropagation,
+    CaptureError, CaptureEvent, CaptureProviderKind, CapturedGap, CapturedLoss,
+    EnforcementEvidencePropagation,
 };
 
 use super::{
@@ -121,6 +123,26 @@ pub(crate) fn unresolved_accept_gap_from_observation(
         timestamp,
         reason,
     )
+}
+
+pub(crate) fn output_loss_event(timestamp: Timestamp, lost_events: u64) -> CaptureEvent {
+    let reason = format!(
+        "eBPF process observation output ring buffer could not accept {lost_events} event(s); parser state may have missed connection or payload observations"
+    );
+    CaptureEvent::Loss(CapturedLoss {
+        timestamp,
+        flow: unknown_ebpf_flow(timestamp.monotonic_ns),
+        source: CaptureSource::EbpfSyscall,
+        provider: CaptureProviderKind::Ebpf,
+        enforcement_evidence: EnforcementEvidence::observation_only_with_detail(
+            ObservationOnlyReason::EbpfCaptureLoss,
+            reason.clone(),
+        ),
+        loss: CaptureLoss {
+            lost_events,
+            reason,
+        },
+    })
 }
 
 fn unresolved_flow_gap(
@@ -252,6 +274,33 @@ fn unknown_local_endpoint_for_remote(remote: TcpEndpoint) -> TcpEndpoint {
 
 fn unknown_tcp_endpoint() -> TcpEndpoint {
     TcpEndpoint::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+}
+
+fn unknown_ebpf_flow(start_monotonic_ns: u64) -> FlowContext {
+    let process = ProcessContext {
+        identity: ProcessIdentity {
+            pid: 0,
+            tgid: 0,
+            start_time_ticks: 0,
+            boot_id: String::new(),
+            exe_path: String::new(),
+            cmdline_hash: String::new(),
+            uid: 0,
+            gid: 0,
+            cgroup: None,
+            systemd_service: None,
+            container_id: None,
+            runtime_hint: None,
+        },
+        name: "unknown".to_string(),
+        cmdline: Vec::new(),
+    };
+    flow_from_unresolved_socket(
+        process,
+        unknown_tcp_endpoint(),
+        unknown_tcp_endpoint(),
+        start_monotonic_ns,
+    )
 }
 
 #[cfg(test)]

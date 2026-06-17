@@ -10,9 +10,11 @@ use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CapturePro
 use super::{
     EbpfCloseTracepointObservation, EbpfProcessObservation, EbpfProcessObservationProbe,
     EbpfProcessObservationProbeConfig, EbpfSocketFlowResolver,
+    bridge::output_loss_event,
     clock::EbpfObservationClock,
     flow_start::{PendingEbpfFlowResolution, PendingEbpfFlowStart},
     observation_source::{EbpfObservationSource, ProbeObservationSource},
+    output_loss::OutputLossTracker,
     payload_authorization::SocketPayloadSampleAuthorization,
     payload_bridge::{read_events, write_events},
     payload_direction::PayloadDirections,
@@ -34,6 +36,7 @@ pub struct EbpfProcessObservationProvider {
     tracked_flows: TrackedEbpfFlows,
     pending_flow: Option<PendingEbpfFlowResolution>,
     pending_events: VecDeque<CaptureEvent>,
+    output_loss: OutputLossTracker,
 }
 
 impl EbpfProcessObservationProvider {
@@ -55,6 +58,7 @@ impl EbpfProcessObservationProvider {
             tracked_flows: TrackedEbpfFlows::bounded(MAX_TRACKED_EBPF_FLOWS),
             pending_flow: None,
             pending_events: VecDeque::new(),
+            output_loss: OutputLossTracker::default(),
         })
     }
 
@@ -65,14 +69,23 @@ impl EbpfProcessObservationProvider {
         if self.pending_flow.is_some() {
             return self.poll_pending_flow_resolution();
         }
-        let Some(observation) = self.observations.next_observation()? else {
-            return Ok(if self.stop_when_idle {
-                CapturePoll::Finished
-            } else {
-                CapturePoll::Idle
-            });
-        };
-        self.poll_observation(observation)
+        if self.output_loss.should_check_during_drain()
+            && let Some(event) = self.output_loss_event()?
+        {
+            return Ok(CapturePoll::event(event));
+        }
+        if let Some(observation) = self.observations.next_observation()? {
+            self.output_loss.record_observation();
+            return self.poll_observation(observation);
+        }
+        if let Some(event) = self.output_loss_event()? {
+            return Ok(CapturePoll::event(event));
+        }
+        Ok(if self.stop_when_idle {
+            CapturePoll::Finished
+        } else {
+            CapturePoll::Idle
+        })
     }
 
     fn poll_observation(
@@ -181,6 +194,14 @@ impl EbpfProcessObservationProvider {
         Ok(())
     }
 
+    fn output_loss_event(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+        let count = self.observations.process_output_loss_count()?;
+        Ok(self
+            .output_loss
+            .checkpoint(count)
+            .map(|lost_events| output_loss_event(self.clock.next_timestamp(), lost_events)))
+    }
+
     fn close_event(&mut self, close: &EbpfCloseTracepointObservation) -> Option<CaptureEvent> {
         let flow = self.tracked_flows.remove_close(close)?.flow;
         Some(CaptureEvent::ConnectionClosed {
@@ -204,7 +225,7 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider emits connect and accept/accept4 flow-start observations, selector-authorized always-degraded outbound single-buffer and bounded first-non-empty-iovec syscall argument samples plus inbound single-buffer and bounded first-non-empty-iovec syscall result samples, and best-effort descriptor-close lifecycle events; payload beyond the first sampled iovec segment, bounded iovec scan, or sample buffer, partial-write retry semantics, and lost-event capture are not implemented",
+            "eBPF provider emits connect and accept/accept4 flow-start observations, selector-authorized always-degraded outbound single-buffer and bounded first-non-empty-iovec syscall argument samples plus inbound single-buffer and bounded first-non-empty-iovec syscall result samples, best-effort descriptor-close lifecycle events, and output ring-buffer failure conversion to degraded capture_loss events; payload beyond the first sampled iovec segment, bounded iovec scan, or sample buffer, partial-write retry semantics, and flow-specific lost-event reconstruction are not implemented",
         )]
     }
 
@@ -248,6 +269,7 @@ mod tests {
                 tracked_flows: TrackedEbpfFlows::bounded(MAX_TRACKED_EBPF_FLOWS),
                 pending_flow: None,
                 pending_events: VecDeque::new(),
+                output_loss: OutputLossTracker::default(),
             }
         }
 
@@ -267,7 +289,13 @@ mod tests {
                 tracked_flows: TrackedEbpfFlows::bounded(MAX_TRACKED_EBPF_FLOWS),
                 pending_flow: None,
                 pending_events: VecDeque::new(),
+                output_loss: OutputLossTracker::default(),
             }
+        }
+
+        fn with_output_loss_check_interval_for_test(mut self, interval: u32) -> Self {
+            self.output_loss = OutputLossTracker::new(interval);
+            self
         }
     }
 
@@ -293,26 +321,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443);
         let local = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 50_000);
-        let observation = EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
-            process: EbpfObservedProcess {
-                pid: 101,
-                tgid: 100,
-                uid: 1000,
-                gid: 1000,
-                command: [0; 16],
-            },
-            fd: 7,
-            addrlen: 16,
-            fd_table_epoch: 0,
-            endpoint: EbpfSocketEndpoint::Remote(remote),
-        });
-        let resolver = Box::new(StaticResolver {
-            resolved: Some(EbpfResolvedSocketFlow {
-                process: demo_process(),
-                confidence: 90,
-                connection: TcpConnection::new(local, remote),
-            }),
-        });
+        let observation = connect_observation(observed_process(101, 100), 7, remote);
+        let resolver = static_resolver(local, remote);
         let mut provider =
             EbpfProcessObservationProvider::from_observations_for_test([observation], resolver);
 
@@ -342,13 +352,7 @@ mod tests {
         let remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 50_000);
         let local = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443);
         let observation = accept_observation(observed_process(101, 100), 9, 3, remote);
-        let resolver = Box::new(StaticResolver {
-            resolved: Some(EbpfResolvedSocketFlow {
-                process: demo_process(),
-                confidence: 90,
-                connection: TcpConnection::new(local, remote),
-            }),
-        });
+        let resolver = static_resolver(local, remote);
         let mut provider =
             EbpfProcessObservationProvider::from_observations_for_test([observation], resolver);
 
@@ -389,13 +393,7 @@ mod tests {
                 read_failed: false,
             }),
         ];
-        let resolver = Box::new(StaticResolver {
-            resolved: Some(EbpfResolvedSocketFlow {
-                process: demo_process(),
-                confidence: 90,
-                connection: TcpConnection::new(local, remote),
-            }),
-        });
+        let resolver = static_resolver(local, remote);
         let selector = Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -453,13 +451,7 @@ mod tests {
                 read_failed: false,
             }),
         ];
-        let resolver = Box::new(StaticResolver {
-            resolved: Some(EbpfResolvedSocketFlow {
-                process: demo_process(),
-                confidence: 90,
-                connection: TcpConnection::new(local, remote),
-            }),
-        });
+        let resolver = static_resolver(local, remote);
         let selector = Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -497,38 +489,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443);
         let local = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 50_000);
+        let process = observed_process(101, 100);
         let observations = [
-            EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
-                process: EbpfObservedProcess {
-                    pid: 101,
-                    tgid: 100,
-                    uid: 1000,
-                    gid: 1000,
-                    command: [0; 16],
-                },
-                fd: 7,
-                addrlen: 16,
-                fd_table_epoch: 0,
-                endpoint: EbpfSocketEndpoint::Remote(remote),
-            }),
-            EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
-                process: EbpfObservedProcess {
-                    pid: 101,
-                    tgid: 100,
-                    uid: 1000,
-                    gid: 1000,
-                    command: [0; 16],
-                },
-                fd: 7,
-            }),
+            connect_observation(process.clone(), 7, remote),
+            close_observation(process, 7),
         ];
-        let resolver = Box::new(StaticResolver {
-            resolved: Some(EbpfResolvedSocketFlow {
-                process: demo_process(),
-                confidence: 90,
-                connection: TcpConnection::new(local, remote),
-            }),
-        });
+        let resolver = static_resolver(local, remote);
         let mut provider =
             EbpfProcessObservationProvider::from_observations_for_test(observations, resolver);
 
@@ -564,37 +530,10 @@ mod tests {
         let remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443);
         let local = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 50_000);
         let observations = [
-            EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
-                process: EbpfObservedProcess {
-                    pid: 101,
-                    tgid: 100,
-                    uid: 1000,
-                    gid: 1000,
-                    command: [0; 16],
-                },
-                fd: 7,
-                addrlen: 16,
-                fd_table_epoch: 0,
-                endpoint: EbpfSocketEndpoint::Remote(remote),
-            }),
-            EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
-                process: EbpfObservedProcess {
-                    pid: 102,
-                    tgid: 100,
-                    uid: 1000,
-                    gid: 1000,
-                    command: [0; 16],
-                },
-                fd: 7,
-            }),
+            connect_observation(observed_process(101, 100), 7, remote),
+            close_observation(observed_process(102, 100), 7),
         ];
-        let resolver = Box::new(StaticResolver {
-            resolved: Some(EbpfResolvedSocketFlow {
-                process: demo_process(),
-                confidence: 90,
-                connection: TcpConnection::new(local, remote),
-            }),
-        });
+        let resolver = static_resolver(local, remote);
         let mut provider =
             EbpfProcessObservationProvider::from_observations_for_test(observations, resolver);
 
@@ -619,15 +558,9 @@ mod tests {
         let process = observed_process(101, 100);
         let observations = [
             connect_observation(process.clone(), 7, remote),
-            EbpfProcessObservation::Close(EbpfCloseTracepointObservation { process, fd: 8 }),
+            close_observation(process, 8),
         ];
-        let resolver = Box::new(StaticResolver {
-            resolved: Some(EbpfResolvedSocketFlow {
-                process: demo_process(),
-                confidence: 90,
-                connection: TcpConnection::new(local, remote),
-            }),
-        });
+        let resolver = static_resolver(local, remote);
         let mut provider =
             EbpfProcessObservationProvider::from_observations_for_test(observations, resolver);
 
@@ -647,18 +580,12 @@ mod tests {
         let process = observed_process(101, 100);
         let observations = [
             connect_observation(process.clone(), 7, remote),
-            EbpfProcessObservation::Close(EbpfCloseTracepointObservation { process, fd: 7 }),
+            close_observation(process, 7),
         ];
         let source = FailingAllowObservationSource {
             observations: observations.into_iter().collect(),
         };
-        let resolver = Box::new(StaticResolver {
-            resolved: Some(EbpfResolvedSocketFlow {
-                process: demo_process(),
-                confidence: 90,
-                connection: TcpConnection::new(local, remote),
-            }),
-        });
+        let resolver = static_resolver(local, remote);
         let selector = Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -685,37 +612,10 @@ mod tests {
         let remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443);
         let local = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 50_000);
         let observations = [
-            EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
-                process: EbpfObservedProcess {
-                    pid: 101,
-                    tgid: 100,
-                    uid: 1000,
-                    gid: 1000,
-                    command: [0; 16],
-                },
-                fd: 7,
-            }),
-            EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
-                process: EbpfObservedProcess {
-                    pid: 101,
-                    tgid: 100,
-                    uid: 1000,
-                    gid: 1000,
-                    command: [0; 16],
-                },
-                fd: 8,
-                addrlen: 16,
-                fd_table_epoch: 0,
-                endpoint: EbpfSocketEndpoint::Remote(remote),
-            }),
+            close_observation(observed_process(101, 100), 7),
+            connect_observation(observed_process(101, 100), 8, remote),
         ];
-        let resolver = Box::new(StaticResolver {
-            resolved: Some(EbpfResolvedSocketFlow {
-                process: demo_process(),
-                confidence: 90,
-                connection: TcpConnection::new(local, remote),
-            }),
-        });
+        let resolver = static_resolver(local, remote);
         let mut provider =
             EbpfProcessObservationProvider::from_observations_for_test(observations, resolver);
 
@@ -738,40 +638,13 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443);
         let local = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 50_000);
-        let process = EbpfObservedProcess {
-            pid: 101,
-            tgid: 100,
-            uid: 1000,
-            gid: 1000,
-            command: [0; 16],
-        };
+        let process = observed_process(101, 100);
         let observations = [
-            EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
-                process: process.clone(),
-                fd: 7,
-                addrlen: 16,
-                fd_table_epoch: 0,
-                endpoint: EbpfSocketEndpoint::Remote(remote),
-            }),
-            EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
-                process: process.clone(),
-                fd: 7,
-            }),
-            EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
-                process,
-                fd: 7,
-                addrlen: 16,
-                fd_table_epoch: 0,
-                endpoint: EbpfSocketEndpoint::Remote(remote),
-            }),
+            connect_observation(process.clone(), 7, remote),
+            close_observation(process.clone(), 7),
+            connect_observation(process, 7, remote),
         ];
-        let resolver = Box::new(StaticResolver {
-            resolved: Some(EbpfResolvedSocketFlow {
-                process: demo_process(),
-                confidence: 90,
-                connection: TcpConnection::new(local, remote),
-            }),
-        });
+        let resolver = static_resolver(local, remote);
         let mut provider =
             EbpfProcessObservationProvider::from_observations_for_test(observations, resolver);
 
@@ -808,19 +681,7 @@ mod tests {
     #[test]
     fn ebpf_process_observation_provider_emits_gap_for_unresolved_observations()
     -> Result<(), Box<dyn std::error::Error>> {
-        let observation = EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
-            process: EbpfObservedProcess {
-                pid: 101,
-                tgid: 100,
-                uid: 1000,
-                gid: 1000,
-                command: [0; 16],
-            },
-            fd: 7,
-            addrlen: 0,
-            fd_table_epoch: 0,
-            endpoint: EbpfSocketEndpoint::Missing,
-        });
+        let observation = missing_connect_observation(observed_process(101, 100), 7);
         let resolver = Box::new(StaticResolver { resolved: None });
         let mut provider =
             EbpfProcessObservationProvider::from_observations_for_test([observation], resolver);
@@ -847,19 +708,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443);
         let local = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 50_000);
-        let observation = EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
-            process: EbpfObservedProcess {
-                pid: 101,
-                tgid: 100,
-                uid: 1000,
-                gid: 1000,
-                command: [0; 16],
-            },
-            fd: 7,
-            addrlen: 16,
-            fd_table_epoch: 0,
-            endpoint: EbpfSocketEndpoint::Remote(remote),
-        });
+        let observation = connect_observation(observed_process(101, 100), 7, remote);
         let resolver = Box::new(RetryResolver {
             calls: 0,
             resolved: EbpfResolvedSocketFlow {
@@ -877,6 +726,68 @@ mod tests {
         };
 
         assert_eq!(flow.local.port, 50_000);
+        Ok(())
+    }
+
+    #[test]
+    fn ebpf_process_observation_provider_emits_output_loss_delta_through_poll()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = OutputLossObservationSource {
+            observations: VecDeque::new(),
+            counts: VecDeque::from([2, 2, 5]),
+        };
+        let resolver = Box::new(StaticResolver { resolved: None });
+        let mut provider =
+            EbpfProcessObservationProvider::from_source_for_test(source, resolver, None);
+        provider.stop_when_idle = false;
+
+        let first = expect_output_loss(provider.poll_next()?);
+        assert_eq!(first.source, CaptureSource::EbpfSyscall);
+        assert_eq!(first.provider, CaptureProviderKind::Ebpf);
+        assert_eq!(first.flow.attribution_confidence, 0);
+        assert_eq!(first.loss.lost_events, 2);
+        assert!(
+            first
+                .loss
+                .reason
+                .contains("output ring buffer could not accept 2 event(s)")
+        );
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Idle));
+        let second = expect_output_loss(provider.poll_next()?);
+        assert_eq!(second.loss.lost_events, 3);
+        assert!(matches!(provider.poll_next()?, CapturePoll::Idle));
+        Ok(())
+    }
+
+    #[test]
+    fn ebpf_process_observation_provider_interleaves_output_loss_during_observation_drain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let process = observed_process(101, 100);
+        let source = OutputLossObservationSource {
+            observations: VecDeque::from([
+                EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
+                    process: process.clone(),
+                    fd: 70,
+                }),
+                EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
+                    process: process.clone(),
+                    fd: 71,
+                }),
+                EbpfProcessObservation::Close(EbpfCloseTracepointObservation { process, fd: 72 }),
+            ]),
+            counts: VecDeque::from([4]),
+        };
+        let resolver = Box::new(StaticResolver { resolved: None });
+        let mut provider =
+            EbpfProcessObservationProvider::from_source_for_test(source, resolver, None)
+                .with_output_loss_check_interval_for_test(2);
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
+        let loss = expect_output_loss(provider.poll_next()?);
+        assert_eq!(loss.loss.lost_events, 4);
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
         Ok(())
     }
 
@@ -928,6 +839,48 @@ mod tests {
         }
     }
 
+    struct OutputLossObservationSource {
+        observations: VecDeque<EbpfProcessObservation>,
+        counts: VecDeque<u64>,
+    }
+
+    impl EbpfObservationSource for OutputLossObservationSource {
+        fn next_observation(&mut self) -> Result<Option<EbpfProcessObservation>, CaptureError> {
+            Ok(self.observations.pop_front())
+        }
+
+        fn allow_socket_payload_sample(
+            &mut self,
+            _authorization: SocketPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn process_output_loss_count(&mut self) -> Result<u64, CaptureError> {
+            Ok(self.counts.pop_front().unwrap_or(5))
+        }
+    }
+
+    fn expect_output_loss(poll: CapturePoll) -> crate::CapturedLoss {
+        let CapturePoll::Event(event) = poll else {
+            panic!("expected output loss event, got {poll:?}");
+        };
+        let CaptureEvent::Loss(loss) = *event else {
+            panic!("expected output loss event, got {event:?}");
+        };
+        loss
+    }
+
+    fn static_resolver(local: TcpEndpoint, remote: TcpEndpoint) -> Box<StaticResolver> {
+        Box::new(StaticResolver {
+            resolved: Some(EbpfResolvedSocketFlow {
+                process: demo_process(),
+                confidence: 90,
+                connection: TcpConnection::new(local, remote),
+            }),
+        })
+    }
+
     fn connect_observation(
         process: EbpfObservedProcess,
         fd: i32,
@@ -939,6 +892,19 @@ mod tests {
             addrlen: 16,
             fd_table_epoch: 9,
             endpoint: EbpfSocketEndpoint::Remote(remote),
+        })
+    }
+
+    fn missing_connect_observation(
+        process: EbpfObservedProcess,
+        fd: i32,
+    ) -> EbpfProcessObservation {
+        EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
+            process,
+            fd,
+            addrlen: 0,
+            fd_table_epoch: 9,
+            endpoint: EbpfSocketEndpoint::Missing,
         })
     }
 
@@ -956,6 +922,10 @@ mod tests {
             fd_table_epoch: 9,
             endpoint: EbpfSocketEndpoint::Remote(remote),
         })
+    }
+
+    fn close_observation(process: EbpfObservedProcess, fd: i32) -> EbpfProcessObservation {
+        EbpfProcessObservation::Close(EbpfCloseTracepointObservation { process, fd })
     }
 
     fn observed_process(pid: u32, tgid: u32) -> EbpfObservedProcess {
