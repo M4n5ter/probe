@@ -10,8 +10,8 @@ use probe_core::{CapabilityKind, CapabilityState, ProcessContext, TcpConnection,
 use super::{
     AttributionError,
     inode_scan::{
-        SocketFdInode, SocketFdInodeSource, hinted_socket_fd_candidates, inode_pid_map,
-        socket_fd_candidates_for_lookup,
+        SocketFdCandidate, SocketFdCandidateSource, hinted_socket_fd_candidates, inode_pid_map,
+        read_socket_cookie_for_pid_fd, socket_fd_candidates_for_lookup,
     },
     io::read_tcp_table_to_string,
     process::{ProcessAttributor, ProcfsAttributor},
@@ -37,6 +37,7 @@ pub struct SocketFdConnectionContext {
     pub process: ProcessContext,
     pub confidence: u8,
     pub socket_inode: u64,
+    pub socket_cookie: Option<u64>,
     pub connection: TcpConnection,
 }
 
@@ -252,13 +253,13 @@ impl ProcfsSocketAttributor {
 
     fn identify_fd_candidates_in_snapshot(
         &self,
-        candidates: &[SocketFdInode],
+        candidates: &[SocketFdCandidate],
         lookup: &SocketFdLookup,
         snapshot: &ProcfsSocketSnapshot,
     ) -> Result<Option<SocketFdConnectionContext>, AttributionError> {
         let mut matched = None;
         for candidate in candidates {
-            if candidate.source != SocketFdInodeSource::Direct
+            if candidate.source != SocketFdCandidateSource::Direct
                 && lookup.expected_remote_endpoint.is_none()
             {
                 continue;
@@ -283,7 +284,7 @@ impl ProcfsSocketAttributor {
                 }
                 Err(error) => return Err(error),
             };
-            if candidate.source == SocketFdInodeSource::ProcessHint
+            if candidate.source == SocketFdCandidateSource::ProcessHint
                 && !lookup
                     .process_hint
                     .as_ref()
@@ -291,17 +292,33 @@ impl ProcfsSocketAttributor {
             {
                 continue;
             }
-            let resolved = SocketFdConnectionContext {
+            let resolved = (
                 process,
-                confidence: fd_candidate_confidence(candidate.source),
-                socket_inode: candidate.inode,
+                candidate.source,
+                candidate.inode,
+                candidate.fd_pid,
                 connection,
-            };
+            );
             if matched.replace(resolved).is_some() {
                 return Ok(None);
             }
         }
-        Ok(matched)
+        Ok(
+            matched.map(|(process, source, socket_inode, fd_pid, connection)| {
+                SocketFdConnectionContext {
+                    process,
+                    confidence: fd_candidate_confidence(source),
+                    socket_inode,
+                    socket_cookie: read_socket_cookie_for_pid_fd(
+                        &self.process_attributor.proc_root,
+                        fd_pid,
+                        lookup.fd,
+                        socket_inode,
+                    ),
+                    connection,
+                }
+            }),
+        )
     }
 
     fn identify_hinted_fd_in_snapshot(
@@ -334,7 +351,7 @@ impl ProcfsSocketAttributor {
         match self.probe() {
             Ok(()) => vec![CapabilityState::degraded(
                 CapabilityKind::ProcfsSocketAttribution,
-                "procfs socket attribution can read /proc/net/tcp and proc root, opportunistically reads /proc/net/tcp6, resolves fd lookups through procfs PID namespace aliases, and can use unique fd/process-hint candidates when kernel PIDs are hidden; fd races, hidepid, namespace boundaries, and PID reuse remain possible",
+                "procfs socket attribution can read /proc/net/tcp and proc root, opportunistically reads /proc/net/tcp6, resolves fd lookups through procfs PID namespace aliases, captures SO_COOKIE for live socket fd lookups when pidfd_getfd is permitted and the duplicated fd inode still matches, and can use unique fd/process-hint candidates when kernel PIDs are hidden; fd races, hidepid, namespace boundaries, and PID reuse remain possible",
             )],
             Err(error) => vec![CapabilityState::unavailable(
                 CapabilityKind::ProcfsSocketAttribution,
@@ -418,10 +435,10 @@ fn process_matches_hint(process: &ProcessContext, hint: &SocketProcessHint) -> b
         && process.name == hint.name
 }
 
-fn fd_candidate_confidence(source: SocketFdInodeSource) -> u8 {
+fn fd_candidate_confidence(source: SocketFdCandidateSource) -> u8 {
     match source {
-        SocketFdInodeSource::Direct => PROCFS_SOCKET_CONFIDENCE,
-        SocketFdInodeSource::NamespaceAlias | SocketFdInodeSource::ProcessHint => {
+        SocketFdCandidateSource::Direct => PROCFS_SOCKET_CONFIDENCE,
+        SocketFdCandidateSource::NamespaceAlias | SocketFdCandidateSource::ProcessHint => {
             PROCFS_HINTED_FD_CONFIDENCE
         }
     }

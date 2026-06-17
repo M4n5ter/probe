@@ -298,6 +298,7 @@ impl LibsslUprobeFlowResolver for LoopbackFlowResolver {
             process: self.process(&lookup),
             confidence: DIRECT_FLOW_CONFIDENCE,
             connection: self.connection(direction),
+            socket_cookie: None,
             start_monotonic_ns: 1,
         }))
     }

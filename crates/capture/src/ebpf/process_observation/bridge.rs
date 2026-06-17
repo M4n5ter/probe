@@ -36,6 +36,7 @@ pub struct EbpfResolvedSocketFlow {
     pub process: ProcessContext,
     pub confidence: u8,
     pub connection: TcpConnection,
+    pub socket_cookie: Option<u64>,
 }
 
 pub trait EbpfSocketFlowResolver {
@@ -189,14 +190,14 @@ fn flow_from_resolved_socket(
             &remote,
             TransportProtocol::Tcp,
             start_monotonic_ns,
-            None,
+            resolved.socket_cookie,
         ),
         process: resolved.process,
         local,
         remote,
         protocol: TransportProtocol::Tcp,
         start_monotonic_ns,
-        socket_cookie: None,
+        socket_cookie: resolved.socket_cookie,
         attribution_confidence: resolved.confidence,
     }
 }
@@ -353,6 +354,7 @@ mod tests {
                     TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 50_000),
                     expected_remote,
                 ),
+                socket_cookie: Some(99),
             }),
         };
 
@@ -380,6 +382,7 @@ mod tests {
                 assert_eq!(flow.process.identity.pid, 100);
                 assert_eq!(flow.local.port, 50_000);
                 assert_eq!(flow.remote.port, 443);
+                assert_eq!(flow.socket_cookie, Some(99));
                 assert_eq!(flow.attribution_confidence, 80);
             }
             event => panic!("unexpected event: {event:?}"),
@@ -465,6 +468,7 @@ mod tests {
                 process: demo_process(),
                 confidence: 80,
                 connection: TcpConnection::new(local, remote),
+                socket_cookie: Some(123),
             }),
         };
 
@@ -483,6 +487,7 @@ mod tests {
             CaptureEvent::ConnectionOpened { flow, .. } => {
                 assert_eq!(flow.local.port, 443);
                 assert_eq!(flow.remote.port, 50_000);
+                assert_eq!(flow.socket_cookie, Some(123));
                 assert_eq!(flow.attribution_confidence, 80);
             }
             event => panic!("unexpected event: {event:?}"),

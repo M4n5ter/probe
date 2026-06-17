@@ -162,6 +162,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "probe-core",
+ "rustix",
  "tempfile",
  "thiserror 2.0.18",
 ]

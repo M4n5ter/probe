@@ -200,6 +200,7 @@ impl EbpfSocketFlowResolver for ProcfsTcpProcessResolver {
                     process: resolved.process,
                     confidence: resolved.confidence,
                     connection: resolved.connection,
+                    socket_cookie: resolved.socket_cookie,
                 })
             })
             .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))

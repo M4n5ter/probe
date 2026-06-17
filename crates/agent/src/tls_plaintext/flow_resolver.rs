@@ -82,11 +82,13 @@ impl ProcfsLibsslFlowResolver {
             ssl_pointer: lookup.ssl_pointer,
             connection: resolved.connection,
         };
+        let start = self.starts.start_for(key, resolved.socket_cookie);
         LibsslResolvedFlow {
             process: resolved.process,
             confidence: resolved.confidence,
             connection: resolved.connection,
-            start_monotonic_ns: self.starts.start_for(key),
+            socket_cookie: start.socket_cookie,
+            start_monotonic_ns: start.monotonic_ns,
         }
     }
 }
@@ -168,8 +170,14 @@ struct LibsslFlowStartKey {
     connection: TcpConnection,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LibsslFlowStart {
+    monotonic_ns: u64,
+    socket_cookie: Option<u64>,
+}
+
 struct TrackedLibsslFlowStarts {
-    by_key: HashMap<LibsslFlowStartKey, u64>,
+    by_key: HashMap<LibsslFlowStartKey, LibsslFlowStart>,
     recency: VecDeque<LibsslFlowStartKey>,
     next_start_monotonic_ns: u64,
     max_tracked_flows: usize,
@@ -187,16 +195,24 @@ impl Default for TrackedLibsslFlowStarts {
 }
 
 impl TrackedLibsslFlowStarts {
-    fn start_for(&mut self, key: LibsslFlowStartKey) -> u64 {
+    fn start_for(
+        &mut self,
+        key: LibsslFlowStartKey,
+        socket_cookie: Option<u64>,
+    ) -> LibsslFlowStart {
         if let Some(start) = self.by_key.get(&key).copied() {
             self.refresh(key);
             return start;
         }
         self.next_start_monotonic_ns = self.next_start_monotonic_ns.saturating_add(1);
         self.evict_until_available();
+        let start = LibsslFlowStart {
+            monotonic_ns: self.next_start_monotonic_ns,
+            socket_cookie,
+        };
         self.recency.push_back(key);
-        self.by_key.insert(key, self.next_start_monotonic_ns);
-        self.next_start_monotonic_ns
+        self.by_key.insert(key, start);
+        start
     }
 
     fn refresh(&mut self, key: LibsslFlowStartKey) {
@@ -237,20 +253,37 @@ mod tests {
         let mut starts = TrackedLibsslFlowStarts::default();
         let key = flow_key(1, 0xfeed, connection(443));
 
-        let first = starts.start_for(key);
-        let second = starts.start_for(key);
-        let other = starts.start_for(flow_key(1, 0xbeef, connection(443)));
+        let first = starts.start_for(key, Some(11));
+        let second = starts.start_for(key, Some(11));
+        let other = starts.start_for(flow_key(1, 0xbeef, connection(443)), Some(11));
 
         assert_eq!(first, second);
         assert_ne!(first, other);
     }
 
     #[test]
+    fn tracked_flow_starts_pin_first_socket_cookie_state() {
+        let mut starts = TrackedLibsslFlowStarts::default();
+        let key = flow_key(1, 0xfeed, connection(443));
+
+        let first = starts.start_for(key, None);
+        let second = starts.start_for(key, Some(99));
+        let other_key = flow_key(1, 0xbeef, connection(443));
+        let third = starts.start_for(other_key, Some(123));
+        let fourth = starts.start_for(other_key, None);
+
+        assert_eq!(first.monotonic_ns, second.monotonic_ns);
+        assert_eq!(second.socket_cookie, None);
+        assert_eq!(third.monotonic_ns, fourth.monotonic_ns);
+        assert_eq!(fourth.socket_cookie, Some(123));
+    }
+
+    #[test]
     fn tracked_flow_starts_include_process_generation_and_connection() {
         let mut starts = TrackedLibsslFlowStarts::default();
-        let first = starts.start_for(flow_key(1, 0xfeed, connection(443)));
-        let reused_pid = starts.start_for(flow_key(2, 0xfeed, connection(443)));
-        let reused_ssl = starts.start_for(flow_key(1, 0xfeed, connection(8443)));
+        let first = starts.start_for(flow_key(1, 0xfeed, connection(443)), Some(11));
+        let reused_pid = starts.start_for(flow_key(2, 0xfeed, connection(443)), Some(11));
+        let reused_ssl = starts.start_for(flow_key(1, 0xfeed, connection(8443)), Some(11));
 
         assert_ne!(first, reused_pid);
         assert_ne!(first, reused_ssl);

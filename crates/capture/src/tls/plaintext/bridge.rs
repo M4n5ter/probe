@@ -26,6 +26,7 @@ pub struct LibsslResolvedFlow {
     pub process: ProcessContext,
     pub confidence: u8,
     pub connection: TcpConnection,
+    pub socket_cookie: Option<u64>,
     pub start_monotonic_ns: u64,
 }
 
@@ -275,14 +276,14 @@ pub(in crate::tls::plaintext) fn flow_from_resolved(resolved: LibsslResolvedFlow
             &remote,
             TransportProtocol::Tcp,
             resolved.start_monotonic_ns,
-            None,
+            resolved.socket_cookie,
         ),
         process: resolved.process,
         local,
         remote,
         protocol: TransportProtocol::Tcp,
         start_monotonic_ns: resolved.start_monotonic_ns,
-        socket_cookie: None,
+        socket_cookie: resolved.socket_cookie,
         attribution_confidence: resolved.confidence,
     }
 }
@@ -608,6 +609,8 @@ mod tests {
         assert_eq!(first_flow.id, second_flow.id);
         assert_eq!(first_flow.start_monotonic_ns, 1);
         assert_eq!(second_flow.start_monotonic_ns, 1);
+        assert_eq!(first_flow.socket_cookie, Some(4242));
+        assert_eq!(second_flow.socket_cookie, Some(4242));
         Ok(())
     }
 
@@ -700,6 +703,7 @@ mod tests {
                 probe_core::TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 50_000),
                 probe_core::TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443),
             ),
+            socket_cookie: Some(4242),
             start_monotonic_ns: 1,
         }
     }

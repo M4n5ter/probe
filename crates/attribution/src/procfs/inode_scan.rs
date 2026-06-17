@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, io, path::Path};
+use std::{collections::HashMap, fs, io, os::fd::AsRawFd, path::Path};
 
 use super::{
     AttributionError,
@@ -9,14 +9,15 @@ use super::{
 const LINUX_ESRCH: i32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SocketFdInode {
+pub(super) struct SocketFdCandidate {
     pub(super) inode: u64,
+    pub(super) fd_pid: u32,
     pub(super) process_pid: u32,
-    pub(super) source: SocketFdInodeSource,
+    pub(super) source: SocketFdCandidateSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SocketFdInodeSource {
+pub(super) enum SocketFdCandidateSource {
     Direct,
     NamespaceAlias,
     ProcessHint,
@@ -24,7 +25,7 @@ pub(super) enum SocketFdInodeSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SocketFdCandidateScan {
-    pub(super) candidates: Vec<SocketFdInode>,
+    pub(super) candidates: Vec<SocketFdCandidate>,
     pub(super) complete: bool,
 }
 
@@ -128,10 +129,11 @@ pub(super) fn socket_fd_candidates_for_lookup(
     if let Some(inode) = thread_inode {
         push_socket_fd_candidate(
             &mut candidates,
-            SocketFdInode {
+            SocketFdCandidate {
                 inode,
+                fd_pid: lookup.thread_pid,
                 process_pid: lookup.tgid,
-                source: SocketFdInodeSource::Direct,
+                source: SocketFdCandidateSource::Direct,
             },
         );
     }
@@ -140,10 +142,11 @@ pub(super) fn socket_fd_candidates_for_lookup(
     {
         push_socket_fd_candidate(
             &mut candidates,
-            SocketFdInode {
+            SocketFdCandidate {
                 inode,
+                fd_pid: lookup.tgid,
                 process_pid: lookup.tgid,
-                source: SocketFdInodeSource::Direct,
+                source: SocketFdCandidateSource::Direct,
             },
         );
     }
@@ -165,10 +168,11 @@ pub(super) fn socket_fd_candidates_for_lookup(
             SocketFdRead::Present(inode) => {
                 push_socket_fd_candidate(
                     &mut candidates,
-                    SocketFdInode {
+                    SocketFdCandidate {
                         inode,
+                        fd_pid: process_pid,
                         process_pid,
-                        source: SocketFdInodeSource::NamespaceAlias,
+                        source: SocketFdCandidateSource::NamespaceAlias,
                     },
                 );
             }
@@ -203,10 +207,11 @@ pub(super) fn hinted_socket_fd_candidates(
             SocketFdRead::Present(inode) => {
                 push_socket_fd_candidate(
                     &mut candidates,
-                    SocketFdInode {
+                    SocketFdCandidate {
                         inode,
+                        fd_pid: pid,
                         process_pid: pid,
-                        source: SocketFdInodeSource::ProcessHint,
+                        source: SocketFdCandidateSource::ProcessHint,
                     },
                 );
             }
@@ -220,12 +225,16 @@ pub(super) fn hinted_socket_fd_candidates(
     })
 }
 
-fn push_socket_fd_candidate(candidates: &mut Vec<SocketFdInode>, candidate: SocketFdInode) {
-    if !candidates.iter().any(|existing| {
+fn push_socket_fd_candidate(candidates: &mut Vec<SocketFdCandidate>, candidate: SocketFdCandidate) {
+    if let Some(existing) = candidates.iter_mut().find(|existing| {
         existing.inode == candidate.inode && existing.process_pid == candidate.process_pid
     }) {
-        candidates.push(candidate);
+        if existing.fd_pid != existing.process_pid && candidate.fd_pid == candidate.process_pid {
+            existing.fd_pid = candidate.fd_pid;
+        }
+        return;
     }
+    candidates.push(candidate);
 }
 
 fn pid_dir_is_visible(proc_root: &Path, pid: u32) -> bool {
@@ -308,6 +317,39 @@ fn read_socket_inode_for_candidate_pid_fd(
         .unwrap_or(SocketFdRead::Absent))
 }
 
+pub(super) fn read_socket_cookie_for_pid_fd(
+    proc_root: &Path,
+    pid: u32,
+    fd: i32,
+    expected_inode: u64,
+) -> Option<u64> {
+    if !proc_root_is_host_proc(proc_root) {
+        return None;
+    }
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)?;
+    let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok()?;
+    let socket =
+        rustix::process::pidfd_getfd(pidfd, fd, rustix::process::PidfdGetfdFlags::empty()).ok()?;
+    let duplicated_inode = socket_inode_for_current_process_fd(socket.as_raw_fd())?;
+    if duplicated_inode != expected_inode {
+        return None;
+    }
+    rustix::net::sockopt::socket_cookie(&socket)
+        .ok()
+        .filter(|cookie| *cookie != 0)
+}
+
+fn proc_root_is_host_proc(proc_root: &Path) -> bool {
+    proc_root == Path::new("/proc")
+}
+
+fn socket_inode_for_current_process_fd(fd: i32) -> Option<u64> {
+    let target = fs::read_link(Path::new("/proc/self/fd").join(fd.to_string())).ok()?;
+    socket_inode_from_link(&target)
+}
+
 pub(super) fn is_skippable_socket_scan_error(source: &io::Error) -> bool {
     matches!(
         source.kind(),
@@ -325,7 +367,13 @@ fn socket_inode_from_link(target: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, fs, io, os::unix::fs::PermissionsExt};
+    use std::{
+        collections::HashMap,
+        fs, io,
+        net::TcpListener,
+        os::{fd::AsRawFd, unix::fs::PermissionsExt},
+        path::Path,
+    };
 
     use tempfile::tempdir;
 
@@ -358,6 +406,69 @@ mod tests {
         fs::set_permissions(&fd_dir, fs::Permissions::from_mode(0o700))?;
         result?;
         assert!(inodes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn socket_fd_candidates_prefer_tgid_fd_evidence_for_duplicate_direct_inode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let proc_root = temp.path().join("proc");
+        let thread_fd_dir = proc_root.join("123").join("fd");
+        let tgid_fd_dir = proc_root.join("321").join("fd");
+        fs::create_dir_all(&thread_fd_dir)?;
+        fs::create_dir_all(&tgid_fd_dir)?;
+        std::os::unix::fs::symlink("socket:[424242]", thread_fd_dir.join("7"))?;
+        std::os::unix::fs::symlink("socket:[424242]", tgid_fd_dir.join("7"))?;
+
+        let candidates = socket_fd_candidates_for_lookup(
+            &proc_root,
+            &SocketFdLookup {
+                tgid: 321,
+                thread_pid: 123,
+                fd: 7,
+                expected_remote_endpoint: None,
+                process_hint: None,
+            },
+        )?;
+
+        assert!(candidates.complete);
+        assert_eq!(candidates.candidates.len(), 1);
+        assert_eq!(candidates.candidates[0].inode, 424242);
+        assert_eq!(candidates.candidates[0].process_pid, 321);
+        assert_eq!(candidates.candidates[0].fd_pid, 321);
+        Ok(())
+    }
+
+    #[test]
+    fn socket_inode_lookup_guards_linux_socket_cookie_when_available()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let inode = read_socket_inode_for_pid_fd(
+            Path::new("/proc"),
+            std::process::id(),
+            listener.as_raw_fd(),
+        )?
+        .expect("live listener fd should resolve to a socket identity");
+
+        assert!(inode > 0);
+        if let Some(socket_cookie) = read_socket_cookie_for_pid_fd(
+            Path::new("/proc"),
+            std::process::id(),
+            listener.as_raw_fd(),
+            inode,
+        ) {
+            assert!(socket_cookie > 0);
+            assert_eq!(
+                read_socket_cookie_for_pid_fd(
+                    Path::new("/proc"),
+                    std::process::id(),
+                    listener.as_raw_fd(),
+                    inode.saturating_add(1),
+                ),
+                None
+            );
+        }
         Ok(())
     }
 }

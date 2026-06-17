@@ -587,6 +587,7 @@ mod tests {
                 TcpEndpoint::new("127.0.0.1".parse().expect("valid local address"), 50_000),
                 TcpEndpoint::new("127.0.0.1".parse().expect("valid remote address"), 443),
             ),
+            socket_cookie: None,
             start_monotonic_ns: 1,
         }
     }

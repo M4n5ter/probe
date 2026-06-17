@@ -652,6 +652,7 @@ mod tests {
                 process: demo_process(),
                 confidence: 90,
                 connection: TcpConnection::new(local, remote),
+                socket_cookie: None,
             },
         });
         let mut provider =
@@ -889,6 +890,7 @@ mod tests {
                 process: demo_process(),
                 confidence: 90,
                 connection: TcpConnection::new(local, remote),
+                socket_cookie: None,
             }),
         })
     }
