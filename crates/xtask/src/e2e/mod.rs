@@ -1,3 +1,4 @@
+mod admin_policy_reload;
 mod ebpf_process_loopback;
 mod file_exporter;
 mod harness;
@@ -14,6 +15,7 @@ mod webhook_exporter;
 mod webhook_receiver;
 mod websocket_plaintext_feed;
 
+pub(crate) use admin_policy_reload::run as run_admin_policy_reload;
 pub(crate) use ebpf_process_loopback::run as run_ebpf_process_loopback;
 pub(crate) use file_exporter::run as run_file_exporter;
 pub(crate) use libpcap_loopback::run as run_libpcap_loopback;

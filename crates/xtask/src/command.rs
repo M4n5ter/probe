@@ -46,6 +46,10 @@ const COMMANDS: &[XtaskCommand] = &[
         run: ebpf::run_build,
     },
     XtaskCommand {
+        name: "e2e-admin-policy-reload",
+        run: e2e::run_admin_policy_reload,
+    },
+    XtaskCommand {
         name: "e2e-ebpf-process-loopback",
         run: e2e::run_ebpf_process_loopback,
     },

@@ -229,6 +229,34 @@ pub(crate) fn wait_for_agent_policy_progress(
     )
 }
 
+pub(crate) fn wait_for_agent_policy_alert_count_at_least(
+    agent: &mut Child,
+    admin_socket_path: &Path,
+    expected: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    wait_for_agent_progress_until(
+        agent,
+        admin_socket_path,
+        format!("policy_alerts>={expected}"),
+        |metrics| metrics.alerts >= expected,
+    )
+    .map(|metrics| metrics.alerts)
+}
+
+pub(crate) fn wait_for_agent_policy_alert_count_above(
+    agent: &mut Child,
+    admin_socket_path: &Path,
+    previous: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    wait_for_agent_progress_until(
+        agent,
+        admin_socket_path,
+        format!("policy_alerts>{previous}"),
+        |metrics| metrics.alerts > previous,
+    )
+    .map(|metrics| metrics.alerts)
+}
+
 pub(crate) fn wait_for_agent_pipeline_progress(
     agent: &mut Child,
     admin_socket_path: &Path,
@@ -252,6 +280,21 @@ fn wait_for_agent_progress(
     admin_socket_path: &Path,
     expectation: AgentProgressExpectation,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_agent_progress_until(
+        agent,
+        admin_socket_path,
+        expectation.describe(),
+        |metrics| metrics.satisfies(expectation),
+    )?;
+    Ok(())
+}
+
+fn wait_for_agent_progress_until(
+    agent: &mut Child,
+    admin_socket_path: &Path,
+    expectation: String,
+    predicate: impl Fn(AgentProgressMetrics) -> bool,
+) -> Result<AgentProgressMetrics, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + AGENT_PROGRESS_TIMEOUT;
     let mut stable_polls = 0u8;
     let mut last_metrics = None;
@@ -264,14 +307,14 @@ fn wait_for_agent_progress(
                 ))
                 .into());
             }
-            Ok(metrics) if metrics.satisfies(expectation) => {
+            Ok(metrics) if predicate(metrics) => {
                 stable_polls = match last_metrics {
                     Some(previous) if previous == metrics => stable_polls.saturating_add(1),
                     _ => 1,
                 };
                 last_metrics = Some(metrics);
                 if stable_polls >= AGENT_PROGRESS_STABLE_POLLS {
-                    return Ok(());
+                    return Ok(metrics);
                 }
             }
             Ok(metrics) => {
@@ -281,15 +324,13 @@ fn wait_for_agent_progress(
             Err(error) => {
                 if let Some(status) = agent.try_wait()? {
                     return Err(e2e_error(format!(
-                        "agent exited with {status} before progress reached {}: {error}",
-                        expectation.describe()
+                        "agent exited with {status} before progress reached {expectation}: {error}",
                     ))
                     .into());
                 }
                 if Instant::now() >= deadline {
                     return Err(e2e_error(format!(
-                        "timed out waiting for agent progress to reach {}: {error}",
-                        expectation.describe()
+                        "timed out waiting for agent progress to reach {expectation}: {error}",
                     ))
                     .into());
                 }
@@ -297,8 +338,7 @@ fn wait_for_agent_progress(
         }
         if Instant::now() >= deadline {
             return Err(e2e_error(format!(
-                "timed out waiting for agent progress to reach {}",
-                expectation.describe()
+                "timed out waiting for agent progress to reach {expectation}",
             ))
             .into());
         }
@@ -443,34 +483,30 @@ impl AgentProgressMetrics {
 fn read_agent_progress_metrics(
     admin_socket_path: &Path,
 ) -> Result<AgentProgressMetrics, Box<dyn std::error::Error>> {
-    let mut stream = UnixStream::connect(admin_socket_path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    stream.write_all(b"{\"command\":\"metrics\"}\n")?;
-
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
-    let response = serde_json::from_str::<serde_json::Value>(&line)?;
+    let response = send_admin_request(
+        admin_socket_path,
+        serde_json::json!({ "command": "metrics" }),
+    )?;
     let pipeline = &response["metrics"]["pipeline"];
     let capture_events_read = pipeline["capture_events_read"].as_u64().ok_or_else(|| {
         e2e_error(format!(
-            "admin metrics response omitted capture event count: {line}"
+            "admin metrics response omitted capture event count: {response}"
         ))
     })?;
     let export_events_written = pipeline["export_events_written"].as_u64().ok_or_else(|| {
         e2e_error(format!(
-            "admin metrics response omitted export event count: {line}"
+            "admin metrics response omitted export event count: {response}"
         ))
     })?;
     let policy = &pipeline["policy"];
     let alerts = policy["alerts"].as_u64().ok_or_else(|| {
         e2e_error(format!(
-            "admin metrics response omitted policy alert count: {line}"
+            "admin metrics response omitted policy alert count: {response}"
         ))
     })?;
     let errors = policy["errors"].as_u64().ok_or_else(|| {
         e2e_error(format!(
-            "admin metrics response omitted policy error count: {line}"
+            "admin metrics response omitted policy error count: {response}"
         ))
     })?;
     Ok(AgentProgressMetrics {
@@ -479,4 +515,20 @@ fn read_agent_progress_metrics(
         alerts,
         errors,
     })
+}
+
+pub(crate) fn send_admin_request(
+    admin_socket_path: &Path,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let mut stream = UnixStream::connect(admin_socket_path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut request = serde_json::to_vec(&request)?;
+    request.push(b'\n');
+    stream.write_all(&request)?;
+
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    Ok(serde_json::from_str(&line)?)
 }
