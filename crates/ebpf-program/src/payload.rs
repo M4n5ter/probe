@@ -1,4 +1,8 @@
-use aya_ebpf::{helpers::bpf_probe_read_user_buf, programs::TracePointContext};
+use aya_ebpf::{
+    cty::c_void,
+    helpers::{bpf_probe_read_user_buf, r#gen},
+    programs::TracePointContext,
+};
 
 const SYSCALL_FD_OFFSET: usize = 16;
 const SYSCALL_USER_BUFFER_OFFSET: usize = 24;
@@ -9,6 +13,8 @@ const USER_IOVEC_BASE_OFFSET: u64 = 0;
 const USER_IOVEC_LEN_OFFSET: u64 = 8;
 const USER_MSGHDR_IOV_OFFSET: u64 = 16;
 const USER_MSGHDR_IOVLEN_OFFSET: u64 = 24;
+const USER_IOVEC_BYTES: u64 = 16;
+const PAYLOAD_IOVEC_SCAN_LIMIT: u64 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PayloadBufferAttempt {
@@ -37,6 +43,10 @@ enum PayloadAttemptKind {
     SingleBuffer,
     Iovec,
     Msghdr,
+}
+
+pub(crate) const fn payload_read_flag_bits(truncated_flag: u16, read_failed_flag: u16) -> u32 {
+    truncated_flag as u32 | ((read_failed_flag as u32) << 16)
 }
 
 pub(crate) fn single_buffer_payload_source_from_tracepoint(
@@ -92,7 +102,8 @@ pub(crate) fn msghdr_payload_source_from_tracepoint(
     })
 }
 
-pub(crate) fn payload_attempt_from_source(
+#[inline(always)]
+pub(crate) fn payload_buffer_attempt_from_source(
     source: PayloadAttemptSource,
 ) -> Option<PayloadBufferAttempt> {
     match source.kind {
@@ -103,17 +114,18 @@ pub(crate) fn payload_attempt_from_source(
             logical_len: PayloadLogicalLen::Known(source.count),
         }),
         PayloadAttemptKind::Iovec => {
-            payload_attempt_from_iovec(source.fd, source.user_pointer, source.count)
+            first_non_empty_iovec_payload_attempt(source.fd, source.user_pointer, source.count)
         }
         PayloadAttemptKind::Msghdr => {
             let user_iovec = read_user_u64(source.user_pointer + USER_MSGHDR_IOV_OFFSET)?;
             let iovlen = read_user_u64(source.user_pointer + USER_MSGHDR_IOVLEN_OFFSET)?;
-            payload_attempt_from_iovec(source.fd, user_iovec, iovlen)
+            first_non_empty_iovec_payload_attempt(source.fd, user_iovec, iovlen)
         }
     }
 }
 
-fn payload_attempt_from_iovec(
+#[inline(always)]
+fn first_non_empty_iovec_payload_attempt(
     fd: i32,
     user_iovec: u64,
     iovlen: u64,
@@ -121,17 +133,33 @@ fn payload_attempt_from_iovec(
     if user_iovec == 0 || iovlen == 0 {
         return None;
     }
-    let user_buffer = read_user_u64(user_iovec + USER_IOVEC_BASE_OFFSET)?;
-    let readable_len = read_user_u64(user_iovec + USER_IOVEC_LEN_OFFSET)?;
-    if user_buffer == 0 && readable_len > 0 {
-        return None;
+    let iovecs_to_scan = core::cmp::min(iovlen, PAYLOAD_IOVEC_SCAN_LIMIT);
+    let mut index = 0u64;
+    while index < PAYLOAD_IOVEC_SCAN_LIMIT {
+        if index >= iovecs_to_scan {
+            break;
+        }
+        let iovec_address = user_iovec.checked_add(index.saturating_mul(USER_IOVEC_BYTES))?;
+        let user_buffer = read_user_u64(iovec_address + USER_IOVEC_BASE_OFFSET)?;
+        let readable_len = read_user_u64(iovec_address + USER_IOVEC_LEN_OFFSET)?;
+        if readable_len == 0 {
+            index += 1;
+            continue;
+        }
+        if user_buffer == 0 {
+            return None;
+        }
+        return Some(PayloadBufferAttempt {
+            fd,
+            user_buffer,
+            readable_len,
+            logical_len: PayloadLogicalLen::UnknownUntilExit,
+        });
     }
-    // A zero-length first iovec can still be followed by later iovecs; keep an attempt
-    // so the syscall exit path can emit a degraded gap for returned bytes.
     Some(PayloadBufferAttempt {
         fd,
-        user_buffer,
-        readable_len,
+        user_buffer: 0,
+        readable_len: 0,
         logical_len: PayloadLogicalLen::UnknownUntilExit,
     })
 }
@@ -140,35 +168,83 @@ pub(crate) fn syscall_result_from_tracepoint(ctx: &TracePointContext) -> Option<
     tracepoint_i64(ctx, SYSCALL_EXIT_RETURN_OFFSET)
 }
 
-pub(crate) fn read_user_payload_prefix(
+#[inline(always)]
+pub(crate) fn read_user_payload_prefix<const SAMPLE_BYTES: usize>(
     user_buffer: u64,
     readable_len: u32,
     logical_len: u32,
-    buffer: &mut [u8],
+    buffer: &mut [u8; SAMPLE_BYTES],
     flags: &mut u16,
     truncated_flag: u16,
     read_failed_flag: u16,
 ) -> u16 {
-    if logical_len as usize > buffer.len() || readable_len < logical_len {
+    if logical_len as usize > SAMPLE_BYTES || readable_len < logical_len {
         *flags |= truncated_flag;
     }
-    let captured_len = core::cmp::min(readable_len as usize, buffer.len()) as u16;
+    let mut captured_len = readable_len;
+    if captured_len > SAMPLE_BYTES as u32 {
+        captured_len = SAMPLE_BYTES as u32;
+    }
+    let captured_len = captured_len as u16;
     if captured_len == 0 {
         return 0;
     }
-    let Some(sample) = buffer.get_mut(..usize::from(captured_len)) else {
-        *flags |= read_failed_flag;
-        return 0;
+    // The lower-level helper keeps the size bound visible to the verifier.
+    let read_result = unsafe {
+        r#gen::bpf_probe_read_user(
+            buffer.as_mut_ptr() as *mut c_void,
+            u32::from(captured_len),
+            user_buffer as *const c_void,
+        )
     };
-    if unsafe { bpf_probe_read_user_buf(user_buffer as *const u8, sample) }.is_err() {
+    if read_result != 0 {
         *flags |= read_failed_flag;
         return 0;
     }
     captured_len
 }
 
+#[inline(always)]
+pub(crate) fn read_payload_prefix_from_attempt<const SAMPLE_BYTES: usize>(
+    attempt: PayloadBufferAttempt,
+    expected_len_or_zero: u32,
+    buffer: &mut [u8; SAMPLE_BYTES],
+    flags: &mut u16,
+    read_flag_bits: u32,
+) -> u16 {
+    let truncated_flag = (read_flag_bits & 0xffff) as u16;
+    let read_failed_flag = (read_flag_bits >> 16) as u16;
+    let copy_len = if expected_len_or_zero == 0 {
+        clamp_usize_to_u32(SAMPLE_BYTES)
+    } else {
+        expected_len_or_zero
+    };
+    if copy_len == 0 {
+        return 0;
+    }
+    let readable_len = core::cmp::min(clamp_u64_to_u32(attempt.readable_len), copy_len);
+    let logical_len = if expected_len_or_zero == 0 {
+        readable_len
+    } else {
+        expected_len_or_zero
+    };
+    read_user_payload_prefix(
+        attempt.user_buffer,
+        readable_len,
+        logical_len,
+        buffer,
+        flags,
+        truncated_flag,
+        read_failed_flag,
+    )
+}
+
 pub(crate) fn clamp_u64_to_u32(value: u64) -> u32 {
     core::cmp::min(value, u64::from(u32::MAX)) as u32
+}
+
+fn clamp_usize_to_u32(value: usize) -> u32 {
+    core::cmp::min(value, u32::MAX as usize) as u32
 }
 
 fn read_user_u64(address: u64) -> Option<u64> {

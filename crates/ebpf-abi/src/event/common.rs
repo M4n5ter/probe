@@ -1,5 +1,5 @@
 pub const EBPF_MAGIC: u32 = 0x4153_5353;
-pub const EBPF_ABI_REVISION: u16 = 10;
+pub const EBPF_ABI_REVISION: u16 = 11;
 pub const EBPF_RING_BUFFER_BYTES: u32 = 256 * 1024;
 pub const EBPF_EVENT_HEADER_BYTES: usize = core::mem::size_of::<EbpfEventHeader>();
 

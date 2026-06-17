@@ -218,11 +218,45 @@ pub(crate) fn wait_for_agent_policy_progress(
     admin_socket_path: &Path,
     expected_alert_floor: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_agent_progress(
+        agent,
+        admin_socket_path,
+        AgentProgressExpectation {
+            policy_alert_floor: expected_alert_floor,
+            capture_event_floor: 0,
+            export_event_floor: 0,
+        },
+    )
+}
+
+pub(crate) fn wait_for_agent_pipeline_progress(
+    agent: &mut Child,
+    admin_socket_path: &Path,
+    expected_alert_floor: u64,
+    expected_capture_event_floor: u64,
+    expected_export_event_floor: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_agent_progress(
+        agent,
+        admin_socket_path,
+        AgentProgressExpectation {
+            policy_alert_floor: expected_alert_floor,
+            capture_event_floor: expected_capture_event_floor,
+            export_event_floor: expected_export_event_floor,
+        },
+    )
+}
+
+fn wait_for_agent_progress(
+    agent: &mut Child,
+    admin_socket_path: &Path,
+    expectation: AgentProgressExpectation,
+) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + AGENT_PROGRESS_TIMEOUT;
     let mut stable_polls = 0u8;
-    let mut last_policy_alerts = None;
+    let mut last_metrics = None;
     loop {
-        match read_agent_policy_metrics(admin_socket_path) {
+        match read_agent_progress_metrics(admin_socket_path) {
             Ok(policy) if policy.errors > 0 => {
                 return Err(e2e_error(format!(
                     "agent policy metrics reported {} runtime errors before expected alerts",
@@ -230,30 +264,32 @@ pub(crate) fn wait_for_agent_policy_progress(
                 ))
                 .into());
             }
-            Ok(policy) if policy.alerts >= expected_alert_floor => {
-                stable_polls = match last_policy_alerts {
-                    Some(previous) if previous == policy.alerts => stable_polls.saturating_add(1),
+            Ok(metrics) if metrics.satisfies(expectation) => {
+                stable_polls = match last_metrics {
+                    Some(previous) if previous == metrics => stable_polls.saturating_add(1),
                     _ => 1,
                 };
-                last_policy_alerts = Some(policy.alerts);
+                last_metrics = Some(metrics);
                 if stable_polls >= AGENT_PROGRESS_STABLE_POLLS {
                     return Ok(());
                 }
             }
-            Ok(policy) => {
+            Ok(metrics) => {
                 stable_polls = 0;
-                last_policy_alerts = Some(policy.alerts);
+                last_metrics = Some(metrics);
             }
             Err(error) => {
                 if let Some(status) = agent.try_wait()? {
                     return Err(e2e_error(format!(
-                        "agent exited with {status} before policy alert progress reached {expected_alert_floor}: {error}"
+                        "agent exited with {status} before progress reached {}: {error}",
+                        expectation.describe()
                     ))
                     .into());
                 }
                 if Instant::now() >= deadline {
                     return Err(e2e_error(format!(
-                        "timed out waiting for agent policy alert progress to reach {expected_alert_floor}: {error}"
+                        "timed out waiting for agent progress to reach {}: {error}",
+                        expectation.describe()
                     ))
                     .into());
                 }
@@ -261,7 +297,8 @@ pub(crate) fn wait_for_agent_policy_progress(
         }
         if Instant::now() >= deadline {
             return Err(e2e_error(format!(
-                "timed out waiting for agent policy alert progress to reach {expected_alert_floor}"
+                "timed out waiting for agent progress to reach {}",
+                expectation.describe()
             ))
             .into());
         }
@@ -372,14 +409,40 @@ fn ready_value(content: &str, key: &str) -> Option<String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AgentPolicyMetrics {
+struct AgentProgressExpectation {
+    policy_alert_floor: u64,
+    capture_event_floor: u64,
+    export_event_floor: u64,
+}
+
+impl AgentProgressExpectation {
+    fn describe(self) -> String {
+        format!(
+            "policy_alerts>={}, capture_events_read>={}, export_events_written>={}",
+            self.policy_alert_floor, self.capture_event_floor, self.export_event_floor
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentProgressMetrics {
+    capture_events_read: u64,
+    export_events_written: u64,
     alerts: u64,
     errors: u64,
 }
 
-fn read_agent_policy_metrics(
+impl AgentProgressMetrics {
+    fn satisfies(self, expectation: AgentProgressExpectation) -> bool {
+        self.alerts >= expectation.policy_alert_floor
+            && self.capture_events_read >= expectation.capture_event_floor
+            && self.export_events_written >= expectation.export_event_floor
+    }
+}
+
+fn read_agent_progress_metrics(
     admin_socket_path: &Path,
-) -> Result<AgentPolicyMetrics, Box<dyn std::error::Error>> {
+) -> Result<AgentProgressMetrics, Box<dyn std::error::Error>> {
     let mut stream = UnixStream::connect(admin_socket_path)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -388,7 +451,18 @@ fn read_agent_policy_metrics(
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     let response = serde_json::from_str::<serde_json::Value>(&line)?;
-    let policy = &response["metrics"]["pipeline"]["policy"];
+    let pipeline = &response["metrics"]["pipeline"];
+    let capture_events_read = pipeline["capture_events_read"].as_u64().ok_or_else(|| {
+        e2e_error(format!(
+            "admin metrics response omitted capture event count: {line}"
+        ))
+    })?;
+    let export_events_written = pipeline["export_events_written"].as_u64().ok_or_else(|| {
+        e2e_error(format!(
+            "admin metrics response omitted export event count: {line}"
+        ))
+    })?;
+    let policy = &pipeline["policy"];
     let alerts = policy["alerts"].as_u64().ok_or_else(|| {
         e2e_error(format!(
             "admin metrics response omitted policy alert count: {line}"
@@ -399,5 +473,10 @@ fn read_agent_policy_metrics(
             "admin metrics response omitted policy error count: {line}"
         ))
     })?;
-    Ok(AgentPolicyMetrics { alerts, errors })
+    Ok(AgentProgressMetrics {
+        capture_events_read,
+        export_events_written,
+        alerts,
+        errors,
+    })
 }

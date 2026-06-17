@@ -376,7 +376,7 @@ impl EbpfSocketReadSampleRecord {
         self.sample = EbpfSocketReadSample::new(0, 0, 0, [0; EBPF_SOCKET_READ_SAMPLE_BYTES]);
     }
 
-    pub fn socket_read_buffer_mut(&mut self) -> &mut [u8] {
+    pub fn socket_read_buffer_mut(&mut self) -> &mut [u8; EBPF_SOCKET_READ_SAMPLE_BYTES] {
         &mut self.sample.buffer
     }
 
@@ -432,7 +432,7 @@ impl EbpfSocketWriteSampleRecord {
         self.sample = EbpfSocketWriteSample::new(0, 0, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]);
     }
 
-    pub fn socket_write_buffer_mut(&mut self) -> &mut [u8] {
+    pub fn socket_write_buffer_mut(&mut self) -> &mut [u8; EBPF_SOCKET_WRITE_SAMPLE_BYTES] {
         &mut self.sample.buffer
     }
 

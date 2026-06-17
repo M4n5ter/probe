@@ -139,7 +139,7 @@ fn ebpf_provider_descriptor_from_object_report(
         CaptureBackend::Ebpf,
         CaptureProviderBuilder::Ebpf,
         format!(
-            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the process observation provider can emit connect and accept/accept4 flow-start observations, selector-authorized always-degraded outbound single-buffer and first-iovec syscall argument samples and inbound single-buffer and first-iovec syscall result samples, plus best-effort descriptor-close lifecycle events, but full multi-iovec continuation, lost-event conversion, and complete kernel traffic capture are not implemented",
+            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the process observation provider can emit connect and accept/accept4 flow-start observations, selector-authorized always-degraded outbound single-buffer and bounded first-non-empty-iovec syscall argument samples and inbound single-buffer and bounded first-non-empty-iovec syscall result samples, plus best-effort descriptor-close lifecycle events, but payload beyond the first sampled iovec segment, bounded iovec scan, or sample buffer, lost-event conversion, and complete kernel traffic capture are not implemented",
             object.summary(),
         ),
     )
@@ -321,9 +321,11 @@ mod tests {
         assert!(reason.contains("complete kernel traffic capture"));
         assert!(reason.contains("selector-authorized"));
         assert!(reason.contains(
-            "always-degraded outbound single-buffer and first-iovec syscall argument samples"
+            "always-degraded outbound single-buffer and bounded first-non-empty-iovec syscall argument samples"
         ));
-        assert!(reason.contains("inbound single-buffer and first-iovec syscall result samples"));
+        assert!(reason.contains(
+            "inbound single-buffer and bounded first-non-empty-iovec syscall result samples"
+        ));
         assert!(reason.contains("lost-event conversion"));
         assert!(reason.contains("best-effort descriptor-close lifecycle events"));
         assert!(reason.contains("process observation provider"));

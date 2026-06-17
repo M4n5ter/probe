@@ -22,8 +22,8 @@ use super::{
         Http1FixtureIoMode, Http1LoopbackFixtureConfig, PlainHttp1LoopbackFixtureConfig,
         assert_no_policy_runtime_errors, is_fixture_process, merge_run_results, spawn_agent,
         spawn_http1_loopback_fixture_with_io_mode, start_http1_loopback_fixture,
-        wait_for_agent_policy_progress, wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
-        wait_for_http1_loopback_fixture_ready,
+        wait_for_agent_pipeline_progress, wait_for_agent_ready,
+        wait_for_http1_loopback_fixture_exit, wait_for_http1_loopback_fixture_ready,
     },
 };
 
@@ -125,22 +125,38 @@ fn run_at(
     let fixture_result = wait_for_http1_loopback_fixture_exit(fixture.child_mut());
     fixture.unwatch();
     let progress_result = match &fixture_result {
-        Ok(()) => wait_for_agent_policy_progress(
+        Ok(()) => wait_for_agent_pipeline_progress(
             agent.child_mut(),
             &admin_socket_path,
             expected_policy_alert_messages().len() as u64,
+            expected_capture_event_floor(io_mode),
+            expected_export_event_floor(io_mode),
         ),
         Err(_) => Ok(()),
     };
     let agent_result = stop_running_child(agent.child_mut(), "agent");
     agent.unwatch();
     let spool_result = match (&fixture_result, &agent_result) {
-        (Ok(()), Ok(())) => assert_spool_outputs(&spool_path, fixture_ready.listen_port),
+        (Ok(()), Ok(())) => assert_spool_outputs(&spool_path, fixture_ready.listen_port, io_mode),
         _ => Ok(()),
     };
     merge_run_results(fixture_result, progress_result, agent_result, spool_result)?;
 
     Ok(())
+}
+
+fn expected_capture_event_floor(io_mode: Http1FixtureIoMode) -> u64 {
+    match io_mode {
+        Http1FixtureIoMode::ReadvWritev | Http1FixtureIoMode::SendmsgRecvmsg => 12,
+        Http1FixtureIoMode::ReadWrite | Http1FixtureIoMode::SendRecv => 10,
+    }
+}
+
+fn expected_export_event_floor(io_mode: Http1FixtureIoMode) -> u64 {
+    match io_mode {
+        Http1FixtureIoMode::ReadvWritev | Http1FixtureIoMode::SendmsgRecvmsg => 18,
+        Http1FixtureIoMode::ReadWrite | Http1FixtureIoMode::SendRecv => 16,
+    }
 }
 
 fn fixture_config() -> PlainHttp1LoopbackFixtureConfig {
@@ -235,13 +251,14 @@ fn write_agent_config(
 fn assert_spool_outputs(
     spool_path: &Path,
     listen_port: u16,
+    io_mode: Http1FixtureIoMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let spool = FjallSpool::open(spool_path)?;
     let ingress = spool.read_ingress_batch_after(0, 256)?;
     if ingress.is_empty() {
         return Err(e2e_error("expected eBPF ingress records, got none").into());
     }
-    assert_ebpf_ingress(&ingress, listen_port)?;
+    assert_ebpf_ingress(&ingress, listen_port, io_mode)?;
 
     let envelopes = spool
         .read_export_batch(E2E_EXPORT_CURSOR_OWNER, 512)?
@@ -265,6 +282,7 @@ fn assert_spool_outputs(
 fn assert_ebpf_ingress(
     events: &[StoredEvent],
     listen_port: u16,
+    io_mode: Http1FixtureIoMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let capture_events = events
         .iter()
@@ -298,7 +316,37 @@ fn assert_ebpf_ingress(
             .into());
         }
     }
+    assert_expected_vector_gaps(&capture_events, listen_port, io_mode)?;
 
+    Ok(())
+}
+
+fn assert_expected_vector_gaps(
+    events: &[CaptureEvent],
+    listen_port: u16,
+    io_mode: Http1FixtureIoMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match io_mode {
+        Http1FixtureIoMode::ReadvWritev | Http1FixtureIoMode::SendmsgRecvmsg => {}
+        Http1FixtureIoMode::ReadWrite | Http1FixtureIoMode::SendRecv => return Ok(()),
+    }
+
+    for (side, direction) in [
+        (FlowSide::Client, Direction::Outbound),
+        (FlowSide::Server, Direction::Inbound),
+    ] {
+        if events
+            .iter()
+            .any(|event| is_expected_gap_event(event, listen_port, side, direction))
+        {
+            continue;
+        }
+        return Err(e2e_error(format!(
+            "missing vector eBPF {side:?} {direction:?} truncated gap; observed {}",
+            ingress_summary(events, listen_port)
+        ))
+        .into());
+    }
     Ok(())
 }
 
@@ -470,6 +518,24 @@ fn is_expected_degraded_payload_event(
                 ..
             }
         )
+}
+
+fn is_expected_gap_event(
+    event: &CaptureEvent,
+    listen_port: u16,
+    side: FlowSide,
+    direction: Direction,
+) -> bool {
+    let CaptureEvent::Gap(gap) = event else {
+        return false;
+    };
+    gap.source == CaptureSource::EbpfSyscall
+        && gap.provider == CaptureProviderKind::Ebpf
+        && gap.gap.direction == direction
+        && matches_expected_side(gap.flow.local.port, gap.flow.remote.port, listen_port, side)
+        && gap.flow.attribution_confidence > 0
+        && is_fixture_process(&gap.flow.process)
+        && gap.gap.reason.contains("syscall sample truncated payload")
 }
 
 fn matches_expected_side(

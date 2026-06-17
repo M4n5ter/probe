@@ -204,7 +204,7 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider emits connect and accept/accept4 flow-start observations, selector-authorized always-degraded outbound single-buffer and first-iovec syscall argument samples plus inbound single-buffer and first-iovec syscall result samples, and best-effort descriptor-close lifecycle events; full multi-iovec continuation, partial-write retry semantics, and lost-event capture are not implemented",
+            "eBPF provider emits connect and accept/accept4 flow-start observations, selector-authorized always-degraded outbound single-buffer and bounded first-non-empty-iovec syscall argument samples plus inbound single-buffer and bounded first-non-empty-iovec syscall result samples, and best-effort descriptor-close lifecycle events; payload beyond the first sampled iovec segment, bounded iovec scan, or sample buffer, partial-write retry semantics, and lost-event capture are not implemented",
         )]
     }
 

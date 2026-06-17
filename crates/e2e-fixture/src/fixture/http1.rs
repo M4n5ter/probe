@@ -17,6 +17,7 @@ use super::{
 };
 
 const SCENARIO: &str = "http1-loopback";
+const VECTOR_FIRST_PAYLOAD_SLICE_BYTES: usize = 160;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Http1LoopbackConfig {
@@ -289,16 +290,18 @@ fn write_chunk(stream: &TcpStream, chunk: &[u8], io_mode: Http1IoMode) -> io::Re
     match io_mode {
         Http1IoMode::ReadWrite => rustix::io::write(stream, chunk).map_err(Into::into),
         Http1IoMode::ReadvWritev => {
-            rustix::io::writev(stream, &[IoSlice::new(chunk)]).map_err(Into::into)
+            let slices = vector_write_slices(chunk);
+            rustix::io::writev(stream, &slices).map_err(Into::into)
         }
         Http1IoMode::SendRecv => {
             rustix::net::send(stream, chunk, rustix::net::SendFlags::empty()).map_err(Into::into)
         }
         Http1IoMode::SendmsgRecvmsg => {
             let mut control = rustix::net::SendAncillaryBuffer::default();
+            let slices = vector_write_slices(chunk);
             rustix::net::sendmsg(
                 stream,
-                &[IoSlice::new(chunk)],
+                &slices,
                 &mut control,
                 rustix::net::SendFlags::empty(),
             )
@@ -323,7 +326,9 @@ fn read_chunk(stream: &TcpStream, buffer: &mut [u8], io_mode: Http1IoMode) -> io
     match io_mode {
         Http1IoMode::ReadWrite => rustix::io::read(stream, buffer).map_err(io::Error::from),
         Http1IoMode::ReadvWritev => {
-            rustix::io::readv(stream, &mut [IoSliceMut::new(buffer)]).map_err(io::Error::from)
+            let mut empty = [];
+            let mut slices = vector_read_slices(&mut empty, buffer);
+            rustix::io::readv(stream, &mut slices).map_err(io::Error::from)
         }
         Http1IoMode::SendRecv => {
             let (read, _) = rustix::net::recv(stream, buffer, rustix::net::RecvFlags::empty())
@@ -333,9 +338,11 @@ fn read_chunk(stream: &TcpStream, buffer: &mut [u8], io_mode: Http1IoMode) -> io
         Http1IoMode::SendmsgRecvmsg => {
             let mut control_space: [MaybeUninit<u8>; 0] = [];
             let mut control = rustix::net::RecvAncillaryBuffer::new(&mut control_space);
+            let mut empty = [];
+            let mut slices = vector_read_slices(&mut empty, buffer);
             let received = rustix::net::recvmsg(
                 stream,
-                &mut [IoSliceMut::new(buffer)],
+                &mut slices,
                 &mut control,
                 rustix::net::RecvFlags::empty(),
             )
@@ -343,6 +350,32 @@ fn read_chunk(stream: &TcpStream, buffer: &mut [u8], io_mode: Http1IoMode) -> io
             Ok(received.bytes)
         }
     }
+}
+
+fn vector_write_slices(chunk: &[u8]) -> [IoSlice<'_>; 3] {
+    let first_len = vector_first_payload_slice_len(chunk.len());
+    [
+        IoSlice::new(&chunk[..0]),
+        IoSlice::new(&chunk[..first_len]),
+        IoSlice::new(&chunk[first_len..]),
+    ]
+}
+
+fn vector_read_slices<'a>(
+    leading_empty: &'a mut [u8; 0],
+    buffer: &'a mut [u8],
+) -> [IoSliceMut<'a>; 3] {
+    let first_len = vector_first_payload_slice_len(buffer.len());
+    let (first, second) = buffer.split_at_mut(first_len);
+    [
+        IoSliceMut::new(leading_empty),
+        IoSliceMut::new(first),
+        IoSliceMut::new(second),
+    ]
+}
+
+fn vector_first_payload_slice_len(len: usize) -> usize {
+    core::cmp::min(len, VECTOR_FIRST_PAYLOAD_SLICE_BYTES)
 }
 
 fn io_error(action: &'static str, source: io::Error) -> Http1LoopbackError {
@@ -490,9 +523,9 @@ mod tests {
             let report = run_http1_loopback(Http1LoopbackConfig {
                 traffic: HttpTrafficConfig {
                     requests: 1,
-                    request_body_bytes: 64,
-                    response_body_bytes: 32,
-                    write_chunks: 2,
+                    request_body_bytes: VECTOR_FIRST_PAYLOAD_SLICE_BYTES + 64,
+                    response_body_bytes: VECTOR_FIRST_PAYLOAD_SLICE_BYTES + 32,
+                    write_chunks: 1,
                 },
                 run: LoopbackRunOptions::default(),
                 io_mode,

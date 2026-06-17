@@ -8,7 +8,7 @@ use ebpf_abi::{
 use super::payload::{
     PayloadAttemptSource, PayloadBufferAttempt, PayloadLogicalLen, clamp_u64_to_u32,
     iovec_payload_source_from_tracepoint, msghdr_payload_source_from_tracepoint,
-    payload_attempt_from_source, read_user_payload_prefix,
+    payload_buffer_attempt_from_source, payload_read_flag_bits, read_payload_prefix_from_attempt,
     single_buffer_payload_source_from_tracepoint, syscall_result_from_tracepoint,
 };
 
@@ -31,7 +31,7 @@ pub(crate) fn recvmsg_source_from_tracepoint(
 pub(crate) fn pending_read_attempt_from_source(
     source: PayloadAttemptSource,
 ) -> Option<EbpfPendingSocketReadAttempt> {
-    let attempt = payload_attempt_from_source(source)?;
+    let attempt = payload_buffer_attempt_from_source(source)?;
     Some(pending_read_attempt(attempt))
 }
 
@@ -64,14 +64,17 @@ pub(crate) fn capture_read_sample_from_result(
     }
     let mut flags = 0;
     event.clear_sample();
-    let captured_len = read_user_payload_prefix(
-        attempt.user_buffer,
-        core::cmp::min(attempt.readable_len, original_len),
+    let captured_len = read_payload_prefix_from_attempt(
+        PayloadBufferAttempt {
+            fd: attempt.fd,
+            user_buffer: attempt.user_buffer,
+            readable_len: u64::from(attempt.readable_len),
+            logical_len: PayloadLogicalLen::Known(u64::from(original_len)),
+        },
         original_len,
         event.socket_read_buffer_mut(),
         &mut flags,
-        EBPF_SOCKET_READ_TRUNCATED,
-        EBPF_SOCKET_READ_READ_FAILED,
+        payload_read_flag_bits(EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_READ_READ_FAILED),
     );
     event.overwrite_socket_read_sampled_metadata(
         super::process_metadata(ctx),
