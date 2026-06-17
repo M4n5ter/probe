@@ -19,14 +19,6 @@ pub(super) enum NftablesPlanError {
     UnsupportedExecutableStrategy {
         strategy: TransparentInterceptionStrategyConfig,
     },
-    #[error("transparent interception requires an explicit selector for setup-time rules")]
-    MissingSelector,
-    #[error(
-        "transparent interception selector must include at least one port or remote address constraint"
-    )]
-    UnconstrainedSelector,
-    #[error("transparent interception selector cannot be projected to nftables rules: {0}")]
-    UnsupportedSelector(String),
 }
 
 fn proxy_port_from_config(

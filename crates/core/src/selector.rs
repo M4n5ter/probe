@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
+};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::RegexSet;
@@ -13,6 +16,8 @@ pub enum SelectorError {
     InvalidGlob(String),
     #[error("invalid cmdline regex: {0}")]
     InvalidRegex(String),
+    #[error("invalid remote address: {0}")]
+    InvalidRemoteAddress(String),
     #[error("unknown named selector: {0}")]
     UnknownNamedSelector(String),
     #[error("recursive named selector reference: {0}")]
@@ -259,16 +264,19 @@ struct CompiledSelectorTerm {
     term: SelectorTerm,
     exe_path_globs: Option<GlobSet>,
     cmdline_regexes: Option<RegexSet>,
+    remote_addresses: Option<BTreeSet<IpAddr>>,
 }
 
 impl CompiledSelectorTerm {
     fn new(term: SelectorTerm) -> Result<Self, SelectorError> {
         let exe_path_globs = compile_globs(&term.process.exe_path_globs)?;
         let cmdline_regexes = compile_regexes(&term.process.cmdline_regexes)?;
+        let remote_addresses = compile_remote_addresses(&term.traffic.remote_addresses)?;
         Ok(Self {
             term,
             exe_path_globs,
             cmdline_regexes,
+            remote_addresses,
         })
     }
 
@@ -328,8 +336,7 @@ impl CompiledSelectorTerm {
             spec.local_ports.is_empty() || spec.local_ports.contains(&flow.local.port),
             spec.remote_ports.is_empty() || spec.remote_ports.contains(&flow.remote.port),
             direction_matches?,
-            spec.remote_addresses.is_empty()
-                || spec.remote_addresses.contains(&flow.remote.address),
+            match_remote_address(self.remote_addresses.as_ref(), &flow.remote.address),
         ]))
     }
 
@@ -448,6 +455,32 @@ fn compile_regexes(patterns: &[String]) -> Result<Option<RegexSet>, SelectorErro
         .map_err(|error| SelectorError::InvalidRegex(error.to_string()))
 }
 
+fn compile_remote_addresses(
+    addresses: &[String],
+) -> Result<Option<BTreeSet<IpAddr>>, SelectorError> {
+    if addresses.is_empty() {
+        return Ok(None);
+    }
+    addresses
+        .iter()
+        .map(|address| {
+            address
+                .parse::<IpAddr>()
+                .map_err(|error| SelectorError::InvalidRemoteAddress(format!("{address}: {error}")))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(Some)
+}
+
+fn match_remote_address(addresses: Option<&BTreeSet<IpAddr>>, flow_address: &str) -> bool {
+    match addresses {
+        None => true,
+        Some(addresses) => flow_address
+            .parse::<IpAddr>()
+            .is_ok_and(|address| addresses.contains(&address)),
+    }
+}
+
 fn all_match<const N: usize>(matches: [bool; N]) -> bool {
     matches.into_iter().all(|matched| matched)
 }
@@ -473,7 +506,7 @@ mod tests {
     use crate::{
         AddressPort, CaptureOrigin, CaptureSource, Direction, EventEnvelope, EventKind,
         FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity, ProcessSelector,
-        Selector, SelectorRegistry, Timestamp, TrafficSelector, TransportProtocol,
+        Selector, SelectorError, SelectorRegistry, Timestamp, TrafficSelector, TransportProtocol,
     };
 
     #[test]
@@ -860,6 +893,40 @@ mod tests {
         .compile();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn selector_matches_remote_addresses_by_ip_value() -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_addresses: vec!["2001:0db8::1".to_string()],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let mut flow = demo_flow();
+        flow.remote.address = "2001:db8::1".to_string();
+
+        assert!(selector.matches_flow_without_direction(&flow));
+        Ok(())
+    }
+
+    #[test]
+    fn selector_rejects_invalid_remote_addresses() {
+        let result = Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_addresses: vec!["not an ip".to_string()],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile();
+
+        assert!(matches!(
+            result,
+            Err(SelectorError::InvalidRemoteAddress(_))
+        ));
     }
 
     fn demo_flow() -> FlowContext {

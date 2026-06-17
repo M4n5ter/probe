@@ -4,8 +4,8 @@ use super::{
     plan::InboundTproxyLifecyclePlan,
 };
 use crate::transparent_interception::TransparentInterceptionError;
+use interception::TransparentInterceptionHostRuleScope;
 use probe_config::EnforcementInterceptionConfig;
-use probe_core::Selector;
 
 pub(in crate::transparent_interception) struct NftablesTransparentInterception {
     config: EnforcementInterceptionConfig,
@@ -53,17 +53,10 @@ impl NftablesTransparentInterception {
 
     pub(in crate::transparent_interception) fn activate(
         mut self,
-        effective_enforcement_selector: Option<&Selector>,
+        setup_scope: TransparentInterceptionHostRuleScope,
     ) -> Result<NftablesTransparentInterceptionGuard, TransparentInterceptionError> {
-        let setup_selector = super::super::effective_setup_selector(
-            effective_enforcement_selector,
-            self.config.selector.as_ref(),
-        );
-        let plan = InboundTproxyLifecyclePlan::from_config_and_scope(
-            &self.config,
-            setup_selector.as_ref(),
-        )
-        .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
+        let plan = InboundTproxyLifecyclePlan::from_config_and_scope(&self.config, setup_scope)
+            .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
         let setup_script = plan.setup_nft_script();
         check_nft_script(self.nft.as_mut(), &setup_script)?;
         let owner_lock = self.owner_lock.acquire(plan.owner_name())?;
@@ -239,7 +232,7 @@ mod tests {
 
         let guard =
             NftablesTransparentInterception::new_for_test(config, nft.clone(), Some(ip.clone()))
-                .activate(Some(&selector))?;
+                .activate(setup_scope(&selector))?;
         guard.deactivate()?;
 
         let nft_scripts = nft.scripts();
@@ -296,14 +289,14 @@ mod tests {
         let nft = FakeNft::succeeding();
         let ip = FakeIp::succeeding();
         let config = outbound_config();
-        let selector = outbound_selector();
+        let selector = setup_selector();
 
         let error = match NftablesTransparentInterception::new_for_test(
             config,
             nft.clone(),
             Some(ip.clone()),
         )
-        .activate(Some(&selector))
+        .activate(setup_scope(&selector))
         {
             Ok(_) => panic!("outbound MITM lifecycle must fail closed before host mutation"),
             Err(error) => error,
@@ -328,7 +321,7 @@ mod tests {
             nft.clone(),
             Some(ip.clone()),
         )
-        .activate(Some(&selector))?;
+        .activate(setup_scope(&selector))?;
         drop(guard);
 
         let nft_scripts = nft.scripts();
@@ -356,7 +349,7 @@ mod tests {
             nft.clone(),
             Some(ip),
         )
-        .activate(Some(&setup_selector()))
+        .activate(setup_scope(&setup_selector()))
         {
             Ok(_) => panic!("failed nft setup must fail activation"),
             Err(error) => error,
@@ -380,7 +373,7 @@ mod tests {
             nft.clone(),
             Some(ip.clone()),
         )
-        .activate(Some(&setup_selector()))
+        .activate(setup_scope(&setup_selector()))
         {
             Ok(_) => panic!("failed nft check must fail activation"),
             Err(error) => error,
@@ -409,7 +402,7 @@ mod tests {
 
         let guard =
             NftablesTransparentInterception::new_for_test(inbound_config(), nft, Some(ip.clone()))
-                .activate(Some(&selector))?;
+                .activate(setup_scope(&selector))?;
         guard.deactivate()?;
 
         let ip_args = ip.args();
@@ -499,15 +492,9 @@ mod tests {
         )
     }
 
-    fn outbound_selector() -> Selector {
-        Selector::term(
-            ProcessSelector::default(),
-            TrafficSelector {
-                remote_ports: vec![443],
-                directions: vec![Direction::Outbound],
-                ..TrafficSelector::default()
-            },
-        )
+    fn setup_scope(selector: &Selector) -> TransparentInterceptionHostRuleScope {
+        TransparentInterceptionHostRuleScope::from_inbound_tproxy_selector(Some(selector))
+            .expect("test selector should project to host rules")
     }
 
     fn string_args<const N: usize>(args: [&str; N]) -> Vec<String> {

@@ -2,6 +2,7 @@ mod capture;
 mod enforcement;
 mod error;
 mod export;
+mod interception_scope;
 mod registry;
 mod runtime_plan;
 mod storage;
@@ -23,6 +24,7 @@ pub use export::{
     ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
     ExportWorkerPlan, FileExportSinkPlan, WebhookExportSinkPlan,
 };
+pub use interception_scope::TransparentInterceptionLocalSetupScopePlan;
 pub use registry::{PlatformProbeResults, ProviderRegistry};
 pub use runtime_plan::{RuntimePlan, validate_static_runtime_config};
 pub use storage::{ExportRetentionPlan, IngressRetentionPlan, StoragePlan, StorageRetentionPlan};

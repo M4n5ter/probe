@@ -4,8 +4,8 @@ mod owner_lock;
 mod plan;
 mod probe;
 
+use interception::TransparentInterceptionHostRuleScope;
 use probe_config::EnforcementInterceptionConfig;
-use probe_core::Selector;
 
 use self::{
     command::{SystemIp, SystemNft},
@@ -16,15 +16,7 @@ use super::TransparentInterceptionRuntime;
 
 pub(super) use lifecycle::{NftablesTransparentInterception, NftablesTransparentInterceptionGuard};
 
-pub(super) fn resolve(
-    config: &EnforcementInterceptionConfig,
-    setup_selector: Option<&Selector>,
-) -> TransparentInterceptionRuntime {
-    match InboundTproxyLifecyclePlan::from_config_and_scope(config, setup_selector) {
-        Ok(_) => {}
-        Err(error) => return TransparentInterceptionRuntime::unavailable(error.to_string()),
-    }
-
+pub(super) fn resolve(config: &EnforcementInterceptionConfig) -> TransparentInterceptionRuntime {
     match NftablesInterceptionProbe::default().resolve() {
         NftablesInterceptionProbeResult::Available { nft, ip } => {
             TransparentInterceptionRuntime::available(
@@ -46,11 +38,11 @@ pub(super) fn resolve(
     }
 }
 
-pub(super) fn validate_setup_scope(
+pub(super) fn validate_effective_setup_scope(
     config: &EnforcementInterceptionConfig,
-    setup_selector: Option<&Selector>,
+    setup_scope: &TransparentInterceptionHostRuleScope,
 ) -> Result<(), super::TransparentInterceptionError> {
-    InboundTproxyLifecyclePlan::from_config_and_scope(config, setup_selector)
+    InboundTproxyLifecyclePlan::from_config_and_scope(config, setup_scope.clone())
         .map(|_| ())
         .map_err(|error| super::TransparentInterceptionError::Nftables(error.to_string()))
 }

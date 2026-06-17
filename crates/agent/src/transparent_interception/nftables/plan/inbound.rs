@@ -1,10 +1,10 @@
+use interception::TransparentInterceptionHostRuleScope;
 use probe_config::{EnforcementInterceptionConfig, TransparentInterceptionStrategyConfig};
-use probe_core::Selector;
 use runtime::TransparentInterceptionNftablesPlan;
 
 use super::{
     INBOUND_TPROXY_OWNER_LOCK, NftablesPlanError, hex_mark,
-    projection::{NftFamily, NftHookProjection, NftRule, NftSelectorProjection},
+    projection::{NftFamily, NftRule, NftSelectorProjection},
     proxy_port_from_config,
     route::PolicyRouteFamily,
 };
@@ -21,7 +21,7 @@ pub(in crate::transparent_interception::nftables) struct InboundTproxyLifecycleP
 impl InboundTproxyLifecyclePlan {
     pub(in crate::transparent_interception::nftables) fn from_config_and_scope(
         config: &EnforcementInterceptionConfig,
-        setup_selector: Option<&Selector>,
+        setup_scope: TransparentInterceptionHostRuleScope,
     ) -> Result<Self, NftablesPlanError> {
         if config.strategy != TransparentInterceptionStrategyConfig::InboundTproxy {
             return Err(NftablesPlanError::UnsupportedExecutableStrategy {
@@ -30,10 +30,7 @@ impl InboundTproxyLifecyclePlan {
         }
 
         let proxy_port = proxy_port_from_config(config)?;
-        let projection = NftSelectorProjection::from_selector(
-            setup_selector,
-            NftHookProjection::inbound_tproxy(),
-        )?;
+        let projection = NftSelectorProjection::from_host_rule_scope(setup_scope);
         let host_resources = TransparentInterceptionNftablesPlan::reserved();
         Ok(Self {
             table_name: host_resources.table_name,
@@ -160,9 +157,11 @@ mod tests {
                 remote_addresses: vec!["203.0.113.10".to_string()],
             },
         )));
-        let plan =
-            InboundTproxyLifecyclePlan::from_config_and_scope(&config, config.selector.as_ref())
-                .expect("selector should be projectable");
+        let plan = InboundTproxyLifecyclePlan::from_config_and_scope(
+            &config,
+            setup_scope(config.selector.as_ref().expect("selector should be set")),
+        )
+        .expect("selector should be projectable");
 
         let script = plan.setup_nft_script();
         let lines = script.lines().collect::<Vec<_>>();
@@ -204,9 +203,11 @@ mod tests {
                 ..TrafficSelector::default()
             },
         )));
-        let plan =
-            InboundTproxyLifecyclePlan::from_config_and_scope(&config, config.selector.as_ref())
-                .expect("selector should be projectable");
+        let plan = InboundTproxyLifecyclePlan::from_config_and_scope(
+            &config,
+            setup_scope(config.selector.as_ref().expect("selector should be set")),
+        )
+        .expect("selector should be projectable");
 
         assert_eq!(
             plan.setup_ip_commands(),
@@ -264,19 +265,19 @@ mod tests {
             },
         };
 
+        let first_scope = setup_scope(first.selector.as_ref().expect("selector should be set"));
         let first_plan =
-            InboundTproxyLifecyclePlan::from_config_and_scope(&first, first.selector.as_ref())
+            InboundTproxyLifecyclePlan::from_config_and_scope(&first, first_scope.clone())
                 .expect("first plan should be valid");
-        let second_plan =
-            InboundTproxyLifecyclePlan::from_config_and_scope(&second, second.selector.as_ref())
-                .expect("second plan should be valid");
+        let second_plan = InboundTproxyLifecyclePlan::from_config_and_scope(&second, first_scope)
+            .expect("second plan should be valid");
 
         assert_eq!(first_plan.owner_name(), "inbound_tproxy");
         assert_eq!(second_plan.owner_name(), "inbound_tproxy");
         assert!(matches!(
             InboundTproxyLifecyclePlan::from_config_and_scope(
                 &outbound,
-                outbound.selector.as_ref()
+                setup_scope(first.selector.as_ref().expect("selector should be set")),
             ),
             Err(NftablesPlanError::UnsupportedExecutableStrategy { .. })
         ));
@@ -290,5 +291,10 @@ mod tests {
                 listen_port: Some(15001),
             },
         }
+    }
+
+    fn setup_scope(selector: &Selector) -> TransparentInterceptionHostRuleScope {
+        TransparentInterceptionHostRuleScope::from_inbound_tproxy_selector(Some(selector))
+            .expect("test selector should project to host rules")
     }
 }

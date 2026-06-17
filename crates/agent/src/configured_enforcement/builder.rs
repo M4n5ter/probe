@@ -1,6 +1,10 @@
 use enforcement::{
     EnforcementBackend, EnforcementError, ScopedEnforcementPlanner, SetupTimeEnforcementSurface,
 };
+use interception::{
+    TransparentInterceptionHostRuleScope, TransparentInterceptionSetupSelectorSources,
+    TransparentInterceptionSetupSelectors,
+};
 use probe_core::{EnforcementMode, ProtectiveActionProfile, Selector};
 use runtime::{EnforcementExecutionSurface, EnforcementPolicySourcePlan, RuntimePlan};
 use thiserror::Error;
@@ -30,6 +34,7 @@ pub struct ConfiguredEnforcement {
     pub config_selector_configured: bool,
     pub manifest_selector_configured: Option<bool>,
     pub effective_selector: Option<Selector>,
+    pub transparent_interception_setup_scope: Option<TransparentInterceptionHostRuleScope>,
     pub policy_source: Option<LoadedEnforcementPolicySource>,
 }
 
@@ -37,7 +42,7 @@ pub async fn build_configured_enforcement_with_backend(
     plan: &RuntimePlan,
     backend: Option<Box<dyn EnforcementBackend>>,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
-    let configured = build_configured_enforcement_from_parts(
+    let mut configured = build_configured_enforcement_from_parts(
         plan.enforcement.mode,
         plan.config.enforcement.selector.clone(),
         plan.enforcement.config_selector_configured,
@@ -46,10 +51,19 @@ pub async fn build_configured_enforcement_with_backend(
         backend,
     )
     .await?;
-    crate::transparent_interception::validate_setup_scope(
-        &plan.config.enforcement.interception,
-        configured.effective_selector.as_ref(),
-    )?;
+    let setup_selectors = TransparentInterceptionSetupSelectors::from_sources(
+        TransparentInterceptionSetupSelectorSources {
+            local_enforcement_selector: plan.config.enforcement.selector.as_ref(),
+            effective_enforcement_selector: configured.effective_selector.as_ref(),
+            interception_selector: plan.config.enforcement.interception.selector.as_ref(),
+        },
+    );
+    let transparent_interception_setup_scope =
+        crate::transparent_interception::effective_setup_scope(
+            &plan.config.enforcement.interception,
+            setup_selectors,
+        )?;
+    configured.transparent_interception_setup_scope = transparent_interception_setup_scope;
     Ok(configured)
 }
 
@@ -91,6 +105,7 @@ async fn build_configured_enforcement_from_parts(
             .as_ref()
             .map(|source| source.manifest.selector.is_some()),
         effective_selector,
+        transparent_interception_setup_scope: None,
         policy_source,
     })
 }
@@ -161,10 +176,19 @@ mod tests {
         EnforcementBackend, EnforcementBackendDecision, EnforcementBackendRequest,
         EnforcementPlanRequest, EnforcementPlanner,
     };
+    use probe_config::{
+        AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicyManifest,
+        EnforcementPolicySourceConfig, TransparentInterceptionStrategyConfig,
+    };
     use probe_core::{
-        Action, AddressPort, CaptureOrigin, CaptureSource, Direction, EnforcementMode,
-        EnforcementOutcome, EventEnvelope, EventKind, FlowContext, FlowIdentity, OpaqueStream,
-        ProcessContext, ProcessIdentity, Timestamp, TransportProtocol, Verdict, VerdictScope,
+        Action, AddressPort, CapabilityKind, CapabilityState, CaptureOrigin, CaptureSource,
+        Direction, EnforcementMode, EnforcementOutcome, EventEnvelope, EventKind, FlowContext,
+        FlowIdentity, OpaqueStream, ProcessContext, ProcessIdentity, ProcessSelector, Timestamp,
+        TrafficSelector, TransportProtocol, Verdict, VerdictScope,
+    };
+    use runtime::{
+        CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry,
+        TransparentInterceptionLocalSetupScopePlan,
     };
 
     use super::*;
@@ -264,6 +288,143 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn local_process_scoped_transparent_interception_fails_at_setup_composition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector {
+                names: vec!["curl".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        ));
+
+        let plan = RuntimePlan::build(config, &transparent_interception_registry())?;
+        assert!(matches!(
+            plan.enforcement.interception.local_setup_scope,
+            TransparentInterceptionLocalSetupScopePlan::RequiresProcessClassifier { .. }
+        ));
+        let error = match build_configured_enforcement_with_backend(&plan, None).await {
+            Ok(_) => panic!("process-scoped setup must require classifier support"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("process classifier"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manifest_selector_can_narrow_but_not_make_setup_process_scoped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let manifest_path = temp.path().join("manifest.toml");
+        let manifest = EnforcementPolicyManifest {
+            id: "managed-apps".to_string(),
+            version: "test-version".to_string(),
+            selector: Some(Selector::term(
+                ProcessSelector {
+                    names: vec!["curl".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            )),
+            protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
+        };
+        std::fs::write(&manifest_path, toml::to_string(&manifest)?)?;
+
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: manifest_path,
+        };
+
+        let plan = RuntimePlan::build(config, &transparent_interception_registry())?;
+        assert_eq!(
+            plan.enforcement.interception.local_setup_scope,
+            TransparentInterceptionLocalSetupScopePlan::HostRules
+        );
+        let error = match build_configured_enforcement_with_backend(&plan, None).await {
+            Ok(_) => panic!("manifest process selector must require classifier support"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("process classifier"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manifest_selector_cannot_supply_the_only_setup_host_constraint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let manifest_path = temp.path().join("manifest.toml");
+        let manifest = EnforcementPolicyManifest {
+            id: "managed-apps".to_string(),
+            version: "test-version".to_string(),
+            selector: Some(Selector::term(
+                ProcessSelector::default(),
+                TrafficSelector {
+                    local_ports: vec![8443],
+                    directions: vec![Direction::Inbound],
+                    ..TrafficSelector::default()
+                },
+            )),
+            protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
+        };
+        std::fs::write(&manifest_path, toml::to_string(&manifest)?)?;
+
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: manifest_path,
+        };
+
+        let plan = RuntimePlan::build(config, &transparent_interception_registry())?;
+        assert!(matches!(
+            plan.enforcement.interception.local_setup_scope,
+            TransparentInterceptionLocalSetupScopePlan::Unsupported { .. }
+        ));
+        let error = match build_configured_enforcement_with_backend(&plan, None).await {
+            Ok(_) => panic!("manifest must not supply the only setup host constraint"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("at least one port or remote address")
+        );
+        Ok(())
+    }
+
     struct ApplyingBackend;
 
     impl EnforcementBackend for ApplyingBackend {
@@ -292,6 +453,25 @@ mod tests {
                 fingerprint: vec![1, 2, 3],
                 reason: "test payload".to_string(),
             }),
+        )
+    }
+
+    fn transparent_interception_registry() -> ProviderRegistry {
+        ProviderRegistry::new(
+            vec![CaptureProviderDescriptor::available(
+                CaptureBackend::Libpcap,
+                CaptureProviderBuilder::Libpcap,
+            )],
+            vec![
+                CapabilityState::available(CapabilityKind::Http1),
+                CapabilityState::available(CapabilityKind::Sse),
+                CapabilityState::available(CapabilityKind::WebSocketHandoff),
+                CapabilityState::available(CapabilityKind::WebSocketFrame),
+                CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
+                CapabilityState::available(CapabilityKind::DryRunEnforcement),
+                CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
+                CapabilityState::available(CapabilityKind::TransparentInterception),
+            ],
         )
     }
 

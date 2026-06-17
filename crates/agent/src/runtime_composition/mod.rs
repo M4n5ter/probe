@@ -67,10 +67,7 @@ fn execution_runtimes_for_config(
 ) -> (ConnectionEnforcementRuntime, TransparentInterceptionRuntime) {
     (
         connection_enforcement::resolve(config.enforcement.backend),
-        transparent_interception::resolve(
-            &config.enforcement.interception,
-            config.enforcement.selector.as_ref(),
-        ),
+        transparent_interception::resolve(&config.enforcement.interception),
     )
 }
 
@@ -100,33 +97,6 @@ mod tests {
         let (_plan, backend) = composition.into_enforcement_parts();
 
         assert!(backend.is_none());
-    }
-
-    #[test]
-    fn process_scoped_transparent_interception_setup_fails_closed() {
-        let mut config = AgentConfig::default();
-        config.capture.selection = CaptureSelection::Libpcap;
-        config.enforcement.mode = EnforcementMode::Enforce;
-        config.enforcement.interception.strategy =
-            TransparentInterceptionStrategyConfig::InboundTproxy;
-        config.enforcement.interception.proxy.listen_port = Some(15001);
-        config.enforcement.interception.selector = Some(Selector::term(
-            ProcessSelector {
-                names: vec!["curl".to_string()],
-                ..ProcessSelector::default()
-            },
-            TrafficSelector::default(),
-        ));
-        let error = match build_runtime_composition(config) {
-            Ok(_) => panic!("transparent interception should be unavailable"),
-            Err(error) => error,
-        };
-
-        assert!(
-            error
-                .to_string()
-                .contains("process constraints cannot be represented")
-        );
     }
 
     #[test]

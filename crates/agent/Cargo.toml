@@ -12,6 +12,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 ebpf-object = { path = "../ebpf-object" }
 enforcement = { path = "../enforcement" }
 exporter = { path = "../exporter" }
+interception = { path = "../interception" }
 parsers = { path = "../parsers" }
 pipeline = { path = "../pipeline" }
 policy = { path = "../policy" }

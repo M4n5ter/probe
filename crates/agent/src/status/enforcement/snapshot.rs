@@ -7,8 +7,8 @@ use crate::configured_enforcement::{
 use probe_config::{ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig};
 use probe_core::{CapabilityKind, EnforcementMode, ProtectiveActionProfile, RuntimeMode};
 use runtime::{
-    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionNftablesPlan,
-    TransparentInterceptionProxyPlan,
+    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionLocalSetupScopePlan,
+    TransparentInterceptionNftablesPlan, TransparentInterceptionProxyPlan,
 };
 use serde::Serialize;
 
@@ -36,6 +36,7 @@ pub struct EnforcementInterceptionStatusSnapshot {
     pub strategy: TransparentInterceptionStrategyConfig,
     pub proxy: TransparentInterceptionProxyPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
+    pub local_setup_scope: TransparentInterceptionLocalSetupScopePlan,
     pub selector_configured: bool,
     pub capability: EnforcementCapabilityStatusSnapshot,
 }
@@ -139,6 +140,7 @@ fn enforcement_status_with_source(
             strategy: plan.enforcement.interception.strategy,
             proxy: plan.enforcement.interception.proxy,
             nftables: plan.enforcement.interception.nftables.clone(),
+            local_setup_scope: plan.enforcement.interception.local_setup_scope.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,
             capability: enforcement_capability_status(&plan.enforcement.interception.capability),
         },
@@ -622,6 +624,10 @@ protective_actions = ["alert"]
         assert_eq!(status.interception.nftables.table_name, "sssa_probe");
         assert_eq!(status.interception.nftables.route_table, 53_534);
         assert!(status.interception.selector_configured);
+        assert!(matches!(
+            status.interception.local_setup_scope,
+            runtime::TransparentInterceptionLocalSetupScopePlan::Unsupported { .. }
+        ));
         assert_eq!(
             status.interception.capability,
             EnforcementCapabilityStatusSnapshot::Required {
@@ -635,6 +641,10 @@ protective_actions = ["alert"]
         assert_eq!(
             value["interception"]["nftables"]["table_name"],
             json!("sssa_probe")
+        );
+        assert_eq!(
+            value["interception"]["local_setup_scope"]["kind"],
+            json!("unsupported")
         );
         assert_eq!(
             value["interception"]["capability"]["capability"],

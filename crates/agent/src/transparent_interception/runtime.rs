@@ -1,4 +1,4 @@
-use probe_core::Selector;
+use interception::TransparentInterceptionHostRuleScope;
 use probe_core::{CapabilityKind, CapabilityState};
 
 use super::{
@@ -14,7 +14,7 @@ pub(crate) struct TransparentInterceptionRuntime {
 pub(super) trait TransparentInterceptionLifecycle: Send {
     fn activate(
         self: Box<Self>,
-        effective_enforcement_selector: Option<&Selector>,
+        setup_scope: TransparentInterceptionHostRuleScope,
     ) -> Result<Box<dyn TransparentInterceptionGuardLifecycle>, TransparentInterceptionError>;
 }
 
@@ -29,12 +29,17 @@ impl TransparentInterceptionRuntime {
 
     pub(crate) fn activate(
         self,
-        effective_enforcement_selector: Option<&Selector>,
+        setup_scope: Option<TransparentInterceptionHostRuleScope>,
     ) -> Result<Option<TransparentInterceptionGuard>, TransparentInterceptionError> {
         self.activation
             .map(|activation| {
+                let setup_scope = setup_scope.ok_or_else(|| {
+                    TransparentInterceptionError::Nftables(
+                        "transparent interception setup scope is missing".to_string(),
+                    )
+                })?;
                 activation
-                    .activate(effective_enforcement_selector)
+                    .activate(setup_scope)
                     .map(TransparentInterceptionGuard::new)
             })
             .transpose()
@@ -82,9 +87,9 @@ impl TransparentInterceptionGuard {
 impl TransparentInterceptionLifecycle for NftablesTransparentInterception {
     fn activate(
         self: Box<Self>,
-        effective_enforcement_selector: Option<&Selector>,
+        setup_scope: TransparentInterceptionHostRuleScope,
     ) -> Result<Box<dyn TransparentInterceptionGuardLifecycle>, TransparentInterceptionError> {
-        NftablesTransparentInterception::activate(*self, effective_enforcement_selector)
+        NftablesTransparentInterception::activate(*self, setup_scope)
             .map(|guard| Box::new(guard) as Box<dyn TransparentInterceptionGuardLifecycle>)
     }
 }

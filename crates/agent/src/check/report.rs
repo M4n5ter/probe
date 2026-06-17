@@ -17,8 +17,8 @@ use probe_config::{
 };
 use probe_core::EnforcementMode;
 use runtime::{
-    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionNftablesPlan,
-    TransparentInterceptionProxyPlan,
+    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionLocalSetupScopePlan,
+    TransparentInterceptionNftablesPlan, TransparentInterceptionProxyPlan,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -91,6 +91,7 @@ pub struct EnforcementInterceptionCheckSnapshot {
     pub strategy: TransparentInterceptionStrategyConfig,
     pub proxy: TransparentInterceptionProxyPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
+    pub local_setup_scope: TransparentInterceptionLocalSetupScopePlan,
     pub selector_configured: bool,
     pub capability: EnforcementCapabilityPlan,
 }
@@ -191,6 +192,7 @@ async fn check_enforcement(
             strategy: plan.enforcement.interception.strategy,
             proxy: plan.enforcement.interception.proxy,
             nftables: plan.enforcement.interception.nftables.clone(),
+            local_setup_scope: plan.enforcement.interception.local_setup_scope.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,
             capability: plan.enforcement.interception.capability.clone(),
         },
@@ -563,6 +565,10 @@ protective_actions = ["alert"]
         assert_eq!(
             value["enforcement"]["interception"]["nftables"]["table_name"],
             json!("sssa_probe")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["local_setup_scope"]["kind"],
+            json!("not_configured")
         );
         assert_eq!(
             value["enforcement"]["interception"]["capability"]["kind"],

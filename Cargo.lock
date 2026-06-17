@@ -18,6 +18,7 @@ dependencies = [
  "ebpf-object",
  "enforcement",
  "exporter",
+ "interception",
  "parsers",
  "pipeline",
  "policy",
@@ -1187,6 +1188,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "interception"
+version = "0.1.0"
+dependencies = [
+ "probe-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "interval-heap"
 version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1990,6 +1999,7 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "attribution",
+ "interception",
  "probe-config",
  "probe-core",
  "serde",

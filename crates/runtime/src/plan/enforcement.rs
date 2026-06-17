@@ -7,6 +7,8 @@ use probe_config::{
 use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
 
+use super::interception_scope::TransparentInterceptionLocalSetupScopePlan;
+
 const RESERVED_TRANSPARENT_INTERCEPTION_NFTABLES_TABLE: &str = "sssa_probe";
 const RESERVED_TRANSPARENT_INTERCEPTION_NFTABLES_MARK: u32 = 0x5353_4101;
 const RESERVED_TRANSPARENT_INTERCEPTION_ROUTE_TABLE: u32 = 53_534;
@@ -88,6 +90,7 @@ pub struct EnforcementInterceptionPlan {
     pub strategy: TransparentInterceptionStrategyConfig,
     pub proxy: TransparentInterceptionProxyPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
+    pub local_setup_scope: TransparentInterceptionLocalSetupScopePlan,
     pub capability: EnforcementCapabilityPlan,
     pub selector_configured: bool,
 }
@@ -101,6 +104,12 @@ impl EnforcementInterceptionPlan {
                 &config.enforcement.interception.proxy,
             ),
             nftables: TransparentInterceptionNftablesPlan::reserved(),
+            local_setup_scope:
+                TransparentInterceptionLocalSetupScopePlan::from_strategy_and_selectors(
+                    strategy,
+                    config.enforcement.selector.as_ref(),
+                    config.enforcement.interception.selector.as_ref(),
+                ),
             capability: EnforcementCapabilityPlan::from_interception_strategy(
                 strategy,
                 capabilities,
@@ -376,6 +385,10 @@ mod tests {
             vec![EnforcementExecutionSurface::TransparentInterception]
         );
         assert!(plan.interception.selector_configured);
+        assert!(matches!(
+            plan.interception.local_setup_scope,
+            TransparentInterceptionLocalSetupScopePlan::Unsupported { .. }
+        ));
         assert_eq!(plan.interception.proxy.listen_port, Some(15001));
         assert_eq!(plan.interception.nftables.table_name, "sssa_probe");
         assert_eq!(plan.interception.nftables.mark, 0x5353_4101);

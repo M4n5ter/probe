@@ -1,6 +1,7 @@
 use std::{io::Write, os::unix::net::UnixStream, path::PathBuf, sync::Arc};
 
 use enforcement::ScopedEnforcementPlanner;
+use interception::TransparentInterceptionHostRuleScope;
 use parsers::Http1ParserFactory;
 use pipeline::{
     CapturePipeline, PipelinePolicySet, PipelineRunOptions, PipelineRuntimeMetrics, PipelineSummary,
@@ -92,7 +93,7 @@ pub(crate) async fn run_live_agent(
         spool: Arc::clone(&spool),
         policy_set,
         enforcement_planner: enforcement.planner,
-        effective_enforcement_selector: enforcement.effective_selector,
+        transparent_interception_setup_scope: enforcement.transparent_interception_setup_scope,
         transparent_interception,
         pipeline_metrics,
         tls_plaintext_runtime,
@@ -144,7 +145,7 @@ struct BlockingCaptureRun {
     spool: Arc<FjallSpool>,
     policy_set: PipelinePolicySet,
     enforcement_planner: ScopedEnforcementPlanner,
-    effective_enforcement_selector: Option<probe_core::Selector>,
+    transparent_interception_setup_scope: Option<TransparentInterceptionHostRuleScope>,
     transparent_interception: TransparentInterceptionRuntime,
     pipeline_metrics: PipelineRuntimeMetrics,
     tls_plaintext_runtime: TlsPlaintextRuntimeState,
@@ -168,7 +169,7 @@ impl BlockingCaptureRun {
             spool,
             policy_set,
             mut enforcement_planner,
-            effective_enforcement_selector,
+            transparent_interception_setup_scope,
             transparent_interception,
             pipeline_metrics,
             tls_plaintext_runtime,
@@ -198,7 +199,7 @@ impl BlockingCaptureRun {
                 .map(|config| spawn_storage_retention_workers(Arc::clone(&spool), config));
             let mut pipeline = pipeline.with_enforcement_planner(&mut enforcement_planner);
             transparent_interception_guard =
-                transparent_interception.activate(effective_enforcement_selector.as_ref())?;
+                transparent_interception.activate(transparent_interception_setup_scope)?;
             let mut provider = build_capture_provider(&plan, Some(&tls_plaintext_runtime))?;
             signal_readiness(readiness)?;
             let capture_summary = pipeline.run_provider_with_options(
