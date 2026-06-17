@@ -1,22 +1,16 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::Path,
-    process::ExitCode,
-};
+use std::{collections::BTreeMap, fs, path::Path, process::ExitCode};
 
 use exporter::CompressionCodec;
-use probe_config::{CompressionCodecName, ExporterConfig, ExporterTransportConfig};
-use probe_core::{
-    CaptureProviderKind, CaptureSource, EventEnvelope, EventKind, SpoolPayloadSchema,
-};
-use proto::PayloadFormat;
-use storage::FjallSpool;
+use probe_config::{ExporterConfig, ExporterTransportConfig};
 
 use super::harness::{e2e_error, run_agent_with_max_events, run_with_temp_root};
+use super::plaintext_export_batches::{
+    assert_batch_sequence_contract, assert_expected_export_set, assert_export_cursor,
+    compression_codec_name, decode_and_assert_event_records,
+};
 use super::plaintext_scenario::{
-    PLAINTEXT_FEED_EVENT_COUNT, PLAINTEXT_FEED_EXPORT_EVENT_COUNT, PlaintextFeedScenario,
-    PlaintextFlow, PlaintextHttpRequest, PlaintextPolicy, PlaintextProcess, PlaintextScenarioIds,
+    PLAINTEXT_FEED_EVENT_COUNT, PlaintextFeedScenario, PlaintextFlow, PlaintextHttpRequest,
+    PlaintextPolicy, PlaintextProcess, PlaintextScenarioIds,
 };
 use super::webhook_receiver::{ReceivedBatch, WebhookBatchReceiver};
 
@@ -65,7 +59,7 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     run_agent_with_max_events(&config_path, PLAINTEXT_FEED_EVENT_COUNT)?;
     let batches = receiver.join()?;
     let expected_cursor = assert_webhook_batches(&batches, &scenario)?;
-    assert_export_cursor(&spool_path, expected_cursor)?;
+    assert_export_cursor(&spool_path, COLLECTOR_SINK, expected_cursor)?;
 
     Ok(())
 }
@@ -113,7 +107,7 @@ fn write_agent_config(
             headers: BTreeMap::from([("x-sssa-e2e".to_string(), "webhook-exporter".to_string())]),
             tls: Default::default(),
         },
-        codec: test_codec_name(),
+        codec: compression_codec_name(TEST_CODEC),
         worker: Default::default(),
     });
     fs::write(path, toml::to_string(&config)?)?;
@@ -139,9 +133,18 @@ fn assert_webhook_batches(
         return Err(e2e_error("webhook receiver did not observe configured header").into());
     }
 
-    let expected_cursor = assert_batch_sequence_contract(batches)?;
-    let envelopes = decode_and_assert_event_records(batches)?;
-    assert_expected_export_set(&envelopes, scenario)?;
+    let batch_envelopes = batches
+        .iter()
+        .map(|batch| batch.batch.clone())
+        .collect::<Vec<_>>();
+    let expected_cursor = assert_batch_sequence_contract(
+        &batch_envelopes,
+        AGENT_ID,
+        COLLECTOR_SINK,
+        "webhook batches",
+    )?;
+    let envelopes = decode_and_assert_event_records(&batch_envelopes, "webhook batches")?;
+    assert_expected_export_set(&envelopes, scenario, "webhook batches")?;
 
     println!(
         "e2e webhook exporter observed {} HTTP requests carrying {} exported events",
@@ -149,222 +152,4 @@ fn assert_webhook_batches(
         envelopes.len()
     );
     Ok(expected_cursor)
-}
-
-fn assert_batch_sequence_contract(
-    batches: &[ReceivedBatch],
-) -> Result<u64, Box<dyn std::error::Error>> {
-    let mut all_sequences = Vec::new();
-    for batch in batches {
-        if batch.batch.agent_id != AGENT_ID {
-            return Err(e2e_error(format!(
-                "batch {} carried unexpected agent id {}",
-                batch.batch.batch_id, batch.batch.agent_id
-            ))
-            .into());
-        }
-        let Some(first_sequence) = batch.batch.events.first().map(|event| event.sequence) else {
-            return Err(e2e_error("webhook receiver observed an empty batch").into());
-        };
-        let last_sequence = batch
-            .batch
-            .events
-            .last()
-            .map(|event| event.sequence)
-            .expect("non-empty batch has a last event");
-        let expected_batch_id = expected_batch_id(first_sequence, last_sequence);
-        if batch.batch.batch_id != expected_batch_id {
-            return Err(e2e_error(format!(
-                "batch id {} did not match expected range id {expected_batch_id}",
-                batch.batch.batch_id
-            ))
-            .into());
-        }
-        let batch_sequences = batch
-            .batch
-            .events
-            .iter()
-            .map(|event| event.sequence)
-            .collect::<Vec<_>>();
-        let expected_batch_sequences = (first_sequence..=last_sequence).collect::<Vec<_>>();
-        if batch_sequences != expected_batch_sequences {
-            return Err(e2e_error(format!(
-                "batch {} has non-contiguous sequences {:?}",
-                batch.batch.batch_id, batch_sequences
-            ))
-            .into());
-        }
-        for event in &batch.batch.events {
-            if event.payload_format() != PayloadFormat::Json {
-                return Err(e2e_error(format!(
-                    "batch {} carried non-json payload format at sequence {}",
-                    batch.batch.batch_id, event.sequence
-                ))
-                .into());
-            }
-            if event.payload_schema != SpoolPayloadSchema::EventEnvelopeSubjectOriginJson.as_str() {
-                return Err(e2e_error(format!(
-                    "batch {} carried unexpected payload schema {} at sequence {}",
-                    batch.batch.batch_id, event.payload_schema, event.sequence
-                ))
-                .into());
-            }
-        }
-        all_sequences.extend(batch_sequences);
-    }
-
-    let unique_sequences = all_sequences.iter().copied().collect::<BTreeSet<_>>();
-    if unique_sequences.len() != all_sequences.len() {
-        return Err(e2e_error(format!(
-            "webhook batches carried duplicate export sequences {all_sequences:?}"
-        ))
-        .into());
-    }
-    let expected_sequences = (1..=u64::try_from(PLAINTEXT_FEED_EXPORT_EVENT_COUNT)
-        .unwrap_or(u64::MAX))
-        .collect::<BTreeSet<_>>();
-    if unique_sequences != expected_sequences {
-        return Err(e2e_error(format!(
-            "webhook batches carried export sequences {:?}, expected {:?}",
-            unique_sequences, expected_sequences
-        ))
-        .into());
-    }
-    unique_sequences
-        .last()
-        .copied()
-        .ok_or_else(|| e2e_error("webhook receiver observed no export sequences").into())
-}
-
-fn expected_batch_id(first_sequence: u64, last_sequence: u64) -> String {
-    format!("{AGENT_ID}:{COLLECTOR_SINK}:{first_sequence}-{last_sequence}")
-}
-
-fn test_codec_name() -> CompressionCodecName {
-    match TEST_CODEC {
-        CompressionCodec::None => CompressionCodecName::None,
-        CompressionCodec::Zstd => CompressionCodecName::Zstd,
-        CompressionCodec::Gzip => CompressionCodecName::Gzip,
-        CompressionCodec::Deflate => CompressionCodecName::Deflate,
-    }
-}
-
-fn decode_and_assert_event_records(
-    batches: &[ReceivedBatch],
-) -> Result<Vec<EventEnvelope>, Box<dyn std::error::Error>> {
-    batches
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .batch
-                .events
-                .iter()
-                .map(|record| (&batch.batch, record))
-        })
-        .map(|(batch, record)| {
-            let envelope = serde_json::from_slice::<EventEnvelope>(&record.payload)?;
-            if record.event_id != envelope.id().as_str() {
-                return Err(e2e_error(format!(
-                    "batch {} record event id {} did not match payload envelope id {}",
-                    batch.batch_id,
-                    record.event_id,
-                    envelope.id().as_str()
-                ))
-                .into());
-            }
-            Ok(envelope)
-        })
-        .collect()
-}
-
-fn assert_expected_export_set(
-    envelopes: &[EventEnvelope],
-    scenario: &PlaintextFeedScenario,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if envelopes.len() != PLAINTEXT_FEED_EXPORT_EVENT_COUNT {
-        return Err(e2e_error(format!(
-            "expected {PLAINTEXT_FEED_EXPORT_EVENT_COUNT} exported events, got {}",
-            envelopes.len()
-        ))
-        .into());
-    }
-    let expected_flow_id = scenario.expected_flow_id();
-    if !envelopes.iter().all(|envelope| {
-        envelope.origin().source() == CaptureSource::ExternalPlaintextFeed
-            && envelope.origin().provider() == CaptureProviderKind::Plaintext
-            && envelope
-                .flow()
-                .is_some_and(|flow| flow.id.0 == expected_flow_id)
-    }) {
-        return Err(e2e_error("webhook batch carried an unexpected source or flow").into());
-    }
-
-    let request_count = envelopes
-        .iter()
-        .filter(|envelope| {
-            matches!(
-                envelope.kind(),
-                EventKind::HttpRequestHeaders(headers)
-                    if headers.method.as_deref() == Some("GET")
-                        && headers.target.as_deref() == Some(scenario.request_target())
-            )
-        })
-        .count();
-    let expected_policy_version = scenario.expected_policy_version();
-    let expected_alert = scenario.expected_policy_alert_message();
-    let policy_alert_count = envelopes
-        .iter()
-        .filter(|envelope| {
-            envelope.policy_version() == Some(expected_policy_version.as_str())
-                && matches!(
-                    envelope.kind(),
-                    EventKind::PolicyAlert(alert) if alert.message == expected_alert
-                )
-        })
-        .count();
-    let opened_count = envelopes
-        .iter()
-        .filter(|envelope| matches!(envelope.kind(), EventKind::ConnectionOpened))
-        .count();
-    let closed_count = envelopes
-        .iter()
-        .filter(|envelope| matches!(envelope.kind(), EventKind::ConnectionClosed))
-        .count();
-
-    if (
-        request_count,
-        policy_alert_count,
-        opened_count,
-        closed_count,
-    ) != (1, 1, 1, 1)
-    {
-        return Err(e2e_error(format!(
-            "unexpected export event set: request={request_count}, policy_alert={policy_alert_count}, opened={opened_count}, closed={closed_count}"
-        ))
-        .into());
-    }
-    Ok(())
-}
-
-fn assert_export_cursor(
-    spool_path: &Path,
-    expected_cursor: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let spool = FjallSpool::open(spool_path)?;
-    let pending = spool.read_export_batch(COLLECTOR_SINK, 64)?;
-    if !pending.is_empty() {
-        return Err(e2e_error(format!(
-            "expected acked collector sink queue to be empty, got {} pending records",
-            pending.len()
-        ))
-        .into());
-    }
-    let cursor = spool.export_cursor(COLLECTOR_SINK)?;
-    if cursor != expected_cursor {
-        return Err(e2e_error(format!(
-            "collector sink cursor advanced to {cursor}, expected {expected_cursor}"
-        ))
-        .into());
-    }
-    Ok(())
 }
