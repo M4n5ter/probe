@@ -27,8 +27,25 @@ pub enum ExportError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("file transport path does not end with a JSON Lines record boundary: {path}")]
+    FileUnframedTail { path: PathBuf },
     #[error("file transport parent path is a symlink for {path}: {parent}")]
     FileParentSymlink { path: PathBuf, parent: PathBuf },
+    #[error(
+        "file transport parent path is owned by uid {owner_uid}, expected effective uid {effective_uid} for {path}: {parent}"
+    )]
+    FileParentOwnerMismatch {
+        path: PathBuf,
+        parent: PathBuf,
+        owner_uid: u32,
+        effective_uid: u32,
+    },
+    #[error("file transport parent path has insecure permissions {mode:o} for {path}: {parent}")]
+    FileParentInsecurePermissions {
+        path: PathBuf,
+        parent: PathBuf,
+        mode: u32,
+    },
     #[error("file transport parent path is unavailable for {path}: {parent}: {source}")]
     FileParentUnavailable {
         path: PathBuf,

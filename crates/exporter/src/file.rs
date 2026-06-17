@@ -2,7 +2,7 @@ use std::{
     ffi::OsStr,
     fs::{self, File},
     io::{ErrorKind, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::{FileExt, MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
 };
 
@@ -21,6 +21,8 @@ use crate::{BatchExporter, CompressionCodec, ExportAck, ExportError};
 
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const INSECURE_PERMISSION_BITS: u32 = 0o077;
+const REQUIRED_FILE_OWNER_BITS: u32 = 0o600;
+const INSECURE_PARENT_WRITE_BITS: u32 = 0o022;
 
 #[derive(Debug, Clone)]
 pub struct FileExporter {
@@ -190,12 +192,13 @@ fn open_existing_private_append_file(path: &Path) -> Result<AppendFile, ExportEr
     let fd = openat(
         &parent,
         target_file_name(path)?,
-        OFlags::WRONLY | OFlags::APPEND | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        OFlags::RDWR | OFlags::APPEND | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
     .map_err(|source| ExportError::File(source.into()))?;
     let file = File::from(fd);
     validate_open_file(path, &file)?;
+    validate_json_lines_tail(path, &file)?;
     Ok(AppendFile { file, parent: None })
 }
 
@@ -218,7 +221,9 @@ fn open_parent_directory(path: &Path, access: ParentAccess) -> Result<File, Expo
         parent: parent.to_path_buf(),
         source: source.into(),
     })?;
-    Ok(File::from(fd))
+    let file = File::from(fd);
+    validate_open_parent_directory(path, parent, &file)?;
+    Ok(file)
 }
 
 fn validate_path_metadata_with(path: &Path, metadata: fs::Metadata) -> Result<(), ExportError> {
@@ -237,7 +242,10 @@ fn validate_path_metadata_with(path: &Path, metadata: fs::Metadata) -> Result<()
 fn preflight_file_path(path: &Path) -> Result<(), ExportError> {
     let _file_name = target_file_name(path)?;
     match fs::symlink_metadata(path) {
-        Ok(metadata) => validate_path_metadata_with(path, metadata),
+        Ok(metadata) => {
+            validate_path_metadata_with(path, metadata)?;
+            open_existing_private_append_file(path).map(|_| ())
+        }
         Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
             open_parent_directory(path, ParentAccess::Create).map(|_| ())
         }
@@ -260,9 +268,33 @@ fn validate_parent_directory(path: &Path, access: ParentAccess) -> Result<(), Ex
         });
     }
     if metadata.is_dir() {
+        validate_parent_trust(path, parent, &metadata)?;
         if access == ParentAccess::Create {
             validate_parent_write_access(path, parent)?;
         }
+        Ok(())
+    } else {
+        Err(ExportError::FileParentNotDirectory {
+            path: path.to_path_buf(),
+            parent: parent.to_path_buf(),
+        })
+    }
+}
+
+fn validate_open_parent_directory(
+    path: &Path,
+    parent: &Path,
+    file: &File,
+) -> Result<(), ExportError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| ExportError::FileParentUnavailable {
+            path: path.to_path_buf(),
+            parent: parent.to_path_buf(),
+            source,
+        })?;
+    if metadata.is_dir() {
+        validate_parent_trust(path, parent, &metadata)?;
         Ok(())
     } else {
         Err(ExportError::FileParentNotDirectory {
@@ -291,7 +323,9 @@ fn validate_regular_file(path: &Path, is_file: bool) -> Result<(), ExportError> 
 
 fn validate_private_permissions(path: &Path, mode: u32) -> Result<(), ExportError> {
     let mode = mode & 0o777;
-    if mode & INSECURE_PERMISSION_BITS == 0 {
+    if mode & INSECURE_PERMISSION_BITS == 0
+        && mode & REQUIRED_FILE_OWNER_BITS == REQUIRED_FILE_OWNER_BITS
+    {
         Ok(())
     } else {
         Err(ExportError::FileInsecurePermissions {
@@ -301,15 +335,44 @@ fn validate_private_permissions(path: &Path, mode: u32) -> Result<(), ExportErro
     }
 }
 
-fn validate_private_owner(path: &Path, owner_uid: u32) -> Result<(), ExportError> {
-    validate_private_owner_with_effective_uid(path, owner_uid, geteuid().as_raw())
+fn validate_parent_trust(
+    path: &Path,
+    parent: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ExportError> {
+    validate_parent_owner(path, parent, metadata.uid())?;
+    validate_parent_permissions(path, parent, metadata.permissions().mode())
 }
 
-fn validate_private_owner_with_effective_uid(
-    path: &Path,
-    owner_uid: u32,
-    effective_uid: u32,
-) -> Result<(), ExportError> {
+fn validate_parent_owner(path: &Path, parent: &Path, owner_uid: u32) -> Result<(), ExportError> {
+    let effective_uid = geteuid().as_raw();
+    if owner_uid == effective_uid {
+        Ok(())
+    } else {
+        Err(ExportError::FileParentOwnerMismatch {
+            path: path.to_path_buf(),
+            parent: parent.to_path_buf(),
+            owner_uid,
+            effective_uid,
+        })
+    }
+}
+
+fn validate_parent_permissions(path: &Path, parent: &Path, mode: u32) -> Result<(), ExportError> {
+    let mode = mode & 0o7777;
+    if mode & INSECURE_PARENT_WRITE_BITS == 0 {
+        Ok(())
+    } else {
+        Err(ExportError::FileParentInsecurePermissions {
+            path: path.to_path_buf(),
+            parent: parent.to_path_buf(),
+            mode,
+        })
+    }
+}
+
+fn validate_private_owner(path: &Path, owner_uid: u32) -> Result<(), ExportError> {
+    let effective_uid = geteuid().as_raw();
     if owner_uid == effective_uid {
         Ok(())
     } else {
@@ -346,6 +409,23 @@ fn validate_parent_write_access(path: &Path, parent: &Path) -> Result<(), Export
 
 fn sync_parent_directory(parent: &File) -> Result<(), ExportError> {
     parent.sync_all().map_err(ExportError::File)
+}
+
+fn validate_json_lines_tail(path: &Path, file: &File) -> Result<(), ExportError> {
+    let len = file.metadata().map_err(ExportError::File)?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut tail = [0_u8; 1];
+    file.read_exact_at(&mut tail, len - 1)
+        .map_err(ExportError::File)?;
+    if tail == [b'\n'] {
+        Ok(())
+    } else {
+        Err(ExportError::FileUnframedTail {
+            path: path.to_path_buf(),
+        })
+    }
 }
 
 fn parent_directory(path: &Path) -> &Path {
@@ -447,6 +527,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_exporter_rejects_unframed_existing_tail() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("export.jsonl");
+        let partial = br#"{"partial":true}"#;
+        std::fs::write(&path, partial)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let exporter = FileExporter::new(&path, CompressionCodec::None);
+
+        let error = exporter
+            .send_batch(&single_event_batch())
+            .await
+            .expect_err("unframed existing JSON Lines tail must be rejected");
+
+        assert!(matches!(error, ExportError::FileUnframedTail { .. }));
+        assert_eq!(std::fs::read(&path)?, partial);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_exporter_appends_after_existing_record_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("export.jsonl");
+        let existing = br#"{"existing":true}"#;
+        let mut framed = existing.to_vec();
+        framed.push(b'\n');
+        std::fs::write(&path, &framed)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let exporter = FileExporter::new(&path, CompressionCodec::None);
+
+        exporter.send_batch(&single_event_batch()).await?;
+
+        let contents = std::fs::read_to_string(&path)?;
+        let lines = contents.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], r#"{"existing":true}"#);
+        assert_eq!(lines.len(), 2);
+        let record = serde_json::from_str::<FileBatchRecord>(lines[1])?;
+        assert_eq!(record.batch_id, "batch-1");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn file_exporter_rejects_symlink_targets() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let target = temp.path().join("target.jsonl");
@@ -509,28 +632,10 @@ mod tests {
     }
 
     #[test]
-    fn file_exporter_rejects_existing_files_owned_by_another_uid() {
-        let path = Path::new("/tmp/export.jsonl");
-
-        let error = validate_private_owner_with_effective_uid(path, 1001, 1000)
-            .expect_err("file exporter must reject files owned by another uid");
-
-        assert!(matches!(
-            error,
-            ExportError::FileOwnerMismatch {
-                owner_uid: 1001,
-                effective_uid: 1000,
-                ..
-            }
-        ));
-    }
-
-    #[test]
+    #[ignore = "requires root to chown the export file fixture"]
     fn file_exporter_preflight_rejects_existing_files_owned_by_another_uid()
     -> Result<(), Box<dyn std::error::Error>> {
-        if !geteuid().is_root() {
-            return Ok(());
-        }
+        assert!(geteuid().is_root(), "test requires root");
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("export.jsonl");
         std::fs::write(&path, b"")?;
@@ -547,6 +652,47 @@ mod tests {
                 effective_uid: 0,
                 ..
             }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires root to chown the export parent fixture"]
+    fn file_exporter_preflight_rejects_parent_owned_by_another_uid()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(geteuid().is_root(), "test requires root");
+        let temp = tempfile::tempdir()?;
+        chown(temp.path(), Some(Uid::from_raw(1)), None)?;
+        let path = temp.path().join("export.jsonl");
+
+        let error = FileExporter::preflight_path(&path)
+            .expect_err("file exporter must reject parents owned by another uid");
+
+        assert!(matches!(
+            error,
+            ExportError::FileParentOwnerMismatch {
+                owner_uid: 1,
+                effective_uid: 0,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn file_exporter_preflight_rejects_group_or_other_writable_parent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o722))?;
+        let path = temp.path().join("export.jsonl");
+
+        let error = FileExporter::preflight_path(&path)
+            .expect_err("file exporter parent must not be writable by group or others");
+
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))?;
+        assert!(matches!(
+            error,
+            ExportError::FileParentInsecurePermissions { mode: 0o722, .. }
         ));
         Ok(())
     }

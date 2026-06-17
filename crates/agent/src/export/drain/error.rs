@@ -79,7 +79,10 @@ fn export_error_failure_reason(error: &exporter::ExportError) -> ExportDrainFail
         | exporter::ExportError::FileNotRegular { .. }
         | exporter::ExportError::FileOwnerMismatch { .. }
         | exporter::ExportError::FileNotWritable { .. }
+        | exporter::ExportError::FileUnframedTail { .. }
         | exporter::ExportError::FileParentSymlink { .. }
+        | exporter::ExportError::FileParentOwnerMismatch { .. }
+        | exporter::ExportError::FileParentInsecurePermissions { .. }
         | exporter::ExportError::FileParentUnavailable { .. }
         | exporter::ExportError::FileParentNotDirectory { .. }
         | exporter::ExportError::FileParentNotWritable { .. }

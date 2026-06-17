@@ -417,6 +417,62 @@ mod tests {
     }
 
     #[test]
+    fn exporter_status_marks_unframed_file_target_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-unframed-file-exporter-target")?;
+        let export_path = temp.join("export.jsonl");
+        fs::write(&export_path, br#"{"partial":true}"#)?;
+        fs::set_permissions(&export_path, fs::Permissions::from_mode(0o600))?;
+        let plan = runtime_plan_from_config(file_exporter_config(&export_path), Vec::new())?;
+        let spool = available_spool_status(0, 0);
+
+        let exporters = exporter_statuses_with_runtime(
+            &plan,
+            &spool,
+            &BTreeMap::from([("primary".to_string(), 0)]),
+            None,
+        );
+
+        assert_eq!(exporters[0].mode, RuntimeMode::Unavailable);
+        assert!(
+            exporters[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("JSON Lines record boundary"))
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exporter_status_marks_insecure_file_parent_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-insecure-file-exporter-parent")?;
+        let export_path = temp.join("export.jsonl");
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o722))?;
+        let plan = runtime_plan_from_config(file_exporter_config(&export_path), Vec::new())?;
+        let spool = available_spool_status(0, 0);
+
+        let exporters = exporter_statuses_with_runtime(
+            &plan,
+            &spool,
+            &BTreeMap::from([("primary".to_string(), 0)]),
+            None,
+        );
+
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o700))?;
+        assert_eq!(exporters[0].mode, RuntimeMode::Unavailable);
+        assert!(
+            exporters[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("insecure permissions 722"))
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
     fn exporter_status_marks_unwritable_file_parent_unavailable()
     -> Result<(), Box<dyn std::error::Error>> {
         if rustix::process::geteuid().is_root() {
