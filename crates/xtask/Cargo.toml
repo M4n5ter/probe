@@ -8,8 +8,10 @@ repository.workspace = true
 [dependencies]
 capture = { version = "0.1.0", path = "../capture" }
 ebpf-object = { version = "0.1.0", path = "../ebpf-object" }
+exporter = { version = "0.1.0", path = "../exporter" }
 probe-config = { version = "0.1.0", path = "../config" }
 probe-core = { version = "0.1.0", path = "../core" }
+proto = { version = "0.1.0", path = "../proto" }
 rustix = { version = "1.1.4", features = ["process"] }
 serde_json = "1.0.150"
 signal-hook = "0.4.4"

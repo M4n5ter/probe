@@ -3296,8 +3296,10 @@ version = "0.1.0"
 dependencies = [
  "capture",
  "ebpf-object",
+ "exporter",
  "probe-config",
  "probe-core",
+ "proto",
  "rustix",
  "serde_json",
  "signal-hook",

@@ -48,6 +48,23 @@ pub(crate) fn create_temp_root(name: &str) -> Result<PathBuf, std::io::Error> {
     )))
 }
 
+pub(crate) fn run_with_temp_root(
+    name: &str,
+    run_at: impl FnOnce(&Path) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = create_temp_root(name)?;
+    match run_at(&root) {
+        Ok(()) => {
+            fs::remove_dir_all(&root)?;
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("e2e artifacts retained at {}", root.display());
+            Err(error)
+        }
+    }
+}
+
 pub(crate) fn cargo_executable() -> OsString {
     env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"))
 }
@@ -58,6 +75,24 @@ pub(crate) fn workspace_root() -> Result<PathBuf, std::io::Error> {
         .and_then(|crates_dir| crates_dir.parent())
         .map(Path::to_path_buf)
         .ok_or_else(|| e2e_error("failed to resolve workspace root"))
+}
+
+pub(crate) fn run_agent_with_max_events(
+    config_path: &Path,
+    max_events: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let max_events = max_events.to_string();
+    let status = Command::new(cargo_executable())
+        .current_dir(workspace_root()?)
+        .args(["run", "-p", "agent", "--locked", "--", "run", "--config"])
+        .arg(config_path)
+        .args(["--max-events", &max_events])
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+
+    Err(e2e_error(format!("agent run exited with {status}")).into())
 }
 
 pub(crate) fn debug_binary(binary: &str) -> Result<PathBuf, std::io::Error> {

@@ -29,6 +29,16 @@ impl CompressionCodec {
         }
     }
 
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        match name {
+            "none" => Some(Self::None),
+            "zstd" => Some(Self::Zstd),
+            "gzip" => Some(Self::Gzip),
+            "deflate" => Some(Self::Deflate),
+            _ => None,
+        }
+    }
+
     pub fn encode(self, bytes: &[u8]) -> Result<Bytes, ExportError> {
         match self {
             Self::None => Ok(Bytes::copy_from_slice(bytes)),

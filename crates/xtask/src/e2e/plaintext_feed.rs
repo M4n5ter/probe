@@ -1,29 +1,22 @@
-use std::{
-    fs,
-    path::Path,
-    process::{Command, ExitCode},
-};
+use std::{fs, path::Path, process::ExitCode};
 
 use capture::CaptureEvent;
-use probe_config::{AgentConfig, CaptureSelection, PolicyConfig};
 use probe_core::{CaptureSource, EventEnvelope, EventKind};
 use storage::{FjallSpool, StoredEvent};
 
 use super::harness::{
-    cargo_executable, create_temp_root, decode_capture_event, decode_envelope, e2e_error,
-    workspace_root,
+    decode_capture_event, decode_envelope, e2e_error, run_agent_with_max_events, run_with_temp_root,
+};
+use super::plaintext_scenario::{
+    PLAINTEXT_FEED_EVENT_COUNT, PlaintextFeedScenario, PlaintextHttpRequest, PlaintextPolicy,
+    PlaintextScenarioIds,
 };
 
 const CONNECTION_ID: &str = "xtask-e2e-conn";
 const E2E_EXPORT_CURSOR_OWNER: &str = "e2e";
-const EXPECTED_FLOW_ID: &str = "external_plaintext_feed:xtask-e2e-conn";
-const EXPECTED_INGRESS_EVENTS: usize = 3;
 const POLICY_ID: &str = "e2e-policy";
 const POLICY_VERSION: &str = "e2e";
-const EXPECTED_POLICY_VERSION: &str = "e2e-policy@e2e";
 const REQUEST_TARGET: &str = "/e2e";
-const REQUEST_BYTES: &[u8] = b"GET /e2e HTTP/1.1\r\nHost: e2e.test\r\n\r\n";
-const POLICY_ALERT_MESSAGE: &str = "e2e policy observed /e2e";
 
 pub(crate) fn run() -> ExitCode {
     match run_inner() {
@@ -36,18 +29,9 @@ pub(crate) fn run() -> ExitCode {
 }
 
 fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
-    let root = create_temp_root("plaintext-feed")?;
-    match run_at(&root) {
-        Ok(()) => {
-            fs::remove_dir_all(&root)?;
-            println!("e2e plaintext feed passed");
-            Ok(())
-        }
-        Err(error) => {
-            eprintln!("e2e artifacts retained at {}", root.display());
-            Err(error)
-        }
-    }
+    run_with_temp_root("plaintext-feed", run_at)?;
+    println!("e2e plaintext feed passed");
+    Ok(())
 }
 
 fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -57,156 +41,46 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = root.join("agent.toml");
     let spool_path = root.join("spool");
 
-    write_plaintext_feed(&feed_path)?;
-    write_policy_bundle(&policy_path)?;
-    write_agent_config(&config_path, &feed_path, &policy_path, &spool_path)?;
-    run_agent(&config_path)?;
-    assert_spool_outputs(&spool_path)?;
+    let scenario = scenario();
+    scenario.write_feed(&feed_path)?;
+    scenario.write_policy_bundle(&policy_path)?;
+    let mut config = scenario.agent_config(feed_path, policy_path, spool_path.clone());
+    config.export.worker.enabled = false;
+    fs::write(&config_path, toml::to_string(&config)?)?;
+    run_agent_with_max_events(&config_path, PLAINTEXT_FEED_EVENT_COUNT)?;
+    assert_spool_outputs(&spool_path, &scenario)?;
 
     Ok(())
 }
 
-fn write_plaintext_feed(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let connection = feed_connection();
-    let records = [
-        serde_json::json!({
-            "type": "connection_opened",
-            "timestamp": feed_timestamp(1),
-            "connection": connection.clone(),
-        }),
-        serde_json::json!({
-            "type": "bytes",
-            "timestamp": feed_timestamp(2),
-            "connection": connection.clone(),
-            "direction": "outbound",
-            "stream_offset": 0,
-            "bytes": REQUEST_BYTES,
-        }),
-        serde_json::json!({
-            "type": "connection_closed",
-            "timestamp": feed_timestamp(3),
-            "connection": connection,
-        }),
-    ];
-    let mut content = String::new();
-    for record in records {
-        content.push_str(&serde_json::to_string(&record)?);
-        content.push('\n');
-    }
-    fs::write(path, content)?;
-    Ok(())
-}
-
-fn feed_connection() -> serde_json::Value {
-    serde_json::json!({
-        "connection_id": CONNECTION_ID,
-        "local": {
-            "address": "127.0.0.1",
-            "port": 50000,
-        },
-        "remote": {
-            "address": "127.0.0.1",
-            "port": 80,
-        },
-        "protocol": "tcp",
-        "start_monotonic_ns": 1,
-        "socket_cookie": 99,
-        "attribution_confidence": 100,
-        "process": {
-            "pid": 123,
-            "tgid": 123,
-            "start_time_ticks": 456,
-            "boot_id": "boot",
-            "exe_path": "/usr/bin/sssa-e2e",
-            "cmdline_hash": "hash",
-            "uid": 1000,
-            "gid": 1000,
-            "name": "sssa-e2e",
-            "cmdline": ["sssa-e2e"],
-        },
-    })
-}
-
-fn feed_timestamp(monotonic_ns: u64) -> serde_json::Value {
-    serde_json::json!({
-        "monotonic_ns": monotonic_ns,
-        "wall_time_unix_ns": i64::try_from(monotonic_ns).unwrap_or(i64::MAX),
-    })
-}
-
-fn write_policy_bundle(path: &Path) -> Result<(), std::io::Error> {
-    fs::create_dir_all(path)?;
-    fs::write(
-        path.join("manifest.toml"),
-        format!(
-            r#"
-id = "{POLICY_ID}"
-version = "{POLICY_VERSION}"
-hooks = ["on_http_request_headers"]
-"#
+fn scenario() -> PlaintextFeedScenario {
+    PlaintextFeedScenario::new(
+        PlaintextScenarioIds::new(
+            "e2e-agent",
+            "e2e-plaintext-feed",
+            POLICY_ID,
+            POLICY_VERSION,
+            CONNECTION_ID,
         ),
-    )?;
-    fs::write(
-        path.join("main.lua"),
-        r#"
-function on_http_request_headers(event)
-  return probe.emit_alert("e2e policy observed " .. event.kind.target)
-end
-"#,
+        PlaintextHttpRequest::get(REQUEST_TARGET, "e2e.test"),
+        PlaintextPolicy::alerting("e2e policy observed "),
     )
 }
 
-fn write_agent_config(
-    path: &Path,
-    feed_path: &Path,
-    policy_path: &Path,
+fn assert_spool_outputs(
     spool_path: &Path,
+    scenario: &PlaintextFeedScenario,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = AgentConfig {
-        agent_id: "e2e-agent".to_string(),
-        config_version: "e2e-plaintext-feed".to_string(),
-        ..AgentConfig::default()
-    };
-    config.capture.selection = CaptureSelection::PlaintextFeed;
-    config.capture.plaintext_feed.path = Some(feed_path.to_path_buf());
-    config.storage.path = spool_path.to_path_buf();
-    config.export.worker.enabled = false;
-    config.policies.push(PolicyConfig {
-        id: POLICY_ID.to_string(),
-        path: policy_path.to_path_buf(),
-        enabled: true,
-        selector: None,
-    });
-    fs::write(path, toml::to_string(&config)?)?;
-    Ok(())
-}
-
-fn run_agent(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let max_events = EXPECTED_INGRESS_EVENTS.to_string();
-    let status = Command::new(cargo_executable())
-        .current_dir(workspace_root()?)
-        .args(["run", "-p", "agent", "--locked", "--", "run", "--config"])
-        .arg(config_path)
-        .args(["--max-events", &max_events])
-        .status()?;
-    if status.success() {
-        return Ok(());
-    }
-
-    Err(e2e_error(format!("agent run exited with {status}")).into())
-}
-
-fn assert_spool_outputs(spool_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let spool = FjallSpool::open(spool_path)?;
     let ingress = spool.read_ingress_batch_after(0, 16)?;
-    if ingress.len() != EXPECTED_INGRESS_EVENTS {
+    if ingress.len() != PLAINTEXT_FEED_EVENT_COUNT {
         return Err(e2e_error(format!(
-            "expected {EXPECTED_INGRESS_EVENTS} ingress records, got {}",
+            "expected {PLAINTEXT_FEED_EVENT_COUNT} ingress records, got {}",
             ingress.len()
         ))
         .into());
     }
-    assert_ingress_events(&ingress)?;
+    assert_ingress_events(&ingress, scenario)?;
 
     let envelopes = spool
         .read_export_batch(E2E_EXPORT_CURSOR_OWNER, 64)?
@@ -214,25 +88,27 @@ fn assert_spool_outputs(spool_path: &Path) -> Result<(), Box<dyn std::error::Err
         .map(decode_envelope)
         .collect::<Result<Vec<_>, _>>()?;
     let request_found = envelopes.iter().any(|envelope| {
-        is_expected_feed_flow(envelope)
+        is_expected_feed_flow(envelope, scenario)
             && matches!(
                 &envelope.kind,
                 EventKind::HttpRequestHeaders(headers)
                     if headers.method.as_deref() == Some("GET")
-                        && headers.target.as_deref() == Some(REQUEST_TARGET)
+                        && headers.target.as_deref() == Some(scenario.request_target())
             )
     });
     if !request_found {
         return Err(e2e_error("missing parsed HTTP request headers for /e2e").into());
     }
 
+    let expected_policy_version = scenario.expected_policy_version();
+    let expected_alert = scenario.expected_policy_alert_message();
     let policy_alert_found = envelopes.iter().any(|envelope| {
-        is_expected_feed_flow(envelope)
-            && envelope.policy_version.as_deref() == Some(EXPECTED_POLICY_VERSION)
+        is_expected_feed_flow(envelope, scenario)
+            && envelope.policy_version.as_deref() == Some(expected_policy_version.as_str())
             && matches!(
                 &envelope.kind,
                 EventKind::PolicyAlert(alert)
-                    if alert.message == POLICY_ALERT_MESSAGE
+                    if alert.message == expected_alert
             )
     });
     if !policy_alert_found {
@@ -240,9 +116,11 @@ fn assert_spool_outputs(spool_path: &Path) -> Result<(), Box<dyn std::error::Err
     }
 
     let lifecycle_found = envelopes.iter().any(|envelope| {
-        is_expected_feed_flow(envelope) && matches!(envelope.kind, EventKind::ConnectionOpened)
+        is_expected_feed_flow(envelope, scenario)
+            && matches!(envelope.kind, EventKind::ConnectionOpened)
     }) && envelopes.iter().any(|envelope| {
-        is_expected_feed_flow(envelope) && matches!(envelope.kind, EventKind::ConnectionClosed)
+        is_expected_feed_flow(envelope, scenario)
+            && matches!(envelope.kind, EventKind::ConnectionClosed)
     });
     if !lifecycle_found {
         return Err(e2e_error("missing connection lifecycle events").into());
@@ -256,14 +134,17 @@ fn assert_spool_outputs(spool_path: &Path) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-fn assert_ingress_events(events: &[StoredEvent]) -> Result<(), Box<dyn std::error::Error>> {
+fn assert_ingress_events(
+    events: &[StoredEvent],
+    scenario: &PlaintextFeedScenario,
+) -> Result<(), Box<dyn std::error::Error>> {
     let capture_events = events
         .iter()
         .map(decode_capture_event)
         .collect::<Result<Vec<_>, _>>()?;
     let [opened, bytes, closed] = capture_events.as_slice() else {
         return Err(e2e_error(format!(
-            "expected {EXPECTED_INGRESS_EVENTS} ordered ingress events, got {}",
+            "expected {PLAINTEXT_FEED_EVENT_COUNT} ordered ingress events, got {}",
             capture_events.len()
         ))
         .into());
@@ -272,7 +153,8 @@ fn assert_ingress_events(events: &[StoredEvent]) -> Result<(), Box<dyn std::erro
     if !matches!(
         opened,
         CaptureEvent::ConnectionOpened { source, flow, .. }
-            if *source == CaptureSource::ExternalPlaintextFeed && flow.id.0 == EXPECTED_FLOW_ID
+            if *source == CaptureSource::ExternalPlaintextFeed
+                && flow.id.0 == scenario.expected_flow_id()
     ) {
         return Err(e2e_error("missing expected ingress connection_opened event").into());
     }
@@ -280,22 +162,23 @@ fn assert_ingress_events(events: &[StoredEvent]) -> Result<(), Box<dyn std::erro
         bytes,
         CaptureEvent::Bytes(bytes)
             if bytes.source == CaptureSource::ExternalPlaintextFeed
-                && bytes.flow.id.0 == EXPECTED_FLOW_ID
-                && bytes.bytes.as_ref() == REQUEST_BYTES
+                && bytes.flow.id.0 == scenario.expected_flow_id()
+                && bytes.bytes.as_ref() == scenario.request_bytes().as_slice()
     ) {
         return Err(e2e_error("missing expected ingress bytes event").into());
     }
     if !matches!(
         closed,
         CaptureEvent::ConnectionClosed { source, flow, .. }
-            if *source == CaptureSource::ExternalPlaintextFeed && flow.id.0 == EXPECTED_FLOW_ID
+            if *source == CaptureSource::ExternalPlaintextFeed
+                && flow.id.0 == scenario.expected_flow_id()
     ) {
         return Err(e2e_error("missing expected ingress connection_closed event").into());
     }
     Ok(())
 }
 
-fn is_expected_feed_flow(envelope: &EventEnvelope) -> bool {
+fn is_expected_feed_flow(envelope: &EventEnvelope, scenario: &PlaintextFeedScenario) -> bool {
     envelope.source == CaptureSource::ExternalPlaintextFeed
-        && envelope.flow.id.0 == EXPECTED_FLOW_ID
+        && envelope.flow.id.0 == scenario.expected_flow_id()
 }
