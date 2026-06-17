@@ -3,8 +3,8 @@ use std::collections::{HashMap, VecDeque};
 use probe_core::{Direction, FlowContext};
 
 use super::{
-    EbpfCloseTracepointObservation, EbpfSocketReadObservation, EbpfSocketWriteObservation,
-    payload_direction::PayloadDirections,
+    EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfSocketReadObservation,
+    EbpfSocketWriteObservation, payload_direction::PayloadDirections,
 };
 
 pub(super) struct TrackedEbpfFlows {
@@ -44,6 +44,22 @@ impl TrackedEbpfFlows {
         close: &EbpfCloseTracepointObservation,
     ) -> Option<TrackedEbpfFlow> {
         self.remove(EbpfDescriptorKey::from_close(close))
+    }
+
+    pub(super) fn remove_close_range(
+        &mut self,
+        close_range: &EbpfCloseRangeTracepointObservation,
+    ) -> Vec<TrackedEbpfFlow> {
+        let mut keys = self
+            .by_descriptor
+            .keys()
+            .copied()
+            .filter(|key| key.is_in_close_range(close_range))
+            .collect::<Vec<_>>();
+        keys.sort_by_key(|key| key.fd);
+        keys.into_iter()
+            .filter_map(|key| self.remove(key))
+            .collect()
     }
 
     pub(super) fn get_write_mut(
@@ -150,6 +166,12 @@ impl EbpfDescriptorKey {
     fn from_read(read: &EbpfSocketReadObservation) -> Self {
         Self::new(read.process.tgid, read.fd)
     }
+
+    fn is_in_close_range(self, close_range: &EbpfCloseRangeTracepointObservation) -> bool {
+        self.tgid == close_range.process.tgid
+            && self.fd >= 0
+            && (close_range.first_fd..=close_range.last_fd).contains(&(self.fd as u32))
+    }
 }
 
 #[cfg(test)]
@@ -159,7 +181,8 @@ mod tests {
     };
 
     use super::super::{
-        EbpfCloseTracepointObservation, EbpfObservedProcess, EbpfSocketReadObservation,
+        EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfObservedProcess,
+        EbpfSocketReadObservation,
     };
     use super::*;
 
@@ -300,9 +323,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tracked_flows_remove_close_range_for_same_process_descriptors_in_fd_order() {
+        let mut tracked = TrackedEbpfFlows::bounded(4);
+        insert_flow_for_descriptor(&mut tracked, 3, flow("fd-3"));
+        insert_flow_for_descriptor(&mut tracked, 10, flow("fd-10"));
+        insert_flow_for_descriptor(&mut tracked, 4, flow("fd-4"));
+        insert_flow_for_process_descriptor(&mut tracked, 200, 4, flow("other-tgid-fd-4"));
+
+        let removed = tracked.remove_close_range(&close_range_observation(4, 10));
+
+        let removed_ids = removed
+            .into_iter()
+            .map(|tracked| tracked.flow.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            removed_ids,
+            vec![
+                FlowIdentity("fd-4".to_string()),
+                FlowIdentity("fd-10".to_string())
+            ]
+        );
+        assert_eq!(
+            tracked
+                .remove_close(&close_observation(3))
+                .expect("fd 3 should remain tracked")
+                .flow
+                .id,
+            FlowIdentity("fd-3".to_string())
+        );
+        assert_eq!(
+            tracked
+                .remove_close(&close_observation_for_process(200, 4))
+                .expect("different TGID fd should remain tracked")
+                .flow
+                .id,
+            FlowIdentity("other-tgid-fd-4".to_string())
+        );
+    }
+
     fn insert_flow_for_descriptor(tracked: &mut TrackedEbpfFlows, fd: i32, flow: FlowContext) {
+        insert_flow_for_process_descriptor(tracked, 100, fd, flow);
+    }
+
+    fn insert_flow_for_process_descriptor(
+        tracked: &mut TrackedEbpfFlows,
+        tgid: u32,
+        fd: i32,
+        flow: FlowContext,
+    ) {
         tracked.insert_flow(
-            100,
+            tgid,
             fd,
             flow,
             PayloadDirections::from_directions([Direction::Outbound, Direction::Inbound]),
@@ -310,9 +381,21 @@ mod tests {
     }
 
     fn close_observation(fd: i32) -> EbpfCloseTracepointObservation {
+        close_observation_for_process(100, fd)
+    }
+
+    fn close_observation_for_process(tgid: u32, fd: i32) -> EbpfCloseTracepointObservation {
         EbpfCloseTracepointObservation {
-            process: observed_process(),
+            process: observed_process_for_tgid(tgid),
             fd,
+        }
+    }
+
+    fn close_range_observation(first_fd: u32, last_fd: u32) -> EbpfCloseRangeTracepointObservation {
+        EbpfCloseRangeTracepointObservation {
+            process: observed_process(),
+            first_fd,
+            last_fd,
         }
     }
 
@@ -339,9 +422,13 @@ mod tests {
     }
 
     fn observed_process() -> EbpfObservedProcess {
+        observed_process_for_tgid(100)
+    }
+
+    fn observed_process_for_tgid(tgid: u32) -> EbpfObservedProcess {
         EbpfObservedProcess {
-            pid: 101,
-            tgid: 100,
+            pid: tgid.saturating_add(1),
+            tgid,
             uid: 1000,
             gid: 1000,
             command: [0; 16],

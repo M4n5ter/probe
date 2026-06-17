@@ -14,9 +14,9 @@ use ebpf_abi::{
     EBPF_SOCKET_FLOW_REMOTE_ENDPOINT_VALID, EBPF_SOCKET_FLOW_SOCKADDR_READ_FAILED,
     EBPF_SOCKET_FLOW_UNSUPPORTED_ADDRESS_FAMILY, EBPF_SOCKET_READ_READ_FAILED,
     EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_WRITE_READ_FAILED, EBPF_SOCKET_WRITE_TRUNCATED,
-    EbpfAcceptObservation, EbpfConnectObservation, EbpfEventDecodeError, EbpfProcessProbeEvent,
-    EbpfProcessTracepointSpec, EbpfSocketFdKey, EbpfSocketPayloadAllowance, EbpfSocketReadSample,
-    EbpfSocketWriteSample, decode_process_probe_event,
+    EbpfAcceptObservation, EbpfCloseRangeObservation, EbpfConnectObservation, EbpfEventDecodeError,
+    EbpfProcessProbeEvent, EbpfProcessTracepointSpec, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
+    EbpfSocketReadSample, EbpfSocketWriteSample, decode_process_probe_event,
 };
 use ebpf_object::{
     EbpfObjectProbe, EbpfObjectProbeConfig, EbpfObjectProbeReport, EbpfPreflightedObject,
@@ -25,9 +25,10 @@ use probe_core::TcpEndpoint;
 use thiserror::Error;
 
 use super::{
-    EbpfAcceptTracepointObservation, EbpfCloseTracepointObservation,
-    EbpfConnectTracepointObservation, EbpfObservedProcess, EbpfProcessObservation,
-    EbpfSocketEndpoint, EbpfSocketReadObservation, EbpfSocketWriteObservation,
+    EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
+    EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
+    EbpfProcessObservation, EbpfSocketEndpoint, EbpfSocketReadObservation,
+    EbpfSocketWriteObservation,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +290,16 @@ fn process_observation_from_event(
                 },
             ))
         }
+        Some(ebpf_abi::EbpfEventKind::CloseRangeTracepointObserved) => {
+            let close_range = close_range_observation_from_event(&event);
+            Ok(EbpfProcessObservation::CloseRange(
+                EbpfCloseRangeTracepointObservation {
+                    process: observed_process_from_event(&event),
+                    first_fd: close_range.first_fd,
+                    last_fd: close_range.last_fd,
+                },
+            ))
+        }
         Some(ebpf_abi::EbpfEventKind::SocketWriteSampled) => {
             let sample = socket_write_sample_from_event(&event);
             Ok(EbpfProcessObservation::Write(EbpfSocketWriteObservation {
@@ -388,6 +399,12 @@ fn close_observation_from_event(event: &EbpfProcessProbeEvent) -> ebpf_abi::Ebpf
         .expect("close event kind should expose close observation")
 }
 
+fn close_range_observation_from_event(event: &EbpfProcessProbeEvent) -> EbpfCloseRangeObservation {
+    event
+        .close_range_observation()
+        .expect("close_range event kind should expose close_range observation")
+}
+
 fn socket_write_sample_from_event(event: &EbpfProcessProbeEvent) -> EbpfSocketWriteSample {
     event
         .socket_write_sample()
@@ -433,7 +450,8 @@ mod tests {
         EBPF_CONNECT_REMOTE_ENDPOINT_VALID, EBPF_CONNECT_SOCKADDR_READ_FAILED,
         EBPF_SOCKET_READ_SAMPLE_BYTES, EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_WRITE_SAMPLE_BYTES,
         EBPF_SOCKET_WRITE_TRUNCATED, EbpfAcceptObservation, EbpfCloseObservation,
-        EbpfConnectObservation, EbpfProcessProbeEvent, EbpfSocketReadSample, EbpfSocketWriteSample,
+        EbpfCloseRangeObservation, EbpfConnectObservation, EbpfProcessProbeEvent,
+        EbpfSocketReadSample, EbpfSocketWriteSample,
     };
     use probe_core::TcpEndpoint;
 
@@ -550,6 +568,35 @@ mod tests {
                 assert_eq!(close.process.gid, 44);
                 assert_eq!(close.process.command_lossy(), "curl");
                 assert_eq!(close.fd, 7);
+            }
+            observation => panic!("unexpected observation: {observation:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn process_observation_decodes_valid_close_range_wire_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let event = EbpfProcessProbeEvent::close_range_tracepoint_observed(
+            11,
+            22,
+            33,
+            44,
+            nul_padded_command("curl"),
+            EbpfCloseRangeObservation::observed(7, 11),
+        );
+
+        let observation =
+            decode_process_observation(&ebpf_abi::encode_process_probe_event(&event))?;
+        match observation {
+            EbpfProcessObservation::CloseRange(close_range) => {
+                assert_eq!(close_range.process.pid, 11);
+                assert_eq!(close_range.process.tgid, 22);
+                assert_eq!(close_range.process.uid, 33);
+                assert_eq!(close_range.process.gid, 44);
+                assert_eq!(close_range.process.command_lossy(), "curl");
+                assert_eq!(close_range.first_fd, 7);
+                assert_eq!(close_range.last_fd, 11);
             }
             observation => panic!("unexpected observation: {observation:?}"),
         }

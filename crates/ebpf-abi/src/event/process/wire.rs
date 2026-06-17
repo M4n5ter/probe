@@ -9,6 +9,7 @@ pub const EBPF_PROCESS_PROBE_MAX_RECORD_BYTES: usize = max_record_bytes([
     core::mem::size_of::<EbpfConnectTracepointRecord>(),
     core::mem::size_of::<EbpfAcceptTracepointRecord>(),
     core::mem::size_of::<EbpfCloseTracepointRecord>(),
+    core::mem::size_of::<EbpfCloseRangeTracepointRecord>(),
     core::mem::size_of::<EbpfSocketWriteSampleRecord>(),
     core::mem::size_of::<EbpfSocketReadSampleRecord>(),
 ]);
@@ -18,6 +19,8 @@ pub const EBPF_ACCEPT_TRACEPOINT_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfAcceptTracepointRecord>();
 pub const EBPF_CLOSE_TRACEPOINT_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfCloseTracepointRecord>();
+pub const EBPF_CLOSE_RANGE_TRACEPOINT_RECORD_BYTES: usize =
+    core::mem::size_of::<EbpfCloseRangeTracepointRecord>();
 pub const EBPF_SOCKET_WRITE_SAMPLE_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfSocketWriteSampleRecord>();
 pub const EBPF_SOCKET_WRITE_SAMPLE_BYTES: usize = 256;
@@ -46,7 +49,7 @@ pub const EBPF_ADDRESS_FAMILY_UNSPEC: u16 = 0;
 pub const EBPF_ADDRESS_FAMILY_INET: u16 = 2;
 pub const EBPF_ADDRESS_FAMILY_INET6: u16 = 10;
 
-const fn max_record_bytes(record_bytes: [usize; 5]) -> usize {
+const fn max_record_bytes(record_bytes: [usize; 6]) -> usize {
     let mut max = 0;
     let mut index = 0;
     while index < record_bytes.len() {
@@ -174,6 +177,24 @@ pub struct EbpfCloseObservation {
 impl EbpfCloseObservation {
     pub const fn observed(fd: i32) -> Self {
         Self { fd, reserved: 0 }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfCloseRangeObservation {
+    pub first_fd: u32,
+    pub last_fd: u32,
+    pub reserved: u32,
+}
+
+impl EbpfCloseRangeObservation {
+    pub const fn observed(first_fd: u32, last_fd: u32) -> Self {
+        Self {
+            first_fd,
+            last_fd,
+            reserved: 0,
+        }
     }
 }
 
@@ -333,6 +354,38 @@ impl EbpfCloseTracepointRecord {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfCloseRangeTracepointRecord {
+    header: EbpfEventHeader,
+    command: [u8; 16],
+    close_range: EbpfCloseRangeObservation,
+}
+
+impl EbpfCloseRangeTracepointRecord {
+    pub fn close_range_tracepoint_observed(
+        pid: u32,
+        tgid: u32,
+        uid: u32,
+        gid: u32,
+        command: [u8; 16],
+        close_range: EbpfCloseRangeObservation,
+    ) -> Self {
+        Self {
+            header: EbpfEventHeader::new(
+                EbpfEventKind::CloseRangeTracepointObserved,
+                EBPF_CLOSE_RANGE_TRACEPOINT_RECORD_BYTES as u16,
+                pid,
+                tgid,
+                uid,
+                gid,
+            ),
+            command,
+            close_range,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EbpfSocketWriteSampleRecord {
     header: EbpfEventHeader,
     command: [u8; 16],
@@ -466,6 +519,7 @@ pub struct EbpfProcessProbeEvent {
     accept: EbpfAcceptObservation,
     connect: EbpfConnectObservation,
     close: EbpfCloseObservation,
+    close_range: EbpfCloseRangeObservation,
     socket_write: EbpfSocketWriteSample,
     socket_read: EbpfSocketReadSample,
 }
@@ -526,6 +580,25 @@ impl EbpfProcessProbeEvent {
             .into()
     }
 
+    pub fn close_range_tracepoint_observed(
+        pid: u32,
+        tgid: u32,
+        uid: u32,
+        gid: u32,
+        command: [u8; 16],
+        close_range: EbpfCloseRangeObservation,
+    ) -> Self {
+        EbpfCloseRangeTracepointRecord::close_range_tracepoint_observed(
+            pid,
+            tgid,
+            uid,
+            gid,
+            command,
+            close_range,
+        )
+        .into()
+    }
+
     pub fn socket_write_sampled(
         pid: u32,
         tgid: u32,
@@ -576,6 +649,13 @@ impl EbpfProcessProbeEvent {
         }
     }
 
+    pub fn close_range_observation(&self) -> Option<EbpfCloseRangeObservation> {
+        match self.kind() {
+            Some(EbpfEventKind::CloseRangeTracepointObserved) => Some(self.close_range),
+            _ => None,
+        }
+    }
+
     pub const fn header(&self) -> &EbpfEventHeader {
         &self.header
     }
@@ -617,6 +697,14 @@ impl From<EbpfCloseTracepointRecord> for EbpfProcessProbeEvent {
     fn from(record: EbpfCloseTracepointRecord) -> Self {
         let mut event = empty_process_probe_event(record.header, record.command);
         event.close = record.close;
+        event
+    }
+}
+
+impl From<EbpfCloseRangeTracepointRecord> for EbpfProcessProbeEvent {
+    fn from(record: EbpfCloseRangeTracepointRecord) -> Self {
+        let mut event = empty_process_probe_event(record.header, record.command);
+        event.close_range = record.close_range;
         event
     }
 }
@@ -729,6 +817,12 @@ pub fn encode_process_probe_event(event: &EbpfProcessProbeEvent) -> EncodedProce
         Some(EbpfEventKind::CloseTracepointObserved) => {
             encode_close_observation(&mut bytes[EBPF_PROCESS_PROBE_PAYLOAD_OFFSET..], event.close);
         }
+        Some(EbpfEventKind::CloseRangeTracepointObserved) => {
+            encode_close_range_observation(
+                &mut bytes[EBPF_PROCESS_PROBE_PAYLOAD_OFFSET..],
+                event.close_range,
+            );
+        }
         Some(EbpfEventKind::SocketWriteSampled) => {
             encode_socket_write_sample(
                 &mut bytes[EBPF_PROCESS_PROBE_PAYLOAD_OFFSET..],
@@ -776,6 +870,7 @@ fn is_process_probe_kind(kind: EbpfEventKind) -> bool {
         EbpfEventKind::ConnectTracepointObserved
             | EbpfEventKind::AcceptTracepointObserved
             | EbpfEventKind::CloseTracepointObserved
+            | EbpfEventKind::CloseRangeTracepointObserved
             | EbpfEventKind::SocketWriteSampled
             | EbpfEventKind::SocketReadSampled
     )
@@ -786,6 +881,7 @@ fn process_record_len(kind: EbpfEventKind) -> usize {
         EbpfEventKind::ConnectTracepointObserved => EBPF_CONNECT_TRACEPOINT_RECORD_BYTES,
         EbpfEventKind::AcceptTracepointObserved => EBPF_ACCEPT_TRACEPOINT_RECORD_BYTES,
         EbpfEventKind::CloseTracepointObserved => EBPF_CLOSE_TRACEPOINT_RECORD_BYTES,
+        EbpfEventKind::CloseRangeTracepointObserved => EBPF_CLOSE_RANGE_TRACEPOINT_RECORD_BYTES,
         EbpfEventKind::SocketWriteSampled => EBPF_SOCKET_WRITE_SAMPLE_RECORD_BYTES,
         EbpfEventKind::SocketReadSampled => EBPF_SOCKET_READ_SAMPLE_RECORD_BYTES,
         EbpfEventKind::LibsslPlaintextSampled => unreachable!("not a process probe kind"),
@@ -810,6 +906,9 @@ fn decode_process_probe_payload(
         EbpfEventKind::CloseTracepointObserved => {
             event.close = decode_close_observation(payload);
         }
+        EbpfEventKind::CloseRangeTracepointObserved => {
+            event.close_range = decode_close_range_observation(payload);
+        }
         EbpfEventKind::SocketWriteSampled => {
             event.socket_write = decode_socket_write_sample(payload);
         }
@@ -828,6 +927,7 @@ fn empty_process_probe_event(header: EbpfEventHeader, command: [u8; 16]) -> Ebpf
         accept: EbpfAcceptObservation::unavailable(0, 0, 0),
         connect: EbpfConnectObservation::unavailable(0, 0),
         close: EbpfCloseObservation::observed(0),
+        close_range: EbpfCloseRangeObservation::observed(0, 0),
         socket_write: EbpfSocketWriteSample::new(0, 0, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
         socket_read: EbpfSocketReadSample::new(0, 0, 0, [0; EBPF_SOCKET_READ_SAMPLE_BYTES]),
     }
@@ -893,6 +993,20 @@ fn decode_close_observation(bytes: &[u8]) -> EbpfCloseObservation {
 fn encode_close_observation(bytes: &mut [u8], close: EbpfCloseObservation) {
     write_i32(bytes, 0, close.fd);
     write_u32(bytes, 4, close.reserved);
+}
+
+fn decode_close_range_observation(bytes: &[u8]) -> EbpfCloseRangeObservation {
+    EbpfCloseRangeObservation {
+        first_fd: read_u32(bytes, 0),
+        last_fd: read_u32(bytes, 4),
+        reserved: read_u32(bytes, 8),
+    }
+}
+
+fn encode_close_range_observation(bytes: &mut [u8], close_range: EbpfCloseRangeObservation) {
+    write_u32(bytes, 0, close_range.first_fd);
+    write_u32(bytes, 4, close_range.last_fd);
+    write_u32(bytes, 8, close_range.reserved);
 }
 
 fn decode_socket_write_sample(bytes: &[u8]) -> EbpfSocketWriteSample {
@@ -1017,6 +1131,8 @@ mod tests {
         assert_eq!(align_of::<EbpfConnectObservation>(), 8);
         assert_eq!(size_of::<EbpfCloseObservation>(), 8);
         assert_eq!(align_of::<EbpfCloseObservation>(), 4);
+        assert_eq!(size_of::<EbpfCloseRangeObservation>(), 12);
+        assert_eq!(align_of::<EbpfCloseRangeObservation>(), 4);
         assert_eq!(size_of::<EbpfSocketWriteSample>(), 268);
         assert_eq!(align_of::<EbpfSocketWriteSample>(), 4);
         assert_eq!(size_of::<EbpfSocketReadSample>(), 268);
@@ -1027,6 +1143,8 @@ mod tests {
         assert_eq!(align_of::<EbpfConnectTracepointRecord>(), 8);
         assert_eq!(size_of::<EbpfCloseTracepointRecord>(), 56);
         assert_eq!(align_of::<EbpfCloseTracepointRecord>(), 4);
+        assert_eq!(size_of::<EbpfCloseRangeTracepointRecord>(), 60);
+        assert_eq!(align_of::<EbpfCloseRangeTracepointRecord>(), 4);
         assert_eq!(size_of::<EbpfSocketWriteSampleRecord>(), 316);
         assert_eq!(align_of::<EbpfSocketWriteSampleRecord>(), 4);
         assert_eq!(size_of::<EbpfSocketReadSampleRecord>(), 316);
@@ -1064,6 +1182,9 @@ mod tests {
         assert_eq!(offset_of!(EbpfConnectObservation, fd_table_epoch), 32);
         assert_eq!(offset_of!(EbpfCloseObservation, fd), 0);
         assert_eq!(offset_of!(EbpfCloseObservation, reserved), 4);
+        assert_eq!(offset_of!(EbpfCloseRangeObservation, first_fd), 0);
+        assert_eq!(offset_of!(EbpfCloseRangeObservation, last_fd), 4);
+        assert_eq!(offset_of!(EbpfCloseRangeObservation, reserved), 8);
         assert_eq!(offset_of!(EbpfSocketWriteSample, fd), 0);
         assert_eq!(offset_of!(EbpfSocketWriteSample, original_len), 4);
         assert_eq!(offset_of!(EbpfSocketWriteSample, captured_len), 8);
@@ -1083,6 +1204,9 @@ mod tests {
         assert_eq!(offset_of!(EbpfCloseTracepointRecord, header), 0);
         assert_eq!(offset_of!(EbpfCloseTracepointRecord, command), 32);
         assert_eq!(offset_of!(EbpfCloseTracepointRecord, close), 48);
+        assert_eq!(offset_of!(EbpfCloseRangeTracepointRecord, header), 0);
+        assert_eq!(offset_of!(EbpfCloseRangeTracepointRecord, command), 32);
+        assert_eq!(offset_of!(EbpfCloseRangeTracepointRecord, close_range), 48);
         assert_eq!(offset_of!(EbpfSocketWriteSampleRecord, header), 0);
         assert_eq!(offset_of!(EbpfSocketWriteSampleRecord, command), 32);
         assert_eq!(offset_of!(EbpfSocketWriteSampleRecord, sample), 48);
@@ -1223,6 +1347,44 @@ mod tests {
     }
 
     #[test]
+    fn close_range_tracepoint_observed_populates_header_fields() {
+        let event = EbpfProcessProbeEvent::close_range_tracepoint_observed(
+            11,
+            22,
+            33,
+            44,
+            *b"0123456789abcdef",
+            EbpfCloseRangeObservation::observed(7, 11),
+        );
+
+        assert_eq!(event.header.magic, EBPF_MAGIC);
+        assert_eq!(event.header.abi_revision, EBPF_ABI_REVISION);
+        assert_eq!(
+            event.header.kind(),
+            Some(EbpfEventKind::CloseRangeTracepointObserved)
+        );
+        assert_eq!(
+            usize::from(event.header.record_len),
+            EBPF_CLOSE_RANGE_TRACEPOINT_RECORD_BYTES
+        );
+        assert_eq!(event.header.pid, 11);
+        assert_eq!(event.header.tgid, 22);
+        assert_eq!(event.header.uid, 33);
+        assert_eq!(event.header.gid, 44);
+        assert_eq!(&event.command, b"0123456789abcdef");
+        assert_eq!(event.header.flags, 0);
+        let close_range = event
+            .close_range_observation()
+            .expect("close_range event should expose close_range payload");
+        assert_eq!(close_range.first_fd, 7);
+        assert_eq!(close_range.last_fd, 11);
+        assert_eq!(close_range.reserved, 0);
+        assert!(event.connect_observation().is_none());
+        assert!(event.accept_observation().is_none());
+        assert!(event.close_observation().is_none());
+    }
+
+    #[test]
     fn socket_write_sampled_populates_header_fields() {
         let event = sample_write_event(5, 5, 0);
 
@@ -1356,7 +1518,7 @@ mod tests {
         }
     }
 
-    fn sample_process_events() -> [EbpfProcessProbeEvent; 5] {
+    fn sample_process_events() -> [EbpfProcessProbeEvent; 6] {
         [
             EbpfProcessProbeEvent::connect_tracepoint_observed(
                 11,
@@ -1397,6 +1559,14 @@ mod tests {
                 44,
                 *b"0123456789abcdef",
                 EbpfCloseObservation::observed(7),
+            ),
+            EbpfProcessProbeEvent::close_range_tracepoint_observed(
+                11,
+                22,
+                33,
+                44,
+                *b"0123456789abcdef",
+                EbpfCloseRangeObservation::observed(7, 11),
             ),
             EbpfProcessProbeEvent::socket_write_sampled(
                 11,

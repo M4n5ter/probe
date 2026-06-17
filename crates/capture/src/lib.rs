@@ -8,12 +8,12 @@ mod replay;
 mod tls;
 
 pub use ebpf::{
-    EbpfAcceptTracepointObservation, EbpfCloseTracepointObservation,
-    EbpfConnectTracepointObservation, EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport,
-    EbpfObservedProcess, EbpfProcessObservation, EbpfProcessObservationProbe,
-    EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeError,
-    EbpfProcessObservationProvider, EbpfResolvedSocketFlow, EbpfSocketEndpoint,
-    EbpfSocketFlowLookup, EbpfSocketFlowResolver, EbpfSocketReadObservation,
+    EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
+    EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfHostProbe,
+    EbpfHostProbeConfig, EbpfHostProbeReport, EbpfObservedProcess, EbpfProcessObservation,
+    EbpfProcessObservationProbe, EbpfProcessObservationProbeConfig,
+    EbpfProcessObservationProbeError, EbpfProcessObservationProvider, EbpfResolvedSocketFlow,
+    EbpfSocketEndpoint, EbpfSocketFlowLookup, EbpfSocketFlowResolver, EbpfSocketReadObservation,
     EbpfSocketWriteObservation, UnprivilegedBpfStatus,
 };
 pub use event::{

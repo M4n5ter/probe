@@ -139,7 +139,7 @@ fn ebpf_provider_descriptor_from_object_report(
         CaptureBackend::Ebpf,
         CaptureProviderBuilder::Ebpf,
         format!(
-            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the process observation provider can emit connect and accept/accept4 flow-start observations, selector-authorized always-degraded outbound single-buffer and bounded first-non-empty-iovec syscall argument samples and inbound single-buffer and bounded first-non-empty-iovec syscall result samples, best-effort descriptor-close lifecycle events, plus output ring-buffer failure conversion to degraded capture_loss events, but payload beyond the first sampled iovec segment, bounded iovec scan, or sample buffer, flow-specific lost-event reconstruction, and complete kernel traffic capture are not implemented",
+            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the process observation provider can emit connect and accept/accept4 flow-start observations, selector-authorized always-degraded outbound single-buffer and bounded first-non-empty-iovec syscall argument samples and inbound single-buffer and bounded first-non-empty-iovec syscall result samples, best-effort close/plain close_range descriptor lifecycle events, plus output ring-buffer failure conversion to degraded capture_loss events, but payload beyond the first sampled iovec segment, bounded iovec scan, or sample buffer, flow-specific lost-event reconstruction, and complete kernel traffic capture are not implemented",
             object.summary(),
         ),
     )
@@ -328,7 +328,7 @@ mod tests {
         ));
         assert!(reason.contains("capture_loss events"));
         assert!(reason.contains("flow-specific lost-event reconstruction"));
-        assert!(reason.contains("best-effort descriptor-close lifecycle events"));
+        assert!(reason.contains("best-effort close/plain close_range descriptor lifecycle events"));
         assert!(reason.contains("process observation provider"));
         assert!(reason.contains("procfs socket attribution is usable"));
     }

@@ -7,6 +7,7 @@ pub enum EbpfProcessObservation {
     Connect(EbpfConnectTracepointObservation),
     Accept(EbpfAcceptTracepointObservation),
     Close(EbpfCloseTracepointObservation),
+    CloseRange(EbpfCloseRangeTracepointObservation),
     Write(EbpfSocketWriteObservation),
     Read(EbpfSocketReadObservation),
 }
@@ -21,6 +22,7 @@ impl EbpfProcessObservation {
             Self::Connect(observation) => &observation.process,
             Self::Accept(observation) => &observation.process,
             Self::Close(observation) => &observation.process,
+            Self::CloseRange(observation) => &observation.process,
             Self::Write(observation) => &observation.process,
             Self::Read(observation) => &observation.process,
         }
@@ -70,6 +72,13 @@ pub struct EbpfAcceptTracepointObservation {
 pub struct EbpfCloseTracepointObservation {
     pub process: EbpfObservedProcess,
     pub fd: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EbpfCloseRangeTracepointObservation {
+    pub process: EbpfObservedProcess,
+    pub first_fd: u32,
+    pub last_fd: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

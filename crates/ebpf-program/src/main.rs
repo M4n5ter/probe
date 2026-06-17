@@ -23,14 +23,14 @@ use ebpf_abi::{
     EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES, EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES,
     EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES, EBPF_RING_BUFFER_BYTES,
     EBPF_SOCKET_PAYLOAD_ALLOW_READ, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE, EbpfAcceptTracepointRecord,
-    EbpfCloseTracepointRecord, EbpfConnectTracepointRecord, EbpfPendingSocketAcceptAttempt,
-    EbpfPendingSocketReadAttempt, EbpfPendingSocketWriteSample, EbpfProcessProbeMetadata,
-    EbpfSocketFdKey, EbpfSocketPayloadAllowance, EbpfSocketReadSampleRecord,
-    EbpfSocketWriteSampleRecord,
+    EbpfCloseRangeTracepointRecord, EbpfCloseTracepointRecord, EbpfConnectTracepointRecord,
+    EbpfPendingSocketAcceptAttempt, EbpfPendingSocketReadAttempt, EbpfPendingSocketWriteSample,
+    EbpfProcessProbeMetadata, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
+    EbpfSocketReadSampleRecord, EbpfSocketWriteSampleRecord,
 };
 
 use accept::{accept_attempt_from_tracepoint, accept_observation_from_result};
-use close::close_observation_from_tracepoint;
+use close::{close_observation_from_tracepoint, close_range_observation_from_tracepoint};
 use connect::connect_observation_from_tracepoint;
 use read::{
     capture_read_sample_from_result, pending_read_attempt_from_source, read_source_from_tracepoint,
@@ -147,8 +147,8 @@ pub fn sssa_sys_enter_fcntl(ctx: TracePointContext) -> u32 {
 }
 
 #[tracepoint(name = "sys_enter_close_range", category = "syscalls")]
-pub fn sssa_sys_enter_close_range(_ctx: TracePointContext) -> u32 {
-    invalidate_current_fd_table();
+pub fn sssa_sys_enter_close_range(ctx: TracePointContext) -> u32 {
+    emit_close_range_attempt(ctx);
     0
 }
 
@@ -326,6 +326,24 @@ fn emit_close_attempt(ctx: TracePointContext) {
         metadata.gid,
         metadata.command,
         close,
+    );
+    submit_process_event(&event);
+}
+
+fn emit_close_range_attempt(ctx: TracePointContext) {
+    let close_range = close_range_observation_from_tracepoint(&ctx);
+    invalidate_current_fd_table();
+    let Some(close_range) = close_range else {
+        return;
+    };
+    let metadata = process_metadata(&ctx);
+    let event = EbpfCloseRangeTracepointRecord::close_range_tracepoint_observed(
+        metadata.pid,
+        metadata.tgid,
+        metadata.uid,
+        metadata.gid,
+        metadata.command,
+        close_range,
     );
     submit_process_event(&event);
 }
