@@ -2,7 +2,6 @@ mod bridge;
 mod clock;
 mod flow_start;
 mod observation_source;
-mod output_loss;
 mod payload_authorization;
 mod payload_bridge;
 mod payload_direction;

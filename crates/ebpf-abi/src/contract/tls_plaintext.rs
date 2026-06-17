@@ -10,11 +10,13 @@ pub const EBPF_TLS_OFFSETS_MAP_NAME: &str = "SSSA_TLS_OFFSETS";
 pub const EBPF_TLS_STATE_EPOCHS_MAP_NAME: &str = "SSSA_TLS_STATE_EPOCHS";
 pub const EBPF_TLS_STATE_EPOCH_KEY: u32 = 0;
 pub const EBPF_TLS_EVENT_SCRATCH_MAP_NAME: &str = "SSSA_TLS_EVENT_SCRATCH";
+pub const EBPF_TLS_OUTPUT_LOSSES_MAP_NAME: &str = "SSSA_TLS_OUTPUT_LOSSES";
 pub const EBPF_TLS_CALLS_MAX_ENTRIES: u32 = 16_384;
 pub const EBPF_TLS_FDS_MAX_ENTRIES: u32 = 65_536;
 pub const EBPF_TLS_OFFSETS_MAX_ENTRIES: u32 = 131_072;
 pub const EBPF_TLS_STATE_EPOCHS_MAX_ENTRIES: u32 = 1;
 pub const EBPF_TLS_EVENT_SCRATCH_MAX_ENTRIES: u32 = 1;
+pub const EBPF_TLS_OUTPUT_LOSSES_MAX_ENTRIES: u32 = 1;
 pub const EBPF_TLS_SSL_SET_FD_PROGRAM_NAME: &str = "sssa_ssl_set_fd";
 pub const EBPF_TLS_SSL_SET_FD_EXIT_PROGRAM_NAME: &str = "sssa_ssl_set_fd_exit";
 pub const EBPF_TLS_SSL_CLEAR_PROGRAM_NAME: &str = "sssa_ssl_clear";
@@ -357,7 +359,7 @@ impl EbpfTlsOffsetKey {
     }
 }
 
-pub const EBPF_TLS_MAP_SPECS: [EbpfMapSpec; 6] = [
+pub const EBPF_TLS_MAP_SPECS: [EbpfMapSpec; 7] = [
     EbpfMapSpec {
         name: EBPF_EVENTS_MAP_NAME,
         kind: EbpfMapKind::Ringbuf,
@@ -404,6 +406,14 @@ pub const EBPF_TLS_MAP_SPECS: [EbpfMapSpec; 6] = [
         key_size: size_of_u32::<u32>(),
         value_size: size_of_u32::<EbpfTlsPlaintextEvent>(),
         max_entries: EBPF_TLS_EVENT_SCRATCH_MAX_ENTRIES,
+        map_flags: 0,
+    },
+    EbpfMapSpec {
+        name: EBPF_TLS_OUTPUT_LOSSES_MAP_NAME,
+        kind: EbpfMapKind::PerCpuArray,
+        key_size: size_of_u32::<u32>(),
+        value_size: size_of_u32::<u64>(),
+        max_entries: EBPF_TLS_OUTPUT_LOSSES_MAX_ENTRIES,
         map_flags: 0,
     },
 ];
@@ -459,7 +469,7 @@ mod tests {
             assert_eq!(spec.map_flags, 0);
         }
 
-        assert_eq!(EBPF_TLS_MAP_SPECS.len(), 6);
+        assert_eq!(EBPF_TLS_MAP_SPECS.len(), 7);
         assert_eq!(EBPF_TLS_STATE_EPOCH_KEY, 0);
         assert!(EBPF_TLS_MAP_SPECS.contains(&EbpfMapSpec {
             name: EBPF_TLS_CALLS_MAP_NAME,
@@ -483,6 +493,14 @@ mod tests {
             key_size: size_of_u32::<u32>(),
             value_size: size_of_u32::<EbpfTlsPlaintextEvent>(),
             max_entries: EBPF_TLS_EVENT_SCRATCH_MAX_ENTRIES,
+            map_flags: 0,
+        }));
+        assert!(EBPF_TLS_MAP_SPECS.contains(&EbpfMapSpec {
+            name: EBPF_TLS_OUTPUT_LOSSES_MAP_NAME,
+            kind: EbpfMapKind::PerCpuArray,
+            key_size: size_of_u32::<u32>(),
+            value_size: size_of_u32::<u64>(),
+            max_entries: EBPF_TLS_OUTPUT_LOSSES_MAX_ENTRIES,
             map_flags: 0,
         }));
     }

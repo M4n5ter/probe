@@ -7,6 +7,7 @@ use probe_core::{
     CapabilityKind, CapabilityState, CaptureSource, CompiledSelector, FlowContext, Timestamp,
 };
 
+use crate::output_loss::OutputLossTracker;
 use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind};
 
 use super::super::{
@@ -16,7 +17,6 @@ use super::super::{
     clock::EbpfObservationClock,
     flow_start::{PendingEbpfFlowResolution, PendingEbpfFlowStart},
     observation_source::{EbpfObservationSource, ProbeObservationSource},
-    output_loss::OutputLossTracker,
     payload_authorization::SocketPayloadSampleAuthorization,
     payload_bridge::{read_events, write_events},
     payload_direction::PayloadDirections,

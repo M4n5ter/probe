@@ -2,11 +2,11 @@ use std::path::PathBuf;
 
 use aya::{
     Ebpf, EbpfError,
-    maps::{HashMap as AyaHashMap, MapData, RingBuf},
+    maps::{HashMap as AyaHashMap, MapData, PerCpuArray, RingBuf},
 };
 use ebpf_abi::{
-    EBPF_EVENTS_MAP_NAME, EBPF_TLS_STATE_EPOCH_KEY, EBPF_TLS_STATE_EPOCHS_MAP_NAME,
-    EbpfEventDecodeError, decode_tls_plaintext_event,
+    EBPF_EVENTS_MAP_NAME, EBPF_TLS_OUTPUT_LOSSES_MAP_NAME, EBPF_TLS_STATE_EPOCH_KEY,
+    EBPF_TLS_STATE_EPOCHS_MAP_NAME, EbpfEventDecodeError, decode_tls_plaintext_event,
 };
 use ebpf_object::{
     EbpfObjectArtifact, EbpfObjectProbe, EbpfObjectProbeReport, EbpfPreflightedObject,
@@ -85,6 +85,7 @@ pub(in crate::tls::plaintext) struct LibsslUprobePlaintextProbe {
     ebpf: Ebpf,
     attach_session: LibsslUprobeAttachSession,
     events: RingBuf<MapData>,
+    output_losses: OutputLossMap,
     state_epoch_fence: TlsStateEpochFence,
     poisoned_reason: Option<String>,
 }
@@ -137,12 +138,13 @@ impl LibsslUprobePlaintextProbe {
         enable_tls_state_epoch(&mut ebpf, &mut state_epoch_fence)?;
         let mut attach_session = LibsslUprobeAttachSession::default();
         attach_session.attach_uprobes(&mut ebpf, attach_recipes, AttachFailurePolicy::Strict)?;
-        let events =
-            open_events_ringbuf_or_detach(&mut ebpf, &mut attach_session, &mut state_epoch_fence)?;
+        let (events, output_losses) =
+            open_output_maps_or_detach(&mut ebpf, &mut attach_session, &mut state_epoch_fence)?;
         Ok(Self {
             ebpf,
             attach_session,
             events,
+            output_losses,
             state_epoch_fence,
             poisoned_reason: None,
         })
@@ -159,15 +161,13 @@ impl LibsslUprobePlaintextProbe {
         let mut state_epoch_fence = TlsStateEpochFence::default();
         let mut attach_session = LibsslUprobeAttachSession::default();
         if attach_work.is_empty() {
-            let events = open_events_ringbuf_or_detach(
-                &mut ebpf,
-                &mut attach_session,
-                &mut state_epoch_fence,
-            )?;
+            let (events, output_losses) =
+                open_output_maps_or_detach(&mut ebpf, &mut attach_session, &mut state_epoch_fence)?;
             return Ok(LibsslUprobePlaintextProbeLoad::Enabled(Box::new(Self {
                 ebpf,
                 attach_session,
                 events,
+                output_losses,
                 state_epoch_fence,
                 poisoned_reason: None,
             })));
@@ -184,12 +184,13 @@ impl LibsslUprobePlaintextProbe {
                 reason: attach_summary.unresolvable_plaintext_reason(),
             });
         }
-        let events =
-            open_events_ringbuf_or_detach(&mut ebpf, &mut attach_session, &mut state_epoch_fence)?;
+        let (events, output_losses) =
+            open_output_maps_or_detach(&mut ebpf, &mut attach_session, &mut state_epoch_fence)?;
         Ok(LibsslUprobePlaintextProbeLoad::Enabled(Box::new(Self {
             ebpf,
             attach_session,
             events,
+            output_losses,
             state_epoch_fence,
             poisoned_reason: None,
         })))
@@ -268,6 +269,19 @@ impl LibsslUprobePlaintextProbe {
             return Ok(None);
         };
         plaintext_sample_from_ringbuf_record(&item).map(Some)
+    }
+
+    fn output_loss_count(&mut self) -> Result<u64, LibsslUprobePlaintextProbeError> {
+        let values = self.output_losses.get(&0, 0).map_err(|source| {
+            LibsslUprobePlaintextProbeError::Map {
+                name: EBPF_TLS_OUTPUT_LOSSES_MAP_NAME,
+                source: Box::new(source),
+            }
+        })?;
+        Ok(values
+            .iter()
+            .copied()
+            .fold(0u64, |total, value| total.saturating_add(value)))
     }
 
     fn current_attach_state(&self) -> LibsslUprobeAttachState {
@@ -462,7 +476,14 @@ impl LibsslUprobePlaintextSampleSource for LibsslUprobePlaintextProbe {
         self.next_sample()
             .map_err(|error| CaptureError::provider("libssl_uprobe_plaintext", error.to_string()))
     }
+
+    fn tls_plaintext_output_loss_count(&mut self) -> Result<u64, CaptureError> {
+        self.output_loss_count()
+            .map_err(|error| CaptureError::provider("libssl_uprobe_plaintext", error.to_string()))
+    }
 }
+
+type OutputLossMap = PerCpuArray<MapData, u64>;
 
 fn open_events_ringbuf(
     ebpf: &mut Ebpf,
@@ -474,6 +495,18 @@ fn open_events_ringbuf(
             })?;
     RingBuf::try_from(map).map_err(|source| LibsslUprobePlaintextProbeError::Map {
         name: EBPF_EVENTS_MAP_NAME,
+        source: Box::new(source),
+    })
+}
+
+fn open_output_loss_map(ebpf: &mut Ebpf) -> Result<OutputLossMap, LibsslUprobePlaintextProbeError> {
+    let map = ebpf.take_map(EBPF_TLS_OUTPUT_LOSSES_MAP_NAME).ok_or(
+        LibsslUprobePlaintextProbeError::MissingMap {
+            name: EBPF_TLS_OUTPUT_LOSSES_MAP_NAME,
+        },
+    )?;
+    OutputLossMap::try_from(map).map_err(|source| LibsslUprobePlaintextProbeError::Map {
+        name: EBPF_TLS_OUTPUT_LOSSES_MAP_NAME,
         source: Box::new(source),
     })
 }
@@ -534,13 +567,21 @@ fn write_tls_state_epoch(
     Ok(())
 }
 
-fn open_events_ringbuf_or_detach(
+fn open_output_maps_or_detach(
     ebpf: &mut Ebpf,
     attach_session: &mut LibsslUprobeAttachSession,
     state_epoch_fence: &mut TlsStateEpochFence,
-) -> Result<RingBuf<MapData>, LibsslUprobePlaintextProbeError> {
-    match open_events_ringbuf(ebpf) {
-        Ok(events) => Ok(events),
+) -> Result<(RingBuf<MapData>, OutputLossMap), LibsslUprobePlaintextProbeError> {
+    let events = match open_events_ringbuf(ebpf) {
+        Ok(events) => events,
+        Err(error) => {
+            let _ = disable_tls_state_epoch(ebpf, state_epoch_fence);
+            let _ = attach_session.detach_all_best_effort(ebpf);
+            return Err(error);
+        }
+    };
+    match open_output_loss_map(ebpf) {
+        Ok(output_losses) => Ok((events, output_losses)),
         Err(error) => {
             let _ = disable_tls_state_epoch(ebpf, state_epoch_fence);
             let _ = attach_session.detach_all_best_effort(ebpf);

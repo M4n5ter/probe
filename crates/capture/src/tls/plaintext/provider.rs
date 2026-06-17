@@ -3,8 +3,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use probe_core::{CapabilityKind, CapabilityState, CompiledSelector, FlowContext, Timestamp};
+use probe_core::{
+    CapabilityKind, CapabilityState, CaptureSource, CompiledSelector, FlowContext, Timestamp,
+};
 
+use crate::output_loss::{OutputLossTracker, provider_output_loss_event};
 use crate::{
     CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderKind, PlaintextEvent,
     tls::LibsslUprobeAttachPlan,
@@ -36,13 +39,18 @@ pub(in crate::tls::plaintext) trait LibsslUprobePlaintextSampleSource {
     fn next_tls_plaintext_sample(
         &mut self,
     ) -> Result<Option<LibsslUprobePlaintextSample>, CaptureError>;
+
+    fn tls_plaintext_output_loss_count(&mut self) -> Result<u64, CaptureError> {
+        Ok(0)
+    }
 }
 
 pub struct LibsslUprobePlaintextProvider {
     source: Box<dyn LibsslUprobePlaintextSampleSource>,
     resolver: Box<dyn LibsslUprobeFlowResolver>,
-    pending_events: VecDeque<PlaintextEvent>,
+    pending_events: VecDeque<CaptureEvent>,
     output_selector: Option<CompiledSelector>,
+    output_loss: OutputLossTracker,
     clock: LibsslUprobePlaintextClock,
     idle_policy: LibsslUprobePlaintextIdlePolicy,
     poisoned_reason: Option<String>,
@@ -112,6 +120,12 @@ impl LibsslUprobePlaintextProvider {
         Self::with_idle_policy(source, resolver, LibsslUprobePlaintextIdlePolicy::Stop)
     }
 
+    #[cfg(test)]
+    fn with_output_loss_check_interval_for_test(mut self, interval: u32) -> Self {
+        self.output_loss = OutputLossTracker::new(interval);
+        self
+    }
+
     fn with_idle_policy(
         source: Box<dyn LibsslUprobePlaintextSampleSource>,
         resolver: Box<dyn LibsslUprobeFlowResolver>,
@@ -122,6 +136,7 @@ impl LibsslUprobePlaintextProvider {
             resolver,
             pending_events: VecDeque::new(),
             output_selector: None,
+            output_loss: OutputLossTracker::default(),
             clock: LibsslUprobePlaintextClock::default(),
             idle_policy,
             poisoned_reason: None,
@@ -131,15 +146,24 @@ impl LibsslUprobePlaintextProvider {
     fn poll_event(&mut self) -> Result<CapturePoll, CaptureError> {
         self.ensure_not_poisoned()?;
         if let Some(event) = self.pending_events.pop_front() {
-            return Ok(CapturePoll::event(CaptureEvent::from(event)));
+            return Ok(CapturePoll::event(event));
+        }
+        if self.output_loss.should_check_during_drain()
+            && let Some(event) = self.output_loss_event()?
+        {
+            return Ok(CapturePoll::event(event));
         }
         let Some(sample) = self.source.next_tls_plaintext_sample()? else {
+            if let Some(event) = self.output_loss_event()? {
+                return Ok(CapturePoll::event(event));
+            }
             return Ok(match self.idle_policy {
                 #[cfg(test)]
                 LibsslUprobePlaintextIdlePolicy::Stop => CapturePoll::Finished,
                 LibsslUprobePlaintextIdlePolicy::Wait => CapturePoll::Idle,
             });
         };
+        self.output_loss.record_observation();
         let events = libssl_plaintext_events_from_sample(
             &sample,
             self.clock.next_timestamp(),
@@ -148,12 +172,12 @@ impl LibsslUprobePlaintextProvider {
         let events = events
             .into_iter()
             .filter(|event| self.allows_event(event))
+            .map(CaptureEvent::from)
             .collect::<Vec<_>>();
         self.pending_events.extend(events);
         Ok(self
             .pending_events
             .pop_front()
-            .map(CaptureEvent::from)
             .map(CapturePoll::event)
             .unwrap_or(CapturePoll::Progress))
     }
@@ -199,6 +223,14 @@ impl LibsslUprobePlaintextProvider {
         self.poisoned_reason = Some(reason.clone());
         CaptureError::provider("libssl_uprobe_plaintext", reason)
     }
+
+    fn output_loss_event(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+        let count = self.source.tls_plaintext_output_loss_count()?;
+        Ok(self
+            .output_loss
+            .checkpoint(count)
+            .map(|lost_events| output_loss_event(self.clock.next_timestamp(), lost_events)))
+    }
 }
 
 fn selector_allows_flow(
@@ -215,6 +247,19 @@ fn selector_allows_flow(
     }
 }
 
+fn output_loss_event(timestamp: Timestamp, lost_events: u64) -> CaptureEvent {
+    let reason = format!(
+        "eBPF libssl uprobe plaintext output ring buffer could not accept {lost_events} event(s); TLS plaintext parser state may have missed encrypted stream observations"
+    );
+    provider_output_loss_event(
+        timestamp,
+        lost_events,
+        CaptureSource::LibsslUprobe,
+        CaptureProviderKind::Plaintext,
+        reason,
+    )
+}
+
 impl CaptureProvider for LibsslUprobePlaintextProvider {
     fn name(&self) -> &'static str {
         "libssl_uprobe_plaintext"
@@ -227,7 +272,7 @@ impl CaptureProvider for LibsslUprobePlaintextProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::LibsslUprobe,
-            "libssl uprobe plaintext provider can attach configured uprobes and read bounded TLS plaintext samples; flow lifecycle and fd-valid ownership remain best-effort",
+            "libssl uprobe plaintext provider can attach configured uprobes, read bounded TLS plaintext samples, and convert output ring-buffer failures to degraded capture_loss events; flow lifecycle and fd-valid ownership remain best-effort",
         )]
     }
 
@@ -394,6 +439,70 @@ mod tests {
         };
 
         assert_eq!(bytes.bytes.as_ref(), b"GET /");
+        Ok(())
+    }
+
+    #[test]
+    fn emits_output_loss_delta_through_poll() -> Result<(), Box<dyn std::error::Error>> {
+        let resolver = Box::new(StaticFlowResolver {
+            expected: lookup_for_sample_event(),
+            resolved: Some(demo_resolved_flow()),
+            seen: false,
+        });
+        let mut provider = LibsslUprobePlaintextProvider::with_idle_policy(
+            Box::new(OutputLossTlsPlaintextSource {
+                samples: VecTlsPlaintextSource::new([]),
+                counts: VecDeque::from([2, 2, 5]),
+            }),
+            resolver,
+            LibsslUprobePlaintextIdlePolicy::Wait,
+        );
+
+        let first = expect_output_loss(provider.poll_next()?);
+        assert_eq!(first.source, CaptureSource::LibsslUprobe);
+        assert_eq!(first.provider, CaptureProviderKind::Plaintext);
+        assert_eq!(first.flow.attribution_confidence, 0);
+        assert_eq!(first.loss.lost_events, 2);
+        assert!(
+            first
+                .loss
+                .reason
+                .contains("output ring buffer could not accept 2 event(s)")
+        );
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Idle));
+        let second = expect_output_loss(provider.poll_next()?);
+        assert_eq!(second.loss.lost_events, 3);
+        assert!(matches!(provider.poll_next()?, CapturePoll::Idle));
+        Ok(())
+    }
+
+    #[test]
+    fn interleaves_output_loss_during_plaintext_sample_drain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let resolver = Box::new(StaticFlowResolver {
+            expected: lookup_for_sample_event(),
+            resolved: Some(demo_resolved_flow()),
+            seen: false,
+        });
+        let mut provider = LibsslUprobePlaintextProvider::new(
+            Box::new(OutputLossTlsPlaintextSource {
+                samples: VecTlsPlaintextSource::new([
+                    sample_event(),
+                    sample_event(),
+                    sample_event(),
+                ]),
+                counts: VecDeque::from([4]),
+            }),
+            resolver,
+        )
+        .with_output_loss_check_interval_for_test(2);
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Event(_)));
+        assert!(matches!(provider.poll_next()?, CapturePoll::Event(_)));
+        let loss = expect_output_loss(provider.poll_next()?);
+        assert_eq!(loss.loss.lost_events, 4);
+        assert!(matches!(provider.poll_next()?, CapturePoll::Event(_)));
         Ok(())
     }
 
@@ -658,6 +767,33 @@ mod tests {
             }
             self.samples.next_tls_plaintext_sample()
         }
+    }
+
+    struct OutputLossTlsPlaintextSource {
+        samples: VecTlsPlaintextSource,
+        counts: VecDeque<u64>,
+    }
+
+    impl LibsslUprobePlaintextSampleSource for OutputLossTlsPlaintextSource {
+        fn next_tls_plaintext_sample(
+            &mut self,
+        ) -> Result<Option<LibsslUprobePlaintextSample>, CaptureError> {
+            self.samples.next_tls_plaintext_sample()
+        }
+
+        fn tls_plaintext_output_loss_count(&mut self) -> Result<u64, CaptureError> {
+            Ok(self.counts.pop_front().unwrap_or(5))
+        }
+    }
+
+    fn expect_output_loss(poll: CapturePoll) -> crate::CapturedLoss {
+        let CapturePoll::Event(event) = poll else {
+            panic!("expected output loss event, got {poll:?}");
+        };
+        let crate::CaptureEvent::Loss(loss) = *event else {
+            panic!("expected output loss event, got {event:?}");
+        };
+        loss
     }
 
     struct FailingReconcileTlsPlaintextSource {

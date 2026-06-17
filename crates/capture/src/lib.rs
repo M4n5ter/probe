@@ -2,6 +2,7 @@ mod ebpf;
 mod event;
 mod libpcap;
 mod multiplex;
+mod output_loss;
 mod plaintext;
 mod provider;
 mod replay;
