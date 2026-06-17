@@ -6,7 +6,7 @@ use std::{
 
 use probe_config::{
     AgentConfig, CaptureBackend, CaptureSelection, CompressionCodecName, ExporterConfig,
-    ExporterTransport,
+    ExporterTransportConfig,
 };
 use probe_core::CapabilityState;
 use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan};
@@ -61,11 +61,12 @@ pub(in crate::status) fn config_with_storage_path(storage_path: PathBuf) -> Agen
         },
         exporters: vec![ExporterConfig {
             id: "primary".to_string(),
-            transport: ExporterTransport::Webhook,
-            endpoint: "https://collector.example/batches".to_string(),
+            transport: ExporterTransportConfig::Webhook {
+                endpoint: "https://collector.example/batches".to_string(),
+                headers: BTreeMap::new(),
+                tls: Default::default(),
+            },
             codec: CompressionCodecName::None,
-            headers: BTreeMap::new(),
-            tls: Default::default(),
             worker: Default::default(),
         }],
         ..AgentConfig::default()

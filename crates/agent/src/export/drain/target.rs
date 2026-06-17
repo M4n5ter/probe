@@ -1,7 +1,10 @@
-use exporter::{CompressionCodec, WebhookExporter, WebhookTlsConfig};
+use std::{future::Future, time::Duration};
+
+use exporter::{CompressionCodec, FileExporter, WebhookExporter, WebhookTlsConfig};
 use probe_config::CompressionCodecName;
 use runtime::{
-    ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportTlsMaterialPlan, WebhookExportSinkPlan,
+    ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportTlsMaterialPlan, FileExportSinkPlan,
+    WebhookExportSinkPlan,
 };
 use storage::ExportSpool;
 
@@ -35,13 +38,34 @@ pub async fn drain_replay_webhook(
     endpoint: String,
     codec: CompressionCodec,
 ) -> Result<(), ExportDrainError> {
-    drain_webhook_sink(
-        spool,
-        agent_id,
-        WebhookExportTarget::replay(endpoint, codec),
-        SinkDrainMode::UntilEmpty,
+    let target = WebhookExportTarget::replay(endpoint, codec);
+    let sink = target.sink.clone();
+    with_sink_timeout(
+        sink,
+        SinkDrainMode::UntilEmpty.sink_timeout(),
+        drain_webhook_sink(spool, agent_id, target, SinkDrainMode::UntilEmpty),
     )
     .await
+}
+
+async fn with_sink_timeout<F>(
+    sink: String,
+    timeout: Option<Duration>,
+    future: F,
+) -> Result<(), ExportDrainError>
+where
+    F: Future<Output = Result<(), ExportDrainError>>,
+{
+    match timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, future).await {
+            Ok(result) => result,
+            Err(_) => Err(ExportDrainError::SinkTimedOut {
+                sink,
+                timeout_ms: duration_millis(timeout),
+            }),
+        },
+        None => future.await,
+    }
 }
 
 pub(super) async fn drain_export_sinks_with_mode(
@@ -89,11 +113,22 @@ pub(super) async fn drain_export_sink_with_mode(
 ) -> Result<(), ExportDrainError> {
     match sink {
         ExportSinkPlan::Webhook(sink) => {
-            drain_webhook_sink_with_mode(
-                spool,
-                agent_id,
-                webhook_export_target_from_plan_sink(sink),
-                mode,
+            let target = webhook_export_target_from_plan_sink(sink);
+            let sink = target.sink.clone();
+            with_sink_timeout(
+                sink,
+                mode.sink_timeout(),
+                drain_webhook_sink(spool, agent_id, target, mode),
+            )
+            .await
+        }
+        ExportSinkPlan::File(sink) => {
+            let target = file_export_target_from_plan_sink(sink);
+            let sink = target.sink.clone();
+            with_sink_timeout(
+                sink,
+                mode.sink_timeout(),
+                drain_file_sink(spool, agent_id, target, mode),
             )
             .await
         }
@@ -135,35 +170,27 @@ fn webhook_export_target_from_plan_sink(sink: &WebhookExportSinkPlan) -> Webhook
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileExportTarget {
+    sink: String,
+    path: std::path::PathBuf,
+    codec: CompressionCodec,
+}
+
+fn file_export_target_from_plan_sink(sink: &FileExportSinkPlan) -> FileExportTarget {
+    FileExportTarget {
+        sink: sink.id.clone(),
+        path: sink.path.clone(),
+        codec: compression_codec_from_config(sink.codec),
+    }
+}
+
 fn compression_codec_from_config(codec: CompressionCodecName) -> CompressionCodec {
     match codec {
         CompressionCodecName::None => CompressionCodec::None,
         CompressionCodecName::Zstd => CompressionCodec::Zstd,
         CompressionCodecName::Gzip => CompressionCodec::Gzip,
         CompressionCodecName::Deflate => CompressionCodec::Deflate,
-    }
-}
-
-async fn drain_webhook_sink_with_mode(
-    spool: &impl ExportSpool,
-    agent_id: &str,
-    target: WebhookExportTarget,
-    mode: SinkDrainMode,
-) -> Result<(), ExportDrainError> {
-    let sink = target.sink.clone();
-    match mode.sink_timeout() {
-        Some(timeout) => {
-            match tokio::time::timeout(timeout, drain_webhook_sink(spool, agent_id, target, mode))
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(ExportDrainError::SinkTimedOut {
-                    sink,
-                    timeout_ms: duration_millis(timeout),
-                }),
-            }
-        }
-        None => drain_webhook_sink(spool, agent_id, target, mode).await,
     }
 }
 
@@ -189,6 +216,26 @@ async fn drain_webhook_sink(
     };
     let tls = webhook_tls_config_from_plan(&tls)?;
     let exporter = WebhookExporter::with_tls_config(endpoint, codec, headers, tls)?;
+    drain_export_sink_from_batch(spool, agent_id, &sink, codec, mode, &exporter, first_batch)
+        .await
+        .map(|_| ())
+}
+
+async fn drain_file_sink(
+    spool: &impl ExportSpool,
+    agent_id: &str,
+    target: FileExportTarget,
+    mode: SinkDrainMode,
+) -> Result<(), ExportDrainError> {
+    let FileExportTarget { sink, path, codec } = target;
+    let first_events = spool.read_export_batch(&sink, EXPORT_BATCH_LIMIT)?;
+    if first_events.is_empty() {
+        return Ok(());
+    }
+    let Some(first_batch) = export_batch_from_events(agent_id, &sink, codec, first_events)? else {
+        return Ok(());
+    };
+    let exporter = FileExporter::new(path, codec);
     drain_export_sink_from_batch(spool, agent_id, &sink, codec, mode, &exporter, first_batch)
         .await
         .map(|_| ())
@@ -258,12 +305,12 @@ mod tests {
     };
 
     use probe_config::{
-        AgentConfig, CompressionCodecName, ExporterConfig, ExporterTransport, TlsMaterialKind,
+        AgentConfig, CompressionCodecName, ExporterConfig, ExporterTransportConfig, TlsMaterialKind,
     };
     use probe_core::{CapabilityKind, CapabilityState, SpoolPayloadSchema};
     use runtime::{
         self, ExportFailureBackoffPlan, ExportPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
-        ExportTlsMaterialPlan, ExportWorkerPlan, ProviderRegistry, RuntimePlan,
+        ExportTlsMaterialPlan, ExportWorkerPlan, FileExportSinkPlan, ProviderRegistry, RuntimePlan,
         WebhookExportSinkPlan,
     };
     use storage::{FjallSpool, SpoolPayload};
@@ -470,20 +517,25 @@ mod tests {
             exporters: vec![
                 ExporterConfig {
                     id: "failing".to_string(),
-                    transport: ExporterTransport::Webhook,
-                    endpoint: failing.endpoint(),
+                    transport: ExporterTransportConfig::Webhook {
+                        endpoint: failing.endpoint(),
+                        headers: BTreeMap::new(),
+                        tls: Default::default(),
+                    },
                     codec: CompressionCodecName::None,
-                    headers: BTreeMap::new(),
-                    tls: Default::default(),
                     worker: Default::default(),
                 },
                 ExporterConfig {
                     id: "successful".to_string(),
-                    transport: ExporterTransport::Webhook,
-                    endpoint: successful.endpoint(),
+                    transport: ExporterTransportConfig::Webhook {
+                        endpoint: successful.endpoint(),
+                        headers: BTreeMap::from([(
+                            "x-probe-node".to_string(),
+                            "node-a".to_string(),
+                        )]),
+                        tls: Default::default(),
+                    },
                     codec: CompressionCodecName::None,
-                    headers: BTreeMap::from([("x-probe-node".to_string(), "node-a".to_string())]),
-                    tls: Default::default(),
                     worker: Default::default(),
                 },
             ],
@@ -523,6 +575,52 @@ mod tests {
             Some(export_batch_id("agent-1", "successful", 1, 1))
         );
         let _ = failing.join()?;
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planned_file_drain_writes_json_lines_and_advances_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = temp_path("planned-file-export-sink");
+        fs::create_dir_all(&temp)?;
+        let spool_path = temp.join("spool");
+        let export_path = temp.join("export.jsonl");
+        let spool = FjallSpool::open(&spool_path)?;
+        append_export_events(&spool, 2)?;
+        let plan = ExportPlan {
+            worker: ExportWorkerPlan::Disabled {
+                reason: "test".to_string(),
+            },
+            sinks: vec![
+                FileExportSinkPlan {
+                    id: "local-file".to_string(),
+                    path: export_path.clone(),
+                    codec: CompressionCodecName::None,
+                    worker: inherited_worker_quota(1),
+                }
+                .into(),
+            ],
+        };
+
+        drain_planned_sinks(&spool, "agent-1", &plan).await?;
+
+        assert_eq!(spool.export_cursor("local-file")?, 2);
+        let contents = fs::read_to_string(&export_path)?;
+        let lines = contents.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let record = serde_json::from_str::<exporter::FileBatchRecord>(lines[0])?;
+        assert_eq!(record.kind, exporter::FileBatchRecordKind::ProtobufBatch);
+        assert_eq!(record.batch_id, "agent-1:local-file:1-2");
+        assert_eq!(record.agent_id, "agent-1");
+        assert_eq!(record.codec, CompressionCodec::None);
+        assert_eq!(record.first_sequence, 1);
+        assert_eq!(record.last_sequence, 2);
+        assert_eq!(record.event_count, 2);
+        let payload = record.decode_payload()?;
+        let batch = proto::BatchEnvelope::decode_from_slice(&payload)?;
+        assert_eq!(batch.batch_id, "agent-1:local-file:1-2");
+        assert_eq!(batch.events.len(), 2);
         fs::remove_dir_all(temp)?;
         Ok(())
     }

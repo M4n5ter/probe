@@ -6,16 +6,18 @@ use crate::{ConfigViolation, ExporterConfig, ExporterTlsConfig, TlsMaterialKind}
 
 pub(super) fn validate_exporter_tls(
     exporter: &ExporterConfig,
+    endpoint: &str,
+    tls: &ExporterTlsConfig,
     materials_by_id: &BTreeMap<&str, TlsMaterialKind>,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    if exporter_tls_configured(&exporter.tls) && !webhook_endpoint_is_https(exporter) {
+    if exporter_tls_configured(tls) && !webhook_endpoint_is_https(endpoint) {
         violations.push(ConfigViolation {
             field: format!("exporters.{}.tls", exporter.id),
             reason: "exporter TLS material refs require an HTTPS webhook endpoint".to_string(),
         });
     }
-    for reference in &exporter.tls.trust_anchor_refs {
+    for reference in &tls.trust_anchor_refs {
         crate::tls::validate_material_ref(
             format!("exporters.{}.tls.trust_anchor_refs", exporter.id),
             reference,
@@ -25,7 +27,7 @@ pub(super) fn validate_exporter_tls(
             "TLS material",
         );
     }
-    for reference in &exporter.tls.client_certificate_refs {
+    for reference in &tls.client_certificate_refs {
         crate::tls::validate_material_ref(
             format!("exporters.{}.tls.client_certificate_refs", exporter.id),
             reference,
@@ -35,7 +37,7 @@ pub(super) fn validate_exporter_tls(
             "TLS material",
         );
     }
-    if let Some(reference) = &exporter.tls.client_private_key_ref {
+    if let Some(reference) = &tls.client_private_key_ref {
         crate::tls::validate_material_ref(
             format!("exporters.{}.tls.client_private_key_ref", exporter.id),
             reference,
@@ -45,17 +47,13 @@ pub(super) fn validate_exporter_tls(
             "TLS material",
         );
     }
-    if !exporter.tls.client_certificate_refs.is_empty()
-        && exporter.tls.client_private_key_ref.is_none()
-    {
+    if !tls.client_certificate_refs.is_empty() && tls.client_private_key_ref.is_none() {
         violations.push(ConfigViolation {
             field: format!("exporters.{}.tls.client_private_key_ref", exporter.id),
             reason: "client certificate refs require a client private key ref".to_string(),
         });
     }
-    if exporter.tls.client_certificate_refs.is_empty()
-        && exporter.tls.client_private_key_ref.is_some()
-    {
+    if tls.client_certificate_refs.is_empty() && tls.client_private_key_ref.is_some() {
         violations.push(ConfigViolation {
             field: format!("exporters.{}.tls.client_certificate_refs", exporter.id),
             reason: "client private key ref requires at least one client certificate ref"
@@ -70,6 +68,6 @@ fn exporter_tls_configured(tls: &ExporterTlsConfig) -> bool {
         || tls.client_private_key_ref.is_some()
 }
 
-fn webhook_endpoint_is_https(exporter: &ExporterConfig) -> bool {
-    Url::parse(&exporter.endpoint).is_ok_and(|url| url.scheme() == "https")
+fn webhook_endpoint_is_https(endpoint: &str) -> bool {
+    Url::parse(endpoint).is_ok_and(|url| url.scheme() == "https")
 }

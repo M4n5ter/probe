@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use probe_config::*;
 use probe_core::EnforcementMode;
@@ -140,10 +140,10 @@ socket_path = "/run/sssa-probe/admin.sock"
     );
     assert_eq!(config.exporters[0].codec, CompressionCodecName::Zstd);
     assert_eq!(config.exporters[0].worker.batches_per_tick, Some(2));
-    assert_eq!(
-        config.exporters[0].tls.trust_anchor_refs,
-        vec!["collector-ca"]
-    );
+    let ExporterTransportConfig::Webhook { tls, .. } = &config.exporters[0].transport else {
+        panic!("expected webhook exporter");
+    };
+    assert_eq!(tls.trust_anchor_refs, vec!["collector-ca"]);
     assert_eq!(config.tls.materials[0].id.as_deref(), Some("collector-ca"));
     assert_eq!(config.tls.materials[0].kind, TlsMaterialKind::TrustAnchor);
     assert!(config.tls.plaintext.instrumentation.enabled);
@@ -173,5 +173,82 @@ socket_path = "/run/sssa-probe/admin.sock"
         config.admin.socket_path,
         PathBuf::from("/run/sssa-probe/admin.sock")
     );
+    Ok(())
+}
+
+#[test]
+fn parses_file_exporter_transport() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "local-file"
+transport = "file"
+path = "/tmp/sssa-export.jsonl"
+codec = "gzip"
+"#,
+    )?;
+
+    assert_eq!(config.exporters[0].id, "local-file");
+    assert_eq!(config.exporters[0].codec, CompressionCodecName::Gzip);
+    assert_eq!(
+        config.exporters[0].transport,
+        ExporterTransportConfig::File {
+            path: PathBuf::from("/tmp/sssa-export.jsonl"),
+        }
+    );
+    config.validate_basic()?;
+    Ok(())
+}
+
+#[test]
+fn exporter_config_serializes_to_parseable_flat_toml() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig {
+        exporters: vec![
+            ExporterConfig {
+                id: "webhook".to_string(),
+                transport: ExporterTransportConfig::Webhook {
+                    endpoint: "https://collector.example/batches".to_string(),
+                    headers: BTreeMap::from([("x-probe-node".to_string(), "node-a".to_string())]),
+                    tls: ExporterTlsConfig {
+                        trust_anchor_refs: vec!["collector-ca".to_string()],
+                        client_certificate_refs: Vec::new(),
+                        client_private_key_ref: None,
+                    },
+                },
+                codec: CompressionCodecName::Gzip,
+                worker: ExporterWorkerConfig {
+                    batches_per_tick: Some(2),
+                },
+            },
+            ExporterConfig {
+                id: "local-file".to_string(),
+                transport: ExporterTransportConfig::File {
+                    path: PathBuf::from("/tmp/sssa-export.jsonl"),
+                },
+                codec: CompressionCodecName::None,
+                worker: ExporterWorkerConfig::default(),
+            },
+        ],
+        tls: TlsConfig {
+            materials: vec![TlsMaterialConfig {
+                id: Some("collector-ca".to_string()),
+                kind: TlsMaterialKind::TrustAnchor,
+                path: PathBuf::from("/etc/ssl/certs/collector-ca.pem"),
+            }],
+            ..TlsConfig::default()
+        },
+        ..AgentConfig::default()
+    };
+
+    let rendered = toml::to_string(&config)?;
+    assert!(rendered.contains("transport = \"webhook\""));
+    assert!(rendered.contains("endpoint = \"https://collector.example/batches\""));
+    assert!(rendered.contains("transport = \"file\""));
+    assert!(rendered.contains("path = \"/tmp/sssa-export.jsonl\""));
+
+    let roundtrip = AgentConfig::from_toml_str(&rendered)?;
+
+    assert_eq!(roundtrip.exporters, config.exporters);
+    roundtrip.validate_basic()?;
     Ok(())
 }

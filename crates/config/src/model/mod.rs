@@ -24,7 +24,7 @@ pub use export::{
     DEFAULT_EXPORT_FAILURE_BACKOFF_MULTIPLIER, DEFAULT_EXPORT_SINK_TIMEOUT_MS,
     DEFAULT_EXPORT_WORKER_INTERVAL_MS, ExportFailureBackoffConfig, ExportRuntimeConfig,
     ExportWorkerRuntimeConfig, ExportWorkerScheduleConfig, ExporterConfig, ExporterTlsConfig,
-    ExporterTransport, ExporterWorkerConfig,
+    ExporterTransportConfig, ExporterWorkerConfig,
 };
 pub use policy::PolicyConfig;
 pub use storage::{

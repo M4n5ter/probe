@@ -227,11 +227,12 @@ mod tests {
             },
             exporters: vec![ExporterConfig {
                 id: "primary".to_string(),
-                transport: probe_config::ExporterTransport::Webhook,
-                endpoint: "https://collector.example/batches".to_string(),
+                transport: probe_config::ExporterTransportConfig::Webhook {
+                    endpoint: "https://collector.example/batches".to_string(),
+                    headers: BTreeMap::new(),
+                    tls: Default::default(),
+                },
                 codec: probe_config::CompressionCodecName::None,
-                headers: BTreeMap::new(),
-                tls: Default::default(),
                 worker: Default::default(),
             }],
             ..AgentConfig::default()

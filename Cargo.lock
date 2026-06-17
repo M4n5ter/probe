@@ -645,14 +645,18 @@ name = "exporter"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "flate2",
  "probe-core",
  "proto",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "zstd",
 ]
 

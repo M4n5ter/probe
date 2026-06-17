@@ -394,7 +394,7 @@ mod tests {
 
     use probe_config::{
         AgentConfig, CompressionCodecName, ExportWorkerScheduleConfig, ExporterConfig,
-        ExporterTransport,
+        ExporterTransportConfig,
     };
     use probe_core::{CapabilityKind, CapabilityState};
     use runtime::{
@@ -486,11 +486,12 @@ mod tests {
             agent_id: "agent-1".to_string(),
             exporters: vec![ExporterConfig {
                 id: "worker".to_string(),
-                transport: ExporterTransport::Webhook,
-                endpoint: server.endpoint(),
+                transport: ExporterTransportConfig::Webhook {
+                    endpoint: server.endpoint(),
+                    headers: BTreeMap::new(),
+                    tls: Default::default(),
+                },
                 codec: CompressionCodecName::None,
-                headers: BTreeMap::new(),
-                tls: Default::default(),
                 worker: Default::default(),
             }],
             ..AgentConfig::default()

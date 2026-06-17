@@ -106,3 +106,26 @@ headers = { "bad header" = "value", good = "bad\nvalue" }
     );
     Ok(())
 }
+
+#[test]
+fn validation_rejects_empty_file_exporter_path() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "local-file"
+transport = "file"
+path = ""
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("empty file exporter path must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("file exporter path cannot be empty")
+    );
+    Ok(())
+}

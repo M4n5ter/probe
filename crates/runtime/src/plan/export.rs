@@ -1,8 +1,8 @@
-use std::{collections::BTreeMap, num::NonZeroU64};
+use std::{collections::BTreeMap, num::NonZeroU64, path::PathBuf};
 
 use probe_config::{
     AgentConfig, CompressionCodecName, ExportFailureBackoffConfig, ExportWorkerScheduleConfig,
-    ExporterTlsConfig, ExporterTransport,
+    ExporterTlsConfig, ExporterTransportConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,18 +22,33 @@ impl ExportPlan {
         let sinks = config
             .exporters
             .iter()
-            .map(|exporter| match exporter.transport {
-                ExporterTransport::Webhook => ExportSinkPlan::Webhook(WebhookExportSinkPlan {
+            .map(|exporter| match &exporter.transport {
+                ExporterTransportConfig::Webhook {
+                    endpoint,
+                    headers,
+                    tls,
+                } => ExportSinkPlan::Webhook(WebhookExportSinkPlan {
                     id: exporter.id.clone(),
-                    endpoint: exporter.endpoint.clone(),
+                    endpoint: endpoint.clone(),
                     codec: exporter.codec,
-                    headers: exporter.headers.clone(),
-                    tls: ExportSinkTlsPlan::from_config(&exporter.tls, &materials_by_id),
+                    headers: headers.clone(),
+                    tls: ExportSinkTlsPlan::from_config(tls, &materials_by_id),
                     worker: ExportSinkWorkerPlan::from_config(
                         exporter.worker.batches_per_tick,
                         default_sink_batches_per_tick,
                     ),
                 }),
+                ExporterTransportConfig::File { path } => {
+                    ExportSinkPlan::File(FileExportSinkPlan {
+                        id: exporter.id.clone(),
+                        path: path.clone(),
+                        codec: exporter.codec,
+                        worker: ExportSinkWorkerPlan::from_config(
+                            exporter.worker.batches_per_tick,
+                            default_sink_batches_per_tick,
+                        ),
+                    })
+                }
             })
             .collect::<Vec<_>>();
         let worker = match (config.export.worker.enabled, sinks.is_empty()) {
@@ -126,18 +141,21 @@ impl From<ExportFailureBackoffConfig> for ExportFailureBackoffPlan {
 #[serde(rename_all = "snake_case", tag = "transport")]
 pub enum ExportSinkPlan {
     Webhook(WebhookExportSinkPlan),
+    File(FileExportSinkPlan),
 }
 
 impl ExportSinkPlan {
     pub fn id(&self) -> &str {
         match self {
             Self::Webhook(sink) => &sink.id,
+            Self::File(sink) => &sink.id,
         }
     }
 
     pub fn worker(&self) -> &ExportSinkWorkerPlan {
         match self {
             Self::Webhook(sink) => &sink.worker,
+            Self::File(sink) => &sink.worker,
         }
     }
 }
@@ -148,6 +166,12 @@ impl From<WebhookExportSinkPlan> for ExportSinkPlan {
     }
 }
 
+impl From<FileExportSinkPlan> for ExportSinkPlan {
+    fn from(value: FileExportSinkPlan) -> Self {
+        Self::File(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookExportSinkPlan {
     pub id: String,
@@ -155,6 +179,14 @@ pub struct WebhookExportSinkPlan {
     pub codec: CompressionCodecName,
     pub headers: BTreeMap<String, String>,
     pub tls: ExportSinkTlsPlan,
+    pub worker: ExportSinkWorkerPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileExportSinkPlan {
+    pub id: String,
+    pub path: PathBuf,
+    pub codec: CompressionCodecName,
     pub worker: ExportSinkWorkerPlan,
 }
 
@@ -217,7 +249,8 @@ mod tests {
     use std::path::PathBuf;
 
     use probe_config::{
-        ExporterConfig, ExporterTransport, ExporterWorkerConfig, TlsMaterialConfig, TlsMaterialKind,
+        ExporterConfig, ExporterTransportConfig, ExporterWorkerConfig, TlsMaterialConfig,
+        TlsMaterialKind,
     };
 
     use super::*;
@@ -250,15 +283,16 @@ mod tests {
         };
         config.exporters = vec![ExporterConfig {
             id: "primary".to_string(),
-            transport: ExporterTransport::Webhook,
-            endpoint: "https://collector.example/batches".to_string(),
-            codec: CompressionCodecName::None,
-            headers: Default::default(),
-            tls: ExporterTlsConfig {
-                trust_anchor_refs: vec!["collector-ca".to_string()],
-                client_certificate_refs: vec!["client-cert".to_string()],
-                client_private_key_ref: Some("client-key".to_string()),
+            transport: ExporterTransportConfig::Webhook {
+                endpoint: "https://collector.example/batches".to_string(),
+                headers: Default::default(),
+                tls: ExporterTlsConfig {
+                    trust_anchor_refs: vec!["collector-ca".to_string()],
+                    client_certificate_refs: vec!["client-cert".to_string()],
+                    client_private_key_ref: Some("client-key".to_string()),
+                },
             },
+            codec: CompressionCodecName::None,
             worker: ExporterWorkerConfig {
                 batches_per_tick: Some(2),
             },
@@ -328,6 +362,38 @@ mod tests {
                 worker: ExportSinkWorkerPlan {
                     batches_per_tick_override: Some(2),
                     effective_batches_per_tick: NonZeroU64::new(2).expect("positive batch quota"),
+                },
+            })]
+        );
+    }
+
+    #[test]
+    fn export_plan_builds_file_sink() {
+        let config = AgentConfig {
+            exporters: vec![ExporterConfig {
+                id: "local-file".to_string(),
+                transport: ExporterTransportConfig::File {
+                    path: PathBuf::from("/var/lib/sssa/export.jsonl"),
+                },
+                codec: CompressionCodecName::Gzip,
+                worker: ExporterWorkerConfig {
+                    batches_per_tick: Some(4),
+                },
+            }],
+            ..AgentConfig::default()
+        };
+
+        let plan = ExportPlan::resolve(&config);
+
+        assert_eq!(
+            plan.sinks,
+            vec![ExportSinkPlan::File(FileExportSinkPlan {
+                id: "local-file".to_string(),
+                path: PathBuf::from("/var/lib/sssa/export.jsonl"),
+                codec: CompressionCodecName::Gzip,
+                worker: ExportSinkWorkerPlan {
+                    batches_per_tick_override: Some(4),
+                    effective_batches_per_tick: NonZeroU64::new(4).expect("positive batch quota"),
                 },
             })]
         );

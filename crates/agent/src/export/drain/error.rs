@@ -37,6 +37,7 @@ pub enum ExportDrainFailureReason {
     StorageError,
     ProtoError,
     CompressionError,
+    FileTransportError,
     HttpTransportError,
     InvalidExporterHeader,
     ReservedExporterHeader,
@@ -71,6 +72,20 @@ impl ExportDrainError {
 
 fn export_error_failure_reason(error: &exporter::ExportError) -> ExportDrainFailureReason {
     match error {
+        exporter::ExportError::File(_)
+        | exporter::ExportError::FileTask(_)
+        | exporter::ExportError::FileInvalidTargetName { .. }
+        | exporter::ExportError::FileSymlink { .. }
+        | exporter::ExportError::FileNotRegular { .. }
+        | exporter::ExportError::FileOwnerMismatch { .. }
+        | exporter::ExportError::FileNotWritable { .. }
+        | exporter::ExportError::FileParentSymlink { .. }
+        | exporter::ExportError::FileParentUnavailable { .. }
+        | exporter::ExportError::FileParentNotDirectory { .. }
+        | exporter::ExportError::FileParentNotWritable { .. }
+        | exporter::ExportError::FileInsecurePermissions { .. }
+        | exporter::ExportError::FileRecord(_) => ExportDrainFailureReason::FileTransportError,
+        exporter::ExportError::EmptyBatch { .. } => ExportDrainFailureReason::InvalidExportAck,
         exporter::ExportError::Compression(_) | exporter::ExportError::Zstd(_) => {
             ExportDrainFailureReason::CompressionError
         }

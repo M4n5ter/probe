@@ -21,7 +21,7 @@ pub use enforcement::{
 pub use error::RuntimeError;
 pub use export::{
     ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
-    ExportWorkerPlan, WebhookExportSinkPlan,
+    ExportWorkerPlan, FileExportSinkPlan, WebhookExportSinkPlan,
 };
 pub use registry::{PlatformProbeResults, ProviderRegistry};
 pub use runtime_plan::{RuntimePlan, validate_static_runtime_config};

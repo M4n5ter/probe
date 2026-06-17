@@ -6,7 +6,7 @@ use std::{
 };
 
 use exporter::CompressionCodec;
-use probe_config::{CompressionCodecName, ExporterConfig, ExporterTransport};
+use probe_config::{CompressionCodecName, ExporterConfig, ExporterTransportConfig};
 use probe_core::{
     CaptureProviderKind, CaptureSource, EventEnvelope, EventKind, SpoolPayloadSchema,
 };
@@ -108,11 +108,12 @@ fn write_agent_config(
     config.export.worker.enabled = false;
     config.exporters.push(ExporterConfig {
         id: COLLECTOR_SINK.to_string(),
-        transport: ExporterTransport::Webhook,
-        endpoint,
+        transport: ExporterTransportConfig::Webhook {
+            endpoint,
+            headers: BTreeMap::from([("x-sssa-e2e".to_string(), "webhook-exporter".to_string())]),
+            tls: Default::default(),
+        },
         codec: test_codec_name(),
-        headers: BTreeMap::from([("x-sssa-e2e".to_string(), "webhook-exporter".to_string())]),
-        tls: Default::default(),
         worker: Default::default(),
     });
     fs::write(path, toml::to_string(&config)?)?;

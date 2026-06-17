@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use probe_config::CompressionCodecName;
 use probe_core::RuntimeMode;
@@ -41,12 +41,19 @@ pub struct ExporterStatusSnapshot {
 #[serde(rename_all = "snake_case", tag = "transport")]
 pub enum ExporterTargetStatusSnapshot {
     Webhook(WebhookExporterTargetStatusSnapshot),
+    File(FileExporterTargetStatusSnapshot),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WebhookExporterTargetStatusSnapshot {
     pub codec: CompressionCodecName,
     pub tls: ExporterTlsStatusSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileExporterTargetStatusSnapshot {
+    pub codec: CompressionCodecName,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -202,6 +209,27 @@ fn exporter_target_status(sink: &ExportSinkPlan) -> ExporterTargetStatus {
                 reason,
             }
         }
+        ExportSinkPlan::File(sink) => {
+            let (mode, reason) = file_exporter_target_mode(&sink.path);
+            ExporterTargetStatus {
+                snapshot: ExporterTargetStatusSnapshot::File(FileExporterTargetStatusSnapshot {
+                    codec: sink.codec,
+                    path: sink.path.clone(),
+                }),
+                mode,
+                reason,
+            }
+        }
+    }
+}
+
+fn file_exporter_target_mode(path: &PathBuf) -> (RuntimeMode, Option<String>) {
+    match exporter::FileExporter::preflight_path(path) {
+        Ok(()) => (RuntimeMode::Available, None),
+        Err(error) => (
+            RuntimeMode::Unavailable,
+            Some(format!("file exporter target is unavailable: {error}")),
+        ),
     }
 }
 
@@ -253,8 +281,9 @@ fn exporter_tls_reason(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, path::PathBuf};
+    use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
+    use probe_config::{CompressionCodecName, ExporterTransportConfig};
     use probe_core::RuntimeMode;
     use serde_json::json;
 
@@ -298,6 +327,123 @@ mod tests {
         assert_eq!(target["codec"], json!("none"));
         assert_eq!(target["tls"]["mode"], json!("available"));
         assert_eq!(target["tls"]["reason"], json!(null));
+        Ok(())
+    }
+
+    #[test]
+    fn exporter_status_reports_file_target() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-file-exporter-target")?;
+        let export_path = temp.join("export.jsonl");
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.exporters[0].transport = ExporterTransportConfig::File {
+            path: export_path.clone(),
+        };
+        config.exporters[0].codec = CompressionCodecName::Gzip;
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+        let spool = available_spool_status(0, 0);
+
+        let exporters = exporter_statuses_with_runtime(
+            &plan,
+            &spool,
+            &BTreeMap::from([("primary".to_string(), 0)]),
+            None,
+        );
+
+        assert_eq!(exporters[0].mode, RuntimeMode::Available);
+        let target = serde_json::to_value(&exporters[0].target)?;
+        assert_eq!(target["transport"], json!("file"));
+        assert_eq!(target["codec"], json!("gzip"));
+        assert_eq!(target["path"], json!(export_path.display().to_string()));
+        assert!(
+            !target
+                .as_object()
+                .expect("target status should serialize to an object")
+                .contains_key("tls")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exporter_status_marks_file_target_directory_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-file-exporter-directory")?;
+        let plan = runtime_plan_from_config(file_exporter_config(&temp), Vec::new())?;
+        let spool = available_spool_status(0, 0);
+
+        let exporters = exporter_statuses_with_runtime(
+            &plan,
+            &spool,
+            &BTreeMap::from([("primary".to_string(), 0)]),
+            None,
+        );
+
+        assert_eq!(exporters[0].mode, RuntimeMode::Unavailable);
+        assert!(
+            exporters[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not a regular file"))
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exporter_status_marks_insecure_file_target_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-insecure-file-exporter-target")?;
+        let export_path = temp.join("export.jsonl");
+        fs::write(&export_path, b"")?;
+        fs::set_permissions(&export_path, fs::Permissions::from_mode(0o644))?;
+        let plan = runtime_plan_from_config(file_exporter_config(&export_path), Vec::new())?;
+        let spool = available_spool_status(0, 0);
+
+        let exporters = exporter_statuses_with_runtime(
+            &plan,
+            &spool,
+            &BTreeMap::from([("primary".to_string(), 0)]),
+            None,
+        );
+
+        assert_eq!(exporters[0].mode, RuntimeMode::Unavailable);
+        assert!(
+            exporters[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("insecure permissions 644"))
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exporter_status_marks_unwritable_file_parent_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+        let temp = test_dir("status-unwritable-file-exporter-parent")?;
+        let export_path = temp.join("export.jsonl");
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o500))?;
+        let plan = runtime_plan_from_config(file_exporter_config(&export_path), Vec::new())?;
+        let spool = available_spool_status(0, 0);
+
+        let exporters = exporter_statuses_with_runtime(
+            &plan,
+            &spool,
+            &BTreeMap::from([("primary".to_string(), 0)]),
+            None,
+        );
+
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o700))?;
+        assert_eq!(exporters[0].mode, RuntimeMode::Unavailable);
+        assert!(
+            exporters[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not writable/searchable"))
+        );
+        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
@@ -403,7 +549,11 @@ mod tests {
         let temp = test_dir("status-missing-exporter-tls-material")?;
         let missing_path = temp.join("missing-ca.pem");
         let mut config = config_with_storage_path(temp.join("spool"));
-        config.exporters[0].tls.trust_anchor_refs = vec!["collector-ca".to_string()];
+        let ExporterTransportConfig::Webhook { tls, .. } = &mut config.exporters[0].transport
+        else {
+            panic!("expected webhook exporter");
+        };
+        tls.trust_anchor_refs = vec!["collector-ca".to_string()];
         config.tls.materials = vec![probe_config::TlsMaterialConfig {
             id: Some("collector-ca".to_string()),
             kind: probe_config::TlsMaterialKind::TrustAnchor,
@@ -460,6 +610,15 @@ mod tests {
     fn webhook_target(exporter: &ExporterStatusSnapshot) -> &WebhookExporterTargetStatusSnapshot {
         match &exporter.target {
             ExporterTargetStatusSnapshot::Webhook(target) => target,
+            ExporterTargetStatusSnapshot::File(_) => panic!("expected webhook target"),
         }
+    }
+
+    fn file_exporter_config(path: &std::path::Path) -> probe_config::AgentConfig {
+        let mut config = config_with_storage_path(path.with_extension("spool"));
+        config.exporters[0].transport = ExporterTransportConfig::File {
+            path: path.to_path_buf(),
+        };
+        config
     }
 }
