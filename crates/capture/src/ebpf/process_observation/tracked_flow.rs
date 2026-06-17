@@ -3,8 +3,8 @@ use std::collections::{HashMap, VecDeque};
 use probe_core::{Direction, FlowContext};
 
 use super::{
-    EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfSocketReadObservation,
-    EbpfSocketWriteObservation, payload_direction::PayloadDirections,
+    EbpfCloseTracepointObservation, EbpfSocketReadObservation, EbpfSocketWriteObservation,
+    payload_direction::PayloadDirections,
 };
 
 pub(super) struct TrackedEbpfFlows {
@@ -29,17 +29,14 @@ impl TrackedEbpfFlows {
         }
     }
 
-    pub(super) fn insert_connect(
+    pub(super) fn insert_flow(
         &mut self,
-        connect: &EbpfConnectTracepointObservation,
+        tgid: u32,
+        fd: i32,
         flow: FlowContext,
         payload_directions: PayloadDirections,
     ) {
-        self.insert(
-            EbpfDescriptorKey::from_connect(connect),
-            flow,
-            payload_directions,
-        );
+        self.insert(EbpfDescriptorKey::new(tgid, fd), flow, payload_directions);
     }
 
     pub(super) fn remove_close(
@@ -138,55 +135,39 @@ struct EbpfDescriptorKey {
 }
 
 impl EbpfDescriptorKey {
-    fn from_connect(connect: &EbpfConnectTracepointObservation) -> Self {
-        Self {
-            tgid: connect.process.tgid,
-            fd: connect.fd,
-        }
+    const fn new(tgid: u32, fd: i32) -> Self {
+        Self { tgid, fd }
     }
 
     fn from_close(close: &EbpfCloseTracepointObservation) -> Self {
-        Self {
-            tgid: close.process.tgid,
-            fd: close.fd,
-        }
+        Self::new(close.process.tgid, close.fd)
     }
 
     fn from_write(write: &EbpfSocketWriteObservation) -> Self {
-        Self {
-            tgid: write.process.tgid,
-            fd: write.fd,
-        }
+        Self::new(write.process.tgid, write.fd)
     }
 
     fn from_read(read: &EbpfSocketReadObservation) -> Self {
-        Self {
-            tgid: read.process.tgid,
-            fd: read.fd,
-        }
+        Self::new(read.process.tgid, read.fd)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
-
     use probe_core::{
-        AddressPort, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, TcpEndpoint,
-        TransportProtocol,
+        AddressPort, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, TransportProtocol,
     };
 
     use super::super::{
-        EbpfCloseTracepointObservation, EbpfConnectEndpoint, EbpfObservedProcess,
-        EbpfSocketReadObservation,
+        EbpfCloseTracepointObservation, EbpfObservedProcess, EbpfSocketReadObservation,
     };
     use super::*;
 
     #[test]
     fn tracked_flows_evict_oldest_descriptor_when_capacity_is_exceeded() {
         let mut tracked = TrackedEbpfFlows::bounded(1);
-        insert_connect(&mut tracked, 7, flow("fd-7"));
-        insert_connect(&mut tracked, 8, flow("fd-8"));
+        insert_flow_for_descriptor(&mut tracked, 7, flow("fd-7"));
+        insert_flow_for_descriptor(&mut tracked, 8, flow("fd-8"));
 
         assert!(tracked.remove_close(&close_observation(7)).is_none());
         assert_eq!(
@@ -202,10 +183,10 @@ mod tests {
     #[test]
     fn tracked_flows_refresh_descriptor_age_on_reuse() {
         let mut tracked = TrackedEbpfFlows::bounded(2);
-        insert_connect(&mut tracked, 7, flow("fd-7-first"));
-        insert_connect(&mut tracked, 8, flow("fd-8"));
-        insert_connect(&mut tracked, 7, flow("fd-7-second"));
-        insert_connect(&mut tracked, 9, flow("fd-9"));
+        insert_flow_for_descriptor(&mut tracked, 7, flow("fd-7-first"));
+        insert_flow_for_descriptor(&mut tracked, 8, flow("fd-8"));
+        insert_flow_for_descriptor(&mut tracked, 7, flow("fd-7-second"));
+        insert_flow_for_descriptor(&mut tracked, 9, flow("fd-9"));
 
         assert!(tracked.remove_close(&close_observation(8)).is_none());
         assert_eq!(
@@ -229,13 +210,13 @@ mod tests {
     #[test]
     fn tracked_flows_refresh_descriptor_age_on_write() {
         let mut tracked = TrackedEbpfFlows::bounded(2);
-        insert_connect(&mut tracked, 7, flow("fd-7"));
-        insert_connect(&mut tracked, 8, flow("fd-8"));
+        insert_flow_for_descriptor(&mut tracked, 7, flow("fd-7"));
+        insert_flow_for_descriptor(&mut tracked, 8, flow("fd-8"));
 
         tracked
             .get_write_mut(&write_observation(7))
             .expect("fd 7 should be tracked");
-        insert_connect(&mut tracked, 9, flow("fd-9"));
+        insert_flow_for_descriptor(&mut tracked, 9, flow("fd-9"));
 
         assert!(tracked.remove_close(&close_observation(8)).is_none());
         assert_eq!(
@@ -259,13 +240,13 @@ mod tests {
     #[test]
     fn tracked_flows_refresh_descriptor_age_on_read() {
         let mut tracked = TrackedEbpfFlows::bounded(2);
-        insert_connect(&mut tracked, 7, flow("fd-7"));
-        insert_connect(&mut tracked, 8, flow("fd-8"));
+        insert_flow_for_descriptor(&mut tracked, 7, flow("fd-7"));
+        insert_flow_for_descriptor(&mut tracked, 8, flow("fd-8"));
 
         tracked
             .get_read_mut(&read_observation(7))
             .expect("fd 7 should be tracked");
-        insert_connect(&mut tracked, 9, flow("fd-9"));
+        insert_flow_for_descriptor(&mut tracked, 9, flow("fd-9"));
 
         assert!(tracked.remove_close(&close_observation(8)).is_none());
         assert_eq!(
@@ -289,15 +270,16 @@ mod tests {
     #[test]
     fn tracked_flows_do_not_refresh_descriptor_on_unallowed_payload_direction() {
         let mut tracked = TrackedEbpfFlows::bounded(2);
-        tracked.insert_connect(
-            &connect_observation(7),
+        tracked.insert_flow(
+            100,
+            7,
             flow("fd-7"),
             PayloadDirections::from_directions([Direction::Outbound]),
         );
-        insert_connect(&mut tracked, 8, flow("fd-8"));
+        insert_flow_for_descriptor(&mut tracked, 8, flow("fd-8"));
 
         assert!(tracked.get_read_mut(&read_observation(7)).is_none());
-        insert_connect(&mut tracked, 9, flow("fd-9"));
+        insert_flow_for_descriptor(&mut tracked, 9, flow("fd-9"));
 
         assert!(tracked.remove_close(&close_observation(7)).is_none());
         assert_eq!(
@@ -318,22 +300,10 @@ mod tests {
         );
     }
 
-    fn connect_observation(fd: i32) -> EbpfConnectTracepointObservation {
-        EbpfConnectTracepointObservation {
-            process: observed_process(),
+    fn insert_flow_for_descriptor(tracked: &mut TrackedEbpfFlows, fd: i32, flow: FlowContext) {
+        tracked.insert_flow(
+            100,
             fd,
-            addrlen: 16,
-            fd_table_epoch: 0,
-            endpoint: EbpfConnectEndpoint::Remote(TcpEndpoint::new(
-                Ipv4Addr::new(127, 0, 0, 1).into(),
-                443,
-            )),
-        }
-    }
-
-    fn insert_connect(tracked: &mut TrackedEbpfFlows, fd: i32, flow: FlowContext) {
-        tracked.insert_connect(
-            &connect_observation(fd),
             flow,
             PayloadDirections::from_directions([Direction::Outbound, Direction::Inbound]),
         );

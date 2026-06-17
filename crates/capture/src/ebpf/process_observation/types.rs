@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EbpfProcessObservation {
     Connect(EbpfConnectTracepointObservation),
+    Accept(EbpfAcceptTracepointObservation),
     Close(EbpfCloseTracepointObservation),
     Write(EbpfSocketWriteObservation),
     Read(EbpfSocketReadObservation),
@@ -18,6 +19,7 @@ impl EbpfProcessObservation {
     pub fn process(&self) -> &EbpfObservedProcess {
         match self {
             Self::Connect(observation) => &observation.process,
+            Self::Accept(observation) => &observation.process,
             Self::Close(observation) => &observation.process,
             Self::Write(observation) => &observation.process,
             Self::Read(observation) => &observation.process,
@@ -51,7 +53,17 @@ pub struct EbpfConnectTracepointObservation {
     pub fd: i32,
     pub addrlen: u32,
     pub fd_table_epoch: u64,
-    pub endpoint: EbpfConnectEndpoint,
+    pub endpoint: EbpfSocketEndpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EbpfAcceptTracepointObservation {
+    pub process: EbpfObservedProcess,
+    pub fd: i32,
+    pub listen_fd: i32,
+    pub addrlen: u32,
+    pub fd_table_epoch: u64,
+    pub endpoint: EbpfSocketEndpoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,14 +94,14 @@ pub struct EbpfSocketReadObservation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum EbpfConnectEndpoint {
+pub enum EbpfSocketEndpoint {
     Remote(TcpEndpoint),
     SockaddrReadFailed,
     UnsupportedAddressFamily { value: u16 },
     Missing,
 }
 
-impl EbpfConnectEndpoint {
+impl EbpfSocketEndpoint {
     pub fn remote_endpoint(self) -> Option<TcpEndpoint> {
         match self {
             Self::Remote(endpoint) => Some(endpoint),

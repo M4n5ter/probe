@@ -196,16 +196,11 @@ fn payload_degradation_reason(sample: &PayloadSample<'_>, captured_len: u64) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
-
     use probe_core::{
-        AddressPort, FlowIdentity, ProcessContext, ProcessIdentity, TcpEndpoint, TransportProtocol,
+        AddressPort, FlowIdentity, ProcessContext, ProcessIdentity, TransportProtocol,
     };
 
-    use super::super::{
-        EbpfConnectEndpoint, EbpfConnectTracepointObservation, EbpfObservedProcess,
-        payload_direction::PayloadDirections,
-    };
+    use super::super::{EbpfObservedProcess, payload_direction::PayloadDirections};
     use super::*;
 
     #[test]
@@ -420,25 +415,8 @@ mod tests {
         payload_directions: PayloadDirections,
     ) -> TrackedEbpfFlows {
         let mut tracked = TrackedEbpfFlows::bounded(8);
-        tracked.insert_connect(
-            &connect_observation(fd),
-            flow(&format!("flow-{fd}")),
-            payload_directions,
-        );
+        tracked.insert_flow(100, fd, flow(&format!("flow-{fd}")), payload_directions);
         tracked
-    }
-
-    fn connect_observation(fd: i32) -> EbpfConnectTracepointObservation {
-        EbpfConnectTracepointObservation {
-            process: observed_process(),
-            fd,
-            addrlen: 16,
-            fd_table_epoch: 0,
-            endpoint: EbpfConnectEndpoint::Remote(TcpEndpoint::new(
-                Ipv4Addr::new(127, 0, 0, 1).into(),
-                443,
-            )),
-        }
     }
 
     fn write_observation(

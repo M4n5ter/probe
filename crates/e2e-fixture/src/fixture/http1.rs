@@ -10,7 +10,7 @@ use super::{
     http::{self, ExchangeReport, HttpMessageError, HttpTrafficConfig},
     loopback::{
         LoopbackError, LoopbackRunOptions, accept_with_timeout, bind_loopback_listener,
-        configure_stream, coordinate_start, delay_after_exchange,
+        configure_stream, coordinate_start, delay_after_exchange, delay_before_accept_read,
     },
 };
 
@@ -21,6 +21,7 @@ pub(crate) struct Http1LoopbackConfig {
     pub traffic: HttpTrafficConfig,
     pub run: LoopbackRunOptions,
     pub io_mode: Http1IoMode,
+    pub accept_read_delay_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -142,9 +143,17 @@ pub(crate) fn run_http1_loopback(
     coordinate_start(&config.run.coordination, listen_addr)?;
     let traffic = config.traffic;
     let io_mode = config.io_mode;
+    let accept_read_delay_ms = config.accept_read_delay_ms;
     let post_exchange_delay_ms = config.run.post_exchange_delay_ms;
-    let server =
-        thread::spawn(move || serve_http1(listener, traffic, io_mode, post_exchange_delay_ms));
+    let server = thread::spawn(move || {
+        serve_http1(
+            listener,
+            traffic,
+            io_mode,
+            accept_read_delay_ms,
+            post_exchange_delay_ms,
+        )
+    });
 
     let mut client_bytes_written = 0usize;
     let mut client_bytes_read = 0usize;
@@ -216,6 +225,7 @@ fn serve_http1(
     listener: TcpListener,
     config: HttpTrafficConfig,
     io_mode: Http1IoMode,
+    accept_read_delay_ms: u64,
     post_exchange_delay_ms: u64,
 ) -> Result<ExchangeReport, Http1LoopbackError> {
     let mut bytes_read = 0usize;
@@ -223,6 +233,7 @@ fn serve_http1(
     for request_index in 0..config.requests {
         let (stream, _) = accept_with_timeout(&listener)?;
         configure_stream(&stream)?;
+        delay_before_accept_read(accept_read_delay_ms);
         let request = read_to_end(&stream, io_mode)
             .map_err(|source| io_error("read HTTP fixture request", source))?;
         http::validate_request(&request, request_index, config.request_body_bytes)?;
@@ -325,6 +336,7 @@ mod tests {
             },
             run: LoopbackRunOptions::default(),
             io_mode: Http1IoMode::ReadWrite,
+            accept_read_delay_ms: 0,
         })?;
 
         assert_eq!(report.requests, 2);
@@ -360,6 +372,7 @@ mod tests {
                 },
             },
             io_mode: Http1IoMode::ReadWrite,
+            accept_read_delay_ms: 0,
         };
         let handle = thread::spawn(move || {
             let report = run_http1_loopback(config);
@@ -405,6 +418,7 @@ mod tests {
                 },
             },
             io_mode: Http1IoMode::ReadWrite,
+            accept_read_delay_ms: 0,
         };
 
         let error = run_http1_loopback(config).expect_err("stale start file must fail");
@@ -425,6 +439,7 @@ mod tests {
             },
             run: LoopbackRunOptions::default(),
             io_mode: Http1IoMode::SendRecv,
+            accept_read_delay_ms: 0,
         })?;
 
         assert_eq!(report.io_mode, Http1IoMode::SendRecv);

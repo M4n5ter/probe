@@ -1,9 +1,8 @@
 use attribution::ProcfsSocketResolver;
 use capture::{
-    CaptureError, CaptureMultiplexer, CaptureProvider, EbpfConnectFlowLookup,
-    EbpfConnectFlowResolver, EbpfProcessObservationProbeConfig, EbpfProcessObservationProvider,
-    EbpfResolvedConnectFlow, LibpcapProvider, MultiplexedProvider, ProcessResolver,
-    ResolvedProcess,
+    CaptureError, CaptureMultiplexer, CaptureProvider, EbpfProcessObservationProbeConfig,
+    EbpfProcessObservationProvider, EbpfResolvedSocketFlow, EbpfSocketFlowLookup,
+    EbpfSocketFlowResolver, LibpcapProvider, MultiplexedProvider, ProcessResolver, ResolvedProcess,
 };
 use probe_config::CaptureBackend;
 use probe_core::{CapabilityKind, RuntimeMode, TcpConnection};
@@ -177,11 +176,11 @@ impl ProcessResolver for ProcfsTcpProcessResolver {
     }
 }
 
-impl EbpfConnectFlowResolver for ProcfsTcpProcessResolver {
-    fn resolve_connect_flow(
+impl EbpfSocketFlowResolver for ProcfsTcpProcessResolver {
+    fn resolve_socket_flow(
         &mut self,
-        lookup: EbpfConnectFlowLookup,
-    ) -> Result<Option<EbpfResolvedConnectFlow>, CaptureError> {
+        lookup: EbpfSocketFlowLookup,
+    ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError> {
         self.resolver
             .resolve_tcp_fd(attribution::SocketFdLookup {
                 tgid: lookup.tgid,
@@ -197,7 +196,7 @@ impl EbpfConnectFlowResolver for ProcfsTcpProcessResolver {
                     }),
             })
             .map(|resolved| {
-                resolved.map(|resolved| EbpfResolvedConnectFlow {
+                resolved.map(|resolved| EbpfResolvedSocketFlow {
                     process: resolved.process,
                     confidence: resolved.confidence,
                     connection: resolved.connection,

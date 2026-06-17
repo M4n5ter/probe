@@ -9,6 +9,18 @@ use crate::event::{
 pub const EBPF_CONNECT_PROGRAM_NAME: &str = "sssa_sys_enter_connect";
 pub const EBPF_CONNECT_TRACEPOINT_CATEGORY: &str = "syscalls";
 pub const EBPF_CONNECT_TRACEPOINT_NAME: &str = "sys_enter_connect";
+pub const EBPF_ACCEPT_ENTER_PROGRAM_NAME: &str = "sssa_sys_enter_accept";
+pub const EBPF_ACCEPT_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_ACCEPT_ENTER_TRACEPOINT_NAME: &str = "sys_enter_accept";
+pub const EBPF_ACCEPT_EXIT_PROGRAM_NAME: &str = "sssa_sys_exit_accept";
+pub const EBPF_ACCEPT_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_ACCEPT_EXIT_TRACEPOINT_NAME: &str = "sys_exit_accept";
+pub const EBPF_ACCEPT4_ENTER_PROGRAM_NAME: &str = "sssa_sys_enter_accept4";
+pub const EBPF_ACCEPT4_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_ACCEPT4_ENTER_TRACEPOINT_NAME: &str = "sys_enter_accept4";
+pub const EBPF_ACCEPT4_EXIT_PROGRAM_NAME: &str = "sssa_sys_exit_accept4";
+pub const EBPF_ACCEPT4_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_ACCEPT4_EXIT_TRACEPOINT_NAME: &str = "sys_exit_accept4";
 pub const EBPF_CLOSE_PROGRAM_NAME: &str = "sssa_sys_enter_close";
 pub const EBPF_CLOSE_TRACEPOINT_CATEGORY: &str = "syscalls";
 pub const EBPF_CLOSE_TRACEPOINT_NAME: &str = "sys_enter_close";
@@ -68,6 +80,11 @@ pub const EBPF_FD_TABLE_EPOCHS_MAP_NAME: &str = "SSSA_FD_TABLE_EPOCHS";
 pub const EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES: u32 = 8192;
 pub const EBPF_FD_TABLE_EPOCH_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
 pub const EBPF_FD_TABLE_EPOCH_VALUE_BYTES: u32 = core::mem::size_of::<u64>() as u32;
+pub const EBPF_PENDING_ACCEPTS_MAP_NAME: &str = "SSSA_PENDING_ACCEPTS";
+pub const EBPF_PENDING_ACCEPTS_MAX_ENTRIES: u32 = 8192;
+pub const EBPF_PENDING_ACCEPT_KEY_BYTES: u32 = core::mem::size_of::<u64>() as u32;
+pub const EBPF_PENDING_ACCEPT_VALUE_BYTES: u32 =
+    core::mem::size_of::<EbpfPendingSocketAcceptAttempt>() as u32;
 pub const EBPF_PENDING_WRITES_MAP_NAME: &str = "SSSA_PENDING_WRITES";
 pub const EBPF_PENDING_WRITES_MAX_ENTRIES: u32 = 8192;
 pub const EBPF_PENDING_WRITE_KEY_BYTES: u32 = core::mem::size_of::<u64>() as u32;
@@ -94,12 +111,36 @@ pub const EBPF_PROCESS_READ_EVENT_SCRATCH_KEY_BYTES: u32 = core::mem::size_of::<
 pub const EBPF_PROCESS_READ_EVENT_SCRATCH_VALUE_BYTES: u32 =
     core::mem::size_of::<EbpfSocketReadSampleRecord>() as u32;
 
-pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 17] = [
+pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 21] = [
     EbpfProcessTracepointSpec {
         role: EbpfProcessTracepointRole::ConnectEnter,
         program_name: EBPF_CONNECT_PROGRAM_NAME,
         category: EBPF_CONNECT_TRACEPOINT_CATEGORY,
         tracepoint_name: EBPF_CONNECT_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::AcceptEnter,
+        program_name: EBPF_ACCEPT_ENTER_PROGRAM_NAME,
+        category: EBPF_ACCEPT_ENTER_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_ACCEPT_ENTER_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::AcceptExit,
+        program_name: EBPF_ACCEPT_EXIT_PROGRAM_NAME,
+        category: EBPF_ACCEPT_EXIT_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_ACCEPT_EXIT_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::Accept4Enter,
+        program_name: EBPF_ACCEPT4_ENTER_PROGRAM_NAME,
+        category: EBPF_ACCEPT4_ENTER_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_ACCEPT4_ENTER_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::Accept4Exit,
+        program_name: EBPF_ACCEPT4_EXIT_PROGRAM_NAME,
+        category: EBPF_ACCEPT4_EXIT_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_ACCEPT4_EXIT_TRACEPOINT_NAME,
     },
     EbpfProcessTracepointSpec {
         role: EbpfProcessTracepointRole::CloseEnter,
@@ -199,7 +240,7 @@ pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 17] = [
     },
 ];
 
-pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 8] = [
+pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 9] = [
     EbpfMapSpec {
         name: EBPF_EVENTS_MAP_NAME,
         kind: EbpfMapKind::Ringbuf,
@@ -222,6 +263,14 @@ pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 8] = [
         key_size: EBPF_FD_TABLE_EPOCH_KEY_BYTES,
         value_size: EBPF_FD_TABLE_EPOCH_VALUE_BYTES,
         max_entries: EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES,
+        map_flags: 0,
+    },
+    EbpfMapSpec {
+        name: EBPF_PENDING_ACCEPTS_MAP_NAME,
+        kind: EbpfMapKind::Hash,
+        key_size: EBPF_PENDING_ACCEPT_KEY_BYTES,
+        value_size: EBPF_PENDING_ACCEPT_VALUE_BYTES,
+        max_entries: EBPF_PENDING_ACCEPTS_MAX_ENTRIES,
         map_flags: 0,
     },
     EbpfMapSpec {
@@ -302,6 +351,10 @@ impl fmt::Display for EbpfTracepointSectionName {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EbpfProcessTracepointRole {
     ConnectEnter,
+    AcceptEnter,
+    AcceptExit,
+    Accept4Enter,
+    Accept4Exit,
     CloseEnter,
     DupEnter,
     Dup2Enter,
@@ -396,6 +449,15 @@ impl EbpfSocketPayloadAllowance {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfPendingSocketAcceptAttempt {
+    pub listen_fd: i32,
+    pub addrlen_capacity: u32,
+    pub user_sockaddr: u64,
+    pub user_addrlen: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EbpfPendingSocketWriteSample {
     pub fd: i32,
     pub original_len: u32,
@@ -421,7 +483,7 @@ mod tests {
 
     #[test]
     fn process_map_specs_are_unique_and_layout_complete() {
-        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 8);
+        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 9);
         assert_unique(EBPF_PROCESS_MAP_SPECS.map(|spec| spec.name));
 
         let allow_map = process_map(EBPF_ALLOWED_SOCKET_FDS_MAP_NAME);
@@ -433,6 +495,13 @@ mod tests {
         assert_eq!(epoch_map.kind, EbpfMapKind::Hash);
         assert_eq!(epoch_map.key_size, EBPF_FD_TABLE_EPOCH_KEY_BYTES);
         assert_eq!(epoch_map.value_size, EBPF_FD_TABLE_EPOCH_VALUE_BYTES);
+
+        let pending_accepts = process_map(EBPF_PENDING_ACCEPTS_MAP_NAME);
+        assert_eq!(pending_accepts.kind, EbpfMapKind::Hash);
+        assert_eq!(
+            pending_accepts.value_size,
+            size_of::<EbpfPendingSocketAcceptAttempt>() as u32
+        );
 
         let pending_map = process_map(EBPF_PENDING_WRITES_MAP_NAME);
         assert_eq!(pending_map.kind, EbpfMapKind::Hash);
@@ -492,7 +561,7 @@ mod tests {
 
     #[test]
     fn process_tracepoint_specs_are_complete() {
-        assert_eq!(EBPF_PROCESS_TRACEPOINT_SPECS.len(), 17);
+        assert_eq!(EBPF_PROCESS_TRACEPOINT_SPECS.len(), 21);
         assert_unique(EBPF_PROCESS_TRACEPOINT_SPECS.map(|spec| spec.program_name));
         assert_unique(EBPF_PROCESS_TRACEPOINT_SPECS.map(|spec| spec.tracepoint_name));
 
@@ -514,6 +583,19 @@ mod tests {
         assert_eq!(offset_of!(EbpfPendingSocketWriteSample, captured_len), 8);
         assert_eq!(offset_of!(EbpfPendingSocketWriteSample, flags), 10);
         assert_eq!(offset_of!(EbpfPendingSocketWriteSample, buffer), 12);
+    }
+
+    #[test]
+    fn pending_socket_accept_attempt_layout_is_stable() {
+        assert_eq!(size_of::<EbpfPendingSocketAcceptAttempt>(), 24);
+        assert_eq!(align_of::<EbpfPendingSocketAcceptAttempt>(), 8);
+        assert_eq!(offset_of!(EbpfPendingSocketAcceptAttempt, listen_fd), 0);
+        assert_eq!(
+            offset_of!(EbpfPendingSocketAcceptAttempt, addrlen_capacity),
+            4
+        );
+        assert_eq!(offset_of!(EbpfPendingSocketAcceptAttempt, user_sockaddr), 8);
+        assert_eq!(offset_of!(EbpfPendingSocketAcceptAttempt, user_addrlen), 16);
     }
 
     #[test]

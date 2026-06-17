@@ -19,8 +19,8 @@ use super::{
         decode_envelope, e2e_error, ensure_e2e_packages_built, stop_running_child,
     },
     loopback::{
-        Http1FixtureIoMode, Http1LoopbackFixtureConfig, assert_no_policy_runtime_errors,
-        is_fixture_process, merge_run_results, spawn_agent,
+        Http1FixtureIoMode, Http1LoopbackFixtureConfig, PlainHttp1LoopbackFixtureConfig,
+        assert_no_policy_runtime_errors, is_fixture_process, merge_run_results, spawn_agent,
         spawn_http1_loopback_fixture_with_io_mode, start_http1_loopback_fixture,
         wait_for_agent_policy_progress, wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
         wait_for_http1_loopback_fixture_ready,
@@ -36,6 +36,7 @@ const REQUEST_BODY_BYTES: usize = 64;
 const RESPONSE_BODY_BYTES: usize = 32;
 const WRITE_CHUNKS: usize = 1;
 const CONNECT_WRITE_DELAY_MS: u64 = 2_000;
+const ACCEPT_READ_DELAY_MS: u64 = 2_000;
 
 pub(crate) fn run() -> ExitCode {
     match run_inner() {
@@ -135,15 +136,18 @@ fn run_at(
     Ok(())
 }
 
-fn fixture_config() -> Http1LoopbackFixtureConfig {
-    Http1LoopbackFixtureConfig {
-        listen_port: None,
-        requests: REQUESTS,
-        request_body_bytes: REQUEST_BODY_BYTES,
-        response_body_bytes: RESPONSE_BODY_BYTES,
-        write_chunks: WRITE_CHUNKS,
-        connect_write_delay_ms: CONNECT_WRITE_DELAY_MS,
-        post_exchange_delay_ms: 0,
+fn fixture_config() -> PlainHttp1LoopbackFixtureConfig {
+    PlainHttp1LoopbackFixtureConfig {
+        shared: Http1LoopbackFixtureConfig {
+            listen_port: None,
+            requests: REQUESTS,
+            request_body_bytes: REQUEST_BODY_BYTES,
+            response_body_bytes: RESPONSE_BODY_BYTES,
+            write_chunks: WRITE_CHUNKS,
+            connect_write_delay_ms: CONNECT_WRITE_DELAY_MS,
+            post_exchange_delay_ms: 0,
+        },
+        accept_read_delay_ms: ACCEPT_READ_DELAY_MS,
     }
 }
 
@@ -187,14 +191,26 @@ fn write_agent_config(
     };
     config.capture.selection = CaptureSelection::Ebpf;
     config.capture.ebpf.object_path = Some(PathBuf::from(ebpf_object_path));
-    config.capture.deep_observe_selector = Some(Selector::term(
-        ProcessSelector::default(),
-        TrafficSelector {
-            remote_ports: vec![listen_port],
-            directions: vec![Direction::Outbound, Direction::Inbound],
-            ..TrafficSelector::default()
-        },
-    ));
+    config.capture.deep_observe_selector = Some(Selector::Any {
+        selectors: vec![
+            Selector::term(
+                ProcessSelector::default(),
+                TrafficSelector {
+                    remote_ports: vec![listen_port],
+                    directions: vec![Direction::Outbound, Direction::Inbound],
+                    ..TrafficSelector::default()
+                },
+            ),
+            Selector::term(
+                ProcessSelector::default(),
+                TrafficSelector {
+                    local_ports: vec![listen_port],
+                    directions: vec![Direction::Outbound, Direction::Inbound],
+                    ..TrafficSelector::default()
+                },
+            ),
+        ],
+    });
     config.storage.path = spool_path.to_path_buf();
     config.export.worker.enabled = false;
     config.admin.enabled = true;
@@ -248,45 +264,32 @@ fn assert_ebpf_ingress(
         .map(decode_capture_event)
         .collect::<Result<Vec<_>, _>>()?;
 
-    if !capture_events
-        .iter()
-        .any(|event| is_expected_connection_event(event, listen_port, ConnectionLifecycle::Opened))
-    {
-        return Err(e2e_error(format!(
-            "missing eBPF connection-opened ingress event; observed {}",
-            ingress_summary(&capture_events, listen_port)
-        ))
-        .into());
-    }
-    if !capture_events
-        .iter()
-        .any(|event| is_expected_connection_event(event, listen_port, ConnectionLifecycle::Closed))
-    {
-        return Err(e2e_error(format!(
-            "missing eBPF connection-closed ingress event; observed {}",
-            ingress_summary(&capture_events, listen_port)
-        ))
-        .into());
-    }
-    if !capture_events
-        .iter()
-        .any(|event| is_expected_degraded_payload_event(event, listen_port, Direction::Outbound))
-    {
-        return Err(e2e_error(format!(
-            "missing selector-authorized eBPF outbound syscall payload sample; observed {}",
-            ingress_summary(&capture_events, listen_port)
-        ))
-        .into());
-    }
-    if !capture_events
-        .iter()
-        .any(|event| is_expected_degraded_payload_event(event, listen_port, Direction::Inbound))
-    {
-        return Err(e2e_error(format!(
-            "missing selector-authorized eBPF inbound syscall payload sample; observed {}",
-            ingress_summary(&capture_events, listen_port)
-        ))
-        .into());
+    for side in [FlowSide::Client, FlowSide::Server] {
+        for lifecycle in [ConnectionLifecycle::Opened, ConnectionLifecycle::Closed] {
+            if capture_events
+                .iter()
+                .any(|event| is_expected_connection_event(event, listen_port, side, lifecycle))
+            {
+                continue;
+            }
+            return Err(e2e_error(format!(
+                "missing eBPF {side:?} {lifecycle:?} ingress event; observed {}",
+                ingress_summary(&capture_events, listen_port)
+            ))
+            .into());
+        }
+        for direction in [Direction::Outbound, Direction::Inbound] {
+            if capture_events.iter().any(|event| {
+                is_expected_degraded_payload_event(event, listen_port, side, direction)
+            }) {
+                continue;
+            }
+            return Err(e2e_error(format!(
+                "missing selector-authorized eBPF {side:?} {direction:?} syscall payload sample; observed {}",
+                ingress_summary(&capture_events, listen_port)
+            ))
+            .into());
+        }
     }
 
     Ok(())
@@ -387,9 +390,16 @@ enum ConnectionLifecycle {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowSide {
+    Client,
+    Server,
+}
+
 fn is_expected_connection_event(
     event: &CaptureEvent,
     listen_port: u16,
+    side: FlowSide,
     lifecycle: ConnectionLifecycle,
 ) -> bool {
     match (lifecycle, event) {
@@ -413,7 +423,7 @@ fn is_expected_connection_event(
         ) => {
             *source == CaptureSource::EbpfSyscall
                 && *provider == CaptureProviderKind::Ebpf
-                && flow.remote.port == listen_port
+                && matches_expected_side(flow.local.port, flow.remote.port, listen_port, side)
                 && flow.attribution_confidence > 0
                 && is_fixture_process(&flow.process)
         }
@@ -424,6 +434,7 @@ fn is_expected_connection_event(
 fn is_expected_degraded_payload_event(
     event: &CaptureEvent,
     listen_port: u16,
+    side: FlowSide,
     direction: Direction,
 ) -> bool {
     let CaptureEvent::Bytes(bytes) = event else {
@@ -432,7 +443,12 @@ fn is_expected_degraded_payload_event(
     bytes.source == CaptureSource::EbpfSyscall
         && bytes.provider == CaptureProviderKind::Ebpf
         && bytes.direction == direction
-        && bytes.flow.remote.port == listen_port
+        && matches_expected_side(
+            bytes.flow.local.port,
+            bytes.flow.remote.port,
+            listen_port,
+            side,
+        )
         && bytes.flow.attribution_confidence > 0
         && is_fixture_process(&bytes.flow.process)
         && bytes.degraded
@@ -447,6 +463,18 @@ fn is_expected_degraded_payload_event(
                 ..
             }
         )
+}
+
+fn matches_expected_side(
+    local_port: u16,
+    remote_port: u16,
+    listen_port: u16,
+    side: FlowSide,
+) -> bool {
+    match side {
+        FlowSide::Client => remote_port == listen_port,
+        FlowSide::Server => local_port == listen_port,
+    }
 }
 
 fn expected_payload_reason(reason: &str, direction: Direction) -> bool {
@@ -468,17 +496,18 @@ fn assert_expected_lifecycle_exports(
     envelopes: &[EventEnvelope],
     listen_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for lifecycle in [ConnectionLifecycle::Opened, ConnectionLifecycle::Closed] {
-        if envelopes
-            .iter()
-            .any(|envelope| is_expected_lifecycle_envelope(envelope, listen_port, lifecycle))
-        {
-            continue;
+    for side in [FlowSide::Client, FlowSide::Server] {
+        for lifecycle in [ConnectionLifecycle::Opened, ConnectionLifecycle::Closed] {
+            if envelopes.iter().any(|envelope| {
+                is_expected_lifecycle_envelope(envelope, listen_port, side, lifecycle)
+            }) {
+                continue;
+            }
+            return Err(e2e_error(format!(
+                "missing eBPF {side:?} {lifecycle:?} export event for fixture flow"
+            ))
+            .into());
         }
-        return Err(e2e_error(format!(
-            "missing eBPF {lifecycle:?} export event for fixture flow"
-        ))
-        .into());
     }
     Ok(())
 }
@@ -486,6 +515,7 @@ fn assert_expected_lifecycle_exports(
 fn is_expected_lifecycle_envelope(
     envelope: &EventEnvelope,
     listen_port: u16,
+    side: FlowSide,
     lifecycle: ConnectionLifecycle,
 ) -> bool {
     let expected_kind = match lifecycle {
@@ -493,13 +523,26 @@ fn is_expected_lifecycle_envelope(
         ConnectionLifecycle::Closed => EventKind::ConnectionClosed,
     };
     envelope.source == CaptureSource::EbpfSyscall
-        && envelope.flow.remote.port == listen_port
+        && matches_expected_side(
+            envelope.flow.local.port,
+            envelope.flow.remote.port,
+            listen_port,
+            side,
+        )
         && envelope.flow.attribution_confidence > 0
         && is_fixture_process(&envelope.flow.process)
         && envelope.kind == expected_kind
 }
 
 fn assert_expected_requests(envelopes: &[EventEnvelope]) -> Result<(), Box<dyn std::error::Error>> {
+    assert_expected_request_direction(envelopes, Direction::Outbound)?;
+    assert_expected_request_direction(envelopes, Direction::Inbound)
+}
+
+fn assert_expected_request_direction(
+    envelopes: &[EventEnvelope],
+    direction: Direction,
+) -> Result<(), Box<dyn std::error::Error>> {
     let observed = envelopes
         .iter()
         .filter_map(|envelope| match &envelope.kind {
@@ -513,7 +556,7 @@ fn assert_expected_requests(envelopes: &[EventEnvelope]) -> Result<(), Box<dyn s
                             ..
                         }
                     )
-                    && headers.direction == Direction::Outbound
+                    && headers.direction == direction
                     && headers.method.as_deref() == Some("POST") =>
             {
                 headers.target.clone()
@@ -527,7 +570,7 @@ fn assert_expected_requests(envelopes: &[EventEnvelope]) -> Result<(), Box<dyn s
     }
 
     Err(e2e_error(format!(
-        "missing eBPF HTTP request targets; expected at least {:?}, observed {:?}",
+        "missing eBPF {direction:?} HTTP request targets; expected at least {:?}, observed {:?}",
         expected, observed
     ))
     .into())
@@ -535,6 +578,14 @@ fn assert_expected_requests(envelopes: &[EventEnvelope]) -> Result<(), Box<dyn s
 
 fn assert_expected_responses(
     envelopes: &[EventEnvelope],
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_expected_response_direction(envelopes, Direction::Inbound)?;
+    assert_expected_response_direction(envelopes, Direction::Outbound)
+}
+
+fn assert_expected_response_direction(
+    envelopes: &[EventEnvelope],
+    direction: Direction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let observed = envelopes
         .iter()
@@ -551,7 +602,7 @@ fn assert_expected_responses(
                             ..
                         }
                     )
-                    && headers.direction == Direction::Inbound
+                    && headers.direction == direction
                     && headers.status == Some(200)
             )
         })
@@ -561,7 +612,7 @@ fn assert_expected_responses(
     }
 
     Err(e2e_error(format!(
-        "missing eBPF HTTP response headers; expected at least {REQUESTS}, observed {observed}",
+        "missing eBPF {direction:?} HTTP response headers; expected at least {REQUESTS}, observed {observed}",
     ))
     .into())
 }

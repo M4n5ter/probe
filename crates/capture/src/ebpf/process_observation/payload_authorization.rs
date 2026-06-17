@@ -1,6 +1,6 @@
 use probe_core::{CompiledSelector, Direction, FlowContext};
 
-use super::{EbpfConnectTracepointObservation, payload_direction::PayloadDirections};
+use super::payload_direction::PayloadDirections;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SocketPayloadSampleAuthorization {
@@ -10,14 +10,31 @@ pub(super) struct SocketPayloadSampleAuthorization {
     payload_directions: PayloadDirections,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SocketPayloadSampleSource {
+    tgid: u32,
+    fd: i32,
+    fd_table_epoch: u64,
+}
+
+impl SocketPayloadSampleSource {
+    pub(super) const fn new(tgid: u32, fd: i32, fd_table_epoch: u64) -> Self {
+        Self {
+            tgid,
+            fd,
+            fd_table_epoch,
+        }
+    }
+}
+
 impl SocketPayloadSampleAuthorization {
     pub(super) fn from_selector(
-        connect: &EbpfConnectTracepointObservation,
+        source: SocketPayloadSampleSource,
         flow: &FlowContext,
         selector: Option<&CompiledSelector>,
     ) -> Option<Self> {
         let selector = selector?;
-        Self::new(connect, payload_directions_for_flow(flow, selector))
+        Self::new(source, payload_directions_for_flow(flow, selector))
     }
 
     pub(super) fn tgid(self) -> u32 {
@@ -37,13 +54,13 @@ impl SocketPayloadSampleAuthorization {
     }
 
     fn new(
-        connect: &EbpfConnectTracepointObservation,
+        source: SocketPayloadSampleSource,
         payload_directions: PayloadDirections,
     ) -> Option<Self> {
         let authorization = Self {
-            tgid: connect.process.tgid,
-            fd: connect.fd,
-            fd_table_epoch: connect.fd_table_epoch,
+            tgid: source.tgid,
+            fd: source.fd,
+            fd_table_epoch: source.fd_table_epoch,
             payload_directions,
         };
         authorization.is_valid().then_some(authorization)
@@ -70,14 +87,11 @@ fn payload_directions_for_flow(
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
-
     use probe_core::{
         AddressPort, FlowIdentity, ProcessContext, ProcessIdentity, ProcessSelector, Selector,
-        TcpEndpoint, TrafficSelector, TransportProtocol,
+        TrafficSelector, TransportProtocol,
     };
 
-    use super::super::{EbpfConnectEndpoint, EbpfObservedProcess};
     use super::*;
 
     #[test]
@@ -144,11 +158,8 @@ mod tests {
     fn authorization_rejects_selector_miss() -> Result<(), Box<dyn std::error::Error>> {
         let selector = selector([Direction::Outbound], 8080)?;
 
-        let authorization = SocketPayloadSampleAuthorization::from_selector(
-            &connect_observation(),
-            &flow(),
-            Some(&selector),
-        );
+        let authorization =
+            SocketPayloadSampleAuthorization::from_selector(source(), &flow(), Some(&selector));
 
         assert!(authorization.is_none());
         Ok(())
@@ -158,18 +169,16 @@ mod tests {
     fn authorization_rejects_invalid_descriptor_or_epoch() -> Result<(), Box<dyn std::error::Error>>
     {
         let selector = selector([Direction::Outbound], 443)?;
-        let mut invalid_fd = connect_observation();
-        invalid_fd.fd = -1;
-        let mut invalid_epoch = connect_observation();
-        invalid_epoch.fd_table_epoch = 0;
+        let invalid_fd = SocketPayloadSampleSource::new(100, -1, 9);
+        let invalid_epoch = SocketPayloadSampleSource::new(100, 7, 0);
 
         assert!(
-            SocketPayloadSampleAuthorization::from_selector(&invalid_fd, &flow(), Some(&selector))
+            SocketPayloadSampleAuthorization::from_selector(invalid_fd, &flow(), Some(&selector))
                 .is_none()
         );
         assert!(
             SocketPayloadSampleAuthorization::from_selector(
-                &invalid_epoch,
+                invalid_epoch,
                 &flow(),
                 Some(&selector),
             )
@@ -183,7 +192,7 @@ mod tests {
     ) -> Result<Option<SocketPayloadSampleAuthorization>, Box<dyn std::error::Error>> {
         let selector = selector(directions, 443)?;
         Ok(SocketPayloadSampleAuthorization::from_selector(
-            &connect_observation(),
+            source(),
             &flow(),
             Some(&selector),
         ))
@@ -204,20 +213,8 @@ mod tests {
         .compile()?)
     }
 
-    fn connect_observation() -> EbpfConnectTracepointObservation {
-        EbpfConnectTracepointObservation {
-            process: EbpfObservedProcess {
-                pid: 101,
-                tgid: 100,
-                uid: 1000,
-                gid: 1000,
-                command: [0; 16],
-            },
-            fd: 7,
-            addrlen: 16,
-            fd_table_epoch: 9,
-            endpoint: EbpfConnectEndpoint::Remote(remote_endpoint()),
-        }
+    fn source() -> SocketPayloadSampleSource {
+        SocketPayloadSampleSource::new(100, 7, 9)
     }
 
     fn flow() -> FlowContext {
@@ -254,9 +251,5 @@ mod tests {
             socket_cookie: None,
             attribution_confidence: 90,
         }
-    }
-
-    fn remote_endpoint() -> TcpEndpoint {
-        TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443)
     }
 }

@@ -139,7 +139,7 @@ fn ebpf_provider_descriptor_from_object_report(
         CaptureBackend::Ebpf,
         CaptureProviderBuilder::Ebpf,
         format!(
-            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the process observation provider can emit connect observations, selector-authorized always-degraded outbound single-buffer syscall argument samples and inbound single-buffer syscall result samples, plus best-effort descriptor-close lifecycle events, but accept-side flows, readv/writev/recvmsg/sendmsg, lost-event conversion, and complete kernel traffic capture are not implemented",
+            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, and the process observation provider can emit connect and accept/accept4 flow-start observations, selector-authorized always-degraded outbound single-buffer syscall argument samples and inbound single-buffer syscall result samples, plus best-effort descriptor-close lifecycle events, but readv/writev/recvmsg/sendmsg, lost-event conversion, and complete kernel traffic capture are not implemented",
             object.summary(),
         ),
     )

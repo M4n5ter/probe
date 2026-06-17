@@ -24,6 +24,7 @@ Options:
   --write-chunks N
   --io-mode read-write|send-recv  (http1-loopback only)
   --connect-write-delay-ms N
+  --accept-read-delay-ms N       (http1-loopback only)
   --post-exchange-delay-ms N
 ";
 
@@ -124,32 +125,46 @@ impl From<TlsHttp1LoopbackError> for FixtureError {
 fn parse_http1_loopback(
     args: impl IntoIterator<Item = String>,
 ) -> Result<Http1LoopbackConfig, FixtureError> {
-    let (traffic, run, io_mode) = parse_http_loopback_args(args)?;
+    let args = parse_http_loopback_args(args, PlainHttpOptions::Allowed)?;
     Ok(Http1LoopbackConfig {
-        traffic,
-        run,
-        io_mode: io_mode.unwrap_or_default(),
+        traffic: args.traffic,
+        run: args.run,
+        io_mode: args.io_mode.unwrap_or_default(),
+        accept_read_delay_ms: args.accept_read_delay_ms,
     })
 }
 
 fn parse_tls_http1_loopback(
     args: impl IntoIterator<Item = String>,
 ) -> Result<TlsHttp1LoopbackConfig, FixtureError> {
-    let (traffic, run, io_mode) = parse_http_loopback_args(args)?;
-    if io_mode.is_some() {
-        return Err(FixtureError::usage(format!(
-            "--io-mode is only supported by http1-loopback\n\n{USAGE}"
-        )));
-    }
-    Ok(TlsHttp1LoopbackConfig { traffic, run })
+    let args = parse_http_loopback_args(args, PlainHttpOptions::Rejected)?;
+    Ok(TlsHttp1LoopbackConfig {
+        traffic: args.traffic,
+        run: args.run,
+    })
+}
+
+struct ParsedHttpLoopbackArgs {
+    traffic: HttpTrafficConfig,
+    run: LoopbackRunOptions,
+    io_mode: Option<Http1IoMode>,
+    accept_read_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlainHttpOptions {
+    Allowed,
+    Rejected,
 }
 
 fn parse_http_loopback_args(
     args: impl IntoIterator<Item = String>,
-) -> Result<(HttpTrafficConfig, LoopbackRunOptions, Option<Http1IoMode>), FixtureError> {
+    plain_http_options: PlainHttpOptions,
+) -> Result<ParsedHttpLoopbackArgs, FixtureError> {
     let mut traffic = HttpTrafficConfig::default();
     let mut run = LoopbackRunOptions::default();
     let mut io_mode = None;
+    let mut accept_read_delay_ms = 0;
     let mut ready_file = None;
     let mut start_file = None;
     let mut args = args.into_iter();
@@ -167,6 +182,10 @@ fn parse_http_loopback_args(
             "--connect-write-delay-ms" => {
                 run.connect_write_delay_ms = parse_u64(&option, &value)?;
             }
+            "--accept-read-delay-ms" => {
+                reject_plain_http_option(plain_http_options, &option)?;
+                accept_read_delay_ms = parse_u64(&option, &value)?;
+            }
             "--post-exchange-delay-ms" => {
                 run.post_exchange_delay_ms = parse_u64(&option, &value)?;
             }
@@ -181,6 +200,7 @@ fn parse_http_loopback_args(
             }
             "--write-chunks" => traffic.write_chunks = parse_usize(&option, &value)?,
             "--io-mode" => {
+                reject_plain_http_option(plain_http_options, &option)?;
                 io_mode = Some(Http1IoMode::parse(&value).ok_or_else(|| {
                     FixtureError::usage(format!(
                         "invalid value for {option}: {value}; expected read-write or send-recv\n\n{USAGE}"
@@ -195,7 +215,24 @@ fn parse_http_loopback_args(
         }
     }
     run.coordination = parse_coordination(ready_file, start_file)?;
-    Ok((traffic, run, io_mode))
+    Ok(ParsedHttpLoopbackArgs {
+        traffic,
+        run,
+        io_mode,
+        accept_read_delay_ms,
+    })
+}
+
+fn reject_plain_http_option(
+    plain_http_options: PlainHttpOptions,
+    option: &str,
+) -> Result<(), FixtureError> {
+    match plain_http_options {
+        PlainHttpOptions::Allowed => Ok(()),
+        PlainHttpOptions::Rejected => Err(FixtureError::usage(format!(
+            "{option} is only supported by http1-loopback\n\n{USAGE}"
+        ))),
+    }
 }
 
 fn parse_coordination(
@@ -270,12 +307,15 @@ mod tests {
             "3".to_string(),
             "--connect-write-delay-ms".to_string(),
             "250".to_string(),
+            "--accept-read-delay-ms".to_string(),
+            "375".to_string(),
             "--post-exchange-delay-ms".to_string(),
             "500".to_string(),
         ])?;
 
         assert_eq!(config.run.listen_port, 0);
         assert_eq!(config.run.connect_write_delay_ms, 250);
+        assert_eq!(config.accept_read_delay_ms, 375);
         assert_eq!(config.run.post_exchange_delay_ms, 500);
         assert_eq!(
             config.run.coordination,
@@ -324,6 +364,19 @@ mod tests {
             error
                 .to_string()
                 .contains("--io-mode is only supported by http1-loopback")
+        );
+    }
+
+    #[test]
+    fn cli_rejects_tls_http1_accept_read_delay() {
+        let error =
+            parse_tls_http1_loopback(["--accept-read-delay-ms".to_string(), "250".to_string()])
+                .expect_err("TLS fixture must not accept plain HTTP accept-read delay");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--accept-read-delay-ms is only supported by http1-loopback")
         );
     }
 

@@ -11,9 +11,10 @@ use super::{
         decode_envelope, e2e_error, ensure_e2e_packages_built, stop_running_child,
     },
     loopback::{
-        Http1LoopbackFixtureConfig, assert_no_policy_runtime_errors, merge_run_results,
-        spawn_agent, spawn_http1_loopback_fixture, start_http1_loopback_fixture,
-        wait_for_agent_policy_progress, wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
+        Http1LoopbackFixtureConfig, PlainHttp1LoopbackFixtureConfig,
+        assert_no_policy_runtime_errors, merge_run_results, spawn_agent,
+        spawn_http1_loopback_fixture, start_http1_loopback_fixture, wait_for_agent_policy_progress,
+        wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
         wait_for_http1_loopback_fixture_ready,
     },
 };
@@ -104,15 +105,18 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn fixture_config() -> Http1LoopbackFixtureConfig {
-    Http1LoopbackFixtureConfig {
-        listen_port: None,
-        requests: REQUESTS,
-        request_body_bytes: REQUEST_BODY_BYTES,
-        response_body_bytes: RESPONSE_BODY_BYTES,
-        write_chunks: WRITE_CHUNKS,
-        connect_write_delay_ms: 0,
-        post_exchange_delay_ms: 0,
+fn fixture_config() -> PlainHttp1LoopbackFixtureConfig {
+    PlainHttp1LoopbackFixtureConfig {
+        shared: Http1LoopbackFixtureConfig {
+            listen_port: None,
+            requests: REQUESTS,
+            request_body_bytes: REQUEST_BODY_BYTES,
+            response_body_bytes: RESPONSE_BODY_BYTES,
+            write_chunks: WRITE_CHUNKS,
+            connect_write_delay_ms: 0,
+            post_exchange_delay_ms: 0,
+        },
+        accept_read_delay_ms: 0,
     }
 }
 

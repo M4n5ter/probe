@@ -143,6 +143,12 @@ pub(crate) fn delay_after_exchange(delay_ms: u64) {
     }
 }
 
+pub(crate) fn delay_before_accept_read(delay_ms: u64) {
+    if delay_ms > 0 {
+        thread::sleep(Duration::from_millis(delay_ms));
+    }
+}
+
 pub(crate) fn start_nonce(content: &str) -> Option<String> {
     content
         .lines()

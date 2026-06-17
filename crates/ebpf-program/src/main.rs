@@ -1,10 +1,12 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 
+mod accept;
 mod close;
 mod connect;
 mod payload;
 mod read;
+mod sockaddr;
 mod write;
 
 use aya_ebpf::{
@@ -16,15 +18,17 @@ use aya_ebpf::{
 };
 use ebpf_abi::{
     EBPF_ALLOWED_SOCKET_FDS_MAX_ENTRIES, EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES,
-    EBPF_PENDING_READS_MAX_ENTRIES, EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES,
-    EBPF_PENDING_WRITES_MAX_ENTRIES, EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES,
-    EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES, EBPF_RING_BUFFER_BYTES,
-    EBPF_SOCKET_PAYLOAD_ALLOW_READ, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE, EbpfCloseTracepointRecord,
-    EbpfConnectTracepointRecord, EbpfPendingSocketReadAttempt, EbpfPendingSocketWriteSample,
+    EBPF_PENDING_ACCEPTS_MAX_ENTRIES, EBPF_PENDING_READS_MAX_ENTRIES,
+    EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES, EBPF_PENDING_WRITES_MAX_ENTRIES,
+    EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES, EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES,
+    EBPF_RING_BUFFER_BYTES, EBPF_SOCKET_PAYLOAD_ALLOW_READ, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE,
+    EbpfAcceptTracepointRecord, EbpfCloseTracepointRecord, EbpfConnectTracepointRecord,
+    EbpfPendingSocketAcceptAttempt, EbpfPendingSocketReadAttempt, EbpfPendingSocketWriteSample,
     EbpfProcessProbeMetadata, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
     EbpfSocketReadSampleRecord, EbpfSocketWriteSampleRecord,
 };
 
+use accept::{accept_attempt_from_tracepoint, accept_observation_from_result};
 use close::close_observation_from_tracepoint;
 use connect::connect_observation_from_tracepoint;
 use read::{capture_read_sample_from_result, read_attempt_from_tracepoint};
@@ -47,6 +51,10 @@ static SSSA_ALLOWED_SOCKET_FDS: LruHashMap<EbpfSocketFdKey, EbpfSocketPayloadAll
 #[map(name = "SSSA_FD_TABLE_EPOCHS")]
 static SSSA_FD_TABLE_EPOCHS: HashMap<u32, u64> =
     HashMap::with_max_entries(EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES, 0);
+
+#[map(name = "SSSA_PENDING_ACCEPTS")]
+static SSSA_PENDING_ACCEPTS: HashMap<u64, EbpfPendingSocketAcceptAttempt> =
+    HashMap::with_max_entries(EBPF_PENDING_ACCEPTS_MAX_ENTRIES, 0);
 
 #[map(name = "SSSA_PENDING_WRITES")]
 static SSSA_PENDING_WRITES: HashMap<u64, EbpfPendingSocketWriteSample> =
@@ -71,6 +79,30 @@ static SSSA_PROCESS_READ_EVENT_SCRATCH: PerCpuArray<EbpfSocketReadSampleRecord> 
 #[tracepoint(name = "sys_enter_connect", category = "syscalls")]
 pub fn sssa_sys_enter_connect(ctx: TracePointContext) -> u32 {
     emit_connect_attempt(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_enter_accept", category = "syscalls")]
+pub fn sssa_sys_enter_accept(ctx: TracePointContext) -> u32 {
+    record_accept_attempt(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_exit_accept", category = "syscalls")]
+pub fn sssa_sys_exit_accept(ctx: TracePointContext) -> u32 {
+    emit_accept_observation(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_enter_accept4", category = "syscalls")]
+pub fn sssa_sys_enter_accept4(ctx: TracePointContext) -> u32 {
+    record_accept_attempt(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_exit_accept4", category = "syscalls")]
+pub fn sssa_sys_exit_accept4(ctx: TracePointContext) -> u32 {
+    emit_accept_observation(ctx);
     0
 }
 
@@ -188,6 +220,39 @@ fn emit_connect_attempt(ctx: TracePointContext) {
         metadata.command,
         observation,
         connect.flags,
+    );
+    let _ = SSSA_EVENTS.output(&event, 0);
+}
+
+fn record_accept_attempt(ctx: TracePointContext) {
+    let Some(attempt) = accept_attempt_from_tracepoint(&ctx) else {
+        return;
+    };
+    let key = bpf_get_current_pid_tgid();
+    let _ = SSSA_PENDING_ACCEPTS.insert(&key, &attempt, 0);
+}
+
+fn emit_accept_observation(ctx: TracePointContext) {
+    let key = bpf_get_current_pid_tgid();
+    let Some(attempt) = (unsafe { SSSA_PENDING_ACCEPTS.get(&key).copied() }) else {
+        return;
+    };
+    let _ = SSSA_PENDING_ACCEPTS.remove(&key);
+    let Some(accept) = accept_observation_from_result(&ctx, attempt) else {
+        return;
+    };
+    let metadata = process_metadata(&ctx);
+    let observation = accept
+        .observation
+        .with_fd_table_epoch(ensure_fd_table_epoch(metadata.tgid));
+    let event = EbpfAcceptTracepointRecord::accept_tracepoint_observed(
+        metadata.pid,
+        metadata.tgid,
+        metadata.uid,
+        metadata.gid,
+        metadata.command,
+        observation,
+        accept.flags,
     );
     let _ = SSSA_EVENTS.output(&event, 0);
 }

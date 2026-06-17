@@ -9,10 +9,12 @@ use crate::{
     CaptureError, CaptureEvent, CaptureProviderKind, CapturedGap, EnforcementEvidencePropagation,
 };
 
-use super::{EbpfConnectTracepointObservation, EbpfObservedProcess};
+use super::{
+    EbpfAcceptTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EbpfConnectFlowLookup {
+pub struct EbpfSocketFlowLookup {
     pub tgid: u32,
     pub thread_pid: u32,
     pub fd: i32,
@@ -28,17 +30,17 @@ pub struct EbpfProcessHint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EbpfResolvedConnectFlow {
+pub struct EbpfResolvedSocketFlow {
     pub process: ProcessContext,
     pub confidence: u8,
     pub connection: TcpConnection,
 }
 
-pub trait EbpfConnectFlowResolver {
-    fn resolve_connect_flow(
+pub trait EbpfSocketFlowResolver {
+    fn resolve_socket_flow(
         &mut self,
-        lookup: EbpfConnectFlowLookup,
-    ) -> Result<Option<EbpfResolvedConnectFlow>, CaptureError>;
+        lookup: EbpfSocketFlowLookup,
+    ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError>;
 
     fn invalidate_cached_resolution(&mut self) {}
 }
@@ -46,18 +48,48 @@ pub trait EbpfConnectFlowResolver {
 pub(crate) fn connect_opened_event_from_observation(
     connect: &EbpfConnectTracepointObservation,
     timestamp: Timestamp,
-    resolver: &mut dyn EbpfConnectFlowResolver,
+    resolver: &mut dyn EbpfSocketFlowResolver,
 ) -> Result<Option<CaptureEvent>, CaptureError> {
-    let resolved = resolver.resolve_connect_flow(EbpfConnectFlowLookup {
-        tgid: connect.process.tgid,
-        thread_pid: connect.process.pid,
-        fd: connect.fd,
-        expected_remote_endpoint: connect.endpoint.remote_endpoint(),
-        process_hint: process_hint_from_observed(&connect.process),
-    })?;
+    opened_event_from_lookup(
+        EbpfSocketFlowLookup {
+            tgid: connect.process.tgid,
+            thread_pid: connect.process.pid,
+            fd: connect.fd,
+            expected_remote_endpoint: connect.endpoint.remote_endpoint(),
+            process_hint: process_hint_from_observed(&connect.process),
+        },
+        timestamp,
+        resolver,
+    )
+}
+
+pub(crate) fn accept_opened_event_from_observation(
+    accept: &EbpfAcceptTracepointObservation,
+    timestamp: Timestamp,
+    resolver: &mut dyn EbpfSocketFlowResolver,
+) -> Result<Option<CaptureEvent>, CaptureError> {
+    opened_event_from_lookup(
+        EbpfSocketFlowLookup {
+            tgid: accept.process.tgid,
+            thread_pid: accept.process.pid,
+            fd: accept.fd,
+            expected_remote_endpoint: accept.endpoint.remote_endpoint(),
+            process_hint: process_hint_from_observed(&accept.process),
+        },
+        timestamp,
+        resolver,
+    )
+}
+
+fn opened_event_from_lookup(
+    lookup: EbpfSocketFlowLookup,
+    timestamp: Timestamp,
+    resolver: &mut dyn EbpfSocketFlowResolver,
+) -> Result<Option<CaptureEvent>, CaptureError> {
+    let resolved = resolver.resolve_socket_flow(lookup)?;
     Ok(resolved.map(|resolved| CaptureEvent::ConnectionOpened {
         timestamp,
-        flow: flow_from_resolved_connect(resolved, timestamp.monotonic_ns),
+        flow: flow_from_resolved_socket(resolved, timestamp.monotonic_ns),
         source: CaptureSource::EbpfSyscall,
         provider: CaptureProviderKind::Ebpf,
     }))
@@ -68,13 +100,40 @@ pub(crate) fn unresolved_connect_gap_from_observation(
     timestamp: Timestamp,
     reason: String,
 ) -> CaptureEvent {
-    let process = process_context_from_observed(&connect.process);
-    let remote = connect
-        .endpoint
-        .remote_endpoint()
-        .unwrap_or_else(unknown_tcp_endpoint);
+    unresolved_flow_gap(
+        &connect.process,
+        connect.endpoint.remote_endpoint(),
+        Direction::Outbound,
+        timestamp,
+        reason,
+    )
+}
+
+pub(crate) fn unresolved_accept_gap_from_observation(
+    accept: &EbpfAcceptTracepointObservation,
+    timestamp: Timestamp,
+    reason: String,
+) -> CaptureEvent {
+    unresolved_flow_gap(
+        &accept.process,
+        accept.endpoint.remote_endpoint(),
+        Direction::Inbound,
+        timestamp,
+        reason,
+    )
+}
+
+fn unresolved_flow_gap(
+    observed_process: &EbpfObservedProcess,
+    remote_endpoint: Option<TcpEndpoint>,
+    direction: Direction,
+    timestamp: Timestamp,
+    reason: String,
+) -> CaptureEvent {
+    let process = process_context_from_observed(observed_process);
+    let remote = remote_endpoint.unwrap_or_else(unknown_tcp_endpoint);
     let local = unknown_local_endpoint_for_remote(remote);
-    let flow = flow_from_unresolved_connect(process, local, remote, timestamp.monotonic_ns);
+    let flow = flow_from_unresolved_socket(process, local, remote, timestamp.monotonic_ns);
     let evidence = EnforcementEvidence::observation_only_with_detail(
         probe_core::ObservationOnlyReason::EbpfUnresolvedFlow,
         reason.clone(),
@@ -87,7 +146,7 @@ pub(crate) fn unresolved_connect_gap_from_observation(
         enforcement_evidence: evidence,
         enforcement_evidence_propagation: EnforcementEvidencePropagation::Event,
         gap: Gap {
-            direction: Direction::Outbound,
+            direction,
             expected_offset: 0,
             next_offset: None,
             reason,
@@ -95,8 +154,8 @@ pub(crate) fn unresolved_connect_gap_from_observation(
     })
 }
 
-fn flow_from_resolved_connect(
-    resolved: EbpfResolvedConnectFlow,
+fn flow_from_resolved_socket(
+    resolved: EbpfResolvedSocketFlow,
     start_monotonic_ns: u64,
 ) -> FlowContext {
     let local = AddressPort::from(resolved.connection.local);
@@ -120,7 +179,7 @@ fn flow_from_resolved_connect(
     }
 }
 
-fn flow_from_unresolved_connect(
+fn flow_from_unresolved_socket(
     process: ProcessContext,
     local_endpoint: TcpEndpoint,
     remote_endpoint: TcpEndpoint,
@@ -201,7 +260,10 @@ mod tests {
 
     use probe_core::{ProcessIdentity, TcpEndpoint};
 
-    use crate::ebpf::{EbpfConnectEndpoint, EbpfConnectTracepointObservation, EbpfObservedProcess};
+    use crate::ebpf::{
+        EbpfAcceptTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
+        EbpfSocketEndpoint,
+    };
 
     use super::*;
 
@@ -220,10 +282,10 @@ mod tests {
             fd: 7,
             addrlen: 16,
             fd_table_epoch: 0,
-            endpoint: EbpfConnectEndpoint::Remote(expected_remote),
+            endpoint: EbpfSocketEndpoint::Remote(expected_remote),
         };
-        let mut resolver = ExpectedConnectResolver {
-            expected: EbpfConnectFlowLookup {
+        let mut resolver = ExpectedSocketResolver {
+            expected: EbpfSocketFlowLookup {
                 tgid: 100,
                 thread_pid: 101,
                 fd: 7,
@@ -235,7 +297,7 @@ mod tests {
                 }),
             },
             seen: false,
-            resolved: Some(EbpfResolvedConnectFlow {
+            resolved: Some(EbpfResolvedSocketFlow {
                 process: demo_process(),
                 confidence: 80,
                 connection: TcpConnection::new(
@@ -290,10 +352,10 @@ mod tests {
             fd: 7,
             addrlen: 0,
             fd_table_epoch: 0,
-            endpoint: EbpfConnectEndpoint::SockaddrReadFailed,
+            endpoint: EbpfSocketEndpoint::SockaddrReadFailed,
         };
-        let mut resolver = ExpectedConnectResolver {
-            expected: EbpfConnectFlowLookup {
+        let mut resolver = ExpectedSocketResolver {
+            expected: EbpfSocketFlowLookup {
                 tgid: 100,
                 thread_pid: 101,
                 fd: 7,
@@ -318,17 +380,78 @@ mod tests {
         Ok(())
     }
 
-    struct ExpectedConnectResolver {
-        expected: EbpfConnectFlowLookup,
-        seen: bool,
-        resolved: Option<EbpfResolvedConnectFlow>,
+    #[test]
+    fn accept_observation_builds_connection_opened_event_from_accepted_fd_resolution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let remote = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 50_000);
+        let local = TcpEndpoint::new(Ipv4Addr::new(127, 0, 0, 1).into(), 443);
+        let observation = EbpfAcceptTracepointObservation {
+            process: EbpfObservedProcess {
+                pid: 101,
+                tgid: 100,
+                uid: 1000,
+                gid: 1000,
+                command: nul_padded_command("server"),
+            },
+            fd: 9,
+            listen_fd: 3,
+            addrlen: 16,
+            fd_table_epoch: 11,
+            endpoint: EbpfSocketEndpoint::Remote(remote),
+        };
+        let mut resolver = ExpectedSocketResolver {
+            expected: EbpfSocketFlowLookup {
+                tgid: 100,
+                thread_pid: 101,
+                fd: 9,
+                expected_remote_endpoint: Some(remote),
+                process_hint: Some(EbpfProcessHint {
+                    name: String::from("server"),
+                    uid: 1000,
+                    gid: 1000,
+                }),
+            },
+            seen: false,
+            resolved: Some(EbpfResolvedSocketFlow {
+                process: demo_process(),
+                confidence: 80,
+                connection: TcpConnection::new(local, remote),
+            }),
+        };
+
+        let event = accept_opened_event_from_observation(
+            &observation,
+            Timestamp {
+                monotonic_ns: 42,
+                wall_time_unix_ns: 99,
+            },
+            &mut resolver,
+        )?
+        .expect("expected connection opened event");
+
+        assert!(resolver.seen);
+        match event {
+            CaptureEvent::ConnectionOpened { flow, .. } => {
+                assert_eq!(flow.local.port, 443);
+                assert_eq!(flow.remote.port, 50_000);
+                assert_eq!(flow.attribution_confidence, 80);
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+        Ok(())
     }
 
-    impl EbpfConnectFlowResolver for ExpectedConnectResolver {
-        fn resolve_connect_flow(
+    struct ExpectedSocketResolver {
+        expected: EbpfSocketFlowLookup,
+        seen: bool,
+        resolved: Option<EbpfResolvedSocketFlow>,
+    }
+
+    impl EbpfSocketFlowResolver for ExpectedSocketResolver {
+        fn resolve_socket_flow(
             &mut self,
-            lookup: EbpfConnectFlowLookup,
-        ) -> Result<Option<EbpfResolvedConnectFlow>, CaptureError> {
+            lookup: EbpfSocketFlowLookup,
+        ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError> {
             assert_eq!(lookup, self.expected);
             self.seen = true;
             Ok(self.resolved.clone())

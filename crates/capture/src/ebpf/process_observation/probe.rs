@@ -10,12 +10,13 @@ use aya::{
 };
 use ebpf_abi::{
     EBPF_ADDRESS_FAMILY_INET, EBPF_ADDRESS_FAMILY_INET6, EBPF_ALLOWED_SOCKET_FDS_MAP_NAME,
-    EBPF_CONNECT_REMOTE_ENDPOINT_VALID, EBPF_CONNECT_SOCKADDR_READ_FAILED,
-    EBPF_CONNECT_UNSUPPORTED_ADDRESS_FAMILY, EBPF_EVENTS_MAP_NAME, EBPF_PROCESS_TRACEPOINT_SPECS,
+    EBPF_EVENTS_MAP_NAME, EBPF_PROCESS_TRACEPOINT_SPECS, EBPF_SOCKET_FLOW_REMOTE_ENDPOINT_VALID,
+    EBPF_SOCKET_FLOW_SOCKADDR_READ_FAILED, EBPF_SOCKET_FLOW_UNSUPPORTED_ADDRESS_FAMILY,
     EBPF_SOCKET_READ_READ_FAILED, EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_WRITE_READ_FAILED,
-    EBPF_SOCKET_WRITE_TRUNCATED, EbpfConnectObservation, EbpfEventDecodeError,
-    EbpfProcessProbeEvent, EbpfProcessTracepointSpec, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
-    EbpfSocketReadSample, EbpfSocketWriteSample, decode_process_probe_event,
+    EBPF_SOCKET_WRITE_TRUNCATED, EbpfAcceptObservation, EbpfConnectObservation,
+    EbpfEventDecodeError, EbpfProcessProbeEvent, EbpfProcessTracepointSpec, EbpfSocketFdKey,
+    EbpfSocketPayloadAllowance, EbpfSocketReadSample, EbpfSocketWriteSample,
+    decode_process_probe_event,
 };
 use ebpf_object::{
     EbpfObjectProbe, EbpfObjectProbeConfig, EbpfObjectProbeReport, EbpfPreflightedObject,
@@ -24,9 +25,9 @@ use probe_core::TcpEndpoint;
 use thiserror::Error;
 
 use super::{
-    EbpfCloseTracepointObservation, EbpfConnectEndpoint, EbpfConnectTracepointObservation,
-    EbpfObservedProcess, EbpfProcessObservation, EbpfSocketReadObservation,
-    EbpfSocketWriteObservation,
+    EbpfAcceptTracepointObservation, EbpfCloseTracepointObservation,
+    EbpfConnectTracepointObservation, EbpfObservedProcess, EbpfProcessObservation,
+    EbpfSocketEndpoint, EbpfSocketReadObservation, EbpfSocketWriteObservation,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +236,19 @@ fn process_observation_from_event(
                 },
             ))
         }
+        Some(ebpf_abi::EbpfEventKind::AcceptTracepointObserved) => {
+            let accept = accept_observation_from_event(&event);
+            Ok(EbpfProcessObservation::Accept(
+                EbpfAcceptTracepointObservation {
+                    process: observed_process_from_event(&event),
+                    fd: accept.fd,
+                    listen_fd: accept.listen_fd,
+                    addrlen: accept.addrlen,
+                    fd_table_epoch: accept.fd_table_epoch,
+                    endpoint: accept_endpoint_from_event(&event),
+                },
+            ))
+        }
         Some(ebpf_abi::EbpfEventKind::CloseTracepointObserved) => {
             let close = close_observation_from_event(&event);
             Ok(EbpfProcessObservation::Close(
@@ -281,30 +295,60 @@ fn observed_process_from_event(event: &EbpfProcessProbeEvent) -> EbpfObservedPro
     }
 }
 
-fn connect_endpoint_from_event(event: &EbpfProcessProbeEvent) -> EbpfConnectEndpoint {
+fn connect_endpoint_from_event(event: &EbpfProcessProbeEvent) -> EbpfSocketEndpoint {
     let connect = connect_observation_from_event(event);
-    if event.flags() & EBPF_CONNECT_REMOTE_ENDPOINT_VALID != 0 {
-        return remote_endpoint_from_wire(connect)
-            .map(EbpfConnectEndpoint::Remote)
-            .unwrap_or(EbpfConnectEndpoint::UnsupportedAddressFamily {
-                value: connect.address_family,
+    socket_flow_endpoint_from_flags(
+        event.flags(),
+        connect.address_family,
+        connect.remote_port,
+        connect.remote_address,
+    )
+}
+
+fn accept_endpoint_from_event(event: &EbpfProcessProbeEvent) -> EbpfSocketEndpoint {
+    let accept = accept_observation_from_event(event);
+    socket_flow_endpoint_from_flags(
+        event.flags(),
+        accept.address_family,
+        accept.remote_port,
+        accept.remote_address,
+    )
+}
+
+fn socket_flow_endpoint_from_flags(
+    flags: u16,
+    address_family: u16,
+    remote_port: u16,
+    remote_address: [u8; 16],
+) -> EbpfSocketEndpoint {
+    if flags & EBPF_SOCKET_FLOW_REMOTE_ENDPOINT_VALID != 0 {
+        return remote_endpoint_from_parts(address_family, remote_port, remote_address)
+            .map(EbpfSocketEndpoint::Remote)
+            .unwrap_or(EbpfSocketEndpoint::UnsupportedAddressFamily {
+                value: address_family,
             });
     }
-    if event.flags() & EBPF_CONNECT_SOCKADDR_READ_FAILED != 0 {
-        return EbpfConnectEndpoint::SockaddrReadFailed;
+    if flags & EBPF_SOCKET_FLOW_SOCKADDR_READ_FAILED != 0 {
+        return EbpfSocketEndpoint::SockaddrReadFailed;
     }
-    if event.flags() & EBPF_CONNECT_UNSUPPORTED_ADDRESS_FAMILY != 0 {
-        return EbpfConnectEndpoint::UnsupportedAddressFamily {
-            value: connect.address_family,
+    if flags & EBPF_SOCKET_FLOW_UNSUPPORTED_ADDRESS_FAMILY != 0 {
+        return EbpfSocketEndpoint::UnsupportedAddressFamily {
+            value: address_family,
         };
     }
-    EbpfConnectEndpoint::Missing
+    EbpfSocketEndpoint::Missing
 }
 
 fn connect_observation_from_event(event: &EbpfProcessProbeEvent) -> EbpfConnectObservation {
     event
         .connect_observation()
         .expect("connect event kind should expose connect observation")
+}
+
+fn accept_observation_from_event(event: &EbpfProcessProbeEvent) -> EbpfAcceptObservation {
+    event
+        .accept_observation()
+        .expect("accept event kind should expose accept observation")
 }
 
 fn close_observation_from_event(event: &EbpfProcessProbeEvent) -> ebpf_abi::EbpfCloseObservation {
@@ -325,16 +369,20 @@ fn socket_read_sample_from_event(event: &EbpfProcessProbeEvent) -> EbpfSocketRea
         .expect("read event kind should expose socket read sample")
 }
 
-fn remote_endpoint_from_wire(connect: EbpfConnectObservation) -> Option<TcpEndpoint> {
-    let address = match connect.address_family {
+fn remote_endpoint_from_parts(
+    address_family: u16,
+    remote_port: u16,
+    remote_address: [u8; 16],
+) -> Option<TcpEndpoint> {
+    let address = match address_family {
         EBPF_ADDRESS_FAMILY_INET => IpAddr::V4(Ipv4Addr::new(
-            connect.remote_address[0],
-            connect.remote_address[1],
-            connect.remote_address[2],
-            connect.remote_address[3],
+            remote_address[0],
+            remote_address[1],
+            remote_address[2],
+            remote_address[3],
         )),
         EBPF_ADDRESS_FAMILY_INET6 => {
-            let address = Ipv6Addr::from(connect.remote_address);
+            let address = Ipv6Addr::from(remote_address);
             address
                 .to_ipv4_mapped()
                 .map(IpAddr::V4)
@@ -342,7 +390,7 @@ fn remote_endpoint_from_wire(connect: EbpfConnectObservation) -> Option<TcpEndpo
         }
         _ => return None,
     };
-    Some(TcpEndpoint::new(address, connect.remote_port))
+    Some(TcpEndpoint::new(address, remote_port))
 }
 
 #[cfg(test)]
@@ -350,11 +398,11 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use ebpf_abi::{
-        EBPF_ADDRESS_FAMILY_INET, EBPF_ADDRESS_FAMILY_INET6, EBPF_CONNECT_REMOTE_ENDPOINT_VALID,
-        EBPF_CONNECT_SOCKADDR_READ_FAILED, EBPF_SOCKET_READ_SAMPLE_BYTES,
-        EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_WRITE_SAMPLE_BYTES, EBPF_SOCKET_WRITE_TRUNCATED,
-        EbpfCloseObservation, EbpfConnectObservation, EbpfProcessProbeEvent, EbpfSocketReadSample,
-        EbpfSocketWriteSample,
+        EBPF_ACCEPT_REMOTE_ENDPOINT_VALID, EBPF_ADDRESS_FAMILY_INET, EBPF_ADDRESS_FAMILY_INET6,
+        EBPF_CONNECT_REMOTE_ENDPOINT_VALID, EBPF_CONNECT_SOCKADDR_READ_FAILED,
+        EBPF_SOCKET_READ_SAMPLE_BYTES, EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_WRITE_SAMPLE_BYTES,
+        EBPF_SOCKET_WRITE_TRUNCATED, EbpfAcceptObservation, EbpfCloseObservation,
+        EbpfConnectObservation, EbpfProcessProbeEvent, EbpfSocketReadSample, EbpfSocketWriteSample,
     };
     use probe_core::TcpEndpoint;
 
@@ -393,9 +441,54 @@ mod tests {
                 assert_eq!(connect.fd_table_epoch, 9);
                 assert_eq!(
                     connect.endpoint,
-                    EbpfConnectEndpoint::Remote(TcpEndpoint::new(
+                    EbpfSocketEndpoint::Remote(TcpEndpoint::new(
                         Ipv4Addr::new(127, 0, 0, 1).into(),
                         443
+                    ))
+                );
+            }
+            observation => panic!("unexpected observation: {observation:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn process_observation_decodes_valid_accept_wire_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let event = EbpfProcessProbeEvent::accept_tracepoint_observed(
+            11,
+            22,
+            33,
+            44,
+            nul_padded_command("server"),
+            EbpfAcceptObservation::remote_endpoint(
+                9,
+                3,
+                16,
+                EBPF_ADDRESS_FAMILY_INET,
+                50_000,
+                [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .with_fd_table_epoch(12),
+            EBPF_ACCEPT_REMOTE_ENDPOINT_VALID,
+        );
+
+        let observation =
+            decode_process_observation(&ebpf_abi::encode_process_probe_event(&event))?;
+        match observation {
+            EbpfProcessObservation::Accept(accept) => {
+                assert_eq!(accept.process.pid, 11);
+                assert_eq!(accept.process.tgid, 22);
+                assert_eq!(accept.process.command_lossy(), "server");
+                assert_eq!(accept.fd, 9);
+                assert_eq!(accept.listen_fd, 3);
+                assert_eq!(accept.addrlen, 16);
+                assert_eq!(accept.fd_table_epoch, 12);
+                assert_eq!(
+                    accept.endpoint,
+                    EbpfSocketEndpoint::Remote(TcpEndpoint::new(
+                        Ipv4Addr::new(127, 0, 0, 1).into(),
+                        50_000
                     ))
                 );
             }
@@ -553,7 +646,7 @@ mod tests {
             EbpfProcessObservation::Connect(connect) => {
                 assert_eq!(
                     connect.endpoint,
-                    EbpfConnectEndpoint::Remote(TcpEndpoint::new(
+                    EbpfSocketEndpoint::Remote(TcpEndpoint::new(
                         Ipv4Addr::new(127, 0, 0, 1).into(),
                         443
                     ))
@@ -582,7 +675,7 @@ mod tests {
 
         match observation {
             EbpfProcessObservation::Connect(connect) => {
-                assert_eq!(connect.endpoint, EbpfConnectEndpoint::SockaddrReadFailed);
+                assert_eq!(connect.endpoint, EbpfSocketEndpoint::SockaddrReadFailed);
             }
             observation => panic!("unexpected observation: {observation:?}"),
         }

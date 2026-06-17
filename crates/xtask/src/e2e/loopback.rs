@@ -37,6 +37,12 @@ pub(crate) struct Http1LoopbackFixtureConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlainHttp1LoopbackFixtureConfig {
+    pub(crate) shared: Http1LoopbackFixtureConfig,
+    pub(crate) accept_read_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Http1FixtureIoMode {
     ReadWrite,
     SendRecv,
@@ -64,7 +70,7 @@ pub(crate) type LabeledRunResult = (&'static str, RunResult);
 pub(crate) fn spawn_http1_loopback_fixture(
     ready_path: &Path,
     start_path: &Path,
-    config: Http1LoopbackFixtureConfig,
+    config: PlainHttp1LoopbackFixtureConfig,
 ) -> Result<Child, Box<dyn std::error::Error>> {
     spawn_http1_loopback_fixture_with_io_mode(
         ready_path,
@@ -77,15 +83,18 @@ pub(crate) fn spawn_http1_loopback_fixture(
 pub(crate) fn spawn_http1_loopback_fixture_with_io_mode(
     ready_path: &Path,
     start_path: &Path,
-    config: Http1LoopbackFixtureConfig,
+    config: PlainHttp1LoopbackFixtureConfig,
     io_mode: Http1FixtureIoMode,
 ) -> Result<Child, Box<dyn std::error::Error>> {
     spawn_loopback_fixture(
         "http1-loopback",
         ready_path,
         start_path,
-        config,
-        Some(io_mode),
+        config.shared,
+        Some(PlainHttp1LoopbackFixtureOptions {
+            io_mode,
+            accept_read_delay_ms: config.accept_read_delay_ms,
+        }),
     )
 }
 
@@ -97,12 +106,18 @@ pub(crate) fn spawn_tls_http1_loopback_fixture(
     spawn_loopback_fixture("tls-http1-loopback", ready_path, start_path, config, None)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlainHttp1LoopbackFixtureOptions {
+    io_mode: Http1FixtureIoMode,
+    accept_read_delay_ms: u64,
+}
+
 fn spawn_loopback_fixture(
     scenario: &'static str,
     ready_path: &Path,
     start_path: &Path,
     config: Http1LoopbackFixtureConfig,
-    io_mode: Option<Http1FixtureIoMode>,
+    plain_options: Option<PlainHttp1LoopbackFixtureOptions>,
 ) -> Result<Child, Box<dyn std::error::Error>> {
     let mut command = Command::new(debug_binary("sssa-e2e-fixture")?);
     let command = run_in_own_process_group(&mut command).arg(scenario);
@@ -118,8 +133,12 @@ fn spawn_loopback_fixture(
         .arg(config.response_body_bytes.to_string())
         .arg("--write-chunks")
         .arg(config.write_chunks.to_string());
-    if let Some(io_mode) = io_mode {
-        command.arg("--io-mode").arg(io_mode.cli_value());
+    if let Some(options) = plain_options {
+        command
+            .arg("--io-mode")
+            .arg(options.io_mode.cli_value())
+            .arg("--accept-read-delay-ms")
+            .arg(options.accept_read_delay_ms.to_string());
     }
     let child = command
         .arg("--connect-write-delay-ms")

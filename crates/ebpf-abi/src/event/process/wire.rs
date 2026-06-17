@@ -7,12 +7,15 @@ use super::super::common::{
 
 pub const EBPF_PROCESS_PROBE_MAX_RECORD_BYTES: usize = max_record_bytes([
     core::mem::size_of::<EbpfConnectTracepointRecord>(),
+    core::mem::size_of::<EbpfAcceptTracepointRecord>(),
     core::mem::size_of::<EbpfCloseTracepointRecord>(),
     core::mem::size_of::<EbpfSocketWriteSampleRecord>(),
     core::mem::size_of::<EbpfSocketReadSampleRecord>(),
 ]);
 pub const EBPF_CONNECT_TRACEPOINT_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfConnectTracepointRecord>();
+pub const EBPF_ACCEPT_TRACEPOINT_RECORD_BYTES: usize =
+    core::mem::size_of::<EbpfAcceptTracepointRecord>();
 pub const EBPF_CLOSE_TRACEPOINT_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfCloseTracepointRecord>();
 pub const EBPF_SOCKET_WRITE_SAMPLE_RECORD_BYTES: usize =
@@ -25,9 +28,16 @@ const EBPF_PROCESS_COMMAND_OFFSET: usize = EBPF_EVENT_HEADER_BYTES;
 const EBPF_PROCESS_COMMAND_BYTES: usize = 16;
 const EBPF_PROCESS_PROBE_PAYLOAD_OFFSET: usize =
     EBPF_PROCESS_COMMAND_OFFSET + EBPF_PROCESS_COMMAND_BYTES;
-pub const EBPF_CONNECT_REMOTE_ENDPOINT_VALID: u16 = 1 << 0;
-pub const EBPF_CONNECT_SOCKADDR_READ_FAILED: u16 = 1 << 1;
-pub const EBPF_CONNECT_UNSUPPORTED_ADDRESS_FAMILY: u16 = 1 << 2;
+pub const EBPF_SOCKET_FLOW_REMOTE_ENDPOINT_VALID: u16 = 1 << 0;
+pub const EBPF_SOCKET_FLOW_SOCKADDR_READ_FAILED: u16 = 1 << 1;
+pub const EBPF_SOCKET_FLOW_UNSUPPORTED_ADDRESS_FAMILY: u16 = 1 << 2;
+pub const EBPF_CONNECT_REMOTE_ENDPOINT_VALID: u16 = EBPF_SOCKET_FLOW_REMOTE_ENDPOINT_VALID;
+pub const EBPF_CONNECT_SOCKADDR_READ_FAILED: u16 = EBPF_SOCKET_FLOW_SOCKADDR_READ_FAILED;
+pub const EBPF_CONNECT_UNSUPPORTED_ADDRESS_FAMILY: u16 =
+    EBPF_SOCKET_FLOW_UNSUPPORTED_ADDRESS_FAMILY;
+pub const EBPF_ACCEPT_REMOTE_ENDPOINT_VALID: u16 = EBPF_SOCKET_FLOW_REMOTE_ENDPOINT_VALID;
+pub const EBPF_ACCEPT_SOCKADDR_READ_FAILED: u16 = EBPF_SOCKET_FLOW_SOCKADDR_READ_FAILED;
+pub const EBPF_ACCEPT_UNSUPPORTED_ADDRESS_FAMILY: u16 = EBPF_SOCKET_FLOW_UNSUPPORTED_ADDRESS_FAMILY;
 pub const EBPF_SOCKET_WRITE_TRUNCATED: u16 = 1 << 0;
 pub const EBPF_SOCKET_WRITE_READ_FAILED: u16 = 1 << 1;
 pub const EBPF_SOCKET_READ_TRUNCATED: u16 = 1 << 0;
@@ -36,7 +46,7 @@ pub const EBPF_ADDRESS_FAMILY_UNSPEC: u16 = 0;
 pub const EBPF_ADDRESS_FAMILY_INET: u16 = 2;
 pub const EBPF_ADDRESS_FAMILY_INET6: u16 = 10;
 
-const fn max_record_bytes(record_bytes: [usize; 4]) -> usize {
+const fn max_record_bytes(record_bytes: [usize; 5]) -> usize {
     let mut max = 0;
     let mut index = 0;
     while index < record_bytes.len() {
@@ -46,6 +56,61 @@ const fn max_record_bytes(record_bytes: [usize; 4]) -> usize {
         index += 1;
     }
     max
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfAcceptObservation {
+    pub fd: i32,
+    pub listen_fd: i32,
+    pub addrlen: u32,
+    pub address_family: u16,
+    pub remote_port: u16,
+    pub remote_address: [u8; 16],
+    pub reserved: u64,
+    pub fd_table_epoch: u64,
+}
+
+impl EbpfAcceptObservation {
+    pub const fn unavailable(fd: i32, listen_fd: i32, addrlen: u32) -> Self {
+        Self {
+            fd,
+            listen_fd,
+            addrlen,
+            address_family: EBPF_ADDRESS_FAMILY_UNSPEC,
+            remote_port: 0,
+            remote_address: [0; 16],
+            reserved: 0,
+            fd_table_epoch: 0,
+        }
+    }
+
+    pub const fn remote_endpoint(
+        fd: i32,
+        listen_fd: i32,
+        addrlen: u32,
+        address_family: u16,
+        remote_port: u16,
+        remote_address: [u8; 16],
+    ) -> Self {
+        Self {
+            fd,
+            listen_fd,
+            addrlen,
+            address_family,
+            remote_port,
+            remote_address,
+            reserved: 0,
+            fd_table_epoch: 0,
+        }
+    }
+
+    pub const fn with_fd_table_epoch(self, fd_table_epoch: u64) -> Self {
+        Self {
+            fd_table_epoch,
+            ..self
+        }
+    }
 }
 
 #[repr(C)]
@@ -196,6 +261,40 @@ impl EbpfConnectTracepointRecord {
             ),
             command,
             connect,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfAcceptTracepointRecord {
+    header: EbpfEventHeader,
+    command: [u8; 16],
+    accept: EbpfAcceptObservation,
+}
+
+impl EbpfAcceptTracepointRecord {
+    pub fn accept_tracepoint_observed(
+        pid: u32,
+        tgid: u32,
+        uid: u32,
+        gid: u32,
+        command: [u8; 16],
+        accept: EbpfAcceptObservation,
+        flags: u16,
+    ) -> Self {
+        Self {
+            header: EbpfEventHeader::new_with_flags(
+                EbpfEventKind::AcceptTracepointObserved,
+                EBPF_ACCEPT_TRACEPOINT_RECORD_BYTES as u16,
+                flags,
+                pid,
+                tgid,
+                uid,
+                gid,
+            ),
+            command,
+            accept,
         }
     }
 }
@@ -364,6 +463,7 @@ impl EbpfSocketWriteSampleRecord {
 pub struct EbpfProcessProbeEvent {
     header: EbpfEventHeader,
     command: [u8; 16],
+    accept: EbpfAcceptObservation,
     connect: EbpfConnectObservation,
     close: EbpfCloseObservation,
     socket_write: EbpfSocketWriteSample,
@@ -382,6 +482,21 @@ impl EbpfProcessProbeEvent {
     ) -> Self {
         EbpfConnectTracepointRecord::connect_tracepoint_observed(
             pid, tgid, uid, gid, command, connect, flags,
+        )
+        .into()
+    }
+
+    pub fn accept_tracepoint_observed(
+        pid: u32,
+        tgid: u32,
+        uid: u32,
+        gid: u32,
+        command: [u8; 16],
+        accept: EbpfAcceptObservation,
+        flags: u16,
+    ) -> Self {
+        EbpfAcceptTracepointRecord::accept_tracepoint_observed(
+            pid, tgid, uid, gid, command, accept, flags,
         )
         .into()
     }
@@ -433,6 +548,13 @@ impl EbpfProcessProbeEvent {
         }
     }
 
+    pub fn accept_observation(&self) -> Option<EbpfAcceptObservation> {
+        match self.kind() {
+            Some(EbpfEventKind::AcceptTracepointObserved) => Some(self.accept),
+            _ => None,
+        }
+    }
+
     pub fn socket_write_sample(&self) -> Option<EbpfSocketWriteSample> {
         match self.kind() {
             Some(EbpfEventKind::SocketWriteSampled) => Some(self.socket_write),
@@ -479,6 +601,14 @@ impl From<EbpfConnectTracepointRecord> for EbpfProcessProbeEvent {
     fn from(record: EbpfConnectTracepointRecord) -> Self {
         let mut event = empty_process_probe_event(record.header, record.command);
         event.connect = record.connect;
+        event
+    }
+}
+
+impl From<EbpfAcceptTracepointRecord> for EbpfProcessProbeEvent {
+    fn from(record: EbpfAcceptTracepointRecord) -> Self {
+        let mut event = empty_process_probe_event(record.header, record.command);
+        event.accept = record.accept;
         event
     }
 }
@@ -590,6 +720,12 @@ pub fn encode_process_probe_event(event: &EbpfProcessProbeEvent) -> EncodedProce
                 event.connect,
             );
         }
+        Some(EbpfEventKind::AcceptTracepointObserved) => {
+            encode_accept_observation(
+                &mut bytes[EBPF_PROCESS_PROBE_PAYLOAD_OFFSET..],
+                event.accept,
+            );
+        }
         Some(EbpfEventKind::CloseTracepointObserved) => {
             encode_close_observation(&mut bytes[EBPF_PROCESS_PROBE_PAYLOAD_OFFSET..], event.close);
         }
@@ -638,6 +774,7 @@ fn is_process_probe_kind(kind: EbpfEventKind) -> bool {
     matches!(
         kind,
         EbpfEventKind::ConnectTracepointObserved
+            | EbpfEventKind::AcceptTracepointObserved
             | EbpfEventKind::CloseTracepointObserved
             | EbpfEventKind::SocketWriteSampled
             | EbpfEventKind::SocketReadSampled
@@ -647,6 +784,7 @@ fn is_process_probe_kind(kind: EbpfEventKind) -> bool {
 fn process_record_len(kind: EbpfEventKind) -> usize {
     match kind {
         EbpfEventKind::ConnectTracepointObserved => EBPF_CONNECT_TRACEPOINT_RECORD_BYTES,
+        EbpfEventKind::AcceptTracepointObserved => EBPF_ACCEPT_TRACEPOINT_RECORD_BYTES,
         EbpfEventKind::CloseTracepointObserved => EBPF_CLOSE_TRACEPOINT_RECORD_BYTES,
         EbpfEventKind::SocketWriteSampled => EBPF_SOCKET_WRITE_SAMPLE_RECORD_BYTES,
         EbpfEventKind::SocketReadSampled => EBPF_SOCKET_READ_SAMPLE_RECORD_BYTES,
@@ -666,6 +804,9 @@ fn decode_process_probe_payload(
         EbpfEventKind::ConnectTracepointObserved => {
             event.connect = decode_connect_observation(payload);
         }
+        EbpfEventKind::AcceptTracepointObserved => {
+            event.accept = decode_accept_observation(payload);
+        }
         EbpfEventKind::CloseTracepointObserved => {
             event.close = decode_close_observation(payload);
         }
@@ -684,11 +825,38 @@ fn empty_process_probe_event(header: EbpfEventHeader, command: [u8; 16]) -> Ebpf
     EbpfProcessProbeEvent {
         header,
         command,
+        accept: EbpfAcceptObservation::unavailable(0, 0, 0),
         connect: EbpfConnectObservation::unavailable(0, 0),
         close: EbpfCloseObservation::observed(0),
         socket_write: EbpfSocketWriteSample::new(0, 0, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
         socket_read: EbpfSocketReadSample::new(0, 0, 0, [0; EBPF_SOCKET_READ_SAMPLE_BYTES]),
     }
+}
+
+fn decode_accept_observation(bytes: &[u8]) -> EbpfAcceptObservation {
+    let mut remote_address = [0; 16];
+    remote_address.copy_from_slice(&bytes[16..32]);
+    EbpfAcceptObservation {
+        fd: read_i32(bytes, 0),
+        listen_fd: read_i32(bytes, 4),
+        addrlen: read_u32(bytes, 8),
+        address_family: read_u16(bytes, 12),
+        remote_port: read_u16(bytes, 14),
+        remote_address,
+        reserved: read_u64(bytes, 32),
+        fd_table_epoch: read_u64(bytes, 40),
+    }
+}
+
+fn encode_accept_observation(bytes: &mut [u8], accept: EbpfAcceptObservation) {
+    write_i32(bytes, 0, accept.fd);
+    write_i32(bytes, 4, accept.listen_fd);
+    write_u32(bytes, 8, accept.addrlen);
+    write_u16(bytes, 12, accept.address_family);
+    write_u16(bytes, 14, accept.remote_port);
+    bytes[16..32].copy_from_slice(&accept.remote_address);
+    write_u64(bytes, 32, accept.reserved);
+    write_u64(bytes, 40, accept.fd_table_epoch);
 }
 
 fn decode_connect_observation(bytes: &[u8]) -> EbpfConnectObservation {
@@ -843,6 +1011,8 @@ mod tests {
 
     #[test]
     fn process_event_layout_fits_ringbuf_alignment() {
+        assert_eq!(size_of::<EbpfAcceptObservation>(), 48);
+        assert_eq!(align_of::<EbpfAcceptObservation>(), 8);
         assert_eq!(size_of::<EbpfConnectObservation>(), 40);
         assert_eq!(align_of::<EbpfConnectObservation>(), 8);
         assert_eq!(size_of::<EbpfCloseObservation>(), 8);
@@ -851,6 +1021,8 @@ mod tests {
         assert_eq!(align_of::<EbpfSocketWriteSample>(), 4);
         assert_eq!(size_of::<EbpfSocketReadSample>(), 268);
         assert_eq!(align_of::<EbpfSocketReadSample>(), 4);
+        assert_eq!(size_of::<EbpfAcceptTracepointRecord>(), 96);
+        assert_eq!(align_of::<EbpfAcceptTracepointRecord>(), 8);
         assert_eq!(size_of::<EbpfConnectTracepointRecord>(), 88);
         assert_eq!(align_of::<EbpfConnectTracepointRecord>(), 8);
         assert_eq!(size_of::<EbpfCloseTracepointRecord>(), 56);
@@ -875,6 +1047,14 @@ mod tests {
         assert_eq!(offset_of!(EbpfEventHeader, tgid), 20);
         assert_eq!(offset_of!(EbpfEventHeader, uid), 24);
         assert_eq!(offset_of!(EbpfEventHeader, gid), 28);
+        assert_eq!(offset_of!(EbpfAcceptObservation, fd), 0);
+        assert_eq!(offset_of!(EbpfAcceptObservation, listen_fd), 4);
+        assert_eq!(offset_of!(EbpfAcceptObservation, addrlen), 8);
+        assert_eq!(offset_of!(EbpfAcceptObservation, address_family), 12);
+        assert_eq!(offset_of!(EbpfAcceptObservation, remote_port), 14);
+        assert_eq!(offset_of!(EbpfAcceptObservation, remote_address), 16);
+        assert_eq!(offset_of!(EbpfAcceptObservation, reserved), 32);
+        assert_eq!(offset_of!(EbpfAcceptObservation, fd_table_epoch), 40);
         assert_eq!(offset_of!(EbpfConnectObservation, fd), 0);
         assert_eq!(offset_of!(EbpfConnectObservation, addrlen), 4);
         assert_eq!(offset_of!(EbpfConnectObservation, address_family), 8);
@@ -894,6 +1074,9 @@ mod tests {
         assert_eq!(offset_of!(EbpfSocketReadSample, captured_len), 8);
         assert_eq!(offset_of!(EbpfSocketReadSample, reserved), 10);
         assert_eq!(offset_of!(EbpfSocketReadSample, buffer), 12);
+        assert_eq!(offset_of!(EbpfAcceptTracepointRecord, header), 0);
+        assert_eq!(offset_of!(EbpfAcceptTracepointRecord, command), 32);
+        assert_eq!(offset_of!(EbpfAcceptTracepointRecord, accept), 48);
         assert_eq!(offset_of!(EbpfConnectTracepointRecord, header), 0);
         assert_eq!(offset_of!(EbpfConnectTracepointRecord, command), 32);
         assert_eq!(offset_of!(EbpfConnectTracepointRecord, connect), 48);
@@ -952,6 +1135,56 @@ mod tests {
         assert_eq!(connect.remote_port, 443);
         assert_eq!(connect.remote_address[0..4], [127, 0, 0, 1]);
         assert_eq!(connect.fd_table_epoch, 9);
+        assert!(event.close_observation().is_none());
+    }
+
+    #[test]
+    fn accept_tracepoint_observed_populates_header_fields() {
+        let event = EbpfProcessProbeEvent::accept_tracepoint_observed(
+            11,
+            22,
+            33,
+            44,
+            *b"0123456789abcdef",
+            EbpfAcceptObservation::remote_endpoint(
+                9,
+                3,
+                16,
+                EBPF_ADDRESS_FAMILY_INET,
+                50_000,
+                [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .with_fd_table_epoch(12),
+            EBPF_ACCEPT_REMOTE_ENDPOINT_VALID,
+        );
+
+        assert_eq!(event.header.magic, EBPF_MAGIC);
+        assert_eq!(event.header.abi_revision, EBPF_ABI_REVISION);
+        assert_eq!(
+            event.header.kind(),
+            Some(EbpfEventKind::AcceptTracepointObserved)
+        );
+        assert_eq!(
+            usize::from(event.header.record_len),
+            EBPF_ACCEPT_TRACEPOINT_RECORD_BYTES
+        );
+        assert_eq!(event.header.pid, 11);
+        assert_eq!(event.header.tgid, 22);
+        assert_eq!(event.header.uid, 33);
+        assert_eq!(event.header.gid, 44);
+        assert_eq!(&event.command, b"0123456789abcdef");
+        assert_eq!(event.header.flags, EBPF_ACCEPT_REMOTE_ENDPOINT_VALID);
+        let accept = event
+            .accept_observation()
+            .expect("accept event should expose accept payload");
+        assert_eq!(accept.fd, 9);
+        assert_eq!(accept.listen_fd, 3);
+        assert_eq!(accept.addrlen, 16);
+        assert_eq!(accept.address_family, EBPF_ADDRESS_FAMILY_INET);
+        assert_eq!(accept.remote_port, 50_000);
+        assert_eq!(accept.remote_address[0..4], [127, 0, 0, 1]);
+        assert_eq!(accept.fd_table_epoch, 12);
+        assert!(event.connect_observation().is_none());
         assert!(event.close_observation().is_none());
     }
 
@@ -1113,28 +1346,89 @@ mod tests {
 
     #[test]
     fn process_event_decodes_from_wire_bytes() {
-        let event = EbpfProcessProbeEvent::connect_tracepoint_observed(
-            11,
-            22,
-            33,
-            44,
-            *b"0123456789abcdef",
-            EbpfConnectObservation::remote_endpoint(
-                7,
-                16,
-                EBPF_ADDRESS_FAMILY_INET,
-                443,
-                [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        for event in sample_process_events() {
+            let decoded = match decode_process_probe_event(&encode_process_probe_event(&event)) {
+                Ok(decoded) => decoded,
+                Err(error) => panic!("event must decode: {error:?}"),
+            };
+
+            assert_eq!(decoded, event);
+        }
+    }
+
+    fn sample_process_events() -> [EbpfProcessProbeEvent; 5] {
+        [
+            EbpfProcessProbeEvent::connect_tracepoint_observed(
+                11,
+                22,
+                33,
+                44,
+                *b"0123456789abcdef",
+                EbpfConnectObservation::remote_endpoint(
+                    7,
+                    16,
+                    EBPF_ADDRESS_FAMILY_INET,
+                    443,
+                    [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                ),
+                EBPF_CONNECT_REMOTE_ENDPOINT_VALID,
             ),
-            EBPF_CONNECT_REMOTE_ENDPOINT_VALID,
-        );
+            EbpfProcessProbeEvent::accept_tracepoint_observed(
+                11,
+                22,
+                33,
+                44,
+                *b"0123456789abcdef",
+                EbpfAcceptObservation::remote_endpoint(
+                    9,
+                    3,
+                    16,
+                    EBPF_ADDRESS_FAMILY_INET,
+                    50_000,
+                    [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                )
+                .with_fd_table_epoch(2),
+                EBPF_ACCEPT_REMOTE_ENDPOINT_VALID,
+            ),
+            EbpfProcessProbeEvent::close_tracepoint_observed(
+                11,
+                22,
+                33,
+                44,
+                *b"0123456789abcdef",
+                EbpfCloseObservation::observed(7),
+            ),
+            EbpfProcessProbeEvent::socket_write_sampled(
+                11,
+                22,
+                33,
+                44,
+                *b"0123456789abcdef",
+                EbpfSocketWriteSample::new(7, 5, 5, write_sample_bytes(b"HTTP/")),
+                EBPF_SOCKET_WRITE_TRUNCATED,
+            ),
+            EbpfProcessProbeEvent::socket_read_sampled(
+                11,
+                22,
+                33,
+                44,
+                *b"0123456789abcdef",
+                EbpfSocketReadSample::new(7, 5, 5, read_sample_bytes(b"HTTP/")),
+                EBPF_SOCKET_READ_TRUNCATED,
+            ),
+        ]
+    }
 
-        let decoded = match decode_process_probe_event(&encode_process_probe_event(&event)) {
-            Ok(decoded) => decoded,
-            Err(error) => panic!("event must decode: {error:?}"),
-        };
+    fn write_sample_bytes(prefix: &[u8]) -> [u8; EBPF_SOCKET_WRITE_SAMPLE_BYTES] {
+        let mut bytes = [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES];
+        bytes[..prefix.len()].copy_from_slice(prefix);
+        bytes
+    }
 
-        assert_eq!(decoded, event);
+    fn read_sample_bytes(prefix: &[u8]) -> [u8; EBPF_SOCKET_READ_SAMPLE_BYTES] {
+        let mut bytes = [0; EBPF_SOCKET_READ_SAMPLE_BYTES];
+        bytes[..prefix.len()].copy_from_slice(prefix);
+        bytes
     }
 
     #[test]
