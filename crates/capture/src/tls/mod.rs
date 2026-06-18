@@ -4,6 +4,7 @@ mod attach_reconcile;
 mod discovery;
 mod keylog;
 mod plaintext;
+mod session_secret;
 
 pub use attach_inventory::{
     LibsslUprobeAttachPlanningError, LibsslUprobeAttachPlanningReport,
@@ -30,3 +31,4 @@ pub use plaintext::{
     LibsslUprobePlaintextReconcile, LibsslUprobeReconcileTargetBucket,
     MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET,
 };
+pub use session_secret::{TlsSessionSecretParseError, TlsSessionSecretSummary};

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use capture::TlsKeyLogSummary;
+use capture::{TlsKeyLogSummary, TlsSessionSecretSummary};
 use probe_config::TlsMaterialKind;
 use runtime::{RuntimePlan, TlsPlaintextMaterialPlan};
 use serde::Serialize;
@@ -44,7 +44,7 @@ struct TlsPlaintextMaterialCheckSnapshot {
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum TlsPlaintextMaterialContentCheck {
     SslKeyLog { summary: TlsKeyLogSummary },
-    SessionSecretFile { bytes: u64 },
+    SessionSecretFile { summary: TlsSessionSecretSummary },
 }
 
 #[derive(Debug, Error)]
@@ -115,13 +115,13 @@ fn check_session_secret_materials(
         .iter()
         .map(|material| {
             let bytes = read_plaintext_material(material, file_store)?;
+            let summary = TlsSessionSecretSummary::parse(&bytes)
+                .map_err(|source| tls_plaintext_material_error(material, source))?;
             Ok(TlsPlaintextMaterialCheckSnapshot {
                 id: material.id.clone(),
                 kind: material.kind,
                 path: material.path.clone(),
-                check: TlsPlaintextMaterialContentCheck::SessionSecretFile {
-                    bytes: bytes.len() as u64,
-                },
+                check: TlsPlaintextMaterialContentCheck::SessionSecretFile { summary },
             })
         })
         .collect()
@@ -170,7 +170,12 @@ mod tests {
             &key_log_path,
             b"CLIENT_RANDOM 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111\n",
         )?;
-        fs::write(&session_secret_path, b"reserved-session-secret")?;
+        let session_secret_material = format!(
+            r#"{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{}","secret":"{}"}}"#,
+            "00".repeat(32),
+            "aa".repeat(32)
+        );
+        fs::write(&session_secret_path, session_secret_material)?;
         let mut config = AgentConfig::default();
         config.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-keys".to_string()];
         config.tls.plaintext.decrypt_hints.session_secret_refs =
@@ -218,8 +223,22 @@ mod tests {
             json!("session_secret_file")
         );
         assert_eq!(
-            value["tls"]["plaintext"]["decrypt_hints"]["session_secrets"][0]["check"]["bytes"],
-            json!(23)
+            value["tls"]["plaintext"]["decrypt_hints"]["session_secrets"][0]["check"]["summary"]["entries"],
+            json!(1)
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["session_secrets"][0]["check"]["summary"]["protocols"]
+                [0]["protocol"],
+            json!("tls13")
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["session_secrets"][0]["check"]["summary"]["secret_kinds"]
+                [0]["secret_kind"],
+            json!("client_application_traffic_secret")
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["session_secrets"][0]["check"]["summary"]["secret_min_bytes"],
+            json!(32)
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -272,6 +291,45 @@ mod tests {
         let error = build_check_report(plan, None)
             .await
             .expect_err("invalid key log file must fail explicit check");
+
+        assert!(matches!(
+            error,
+            CheckError::Tls(TlsCheckError::PlaintextMaterial { .. })
+        ));
+        assert!(error.to_string().contains("invalid hex in secret"));
+        assert!(
+            !error.to_string().contains("not-a-secret"),
+            "check errors must not leak TLS secret field values"
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_rejects_invalid_tls_session_secret_material_without_leaking_secret_value()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-invalid-tls-session-secret")?;
+        let session_secret_path = temp.join("session-secrets.jsonl");
+        fs::write(
+            &session_secret_path,
+            format!(
+                r#"{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{}","secret":"not-a-secret"}}"#,
+                "00".repeat(32)
+            ),
+        )?;
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.decrypt_hints.session_secret_refs =
+            vec!["session-secrets".to_string()];
+        config.tls.materials.push(TlsMaterialConfig {
+            id: Some("session-secrets".to_string()),
+            kind: TlsMaterialKind::SessionSecretFile,
+            path: session_secret_path,
+        });
+        let plan = runtime_plan(config)?;
+
+        let error = build_check_report(plan, None)
+            .await
+            .expect_err("invalid session secret file must fail explicit check");
 
         assert!(matches!(
             error,

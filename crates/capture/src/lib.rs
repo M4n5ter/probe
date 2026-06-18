@@ -44,5 +44,5 @@ pub use tls::{
     LibsslUprobeSymbolRole, LibsslUprobeTarget, LibsslUprobeTargetDiscovery,
     LibsslUprobeTargetDiscoveryReport, MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET,
     TlsKeyLogField, TlsKeyLogLabelCount, TlsKeyLogParseError, TlsKeyLogSummary,
-    plan_libssl_uprobes_for_processes,
+    TlsSessionSecretParseError, TlsSessionSecretSummary, plan_libssl_uprobes_for_processes,
 };
