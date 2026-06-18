@@ -453,6 +453,32 @@ mod tests {
     }
 
     #[test]
+    fn lua_policy_receives_tls_session_secret_origin_view() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let runtime = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "demo".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::HttpRequestHeaders],
+            },
+            r#"
+            function on_http_request_headers(event)
+              return probe.emit_alert(event.origin.source .. " " .. event.origin.provider)
+            end
+            "#,
+        )?;
+        let event =
+            demo_event_with_origin(CaptureOrigin::from_source(CaptureSource::TlsSessionSecret));
+        let outcomes = runtime.handle_event(PolicyHook::HttpRequestHeaders, &event)?;
+
+        let [PolicyOutcome::Alert(alert)] = outcomes.as_slice() else {
+            panic!("expected one alert outcome: {outcomes:?}");
+        };
+        assert_eq!(alert.message, "tls_session_secret plaintext");
+        Ok(())
+    }
+
+    #[test]
     fn lua_policy_event_view_does_not_expose_lua_reserved_keys()
     -> Result<(), Box<dyn std::error::Error>> {
         let runtime = PolicyRuntime::from_source(
@@ -971,25 +997,36 @@ mod tests {
     }
 
     fn demo_event() -> EventEnvelope {
-        demo_event_with_kind(EventKind::HttpRequestHeaders(http_headers(
-            Direction::Outbound,
-            Some("GET"),
-            Some("/chat"),
-            None,
-            None,
-            "host",
-            "example.test",
-        )))
+        demo_event_with_origin(replay_origin())
+    }
+
+    fn demo_event_with_origin(origin: CaptureOrigin) -> EventEnvelope {
+        demo_event_with_kind_and_origin(
+            EventKind::HttpRequestHeaders(http_headers(
+                Direction::Outbound,
+                Some("GET"),
+                Some("/chat"),
+                None,
+                None,
+                "host",
+                "example.test",
+            )),
+            origin,
+        )
     }
 
     fn demo_event_with_kind(kind: EventKind) -> EventEnvelope {
+        demo_event_with_kind_and_origin(kind, replay_origin())
+    }
+
+    fn demo_event_with_kind_and_origin(kind: EventKind, origin: CaptureOrigin) -> EventEnvelope {
         EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
             demo_flow(),
-            replay_origin(),
+            origin,
             "test",
             kind,
         )

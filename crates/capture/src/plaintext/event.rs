@@ -11,6 +11,7 @@ use crate::{CaptureEvent, CapturedBytes, CapturedGap};
 pub enum PlaintextSource {
     ExternalPlaintextFeed,
     LibsslUprobe,
+    TlsSessionSecret,
 }
 
 impl PlaintextSource {
@@ -18,6 +19,7 @@ impl PlaintextSource {
         match self {
             Self::ExternalPlaintextFeed => CaptureSource::ExternalPlaintextFeed,
             Self::LibsslUprobe => CaptureSource::LibsslUprobe,
+            Self::TlsSessionSecret => CaptureSource::TlsSessionSecret,
         }
     }
 }
@@ -242,7 +244,7 @@ mod tests {
     #[test]
     fn plaintext_event_source_controls_capture_source() {
         let event = PlaintextEvent::bytes(
-            PlaintextSource::LibsslUprobe,
+            PlaintextSource::TlsSessionSecret,
             PlaintextChunk::new(
                 Timestamp {
                     monotonic_ns: 1,
@@ -258,7 +260,8 @@ mod tests {
             panic!("expected plaintext bytes");
         };
 
-        assert_eq!(bytes.origin.source(), CaptureSource::LibsslUprobe);
+        assert_eq!(bytes.origin.source(), CaptureSource::TlsSessionSecret);
+        assert_eq!(bytes.origin.provider(), CaptureProviderKind::Plaintext);
     }
 
     fn demo_flow() -> FlowContext {

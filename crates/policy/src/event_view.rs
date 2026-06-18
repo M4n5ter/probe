@@ -465,6 +465,7 @@ fn source_name(source: CaptureSource) -> &'static str {
         CaptureSource::EbpfSyscall => "ebpf_syscall",
         CaptureSource::Libpcap => "libpcap",
         CaptureSource::LibsslUprobe => "libssl_uprobe",
+        CaptureSource::TlsSessionSecret => "tls_session_secret",
         CaptureSource::ExternalPlaintextFeed => "external_plaintext_feed",
         CaptureSource::Replay => "replay",
         CaptureSource::Mock => "mock",

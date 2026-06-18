@@ -426,6 +426,70 @@ impl hkdf::KeyType for HkdfOutputLen {
 }
 
 #[cfg(test)]
+pub(in crate::tls::session_secret) fn protect_tls13_test_record(
+    record: &TlsSessionSecretRecord,
+    sequence_number: u64,
+    inner_plaintext: &[u8],
+) -> Result<Vec<u8>, Tls13DecryptError> {
+    let cipher_suite = record
+        .cipher_suite()
+        .ok_or(Tls13DecryptError::MissingCipherSuite)?;
+    let suite = Tls13AeadSuite::from_cipher_suite(cipher_suite)
+        .ok_or_else(|| Tls13DecryptError::unsupported_cipher_suite(cipher_suite))?;
+    let secret = record.secret();
+    if secret.len() != suite.secret_len {
+        return Err(Tls13DecryptError::InvalidTrafficSecretLength {
+            expected_bytes: suite.secret_len,
+            actual_bytes: secret.len(),
+        });
+    }
+    let key_bytes =
+        derive_tls13_secret_bytes(secret.as_bytes(), suite.hkdf, b"key", suite.key_len)?;
+    let static_iv: [u8; TLS13_NONCE_BYTES] =
+        derive_tls13_secret_bytes(secret.as_bytes(), suite.hkdf, b"iv", TLS13_NONCE_BYTES)?
+            .try_into()
+            .expect("TLS 1.3 traffic IV length is fixed");
+    let key = aead::UnboundKey::new(suite.aead, &key_bytes)
+        .map(aead::LessSafeKey::new)
+        .map_err(|_| Tls13DecryptError::CryptoInitializationFailed)?;
+    let payload_len = inner_plaintext.len() + TLS13_AEAD_TAG_BYTES;
+    assert!(payload_len <= u16::MAX as usize);
+    let mut wire_record = vec![
+        TLS13_OUTER_APPLICATION_DATA,
+        TLS13_LEGACY_RECORD_VERSION[0],
+        TLS13_LEGACY_RECORD_VERSION[1],
+        (payload_len >> 8) as u8,
+        payload_len as u8,
+    ];
+    let aad: [u8; TLS13_RECORD_HEADER_BYTES] = wire_record[..TLS13_RECORD_HEADER_BYTES]
+        .try_into()
+        .expect("TLS record header has fixed length");
+    let mut payload = inner_plaintext.to_vec();
+    let tag = key
+        .seal_in_place_separate_tag(
+            aead::Nonce::assume_unique_for_key(test_nonce(static_iv, sequence_number)),
+            aead::Aad::from(aad),
+            &mut payload,
+        )
+        .map_err(|_| Tls13DecryptError::AeadOpenFailed)?;
+    wire_record.extend_from_slice(&payload);
+    wire_record.extend_from_slice(tag.as_ref());
+    Ok(wire_record)
+}
+
+#[cfg(test)]
+fn test_nonce(
+    mut static_iv: [u8; TLS13_NONCE_BYTES],
+    sequence_number: u64,
+) -> [u8; TLS13_NONCE_BYTES] {
+    for (nonce_byte, sequence_byte) in static_iv[4..].iter_mut().zip(sequence_number.to_be_bytes())
+    {
+        *nonce_byte ^= sequence_byte;
+    }
+    static_iv
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::TlsSessionSecretStore;
     use super::*;
@@ -595,7 +659,7 @@ mod tests {
         inner_plaintext.push(Tls13InnerContentType::ApplicationData.as_u8());
         inner_plaintext.push(0);
 
-        let wire_record = protected_record("0x1301", SHA256_TRAFFIC_SECRET, 0, &inner_plaintext)?;
+        let wire_record = protect_tls13_test_record(&record, 0, &inner_plaintext)?;
         let decrypted = decryptor.decrypt_next_record(&wire_record)?;
 
         assert_eq!(
@@ -690,69 +754,6 @@ mod tests {
         );
         let store = TlsSessionSecretStore::parse(material.as_bytes())?;
         Ok(store.records()[0].clone())
-    }
-
-    fn protected_record(
-        cipher_suite: &str,
-        secret: &str,
-        sequence_number: u64,
-        inner_plaintext: &[u8],
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let record = session_secret_record(
-            TlsSessionSecretProtocol::Tls13,
-            TlsSessionSecretKind::ClientApplicationTraffic,
-            Some(cipher_suite),
-            secret,
-        )?;
-        let cipher_suite = record
-            .cipher_suite()
-            .expect("test record carries cipher suite");
-        let suite =
-            Tls13AeadSuite::from_cipher_suite(cipher_suite).expect("test suite is supported");
-        let traffic_secret = record.secret().as_bytes();
-        let key_bytes =
-            derive_tls13_secret_bytes(traffic_secret, suite.hkdf, b"key", suite.key_len)?;
-        let static_iv: [u8; TLS13_NONCE_BYTES] =
-            derive_tls13_secret_bytes(traffic_secret, suite.hkdf, b"iv", TLS13_NONCE_BYTES)?
-                .try_into()
-                .expect("TLS 1.3 traffic IV length is fixed");
-        let key = aead::UnboundKey::new(suite.aead, &key_bytes)
-            .map(aead::LessSafeKey::new)
-            .map_err(|_| "failed to initialize test AEAD key")?;
-        let payload_len = inner_plaintext.len() + TLS13_AEAD_TAG_BYTES;
-        let mut wire_record = vec![
-            TLS13_OUTER_APPLICATION_DATA,
-            TLS13_LEGACY_RECORD_VERSION[0],
-            TLS13_LEGACY_RECORD_VERSION[1],
-            (payload_len >> 8) as u8,
-            payload_len as u8,
-        ];
-        let aad: [u8; TLS13_RECORD_HEADER_BYTES] = wire_record[..TLS13_RECORD_HEADER_BYTES]
-            .try_into()
-            .expect("TLS record header has fixed length");
-        let mut payload = inner_plaintext.to_vec();
-        let tag = key
-            .seal_in_place_separate_tag(
-                aead::Nonce::assume_unique_for_key(test_nonce(static_iv, sequence_number)),
-                aead::Aad::from(aad),
-                &mut payload,
-            )
-            .map_err(|_| "failed to seal test TLS record")?;
-        wire_record.extend_from_slice(&payload);
-        wire_record.extend_from_slice(tag.as_ref());
-        Ok(wire_record)
-    }
-
-    fn test_nonce(
-        mut static_iv: [u8; TLS13_NONCE_BYTES],
-        sequence_number: u64,
-    ) -> [u8; TLS13_NONCE_BYTES] {
-        for (nonce_byte, sequence_byte) in
-            static_iv[4..].iter_mut().zip(sequence_number.to_be_bytes())
-        {
-            *nonce_byte ^= sequence_byte;
-        }
-        static_iv
     }
 
     fn hex(value: &str) -> Vec<u8> {

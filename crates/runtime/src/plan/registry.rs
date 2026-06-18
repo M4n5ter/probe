@@ -101,6 +101,7 @@ fn default_platform_capabilities(
 ) -> impl IntoIterator<Item = CapabilityState> {
     [
         libssl_uprobe_capability,
+        CapabilityState::available(CapabilityKind::TlsSessionSecretRecordDecrypt),
         CapabilityState::available(CapabilityKind::Http1),
         CapabilityState::available(CapabilityKind::Sse),
         CapabilityState::available(CapabilityKind::WebSocketHandoff),

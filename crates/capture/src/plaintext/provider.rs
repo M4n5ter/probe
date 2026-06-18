@@ -63,6 +63,7 @@ impl CaptureProvider for PlaintextEventProvider {
         match self.source {
             PlaintextSource::ExternalPlaintextFeed => "plaintext_event_external_feed",
             PlaintextSource::LibsslUprobe => "plaintext_event_libssl_uprobe",
+            PlaintextSource::TlsSessionSecret => "plaintext_event_tls_session_secret",
         }
     }
 
@@ -70,6 +71,7 @@ impl CaptureProvider for PlaintextEventProvider {
         vec![CapabilityState::available(match self.source {
             PlaintextSource::ExternalPlaintextFeed => CapabilityKind::ExternalPlaintextFeed,
             PlaintextSource::LibsslUprobe => CapabilityKind::LibsslUprobe,
+            PlaintextSource::TlsSessionSecret => CapabilityKind::TlsSessionSecretRecordDecrypt,
         })]
     }
 
@@ -94,29 +96,51 @@ mod tests {
 
     #[test]
     fn provider_preserves_single_source_events() -> Result<(), Box<dyn std::error::Error>> {
-        let mut provider = PlaintextEventProvider::from_chunks(
-            PlaintextSource::LibsslUprobe,
-            [PlaintextChunk::new(
-                Timestamp {
-                    monotonic_ns: 1,
-                    wall_time_unix_ns: 1,
-                },
-                demo_flow(),
-                Direction::Outbound,
-                b"GET / HTTP/1.1\r\n\r\n",
-            )],
-        );
+        for case in [
+            SourceCase {
+                source: PlaintextSource::ExternalPlaintextFeed,
+                capture_source: CaptureSource::ExternalPlaintextFeed,
+                capability: CapabilityKind::ExternalPlaintextFeed,
+                name: "plaintext_event_external_feed",
+            },
+            SourceCase {
+                source: PlaintextSource::LibsslUprobe,
+                capture_source: CaptureSource::LibsslUprobe,
+                capability: CapabilityKind::LibsslUprobe,
+                name: "plaintext_event_libssl_uprobe",
+            },
+            SourceCase {
+                source: PlaintextSource::TlsSessionSecret,
+                capture_source: CaptureSource::TlsSessionSecret,
+                capability: CapabilityKind::TlsSessionSecretRecordDecrypt,
+                name: "plaintext_event_tls_session_secret",
+            },
+        ] {
+            let mut provider = PlaintextEventProvider::from_chunks(
+                case.source,
+                [PlaintextChunk::new(
+                    Timestamp {
+                        monotonic_ns: 1,
+                        wall_time_unix_ns: 1,
+                    },
+                    demo_flow(),
+                    Direction::Outbound,
+                    b"GET / HTTP/1.1\r\n\r\n",
+                )],
+            );
 
-        let Some(CaptureEvent::Bytes(bytes)) = provider.next()? else {
-            panic!("expected plaintext bytes");
-        };
+            let Some(CaptureEvent::Bytes(bytes)) = provider.next()? else {
+                panic!("expected plaintext bytes");
+            };
 
-        assert_eq!(bytes.origin.source(), CaptureSource::LibsslUprobe);
-        assert_eq!(
-            provider.capabilities(),
-            vec![CapabilityState::available(CapabilityKind::LibsslUprobe)]
-        );
-        assert!(provider.next()?.is_none());
+            assert_eq!(provider.name(), case.name);
+            assert_eq!(bytes.origin.source(), case.capture_source);
+            assert_eq!(
+                provider.capabilities(),
+                vec![CapabilityState::available(case.capability)]
+            );
+            assert!(provider.next()?.is_none());
+        }
         Ok(())
     }
 
@@ -185,5 +209,13 @@ mod tests {
             socket_cookie: None,
             attribution_confidence: 100,
         }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct SourceCase {
+        source: PlaintextSource,
+        capture_source: CaptureSource,
+        capability: CapabilityKind,
+        name: &'static str,
     }
 }

@@ -13,6 +13,7 @@ pub enum CaptureSource {
     EbpfSyscall,
     Libpcap,
     LibsslUprobe,
+    TlsSessionSecret,
     ExternalPlaintextFeed,
     Replay,
     Mock,
@@ -27,7 +28,9 @@ impl CaptureSource {
         match self {
             Self::EbpfSyscall => CaptureProviderKind::Ebpf,
             Self::Libpcap => CaptureProviderKind::Libpcap,
-            Self::LibsslUprobe | Self::ExternalPlaintextFeed => CaptureProviderKind::Plaintext,
+            Self::LibsslUprobe | Self::TlsSessionSecret | Self::ExternalPlaintextFeed => {
+                CaptureProviderKind::Plaintext
+            }
             Self::Replay | Self::Mock => CaptureProviderKind::Replay,
         }
     }
@@ -108,6 +111,7 @@ mod tests {
         assert!(CaptureSource::EbpfSyscall.is_live_host_observation());
         assert!(CaptureSource::Libpcap.is_live_host_observation());
         assert!(CaptureSource::LibsslUprobe.is_live_host_observation());
+        assert!(!CaptureSource::TlsSessionSecret.is_live_host_observation());
         assert!(!CaptureSource::ExternalPlaintextFeed.is_live_host_observation());
         assert!(!CaptureSource::Replay.is_live_host_observation());
         assert!(!CaptureSource::Mock.is_live_host_observation());
