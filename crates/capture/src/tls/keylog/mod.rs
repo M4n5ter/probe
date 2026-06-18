@@ -1,3 +1,6 @@
-mod summary;
+mod material;
 
-pub use summary::{TlsKeyLogField, TlsKeyLogLabelCount, TlsKeyLogParseError, TlsKeyLogSummary};
+pub use material::{
+    TlsKeyLog, TlsKeyLogEntry, TlsKeyLogField, TlsKeyLogLabel, TlsKeyLogLabelCount,
+    TlsKeyLogParseError, TlsKeyLogSummary,
+};

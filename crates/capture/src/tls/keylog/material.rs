@@ -3,8 +3,126 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum TlsKeyLogLabel {
+use super::super::{TlsMaterialLookup, TlsRandom, TlsSecret, decode_hex, hex_len, resolve_lookup};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsKeyLog {
+    entries: Vec<TlsKeyLogEntry>,
+}
+
+impl TlsKeyLog {
+    pub fn parse(bytes: &[u8]) -> Result<Self, TlsKeyLogParseError> {
+        let content = std::str::from_utf8(bytes).map_err(|_| TlsKeyLogParseError::InvalidUtf8)?;
+        let mut entries = Vec::new();
+        for (index, line) in content.lines().enumerate() {
+            let line_number = index + 1;
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            entries.push(TlsKeyLogEntry::parse(line_number, line)?);
+        }
+        Ok(Self { entries })
+    }
+
+    pub fn entries(&self) -> &[TlsKeyLogEntry] {
+        &self.entries
+    }
+
+    pub fn lookup_secret_for_label_and_context(
+        &self,
+        label: &TlsKeyLogLabel,
+        context: &[u8],
+    ) -> TlsMaterialLookup<'_, TlsSecret> {
+        resolve_lookup(
+            self.entries
+                .iter()
+                .filter(|entry| entry.label == *label && entry.context.as_ref() == context)
+                .map(TlsKeyLogEntry::secret),
+        )
+    }
+
+    pub fn lookup_secret_for_label_and_random(
+        &self,
+        label: &TlsKeyLogLabel,
+        random: &TlsRandom,
+    ) -> TlsMaterialLookup<'_, TlsSecret> {
+        self.lookup_secret_for_label_and_context(label, random.as_bytes())
+    }
+
+    pub fn summary(&self) -> TlsKeyLogSummary {
+        let mut labels = BTreeMap::<String, u64>::new();
+        for entry in &self.entries {
+            *labels.entry(entry.label.as_str().to_string()).or_default() += 1;
+        }
+        TlsKeyLogSummary {
+            entries: self.entries.len() as u64,
+            labels: labels
+                .into_iter()
+                .map(|(label, count)| TlsKeyLogLabelCount { label, count })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsKeyLogEntry {
+    label: TlsKeyLogLabel,
+    context: Box<[u8]>,
+    secret: TlsSecret,
+}
+
+impl TlsKeyLogEntry {
+    fn parse(line_number: usize, line: &str) -> Result<Self, TlsKeyLogParseError> {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let [label, context, secret] = fields.as_slice() else {
+            return Err(TlsKeyLogParseError::InvalidFieldCount { line_number });
+        };
+        let label = TlsKeyLogLabel::parse(label)
+            .ok_or(TlsKeyLogParseError::InvalidLabel { line_number })?;
+        let context_len = hex_len(context).ok_or(TlsKeyLogParseError::InvalidHex {
+            line_number,
+            field: TlsKeyLogField::Context,
+        })?;
+        if let Some(expected_bytes) = label.expected_context_len()
+            && context_len != expected_bytes
+        {
+            return Err(TlsKeyLogParseError::InvalidContextLength {
+                line_number,
+                label: label.as_str().to_string(),
+                expected_bytes,
+                actual_bytes: context_len,
+            });
+        }
+        let context = decode_hex(context)
+            .expect("context was validated before decoding")
+            .into_boxed_slice();
+        let secret = TlsSecret::from_hex(secret).ok_or(TlsKeyLogParseError::InvalidHex {
+            line_number,
+            field: TlsKeyLogField::Secret,
+        })?;
+        Ok(Self {
+            label,
+            context,
+            secret,
+        })
+    }
+
+    pub fn label(&self) -> &TlsKeyLogLabel {
+        &self.label
+    }
+
+    pub fn context(&self) -> &[u8] {
+        &self.context
+    }
+
+    pub fn secret(&self) -> &TlsSecret {
+        &self.secret
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TlsKeyLogLabel {
     Rsa,
     ClientRandom,
     ClientEarlyTrafficSecret,
@@ -61,56 +179,12 @@ pub enum TlsKeyLogField {
 
 impl TlsKeyLogSummary {
     pub fn parse(bytes: &[u8]) -> Result<Self, TlsKeyLogParseError> {
-        let content = std::str::from_utf8(bytes).map_err(|_| TlsKeyLogParseError::InvalidUtf8)?;
-        let mut entries = 0_u64;
-        let mut labels = BTreeMap::<String, u64>::new();
-        for (index, line) in content.lines().enumerate() {
-            let line_number = index + 1;
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let label = parse_entry_label(line_number, line)?;
-            entries += 1;
-            *labels.entry(label.wire_name()).or_default() += 1;
-        }
-        Ok(Self {
-            entries,
-            labels: labels
-                .into_iter()
-                .map(|(label, count)| TlsKeyLogLabelCount { label, count })
-                .collect(),
-        })
+        TlsKeyLog::parse(bytes).map(|key_log| key_log.summary())
     }
-}
-
-fn parse_entry_label(
-    line_number: usize,
-    line: &str,
-) -> Result<TlsKeyLogLabel, TlsKeyLogParseError> {
-    let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
-    let [label, context, secret] = fields.as_slice() else {
-        return Err(TlsKeyLogParseError::InvalidFieldCount { line_number });
-    };
-    let label =
-        TlsKeyLogLabel::parse(label).ok_or(TlsKeyLogParseError::InvalidLabel { line_number })?;
-    let context_len = hex_len(context, line_number, TlsKeyLogField::Context)?;
-    hex_len(secret, line_number, TlsKeyLogField::Secret)?;
-    if let Some(expected_bytes) = label.expected_context_len()
-        && context_len != expected_bytes
-    {
-        return Err(TlsKeyLogParseError::InvalidContextLength {
-            line_number,
-            label: label.wire_name(),
-            expected_bytes,
-            actual_bytes: context_len,
-        });
-    }
-    Ok(label)
 }
 
 impl TlsKeyLogLabel {
-    fn parse(label: &str) -> Option<Self> {
+    pub fn parse(label: &str) -> Option<Self> {
         let label = match label {
             "RSA" => Self::Rsa,
             "CLIENT_RANDOM" => Self::ClientRandom,
@@ -127,7 +201,7 @@ impl TlsKeyLogLabel {
         Some(label)
     }
 
-    fn wire_name(&self) -> String {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Rsa => "RSA",
             Self::ClientRandom => "CLIENT_RANDOM",
@@ -140,10 +214,9 @@ impl TlsKeyLogLabel {
             Self::EarlyExporterSecret => "EARLY_EXPORTER_SECRET",
             Self::Other(label) => label,
         }
-        .to_string()
     }
 
-    fn expected_context_len(&self) -> Option<usize> {
+    pub fn expected_context_len(&self) -> Option<usize> {
         match self {
             Self::Rsa | Self::Other(_) => None,
             Self::ClientRandom
@@ -174,27 +247,13 @@ fn is_valid_label(label: &str) -> bool {
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
-fn hex_len(
-    value: &str,
-    line_number: usize,
-    field: TlsKeyLogField,
-) -> Result<usize, TlsKeyLogParseError> {
-    if value.is_empty()
-        || !value.len().is_multiple_of(2)
-        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(TlsKeyLogParseError::InvalidHex { line_number, field });
-    }
-    Ok(value.len() / 2)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_nss_key_log_file_without_retaining_secret_bytes() {
-        let summary = TlsKeyLogSummary::parse(
+    fn parses_nss_key_log_file_and_summarizes_without_serializing_secret_bytes() {
+        let key_log = TlsKeyLog::parse(
             b"
 # comment
 CLIENT_RANDOM 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111
@@ -203,6 +262,7 @@ FUTURE_SECRET_LABEL 01 ff
 ",
         )
         .expect("valid key log");
+        let summary = key_log.summary();
 
         assert_eq!(summary.entries, 3);
         assert_eq!(
@@ -222,6 +282,33 @@ FUTURE_SECRET_LABEL 01 ff
                 }
             ]
         );
+        let random =
+            TlsRandom::from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .expect("valid random");
+        let TlsMaterialLookup::Found(secret) =
+            key_log.lookup_secret_for_label_and_random(&TlsKeyLogLabel::ClientRandom, &random)
+        else {
+            panic!("client random secret must be uniquely available");
+        };
+        assert_eq!(secret.len(), 48);
+        assert!(!format!("{secret:?}").contains("111111"));
+    }
+
+    #[test]
+    fn lookup_reports_ambiguous_duplicate_contexts() {
+        let material = b"
+CLIENT_RANDOM 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 1111
+CLIENT_RANDOM 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 2222
+";
+        let key_log = TlsKeyLog::parse(material).expect("valid key log");
+        let random =
+            TlsRandom::from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .expect("valid random");
+
+        let lookup =
+            key_log.lookup_secret_for_label_and_random(&TlsKeyLogLabel::ClientRandom, &random);
+
+        assert_eq!(lookup, TlsMaterialLookup::Ambiguous { matches: 2 });
     }
 
     #[test]

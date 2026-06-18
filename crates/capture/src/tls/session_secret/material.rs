@@ -3,7 +3,149 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const RANDOM_BYTES: usize = 32;
+use super::super::{
+    TLS_RANDOM_BYTES, TlsMaterialLookup, TlsRandom, TlsSecret, hex_len, resolve_lookup,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsSessionSecretStore {
+    records: Vec<TlsSessionSecretRecord>,
+}
+
+impl TlsSessionSecretStore {
+    pub fn parse(bytes: &[u8]) -> Result<Self, TlsSessionSecretParseError> {
+        let content =
+            std::str::from_utf8(bytes).map_err(|_| TlsSessionSecretParseError::invalid_utf8())?;
+        let mut records = Vec::new();
+        for (index, line) in content.lines().enumerate() {
+            let line_number = index + 1;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            records
+                .push(TlsSessionSecretRecordWire::parse(line_number, line)?.decode(line_number)?);
+        }
+        if records.is_empty() {
+            return Err(TlsSessionSecretParseError::no_entries());
+        }
+        Ok(Self { records })
+    }
+
+    pub fn records(&self) -> &[TlsSessionSecretRecord] {
+        &self.records
+    }
+
+    pub fn lookup(
+        &self,
+        protocol: TlsSessionSecretProtocol,
+        secret_kind: TlsSessionSecretKind,
+        client_random: &TlsRandom,
+        at_unix_ns: Option<u64>,
+    ) -> TlsMaterialLookup<'_, TlsSessionSecretRecord> {
+        resolve_lookup(self.records.iter().filter(|record| {
+            record.protocol == protocol
+                && record.secret_kind == secret_kind
+                && record.client_random == *client_random
+                && record.is_valid_at(at_unix_ns)
+        }))
+    }
+
+    pub fn summary(&self) -> TlsSessionSecretSummary {
+        let mut protocol_counts = BTreeMap::<TlsSessionSecretProtocol, u64>::new();
+        let mut secret_kind_counts = BTreeMap::<TlsSessionSecretKind, u64>::new();
+        let mut secret_min_bytes = u64::MAX;
+        let mut secret_max_bytes = 0_u64;
+
+        for record in &self.records {
+            *protocol_counts.entry(record.protocol).or_default() += 1;
+            *secret_kind_counts.entry(record.secret_kind).or_default() += 1;
+            let secret_bytes = record.secret.len() as u64;
+            secret_min_bytes = secret_min_bytes.min(secret_bytes);
+            secret_max_bytes = secret_max_bytes.max(secret_bytes);
+        }
+
+        TlsSessionSecretSummary {
+            entries: self.records.len() as u64,
+            protocols: protocol_counts
+                .into_iter()
+                .map(|(protocol, count)| TlsSessionSecretProtocolCount { protocol, count })
+                .collect(),
+            secret_kinds: secret_kind_counts
+                .into_iter()
+                .map(|(secret_kind, count)| TlsSessionSecretKindCount { secret_kind, count })
+                .collect(),
+            secret_min_bytes,
+            secret_max_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsSessionSecretRecord {
+    protocol: TlsSessionSecretProtocol,
+    secret_kind: TlsSessionSecretKind,
+    client_random: TlsRandom,
+    server_random: Option<TlsRandom>,
+    cipher_suite: Option<TlsCipherSuite>,
+    secret: TlsSecret,
+    not_before_unix_ns: Option<u64>,
+    not_after_unix_ns: Option<u64>,
+}
+
+impl TlsSessionSecretRecord {
+    pub fn protocol(&self) -> TlsSessionSecretProtocol {
+        self.protocol
+    }
+
+    pub fn secret_kind(&self) -> TlsSessionSecretKind {
+        self.secret_kind
+    }
+
+    pub fn client_random(&self) -> &TlsRandom {
+        &self.client_random
+    }
+
+    pub fn server_random(&self) -> Option<&TlsRandom> {
+        self.server_random.as_ref()
+    }
+
+    pub fn cipher_suite(&self) -> Option<TlsCipherSuite> {
+        self.cipher_suite
+    }
+
+    pub fn secret(&self) -> &TlsSecret {
+        &self.secret
+    }
+
+    pub fn not_before_unix_ns(&self) -> Option<u64> {
+        self.not_before_unix_ns
+    }
+
+    pub fn not_after_unix_ns(&self) -> Option<u64> {
+        self.not_after_unix_ns
+    }
+
+    pub fn is_valid_at(&self, at_unix_ns: Option<u64>) -> bool {
+        let Some(at_unix_ns) = at_unix_ns else {
+            return true;
+        };
+        self.not_before_unix_ns
+            .is_none_or(|not_before| at_unix_ns >= not_before)
+            && self
+                .not_after_unix_ns
+                .is_none_or(|not_after| at_unix_ns <= not_after)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TlsCipherSuite(u16);
+
+impl TlsCipherSuite {
+    pub fn code(self) -> u16 {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TlsSessionSecretSummary {
@@ -79,47 +221,7 @@ enum TlsSessionSecretJsonErrorKind {
 
 impl TlsSessionSecretSummary {
     pub fn parse(bytes: &[u8]) -> Result<Self, TlsSessionSecretParseError> {
-        let content =
-            std::str::from_utf8(bytes).map_err(|_| TlsSessionSecretParseError::invalid_utf8())?;
-        let mut entries = 0_u64;
-        let mut protocol_counts = BTreeMap::<TlsSessionSecretProtocol, u64>::new();
-        let mut secret_kind_counts = BTreeMap::<TlsSessionSecretKind, u64>::new();
-        let mut secret_min_bytes = u64::MAX;
-        let mut secret_max_bytes = 0_u64;
-
-        for (index, line) in content.lines().enumerate() {
-            let line_number = index + 1;
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let record = TlsSessionSecretRecordWire::parse(line_number, line)?;
-            let secret_bytes = record.validate(line_number)? as u64;
-
-            entries += 1;
-            *protocol_counts.entry(record.protocol).or_default() += 1;
-            *secret_kind_counts.entry(record.secret_kind).or_default() += 1;
-            secret_min_bytes = secret_min_bytes.min(secret_bytes);
-            secret_max_bytes = secret_max_bytes.max(secret_bytes);
-        }
-
-        if entries == 0 {
-            return Err(TlsSessionSecretParseError::no_entries());
-        }
-
-        Ok(Self {
-            entries,
-            protocols: protocol_counts
-                .into_iter()
-                .map(|(protocol, count)| TlsSessionSecretProtocolCount { protocol, count })
-                .collect(),
-            secret_kinds: secret_kind_counts
-                .into_iter()
-                .map(|(secret_kind, count)| TlsSessionSecretKindCount { secret_kind, count })
-                .collect(),
-            secret_min_bytes,
-            secret_max_bytes,
-        })
+        TlsSessionSecretStore::parse(bytes).map(|store| store.summary())
     }
 }
 
@@ -137,7 +239,7 @@ impl TlsSessionSecretParseError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TlsSessionSecretRecordWire {
     protocol: TlsSessionSecretProtocol,
@@ -165,50 +267,66 @@ impl TlsSessionSecretRecordWire {
         })
     }
 
-    fn validate(&self, line_number: usize) -> Result<usize, TlsSessionSecretParseError> {
+    fn decode(
+        &self,
+        line_number: usize,
+    ) -> Result<TlsSessionSecretRecord, TlsSessionSecretParseError> {
         if !self.secret_kind.is_valid_for(self.protocol) {
             return Err(TlsSessionSecretParseError::new(
                 TlsSessionSecretParseErrorKind::InvalidSecretKindForProtocol { line_number },
             ));
         }
-        validate_fixed_hex_len(
+        let client_random = parse_random_field(
             &self.client_random,
             line_number,
             TlsSessionSecretField::ClientRandom,
-            RANDOM_BYTES,
         )?;
-        if let Some(server_random) = &self.server_random {
-            validate_fixed_hex_len(
-                server_random,
+        let server_random = self
+            .server_random
+            .as_deref()
+            .map(|server_random| {
+                parse_random_field(
+                    server_random,
+                    line_number,
+                    TlsSessionSecretField::ServerRandom,
+                )
+            })
+            .transpose()?;
+        let cipher_suite = self
+            .cipher_suite
+            .as_deref()
+            .map(|cipher_suite| parse_cipher_suite(line_number, cipher_suite))
+            .transpose()?;
+        validate_time_range(line_number, self.not_before_unix_ns, self.not_after_unix_ns)?;
+        let secret = TlsSecret::from_hex(&self.secret).ok_or_else(|| {
+            TlsSessionSecretParseError::new(TlsSessionSecretParseErrorKind::InvalidHex {
                 line_number,
-                TlsSessionSecretField::ServerRandom,
-                RANDOM_BYTES,
-            )?;
-        }
-        if let Some(cipher_suite) = &self.cipher_suite {
-            validate_cipher_suite(line_number, cipher_suite)?;
-        }
-        if let (Some(not_before), Some(not_after)) =
-            (self.not_before_unix_ns, self.not_after_unix_ns)
-            && not_after < not_before
-        {
-            return Err(TlsSessionSecretParseError::new(
-                TlsSessionSecretParseErrorKind::InvalidTimeRange { line_number },
-            ));
-        }
-        hex_len(&self.secret, line_number, TlsSessionSecretField::Secret)
+                field: TlsSessionSecretField::Secret,
+            })
+        })?;
+
+        Ok(TlsSessionSecretRecord {
+            protocol: self.protocol,
+            secret_kind: self.secret_kind,
+            client_random,
+            server_random,
+            cipher_suite,
+            secret,
+            not_before_unix_ns: self.not_before_unix_ns,
+            not_after_unix_ns: self.not_after_unix_ns,
+        })
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum TlsSessionSecretProtocol {
+pub enum TlsSessionSecretProtocol {
     Tls12,
     Tls13,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-enum TlsSessionSecretKind {
+pub enum TlsSessionSecretKind {
     #[serde(rename = "master_secret")]
     Master,
     #[serde(rename = "client_handshake_traffic_secret")]
@@ -224,7 +342,7 @@ enum TlsSessionSecretKind {
 }
 
 impl TlsSessionSecretKind {
-    fn is_valid_for(self, protocol: TlsSessionSecretProtocol) -> bool {
+    pub fn is_valid_for(self, protocol: TlsSessionSecretProtocol) -> bool {
         match protocol {
             TlsSessionSecretProtocol::Tls12 => matches!(self, Self::Master),
             TlsSessionSecretProtocol::Tls13 => matches!(
@@ -315,13 +433,27 @@ impl From<serde_json::error::Category> for TlsSessionSecretJsonErrorKind {
     }
 }
 
+fn parse_random_field(
+    value: &str,
+    line_number: usize,
+    field: TlsSessionSecretField,
+) -> Result<TlsRandom, TlsSessionSecretParseError> {
+    validate_fixed_hex_len(value, line_number, field, TLS_RANDOM_BYTES)?;
+    Ok(TlsRandom::from_hex(value).expect("random was validated before decoding"))
+}
+
 fn validate_fixed_hex_len(
     value: &str,
     line_number: usize,
     field: TlsSessionSecretField,
     expected_bytes: usize,
 ) -> Result<(), TlsSessionSecretParseError> {
-    let actual_bytes = hex_len(value, line_number, field)?;
+    let actual_bytes = hex_len(value).ok_or_else(|| {
+        TlsSessionSecretParseError::new(TlsSessionSecretParseErrorKind::InvalidHex {
+            line_number,
+            field,
+        })
+    })?;
     if actual_bytes != expected_bytes {
         return Err(TlsSessionSecretParseError::new(
             TlsSessionSecretParseErrorKind::InvalidFieldLength {
@@ -335,10 +467,10 @@ fn validate_fixed_hex_len(
     Ok(())
 }
 
-fn validate_cipher_suite(
+fn parse_cipher_suite(
     line_number: usize,
     cipher_suite: &str,
-) -> Result<(), TlsSessionSecretParseError> {
+) -> Result<TlsCipherSuite, TlsSessionSecretParseError> {
     let Some(hex) = cipher_suite.strip_prefix("0x") else {
         return Err(TlsSessionSecretParseError::new(
             TlsSessionSecretParseErrorKind::InvalidCipherSuite { line_number },
@@ -349,23 +481,27 @@ fn validate_cipher_suite(
             TlsSessionSecretParseErrorKind::InvalidCipherSuite { line_number },
         ));
     }
-    Ok(())
+    let code = u16::from_str_radix(hex, 16).map_err(|_| {
+        TlsSessionSecretParseError::new(TlsSessionSecretParseErrorKind::InvalidCipherSuite {
+            line_number,
+        })
+    })?;
+    Ok(TlsCipherSuite(code))
 }
 
-fn hex_len(
-    value: &str,
+fn validate_time_range(
     line_number: usize,
-    field: TlsSessionSecretField,
-) -> Result<usize, TlsSessionSecretParseError> {
-    if value.is_empty()
-        || !value.len().is_multiple_of(2)
-        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    not_before_unix_ns: Option<u64>,
+    not_after_unix_ns: Option<u64>,
+) -> Result<(), TlsSessionSecretParseError> {
+    if let (Some(not_before), Some(not_after)) = (not_before_unix_ns, not_after_unix_ns)
+        && not_after < not_before
     {
         return Err(TlsSessionSecretParseError::new(
-            TlsSessionSecretParseErrorKind::InvalidHex { line_number, field },
+            TlsSessionSecretParseErrorKind::InvalidTimeRange { line_number },
         ));
     }
-    Ok(value.len() / 2)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -373,10 +509,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_jsonl_session_secret_file_without_retaining_secret_bytes() {
-        let client_random_a = "00".repeat(RANDOM_BYTES);
-        let client_random_b = "11".repeat(RANDOM_BYTES);
-        let server_random = "22".repeat(RANDOM_BYTES);
+    fn parses_jsonl_session_secret_file_and_summarizes_without_serializing_secret_bytes() {
+        let client_random_a = "00".repeat(TLS_RANDOM_BYTES);
+        let client_random_b = "11".repeat(TLS_RANDOM_BYTES);
+        let server_random = "22".repeat(TLS_RANDOM_BYTES);
         let client_secret = "aa".repeat(32);
         let master_secret = "bb".repeat(48);
         let material = format!(
@@ -386,8 +522,9 @@ mod tests {
 "#
         );
 
-        let summary =
-            TlsSessionSecretSummary::parse(material.as_bytes()).expect("valid session secret file");
+        let store =
+            TlsSessionSecretStore::parse(material.as_bytes()).expect("valid session secret file");
+        let summary = store.summary();
 
         assert_eq!(summary.entries, 2);
         assert_eq!(
@@ -418,6 +555,51 @@ mod tests {
         );
         assert_eq!(summary.secret_min_bytes, 32);
         assert_eq!(summary.secret_max_bytes, 48);
+        let random = TlsRandom::from_hex(&client_random_a).expect("valid client random");
+        let TlsMaterialLookup::Found(record) = store.lookup(
+            TlsSessionSecretProtocol::Tls13,
+            TlsSessionSecretKind::ClientApplicationTraffic,
+            &random,
+            Some(15),
+        ) else {
+            panic!("valid record by client random and time must be uniquely available");
+        };
+        assert_eq!(record.secret().as_bytes(), vec![0xaa; 32]);
+        assert_eq!(record.cipher_suite().expect("cipher suite").code(), 0x1301);
+        assert!(record.server_random().is_some());
+        assert_eq!(
+            store.lookup(
+                TlsSessionSecretProtocol::Tls13,
+                TlsSessionSecretKind::ClientApplicationTraffic,
+                &random,
+                Some(21),
+            ),
+            TlsMaterialLookup::Missing
+        );
+        assert!(!format!("{record:?}").contains(&client_secret));
+    }
+
+    #[test]
+    fn lookup_reports_overlapping_validity_as_ambiguous() {
+        let client_random = "00".repeat(TLS_RANDOM_BYTES);
+        let material = format!(
+            r#"
+{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{client_random}","secret":"aa","not_before_unix_ns":10,"not_after_unix_ns":20}}
+{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{client_random}","secret":"bb","not_before_unix_ns":15,"not_after_unix_ns":25}}
+"#
+        );
+        let store =
+            TlsSessionSecretStore::parse(material.as_bytes()).expect("valid session secret file");
+        let random = TlsRandom::from_hex(&client_random).expect("valid client random");
+
+        let lookup = store.lookup(
+            TlsSessionSecretProtocol::Tls13,
+            TlsSessionSecretKind::ClientApplicationTraffic,
+            &random,
+            Some(16),
+        );
+
+        assert_eq!(lookup, TlsMaterialLookup::Ambiguous { matches: 2 });
     }
 
     #[test]
@@ -430,7 +612,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_secret_hex_without_leaking_secret_value() {
-        let client_random = "00".repeat(RANDOM_BYTES);
+        let client_random = "00".repeat(TLS_RANDOM_BYTES);
         let material = format!(
             r#"{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{client_random}","secret":"not-a-secret"}}"#
         );
@@ -450,7 +632,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_json_without_leaking_input_fragments() {
-        let client_random = "00".repeat(RANDOM_BYTES);
+        let client_random = "00".repeat(TLS_RANDOM_BYTES);
         let material = format!(
             r#"{{"protocol":"sensitive-protocol-value","secret_kind":"client_application_traffic_secret","client_random":"{client_random}","secret":"aa"}}"#
         );
@@ -481,7 +663,7 @@ mod tests {
             TlsSessionSecretParseErrorKind::InvalidFieldLength {
                 line_number: 1,
                 field: TlsSessionSecretField::ClientRandom,
-                expected_bytes: RANDOM_BYTES,
+                expected_bytes: TLS_RANDOM_BYTES,
                 actual_bytes: 3,
             }
         );
@@ -489,7 +671,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_time_range() {
-        let client_random = "00".repeat(RANDOM_BYTES);
+        let client_random = "00".repeat(TLS_RANDOM_BYTES);
         let material = format!(
             r#"{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{client_random}","secret":"aa","not_before_unix_ns":20,"not_after_unix_ns":10}}"#
         );
@@ -505,7 +687,7 @@ mod tests {
 
     #[test]
     fn rejects_tls12_record_with_tls13_traffic_secret_kind() {
-        let client_random = "00".repeat(RANDOM_BYTES);
+        let client_random = "00".repeat(TLS_RANDOM_BYTES);
         let material = format!(
             r#"{{"protocol":"tls12","secret_kind":"client_application_traffic_secret","client_random":"{client_random}","secret":"aa"}}"#
         );
@@ -521,7 +703,7 @@ mod tests {
 
     #[test]
     fn rejects_tls13_record_with_tls12_master_secret_kind() {
-        let client_random = "00".repeat(RANDOM_BYTES);
+        let client_random = "00".repeat(TLS_RANDOM_BYTES);
         let material = format!(
             r#"{{"protocol":"tls13","secret_kind":"master_secret","client_random":"{client_random}","secret":"aa"}}"#
         );

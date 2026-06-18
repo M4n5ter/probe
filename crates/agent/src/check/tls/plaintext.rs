@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use capture::{TlsKeyLogSummary, TlsSessionSecretSummary};
+use capture::{TlsKeyLog, TlsKeyLogSummary, TlsSessionSecretStore, TlsSessionSecretSummary};
 use probe_config::TlsMaterialKind;
 use runtime::{RuntimePlan, TlsPlaintextMaterialPlan};
 use serde::Serialize;
@@ -95,7 +95,8 @@ fn check_key_log_materials(
         .iter()
         .map(|material| {
             let bytes = read_plaintext_material(material, file_store)?;
-            let summary = TlsKeyLogSummary::parse(&bytes)
+            let summary = TlsKeyLog::parse(&bytes)
+                .map(|key_log| key_log.summary())
                 .map_err(|source| tls_plaintext_material_error(material, source))?;
             Ok(TlsPlaintextMaterialCheckSnapshot {
                 id: material.id.clone(),
@@ -115,7 +116,8 @@ fn check_session_secret_materials(
         .iter()
         .map(|material| {
             let bytes = read_plaintext_material(material, file_store)?;
-            let summary = TlsSessionSecretSummary::parse(&bytes)
+            let summary = TlsSessionSecretStore::parse(&bytes)
+                .map(|store| store.summary())
                 .map_err(|source| tls_plaintext_material_error(material, source))?;
             Ok(TlsPlaintextMaterialCheckSnapshot {
                 id: material.id.clone(),

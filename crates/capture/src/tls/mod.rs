@@ -4,6 +4,7 @@ mod attach_reconcile;
 mod discovery;
 mod keylog;
 mod plaintext;
+mod secret;
 mod session_secret;
 
 pub use attach_inventory::{
@@ -24,11 +25,19 @@ pub use discovery::{
     LibsslUprobeSymbolRole, LibsslUprobeTarget, LibsslUprobeTargetDiscovery,
     LibsslUprobeTargetDiscoveryReport,
 };
-pub use keylog::{TlsKeyLogField, TlsKeyLogLabelCount, TlsKeyLogParseError, TlsKeyLogSummary};
+pub use keylog::{
+    TlsKeyLog, TlsKeyLogEntry, TlsKeyLogField, TlsKeyLogLabel, TlsKeyLogLabelCount,
+    TlsKeyLogParseError, TlsKeyLogSummary,
+};
 pub use plaintext::{
     LibsslResolvedFlow, LibsslUprobeFlowLookup, LibsslUprobeFlowResolver,
     LibsslUprobePlaintextOpen, LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
     LibsslUprobePlaintextReconcile, LibsslUprobeReconcileTargetBucket,
     MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET,
 };
-pub use session_secret::{TlsSessionSecretParseError, TlsSessionSecretSummary};
+pub(in crate::tls) use secret::{TLS_RANDOM_BYTES, decode_hex, hex_len, resolve_lookup};
+pub use secret::{TlsMaterialLookup, TlsRandom, TlsSecret};
+pub use session_secret::{
+    TlsCipherSuite, TlsSessionSecretKind, TlsSessionSecretParseError, TlsSessionSecretProtocol,
+    TlsSessionSecretRecord, TlsSessionSecretStore, TlsSessionSecretSummary,
+};

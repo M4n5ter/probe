@@ -1,3 +1,6 @@
-mod summary;
+mod material;
 
-pub use summary::{TlsSessionSecretParseError, TlsSessionSecretSummary};
+pub use material::{
+    TlsCipherSuite, TlsSessionSecretKind, TlsSessionSecretParseError, TlsSessionSecretProtocol,
+    TlsSessionSecretRecord, TlsSessionSecretStore, TlsSessionSecretSummary,
+};
