@@ -9,11 +9,8 @@ use crate::{
 };
 
 use super::{
-    material::TlsSessionSecretRecord,
-    stream::{
-        Tls13SessionSecretStreamAdapter, Tls13SessionSecretStreamCursor,
-        Tls13SessionSecretStreamError,
-    },
+    binding::Tls13SessionSecretFlowBinding,
+    stream::{Tls13SessionSecretStreamAdapter, Tls13SessionSecretStreamError},
 };
 
 #[derive(Debug, Default)]
@@ -143,43 +140,6 @@ impl Tls13SessionSecretFlowDecryptor {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Tls13SessionSecretFlowBinding<'a> {
-    record: &'a TlsSessionSecretRecord,
-    flow: FlowContext,
-    direction: Direction,
-    cursor: Tls13SessionSecretStreamCursor,
-}
-
-impl<'a> Tls13SessionSecretFlowBinding<'a> {
-    pub fn start(
-        record: &'a TlsSessionSecretRecord,
-        flow: FlowContext,
-        direction: Direction,
-    ) -> Self {
-        Self::resume_at(
-            record,
-            flow,
-            direction,
-            Tls13SessionSecretStreamCursor::start(),
-        )
-    }
-
-    pub fn resume_at(
-        record: &'a TlsSessionSecretRecord,
-        flow: FlowContext,
-        direction: Direction,
-        cursor: Tls13SessionSecretStreamCursor,
-    ) -> Self {
-        Self {
-            record,
-            flow,
-            direction,
-            cursor,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Tls13SessionSecretStreamKey {
     flow: FlowIdentity,
@@ -235,7 +195,8 @@ mod tests {
     };
 
     use super::super::{
-        Tls13InnerContentType, TlsSessionSecretStore, decrypt::protect_tls13_test_record,
+        Tls13InnerContentType, Tls13SessionSecretStreamCursor, TlsSessionSecretStore,
+        decrypt::protect_tls13_test_record, material::TlsSessionSecretRecord,
     };
     use super::*;
     use crate::{CapturedBytes, CapturedGap, EnforcementEvidencePropagation};
@@ -250,10 +211,11 @@ mod tests {
         let record = session_secret_record()?;
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
-        decryptor.bind(Tls13SessionSecretFlowBinding::start(
+        decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
             &record,
             flow.clone(),
             Direction::Outbound,
+            Tls13SessionSecretStreamCursor::start(),
         ))?;
         let wire_record = protected_application_record(&record, 0, b"GET / HTTP/1.1\r\n\r\n")?;
 
@@ -381,10 +343,11 @@ mod tests {
         let record = session_secret_record()?;
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
-        decryptor.bind(Tls13SessionSecretFlowBinding::start(
+        decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
             &record,
             flow.clone(),
             Direction::Outbound,
+            Tls13SessionSecretStreamCursor::start(),
         ))?;
 
         let events = decryptor.push_capture_event(&CaptureEvent::ConnectionClosed {
@@ -418,10 +381,11 @@ mod tests {
         let record = session_secret_record()?;
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
-        decryptor.bind(Tls13SessionSecretFlowBinding::start(
+        decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
             &record,
             flow.clone(),
             Direction::Outbound,
+            Tls13SessionSecretStreamCursor::start(),
         ))?;
         let wire_record = protected_application_record(&record, 0, b"truncated")?;
         let split_at = 8;

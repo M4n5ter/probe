@@ -1,3 +1,4 @@
+mod binding;
 mod decrypt;
 mod flow;
 mod frame;
@@ -5,13 +6,15 @@ mod material;
 mod plaintext;
 mod stream;
 
+pub use binding::{
+    Tls13ApplicationTrafficSecretKind, Tls13SessionSecretFlowBinding,
+    Tls13SessionSecretFlowBindingPlanError, Tls13SessionSecretFlowBindingPlanner,
+    Tls13SessionSecretFlowCandidate, TlsSessionSecretLookupTime, TlsSessionSecretLookupTimeError,
+};
 pub use decrypt::{
     Tls13ApplicationDataDecryptor, Tls13DecryptError, Tls13DecryptedRecord, Tls13InnerContentType,
 };
-pub use flow::{
-    Tls13SessionSecretFlowBinding, Tls13SessionSecretFlowDecryptError,
-    Tls13SessionSecretFlowDecryptor,
-};
+pub use flow::{Tls13SessionSecretFlowDecryptError, Tls13SessionSecretFlowDecryptor};
 pub use material::{
     TlsCipherSuite, TlsSessionSecretKind, TlsSessionSecretParseError, TlsSessionSecretProtocol,
     TlsSessionSecretRecord, TlsSessionSecretStore, TlsSessionSecretSummary,

@@ -41,13 +41,13 @@ impl TlsSessionSecretStore {
         protocol: TlsSessionSecretProtocol,
         secret_kind: TlsSessionSecretKind,
         client_random: &TlsRandom,
-        at_unix_ns: Option<u64>,
+        at_wall_time_unix_ns: Option<u64>,
     ) -> TlsMaterialLookup<'_, TlsSessionSecretRecord> {
         resolve_lookup(self.records.iter().filter(|record| {
             record.protocol == protocol
                 && record.secret_kind == secret_kind
                 && record.client_random == *client_random
-                && record.is_valid_at(at_unix_ns)
+                && record.is_valid_at(at_wall_time_unix_ns)
         }))
     }
 
@@ -126,15 +126,15 @@ impl TlsSessionSecretRecord {
         self.not_after_unix_ns
     }
 
-    pub fn is_valid_at(&self, at_unix_ns: Option<u64>) -> bool {
-        let Some(at_unix_ns) = at_unix_ns else {
+    pub fn is_valid_at(&self, at_wall_time_unix_ns: Option<u64>) -> bool {
+        let Some(at_wall_time_unix_ns) = at_wall_time_unix_ns else {
             return true;
         };
         self.not_before_unix_ns
-            .is_none_or(|not_before| at_unix_ns >= not_before)
+            .is_none_or(|not_before| at_wall_time_unix_ns >= not_before)
             && self
                 .not_after_unix_ns
-                .is_none_or(|not_after| at_unix_ns <= not_after)
+                .is_none_or(|not_after| at_wall_time_unix_ns <= not_after)
     }
 }
 
