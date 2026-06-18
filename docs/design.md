@@ -1405,7 +1405,8 @@ Runtime/config/status 验证覆盖：
 6. 运行 `cargo run -p xtask --locked -- e2e-file-exporter`，验证 plaintext feed 产生的 HTTP/policy export events 通过 configured file exporter 在 bounded run tail drain 中以 zstd-compressed protobuf batch 写入 JSON Lines file record，解码后 local-file sink cursor 前进且该 sink 没有 pending records。
 7. 以 root/CAP_NET_RAW 运行 `sudo target/debug/xtask e2e-admin-policy-reload`，验证真实 `agent run` 通过 admin Unix socket 在线 reload policy bundle 后，新旧两批 live HTTP 流量分别命中旧/新 active policy set，且后续请求不会继续使用旧 policy。
 8. 以 root/CAP_NET_RAW 运行 `sudo target/debug/xtask e2e-admin-enforcement-reload`，验证真实 `agent run` 通过 admin Unix socket 在线 reload enforcement manifest 后，后续 live HTTP 流量使用新的 effective selector 和 protective action profile，并从 durable export queue 读回 reload 前后的 enforcement decisions。
-9. 后续 SSE/overload E2E 覆盖 streaming response、metrics 中无静默 gap；如人为制造过载，则出现明确 degraded/gap。
+9. 以 root/bpffs 环境运行 `sudo target/debug/xtask e2e-tls-plaintext-target-lifecycle-loopback`，验证真实 agent 中 libssl plaintext sidecar 在同一生命周期内先清理退出的旧 target，再发现并 attach 复用同一监听端口的新 target，并从 durable output 读回旧/新 PID 的 TLS plaintext HTTP request 和各自 policy alert。
+10. 后续 SSE/overload E2E 覆盖 streaming response、metrics 中无静默 gap；如人为制造过载，则出现明确 degraded/gap。
 
 当前 TLS 已验证边界：
 
@@ -1416,11 +1417,12 @@ Runtime/config/status 验证覆盖：
 5. best-effort attach readiness 要求同一 process/library target 上 fd association recipe 与 plaintext recipe 都完整。
 6. flow 未解析时输出 degraded unknown-flow bytes/gap 仍必须经过 output selector gate；解析成功的 libssl bytes 仍标记 degraded。
 7. online admin status 能显示 TLS sidecar runtime pending/enabled/disabled，并在 disabled 时暴露原因。
-8. ABI/object/loader 层已验证 TLS artifact 通过 `SSSA_TLS_STATE_EPOCHS[0]` 和 state-epoch-bound fd/offset keys 表达 sidecar 级 TLS state lifecycle；initial attach、空 sidecar 首次 attach 和 stale-detach 后继续保留 target 的路径会写入新的非零 epoch，stale detach 前会先写 `0` 关闭 gate，return probe 会用 best-effort epoch gate 防止旧 `SSL*` map state 跨普通 attach lifecycle 被继续解释。目标进程运行中替换或重新映射 libssl 的 stale+new 路径仍需要单独 privileged E2E。
+8. ABI/object/loader 层已验证 TLS artifact 通过 `SSSA_TLS_STATE_EPOCHS[0]` 和 state-epoch-bound fd/offset keys 表达 sidecar 级 TLS state lifecycle；initial attach、空 sidecar 首次 attach 和 stale-detach 后继续保留 target 的路径会写入新的非零 epoch，stale detach 前会先写 `0` 关闭 gate，return probe 会用 best-effort epoch gate 防止旧 `SSL*` map state 跨普通 attach lifecycle 被继续解释。
+9. `xtask e2e-tls-plaintext-target-lifecycle-loopback` 在真实 agent + libpcap primary + libssl plaintext sidecar 下覆盖同一 agent 生命周期内旧 fixture target 退出、admin status 后续报告旧 PID detached 或 active 清除、新 fixture target 使用同一端口启动、后续 reconcile 报告新 PID active；随后触发新流量，并从 durable ingress/export 读回两批 PID 的 libssl plaintext HTTP request 和各自 policy alert。该入口证明真实 sidecar runtime 的两阶段 stale process cleanup、new process attach、selector gate 与 durable parser/policy 链路能跨旧/新进程 target 工作；它不直接观察 `SSSA_TLS_STATE_EPOCHS` 写 `0` 或新 epoch，也不等同于同一目标进程内替换或重新映射 libssl。
 
 后续 privileged TLS 验收：
 
-1. 覆盖目标进程运行中替换或重新映射 libssl 后的 stale+new target 生命周期。
+1. 覆盖目标进程运行中替换或重新映射 libssl 后的同进程 stale+new library target 生命周期。
 2. 覆盖 provider disabled 健康面与 last successful reconcile fact 的组合语义。
 3. 覆盖强 fd ownership 边界，避免把 `FD_VALID` 误升级为强 socket 生命周期证明。
 

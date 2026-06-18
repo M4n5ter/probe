@@ -4,15 +4,18 @@ use std::{
     fmt, fs,
     fs::OpenOptions,
     io,
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 const COORDINATION_TIMEOUT: Duration = Duration::from_secs(30);
+const LOOPBACK_LISTENER_BACKLOG: i32 = 128;
 const READY_FILE_TEMP_ATTEMPTS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,8 +74,21 @@ impl Error for LoopbackError {
 }
 
 pub(crate) fn bind_loopback_listener(listen_port: u16) -> Result<TcpListener, LoopbackError> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, listen_port))
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|source| io_error("create loopback TCP listener socket", source))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|source| io_error("set listener SO_REUSEADDR", source))?;
+    socket
+        .bind(&SockAddr::from(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            listen_port,
+        )))
         .map_err(|source| io_error("bind loopback TCP listener", source))?;
+    socket
+        .listen(LOOPBACK_LISTENER_BACKLOG)
+        .map_err(|source| io_error("listen on loopback TCP listener", source))?;
+    let listener = TcpListener::from(socket);
     listener
         .set_nonblocking(true)
         .map_err(|source| io_error("set listener nonblocking", source))?;

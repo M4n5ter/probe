@@ -82,6 +82,10 @@ const COMMANDS: &[XtaskCommand] = &[
         run: e2e::run_tls_plaintext_loopback,
     },
     XtaskCommand {
+        name: "e2e-tls-plaintext-target-lifecycle-loopback",
+        run: e2e::run_tls_plaintext_target_lifecycle_loopback,
+    },
+    XtaskCommand {
         name: "e2e-tls-plaintext-provider-loopback",
         run: e2e::run_tls_plaintext_provider_loopback,
     },

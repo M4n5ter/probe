@@ -16,3 +16,4 @@ workspace = true
 e2e-libssl-ffi = { version = "0.1.0", path = "../e2e-libssl-ffi" }
 openssl = "0.10"
 rustix = { version = "1.1", features = ["net"] }
+socket2 = { version = "0.6", features = ["all"] }

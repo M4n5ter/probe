@@ -541,6 +541,7 @@ dependencies = [
  "e2e-libssl-ffi",
  "openssl",
  "rustix",
+ "socket2",
 ]
 
 [[package]]
