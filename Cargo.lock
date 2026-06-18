@@ -309,6 +309,7 @@ dependencies = [
  "pcap",
  "probe-core",
  "probe-io",
+ "ring",
  "rustix",
  "serde",
  "serde_json",

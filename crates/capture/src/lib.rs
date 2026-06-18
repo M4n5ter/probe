@@ -43,6 +43,7 @@ pub use tls::{
     LibsslUprobeReconcileTargetBucket, LibsslUprobeSymbol, LibsslUprobeSymbolFailure,
     LibsslUprobeSymbolRole, LibsslUprobeTarget, LibsslUprobeTargetDiscovery,
     LibsslUprobeTargetDiscoveryReport, MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET,
+    Tls13ApplicationDataDecryptor, Tls13DecryptError, Tls13DecryptedRecord, Tls13InnerContentType,
     TlsCipherSuite, TlsKeyLog, TlsKeyLogEntry, TlsKeyLogField, TlsKeyLogLabel, TlsKeyLogLabelCount,
     TlsKeyLogParseError, TlsKeyLogSummary, TlsMaterialLookup, TlsRandom, TlsSecret,
     TlsSessionSecretKind, TlsSessionSecretParseError, TlsSessionSecretProtocol,
