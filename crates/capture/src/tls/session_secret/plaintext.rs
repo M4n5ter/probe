@@ -72,11 +72,24 @@ impl Tls13SessionSecretPlaintextAdapter {
         timestamp: Timestamp,
         wire_record: &[u8],
     ) -> Result<Option<PlaintextEvent>, Tls13SessionSecretPlaintextError> {
-        let decrypted = self.decryptor.decrypt_next_record(wire_record)?;
+        let sequence_number = self.decryptor.sequence_number();
+        let next_sequence_number = sequence_number
+            .checked_add(1)
+            .ok_or(Tls13DecryptError::SequenceNumberExhausted)?;
+        let decrypted = self
+            .decryptor
+            .decrypt_record_at(sequence_number, wire_record)?;
         if !decrypted.content_type().is_application_data() || decrypted.plaintext().is_empty() {
+            self.decryptor.set_sequence_number(next_sequence_number);
             return Ok(None);
         }
         let plaintext_len = decrypted.plaintext().len() as u64;
+        let next_stream_offset = self.next_stream_offset.checked_add(plaintext_len).ok_or(
+            Tls13SessionSecretPlaintextError::PlaintextOffsetExhausted {
+                offset: self.next_stream_offset,
+                plaintext_len,
+            },
+        )?;
         let mut chunk = PlaintextChunk::new(
             timestamp,
             self.flow.clone(),
@@ -87,7 +100,8 @@ impl Tls13SessionSecretPlaintextAdapter {
         if let Some(reason) = &self.degradation_reason {
             chunk = chunk.with_degradation(reason.clone());
         }
-        self.next_stream_offset = self.next_stream_offset.saturating_add(plaintext_len);
+        self.decryptor.set_sequence_number(next_sequence_number);
+        self.next_stream_offset = next_stream_offset;
         Ok(Some(PlaintextEvent::bytes(
             PlaintextSource::TlsSessionSecret,
             chunk,
@@ -104,6 +118,10 @@ pub enum Tls13SessionSecretPlaintextError {
         #[from]
         source: Tls13DecryptError,
     },
+    #[error(
+        "TLS 1.3 session secret plaintext adapter exhausted plaintext offset: offset={offset}, plaintext_len={plaintext_len}"
+    )]
+    PlaintextOffsetExhausted { offset: u64, plaintext_len: u64 },
 }
 
 #[cfg(test)]
@@ -211,6 +229,43 @@ mod tests {
         );
         assert_eq!(adapter.sequence_number(), 0);
         assert_eq!(adapter.next_stream_offset(), 99);
+        Ok(())
+    }
+
+    #[test]
+    fn plaintext_offset_exhaustion_does_not_advance_plaintext_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let record = session_secret_record(
+            TlsSessionSecretProtocol::Tls13,
+            TlsSessionSecretKind::ClientApplicationTraffic,
+            "0x1301",
+            SHA256_TRAFFIC_SECRET,
+        )?;
+        let start_offset = u64::MAX - PLAINTEXT.len() as u64 + 1;
+        let mut adapter = Tls13SessionSecretPlaintextAdapter::from_session_secret_record(
+            &record,
+            demo_flow(),
+            Direction::Outbound,
+        )?
+        .with_stream_offset(start_offset);
+        let timestamp = Timestamp {
+            monotonic_ns: 17,
+            wall_time_unix_ns: 23,
+        };
+
+        let error = adapter
+            .decrypt_next_record(timestamp, &hex(OPENSSL_AES_128_GCM_RECORD))
+            .expect_err("plaintext stream offset overflow must fail closed");
+
+        assert_eq!(
+            error,
+            Tls13SessionSecretPlaintextError::PlaintextOffsetExhausted {
+                offset: start_offset,
+                plaintext_len: PLAINTEXT.len() as u64,
+            }
+        );
+        assert_eq!(adapter.sequence_number(), 0);
+        assert_eq!(adapter.next_stream_offset(), start_offset);
         Ok(())
     }
 

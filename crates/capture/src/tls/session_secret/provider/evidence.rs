@@ -94,11 +94,13 @@ impl Tls13SessionSecretFlowRegistry {
     pub(super) fn record_plaintext_progress(&mut self, events: &[PlaintextEvent]) {
         for event in events {
             match &event.kind {
-                PlaintextEventKind::Bytes(bytes) => self.record_plaintext_offset(
-                    &bytes.flow.id,
-                    bytes.direction,
-                    bytes.stream_offset.saturating_add(bytes.bytes.len() as u64),
-                ),
+                PlaintextEventKind::Bytes(bytes) => {
+                    if let Some(next_offset) =
+                        bytes.stream_offset.checked_add(bytes.bytes.len() as u64)
+                    {
+                        self.record_plaintext_offset(&bytes.flow.id, bytes.direction, next_offset);
+                    }
+                }
                 PlaintextEventKind::Gap(gap) => self.record_plaintext_offset(
                     &gap.flow.id,
                     gap.gap.direction,
@@ -443,5 +445,129 @@ fn strongest_enforcement_evidence_propagation(
         EnforcementEvidencePropagation::Flow
     } else {
         EnforcementEvidencePropagation::Event
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use probe_core::{
+        AddressPort, ObservationOnlyReason, ProcessContext, ProcessIdentity, TransportProtocol,
+    };
+
+    use super::*;
+    use crate::PlaintextChunk;
+
+    #[test]
+    fn overflowing_plaintext_progress_keeps_previous_plaintext_offset() {
+        let flow = demo_flow();
+        let key = Tls13SessionSecretDecryptingStreamKey::new(flow.id.clone(), Direction::Outbound);
+        let timestamp = Timestamp {
+            monotonic_ns: 17,
+            wall_time_unix_ns: 23,
+        };
+        let mut registry = Tls13SessionSecretFlowRegistry::new();
+        registry.insert(key.clone(), flow.clone());
+        registry.observe_stream(
+            &key,
+            Tls13SessionSecretStreamObservation {
+                timestamp,
+                event_evidence: Tls13SessionSecretEventEvidence {
+                    enforcement_evidence: EnforcementEvidence::observation_only(
+                        ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
+                    ),
+                    enforcement_evidence_propagation: EnforcementEvidencePropagation::Flow,
+                },
+            },
+        );
+        registry.record_plaintext_progress(&[plaintext_bytes(
+            flow.clone(),
+            Direction::Outbound,
+            7,
+            b"abc",
+        )]);
+
+        registry.record_plaintext_progress(&[plaintext_bytes(
+            flow.clone(),
+            Direction::Outbound,
+            u64::MAX,
+            b"x",
+        )]);
+
+        let gaps =
+            registry.observation_only_gaps_before_plaintext_finalization(&flow, timestamp, &[]);
+        let [gap] = gaps.as_slice() else {
+            panic!("expected one observation-only plaintext gap: {gaps:?}");
+        };
+        let PlaintextEventKind::Gap(gap) = &gap.kind else {
+            panic!("expected plaintext gap: {gap:?}");
+        };
+        assert_eq!(gap.gap.expected_offset, 10);
+    }
+
+    fn plaintext_bytes(
+        flow: FlowContext,
+        direction: Direction,
+        stream_offset: u64,
+        bytes: &[u8],
+    ) -> PlaintextEvent {
+        PlaintextEvent::bytes(
+            PlaintextSource::TlsSessionSecret,
+            PlaintextChunk::new(
+                Timestamp {
+                    monotonic_ns: 17,
+                    wall_time_unix_ns: 23,
+                },
+                flow,
+                direction,
+                bytes,
+            )
+            .with_stream_offset(stream_offset),
+        )
+    }
+
+    fn demo_flow() -> FlowContext {
+        let process = ProcessIdentity {
+            pid: 1,
+            tgid: 1,
+            start_time_ticks: 1,
+            boot_id: "boot".to_string(),
+            exe_path: "/bin/demo".to_string(),
+            cmdline_hash: "hash".to_string(),
+            uid: 0,
+            gid: 0,
+            cgroup: None,
+            systemd_service: None,
+            container_id: None,
+            runtime_hint: None,
+        };
+        let local = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 12345,
+        };
+        let remote = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 443,
+        };
+        FlowContext {
+            id: FlowIdentity::stable(
+                &process,
+                &local,
+                &remote,
+                TransportProtocol::Tcp,
+                1,
+                Some(7),
+            ),
+            process: ProcessContext {
+                identity: process,
+                name: "demo".to_string(),
+                cmdline: vec!["demo".to_string()],
+            },
+            local,
+            remote,
+            protocol: TransportProtocol::Tcp,
+            start_monotonic_ns: 1,
+            socket_cookie: Some(7),
+            attribution_confidence: 100,
+        }
     }
 }

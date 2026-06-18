@@ -2,6 +2,7 @@ mod binding;
 mod decrypt;
 mod flow;
 mod frame;
+mod handshake;
 mod material;
 mod plaintext;
 mod provider;
@@ -16,6 +17,10 @@ pub use decrypt::{
     Tls13ApplicationDataDecryptor, Tls13DecryptError, Tls13DecryptedRecord, Tls13InnerContentType,
 };
 pub use flow::{Tls13SessionSecretFlowDecryptError, Tls13SessionSecretFlowDecryptor};
+pub use handshake::{
+    Tls13SessionSecretHandshakeObservation, Tls13SessionSecretHandshakeObservationKind,
+    Tls13SessionSecretHandshakeObserver,
+};
 pub use material::{
     TlsCipherSuite, TlsSessionSecretKind, TlsSessionSecretParseError, TlsSessionSecretProtocol,
     TlsSessionSecretRecord, TlsSessionSecretStore, TlsSessionSecretSummary,

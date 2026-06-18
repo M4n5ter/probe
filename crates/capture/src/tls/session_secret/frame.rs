@@ -1,11 +1,45 @@
 use super::decrypt::Tls13DecryptError;
 
-pub(in crate::tls::session_secret) const TLS13_RECORD_HEADER_BYTES: usize = 5;
+pub(in crate::tls::session_secret) const TLS_RECORD_HEADER_BYTES: usize = 5;
+pub(in crate::tls::session_secret) const TLS13_RECORD_HEADER_BYTES: usize = TLS_RECORD_HEADER_BYTES;
 pub(in crate::tls::session_secret) const TLS13_LEGACY_RECORD_VERSION: [u8; 2] = [0x03, 0x03];
 pub(in crate::tls::session_secret) const TLS13_OUTER_APPLICATION_DATA: u8 = 0x17;
 pub(in crate::tls::session_secret) const TLS13_MAX_FRAGMENT_BYTES: usize = 16 * 1024;
 pub(in crate::tls::session_secret) const TLS13_MAX_CIPHERTEXT_FRAGMENT_BYTES: usize =
     TLS13_MAX_FRAGMENT_BYTES + 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tls::session_secret) struct TlsRecordHeader {
+    content_type: u8,
+    legacy_version: [u8; 2],
+    payload_len: usize,
+}
+
+impl TlsRecordHeader {
+    pub(in crate::tls::session_secret) fn from_buffer(buffer: &[u8]) -> Option<Self> {
+        Self::parse(buffer.get(..TLS_RECORD_HEADER_BYTES)?)
+    }
+
+    pub(in crate::tls::session_secret) fn parse(header: &[u8]) -> Option<Self> {
+        Some(Self {
+            content_type: *header.first()?,
+            legacy_version: [*header.get(1)?, *header.get(2)?],
+            payload_len: u16::from_be_bytes([*header.get(3)?, *header.get(4)?]) as usize,
+        })
+    }
+
+    pub(in crate::tls::session_secret) fn content_type(self) -> u8 {
+        self.content_type
+    }
+
+    pub(in crate::tls::session_secret) fn legacy_version(self) -> [u8; 2] {
+        self.legacy_version
+    }
+
+    pub(in crate::tls::session_secret) fn payload_len(self) -> usize {
+        self.payload_len
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::tls::session_secret) struct Tls13RecordFrame<'a> {
@@ -20,8 +54,10 @@ impl<'a> Tls13RecordFrame<'a> {
         let header = record
             .get(..TLS13_RECORD_HEADER_BYTES)
             .ok_or(Tls13DecryptError::IncompleteRecordHeader)?;
-        validate_tls13_record_header(header)?;
-        let declared_bytes = tls13_record_payload_len(header);
+        let parsed_header =
+            TlsRecordHeader::parse(header).expect("TLS record header length was validated");
+        validate_tls13_record_header(parsed_header)?;
+        let declared_bytes = parsed_header.payload_len();
         let encrypted_payload = record
             .get(TLS13_RECORD_HEADER_BYTES..)
             .expect("header length was validated");
@@ -49,10 +85,10 @@ impl<'a> Tls13RecordFrame<'a> {
     }
 
     pub(in crate::tls::session_secret) fn buffered(buffer: &[u8]) -> Tls13BufferedRecord {
-        let Some(header) = buffer.get(..TLS13_RECORD_HEADER_BYTES) else {
+        let Some(header) = TlsRecordHeader::from_buffer(buffer) else {
             return Tls13BufferedRecord::Incomplete;
         };
-        let declared_bytes = tls13_record_payload_len(header);
+        let declared_bytes = header.payload_len();
         if let Err(error) = validate_tls13_record_payload_len(declared_bytes) {
             return Tls13BufferedRecord::Invalid { error };
         }
@@ -72,15 +108,15 @@ pub(in crate::tls::session_secret) enum Tls13BufferedRecord {
     Invalid { error: Tls13DecryptError },
 }
 
-fn validate_tls13_record_header(header: &[u8]) -> Result<(), Tls13DecryptError> {
-    if header[0] != TLS13_OUTER_APPLICATION_DATA {
+fn validate_tls13_record_header(header: TlsRecordHeader) -> Result<(), Tls13DecryptError> {
+    if header.content_type() != TLS13_OUTER_APPLICATION_DATA {
         return Err(Tls13DecryptError::UnsupportedOuterContentType {
-            content_type: header[0],
+            content_type: header.content_type(),
         });
     }
-    if header[1..3] != TLS13_LEGACY_RECORD_VERSION {
+    if header.legacy_version() != TLS13_LEGACY_RECORD_VERSION {
         return Err(Tls13DecryptError::UnsupportedLegacyVersion {
-            version: u16::from_be_bytes([header[1], header[2]]),
+            version: u16::from_be_bytes(header.legacy_version()),
         });
     }
     Ok(())
@@ -94,8 +130,4 @@ fn validate_tls13_record_payload_len(payload_len: usize) -> Result<(), Tls13Decr
         });
     }
     Ok(())
-}
-
-fn tls13_record_payload_len(header: &[u8]) -> usize {
-    u16::from_be_bytes([header[3], header[4]]) as usize
 }

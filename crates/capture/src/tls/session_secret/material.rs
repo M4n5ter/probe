@@ -142,6 +142,10 @@ impl TlsSessionSecretRecord {
 pub struct TlsCipherSuite(u16);
 
 impl TlsCipherSuite {
+    pub(in crate::tls::session_secret) fn from_code(code: u16) -> Self {
+        Self(code)
+    }
+
     pub fn code(self) -> u16 {
         self.0
     }
@@ -486,7 +490,7 @@ fn parse_cipher_suite(
             line_number,
         })
     })?;
-    Ok(TlsCipherSuite(code))
+    Ok(TlsCipherSuite::from_code(code))
 }
 
 fn validate_time_range(
