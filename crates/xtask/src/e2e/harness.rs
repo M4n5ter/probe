@@ -222,6 +222,13 @@ fn setpriv_command() -> Result<PathBuf, io::Error> {
     first_existing_system_command(["/usr/bin/setpriv", "/bin/setpriv"], "setpriv")
 }
 
+pub(crate) fn trusted_system_command<const N: usize>(
+    candidates: [&str; N],
+    name: &str,
+) -> Result<PathBuf, io::Error> {
+    first_existing_system_command(candidates, name)
+}
+
 fn first_existing_system_command<const N: usize>(
     candidates: [&str; N],
     name: &str,
@@ -541,7 +548,7 @@ fn cargo_dep_info_build_inputs(binary_path: &Path) -> Result<Vec<PathBuf>, io::E
             binary_path.display()
         ))
     })?;
-    let mut inputs = parse_dep_info_dependencies(&dep_info)
+    let inputs = parse_dep_info_dependencies(&dep_info)
         .into_iter()
         .map(|path| {
             if path.is_absolute() {
@@ -558,33 +565,7 @@ fn cargo_dep_info_build_inputs(binary_path: &Path) -> Result<Vec<PathBuf>, io::E
             binary_path.display()
         )));
     }
-    inputs.insert(root.join("Cargo.toml"));
-    for input in inputs.clone() {
-        add_scoped_manifest_inputs(&root, &input, &mut inputs);
-    }
     Ok(inputs.into_iter().collect())
-}
-
-fn add_scoped_manifest_inputs(root: &Path, input: &Path, inputs: &mut BTreeSet<PathBuf>) {
-    let Ok(relative) = input.strip_prefix(root) else {
-        return;
-    };
-    let mut components = relative.components();
-    let Some(first) = components.next() else {
-        return;
-    };
-    let Some(crate_name) = components.next() else {
-        return;
-    };
-    if first.as_os_str() != "crates" {
-        return;
-    }
-    let crate_root = root.join("crates").join(crate_name.as_os_str());
-    for path in [crate_root.join("Cargo.toml"), crate_root.join("build.rs")] {
-        if path.is_file() {
-            inputs.insert(path);
-        }
-    }
 }
 
 fn parse_dep_info_dependencies(contents: &str) -> Vec<PathBuf> {

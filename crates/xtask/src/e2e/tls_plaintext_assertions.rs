@@ -72,6 +72,22 @@ pub(super) fn assert_spool_outputs(
     Ok(())
 }
 
+pub(super) fn assert_spool_outputs_for_pid(
+    spool_path: &Path,
+    listen_port: u16,
+    expectations: TlsPlaintextExpectations,
+    expected_pid: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_spool_outputs_for_pids(
+        spool_path,
+        listen_port,
+        expectations,
+        [expected_pid],
+        1,
+        "dynamic libssl loopback",
+    )
+}
+
 pub(super) fn assert_target_lifecycle_spool_outputs(
     spool_path: &Path,
     listen_port: u16,
@@ -79,14 +95,39 @@ pub(super) fn assert_target_lifecycle_spool_outputs(
     old_pid: u32,
     new_pid: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    assert_spool_outputs_for_pids(
+        spool_path,
+        listen_port,
+        expectations,
+        [old_pid, new_pid],
+        2,
+        "target lifecycle loopback",
+    )
+}
+
+fn assert_spool_outputs_for_pids(
+    spool_path: &Path,
+    listen_port: u16,
+    expectations: TlsPlaintextExpectations,
+    expected_pids: impl IntoIterator<Item = u32>,
+    expected_runs: usize,
+    scenario: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected_pids = expected_pids.into_iter().collect::<BTreeSet<_>>();
     let spool = FjallSpool::open(spool_path)?;
     let ingress = spool.read_ingress_batch_after(0, 512)?;
     if ingress.is_empty() {
-        return Err(
-            e2e_error("expected target lifecycle TLS plaintext ingress records, got none").into(),
-        );
+        return Err(e2e_error(format!(
+            "expected {scenario} TLS plaintext ingress records, got none"
+        ))
+        .into());
     }
-    assert_tls_plaintext_ingress_for_pids(&ingress, listen_port, expectations, [old_pid, new_pid])?;
+    assert_tls_plaintext_ingress_for_pids(
+        &ingress,
+        listen_port,
+        expectations,
+        expected_pids.iter().copied(),
+    )?;
 
     let envelopes = spool
         .read_export_batch(E2E_EXPORT_CURSOR_OWNER, 1024)?
@@ -95,17 +136,16 @@ pub(super) fn assert_target_lifecycle_spool_outputs(
         .collect::<Result<Vec<_>, _>>()?;
     assert_no_policy_runtime_errors(&envelopes)?;
     assert_expected_requests(&envelopes, expectations)?;
-    assert_expected_request_pids(&envelopes, expectations, [old_pid, new_pid])?;
+    assert_expected_request_pids(&envelopes, expectations, expected_pids.iter().copied())?;
     assert_expected_policy_alerts(&envelopes, expectations)?;
-    assert_expected_policy_alert_pids(&envelopes, expectations, [old_pid, new_pid])?;
-    assert_expected_policy_alert_count(&envelopes, expectations, 2)?;
+    assert_expected_policy_alert_pids(&envelopes, expectations, expected_pids.iter().copied())?;
+    assert_expected_policy_alert_count(&envelopes, expectations, expected_runs)?;
 
     println!(
-        "e2e TLS plaintext target lifecycle loopback observed {} ingress records and {} export records across old pid {} and new pid {}",
+        "e2e TLS plaintext {scenario} observed {} ingress records and {} export records for pids {:?}",
         ingress.len(),
         envelopes.len(),
-        old_pid,
-        new_pid
+        expected_pids
     );
     Ok(())
 }

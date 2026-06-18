@@ -1,13 +1,8 @@
 use std::{
-    collections::BTreeSet,
     fs,
-    io::{BufRead, BufReader, Write},
     net::{Ipv4Addr, TcpListener},
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    process::{Child, ExitCode},
-    thread,
-    time::{Duration, Instant},
+    process::ExitCode,
 };
 
 use probe_config::{AgentConfig, CaptureSelection, PolicyConfig};
@@ -27,6 +22,10 @@ use super::{
     tls_plaintext_assertions::{
         TlsPlaintextExpectations, assert_spool_outputs, assert_target_lifecycle_spool_outputs,
     },
+    tls_plaintext_status::{
+        wait_for_tls_plaintext_active_target, wait_for_tls_plaintext_active_target_after_sequence,
+        wait_for_tls_plaintext_detached_target, wait_for_tls_plaintext_detached_target_status,
+    },
 };
 
 const INTERFACE: &str = "any";
@@ -39,9 +38,6 @@ const WRITE_CHUNKS: usize = 1;
 const POST_EXCHANGE_DELAY_MS: u64 = 500;
 const FIXTURE_EXE_GLOB: &str = "**/sssa-e2e-fixture";
 const TLS_RECONCILE_INTERVAL_MS: u64 = 100;
-const TLS_ATTACH_READY_TIMEOUT: Duration = Duration::from_secs(5);
-const TLS_TARGET_LIFECYCLE_READY_TIMEOUT: Duration = Duration::from_secs(8);
-const TLS_ATTACH_READY_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) fn run() -> ExitCode {
     match run_inner(Scenario::Startup) {
@@ -574,221 +570,4 @@ fn write_agent_config(
     });
     fs::write(&paths.config, toml::to_string(&config)?)?;
     Ok(())
-}
-
-fn wait_for_tls_plaintext_active_target(
-    agent: &mut Child,
-    admin_socket_path: &Path,
-    fixture_pid: u32,
-) -> Result<TlsPlaintextAttachStatus, Box<dyn std::error::Error>> {
-    wait_for_tls_plaintext_active_target_until(
-        agent,
-        admin_socket_path,
-        fixture_pid,
-        0,
-        TLS_ATTACH_READY_TIMEOUT,
-    )
-}
-
-fn wait_for_tls_plaintext_active_target_after_sequence(
-    agent: &mut Child,
-    admin_socket_path: &Path,
-    fixture_pid: u32,
-    sequence: u64,
-) -> Result<TlsPlaintextAttachStatus, Box<dyn std::error::Error>> {
-    wait_for_tls_plaintext_active_target_until(
-        agent,
-        admin_socket_path,
-        fixture_pid,
-        sequence,
-        TLS_TARGET_LIFECYCLE_READY_TIMEOUT,
-    )
-}
-
-fn wait_for_tls_plaintext_active_target_until(
-    agent: &mut Child,
-    admin_socket_path: &Path,
-    fixture_pid: u32,
-    min_sequence: u64,
-    timeout: Duration,
-) -> Result<TlsPlaintextAttachStatus, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let status = match read_tls_plaintext_status(admin_socket_path) {
-            Ok(status)
-                if status.sequence > min_sequence && status.has_active_target(fixture_pid) =>
-            {
-                return Ok(status);
-            }
-            Ok(status) => status,
-            Err(error) => {
-                if let Some(status) = agent.try_wait()? {
-                    return Err(e2e_error(format!(
-                        "agent exited with {status} before TLS plaintext attached to fixture pid {fixture_pid}: {error}"
-                    ))
-                    .into());
-                }
-                TlsPlaintextAttachStatus::error(error.to_string())
-            }
-        };
-        if Instant::now() >= deadline {
-            return Err(e2e_error(format!(
-                "timed out waiting for TLS plaintext active target pid {fixture_pid} after sequence {min_sequence}; last status: {}",
-                status.summary()
-            ))
-            .into());
-        }
-        thread::sleep(TLS_ATTACH_READY_INTERVAL);
-    }
-}
-
-fn wait_for_tls_plaintext_detached_target(
-    agent: &mut Child,
-    admin_socket_path: &Path,
-    fixture_pid: u32,
-    active_sequence: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    wait_for_tls_plaintext_detached_target_status(
-        agent,
-        admin_socket_path,
-        fixture_pid,
-        active_sequence,
-    )
-    .map(|_| ())
-}
-
-fn wait_for_tls_plaintext_detached_target_status(
-    agent: &mut Child,
-    admin_socket_path: &Path,
-    fixture_pid: u32,
-    active_sequence: u64,
-) -> Result<TlsPlaintextAttachStatus, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + TLS_ATTACH_READY_TIMEOUT;
-    loop {
-        let status = match read_tls_plaintext_status(admin_socket_path) {
-            Ok(status)
-                if status.sequence > active_sequence
-                    && (status.has_detached_target(fixture_pid)
-                        || (status.active == 0 && !status.has_active_target(fixture_pid))) =>
-            {
-                return Ok(status);
-            }
-            Ok(status) => status,
-            Err(error) => {
-                if let Some(status) = agent.try_wait()? {
-                    return Err(e2e_error(format!(
-                        "agent exited with {status} before TLS plaintext detached fixture pid {fixture_pid}: {error}"
-                    ))
-                    .into());
-                }
-                TlsPlaintextAttachStatus::error(error.to_string())
-            }
-        };
-        if Instant::now() >= deadline {
-            return Err(e2e_error(format!(
-                "timed out waiting for TLS plaintext detach of fixture pid {fixture_pid}; last status: {}",
-                status.summary()
-            ))
-            .into());
-        }
-        thread::sleep(TLS_ATTACH_READY_INTERVAL);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TlsPlaintextAttachStatus {
-    mode: Option<String>,
-    reason: Option<String>,
-    sequence: u64,
-    active: u64,
-    detached: u64,
-    active_pids: BTreeSet<u32>,
-    detached_pids: BTreeSet<u32>,
-    error: Option<String>,
-}
-
-impl TlsPlaintextAttachStatus {
-    fn error(error: String) -> Self {
-        Self {
-            mode: None,
-            reason: None,
-            sequence: 0,
-            active: 0,
-            detached: 0,
-            active_pids: BTreeSet::new(),
-            detached_pids: BTreeSet::new(),
-            error: Some(error),
-        }
-    }
-
-    fn has_active_target(&self, fixture_pid: u32) -> bool {
-        self.active_pids.contains(&fixture_pid)
-    }
-
-    fn has_detached_target(&self, fixture_pid: u32) -> bool {
-        self.detached_pids.contains(&fixture_pid)
-    }
-
-    fn summary(&self) -> String {
-        if let Some(error) = &self.error {
-            return format!("admin error: {error}");
-        }
-        format!(
-            "mode={:?} reason={:?} sequence={} active={} detached={} active_pids={:?} detached_pids={:?}",
-            self.mode,
-            self.reason,
-            self.sequence,
-            self.active,
-            self.detached,
-            self.active_pids,
-            self.detached_pids
-        )
-    }
-}
-
-fn read_tls_plaintext_status(
-    admin_socket_path: &Path,
-) -> Result<TlsPlaintextAttachStatus, Box<dyn std::error::Error>> {
-    let mut stream = UnixStream::connect(admin_socket_path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    stream.write_all(b"{\"command\":\"status\"}\n")?;
-
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
-    let value = serde_json::from_str::<serde_json::Value>(&line)?;
-    let runtime = &value["snapshot"]["tls"]["plaintext"]["instrumentation"]["runtime"];
-    let sequence = runtime["last_reconcile"]["sequence"]
-        .as_u64()
-        .unwrap_or_default();
-    let active = runtime["last_reconcile"]["target_counts"]["active"]
-        .as_u64()
-        .unwrap_or_default();
-    let detached = runtime["last_reconcile"]["target_counts"]["detached"]
-        .as_u64()
-        .unwrap_or_default();
-    let active_pids = runtime["last_reconcile"]["targets"]["active"]["targets"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|target| target["pid"].as_u64())
-        .filter_map(|pid| u32::try_from(pid).ok())
-        .collect::<BTreeSet<_>>();
-    let detached_pids = runtime["last_reconcile"]["targets"]["detached"]["targets"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|target| target["pid"].as_u64())
-        .filter_map(|pid| u32::try_from(pid).ok())
-        .collect::<BTreeSet<_>>();
-    Ok(TlsPlaintextAttachStatus {
-        mode: runtime["mode"].as_str().map(ToOwned::to_owned),
-        reason: runtime["reason"].as_str().map(ToOwned::to_owned),
-        sequence,
-        active,
-        detached,
-        active_pids,
-        detached_pids,
-        error: None,
-    })
 }
