@@ -7,12 +7,17 @@ use std::{
 use crate::{e2e, ebpf};
 
 pub(crate) fn run() -> ExitCode {
-    let Some(name) = env::args().nth(1) else {
+    let mut args = env::args().skip(1);
+    let Some(name) = args.next() else {
         print_usage();
         return ExitCode::FAILURE;
     };
+    let command_args = args.collect::<Vec<_>>();
     if let Some(command) = COMMANDS.iter().find(|command| command.name == name) {
-        return (command.run)();
+        return command.run(&command_args);
+    }
+    if let Some(status) = e2e::run_case_by_name(&name, &command_args) {
+        return status;
     }
 
     print_usage();
@@ -21,99 +26,67 @@ pub(crate) fn run() -> ExitCode {
 
 struct XtaskCommand {
     name: &'static str,
-    run: fn() -> ExitCode,
+    runner: XtaskRunner,
+}
+
+impl XtaskCommand {
+    const fn new(name: &'static str, run: fn() -> ExitCode) -> Self {
+        Self {
+            name,
+            runner: XtaskRunner::NoArgs(run),
+        }
+    }
+
+    const fn with_args(name: &'static str, run: fn(&[String]) -> ExitCode) -> Self {
+        Self {
+            name,
+            runner: XtaskRunner::WithArgs(run),
+        }
+    }
+
+    fn run(&self, args: &[String]) -> ExitCode {
+        self.runner.run(self.name, args)
+    }
+}
+
+enum XtaskRunner {
+    NoArgs(fn() -> ExitCode),
+    WithArgs(fn(&[String]) -> ExitCode),
+}
+
+impl XtaskRunner {
+    fn run(&self, name: &str, args: &[String]) -> ExitCode {
+        match self {
+            Self::NoArgs(run) => {
+                if !args.is_empty() {
+                    eprintln!("xtask command `{name}` does not accept arguments");
+                    return ExitCode::FAILURE;
+                }
+                run()
+            }
+            Self::WithArgs(run) => run(args),
+        }
+    }
 }
 
 const COMMANDS: &[XtaskCommand] = &[
-    XtaskCommand {
-        name: "check",
-        run: run_check,
-    },
-    XtaskCommand {
-        name: "check-host",
-        run: run_host_check,
-    },
-    XtaskCommand {
-        name: "check-all",
-        run: run_check_all,
-    },
-    XtaskCommand {
-        name: "check-ebpf",
-        run: ebpf::run_check,
-    },
-    XtaskCommand {
-        name: "ebpf-build",
-        run: ebpf::run_build,
-    },
-    XtaskCommand {
-        name: "e2e-admin-enforcement-reload",
-        run: e2e::run_admin_enforcement_reload,
-    },
-    XtaskCommand {
-        name: "e2e-admin-policy-reload",
-        run: e2e::run_admin_policy_reload,
-    },
-    XtaskCommand {
-        name: "e2e-ebpf-process-loopback",
-        run: e2e::run_ebpf_process_loopback,
-    },
-    XtaskCommand {
-        name: "e2e-file-exporter",
-        run: e2e::run_file_exporter,
-    },
-    XtaskCommand {
-        name: "e2e-libpcap-loopback",
-        run: e2e::run_libpcap_loopback,
-    },
-    XtaskCommand {
-        name: "e2e-plaintext-feed",
-        run: e2e::run_plaintext_feed,
-    },
-    XtaskCommand {
-        name: "e2e-remote-enforcement-policy",
-        run: e2e::run_remote_enforcement_policy,
-    },
-    XtaskCommand {
-        name: "e2e-tls-plaintext-dynamic-loopback",
-        run: e2e::run_tls_plaintext_dynamic_loopback,
-    },
-    XtaskCommand {
-        name: "e2e-tls-plaintext-dynamic-library-loopback",
-        run: e2e::run_tls_plaintext_dynamic_library_loopback,
-    },
-    XtaskCommand {
-        name: "e2e-tls-plaintext-loopback",
-        run: e2e::run_tls_plaintext_loopback,
-    },
-    XtaskCommand {
-        name: "e2e-tls-plaintext-target-lifecycle-loopback",
-        run: e2e::run_tls_plaintext_target_lifecycle_loopback,
-    },
-    XtaskCommand {
-        name: "e2e-tls-plaintext-provider-loopback",
-        run: e2e::run_tls_plaintext_provider_loopback,
-    },
-    XtaskCommand {
-        name: "e2e-transparent-tproxy-loopback",
-        run: e2e::run_transparent_tproxy_loopback,
-    },
-    XtaskCommand {
-        name: "e2e-webhook-exporter",
-        run: e2e::run_webhook_exporter,
-    },
-    XtaskCommand {
-        name: "e2e-websocket-plaintext-feed",
-        run: e2e::run_websocket_plaintext_feed,
-    },
+    XtaskCommand::new("check", run_check),
+    XtaskCommand::new("check-host", run_host_check),
+    XtaskCommand::new("check-all", run_check_all),
+    XtaskCommand::new("check-ebpf", ebpf::run_check),
+    XtaskCommand::new("ebpf-build", ebpf::run_build),
+    XtaskCommand::with_args("e2e-suite", e2e::run_suite),
 ];
 
 fn print_usage() {
     let commands = COMMANDS
         .iter()
         .map(|command| command.name)
+        .chain(e2e::case_names())
         .collect::<Vec<_>>()
         .join("|");
     eprintln!("usage: cargo run -p xtask -- <{commands}>");
+    eprintln!("       cargo run -p xtask -- e2e-suite --help");
 }
 
 fn run_check() -> ExitCode {

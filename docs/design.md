@@ -1398,17 +1398,30 @@ Runtime/config/status 验证覆盖：
 
 当前端到端验收：
 
-1. 运行 `cargo run -p xtask --locked -- e2e-plaintext-feed`，验证非特权 plaintext feed 到 agent durable output 的闭环。
-2. 运行 `cargo run -p xtask --locked -- e2e-websocket-plaintext-feed`，验证非特权 plaintext feed 中的 HTTP Upgrade、101 response 和 WebSocket frame 通过真实 agent 进入 parser、policy 和 durable output。
-3. 可先用普通用户运行 `cargo build -p agent -p e2e-fixture -p xtask --locked` 预构建，也可让 E2E entry 做降权 preflight；随后以 root/CAP_NET_RAW 运行 `sudo target/debug/xtask e2e-libpcap-loopback`，验证真实 libpcap fallback 捕获 loopback HTTP/1 traffic 后进入 agent durable output。
-4. 先运行 `cargo run -p xtask --locked -- ebpf-build` 生成 eBPF artifact，用户态 package 可手动预构建或由 E2E entry 做降权 preflight；再以 root/bpffs 环境运行 `sudo target/debug/xtask e2e-ebpf-process-loopback`，验证真实 eBPF process observation 捕获 loopback HTTP/1 traffic 后进入 agent durable output。
-5. 运行 `cargo run -p xtask --locked -- e2e-webhook-exporter`，验证 plaintext feed 产生的 HTTP/policy export events 通过 configured webhook exporter 在 bounded run tail drain 中以 gzip-compressed protobuf batch 发送到本地 receiver，receiver 返回 JSON structured ack 后 collector sink cursor 前进且该 sink 没有 pending records。
-6. 运行 `cargo run -p xtask --locked -- e2e-file-exporter`，验证 plaintext feed 产生的 HTTP/policy export events 通过 configured file exporter 在 bounded run tail drain 中以 zstd-compressed protobuf batch 写入 JSON Lines file record，解码后 local-file sink cursor 前进且该 sink 没有 pending records。
-7. 以 root/CAP_NET_RAW 运行 `sudo target/debug/xtask e2e-admin-policy-reload`，验证真实 `agent run` 通过 admin Unix socket 在线 reload policy bundle 后，新旧两批 live HTTP 流量分别命中旧/新 active policy set，且后续请求不会继续使用旧 policy。
-8. 以 root/CAP_NET_RAW 运行 `sudo target/debug/xtask e2e-admin-enforcement-reload`，验证真实 `agent run` 通过 admin Unix socket 在线 reload enforcement manifest 后，后续 live HTTP 流量使用新的 effective selector 和 protective action profile，并从 durable export queue 读回 reload 前后的 enforcement decisions。
-9. 以 root/bpffs 环境运行 `sudo target/debug/xtask e2e-tls-plaintext-target-lifecycle-loopback`，验证真实 agent 中 libssl plaintext sidecar 在同一生命周期内先清理退出的旧 target，再发现并 attach 复用同一监听端口的新 target，并从 durable output 读回旧/新 PID 的 TLS plaintext HTTP request 和各自 policy alert。
-10. 以 root/bpffs 环境运行 `sudo target/debug/xtask e2e-tls-plaintext-dynamic-library-loopback`，验证真实 agent 先看到同一 PID 无 active TLS target，再在该 PID `dlopen` libssl 后 attach 到具体 mapped path，并从 durable output 读回该 PID 的 TLS plaintext HTTP request 和 policy alert。
-11. 后续 SSE/overload E2E 覆盖 streaming response、metrics 中无静默 gap；如人为制造过载，则出现明确 degraded/gap。
+`xtask e2e-suite` 是当前端到端验证的统一入口。默认 `cargo run -p xtask --locked -- e2e-suite` 只运行非特权 case，覆盖 plaintext feed、WebSocket handoff/frame、webhook exporter、file exporter 和 remote enforcement manifest。`cargo run -p xtask --locked -- e2e-suite --list` 会列出全部 case 及其 host capability requirement；`--case <name>` 可定向运行单个或多个 case，且不能与 privilege selection flag 混用；`--include-privileged` 会把 root/CAP_NET_RAW、root/bpffs 和 root/net-admin case 纳入同一套 suite；`--only-privileged` 只运行特权 case。每个旧的 `e2e-*` 命令仍保留，作为定向调试入口；这些 legacy 命令也通过同一个 suite case registry 分发，因此 case 名称、执行入口、顺序、分组和 privilege gate 只有一个事实源。
+
+| 入口 | 默认权限 | 覆盖能力 |
+| --- | --- | --- |
+| `e2e-suite` | user | 非特权 agent durable output、HTTP/WebSocket parser、policy、remote enforcement manifest、webhook/file exporter。 |
+| `e2e-suite --include-privileged` | 取决于 case | 在默认集合之上纳入 libpcap loopback、admin reload live capture、eBPF process observation、libssl plaintext 和 transparent TPROXY。 |
+| `e2e-suite --only-privileged` | root/CAP_NET_RAW、root/bpffs 或 root/net-admin | 只跑需要 host capability 的真实主机场景。 |
+| `e2e-suite --case <name>` | 取决于 case | 对单个能力闭环做定向验收；case 名称与原 `e2e-*` 命令一致。 |
+
+当前 suite 覆盖的代表性 case：
+
+1. `e2e-plaintext-feed` 验证非特权 plaintext feed 到 agent durable output 的闭环。
+2. `e2e-websocket-plaintext-feed` 验证 HTTP Upgrade、101 response 和 WebSocket frame 通过真实 agent 进入 parser、policy 和 durable output。
+3. `e2e-webhook-exporter` 验证 plaintext feed 产生的 HTTP/policy export events 通过 configured webhook exporter 在 bounded run tail drain 中以 gzip-compressed protobuf batch 发送到本地 receiver，receiver 返回 JSON structured ack 后 collector sink cursor 前进且该 sink 没有 pending records。
+4. `e2e-file-exporter` 验证 plaintext feed 产生的 HTTP/policy export events 通过 configured file exporter 在 bounded run tail drain 中以 zstd-compressed protobuf batch 写入 JSON Lines file record，解码后 local-file sink cursor 前进且该 sink 没有 pending records。
+5. `e2e-remote-enforcement-policy` 验证 remote external enforcement manifest 的一次性拉取、selector 合成和 manifest protective action profile 对 dry-run decision 的约束。
+6. `e2e-libpcap-loopback` 在 root/CAP_NET_RAW 下验证真实 libpcap fallback 捕获 loopback HTTP/1 traffic 后进入 agent durable output。
+7. `e2e-ebpf-process-loopback` 在 root/bpffs 环境下验证真实 eBPF process observation 捕获 loopback HTTP/1 traffic 后进入 agent durable output。
+8. `e2e-admin-policy-reload` 和 `e2e-admin-enforcement-reload` 在 root/CAP_NET_RAW 下验证真实 `agent run` 通过 admin Unix socket 在线切换 active policy/enforcement state。
+9. `e2e-tls-plaintext-target-lifecycle-loopback` 在 root/bpffs 环境下验证真实 agent 中 libssl plaintext sidecar 在同一生命周期内先清理退出的旧 target，再发现并 attach 复用同一监听端口的新 target。
+10. `e2e-tls-plaintext-dynamic-library-loopback` 在 root/bpffs 环境下验证同一 PID 先无 active TLS target、随后 `dlopen` libssl mapped path 后被 attach，并从 durable output 读回该 PID 的 TLS plaintext HTTP request 和 policy alert。
+11. `e2e-transparent-tproxy-loopback` 在 root/net-admin 环境下验证隔离 network namespace 中的 nftables/TPROXY host rule lifecycle 与 managed relay 入站转发。
+
+后续 SSE/overload E2E 覆盖 streaming response、metrics 中无静默 gap；如人为制造过载，则出现明确 degraded/gap。
 
 当前 TLS 已验证边界：
 
