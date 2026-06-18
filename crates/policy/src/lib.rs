@@ -1,3 +1,4 @@
+mod event_view;
 mod lua_policy;
 
 pub use lua_policy::{

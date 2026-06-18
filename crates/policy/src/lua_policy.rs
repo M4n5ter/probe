@@ -8,13 +8,11 @@ use std::{
 };
 
 use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
-use probe_core::{
-    Action, AddressPort, CaptureOrigin, CaptureProviderKind, CaptureSource, Direction, DomainEvent,
-    EnforcementEvidence, EventEnvelope, EventId, EventKind, EventType, FlowContext, FlowIdentity,
-    ProcessContext, Timestamp, TransportProtocol, Verdict,
-};
+use probe_core::{Action, DomainEvent, EventEnvelope, EventType, Verdict};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
+
+use crate::event_view::PolicyEventView;
 
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 100_000;
 const DEFAULT_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
@@ -143,8 +141,8 @@ pub enum PolicyError {
     MissingHook { hook: PolicyHook },
     #[error("policy returned an invalid outcome: {0}")]
     InvalidOutcome(String),
-    #[error("policy hook for {event_type} requires a flow-scoped event")]
-    NonFlowEvent { event_type: EventType },
+    #[error("event type {event_type} cannot be delivered to a Lua policy hook")]
+    UnsupportedPolicyEvent { event_type: EventType },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,7 +239,11 @@ impl PolicyRuntime {
 
         self.instruction_budget
             .store(self.limits.instruction_budget, Ordering::Relaxed);
-        let event_view = PolicyEventView::from_envelope(event)?;
+        let event_view = PolicyEventView::from_envelope(event).map_err(|error| {
+            PolicyError::UnsupportedPolicyEvent {
+                event_type: error.event_type,
+            }
+        })?;
         let event_value = self.lua.to_value(&event_view)?;
         let returned: Value = function.call(event_value)?;
         value_to_outcomes(&self.lua, returned)
@@ -366,75 +368,6 @@ fn table_value_to_outcome(lua: &Lua, value: Value) -> Result<PolicyOutcome, mlua
         .map(PolicyOutcome::Alert)
 }
 
-#[derive(Serialize)]
-struct PolicyEventView<'a> {
-    id: &'a EventId,
-    timestamp: Timestamp,
-    flow: PolicyFlowView<'a>,
-    source: CaptureSource,
-    provider: CaptureProviderKind,
-    origin: CaptureOrigin,
-    config_version: &'a str,
-    policy_version: Option<&'a str>,
-    degraded: bool,
-    enforcement_evidence: &'a EnforcementEvidence,
-    event_type: EventType,
-    direction: Option<Direction>,
-    kind: &'a EventKind,
-}
-
-impl<'a> PolicyEventView<'a> {
-    fn from_envelope(event: &'a EventEnvelope) -> Result<Self, PolicyError> {
-        let Some(flow) = event.flow() else {
-            return Err(PolicyError::NonFlowEvent {
-                event_type: event.kind().event_type(),
-            });
-        };
-        Ok(Self {
-            id: event.id(),
-            timestamp: event.timestamp(),
-            flow: PolicyFlowView::from_flow(flow),
-            source: event.origin().source(),
-            provider: event.origin().provider(),
-            origin: event.origin(),
-            config_version: event.config_version(),
-            policy_version: event.policy_version(),
-            degraded: event.degraded(),
-            enforcement_evidence: event.enforcement_evidence(),
-            event_type: event.kind().event_type(),
-            direction: event.kind().direction(),
-            kind: event.kind(),
-        })
-    }
-}
-
-#[derive(Serialize)]
-struct PolicyFlowView<'a> {
-    id: &'a FlowIdentity,
-    process: &'a ProcessContext,
-    local_endpoint: &'a AddressPort,
-    remote_endpoint: &'a AddressPort,
-    protocol: TransportProtocol,
-    start_monotonic_ns: u64,
-    socket_cookie: Option<u64>,
-    attribution_confidence: u8,
-}
-
-impl<'a> PolicyFlowView<'a> {
-    fn from_flow(flow: &'a FlowContext) -> Self {
-        Self {
-            id: &flow.id,
-            process: &flow.process,
-            local_endpoint: &flow.local,
-            remote_endpoint: &flow.remote,
-            protocol: flow.protocol,
-            start_monotonic_ns: flow.start_monotonic_ns,
-            socket_cookie: flow.socket_cookie,
-            attribution_confidence: flow.attribution_confidence,
-        }
-    }
-}
-
 pub fn hook_for_event(event: &EventEnvelope) -> Option<PolicyHook> {
     PolicyHook::from_event_type(event.kind().event_type())
 }
@@ -449,8 +382,8 @@ mod tests {
     };
 
     use crate::{
-        POLICY_HOOKS, PolicyHook, PolicyLimits, PolicyManifest, PolicyOutcome, PolicyRuntime,
-        hook_for_event,
+        POLICY_HOOKS, PolicyError, PolicyHook, PolicyLimits, PolicyManifest, PolicyOutcome,
+        PolicyRuntime, hook_for_event,
     };
 
     #[test]
@@ -496,8 +429,10 @@ mod tests {
             function on_http_request_headers(event)
               return probe.emit_alert(
                 event.flow.process.name .. " " ..
-                event.source .. " " ..
-                event.provider .. " " ..
+                tostring(event.flow.process.identity.pid) .. " " ..
+                event.origin.source .. " " ..
+                event.origin.provider .. " " ..
+                event.enforcement_evidence.kind .. " " ..
                 event.event_type .. " " ..
                 event.kind.target
               )
@@ -512,7 +447,7 @@ mod tests {
         };
         assert_eq!(
             alert.message,
-            "demo replay replay http_request_headers /chat"
+            "demo 1 replay replay destructive_allowed http_request_headers /chat"
         );
         Ok(())
     }
@@ -527,14 +462,11 @@ mod tests {
                 hooks: POLICY_HOOKS.to_vec(),
             },
             r#"
-            local reserved = {
-              ["and"] = true, ["break"] = true, ["do"] = true, ["else"] = true,
-              ["elseif"] = true, ["end"] = true, ["false"] = true, ["for"] = true,
-              ["function"] = true, ["goto"] = true, ["if"] = true, ["in"] = true,
-              ["local"] = true, ["nil"] = true, ["not"] = true, ["or"] = true,
-              ["repeat"] = true, ["return"] = true, ["then"] = true, ["true"] = true,
-              ["until"] = true, ["while"] = true,
-            }
+            local reserved = {}
+            for word in string.gmatch(
+              "and break do else elseif end false for function goto if in local nil not or repeat return then true until while",
+              "%S+"
+            ) do reserved[word] = true end
 
             local function scan(value, path)
               if type(value) ~= "table" then
@@ -552,6 +484,40 @@ mod tests {
               return nil
             end
 
+            local function payload_marker(event)
+              local kind = event.kind
+              if kind.type == "connection_opened" then
+                return event.flow.protocol .. ":" .. tostring(event.flow.attribution_confidence)
+              elseif kind.type == "connection_closed" then
+                return event.flow.process.identity.exe_path
+              elseif kind.type == "http_request_headers" then
+                return kind.method .. ":" .. kind.target .. ":" ..
+                  kind.headers[1][1] .. "=" .. kind.headers[1][2]
+              elseif kind.type == "http_response_headers" then
+                return tostring(kind.status) .. ":" .. kind.reason
+              elseif kind.type == "http_body_chunk" then
+                return tostring(kind.offset) .. ":" ..
+                  tostring(kind.data[1]) .. ":" .. tostring(kind.end_stream)
+              elseif kind.type == "sse_event" then
+                return kind.event .. ":" .. kind.id .. ":" ..
+                  tostring(kind.retry_ms) .. ":" .. kind.data
+              elseif kind.type == "websocket_handoff" then
+                return kind.target .. ":" .. kind.subprotocol .. ":" .. kind.extensions[1]
+              elseif kind.type == "websocket_frame" then
+                return kind.opcode.kind .. ":" ..
+                  tostring(kind.payload_len) .. ":" .. tostring(kind.masked)
+              elseif kind.type == "opaque_stream" then
+                return kind.direction .. ":" .. kind.reason .. ":" ..
+                  tostring(kind.fingerprint[1])
+              elseif kind.type == "gap" then
+                return kind.direction .. ":" .. tostring(kind.expected_offset) .. ":" ..
+                  tostring(kind.next_offset) .. ":" .. kind.reason
+              elseif kind.type == "protocol_error" then
+                return kind.direction .. ":" .. kind.reason
+              end
+              return "unknown"
+            end
+
             function inspect_policy_event(event)
               local leaked = scan(event, "event")
               if leaked ~= nil then
@@ -562,33 +528,31 @@ mod tests {
                 scope = "request",
                 reason = event.kind.type .. " " ..
                   tostring(event.flow.local_endpoint.port) .. "->" ..
-                  tostring(event.flow.remote_endpoint.port),
+                  tostring(event.flow.remote_endpoint.port) .. " " ..
+                  payload_marker(event),
                 confidence = 100
               }
             end
 
             for _, hook in ipairs({
-              "on_connection_opened", "on_connection_closed",
-              "on_http_request_headers", "on_http_response_headers",
-              "on_http_body_chunk", "on_sse_event", "on_websocket_handoff",
-              "on_websocket_frame", "on_opaque_stream", "on_gap", "on_protocol_error"
+              "on_connection_opened", "on_connection_closed", "on_http_request_headers",
+              "on_http_response_headers", "on_http_body_chunk", "on_sse_event",
+              "on_websocket_handoff", "on_websocket_frame", "on_opaque_stream", "on_gap",
+              "on_protocol_error"
             }) do
               _G[hook] = inspect_policy_event
             end
             "#,
         )?;
 
-        for event in lua_policy_event_view_contract_events() {
+        for (event, expected_reason) in lua_policy_event_view_contract_events() {
             let outcomes = runtime.handle_event(primary_hook_for_event(&event), &event)?;
             let Some(PolicyOutcome::Verdict(verdict)) = outcomes.first() else {
                 return Err(format!("missing verdict for {}", event.kind().event_type()).into());
             };
 
             assert_eq!(verdict.action, Action::Allow, "{event:?}");
-            assert_eq!(
-                verdict.reason,
-                format!("{} 50000->80", event.kind().event_type().as_str())
-            );
+            assert_eq!(verdict.reason, expected_reason, "{event:?}");
         }
         Ok(())
     }
@@ -796,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn secondary_events_do_not_have_policy_hooks() {
+    fn secondary_events_do_not_have_policy_hooks() -> Result<(), Box<dyn std::error::Error>> {
         let trigger = demo_event().with_provenance(EventProvenance::primary(1, 0));
         let policy_alert = EventEnvelope::from_policy_emission(
             Timestamp {
@@ -817,6 +781,28 @@ mod tests {
         );
 
         assert_eq!(hook_for_event(&policy_alert), None);
+        let runtime = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "demo".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::HttpRequestHeaders],
+            },
+            r#"
+            function on_http_request_headers(event)
+              return probe.emit_alert(event.kind.type)
+            end
+            "#,
+        )?;
+        let error = runtime
+            .handle_event(PolicyHook::HttpRequestHeaders, &policy_alert)
+            .expect_err("secondary events must not be valid Lua policy inputs");
+        assert!(matches!(
+            error,
+            PolicyError::UnsupportedPolicyEvent {
+                event_type: EventType::PolicyAlert
+            }
+        ));
+        Ok(())
     }
 
     #[test]
@@ -869,15 +855,11 @@ mod tests {
                 PolicyHook::WebSocketFrame,
             ]
         );
-        Ok(())
-    }
-
-    #[test]
-    fn policy_hook_rejects_unknown_lua_callback_name() {
         let error = serde_json::from_str::<PolicyHook>(r#""on_http2_headers""#)
             .expect_err("unknown hook names must fail");
 
         assert!(error.to_string().contains("unknown policy hook"));
+        Ok(())
     }
 
     fn primary_hook_for_event(event: &EventEnvelope) -> PolicyHook {
@@ -906,52 +888,85 @@ mod tests {
         ]
     }
 
-    fn lua_policy_event_view_contract_events() -> Vec<EventEnvelope> {
+    fn lua_policy_event_view_contract_events() -> Vec<(EventEnvelope, &'static str)> {
         vec![
-            demo_event_with_kind(EventKind::ConnectionOpened),
-            demo_event_with_kind(EventKind::ConnectionClosed),
-            demo_event(),
-            demo_event_with_kind(EventKind::HttpResponseHeaders(http_headers(
-                Direction::Inbound,
-                None,
-                None,
-                Some(200),
-                Some("OK"),
-                "content-type",
-                "text/plain",
-            ))),
-            demo_event_with_kind(EventKind::HttpBodyChunk(BodyChunk {
-                direction: Direction::Inbound,
-                stream_sequence: 1,
-                offset: 0,
-                data: Default::default(),
-                end_stream: true,
-            })),
-            demo_event_with_kind(EventKind::SseEvent(SseEvent {
-                direction: Direction::Inbound,
-                stream_sequence: 1,
-                event: Some("message".to_string()),
-                id: Some("1".to_string()),
-                retry_ms: Some(1000),
-                data: "hello".to_string(),
-            })),
-            websocket_handoff_event(),
-            websocket_frame_event(),
-            demo_event_with_kind(EventKind::OpaqueStream(OpaqueStream {
-                direction: Direction::Inbound,
-                fingerprint: vec![1, 2, 3],
-                reason: "unknown protocol".to_string(),
-            })),
-            demo_event_with_kind(EventKind::Gap(Gap {
-                direction: Direction::Inbound,
-                expected_offset: 1,
-                next_offset: Some(2),
-                reason: "truncated".to_string(),
-            })),
-            demo_event_with_kind(EventKind::ProtocolError(ProtocolError {
-                direction: Direction::Inbound,
-                reason: "invalid frame".to_string(),
-            })),
+            (
+                demo_event_with_kind(EventKind::ConnectionOpened),
+                "connection_opened 50000->80 tcp:100",
+            ),
+            (
+                demo_event_with_kind(EventKind::ConnectionClosed),
+                "connection_closed 50000->80 /usr/bin/demo",
+            ),
+            (
+                demo_event(),
+                "http_request_headers 50000->80 GET:/chat:host=example.test",
+            ),
+            (
+                demo_event_with_kind(EventKind::HttpResponseHeaders(http_headers(
+                    Direction::Inbound,
+                    None,
+                    None,
+                    Some(200),
+                    Some("OK"),
+                    "content-type",
+                    "text/plain",
+                ))),
+                "http_response_headers 50000->80 200:OK",
+            ),
+            (
+                demo_event_with_kind(EventKind::HttpBodyChunk(BodyChunk {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    offset: 0,
+                    data: vec![65, 66].into(),
+                    end_stream: true,
+                })),
+                "http_body_chunk 50000->80 0:65:true",
+            ),
+            (
+                demo_event_with_kind(EventKind::SseEvent(SseEvent {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    event: Some("message".to_string()),
+                    id: Some("1".to_string()),
+                    retry_ms: Some(1000),
+                    data: "hello".to_string(),
+                })),
+                "sse_event 50000->80 message:1:1000:hello",
+            ),
+            (
+                websocket_handoff_event(),
+                "websocket_handoff 50000->80 /chat:chat:permessage-deflate",
+            ),
+            (
+                websocket_frame_event(),
+                "websocket_frame 50000->80 text:5:false",
+            ),
+            (
+                demo_event_with_kind(EventKind::OpaqueStream(OpaqueStream {
+                    direction: Direction::Inbound,
+                    fingerprint: vec![1, 2, 3],
+                    reason: "unknown protocol".to_string(),
+                })),
+                "opaque_stream 50000->80 inbound:unknown protocol:1",
+            ),
+            (
+                demo_event_with_kind(EventKind::Gap(Gap {
+                    direction: Direction::Inbound,
+                    expected_offset: 1,
+                    next_offset: Some(2),
+                    reason: "truncated".to_string(),
+                })),
+                "gap 50000->80 inbound:1:2:truncated",
+            ),
+            (
+                demo_event_with_kind(EventKind::ProtocolError(ProtocolError {
+                    direction: Direction::Inbound,
+                    reason: "invalid frame".to_string(),
+                })),
+                "protocol_error 50000->80 inbound:invalid frame",
+            ),
         ]
     }
 
@@ -1002,47 +1017,29 @@ mod tests {
     }
 
     fn websocket_handoff_event() -> EventEnvelope {
-        EventEnvelope::from_flow(
-            Timestamp {
-                monotonic_ns: 1,
-                wall_time_unix_ns: 1,
-            },
-            demo_flow(),
-            replay_origin(),
-            "test",
-            EventKind::WebSocketHandoff(WebSocketHandoff {
-                direction: Direction::Inbound,
-                stream_sequence: 1,
-                target: Some("/chat".to_string()),
-                subprotocol: Some("chat".to_string()),
-                extensions: vec!["permessage-deflate".to_string()],
-            }),
-        )
+        demo_event_with_kind(EventKind::WebSocketHandoff(WebSocketHandoff {
+            direction: Direction::Inbound,
+            stream_sequence: 1,
+            target: Some("/chat".to_string()),
+            subprotocol: Some("chat".to_string()),
+            extensions: vec!["permessage-deflate".to_string()],
+        }))
     }
 
     fn websocket_frame_event() -> EventEnvelope {
-        EventEnvelope::from_flow(
-            Timestamp {
-                monotonic_ns: 1,
-                wall_time_unix_ns: 1,
-            },
-            demo_flow(),
-            replay_origin(),
-            "test",
-            EventKind::WebSocketFrame(WebSocketFrame {
-                direction: Direction::Inbound,
-                stream_sequence: 1,
-                frame_sequence: 1,
-                fin: true,
-                rsv1: false,
-                rsv2: false,
-                rsv3: false,
-                opcode: WebSocketOpcode::Text,
-                payload_len: 5,
-                masked: false,
-                payload_fingerprint: vec![1, 2, 3],
-            }),
-        )
+        demo_event_with_kind(EventKind::WebSocketFrame(WebSocketFrame {
+            direction: Direction::Inbound,
+            stream_sequence: 1,
+            frame_sequence: 1,
+            fin: true,
+            rsv1: false,
+            rsv2: false,
+            rsv3: false,
+            opcode: WebSocketOpcode::Text,
+            payload_len: 5,
+            masked: false,
+            payload_fingerprint: vec![1, 2, 3],
+        }))
     }
 
     fn replay_origin() -> CaptureOrigin {

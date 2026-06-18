@@ -715,7 +715,7 @@ Lua API 采用受控领域 API：
 
 不暴露任意文件、网络、系统调用或 Rust 内部对象。
 
-Lua policy 收到的是受控的 `PolicyEventView`，不是底层 storage/export JSON 的直接投影。flow 端点在脚本中使用 `event.flow.local_endpoint` 和 `event.flow.remote_endpoint`，不暴露 `local`/`remote` 字段；原因是 `local` 是 Lua 保留字，脚本 API 不能要求用户使用 `event.flow["local"]` 这种绕行写法。当前 contract test 会递归拒绝 Lua 保留字字段泄漏；完整 nested Lua API view 仍应继续显式建模，避免未来把 `origin`、`kind`、`process` 或 `enforcement_evidence` 的 Rust serde 形状误当成长期脚本契约。durable `EventEnvelope`/`FlowContext` JSON 仍保持事实模型中的 `local`/`remote` 字段。
+Lua policy 收到的是受控的 `PolicyEventView`，不是底层 storage/export JSON 的直接投影。`origin`、`kind`、`flow.process`、`flow.local_endpoint`、`flow.remote_endpoint` 和 `enforcement_evidence` 都由 policy crate 的 Lua-facing view 显式建模，避免把 `probe_core` 的 Rust serde 形状误当成长期脚本契约。capture source/provider 只通过 `event.origin.source` 和 `event.origin.provider` 暴露，不提供顶层 `event.source`/`event.provider` 别名。flow 端点在脚本中使用 `event.flow.local_endpoint` 和 `event.flow.remote_endpoint`，不暴露 `local`/`remote` 字段；原因是 `local` 是 Lua 保留字，脚本 API 不能要求用户使用 `event.flow["local"]` 这种绕行写法。当前 contract test 会递归拒绝 Lua 保留字字段泄漏，并对每个 primary policy hook event 读取代表性 payload 字段。durable `EventEnvelope`/`FlowContext` JSON 仍保持事实模型中的 `local`/`remote` 字段。
 
 策略执行采用分阶段 Hook，而不是每个底层事件都无差别同步调用 Lua。
 
