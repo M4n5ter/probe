@@ -813,7 +813,18 @@ fn captured_bytes(
     stream_offset: u64,
     bytes: Vec<u8>,
 ) -> CapturedBytes {
-    captured_bytes_with_evidence(
+    captured_bytes_with_timestamp(timestamp(), flow, direction, stream_offset, bytes)
+}
+
+fn captured_bytes_with_timestamp(
+    timestamp: Timestamp,
+    flow: FlowContext,
+    direction: Direction,
+    stream_offset: u64,
+    bytes: Vec<u8>,
+) -> CapturedBytes {
+    captured_bytes_with_timestamp_and_evidence(
+        timestamp,
         flow,
         direction,
         stream_offset,
@@ -831,8 +842,28 @@ fn captured_bytes_with_evidence(
     enforcement_evidence: EnforcementEvidence,
     enforcement_evidence_propagation: EnforcementEvidencePropagation,
 ) -> CapturedBytes {
+    captured_bytes_with_timestamp_and_evidence(
+        timestamp(),
+        flow,
+        direction,
+        stream_offset,
+        bytes,
+        enforcement_evidence,
+        enforcement_evidence_propagation,
+    )
+}
+
+fn captured_bytes_with_timestamp_and_evidence(
+    timestamp: Timestamp,
+    flow: FlowContext,
+    direction: Direction,
+    stream_offset: u64,
+    bytes: Vec<u8>,
+    enforcement_evidence: EnforcementEvidence,
+    enforcement_evidence_propagation: EnforcementEvidencePropagation,
+) -> CapturedBytes {
     CapturedBytes {
-        timestamp: timestamp(),
+        timestamp,
         flow,
         origin: CaptureOrigin::from_source(CaptureSource::Libpcap),
         direction,

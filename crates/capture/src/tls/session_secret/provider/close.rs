@@ -1,8 +1,8 @@
 use crate::{CaptureEvent, PlaintextConnection, PlaintextEvent, PlaintextSource};
 
-use super::{Tls13SessionSecretCaptureDisposition, Tls13SessionSecretDecryptingProvider};
+use super::{Tls13SessionSecretCaptureDisposition, Tls13SessionSecretDecryptingEngine};
 
-impl Tls13SessionSecretDecryptingProvider {
+impl Tls13SessionSecretDecryptingEngine {
     pub(super) fn ensure_plaintext_close_for_bound_capture_close(
         &self,
         event: &CaptureEvent,

@@ -27,7 +27,8 @@ pub use material::{
 };
 pub use plaintext::{Tls13SessionSecretPlaintextAdapter, Tls13SessionSecretPlaintextError};
 pub use provider::{
-    Tls13SessionSecretDecryptingProvider, Tls13SessionSecretDecryptingProviderError,
+    Tls13SessionSecretAutoBindingProvider, Tls13SessionSecretDecryptingProvider,
+    Tls13SessionSecretDecryptingProviderError,
 };
 pub use stream::{
     Tls13SessionSecretStreamAdapter, Tls13SessionSecretStreamCursor, Tls13SessionSecretStreamError,

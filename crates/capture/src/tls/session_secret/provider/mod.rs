@@ -7,14 +7,22 @@ use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider};
 
 use super::{Tls13SessionSecretFlowBinding, Tls13SessionSecretFlowDecryptError};
 
+mod automatic;
 mod close;
 mod evidence;
 mod lifecycle;
 
+pub use automatic::Tls13SessionSecretAutoBindingProvider;
 use evidence::Tls13SessionSecretFlowRegistry;
+
+const TLS13_SESSION_SECRET_DECRYPTING_PROVIDER_NAME: &str = "tls_session_secret_decrypting";
 
 pub struct Tls13SessionSecretDecryptingProvider {
     inner: Box<dyn CaptureProvider>,
+    engine: Tls13SessionSecretDecryptingEngine,
+}
+
+struct Tls13SessionSecretDecryptingEngine {
     decryptor: super::Tls13SessionSecretFlowDecryptor,
     flow_registry: Tls13SessionSecretFlowRegistry,
     pending_events: VecDeque<CaptureEvent>,
@@ -24,9 +32,7 @@ impl Tls13SessionSecretDecryptingProvider {
     pub fn new(inner: Box<dyn CaptureProvider>) -> Self {
         Self {
             inner,
-            decryptor: super::Tls13SessionSecretFlowDecryptor::new(),
-            flow_registry: Tls13SessionSecretFlowRegistry::new(),
-            pending_events: VecDeque::new(),
+            engine: Tls13SessionSecretDecryptingEngine::new(),
         }
     }
 
@@ -42,6 +48,23 @@ impl Tls13SessionSecretDecryptingProvider {
     }
 
     pub fn bind(
+        &mut self,
+        binding: Tls13SessionSecretFlowBinding<'_>,
+    ) -> Result<(), Tls13SessionSecretDecryptingProviderError> {
+        self.engine.bind(binding)
+    }
+}
+
+impl Tls13SessionSecretDecryptingEngine {
+    fn new() -> Self {
+        Self {
+            decryptor: super::Tls13SessionSecretFlowDecryptor::new(),
+            flow_registry: Tls13SessionSecretFlowRegistry::new(),
+            pending_events: VecDeque::new(),
+        }
+    }
+
+    fn bind(
         &mut self,
         binding: Tls13SessionSecretFlowBinding<'_>,
     ) -> Result<(), Tls13SessionSecretDecryptingProviderError> {
@@ -69,7 +92,7 @@ impl Tls13SessionSecretDecryptingProvider {
 
 impl CaptureProvider for Tls13SessionSecretDecryptingProvider {
     fn name(&self) -> &'static str {
-        "tls_session_secret_decrypting"
+        TLS13_SESSION_SECRET_DECRYPTING_PROVIDER_NAME
     }
 
     fn capabilities(&self) -> Vec<CapabilityState> {
@@ -82,7 +105,10 @@ impl CaptureProvider for Tls13SessionSecretDecryptingProvider {
     }
 
     fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
-        self.poll_pending_or_inner()
+        self.engine.poll_pending_or_inner(
+            TLS13_SESSION_SECRET_DECRYPTING_PROVIDER_NAME,
+            self.inner.as_mut(),
+        )
     }
 }
 

@@ -5,7 +5,7 @@ use crate::{
 };
 
 use super::{
-    Tls13SessionSecretCaptureDisposition, Tls13SessionSecretDecryptingProvider,
+    Tls13SessionSecretCaptureDisposition, Tls13SessionSecretDecryptingEngine,
     Tls13SessionSecretDecryptingProviderError, Tls13SessionSecretDecryptingStreamKey,
     evidence::{
         Tls13SessionSecretEventEvidence, Tls13SessionSecretStreamObservation,
@@ -13,23 +13,75 @@ use super::{
     },
 };
 
-impl Tls13SessionSecretDecryptingProvider {
-    pub(super) fn poll_pending_or_inner(&mut self) -> Result<CapturePoll, CaptureError> {
+impl Tls13SessionSecretDecryptingEngine {
+    pub(super) fn poll_pending_or_inner(
+        &mut self,
+        provider_name: &'static str,
+        inner: &mut dyn CaptureProvider,
+    ) -> Result<CapturePoll, CaptureError> {
         if let Some(event) = self.pop_pending_event() {
             return Ok(CapturePoll::event(event));
         }
-        match self.inner.poll_next()? {
-            CapturePoll::Event(event) => self.handle_inner_event(*event),
+        match inner.poll_next()? {
+            CapturePoll::Event(event) => self.handle_inner_event(provider_name, *event),
             CapturePoll::Finished => self.finish_bound_streams_before_inner_finished(),
             other => Ok(other),
         }
     }
 
-    fn handle_inner_event(&mut self, event: CaptureEvent) -> Result<CapturePoll, CaptureError> {
+    pub(super) fn pop_pending_event(&mut self) -> Option<CaptureEvent> {
+        self.pending_events.pop_front()
+    }
+
+    fn handle_inner_event(
+        &mut self,
+        provider_name: &'static str,
+        event: CaptureEvent,
+    ) -> Result<CapturePoll, CaptureError> {
+        self.handle_inner_events(provider_name, vec![event])
+    }
+
+    pub(super) fn handle_inner_events(
+        &mut self,
+        provider_name: &'static str,
+        events: Vec<CaptureEvent>,
+    ) -> Result<CapturePoll, CaptureError> {
+        let mut ready_events = Vec::new();
+        for event in events {
+            ready_events.extend(self.materialize_inner_event(provider_name, event)?);
+        }
+        Ok(self.emit_ready_events(ready_events, CapturePoll::Progress))
+    }
+
+    pub(super) fn bind_and_handle_inner_event_after_raw_prefix(
+        &mut self,
+        provider_name: &'static str,
+        preceding_inner_events: Vec<CaptureEvent>,
+        raw_prefix_events: Vec<CaptureEvent>,
+        binding: super::Tls13SessionSecretFlowBinding<'_>,
+        event: CaptureEvent,
+    ) -> Result<CapturePoll, CaptureError> {
+        let mut ready_events = Vec::new();
+        for event in preceding_inner_events {
+            ready_events.extend(self.materialize_inner_event(provider_name, event)?);
+        }
+        self.bind(binding)
+            .map_err(|error| CaptureError::provider(provider_name, error.to_string()))?;
+        ready_events.extend(raw_prefix_events);
+        ready_events.extend(self.materialize_inner_event(provider_name, event)?);
+        Ok(self.emit_ready_events(ready_events, CapturePoll::Progress))
+    }
+
+    fn materialize_inner_event(
+        &mut self,
+        provider_name: &'static str,
+        event: CaptureEvent,
+    ) -> Result<Vec<CaptureEvent>, CaptureError> {
         let disposition = self.disposition(&event);
         self.record_observed_bound_timestamp(&event, &disposition);
         let bound_stream_was_active = self.bound_stream_was_active(&disposition);
-        let mut plaintext_events = self.plaintext_events_from_inner_event(&event, &disposition)?;
+        let mut plaintext_events =
+            self.plaintext_events_from_inner_event(provider_name, &event, &disposition)?;
         self.flow_registry
             .record_plaintext_progress(&plaintext_events);
         self.ensure_plaintext_close_for_bound_capture_close(
@@ -52,17 +104,13 @@ impl Tls13SessionSecretDecryptingProvider {
             bound_stream_was_active,
             &capture_events,
         );
-        self.pending_events.extend(capture_events);
+        let mut ready_events = capture_events;
         self.record_observed_bound_close(&event, &disposition);
 
-        if disposition.suppress_ciphertext() {
-            Ok(self
-                .pop_pending_event()
-                .map(CapturePoll::event)
-                .unwrap_or(CapturePoll::Progress))
-        } else {
-            Ok(CapturePoll::event(event))
+        if !disposition.suppress_ciphertext() {
+            ready_events.push(event);
         }
+        Ok(ready_events)
     }
 
     fn bound_stream_was_active(&self, disposition: &Tls13SessionSecretCaptureDisposition) -> bool {
@@ -78,6 +126,7 @@ impl Tls13SessionSecretDecryptingProvider {
 
     fn plaintext_events_from_inner_event(
         &mut self,
+        provider_name: &'static str,
         event: &CaptureEvent,
         disposition: &Tls13SessionSecretCaptureDisposition,
     ) -> Result<Vec<PlaintextEvent>, CaptureError> {
@@ -92,7 +141,7 @@ impl Tls13SessionSecretDecryptingProvider {
         };
         events
             .map_err(Tls13SessionSecretDecryptingProviderError::from)
-            .map_err(|error| CaptureError::provider(self.name(), error.to_string()))
+            .map_err(|error| CaptureError::provider(provider_name, error.to_string()))
     }
 
     fn disposition(&self, event: &CaptureEvent) -> Tls13SessionSecretCaptureDisposition {
@@ -183,10 +232,6 @@ impl Tls13SessionSecretDecryptingProvider {
         self.flow_registry.observe_flow_timestamp(flow, timestamp);
     }
 
-    fn pop_pending_event(&mut self) -> Option<CaptureEvent> {
-        self.pending_events.pop_front()
-    }
-
     fn record_observed_bound_close(
         &mut self,
         event: &CaptureEvent,
@@ -205,7 +250,10 @@ impl Tls13SessionSecretDecryptingProvider {
         self.flow_registry.remove_flow(flow);
     }
 
-    fn finish_bound_streams_before_inner_finished(&mut self) -> Result<CapturePoll, CaptureError> {
+    pub(super) fn finish_bound_streams_before_inner_finished(
+        &mut self,
+    ) -> Result<CapturePoll, CaptureError> {
+        let mut ready_events = Vec::new();
         for (flow, timestamp) in self.flow_registry.bound_flow_finish_events() {
             let mut plaintext_events = self.decryptor.finish_flow_observation(timestamp, &flow);
             self.flow_registry
@@ -230,15 +278,25 @@ impl Tls13SessionSecretDecryptingProvider {
                             buffered_flow == flow && *buffered_direction == direction
                         })
                 });
-            self.pending_events.extend(capture_events);
+            ready_events.extend(capture_events);
             self.remove_bound_flow(&flow.id);
         }
 
         self.flow_registry.clear_streams();
-        Ok(self
-            .pop_pending_event()
-            .map(CapturePoll::event)
-            .unwrap_or(CapturePoll::Finished))
+        Ok(self.emit_ready_events(ready_events, CapturePoll::Finished))
+    }
+
+    fn emit_ready_events(
+        &mut self,
+        events: Vec<CaptureEvent>,
+        empty_poll: CapturePoll,
+    ) -> CapturePoll {
+        let mut events = events.into_iter();
+        let Some(event) = events.next() else {
+            return empty_poll;
+        };
+        self.pending_events.extend(events);
+        CapturePoll::event(event)
     }
 
     fn capture_events_from_plaintext_events(
