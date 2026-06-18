@@ -2,17 +2,17 @@ use bytes::Bytes;
 use ring::{aead, hkdf};
 use thiserror::Error;
 
+#[cfg(test)]
+use super::frame::{
+    TLS13_LEGACY_RECORD_VERSION, TLS13_OUTER_APPLICATION_DATA, TLS13_RECORD_HEADER_BYTES,
+};
 use super::{
     TlsCipherSuite, TlsSessionSecretKind, TlsSessionSecretProtocol, TlsSessionSecretRecord,
+    frame::{TLS13_MAX_CIPHERTEXT_FRAGMENT_BYTES, TLS13_MAX_FRAGMENT_BYTES, Tls13RecordFrame},
 };
 
-const TLS13_RECORD_HEADER_BYTES: usize = 5;
-const TLS13_LEGACY_RECORD_VERSION: [u8; 2] = [0x03, 0x03];
-const TLS13_OUTER_APPLICATION_DATA: u8 = 0x17;
 const TLS13_AEAD_TAG_BYTES: usize = 16;
 const TLS13_NONCE_BYTES: usize = 12;
-const TLS13_MAX_FRAGMENT_BYTES: usize = 16 * 1024;
-const TLS13_MAX_CIPHERTEXT_FRAGMENT_BYTES: usize = TLS13_MAX_FRAGMENT_BYTES + 256;
 const TLS13_MAX_INNER_PLAINTEXT_BYTES: usize =
     TLS13_MAX_CIPHERTEXT_FRAGMENT_BYTES - TLS13_AEAD_TAG_BYTES;
 
@@ -151,12 +151,18 @@ impl Tls13ApplicationDataDecryptor {
         sequence_number: u64,
         record: &[u8],
     ) -> Result<Tls13DecryptedRecord, Tls13DecryptError> {
-        let record = Tls13EncryptedRecord::parse(record)?;
-        let mut payload = record.encrypted_payload.to_vec();
+        let record = Tls13RecordFrame::parse(record)?;
+        if record.encrypted_payload().len() < TLS13_AEAD_TAG_BYTES + 1 {
+            return Err(Tls13DecryptError::EncryptedPayloadTooShort {
+                min_bytes: TLS13_AEAD_TAG_BYTES + 1,
+                actual_bytes: record.encrypted_payload().len(),
+            });
+        }
+        let mut payload = record.encrypted_payload().to_vec();
         let nonce = aead::Nonce::assume_unique_for_key(self.nonce(sequence_number));
         let plaintext = self
             .key
-            .open_in_place(nonce, aead::Aad::from(record.aad), &mut payload)
+            .open_in_place(nonce, aead::Aad::from(record.aad()), &mut payload)
             .map_err(|_| Tls13DecryptError::AeadOpenFailed)?;
         let plain_len = plaintext.len();
         payload.truncate(plain_len);
@@ -307,57 +313,6 @@ impl Tls13AeadSuite {
             _ => return None,
         };
         Some(suite)
-    }
-}
-
-struct Tls13EncryptedRecord<'a> {
-    aad: [u8; TLS13_RECORD_HEADER_BYTES],
-    encrypted_payload: &'a [u8],
-}
-
-impl<'a> Tls13EncryptedRecord<'a> {
-    fn parse(record: &'a [u8]) -> Result<Self, Tls13DecryptError> {
-        let header = record
-            .get(..TLS13_RECORD_HEADER_BYTES)
-            .ok_or(Tls13DecryptError::IncompleteRecordHeader)?;
-        if header[0] != TLS13_OUTER_APPLICATION_DATA {
-            return Err(Tls13DecryptError::UnsupportedOuterContentType {
-                content_type: header[0],
-            });
-        }
-        if header[1..3] != TLS13_LEGACY_RECORD_VERSION {
-            return Err(Tls13DecryptError::UnsupportedLegacyVersion {
-                version: u16::from_be_bytes([header[1], header[2]]),
-            });
-        }
-        let declared_bytes = u16::from_be_bytes([header[3], header[4]]) as usize;
-        let encrypted_payload = record
-            .get(TLS13_RECORD_HEADER_BYTES..)
-            .expect("header length was validated");
-        if encrypted_payload.len() != declared_bytes {
-            return Err(Tls13DecryptError::RecordLengthMismatch {
-                declared_bytes,
-                actual_bytes: encrypted_payload.len(),
-            });
-        }
-        if encrypted_payload.len() < TLS13_AEAD_TAG_BYTES + 1 {
-            return Err(Tls13DecryptError::EncryptedPayloadTooShort {
-                min_bytes: TLS13_AEAD_TAG_BYTES + 1,
-                actual_bytes: encrypted_payload.len(),
-            });
-        }
-        if encrypted_payload.len() > TLS13_MAX_CIPHERTEXT_FRAGMENT_BYTES {
-            return Err(Tls13DecryptError::EncryptedPayloadTooLarge {
-                actual_bytes: encrypted_payload.len(),
-                max_bytes: TLS13_MAX_CIPHERTEXT_FRAGMENT_BYTES,
-            });
-        }
-        Ok(Self {
-            aad: header
-                .try_into()
-                .expect("TLS record header has fixed length"),
-            encrypted_payload,
-        })
     }
 }
 

@@ -39,7 +39,8 @@ pub(in crate::tls) use secret::{TLS_RANDOM_BYTES, decode_hex, hex_len, resolve_l
 pub use secret::{TlsMaterialLookup, TlsRandom, TlsSecret};
 pub use session_secret::{
     Tls13ApplicationDataDecryptor, Tls13DecryptError, Tls13DecryptedRecord, Tls13InnerContentType,
-    Tls13SessionSecretPlaintextAdapter, Tls13SessionSecretPlaintextError, TlsCipherSuite,
+    Tls13SessionSecretPlaintextAdapter, Tls13SessionSecretPlaintextError,
+    Tls13SessionSecretStreamAdapter, Tls13SessionSecretStreamError, TlsCipherSuite,
     TlsSessionSecretKind, TlsSessionSecretParseError, TlsSessionSecretProtocol,
     TlsSessionSecretRecord, TlsSessionSecretStore, TlsSessionSecretSummary,
 };

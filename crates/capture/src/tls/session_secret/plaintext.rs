@@ -37,6 +37,14 @@ impl Tls13SessionSecretPlaintextAdapter {
         self.next_stream_offset
     }
 
+    pub(in crate::tls::session_secret) fn flow(&self) -> &FlowContext {
+        &self.flow
+    }
+
+    pub(in crate::tls::session_secret) fn direction(&self) -> Direction {
+        self.direction
+    }
+
     pub fn set_sequence_number(&mut self, sequence_number: u64) {
         self.decryptor.set_sequence_number(sequence_number);
     }
