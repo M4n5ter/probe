@@ -129,7 +129,7 @@ impl Tls13ApplicationDataDecryptor {
         self.sequence_number
     }
 
-    pub fn set_sequence_number(&mut self, sequence_number: u64) {
+    pub(in crate::tls::session_secret) fn set_sequence_number(&mut self, sequence_number: u64) {
         self.sequence_number = sequence_number;
     }
 

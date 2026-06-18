@@ -23,18 +23,38 @@ impl Tls13SessionSecretStreamAdapter {
         flow: FlowContext,
         direction: Direction,
     ) -> Result<Self, Tls13SessionSecretStreamError> {
+        Self::from_session_secret_record_with_cursor(
+            record,
+            flow,
+            direction,
+            Tls13SessionSecretStreamCursor::start(),
+        )
+    }
+
+    pub fn from_session_secret_record_with_cursor(
+        record: &TlsSessionSecretRecord,
+        flow: FlowContext,
+        direction: Direction,
+        cursor: Tls13SessionSecretStreamCursor,
+    ) -> Result<Self, Tls13SessionSecretStreamError> {
         Ok(Self::new(
             Tls13SessionSecretPlaintextAdapter::from_session_secret_record(
                 record, flow, direction,
             )?,
+            cursor,
         ))
     }
 
-    fn new(plaintext: Tls13SessionSecretPlaintextAdapter) -> Self {
+    fn new(
+        mut plaintext: Tls13SessionSecretPlaintextAdapter,
+        cursor: Tls13SessionSecretStreamCursor,
+    ) -> Self {
+        plaintext.set_sequence_number(cursor.sequence_number);
+        plaintext.set_next_stream_offset(cursor.plaintext_offset);
         Self {
             plaintext,
             buffer: BytesMut::new(),
-            next_ciphertext_offset: 0,
+            next_ciphertext_offset: cursor.ciphertext_offset,
             poisoned_reason: None,
         }
     }
@@ -55,17 +75,6 @@ impl Tls13SessionSecretStreamAdapter {
         self.buffer.len()
     }
 
-    #[cfg(test)]
-    fn set_next_plaintext_offset(&mut self, next_plaintext_offset: u64) {
-        self.plaintext.set_next_stream_offset(next_plaintext_offset);
-    }
-
-    #[cfg(test)]
-    fn with_plaintext_offset(mut self, next_plaintext_offset: u64) -> Self {
-        self.set_next_plaintext_offset(next_plaintext_offset);
-        self
-    }
-
     pub fn with_degradation(mut self, reason: impl Into<String>) -> Self {
         self.plaintext = self.plaintext.with_degradation(reason);
         self
@@ -77,26 +86,44 @@ impl Tls13SessionSecretStreamAdapter {
         stream_offset: u64,
         bytes: impl AsRef<[u8]>,
     ) -> Result<Vec<PlaintextEvent>, Tls13SessionSecretStreamError> {
+        Ok(self
+            .push_ciphertext_with_outcome(timestamp, stream_offset, bytes)?
+            .into_events())
+    }
+
+    pub(in crate::tls::session_secret) fn push_ciphertext_with_outcome(
+        &mut self,
+        timestamp: Timestamp,
+        stream_offset: u64,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<Tls13SessionSecretStreamOutcome, Tls13SessionSecretStreamError> {
         self.ensure_not_poisoned()?;
         let bytes = bytes.as_ref();
         if bytes.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Tls13SessionSecretStreamOutcome::alive(Vec::new()));
         }
         if stream_offset != self.next_ciphertext_offset {
-            return Ok(vec![self.poison_with_plaintext_gap(
-                timestamp,
-                format!(
-                    "TLS session-secret ciphertext stream offset mismatch: expected {}, got {}",
-                    self.next_ciphertext_offset, stream_offset
+            return Ok(Tls13SessionSecretStreamOutcome::terminal(vec![
+                self.poison_with_plaintext_gap(
+                    timestamp,
+                    format!(
+                        "TLS session-secret ciphertext stream offset mismatch: expected {}, got {}",
+                        self.next_ciphertext_offset, stream_offset
+                    ),
                 ),
-            )]);
+            ]));
         }
         self.next_ciphertext_offset = self
             .next_ciphertext_offset
             .checked_add(bytes.len() as u64)
             .ok_or(Tls13SessionSecretStreamError::CiphertextOffsetExhausted)?;
         self.buffer.extend_from_slice(bytes);
-        Ok(self.drain_records(timestamp))
+        let events = self.drain_records(timestamp);
+        Ok(if self.poisoned_reason.is_some() {
+            Tls13SessionSecretStreamOutcome::terminal(events)
+        } else {
+            Tls13SessionSecretStreamOutcome::alive(events)
+        })
     }
 
     pub fn push_ciphertext_gap(
@@ -112,6 +139,21 @@ impl Tls13SessionSecretStreamAdapter {
                 gap.expected_offset, gap.next_offset, gap.reason
             ),
         ))
+    }
+
+    pub(in crate::tls::session_secret) fn close_with_incomplete_record_gap(
+        &mut self,
+        timestamp: Timestamp,
+    ) -> Option<PlaintextEvent> {
+        let buffered = self.buffer.len();
+        (buffered > 0).then(|| {
+            self.poison_with_plaintext_gap(
+                timestamp,
+                format!(
+                    "TLS session-secret ciphertext stream closed with incomplete protected record: buffered_ciphertext_bytes={buffered}"
+                ),
+            )
+        })
     }
 
     fn drain_records(&mut self, timestamp: Timestamp) -> Vec<PlaintextEvent> {
@@ -177,6 +219,79 @@ impl Tls13SessionSecretStreamAdapter {
             }),
             None => Ok(()),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tls13SessionSecretStreamCursor {
+    ciphertext_offset: u64,
+    plaintext_offset: u64,
+    sequence_number: u64,
+}
+
+impl Tls13SessionSecretStreamCursor {
+    pub fn start() -> Self {
+        Self {
+            ciphertext_offset: 0,
+            plaintext_offset: 0,
+            sequence_number: 0,
+        }
+    }
+
+    pub fn resume_at(ciphertext_offset: u64, plaintext_offset: u64, sequence_number: u64) -> Self {
+        Self {
+            ciphertext_offset,
+            plaintext_offset,
+            sequence_number,
+        }
+    }
+
+    pub fn ciphertext_offset(self) -> u64 {
+        self.ciphertext_offset
+    }
+
+    pub fn plaintext_offset(self) -> u64 {
+        self.plaintext_offset
+    }
+
+    pub fn sequence_number(self) -> u64 {
+        self.sequence_number
+    }
+}
+
+impl Default for Tls13SessionSecretStreamCursor {
+    fn default() -> Self {
+        Self::start()
+    }
+}
+
+#[derive(Debug)]
+pub(in crate::tls::session_secret) struct Tls13SessionSecretStreamOutcome {
+    events: Vec<PlaintextEvent>,
+    terminal: bool,
+}
+
+impl Tls13SessionSecretStreamOutcome {
+    fn alive(events: Vec<PlaintextEvent>) -> Self {
+        Self {
+            events,
+            terminal: false,
+        }
+    }
+
+    fn terminal(events: Vec<PlaintextEvent>) -> Self {
+        Self {
+            events,
+            terminal: true,
+        }
+    }
+
+    pub(in crate::tls::session_secret) fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
+    pub(in crate::tls::session_secret) fn into_events(self) -> Vec<PlaintextEvent> {
+        self.events
     }
 }
 
@@ -311,7 +426,7 @@ mod tests {
     #[test]
     fn upstream_ciphertext_gap_emits_plaintext_gap_and_poisons_stream()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut adapter = stream_adapter()?.with_plaintext_offset(42);
+        let mut adapter = stream_adapter_at(Tls13SessionSecretStreamCursor::resume_at(0, 42, 0))?;
         let timestamp = timestamp();
 
         let event = adapter.push_ciphertext_gap(
@@ -426,11 +541,21 @@ mod tests {
     }
 
     fn stream_adapter() -> Result<Tls13SessionSecretStreamAdapter, Box<dyn std::error::Error>> {
-        Ok(Tls13SessionSecretStreamAdapter::from_session_secret_record(
-            &session_secret_record()?,
-            demo_flow(),
-            Direction::Outbound,
-        )?)
+        stream_adapter_at(Tls13SessionSecretStreamCursor::start())
+    }
+
+    fn stream_adapter_at(
+        cursor: Tls13SessionSecretStreamCursor,
+    ) -> Result<Tls13SessionSecretStreamAdapter, Box<dyn std::error::Error>> {
+        let record = session_secret_record()?;
+        Ok(
+            Tls13SessionSecretStreamAdapter::from_session_secret_record_with_cursor(
+                &record,
+                demo_flow(),
+                Direction::Outbound,
+                cursor,
+            )?,
+        )
     }
 
     fn session_secret_record() -> Result<TlsSessionSecretRecord, Box<dyn std::error::Error>> {

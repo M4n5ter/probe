@@ -45,20 +45,19 @@ impl Tls13SessionSecretPlaintextAdapter {
         self.direction
     }
 
-    pub fn set_sequence_number(&mut self, sequence_number: u64) {
+    pub(in crate::tls::session_secret) fn set_sequence_number(&mut self, sequence_number: u64) {
         self.decryptor.set_sequence_number(sequence_number);
     }
 
-    pub fn set_next_stream_offset(&mut self, next_stream_offset: u64) {
+    pub(in crate::tls::session_secret) fn set_next_stream_offset(
+        &mut self,
+        next_stream_offset: u64,
+    ) {
         self.next_stream_offset = next_stream_offset;
     }
 
-    pub fn with_sequence_number(mut self, sequence_number: u64) -> Self {
-        self.set_sequence_number(sequence_number);
-        self
-    }
-
-    pub fn with_stream_offset(mut self, next_stream_offset: u64) -> Self {
+    #[cfg(test)]
+    fn with_stream_offset(mut self, next_stream_offset: u64) -> Self {
         self.set_next_stream_offset(next_stream_offset);
         self
     }
