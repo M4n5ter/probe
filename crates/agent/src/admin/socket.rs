@@ -1,0 +1,264 @@
+use std::{
+    fs,
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        net::UnixStream as StdUnixStream,
+    },
+    path::{Path, PathBuf},
+};
+
+use thiserror::Error;
+use tokio::net::UnixListener;
+
+pub(super) const ADMIN_SOCKET_MODE: u32 = 0o600;
+const ROOT_UID: u32 = 0;
+
+#[derive(Debug, Error)]
+pub enum AdminError {
+    #[error("admin socket path is empty")]
+    EmptySocketPath,
+    #[error("admin socket path {path} exists and is not a Unix socket")]
+    SocketPathNotSocket { path: String },
+    #[error("admin socket {path} already has a listener")]
+    SocketAlreadyInUse { path: String },
+    #[error("admin socket parent {path} is unsafe: {reason}")]
+    UnsafeSocketParent { path: String, reason: String },
+    #[error("admin socket {path} has unsafe permissions {mode:o}")]
+    UnsafeSocketMode { path: String, mode: u32 },
+    #[error("failed to probe existing admin socket {path}: {source}")]
+    ProbeExistingSocket {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("admin socket filesystem error for {path}: {source}")]
+    SocketFile {
+        path: String,
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminServerConfig {
+    pub socket_path: PathBuf,
+}
+
+pub(super) fn bind_admin_socket(path: &Path) -> Result<UnixListener, AdminError> {
+    if path.as_os_str().is_empty() {
+        return Err(AdminError::EmptySocketPath);
+    }
+    validate_admin_socket_parent(path)?;
+    remove_stale_admin_socket(path)?;
+    let listener = UnixListener::bind(path).map_err(|source| AdminError::SocketFile {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if let Err(error) =
+        set_private_admin_socket_permissions(path).and_then(|()| validate_admin_socket_mode(path))
+    {
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(listener)
+}
+
+fn set_private_admin_socket_permissions(path: &Path) -> Result<(), AdminError> {
+    fs::set_permissions(path, fs::Permissions::from_mode(ADMIN_SOCKET_MODE)).map_err(|source| {
+        AdminError::SocketFile {
+            path: path.display().to_string(),
+            source,
+        }
+    })
+}
+
+fn validate_admin_socket_parent(path: &Path) -> Result<(), AdminError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AdminError::UnsafeSocketParent {
+            path: path.display().to_string(),
+            reason: "socket path has no parent directory".to_string(),
+        })?;
+    let metadata = fs::symlink_metadata(parent).map_err(|source| AdminError::SocketFile {
+        path: parent.display().to_string(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(AdminError::UnsafeSocketParent {
+            path: parent.display().to_string(),
+            reason: "parent directory cannot be a symlink".to_string(),
+        });
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(AdminError::UnsafeSocketParent {
+            path: parent.display().to_string(),
+            reason: "parent path is not a directory".to_string(),
+        });
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(AdminError::UnsafeSocketParent {
+            path: parent.display().to_string(),
+            reason: format!("parent directory is accessible by group/other users: {mode:o}"),
+        });
+    }
+    let owner = metadata.uid();
+    let current_euid = rustix::process::geteuid().as_raw();
+    if owner != ROOT_UID && owner != current_euid {
+        return Err(AdminError::UnsafeSocketParent {
+            path: parent.display().to_string(),
+            reason: format!(
+                "parent directory owner {owner} is neither root nor current euid {current_euid}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_admin_socket_mode(path: &Path) -> Result<(), AdminError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| AdminError::SocketFile {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != ADMIN_SOCKET_MODE {
+        return Err(AdminError::UnsafeSocketMode {
+            path: path.display().to_string(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
+fn remove_stale_admin_socket(path: &Path) -> Result<(), AdminError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(AdminError::SocketFile {
+                path: path.display().to_string(),
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(AdminError::SocketPathNotSocket {
+            path: path.display().to_string(),
+        });
+    }
+
+    match StdUnixStream::connect(path) {
+        Ok(_) => Err(AdminError::SocketAlreadyInUse {
+            path: path.display().to_string(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            fs::remove_file(path).map_err(|source| AdminError::SocketFile {
+                path: path.display().to_string(),
+                source,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(AdminError::ProbeExistingSocket {
+            path: path.display().to_string(),
+            source,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        os::unix::{fs::PermissionsExt, net::UnixListener as StdUnixListener},
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{ADMIN_SOCKET_MODE, AdminError, bind_admin_socket};
+
+    #[tokio::test]
+    async fn admin_socket_uses_private_permissions() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-mode")?;
+        let socket_path = temp.join("admin.sock");
+        let listener = bind_admin_socket(&socket_path)?;
+
+        let mode = fs::symlink_metadata(&socket_path)?.permissions().mode() & 0o777;
+
+        assert_eq!(mode, ADMIN_SOCKET_MODE);
+        drop(listener);
+        fs::remove_file(&socket_path)?;
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn admin_socket_rejects_shared_parent() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-unsafe-parent")?;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o755))?;
+        let socket_path = temp.join("admin.sock");
+
+        let result = bind_admin_socket(&socket_path);
+
+        assert!(matches!(result, Err(AdminError::UnsafeSocketParent { .. })));
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o700))?;
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn admin_socket_rejects_existing_non_socket() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-non-socket")?;
+        let socket_path = temp.join("admin.sock");
+        fs::write(&socket_path, b"not a socket")?;
+
+        let result = bind_admin_socket(&socket_path);
+
+        assert!(matches!(
+            result,
+            Err(AdminError::SocketPathNotSocket { .. })
+        ));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn admin_socket_rejects_active_listener() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-active-listener")?;
+        let socket_path = temp.join("admin.sock");
+        let active_listener = StdUnixListener::bind(&socket_path)?;
+
+        let result = bind_admin_socket(&socket_path);
+
+        assert!(matches!(result, Err(AdminError::SocketAlreadyInUse { .. })));
+        drop(active_listener);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_socket_replaces_stale_socket() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-stale-socket")?;
+        let socket_path = temp.join("admin.sock");
+        let stale_listener = StdUnixListener::bind(&socket_path)?;
+        drop(stale_listener);
+
+        let listener = bind_admin_socket(&socket_path)?;
+
+        drop(listener);
+        fs::remove_file(&socket_path)?;
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("{name}-{nanos}"));
+        if path.exists() {
+            fs::remove_dir_all(&path)?;
+        }
+        fs::create_dir_all(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        Ok(path)
+    }
+}

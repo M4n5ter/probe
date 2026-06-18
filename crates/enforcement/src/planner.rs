@@ -29,10 +29,43 @@ pub trait EnforcementPlanner {
     fn evaluate(&mut self, request: EnforcementPlanRequest<'_>) -> Option<EnforcementDecision>;
 }
 
-pub struct ScopedEnforcementPlanner {
-    execution: EnforcementExecution,
+#[derive(Clone)]
+pub struct PlannerPolicy {
     scope: TargetScope,
     protective_actions: ProtectiveActionProfile,
+}
+
+impl PlannerPolicy {
+    pub fn compile(
+        selector: Option<&Selector>,
+        protective_actions: ProtectiveActionProfile,
+    ) -> Result<Self, EnforcementError> {
+        Ok(Self {
+            scope: TargetScope::compile(selector)?,
+            protective_actions,
+        })
+    }
+
+    pub fn protective_actions(&self) -> &[Action] {
+        self.protective_actions.actions()
+    }
+
+    pub fn protective_action_profile(&self) -> &ProtectiveActionProfile {
+        &self.protective_actions
+    }
+
+    pub fn target_scope(&self) -> &TargetScope {
+        &self.scope
+    }
+
+    fn contains_action(&self, action: Action) -> bool {
+        self.protective_actions.contains(action)
+    }
+}
+
+pub struct ScopedEnforcementPlanner {
+    execution: EnforcementExecution,
+    policy: PlannerPolicy,
 }
 
 impl ScopedEnforcementPlanner {
@@ -60,10 +93,17 @@ impl ScopedEnforcementPlanner {
         selector: Option<&Selector>,
         protective_actions: ProtectiveActionProfile,
     ) -> Result<Self, EnforcementError> {
+        let policy = PlannerPolicy::compile(selector, protective_actions)?;
+        Self::with_planner_policy(mode, policy)
+    }
+
+    pub fn with_planner_policy(
+        mode: EnforcementMode,
+        policy: PlannerPolicy,
+    ) -> Result<Self, EnforcementError> {
         Ok(Self {
             execution: EnforcementExecution::without_backend(mode)?,
-            scope: TargetScope::compile(selector)?,
-            protective_actions,
+            policy,
         })
     }
 
@@ -72,10 +112,17 @@ impl ScopedEnforcementPlanner {
         protective_actions: ProtectiveActionProfile,
         backend: impl EnforcementBackend + 'static,
     ) -> Result<Self, EnforcementError> {
+        let policy = PlannerPolicy::compile(selector, protective_actions)?;
+        Self::with_backend_policy(policy, backend)
+    }
+
+    pub fn with_backend_policy(
+        policy: PlannerPolicy,
+        backend: impl EnforcementBackend + 'static,
+    ) -> Result<Self, EnforcementError> {
         Ok(Self {
             execution: EnforcementExecution::Enforce(Box::new(backend)),
-            scope: TargetScope::compile(selector)?,
-            protective_actions,
+            policy,
         })
     }
 
@@ -84,10 +131,17 @@ impl ScopedEnforcementPlanner {
         protective_actions: ProtectiveActionProfile,
         surface: SetupTimeEnforcementSurface,
     ) -> Result<Self, EnforcementError> {
+        let policy = PlannerPolicy::compile(selector, protective_actions)?;
+        Self::with_setup_time_policy(policy, surface)
+    }
+
+    pub fn with_setup_time_policy(
+        policy: PlannerPolicy,
+        surface: SetupTimeEnforcementSurface,
+    ) -> Result<Self, EnforcementError> {
         Ok(Self {
             execution: EnforcementExecution::SetupTimeOnly(surface),
-            scope: TargetScope::compile(selector)?,
-            protective_actions,
+            policy,
         })
     }
 
@@ -96,15 +150,19 @@ impl ScopedEnforcementPlanner {
     }
 
     pub fn protective_actions(&self) -> &[Action] {
-        self.protective_actions.actions()
+        self.policy.protective_actions()
+    }
+
+    pub fn replace_policy(&mut self, policy: PlannerPolicy) {
+        self.policy = policy;
     }
 
     pub fn target_scope(&self) -> &TargetScope {
-        &self.scope
+        self.policy.target_scope()
     }
 
     pub fn may_include_process(&self, process: &ProcessContext) -> bool {
-        self.scope.may_include_process(process)
+        self.policy.target_scope().may_include_process(process)
     }
 }
 
@@ -129,7 +187,7 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
             });
         }
 
-        let selector_matched = self.scope.matches_trigger(request.trigger);
+        let selector_matched = self.policy.target_scope().matches_trigger(request.trigger);
         let (outcome, effective_action, reason) = if !selector_matched {
             (
                 EnforcementOutcome::SelectorMiss,
@@ -139,7 +197,7 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
                     request.verdict.action, request.verdict.reason
                 ),
             )
-        } else if !self.protective_actions.contains(request.verdict.action) {
+        } else if !self.policy.contains_action(request.verdict.action) {
             (
                 EnforcementOutcome::Unsupported,
                 Action::Observe,
@@ -519,6 +577,39 @@ mod tests {
     }
 
     #[test]
+    fn scoped_planner_policy_replacement_changes_scope_and_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut planner = ScopedEnforcementPlanner::with_protective_actions(
+            EnforcementMode::DryRun,
+            Some(&remote_port_selector(80)),
+            [Action::Deny],
+        )?;
+
+        let decision = evaluate_plan(&mut planner, Action::Deny, 80)?;
+        assert_eq!(decision.outcome, EnforcementOutcome::DryRun);
+        assert!(decision.selector_matched);
+
+        let policy = PlannerPolicy::compile(
+            Some(&remote_port_selector(443)),
+            ProtectiveActionProfile::new([Action::Reset])?,
+        )?;
+        planner.replace_policy(policy);
+
+        let old_scope_decision = evaluate_plan(&mut planner, Action::Deny, 80)?;
+        assert_eq!(old_scope_decision.outcome, EnforcementOutcome::SelectorMiss);
+        assert!(!old_scope_decision.selector_matched);
+
+        let new_profile_decision = evaluate_plan(&mut planner, Action::Reset, 443)?;
+        assert_eq!(new_profile_decision.outcome, EnforcementOutcome::DryRun);
+        assert!(new_profile_decision.selector_matched);
+
+        let rejected_action = evaluate_plan(&mut planner, Action::Deny, 443)?;
+        assert_eq!(rejected_action.outcome, EnforcementOutcome::Unsupported);
+        assert!(rejected_action.selector_matched);
+        Ok(())
+    }
+
+    #[test]
     fn enforce_mode_delegates_to_backend() -> Result<(), Box<dyn std::error::Error>> {
         let mut planner = ScopedEnforcementPlanner::with_backend(
             None,
@@ -689,6 +780,38 @@ mod tests {
         ));
     }
 
+    fn evaluate_plan(
+        planner: &mut impl EnforcementPlanner,
+        action: Action,
+        remote_port: u16,
+    ) -> Result<EnforcementDecision, Box<dyn std::error::Error>> {
+        let trigger = request_event_with_remote_port(Direction::Outbound, remote_port);
+        let verdict = Verdict {
+            action,
+            scope: VerdictScope::Flow,
+            reason: "managed policy".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+        Ok(planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("protective verdict should produce enforcement audit"))
+    }
+
+    fn remote_port_selector(remote_port: u16) -> Selector {
+        Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![remote_port],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        )
+    }
+
     struct ApplyingBackend;
 
     impl EnforcementBackend for ApplyingBackend {
@@ -741,16 +864,24 @@ mod tests {
     }
 
     fn request_event(direction: Direction) -> EventEnvelope {
-        request_event_from_source(direction, CaptureSource::Replay)
+        request_event_with_remote_port(direction, 80)
     }
 
-    fn request_event_from_source(direction: Direction, source: CaptureSource) -> EventEnvelope {
+    fn request_event_with_remote_port(direction: Direction, remote_port: u16) -> EventEnvelope {
+        request_event_from_source(direction, CaptureSource::Replay, remote_port)
+    }
+
+    fn request_event_from_source(
+        direction: Direction,
+        source: CaptureSource,
+        remote_port: u16,
+    ) -> EventEnvelope {
         EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
-            demo_flow(),
+            demo_flow(remote_port),
             CaptureOrigin::from_source(source),
             "test",
             EventKind::HttpRequestHeaders(HttpHeaders {
@@ -772,14 +903,14 @@ mod tests {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
-            demo_flow(),
+            demo_flow(80),
             CaptureOrigin::from_source(CaptureSource::Replay),
             "test",
             EventKind::ConnectionClosed,
         )
     }
 
-    fn demo_flow() -> FlowContext {
+    fn demo_flow(remote_port: u16) -> FlowContext {
         let process = ProcessIdentity {
             pid: 100,
             tgid: 100,
@@ -800,7 +931,7 @@ mod tests {
         };
         let remote = AddressPort {
             address: "127.0.0.1".to_string(),
-            port: 80,
+            port: remote_port,
         };
 
         FlowContext {

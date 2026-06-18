@@ -166,7 +166,8 @@ async fn check_enforcement(
     backend: Option<Box<dyn EnforcementBackend>>,
 ) -> Result<EnforcementCheckSnapshot, CheckError> {
     let enforcement = build_configured_enforcement_with_backend(plan, backend).await?;
-    let policy = enforcement.policy_source.as_ref().map_or(
+    let active_policy = &enforcement.active_policy;
+    let policy = active_policy.policy_source().map_or(
         EnforcementPolicyCheckSnapshot {
             mode: EnforcementPolicyCheckMode::NotConfigured,
             active: None,
@@ -196,9 +197,9 @@ async fn check_enforcement(
             selector_configured: plan.enforcement.interception.selector_configured,
             capability: plan.enforcement.interception.capability.clone(),
         },
-        effective_selector_configured: enforcement.effective_selector_configured,
+        effective_selector_configured: active_policy.effective_selector_configured(),
         config_selector_configured: enforcement.config_selector_configured,
-        manifest_selector_configured: enforcement.manifest_selector_configured,
+        manifest_selector_configured: active_policy.manifest_selector_configured(),
         policy,
     })
 }

@@ -107,6 +107,7 @@ pub struct TrafficSelector {
     pub remote_addresses: Vec<String>,
 }
 
+#[derive(Clone)]
 pub struct CompiledSelector {
     node: CompiledSelectorNode,
 }
@@ -156,6 +157,7 @@ impl CompiledSelector {
     }
 }
 
+#[derive(Clone)]
 enum CompiledSelectorNode {
     Match(Box<CompiledSelectorTerm>),
     All(Vec<CompiledSelectorNode>),
@@ -260,6 +262,7 @@ impl CompiledSelectorNode {
     }
 }
 
+#[derive(Clone)]
 struct CompiledSelectorTerm {
     term: SelectorTerm,
     exe_path_globs: Option<GlobSet>,

@@ -1,6 +1,5 @@
 use std::{io::Write, os::unix::net::UnixStream, path::PathBuf, sync::Arc};
 
-use enforcement::ScopedEnforcementPlanner;
 use interception::TransparentInterceptionHostRuleScope;
 use parsers::Http1ParserFactory;
 use pipeline::{
@@ -13,7 +12,10 @@ use storage::FjallSpool;
 use crate::{
     admin::{AdminRuntimeState, AdminServerConfig, spawn_admin_server},
     capture_provider::build_capture_provider,
-    configured_enforcement::build_configured_enforcement_with_backend,
+    configured_enforcement::{
+        EnforcementRuntimeState, RuntimeEnforcementPlanner,
+        build_configured_enforcement_with_backend,
+    },
     configured_policy::load_configured_pipeline_policies,
     error::AgentError,
     export::{ExportDrainError, ExportWorker, ExportWorkerConfig, drain_planned_sinks},
@@ -58,9 +60,13 @@ pub(crate) async fn run_live_agent(
     let export_worker = export_worker_config_from_plan(&plan).map(ExportWorker::new);
     let pipeline_metrics = PipelineRuntimeMetrics::default();
     let policy_set = policies.into_policy_set();
+    let (enforcement_planner, enforcement_runtime) = EnforcementRuntimeState::from_planner(
+        enforcement.planner,
+        enforcement.active_policy.clone(),
+    );
     let tls_plaintext_runtime = TlsPlaintextRuntimeState::for_plan(&plan);
     let admin_runtime_state = AdminRuntimeState {
-        enforcement_policy_source: enforcement.policy_source.clone(),
+        enforcement: Some(enforcement_runtime),
         export_worker: export_worker.as_ref().map(ExportWorker::runtime_state),
         pipeline: Some(pipeline_metrics.clone()),
         policy_set: policy_set.clone(),
@@ -92,7 +98,7 @@ pub(crate) async fn run_live_agent(
         plan: plan.clone(),
         spool: Arc::clone(&spool),
         policy_set,
-        enforcement_planner: enforcement.planner,
+        enforcement_planner,
         transparent_interception_setup_scope: enforcement.transparent_interception_setup_scope,
         transparent_interception,
         pipeline_metrics,
@@ -144,7 +150,7 @@ struct BlockingCaptureRun {
     plan: RuntimePlan,
     spool: Arc<FjallSpool>,
     policy_set: PipelinePolicySet,
-    enforcement_planner: ScopedEnforcementPlanner,
+    enforcement_planner: RuntimeEnforcementPlanner,
     transparent_interception_setup_scope: Option<TransparentInterceptionHostRuleScope>,
     transparent_interception: TransparentInterceptionRuntime,
     pipeline_metrics: PipelineRuntimeMetrics,

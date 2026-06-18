@@ -11,13 +11,13 @@ use runtime::{CapturePlanMode, IngressRetentionPlan, RuntimePlan};
 use serde::Serialize;
 use storage::{FjallSpool, SpoolProbe, SpoolSnapshot};
 
-use crate::configured_enforcement::LoadedEnforcementPolicySource;
+use crate::configured_enforcement::ActiveEnforcementPolicy;
 use crate::export::ExportWorkerRuntimeSnapshot;
 use crate::tls_plaintext::{TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot};
 
 use super::{
     enforcement::{
-        EnforcementStatusSnapshot, enforcement_status, enforcement_status_with_loaded_source,
+        EnforcementStatusSnapshot, enforcement_status, enforcement_status_with_active_policy,
     },
     export::{
         ExportStatusSnapshot, ExporterStatusSnapshot, backing_off_exporter_count, export_status,
@@ -97,12 +97,21 @@ pub struct ExportMetricsSnapshot {
     pub backing_off_sink_count: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct RuntimeStatusInput {
-    pub enforcement_policy_source: Option<LoadedEnforcementPolicySource>,
+    pub enforcement: EnforcementRuntimeStatusInput,
     pub export_worker: Option<ExportWorkerRuntimeSnapshot>,
     pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
     pub tls_plaintext: Option<TlsPlaintextRuntimeSnapshot>,
+}
+
+#[derive(Clone, Default)]
+pub enum EnforcementRuntimeStatusInput {
+    #[default]
+    OfflineInspect,
+    Runtime {
+        active_policy: Box<ActiveEnforcementPolicy>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,9 +265,11 @@ fn build_status_snapshot_at_with_runtime(
         export_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_export_sequence),
     };
     let policy = policy_status(plan);
-    let enforcement = match runtime.enforcement_policy_source.as_ref() {
-        Some(source) => enforcement_status_with_loaded_source(plan, Some(source)),
-        None => enforcement_status(plan),
+    let enforcement = match &runtime.enforcement {
+        EnforcementRuntimeStatusInput::OfflineInspect => enforcement_status(plan),
+        EnforcementRuntimeStatusInput::Runtime { active_policy } => {
+            enforcement_status_with_active_policy(plan, active_policy)
+        }
     };
     let capabilities = capabilities_with_runtime(plan, runtime.tls_plaintext.as_ref());
     let tls = tls_status(plan, &capabilities, runtime.tls_plaintext.clone());

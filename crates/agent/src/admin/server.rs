@@ -1,10 +1,6 @@
 use std::{
     fs,
-    os::unix::{
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
-        net::UnixStream as StdUnixStream,
-    },
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,11 +9,9 @@ use std::{
 };
 
 use runtime::RuntimePlan;
-use serde::{Deserialize, Serialize};
 use storage::FjallSpool;
-use thiserror::Error;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
     sync::Notify,
     task::JoinSet,
@@ -25,54 +19,28 @@ use tokio::{
 
 use pipeline::{PipelinePolicySet, PipelineRuntimeMetrics};
 
-use super::policy_reload::{PolicyReloadGate, reload_policies};
-use crate::configured_enforcement::LoadedEnforcementPolicySource;
-use crate::configured_policy::ConfiguredPolicySource;
+use super::{
+    enforcement_reload::{EnforcementReloadGate, reload_enforcement_policy},
+    policy_reload::{PolicyReloadGate, reload_policies},
+    protocol::{AdminRequest, AdminResponse, enforcement_policy_reload_source, read_admin_request},
+    socket::{AdminError, AdminServerConfig, bind_admin_socket},
+};
+use crate::configured_enforcement::EnforcementRuntimeState;
 use crate::export::ExportWorkerRuntimeState;
 use crate::status::{
-    AgentStatusSnapshot, MetricsSnapshot, PROMETHEUS_TEXT_CONTENT_TYPE, RuntimeStatusInput,
-    build_status_snapshot_with_runtime, collect_running_spool_status, render_prometheus_metrics,
+    AgentStatusSnapshot, EnforcementRuntimeStatusInput, PROMETHEUS_TEXT_CONTENT_TYPE,
+    RuntimeStatusInput, build_status_snapshot_with_runtime, collect_running_spool_status,
+    render_prometheus_metrics,
 };
 use crate::tls_plaintext::TlsPlaintextRuntimeState;
 
-const ADMIN_REQUEST_MAX_BYTES: usize = 4 * 1024;
-const ADMIN_SOCKET_MODE: u32 = 0o600;
 const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const ADMIN_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const ROOT_UID: u32 = 0;
-
-#[derive(Debug, Error)]
-pub enum AdminError {
-    #[error("admin socket path is empty")]
-    EmptySocketPath,
-    #[error("admin socket path {path} exists and is not a Unix socket")]
-    SocketPathNotSocket { path: String },
-    #[error("admin socket {path} already has a listener")]
-    SocketAlreadyInUse { path: String },
-    #[error("admin socket parent {path} is unsafe: {reason}")]
-    UnsafeSocketParent { path: String, reason: String },
-    #[error("admin socket {path} has unsafe permissions {mode:o}")]
-    UnsafeSocketMode { path: String, mode: u32 },
-    #[error("failed to probe existing admin socket {path}: {source}")]
-    ProbeExistingSocket {
-        path: String,
-        source: std::io::Error,
-    },
-    #[error("admin socket filesystem error for {path}: {source}")]
-    SocketFile {
-        path: String,
-        source: std::io::Error,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdminServerConfig {
-    pub socket_path: PathBuf,
-}
 
 #[derive(Clone, Default)]
 pub struct AdminRuntimeState {
-    pub enforcement_policy_source: Option<LoadedEnforcementPolicySource>,
+    pub enforcement: Option<EnforcementRuntimeState>,
+    pub enforcement_reload_gate: EnforcementReloadGate,
     pub export_worker: Option<ExportWorkerRuntimeState>,
     pub pipeline: Option<PipelineRuntimeMetrics>,
     pub policy_reload_gate: PolicyReloadGate,
@@ -146,127 +114,6 @@ impl AdminServerHandle {
                 self.socket_path.display()
             );
         }
-    }
-}
-
-fn bind_admin_socket(path: &Path) -> Result<UnixListener, AdminError> {
-    if path.as_os_str().is_empty() {
-        return Err(AdminError::EmptySocketPath);
-    }
-    validate_admin_socket_parent(path)?;
-    remove_stale_admin_socket(path)?;
-    let listener = UnixListener::bind(path).map_err(|source| AdminError::SocketFile {
-        path: path.display().to_string(),
-        source,
-    })?;
-    if let Err(error) =
-        set_private_admin_socket_permissions(path).and_then(|()| validate_admin_socket_mode(path))
-    {
-        let _ = fs::remove_file(path);
-        return Err(error);
-    }
-    Ok(listener)
-}
-
-fn set_private_admin_socket_permissions(path: &Path) -> Result<(), AdminError> {
-    fs::set_permissions(path, fs::Permissions::from_mode(ADMIN_SOCKET_MODE)).map_err(|source| {
-        AdminError::SocketFile {
-            path: path.display().to_string(),
-            source,
-        }
-    })
-}
-
-fn validate_admin_socket_parent(path: &Path) -> Result<(), AdminError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AdminError::UnsafeSocketParent {
-            path: path.display().to_string(),
-            reason: "socket path has no parent directory".to_string(),
-        })?;
-    let metadata = fs::symlink_metadata(parent).map_err(|source| AdminError::SocketFile {
-        path: parent.display().to_string(),
-        source,
-    })?;
-    if metadata.file_type().is_symlink() {
-        return Err(AdminError::UnsafeSocketParent {
-            path: parent.display().to_string(),
-            reason: "parent directory cannot be a symlink".to_string(),
-        });
-    }
-    if !metadata.file_type().is_dir() {
-        return Err(AdminError::UnsafeSocketParent {
-            path: parent.display().to_string(),
-            reason: "parent path is not a directory".to_string(),
-        });
-    }
-    let mode = metadata.permissions().mode();
-    if mode & 0o077 != 0 {
-        return Err(AdminError::UnsafeSocketParent {
-            path: parent.display().to_string(),
-            reason: format!("parent directory is accessible by group/other users: {mode:o}"),
-        });
-    }
-    let owner = metadata.uid();
-    let current_euid = rustix::process::geteuid().as_raw();
-    if owner != ROOT_UID && owner != current_euid {
-        return Err(AdminError::UnsafeSocketParent {
-            path: parent.display().to_string(),
-            reason: format!(
-                "parent directory owner {owner} is neither root nor current euid {current_euid}"
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn validate_admin_socket_mode(path: &Path) -> Result<(), AdminError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| AdminError::SocketFile {
-        path: path.display().to_string(),
-        source,
-    })?;
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode != ADMIN_SOCKET_MODE {
-        return Err(AdminError::UnsafeSocketMode {
-            path: path.display().to_string(),
-            mode,
-        });
-    }
-    Ok(())
-}
-
-fn remove_stale_admin_socket(path: &Path) -> Result<(), AdminError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(AdminError::SocketFile {
-                path: path.display().to_string(),
-                source,
-            });
-        }
-    };
-    if !metadata.file_type().is_socket() {
-        return Err(AdminError::SocketPathNotSocket {
-            path: path.display().to_string(),
-        });
-    }
-
-    match StdUnixStream::connect(path) {
-        Ok(_) => Err(AdminError::SocketAlreadyInUse {
-            path: path.display().to_string(),
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-            fs::remove_file(path).map_err(|source| AdminError::SocketFile {
-                path: path.display().to_string(),
-                source,
-            })
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(AdminError::ProbeExistingSocket {
-            path: path.display().to_string(),
-            source,
-        }),
     }
 }
 
@@ -350,48 +197,6 @@ async fn handle_admin_connection(
     stream.write_all(&bytes).await
 }
 
-async fn read_admin_request(stream: &mut UnixStream) -> Result<AdminRequest, AdminRequestError> {
-    let bytes = read_admin_request_line(stream).await?;
-    let trimmed = trim_ascii_whitespace(&bytes);
-    if trimmed.is_empty() {
-        return Err(AdminRequestError::Empty);
-    }
-    serde_json::from_slice(trimmed).map_err(AdminRequestError::Json)
-}
-
-async fn read_admin_request_line(stream: &mut UnixStream) -> Result<Vec<u8>, AdminRequestError> {
-    let mut bytes = Vec::new();
-    let mut byte = [0_u8; 1];
-    loop {
-        let read = stream.read(&mut byte).await?;
-        if read == 0 {
-            break;
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        bytes.push(byte[0]);
-        if bytes.len() > ADMIN_REQUEST_MAX_BYTES {
-            return Err(AdminRequestError::TooLarge {
-                limit: ADMIN_REQUEST_MAX_BYTES,
-            });
-        }
-    }
-    Ok(bytes)
-}
-
-fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(start, |index| index + 1);
-    &bytes[start..end]
-}
-
 async fn handle_admin_request(
     request: AdminRequest,
     plan: &RuntimePlan,
@@ -413,6 +218,29 @@ async fn handle_admin_request(
                 },
                 Err(source) => AdminResponse::Error {
                     message: format!("failed to reload policies: {source}"),
+                },
+            }
+        }
+        AdminRequest::ReloadEnforcementPolicy => {
+            match reload_enforcement_policy(
+                plan,
+                runtime_state.enforcement.as_ref(),
+                &runtime_state.enforcement_reload_gate,
+            )
+            .await
+            {
+                Ok(summary) => AdminResponse::EnforcementPolicyReload {
+                    source: enforcement_policy_reload_source(&summary.active_policy),
+                    effective_selector_configured: summary
+                        .active_policy
+                        .effective_selector_configured(),
+                    manifest_selector_configured: summary
+                        .active_policy
+                        .manifest_selector_configured(),
+                    protective_actions: summary.active_policy.protective_actions().clone(),
+                },
+                Err(source) => AdminResponse::Error {
+                    message: format!("failed to reload enforcement policy: {source}"),
                 },
             }
         }
@@ -447,7 +275,12 @@ fn build_admin_status_snapshot(
         plan,
         collect_running_spool_status(plan, spool),
         RuntimeStatusInput {
-            enforcement_policy_source: runtime_state.enforcement_policy_source.clone(),
+            enforcement: runtime_state.enforcement.as_ref().map_or(
+                EnforcementRuntimeStatusInput::OfflineInspect,
+                |state| EnforcementRuntimeStatusInput::Runtime {
+                    active_policy: Box::new(state.active_policy()),
+                },
+            ),
             export_worker: runtime_state
                 .export_worker
                 .as_ref()
@@ -464,59 +297,17 @@ fn build_admin_status_snapshot(
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "command")]
-enum AdminRequest {
-    Status,
-    Metrics,
-    PrometheusMetrics,
-    ReloadPolicies,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-enum AdminResponse {
-    Status {
-        snapshot: Box<AgentStatusSnapshot>,
-    },
-    Metrics {
-        metrics: Box<MetricsSnapshot>,
-    },
-    PrometheusMetrics {
-        content_type: &'static str,
-        metrics: String,
-    },
-    PolicyReload {
-        loaded_count: u64,
-        policies: Vec<ConfiguredPolicySource>,
-    },
-    Error {
-        message: String,
-    },
-}
-
-#[derive(Debug, Error)]
-enum AdminRequestError {
-    #[error("failed to read admin request: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("admin request is empty")]
-    Empty,
-    #[error("admin request exceeds {limit} bytes")]
-    TooLarge { limit: usize },
-    #[error("failed to parse admin request JSON: {0}")]
-    Json(serde_json::Error),
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
         collections::BTreeMap,
-        os::unix::net::UnixListener as StdUnixListener,
+        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use capture::ReplayProvider;
+    use enforcement::{EnforcementPlanRequest, EnforcementPlanner, ScopedEnforcementPlanner};
     use parsers::Http1ParserFactory;
     use pipeline::{CapturePipeline, PipelineRuntimeMetrics};
     use probe_config::{
@@ -524,18 +315,24 @@ mod tests {
         EnforcementPolicySourceConfig, ExporterConfig,
     };
     use probe_core::{
-        Action, AddressPort, CapabilityState, Direction, FlowContext, FlowIdentity, ProcessContext,
-        ProcessIdentity, ProtectiveActionProfile, RuntimeMode, SpoolPayloadSchema, Timestamp,
-        TransportProtocol,
+        Action, AddressPort, CapabilityKind, CapabilityState, CaptureOrigin, CaptureSource,
+        Direction, EnforcementDecision, EnforcementMode, EnforcementOutcome, EventEnvelope,
+        EventKind, FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity,
+        ProcessSelector, ProtectiveActionProfile, RuntimeMode, Selector, SpoolPayloadSchema,
+        Timestamp, TrafficSelector, TransportProtocol, Verdict, VerdictScope,
     };
     use runtime::{
         CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
     };
     use serde_json::json;
     use storage::SpoolPayload;
-    use tokio::{io::AsyncWriteExt, net::UnixStream};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixStream,
+    };
 
     use super::*;
+    use crate::configured_enforcement::LoadedEnforcementPolicySource;
 
     #[tokio::test]
     async fn admin_status_request_returns_running_spool_snapshot()
@@ -672,10 +469,9 @@ mod tests {
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
         let plan = Arc::new(runtime_plan_from_config(config)?);
         let runtime_state = AdminRuntimeState {
-            enforcement_policy_source: Some(LoadedEnforcementPolicySource::local(
-                manifest_path.clone(),
-                manifest,
-            )),
+            enforcement: Some(enforcement_runtime(Some(
+                LoadedEnforcementPolicySource::local(manifest_path.clone(), manifest),
+            ))?),
             ..AdminRuntimeState::default()
         };
         fs::remove_file(&manifest_path)?;
@@ -714,124 +510,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_socket_uses_private_permissions() -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("admin-mode")?;
+    async fn admin_reload_enforcement_policy_swaps_active_planner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-enforcement-reload")?;
         let socket_path = temp.join("admin.sock");
         let spool_path = temp.join("spool");
+        let manifest_path = temp.join("enforcement.toml");
+        write_enforcement_manifest(&manifest_path, "initial", 80, Action::Deny)?;
+        let mut config = config_with_storage_path(spool_path.clone());
+        config.enforcement.mode = EnforcementMode::DryRun;
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: manifest_path.clone(),
+        };
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
-        let plan = Arc::new(runtime_plan(spool_path)?);
+        let plan = Arc::new(runtime_plan_from_config(config)?);
+        let configured =
+            crate::configured_enforcement::build_configured_enforcement_with_backend(&plan, None)
+                .await?;
+        let (mut planner_view, runtime_state) =
+            EnforcementRuntimeState::from_planner(configured.planner, configured.active_policy);
+        let initial_decision = enforcement_decision(&mut planner_view, Action::Deny, 80)?;
+        assert_eq!(initial_decision.outcome, EnforcementOutcome::DryRun);
+        assert!(initial_decision.selector_matched);
         let server = spawn_admin_server(
             Arc::clone(&plan),
             Arc::clone(&spool),
             AdminServerConfig {
                 socket_path: socket_path.clone(),
             },
-            AdminRuntimeState::default(),
-        )?;
-
-        let mode = fs::symlink_metadata(&socket_path)?.permissions().mode() & 0o777;
-
-        assert_eq!(mode, ADMIN_SOCKET_MODE);
-        server.stop().await;
-        drop(spool);
-        fs::remove_dir_all(temp)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn admin_socket_rejects_shared_parent() -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("admin-unsafe-parent")?;
-        fs::set_permissions(&temp, fs::Permissions::from_mode(0o755))?;
-        let socket_path = temp.join("admin.sock");
-        let spool_path = temp.join("spool");
-        let spool = Arc::new(FjallSpool::open(&spool_path)?);
-        let plan = Arc::new(runtime_plan(spool_path)?);
-
-        let result = spawn_admin_server(
-            Arc::clone(&plan),
-            Arc::clone(&spool),
-            AdminServerConfig { socket_path },
-            AdminRuntimeState::default(),
-        );
-
-        assert!(matches!(result, Err(AdminError::UnsafeSocketParent { .. })));
-        fs::set_permissions(&temp, fs::Permissions::from_mode(0o700))?;
-        drop(spool);
-        fs::remove_dir_all(temp)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn admin_socket_rejects_existing_non_socket() -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("admin-non-socket")?;
-        let socket_path = temp.join("admin.sock");
-        fs::write(&socket_path, b"not a socket")?;
-        let spool_path = temp.join("spool");
-        let spool = Arc::new(FjallSpool::open(&spool_path)?);
-        let plan = Arc::new(runtime_plan(spool_path)?);
-
-        let result = spawn_admin_server(
-            Arc::clone(&plan),
-            Arc::clone(&spool),
-            AdminServerConfig { socket_path },
-            AdminRuntimeState::default(),
-        );
-
-        assert!(matches!(
-            result,
-            Err(AdminError::SocketPathNotSocket { .. })
-        ));
-        drop(spool);
-        fs::remove_dir_all(temp)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn admin_socket_rejects_active_listener() -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("admin-active-listener")?;
-        let socket_path = temp.join("admin.sock");
-        let active_listener = StdUnixListener::bind(&socket_path)?;
-        let spool_path = temp.join("spool");
-        let spool = Arc::new(FjallSpool::open(&spool_path)?);
-        let plan = Arc::new(runtime_plan(spool_path)?);
-
-        let result = spawn_admin_server(
-            Arc::clone(&plan),
-            Arc::clone(&spool),
-            AdminServerConfig {
-                socket_path: socket_path.clone(),
+            AdminRuntimeState {
+                enforcement: Some(runtime_state),
+                ..AdminRuntimeState::default()
             },
-            AdminRuntimeState::default(),
+        )?;
+        write_enforcement_manifest(&manifest_path, "reloaded", 443, Action::Reset)?;
+
+        let response = send_admin_request(
+            &socket_path,
+            json!({ "command": "reload_enforcement_policy" }),
+        )
+        .await?;
+
+        assert_eq!(response["kind"], json!("enforcement_policy_reload"));
+        assert_eq!(response["source"]["manifest"]["version"], json!("reloaded"));
+        assert_eq!(response["effective_selector_configured"], json!(true));
+        assert_eq!(response["manifest_selector_configured"], json!(true));
+        assert_eq!(response["protective_actions"], json!(["reset"]));
+
+        let old_scope_decision = enforcement_decision(&mut planner_view, Action::Deny, 80)?;
+        assert_eq!(old_scope_decision.outcome, EnforcementOutcome::SelectorMiss);
+        assert!(!old_scope_decision.selector_matched);
+
+        let new_scope_decision = enforcement_decision(&mut planner_view, Action::Reset, 443)?;
+        assert_eq!(new_scope_decision.outcome, EnforcementOutcome::DryRun);
+        assert!(new_scope_decision.selector_matched);
+
+        fs::write(&manifest_path, b"id = ")?;
+        let failed_reload = send_admin_request(
+            &socket_path,
+            json!({ "command": "reload_enforcement_policy" }),
+        )
+        .await?;
+        assert_eq!(failed_reload["kind"], json!("error"));
+        assert!(
+            failed_reload["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("failed to reload enforcement policy"))
         );
 
-        assert!(matches!(result, Err(AdminError::SocketAlreadyInUse { .. })));
-        drop(active_listener);
-        drop(spool);
-        fs::remove_dir_all(temp)?;
-        Ok(())
-    }
+        let retained_decision = enforcement_decision(&mut planner_view, Action::Reset, 443)?;
+        assert_eq!(retained_decision.outcome, EnforcementOutcome::DryRun);
+        assert!(retained_decision.selector_matched);
 
-    #[tokio::test]
-    async fn admin_socket_replaces_stale_socket() -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("admin-stale-socket")?;
-        let socket_path = temp.join("admin.sock");
-        let stale_listener = StdUnixListener::bind(&socket_path)?;
-        drop(stale_listener);
-        let spool_path = temp.join("spool");
-        let spool = Arc::new(FjallSpool::open(&spool_path)?);
-        let plan = Arc::new(runtime_plan(spool_path)?);
+        let status = send_admin_request(&socket_path, json!({ "command": "status" })).await?;
+        assert_eq!(
+            status["snapshot"]["enforcement"]["policy"]["source"]["manifest"]["version"],
+            json!("reloaded")
+        );
+        assert_eq!(
+            status["snapshot"]["enforcement"]["policy"]["source"]["manifest"]["protective_actions"],
+            json!(["reset"])
+        );
 
-        let server = spawn_admin_server(
-            Arc::clone(&plan),
-            Arc::clone(&spool),
-            AdminServerConfig {
-                socket_path: socket_path.clone(),
-            },
-            AdminRuntimeState::default(),
-        )?;
-        let response = send_admin_request(&socket_path, json!({ "command": "metrics" })).await?;
-
-        assert_eq!(response["kind"], json!("metrics"));
         server.stop().await;
         drop(spool);
         fs::remove_dir_all(temp)?;
@@ -906,7 +666,7 @@ mod tests {
                 CaptureBackend::Replay,
                 CaptureProviderBuilder::Replay,
             )],
-            Vec::<CapabilityState>::new(),
+            test_platform_capabilities(),
         );
         RuntimePlan::build(config, &registry)
     }
@@ -935,7 +695,111 @@ mod tests {
         }
     }
 
+    fn test_platform_capabilities() -> Vec<CapabilityState> {
+        vec![
+            CapabilityState::available(CapabilityKind::Http1),
+            CapabilityState::available(CapabilityKind::Sse),
+            CapabilityState::available(CapabilityKind::WebSocketHandoff),
+            CapabilityState::available(CapabilityKind::WebSocketFrame),
+            CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
+            CapabilityState::available(CapabilityKind::DryRunEnforcement),
+            CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
+            CapabilityState::unavailable(CapabilityKind::TransparentInterception, "not built"),
+        ]
+    }
+
+    fn enforcement_runtime(
+        policy_source: Option<LoadedEnforcementPolicySource>,
+    ) -> Result<EnforcementRuntimeState, enforcement::EnforcementError> {
+        let planner = ScopedEnforcementPlanner::new(EnforcementMode::AuditOnly, None)?;
+        let protective_actions = policy_source
+            .as_ref()
+            .map_or_else(ProtectiveActionProfile::default, |source| {
+                source.manifest.protective_actions.clone()
+            });
+        let effective_selector = policy_source
+            .as_ref()
+            .and_then(|source| source.manifest.selector.clone());
+        let active_policy = crate::configured_enforcement::ActiveEnforcementPolicy::new(
+            effective_selector,
+            protective_actions,
+            policy_source,
+        )?;
+        let (_, runtime_state) = EnforcementRuntimeState::from_planner(planner, active_policy);
+        Ok(runtime_state)
+    }
+
+    fn write_enforcement_manifest(
+        path: &Path,
+        version: &str,
+        remote_port: u16,
+        action: Action,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = EnforcementPolicyManifest {
+            id: "managed-apps".to_string(),
+            version: version.to_string(),
+            selector: Some(Selector::term(
+                ProcessSelector::default(),
+                TrafficSelector {
+                    remote_ports: vec![remote_port],
+                    directions: vec![Direction::Outbound],
+                    ..TrafficSelector::default()
+                },
+            )),
+            protective_actions: ProtectiveActionProfile::new([action])?,
+        };
+        fs::write(path, toml::to_string(&manifest)?)?;
+        Ok(())
+    }
+
+    fn enforcement_decision(
+        planner: &mut impl EnforcementPlanner,
+        action: Action,
+        remote_port: u16,
+    ) -> Result<EnforcementDecision, Box<dyn std::error::Error>> {
+        let trigger = request_event(remote_port);
+        let verdict = Verdict {
+            action,
+            scope: VerdictScope::Flow,
+            reason: "managed policy".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+        Ok(planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("protective verdict should produce enforcement audit"))
+    }
+
+    fn request_event(remote_port: u16) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            demo_flow_with_remote_port(remote_port),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some("/".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        )
+    }
+
     fn demo_flow() -> FlowContext {
+        demo_flow_with_remote_port(80)
+    }
+
+    fn demo_flow_with_remote_port(remote_port: u16) -> FlowContext {
         let process = ProcessIdentity {
             pid: 1,
             tgid: 1,
@@ -956,7 +820,7 @@ mod tests {
         };
         let remote = AddressPort {
             address: "127.0.0.1".to_string(),
-            port: 80,
+            port: remote_port,
         };
         FlowContext {
             id: FlowIdentity::stable(&process, &local, &remote, TransportProtocol::Tcp, 1, None),

@@ -1,5 +1,6 @@
 use probe_core::{CompiledSelector, EventEnvelope, ProcessContext, Selector, SelectorError};
 
+#[derive(Clone)]
 pub struct TargetScope {
     selector: Option<CompiledSelector>,
 }

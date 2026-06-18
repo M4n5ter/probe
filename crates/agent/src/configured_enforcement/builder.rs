@@ -1,5 +1,6 @@
 use enforcement::{
-    EnforcementBackend, EnforcementError, ScopedEnforcementPlanner, SetupTimeEnforcementSurface,
+    EnforcementBackend, EnforcementError, PlannerPolicy, ScopedEnforcementPlanner,
+    SetupTimeEnforcementSurface,
 };
 use interception::{
     TransparentInterceptionHostRuleScope, TransparentInterceptionSetupSelectorSources,
@@ -27,15 +28,61 @@ pub enum ConfiguredEnforcementError {
     ExecutionBackendUnavailable,
 }
 
+#[derive(Clone)]
+pub(crate) struct ActiveEnforcementPolicy {
+    effective_selector: Option<Selector>,
+    planner_policy: PlannerPolicy,
+    policy_source: Option<LoadedEnforcementPolicySource>,
+}
+
+impl ActiveEnforcementPolicy {
+    pub(crate) fn new(
+        effective_selector: Option<Selector>,
+        protective_actions: ProtectiveActionProfile,
+        policy_source: Option<LoadedEnforcementPolicySource>,
+    ) -> Result<Self, EnforcementError> {
+        let planner_policy =
+            PlannerPolicy::compile(effective_selector.as_ref(), protective_actions)?;
+        Ok(Self {
+            effective_selector,
+            planner_policy,
+            policy_source,
+        })
+    }
+
+    pub(crate) fn effective_selector(&self) -> Option<&Selector> {
+        self.effective_selector.as_ref()
+    }
+
+    pub(crate) fn effective_selector_configured(&self) -> bool {
+        self.effective_selector.is_some()
+    }
+
+    pub(crate) fn manifest_selector_configured(&self) -> Option<bool> {
+        self.policy_source
+            .as_ref()
+            .map(|source| source.manifest.selector.is_some())
+    }
+
+    pub(crate) fn planner_policy(&self) -> &PlannerPolicy {
+        &self.planner_policy
+    }
+
+    pub(crate) fn policy_source(&self) -> Option<&LoadedEnforcementPolicySource> {
+        self.policy_source.as_ref()
+    }
+
+    pub(crate) fn protective_actions(&self) -> &ProtectiveActionProfile {
+        self.planner_policy.protective_action_profile()
+    }
+}
+
 pub struct ConfiguredEnforcement {
     pub planner: ScopedEnforcementPlanner,
     pub mode: EnforcementMode,
-    pub effective_selector_configured: bool,
     pub config_selector_configured: bool,
-    pub manifest_selector_configured: Option<bool>,
-    pub effective_selector: Option<Selector>,
+    pub active_policy: ActiveEnforcementPolicy,
     pub transparent_interception_setup_scope: Option<TransparentInterceptionHostRuleScope>,
-    pub policy_source: Option<LoadedEnforcementPolicySource>,
 }
 
 pub async fn build_configured_enforcement_with_backend(
@@ -54,7 +101,7 @@ pub async fn build_configured_enforcement_with_backend(
     let setup_selectors = TransparentInterceptionSetupSelectors::from_sources(
         TransparentInterceptionSetupSelectorSources {
             local_enforcement_selector: plan.config.enforcement.selector.as_ref(),
-            effective_enforcement_selector: configured.effective_selector.as_ref(),
+            effective_enforcement_selector: configured.active_policy.effective_selector(),
             interception_selector: plan.config.enforcement.interception.selector.as_ref(),
         },
     );
@@ -77,6 +124,27 @@ async fn build_configured_enforcement_from_parts(
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
     validate_enforcement_execution(mode, execution_surfaces, backend.is_some())?;
 
+    let policy_runtime =
+        load_configured_enforcement_policy_runtime(config_selector, policy_source_plan).await?;
+    let planner = scoped_enforcement_planner(
+        mode,
+        policy_runtime.planner_policy().clone(),
+        execution_surfaces,
+        backend,
+    )?;
+    Ok(ConfiguredEnforcement {
+        planner,
+        mode,
+        config_selector_configured,
+        active_policy: policy_runtime,
+        transparent_interception_setup_scope: None,
+    })
+}
+
+pub(crate) async fn load_configured_enforcement_policy_runtime(
+    config_selector: Option<Selector>,
+    policy_source_plan: &EnforcementPolicySourcePlan,
+) -> Result<ActiveEnforcementPolicy, ConfiguredEnforcementError> {
     let policy_source = load_enforcement_policy_source(policy_source_plan).await?;
     let effective_selector = effective_selector(
         config_selector,
@@ -89,52 +157,29 @@ async fn build_configured_enforcement_from_parts(
         .map_or_else(ProtectiveActionProfile::default, |source| {
             source.manifest.protective_actions.clone()
         });
-    let planner = scoped_enforcement_planner(
-        mode,
-        effective_selector.as_ref(),
-        protective_actions,
-        execution_surfaces,
-        backend,
-    )?;
-    Ok(ConfiguredEnforcement {
-        planner,
-        mode,
-        effective_selector_configured: effective_selector.is_some(),
-        config_selector_configured,
-        manifest_selector_configured: policy_source
-            .as_ref()
-            .map(|source| source.manifest.selector.is_some()),
-        effective_selector,
-        transparent_interception_setup_scope: None,
-        policy_source,
-    })
+    ActiveEnforcementPolicy::new(effective_selector, protective_actions, policy_source)
+        .map_err(ConfiguredEnforcementError::Planner)
 }
 
 fn scoped_enforcement_planner(
     mode: EnforcementMode,
-    selector: Option<&Selector>,
-    protective_actions: ProtectiveActionProfile,
+    policy: PlannerPolicy,
     execution_surfaces: &[EnforcementExecutionSurface],
     backend: Option<Box<dyn EnforcementBackend>>,
 ) -> Result<ScopedEnforcementPlanner, ConfiguredEnforcementError> {
     if mode != EnforcementMode::Enforce {
-        return ScopedEnforcementPlanner::with_protective_action_profile(
-            mode,
-            selector,
-            protective_actions,
-        )
-        .map_err(ConfiguredEnforcementError::Planner);
+        return ScopedEnforcementPlanner::with_planner_policy(mode, policy)
+            .map_err(ConfiguredEnforcementError::Planner);
     }
 
     if let Some(backend) = backend {
-        return ScopedEnforcementPlanner::with_backend(selector, protective_actions, backend)
+        return ScopedEnforcementPlanner::with_backend_policy(policy, backend)
             .map_err(ConfiguredEnforcementError::Planner);
     }
 
     if execution_surfaces == [EnforcementExecutionSurface::TransparentInterception] {
-        return ScopedEnforcementPlanner::with_setup_time_execution(
-            selector,
-            protective_actions,
+        return ScopedEnforcementPlanner::with_setup_time_policy(
+            policy,
             SetupTimeEnforcementSurface::TransparentInterception,
         )
         .map_err(ConfiguredEnforcementError::Planner);

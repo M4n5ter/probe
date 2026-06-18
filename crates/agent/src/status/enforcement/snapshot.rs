@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::configured_enforcement::{
-    EnforcementPolicySourceInspection, LoadedEnforcementPolicySource,
+    ActiveEnforcementPolicy, EnforcementPolicySourceInspection, LoadedEnforcementPolicySource,
     LoadedEnforcementPolicySourceOriginRef, inspect_enforcement_policy_source,
 };
 use probe_config::{ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig};
@@ -105,11 +105,11 @@ pub(in crate::status) fn enforcement_status(plan: &RuntimePlan) -> EnforcementSt
     enforcement_status_with_source(plan, EnforcementPolicyStatusSource::Offline)
 }
 
-pub(in crate::status) fn enforcement_status_with_loaded_source(
+pub(in crate::status) fn enforcement_status_with_active_policy(
     plan: &RuntimePlan,
-    source: Option<&LoadedEnforcementPolicySource>,
+    policy: &ActiveEnforcementPolicy,
 ) -> EnforcementStatusSnapshot {
-    enforcement_status_with_source(plan, EnforcementPolicyStatusSource::Loaded(source))
+    enforcement_status_with_source(plan, EnforcementPolicyStatusSource::Active(policy))
 }
 
 fn enforcement_status_with_source(
@@ -165,7 +165,7 @@ fn enforcement_capability_status(
 
 enum EnforcementPolicyStatusSource<'a> {
     Offline,
-    Loaded(Option<&'a LoadedEnforcementPolicySource>),
+    Active(&'a ActiveEnforcementPolicy),
 }
 
 fn enforcement_policy_status(
@@ -174,9 +174,7 @@ fn enforcement_policy_status(
 ) -> EnforcementPolicyStatus {
     match source {
         EnforcementPolicyStatusSource::Offline => offline_enforcement_policy_status(plan),
-        EnforcementPolicyStatusSource::Loaded(source) => {
-            loaded_enforcement_policy_status(plan, source)
-        }
+        EnforcementPolicyStatusSource::Active(policy) => active_enforcement_policy_status(policy),
     }
 }
 
@@ -206,25 +204,21 @@ fn offline_enforcement_policy_status(plan: &RuntimePlan) -> EnforcementPolicySta
     }
 }
 
-fn loaded_enforcement_policy_status(
-    plan: &RuntimePlan,
-    source: Option<&LoadedEnforcementPolicySource>,
-) -> EnforcementPolicyStatus {
-    let Some(source) = source else {
-        return not_configured_policy_status(plan);
+fn active_enforcement_policy_status(policy: &ActiveEnforcementPolicy) -> EnforcementPolicyStatus {
+    let Some(source) = policy.policy_source() else {
+        return EnforcementPolicyStatus {
+            effective_selector_configured: Some(policy.effective_selector_configured()),
+            manifest_selector_configured: None,
+            snapshot: EnforcementPolicyStatusSnapshot {
+                source: EnforcementPolicySourceStatusSnapshot::NotConfigured,
+            },
+        };
     };
 
-    let manifest = EnforcementPolicyManifestStatusSnapshot {
-        id: source.manifest.id.clone(),
-        version: source.manifest.version.clone(),
-        selector_configured: source.manifest.selector.is_some(),
-        protective_actions: source.manifest.protective_actions.clone(),
-    };
+    let manifest = loaded_enforcement_policy_manifest_status(source);
     let manifest_selector_configured = Some(manifest.selector_configured);
     EnforcementPolicyStatus {
-        effective_selector_configured: Some(
-            plan.enforcement.config_selector_configured || manifest.selector_configured,
-        ),
+        effective_selector_configured: Some(policy.effective_selector_configured()),
         manifest_selector_configured,
         snapshot: EnforcementPolicyStatusSnapshot {
             source: EnforcementPolicySourceStatusSnapshot::Loaded {
@@ -232,6 +226,17 @@ fn loaded_enforcement_policy_status(
                 manifest,
             },
         },
+    }
+}
+
+fn loaded_enforcement_policy_manifest_status(
+    source: &LoadedEnforcementPolicySource,
+) -> EnforcementPolicyManifestStatusSnapshot {
+    EnforcementPolicyManifestStatusSnapshot {
+        id: source.manifest.id.clone(),
+        version: source.manifest.version.clone(),
+        selector_configured: source.manifest.selector.is_some(),
+        protective_actions: source.manifest.protective_actions.clone(),
     }
 }
 
@@ -491,13 +496,14 @@ protective_actions = ["alert"]
             protective_actions: ProtectiveActionProfile::new([Action::Reset])?,
         };
 
-        let status = enforcement_status_with_loaded_source(
-            &plan,
-            Some(&LoadedEnforcementPolicySource::remote(
-                endpoint.clone(),
-                manifest,
-            )),
-        );
+        let policy_source = LoadedEnforcementPolicySource::remote(endpoint.clone(), manifest);
+        let active_policy = ActiveEnforcementPolicy::new(
+            None,
+            policy_source.manifest.protective_actions.clone(),
+            Some(policy_source),
+        )?;
+
+        let status = enforcement_status_with_active_policy(&plan, &active_policy);
 
         let EnforcementPolicySourceStatusSnapshot::Loaded {
             source: LoadedEnforcementPolicySourceStatusSnapshot::Remote { endpoint: actual },

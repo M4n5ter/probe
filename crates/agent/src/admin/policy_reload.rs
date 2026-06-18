@@ -74,7 +74,7 @@ mod tests {
         net::UnixStream,
     };
 
-    use super::super::server::{AdminRuntimeState, AdminServerConfig, spawn_admin_server};
+    use super::super::{AdminRuntimeState, AdminServerConfig, spawn_admin_server};
     use crate::configured_policy::load_configured_pipeline_policies;
 
     #[tokio::test]
