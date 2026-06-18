@@ -4,6 +4,7 @@ mod flow;
 mod frame;
 mod material;
 mod plaintext;
+mod provider;
 mod stream;
 
 pub use binding::{
@@ -20,6 +21,9 @@ pub use material::{
     TlsSessionSecretRecord, TlsSessionSecretStore, TlsSessionSecretSummary,
 };
 pub use plaintext::{Tls13SessionSecretPlaintextAdapter, Tls13SessionSecretPlaintextError};
+pub use provider::{
+    Tls13SessionSecretDecryptingProvider, Tls13SessionSecretDecryptingProviderError,
+};
 pub use stream::{
     Tls13SessionSecretStreamAdapter, Tls13SessionSecretStreamCursor, Tls13SessionSecretStreamError,
 };

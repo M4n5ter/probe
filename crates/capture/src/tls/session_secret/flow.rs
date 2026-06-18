@@ -74,6 +74,51 @@ impl Tls13SessionSecretFlowDecryptor {
         }
     }
 
+    pub fn finish_flow_observation(
+        &mut self,
+        timestamp: Option<Timestamp>,
+        flow: &FlowContext,
+    ) -> Vec<PlaintextEvent> {
+        let mut events = Vec::new();
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            let key = Tls13SessionSecretStreamKey::new(flow.id.clone(), direction);
+            if let Some(mut stream) = self.streams.remove(&key)
+                && let Some(timestamp) = timestamp
+                && let Some(event) = stream.close_with_incomplete_record_gap(timestamp)
+            {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    pub(in crate::tls::session_secret) fn close_flow_observation(
+        &mut self,
+        timestamp: Timestamp,
+        flow: &FlowContext,
+    ) -> Vec<PlaintextEvent> {
+        self.close_flow(timestamp, flow).unwrap_or_default()
+    }
+
+    pub(in crate::tls::session_secret) fn stream_has_buffered_ciphertext(
+        &self,
+        flow: &FlowIdentity,
+        direction: Direction,
+    ) -> bool {
+        self.streams
+            .get(&Tls13SessionSecretStreamKey::new(flow.clone(), direction))
+            .is_some_and(|stream| stream.buffered_ciphertext_bytes() > 0)
+    }
+
+    pub(in crate::tls::session_secret) fn stream_is_active(
+        &self,
+        flow: &FlowIdentity,
+        direction: Direction,
+    ) -> bool {
+        self.streams
+            .contains_key(&Tls13SessionSecretStreamKey::new(flow.clone(), direction))
+    }
+
     fn push_captured_bytes(
         &mut self,
         bytes: &CapturedBytes,
@@ -430,6 +475,55 @@ mod tests {
             None,
         )))?;
         assert!(after_close.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn finish_flow_observation_emits_gap_without_inventing_close_for_incomplete_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let record = session_secret_record()?;
+        let flow = demo_flow();
+        let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
+        decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
+            &record,
+            flow.clone(),
+            Direction::Outbound,
+            Tls13SessionSecretStreamCursor::start(),
+        ))?;
+        let wire_record = protected_application_record(&record, 0, b"truncated")?;
+        let split_at = 8;
+
+        let partial = decryptor.push_capture_event(&CaptureEvent::Bytes(captured_bytes(
+            flow.clone(),
+            Direction::Outbound,
+            0,
+            wire_record[..split_at].to_vec(),
+            None,
+        )))?;
+        assert!(partial.is_empty());
+
+        let events = decryptor.finish_flow_observation(Some(timestamp()), &flow);
+
+        let [event] = events.as_slice() else {
+            panic!("expected only a plaintext gap: {events:?}");
+        };
+        let PlaintextEventKind::Gap(gap) = &event.kind else {
+            panic!("expected plaintext gap");
+        };
+        assert!(
+            gap.gap
+                .reason
+                .contains("closed with incomplete protected record")
+        );
+
+        let after_finish = decryptor.push_capture_event(&CaptureEvent::Bytes(captured_bytes(
+            flow,
+            Direction::Outbound,
+            split_at as u64,
+            wire_record[split_at..].to_vec(),
+            None,
+        )))?;
+        assert!(after_finish.is_empty());
         Ok(())
     }
 

@@ -1,0 +1,130 @@
+use std::collections::VecDeque;
+
+use probe_core::{CapabilityKind, CapabilityState, Direction, FlowIdentity};
+use thiserror::Error;
+
+use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider};
+
+use super::{Tls13SessionSecretFlowBinding, Tls13SessionSecretFlowDecryptError};
+
+mod close;
+mod evidence;
+mod lifecycle;
+
+use evidence::Tls13SessionSecretFlowRegistry;
+
+pub struct Tls13SessionSecretDecryptingProvider {
+    inner: Box<dyn CaptureProvider>,
+    decryptor: super::Tls13SessionSecretFlowDecryptor,
+    flow_registry: Tls13SessionSecretFlowRegistry,
+    pending_events: VecDeque<CaptureEvent>,
+}
+
+impl Tls13SessionSecretDecryptingProvider {
+    pub fn new(inner: Box<dyn CaptureProvider>) -> Self {
+        Self {
+            inner,
+            decryptor: super::Tls13SessionSecretFlowDecryptor::new(),
+            flow_registry: Tls13SessionSecretFlowRegistry::new(),
+            pending_events: VecDeque::new(),
+        }
+    }
+
+    pub fn with_bindings<'a>(
+        inner: Box<dyn CaptureProvider>,
+        bindings: impl IntoIterator<Item = Tls13SessionSecretFlowBinding<'a>>,
+    ) -> Result<Self, Tls13SessionSecretDecryptingProviderError> {
+        let mut provider = Self::new(inner);
+        for binding in bindings {
+            provider.bind(binding)?;
+        }
+        Ok(provider)
+    }
+
+    pub fn bind(
+        &mut self,
+        binding: Tls13SessionSecretFlowBinding<'_>,
+    ) -> Result<(), Tls13SessionSecretDecryptingProviderError> {
+        let key =
+            Tls13SessionSecretDecryptingStreamKey::new(binding.flow.id.clone(), binding.direction);
+        if self.flow_registry.flow_is_closed(&key.flow) {
+            return Err(Tls13SessionSecretDecryptingProviderError::ClosedFlow {
+                flow: key.flow,
+                direction: key.direction,
+            });
+        }
+        if self.flow_registry.contains(&key) {
+            return Err(Tls13SessionSecretFlowDecryptError::AlreadyBound {
+                flow: key.flow,
+                direction: key.direction,
+            }
+            .into());
+        }
+        let flow = binding.flow.clone();
+        self.decryptor.bind(binding)?;
+        self.flow_registry.insert(key, flow);
+        Ok(())
+    }
+}
+
+impl CaptureProvider for Tls13SessionSecretDecryptingProvider {
+    fn name(&self) -> &'static str {
+        "tls_session_secret_decrypting"
+    }
+
+    fn capabilities(&self) -> Vec<CapabilityState> {
+        let mut capabilities = self.inner.capabilities();
+        capabilities.push(CapabilityState::degraded(
+            CapabilityKind::TlsSessionSecretRecordDecrypt,
+            "TLS session-secret decrypting provider requires explicit flow bindings and best-effort ciphertext capture",
+        ));
+        capabilities
+    }
+
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_pending_or_inner()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum Tls13SessionSecretDecryptingProviderError {
+    #[error("{source}")]
+    FlowDecrypt {
+        #[from]
+        source: Tls13SessionSecretFlowDecryptError,
+    },
+    #[error("TLS session-secret stream is closed for flow {flow:?} direction {direction:?}")]
+    ClosedFlow {
+        flow: FlowIdentity,
+        direction: Direction,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Tls13SessionSecretDecryptingStreamKey {
+    flow: FlowIdentity,
+    direction: Direction,
+}
+
+impl Tls13SessionSecretDecryptingStreamKey {
+    fn new(flow: FlowIdentity, direction: Direction) -> Self {
+        Self { flow, direction }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tls13SessionSecretCaptureDisposition {
+    BoundStream(Tls13SessionSecretDecryptingStreamKey),
+    BoundFlow(FlowIdentity),
+    ClosedFlow,
+    Unbound,
+}
+
+impl Tls13SessionSecretCaptureDisposition {
+    fn suppress_ciphertext(&self) -> bool {
+        !matches!(self, Self::Unbound)
+    }
+}
+
+#[cfg(test)]
+mod tests;
