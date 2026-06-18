@@ -234,13 +234,13 @@ pub(crate) fn wait_for_agent_policy_alert_count_at_least(
     admin_socket_path: &Path,
     expected: u64,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    wait_for_agent_progress_until(
+    wait_for_agent_counter_until(
         agent,
         admin_socket_path,
+        AgentProgressCounter::PolicyAlerts,
         format!("policy_alerts>={expected}"),
-        |metrics| metrics.alerts >= expected,
+        |value| value >= expected,
     )
-    .map(|metrics| metrics.alerts)
 }
 
 pub(crate) fn wait_for_agent_policy_alert_count_above(
@@ -248,13 +248,41 @@ pub(crate) fn wait_for_agent_policy_alert_count_above(
     admin_socket_path: &Path,
     previous: u64,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    wait_for_agent_progress_until(
+    wait_for_agent_counter_until(
         agent,
         admin_socket_path,
+        AgentProgressCounter::PolicyAlerts,
         format!("policy_alerts>{previous}"),
-        |metrics| metrics.alerts > previous,
+        |value| value > previous,
     )
-    .map(|metrics| metrics.alerts)
+}
+
+pub(crate) fn wait_for_agent_enforcement_decision_count_at_least(
+    agent: &mut Child,
+    admin_socket_path: &Path,
+    expected: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    wait_for_agent_counter_until(
+        agent,
+        admin_socket_path,
+        AgentProgressCounter::EnforcementDecisions,
+        format!("enforcement_decisions>={expected}"),
+        |value| value >= expected,
+    )
+}
+
+pub(crate) fn wait_for_agent_enforcement_decision_count_above(
+    agent: &mut Child,
+    admin_socket_path: &Path,
+    previous: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    wait_for_agent_counter_until(
+        agent,
+        admin_socket_path,
+        AgentProgressCounter::EnforcementDecisions,
+        format!("enforcement_decisions>{previous}"),
+        |value| value > previous,
+    )
 }
 
 pub(crate) fn wait_for_agent_pipeline_progress(
@@ -320,6 +348,57 @@ fn wait_for_agent_progress_until(
             Ok(metrics) => {
                 stable_polls = 0;
                 last_metrics = Some(metrics);
+            }
+            Err(error) => {
+                if let Some(status) = agent.try_wait()? {
+                    return Err(e2e_error(format!(
+                        "agent exited with {status} before progress reached {expectation}: {error}",
+                    ))
+                    .into());
+                }
+                if Instant::now() >= deadline {
+                    return Err(e2e_error(format!(
+                        "timed out waiting for agent progress to reach {expectation}: {error}",
+                    ))
+                    .into());
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(e2e_error(format!(
+                "timed out waiting for agent progress to reach {expectation}",
+            ))
+            .into());
+        }
+        thread::sleep(AGENT_PROGRESS_INTERVAL);
+    }
+}
+
+fn wait_for_agent_counter_until(
+    agent: &mut Child,
+    admin_socket_path: &Path,
+    counter: AgentProgressCounter,
+    expectation: String,
+    predicate: impl Fn(u64) -> bool,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + AGENT_PROGRESS_TIMEOUT;
+    let mut stable_polls = 0u8;
+    let mut last_value = None;
+    loop {
+        match read_agent_progress_counter(admin_socket_path, counter) {
+            Ok(value) if predicate(value) => {
+                stable_polls = match last_value {
+                    Some(previous) if previous == value => stable_polls.saturating_add(1),
+                    _ => 1,
+                };
+                last_value = Some(value);
+                if stable_polls >= AGENT_PROGRESS_STABLE_POLLS {
+                    return Ok(value);
+                }
+            }
+            Ok(value) => {
+                stable_polls = 0;
+                last_value = Some(value);
             }
             Err(error) => {
                 if let Some(status) = agent.try_wait()? {
@@ -480,6 +559,53 @@ impl AgentProgressMetrics {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentProgressCounter {
+    PolicyAlerts,
+    EnforcementDecisions,
+}
+
+impl AgentProgressCounter {
+    fn read_from(self, response: &serde_json::Value) -> Result<u64, Box<dyn std::error::Error>> {
+        match self {
+            Self::PolicyAlerts => {
+                let policy = &response["metrics"]["pipeline"]["policy"];
+                Ok(policy["alerts"].as_u64().ok_or_else(|| {
+                    e2e_error(format!(
+                        "admin metrics response omitted policy alert count: {response}"
+                    ))
+                })?)
+            }
+            Self::EnforcementDecisions => {
+                let enforcement = &response["metrics"]["pipeline"]["enforcement"];
+                Ok(enforcement["decisions"].as_u64().ok_or_else(|| {
+                    e2e_error(format!(
+                        "admin metrics response omitted enforcement decision count: {response}"
+                    ))
+                })?)
+            }
+        }
+    }
+}
+
+fn read_agent_progress_counter(
+    admin_socket_path: &Path,
+    counter: AgentProgressCounter,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let response = send_admin_request(
+        admin_socket_path,
+        serde_json::json!({ "command": "metrics" }),
+    )?;
+    let errors = read_policy_error_count(&response)?;
+    if errors > 0 {
+        return Err(e2e_error(format!(
+            "agent policy metrics reported {errors} runtime errors before expected progress"
+        ))
+        .into());
+    }
+    counter.read_from(&response)
+}
+
 fn read_agent_progress_metrics(
     admin_socket_path: &Path,
 ) -> Result<AgentProgressMetrics, Box<dyn std::error::Error>> {
@@ -504,17 +630,24 @@ fn read_agent_progress_metrics(
             "admin metrics response omitted policy alert count: {response}"
         ))
     })?;
-    let errors = policy["errors"].as_u64().ok_or_else(|| {
-        e2e_error(format!(
-            "admin metrics response omitted policy error count: {response}"
-        ))
-    })?;
+    let errors = read_policy_error_count(&response)?;
     Ok(AgentProgressMetrics {
         capture_events_read,
         export_events_written,
         alerts,
         errors,
     })
+}
+
+fn read_policy_error_count(
+    response: &serde_json::Value,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let policy = &response["metrics"]["pipeline"]["policy"];
+    Ok(policy["errors"].as_u64().ok_or_else(|| {
+        e2e_error(format!(
+            "admin metrics response omitted policy error count: {response}"
+        ))
+    })?)
 }
 
 pub(crate) fn send_admin_request(

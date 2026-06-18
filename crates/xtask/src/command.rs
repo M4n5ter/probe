@@ -46,6 +46,10 @@ const COMMANDS: &[XtaskCommand] = &[
         run: ebpf::run_build,
     },
     XtaskCommand {
+        name: "e2e-admin-enforcement-reload",
+        run: e2e::run_admin_enforcement_reload,
+    },
+    XtaskCommand {
         name: "e2e-admin-policy-reload",
         run: e2e::run_admin_policy_reload,
     },
