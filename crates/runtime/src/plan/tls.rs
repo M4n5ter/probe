@@ -62,6 +62,7 @@ impl TlsPlaintextInstrumentationPlan {
 pub struct TlsDecryptHintPlan {
     pub key_logs: Vec<TlsPlaintextMaterialPlan>,
     pub session_secrets: Vec<TlsPlaintextMaterialPlan>,
+    pub refresh_interval_ms: u64,
 }
 
 impl TlsDecryptHintPlan {
@@ -78,6 +79,7 @@ impl TlsDecryptHintPlan {
                 TlsMaterialKind::SessionSecretFile,
                 &materials_by_id,
             ),
+            refresh_interval_ms: config.tls.plaintext.decrypt_hints.refresh_interval_ms,
         }
     }
 }
@@ -243,6 +245,7 @@ mod tests {
         config.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-keys".to_string()];
         config.tls.plaintext.decrypt_hints.session_secret_refs =
             vec!["session-secrets".to_string()];
+        config.tls.plaintext.decrypt_hints.refresh_interval_ms = 250;
         config.tls.materials = vec![
             TlsMaterialConfig {
                 id: Some("ssl-keys".to_string()),
@@ -279,6 +282,7 @@ mod tests {
                 path: "/tmp/session-secrets.jsonl".into(),
             }]
         );
+        assert_eq!(plan.plaintext.decrypt_hints.refresh_interval_ms, 250);
     }
 
     fn capability_matrix_with_libssl(mode: RuntimeMode) -> CapabilityMatrix {

@@ -36,9 +36,9 @@ impl Tls13SessionSecretDecryptingProvider {
         }
     }
 
-    pub fn with_bindings<'a>(
+    pub fn with_bindings(
         inner: Box<dyn CaptureProvider>,
-        bindings: impl IntoIterator<Item = Tls13SessionSecretFlowBinding<'a>>,
+        bindings: impl IntoIterator<Item = Tls13SessionSecretFlowBinding>,
     ) -> Result<Self, Tls13SessionSecretDecryptingProviderError> {
         let mut provider = Self::new(inner);
         for binding in bindings {
@@ -49,7 +49,7 @@ impl Tls13SessionSecretDecryptingProvider {
 
     pub fn bind(
         &mut self,
-        binding: Tls13SessionSecretFlowBinding<'_>,
+        binding: Tls13SessionSecretFlowBinding,
     ) -> Result<(), Tls13SessionSecretDecryptingProviderError> {
         self.engine.bind(binding)
     }
@@ -66,7 +66,7 @@ impl Tls13SessionSecretDecryptingEngine {
 
     fn bind(
         &mut self,
-        binding: Tls13SessionSecretFlowBinding<'_>,
+        binding: Tls13SessionSecretFlowBinding,
     ) -> Result<(), Tls13SessionSecretDecryptingProviderError> {
         let key =
             Tls13SessionSecretDecryptingStreamKey::new(binding.flow.id.clone(), binding.direction);

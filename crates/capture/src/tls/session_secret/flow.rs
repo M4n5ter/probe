@@ -25,7 +25,7 @@ impl Tls13SessionSecretFlowDecryptor {
 
     pub fn bind(
         &mut self,
-        binding: Tls13SessionSecretFlowBinding<'_>,
+        binding: Tls13SessionSecretFlowBinding,
     ) -> Result<(), Tls13SessionSecretFlowDecryptError> {
         let Tls13SessionSecretFlowBinding {
             record,
@@ -41,7 +41,7 @@ impl Tls13SessionSecretFlowDecryptor {
             });
         }
         let adapter = Tls13SessionSecretStreamAdapter::from_session_secret_record_with_cursor(
-            record, flow, direction, cursor,
+            &record, flow, direction, cursor,
         )?
         .with_degradation("TLS session-secret decrypt uses best-effort ciphertext capture");
         self.streams.insert(key, adapter);
@@ -257,7 +257,7 @@ mod tests {
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
         decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
-            &record,
+            record.clone(),
             flow.clone(),
             Direction::Outbound,
             Tls13SessionSecretStreamCursor::start(),
@@ -295,7 +295,7 @@ mod tests {
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
         decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
-            &record,
+            record.clone(),
             flow.clone(),
             Direction::Inbound,
             Tls13SessionSecretStreamCursor::resume_at(128, 7, 2),
@@ -349,7 +349,7 @@ mod tests {
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
         decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
-            &record,
+            record.clone(),
             flow.clone(),
             Direction::Outbound,
             Tls13SessionSecretStreamCursor::resume_at(0, 42, 0),
@@ -389,7 +389,7 @@ mod tests {
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
         decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
-            &record,
+            record.clone(),
             flow.clone(),
             Direction::Outbound,
             Tls13SessionSecretStreamCursor::start(),
@@ -427,7 +427,7 @@ mod tests {
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
         decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
-            &record,
+            record.clone(),
             flow.clone(),
             Direction::Outbound,
             Tls13SessionSecretStreamCursor::start(),
@@ -485,7 +485,7 @@ mod tests {
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
         decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
-            &record,
+            record.clone(),
             flow.clone(),
             Direction::Outbound,
             Tls13SessionSecretStreamCursor::start(),

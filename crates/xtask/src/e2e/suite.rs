@@ -18,7 +18,10 @@ use super::{
         run_target_lifecycle as run_tls_plaintext_target_lifecycle_loopback,
     },
     tls_plaintext_provider_loopback::run as run_tls_plaintext_provider_loopback,
-    tls_session_secret_auto_binding_loopback::run as run_tls_session_secret_auto_binding_loopback,
+    tls_session_secret_auto_binding_loopback::{
+        run as run_tls_session_secret_auto_binding_loopback,
+        run_refresh as run_tls_session_secret_material_refresh_auto_binding_loopback,
+    },
     transparent_tproxy_loopback::run as run_transparent_tproxy_loopback,
     webhook_exporter::run as run_webhook_exporter,
     websocket_plaintext_feed::run as run_websocket_plaintext_feed,
@@ -222,6 +225,11 @@ const E2E_CASES: &[E2eCase] = &[
         name: "e2e-tls-session-secret-auto-binding-loopback",
         requirement: E2eRequirement::RootCapNetRaw,
         run: run_tls_session_secret_auto_binding_loopback,
+    },
+    E2eCase {
+        name: "e2e-tls-session-secret-material-refresh-auto-binding-loopback",
+        requirement: E2eRequirement::RootCapNetRaw,
+        run: run_tls_session_secret_material_refresh_auto_binding_loopback,
     },
     E2eCase {
         name: "e2e-transparent-tproxy-loopback",

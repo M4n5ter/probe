@@ -5,8 +5,9 @@ mod runtime;
 mod sidecar;
 
 pub(crate) use decrypt_hints::{
-    TlsDecryptHintError, TlsSessionSecretAutoBindingBuild, TlsSessionSecretAutoBindingPlan,
-    build_tls_session_secret_auto_binding, load_tls_session_secret_materials,
+    TlsDecryptHintError, TlsDecryptHintRuntimeSnapshot, TlsDecryptHintRuntimeState,
+    TlsSessionSecretAutoBindingBuild, TlsSessionSecretAutoBindingPlan,
+    build_tls_session_secret_auto_binding_with_runtime, load_tls_session_secret_materials,
 };
 pub(crate) use runtime::{
     TlsPlaintextInstrumentationBuild, TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot,

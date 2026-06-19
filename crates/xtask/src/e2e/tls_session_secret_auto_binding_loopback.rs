@@ -1,12 +1,12 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{Ipv4Addr, Shutdown, TcpListener, TcpStream},
     path::Path,
-    process::ExitCode,
+    process::{Child, ExitCode},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use capture::{
@@ -30,8 +30,9 @@ use super::{
         decode_envelope, e2e_error, ensure_e2e_packages_built, stop_running_child,
     },
     loopback::{
-        assert_no_policy_runtime_errors, merge_labeled_run_results, spawn_agent,
-        wait_for_agent_policy_progress, wait_for_agent_ready,
+        assert_no_policy_runtime_errors, merge_labeled_run_results, send_admin_request,
+        spawn_agent, wait_for_agent_pipeline_progress, wait_for_agent_policy_progress,
+        wait_for_agent_ready,
     },
 };
 
@@ -59,24 +60,42 @@ const TLS_LEGACY_RECORD_VERSION: [u8; 2] = [0x03, 0x03];
 const TLS_HANDSHAKE_CONTENT_TYPE: u8 = 0x16;
 const TLS_CLIENT_HELLO: u8 = 0x01;
 const TRAFFIC_DELAY: Duration = Duration::from_millis(25);
+const MATERIAL_REFRESH_INTERVAL_MS: u64 = 10;
+const MATERIAL_REFRESH_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) fn run() -> ExitCode {
-    match run_inner() {
+    run_case(SessionSecretMaterialTiming::Preloaded)
+}
+
+pub(crate) fn run_refresh() -> ExitCode {
+    run_case(SessionSecretMaterialTiming::RefreshAfterClientHello)
+}
+
+fn run_case(material_timing: SessionSecretMaterialTiming) -> ExitCode {
+    match run_inner(material_timing) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("e2e TLS session-secret auto-binding loopback failed: {error}");
+            eprintln!(
+                "e2e TLS session-secret {} loopback failed: {error}",
+                material_timing.label()
+            );
             ExitCode::FAILURE
         }
     }
 }
 
-fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
+fn run_inner(
+    material_timing: SessionSecretMaterialTiming,
+) -> Result<(), Box<dyn std::error::Error>> {
     ensure_e2e_packages_built(["agent"])?;
-    let root = create_temp_root("tls-session-secret-auto-binding-loopback")?;
-    match run_at(&root) {
+    let root = create_temp_root(material_timing.temp_root_prefix())?;
+    match run_at(&root, material_timing) {
         Ok(()) => {
             fs::remove_dir_all(&root)?;
-            println!("e2e TLS session-secret auto-binding loopback passed");
+            println!(
+                "e2e TLS session-secret {} loopback passed",
+                material_timing.label()
+            );
             Ok(())
         }
         Err(error) => {
@@ -86,7 +105,10 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn run_at(
+    root: &Path,
+    material_timing: SessionSecretMaterialTiming,
+) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(root)?;
     let fixture = SyntheticTls13SessionSecretFixture;
     fixture.validate()?;
@@ -101,7 +123,7 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     let supervisor = ChildSupervisor::new()?;
     write_policy_bundle(&policy_path, fixture)?;
-    write_session_secret_material(&session_secret_path, fixture)?;
+    material_timing.write_initial_session_secret_material(&session_secret_path, fixture)?;
     write_agent_config(
         &config_path,
         &policy_path,
@@ -109,13 +131,21 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
         &admin_socket_path,
         &session_secret_path,
         listen_port,
+        material_timing,
     )?;
 
     let mut ready_signal = UnixSocketReadySignal::bind(agent_ready_socket_path)?;
     let mut agent = supervisor.watch(spawn_agent(&config_path, &ready_signal)?, "agent");
     wait_for_agent_ready(agent.child_mut(), &mut ready_signal)?;
 
-    let traffic_result = run_synthetic_tls_traffic(listener, fixture);
+    let traffic_result = run_synthetic_tls_traffic(
+        listener,
+        fixture,
+        &session_secret_path,
+        material_timing,
+        agent.child_mut(),
+        &admin_socket_path,
+    );
     let progress_result = match &traffic_result {
         Ok(()) => wait_for_agent_policy_progress(agent.child_mut(), &admin_socket_path, 1),
         Err(_) => Ok(()),
@@ -139,13 +169,17 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn run_synthetic_tls_traffic(
     listener: TcpListener,
     fixture: SyntheticTls13SessionSecretFixture,
+    session_secret_path: &Path,
+    material_timing: SessionSecretMaterialTiming,
+    agent: &mut Child,
+    admin_socket_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = listener.local_addr()?;
     let server = thread::spawn(move || drain_server_connection(listener));
     let mut client = TcpStream::connect(listen_addr)?;
     client.set_nodelay(true)?;
     client.write_all(&fixture.client_hello_record())?;
-    thread::sleep(TRAFFIC_DELAY);
+    material_timing.after_client_hello(session_secret_path, fixture, agent, admin_socket_path)?;
     client.write_all(fixture.application_record())?;
     client.shutdown(Shutdown::Write)?;
     let server_result = server
@@ -197,7 +231,22 @@ fn write_session_secret_material(
     path: &Path,
     fixture: SyntheticTls13SessionSecretFixture,
 ) -> Result<(), std::io::Error> {
-    fs::write(path, fixture.session_secret_material_jsonl())
+    write_file_atomically(path, fixture.session_secret_material_jsonl().as_bytes())
+}
+
+fn write_file_atomically(path: &Path, content: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "session-secret-material".into());
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    {
+        let mut file = fs::File::create(&temp_path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+    }
+    fs::rename(temp_path, path)
 }
 
 fn write_agent_config(
@@ -207,10 +256,11 @@ fn write_agent_config(
     admin_socket_path: &Path,
     session_secret_path: &Path,
     listen_port: u16,
+    material_timing: SessionSecretMaterialTiming,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = AgentConfig {
         agent_id: "e2e-tls-session-secret-agent".to_string(),
-        config_version: "e2e-tls-session-secret-auto-binding-loopback".to_string(),
+        config_version: format!("e2e-tls-session-secret-{}", material_timing.label()),
         ..AgentConfig::default()
     };
     config.capture.selection = CaptureSelection::Libpcap;
@@ -232,6 +282,7 @@ fn write_agent_config(
         .decrypt_hints
         .session_secret_refs
         .push(SESSION_SECRET_ID.to_string());
+    config.tls.plaintext.decrypt_hints.refresh_interval_ms = MATERIAL_REFRESH_INTERVAL_MS;
     config.policies.push(PolicyConfig {
         id: POLICY_ID.to_string(),
         path: policy_path.to_path_buf(),
@@ -240,6 +291,93 @@ fn write_agent_config(
     });
     fs::write(path, toml::to_string(&config)?)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionSecretMaterialTiming {
+    Preloaded,
+    RefreshAfterClientHello,
+}
+
+impl SessionSecretMaterialTiming {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Preloaded => "auto-binding",
+            Self::RefreshAfterClientHello => "material-refresh-auto-binding",
+        }
+    }
+
+    fn temp_root_prefix(self) -> &'static str {
+        match self {
+            Self::Preloaded => "tls-session-secret-auto-binding-loopback",
+            Self::RefreshAfterClientHello => "tls-session-secret-refresh-loopback",
+        }
+    }
+
+    fn write_initial_session_secret_material(
+        self,
+        path: &Path,
+        fixture: SyntheticTls13SessionSecretFixture,
+    ) -> Result<(), std::io::Error> {
+        match self {
+            Self::Preloaded => write_session_secret_material(path, fixture),
+            Self::RefreshAfterClientHello => write_file_atomically(path, b"\n"),
+        }
+    }
+
+    fn after_client_hello(
+        self,
+        session_secret_path: &Path,
+        fixture: SyntheticTls13SessionSecretFixture,
+        agent: &mut Child,
+        admin_socket_path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Preloaded => {
+                thread::sleep(TRAFFIC_DELAY);
+                Ok(())
+            }
+            Self::RefreshAfterClientHello => {
+                wait_for_agent_pipeline_progress(agent, admin_socket_path, 0, 1, 0)?;
+                write_session_secret_material(session_secret_path, fixture)?;
+                wait_for_session_secret_refresh_generation(admin_socket_path, 1)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+fn wait_for_session_secret_refresh_generation(
+    admin_socket_path: &Path,
+    expected_generation: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + MATERIAL_REFRESH_WAIT_TIMEOUT;
+    loop {
+        let response =
+            send_admin_request(admin_socket_path, serde_json::json!({"command": "status"}))?;
+        let refresh = response
+            .pointer("/snapshot/tls/plaintext/decrypt_hints/runtime/session_secret_refresh")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let generation = refresh
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let mode = refresh
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        if generation >= expected_generation && mode == "active" {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(e2e_error(format!(
+                "timed out waiting for TLS session-secret refresh generation {expected_generation}; last refresh status {refresh}"
+            ))
+            .into());
+        }
+        thread::sleep(TRAFFIC_DELAY);
+    }
 }
 
 fn assert_spool_outputs(

@@ -6,7 +6,7 @@ use runtime::{RuntimePlan, TlsPlaintextCapabilityPlan, TlsPlaintextMaterialPlan}
 use serde::Serialize;
 
 use crate::tls_material::{FilesystemTlsMaterialStore, TlsMaterialFileStore};
-use crate::tls_plaintext::TlsPlaintextRuntimeSnapshot;
+use crate::tls_plaintext::{TlsDecryptHintRuntimeSnapshot, TlsPlaintextRuntimeSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TlsStatusSnapshot {
@@ -34,6 +34,7 @@ pub struct TlsPlaintextInstrumentationStatusSnapshot {
 pub struct TlsDecryptHintStatusSnapshot {
     pub key_logs: Vec<TlsPlaintextMaterialStatusSnapshot>,
     pub session_secrets: Vec<TlsPlaintextMaterialStatusSnapshot>,
+    pub runtime: Option<TlsDecryptHintRuntimeSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -86,9 +87,10 @@ pub(in crate::status) fn tls_status(
     plan: &RuntimePlan,
     capabilities: &CapabilityMatrix,
     runtime: Option<TlsPlaintextRuntimeSnapshot>,
+    decrypt_hint_runtime: Option<TlsDecryptHintRuntimeSnapshot>,
 ) -> TlsStatusSnapshot {
     TlsStatusSnapshot {
-        plaintext: plaintext_status(plan, capabilities, runtime),
+        plaintext: plaintext_status(plan, capabilities, runtime, decrypt_hint_runtime),
         materials: plan
             .config
             .tls
@@ -108,6 +110,7 @@ fn plaintext_status(
     plan: &RuntimePlan,
     capabilities: &CapabilityMatrix,
     runtime: Option<TlsPlaintextRuntimeSnapshot>,
+    decrypt_hint_runtime: Option<TlsDecryptHintRuntimeSnapshot>,
 ) -> TlsPlaintextStatusSnapshot {
     let plaintext = &plan.tls.plaintext;
     let instrumentation = &plaintext.instrumentation;
@@ -135,6 +138,7 @@ fn plaintext_status(
         decrypt_hints: TlsDecryptHintStatusSnapshot {
             key_logs: plaintext_material_statuses(&plaintext.decrypt_hints.key_logs),
             session_secrets: plaintext_material_statuses(&plaintext.decrypt_hints.session_secrets),
+            runtime: decrypt_hint_runtime,
         },
     }
 }
@@ -191,6 +195,8 @@ mod tests {
     use probe_core::{CapabilityKind, CapabilityState, RuntimeMode, Selector};
     use serde_json::json;
 
+    use crate::tls_plaintext::TlsDecryptHintRuntimeState;
+
     use super::super::super::plan_fixture::{
         config_with_storage_path, runtime_plan_from_config, test_dir,
     };
@@ -209,7 +215,7 @@ mod tests {
         }];
         let plan = runtime_plan_from_config(config, Vec::new())?;
 
-        let status = tls_status(&plan, &plan.capabilities, None);
+        let status = tls_status(&plan, &plan.capabilities, None, None);
 
         assert_eq!(status.materials.len(), 1);
         let material = &status.materials[0];
@@ -245,7 +251,7 @@ mod tests {
             vec![CapabilityState::available(CapabilityKind::LibsslUprobe)],
         )?;
 
-        let status = tls_status(&plan, &plan.capabilities, None);
+        let status = tls_status(&plan, &plan.capabilities, None, None);
 
         let instrumentation = &status.plaintext.instrumentation;
         assert!(instrumentation.enabled);
@@ -286,6 +292,92 @@ mod tests {
     }
 
     #[test]
+    fn tls_status_reports_decrypt_hint_runtime() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-tls-decrypt-hint-runtime")?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.capture.selection = probe_config::CaptureSelection::Libpcap;
+        config
+            .tls
+            .plaintext
+            .decrypt_hints
+            .session_secret_refs
+            .push("session-secrets".to_string());
+        config.tls.materials.push(probe_config::TlsMaterialConfig {
+            id: Some("session-secrets".to_string()),
+            kind: probe_config::TlsMaterialKind::SessionSecretFile,
+            path: temp.join("session-secrets.jsonl"),
+        });
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+        let runtime = TlsDecryptHintRuntimeState::for_plan(&plan).snapshot();
+
+        let status = tls_status(&plan, &plan.capabilities, None, Some(runtime));
+
+        assert!(
+            status
+                .plaintext
+                .decrypt_hints
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| {
+                    runtime.session_secret_refresh.configured_ref_count == 1
+                        && runtime.session_secret_refresh.enabled_ref_count == 1
+                        && runtime.session_secret_refresh.generation == 0
+                })
+        );
+        let value = serde_json::to_value(&status)?;
+        assert_eq!(
+            value["plaintext"]["decrypt_hints"]["runtime"]["session_secret_refresh"]["mode"],
+            json!("pending")
+        );
+        assert_eq!(
+            value["plaintext"]["decrypt_hints"]["runtime"]["session_secret_refresh"]["generation"],
+            json!(0)
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tls_status_reports_configured_but_disabled_decrypt_hint_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-tls-disabled-decrypt-hint-runtime")?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.capture.selection = probe_config::CaptureSelection::Replay;
+        config
+            .tls
+            .plaintext
+            .decrypt_hints
+            .session_secret_refs
+            .push("session-secrets".to_string());
+        config.tls.materials.push(probe_config::TlsMaterialConfig {
+            id: Some("session-secrets".to_string()),
+            kind: probe_config::TlsMaterialKind::SessionSecretFile,
+            path: temp.join("session-secrets.jsonl"),
+        });
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+        let runtime = TlsDecryptHintRuntimeState::for_plan(&plan).snapshot();
+
+        let status = tls_status(&plan, &plan.capabilities, None, Some(runtime));
+
+        let refresh = &status
+            .plaintext
+            .decrypt_hints
+            .runtime
+            .as_ref()
+            .expect("decrypt hint runtime status")
+            .session_secret_refresh;
+        assert_eq!(refresh.configured_ref_count, 1);
+        assert_eq!(refresh.enabled_ref_count, 0);
+        let value = serde_json::to_value(&status)?;
+        assert_eq!(
+            value["plaintext"]["decrypt_hints"]["runtime"]["session_secret_refresh"]["mode"],
+            json!("disabled")
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
     fn tls_status_reports_configured_plaintext_material_refs()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("status-tls-plaintext-materials")?;
@@ -311,7 +403,7 @@ mod tests {
         ];
         let plan = runtime_plan_from_config(config, Vec::new())?;
 
-        let status = tls_status(&plan, &plan.capabilities, None);
+        let status = tls_status(&plan, &plan.capabilities, None, None);
 
         assert_eq!(
             status.plaintext.instrumentation.capability,
@@ -350,7 +442,7 @@ mod tests {
         }];
         let plan = runtime_plan_from_config(config, Vec::new())?;
 
-        let status = tls_status(&plan, &plan.capabilities, None);
+        let status = tls_status(&plan, &plan.capabilities, None, None);
 
         let material = &status.materials[0];
         assert_eq!(material.purpose, TlsMaterialPurpose::DecryptHint);

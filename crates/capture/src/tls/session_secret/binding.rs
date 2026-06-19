@@ -11,16 +11,16 @@ use super::{
 };
 
 #[derive(Debug, Clone)]
-pub struct Tls13SessionSecretFlowBinding<'a> {
-    pub(in crate::tls::session_secret) record: &'a TlsSessionSecretRecord,
+pub struct Tls13SessionSecretFlowBinding {
+    pub(in crate::tls::session_secret) record: TlsSessionSecretRecord,
     pub(in crate::tls::session_secret) flow: FlowContext,
     pub(in crate::tls::session_secret) direction: Direction,
     pub(in crate::tls::session_secret) cursor: Tls13SessionSecretStreamCursor,
 }
 
-impl<'a> Tls13SessionSecretFlowBinding<'a> {
+impl Tls13SessionSecretFlowBinding {
     pub(in crate::tls::session_secret) fn resume_at(
-        record: &'a TlsSessionSecretRecord,
+        record: TlsSessionSecretRecord,
         flow: FlowContext,
         direction: Direction,
         cursor: Tls13SessionSecretStreamCursor,
@@ -143,7 +143,7 @@ impl<'a> Tls13SessionSecretFlowBindingPlanner<'a> {
     pub fn plan(
         &self,
         candidate: Tls13SessionSecretFlowCandidate,
-    ) -> Result<Tls13SessionSecretFlowBinding<'a>, Tls13SessionSecretFlowBindingPlanError> {
+    ) -> Result<Tls13SessionSecretFlowBinding, Tls13SessionSecretFlowBindingPlanError> {
         let secret_kind = candidate.secret_kind.session_secret_kind();
         let at_wall_time_unix_ns = candidate
             .lookup_time
@@ -155,7 +155,7 @@ impl<'a> Tls13SessionSecretFlowBindingPlanner<'a> {
             at_wall_time_unix_ns,
         ) {
             TlsMaterialLookup::Found(record) => Ok(Tls13SessionSecretFlowBinding::resume_at(
-                record,
+                record.clone(),
                 candidate.flow,
                 candidate.direction,
                 candidate.cursor,

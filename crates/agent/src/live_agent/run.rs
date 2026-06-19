@@ -24,7 +24,7 @@ use crate::{
     storage_retention::{
         StorageRetentionWorkerConfig, StorageRetentionWorkerHandle, spawn_storage_retention_workers,
     },
-    tls_plaintext::TlsPlaintextRuntimeState,
+    tls_plaintext::{TlsDecryptHintRuntimeState, TlsPlaintextRuntimeState},
     transparent_interception::{TransparentInterceptionGuard, TransparentInterceptionRuntime},
 };
 
@@ -54,7 +54,9 @@ pub(crate) async fn run_live_agent(
     validate_static_runtime_config(&agent_config)?;
     let runtime = build_runtime_composition(agent_config)?;
     let (plan, enforcement_backend, transparent_interception) = runtime.into_run_parts();
-    let capture_provider_preflight = CaptureProviderPreflight::build(&plan)?;
+    let tls_decrypt_hint_runtime = TlsDecryptHintRuntimeState::for_plan(&plan);
+    let capture_provider_preflight =
+        CaptureProviderPreflight::build(&plan, Some(&tls_decrypt_hint_runtime))?;
     let enforcement = build_configured_enforcement_with_backend(&plan, enforcement_backend).await?;
     let policies = load_configured_pipeline_policies(&plan.config)?;
     let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
@@ -71,6 +73,7 @@ pub(crate) async fn run_live_agent(
         export_worker: export_worker.as_ref().map(ExportWorker::runtime_state),
         pipeline: Some(pipeline_metrics.clone()),
         policy_set: policy_set.clone(),
+        tls_decrypt_hints: Some(tls_decrypt_hint_runtime.clone()),
         tls_plaintext: Some(tls_plaintext_runtime.clone()),
         ..AdminRuntimeState::default()
     };

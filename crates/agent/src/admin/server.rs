@@ -32,7 +32,7 @@ use crate::status::{
     RuntimeStatusInput, build_status_snapshot_with_runtime, collect_running_spool_status,
     render_prometheus_metrics,
 };
-use crate::tls_plaintext::TlsPlaintextRuntimeState;
+use crate::tls_plaintext::{TlsDecryptHintRuntimeState, TlsPlaintextRuntimeState};
 
 const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const ADMIN_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -45,6 +45,7 @@ pub struct AdminRuntimeState {
     pub pipeline: Option<PipelineRuntimeMetrics>,
     pub policy_reload_gate: PolicyReloadGate,
     pub policy_set: PipelinePolicySet,
+    pub tls_decrypt_hints: Option<TlsDecryptHintRuntimeState>,
     pub tls_plaintext: Option<TlsPlaintextRuntimeState>,
 }
 
@@ -289,6 +290,10 @@ fn build_admin_status_snapshot(
                 .pipeline
                 .as_ref()
                 .map(PipelineRuntimeMetrics::snapshot),
+            tls_decrypt_hints: runtime_state
+                .tls_decrypt_hints
+                .as_ref()
+                .map(TlsDecryptHintRuntimeState::snapshot),
             tls_plaintext: runtime_state
                 .tls_plaintext
                 .as_ref()

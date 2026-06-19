@@ -1,79 +1,13 @@
 use std::path::PathBuf;
 
 use capture::{
-    CaptureProvider, Tls13ApplicationDataDecryptor, Tls13DecryptError,
-    Tls13SessionSecretAutoBindingProvider, TlsSessionSecretRecord, TlsSessionSecretStore,
+    Tls13ApplicationDataDecryptor, Tls13DecryptError, TlsSessionSecretRecord, TlsSessionSecretStore,
 };
 use probe_config::TlsMaterialKind;
-use runtime::{CapturePlanMode, RuntimePlan, TlsPlaintextMaterialPlan};
+use runtime::TlsPlaintextMaterialPlan;
 use thiserror::Error;
 
-use crate::tls_material::{FilesystemTlsMaterialStore, TlsMaterialFileStore};
-
-pub(crate) fn build_tls_session_secret_auto_binding(
-    plan: &RuntimePlan,
-) -> Result<TlsSessionSecretAutoBindingBuild, TlsDecryptHintError> {
-    build_tls_session_secret_auto_binding_with_store(plan, &FilesystemTlsMaterialStore)
-}
-
-fn build_tls_session_secret_auto_binding_with_store(
-    plan: &RuntimePlan,
-    file_store: &impl TlsMaterialFileStore,
-) -> Result<TlsSessionSecretAutoBindingBuild, TlsDecryptHintError> {
-    match TlsSessionSecretAutoBindingPlan::for_runtime(plan) {
-        TlsSessionSecretAutoBindingPlan::Disabled => {
-            Ok(TlsSessionSecretAutoBindingBuild::NotConfigured)
-        }
-        TlsSessionSecretAutoBindingPlan::Enabled { materials } => {
-            let materials = load_tls_session_secret_materials(materials, file_store)?;
-            Ok(TlsSessionSecretAutoBindingBuild::Enabled(
-                materials.build_auto_binding_store()?,
-            ))
-        }
-    }
-}
-
-pub(crate) enum TlsSessionSecretAutoBindingPlan<'a> {
-    Disabled,
-    Enabled {
-        materials: &'a [TlsPlaintextMaterialPlan],
-    },
-}
-
-impl<'a> TlsSessionSecretAutoBindingPlan<'a> {
-    pub(crate) fn for_runtime(plan: &'a RuntimePlan) -> Self {
-        let materials = plan.tls.plaintext.decrypt_hints.session_secrets.as_slice();
-        if materials.is_empty() {
-            return Self::Disabled;
-        }
-        match plan.capture.mode {
-            CapturePlanMode::Live => Self::Enabled { materials },
-            CapturePlanMode::PlaintextFeed
-            | CapturePlanMode::Replay
-            | CapturePlanMode::Unavailable => Self::Disabled,
-        }
-    }
-
-    pub(crate) fn is_enabled(&self) -> bool {
-        matches!(self, Self::Enabled { .. })
-    }
-}
-
-pub(crate) enum TlsSessionSecretAutoBindingBuild {
-    NotConfigured,
-    Enabled(TlsSessionSecretStore),
-}
-
-impl TlsSessionSecretAutoBindingBuild {
-    pub(crate) fn wrap(self, primary: Box<dyn CaptureProvider>) -> Box<dyn CaptureProvider> {
-        match self {
-            Self::NotConfigured => primary,
-            Self::Enabled(store) => {
-                Box::new(Tls13SessionSecretAutoBindingProvider::new(primary, store))
-            }
-        }
-    }
-}
+use crate::tls_material::{TlsMaterialFileStore, TlsMaterialFileStoreError};
 
 #[derive(Debug)]
 pub(crate) struct TlsSessionSecretMaterialSet {
@@ -90,11 +24,21 @@ impl TlsSessionSecretMaterialSet {
     ) -> Result<TlsSessionSecretStore, TlsDecryptHintError> {
         let mut records = Vec::new();
         for material in &self.materials {
+            let mut material_records = Vec::new();
             for record in material.store.records() {
                 if let Some(record) = live_auto_binding_record(material, record)? {
-                    records.push(record);
+                    material_records.push(record);
                 }
             }
+            if material_records.is_empty() {
+                return Err(TlsDecryptHintError::SessionSecretMaterialSet {
+                    reason: format!(
+                        "session_secret_refs material {} ({:?}) at {:?} does not contain any session_secret_file TLS 1.3 application traffic secret record usable by live auto-binding",
+                        material.id, material.kind, material.path
+                    ),
+                });
+            }
+            records.extend(material_records);
         }
         TlsSessionSecretStore::from_time_qualified_lookup_records(records)
             .map_err(|source| TlsDecryptHintError::SessionSecretMaterialSet {
@@ -116,7 +60,7 @@ pub(crate) struct TlsSessionSecretMaterial {
 
 pub(crate) fn load_tls_session_secret_materials(
     materials: &[TlsPlaintextMaterialPlan],
-    file_store: &impl TlsMaterialFileStore,
+    file_store: &(impl TlsMaterialFileStore + ?Sized),
 ) -> Result<TlsSessionSecretMaterialSet, TlsDecryptHintError> {
     materials
         .iter()
@@ -124,17 +68,93 @@ pub(crate) fn load_tls_session_secret_materials(
             let bytes = file_store
                 .read_tls_material(&material.path)
                 .map_err(|source| tls_session_secret_plan_material_error(material, source))?;
-            let store = TlsSessionSecretStore::parse(&bytes)
-                .map_err(|source| tls_session_secret_plan_material_error(material, source))?;
-            Ok(TlsSessionSecretMaterial {
-                id: material.id.clone(),
-                kind: material.kind,
-                path: material.path.clone(),
-                store,
-            })
+            decode_tls_session_secret_material(material, &bytes)
         })
         .collect::<Result<Vec<_>, _>>()
         .map(|materials| TlsSessionSecretMaterialSet { materials })
+}
+
+pub(super) enum TlsSessionSecretMaterialLoad {
+    Ready(TlsSessionSecretStore),
+    Pending,
+}
+
+enum TlsSessionSecretMaterialSetLoad {
+    Ready(TlsSessionSecretMaterialSet),
+    Pending,
+}
+
+pub(super) fn load_tls_session_secret_auto_binding_material(
+    materials: &[TlsPlaintextMaterialPlan],
+    file_store: &(impl TlsMaterialFileStore + ?Sized),
+) -> Result<TlsSessionSecretMaterialLoad, TlsDecryptHintError> {
+    let TlsSessionSecretMaterialSetLoad::Ready(materials) =
+        load_tls_session_secret_materials_if_available(materials, file_store)?
+    else {
+        return Ok(TlsSessionSecretMaterialLoad::Pending);
+    };
+    Ok(TlsSessionSecretMaterialLoad::Ready(
+        materials.build_auto_binding_store()?,
+    ))
+}
+
+fn load_tls_session_secret_materials_if_available(
+    materials: &[TlsPlaintextMaterialPlan],
+    file_store: &(impl TlsMaterialFileStore + ?Sized),
+) -> Result<TlsSessionSecretMaterialSetLoad, TlsDecryptHintError> {
+    let mut pending_material = false;
+    let mut loaded_materials = Vec::new();
+    for material in materials {
+        let Some(loaded) = load_tls_session_secret_material_if_available(material, file_store)?
+        else {
+            pending_material = true;
+            continue;
+        };
+        loaded_materials.push(loaded);
+    }
+    if pending_material {
+        return Ok(TlsSessionSecretMaterialSetLoad::Pending);
+    }
+    Ok(TlsSessionSecretMaterialSetLoad::Ready(
+        TlsSessionSecretMaterialSet {
+            materials: loaded_materials,
+        },
+    ))
+}
+
+fn load_tls_session_secret_material_if_available(
+    material: &TlsPlaintextMaterialPlan,
+    file_store: &(impl TlsMaterialFileStore + ?Sized),
+) -> Result<Option<TlsSessionSecretMaterial>, TlsDecryptHintError> {
+    let bytes = match file_store.read_tls_material(&material.path) {
+        Ok(bytes) => bytes,
+        Err(TlsMaterialFileStoreError::NotFound) => return Ok(None),
+        Err(source) => return Err(tls_session_secret_plan_material_error(material, source)),
+    };
+    if tls_session_secret_material_is_empty(&bytes) {
+        return Ok(None);
+    }
+    Ok(Some(decode_tls_session_secret_material(material, &bytes)?))
+}
+
+fn decode_tls_session_secret_material(
+    material: &TlsPlaintextMaterialPlan,
+    bytes: &[u8],
+) -> Result<TlsSessionSecretMaterial, TlsDecryptHintError> {
+    let store = TlsSessionSecretStore::parse(bytes)
+        .map_err(|source| tls_session_secret_plan_material_error(material, source))?;
+    Ok(TlsSessionSecretMaterial {
+        id: material.id.clone(),
+        kind: material.kind,
+        path: material.path.clone(),
+        store,
+    })
+}
+
+fn tls_session_secret_material_is_empty(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
 }
 
 fn live_auto_binding_record(
@@ -197,78 +217,31 @@ pub(crate) enum TlsDecryptHintError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, path::Path};
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+    };
 
-    use capture::{CaptureError, CapturePoll};
-    use probe_config::{AgentConfig, CaptureSelection, TlsMaterialConfig};
-    use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
-    use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
+    use capture::TlsSessionSecretProtocol;
+    use runtime::TlsPlaintextMaterialPlan;
 
     use super::*;
-    use crate::tls_material::TlsMaterialFileStoreError;
-
-    #[test]
-    fn absent_session_secret_hints_keep_primary_provider() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let plan = runtime_plan(AgentConfig::default())?;
-
-        let provider = build_tls_session_secret_auto_binding_with_store(
-            &plan,
-            &MemoryTlsMaterialStore::default(),
-        )?
-        .wrap(Box::new(NoopCaptureProvider));
-
-        assert_eq!(provider.name(), "noop");
-        assert!(provider.capabilities().is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn session_secret_hints_wrap_primary_provider() -> Result<(), Box<dyn std::error::Error>> {
-        let path = PathBuf::from("/tmp/session-secrets.jsonl");
-        let mut config = config_with_session_secret_material("session-secrets", &path);
-        config.capture.selection = CaptureSelection::Libpcap;
-        let plan = runtime_plan(config)?;
-        let store = MemoryTlsMaterialStore::default()
-            .with_file(&path, valid_session_secret("00", "aa").into_bytes());
-
-        let provider = build_tls_session_secret_auto_binding_with_store(&plan, &store)?
-            .wrap(Box::new(NoopCaptureProvider));
-
-        assert_eq!(provider.name(), "tls_session_secret_auto_binding");
-        assert!(provider.capabilities().iter().any(|capability| {
-            capability.kind == CapabilityKind::TlsSessionSecretRecordDecrypt
-                && capability.mode == RuntimeMode::Degraded
-        }));
-        Ok(())
-    }
+    use crate::tls_material::{TlsMaterialFileStore, TlsMaterialFileStoreError};
 
     #[test]
     fn multiple_session_secret_materials_are_merged() -> Result<(), Box<dyn std::error::Error>> {
         let first_path = PathBuf::from("/tmp/session-secrets-a.jsonl");
         let second_path = PathBuf::from("/tmp/session-secrets-b.jsonl");
-        let mut config = config_with_session_secret_material("session-secrets-a", &first_path);
-        config
-            .tls
-            .plaintext
-            .decrypt_hints
-            .session_secret_refs
-            .push("session-secrets-b".to_string());
-        config.tls.materials.push(TlsMaterialConfig {
-            id: Some("session-secrets-b".to_string()),
-            kind: TlsMaterialKind::SessionSecretFile,
-            path: second_path.clone(),
-        });
-        let plan = runtime_plan(config)?;
+        let material_plans = material_plans([
+            ("session-secrets-a", first_path.as_path()),
+            ("session-secrets-b", second_path.as_path()),
+        ]);
         let store = MemoryTlsMaterialStore::default()
             .with_file(&first_path, valid_session_secret("00", "aa").into_bytes())
             .with_file(&second_path, valid_session_secret("11", "bb").into_bytes());
 
-        let materials = load_tls_session_secret_materials(
-            &plan.tls.plaintext.decrypt_hints.session_secrets,
-            &store,
-        )
-        .expect("session secret hints should load");
+        let materials = load_tls_session_secret_materials(&material_plans, &store)
+            .expect("session secret hints should load");
         let session_secrets = materials
             .build_auto_binding_store()
             .expect("configured records should build a live auto-binding store");
@@ -282,21 +255,17 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let first_path = PathBuf::from("/tmp/session-secrets-a.jsonl");
         let second_path = PathBuf::from("/tmp/session-secrets-b.jsonl");
-        let config = config_with_session_secret_materials([
+        let material_plans = material_plans([
             ("session-secrets-a", first_path.as_path()),
             ("session-secrets-b", second_path.as_path()),
         ]);
-        let plan = runtime_plan(config)?;
         let material = valid_session_secret("00", "aa").into_bytes();
         let store = MemoryTlsMaterialStore::default()
             .with_file(&first_path, material.clone())
             .with_file(&second_path, material);
 
-        let materials = load_tls_session_secret_materials(
-            &plan.tls.plaintext.decrypt_hints.session_secrets,
-            &store,
-        )
-        .expect("duplicate exact records should load");
+        let materials = load_tls_session_secret_materials(&material_plans, &store)
+            .expect("duplicate exact records should load");
         let session_secrets = materials
             .build_auto_binding_store()
             .expect("configured records should build a live auto-binding store");
@@ -309,8 +278,7 @@ mod tests {
     fn non_live_session_secret_records_do_not_enter_auto_binding_store()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = PathBuf::from("/tmp/session-secrets.jsonl");
-        let config = config_with_session_secret_material("session-secrets", &path);
-        let plan = runtime_plan(config)?;
+        let material_plans = material_plans([("session-secrets", path.as_path())]);
         let material = format!(
             "{}\n{}",
             valid_session_secret("00", "aa"),
@@ -318,17 +286,14 @@ mod tests {
         );
         let store = MemoryTlsMaterialStore::default().with_file(&path, material.into_bytes());
 
-        let materials = load_tls_session_secret_materials(
-            &plan.tls.plaintext.decrypt_hints.session_secrets,
-            &store,
-        )?;
+        let materials = load_tls_session_secret_materials(&material_plans, &store)?;
         let session_secrets = materials.build_auto_binding_store()?;
 
         assert_eq!(materials.materials()[0].store.records().len(), 2);
         assert_eq!(session_secrets.records().len(), 1);
         assert_eq!(
             session_secrets.records()[0].protocol(),
-            capture::TlsSessionSecretProtocol::Tls13
+            TlsSessionSecretProtocol::Tls13
         );
         Ok(())
     }
@@ -338,11 +303,10 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let first_path = PathBuf::from("/tmp/session-secrets-a.jsonl");
         let second_path = PathBuf::from("/tmp/session-secrets-b.jsonl");
-        let config = config_with_session_secret_materials([
+        let material_plans = material_plans([
             ("session-secrets-a", first_path.as_path()),
             ("session-secrets-b", second_path.as_path()),
         ]);
-        let plan = runtime_plan(config)?;
         let store = MemoryTlsMaterialStore::default()
             .with_file(
                 &first_path,
@@ -353,11 +317,8 @@ mod tests {
                 valid_session_secret_with_window("00", "bb", 20, 40).into_bytes(),
             );
 
-        let materials = load_tls_session_secret_materials(
-            &plan.tls.plaintext.decrypt_hints.session_secrets,
-            &store,
-        )
-        .expect("overlapping records are syntactically valid material");
+        let materials = load_tls_session_secret_materials(&material_plans, &store)
+            .expect("overlapping records are syntactically valid material");
         let error = materials
             .build_auto_binding_store()
             .expect_err("overlapping lookup windows should fail closed");
@@ -370,29 +331,10 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_feed_capture_does_not_enable_session_secret_auto_binding()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let path = PathBuf::from("/tmp/session-secrets.jsonl");
-        let mut config = config_with_session_secret_material("session-secrets", &path);
-        config.capture.selection = CaptureSelection::PlaintextFeed;
-        config.capture.plaintext_feed.path = Some("/tmp/plaintext-feed.jsonl".into());
-        let plan = runtime_plan(config)?;
-        let store = MemoryTlsMaterialStore::default()
-            .with_file(&path, tls12_master_secret("00", "bb").into_bytes());
-
-        let provider = build_tls_session_secret_auto_binding_with_store(&plan, &store)?
-            .wrap(Box::new(NoopCaptureProvider));
-
-        assert_eq!(provider.name(), "noop");
-        Ok(())
-    }
-
-    #[test]
     fn application_traffic_secret_without_cipher_suite_fails_live_auto_binding()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = PathBuf::from("/tmp/session-secrets.jsonl");
-        let config = config_with_session_secret_material("session-secrets", &path);
-        let plan = runtime_plan(config)?;
+        let material_plans = material_plans([("session-secrets", path.as_path())]);
         let material = format!(
             r#"{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{}","secret":"{}"}}"#,
             "00".repeat(32),
@@ -400,11 +342,8 @@ mod tests {
         );
         let store = MemoryTlsMaterialStore::default().with_file(&path, material.into_bytes());
 
-        let materials = load_tls_session_secret_materials(
-            &plan.tls.plaintext.decrypt_hints.session_secrets,
-            &store,
-        )
-        .expect("missing cipher suite is syntactically valid material");
+        let materials = load_tls_session_secret_materials(&material_plans, &store)
+            .expect("missing cipher suite is syntactically valid material");
         let error = materials
             .build_auto_binding_store()
             .expect_err("live auto-binding requires cipher suite metadata");
@@ -420,26 +359,18 @@ mod tests {
     fn session_secret_refs_without_live_application_material_fail_closed()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = PathBuf::from("/tmp/session-secrets.jsonl");
-        let config = config_with_session_secret_material("session-secrets", &path);
-        let plan = runtime_plan(config)?;
-        let material = format!(
-            r#"{{"protocol":"tls12","secret_kind":"master_secret","client_random":"{}","secret":"{}"}}"#,
-            "00".repeat(32),
-            "bb".repeat(48),
-        );
-        let store = MemoryTlsMaterialStore::default().with_file(&path, material.into_bytes());
+        let material_plans = material_plans([("session-secrets", path.as_path())]);
+        let store = MemoryTlsMaterialStore::default()
+            .with_file(&path, tls12_master_secret("00", "bb").into_bytes());
 
-        let materials = load_tls_session_secret_materials(
-            &plan.tls.plaintext.decrypt_hints.session_secrets,
-            &store,
-        )
-        .expect("non-live material is syntactically valid");
+        let materials = load_tls_session_secret_materials(&material_plans, &store)
+            .expect("non-live material is syntactically valid");
         let error = materials
             .build_auto_binding_store()
             .expect_err("non-live material must not enable the live wrapper");
 
         let message = error.to_string();
-        assert!(message.contains("session_secret_refs"));
+        assert!(message.contains("session_secret_file"));
         assert!(message.contains("usable by live auto-binding"));
         assert!(!message.contains(&"bb".repeat(48)));
         Ok(())
@@ -449,18 +380,14 @@ mod tests {
     fn invalid_session_secret_material_error_does_not_leak_secret_value()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = PathBuf::from("/tmp/session-secrets.jsonl");
-        let config = config_with_session_secret_material("session-secrets", &path);
-        let plan = runtime_plan(config)?;
+        let material_plans = material_plans([("session-secrets", path.as_path())]);
         let store = MemoryTlsMaterialStore::default().with_file(
             &path,
             br#"{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"0000000000000000000000000000000000000000000000000000000000000000","secret":"not-a-secret"}"#.to_vec(),
         );
 
-        let error = load_tls_session_secret_materials(
-            &plan.tls.plaintext.decrypt_hints.session_secrets,
-            &store,
-        )
-        .expect_err("invalid configured session secret material must fail");
+        let error = load_tls_session_secret_materials(&material_plans, &store)
+            .expect_err("invalid configured session secret material must fail");
 
         let message = error.to_string();
         assert!(message.contains("session-secrets"));
@@ -496,62 +423,17 @@ mod tests {
         }
     }
 
-    struct NoopCaptureProvider;
-
-    impl CaptureProvider for NoopCaptureProvider {
-        fn name(&self) -> &'static str {
-            "noop"
-        }
-
-        fn capabilities(&self) -> Vec<CapabilityState> {
-            Vec::new()
-        }
-
-        fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
-            Ok(CapturePoll::Finished)
-        }
-    }
-
-    fn config_with_session_secret_material(id: &str, path: &Path) -> AgentConfig {
-        config_with_session_secret_materials([(id, path)])
-    }
-
-    fn config_with_session_secret_materials<'a>(
+    fn material_plans<'a>(
         materials: impl IntoIterator<Item = (&'a str, &'a Path)>,
-    ) -> AgentConfig {
-        let mut config = AgentConfig::default();
-        config.capture.selection = CaptureSelection::Libpcap;
-        for (id, path) in materials {
-            config
-                .tls
-                .plaintext
-                .decrypt_hints
-                .session_secret_refs
-                .push(id.to_string());
-            config.tls.materials.push(TlsMaterialConfig {
-                id: Some(id.to_string()),
+    ) -> Vec<TlsPlaintextMaterialPlan> {
+        materials
+            .into_iter()
+            .map(|(id, path)| TlsPlaintextMaterialPlan {
+                id: id.to_string(),
                 kind: TlsMaterialKind::SessionSecretFile,
                 path: path.to_path_buf(),
-            });
-        }
-        config
-    }
-
-    fn runtime_plan(config: AgentConfig) -> Result<RuntimePlan, runtime::RuntimeError> {
-        let registry = ProviderRegistry::new(
-            vec![
-                CaptureProviderDescriptor::available(
-                    probe_config::CaptureBackend::Libpcap,
-                    CaptureProviderBuilder::Libpcap,
-                ),
-                CaptureProviderDescriptor::available(
-                    probe_config::CaptureBackend::PlaintextFeed,
-                    CaptureProviderBuilder::PlaintextFeed,
-                ),
-            ],
-            Vec::new(),
-        );
-        RuntimePlan::build(config, &registry)
+            })
+            .collect()
     }
 
     fn valid_session_secret(client_random_byte: &str, secret_byte: &str) -> String {

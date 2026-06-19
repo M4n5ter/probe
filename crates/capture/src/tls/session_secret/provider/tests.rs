@@ -749,12 +749,12 @@ fn outbound_client_provider(
     )?)
 }
 
-fn binding<'a>(
-    store: &'a TlsSessionSecretStore,
+fn binding(
+    store: &TlsSessionSecretStore,
     flow: FlowContext,
     direction: Direction,
     secret_kind: Tls13ApplicationTrafficSecretKind,
-) -> Result<Tls13SessionSecretFlowBinding<'a>, Box<dyn std::error::Error>> {
+) -> Result<Tls13SessionSecretFlowBinding, Box<dyn std::error::Error>> {
     let client_random = TlsRandom::from_hex(CLIENT_RANDOM).expect("valid client random");
     Ok(Tls13SessionSecretFlowBindingPlanner::new(store).plan(
         Tls13SessionSecretFlowCandidate::start(flow, direction, client_random, secret_kind),

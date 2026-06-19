@@ -22,7 +22,7 @@ pub(crate) enum TlsMaterialFileStoreError {
     TooLarge { size: u64, limit: u64 },
 }
 
-pub(crate) trait TlsMaterialFileStore {
+pub(crate) trait TlsMaterialFileStore: Send {
     fn inspect_tls_material(&self, path: &Path) -> Result<(), TlsMaterialFileStoreError>;
 
     fn read_tls_material(&self, path: &Path) -> Result<Vec<u8>, TlsMaterialFileStoreError>;

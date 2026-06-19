@@ -13,7 +13,9 @@ use storage::{FjallSpool, SpoolProbe, SpoolSnapshot};
 
 use crate::configured_enforcement::ActiveEnforcementPolicy;
 use crate::export::ExportWorkerRuntimeSnapshot;
-use crate::tls_plaintext::{TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot};
+use crate::tls_plaintext::{
+    TlsDecryptHintRuntimeSnapshot, TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot,
+};
 
 use super::{
     enforcement::{
@@ -102,6 +104,7 @@ pub struct RuntimeStatusInput {
     pub enforcement: EnforcementRuntimeStatusInput,
     pub export_worker: Option<ExportWorkerRuntimeSnapshot>,
     pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
+    pub tls_decrypt_hints: Option<TlsDecryptHintRuntimeSnapshot>,
     pub tls_plaintext: Option<TlsPlaintextRuntimeSnapshot>,
 }
 
@@ -272,7 +275,12 @@ fn build_status_snapshot_at_with_runtime(
         }
     };
     let capabilities = capabilities_with_runtime(plan, runtime.tls_plaintext.as_ref());
-    let tls = tls_status(plan, &capabilities, runtime.tls_plaintext.clone());
+    let tls = tls_status(
+        plan,
+        &capabilities,
+        runtime.tls_plaintext.clone(),
+        runtime.tls_decrypt_hints.clone(),
+    );
     let export = export_status(plan);
     let exporters = exporter_statuses_with_runtime(
         plan,

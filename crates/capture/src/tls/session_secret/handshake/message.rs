@@ -99,7 +99,7 @@ impl Tls13SessionSecretHandshakeMessageStream {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 enum Tls13SessionSecretHandshakeMessageState {
     #[default]
     Empty,
@@ -113,7 +113,7 @@ enum Tls13SessionSecretHandshakeMessageState {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Tls13SessionSecretPendingHandshakeMessage {
     handshake_type: u8,
     body_len: usize,
@@ -137,7 +137,7 @@ impl Tls13SessionSecretPendingHandshakeMessage {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct Tls13SessionSecretHandshakeMessageRead {
     pub(super) completed: Vec<Tls13SessionSecretCompletedHandshakeMessage>,
     pub(super) terminal: bool,
@@ -159,7 +159,7 @@ impl Tls13SessionSecretHandshakeMessageRead {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct Tls13SessionSecretCompletedHandshakeMessage {
     pub(super) handshake_type: u8,
     pub(super) message_offset: u64,

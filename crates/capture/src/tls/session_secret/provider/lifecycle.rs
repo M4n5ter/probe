@@ -58,7 +58,7 @@ impl Tls13SessionSecretDecryptingEngine {
         provider_name: &'static str,
         preceding_inner_events: Vec<CaptureEvent>,
         raw_prefix_events: Vec<CaptureEvent>,
-        binding: super::Tls13SessionSecretFlowBinding<'_>,
+        binding: super::Tls13SessionSecretFlowBinding,
         event: CaptureEvent,
     ) -> Result<CapturePoll, CaptureError> {
         let mut ready_events = Vec::new();

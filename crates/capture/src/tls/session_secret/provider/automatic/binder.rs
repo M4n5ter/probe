@@ -13,19 +13,21 @@ use super::super::super::{
 };
 use super::super::Tls13SessionSecretDecryptingStreamKey;
 use super::buffered::{Tls13SessionSecretBufferedBytes, sliced_event};
-use super::candidates::Tls13SessionSecretCandidateSet;
+use super::candidates::{Tls13SessionSecretCandidate, Tls13SessionSecretCandidateSet};
 
 const TLS13_AUTO_BIND_MAX_CANDIDATES: usize = 2048;
 const TLS13_AUTO_BIND_MAX_RESYNC_RECORDS: u8 = 32;
 
 pub(in crate::tls::session_secret::provider) struct Tls13SessionSecretAutomaticBinder {
-    store: TlsSessionSecretStore,
+    store: Option<TlsSessionSecretStore>,
     observer: Tls13SessionSecretHandshakeObserver,
     candidates: Tls13SessionSecretCandidateSet,
 }
 
 impl Tls13SessionSecretAutomaticBinder {
-    pub(in crate::tls::session_secret::provider) fn new(store: TlsSessionSecretStore) -> Self {
+    pub(in crate::tls::session_secret::provider) fn new(
+        store: Option<TlsSessionSecretStore>,
+    ) -> Self {
         Self {
             store,
             observer: Tls13SessionSecretHandshakeObserver::new(),
@@ -33,10 +35,20 @@ impl Tls13SessionSecretAutomaticBinder {
         }
     }
 
+    pub(in crate::tls::session_secret::provider) fn replace_store(
+        &mut self,
+        store: TlsSessionSecretStore,
+    ) {
+        self.store = Some(store);
+        let store = self.store.as_ref();
+        self.candidates
+            .activate_waiting_candidates(|intent| candidate_has_usable_material(store, intent));
+    }
+
     pub(in crate::tls::session_secret::provider) fn observe_and_bind(
         &mut self,
         event: CaptureEvent,
-    ) -> Tls13SessionSecretAutomaticAction<'_> {
+    ) -> Tls13SessionSecretAutomaticAction {
         let mut released_events = self.release_buffered_events_before_current_event(&event);
         released_events.extend(self.release_terminal_candidate_events(&event));
         for observation in self.observer.push_capture_event(&event) {
@@ -141,48 +153,29 @@ impl Tls13SessionSecretAutomaticBinder {
         next_probe_offset: u64,
         lookup_time: Option<TlsSessionSecretLookupTime>,
     ) -> Vec<CaptureEvent> {
-        if !self.has_usable_material(
-            flow.clone(),
-            direction,
-            client_random,
-            secret_kind,
-            lookup_time,
-        ) {
+        let key = Tls13SessionSecretDecryptingStreamKey::new(flow.id.clone(), direction);
+        if self.candidates.key_has_probing_candidate(&key) {
             return Vec::new();
         }
-        let key = Tls13SessionSecretDecryptingStreamKey::new(flow.id.clone(), direction);
-        self.candidates.insert(
-            key,
-            Tls13SessionSecretBindingCandidate::new(
-                flow,
-                direction,
-                client_random,
-                secret_kind,
-                next_probe_offset,
-                lookup_time,
-            ),
-        )
-    }
-
-    fn has_usable_material(
-        &self,
-        flow: FlowContext,
-        direction: Direction,
-        client_random: TlsRandom,
-        secret_kind: Tls13ApplicationTrafficSecretKind,
-        lookup_time: Option<TlsSessionSecretLookupTime>,
-    ) -> bool {
-        let Some(binding) = self.plan_flow_candidate(
+        let intent = Tls13SessionSecretBindingIntent::new(
             flow,
             direction,
             client_random,
             secret_kind,
+            next_probe_offset,
             lookup_time,
-            Tls13SessionSecretStreamCursor::start(),
-        ) else {
-            return false;
-        };
-        Tls13ApplicationDataDecryptor::from_session_secret_record(binding.record).is_ok()
+        );
+        if candidate_has_usable_material(self.store.as_ref(), &intent) {
+            self.candidates.insert(
+                key,
+                Tls13SessionSecretCandidate::Probing(
+                    Tls13SessionSecretBindingCandidate::from_intent(intent),
+                ),
+            )
+        } else {
+            self.candidates
+                .insert(key, Tls13SessionSecretCandidate::WaitingForMaterial(intent))
+        }
     }
 
     fn release_terminal_candidate_events(&mut self, event: &CaptureEvent) -> Vec<CaptureEvent> {
@@ -203,10 +196,7 @@ impl Tls13SessionSecretAutomaticBinder {
         }
     }
 
-    fn try_bind_candidate(
-        &mut self,
-        bytes: CapturedBytes,
-    ) -> Tls13SessionSecretCandidateAction<'_> {
+    fn try_bind_candidate(&mut self, bytes: CapturedBytes) -> Tls13SessionSecretCandidateAction {
         let key =
             Tls13SessionSecretDecryptingStreamKey::new(bytes.flow.id.clone(), bytes.direction);
         let Some(mut taken) = self.candidates.take(&key) else {
@@ -246,20 +236,12 @@ impl Tls13SessionSecretAutomaticBinder {
             Tls13SessionSecretCandidateProbe::Bind {
                 raw_prefix_events,
                 bytes,
-                cursor,
-            } => {
-                if let Some(binding) = self.plan_binding(&taken.candidate, cursor) {
-                    Tls13SessionSecretCandidateAction::Bind {
-                        raw_prefix_events,
-                        binding: Box::new(binding),
-                        bytes: Box::new(bytes),
-                    }
-                } else {
-                    let mut events = raw_prefix_events;
-                    events.push(CaptureEvent::Bytes(bytes));
-                    Tls13SessionSecretCandidateAction::Queue { events }
-                }
-            }
+                binding,
+            } => Tls13SessionSecretCandidateAction::Bind {
+                raw_prefix_events,
+                binding,
+                bytes: Box::new(bytes),
+            },
         }
     }
 
@@ -291,12 +273,13 @@ impl Tls13SessionSecretAutomaticBinder {
                 prefix_events: vec![CaptureEvent::Bytes(bytes)],
             };
         };
-        if end_offset <= candidate.next_probe_offset {
+        if end_offset <= candidate.intent.next_probe_offset {
             return Tls13SessionSecretCandidateProbe::Continue {
                 event: CaptureEvent::Bytes(bytes),
             };
         }
         let cursor = candidate
+            .intent
             .next_probe_offset
             .saturating_sub(bytes.stream_offset)
             .min(bytes.bytes.len() as u64) as usize;
@@ -323,6 +306,7 @@ impl Tls13SessionSecretAutomaticBinder {
         mut prefix_events: Vec<CaptureEvent>,
     ) -> Tls13SessionSecretCandidateProbe {
         let mut cursor = candidate
+            .intent
             .next_probe_offset
             .saturating_sub(held.stream_offset())
             .min(held.payload().len() as u64) as usize;
@@ -373,12 +357,14 @@ impl Tls13SessionSecretAutomaticBinder {
                     let stream_cursor =
                         Tls13SessionSecretStreamCursor::resume_at(ciphertext_offset, 0, 0);
                     let record = &held.payload()[cursor..cursor + len];
-                    if self.candidate_decrypts_at(candidate, stream_cursor, record) {
+                    if let Some(binding) =
+                        self.candidate_decrypts_at(candidate, stream_cursor, record)
+                    {
                         prefix_events.extend(held.drain_prefix(cursor));
                         return Tls13SessionSecretCandidateProbe::Bind {
                             raw_prefix_events: prefix_events,
                             bytes: held.into_bytes(),
-                            cursor: stream_cursor,
+                            binding: Box::new(binding),
                         };
                     }
                     if candidate.resync_attempts >= TLS13_AUTO_BIND_MAX_RESYNC_RECORDS {
@@ -402,81 +388,86 @@ impl Tls13SessionSecretAutomaticBinder {
         candidate: &Tls13SessionSecretBindingCandidate,
         cursor: Tls13SessionSecretStreamCursor,
         record: &[u8],
-    ) -> bool {
-        let Some(binding) = self.plan_binding(candidate, cursor) else {
-            return false;
-        };
-        Tls13ApplicationDataDecryptor::from_session_secret_record(binding.record)
+    ) -> Option<Tls13SessionSecretFlowBinding> {
+        let binding = self.binding_for_candidate(candidate, cursor)?;
+        let decrypts = Tls13ApplicationDataDecryptor::from_session_secret_record(&binding.record)
             .and_then(|decryptor| decryptor.decrypt_record_at(cursor.sequence_number(), record))
-            .is_ok()
+            .is_ok();
+        decrypts.then_some(binding)
     }
 
-    fn plan_binding(
+    fn binding_for_candidate(
         &self,
         candidate: &Tls13SessionSecretBindingCandidate,
         cursor: Tls13SessionSecretStreamCursor,
-    ) -> Option<Tls13SessionSecretFlowBinding<'_>> {
-        self.plan_flow_candidate(
-            candidate.flow.clone(),
-            candidate.direction,
-            candidate.client_random,
-            candidate.secret_kind,
-            candidate.lookup_time,
-            cursor,
-        )
-    }
-
-    fn plan_flow_candidate(
-        &self,
-        flow: FlowContext,
-        direction: Direction,
-        client_random: TlsRandom,
-        secret_kind: Tls13ApplicationTrafficSecretKind,
-        lookup_time: Option<TlsSessionSecretLookupTime>,
-        cursor: Tls13SessionSecretStreamCursor,
-    ) -> Option<Tls13SessionSecretFlowBinding<'_>> {
-        let mut flow_candidate = Tls13SessionSecretFlowCandidate::resume_at(
-            flow,
-            direction,
-            client_random,
-            secret_kind,
-            cursor,
-        );
-        if let Some(lookup_time) = lookup_time {
-            flow_candidate = flow_candidate.with_lookup_time(lookup_time);
-        }
-        Tls13SessionSecretFlowBindingPlanner::new(&self.store)
-            .plan(flow_candidate)
-            .ok()
+    ) -> Option<Tls13SessionSecretFlowBinding> {
+        binding_for_intent(self.store.as_ref(), &candidate.intent, cursor)
     }
 }
 
+fn candidate_has_usable_material(
+    store: Option<&TlsSessionSecretStore>,
+    intent: &Tls13SessionSecretBindingIntent,
+) -> bool {
+    let Some(binding) = binding_for_intent(store, intent, Tls13SessionSecretStreamCursor::start())
+    else {
+        return false;
+    };
+    Tls13ApplicationDataDecryptor::from_session_secret_record(&binding.record).is_ok()
+}
+
+fn binding_for_intent(
+    store: Option<&TlsSessionSecretStore>,
+    intent: &Tls13SessionSecretBindingIntent,
+    cursor: Tls13SessionSecretStreamCursor,
+) -> Option<Tls13SessionSecretFlowBinding> {
+    let store = store?;
+    let mut flow_candidate = Tls13SessionSecretFlowCandidate::resume_at(
+        intent.flow.clone(),
+        intent.direction,
+        intent.client_random,
+        intent.secret_kind,
+        cursor,
+    );
+    if let Some(lookup_time) = intent.lookup_time {
+        flow_candidate = flow_candidate.with_lookup_time(lookup_time);
+    }
+    Tls13SessionSecretFlowBindingPlanner::new(store)
+        .plan(flow_candidate)
+        .ok()
+}
+
 #[derive(Debug)]
-pub(in crate::tls::session_secret::provider) enum Tls13SessionSecretAutomaticAction<'a> {
+pub(in crate::tls::session_secret::provider) enum Tls13SessionSecretAutomaticAction {
     PassThrough {
         events: Vec<CaptureEvent>,
     },
     BindAndProcess {
         released_events: Vec<CaptureEvent>,
         raw_prefix_events: Vec<CaptureEvent>,
-        binding: Box<Tls13SessionSecretFlowBinding<'a>>,
+        binding: Box<Tls13SessionSecretFlowBinding>,
         bytes: Box<CapturedBytes>,
     },
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct Tls13SessionSecretBindingCandidate {
+pub(super) struct Tls13SessionSecretBindingIntent {
     flow: FlowContext,
     direction: Direction,
     client_random: TlsRandom,
     secret_kind: Tls13ApplicationTrafficSecretKind,
     next_probe_offset: u64,
     lookup_time: Option<TlsSessionSecretLookupTime>,
+}
+
+#[derive(Debug)]
+pub(super) struct Tls13SessionSecretBindingCandidate {
+    intent: Tls13SessionSecretBindingIntent,
     resync_attempts: u8,
     held: Option<Tls13SessionSecretBufferedBytes>,
 }
 
-impl Tls13SessionSecretBindingCandidate {
+impl Tls13SessionSecretBindingIntent {
     pub(super) fn new(
         flow: FlowContext,
         direction: Direction,
@@ -492,6 +483,14 @@ impl Tls13SessionSecretBindingCandidate {
             secret_kind,
             next_probe_offset,
             lookup_time,
+        }
+    }
+}
+
+impl Tls13SessionSecretBindingCandidate {
+    pub(super) fn from_intent(intent: Tls13SessionSecretBindingIntent) -> Self {
+        Self {
+            intent,
             resync_attempts: 0,
             held: None,
         }
@@ -508,7 +507,7 @@ impl Tls13SessionSecretBindingCandidate {
     }
 
     fn advance_probe_offset(&mut self, offset: u64) {
-        self.next_probe_offset = self.next_probe_offset.max(offset);
+        self.intent.next_probe_offset = self.intent.next_probe_offset.max(offset);
     }
 
     #[cfg(test)]
@@ -518,7 +517,7 @@ impl Tls13SessionSecretBindingCandidate {
     }
 }
 
-enum Tls13SessionSecretCandidateAction<'a> {
+enum Tls13SessionSecretCandidateAction {
     Process {
         event: Box<CaptureEvent>,
     },
@@ -527,7 +526,7 @@ enum Tls13SessionSecretCandidateAction<'a> {
     },
     Bind {
         raw_prefix_events: Vec<CaptureEvent>,
-        binding: Box<Tls13SessionSecretFlowBinding<'a>>,
+        binding: Box<Tls13SessionSecretFlowBinding>,
         bytes: Box<CapturedBytes>,
     },
 }
@@ -545,7 +544,7 @@ enum Tls13SessionSecretCandidateProbe {
     Bind {
         raw_prefix_events: Vec<CaptureEvent>,
         bytes: CapturedBytes,
-        cursor: Tls13SessionSecretStreamCursor,
+        binding: Box<Tls13SessionSecretFlowBinding>,
     },
     ReleaseBuffered {
         prefix_events: Vec<CaptureEvent>,

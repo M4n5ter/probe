@@ -5,9 +5,15 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS: u64 = 1_000;
 pub const MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS: u64 = 3_600_000;
+pub const DEFAULT_TLS_DECRYPT_HINT_REFRESH_INTERVAL_MS: u64 = 1_000;
+pub const MAX_TLS_DECRYPT_HINT_REFRESH_INTERVAL_MS: u64 = 3_600_000;
 
 fn default_tls_plaintext_reconcile_interval_ms() -> u64 {
     DEFAULT_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS
+}
+
+fn default_tls_decrypt_hint_refresh_interval_ms() -> u64 {
+    DEFAULT_TLS_DECRYPT_HINT_REFRESH_INTERVAL_MS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -45,11 +51,23 @@ impl Default for TlsPlaintextInstrumentationConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TlsPlaintextDecryptHintConfig {
     pub key_log_refs: Vec<String>,
     pub session_secret_refs: Vec<String>,
+    #[serde(default = "default_tls_decrypt_hint_refresh_interval_ms")]
+    pub refresh_interval_ms: u64,
+}
+
+impl Default for TlsPlaintextDecryptHintConfig {
+    fn default() -> Self {
+        Self {
+            key_log_refs: Vec::new(),
+            session_secret_refs: Vec::new(),
+            refresh_interval_ms: DEFAULT_TLS_DECRYPT_HINT_REFRESH_INTERVAL_MS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

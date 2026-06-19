@@ -5,7 +5,7 @@ use probe_core::FlowIdentity;
 use crate::CaptureEvent;
 
 use super::super::Tls13SessionSecretDecryptingStreamKey;
-use super::binder::Tls13SessionSecretBindingCandidate;
+use super::binder::{Tls13SessionSecretBindingCandidate, Tls13SessionSecretBindingIntent};
 
 #[derive(Debug)]
 pub(super) struct Tls13SessionSecretCandidateSet {
@@ -16,7 +16,7 @@ pub(super) struct Tls13SessionSecretCandidateSet {
 
 #[derive(Debug)]
 struct Tls13SessionSecretCandidateSlot {
-    candidate: Tls13SessionSecretBindingCandidate,
+    candidate: Tls13SessionSecretCandidate,
     order: u64,
 }
 
@@ -24,6 +24,40 @@ struct Tls13SessionSecretCandidateSlot {
 pub(super) struct Tls13SessionSecretTakenCandidate {
     pub(super) candidate: Tls13SessionSecretBindingCandidate,
     order: u64,
+}
+
+#[derive(Debug)]
+pub(super) enum Tls13SessionSecretCandidate {
+    WaitingForMaterial(Tls13SessionSecretBindingIntent),
+    Probing(Tls13SessionSecretBindingCandidate),
+}
+
+impl Tls13SessionSecretCandidate {
+    fn has_buffered_event(&self) -> bool {
+        match self {
+            Self::WaitingForMaterial(_) => false,
+            Self::Probing(candidate) => candidate.has_buffered_event(),
+        }
+    }
+
+    fn into_buffered_events(self) -> Vec<CaptureEvent> {
+        match self {
+            Self::WaitingForMaterial(_) => Vec::new(),
+            Self::Probing(candidate) => candidate.into_buffered_events(),
+        }
+    }
+}
+
+impl From<Tls13SessionSecretBindingIntent> for Tls13SessionSecretCandidate {
+    fn from(intent: Tls13SessionSecretBindingIntent) -> Self {
+        Self::WaitingForMaterial(intent)
+    }
+}
+
+impl From<Tls13SessionSecretBindingCandidate> for Tls13SessionSecretCandidate {
+    fn from(candidate: Tls13SessionSecretBindingCandidate) -> Self {
+        Self::Probing(candidate)
+    }
 }
 
 impl Tls13SessionSecretCandidateSet {
@@ -38,8 +72,9 @@ impl Tls13SessionSecretCandidateSet {
     pub(super) fn insert(
         &mut self,
         key: Tls13SessionSecretDecryptingStreamKey,
-        candidate: Tls13SessionSecretBindingCandidate,
+        candidate: impl Into<Tls13SessionSecretCandidate>,
     ) -> Vec<CaptureEvent> {
+        let candidate = candidate.into();
         if self
             .candidates
             .get(&key)
@@ -66,12 +101,34 @@ impl Tls13SessionSecretCandidateSet {
         &mut self,
         key: &Tls13SessionSecretDecryptingStreamKey,
     ) -> Option<Tls13SessionSecretTakenCandidate> {
+        let slot = self.candidates.remove(key)?;
+        match slot.candidate {
+            Tls13SessionSecretCandidate::Probing(candidate) => {
+                Some(Tls13SessionSecretTakenCandidate {
+                    candidate,
+                    order: slot.order,
+                })
+            }
+            waiting @ Tls13SessionSecretCandidate::WaitingForMaterial(_) => {
+                self.candidates.insert(
+                    key.clone(),
+                    Tls13SessionSecretCandidateSlot {
+                        candidate: waiting,
+                        order: slot.order,
+                    },
+                );
+                None
+            }
+        }
+    }
+
+    pub(super) fn key_has_probing_candidate(
+        &self,
+        key: &Tls13SessionSecretDecryptingStreamKey,
+    ) -> bool {
         self.candidates
-            .remove(key)
-            .map(|slot| Tls13SessionSecretTakenCandidate {
-                candidate: slot.candidate,
-                order: slot.order,
-            })
+            .get(key)
+            .is_some_and(|slot| matches!(slot.candidate, Tls13SessionSecretCandidate::Probing(_)))
     }
 
     pub(super) fn restore(
@@ -82,10 +139,27 @@ impl Tls13SessionSecretCandidateSet {
         self.candidates.insert(
             key,
             Tls13SessionSecretCandidateSlot {
-                candidate: taken.candidate,
+                candidate: Tls13SessionSecretCandidate::Probing(taken.candidate),
                 order: taken.order,
             },
         );
+        self.debug_assert_single_held_candidate();
+    }
+
+    pub(super) fn activate_waiting_candidates(
+        &mut self,
+        mut candidate_is_usable: impl FnMut(&Tls13SessionSecretBindingIntent) -> bool,
+    ) {
+        for slot in self.candidates.values_mut() {
+            let Tls13SessionSecretCandidate::WaitingForMaterial(intent) = &slot.candidate else {
+                continue;
+            };
+            if candidate_is_usable(intent) {
+                slot.candidate = Tls13SessionSecretCandidate::Probing(
+                    Tls13SessionSecretBindingCandidate::from_intent(intent.clone()),
+                );
+            }
+        }
         self.debug_assert_single_held_candidate();
     }
 
@@ -228,6 +302,7 @@ mod tests {
         FlowIdentity, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
     };
 
+    use super::super::binder::Tls13SessionSecretBindingIntent;
     use super::super::buffered::Tls13SessionSecretBufferedBytes;
     use super::*;
     use crate::CapturedBytes;
@@ -236,7 +311,6 @@ mod tests {
     use crate::tls::TlsRandom;
 
     const CLIENT_RANDOM: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-
     #[test]
     fn replacing_candidate_keeps_single_accessible_candidate() {
         let flow = demo_flow(1);
@@ -460,14 +534,15 @@ mod tests {
         flow: FlowContext,
         direction: Direction,
     ) -> Tls13SessionSecretBindingCandidate {
-        Tls13SessionSecretBindingCandidate::new(
+        let intent = Tls13SessionSecretBindingIntent::new(
             flow,
             direction,
             TlsRandom::from_hex(CLIENT_RANDOM).expect("valid client random"),
             Tls13ApplicationTrafficSecretKind::Client,
             0,
             None,
-        )
+        );
+        Tls13SessionSecretBindingCandidate::from_intent(intent)
     }
 
     fn held_candidate(

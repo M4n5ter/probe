@@ -13,9 +13,9 @@ use crate::{
     error::AgentError,
     plaintext_feed::load_plaintext_feed_provider,
     tls_plaintext::{
-        TlsPlaintextInstrumentationBuild, TlsPlaintextRuntimeState,
+        TlsDecryptHintRuntimeState, TlsPlaintextInstrumentationBuild, TlsPlaintextRuntimeState,
         TlsSessionSecretAutoBindingBuild, build_tls_plaintext_instrumentation,
-        build_tls_session_secret_auto_binding,
+        build_tls_session_secret_auto_binding_with_runtime,
     },
 };
 
@@ -24,8 +24,12 @@ pub(crate) struct CaptureProviderPreflight {
 }
 
 impl CaptureProviderPreflight {
-    pub(crate) fn build(plan: &RuntimePlan) -> Result<Self, AgentError> {
-        let session_secret_auto_binding = build_tls_session_secret_auto_binding(plan)?;
+    pub(crate) fn build(
+        plan: &RuntimePlan,
+        tls_decrypt_hint_runtime: Option<&TlsDecryptHintRuntimeState>,
+    ) -> Result<Self, AgentError> {
+        let session_secret_auto_binding =
+            build_tls_session_secret_auto_binding_with_runtime(plan, tls_decrypt_hint_runtime)?;
         Ok(Self {
             session_secret_auto_binding,
         })

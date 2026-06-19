@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::{
-    CaptureConfig, CaptureSelection, ConfigViolation, MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS,
-    TlsConfig, TlsMaterialKind,
+    CaptureConfig, CaptureSelection, ConfigViolation, MAX_TLS_DECRYPT_HINT_REFRESH_INTERVAL_MS,
+    MAX_TLS_PLAINTEXT_RECONCILE_INTERVAL_MS, TlsConfig, TlsMaterialKind,
 };
 
 pub(crate) fn validate_tls(
@@ -142,6 +142,20 @@ fn validate_plaintext_tls_provider_config(tls: &TlsConfig, violations: &mut Vec<
             ),
         });
     }
+    if tls.plaintext.decrypt_hints.refresh_interval_ms == 0 {
+        violations.push(ConfigViolation {
+            field: "tls.plaintext.decrypt_hints.refresh_interval_ms".to_string(),
+            reason: "TLS decrypt hint refresh interval must be positive".to_string(),
+        });
+    }
+    if tls.plaintext.decrypt_hints.refresh_interval_ms > MAX_TLS_DECRYPT_HINT_REFRESH_INTERVAL_MS {
+        violations.push(ConfigViolation {
+            field: "tls.plaintext.decrypt_hints.refresh_interval_ms".to_string(),
+            reason: format!(
+                "TLS decrypt hint refresh interval must be at most {MAX_TLS_DECRYPT_HINT_REFRESH_INTERVAL_MS} ms"
+            ),
+        });
+    }
 
     let Some(path) = &tls.plaintext.instrumentation.libssl_uprobe_object_path else {
         return;
@@ -209,6 +223,36 @@ mod tests {
                 && violation
                     .reason
                     .contains("TLS plaintext material ref session-secrets is duplicated")
+        }));
+    }
+
+    #[test]
+    fn plaintext_decrypt_hint_refresh_interval_must_be_positive_and_bounded() {
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.decrypt_hints.refresh_interval_ms = 0;
+
+        let error = config
+            .validate_basic()
+            .expect_err("zero TLS decrypt hint refresh interval must fail");
+        let ConfigError::Validation(error) = error else {
+            panic!("invalid refresh interval should produce a validation error");
+        };
+        assert!(error.violations().iter().any(|violation| {
+            violation.field == "tls.plaintext.decrypt_hints.refresh_interval_ms"
+                && violation.reason.contains("must be positive")
+        }));
+
+        config.tls.plaintext.decrypt_hints.refresh_interval_ms =
+            crate::MAX_TLS_DECRYPT_HINT_REFRESH_INTERVAL_MS + 1;
+        let error = config
+            .validate_basic()
+            .expect_err("oversized TLS decrypt hint refresh interval must fail");
+        let ConfigError::Validation(error) = error else {
+            panic!("invalid refresh interval should produce a validation error");
+        };
+        assert!(error.violations().iter().any(|violation| {
+            violation.field == "tls.plaintext.decrypt_hints.refresh_interval_ms"
+                && violation.reason.contains("must be at most")
         }));
     }
 }
