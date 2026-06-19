@@ -22,8 +22,9 @@ pub use handshake::{
     Tls13SessionSecretHandshakeObserver,
 };
 pub use material::{
-    TlsCipherSuite, TlsSessionSecretKind, TlsSessionSecretParseError, TlsSessionSecretProtocol,
-    TlsSessionSecretRecord, TlsSessionSecretStore, TlsSessionSecretSummary,
+    TlsCipherSuite, TlsSessionSecretKind, TlsSessionSecretLookupConflict,
+    TlsSessionSecretParseError, TlsSessionSecretProtocol, TlsSessionSecretRecord,
+    TlsSessionSecretStore, TlsSessionSecretSummary,
 };
 pub use plaintext::{Tls13SessionSecretPlaintextAdapter, Tls13SessionSecretPlaintextError};
 pub use provider::{

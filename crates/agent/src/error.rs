@@ -3,7 +3,8 @@ use thiserror::Error;
 use crate::{
     check::CheckError, configured_enforcement::ConfiguredEnforcementError,
     configured_policy::ConfiguredPolicyError, export::ExportDrainError,
-    plaintext_feed::PlaintextFeedLoadError, transparent_interception::TransparentInterceptionError,
+    plaintext_feed::PlaintextFeedLoadError, tls_plaintext::TlsDecryptHintError,
+    transparent_interception::TransparentInterceptionError,
 };
 
 #[derive(Debug, Error)]
@@ -54,6 +55,8 @@ pub(crate) enum AgentError {
     Attribution(#[from] attribution::AttributionError),
     #[error("plaintext feed error: {0}")]
     PlaintextFeed(#[from] PlaintextFeedLoadError),
+    #[error("TLS decrypt hint error: {0}")]
+    TlsDecryptHints(#[from] TlsDecryptHintError),
     #[error("admin error: {0}")]
     Admin(#[from] crate::admin::AdminError),
     #[error("{0}")]

@@ -32,6 +32,25 @@ impl TlsSessionSecretStore {
         Ok(Self { records })
     }
 
+    pub fn from_time_qualified_lookup_records(
+        records: impl IntoIterator<Item = TlsSessionSecretRecord>,
+    ) -> Result<Option<Self>, TlsSessionSecretLookupConflict> {
+        let mut unique = Vec::new();
+        for record in records {
+            if unique.iter().any(|existing| existing == &record) {
+                continue;
+            }
+            if unique
+                .iter()
+                .any(|existing| lookup_domains_overlap(existing, &record))
+            {
+                return Err(TlsSessionSecretLookupConflict::from_record(&record));
+            }
+            unique.push(record);
+        }
+        Ok((!unique.is_empty()).then_some(Self { records: unique }))
+    }
+
     pub fn records(&self) -> &[TlsSessionSecretRecord] {
         &self.records
     }
@@ -136,6 +155,48 @@ impl TlsSessionSecretRecord {
                 .not_after_unix_ns
                 .is_none_or(|not_after| at_wall_time_unix_ns <= not_after)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "overlapping TLS session secret records for protocol {protocol:?}, secret_kind {secret_kind:?}, client_random {client_random:?}"
+)]
+pub struct TlsSessionSecretLookupConflict {
+    protocol: TlsSessionSecretProtocol,
+    secret_kind: TlsSessionSecretKind,
+    client_random: TlsRandom,
+}
+
+impl TlsSessionSecretLookupConflict {
+    fn from_record(record: &TlsSessionSecretRecord) -> Self {
+        Self {
+            protocol: record.protocol,
+            secret_kind: record.secret_kind,
+            client_random: record.client_random,
+        }
+    }
+}
+
+fn lookup_domains_overlap(left: &TlsSessionSecretRecord, right: &TlsSessionSecretRecord) -> bool {
+    left.protocol == right.protocol
+        && left.secret_kind == right.secret_kind
+        && left.client_random == right.client_random
+        && validity_windows_overlap(left, right)
+}
+
+fn validity_windows_overlap(left: &TlsSessionSecretRecord, right: &TlsSessionSecretRecord) -> bool {
+    record_ends_after_other_starts(left, right) && record_ends_after_other_starts(right, left)
+}
+
+fn record_ends_after_other_starts(
+    left: &TlsSessionSecretRecord,
+    right: &TlsSessionSecretRecord,
+) -> bool {
+    left.not_after_unix_ns.is_none_or(|left_end| {
+        right
+            .not_before_unix_ns
+            .is_none_or(|right_start| left_end >= right_start)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -604,6 +665,55 @@ mod tests {
         );
 
         assert_eq!(lookup, TlsMaterialLookup::Ambiguous { matches: 2 });
+    }
+
+    #[test]
+    fn time_qualified_store_dedupes_exact_records_and_rejects_ambiguous_lookup_domain() {
+        let client_random = "00".repeat(TLS_RANDOM_BYTES);
+        let material = format!(
+            r#"
+{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{client_random}","secret":"aa","not_before_unix_ns":10,"not_after_unix_ns":20}}
+{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{client_random}","secret":"bb","not_before_unix_ns":20,"not_after_unix_ns":30}}
+"#
+        );
+        let store =
+            TlsSessionSecretStore::parse(material.as_bytes()).expect("valid session secret file");
+
+        let error =
+            TlsSessionSecretStore::from_time_qualified_lookup_records(store.records().to_vec())
+                .expect_err("overlapping lookup domains must be rejected");
+
+        assert_eq!(
+            error,
+            TlsSessionSecretLookupConflict {
+                protocol: TlsSessionSecretProtocol::Tls13,
+                secret_kind: TlsSessionSecretKind::ClientApplicationTraffic,
+                client_random: TlsRandom::from_hex(&client_random).expect("valid random"),
+            }
+        );
+    }
+
+    #[test]
+    fn time_qualified_store_keeps_non_overlapping_records() {
+        let client_random = "00".repeat(TLS_RANDOM_BYTES);
+        let material = format!(
+            r#"
+{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{client_random}","secret":"aa","not_before_unix_ns":10,"not_after_unix_ns":20}}
+{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{client_random}","secret":"aa","not_before_unix_ns":10,"not_after_unix_ns":20}}
+{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{client_random}","secret":"cc","not_before_unix_ns":31,"not_after_unix_ns":40}}
+{{"protocol":"tls13","secret_kind":"server_application_traffic_secret","client_random":"{client_random}","secret":"dd","not_before_unix_ns":10,"not_after_unix_ns":20}}
+"#
+        );
+        let store =
+            TlsSessionSecretStore::parse(material.as_bytes()).expect("valid session secret file");
+
+        let lookup_unique = TlsSessionSecretStore::from_time_qualified_lookup_records(
+            store.records().iter().cloned(),
+        )
+        .expect("non-overlapping lookup records should build a store")
+        .expect("non-empty unique records should remain");
+
+        assert_eq!(lookup_unique.records().len(), 3);
     }
 
     #[test]

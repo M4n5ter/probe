@@ -14,23 +14,43 @@ use crate::{
     plaintext_feed::load_plaintext_feed_provider,
     tls_plaintext::{
         TlsPlaintextInstrumentationBuild, TlsPlaintextRuntimeState,
-        build_tls_plaintext_instrumentation,
+        TlsSessionSecretAutoBindingBuild, build_tls_plaintext_instrumentation,
+        build_tls_session_secret_auto_binding,
     },
 };
+
+pub(crate) struct CaptureProviderPreflight {
+    session_secret_auto_binding: TlsSessionSecretAutoBindingBuild,
+}
+
+impl CaptureProviderPreflight {
+    pub(crate) fn build(plan: &RuntimePlan) -> Result<Self, AgentError> {
+        let session_secret_auto_binding = build_tls_session_secret_auto_binding(plan)?;
+        Ok(Self {
+            session_secret_auto_binding,
+        })
+    }
+}
 
 pub(crate) fn build_capture_provider(
     plan: &RuntimePlan,
     tls_plaintext_runtime: Option<&TlsPlaintextRuntimeState>,
+    preflight: CaptureProviderPreflight,
 ) -> Result<Box<dyn CaptureProvider>, AgentError> {
     match plan.capture.selected_backend {
         Some(CaptureBackend::PlaintextFeed) => build_plaintext_feed_provider(plan),
-        _ => build_live_capture_provider(plan, tls_plaintext_runtime),
+        _ => build_live_capture_provider(
+            plan,
+            tls_plaintext_runtime,
+            preflight.session_secret_auto_binding,
+        ),
     }
 }
 
 fn build_live_capture_provider(
     plan: &RuntimePlan,
     tls_plaintext_runtime: Option<&TlsPlaintextRuntimeState>,
+    session_secret_auto_binding: TlsSessionSecretAutoBindingBuild,
 ) -> Result<Box<dyn CaptureProvider>, AgentError> {
     plan.require_live_capture()?;
     let primary = match plan.capture.selected_backend {
@@ -50,6 +70,7 @@ fn build_live_capture_provider(
                 .unwrap_or_else(|| "capture plan did not select a live backend".to_string()),
         })),
     }?;
+    let primary = session_secret_auto_binding.wrap(primary);
     with_tls_plaintext_provider(plan, primary, tls_plaintext_runtime)
 }
 

@@ -1,12 +1,15 @@
 use std::path::PathBuf;
 
-use capture::{TlsKeyLog, TlsKeyLogSummary, TlsSessionSecretStore, TlsSessionSecretSummary};
+use capture::{TlsKeyLog, TlsKeyLogSummary, TlsSessionSecretSummary};
 use probe_config::TlsMaterialKind;
 use runtime::{RuntimePlan, TlsPlaintextMaterialPlan};
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::tls_material::{FilesystemTlsMaterialStore, TlsMaterialFileStore};
+use crate::tls_plaintext::{
+    TlsDecryptHintError, TlsSessionSecretAutoBindingPlan, load_tls_session_secret_materials,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct TlsCheckSnapshot {
@@ -56,6 +59,8 @@ pub(crate) enum TlsCheckError {
         path: PathBuf,
         reason: String,
     },
+    #[error("TLS plaintext decrypt hints are invalid: {reason}")]
+    DecryptHints { reason: String },
 }
 
 pub(in crate::check) fn check_tls(plan: &RuntimePlan) -> Result<TlsCheckSnapshot, TlsCheckError> {
@@ -78,10 +83,7 @@ fn check_tls_with_file_store(
             },
             decrypt_hints: TlsDecryptHintCheckSnapshot {
                 key_logs: check_key_log_materials(&decrypt_hints.key_logs, file_store)?,
-                session_secrets: check_session_secret_materials(
-                    &decrypt_hints.session_secrets,
-                    file_store,
-                )?,
+                session_secrets: check_session_secret_materials(plan, file_store)?,
             },
         },
     })
@@ -109,21 +111,31 @@ fn check_key_log_materials(
 }
 
 fn check_session_secret_materials(
-    materials: &[TlsPlaintextMaterialPlan],
+    plan: &RuntimePlan,
     file_store: &impl TlsMaterialFileStore,
 ) -> Result<Vec<TlsPlaintextMaterialCheckSnapshot>, TlsCheckError> {
+    let materials = load_tls_session_secret_materials(
+        &plan.tls.plaintext.decrypt_hints.session_secrets,
+        file_store,
+    )
+    .map_err(TlsCheckError::from)?;
+    if TlsSessionSecretAutoBindingPlan::for_runtime(plan).is_enabled() {
+        materials
+            .build_auto_binding_store()
+            .map(|_| ())
+            .map_err(TlsCheckError::from)?;
+    }
     materials
+        .materials()
         .iter()
         .map(|material| {
-            let bytes = read_plaintext_material(material, file_store)?;
-            let summary = TlsSessionSecretStore::parse(&bytes)
-                .map(|store| store.summary())
-                .map_err(|source| tls_plaintext_material_error(material, source))?;
             Ok(TlsPlaintextMaterialCheckSnapshot {
                 id: material.id.clone(),
                 kind: material.kind,
                 path: material.path.clone(),
-                check: TlsPlaintextMaterialContentCheck::SessionSecretFile { summary },
+                check: TlsPlaintextMaterialContentCheck::SessionSecretFile {
+                    summary: material.store.summary(),
+                },
             })
         })
         .collect()
@@ -150,11 +162,34 @@ fn tls_plaintext_material_error(
     }
 }
 
+impl From<TlsDecryptHintError> for TlsCheckError {
+    fn from(error: TlsDecryptHintError) -> Self {
+        match error {
+            TlsDecryptHintError::SessionSecretMaterial {
+                id,
+                kind,
+                path,
+                reason,
+            } => Self::PlaintextMaterial {
+                id,
+                kind,
+                path,
+                reason,
+            },
+            TlsDecryptHintError::SessionSecretMaterialSet { reason } => {
+                Self::DecryptHints { reason }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use probe_config::{AgentConfig, CaptureBackend, TlsMaterialConfig, TlsMaterialKind};
+    use probe_config::{
+        AgentConfig, CaptureBackend, CaptureSelection, TlsMaterialConfig, TlsMaterialKind,
+    };
     use probe_core::{CapabilityKind, CapabilityState};
     use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
     use serde_json::json;
@@ -173,7 +208,7 @@ mod tests {
             b"CLIENT_RANDOM 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111\n",
         )?;
         let session_secret_material = format!(
-            r#"{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{}","secret":"{}"}}"#,
+            r#"{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{}","cipher_suite":"0x1301","secret":"{}"}}"#,
             "00".repeat(32),
             "aa".repeat(32)
         );
@@ -346,16 +381,153 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn check_report_rejects_overlapping_tls_session_secret_materials()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-overlapping-tls-session-secrets")?;
+        let first_path = temp.join("session-secrets-a.jsonl");
+        let second_path = temp.join("session-secrets-b.jsonl");
+        fs::write(
+            &first_path,
+            session_secret_material_with_window("00", "aa", 10, 30),
+        )?;
+        fs::write(
+            &second_path,
+            session_secret_material_with_window("00", "bb", 20, 40),
+        )?;
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.decrypt_hints.session_secret_refs = vec![
+            "session-secrets-a".to_string(),
+            "session-secrets-b".to_string(),
+        ];
+        config.tls.materials.extend([
+            TlsMaterialConfig {
+                id: Some("session-secrets-a".to_string()),
+                kind: TlsMaterialKind::SessionSecretFile,
+                path: first_path,
+            },
+            TlsMaterialConfig {
+                id: Some("session-secrets-b".to_string()),
+                kind: TlsMaterialKind::SessionSecretFile,
+                path: second_path,
+            },
+        ]);
+        let plan = runtime_plan(config)?;
+
+        let error = build_check_report(plan, None)
+            .await
+            .expect_err("overlapping session secret material must fail explicit check");
+
+        assert!(matches!(
+            error,
+            CheckError::Tls(TlsCheckError::DecryptHints { .. })
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("overlapping TLS session secret records")
+        );
+        assert!(!error.to_string().contains(&"aa".repeat(32)));
+        assert!(!error.to_string().contains(&"bb".repeat(32)));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_rejects_session_secret_refs_without_live_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-session-secret-without-live-material")?;
+        let session_secret_path = temp.join("session-secrets.jsonl");
+        fs::write(
+            &session_secret_path,
+            format!(
+                r#"{{"protocol":"tls12","secret_kind":"master_secret","client_random":"{}","secret":"{}"}}"#,
+                "00".repeat(32),
+                "bb".repeat(48),
+            ),
+        )?;
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.decrypt_hints.session_secret_refs =
+            vec!["session-secrets".to_string()];
+        config.tls.materials.push(TlsMaterialConfig {
+            id: Some("session-secrets".to_string()),
+            kind: TlsMaterialKind::SessionSecretFile,
+            path: session_secret_path,
+        });
+        let plan = runtime_plan(config)?;
+
+        let error = build_check_report(plan, None)
+            .await
+            .expect_err("session_secret_refs without live application material must fail check");
+
+        assert!(matches!(
+            error,
+            CheckError::Tls(TlsCheckError::DecryptHints { .. })
+        ));
+        assert!(error.to_string().contains("session_secret_refs"));
+        assert!(error.to_string().contains("usable by live auto-binding"));
+        assert!(!error.to_string().contains(&"bb".repeat(48)));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_summarizes_session_secret_refs_when_auto_binding_is_disabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-plaintext-feed-session-secret-summary")?;
+        let session_secret_path = temp.join("session-secrets.jsonl");
+        fs::write(
+            &session_secret_path,
+            format!(
+                r#"{{"protocol":"tls12","secret_kind":"master_secret","client_random":"{}","secret":"{}"}}"#,
+                "00".repeat(32),
+                "bb".repeat(48),
+            ),
+        )?;
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::PlaintextFeed;
+        config.capture.plaintext_feed.path = Some(temp.join("feed.jsonl"));
+        config.tls.plaintext.decrypt_hints.session_secret_refs =
+            vec!["session-secrets".to_string()];
+        config.tls.materials.push(TlsMaterialConfig {
+            id: Some("session-secrets".to_string()),
+            kind: TlsMaterialKind::SessionSecretFile,
+            path: session_secret_path,
+        });
+        let plan = runtime_plan(config)?;
+
+        let report = build_check_report(plan, None).await?;
+
+        let value = serde_json::to_value(report)?;
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["session_secrets"][0]["check"]["summary"]["protocols"]
+                [0]["protocol"],
+            json!("tls12")
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
     fn runtime_plan(config: AgentConfig) -> Result<RuntimePlan, runtime::RuntimeError> {
         RuntimePlan::build(config, &runtime_registry())
     }
 
     fn runtime_registry() -> ProviderRegistry {
         ProviderRegistry::new(
-            vec![CaptureProviderDescriptor::available(
-                CaptureBackend::Replay,
-                CaptureProviderBuilder::Replay,
-            )],
+            vec![
+                CaptureProviderDescriptor::available(
+                    CaptureBackend::Libpcap,
+                    CaptureProviderBuilder::Libpcap,
+                ),
+                CaptureProviderDescriptor::available(
+                    CaptureBackend::PlaintextFeed,
+                    CaptureProviderBuilder::PlaintextFeed,
+                ),
+                CaptureProviderDescriptor::available(
+                    CaptureBackend::Replay,
+                    CaptureProviderBuilder::Replay,
+                ),
+            ],
             vec![
                 CapabilityState::available(CapabilityKind::Http1),
                 CapabilityState::available(CapabilityKind::Sse),
@@ -379,5 +551,18 @@ mod tests {
         }
         fs::create_dir_all(&path)?;
         Ok(path)
+    }
+
+    fn session_secret_material_with_window(
+        client_random_byte: &str,
+        secret_byte: &str,
+        not_before_unix_ns: u64,
+        not_after_unix_ns: u64,
+    ) -> String {
+        format!(
+            r#"{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{}","cipher_suite":"0x1301","secret":"{}","not_before_unix_ns":{not_before_unix_ns},"not_after_unix_ns":{not_after_unix_ns}}}"#,
+            client_random_byte.repeat(32),
+            secret_byte.repeat(32),
+        )
     }
 }

@@ -1,3 +1,3 @@
 mod factory;
 
-pub(super) use factory::build_capture_provider;
+pub(super) use factory::{CaptureProviderPreflight, build_capture_provider};

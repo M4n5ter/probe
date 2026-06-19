@@ -55,7 +55,7 @@ pub use tls::{
     Tls13SessionSecretStreamCursor, Tls13SessionSecretStreamError, TlsCipherSuite, TlsKeyLog,
     TlsKeyLogEntry, TlsKeyLogField, TlsKeyLogLabel, TlsKeyLogLabelCount, TlsKeyLogParseError,
     TlsKeyLogSummary, TlsMaterialLookup, TlsRandom, TlsSecret, TlsSessionSecretKind,
-    TlsSessionSecretLookupTime, TlsSessionSecretLookupTimeError, TlsSessionSecretParseError,
-    TlsSessionSecretProtocol, TlsSessionSecretRecord, TlsSessionSecretStore,
-    TlsSessionSecretSummary, plan_libssl_uprobes_for_processes,
+    TlsSessionSecretLookupConflict, TlsSessionSecretLookupTime, TlsSessionSecretLookupTimeError,
+    TlsSessionSecretParseError, TlsSessionSecretProtocol, TlsSessionSecretRecord,
+    TlsSessionSecretStore, TlsSessionSecretSummary, plan_libssl_uprobes_for_processes,
 };

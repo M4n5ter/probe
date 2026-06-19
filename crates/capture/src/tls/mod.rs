@@ -48,7 +48,7 @@ pub use session_secret::{
     Tls13SessionSecretHandshakeObserver, Tls13SessionSecretPlaintextAdapter,
     Tls13SessionSecretPlaintextError, Tls13SessionSecretStreamAdapter,
     Tls13SessionSecretStreamCursor, Tls13SessionSecretStreamError, TlsCipherSuite,
-    TlsSessionSecretKind, TlsSessionSecretLookupTime, TlsSessionSecretLookupTimeError,
-    TlsSessionSecretParseError, TlsSessionSecretProtocol, TlsSessionSecretRecord,
-    TlsSessionSecretStore, TlsSessionSecretSummary,
+    TlsSessionSecretKind, TlsSessionSecretLookupConflict, TlsSessionSecretLookupTime,
+    TlsSessionSecretLookupTimeError, TlsSessionSecretParseError, TlsSessionSecretProtocol,
+    TlsSessionSecretRecord, TlsSessionSecretStore, TlsSessionSecretSummary,
 };

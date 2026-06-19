@@ -11,7 +11,7 @@ use storage::FjallSpool;
 
 use crate::{
     admin::{AdminRuntimeState, AdminServerConfig, spawn_admin_server},
-    capture_provider::build_capture_provider,
+    capture_provider::{CaptureProviderPreflight, build_capture_provider},
     configured_enforcement::{
         EnforcementRuntimeState, RuntimeEnforcementPlanner,
         build_configured_enforcement_with_backend,
@@ -54,6 +54,7 @@ pub(crate) async fn run_live_agent(
     validate_static_runtime_config(&agent_config)?;
     let runtime = build_runtime_composition(agent_config)?;
     let (plan, enforcement_backend, transparent_interception) = runtime.into_run_parts();
+    let capture_provider_preflight = CaptureProviderPreflight::build(&plan)?;
     let enforcement = build_configured_enforcement_with_backend(&plan, enforcement_backend).await?;
     let policies = load_configured_pipeline_policies(&plan.config)?;
     let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
@@ -102,6 +103,7 @@ pub(crate) async fn run_live_agent(
         transparent_interception_setup_scope: enforcement.transparent_interception_setup_scope,
         transparent_interception,
         pipeline_metrics,
+        capture_provider_preflight,
         tls_plaintext_runtime,
         storage_retention_config,
         shutdown_requested: Arc::clone(&shutdown_requested),
@@ -154,6 +156,7 @@ struct BlockingCaptureRun {
     transparent_interception_setup_scope: Option<TransparentInterceptionHostRuleScope>,
     transparent_interception: TransparentInterceptionRuntime,
     pipeline_metrics: PipelineRuntimeMetrics,
+    capture_provider_preflight: CaptureProviderPreflight,
     tls_plaintext_runtime: TlsPlaintextRuntimeState,
     storage_retention_config: Option<StorageRetentionWorkerConfig>,
     shutdown_requested: shutdown::ShutdownFlag,
@@ -178,6 +181,7 @@ impl BlockingCaptureRun {
             transparent_interception_setup_scope,
             transparent_interception,
             pipeline_metrics,
+            capture_provider_preflight,
             tls_plaintext_runtime,
             mut storage_retention_config,
             shutdown_requested,
@@ -206,7 +210,11 @@ impl BlockingCaptureRun {
             let mut pipeline = pipeline.with_enforcement_planner(&mut enforcement_planner);
             transparent_interception_guard =
                 transparent_interception.activate(transparent_interception_setup_scope)?;
-            let mut provider = build_capture_provider(&plan, Some(&tls_plaintext_runtime))?;
+            let mut provider = build_capture_provider(
+                &plan,
+                Some(&tls_plaintext_runtime),
+                capture_provider_preflight,
+            )?;
             signal_readiness(readiness)?;
             let capture_summary = pipeline.run_provider_with_options(
                 provider.as_mut(),

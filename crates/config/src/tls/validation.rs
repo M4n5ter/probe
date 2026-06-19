@@ -84,25 +84,45 @@ fn validate_tls_materials(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>
 
 fn validate_plaintext_tls_material_refs(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
     let materials_by_id = materials_by_id(tls);
-    for reference in &tls.plaintext.decrypt_hints.key_log_refs {
+    validate_plaintext_tls_material_ref_list(
+        &tls.plaintext.decrypt_hints.key_log_refs,
+        "tls.plaintext.decrypt_hints.key_log_refs",
+        TlsMaterialKind::KeyLogFile,
+        &materials_by_id,
+        violations,
+    );
+    validate_plaintext_tls_material_ref_list(
+        &tls.plaintext.decrypt_hints.session_secret_refs,
+        "tls.plaintext.decrypt_hints.session_secret_refs",
+        TlsMaterialKind::SessionSecretFile,
+        &materials_by_id,
+        violations,
+    );
+}
+
+fn validate_plaintext_tls_material_ref_list(
+    refs: &[String],
+    field: &'static str,
+    expected_kind: TlsMaterialKind,
+    materials_by_id: &BTreeMap<&str, TlsMaterialKind>,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    let mut seen_refs = HashSet::new();
+    for reference in refs {
         validate_material_ref(
-            "tls.plaintext.decrypt_hints.key_log_refs",
+            field,
             reference,
-            TlsMaterialKind::KeyLogFile,
-            &materials_by_id,
+            expected_kind,
+            materials_by_id,
             violations,
             "TLS plaintext material",
         );
-    }
-    for reference in &tls.plaintext.decrypt_hints.session_secret_refs {
-        validate_material_ref(
-            "tls.plaintext.decrypt_hints.session_secret_refs",
-            reference,
-            TlsMaterialKind::SessionSecretFile,
-            &materials_by_id,
-            violations,
-            "TLS plaintext material",
-        );
+        if !reference.trim().is_empty() && !seen_refs.insert(reference.as_str()) {
+            violations.push(ConfigViolation {
+                field: field.to_string(),
+                reason: format!("TLS plaintext material ref {reference} is duplicated"),
+            });
+        }
     }
 }
 
@@ -144,4 +164,51 @@ fn validate_plaintext_feed_selection(tls: &TlsConfig, violations: &mut Vec<Confi
         reason: "plaintext_feed capture is the external plaintext source; disable tls.plaintext.instrumentation or select a TLS instrumentation backend"
             .to_string(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{AgentConfig, ConfigError, TlsMaterialConfig, TlsMaterialKind};
+
+    #[test]
+    fn duplicate_plaintext_decrypt_hint_refs_fail_validation() {
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.decrypt_hints.key_log_refs =
+            vec!["ssl-keys".to_string(), "ssl-keys".to_string()];
+        config.tls.plaintext.decrypt_hints.session_secret_refs =
+            vec!["session-secrets".to_string(), "session-secrets".to_string()];
+        config.tls.materials = vec![
+            TlsMaterialConfig {
+                id: Some("ssl-keys".to_string()),
+                kind: TlsMaterialKind::KeyLogFile,
+                path: "/tmp/sslkeylog.log".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("session-secrets".to_string()),
+                kind: TlsMaterialKind::SessionSecretFile,
+                path: "/tmp/session-secrets.jsonl".into(),
+            },
+        ];
+
+        let error = config
+            .validate_basic()
+            .expect_err("duplicate TLS plaintext decrypt hint refs must fail");
+        let ConfigError::Validation(error) = error else {
+            panic!("duplicate refs should produce a validation error");
+        };
+
+        assert_eq!(error.violations().len(), 2);
+        assert!(error.violations().iter().any(|violation| {
+            violation.field == "tls.plaintext.decrypt_hints.key_log_refs"
+                && violation
+                    .reason
+                    .contains("TLS plaintext material ref ssl-keys is duplicated")
+        }));
+        assert!(error.violations().iter().any(|violation| {
+            violation.field == "tls.plaintext.decrypt_hints.session_secret_refs"
+                && violation
+                    .reason
+                    .contains("TLS plaintext material ref session-secrets is duplicated")
+        }));
+    }
 }
