@@ -15,6 +15,7 @@ mod tls_plaintext_dynamic_library;
 mod tls_plaintext_loopback;
 mod tls_plaintext_provider_loopback;
 mod tls_plaintext_status;
+mod tls_session_secret_auto_binding_loopback;
 mod transparent_tproxy_loopback;
 mod webhook_exporter;
 mod webhook_receiver;
