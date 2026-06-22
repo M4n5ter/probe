@@ -5,9 +5,12 @@ mod registry;
 mod relay;
 mod state;
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    net::IpAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use ::runtime::TransparentInterceptionInboundTproxyPlan;
@@ -19,6 +22,9 @@ use self::{
     registry::RelayRegistry,
 };
 use super::{TransparentInterceptionError, TransparentInterceptionIpFamily};
+
+pub(super) type LocalAddressInventory =
+    Arc<dyn Fn() -> Result<Vec<IpAddr>, TransparentInterceptionError> + Send + Sync>;
 
 pub(in crate::transparent_interception) use state::TransparentProxyRuntime;
 pub(crate) use state::{
@@ -46,10 +52,17 @@ pub(in crate::transparent_interception) struct TransparentProxyGuard {
 pub(in crate::transparent_interception) fn prepare_proxy_lifecycle(
     inbound_plan: &TransparentInterceptionInboundTproxyPlan,
     families: Vec<TransparentInterceptionIpFamily>,
+    load_local_addresses: LocalAddressInventory,
 ) -> Result<TransparentProxyLifecyclePlan, TransparentInterceptionError> {
+    let managed = prepare_managed_proxy(inbound_plan, families)?;
+    let health_probe = prepare_health_probe(
+        inbound_plan.health_probe(),
+        managed.as_ref(),
+        load_local_addresses,
+    )?;
     Ok(TransparentProxyLifecyclePlan {
-        managed: prepare_managed_proxy(inbound_plan, families)?,
-        health_probe: prepare_health_probe(inbound_plan.health_probe()),
+        managed,
+        health_probe,
     })
 }
 
@@ -227,7 +240,7 @@ mod tests {
             panic!("test transparent interception config should use inbound TPROXY");
         };
 
-        let plan = prepare_proxy_lifecycle(&inbound_plan, Vec::new())
+        let plan = prepare_proxy_lifecycle(&inbound_plan, Vec::new(), Arc::new(|| Ok(Vec::new())))
             .expect("external mode without health probe should be prepared");
         let guard = start_proxy_lifecycle(
             plan,
@@ -256,10 +269,11 @@ mod tests {
             panic!("test transparent interception config should use inbound TPROXY");
         };
 
-        let error = match prepare_proxy_lifecycle(&inbound_plan, Vec::new()) {
-            Ok(_) => panic!("managed relay should require at least one listener family"),
-            Err(error) => error,
-        };
+        let error =
+            match prepare_proxy_lifecycle(&inbound_plan, Vec::new(), Arc::new(|| Ok(Vec::new()))) {
+                Ok(_) => panic!("managed relay should require at least one listener family"),
+                Err(error) => error,
+            };
 
         assert!(error.to_string().contains("at least one listener family"));
     }

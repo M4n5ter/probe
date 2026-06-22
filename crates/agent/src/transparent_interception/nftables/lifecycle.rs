@@ -1,13 +1,14 @@
 use super::{
     command::{CommandResult, IpCommand, NftCommand},
+    local_addresses,
     owner_lock::{NftablesOwnerLock, NftablesOwnerLockGuard, SystemNftablesOwnerLock},
     plan::InboundTproxyLifecyclePlan,
 };
 use crate::transparent_interception::{
     TransparentInterceptionError,
     proxy::{
-        TransparentProxyGuard, TransparentProxyRuntime, prepare_proxy_lifecycle,
-        start_proxy_lifecycle,
+        LocalAddressInventory, TransparentProxyGuard, TransparentProxyRuntime,
+        prepare_proxy_lifecycle, start_proxy_lifecycle,
     },
 };
 #[cfg(test)]
@@ -16,11 +17,14 @@ use ::runtime::TransparentInterceptionInboundTproxyPlan;
 use interception::TransparentInterceptionHostRuleScope;
 #[cfg(test)]
 use probe_config::EnforcementInterceptionConfig;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+type SharedIpCommand = Arc<Mutex<Box<dyn IpCommand + Send>>>;
 
 pub(in crate::transparent_interception) struct NftablesTransparentInterception {
     inbound_plan: TransparentInterceptionInboundTproxyPlan,
     nft: Box<dyn NftCommand + Send>,
-    ip: Option<Box<dyn IpCommand + Send>>,
+    ip: Option<SharedIpCommand>,
     owner_lock: Box<dyn NftablesOwnerLock>,
     proxy_runtime: TransparentProxyRuntime,
 }
@@ -60,7 +64,7 @@ impl NftablesTransparentInterception {
         Self {
             inbound_plan,
             nft: Box::new(nft),
-            ip: ip.map(|ip| Box::new(ip) as Box<dyn IpCommand + Send>),
+            ip: ip.map(|ip| Arc::new(Mutex::new(Box::new(ip) as Box<dyn IpCommand + Send>))),
             owner_lock: Box::new(owner_lock),
             proxy_runtime,
         }
@@ -97,7 +101,11 @@ impl NftablesTransparentInterception {
             setup_scope,
         )
         .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
-        let proxy_plan = prepare_proxy_lifecycle(&self.inbound_plan, plan.listener_families())?;
+        let proxy_plan = prepare_proxy_lifecycle(
+            &self.inbound_plan,
+            plan.listener_families(),
+            local_address_inventory(self.ip.clone()),
+        )?;
         let setup_script = plan.setup_nft_script();
         check_nft_script(self.nft.as_mut(), &setup_script)?;
         let owner_lock = self.owner_lock.acquire(plan.owner_name())?;
@@ -128,11 +136,12 @@ impl NftablesTransparentInterception {
         if plan.setup_ip_commands().is_empty() {
             return Ok(());
         }
-        let Some(ip) = self.ip.as_mut() else {
+        let Some(ip) = self.ip.as_ref() else {
             return Err(TransparentInterceptionError::Nftables(
                 "policy routing command is unavailable".to_string(),
             ));
         };
+        let mut ip = lock_ip_command(ip)?;
         for command in plan.setup_ip_commands() {
             apply_ip_command(ip.as_mut(), &command, "ip setup")?;
         }
@@ -150,7 +159,10 @@ impl NftablesTransparentInterception {
     }
 
     fn cleanup_ip_commands_best_effort(&mut self, commands: Vec<Vec<String>>) {
-        let Some(ip) = self.ip.as_mut() else {
+        let Some(ip) = self.ip.as_ref() else {
+            return;
+        };
+        let Ok(mut ip) = lock_ip_command(ip) else {
             return;
         };
         for command in commands {
@@ -181,11 +193,16 @@ impl NftablesTransparentInterceptionGuard {
             "nft cleanup",
         );
         let mut route_result = Ok(());
-        if let Some(ip) = inner.ip.as_mut() {
-            for command in self.plan.cleanup_ip_commands() {
-                if let Err(error) = apply_ip_command(ip.as_mut(), &command, "ip cleanup") {
-                    route_result = Err(error);
+        if let Some(ip) = inner.ip.as_ref() {
+            match lock_ip_command(ip) {
+                Ok(mut ip) => {
+                    for command in self.plan.cleanup_ip_commands() {
+                        if let Err(error) = apply_ip_command(ip.as_mut(), &command, "ip cleanup") {
+                            route_result = Err(error);
+                        }
+                    }
                 }
+                Err(error) => route_result = Err(error),
             }
         }
         self.inner = None;
@@ -203,6 +220,26 @@ impl Drop for NftablesTransparentInterceptionGuard {
             eprintln!("transparent interception cleanup failed during drop: {error}");
         }
     }
+}
+
+fn local_address_inventory(ip: Option<SharedIpCommand>) -> LocalAddressInventory {
+    Arc::new(move || {
+        let Some(ip) = ip.as_ref() else {
+            return Err(TransparentInterceptionError::Nftables(
+                "local address inventory requires ip at a trusted system path".to_string(),
+            ));
+        };
+        let mut ip = lock_ip_command(ip)?;
+        local_addresses::load(ip.as_mut())
+    })
+}
+
+fn lock_ip_command(
+    ip: &SharedIpCommand,
+) -> Result<MutexGuard<'_, Box<dyn IpCommand + Send>>, TransparentInterceptionError> {
+    ip.lock().map_err(|_| {
+        TransparentInterceptionError::Nftables("ip command mutex is poisoned".to_string())
+    })
 }
 
 fn apply_nft_script(
@@ -457,6 +494,39 @@ mod tests {
     }
 
     #[test]
+    fn activation_rejects_health_probe_target_on_local_relay_listener_before_host_mutation() {
+        let nft = FakeNft::succeeding();
+        let ip = FakeIp::with_results([Ok(CommandResult {
+            success: true,
+            stdout: br#"[{"addr_info":[{"local":"192.0.2.10"}]}]"#.to_vec(),
+            stderr: Vec::new(),
+        })]);
+        let mut config = inbound_config();
+        config.proxy.mode = probe_config::TransparentInterceptionProxyModeConfig::ManagedTcpRelay;
+        config.proxy.health_probe = TransparentInterceptionProxyHealthProbeConfig {
+            target: Some("192.0.2.10:15001".to_string()),
+            interval_ms: 100,
+            timeout_ms: 10,
+            failure_threshold: 1,
+        };
+
+        let error = match NftablesTransparentInterception::new_for_test(
+            config,
+            nft.clone(),
+            Some(ip.clone()),
+        )
+        .activate(setup_scope(&setup_selector()))
+        {
+            Ok(_) => panic!("local relay listener health probe target must fail activation"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("local relay listener"));
+        assert!(nft.scripts().is_empty());
+        assert_eq!(ip.args(), vec![string_args(["-j", "address", "show"])]);
+    }
+
+    #[test]
     fn startup_cleanup_removes_all_owned_route_families_before_projected_install()
     -> Result<(), Box<dyn std::error::Error>> {
         let nft = FakeNft::succeeding();
@@ -661,25 +731,38 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeIp {
-        state: Arc<Mutex<Vec<Vec<String>>>>,
+        state: Arc<Mutex<FakeIpState>>,
+    }
+
+    struct FakeIpState {
+        args: Vec<Vec<String>>,
+        results: VecDeque<io::Result<CommandResult>>,
     }
 
     impl FakeIp {
         fn succeeding() -> Self {
+            Self::with_results(std::iter::repeat_with(|| Ok(success())).take(16))
+        }
+
+        fn with_results(results: impl IntoIterator<Item = io::Result<CommandResult>>) -> Self {
             Self {
-                state: Arc::new(Mutex::new(Vec::new())),
+                state: Arc::new(Mutex::new(FakeIpState {
+                    args: Vec::new(),
+                    results: results.into_iter().collect(),
+                })),
             }
         }
 
         fn args(&self) -> Vec<Vec<String>> {
-            self.state.lock().expect("fake ip lock").clone()
+            self.state.lock().expect("fake ip lock").args.clone()
         }
     }
 
     impl IpCommand for FakeIp {
         fn run(&mut self, args: &[String]) -> io::Result<CommandResult> {
-            self.state.lock().expect("fake ip lock").push(args.to_vec());
-            Ok(success())
+            let mut state = self.state.lock().expect("fake ip lock");
+            state.args.push(args.to_vec());
+            state.results.pop_front().unwrap_or_else(|| Ok(success()))
         }
     }
 }

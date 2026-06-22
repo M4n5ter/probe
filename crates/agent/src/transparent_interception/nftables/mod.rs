@@ -1,5 +1,6 @@
 mod command;
 mod lifecycle;
+mod local_addresses;
 mod owner_lock;
 mod plan;
 mod probe;

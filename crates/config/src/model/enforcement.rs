@@ -379,9 +379,19 @@ fn health_probe_target_matches_managed_relay_listener(
 }
 
 fn is_local_listener_address(address: IpAddr) -> bool {
-    match address {
+    match normalized_ip_address(address) {
         IpAddr::V4(address) => address.is_loopback() || address.is_unspecified(),
         IpAddr::V6(address) => address.is_loopback() || address.is_unspecified(),
+    }
+}
+
+fn normalized_ip_address(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V4(_) => address,
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
     }
 }
 

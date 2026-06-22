@@ -120,3 +120,35 @@ listen_port = 15001
     );
     Ok(())
 }
+
+#[test]
+fn validation_rejects_ipv4_mapped_managed_relay_health_probe_self_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    for target in ["[::ffff:127.0.0.1]:15001", "[::ffff:0.0.0.0]:15001"] {
+        let config = AgentConfig::from_toml_str(&format!(
+            r#"
+[enforcement.interception]
+strategy = "inbound_tproxy"
+
+[enforcement.interception.proxy]
+mode = "managed_tcp_relay"
+listen_port = 15001
+
+[enforcement.interception.proxy.health_probe]
+target = "{target}"
+"#
+        ))?;
+
+        let error = config
+            .validate_basic()
+            .expect_err("IPv4-mapped self-target health probe must be rejected");
+
+        assert!(
+            error.to_string().contains(
+                "managed TCP relay health probe target must not point at the local relay listener"
+            ),
+            "expected self-target rejection for {target}: {error}"
+        );
+    }
+    Ok(())
+}
