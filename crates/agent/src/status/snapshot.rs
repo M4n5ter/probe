@@ -443,15 +443,11 @@ mod tests {
                     None,
                 )?),
             },
-            transparent_proxy: Some(TransparentProxyRuntimeSnapshot {
-                mode: TransparentProxyRuntimeMode::Configured,
-                listener_families: Vec::new(),
-                active_relays: 2,
-                accepted_relays: 3,
-                rejected_relays: 5,
-                relay_failures: 7,
-                listener_failures: 11,
-            }),
+            transparent_proxy: Some(
+                TransparentProxyRuntimeSnapshot::for_test(TransparentProxyRuntimeMode::Configured)
+                    .with_relay_counts(2, 3, 5, 7, 11)
+                    .with_upstream_connects(13, 17, Some("connection refused")),
+            ),
             ..RuntimeStatusInput::default()
         };
 
@@ -471,6 +467,8 @@ mod tests {
         assert_eq!(proxy_metrics.rejected_relays, 5);
         assert_eq!(proxy_metrics.relay_failures, 7);
         assert_eq!(proxy_metrics.listener_failures, 11);
+        assert_eq!(proxy_metrics.upstream_connects.connect_successes, 13);
+        assert_eq!(proxy_metrics.upstream_connects.connect_failures, 17);
         let runtime_proxy = snapshot
             .enforcement
             .interception
@@ -487,6 +485,10 @@ mod tests {
             value["metrics"]["transparent_proxy"]["active_relays"],
             json!(2)
         );
+        assert_eq!(
+            value["enforcement"]["interception"]["runtime_proxy"]["upstream_connects"]["connect_failures"],
+            json!(17)
+        );
         Ok(())
     }
 
@@ -502,15 +504,10 @@ mod tests {
                     None,
                 )?),
             },
-            transparent_proxy: Some(TransparentProxyRuntimeSnapshot {
-                mode: TransparentProxyRuntimeMode::Failed,
-                listener_families: Vec::new(),
-                active_relays: 0,
-                accepted_relays: 1,
-                rejected_relays: 0,
-                relay_failures: 0,
-                listener_failures: 1,
-            }),
+            transparent_proxy: Some(
+                TransparentProxyRuntimeSnapshot::for_test(TransparentProxyRuntimeMode::Failed)
+                    .with_relay_counts(0, 1, 0, 0, 1),
+            ),
             ..RuntimeStatusInput::default()
         };
 

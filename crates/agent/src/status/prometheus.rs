@@ -236,6 +236,25 @@ fn write_transparent_proxy(output: &mut String, snapshot: &AgentStatusSnapshot) 
 
     write_family(
         output,
+        "sssa_transparent_proxy_upstream_connects_total",
+        "counter",
+        "Managed transparent proxy upstream connect attempts by outcome.",
+    );
+    write_sample(
+        output,
+        "sssa_transparent_proxy_upstream_connects_total",
+        &[("outcome", "success")],
+        metrics.upstream_connects.connect_successes,
+    );
+    write_sample(
+        output,
+        "sssa_transparent_proxy_upstream_connects_total",
+        &[("outcome", "failure")],
+        metrics.upstream_connects.connect_failures,
+    );
+
+    write_family(
+        output,
         "sssa_transparent_proxy_relays_total",
         "counter",
         "Managed transparent proxy relays by outcome.",
@@ -525,15 +544,13 @@ mod tests {
                 BTreeMap::from([("primary".to_string(), 0)]),
             ),
             RuntimeStatusInput {
-                transparent_proxy: Some(TransparentProxyRuntimeSnapshot {
-                    mode: TransparentProxyRuntimeMode::Configured,
-                    listener_families: Vec::new(),
-                    active_relays: 2,
-                    accepted_relays: 3,
-                    rejected_relays: 5,
-                    relay_failures: 7,
-                    listener_failures: 11,
-                }),
+                transparent_proxy: Some(
+                    TransparentProxyRuntimeSnapshot::for_test(
+                        TransparentProxyRuntimeMode::Configured,
+                    )
+                    .with_relay_counts(2, 3, 5, 7, 11)
+                    .with_upstream_connects(13, 17, Some("connection refused")),
+                ),
                 ..RuntimeStatusInput::default()
             },
         );
@@ -542,6 +559,16 @@ mod tests {
 
         assert!(metrics.contains("sssa_transparent_proxy_metrics_available 1\n"));
         assert!(metrics.contains("sssa_transparent_proxy_active_relays 2\n"));
+        assert!(
+            metrics.contains(
+                "sssa_transparent_proxy_upstream_connects_total{outcome=\"success\"} 13\n"
+            )
+        );
+        assert!(
+            metrics.contains(
+                "sssa_transparent_proxy_upstream_connects_total{outcome=\"failure\"} 17\n"
+            )
+        );
         assert!(metrics.contains("sssa_transparent_proxy_relays_total{outcome=\"accepted\"} 3\n"));
         assert!(metrics.contains("sssa_transparent_proxy_relays_total{outcome=\"rejected\"} 5\n"));
         assert!(metrics.contains("sssa_transparent_proxy_failures_total{kind=\"relay\"} 7\n"));

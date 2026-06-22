@@ -42,11 +42,18 @@ pub struct ExportMetricsSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct TransparentProxyMetricsSnapshot {
+    pub upstream_connects: TransparentProxyUpstreamConnectMetricsSnapshot,
     pub active_relays: u64,
     pub accepted_relays: u64,
     pub rejected_relays: u64,
     pub relay_failures: u64,
     pub listener_failures: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TransparentProxyUpstreamConnectMetricsSnapshot {
+    pub connect_successes: u64,
+    pub connect_failures: u64,
 }
 
 pub(in crate::status) fn metrics_snapshot(
@@ -77,6 +84,10 @@ fn transparent_proxy_metrics(
     proxy: TransparentProxyRuntimeSnapshot,
 ) -> TransparentProxyMetricsSnapshot {
     TransparentProxyMetricsSnapshot {
+        upstream_connects: TransparentProxyUpstreamConnectMetricsSnapshot {
+            connect_successes: proxy.upstream_connects.connect_successes,
+            connect_failures: proxy.upstream_connects.connect_failures,
+        },
         active_relays: proxy.active_relays,
         accepted_relays: proxy.accepted_relays,
         rejected_relays: proxy.rejected_relays,

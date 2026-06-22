@@ -1,5 +1,5 @@
 use std::{
-    io,
+    fmt, io,
     net::{Shutdown, SocketAddr, TcpStream},
     sync::{
         Arc,
@@ -37,9 +37,14 @@ pub(super) fn spawn_relay(
             shutdown_requested,
             relays,
             slot,
+            runtime.clone(),
         ) {
-            runtime.record_relay_failure();
-            eprintln!("managed transparent proxy relay failed: {error}");
+            if error.counts_as_relay_failure() {
+                runtime.record_relay_failure();
+                eprintln!("managed transparent proxy relay failed: {error}");
+            } else {
+                eprintln!("managed transparent proxy upstream connect failed: {error}");
+            }
         }
     })
 }
@@ -51,33 +56,100 @@ fn relay_connection(
     shutdown_requested: Arc<AtomicBool>,
     relays: RelayRegistry,
     _slot: RelaySlot,
-) -> Result<(), TransparentInterceptionError> {
+    runtime: TransparentProxyRuntime,
+) -> Result<(), RelayConnectionError> {
     let peer = peer
         .as_socket()
-        .ok_or_else(|| proxy_error("transparent proxy accepted non-IP peer address"))?;
-    let target = tproxy_target(&accepted)?;
+        .ok_or_else(|| proxy_error("transparent proxy accepted non-IP peer address"))
+        .map_err(RelayConnectionError::relay)?;
+    let target = tproxy_target(&accepted).map_err(RelayConnectionError::relay)?;
     if target.port() == listen_port {
-        return Err(proxy_error(format!(
+        return Err(RelayConnectionError::relay(proxy_error(format!(
             "refusing transparent proxy self-relay for peer {peer} target {target}"
-        )));
+        ))));
     }
     let downstream = TcpStream::from(accepted);
     downstream
         .set_nodelay(true)
-        .map_err(proxy_io_error("set downstream TCP_NODELAY"))?;
-    let upstream = TcpStream::connect_timeout(&target, CONNECT_TIMEOUT).map_err(proxy_io_error(
-        format!("connect transparent upstream target {target} for peer {peer}"),
-    ))?;
+        .map_err(proxy_io_error("set downstream TCP_NODELAY"))
+        .map_err(RelayConnectionError::relay)?;
+    let upstream = connect_upstream_for_relay(target, peer, &runtime)
+        .map_err(RelayConnectionError::upstream_connect)?;
     upstream
         .set_nodelay(true)
-        .map_err(proxy_io_error("set upstream TCP_NODELAY"))?;
+        .map_err(proxy_io_error("set upstream TCP_NODELAY"))
+        .map_err(RelayConnectionError::relay)?;
     let _registration = relays
         .register(&downstream, &upstream)
-        .map_err(proxy_io_error("register active transparent relay"))?;
+        .map_err(proxy_io_error("register active transparent relay"))
+        .map_err(RelayConnectionError::relay)?;
     if shutdown_requested.load(Ordering::SeqCst) {
         shutdown_streams(&downstream, &upstream);
     }
-    relay_bidirectional(downstream, upstream)
+    relay_bidirectional(downstream, upstream).map_err(RelayConnectionError::relay)
+}
+
+#[derive(Debug)]
+enum RelayConnectionError {
+    UpstreamConnect(TransparentInterceptionError),
+    Relay(TransparentInterceptionError),
+}
+
+impl RelayConnectionError {
+    fn upstream_connect(error: TransparentInterceptionError) -> Self {
+        Self::UpstreamConnect(error)
+    }
+
+    fn relay(error: TransparentInterceptionError) -> Self {
+        Self::Relay(error)
+    }
+
+    fn counts_as_relay_failure(&self) -> bool {
+        match self {
+            Self::UpstreamConnect(_) => false,
+            Self::Relay(_) => true,
+        }
+    }
+}
+
+impl fmt::Display for RelayConnectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UpstreamConnect(error) | Self::Relay(error) => {
+                fmt::Display::fmt(error, formatter)
+            }
+        }
+    }
+}
+
+fn connect_upstream_for_relay(
+    target: SocketAddr,
+    peer: SocketAddr,
+    runtime: &TransparentProxyRuntime,
+) -> Result<TcpStream, TransparentInterceptionError> {
+    match TcpStream::connect_timeout(&target, CONNECT_TIMEOUT) {
+        Ok(upstream) => {
+            runtime.record_upstream_connect_success();
+            Ok(upstream)
+        }
+        Err(error) => {
+            runtime.record_upstream_connect_failure(upstream_connect_failure_reason(&error));
+            Err(proxy_io_error(format!(
+                "connect transparent upstream target {target} for peer {peer}"
+            ))(error))
+        }
+    }
+}
+
+fn upstream_connect_failure_reason(error: &io::Error) -> String {
+    match error.kind() {
+        io::ErrorKind::ConnectionRefused => "connection refused".to_string(),
+        io::ErrorKind::TimedOut => "timed out".to_string(),
+        io::ErrorKind::NetworkUnreachable => "network unreachable".to_string(),
+        io::ErrorKind::HostUnreachable => "host unreachable".to_string(),
+        io::ErrorKind::AddrNotAvailable => "address not available".to_string(),
+        kind => format!("{kind:?}").to_ascii_lowercase(),
+    }
 }
 
 fn tproxy_target(socket: &Socket) -> Result<SocketAddr, TransparentInterceptionError> {
@@ -150,7 +222,12 @@ fn is_expected_relay_close(error: &io::Error) -> bool {
 mod tests {
     use std::{
         io::{Read, Write},
-        net::{Ipv4Addr, TcpListener},
+        net::{Ipv4Addr, SocketAddr, TcpListener},
+    };
+
+    use probe_config::{
+        EnforcementInterceptionConfig, TransparentInterceptionProxyConfig,
+        TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
     };
 
     use super::*;
@@ -249,6 +326,99 @@ mod tests {
             io::ErrorKind::NotConnected,
         ] {
             assert!(is_expected_relay_close(&io::Error::from(kind)));
+        }
+    }
+
+    #[test]
+    fn upstream_connect_success_records_connect_metrics() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let runtime = TransparentProxyRuntime::for_config(&managed_interception_config());
+        let handle = runtime.handle();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 42000));
+
+        let upstream = connect_upstream_for_relay(listener.local_addr()?, peer, &runtime)?;
+        let (_accepted, _) = listener.accept()?;
+        drop(upstream);
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.upstream_connects.connect_successes, 1);
+        assert_eq!(snapshot.upstream_connects.connect_failures, 0);
+        assert_eq!(snapshot.upstream_connects.last_failure_reason, None);
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_connect_failure_records_connect_metrics() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let runtime = TransparentProxyRuntime::for_config(&managed_interception_config());
+        let handle = runtime.handle();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let target = listener.local_addr()?;
+        drop(listener);
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 42000));
+
+        let error = connect_upstream_for_relay(target, peer, &runtime)
+            .expect_err("closed listener should refuse upstream connect");
+
+        assert!(error.to_string().contains("connect transparent upstream"));
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.upstream_connects.connect_successes, 0);
+        assert_eq!(snapshot.upstream_connects.connect_failures, 1);
+        assert_eq!(
+            snapshot.upstream_connects.last_failure_reason.as_deref(),
+            Some("connection refused")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_connect_failure_is_not_a_relay_failure() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = TransparentProxyRuntime::for_config(&managed_interception_config());
+        let handle = runtime.handle();
+        let registry = RelayRegistry::new(runtime.clone());
+        let slot = registry
+            .try_acquire_slot()
+            .expect("relay slot should be available");
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let (downstream, peer) = listener.accept()?;
+        drop(listener);
+
+        let relay = spawn_relay(
+            Socket::from(downstream),
+            SockAddr::from(peer),
+            0,
+            shutdown_requested,
+            registry,
+            slot,
+            runtime,
+        );
+
+        relay.join().expect("relay thread should not panic");
+        drop(client);
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.active_relays, 0);
+        assert_eq!(snapshot.relay_failures, 0);
+        assert_eq!(snapshot.upstream_connects.connect_successes, 0);
+        assert_eq!(snapshot.upstream_connects.connect_failures, 1);
+        assert_eq!(
+            snapshot.upstream_connects.last_failure_reason.as_deref(),
+            Some("connection refused")
+        );
+        Ok(())
+    }
+
+    fn managed_interception_config() -> EnforcementInterceptionConfig {
+        EnforcementInterceptionConfig {
+            strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
+            proxy: TransparentInterceptionProxyConfig {
+                mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+                listen_port: Some(15001),
+            },
+            ..EnforcementInterceptionConfig::default()
         }
     }
 }

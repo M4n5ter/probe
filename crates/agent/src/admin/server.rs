@@ -442,6 +442,10 @@ mod tests {
             response["metrics"]["transparent_proxy"]["active_relays"],
             json!(0)
         );
+        assert_eq!(
+            response["metrics"]["transparent_proxy"]["upstream_connects"]["connect_successes"],
+            json!(0)
+        );
 
         let response = send_admin_request(&socket_path, json!({ "command": "status" })).await?;
 
@@ -463,6 +467,11 @@ mod tests {
             .expect("prometheus metrics should be returned as text");
         assert!(metrics.contains("sssa_pipeline_metrics_available 1\n"));
         assert!(metrics.contains("sssa_transparent_proxy_metrics_available 1\n"));
+        assert!(
+            metrics.contains(
+                "sssa_transparent_proxy_upstream_connects_total{outcome=\"success\"} 0\n"
+            )
+        );
         assert!(metrics.contains("sssa_pipeline_capture_events_read_total 1\n"));
         assert!(metrics.contains("sssa_pipeline_export_events_written_total 1\n"));
         assert!(metrics.contains("sssa_export_sink_lag{sink=\"primary\"} 1\n"));

@@ -12,6 +12,7 @@ use crate::transparent_interception::TransparentInterceptionIpFamily;
 pub(crate) struct TransparentProxyRuntimeSnapshot {
     pub mode: TransparentProxyRuntimeMode,
     pub listener_families: Vec<TransparentInterceptionIpFamily>,
+    pub upstream_connects: TransparentProxyConnectMetricsSnapshot,
     pub active_relays: u64,
     pub accepted_relays: u64,
     pub rejected_relays: u64,
@@ -29,6 +30,13 @@ pub(crate) enum TransparentProxyRuntimeMode {
     Degraded,
     Failed,
     Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TransparentProxyConnectMetricsSnapshot {
+    pub connect_successes: u64,
+    pub connect_failures: u64,
+    pub last_failure_reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -59,6 +67,11 @@ impl TransparentProxyRuntime {
                 inner: Arc::new(Mutex::new(TransparentProxyRuntimeSnapshot {
                     mode,
                     listener_families: Vec::new(),
+                    upstream_connects: TransparentProxyConnectMetricsSnapshot {
+                        connect_successes: 0,
+                        connect_failures: 0,
+                        last_failure_reason: None,
+                    },
                     active_relays: 0,
                     accepted_relays: 0,
                     rejected_relays: 0,
@@ -105,6 +118,19 @@ impl TransparentProxyRuntime {
         state.relay_failures = state.relay_failures.saturating_add(1);
     }
 
+    pub(super) fn record_upstream_connect_success(&self) {
+        let mut state = self.handle.lock();
+        state.upstream_connects.connect_successes =
+            state.upstream_connects.connect_successes.saturating_add(1);
+    }
+
+    pub(super) fn record_upstream_connect_failure(&self, reason: impl Into<String>) {
+        let mut state = self.handle.lock();
+        state.upstream_connects.connect_failures =
+            state.upstream_connects.connect_failures.saturating_add(1);
+        state.upstream_connects.last_failure_reason = Some(reason.into());
+    }
+
     pub(super) fn record_listener_failure(&self, family: TransparentInterceptionIpFamily) {
         let mut state = self.handle.lock();
         state.listener_failures = state.listener_failures.saturating_add(1);
@@ -144,6 +170,54 @@ impl TransparentProxyRuntimeHandle {
         self.inner
             .lock()
             .expect("transparent proxy runtime state should not be poisoned")
+    }
+}
+
+#[cfg(test)]
+impl TransparentProxyRuntimeSnapshot {
+    pub(crate) fn for_test(mode: TransparentProxyRuntimeMode) -> Self {
+        Self {
+            mode,
+            listener_families: Vec::new(),
+            upstream_connects: TransparentProxyConnectMetricsSnapshot {
+                connect_successes: 0,
+                connect_failures: 0,
+                last_failure_reason: None,
+            },
+            active_relays: 0,
+            accepted_relays: 0,
+            rejected_relays: 0,
+            relay_failures: 0,
+            listener_failures: 0,
+        }
+    }
+
+    pub(crate) fn with_relay_counts(
+        mut self,
+        active_relays: u64,
+        accepted_relays: u64,
+        rejected_relays: u64,
+        relay_failures: u64,
+        listener_failures: u64,
+    ) -> Self {
+        self.active_relays = active_relays;
+        self.accepted_relays = accepted_relays;
+        self.rejected_relays = rejected_relays;
+        self.relay_failures = relay_failures;
+        self.listener_failures = listener_failures;
+        self
+    }
+
+    pub(crate) fn with_upstream_connects(
+        mut self,
+        connect_successes: u64,
+        connect_failures: u64,
+        last_failure_reason: Option<&str>,
+    ) -> Self {
+        self.upstream_connects.connect_successes = connect_successes;
+        self.upstream_connects.connect_failures = connect_failures;
+        self.upstream_connects.last_failure_reason = last_failure_reason.map(ToString::to_string);
+        self
     }
 }
 
@@ -218,6 +292,8 @@ mod tests {
         assert_eq!(snapshot.rejected_relays, 1);
         assert_eq!(snapshot.relay_failures, 1);
         assert_eq!(snapshot.listener_failures, 1);
+        assert_eq!(snapshot.upstream_connects.connect_successes, 0);
+        assert_eq!(snapshot.upstream_connects.connect_failures, 0);
 
         state.record_listener_failure(TransparentInterceptionIpFamily::Ipv4);
         let snapshot = handle.snapshot();
@@ -238,6 +314,42 @@ mod tests {
         assert_eq!(snapshot.rejected_relays, 1);
         assert_eq!(snapshot.relay_failures, 1);
         assert_eq!(snapshot.listener_failures, 2);
+    }
+
+    #[test]
+    fn upstream_connect_metrics_follow_connect_results() {
+        let state = TransparentProxyRuntime::for_config(&interception_config(
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+            TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+        ));
+        let handle = state.handle();
+
+        state.record_upstream_connect_success();
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.upstream_connects.connect_successes, 1);
+        assert_eq!(snapshot.upstream_connects.connect_failures, 0);
+        assert_eq!(snapshot.upstream_connects.last_failure_reason, None);
+
+        state.record_upstream_connect_failure("connection refused");
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.upstream_connects.connect_successes, 1);
+        assert_eq!(snapshot.upstream_connects.connect_failures, 1);
+        assert_eq!(
+            snapshot.upstream_connects.last_failure_reason.as_deref(),
+            Some("connection refused")
+        );
+
+        state.record_upstream_connect_success();
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.upstream_connects.connect_successes, 2);
+        assert_eq!(snapshot.upstream_connects.connect_failures, 1);
+        assert_eq!(
+            snapshot.upstream_connects.last_failure_reason.as_deref(),
+            Some("connection refused")
+        );
     }
 
     #[test]
