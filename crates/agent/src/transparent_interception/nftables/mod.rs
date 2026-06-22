@@ -51,5 +51,5 @@ pub(super) fn validate_effective_setup_scope(
 ) -> Result<(), super::TransparentInterceptionError> {
     InboundTproxyLifecyclePlan::from_inbound_plan_and_scope(inbound_plan, setup_scope.clone())
         .map(|_| ())
-        .map_err(|error| super::TransparentInterceptionError::Nftables(error.to_string()))
+        .map_err(|error| super::TransparentInterceptionError::Setup(error.to_string()))
 }

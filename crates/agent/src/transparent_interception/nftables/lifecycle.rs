@@ -16,6 +16,8 @@ use ::runtime::TransparentInterceptionExecutionPlan;
 use ::runtime::TransparentInterceptionInboundTproxyPlan;
 use interception::TransparentInterceptionHostRuleScope;
 #[cfg(test)]
+use interception::TransparentInterceptionSetupPlan;
+#[cfg(test)]
 use probe_config::EnforcementInterceptionConfig;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -100,7 +102,7 @@ impl NftablesTransparentInterception {
             &self.inbound_plan,
             setup_scope,
         )
-        .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
+        .map_err(|error| TransparentInterceptionError::Setup(error.to_string()))?;
         let proxy_plan = prepare_proxy_lifecycle(
             &self.inbound_plan,
             plan.listener_families(),
@@ -625,8 +627,12 @@ mod tests {
     }
 
     fn setup_scope(selector: &Selector) -> TransparentInterceptionHostRuleScope {
-        TransparentInterceptionHostRuleScope::from_inbound_tproxy_selector(Some(selector))
-            .expect("test selector should project to host rules")
+        match TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(selector))
+            .expect("test selector should project")
+        {
+            TransparentInterceptionSetupPlan::HostRules(scope) => scope,
+            _ => panic!("test selector should project to host rules"),
+        }
     }
 
     fn string_args<const N: usize>(args: [&str; N]) -> Vec<String> {

@@ -1,22 +1,116 @@
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 use interception::{
-    TransparentInterceptionHostRuleScope, TransparentInterceptionSetupProjectionError,
-    TransparentInterceptionSetupSelectorSources, TransparentInterceptionSetupSelectors,
+    TransparentInterceptionClassifierSelector, TransparentInterceptionClassifierTerm,
+    TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
+    TransparentInterceptionHostRuleScope, TransparentInterceptionProcessScope,
+    TransparentInterceptionProcessScopeExpression, TransparentInterceptionSetupPlan,
+    TransparentInterceptionSetupProjectionError, TransparentInterceptionSetupSelectorSources,
+    TransparentInterceptionSetupSelectors,
 };
 use probe_config::TransparentInterceptionStrategyConfig;
-use probe_core::Selector;
+use probe_core::{ProcessSelector, Selector, TrafficSelector};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
-pub enum TransparentInterceptionLocalSetupScopePlan {
+pub enum TransparentInterceptionLocalSetupProjectionPlan {
     NotConfigured,
-    HostRules,
-    RequiresProcessClassifier { reason: String },
-    RequiresFlowClassifier { reason: String },
-    Unsupported { reason: String },
+    HostRules {
+        scope: TransparentInterceptionProjectedHostRuleScopePlan,
+    },
+    RequiresProcessClassifier {
+        reason: String,
+        host_rule_boundary: TransparentInterceptionProjectedHostRuleBoundaryPlan,
+        process_scope: Box<TransparentInterceptionProcessScopePlan>,
+    },
+    RequiresFlowClassifier {
+        reason: String,
+        host_rule_boundary: TransparentInterceptionProjectedHostRuleBoundaryPlan,
+        flow_scope: Box<TransparentInterceptionFlowClassifierScopePlan>,
+    },
+    Unsupported {
+        reason: String,
+    },
 }
 
-impl TransparentInterceptionLocalSetupScopePlan {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TransparentInterceptionProjectedHostRuleBoundaryPlan {
+    NoHostRuleBoundary,
+    Scope {
+        scope: TransparentInterceptionProjectedHostRuleScopePlan,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionProjectedHostRuleScopePlan {
+    pub local_ports: TransparentInterceptionProjectedPortScopePlan,
+    pub remote_ports: TransparentInterceptionProjectedPortScopePlan,
+    pub remote_addresses: TransparentInterceptionProjectedRemoteAddressScopePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TransparentInterceptionProjectedPortScopePlan {
+    Any,
+    Only { ports: Vec<u16> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionProjectedRemoteAddressScopePlan {
+    pub ipv4: Vec<Ipv4Addr>,
+    pub ipv6: Vec<Ipv6Addr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionProcessScopePlan {
+    pub expression: TransparentInterceptionProcessScopeExpressionPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TransparentInterceptionProcessScopeExpressionPlan {
+    Match {
+        process: ProcessSelector,
+    },
+    All {
+        expressions: Vec<TransparentInterceptionProcessScopeExpressionPlan>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionFlowClassifierScopePlan {
+    pub selector: TransparentInterceptionClassifierSelectorPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "op")]
+pub enum TransparentInterceptionClassifierSelectorPlan {
+    Match {
+        term: Box<TransparentInterceptionClassifierTermPlan>,
+    },
+    All {
+        selectors: Vec<TransparentInterceptionClassifierSelectorPlan>,
+    },
+    Any {
+        selectors: Vec<TransparentInterceptionClassifierSelectorPlan>,
+    },
+    Not {
+        selector: Box<TransparentInterceptionClassifierSelectorPlan>,
+    },
+    Ref {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionClassifierTermPlan {
+    pub process: ProcessSelector,
+    pub traffic: TrafficSelector,
+}
+
+impl TransparentInterceptionLocalSetupProjectionPlan {
     pub(super) fn from_strategy_and_selectors(
         strategy: TransparentInterceptionStrategyConfig,
         enforcement_selector: Option<&Selector>,
@@ -44,30 +138,153 @@ impl TransparentInterceptionLocalSetupScopePlan {
                 interception_selector,
             },
         );
-        Self::from_projection_result(selectors.local_host_rule_scope())
+        Self::from_projection_result(selectors.local_setup_plan())
     }
 
     fn from_projection_result(
         result: Result<
-            TransparentInterceptionHostRuleScope,
+            TransparentInterceptionSetupPlan,
             TransparentInterceptionSetupProjectionError,
         >,
     ) -> Self {
         match result {
-            Ok(_) => Self::HostRules,
-            Err(TransparentInterceptionSetupProjectionError::RequiresProcessClassifier {
+            Ok(TransparentInterceptionSetupPlan::HostRules(scope)) => Self::HostRules {
+                scope: TransparentInterceptionProjectedHostRuleScopePlan::from_scope(&scope),
+            },
+            Ok(TransparentInterceptionSetupPlan::RequiresProcessClassifier {
+                host_rule_boundary,
+                process_scope,
                 reason,
-            }) => Self::RequiresProcessClassifier { reason },
-            Err(TransparentInterceptionSetupProjectionError::RequiresFlowClassifier { reason }) => {
-                Self::RequiresFlowClassifier { reason }
-            }
-            Err(
-                error @ (TransparentInterceptionSetupProjectionError::MissingSelector
-                | TransparentInterceptionSetupProjectionError::UnconstrainedSelector
-                | TransparentInterceptionSetupProjectionError::Unsupported { .. }),
-            ) => Self::Unsupported {
+            }) => Self::RequiresProcessClassifier {
+                reason,
+                host_rule_boundary:
+                    TransparentInterceptionProjectedHostRuleBoundaryPlan::from_boundary(
+                        &host_rule_boundary,
+                    ),
+                process_scope: Box::new(TransparentInterceptionProcessScopePlan::from_scope(
+                    &process_scope,
+                )),
+            },
+            Ok(TransparentInterceptionSetupPlan::RequiresFlowClassifier {
+                host_rule_boundary,
+                flow_scope,
+                reason,
+            }) => Self::RequiresFlowClassifier {
+                reason,
+                host_rule_boundary:
+                    TransparentInterceptionProjectedHostRuleBoundaryPlan::from_boundary(
+                        &host_rule_boundary,
+                    ),
+                flow_scope: Box::new(TransparentInterceptionFlowClassifierScopePlan::from_scope(
+                    &flow_scope,
+                )),
+            },
+            Err(error) => Self::Unsupported {
                 reason: error.to_string(),
             },
+        }
+    }
+}
+
+impl TransparentInterceptionProjectedHostRuleBoundaryPlan {
+    fn from_boundary(boundary: &TransparentInterceptionHostRuleBoundary) -> Self {
+        match boundary {
+            TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary => Self::NoHostRuleBoundary,
+            TransparentInterceptionHostRuleBoundary::Scope(scope) => Self::Scope {
+                scope: TransparentInterceptionProjectedHostRuleScopePlan::from_scope(scope),
+            },
+        }
+    }
+}
+
+impl TransparentInterceptionProjectedHostRuleScopePlan {
+    fn from_scope(scope: &TransparentInterceptionHostRuleScope) -> Self {
+        Self {
+            local_ports: TransparentInterceptionProjectedPortScopePlan::from_values(
+                scope.local_ports().only_values(),
+            ),
+            remote_ports: TransparentInterceptionProjectedPortScopePlan::from_values(
+                scope.remote_ports().only_values(),
+            ),
+            remote_addresses: TransparentInterceptionProjectedRemoteAddressScopePlan {
+                ipv4: scope.remote_addresses().ipv4().to_vec(),
+                ipv6: scope.remote_addresses().ipv6().to_vec(),
+            },
+        }
+    }
+}
+
+impl TransparentInterceptionProjectedPortScopePlan {
+    fn from_values(values: Option<&[u16]>) -> Self {
+        match values {
+            Some(ports) => Self::Only {
+                ports: ports.to_vec(),
+            },
+            None => Self::Any,
+        }
+    }
+}
+
+impl TransparentInterceptionProcessScopePlan {
+    fn from_scope(scope: &TransparentInterceptionProcessScope) -> Self {
+        Self {
+            expression: TransparentInterceptionProcessScopeExpressionPlan::from_expression(
+                scope.expression(),
+            ),
+        }
+    }
+}
+
+impl TransparentInterceptionProcessScopeExpressionPlan {
+    fn from_expression(expression: &TransparentInterceptionProcessScopeExpression) -> Self {
+        match expression {
+            TransparentInterceptionProcessScopeExpression::Match { process } => Self::Match {
+                process: process.clone(),
+            },
+            TransparentInterceptionProcessScopeExpression::All { expressions } => Self::All {
+                expressions: expressions.iter().map(Self::from_expression).collect(),
+            },
+        }
+    }
+}
+
+impl TransparentInterceptionFlowClassifierScopePlan {
+    fn from_scope(scope: &TransparentInterceptionFlowClassifierScope) -> Self {
+        Self {
+            selector: TransparentInterceptionClassifierSelectorPlan::from_selector(
+                scope.selector(),
+            ),
+        }
+    }
+}
+
+impl TransparentInterceptionClassifierSelectorPlan {
+    fn from_selector(selector: &TransparentInterceptionClassifierSelector) -> Self {
+        match selector {
+            TransparentInterceptionClassifierSelector::Match { term } => Self::Match {
+                term: Box::new(TransparentInterceptionClassifierTermPlan::from_term(term)),
+            },
+            TransparentInterceptionClassifierSelector::All { selectors } => Self::All {
+                selectors: selectors.iter().map(Self::from_selector).collect(),
+            },
+            TransparentInterceptionClassifierSelector::Any { selectors } => Self::Any {
+                selectors: selectors.iter().map(Self::from_selector).collect(),
+            },
+            TransparentInterceptionClassifierSelector::Not { selector } => Self::Not {
+                selector: Box::new(Self::from_selector(selector)),
+            },
+            TransparentInterceptionClassifierSelector::Ref { name } => {
+                Self::Ref { name: name.clone() }
+            }
+        }
+    }
+}
+
+impl TransparentInterceptionClassifierTermPlan {
+    fn from_term(term: &TransparentInterceptionClassifierTerm) -> Self {
+        Self {
+            process: term.process.clone(),
+            traffic: term.traffic.clone(),
         }
     }
 }
@@ -93,7 +310,7 @@ mod tests {
 
         assert_eq!(
             scope,
-            TransparentInterceptionLocalSetupScopePlan::NotConfigured
+            TransparentInterceptionLocalSetupProjectionPlan::NotConfigured
         );
     }
 
@@ -113,7 +330,7 @@ mod tests {
 
         assert!(matches!(
             scope,
-            TransparentInterceptionLocalSetupScopePlan::Unsupported { .. }
+            TransparentInterceptionLocalSetupProjectionPlan::Unsupported { .. }
         ));
     }
 
@@ -132,12 +349,22 @@ mod tests {
             ),
         );
 
-        assert_eq!(scope, TransparentInterceptionLocalSetupScopePlan::HostRules);
+        let TransparentInterceptionLocalSetupProjectionPlan::HostRules { scope } = scope else {
+            panic!("projectable selector should report host rules");
+        };
+        assert_eq!(
+            scope.local_ports,
+            TransparentInterceptionProjectedPortScopePlan::Only { ports: vec![8443] }
+        );
+        assert_eq!(
+            scope.remote_addresses.ipv4,
+            [Ipv4Addr::new(203, 0, 113, 10)]
+        );
     }
 
     #[test]
     fn inbound_without_local_selector_is_unsupported() {
-        let scope = TransparentInterceptionLocalSetupScopePlan::from_strategy_and_selectors(
+        let scope = TransparentInterceptionLocalSetupProjectionPlan::from_strategy_and_selectors(
             TransparentInterceptionStrategyConfig::InboundTproxy,
             None,
             None,
@@ -145,12 +372,12 @@ mod tests {
 
         assert!(matches!(
             scope,
-            TransparentInterceptionLocalSetupScopePlan::Unsupported { .. }
+            TransparentInterceptionLocalSetupProjectionPlan::Unsupported { .. }
         ));
     }
 
     #[test]
-    fn process_selector_reports_process_classifier_requirement() {
+    fn process_only_selector_reports_typed_classifier_requirement_without_host_scope() {
         let scope = scope_for(
             TransparentInterceptionStrategyConfig::InboundTproxy,
             Selector::term(
@@ -159,17 +386,68 @@ mod tests {
                     ..ProcessSelector::default()
                 },
                 TrafficSelector {
-                    remote_ports: vec![443],
                     directions: vec![Direction::Inbound],
                     ..TrafficSelector::default()
                 },
             ),
         );
 
-        assert!(matches!(
-            scope,
-            TransparentInterceptionLocalSetupScopePlan::RequiresProcessClassifier { .. }
-        ));
+        let TransparentInterceptionLocalSetupProjectionPlan::RequiresProcessClassifier {
+            host_rule_boundary,
+            process_scope,
+            ..
+        } = scope
+        else {
+            panic!("process-only selector should require process classifier");
+        };
+        assert_eq!(
+            host_rule_boundary,
+            TransparentInterceptionProjectedHostRuleBoundaryPlan::NoHostRuleBoundary
+        );
+        assert_eq!(process_scope_names(&process_scope), ["curl"]);
+    }
+
+    #[test]
+    fn process_scoped_traffic_reports_typed_host_scope() {
+        let scope = scope_for(
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["curl".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector {
+                    local_ports: vec![8443],
+                    directions: vec![Direction::Inbound],
+                    remote_addresses: vec!["203.0.113.10".to_string()],
+                    ..TrafficSelector::default()
+                },
+            ),
+        );
+
+        let TransparentInterceptionLocalSetupProjectionPlan::RequiresProcessClassifier {
+            host_rule_boundary,
+            process_scope,
+            ..
+        } = scope
+        else {
+            panic!("process-scoped traffic should require process classifier");
+        };
+        let TransparentInterceptionProjectedHostRuleBoundaryPlan::Scope {
+            scope: host_rule_scope,
+        } = host_rule_boundary
+        else {
+            panic!("traffic selector should keep a projected host-rule boundary");
+        };
+        assert_eq!(
+            host_rule_scope.local_ports,
+            TransparentInterceptionProjectedPortScopePlan::Only { ports: vec![8443] }
+        );
+        assert_eq!(
+            host_rule_scope.remote_addresses.ipv4,
+            [Ipv4Addr::new(203, 0, 113, 10)]
+        );
+        assert_eq!(process_scope_names(&process_scope), ["curl"]);
     }
 
     #[test]
@@ -196,10 +474,68 @@ mod tests {
             },
         );
 
+        let TransparentInterceptionLocalSetupProjectionPlan::RequiresFlowClassifier {
+            flow_scope,
+            host_rule_boundary,
+            ..
+        } = scope
+        else {
+            panic!("any selector should require flow classifier");
+        };
         assert!(matches!(
-            scope,
-            TransparentInterceptionLocalSetupScopePlan::RequiresFlowClassifier { .. }
+            flow_scope.selector,
+            TransparentInterceptionClassifierSelectorPlan::Any { .. }
         ));
+        assert_eq!(
+            host_rule_boundary,
+            TransparentInterceptionProjectedHostRuleBoundaryPlan::NoHostRuleBoundary
+        );
+    }
+
+    #[test]
+    fn flow_classifier_requirement_reports_typed_host_scope() {
+        let scope = scope_for(
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+            Selector::All {
+                selectors: vec![
+                    Selector::term(
+                        ProcessSelector::default(),
+                        TrafficSelector {
+                            local_ports: vec![8443],
+                            directions: vec![Direction::Inbound],
+                            ..TrafficSelector::default()
+                        },
+                    ),
+                    Selector::Any {
+                        selectors: vec![Selector::term(
+                            ProcessSelector::default(),
+                            TrafficSelector {
+                                remote_ports: vec![443],
+                                ..TrafficSelector::default()
+                            },
+                        )],
+                    },
+                ],
+            },
+        );
+
+        let TransparentInterceptionLocalSetupProjectionPlan::RequiresFlowClassifier {
+            host_rule_boundary,
+            ..
+        } = scope
+        else {
+            panic!("flow-aware selector should require flow classifier");
+        };
+        let TransparentInterceptionProjectedHostRuleBoundaryPlan::Scope {
+            scope: host_rule_scope,
+        } = host_rule_boundary
+        else {
+            panic!("traffic selector should keep a projected host-rule boundary");
+        };
+        assert_eq!(
+            host_rule_scope.local_ports,
+            TransparentInterceptionProjectedPortScopePlan::Only { ports: vec![8443] }
+        );
     }
 
     #[test]
@@ -218,7 +554,7 @@ mod tests {
 
         assert!(matches!(
             scope,
-            TransparentInterceptionLocalSetupScopePlan::Unsupported { .. }
+            TransparentInterceptionLocalSetupProjectionPlan::Unsupported { .. }
         ));
     }
 
@@ -248,7 +584,7 @@ mod tests {
 
         assert!(matches!(
             scope,
-            TransparentInterceptionLocalSetupScopePlan::Unsupported { .. }
+            TransparentInterceptionLocalSetupProjectionPlan::Unsupported { .. }
         ));
     }
 
@@ -267,18 +603,27 @@ mod tests {
 
         assert!(matches!(
             scope,
-            TransparentInterceptionLocalSetupScopePlan::Unsupported { .. }
+            TransparentInterceptionLocalSetupProjectionPlan::Unsupported { .. }
         ));
     }
 
     fn scope_for(
         strategy: TransparentInterceptionStrategyConfig,
         selector: Selector,
-    ) -> TransparentInterceptionLocalSetupScopePlan {
-        TransparentInterceptionLocalSetupScopePlan::from_strategy_and_selectors(
+    ) -> TransparentInterceptionLocalSetupProjectionPlan {
+        TransparentInterceptionLocalSetupProjectionPlan::from_strategy_and_selectors(
             strategy,
             Some(&selector),
             None,
         )
+    }
+
+    fn process_scope_names(scope: &TransparentInterceptionProcessScopePlan) -> Vec<&str> {
+        let TransparentInterceptionProcessScopeExpressionPlan::Match { process } =
+            &scope.expression
+        else {
+            panic!("test process scope should be a match expression");
+        };
+        process.names.iter().map(String::as_str).collect()
     }
 }

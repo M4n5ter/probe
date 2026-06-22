@@ -26,7 +26,16 @@ pub use export::{
     ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
     ExportWorkerPlan, FileExportSinkPlan, WebhookExportSinkPlan,
 };
-pub use interception_scope::TransparentInterceptionLocalSetupScopePlan;
+pub use interception_scope::{
+    TransparentInterceptionClassifierSelectorPlan, TransparentInterceptionClassifierTermPlan,
+    TransparentInterceptionFlowClassifierScopePlan,
+    TransparentInterceptionLocalSetupProjectionPlan,
+    TransparentInterceptionProcessScopeExpressionPlan, TransparentInterceptionProcessScopePlan,
+    TransparentInterceptionProjectedHostRuleBoundaryPlan,
+    TransparentInterceptionProjectedHostRuleScopePlan,
+    TransparentInterceptionProjectedPortScopePlan,
+    TransparentInterceptionProjectedRemoteAddressScopePlan,
+};
 pub use registry::{PlatformProbeResults, ProviderRegistry};
 pub use runtime_plan::{RuntimePlan, validate_static_runtime_config};
 pub use storage::{ExportRetentionPlan, IngressRetentionPlan, StoragePlan, StorageRetentionPlan};

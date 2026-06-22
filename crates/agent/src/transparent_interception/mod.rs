@@ -5,7 +5,10 @@ mod proxy;
 mod runtime;
 
 use ::runtime::TransparentInterceptionExecutionPlan;
-use interception::{TransparentInterceptionHostRuleScope, TransparentInterceptionSetupSelectors};
+use interception::{
+    TransparentInterceptionHostRuleScope, TransparentInterceptionSetupPlan,
+    TransparentInterceptionSetupProjectionError, TransparentInterceptionSetupSelectors,
+};
 use probe_config::TransparentInterceptionStrategyConfig;
 
 pub(crate) use error::TransparentInterceptionError;
@@ -55,23 +58,34 @@ pub(crate) fn effective_setup_scope(
         return Ok(None);
     }
     let TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) = execution_plan else {
-        return Err(TransparentInterceptionError::Nftables(
+        return Err(TransparentInterceptionError::Setup(
             OUTBOUND_MITM_UNAVAILABLE.to_string(),
         ));
     };
     if selectors.local_config_scope().is_none() {
-        return Err(TransparentInterceptionError::Nftables(
+        return Err(TransparentInterceptionError::Setup(
             MISSING_LOCAL_SETUP_SELECTOR.to_string(),
         ));
     }
-    selectors
-        .local_host_rule_scope()
-        .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
-    let scope = selectors
-        .final_host_rule_scope()
-        .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
+    executable_host_rule_scope(selectors.local_setup_plan())?;
+    let scope = executable_host_rule_scope(selectors.final_setup_plan())?;
     nftables::validate_effective_setup_scope(inbound_plan, &scope)?;
     Ok(Some(scope))
+}
+
+fn executable_host_rule_scope(
+    plan: Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError>,
+) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionError> {
+    match plan {
+        Ok(TransparentInterceptionSetupPlan::HostRules(scope)) => Ok(scope),
+        Ok(TransparentInterceptionSetupPlan::RequiresProcessClassifier { reason, .. }) => {
+            Err(TransparentInterceptionError::Setup(reason))
+        }
+        Ok(TransparentInterceptionSetupPlan::RequiresFlowClassifier { reason, .. }) => {
+            Err(TransparentInterceptionError::Setup(reason))
+        }
+        Err(error) => Err(TransparentInterceptionError::Setup(error.to_string())),
+    }
 }
 
 #[cfg(test)]

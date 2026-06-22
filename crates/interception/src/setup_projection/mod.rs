@@ -1,11 +1,15 @@
-mod setup_projection;
+mod analysis;
+mod model;
+mod selectors;
 
-pub use setup_projection::{
+pub use model::{
     TransparentInterceptionClassifierSelector, TransparentInterceptionClassifierTerm,
     TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
     TransparentInterceptionHostRuleScope, TransparentInterceptionPortScope,
     TransparentInterceptionProcessScope, TransparentInterceptionProcessScopeExpression,
     TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupPlan,
-    TransparentInterceptionSetupProjectionError, TransparentInterceptionSetupSelectorSources,
-    TransparentInterceptionSetupSelectors,
+    TransparentInterceptionSetupProjectionError,
+};
+pub use selectors::{
+    TransparentInterceptionSetupSelectorSources, TransparentInterceptionSetupSelectors,
 };

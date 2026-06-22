@@ -8,7 +8,7 @@ use crate::transparent_interception::TransparentProxyRuntimeSnapshot;
 use probe_config::{ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig};
 use probe_core::{CapabilityKind, EnforcementMode, ProtectiveActionProfile, RuntimeMode};
 use runtime::{
-    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionLocalSetupScopePlan,
+    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionLocalSetupProjectionPlan,
     TransparentInterceptionNftablesPlan, TransparentInterceptionProxyPlan,
 };
 use serde::Serialize;
@@ -37,7 +37,7 @@ pub struct EnforcementInterceptionStatusSnapshot {
     pub strategy: TransparentInterceptionStrategyConfig,
     pub proxy: TransparentInterceptionProxyPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
-    pub local_setup_scope: TransparentInterceptionLocalSetupScopePlan,
+    pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
     pub selector_configured: bool,
     pub capability: EnforcementCapabilityStatusSnapshot,
     pub runtime_proxy: Option<TransparentProxyRuntimeSnapshot>,
@@ -155,7 +155,7 @@ fn enforcement_status_with_source(
             strategy: plan.enforcement.interception.strategy,
             proxy: plan.enforcement.interception.proxy.clone(),
             nftables: plan.enforcement.interception.nftables.clone(),
-            local_setup_scope: plan.enforcement.interception.local_setup_scope.clone(),
+            local_setup_projection: plan.enforcement.interception.local_setup_projection.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,
             capability: enforcement_capability_status(&plan.enforcement.interception.capability),
             runtime_proxy: transparent_proxy,
@@ -671,8 +671,8 @@ protective_actions = ["alert"]
         assert_eq!(status.interception.nftables.route_table, 53_534);
         assert!(status.interception.selector_configured);
         assert!(matches!(
-            status.interception.local_setup_scope,
-            runtime::TransparentInterceptionLocalSetupScopePlan::HostRules
+            status.interception.local_setup_projection,
+            runtime::TransparentInterceptionLocalSetupProjectionPlan::HostRules { .. }
         ));
         assert_eq!(
             status.interception.capability,
@@ -710,12 +710,72 @@ protective_actions = ["alert"]
             json!("sssa_probe")
         );
         assert_eq!(
-            value["interception"]["local_setup_scope"]["kind"],
+            value["interception"]["local_setup_projection"]["kind"],
             json!("host_rules")
         );
         assert_eq!(
             value["interception"]["capability"]["capability"],
             json!("transparent_interception")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_status_reports_process_classifier_setup_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        config.capture.selection = probe_config::CaptureSelection::Libpcap;
+        config.enforcement.mode = probe_core::EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            probe_config::TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector {
+                names: vec!["curl".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let plan = runtime_plan_from_config(
+            config,
+            vec![probe_core::CapabilityState::available(
+                CapabilityKind::TransparentInterception,
+            )],
+        )?;
+
+        let status = enforcement_status(&plan);
+
+        let value = serde_json::to_value(&status)?;
+        assert_eq!(
+            value["interception"]["local_setup_projection"]["kind"],
+            json!("requires_process_classifier")
+        );
+        assert_eq!(
+            value["interception"]["local_setup_projection"]["process_scope"]["expression"]["kind"],
+            json!("match")
+        );
+        assert_eq!(
+            value["interception"]["local_setup_projection"]["process_scope"]["expression"]["process"]
+                ["names"],
+            json!(["curl"])
+        );
+        assert_eq!(
+            value["interception"]["local_setup_projection"]["host_rule_boundary"]["kind"],
+            json!("scope")
+        );
+        assert_eq!(
+            value["interception"]["local_setup_projection"]["host_rule_boundary"]["scope"]["local_ports"]
+                ["kind"],
+            json!("only")
+        );
+        assert_eq!(
+            value["interception"]["local_setup_projection"]["host_rule_boundary"]["scope"]["local_ports"]
+                ["ports"],
+            json!([8443])
         );
         Ok(())
     }

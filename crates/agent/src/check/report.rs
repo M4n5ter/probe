@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::{
     configured_enforcement::{
         ConfiguredEnforcementError, LoadedEnforcementPolicySource,
-        LoadedEnforcementPolicySourceOriginRef, build_configured_enforcement_with_backend,
+        LoadedEnforcementPolicySourceOriginRef, build_configured_enforcement_check_with_backend,
     },
     configured_policy::{
         ConfiguredPolicyError, LoadedConfiguredPolicy, configured_policy_selection,
@@ -17,7 +17,7 @@ use probe_config::{
 };
 use probe_core::EnforcementMode;
 use runtime::{
-    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionLocalSetupScopePlan,
+    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionLocalSetupProjectionPlan,
     TransparentInterceptionNftablesPlan, TransparentInterceptionProxyPlan,
 };
 use serde::Serialize;
@@ -72,12 +72,20 @@ pub struct LoadedPolicySnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnforcementCheckSnapshot {
     pub mode: EnforcementMode,
+    pub composition: EnforcementCompositionCheckSnapshot,
     pub connection: EnforcementConnectionCheckSnapshot,
     pub interception: EnforcementInterceptionCheckSnapshot,
     pub effective_selector_configured: bool,
     pub config_selector_configured: bool,
     pub manifest_selector_configured: Option<bool>,
     pub policy: EnforcementPolicyCheckSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum EnforcementCompositionCheckSnapshot {
+    Ready,
+    Blocked { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -91,7 +99,7 @@ pub struct EnforcementInterceptionCheckSnapshot {
     pub strategy: TransparentInterceptionStrategyConfig,
     pub proxy: TransparentInterceptionProxyPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
-    pub local_setup_scope: TransparentInterceptionLocalSetupScopePlan,
+    pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
     pub selector_configured: bool,
     pub capability: EnforcementCapabilityPlan,
 }
@@ -165,7 +173,16 @@ async fn check_enforcement(
     plan: &RuntimePlan,
     backend: Option<Box<dyn EnforcementBackend>>,
 ) -> Result<EnforcementCheckSnapshot, CheckError> {
-    let enforcement = build_configured_enforcement_with_backend(plan, backend).await?;
+    let check = build_configured_enforcement_check_with_backend(plan, backend).await?;
+    let composition =
+        check
+            .setup_error
+            .map_or(EnforcementCompositionCheckSnapshot::Ready, |error| {
+                EnforcementCompositionCheckSnapshot::Blocked {
+                    reason: error.to_string(),
+                }
+            });
+    let enforcement = check.configured;
     let active_policy = &enforcement.active_policy;
     let policy = active_policy.policy_source().map_or(
         EnforcementPolicyCheckSnapshot {
@@ -185,6 +202,7 @@ async fn check_enforcement(
     );
     Ok(EnforcementCheckSnapshot {
         mode: enforcement.mode,
+        composition,
         connection: EnforcementConnectionCheckSnapshot {
             backend: plan.enforcement.connection.backend,
             capability: plan.enforcement.connection.capability.clone(),
@@ -193,7 +211,7 @@ async fn check_enforcement(
             strategy: plan.enforcement.interception.strategy,
             proxy: plan.enforcement.interception.proxy.clone(),
             nftables: plan.enforcement.interception.nftables.clone(),
-            local_setup_scope: plan.enforcement.interception.local_setup_scope.clone(),
+            local_setup_projection: plan.enforcement.interception.local_setup_projection.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,
             capability: plan.enforcement.interception.capability.clone(),
         },
@@ -239,8 +257,13 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
-    use probe_core::{Action, CapabilityKind, CapabilityState, ProtectiveActionProfile, Selector};
+    use probe_config::{
+        AgentConfig, CaptureBackend, CaptureSelection, TransparentInterceptionStrategyConfig,
+    };
+    use probe_core::{
+        Action, CapabilityKind, CapabilityState, Direction, ProcessSelector,
+        ProtectiveActionProfile, Selector, TrafficSelector,
+    };
     use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
     use serde_json::json;
 
@@ -550,6 +573,7 @@ protective_actions = ["alert"]
                 .is_some_and(|hooks| hooks.iter().any(|hook| hook == "on_http_request_headers"))
         );
         assert_eq!(value["enforcement"]["mode"], json!("audit_only"));
+        assert_eq!(value["enforcement"]["composition"]["kind"], json!("ready"));
         assert_eq!(value["enforcement"]["connection"]["backend"], json!("none"));
         assert_eq!(
             value["enforcement"]["connection"]["capability"]["kind"],
@@ -576,7 +600,7 @@ protective_actions = ["alert"]
             json!("sssa_probe")
         );
         assert_eq!(
-            value["enforcement"]["interception"]["local_setup_scope"]["kind"],
+            value["enforcement"]["interception"]["local_setup_projection"]["kind"],
             json!("not_configured")
         );
         assert_eq!(
@@ -601,6 +625,61 @@ protective_actions = ["alert"]
         );
         assert!(value["enforcement"].get("planner_loaded").is_none());
         fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_exposes_process_classifier_setup_block()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector {
+                names: vec!["curl".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let plan = RuntimePlan::build(
+            config,
+            &runtime_registry(vec![CapabilityState::available(
+                CapabilityKind::TransparentInterception,
+            )]),
+        )?;
+
+        let report = build_check_report(plan, None).await?;
+        let value = serde_json::to_value(report)?;
+
+        assert_eq!(
+            value["enforcement"]["composition"]["kind"],
+            json!("blocked")
+        );
+        assert!(
+            value["enforcement"]["composition"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("process classifier"))
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["local_setup_projection"]["kind"],
+            json!("requires_process_classifier")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["local_setup_projection"]["host_rule_boundary"]["kind"],
+            json!("scope")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["local_setup_projection"]["process_scope"]["expression"]
+                ["process"]["names"],
+            json!(["curl"])
+        );
         Ok(())
     }
 

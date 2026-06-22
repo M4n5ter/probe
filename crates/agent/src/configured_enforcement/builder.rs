@@ -85,10 +85,26 @@ pub struct ConfiguredEnforcement {
     pub transparent_interception_setup_scope: Option<TransparentInterceptionHostRuleScope>,
 }
 
+pub struct ConfiguredEnforcementCheck {
+    pub configured: ConfiguredEnforcement,
+    pub setup_error: Option<TransparentInterceptionError>,
+}
+
 pub async fn build_configured_enforcement_with_backend(
     plan: &RuntimePlan,
     backend: Option<Box<dyn EnforcementBackend>>,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
+    let check = build_configured_enforcement_check_with_backend(plan, backend).await?;
+    if let Some(error) = check.setup_error {
+        return Err(error.into());
+    }
+    Ok(check.configured)
+}
+
+pub async fn build_configured_enforcement_check_with_backend(
+    plan: &RuntimePlan,
+    backend: Option<Box<dyn EnforcementBackend>>,
+) -> Result<ConfiguredEnforcementCheck, ConfiguredEnforcementError> {
     let mut configured = build_configured_enforcement_from_parts(
         plan.enforcement.mode,
         plan.config.enforcement.selector.clone(),
@@ -109,9 +125,19 @@ pub async fn build_configured_enforcement_with_backend(
         crate::transparent_interception::effective_setup_scope(
             &plan.enforcement.interception.execution,
             setup_selectors,
-        )?;
-    configured.transparent_interception_setup_scope = transparent_interception_setup_scope;
-    Ok(configured)
+        );
+    let setup_error = match transparent_interception_setup_scope {
+        Ok(scope) => {
+            configured.transparent_interception_setup_scope = scope;
+            None
+        }
+        Err(error @ TransparentInterceptionError::Setup(_)) => Some(error),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(ConfiguredEnforcementCheck {
+        configured,
+        setup_error,
+    })
 }
 
 async fn build_configured_enforcement_from_parts(
@@ -233,7 +259,7 @@ mod tests {
     };
     use runtime::{
         CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry,
-        TransparentInterceptionLocalSetupScopePlan,
+        TransparentInterceptionLocalSetupProjectionPlan,
     };
 
     use super::*;
@@ -352,8 +378,8 @@ mod tests {
 
         let plan = RuntimePlan::build(config, &transparent_interception_registry())?;
         assert!(matches!(
-            plan.enforcement.interception.local_setup_scope,
-            TransparentInterceptionLocalSetupScopePlan::RequiresProcessClassifier { .. }
+            plan.enforcement.interception.local_setup_projection,
+            TransparentInterceptionLocalSetupProjectionPlan::RequiresProcessClassifier { .. }
         ));
         let error = match build_configured_enforcement_with_backend(&plan, None).await {
             Ok(_) => panic!("process-scoped setup must require classifier support"),
@@ -402,10 +428,10 @@ mod tests {
         };
 
         let plan = RuntimePlan::build(config, &transparent_interception_registry())?;
-        assert_eq!(
-            plan.enforcement.interception.local_setup_scope,
-            TransparentInterceptionLocalSetupScopePlan::HostRules
-        );
+        assert!(matches!(
+            plan.enforcement.interception.local_setup_projection,
+            TransparentInterceptionLocalSetupProjectionPlan::HostRules { .. }
+        ));
         let error = match build_configured_enforcement_with_backend(&plan, None).await {
             Ok(_) => panic!("manifest process selector must require classifier support"),
             Err(error) => error,
@@ -454,8 +480,8 @@ mod tests {
 
         let plan = RuntimePlan::build(config, &transparent_interception_registry())?;
         assert!(matches!(
-            plan.enforcement.interception.local_setup_scope,
-            TransparentInterceptionLocalSetupScopePlan::Unsupported { .. }
+            plan.enforcement.interception.local_setup_projection,
+            TransparentInterceptionLocalSetupProjectionPlan::Unsupported { .. }
         ));
         let error = match build_configured_enforcement_with_backend(&plan, None).await {
             Ok(_) => panic!("manifest must not supply the only setup host constraint"),

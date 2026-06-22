@@ -9,7 +9,7 @@ use probe_config::{
 use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
 
-use super::interception_scope::TransparentInterceptionLocalSetupScopePlan;
+use super::interception_scope::TransparentInterceptionLocalSetupProjectionPlan;
 
 const RESERVED_TRANSPARENT_INTERCEPTION_NFTABLES_TABLE: &str = "sssa_probe";
 const RESERVED_TRANSPARENT_INTERCEPTION_NFTABLES_MARK: u32 = 0x5353_4101;
@@ -93,7 +93,7 @@ pub struct EnforcementInterceptionPlan {
     pub proxy: TransparentInterceptionProxyPlan,
     pub execution: TransparentInterceptionExecutionPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
-    pub local_setup_scope: TransparentInterceptionLocalSetupScopePlan,
+    pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
     pub capability: EnforcementCapabilityPlan,
     pub selector_configured: bool,
 }
@@ -111,8 +111,8 @@ impl EnforcementInterceptionPlan {
             proxy: TransparentInterceptionProxyPlan::from_intent(&intent),
             execution: TransparentInterceptionExecutionPlan::from_intent(&intent),
             nftables: TransparentInterceptionNftablesPlan::reserved(),
-            local_setup_scope:
-                TransparentInterceptionLocalSetupScopePlan::from_strategy_and_selectors(
+            local_setup_projection:
+                TransparentInterceptionLocalSetupProjectionPlan::from_strategy_and_selectors(
                     strategy,
                     config.enforcement.selector.as_ref(),
                     config.enforcement.interception.selector.as_ref(),
@@ -569,8 +569,8 @@ mod tests {
         );
         assert!(plan.interception.selector_configured);
         assert!(matches!(
-            plan.interception.local_setup_scope,
-            TransparentInterceptionLocalSetupScopePlan::Unsupported { .. }
+            plan.interception.local_setup_projection,
+            TransparentInterceptionLocalSetupProjectionPlan::Unsupported { .. }
         ));
         assert_eq!(
             plan.interception.proxy.mode,
