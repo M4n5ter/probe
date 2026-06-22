@@ -44,9 +44,9 @@ fn build_tls_session_secret_auto_binding_with_store_and_runtime(
         TlsSessionSecretAutoBindingPlan::Disabled => {
             Ok(TlsSessionSecretAutoBindingBuild::NotConfigured)
         }
-        TlsSessionSecretAutoBindingPlan::Enabled { materials } => Ok(
+        TlsSessionSecretAutoBindingPlan::Enabled(materials) => Ok(
             TlsSessionSecretAutoBindingBuild::Enabled(TlsSessionSecretAutoBindingRuntime::new(
-                materials.to_vec(),
+                materials.to_owned_materials(),
                 Box::new(file_store),
                 Duration::from_millis(plan.tls.plaintext.decrypt_hints.refresh_interval_ms),
                 runtime_state.cloned(),
@@ -203,6 +203,33 @@ mod tests {
     }
 
     #[test]
+    fn key_log_hints_wrap_primary_provider() -> Result<(), Box<dyn std::error::Error>> {
+        let path = PathBuf::from("/tmp/sslkeylog.log");
+        let mut config = config_with_key_log_material("ssl-keys", &path);
+        config.capture.selection = CaptureSelection::Libpcap;
+        let plan = runtime_plan(config)?;
+        let store = MemoryTlsMaterialStore::default().with_file(
+            &path,
+            format!(
+                "CLIENT_TRAFFIC_SECRET_0 {} {}\n",
+                "00".repeat(32),
+                "aa".repeat(32)
+            )
+            .into_bytes(),
+        );
+
+        let provider = build_tls_session_secret_auto_binding_with_store(&plan, store)?
+            .wrap(Box::new(NoopCaptureProvider));
+
+        assert_eq!(provider.name(), "tls_session_secret_auto_binding");
+        assert!(provider.capabilities().iter().any(|capability| {
+            capability.kind == CapabilityKind::TlsSessionSecretRecordDecrypt
+                && capability.mode == RuntimeMode::Degraded
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn empty_session_secret_file_keeps_live_auto_binding_enabled_for_refresh()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = PathBuf::from("/tmp/session-secrets.jsonl");
@@ -251,7 +278,7 @@ mod tests {
                 ],
             );
         let mut runtime = TlsSessionSecretAutoBindingRuntime::new(
-            plan.tls.plaintext.decrypt_hints.session_secrets,
+            auto_binding_materials(&plan),
             Box::new(store),
             Duration::from_millis(1),
             Some(runtime_state.clone()),
@@ -327,7 +354,7 @@ mod tests {
                 ],
             );
         let mut runtime = TlsSessionSecretAutoBindingRuntime::new(
-            plan.tls.plaintext.decrypt_hints.session_secrets,
+            auto_binding_materials(&plan),
             Box::new(store),
             Duration::from_millis(1),
             Some(runtime_state.clone()),
@@ -544,6 +571,23 @@ mod tests {
         config_with_session_secret_materials([(id, path)])
     }
 
+    fn config_with_key_log_material(id: &str, path: &Path) -> AgentConfig {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config
+            .tls
+            .plaintext
+            .decrypt_hints
+            .key_log_refs
+            .push(id.to_string());
+        config.tls.materials.push(TlsMaterialConfig {
+            id: Some(id.to_string()),
+            kind: TlsMaterialKind::KeyLogFile,
+            path: path.to_path_buf(),
+        });
+        config
+    }
+
     fn config_with_session_secret_materials<'a>(
         materials: impl IntoIterator<Item = (&'a str, &'a Path)>,
     ) -> AgentConfig {
@@ -592,6 +636,15 @@ mod tests {
             client_random_byte.repeat(32),
             secret_byte.repeat(48),
         )
+    }
+
+    fn auto_binding_materials(
+        plan: &runtime::RuntimePlan,
+    ) -> Vec<crate::tls_plaintext::decrypt_hints::plan::TlsSessionSecretAutoBindingMaterial> {
+        TlsSessionSecretAutoBindingPlan::for_runtime(plan)
+            .enabled_materials()
+            .expect("test plan should enable live auto-binding")
+            .to_owned_materials()
     }
 
     fn valid_session_secret_fields(

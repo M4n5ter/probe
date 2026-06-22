@@ -47,10 +47,11 @@ pub(super) enum TlsSessionSecretRefreshRuntimeTransition {
 
 impl TlsDecryptHintRuntimeState {
     pub(crate) fn for_plan(plan: &RuntimePlan) -> Self {
-        let configured_ref_count = plan.tls.plaintext.decrypt_hints.session_secrets.len() as u64;
+        let configured_ref_count =
+            TlsSessionSecretAutoBindingPlan::configured_ref_count(plan) as u64;
         let enabled_ref_count = match TlsSessionSecretAutoBindingPlan::for_runtime(plan) {
             TlsSessionSecretAutoBindingPlan::Disabled => 0,
-            TlsSessionSecretAutoBindingPlan::Enabled { materials } => materials.len() as u64,
+            TlsSessionSecretAutoBindingPlan::Enabled(materials) => materials.len() as u64,
         };
         let mode = match (configured_ref_count, enabled_ref_count) {
             (0, _) => TlsSessionSecretRefreshRuntimeMode::NotConfigured,

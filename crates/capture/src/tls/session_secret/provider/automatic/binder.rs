@@ -1,4 +1,6 @@
-use probe_core::{Direction, FlowContext};
+use std::collections::{HashMap, VecDeque};
+
+use probe_core::{Direction, FlowContext, FlowIdentity};
 
 use crate::tls::{TlsRandom, TlsSessionSecretLookupTime};
 use crate::{CaptureEvent, CapturedBytes};
@@ -8,7 +10,7 @@ use super::super::super::{
     Tls13SessionSecretFlowBinding, Tls13SessionSecretFlowBindingPlanner,
     Tls13SessionSecretFlowCandidate, Tls13SessionSecretHandshakeObservation,
     Tls13SessionSecretHandshakeObservationKind, Tls13SessionSecretHandshakeObserver,
-    Tls13SessionSecretStreamCursor, TlsSessionSecretStore,
+    Tls13SessionSecretStreamCursor, TlsCipherSuite, TlsSessionSecretStore,
     binding::Tls13SessionSecretMissingPlaintextPrefix,
     frame::{TLS13_OUTER_APPLICATION_DATA, Tls13BufferedRecord, Tls13RecordFrame, TlsRecordHeader},
 };
@@ -23,6 +25,7 @@ const TLS13_AUTO_BIND_MAX_RESYNC_RECORDS: u8 = 32;
 pub(in crate::tls::session_secret::provider) struct Tls13SessionSecretAutomaticBinder {
     store: Option<TlsSessionSecretStore>,
     observer: Tls13SessionSecretHandshakeObserver,
+    handshake_facts: Tls13SessionSecretHandshakeFacts,
     candidates: Tls13SessionSecretCandidateSet,
 }
 
@@ -33,6 +36,7 @@ impl Tls13SessionSecretAutomaticBinder {
         Self {
             store,
             observer: Tls13SessionSecretHandshakeObserver::new(),
+            handshake_facts: Tls13SessionSecretHandshakeFacts::new(TLS13_AUTO_BIND_MAX_CANDIDATES),
             candidates: Tls13SessionSecretCandidateSet::new(TLS13_AUTO_BIND_MAX_CANDIDATES),
         }
     }
@@ -120,7 +124,12 @@ impl Tls13SessionSecretAutomaticBinder {
         let Tls13SessionSecretHandshakeObservationKind::ClientHello { client_random } =
             observation.kind()
         else {
-            return Vec::new();
+            let Tls13SessionSecretHandshakeObservationKind::ServerHello { cipher_suite, .. } =
+                observation.kind()
+            else {
+                return Vec::new();
+            };
+            return self.observe_server_hello(observation.flow().id.clone(), *cipher_suite);
         };
         let Ok(lookup_time) = TlsSessionSecretLookupTime::from_timestamp(observation.timestamp())
         else {
@@ -146,6 +155,22 @@ impl Tls13SessionSecretAutomaticBinder {
         released_events
     }
 
+    fn observe_server_hello(
+        &mut self,
+        flow: FlowIdentity,
+        cipher_suite: TlsCipherSuite,
+    ) -> Vec<CaptureEvent> {
+        self.handshake_facts
+            .observe_server_hello(flow.clone(), cipher_suite);
+        self.candidates.update_flow_candidates(&flow, |intent| {
+            self.handshake_facts.apply_to_intent(intent);
+        });
+        let store = self.store.as_ref();
+        self.candidates
+            .activate_waiting_candidates(|intent| candidate_has_usable_material(store, intent));
+        Vec::new()
+    }
+
     fn insert_candidate(
         &mut self,
         flow: FlowContext,
@@ -159,7 +184,7 @@ impl Tls13SessionSecretAutomaticBinder {
         if self.candidates.key_has_probing_candidate(&key) {
             return Vec::new();
         }
-        let intent = Tls13SessionSecretBindingIntent::new(
+        let mut intent = Tls13SessionSecretBindingIntent::new(
             flow,
             direction,
             client_random,
@@ -167,6 +192,7 @@ impl Tls13SessionSecretAutomaticBinder {
             next_probe_offset,
             lookup_time,
         );
+        self.handshake_facts.apply_to_intent(&mut intent);
         if candidate_has_usable_material(self.store.as_ref(), &intent) {
             self.candidates.insert(
                 key,
@@ -190,6 +216,7 @@ impl Tls13SessionSecretAutomaticBinder {
                 self.candidates.remove_candidate(&key)
             }
             CaptureEvent::ConnectionClosed { flow, .. } => {
+                self.handshake_facts.remove_flow(&flow.id);
                 self.candidates.remove_flow_candidates(&flow.id)
             }
             CaptureEvent::Bytes(_)
@@ -392,7 +419,8 @@ impl Tls13SessionSecretAutomaticBinder {
         let base_cursor = Tls13SessionSecretStreamCursor::resume_at(ciphertext_offset, 0, 0);
         let binding = self.binding_for_candidate(candidate, base_cursor)?;
         let decryptor =
-            Tls13ApplicationDataDecryptor::from_session_secret_record(&binding.record).ok()?;
+            Tls13ApplicationDataDecryptor::from_application_traffic_secret(&binding.traffic_secret)
+                .ok()?;
         let sequence_number = matching_sequence_number(&decryptor, record)?;
         let cursor =
             Tls13SessionSecretStreamCursor::resume_at(ciphertext_offset, 0, sequence_number);
@@ -435,7 +463,7 @@ fn candidate_has_usable_material(
     else {
         return false;
     };
-    Tls13ApplicationDataDecryptor::from_session_secret_record(&binding.record).is_ok()
+    Tls13ApplicationDataDecryptor::from_application_traffic_secret(&binding.traffic_secret).is_ok()
 }
 
 fn binding_for_intent(
@@ -453,6 +481,9 @@ fn binding_for_intent(
     );
     if let Some(lookup_time) = intent.lookup_time {
         flow_candidate = flow_candidate.with_lookup_time(lookup_time);
+    }
+    if let Some(cipher_suite) = intent.observed_cipher_suite {
+        flow_candidate = flow_candidate.with_observed_cipher_suite(cipher_suite);
     }
     Tls13SessionSecretFlowBindingPlanner::new(store)
         .plan(flow_candidate)
@@ -480,6 +511,7 @@ pub(super) struct Tls13SessionSecretBindingIntent {
     secret_kind: Tls13ApplicationTrafficSecretKind,
     next_probe_offset: u64,
     lookup_time: Option<TlsSessionSecretLookupTime>,
+    observed_cipher_suite: Option<TlsCipherSuite>,
 }
 
 #[derive(Debug)]
@@ -505,7 +537,16 @@ impl Tls13SessionSecretBindingIntent {
             secret_kind,
             next_probe_offset,
             lookup_time,
+            observed_cipher_suite: None,
         }
+    }
+
+    pub(super) fn flow(&self) -> &FlowContext {
+        &self.flow
+    }
+
+    fn set_observed_cipher_suite(&mut self, cipher_suite: TlsCipherSuite) {
+        self.observed_cipher_suite = Some(cipher_suite);
     }
 }
 
@@ -526,6 +567,14 @@ impl Tls13SessionSecretBindingCandidate {
         self.held
             .map(Tls13SessionSecretBufferedBytes::into_events)
             .unwrap_or_default()
+    }
+
+    pub(super) fn intent(&self) -> &Tls13SessionSecretBindingIntent {
+        &self.intent
+    }
+
+    pub(super) fn intent_mut(&mut self) -> &mut Tls13SessionSecretBindingIntent {
+        &mut self.intent
     }
 
     fn advance_probe_offset(&mut self, offset: u64) {
@@ -601,5 +650,54 @@ fn opposite_direction(direction: Direction) -> Direction {
     match direction {
         Direction::Inbound => Direction::Outbound,
         Direction::Outbound => Direction::Inbound,
+    }
+}
+
+#[derive(Debug)]
+struct Tls13SessionSecretHandshakeFacts {
+    by_flow: HashMap<FlowIdentity, TlsCipherSuite>,
+    order: VecDeque<FlowIdentity>,
+    max_flows: usize,
+}
+
+impl Tls13SessionSecretHandshakeFacts {
+    fn new(max_flows: usize) -> Self {
+        Self {
+            by_flow: HashMap::new(),
+            order: VecDeque::new(),
+            max_flows,
+        }
+    }
+
+    fn apply_to_intent(&self, intent: &mut Tls13SessionSecretBindingIntent) {
+        if let Some(cipher_suite) = self.by_flow.get(&intent.flow.id).copied() {
+            intent.set_observed_cipher_suite(cipher_suite);
+        }
+    }
+
+    fn observe_server_hello(&mut self, flow: FlowIdentity, cipher_suite: TlsCipherSuite) {
+        if self.max_flows == 0 {
+            return;
+        }
+        if !self.by_flow.contains_key(&flow) {
+            self.reserve_slot();
+            self.order.push_back(flow.clone());
+        }
+        self.by_flow.insert(flow, cipher_suite);
+    }
+
+    fn remove_flow(&mut self, flow: &FlowIdentity) {
+        self.by_flow.remove(flow);
+        self.order.retain(|candidate| candidate != flow);
+    }
+
+    fn reserve_slot(&mut self) {
+        while self.by_flow.len() >= self.max_flows {
+            let Some(flow) = self.order.pop_front() else {
+                self.by_flow.clear();
+                return;
+            };
+            self.by_flow.remove(&flow);
+        }
     }
 }

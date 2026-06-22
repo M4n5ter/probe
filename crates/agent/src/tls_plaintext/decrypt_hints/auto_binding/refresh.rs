@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 
 use capture::TlsSessionSecretStore;
-use runtime::TlsPlaintextMaterialPlan;
 
 use crate::tls_material::TlsMaterialFileStore;
 
@@ -10,6 +9,7 @@ use super::super::{
         TlsDecryptHintError, TlsSessionSecretMaterialLoad,
         load_tls_session_secret_auto_binding_material,
     },
+    plan::TlsSessionSecretAutoBindingMaterial,
     runtime::{TlsDecryptHintRuntimeState, TlsSessionSecretRefreshRuntimeTransition},
 };
 
@@ -21,7 +21,7 @@ pub(crate) struct TlsSessionSecretAutoBindingRuntime {
 
 impl TlsSessionSecretAutoBindingRuntime {
     pub(super) fn new(
-        materials: Vec<TlsPlaintextMaterialPlan>,
+        materials: Vec<TlsSessionSecretAutoBindingMaterial>,
         file_store: Box<dyn TlsMaterialFileStore>,
         refresh_interval: Duration,
         runtime_state: Option<TlsDecryptHintRuntimeState>,
@@ -69,7 +69,7 @@ impl TlsSessionSecretAutoBindingRuntime {
 }
 
 pub(super) struct TlsSessionSecretMaterialRefresh {
-    materials: Vec<TlsPlaintextMaterialPlan>,
+    materials: Vec<TlsSessionSecretAutoBindingMaterial>,
     file_store: Box<dyn TlsMaterialFileStore>,
     refresh_interval: Duration,
     next_refresh: Instant,
@@ -77,7 +77,7 @@ pub(super) struct TlsSessionSecretMaterialRefresh {
 
 impl TlsSessionSecretMaterialRefresh {
     fn new(
-        materials: Vec<TlsPlaintextMaterialPlan>,
+        materials: Vec<TlsSessionSecretAutoBindingMaterial>,
         file_store: Box<dyn TlsMaterialFileStore>,
         refresh_interval: Duration,
     ) -> Self {
@@ -308,13 +308,15 @@ mod tests {
 
     fn material_plans<'a>(
         materials: impl IntoIterator<Item = (&'a str, &'a Path)>,
-    ) -> Vec<TlsPlaintextMaterialPlan> {
+    ) -> Vec<TlsSessionSecretAutoBindingMaterial> {
         materials
             .into_iter()
-            .map(|(id, path)| TlsPlaintextMaterialPlan {
-                id: id.to_string(),
-                kind: TlsMaterialKind::SessionSecretFile,
-                path: path.to_path_buf(),
+            .map(|(id, path)| {
+                TlsSessionSecretAutoBindingMaterial::SessionSecret(TlsPlaintextMaterialPlan {
+                    id: id.to_string(),
+                    kind: TlsMaterialKind::SessionSecretFile,
+                    path: path.to_path_buf(),
+                })
             })
             .collect()
     }

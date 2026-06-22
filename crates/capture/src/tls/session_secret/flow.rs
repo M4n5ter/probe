@@ -28,7 +28,7 @@ impl Tls13SessionSecretFlowDecryptor {
         binding: Tls13SessionSecretFlowBinding,
     ) -> Result<(), Tls13SessionSecretFlowDecryptError> {
         let Tls13SessionSecretFlowBinding {
-            record,
+            traffic_secret,
             flow,
             direction,
             cursor,
@@ -41,8 +41,11 @@ impl Tls13SessionSecretFlowDecryptor {
                 direction,
             });
         }
-        let adapter = Tls13SessionSecretStreamAdapter::from_session_secret_record_with_cursor(
-            &record, flow, direction, cursor,
+        let adapter = Tls13SessionSecretStreamAdapter::from_application_traffic_secret_with_cursor(
+            &traffic_secret,
+            flow,
+            direction,
+            cursor,
         )?
         .with_degradation("TLS session-secret decrypt uses best-effort ciphertext capture");
         let adapter = match missing_plaintext_prefix {
@@ -261,12 +264,12 @@ mod tests {
         let record = session_secret_record()?;
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
-        decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
-            record.clone(),
+        decryptor.bind(flow_binding(
+            &record,
             flow.clone(),
             Direction::Outbound,
             Tls13SessionSecretStreamCursor::start(),
-        ))?;
+        )?)?;
         let wire_record = protected_application_record(&record, 0, b"GET / HTTP/1.1\r\n\r\n")?;
 
         let events = decryptor.push_capture_event(&CaptureEvent::Bytes(captured_bytes(
@@ -299,12 +302,12 @@ mod tests {
         let record = session_secret_record()?;
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
-        decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
-            record.clone(),
+        decryptor.bind(flow_binding(
+            &record,
             flow.clone(),
             Direction::Inbound,
             Tls13SessionSecretStreamCursor::resume_at(128, 7, 2),
-        ))?;
+        )?)?;
         let wire_record = protected_application_record(&record, 2, b"ok")?;
 
         let events = decryptor.push_capture_event(&CaptureEvent::Bytes(captured_bytes(
@@ -353,12 +356,12 @@ mod tests {
         let record = session_secret_record()?;
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
-        decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
-            record.clone(),
+        decryptor.bind(flow_binding(
+            &record,
             flow.clone(),
             Direction::Outbound,
             Tls13SessionSecretStreamCursor::resume_at(0, 42, 0),
-        ))?;
+        )?)?;
 
         let events = decryptor.push_capture_event(&CaptureEvent::Gap(captured_gap(
             flow.clone(),
@@ -393,12 +396,12 @@ mod tests {
         let record = session_secret_record()?;
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
-        decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
-            record.clone(),
+        decryptor.bind(flow_binding(
+            &record,
             flow.clone(),
             Direction::Outbound,
             Tls13SessionSecretStreamCursor::start(),
-        ))?;
+        )?)?;
 
         let events = decryptor.push_capture_event(&CaptureEvent::ConnectionClosed {
             timestamp: timestamp(),
@@ -431,12 +434,12 @@ mod tests {
         let record = session_secret_record()?;
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
-        decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
-            record.clone(),
+        decryptor.bind(flow_binding(
+            &record,
             flow.clone(),
             Direction::Outbound,
             Tls13SessionSecretStreamCursor::start(),
-        ))?;
+        )?)?;
         let wire_record = protected_application_record(&record, 0, b"truncated")?;
         let split_at = 8;
 
@@ -489,12 +492,12 @@ mod tests {
         let record = session_secret_record()?;
         let flow = demo_flow();
         let mut decryptor = Tls13SessionSecretFlowDecryptor::new();
-        decryptor.bind(Tls13SessionSecretFlowBinding::resume_at(
-            record.clone(),
+        decryptor.bind(flow_binding(
+            &record,
             flow.clone(),
             Direction::Outbound,
             Tls13SessionSecretStreamCursor::start(),
-        ))?;
+        )?)?;
         let wire_record = protected_application_record(&record, 0, b"truncated")?;
         let split_at = 8;
 
@@ -538,6 +541,20 @@ mod tests {
         );
         let store = TlsSessionSecretStore::parse(material.as_bytes())?;
         Ok(store.records()[0].clone())
+    }
+
+    fn flow_binding(
+        record: &TlsSessionSecretRecord,
+        flow: FlowContext,
+        direction: Direction,
+        cursor: Tls13SessionSecretStreamCursor,
+    ) -> Result<Tls13SessionSecretFlowBinding, Box<dyn std::error::Error>> {
+        Ok(Tls13SessionSecretFlowBinding::resume_at(
+            super::super::Tls13ApplicationTrafficSecret::from_session_secret_record(record)?,
+            flow,
+            direction,
+            cursor,
+        ))
     }
 
     fn protected_application_record(

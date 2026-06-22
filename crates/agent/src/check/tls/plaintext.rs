@@ -1,14 +1,17 @@
 use std::path::PathBuf;
 
-use capture::{TlsKeyLog, TlsKeyLogSummary, TlsSessionSecretSummary};
+use capture::{TlsKeyLog, TlsKeyLogSummary, TlsSessionSecretStore, TlsSessionSecretSummary};
 use probe_config::TlsMaterialKind;
 use runtime::{RuntimePlan, TlsPlaintextMaterialPlan};
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::tls_material::{FilesystemTlsMaterialStore, TlsMaterialFileStore};
+use crate::tls_material::{
+    FilesystemTlsMaterialStore, TlsMaterialFileStore, TlsMaterialFileStoreError,
+};
 use crate::tls_plaintext::{
-    TlsDecryptHintError, TlsSessionSecretAutoBindingPlan, load_tls_session_secret_materials,
+    TlsDecryptHintError, TlsSessionSecretAutoBindingMaterials, TlsSessionSecretAutoBindingPlan,
+    load_tls_session_secret_auto_binding_material,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -46,8 +49,22 @@ struct TlsPlaintextMaterialCheckSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum TlsPlaintextMaterialContentCheck {
-    SslKeyLog { summary: TlsKeyLogSummary },
-    SessionSecretFile { summary: TlsSessionSecretSummary },
+    SslKeyLog {
+        summary: TlsKeyLogSummary,
+    },
+    Pending {
+        reason: TlsPlaintextMaterialPendingReason,
+    },
+    SessionSecretFile {
+        summary: TlsSessionSecretSummary,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TlsPlaintextMaterialPendingReason {
+    NotFound,
+    Empty,
 }
 
 #[derive(Debug, Error)]
@@ -74,6 +91,20 @@ fn check_tls_with_file_store(
     let plaintext = &plan.tls.plaintext;
     let instrumentation = &plaintext.instrumentation;
     let decrypt_hints = &plaintext.decrypt_hints;
+    let auto_binding_plan = TlsSessionSecretAutoBindingPlan::for_runtime(plan);
+    let live_auto_binding_materials = auto_binding_plan.enabled_materials();
+    let key_logs = check_key_log_materials(
+        &decrypt_hints.key_logs,
+        key_log_check_mode(live_auto_binding_materials),
+        file_store,
+    )?;
+    let session_secrets = check_session_secret_materials(
+        &decrypt_hints.session_secrets,
+        session_secret_check_mode(live_auto_binding_materials),
+        file_store,
+    )?;
+    check_live_auto_binding_materials(auto_binding_plan, file_store)?;
+
     Ok(TlsCheckSnapshot {
         plaintext: TlsPlaintextCheckSnapshot {
             instrumentation: TlsPlaintextInstrumentationCheckSnapshot {
@@ -82,8 +113,8 @@ fn check_tls_with_file_store(
                 reconcile_interval_ms: instrumentation.reconcile_interval_ms,
             },
             decrypt_hints: TlsDecryptHintCheckSnapshot {
-                key_logs: check_key_log_materials(&decrypt_hints.key_logs, file_store)?,
-                session_secrets: check_session_secret_materials(plan, file_store)?,
+                key_logs,
+                session_secrets,
             },
         },
     })
@@ -91,63 +122,162 @@ fn check_tls_with_file_store(
 
 fn check_key_log_materials(
     materials: &[TlsPlaintextMaterialPlan],
+    mode: KeyLogCheckMode,
     file_store: &impl TlsMaterialFileStore,
 ) -> Result<Vec<TlsPlaintextMaterialCheckSnapshot>, TlsCheckError> {
     materials
         .iter()
-        .map(|material| {
-            let bytes = read_plaintext_material(material, file_store)?;
-            let summary = TlsKeyLog::parse(&bytes)
-                .map(|key_log| key_log.summary())
-                .map_err(|source| tls_plaintext_material_error(material, source))?;
-            Ok(TlsPlaintextMaterialCheckSnapshot {
-                id: material.id.clone(),
-                kind: material.kind,
-                path: material.path.clone(),
-                check: TlsPlaintextMaterialContentCheck::SslKeyLog { summary },
-            })
-        })
+        .map(|material| check_key_log_material(material, mode, file_store))
         .collect()
+}
+
+fn check_key_log_material(
+    material: &TlsPlaintextMaterialPlan,
+    mode: KeyLogCheckMode,
+    file_store: &impl TlsMaterialFileStore,
+) -> Result<TlsPlaintextMaterialCheckSnapshot, TlsCheckError> {
+    let bytes = match file_store.read_tls_material(&material.path) {
+        Ok(bytes) => bytes,
+        Err(TlsMaterialFileStoreError::NotFound) if mode == KeyLogCheckMode::LiveTail => {
+            return Ok(pending_check_snapshot(
+                material,
+                TlsPlaintextMaterialPendingReason::NotFound,
+            ));
+        }
+        Err(source) => return Err(tls_plaintext_material_error(material, source)),
+    };
+    let key_log = if mode == KeyLogCheckMode::LiveTail {
+        TlsKeyLog::parse_live_snapshot(&bytes)
+    } else {
+        TlsKeyLog::parse(&bytes)
+    }
+    .map_err(|source| tls_plaintext_material_error(material, source))?;
+    Ok(key_log_check_snapshot(material, key_log.summary()))
+}
+
+fn key_log_check_snapshot(
+    material: &TlsPlaintextMaterialPlan,
+    summary: TlsKeyLogSummary,
+) -> TlsPlaintextMaterialCheckSnapshot {
+    TlsPlaintextMaterialCheckSnapshot {
+        id: material.id.clone(),
+        kind: material.kind,
+        path: material.path.clone(),
+        check: TlsPlaintextMaterialContentCheck::SslKeyLog { summary },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyLogCheckMode {
+    Static,
+    LiveTail,
+}
+
+fn key_log_check_mode(
+    materials: Option<TlsSessionSecretAutoBindingMaterials<'_>>,
+) -> KeyLogCheckMode {
+    if materials.is_some_and(|materials| !materials.key_logs().is_empty()) {
+        KeyLogCheckMode::LiveTail
+    } else {
+        KeyLogCheckMode::Static
+    }
 }
 
 fn check_session_secret_materials(
-    plan: &RuntimePlan,
+    materials: &[TlsPlaintextMaterialPlan],
+    mode: SessionSecretCheckMode,
     file_store: &impl TlsMaterialFileStore,
 ) -> Result<Vec<TlsPlaintextMaterialCheckSnapshot>, TlsCheckError> {
-    let materials = load_tls_session_secret_materials(
-        &plan.tls.plaintext.decrypt_hints.session_secrets,
-        file_store,
-    )
-    .map_err(TlsCheckError::from)?;
-    if TlsSessionSecretAutoBindingPlan::for_runtime(plan).is_enabled() {
-        materials
-            .build_auto_binding_store()
-            .map(|_| ())
-            .map_err(TlsCheckError::from)?;
-    }
     materials
-        .materials()
         .iter()
-        .map(|material| {
-            Ok(TlsPlaintextMaterialCheckSnapshot {
-                id: material.id.clone(),
-                kind: material.kind,
-                path: material.path.clone(),
-                check: TlsPlaintextMaterialContentCheck::SessionSecretFile {
-                    summary: material.store.summary(),
-                },
-            })
-        })
+        .map(|material| check_session_secret_material(material, mode, file_store))
         .collect()
 }
 
-fn read_plaintext_material(
+fn check_session_secret_material(
     material: &TlsPlaintextMaterialPlan,
+    mode: SessionSecretCheckMode,
     file_store: &impl TlsMaterialFileStore,
-) -> Result<Vec<u8>, TlsCheckError> {
-    file_store
-        .read_tls_material(&material.path)
-        .map_err(|source| tls_plaintext_material_error(material, source))
+) -> Result<TlsPlaintextMaterialCheckSnapshot, TlsCheckError> {
+    let bytes = match file_store.read_tls_material(&material.path) {
+        Ok(bytes) => bytes,
+        Err(TlsMaterialFileStoreError::NotFound)
+            if mode == SessionSecretCheckMode::LiveAutoBinding =>
+        {
+            return Ok(pending_check_snapshot(
+                material,
+                TlsPlaintextMaterialPendingReason::NotFound,
+            ));
+        }
+        Err(source) => return Err(tls_plaintext_material_error(material, source)),
+    };
+    if mode == SessionSecretCheckMode::LiveAutoBinding && tls_material_is_empty(&bytes) {
+        return Ok(pending_check_snapshot(
+            material,
+            TlsPlaintextMaterialPendingReason::Empty,
+        ));
+    }
+    let store = TlsSessionSecretStore::parse(&bytes)
+        .map_err(|source| tls_plaintext_material_error(material, source))?;
+    Ok(session_secret_check_snapshot(material, store.summary()))
+}
+
+fn session_secret_check_snapshot(
+    material: &TlsPlaintextMaterialPlan,
+    summary: TlsSessionSecretSummary,
+) -> TlsPlaintextMaterialCheckSnapshot {
+    TlsPlaintextMaterialCheckSnapshot {
+        id: material.id.clone(),
+        kind: material.kind,
+        path: material.path.clone(),
+        check: TlsPlaintextMaterialContentCheck::SessionSecretFile { summary },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionSecretCheckMode {
+    Static,
+    LiveAutoBinding,
+}
+
+fn session_secret_check_mode(
+    materials: Option<TlsSessionSecretAutoBindingMaterials<'_>>,
+) -> SessionSecretCheckMode {
+    if materials.is_some_and(|materials| !materials.session_secrets().is_empty()) {
+        SessionSecretCheckMode::LiveAutoBinding
+    } else {
+        SessionSecretCheckMode::Static
+    }
+}
+
+fn check_live_auto_binding_materials(
+    plan: TlsSessionSecretAutoBindingPlan<'_>,
+    file_store: &impl TlsMaterialFileStore,
+) -> Result<(), TlsCheckError> {
+    let Some(materials) = plan.enabled_materials() else {
+        return Ok(());
+    };
+    load_tls_session_secret_auto_binding_material(&materials.to_owned_materials(), file_store)
+        .map(|_| ())
+        .map_err(TlsCheckError::from)
+}
+
+fn pending_check_snapshot(
+    material: &TlsPlaintextMaterialPlan,
+    reason: TlsPlaintextMaterialPendingReason,
+) -> TlsPlaintextMaterialCheckSnapshot {
+    TlsPlaintextMaterialCheckSnapshot {
+        id: material.id.clone(),
+        kind: material.kind,
+        path: material.path.clone(),
+        check: TlsPlaintextMaterialContentCheck::Pending { reason },
+    }
+}
+
+fn tls_material_is_empty(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
 }
 
 fn tls_plaintext_material_error(
@@ -165,7 +295,7 @@ fn tls_plaintext_material_error(
 impl From<TlsDecryptHintError> for TlsCheckError {
     fn from(error: TlsDecryptHintError) -> Self {
         match error {
-            TlsDecryptHintError::SessionSecretMaterial {
+            TlsDecryptHintError::Material {
                 id,
                 kind,
                 path,
@@ -176,9 +306,7 @@ impl From<TlsDecryptHintError> for TlsCheckError {
                 path,
                 reason,
             },
-            TlsDecryptHintError::SessionSecretMaterialSet { reason } => {
-                Self::DecryptHints { reason }
-            }
+            TlsDecryptHintError::MaterialSet { reason } => Self::DecryptHints { reason },
         }
     }
 }
@@ -276,6 +404,141 @@ mod tests {
         assert_eq!(
             value["tls"]["plaintext"]["decrypt_hints"]["session_secrets"][0]["check"]["summary"]["secret_min_bytes"],
             json!(32)
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_accepts_key_log_only_live_auto_binding_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-keylog-only-live-auto-binding")?;
+        let key_log_path = temp.join("sslkeylog.log");
+        fs::write(
+            &key_log_path,
+            format!(
+                "CLIENT_TRAFFIC_SECRET_0 {} {}\n",
+                "00".repeat(32),
+                "aa".repeat(32)
+            ),
+        )?;
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-keys".to_string()];
+        config.tls.materials.push(TlsMaterialConfig {
+            id: Some("ssl-keys".to_string()),
+            kind: TlsMaterialKind::KeyLogFile,
+            path: key_log_path,
+        });
+        let plan = runtime_plan(config)?;
+
+        let report = build_check_report(plan, None).await?;
+
+        let value = serde_json::to_value(report)?;
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["key_logs"][0]["check"]["summary"]["labels"]
+                [0]["label"],
+            json!("CLIENT_TRAFFIC_SECRET_0")
+        );
+        assert!(
+            value["tls"]["plaintext"]["decrypt_hints"]["session_secrets"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_ignores_live_key_log_trailing_partial_line()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-live-keylog-partial-tail")?;
+        let key_log_path = temp.join("sslkeylog.log");
+        fs::write(
+            &key_log_path,
+            format!(
+                "CLIENT_TRAFFIC_SECRET_0 {} {}\nCLIENT_TRAFFIC_SECRET_0 {} aa",
+                "00".repeat(32),
+                "aa".repeat(32),
+                "11".repeat(32)
+            ),
+        )?;
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-keys".to_string()];
+        config.tls.materials.push(TlsMaterialConfig {
+            id: Some("ssl-keys".to_string()),
+            kind: TlsMaterialKind::KeyLogFile,
+            path: key_log_path,
+        });
+        let plan = runtime_plan(config)?;
+
+        let report = build_check_report(plan, None).await?;
+
+        let value = serde_json::to_value(report)?;
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["key_logs"][0]["check"]["summary"]["entries"],
+            json!(1)
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["key_logs"][0]["check"]["summary"]["labels"]
+                [0]["label"],
+            json!("CLIENT_TRAFFIC_SECRET_0")
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_accepts_missing_live_key_log_as_pending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-missing-live-keylog")?;
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-keys".to_string()];
+        config.tls.materials.push(TlsMaterialConfig {
+            id: Some("ssl-keys".to_string()),
+            kind: TlsMaterialKind::KeyLogFile,
+            path: temp.join("sslkeylog.log"),
+        });
+        let plan = runtime_plan(config)?;
+
+        let report = build_check_report(plan, None).await?;
+
+        let value = serde_json::to_value(report)?;
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["key_logs"][0]["check"]["kind"],
+            json!("pending")
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["key_logs"][0]["check"]["reason"],
+            json!("not_found")
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_accepts_missing_live_session_secret_as_pending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-missing-live-session-secret")?;
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.decrypt_hints.session_secret_refs =
+            vec!["session-secrets".to_string()];
+        config.tls.materials.push(TlsMaterialConfig {
+            id: Some("session-secrets".to_string()),
+            kind: TlsMaterialKind::SessionSecretFile,
+            path: temp.join("session-secrets.jsonl"),
+        });
+        let plan = runtime_plan(config)?;
+
+        let report = build_check_report(plan, None).await?;
+
+        let value = serde_json::to_value(report)?;
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["session_secrets"][0]["check"]["kind"],
+            json!("pending")
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["session_secrets"][0]["check"]["reason"],
+            json!("not_found")
         );
         fs::remove_dir_all(temp)?;
         Ok(())

@@ -22,8 +22,9 @@ pub(super) const CLIENT_RANDOM: &str =
     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 pub(super) const OTHER_CLIENT_RANDOM: &str =
     "101112131415161718191a1b1c1d1e1f000102030405060708090a0b0c0d0e0f";
-const SHA256_TRAFFIC_SECRET: &str =
+pub(super) const SHA256_TRAFFIC_SECRET: &str =
     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+const SERVER_RANDOM: &str = "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
 
 pub(super) struct AutoBindingFixture {
     pub(super) store: TlsSessionSecretStore,
@@ -209,6 +210,10 @@ fn tls_client_hello_record() -> Vec<u8> {
     tls_handshake_record(1, tls_client_hello_body())
 }
 
+pub(super) fn tls_server_hello_record() -> Vec<u8> {
+    tls_handshake_record(2, tls_server_hello_body())
+}
+
 fn tls_client_hello_body() -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]);
@@ -217,6 +222,19 @@ fn tls_client_hello_body() -> Vec<u8> {
     body.extend_from_slice(&[0, 2, 0x13, 0x01]);
     body.extend_from_slice(&[1, 0]);
     let supported_versions = vec![0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04];
+    body.extend_from_slice(&(supported_versions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&supported_versions);
+    body
+}
+
+fn tls_server_hello_body() -> Vec<u8> {
+    let supported_versions = vec![0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&decode_hex(SERVER_RANDOM).expect("valid server random"));
+    body.push(0);
+    body.extend_from_slice(&[0x13, 0x01]);
+    body.push(0);
     body.extend_from_slice(&(supported_versions.len() as u16).to_be_bytes());
     body.extend_from_slice(&supported_versions);
     body

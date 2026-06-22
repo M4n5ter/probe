@@ -69,29 +69,83 @@ pub struct Tls13ApplicationDataDecryptor {
     sequence_number: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::tls::session_secret) struct Tls13ApplicationTrafficSecret {
+    record: TlsSessionSecretRecord,
+    cipher_suite: TlsCipherSuite,
+}
+
+impl Tls13ApplicationTrafficSecret {
+    pub(in crate::tls::session_secret) fn from_session_secret_record(
+        record: &TlsSessionSecretRecord,
+    ) -> Result<Self, Tls13DecryptError> {
+        validate_application_traffic_record(record)?;
+        let cipher_suite = record
+            .cipher_suite()
+            .ok_or(Tls13DecryptError::MissingCipherSuite)?;
+        Self::from_resolved_cipher_suite(record, cipher_suite)
+    }
+
+    pub(in crate::tls::session_secret) fn from_resolved_cipher_suite(
+        record: &TlsSessionSecretRecord,
+        cipher_suite: TlsCipherSuite,
+    ) -> Result<Self, Tls13DecryptError> {
+        validate_application_traffic_record(record)?;
+        Ok(Self {
+            record: record.clone(),
+            cipher_suite,
+        })
+    }
+
+    pub(in crate::tls::session_secret) fn cipher_suite(&self) -> TlsCipherSuite {
+        self.cipher_suite
+    }
+
+    fn secret_kind(&self) -> TlsSessionSecretKind {
+        self.record.secret_kind()
+    }
+
+    fn secret(&self) -> &crate::tls::TlsSecret {
+        self.record.secret()
+    }
+}
+
+fn validate_application_traffic_record(
+    record: &TlsSessionSecretRecord,
+) -> Result<(), Tls13DecryptError> {
+    if record.protocol() != TlsSessionSecretProtocol::Tls13 {
+        return Err(Tls13DecryptError::UnsupportedProtocol {
+            protocol: record.protocol(),
+        });
+    }
+    let secret_kind = record.secret_kind();
+    if !matches!(
+        secret_kind,
+        TlsSessionSecretKind::ClientApplicationTraffic
+            | TlsSessionSecretKind::ServerApplicationTraffic
+    ) {
+        return Err(Tls13DecryptError::UnsupportedSecretKind { secret_kind });
+    }
+    Ok(())
+}
+
 impl Tls13ApplicationDataDecryptor {
     pub fn from_session_secret_record(
         record: &TlsSessionSecretRecord,
     ) -> Result<Self, Tls13DecryptError> {
-        if record.protocol() != TlsSessionSecretProtocol::Tls13 {
-            return Err(Tls13DecryptError::UnsupportedProtocol {
-                protocol: record.protocol(),
-            });
-        }
-        let secret_kind = record.secret_kind();
-        if !matches!(
-            secret_kind,
-            TlsSessionSecretKind::ClientApplicationTraffic
-                | TlsSessionSecretKind::ServerApplicationTraffic
-        ) {
-            return Err(Tls13DecryptError::UnsupportedSecretKind { secret_kind });
-        }
-        let cipher_suite = record
-            .cipher_suite()
-            .ok_or(Tls13DecryptError::MissingCipherSuite)?;
+        Self::from_application_traffic_secret(
+            &Tls13ApplicationTrafficSecret::from_session_secret_record(record)?,
+        )
+    }
+
+    pub(in crate::tls::session_secret) fn from_application_traffic_secret(
+        traffic_secret: &Tls13ApplicationTrafficSecret,
+    ) -> Result<Self, Tls13DecryptError> {
+        let secret_kind = traffic_secret.secret_kind();
+        let cipher_suite = traffic_secret.cipher_suite();
         let suite = Tls13AeadSuite::from_cipher_suite(cipher_suite)
             .ok_or_else(|| Tls13DecryptError::unsupported_cipher_suite(cipher_suite))?;
-        let secret = record.secret();
+        let secret = traffic_secret.secret();
         if secret.len() != suite.secret_len {
             return Err(Tls13DecryptError::InvalidTrafficSecretLength {
                 expected_bytes: suite.secret_len,

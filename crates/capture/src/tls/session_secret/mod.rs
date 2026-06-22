@@ -13,6 +13,7 @@ pub use binding::{
     Tls13SessionSecretFlowBindingPlanError, Tls13SessionSecretFlowBindingPlanner,
     Tls13SessionSecretFlowCandidate, TlsSessionSecretLookupTime, TlsSessionSecretLookupTimeError,
 };
+pub(in crate::tls::session_secret) use decrypt::Tls13ApplicationTrafficSecret;
 pub use decrypt::{
     Tls13ApplicationDataDecryptor, Tls13DecryptError, Tls13DecryptedRecord, Tls13InnerContentType,
 };

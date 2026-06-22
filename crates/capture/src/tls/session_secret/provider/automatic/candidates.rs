@@ -33,6 +33,20 @@ pub(super) enum Tls13SessionSecretCandidate {
 }
 
 impl Tls13SessionSecretCandidate {
+    fn intent(&self) -> &Tls13SessionSecretBindingIntent {
+        match self {
+            Self::WaitingForMaterial(intent) => intent,
+            Self::Probing(candidate) => candidate.intent(),
+        }
+    }
+
+    fn intent_mut(&mut self) -> &mut Tls13SessionSecretBindingIntent {
+        match self {
+            Self::WaitingForMaterial(intent) => intent,
+            Self::Probing(candidate) => candidate.intent_mut(),
+        }
+    }
+
     fn has_buffered_event(&self) -> bool {
         match self {
             Self::WaitingForMaterial(_) => false,
@@ -161,6 +175,18 @@ impl Tls13SessionSecretCandidateSet {
             }
         }
         self.debug_assert_single_held_candidate();
+    }
+
+    pub(super) fn update_flow_candidates(
+        &mut self,
+        flow: &FlowIdentity,
+        mut update: impl FnMut(&mut Tls13SessionSecretBindingIntent),
+    ) {
+        for slot in self.candidates.values_mut() {
+            if slot.candidate.intent().flow().id == *flow {
+                update(slot.candidate.intent_mut());
+            }
+        }
     }
 
     pub(super) fn has_buffered_candidate(&self) -> bool {

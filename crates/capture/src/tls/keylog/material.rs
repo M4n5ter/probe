@@ -25,6 +25,10 @@ impl TlsKeyLog {
         Ok(Self { entries })
     }
 
+    pub fn parse_live_snapshot(bytes: &[u8]) -> Result<Self, TlsKeyLogParseError> {
+        Self::parse(complete_live_snapshot_bytes(bytes))
+    }
+
     pub fn entries(&self) -> &[TlsKeyLogEntry] {
         &self.entries
     }
@@ -247,6 +251,21 @@ fn is_valid_label(label: &str) -> bool {
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+fn complete_live_snapshot_bytes(bytes: &[u8]) -> &[u8] {
+    if ends_with_lf(bytes) {
+        return bytes;
+    }
+    bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|last_newline| &bytes[..=last_newline])
+        .unwrap_or_default()
+}
+
+fn ends_with_lf(bytes: &[u8]) -> bool {
+    bytes.last().is_some_and(|byte| *byte == b'\n')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +374,47 @@ CLIENT_RANDOM 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 2
                 actual_bytes: 3,
             }
         );
+    }
+
+    #[test]
+    fn live_snapshot_ignores_unterminated_tail_even_when_tail_is_syntactically_valid() {
+        let material = format!(
+            "CLIENT_TRAFFIC_SECRET_0 {} {}\nCLIENT_TRAFFIC_SECRET_0 {} aa",
+            "00".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32)
+        );
+
+        let key_log =
+            TlsKeyLog::parse_live_snapshot(material.as_bytes()).expect("valid live snapshot");
+
+        assert_eq!(key_log.entries().len(), 1);
+        assert_eq!(key_log.entries()[0].secret().as_bytes(), vec![0x11; 32]);
+    }
+
+    #[test]
+    fn live_snapshot_treats_trailing_cr_as_unterminated_tail() {
+        let material = format!(
+            "CLIENT_TRAFFIC_SECRET_0 {} {}\r\nCLIENT_TRAFFIC_SECRET_0 {} aa\r",
+            "00".repeat(32),
+            "11".repeat(32),
+            "22".repeat(32)
+        );
+
+        let key_log =
+            TlsKeyLog::parse_live_snapshot(material.as_bytes()).expect("valid live snapshot");
+
+        assert_eq!(key_log.entries().len(), 1);
+        assert_eq!(key_log.entries()[0].secret().as_bytes(), vec![0x11; 32]);
+    }
+
+    #[test]
+    fn live_snapshot_without_any_complete_line_is_empty() {
+        let material = format!("CLIENT_TRAFFIC_SECRET_0 {} aa", "00".repeat(32),);
+
+        let key_log =
+            TlsKeyLog::parse_live_snapshot(material.as_bytes()).expect("empty live snapshot");
+
+        assert!(key_log.entries().is_empty());
     }
 }

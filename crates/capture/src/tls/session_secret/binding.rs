@@ -5,8 +5,9 @@ use thiserror::Error;
 
 use super::super::{TlsMaterialLookup, TlsRandom};
 use super::{
+    Tls13ApplicationTrafficSecret, Tls13DecryptError,
     material::{
-        TlsSessionSecretKind, TlsSessionSecretProtocol, TlsSessionSecretRecord,
+        TlsCipherSuite, TlsSessionSecretKind, TlsSessionSecretProtocol, TlsSessionSecretRecord,
         TlsSessionSecretStore,
     },
     stream::Tls13SessionSecretStreamCursor,
@@ -14,7 +15,7 @@ use super::{
 
 #[derive(Debug, Clone)]
 pub struct Tls13SessionSecretFlowBinding {
-    pub(in crate::tls::session_secret) record: TlsSessionSecretRecord,
+    pub(in crate::tls::session_secret) traffic_secret: Tls13ApplicationTrafficSecret,
     pub(in crate::tls::session_secret) flow: FlowContext,
     pub(in crate::tls::session_secret) direction: Direction,
     pub(in crate::tls::session_secret) cursor: Tls13SessionSecretStreamCursor,
@@ -24,13 +25,13 @@ pub struct Tls13SessionSecretFlowBinding {
 
 impl Tls13SessionSecretFlowBinding {
     pub(in crate::tls::session_secret) fn resume_at(
-        record: TlsSessionSecretRecord,
+        traffic_secret: Tls13ApplicationTrafficSecret,
         flow: FlowContext,
         direction: Direction,
         cursor: Tls13SessionSecretStreamCursor,
     ) -> Self {
         Self {
-            record,
+            traffic_secret,
             flow,
             direction,
             cursor,
@@ -84,6 +85,7 @@ pub struct Tls13SessionSecretFlowCandidate {
     client_random: TlsRandom,
     secret_kind: Tls13ApplicationTrafficSecretKind,
     lookup_time: Option<TlsSessionSecretLookupTime>,
+    observed_cipher_suite: Option<TlsCipherSuite>,
     cursor: Tls13SessionSecretStreamCursor,
 }
 
@@ -116,12 +118,18 @@ impl Tls13SessionSecretFlowCandidate {
             client_random,
             secret_kind,
             lookup_time: None,
+            observed_cipher_suite: None,
             cursor,
         }
     }
 
     pub fn with_lookup_time(mut self, lookup_time: TlsSessionSecretLookupTime) -> Self {
         self.lookup_time = Some(lookup_time);
+        self
+    }
+
+    pub fn with_observed_cipher_suite(mut self, cipher_suite: TlsCipherSuite) -> Self {
+        self.observed_cipher_suite = Some(cipher_suite);
         self
     }
 }
@@ -197,12 +205,21 @@ impl<'a> Tls13SessionSecretFlowBindingPlanner<'a> {
             &candidate.client_random,
             at_wall_time_unix_ns,
         ) {
-            TlsMaterialLookup::Found(record) => Ok(Tls13SessionSecretFlowBinding::resume_at(
-                record.clone(),
-                candidate.flow,
-                candidate.direction,
-                candidate.cursor,
-            )),
+            TlsMaterialLookup::Found(record) => {
+                let traffic_secret = resolve_application_traffic_secret(
+                    record,
+                    candidate.observed_cipher_suite,
+                    candidate.client_random,
+                    secret_kind,
+                    at_wall_time_unix_ns,
+                )?;
+                Ok(Tls13SessionSecretFlowBinding::resume_at(
+                    traffic_secret,
+                    candidate.flow,
+                    candidate.direction,
+                    candidate.cursor,
+                ))
+            }
             TlsMaterialLookup::Missing => {
                 Err(Tls13SessionSecretFlowBindingPlanError::MissingSecret {
                     client_random: candidate.client_random,
@@ -220,6 +237,51 @@ impl<'a> Tls13SessionSecretFlowBindingPlanner<'a> {
             }
         }
     }
+}
+
+fn resolve_application_traffic_secret(
+    record: &TlsSessionSecretRecord,
+    observed_cipher_suite: Option<TlsCipherSuite>,
+    client_random: TlsRandom,
+    secret_kind: TlsSessionSecretKind,
+    at_wall_time_unix_ns: Option<u64>,
+) -> Result<Tls13ApplicationTrafficSecret, Tls13SessionSecretFlowBindingPlanError> {
+    let cipher_suite = match (record.cipher_suite(), observed_cipher_suite) {
+        (Some(material_cipher_suite), Some(observed_cipher_suite))
+            if material_cipher_suite != observed_cipher_suite =>
+        {
+            return Err(
+                Tls13SessionSecretFlowBindingPlanError::CipherSuiteMismatch {
+                    client_random,
+                    secret_kind,
+                    at_wall_time_unix_ns,
+                    material_cipher_suite,
+                    observed_cipher_suite,
+                },
+            );
+        }
+        (Some(material_cipher_suite), _) => material_cipher_suite,
+        (None, Some(observed_cipher_suite)) => observed_cipher_suite,
+        (None, None) => {
+            return Err(Tls13SessionSecretFlowBindingPlanError::MissingCipherSuite {
+                client_random,
+                secret_kind,
+                at_wall_time_unix_ns,
+            });
+        }
+    };
+    Tls13ApplicationTrafficSecret::from_resolved_cipher_suite(record, cipher_suite).map_err(
+        |source| Tls13SessionSecretFlowBindingPlanError::InvalidApplicationTrafficSecret {
+            client_random,
+            secret_kind,
+            at_wall_time_unix_ns,
+            source,
+        },
+    )
+}
+
+fn decrypt_error_reason(source: &Tls13DecryptError) -> String {
+    source.to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -240,6 +302,34 @@ pub enum Tls13SessionSecretFlowBindingPlanError {
         secret_kind: TlsSessionSecretKind,
         at_wall_time_unix_ns: Option<u64>,
         matches: usize,
+    },
+    #[error(
+        "TLS 1.3 session secret for client_random {client_random:?} secret_kind {secret_kind:?} at {at_wall_time_unix_ns:?} requires observed cipher_suite"
+    )]
+    MissingCipherSuite {
+        client_random: TlsRandom,
+        secret_kind: TlsSessionSecretKind,
+        at_wall_time_unix_ns: Option<u64>,
+    },
+    #[error(
+        "TLS 1.3 session secret for client_random {client_random:?} secret_kind {secret_kind:?} at {at_wall_time_unix_ns:?} has cipher_suite {material_cipher_suite:?}, but observed ServerHello selected {observed_cipher_suite:?}"
+    )]
+    CipherSuiteMismatch {
+        client_random: TlsRandom,
+        secret_kind: TlsSessionSecretKind,
+        at_wall_time_unix_ns: Option<u64>,
+        material_cipher_suite: TlsCipherSuite,
+        observed_cipher_suite: TlsCipherSuite,
+    },
+    #[error(
+        "TLS 1.3 session secret for client_random {client_random:?} secret_kind {secret_kind:?} at {at_wall_time_unix_ns:?} is not usable for application data decrypt: {}",
+        decrypt_error_reason(source)
+    )]
+    InvalidApplicationTrafficSecret {
+        client_random: TlsRandom,
+        secret_kind: TlsSessionSecretKind,
+        at_wall_time_unix_ns: Option<u64>,
+        source: Tls13DecryptError,
     },
 }
 
@@ -375,6 +465,104 @@ mod tests {
                 secret_kind: TlsSessionSecretKind::ClientApplicationTraffic,
                 at_wall_time_unix_ns: None,
                 matches: 2,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn planner_uses_observed_cipher_suite_when_material_omits_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = session_secret_store(session_secret_record_json_without_cipher_suite(
+            CLIENT_RANDOM,
+            TlsSessionSecretKind::ClientApplicationTraffic,
+            SHA256_TRAFFIC_SECRET,
+        ))?;
+        let client_random = TlsRandom::from_hex(CLIENT_RANDOM).expect("valid client random");
+        let flow = demo_flow();
+
+        let binding = Tls13SessionSecretFlowBindingPlanner::new(&store).plan(
+            Tls13SessionSecretFlowCandidate::start(
+                flow,
+                Direction::Outbound,
+                client_random,
+                Tls13ApplicationTrafficSecretKind::Client,
+            )
+            .with_observed_cipher_suite(TlsCipherSuite::from_code(0x1301)),
+        )?;
+
+        assert_eq!(
+            store.records()[0].cipher_suite(),
+            None,
+            "observed handshake metadata must not mutate imported material"
+        );
+        assert_eq!(
+            binding.traffic_secret.cipher_suite(),
+            TlsCipherSuite::from_code(0x1301)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn planner_rejects_observed_cipher_suite_conflict() -> Result<(), Box<dyn std::error::Error>> {
+        let store = session_secret_store(session_secret_record_json(
+            CLIENT_RANDOM,
+            TlsSessionSecretKind::ClientApplicationTraffic,
+            SHA256_TRAFFIC_SECRET,
+            None,
+        ))?;
+        let client_random = TlsRandom::from_hex(CLIENT_RANDOM).expect("valid client random");
+
+        let error = Tls13SessionSecretFlowBindingPlanner::new(&store)
+            .plan(
+                Tls13SessionSecretFlowCandidate::start(
+                    demo_flow(),
+                    Direction::Outbound,
+                    client_random,
+                    Tls13ApplicationTrafficSecretKind::Client,
+                )
+                .with_observed_cipher_suite(TlsCipherSuite::from_code(0x1302)),
+            )
+            .expect_err("observed ServerHello suite must constrain material metadata");
+
+        assert_eq!(
+            error,
+            Tls13SessionSecretFlowBindingPlanError::CipherSuiteMismatch {
+                client_random,
+                secret_kind: TlsSessionSecretKind::ClientApplicationTraffic,
+                at_wall_time_unix_ns: None,
+                material_cipher_suite: TlsCipherSuite::from_code(0x1301),
+                observed_cipher_suite: TlsCipherSuite::from_code(0x1302),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn planner_requires_cipher_suite_from_material_or_observed_handshake()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = session_secret_store(session_secret_record_json_without_cipher_suite(
+            CLIENT_RANDOM,
+            TlsSessionSecretKind::ClientApplicationTraffic,
+            SHA256_TRAFFIC_SECRET,
+        ))?;
+        let client_random = TlsRandom::from_hex(CLIENT_RANDOM).expect("valid client random");
+
+        let error = Tls13SessionSecretFlowBindingPlanner::new(&store)
+            .plan(Tls13SessionSecretFlowCandidate::start(
+                demo_flow(),
+                Direction::Outbound,
+                client_random,
+                Tls13ApplicationTrafficSecretKind::Client,
+            ))
+            .expect_err("record without cipher suite needs observed handshake metadata");
+
+        assert_eq!(
+            error,
+            Tls13SessionSecretFlowBindingPlanError::MissingCipherSuite {
+                client_random,
+                secret_kind: TlsSessionSecretKind::ClientApplicationTraffic,
+                at_wall_time_unix_ns: None,
             }
         );
         Ok(())
@@ -519,6 +707,24 @@ mod tests {
             .unwrap_or_default();
         format!(
             r#"{{"protocol":"tls13","secret_kind":"{kind}","client_random":"{client_random}","secret":"{secret}","cipher_suite":"0x1301"{validity}}}"#
+        )
+    }
+
+    fn session_secret_record_json_without_cipher_suite(
+        client_random: &str,
+        secret_kind: TlsSessionSecretKind,
+        secret: &str,
+    ) -> String {
+        let kind = match secret_kind {
+            TlsSessionSecretKind::ClientApplicationTraffic => "client_application_traffic_secret",
+            TlsSessionSecretKind::ServerApplicationTraffic => "server_application_traffic_secret",
+            TlsSessionSecretKind::ClientHandshakeTraffic => "client_handshake_traffic_secret",
+            TlsSessionSecretKind::ServerHandshakeTraffic => "server_handshake_traffic_secret",
+            TlsSessionSecretKind::Exporter => "exporter_secret",
+            TlsSessionSecretKind::Master => "master_secret",
+        };
+        format!(
+            r#"{{"protocol":"tls13","secret_kind":"{kind}","client_random":"{client_random}","secret":"{secret}"}}"#
         )
     }
 

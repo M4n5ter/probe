@@ -3,7 +3,10 @@ use thiserror::Error;
 
 use crate::{PlaintextChunk, PlaintextEvent, PlaintextSource};
 
-use super::{Tls13ApplicationDataDecryptor, Tls13DecryptError, TlsSessionSecretRecord};
+use super::{
+    Tls13ApplicationDataDecryptor, Tls13ApplicationTrafficSecret, Tls13DecryptError,
+    TlsSessionSecretRecord,
+};
 
 #[derive(Debug)]
 pub struct Tls13SessionSecretPlaintextAdapter {
@@ -20,8 +23,22 @@ impl Tls13SessionSecretPlaintextAdapter {
         flow: FlowContext,
         direction: Direction,
     ) -> Result<Self, Tls13SessionSecretPlaintextError> {
+        Self::from_application_traffic_secret(
+            &Tls13ApplicationTrafficSecret::from_session_secret_record(record)?,
+            flow,
+            direction,
+        )
+    }
+
+    pub(in crate::tls::session_secret) fn from_application_traffic_secret(
+        traffic_secret: &Tls13ApplicationTrafficSecret,
+        flow: FlowContext,
+        direction: Direction,
+    ) -> Result<Self, Tls13SessionSecretPlaintextError> {
         Ok(Self {
-            decryptor: Tls13ApplicationDataDecryptor::from_session_secret_record(record)?,
+            decryptor: Tls13ApplicationDataDecryptor::from_application_traffic_secret(
+                traffic_secret,
+            )?,
             flow,
             direction,
             next_stream_offset: 0,

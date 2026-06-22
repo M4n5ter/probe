@@ -112,6 +112,7 @@ mod tests {
     use super::super::super::super::TlsSessionSecretStore;
     use super::fixture::*;
     use super::*;
+    use crate::tls::TlsKeyLog;
 
     #[test]
     fn auto_binding_provider_binds_after_authenticated_application_record()
@@ -168,6 +169,75 @@ mod tests {
         assert_next_libpcap_bytes(&mut provider, client_hello.as_slice())?;
         provider.replace_store(store);
         let bytes = assert_next_tls_session_secret_bytes(&mut provider, b"GET / HTTP/1.1\r\n\r\n")?;
+        assert!(bytes.degraded);
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn auto_binding_provider_uses_server_hello_cipher_suite_for_key_log_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let AutoBindingFixture {
+            flow,
+            client_hello,
+            application_record,
+            ..
+        } = auto_binding_fixture()?;
+        let key_log = TlsKeyLog::parse(
+            format!("CLIENT_TRAFFIC_SECRET_0 {CLIENT_RANDOM} {SHA256_TRAFFIC_SECRET}\n").as_bytes(),
+        )?;
+        let store = TlsSessionSecretStore::from_tls_key_log(&key_log)?
+            .expect("key log should produce client application traffic material");
+        assert!(store.records()[0].cipher_suite().is_none());
+        let server_hello = tls_server_hello_record();
+        let mut provider = auto_provider(
+            store,
+            [
+                outbound_bytes_event(&flow, 0, client_hello.clone()),
+                CaptureEvent::Bytes(inbound_captured_bytes(&flow, 0, server_hello.clone())),
+                outbound_bytes_event(&flow, client_hello.len() as u64, application_record),
+            ],
+        );
+
+        assert_next_libpcap_bytes(&mut provider, client_hello.as_slice())?;
+        assert_next_libpcap_bytes(&mut provider, server_hello.as_slice())?;
+        let bytes = assert_next_tls_session_secret_bytes(&mut provider, b"GET / HTTP/1.1\r\n\r\n")?;
+
+        assert!(bytes.degraded);
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn auto_binding_provider_uses_server_hello_cipher_suite_for_session_secret_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let AutoBindingFixture {
+            flow,
+            client_hello,
+            application_record,
+            ..
+        } = auto_binding_fixture()?;
+        let store = TlsSessionSecretStore::parse(
+            format!(
+                r#"{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{CLIENT_RANDOM}","secret":"{SHA256_TRAFFIC_SECRET}"}}"#
+            )
+            .as_bytes(),
+        )?;
+        assert!(store.records()[0].cipher_suite().is_none());
+        let server_hello = tls_server_hello_record();
+        let mut provider = auto_provider(
+            store,
+            [
+                outbound_bytes_event(&flow, 0, client_hello.clone()),
+                CaptureEvent::Bytes(inbound_captured_bytes(&flow, 0, server_hello.clone())),
+                outbound_bytes_event(&flow, client_hello.len() as u64, application_record),
+            ],
+        );
+
+        assert_next_libpcap_bytes(&mut provider, client_hello.as_slice())?;
+        assert_next_libpcap_bytes(&mut provider, server_hello.as_slice())?;
+        let bytes = assert_next_tls_session_secret_bytes(&mut provider, b"GET / HTTP/1.1\r\n\r\n")?;
+
         assert!(bytes.degraded);
         assert!(provider.next()?.is_none());
         Ok(())

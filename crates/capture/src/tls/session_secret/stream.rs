@@ -5,7 +5,8 @@ use thiserror::Error;
 use crate::{PlaintextEvent, PlaintextGap, PlaintextSource};
 
 use super::{
-    Tls13SessionSecretPlaintextAdapter, Tls13SessionSecretPlaintextError, TlsSessionSecretRecord,
+    Tls13ApplicationTrafficSecret, Tls13SessionSecretPlaintextAdapter,
+    Tls13SessionSecretPlaintextError, TlsSessionSecretRecord,
     binding::Tls13SessionSecretMissingPlaintextPrefix,
     frame::{Tls13BufferedRecord, Tls13RecordFrame},
 };
@@ -42,6 +43,22 @@ impl Tls13SessionSecretStreamAdapter {
         Ok(Self::new(
             Tls13SessionSecretPlaintextAdapter::from_session_secret_record(
                 record, flow, direction,
+            )?,
+            cursor,
+        ))
+    }
+
+    pub(in crate::tls::session_secret) fn from_application_traffic_secret_with_cursor(
+        traffic_secret: &Tls13ApplicationTrafficSecret,
+        flow: FlowContext,
+        direction: Direction,
+        cursor: Tls13SessionSecretStreamCursor,
+    ) -> Result<Self, Tls13SessionSecretStreamError> {
+        Ok(Self::new(
+            Tls13SessionSecretPlaintextAdapter::from_application_traffic_secret(
+                traffic_secret,
+                flow,
+                direction,
             )?,
             cursor,
         ))
