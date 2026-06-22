@@ -4,7 +4,8 @@ use super::{
     plan::InboundTproxyLifecyclePlan,
 };
 use crate::transparent_interception::{
-    ManagedTransparentProxyGuard, TransparentInterceptionError, start_managed_proxy,
+    ManagedTransparentProxyGuard, TransparentInterceptionError,
+    proxy::{TransparentProxyRuntime, start_managed_proxy},
 };
 use interception::TransparentInterceptionHostRuleScope;
 use probe_config::EnforcementInterceptionConfig;
@@ -14,15 +15,27 @@ pub(in crate::transparent_interception) struct NftablesTransparentInterception {
     nft: Box<dyn NftCommand + Send>,
     ip: Option<Box<dyn IpCommand + Send>>,
     owner_lock: Box<dyn NftablesOwnerLock>,
+    proxy_runtime: TransparentProxyRuntime,
 }
 
 impl NftablesTransparentInterception {
-    pub(super) fn new<N, I>(config: EnforcementInterceptionConfig, nft: N, ip: Option<I>) -> Self
+    pub(super) fn new<N, I>(
+        config: EnforcementInterceptionConfig,
+        nft: N,
+        ip: Option<I>,
+        proxy_runtime: TransparentProxyRuntime,
+    ) -> Self
     where
         N: NftCommand + Send + 'static,
         I: IpCommand + Send + 'static,
     {
-        Self::with_owner_lock(config, nft, ip, SystemNftablesOwnerLock::default())
+        Self::with_owner_lock(
+            config,
+            nft,
+            ip,
+            SystemNftablesOwnerLock::default(),
+            proxy_runtime,
+        )
     }
 
     fn with_owner_lock<N, I, L>(
@@ -30,6 +43,7 @@ impl NftablesTransparentInterception {
         nft: N,
         ip: Option<I>,
         owner_lock: L,
+        proxy_runtime: TransparentProxyRuntime,
     ) -> Self
     where
         N: NftCommand + Send + 'static,
@@ -41,6 +55,7 @@ impl NftablesTransparentInterception {
             nft: Box::new(nft),
             ip: ip.map(|ip| Box::new(ip) as Box<dyn IpCommand + Send>),
             owner_lock: Box::new(owner_lock),
+            proxy_runtime,
         }
     }
 
@@ -50,7 +65,14 @@ impl NftablesTransparentInterception {
         N: NftCommand + Send + 'static,
         I: IpCommand + Send + 'static,
     {
-        Self::with_owner_lock(config, nft, ip, super::owner_lock::NoopNftablesOwnerLock)
+        let proxy_runtime = TransparentProxyRuntime::for_config(&config);
+        Self::with_owner_lock(
+            config,
+            nft,
+            ip,
+            super::owner_lock::NoopNftablesOwnerLock,
+            proxy_runtime,
+        )
     }
 
     pub(in crate::transparent_interception) fn activate(
@@ -63,7 +85,11 @@ impl NftablesTransparentInterception {
         check_nft_script(self.nft.as_mut(), &setup_script)?;
         let owner_lock = self.owner_lock.acquire(plan.owner_name())?;
         self.cleanup_previous_owned_state_best_effort(&plan);
-        let managed_proxy = start_managed_proxy(&self.config, plan.listener_families())?;
+        let managed_proxy = start_managed_proxy(
+            &self.config,
+            plan.listener_families(),
+            self.proxy_runtime.clone(),
+        )?;
         if let Err(error) = self.install_policy_routes(&plan) {
             self.cleanup_active_plan_best_effort(&plan);
             let _ = stop_managed_proxy_best_effort(managed_proxy);

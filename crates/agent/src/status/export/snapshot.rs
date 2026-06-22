@@ -14,7 +14,7 @@ use crate::export::{
 };
 
 use super::super::{
-    snapshot::SpoolStatusSnapshot,
+    spool::SpoolStatusSnapshot,
     tls::{self, TlsMaterialSourceStatusSnapshot},
 };
 

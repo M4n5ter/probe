@@ -4,11 +4,13 @@ use probe_core::{CapabilityKind, CapabilityState};
 use super::{
     TransparentInterceptionError,
     nftables::{NftablesTransparentInterception, NftablesTransparentInterceptionGuard},
+    proxy::{TransparentProxyRuntime, TransparentProxyRuntimeHandle},
 };
 
 pub(crate) struct TransparentInterceptionRuntime {
     capability: CapabilityState,
     activation: Option<Box<dyn TransparentInterceptionLifecycle>>,
+    proxy_runtime: TransparentProxyRuntime,
 }
 
 pub(super) trait TransparentInterceptionLifecycle: Send {
@@ -25,6 +27,10 @@ pub(super) trait TransparentInterceptionGuardLifecycle {
 impl TransparentInterceptionRuntime {
     pub(crate) fn capability(&self) -> CapabilityState {
         self.capability.clone()
+    }
+
+    pub(crate) fn proxy_runtime_handle(&self) -> TransparentProxyRuntimeHandle {
+        self.proxy_runtime.handle()
     }
 
     pub(crate) fn activate(
@@ -45,18 +51,23 @@ impl TransparentInterceptionRuntime {
             .transpose()
     }
 
-    pub(super) fn unavailable(reason: impl Into<String>) -> Self {
+    pub(super) fn unavailable(
+        reason: impl Into<String>,
+        proxy_runtime: TransparentProxyRuntime,
+    ) -> Self {
         Self {
             capability: CapabilityState::unavailable(
                 CapabilityKind::TransparentInterception,
                 reason,
             ),
             activation: None,
+            proxy_runtime,
         }
     }
 
     pub(super) fn available(
         activation: impl TransparentInterceptionLifecycle + 'static,
+        proxy_runtime: TransparentProxyRuntime,
         note: impl Into<String>,
     ) -> Self {
         Self {
@@ -66,6 +77,7 @@ impl TransparentInterceptionRuntime {
                 reason: Some(note.into()),
             },
             activation: Some(Box::new(activation)),
+            proxy_runtime,
         }
     }
 }

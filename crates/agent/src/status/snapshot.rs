@@ -1,32 +1,30 @@
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pipeline::PipelineRuntimeMetricsSnapshot;
 use probe_config::{CaptureBackend, CaptureSelection};
 use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, RuntimeMode};
-use runtime::{CapturePlanMode, IngressRetentionPlan, RuntimePlan};
+use runtime::{CapturePlanMode, RuntimePlan};
 use serde::Serialize;
-use storage::{FjallSpool, SpoolProbe, SpoolSnapshot};
 
 use crate::configured_enforcement::ActiveEnforcementPolicy;
 use crate::export::ExportWorkerRuntimeSnapshot;
 use crate::tls_plaintext::{
     TlsDecryptHintRuntimeSnapshot, TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot,
 };
+use crate::transparent_interception::TransparentProxyRuntimeSnapshot;
 
 use super::{
     enforcement::{
-        EnforcementStatusSnapshot, enforcement_status, enforcement_status_with_active_policy,
+        EnforcementStatusSnapshot, enforcement_status_with_active_policy,
+        enforcement_status_with_transparent_proxy,
     },
     export::{
-        ExportStatusSnapshot, ExporterStatusSnapshot, backing_off_exporter_count, export_status,
-        exporter_statuses_with_runtime,
+        ExportStatusSnapshot, ExporterStatusSnapshot, export_status, exporter_statuses_with_runtime,
     },
     health::health_snapshot,
+    metrics::{MetricsSnapshot, metrics_snapshot},
     policy::{PolicyStatusSnapshot, policy_status},
+    spool::{SpoolStatusInput, SpoolStatusSnapshot},
     tls::{TlsStatusSnapshot, tls_status},
 };
 
@@ -61,44 +59,6 @@ pub struct CaptureStatusSnapshot {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SpoolStatusSnapshot {
-    pub path: PathBuf,
-    pub mode: RuntimeMode,
-    pub reason: Option<String>,
-    pub ingress_retention: IngressRetentionPlan,
-    pub ingress_last_sequence: Option<u64>,
-    pub export_last_sequence: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct MetricsSnapshot {
-    pub capabilities: CapabilityMetricsSnapshot,
-    pub spool: SpoolMetricsSnapshot,
-    pub export: ExportMetricsSnapshot,
-    pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct CapabilityMetricsSnapshot {
-    pub available: u64,
-    pub degraded: u64,
-    pub unavailable: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct SpoolMetricsSnapshot {
-    pub ingress_last_sequence: Option<u64>,
-    pub export_last_sequence: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct ExportMetricsSnapshot {
-    pub sink_count: u64,
-    pub total_lag: Option<u64>,
-    pub backing_off_sink_count: Option<u64>,
-}
-
 #[derive(Clone, Default)]
 pub struct RuntimeStatusInput {
     pub enforcement: EnforcementRuntimeStatusInput,
@@ -106,6 +66,7 @@ pub struct RuntimeStatusInput {
     pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
     pub tls_decrypt_hints: Option<TlsDecryptHintRuntimeSnapshot>,
     pub tls_plaintext: Option<TlsPlaintextRuntimeSnapshot>,
+    pub transparent_proxy: Option<TransparentProxyRuntimeSnapshot>,
 }
 
 #[derive(Clone, Default)]
@@ -115,51 +76,6 @@ pub enum EnforcementRuntimeStatusInput {
     Runtime {
         active_policy: Box<ActiveEnforcementPolicy>,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpoolStatusInput {
-    pub path: PathBuf,
-    pub mode: RuntimeMode,
-    pub reason: Option<String>,
-    pub snapshot: Option<SpoolSnapshot>,
-    pub export_cursors: BTreeMap<String, u64>,
-}
-
-impl SpoolStatusInput {
-    pub fn available(
-        path: PathBuf,
-        snapshot: SpoolSnapshot,
-        export_cursors: BTreeMap<String, u64>,
-    ) -> Self {
-        Self {
-            path,
-            mode: RuntimeMode::Available,
-            reason: None,
-            snapshot: Some(snapshot),
-            export_cursors,
-        }
-    }
-
-    pub fn unavailable(path: PathBuf, reason: impl Into<String>) -> Self {
-        Self {
-            path,
-            mode: RuntimeMode::Unavailable,
-            reason: Some(reason.into()),
-            snapshot: None,
-            export_cursors: BTreeMap::new(),
-        }
-    }
-
-    pub fn degraded(path: PathBuf, reason: impl Into<String>) -> Self {
-        Self {
-            path,
-            mode: RuntimeMode::Degraded,
-            reason: Some(reason.into()),
-            snapshot: None,
-            export_cursors: BTreeMap::new(),
-        }
-    }
 }
 
 pub fn build_status_snapshot(plan: &RuntimePlan, spool: SpoolStatusInput) -> AgentStatusSnapshot {
@@ -174,72 +90,7 @@ pub fn build_status_snapshot_with_runtime(
     build_status_snapshot_at_with_runtime(plan, spool, current_unix_time_ns(), runtime)
 }
 
-pub fn collect_spool_status(plan: &RuntimePlan) -> SpoolStatusInput {
-    let path = plan.config.storage.path.clone();
-    let probe = match FjallSpool::probe(&path) {
-        Ok(probe) => probe,
-        Err(error) => {
-            return SpoolStatusInput::unavailable(
-                path,
-                format!("failed to inspect spool: {error}"),
-            );
-        }
-    };
-
-    match probe {
-        SpoolProbe::Available {
-            snapshot,
-            export_cursors,
-        } => {
-            let export_cursors = plan
-                .export
-                .sinks
-                .iter()
-                .map(|sink| {
-                    let cursor = export_cursors.get(sink.id()).copied().unwrap_or(0);
-                    (sink.id().to_string(), cursor)
-                })
-                .collect::<BTreeMap<_, _>>();
-            SpoolStatusInput::available(path, snapshot, export_cursors)
-        }
-        SpoolProbe::Busy { reason } => SpoolStatusInput::degraded(path, reason),
-        SpoolProbe::Missing => SpoolStatusInput::unavailable(path, "spool path does not exist"),
-        SpoolProbe::Incomplete { reason } => SpoolStatusInput::unavailable(path, reason),
-    }
-}
-
-pub fn collect_running_spool_status(plan: &RuntimePlan, spool: &FjallSpool) -> SpoolStatusInput {
-    let path = plan.config.storage.path.clone();
-    let snapshot = match spool.snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return SpoolStatusInput::unavailable(
-                path,
-                format!("failed to inspect running spool: {error}"),
-            );
-        }
-    };
-    let mut export_cursors = BTreeMap::new();
-    for sink in &plan.export.sinks {
-        match spool.export_cursor(sink.id()) {
-            Ok(cursor) => {
-                export_cursors.insert(sink.id().to_string(), cursor);
-            }
-            Err(error) => {
-                return SpoolStatusInput::unavailable(
-                    path,
-                    format!(
-                        "failed to inspect export cursor for sink {}: {error}",
-                        sink.id()
-                    ),
-                );
-            }
-        }
-    }
-    SpoolStatusInput::available(path, snapshot, export_cursors)
-}
-
-fn build_status_snapshot_at(
+pub(in crate::status) fn build_status_snapshot_at(
     plan: &RuntimePlan,
     spool: SpoolStatusInput,
     generated_unix_ns: u64,
@@ -268,10 +119,13 @@ fn build_status_snapshot_at_with_runtime(
         export_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_export_sequence),
     };
     let policy = policy_status(plan);
+    let transparent_proxy = runtime.transparent_proxy.clone();
     let enforcement = match &runtime.enforcement {
-        EnforcementRuntimeStatusInput::OfflineInspect => enforcement_status(plan),
+        EnforcementRuntimeStatusInput::OfflineInspect => {
+            enforcement_status_with_transparent_proxy(plan, transparent_proxy.clone())
+        }
         EnforcementRuntimeStatusInput::Runtime { active_policy } => {
-            enforcement_status_with_active_policy(plan, active_policy)
+            enforcement_status_with_active_policy(plan, active_policy, transparent_proxy.clone())
         }
     };
     let capabilities = capabilities_with_runtime(plan, runtime.tls_plaintext.as_ref());
@@ -293,6 +147,7 @@ fn build_status_snapshot_at_with_runtime(
         &spool_status,
         &exporters,
         runtime.export_worker.as_ref(),
+        transparent_proxy,
         runtime.pipeline,
     );
     let health = health_snapshot(plan, &spool_status, &exporters, &policy, &enforcement, &tls);
@@ -349,50 +204,6 @@ fn capabilities_with_runtime(
     )
 }
 
-fn metrics_snapshot(
-    capabilities: &CapabilityMatrix,
-    spool: &SpoolStatusSnapshot,
-    exporters: &[ExporterStatusSnapshot],
-    export_worker: Option<&ExportWorkerRuntimeSnapshot>,
-    pipeline: Option<PipelineRuntimeMetricsSnapshot>,
-) -> MetricsSnapshot {
-    MetricsSnapshot {
-        capabilities: capability_metrics(capabilities),
-        spool: SpoolMetricsSnapshot {
-            ingress_last_sequence: spool.ingress_last_sequence,
-            export_last_sequence: spool.export_last_sequence,
-        },
-        export: ExportMetricsSnapshot {
-            sink_count: exporters.len() as u64,
-            total_lag: total_export_lag(exporters),
-            backing_off_sink_count: export_worker.map(|_| backing_off_exporter_count(exporters)),
-        },
-        pipeline,
-    }
-}
-
-fn capability_metrics(capabilities: &CapabilityMatrix) -> CapabilityMetricsSnapshot {
-    let mut metrics = CapabilityMetricsSnapshot {
-        available: 0,
-        degraded: 0,
-        unavailable: 0,
-    };
-    for state in capabilities.states() {
-        match state.mode {
-            RuntimeMode::Available => metrics.available += 1,
-            RuntimeMode::Degraded => metrics.degraded += 1,
-            RuntimeMode::Unavailable => metrics.unavailable += 1,
-        }
-    }
-    metrics
-}
-
-fn total_export_lag(exporters: &[ExporterStatusSnapshot]) -> Option<u64> {
-    exporters.iter().try_fold(0_u64, |total, exporter| {
-        exporter.lag.map(|lag| total.saturating_add(lag))
-    })
-}
-
 fn current_unix_time_ns() -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -403,7 +214,7 @@ fn current_unix_time_ns() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{collections::BTreeMap, fs, path::PathBuf};
 
     use super::super::plan_fixture::{
         config_with_storage_path, runtime_plan_from_config, test_dir,
@@ -414,13 +225,18 @@ mod tests {
         TlsMaterialKind,
     };
     use probe_core::{
-        Action, CapabilityKind, CapabilityState, ProtectiveActionProfile, SpoolPayloadSchema,
+        Action, CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector,
+        ProtectiveActionProfile, Selector, TrafficSelector,
     };
     use runtime::{ExportFailureBackoffPlan, ExportWorkerPlan};
     use serde_json::json;
-    use storage::SpoolPayload;
+    use storage::SpoolSnapshot;
 
-    use crate::tls_plaintext::{TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot};
+    use crate::{
+        configured_enforcement::ActiveEnforcementPolicy,
+        tls_plaintext::{TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot},
+        transparent_interception::{TransparentProxyRuntimeMode, TransparentProxyRuntimeSnapshot},
+    };
 
     #[test]
     fn status_snapshot_reports_sink_lag_and_health() -> Result<(), Box<dyn std::error::Error>> {
@@ -611,6 +427,107 @@ mod tests {
         assert_eq!(
             value["exporters"][0]["runtime"]["mode"],
             json!("backing_off")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_snapshot_reports_transparent_proxy_runtime_metrics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_with_managed_transparent_proxy()?;
+        let runtime = RuntimeStatusInput {
+            enforcement: EnforcementRuntimeStatusInput::Runtime {
+                active_policy: Box::new(ActiveEnforcementPolicy::new(
+                    None,
+                    ProtectiveActionProfile::default(),
+                    None,
+                )?),
+            },
+            transparent_proxy: Some(TransparentProxyRuntimeSnapshot {
+                mode: TransparentProxyRuntimeMode::Configured,
+                listener_families: Vec::new(),
+                active_relays: 2,
+                accepted_relays: 3,
+                rejected_relays: 5,
+                relay_failures: 7,
+                listener_failures: 11,
+            }),
+            ..RuntimeStatusInput::default()
+        };
+
+        let snapshot = build_status_snapshot_at_with_runtime(
+            &plan,
+            available_spool_input(PathBuf::from("/tmp/sssa-spool")),
+            42,
+            runtime,
+        );
+
+        let proxy_metrics = snapshot
+            .metrics
+            .transparent_proxy
+            .expect("transparent proxy metrics should be reported");
+        assert_eq!(proxy_metrics.active_relays, 2);
+        assert_eq!(proxy_metrics.accepted_relays, 3);
+        assert_eq!(proxy_metrics.rejected_relays, 5);
+        assert_eq!(proxy_metrics.relay_failures, 7);
+        assert_eq!(proxy_metrics.listener_failures, 11);
+        let runtime_proxy = snapshot
+            .enforcement
+            .interception
+            .runtime_proxy
+            .as_ref()
+            .expect("transparent proxy runtime should be reported");
+        assert!(runtime_proxy.listener_families.is_empty());
+        let value = serde_json::to_value(&snapshot)?;
+        assert_eq!(
+            value["enforcement"]["interception"]["runtime_proxy"]["mode"],
+            json!("configured")
+        );
+        assert_eq!(
+            value["metrics"]["transparent_proxy"]["active_relays"],
+            json!(2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_transparent_proxy_runtime_makes_health_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_with_managed_transparent_proxy()?;
+        let runtime = RuntimeStatusInput {
+            enforcement: EnforcementRuntimeStatusInput::Runtime {
+                active_policy: Box::new(ActiveEnforcementPolicy::new(
+                    None,
+                    ProtectiveActionProfile::default(),
+                    None,
+                )?),
+            },
+            transparent_proxy: Some(TransparentProxyRuntimeSnapshot {
+                mode: TransparentProxyRuntimeMode::Failed,
+                listener_families: Vec::new(),
+                active_relays: 0,
+                accepted_relays: 1,
+                rejected_relays: 0,
+                relay_failures: 0,
+                listener_failures: 1,
+            }),
+            ..RuntimeStatusInput::default()
+        };
+
+        let snapshot = build_status_snapshot_at_with_runtime(
+            &plan,
+            available_spool_input(PathBuf::from("/tmp/sssa-spool")),
+            42,
+            runtime,
+        );
+
+        assert_eq!(snapshot.health.mode, RuntimeMode::Unavailable);
+        assert!(
+            snapshot
+                .health
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("transparent proxy failed"))
         );
         Ok(())
     }
@@ -901,70 +818,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn collect_spool_status_does_not_initialize_empty_directory()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("status-empty-spool")?;
-        let plan = runtime_plan(temp.to_path_buf(), Vec::new())?;
-
-        let spool = collect_spool_status(&plan);
-
-        assert_eq!(spool.mode, RuntimeMode::Unavailable);
-        assert!(
-            spool
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("marker is missing"))
-        );
-        assert!(temp.read_dir()?.next().is_none());
-        fs::remove_dir_all(temp)?;
-        Ok(())
-    }
-
-    #[test]
-    fn collect_spool_status_reports_initialized_spool_cursor()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("status-initialized-spool")?;
-        let spool = FjallSpool::open(&temp)?;
-        spool.append_export(test_payload(b"one"))?;
-        spool.append_export(test_payload(b"two"))?;
-        spool.ack_export("primary", 1)?;
-        drop(spool);
-        let plan = runtime_plan(temp.to_path_buf(), Vec::new())?;
-
-        let status = collect_spool_status(&plan);
-        let snapshot = build_status_snapshot_at(&plan, status, 42);
-
-        assert_eq!(snapshot.spool.mode, RuntimeMode::Available);
-        assert_eq!(snapshot.spool.export_last_sequence, Some(2));
-        assert_eq!(snapshot.exporters[0].cursor, Some(1));
-        assert_eq!(snapshot.exporters[0].lag, Some(1));
-        fs::remove_dir_all(temp)?;
-        Ok(())
-    }
-
-    #[test]
-    fn collect_running_spool_status_reads_open_spool_without_probe_lock()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("status-running-spool")?;
-        let spool = FjallSpool::open(&temp)?;
-        spool.append_export(test_payload(b"one"))?;
-        spool.append_export(test_payload(b"two"))?;
-        spool.ack_export("primary", 1)?;
-        let plan = runtime_plan(temp.to_path_buf(), Vec::new())?;
-
-        let status = collect_running_spool_status(&plan, &spool);
-        let snapshot = build_status_snapshot_at(&plan, status, 42);
-
-        assert_eq!(snapshot.spool.mode, RuntimeMode::Available);
-        assert_eq!(snapshot.spool.export_last_sequence, Some(2));
-        assert_eq!(snapshot.exporters[0].cursor, Some(1));
-        assert_eq!(snapshot.exporters[0].lag, Some(1));
-        drop(spool);
-        fs::remove_dir_all(temp)?;
-        Ok(())
-    }
-
     fn available_spool_input(path: PathBuf) -> SpoolStatusInput {
         SpoolStatusInput::available(
             path,
@@ -980,14 +833,36 @@ mod tests {
         runtime_plan(PathBuf::from("/tmp/sssa-spool"), Vec::new())
     }
 
+    fn runtime_plan_with_managed_transparent_proxy() -> Result<RuntimePlan, runtime::RuntimeError> {
+        let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            probe_config::TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        config.enforcement.interception.proxy = probe_config::TransparentInterceptionProxyConfig {
+            mode: probe_config::TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+            listen_port: Some(15001),
+        };
+        runtime_plan_from_config(
+            config,
+            vec![CapabilityState::available(
+                CapabilityKind::TransparentInterception,
+            )],
+        )
+    }
+
     fn runtime_plan(
         storage_path: PathBuf,
         capabilities: Vec<CapabilityState>,
     ) -> Result<RuntimePlan, runtime::RuntimeError> {
         runtime_plan_from_config(config_with_storage_path(storage_path), capabilities)
-    }
-
-    fn test_payload(bytes: &[u8]) -> SpoolPayload {
-        SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeSubjectOriginJson, bytes)
     }
 }

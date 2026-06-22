@@ -12,11 +12,14 @@ use self::{
     plan::InboundTproxyLifecyclePlan,
     probe::{NftablesInterceptionProbe, NftablesInterceptionProbeResult},
 };
-use super::TransparentInterceptionRuntime;
+use super::{TransparentInterceptionRuntime, proxy::TransparentProxyRuntime};
 
 pub(super) use lifecycle::{NftablesTransparentInterception, NftablesTransparentInterceptionGuard};
 
-pub(super) fn resolve(config: &EnforcementInterceptionConfig) -> TransparentInterceptionRuntime {
+pub(super) fn resolve(
+    config: &EnforcementInterceptionConfig,
+    proxy_runtime: TransparentProxyRuntime,
+) -> TransparentInterceptionRuntime {
     match NftablesInterceptionProbe::default().resolve() {
         NftablesInterceptionProbeResult::Available { nft, ip } => {
             TransparentInterceptionRuntime::available(
@@ -24,7 +27,9 @@ pub(super) fn resolve(config: &EnforcementInterceptionConfig) -> TransparentInte
                     config.clone(),
                     SystemNft::new(nft),
                     ip.map(SystemIp::new),
+                    proxy_runtime.clone(),
                 ),
+                proxy_runtime,
                 "transparent interception nftables lifecycle entrypoints are available; run will check the final selector-projected rules before acquiring the owner lock and installing them",
             )
         }
@@ -33,6 +38,7 @@ pub(super) fn resolve(config: &EnforcementInterceptionConfig) -> TransparentInte
                 capability
                     .reason
                     .unwrap_or_else(|| "transparent interception is unavailable".to_string()),
+                proxy_runtime,
             )
         }
     }

@@ -4,6 +4,7 @@ use crate::configured_enforcement::{
     ActiveEnforcementPolicy, EnforcementPolicySourceInspection, LoadedEnforcementPolicySource,
     LoadedEnforcementPolicySourceOriginRef, inspect_enforcement_policy_source,
 };
+use crate::transparent_interception::TransparentProxyRuntimeSnapshot;
 use probe_config::{ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig};
 use probe_core::{CapabilityKind, EnforcementMode, ProtectiveActionProfile, RuntimeMode};
 use runtime::{
@@ -39,6 +40,7 @@ pub struct EnforcementInterceptionStatusSnapshot {
     pub local_setup_scope: TransparentInterceptionLocalSetupScopePlan,
     pub selector_configured: bool,
     pub capability: EnforcementCapabilityStatusSnapshot,
+    pub runtime_proxy: Option<TransparentProxyRuntimeSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -101,20 +103,33 @@ pub struct EnforcementPolicyManifestStatusSnapshot {
     pub protective_actions: ProtectiveActionProfile,
 }
 
-pub(in crate::status) fn enforcement_status(plan: &RuntimePlan) -> EnforcementStatusSnapshot {
-    enforcement_status_with_source(plan, EnforcementPolicyStatusSource::Offline)
+pub(in crate::status) fn enforcement_status_with_transparent_proxy(
+    plan: &RuntimePlan,
+    transparent_proxy: Option<TransparentProxyRuntimeSnapshot>,
+) -> EnforcementStatusSnapshot {
+    enforcement_status_with_source(
+        plan,
+        EnforcementPolicyStatusSource::Offline,
+        transparent_proxy,
+    )
 }
 
 pub(in crate::status) fn enforcement_status_with_active_policy(
     plan: &RuntimePlan,
     policy: &ActiveEnforcementPolicy,
+    transparent_proxy: Option<TransparentProxyRuntimeSnapshot>,
 ) -> EnforcementStatusSnapshot {
-    enforcement_status_with_source(plan, EnforcementPolicyStatusSource::Active(policy))
+    enforcement_status_with_source(
+        plan,
+        EnforcementPolicyStatusSource::Active(policy),
+        transparent_proxy,
+    )
 }
 
 fn enforcement_status_with_source(
     plan: &RuntimePlan,
     source: EnforcementPolicyStatusSource<'_>,
+    transparent_proxy: Option<TransparentProxyRuntimeSnapshot>,
 ) -> EnforcementStatusSnapshot {
     let configured_mode = plan.enforcement.mode;
     let policy = enforcement_policy_status(plan, source);
@@ -143,6 +158,7 @@ fn enforcement_status_with_source(
             local_setup_scope: plan.enforcement.interception.local_setup_scope.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,
             capability: enforcement_capability_status(&plan.enforcement.interception.capability),
+            runtime_proxy: transparent_proxy,
         },
         policy: policy.snapshot,
         mode_capability,
@@ -503,7 +519,7 @@ protective_actions = ["alert"]
             Some(policy_source),
         )?;
 
-        let status = enforcement_status_with_active_policy(&plan, &active_policy);
+        let status = enforcement_status_with_active_policy(&plan, &active_policy, None);
 
         let EnforcementPolicySourceStatusSnapshot::Loaded {
             source: LoadedEnforcementPolicySourceStatusSnapshot::Remote { endpoint: actual },
@@ -662,5 +678,9 @@ protective_actions = ["alert"]
             json!("transparent_interception")
         );
         Ok(())
+    }
+
+    fn enforcement_status(plan: &RuntimePlan) -> EnforcementStatusSnapshot {
+        enforcement_status_with_transparent_proxy(plan, None)
     }
 }

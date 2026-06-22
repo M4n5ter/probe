@@ -33,6 +33,7 @@ use crate::status::{
     render_prometheus_metrics,
 };
 use crate::tls_plaintext::{TlsDecryptHintRuntimeState, TlsPlaintextRuntimeState};
+use crate::transparent_interception::TransparentProxyRuntimeHandle;
 
 const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const ADMIN_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,6 +48,7 @@ pub struct AdminRuntimeState {
     pub policy_set: PipelinePolicySet,
     pub tls_decrypt_hints: Option<TlsDecryptHintRuntimeState>,
     pub tls_plaintext: Option<TlsPlaintextRuntimeState>,
+    pub transparent_proxy: Option<TransparentProxyRuntimeHandle>,
 }
 
 pub struct AdminServerHandle {
@@ -298,6 +300,10 @@ fn build_admin_status_snapshot(
                 .tls_plaintext
                 .as_ref()
                 .map(TlsPlaintextRuntimeState::snapshot),
+            transparent_proxy: runtime_state
+                .transparent_proxy
+                .as_ref()
+                .map(TransparentProxyRuntimeHandle::snapshot),
         },
     )
 }
@@ -404,6 +410,9 @@ mod tests {
             pipeline.run_provider(&mut provider)?;
         }
         let plan = Arc::new(runtime_plan(spool_path)?);
+        let transparent_proxy_runtime =
+            crate::transparent_interception::resolve(&plan.config.enforcement.interception)
+                .proxy_runtime_handle();
         let server = spawn_admin_server(
             Arc::clone(&plan),
             Arc::clone(&spool),
@@ -412,6 +421,7 @@ mod tests {
             },
             AdminRuntimeState {
                 pipeline: Some(pipeline_metrics),
+                transparent_proxy: Some(transparent_proxy_runtime),
                 ..AdminRuntimeState::default()
             },
         )?;
@@ -428,6 +438,17 @@ mod tests {
             response["metrics"]["pipeline"]["export_events_written"],
             json!(1)
         );
+        assert_eq!(
+            response["metrics"]["transparent_proxy"]["active_relays"],
+            json!(0)
+        );
+
+        let response = send_admin_request(&socket_path, json!({ "command": "status" })).await?;
+
+        assert_eq!(
+            response["snapshot"]["enforcement"]["interception"]["runtime_proxy"]["mode"],
+            json!("disabled")
+        );
 
         let response =
             send_admin_request(&socket_path, json!({ "command": "prometheus_metrics" })).await?;
@@ -441,6 +462,7 @@ mod tests {
             .as_str()
             .expect("prometheus metrics should be returned as text");
         assert!(metrics.contains("sssa_pipeline_metrics_available 1\n"));
+        assert!(metrics.contains("sssa_transparent_proxy_metrics_available 1\n"));
         assert!(metrics.contains("sssa_pipeline_capture_events_read_total 1\n"));
         assert!(metrics.contains("sssa_pipeline_export_events_written_total 1\n"));
         assert!(metrics.contains("sssa_export_sink_lag{sink=\"primary\"} 1\n"));

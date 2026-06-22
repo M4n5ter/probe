@@ -1,11 +1,14 @@
 use probe_core::RuntimeMode;
 use runtime::{CapturePlanMode, RuntimePlan};
 
+use crate::transparent_interception::TransparentProxyRuntimeMode;
+
 use super::super::{
     enforcement::{EnforcementPolicySourceStatusSnapshot, EnforcementStatusSnapshot},
     export::ExporterStatusSnapshot,
     policy::{PolicyStatusMode, PolicyStatusSnapshot},
-    snapshot::{HealthSnapshot, SpoolStatusSnapshot},
+    snapshot::HealthSnapshot,
+    spool::SpoolStatusSnapshot,
     tls::TlsStatusSnapshot,
 };
 
@@ -23,6 +26,9 @@ pub(in crate::status) fn health_snapshot(
             .chain(exporters.iter().map(exporter_health_contribution))
             .chain(std::iter::once(policy_health_contribution(policy)))
             .chain(std::iter::once(enforcement_health_contribution(
+                enforcement,
+            )))
+            .chain(std::iter::once(transparent_proxy_health_contribution(
                 enforcement,
             )))
             .chain(std::iter::once(tls_health_contribution(tls))),
@@ -125,6 +131,29 @@ fn enforcement_policy_reason(enforcement: &EnforcementStatusSnapshot, fallback: 
         || format!("enforcement policy: {fallback}"),
         |reason| format!("enforcement policy: {reason}"),
     )
+}
+
+fn transparent_proxy_health_contribution(
+    enforcement: &EnforcementStatusSnapshot,
+) -> HealthContribution {
+    let Some(proxy) = &enforcement.interception.runtime_proxy else {
+        return HealthContribution::available();
+    };
+    match proxy.mode {
+        TransparentProxyRuntimeMode::Degraded => HealthContribution::degraded(format!(
+            "transparent proxy degraded: {} listener failure(s)",
+            proxy.listener_failures
+        )),
+        TransparentProxyRuntimeMode::Failed => HealthContribution::unavailable(format!(
+            "transparent proxy failed: {} listener failure(s)",
+            proxy.listener_failures
+        )),
+        TransparentProxyRuntimeMode::Disabled
+        | TransparentProxyRuntimeMode::External
+        | TransparentProxyRuntimeMode::Configured
+        | TransparentProxyRuntimeMode::Running
+        | TransparentProxyRuntimeMode::Stopped => HealthContribution::available(),
+    }
 }
 
 fn tls_health_contribution(tls: &TlsStatusSnapshot) -> HealthContribution {

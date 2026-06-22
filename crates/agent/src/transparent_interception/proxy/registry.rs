@@ -7,13 +7,15 @@ use std::{
     },
 };
 
+use super::state::TransparentProxyRuntime;
+
 const MAX_ACTIVE_RELAYS: usize = 256;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct RelayRegistry {
     next_id: Arc<AtomicU64>,
-    active_slots: Arc<AtomicU64>,
     relays: Arc<Mutex<Vec<TrackedRelay>>>,
+    runtime: TransparentProxyRuntime,
 }
 
 struct TrackedRelay {
@@ -32,30 +34,29 @@ pub(super) struct RelaySlot {
 }
 
 impl RelayRegistry {
+    pub(super) fn new(runtime: TransparentProxyRuntime) -> Self {
+        Self {
+            next_id: Arc::new(AtomicU64::new(0)),
+            relays: Arc::new(Mutex::new(Vec::new())),
+            runtime,
+        }
+    }
+
     pub(super) fn try_acquire_slot(&self) -> Option<RelaySlot> {
-        let mut current = self.active_slots.load(Ordering::SeqCst);
-        loop {
-            if current >= MAX_ACTIVE_RELAYS as u64 {
-                return None;
-            }
-            match self.active_slots.compare_exchange(
-                current,
-                current + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => {
-                    return Some(RelaySlot {
-                        registry: self.clone(),
-                    });
-                }
-                Err(next) => current = next,
-            }
+        if self
+            .runtime
+            .try_record_relay_started(MAX_ACTIVE_RELAYS as u64)
+        {
+            Some(RelaySlot {
+                registry: self.clone(),
+            })
+        } else {
+            None
         }
     }
 
     fn release_slot(&self) {
-        self.active_slots.fetch_sub(1, Ordering::SeqCst);
+        self.runtime.record_relay_finished();
     }
 
     pub(super) fn register(
@@ -98,6 +99,18 @@ impl RelayRegistry {
     }
 }
 
+impl Default for RelayRegistry {
+    fn default() -> Self {
+        Self {
+            next_id: Arc::new(AtomicU64::new(0)),
+            relays: Arc::new(Mutex::new(Vec::new())),
+            runtime: TransparentProxyRuntime::for_config(
+                &probe_config::EnforcementInterceptionConfig::default(),
+            ),
+        }
+    }
+}
+
 impl Drop for RelayRegistration {
     fn drop(&mut self) {
         self.registry.unregister(self.id);
@@ -117,6 +130,11 @@ pub(super) fn shutdown_streams(downstream: &TcpStream, upstream: &TcpStream) {
 
 #[cfg(test)]
 mod tests {
+    use probe_config::{
+        EnforcementInterceptionConfig, TransparentInterceptionProxyConfig,
+        TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
+    };
+
     use super::*;
 
     #[test]
@@ -134,5 +152,55 @@ mod tests {
 
         drop(slots);
         assert!(registry.try_acquire_slot().is_some());
+    }
+
+    #[test]
+    fn relay_slots_update_runtime_active_count() {
+        let runtime = TransparentProxyRuntime::for_config(&managed_interception_config());
+        let handle = runtime.handle();
+        let registry = RelayRegistry::new(runtime);
+
+        let first = registry
+            .try_acquire_slot()
+            .expect("first slot should be available");
+        let second = registry
+            .try_acquire_slot()
+            .expect("second slot should be available");
+        assert_eq!(handle.snapshot().active_relays, 2);
+
+        drop(first);
+        assert_eq!(handle.snapshot().active_relays, 1);
+
+        drop(second);
+        assert_eq!(handle.snapshot().active_relays, 0);
+    }
+
+    #[test]
+    fn stopped_runtime_does_not_forge_active_relay_count() {
+        let runtime = TransparentProxyRuntime::for_config(&managed_interception_config());
+        let handle = runtime.handle();
+        let registry = RelayRegistry::new(runtime.clone());
+        let slot = registry
+            .try_acquire_slot()
+            .expect("slot should be available");
+
+        runtime.mark_stopped();
+
+        assert_eq!(handle.snapshot().active_relays, 1);
+
+        drop(slot);
+
+        assert_eq!(handle.snapshot().active_relays, 0);
+    }
+
+    fn managed_interception_config() -> EnforcementInterceptionConfig {
+        EnforcementInterceptionConfig {
+            strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
+            proxy: TransparentInterceptionProxyConfig {
+                mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+                listen_port: Some(15001),
+            },
+            ..EnforcementInterceptionConfig::default()
+        }
     }
 }

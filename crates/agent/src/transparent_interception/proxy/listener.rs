@@ -11,7 +11,9 @@ use std::{
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
-use super::{proxy_io_error, registry::RelayRegistry, relay::spawn_relay};
+use super::{
+    proxy_io_error, registry::RelayRegistry, relay::spawn_relay, state::TransparentProxyRuntime,
+};
 use crate::transparent_interception::{
     TransparentInterceptionError, TransparentInterceptionIpFamily,
 };
@@ -28,18 +30,39 @@ pub(super) fn start_listeners(
     families: Vec<TransparentInterceptionIpFamily>,
     shutdown_requested: Arc<AtomicBool>,
     relays: RelayRegistry,
+    runtime: TransparentProxyRuntime,
 ) -> Result<Vec<ManagedTransparentProxyListener>, TransparentInterceptionError> {
-    let listeners = families
-        .into_iter()
-        .map(|family| transparent_listener(family, listen_port).map(|listener| (family, listener)))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut listeners = Vec::new();
+    for family in families {
+        match transparent_listener(family, listen_port) {
+            Ok(listener) => listeners.push((family, listener)),
+            Err(error) => {
+                runtime.record_listener_failure(family);
+                return Err(error);
+            }
+        }
+    }
+    runtime.mark_running(
+        listeners
+            .iter()
+            .map(|(family, _)| *family)
+            .collect::<Vec<_>>(),
+    );
     Ok(listeners
         .into_iter()
         .map(|(family, listener)| {
             let shutdown = Arc::clone(&shutdown_requested);
             let relay_registry = relays.clone();
+            let proxy_runtime = runtime.clone();
             let thread = thread::spawn(move || {
-                listener_loop(listener, listen_port, shutdown, relay_registry)
+                listener_loop(
+                    listener,
+                    family,
+                    listen_port,
+                    shutdown,
+                    relay_registry,
+                    proxy_runtime,
+                )
             });
             ManagedTransparentProxyListener { family, thread }
         })
@@ -103,24 +126,31 @@ fn transparent_listener(
 
 fn listener_loop(
     listener: Socket,
+    family: TransparentInterceptionIpFamily,
     listen_port: u16,
     shutdown_requested: Arc<AtomicBool>,
     relay_registry: RelayRegistry,
+    runtime: TransparentProxyRuntime,
 ) -> Result<(), String> {
     let mut relay_threads = Vec::new();
     while !shutdown_requested.load(Ordering::SeqCst) {
         reap_finished_relays(&mut relay_threads);
         match listener.accept() {
             Ok((accepted, peer)) => match relay_registry.try_acquire_slot() {
-                Some(slot) => relay_threads.push(spawn_relay(
-                    accepted,
-                    peer,
-                    listen_port,
-                    Arc::clone(&shutdown_requested),
-                    relay_registry.clone(),
-                    slot,
-                )),
+                Some(slot) => {
+                    runtime.record_accepted_relay();
+                    relay_threads.push(spawn_relay(
+                        accepted,
+                        peer,
+                        listen_port,
+                        Arc::clone(&shutdown_requested),
+                        relay_registry.clone(),
+                        slot,
+                        runtime.clone(),
+                    ));
+                }
                 None => {
+                    runtime.record_rejected_relay();
                     let _ = TcpStream::from(accepted).shutdown(Shutdown::Both);
                     eprintln!(
                         "managed transparent proxy rejected connection because active relay limit is reached"
@@ -131,7 +161,10 @@ fn listener_loop(
                 thread::sleep(ACCEPT_POLL_INTERVAL);
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(format!("accept transparent connection: {error}")),
+            Err(error) => {
+                runtime.record_listener_failure(family);
+                return Err(format!("accept transparent connection: {error}"));
+            }
         }
     }
     relay_registry.shutdown_all();

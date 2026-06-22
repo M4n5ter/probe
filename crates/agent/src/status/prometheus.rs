@@ -48,6 +48,7 @@ pub(crate) fn render_prometheus_metrics(snapshot: &AgentStatusSnapshot) -> Strin
     write_capabilities(&mut output, snapshot);
     write_spool(&mut output, snapshot);
     write_export(&mut output, snapshot);
+    write_transparent_proxy(&mut output, snapshot);
     write_pipeline(&mut output, snapshot);
 
     output
@@ -200,6 +201,76 @@ fn write_export(output: &mut String, snapshot: &AgentStatusSnapshot) {
             );
         }
     }
+}
+
+fn write_transparent_proxy(output: &mut String, snapshot: &AgentStatusSnapshot) {
+    write_family(
+        output,
+        "sssa_transparent_proxy_metrics_available",
+        "gauge",
+        "Whether transparent proxy runtime metrics are present in this snapshot.",
+    );
+    write_sample(
+        output,
+        "sssa_transparent_proxy_metrics_available",
+        &[],
+        u64::from(snapshot.metrics.transparent_proxy.is_some()),
+    );
+
+    let Some(metrics) = snapshot.metrics.transparent_proxy else {
+        return;
+    };
+
+    write_family(
+        output,
+        "sssa_transparent_proxy_active_relays",
+        "gauge",
+        "Active managed transparent proxy relay count.",
+    );
+    write_sample(
+        output,
+        "sssa_transparent_proxy_active_relays",
+        &[],
+        metrics.active_relays,
+    );
+
+    write_family(
+        output,
+        "sssa_transparent_proxy_relays_total",
+        "counter",
+        "Managed transparent proxy relays by outcome.",
+    );
+    write_sample(
+        output,
+        "sssa_transparent_proxy_relays_total",
+        &[("outcome", "accepted")],
+        metrics.accepted_relays,
+    );
+    write_sample(
+        output,
+        "sssa_transparent_proxy_relays_total",
+        &[("outcome", "rejected")],
+        metrics.rejected_relays,
+    );
+
+    write_family(
+        output,
+        "sssa_transparent_proxy_failures_total",
+        "counter",
+        "Managed transparent proxy failures by kind.",
+    );
+    write_sample(
+        output,
+        "sssa_transparent_proxy_failures_total",
+        &[("kind", "relay")],
+        metrics.relay_failures,
+    );
+    write_sample(
+        output,
+        "sssa_transparent_proxy_failures_total",
+        &[("kind", "listener")],
+        metrics.listener_failures,
+    );
 }
 
 fn write_pipeline(output: &mut String, snapshot: &AgentStatusSnapshot) {
@@ -404,11 +475,14 @@ mod tests {
     use storage::SpoolSnapshot;
 
     use super::super::{
-        build_status_snapshot,
+        RuntimeStatusInput, build_status_snapshot, build_status_snapshot_with_runtime,
         plan_fixture::{config_with_storage_path, runtime_plan_from_config},
-        snapshot::SpoolStatusInput,
+        spool::SpoolStatusInput,
     };
     use super::*;
+    use crate::transparent_interception::{
+        TransparentProxyRuntimeMode, TransparentProxyRuntimeSnapshot,
+    };
 
     #[test]
     fn render_prometheus_metrics_escapes_label_values() -> Result<(), Box<dyn std::error::Error>> {
@@ -430,6 +504,48 @@ mod tests {
         let metrics = render_prometheus_metrics(&snapshot);
 
         assert!(metrics.contains("sssa_agent_info{agent_id=\"agent\\\"\\\\\\nnext\""));
+        Ok(())
+    }
+
+    #[test]
+    fn render_prometheus_metrics_includes_transparent_proxy_counters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/sssa-spool")),
+            Vec::new(),
+        )?;
+        let snapshot = build_status_snapshot_with_runtime(
+            &plan,
+            SpoolStatusInput::available(
+                PathBuf::from("/tmp/sssa-spool"),
+                SpoolSnapshot {
+                    last_ingress_sequence: 0,
+                    last_export_sequence: 0,
+                },
+                BTreeMap::from([("primary".to_string(), 0)]),
+            ),
+            RuntimeStatusInput {
+                transparent_proxy: Some(TransparentProxyRuntimeSnapshot {
+                    mode: TransparentProxyRuntimeMode::Configured,
+                    listener_families: Vec::new(),
+                    active_relays: 2,
+                    accepted_relays: 3,
+                    rejected_relays: 5,
+                    relay_failures: 7,
+                    listener_failures: 11,
+                }),
+                ..RuntimeStatusInput::default()
+            },
+        );
+
+        let metrics = render_prometheus_metrics(&snapshot);
+
+        assert!(metrics.contains("sssa_transparent_proxy_metrics_available 1\n"));
+        assert!(metrics.contains("sssa_transparent_proxy_active_relays 2\n"));
+        assert!(metrics.contains("sssa_transparent_proxy_relays_total{outcome=\"accepted\"} 3\n"));
+        assert!(metrics.contains("sssa_transparent_proxy_relays_total{outcome=\"rejected\"} 5\n"));
+        assert!(metrics.contains("sssa_transparent_proxy_failures_total{kind=\"relay\"} 7\n"));
+        assert!(metrics.contains("sssa_transparent_proxy_failures_total{kind=\"listener\"} 11\n"));
         Ok(())
     }
 }

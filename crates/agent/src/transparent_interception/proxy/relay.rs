@@ -14,6 +14,7 @@ use socket2::{SockAddr, Socket};
 use super::{
     proxy_error, proxy_io_error,
     registry::{RelayRegistry, RelaySlot, shutdown_streams},
+    state::TransparentProxyRuntime,
 };
 use crate::transparent_interception::TransparentInterceptionError;
 
@@ -26,6 +27,7 @@ pub(super) fn spawn_relay(
     shutdown_requested: Arc<AtomicBool>,
     relays: RelayRegistry,
     slot: RelaySlot,
+    runtime: TransparentProxyRuntime,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         if let Err(error) = relay_connection(
@@ -36,6 +38,7 @@ pub(super) fn spawn_relay(
             relays,
             slot,
         ) {
+            runtime.record_relay_failure();
             eprintln!("managed transparent proxy relay failed: {error}");
         }
     })

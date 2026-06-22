@@ -68,6 +68,7 @@ pub(crate) async fn run_live_agent(
         enforcement.active_policy.clone(),
     );
     let tls_plaintext_runtime = TlsPlaintextRuntimeState::for_plan(&plan);
+    let transparent_proxy_runtime = transparent_interception.proxy_runtime_handle();
     let admin_runtime_state = AdminRuntimeState {
         enforcement: Some(enforcement_runtime),
         export_worker: export_worker.as_ref().map(ExportWorker::runtime_state),
@@ -75,6 +76,7 @@ pub(crate) async fn run_live_agent(
         policy_set: policy_set.clone(),
         tls_decrypt_hints: Some(tls_decrypt_hint_runtime.clone()),
         tls_plaintext: Some(tls_plaintext_runtime.clone()),
+        transparent_proxy: Some(transparent_proxy_runtime.clone()),
         ..AdminRuntimeState::default()
     };
     let admin_server = admin_server_config_from_plan(&plan)

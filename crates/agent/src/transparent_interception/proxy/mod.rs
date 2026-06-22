@@ -1,6 +1,7 @@
 mod listener;
 mod registry;
 mod relay;
+mod state;
 
 use std::sync::{
     Arc,
@@ -18,15 +19,22 @@ use self::{
 };
 use super::{TransparentInterceptionError, TransparentInterceptionIpFamily};
 
+pub(in crate::transparent_interception) use state::TransparentProxyRuntime;
+pub(crate) use state::{
+    TransparentProxyRuntimeHandle, TransparentProxyRuntimeMode, TransparentProxyRuntimeSnapshot,
+};
+
 pub(crate) struct ManagedTransparentProxyGuard {
     shutdown_requested: Arc<AtomicBool>,
     relays: RelayRegistry,
     listeners: Vec<ManagedTransparentProxyListener>,
+    runtime: TransparentProxyRuntime,
 }
 
 pub(crate) fn start_managed_proxy(
     config: &EnforcementInterceptionConfig,
     families: Vec<TransparentInterceptionIpFamily>,
+    runtime: TransparentProxyRuntime,
 ) -> Result<Option<ManagedTransparentProxyGuard>, TransparentInterceptionError> {
     if config.proxy.mode == TransparentInterceptionProxyModeConfig::External {
         return Ok(None);
@@ -52,26 +60,29 @@ pub(crate) fn start_managed_proxy(
             "managed TCP relay requires at least one listener family".to_string(),
         ));
     }
-    ManagedTransparentProxyGuard::start(listen_port, families).map(Some)
+    ManagedTransparentProxyGuard::start(listen_port, families, runtime).map(Some)
 }
 
 impl ManagedTransparentProxyGuard {
     fn start(
         listen_port: u16,
         families: Vec<TransparentInterceptionIpFamily>,
+        runtime: TransparentProxyRuntime,
     ) -> Result<Self, TransparentInterceptionError> {
         let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let relays = RelayRegistry::default();
+        let relays = RelayRegistry::new(runtime.clone());
         let listeners = start_listeners(
             listen_port,
             families,
             Arc::clone(&shutdown_requested),
             relays.clone(),
+            runtime.clone(),
         )?;
         Ok(Self {
             shutdown_requested,
             relays,
             listeners,
+            runtime,
         })
     }
 
@@ -87,8 +98,10 @@ impl ManagedTransparentProxyGuard {
             }
         }
         if errors.is_empty() {
+            self.runtime.mark_stopped();
             Ok(())
         } else {
+            self.runtime.mark_stopped();
             Err(TransparentInterceptionError::Proxy(errors.join("; ")))
         }
     }
@@ -97,6 +110,7 @@ impl ManagedTransparentProxyGuard {
 impl Drop for ManagedTransparentProxyGuard {
     fn drop(&mut self) {
         self.shutdown_requested.store(true, Ordering::SeqCst);
+        self.runtime.mark_stopped();
     }
 }
 
@@ -125,8 +139,12 @@ mod tests {
     fn external_proxy_mode_does_not_start_managed_listener() {
         let config = EnforcementInterceptionConfig::default();
 
-        let guard =
-            start_managed_proxy(&config, Vec::new()).expect("external mode should be ignored");
+        let guard = start_managed_proxy(
+            &config,
+            Vec::new(),
+            TransparentProxyRuntime::for_config(&config),
+        )
+        .expect("external mode should be ignored");
 
         assert!(guard.is_none());
     }
@@ -142,7 +160,11 @@ mod tests {
             ..EnforcementInterceptionConfig::default()
         };
 
-        let error = match start_managed_proxy(&config, Vec::new()) {
+        let error = match start_managed_proxy(
+            &config,
+            Vec::new(),
+            TransparentProxyRuntime::for_config(&config),
+        ) {
             Ok(_) => panic!("managed relay should require at least one listener"),
             Err(error) => error,
         };
@@ -162,6 +184,7 @@ mod tests {
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             relays: registry,
             listeners: Vec::new(),
+            runtime: TransparentProxyRuntime::for_config(&EnforcementInterceptionConfig::default()),
         };
 
         guard.stop()?;

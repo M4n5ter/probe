@@ -9,7 +9,11 @@ use probe_config::{EnforcementInterceptionConfig, TransparentInterceptionStrateg
 
 pub(crate) use error::TransparentInterceptionError;
 pub(crate) use ip_family::TransparentInterceptionIpFamily;
-pub(crate) use proxy::{ManagedTransparentProxyGuard, start_managed_proxy};
+use proxy::TransparentProxyRuntime;
+pub(crate) use proxy::{
+    ManagedTransparentProxyGuard, TransparentProxyRuntimeHandle, TransparentProxyRuntimeMode,
+    TransparentProxyRuntimeSnapshot,
+};
 pub(crate) use runtime::{TransparentInterceptionGuard, TransparentInterceptionRuntime};
 
 const OUTBOUND_MITM_UNAVAILABLE: &str = "outbound transparent MITM requires proxy self-bypass and MITM lifecycle before rules can be installed";
@@ -17,13 +21,17 @@ const MISSING_LOCAL_SETUP_SELECTOR: &str =
     "transparent interception requires an explicit local selector for setup-time rules";
 
 pub(crate) fn resolve(config: &EnforcementInterceptionConfig) -> TransparentInterceptionRuntime {
+    let proxy_runtime = TransparentProxyRuntime::for_config(config);
     match config.strategy {
         TransparentInterceptionStrategyConfig::None => TransparentInterceptionRuntime::unavailable(
             "transparent interception backend is not configured",
+            proxy_runtime,
         ),
-        TransparentInterceptionStrategyConfig::InboundTproxy => nftables::resolve(config),
+        TransparentInterceptionStrategyConfig::InboundTproxy => {
+            nftables::resolve(config, proxy_runtime)
+        }
         TransparentInterceptionStrategyConfig::OutboundMitm => {
-            TransparentInterceptionRuntime::unavailable(OUTBOUND_MITM_UNAVAILABLE)
+            TransparentInterceptionRuntime::unavailable(OUTBOUND_MITM_UNAVAILABLE, proxy_runtime)
         }
     }
 }
