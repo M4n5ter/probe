@@ -10,10 +10,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use probe_config::{
-    EnforcementInterceptionConfig, TransparentInterceptionProxyModeConfig,
-    TransparentInterceptionStrategyConfig,
-};
+use ::runtime::TransparentInterceptionInboundTproxyPlan;
+use probe_config::TransparentInterceptionProxyModeConfig;
 
 use self::{
     health_probe::{prepare_health_probe, start_health_probe},
@@ -46,12 +44,12 @@ pub(in crate::transparent_interception) struct TransparentProxyGuard {
 }
 
 pub(in crate::transparent_interception) fn prepare_proxy_lifecycle(
-    config: &EnforcementInterceptionConfig,
+    inbound_plan: &TransparentInterceptionInboundTproxyPlan,
     families: Vec<TransparentInterceptionIpFamily>,
 ) -> Result<TransparentProxyLifecyclePlan, TransparentInterceptionError> {
     Ok(TransparentProxyLifecyclePlan {
-        managed: prepare_managed_proxy(config, families)?,
-        health_probe: prepare_health_probe(config)?,
+        managed: prepare_managed_proxy(inbound_plan, families)?,
+        health_probe: prepare_health_probe(inbound_plan.health_probe()),
     })
 }
 
@@ -88,35 +86,19 @@ struct ManagedTransparentProxyGuard {
 }
 
 fn prepare_managed_proxy(
-    config: &EnforcementInterceptionConfig,
+    inbound_plan: &TransparentInterceptionInboundTproxyPlan,
     families: Vec<TransparentInterceptionIpFamily>,
 ) -> Result<Option<ManagedTransparentProxyPlan>, TransparentInterceptionError> {
-    if config.proxy.mode == TransparentInterceptionProxyModeConfig::External {
+    let TransparentInterceptionProxyModeConfig::ManagedTcpRelay = inbound_plan.proxy_mode() else {
         return Ok(None);
-    }
-    if config.proxy.mode != TransparentInterceptionProxyModeConfig::ManagedTcpRelay {
-        return Err(TransparentInterceptionError::Proxy(format!(
-            "unsupported transparent proxy mode {:?}",
-            config.proxy.mode
-        )));
-    }
-    if config.strategy != TransparentInterceptionStrategyConfig::InboundTproxy {
-        return Err(TransparentInterceptionError::Proxy(
-            "managed TCP relay proxy mode is only executable for inbound TPROXY".to_string(),
-        ));
-    }
-    let listen_port = config.proxy.listen_port.ok_or_else(|| {
-        TransparentInterceptionError::Proxy(
-            "managed TCP relay requires a proxy listen port".to_string(),
-        )
-    })?;
+    };
     if families.is_empty() {
         return Err(TransparentInterceptionError::Proxy(
             "managed TCP relay requires at least one listener family".to_string(),
         ));
     }
     Ok(Some(ManagedTransparentProxyPlan {
-        listen_port,
+        listen_port: inbound_plan.listen_port().get(),
         families,
     }))
 }
@@ -221,33 +203,60 @@ mod tests {
         sync::Arc,
     };
 
+    use probe_config::TransparentInterceptionStrategyConfig;
+    use runtime::TransparentInterceptionExecutionPlan;
+
     use super::*;
 
     #[test]
     fn external_proxy_mode_does_not_start_managed_listener() {
-        let config = EnforcementInterceptionConfig::default();
+        let config = probe_config::EnforcementInterceptionConfig {
+            strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
+            proxy: probe_config::TransparentInterceptionProxyConfig {
+                mode: TransparentInterceptionProxyModeConfig::External,
+                listen_port: Some(15001),
+                ..probe_config::TransparentInterceptionProxyConfig::default()
+            },
+            ..probe_config::EnforcementInterceptionConfig::default()
+        };
+        let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
+            .expect("test transparent interception config should be valid");
+        let TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) =
+            execution_plan.clone()
+        else {
+            panic!("test transparent interception config should use inbound TPROXY");
+        };
 
-        let plan = prepare_proxy_lifecycle(&config, Vec::new())
+        let plan = prepare_proxy_lifecycle(&inbound_plan, Vec::new())
             .expect("external mode without health probe should be prepared");
-        let guard = start_proxy_lifecycle(plan, TransparentProxyRuntime::for_config(&config))
-            .expect("external mode without health probe should start no proxy lifecycle");
+        let guard = start_proxy_lifecycle(
+            plan,
+            TransparentProxyRuntime::for_execution_plan(&execution_plan),
+        )
+        .expect("external mode without health probe should start no proxy lifecycle");
 
         assert!(guard.is_none());
     }
 
     #[test]
     fn managed_proxy_rejects_empty_listener_family_set() {
-        let config = EnforcementInterceptionConfig {
+        let config = probe_config::EnforcementInterceptionConfig {
             strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
             proxy: probe_config::TransparentInterceptionProxyConfig {
                 mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
                 listen_port: Some(15001),
                 ..probe_config::TransparentInterceptionProxyConfig::default()
             },
-            ..EnforcementInterceptionConfig::default()
+            ..probe_config::EnforcementInterceptionConfig::default()
+        };
+        let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
+            .expect("test transparent interception config should be valid");
+        let TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) = execution_plan
+        else {
+            panic!("test transparent interception config should use inbound TPROXY");
         };
 
-        let error = match prepare_proxy_lifecycle(&config, Vec::new()) {
+        let error = match prepare_proxy_lifecycle(&inbound_plan, Vec::new()) {
             Ok(_) => panic!("managed relay should require at least one listener family"),
             Err(error) => error,
         };
@@ -267,7 +276,9 @@ mod tests {
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             relays: registry,
             listeners: Vec::new(),
-            runtime: TransparentProxyRuntime::for_config(&EnforcementInterceptionConfig::default()),
+            runtime: TransparentProxyRuntime::for_test_config(
+                &probe_config::EnforcementInterceptionConfig::default(),
+            ),
         };
 
         guard.stop()?;

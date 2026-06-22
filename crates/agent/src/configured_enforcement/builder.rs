@@ -107,7 +107,7 @@ pub async fn build_configured_enforcement_with_backend(
     );
     let transparent_interception_setup_scope =
         crate::transparent_interception::effective_setup_scope(
-            &plan.config.enforcement.interception,
+            &plan.enforcement.interception.execution,
             setup_selectors,
         )?;
     configured.transparent_interception_setup_scope = transparent_interception_setup_scope;

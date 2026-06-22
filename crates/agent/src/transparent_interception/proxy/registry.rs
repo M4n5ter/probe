@@ -99,12 +99,13 @@ impl RelayRegistry {
     }
 }
 
+#[cfg(test)]
 impl Default for RelayRegistry {
     fn default() -> Self {
         Self {
             next_id: Arc::new(AtomicU64::new(0)),
             relays: Arc::new(Mutex::new(Vec::new())),
-            runtime: TransparentProxyRuntime::for_config(
+            runtime: TransparentProxyRuntime::for_test_config(
                 &probe_config::EnforcementInterceptionConfig::default(),
             ),
         }
@@ -156,7 +157,7 @@ mod tests {
 
     #[test]
     fn relay_slots_update_runtime_active_count() {
-        let runtime = TransparentProxyRuntime::for_config(&managed_interception_config());
+        let runtime = TransparentProxyRuntime::for_test_config(&managed_interception_config());
         let handle = runtime.handle();
         let registry = RelayRegistry::new(runtime);
 
@@ -177,7 +178,7 @@ mod tests {
 
     #[test]
     fn stopped_runtime_does_not_forge_active_relay_count() {
-        let runtime = TransparentProxyRuntime::for_config(&managed_interception_config());
+        let runtime = TransparentProxyRuntime::for_test_config(&managed_interception_config());
         let handle = runtime.handle();
         let registry = RelayRegistry::new(runtime.clone());
         let slot = registry

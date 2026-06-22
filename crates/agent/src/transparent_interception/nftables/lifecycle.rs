@@ -10,11 +10,15 @@ use crate::transparent_interception::{
         start_proxy_lifecycle,
     },
 };
+#[cfg(test)]
+use ::runtime::TransparentInterceptionExecutionPlan;
+use ::runtime::TransparentInterceptionInboundTproxyPlan;
 use interception::TransparentInterceptionHostRuleScope;
+#[cfg(test)]
 use probe_config::EnforcementInterceptionConfig;
 
 pub(in crate::transparent_interception) struct NftablesTransparentInterception {
-    config: EnforcementInterceptionConfig,
+    inbound_plan: TransparentInterceptionInboundTproxyPlan,
     nft: Box<dyn NftCommand + Send>,
     ip: Option<Box<dyn IpCommand + Send>>,
     owner_lock: Box<dyn NftablesOwnerLock>,
@@ -23,7 +27,7 @@ pub(in crate::transparent_interception) struct NftablesTransparentInterception {
 
 impl NftablesTransparentInterception {
     pub(super) fn new<N, I>(
-        config: EnforcementInterceptionConfig,
+        inbound_plan: TransparentInterceptionInboundTproxyPlan,
         nft: N,
         ip: Option<I>,
         proxy_runtime: TransparentProxyRuntime,
@@ -33,7 +37,7 @@ impl NftablesTransparentInterception {
         I: IpCommand + Send + 'static,
     {
         Self::with_owner_lock(
-            config,
+            inbound_plan,
             nft,
             ip,
             SystemNftablesOwnerLock::default(),
@@ -42,7 +46,7 @@ impl NftablesTransparentInterception {
     }
 
     fn with_owner_lock<N, I, L>(
-        config: EnforcementInterceptionConfig,
+        inbound_plan: TransparentInterceptionInboundTproxyPlan,
         nft: N,
         ip: Option<I>,
         owner_lock: L,
@@ -54,7 +58,7 @@ impl NftablesTransparentInterception {
         L: NftablesOwnerLock + 'static,
     {
         Self {
-            config,
+            inbound_plan,
             nft: Box::new(nft),
             ip: ip.map(|ip| Box::new(ip) as Box<dyn IpCommand + Send>),
             owner_lock: Box::new(owner_lock),
@@ -68,9 +72,15 @@ impl NftablesTransparentInterception {
         N: NftCommand + Send + 'static,
         I: IpCommand + Send + 'static,
     {
-        let proxy_runtime = TransparentProxyRuntime::for_config(&config);
+        let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
+            .expect("test transparent interception config should be valid");
+        let proxy_runtime = TransparentProxyRuntime::for_execution_plan(&execution_plan);
+        let TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) = execution_plan
+        else {
+            panic!("test transparent interception config should use inbound TPROXY");
+        };
         Self::with_owner_lock(
-            config,
+            inbound_plan,
             nft,
             ip,
             super::owner_lock::NoopNftablesOwnerLock,
@@ -82,9 +92,12 @@ impl NftablesTransparentInterception {
         mut self,
         setup_scope: TransparentInterceptionHostRuleScope,
     ) -> Result<NftablesTransparentInterceptionGuard, TransparentInterceptionError> {
-        let plan = InboundTproxyLifecyclePlan::from_config_and_scope(&self.config, setup_scope)
-            .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
-        let proxy_plan = prepare_proxy_lifecycle(&self.config, plan.listener_families())?;
+        let plan = InboundTproxyLifecyclePlan::from_inbound_plan_and_scope(
+            &self.inbound_plan,
+            setup_scope,
+        )
+        .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
+        let proxy_plan = prepare_proxy_lifecycle(&self.inbound_plan, plan.listener_families())?;
         let setup_script = plan.setup_nft_script();
         check_nft_script(self.nft.as_mut(), &setup_script)?;
         let owner_lock = self.owner_lock.acquire(plan.owner_name())?;
@@ -262,6 +275,7 @@ mod tests {
         TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionStrategyConfig,
     };
     use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
+    use runtime::TransparentInterceptionExecutionPlan;
 
     use crate::transparent_interception::{
         TransparentProxyRuntimeHandle, nftables::owner_lock::NoopNftablesOwnerLock,
@@ -327,32 +341,6 @@ mod tests {
             ip_args[4],
             string_args(["rule", "add", "fwmark", "0x53534101", "lookup", "53534"])
         );
-        Ok(())
-    }
-
-    #[test]
-    fn outbound_mitm_activation_fails_before_host_mutation()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let nft = FakeNft::succeeding();
-        let ip = FakeIp::succeeding();
-        let config = outbound_config();
-        let selector = setup_selector();
-
-        let error = match NftablesTransparentInterception::new_for_test(
-            config,
-            nft.clone(),
-            Some(ip.clone()),
-        )
-        .activate(setup_scope(&selector))
-        {
-            Ok(_) => panic!("outbound MITM lifecycle must fail closed before host mutation"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("supports inbound TPROXY only"));
-        assert!(nft.checked_scripts().is_empty());
-        assert!(nft.scripts().is_empty());
-        assert!(ip.args().is_empty());
         Ok(())
     }
 
@@ -433,35 +421,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_health_probe_fails_before_host_mutation() {
-        let nft = FakeNft::succeeding();
-        let ip = FakeIp::succeeding();
-        let mut config = inbound_config();
-        config.proxy.health_probe = TransparentInterceptionProxyHealthProbeConfig {
-            target: Some("127.0.0.1:0".to_string()),
-            interval_ms: 500,
-            timeout_ms: 100,
-            failure_threshold: 1,
-        };
-
-        let error = match NftablesTransparentInterception::new_for_test(
-            config,
-            nft.clone(),
-            Some(ip.clone()),
-        )
-        .activate(setup_scope(&setup_selector()))
-        {
-            Ok(_) => panic!("invalid health probe must fail activation"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("non-zero port"));
-        assert!(nft.checked_scripts().is_empty());
-        assert!(nft.scripts().is_empty());
-        assert!(ip.args().is_empty());
-    }
-
-    #[test]
     fn activation_starts_configured_health_probe() -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let nft = FakeNft::succeeding();
@@ -473,10 +432,16 @@ mod tests {
             timeout_ms: 10,
             failure_threshold: 1,
         };
-        let runtime = TransparentProxyRuntime::for_config(&config);
+        let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
+            .expect("test transparent interception config should be valid");
+        let runtime = TransparentProxyRuntime::for_execution_plan(&execution_plan);
         let handle = runtime.handle();
+        let TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) = execution_plan
+        else {
+            panic!("test transparent interception config should use inbound TPROXY");
+        };
         let lifecycle = NftablesTransparentInterception::with_owner_lock(
-            config,
+            inbound_plan,
             nft,
             Some(ip),
             NoopNftablesOwnerLock,
@@ -570,17 +535,6 @@ mod tests {
     fn inbound_config() -> EnforcementInterceptionConfig {
         EnforcementInterceptionConfig {
             strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
-            selector: None,
-            proxy: TransparentInterceptionProxyConfig {
-                listen_port: Some(15001),
-                ..TransparentInterceptionProxyConfig::default()
-            },
-        }
-    }
-
-    fn outbound_config() -> EnforcementInterceptionConfig {
-        EnforcementInterceptionConfig {
-            strategy: TransparentInterceptionStrategyConfig::OutboundMitm,
             selector: None,
             proxy: TransparentInterceptionProxyConfig {
                 listen_port: Some(15001),

@@ -4,8 +4,9 @@ mod nftables;
 mod proxy;
 mod runtime;
 
+use ::runtime::TransparentInterceptionExecutionPlan;
 use interception::{TransparentInterceptionHostRuleScope, TransparentInterceptionSetupSelectors};
-use probe_config::{EnforcementInterceptionConfig, TransparentInterceptionStrategyConfig};
+use probe_config::TransparentInterceptionStrategyConfig;
 
 pub(crate) use error::TransparentInterceptionError;
 pub(crate) use ip_family::TransparentInterceptionIpFamily;
@@ -20,34 +21,44 @@ const OUTBOUND_MITM_UNAVAILABLE: &str = "outbound transparent MITM requires prox
 const MISSING_LOCAL_SETUP_SELECTOR: &str =
     "transparent interception requires an explicit local selector for setup-time rules";
 
-pub(crate) fn resolve(config: &EnforcementInterceptionConfig) -> TransparentInterceptionRuntime {
-    let proxy_runtime = TransparentProxyRuntime::for_config(config);
-    match config.strategy {
-        TransparentInterceptionStrategyConfig::None => TransparentInterceptionRuntime::unavailable(
-            "transparent interception backend is not configured",
-            proxy_runtime,
-        ),
-        TransparentInterceptionStrategyConfig::InboundTproxy => {
-            nftables::resolve(config, proxy_runtime)
+pub(crate) fn unavailable_for_config_error(
+    error: impl Into<String>,
+) -> TransparentInterceptionRuntime {
+    TransparentInterceptionRuntime::unavailable(error.into(), TransparentProxyRuntime::disabled())
+}
+
+pub(crate) fn resolve(
+    execution_plan: TransparentInterceptionExecutionPlan,
+) -> TransparentInterceptionRuntime {
+    let proxy_runtime = TransparentProxyRuntime::for_execution_plan(&execution_plan);
+    match execution_plan {
+        TransparentInterceptionExecutionPlan::Disabled => {
+            TransparentInterceptionRuntime::unavailable(
+                "transparent interception backend is not configured",
+                proxy_runtime,
+            )
         }
-        TransparentInterceptionStrategyConfig::OutboundMitm => {
+        TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) => {
+            nftables::resolve(inbound_plan, proxy_runtime)
+        }
+        TransparentInterceptionExecutionPlan::OutboundMitm(_) => {
             TransparentInterceptionRuntime::unavailable(OUTBOUND_MITM_UNAVAILABLE, proxy_runtime)
         }
     }
 }
 
 pub(crate) fn effective_setup_scope(
-    config: &EnforcementInterceptionConfig,
+    execution_plan: &TransparentInterceptionExecutionPlan,
     selectors: TransparentInterceptionSetupSelectors,
 ) -> Result<Option<TransparentInterceptionHostRuleScope>, TransparentInterceptionError> {
-    if !config.strategy.is_enabled() {
+    if execution_plan.strategy() == TransparentInterceptionStrategyConfig::None {
         return Ok(None);
     }
-    if config.strategy == TransparentInterceptionStrategyConfig::OutboundMitm {
+    let TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) = execution_plan else {
         return Err(TransparentInterceptionError::Nftables(
             OUTBOUND_MITM_UNAVAILABLE.to_string(),
         ));
-    }
+    };
     if selectors.local_config_scope().is_none() {
         return Err(TransparentInterceptionError::Nftables(
             MISSING_LOCAL_SETUP_SELECTOR.to_string(),
@@ -59,14 +70,17 @@ pub(crate) fn effective_setup_scope(
     let scope = selectors
         .final_host_rule_scope()
         .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
-    nftables::validate_effective_setup_scope(config, &scope)?;
+    nftables::validate_effective_setup_scope(inbound_plan, &scope)?;
     Ok(Some(scope))
 }
 
 #[cfg(test)]
 mod tests {
     use interception::TransparentInterceptionSetupSelectorSources;
-    use probe_config::{TransparentInterceptionProxyConfig, TransparentInterceptionStrategyConfig};
+    use probe_config::{
+        EnforcementInterceptionConfig, TransparentInterceptionProxyConfig,
+        TransparentInterceptionStrategyConfig,
+    };
     use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
 
     use super::*;
@@ -97,7 +111,9 @@ mod tests {
                 interception_selector: config.selector.as_ref(),
             },
         );
-        let error = effective_setup_scope(&config, selectors)
+        let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
+            .expect("test transparent interception config should be valid");
+        let error = effective_setup_scope(&execution_plan, selectors)
             .expect_err("remote manifest must not be the only transparent setup scope");
 
         assert!(error.to_string().contains("explicit local selector"));

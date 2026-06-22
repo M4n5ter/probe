@@ -29,6 +29,9 @@ pub use model::{
     PlaintextFeedCaptureConfig, PlaintextTlsConfig, PolicyConfig, StorageConfig,
     StorageRetentionConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind,
     TlsPlaintextDecryptHintConfig, TlsPlaintextInstrumentationConfig,
+    TransparentInterceptionDisabledProxyIntent, TransparentInterceptionEnabledProxyIntent,
     TransparentInterceptionProxyConfig, TransparentInterceptionProxyHealthProbeConfig,
-    TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
+    TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
+    TransparentInterceptionProxyIntentViolation, TransparentInterceptionProxyModeConfig,
+    TransparentInterceptionStrategyConfig,
 };

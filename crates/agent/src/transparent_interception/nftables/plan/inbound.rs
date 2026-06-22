@@ -1,11 +1,9 @@
 use interception::TransparentInterceptionHostRuleScope;
-use probe_config::{EnforcementInterceptionConfig, TransparentInterceptionStrategyConfig};
-use runtime::TransparentInterceptionNftablesPlan;
+use runtime::{TransparentInterceptionInboundTproxyPlan, TransparentInterceptionNftablesPlan};
 
 use super::{
     INBOUND_TPROXY_OWNER_LOCK, NftablesPlanError, hex_mark,
     projection::{NftFamily, NftRule, NftSelectorProjection},
-    proxy_port_from_config,
 };
 use crate::transparent_interception::TransparentInterceptionIpFamily;
 
@@ -19,17 +17,11 @@ pub(in crate::transparent_interception::nftables) struct InboundTproxyLifecycleP
 }
 
 impl InboundTproxyLifecyclePlan {
-    pub(in crate::transparent_interception::nftables) fn from_config_and_scope(
-        config: &EnforcementInterceptionConfig,
+    pub(in crate::transparent_interception::nftables) fn from_inbound_plan_and_scope(
+        plan: &TransparentInterceptionInboundTproxyPlan,
         setup_scope: TransparentInterceptionHostRuleScope,
     ) -> Result<Self, NftablesPlanError> {
-        if config.strategy != TransparentInterceptionStrategyConfig::InboundTproxy {
-            return Err(NftablesPlanError::UnsupportedExecutableStrategy {
-                strategy: config.strategy,
-            });
-        }
-
-        let proxy_port = proxy_port_from_config(config)?;
+        let proxy_port = plan.listen_port().get();
         if setup_scope.local_ports().is_any() {
             return Err(NftablesPlanError::WildcardLocalPortsRequireProxyBypass { proxy_port });
         }
@@ -153,8 +145,12 @@ impl InboundTproxyLifecyclePlan {
 
 #[cfg(test)]
 mod tests {
-    use probe_config::{EnforcementInterceptionConfig, TransparentInterceptionProxyConfig};
+    use probe_config::{
+        EnforcementInterceptionConfig, TransparentInterceptionProxyConfig,
+        TransparentInterceptionStrategyConfig,
+    };
     use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
+    use runtime::TransparentInterceptionExecutionPlan;
 
     use super::*;
 
@@ -169,7 +165,7 @@ mod tests {
                 remote_addresses: vec!["203.0.113.10".to_string()],
             },
         )));
-        let plan = InboundTproxyLifecyclePlan::from_config_and_scope(
+        let plan = lifecycle_plan(
             &config,
             setup_scope(config.selector.as_ref().expect("selector should be set")),
         )
@@ -215,7 +211,7 @@ mod tests {
                 ..TrafficSelector::default()
             },
         )));
-        let plan = InboundTproxyLifecyclePlan::from_config_and_scope(
+        let plan = lifecycle_plan(
             &config,
             setup_scope(config.selector.as_ref().expect("selector should be set")),
         )
@@ -262,38 +258,15 @@ mod tests {
             },
         )));
         let second = first.clone();
-        let outbound = EnforcementInterceptionConfig {
-            strategy: TransparentInterceptionStrategyConfig::OutboundMitm,
-            selector: Some(Selector::term(
-                ProcessSelector::default(),
-                TrafficSelector {
-                    remote_ports: vec![443],
-                    directions: vec![Direction::Outbound],
-                    ..TrafficSelector::default()
-                },
-            )),
-            proxy: TransparentInterceptionProxyConfig {
-                listen_port: Some(15001),
-                ..TransparentInterceptionProxyConfig::default()
-            },
-        };
 
         let first_scope = setup_scope(first.selector.as_ref().expect("selector should be set"));
         let first_plan =
-            InboundTproxyLifecyclePlan::from_config_and_scope(&first, first_scope.clone())
-                .expect("first plan should be valid");
-        let second_plan = InboundTproxyLifecyclePlan::from_config_and_scope(&second, first_scope)
-            .expect("second plan should be valid");
+            lifecycle_plan(&first, first_scope.clone()).expect("first plan should be valid");
+        let second_plan =
+            lifecycle_plan(&second, first_scope).expect("second plan should be valid");
 
         assert_eq!(first_plan.owner_name(), "inbound_tproxy");
         assert_eq!(second_plan.owner_name(), "inbound_tproxy");
-        assert!(matches!(
-            InboundTproxyLifecyclePlan::from_config_and_scope(
-                &outbound,
-                setup_scope(first.selector.as_ref().expect("selector should be set")),
-            ),
-            Err(NftablesPlanError::UnsupportedExecutableStrategy { .. })
-        ));
     }
 
     #[test]
@@ -307,7 +280,7 @@ mod tests {
             },
         )));
 
-        let error = InboundTproxyLifecyclePlan::from_config_and_scope(
+        let error = lifecycle_plan(
             &config,
             setup_scope(config.selector.as_ref().expect("selector should be set")),
         )
@@ -330,7 +303,7 @@ mod tests {
             },
         )));
 
-        let error = InboundTproxyLifecyclePlan::from_config_and_scope(
+        let error = lifecycle_plan(
             &config,
             setup_scope(config.selector.as_ref().expect("selector should be set")),
         )
@@ -356,5 +329,18 @@ mod tests {
     fn setup_scope(selector: &Selector) -> TransparentInterceptionHostRuleScope {
         TransparentInterceptionHostRuleScope::from_inbound_tproxy_selector(Some(selector))
             .expect("test selector should project to host rules")
+    }
+
+    fn lifecycle_plan(
+        config: &EnforcementInterceptionConfig,
+        setup_scope: TransparentInterceptionHostRuleScope,
+    ) -> Result<InboundTproxyLifecyclePlan, NftablesPlanError> {
+        let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(config)
+            .expect("test transparent interception config should be valid");
+        let TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) = execution_plan
+        else {
+            panic!("test transparent interception config should use inbound TPROXY");
+        };
+        InboundTproxyLifecyclePlan::from_inbound_plan_and_scope(&inbound_plan, setup_scope)
     }
 }

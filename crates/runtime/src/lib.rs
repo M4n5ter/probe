@@ -10,6 +10,9 @@ pub use plan::{
     PlatformProbeResults, ProviderRegistry, RuntimeError, RuntimePlan, StoragePlan,
     StorageRetentionPlan, TlsDecryptHintPlan, TlsMaterialPlan, TlsPlaintextCapabilityPlan,
     TlsPlaintextInstrumentationPlan, TlsPlaintextMaterialPlan, TlsPlaintextPlan, TlsPlan,
+    TransparentInterceptionExecutionPlan, TransparentInterceptionInboundTproxyPlan,
     TransparentInterceptionLocalSetupScopePlan, TransparentInterceptionNftablesPlan,
-    TransparentInterceptionProxyPlan, WebhookExportSinkPlan, validate_static_runtime_config,
+    TransparentInterceptionOutboundMitmPlan, TransparentInterceptionProxyHealthProbePlan,
+    TransparentInterceptionProxyPlan, TransparentInterceptionProxyPlanError, WebhookExportSinkPlan,
+    validate_static_runtime_config,
 };

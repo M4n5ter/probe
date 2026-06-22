@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::{fmt, net::SocketAddr, num::NonZeroU16, path::PathBuf};
 
 use probe_config::{
-    AgentConfig, ConnectionEnforcementBackendConfig, EnforcementPolicySourceConfig,
-    TransparentInterceptionProxyConfig, TransparentInterceptionProxyHealthProbeConfig,
+    AgentConfig, ConnectionEnforcementBackendConfig, EnforcementInterceptionConfig,
+    EnforcementPolicySourceConfig, TransparentInterceptionProxyHealthProbeIntent,
+    TransparentInterceptionProxyIntent, TransparentInterceptionProxyIntentViolation,
     TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
 };
 use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
@@ -26,7 +27,7 @@ pub struct EnforcementPlan {
 }
 
 impl EnforcementPlan {
-    pub fn resolve(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
+    pub(super) fn resolve(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
         Self {
             mode: config.enforcement.mode,
             execution_surfaces: enabled_execution_surfaces(config),
@@ -90,6 +91,7 @@ impl EnforcementConnectionPlan {
 pub struct EnforcementInterceptionPlan {
     pub strategy: TransparentInterceptionStrategyConfig,
     pub proxy: TransparentInterceptionProxyPlan,
+    pub execution: TransparentInterceptionExecutionPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
     pub local_setup_scope: TransparentInterceptionLocalSetupScopePlan,
     pub capability: EnforcementCapabilityPlan,
@@ -98,12 +100,16 @@ pub struct EnforcementInterceptionPlan {
 
 impl EnforcementInterceptionPlan {
     fn from_config(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
-        let strategy = config.enforcement.interception.strategy;
+        let intent = config
+            .enforcement
+            .interception
+            .transparent_proxy_intent()
+            .expect("transparent interception config should be validated before planning");
+        let strategy = intent.strategy();
         Self {
             strategy,
-            proxy: TransparentInterceptionProxyPlan::from_config(
-                &config.enforcement.interception.proxy,
-            ),
+            proxy: TransparentInterceptionProxyPlan::from_intent(&intent),
+            execution: TransparentInterceptionExecutionPlan::from_intent(&intent),
             nftables: TransparentInterceptionNftablesPlan::reserved(),
             local_setup_scope:
                 TransparentInterceptionLocalSetupScopePlan::from_strategy_and_selectors(
@@ -124,16 +130,168 @@ impl EnforcementInterceptionPlan {
 pub struct TransparentInterceptionProxyPlan {
     pub mode: TransparentInterceptionProxyModeConfig,
     pub listen_port: Option<u16>,
-    pub health_probe: TransparentInterceptionProxyHealthProbeConfig,
+    pub health_probe: TransparentInterceptionProxyHealthProbePlan,
 }
 
 impl TransparentInterceptionProxyPlan {
-    fn from_config(config: &TransparentInterceptionProxyConfig) -> Self {
+    pub fn try_from_config(
+        config: &EnforcementInterceptionConfig,
+    ) -> Result<Self, TransparentInterceptionProxyPlanError> {
+        let intent = config
+            .transparent_proxy_intent()
+            .map_err(TransparentInterceptionProxyPlanError::new)?;
+        Ok(Self::from_intent(&intent))
+    }
+
+    fn from_intent(intent: &TransparentInterceptionProxyIntent) -> Self {
         Self {
-            mode: config.mode,
-            listen_port: config.listen_port,
-            health_probe: config.health_probe.clone(),
+            mode: intent.mode(),
+            listen_port: intent.listen_port().map(NonZeroU16::get),
+            health_probe: TransparentInterceptionProxyHealthProbePlan::from_intent(
+                intent.health_probe().clone(),
+            ),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransparentInterceptionProxyPlanError {
+    violations: Vec<TransparentInterceptionProxyIntentViolation>,
+}
+
+impl TransparentInterceptionProxyPlanError {
+    fn new(violations: Vec<TransparentInterceptionProxyIntentViolation>) -> Self {
+        Self { violations }
+    }
+
+    pub fn violations(&self) -> &[TransparentInterceptionProxyIntentViolation] {
+        &self.violations
+    }
+}
+
+impl fmt::Display for TransparentInterceptionProxyPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("transparent interception proxy config is invalid")?;
+        for violation in &self.violations {
+            write!(formatter, "; {}: {}", violation.field(), violation.reason())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for TransparentInterceptionProxyPlanError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "strategy")]
+pub enum TransparentInterceptionExecutionPlan {
+    Disabled,
+    InboundTproxy(TransparentInterceptionInboundTproxyPlan),
+    OutboundMitm(TransparentInterceptionOutboundMitmPlan),
+}
+
+impl TransparentInterceptionExecutionPlan {
+    pub fn try_from_config(
+        config: &EnforcementInterceptionConfig,
+    ) -> Result<Self, TransparentInterceptionProxyPlanError> {
+        let intent = config
+            .transparent_proxy_intent()
+            .map_err(TransparentInterceptionProxyPlanError::new)?;
+        Ok(Self::from_intent(&intent))
+    }
+
+    fn from_intent(intent: &TransparentInterceptionProxyIntent) -> Self {
+        match intent {
+            TransparentInterceptionProxyIntent::Disabled(_) => Self::Disabled,
+            TransparentInterceptionProxyIntent::InboundTproxy(proxy) => {
+                Self::InboundTproxy(TransparentInterceptionInboundTproxyPlan {
+                    proxy_mode: proxy.mode(),
+                    listen_port: proxy.listen_port(),
+                    health_probe: TransparentInterceptionProxyHealthProbePlan::from_intent(
+                        proxy.health_probe().clone(),
+                    ),
+                })
+            }
+            TransparentInterceptionProxyIntent::OutboundMitm(proxy) => {
+                Self::OutboundMitm(TransparentInterceptionOutboundMitmPlan {
+                    listen_port: proxy.listen_port(),
+                })
+            }
+        }
+    }
+
+    pub fn strategy(&self) -> TransparentInterceptionStrategyConfig {
+        match self {
+            Self::Disabled => TransparentInterceptionStrategyConfig::None,
+            Self::InboundTproxy(_) => TransparentInterceptionStrategyConfig::InboundTproxy,
+            Self::OutboundMitm(_) => TransparentInterceptionStrategyConfig::OutboundMitm,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionInboundTproxyPlan {
+    proxy_mode: TransparentInterceptionProxyModeConfig,
+    listen_port: NonZeroU16,
+    health_probe: TransparentInterceptionProxyHealthProbePlan,
+}
+
+impl TransparentInterceptionInboundTproxyPlan {
+    pub fn proxy_mode(&self) -> TransparentInterceptionProxyModeConfig {
+        self.proxy_mode
+    }
+
+    pub fn listen_port(&self) -> NonZeroU16 {
+        self.listen_port
+    }
+
+    pub fn health_probe(&self) -> &TransparentInterceptionProxyHealthProbePlan {
+        &self.health_probe
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionOutboundMitmPlan {
+    listen_port: NonZeroU16,
+}
+
+impl TransparentInterceptionOutboundMitmPlan {
+    pub fn listen_port(&self) -> NonZeroU16 {
+        self.listen_port
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum TransparentInterceptionProxyHealthProbePlan {
+    Disabled,
+    Enabled {
+        target: SocketAddr,
+        interval_ms: u64,
+        timeout_ms: u64,
+        failure_threshold: u32,
+    },
+}
+
+impl TransparentInterceptionProxyHealthProbePlan {
+    fn from_intent(intent: TransparentInterceptionProxyHealthProbeIntent) -> Self {
+        match intent {
+            TransparentInterceptionProxyHealthProbeIntent::Disabled => Self::Disabled,
+            TransparentInterceptionProxyHealthProbeIntent::Enabled {
+                target,
+                interval_ms,
+                timeout_ms,
+                failure_threshold,
+            } => Self::Enabled {
+                target,
+                interval_ms,
+                timeout_ms,
+                failure_threshold,
+            },
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled { .. })
     }
 }
 
@@ -420,12 +578,16 @@ mod tests {
         );
         assert_eq!(plan.interception.proxy.listen_port, Some(15001));
         assert_eq!(
-            plan.interception.proxy.health_probe.target.as_deref(),
-            Some("127.0.0.1:18080")
+            plan.interception.proxy.health_probe,
+            TransparentInterceptionProxyHealthProbePlan::Enabled {
+                target: "127.0.0.1:18080"
+                    .parse()
+                    .expect("test socket address should parse"),
+                interval_ms: 500,
+                timeout_ms: 100,
+                failure_threshold: 2,
+            }
         );
-        assert_eq!(plan.interception.proxy.health_probe.interval_ms, 500);
-        assert_eq!(plan.interception.proxy.health_probe.timeout_ms, 100);
-        assert_eq!(plan.interception.proxy.health_probe.failure_threshold, 2);
         assert_eq!(plan.interception.nftables.table_name, "sssa_probe");
         assert_eq!(plan.interception.nftables.mark, 0x5353_4101);
         assert_eq!(plan.interception.nftables.route_table, 53_534);

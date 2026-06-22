@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use probe_config::{
-    EnforcementInterceptionConfig, TransparentInterceptionProxyHealthProbeConfig,
-    TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
+use ::runtime::{
+    TransparentInterceptionExecutionPlan, TransparentInterceptionProxyHealthProbePlan,
 };
+use probe_config::TransparentInterceptionProxyModeConfig;
 use serde::Serialize;
 
 use crate::transparent_interception::TransparentInterceptionIpFamily;
@@ -85,27 +85,62 @@ struct TransparentProxyRuntimeState {
 }
 
 impl TransparentProxyRuntime {
-    pub(crate) fn for_config(config: &EnforcementInterceptionConfig) -> Self {
-        let mode = match (config.strategy, config.proxy.mode) {
-            (TransparentInterceptionStrategyConfig::None, _) => {
-                TransparentProxyRuntimeMode::Disabled
+    pub(crate) fn disabled() -> Self {
+        Self::new(
+            TransparentProxyRuntimeMode::Disabled,
+            TransparentProxyHealthProbeSnapshot::disabled(),
+            1,
+        )
+    }
+
+    pub(crate) fn for_execution_plan(plan: &TransparentInterceptionExecutionPlan) -> Self {
+        let (mode, health_probe_plan) = match plan {
+            TransparentInterceptionExecutionPlan::Disabled => {
+                (TransparentProxyRuntimeMode::Disabled, None)
             }
-            (_, TransparentInterceptionProxyModeConfig::External) => {
-                TransparentProxyRuntimeMode::External
+            TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) => {
+                let mode = match inbound_plan.proxy_mode() {
+                    TransparentInterceptionProxyModeConfig::External => {
+                        TransparentProxyRuntimeMode::External
+                    }
+                    TransparentInterceptionProxyModeConfig::ManagedTcpRelay => {
+                        TransparentProxyRuntimeMode::Configured
+                    }
+                };
+                (mode, Some(inbound_plan.health_probe()))
             }
-            (_, TransparentInterceptionProxyModeConfig::ManagedTcpRelay) => {
-                TransparentProxyRuntimeMode::Configured
+            TransparentInterceptionExecutionPlan::OutboundMitm(_) => {
+                (TransparentProxyRuntimeMode::External, None)
             }
         };
+        let health_probe = health_probe_plan
+            .map_or_else(TransparentProxyHealthProbeSnapshot::disabled, |plan| {
+                TransparentProxyHealthProbeSnapshot::from_plan(plan)
+            });
+        let health_probe_failure_threshold =
+            health_probe_plan.map_or(1, health_probe_failure_threshold);
+        Self::new(mode, health_probe, health_probe_failure_threshold)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_config(config: &probe_config::EnforcementInterceptionConfig) -> Self {
+        let plan = TransparentInterceptionExecutionPlan::try_from_config(config)
+            .expect("test transparent interception config should be valid");
+        Self::for_execution_plan(&plan)
+    }
+
+    fn new(
+        mode: TransparentProxyRuntimeMode,
+        health_probe: TransparentProxyHealthProbeSnapshot,
+        health_probe_failure_threshold: u32,
+    ) -> Self {
         Self {
             handle: TransparentProxyRuntimeHandle {
                 inner: Arc::new(Mutex::new(TransparentProxyRuntimeState {
                     snapshot: TransparentProxyRuntimeSnapshot {
                         mode,
                         listener_families: Vec::new(),
-                        health_probe: TransparentProxyHealthProbeSnapshot::from_config(
-                            &config.proxy.health_probe,
-                        ),
+                        health_probe,
                         upstream_connects: TransparentProxyConnectMetricsSnapshot {
                             connect_successes: 0,
                             connect_failures: 0,
@@ -117,7 +152,7 @@ impl TransparentProxyRuntime {
                         relay_failures: 0,
                         listener_failures: 0,
                     },
-                    health_probe_failure_threshold: config.proxy.health_probe.failure_threshold,
+                    health_probe_failure_threshold,
                 })),
             },
         }
@@ -248,19 +283,35 @@ impl TransparentProxyRuntime {
 }
 
 impl TransparentProxyHealthProbeSnapshot {
-    fn from_config(config: &TransparentInterceptionProxyHealthProbeConfig) -> Self {
-        let mode = if config.is_enabled() {
+    fn disabled() -> Self {
+        Self {
+            mode: TransparentProxyHealthProbeMode::Disabled,
+            check_successes: 0,
+            check_failures: 0,
+            consecutive_failures: 0,
+            last_failure_reason: None,
+        }
+    }
+
+    fn from_plan(plan: &TransparentInterceptionProxyHealthProbePlan) -> Self {
+        let mode = if plan.is_enabled() {
             TransparentProxyHealthProbeMode::Pending
         } else {
             TransparentProxyHealthProbeMode::Disabled
         };
         Self {
             mode,
-            check_successes: 0,
-            check_failures: 0,
-            consecutive_failures: 0,
-            last_failure_reason: None,
+            ..Self::disabled()
         }
+    }
+}
+
+fn health_probe_failure_threshold(plan: &TransparentInterceptionProxyHealthProbePlan) -> u32 {
+    match plan {
+        TransparentInterceptionProxyHealthProbePlan::Disabled => 1,
+        TransparentInterceptionProxyHealthProbePlan::Enabled {
+            failure_threshold, ..
+        } => *failure_threshold,
     }
 }
 
@@ -350,7 +401,8 @@ impl TransparentProxyRuntimeSnapshot {
 #[cfg(test)]
 mod tests {
     use probe_config::{
-        TransparentInterceptionProxyConfig, TransparentInterceptionProxyHealthProbeConfig,
+        EnforcementInterceptionConfig, TransparentInterceptionProxyConfig,
+        TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionStrategyConfig,
     };
 
     use super::*;
@@ -358,7 +410,7 @@ mod tests {
     #[test]
     fn runtime_mode_follows_interception_config() {
         assert_eq!(
-            TransparentProxyRuntime::for_config(&EnforcementInterceptionConfig::default())
+            TransparentProxyRuntime::for_test_config(&EnforcementInterceptionConfig::default())
                 .handle()
                 .snapshot()
                 .mode,
@@ -366,7 +418,7 @@ mod tests {
         );
 
         assert_eq!(
-            TransparentProxyRuntime::for_config(&interception_config(
+            TransparentProxyRuntime::for_test_config(&interception_config(
                 TransparentInterceptionStrategyConfig::InboundTproxy,
                 TransparentInterceptionProxyModeConfig::External,
             ))
@@ -377,7 +429,7 @@ mod tests {
         );
 
         assert_eq!(
-            TransparentProxyRuntime::for_config(&interception_config(
+            TransparentProxyRuntime::for_test_config(&interception_config(
                 TransparentInterceptionStrategyConfig::InboundTproxy,
                 TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
             ))
@@ -390,7 +442,8 @@ mod tests {
 
     #[test]
     fn health_probe_state_follows_configured_checks() {
-        let state = TransparentProxyRuntime::for_config(&interception_config_with_health_probe());
+        let state =
+            TransparentProxyRuntime::for_test_config(&interception_config_with_health_probe());
         let handle = state.handle();
 
         let snapshot = handle.snapshot();
@@ -437,7 +490,7 @@ mod tests {
 
     #[test]
     fn runtime_counters_follow_relay_lifecycle() {
-        let state = TransparentProxyRuntime::for_config(&interception_config(
+        let state = TransparentProxyRuntime::for_test_config(&interception_config(
             TransparentInterceptionStrategyConfig::InboundTproxy,
             TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
         ));
@@ -493,7 +546,7 @@ mod tests {
 
     #[test]
     fn upstream_connect_metrics_follow_connect_results() {
-        let state = TransparentProxyRuntime::for_config(&interception_config(
+        let state = TransparentProxyRuntime::for_test_config(&interception_config(
             TransparentInterceptionStrategyConfig::InboundTproxy,
             TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
         ));
@@ -529,7 +582,7 @@ mod tests {
 
     #[test]
     fn clean_stop_marks_proxy_stopped_without_forging_relay_lifecycle() {
-        let state = TransparentProxyRuntime::for_config(&interception_config(
+        let state = TransparentProxyRuntime::for_test_config(&interception_config(
             TransparentInterceptionStrategyConfig::InboundTproxy,
             TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
         ));

@@ -22,8 +22,11 @@ pub use enforcement::{
     MAX_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS, MAX_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS,
     MIN_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD,
     MIN_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS, MIN_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS,
+    TransparentInterceptionDisabledProxyIntent, TransparentInterceptionEnabledProxyIntent,
     TransparentInterceptionProxyConfig, TransparentInterceptionProxyHealthProbeConfig,
-    TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
+    TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
+    TransparentInterceptionProxyIntentViolation, TransparentInterceptionProxyModeConfig,
+    TransparentInterceptionStrategyConfig,
 };
 pub use export::{
     CompressionCodecName, DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK,

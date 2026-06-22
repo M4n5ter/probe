@@ -410,9 +410,10 @@ mod tests {
             pipeline.run_provider(&mut provider)?;
         }
         let plan = Arc::new(runtime_plan(spool_path)?);
-        let transparent_proxy_runtime =
-            crate::transparent_interception::resolve(&plan.config.enforcement.interception)
-                .proxy_runtime_handle();
+        let transparent_proxy_runtime = crate::transparent_interception::resolve(
+            plan.enforcement.interception.execution.clone(),
+        )
+        .proxy_runtime_handle();
         let server = spawn_admin_server(
             Arc::clone(&plan),
             Arc::clone(&spool),

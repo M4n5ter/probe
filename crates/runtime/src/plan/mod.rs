@@ -16,8 +16,10 @@ pub use capture::{
 pub use enforcement::{
     EnforcementCapabilityPlan, EnforcementConnectionPlan, EnforcementExecutionSurface,
     EnforcementInterceptionPlan, EnforcementPlan, EnforcementPolicySourceKind,
-    EnforcementPolicySourcePlan, TransparentInterceptionNftablesPlan,
-    TransparentInterceptionProxyPlan,
+    EnforcementPolicySourcePlan, TransparentInterceptionExecutionPlan,
+    TransparentInterceptionInboundTproxyPlan, TransparentInterceptionNftablesPlan,
+    TransparentInterceptionOutboundMitmPlan, TransparentInterceptionProxyHealthProbePlan,
+    TransparentInterceptionProxyPlan, TransparentInterceptionProxyPlanError,
 };
 pub use error::RuntimeError;
 pub use export::{

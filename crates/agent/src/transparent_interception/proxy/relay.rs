@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn upstream_connect_success_records_connect_metrics() -> Result<(), Box<dyn std::error::Error>>
     {
-        let runtime = TransparentProxyRuntime::for_config(&managed_interception_config());
+        let runtime = TransparentProxyRuntime::for_test_config(&managed_interception_config());
         let handle = runtime.handle();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 42000));
@@ -341,7 +341,7 @@ mod tests {
     #[test]
     fn upstream_connect_failure_records_connect_metrics() -> Result<(), Box<dyn std::error::Error>>
     {
-        let runtime = TransparentProxyRuntime::for_config(&managed_interception_config());
+        let runtime = TransparentProxyRuntime::for_test_config(&managed_interception_config());
         let handle = runtime.handle();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let target = listener.local_addr()?;
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn upstream_connect_failure_is_not_a_relay_failure() -> Result<(), Box<dyn std::error::Error>> {
-        let runtime = TransparentProxyRuntime::for_config(&managed_interception_config());
+        let runtime = TransparentProxyRuntime::for_test_config(&managed_interception_config());
         let handle = runtime.handle();
         let registry = RelayRegistry::new(runtime.clone());
         let slot = registry

@@ -1,7 +1,7 @@
 use enforcement::EnforcementBackend;
 use probe_config::AgentConfig;
 use probe_core::CapabilityMatrix;
-use runtime::{ProviderRegistry, RuntimePlan};
+use runtime::{ProviderRegistry, RuntimePlan, TransparentInterceptionExecutionPlan};
 
 use crate::{
     capture_registry::default_provider_registry,
@@ -65,9 +65,15 @@ pub(crate) fn capability_matrix_for_config(config: &AgentConfig) -> CapabilityMa
 fn execution_runtimes_for_config(
     config: &AgentConfig,
 ) -> (ConnectionEnforcementRuntime, TransparentInterceptionRuntime) {
+    let transparent_interception_execution =
+        TransparentInterceptionExecutionPlan::try_from_config(&config.enforcement.interception);
+    let transparent_interception = match transparent_interception_execution {
+        Ok(execution_plan) => transparent_interception::resolve(execution_plan),
+        Err(error) => transparent_interception::unavailable_for_config_error(error.to_string()),
+    };
     (
         connection_enforcement::resolve(config.enforcement.backend),
-        transparent_interception::resolve(&config.enforcement.interception),
+        transparent_interception,
     )
 }
 
@@ -86,7 +92,10 @@ fn provider_registry_for_runtimes(
 #[cfg(test)]
 mod tests {
     use probe_config::{CaptureSelection, TransparentInterceptionStrategyConfig};
-    use probe_core::{Direction, EnforcementMode, ProcessSelector, Selector, TrafficSelector};
+    use probe_core::{
+        CapabilityKind, Direction, EnforcementMode, ProcessSelector, RuntimeMode, Selector,
+        TrafficSelector,
+    };
 
     use super::*;
 
@@ -121,5 +130,37 @@ mod tests {
         };
 
         assert!(error.to_string().contains("proxy self-bypass"));
+    }
+
+    #[test]
+    fn invalid_transparent_proxy_plan_does_not_panic_during_capability_probe() {
+        let mut config = AgentConfig::default();
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.proxy.health_probe.target =
+            Some("not-a-socket-address".to_string());
+
+        let capabilities = capability_matrix_for_config(&config);
+        let transparent_interception = capabilities
+            .states()
+            .iter()
+            .find(|state| state.kind == CapabilityKind::TransparentInterception)
+            .expect("transparent interception capability should be reported");
+
+        assert_eq!(transparent_interception.mode, RuntimeMode::Unavailable);
+        assert!(
+            transparent_interception
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("IP socket address"))
+        );
+
+        let error = match build_runtime_composition(config) {
+            Ok(_) => panic!("runtime build should still return a config validation error"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("health_probe.target"));
     }
 }

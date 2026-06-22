@@ -615,13 +615,33 @@ protective_actions = ["alert"]
         config.capture.selection = probe_config::CaptureSelection::Libpcap;
         config.enforcement.mode = probe_core::EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
-            probe_config::TransparentInterceptionStrategyConfig::OutboundMitm;
+            probe_config::TransparentInterceptionStrategyConfig::InboundTproxy;
         config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.proxy.health_probe.target =
+            Some("127.0.0.1:18080".to_string());
+        config
+            .enforcement
+            .interception
+            .proxy
+            .health_probe
+            .interval_ms = 500;
+        config
+            .enforcement
+            .interception
+            .proxy
+            .health_probe
+            .timeout_ms = 100;
+        config
+            .enforcement
+            .interception
+            .proxy
+            .health_probe
+            .failure_threshold = 2;
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
-                remote_ports: vec![443],
-                directions: vec![Direction::Outbound],
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
                 ..TrafficSelector::default()
             },
         ));
@@ -640,7 +660,7 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             status.interception.strategy,
-            probe_config::TransparentInterceptionStrategyConfig::OutboundMitm
+            probe_config::TransparentInterceptionStrategyConfig::InboundTproxy
         );
         assert_eq!(
             status.interception.proxy.mode,
@@ -652,7 +672,7 @@ protective_actions = ["alert"]
         assert!(status.interception.selector_configured);
         assert!(matches!(
             status.interception.local_setup_scope,
-            runtime::TransparentInterceptionLocalSetupScopePlan::Unsupported { .. }
+            runtime::TransparentInterceptionLocalSetupScopePlan::HostRules
         ));
         assert_eq!(
             status.interception.capability,
@@ -662,16 +682,36 @@ protective_actions = ["alert"]
             }
         );
         let value = serde_json::to_value(&status)?;
-        assert_eq!(value["interception"]["strategy"], json!("outbound_mitm"));
+        assert_eq!(value["interception"]["strategy"], json!("inbound_tproxy"));
         assert_eq!(value["interception"]["proxy"]["mode"], json!("external"));
         assert_eq!(value["interception"]["proxy"]["listen_port"], json!(15001));
+        assert_eq!(
+            value["interception"]["proxy"]["health_probe"]["mode"],
+            json!("enabled")
+        );
+        assert_eq!(
+            value["interception"]["proxy"]["health_probe"]["target"],
+            json!("127.0.0.1:18080")
+        );
+        assert_eq!(
+            value["interception"]["proxy"]["health_probe"]["interval_ms"],
+            json!(500)
+        );
+        assert_eq!(
+            value["interception"]["proxy"]["health_probe"]["timeout_ms"],
+            json!(100)
+        );
+        assert_eq!(
+            value["interception"]["proxy"]["health_probe"]["failure_threshold"],
+            json!(2)
+        );
         assert_eq!(
             value["interception"]["nftables"]["table_name"],
             json!("sssa_probe")
         );
         assert_eq!(
             value["interception"]["local_setup_scope"]["kind"],
-            json!("unsupported")
+            json!("host_rules")
         );
         assert_eq!(
             value["interception"]["capability"]["capability"],
