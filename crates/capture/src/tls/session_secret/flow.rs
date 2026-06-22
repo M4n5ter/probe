@@ -32,6 +32,7 @@ impl Tls13SessionSecretFlowDecryptor {
             flow,
             direction,
             cursor,
+            missing_plaintext_prefix,
         } = binding;
         let key = Tls13SessionSecretStreamKey::new(flow.id.clone(), direction);
         if self.streams.contains_key(&key) {
@@ -44,6 +45,10 @@ impl Tls13SessionSecretFlowDecryptor {
             &record, flow, direction, cursor,
         )?
         .with_degradation("TLS session-secret decrypt uses best-effort ciphertext capture");
+        let adapter = match missing_plaintext_prefix {
+            Some(prefix) => adapter.with_missing_plaintext_prefix(prefix),
+            None => adapter,
+        };
         self.streams.insert(key, adapter);
         Ok(())
     }

@@ -1,3 +1,5 @@
+use std::num::NonZeroU64;
+
 use probe_core::{Direction, FlowContext, Timestamp};
 use thiserror::Error;
 
@@ -16,6 +18,8 @@ pub struct Tls13SessionSecretFlowBinding {
     pub(in crate::tls::session_secret) flow: FlowContext,
     pub(in crate::tls::session_secret) direction: Direction,
     pub(in crate::tls::session_secret) cursor: Tls13SessionSecretStreamCursor,
+    pub(in crate::tls::session_secret) missing_plaintext_prefix:
+        Option<Tls13SessionSecretMissingPlaintextPrefix>,
 }
 
 impl Tls13SessionSecretFlowBinding {
@@ -30,7 +34,46 @@ impl Tls13SessionSecretFlowBinding {
             flow,
             direction,
             cursor,
+            missing_plaintext_prefix: None,
         }
+    }
+
+    pub(in crate::tls::session_secret) fn with_cursor(
+        mut self,
+        cursor: Tls13SessionSecretStreamCursor,
+    ) -> Self {
+        self.cursor = cursor;
+        self
+    }
+
+    pub(in crate::tls::session_secret) fn with_missing_plaintext_prefix(
+        mut self,
+        prefix: Tls13SessionSecretMissingPlaintextPrefix,
+    ) -> Self {
+        self.missing_plaintext_prefix = Some(prefix);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tls::session_secret) struct Tls13SessionSecretMissingPlaintextPrefix {
+    skipped_application_records: NonZeroU64,
+}
+
+impl Tls13SessionSecretMissingPlaintextPrefix {
+    pub(in crate::tls::session_secret) fn from_skipped_application_records(
+        skipped_application_records: u64,
+    ) -> Option<Self> {
+        NonZeroU64::new(skipped_application_records).map(|skipped_application_records| Self {
+            skipped_application_records,
+        })
+    }
+
+    pub(in crate::tls::session_secret) fn reason(self) -> String {
+        format!(
+            "TLS session-secret auto-binding started after {} earlier application-data protected record(s); earlier plaintext is unavailable",
+            self.skipped_application_records
+        )
     }
 }
 

@@ -174,6 +174,62 @@ mod tests {
     }
 
     #[test]
+    fn auto_binding_provider_binds_later_record_when_store_arrives_after_first_application_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let AutoBindingFixture {
+            store,
+            flow,
+            client_hello,
+            application_record,
+        } = auto_binding_fixture()?;
+        let second_application_record =
+            protected_application_record(&store.records()[0], 1, b"second")?;
+        let mut provider = auto_provider(
+            None,
+            [
+                outbound_bytes_event(&flow, 0, client_hello.clone()),
+                outbound_bytes_event(&flow, client_hello.len() as u64, application_record.clone()),
+                outbound_bytes_event(
+                    &flow,
+                    (client_hello.len() + application_record.len()) as u64,
+                    second_application_record,
+                ),
+            ],
+        );
+
+        assert_next_libpcap_bytes(&mut provider, client_hello.as_slice())?;
+        assert_next_libpcap_bytes(&mut provider, application_record.as_slice())?;
+        provider.replace_store(store);
+
+        let Some(CaptureEvent::Gap(gap)) = provider.next()? else {
+            panic!("late binding should expose skipped plaintext as a gap");
+        };
+        assert_eq!(gap.origin.source(), CaptureSource::TlsSessionSecret);
+        assert_eq!(gap.gap.direction, Direction::Outbound);
+        assert_eq!(gap.gap.expected_offset, 0);
+        assert_eq!(gap.gap.next_offset, None);
+        assert!(gap.gap.reason.contains("earlier plaintext is unavailable"));
+
+        let bytes = assert_next_tls_session_secret_bytes(&mut provider, b"second")?;
+        assert_eq!(bytes.stream_offset, 0);
+        assert!(bytes.degraded);
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn auto_binding_provider_binds_at_sequence_window_boundary_after_material_arrives_late()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_late_material_sequence_window_boundary(true)
+    }
+
+    #[test]
+    fn auto_binding_provider_passes_through_after_sequence_window_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_late_material_sequence_window_boundary(false)
+    }
+
+    #[test]
     fn auto_binding_provider_pre_auth_candidate_uses_refreshed_material_before_binding()
     -> Result<(), Box<dyn std::error::Error>> {
         let AutoBindingFixture {
@@ -663,6 +719,59 @@ mod tests {
         assert_next_libpcap_bytes(&mut provider, client_hello.as_slice())?;
         assert_next_libpcap_bytes(&mut provider, &application_record[..split_at])?;
         assert_next_libpcap_bytes(&mut provider, &application_record[split_at..])?;
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    fn assert_late_material_sequence_window_boundary(
+        within_window: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let AutoBindingFixture {
+            store,
+            flow,
+            client_hello,
+            application_record,
+        } = auto_binding_fixture()?;
+        let sequence_number = if within_window {
+            super::super::TLS13_AUTO_BIND_MAX_SEQUENCE_NUMBER
+        } else {
+            super::super::TLS13_AUTO_BIND_MAX_SEQUENCE_NUMBER + 1
+        };
+        let boundary_record =
+            protected_application_record(&store.records()[0], sequence_number, b"boundary")?;
+        let mut provider = auto_provider(
+            None,
+            [
+                outbound_bytes_event(&flow, 0, client_hello.clone()),
+                outbound_bytes_event(&flow, client_hello.len() as u64, application_record.clone()),
+                outbound_bytes_event(
+                    &flow,
+                    (client_hello.len() + application_record.len()) as u64,
+                    boundary_record.clone(),
+                ),
+            ],
+        );
+
+        assert_next_libpcap_bytes(&mut provider, client_hello.as_slice())?;
+        assert_next_libpcap_bytes(&mut provider, application_record.as_slice())?;
+        provider.replace_store(store);
+
+        if within_window {
+            let Some(CaptureEvent::Gap(gap)) = provider.next()? else {
+                panic!("late boundary binding should expose skipped plaintext as a gap");
+            };
+            assert_eq!(gap.origin.source(), CaptureSource::TlsSessionSecret);
+            assert!(
+                gap.gap
+                    .reason
+                    .contains(&format!("after {sequence_number} earlier"))
+            );
+            let bytes = assert_next_tls_session_secret_bytes(&mut provider, b"boundary")?;
+            assert!(bytes.degraded);
+        } else {
+            assert_next_libpcap_bytes(&mut provider, boundary_record.as_slice())?;
+        }
+
         assert!(provider.next()?.is_none());
         Ok(())
     }

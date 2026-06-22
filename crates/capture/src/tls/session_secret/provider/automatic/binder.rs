@@ -9,9 +9,11 @@ use super::super::super::{
     Tls13SessionSecretFlowCandidate, Tls13SessionSecretHandshakeObservation,
     Tls13SessionSecretHandshakeObservationKind, Tls13SessionSecretHandshakeObserver,
     Tls13SessionSecretStreamCursor, TlsSessionSecretStore,
+    binding::Tls13SessionSecretMissingPlaintextPrefix,
     frame::{TLS13_OUTER_APPLICATION_DATA, Tls13BufferedRecord, Tls13RecordFrame, TlsRecordHeader},
 };
 use super::super::Tls13SessionSecretDecryptingStreamKey;
+use super::TLS13_AUTO_BIND_MAX_SEQUENCE_NUMBER;
 use super::buffered::{Tls13SessionSecretBufferedBytes, sliced_event};
 use super::candidates::{Tls13SessionSecretCandidate, Tls13SessionSecretCandidateSet};
 
@@ -354,11 +356,9 @@ impl Tls13SessionSecretAutomaticBinder {
                             trailing_events: Vec::new(),
                         };
                     };
-                    let stream_cursor =
-                        Tls13SessionSecretStreamCursor::resume_at(ciphertext_offset, 0, 0);
                     let record = &held.payload()[cursor..cursor + len];
                     if let Some(binding) =
-                        self.candidate_decrypts_at(candidate, stream_cursor, record)
+                        self.candidate_decrypts_at(candidate, ciphertext_offset, record)
                     {
                         prefix_events.extend(held.drain_prefix(cursor));
                         return Tls13SessionSecretCandidateProbe::Bind {
@@ -386,14 +386,25 @@ impl Tls13SessionSecretAutomaticBinder {
     fn candidate_decrypts_at(
         &self,
         candidate: &Tls13SessionSecretBindingCandidate,
-        cursor: Tls13SessionSecretStreamCursor,
+        ciphertext_offset: u64,
         record: &[u8],
     ) -> Option<Tls13SessionSecretFlowBinding> {
-        let binding = self.binding_for_candidate(candidate, cursor)?;
-        let decrypts = Tls13ApplicationDataDecryptor::from_session_secret_record(&binding.record)
-            .and_then(|decryptor| decryptor.decrypt_record_at(cursor.sequence_number(), record))
-            .is_ok();
-        decrypts.then_some(binding)
+        let base_cursor = Tls13SessionSecretStreamCursor::resume_at(ciphertext_offset, 0, 0);
+        let binding = self.binding_for_candidate(candidate, base_cursor)?;
+        let decryptor =
+            Tls13ApplicationDataDecryptor::from_session_secret_record(&binding.record).ok()?;
+        let sequence_number = matching_sequence_number(&decryptor, record)?;
+        let cursor =
+            Tls13SessionSecretStreamCursor::resume_at(ciphertext_offset, 0, sequence_number);
+        let binding = binding.with_cursor(cursor);
+        Some(
+            match Tls13SessionSecretMissingPlaintextPrefix::from_skipped_application_records(
+                sequence_number,
+            ) {
+                Some(prefix) => binding.with_missing_plaintext_prefix(prefix),
+                None => binding,
+            },
+        )
     }
 
     fn binding_for_candidate(
@@ -403,6 +414,17 @@ impl Tls13SessionSecretAutomaticBinder {
     ) -> Option<Tls13SessionSecretFlowBinding> {
         binding_for_intent(self.store.as_ref(), &candidate.intent, cursor)
     }
+}
+
+fn matching_sequence_number(
+    decryptor: &Tls13ApplicationDataDecryptor,
+    record: &[u8],
+) -> Option<u64> {
+    (0..=TLS13_AUTO_BIND_MAX_SEQUENCE_NUMBER).find(|sequence_number| {
+        decryptor
+            .decrypt_record_at(*sequence_number, record)
+            .is_ok()
+    })
 }
 
 fn candidate_has_usable_material(

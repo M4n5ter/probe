@@ -6,6 +6,7 @@ use crate::{PlaintextEvent, PlaintextGap, PlaintextSource};
 
 use super::{
     Tls13SessionSecretPlaintextAdapter, Tls13SessionSecretPlaintextError, TlsSessionSecretRecord,
+    binding::Tls13SessionSecretMissingPlaintextPrefix,
     frame::{Tls13BufferedRecord, Tls13RecordFrame},
 };
 
@@ -14,6 +15,7 @@ pub struct Tls13SessionSecretStreamAdapter {
     plaintext: Tls13SessionSecretPlaintextAdapter,
     buffer: BytesMut,
     next_ciphertext_offset: u64,
+    missing_plaintext_prefix: Option<Tls13SessionSecretMissingPlaintextPrefix>,
     poisoned_reason: Option<String>,
 }
 
@@ -55,6 +57,7 @@ impl Tls13SessionSecretStreamAdapter {
             plaintext,
             buffer: BytesMut::new(),
             next_ciphertext_offset: cursor.ciphertext_offset,
+            missing_plaintext_prefix: None,
             poisoned_reason: None,
         }
     }
@@ -77,6 +80,14 @@ impl Tls13SessionSecretStreamAdapter {
 
     pub fn with_degradation(mut self, reason: impl Into<String>) -> Self {
         self.plaintext = self.plaintext.with_degradation(reason);
+        self
+    }
+
+    pub(in crate::tls::session_secret) fn with_missing_plaintext_prefix(
+        mut self,
+        prefix: Tls13SessionSecretMissingPlaintextPrefix,
+    ) -> Self {
+        self.missing_plaintext_prefix = Some(prefix);
         self
     }
 
@@ -118,7 +129,11 @@ impl Tls13SessionSecretStreamAdapter {
             .checked_add(bytes.len() as u64)
             .ok_or(Tls13SessionSecretStreamError::CiphertextOffsetExhausted)?;
         self.buffer.extend_from_slice(bytes);
-        let events = self.drain_records(timestamp);
+        let mut events: Vec<PlaintextEvent> = self
+            .missing_plaintext_prefix_gap(timestamp)
+            .into_iter()
+            .collect();
+        events.extend(self.drain_records(timestamp));
         Ok(if self.poisoned_reason.is_some() {
             Tls13SessionSecretStreamOutcome::terminal(events)
         } else {
@@ -188,6 +203,24 @@ impl Tls13SessionSecretStreamAdapter {
             }
         }
         events
+    }
+
+    fn missing_plaintext_prefix_gap(&mut self, timestamp: Timestamp) -> Option<PlaintextEvent> {
+        self.missing_plaintext_prefix.take().map(|prefix| {
+            PlaintextEvent::gap(
+                PlaintextSource::TlsSessionSecret,
+                PlaintextGap::new(
+                    timestamp,
+                    self.plaintext.flow().clone(),
+                    Gap {
+                        direction: self.plaintext.direction(),
+                        expected_offset: self.plaintext.next_stream_offset(),
+                        next_offset: None,
+                        reason: prefix.reason(),
+                    },
+                ),
+            )
+        })
     }
 
     fn poison_with_plaintext_gap(
