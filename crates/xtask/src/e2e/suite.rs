@@ -12,16 +12,18 @@ use super::{
     libpcap_loopback::run as run_libpcap_loopback,
     plaintext_feed::run as run_plaintext_feed,
     remote_enforcement_policy::run as run_remote_enforcement_policy,
+    tls_material_auto_binding_loopback::{
+        run as run_tls_session_secret_auto_binding_loopback,
+        run_key_log as run_tls_key_log_auto_binding_loopback,
+        run_key_log_refresh as run_tls_key_log_material_refresh_auto_binding_loopback,
+        run_refresh as run_tls_session_secret_material_refresh_auto_binding_loopback,
+    },
     tls_plaintext_dynamic_library::run as run_tls_plaintext_dynamic_library_loopback,
     tls_plaintext_loopback::{
         run as run_tls_plaintext_loopback, run_dynamic as run_tls_plaintext_dynamic_loopback,
         run_target_lifecycle as run_tls_plaintext_target_lifecycle_loopback,
     },
     tls_plaintext_provider_loopback::run as run_tls_plaintext_provider_loopback,
-    tls_session_secret_auto_binding_loopback::{
-        run as run_tls_session_secret_auto_binding_loopback,
-        run_refresh as run_tls_session_secret_material_refresh_auto_binding_loopback,
-    },
     transparent_tproxy_loopback::run as run_transparent_tproxy_loopback,
     webhook_exporter::run as run_webhook_exporter,
     websocket_plaintext_feed::run as run_websocket_plaintext_feed,
@@ -230,6 +232,16 @@ const E2E_CASES: &[E2eCase] = &[
         name: "e2e-tls-session-secret-material-refresh-auto-binding-loopback",
         requirement: E2eRequirement::RootCapNetRaw,
         run: run_tls_session_secret_material_refresh_auto_binding_loopback,
+    },
+    E2eCase {
+        name: "e2e-tls-keylog-auto-binding-loopback",
+        requirement: E2eRequirement::RootCapNetRaw,
+        run: run_tls_key_log_auto_binding_loopback,
+    },
+    E2eCase {
+        name: "e2e-tls-keylog-material-refresh-auto-binding-loopback",
+        requirement: E2eRequirement::RootCapNetRaw,
+        run: run_tls_key_log_material_refresh_auto_binding_loopback,
     },
     E2eCase {
         name: "e2e-transparent-tproxy-loopback",
