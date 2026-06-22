@@ -185,6 +185,7 @@ fn write_agent_config(path: &Path, spool_path: &Path) -> Result<(), Box<dyn std:
     config.enforcement.interception.proxy = TransparentInterceptionProxyConfig {
         mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
         listen_port: Some(PROXY_PORT),
+        ..TransparentInterceptionProxyConfig::default()
     };
     config.enforcement.interception.selector = Some(Selector::term(
         ProcessSelector::default(),

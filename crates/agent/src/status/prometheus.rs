@@ -2,7 +2,9 @@ use std::fmt::Write as _;
 
 use probe_core::RuntimeMode;
 
-use crate::status::AgentStatusSnapshot;
+use crate::{
+    status::AgentStatusSnapshot, transparent_interception::TransparentProxyHealthProbeMode,
+};
 
 pub(crate) const PROMETHEUS_TEXT_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -10,6 +12,13 @@ const RUNTIME_MODES: [RuntimeMode; 3] = [
     RuntimeMode::Available,
     RuntimeMode::Degraded,
     RuntimeMode::Unavailable,
+];
+
+const TRANSPARENT_PROXY_HEALTH_PROBE_MODES: [TransparentProxyHealthProbeMode; 4] = [
+    TransparentProxyHealthProbeMode::Disabled,
+    TransparentProxyHealthProbeMode::Pending,
+    TransparentProxyHealthProbeMode::Healthy,
+    TransparentProxyHealthProbeMode::Unhealthy,
 ];
 
 pub(crate) fn render_prometheus_metrics(snapshot: &AgentStatusSnapshot) -> String {
@@ -232,6 +241,40 @@ fn write_transparent_proxy(output: &mut String, snapshot: &AgentStatusSnapshot) 
         "sssa_transparent_proxy_active_relays",
         &[],
         metrics.active_relays,
+    );
+
+    write_family(
+        output,
+        "sssa_transparent_proxy_health_probe_mode",
+        "gauge",
+        "Configured transparent proxy active health probe mode as a one-hot gauge.",
+    );
+    for mode in TRANSPARENT_PROXY_HEALTH_PROBE_MODES {
+        write_sample(
+            output,
+            "sssa_transparent_proxy_health_probe_mode",
+            &[("mode", mode.wire_name())],
+            u64::from(metrics.health_probe.mode == mode),
+        );
+    }
+
+    write_family(
+        output,
+        "sssa_transparent_proxy_health_probe_checks_total",
+        "counter",
+        "Configured transparent proxy active health probe checks by outcome.",
+    );
+    write_sample(
+        output,
+        "sssa_transparent_proxy_health_probe_checks_total",
+        &[("outcome", "success")],
+        metrics.health_probe.check_successes,
+    );
+    write_sample(
+        output,
+        "sssa_transparent_proxy_health_probe_checks_total",
+        &[("outcome", "failure")],
+        metrics.health_probe.check_failures,
     );
 
     write_family(
@@ -500,7 +543,8 @@ mod tests {
     };
     use super::*;
     use crate::transparent_interception::{
-        TransparentProxyRuntimeMode, TransparentProxyRuntimeSnapshot,
+        TransparentProxyHealthProbeMode, TransparentProxyRuntimeMode,
+        TransparentProxyRuntimeSnapshot,
     };
 
     #[test]
@@ -549,7 +593,14 @@ mod tests {
                         TransparentProxyRuntimeMode::Configured,
                     )
                     .with_relay_counts(2, 3, 5, 7, 11)
-                    .with_upstream_connects(13, 17, Some("connection refused")),
+                    .with_upstream_connects(13, 17, Some("connection refused"))
+                    .with_health_probe(
+                        TransparentProxyHealthProbeMode::Healthy,
+                        19,
+                        23,
+                        0,
+                        None,
+                    ),
                 ),
                 ..RuntimeStatusInput::default()
             },
@@ -559,6 +610,13 @@ mod tests {
 
         assert!(metrics.contains("sssa_transparent_proxy_metrics_available 1\n"));
         assert!(metrics.contains("sssa_transparent_proxy_active_relays 2\n"));
+        assert!(metrics.contains("sssa_transparent_proxy_health_probe_mode{mode=\"healthy\"} 1\n"));
+        assert!(metrics.contains(
+            "sssa_transparent_proxy_health_probe_checks_total{outcome=\"success\"} 19\n"
+        ));
+        assert!(metrics.contains(
+            "sssa_transparent_proxy_health_probe_checks_total{outcome=\"failure\"} 23\n"
+        ));
         assert!(
             metrics.contains(
                 "sssa_transparent_proxy_upstream_connects_total{outcome=\"success\"} 13\n"

@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use probe_config::{
-    EnforcementInterceptionConfig, TransparentInterceptionProxyModeConfig,
-    TransparentInterceptionStrategyConfig,
+    EnforcementInterceptionConfig, TransparentInterceptionProxyHealthProbeConfig,
+    TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
 };
 use serde::Serialize;
 
@@ -12,6 +12,7 @@ use crate::transparent_interception::TransparentInterceptionIpFamily;
 pub(crate) struct TransparentProxyRuntimeSnapshot {
     pub mode: TransparentProxyRuntimeMode,
     pub listener_families: Vec<TransparentInterceptionIpFamily>,
+    pub health_probe: TransparentProxyHealthProbeSnapshot,
     pub upstream_connects: TransparentProxyConnectMetricsSnapshot,
     pub active_relays: u64,
     pub accepted_relays: u64,
@@ -32,6 +33,35 @@ pub(crate) enum TransparentProxyRuntimeMode {
     Stopped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TransparentProxyHealthProbeMode {
+    Disabled,
+    Pending,
+    Healthy,
+    Unhealthy,
+}
+
+impl TransparentProxyHealthProbeMode {
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Pending => "pending",
+            Self::Healthy => "healthy",
+            Self::Unhealthy => "unhealthy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TransparentProxyHealthProbeSnapshot {
+    pub mode: TransparentProxyHealthProbeMode,
+    pub check_successes: u64,
+    pub check_failures: u64,
+    pub consecutive_failures: u64,
+    pub last_failure_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct TransparentProxyConnectMetricsSnapshot {
     pub connect_successes: u64,
@@ -46,7 +76,12 @@ pub(in crate::transparent_interception) struct TransparentProxyRuntime {
 
 #[derive(Clone)]
 pub(crate) struct TransparentProxyRuntimeHandle {
-    inner: Arc<Mutex<TransparentProxyRuntimeSnapshot>>,
+    inner: Arc<Mutex<TransparentProxyRuntimeState>>,
+}
+
+struct TransparentProxyRuntimeState {
+    snapshot: TransparentProxyRuntimeSnapshot,
+    health_probe_failure_threshold: u32,
 }
 
 impl TransparentProxyRuntime {
@@ -64,19 +99,25 @@ impl TransparentProxyRuntime {
         };
         Self {
             handle: TransparentProxyRuntimeHandle {
-                inner: Arc::new(Mutex::new(TransparentProxyRuntimeSnapshot {
-                    mode,
-                    listener_families: Vec::new(),
-                    upstream_connects: TransparentProxyConnectMetricsSnapshot {
-                        connect_successes: 0,
-                        connect_failures: 0,
-                        last_failure_reason: None,
+                inner: Arc::new(Mutex::new(TransparentProxyRuntimeState {
+                    snapshot: TransparentProxyRuntimeSnapshot {
+                        mode,
+                        listener_families: Vec::new(),
+                        health_probe: TransparentProxyHealthProbeSnapshot::from_config(
+                            &config.proxy.health_probe,
+                        ),
+                        upstream_connects: TransparentProxyConnectMetricsSnapshot {
+                            connect_successes: 0,
+                            connect_failures: 0,
+                            last_failure_reason: None,
+                        },
+                        active_relays: 0,
+                        accepted_relays: 0,
+                        rejected_relays: 0,
+                        relay_failures: 0,
+                        listener_failures: 0,
                     },
-                    active_relays: 0,
-                    accepted_relays: 0,
-                    rejected_relays: 0,
-                    relay_failures: 0,
-                    listener_failures: 0,
+                    health_probe_failure_threshold: config.proxy.health_probe.failure_threshold,
                 })),
             },
         }
@@ -88,56 +129,101 @@ impl TransparentProxyRuntime {
 
     pub(super) fn mark_running(&self, listener_families: Vec<TransparentInterceptionIpFamily>) {
         let mut state = self.handle.lock();
-        state.mode = TransparentProxyRuntimeMode::Running;
-        state.listener_families = listener_families;
+        state.snapshot.mode = TransparentProxyRuntimeMode::Running;
+        state.snapshot.listener_families = listener_families;
     }
 
     pub(super) fn mark_stopped(&self) {
         let mut state = self.handle.lock();
-        state.mode = match state.mode {
+        state.snapshot.mode = match state.snapshot.mode {
             TransparentProxyRuntimeMode::Degraded | TransparentProxyRuntimeMode::Failed => {
-                state.mode
+                state.snapshot.mode
             }
             _ => TransparentProxyRuntimeMode::Stopped,
         };
-        state.listener_families.clear();
+        state.snapshot.listener_families.clear();
     }
 
     pub(super) fn record_accepted_relay(&self) {
         let mut state = self.handle.lock();
-        state.accepted_relays = state.accepted_relays.saturating_add(1);
+        state.snapshot.accepted_relays = state.snapshot.accepted_relays.saturating_add(1);
     }
 
     pub(super) fn record_rejected_relay(&self) {
         let mut state = self.handle.lock();
-        state.rejected_relays = state.rejected_relays.saturating_add(1);
+        state.snapshot.rejected_relays = state.snapshot.rejected_relays.saturating_add(1);
     }
 
     pub(super) fn record_relay_failure(&self) {
         let mut state = self.handle.lock();
-        state.relay_failures = state.relay_failures.saturating_add(1);
+        state.snapshot.relay_failures = state.snapshot.relay_failures.saturating_add(1);
     }
 
     pub(super) fn record_upstream_connect_success(&self) {
         let mut state = self.handle.lock();
-        state.upstream_connects.connect_successes =
-            state.upstream_connects.connect_successes.saturating_add(1);
+        state.snapshot.upstream_connects.connect_successes = state
+            .snapshot
+            .upstream_connects
+            .connect_successes
+            .saturating_add(1);
     }
 
     pub(super) fn record_upstream_connect_failure(&self, reason: impl Into<String>) {
         let mut state = self.handle.lock();
-        state.upstream_connects.connect_failures =
-            state.upstream_connects.connect_failures.saturating_add(1);
-        state.upstream_connects.last_failure_reason = Some(reason.into());
+        state.snapshot.upstream_connects.connect_failures = state
+            .snapshot
+            .upstream_connects
+            .connect_failures
+            .saturating_add(1);
+        state.snapshot.upstream_connects.last_failure_reason = Some(reason.into());
+    }
+
+    pub(super) fn record_health_probe_success(&self) {
+        let mut state = self.handle.lock();
+        if state.snapshot.health_probe.mode == TransparentProxyHealthProbeMode::Disabled {
+            return;
+        }
+        state.snapshot.health_probe.check_successes = state
+            .snapshot
+            .health_probe
+            .check_successes
+            .saturating_add(1);
+        state.snapshot.health_probe.consecutive_failures = 0;
+        state.snapshot.health_probe.last_failure_reason = None;
+        state.snapshot.health_probe.mode = TransparentProxyHealthProbeMode::Healthy;
+    }
+
+    pub(super) fn record_health_probe_failure(&self, reason: impl Into<String>) {
+        let mut state = self.handle.lock();
+        if state.snapshot.health_probe.mode == TransparentProxyHealthProbeMode::Disabled {
+            return;
+        }
+        state.snapshot.health_probe.check_failures =
+            state.snapshot.health_probe.check_failures.saturating_add(1);
+        state.snapshot.health_probe.consecutive_failures = state
+            .snapshot
+            .health_probe
+            .consecutive_failures
+            .saturating_add(1);
+        state.snapshot.health_probe.last_failure_reason = Some(reason.into());
+        if state.snapshot.health_probe.consecutive_failures
+            >= u64::from(state.health_probe_failure_threshold)
+        {
+            state.snapshot.health_probe.mode = TransparentProxyHealthProbeMode::Unhealthy;
+        }
     }
 
     pub(super) fn record_listener_failure(&self, family: TransparentInterceptionIpFamily) {
         let mut state = self.handle.lock();
-        state.listener_failures = state.listener_failures.saturating_add(1);
+        state.snapshot.listener_failures = state.snapshot.listener_failures.saturating_add(1);
         state
+            .snapshot
             .listener_families
             .retain(|listener_family| *listener_family != family);
-        state.mode = match (state.mode, state.listener_families.is_empty()) {
+        state.snapshot.mode = match (
+            state.snapshot.mode,
+            state.snapshot.listener_families.is_empty(),
+        ) {
             (TransparentProxyRuntimeMode::Running, true)
             | (TransparentProxyRuntimeMode::Degraded, true)
             | (TransparentProxyRuntimeMode::Configured, _) => TransparentProxyRuntimeMode::Failed,
@@ -148,25 +234,42 @@ impl TransparentProxyRuntime {
 
     pub(super) fn try_record_relay_started(&self, max_active_relays: u64) -> bool {
         let mut state = self.handle.lock();
-        if state.active_relays >= max_active_relays {
+        if state.snapshot.active_relays >= max_active_relays {
             return false;
         }
-        state.active_relays = state.active_relays.saturating_add(1);
+        state.snapshot.active_relays = state.snapshot.active_relays.saturating_add(1);
         true
     }
 
     pub(super) fn record_relay_finished(&self) {
         let mut state = self.handle.lock();
-        state.active_relays = state.active_relays.saturating_sub(1);
+        state.snapshot.active_relays = state.snapshot.active_relays.saturating_sub(1);
+    }
+}
+
+impl TransparentProxyHealthProbeSnapshot {
+    fn from_config(config: &TransparentInterceptionProxyHealthProbeConfig) -> Self {
+        let mode = if config.is_enabled() {
+            TransparentProxyHealthProbeMode::Pending
+        } else {
+            TransparentProxyHealthProbeMode::Disabled
+        };
+        Self {
+            mode,
+            check_successes: 0,
+            check_failures: 0,
+            consecutive_failures: 0,
+            last_failure_reason: None,
+        }
     }
 }
 
 impl TransparentProxyRuntimeHandle {
     pub(crate) fn snapshot(&self) -> TransparentProxyRuntimeSnapshot {
-        self.lock().clone()
+        self.lock().snapshot.clone()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, TransparentProxyRuntimeSnapshot> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TransparentProxyRuntimeState> {
         self.inner
             .lock()
             .expect("transparent proxy runtime state should not be poisoned")
@@ -179,6 +282,13 @@ impl TransparentProxyRuntimeSnapshot {
         Self {
             mode,
             listener_families: Vec::new(),
+            health_probe: TransparentProxyHealthProbeSnapshot {
+                mode: TransparentProxyHealthProbeMode::Disabled,
+                check_successes: 0,
+                check_failures: 0,
+                consecutive_failures: 0,
+                last_failure_reason: None,
+            },
             upstream_connects: TransparentProxyConnectMetricsSnapshot {
                 connect_successes: 0,
                 connect_failures: 0,
@@ -219,11 +329,29 @@ impl TransparentProxyRuntimeSnapshot {
         self.upstream_connects.last_failure_reason = last_failure_reason.map(ToString::to_string);
         self
     }
+
+    pub(crate) fn with_health_probe(
+        mut self,
+        mode: TransparentProxyHealthProbeMode,
+        check_successes: u64,
+        check_failures: u64,
+        consecutive_failures: u64,
+        last_failure_reason: Option<&str>,
+    ) -> Self {
+        self.health_probe.mode = mode;
+        self.health_probe.check_successes = check_successes;
+        self.health_probe.check_failures = check_failures;
+        self.health_probe.consecutive_failures = consecutive_failures;
+        self.health_probe.last_failure_reason = last_failure_reason.map(ToString::to_string);
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use probe_config::TransparentInterceptionProxyConfig;
+    use probe_config::{
+        TransparentInterceptionProxyConfig, TransparentInterceptionProxyHealthProbeConfig,
+    };
 
     use super::*;
 
@@ -258,6 +386,53 @@ mod tests {
             .mode,
             TransparentProxyRuntimeMode::Configured
         );
+    }
+
+    #[test]
+    fn health_probe_state_follows_configured_checks() {
+        let state = TransparentProxyRuntime::for_config(&interception_config_with_health_probe());
+        let handle = state.handle();
+
+        let snapshot = handle.snapshot();
+        assert_eq!(
+            snapshot.health_probe.mode,
+            TransparentProxyHealthProbeMode::Pending
+        );
+
+        state.record_health_probe_failure("connection refused");
+
+        let snapshot = handle.snapshot();
+        assert_eq!(
+            snapshot.health_probe.mode,
+            TransparentProxyHealthProbeMode::Pending
+        );
+        assert_eq!(snapshot.health_probe.check_failures, 1);
+        assert_eq!(snapshot.health_probe.consecutive_failures, 1);
+
+        state.record_health_probe_failure("timed out");
+
+        let snapshot = handle.snapshot();
+        assert_eq!(
+            snapshot.health_probe.mode,
+            TransparentProxyHealthProbeMode::Unhealthy
+        );
+        assert_eq!(snapshot.health_probe.check_failures, 2);
+        assert_eq!(snapshot.health_probe.consecutive_failures, 2);
+        assert_eq!(
+            snapshot.health_probe.last_failure_reason.as_deref(),
+            Some("timed out")
+        );
+
+        state.record_health_probe_success();
+
+        let snapshot = handle.snapshot();
+        assert_eq!(
+            snapshot.health_probe.mode,
+            TransparentProxyHealthProbeMode::Healthy
+        );
+        assert_eq!(snapshot.health_probe.check_successes, 1);
+        assert_eq!(snapshot.health_probe.consecutive_failures, 0);
+        assert_eq!(snapshot.health_probe.last_failure_reason, None);
     }
 
     #[test]
@@ -383,6 +558,24 @@ mod tests {
             proxy: TransparentInterceptionProxyConfig {
                 mode: proxy_mode,
                 listen_port: Some(15001),
+                ..TransparentInterceptionProxyConfig::default()
+            },
+            ..EnforcementInterceptionConfig::default()
+        }
+    }
+
+    fn interception_config_with_health_probe() -> EnforcementInterceptionConfig {
+        EnforcementInterceptionConfig {
+            strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
+            proxy: TransparentInterceptionProxyConfig {
+                mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+                listen_port: Some(15001),
+                health_probe: TransparentInterceptionProxyHealthProbeConfig {
+                    target: Some("127.0.0.1:18080".to_string()),
+                    interval_ms: 500,
+                    timeout_ms: 100,
+                    failure_threshold: 2,
+                },
             },
             ..EnforcementInterceptionConfig::default()
         }

@@ -14,10 +14,16 @@ pub use capture::{
     LiveCaptureBackend, PlaintextFeedCaptureConfig,
 };
 pub use enforcement::{
-    ConnectionEnforcementBackendConfig, EnforcementConfig, EnforcementInterceptionConfig,
-    EnforcementPolicyConfig, EnforcementPolicyManifest, EnforcementPolicySourceConfig,
-    TransparentInterceptionProxyConfig, TransparentInterceptionProxyModeConfig,
-    TransparentInterceptionStrategyConfig,
+    ConnectionEnforcementBackendConfig, DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD,
+    DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS,
+    DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS, EnforcementConfig,
+    EnforcementInterceptionConfig, EnforcementPolicyConfig, EnforcementPolicyManifest,
+    EnforcementPolicySourceConfig, MAX_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD,
+    MAX_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS, MAX_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS,
+    MIN_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD,
+    MIN_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS, MIN_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS,
+    TransparentInterceptionProxyConfig, TransparentInterceptionProxyHealthProbeConfig,
+    TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
 };
 pub use export::{
     CompressionCodecName, DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK,

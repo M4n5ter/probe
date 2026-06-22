@@ -1,3 +1,5 @@
+mod connect;
+mod health_probe;
 mod listener;
 mod registry;
 mod relay;
@@ -14,6 +16,7 @@ use probe_config::{
 };
 
 use self::{
+    health_probe::{prepare_health_probe, start_health_probe},
     listener::{ManagedTransparentProxyListener, start_listeners},
     registry::RelayRegistry,
 };
@@ -21,21 +24,73 @@ use super::{TransparentInterceptionError, TransparentInterceptionIpFamily};
 
 pub(in crate::transparent_interception) use state::TransparentProxyRuntime;
 pub(crate) use state::{
-    TransparentProxyRuntimeHandle, TransparentProxyRuntimeMode, TransparentProxyRuntimeSnapshot,
+    TransparentProxyHealthProbeMode, TransparentProxyRuntimeHandle, TransparentProxyRuntimeMode,
+    TransparentProxyRuntimeSnapshot,
 };
 
-pub(crate) struct ManagedTransparentProxyGuard {
+#[derive(Debug)]
+pub(in crate::transparent_interception) struct TransparentProxyLifecyclePlan {
+    managed: Option<ManagedTransparentProxyPlan>,
+    health_probe: Option<health_probe::TransparentProxyHealthProbePlan>,
+}
+
+#[derive(Debug)]
+struct ManagedTransparentProxyPlan {
+    listen_port: u16,
+    families: Vec<TransparentInterceptionIpFamily>,
+}
+
+pub(in crate::transparent_interception) struct TransparentProxyGuard {
+    managed: Option<ManagedTransparentProxyGuard>,
+    health_probe: Option<health_probe::TransparentProxyHealthProbeGuard>,
+}
+
+pub(in crate::transparent_interception) fn prepare_proxy_lifecycle(
+    config: &EnforcementInterceptionConfig,
+    families: Vec<TransparentInterceptionIpFamily>,
+) -> Result<TransparentProxyLifecyclePlan, TransparentInterceptionError> {
+    Ok(TransparentProxyLifecyclePlan {
+        managed: prepare_managed_proxy(config, families)?,
+        health_probe: prepare_health_probe(config)?,
+    })
+}
+
+pub(in crate::transparent_interception) fn start_proxy_lifecycle(
+    plan: TransparentProxyLifecyclePlan,
+    runtime: TransparentProxyRuntime,
+) -> Result<Option<TransparentProxyGuard>, TransparentInterceptionError> {
+    let managed = start_managed_proxy(plan.managed, runtime.clone())?;
+    let health_probe = start_health_probe(plan.health_probe, runtime);
+    if managed.is_none() && health_probe.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(TransparentProxyGuard {
+        managed,
+        health_probe,
+    }))
+}
+
+impl TransparentProxyGuard {
+    pub(in crate::transparent_interception) fn stop(
+        self,
+    ) -> Result<(), TransparentInterceptionError> {
+        let health_result = stop_health_probe(self.health_probe);
+        let managed_result = stop_managed_proxy(self.managed);
+        health_result.and(managed_result)
+    }
+}
+
+struct ManagedTransparentProxyGuard {
     shutdown_requested: Arc<AtomicBool>,
     relays: RelayRegistry,
     listeners: Vec<ManagedTransparentProxyListener>,
     runtime: TransparentProxyRuntime,
 }
 
-pub(crate) fn start_managed_proxy(
+fn prepare_managed_proxy(
     config: &EnforcementInterceptionConfig,
     families: Vec<TransparentInterceptionIpFamily>,
-    runtime: TransparentProxyRuntime,
-) -> Result<Option<ManagedTransparentProxyGuard>, TransparentInterceptionError> {
+) -> Result<Option<ManagedTransparentProxyPlan>, TransparentInterceptionError> {
     if config.proxy.mode == TransparentInterceptionProxyModeConfig::External {
         return Ok(None);
     }
@@ -60,7 +115,40 @@ pub(crate) fn start_managed_proxy(
             "managed TCP relay requires at least one listener family".to_string(),
         ));
     }
-    ManagedTransparentProxyGuard::start(listen_port, families, runtime).map(Some)
+    Ok(Some(ManagedTransparentProxyPlan {
+        listen_port,
+        families,
+    }))
+}
+
+fn start_managed_proxy(
+    plan: Option<ManagedTransparentProxyPlan>,
+    runtime: TransparentProxyRuntime,
+) -> Result<Option<ManagedTransparentProxyGuard>, TransparentInterceptionError> {
+    match plan {
+        Some(plan) => {
+            ManagedTransparentProxyGuard::start(plan.listen_port, plan.families, runtime).map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
+fn stop_managed_proxy(
+    proxy: Option<ManagedTransparentProxyGuard>,
+) -> Result<(), TransparentInterceptionError> {
+    match proxy {
+        Some(proxy) => proxy.stop(),
+        None => Ok(()),
+    }
+}
+
+fn stop_health_probe(
+    health_probe: Option<health_probe::TransparentProxyHealthProbeGuard>,
+) -> Result<(), TransparentInterceptionError> {
+    match health_probe {
+        Some(health_probe) => health_probe.stop(),
+        None => Ok(()),
+    }
 }
 
 impl ManagedTransparentProxyGuard {
@@ -139,12 +227,10 @@ mod tests {
     fn external_proxy_mode_does_not_start_managed_listener() {
         let config = EnforcementInterceptionConfig::default();
 
-        let guard = start_managed_proxy(
-            &config,
-            Vec::new(),
-            TransparentProxyRuntime::for_config(&config),
-        )
-        .expect("external mode should be ignored");
+        let plan = prepare_proxy_lifecycle(&config, Vec::new())
+            .expect("external mode without health probe should be prepared");
+        let guard = start_proxy_lifecycle(plan, TransparentProxyRuntime::for_config(&config))
+            .expect("external mode without health probe should start no proxy lifecycle");
 
         assert!(guard.is_none());
     }
@@ -156,16 +242,13 @@ mod tests {
             proxy: probe_config::TransparentInterceptionProxyConfig {
                 mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
                 listen_port: Some(15001),
+                ..probe_config::TransparentInterceptionProxyConfig::default()
             },
             ..EnforcementInterceptionConfig::default()
         };
 
-        let error = match start_managed_proxy(
-            &config,
-            Vec::new(),
-            TransparentProxyRuntime::for_config(&config),
-        ) {
-            Ok(_) => panic!("managed relay should require at least one listener"),
+        let error = match prepare_proxy_lifecycle(&config, Vec::new()) {
+            Ok(_) => panic!("managed relay should require at least one listener family"),
             Err(error) => error,
         };
 

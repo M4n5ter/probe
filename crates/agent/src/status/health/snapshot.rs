@@ -1,7 +1,9 @@
 use probe_core::RuntimeMode;
 use runtime::{CapturePlanMode, RuntimePlan};
 
-use crate::transparent_interception::TransparentProxyRuntimeMode;
+use crate::transparent_interception::{
+    TransparentProxyHealthProbeMode, TransparentProxyRuntimeMode,
+};
 
 use super::super::{
     enforcement::{EnforcementPolicySourceStatusSnapshot, EnforcementStatusSnapshot},
@@ -139,20 +141,34 @@ fn transparent_proxy_health_contribution(
     let Some(proxy) = &enforcement.interception.runtime_proxy else {
         return HealthContribution::available();
     };
-    match proxy.mode {
-        TransparentProxyRuntimeMode::Degraded => HealthContribution::degraded(format!(
-            "transparent proxy degraded: {} listener failure(s)",
-            proxy.listener_failures
-        )),
-        TransparentProxyRuntimeMode::Failed => HealthContribution::unavailable(format!(
+    if proxy.mode == TransparentProxyRuntimeMode::Failed {
+        return HealthContribution::unavailable(format!(
             "transparent proxy failed: {} listener failure(s)",
             proxy.listener_failures
-        )),
-        TransparentProxyRuntimeMode::Disabled
-        | TransparentProxyRuntimeMode::External
-        | TransparentProxyRuntimeMode::Configured
-        | TransparentProxyRuntimeMode::Running
-        | TransparentProxyRuntimeMode::Stopped => HealthContribution::available(),
+        ));
+    }
+    let mut reasons = Vec::new();
+    if proxy.mode == TransparentProxyRuntimeMode::Degraded {
+        reasons.push(format!(
+            "transparent proxy degraded: {} listener failure(s)",
+            proxy.listener_failures
+        ));
+    }
+    if proxy.health_probe.mode == TransparentProxyHealthProbeMode::Unhealthy {
+        let reason = proxy
+            .health_probe
+            .last_failure_reason
+            .as_deref()
+            .unwrap_or("probe failed");
+        reasons.push(format!(
+            "transparent proxy health probe unhealthy after {} consecutive failure(s): {reason}",
+            proxy.health_probe.consecutive_failures
+        ));
+    }
+    if reasons.is_empty() {
+        HealthContribution::available()
+    } else {
+        HealthContribution::degraded(reasons.join("; "))
     }
 }
 

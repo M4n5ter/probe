@@ -235,7 +235,10 @@ mod tests {
     use crate::{
         configured_enforcement::ActiveEnforcementPolicy,
         tls_plaintext::{TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot},
-        transparent_interception::{TransparentProxyRuntimeMode, TransparentProxyRuntimeSnapshot},
+        transparent_interception::{
+            TransparentProxyHealthProbeMode, TransparentProxyRuntimeMode,
+            TransparentProxyRuntimeSnapshot,
+        },
     };
 
     #[test]
@@ -446,7 +449,8 @@ mod tests {
             transparent_proxy: Some(
                 TransparentProxyRuntimeSnapshot::for_test(TransparentProxyRuntimeMode::Configured)
                     .with_relay_counts(2, 3, 5, 7, 11)
-                    .with_upstream_connects(13, 17, Some("connection refused")),
+                    .with_upstream_connects(13, 17, Some("connection refused"))
+                    .with_health_probe(TransparentProxyHealthProbeMode::Healthy, 19, 23, 0, None),
             ),
             ..RuntimeStatusInput::default()
         };
@@ -467,6 +471,12 @@ mod tests {
         assert_eq!(proxy_metrics.rejected_relays, 5);
         assert_eq!(proxy_metrics.relay_failures, 7);
         assert_eq!(proxy_metrics.listener_failures, 11);
+        assert_eq!(
+            proxy_metrics.health_probe.mode,
+            TransparentProxyHealthProbeMode::Healthy
+        );
+        assert_eq!(proxy_metrics.health_probe.check_successes, 19);
+        assert_eq!(proxy_metrics.health_probe.check_failures, 23);
         assert_eq!(proxy_metrics.upstream_connects.connect_successes, 13);
         assert_eq!(proxy_metrics.upstream_connects.connect_failures, 17);
         let runtime_proxy = snapshot
@@ -488,6 +498,14 @@ mod tests {
         assert_eq!(
             value["enforcement"]["interception"]["runtime_proxy"]["upstream_connects"]["connect_failures"],
             json!(17)
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["runtime_proxy"]["health_probe"]["mode"],
+            json!("healthy")
+        );
+        assert_eq!(
+            value["metrics"]["transparent_proxy"]["health_probe"]["check_failures"],
+            json!(23)
         );
         Ok(())
     }
@@ -526,6 +544,46 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("transparent proxy failed"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unhealthy_transparent_proxy_health_probe_makes_health_degraded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_with_managed_transparent_proxy()?;
+        let runtime = RuntimeStatusInput {
+            enforcement: EnforcementRuntimeStatusInput::Runtime {
+                active_policy: Box::new(ActiveEnforcementPolicy::new(
+                    None,
+                    ProtectiveActionProfile::default(),
+                    None,
+                )?),
+            },
+            transparent_proxy: Some(
+                TransparentProxyRuntimeSnapshot::for_test(TransparentProxyRuntimeMode::Running)
+                    .with_health_probe(
+                        TransparentProxyHealthProbeMode::Unhealthy,
+                        0,
+                        3,
+                        3,
+                        Some("connection refused"),
+                    ),
+            ),
+            ..RuntimeStatusInput::default()
+        };
+
+        let snapshot = build_status_snapshot_at_with_runtime(
+            &plan,
+            available_spool_input(PathBuf::from("/tmp/sssa-spool")),
+            42,
+            runtime,
+        );
+
+        assert_eq!(snapshot.health.mode, RuntimeMode::Degraded);
+        assert!(snapshot.health.reasons.iter().any(|reason| {
+            reason.contains("transparent proxy health probe unhealthy")
+                && reason.contains("connection refused")
+        }));
         Ok(())
     }
 
@@ -847,6 +905,7 @@ mod tests {
         config.enforcement.interception.proxy = probe_config::TransparentInterceptionProxyConfig {
             mode: probe_config::TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
             listen_port: Some(15001),
+            ..probe_config::TransparentInterceptionProxyConfig::default()
         };
         runtime_plan_from_config(
             config,

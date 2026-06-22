@@ -11,7 +11,7 @@ pub(crate) use error::TransparentInterceptionError;
 pub(crate) use ip_family::TransparentInterceptionIpFamily;
 use proxy::TransparentProxyRuntime;
 pub(crate) use proxy::{
-    ManagedTransparentProxyGuard, TransparentProxyRuntimeHandle, TransparentProxyRuntimeMode,
+    TransparentProxyHealthProbeMode, TransparentProxyRuntimeHandle, TransparentProxyRuntimeMode,
     TransparentProxyRuntimeSnapshot,
 };
 pub(crate) use runtime::{TransparentInterceptionGuard, TransparentInterceptionRuntime};

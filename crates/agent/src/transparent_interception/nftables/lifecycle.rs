@@ -4,8 +4,11 @@ use super::{
     plan::InboundTproxyLifecyclePlan,
 };
 use crate::transparent_interception::{
-    ManagedTransparentProxyGuard, TransparentInterceptionError,
-    proxy::{TransparentProxyRuntime, start_managed_proxy},
+    TransparentInterceptionError,
+    proxy::{
+        TransparentProxyGuard, TransparentProxyRuntime, prepare_proxy_lifecycle,
+        start_proxy_lifecycle,
+    },
 };
 use interception::TransparentInterceptionHostRuleScope;
 use probe_config::EnforcementInterceptionConfig;
@@ -81,29 +84,26 @@ impl NftablesTransparentInterception {
     ) -> Result<NftablesTransparentInterceptionGuard, TransparentInterceptionError> {
         let plan = InboundTproxyLifecyclePlan::from_config_and_scope(&self.config, setup_scope)
             .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
+        let proxy_plan = prepare_proxy_lifecycle(&self.config, plan.listener_families())?;
         let setup_script = plan.setup_nft_script();
         check_nft_script(self.nft.as_mut(), &setup_script)?;
         let owner_lock = self.owner_lock.acquire(plan.owner_name())?;
         self.cleanup_previous_owned_state_best_effort(&plan);
-        let managed_proxy = start_managed_proxy(
-            &self.config,
-            plan.listener_families(),
-            self.proxy_runtime.clone(),
-        )?;
+        let proxy = start_proxy_lifecycle(proxy_plan, self.proxy_runtime.clone())?;
         if let Err(error) = self.install_policy_routes(&plan) {
             self.cleanup_active_plan_best_effort(&plan);
-            let _ = stop_managed_proxy_best_effort(managed_proxy);
+            let _ = stop_proxy_best_effort(proxy);
             return Err(error);
         }
         if let Err(error) = apply_nft_script(self.nft.as_mut(), &setup_script, "nft setup") {
             self.cleanup_active_plan_best_effort(&plan);
-            let _ = stop_managed_proxy_best_effort(managed_proxy);
+            let _ = stop_proxy_best_effort(proxy);
             return Err(error);
         }
         Ok(NftablesTransparentInterceptionGuard {
             inner: Some(self),
             plan,
-            managed_proxy,
+            proxy,
             owner_lock: Some(owner_lock),
         })
     }
@@ -149,7 +149,7 @@ impl NftablesTransparentInterception {
 pub(in crate::transparent_interception) struct NftablesTransparentInterceptionGuard {
     inner: Option<NftablesTransparentInterception>,
     plan: InboundTproxyLifecyclePlan,
-    managed_proxy: Option<ManagedTransparentProxyGuard>,
+    proxy: Option<TransparentProxyGuard>,
     owner_lock: Option<NftablesOwnerLockGuard>,
 }
 
@@ -176,7 +176,7 @@ impl NftablesTransparentInterceptionGuard {
             }
         }
         self.inner = None;
-        let proxy_result = stop_managed_proxy_best_effort(self.managed_proxy.take());
+        let proxy_result = stop_proxy_best_effort(self.proxy.take());
         self.owner_lock = None;
         nft_result.and(route_result).and(proxy_result)
     }
@@ -203,8 +203,8 @@ fn apply_nft_script(
     command_success(result, command_name)
 }
 
-fn stop_managed_proxy_best_effort(
-    proxy: Option<ManagedTransparentProxyGuard>,
+fn stop_proxy_best_effort(
+    proxy: Option<TransparentProxyGuard>,
 ) -> Result<(), TransparentInterceptionError> {
     match proxy {
         Some(proxy) => proxy.stop(),
@@ -251,14 +251,21 @@ mod tests {
     use std::{
         collections::VecDeque,
         io,
+        net::{Ipv4Addr, TcpListener},
         sync::{Arc, Mutex},
+        thread,
+        time::{Duration, Instant},
     };
 
     use probe_config::{
         EnforcementInterceptionConfig, TransparentInterceptionProxyConfig,
-        TransparentInterceptionStrategyConfig,
+        TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionStrategyConfig,
     };
     use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
+
+    use crate::transparent_interception::{
+        TransparentProxyRuntimeHandle, nftables::owner_lock::NoopNftablesOwnerLock,
+    };
 
     use super::*;
 
@@ -426,6 +433,65 @@ mod tests {
     }
 
     #[test]
+    fn invalid_health_probe_fails_before_host_mutation() {
+        let nft = FakeNft::succeeding();
+        let ip = FakeIp::succeeding();
+        let mut config = inbound_config();
+        config.proxy.health_probe = TransparentInterceptionProxyHealthProbeConfig {
+            target: Some("127.0.0.1:0".to_string()),
+            interval_ms: 500,
+            timeout_ms: 100,
+            failure_threshold: 1,
+        };
+
+        let error = match NftablesTransparentInterception::new_for_test(
+            config,
+            nft.clone(),
+            Some(ip.clone()),
+        )
+        .activate(setup_scope(&setup_selector()))
+        {
+            Ok(_) => panic!("invalid health probe must fail activation"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("non-zero port"));
+        assert!(nft.checked_scripts().is_empty());
+        assert!(nft.scripts().is_empty());
+        assert!(ip.args().is_empty());
+    }
+
+    #[test]
+    fn activation_starts_configured_health_probe() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let nft = FakeNft::succeeding();
+        let ip = FakeIp::succeeding();
+        let mut config = inbound_config();
+        config.proxy.health_probe = TransparentInterceptionProxyHealthProbeConfig {
+            target: Some(listener.local_addr()?.to_string()),
+            interval_ms: 100,
+            timeout_ms: 10,
+            failure_threshold: 1,
+        };
+        let runtime = TransparentProxyRuntime::for_config(&config);
+        let handle = runtime.handle();
+        let lifecycle = NftablesTransparentInterception::with_owner_lock(
+            config,
+            nft,
+            Some(ip),
+            NoopNftablesOwnerLock,
+            runtime,
+        );
+
+        let guard = lifecycle.activate(setup_scope(&setup_selector()))?;
+        wait_for_health_probe_success(&handle)?;
+        guard.deactivate()?;
+
+        assert!(handle.snapshot().health_probe.check_successes > 0);
+        Ok(())
+    }
+
+    #[test]
     fn startup_cleanup_removes_all_owned_route_families_before_projected_install()
     -> Result<(), Box<dyn std::error::Error>> {
         let nft = FakeNft::succeeding();
@@ -549,6 +615,23 @@ mod tests {
             stdout: Vec::new(),
             stderr: Vec::new(),
         }
+    }
+
+    fn wait_for_health_probe_success(
+        handle: &TransparentProxyRuntimeHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if handle.snapshot().health_probe.check_successes > 0 {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "health probe did not record a successful check",
+        )
+        .into())
     }
 
     #[derive(Clone)]

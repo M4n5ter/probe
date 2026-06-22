@@ -199,6 +199,7 @@ mod tests {
             proxy: TransparentInterceptionProxyConfig {
                 mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
                 listen_port: Some(15001),
+                ..TransparentInterceptionProxyConfig::default()
             },
             ..EnforcementInterceptionConfig::default()
         }

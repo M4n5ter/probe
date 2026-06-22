@@ -67,6 +67,59 @@ listen_port = 15001
 }
 
 #[test]
+fn parses_transparent_proxy_health_probe() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy"
+
+[enforcement.interception.proxy]
+mode = "managed_tcp_relay"
+listen_port = 15001
+
+[enforcement.interception.proxy.health_probe]
+target = "127.0.0.1:18080"
+interval_ms = 500
+timeout_ms = 100
+failure_threshold = 2
+"#,
+    )?;
+
+    assert_eq!(
+        config.enforcement.interception.proxy.health_probe.target,
+        Some("127.0.0.1:18080".to_string())
+    );
+    assert_eq!(
+        config
+            .enforcement
+            .interception
+            .proxy
+            .health_probe
+            .interval_ms,
+        500
+    );
+    assert_eq!(
+        config
+            .enforcement
+            .interception
+            .proxy
+            .health_probe
+            .timeout_ms,
+        100
+    );
+    assert_eq!(
+        config
+            .enforcement
+            .interception
+            .proxy
+            .health_probe
+            .failure_threshold,
+        2
+    );
+    Ok(())
+}
+
+#[test]
 fn rejects_transparent_interception_host_resource_overrides() {
     let error = AgentConfig::from_toml_str(
         r#"

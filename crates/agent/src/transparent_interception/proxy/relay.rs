@@ -12,6 +12,7 @@ use std::{
 use socket2::{SockAddr, Socket};
 
 use super::{
+    connect::tcp_connect_failure_reason,
     proxy_error, proxy_io_error,
     registry::{RelayRegistry, RelaySlot, shutdown_streams},
     state::TransparentProxyRuntime,
@@ -133,22 +134,11 @@ fn connect_upstream_for_relay(
             Ok(upstream)
         }
         Err(error) => {
-            runtime.record_upstream_connect_failure(upstream_connect_failure_reason(&error));
+            runtime.record_upstream_connect_failure(tcp_connect_failure_reason(&error));
             Err(proxy_io_error(format!(
                 "connect transparent upstream target {target} for peer {peer}"
             ))(error))
         }
-    }
-}
-
-fn upstream_connect_failure_reason(error: &io::Error) -> String {
-    match error.kind() {
-        io::ErrorKind::ConnectionRefused => "connection refused".to_string(),
-        io::ErrorKind::TimedOut => "timed out".to_string(),
-        io::ErrorKind::NetworkUnreachable => "network unreachable".to_string(),
-        io::ErrorKind::HostUnreachable => "host unreachable".to_string(),
-        io::ErrorKind::AddrNotAvailable => "address not available".to_string(),
-        kind => format!("{kind:?}").to_ascii_lowercase(),
     }
 }
 
@@ -417,6 +407,7 @@ mod tests {
             proxy: TransparentInterceptionProxyConfig {
                 mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
                 listen_port: Some(15001),
+                ..TransparentInterceptionProxyConfig::default()
             },
             ..EnforcementInterceptionConfig::default()
         }

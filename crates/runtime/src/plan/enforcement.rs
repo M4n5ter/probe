@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use probe_config::{
     AgentConfig, ConnectionEnforcementBackendConfig, EnforcementPolicySourceConfig,
-    TransparentInterceptionProxyConfig, TransparentInterceptionProxyModeConfig,
-    TransparentInterceptionStrategyConfig,
+    TransparentInterceptionProxyConfig, TransparentInterceptionProxyHealthProbeConfig,
+    TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
 };
 use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
@@ -120,10 +120,11 @@ impl EnforcementInterceptionPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransparentInterceptionProxyPlan {
     pub mode: TransparentInterceptionProxyModeConfig,
     pub listen_port: Option<u16>,
+    pub health_probe: TransparentInterceptionProxyHealthProbeConfig,
 }
 
 impl TransparentInterceptionProxyPlan {
@@ -131,6 +132,7 @@ impl TransparentInterceptionProxyPlan {
         Self {
             mode: config.mode,
             listen_port: config.listen_port,
+            health_probe: config.health_probe.clone(),
         }
     }
 }
@@ -372,6 +374,26 @@ mod tests {
         config.enforcement.interception.strategy =
             TransparentInterceptionStrategyConfig::InboundTproxy;
         config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.proxy.health_probe.target =
+            Some("127.0.0.1:18080".to_string());
+        config
+            .enforcement
+            .interception
+            .proxy
+            .health_probe
+            .interval_ms = 500;
+        config
+            .enforcement
+            .interception
+            .proxy
+            .health_probe
+            .timeout_ms = 100;
+        config
+            .enforcement
+            .interception
+            .proxy
+            .health_probe
+            .failure_threshold = 2;
         config.enforcement.interception.selector = Some(Selector::default());
         let capabilities = CapabilityMatrix::new(test_platform_capabilities_with_interception(
             RuntimeMode::Available,
@@ -397,6 +419,13 @@ mod tests {
             TransparentInterceptionProxyModeConfig::External
         );
         assert_eq!(plan.interception.proxy.listen_port, Some(15001));
+        assert_eq!(
+            plan.interception.proxy.health_probe.target.as_deref(),
+            Some("127.0.0.1:18080")
+        );
+        assert_eq!(plan.interception.proxy.health_probe.interval_ms, 500);
+        assert_eq!(plan.interception.proxy.health_probe.timeout_ms, 100);
+        assert_eq!(plan.interception.proxy.health_probe.failure_threshold, 2);
         assert_eq!(plan.interception.nftables.table_name, "sssa_probe");
         assert_eq!(plan.interception.nftables.mark, 0x5353_4101);
         assert_eq!(plan.interception.nftables.route_table, 53_534);

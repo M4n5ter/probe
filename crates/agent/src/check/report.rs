@@ -191,7 +191,7 @@ async fn check_enforcement(
         },
         interception: EnforcementInterceptionCheckSnapshot {
             strategy: plan.enforcement.interception.strategy,
-            proxy: plan.enforcement.interception.proxy,
+            proxy: plan.enforcement.interception.proxy.clone(),
             nftables: plan.enforcement.interception.nftables.clone(),
             local_setup_scope: plan.enforcement.interception.local_setup_scope.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,

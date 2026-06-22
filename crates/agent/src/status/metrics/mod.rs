@@ -3,7 +3,8 @@ use probe_core::{CapabilityMatrix, RuntimeMode};
 use serde::Serialize;
 
 use crate::{
-    export::ExportWorkerRuntimeSnapshot, transparent_interception::TransparentProxyRuntimeSnapshot,
+    export::ExportWorkerRuntimeSnapshot,
+    transparent_interception::{TransparentProxyHealthProbeMode, TransparentProxyRuntimeSnapshot},
 };
 
 use super::{
@@ -42,12 +43,21 @@ pub struct ExportMetricsSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct TransparentProxyMetricsSnapshot {
+    pub health_probe: TransparentProxyHealthProbeMetricsSnapshot,
     pub upstream_connects: TransparentProxyUpstreamConnectMetricsSnapshot,
     pub active_relays: u64,
     pub accepted_relays: u64,
     pub rejected_relays: u64,
     pub relay_failures: u64,
     pub listener_failures: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TransparentProxyHealthProbeMetricsSnapshot {
+    pub mode: TransparentProxyHealthProbeMode,
+    pub check_successes: u64,
+    pub check_failures: u64,
+    pub consecutive_failures: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -84,6 +94,12 @@ fn transparent_proxy_metrics(
     proxy: TransparentProxyRuntimeSnapshot,
 ) -> TransparentProxyMetricsSnapshot {
     TransparentProxyMetricsSnapshot {
+        health_probe: TransparentProxyHealthProbeMetricsSnapshot {
+            mode: proxy.health_probe.mode,
+            check_successes: proxy.health_probe.check_successes,
+            check_failures: proxy.health_probe.check_failures,
+            consecutive_failures: proxy.health_probe.consecutive_failures,
+        },
         upstream_connects: TransparentProxyUpstreamConnectMetricsSnapshot {
             connect_successes: proxy.upstream_connects.connect_successes,
             connect_failures: proxy.upstream_connects.connect_failures,
