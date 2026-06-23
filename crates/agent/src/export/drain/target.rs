@@ -1,6 +1,8 @@
 use std::{future::Future, time::Duration};
 
-use exporter::{CompressionCodec, FileExporter, WebhookExporter, WebhookTlsConfig};
+use exporter::{
+    CompressionCodec, FileExporter, WebhookConnectionOptions, WebhookExporter, WebhookTlsConfig,
+};
 use probe_config::CompressionCodecName;
 use runtime::{
     ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportTlsMaterialPlan, FileExportSinkPlan,
@@ -18,14 +20,35 @@ use crate::tls_material::{FilesystemTlsMaterialStore, TlsMaterialFileStore};
 
 const REPLAY_WEBHOOK_SINK: &str = "replay-webhook";
 
+#[cfg(test)]
 pub async fn drain_planned_sinks(
     spool: &impl ExportSpool,
     agent_id: &str,
     export: &ExportPlan,
 ) -> Result<(), ExportDrainError> {
-    let result =
-        drain_export_sinks_with_mode(spool, agent_id, &export.sinks, SinkDrainMode::UntilEmpty)
-            .await;
+    drain_planned_sinks_with_webhook_connection(
+        spool,
+        agent_id,
+        export,
+        WebhookConnectionOptions::default(),
+    )
+    .await
+}
+
+pub(crate) async fn drain_planned_sinks_with_webhook_connection(
+    spool: &impl ExportSpool,
+    agent_id: &str,
+    export: &ExportPlan,
+    webhook_connection: WebhookConnectionOptions,
+) -> Result<(), ExportDrainError> {
+    let result = drain_export_sinks_with_mode(
+        spool,
+        agent_id,
+        &export.sinks,
+        SinkDrainMode::UntilEmpty,
+        webhook_connection,
+    )
+    .await;
     finish_export_sink_drain(
         result,
         prune_export_acknowledged_prefix_for_sinks(spool, &export.sinks),
@@ -73,10 +96,12 @@ pub(super) async fn drain_export_sinks_with_mode(
     agent_id: &str,
     sinks: &[ExportSinkPlan],
     mode: SinkDrainMode,
+    webhook_connection: WebhookConnectionOptions,
 ) -> Result<(), ExportDrainError> {
     let mut failures = Vec::new();
     for sink in sinks {
-        let result = drain_export_sink_with_mode(spool, agent_id, sink, mode).await;
+        let result =
+            drain_export_sink_with_mode(spool, agent_id, sink, mode, webhook_connection).await;
         if let Err(error) = result {
             eprintln!("exporter sink {} failed: {error}", sink.id());
             failures.push(format!("{}: {error}", sink.id()));
@@ -110,10 +135,11 @@ pub(super) async fn drain_export_sink_with_mode(
     agent_id: &str,
     sink: &ExportSinkPlan,
     mode: SinkDrainMode,
+    webhook_connection: WebhookConnectionOptions,
 ) -> Result<(), ExportDrainError> {
     match sink {
         ExportSinkPlan::Webhook(sink) => {
-            let target = webhook_export_target_from_plan_sink(sink);
+            let target = webhook_export_target_from_plan_sink(sink, webhook_connection);
             let sink = target.sink.clone();
             with_sink_timeout(
                 sink,
@@ -142,6 +168,7 @@ struct WebhookExportTarget {
     codec: CompressionCodec,
     headers: Vec<(String, String)>,
     tls: ExportSinkTlsPlan,
+    webhook_connection: WebhookConnectionOptions,
 }
 
 impl WebhookExportTarget {
@@ -152,11 +179,15 @@ impl WebhookExportTarget {
             codec,
             headers: Vec::new(),
             tls: ExportSinkTlsPlan::default(),
+            webhook_connection: WebhookConnectionOptions::default(),
         }
     }
 }
 
-fn webhook_export_target_from_plan_sink(sink: &WebhookExportSinkPlan) -> WebhookExportTarget {
+fn webhook_export_target_from_plan_sink(
+    sink: &WebhookExportSinkPlan,
+    webhook_connection: WebhookConnectionOptions,
+) -> WebhookExportTarget {
     WebhookExportTarget {
         sink: sink.id.clone(),
         endpoint: sink.endpoint.clone(),
@@ -167,6 +198,7 @@ fn webhook_export_target_from_plan_sink(sink: &WebhookExportSinkPlan) -> Webhook
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
         tls: sink.tls.clone(),
+        webhook_connection,
     }
 }
 
@@ -206,6 +238,7 @@ async fn drain_webhook_sink(
         codec,
         headers,
         tls,
+        webhook_connection,
     } = target;
     let first_events = spool.read_export_batch(&sink, EXPORT_BATCH_LIMIT)?;
     if first_events.is_empty() {
@@ -215,7 +248,13 @@ async fn drain_webhook_sink(
         return Ok(());
     };
     let tls = webhook_tls_config_from_plan(&tls)?;
-    let exporter = WebhookExporter::with_tls_config(endpoint, codec, headers, tls)?;
+    let exporter = WebhookExporter::with_connection_options(
+        endpoint,
+        codec,
+        headers,
+        tls,
+        webhook_connection,
+    )?;
     drain_export_sink_from_batch(spool, agent_id, &sink, codec, mode, &exporter, first_batch)
         .await
         .map(|_| ())

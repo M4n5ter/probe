@@ -10,4 +10,4 @@ pub use batch::BatchExporter;
 pub use codec::CompressionCodec;
 pub use error::ExportError;
 pub use file::{FileBatchRecord, FileBatchRecordDecodeError, FileBatchRecordKind, FileExporter};
-pub use webhook::{WebhookExporter, WebhookTlsConfig};
+pub use webhook::{WebhookConnectionOptions, WebhookExporter, WebhookTlsConfig};

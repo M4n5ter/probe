@@ -129,7 +129,7 @@ fn validate_outbound_redirect_setup_scope(
 
 fn outbound_transparent_proxy_classifier_unavailable() -> String {
     format!(
-        "outbound transparent proxy requires a host-rule setup scope before rule installation; existing {} and proxy pre-connect SO_MARK primitive only make host-rule OUTPUT redirect executable",
+        "outbound transparent proxy requires a host-rule setup scope before rule installation; existing {}, proxy upstream SO_MARK, and agent control-plane SO_MARK only make host-rule OUTPUT redirect executable",
         proxy::outbound_original_destination_recovery_name()
     )
 }

@@ -24,9 +24,15 @@ pub enum CheckError {
     #[error("enforcement error: {0}")]
     Enforcement(#[from] enforcement::EnforcementError),
     #[error("{0}")]
-    ConfiguredEnforcement(#[from] ConfiguredEnforcementError),
+    ConfiguredEnforcement(#[source] Box<ConfiguredEnforcementError>),
     #[error("{0}")]
     Tls(#[from] TlsCheckError),
+}
+
+impl From<ConfiguredEnforcementError> for CheckError {
+    fn from(error: ConfiguredEnforcementError) -> Self {
+        Self::ConfiguredEnforcement(Box::new(error))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -737,9 +743,8 @@ protective_actions = ["alert"]
 
         assert!(matches!(
             error,
-            CheckError::ConfiguredEnforcement(
-                ConfiguredEnforcementError::ExecutionBackendUnavailable
-            )
+            CheckError::ConfiguredEnforcement(error)
+                if matches!(*error, ConfiguredEnforcementError::ExecutionBackendUnavailable)
         ));
         fs::remove_dir_all(temp)?;
         Ok(())

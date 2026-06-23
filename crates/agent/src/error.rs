@@ -40,7 +40,7 @@ pub(crate) enum AgentError {
     #[error("enforcement error: {0}")]
     Enforcement(#[from] enforcement::EnforcementError),
     #[error("{0}")]
-    ConfiguredEnforcement(#[from] ConfiguredEnforcementError),
+    ConfiguredEnforcement(#[source] Box<ConfiguredEnforcementError>),
     #[error("{0}")]
     TransparentInterception(#[from] TransparentInterceptionError),
     #[error("proto error: {0}")]
@@ -68,5 +68,11 @@ pub(crate) enum AgentError {
 impl From<CheckError> for AgentError {
     fn from(error: CheckError) -> Self {
         Self::Check(Box::new(error))
+    }
+}
+
+impl From<ConfiguredEnforcementError> for AgentError {
+    fn from(error: ConfiguredEnforcementError) -> Self {
+        Self::ConfiguredEnforcement(Box::new(error))
     }
 }

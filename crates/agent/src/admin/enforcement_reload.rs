@@ -27,9 +27,15 @@ pub(super) enum EnforcementReloadError {
     )]
     SetupTimeInterception,
     #[error(transparent)]
-    Configured(#[from] ConfiguredEnforcementError),
+    Configured(#[from] Box<ConfiguredEnforcementError>),
     #[error("failed to reconfigure active enforcement planner: {0}")]
     Planner(#[from] enforcement::EnforcementError),
+}
+
+impl From<ConfiguredEnforcementError> for EnforcementReloadError {
+    fn from(error: ConfiguredEnforcementError) -> Self {
+        Self::Configured(Box::new(error))
+    }
 }
 
 pub(super) async fn reload_enforcement_policy(

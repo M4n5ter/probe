@@ -23,11 +23,17 @@ pub enum ConfiguredEnforcementError {
     #[error("enforcement planner error: {0}")]
     Planner(#[from] EnforcementError),
     #[error("enforcement policy source error: {0}")]
-    Source(#[from] EnforcementPolicySourceError),
+    Source(#[source] Box<EnforcementPolicySourceError>),
     #[error("{0}")]
     TransparentInterception(#[from] TransparentInterceptionError),
     #[error("enforcement execution backend is not available in this build/runtime")]
     ExecutionBackendUnavailable,
+}
+
+impl From<EnforcementPolicySourceError> for ConfiguredEnforcementError {
+    fn from(error: EnforcementPolicySourceError) -> Self {
+        Self::Source(Box::new(error))
+    }
 }
 
 #[derive(Clone)]

@@ -1,12 +1,13 @@
 use std::{io::Write, os::unix::net::UnixStream, path::PathBuf, sync::Arc};
 
+use exporter::WebhookConnectionOptions;
 use interception::TransparentInterceptionHostRuleScope;
 use parsers::Http1ParserFactory;
 use pipeline::{
     CapturePipeline, PipelinePolicySet, PipelineRunOptions, PipelineRuntimeMetrics, PipelineSummary,
 };
 use probe_config::AgentConfig;
-use runtime::{RuntimePlan, validate_static_runtime_config};
+use runtime::{RuntimePlan, TransparentInterceptionExecutionPlan, validate_static_runtime_config};
 use storage::FjallSpool;
 
 use crate::{
@@ -18,7 +19,10 @@ use crate::{
     },
     configured_policy::load_configured_pipeline_policies,
     error::AgentError,
-    export::{ExportDrainError, ExportWorker, ExportWorkerConfig, drain_planned_sinks},
+    export::{
+        ExportDrainError, ExportWorker, ExportWorkerConfig,
+        drain_planned_sinks_with_webhook_connection,
+    },
     runtime_composition::build_runtime_composition,
     shutdown,
     storage_retention::{
@@ -60,7 +64,9 @@ pub(crate) async fn run_live_agent(
     let enforcement = build_configured_enforcement_with_backend(&plan, enforcement_backend).await?;
     let policies = load_configured_pipeline_policies(&plan.config)?;
     let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
-    let export_worker = export_worker_config_from_plan(&plan).map(ExportWorker::new);
+    let webhook_connection = webhook_connection_options_from_plan(&plan);
+    let export_worker =
+        export_worker_config_from_plan(&plan, webhook_connection).map(ExportWorker::new);
     let pipeline_metrics = PipelineRuntimeMetrics::default();
     let policy_set = policies.into_policy_set();
     let (enforcement_planner, enforcement_runtime) = EnforcementRuntimeState::from_planner(
@@ -139,8 +145,13 @@ pub(crate) async fn run_live_agent(
     if let Some(worker) = storage_retention_worker {
         worker.stop().await;
     }
-    let drain_result =
-        drain_planned_sinks(spool.as_ref(), &plan.config.agent_id, &plan.export).await;
+    let drain_result = drain_planned_sinks_with_webhook_connection(
+        spool.as_ref(),
+        &plan.config.agent_id,
+        &plan.export,
+        webhook_connection,
+    )
+    .await;
     let summary = merge_run_results(summary_result, interception_cleanup_result, drain_result)?;
     println!(
         "agent stopped after reading {} capture events, journaling {} ingress records, processing {} ingress records ({} recovered), and storing {} export events",
@@ -305,8 +316,28 @@ fn merge_run_results(
     }
 }
 
-fn export_worker_config_from_plan(plan: &RuntimePlan) -> Option<ExportWorkerConfig> {
-    ExportWorkerConfig::from_plans(plan.config.agent_id.clone(), &plan.export)
+fn export_worker_config_from_plan(
+    plan: &RuntimePlan,
+    webhook_connection: WebhookConnectionOptions,
+) -> Option<ExportWorkerConfig> {
+    ExportWorkerConfig::from_plans_with_webhook_connection(
+        plan.config.agent_id.clone(),
+        &plan.export,
+        webhook_connection,
+    )
+}
+
+fn webhook_connection_options_from_plan(plan: &RuntimePlan) -> WebhookConnectionOptions {
+    match &plan.enforcement.interception.execution {
+        TransparentInterceptionExecutionPlan::OutboundTransparentProxy(outbound) => {
+            WebhookConnectionOptions::default()
+                .with_socket_mark(outbound.outbound_redirect_artifact().proxy_bypass_mark)
+        }
+        TransparentInterceptionExecutionPlan::Disabled
+        | TransparentInterceptionExecutionPlan::InboundTproxy(_) => {
+            WebhookConnectionOptions::default()
+        }
+    }
 }
 
 fn storage_retention_worker_config_from_plan(

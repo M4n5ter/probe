@@ -70,19 +70,23 @@ pub enum ExportError {
     Compression(std::io::Error),
     #[error("zstd compression failed: {0}")]
     Zstd(std::io::Error),
-    #[error("http transport failed: {0}")]
-    Http(#[from] reqwest::Error),
+    #[error("http transport failed: {reason}")]
+    HttpTransport { reason: String },
+    #[error("invalid webhook TLS material: {reason}")]
+    InvalidWebhookTlsMaterial { reason: String },
     #[error("invalid ack response body: {source}")]
     InvalidAckResponse { source: serde_json::Error },
+    #[error("ack response body is too large: at least {size} bytes, limit {limit}")]
+    AckResponseTooLarge { size: u64, limit: u64 },
     #[error("invalid HTTP header name {name}: {source}")]
     InvalidHeaderName {
         name: String,
-        source: reqwest::header::InvalidHeaderName,
+        source: http::header::InvalidHeaderName,
     },
     #[error("invalid HTTP header value for {name}: {source}")]
     InvalidHeaderValue {
         name: String,
-        source: reqwest::header::InvalidHeaderValue,
+        source: http::header::InvalidHeaderValue,
     },
     #[error("HTTP header {name} is reserved by the webhook protocol")]
     ReservedHeaderName { name: String },

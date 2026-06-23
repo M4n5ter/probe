@@ -1,6 +1,4 @@
-use probe_config::{
-    AgentConfig, ConfigViolation, ExporterTransportConfig, TransparentInterceptionStrategyConfig,
-};
+use probe_config::{AgentConfig, ConfigViolation};
 use probe_core::EnforcementMode;
 
 use crate::plan::{
@@ -60,18 +58,6 @@ pub(super) fn validate_static_config(config: &AgentConfig, violations: &mut Vec<
                 reason: "enforce mode supports exactly one enforcement execution surface until composite enforcement execution is implemented".to_string(),
             }),
         }
-    }
-    if config.enforcement.interception.strategy
-        == TransparentInterceptionStrategyConfig::OutboundTransparentProxy
-        && config
-            .exporters
-            .iter()
-            .any(|exporter| matches!(&exporter.transport, ExporterTransportConfig::Webhook { .. }))
-    {
-        violations.push(ConfigViolation {
-            field: "exporters".to_string(),
-            reason: "outbound transparent proxy cannot be combined with webhook exporters until agent-owned outbound control-plane sockets have a verified bypass contract".to_string(),
-        });
     }
 }
 
@@ -384,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_transparent_proxy_rejects_webhook_exporter_without_control_plane_bypass() {
+    fn outbound_transparent_proxy_accepts_webhook_exporter_with_control_plane_bypass() {
         let registry = ProviderRegistry::new(
             vec![live_capture_provider()],
             transparent_interception_capabilities(),
@@ -416,9 +402,8 @@ mod tests {
             worker: Default::default(),
         }];
 
-        let error = validation_error(config, &registry);
-
-        assert_violation(&error, "exporters", "control-plane sockets");
+        validate_runtime_config(&config, &registry)
+            .expect("agent-owned control-plane socket bypass makes webhook export executable");
     }
 
     #[test]

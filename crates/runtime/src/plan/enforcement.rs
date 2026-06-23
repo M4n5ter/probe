@@ -517,6 +517,8 @@ impl EnforcementPolicySourcePlan {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use probe_config::{
         AgentConfig, ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig,
     };
@@ -660,7 +662,8 @@ mod tests {
         assert_eq!(plan.interception.nftables.inbound_tproxy_mark, 0x5353_4101);
         assert_eq!(
             plan.interception.nftables.outbound_proxy_bypass_mark,
-            0x5353_4102
+            NonZeroU32::new(0x5353_4102)
+                .expect("test outbound proxy bypass mark should be non-zero")
         );
         assert_eq!(
             plan.interception.nftables.inbound_tproxy_route_table,
@@ -734,7 +737,8 @@ mod tests {
                     hook: "output".to_string(),
                     priority: "dstnat".to_string(),
                     proxy_port: 15001,
-                    proxy_bypass_mark: 0x5353_4102,
+                    proxy_bypass_mark: NonZeroU32::new(0x5353_4102)
+                        .expect("test outbound proxy bypass mark should be non-zero"),
                 }
             }
         );

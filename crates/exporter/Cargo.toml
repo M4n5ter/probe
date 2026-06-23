@@ -10,14 +10,23 @@ async-trait = "0.1.89"
 base64 = "0.22.1"
 bytes = "1.11.1"
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
+http = "1.4"
+http-body-util = "0.1"
+hyper = { version = "1.10", features = ["client", "http1"] }
+hyper-rustls = "0.27"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+probe-io = { path = "../probe-io" }
 probe-core = { path = "../core" }
 proto = { version = "0.1.0", path = "../proto" }
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
+rustls = "0.23"
+rustls-native-certs = "0.8"
+rustls-pemfile = "2.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt"] }
+tokio = { version = "1.52.3", features = ["net", "rt"] }
+tower-service = "0.3"
 zstd = "0.13.3"
 
 [lints]

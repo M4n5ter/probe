@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use interception::TransparentInterceptionHostRuleScope;
 #[cfg(test)]
 use interception::TransparentInterceptionSetupDirection;
@@ -14,7 +16,7 @@ pub struct OutboundRedirectLifecyclePlan {
     hook: String,
     priority: String,
     proxy_port: u16,
-    proxy_bypass_mark: u32,
+    proxy_bypass_mark: NonZeroU32,
     rules: Vec<NftRule>,
 }
 
@@ -79,7 +81,7 @@ impl OutboundRedirectLifecyclePlan {
         families
     }
 
-    pub fn proxy_bypass_mark(&self) -> u32 {
+    pub fn proxy_bypass_mark(&self) -> NonZeroU32 {
         self.proxy_bypass_mark
     }
 
@@ -95,7 +97,7 @@ impl OutboundRedirectLifecyclePlan {
             "add rule inet {} {} meta mark {} return",
             self.table_name,
             self.chain_name,
-            hex_mark(self.proxy_bypass_mark)
+            hex_mark(self.proxy_bypass_mark.get())
         )
     }
 

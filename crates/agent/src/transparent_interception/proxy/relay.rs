@@ -13,10 +13,7 @@ use std::{
 use socket2::{SockAddr, Socket};
 
 use super::{
-    connect::{
-        TransparentProxyBypassMark, TransparentProxyUpstreamConnectPlan, connect_tcp,
-        tcp_connect_failure_reason,
-    },
+    connect::{TransparentProxyUpstreamConnectPlan, connect_tcp, tcp_connect_failure_reason},
     proxy_error, proxy_io_error,
     registry::{RelayRegistry, RelaySlot, shutdown_streams},
     state::TransparentProxyRuntime,
@@ -127,7 +124,7 @@ impl TransparentProxyRelayPlan {
             },
             upstream_connect: TransparentProxyUpstreamConnectPlan::new(
                 CONNECT_TIMEOUT,
-                Some(TransparentProxyBypassMark::new(proxy_bypass_mark)),
+                Some(probe_io::TcpSocketMark::new(proxy_bypass_mark)),
             ),
         }
     }

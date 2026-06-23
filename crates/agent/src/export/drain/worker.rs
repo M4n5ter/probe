@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use exporter::WebhookConnectionOptions;
 use runtime::{ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportWorkerPlan};
 use serde::Serialize;
 use storage::ExportSpool;
@@ -38,6 +39,7 @@ pub struct ExportWorkerConfig {
     interval: Duration,
     sink_timeout: Duration,
     failure_backoff: ExportWorkerBackoffPolicy,
+    webhook_connection: WebhookConnectionOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +113,7 @@ impl ExportWorkerConfig {
         interval: Duration,
         sink_timeout: Duration,
         failure_backoff: ExportWorkerBackoffPolicy,
+        webhook_connection: WebhookConnectionOptions,
     ) -> Self {
         Self {
             agent_id,
@@ -118,10 +121,24 @@ impl ExportWorkerConfig {
             interval,
             sink_timeout,
             failure_backoff,
+            webhook_connection,
         }
     }
 
+    #[cfg(test)]
     pub fn from_plans(agent_id: String, export: &ExportPlan) -> Option<Self> {
+        Self::from_plans_with_webhook_connection(
+            agent_id,
+            export,
+            WebhookConnectionOptions::default(),
+        )
+    }
+
+    pub(crate) fn from_plans_with_webhook_connection(
+        agent_id: String,
+        export: &ExportPlan,
+        webhook_connection: WebhookConnectionOptions,
+    ) -> Option<Self> {
         match &export.worker {
             ExportWorkerPlan::Disabled { .. } => None,
             ExportWorkerPlan::FixedIntervalBounded {
@@ -135,6 +152,7 @@ impl ExportWorkerConfig {
                 Duration::from_millis(*interval_ms),
                 Duration::from_millis(*sink_timeout_ms),
                 ExportWorkerBackoffPolicy::from(*failure_backoff),
+                webhook_connection,
             )),
         }
     }
@@ -326,7 +344,14 @@ async fn drain_export_sinks_once(
             max_batches: sink.worker().effective_batches_per_tick.get(),
             sink_timeout: config.sink_timeout,
         };
-        let result = drain_export_sink_with_mode(spool, &config.agent_id, sink, mode).await;
+        let result = drain_export_sink_with_mode(
+            spool,
+            &config.agent_id,
+            sink,
+            mode,
+            config.webhook_connection,
+        )
+        .await;
         match result {
             Ok(()) => {
                 runtime_state.record_success(sink_id);

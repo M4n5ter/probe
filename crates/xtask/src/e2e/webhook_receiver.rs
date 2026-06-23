@@ -7,16 +7,18 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use exporter::{CompressionCodec, WebhookAck};
 use proto::BatchEnvelope;
 
 const REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const BATCH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 pub(crate) struct WebhookBatchReceiver {
     endpoint: String,
+    listen_port: u16,
     stop_requested: Arc<AtomicBool>,
     batches: Arc<Mutex<Vec<ReceivedBatch>>>,
     handle: Option<thread::JoinHandle<Result<(), String>>>,
@@ -26,7 +28,8 @@ impl WebhookBatchReceiver {
     pub(crate) fn spawn() -> Result<Self, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
-        let endpoint = format!("http://{}/batches", listener.local_addr()?);
+        let listen_addr = listener.local_addr()?;
+        let endpoint = format!("http://{listen_addr}/batches");
         let stop_requested = Arc::new(AtomicBool::new(false));
         let stop_requested_for_thread = Arc::clone(&stop_requested);
         let batches = Arc::new(Mutex::new(Vec::new()));
@@ -63,6 +66,7 @@ impl WebhookBatchReceiver {
 
         Ok(Self {
             endpoint,
+            listen_port: listen_addr.port(),
             stop_requested,
             batches,
             handle: Some(handle),
@@ -71,6 +75,35 @@ impl WebhookBatchReceiver {
 
     pub(crate) fn endpoint(&self) -> String {
         self.endpoint.clone()
+    }
+
+    pub(crate) fn listen_port(&self) -> u16 {
+        self.listen_port
+    }
+
+    pub(crate) fn wait_for_batches(
+        &self,
+        expected: usize,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let observed = self
+                .batches
+                .lock()
+                .map_err(|_| "batch lock poisoned")?
+                .len();
+            if observed >= expected {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "webhook receiver observed {observed} batch(es), expected at least {expected}"
+                )
+                .into());
+            }
+            thread::sleep(BATCH_POLL_INTERVAL);
+        }
     }
 
     pub(crate) fn join(mut self) -> Result<Vec<ReceivedBatch>, Box<dyn std::error::Error>> {

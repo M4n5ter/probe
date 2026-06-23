@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener},
@@ -16,14 +17,24 @@ use super::{
         trusted_system_command, verify_fresh_network_namespace,
     },
     loopback::{send_admin_request, spawn_agent, wait_for_agent_ready},
+    webhook_receiver::{ReceivedBatch, WebhookBatchReceiver},
 };
+use exporter::CompressionCodec;
 use probe_config::{
-    AgentConfig, CaptureSelection, TransparentInterceptionProxyConfig,
-    TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
+    AgentConfig, CaptureSelection, CompressionCodecName, ExportFailureBackoffConfig,
+    ExportWorkerScheduleConfig, ExporterConfig, ExporterTransportConfig, PolicyConfig,
+    TransparentInterceptionProxyConfig, TransparentInterceptionProxyModeConfig,
+    TransparentInterceptionStrategyConfig,
 };
-use probe_core::{Direction, EnforcementMode, ProcessSelector, Selector, TrafficSelector};
+use probe_core::{
+    Direction, EnforcementMode, EventEnvelope, EventKind, ProcessSelector, Selector,
+    TrafficSelector,
+};
 
 const CASE_NAME: &str = "e2e-transparent-outbound-proxy-loopback";
+const COLLECTOR_SINK: &str = "collector";
+const POLICY_ID: &str = "outbound-proxy-e2e-policy";
+const POLICY_VERSION: &str = "e2e";
 const IN_NETNS_ENV: &str = "SSSA_PROBE_E2E_TRANSPARENT_OUTBOUND_PROXY_NETNS";
 const LOOPBACK_ADDR: Ipv4Addr = Ipv4Addr::LOCALHOST;
 const UPSTREAM_PORT: u16 = 18082;
@@ -38,6 +49,7 @@ const SERVER_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 const METRICS_TIMEOUT: Duration = Duration::from_secs(10);
 const METRICS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) fn run() -> ExitCode {
     match run_outer() {
@@ -79,28 +91,56 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let spool_path = root.join("spool");
     let admin_socket_path = root.join("admin.sock");
     let ready_socket_path = root.join("agent.ready.sock");
+    let policy_path = root.join("outbound-proxy-e2e-policy.bundle");
 
-    write_agent_config(&config_path, &spool_path, &admin_socket_path)?;
+    write_policy_bundle(&policy_path)?;
+    let webhook_receiver = WebhookBatchReceiver::spawn()?;
+    write_agent_config(
+        &config_path,
+        &spool_path,
+        &admin_socket_path,
+        &policy_path,
+        webhook_receiver.endpoint(),
+        webhook_receiver.listen_port(),
+    )?;
     let supervisor = ChildSupervisor::new()?;
     let upstream = UpstreamServer::spawn()?;
     let mut ready_signal = UnixSocketReadySignal::bind(ready_socket_path)?;
     let mut agent = supervisor.watch(spawn_agent(&config_path, &ready_signal)?, "agent");
     wait_for_agent_ready(agent.child_mut(), &mut ready_signal)?;
-    assert_outbound_redirect_table_installed()?;
+    assert_outbound_redirect_table_installed(webhook_receiver.listen_port())?;
 
     let client_response = run_client();
     let upstream_report = upstream.join();
-    let proxy_metrics = match (&client_response, &upstream_report) {
-        (Ok(_), Ok(_)) => wait_for_proxy_relay_metrics(agent.child_mut(), &admin_socket_path),
+    let webhook_wait = match (&client_response, &upstream_report) {
+        (Ok(_), Ok(_)) => webhook_receiver.wait_for_batches(1, WEBHOOK_TIMEOUT),
+        _ => Ok(()),
+    };
+    let proxy_metrics = match (&client_response, &upstream_report, &webhook_wait) {
+        (Ok(_), Ok(_), Ok(())) => wait_for_proxy_relay_metrics(
+            agent.child_mut(),
+            &admin_socket_path,
+            ExpectedProxyRelayMetrics {
+                accepted_relays: 1,
+                upstream_connect_successes: 1,
+            },
+        ),
         _ => Ok(()),
     };
     let agent_result = stop_running_child(agent.child_mut(), "agent");
     agent.unwatch();
     let cleanup_result = assert_transparent_interception_cleanup();
+    let webhook_result = match webhook_wait {
+        Ok(()) => webhook_receiver
+            .join()
+            .and_then(|batches| assert_webhook_batches(&batches)),
+        Err(error) => Err(error),
+    };
 
     merge_run_results(
         client_response,
         upstream_report,
+        webhook_result,
         proxy_metrics,
         agent_result,
         cleanup_result,
@@ -111,6 +151,9 @@ fn write_agent_config(
     path: &Path,
     spool_path: &Path,
     admin_socket_path: &Path,
+    policy_path: &Path,
+    webhook_endpoint: String,
+    webhook_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = AgentConfig {
         agent_id: "e2e-transparent-outbound-proxy-agent".to_string(),
@@ -123,9 +166,38 @@ fn write_agent_config(
         format!("tcp and (port {UPSTREAM_PORT} or port {PROXY_PORT})");
     config.capture.libpcap.read_timeout_ms = 100;
     config.storage.path = spool_path.to_path_buf();
-    config.export.worker.enabled = false;
+    config.export.worker.enabled = true;
+    config.export.worker.schedule = ExportWorkerScheduleConfig::FixedIntervalBounded {
+        interval_ms: 100,
+        batches_per_sink_per_tick: 1,
+        sink_timeout_ms: 5_000,
+        failure_backoff: ExportFailureBackoffConfig {
+            initial_ms: 5_000,
+            max_ms: 5_000,
+            multiplier: 1,
+        },
+    };
+    config.exporters.push(ExporterConfig {
+        id: COLLECTOR_SINK.to_string(),
+        transport: ExporterTransportConfig::Webhook {
+            endpoint: webhook_endpoint,
+            headers: BTreeMap::from([(
+                "x-sssa-e2e".to_string(),
+                "transparent-outbound-proxy".to_string(),
+            )]),
+            tls: Default::default(),
+        },
+        codec: CompressionCodecName::None,
+        worker: Default::default(),
+    });
     config.admin.enabled = true;
     config.admin.socket_path = admin_socket_path.to_path_buf();
+    config.policies.push(PolicyConfig {
+        id: POLICY_ID.to_string(),
+        path: policy_path.to_path_buf(),
+        enabled: true,
+        selector: None,
+    });
     config.enforcement.mode = EnforcementMode::Enforce;
     config.enforcement.interception.strategy =
         TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
@@ -137,7 +209,7 @@ fn write_agent_config(
     config.enforcement.interception.selector = Some(Selector::term(
         ProcessSelector::default(),
         TrafficSelector {
-            remote_ports: vec![UPSTREAM_PORT],
+            remote_ports: vec![UPSTREAM_PORT, webhook_port],
             directions: vec![Direction::Outbound],
             remote_addresses: vec![LOOPBACK_ADDR.to_string()],
             ..TrafficSelector::default()
@@ -145,6 +217,31 @@ fn write_agent_config(
     ));
     fs::write(path, toml::to_string(&config)?)?;
     Ok(())
+}
+
+fn write_policy_bundle(path: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(path)?;
+    fs::write(
+        path.join("manifest.toml"),
+        format!(
+            r#"
+id = "{POLICY_ID}"
+version = "{POLICY_VERSION}"
+hooks = ["on_http_request_headers"]
+"#
+        ),
+    )?;
+    fs::write(
+        path.join("main.lua"),
+        r#"
+function on_http_request_headers(event)
+  local target = event.kind.target or ""
+  if target == "/transparent-outbound-proxy-e2e" then
+    return probe.emit_alert("transparent outbound proxy observed " .. target)
+  end
+end
+"#,
+    )
 }
 
 struct UpstreamServer {
@@ -238,11 +335,12 @@ fn run_client() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 fn wait_for_proxy_relay_metrics(
     agent: &mut Child,
     admin_socket_path: &Path,
+    expected: ExpectedProxyRelayMetrics,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + METRICS_TIMEOUT;
     loop {
         match read_proxy_relay_metrics(admin_socket_path) {
-            Ok(metrics) if metrics.proves_relay_success() => return Ok(()),
+            Ok(metrics) if metrics.matches_expected(expected) => return Ok(()),
             Ok(metrics) if metrics.has_failure() => {
                 return Err(e2e_error(format!(
                     "transparent proxy reported relay failure metrics: {metrics:?}"
@@ -260,10 +358,22 @@ fn wait_for_proxy_relay_metrics(
             }
         }
         if Instant::now() >= deadline {
-            return Err(e2e_error("timed out waiting for transparent proxy relay metrics").into());
+            let metrics = read_proxy_relay_metrics(admin_socket_path)
+                .map(|metrics| format!("{metrics:?}"))
+                .unwrap_or_else(|error| format!("unavailable: {error}"));
+            return Err(e2e_error(format!(
+                "timed out waiting for transparent proxy relay metrics {expected:?}; last metrics {metrics}"
+            ))
+            .into());
         }
         thread::sleep(METRICS_POLL_INTERVAL);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpectedProxyRelayMetrics {
+    accepted_relays: u64,
+    upstream_connect_successes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,8 +387,10 @@ struct ProxyRelayMetrics {
 }
 
 impl ProxyRelayMetrics {
-    fn proves_relay_success(self) -> bool {
-        self.accepted_relays >= 1 && self.upstream_connect_successes >= 1 && !self.has_failure()
+    fn matches_expected(self, expected: ExpectedProxyRelayMetrics) -> bool {
+        self.accepted_relays == expected.accepted_relays
+            && self.upstream_connect_successes == expected.upstream_connect_successes
+            && !self.has_failure()
     }
 
     fn has_failure(self) -> bool {
@@ -320,18 +432,28 @@ fn metric_u64(
     })?)
 }
 
-fn assert_outbound_redirect_table_installed() -> Result<(), Box<dyn std::error::Error>> {
+fn assert_outbound_redirect_table_installed(
+    webhook_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listing = nft_output(["list", "table", "inet", "sssa_probe"])?;
-    if !listing.contains("chain outbound_transparent_proxy")
-        || !listing.contains("type nat hook output priority dstnat; policy accept;")
-        || !listing.contains(OUTBOUND_BYPASS_MARK)
-        || !listing.contains(&format!("tcp dport {UPSTREAM_PORT}"))
-        || !listing.contains(&format!("redirect to :{PROXY_PORT}"))
-    {
-        return Err(e2e_error(format!(
-            "outbound transparent proxy nft table does not contain expected redirect rules: {listing}"
-        ))
-        .into());
+    let expected_snippets = [
+        "chain outbound_transparent_proxy".to_string(),
+        "type nat hook output priority dstnat; policy accept;".to_string(),
+        format!("meta mark {OUTBOUND_BYPASS_MARK} return"),
+        format!(
+            "meta l4proto tcp meta nfproto ipv4 tcp dport {{ {UPSTREAM_PORT}, {webhook_port} }} redirect to :{PROXY_PORT}"
+        ),
+        format!(
+            "meta l4proto tcp meta nfproto ipv6 tcp dport {{ {UPSTREAM_PORT}, {webhook_port} }} redirect to :{PROXY_PORT}"
+        ),
+    ];
+    for snippet in expected_snippets {
+        if !listing.contains(&snippet) {
+            return Err(e2e_error(format!(
+                "outbound transparent proxy nft table is missing expected snippet `{snippet}`: {listing}"
+            ))
+            .into());
+        }
     }
     Ok(())
 }
@@ -413,9 +535,54 @@ fn assert_client_received_server_response(
     }
 }
 
+fn assert_webhook_batches(batches: &[ReceivedBatch]) -> Result<(), Box<dyn std::error::Error>> {
+    if batches.is_empty() {
+        return Err(e2e_error("webhook receiver captured no batches").into());
+    }
+    if !batches
+        .iter()
+        .all(|batch| batch.codec == CompressionCodec::None)
+    {
+        return Err(e2e_error("webhook receiver observed an unexpected codec").into());
+    }
+    if !batches.iter().all(|batch| {
+        batch
+            .headers
+            .get("x-sssa-e2e")
+            .is_some_and(|value| value == "transparent-outbound-proxy")
+    }) {
+        return Err(e2e_error("webhook receiver did not observe configured header").into());
+    }
+
+    let exported = batches
+        .iter()
+        .flat_map(|batch| batch.batch.events.iter())
+        .map(|event| serde_json::from_slice::<EventEnvelope>(&event.payload))
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected = expected_policy_alert_message();
+    if exported.iter().any(|event| {
+        matches!(
+            event.kind(),
+            EventKind::PolicyAlert(alert) if alert.message == expected
+        )
+    }) {
+        return Ok(());
+    }
+
+    Err(e2e_error(format!(
+        "webhook export batches did not contain expected policy alert {expected:?}"
+    ))
+    .into())
+}
+
+fn expected_policy_alert_message() -> String {
+    "transparent outbound proxy observed /transparent-outbound-proxy-e2e".to_string()
+}
+
 fn merge_run_results(
     client_response: Result<Vec<u8>, Box<dyn std::error::Error>>,
     upstream_report: Result<UpstreamReport, Box<dyn std::error::Error>>,
+    webhook_result: Result<(), Box<dyn std::error::Error>>,
     proxy_metrics: Result<(), Box<dyn std::error::Error>>,
     agent_result: Result<(), Box<dyn std::error::Error>>,
     cleanup_result: Result<(), Box<dyn std::error::Error>>,
@@ -437,6 +604,7 @@ fn merge_run_results(
         ),
         Err(error) => errors.push(format!("upstream server failed: {error}")),
     }
+    record_result("webhook exporter", webhook_result, &mut errors);
     record_result("transparent proxy metrics", proxy_metrics, &mut errors);
     record_result("agent shutdown", agent_result, &mut errors);
     record_result(

@@ -42,6 +42,7 @@ pub enum ExportDrainFailureReason {
     InvalidExporterHeader,
     ReservedExporterHeader,
     EmptyTlsTrustAnchorBundle,
+    InvalidWebhookTlsMaterial,
     RemoteRejectedBatch,
     InvalidExportAck,
     MultipleSinksFailed,
@@ -92,7 +93,7 @@ fn export_error_failure_reason(error: &exporter::ExportError) -> ExportDrainFail
         exporter::ExportError::Compression(_) | exporter::ExportError::Zstd(_) => {
             ExportDrainFailureReason::CompressionError
         }
-        exporter::ExportError::Http(_) => ExportDrainFailureReason::HttpTransportError,
+        exporter::ExportError::HttpTransport { .. } => ExportDrainFailureReason::HttpTransportError,
         exporter::ExportError::InvalidHeaderName { .. }
         | exporter::ExportError::InvalidHeaderValue { .. } => {
             ExportDrainFailureReason::InvalidExporterHeader
@@ -103,8 +104,12 @@ fn export_error_failure_reason(error: &exporter::ExportError) -> ExportDrainFail
         exporter::ExportError::EmptyTrustAnchorBundle => {
             ExportDrainFailureReason::EmptyTlsTrustAnchorBundle
         }
+        exporter::ExportError::InvalidWebhookTlsMaterial { .. } => {
+            ExportDrainFailureReason::InvalidWebhookTlsMaterial
+        }
         exporter::ExportError::Rejected { .. } => ExportDrainFailureReason::RemoteRejectedBatch,
         exporter::ExportError::InvalidAckResponse { .. }
+        | exporter::ExportError::AckResponseTooLarge { .. }
         | exporter::ExportError::AckBatchMismatch { .. }
         | exporter::ExportError::AckMissingCursor { .. }
         | exporter::ExportError::AckCursorOutOfRange { .. } => {
@@ -144,6 +149,18 @@ mod tests {
         assert_eq!(
             error.runtime_failure_reason(),
             ExportDrainFailureReason::InvalidExportAck
+        );
+    }
+
+    #[test]
+    fn runtime_failure_reason_distinguishes_webhook_tls_material_errors() {
+        let error = ExportDrainError::Export(exporter::ExportError::InvalidWebhookTlsMaterial {
+            reason: "private key mismatch".to_string(),
+        });
+
+        assert_eq!(
+            error.runtime_failure_reason(),
+            ExportDrainFailureReason::InvalidWebhookTlsMaterial
         );
     }
 }

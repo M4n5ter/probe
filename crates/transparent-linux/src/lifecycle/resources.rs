@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use serde::{Deserialize, Serialize};
 
 const TRANSPARENT_INTERCEPTION_NFTABLES_TABLE: &str = "sssa_probe";
@@ -12,7 +14,7 @@ const TRANSPARENT_INTERCEPTION_DSTNAT_PRIORITY: &str = "dstnat";
 pub struct TransparentLinuxResources {
     pub table_name: String,
     pub inbound_tproxy_mark: u32,
-    pub outbound_proxy_bypass_mark: u32,
+    pub outbound_proxy_bypass_mark: NonZeroU32,
     pub inbound_tproxy_route_table: u32,
 }
 
@@ -21,7 +23,10 @@ impl TransparentLinuxResources {
         Self {
             table_name: TRANSPARENT_INTERCEPTION_NFTABLES_TABLE.to_string(),
             inbound_tproxy_mark: TRANSPARENT_INTERCEPTION_INBOUND_TPROXY_MARK,
-            outbound_proxy_bypass_mark: TRANSPARENT_INTERCEPTION_OUTBOUND_PROXY_BYPASS_MARK,
+            outbound_proxy_bypass_mark: NonZeroU32::new(
+                TRANSPARENT_INTERCEPTION_OUTBOUND_PROXY_BYPASS_MARK,
+            )
+            .expect("reserved outbound proxy bypass mark should be non-zero"),
             inbound_tproxy_route_table: TRANSPARENT_INTERCEPTION_INBOUND_TPROXY_ROUTE_TABLE,
         }
     }
@@ -49,7 +54,7 @@ pub struct OutboundRedirectArtifactSpec {
     pub hook: String,
     pub priority: String,
     pub proxy_port: u16,
-    pub proxy_bypass_mark: u32,
+    pub proxy_bypass_mark: NonZeroU32,
 }
 
 impl OutboundRedirectArtifactSpec {

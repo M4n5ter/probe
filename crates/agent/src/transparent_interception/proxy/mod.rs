@@ -8,6 +8,7 @@ mod target;
 
 use std::{
     net::IpAddr,
+    num::NonZeroU32,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -73,7 +74,7 @@ pub(in crate::transparent_interception) fn prepare_proxy_lifecycle(
 pub(in crate::transparent_interception) fn prepare_outbound_proxy_lifecycle(
     outbound_plan: &TransparentInterceptionOutboundProxyPlan,
     families: Vec<TransparentInterceptionIpFamily>,
-    proxy_bypass_mark: u32,
+    proxy_bypass_mark: NonZeroU32,
     load_local_addresses: LocalAddressInventory,
 ) -> Result<TransparentProxyLifecyclePlan, TransparentInterceptionError> {
     let managed = prepare_outbound_managed_proxy(
@@ -144,7 +145,7 @@ fn prepare_managed_proxy(
 fn prepare_outbound_managed_proxy(
     outbound_plan: &TransparentInterceptionOutboundProxyPlan,
     families: Vec<TransparentInterceptionIpFamily>,
-    proxy_bypass_mark: u32,
+    proxy_bypass_mark: NonZeroU32,
     load_local_addresses: LocalAddressInventory,
 ) -> Result<Option<ManagedTransparentProxyPlan>, TransparentInterceptionError> {
     if families.is_empty() {
@@ -152,11 +153,6 @@ fn prepare_outbound_managed_proxy(
             "managed outbound transparent proxy requires at least one listener family".to_string(),
         ));
     }
-    let Some(proxy_bypass_mark) = std::num::NonZeroU32::new(proxy_bypass_mark) else {
-        return Err(proxy_error(
-            "outbound transparent proxy bypass mark must be non-zero",
-        ));
-    };
     let local_addresses = load_local_addresses()?;
     let listen_port = outbound_plan.listen_port().get();
     Ok(Some(ManagedTransparentProxyPlan {
