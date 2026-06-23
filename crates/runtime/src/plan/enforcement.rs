@@ -14,6 +14,10 @@ use super::interception_scope::TransparentInterceptionLocalSetupProjectionPlan;
 const RESERVED_TRANSPARENT_INTERCEPTION_NFTABLES_TABLE: &str = "sssa_probe";
 const RESERVED_TRANSPARENT_INTERCEPTION_NFTABLES_MARK: u32 = 0x5353_4101;
 const RESERVED_TRANSPARENT_INTERCEPTION_ROUTE_TABLE: u32 = 53_534;
+const RESERVED_TRANSPARENT_INTERCEPTION_OUTBOUND_CHAIN: &str = "outbound_mitm";
+const TRANSPARENT_INTERCEPTION_OUTPUT_HOOK: &str = "output";
+const TRANSPARENT_INTERCEPTION_DSTNAT_PRIORITY: &str = "dstnat";
+const OUTBOUND_MITM_INSTALL_BLOCKED_REASON: &str = "outbound transparent MITM redirect install requires proxy self-bypass socket marking, original-destination recovery, and MITM lifecycle";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPlan {
@@ -93,6 +97,7 @@ pub struct EnforcementInterceptionPlan {
     pub proxy: TransparentInterceptionProxyPlan,
     pub execution: TransparentInterceptionExecutionPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
+    pub outbound_redirect: TransparentInterceptionOutboundRedirectPlan,
     pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
     pub classification: TransparentInterceptionClassificationPlan,
     pub capability: EnforcementCapabilityPlan,
@@ -107,11 +112,15 @@ impl EnforcementInterceptionPlan {
             .transparent_proxy_intent()
             .expect("transparent interception config should be validated before planning");
         let strategy = intent.strategy();
+        let nftables = TransparentInterceptionNftablesPlan::reserved();
         Self {
             strategy,
             proxy: TransparentInterceptionProxyPlan::from_intent(&intent),
             execution: TransparentInterceptionExecutionPlan::from_intent(&intent),
-            nftables: TransparentInterceptionNftablesPlan::reserved(),
+            outbound_redirect: TransparentInterceptionOutboundRedirectPlan::from_intent(
+                &intent, &nftables,
+            ),
+            nftables,
             local_setup_projection:
                 TransparentInterceptionLocalSetupProjectionPlan::from_strategy_and_selectors(
                     strategy,
@@ -333,6 +342,49 @@ impl TransparentInterceptionNftablesPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TransparentInterceptionOutboundRedirectPlan {
+    NotConfigured,
+    Planned {
+        table_name: String,
+        chain_name: String,
+        hook: String,
+        priority: String,
+        proxy_port: u16,
+        proxy_bypass_mark: u32,
+        install: TransparentInterceptionOutboundRedirectInstallPlan,
+    },
+}
+
+impl TransparentInterceptionOutboundRedirectPlan {
+    fn from_intent(
+        intent: &TransparentInterceptionProxyIntent,
+        nftables: &TransparentInterceptionNftablesPlan,
+    ) -> Self {
+        let TransparentInterceptionProxyIntent::OutboundMitm(proxy) = intent else {
+            return Self::NotConfigured;
+        };
+        Self::Planned {
+            table_name: nftables.table_name.clone(),
+            chain_name: RESERVED_TRANSPARENT_INTERCEPTION_OUTBOUND_CHAIN.to_string(),
+            hook: TRANSPARENT_INTERCEPTION_OUTPUT_HOOK.to_string(),
+            priority: TRANSPARENT_INTERCEPTION_DSTNAT_PRIORITY.to_string(),
+            proxy_port: proxy.listen_port().get(),
+            proxy_bypass_mark: nftables.mark,
+            install: TransparentInterceptionOutboundRedirectInstallPlan::Blocked {
+                reason: OUTBOUND_MITM_INSTALL_BLOCKED_REASON.to_string(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TransparentInterceptionOutboundRedirectInstallPlan {
+    Blocked { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
 pub enum EnforcementCapabilityPlan {
     NotRequired,
     Required {
@@ -372,10 +424,16 @@ impl EnforcementCapabilityPlan {
     pub(super) fn requirement_for_interception_strategy(
         strategy: TransparentInterceptionStrategyConfig,
     ) -> Option<EnforcementCapabilityRequirement> {
-        strategy.is_enabled().then_some(EnforcementCapabilityRequirement {
-            capability: CapabilityKind::TransparentInterception,
-            unavailable_reason: "transparent interception backend is not available in this build/runtime",
-        })
+        match strategy {
+            TransparentInterceptionStrategyConfig::InboundTproxy => {
+                Some(EnforcementCapabilityRequirement {
+                    capability: CapabilityKind::TransparentInterception,
+                    unavailable_reason: "transparent interception backend is not available in this build/runtime",
+                })
+            }
+            TransparentInterceptionStrategyConfig::None
+            | TransparentInterceptionStrategyConfig::OutboundMitm => None,
+        }
     }
 
     fn from_mode(mode: EnforcementMode, capabilities: &CapabilityMatrix) -> Self {
@@ -473,7 +531,9 @@ mod tests {
     use probe_config::{
         AgentConfig, ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig,
     };
-    use probe_core::{CapabilityMatrix, CapabilityState, Selector};
+    use probe_core::{
+        CapabilityMatrix, CapabilityState, Direction, ProcessSelector, Selector, TrafficSelector,
+    };
 
     use super::*;
 
@@ -611,6 +671,10 @@ mod tests {
         assert_eq!(plan.interception.nftables.mark, 0x5353_4101);
         assert_eq!(plan.interception.nftables.route_table, 53_534);
         assert_eq!(
+            plan.interception.outbound_redirect,
+            TransparentInterceptionOutboundRedirectPlan::NotConfigured
+        );
+        assert_eq!(
             plan.interception.capability,
             EnforcementCapabilityPlan::Required {
                 capability: CapabilityKind::TransparentInterception,
@@ -624,6 +688,55 @@ mod tests {
         assert_eq!(
             plan.interception.classification.flow_classifier,
             CapabilityState::unavailable(CapabilityKind::TransparentFlowClassifier, "not built")
+        );
+    }
+
+    #[test]
+    fn enforcement_plan_reports_outbound_redirect_preview() {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let capabilities = CapabilityMatrix::new(test_platform_capabilities_with_interception(
+            RuntimeMode::Unavailable,
+        ));
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        assert_eq!(
+            plan.interception.strategy,
+            TransparentInterceptionStrategyConfig::OutboundMitm
+        );
+        assert!(matches!(
+            plan.interception.local_setup_projection,
+            TransparentInterceptionLocalSetupProjectionPlan::HostRules { .. }
+        ));
+        assert_eq!(
+            plan.interception.capability,
+            EnforcementCapabilityPlan::NotRequired
+        );
+        assert_eq!(
+            plan.interception.outbound_redirect,
+            TransparentInterceptionOutboundRedirectPlan::Planned {
+                table_name: "sssa_probe".to_string(),
+                chain_name: "outbound_mitm".to_string(),
+                hook: "output".to_string(),
+                priority: "dstnat".to_string(),
+                proxy_port: 15001,
+                proxy_bypass_mark: 0x5353_4101,
+                install: TransparentInterceptionOutboundRedirectInstallPlan::Blocked {
+                    reason: OUTBOUND_MITM_INSTALL_BLOCKED_REASON.to_string(),
+                },
+            }
         );
     }
 

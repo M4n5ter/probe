@@ -19,8 +19,9 @@ pub use enforcement::{
     EnforcementPolicySourcePlan, TransparentInterceptionClassificationPlan,
     TransparentInterceptionExecutionPlan, TransparentInterceptionInboundTproxyPlan,
     TransparentInterceptionNftablesPlan, TransparentInterceptionOutboundMitmPlan,
-    TransparentInterceptionProxyHealthProbePlan, TransparentInterceptionProxyPlan,
-    TransparentInterceptionProxyPlanError,
+    TransparentInterceptionOutboundRedirectInstallPlan,
+    TransparentInterceptionOutboundRedirectPlan, TransparentInterceptionProxyHealthProbePlan,
+    TransparentInterceptionProxyPlan, TransparentInterceptionProxyPlanError,
 };
 pub use error::RuntimeError;
 pub use export::{

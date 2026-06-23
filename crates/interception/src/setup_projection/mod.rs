@@ -7,8 +7,8 @@ pub use model::{
     TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
     TransparentInterceptionHostRuleScope, TransparentInterceptionPortScope,
     TransparentInterceptionProcessScope, TransparentInterceptionProcessScopeExpression,
-    TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupPlan,
-    TransparentInterceptionSetupProjectionError,
+    TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupDirection,
+    TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError,
 };
 pub use selectors::{
     TransparentInterceptionSetupSelectorSources, TransparentInterceptionSetupSelectors,

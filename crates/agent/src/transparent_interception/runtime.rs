@@ -1,5 +1,5 @@
 use interception::TransparentInterceptionHostRuleScope;
-use probe_core::{CapabilityKind, CapabilityState};
+use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
 
 use super::{
     TransparentInterceptionError,
@@ -73,7 +73,7 @@ impl TransparentInterceptionRuntime {
         Self {
             capability: CapabilityState {
                 kind: CapabilityKind::TransparentInterception,
-                mode: probe_core::RuntimeMode::Available,
+                mode: RuntimeMode::Available,
                 reason: Some(note.into()),
             },
             activation: Some(Box::new(activation)),

@@ -4,9 +4,9 @@ use interception::{
     TransparentInterceptionClassifierSelector, TransparentInterceptionClassifierTerm,
     TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
     TransparentInterceptionHostRuleScope, TransparentInterceptionProcessScope,
-    TransparentInterceptionProcessScopeExpression, TransparentInterceptionSetupPlan,
-    TransparentInterceptionSetupProjectionError, TransparentInterceptionSetupSelectorSources,
-    TransparentInterceptionSetupSelectors,
+    TransparentInterceptionProcessScopeExpression, TransparentInterceptionSetupDirection,
+    TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError,
+    TransparentInterceptionSetupSelectorSources, TransparentInterceptionSetupSelectors,
 };
 use probe_config::TransparentInterceptionStrategyConfig;
 use probe_core::{ProcessSelector, Selector, TrafficSelector};
@@ -118,16 +118,16 @@ impl TransparentInterceptionLocalSetupProjectionPlan {
     ) -> Self {
         match strategy {
             TransparentInterceptionStrategyConfig::None => Self::NotConfigured,
-            TransparentInterceptionStrategyConfig::OutboundMitm => Self::Unsupported {
-                reason: "outbound transparent MITM requires proxy self-bypass and MITM lifecycle before local setup rules can be planned".to_string(),
-            },
             TransparentInterceptionStrategyConfig::InboundTproxy => {
-                Self::from_selectors(enforcement_selector, interception_selector)
+                Self::from_inbound_selectors(enforcement_selector, interception_selector)
+            }
+            TransparentInterceptionStrategyConfig::OutboundMitm => {
+                Self::from_outbound_selectors(enforcement_selector, interception_selector)
             }
         }
     }
 
-    fn from_selectors(
+    fn from_inbound_selectors(
         enforcement_selector: Option<&Selector>,
         interception_selector: Option<&Selector>,
     ) -> Self {
@@ -138,7 +138,25 @@ impl TransparentInterceptionLocalSetupProjectionPlan {
                 interception_selector,
             },
         );
-        Self::from_projection_result(selectors.local_setup_plan())
+        Self::from_projection_result(
+            selectors.local_setup_plan(TransparentInterceptionSetupDirection::Inbound),
+        )
+    }
+
+    fn from_outbound_selectors(
+        enforcement_selector: Option<&Selector>,
+        interception_selector: Option<&Selector>,
+    ) -> Self {
+        let selectors = TransparentInterceptionSetupSelectors::from_sources(
+            TransparentInterceptionSetupSelectorSources {
+                local_enforcement_selector: enforcement_selector,
+                effective_enforcement_selector: enforcement_selector,
+                interception_selector,
+            },
+        );
+        Self::from_projection_result(
+            selectors.local_setup_plan(TransparentInterceptionSetupDirection::Outbound),
+        )
     }
 
     fn from_projection_result(
@@ -315,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_mitm_is_not_reported_as_host_rules() {
+    fn outbound_mitm_projectable_selector_reports_host_rules() {
         let scope = scope_for(
             TransparentInterceptionStrategyConfig::OutboundMitm,
             Selector::term(
@@ -328,10 +346,13 @@ mod tests {
             ),
         );
 
-        assert!(matches!(
-            scope,
-            TransparentInterceptionLocalSetupProjectionPlan::Unsupported { .. }
-        ));
+        let TransparentInterceptionLocalSetupProjectionPlan::HostRules { scope } = scope else {
+            panic!("projectable outbound selector should report host rules");
+        };
+        assert_eq!(
+            scope.remote_ports,
+            TransparentInterceptionProjectedPortScopePlan::Only { ports: vec![443] }
+        );
     }
 
     #[test]

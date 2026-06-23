@@ -7,8 +7,8 @@ use super::{
     TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
     TransparentInterceptionHostRuleScope, TransparentInterceptionPortScope,
     TransparentInterceptionProcessScope, TransparentInterceptionProcessScopeExpression,
-    TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupPlan,
-    TransparentInterceptionSetupProjectionError,
+    TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupDirection,
+    TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError,
 };
 
 const PROCESS_CLASSIFIER_REASON: &str = "selector contains process constraints that require a process classifier such as cgroup/owner marking or proxy-side process classification before host rules can be safely narrowed";
@@ -20,11 +20,24 @@ impl TransparentInterceptionSetupPlan {
     pub fn from_inbound_tproxy_selector(
         selector: Option<&Selector>,
     ) -> Result<Self, TransparentInterceptionSetupProjectionError> {
+        Self::from_selector(selector, TransparentInterceptionSetupDirection::Inbound)
+    }
+
+    pub fn from_outbound_mitm_selector(
+        selector: Option<&Selector>,
+    ) -> Result<Self, TransparentInterceptionSetupProjectionError> {
+        Self::from_selector(selector, TransparentInterceptionSetupDirection::Outbound)
+    }
+
+    fn from_selector(
+        selector: Option<&Selector>,
+        direction: TransparentInterceptionSetupDirection,
+    ) -> Result<Self, TransparentInterceptionSetupProjectionError> {
         let Some(selector) = selector else {
             return Err(TransparentInterceptionSetupProjectionError::MissingSelector);
         };
-        let analysis = analyze_selector(selector)?;
-        let host_rule_boundary = host_rule_boundary_from_term(analysis.host_term)?;
+        let analysis = analyze_selector(selector, direction)?;
+        let host_rule_boundary = host_rule_boundary_from_term(analysis.host_term, direction)?;
 
         match analysis.classifier {
             Some(SetupClassifierRequirement::Flow { reason }) => Ok(Self::RequiresFlowClassifier {
@@ -77,19 +90,23 @@ impl ProjectableLocalSetupTerm {
         })
     }
 
-    fn from_scope(scope: TransparentInterceptionHostRuleScope) -> Self {
+    fn from_scope(
+        scope: TransparentInterceptionHostRuleScope,
+        direction: TransparentInterceptionSetupDirection,
+    ) -> Self {
         Self {
-            traffic: scope.to_inbound_traffic_selector(),
+            traffic: scope.to_traffic_selector(direction),
         }
     }
 }
 
 fn analyze_selector(
     selector: &Selector,
+    direction: TransparentInterceptionSetupDirection,
 ) -> Result<SelectorSetupAnalysis, TransparentInterceptionSetupProjectionError> {
     match selector {
         Selector::Match { term } => {
-            validate_traffic_selector(&term.traffic)?;
+            validate_traffic_selector(&term.traffic, direction)?;
             Ok(SelectorSetupAnalysis {
                 host_term: Some(ProjectableLocalSetupTerm {
                     traffic: term.traffic.clone(),
@@ -97,8 +114,8 @@ fn analyze_selector(
                 classifier: process_classifier_requirement(&term.process),
             })
         }
-        Selector::All { selectors } => analyze_all_selector(selectors),
-        Selector::Any { selectors } => analyze_any_selector(selectors),
+        Selector::All { selectors } => analyze_all_selector(selectors, direction),
+        Selector::Any { selectors } => analyze_any_selector(selectors, direction),
         Selector::Not { .. } => Ok(flow_classifier_analysis(
             NOT_FLOW_CLASSIFIER_REASON.to_string(),
         )),
@@ -110,6 +127,7 @@ fn analyze_selector(
 
 fn analyze_any_selector(
     selectors: &[Selector],
+    direction: TransparentInterceptionSetupDirection,
 ) -> Result<SelectorSetupAnalysis, TransparentInterceptionSetupProjectionError> {
     if selectors.is_empty() {
         return Err(TransparentInterceptionSetupProjectionError::Unsupported {
@@ -119,9 +137,9 @@ fn analyze_any_selector(
 
     let analyses = selectors
         .iter()
-        .map(analyze_selector)
+        .map(|selector| analyze_selector(selector, direction))
         .collect::<Result<Vec<_>, _>>()?;
-    match project_any_selector_host_term(&analyses)? {
+    match project_any_selector_host_term(&analyses, direction)? {
         Some(host_term) => Ok(SelectorSetupAnalysis {
             host_term: Some(host_term),
             classifier: None,
@@ -134,6 +152,7 @@ fn analyze_any_selector(
 
 fn analyze_all_selector(
     selectors: &[Selector],
+    direction: TransparentInterceptionSetupDirection,
 ) -> Result<SelectorSetupAnalysis, TransparentInterceptionSetupProjectionError> {
     if selectors.is_empty() {
         return Err(TransparentInterceptionSetupProjectionError::Unsupported {
@@ -146,7 +165,7 @@ fn analyze_all_selector(
     let mut flow_reason = None;
 
     for selector in selectors {
-        let analysis = analyze_selector(selector)?;
+        let analysis = analyze_selector(selector, direction)?;
         host_term = intersect_projectable_terms(host_term, analysis.host_term)?;
         match analysis.classifier {
             Some(SetupClassifierRequirement::Flow { reason }) => {
@@ -172,6 +191,7 @@ fn analyze_all_selector(
 
 fn project_any_selector_host_term(
     analyses: &[SelectorSetupAnalysis],
+    direction: TransparentInterceptionSetupDirection,
 ) -> Result<Option<ProjectableLocalSetupTerm>, TransparentInterceptionSetupProjectionError> {
     if analyses
         .iter()
@@ -187,6 +207,7 @@ fn project_any_selector_host_term(
                 .host_term
                 .clone()
                 .expect("host term presence checked above"),
+            direction,
         )?
         else {
             return Ok(None);
@@ -195,15 +216,16 @@ fn project_any_selector_host_term(
     }
     Ok(
         TransparentInterceptionHostRuleScope::union_without_expansion(&scopes)
-            .map(ProjectableLocalSetupTerm::from_scope),
+            .map(|scope| ProjectableLocalSetupTerm::from_scope(scope, direction)),
     )
 }
 
 fn optional_host_rule_scope_for_any_branch(
     term: ProjectableLocalSetupTerm,
+    direction: TransparentInterceptionSetupDirection,
 ) -> Result<Option<TransparentInterceptionHostRuleScope>, TransparentInterceptionSetupProjectionError>
 {
-    match host_rule_scope_from_term(term) {
+    match host_rule_scope_from_term(term, direction) {
         Ok(scope) => Ok(Some(scope)),
         Err(TransparentInterceptionSetupProjectionError::UnconstrainedSelector) => Ok(None),
         Err(error) => Err(error),
@@ -241,11 +263,12 @@ fn process_classifier_requirement_from_expressions(
 
 fn host_rule_boundary_from_term(
     term: Option<ProjectableLocalSetupTerm>,
+    direction: TransparentInterceptionSetupDirection,
 ) -> Result<TransparentInterceptionHostRuleBoundary, TransparentInterceptionSetupProjectionError> {
     let Some(term) = term else {
         return Ok(TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary);
     };
-    match host_rule_scope_from_term(term) {
+    match host_rule_scope_from_term(term, direction) {
         Ok(scope) => Ok(TransparentInterceptionHostRuleBoundary::Scope(scope)),
         Err(TransparentInterceptionSetupProjectionError::UnconstrainedSelector) => {
             Ok(TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary)
@@ -256,8 +279,9 @@ fn host_rule_boundary_from_term(
 
 fn host_rule_scope_from_term(
     term: ProjectableLocalSetupTerm,
+    direction: TransparentInterceptionSetupDirection,
 ) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionSetupProjectionError> {
-    validate_direction_projection(&term.traffic)?;
+    validate_direction_projection(&term.traffic, direction)?;
     TransparentInterceptionHostRuleScope::new(
         TransparentInterceptionPortScope::from_values(term.traffic.local_ports),
         TransparentInterceptionPortScope::from_values(term.traffic.remote_ports),
@@ -267,8 +291,9 @@ fn host_rule_scope_from_term(
 
 fn validate_traffic_selector(
     traffic: &TrafficSelector,
+    direction: TransparentInterceptionSetupDirection,
 ) -> Result<(), TransparentInterceptionSetupProjectionError> {
-    validate_direction_projection(traffic)?;
+    validate_direction_projection(traffic, direction)?;
     parse_ip_addresses(&traffic.remote_addresses).map(|_| ())
 }
 
@@ -331,18 +356,29 @@ where
 
 fn validate_direction_projection(
     traffic: &TrafficSelector,
+    direction: TransparentInterceptionSetupDirection,
 ) -> Result<(), TransparentInterceptionSetupProjectionError> {
+    let expected = Direction::from(direction);
     if traffic.directions.is_empty()
         || traffic
             .directions
             .iter()
-            .all(|direction| *direction == Direction::Inbound)
+            .all(|selected| *selected == expected)
     {
         Ok(())
     } else {
         Err(TransparentInterceptionSetupProjectionError::Unsupported {
-            reason: "inbound TPROXY can only project Inbound traffic selectors".to_string(),
+            reason: direction.wrong_direction_reason().to_string(),
         })
+    }
+}
+
+impl TransparentInterceptionSetupDirection {
+    fn wrong_direction_reason(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound TPROXY can only project Inbound traffic selectors",
+            Self::Outbound => "outbound MITM can only project Outbound traffic selectors",
+        }
     }
 }
 
@@ -435,6 +471,20 @@ mod tests {
             .expect("selector should project");
 
         assert_eq!(scope.local_ports().values(), &[8443]);
+        assert_eq!(
+            scope.remote_addresses().ipv4(),
+            &[Ipv4Addr::new(203, 0, 113, 10)]
+        );
+        assert!(scope.remote_addresses().ipv6().is_empty());
+    }
+
+    #[test]
+    fn projects_outbound_host_rule_scope() {
+        let scope =
+            outbound_scope_for(term(outbound_remote_port_addresses(443, &["203.0.113.10"])))
+                .expect("selector should project");
+
+        assert_eq!(scope.remote_ports().values(), &[443]);
         assert_eq!(
             scope.remote_addresses().ipv4(),
             &[Ipv4Addr::new(203, 0, 113, 10)]
@@ -695,6 +745,14 @@ mod tests {
             error,
             TransparentInterceptionSetupProjectionError::Unsupported { .. }
         ));
+
+        let error = outbound_scope_for(term(inbound_local_port(8443)))
+            .expect_err("wrong direction should not project to outbound");
+
+        assert!(matches!(
+            error,
+            TransparentInterceptionSetupProjectionError::Unsupported { .. }
+        ));
     }
 
     #[test]
@@ -772,7 +830,21 @@ mod tests {
         selector: Selector,
     ) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionSetupProjectionError>
     {
-        match plan_for(selector)? {
+        scope_from_plan(plan_for(selector)?)
+    }
+
+    fn outbound_scope_for(
+        selector: Selector,
+    ) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionSetupProjectionError>
+    {
+        scope_from_plan(outbound_plan_for(selector)?)
+    }
+
+    fn scope_from_plan(
+        plan: TransparentInterceptionSetupPlan,
+    ) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionSetupProjectionError>
+    {
+        match plan {
             TransparentInterceptionSetupPlan::HostRules(scope) => Ok(scope),
             TransparentInterceptionSetupPlan::RequiresProcessClassifier { reason, .. }
             | TransparentInterceptionSetupPlan::RequiresFlowClassifier { reason, .. } => {
@@ -785,6 +857,12 @@ mod tests {
         selector: Selector,
     ) -> Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError> {
         TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(&selector))
+    }
+
+    fn outbound_plan_for(
+        selector: Selector,
+    ) -> Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError> {
+        TransparentInterceptionSetupPlan::from_outbound_mitm_selector(Some(&selector))
     }
 
     fn term(traffic: TrafficSelector) -> Selector {
@@ -838,6 +916,13 @@ mod tests {
             remote_ports: vec![port],
             remote_addresses: strings(addresses),
             ..TrafficSelector::default()
+        }
+    }
+
+    fn outbound_remote_port_addresses(port: u16, addresses: &[&str]) -> TrafficSelector {
+        TrafficSelector {
+            directions: vec![Direction::Outbound],
+            ..remote_port_addresses(port, addresses)
         }
     }
 

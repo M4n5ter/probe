@@ -1,29 +1,20 @@
 use std::path::PathBuf;
 
 use crate::{
-    configured_enforcement::{
-        ConfiguredEnforcementError, LoadedEnforcementPolicySource,
-        LoadedEnforcementPolicySourceOriginRef, build_configured_enforcement_check_with_backend,
-    },
+    configured_enforcement::ConfiguredEnforcementError,
     configured_policy::{
         ConfiguredPolicyError, LoadedConfiguredPolicy, configured_policy_selection,
         load_configured_policies,
     },
 };
-use enforcement::EnforcementBackend;
+use ::enforcement::EnforcementBackend;
 use policy::PolicyHook;
-use probe_config::{
-    AgentConfig, ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig,
-};
-use probe_core::EnforcementMode;
-use runtime::{
-    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionClassificationPlan,
-    TransparentInterceptionLocalSetupProjectionPlan, TransparentInterceptionNftablesPlan,
-    TransparentInterceptionProxyPlan,
-};
+use probe_config::AgentConfig;
+use runtime::RuntimePlan;
 use serde::Serialize;
 use thiserror::Error;
 
+use super::enforcement::{EnforcementCheckSnapshot, check_enforcement};
 use super::tls::{TlsCheckError, TlsCheckSnapshot, check_tls};
 
 #[derive(Debug, Error)]
@@ -70,71 +61,6 @@ pub struct LoadedPolicySnapshot {
     pub registered_hooks: Vec<PolicyHook>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EnforcementCheckSnapshot {
-    pub mode: EnforcementMode,
-    pub composition: EnforcementCompositionCheckSnapshot,
-    pub connection: EnforcementConnectionCheckSnapshot,
-    pub interception: EnforcementInterceptionCheckSnapshot,
-    pub effective_selector_configured: bool,
-    pub config_selector_configured: bool,
-    pub manifest_selector_configured: Option<bool>,
-    pub policy: EnforcementPolicyCheckSnapshot,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum EnforcementCompositionCheckSnapshot {
-    Ready,
-    Blocked { reason: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EnforcementConnectionCheckSnapshot {
-    pub backend: ConnectionEnforcementBackendConfig,
-    pub capability: EnforcementCapabilityPlan,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EnforcementInterceptionCheckSnapshot {
-    pub strategy: TransparentInterceptionStrategyConfig,
-    pub proxy: TransparentInterceptionProxyPlan,
-    pub nftables: TransparentInterceptionNftablesPlan,
-    pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
-    pub classification: TransparentInterceptionClassificationPlan,
-    pub selector_configured: bool,
-    pub capability: EnforcementCapabilityPlan,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EnforcementPolicyCheckSnapshot {
-    pub mode: EnforcementPolicyCheckMode,
-    pub active: Option<LoadedEnforcementPolicySnapshot>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EnforcementPolicyCheckMode {
-    NotConfigured,
-    Loaded,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct LoadedEnforcementPolicySnapshot {
-    pub id: String,
-    pub version: String,
-    pub source: LoadedEnforcementPolicySourceSnapshot,
-    pub selector_configured: bool,
-    pub protective_actions: probe_core::ProtectiveActionProfile,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum LoadedEnforcementPolicySourceSnapshot {
-    Local { path: PathBuf },
-    Remote { endpoint: String },
-}
-
 pub async fn build_check_report(
     plan: RuntimePlan,
     backend: Option<Box<dyn EnforcementBackend>>,
@@ -171,77 +97,6 @@ fn check_policy(config: &AgentConfig) -> Result<PolicyCheckSnapshot, CheckError>
     })
 }
 
-async fn check_enforcement(
-    plan: &RuntimePlan,
-    backend: Option<Box<dyn EnforcementBackend>>,
-) -> Result<EnforcementCheckSnapshot, CheckError> {
-    let check = build_configured_enforcement_check_with_backend(plan, backend).await?;
-    let composition =
-        check
-            .setup_error
-            .map_or(EnforcementCompositionCheckSnapshot::Ready, |error| {
-                EnforcementCompositionCheckSnapshot::Blocked {
-                    reason: error.to_string(),
-                }
-            });
-    let enforcement = check.configured;
-    let active_policy = &enforcement.active_policy;
-    let policy = active_policy.policy_source().map_or(
-        EnforcementPolicyCheckSnapshot {
-            mode: EnforcementPolicyCheckMode::NotConfigured,
-            active: None,
-        },
-        |source| EnforcementPolicyCheckSnapshot {
-            mode: EnforcementPolicyCheckMode::Loaded,
-            active: Some(LoadedEnforcementPolicySnapshot {
-                id: source.manifest.id.clone(),
-                version: source.manifest.version.clone(),
-                source: loaded_enforcement_policy_source_snapshot(source),
-                selector_configured: source.manifest.selector.is_some(),
-                protective_actions: source.manifest.protective_actions.clone(),
-            }),
-        },
-    );
-    Ok(EnforcementCheckSnapshot {
-        mode: enforcement.mode,
-        composition,
-        connection: EnforcementConnectionCheckSnapshot {
-            backend: plan.enforcement.connection.backend,
-            capability: plan.enforcement.connection.capability.clone(),
-        },
-        interception: EnforcementInterceptionCheckSnapshot {
-            strategy: plan.enforcement.interception.strategy,
-            proxy: plan.enforcement.interception.proxy.clone(),
-            nftables: plan.enforcement.interception.nftables.clone(),
-            local_setup_projection: plan.enforcement.interception.local_setup_projection.clone(),
-            classification: plan.enforcement.interception.classification.clone(),
-            selector_configured: plan.enforcement.interception.selector_configured,
-            capability: plan.enforcement.interception.capability.clone(),
-        },
-        effective_selector_configured: active_policy.effective_selector_configured(),
-        config_selector_configured: enforcement.config_selector_configured,
-        manifest_selector_configured: active_policy.manifest_selector_configured(),
-        policy,
-    })
-}
-
-fn loaded_enforcement_policy_source_snapshot(
-    source: &LoadedEnforcementPolicySource,
-) -> LoadedEnforcementPolicySourceSnapshot {
-    match source.origin() {
-        LoadedEnforcementPolicySourceOriginRef::LocalPath(path) => {
-            LoadedEnforcementPolicySourceSnapshot::Local {
-                path: path.to_path_buf(),
-            }
-        }
-        LoadedEnforcementPolicySourceOriginRef::RemoteEndpoint(endpoint) => {
-            LoadedEnforcementPolicySourceSnapshot::Remote {
-                endpoint: endpoint.to_string(),
-            }
-        }
-    }
-}
-
 fn loaded_policy_snapshot(policy: &LoadedConfiguredPolicy) -> LoadedPolicySnapshot {
     let manifest = policy.runtime.manifest();
     LoadedPolicySnapshot {
@@ -261,10 +116,11 @@ mod tests {
     };
 
     use probe_config::{
-        AgentConfig, CaptureBackend, CaptureSelection, TransparentInterceptionStrategyConfig,
+        AgentConfig, CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig,
+        TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
-        Action, CapabilityKind, CapabilityState, Direction, ProcessSelector,
+        Action, CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector,
         ProtectiveActionProfile, Selector, TrafficSelector,
     };
     use runtime::{
@@ -272,6 +128,11 @@ mod tests {
     };
     use serde_json::json;
 
+    use crate::runtime_composition::{RuntimeComposition, build_runtime_composition_for_test};
+
+    use super::super::enforcement::{
+        EnforcementPolicyCheckMode, LoadedEnforcementPolicySourceSnapshot,
+    };
     use super::*;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -605,6 +466,10 @@ protective_actions = ["alert"]
             json!("sssa_probe")
         );
         assert_eq!(
+            value["enforcement"]["interception"]["outbound_redirect"]["kind"],
+            json!("not_configured")
+        );
+        assert_eq!(
             value["enforcement"]["interception"]["local_setup_projection"]["kind"],
             json!("not_configured")
         );
@@ -737,6 +602,113 @@ protective_actions = ["alert"]
     }
 
     #[tokio::test]
+    async fn check_report_exposes_outbound_redirect_preview()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let (plan, backend) = build_test_runtime_composition(config)?.into_enforcement_parts();
+
+        let report = build_check_report(plan, backend).await?;
+        let value = serde_json::to_value(report)?;
+
+        assert_eq!(
+            value["enforcement"]["composition"]["kind"],
+            json!("blocked")
+        );
+        assert!(
+            value["enforcement"]["composition"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("original-destination recovery"))
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["local_setup_projection"]["kind"],
+            json!("host_rules")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["outbound_redirect"]["kind"],
+            json!("planned")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["outbound_redirect"]["chain_name"],
+            json!("outbound_mitm")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["outbound_redirect"]["hook"],
+            json!("output")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["outbound_redirect"]["proxy_port"],
+            json!(15001)
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["outbound_redirect"]["install"]["kind"],
+            json!("blocked")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_exposes_outbound_process_scope_preview()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector {
+                names: vec!["curl".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let (plan, backend) = build_test_runtime_composition(config)?.into_enforcement_parts();
+
+        let report = build_check_report(plan, backend).await?;
+        let value = serde_json::to_value(report)?;
+
+        assert_eq!(
+            value["enforcement"]["composition"]["kind"],
+            json!("blocked")
+        );
+        assert!(
+            value["enforcement"]["composition"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("original-destination recovery"))
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["local_setup_projection"]["kind"],
+            json!("requires_process_classifier")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["outbound_redirect"]["kind"],
+            json!("planned")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["outbound_redirect"]["install"]["kind"],
+            json!("blocked")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn check_report_rejects_invalid_policy_source() -> Result<(), Box<dyn std::error::Error>>
     {
         let temp = test_dir("check-invalid-policy")?;
@@ -782,6 +754,39 @@ protective_actions = ["alert"]
 
     fn runtime_plan(config: AgentConfig) -> Result<RuntimePlan, runtime::RuntimeError> {
         RuntimePlan::build(config, &runtime_registry(Vec::new()))
+    }
+
+    fn build_test_runtime_composition(
+        config: AgentConfig,
+    ) -> Result<RuntimeComposition, crate::error::AgentError> {
+        build_runtime_composition_for_test(
+            config,
+            vec![CaptureProviderDescriptor::available(
+                CaptureBackend::Libpcap,
+                CaptureProviderBuilder::Libpcap,
+            )],
+            PlatformProbeResults {
+                procfs_socket: Vec::new(),
+                connection_enforcement: CapabilityState::unavailable(
+                    CapabilityKind::ConnectionEnforcement,
+                    "not configured",
+                ),
+                transparent_interception: CapabilityState::unavailable(
+                    CapabilityKind::TransparentInterception,
+                    "not configured",
+                ),
+                transparent_process_classifier: CapabilityState::degraded(
+                    CapabilityKind::TransparentProcessClassifier,
+                    "setup-time listener proof only",
+                ),
+                transparent_flow_classifier:
+                    PlatformProbeResults::default_transparent_flow_classifier(),
+                libssl_uprobe: CapabilityState::unavailable(
+                    CapabilityKind::LibsslUprobe,
+                    "not configured",
+                ),
+            },
+        )
     }
 
     fn runtime_plan_with_connection_enforcement(

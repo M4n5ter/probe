@@ -48,12 +48,44 @@ pub(crate) fn build_runtime_composition(
     let (connection_enforcement, transparent_interception) = execution_runtimes_for_config(&config);
     let registry =
         provider_registry_for_runtimes(&config, &connection_enforcement, &transparent_interception);
+    build_runtime_composition_from_registry(
+        config,
+        connection_enforcement,
+        transparent_interception,
+        registry,
+    )
+}
+
+fn build_runtime_composition_from_registry(
+    config: AgentConfig,
+    connection_enforcement: ConnectionEnforcementRuntime,
+    transparent_interception: TransparentInterceptionRuntime,
+    registry: ProviderRegistry,
+) -> Result<RuntimeComposition, AgentError> {
     let plan = RuntimePlan::build(config, &registry).map_err(AgentError::Runtime)?;
     Ok(RuntimeComposition {
         plan,
         connection_enforcement,
         transparent_interception,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn build_runtime_composition_for_test(
+    config: AgentConfig,
+    capture_providers: Vec<runtime::CaptureProviderDescriptor>,
+    mut platform: runtime::PlatformProbeResults,
+) -> Result<RuntimeComposition, AgentError> {
+    let (connection_enforcement, transparent_interception) = execution_runtimes_for_config(&config);
+    platform.connection_enforcement = connection_enforcement.capability();
+    platform.transparent_interception = transparent_interception.capability();
+    let registry = ProviderRegistry::with_platform_probes(capture_providers, platform);
+    build_runtime_composition_from_registry(
+        config,
+        connection_enforcement,
+        transparent_interception,
+        registry,
+    )
 }
 
 pub(crate) fn capability_matrix_for_config(config: &AgentConfig) -> CapabilityMatrix {
@@ -93,8 +125,12 @@ fn provider_registry_for_runtimes(
 mod tests {
     use probe_config::{CaptureSelection, TransparentInterceptionStrategyConfig};
     use probe_core::{
-        CapabilityKind, Direction, EnforcementMode, ProcessSelector, RuntimeMode, Selector,
-        TrafficSelector,
+        CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector, RuntimeMode,
+        Selector, TrafficSelector,
+    };
+    use runtime::{
+        CaptureProviderBuilder, CaptureProviderDescriptor, PlatformProbeResults,
+        TransparentInterceptionOutboundRedirectPlan,
     };
 
     use super::*;
@@ -109,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_mitm_runtime_fails_closed_until_proxy_lifecycle_exists() {
+    fn outbound_mitm_composition_exposes_preview_without_executable_capability() {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -124,12 +160,39 @@ mod tests {
                 ..TrafficSelector::default()
             },
         ));
-        let error = match build_runtime_composition(config) {
-            Ok(_) => panic!("outbound MITM must not be executable without proxy lifecycle"),
-            Err(error) => error,
-        };
+        let composition = build_runtime_composition_for_test(
+            config,
+            vec![CaptureProviderDescriptor::available(
+                probe_config::CaptureBackend::Libpcap,
+                CaptureProviderBuilder::Libpcap,
+            )],
+            test_platform_probes(),
+        )
+        .expect("outbound MITM preview should build through runtime composition");
+        let plan = composition.into_plan();
+        let transparent_interception = plan
+            .capabilities
+            .state(CapabilityKind::TransparentInterception);
 
-        assert!(error.to_string().contains("proxy self-bypass"));
+        assert_eq!(transparent_interception.mode, RuntimeMode::Unavailable);
+        assert!(
+            transparent_interception
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("proxy self-bypass"))
+        );
+        assert_eq!(
+            plan.enforcement.interception.capability,
+            runtime::EnforcementCapabilityPlan::NotRequired
+        );
+        let TransparentInterceptionOutboundRedirectPlan::Planned { install, .. } =
+            plan.enforcement.interception.outbound_redirect
+        else {
+            panic!("outbound MITM should expose a redirect preview");
+        };
+        let runtime::TransparentInterceptionOutboundRedirectInstallPlan::Blocked { reason } =
+            install;
+        assert!(reason.contains("original-destination recovery"));
     }
 
     #[test]
@@ -162,5 +225,27 @@ mod tests {
         };
 
         assert!(error.to_string().contains("health_probe.target"));
+    }
+
+    fn test_platform_probes() -> PlatformProbeResults {
+        PlatformProbeResults {
+            procfs_socket: Vec::new(),
+            connection_enforcement: CapabilityState::unavailable(
+                CapabilityKind::ConnectionEnforcement,
+                "not configured",
+            ),
+            transparent_interception: CapabilityState::unavailable(
+                CapabilityKind::TransparentInterception,
+                "not configured",
+            ),
+            transparent_process_classifier:
+                PlatformProbeResults::default_transparent_process_classifier(),
+            transparent_flow_classifier: PlatformProbeResults::default_transparent_flow_classifier(
+            ),
+            libssl_uprobe: CapabilityState::unavailable(
+                CapabilityKind::LibsslUprobe,
+                "not configured",
+            ),
+        }
     }
 }

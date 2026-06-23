@@ -5,7 +5,7 @@ pub use setup_projection::{
     TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
     TransparentInterceptionHostRuleScope, TransparentInterceptionPortScope,
     TransparentInterceptionProcessScope, TransparentInterceptionProcessScopeExpression,
-    TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupPlan,
-    TransparentInterceptionSetupProjectionError, TransparentInterceptionSetupSelectorSources,
-    TransparentInterceptionSetupSelectors,
+    TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupDirection,
+    TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError,
+    TransparentInterceptionSetupSelectorSources, TransparentInterceptionSetupSelectors,
 };

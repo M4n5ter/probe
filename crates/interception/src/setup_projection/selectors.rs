@@ -1,6 +1,9 @@
 use probe_core::Selector;
 
-use super::{TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError};
+use super::{
+    TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan,
+    TransparentInterceptionSetupProjectionError,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct TransparentInterceptionSetupSelectorSources<'a> {
@@ -39,14 +42,30 @@ impl TransparentInterceptionSetupSelectors {
 
     pub fn local_setup_plan(
         &self,
+        direction: TransparentInterceptionSetupDirection,
     ) -> Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError> {
-        TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(self.local_config_scope())
+        setup_plan(self.local_config_scope(), direction)
     }
 
     pub fn final_setup_plan(
         &self,
+        direction: TransparentInterceptionSetupDirection,
     ) -> Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError> {
-        TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(self.final_effective_scope())
+        setup_plan(self.final_effective_scope(), direction)
+    }
+}
+
+fn setup_plan(
+    selector: Option<&Selector>,
+    direction: TransparentInterceptionSetupDirection,
+) -> Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError> {
+    match direction {
+        TransparentInterceptionSetupDirection::Inbound => {
+            TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(selector)
+        }
+        TransparentInterceptionSetupDirection::Outbound => {
+            TransparentInterceptionSetupPlan::from_outbound_mitm_selector(selector)
+        }
     }
 }
 

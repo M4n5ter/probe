@@ -7,8 +7,9 @@ mod runtime;
 
 use ::runtime::{TransparentInterceptionClassificationPlan, TransparentInterceptionExecutionPlan};
 use interception::{
-    TransparentInterceptionHostRuleScope, TransparentInterceptionSetupPlan,
-    TransparentInterceptionSetupProjectionError, TransparentInterceptionSetupSelectors,
+    TransparentInterceptionHostRuleScope, TransparentInterceptionSetupDirection,
+    TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError,
+    TransparentInterceptionSetupSelectors,
 };
 use probe_config::TransparentInterceptionStrategyConfig;
 use probe_core::{CapabilityState, RuntimeMode};
@@ -23,7 +24,7 @@ pub(crate) use proxy::{
 };
 pub(crate) use runtime::{TransparentInterceptionGuard, TransparentInterceptionRuntime};
 
-const OUTBOUND_MITM_UNAVAILABLE: &str = "outbound transparent MITM requires proxy self-bypass and MITM lifecycle before rules can be installed";
+const OUTBOUND_MITM_UNAVAILABLE: &str = "outbound transparent MITM has a typed redirect plan, but requires proxy self-bypass, original-destination recovery, and MITM lifecycle before rules can be installed";
 const MISSING_LOCAL_SETUP_SELECTOR: &str =
     "transparent interception requires an explicit local selector for setup-time rules";
 
@@ -72,9 +73,11 @@ pub(crate) fn effective_setup_scope(
             MISSING_LOCAL_SETUP_SELECTOR.to_string(),
         ));
     }
-    validate_local_setup_plan(selectors.local_setup_plan())?;
+    validate_local_setup_plan(
+        selectors.local_setup_plan(TransparentInterceptionSetupDirection::Inbound),
+    )?;
     let scope = executable_host_rule_scope(
-        selectors.final_setup_plan(),
+        selectors.final_setup_plan(TransparentInterceptionSetupDirection::Inbound),
         classification,
         process_classifier,
     )?;

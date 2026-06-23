@@ -30,7 +30,7 @@ impl InboundTproxyLifecyclePlan {
         if setup_scope.local_ports().contains(proxy_port) {
             return Err(NftablesPlanError::ProxyPortInInterceptedLocalPorts { proxy_port });
         }
-        let projection = NftSelectorProjection::from_host_rule_scope(setup_scope);
+        let projection = NftSelectorProjection::inbound_tproxy(setup_scope);
         let host_resources = TransparentInterceptionNftablesPlan::reserved();
         Ok(Self {
             table_name: host_resources.table_name,

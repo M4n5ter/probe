@@ -72,6 +72,12 @@ pub enum TransparentInterceptionSetupPlan {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransparentInterceptionSetupDirection {
+    Inbound,
+    Outbound,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentInterceptionPortScope {
     kind: TransparentInterceptionPortScopeKind,
@@ -129,11 +135,14 @@ impl TransparentInterceptionHostRuleScope {
         &self.remote_addresses
     }
 
-    pub(crate) fn to_inbound_traffic_selector(&self) -> TrafficSelector {
+    pub(crate) fn to_traffic_selector(
+        &self,
+        direction: TransparentInterceptionSetupDirection,
+    ) -> TrafficSelector {
         TrafficSelector {
             local_ports: self.local_ports.traffic_selector_values(),
             remote_ports: self.remote_ports.traffic_selector_values(),
-            directions: vec![Direction::Inbound],
+            directions: vec![direction.into()],
             remote_addresses: self.remote_addresses.traffic_selector_values(),
         }
     }
@@ -150,6 +159,15 @@ impl TransparentInterceptionHostRuleScope {
             )
             .expect("union of constrained host-rule scopes should remain constrained"),
         )
+    }
+}
+
+impl From<TransparentInterceptionSetupDirection> for Direction {
+    fn from(direction: TransparentInterceptionSetupDirection) -> Self {
+        match direction {
+            TransparentInterceptionSetupDirection::Inbound => Self::Inbound,
+            TransparentInterceptionSetupDirection::Outbound => Self::Outbound,
+        }
     }
 }
 

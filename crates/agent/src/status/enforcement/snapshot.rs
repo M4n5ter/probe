@@ -10,7 +10,7 @@ use probe_core::{CapabilityKind, EnforcementMode, ProtectiveActionProfile, Runti
 use runtime::{
     EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionClassificationPlan,
     TransparentInterceptionLocalSetupProjectionPlan, TransparentInterceptionNftablesPlan,
-    TransparentInterceptionProxyPlan,
+    TransparentInterceptionOutboundRedirectPlan, TransparentInterceptionProxyPlan,
 };
 use serde::Serialize;
 
@@ -38,6 +38,7 @@ pub struct EnforcementInterceptionStatusSnapshot {
     pub strategy: TransparentInterceptionStrategyConfig,
     pub proxy: TransparentInterceptionProxyPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
+    pub outbound_redirect: TransparentInterceptionOutboundRedirectPlan,
     pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
     pub classification: TransparentInterceptionClassificationPlan,
     pub selector_configured: bool,
@@ -157,6 +158,7 @@ fn enforcement_status_with_source(
             strategy: plan.enforcement.interception.strategy,
             proxy: plan.enforcement.interception.proxy.clone(),
             nftables: plan.enforcement.interception.nftables.clone(),
+            outbound_redirect: plan.enforcement.interception.outbound_redirect.clone(),
             local_setup_projection: plan.enforcement.interception.local_setup_projection.clone(),
             classification: plan.enforcement.interception.classification.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,
@@ -357,6 +359,7 @@ mod tests {
         config_with_storage_path, runtime_plan_from_config, test_dir,
     };
     use super::*;
+    use crate::runtime_composition::{RuntimeComposition, build_runtime_composition_for_test};
 
     #[test]
     fn enforcement_status_reports_metadata_only_policy_source()
@@ -674,6 +677,10 @@ protective_actions = ["alert"]
         assert_eq!(status.interception.proxy.listen_port, Some(15001));
         assert_eq!(status.interception.nftables.table_name, "sssa_probe");
         assert_eq!(status.interception.nftables.route_table, 53_534);
+        assert_eq!(
+            status.interception.outbound_redirect,
+            runtime::TransparentInterceptionOutboundRedirectPlan::NotConfigured
+        );
         assert!(status.interception.selector_configured);
         assert!(matches!(
             status.interception.local_setup_projection,
@@ -731,6 +738,10 @@ protective_actions = ["alert"]
             json!("sssa_probe")
         );
         assert_eq!(
+            value["interception"]["outbound_redirect"]["kind"],
+            json!("not_configured")
+        );
+        assert_eq!(
             value["interception"]["local_setup_projection"]["kind"],
             json!("host_rules")
         );
@@ -765,6 +776,68 @@ protective_actions = ["alert"]
         assert_eq!(
             value["interception"]["capability"]["capability"],
             json!("transparent_interception")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_status_reports_outbound_redirect_preview() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        config.capture.selection = probe_config::CaptureSelection::Libpcap;
+        config.enforcement.mode = probe_core::EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            probe_config::TransparentInterceptionStrategyConfig::OutboundMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let plan = build_test_runtime_composition(config)?.into_plan();
+
+        let status = enforcement_status(&plan);
+        let value = serde_json::to_value(&status)?;
+
+        assert_eq!(
+            status.interception.strategy,
+            probe_config::TransparentInterceptionStrategyConfig::OutboundMitm
+        );
+        assert!(matches!(
+            status.interception.local_setup_projection,
+            runtime::TransparentInterceptionLocalSetupProjectionPlan::HostRules { .. }
+        ));
+        assert!(matches!(
+            status.interception.capability,
+            EnforcementCapabilityStatusSnapshot::NotRequired
+        ));
+        assert_eq!(
+            value["interception"]["outbound_redirect"]["kind"],
+            json!("planned")
+        );
+        assert_eq!(
+            value["interception"]["outbound_redirect"]["chain_name"],
+            json!("outbound_mitm")
+        );
+        assert_eq!(
+            value["interception"]["outbound_redirect"]["priority"],
+            json!("dstnat")
+        );
+        assert_eq!(
+            value["interception"]["outbound_redirect"]["proxy_bypass_mark"],
+            json!(0x5353_4101)
+        );
+        assert_eq!(
+            value["interception"]["outbound_redirect"]["install"]["kind"],
+            json!("blocked")
+        );
+        assert!(
+            value["interception"]["outbound_redirect"]["install"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("original-destination recovery"))
         );
         Ok(())
     }
@@ -831,5 +904,36 @@ protective_actions = ["alert"]
 
     fn enforcement_status(plan: &RuntimePlan) -> EnforcementStatusSnapshot {
         enforcement_status_with_transparent_proxy(plan, None)
+    }
+
+    fn build_test_runtime_composition(
+        config: probe_config::AgentConfig,
+    ) -> Result<RuntimeComposition, crate::error::AgentError> {
+        build_runtime_composition_for_test(
+            config,
+            vec![runtime::CaptureProviderDescriptor::available(
+                probe_config::CaptureBackend::Libpcap,
+                runtime::CaptureProviderBuilder::Libpcap,
+            )],
+            runtime::PlatformProbeResults {
+                procfs_socket: Vec::new(),
+                connection_enforcement: probe_core::CapabilityState::unavailable(
+                    CapabilityKind::ConnectionEnforcement,
+                    "not configured",
+                ),
+                transparent_interception: probe_core::CapabilityState::unavailable(
+                    CapabilityKind::TransparentInterception,
+                    "not configured",
+                ),
+                transparent_process_classifier:
+                    runtime::PlatformProbeResults::default_transparent_process_classifier(),
+                transparent_flow_classifier:
+                    runtime::PlatformProbeResults::default_transparent_flow_classifier(),
+                libssl_uprobe: probe_core::CapabilityState::unavailable(
+                    CapabilityKind::LibsslUprobe,
+                    "not configured",
+                ),
+            },
+        )
     }
 }

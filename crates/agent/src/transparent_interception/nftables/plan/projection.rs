@@ -10,7 +10,7 @@ impl NftSelectorProjection {
         self.rules
     }
 
-    pub(super) fn from_host_rule_scope(scope: TransparentInterceptionHostRuleScope) -> Self {
+    pub(super) fn inbound_tproxy(scope: TransparentInterceptionHostRuleScope) -> Self {
         let traffic_projection = NftTrafficProjection::from_host_rule_scope(&scope);
         let mut rules = Vec::new();
         let addresses = scope.remote_addresses();
@@ -208,7 +208,7 @@ mod tests {
     }
 
     fn match_expressions(scope: TransparentInterceptionHostRuleScope) -> Vec<String> {
-        NftSelectorProjection::from_host_rule_scope(scope)
+        NftSelectorProjection::inbound_tproxy(scope)
             .into_rules()
             .into_iter()
             .map(|rule| rule.match_expression())

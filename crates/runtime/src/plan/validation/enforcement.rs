@@ -341,6 +341,31 @@ mod tests {
     }
 
     #[test]
+    fn outbound_mitm_preview_does_not_require_executable_interception_capability() {
+        let registry = ProviderRegistry::new(
+            vec![live_capture_provider()],
+            test_platform_capabilities_with_connection_enforcement(RuntimeMode::Available),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+
+        validate_runtime_config(&config, &registry)
+            .expect("outbound MITM preview should not require executable interception capability");
+    }
+
+    #[test]
     fn transparent_interception_requires_live_capture_mode() {
         let registry = ProviderRegistry::new(
             vec![capture_provider(
