@@ -1,4 +1,6 @@
 use interception::TransparentInterceptionHostRuleScope;
+#[cfg(test)]
+use interception::TransparentInterceptionSetupDirection;
 
 use super::{
     OutboundRedirectArtifactSpec, TransparentLinuxPlanError, hex_mark,
@@ -116,9 +118,9 @@ mod tests {
             vec![
                 "destroy table inet sssa_probe",
                 "add table inet sssa_probe",
-                "add chain inet sssa_probe outbound_mitm { type nat hook output priority dstnat; policy accept; }",
-                "add rule inet sssa_probe outbound_mitm meta mark 0x53534102 return",
-                "add rule inet sssa_probe outbound_mitm meta l4proto tcp meta nfproto ipv4 tcp dport 443 ip daddr 203.0.113.10 redirect to :15001",
+                "add chain inet sssa_probe outbound_transparent_proxy { type nat hook output priority dstnat; policy accept; }",
+                "add rule inet sssa_probe outbound_transparent_proxy meta mark 0x53534102 return",
+                "add rule inet sssa_probe outbound_transparent_proxy meta l4proto tcp meta nfproto ipv4 tcp dport 443 ip daddr 203.0.113.10 redirect to :15001",
             ]
         );
     }
@@ -171,7 +173,7 @@ mod tests {
 
     fn interception_config(selector: Option<Selector>) -> EnforcementInterceptionConfig {
         EnforcementInterceptionConfig {
-            strategy: TransparentInterceptionStrategyConfig::OutboundMitm,
+            strategy: TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
             selector,
             proxy: TransparentInterceptionProxyConfig {
                 listen_port: Some(15001),
@@ -181,9 +183,10 @@ mod tests {
     }
 
     fn setup_scope(selector: &Selector) -> TransparentInterceptionHostRuleScope {
-        match interception::TransparentInterceptionSetupPlan::from_outbound_mitm_selector(Some(
-            selector,
-        ))
+        match interception::TransparentInterceptionSetupPlan::from_selector(
+            Some(selector),
+            TransparentInterceptionSetupDirection::Outbound,
+        )
         .expect("test selector should project")
         {
             interception::TransparentInterceptionSetupPlan::HostRules(scope) => scope,
@@ -196,7 +199,7 @@ mod tests {
         setup_scope: TransparentInterceptionHostRuleScope,
     ) -> Result<OutboundRedirectLifecyclePlan, TransparentLinuxPlanError> {
         OutboundRedirectLifecyclePlan::from_spec_and_scope(
-            OutboundRedirectArtifactSpec::outbound_mitm(
+            OutboundRedirectArtifactSpec::outbound_transparent_proxy(
                 crate::TransparentLinuxResources::reserved(),
                 config
                     .proxy

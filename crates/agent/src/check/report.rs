@@ -608,7 +608,7 @@ protective_actions = ["alert"]
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
-            TransparentInterceptionStrategyConfig::OutboundMitm;
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
         config.enforcement.interception.proxy.listen_port = Some(15001);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
@@ -642,7 +642,7 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["chain_name"],
-            json!("outbound_mitm")
+            json!("outbound_transparent_proxy")
         );
         assert_eq!(
             value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["hook"],
@@ -666,7 +666,7 @@ protective_actions = ["alert"]
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
-            TransparentInterceptionStrategyConfig::OutboundMitm;
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
         config.enforcement.interception.proxy.listen_port = Some(15001);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector {

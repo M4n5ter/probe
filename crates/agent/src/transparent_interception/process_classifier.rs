@@ -199,8 +199,9 @@ mod tests {
     use attribution::ProcfsSocketResolver;
     use interception::{
         TransparentInterceptionPortScope, TransparentInterceptionProcessScope,
-        TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupPlan,
-        TransparentInterceptionSetupSelectorSources, TransparentInterceptionSetupSelectors,
+        TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupDirection,
+        TransparentInterceptionSetupPlan, TransparentInterceptionSetupSelectorSources,
+        TransparentInterceptionSetupSelectors,
     };
     use probe_config::{
         EnforcementInterceptionConfig, TransparentInterceptionProxyConfig,
@@ -387,7 +388,10 @@ mod tests {
                 ..TrafficSelector::default()
             },
         );
-        match TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(&selector))? {
+        match TransparentInterceptionSetupPlan::from_selector(
+            Some(&selector),
+            TransparentInterceptionSetupDirection::Inbound,
+        )? {
             TransparentInterceptionSetupPlan::RequiresProcessClassifier {
                 process_scope, ..
             } => Ok(process_scope),

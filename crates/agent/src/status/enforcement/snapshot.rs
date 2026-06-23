@@ -802,7 +802,7 @@ protective_actions = ["alert"]
         config.capture.selection = probe_config::CaptureSelection::Libpcap;
         config.enforcement.mode = probe_core::EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
-            probe_config::TransparentInterceptionStrategyConfig::OutboundMitm;
+            probe_config::TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
         config.enforcement.interception.proxy.listen_port = Some(15001);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
@@ -819,7 +819,7 @@ protective_actions = ["alert"]
 
         assert_eq!(
             status.interception.strategy,
-            probe_config::TransparentInterceptionStrategyConfig::OutboundMitm
+            probe_config::TransparentInterceptionStrategyConfig::OutboundTransparentProxy
         );
         assert!(matches!(
             status.interception.local_setup_projection,
@@ -835,7 +835,7 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             value["interception"]["outbound_redirect"]["artifact"]["chain_name"],
-            json!("outbound_mitm")
+            json!("outbound_transparent_proxy")
         );
         assert_eq!(
             value["interception"]["outbound_redirect"]["artifact"]["priority"],

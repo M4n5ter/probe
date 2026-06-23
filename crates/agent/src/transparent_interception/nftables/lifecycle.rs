@@ -15,7 +15,7 @@ use ::runtime::TransparentInterceptionExecutionPlan;
 use ::runtime::TransparentInterceptionInboundTproxyPlan;
 use interception::TransparentInterceptionHostRuleScope;
 #[cfg(test)]
-use interception::TransparentInterceptionSetupPlan;
+use interception::{TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan};
 #[cfg(test)]
 use probe_config::EnforcementInterceptionConfig;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -633,8 +633,11 @@ mod tests {
     }
 
     fn setup_scope(selector: &Selector) -> TransparentInterceptionHostRuleScope {
-        match TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(selector))
-            .expect("test selector should project")
+        match TransparentInterceptionSetupPlan::from_selector(
+            Some(selector),
+            TransparentInterceptionSetupDirection::Inbound,
+        )
+        .expect("test selector should project")
         {
             TransparentInterceptionSetupPlan::HostRules(scope) => scope,
             _ => panic!("test selector should project to host rules"),

@@ -145,12 +145,12 @@ mod tests {
     }
 
     #[test]
-    fn outbound_mitm_composition_exposes_preview_without_executable_capability() {
+    fn outbound_transparent_proxy_composition_exposes_preview_without_executable_capability() {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
-            TransparentInterceptionStrategyConfig::OutboundMitm;
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
         config.enforcement.interception.proxy.listen_port = Some(15001);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
@@ -168,7 +168,7 @@ mod tests {
             )],
             test_platform_probes(),
         )
-        .expect("outbound MITM preview should build through runtime composition");
+        .expect("outbound transparent proxy preview should build through runtime composition");
         let plan = composition.into_plan();
         let transparent_interception = plan
             .capabilities
@@ -188,7 +188,7 @@ mod tests {
         let TransparentInterceptionOutboundRedirectPlan::Planned { install, .. } =
             plan.enforcement.interception.outbound_redirect
         else {
-            panic!("outbound MITM should expose a redirect preview");
+            panic!("outbound transparent proxy should expose a redirect preview");
         };
         let runtime::TransparentInterceptionOutboundRedirectInstallPlan::Blocked { reason } =
             install;

@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_mitm_preview_does_not_require_executable_interception_capability() {
+    fn outbound_transparent_proxy_preview_does_not_require_executable_interception_capability() {
         let registry = ProviderRegistry::new(
             vec![live_capture_provider()],
             test_platform_capabilities_with_connection_enforcement(RuntimeMode::Available),
@@ -350,7 +350,7 @@ mod tests {
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
-            TransparentInterceptionStrategyConfig::OutboundMitm;
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
         config.enforcement.interception.proxy.listen_port = Some(15001);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
@@ -362,7 +362,7 @@ mod tests {
         ));
 
         validate_runtime_config(&config, &registry)
-            .expect("outbound MITM preview should not require executable interception capability");
+            .expect("outbound transparent proxy preview should not require executable interception capability");
     }
 
     #[test]

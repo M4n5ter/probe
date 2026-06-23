@@ -59,14 +59,7 @@ fn setup_plan(
     selector: Option<&Selector>,
     direction: TransparentInterceptionSetupDirection,
 ) -> Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError> {
-    match direction {
-        TransparentInterceptionSetupDirection::Inbound => {
-            TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(selector)
-        }
-        TransparentInterceptionSetupDirection::Outbound => {
-            TransparentInterceptionSetupPlan::from_outbound_mitm_selector(selector)
-        }
-    }
+    TransparentInterceptionSetupPlan::from_selector(selector, direction)
 }
 
 fn setup_selector(

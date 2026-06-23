@@ -84,7 +84,7 @@ fn outbound_redirect_spec(
         }
         TransparentInterceptionOutboundRedirectPlan::NotConfigured => {
             Err(super::TransparentInterceptionError::Setup(
-                "outbound MITM redirect preview is not planned".to_string(),
+                "outbound transparent proxy redirect preview is not planned".to_string(),
             ))
         }
     }

@@ -121,7 +121,7 @@ impl TransparentInterceptionLocalSetupProjectionPlan {
             TransparentInterceptionStrategyConfig::InboundTproxy => {
                 Self::from_inbound_selectors(enforcement_selector, interception_selector)
             }
-            TransparentInterceptionStrategyConfig::OutboundMitm => {
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy => {
                 Self::from_outbound_selectors(enforcement_selector, interception_selector)
             }
         }
@@ -333,9 +333,9 @@ mod tests {
     }
 
     #[test]
-    fn outbound_mitm_projectable_selector_reports_host_rules() {
+    fn outbound_transparent_proxy_projectable_selector_reports_host_rules() {
         let scope = scope_for(
-            TransparentInterceptionStrategyConfig::OutboundMitm,
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
             Selector::term(
                 ProcessSelector::default(),
                 TrafficSelector {

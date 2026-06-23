@@ -27,7 +27,7 @@ pub enum TransparentLinuxPlanError {
     )]
     WildcardLocalPortsRequireProxyBypass { proxy_port: u16 },
     #[error(
-        "outbound MITM redirect requires an explicit remote port scope for proxy listen port {proxy_port}; wildcard remote port interception needs L7 proxy classification before rule installation"
+        "outbound transparent proxy redirect requires an explicit remote port scope for proxy listen port {proxy_port}; wildcard remote port interception needs flow-aware outbound scope resolution before rule installation"
     )]
     OutboundRedirectRequiresRemotePorts { proxy_port: u16 },
 }

@@ -101,7 +101,7 @@ fn validation_rejects_managed_relay_without_inbound_tproxy()
     let config = AgentConfig::from_toml_str(
         r#"
 [enforcement.interception]
-strategy = "outbound_mitm"
+strategy = "outbound_transparent_proxy"
 
 [enforcement.interception.proxy]
 mode = "managed_tcp_relay"

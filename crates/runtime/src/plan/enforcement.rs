@@ -12,7 +12,7 @@ use transparent_linux::{OutboundRedirectArtifactSpec, TransparentLinuxResources}
 
 use super::interception_scope::TransparentInterceptionLocalSetupProjectionPlan;
 
-const OUTBOUND_MITM_INSTALL_BLOCKED_REASON: &str = "outbound transparent MITM redirect install has a typed redirect preview, Linux original-destination recovery and proxy pre-connect SO_MARK primitives, but requires wiring them into an executable output redirect lifecycle for activation/install and MITM lifecycle";
+const OUTBOUND_TRANSPARENT_PROXY_INSTALL_BLOCKED_REASON: &str = "outbound transparent proxy redirect install has a typed redirect preview, Linux original-destination recovery and proxy pre-connect SO_MARK primitives, but requires wiring them into an executable output redirect lifecycle with proxy self-bypass and target recovery before rules can be installed; L7 MITM and certificate handling remain a separate proxy backend";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPlan {
@@ -209,7 +209,7 @@ impl std::error::Error for TransparentInterceptionProxyPlanError {}
 pub enum TransparentInterceptionExecutionPlan {
     Disabled,
     InboundTproxy(TransparentInterceptionInboundTproxyPlan),
-    OutboundMitm(TransparentInterceptionOutboundMitmPlan),
+    OutboundTransparentProxy(TransparentInterceptionOutboundProxyPlan),
 }
 
 impl TransparentInterceptionExecutionPlan {
@@ -234,8 +234,8 @@ impl TransparentInterceptionExecutionPlan {
                     ),
                 })
             }
-            TransparentInterceptionProxyIntent::OutboundMitm(proxy) => {
-                Self::OutboundMitm(TransparentInterceptionOutboundMitmPlan {
+            TransparentInterceptionProxyIntent::OutboundTransparentProxy(proxy) => {
+                Self::OutboundTransparentProxy(TransparentInterceptionOutboundProxyPlan {
                     listen_port: proxy.listen_port(),
                 })
             }
@@ -246,7 +246,9 @@ impl TransparentInterceptionExecutionPlan {
         match self {
             Self::Disabled => TransparentInterceptionStrategyConfig::None,
             Self::InboundTproxy(_) => TransparentInterceptionStrategyConfig::InboundTproxy,
-            Self::OutboundMitm(_) => TransparentInterceptionStrategyConfig::OutboundMitm,
+            Self::OutboundTransparentProxy(_) => {
+                TransparentInterceptionStrategyConfig::OutboundTransparentProxy
+            }
         }
     }
 }
@@ -273,11 +275,11 @@ impl TransparentInterceptionInboundTproxyPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransparentInterceptionOutboundMitmPlan {
+pub struct TransparentInterceptionOutboundProxyPlan {
     listen_port: NonZeroU16,
 }
 
-impl TransparentInterceptionOutboundMitmPlan {
+impl TransparentInterceptionOutboundProxyPlan {
     pub fn listen_port(&self) -> NonZeroU16 {
         self.listen_port
     }
@@ -335,12 +337,14 @@ impl TransparentInterceptionOutboundRedirectPlan {
         proxy_port: NonZeroU16,
         nftables: &TransparentInterceptionNftablesPlan,
     ) -> Self {
-        let artifact =
-            OutboundRedirectArtifactSpec::outbound_mitm(nftables.clone(), proxy_port.get());
+        let artifact = OutboundRedirectArtifactSpec::outbound_transparent_proxy(
+            nftables.clone(),
+            proxy_port.get(),
+        );
         Self::Planned {
             artifact,
             install: TransparentInterceptionOutboundRedirectInstallPlan::Blocked {
-                reason: OUTBOUND_MITM_INSTALL_BLOCKED_REASON.to_string(),
+                reason: OUTBOUND_TRANSPARENT_PROXY_INSTALL_BLOCKED_REASON.to_string(),
             },
         }
     }
@@ -349,7 +353,7 @@ impl TransparentInterceptionOutboundRedirectPlan {
         intent: &TransparentInterceptionProxyIntent,
         nftables: &TransparentInterceptionNftablesPlan,
     ) -> Self {
-        let TransparentInterceptionProxyIntent::OutboundMitm(proxy) = intent else {
+        let TransparentInterceptionProxyIntent::OutboundTransparentProxy(proxy) = intent else {
             return Self::NotConfigured;
         };
         Self::planned_for_proxy_port(proxy.listen_port(), nftables)
@@ -411,7 +415,7 @@ impl EnforcementCapabilityPlan {
                 })
             }
             TransparentInterceptionStrategyConfig::None
-            | TransparentInterceptionStrategyConfig::OutboundMitm => None,
+            | TransparentInterceptionStrategyConfig::OutboundTransparentProxy => None,
         }
     }
 
@@ -682,7 +686,7 @@ mod tests {
         let mut config = AgentConfig::default();
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
-            TransparentInterceptionStrategyConfig::OutboundMitm;
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
         config.enforcement.interception.proxy.listen_port = Some(15001);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
@@ -700,7 +704,7 @@ mod tests {
 
         assert_eq!(
             plan.interception.strategy,
-            TransparentInterceptionStrategyConfig::OutboundMitm
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy
         );
         assert!(matches!(
             plan.interception.local_setup_projection,
@@ -715,14 +719,14 @@ mod tests {
             TransparentInterceptionOutboundRedirectPlan::Planned {
                 artifact: OutboundRedirectArtifactSpec {
                     table_name: "sssa_probe".to_string(),
-                    chain_name: "outbound_mitm".to_string(),
+                    chain_name: "outbound_transparent_proxy".to_string(),
                     hook: "output".to_string(),
                     priority: "dstnat".to_string(),
                     proxy_port: 15001,
                     proxy_bypass_mark: 0x5353_4102,
                 },
                 install: TransparentInterceptionOutboundRedirectInstallPlan::Blocked {
-                    reason: OUTBOUND_MITM_INSTALL_BLOCKED_REASON.to_string(),
+                    reason: OUTBOUND_TRANSPARENT_PROXY_INSTALL_BLOCKED_REASON.to_string(),
                 },
             }
         );

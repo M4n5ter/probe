@@ -61,14 +61,14 @@ pub enum TransparentInterceptionStrategyConfig {
     #[default]
     None,
     InboundTproxy,
-    OutboundMitm,
+    OutboundTransparentProxy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransparentInterceptionProxyIntent {
     Disabled(TransparentInterceptionDisabledProxyIntent),
     InboundTproxy(TransparentInterceptionEnabledProxyIntent),
-    OutboundMitm(TransparentInterceptionEnabledProxyIntent),
+    OutboundTransparentProxy(TransparentInterceptionEnabledProxyIntent),
 }
 
 impl TransparentInterceptionProxyIntent {
@@ -76,28 +76,34 @@ impl TransparentInterceptionProxyIntent {
         match self {
             Self::Disabled(_) => TransparentInterceptionStrategyConfig::None,
             Self::InboundTproxy(_) => TransparentInterceptionStrategyConfig::InboundTproxy,
-            Self::OutboundMitm(_) => TransparentInterceptionStrategyConfig::OutboundMitm,
+            Self::OutboundTransparentProxy(_) => {
+                TransparentInterceptionStrategyConfig::OutboundTransparentProxy
+            }
         }
     }
 
     pub fn mode(&self) -> TransparentInterceptionProxyModeConfig {
         match self {
             Self::Disabled(proxy) => proxy.mode,
-            Self::InboundTproxy(proxy) | Self::OutboundMitm(proxy) => proxy.mode,
+            Self::InboundTproxy(proxy) | Self::OutboundTransparentProxy(proxy) => proxy.mode,
         }
     }
 
     pub fn listen_port(&self) -> Option<NonZeroU16> {
         match self {
             Self::Disabled(proxy) => proxy.listen_port,
-            Self::InboundTproxy(proxy) | Self::OutboundMitm(proxy) => Some(proxy.listen_port),
+            Self::InboundTproxy(proxy) | Self::OutboundTransparentProxy(proxy) => {
+                Some(proxy.listen_port)
+            }
         }
     }
 
     pub fn health_probe(&self) -> &TransparentInterceptionProxyHealthProbeIntent {
         match self {
             Self::Disabled(proxy) => &proxy.health_probe,
-            Self::InboundTproxy(proxy) | Self::OutboundMitm(proxy) => &proxy.health_probe,
+            Self::InboundTproxy(proxy) | Self::OutboundTransparentProxy(proxy) => {
+                &proxy.health_probe
+            }
         }
     }
 }
@@ -250,14 +256,14 @@ impl EnforcementInterceptionConfig {
                     },
                 )
             }
-            TransparentInterceptionStrategyConfig::OutboundMitm => {
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy => {
                 let Some(listen_port) = listen_port else {
                     return Err(vec![intent_violation(
                         "enforcement.interception.proxy.listen_port",
                         "transparent interception requires a non-zero proxy listen port",
                     )]);
                 };
-                TransparentInterceptionProxyIntent::OutboundMitm(
+                TransparentInterceptionProxyIntent::OutboundTransparentProxy(
                     TransparentInterceptionEnabledProxyIntent {
                         mode: self.proxy.mode,
                         listen_port,
@@ -284,7 +290,7 @@ fn validate_transparent_proxy_health_probe(
             "transparent proxy health probe requires an enabled interception strategy",
         ));
     }
-    if interception.strategy == TransparentInterceptionStrategyConfig::OutboundMitm {
+    if interception.strategy == TransparentInterceptionStrategyConfig::OutboundTransparentProxy {
         violations.push(intent_violation(
             "enforcement.interception.proxy.health_probe.target",
             "transparent proxy health probe is currently executable for inbound TPROXY only",

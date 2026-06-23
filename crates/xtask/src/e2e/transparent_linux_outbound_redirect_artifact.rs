@@ -4,7 +4,7 @@ use std::{
     process::{Command, ExitCode, Output, Stdio},
 };
 
-use interception::TransparentInterceptionSetupPlan;
+use interception::{TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan};
 use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
 use transparent_linux::{
     OutboundRedirectArtifactSpec, OutboundRedirectLifecyclePlan, TransparentLinuxResources,
@@ -73,18 +73,20 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn outbound_redirect_artifact() -> Result<OutboundRedirectLifecyclePlan, Box<dyn std::error::Error>>
 {
     let selector = outbound_redirect_selector();
-    let setup_scope =
-        match TransparentInterceptionSetupPlan::from_outbound_mitm_selector(Some(&selector))? {
-            TransparentInterceptionSetupPlan::HostRules(scope) => scope,
-            _ => {
-                return Err(e2e_error(
-                    "outbound redirect artifact selector must project to host rules",
-                )
-                .into());
-            }
-        };
+    let setup_scope = match TransparentInterceptionSetupPlan::from_selector(
+        Some(&selector),
+        TransparentInterceptionSetupDirection::Outbound,
+    )? {
+        TransparentInterceptionSetupPlan::HostRules(scope) => scope,
+        _ => {
+            return Err(e2e_error(
+                "outbound redirect artifact selector must project to host rules",
+            )
+            .into());
+        }
+    };
     Ok(OutboundRedirectLifecyclePlan::from_spec_and_scope(
-        OutboundRedirectArtifactSpec::outbound_mitm(
+        OutboundRedirectArtifactSpec::outbound_transparent_proxy(
             TransparentLinuxResources::reserved(),
             PROXY_PORT,
         ),
@@ -126,7 +128,7 @@ fn cleanup_owned_table_best_effort(nft: &Path, cleanup: &Path) {
 
 fn assert_installed_rules(listing: &str) -> Result<(), Box<dyn std::error::Error>> {
     for expected in [
-        "chain outbound_mitm",
+        "chain outbound_transparent_proxy",
         "type nat hook output priority dstnat; policy accept;",
         "meta mark 0x53534102 return",
         "tcp dport 443",

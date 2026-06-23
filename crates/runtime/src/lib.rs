@@ -14,7 +14,7 @@ pub use plan::{
     TransparentInterceptionClassifierTermPlan, TransparentInterceptionExecutionPlan,
     TransparentInterceptionFlowClassifierScopePlan, TransparentInterceptionInboundTproxyPlan,
     TransparentInterceptionLocalSetupProjectionPlan, TransparentInterceptionNftablesPlan,
-    TransparentInterceptionOutboundMitmPlan, TransparentInterceptionOutboundRedirectInstallPlan,
+    TransparentInterceptionOutboundProxyPlan, TransparentInterceptionOutboundRedirectInstallPlan,
     TransparentInterceptionOutboundRedirectPlan, TransparentInterceptionProcessScopeExpressionPlan,
     TransparentInterceptionProcessScopePlan, TransparentInterceptionProjectedHostRuleBoundaryPlan,
     TransparentInterceptionProjectedHostRuleScopePlan,

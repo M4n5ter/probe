@@ -17,19 +17,7 @@ const NOT_FLOW_CLASSIFIER_REASON: &str = "not selectors require a flow-aware cla
 const REF_FLOW_CLASSIFIER_REASON: &str = "named selector refs require registry-backed classifier resolution before transparent interception setup";
 
 impl TransparentInterceptionSetupPlan {
-    pub fn from_inbound_tproxy_selector(
-        selector: Option<&Selector>,
-    ) -> Result<Self, TransparentInterceptionSetupProjectionError> {
-        Self::from_selector(selector, TransparentInterceptionSetupDirection::Inbound)
-    }
-
-    pub fn from_outbound_mitm_selector(
-        selector: Option<&Selector>,
-    ) -> Result<Self, TransparentInterceptionSetupProjectionError> {
-        Self::from_selector(selector, TransparentInterceptionSetupDirection::Outbound)
-    }
-
-    fn from_selector(
+    pub fn from_selector(
         selector: Option<&Selector>,
         direction: TransparentInterceptionSetupDirection,
     ) -> Result<Self, TransparentInterceptionSetupProjectionError> {
@@ -377,7 +365,9 @@ impl TransparentInterceptionSetupDirection {
     fn wrong_direction_reason(self) -> &'static str {
         match self {
             Self::Inbound => "inbound TPROXY can only project Inbound traffic selectors",
-            Self::Outbound => "outbound MITM can only project Outbound traffic selectors",
+            Self::Outbound => {
+                "outbound transparent proxy can only project Outbound traffic selectors"
+            }
         }
     }
 }
@@ -699,11 +689,13 @@ mod tests {
 
     #[test]
     fn empty_any_selector_is_unsupported() {
-        let error =
-            TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(&Selector::Any {
+        let error = TransparentInterceptionSetupPlan::from_selector(
+            Some(&Selector::Any {
                 selectors: Vec::new(),
-            }))
-            .expect_err("empty any selector is invalid setup input");
+            }),
+            TransparentInterceptionSetupDirection::Inbound,
+        )
+        .expect_err("empty any selector is invalid setup input");
 
         assert!(matches!(
             error,
@@ -856,13 +848,19 @@ mod tests {
     fn plan_for(
         selector: Selector,
     ) -> Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError> {
-        TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(&selector))
+        TransparentInterceptionSetupPlan::from_selector(
+            Some(&selector),
+            TransparentInterceptionSetupDirection::Inbound,
+        )
     }
 
     fn outbound_plan_for(
         selector: Selector,
     ) -> Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError> {
-        TransparentInterceptionSetupPlan::from_outbound_mitm_selector(Some(&selector))
+        TransparentInterceptionSetupPlan::from_selector(
+            Some(&selector),
+            TransparentInterceptionSetupDirection::Outbound,
+        )
     }
 
     fn term(traffic: TrafficSelector) -> Selector {

@@ -82,7 +82,7 @@ mod tests {
         let mut violations = Vec::new();
         validate(
             &EnforcementInterceptionConfig {
-                strategy: TransparentInterceptionStrategyConfig::OutboundMitm,
+                strategy: TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
                 selector: None,
                 proxy: TransparentInterceptionProxyConfig {
                     mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
@@ -187,7 +187,7 @@ mod tests {
         let mut violations = Vec::new();
         validate(
             &EnforcementInterceptionConfig {
-                strategy: TransparentInterceptionStrategyConfig::OutboundMitm,
+                strategy: TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
                 proxy: TransparentInterceptionProxyConfig {
                     listen_port: Some(15001),
                     health_probe: TransparentInterceptionProxyHealthProbeConfig {

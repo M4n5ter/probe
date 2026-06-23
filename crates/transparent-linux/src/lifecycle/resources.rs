@@ -4,7 +4,7 @@ const TRANSPARENT_INTERCEPTION_NFTABLES_TABLE: &str = "sssa_probe";
 const TRANSPARENT_INTERCEPTION_INBOUND_TPROXY_MARK: u32 = 0x5353_4101;
 const TRANSPARENT_INTERCEPTION_OUTBOUND_PROXY_BYPASS_MARK: u32 = 0x5353_4102;
 const TRANSPARENT_INTERCEPTION_INBOUND_TPROXY_ROUTE_TABLE: u32 = 53_534;
-const TRANSPARENT_INTERCEPTION_OUTBOUND_CHAIN: &str = "outbound_mitm";
+const TRANSPARENT_INTERCEPTION_OUTBOUND_CHAIN: &str = "outbound_transparent_proxy";
 const TRANSPARENT_INTERCEPTION_OUTPUT_HOOK: &str = "output";
 const TRANSPARENT_INTERCEPTION_DSTNAT_PRIORITY: &str = "dstnat";
 
@@ -53,7 +53,10 @@ pub struct OutboundRedirectArtifactSpec {
 }
 
 impl OutboundRedirectArtifactSpec {
-    pub fn outbound_mitm(resources: TransparentLinuxResources, proxy_port: u16) -> Self {
+    pub fn outbound_transparent_proxy(
+        resources: TransparentLinuxResources,
+        proxy_port: u16,
+    ) -> Self {
         Self {
             table_name: resources.table_name,
             chain_name: TRANSPARENT_INTERCEPTION_OUTBOUND_CHAIN.to_string(),

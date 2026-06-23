@@ -6,7 +6,7 @@ fn parses_transparent_interception_strategy() -> Result<(), Box<dyn std::error::
     let config = AgentConfig::from_toml_str(
         r#"
 [enforcement.interception]
-strategy = "outbound_mitm"
+strategy = "outbound_transparent_proxy"
 
 [enforcement.interception.proxy]
 listen_port = 15001
@@ -32,7 +32,7 @@ remote_addresses = []
 
     assert_eq!(
         config.enforcement.interception.strategy,
-        TransparentInterceptionStrategyConfig::OutboundMitm
+        TransparentInterceptionStrategyConfig::OutboundTransparentProxy
     );
     assert_eq!(
         config.enforcement.interception.proxy.listen_port,

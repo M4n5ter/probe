@@ -50,8 +50,11 @@ pub(crate) fn resolve(
         TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) => {
             nftables::resolve(inbound_plan, proxy_runtime)
         }
-        TransparentInterceptionExecutionPlan::OutboundMitm(_) => {
-            TransparentInterceptionRuntime::unavailable(outbound_mitm_unavailable(), proxy_runtime)
+        TransparentInterceptionExecutionPlan::OutboundTransparentProxy(_) => {
+            TransparentInterceptionRuntime::unavailable(
+                outbound_transparent_proxy_unavailable(),
+                proxy_runtime,
+            )
         }
     }
 }
@@ -81,10 +84,10 @@ pub(crate) fn effective_setup_scope(
                 selectors,
             )
         }
-        TransparentInterceptionExecutionPlan::OutboundMitm(_) => {
+        TransparentInterceptionExecutionPlan::OutboundTransparentProxy(_) => {
             validate_outbound_redirect_setup_scope(outbound_redirect, selectors)?;
             Err(TransparentInterceptionError::Setup(
-                outbound_mitm_unavailable(),
+                outbound_transparent_proxy_unavailable(),
             ))
         }
     }
@@ -124,15 +127,15 @@ fn validate_outbound_redirect_setup_scope(
             | TransparentInterceptionSetupPlan::RequiresFlowClassifier { reason, .. },
         ) => Err(TransparentInterceptionError::Setup(format!(
             "{reason}; {}",
-            outbound_mitm_unavailable()
+            outbound_transparent_proxy_unavailable()
         ))),
         Err(error) => Err(TransparentInterceptionError::Setup(error.to_string())),
     }
 }
 
-fn outbound_mitm_unavailable() -> String {
+fn outbound_transparent_proxy_unavailable() -> String {
     format!(
-        "outbound transparent MITM has a typed redirect plan, transparent-linux artifact planning, existing {}, and proxy pre-connect SO_MARK primitive, but requires wiring them into an executable output redirect lifecycle for activation/install and MITM lifecycle before rules can be installed",
+        "outbound transparent proxy has a typed redirect plan, transparent-linux artifact planning, existing {}, and proxy pre-connect SO_MARK primitive, but requires wiring them into an executable output redirect lifecycle with proxy self-bypass and target recovery before rules can be installed; L7 MITM and certificate handling remain a separate proxy backend",
         proxy::outbound_original_destination_recovery_name()
     )
 }
@@ -300,8 +303,8 @@ mod tests {
     }
 
     #[test]
-    fn outbound_mitm_valid_host_scope_reaches_fail_closed_runtime_boundary() {
-        let config = outbound_mitm_config();
+    fn outbound_transparent_proxy_valid_host_scope_reaches_fail_closed_runtime_boundary() {
+        let config = outbound_transparent_proxy_config();
         let selector = Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -321,16 +324,19 @@ mod tests {
             &mut TransparentInterceptionProcessClassifier::new(),
             selectors,
         )
-        .expect_err("outbound MITM should remain fail closed after artifact validation");
+        .expect_err(
+            "outbound transparent proxy should remain fail closed after artifact validation",
+        );
         let message = error.to_string();
 
         assert!(message.contains("transparent-linux artifact planning"));
-        assert!(message.contains("activation/install"));
+        assert!(message.contains("proxy self-bypass"));
+        assert!(message.contains("target recovery"));
     }
 
     #[test]
-    fn outbound_mitm_wildcard_remote_ports_fail_before_runtime_boundary() {
-        let config = outbound_mitm_config();
+    fn outbound_transparent_proxy_wildcard_remote_ports_fail_before_runtime_boundary() {
+        let config = outbound_transparent_proxy_config();
         let selector = Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -354,12 +360,14 @@ mod tests {
         let message = error.to_string();
 
         assert!(message.contains("explicit remote port scope"));
-        assert!(!message.contains("activation/install"));
+        assert!(!message.contains("transparent-linux artifact planning"));
+        assert!(!message.contains("proxy self-bypass"));
+        assert!(!message.contains("target recovery"));
     }
 
-    fn outbound_mitm_config() -> EnforcementInterceptionConfig {
+    fn outbound_transparent_proxy_config() -> EnforcementInterceptionConfig {
         EnforcementInterceptionConfig {
-            strategy: TransparentInterceptionStrategyConfig::OutboundMitm,
+            strategy: TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
             selector: None,
             proxy: TransparentInterceptionProxyConfig {
                 listen_port: Some(15001),
@@ -369,7 +377,7 @@ mod tests {
     }
 
     fn outbound_redirect_plan() -> TransparentInterceptionOutboundRedirectPlan {
-        let artifact = transparent_linux::OutboundRedirectArtifactSpec::outbound_mitm(
+        let artifact = transparent_linux::OutboundRedirectArtifactSpec::outbound_transparent_proxy(
             ::runtime::TransparentInterceptionNftablesPlan::reserved(),
             15001,
         );
