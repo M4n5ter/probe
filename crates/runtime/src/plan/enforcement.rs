@@ -6,7 +6,7 @@ use probe_config::{
     TransparentInterceptionProxyIntent, TransparentInterceptionProxyIntentViolation,
     TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
 };
-use probe_core::{CapabilityKind, CapabilityMatrix, EnforcementMode, RuntimeMode};
+use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
 
 use super::interception_scope::TransparentInterceptionLocalSetupProjectionPlan;
@@ -94,6 +94,7 @@ pub struct EnforcementInterceptionPlan {
     pub execution: TransparentInterceptionExecutionPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
     pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
+    pub classification: TransparentInterceptionClassificationPlan,
     pub capability: EnforcementCapabilityPlan,
     pub selector_configured: bool,
 }
@@ -117,11 +118,29 @@ impl EnforcementInterceptionPlan {
                     config.enforcement.selector.as_ref(),
                     config.enforcement.interception.selector.as_ref(),
                 ),
+            classification: TransparentInterceptionClassificationPlan::from_capabilities(
+                capabilities,
+            ),
             capability: EnforcementCapabilityPlan::from_interception_strategy(
                 strategy,
                 capabilities,
             ),
             selector_configured: config.enforcement.interception.selector.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionClassificationPlan {
+    pub process_classifier: CapabilityState,
+    pub flow_classifier: CapabilityState,
+}
+
+impl TransparentInterceptionClassificationPlan {
+    fn from_capabilities(capabilities: &CapabilityMatrix) -> Self {
+        Self {
+            process_classifier: capabilities.state(CapabilityKind::TransparentProcessClassifier),
+            flow_classifier: capabilities.state(CapabilityKind::TransparentFlowClassifier),
         }
     }
 }
@@ -598,6 +617,14 @@ mod tests {
                 mode: RuntimeMode::Available,
             }
         );
+        assert_eq!(
+            plan.interception.classification.process_classifier,
+            CapabilityState::unavailable(CapabilityKind::TransparentProcessClassifier, "not built")
+        );
+        assert_eq!(
+            plan.interception.classification.flow_classifier,
+            CapabilityState::unavailable(CapabilityKind::TransparentFlowClassifier, "not built")
+        );
     }
 
     fn test_platform_capabilities() -> Vec<CapabilityState> {
@@ -624,6 +651,8 @@ mod tests {
                 }
             },
             CapabilityState::unavailable(CapabilityKind::TransparentInterception, "not built"),
+            CapabilityState::unavailable(CapabilityKind::TransparentProcessClassifier, "not built"),
+            CapabilityState::unavailable(CapabilityKind::TransparentFlowClassifier, "not built"),
         ]
     }
 

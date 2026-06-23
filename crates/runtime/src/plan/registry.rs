@@ -15,6 +15,8 @@ pub struct PlatformProbeResults {
     pub procfs_socket: Vec<CapabilityState>,
     pub connection_enforcement: CapabilityState,
     pub transparent_interception: CapabilityState,
+    pub transparent_process_classifier: CapabilityState,
+    pub transparent_flow_classifier: CapabilityState,
     pub libssl_uprobe: CapabilityState,
 }
 
@@ -24,8 +26,24 @@ impl PlatformProbeResults {
             procfs_socket: ProcfsSocketResolver::new().capabilities(),
             connection_enforcement: default_connection_enforcement_capability(),
             transparent_interception: default_transparent_interception_capability(),
+            transparent_process_classifier: Self::default_transparent_process_classifier(),
+            transparent_flow_classifier: Self::default_transparent_flow_classifier(),
             libssl_uprobe: default_libssl_uprobe_capability(),
         }
+    }
+
+    pub fn default_transparent_process_classifier() -> CapabilityState {
+        CapabilityState::unavailable(
+            CapabilityKind::TransparentProcessClassifier,
+            "transparent process classifier backend is not configured; process-scoped transparent interception requires cgroup/owner marking or proxy-side process classification",
+        )
+    }
+
+    pub fn default_transparent_flow_classifier() -> CapabilityState {
+        CapabilityState::unavailable(
+            CapabilityKind::TransparentFlowClassifier,
+            "transparent flow classifier backend is not configured; any/not/ref transparent interception selectors require flow-aware classification before rule installation",
+        )
     }
 }
 
@@ -48,6 +66,8 @@ impl ProviderRegistry {
                 procfs,
                 platform.connection_enforcement,
                 platform.transparent_interception,
+                platform.transparent_process_classifier,
+                platform.transparent_flow_classifier,
                 platform.libssl_uprobe,
             )
             .into_iter()
@@ -97,6 +117,8 @@ fn default_platform_capabilities(
     procfs: impl ProcessAttributor,
     connection_enforcement_capability: CapabilityState,
     transparent_interception_capability: CapabilityState,
+    transparent_process_classifier_capability: CapabilityState,
+    transparent_flow_classifier_capability: CapabilityState,
     libssl_uprobe_capability: CapabilityState,
 ) -> impl IntoIterator<Item = CapabilityState> {
     [
@@ -123,6 +145,8 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::DryRunEnforcement),
         connection_enforcement_capability,
         transparent_interception_capability,
+        transparent_process_classifier_capability,
+        transparent_flow_classifier_capability,
     ]
     .into_iter()
     .chain(procfs.capabilities())

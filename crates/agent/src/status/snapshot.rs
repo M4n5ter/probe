@@ -341,6 +341,51 @@ mod tests {
     }
 
     #[test]
+    fn status_snapshot_serializes_transparent_classifier_capabilities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/sssa-spool")),
+            vec![
+                runtime::PlatformProbeResults::default_transparent_process_classifier(),
+                runtime::PlatformProbeResults::default_transparent_flow_classifier(),
+            ],
+        )?;
+        let spool = SpoolStatusInput::available(
+            PathBuf::from("/tmp/sssa-spool"),
+            SpoolSnapshot {
+                last_ingress_sequence: 0,
+                last_export_sequence: 0,
+            },
+            BTreeMap::new(),
+        );
+
+        let snapshot = build_status_snapshot_at(&plan, spool, 42);
+
+        let value = serde_json::to_value(&snapshot)?;
+        assert_eq!(
+            status_capability(&value, "transparent_process_classifier")["mode"],
+            json!("unavailable")
+        );
+        assert_eq!(
+            status_capability(&value, "transparent_process_classifier")["reason"],
+            json!(
+                "transparent process classifier backend is not configured; process-scoped transparent interception requires cgroup/owner marking or proxy-side process classification"
+            )
+        );
+        assert_eq!(
+            status_capability(&value, "transparent_flow_classifier")["mode"],
+            json!("unavailable")
+        );
+        assert_eq!(
+            status_capability(&value, "transparent_flow_classifier")["reason"],
+            json!(
+                "transparent flow classifier backend is not configured; any/not/ref transparent interception selectors require flow-aware classification before rule installation"
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
     fn status_snapshot_reports_export_worker_runtime_metrics()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = runtime_plan_with_exporter()?;
@@ -920,5 +965,14 @@ mod tests {
         capabilities: Vec<CapabilityState>,
     ) -> Result<RuntimePlan, runtime::RuntimeError> {
         runtime_plan_from_config(config_with_storage_path(storage_path), capabilities)
+    }
+
+    fn status_capability<'a>(value: &'a serde_json::Value, kind: &str) -> &'a serde_json::Value {
+        value["capabilities"]["states"]
+            .as_array()
+            .expect("status capabilities should serialize as states")
+            .iter()
+            .find(|state| state["kind"] == json!(kind))
+            .unwrap_or_else(|| panic!("missing serialized capability {kind}"))
     }
 }

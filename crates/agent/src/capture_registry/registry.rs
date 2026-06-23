@@ -27,6 +27,10 @@ pub fn default_provider_registry(
             procfs_socket: procfs_socket_capabilities,
             connection_enforcement: connection_enforcement_capability,
             transparent_interception: transparent_interception_capability,
+            transparent_process_classifier:
+                PlatformProbeResults::default_transparent_process_classifier(),
+            transparent_flow_classifier: PlatformProbeResults::default_transparent_flow_classifier(
+            ),
             libssl_uprobe,
         },
     )

@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +25,8 @@ pub enum CapabilityKind {
     DryRunEnforcement,
     ConnectionEnforcement,
     TransparentInterception,
+    TransparentProcessClassifier,
+    TransparentFlowClassifier,
 }
 
 impl CapabilityKind {
@@ -50,6 +52,8 @@ impl CapabilityKind {
             Self::DryRunEnforcement => "dry_run_enforcement",
             Self::ConnectionEnforcement => "connection_enforcement",
             Self::TransparentInterception => "transparent_interception",
+            Self::TransparentProcessClassifier => "transparent_process_classifier",
+            Self::TransparentFlowClassifier => "transparent_flow_classifier",
         }
     }
 }
@@ -111,26 +115,64 @@ pub struct CapabilityRequirement {
     pub preferred: Vec<CapabilityKind>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CapabilityMatrix {
     states: Vec<CapabilityState>,
 }
 
+impl<'de> Deserialize<'de> for CapabilityMatrix {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            states: Vec<CapabilityState>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self::new(wire.states))
+    }
+}
+
 impl CapabilityMatrix {
     pub fn new(states: impl IntoIterator<Item = CapabilityState>) -> Self {
-        Self {
-            states: states.into_iter().collect(),
+        let mut normalized: Vec<CapabilityState> = Vec::new();
+        for state in states {
+            if let Some(existing) = normalized
+                .iter_mut()
+                .find(|existing| existing.kind == state.kind)
+            {
+                *existing = state;
+            } else {
+                normalized.push(state);
+            }
         }
+        Self { states: normalized }
     }
 
     pub fn states(&self) -> &[CapabilityState] {
         &self.states
     }
 
+    pub fn reported_state(&self, kind: CapabilityKind) -> Option<&CapabilityState> {
+        self.states.iter().find(|state| state.kind == kind)
+    }
+
+    pub fn state(&self, kind: CapabilityKind) -> CapabilityState {
+        self.reported_state(kind).cloned().unwrap_or_else(|| {
+            CapabilityState::unavailable(
+                kind,
+                format!(
+                    "capability {} is not reported by provider registry",
+                    kind.wire_name()
+                ),
+            )
+        })
+    }
+
     pub fn mode(&self, kind: CapabilityKind) -> RuntimeMode {
-        self.states
-            .iter()
-            .find(|state| state.kind == kind)
+        self.reported_state(kind)
             .map_or(RuntimeMode::Unavailable, |state| state.mode)
     }
 
@@ -169,6 +211,8 @@ mod tests {
             CapabilityKind::DryRunEnforcement,
             CapabilityKind::ConnectionEnforcement,
             CapabilityKind::TransparentInterception,
+            CapabilityKind::TransparentProcessClassifier,
+            CapabilityKind::TransparentFlowClassifier,
         ] {
             assert_eq!(serde_json::to_value(kind)?, kind.wire_name());
         }
@@ -185,5 +229,83 @@ mod tests {
             assert_eq!(serde_json::to_value(mode)?, mode.wire_name());
         }
         Ok(())
+    }
+
+    #[test]
+    fn capability_matrix_state_preserves_reported_reason() {
+        let matrix = CapabilityMatrix::new([CapabilityState::unavailable(
+            CapabilityKind::TransparentProcessClassifier,
+            "not built",
+        )]);
+
+        assert_eq!(
+            matrix.state(CapabilityKind::TransparentProcessClassifier),
+            CapabilityState::unavailable(CapabilityKind::TransparentProcessClassifier, "not built")
+        );
+    }
+
+    #[test]
+    fn capability_matrix_new_deduplicates_with_last_state_winning() {
+        let matrix = CapabilityMatrix::new([
+            CapabilityState::unavailable(
+                CapabilityKind::TransparentProcessClassifier,
+                "default unavailable",
+            ),
+            CapabilityState::available(CapabilityKind::TransparentProcessClassifier),
+        ]);
+
+        assert_eq!(
+            matrix.states(),
+            &[CapabilityState::available(
+                CapabilityKind::TransparentProcessClassifier
+            )]
+        );
+        assert_eq!(
+            matrix.mode(CapabilityKind::TransparentProcessClassifier),
+            RuntimeMode::Available
+        );
+    }
+
+    #[test]
+    fn capability_matrix_deserialization_deduplicates_with_last_state_winning()
+    -> Result<(), serde_json::Error> {
+        let matrix: CapabilityMatrix = serde_json::from_value(serde_json::json!({
+            "states": [
+                {
+                    "kind": "transparent_process_classifier",
+                    "mode": "unavailable",
+                    "reason": "default unavailable"
+                },
+                {
+                    "kind": "transparent_process_classifier",
+                    "mode": "available",
+                    "reason": null
+                }
+            ]
+        }))?;
+
+        assert_eq!(
+            matrix.states(),
+            &[CapabilityState::available(
+                CapabilityKind::TransparentProcessClassifier
+            )]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn capability_matrix_state_reports_missing_capability() {
+        let matrix = CapabilityMatrix::new([]);
+
+        let state = matrix.state(CapabilityKind::TransparentProcessClassifier);
+
+        assert_eq!(state.kind, CapabilityKind::TransparentProcessClassifier);
+        assert_eq!(state.mode, RuntimeMode::Unavailable);
+        assert!(
+            state
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not reported by provider registry"))
+        );
     }
 }

@@ -8,8 +8,9 @@ use crate::transparent_interception::TransparentProxyRuntimeSnapshot;
 use probe_config::{ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig};
 use probe_core::{CapabilityKind, EnforcementMode, ProtectiveActionProfile, RuntimeMode};
 use runtime::{
-    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionLocalSetupProjectionPlan,
-    TransparentInterceptionNftablesPlan, TransparentInterceptionProxyPlan,
+    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionClassificationPlan,
+    TransparentInterceptionLocalSetupProjectionPlan, TransparentInterceptionNftablesPlan,
+    TransparentInterceptionProxyPlan,
 };
 use serde::Serialize;
 
@@ -38,6 +39,7 @@ pub struct EnforcementInterceptionStatusSnapshot {
     pub proxy: TransparentInterceptionProxyPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
     pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
+    pub classification: TransparentInterceptionClassificationPlan,
     pub selector_configured: bool,
     pub capability: EnforcementCapabilityStatusSnapshot,
     pub runtime_proxy: Option<TransparentProxyRuntimeSnapshot>,
@@ -156,6 +158,7 @@ fn enforcement_status_with_source(
             proxy: plan.enforcement.interception.proxy.clone(),
             nftables: plan.enforcement.interception.nftables.clone(),
             local_setup_projection: plan.enforcement.interception.local_setup_projection.clone(),
+            classification: plan.enforcement.interception.classification.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,
             capability: enforcement_capability_status(&plan.enforcement.interception.capability),
             runtime_proxy: transparent_proxy,
@@ -647,9 +650,11 @@ protective_actions = ["alert"]
         ));
         let plan = runtime_plan_from_config(
             config,
-            vec![probe_core::CapabilityState::available(
-                CapabilityKind::TransparentInterception,
-            )],
+            vec![
+                probe_core::CapabilityState::available(CapabilityKind::TransparentInterception),
+                runtime::PlatformProbeResults::default_transparent_process_classifier(),
+                runtime::PlatformProbeResults::default_transparent_flow_classifier(),
+            ],
         )?;
 
         let status = enforcement_status(&plan);
@@ -680,6 +685,22 @@ protective_actions = ["alert"]
                 capability: CapabilityKind::TransparentInterception,
                 mode: RuntimeMode::Available,
             }
+        );
+        assert_eq!(
+            status.interception.classification.process_classifier.kind,
+            CapabilityKind::TransparentProcessClassifier
+        );
+        assert_eq!(
+            status.interception.classification.process_classifier.mode,
+            RuntimeMode::Unavailable
+        );
+        assert_eq!(
+            status.interception.classification.flow_classifier.kind,
+            CapabilityKind::TransparentFlowClassifier
+        );
+        assert_eq!(
+            status.interception.classification.flow_classifier.mode,
+            RuntimeMode::Unavailable
         );
         let value = serde_json::to_value(&status)?;
         assert_eq!(value["interception"]["strategy"], json!("inbound_tproxy"));
@@ -712,6 +733,34 @@ protective_actions = ["alert"]
         assert_eq!(
             value["interception"]["local_setup_projection"]["kind"],
             json!("host_rules")
+        );
+        assert_eq!(
+            value["interception"]["classification"]["process_classifier"]["kind"],
+            json!("transparent_process_classifier")
+        );
+        assert_eq!(
+            value["interception"]["classification"]["process_classifier"]["mode"],
+            json!("unavailable")
+        );
+        assert_eq!(
+            value["interception"]["classification"]["process_classifier"]["reason"],
+            json!(
+                "transparent process classifier backend is not configured; process-scoped transparent interception requires cgroup/owner marking or proxy-side process classification"
+            )
+        );
+        assert_eq!(
+            value["interception"]["classification"]["flow_classifier"]["kind"],
+            json!("transparent_flow_classifier")
+        );
+        assert_eq!(
+            value["interception"]["classification"]["flow_classifier"]["mode"],
+            json!("unavailable")
+        );
+        assert_eq!(
+            value["interception"]["classification"]["flow_classifier"]["reason"],
+            json!(
+                "transparent flow classifier backend is not configured; any/not/ref transparent interception selectors require flow-aware classification before rule installation"
+            )
         );
         assert_eq!(
             value["interception"]["capability"]["capability"],

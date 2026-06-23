@@ -55,11 +55,11 @@ fn require_available(
     reason: impl Into<String>,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    if capabilities.mode(capability) != RuntimeMode::Available {
-        let reason = capabilities
-            .states()
-            .iter()
-            .find(|state| state.kind == capability)
+    let reported_capability = capabilities.reported_state(capability);
+    if reported_capability.map_or(RuntimeMode::Unavailable, |state| state.mode)
+        != RuntimeMode::Available
+    {
+        let reason = reported_capability
             .and_then(|state| state.reason.clone())
             .unwrap_or_else(|| reason.into());
         violations.push(ConfigViolation {
@@ -76,11 +76,11 @@ fn require_usable(
     reason: impl Into<String>,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    if capabilities.mode(capability) == RuntimeMode::Unavailable {
-        let reason = capabilities
-            .states()
-            .iter()
-            .find(|state| state.kind == capability)
+    let reported_capability = capabilities.reported_state(capability);
+    if reported_capability.map_or(RuntimeMode::Unavailable, |state| state.mode)
+        == RuntimeMode::Unavailable
+    {
+        let reason = reported_capability
             .and_then(|state| state.reason.clone())
             .unwrap_or_else(|| reason.into());
         violations.push(ConfigViolation {
