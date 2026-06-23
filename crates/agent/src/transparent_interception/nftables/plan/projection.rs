@@ -1,4 +1,7 @@
-use interception::{TransparentInterceptionHostRuleScope, TransparentInterceptionPortScope};
+use interception::{
+    TransparentInterceptionHostRuleScope, TransparentInterceptionPortScope,
+    TransparentInterceptionRemoteAddressScope,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NftSelectorProjection {
@@ -11,29 +14,14 @@ impl NftSelectorProjection {
     }
 
     pub(super) fn inbound_tproxy(scope: TransparentInterceptionHostRuleScope) -> Self {
-        let traffic_projection = NftTrafficProjection::from_host_rule_scope(&scope);
-        let mut rules = Vec::new();
-        let addresses = scope.remote_addresses();
-        match (addresses.ipv4().is_empty(), addresses.ipv6().is_empty()) {
-            (true, true) => {
-                rules.push(traffic_projection.rule(NftFamily::Ipv4, None));
-                rules.push(traffic_projection.rule(NftFamily::Ipv6, None));
-            }
-            (false, true) => rules.push(
-                traffic_projection.rule(NftFamily::Ipv4, Some(string_values(addresses.ipv4()))),
-            ),
-            (true, false) => rules.push(
-                traffic_projection.rule(NftFamily::Ipv6, Some(string_values(addresses.ipv6()))),
-            ),
-            (false, false) => {
-                rules.push(
-                    traffic_projection.rule(NftFamily::Ipv4, Some(string_values(addresses.ipv4()))),
-                );
-                rules.push(
-                    traffic_projection.rule(NftFamily::Ipv6, Some(string_values(addresses.ipv6()))),
-                );
-            }
-        }
+        let traffic_projection = NftTrafficProjection::inbound_tproxy(&scope);
+        let rules = rules_for_remote_addresses(traffic_projection, scope.remote_addresses());
+        Self { rules }
+    }
+
+    pub(super) fn outbound_redirect(scope: TransparentInterceptionHostRuleScope) -> Self {
+        let traffic_projection = NftTrafficProjection::outbound_redirect(&scope);
+        let rules = rules_for_remote_addresses(traffic_projection, scope.remote_addresses());
         Self { rules }
     }
 }
@@ -42,15 +30,27 @@ impl NftSelectorProjection {
 struct NftTrafficProjection {
     local_port_field: &'static str,
     remote_port_field: &'static str,
+    remote_address_side: NftAddressSide,
     local_ports: TransparentInterceptionPortScope,
     remote_ports: TransparentInterceptionPortScope,
 }
 
 impl NftTrafficProjection {
-    fn from_host_rule_scope(scope: &TransparentInterceptionHostRuleScope) -> Self {
+    fn inbound_tproxy(scope: &TransparentInterceptionHostRuleScope) -> Self {
         Self {
             local_port_field: "tcp dport",
             remote_port_field: "tcp sport",
+            remote_address_side: NftAddressSide::Source,
+            local_ports: scope.local_ports().clone(),
+            remote_ports: scope.remote_ports().clone(),
+        }
+    }
+
+    fn outbound_redirect(scope: &TransparentInterceptionHostRuleScope) -> Self {
+        Self {
+            local_port_field: "tcp sport",
+            remote_port_field: "tcp dport",
+            remote_address_side: NftAddressSide::Destination,
             local_ports: scope.local_ports().clone(),
             remote_ports: scope.remote_ports().clone(),
         }
@@ -93,8 +93,27 @@ impl NftRule {
     }
 
     fn remote_address_match_expression(&self, addresses: &[String]) -> String {
-        let field = format!("{} saddr", self.family.nft_address_family());
+        let field = format!(
+            "{} {}",
+            self.family.nft_address_family(),
+            self.traffic.remote_address_side.nft_field()
+        );
         format!("{field} {}", nft_set_or_value(addresses))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NftAddressSide {
+    Source,
+    Destination,
+}
+
+impl NftAddressSide {
+    fn nft_field(self) -> &'static str {
+        match self {
+            Self::Source => "saddr",
+            Self::Destination => "daddr",
+        }
     }
 }
 
@@ -126,6 +145,32 @@ fn port_match(field: &str, ports: &[u16]) -> String {
 
 fn string_values<T: ToString>(values: &[T]) -> Vec<String> {
     values.iter().map(ToString::to_string).collect()
+}
+
+fn rules_for_remote_addresses(
+    traffic_projection: NftTrafficProjection,
+    addresses: &TransparentInterceptionRemoteAddressScope,
+) -> Vec<NftRule> {
+    let mut rules = Vec::new();
+    match (addresses.ipv4().is_empty(), addresses.ipv6().is_empty()) {
+        (true, true) => {
+            rules.push(traffic_projection.rule(NftFamily::Ipv4, None));
+            rules.push(traffic_projection.rule(NftFamily::Ipv6, None));
+        }
+        (false, true) => rules
+            .push(traffic_projection.rule(NftFamily::Ipv4, Some(string_values(addresses.ipv4())))),
+        (true, false) => rules
+            .push(traffic_projection.rule(NftFamily::Ipv6, Some(string_values(addresses.ipv6())))),
+        (false, false) => {
+            rules.push(
+                traffic_projection.rule(NftFamily::Ipv4, Some(string_values(addresses.ipv4()))),
+            );
+            rules.push(
+                traffic_projection.rule(NftFamily::Ipv6, Some(string_values(addresses.ipv6()))),
+            );
+        }
+    }
+    rules
 }
 
 fn nft_set_or_value<T>(values: &[T]) -> String
@@ -207,6 +252,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn outbound_host_rule_scope_renders_destination_matches() {
+        let expressions = NftSelectorProjection::outbound_redirect(outbound_scope())
+            .into_rules()
+            .into_iter()
+            .map(|rule| rule.match_expression())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            expressions,
+            vec!["meta l4proto tcp meta nfproto ipv4 tcp dport 443 ip daddr 203.0.113.10",]
+        );
+    }
+
     fn match_expressions(scope: TransparentInterceptionHostRuleScope) -> Vec<String> {
         NftSelectorProjection::inbound_tproxy(scope)
             .into_rules()
@@ -233,5 +292,17 @@ mod tests {
             TransparentInterceptionRemoteAddressScope::new(ipv4, ipv6),
         )
         .expect("test scope should contain host-rule constraints")
+    }
+
+    fn outbound_scope() -> TransparentInterceptionHostRuleScope {
+        TransparentInterceptionHostRuleScope::new(
+            TransparentInterceptionPortScope::any(),
+            TransparentInterceptionPortScope::only(vec![443]),
+            TransparentInterceptionRemoteAddressScope::new(
+                vec![Ipv4Addr::new(203, 0, 113, 10)],
+                Vec::new(),
+            ),
+        )
+        .expect("test scope should contain outbound host-rule constraints")
     }
 }

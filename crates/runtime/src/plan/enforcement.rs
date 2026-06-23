@@ -18,7 +18,7 @@ const RESERVED_TRANSPARENT_INTERCEPTION_INBOUND_TPROXY_ROUTE_TABLE: u32 = 53_534
 const RESERVED_TRANSPARENT_INTERCEPTION_OUTBOUND_CHAIN: &str = "outbound_mitm";
 const TRANSPARENT_INTERCEPTION_OUTPUT_HOOK: &str = "output";
 const TRANSPARENT_INTERCEPTION_DSTNAT_PRIORITY: &str = "dstnat";
-const OUTBOUND_MITM_INSTALL_BLOCKED_REASON: &str = "outbound transparent MITM redirect install has Linux original-destination recovery and proxy pre-connect SO_MARK primitives, but requires wiring them into an executable output redirect lifecycle and MITM lifecycle";
+const OUTBOUND_MITM_INSTALL_BLOCKED_REASON: &str = "outbound transparent MITM redirect install has a typed redirect preview, Linux original-destination recovery and proxy pre-connect SO_MARK primitives, but requires wiring them into an executable output redirect lifecycle for activation/install and MITM lifecycle";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPlan {
@@ -361,6 +361,23 @@ pub enum TransparentInterceptionOutboundRedirectPlan {
 }
 
 impl TransparentInterceptionOutboundRedirectPlan {
+    fn planned_for_proxy_port(
+        proxy_port: NonZeroU16,
+        nftables: &TransparentInterceptionNftablesPlan,
+    ) -> Self {
+        Self::Planned {
+            table_name: nftables.table_name.clone(),
+            chain_name: RESERVED_TRANSPARENT_INTERCEPTION_OUTBOUND_CHAIN.to_string(),
+            hook: TRANSPARENT_INTERCEPTION_OUTPUT_HOOK.to_string(),
+            priority: TRANSPARENT_INTERCEPTION_DSTNAT_PRIORITY.to_string(),
+            proxy_port: proxy_port.get(),
+            proxy_bypass_mark: nftables.outbound_proxy_bypass_mark,
+            install: TransparentInterceptionOutboundRedirectInstallPlan::Blocked {
+                reason: OUTBOUND_MITM_INSTALL_BLOCKED_REASON.to_string(),
+            },
+        }
+    }
+
     fn from_intent(
         intent: &TransparentInterceptionProxyIntent,
         nftables: &TransparentInterceptionNftablesPlan,
@@ -368,17 +385,7 @@ impl TransparentInterceptionOutboundRedirectPlan {
         let TransparentInterceptionProxyIntent::OutboundMitm(proxy) = intent else {
             return Self::NotConfigured;
         };
-        Self::Planned {
-            table_name: nftables.table_name.clone(),
-            chain_name: RESERVED_TRANSPARENT_INTERCEPTION_OUTBOUND_CHAIN.to_string(),
-            hook: TRANSPARENT_INTERCEPTION_OUTPUT_HOOK.to_string(),
-            priority: TRANSPARENT_INTERCEPTION_DSTNAT_PRIORITY.to_string(),
-            proxy_port: proxy.listen_port().get(),
-            proxy_bypass_mark: nftables.outbound_proxy_bypass_mark,
-            install: TransparentInterceptionOutboundRedirectInstallPlan::Blocked {
-                reason: OUTBOUND_MITM_INSTALL_BLOCKED_REASON.to_string(),
-            },
-        }
+        Self::planned_for_proxy_port(proxy.listen_port(), nftables)
     }
 }
 

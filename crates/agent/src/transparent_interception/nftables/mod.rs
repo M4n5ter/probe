@@ -5,12 +5,14 @@ mod owner_lock;
 mod plan;
 mod probe;
 
-use ::runtime::TransparentInterceptionInboundTproxyPlan;
+use ::runtime::{
+    TransparentInterceptionInboundTproxyPlan, TransparentInterceptionOutboundRedirectPlan,
+};
 use interception::TransparentInterceptionHostRuleScope;
 
 use self::{
     command::{SystemIp, SystemNft},
-    plan::InboundTproxyLifecyclePlan,
+    plan::{InboundTproxyLifecyclePlan, OutboundRedirectLifecyclePlan},
     probe::{NftablesInterceptionProbe, NftablesInterceptionProbeResult},
 };
 use super::{TransparentInterceptionRuntime, proxy::TransparentProxyRuntime};
@@ -45,11 +47,24 @@ pub(super) fn resolve(
     }
 }
 
-pub(super) fn validate_effective_setup_scope(
+pub(super) fn validate_inbound_tproxy_setup_scope(
     inbound_plan: &TransparentInterceptionInboundTproxyPlan,
     setup_scope: &TransparentInterceptionHostRuleScope,
 ) -> Result<(), super::TransparentInterceptionError> {
     InboundTproxyLifecyclePlan::from_inbound_plan_and_scope(inbound_plan, setup_scope.clone())
         .map(|_| ())
         .map_err(|error| super::TransparentInterceptionError::Setup(error.to_string()))
+}
+
+pub(super) fn validate_outbound_redirect_setup_scope(
+    outbound_redirect: &TransparentInterceptionOutboundRedirectPlan,
+    setup_scope: &TransparentInterceptionHostRuleScope,
+) -> Result<(), super::TransparentInterceptionError> {
+    OutboundRedirectLifecyclePlan::from_redirect_plan_and_scope(
+        outbound_redirect,
+        setup_scope.clone(),
+    )
+    .map(|plan| plan.setup_nft_script())
+    .map_err(|error| super::TransparentInterceptionError::Setup(error.to_string()))
+    .map(|_| ())
 }

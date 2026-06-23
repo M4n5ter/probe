@@ -365,6 +365,7 @@ mod tests {
 
         let scope = crate::transparent_interception::effective_setup_scope(
             &execution_plan,
+            &::runtime::TransparentInterceptionOutboundRedirectPlan::NotConfigured,
             &degraded_process_classifier(),
             &mut classifier,
             selectors,
