@@ -24,7 +24,10 @@ use super::{
         run_target_lifecycle as run_tls_plaintext_target_lifecycle_loopback,
     },
     tls_plaintext_provider_loopback::run as run_tls_plaintext_provider_loopback,
-    transparent_tproxy_loopback::run as run_transparent_tproxy_loopback,
+    transparent_tproxy_loopback::{
+        run as run_transparent_tproxy_loopback,
+        run_process_scoped as run_transparent_tproxy_process_loopback,
+    },
     webhook_exporter::run as run_webhook_exporter,
     websocket_plaintext_feed::run as run_websocket_plaintext_feed,
 };
@@ -269,7 +272,7 @@ enum E2eProfileId {
     LiveCore,
     ProcessEbpf,
     TlsPlaintext,
-    HostRules,
+    TransparentInterception,
 }
 
 const E2E_CASES: &[E2eCase] = &[
@@ -368,6 +371,11 @@ const E2E_CASES: &[E2eCase] = &[
         requirement: E2eRequirement::RootNetAdmin,
         run: run_transparent_tproxy_loopback,
     },
+    E2eCase {
+        name: "e2e-transparent-tproxy-process-loopback",
+        requirement: E2eRequirement::RootNetAdmin,
+        run: run_transparent_tproxy_process_loopback,
+    },
 ];
 
 const E2E_PROFILES: &[E2eProfile] = &[
@@ -416,10 +424,13 @@ const E2E_PROFILES: &[E2eProfile] = &[
         ],
     },
     E2eProfile {
-        id: E2eProfileId::HostRules,
-        name: "host-rules",
-        description: "root/net-admin transparent interception host rule suite",
-        cases: &["e2e-transparent-tproxy-loopback"],
+        id: E2eProfileId::TransparentInterception,
+        name: "transparent-interception",
+        description: "root/net-admin transparent interception suite",
+        cases: &[
+            "e2e-transparent-tproxy-loopback",
+            "e2e-transparent-tproxy-process-loopback",
+        ],
     },
 ];
 
@@ -671,10 +682,13 @@ mod tests {
             ],
         },
         ExpectedProfile {
-            name: "host-rules",
+            name: "transparent-interception",
             requirements: "root/net-admin",
-            description: "root/net-admin transparent interception host rule suite",
-            cases: &["e2e-transparent-tproxy-loopback"],
+            description: "root/net-admin transparent interception suite",
+            cases: &[
+                "e2e-transparent-tproxy-loopback",
+                "e2e-transparent-tproxy-process-loopback",
+            ],
         },
     ];
 
@@ -736,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_profiles_select_expected_cases() {
+    fn named_profiles_select_expected_cases() {
         for profile in EXPECTED_PROFILES {
             let profile_id = profile_id_by_name(profile.name).expect("known profile");
 
@@ -810,7 +824,7 @@ mod tests {
         for case in E2E_CASES {
             assert!(
                 covered_case_names.contains(case.name),
-                "registered case {} is not covered by any stable profile",
+                "registered case {} is not covered by any named profile",
                 case.name
             );
         }
