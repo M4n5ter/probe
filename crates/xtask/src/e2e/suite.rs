@@ -263,7 +263,13 @@ struct E2eProfile {
     id: E2eProfileId,
     name: &'static str,
     description: &'static str,
-    cases: &'static [&'static str],
+    cases: E2eProfileCases,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum E2eProfileCases {
+    Named(&'static [&'static str]),
+    AllRegistered,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -273,6 +279,7 @@ enum E2eProfileId {
     ProcessEbpf,
     TlsPlaintext,
     TransparentInterception,
+    Product,
 }
 
 const E2E_CASES: &[E2eCase] = &[
@@ -383,19 +390,19 @@ const E2E_PROFILES: &[E2eProfile] = &[
         id: E2eProfileId::Baseline,
         name: "baseline",
         description: "non-privileged replay/plaintext/export/policy regression suite",
-        cases: &[
+        cases: E2eProfileCases::Named(&[
             "e2e-plaintext-feed",
             "e2e-websocket-plaintext-feed",
             "e2e-webhook-exporter",
             "e2e-file-exporter",
             "e2e-remote-enforcement-policy",
-        ],
+        ]),
     },
     E2eProfile {
         id: E2eProfileId::LiveCore,
         name: "live-core",
         description: "root/CAP_NET_RAW live libpcap, admin reload, and TLS material suite",
-        cases: &[
+        cases: E2eProfileCases::Named(&[
             "e2e-libpcap-loopback",
             "e2e-admin-policy-reload",
             "e2e-admin-enforcement-reload",
@@ -403,41 +410,47 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-tls-session-secret-material-refresh-auto-binding-loopback",
             "e2e-tls-keylog-auto-binding-loopback",
             "e2e-tls-keylog-material-refresh-auto-binding-loopback",
-        ],
+        ]),
     },
     E2eProfile {
         id: E2eProfileId::ProcessEbpf,
         name: "process-ebpf",
         description: "root/bpffs eBPF process observation suite",
-        cases: &["e2e-ebpf-process-loopback"],
+        cases: E2eProfileCases::Named(&["e2e-ebpf-process-loopback"]),
     },
     E2eProfile {
         id: E2eProfileId::TlsPlaintext,
         name: "tls-plaintext",
         description: "root/bpffs libssl plaintext instrumentation lifecycle suite",
-        cases: &[
+        cases: E2eProfileCases::Named(&[
             "e2e-tls-plaintext-provider-loopback",
             "e2e-tls-plaintext-loopback",
             "e2e-tls-plaintext-dynamic-loopback",
             "e2e-tls-plaintext-target-lifecycle-loopback",
             "e2e-tls-plaintext-dynamic-library-loopback",
-        ],
+        ]),
     },
     E2eProfile {
         id: E2eProfileId::TransparentInterception,
         name: "transparent-interception",
         description: "root/net-admin transparent interception suite",
-        cases: &[
+        cases: E2eProfileCases::Named(&[
             "e2e-transparent-tproxy-loopback",
             "e2e-transparent-tproxy-process-loopback",
-        ],
+        ]),
+    },
+    E2eProfile {
+        id: E2eProfileId::Product,
+        name: "product",
+        description: "full product capability suite across replay, live capture, eBPF, TLS, and transparent interception",
+        cases: E2eProfileCases::AllRegistered,
     },
 ];
 
 fn select_cases(selection: &SuiteSelection) -> Result<Vec<&'static E2eCase>, String> {
     match selection {
         SuiteSelection::Default => select_profile_cases(E2eProfileId::Baseline),
-        SuiteSelection::IncludePrivileged => Ok(E2E_CASES.iter().collect()),
+        SuiteSelection::IncludePrivileged => select_profile_cases(E2eProfileId::Product),
         SuiteSelection::OnlyPrivileged => Ok(E2E_CASES
             .iter()
             .filter(|case| case.requirement.is_privileged())
@@ -473,22 +486,32 @@ fn select_profile_cases(profile_id: E2eProfileId) -> Result<Vec<&'static E2eCase
     let Some(profile) = E2E_PROFILES.iter().find(|profile| profile.id == profile_id) else {
         return Err(format!("unregistered e2e profile `{profile_id:?}`"));
     };
-    let selected = profile
-        .cases
-        .iter()
-        .map(|name| {
-            case_by_name(name).ok_or_else(|| {
-                format!(
-                    "e2e profile `{}` references unknown case `{name}`",
-                    profile.name
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let selected = profile.cases.select(profile.name)?;
     if selected.is_empty() {
         return Err(format!("e2e profile `{}` selected no cases", profile.name));
     }
     Ok(selected)
+}
+
+impl E2eProfileCases {
+    fn select(self, profile_name: &str) -> Result<Vec<&'static E2eCase>, String> {
+        match self {
+            Self::Named(names) => names
+                .iter()
+                .map(|name| {
+                    case_by_name(name).ok_or_else(|| {
+                        format!("e2e profile `{profile_name}` references unknown case `{name}`")
+                    })
+                })
+                .collect(),
+            Self::AllRegistered => Ok(E2E_CASES.iter().collect()),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_aggregate(self) -> bool {
+        matches!(self, Self::AllRegistered)
+    }
 }
 
 fn run_cases(cases: Vec<&'static E2eCase>) -> ExitCode {
@@ -633,7 +656,23 @@ mod tests {
         name: &'static str,
         requirements: &'static str,
         description: &'static str,
-        cases: &'static [&'static str],
+        cases: ExpectedProfileCases,
+    }
+
+    enum ExpectedProfileCases {
+        Named(&'static [&'static str]),
+        AllRegistered,
+    }
+
+    impl ExpectedProfile {
+        fn case_names(&self) -> Vec<&'static str> {
+            match self.cases {
+                ExpectedProfileCases::Named(cases) => cases.to_vec(),
+                ExpectedProfileCases::AllRegistered => {
+                    E2E_CASES.iter().map(|case| case.name).collect()
+                }
+            }
+        }
     }
 
     const EXPECTED_PROFILES: &[ExpectedProfile] = &[
@@ -641,19 +680,19 @@ mod tests {
             name: "baseline",
             requirements: "user",
             description: "non-privileged replay/plaintext/export/policy regression suite",
-            cases: &[
+            cases: ExpectedProfileCases::Named(&[
                 "e2e-plaintext-feed",
                 "e2e-websocket-plaintext-feed",
                 "e2e-webhook-exporter",
                 "e2e-file-exporter",
                 "e2e-remote-enforcement-policy",
-            ],
+            ]),
         },
         ExpectedProfile {
             name: "live-core",
             requirements: "root/CAP_NET_RAW",
             description: "root/CAP_NET_RAW live libpcap, admin reload, and TLS material suite",
-            cases: &[
+            cases: ExpectedProfileCases::Named(&[
                 "e2e-libpcap-loopback",
                 "e2e-admin-policy-reload",
                 "e2e-admin-enforcement-reload",
@@ -661,34 +700,40 @@ mod tests {
                 "e2e-tls-session-secret-material-refresh-auto-binding-loopback",
                 "e2e-tls-keylog-auto-binding-loopback",
                 "e2e-tls-keylog-material-refresh-auto-binding-loopback",
-            ],
+            ]),
         },
         ExpectedProfile {
             name: "process-ebpf",
             requirements: "root/bpffs",
             description: "root/bpffs eBPF process observation suite",
-            cases: &["e2e-ebpf-process-loopback"],
+            cases: ExpectedProfileCases::Named(&["e2e-ebpf-process-loopback"]),
         },
         ExpectedProfile {
             name: "tls-plaintext",
             requirements: "root/bpffs",
             description: "root/bpffs libssl plaintext instrumentation lifecycle suite",
-            cases: &[
+            cases: ExpectedProfileCases::Named(&[
                 "e2e-tls-plaintext-provider-loopback",
                 "e2e-tls-plaintext-loopback",
                 "e2e-tls-plaintext-dynamic-loopback",
                 "e2e-tls-plaintext-target-lifecycle-loopback",
                 "e2e-tls-plaintext-dynamic-library-loopback",
-            ],
+            ]),
         },
         ExpectedProfile {
             name: "transparent-interception",
             requirements: "root/net-admin",
             description: "root/net-admin transparent interception suite",
-            cases: &[
+            cases: ExpectedProfileCases::Named(&[
                 "e2e-transparent-tproxy-loopback",
                 "e2e-transparent-tproxy-process-loopback",
-            ],
+            ]),
+        },
+        ExpectedProfile {
+            name: "product",
+            requirements: "user,root/CAP_NET_RAW,root/bpffs,root/net-admin",
+            description: "full product capability suite across replay, live capture, eBPF, TLS, and transparent interception",
+            cases: ExpectedProfileCases::AllRegistered,
         },
     ];
 
@@ -713,6 +758,17 @@ mod tests {
         let selected = select_cases(&selection).expect("include-privileged suite selection");
 
         assert_eq!(selected.len(), E2E_CASES.len());
+    }
+
+    #[test]
+    fn include_privileged_selection_matches_product_profile() {
+        let include_privileged = parse_selection(&["--include-privileged"]);
+        let product = parse_selection(&["--profile", "product"]);
+
+        assert_eq!(
+            selected_names(&include_privileged),
+            selected_names(&product)
+        );
     }
 
     #[test]
@@ -756,7 +812,7 @@ mod tests {
 
             assert_eq!(
                 selected_names(&SuiteSelection::Profile(profile_id)),
-                profile.cases.to_vec(),
+                profile.case_names(),
                 "{}",
                 profile.name
             );
@@ -800,10 +856,11 @@ mod tests {
                 "duplicate profile id {:?}",
                 profile.id
             );
-            assert!(!profile.cases.is_empty(), "empty profile {}", profile.name);
+            let selected = select_profile_cases(profile.id).expect("profile should resolve cases");
+            assert!(!selected.is_empty(), "empty profile {}", profile.name);
 
             let mut profile_case_names = BTreeSet::new();
-            for case_name in profile.cases {
+            for case_name in selected.iter().map(|case| case.name) {
                 assert!(
                     profile_case_names.insert(case_name),
                     "duplicate case {case_name} in profile {}",
@@ -817,14 +874,20 @@ mod tests {
             }
         }
 
-        let covered_case_names = E2E_PROFILES
+        let curated_profile_case_names = E2E_PROFILES
             .iter()
-            .flat_map(|profile| profile.cases.iter().copied())
+            .filter(|profile| !profile.cases.is_aggregate())
+            .flat_map(|profile| {
+                select_profile_cases(profile.id)
+                    .expect("profile should resolve cases")
+                    .into_iter()
+                    .map(|case| case.name)
+            })
             .collect::<BTreeSet<_>>();
         for case in E2E_CASES {
             assert!(
-                covered_case_names.contains(case.name),
-                "registered case {} is not covered by any named profile",
+                curated_profile_case_names.contains(case.name),
+                "registered case {} is not covered by any curated profile",
                 case.name
             );
         }
@@ -839,7 +902,7 @@ mod tests {
                 name: profile.name,
                 requirements: profile.requirements.to_string(),
                 description: profile.description,
-                case_names: profile.cases.to_vec(),
+                case_names: profile.case_names(),
             })
             .collect::<Vec<_>>();
 
