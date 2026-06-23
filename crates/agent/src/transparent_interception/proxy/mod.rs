@@ -4,6 +4,7 @@ mod listener;
 mod registry;
 mod relay;
 mod state;
+mod target;
 
 use std::{
     net::IpAddr,
@@ -206,6 +207,11 @@ fn proxy_io_error(
 
 fn proxy_error(message: impl Into<String>) -> TransparentInterceptionError {
     TransparentInterceptionError::Proxy(message.into())
+}
+
+pub(in crate::transparent_interception) fn outbound_original_destination_recovery_name()
+-> &'static str {
+    target::TransparentProxyTargetRecovery::LinuxOriginalDestination.description()
 }
 
 #[cfg(test)]

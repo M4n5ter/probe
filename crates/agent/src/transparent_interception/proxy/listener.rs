@@ -12,7 +12,10 @@ use std::{
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use super::{
-    proxy_io_error, registry::RelayRegistry, relay::spawn_relay, state::TransparentProxyRuntime,
+    proxy_io_error,
+    registry::RelayRegistry,
+    relay::{TransparentProxyRelayContext, spawn_relay},
+    state::TransparentProxyRuntime,
 };
 use crate::transparent_interception::{
     TransparentInterceptionError, TransparentInterceptionIpFamily,
@@ -58,7 +61,7 @@ pub(super) fn start_listeners(
                 listener_loop(
                     listener,
                     family,
-                    listen_port,
+                    TransparentProxyRelayContext::inbound_tproxy(listen_port),
                     shutdown,
                     relay_registry,
                     proxy_runtime,
@@ -127,7 +130,7 @@ fn transparent_listener(
 fn listener_loop(
     listener: Socket,
     family: TransparentInterceptionIpFamily,
-    listen_port: u16,
+    context: TransparentProxyRelayContext,
     shutdown_requested: Arc<AtomicBool>,
     relay_registry: RelayRegistry,
     runtime: TransparentProxyRuntime,
@@ -142,7 +145,7 @@ fn listener_loop(
                     relay_threads.push(spawn_relay(
                         accepted,
                         peer,
-                        listen_port,
+                        context,
                         Arc::clone(&shutdown_requested),
                         relay_registry.clone(),
                         slot,

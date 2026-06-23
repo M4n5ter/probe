@@ -630,7 +630,7 @@ protective_actions = ["alert"]
         assert!(
             value["enforcement"]["composition"]["reason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("original-destination recovery"))
+                .is_some_and(|reason| reason.contains("output redirect lifecycle"))
         );
         assert_eq!(
             value["enforcement"]["interception"]["local_setup_projection"]["kind"],
@@ -691,7 +691,7 @@ protective_actions = ["alert"]
         assert!(
             value["enforcement"]["composition"]["reason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("original-destination recovery"))
+                .is_some_and(|reason| reason.contains("output redirect lifecycle"))
         );
         assert_eq!(
             value["enforcement"]["interception"]["local_setup_projection"]["kind"],

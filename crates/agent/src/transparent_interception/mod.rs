@@ -24,7 +24,6 @@ pub(crate) use proxy::{
 };
 pub(crate) use runtime::{TransparentInterceptionGuard, TransparentInterceptionRuntime};
 
-const OUTBOUND_MITM_UNAVAILABLE: &str = "outbound transparent MITM has a typed redirect plan, but requires proxy self-bypass, original-destination recovery, and MITM lifecycle before rules can be installed";
 const MISSING_LOCAL_SETUP_SELECTOR: &str =
     "transparent interception requires an explicit local selector for setup-time rules";
 
@@ -49,7 +48,7 @@ pub(crate) fn resolve(
             nftables::resolve(inbound_plan, proxy_runtime)
         }
         TransparentInterceptionExecutionPlan::OutboundMitm(_) => {
-            TransparentInterceptionRuntime::unavailable(OUTBOUND_MITM_UNAVAILABLE, proxy_runtime)
+            TransparentInterceptionRuntime::unavailable(outbound_mitm_unavailable(), proxy_runtime)
         }
     }
 }
@@ -65,7 +64,7 @@ pub(crate) fn effective_setup_scope(
     }
     let TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) = execution_plan else {
         return Err(TransparentInterceptionError::Setup(
-            OUTBOUND_MITM_UNAVAILABLE.to_string(),
+            outbound_mitm_unavailable(),
         ));
     };
     if selectors.local_config_scope().is_none() {
@@ -83,6 +82,13 @@ pub(crate) fn effective_setup_scope(
     )?;
     nftables::validate_effective_setup_scope(inbound_plan, &scope)?;
     Ok(Some(scope))
+}
+
+fn outbound_mitm_unavailable() -> String {
+    format!(
+        "outbound transparent MITM has a typed redirect plan and existing {}, but requires proxy self-bypass socket marking, output redirect lifecycle, and MITM lifecycle before rules can be installed",
+        proxy::outbound_original_destination_recovery_name()
+    )
 }
 
 fn validate_local_setup_plan(

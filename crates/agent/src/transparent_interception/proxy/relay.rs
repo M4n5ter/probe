@@ -16,6 +16,7 @@ use super::{
     proxy_error, proxy_io_error,
     registry::{RelayRegistry, RelaySlot, shutdown_streams},
     state::TransparentProxyRuntime,
+    target::TransparentProxyTargetRecovery,
 };
 use crate::transparent_interception::TransparentInterceptionError;
 
@@ -24,7 +25,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) fn spawn_relay(
     accepted: Socket,
     peer: SockAddr,
-    listen_port: u16,
+    context: TransparentProxyRelayContext,
     shutdown_requested: Arc<AtomicBool>,
     relays: RelayRegistry,
     slot: RelaySlot,
@@ -34,7 +35,7 @@ pub(super) fn spawn_relay(
         if let Err(error) = relay_connection(
             accepted,
             peer,
-            listen_port,
+            context,
             shutdown_requested,
             relays,
             slot,
@@ -53,7 +54,7 @@ pub(super) fn spawn_relay(
 fn relay_connection(
     accepted: Socket,
     peer: SockAddr,
-    listen_port: u16,
+    context: TransparentProxyRelayContext,
     shutdown_requested: Arc<AtomicBool>,
     relays: RelayRegistry,
     _slot: RelaySlot,
@@ -63,8 +64,11 @@ fn relay_connection(
         .as_socket()
         .ok_or_else(|| proxy_error("transparent proxy accepted non-IP peer address"))
         .map_err(RelayConnectionError::relay)?;
-    let target = tproxy_target(&accepted).map_err(RelayConnectionError::relay)?;
-    if target.port() == listen_port {
+    let target = context
+        .target_recovery
+        .recover(&accepted)
+        .map_err(RelayConnectionError::relay)?;
+    if context.self_relay_guard.is_self_relay(target) {
         return Err(RelayConnectionError::relay(proxy_error(format!(
             "refusing transparent proxy self-relay for peer {peer} target {target}"
         ))));
@@ -88,6 +92,34 @@ fn relay_connection(
         shutdown_streams(&downstream, &upstream);
     }
     relay_bidirectional(downstream, upstream).map_err(RelayConnectionError::relay)
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TransparentProxyRelayContext {
+    target_recovery: TransparentProxyTargetRecovery,
+    self_relay_guard: TransparentProxySelfRelayGuard,
+}
+
+impl TransparentProxyRelayContext {
+    pub(super) fn inbound_tproxy(listen_port: u16) -> Self {
+        Self {
+            target_recovery: TransparentProxyTargetRecovery::TproxyLocalAddress,
+            self_relay_guard: TransparentProxySelfRelayGuard::RejectSamePort { listen_port },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum TransparentProxySelfRelayGuard {
+    RejectSamePort { listen_port: u16 },
+}
+
+impl TransparentProxySelfRelayGuard {
+    fn is_self_relay(self, target: SocketAddr) -> bool {
+        match self {
+            Self::RejectSamePort { listen_port } => target.port() == listen_port,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -140,14 +172,6 @@ fn connect_upstream_for_relay(
             ))(error))
         }
     }
-}
-
-fn tproxy_target(socket: &Socket) -> Result<SocketAddr, TransparentInterceptionError> {
-    socket
-        .local_addr()
-        .map_err(proxy_io_error("read transparent socket local address"))?
-        .as_socket()
-        .ok_or_else(|| proxy_error("transparent socket local address is not an IP socket"))
 }
 
 fn relay_bidirectional(
@@ -379,7 +403,7 @@ mod tests {
         let relay = spawn_relay(
             Socket::from(downstream),
             SockAddr::from(peer),
-            0,
+            TransparentProxyRelayContext::inbound_tproxy(0),
             shutdown_requested,
             registry,
             slot,

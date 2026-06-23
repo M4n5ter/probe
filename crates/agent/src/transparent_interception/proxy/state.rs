@@ -409,35 +409,38 @@ mod tests {
 
     #[test]
     fn runtime_mode_follows_interception_config() {
-        assert_eq!(
+        let disabled =
             TransparentProxyRuntime::for_test_config(&EnforcementInterceptionConfig::default())
                 .handle()
-                .snapshot()
-                .mode,
-            TransparentProxyRuntimeMode::Disabled
-        );
+                .snapshot();
+        assert_eq!(disabled.mode, TransparentProxyRuntimeMode::Disabled);
 
-        assert_eq!(
-            TransparentProxyRuntime::for_test_config(&interception_config(
-                TransparentInterceptionStrategyConfig::InboundTproxy,
-                TransparentInterceptionProxyModeConfig::External,
-            ))
-            .handle()
-            .snapshot()
-            .mode,
-            TransparentProxyRuntimeMode::External
-        );
+        let inbound_external = TransparentProxyRuntime::for_test_config(&interception_config(
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+            TransparentInterceptionProxyModeConfig::External,
+        ))
+        .handle()
+        .snapshot();
+        assert_eq!(inbound_external.mode, TransparentProxyRuntimeMode::External);
 
+        let inbound_managed = TransparentProxyRuntime::for_test_config(&interception_config(
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+            TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+        ))
+        .handle()
+        .snapshot();
         assert_eq!(
-            TransparentProxyRuntime::for_test_config(&interception_config(
-                TransparentInterceptionStrategyConfig::InboundTproxy,
-                TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
-            ))
-            .handle()
-            .snapshot()
-            .mode,
+            inbound_managed.mode,
             TransparentProxyRuntimeMode::Configured
         );
+
+        let outbound_mitm = TransparentProxyRuntime::for_test_config(&interception_config(
+            TransparentInterceptionStrategyConfig::OutboundMitm,
+            TransparentInterceptionProxyModeConfig::External,
+        ))
+        .handle()
+        .snapshot();
+        assert_eq!(outbound_mitm.mode, TransparentProxyRuntimeMode::External);
     }
 
     #[test]

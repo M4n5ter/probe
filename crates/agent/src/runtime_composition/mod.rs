@@ -192,7 +192,7 @@ mod tests {
         };
         let runtime::TransparentInterceptionOutboundRedirectInstallPlan::Blocked { reason } =
             install;
-        assert!(reason.contains("original-destination recovery"));
+        assert!(reason.contains("output redirect lifecycle"));
     }
 
     #[test]

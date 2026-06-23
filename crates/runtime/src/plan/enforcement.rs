@@ -17,7 +17,7 @@ const RESERVED_TRANSPARENT_INTERCEPTION_ROUTE_TABLE: u32 = 53_534;
 const RESERVED_TRANSPARENT_INTERCEPTION_OUTBOUND_CHAIN: &str = "outbound_mitm";
 const TRANSPARENT_INTERCEPTION_OUTPUT_HOOK: &str = "output";
 const TRANSPARENT_INTERCEPTION_DSTNAT_PRIORITY: &str = "dstnat";
-const OUTBOUND_MITM_INSTALL_BLOCKED_REASON: &str = "outbound transparent MITM redirect install requires proxy self-bypass socket marking, original-destination recovery, and MITM lifecycle";
+const OUTBOUND_MITM_INSTALL_BLOCKED_REASON: &str = "outbound transparent MITM redirect install has an existing Linux original-destination resolver primitive, but requires proxy self-bypass socket marking, output redirect lifecycle, and MITM lifecycle";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPlan {

@@ -837,7 +837,7 @@ protective_actions = ["alert"]
         assert!(
             value["interception"]["outbound_redirect"]["install"]["reason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("original-destination recovery"))
+                .is_some_and(|reason| reason.contains("output redirect lifecycle"))
         );
         Ok(())
     }
