@@ -633,7 +633,7 @@ protective_actions = ["alert"]
         assert_eq!(
             value["enforcement"]["interception"]["classification"]["flow_classifier"]["reason"],
             json!(
-                "transparent flow classifier backend is not configured; any/not/ref transparent interception selectors require flow-aware classification before rule installation"
+                "transparent flow classifier backend is not configured; not/ref transparent interception selectors and any selectors that cannot be represented as one setup-time host-rule scope require flow-aware classification before rule installation"
             )
         );
         assert_eq!(
@@ -653,7 +653,7 @@ protective_actions = ["alert"]
         assert_eq!(
             plan_capability(&value, "transparent_flow_classifier")["reason"],
             json!(
-                "transparent flow classifier backend is not configured; any/not/ref transparent interception selectors require flow-aware classification before rule installation"
+                "transparent flow classifier backend is not configured; not/ref transparent interception selectors and any selectors that cannot be represented as one setup-time host-rule scope require flow-aware classification before rule installation"
             )
         );
         assert_eq!(

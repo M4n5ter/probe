@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn any_selector_reports_flow_classifier_requirement() {
+    fn any_selector_projects_single_host_rule_dimension() {
         let scope = scope_for(
             TransparentInterceptionStrategyConfig::InboundTproxy,
             Selector::Any {
@@ -460,6 +460,10 @@ mod tests {
                         ProcessSelector::default(),
                         TrafficSelector {
                             local_ports: vec![8443],
+                            remote_addresses: vec![
+                                "203.0.113.10".to_string(),
+                                "203.0.113.20".to_string(),
+                            ],
                             ..TrafficSelector::default()
                         },
                     ),
@@ -467,6 +471,54 @@ mod tests {
                         ProcessSelector::default(),
                         TrafficSelector {
                             local_ports: vec![9443],
+                            remote_addresses: vec![
+                                "203.0.113.20".to_string(),
+                                "203.0.113.10".to_string(),
+                            ],
+                            ..TrafficSelector::default()
+                        },
+                    ),
+                ],
+            },
+        );
+
+        let TransparentInterceptionLocalSetupProjectionPlan::HostRules { scope } = scope else {
+            panic!("single-dimension any selector should report host rules");
+        };
+        assert_eq!(
+            scope.local_ports,
+            TransparentInterceptionProjectedPortScopePlan::Only {
+                ports: vec![8443, 9443]
+            }
+        );
+        assert_eq!(
+            scope.remote_addresses.ipv4,
+            [
+                Ipv4Addr::new(203, 0, 113, 10),
+                Ipv4Addr::new(203, 0, 113, 20)
+            ]
+        );
+    }
+
+    #[test]
+    fn any_selector_with_cross_product_risk_reports_flow_classifier_requirement() {
+        let scope = scope_for(
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+            Selector::Any {
+                selectors: vec![
+                    Selector::term(
+                        ProcessSelector::default(),
+                        TrafficSelector {
+                            local_ports: vec![8443],
+                            remote_addresses: vec!["203.0.113.10".to_string()],
+                            ..TrafficSelector::default()
+                        },
+                    ),
+                    Selector::term(
+                        ProcessSelector::default(),
+                        TrafficSelector {
+                            local_ports: vec![9443],
+                            remote_addresses: vec!["203.0.113.20".to_string()],
                             ..TrafficSelector::default()
                         },
                     ),
@@ -480,7 +532,7 @@ mod tests {
             ..
         } = scope
         else {
-            panic!("any selector should require flow classifier");
+            panic!("cross-product any selector should require flow classifier");
         };
         assert!(matches!(
             flow_scope.selector,
@@ -507,13 +559,24 @@ mod tests {
                         },
                     ),
                     Selector::Any {
-                        selectors: vec![Selector::term(
-                            ProcessSelector::default(),
-                            TrafficSelector {
-                                remote_ports: vec![443],
-                                ..TrafficSelector::default()
-                            },
-                        )],
+                        selectors: vec![
+                            Selector::term(
+                                ProcessSelector::default(),
+                                TrafficSelector {
+                                    remote_ports: vec![443],
+                                    remote_addresses: vec!["203.0.113.10".to_string()],
+                                    ..TrafficSelector::default()
+                                },
+                            ),
+                            Selector::term(
+                                ProcessSelector::default(),
+                                TrafficSelector {
+                                    remote_ports: vec![444],
+                                    remote_addresses: vec!["203.0.113.20".to_string()],
+                                    ..TrafficSelector::default()
+                                },
+                            ),
+                        ],
                     },
                 ],
             },
@@ -550,6 +613,36 @@ mod tests {
                     ..TrafficSelector::default()
                 },
             ),
+        );
+
+        assert!(matches!(
+            scope,
+            TransparentInterceptionLocalSetupProjectionPlan::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn any_selector_with_wrong_direction_is_unsupported() {
+        let scope = scope_for(
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+            Selector::Any {
+                selectors: vec![
+                    Selector::term(
+                        ProcessSelector {
+                            names: vec!["curl".to_string()],
+                            ..ProcessSelector::default()
+                        },
+                        TrafficSelector {
+                            local_ports: vec![8443],
+                            directions: vec![Direction::Outbound],
+                            ..TrafficSelector::default()
+                        },
+                    ),
+                    Selector::Ref {
+                        name: "external".to_string(),
+                    },
+                ],
+            },
         );
 
         assert!(matches!(

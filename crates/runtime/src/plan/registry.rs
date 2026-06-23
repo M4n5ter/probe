@@ -43,7 +43,7 @@ impl PlatformProbeResults {
     pub fn default_transparent_flow_classifier() -> CapabilityState {
         CapabilityState::unavailable(
             CapabilityKind::TransparentFlowClassifier,
-            "transparent flow classifier backend is not configured; any/not/ref transparent interception selectors require flow-aware classification before rule installation",
+            "transparent flow classifier backend is not configured; not/ref transparent interception selectors and any selectors that cannot be represented as one setup-time host-rule scope require flow-aware classification before rule installation",
         )
     }
 }

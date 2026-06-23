@@ -1,6 +1,6 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use probe_core::{ProcessSelector, Selector, TrafficSelector};
+use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +128,29 @@ impl TransparentInterceptionHostRuleScope {
     pub fn remote_addresses(&self) -> &TransparentInterceptionRemoteAddressScope {
         &self.remote_addresses
     }
+
+    pub(crate) fn to_inbound_traffic_selector(&self) -> TrafficSelector {
+        TrafficSelector {
+            local_ports: self.local_ports.traffic_selector_values(),
+            remote_ports: self.remote_ports.traffic_selector_values(),
+            directions: vec![Direction::Inbound],
+            remote_addresses: self.remote_addresses.traffic_selector_values(),
+        }
+    }
+
+    pub(crate) fn union_without_expansion(scopes: &[Self]) -> Option<Self> {
+        if scopes.is_empty() || host_rule_scope_varying_dimensions(scopes) > 1 {
+            return None;
+        }
+        Some(
+            Self::new(
+                union_port_scopes(scopes.iter().map(Self::local_ports)),
+                union_port_scopes(scopes.iter().map(Self::remote_ports)),
+                union_remote_address_scopes(scopes.iter().map(Self::remote_addresses)),
+            )
+            .expect("union of constrained host-rule scopes should remain constrained"),
+        )
+    }
 }
 
 impl TransparentInterceptionProcessScope {
@@ -252,6 +275,19 @@ impl TransparentInterceptionPortScope {
             TransparentInterceptionPortScopeKind::Only(ports) => ports.contains(&port),
         }
     }
+
+    fn equivalent_to(&self, other: &Self) -> bool {
+        match (self.only_values(), other.only_values()) {
+            (None, None) => true,
+            (Some(left), Some(right)) => same_values(left, right),
+            _ => false,
+        }
+    }
+
+    fn traffic_selector_values(&self) -> Vec<u16> {
+        self.only_values()
+            .map_or_else(Vec::new, |ports| ports.to_vec())
+    }
 }
 
 impl TransparentInterceptionRemoteAddressScope {
@@ -274,6 +310,20 @@ impl TransparentInterceptionRemoteAddressScope {
     pub fn ipv6(&self) -> &[Ipv6Addr] {
         &self.ipv6
     }
+
+    fn equivalent_to(&self, other: &Self) -> bool {
+        same_values(&self.ipv4, &other.ipv4) && same_values(&self.ipv6, &other.ipv6)
+    }
+
+    fn traffic_selector_values(&self) -> Vec<String> {
+        self.ipv4
+            .iter()
+            .copied()
+            .map(IpAddr::V4)
+            .chain(self.ipv6.iter().copied().map(IpAddr::V6))
+            .map(|address| address.to_string())
+            .collect()
+    }
 }
 
 pub(crate) fn process_selector_has_constraints(process: &ProcessSelector) -> bool {
@@ -283,4 +333,76 @@ pub(crate) fn process_selector_has_constraints(process: &ProcessSelector) -> boo
         || !process.cmdline_regexes.is_empty()
         || !process.systemd_services.is_empty()
         || !process.container_ids.is_empty()
+}
+
+fn host_rule_scope_varying_dimensions(scopes: &[TransparentInterceptionHostRuleScope]) -> u8 {
+    [
+        all_equivalent_by(scopes, |left, right| {
+            left.local_ports.equivalent_to(&right.local_ports)
+        }),
+        all_equivalent_by(scopes, |left, right| {
+            left.remote_ports.equivalent_to(&right.remote_ports)
+        }),
+        all_equivalent_by(scopes, |left, right| {
+            left.remote_addresses.equivalent_to(&right.remote_addresses)
+        }),
+    ]
+    .into_iter()
+    .filter(|equal| !equal)
+    .count() as u8
+}
+
+fn union_port_scopes<'a>(
+    scopes: impl Iterator<Item = &'a TransparentInterceptionPortScope>,
+) -> TransparentInterceptionPortScope {
+    let mut values = Vec::new();
+    for scope in scopes {
+        let Some(ports) = scope.only_values() else {
+            return TransparentInterceptionPortScope::any();
+        };
+        push_unique_all(&mut values, ports);
+    }
+    TransparentInterceptionPortScope::from_values(values)
+}
+
+fn union_remote_address_scopes<'a>(
+    scopes: impl Iterator<Item = &'a TransparentInterceptionRemoteAddressScope>,
+) -> TransparentInterceptionRemoteAddressScope {
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    for scope in scopes {
+        if scope.is_empty() {
+            return TransparentInterceptionRemoteAddressScope::empty();
+        }
+        push_unique_all(&mut ipv4, scope.ipv4());
+        push_unique_all(&mut ipv6, scope.ipv6());
+    }
+    TransparentInterceptionRemoteAddressScope::new(ipv4, ipv6)
+}
+
+fn all_equivalent_by<T, F>(values: &[T], equivalent: F) -> bool
+where
+    F: Fn(&T, &T) -> bool,
+{
+    values
+        .split_first()
+        .is_none_or(|(first, rest)| rest.iter().all(|value| equivalent(value, first)))
+}
+
+fn same_values<T>(left: &[T], right: &[T]) -> bool
+where
+    T: Eq,
+{
+    left.iter().all(|value| right.contains(value)) && right.iter().all(|value| left.contains(value))
+}
+
+fn push_unique_all<T>(values: &mut Vec<T>, candidates: &[T])
+where
+    T: Copy + Eq,
+{
+    for candidate in candidates {
+        if !values.contains(candidate) {
+            values.push(*candidate);
+        }
+    }
 }

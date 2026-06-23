@@ -12,7 +12,8 @@ use super::{
 };
 
 const PROCESS_CLASSIFIER_REASON: &str = "selector contains process constraints that require a process classifier such as cgroup/owner marking or proxy-side process classification before host rules can be safely narrowed";
-const ANY_NOT_FLOW_CLASSIFIER_REASON: &str = "any/not selectors require a flow-aware classifier and cannot be projected to setup-time host rules";
+const ANY_FLOW_CLASSIFIER_REASON: &str = "any selectors that cannot be represented as one setup-time host-rule scope require a flow-aware classifier";
+const NOT_FLOW_CLASSIFIER_REASON: &str = "not selectors require a flow-aware classifier and cannot be projected to setup-time host rules";
 const REF_FLOW_CLASSIFIER_REASON: &str = "named selector refs require registry-backed classifier resolution before transparent interception setup";
 
 impl TransparentInterceptionSetupPlan {
@@ -75,34 +76,58 @@ impl ProjectableLocalSetupTerm {
             traffic: intersect_traffic_selectors(self.traffic, other.traffic)?,
         })
     }
+
+    fn from_scope(scope: TransparentInterceptionHostRuleScope) -> Self {
+        Self {
+            traffic: scope.to_inbound_traffic_selector(),
+        }
+    }
 }
 
 fn analyze_selector(
     selector: &Selector,
 ) -> Result<SelectorSetupAnalysis, TransparentInterceptionSetupProjectionError> {
     match selector {
-        Selector::Match { term } => Ok(SelectorSetupAnalysis {
-            host_term: Some(ProjectableLocalSetupTerm {
-                traffic: term.traffic.clone(),
-            }),
-            classifier: process_classifier_requirement(&term.process),
-        }),
-        Selector::All { selectors } => analyze_all_selector(selectors),
-        Selector::Any { selectors } => {
-            if selectors.is_empty() {
-                return Err(TransparentInterceptionSetupProjectionError::Unsupported {
-                    reason: "any selector requires at least one child".to_string(),
-                });
-            }
-            Ok(flow_classifier_analysis(
-                ANY_NOT_FLOW_CLASSIFIER_REASON.to_string(),
-            ))
+        Selector::Match { term } => {
+            validate_traffic_selector(&term.traffic)?;
+            Ok(SelectorSetupAnalysis {
+                host_term: Some(ProjectableLocalSetupTerm {
+                    traffic: term.traffic.clone(),
+                }),
+                classifier: process_classifier_requirement(&term.process),
+            })
         }
+        Selector::All { selectors } => analyze_all_selector(selectors),
+        Selector::Any { selectors } => analyze_any_selector(selectors),
         Selector::Not { .. } => Ok(flow_classifier_analysis(
-            ANY_NOT_FLOW_CLASSIFIER_REASON.to_string(),
+            NOT_FLOW_CLASSIFIER_REASON.to_string(),
         )),
         Selector::Ref { .. } => Ok(flow_classifier_analysis(
             REF_FLOW_CLASSIFIER_REASON.to_string(),
+        )),
+    }
+}
+
+fn analyze_any_selector(
+    selectors: &[Selector],
+) -> Result<SelectorSetupAnalysis, TransparentInterceptionSetupProjectionError> {
+    if selectors.is_empty() {
+        return Err(TransparentInterceptionSetupProjectionError::Unsupported {
+            reason: "any selector requires at least one child".to_string(),
+        });
+    }
+
+    let analyses = selectors
+        .iter()
+        .map(analyze_selector)
+        .collect::<Result<Vec<_>, _>>()?;
+    match project_any_selector_host_term(&analyses)? {
+        Some(host_term) => Ok(SelectorSetupAnalysis {
+            host_term: Some(host_term),
+            classifier: None,
+        }),
+        None => Ok(flow_classifier_analysis(
+            ANY_FLOW_CLASSIFIER_REASON.to_string(),
         )),
     }
 }
@@ -143,6 +168,46 @@ fn analyze_all_selector(
         host_term,
         classifier,
     })
+}
+
+fn project_any_selector_host_term(
+    analyses: &[SelectorSetupAnalysis],
+) -> Result<Option<ProjectableLocalSetupTerm>, TransparentInterceptionSetupProjectionError> {
+    if analyses
+        .iter()
+        .any(|analysis| analysis.classifier.is_some() || analysis.host_term.is_none())
+    {
+        return Ok(None);
+    }
+
+    let mut scopes = Vec::new();
+    for analysis in analyses {
+        let Some(scope) = optional_host_rule_scope_for_any_branch(
+            analysis
+                .host_term
+                .clone()
+                .expect("host term presence checked above"),
+        )?
+        else {
+            return Ok(None);
+        };
+        scopes.push(scope);
+    }
+    Ok(
+        TransparentInterceptionHostRuleScope::union_without_expansion(&scopes)
+            .map(ProjectableLocalSetupTerm::from_scope),
+    )
+}
+
+fn optional_host_rule_scope_for_any_branch(
+    term: ProjectableLocalSetupTerm,
+) -> Result<Option<TransparentInterceptionHostRuleScope>, TransparentInterceptionSetupProjectionError>
+{
+    match host_rule_scope_from_term(term) {
+        Ok(scope) => Ok(Some(scope)),
+        Err(TransparentInterceptionSetupProjectionError::UnconstrainedSelector) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn flow_classifier_analysis(reason: String) -> SelectorSetupAnalysis {
@@ -198,6 +263,13 @@ fn host_rule_scope_from_term(
         TransparentInterceptionPortScope::from_values(term.traffic.remote_ports),
         parse_remote_addresses(&term.traffic.remote_addresses)?,
     )
+}
+
+fn validate_traffic_selector(
+    traffic: &TrafficSelector,
+) -> Result<(), TransparentInterceptionSetupProjectionError> {
+    validate_direction_projection(traffic)?;
+    parse_ip_addresses(&traffic.remote_addresses).map(|_| ())
 }
 
 fn intersect_projectable_terms(
@@ -359,16 +431,8 @@ mod tests {
 
     #[test]
     fn projects_inbound_host_rule_scope() {
-        let scope = scope_for(Selector::term(
-            ProcessSelector::default(),
-            TrafficSelector {
-                local_ports: vec![8443],
-                directions: vec![Direction::Inbound],
-                remote_addresses: vec!["203.0.113.10".to_string()],
-                ..TrafficSelector::default()
-            },
-        ))
-        .expect("selector should project");
+        let scope = scope_for(term(inbound_local_port_addresses(8443, &["203.0.113.10"])))
+            .expect("selector should project");
 
         assert_eq!(scope.local_ports().values(), &[8443]);
         assert_eq!(
@@ -380,26 +444,16 @@ mod tests {
 
     #[test]
     fn setup_plan_preserves_all_process_scope_without_flattening_globs() {
-        let plan =
-            TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(&Selector::All {
-                selectors: vec![
-                    Selector::term(
-                        ProcessSelector {
-                            exe_path_globs: vec!["/usr/bin/*".to_string()],
-                            ..ProcessSelector::default()
-                        },
-                        TrafficSelector::default(),
-                    ),
-                    Selector::term(
-                        ProcessSelector {
-                            exe_path_globs: vec!["/usr/bin/curl".to_string()],
-                            ..ProcessSelector::default()
-                        },
-                        TrafficSelector::default(),
-                    ),
-                ],
-            }))
-            .expect("process-only all selector should produce a classifier setup plan");
+        let plan = plan_for(Selector::All {
+            selectors: vec![
+                Selector::term(process_globs(&["/usr/bin/*"]), TrafficSelector::default()),
+                Selector::term(
+                    process_globs(&["/usr/bin/curl"]),
+                    TrafficSelector::default(),
+                ),
+            ],
+        })
+        .expect("process-only all selector should produce a classifier setup plan");
 
         let TransparentInterceptionSetupPlan::RequiresProcessClassifier {
             host_rule_boundary,
@@ -423,32 +477,13 @@ mod tests {
 
     #[test]
     fn setup_plan_preserves_all_process_scope_and_traffic_boundary() {
-        let plan =
-            TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(&Selector::All {
-                selectors: vec![
-                    Selector::term(
-                        ProcessSelector {
-                            exe_path_globs: vec!["/usr/bin/*".to_string()],
-                            ..ProcessSelector::default()
-                        },
-                        TrafficSelector {
-                            local_ports: vec![8443],
-                            ..TrafficSelector::default()
-                        },
-                    ),
-                    Selector::term(
-                        ProcessSelector {
-                            exe_path_globs: vec!["/usr/bin/curl".to_string()],
-                            ..ProcessSelector::default()
-                        },
-                        TrafficSelector {
-                            directions: vec![Direction::Inbound],
-                            ..TrafficSelector::default()
-                        },
-                    ),
-                ],
-            }))
-            .expect("process-scoped all selector should produce a classifier setup plan");
+        let plan = plan_for(Selector::All {
+            selectors: vec![
+                Selector::term(process_globs(&["/usr/bin/*"]), local_port(8443)),
+                Selector::term(process_globs(&["/usr/bin/curl"]), inbound_traffic()),
+            ],
+        })
+        .expect("process-scoped all selector should produce a classifier setup plan");
 
         let TransparentInterceptionSetupPlan::RequiresProcessClassifier {
             host_rule_boundary,
@@ -470,17 +505,7 @@ mod tests {
 
     #[test]
     fn setup_plan_preserves_process_only_classifier_requirement() {
-        let plan =
-            TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(&Selector::term(
-                ProcessSelector {
-                    names: vec!["curl".to_string()],
-                    ..ProcessSelector::default()
-                },
-                TrafficSelector {
-                    directions: vec![Direction::Inbound],
-                    ..TrafficSelector::default()
-                },
-            )))
+        let plan = plan_for(Selector::term(process_names(&["curl"]), inbound_traffic()))
             .expect("process-only selector should produce a classifier plan");
 
         let TransparentInterceptionSetupPlan::RequiresProcessClassifier {
@@ -500,20 +525,11 @@ mod tests {
 
     #[test]
     fn setup_plan_preserves_process_scoped_host_rule_boundary() {
-        let plan =
-            TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(&Selector::term(
-                ProcessSelector {
-                    names: vec!["curl".to_string()],
-                    ..ProcessSelector::default()
-                },
-                TrafficSelector {
-                    local_ports: vec![8443],
-                    directions: vec![Direction::Inbound],
-                    remote_addresses: vec!["203.0.113.10".to_string()],
-                    ..TrafficSelector::default()
-                },
-            )))
-            .expect("process-scoped traffic selector should produce a classifier plan");
+        let plan = plan_for(Selector::term(
+            process_names(&["curl"]),
+            inbound_local_port_addresses(8443, &["203.0.113.10"]),
+        ))
+        .expect("process-scoped traffic selector should produce a classifier plan");
 
         let TransparentInterceptionSetupPlan::RequiresProcessClassifier {
             host_rule_boundary,
@@ -535,31 +551,68 @@ mod tests {
     }
 
     #[test]
-    fn any_selector_reports_flow_classifier_requirement() {
-        let plan =
-            TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(&Selector::Any {
-                selectors: vec![
-                    Selector::term(
-                        ProcessSelector::default(),
-                        TrafficSelector {
-                            local_ports: vec![8443],
-                            ..TrafficSelector::default()
-                        },
-                    ),
-                    Selector::term(
-                        ProcessSelector::default(),
-                        TrafficSelector {
-                            local_ports: vec![9443],
-                            ..TrafficSelector::default()
-                        },
-                    ),
-                ],
-            }))
-            .expect("any selector should produce a flow classifier setup plan");
+    fn any_selector_projects_single_host_rule_dimension() {
+        let plan = plan_for(Selector::Any {
+            selectors: vec![
+                term(local_port_addresses(
+                    8443,
+                    &["203.0.113.10", "203.0.113.20"],
+                )),
+                term(local_port_addresses(
+                    9443,
+                    &["203.0.113.20", "203.0.113.10"],
+                )),
+            ],
+        })
+        .expect("single-dimension any selector should project to host rules");
+
+        let TransparentInterceptionSetupPlan::HostRules(scope) = plan else {
+            panic!("single-dimension any selector should not require a flow classifier");
+        };
+        assert_eq!(scope.local_ports().values(), &[8443, 9443]);
+        assert!(scope.remote_ports().is_any());
+        assert_eq!(
+            scope.remote_addresses().ipv4(),
+            &[
+                Ipv4Addr::new(203, 0, 113, 10),
+                Ipv4Addr::new(203, 0, 113, 20)
+            ]
+        );
+    }
+
+    #[test]
+    fn any_selector_with_cross_product_risk_reports_flow_classifier_requirement() {
+        let plan = plan_for(Selector::Any {
+            selectors: vec![
+                term(local_port_addresses(8443, &["203.0.113.10"])),
+                term(local_port_addresses(9443, &["203.0.113.20"])),
+            ],
+        })
+        .expect("cross-product any selector should produce a flow classifier setup plan");
 
         let TransparentInterceptionSetupPlan::RequiresFlowClassifier { flow_scope, .. } = plan
         else {
-            panic!("any selector should require a flow classifier");
+            panic!("cross-product any selector should require a flow classifier");
+        };
+        assert!(matches!(
+            flow_scope.selector(),
+            TransparentInterceptionClassifierSelector::Any { .. }
+        ));
+    }
+
+    #[test]
+    fn process_scoped_any_selector_reports_flow_classifier_requirement() {
+        let plan = plan_for(Selector::Any {
+            selectors: vec![
+                Selector::term(process_names(&["curl"]), local_port(8443)),
+                Selector::term(process_names(&["nginx"]), local_port(9443)),
+            ],
+        })
+        .expect("process-scoped any selector should produce a classifier setup plan");
+
+        let TransparentInterceptionSetupPlan::RequiresFlowClassifier { flow_scope, .. } = plan
+        else {
+            panic!("process-scoped any selector should require a flow classifier");
         };
         assert!(matches!(
             flow_scope.selector(),
@@ -569,29 +622,18 @@ mod tests {
 
     #[test]
     fn flow_classifier_requirement_preserves_host_rule_boundary() {
-        let plan =
-            TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(&Selector::All {
-                selectors: vec![
-                    Selector::term(
-                        ProcessSelector::default(),
-                        TrafficSelector {
-                            local_ports: vec![8443],
-                            directions: vec![Direction::Inbound],
-                            ..TrafficSelector::default()
-                        },
-                    ),
-                    Selector::Any {
-                        selectors: vec![Selector::term(
-                            ProcessSelector::default(),
-                            TrafficSelector {
-                                remote_ports: vec![443],
-                                ..TrafficSelector::default()
-                            },
-                        )],
-                    },
-                ],
-            }))
-            .expect("flow-aware selector should produce a classifier setup plan");
+        let plan = plan_for(Selector::All {
+            selectors: vec![
+                term(inbound_local_port(8443)),
+                Selector::Any {
+                    selectors: vec![
+                        term(remote_port_addresses(443, &["203.0.113.10"])),
+                        term(remote_port_addresses(444, &["203.0.113.20"])),
+                    ],
+                },
+            ],
+        })
+        .expect("flow-aware selector should produce a classifier setup plan");
 
         let TransparentInterceptionSetupPlan::RequiresFlowClassifier {
             host_rule_boundary, ..
@@ -621,15 +663,33 @@ mod tests {
 
     #[test]
     fn wrong_direction_is_unsupported() {
-        let error = scope_for(Selector::term(
-            ProcessSelector::default(),
-            TrafficSelector {
-                local_ports: vec![8443],
-                directions: vec![Direction::Outbound],
-                ..TrafficSelector::default()
-            },
-        ))
-        .expect_err("wrong direction should not project");
+        let error = scope_for(term(outbound_local_port(8443)))
+            .expect_err("wrong direction should not project");
+
+        assert!(matches!(
+            error,
+            TransparentInterceptionSetupProjectionError::Unsupported { .. }
+        ));
+
+        let error = plan_for(Selector::Any {
+            selectors: vec![term(outbound_local_port(8443))],
+        })
+        .expect_err("wrong direction in any should not become a classifier requirement");
+
+        assert!(matches!(
+            error,
+            TransparentInterceptionSetupProjectionError::Unsupported { .. }
+        ));
+
+        let error = plan_for(Selector::Any {
+            selectors: vec![
+                Selector::term(process_names(&["curl"]), outbound_local_port(8443)),
+                Selector::Ref {
+                    name: "external".to_string(),
+                },
+            ],
+        })
+        .expect_err("classifier-bearing wrong direction should remain unsupported");
 
         assert!(matches!(
             error,
@@ -640,22 +700,7 @@ mod tests {
     #[test]
     fn disjoint_all_selector_is_unsupported() {
         let error = scope_for(Selector::All {
-            selectors: vec![
-                Selector::term(
-                    ProcessSelector::default(),
-                    TrafficSelector {
-                        local_ports: vec![8443],
-                        ..TrafficSelector::default()
-                    },
-                ),
-                Selector::term(
-                    ProcessSelector::default(),
-                    TrafficSelector {
-                        local_ports: vec![9443],
-                        ..TrafficSelector::default()
-                    },
-                ),
-            ],
+            selectors: vec![term(local_port(8443)), term(local_port(9443))],
         })
         .expect_err("disjoint selector should not project");
 
@@ -669,22 +714,8 @@ mod tests {
     fn remote_address_intersection_uses_ip_value() {
         let scope = scope_for(Selector::All {
             selectors: vec![
-                Selector::term(
-                    ProcessSelector::default(),
-                    TrafficSelector {
-                        local_ports: vec![8443],
-                        remote_addresses: vec!["2001:0db8::1".to_string()],
-                        ..TrafficSelector::default()
-                    },
-                ),
-                Selector::term(
-                    ProcessSelector::default(),
-                    TrafficSelector {
-                        local_ports: vec![8443],
-                        remote_addresses: vec!["2001:db8::1".to_string()],
-                        ..TrafficSelector::default()
-                    },
-                ),
+                term(local_port_addresses(8443, &["2001:0db8::1"])),
+                term(local_port_addresses(8443, &["2001:db8::1"])),
             ],
         })
         .expect("equivalent IP address text should intersect");
@@ -697,14 +728,24 @@ mod tests {
 
     #[test]
     fn invalid_remote_address_is_unsupported() {
-        let error = scope_for(Selector::term(
-            ProcessSelector::default(),
-            TrafficSelector {
-                remote_addresses: vec!["not an ip".to_string()],
-                ..TrafficSelector::default()
-            },
-        ))
+        let error = scope_for(term(TrafficSelector {
+            remote_addresses: strings(&["not an ip"]),
+            ..TrafficSelector::default()
+        }))
         .expect_err("invalid remote address should not project");
+
+        assert!(matches!(
+            error,
+            TransparentInterceptionSetupProjectionError::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn invalid_any_child_remote_address_is_unsupported() {
+        let error = plan_for(Selector::Any {
+            selectors: vec![term(local_port_addresses(8443, &["not an ip"]))],
+        })
+        .expect_err("invalid any child remote address should not become a classifier requirement");
 
         assert!(matches!(
             error,
@@ -731,13 +772,91 @@ mod tests {
         selector: Selector,
     ) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionSetupProjectionError>
     {
-        match TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(&selector))? {
+        match plan_for(selector)? {
             TransparentInterceptionSetupPlan::HostRules(scope) => Ok(scope),
             TransparentInterceptionSetupPlan::RequiresProcessClassifier { reason, .. }
             | TransparentInterceptionSetupPlan::RequiresFlowClassifier { reason, .. } => {
                 Err(TransparentInterceptionSetupProjectionError::Unsupported { reason })
             }
         }
+    }
+
+    fn plan_for(
+        selector: Selector,
+    ) -> Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError> {
+        TransparentInterceptionSetupPlan::from_inbound_tproxy_selector(Some(&selector))
+    }
+
+    fn term(traffic: TrafficSelector) -> Selector {
+        Selector::term(ProcessSelector::default(), traffic)
+    }
+
+    fn local_port(port: u16) -> TrafficSelector {
+        TrafficSelector {
+            local_ports: vec![port],
+            ..TrafficSelector::default()
+        }
+    }
+
+    fn inbound_traffic() -> TrafficSelector {
+        TrafficSelector {
+            directions: vec![Direction::Inbound],
+            ..TrafficSelector::default()
+        }
+    }
+
+    fn inbound_local_port(port: u16) -> TrafficSelector {
+        TrafficSelector {
+            directions: vec![Direction::Inbound],
+            ..local_port(port)
+        }
+    }
+
+    fn outbound_local_port(port: u16) -> TrafficSelector {
+        TrafficSelector {
+            directions: vec![Direction::Outbound],
+            ..local_port(port)
+        }
+    }
+
+    fn local_port_addresses(port: u16, addresses: &[&str]) -> TrafficSelector {
+        TrafficSelector {
+            remote_addresses: strings(addresses),
+            ..local_port(port)
+        }
+    }
+
+    fn inbound_local_port_addresses(port: u16, addresses: &[&str]) -> TrafficSelector {
+        TrafficSelector {
+            directions: vec![Direction::Inbound],
+            ..local_port_addresses(port, addresses)
+        }
+    }
+
+    fn remote_port_addresses(port: u16, addresses: &[&str]) -> TrafficSelector {
+        TrafficSelector {
+            remote_ports: vec![port],
+            remote_addresses: strings(addresses),
+            ..TrafficSelector::default()
+        }
+    }
+
+    fn process_names(names: &[&str]) -> ProcessSelector {
+        ProcessSelector {
+            names: strings(names),
+            ..ProcessSelector::default()
+        }
+    }
+
+    fn process_globs(globs: &[&str]) -> ProcessSelector {
+        ProcessSelector {
+            exe_path_globs: strings(globs),
+            ..ProcessSelector::default()
+        }
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
     }
 
     fn process_scope_names(scope: &TransparentInterceptionProcessScope) -> Vec<&str> {
