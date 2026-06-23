@@ -676,7 +676,10 @@ protective_actions = ["alert"]
         );
         assert_eq!(status.interception.proxy.listen_port, Some(15001));
         assert_eq!(status.interception.nftables.table_name, "sssa_probe");
-        assert_eq!(status.interception.nftables.route_table, 53_534);
+        assert_eq!(
+            status.interception.nftables.inbound_tproxy_route_table,
+            53_534
+        );
         assert_eq!(
             status.interception.outbound_redirect,
             runtime::TransparentInterceptionOutboundRedirectPlan::NotConfigured
@@ -736,6 +739,18 @@ protective_actions = ["alert"]
         assert_eq!(
             value["interception"]["nftables"]["table_name"],
             json!("sssa_probe")
+        );
+        assert_eq!(
+            value["interception"]["nftables"]["inbound_tproxy_mark"],
+            json!(0x5353_4101)
+        );
+        assert_eq!(
+            value["interception"]["nftables"]["outbound_proxy_bypass_mark"],
+            json!(0x5353_4102)
+        );
+        assert_eq!(
+            value["interception"]["nftables"]["inbound_tproxy_route_table"],
+            json!(53_534)
         );
         assert_eq!(
             value["interception"]["outbound_redirect"]["kind"],
@@ -828,7 +843,7 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             value["interception"]["outbound_redirect"]["proxy_bypass_mark"],
-            json!(0x5353_4101)
+            json!(0x5353_4102)
         );
         assert_eq!(
             value["interception"]["outbound_redirect"]["install"]["kind"],

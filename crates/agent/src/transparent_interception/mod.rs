@@ -86,7 +86,7 @@ pub(crate) fn effective_setup_scope(
 
 fn outbound_mitm_unavailable() -> String {
     format!(
-        "outbound transparent MITM has a typed redirect plan and existing {}, but requires proxy self-bypass socket marking, output redirect lifecycle, and MITM lifecycle before rules can be installed",
+        "outbound transparent MITM has a typed redirect plan, existing {}, and proxy pre-connect SO_MARK primitive, but requires wiring them into an executable output redirect lifecycle and MITM lifecycle before rules can be installed",
         proxy::outbound_original_destination_recovery_name()
     )
 }

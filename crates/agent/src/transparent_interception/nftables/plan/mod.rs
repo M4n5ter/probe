@@ -15,7 +15,7 @@ pub(super) enum NftablesPlanError {
     )]
     ProxyPortInInterceptedLocalPorts { proxy_port: u16 },
     #[error(
-        "transparent interception requires an explicit local port scope for proxy listen port {proxy_port}; wildcard local port interception needs proxy self-bypass first"
+        "transparent interception requires an explicit local port scope for proxy listen port {proxy_port}; wildcard local port interception needs a complete proxy self-bypass lifecycle first"
     )]
     WildcardLocalPortsRequireProxyBypass { proxy_port: u16 },
 }

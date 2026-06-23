@@ -179,7 +179,7 @@ mod tests {
             transparent_interception
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("proxy self-bypass"))
+                .is_some_and(|reason| reason.contains("executable output redirect lifecycle"))
         );
         assert_eq!(
             plan.enforcement.interception.capability,

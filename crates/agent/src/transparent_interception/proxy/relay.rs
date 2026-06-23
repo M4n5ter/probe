@@ -12,7 +12,7 @@ use std::{
 use socket2::{SockAddr, Socket};
 
 use super::{
-    connect::tcp_connect_failure_reason,
+    connect::{TransparentProxyUpstreamConnectPlan, connect_tcp, tcp_connect_failure_reason},
     proxy_error, proxy_io_error,
     registry::{RelayRegistry, RelaySlot, shutdown_streams},
     state::TransparentProxyRuntime,
@@ -25,7 +25,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) fn spawn_relay(
     accepted: Socket,
     peer: SockAddr,
-    context: TransparentProxyRelayContext,
+    plan: TransparentProxyRelayPlan,
     shutdown_requested: Arc<AtomicBool>,
     relays: RelayRegistry,
     slot: RelaySlot,
@@ -35,7 +35,7 @@ pub(super) fn spawn_relay(
         if let Err(error) = relay_connection(
             accepted,
             peer,
-            context,
+            plan,
             shutdown_requested,
             relays,
             slot,
@@ -54,7 +54,7 @@ pub(super) fn spawn_relay(
 fn relay_connection(
     accepted: Socket,
     peer: SockAddr,
-    context: TransparentProxyRelayContext,
+    plan: TransparentProxyRelayPlan,
     shutdown_requested: Arc<AtomicBool>,
     relays: RelayRegistry,
     _slot: RelaySlot,
@@ -64,11 +64,11 @@ fn relay_connection(
         .as_socket()
         .ok_or_else(|| proxy_error("transparent proxy accepted non-IP peer address"))
         .map_err(RelayConnectionError::relay)?;
-    let target = context
+    let target = plan
         .target_recovery
         .recover(&accepted)
         .map_err(RelayConnectionError::relay)?;
-    if context.self_relay_guard.is_self_relay(target) {
+    if plan.self_relay_guard.is_self_relay(target) {
         return Err(RelayConnectionError::relay(proxy_error(format!(
             "refusing transparent proxy self-relay for peer {peer} target {target}"
         ))));
@@ -78,7 +78,7 @@ fn relay_connection(
         .set_nodelay(true)
         .map_err(proxy_io_error("set downstream TCP_NODELAY"))
         .map_err(RelayConnectionError::relay)?;
-    let upstream = connect_upstream_for_relay(target, peer, &runtime)
+    let upstream = connect_upstream_for_relay(target, peer, plan.upstream_connect, &runtime)
         .map_err(RelayConnectionError::upstream_connect)?;
     upstream
         .set_nodelay(true)
@@ -95,16 +95,18 @@ fn relay_connection(
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct TransparentProxyRelayContext {
+pub(super) struct TransparentProxyRelayPlan {
     target_recovery: TransparentProxyTargetRecovery,
     self_relay_guard: TransparentProxySelfRelayGuard,
+    upstream_connect: TransparentProxyUpstreamConnectPlan,
 }
 
-impl TransparentProxyRelayContext {
+impl TransparentProxyRelayPlan {
     pub(super) fn inbound_tproxy(listen_port: u16) -> Self {
         Self {
             target_recovery: TransparentProxyTargetRecovery::TproxyLocalAddress,
             self_relay_guard: TransparentProxySelfRelayGuard::RejectSamePort { listen_port },
+            upstream_connect: TransparentProxyUpstreamConnectPlan::new(CONNECT_TIMEOUT, None),
         }
     }
 }
@@ -158,9 +160,10 @@ impl fmt::Display for RelayConnectionError {
 fn connect_upstream_for_relay(
     target: SocketAddr,
     peer: SocketAddr,
+    plan: TransparentProxyUpstreamConnectPlan,
     runtime: &TransparentProxyRuntime,
 ) -> Result<TcpStream, TransparentInterceptionError> {
-    match TcpStream::connect_timeout(&target, CONNECT_TIMEOUT) {
+    match connect_tcp(target, plan) {
         Ok(upstream) => {
             runtime.record_upstream_connect_success();
             Ok(upstream)
@@ -351,7 +354,12 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 42000));
 
-        let upstream = connect_upstream_for_relay(listener.local_addr()?, peer, &runtime)?;
+        let upstream = connect_upstream_for_relay(
+            listener.local_addr()?,
+            peer,
+            TransparentProxyUpstreamConnectPlan::new(CONNECT_TIMEOUT, None),
+            &runtime,
+        )?;
         let (_accepted, _) = listener.accept()?;
         drop(upstream);
 
@@ -372,8 +380,13 @@ mod tests {
         drop(listener);
         let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 42000));
 
-        let error = connect_upstream_for_relay(target, peer, &runtime)
-            .expect_err("closed listener should refuse upstream connect");
+        let error = connect_upstream_for_relay(
+            target,
+            peer,
+            TransparentProxyUpstreamConnectPlan::new(CONNECT_TIMEOUT, None),
+            &runtime,
+        )
+        .expect_err("closed listener should refuse upstream connect");
 
         assert!(error.to_string().contains("connect transparent upstream"));
         let snapshot = handle.snapshot();
@@ -403,7 +416,7 @@ mod tests {
         let relay = spawn_relay(
             Socket::from(downstream),
             SockAddr::from(peer),
-            TransparentProxyRelayContext::inbound_tproxy(0),
+            TransparentProxyRelayPlan::inbound_tproxy(0),
             shutdown_requested,
             registry,
             slot,

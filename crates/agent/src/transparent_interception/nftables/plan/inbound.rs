@@ -35,8 +35,8 @@ impl InboundTproxyLifecyclePlan {
         Ok(Self {
             table_name: host_resources.table_name,
             proxy_port,
-            mark: host_resources.mark,
-            route_table: host_resources.route_table,
+            mark: host_resources.inbound_tproxy_mark,
+            route_table: host_resources.inbound_tproxy_route_table,
             rules: projection.into_rules(),
         })
     }
