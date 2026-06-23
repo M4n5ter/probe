@@ -39,6 +39,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "transparent-linux",
  "wiremock",
 ]
 
@@ -2024,6 +2025,7 @@ dependencies = [
  "probe-core",
  "serde",
  "thiserror 2.0.18",
+ "transparent-linux",
 ]
 
 [[package]]
@@ -2694,6 +2696,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "transparent-linux"
+version = "0.1.0"
+dependencies = [
+ "interception",
+ "probe-config",
+ "probe-core",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3331,6 +3344,7 @@ dependencies = [
  "capture",
  "ebpf-object",
  "exporter",
+ "interception",
  "probe-config",
  "probe-core",
  "proto",
@@ -3340,6 +3354,7 @@ dependencies = [
  "socket2",
  "storage",
  "toml",
+ "transparent-linux",
 ]
 
 [[package]]

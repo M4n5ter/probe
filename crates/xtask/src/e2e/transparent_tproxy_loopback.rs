@@ -12,7 +12,9 @@ use std::{
 use super::{
     harness::{
         ChildSupervisor, UnixSocketReadySignal, create_temp_root, debug_binary, e2e_error,
-        ensure_e2e_packages_built, run_in_own_process_group, stop_running_child,
+        ensure_e2e_packages_built, reexec_current_case_in_fresh_network_namespace,
+        run_in_own_process_group, stop_running_child, trusted_system_command,
+        verify_fresh_network_namespace,
     },
     loopback::{spawn_agent, wait_for_agent_ready},
 };
@@ -137,31 +139,16 @@ fn run_outer(mode: TproxyE2eMode) -> Result<(), Box<dyn std::error::Error>> {
     }
     if env::var_os(IN_NETNS_ENV).is_some() {
         require_root()?;
+        verify_fresh_network_namespace(IN_NETNS_ENV)?;
         run_inner(mode)
     } else {
         ensure_e2e_packages_built(["agent"])?;
         require_root()?;
-        reexec_in_network_namespace(mode)
-    }
-}
-
-fn reexec_in_network_namespace(mode: TproxyE2eMode) -> Result<(), Box<dyn std::error::Error>> {
-    let current_exe = env::current_exe()?;
-    let status = Command::new(unshare_command()?)
-        .arg("-n")
-        .arg("--")
-        .arg(current_exe)
-        .arg(mode.case_name())
-        .env(IN_NETNS_ENV, "1")
-        .stdin(Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(e2e_error(format!(
-            "network-namespace transparent TPROXY e2e exited with {status}"
-        ))
-        .into())
+        reexec_current_case_in_fresh_network_namespace(
+            IN_NETNS_ENV,
+            mode.case_name(),
+            "network-namespace transparent TPROXY e2e",
+        )
     }
 }
 
@@ -861,38 +848,36 @@ fn require_root() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn unshare_command() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    first_existing_system_command(["/usr/bin/unshare", "/bin/unshare"], "unshare")
+    Ok(trusted_system_command(
+        ["/usr/bin/unshare", "/bin/unshare"],
+        "unshare",
+    )?)
 }
 
 fn nsenter_command() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    first_existing_system_command(["/usr/bin/nsenter", "/bin/nsenter"], "nsenter")
+    Ok(trusted_system_command(
+        ["/usr/bin/nsenter", "/bin/nsenter"],
+        "nsenter",
+    )?)
 }
 
 fn ip_command() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    first_existing_system_command(["/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip", "/bin/ip"], "ip")
+    Ok(trusted_system_command(
+        ["/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip", "/bin/ip"],
+        "ip",
+    )?)
 }
 
 fn nft_command() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    first_existing_system_command(
+    Ok(trusted_system_command(
         ["/usr/sbin/nft", "/usr/bin/nft", "/sbin/nft", "/bin/nft"],
         "nft",
-    )
+    )?)
 }
 
 fn nc_command() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    first_existing_system_command(
+    Ok(trusted_system_command(
         ["/usr/bin/nc", "/bin/nc", "/usr/bin/netcat", "/bin/netcat"],
         "nc",
-    )
-}
-
-fn first_existing_system_command<const N: usize>(
-    candidates: [&str; N],
-    name: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    candidates
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
-        .ok_or_else(|| e2e_error(format!("missing trusted system command {name}")).into())
+    )?)
 }

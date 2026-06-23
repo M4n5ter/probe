@@ -20,6 +20,7 @@ members = [
     "crates/proto",
     "crates/runtime",
     "crates/storage",
+    "crates/transparent-linux",
     "crates/xtask",
 ]
 exclude = ["crates/ebpf-program"]

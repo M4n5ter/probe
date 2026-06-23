@@ -132,7 +132,7 @@ fn validate_outbound_redirect_setup_scope(
 
 fn outbound_mitm_unavailable() -> String {
     format!(
-        "outbound transparent MITM has a typed redirect plan, agent-side nft artifact rendering, existing {}, and proxy pre-connect SO_MARK primitive, but requires wiring them into an executable output redirect lifecycle for activation/install and MITM lifecycle before rules can be installed",
+        "outbound transparent MITM has a typed redirect plan, transparent-linux artifact planning, existing {}, and proxy pre-connect SO_MARK primitive, but requires wiring them into an executable output redirect lifecycle for activation/install and MITM lifecycle before rules can be installed",
         proxy::outbound_original_destination_recovery_name()
     )
 }
@@ -324,7 +324,7 @@ mod tests {
         .expect_err("outbound MITM should remain fail closed after artifact validation");
         let message = error.to_string();
 
-        assert!(message.contains("agent-side nft artifact rendering"));
+        assert!(message.contains("transparent-linux artifact planning"));
         assert!(message.contains("activation/install"));
     }
 
@@ -369,14 +369,12 @@ mod tests {
     }
 
     fn outbound_redirect_plan() -> TransparentInterceptionOutboundRedirectPlan {
-        let host_resources = ::runtime::TransparentInterceptionNftablesPlan::reserved();
+        let artifact = transparent_linux::OutboundRedirectArtifactSpec::outbound_mitm(
+            ::runtime::TransparentInterceptionNftablesPlan::reserved(),
+            15001,
+        );
         TransparentInterceptionOutboundRedirectPlan::Planned {
-            table_name: host_resources.table_name,
-            chain_name: "outbound_mitm".to_string(),
-            hook: "output".to_string(),
-            priority: "dstnat".to_string(),
-            proxy_port: 15001,
-            proxy_bypass_mark: host_resources.outbound_proxy_bypass_mark,
+            artifact,
             install: ::runtime::TransparentInterceptionOutboundRedirectInstallPlan::Blocked {
                 reason: "test blocked".to_string(),
             },

@@ -834,15 +834,15 @@ protective_actions = ["alert"]
             json!("planned")
         );
         assert_eq!(
-            value["interception"]["outbound_redirect"]["chain_name"],
+            value["interception"]["outbound_redirect"]["artifact"]["chain_name"],
             json!("outbound_mitm")
         );
         assert_eq!(
-            value["interception"]["outbound_redirect"]["priority"],
+            value["interception"]["outbound_redirect"]["artifact"]["priority"],
             json!("dstnat")
         );
         assert_eq!(
-            value["interception"]["outbound_redirect"]["proxy_bypass_mark"],
+            value["interception"]["outbound_redirect"]["artifact"]["proxy_bypass_mark"],
             json!(0x5353_4102)
         );
         assert_eq!(

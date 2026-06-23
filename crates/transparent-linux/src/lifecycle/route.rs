@@ -1,11 +1,7 @@
+use super::TransparentLinuxIpFamily;
 use super::hex_mark;
-use crate::transparent_interception::TransparentInterceptionIpFamily;
 
-impl TransparentInterceptionIpFamily {
-    pub(super) fn all() -> [Self; 2] {
-        [Self::Ipv4, Self::Ipv6]
-    }
-
+impl TransparentLinuxIpFamily {
     pub(super) fn rule_command(self, operation: &str, mark: u32, route_table: u32) -> Vec<String> {
         let mut command = self.command_prefix();
         command.extend([

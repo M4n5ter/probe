@@ -9,6 +9,7 @@ repository.workspace = true
 capture = { version = "0.1.0", path = "../capture" }
 ebpf-object = { version = "0.1.0", path = "../ebpf-object" }
 exporter = { version = "0.1.0", path = "../exporter" }
+interception = { version = "0.1.0", path = "../interception" }
 probe-config = { version = "0.1.0", path = "../config" }
 probe-core = { version = "0.1.0", path = "../core" }
 proto = { version = "0.1.0", path = "../proto" }
@@ -18,6 +19,7 @@ signal-hook = "0.4.4"
 socket2 = { version = "0.6.4", features = ["all"] }
 storage = { version = "0.1.0", path = "../storage" }
 toml = "1.1"
+transparent-linux = { version = "0.1.0", path = "../transparent-linux" }
 
 [lints]
 workspace = true

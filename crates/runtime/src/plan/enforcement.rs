@@ -8,16 +8,10 @@ use probe_config::{
 };
 use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
+use transparent_linux::{OutboundRedirectArtifactSpec, TransparentLinuxResources};
 
 use super::interception_scope::TransparentInterceptionLocalSetupProjectionPlan;
 
-const RESERVED_TRANSPARENT_INTERCEPTION_NFTABLES_TABLE: &str = "sssa_probe";
-const RESERVED_TRANSPARENT_INTERCEPTION_INBOUND_TPROXY_MARK: u32 = 0x5353_4101;
-const RESERVED_TRANSPARENT_INTERCEPTION_OUTBOUND_PROXY_BYPASS_MARK: u32 = 0x5353_4102;
-const RESERVED_TRANSPARENT_INTERCEPTION_INBOUND_TPROXY_ROUTE_TABLE: u32 = 53_534;
-const RESERVED_TRANSPARENT_INTERCEPTION_OUTBOUND_CHAIN: &str = "outbound_mitm";
-const TRANSPARENT_INTERCEPTION_OUTPUT_HOOK: &str = "output";
-const TRANSPARENT_INTERCEPTION_DSTNAT_PRIORITY: &str = "dstnat";
 const OUTBOUND_MITM_INSTALL_BLOCKED_REASON: &str = "outbound transparent MITM redirect install has a typed redirect preview, Linux original-destination recovery and proxy pre-connect SO_MARK primitives, but requires wiring them into an executable output redirect lifecycle for activation/install and MITM lifecycle";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,38 +318,14 @@ impl TransparentInterceptionProxyHealthProbePlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransparentInterceptionNftablesPlan {
-    pub table_name: String,
-    pub inbound_tproxy_mark: u32,
-    pub outbound_proxy_bypass_mark: u32,
-    pub inbound_tproxy_route_table: u32,
-}
-
-impl TransparentInterceptionNftablesPlan {
-    pub fn reserved() -> Self {
-        Self {
-            table_name: RESERVED_TRANSPARENT_INTERCEPTION_NFTABLES_TABLE.to_string(),
-            inbound_tproxy_mark: RESERVED_TRANSPARENT_INTERCEPTION_INBOUND_TPROXY_MARK,
-            outbound_proxy_bypass_mark:
-                RESERVED_TRANSPARENT_INTERCEPTION_OUTBOUND_PROXY_BYPASS_MARK,
-            inbound_tproxy_route_table:
-                RESERVED_TRANSPARENT_INTERCEPTION_INBOUND_TPROXY_ROUTE_TABLE,
-        }
-    }
-}
+pub type TransparentInterceptionNftablesPlan = TransparentLinuxResources;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum TransparentInterceptionOutboundRedirectPlan {
     NotConfigured,
     Planned {
-        table_name: String,
-        chain_name: String,
-        hook: String,
-        priority: String,
-        proxy_port: u16,
-        proxy_bypass_mark: u32,
+        artifact: OutboundRedirectArtifactSpec,
         install: TransparentInterceptionOutboundRedirectInstallPlan,
     },
 }
@@ -365,13 +335,10 @@ impl TransparentInterceptionOutboundRedirectPlan {
         proxy_port: NonZeroU16,
         nftables: &TransparentInterceptionNftablesPlan,
     ) -> Self {
+        let artifact =
+            OutboundRedirectArtifactSpec::outbound_mitm(nftables.clone(), proxy_port.get());
         Self::Planned {
-            table_name: nftables.table_name.clone(),
-            chain_name: RESERVED_TRANSPARENT_INTERCEPTION_OUTBOUND_CHAIN.to_string(),
-            hook: TRANSPARENT_INTERCEPTION_OUTPUT_HOOK.to_string(),
-            priority: TRANSPARENT_INTERCEPTION_DSTNAT_PRIORITY.to_string(),
-            proxy_port: proxy_port.get(),
-            proxy_bypass_mark: nftables.outbound_proxy_bypass_mark,
+            artifact,
             install: TransparentInterceptionOutboundRedirectInstallPlan::Blocked {
                 reason: OUTBOUND_MITM_INSTALL_BLOCKED_REASON.to_string(),
             },
@@ -746,12 +713,14 @@ mod tests {
         assert_eq!(
             plan.interception.outbound_redirect,
             TransparentInterceptionOutboundRedirectPlan::Planned {
-                table_name: "sssa_probe".to_string(),
-                chain_name: "outbound_mitm".to_string(),
-                hook: "output".to_string(),
-                priority: "dstnat".to_string(),
-                proxy_port: 15001,
-                proxy_bypass_mark: 0x5353_4102,
+                artifact: OutboundRedirectArtifactSpec {
+                    table_name: "sssa_probe".to_string(),
+                    chain_name: "outbound_mitm".to_string(),
+                    hook: "output".to_string(),
+                    priority: "dstnat".to_string(),
+                    proxy_port: 15001,
+                    proxy_bypass_mark: 0x5353_4102,
+                },
                 install: TransparentInterceptionOutboundRedirectInstallPlan::Blocked {
                     reason: OUTBOUND_MITM_INSTALL_BLOCKED_REASON.to_string(),
                 },

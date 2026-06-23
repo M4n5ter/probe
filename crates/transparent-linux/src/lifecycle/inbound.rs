@@ -1,16 +1,15 @@
 use interception::TransparentInterceptionHostRuleScope;
 #[cfg(test)]
 use interception::TransparentInterceptionSetupPlan;
-use runtime::{TransparentInterceptionInboundTproxyPlan, TransparentInterceptionNftablesPlan};
 
 use super::{
-    INBOUND_TPROXY_OWNER_LOCK, NftablesPlanError, hex_mark,
+    INBOUND_TPROXY_OWNER_LOCK, InboundTproxyArtifactSpec, TransparentLinuxIpFamily,
+    TransparentLinuxPlanError, hex_mark,
     projection::{NftFamily, NftRule, NftSelectorProjection},
 };
-use crate::transparent_interception::TransparentInterceptionIpFamily;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::transparent_interception::nftables) struct InboundTproxyLifecyclePlan {
+pub struct InboundTproxyLifecyclePlan {
     table_name: String,
     proxy_port: u16,
     mark: u32,
@@ -19,29 +18,30 @@ pub(in crate::transparent_interception::nftables) struct InboundTproxyLifecycleP
 }
 
 impl InboundTproxyLifecyclePlan {
-    pub(in crate::transparent_interception::nftables) fn from_inbound_plan_and_scope(
-        plan: &TransparentInterceptionInboundTproxyPlan,
+    pub fn from_spec_and_scope(
+        spec: InboundTproxyArtifactSpec,
         setup_scope: TransparentInterceptionHostRuleScope,
-    ) -> Result<Self, NftablesPlanError> {
-        let proxy_port = plan.listen_port().get();
+    ) -> Result<Self, TransparentLinuxPlanError> {
+        let proxy_port = spec.proxy_port;
         if setup_scope.local_ports().is_any() {
-            return Err(NftablesPlanError::WildcardLocalPortsRequireProxyBypass { proxy_port });
+            return Err(
+                TransparentLinuxPlanError::WildcardLocalPortsRequireProxyBypass { proxy_port },
+            );
         }
         if setup_scope.local_ports().contains(proxy_port) {
-            return Err(NftablesPlanError::ProxyPortInInterceptedLocalPorts { proxy_port });
+            return Err(TransparentLinuxPlanError::ProxyPortInInterceptedLocalPorts { proxy_port });
         }
         let projection = NftSelectorProjection::inbound_tproxy(setup_scope);
-        let host_resources = TransparentInterceptionNftablesPlan::reserved();
         Ok(Self {
-            table_name: host_resources.table_name,
+            table_name: spec.resources.table_name,
             proxy_port,
-            mark: host_resources.inbound_tproxy_mark,
-            route_table: host_resources.inbound_tproxy_route_table,
+            mark: spec.resources.inbound_tproxy_mark,
+            route_table: spec.resources.inbound_tproxy_route_table,
             rules: projection.into_rules(),
         })
     }
 
-    pub(in crate::transparent_interception::nftables) fn setup_nft_script(&self) -> String {
+    pub fn setup_nft_script(&self) -> String {
         let mut lines = vec![
             format!("destroy table inet {}", self.table_name),
             format!("add table inet {}", self.table_name),
@@ -51,13 +51,11 @@ impl InboundTproxyLifecyclePlan {
         lines.join("\n") + "\n"
     }
 
-    pub(in crate::transparent_interception::nftables) fn cleanup_nft_script(&self) -> String {
+    pub fn cleanup_nft_script(&self) -> String {
         format!("destroy table inet {}\n", self.table_name)
     }
 
-    pub(in crate::transparent_interception::nftables) fn setup_ip_commands(
-        &self,
-    ) -> Vec<Vec<String>> {
+    pub fn setup_ip_commands(&self) -> Vec<Vec<String>> {
         self.policy_route_families()
             .into_iter()
             .flat_map(|family| {
@@ -69,9 +67,7 @@ impl InboundTproxyLifecyclePlan {
             .collect()
     }
 
-    pub(in crate::transparent_interception::nftables) fn cleanup_ip_commands(
-        &self,
-    ) -> Vec<Vec<String>> {
+    pub fn cleanup_ip_commands(&self) -> Vec<Vec<String>> {
         self.policy_route_families()
             .into_iter()
             .flat_map(|family| {
@@ -83,10 +79,8 @@ impl InboundTproxyLifecyclePlan {
             .collect()
     }
 
-    pub(in crate::transparent_interception::nftables) fn cleanup_all_ip_commands(
-        &self,
-    ) -> Vec<Vec<String>> {
-        TransparentInterceptionIpFamily::all()
+    pub fn cleanup_all_ip_commands(&self) -> Vec<Vec<String>> {
+        TransparentLinuxIpFamily::all()
             .into_iter()
             .flat_map(|family| {
                 [
@@ -97,31 +91,29 @@ impl InboundTproxyLifecyclePlan {
             .collect()
     }
 
-    pub(in crate::transparent_interception::nftables) fn owner_name(&self) -> &'static str {
+    pub fn owner_name(&self) -> &'static str {
         INBOUND_TPROXY_OWNER_LOCK
     }
 
-    pub(in crate::transparent_interception) fn listener_families(
-        &self,
-    ) -> Vec<TransparentInterceptionIpFamily> {
+    pub fn listener_families(&self) -> Vec<TransparentLinuxIpFamily> {
         self.policy_route_families()
     }
 
-    fn policy_route_families(&self) -> Vec<TransparentInterceptionIpFamily> {
+    fn policy_route_families(&self) -> Vec<TransparentLinuxIpFamily> {
         let mut families = Vec::new();
         if self
             .rules
             .iter()
             .any(|rule| rule.family() == NftFamily::Ipv4)
         {
-            families.push(TransparentInterceptionIpFamily::Ipv4);
+            families.push(TransparentLinuxIpFamily::Ipv4);
         }
         if self
             .rules
             .iter()
             .any(|rule| rule.family() == NftFamily::Ipv6)
         {
-            families.push(TransparentInterceptionIpFamily::Ipv6);
+            families.push(TransparentLinuxIpFamily::Ipv6);
         }
         families
     }
@@ -152,7 +144,6 @@ mod tests {
         TransparentInterceptionStrategyConfig,
     };
     use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
-    use runtime::TransparentInterceptionExecutionPlan;
 
     use super::*;
 
@@ -290,7 +281,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            NftablesPlanError::ProxyPortInInterceptedLocalPorts { proxy_port: 15001 }
+            TransparentLinuxPlanError::ProxyPortInInterceptedLocalPorts { proxy_port: 15001 }
         ));
     }
 
@@ -313,7 +304,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            NftablesPlanError::WildcardLocalPortsRequireProxyBypass { proxy_port: 15001 }
+            TransparentLinuxPlanError::WildcardLocalPortsRequireProxyBypass { proxy_port: 15001 }
         ));
     }
 
@@ -340,13 +331,16 @@ mod tests {
     fn lifecycle_plan(
         config: &EnforcementInterceptionConfig,
         setup_scope: TransparentInterceptionHostRuleScope,
-    ) -> Result<InboundTproxyLifecyclePlan, NftablesPlanError> {
-        let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(config)
-            .expect("test transparent interception config should be valid");
-        let TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) = execution_plan
-        else {
-            panic!("test transparent interception config should use inbound TPROXY");
-        };
-        InboundTproxyLifecyclePlan::from_inbound_plan_and_scope(&inbound_plan, setup_scope)
+    ) -> Result<InboundTproxyLifecyclePlan, TransparentLinuxPlanError> {
+        InboundTproxyLifecyclePlan::from_spec_and_scope(
+            InboundTproxyArtifactSpec::new(
+                crate::TransparentLinuxResources::reserved(),
+                config
+                    .proxy
+                    .listen_port
+                    .expect("test config should have proxy listen port"),
+            ),
+            setup_scope,
+        )
     }
 }

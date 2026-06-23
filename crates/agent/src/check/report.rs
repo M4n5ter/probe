@@ -641,15 +641,15 @@ protective_actions = ["alert"]
             json!("planned")
         );
         assert_eq!(
-            value["enforcement"]["interception"]["outbound_redirect"]["chain_name"],
+            value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["chain_name"],
             json!("outbound_mitm")
         );
         assert_eq!(
-            value["enforcement"]["interception"]["outbound_redirect"]["hook"],
+            value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["hook"],
             json!("output")
         );
         assert_eq!(
-            value["enforcement"]["interception"]["outbound_redirect"]["proxy_port"],
+            value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["proxy_port"],
             json!(15001)
         );
         assert_eq!(

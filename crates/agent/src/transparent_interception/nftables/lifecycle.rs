@@ -2,10 +2,9 @@ use super::{
     command::{CommandResult, IpCommand, NftCommand},
     local_addresses,
     owner_lock::{NftablesOwnerLock, NftablesOwnerLockGuard, SystemNftablesOwnerLock},
-    plan::InboundTproxyLifecyclePlan,
 };
 use crate::transparent_interception::{
-    TransparentInterceptionError,
+    TransparentInterceptionError, TransparentInterceptionIpFamily,
     proxy::{
         LocalAddressInventory, TransparentProxyGuard, TransparentProxyRuntime,
         prepare_proxy_lifecycle, start_proxy_lifecycle,
@@ -20,6 +19,7 @@ use interception::TransparentInterceptionSetupPlan;
 #[cfg(test)]
 use probe_config::EnforcementInterceptionConfig;
 use std::sync::{Arc, Mutex, MutexGuard};
+use transparent_linux::{InboundTproxyArtifactSpec, InboundTproxyLifecyclePlan};
 
 type SharedIpCommand = Arc<Mutex<Box<dyn IpCommand + Send>>>;
 
@@ -98,14 +98,20 @@ impl NftablesTransparentInterception {
         mut self,
         setup_scope: TransparentInterceptionHostRuleScope,
     ) -> Result<NftablesTransparentInterceptionGuard, TransparentInterceptionError> {
-        let plan = InboundTproxyLifecyclePlan::from_inbound_plan_and_scope(
-            &self.inbound_plan,
+        let plan = InboundTproxyLifecyclePlan::from_spec_and_scope(
+            InboundTproxyArtifactSpec::new(
+                ::runtime::TransparentInterceptionNftablesPlan::reserved(),
+                self.inbound_plan.listen_port().get(),
+            ),
             setup_scope,
         )
         .map_err(|error| TransparentInterceptionError::Setup(error.to_string()))?;
         let proxy_plan = prepare_proxy_lifecycle(
             &self.inbound_plan,
-            plan.listener_families(),
+            plan.listener_families()
+                .into_iter()
+                .map(TransparentInterceptionIpFamily::from)
+                .collect(),
             local_address_inventory(self.ip.clone()),
         )?;
         let setup_script = plan.setup_nft_script();

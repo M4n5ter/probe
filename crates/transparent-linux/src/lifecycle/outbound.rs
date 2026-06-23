@@ -1,13 +1,12 @@
 use interception::TransparentInterceptionHostRuleScope;
-use runtime::TransparentInterceptionOutboundRedirectPlan;
 
 use super::{
-    NftablesPlanError, hex_mark,
+    OutboundRedirectArtifactSpec, TransparentLinuxPlanError, hex_mark,
     projection::{NftRule, NftSelectorProjection},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::transparent_interception::nftables) struct OutboundRedirectLifecyclePlan {
+pub struct OutboundRedirectLifecyclePlan {
     table_name: String,
     chain_name: String,
     hook: String,
@@ -18,39 +17,29 @@ pub(in crate::transparent_interception::nftables) struct OutboundRedirectLifecyc
 }
 
 impl OutboundRedirectLifecyclePlan {
-    pub(in crate::transparent_interception::nftables) fn from_redirect_plan_and_scope(
-        redirect: &TransparentInterceptionOutboundRedirectPlan,
+    pub fn from_spec_and_scope(
+        spec: OutboundRedirectArtifactSpec,
         setup_scope: TransparentInterceptionHostRuleScope,
-    ) -> Result<Self, NftablesPlanError> {
-        let TransparentInterceptionOutboundRedirectPlan::Planned {
-            table_name,
-            chain_name,
-            hook,
-            priority,
-            proxy_port,
-            proxy_bypass_mark,
-            ..
-        } = redirect
-        else {
-            return Err(NftablesPlanError::OutboundRedirectNotPlanned);
-        };
+    ) -> Result<Self, TransparentLinuxPlanError> {
         if setup_scope.remote_ports().is_any() {
-            return Err(NftablesPlanError::OutboundRedirectRequiresRemotePorts {
-                proxy_port: *proxy_port,
-            });
+            return Err(
+                TransparentLinuxPlanError::OutboundRedirectRequiresRemotePorts {
+                    proxy_port: spec.proxy_port,
+                },
+            );
         }
         Ok(Self {
-            table_name: table_name.clone(),
-            chain_name: chain_name.clone(),
-            hook: hook.clone(),
-            priority: priority.clone(),
-            proxy_port: *proxy_port,
-            proxy_bypass_mark: *proxy_bypass_mark,
+            table_name: spec.table_name,
+            chain_name: spec.chain_name,
+            hook: spec.hook,
+            priority: spec.priority,
+            proxy_port: spec.proxy_port,
+            proxy_bypass_mark: spec.proxy_bypass_mark,
             rules: NftSelectorProjection::outbound_redirect(setup_scope).into_rules(),
         })
     }
 
-    pub(in crate::transparent_interception::nftables) fn setup_nft_script(&self) -> String {
+    pub fn setup_nft_script(&self) -> String {
         let mut lines = vec![
             format!("destroy table inet {}", self.table_name),
             format!("add table inet {}", self.table_name),
@@ -59,6 +48,10 @@ impl OutboundRedirectLifecyclePlan {
         ];
         lines.extend(self.rules.iter().map(|rule| self.add_rule_command(rule)));
         lines.join("\n") + "\n"
+    }
+
+    pub fn cleanup_nft_script(&self) -> String {
+        format!("destroy table inet {}\n", self.table_name)
     }
 
     fn add_chain_command(&self) -> String {
@@ -95,9 +88,6 @@ mod tests {
         TransparentInterceptionStrategyConfig,
     };
     use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
-    use runtime::{
-        TransparentInterceptionNftablesPlan, TransparentInterceptionOutboundRedirectInstallPlan,
-    };
 
     use super::*;
 
@@ -152,7 +142,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            NftablesPlanError::OutboundRedirectRequiresRemotePorts { proxy_port: 15001 }
+            TransparentLinuxPlanError::OutboundRedirectRequiresRemotePorts { proxy_port: 15001 }
         ));
     }
 
@@ -204,22 +194,16 @@ mod tests {
     fn lifecycle_plan(
         config: &EnforcementInterceptionConfig,
         setup_scope: TransparentInterceptionHostRuleScope,
-    ) -> Result<OutboundRedirectLifecyclePlan, NftablesPlanError> {
-        let host_resources = TransparentInterceptionNftablesPlan::reserved();
-        let redirect = TransparentInterceptionOutboundRedirectPlan::Planned {
-            table_name: host_resources.table_name,
-            chain_name: "outbound_mitm".to_string(),
-            hook: "output".to_string(),
-            priority: "dstnat".to_string(),
-            proxy_port: config
-                .proxy
-                .listen_port
-                .expect("test config should have proxy listen port"),
-            proxy_bypass_mark: host_resources.outbound_proxy_bypass_mark,
-            install: TransparentInterceptionOutboundRedirectInstallPlan::Blocked {
-                reason: "test blocked".to_string(),
-            },
-        };
-        OutboundRedirectLifecyclePlan::from_redirect_plan_and_scope(&redirect, setup_scope)
+    ) -> Result<OutboundRedirectLifecyclePlan, TransparentLinuxPlanError> {
+        OutboundRedirectLifecyclePlan::from_spec_and_scope(
+            OutboundRedirectArtifactSpec::outbound_mitm(
+                crate::TransparentLinuxResources::reserved(),
+                config
+                    .proxy
+                    .listen_port
+                    .expect("test config should have proxy listen port"),
+            ),
+            setup_scope,
+        )
     }
 }
