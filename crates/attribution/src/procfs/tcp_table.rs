@@ -27,6 +27,16 @@ pub(super) struct ProcfsTcpTable {
     pub(super) policy: ProcfsTcpTablePolicy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProcfsTcpListenerEntry {
+    pub(super) local: TcpEndpoint,
+    pub(super) inode: u64,
+}
+
+const TCP_LISTEN_STATE_VALUE: u8 = 0x0A;
+const TCP_MIN_STATE_VALUE: u8 = 0x01;
+const TCP_MAX_STATE_VALUE: u8 = 0x0C;
+
 pub(super) fn procfs_tcp_tables(proc_root: &Path) -> [ProcfsTcpTable; 2] {
     [
         ProcfsTcpTable {
@@ -57,27 +67,35 @@ pub(super) fn endpoint_uses_family(endpoint: TcpEndpoint, family: ProcfsTcpTable
     )
 }
 
-pub(super) fn tcp_inode_map_from_table(
+pub(super) fn tcp_entries_from_table(
     table: &ProcfsTcpTable,
     content: &str,
-) -> Result<HashMap<TcpConnection, u64>, AttributionError> {
+) -> Result<Vec<ProcfsTcpEntry>, AttributionError> {
+    parse_tcp_entries(table, content)
+}
+
+pub(super) fn tcp_inode_map_from_entries(
+    entries: &[ProcfsTcpEntry],
+) -> HashMap<TcpConnection, u64> {
     let mut inodes = HashMap::new();
-    for line in content.lines().skip(1) {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() <= 9 {
-            continue;
-        }
-        let local = parse_tcp_endpoint(table, fields[1])?;
-        let remote = parse_tcp_endpoint(table, fields[2])?;
-        let inode = fields[9]
-            .parse::<u64>()
-            .map_err(|source| AttributionError::InvalidNetTcp {
-                path: table.path.display().to_string(),
-                reason: format!("invalid socket inode: {source}"),
-            })?;
-        inodes.insert(TcpConnection::new(local, remote), inode);
+    for entry in entries {
+        inodes.insert(TcpConnection::new(entry.local, entry.remote), entry.inode);
     }
-    Ok(inodes)
+    inodes
+}
+
+pub(super) fn tcp_listener_entries_from_entries(
+    entries: &[ProcfsTcpEntry],
+) -> Vec<ProcfsTcpListenerEntry> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            entry.is_listener.then_some(ProcfsTcpListenerEntry {
+                local: entry.local,
+                inode: entry.inode,
+            })
+        })
+        .collect()
 }
 
 pub(super) fn connections_by_inode(
@@ -88,6 +106,70 @@ pub(super) fn connections_by_inode(
         connections.entry(*inode).or_default().push(*connection);
     }
     connections
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProcfsTcpEntry {
+    local: TcpEndpoint,
+    remote: TcpEndpoint,
+    is_listener: bool,
+    inode: u64,
+}
+
+fn parse_tcp_entries(
+    table: &ProcfsTcpTable,
+    content: &str,
+) -> Result<Vec<ProcfsTcpEntry>, AttributionError> {
+    let mut entries = Vec::new();
+    for line in content.lines().skip(1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() <= 9 {
+            return Err(AttributionError::InvalidNetTcp {
+                path: table.path.display().to_string(),
+                reason: format!("expected at least 10 fields, got {}", fields.len()),
+            });
+        }
+        let local = parse_tcp_endpoint(table, fields[1])?;
+        let remote = parse_tcp_endpoint(table, fields[2])?;
+        let is_listener = parse_tcp_state(table, fields[3])? == TCP_LISTEN_STATE_VALUE;
+        let inode = fields[9]
+            .parse::<u64>()
+            .map_err(|source| AttributionError::InvalidNetTcp {
+                path: table.path.display().to_string(),
+                reason: format!("invalid socket inode: {source}"),
+            })?;
+        entries.push(ProcfsTcpEntry {
+            local,
+            remote,
+            is_listener,
+            inode,
+        });
+    }
+    Ok(entries)
+}
+
+fn parse_tcp_state(table: &ProcfsTcpTable, state: &str) -> Result<u8, AttributionError> {
+    if state.len() != 2 {
+        return Err(AttributionError::InvalidNetTcp {
+            path: table.path.display().to_string(),
+            reason: format!("invalid TCP state {state:?}"),
+        });
+    }
+    let state =
+        u8::from_str_radix(state, 16).map_err(|source| AttributionError::InvalidNetTcp {
+            path: table.path.display().to_string(),
+            reason: format!("invalid TCP state: {source}"),
+        })?;
+    if !(TCP_MIN_STATE_VALUE..=TCP_MAX_STATE_VALUE).contains(&state) {
+        return Err(AttributionError::InvalidNetTcp {
+            path: table.path.display().to_string(),
+            reason: format!("unsupported TCP state 0x{state:02X}"),
+        });
+    }
+    Ok(state)
 }
 
 fn parse_tcp_endpoint(
@@ -160,4 +242,61 @@ fn parse_proc_net_tcp6_address(path: &Path, address: &str) -> Result<IpAddr, Att
         )));
     }
     Ok(IpAddr::V6(Ipv6Addr::from(bytes)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_table_parser_rejects_short_data_rows() {
+        let error = tcp_entries_from_table(&ipv4_table(), "header\n   0: 0100007F:20FB\n")
+            .expect_err("short tcp row must fail closed");
+
+        assert!(matches!(
+            error,
+            AttributionError::InvalidNetTcp { reason, .. }
+                if reason.contains("expected at least 10 fields")
+        ));
+    }
+
+    #[test]
+    fn tcp_table_parser_rejects_invalid_state() {
+        let error = tcp_entries_from_table(
+            &ipv4_table(),
+            "header\n   0: 0100007F:20FB 00000000:0000 ZZ 00000000:00000000 00:00000000 00000000 1000 0 424242 1 0000000000000000\n",
+        )
+        .expect_err("invalid tcp state must fail closed");
+
+        assert!(matches!(
+            error,
+            AttributionError::InvalidNetTcp { reason, .. }
+                if reason.contains("invalid TCP state")
+        ));
+    }
+
+    #[test]
+    fn tcp_table_parser_rejects_unsupported_state() {
+        for state in ["00", "FF"] {
+            let content = format!(
+                "header\n   0: 0100007F:20FB 00000000:0000 {state} 00000000:00000000 00:00000000 00000000 1000 0 424242 1 0000000000000000\n",
+            );
+            let error = tcp_entries_from_table(&ipv4_table(), &content)
+                .expect_err("unsupported tcp state must fail closed");
+
+            assert!(matches!(
+                error,
+                AttributionError::InvalidNetTcp { reason, .. }
+                    if reason.contains("unsupported TCP state")
+            ));
+        }
+    }
+
+    fn ipv4_table() -> ProcfsTcpTable {
+        ProcfsTcpTable {
+            family: ProcfsTcpTableFamily::Ipv4,
+            path: PathBuf::from("/proc/net/tcp"),
+            policy: ProcfsTcpTablePolicy::Required,
+        }
+    }
 }

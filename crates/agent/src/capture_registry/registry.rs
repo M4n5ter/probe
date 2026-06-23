@@ -11,15 +11,20 @@ use runtime::{
     CaptureProviderBuilder, CaptureProviderDescriptor, PlatformProbeResults, ProviderRegistry,
 };
 
+use crate::transparent_interception::TransparentInterceptionProcessClassifier;
+
 pub fn default_provider_registry(
     config: &AgentConfig,
     connection_enforcement_capability: CapabilityState,
     transparent_interception_capability: CapabilityState,
 ) -> ProviderRegistry {
     let ebpf_host = EbpfHostProbe::probe(&EbpfHostProbeConfig::default());
-    let procfs_socket_capabilities = attribution::ProcfsSocketResolver::new().capabilities();
+    let procfs_socket_resolver = attribution::ProcfsSocketResolver::new();
+    let procfs_socket_capabilities = procfs_socket_resolver.capabilities();
     let procfs_socket_attribution =
         procfs_socket_attribution_capability(&procfs_socket_capabilities);
+    let transparent_process_classifier =
+        TransparentInterceptionProcessClassifier::capability_from_resolver(&procfs_socket_resolver);
     let libssl_uprobe = libssl_uprobe::capability(config, &ebpf_host, &procfs_socket_attribution);
     ProviderRegistry::with_platform_probes(
         default_capture_provider_descriptors(config, ebpf_host, procfs_socket_attribution),
@@ -27,8 +32,7 @@ pub fn default_provider_registry(
             procfs_socket: procfs_socket_capabilities,
             connection_enforcement: connection_enforcement_capability,
             transparent_interception: transparent_interception_capability,
-            transparent_process_classifier:
-                PlatformProbeResults::default_transparent_process_classifier(),
+            transparent_process_classifier,
             transparent_flow_classifier: PlatformProbeResults::default_transparent_flow_classifier(
             ),
             libssl_uprobe,

@@ -10,7 +10,9 @@ use probe_core::{EnforcementMode, ProtectiveActionProfile, Selector};
 use runtime::{EnforcementExecutionSurface, EnforcementPolicySourcePlan, RuntimePlan};
 use thiserror::Error;
 
-use crate::transparent_interception::TransparentInterceptionError;
+use crate::transparent_interception::{
+    TransparentInterceptionError, TransparentInterceptionProcessClassifier,
+};
 
 use super::source::{
     EnforcementPolicySourceError, LoadedEnforcementPolicySource, load_enforcement_policy_source,
@@ -121,10 +123,12 @@ pub async fn build_configured_enforcement_check_with_backend(
             interception_selector: plan.config.enforcement.interception.selector.as_ref(),
         },
     );
+    let mut process_classifier = TransparentInterceptionProcessClassifier::new();
     let transparent_interception_setup_scope =
         crate::transparent_interception::effective_setup_scope(
             &plan.enforcement.interception.execution,
             &plan.enforcement.interception.classification,
+            &mut process_classifier,
             setup_selectors,
         );
     let setup_error = match transparent_interception_setup_scope {

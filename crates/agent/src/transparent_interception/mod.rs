@@ -1,6 +1,7 @@
 mod error;
 mod ip_family;
 mod nftables;
+mod process_classifier;
 mod proxy;
 mod runtime;
 
@@ -14,6 +15,7 @@ use probe_core::{CapabilityState, RuntimeMode};
 
 pub(crate) use error::TransparentInterceptionError;
 pub(crate) use ip_family::TransparentInterceptionIpFamily;
+pub(crate) use process_classifier::TransparentInterceptionProcessClassifier;
 use proxy::TransparentProxyRuntime;
 pub(crate) use proxy::{
     TransparentProxyHealthProbeMode, TransparentProxyRuntimeHandle, TransparentProxyRuntimeMode,
@@ -54,6 +56,7 @@ pub(crate) fn resolve(
 pub(crate) fn effective_setup_scope(
     execution_plan: &TransparentInterceptionExecutionPlan,
     classification: &TransparentInterceptionClassificationPlan,
+    process_classifier: &mut TransparentInterceptionProcessClassifier,
     selectors: TransparentInterceptionSetupSelectors,
 ) -> Result<Option<TransparentInterceptionHostRuleScope>, TransparentInterceptionError> {
     if execution_plan.strategy() == TransparentInterceptionStrategyConfig::None {
@@ -69,25 +72,42 @@ pub(crate) fn effective_setup_scope(
             MISSING_LOCAL_SETUP_SELECTOR.to_string(),
         ));
     }
-    executable_host_rule_scope(selectors.local_setup_plan(), classification)?;
-    let scope = executable_host_rule_scope(selectors.final_setup_plan(), classification)?;
+    validate_local_setup_plan(selectors.local_setup_plan())?;
+    let scope = executable_host_rule_scope(
+        selectors.final_setup_plan(),
+        classification,
+        process_classifier,
+    )?;
     nftables::validate_effective_setup_scope(inbound_plan, &scope)?;
     Ok(Some(scope))
+}
+
+fn validate_local_setup_plan(
+    plan: Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError>,
+) -> Result<(), TransparentInterceptionError> {
+    match plan {
+        Ok(_) => Ok(()),
+        Err(error) => Err(TransparentInterceptionError::Setup(error.to_string())),
+    }
 }
 
 fn executable_host_rule_scope(
     plan: Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError>,
     classification: &TransparentInterceptionClassificationPlan,
+    process_classifier: &mut TransparentInterceptionProcessClassifier,
 ) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionError> {
     match plan {
         Ok(TransparentInterceptionSetupPlan::HostRules(scope)) => Ok(scope),
-        Ok(TransparentInterceptionSetupPlan::RequiresProcessClassifier { reason, .. }) => {
-            Err(classifier_setup_error(
-                reason,
-                "process classifier",
-                &classification.process_classifier,
-            ))
-        }
+        Ok(TransparentInterceptionSetupPlan::RequiresProcessClassifier {
+            host_rule_boundary,
+            process_scope,
+            reason,
+        }) => process_classifier.executable_host_rule_scope(
+            reason,
+            host_rule_boundary,
+            process_scope,
+            &classification.process_classifier,
+        ),
         Ok(TransparentInterceptionSetupPlan::RequiresFlowClassifier { reason, .. }) => Err(
             classifier_setup_error(reason, "flow classifier", &classification.flow_classifier),
         ),
@@ -167,8 +187,13 @@ mod tests {
         );
         let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
             .expect("test transparent interception config should be valid");
-        let error = effective_setup_scope(&execution_plan, &unavailable_classifiers(), selectors)
-            .expect_err("remote manifest must not be the only transparent setup scope");
+        let error = effective_setup_scope(
+            &execution_plan,
+            &unavailable_classifiers(),
+            &mut TransparentInterceptionProcessClassifier::new(),
+            selectors,
+        )
+        .expect_err("remote manifest must not be the only transparent setup scope");
 
         assert!(error.to_string().contains("explicit local selector"));
     }
@@ -204,8 +229,13 @@ mod tests {
         let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
             .expect("test transparent interception config should be valid");
 
-        let error = effective_setup_scope(&execution_plan, &unavailable_classifiers(), selectors)
-            .expect_err("process-scoped setup should require a classifier");
+        let error = effective_setup_scope(
+            &execution_plan,
+            &unavailable_classifiers(),
+            &mut TransparentInterceptionProcessClassifier::new(),
+            selectors,
+        )
+        .expect_err("process-scoped setup should require a classifier");
         let message = error.to_string();
 
         assert!(message.contains("transparent_process_classifier"));

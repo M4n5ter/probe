@@ -30,6 +30,12 @@ pub(super) struct SocketFdCandidateScan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SocketInodeOwnerScan {
+    pub(super) pids_by_inode: HashMap<u64, Vec<u32>>,
+    pub(super) complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NamespaceTgidCandidateScan {
     pids: Vec<u32>,
     complete: bool,
@@ -42,22 +48,30 @@ enum SocketFdRead {
     Unknown,
 }
 
-pub(super) fn inode_pid_map(proc_root: &Path) -> Result<HashMap<u64, u32>, AttributionError> {
-    let mut inodes = HashMap::new();
+pub(super) fn socket_inode_owner_scan(
+    proc_root: &Path,
+) -> Result<SocketInodeOwnerScan, AttributionError> {
+    let mut pids_by_inode = HashMap::new();
+    let mut complete = true;
     for ProcfsPidEntry { pid, path } in numeric_pid_dirs(proc_root)? {
-        read_pid_socket_inodes(&path.join("fd"), pid, &mut inodes)?;
+        complete &= read_pid_socket_inodes(&path.join("fd"), pid, &mut pids_by_inode)?;
     }
-    Ok(inodes)
+    Ok(SocketInodeOwnerScan {
+        pids_by_inode,
+        complete,
+    })
 }
 
 pub(super) fn read_pid_socket_inodes(
     fd_dir: &Path,
     pid: u32,
-    inodes: &mut HashMap<u64, u32>,
-) -> Result<(), AttributionError> {
+    inodes: &mut HashMap<u64, Vec<u32>>,
+) -> Result<bool, AttributionError> {
+    let mut complete = true;
     let entries = match fs::read_dir(fd_dir) {
         Ok(entries) => entries,
-        Err(source) if is_skippable_socket_scan_error(&source) => return Ok(()),
+        Err(source) if is_absent_pid_dir_error(&source) => return Ok(true),
+        Err(source) if source.kind() == io::ErrorKind::PermissionDenied => return Ok(false),
         Err(source) => {
             return Err(AttributionError::Read {
                 path: fd_dir.display().to_string(),
@@ -68,7 +82,11 @@ pub(super) fn read_pid_socket_inodes(
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(source) if is_skippable_socket_scan_error(&source) => continue,
+            Err(source) if is_absent_pid_dir_error(&source) => continue,
+            Err(source) if source.kind() == io::ErrorKind::PermissionDenied => {
+                complete = false;
+                continue;
+            }
             Err(source) => {
                 return Err(AttributionError::Read {
                     path: fd_dir.display().to_string(),
@@ -79,7 +97,11 @@ pub(super) fn read_pid_socket_inodes(
         let link_path = entry.path();
         let target = match fs::read_link(&link_path) {
             Ok(target) => target,
-            Err(source) if is_skippable_socket_scan_error(&source) => continue,
+            Err(source) if is_absent_pid_dir_error(&source) => continue,
+            Err(source) if source.kind() == io::ErrorKind::PermissionDenied => {
+                complete = false;
+                continue;
+            }
             Err(source) => {
                 return Err(AttributionError::ReadLink {
                     path: link_path.display().to_string(),
@@ -90,9 +112,9 @@ pub(super) fn read_pid_socket_inodes(
         let Some(inode) = socket_inode_from_link(&target) else {
             continue;
         };
-        inodes.entry(inode).or_insert(pid);
+        push_unique_pid(inodes.entry(inode).or_default(), pid);
     }
-    Ok(())
+    Ok(complete)
 }
 
 pub(super) fn read_socket_inode_for_pid_fd(
@@ -235,6 +257,12 @@ fn push_socket_fd_candidate(candidates: &mut Vec<SocketFdCandidate>, candidate: 
         return;
     }
     candidates.push(candidate);
+}
+
+fn push_unique_pid(pids: &mut Vec<u32>, pid: u32) {
+    if !pids.contains(&pid) {
+        pids.push(pid);
+    }
 }
 
 fn pid_dir_is_visible(proc_root: &Path, pid: u32) -> bool {
@@ -394,7 +422,8 @@ mod tests {
     }
 
     #[test]
-    fn procfs_socket_scan_skips_unreadable_pid_fd_dir() -> Result<(), Box<dyn std::error::Error>> {
+    fn procfs_socket_scan_marks_unreadable_pid_fd_dir_incomplete()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let fd_dir = temp.path().join("fd");
         fs::create_dir(&fd_dir)?;
@@ -404,8 +433,27 @@ mod tests {
         let result = read_pid_socket_inodes(&fd_dir, 321, &mut inodes);
 
         fs::set_permissions(&fd_dir, fs::Permissions::from_mode(0o700))?;
-        result?;
+        assert!(!result?);
         assert!(inodes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn procfs_socket_scan_keeps_all_socket_inode_holders() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let proc_root = temp.path().join("proc");
+        let first_fd_dir = proc_root.join("321").join("fd");
+        let second_fd_dir = proc_root.join("654").join("fd");
+        fs::create_dir_all(&first_fd_dir)?;
+        fs::create_dir_all(&second_fd_dir)?;
+        std::os::unix::fs::symlink("socket:[424242]", first_fd_dir.join("7"))?;
+        std::os::unix::fs::symlink("socket:[424242]", second_fd_dir.join("9"))?;
+
+        let scan = socket_inode_owner_scan(&proc_root)?;
+
+        assert!(scan.complete);
+        assert_eq!(scan.pids_by_inode.get(&424242), Some(&vec![321, 654]));
         Ok(())
     }
 

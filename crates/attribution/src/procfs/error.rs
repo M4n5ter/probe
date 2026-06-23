@@ -14,6 +14,8 @@ pub enum AttributionError {
     InvalidStatus { pid: u32, reason: String },
     #[error("invalid proc net tcp entry in {path}: {reason}")]
     InvalidNetTcp { path: String, reason: String },
+    #[error("incomplete procfs socket owner scan: {reason}")]
+    IncompleteSocketOwnerScan { reason: String },
 }
 
 impl Clone for AttributionError {
@@ -37,6 +39,9 @@ impl Clone for AttributionError {
             },
             Self::InvalidNetTcp { path, reason } => Self::InvalidNetTcp {
                 path: path.clone(),
+                reason: reason.clone(),
+            },
+            Self::IncompleteSocketOwnerScan { reason } => Self::IncompleteSocketOwnerScan {
                 reason: reason.clone(),
             },
         }

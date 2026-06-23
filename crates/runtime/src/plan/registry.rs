@@ -22,8 +22,9 @@ pub struct PlatformProbeResults {
 
 impl PlatformProbeResults {
     pub fn from_host_defaults() -> Self {
+        let procfs_socket = ProcfsSocketResolver::new().capabilities();
         Self {
-            procfs_socket: ProcfsSocketResolver::new().capabilities(),
+            procfs_socket,
             connection_enforcement: default_connection_enforcement_capability(),
             transparent_interception: default_transparent_interception_capability(),
             transparent_process_classifier: Self::default_transparent_process_classifier(),
@@ -35,7 +36,7 @@ impl PlatformProbeResults {
     pub fn default_transparent_process_classifier() -> CapabilityState {
         CapabilityState::unavailable(
             CapabilityKind::TransparentProcessClassifier,
-            "transparent process classifier backend is not configured; process-scoped transparent interception requires cgroup/owner marking or proxy-side process classification",
+            "transparent process classifier capability is not provided by this runtime registry",
         )
     }
 

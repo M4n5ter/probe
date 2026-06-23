@@ -144,7 +144,8 @@ impl ProcfsAttributor {
             }
             AttributionError::InvalidStat { pid: error_pid, .. }
             | AttributionError::InvalidStatus { pid: error_pid, .. } => *error_pid == pid,
-            AttributionError::InvalidNetTcp { .. } => false,
+            AttributionError::InvalidNetTcp { .. }
+            | AttributionError::IncompleteSocketOwnerScan { .. } => false,
         }
     }
 }

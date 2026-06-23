@@ -619,7 +619,7 @@ protective_actions = ["alert"]
         assert_eq!(
             value["enforcement"]["interception"]["classification"]["process_classifier"]["reason"],
             json!(
-                "transparent process classifier backend is not configured; process-scoped transparent interception requires cgroup/owner marking or proxy-side process classification"
+                "transparent process classifier capability is not provided by this runtime registry"
             )
         );
         assert_eq!(
@@ -643,7 +643,7 @@ protective_actions = ["alert"]
         assert_eq!(
             plan_capability(&value, "transparent_process_classifier")["reason"],
             json!(
-                "transparent process classifier backend is not configured; process-scoped transparent interception requires cgroup/owner marking or proxy-side process classification"
+                "transparent process classifier capability is not provided by this runtime registry"
             )
         );
         assert_eq!(
