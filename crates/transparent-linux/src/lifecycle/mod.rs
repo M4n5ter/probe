@@ -14,7 +14,17 @@ pub use resources::{
     InboundTproxyArtifactSpec, OutboundRedirectArtifactSpec, TransparentLinuxResources,
 };
 
-const INBOUND_TPROXY_OWNER_LOCK: &str = "inbound_tproxy";
+pub fn cleanup_all_policy_route_ip_commands(mark: u32, route_table: u32) -> Vec<Vec<String>> {
+    TransparentLinuxIpFamily::all()
+        .into_iter()
+        .flat_map(|family| {
+            [
+                family.rule_command("del", mark, route_table),
+                family.route_command("del", route_table),
+            ]
+        })
+        .collect()
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransparentLinuxPlanError {

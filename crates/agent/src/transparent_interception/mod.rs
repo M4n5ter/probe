@@ -7,7 +7,7 @@ mod runtime;
 
 use ::runtime::{
     TransparentInterceptionClassificationPlan, TransparentInterceptionExecutionPlan,
-    TransparentInterceptionOutboundRedirectPlan,
+    TransparentInterceptionOutboundProxyPlan,
 };
 use interception::{
     TransparentInterceptionHostRuleScope, TransparentInterceptionSetupDirection,
@@ -50,18 +50,14 @@ pub(crate) fn resolve(
         TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) => {
             nftables::resolve(inbound_plan, proxy_runtime)
         }
-        TransparentInterceptionExecutionPlan::OutboundTransparentProxy(_) => {
-            TransparentInterceptionRuntime::unavailable(
-                outbound_transparent_proxy_unavailable(),
-                proxy_runtime,
-            )
+        TransparentInterceptionExecutionPlan::OutboundTransparentProxy(outbound_plan) => {
+            nftables::resolve_outbound(outbound_plan, proxy_runtime)
         }
     }
 }
 
 pub(crate) fn effective_setup_scope(
     execution_plan: &TransparentInterceptionExecutionPlan,
-    outbound_redirect: &TransparentInterceptionOutboundRedirectPlan,
     classification: &TransparentInterceptionClassificationPlan,
     process_classifier: &mut TransparentInterceptionProcessClassifier,
     selectors: TransparentInterceptionSetupSelectors,
@@ -84,11 +80,8 @@ pub(crate) fn effective_setup_scope(
                 selectors,
             )
         }
-        TransparentInterceptionExecutionPlan::OutboundTransparentProxy(_) => {
-            validate_outbound_redirect_setup_scope(outbound_redirect, selectors)?;
-            Err(TransparentInterceptionError::Setup(
-                outbound_transparent_proxy_unavailable(),
-            ))
+        TransparentInterceptionExecutionPlan::OutboundTransparentProxy(outbound_plan) => {
+            validate_outbound_redirect_setup_scope(outbound_plan, selectors).map(Some)
         }
     }
 }
@@ -112,30 +105,31 @@ fn inbound_tproxy_effective_setup_scope(
 }
 
 fn validate_outbound_redirect_setup_scope(
-    outbound_redirect: &TransparentInterceptionOutboundRedirectPlan,
+    outbound_plan: &TransparentInterceptionOutboundProxyPlan,
     selectors: TransparentInterceptionSetupSelectors,
-) -> Result<(), TransparentInterceptionError> {
+) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionError> {
     validate_local_setup_plan(
         selectors.local_setup_plan(TransparentInterceptionSetupDirection::Outbound),
     )?;
     match selectors.final_setup_plan(TransparentInterceptionSetupDirection::Outbound) {
         Ok(TransparentInterceptionSetupPlan::HostRules(scope)) => {
-            nftables::validate_outbound_redirect_setup_scope(outbound_redirect, &scope)
+            nftables::validate_outbound_redirect_setup_scope(outbound_plan, &scope)?;
+            Ok(scope)
         }
         Ok(
             TransparentInterceptionSetupPlan::RequiresProcessClassifier { reason, .. }
             | TransparentInterceptionSetupPlan::RequiresFlowClassifier { reason, .. },
         ) => Err(TransparentInterceptionError::Setup(format!(
             "{reason}; {}",
-            outbound_transparent_proxy_unavailable()
+            outbound_transparent_proxy_classifier_unavailable()
         ))),
         Err(error) => Err(TransparentInterceptionError::Setup(error.to_string())),
     }
 }
 
-fn outbound_transparent_proxy_unavailable() -> String {
+fn outbound_transparent_proxy_classifier_unavailable() -> String {
     format!(
-        "outbound transparent proxy has a typed redirect plan, transparent-linux artifact planning, existing {}, and proxy pre-connect SO_MARK primitive, but requires wiring them into an executable output redirect lifecycle with proxy self-bypass and target recovery before rules can be installed; L7 MITM and certificate handling remain a separate proxy backend",
+        "outbound transparent proxy requires a host-rule setup scope before rule installation; existing {} and proxy pre-connect SO_MARK primitive only make host-rule OUTPUT redirect executable",
         proxy::outbound_original_destination_recovery_name()
     )
 }
@@ -247,7 +241,6 @@ mod tests {
             .expect("test transparent interception config should be valid");
         let error = effective_setup_scope(
             &execution_plan,
-            &TransparentInterceptionOutboundRedirectPlan::NotConfigured,
             &unavailable_classifiers(),
             &mut TransparentInterceptionProcessClassifier::new(),
             selectors,
@@ -290,7 +283,6 @@ mod tests {
 
         let error = effective_setup_scope(
             &execution_plan,
-            &TransparentInterceptionOutboundRedirectPlan::NotConfigured,
             &unavailable_classifiers(),
             &mut TransparentInterceptionProcessClassifier::new(),
             selectors,
@@ -303,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_transparent_proxy_valid_host_scope_reaches_fail_closed_runtime_boundary() {
+    fn outbound_transparent_proxy_valid_host_scope_returns_executable_scope() {
         let config = outbound_transparent_proxy_config();
         let selector = Selector::term(
             ProcessSelector::default(),
@@ -317,21 +309,15 @@ mod tests {
         let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
             .expect("test transparent interception config should be valid");
 
-        let error = effective_setup_scope(
+        let scope = effective_setup_scope(
             &execution_plan,
-            &outbound_redirect_plan(),
             &unavailable_classifiers(),
             &mut TransparentInterceptionProcessClassifier::new(),
             selectors,
         )
-        .expect_err(
-            "outbound transparent proxy should remain fail closed after artifact validation",
-        );
-        let message = error.to_string();
+        .expect("outbound transparent proxy host scope should be executable");
 
-        assert!(message.contains("transparent-linux artifact planning"));
-        assert!(message.contains("proxy self-bypass"));
-        assert!(message.contains("target recovery"));
+        assert!(scope.is_some());
     }
 
     #[test]
@@ -351,7 +337,6 @@ mod tests {
 
         let error = effective_setup_scope(
             &execution_plan,
-            &outbound_redirect_plan(),
             &unavailable_classifiers(),
             &mut TransparentInterceptionProcessClassifier::new(),
             selectors,
@@ -370,21 +355,9 @@ mod tests {
             strategy: TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
             selector: None,
             proxy: TransparentInterceptionProxyConfig {
+                mode: probe_config::TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
                 listen_port: Some(15001),
                 ..TransparentInterceptionProxyConfig::default()
-            },
-        }
-    }
-
-    fn outbound_redirect_plan() -> TransparentInterceptionOutboundRedirectPlan {
-        let artifact = transparent_linux::OutboundRedirectArtifactSpec::outbound_transparent_proxy(
-            ::runtime::TransparentInterceptionNftablesPlan::reserved(),
-            15001,
-        );
-        TransparentInterceptionOutboundRedirectPlan::Planned {
-            artifact,
-            install: ::runtime::TransparentInterceptionOutboundRedirectInstallPlan::Blocked {
-                reason: "test blocked".to_string(),
             },
         }
     }

@@ -1,11 +1,13 @@
+mod activation;
 mod command;
 mod lifecycle;
 mod local_addresses;
+mod outbound;
 mod owner_lock;
 mod probe;
 
 use ::runtime::{
-    TransparentInterceptionInboundTproxyPlan, TransparentInterceptionOutboundRedirectPlan,
+    TransparentInterceptionInboundTproxyPlan, TransparentInterceptionOutboundProxyPlan,
 };
 use interception::TransparentInterceptionHostRuleScope;
 
@@ -15,11 +17,14 @@ use self::{
 };
 use super::{TransparentInterceptionRuntime, proxy::TransparentProxyRuntime};
 use transparent_linux::{
-    InboundTproxyArtifactSpec, InboundTproxyLifecyclePlan, OutboundRedirectArtifactSpec,
-    OutboundRedirectLifecyclePlan, TransparentLinuxResources,
+    InboundTproxyArtifactSpec, InboundTproxyLifecyclePlan, OutboundRedirectLifecyclePlan,
+    TransparentLinuxResources,
 };
 
 pub(super) use lifecycle::{NftablesTransparentInterception, NftablesTransparentInterceptionGuard};
+pub(super) use outbound::{
+    NftablesOutboundTransparentProxy, NftablesOutboundTransparentProxyGuard,
+};
 
 pub(super) fn resolve(
     inbound_plan: TransparentInterceptionInboundTproxyPlan,
@@ -49,6 +54,34 @@ pub(super) fn resolve(
     }
 }
 
+pub(super) fn resolve_outbound(
+    outbound_plan: TransparentInterceptionOutboundProxyPlan,
+    proxy_runtime: TransparentProxyRuntime,
+) -> TransparentInterceptionRuntime {
+    match NftablesInterceptionProbe::default().resolve() {
+        NftablesInterceptionProbeResult::Available { nft, ip } => {
+            TransparentInterceptionRuntime::available(
+                NftablesOutboundTransparentProxy::new(
+                    outbound_plan,
+                    SystemNft::new(nft),
+                    ip.map(SystemIp::new),
+                    proxy_runtime.clone(),
+                ),
+                proxy_runtime,
+                "outbound transparent proxy nftables lifecycle entrypoints are available; run will check final selector-projected OUTPUT redirect rules before acquiring the owner lock and installing them",
+            )
+        }
+        NftablesInterceptionProbeResult::Unavailable(capability) => {
+            TransparentInterceptionRuntime::unavailable(
+                capability
+                    .reason
+                    .unwrap_or_else(|| "outbound transparent proxy is unavailable".to_string()),
+                proxy_runtime,
+            )
+        }
+    }
+}
+
 pub(super) fn validate_inbound_tproxy_setup_scope(
     inbound_plan: &TransparentInterceptionInboundTproxyPlan,
     setup_scope: &TransparentInterceptionHostRuleScope,
@@ -65,27 +98,14 @@ pub(super) fn validate_inbound_tproxy_setup_scope(
 }
 
 pub(super) fn validate_outbound_redirect_setup_scope(
-    outbound_redirect: &TransparentInterceptionOutboundRedirectPlan,
+    outbound_plan: &TransparentInterceptionOutboundProxyPlan,
     setup_scope: &TransparentInterceptionHostRuleScope,
 ) -> Result<(), super::TransparentInterceptionError> {
-    let spec = outbound_redirect_spec(outbound_redirect)?;
-    OutboundRedirectLifecyclePlan::from_spec_and_scope(spec, setup_scope.clone())
-        .map(|plan| plan.setup_nft_script())
-        .map_err(|error| super::TransparentInterceptionError::Setup(error.to_string()))
-        .map(|_| ())
-}
-
-fn outbound_redirect_spec(
-    outbound_redirect: &TransparentInterceptionOutboundRedirectPlan,
-) -> Result<OutboundRedirectArtifactSpec, super::TransparentInterceptionError> {
-    match outbound_redirect {
-        TransparentInterceptionOutboundRedirectPlan::Planned { artifact, .. } => {
-            Ok(artifact.clone())
-        }
-        TransparentInterceptionOutboundRedirectPlan::NotConfigured => {
-            Err(super::TransparentInterceptionError::Setup(
-                "outbound transparent proxy redirect preview is not planned".to_string(),
-            ))
-        }
-    }
+    OutboundRedirectLifecyclePlan::from_spec_and_scope(
+        outbound_plan.outbound_redirect_artifact().clone(),
+        setup_scope.clone(),
+    )
+    .map(|plan| plan.setup_nft_script())
+    .map_err(|error| super::TransparentInterceptionError::Setup(error.to_string()))
+    .map(|_| ())
 }

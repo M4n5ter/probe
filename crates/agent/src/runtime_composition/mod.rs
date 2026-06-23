@@ -74,11 +74,9 @@ fn build_runtime_composition_from_registry(
 pub(crate) fn build_runtime_composition_for_test(
     config: AgentConfig,
     capture_providers: Vec<runtime::CaptureProviderDescriptor>,
-    mut platform: runtime::PlatformProbeResults,
+    platform: runtime::PlatformProbeResults,
 ) -> Result<RuntimeComposition, AgentError> {
     let (connection_enforcement, transparent_interception) = execution_runtimes_for_config(&config);
-    platform.connection_enforcement = connection_enforcement.capability();
-    platform.transparent_interception = transparent_interception.capability();
     let registry = ProviderRegistry::with_platform_probes(capture_providers, platform);
     build_runtime_composition_from_registry(
         config,
@@ -128,10 +126,7 @@ mod tests {
         CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector, RuntimeMode,
         Selector, TrafficSelector,
     };
-    use runtime::{
-        CaptureProviderBuilder, CaptureProviderDescriptor, PlatformProbeResults,
-        TransparentInterceptionOutboundRedirectPlan,
-    };
+    use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, PlatformProbeResults};
 
     use super::*;
 
@@ -145,12 +140,14 @@ mod tests {
     }
 
     #[test]
-    fn outbound_transparent_proxy_composition_exposes_preview_without_executable_capability() {
+    fn outbound_transparent_proxy_requires_available_interception_capability() {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
             TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
+        config.enforcement.interception.proxy.mode =
+            probe_config::TransparentInterceptionProxyModeConfig::ManagedTcpRelay;
         config.enforcement.interception.proxy.listen_port = Some(15001);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
@@ -160,39 +157,20 @@ mod tests {
                 ..TrafficSelector::default()
             },
         ));
-        let composition = build_runtime_composition_for_test(
+        let error = match build_runtime_composition_for_test(
             config,
             vec![CaptureProviderDescriptor::available(
                 probe_config::CaptureBackend::Libpcap,
                 CaptureProviderBuilder::Libpcap,
             )],
             test_platform_probes(),
-        )
-        .expect("outbound transparent proxy preview should build through runtime composition");
-        let plan = composition.into_plan();
-        let transparent_interception = plan
-            .capabilities
-            .state(CapabilityKind::TransparentInterception);
-
-        assert_eq!(transparent_interception.mode, RuntimeMode::Unavailable);
-        assert!(
-            transparent_interception
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("executable output redirect lifecycle"))
-        );
-        assert_eq!(
-            plan.enforcement.interception.capability,
-            runtime::EnforcementCapabilityPlan::NotRequired
-        );
-        let TransparentInterceptionOutboundRedirectPlan::Planned { install, .. } =
-            plan.enforcement.interception.outbound_redirect
-        else {
-            panic!("outbound transparent proxy should expose a redirect preview");
+        ) {
+            Ok(_) => panic!("outbound transparent proxy should require executable capability"),
+            Err(error) => error,
         };
-        let runtime::TransparentInterceptionOutboundRedirectInstallPlan::Blocked { reason } =
-            install;
-        assert!(reason.contains("output redirect lifecycle"));
+
+        let message = error.to_string();
+        assert!(message.contains("not configured"), "{message}");
     }
 
     #[test]

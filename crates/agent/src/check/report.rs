@@ -440,6 +440,7 @@ protective_actions = ["alert"]
         );
         assert_eq!(value["enforcement"]["mode"], json!("audit_only"));
         assert_eq!(value["enforcement"]["composition"]["kind"], json!("ready"));
+        assert!(value["enforcement"]["composition"].get("reason").is_none());
         assert_eq!(value["enforcement"]["connection"]["backend"], json!("none"));
         assert_eq!(
             value["enforcement"]["connection"]["capability"]["kind"],
@@ -602,13 +603,15 @@ protective_actions = ["alert"]
     }
 
     #[tokio::test]
-    async fn check_report_exposes_outbound_redirect_preview()
+    async fn check_report_exposes_outbound_redirect_artifact()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
             TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
+        config.enforcement.interception.proxy.mode =
+            probe_config::TransparentInterceptionProxyModeConfig::ManagedTcpRelay;
         config.enforcement.interception.proxy.listen_port = Some(15001);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
@@ -623,15 +626,7 @@ protective_actions = ["alert"]
         let report = build_check_report(plan, backend).await?;
         let value = serde_json::to_value(report)?;
 
-        assert_eq!(
-            value["enforcement"]["composition"]["kind"],
-            json!("blocked")
-        );
-        assert!(
-            value["enforcement"]["composition"]["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("output redirect lifecycle"))
-        );
+        assert_eq!(value["enforcement"]["composition"]["kind"], json!("ready"));
         assert_eq!(
             value["enforcement"]["interception"]["local_setup_projection"]["kind"],
             json!("host_rules")
@@ -653,20 +648,22 @@ protective_actions = ["alert"]
             json!(15001)
         );
         assert_eq!(
-            value["enforcement"]["interception"]["outbound_redirect"]["install"]["kind"],
-            json!("blocked")
+            value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["proxy_bypass_mark"],
+            json!(0x5353_4102)
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn check_report_exposes_outbound_process_scope_preview()
+    async fn check_report_exposes_outbound_process_scope_requirement()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
             TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
+        config.enforcement.interception.proxy.mode =
+            probe_config::TransparentInterceptionProxyModeConfig::ManagedTcpRelay;
         config.enforcement.interception.proxy.listen_port = Some(15001);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector {
@@ -691,7 +688,7 @@ protective_actions = ["alert"]
         assert!(
             value["enforcement"]["composition"]["reason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("output redirect lifecycle"))
+                .is_some_and(|reason| reason.contains("process classifier"))
         );
         assert_eq!(
             value["enforcement"]["interception"]["local_setup_projection"]["kind"],
@@ -700,10 +697,6 @@ protective_actions = ["alert"]
         assert_eq!(
             value["enforcement"]["interception"]["outbound_redirect"]["kind"],
             json!("planned")
-        );
-        assert_eq!(
-            value["enforcement"]["interception"]["outbound_redirect"]["install"]["kind"],
-            json!("blocked")
         );
         Ok(())
     }
@@ -771,9 +764,8 @@ protective_actions = ["alert"]
                     CapabilityKind::ConnectionEnforcement,
                     "not configured",
                 ),
-                transparent_interception: CapabilityState::unavailable(
+                transparent_interception: CapabilityState::available(
                     CapabilityKind::TransparentInterception,
-                    "not configured",
                 ),
                 transparent_process_classifier: CapabilityState::degraded(
                     CapabilityKind::TransparentProcessClassifier,

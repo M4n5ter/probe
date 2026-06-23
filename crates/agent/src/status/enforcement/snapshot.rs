@@ -158,7 +158,11 @@ fn enforcement_status_with_source(
             strategy: plan.enforcement.interception.strategy,
             proxy: plan.enforcement.interception.proxy.clone(),
             nftables: plan.enforcement.interception.nftables.clone(),
-            outbound_redirect: plan.enforcement.interception.outbound_redirect.clone(),
+            outbound_redirect: plan
+                .enforcement
+                .interception
+                .execution
+                .outbound_redirect_plan(),
             local_setup_projection: plan.enforcement.interception.local_setup_projection.clone(),
             classification: plan.enforcement.interception.classification.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,
@@ -796,13 +800,16 @@ protective_actions = ["alert"]
     }
 
     #[test]
-    fn enforce_status_reports_outbound_redirect_preview() -> Result<(), Box<dyn std::error::Error>>
+    fn enforce_status_reports_outbound_redirect_artifact() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut config = config_with_storage_path("/tmp/sssa-spool".into());
         config.capture.selection = probe_config::CaptureSelection::Libpcap;
+        config.exporters.clear();
         config.enforcement.mode = probe_core::EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
             probe_config::TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
+        config.enforcement.interception.proxy.mode =
+            probe_config::TransparentInterceptionProxyModeConfig::ManagedTcpRelay;
         config.enforcement.interception.proxy.listen_port = Some(15001);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
@@ -827,7 +834,7 @@ protective_actions = ["alert"]
         ));
         assert!(matches!(
             status.interception.capability,
-            EnforcementCapabilityStatusSnapshot::NotRequired
+            EnforcementCapabilityStatusSnapshot::Required { .. }
         ));
         assert_eq!(
             value["interception"]["outbound_redirect"]["kind"],
@@ -844,15 +851,6 @@ protective_actions = ["alert"]
         assert_eq!(
             value["interception"]["outbound_redirect"]["artifact"]["proxy_bypass_mark"],
             json!(0x5353_4102)
-        );
-        assert_eq!(
-            value["interception"]["outbound_redirect"]["install"]["kind"],
-            json!("blocked")
-        );
-        assert!(
-            value["interception"]["outbound_redirect"]["install"]["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("output redirect lifecycle"))
         );
         Ok(())
     }
@@ -936,9 +934,8 @@ protective_actions = ["alert"]
                     CapabilityKind::ConnectionEnforcement,
                     "not configured",
                 ),
-                transparent_interception: probe_core::CapabilityState::unavailable(
+                transparent_interception: probe_core::CapabilityState::available(
                     CapabilityKind::TransparentInterception,
-                    "not configured",
                 ),
                 transparent_process_classifier:
                     runtime::PlatformProbeResults::default_transparent_process_classifier(),

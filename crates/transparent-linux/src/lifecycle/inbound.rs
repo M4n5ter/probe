@@ -3,8 +3,8 @@ use interception::TransparentInterceptionHostRuleScope;
 use interception::{TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan};
 
 use super::{
-    INBOUND_TPROXY_OWNER_LOCK, InboundTproxyArtifactSpec, TransparentLinuxIpFamily,
-    TransparentLinuxPlanError, hex_mark,
+    InboundTproxyArtifactSpec, TransparentLinuxIpFamily, TransparentLinuxPlanError,
+    cleanup_all_policy_route_ip_commands, hex_mark,
     projection::{NftFamily, NftRule, NftSelectorProjection},
 };
 
@@ -80,19 +80,11 @@ impl InboundTproxyLifecyclePlan {
     }
 
     pub fn cleanup_all_ip_commands(&self) -> Vec<Vec<String>> {
-        TransparentLinuxIpFamily::all()
-            .into_iter()
-            .flat_map(|family| {
-                [
-                    family.rule_command("del", self.mark, self.route_table),
-                    family.route_command("del", self.route_table),
-                ]
-            })
-            .collect()
+        cleanup_all_policy_route_ip_commands(self.mark, self.route_table)
     }
 
-    pub fn owner_name(&self) -> &'static str {
-        INBOUND_TPROXY_OWNER_LOCK
+    pub fn owner_name(&self) -> &str {
+        &self.table_name
     }
 
     pub fn listener_families(&self) -> Vec<TransparentLinuxIpFamily> {
@@ -139,6 +131,9 @@ impl InboundTproxyLifecyclePlan {
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        OutboundRedirectArtifactSpec, OutboundRedirectLifecyclePlan, TransparentLinuxResources,
+    };
     use probe_config::{
         EnforcementInterceptionConfig, TransparentInterceptionProxyConfig,
         TransparentInterceptionStrategyConfig,
@@ -241,8 +236,8 @@ mod tests {
     }
 
     #[test]
-    fn executable_owner_lock_stays_on_the_inbound_tproxy_lifecycle() {
-        let first = interception_config(Some(Selector::term(
+    fn owner_lock_is_scoped_to_the_shared_nft_table() {
+        let inbound = interception_config(Some(Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
                 local_ports: vec![8443],
@@ -250,16 +245,31 @@ mod tests {
                 ..TrafficSelector::default()
             },
         )));
-        let second = first.clone();
+        let outbound_selector = Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        );
 
-        let first_scope = setup_scope(first.selector.as_ref().expect("selector should be set"));
-        let first_plan =
-            lifecycle_plan(&first, first_scope.clone()).expect("first plan should be valid");
-        let second_plan =
-            lifecycle_plan(&second, first_scope).expect("second plan should be valid");
+        let inbound_plan = lifecycle_plan(
+            &inbound,
+            setup_scope(inbound.selector.as_ref().expect("selector should be set")),
+        )
+        .expect("inbound plan should be valid");
+        let outbound_plan = OutboundRedirectLifecyclePlan::from_spec_and_scope(
+            OutboundRedirectArtifactSpec::outbound_transparent_proxy(
+                TransparentLinuxResources::reserved(),
+                15001,
+            ),
+            outbound_setup_scope(&outbound_selector),
+        )
+        .expect("outbound plan should be valid");
 
-        assert_eq!(first_plan.owner_name(), "inbound_tproxy");
-        assert_eq!(second_plan.owner_name(), "inbound_tproxy");
+        assert_eq!(inbound_plan.owner_name(), "sssa_probe");
+        assert_eq!(outbound_plan.owner_name(), inbound_plan.owner_name());
     }
 
     #[test]
@@ -323,6 +333,18 @@ mod tests {
         match TransparentInterceptionSetupPlan::from_selector(
             Some(selector),
             TransparentInterceptionSetupDirection::Inbound,
+        )
+        .expect("test selector should project")
+        {
+            TransparentInterceptionSetupPlan::HostRules(scope) => scope,
+            _ => panic!("test selector should project to host rules"),
+        }
+    }
+
+    fn outbound_setup_scope(selector: &Selector) -> TransparentInterceptionHostRuleScope {
+        match TransparentInterceptionSetupPlan::from_selector(
+            Some(selector),
+            TransparentInterceptionSetupDirection::Outbound,
         )
         .expect("test selector should project")
         {

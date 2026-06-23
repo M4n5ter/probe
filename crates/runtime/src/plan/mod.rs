@@ -19,7 +19,6 @@ pub use enforcement::{
     EnforcementPolicySourcePlan, TransparentInterceptionClassificationPlan,
     TransparentInterceptionExecutionPlan, TransparentInterceptionInboundTproxyPlan,
     TransparentInterceptionNftablesPlan, TransparentInterceptionOutboundProxyPlan,
-    TransparentInterceptionOutboundRedirectInstallPlan,
     TransparentInterceptionOutboundRedirectPlan, TransparentInterceptionProxyHealthProbePlan,
     TransparentInterceptionProxyPlan, TransparentInterceptionProxyPlanError,
 };

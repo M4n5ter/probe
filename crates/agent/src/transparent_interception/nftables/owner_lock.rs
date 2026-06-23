@@ -128,11 +128,11 @@ mod tests {
             directory: temp.path().to_path_buf(),
         };
 
-        let guard = first.acquire("inbound_tproxy")?;
-        let path = temp.path().join("inbound_tproxy.lock");
+        let guard = first.acquire("sssa_probe")?;
+        let path = temp.path().join("sssa_probe.lock");
         assert!(path.exists());
 
-        let error = match second.acquire("inbound_tproxy") {
+        let error = match second.acquire("sssa_probe") {
             Ok(_) => panic!("same owner must be single-writer"),
             Err(error) => error,
         };
@@ -140,7 +140,7 @@ mod tests {
         assert!(error.to_string().contains("already active"));
         drop(guard);
         assert!(path.exists());
-        second.acquire("inbound_tproxy")?;
+        second.acquire("sssa_probe")?;
         Ok(())
     }
 }

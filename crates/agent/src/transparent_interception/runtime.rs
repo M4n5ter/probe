@@ -3,7 +3,10 @@ use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
 
 use super::{
     TransparentInterceptionError,
-    nftables::{NftablesTransparentInterception, NftablesTransparentInterceptionGuard},
+    nftables::{
+        NftablesOutboundTransparentProxy, NftablesOutboundTransparentProxyGuard,
+        NftablesTransparentInterception, NftablesTransparentInterceptionGuard,
+    },
     proxy::{TransparentProxyRuntime, TransparentProxyRuntimeHandle},
 };
 
@@ -106,8 +109,24 @@ impl TransparentInterceptionLifecycle for NftablesTransparentInterception {
     }
 }
 
+impl TransparentInterceptionLifecycle for NftablesOutboundTransparentProxy {
+    fn activate(
+        self: Box<Self>,
+        setup_scope: TransparentInterceptionHostRuleScope,
+    ) -> Result<Box<dyn TransparentInterceptionGuardLifecycle>, TransparentInterceptionError> {
+        NftablesOutboundTransparentProxy::activate(*self, setup_scope)
+            .map(|guard| Box::new(guard) as Box<dyn TransparentInterceptionGuardLifecycle>)
+    }
+}
+
 impl TransparentInterceptionGuardLifecycle for NftablesTransparentInterceptionGuard {
     fn deactivate(self: Box<Self>) -> Result<(), TransparentInterceptionError> {
         NftablesTransparentInterceptionGuard::deactivate(*self)
+    }
+}
+
+impl TransparentInterceptionGuardLifecycle for NftablesOutboundTransparentProxyGuard {
+    fn deactivate(self: Box<Self>) -> Result<(), TransparentInterceptionError> {
+        NftablesOutboundTransparentProxyGuard::deactivate(*self)
     }
 }

@@ -3,8 +3,8 @@ use interception::TransparentInterceptionHostRuleScope;
 use interception::TransparentInterceptionSetupDirection;
 
 use super::{
-    OutboundRedirectArtifactSpec, TransparentLinuxPlanError, hex_mark,
-    projection::{NftRule, NftSelectorProjection},
+    OutboundRedirectArtifactSpec, TransparentLinuxIpFamily, TransparentLinuxPlanError, hex_mark,
+    projection::{NftFamily, NftRule, NftSelectorProjection},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +54,33 @@ impl OutboundRedirectLifecyclePlan {
 
     pub fn cleanup_nft_script(&self) -> String {
         format!("destroy table inet {}\n", self.table_name)
+    }
+
+    pub fn owner_name(&self) -> &str {
+        &self.table_name
+    }
+
+    pub fn listener_families(&self) -> Vec<TransparentLinuxIpFamily> {
+        let mut families = Vec::new();
+        if self
+            .rules
+            .iter()
+            .any(|rule| rule.family() == NftFamily::Ipv4)
+        {
+            families.push(TransparentLinuxIpFamily::Ipv4);
+        }
+        if self
+            .rules
+            .iter()
+            .any(|rule| rule.family() == NftFamily::Ipv6)
+        {
+            families.push(TransparentLinuxIpFamily::Ipv6);
+        }
+        families
+    }
+
+    pub fn proxy_bypass_mark(&self) -> u32 {
+        self.proxy_bypass_mark
     }
 
     fn add_chain_command(&self) -> String {

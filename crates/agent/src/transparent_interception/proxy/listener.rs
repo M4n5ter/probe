@@ -31,6 +31,7 @@ pub(super) struct ManagedTransparentProxyListener {
 pub(super) fn start_listeners(
     listen_port: u16,
     families: Vec<TransparentInterceptionIpFamily>,
+    relay_plan: TransparentProxyRelayPlan,
     shutdown_requested: Arc<AtomicBool>,
     relays: RelayRegistry,
     runtime: TransparentProxyRuntime,
@@ -57,11 +58,12 @@ pub(super) fn start_listeners(
             let shutdown = Arc::clone(&shutdown_requested);
             let relay_registry = relays.clone();
             let proxy_runtime = runtime.clone();
+            let listener_relay_plan = relay_plan.clone();
             let thread = thread::spawn(move || {
                 listener_loop(
                     listener,
                     family,
-                    TransparentProxyRelayPlan::inbound_tproxy(listen_port),
+                    listener_relay_plan,
                     shutdown,
                     relay_registry,
                     proxy_runtime,
@@ -145,7 +147,7 @@ fn listener_loop(
                     relay_threads.push(spawn_relay(
                         accepted,
                         peer,
-                        plan,
+                        plan.clone(),
                         Arc::clone(&shutdown_requested),
                         relay_registry.clone(),
                         slot,

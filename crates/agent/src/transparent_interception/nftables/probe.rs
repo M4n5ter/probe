@@ -37,13 +37,13 @@ impl NftablesInterceptionProbe {
 
         if !self.running_as_root {
             return unavailable(
-                "transparent interception requires root to install nftables rules and policy routing",
+                "transparent interception requires root to install nftables rules and host routing state",
             );
         }
 
         let Some(ip) = self.ip.clone() else {
             return unavailable(
-                "inbound TPROXY interception requires ip at a trusted system path for policy routing",
+                "transparent interception requires ip at a trusted system path for host routing state",
             );
         };
         let ip = Some(ip);

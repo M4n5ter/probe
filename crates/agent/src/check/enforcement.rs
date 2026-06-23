@@ -125,7 +125,11 @@ pub(super) async fn check_enforcement(
             strategy: plan.enforcement.interception.strategy,
             proxy: plan.enforcement.interception.proxy.clone(),
             nftables: plan.enforcement.interception.nftables.clone(),
-            outbound_redirect: plan.enforcement.interception.outbound_redirect.clone(),
+            outbound_redirect: plan
+                .enforcement
+                .interception
+                .execution
+                .outbound_redirect_plan(),
             local_setup_projection: plan.enforcement.interception.local_setup_projection.clone(),
             classification: plan.enforcement.interception.classification.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,

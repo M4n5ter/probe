@@ -7,7 +7,7 @@ use std::{
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct TransparentProxyUpstreamConnectPlan {
     timeout: Duration,
     proxy_bypass_mark: Option<TransparentProxyBypassMark>,
@@ -25,10 +25,14 @@ impl TransparentProxyUpstreamConnectPlan {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct TransparentProxyBypassMark(pub(super) NonZeroU32);
 
 impl TransparentProxyBypassMark {
+    pub(super) fn new(mark: NonZeroU32) -> Self {
+        Self(mark)
+    }
+
     fn get(self) -> u32 {
         self.0.get()
     }

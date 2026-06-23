@@ -199,11 +199,19 @@ impl EnforcementInterceptionConfig {
         let mut violations = Vec::new();
 
         if self.proxy.mode == TransparentInterceptionProxyModeConfig::ManagedTcpRelay
-            && self.strategy != TransparentInterceptionStrategyConfig::InboundTproxy
+            && self.strategy == TransparentInterceptionStrategyConfig::None
         {
             violations.push(intent_violation(
                 "enforcement.interception.proxy.mode",
-                "managed TCP relay proxy mode is only valid for inbound TPROXY interception",
+                "managed TCP relay proxy mode requires an enabled transparent interception strategy",
+            ));
+        }
+        if self.strategy == TransparentInterceptionStrategyConfig::OutboundTransparentProxy
+            && self.proxy.mode != TransparentInterceptionProxyModeConfig::ManagedTcpRelay
+        {
+            violations.push(intent_violation(
+                "enforcement.interception.proxy.mode",
+                "outbound transparent proxy currently requires managed TCP relay so the agent can apply proxy self-bypass marks",
             ));
         }
 

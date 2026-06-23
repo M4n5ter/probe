@@ -110,7 +110,7 @@ impl TransparentProxyRuntime {
                 (mode, Some(inbound_plan.health_probe()))
             }
             TransparentInterceptionExecutionPlan::OutboundTransparentProxy(_) => {
-                (TransparentProxyRuntimeMode::External, None)
+                (TransparentProxyRuntimeMode::Configured, None)
             }
         };
         let health_probe = health_probe_plan
@@ -437,13 +437,13 @@ mod tests {
         let outbound_transparent_proxy =
             TransparentProxyRuntime::for_test_config(&interception_config(
                 TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
-                TransparentInterceptionProxyModeConfig::External,
+                TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
             ))
             .handle()
             .snapshot();
         assert_eq!(
             outbound_transparent_proxy.mode,
-            TransparentProxyRuntimeMode::External
+            TransparentProxyRuntimeMode::Configured
         );
     }
 

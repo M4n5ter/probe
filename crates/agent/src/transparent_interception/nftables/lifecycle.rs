@@ -1,13 +1,16 @@
 use super::{
-    command::{CommandResult, IpCommand, NftCommand},
-    local_addresses,
+    activation::{
+        SharedIpCommand, apply_ip_command, apply_nft_script, checked_nft_setup_owner,
+        local_address_inventory, lock_ip_command, stop_proxy_best_effort,
+    },
+    command::{IpCommand, NftCommand},
     owner_lock::{NftablesOwnerLock, NftablesOwnerLockGuard, SystemNftablesOwnerLock},
 };
 use crate::transparent_interception::{
     TransparentInterceptionError, TransparentInterceptionIpFamily,
     proxy::{
-        LocalAddressInventory, TransparentProxyGuard, TransparentProxyRuntime,
-        prepare_proxy_lifecycle, start_proxy_lifecycle,
+        TransparentProxyGuard, TransparentProxyRuntime, prepare_proxy_lifecycle,
+        start_proxy_lifecycle,
     },
 };
 #[cfg(test)]
@@ -18,10 +21,8 @@ use interception::TransparentInterceptionHostRuleScope;
 use interception::{TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan};
 #[cfg(test)]
 use probe_config::EnforcementInterceptionConfig;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use transparent_linux::{InboundTproxyArtifactSpec, InboundTproxyLifecyclePlan};
-
-type SharedIpCommand = Arc<Mutex<Box<dyn IpCommand + Send>>>;
 
 pub(in crate::transparent_interception) struct NftablesTransparentInterception {
     inbound_plan: TransparentInterceptionInboundTproxyPlan,
@@ -115,8 +116,12 @@ impl NftablesTransparentInterception {
             local_address_inventory(self.ip.clone()),
         )?;
         let setup_script = plan.setup_nft_script();
-        check_nft_script(self.nft.as_mut(), &setup_script)?;
-        let owner_lock = self.owner_lock.acquire(plan.owner_name())?;
+        let owner_lock = checked_nft_setup_owner(
+            self.nft.as_mut(),
+            self.owner_lock.as_mut(),
+            &setup_script,
+            plan.owner_name(),
+        )?;
         self.cleanup_previous_owned_state_best_effort(&plan);
         let proxy = start_proxy_lifecycle(proxy_plan, self.proxy_runtime.clone())?;
         if let Err(error) = self.install_policy_routes(&plan) {
@@ -230,80 +235,6 @@ impl Drop for NftablesTransparentInterceptionGuard {
     }
 }
 
-fn local_address_inventory(ip: Option<SharedIpCommand>) -> LocalAddressInventory {
-    Arc::new(move || {
-        let Some(ip) = ip.as_ref() else {
-            return Err(TransparentInterceptionError::Nftables(
-                "local address inventory requires ip at a trusted system path".to_string(),
-            ));
-        };
-        let mut ip = lock_ip_command(ip)?;
-        local_addresses::load(ip.as_mut())
-    })
-}
-
-fn lock_ip_command(
-    ip: &SharedIpCommand,
-) -> Result<MutexGuard<'_, Box<dyn IpCommand + Send>>, TransparentInterceptionError> {
-    ip.lock().map_err(|_| {
-        TransparentInterceptionError::Nftables("ip command mutex is poisoned".to_string())
-    })
-}
-
-fn apply_nft_script(
-    nft: &mut dyn NftCommand,
-    script: &str,
-    command_name: &str,
-) -> Result<(), TransparentInterceptionError> {
-    let result = nft
-        .apply(script)
-        .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
-    command_success(result, command_name)
-}
-
-fn stop_proxy_best_effort(
-    proxy: Option<TransparentProxyGuard>,
-) -> Result<(), TransparentInterceptionError> {
-    match proxy {
-        Some(proxy) => proxy.stop(),
-        None => Ok(()),
-    }
-}
-
-fn check_nft_script(
-    nft: &mut dyn NftCommand,
-    script: &str,
-) -> Result<(), TransparentInterceptionError> {
-    let result = nft
-        .check(script)
-        .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
-    command_success(result, "nft --check")
-}
-
-fn apply_ip_command(
-    ip: &mut dyn IpCommand,
-    args: &[String],
-    command_name: &str,
-) -> Result<(), TransparentInterceptionError> {
-    let result = ip
-        .run(args)
-        .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
-    command_success(result, command_name)
-}
-
-fn command_success(
-    result: CommandResult,
-    command_name: &str,
-) -> Result<(), TransparentInterceptionError> {
-    if result.success {
-        Ok(())
-    } else {
-        Err(TransparentInterceptionError::Nftables(
-            result.failure_reason(command_name),
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -326,6 +257,7 @@ mod tests {
         TransparentProxyRuntimeHandle, nftables::owner_lock::NoopNftablesOwnerLock,
     };
 
+    use super::super::command::CommandResult;
     use super::*;
 
     #[test]

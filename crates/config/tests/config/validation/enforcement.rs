@@ -96,7 +96,7 @@ strategy = "inbound_tproxy"
 }
 
 #[test]
-fn validation_rejects_managed_relay_without_inbound_tproxy()
+fn validation_rejects_outbound_transparent_proxy_without_managed_relay()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
         r#"
@@ -104,19 +104,18 @@ fn validation_rejects_managed_relay_without_inbound_tproxy()
 strategy = "outbound_transparent_proxy"
 
 [enforcement.interception.proxy]
-mode = "managed_tcp_relay"
 listen_port = 15001
 "#,
     )?;
 
     let error = config
         .validate_basic()
-        .expect_err("managed relay must be tied to inbound TPROXY");
+        .expect_err("outbound transparent proxy must use managed relay");
 
     assert!(
         error
             .to_string()
-            .contains("managed TCP relay proxy mode is only valid for inbound TPROXY interception")
+            .contains("outbound transparent proxy currently requires managed TCP relay")
     );
     Ok(())
 }

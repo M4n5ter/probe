@@ -9,6 +9,7 @@ fn parses_transparent_interception_strategy() -> Result<(), Box<dyn std::error::
 strategy = "outbound_transparent_proxy"
 
 [enforcement.interception.proxy]
+mode = "managed_tcp_relay"
 listen_port = 15001
 
 [enforcement.interception.selector]
@@ -37,6 +38,10 @@ remote_addresses = []
     assert_eq!(
         config.enforcement.interception.proxy.listen_port,
         Some(15001)
+    );
+    assert_eq!(
+        config.enforcement.interception.proxy.mode,
+        TransparentInterceptionProxyModeConfig::ManagedTcpRelay
     );
     assert!(config.enforcement.interception.selector.is_some());
     Ok(())

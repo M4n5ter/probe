@@ -14,7 +14,9 @@ use std::{
     },
 };
 
-use ::runtime::TransparentInterceptionInboundTproxyPlan;
+use ::runtime::{
+    TransparentInterceptionInboundTproxyPlan, TransparentInterceptionOutboundProxyPlan,
+};
 use probe_config::TransparentInterceptionProxyModeConfig;
 
 use self::{
@@ -43,6 +45,7 @@ pub(in crate::transparent_interception) struct TransparentProxyLifecyclePlan {
 struct ManagedTransparentProxyPlan {
     listen_port: u16,
     families: Vec<TransparentInterceptionIpFamily>,
+    relay_plan: relay::TransparentProxyRelayPlan,
 }
 
 pub(in crate::transparent_interception) struct TransparentProxyGuard {
@@ -64,6 +67,24 @@ pub(in crate::transparent_interception) fn prepare_proxy_lifecycle(
     Ok(TransparentProxyLifecyclePlan {
         managed,
         health_probe,
+    })
+}
+
+pub(in crate::transparent_interception) fn prepare_outbound_proxy_lifecycle(
+    outbound_plan: &TransparentInterceptionOutboundProxyPlan,
+    families: Vec<TransparentInterceptionIpFamily>,
+    proxy_bypass_mark: u32,
+    load_local_addresses: LocalAddressInventory,
+) -> Result<TransparentProxyLifecyclePlan, TransparentInterceptionError> {
+    let managed = prepare_outbound_managed_proxy(
+        outbound_plan,
+        families,
+        proxy_bypass_mark,
+        load_local_addresses,
+    )?;
+    Ok(TransparentProxyLifecyclePlan {
+        managed,
+        health_probe: None,
     })
 }
 
@@ -114,6 +135,38 @@ fn prepare_managed_proxy(
     Ok(Some(ManagedTransparentProxyPlan {
         listen_port: inbound_plan.listen_port().get(),
         families,
+        relay_plan: relay::TransparentProxyRelayPlan::inbound_tproxy(
+            inbound_plan.listen_port().get(),
+        ),
+    }))
+}
+
+fn prepare_outbound_managed_proxy(
+    outbound_plan: &TransparentInterceptionOutboundProxyPlan,
+    families: Vec<TransparentInterceptionIpFamily>,
+    proxy_bypass_mark: u32,
+    load_local_addresses: LocalAddressInventory,
+) -> Result<Option<ManagedTransparentProxyPlan>, TransparentInterceptionError> {
+    if families.is_empty() {
+        return Err(TransparentInterceptionError::Proxy(
+            "managed outbound transparent proxy requires at least one listener family".to_string(),
+        ));
+    }
+    let Some(proxy_bypass_mark) = std::num::NonZeroU32::new(proxy_bypass_mark) else {
+        return Err(proxy_error(
+            "outbound transparent proxy bypass mark must be non-zero",
+        ));
+    };
+    let local_addresses = load_local_addresses()?;
+    let listen_port = outbound_plan.listen_port().get();
+    Ok(Some(ManagedTransparentProxyPlan {
+        listen_port,
+        families,
+        relay_plan: relay::TransparentProxyRelayPlan::outbound_redirect(
+            listen_port,
+            proxy_bypass_mark,
+            Arc::from(local_addresses),
+        ),
     }))
 }
 
@@ -122,9 +175,7 @@ fn start_managed_proxy(
     runtime: TransparentProxyRuntime,
 ) -> Result<Option<ManagedTransparentProxyGuard>, TransparentInterceptionError> {
     match plan {
-        Some(plan) => {
-            ManagedTransparentProxyGuard::start(plan.listen_port, plan.families, runtime).map(Some)
-        }
+        Some(plan) => ManagedTransparentProxyGuard::start(plan, runtime).map(Some),
         None => Ok(None),
     }
 }
@@ -149,15 +200,15 @@ fn stop_health_probe(
 
 impl ManagedTransparentProxyGuard {
     fn start(
-        listen_port: u16,
-        families: Vec<TransparentInterceptionIpFamily>,
+        plan: ManagedTransparentProxyPlan,
         runtime: TransparentProxyRuntime,
     ) -> Result<Self, TransparentInterceptionError> {
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let relays = RelayRegistry::new(runtime.clone());
         let listeners = start_listeners(
-            listen_port,
-            families,
+            plan.listen_port,
+            plan.families,
+            plan.relay_plan,
             Arc::clone(&shutdown_requested),
             relays.clone(),
             runtime.clone(),

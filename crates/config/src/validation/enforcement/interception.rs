@@ -78,7 +78,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_tcp_relay_requires_inbound_tproxy_strategy() {
+    fn managed_tcp_relay_is_valid_for_outbound_transparent_proxy() {
         let mut violations = Vec::new();
         validate(
             &EnforcementInterceptionConfig {
@@ -86,6 +86,24 @@ mod tests {
                 selector: None,
                 proxy: TransparentInterceptionProxyConfig {
                     mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+                    listen_port: Some(15001),
+                    ..TransparentInterceptionProxyConfig::default()
+                },
+            },
+            &mut violations,
+        );
+
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn outbound_transparent_proxy_requires_managed_tcp_relay() {
+        let mut violations = Vec::new();
+        validate(
+            &EnforcementInterceptionConfig {
+                strategy: TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
+                selector: None,
+                proxy: TransparentInterceptionProxyConfig {
                     listen_port: Some(15001),
                     ..TransparentInterceptionProxyConfig::default()
                 },

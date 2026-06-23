@@ -2,17 +2,16 @@ use std::{fmt, net::SocketAddr, num::NonZeroU16, path::PathBuf};
 
 use probe_config::{
     AgentConfig, ConnectionEnforcementBackendConfig, EnforcementInterceptionConfig,
-    EnforcementPolicySourceConfig, TransparentInterceptionProxyHealthProbeIntent,
-    TransparentInterceptionProxyIntent, TransparentInterceptionProxyIntentViolation,
-    TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
+    EnforcementPolicySourceConfig, TransparentInterceptionEnabledProxyIntent,
+    TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
+    TransparentInterceptionProxyIntentViolation, TransparentInterceptionProxyModeConfig,
+    TransparentInterceptionStrategyConfig,
 };
 use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
 use transparent_linux::{OutboundRedirectArtifactSpec, TransparentLinuxResources};
 
 use super::interception_scope::TransparentInterceptionLocalSetupProjectionPlan;
-
-const OUTBOUND_TRANSPARENT_PROXY_INSTALL_BLOCKED_REASON: &str = "outbound transparent proxy redirect install has a typed redirect preview, Linux original-destination recovery and proxy pre-connect SO_MARK primitives, but requires wiring them into an executable output redirect lifecycle with proxy self-bypass and target recovery before rules can be installed; L7 MITM and certificate handling remain a separate proxy backend";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPlan {
@@ -92,7 +91,6 @@ pub struct EnforcementInterceptionPlan {
     pub proxy: TransparentInterceptionProxyPlan,
     pub execution: TransparentInterceptionExecutionPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
-    pub outbound_redirect: TransparentInterceptionOutboundRedirectPlan,
     pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
     pub classification: TransparentInterceptionClassificationPlan,
     pub capability: EnforcementCapabilityPlan,
@@ -108,13 +106,12 @@ impl EnforcementInterceptionPlan {
             .expect("transparent interception config should be validated before planning");
         let strategy = intent.strategy();
         let nftables = TransparentInterceptionNftablesPlan::reserved();
+        let execution =
+            TransparentInterceptionExecutionPlan::from_intent_with_nftables(&intent, &nftables);
         Self {
             strategy,
             proxy: TransparentInterceptionProxyPlan::from_intent(&intent),
-            execution: TransparentInterceptionExecutionPlan::from_intent(&intent),
-            outbound_redirect: TransparentInterceptionOutboundRedirectPlan::from_intent(
-                &intent, &nftables,
-            ),
+            execution,
             nftables,
             local_setup_projection:
                 TransparentInterceptionLocalSetupProjectionPlan::from_strategy_and_selectors(
@@ -223,6 +220,13 @@ impl TransparentInterceptionExecutionPlan {
     }
 
     fn from_intent(intent: &TransparentInterceptionProxyIntent) -> Self {
+        Self::from_intent_with_nftables(intent, &TransparentInterceptionNftablesPlan::reserved())
+    }
+
+    fn from_intent_with_nftables(
+        intent: &TransparentInterceptionProxyIntent,
+        nftables: &TransparentInterceptionNftablesPlan,
+    ) -> Self {
         match intent {
             TransparentInterceptionProxyIntent::Disabled(_) => Self::Disabled,
             TransparentInterceptionProxyIntent::InboundTproxy(proxy) => {
@@ -235,9 +239,9 @@ impl TransparentInterceptionExecutionPlan {
                 })
             }
             TransparentInterceptionProxyIntent::OutboundTransparentProxy(proxy) => {
-                Self::OutboundTransparentProxy(TransparentInterceptionOutboundProxyPlan {
-                    listen_port: proxy.listen_port(),
-                })
+                Self::OutboundTransparentProxy(
+                    TransparentInterceptionOutboundProxyPlan::from_proxy(proxy, nftables),
+                )
             }
         }
     }
@@ -248,6 +252,15 @@ impl TransparentInterceptionExecutionPlan {
             Self::InboundTproxy(_) => TransparentInterceptionStrategyConfig::InboundTproxy,
             Self::OutboundTransparentProxy(_) => {
                 TransparentInterceptionStrategyConfig::OutboundTransparentProxy
+            }
+        }
+    }
+
+    pub fn outbound_redirect_plan(&self) -> TransparentInterceptionOutboundRedirectPlan {
+        match self {
+            Self::OutboundTransparentProxy(plan) => plan.outbound_redirect_plan(),
+            Self::Disabled | Self::InboundTproxy(_) => {
+                TransparentInterceptionOutboundRedirectPlan::NotConfigured
             }
         }
     }
@@ -276,12 +289,35 @@ impl TransparentInterceptionInboundTproxyPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransparentInterceptionOutboundProxyPlan {
-    listen_port: NonZeroU16,
+    outbound_redirect_artifact: OutboundRedirectArtifactSpec,
 }
 
 impl TransparentInterceptionOutboundProxyPlan {
+    fn from_proxy(
+        proxy: &TransparentInterceptionEnabledProxyIntent,
+        nftables: &TransparentInterceptionNftablesPlan,
+    ) -> Self {
+        Self {
+            outbound_redirect_artifact: OutboundRedirectArtifactSpec::outbound_transparent_proxy(
+                nftables.clone(),
+                proxy.listen_port().get(),
+            ),
+        }
+    }
+
     pub fn listen_port(&self) -> NonZeroU16 {
-        self.listen_port
+        NonZeroU16::new(self.outbound_redirect_artifact.proxy_port)
+            .expect("outbound transparent proxy redirect artifact proxy port should be non-zero")
+    }
+
+    pub fn outbound_redirect_artifact(&self) -> &OutboundRedirectArtifactSpec {
+        &self.outbound_redirect_artifact
+    }
+
+    pub fn outbound_redirect_plan(&self) -> TransparentInterceptionOutboundRedirectPlan {
+        TransparentInterceptionOutboundRedirectPlan::Planned {
+            artifact: self.outbound_redirect_artifact.clone(),
+        }
     }
 }
 
@@ -328,42 +364,7 @@ pub enum TransparentInterceptionOutboundRedirectPlan {
     NotConfigured,
     Planned {
         artifact: OutboundRedirectArtifactSpec,
-        install: TransparentInterceptionOutboundRedirectInstallPlan,
     },
-}
-
-impl TransparentInterceptionOutboundRedirectPlan {
-    fn planned_for_proxy_port(
-        proxy_port: NonZeroU16,
-        nftables: &TransparentInterceptionNftablesPlan,
-    ) -> Self {
-        let artifact = OutboundRedirectArtifactSpec::outbound_transparent_proxy(
-            nftables.clone(),
-            proxy_port.get(),
-        );
-        Self::Planned {
-            artifact,
-            install: TransparentInterceptionOutboundRedirectInstallPlan::Blocked {
-                reason: OUTBOUND_TRANSPARENT_PROXY_INSTALL_BLOCKED_REASON.to_string(),
-            },
-        }
-    }
-
-    fn from_intent(
-        intent: &TransparentInterceptionProxyIntent,
-        nftables: &TransparentInterceptionNftablesPlan,
-    ) -> Self {
-        let TransparentInterceptionProxyIntent::OutboundTransparentProxy(proxy) = intent else {
-            return Self::NotConfigured;
-        };
-        Self::planned_for_proxy_port(proxy.listen_port(), nftables)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum TransparentInterceptionOutboundRedirectInstallPlan {
-    Blocked { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,8 +415,13 @@ impl EnforcementCapabilityPlan {
                     unavailable_reason: "transparent interception backend is not available in this build/runtime",
                 })
             }
-            TransparentInterceptionStrategyConfig::None
-            | TransparentInterceptionStrategyConfig::OutboundTransparentProxy => None,
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy => {
+                Some(EnforcementCapabilityRequirement {
+                    capability: CapabilityKind::TransparentInterception,
+                    unavailable_reason: "outbound transparent proxy backend is not available in this build/runtime",
+                })
+            }
+            TransparentInterceptionStrategyConfig::None => None,
         }
     }
 
@@ -661,7 +667,7 @@ mod tests {
             53_534
         );
         assert_eq!(
-            plan.interception.outbound_redirect,
+            plan.interception.execution.outbound_redirect_plan(),
             TransparentInterceptionOutboundRedirectPlan::NotConfigured
         );
         assert_eq!(
@@ -682,11 +688,13 @@ mod tests {
     }
 
     #[test]
-    fn enforcement_plan_reports_outbound_redirect_preview() {
+    fn enforcement_plan_reports_outbound_redirect_artifact() {
         let mut config = AgentConfig::default();
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
             TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
+        config.enforcement.interception.proxy.mode =
+            TransparentInterceptionProxyModeConfig::ManagedTcpRelay;
         config.enforcement.interception.proxy.listen_port = Some(15001);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
@@ -712,10 +720,13 @@ mod tests {
         ));
         assert_eq!(
             plan.interception.capability,
-            EnforcementCapabilityPlan::NotRequired
+            EnforcementCapabilityPlan::Required {
+                capability: CapabilityKind::TransparentInterception,
+                mode: RuntimeMode::Unavailable,
+            }
         );
         assert_eq!(
-            plan.interception.outbound_redirect,
+            plan.interception.execution.outbound_redirect_plan(),
             TransparentInterceptionOutboundRedirectPlan::Planned {
                 artifact: OutboundRedirectArtifactSpec {
                     table_name: "sssa_probe".to_string(),
@@ -724,10 +735,7 @@ mod tests {
                     priority: "dstnat".to_string(),
                     proxy_port: 15001,
                     proxy_bypass_mark: 0x5353_4102,
-                },
-                install: TransparentInterceptionOutboundRedirectInstallPlan::Blocked {
-                    reason: OUTBOUND_TRANSPARENT_PROXY_INSTALL_BLOCKED_REASON.to_string(),
-                },
+                }
             }
         );
     }

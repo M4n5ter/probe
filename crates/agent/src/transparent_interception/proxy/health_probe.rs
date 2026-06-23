@@ -447,6 +447,7 @@ mod tests {
         ManagedTransparentProxyPlan {
             listen_port: 15001,
             families: vec![TransparentInterceptionIpFamily::Ipv4],
+            relay_plan: crate::transparent_interception::proxy::relay::TransparentProxyRelayPlan::inbound_tproxy(15001),
         }
     }
 

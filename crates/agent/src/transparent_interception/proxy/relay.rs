@@ -1,6 +1,7 @@
 use std::{
     fmt, io,
-    net::{Shutdown, SocketAddr, TcpStream},
+    net::{IpAddr, Shutdown, SocketAddr, TcpStream},
+    num::NonZeroU32,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -12,7 +13,10 @@ use std::{
 use socket2::{SockAddr, Socket};
 
 use super::{
-    connect::{TransparentProxyUpstreamConnectPlan, connect_tcp, tcp_connect_failure_reason},
+    connect::{
+        TransparentProxyBypassMark, TransparentProxyUpstreamConnectPlan, connect_tcp,
+        tcp_connect_failure_reason,
+    },
     proxy_error, proxy_io_error,
     registry::{RelayRegistry, RelaySlot, shutdown_streams},
     state::TransparentProxyRuntime,
@@ -94,7 +98,7 @@ fn relay_connection(
     relay_bidirectional(downstream, upstream).map_err(RelayConnectionError::relay)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug)]
 pub(super) struct TransparentProxyRelayPlan {
     target_recovery: TransparentProxyTargetRecovery,
     self_relay_guard: TransparentProxySelfRelayGuard,
@@ -109,18 +113,71 @@ impl TransparentProxyRelayPlan {
             upstream_connect: TransparentProxyUpstreamConnectPlan::new(CONNECT_TIMEOUT, None),
         }
     }
+
+    pub(super) fn outbound_redirect(
+        listen_port: u16,
+        proxy_bypass_mark: NonZeroU32,
+        local_addresses: Arc<[IpAddr]>,
+    ) -> Self {
+        Self {
+            target_recovery: TransparentProxyTargetRecovery::LinuxOriginalDestination,
+            self_relay_guard: TransparentProxySelfRelayGuard::RejectLocalListener {
+                listen_port,
+                local_addresses,
+            },
+            upstream_connect: TransparentProxyUpstreamConnectPlan::new(
+                CONNECT_TIMEOUT,
+                Some(TransparentProxyBypassMark::new(proxy_bypass_mark)),
+            ),
+        }
+    }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug)]
 pub(super) enum TransparentProxySelfRelayGuard {
-    RejectSamePort { listen_port: u16 },
+    RejectSamePort {
+        listen_port: u16,
+    },
+    RejectLocalListener {
+        listen_port: u16,
+        local_addresses: Arc<[IpAddr]>,
+    },
 }
 
 impl TransparentProxySelfRelayGuard {
-    fn is_self_relay(self, target: SocketAddr) -> bool {
+    fn is_self_relay(&self, target: SocketAddr) -> bool {
         match self {
-            Self::RejectSamePort { listen_port } => target.port() == listen_port,
+            Self::RejectSamePort { listen_port } => target.port() == *listen_port,
+            Self::RejectLocalListener {
+                listen_port,
+                local_addresses,
+            } => {
+                target.port() == *listen_port
+                    && is_local_listener_address(target.ip(), local_addresses)
+            }
         }
+    }
+}
+
+fn is_local_listener_address(address: IpAddr, local_addresses: &[IpAddr]) -> bool {
+    if address.is_unspecified() || address.is_loopback() {
+        return true;
+    }
+    let normalized = normalized_ip_address(address);
+    local_addresses
+        .iter()
+        .copied()
+        .map(normalized_ip_address)
+        .any(|local| local == normalized)
+}
+
+fn normalized_ip_address(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V4(_) => address,
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
     }
 }
 

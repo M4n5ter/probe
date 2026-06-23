@@ -1,4 +1,6 @@
-use probe_config::{AgentConfig, ConfigViolation};
+use probe_config::{
+    AgentConfig, ConfigViolation, ExporterTransportConfig, TransparentInterceptionStrategyConfig,
+};
 use probe_core::EnforcementMode;
 
 use crate::plan::{
@@ -58,6 +60,18 @@ pub(super) fn validate_static_config(config: &AgentConfig, violations: &mut Vec<
                 reason: "enforce mode supports exactly one enforcement execution surface until composite enforcement execution is implemented".to_string(),
             }),
         }
+    }
+    if config.enforcement.interception.strategy
+        == TransparentInterceptionStrategyConfig::OutboundTransparentProxy
+        && config
+            .exporters
+            .iter()
+            .any(|exporter| matches!(&exporter.transport, ExporterTransportConfig::Webhook { .. }))
+    {
+        violations.push(ConfigViolation {
+            field: "exporters".to_string(),
+            reason: "outbound transparent proxy cannot be combined with webhook exporters until agent-owned outbound control-plane sockets have a verified bypass contract".to_string(),
+        });
     }
 }
 
@@ -137,8 +151,9 @@ struct EnforcementCapabilityCheck {
 #[cfg(test)]
 mod tests {
     use probe_config::{
-        CaptureBackend, CaptureSelection, ConfigValidationError,
-        ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig,
+        CaptureBackend, CaptureSelection, CompressionCodecName, ConfigValidationError,
+        ConnectionEnforcementBackendConfig, ExporterConfig, ExporterTransportConfig,
+        TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
         CapabilityKind, CapabilityState, Direction, ProcessSelector, RuntimeMode, Selector,
@@ -341,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_transparent_proxy_preview_does_not_require_executable_interception_capability() {
+    fn outbound_transparent_proxy_requires_executable_interception_capability() {
         let registry = ProviderRegistry::new(
             vec![live_capture_provider()],
             test_platform_capabilities_with_connection_enforcement(RuntimeMode::Available),
@@ -351,6 +366,8 @@ mod tests {
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
             TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
+        config.enforcement.interception.proxy.mode =
+            probe_config::TransparentInterceptionProxyModeConfig::ManagedTcpRelay;
         config.enforcement.interception.proxy.listen_port = Some(15001);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
@@ -361,8 +378,47 @@ mod tests {
             },
         ));
 
-        validate_runtime_config(&config, &registry)
-            .expect("outbound transparent proxy preview should not require executable interception capability");
+        let error = validation_error(config, &registry);
+
+        assert_violation(&error, "enforcement.interception.strategy", "not built");
+    }
+
+    #[test]
+    fn outbound_transparent_proxy_rejects_webhook_exporter_without_control_plane_bypass() {
+        let registry = ProviderRegistry::new(
+            vec![live_capture_provider()],
+            transparent_interception_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
+        config.enforcement.interception.proxy.mode =
+            TransparentInterceptionProxyModeConfig::ManagedTcpRelay;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        config.exporters = vec![ExporterConfig {
+            id: "collector".to_string(),
+            transport: ExporterTransportConfig::Webhook {
+                endpoint: "https://collector.example/batches".to_string(),
+                headers: Default::default(),
+                tls: Default::default(),
+            },
+            codec: CompressionCodecName::Zstd,
+            worker: Default::default(),
+        }];
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(&error, "exporters", "control-plane sockets");
     }
 
     #[test]
