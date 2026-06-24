@@ -23,7 +23,7 @@ mod tests {
         MAX_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS,
         MIN_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS, TransparentInterceptionProxyConfig,
         TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionProxyModeConfig,
-        TransparentInterceptionStrategyConfig,
+        TransparentInterceptionProxySelfBypassConfig, TransparentInterceptionStrategyConfig,
     };
 
     use super::*;
@@ -97,25 +97,6 @@ mod tests {
     }
 
     #[test]
-    fn outbound_transparent_proxy_requires_managed_tcp_relay() {
-        let mut violations = Vec::new();
-        validate(
-            &EnforcementInterceptionConfig {
-                strategy: TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
-                selector: None,
-                proxy: TransparentInterceptionProxyConfig {
-                    listen_port: Some(15001),
-                    ..TransparentInterceptionProxyConfig::default()
-                },
-            },
-            &mut violations,
-        );
-
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].field, "enforcement.interception.proxy.mode");
-    }
-
-    #[test]
     fn health_probe_requires_enabled_strategy_and_valid_target() {
         let mut violations = Vec::new();
         validate(
@@ -158,6 +139,7 @@ mod tests {
                 strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
                 proxy: TransparentInterceptionProxyConfig {
                     mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+                    self_bypass: TransparentInterceptionProxySelfBypassConfig::None,
                     listen_port: Some(15001),
                     health_probe: TransparentInterceptionProxyHealthProbeConfig {
                         target: Some("127.0.0.1:15001".to_string()),
@@ -184,6 +166,7 @@ mod tests {
                 strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
                 proxy: TransparentInterceptionProxyConfig {
                     mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+                    self_bypass: TransparentInterceptionProxySelfBypassConfig::None,
                     listen_port: Some(15001),
                     health_probe: TransparentInterceptionProxyHealthProbeConfig {
                         target: Some("203.0.113.10:15001".to_string()),

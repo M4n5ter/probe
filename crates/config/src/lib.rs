@@ -30,8 +30,10 @@ pub use model::{
     StorageRetentionConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind,
     TlsPlaintextDecryptHintConfig, TlsPlaintextInstrumentationConfig,
     TransparentInterceptionDisabledProxyIntent, TransparentInterceptionEnabledProxyIntent,
-    TransparentInterceptionProxyConfig, TransparentInterceptionProxyHealthProbeConfig,
-    TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
-    TransparentInterceptionProxyIntentViolation, TransparentInterceptionProxyModeConfig,
+    TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
+    TransparentInterceptionOutboundProxySelfBypassIntent, TransparentInterceptionProxyConfig,
+    TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionProxyHealthProbeIntent,
+    TransparentInterceptionProxyIntent, TransparentInterceptionProxyIntentViolation,
+    TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
     TransparentInterceptionStrategyConfig,
 };

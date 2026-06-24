@@ -678,6 +678,10 @@ protective_actions = ["alert"]
             status.interception.proxy.mode,
             probe_config::TransparentInterceptionProxyModeConfig::External
         );
+        assert_eq!(
+            status.interception.proxy.self_bypass,
+            probe_config::TransparentInterceptionProxySelfBypassConfig::None
+        );
         assert_eq!(status.interception.proxy.listen_port, Some(15001));
         assert_eq!(status.interception.nftables.table_name, "sssa_probe");
         assert_eq!(
@@ -719,6 +723,7 @@ protective_actions = ["alert"]
         let value = serde_json::to_value(&status)?;
         assert_eq!(value["interception"]["strategy"], json!("inbound_tproxy"));
         assert_eq!(value["interception"]["proxy"]["mode"], json!("external"));
+        assert_eq!(value["interception"]["proxy"]["self_bypass"], json!("none"));
         assert_eq!(value["interception"]["proxy"]["listen_port"], json!(15001));
         assert_eq!(
             value["interception"]["proxy"]["health_probe"]["mode"],
@@ -851,6 +856,53 @@ protective_actions = ["alert"]
         assert_eq!(
             value["interception"]["outbound_redirect"]["artifact"]["proxy_bypass_mark"],
             json!(0x5353_4102)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_status_reports_external_outbound_proxy_self_bypass_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        config.capture.selection = probe_config::CaptureSelection::Libpcap;
+        config.exporters.clear();
+        config.enforcement.mode = probe_core::EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            probe_config::TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
+        config.enforcement.interception.proxy.mode =
+            probe_config::TransparentInterceptionProxyModeConfig::External;
+        config.enforcement.interception.proxy.self_bypass =
+            probe_config::TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let plan = build_test_runtime_composition(config)?.into_plan();
+
+        let status = enforcement_status(&plan);
+        let value = serde_json::to_value(&status)?;
+
+        assert_eq!(
+            status.interception.proxy.mode,
+            probe_config::TransparentInterceptionProxyModeConfig::External
+        );
+        assert_eq!(
+            status.interception.proxy.self_bypass,
+            probe_config::TransparentInterceptionProxySelfBypassConfig::UsesReservedMark
+        );
+        assert_eq!(value["interception"]["proxy"]["mode"], json!("external"));
+        assert_eq!(
+            value["interception"]["proxy"]["self_bypass"],
+            json!("uses_reserved_mark")
+        );
+        assert_eq!(
+            value["interception"]["outbound_redirect"]["kind"],
+            json!("planned")
         );
         Ok(())
     }

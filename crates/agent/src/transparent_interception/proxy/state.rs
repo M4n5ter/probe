@@ -33,6 +33,15 @@ pub(crate) enum TransparentProxyRuntimeMode {
     Stopped,
 }
 
+impl TransparentProxyRuntimeMode {
+    fn from_proxy_mode(mode: TransparentInterceptionProxyModeConfig) -> Self {
+        match mode {
+            TransparentInterceptionProxyModeConfig::External => Self::External,
+            TransparentInterceptionProxyModeConfig::ManagedTcpRelay => Self::Configured,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TransparentProxyHealthProbeMode {
@@ -98,20 +107,14 @@ impl TransparentProxyRuntime {
             TransparentInterceptionExecutionPlan::Disabled => {
                 (TransparentProxyRuntimeMode::Disabled, None)
             }
-            TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) => {
-                let mode = match inbound_plan.proxy_mode() {
-                    TransparentInterceptionProxyModeConfig::External => {
-                        TransparentProxyRuntimeMode::External
-                    }
-                    TransparentInterceptionProxyModeConfig::ManagedTcpRelay => {
-                        TransparentProxyRuntimeMode::Configured
-                    }
-                };
-                (mode, Some(inbound_plan.health_probe()))
-            }
-            TransparentInterceptionExecutionPlan::OutboundTransparentProxy(_) => {
-                (TransparentProxyRuntimeMode::Configured, None)
-            }
+            TransparentInterceptionExecutionPlan::InboundTproxy(inbound_plan) => (
+                TransparentProxyRuntimeMode::from_proxy_mode(inbound_plan.proxy_mode()),
+                Some(inbound_plan.health_probe()),
+            ),
+            TransparentInterceptionExecutionPlan::OutboundTransparentProxy(outbound_plan) => (
+                TransparentProxyRuntimeMode::from_proxy_mode(outbound_plan.proxy_mode()),
+                None,
+            ),
         };
         let health_probe = health_probe_plan
             .map_or_else(TransparentProxyHealthProbeSnapshot::disabled, |plan| {
@@ -402,7 +405,8 @@ impl TransparentProxyRuntimeSnapshot {
 mod tests {
     use probe_config::{
         EnforcementInterceptionConfig, TransparentInterceptionProxyConfig,
-        TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionStrategyConfig,
+        TransparentInterceptionProxyHealthProbeConfig,
+        TransparentInterceptionProxySelfBypassConfig, TransparentInterceptionStrategyConfig,
     };
 
     use super::*;
@@ -417,7 +421,7 @@ mod tests {
 
         let inbound_external = TransparentProxyRuntime::for_test_config(&interception_config(
             TransparentInterceptionStrategyConfig::InboundTproxy,
-            TransparentInterceptionProxyModeConfig::External,
+            external_proxy_config(),
         ))
         .handle()
         .snapshot();
@@ -425,7 +429,7 @@ mod tests {
 
         let inbound_managed = TransparentProxyRuntime::for_test_config(&interception_config(
             TransparentInterceptionStrategyConfig::InboundTproxy,
-            TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+            managed_proxy_config(),
         ))
         .handle()
         .snapshot();
@@ -437,13 +441,24 @@ mod tests {
         let outbound_transparent_proxy =
             TransparentProxyRuntime::for_test_config(&interception_config(
                 TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
-                TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+                managed_proxy_config(),
             ))
             .handle()
             .snapshot();
         assert_eq!(
             outbound_transparent_proxy.mode,
             TransparentProxyRuntimeMode::Configured
+        );
+
+        let outbound_external = TransparentProxyRuntime::for_test_config(&interception_config(
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
+            external_outbound_proxy_config(),
+        ))
+        .handle()
+        .snapshot();
+        assert_eq!(
+            outbound_external.mode,
+            TransparentProxyRuntimeMode::External
         );
     }
 
@@ -499,7 +514,7 @@ mod tests {
     fn runtime_counters_follow_relay_lifecycle() {
         let state = TransparentProxyRuntime::for_test_config(&interception_config(
             TransparentInterceptionStrategyConfig::InboundTproxy,
-            TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+            managed_proxy_config(),
         ));
         let handle = state.handle();
 
@@ -555,7 +570,7 @@ mod tests {
     fn upstream_connect_metrics_follow_connect_results() {
         let state = TransparentProxyRuntime::for_test_config(&interception_config(
             TransparentInterceptionStrategyConfig::InboundTproxy,
-            TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+            managed_proxy_config(),
         ));
         let handle = state.handle();
 
@@ -591,7 +606,7 @@ mod tests {
     fn clean_stop_marks_proxy_stopped_without_forging_relay_lifecycle() {
         let state = TransparentProxyRuntime::for_test_config(&interception_config(
             TransparentInterceptionStrategyConfig::InboundTproxy,
-            TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+            managed_proxy_config(),
         ));
         let handle = state.handle();
 
@@ -611,16 +626,38 @@ mod tests {
 
     fn interception_config(
         strategy: TransparentInterceptionStrategyConfig,
-        proxy_mode: TransparentInterceptionProxyModeConfig,
+        proxy: TransparentInterceptionProxyConfig,
     ) -> EnforcementInterceptionConfig {
         EnforcementInterceptionConfig {
             strategy,
-            proxy: TransparentInterceptionProxyConfig {
-                mode: proxy_mode,
-                listen_port: Some(15001),
-                ..TransparentInterceptionProxyConfig::default()
-            },
+            proxy,
             ..EnforcementInterceptionConfig::default()
+        }
+    }
+
+    fn external_proxy_config() -> TransparentInterceptionProxyConfig {
+        TransparentInterceptionProxyConfig {
+            mode: TransparentInterceptionProxyModeConfig::External,
+            listen_port: Some(15001),
+            ..TransparentInterceptionProxyConfig::default()
+        }
+    }
+
+    fn external_outbound_proxy_config() -> TransparentInterceptionProxyConfig {
+        TransparentInterceptionProxyConfig {
+            mode: TransparentInterceptionProxyModeConfig::External,
+            self_bypass: TransparentInterceptionProxySelfBypassConfig::UsesReservedMark,
+            listen_port: Some(15001),
+            ..TransparentInterceptionProxyConfig::default()
+        }
+    }
+
+    fn managed_proxy_config() -> TransparentInterceptionProxyConfig {
+        TransparentInterceptionProxyConfig {
+            mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+            self_bypass: TransparentInterceptionProxySelfBypassConfig::None,
+            listen_port: Some(15001),
+            ..TransparentInterceptionProxyConfig::default()
         }
     }
 
@@ -629,6 +666,7 @@ mod tests {
             strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
             proxy: TransparentInterceptionProxyConfig {
                 mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+                self_bypass: TransparentInterceptionProxySelfBypassConfig::None,
                 listen_port: Some(15001),
                 health_probe: TransparentInterceptionProxyHealthProbeConfig {
                     target: Some("127.0.0.1:18080".to_string()),

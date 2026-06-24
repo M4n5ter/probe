@@ -465,6 +465,10 @@ protective_actions = ["alert"]
             json!("external")
         );
         assert_eq!(
+            value["enforcement"]["interception"]["proxy"]["self_bypass"],
+            json!("none")
+        );
+        assert_eq!(
             value["enforcement"]["interception"]["proxy"]["health_probe"]["mode"],
             json!("disabled")
         );
@@ -652,6 +656,48 @@ protective_actions = ["alert"]
         assert_eq!(
             value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["proxy_port"],
             json!(15001)
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["proxy_bypass_mark"],
+            json!(0x5353_4102)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_exposes_external_outbound_proxy_self_bypass_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
+        config.enforcement.interception.proxy.mode =
+            probe_config::TransparentInterceptionProxyModeConfig::External;
+        config.enforcement.interception.proxy.self_bypass =
+            probe_config::TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let (plan, backend) = build_test_runtime_composition(config)?.into_enforcement_parts();
+
+        let report = build_check_report(plan, backend).await?;
+        let value = serde_json::to_value(report)?;
+
+        assert_eq!(value["enforcement"]["composition"]["kind"], json!("ready"));
+        assert_eq!(
+            value["enforcement"]["interception"]["proxy"]["mode"],
+            json!("external")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["proxy"]["self_bypass"],
+            json!("uses_reserved_mark")
         );
         assert_eq!(
             value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["proxy_bypass_mark"],

@@ -471,6 +471,7 @@ mod tests {
             strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
             proxy: TransparentInterceptionProxyConfig {
                 mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+                self_bypass: probe_config::TransparentInterceptionProxySelfBypassConfig::None,
                 listen_port: Some(15001),
                 health_probe: TransparentInterceptionProxyHealthProbeConfig::default(),
             },
@@ -502,6 +503,7 @@ mod tests {
             strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
             proxy: TransparentInterceptionProxyConfig {
                 mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+                self_bypass: probe_config::TransparentInterceptionProxySelfBypassConfig::None,
                 listen_port: Some(15001),
                 health_probe: TransparentInterceptionProxyHealthProbeConfig {
                     target: Some(target.to_string()),

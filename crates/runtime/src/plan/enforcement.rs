@@ -2,10 +2,12 @@ use std::{fmt, net::SocketAddr, num::NonZeroU16, path::PathBuf};
 
 use probe_config::{
     AgentConfig, ConnectionEnforcementBackendConfig, EnforcementInterceptionConfig,
-    EnforcementPolicySourceConfig, TransparentInterceptionEnabledProxyIntent,
+    EnforcementPolicySourceConfig, TransparentInterceptionOutboundProxyIntent,
+    TransparentInterceptionOutboundProxyModeIntent,
+    TransparentInterceptionOutboundProxySelfBypassIntent,
     TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
     TransparentInterceptionProxyIntentViolation, TransparentInterceptionProxyModeConfig,
-    TransparentInterceptionStrategyConfig,
+    TransparentInterceptionProxySelfBypassConfig, TransparentInterceptionStrategyConfig,
 };
 use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, EnforcementMode, RuntimeMode};
 use serde::{Deserialize, Serialize};
@@ -149,6 +151,7 @@ impl TransparentInterceptionClassificationPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransparentInterceptionProxyPlan {
     pub mode: TransparentInterceptionProxyModeConfig,
+    pub self_bypass: TransparentInterceptionProxySelfBypassConfig,
     pub listen_port: Option<u16>,
     pub health_probe: TransparentInterceptionProxyHealthProbePlan,
 }
@@ -166,9 +169,10 @@ impl TransparentInterceptionProxyPlan {
     fn from_intent(intent: &TransparentInterceptionProxyIntent) -> Self {
         Self {
             mode: intent.mode(),
+            self_bypass: intent.self_bypass(),
             listen_port: intent.listen_port().map(NonZeroU16::get),
             health_probe: TransparentInterceptionProxyHealthProbePlan::from_intent(
-                intent.health_probe().clone(),
+                intent.health_probe(),
             ),
         }
     }
@@ -289,20 +293,36 @@ impl TransparentInterceptionInboundTproxyPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransparentInterceptionOutboundProxyPlan {
+    lifecycle: TransparentInterceptionOutboundProxyLifecyclePlan,
     outbound_redirect_artifact: OutboundRedirectArtifactSpec,
 }
 
 impl TransparentInterceptionOutboundProxyPlan {
     fn from_proxy(
-        proxy: &TransparentInterceptionEnabledProxyIntent,
+        proxy: &TransparentInterceptionOutboundProxyIntent,
         nftables: &TransparentInterceptionNftablesPlan,
     ) -> Self {
         Self {
+            lifecycle: TransparentInterceptionOutboundProxyLifecyclePlan::from_intent(
+                *proxy.lifecycle(),
+            ),
             outbound_redirect_artifact: OutboundRedirectArtifactSpec::outbound_transparent_proxy(
                 nftables.clone(),
                 proxy.listen_port().get(),
             ),
         }
+    }
+
+    pub fn proxy_mode(&self) -> TransparentInterceptionProxyModeConfig {
+        self.lifecycle.proxy_mode()
+    }
+
+    pub fn requires_managed_proxy(&self) -> bool {
+        self.lifecycle.requires_managed_proxy()
+    }
+
+    pub fn self_bypass(&self) -> TransparentInterceptionProxySelfBypassConfig {
+        self.lifecycle.self_bypass()
     }
 
     pub fn listen_port(&self) -> NonZeroU16 {
@@ -317,6 +337,74 @@ impl TransparentInterceptionOutboundProxyPlan {
     pub fn outbound_redirect_plan(&self) -> TransparentInterceptionOutboundRedirectPlan {
         TransparentInterceptionOutboundRedirectPlan::Planned {
             artifact: self.outbound_redirect_artifact.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+enum TransparentInterceptionOutboundProxyLifecyclePlan {
+    ManagedTcpRelay,
+    External {
+        self_bypass: TransparentInterceptionOutboundProxySelfBypassPlan,
+    },
+}
+
+impl TransparentInterceptionOutboundProxyLifecyclePlan {
+    fn from_intent(intent: TransparentInterceptionOutboundProxyModeIntent) -> Self {
+        match intent {
+            TransparentInterceptionOutboundProxyModeIntent::ManagedTcpRelay => {
+                Self::ManagedTcpRelay
+            }
+            TransparentInterceptionOutboundProxyModeIntent::External { self_bypass } => {
+                Self::External {
+                    self_bypass: TransparentInterceptionOutboundProxySelfBypassPlan::from_intent(
+                        self_bypass,
+                    ),
+                }
+            }
+        }
+    }
+
+    fn proxy_mode(self) -> TransparentInterceptionProxyModeConfig {
+        match self {
+            Self::ManagedTcpRelay => TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+            Self::External { .. } => TransparentInterceptionProxyModeConfig::External,
+        }
+    }
+
+    fn requires_managed_proxy(self) -> bool {
+        matches!(self, Self::ManagedTcpRelay)
+    }
+
+    fn self_bypass(self) -> TransparentInterceptionProxySelfBypassConfig {
+        match self {
+            Self::ManagedTcpRelay => TransparentInterceptionProxySelfBypassConfig::None,
+            Self::External { self_bypass } => self_bypass.config(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TransparentInterceptionOutboundProxySelfBypassPlan {
+    UsesReservedMark,
+}
+
+impl TransparentInterceptionOutboundProxySelfBypassPlan {
+    fn from_intent(intent: TransparentInterceptionOutboundProxySelfBypassIntent) -> Self {
+        match intent {
+            TransparentInterceptionOutboundProxySelfBypassIntent::UsesReservedMark => {
+                Self::UsesReservedMark
+            }
+        }
+    }
+
+    fn config(self) -> TransparentInterceptionProxySelfBypassConfig {
+        match self {
+            Self::UsesReservedMark => {
+                TransparentInterceptionProxySelfBypassConfig::UsesReservedMark
+            }
         }
     }
 }
@@ -646,6 +734,10 @@ mod tests {
             plan.interception.proxy.mode,
             TransparentInterceptionProxyModeConfig::External
         );
+        assert_eq!(
+            plan.interception.proxy.self_bypass,
+            TransparentInterceptionProxySelfBypassConfig::None
+        );
         assert_eq!(plan.interception.proxy.listen_port, Some(15001));
         assert_eq!(
             plan.interception.proxy.health_probe,
@@ -741,6 +833,55 @@ mod tests {
                         .expect("test outbound proxy bypass mark should be non-zero"),
                 }
             }
+        );
+    }
+
+    #[test]
+    fn enforcement_plan_reports_external_outbound_proxy_self_bypass_contract() {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
+        config.enforcement.interception.proxy.mode =
+            TransparentInterceptionProxyModeConfig::External;
+        config.enforcement.interception.proxy.self_bypass =
+            TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let capabilities = CapabilityMatrix::new(test_platform_capabilities_with_interception(
+            RuntimeMode::Available,
+        ));
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        assert_eq!(
+            plan.interception.proxy.self_bypass,
+            TransparentInterceptionProxySelfBypassConfig::UsesReservedMark
+        );
+        let TransparentInterceptionExecutionPlan::OutboundTransparentProxy(outbound) =
+            plan.interception.execution
+        else {
+            panic!("external outbound proxy should produce outbound execution plan");
+        };
+        assert_eq!(
+            outbound.self_bypass(),
+            TransparentInterceptionProxySelfBypassConfig::UsesReservedMark
+        );
+        assert_eq!(
+            outbound.proxy_mode(),
+            TransparentInterceptionProxyModeConfig::External
+        );
+        assert_eq!(
+            outbound.outbound_redirect_artifact().proxy_bypass_mark,
+            NonZeroU32::new(0x5353_4102)
+                .expect("test outbound proxy bypass mark should be non-zero")
         );
     }
 

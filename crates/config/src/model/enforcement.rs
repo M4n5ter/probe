@@ -68,7 +68,7 @@ pub enum TransparentInterceptionStrategyConfig {
 pub enum TransparentInterceptionProxyIntent {
     Disabled(TransparentInterceptionDisabledProxyIntent),
     InboundTproxy(TransparentInterceptionEnabledProxyIntent),
-    OutboundTransparentProxy(TransparentInterceptionEnabledProxyIntent),
+    OutboundTransparentProxy(TransparentInterceptionOutboundProxyIntent),
 }
 
 impl TransparentInterceptionProxyIntent {
@@ -85,25 +85,35 @@ impl TransparentInterceptionProxyIntent {
     pub fn mode(&self) -> TransparentInterceptionProxyModeConfig {
         match self {
             Self::Disabled(proxy) => proxy.mode,
-            Self::InboundTproxy(proxy) | Self::OutboundTransparentProxy(proxy) => proxy.mode,
+            Self::InboundTproxy(proxy) => proxy.mode,
+            Self::OutboundTransparentProxy(proxy) => proxy.mode(),
         }
     }
 
     pub fn listen_port(&self) -> Option<NonZeroU16> {
         match self {
             Self::Disabled(proxy) => proxy.listen_port,
-            Self::InboundTproxy(proxy) | Self::OutboundTransparentProxy(proxy) => {
-                Some(proxy.listen_port)
+            Self::InboundTproxy(proxy) => Some(proxy.listen_port),
+            Self::OutboundTransparentProxy(proxy) => Some(proxy.listen_port()),
+        }
+    }
+
+    pub fn health_probe(&self) -> TransparentInterceptionProxyHealthProbeIntent {
+        match self {
+            Self::Disabled(proxy) => proxy.health_probe.clone(),
+            Self::InboundTproxy(proxy) => proxy.health_probe.clone(),
+            Self::OutboundTransparentProxy(_) => {
+                TransparentInterceptionProxyHealthProbeIntent::Disabled
             }
         }
     }
 
-    pub fn health_probe(&self) -> &TransparentInterceptionProxyHealthProbeIntent {
+    pub fn self_bypass(&self) -> TransparentInterceptionProxySelfBypassConfig {
         match self {
-            Self::Disabled(proxy) => &proxy.health_probe,
-            Self::InboundTproxy(proxy) | Self::OutboundTransparentProxy(proxy) => {
-                &proxy.health_probe
+            Self::Disabled(_) | Self::InboundTproxy(_) => {
+                TransparentInterceptionProxySelfBypassConfig::None
             }
+            Self::OutboundTransparentProxy(proxy) => proxy.self_bypass(),
         }
     }
 }
@@ -151,6 +161,69 @@ impl TransparentInterceptionEnabledProxyIntent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransparentInterceptionOutboundProxyIntent {
+    mode: TransparentInterceptionOutboundProxyModeIntent,
+    listen_port: NonZeroU16,
+}
+
+impl TransparentInterceptionOutboundProxyIntent {
+    pub fn mode(&self) -> TransparentInterceptionProxyModeConfig {
+        self.mode.mode()
+    }
+
+    pub fn lifecycle(&self) -> &TransparentInterceptionOutboundProxyModeIntent {
+        &self.mode
+    }
+
+    pub fn listen_port(&self) -> NonZeroU16 {
+        self.listen_port
+    }
+
+    pub fn self_bypass(&self) -> TransparentInterceptionProxySelfBypassConfig {
+        self.mode.self_bypass()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransparentInterceptionOutboundProxyModeIntent {
+    ManagedTcpRelay,
+    External {
+        self_bypass: TransparentInterceptionOutboundProxySelfBypassIntent,
+    },
+}
+
+impl TransparentInterceptionOutboundProxyModeIntent {
+    pub fn mode(self) -> TransparentInterceptionProxyModeConfig {
+        match self {
+            Self::ManagedTcpRelay => TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+            Self::External { .. } => TransparentInterceptionProxyModeConfig::External,
+        }
+    }
+
+    pub fn self_bypass(self) -> TransparentInterceptionProxySelfBypassConfig {
+        match self {
+            Self::ManagedTcpRelay => TransparentInterceptionProxySelfBypassConfig::None,
+            Self::External { self_bypass } => self_bypass.config(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransparentInterceptionOutboundProxySelfBypassIntent {
+    UsesReservedMark,
+}
+
+impl TransparentInterceptionOutboundProxySelfBypassIntent {
+    pub fn config(self) -> TransparentInterceptionProxySelfBypassConfig {
+        match self {
+            Self::UsesReservedMark => {
+                TransparentInterceptionProxySelfBypassConfig::UsesReservedMark
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransparentInterceptionProxyHealthProbeIntent {
     Disabled,
     Enabled {
@@ -187,6 +260,7 @@ impl TransparentInterceptionStrategyConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct TransparentInterceptionProxyConfig {
     pub mode: TransparentInterceptionProxyModeConfig,
+    pub self_bypass: TransparentInterceptionProxySelfBypassConfig,
     pub listen_port: Option<u16>,
     pub health_probe: TransparentInterceptionProxyHealthProbeConfig,
 }
@@ -206,14 +280,8 @@ impl EnforcementInterceptionConfig {
                 "managed TCP relay proxy mode requires an enabled transparent interception strategy",
             ));
         }
-        if self.strategy == TransparentInterceptionStrategyConfig::OutboundTransparentProxy
-            && self.proxy.mode != TransparentInterceptionProxyModeConfig::ManagedTcpRelay
-        {
-            violations.push(intent_violation(
-                "enforcement.interception.proxy.mode",
-                "outbound transparent proxy currently requires managed TCP relay so the agent can apply proxy self-bypass marks",
-            ));
-        }
+        let self_bypass_contract = resolve_self_bypass_contract(self);
+        self_bypass_contract.record_violation(&mut violations);
 
         let listen_port = self.proxy.listen_port.and_then(NonZeroU16::new);
         if self.strategy.is_enabled() && listen_port.is_none() {
@@ -271,16 +339,33 @@ impl EnforcementInterceptionConfig {
                         "transparent interception requires a non-zero proxy listen port",
                     )]);
                 };
+                let TransparentProxySelfBypassContract::Outbound(mode) = self_bypass_contract
+                else {
+                    return Err(vec![intent_violation(
+                        "enforcement.interception.proxy.self_bypass",
+                        "outbound transparent proxy requires a valid proxy lifecycle",
+                    )]);
+                };
                 TransparentInterceptionProxyIntent::OutboundTransparentProxy(
-                    TransparentInterceptionEnabledProxyIntent {
-                        mode: self.proxy.mode,
-                        listen_port,
-                        health_probe,
-                    },
+                    TransparentInterceptionOutboundProxyIntent { mode, listen_port },
                 )
             }
         };
         Ok(intent)
+    }
+}
+
+enum TransparentProxySelfBypassContract {
+    NotOutbound,
+    Outbound(TransparentInterceptionOutboundProxyModeIntent),
+    Violation(TransparentInterceptionProxyIntentViolation),
+}
+
+impl TransparentProxySelfBypassContract {
+    fn record_violation(&self, violations: &mut Vec<TransparentInterceptionProxyIntentViolation>) {
+        if let Self::Violation(violation) = self {
+            violations.push(violation.clone());
+        }
     }
 }
 
@@ -369,6 +454,53 @@ fn validate_transparent_proxy_health_probe(
     parsed_target
 }
 
+fn resolve_self_bypass_contract(
+    interception: &EnforcementInterceptionConfig,
+) -> TransparentProxySelfBypassContract {
+    let self_bypass = interception.proxy.self_bypass;
+
+    if interception.strategy != TransparentInterceptionStrategyConfig::OutboundTransparentProxy {
+        if self_bypass == TransparentInterceptionProxySelfBypassConfig::UsesReservedMark {
+            return TransparentProxySelfBypassContract::Violation(intent_violation(
+                "enforcement.interception.proxy.self_bypass",
+                "reserved-mark self-bypass is only valid for external outbound transparent proxy",
+            ));
+        }
+        return TransparentProxySelfBypassContract::NotOutbound;
+    }
+
+    match (interception.proxy.mode, self_bypass) {
+        (
+            TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+            TransparentInterceptionProxySelfBypassConfig::None,
+        ) => TransparentProxySelfBypassContract::Outbound(
+            TransparentInterceptionOutboundProxyModeIntent::ManagedTcpRelay,
+        ),
+        (
+            TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+            TransparentInterceptionProxySelfBypassConfig::UsesReservedMark,
+        ) => TransparentProxySelfBypassContract::Violation(intent_violation(
+            "enforcement.interception.proxy.self_bypass",
+            "reserved-mark self-bypass is only valid for external outbound transparent proxy",
+        )),
+        (
+            TransparentInterceptionProxyModeConfig::External,
+            TransparentInterceptionProxySelfBypassConfig::UsesReservedMark,
+        ) => TransparentProxySelfBypassContract::Outbound(
+            TransparentInterceptionOutboundProxyModeIntent::External {
+                self_bypass: TransparentInterceptionOutboundProxySelfBypassIntent::UsesReservedMark,
+            },
+        ),
+        (
+            TransparentInterceptionProxyModeConfig::External,
+            TransparentInterceptionProxySelfBypassConfig::None,
+        ) => TransparentProxySelfBypassContract::Violation(intent_violation(
+            "enforcement.interception.proxy.self_bypass",
+            "external outbound transparent proxy requires self_bypass = \"uses_reserved_mark\" so its upstream and control-plane sockets can bypass the agent-owned OUTPUT redirect",
+        )),
+    }
+}
+
 fn validate_health_probe_range(
     field: &'static str,
     value: u64,
@@ -425,6 +557,14 @@ pub enum TransparentInterceptionProxyModeConfig {
     #[default]
     External,
     ManagedTcpRelay,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparentInterceptionProxySelfBypassConfig {
+    #[default]
+    None,
+    UsesReservedMark,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

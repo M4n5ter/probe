@@ -48,6 +48,31 @@ remote_addresses = []
 }
 
 #[test]
+fn parses_external_outbound_proxy_self_bypass_contract() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "outbound_transparent_proxy"
+
+[enforcement.interception.proxy]
+mode = "external"
+self_bypass = "uses_reserved_mark"
+listen_port = 15001
+"#,
+    )?;
+
+    assert_eq!(
+        config.enforcement.interception.proxy.mode,
+        TransparentInterceptionProxyModeConfig::External
+    );
+    assert_eq!(
+        config.enforcement.interception.proxy.self_bypass,
+        TransparentInterceptionProxySelfBypassConfig::UsesReservedMark
+    );
+    Ok(())
+}
+
+#[test]
 fn parses_managed_transparent_interception_proxy_mode() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
         r#"

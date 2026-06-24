@@ -23,9 +23,11 @@ pub use enforcement::{
     MIN_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD,
     MIN_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS, MIN_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS,
     TransparentInterceptionDisabledProxyIntent, TransparentInterceptionEnabledProxyIntent,
-    TransparentInterceptionProxyConfig, TransparentInterceptionProxyHealthProbeConfig,
-    TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
-    TransparentInterceptionProxyIntentViolation, TransparentInterceptionProxyModeConfig,
+    TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
+    TransparentInterceptionOutboundProxySelfBypassIntent, TransparentInterceptionProxyConfig,
+    TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionProxyHealthProbeIntent,
+    TransparentInterceptionProxyIntent, TransparentInterceptionProxyIntentViolation,
+    TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
     TransparentInterceptionStrategyConfig,
 };
 pub use export::{

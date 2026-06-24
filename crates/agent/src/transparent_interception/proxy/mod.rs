@@ -38,8 +38,23 @@ pub(crate) use state::{
 
 #[derive(Debug)]
 pub(in crate::transparent_interception) struct TransparentProxyLifecyclePlan {
-    managed: Option<ManagedTransparentProxyPlan>,
+    proxy: TransparentProxyLifecycleProxyPlan,
     health_probe: Option<health_probe::TransparentProxyHealthProbePlan>,
+}
+
+#[derive(Debug)]
+enum TransparentProxyLifecycleProxyPlan {
+    External,
+    Managed(ManagedTransparentProxyPlan),
+}
+
+impl TransparentProxyLifecycleProxyPlan {
+    fn managed(&self) -> Option<&ManagedTransparentProxyPlan> {
+        match self {
+            Self::External => None,
+            Self::Managed(plan) => Some(plan),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -59,14 +74,14 @@ pub(in crate::transparent_interception) fn prepare_proxy_lifecycle(
     families: Vec<TransparentInterceptionIpFamily>,
     load_local_addresses: LocalAddressInventory,
 ) -> Result<TransparentProxyLifecyclePlan, TransparentInterceptionError> {
-    let managed = prepare_managed_proxy(inbound_plan, families)?;
+    let proxy = prepare_proxy_plan(inbound_plan, families)?;
     let health_probe = prepare_health_probe(
         inbound_plan.health_probe(),
-        managed.as_ref(),
+        proxy.managed(),
         load_local_addresses,
     )?;
     Ok(TransparentProxyLifecyclePlan {
-        managed,
+        proxy,
         health_probe,
     })
 }
@@ -77,14 +92,18 @@ pub(in crate::transparent_interception) fn prepare_outbound_proxy_lifecycle(
     proxy_bypass_mark: NonZeroU32,
     load_local_addresses: LocalAddressInventory,
 ) -> Result<TransparentProxyLifecyclePlan, TransparentInterceptionError> {
-    let managed = prepare_outbound_managed_proxy(
-        outbound_plan,
-        families,
-        proxy_bypass_mark,
-        load_local_addresses,
-    )?;
+    let proxy = if outbound_plan.requires_managed_proxy() {
+        TransparentProxyLifecycleProxyPlan::Managed(prepare_outbound_managed_proxy(
+            outbound_plan,
+            families,
+            proxy_bypass_mark,
+            load_local_addresses,
+        )?)
+    } else {
+        TransparentProxyLifecycleProxyPlan::External
+    };
     Ok(TransparentProxyLifecyclePlan {
-        managed,
+        proxy,
         health_probe: None,
     })
 }
@@ -93,7 +112,7 @@ pub(in crate::transparent_interception) fn start_proxy_lifecycle(
     plan: TransparentProxyLifecyclePlan,
     runtime: TransparentProxyRuntime,
 ) -> Result<Option<TransparentProxyGuard>, TransparentInterceptionError> {
-    let managed = start_managed_proxy(plan.managed, runtime.clone())?;
+    let managed = start_proxy_plan(plan.proxy, runtime.clone())?;
     let health_probe = start_health_probe(plan.health_probe, runtime);
     if managed.is_none() && health_probe.is_none() {
         return Ok(None);
@@ -121,25 +140,27 @@ struct ManagedTransparentProxyGuard {
     runtime: TransparentProxyRuntime,
 }
 
-fn prepare_managed_proxy(
+fn prepare_proxy_plan(
     inbound_plan: &TransparentInterceptionInboundTproxyPlan,
     families: Vec<TransparentInterceptionIpFamily>,
-) -> Result<Option<ManagedTransparentProxyPlan>, TransparentInterceptionError> {
+) -> Result<TransparentProxyLifecycleProxyPlan, TransparentInterceptionError> {
     let TransparentInterceptionProxyModeConfig::ManagedTcpRelay = inbound_plan.proxy_mode() else {
-        return Ok(None);
+        return Ok(TransparentProxyLifecycleProxyPlan::External);
     };
     if families.is_empty() {
         return Err(TransparentInterceptionError::Proxy(
             "managed TCP relay requires at least one listener family".to_string(),
         ));
     }
-    Ok(Some(ManagedTransparentProxyPlan {
-        listen_port: inbound_plan.listen_port().get(),
-        families,
-        relay_plan: relay::TransparentProxyRelayPlan::inbound_tproxy(
-            inbound_plan.listen_port().get(),
-        ),
-    }))
+    Ok(TransparentProxyLifecycleProxyPlan::Managed(
+        ManagedTransparentProxyPlan {
+            listen_port: inbound_plan.listen_port().get(),
+            families,
+            relay_plan: relay::TransparentProxyRelayPlan::inbound_tproxy(
+                inbound_plan.listen_port().get(),
+            ),
+        },
+    ))
 }
 
 fn prepare_outbound_managed_proxy(
@@ -147,7 +168,7 @@ fn prepare_outbound_managed_proxy(
     families: Vec<TransparentInterceptionIpFamily>,
     proxy_bypass_mark: NonZeroU32,
     load_local_addresses: LocalAddressInventory,
-) -> Result<Option<ManagedTransparentProxyPlan>, TransparentInterceptionError> {
+) -> Result<ManagedTransparentProxyPlan, TransparentInterceptionError> {
     if families.is_empty() {
         return Err(TransparentInterceptionError::Proxy(
             "managed outbound transparent proxy requires at least one listener family".to_string(),
@@ -155,7 +176,7 @@ fn prepare_outbound_managed_proxy(
     }
     let local_addresses = load_local_addresses()?;
     let listen_port = outbound_plan.listen_port().get();
-    Ok(Some(ManagedTransparentProxyPlan {
+    Ok(ManagedTransparentProxyPlan {
         listen_port,
         families,
         relay_plan: relay::TransparentProxyRelayPlan::outbound_redirect(
@@ -163,16 +184,18 @@ fn prepare_outbound_managed_proxy(
             proxy_bypass_mark,
             Arc::from(local_addresses),
         ),
-    }))
+    })
 }
 
-fn start_managed_proxy(
-    plan: Option<ManagedTransparentProxyPlan>,
+fn start_proxy_plan(
+    plan: TransparentProxyLifecycleProxyPlan,
     runtime: TransparentProxyRuntime,
 ) -> Result<Option<ManagedTransparentProxyGuard>, TransparentInterceptionError> {
     match plan {
-        Some(plan) => ManagedTransparentProxyGuard::start(plan, runtime).map(Some),
-        None => Ok(None),
+        TransparentProxyLifecycleProxyPlan::External => Ok(None),
+        TransparentProxyLifecycleProxyPlan::Managed(plan) => {
+            ManagedTransparentProxyGuard::start(plan, runtime).map(Some)
+        }
     }
 }
 
@@ -300,6 +323,43 @@ mod tests {
             TransparentProxyRuntime::for_execution_plan(&execution_plan),
         )
         .expect("external mode without health probe should start no proxy lifecycle");
+
+        assert!(guard.is_none());
+    }
+
+    #[test]
+    fn outbound_external_proxy_mode_does_not_start_managed_listener() {
+        let config = probe_config::EnforcementInterceptionConfig {
+            strategy: TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
+            proxy: probe_config::TransparentInterceptionProxyConfig {
+                mode: TransparentInterceptionProxyModeConfig::External,
+                self_bypass:
+                    probe_config::TransparentInterceptionProxySelfBypassConfig::UsesReservedMark,
+                listen_port: Some(15001),
+                ..probe_config::TransparentInterceptionProxyConfig::default()
+            },
+            ..probe_config::EnforcementInterceptionConfig::default()
+        };
+        let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
+            .expect("test transparent interception config should be valid");
+        let TransparentInterceptionExecutionPlan::OutboundTransparentProxy(outbound_plan) =
+            execution_plan.clone()
+        else {
+            panic!("test transparent interception config should use outbound transparent proxy");
+        };
+
+        let plan = prepare_outbound_proxy_lifecycle(
+            &outbound_plan,
+            vec![TransparentInterceptionIpFamily::Ipv4],
+            outbound_plan.outbound_redirect_artifact().proxy_bypass_mark,
+            Arc::new(|| Ok(Vec::new())),
+        )
+        .expect("external outbound mode should be prepared");
+        let guard = start_proxy_lifecycle(
+            plan,
+            TransparentProxyRuntime::for_execution_plan(&execution_plan),
+        )
+        .expect("external outbound mode should start no proxy lifecycle");
 
         assert!(guard.is_none());
     }

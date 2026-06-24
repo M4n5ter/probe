@@ -96,7 +96,7 @@ strategy = "inbound_tproxy"
 }
 
 #[test]
-fn validation_rejects_outbound_transparent_proxy_without_managed_relay()
+fn validation_rejects_external_outbound_proxy_without_self_bypass_contract()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
         r#"
@@ -110,12 +110,85 @@ listen_port = 15001
 
     let error = config
         .validate_basic()
-        .expect_err("outbound transparent proxy must use managed relay");
+        .expect_err("external outbound transparent proxy must declare self-bypass contract");
 
     assert!(
         error
             .to_string()
-            .contains("outbound transparent proxy currently requires managed TCP relay")
+            .contains("external outbound transparent proxy requires self_bypass")
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_accepts_external_outbound_proxy_with_reserved_mark_self_bypass()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "outbound_transparent_proxy"
+
+[enforcement.interception.proxy]
+mode = "external"
+self_bypass = "uses_reserved_mark"
+listen_port = 15001
+"#,
+    )?;
+
+    config.validate_basic()?;
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_reserved_mark_self_bypass_outside_external_outbound_proxy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy"
+
+[enforcement.interception.proxy]
+mode = "external"
+self_bypass = "uses_reserved_mark"
+listen_port = 15001
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("reserved mark self-bypass must be scoped to external outbound proxy");
+
+    assert!(
+        error
+            .to_string()
+            .contains("reserved-mark self-bypass is only valid")
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_reserved_mark_self_bypass_for_managed_outbound_proxy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "outbound_transparent_proxy"
+
+[enforcement.interception.proxy]
+mode = "managed_tcp_relay"
+self_bypass = "uses_reserved_mark"
+listen_port = 15001
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("managed outbound proxy must not accept reserved mark self-bypass");
+
+    assert!(
+        error
+            .to_string()
+            .contains("reserved-mark self-bypass is only valid")
     );
     Ok(())
 }
