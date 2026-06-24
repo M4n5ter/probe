@@ -1,0 +1,119 @@
+use std::{collections::BTreeMap, fs, path::Path};
+
+use probe_config::{
+    AgentConfig, CaptureSelection, CompressionCodecName, ExportFailureBackoffConfig,
+    ExportWorkerScheduleConfig, ExporterConfig, ExporterTransportConfig, PolicyConfig,
+    TransparentInterceptionProxyConfig, TransparentInterceptionProxyModeConfig,
+    TransparentInterceptionStrategyConfig,
+};
+use probe_core::{Direction, EnforcementMode, ProcessSelector, Selector, TrafficSelector};
+
+use super::{LOOPBACK_ADDR, OutboundProxyE2eMode, PROXY_PORT, UPSTREAM_PORT};
+
+const COLLECTOR_SINK: &str = "collector";
+const POLICY_ID: &str = "outbound-proxy-e2e-policy";
+const POLICY_VERSION: &str = "e2e";
+
+pub(super) fn write_agent_config(
+    path: &Path,
+    spool_path: &Path,
+    admin_socket_path: &Path,
+    policy_path: &Path,
+    webhook_endpoint: String,
+    webhook_port: u16,
+    mode: OutboundProxyE2eMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = AgentConfig {
+        agent_id: mode.agent_id().to_string(),
+        config_version: mode.case_name().to_string(),
+        ..AgentConfig::default()
+    };
+    config.capture.selection = CaptureSelection::Libpcap;
+    config.capture.libpcap.interface = Some("lo".to_string());
+    config.capture.libpcap.bpf_filter =
+        format!("tcp and (port {UPSTREAM_PORT} or port {PROXY_PORT})");
+    config.capture.libpcap.read_timeout_ms = 100;
+    config.storage.path = spool_path.to_path_buf();
+    config.export.worker.enabled = true;
+    config.export.worker.schedule = ExportWorkerScheduleConfig::FixedIntervalBounded {
+        interval_ms: 100,
+        batches_per_sink_per_tick: 1,
+        sink_timeout_ms: 5_000,
+        failure_backoff: ExportFailureBackoffConfig {
+            initial_ms: 5_000,
+            max_ms: 5_000,
+            multiplier: 1,
+        },
+    };
+    config.exporters.push(ExporterConfig {
+        id: COLLECTOR_SINK.to_string(),
+        transport: ExporterTransportConfig::Webhook {
+            endpoint: webhook_endpoint,
+            headers: BTreeMap::from([("x-sssa-e2e".to_string(), mode.header_value().to_string())]),
+            tls: Default::default(),
+        },
+        codec: CompressionCodecName::None,
+        worker: Default::default(),
+    });
+    config.admin.enabled = true;
+    config.admin.socket_path = admin_socket_path.to_path_buf();
+    config.policies.push(PolicyConfig {
+        id: POLICY_ID.to_string(),
+        path: policy_path.to_path_buf(),
+        enabled: true,
+        selector: None,
+    });
+    config.enforcement.mode = EnforcementMode::Enforce;
+    config.enforcement.interception.strategy =
+        TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
+    config.enforcement.interception.proxy = match mode {
+        OutboundProxyE2eMode::ManagedRelay => TransparentInterceptionProxyConfig {
+            mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+            listen_port: Some(PROXY_PORT),
+            ..TransparentInterceptionProxyConfig::default()
+        },
+        OutboundProxyE2eMode::ExternalProxy => TransparentInterceptionProxyConfig {
+            mode: TransparentInterceptionProxyModeConfig::External,
+            self_bypass:
+                probe_config::TransparentInterceptionProxySelfBypassConfig::UsesReservedMark,
+            listen_port: Some(PROXY_PORT),
+            ..TransparentInterceptionProxyConfig::default()
+        },
+    };
+    config.enforcement.interception.selector = Some(Selector::term(
+        ProcessSelector::default(),
+        TrafficSelector {
+            remote_ports: vec![UPSTREAM_PORT, webhook_port],
+            directions: vec![Direction::Outbound],
+            remote_addresses: vec![LOOPBACK_ADDR.to_string()],
+            ..TrafficSelector::default()
+        },
+    ));
+    fs::write(path, toml::to_string(&config)?)?;
+    Ok(())
+}
+
+pub(super) fn write_policy_bundle(path: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(path)?;
+    fs::write(
+        path.join("manifest.toml"),
+        format!(
+            r#"
+id = "{POLICY_ID}"
+version = "{POLICY_VERSION}"
+hooks = ["on_http_request_headers"]
+"#
+        ),
+    )?;
+    fs::write(
+        path.join("main.lua"),
+        r#"
+function on_http_request_headers(event)
+  local target = event.kind.target or ""
+  if target == "/transparent-outbound-proxy-e2e" then
+    return probe.emit_alert("transparent outbound proxy observed " .. target)
+  end
+end
+"#,
+    )
+}

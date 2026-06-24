@@ -21,7 +21,10 @@ use super::super::{
     },
     tls_plaintext_provider_loopback::run as run_tls_plaintext_provider_loopback,
     transparent_linux_outbound_redirect_artifact::run as run_transparent_linux_outbound_redirect_artifact,
-    transparent_outbound_proxy_loopback::run as run_transparent_outbound_proxy_loopback,
+    transparent_outbound_proxy_loopback::{
+        run as run_transparent_outbound_proxy_loopback,
+        run_external as run_transparent_outbound_external_proxy_loopback,
+    },
     transparent_tproxy_loopback::{
         run as run_transparent_tproxy_loopback,
         run_process_scoped as run_transparent_tproxy_process_loopback,
@@ -204,6 +207,11 @@ const E2E_CASES: &[E2eCase] = &[
         requirement: E2eRequirement::RootNetAdmin,
         run: run_transparent_outbound_proxy_loopback,
     },
+    E2eCase {
+        name: "e2e-transparent-outbound-external-proxy-loopback",
+        requirement: E2eRequirement::RootNetAdmin,
+        run: run_transparent_outbound_external_proxy_loopback,
+    },
 ];
 
 const E2E_PROFILES: &[E2eProfile] = &[
@@ -259,6 +267,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-transparent-tproxy-loopback",
             "e2e-transparent-tproxy-process-loopback",
             "e2e-transparent-outbound-proxy-loopback",
+            "e2e-transparent-outbound-external-proxy-loopback",
         ]),
     },
     E2eProfile {
@@ -293,6 +302,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-transparent-tproxy-loopback",
             "e2e-transparent-tproxy-process-loopback",
             "e2e-transparent-outbound-proxy-loopback",
+            "e2e-transparent-outbound-external-proxy-loopback",
         ]),
     },
 ];
@@ -477,6 +487,7 @@ mod tests {
                 "e2e-transparent-tproxy-loopback",
                 "e2e-transparent-tproxy-process-loopback",
                 "e2e-transparent-outbound-proxy-loopback",
+                "e2e-transparent-outbound-external-proxy-loopback",
             ]),
         },
         ExpectedProfile {
@@ -513,6 +524,7 @@ mod tests {
                 "e2e-transparent-tproxy-loopback",
                 "e2e-transparent-tproxy-process-loopback",
                 "e2e-transparent-outbound-proxy-loopback",
+                "e2e-transparent-outbound-external-proxy-loopback",
             ]),
         },
     ];
