@@ -1,19 +1,21 @@
 use std::{fs, path::Path, process::ExitCode};
 
-use capture::CaptureEvent;
-use probe_core::{
-    CaptureProviderKind, CaptureSource, Direction, EventEnvelope, EventKind, WebSocketOpcode,
-};
+use probe_core::{Direction, EventEnvelope, EventKind, WebSocketOpcode};
 use storage::{FjallSpool, StoredEvent};
 
-use super::harness::{
-    decode_capture_event, decode_envelope, e2e_error, run_agent_with_max_events, run_with_temp_root,
+use super::harness::{decode_envelope, e2e_error, run_agent_with_max_events, run_with_temp_root};
+use super::plaintext_assertions::{
+    assert_bytes_event, assert_connection_closed, assert_connection_opened,
+    assert_no_http_body_chunks_after, assert_no_protocol_errors, assert_policy_alert,
+    decode_capture_events, export_event_position, has_header,
 };
 use super::plaintext_scenario::{
     PlaintextFeedCase, PlaintextFeedRecord, PlaintextFlow, PlaintextProcess,
 };
 
+const CONTEXT: &str = "websocket";
 const WEBSOCKET_FEED_EVENT_COUNT: usize = 5;
+const WEBSOCKET_CAPTURE_READ_LIMIT: usize = WEBSOCKET_FEED_EVENT_COUNT + 1;
 const WEBSOCKET_EXPORT_EVENT_COUNT: usize = 8;
 const E2E_EXPORT_CURSOR_OWNER: &str = "e2e";
 const AGENT_ID: &str = "e2e-websocket-agent";
@@ -62,7 +64,7 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
         scenario.agent_config_with_policy(feed_path, policy_path, spool_path.clone(), POLICY_ID);
     config.export.worker.enabled = false;
     fs::write(&config_path, toml::to_string(&config)?)?;
-    run_agent_with_max_events(&config_path, WEBSOCKET_FEED_EVENT_COUNT)?;
+    run_agent_with_max_events(&config_path, WEBSOCKET_CAPTURE_READ_LIMIT)?;
     assert_spool_outputs(&spool_path, &scenario)?;
 
     Ok(())
@@ -96,13 +98,9 @@ fn write_feed(scenario: &PlaintextFeedCase, path: &Path) -> Result<(), Box<dyn s
         path,
         [
             PlaintextFeedRecord::connection_opened(),
-            PlaintextFeedRecord::bytes(Direction::Outbound, 0, request.clone()),
+            PlaintextFeedRecord::bytes(Direction::Outbound, 0, request),
             PlaintextFeedRecord::bytes(Direction::Inbound, 0, response.clone()),
-            PlaintextFeedRecord::bytes(
-                Direction::Inbound,
-                u64::try_from(response.len())?,
-                frame.clone(),
-            ),
+            PlaintextFeedRecord::bytes(Direction::Inbound, u64::try_from(response.len())?, frame),
             PlaintextFeedRecord::connection_closed(),
         ],
     )
@@ -196,37 +194,24 @@ fn assert_spool_outputs(
     );
     Ok(())
 }
+
 fn assert_ingress_events(
     events: &[StoredEvent],
     scenario: &PlaintextFeedCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let capture_events = events
-        .iter()
-        .map(decode_capture_event)
-        .collect::<Result<Vec<_>, _>>()?;
+    let capture_events = decode_capture_events(events, WEBSOCKET_FEED_EVENT_COUNT, CONTEXT)?;
     let [opened, request, response, frame, closed] = capture_events.as_slice() else {
-        return Err(e2e_error(format!(
-            "expected {WEBSOCKET_FEED_EVENT_COUNT} ordered websocket ingress events, got {}",
-            capture_events.len()
-        ))
-        .into());
+        unreachable!("decode_capture_events already checked the event count");
     };
 
-    if !matches!(
-        opened,
-        CaptureEvent::ConnectionOpened { origin, flow, .. }
-            if origin.source() == CaptureSource::ExternalPlaintextFeed
-                && origin.provider() == CaptureProviderKind::Plaintext
-                && flow.id.0 == scenario.expected_flow_id()
-    ) {
-        return Err(e2e_error("missing websocket ingress connection_opened event").into());
-    }
+    assert_connection_opened(opened, scenario, CONTEXT)?;
     assert_bytes_event(
         request,
         scenario,
         Direction::Outbound,
         0,
         websocket_upgrade_request().as_slice(),
+        CONTEXT,
         "upgrade request",
     )?;
     let upgrade_response = websocket_upgrade_response();
@@ -236,6 +221,7 @@ fn assert_ingress_events(
         Direction::Inbound,
         0,
         upgrade_response.as_slice(),
+        CONTEXT,
         "upgrade response",
     )?;
     assert_bytes_event(
@@ -244,52 +230,26 @@ fn assert_ingress_events(
         Direction::Inbound,
         u64::try_from(upgrade_response.len())?,
         websocket_text_frame(FRAME_PAYLOAD).as_slice(),
+        CONTEXT,
         "websocket frame",
     )?;
-    if !matches!(
-        closed,
-        CaptureEvent::ConnectionClosed { origin, flow, .. }
-            if origin.source() == CaptureSource::ExternalPlaintextFeed
-                && origin.provider() == CaptureProviderKind::Plaintext
-                && flow.id.0 == scenario.expected_flow_id()
-    ) {
-        return Err(e2e_error("missing websocket ingress connection_closed event").into());
-    }
-    Ok(())
-}
-
-fn assert_bytes_event(
-    event: &CaptureEvent,
-    scenario: &PlaintextFeedCase,
-    direction: Direction,
-    stream_offset: u64,
-    expected: &[u8],
-    label: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if matches!(
-        event,
-        CaptureEvent::Bytes(bytes)
-            if bytes.origin.source() == CaptureSource::ExternalPlaintextFeed
-                && bytes.origin.provider() == CaptureProviderKind::Plaintext
-                && bytes.flow.id.0 == scenario.expected_flow_id()
-                && bytes.direction == direction
-                && bytes.stream_offset == stream_offset
-                && bytes.bytes.as_ref() == expected
-    ) {
-        return Ok(());
-    }
-    Err(e2e_error(format!(
-        "missing expected websocket ingress {label} bytes event"
-    ))
-    .into())
+    assert_connection_closed(closed, scenario, CONTEXT)
 }
 
 fn assert_websocket_exports(
     envelopes: &[EventEnvelope],
     scenario: &PlaintextFeedCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let request_index =
-        single_event_position(envelopes, scenario, "HTTP upgrade request", |kind| {
+    let opened_index =
+        export_event_position(envelopes, scenario, CONTEXT, "connection opened", |kind| {
+            matches!(kind, EventKind::ConnectionOpened)
+        })?;
+    let request_index = export_event_position(
+        envelopes,
+        scenario,
+        CONTEXT,
+        "HTTP upgrade request",
+        |kind| {
             matches!(
                 kind,
                 EventKind::HttpRequestHeaders(headers)
@@ -297,174 +257,94 @@ fn assert_websocket_exports(
                         && headers.method.as_deref() == Some("GET")
                         && headers.target.as_deref() == Some(REQUEST_TARGET)
             )
+        },
+    )?;
+    let response_index =
+        export_event_position(envelopes, scenario, CONTEXT, "HTTP 101 response", |kind| {
+            matches!(
+                kind,
+                EventKind::HttpResponseHeaders(headers)
+                    if headers.direction == Direction::Inbound
+                        && headers.status == Some(101)
+                        && has_header(
+                            &headers.headers,
+                            "sec-websocket-accept",
+                            RFC_SAMPLE_WEBSOCKET_ACCEPT,
+                        )
+                        && has_header(&headers.headers, "sec-websocket-protocol", SUBPROTOCOL)
+            )
         })?;
-    let response_index = single_event_position(envelopes, scenario, "HTTP 101 response", |kind| {
-        matches!(
-            kind,
-            EventKind::HttpResponseHeaders(headers)
-                if headers.direction == Direction::Inbound
-                    && headers.status == Some(101)
-                    && has_header(
-                        &headers.headers,
-                        "sec-websocket-accept",
-                        RFC_SAMPLE_WEBSOCKET_ACCEPT,
-                    )
-                    && has_header(&headers.headers, "sec-websocket-protocol", SUBPROTOCOL)
-        )
-    })?;
-    let handoff_index = single_event_position(envelopes, scenario, "WebSocket handoff", |kind| {
-        matches!(
-            kind,
-            EventKind::WebSocketHandoff(handoff)
-                if handoff.direction == Direction::Inbound
-                    && handoff.target.as_deref() == Some(REQUEST_TARGET)
-                    && handoff.subprotocol.as_deref() == Some(SUBPROTOCOL)
-        )
-    })?;
-    let frame_index = single_event_position(envelopes, scenario, "WebSocket frame", |kind| {
-        matches!(
-            kind,
-            EventKind::WebSocketFrame(frame)
-                if frame.direction == Direction::Inbound
-                    && frame.frame_sequence == 1
-                    && frame.fin
-                    && !frame.masked
-                    && matches!(frame.opcode, WebSocketOpcode::Text)
-                    && frame.payload_len == u64::try_from(FRAME_PAYLOAD.len()).unwrap_or(u64::MAX)
-                    && frame.payload_fingerprint.as_slice() == FRAME_PAYLOAD_FINGERPRINT.as_slice()
-        )
-    })?;
+    let handoff_index =
+        export_event_position(envelopes, scenario, CONTEXT, "WebSocket handoff", |kind| {
+            matches!(
+                kind,
+                EventKind::WebSocketHandoff(handoff)
+                    if handoff.direction == Direction::Inbound
+                        && handoff.target.as_deref() == Some(REQUEST_TARGET)
+                        && handoff.subprotocol.as_deref() == Some(SUBPROTOCOL)
+            )
+        })?;
+    let frame_index =
+        export_event_position(envelopes, scenario, CONTEXT, "WebSocket frame", |kind| {
+            matches!(
+                kind,
+                EventKind::WebSocketFrame(frame)
+                    if frame.direction == Direction::Inbound
+                        && frame.frame_sequence == 1
+                        && frame.fin
+                        && !frame.masked
+                        && matches!(frame.opcode, WebSocketOpcode::Text)
+                        && frame.payload_len
+                            == u64::try_from(FRAME_PAYLOAD.len()).unwrap_or(u64::MAX)
+                        && frame.payload_fingerprint.as_slice()
+                            == FRAME_PAYLOAD_FINGERPRINT.as_slice()
+            )
+        })?;
+    let closed_index =
+        export_event_position(envelopes, scenario, CONTEXT, "connection closed", |kind| {
+            matches!(kind, EventKind::ConnectionClosed)
+        })?;
 
-    if !(request_index < response_index
+    if !(opened_index < request_index
+        && request_index < response_index
         && response_index < handoff_index
-        && handoff_index < frame_index)
+        && handoff_index < frame_index
+        && frame_index < closed_index)
     {
         return Err(e2e_error(format!(
-            "websocket export order was request={request_index}, response={response_index}, handoff={handoff_index}, frame={frame_index}"
+            "websocket export order was opened={opened_index}, request={request_index}, response={response_index}, handoff={handoff_index}, frame={frame_index}, closed={closed_index}"
         ))
         .into());
     }
-    assert_policy_alert(envelopes, scenario, HANDOFF_ALERT)?;
-    assert_policy_alert(envelopes, scenario, FRAME_ALERT)?;
-    assert_lifecycle_exports(envelopes, scenario)?;
+
+    let expected_policy_version = expected_policy_version();
+    assert_policy_alert(
+        envelopes,
+        scenario,
+        &expected_policy_version,
+        CONTEXT,
+        HANDOFF_ALERT,
+    )?;
+    assert_policy_alert(
+        envelopes,
+        scenario,
+        &expected_policy_version,
+        CONTEXT,
+        FRAME_ALERT,
+    )?;
     assert_no_protocol_errors_after_handoff(envelopes, handoff_index)?;
     Ok(())
-}
-
-fn single_event_position(
-    envelopes: &[EventEnvelope],
-    scenario: &PlaintextFeedCase,
-    label: &str,
-    matches_kind: impl Fn(&EventKind) -> bool,
-) -> Result<usize, Box<dyn std::error::Error>> {
-    let matching_positions = envelopes
-        .iter()
-        .enumerate()
-        .filter_map(|(position, envelope)| {
-            (is_expected_feed_flow(envelope, scenario) && matches_kind(envelope.kind()))
-                .then_some(position)
-        })
-        .collect::<Vec<_>>();
-    let [position] = matching_positions.as_slice() else {
-        return Err(e2e_error(format!(
-            "expected exactly one websocket export event for {label}, got {} at positions {matching_positions:?}",
-            matching_positions.len()
-        ))
-        .into());
-    };
-    Ok(*position)
-}
-
-fn has_header(headers: &[(String, String)], name: &str, value: &str) -> bool {
-    headers
-        .iter()
-        .any(|(header_name, header_value)| header_name == name && header_value == value)
-}
-
-fn assert_policy_alert(
-    envelopes: &[EventEnvelope],
-    scenario: &PlaintextFeedCase,
-    message: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let expected_policy_version = expected_policy_version();
-    let matching_alerts = envelopes
-        .iter()
-        .filter(|envelope| {
-            is_expected_feed_flow(envelope, scenario)
-                && envelope.policy_version() == Some(expected_policy_version.as_str())
-                && matches!(
-                    envelope.kind(),
-                    EventKind::PolicyAlert(alert) if alert.message == message
-                )
-        })
-        .count();
-    if matching_alerts == 1 {
-        return Ok(());
-    }
-    let observed = envelopes
-        .iter()
-        .filter_map(|envelope| match envelope.kind() {
-            EventKind::PolicyAlert(alert) => Some(alert.message.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    Err(e2e_error(format!(
-        "expected exactly one websocket policy alert {message}, got {matching_alerts}; observed alerts {observed:?}"
-    ))
-    .into())
-}
-
-fn assert_lifecycle_exports(
-    envelopes: &[EventEnvelope],
-    scenario: &PlaintextFeedCase,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let opened = envelopes
-        .iter()
-        .filter(|envelope| {
-            is_expected_feed_flow(envelope, scenario)
-                && matches!(envelope.kind(), EventKind::ConnectionOpened)
-        })
-        .count();
-    let closed = envelopes
-        .iter()
-        .filter(|envelope| {
-            is_expected_feed_flow(envelope, scenario)
-                && matches!(envelope.kind(), EventKind::ConnectionClosed)
-        })
-        .count();
-    if opened == 1 && closed == 1 {
-        return Ok(());
-    }
-    Err(e2e_error(format!(
-        "expected exactly one websocket connection_opened and connection_closed export, got opened={opened}, closed={closed}"
-    ))
-    .into())
 }
 
 fn assert_no_protocol_errors_after_handoff(
     envelopes: &[EventEnvelope],
     handoff_index: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if envelopes
-        .iter()
-        .skip(handoff_index + 1)
-        .any(|envelope| matches!(envelope.kind(), EventKind::HttpBodyChunk(_)))
-    {
-        return Err(e2e_error("websocket payload was parsed as HTTP body after handoff").into());
-    }
-    if envelopes
-        .iter()
-        .any(|envelope| matches!(envelope.kind(), EventKind::ProtocolError(_)))
-    {
-        return Err(e2e_error("websocket plaintext feed produced a protocol error").into());
-    }
+    assert_no_http_body_chunks_after(envelopes, handoff_index, CONTEXT, "handoff")?;
+    assert_no_protocol_errors(envelopes, CONTEXT)?;
     Ok(())
 }
 
 fn expected_policy_version() -> String {
     format!("{POLICY_ID}@{POLICY_VERSION}")
-}
-
-fn is_expected_feed_flow(envelope: &EventEnvelope, scenario: &PlaintextFeedCase) -> bool {
-    scenario.matches_export_flow(envelope)
 }

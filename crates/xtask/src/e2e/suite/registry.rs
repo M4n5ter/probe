@@ -8,6 +8,7 @@ use super::super::{
     libpcap_loopback::run as run_libpcap_loopback,
     plaintext_feed::run as run_plaintext_feed,
     remote_enforcement_policy::run as run_remote_enforcement_policy,
+    sse_plaintext_feed::run as run_sse_plaintext_feed,
     tls_material_auto_binding_loopback::{
         run as run_tls_session_secret_auto_binding_loopback,
         run_key_log as run_tls_key_log_auto_binding_loopback,
@@ -102,6 +103,11 @@ const E2E_CASES: &[E2eCase] = &[
         name: "e2e-plaintext-feed",
         requirement: E2eRequirement::User,
         run: run_plaintext_feed,
+    },
+    E2eCase {
+        name: "e2e-sse-plaintext-feed",
+        requirement: E2eRequirement::User,
+        run: run_sse_plaintext_feed,
     },
     E2eCase {
         name: "e2e-websocket-plaintext-feed",
@@ -227,6 +233,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
         description: "non-privileged replay/plaintext/export/policy regression suite",
         cases: E2eProfileCases::Named(&[
             "e2e-plaintext-feed",
+            "e2e-sse-plaintext-feed",
             "e2e-websocket-plaintext-feed",
             "e2e-webhook-exporter",
             "e2e-file-exporter",
@@ -289,6 +296,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
         description: "full product capability suite across replay, live capture, eBPF, TLS, and transparent interception",
         cases: E2eProfileCases::Named(&[
             "e2e-plaintext-feed",
+            "e2e-sse-plaintext-feed",
             "e2e-websocket-plaintext-feed",
             "e2e-webhook-exporter",
             "e2e-file-exporter",
@@ -449,6 +457,7 @@ mod tests {
             description: "non-privileged replay/plaintext/export/policy regression suite",
             cases: ExpectedProfileCases::Named(&[
                 "e2e-plaintext-feed",
+                "e2e-sse-plaintext-feed",
                 "e2e-websocket-plaintext-feed",
                 "e2e-webhook-exporter",
                 "e2e-file-exporter",
@@ -513,6 +522,7 @@ mod tests {
             description: "full product capability suite across replay, live capture, eBPF, TLS, and transparent interception",
             cases: ExpectedProfileCases::Named(&[
                 "e2e-plaintext-feed",
+                "e2e-sse-plaintext-feed",
                 "e2e-websocket-plaintext-feed",
                 "e2e-webhook-exporter",
                 "e2e-file-exporter",
