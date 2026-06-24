@@ -24,6 +24,7 @@ use super::super::{
     transparent_outbound_proxy_loopback::{
         run as run_transparent_outbound_proxy_loopback,
         run_external as run_transparent_outbound_external_proxy_loopback,
+        run_owner_scoped as run_transparent_outbound_owner_proxy_loopback,
     },
     transparent_tproxy_loopback::{
         run as run_transparent_tproxy_loopback,
@@ -212,6 +213,11 @@ const E2E_CASES: &[E2eCase] = &[
         requirement: E2eRequirement::RootNetAdmin,
         run: run_transparent_outbound_external_proxy_loopback,
     },
+    E2eCase {
+        name: "e2e-transparent-outbound-owner-proxy-loopback",
+        requirement: E2eRequirement::RootNetAdmin,
+        run: run_transparent_outbound_owner_proxy_loopback,
+    },
 ];
 
 const E2E_PROFILES: &[E2eProfile] = &[
@@ -268,6 +274,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-transparent-tproxy-process-loopback",
             "e2e-transparent-outbound-proxy-loopback",
             "e2e-transparent-outbound-external-proxy-loopback",
+            "e2e-transparent-outbound-owner-proxy-loopback",
         ]),
     },
     E2eProfile {
@@ -303,6 +310,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-transparent-tproxy-process-loopback",
             "e2e-transparent-outbound-proxy-loopback",
             "e2e-transparent-outbound-external-proxy-loopback",
+            "e2e-transparent-outbound-owner-proxy-loopback",
         ]),
     },
 ];
@@ -488,6 +496,7 @@ mod tests {
                 "e2e-transparent-tproxy-process-loopback",
                 "e2e-transparent-outbound-proxy-loopback",
                 "e2e-transparent-outbound-external-proxy-loopback",
+                "e2e-transparent-outbound-owner-proxy-loopback",
             ]),
         },
         ExpectedProfile {
@@ -525,6 +534,7 @@ mod tests {
                 "e2e-transparent-tproxy-process-loopback",
                 "e2e-transparent-outbound-proxy-loopback",
                 "e2e-transparent-outbound-external-proxy-loopback",
+                "e2e-transparent-outbound-owner-proxy-loopback",
             ]),
         },
     ];

@@ -1,6 +1,7 @@
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
+    os::unix::process::CommandExt,
     process::{Child, Command, Stdio},
     sync::mpsc,
     thread,
@@ -59,7 +60,9 @@ pub(super) enum ProxyFixture {
 impl ProxyFixture {
     pub(super) fn spawn(mode: OutboundProxyE2eMode) -> Result<Self, Box<dyn std::error::Error>> {
         match mode {
-            OutboundProxyE2eMode::ManagedRelay => Ok(Self::ManagedRelay),
+            OutboundProxyE2eMode::ManagedRelay | OutboundProxyE2eMode::OwnerScopedManagedRelay => {
+                Ok(Self::ManagedRelay)
+            }
             OutboundProxyE2eMode::ExternalProxy => {
                 ExternalProxyServer::spawn().map(Self::ExternalProxy)
             }
@@ -211,15 +214,22 @@ fn connect_marked_upstream() -> Result<TcpStream, Box<dyn std::error::Error>> {
     Ok(TcpStream::from(socket))
 }
 
-pub(super) fn run_client() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+pub(super) fn run_client(
+    owner: Option<super::ClientOwner>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let host = LOOPBACK_ADDR.to_string();
     let port = UPSTREAM_PORT.to_string();
-    let mut child = Command::new(nc_command()?)
+    let mut command = Command::new(nc_command()?);
+    command
         .args(["-w", "2", &host, &port])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    if let Some(owner) = owner {
+        command.uid(owner.uid);
+        command.gid(owner.gid);
+    }
+    let mut child = command.spawn()?;
     child
         .stdin
         .take()

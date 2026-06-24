@@ -9,6 +9,7 @@ use super::{
     TransparentInterceptionProcessScope, TransparentInterceptionProcessScopeExpression,
     TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupDirection,
     TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError,
+    TransparentInterceptionSocketOwnerScope,
 };
 
 const PROCESS_CLASSIFIER_REASON: &str = "selector contains process constraints that require a process classifier such as cgroup/owner marking or proxy-side process classification before host rules can be safely narrowed";
@@ -69,12 +70,14 @@ enum SetupClassifierRequirement {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ProjectableLocalSetupTerm {
     traffic: TrafficSelector,
+    socket_owners: TransparentInterceptionSocketOwnerScope,
 }
 
 impl ProjectableLocalSetupTerm {
     fn intersect(self, other: Self) -> Result<Self, TransparentInterceptionSetupProjectionError> {
         Ok(Self {
             traffic: intersect_traffic_selectors(self.traffic, other.traffic)?,
+            socket_owners: intersect_socket_owner_scopes(self.socket_owners, other.socket_owners)?,
         })
     }
 
@@ -84,6 +87,7 @@ impl ProjectableLocalSetupTerm {
     ) -> Self {
         Self {
             traffic: scope.to_traffic_selector(direction),
+            socket_owners: scope.socket_owners().clone(),
         }
     }
 }
@@ -95,11 +99,13 @@ fn analyze_selector(
     match selector {
         Selector::Match { term } => {
             validate_traffic_selector(&term.traffic, direction)?;
+            let process_projection = process_setup_projection(&term.process, direction);
             Ok(SelectorSetupAnalysis {
                 host_term: Some(ProjectableLocalSetupTerm {
                     traffic: term.traffic.clone(),
+                    socket_owners: process_projection.socket_owners,
                 }),
-                classifier: process_classifier_requirement(&term.process),
+                classifier: process_projection.classifier,
             })
         }
         Selector::All { selectors } => analyze_all_selector(selectors, direction),
@@ -227,12 +233,69 @@ fn flow_classifier_analysis(reason: String) -> SelectorSetupAnalysis {
     }
 }
 
-fn process_classifier_requirement(process: &ProcessSelector) -> Option<SetupClassifierRequirement> {
-    process_selector_has_constraints(process).then(|| SetupClassifierRequirement::Process {
-        expression: TransparentInterceptionProcessScopeExpression::Match {
-            process: process.clone(),
-        },
-    })
+struct ProcessSetupProjection {
+    socket_owners: TransparentInterceptionSocketOwnerScope,
+    classifier: Option<SetupClassifierRequirement>,
+}
+
+fn process_setup_projection(
+    process: &ProcessSelector,
+    direction: TransparentInterceptionSetupDirection,
+) -> ProcessSetupProjection {
+    if !process_selector_has_constraints(process) {
+        return ProcessSetupProjection {
+            socket_owners: TransparentInterceptionSocketOwnerScope::any(),
+            classifier: None,
+        };
+    }
+
+    let socket_owners = socket_owner_scope_for_process(process, direction);
+    if process_selector_has_only_socket_owner_constraints(process, direction) {
+        return ProcessSetupProjection {
+            socket_owners,
+            classifier: None,
+        };
+    }
+
+    ProcessSetupProjection {
+        socket_owners,
+        classifier: Some(SetupClassifierRequirement::Process {
+            expression: TransparentInterceptionProcessScopeExpression::Match {
+                process: process.clone(),
+            },
+        }),
+    }
+}
+
+fn socket_owner_scope_for_process(
+    process: &ProcessSelector,
+    direction: TransparentInterceptionSetupDirection,
+) -> TransparentInterceptionSocketOwnerScope {
+    if direction == TransparentInterceptionSetupDirection::Outbound {
+        TransparentInterceptionSocketOwnerScope::new(process.uids.clone(), process.gids.clone())
+    } else {
+        TransparentInterceptionSocketOwnerScope::any()
+    }
+}
+
+fn process_selector_has_only_socket_owner_constraints(
+    process: &ProcessSelector,
+    direction: TransparentInterceptionSetupDirection,
+) -> bool {
+    direction == TransparentInterceptionSetupDirection::Outbound
+        && process_selector_has_socket_owner_constraints(process)
+        && !process_selector_has_constraints(&process_without_socket_owner_constraints(process))
+}
+
+fn process_selector_has_socket_owner_constraints(process: &ProcessSelector) -> bool {
+    !process.uids.is_empty() || !process.gids.is_empty()
+}
+
+fn process_without_socket_owner_constraints(process: &ProcessSelector) -> ProcessSelector {
+    let mut residual = process.clone();
+    residual.uids.clear();
+    residual.gids.clear();
+    residual
 }
 
 fn process_classifier_requirement_from_expressions(
@@ -270,11 +333,49 @@ fn host_rule_scope_from_term(
     direction: TransparentInterceptionSetupDirection,
 ) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionSetupProjectionError> {
     validate_direction_projection(&term.traffic, direction)?;
-    TransparentInterceptionHostRuleScope::new(
+    TransparentInterceptionHostRuleScope::with_socket_owners(
         TransparentInterceptionPortScope::from_values(term.traffic.local_ports),
         TransparentInterceptionPortScope::from_values(term.traffic.remote_ports),
         parse_remote_addresses(&term.traffic.remote_addresses)?,
+        term.socket_owners,
     )
+}
+
+fn intersect_socket_owner_scopes(
+    left: TransparentInterceptionSocketOwnerScope,
+    right: TransparentInterceptionSocketOwnerScope,
+) -> Result<TransparentInterceptionSocketOwnerScope, TransparentInterceptionSetupProjectionError> {
+    Ok(TransparentInterceptionSocketOwnerScope::new(
+        intersect_owner_values(left.uids(), right.uids(), "uid")?,
+        intersect_owner_values(left.gids(), right.gids(), "gid")?,
+    ))
+}
+
+fn intersect_owner_values(
+    left: &[u32],
+    right: &[u32],
+    label: &'static str,
+) -> Result<Vec<u32>, TransparentInterceptionSetupProjectionError> {
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => Ok(Vec::new()),
+        (true, false) => Ok(right.to_vec()),
+        (false, true) => Ok(left.to_vec()),
+        (false, false) => {
+            let mut values = Vec::new();
+            for value in left {
+                if right.contains(value) && !values.contains(value) {
+                    values.push(*value);
+                }
+            }
+            if values.is_empty() {
+                Err(TransparentInterceptionSetupProjectionError::Unsupported {
+                    reason: format!("selector socket owner {label} intersections do not overlap"),
+                })
+            } else {
+                Ok(values)
+            }
+        }
+    }
 }
 
 fn validate_traffic_selector(
@@ -483,6 +584,45 @@ mod tests {
     }
 
     #[test]
+    fn projects_outbound_socket_owner_host_rule_scope() {
+        let scope = outbound_scope_for(Selector::term(
+            process_owners(&[1000], &[2000]),
+            outbound_remote_port_addresses(443, &["203.0.113.10"]),
+        ))
+        .expect("pure owner-scoped outbound selector should project");
+
+        assert_eq!(scope.remote_ports().values(), &[443]);
+        assert_eq!(scope.socket_owners().uids(), &[1000]);
+        assert_eq!(scope.socket_owners().gids(), &[2000]);
+    }
+
+    #[test]
+    fn outbound_non_owner_process_constraints_still_require_classifier() {
+        let plan = outbound_plan_for(Selector::term(
+            ProcessSelector {
+                uids: vec![1000],
+                names: strings(&["curl"]),
+                ..ProcessSelector::default()
+            },
+            outbound_remote_port_addresses(443, &["203.0.113.10"]),
+        ))
+        .expect("mixed owner/name selector should remain typed");
+
+        let TransparentInterceptionSetupPlan::RequiresProcessClassifier {
+            host_rule_boundary, ..
+        } = plan
+        else {
+            panic!("mixed owner/name selector should require classifier");
+        };
+        let Some(host_scope) = host_rule_boundary.scope() else {
+            panic!("traffic boundary should still carry the projectable host dimensions");
+        };
+        assert_eq!(host_scope.remote_ports().values(), &[443]);
+        assert_eq!(host_scope.socket_owners().uids(), &[1000]);
+        assert!(host_scope.socket_owners().gids().is_empty());
+    }
+
+    #[test]
     fn setup_plan_preserves_all_process_scope_without_flattening_globs() {
         let plan = plan_for(Selector::All {
             selectors: vec![
@@ -638,6 +778,90 @@ mod tests {
             flow_scope.selector(),
             TransparentInterceptionClassifierSelector::Any { .. }
         ));
+    }
+
+    #[test]
+    fn owner_any_with_cross_product_risk_reports_flow_classifier_requirement() {
+        let plan = outbound_plan_for(Selector::Any {
+            selectors: vec![
+                Selector::term(
+                    process_owners(&[1000], &[]),
+                    outbound_remote_port_addresses(443, &["203.0.113.10"]),
+                ),
+                Selector::term(
+                    process_owners(&[2000], &[]),
+                    outbound_remote_port_addresses(444, &["203.0.113.10"]),
+                ),
+            ],
+        })
+        .expect("owner/port cross product should produce a classifier setup plan");
+
+        let TransparentInterceptionSetupPlan::RequiresFlowClassifier { .. } = plan else {
+            panic!("owner/port cross-product any selector should require flow classifier");
+        };
+    }
+
+    #[test]
+    fn owner_any_with_different_owner_pairs_reports_flow_classifier_requirement() {
+        let plan = outbound_plan_for(Selector::Any {
+            selectors: vec![
+                Selector::term(
+                    process_owners(&[1000], &[2000]),
+                    outbound_remote_port_addresses(443, &["203.0.113.10"]),
+                ),
+                Selector::term(
+                    process_owners(&[1001], &[2001]),
+                    outbound_remote_port_addresses(443, &["203.0.113.10"]),
+                ),
+            ],
+        })
+        .expect("owner tuple disjunction should produce a classifier setup plan");
+
+        let TransparentInterceptionSetupPlan::RequiresFlowClassifier { .. } = plan else {
+            panic!("owner tuple disjunction should require flow classifier");
+        };
+    }
+
+    #[test]
+    fn owner_any_with_uid_or_gid_reports_flow_classifier_requirement() {
+        let plan = outbound_plan_for(Selector::Any {
+            selectors: vec![
+                Selector::term(
+                    process_owners(&[1000], &[]),
+                    outbound_remote_port_addresses(443, &["203.0.113.10"]),
+                ),
+                Selector::term(
+                    process_owners(&[], &[2000]),
+                    outbound_remote_port_addresses(443, &["203.0.113.10"]),
+                ),
+            ],
+        })
+        .expect("owner uid/gid disjunction should produce a classifier setup plan");
+
+        let TransparentInterceptionSetupPlan::RequiresFlowClassifier { .. } = plan else {
+            panic!("owner uid/gid disjunction should require flow classifier");
+        };
+    }
+
+    #[test]
+    fn owner_any_with_equivalent_owner_scope_can_union_traffic_dimension() {
+        let scope = outbound_scope_for(Selector::Any {
+            selectors: vec![
+                Selector::term(
+                    process_owners(&[1000], &[2000]),
+                    outbound_remote_port_addresses(443, &["203.0.113.10"]),
+                ),
+                Selector::term(
+                    process_owners(&[1000], &[2000]),
+                    outbound_remote_port_addresses(444, &["203.0.113.10"]),
+                ),
+            ],
+        })
+        .expect("same owner scope with one varying traffic dimension should project");
+
+        assert_eq!(scope.remote_ports().values(), &[443, 444]);
+        assert_eq!(scope.socket_owners().uids(), &[1000]);
+        assert_eq!(scope.socket_owners().gids(), &[2000]);
     }
 
     #[test]
@@ -934,6 +1158,14 @@ mod tests {
     fn process_globs(globs: &[&str]) -> ProcessSelector {
         ProcessSelector {
             exe_path_globs: strings(globs),
+            ..ProcessSelector::default()
+        }
+    }
+
+    fn process_owners(uids: &[u32], gids: &[u32]) -> ProcessSelector {
+        ProcessSelector {
+            uids: uids.to_vec(),
+            gids: gids.to_vec(),
             ..ProcessSelector::default()
         }
     }

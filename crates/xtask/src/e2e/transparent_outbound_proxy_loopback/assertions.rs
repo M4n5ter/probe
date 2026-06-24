@@ -27,14 +27,16 @@ pub(super) fn assert_proxy_relay_metrics(
     mode: OutboundProxyE2eMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match mode {
-        OutboundProxyE2eMode::ManagedRelay => wait_for_proxy_relay_metrics(
-            agent,
-            admin_socket_path,
-            ExpectedProxyRelayMetrics {
-                accepted_relays: 1,
-                upstream_connect_successes: 1,
-            },
-        ),
+        OutboundProxyE2eMode::ManagedRelay | OutboundProxyE2eMode::OwnerScopedManagedRelay => {
+            wait_for_proxy_relay_metrics(
+                agent,
+                admin_socket_path,
+                ExpectedProxyRelayMetrics {
+                    accepted_relays: 1,
+                    upstream_connect_successes: 1,
+                },
+            )
+        }
         OutboundProxyE2eMode::ExternalProxy => {
             let metrics = read_proxy_relay_metrics(admin_socket_path)?;
             let expected = ExpectedProxyRelayMetrics {
@@ -155,16 +157,26 @@ fn metric_u64(
 
 pub(super) fn assert_outbound_redirect_table_installed(
     webhook_port: u16,
+    mode: OutboundProxyE2eMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listing = nft_output(["list", "table", "inet", "sssa_probe"])?;
-    let expected_snippets = [
+    let mut expected_snippets = vec![
         "chain outbound_transparent_proxy".to_string(),
         "type nat hook output priority dstnat; policy accept;".to_string(),
         format!("meta mark {} return", outbound_bypass_mark_text()),
-        format!("tcp dport {{ {UPSTREAM_PORT}, {webhook_port} }}"),
         format!("ip daddr {LOOPBACK_ADDR}"),
         format!("redirect to :{PROXY_PORT}"),
     ];
+    match mode {
+        OutboundProxyE2eMode::ManagedRelay | OutboundProxyE2eMode::ExternalProxy => {
+            expected_snippets.push(format!("tcp dport {{ {UPSTREAM_PORT}, {webhook_port} }}"));
+        }
+        OutboundProxyE2eMode::OwnerScopedManagedRelay => {
+            expected_snippets.push(format!("meta skuid {}", super::OWNER_SCOPED_CLIENT_UID));
+            expected_snippets.push(format!("meta skgid {}", super::OWNER_SCOPED_CLIENT_GID));
+            expected_snippets.push(format!("tcp dport {UPSTREAM_PORT}"));
+        }
+    }
     for snippet in expected_snippets {
         if !listing.contains(&snippet) {
             return Err(e2e_error(format!(

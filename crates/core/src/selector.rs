@@ -92,6 +92,10 @@ impl SelectorRegistry {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessSelector {
     pub pids: Vec<u32>,
+    #[serde(default)]
+    pub uids: Vec<u32>,
+    #[serde(default)]
+    pub gids: Vec<u32>,
     pub names: Vec<String>,
     pub exe_path_globs: Vec<String>,
     pub cmdline_regexes: Vec<String>,
@@ -300,9 +304,12 @@ impl CompiledSelectorTerm {
 
     fn matches_process_with_unknowns(&self, process: &ProcessContext) -> Option<bool> {
         let spec = &self.term.process;
+        let unknown_numeric_identity = process.identity.pid == 0;
         all_selector_matches(
             [
                 match_u32_list(&spec.pids, process.identity.pid, process.identity.pid == 0),
+                match_u32_list(&spec.uids, process.identity.uid, unknown_numeric_identity),
+                match_u32_list(&spec.gids, process.identity.gid, unknown_numeric_identity),
                 match_string_list(
                     &spec.names,
                     &process.name,
@@ -535,6 +542,32 @@ mod tests {
     }
 
     #[test]
+    fn selector_matches_process_owner_dimensions() -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector {
+                uids: vec![1000],
+                gids: vec![1000],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+        .compile()?;
+        let other_uid = Selector::term(
+            ProcessSelector {
+                uids: vec![2000],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+        .compile()?;
+
+        let flow = demo_flow();
+        assert!(selector.matches_flow_without_direction(&flow));
+        assert!(!other_uid.matches_flow_without_direction(&flow));
+        Ok(())
+    }
+
+    #[test]
     fn selector_matches_flow_events_with_event_direction() -> Result<(), Box<dyn std::error::Error>>
     {
         let selector = Selector::term(
@@ -694,6 +727,23 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let process = partial_process();
         for selector in unknown_process_dimension_selectors() {
+            let positive = selector.clone().compile()?;
+            let negated = Selector::Not {
+                selector: Box::new(selector),
+            }
+            .compile()?;
+
+            assert!(!positive.matches_unattributed_flow(&process, Direction::Outbound));
+            assert!(!negated.matches_unattributed_flow(&process, Direction::Outbound));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unattributed_flow_match_fails_closed_for_unknown_owner_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let process = synthetic_process();
+        for selector in owner_identity_selectors() {
             let positive = selector.clone().compile()?;
             let negated = Selector::Not {
                 selector: Box::new(selector),
@@ -1025,6 +1075,27 @@ mod tests {
         }
     }
 
+    fn synthetic_process() -> ProcessContext {
+        ProcessContext {
+            identity: ProcessIdentity {
+                pid: 0,
+                tgid: 0,
+                start_time_ticks: 0,
+                boot_id: "synthetic".to_string(),
+                exe_path: "unknown".to_string(),
+                cmdline_hash: "unknown".to_string(),
+                uid: 0,
+                gid: 0,
+                cgroup: None,
+                systemd_service: None,
+                container_id: None,
+                runtime_hint: Some("synthetic".to_string()),
+            },
+            name: "unknown".to_string(),
+            cmdline: Vec::new(),
+        }
+    }
+
     fn unknown_process_dimension_selectors() -> Vec<Selector> {
         vec![
             Selector::term(
@@ -1051,6 +1122,25 @@ mod tests {
             Selector::term(
                 ProcessSelector {
                     container_ids: vec!["container-a".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        ]
+    }
+
+    fn owner_identity_selectors() -> Vec<Selector> {
+        vec![
+            Selector::term(
+                ProcessSelector {
+                    uids: vec![0],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+            Selector::term(
+                ProcessSelector {
+                    gids: vec![0],
                     ..ProcessSelector::default()
                 },
                 TrafficSelector::default(),

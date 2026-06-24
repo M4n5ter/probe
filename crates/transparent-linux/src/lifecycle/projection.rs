@@ -1,6 +1,6 @@
 use interception::{
     TransparentInterceptionHostRuleScope, TransparentInterceptionPortScope,
-    TransparentInterceptionRemoteAddressScope,
+    TransparentInterceptionRemoteAddressScope, TransparentInterceptionSocketOwnerScope,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +33,7 @@ struct NftTrafficProjection {
     remote_address_side: NftAddressSide,
     local_ports: TransparentInterceptionPortScope,
     remote_ports: TransparentInterceptionPortScope,
+    socket_owners: TransparentInterceptionSocketOwnerScope,
 }
 
 impl NftTrafficProjection {
@@ -43,6 +44,7 @@ impl NftTrafficProjection {
             remote_address_side: NftAddressSide::Source,
             local_ports: scope.local_ports().clone(),
             remote_ports: scope.remote_ports().clone(),
+            socket_owners: TransparentInterceptionSocketOwnerScope::any(),
         }
     }
 
@@ -53,6 +55,7 @@ impl NftTrafficProjection {
             remote_address_side: NftAddressSide::Destination,
             local_ports: scope.local_ports().clone(),
             remote_ports: scope.remote_ports().clone(),
+            socket_owners: scope.socket_owners().clone(),
         }
     }
 
@@ -80,6 +83,7 @@ impl NftRule {
     pub(super) fn match_expression(&self) -> String {
         let mut clauses = vec!["meta l4proto tcp".to_string()];
         clauses.push(format!("meta nfproto {}", self.family.nfproto_name()));
+        clauses.extend(socket_owner_match_expressions(&self.traffic.socket_owners));
         if let Some(ports) = self.traffic.local_ports.only_values() {
             clauses.push(port_match(self.traffic.local_port_field, ports));
         }
@@ -143,6 +147,17 @@ fn port_match(field: &str, ports: &[u16]) -> String {
     format!("{field} {}", nft_set_or_value(ports))
 }
 
+fn socket_owner_match_expressions(owners: &TransparentInterceptionSocketOwnerScope) -> Vec<String> {
+    let mut expressions = Vec::new();
+    if !owners.uids().is_empty() {
+        expressions.push(format!("meta skuid {}", nft_set_or_value(owners.uids())));
+    }
+    if !owners.gids().is_empty() {
+        expressions.push(format!("meta skgid {}", nft_set_or_value(owners.gids())));
+    }
+    expressions
+}
+
 fn string_values<T: ToString>(values: &[T]) -> Vec<String> {
     values.iter().map(ToString::to_string).collect()
 }
@@ -197,6 +212,7 @@ mod tests {
 
     use interception::{
         TransparentInterceptionPortScope, TransparentInterceptionRemoteAddressScope,
+        TransparentInterceptionSocketOwnerScope,
     };
 
     use super::*;
@@ -266,6 +282,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn outbound_host_rule_scope_renders_socket_owner_matches() {
+        let expressions = NftSelectorProjection::outbound_redirect(outbound_owner_scope())
+            .into_rules()
+            .into_iter()
+            .map(|rule| rule.match_expression())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            expressions,
+            vec![
+                "meta l4proto tcp meta nfproto ipv4 meta skuid { 1000, 1001 } meta skgid 2000 tcp dport 443 ip daddr 203.0.113.10",
+            ]
+        );
+    }
+
     fn match_expressions(scope: TransparentInterceptionHostRuleScope) -> Vec<String> {
         NftSelectorProjection::inbound_tproxy(scope)
             .into_rules()
@@ -304,5 +336,18 @@ mod tests {
             ),
         )
         .expect("test scope should contain outbound host-rule constraints")
+    }
+
+    fn outbound_owner_scope() -> TransparentInterceptionHostRuleScope {
+        TransparentInterceptionHostRuleScope::with_socket_owners(
+            TransparentInterceptionPortScope::any(),
+            TransparentInterceptionPortScope::only(vec![443]),
+            TransparentInterceptionRemoteAddressScope::new(
+                vec![Ipv4Addr::new(203, 0, 113, 10)],
+                Vec::new(),
+            ),
+            TransparentInterceptionSocketOwnerScope::new(vec![1000, 1001], vec![2000]),
+        )
+        .expect("test scope should contain outbound owner host-rule constraints")
     }
 }

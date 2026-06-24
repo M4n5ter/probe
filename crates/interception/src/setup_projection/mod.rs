@@ -9,6 +9,7 @@ pub use model::{
     TransparentInterceptionProcessScope, TransparentInterceptionProcessScopeExpression,
     TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupDirection,
     TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError,
+    TransparentInterceptionSocketOwnerScope,
 };
 pub use selectors::{
     TransparentInterceptionSetupSelectorSources, TransparentInterceptionSetupSelectors,

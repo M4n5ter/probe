@@ -34,6 +34,8 @@ const TPROXY_ROUTE_TABLE: &str = "53534";
 const CLIENT_PAYLOAD: &[u8] =
     b"GET /transparent-outbound-proxy-e2e HTTP/1.1\r\nHost: outbound-proxy.test\r\n\r\n";
 const SERVER_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\noutbound-proxy\n";
+const OWNER_SCOPED_CLIENT_UID: u32 = 65_534;
+const OWNER_SCOPED_CLIENT_GID: u32 = 65_534;
 const SERVER_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -44,6 +46,10 @@ pub(crate) fn run() -> ExitCode {
 
 pub(crate) fn run_external() -> ExitCode {
     run_mode(OutboundProxyE2eMode::ExternalProxy)
+}
+
+pub(crate) fn run_owner_scoped() -> ExitCode {
+    run_mode(OutboundProxyE2eMode::OwnerScopedManagedRelay)
 }
 
 fn run_mode(mode: OutboundProxyE2eMode) -> ExitCode {
@@ -60,6 +66,13 @@ fn run_mode(mode: OutboundProxyE2eMode) -> ExitCode {
 enum OutboundProxyE2eMode {
     ManagedRelay,
     ExternalProxy,
+    OwnerScopedManagedRelay,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClientOwner {
+    uid: u32,
+    gid: u32,
 }
 
 impl OutboundProxyE2eMode {
@@ -67,6 +80,7 @@ impl OutboundProxyE2eMode {
         match self {
             Self::ManagedRelay => "e2e-transparent-outbound-proxy-loopback",
             Self::ExternalProxy => "e2e-transparent-outbound-external-proxy-loopback",
+            Self::OwnerScopedManagedRelay => "e2e-transparent-outbound-owner-proxy-loopback",
         }
     }
 
@@ -74,6 +88,7 @@ impl OutboundProxyE2eMode {
         match self {
             Self::ManagedRelay => "transparent-outbound-proxy-loopback",
             Self::ExternalProxy => "out-ext",
+            Self::OwnerScopedManagedRelay => "out-owner",
         }
     }
 
@@ -81,6 +96,7 @@ impl OutboundProxyE2eMode {
         match self {
             Self::ManagedRelay => "e2e-transparent-outbound-proxy-agent",
             Self::ExternalProxy => "e2e-transparent-outbound-external-proxy-agent",
+            Self::OwnerScopedManagedRelay => "e2e-transparent-outbound-owner-proxy-agent",
         }
     }
 
@@ -88,6 +104,7 @@ impl OutboundProxyE2eMode {
         match self {
             Self::ManagedRelay => "e2e transparent outbound managed proxy loopback",
             Self::ExternalProxy => "e2e transparent outbound external proxy loopback",
+            Self::OwnerScopedManagedRelay => "e2e transparent outbound owner-scoped proxy loopback",
         }
     }
 
@@ -95,6 +112,17 @@ impl OutboundProxyE2eMode {
         match self {
             Self::ManagedRelay => "transparent-outbound-proxy",
             Self::ExternalProxy => "transparent-outbound-external-proxy",
+            Self::OwnerScopedManagedRelay => "transparent-outbound-owner-proxy",
+        }
+    }
+
+    fn client_owner(self) -> Option<ClientOwner> {
+        match self {
+            Self::OwnerScopedManagedRelay => Some(ClientOwner {
+                uid: OWNER_SCOPED_CLIENT_UID,
+                gid: OWNER_SCOPED_CLIENT_GID,
+            }),
+            Self::ManagedRelay | Self::ExternalProxy => None,
         }
     }
 }
@@ -149,10 +177,16 @@ fn run_at(root: &Path, mode: OutboundProxyE2eMode) -> Result<(), Box<dyn std::er
     let mut ready_signal = UnixSocketReadySignal::bind(ready_socket_path)?;
     let mut agent = supervisor.watch(spawn_agent(&config_path, &ready_signal)?, "agent");
     wait_for_agent_ready(agent.child_mut(), &mut ready_signal)?;
-    assert_outbound_redirect_table_installed(webhook_receiver.listen_port())?;
+    assert_outbound_redirect_table_installed(webhook_receiver.listen_port(), mode)?;
 
-    let client_response = run_client();
+    let client_response = run_client(mode.client_owner());
     let upstream_report = upstream.join();
+    let unmatched_owner_bypass = match (&client_response, &upstream_report, mode) {
+        (Ok(_), Ok(_), OutboundProxyE2eMode::OwnerScopedManagedRelay) => {
+            assert_unmatched_owner_reaches_upstream_directly()
+        }
+        _ => Ok(()),
+    };
     let proxy_fixture_report = proxy_fixture.join();
     let webhook_wait = match (&client_response, &upstream_report) {
         (Ok(_), Ok(_)) => webhook_receiver.wait_for_batches(1, WEBHOOK_TIMEOUT),
@@ -177,6 +211,7 @@ fn run_at(root: &Path, mode: OutboundProxyE2eMode) -> Result<(), Box<dyn std::er
     merge_run_results(RunResults {
         client_response,
         upstream_report,
+        unmatched_owner_bypass,
         proxy_fixture_report,
         webhook_result,
         proxy_metrics,
@@ -188,6 +223,7 @@ fn run_at(root: &Path, mode: OutboundProxyE2eMode) -> Result<(), Box<dyn std::er
 struct RunResults {
     client_response: Result<Vec<u8>, Box<dyn std::error::Error>>,
     upstream_report: Result<UpstreamReport, Box<dyn std::error::Error>>,
+    unmatched_owner_bypass: Result<(), Box<dyn std::error::Error>>,
     proxy_fixture_report: Result<ProxyFixtureReport, Box<dyn std::error::Error>>,
     webhook_result: Result<(), Box<dyn std::error::Error>>,
     proxy_metrics: Result<(), Box<dyn std::error::Error>>,
@@ -199,6 +235,7 @@ fn merge_run_results(results: RunResults) -> Result<(), Box<dyn std::error::Erro
     let RunResults {
         client_response,
         upstream_report,
+        unmatched_owner_bypass,
         proxy_fixture_report,
         webhook_result,
         proxy_metrics,
@@ -223,6 +260,11 @@ fn merge_run_results(results: RunResults) -> Result<(), Box<dyn std::error::Erro
         ),
         Err(error) => errors.push(format!("upstream server failed: {error}")),
     }
+    record_result(
+        "unmatched owner bypass",
+        unmatched_owner_bypass,
+        &mut errors,
+    );
     match proxy_fixture_report {
         Ok(report) => record_result(
             "proxy fixture assertion",
@@ -244,6 +286,15 @@ fn merge_run_results(results: RunResults) -> Result<(), Box<dyn std::error::Erro
     } else {
         Err(e2e_error(errors.join("; ")).into())
     }
+}
+
+fn assert_unmatched_owner_reaches_upstream_directly() -> Result<(), Box<dyn std::error::Error>> {
+    let upstream = UpstreamServer::spawn()?;
+    let response = run_client(None);
+    let report = upstream.join();
+    assert_client_received_server_response(&response?)?;
+    assert_upstream_observed_request(&report?)?;
+    Ok(())
 }
 
 fn record_result(

@@ -502,7 +502,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("at least one port or remote address")
+                .contains("at least one host-rule constraint")
         );
         Ok(())
     }

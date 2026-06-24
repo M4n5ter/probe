@@ -7,6 +7,7 @@ use interception::{
     TransparentInterceptionProcessScopeExpression, TransparentInterceptionSetupDirection,
     TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError,
     TransparentInterceptionSetupSelectorSources, TransparentInterceptionSetupSelectors,
+    TransparentInterceptionSocketOwnerScope,
 };
 use probe_config::TransparentInterceptionStrategyConfig;
 use probe_core::{ProcessSelector, Selector, TrafficSelector};
@@ -48,6 +49,7 @@ pub struct TransparentInterceptionProjectedHostRuleScopePlan {
     pub local_ports: TransparentInterceptionProjectedPortScopePlan,
     pub remote_ports: TransparentInterceptionProjectedPortScopePlan,
     pub remote_addresses: TransparentInterceptionProjectedRemoteAddressScopePlan,
+    pub socket_owners: TransparentInterceptionProjectedSocketOwnerScopePlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +63,12 @@ pub enum TransparentInterceptionProjectedPortScopePlan {
 pub struct TransparentInterceptionProjectedRemoteAddressScopePlan {
     pub ipv4: Vec<Ipv4Addr>,
     pub ipv6: Vec<Ipv6Addr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionProjectedSocketOwnerScopePlan {
+    pub uids: Vec<u32>,
+    pub gids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +236,18 @@ impl TransparentInterceptionProjectedHostRuleScopePlan {
                 ipv4: scope.remote_addresses().ipv4().to_vec(),
                 ipv6: scope.remote_addresses().ipv6().to_vec(),
             },
+            socket_owners: TransparentInterceptionProjectedSocketOwnerScopePlan::from_scope(
+                scope.socket_owners(),
+            ),
+        }
+    }
+}
+
+impl TransparentInterceptionProjectedSocketOwnerScopePlan {
+    fn from_scope(scope: &TransparentInterceptionSocketOwnerScope) -> Self {
+        Self {
+            uids: scope.uids().to_vec(),
+            gids: scope.gids().to_vec(),
         }
     }
 }

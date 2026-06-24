@@ -67,11 +67,13 @@ pub(super) fn write_agent_config(
     config.enforcement.interception.strategy =
         TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
     config.enforcement.interception.proxy = match mode {
-        OutboundProxyE2eMode::ManagedRelay => TransparentInterceptionProxyConfig {
-            mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
-            listen_port: Some(PROXY_PORT),
-            ..TransparentInterceptionProxyConfig::default()
-        },
+        OutboundProxyE2eMode::ManagedRelay | OutboundProxyE2eMode::OwnerScopedManagedRelay => {
+            TransparentInterceptionProxyConfig {
+                mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+                listen_port: Some(PROXY_PORT),
+                ..TransparentInterceptionProxyConfig::default()
+            }
+        }
         OutboundProxyE2eMode::ExternalProxy => TransparentInterceptionProxyConfig {
             mode: TransparentInterceptionProxyModeConfig::External,
             self_bypass:
@@ -81,9 +83,9 @@ pub(super) fn write_agent_config(
         },
     };
     config.enforcement.interception.selector = Some(Selector::term(
-        ProcessSelector::default(),
+        process_selector(mode),
         TrafficSelector {
-            remote_ports: vec![UPSTREAM_PORT, webhook_port],
+            remote_ports: remote_ports(mode, webhook_port),
             directions: vec![Direction::Outbound],
             remote_addresses: vec![LOOPBACK_ADDR.to_string()],
             ..TrafficSelector::default()
@@ -91,6 +93,28 @@ pub(super) fn write_agent_config(
     ));
     fs::write(path, toml::to_string(&config)?)?;
     Ok(())
+}
+
+fn process_selector(mode: OutboundProxyE2eMode) -> ProcessSelector {
+    match mode {
+        OutboundProxyE2eMode::OwnerScopedManagedRelay => ProcessSelector {
+            uids: vec![super::OWNER_SCOPED_CLIENT_UID],
+            gids: vec![super::OWNER_SCOPED_CLIENT_GID],
+            ..ProcessSelector::default()
+        },
+        OutboundProxyE2eMode::ManagedRelay | OutboundProxyE2eMode::ExternalProxy => {
+            ProcessSelector::default()
+        }
+    }
+}
+
+fn remote_ports(mode: OutboundProxyE2eMode, webhook_port: u16) -> Vec<u16> {
+    match mode {
+        OutboundProxyE2eMode::OwnerScopedManagedRelay => vec![UPSTREAM_PORT],
+        OutboundProxyE2eMode::ManagedRelay | OutboundProxyE2eMode::ExternalProxy => {
+            vec![UPSTREAM_PORT, webhook_port]
+        }
+    }
 }
 
 pub(super) fn write_policy_bundle(path: &Path) -> Result<(), std::io::Error> {
