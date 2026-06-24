@@ -43,6 +43,16 @@ pub(crate) struct PlainHttp1LoopbackFixtureConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WebSocketLoopbackFixtureConfig {
+    pub(crate) listen_port: Option<u16>,
+    pub(crate) connections: usize,
+    pub(crate) frame_payload_bytes: usize,
+    pub(crate) write_chunks: usize,
+    pub(crate) connect_write_delay_ms: u64,
+    pub(crate) post_exchange_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Http1FixtureIoMode {
     ReadWrite,
     SendRecv,
@@ -94,11 +104,19 @@ pub(crate) fn spawn_http1_loopback_fixture_with_io_mode(
         "http1-loopback",
         ready_path,
         start_path,
-        config.shared,
-        Some(PlainHttp1LoopbackFixtureOptions {
-            io_mode,
-            accept_read_delay_ms: config.accept_read_delay_ms,
-        }),
+        config.shared.listen_port,
+        config.shared.connect_write_delay_ms,
+        config.shared.post_exchange_delay_ms,
+        |command| {
+            append_http1_loopback_fixture_args(command, config.shared);
+            append_plain_http1_loopback_fixture_args(
+                command,
+                PlainHttp1LoopbackFixtureOptions {
+                    io_mode,
+                    accept_read_delay_ms: config.accept_read_delay_ms,
+                },
+            );
+        },
     )
 }
 
@@ -107,7 +125,31 @@ pub(crate) fn spawn_tls_http1_loopback_fixture(
     start_path: &Path,
     config: Http1LoopbackFixtureConfig,
 ) -> Result<Child, Box<dyn std::error::Error>> {
-    spawn_loopback_fixture("tls-http1-loopback", ready_path, start_path, config, None)
+    spawn_loopback_fixture(
+        "tls-http1-loopback",
+        ready_path,
+        start_path,
+        config.listen_port,
+        config.connect_write_delay_ms,
+        config.post_exchange_delay_ms,
+        |command| append_http1_loopback_fixture_args(command, config),
+    )
+}
+
+pub(crate) fn spawn_websocket_loopback_fixture(
+    ready_path: &Path,
+    start_path: &Path,
+    config: WebSocketLoopbackFixtureConfig,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    spawn_loopback_fixture(
+        "websocket-loopback",
+        ready_path,
+        start_path,
+        config.listen_port,
+        config.connect_write_delay_ms,
+        config.post_exchange_delay_ms,
+        |command| append_websocket_loopback_fixture_args(command, config),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,35 +162,22 @@ fn spawn_loopback_fixture(
     scenario: &'static str,
     ready_path: &Path,
     start_path: &Path,
-    config: Http1LoopbackFixtureConfig,
-    plain_options: Option<PlainHttp1LoopbackFixtureOptions>,
+    listen_port: Option<u16>,
+    connect_write_delay_ms: u64,
+    post_exchange_delay_ms: u64,
+    append_scenario_args: impl FnOnce(&mut Command),
 ) -> Result<Child, Box<dyn std::error::Error>> {
-    let mut command = Command::new(debug_binary("sssa-e2e-fixture")?);
+    let mut command = Command::new(debug_binary(FIXTURE_BINARY_NAME)?);
     let command = run_in_own_process_group(&mut command).arg(scenario);
-    if let Some(listen_port) = config.listen_port {
+    if let Some(listen_port) = listen_port {
         command.arg("--listen-port").arg(listen_port.to_string());
     }
-    command
-        .arg("--requests")
-        .arg(config.requests.to_string())
-        .arg("--request-body-bytes")
-        .arg(config.request_body_bytes.to_string())
-        .arg("--response-body-bytes")
-        .arg(config.response_body_bytes.to_string())
-        .arg("--write-chunks")
-        .arg(config.write_chunks.to_string());
-    if let Some(options) = plain_options {
-        command
-            .arg("--io-mode")
-            .arg(options.io_mode.cli_value())
-            .arg("--accept-read-delay-ms")
-            .arg(options.accept_read_delay_ms.to_string());
-    }
+    append_scenario_args(command);
     let child = command
         .arg("--connect-write-delay-ms")
-        .arg(config.connect_write_delay_ms.to_string())
+        .arg(connect_write_delay_ms.to_string())
         .arg("--post-exchange-delay-ms")
-        .arg(config.post_exchange_delay_ms.to_string())
+        .arg(post_exchange_delay_ms.to_string())
         .arg("--ready-file")
         .arg(ready_path)
         .arg("--start-file")
@@ -158,6 +187,42 @@ fn spawn_loopback_fixture(
         .stderr(Stdio::inherit())
         .spawn()?;
     Ok(child)
+}
+
+fn append_http1_loopback_fixture_args(command: &mut Command, config: Http1LoopbackFixtureConfig) {
+    command
+        .arg("--requests")
+        .arg(config.requests.to_string())
+        .arg("--request-body-bytes")
+        .arg(config.request_body_bytes.to_string())
+        .arg("--response-body-bytes")
+        .arg(config.response_body_bytes.to_string())
+        .arg("--write-chunks")
+        .arg(config.write_chunks.to_string());
+}
+
+fn append_plain_http1_loopback_fixture_args(
+    command: &mut Command,
+    options: PlainHttp1LoopbackFixtureOptions,
+) {
+    command
+        .arg("--io-mode")
+        .arg(options.io_mode.cli_value())
+        .arg("--accept-read-delay-ms")
+        .arg(options.accept_read_delay_ms.to_string());
+}
+
+fn append_websocket_loopback_fixture_args(
+    command: &mut Command,
+    config: WebSocketLoopbackFixtureConfig,
+) {
+    command
+        .arg("--connections")
+        .arg(config.connections.to_string())
+        .arg("--frame-payload-bytes")
+        .arg(config.frame_payload_bytes.to_string())
+        .arg("--write-chunks")
+        .arg(config.write_chunks.to_string());
 }
 
 pub(crate) fn spawn_agent(

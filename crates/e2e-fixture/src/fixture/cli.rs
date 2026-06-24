@@ -5,6 +5,10 @@ use super::{
     http1::{Http1IoMode, Http1LoopbackConfig, Http1LoopbackError, Http1LoopbackReport},
     loopback::{LoopbackCoordination, LoopbackRunOptions},
     tls::{TlsHttp1LoopbackConfig, TlsHttp1LoopbackError, TlsHttp1LoopbackReport},
+    websocket::{
+        WebSocketLoopbackConfig, WebSocketLoopbackError, WebSocketLoopbackReport,
+        WebSocketTrafficConfig,
+    },
 };
 
 const USAGE: &str = "\
@@ -13,14 +17,17 @@ usage: sssa-e2e-fixture <scenario> [options]
 Scenarios:
   http1-loopback        Start a local TCP server and client in this process, then exchange deterministic HTTP/1 traffic.
   tls-http1-loopback    Start a local OpenSSL/libssl TLS server and client in this process, then exchange deterministic HTTP/1 traffic.
+  websocket-loopback    Start a local TCP server and client in this process, then exchange a deterministic HTTP Upgrade and WebSocket text frame.
 
 Options:
   --listen-port PORT
   --ready-file PATH
   --start-file PATH
-  --requests N
-  --request-body-bytes N
-  --response-body-bytes N
+  --requests N                 (http1-loopback and tls-http1-loopback)
+  --request-body-bytes N       (http1-loopback and tls-http1-loopback)
+  --response-body-bytes N      (http1-loopback and tls-http1-loopback)
+  --connections N              (websocket-loopback only)
+  --frame-payload-bytes N      (websocket-loopback only)
   --write-chunks N
   --io-mode read-write|send-recv|readv-writev|sendmsg-recvmsg  (http1-loopback only)
   --connect-write-delay-ms N
@@ -55,6 +62,15 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> Result<FixtureRepor
             let report = super::tls::run_tls_http1_loopback(config)?;
             Ok(FixtureReport::TlsHttp1Loopback(report))
         }
+        "websocket-loopback" => {
+            let scenario_args = args.collect::<Vec<_>>();
+            if has_help(&scenario_args) {
+                return Ok(FixtureReport::Help(USAGE));
+            }
+            let config = parse_websocket_loopback(scenario_args)?;
+            let report = super::websocket::run_websocket_loopback(config)?;
+            Ok(FixtureReport::WebSocketLoopback(report))
+        }
         _ => Err(FixtureError::usage(format!(
             "unknown scenario {scenario}\n\n{USAGE}"
         ))),
@@ -65,6 +81,7 @@ pub(crate) enum FixtureReport {
     Help(&'static str),
     Http1Loopback(Http1LoopbackReport),
     TlsHttp1Loopback(TlsHttp1LoopbackReport),
+    WebSocketLoopback(WebSocketLoopbackReport),
 }
 
 impl fmt::Display for FixtureReport {
@@ -73,6 +90,7 @@ impl fmt::Display for FixtureReport {
             Self::Help(usage) => write!(formatter, "{usage}"),
             Self::Http1Loopback(report) => write!(formatter, "{report}"),
             Self::TlsHttp1Loopback(report) => write!(formatter, "{report}"),
+            Self::WebSocketLoopback(report) => write!(formatter, "{report}"),
         }
     }
 }
@@ -82,6 +100,7 @@ pub(crate) enum FixtureError {
     Usage(String),
     Http1Scenario(Http1LoopbackError),
     TlsScenario(TlsHttp1LoopbackError),
+    WebSocketScenario(WebSocketLoopbackError),
 }
 
 impl FixtureError {
@@ -96,6 +115,7 @@ impl fmt::Display for FixtureError {
             Self::Usage(message) => write!(formatter, "{message}"),
             Self::Http1Scenario(error) => write!(formatter, "{error}"),
             Self::TlsScenario(error) => write!(formatter, "{error}"),
+            Self::WebSocketScenario(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -106,6 +126,7 @@ impl Error for FixtureError {
             Self::Usage(_) => None,
             Self::Http1Scenario(error) => Some(error),
             Self::TlsScenario(error) => Some(error),
+            Self::WebSocketScenario(error) => Some(error),
         }
     }
 }
@@ -119,6 +140,12 @@ impl From<Http1LoopbackError> for FixtureError {
 impl From<TlsHttp1LoopbackError> for FixtureError {
     fn from(error: TlsHttp1LoopbackError) -> Self {
         Self::TlsScenario(error)
+    }
+}
+
+impl From<WebSocketLoopbackError> for FixtureError {
+    fn from(error: WebSocketLoopbackError) -> Self {
+        Self::WebSocketScenario(error)
     }
 }
 
@@ -144,6 +171,53 @@ fn parse_tls_http1_loopback(
     })
 }
 
+fn parse_websocket_loopback(
+    args: impl IntoIterator<Item = String>,
+) -> Result<WebSocketLoopbackConfig, FixtureError> {
+    let mut traffic = WebSocketTrafficConfig::default();
+    let mut run = ParsedLoopbackRunOptions::default();
+    let mut args = args.into_iter();
+    while let Some(option) = args.next() {
+        if option == "--help" || option == "-h" {
+            return Err(FixtureError::usage(USAGE));
+        }
+        let Some(value) = args.next() else {
+            return Err(FixtureError::usage(format!(
+                "missing value for {option}\n\n{USAGE}"
+            )));
+        };
+        if run.parse_option(&option, &value)? {
+            continue;
+        }
+        match option.as_str() {
+            "--connections" => traffic.connections = parse_usize(&option, &value)?,
+            "--frame-payload-bytes" => {
+                traffic.frame_payload_bytes = parse_usize(&option, &value)?;
+            }
+            "--write-chunks" => traffic.write_chunks = parse_usize(&option, &value)?,
+            "--requests" | "--request-body-bytes" | "--response-body-bytes" => {
+                return Err(FixtureError::usage(format!(
+                    "{option} is only supported by HTTP loopback scenarios\n\n{USAGE}"
+                )));
+            }
+            "--io-mode" | "--accept-read-delay-ms" => {
+                return Err(FixtureError::usage(format!(
+                    "{option} is only supported by http1-loopback\n\n{USAGE}"
+                )));
+            }
+            _ => {
+                return Err(FixtureError::usage(format!(
+                    "unknown option {option}\n\n{USAGE}"
+                )));
+            }
+        }
+    }
+    Ok(WebSocketLoopbackConfig {
+        traffic,
+        run: run.finish()?,
+    })
+}
+
 struct ParsedHttpLoopbackArgs {
     traffic: HttpTrafficConfig,
     run: LoopbackRunOptions,
@@ -162,11 +236,9 @@ fn parse_http_loopback_args(
     plain_http_options: PlainHttpOptions,
 ) -> Result<ParsedHttpLoopbackArgs, FixtureError> {
     let mut traffic = HttpTrafficConfig::default();
-    let mut run = LoopbackRunOptions::default();
+    let mut run = ParsedLoopbackRunOptions::default();
     let mut io_mode = None;
     let mut accept_read_delay_ms = 0;
-    let mut ready_file = None;
-    let mut start_file = None;
     let mut args = args.into_iter();
     while let Some(option) = args.next() {
         if option == "--help" || option == "-h" {
@@ -177,20 +249,14 @@ fn parse_http_loopback_args(
                 "missing value for {option}\n\n{USAGE}"
             )));
         };
+        if run.parse_option(&option, &value)? {
+            continue;
+        }
         match option.as_str() {
-            "--listen-port" => run.listen_port = parse_u16(&option, &value)?,
-            "--connect-write-delay-ms" => {
-                run.connect_write_delay_ms = parse_u64(&option, &value)?;
-            }
             "--accept-read-delay-ms" => {
                 reject_plain_http_option(plain_http_options, &option)?;
                 accept_read_delay_ms = parse_u64(&option, &value)?;
             }
-            "--post-exchange-delay-ms" => {
-                run.post_exchange_delay_ms = parse_u64(&option, &value)?;
-            }
-            "--ready-file" => ready_file = Some(PathBuf::from(value)),
-            "--start-file" => start_file = Some(PathBuf::from(value)),
             "--requests" => traffic.requests = parse_usize(&option, &value)?,
             "--request-body-bytes" => {
                 traffic.request_body_bytes = parse_usize(&option, &value)?;
@@ -214,13 +280,42 @@ fn parse_http_loopback_args(
             }
         }
     }
-    run.coordination = parse_coordination(ready_file, start_file)?;
     Ok(ParsedHttpLoopbackArgs {
         traffic,
-        run,
+        run: run.finish()?,
         io_mode,
         accept_read_delay_ms,
     })
+}
+
+#[derive(Default)]
+struct ParsedLoopbackRunOptions {
+    run: LoopbackRunOptions,
+    ready_file: Option<PathBuf>,
+    start_file: Option<PathBuf>,
+}
+
+impl ParsedLoopbackRunOptions {
+    fn parse_option(&mut self, option: &str, value: &str) -> Result<bool, FixtureError> {
+        match option {
+            "--listen-port" => self.run.listen_port = parse_u16(option, value)?,
+            "--connect-write-delay-ms" => {
+                self.run.connect_write_delay_ms = parse_u64(option, value)?;
+            }
+            "--post-exchange-delay-ms" => {
+                self.run.post_exchange_delay_ms = parse_u64(option, value)?;
+            }
+            "--ready-file" => self.ready_file = Some(PathBuf::from(value)),
+            "--start-file" => self.start_file = Some(PathBuf::from(value)),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn finish(mut self) -> Result<LoopbackRunOptions, FixtureError> {
+        self.run.coordination = parse_coordination(self.ready_file, self.start_file)?;
+        Ok(self.run)
+    }
 }
 
 fn reject_plain_http_option(
@@ -364,6 +459,45 @@ mod tests {
         assert_eq!(config.traffic.write_chunks, 2);
         assert_eq!(config.run.coordination, LoopbackCoordination::Immediate);
         Ok(())
+    }
+
+    #[test]
+    fn cli_parses_websocket_loopback_options() -> Result<(), Box<dyn Error>> {
+        let config = parse_websocket_loopback([
+            "--listen-port".to_string(),
+            "0".to_string(),
+            "--connections".to_string(),
+            "2".to_string(),
+            "--frame-payload-bytes".to_string(),
+            "7".to_string(),
+            "--write-chunks".to_string(),
+            "3".to_string(),
+            "--connect-write-delay-ms".to_string(),
+            "25".to_string(),
+            "--post-exchange-delay-ms".to_string(),
+            "50".to_string(),
+        ])?;
+
+        assert_eq!(config.run.listen_port, 0);
+        assert_eq!(config.run.connect_write_delay_ms, 25);
+        assert_eq!(config.run.post_exchange_delay_ms, 50);
+        assert_eq!(config.traffic.connections, 2);
+        assert_eq!(config.traffic.frame_payload_bytes, 7);
+        assert_eq!(config.traffic.write_chunks, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_rejects_websocket_http_body_options() {
+        let error =
+            parse_websocket_loopback(["--request-body-bytes".to_string(), "64".to_string()])
+                .expect_err("websocket fixture must not accept HTTP body options");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--request-body-bytes is only supported by HTTP loopback scenarios")
+        );
     }
 
     #[test]

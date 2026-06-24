@@ -8,6 +8,7 @@ use super::super::{
     file_exporter::run as run_file_exporter,
     gap_plaintext_feed::run as run_gap_plaintext_feed,
     libpcap_loopback::run as run_libpcap_loopback,
+    libpcap_websocket_loopback::run as run_libpcap_websocket_loopback,
     plaintext_feed::run as run_plaintext_feed,
     remote_enforcement_policy::run as run_remote_enforcement_policy,
     sse_plaintext_feed::run as run_sse_plaintext_feed,
@@ -147,6 +148,11 @@ const E2E_CASES: &[E2eCase] = &[
         run: run_libpcap_loopback,
     },
     E2eCase {
+        name: "e2e-libpcap-websocket-loopback",
+        requirement: E2eRequirement::RootCapNetRaw,
+        run: run_libpcap_websocket_loopback,
+    },
+    E2eCase {
         name: "e2e-admin-policy-reload",
         requirement: E2eRequirement::RootCapNetRaw,
         run: run_admin_policy_reload,
@@ -260,6 +266,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
         description: "root/CAP_NET_RAW live libpcap, admin reload, and TLS material suite",
         cases: E2eProfileCases::Named(&[
             "e2e-libpcap-loopback",
+            "e2e-libpcap-websocket-loopback",
             "e2e-admin-policy-reload",
             "e2e-admin-enforcement-reload",
             "e2e-tls-session-secret-auto-binding-loopback",
@@ -318,6 +325,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-file-exporter",
             "e2e-remote-enforcement-policy",
             "e2e-libpcap-loopback",
+            "e2e-libpcap-websocket-loopback",
             "e2e-admin-policy-reload",
             "e2e-admin-enforcement-reload",
             "e2e-ebpf-process-loopback",
@@ -488,6 +496,7 @@ mod tests {
             description: "root/CAP_NET_RAW live libpcap, admin reload, and TLS material suite",
             cases: ExpectedProfileCases::Named(&[
                 "e2e-libpcap-loopback",
+                "e2e-libpcap-websocket-loopback",
                 "e2e-admin-policy-reload",
                 "e2e-admin-enforcement-reload",
                 "e2e-tls-session-secret-auto-binding-loopback",
@@ -548,6 +557,7 @@ mod tests {
                 "e2e-file-exporter",
                 "e2e-remote-enforcement-policy",
                 "e2e-libpcap-loopback",
+                "e2e-libpcap-websocket-loopback",
                 "e2e-admin-policy-reload",
                 "e2e-admin-enforcement-reload",
                 "e2e-ebpf-process-loopback",

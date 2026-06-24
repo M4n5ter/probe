@@ -6,6 +6,7 @@ mod file_exporter;
 mod gap_plaintext_feed;
 mod harness;
 mod libpcap_loopback;
+mod libpcap_websocket_loopback;
 mod loopback;
 mod plaintext_assertions;
 mod plaintext_export_batches;
@@ -25,6 +26,7 @@ mod transparent_outbound_proxy_loopback;
 mod transparent_tproxy_loopback;
 mod webhook_exporter;
 mod webhook_receiver;
+mod websocket_expectations;
 mod websocket_plaintext_feed;
 
 pub(crate) use suite::{case_names, run as run_suite, run_case_by_name};

@@ -11,6 +11,10 @@ use super::plaintext_assertions::{
 use super::plaintext_scenario::{
     PlaintextFeedCase, PlaintextFeedRecord, PlaintextFlow, PlaintextProcess,
 };
+use super::websocket_expectations::{
+    FRAME_PAYLOAD, FRAME_PAYLOAD_FINGERPRINT, FRAME_PAYLOAD_LEN, REQUEST_TARGET,
+    RFC_SAMPLE_WEBSOCKET_ACCEPT, RFC_SAMPLE_WEBSOCKET_KEY, SUBPROTOCOL,
+};
 
 const CONTEXT: &str = "websocket";
 const WEBSOCKET_FEED_EVENT_COUNT: usize = 5;
@@ -22,14 +26,6 @@ const CONFIG_VERSION: &str = "e2e-websocket-plaintext-feed";
 const CONNECTION_ID: &str = "xtask-e2e-websocket-conn";
 const POLICY_ID: &str = "e2e-websocket-policy";
 const POLICY_VERSION: &str = "e2e";
-const REQUEST_TARGET: &str = "/chat";
-const SUBPROTOCOL: &str = "chat";
-const RFC_SAMPLE_WEBSOCKET_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
-const RFC_SAMPLE_WEBSOCKET_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
-const FRAME_PAYLOAD: &[u8] = b"hi";
-const FRAME_PAYLOAD_FINGERPRINT: [u8; 16] = [
-    133, 5, 46, 154, 171, 27, 103, 182, 98, 45, 148, 160, 132, 65, 176, 159,
-];
 const HANDOFF_ALERT: &str = "websocket handoff /chat chat";
 const FRAME_ALERT: &str = "websocket frame text 2";
 
@@ -262,8 +258,7 @@ fn assert_websocket_exports(
                         && frame.fin
                         && !frame.masked
                         && matches!(frame.opcode, WebSocketOpcode::Text)
-                        && frame.payload_len
-                            == u64::try_from(FRAME_PAYLOAD.len()).unwrap_or(u64::MAX)
+                        && frame.payload_len == FRAME_PAYLOAD_LEN
                         && frame.payload_fingerprint.as_slice()
                             == FRAME_PAYLOAD_FINGERPRINT.as_slice()
             )
