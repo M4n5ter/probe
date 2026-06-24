@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 
-use interception::TransparentInterceptionHostRuleScope;
+use interception::TransparentInterceptionHostRuleSet;
 #[cfg(test)]
 use interception::TransparentInterceptionSetupDirection;
 
@@ -21,16 +21,21 @@ pub struct OutboundRedirectLifecyclePlan {
 }
 
 impl OutboundRedirectLifecyclePlan {
-    pub fn from_spec_and_scope(
+    pub fn from_spec_and_rule_set(
         spec: OutboundRedirectArtifactSpec,
-        setup_scope: TransparentInterceptionHostRuleScope,
+        setup_rules: TransparentInterceptionHostRuleSet,
     ) -> Result<Self, TransparentLinuxPlanError> {
-        if setup_scope.remote_ports().is_any() {
-            return Err(
-                TransparentLinuxPlanError::OutboundRedirectRequiresRemotePorts {
-                    proxy_port: spec.proxy_port,
-                },
-            );
+        let mut rules = Vec::new();
+        for setup_scope in setup_rules.scopes() {
+            if setup_scope.remote_ports().is_any() {
+                return Err(
+                    TransparentLinuxPlanError::OutboundRedirectRequiresRemotePorts {
+                        proxy_port: spec.proxy_port,
+                    },
+                );
+            }
+            rules
+                .extend(NftSelectorProjection::outbound_redirect(setup_scope.clone()).into_rules());
         }
         Ok(Self {
             table_name: spec.table_name,
@@ -39,7 +44,7 @@ impl OutboundRedirectLifecyclePlan {
             priority: spec.priority,
             proxy_port: spec.proxy_port,
             proxy_bypass_mark: spec.proxy_bypass_mark,
-            rules: NftSelectorProjection::outbound_redirect(setup_scope).into_rules(),
+            rules,
         })
     }
 
@@ -135,7 +140,7 @@ mod tests {
         )));
         let plan = lifecycle_plan(
             &config,
-            setup_scope(config.selector.as_ref().expect("selector should be set")),
+            setup_rule_set(config.selector.as_ref().expect("selector should be set")),
         )
         .expect("selector should be projectable");
 
@@ -155,6 +160,52 @@ mod tests {
     }
 
     #[test]
+    fn outbound_redirect_plan_projects_disjoint_host_rule_set_to_redirect_rules() {
+        let config = interception_config(Some(Selector::Any {
+            selectors: vec![
+                Selector::term(
+                    ProcessSelector::default(),
+                    TrafficSelector {
+                        remote_ports: vec![443],
+                        directions: vec![Direction::Outbound],
+                        remote_addresses: vec!["203.0.113.10".to_string()],
+                        ..TrafficSelector::default()
+                    },
+                ),
+                Selector::term(
+                    ProcessSelector::default(),
+                    TrafficSelector {
+                        remote_ports: vec![444],
+                        directions: vec![Direction::Outbound],
+                        remote_addresses: vec!["203.0.113.20".to_string()],
+                        ..TrafficSelector::default()
+                    },
+                ),
+            ],
+        }));
+        let plan = lifecycle_plan_for_rule_set(
+            &config,
+            setup_rule_set(config.selector.as_ref().expect("selector should be set")),
+        )
+        .expect("disjoint selector should project to executable redirect rules");
+
+        let script = plan.setup_nft_script();
+        let lines = script.lines().collect::<Vec<_>>();
+
+        assert_eq!(
+            lines,
+            vec![
+                "destroy table inet sssa_probe",
+                "add table inet sssa_probe",
+                "add chain inet sssa_probe outbound_transparent_proxy { type nat hook output priority dstnat; policy accept; }",
+                "add rule inet sssa_probe outbound_transparent_proxy meta mark 0x53534102 return",
+                "add rule inet sssa_probe outbound_transparent_proxy meta l4proto tcp meta nfproto ipv4 tcp dport 443 ip daddr 203.0.113.10 redirect to :15001",
+                "add rule inet sssa_probe outbound_transparent_proxy meta l4proto tcp meta nfproto ipv4 tcp dport 444 ip daddr 203.0.113.20 redirect to :15001",
+            ]
+        );
+    }
+
+    #[test]
     fn outbound_redirect_requires_explicit_remote_ports() {
         let config = interception_config(Some(Selector::term(
             ProcessSelector::default(),
@@ -167,7 +218,7 @@ mod tests {
 
         let error = lifecycle_plan(
             &config,
-            setup_scope(config.selector.as_ref().expect("selector should be set")),
+            setup_rule_set(config.selector.as_ref().expect("selector should be set")),
         )
         .expect_err("wildcard remote ports would redirect too much outbound traffic");
 
@@ -190,7 +241,7 @@ mod tests {
 
         let plan = lifecycle_plan(
             &config,
-            setup_scope(config.selector.as_ref().expect("selector should be set")),
+            setup_rule_set(config.selector.as_ref().expect("selector should be set")),
         )
         .expect("remote port equal to proxy listen port is a valid original destination");
 
@@ -211,23 +262,23 @@ mod tests {
         }
     }
 
-    fn setup_scope(selector: &Selector) -> TransparentInterceptionHostRuleScope {
+    fn setup_rule_set(selector: &Selector) -> TransparentInterceptionHostRuleSet {
         match interception::TransparentInterceptionSetupPlan::from_selector(
             Some(selector),
             TransparentInterceptionSetupDirection::Outbound,
         )
         .expect("test selector should project")
         {
-            interception::TransparentInterceptionSetupPlan::HostRules(scope) => scope,
+            interception::TransparentInterceptionSetupPlan::HostRules(rules) => rules,
             _ => panic!("test selector should project to host rules"),
         }
     }
 
     fn lifecycle_plan(
         config: &EnforcementInterceptionConfig,
-        setup_scope: TransparentInterceptionHostRuleScope,
+        setup_rules: TransparentInterceptionHostRuleSet,
     ) -> Result<OutboundRedirectLifecyclePlan, TransparentLinuxPlanError> {
-        OutboundRedirectLifecyclePlan::from_spec_and_scope(
+        OutboundRedirectLifecyclePlan::from_spec_and_rule_set(
             OutboundRedirectArtifactSpec::outbound_transparent_proxy(
                 crate::TransparentLinuxResources::reserved(),
                 config
@@ -235,7 +286,23 @@ mod tests {
                     .listen_port
                     .expect("test config should have proxy listen port"),
             ),
-            setup_scope,
+            setup_rules,
+        )
+    }
+
+    fn lifecycle_plan_for_rule_set(
+        config: &EnforcementInterceptionConfig,
+        setup_rules: TransparentInterceptionHostRuleSet,
+    ) -> Result<OutboundRedirectLifecyclePlan, TransparentLinuxPlanError> {
+        OutboundRedirectLifecyclePlan::from_spec_and_rule_set(
+            OutboundRedirectArtifactSpec::outbound_transparent_proxy(
+                crate::TransparentLinuxResources::reserved(),
+                config
+                    .proxy
+                    .listen_port
+                    .expect("test config should have proxy listen port"),
+            ),
+            setup_rules,
         )
     }
 }

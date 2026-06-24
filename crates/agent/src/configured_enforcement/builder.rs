@@ -3,7 +3,7 @@ use enforcement::{
     SetupTimeEnforcementSurface,
 };
 use interception::{
-    TransparentInterceptionHostRuleScope, TransparentInterceptionSetupSelectorSources,
+    TransparentInterceptionHostRuleSet, TransparentInterceptionSetupSelectorSources,
     TransparentInterceptionSetupSelectors,
 };
 use probe_core::{EnforcementMode, ProtectiveActionProfile, Selector};
@@ -90,7 +90,7 @@ pub struct ConfiguredEnforcement {
     pub mode: EnforcementMode,
     pub config_selector_configured: bool,
     pub active_policy: ActiveEnforcementPolicy,
-    pub transparent_interception_setup_scope: Option<TransparentInterceptionHostRuleScope>,
+    pub transparent_interception_setup_scope: Option<TransparentInterceptionHostRuleSet>,
 }
 
 pub struct ConfiguredEnforcementCheck {

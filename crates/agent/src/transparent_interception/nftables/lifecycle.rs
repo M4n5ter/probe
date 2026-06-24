@@ -16,7 +16,7 @@ use crate::transparent_interception::{
 #[cfg(test)]
 use ::runtime::TransparentInterceptionExecutionPlan;
 use ::runtime::TransparentInterceptionInboundTproxyPlan;
-use interception::TransparentInterceptionHostRuleScope;
+use interception::TransparentInterceptionHostRuleSet;
 #[cfg(test)]
 use interception::{TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan};
 #[cfg(test)]
@@ -97,9 +97,9 @@ impl NftablesTransparentInterception {
 
     pub(in crate::transparent_interception) fn activate(
         mut self,
-        setup_scope: TransparentInterceptionHostRuleScope,
+        setup_scope: TransparentInterceptionHostRuleSet,
     ) -> Result<NftablesTransparentInterceptionGuard, TransparentInterceptionError> {
-        let plan = InboundTproxyLifecyclePlan::from_spec_and_scope(
+        let plan = InboundTproxyLifecyclePlan::from_spec_and_rule_set(
             InboundTproxyArtifactSpec::new(
                 ::runtime::TransparentInterceptionNftablesPlan::reserved(),
                 self.inbound_plan.listen_port().get(),
@@ -564,14 +564,14 @@ mod tests {
         )
     }
 
-    fn setup_scope(selector: &Selector) -> TransparentInterceptionHostRuleScope {
+    fn setup_scope(selector: &Selector) -> TransparentInterceptionHostRuleSet {
         match TransparentInterceptionSetupPlan::from_selector(
             Some(selector),
             TransparentInterceptionSetupDirection::Inbound,
         )
         .expect("test selector should project")
         {
-            TransparentInterceptionSetupPlan::HostRules(scope) => scope,
+            TransparentInterceptionSetupPlan::HostRules(rules) => rules,
             _ => panic!("test selector should project to host rules"),
         }
     }

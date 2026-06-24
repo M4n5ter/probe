@@ -10,7 +10,7 @@ use ::runtime::{
     TransparentInterceptionOutboundProxyPlan,
 };
 use interception::{
-    TransparentInterceptionHostRuleScope, TransparentInterceptionSetupDirection,
+    TransparentInterceptionHostRuleSet, TransparentInterceptionSetupDirection,
     TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError,
     TransparentInterceptionSetupSelectors,
 };
@@ -61,7 +61,7 @@ pub(crate) fn effective_setup_scope(
     classification: &TransparentInterceptionClassificationPlan,
     process_classifier: &mut TransparentInterceptionProcessClassifier,
     selectors: TransparentInterceptionSetupSelectors,
-) -> Result<Option<TransparentInterceptionHostRuleScope>, TransparentInterceptionError> {
+) -> Result<Option<TransparentInterceptionHostRuleSet>, TransparentInterceptionError> {
     if execution_plan.strategy() == TransparentInterceptionStrategyConfig::None {
         return Ok(None);
     }
@@ -91,7 +91,7 @@ fn inbound_tproxy_effective_setup_scope(
     classification: &TransparentInterceptionClassificationPlan,
     process_classifier: &mut TransparentInterceptionProcessClassifier,
     selectors: TransparentInterceptionSetupSelectors,
-) -> Result<Option<TransparentInterceptionHostRuleScope>, TransparentInterceptionError> {
+) -> Result<Option<TransparentInterceptionHostRuleSet>, TransparentInterceptionError> {
     validate_local_setup_plan(
         selectors.local_setup_plan(TransparentInterceptionSetupDirection::Inbound),
     )?;
@@ -107,14 +107,14 @@ fn inbound_tproxy_effective_setup_scope(
 fn validate_outbound_redirect_setup_scope(
     outbound_plan: &TransparentInterceptionOutboundProxyPlan,
     selectors: TransparentInterceptionSetupSelectors,
-) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionError> {
+) -> Result<TransparentInterceptionHostRuleSet, TransparentInterceptionError> {
     validate_local_setup_plan(
         selectors.local_setup_plan(TransparentInterceptionSetupDirection::Outbound),
     )?;
     match selectors.final_setup_plan(TransparentInterceptionSetupDirection::Outbound) {
-        Ok(TransparentInterceptionSetupPlan::HostRules(scope)) => {
-            nftables::validate_outbound_redirect_setup_scope(outbound_plan, &scope)?;
-            Ok(scope)
+        Ok(TransparentInterceptionSetupPlan::HostRules(rules)) => {
+            nftables::validate_outbound_redirect_setup_scope(outbound_plan, &rules)?;
+            Ok(rules)
         }
         Ok(
             TransparentInterceptionSetupPlan::RequiresProcessClassifier { reason, .. }
@@ -129,7 +129,7 @@ fn validate_outbound_redirect_setup_scope(
 
 fn outbound_transparent_proxy_classifier_unavailable() -> String {
     format!(
-        "outbound transparent proxy requires a host-rule setup scope before rule installation; existing {}, proxy upstream SO_MARK, and agent control-plane SO_MARK only make host-rule OUTPUT redirect executable",
+        "outbound transparent proxy requires host-rule setup rules before rule installation; existing {}, proxy upstream SO_MARK, and agent control-plane SO_MARK only make host-rule OUTPUT redirect executable",
         proxy::outbound_original_destination_recovery_name()
     )
 }
@@ -147,9 +147,9 @@ fn executable_host_rule_scope(
     plan: Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError>,
     classification: &TransparentInterceptionClassificationPlan,
     process_classifier: &mut TransparentInterceptionProcessClassifier,
-) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionError> {
+) -> Result<TransparentInterceptionHostRuleSet, TransparentInterceptionError> {
     match plan {
-        Ok(TransparentInterceptionSetupPlan::HostRules(scope)) => Ok(scope),
+        Ok(TransparentInterceptionSetupPlan::HostRules(rules)) => Ok(rules),
         Ok(TransparentInterceptionSetupPlan::RequiresProcessClassifier {
             host_rule_boundary,
             process_scope,

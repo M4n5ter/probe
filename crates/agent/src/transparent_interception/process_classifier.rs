@@ -1,6 +1,6 @@
 use attribution::ProcfsSocketResolver;
 use interception::{
-    TransparentInterceptionHostRuleBoundary, TransparentInterceptionHostRuleScope,
+    TransparentInterceptionHostRuleBoundary, TransparentInterceptionHostRuleSet,
     TransparentInterceptionProcessScope, TransparentInterceptionProcessScopeExpression,
 };
 use probe_core::{
@@ -47,7 +47,7 @@ impl TransparentInterceptionProcessClassifier {
         host_rule_boundary: TransparentInterceptionHostRuleBoundary,
         process_scope: TransparentInterceptionProcessScope,
         capability: &CapabilityState,
-    ) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionError> {
+    ) -> Result<TransparentInterceptionHostRuleSet, TransparentInterceptionError> {
         match capability.mode {
             RuntimeMode::Available | RuntimeMode::Degraded => {}
             RuntimeMode::Unavailable => {
@@ -55,22 +55,22 @@ impl TransparentInterceptionProcessClassifier {
             }
         }
 
-        let TransparentInterceptionHostRuleBoundary::Scope(scope) = host_rule_boundary else {
+        let TransparentInterceptionHostRuleBoundary::HostRules(rules) = host_rule_boundary else {
             return Err(setup_error(
                 "transparent process classifier requires a host-rule boundary before rules can be installed",
             ));
         };
-        let Some(local_ports) = scope.local_ports().only_values() else {
+        let matcher = ProcessScopeMatcher::compile(process_scope.expression())?;
+
+        let Some(local_ports) = rules.explicit_local_ports() else {
             return Err(setup_error(
                 "transparent process classifier requires explicit local ports before rules can be installed",
             ));
         };
-        let matcher = ProcessScopeMatcher::compile(process_scope.expression())?;
-
         for port in local_ports {
-            self.require_matching_listener(*port, &matcher)?;
+            self.require_matching_listener(port, &matcher)?;
         }
-        Ok(scope)
+        Ok(rules)
     }
 
     fn require_matching_listener(
@@ -198,10 +198,10 @@ mod tests {
     use ::runtime::TransparentInterceptionClassificationPlan;
     use attribution::ProcfsSocketResolver;
     use interception::{
-        TransparentInterceptionPortScope, TransparentInterceptionProcessScope,
-        TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupDirection,
-        TransparentInterceptionSetupPlan, TransparentInterceptionSetupSelectorSources,
-        TransparentInterceptionSetupSelectors,
+        TransparentInterceptionHostRuleScope, TransparentInterceptionPortScope,
+        TransparentInterceptionProcessScope, TransparentInterceptionRemoteAddressScope,
+        TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan,
+        TransparentInterceptionSetupSelectorSources, TransparentInterceptionSetupSelectors,
     };
     use probe_config::{
         EnforcementInterceptionConfig, TransparentInterceptionProxyConfig,
@@ -269,7 +269,7 @@ mod tests {
 
         let result = classifier.executable_host_rule_scope(
             "needs process classifier".to_string(),
-            TransparentInterceptionHostRuleBoundary::Scope(scope.clone()),
+            TransparentInterceptionHostRuleBoundary::HostRules(scope.clone()),
             process_scope(ProcessSelector {
                 names: vec!["demo-listener".to_string()],
                 ..ProcessSelector::default()
@@ -294,7 +294,7 @@ mod tests {
         let error = classifier
             .executable_host_rule_scope(
                 "needs process classifier".to_string(),
-                TransparentInterceptionHostRuleBoundary::Scope(host_scope(8443)),
+                TransparentInterceptionHostRuleBoundary::HostRules(host_scope(8443)),
                 process_scope(ProcessSelector {
                     names: vec!["demo-listener".to_string()],
                     ..ProcessSelector::default()
@@ -321,7 +321,7 @@ mod tests {
         let error = classifier
             .executable_host_rule_scope(
                 "needs process classifier".to_string(),
-                TransparentInterceptionHostRuleBoundary::Scope(host_scope(8443)),
+                TransparentInterceptionHostRuleBoundary::HostRules(host_scope(8443)),
                 process_scope(ProcessSelector {
                     names: vec!["demo-listener".to_string()],
                     ..ProcessSelector::default()
@@ -372,7 +372,10 @@ mod tests {
         )?
         .expect("inbound TPROXY setup should produce host rules");
 
-        assert_eq!(scope.local_ports().only_values(), Some(&[8443][..]));
+        assert_eq!(
+            single_scope(&scope).local_ports().only_values(),
+            Some(&[8443][..])
+        );
         Ok(())
     }
 
@@ -398,13 +401,26 @@ mod tests {
         }
     }
 
-    fn host_scope(local_port: u16) -> TransparentInterceptionHostRuleScope {
-        TransparentInterceptionHostRuleScope::new(
+    fn host_scope(local_port: u16) -> TransparentInterceptionHostRuleSet {
+        let scope = TransparentInterceptionHostRuleScope::new(
             TransparentInterceptionPortScope::only(vec![local_port]),
             TransparentInterceptionPortScope::any(),
             TransparentInterceptionRemoteAddressScope::default(),
         )
-        .expect("test scope should contain a local port")
+        .expect("test scope should contain a local port");
+        TransparentInterceptionHostRuleSet::single(scope)
+    }
+
+    fn single_scope(
+        rules: &TransparentInterceptionHostRuleSet,
+    ) -> &TransparentInterceptionHostRuleScope {
+        let [scope] = rules.scopes() else {
+            panic!(
+                "test setup should produce one host-rule scope, got {:?}",
+                rules.scopes()
+            );
+        };
+        scope
     }
 
     fn process_selector(local_ports: Vec<u16>) -> Selector {

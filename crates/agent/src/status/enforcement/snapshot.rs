@@ -794,7 +794,7 @@ protective_actions = ["alert"]
         assert_eq!(
             value["interception"]["classification"]["flow_classifier"]["reason"],
             json!(
-                "transparent flow classifier backend is not configured; not/ref transparent interception selectors and any selectors that cannot be represented as one setup-time host-rule scope require flow-aware classification before rule installation"
+                "transparent flow classifier backend is not configured; not/ref transparent interception selectors and any selectors with classifier-only or unconstrained setup branches require flow-aware classification before rule installation"
             )
         );
         assert_eq!(
@@ -952,15 +952,15 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             value["interception"]["local_setup_projection"]["host_rule_boundary"]["kind"],
-            json!("scope")
+            json!("host_rules")
         );
         assert_eq!(
-            value["interception"]["local_setup_projection"]["host_rule_boundary"]["scope"]["local_ports"]
+            value["interception"]["local_setup_projection"]["host_rule_boundary"]["scopes"][0]["local_ports"]
                 ["kind"],
             json!("only")
         );
         assert_eq!(
-            value["interception"]["local_setup_projection"]["host_rule_boundary"]["scope"]["local_ports"]
+            value["interception"]["local_setup_projection"]["host_rule_boundary"]["scopes"][0]["local_ports"]
                 ["ports"],
             json!([8443])
         );

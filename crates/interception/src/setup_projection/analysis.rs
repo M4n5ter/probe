@@ -5,15 +5,15 @@ use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
 use super::model::process_selector_has_constraints;
 use super::{
     TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
-    TransparentInterceptionHostRuleScope, TransparentInterceptionPortScope,
-    TransparentInterceptionProcessScope, TransparentInterceptionProcessScopeExpression,
-    TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupDirection,
-    TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError,
-    TransparentInterceptionSocketOwnerScope,
+    TransparentInterceptionHostRuleScope, TransparentInterceptionHostRuleSet,
+    TransparentInterceptionPortScope, TransparentInterceptionProcessScope,
+    TransparentInterceptionProcessScopeExpression, TransparentInterceptionRemoteAddressScope,
+    TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan,
+    TransparentInterceptionSetupProjectionError, TransparentInterceptionSocketOwnerScope,
 };
 
 const PROCESS_CLASSIFIER_REASON: &str = "selector contains process constraints that require a process classifier such as cgroup/owner marking or proxy-side process classification before host rules can be safely narrowed";
-const ANY_FLOW_CLASSIFIER_REASON: &str = "any selectors that cannot be represented as one setup-time host-rule scope require a flow-aware classifier";
+const ANY_FLOW_CLASSIFIER_REASON: &str = "any selectors that contain classifier-only or unconstrained branches require a flow-aware classifier";
 const NOT_FLOW_CLASSIFIER_REASON: &str = "not selectors require a flow-aware classifier and cannot be projected to setup-time host rules";
 const REF_FLOW_CLASSIFIER_REASON: &str = "named selector refs require registry-backed classifier resolution before transparent interception setup";
 
@@ -26,7 +26,7 @@ impl TransparentInterceptionSetupPlan {
             return Err(TransparentInterceptionSetupProjectionError::MissingSelector);
         };
         let analysis = analyze_selector(selector, direction)?;
-        let host_rule_boundary = host_rule_boundary_from_term(analysis.host_term, direction)?;
+        let host_rule_boundary = host_rule_boundary_from_terms(analysis.host_terms, direction)?;
 
         match analysis.classifier {
             Some(SetupClassifierRequirement::Flow { reason }) => Ok(Self::RequiresFlowClassifier {
@@ -42,7 +42,9 @@ impl TransparentInterceptionSetupPlan {
                 })
             }
             None => match host_rule_boundary {
-                TransparentInterceptionHostRuleBoundary::Scope(scope) => Ok(Self::HostRules(scope)),
+                TransparentInterceptionHostRuleBoundary::HostRules(rules) => {
+                    Ok(Self::HostRules(rules))
+                }
                 TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary => {
                     Err(TransparentInterceptionSetupProjectionError::UnconstrainedSelector)
                 }
@@ -53,7 +55,7 @@ impl TransparentInterceptionSetupPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SelectorSetupAnalysis {
-    host_term: Option<ProjectableLocalSetupTerm>,
+    host_terms: Vec<ProjectableLocalSetupTerm>,
     classifier: Option<SetupClassifierRequirement>,
 }
 
@@ -74,11 +76,22 @@ struct ProjectableLocalSetupTerm {
 }
 
 impl ProjectableLocalSetupTerm {
-    fn intersect(self, other: Self) -> Result<Self, TransparentInterceptionSetupProjectionError> {
-        Ok(Self {
-            traffic: intersect_traffic_selectors(self.traffic, other.traffic)?,
-            socket_owners: intersect_socket_owner_scopes(self.socket_owners, other.socket_owners)?,
-        })
+    fn intersect(
+        self,
+        other: Self,
+    ) -> Result<Option<Self>, TransparentInterceptionSetupProjectionError> {
+        let Some(traffic) = intersect_traffic_selectors(self.traffic, other.traffic)? else {
+            return Ok(None);
+        };
+        let Some(socket_owners) =
+            intersect_socket_owner_scopes(self.socket_owners, other.socket_owners)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            traffic,
+            socket_owners,
+        }))
     }
 
     fn from_scope(
@@ -101,10 +114,10 @@ fn analyze_selector(
             validate_traffic_selector(&term.traffic, direction)?;
             let process_projection = process_setup_projection(&term.process, direction);
             Ok(SelectorSetupAnalysis {
-                host_term: Some(ProjectableLocalSetupTerm {
+                host_terms: vec![ProjectableLocalSetupTerm {
                     traffic: term.traffic.clone(),
                     socket_owners: process_projection.socket_owners,
-                }),
+                }],
                 classifier: process_projection.classifier,
             })
         }
@@ -134,8 +147,8 @@ fn analyze_any_selector(
         .map(|selector| analyze_selector(selector, direction))
         .collect::<Result<Vec<_>, _>>()?;
     match project_any_selector_host_term(&analyses, direction)? {
-        Some(host_term) => Ok(SelectorSetupAnalysis {
-            host_term: Some(host_term),
+        Some(host_terms) => Ok(SelectorSetupAnalysis {
+            host_terms,
             classifier: None,
         }),
         None => Ok(flow_classifier_analysis(
@@ -154,13 +167,13 @@ fn analyze_all_selector(
         });
     }
 
-    let mut host_term = None;
+    let mut host_terms = Vec::new();
     let mut process_expressions = Vec::new();
     let mut flow_reason = None;
 
     for selector in selectors {
         let analysis = analyze_selector(selector, direction)?;
-        host_term = intersect_projectable_terms(host_term, analysis.host_term)?;
+        host_terms = intersect_projectable_term_sets(host_terms, analysis.host_terms)?;
         match analysis.classifier {
             Some(SetupClassifierRequirement::Flow { reason }) => {
                 flow_reason.get_or_insert(reason);
@@ -178,7 +191,7 @@ fn analyze_all_selector(
     };
 
     Ok(SelectorSetupAnalysis {
-        host_term,
+        host_terms,
         classifier,
     })
 }
@@ -186,31 +199,33 @@ fn analyze_all_selector(
 fn project_any_selector_host_term(
     analyses: &[SelectorSetupAnalysis],
     direction: TransparentInterceptionSetupDirection,
-) -> Result<Option<ProjectableLocalSetupTerm>, TransparentInterceptionSetupProjectionError> {
+) -> Result<Option<Vec<ProjectableLocalSetupTerm>>, TransparentInterceptionSetupProjectionError> {
     if analyses
         .iter()
-        .any(|analysis| analysis.classifier.is_some() || analysis.host_term.is_none())
+        .any(|analysis| analysis.classifier.is_some() || analysis.host_terms.is_empty())
     {
         return Ok(None);
     }
 
     let mut scopes = Vec::new();
     for analysis in analyses {
-        let Some(scope) = optional_host_rule_scope_for_any_branch(
-            analysis
-                .host_term
-                .clone()
-                .expect("host term presence checked above"),
-            direction,
-        )?
-        else {
-            return Ok(None);
-        };
-        scopes.push(scope);
+        for term in &analysis.host_terms {
+            let Some(scope) = optional_host_rule_scope_for_any_branch(term.clone(), direction)?
+            else {
+                return Ok(None);
+            };
+            scopes.push(scope);
+        }
     }
     Ok(
-        TransparentInterceptionHostRuleScope::union_without_expansion(&scopes)
-            .map(|scope| ProjectableLocalSetupTerm::from_scope(scope, direction)),
+        TransparentInterceptionHostRuleSet::compacting(scopes)?.map(|rules| {
+            rules
+                .scopes()
+                .iter()
+                .cloned()
+                .map(|scope| ProjectableLocalSetupTerm::from_scope(scope, direction))
+                .collect()
+        }),
     )
 }
 
@@ -228,7 +243,7 @@ fn optional_host_rule_scope_for_any_branch(
 
 fn flow_classifier_analysis(reason: String) -> SelectorSetupAnalysis {
     SelectorSetupAnalysis {
-        host_term: None,
+        host_terms: Vec::new(),
         classifier: Some(SetupClassifierRequirement::Flow { reason }),
     }
 }
@@ -312,20 +327,28 @@ fn process_classifier_requirement_from_expressions(
     }
 }
 
-fn host_rule_boundary_from_term(
-    term: Option<ProjectableLocalSetupTerm>,
+fn host_rule_boundary_from_terms(
+    terms: Vec<ProjectableLocalSetupTerm>,
     direction: TransparentInterceptionSetupDirection,
 ) -> Result<TransparentInterceptionHostRuleBoundary, TransparentInterceptionSetupProjectionError> {
-    let Some(term) = term else {
+    if terms.is_empty() {
         return Ok(TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary);
-    };
-    match host_rule_scope_from_term(term, direction) {
-        Ok(scope) => Ok(TransparentInterceptionHostRuleBoundary::Scope(scope)),
-        Err(TransparentInterceptionSetupProjectionError::UnconstrainedSelector) => {
-            Ok(TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary)
-        }
-        Err(error) => Err(error),
     }
+
+    let mut scopes = Vec::new();
+    for term in terms {
+        match host_rule_scope_from_term(term, direction) {
+            Ok(scope) => scopes.push(scope),
+            Err(TransparentInterceptionSetupProjectionError::UnconstrainedSelector) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(
+        TransparentInterceptionHostRuleSet::compacting(scopes)?.map_or(
+            TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary,
+            TransparentInterceptionHostRuleBoundary::HostRules,
+        ),
+    )
 }
 
 fn host_rule_scope_from_term(
@@ -344,22 +367,26 @@ fn host_rule_scope_from_term(
 fn intersect_socket_owner_scopes(
     left: TransparentInterceptionSocketOwnerScope,
     right: TransparentInterceptionSocketOwnerScope,
-) -> Result<TransparentInterceptionSocketOwnerScope, TransparentInterceptionSetupProjectionError> {
-    Ok(TransparentInterceptionSocketOwnerScope::new(
-        intersect_owner_values(left.uids(), right.uids(), "uid")?,
-        intersect_owner_values(left.gids(), right.gids(), "gid")?,
-    ))
+) -> Result<
+    Option<TransparentInterceptionSocketOwnerScope>,
+    TransparentInterceptionSetupProjectionError,
+> {
+    let Some(uids) = intersect_owner_values(left.uids(), right.uids()) else {
+        return Ok(None);
+    };
+    let Some(gids) = intersect_owner_values(left.gids(), right.gids()) else {
+        return Ok(None);
+    };
+    Ok(Some(TransparentInterceptionSocketOwnerScope::new(
+        uids, gids,
+    )))
 }
 
-fn intersect_owner_values(
-    left: &[u32],
-    right: &[u32],
-    label: &'static str,
-) -> Result<Vec<u32>, TransparentInterceptionSetupProjectionError> {
+fn intersect_owner_values(left: &[u32], right: &[u32]) -> Option<Vec<u32>> {
     match (left.is_empty(), right.is_empty()) {
-        (true, true) => Ok(Vec::new()),
-        (true, false) => Ok(right.to_vec()),
-        (false, true) => Ok(left.to_vec()),
+        (true, true) => Some(Vec::new()),
+        (true, false) => Some(right.to_vec()),
+        (false, true) => Some(left.to_vec()),
         (false, false) => {
             let mut values = Vec::new();
             for value in left {
@@ -368,11 +395,9 @@ fn intersect_owner_values(
                 }
             }
             if values.is_empty() {
-                Err(TransparentInterceptionSetupProjectionError::Unsupported {
-                    reason: format!("selector socket owner {label} intersections do not overlap"),
-                })
+                None
             } else {
-                Ok(values)
+                Some(values)
             }
         }
     }
@@ -386,45 +411,71 @@ fn validate_traffic_selector(
     parse_ip_addresses(&traffic.remote_addresses).map(|_| ())
 }
 
-fn intersect_projectable_terms(
-    current: Option<ProjectableLocalSetupTerm>,
-    next: Option<ProjectableLocalSetupTerm>,
-) -> Result<Option<ProjectableLocalSetupTerm>, TransparentInterceptionSetupProjectionError> {
-    let Some(next) = next else {
+fn intersect_projectable_term_sets(
+    current: Vec<ProjectableLocalSetupTerm>,
+    next: Vec<ProjectableLocalSetupTerm>,
+) -> Result<Vec<ProjectableLocalSetupTerm>, TransparentInterceptionSetupProjectionError> {
+    if next.is_empty() {
         return Ok(current);
-    };
-    match current {
-        Some(current) => current.intersect(next).map(Some),
-        None => Ok(Some(next)),
+    }
+    if current.is_empty() {
+        return Ok(next);
+    }
+
+    let mut terms = Vec::new();
+    for current in current {
+        for next in &next {
+            if let Some(term) = current.clone().intersect(next.clone())? {
+                terms.push(term);
+            }
+        }
+    }
+    if terms.is_empty() {
+        Err(TransparentInterceptionSetupProjectionError::Unsupported {
+            reason: "selector intersections do not overlap".to_string(),
+        })
+    } else {
+        Ok(terms)
     }
 }
 
 fn intersect_traffic_selectors(
     left: TrafficSelector,
     right: TrafficSelector,
-) -> Result<TrafficSelector, TransparentInterceptionSetupProjectionError> {
-    Ok(TrafficSelector {
-        local_ports: intersect_values(left.local_ports, right.local_ports)?,
-        remote_ports: intersect_values(left.remote_ports, right.remote_ports)?,
-        directions: intersect_values(left.directions, right.directions)?,
-        remote_addresses: intersect_remote_addresses(
-            left.remote_addresses,
-            right.remote_addresses,
-        )?,
-    })
+) -> Result<Option<TrafficSelector>, TransparentInterceptionSetupProjectionError> {
+    let Some(local_ports) = intersect_values(left.local_ports, right.local_ports)? else {
+        return Ok(None);
+    };
+    let Some(remote_ports) = intersect_values(left.remote_ports, right.remote_ports)? else {
+        return Ok(None);
+    };
+    let Some(directions) = intersect_values(left.directions, right.directions)? else {
+        return Ok(None);
+    };
+    let Some(remote_addresses) =
+        intersect_remote_addresses(left.remote_addresses, right.remote_addresses)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(TrafficSelector {
+        local_ports,
+        remote_ports,
+        directions,
+        remote_addresses,
+    }))
 }
 
 fn intersect_values<T>(
     left: Vec<T>,
     right: Vec<T>,
-) -> Result<Vec<T>, TransparentInterceptionSetupProjectionError>
+) -> Result<Option<Vec<T>>, TransparentInterceptionSetupProjectionError>
 where
     T: Clone + Eq,
 {
     match (left.is_empty(), right.is_empty()) {
-        (true, true) => Ok(Vec::new()),
-        (true, false) => Ok(right),
-        (false, true) => Ok(left),
+        (true, true) => Ok(Some(Vec::new())),
+        (true, false) => Ok(Some(right)),
+        (false, true) => Ok(Some(left)),
         (false, false) => {
             let mut values = Vec::new();
             for value in left {
@@ -433,11 +484,9 @@ where
                 }
             }
             if values.is_empty() {
-                Err(TransparentInterceptionSetupProjectionError::Unsupported {
-                    reason: "selector intersections do not overlap".to_string(),
-                })
+                Ok(None)
             } else {
-                Ok(values)
+                Ok(Some(values))
             }
         }
     }
@@ -476,11 +525,11 @@ impl TransparentInterceptionSetupDirection {
 fn intersect_remote_addresses(
     left: Vec<String>,
     right: Vec<String>,
-) -> Result<Vec<String>, TransparentInterceptionSetupProjectionError> {
+) -> Result<Option<Vec<String>>, TransparentInterceptionSetupProjectionError> {
     match (left.is_empty(), right.is_empty()) {
-        (true, true) => Ok(Vec::new()),
-        (true, false) => normalize_remote_addresses(&right),
-        (false, true) => normalize_remote_addresses(&left),
+        (true, true) => Ok(Some(Vec::new())),
+        (true, false) => normalize_remote_addresses(&right).map(Some),
+        (false, true) => normalize_remote_addresses(&left).map(Some),
         (false, false) => {
             let left = parse_ip_addresses(&left)?;
             let right = parse_ip_addresses(&right)?;
@@ -494,11 +543,9 @@ fn intersect_remote_addresses(
                     values
                 });
             if values.is_empty() {
-                Err(TransparentInterceptionSetupProjectionError::Unsupported {
-                    reason: "selector remote address intersections do not overlap".to_string(),
-                })
+                Ok(None)
             } else {
-                Ok(format_ip_addresses(values))
+                Ok(Some(format_ip_addresses(values)))
             }
         }
     }
@@ -614,9 +661,7 @@ mod tests {
         else {
             panic!("mixed owner/name selector should require classifier");
         };
-        let Some(host_scope) = host_rule_boundary.scope() else {
-            panic!("traffic boundary should still carry the projectable host dimensions");
-        };
+        let host_scope = single_boundary_scope(&host_rule_boundary);
         assert_eq!(host_scope.remote_ports().values(), &[443]);
         assert_eq!(host_scope.socket_owners().uids(), &[1000]);
         assert!(host_scope.socket_owners().gids().is_empty());
@@ -673,9 +718,7 @@ mod tests {
         else {
             panic!("process-scoped setup should require a process classifier");
         };
-        let Some(host_rule_scope) = host_rule_boundary.scope() else {
-            panic!("traffic selector should preserve a host-rule boundary");
-        };
+        let host_rule_scope = single_boundary_scope(&host_rule_boundary);
         assert_eq!(host_rule_scope.local_ports().values(), &[8443]);
         assert!(matches!(
             process_scope.expression(),
@@ -719,9 +762,7 @@ mod tests {
         else {
             panic!("process-scoped setup should require a process classifier");
         };
-        let Some(host_rule_scope) = host_rule_boundary.scope() else {
-            panic!("traffic selector should preserve host-rule boundary");
-        };
+        let host_rule_scope = single_boundary_scope(&host_rule_boundary);
         assert_eq!(host_rule_scope.local_ports().values(), &[8443]);
         assert_eq!(
             host_rule_scope.remote_addresses().ipv4(),
@@ -746,9 +787,10 @@ mod tests {
         })
         .expect("single-dimension any selector should project to host rules");
 
-        let TransparentInterceptionSetupPlan::HostRules(scope) = plan else {
+        let TransparentInterceptionSetupPlan::HostRules(rules) = plan else {
             panic!("single-dimension any selector should not require a flow classifier");
         };
+        let scope = single_scope(&rules);
         assert_eq!(scope.local_ports().values(), &[8443, 9443]);
         assert!(scope.remote_ports().is_any());
         assert_eq!(
@@ -761,27 +803,33 @@ mod tests {
     }
 
     #[test]
-    fn any_selector_with_cross_product_risk_reports_flow_classifier_requirement() {
+    fn any_selector_with_multiple_dimensions_projects_disjoint_host_rules() {
         let plan = plan_for(Selector::Any {
             selectors: vec![
                 term(local_port_addresses(8443, &["203.0.113.10"])),
                 term(local_port_addresses(9443, &["203.0.113.20"])),
             ],
         })
-        .expect("cross-product any selector should produce a flow classifier setup plan");
+        .expect("disjoint any selector should project to host rules");
 
-        let TransparentInterceptionSetupPlan::RequiresFlowClassifier { flow_scope, .. } = plan
-        else {
-            panic!("cross-product any selector should require a flow classifier");
+        let TransparentInterceptionSetupPlan::HostRules(rules) = plan else {
+            panic!("disjoint any selector should not require a flow classifier");
         };
-        assert!(matches!(
-            flow_scope.selector(),
-            TransparentInterceptionClassifierSelector::Any { .. }
-        ));
+        assert_eq!(rules.scopes().len(), 2);
+        assert_eq!(rules.scopes()[0].local_ports().values(), &[8443]);
+        assert_eq!(
+            rules.scopes()[0].remote_addresses().ipv4(),
+            &[Ipv4Addr::new(203, 0, 113, 10)]
+        );
+        assert_eq!(rules.scopes()[1].local_ports().values(), &[9443]);
+        assert_eq!(
+            rules.scopes()[1].remote_addresses().ipv4(),
+            &[Ipv4Addr::new(203, 0, 113, 20)]
+        );
     }
 
     #[test]
-    fn owner_any_with_cross_product_risk_reports_flow_classifier_requirement() {
+    fn owner_any_with_multiple_dimensions_projects_disjoint_host_rules() {
         let plan = outbound_plan_for(Selector::Any {
             selectors: vec![
                 Selector::term(
@@ -794,15 +842,20 @@ mod tests {
                 ),
             ],
         })
-        .expect("owner/port cross product should produce a classifier setup plan");
+        .expect("owner/port disjunction should project to host rules");
 
-        let TransparentInterceptionSetupPlan::RequiresFlowClassifier { .. } = plan else {
-            panic!("owner/port cross-product any selector should require flow classifier");
+        let TransparentInterceptionSetupPlan::HostRules(rules) = plan else {
+            panic!("owner/port disjunction should not require flow classifier");
         };
+        assert_eq!(rules.scopes().len(), 2);
+        assert_eq!(rules.scopes()[0].socket_owners().uids(), &[1000]);
+        assert_eq!(rules.scopes()[0].remote_ports().values(), &[443]);
+        assert_eq!(rules.scopes()[1].socket_owners().uids(), &[2000]);
+        assert_eq!(rules.scopes()[1].remote_ports().values(), &[444]);
     }
 
     #[test]
-    fn owner_any_with_different_owner_pairs_reports_flow_classifier_requirement() {
+    fn owner_any_with_different_owner_pairs_projects_disjoint_host_rules() {
         let plan = outbound_plan_for(Selector::Any {
             selectors: vec![
                 Selector::term(
@@ -815,15 +868,20 @@ mod tests {
                 ),
             ],
         })
-        .expect("owner tuple disjunction should produce a classifier setup plan");
+        .expect("owner tuple disjunction should project to host rules");
 
-        let TransparentInterceptionSetupPlan::RequiresFlowClassifier { .. } = plan else {
-            panic!("owner tuple disjunction should require flow classifier");
+        let TransparentInterceptionSetupPlan::HostRules(rules) = plan else {
+            panic!("owner tuple disjunction should not require flow classifier");
         };
+        assert_eq!(rules.scopes().len(), 2);
+        assert_eq!(rules.scopes()[0].socket_owners().uids(), &[1000]);
+        assert_eq!(rules.scopes()[0].socket_owners().gids(), &[2000]);
+        assert_eq!(rules.scopes()[1].socket_owners().uids(), &[1001]);
+        assert_eq!(rules.scopes()[1].socket_owners().gids(), &[2001]);
     }
 
     #[test]
-    fn owner_any_with_uid_or_gid_reports_flow_classifier_requirement() {
+    fn owner_any_with_uid_or_gid_projects_disjoint_host_rules() {
         let plan = outbound_plan_for(Selector::Any {
             selectors: vec![
                 Selector::term(
@@ -836,11 +894,16 @@ mod tests {
                 ),
             ],
         })
-        .expect("owner uid/gid disjunction should produce a classifier setup plan");
+        .expect("owner uid/gid disjunction should project to host rules");
 
-        let TransparentInterceptionSetupPlan::RequiresFlowClassifier { .. } = plan else {
-            panic!("owner uid/gid disjunction should require flow classifier");
+        let TransparentInterceptionSetupPlan::HostRules(rules) = plan else {
+            panic!("owner uid/gid disjunction should not require flow classifier");
         };
+        assert_eq!(rules.scopes().len(), 2);
+        assert_eq!(rules.scopes()[0].socket_owners().uids(), &[1000]);
+        assert!(rules.scopes()[0].socket_owners().gids().is_empty());
+        assert!(rules.scopes()[1].socket_owners().uids().is_empty());
+        assert_eq!(rules.scopes()[1].socket_owners().gids(), &[2000]);
     }
 
     #[test]
@@ -885,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_classifier_requirement_preserves_host_rule_boundary() {
+    fn all_with_nested_host_any_projects_disjoint_host_rules() {
         let plan = plan_for(Selector::All {
             selectors: vec![
                 term(inbound_local_port(8443)),
@@ -897,18 +960,62 @@ mod tests {
                 },
             ],
         })
-        .expect("flow-aware selector should produce a classifier setup plan");
+        .expect("nested host-rule any selector should project to host rules");
 
-        let TransparentInterceptionSetupPlan::RequiresFlowClassifier {
-            host_rule_boundary, ..
-        } = plan
-        else {
-            panic!("flow-aware setup should require a flow classifier");
+        let TransparentInterceptionSetupPlan::HostRules(rules) = plan else {
+            panic!("nested host-rule any selector should not require a flow classifier");
         };
-        let Some(host_rule_scope) = host_rule_boundary.scope() else {
-            panic!("traffic selector should preserve host-rule boundary");
+        assert_eq!(rules.scopes().len(), 2);
+        assert_eq!(rules.scopes()[0].local_ports().values(), &[8443]);
+        assert_eq!(rules.scopes()[0].remote_ports().values(), &[443]);
+        assert_eq!(rules.scopes()[1].local_ports().values(), &[8443]);
+        assert_eq!(rules.scopes()[1].remote_ports().values(), &[444]);
+    }
+
+    #[test]
+    fn all_of_host_rule_any_selectors_skips_disjoint_pairs() {
+        let plan = plan_for(Selector::All {
+            selectors: vec![
+                Selector::Any {
+                    selectors: vec![
+                        term(local_port_addresses(8443, &["203.0.113.10"])),
+                        term(local_port_addresses(9443, &["203.0.113.20"])),
+                    ],
+                },
+                Selector::Any {
+                    selectors: vec![
+                        term(TrafficSelector {
+                            local_ports: vec![8443],
+                            remote_ports: vec![443],
+                            ..TrafficSelector::default()
+                        }),
+                        term(TrafficSelector {
+                            local_ports: vec![9443],
+                            remote_ports: vec![444],
+                            ..TrafficSelector::default()
+                        }),
+                    ],
+                },
+            ],
+        })
+        .expect("all of disjoint host-rule sets should keep overlapping pairs");
+
+        let TransparentInterceptionSetupPlan::HostRules(rules) = plan else {
+            panic!("overlapping host-rule pairs should not require a flow classifier");
         };
-        assert_eq!(host_rule_scope.local_ports().values(), &[8443]);
+        assert_eq!(rules.scopes().len(), 2);
+        assert_eq!(rules.scopes()[0].local_ports().values(), &[8443]);
+        assert_eq!(rules.scopes()[0].remote_ports().values(), &[443]);
+        assert_eq!(
+            rules.scopes()[0].remote_addresses().ipv4(),
+            &[Ipv4Addr::new(203, 0, 113, 10)]
+        );
+        assert_eq!(rules.scopes()[1].local_ports().values(), &[9443]);
+        assert_eq!(rules.scopes()[1].remote_ports().values(), &[444]);
+        assert_eq!(
+            rules.scopes()[1].remote_addresses().ipv4(),
+            &[Ipv4Addr::new(203, 0, 113, 20)]
+        );
     }
 
     #[test]
@@ -1061,12 +1168,33 @@ mod tests {
     ) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionSetupProjectionError>
     {
         match plan {
-            TransparentInterceptionSetupPlan::HostRules(scope) => Ok(scope),
+            TransparentInterceptionSetupPlan::HostRules(rules) => Ok(single_scope(&rules).clone()),
             TransparentInterceptionSetupPlan::RequiresProcessClassifier { reason, .. }
             | TransparentInterceptionSetupPlan::RequiresFlowClassifier { reason, .. } => {
                 Err(TransparentInterceptionSetupProjectionError::Unsupported { reason })
             }
         }
+    }
+
+    fn single_scope(
+        rules: &TransparentInterceptionHostRuleSet,
+    ) -> &TransparentInterceptionHostRuleScope {
+        let [scope] = rules.scopes() else {
+            panic!(
+                "test selector should project to exactly one host-rule scope, got {:?}",
+                rules.scopes()
+            );
+        };
+        scope
+    }
+
+    fn single_boundary_scope(
+        boundary: &TransparentInterceptionHostRuleBoundary,
+    ) -> &TransparentInterceptionHostRuleScope {
+        let Some(rules) = boundary.rules() else {
+            panic!("traffic selector should preserve host-rule boundary");
+        };
+        single_scope(rules)
     }
 
     fn plan_for(

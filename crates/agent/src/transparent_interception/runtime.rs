@@ -1,4 +1,4 @@
-use interception::TransparentInterceptionHostRuleScope;
+use interception::TransparentInterceptionHostRuleSet;
 use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
 
 use super::{
@@ -19,7 +19,7 @@ pub(crate) struct TransparentInterceptionRuntime {
 pub(super) trait TransparentInterceptionLifecycle: Send {
     fn activate(
         self: Box<Self>,
-        setup_scope: TransparentInterceptionHostRuleScope,
+        setup_scope: TransparentInterceptionHostRuleSet,
     ) -> Result<Box<dyn TransparentInterceptionGuardLifecycle>, TransparentInterceptionError>;
 }
 
@@ -38,7 +38,7 @@ impl TransparentInterceptionRuntime {
 
     pub(crate) fn activate(
         self,
-        setup_scope: Option<TransparentInterceptionHostRuleScope>,
+        setup_scope: Option<TransparentInterceptionHostRuleSet>,
     ) -> Result<Option<TransparentInterceptionGuard>, TransparentInterceptionError> {
         self.activation
             .map(|activation| {
@@ -102,7 +102,7 @@ impl TransparentInterceptionGuard {
 impl TransparentInterceptionLifecycle for NftablesTransparentInterception {
     fn activate(
         self: Box<Self>,
-        setup_scope: TransparentInterceptionHostRuleScope,
+        setup_scope: TransparentInterceptionHostRuleSet,
     ) -> Result<Box<dyn TransparentInterceptionGuardLifecycle>, TransparentInterceptionError> {
         NftablesTransparentInterception::activate(*self, setup_scope)
             .map(|guard| Box::new(guard) as Box<dyn TransparentInterceptionGuardLifecycle>)
@@ -112,7 +112,7 @@ impl TransparentInterceptionLifecycle for NftablesTransparentInterception {
 impl TransparentInterceptionLifecycle for NftablesOutboundTransparentProxy {
     fn activate(
         self: Box<Self>,
-        setup_scope: TransparentInterceptionHostRuleScope,
+        setup_scope: TransparentInterceptionHostRuleSet,
     ) -> Result<Box<dyn TransparentInterceptionGuardLifecycle>, TransparentInterceptionError> {
         NftablesOutboundTransparentProxy::activate(*self, setup_scope)
             .map(|guard| Box::new(guard) as Box<dyn TransparentInterceptionGuardLifecycle>)

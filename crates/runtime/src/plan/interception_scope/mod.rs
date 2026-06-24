@@ -3,11 +3,11 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use interception::{
     TransparentInterceptionClassifierSelector, TransparentInterceptionClassifierTerm,
     TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
-    TransparentInterceptionHostRuleScope, TransparentInterceptionProcessScope,
-    TransparentInterceptionProcessScopeExpression, TransparentInterceptionSetupDirection,
-    TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError,
-    TransparentInterceptionSetupSelectorSources, TransparentInterceptionSetupSelectors,
-    TransparentInterceptionSocketOwnerScope,
+    TransparentInterceptionHostRuleScope, TransparentInterceptionHostRuleSet,
+    TransparentInterceptionProcessScope, TransparentInterceptionProcessScopeExpression,
+    TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan,
+    TransparentInterceptionSetupProjectionError, TransparentInterceptionSetupSelectorSources,
+    TransparentInterceptionSetupSelectors, TransparentInterceptionSocketOwnerScope,
 };
 use probe_config::TransparentInterceptionStrategyConfig;
 use probe_core::{ProcessSelector, Selector, TrafficSelector};
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 pub enum TransparentInterceptionLocalSetupProjectionPlan {
     NotConfigured,
     HostRules {
-        scope: TransparentInterceptionProjectedHostRuleScopePlan,
+        scopes: Vec<TransparentInterceptionProjectedHostRuleScopePlan>,
     },
     RequiresProcessClassifier {
         reason: String,
@@ -39,8 +39,8 @@ pub enum TransparentInterceptionLocalSetupProjectionPlan {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum TransparentInterceptionProjectedHostRuleBoundaryPlan {
     NoHostRuleBoundary,
-    Scope {
-        scope: TransparentInterceptionProjectedHostRuleScopePlan,
+    HostRules {
+        scopes: Vec<TransparentInterceptionProjectedHostRuleScopePlan>,
     },
 }
 
@@ -174,8 +174,8 @@ impl TransparentInterceptionLocalSetupProjectionPlan {
         >,
     ) -> Self {
         match result {
-            Ok(TransparentInterceptionSetupPlan::HostRules(scope)) => Self::HostRules {
-                scope: TransparentInterceptionProjectedHostRuleScopePlan::from_scope(&scope),
+            Ok(TransparentInterceptionSetupPlan::HostRules(rules)) => Self::HostRules {
+                scopes: TransparentInterceptionProjectedHostRuleScopePlan::from_rule_set(&rules),
             },
             Ok(TransparentInterceptionSetupPlan::RequiresProcessClassifier {
                 host_rule_boundary,
@@ -216,14 +216,20 @@ impl TransparentInterceptionProjectedHostRuleBoundaryPlan {
     fn from_boundary(boundary: &TransparentInterceptionHostRuleBoundary) -> Self {
         match boundary {
             TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary => Self::NoHostRuleBoundary,
-            TransparentInterceptionHostRuleBoundary::Scope(scope) => Self::Scope {
-                scope: TransparentInterceptionProjectedHostRuleScopePlan::from_scope(scope),
+            TransparentInterceptionHostRuleBoundary::HostRules(rules) => Self::HostRules {
+                scopes: TransparentInterceptionProjectedHostRuleScopePlan::from_rule_set(rules),
             },
         }
     }
 }
 
 impl TransparentInterceptionProjectedHostRuleScopePlan {
+    fn from_rule_set(
+        rules: &TransparentInterceptionHostRuleSet,
+    ) -> Vec<TransparentInterceptionProjectedHostRuleScopePlan> {
+        rules.scopes().iter().map(Self::from_scope).collect()
+    }
+
     fn from_scope(scope: &TransparentInterceptionHostRuleScope) -> Self {
         Self {
             local_ports: TransparentInterceptionProjectedPortScopePlan::from_values(
@@ -366,9 +372,10 @@ mod tests {
             ),
         );
 
-        let TransparentInterceptionLocalSetupProjectionPlan::HostRules { scope } = scope else {
+        let TransparentInterceptionLocalSetupProjectionPlan::HostRules { scopes } = scope else {
             panic!("projectable outbound selector should report host rules");
         };
+        let scope = single_scope(&scopes);
         assert_eq!(
             scope.remote_ports,
             TransparentInterceptionProjectedPortScopePlan::Only { ports: vec![443] }
@@ -390,9 +397,10 @@ mod tests {
             ),
         );
 
-        let TransparentInterceptionLocalSetupProjectionPlan::HostRules { scope } = scope else {
+        let TransparentInterceptionLocalSetupProjectionPlan::HostRules { scopes } = scope else {
             panic!("projectable selector should report host rules");
         };
+        let scope = single_scope(&scopes);
         assert_eq!(
             scope.local_ports,
             TransparentInterceptionProjectedPortScopePlan::Only { ports: vec![8443] }
@@ -474,12 +482,12 @@ mod tests {
         else {
             panic!("process-scoped traffic should require process classifier");
         };
-        let TransparentInterceptionProjectedHostRuleBoundaryPlan::Scope {
-            scope: host_rule_scope,
-        } = host_rule_boundary
+        let TransparentInterceptionProjectedHostRuleBoundaryPlan::HostRules { scopes } =
+            host_rule_boundary
         else {
             panic!("traffic selector should keep a projected host-rule boundary");
         };
+        let host_rule_scope = single_scope(&scopes);
         assert_eq!(
             host_rule_scope.local_ports,
             TransparentInterceptionProjectedPortScopePlan::Only { ports: vec![8443] }
@@ -523,9 +531,10 @@ mod tests {
             },
         );
 
-        let TransparentInterceptionLocalSetupProjectionPlan::HostRules { scope } = scope else {
+        let TransparentInterceptionLocalSetupProjectionPlan::HostRules { scopes } = scope else {
             panic!("single-dimension any selector should report host rules");
         };
+        let scope = single_scope(&scopes);
         assert_eq!(
             scope.local_ports,
             TransparentInterceptionProjectedPortScopePlan::Only {
@@ -542,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn any_selector_with_cross_product_risk_reports_flow_classifier_requirement() {
+    fn any_selector_with_multiple_dimensions_reports_disjoint_host_rules() {
         let scope = scope_for(
             TransparentInterceptionStrategyConfig::InboundTproxy,
             Selector::Any {
@@ -567,26 +576,30 @@ mod tests {
             },
         );
 
-        let TransparentInterceptionLocalSetupProjectionPlan::RequiresFlowClassifier {
-            flow_scope,
-            host_rule_boundary,
-            ..
-        } = scope
-        else {
-            panic!("cross-product any selector should require flow classifier");
+        let TransparentInterceptionLocalSetupProjectionPlan::HostRules { scopes } = scope else {
+            panic!("disjoint any selector should report multiple host rules");
         };
-        assert!(matches!(
-            flow_scope.selector,
-            TransparentInterceptionClassifierSelectorPlan::Any { .. }
-        ));
+        assert_eq!(scopes.len(), 2);
         assert_eq!(
-            host_rule_boundary,
-            TransparentInterceptionProjectedHostRuleBoundaryPlan::NoHostRuleBoundary
+            scopes[0].local_ports,
+            TransparentInterceptionProjectedPortScopePlan::Only { ports: vec![8443] }
+        );
+        assert_eq!(
+            scopes[0].remote_addresses.ipv4,
+            [Ipv4Addr::new(203, 0, 113, 10)]
+        );
+        assert_eq!(
+            scopes[1].local_ports,
+            TransparentInterceptionProjectedPortScopePlan::Only { ports: vec![9443] }
+        );
+        assert_eq!(
+            scopes[1].remote_addresses.ipv4,
+            [Ipv4Addr::new(203, 0, 113, 20)]
         );
     }
 
     #[test]
-    fn flow_classifier_requirement_reports_typed_host_scope() {
+    fn nested_any_with_host_boundary_reports_disjoint_host_rules() {
         let scope = scope_for(
             TransparentInterceptionStrategyConfig::InboundTproxy,
             Selector::All {
@@ -623,19 +636,11 @@ mod tests {
             },
         );
 
-        let TransparentInterceptionLocalSetupProjectionPlan::RequiresFlowClassifier {
-            host_rule_boundary,
-            ..
-        } = scope
-        else {
-            panic!("flow-aware selector should require flow classifier");
+        let TransparentInterceptionLocalSetupProjectionPlan::HostRules { scopes } = scope else {
+            panic!("nested host-rule any selector should report host rules");
         };
-        let TransparentInterceptionProjectedHostRuleBoundaryPlan::Scope {
-            scope: host_rule_scope,
-        } = host_rule_boundary
-        else {
-            panic!("traffic selector should keep a projected host-rule boundary");
-        };
+        assert_eq!(scopes.len(), 2);
+        let host_rule_scope = &scopes[0];
         assert_eq!(
             host_rule_scope.local_ports,
             TransparentInterceptionProjectedPortScopePlan::Only { ports: vec![8443] }
@@ -759,5 +764,14 @@ mod tests {
             panic!("test process scope should be a match expression");
         };
         process.names.iter().map(String::as_str).collect()
+    }
+
+    fn single_scope(
+        scopes: &[TransparentInterceptionProjectedHostRuleScopePlan],
+    ) -> &TransparentInterceptionProjectedHostRuleScopePlan {
+        let [scope] = scopes else {
+            panic!("expected exactly one projected host-rule scope, got {scopes:?}");
+        };
+        scope
     }
 }

@@ -73,11 +73,11 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn outbound_redirect_artifact() -> Result<OutboundRedirectLifecyclePlan, Box<dyn std::error::Error>>
 {
     let selector = outbound_redirect_selector();
-    let setup_scope = match TransparentInterceptionSetupPlan::from_selector(
+    let setup_rules = match TransparentInterceptionSetupPlan::from_selector(
         Some(&selector),
         TransparentInterceptionSetupDirection::Outbound,
     )? {
-        TransparentInterceptionSetupPlan::HostRules(scope) => scope,
+        TransparentInterceptionSetupPlan::HostRules(rules) => rules,
         _ => {
             return Err(e2e_error(
                 "outbound redirect artifact selector must project to host rules",
@@ -85,12 +85,12 @@ fn outbound_redirect_artifact() -> Result<OutboundRedirectLifecyclePlan, Box<dyn
             .into());
         }
     };
-    Ok(OutboundRedirectLifecyclePlan::from_spec_and_scope(
+    Ok(OutboundRedirectLifecyclePlan::from_spec_and_rule_set(
         OutboundRedirectArtifactSpec::outbound_transparent_proxy(
             TransparentLinuxResources::reserved(),
             PROXY_PORT,
         ),
-        setup_scope,
+        setup_rules,
     )?)
 }
 

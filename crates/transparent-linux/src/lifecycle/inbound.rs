@@ -1,4 +1,4 @@
-use interception::TransparentInterceptionHostRuleScope;
+use interception::TransparentInterceptionHostRuleSet;
 #[cfg(test)]
 use interception::{TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan};
 
@@ -18,26 +18,31 @@ pub struct InboundTproxyLifecyclePlan {
 }
 
 impl InboundTproxyLifecyclePlan {
-    pub fn from_spec_and_scope(
+    pub fn from_spec_and_rule_set(
         spec: InboundTproxyArtifactSpec,
-        setup_scope: TransparentInterceptionHostRuleScope,
+        setup_rules: TransparentInterceptionHostRuleSet,
     ) -> Result<Self, TransparentLinuxPlanError> {
         let proxy_port = spec.proxy_port;
-        if setup_scope.local_ports().is_any() {
-            return Err(
-                TransparentLinuxPlanError::WildcardLocalPortsRequireProxyBypass { proxy_port },
-            );
+        let mut rules = Vec::new();
+        for setup_scope in setup_rules.scopes() {
+            if setup_scope.local_ports().is_any() {
+                return Err(
+                    TransparentLinuxPlanError::WildcardLocalPortsRequireProxyBypass { proxy_port },
+                );
+            }
+            if setup_scope.local_ports().contains(proxy_port) {
+                return Err(
+                    TransparentLinuxPlanError::ProxyPortInInterceptedLocalPorts { proxy_port },
+                );
+            }
+            rules.extend(NftSelectorProjection::inbound_tproxy(setup_scope.clone()).into_rules());
         }
-        if setup_scope.local_ports().contains(proxy_port) {
-            return Err(TransparentLinuxPlanError::ProxyPortInInterceptedLocalPorts { proxy_port });
-        }
-        let projection = NftSelectorProjection::inbound_tproxy(setup_scope);
         Ok(Self {
             table_name: spec.resources.table_name,
             proxy_port,
             mark: spec.resources.inbound_tproxy_mark,
             route_table: spec.resources.inbound_tproxy_route_table,
-            rules: projection.into_rules(),
+            rules,
         })
     }
 
@@ -155,7 +160,7 @@ mod tests {
         )));
         let plan = lifecycle_plan(
             &config,
-            setup_scope(config.selector.as_ref().expect("selector should be set")),
+            setup_rule_set(config.selector.as_ref().expect("selector should be set")),
         )
         .expect("selector should be projectable");
 
@@ -190,6 +195,51 @@ mod tests {
     }
 
     #[test]
+    fn inbound_tproxy_plan_projects_disjoint_host_rule_set_to_tproxy_rules() {
+        let config = interception_config(Some(Selector::Any {
+            selectors: vec![
+                Selector::term(
+                    ProcessSelector::default(),
+                    TrafficSelector {
+                        local_ports: vec![8443],
+                        directions: vec![Direction::Inbound],
+                        remote_addresses: vec!["203.0.113.10".to_string()],
+                        ..TrafficSelector::default()
+                    },
+                ),
+                Selector::term(
+                    ProcessSelector::default(),
+                    TrafficSelector {
+                        local_ports: vec![9443],
+                        directions: vec![Direction::Inbound],
+                        remote_addresses: vec!["203.0.113.20".to_string()],
+                        ..TrafficSelector::default()
+                    },
+                ),
+            ],
+        }));
+        let plan = lifecycle_plan_for_rule_set(
+            &config,
+            setup_rule_set(config.selector.as_ref().expect("selector should be set")),
+        )
+        .expect("disjoint selector should project to executable tproxy rules");
+
+        let script = plan.setup_nft_script();
+        let lines = script.lines().collect::<Vec<_>>();
+
+        assert_eq!(
+            lines,
+            vec![
+                "destroy table inet sssa_probe",
+                "add table inet sssa_probe",
+                "add chain inet sssa_probe inbound_tproxy { type filter hook prerouting priority mangle; policy accept; }",
+                "add rule inet sssa_probe inbound_tproxy meta l4proto tcp meta nfproto ipv4 tcp dport 8443 ip saddr 203.0.113.10 tproxy ip to :15001 meta mark set 0x53534101",
+                "add rule inet sssa_probe inbound_tproxy meta l4proto tcp meta nfproto ipv4 tcp dport 9443 ip saddr 203.0.113.20 tproxy ip to :15001 meta mark set 0x53534101",
+            ]
+        );
+    }
+
+    #[test]
     fn unconstrained_remote_address_projects_both_policy_route_families() {
         let config = interception_config(Some(Selector::term(
             ProcessSelector::default(),
@@ -201,7 +251,7 @@ mod tests {
         )));
         let plan = lifecycle_plan(
             &config,
-            setup_scope(config.selector.as_ref().expect("selector should be set")),
+            setup_rule_set(config.selector.as_ref().expect("selector should be set")),
         )
         .expect("selector should be projectable");
 
@@ -256,15 +306,15 @@ mod tests {
 
         let inbound_plan = lifecycle_plan(
             &inbound,
-            setup_scope(inbound.selector.as_ref().expect("selector should be set")),
+            setup_rule_set(inbound.selector.as_ref().expect("selector should be set")),
         )
         .expect("inbound plan should be valid");
-        let outbound_plan = OutboundRedirectLifecyclePlan::from_spec_and_scope(
+        let outbound_plan = OutboundRedirectLifecyclePlan::from_spec_and_rule_set(
             OutboundRedirectArtifactSpec::outbound_transparent_proxy(
                 TransparentLinuxResources::reserved(),
                 15001,
             ),
-            outbound_setup_scope(&outbound_selector),
+            outbound_setup_rule_set(&outbound_selector),
         )
         .expect("outbound plan should be valid");
 
@@ -285,7 +335,7 @@ mod tests {
 
         let error = lifecycle_plan(
             &config,
-            setup_scope(config.selector.as_ref().expect("selector should be set")),
+            setup_rule_set(config.selector.as_ref().expect("selector should be set")),
         )
         .expect_err("proxy port should not be intercepted by its own TPROXY plan");
 
@@ -308,7 +358,7 @@ mod tests {
 
         let error = lifecycle_plan(
             &config,
-            setup_scope(config.selector.as_ref().expect("selector should be set")),
+            setup_rule_set(config.selector.as_ref().expect("selector should be set")),
         )
         .expect_err("wildcard local ports would intercept the proxy itself");
 
@@ -329,35 +379,35 @@ mod tests {
         }
     }
 
-    fn setup_scope(selector: &Selector) -> TransparentInterceptionHostRuleScope {
+    fn setup_rule_set(selector: &Selector) -> TransparentInterceptionHostRuleSet {
         match TransparentInterceptionSetupPlan::from_selector(
             Some(selector),
             TransparentInterceptionSetupDirection::Inbound,
         )
         .expect("test selector should project")
         {
-            TransparentInterceptionSetupPlan::HostRules(scope) => scope,
+            TransparentInterceptionSetupPlan::HostRules(rules) => rules,
             _ => panic!("test selector should project to host rules"),
         }
     }
 
-    fn outbound_setup_scope(selector: &Selector) -> TransparentInterceptionHostRuleScope {
+    fn outbound_setup_rule_set(selector: &Selector) -> TransparentInterceptionHostRuleSet {
         match TransparentInterceptionSetupPlan::from_selector(
             Some(selector),
             TransparentInterceptionSetupDirection::Outbound,
         )
         .expect("test selector should project")
         {
-            TransparentInterceptionSetupPlan::HostRules(scope) => scope,
+            TransparentInterceptionSetupPlan::HostRules(rules) => rules,
             _ => panic!("test selector should project to host rules"),
         }
     }
 
     fn lifecycle_plan(
         config: &EnforcementInterceptionConfig,
-        setup_scope: TransparentInterceptionHostRuleScope,
+        setup_rules: TransparentInterceptionHostRuleSet,
     ) -> Result<InboundTproxyLifecyclePlan, TransparentLinuxPlanError> {
-        InboundTproxyLifecyclePlan::from_spec_and_scope(
+        InboundTproxyLifecyclePlan::from_spec_and_rule_set(
             InboundTproxyArtifactSpec::new(
                 crate::TransparentLinuxResources::reserved(),
                 config
@@ -365,7 +415,23 @@ mod tests {
                     .listen_port
                     .expect("test config should have proxy listen port"),
             ),
-            setup_scope,
+            setup_rules,
+        )
+    }
+
+    fn lifecycle_plan_for_rule_set(
+        config: &EnforcementInterceptionConfig,
+        setup_rules: TransparentInterceptionHostRuleSet,
+    ) -> Result<InboundTproxyLifecyclePlan, TransparentLinuxPlanError> {
+        InboundTproxyLifecyclePlan::from_spec_and_rule_set(
+            InboundTproxyArtifactSpec::new(
+                crate::TransparentLinuxResources::reserved(),
+                config
+                    .proxy
+                    .listen_port
+                    .expect("test config should have proxy listen port"),
+            ),
+            setup_rules,
         )
     }
 }

@@ -3,12 +3,19 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
 use thiserror::Error;
 
+const MAX_HOST_RULE_SCOPES: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentInterceptionHostRuleScope {
     local_ports: TransparentInterceptionPortScope,
     remote_ports: TransparentInterceptionPortScope,
     remote_addresses: TransparentInterceptionRemoteAddressScope,
     socket_owners: TransparentInterceptionSocketOwnerScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransparentInterceptionHostRuleSet {
+    scopes: Vec<TransparentInterceptionHostRuleScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,12 +62,12 @@ pub struct TransparentInterceptionClassifierTerm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransparentInterceptionHostRuleBoundary {
     NoHostRuleBoundary,
-    Scope(TransparentInterceptionHostRuleScope),
+    HostRules(TransparentInterceptionHostRuleSet),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransparentInterceptionSetupPlan {
-    HostRules(TransparentInterceptionHostRuleScope),
+    HostRules(TransparentInterceptionHostRuleSet),
     RequiresProcessClassifier {
         host_rule_boundary: TransparentInterceptionHostRuleBoundary,
         process_scope: TransparentInterceptionProcessScope,
@@ -196,6 +203,64 @@ impl TransparentInterceptionHostRuleScope {
             .expect("union of constrained host-rule scopes should remain constrained"),
         )
     }
+
+    fn contains_scope(&self, other: &Self) -> bool {
+        self.local_ports.contains_scope(&other.local_ports)
+            && self.remote_ports.contains_scope(&other.remote_ports)
+            && self
+                .remote_addresses
+                .contains_scope(&other.remote_addresses)
+            && self.socket_owners.contains_scope(&other.socket_owners)
+    }
+}
+
+impl TransparentInterceptionHostRuleSet {
+    pub fn new(
+        scopes: Vec<TransparentInterceptionHostRuleScope>,
+    ) -> Result<Self, TransparentInterceptionSetupProjectionError> {
+        Self::canonicalize(scopes)?
+            .ok_or(TransparentInterceptionSetupProjectionError::UnconstrainedSelector)
+    }
+
+    pub fn single(scope: TransparentInterceptionHostRuleScope) -> Self {
+        Self {
+            scopes: vec![scope],
+        }
+    }
+
+    pub fn compacting(
+        scopes: Vec<TransparentInterceptionHostRuleScope>,
+    ) -> Result<Option<Self>, TransparentInterceptionSetupProjectionError> {
+        Self::canonicalize(scopes)
+    }
+
+    pub fn scopes(&self) -> &[TransparentInterceptionHostRuleScope] {
+        &self.scopes
+    }
+
+    pub fn explicit_local_ports(&self) -> Option<Vec<u16>> {
+        collect_unique_explicit_ports(self.scopes.iter().map(|scope| scope.local_ports()))
+    }
+
+    fn canonicalize(
+        scopes: Vec<TransparentInterceptionHostRuleScope>,
+    ) -> Result<Option<Self>, TransparentInterceptionSetupProjectionError> {
+        if scopes.is_empty() {
+            return Ok(None);
+        }
+        let scopes = compact_host_rule_scopes(scopes);
+        if scopes.len() > MAX_HOST_RULE_SCOPES {
+            return Err(TransparentInterceptionSetupProjectionError::Unsupported {
+                reason: format!(
+                    "transparent interception selector expands to {} host rules, exceeding the maximum of {}",
+                    scopes.len(),
+                    MAX_HOST_RULE_SCOPES
+                ),
+            });
+        }
+
+        Ok(Some(Self { scopes }))
+    }
 }
 
 impl From<TransparentInterceptionSetupDirection> for Direction {
@@ -272,10 +337,10 @@ impl TransparentInterceptionClassifierSelector {
 }
 
 impl TransparentInterceptionHostRuleBoundary {
-    pub fn scope(&self) -> Option<&TransparentInterceptionHostRuleScope> {
+    pub fn rules(&self) -> Option<&TransparentInterceptionHostRuleSet> {
         match self {
             Self::NoHostRuleBoundary => None,
-            Self::Scope(scope) => Some(scope),
+            Self::HostRules(rules) => Some(rules),
         }
     }
 }
@@ -338,6 +403,14 @@ impl TransparentInterceptionPortScope {
         }
     }
 
+    fn contains_scope(&self, other: &Self) -> bool {
+        match (self.only_values(), other.only_values()) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(left), Some(right)) => right.iter().all(|value| left.contains(value)),
+        }
+    }
+
     fn traffic_selector_values(&self) -> Vec<u16> {
         self.only_values()
             .map_or_else(Vec::new, |ports| ports.to_vec())
@@ -367,6 +440,13 @@ impl TransparentInterceptionRemoteAddressScope {
 
     fn equivalent_to(&self, other: &Self) -> bool {
         same_values(&self.ipv4, &other.ipv4) && same_values(&self.ipv6, &other.ipv6)
+    }
+
+    fn contains_scope(&self, other: &Self) -> bool {
+        self.is_empty()
+            || (!other.is_empty()
+                && other.ipv4.iter().all(|address| self.ipv4.contains(address))
+                && other.ipv6.iter().all(|address| self.ipv6.contains(address)))
     }
 
     fn traffic_selector_values(&self) -> Vec<String> {
@@ -403,6 +483,11 @@ impl TransparentInterceptionSocketOwnerScope {
 
     fn equivalent_to(&self, other: &Self) -> bool {
         same_values(&self.uids, &other.uids) && same_values(&self.gids, &other.gids)
+    }
+
+    fn contains_scope(&self, other: &Self) -> bool {
+        owner_values_contain(&self.uids, &other.uids)
+            && owner_values_contain(&self.gids, &other.gids)
     }
 }
 
@@ -468,6 +553,59 @@ fn union_remote_address_scopes<'a>(
     TransparentInterceptionRemoteAddressScope::new(ipv4, ipv6)
 }
 
+fn compact_host_rule_scopes(
+    scopes: Vec<TransparentInterceptionHostRuleScope>,
+) -> Vec<TransparentInterceptionHostRuleScope> {
+    let mut scopes = dedup_host_rule_scopes(scopes);
+    scopes = collapse_covered_host_rule_scopes(scopes);
+    match TransparentInterceptionHostRuleScope::union_without_expansion(&scopes) {
+        Some(scope) => vec![scope],
+        None => scopes,
+    }
+}
+
+fn dedup_host_rule_scopes(
+    scopes: Vec<TransparentInterceptionHostRuleScope>,
+) -> Vec<TransparentInterceptionHostRuleScope> {
+    let mut unique = Vec::new();
+    for scope in scopes {
+        if !unique.contains(&scope) {
+            unique.push(scope);
+        }
+    }
+    unique
+}
+
+fn collapse_covered_host_rule_scopes(
+    scopes: Vec<TransparentInterceptionHostRuleScope>,
+) -> Vec<TransparentInterceptionHostRuleScope> {
+    scopes
+        .iter()
+        .enumerate()
+        .filter_map(|(candidate_index, candidate)| {
+            let covered = scopes.iter().enumerate().any(|(cover_index, cover)| {
+                cover_index != candidate_index && cover.contains_scope(candidate)
+            });
+            (!covered).then(|| candidate.clone())
+        })
+        .collect()
+}
+
+fn collect_unique_explicit_ports<'a>(
+    scopes: impl Iterator<Item = &'a TransparentInterceptionPortScope>,
+) -> Option<Vec<u16>> {
+    let mut ports = Vec::new();
+    for scope in scopes {
+        let scope_ports = scope.only_values()?;
+        push_unique_all(&mut ports, scope_ports);
+    }
+    Some(ports)
+}
+
+fn owner_values_contain(left: &[u32], right: &[u32]) -> bool {
+    left.is_empty() || (!right.is_empty() && right.iter().all(|value| left.contains(value)))
+}
+
 fn all_equivalent_by<T, F>(values: &[T], equivalent: F) -> bool
 where
     F: Fn(&T, &T) -> bool,
@@ -492,5 +630,93 @@ where
         if !values.contains(candidate) {
             values.push(*candidate);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_rule_set_removes_duplicate_and_covered_scopes() {
+        let narrow = local_port_scope_with_remote_addresses(8443, [Ipv4Addr::new(203, 0, 113, 10)]);
+        let broad = local_port_scope(8443);
+
+        let rules = TransparentInterceptionHostRuleSet::new(vec![narrow, broad.clone(), broad])
+            .expect("covered and duplicate scopes should still form host rules");
+
+        let [scope] = rules.scopes() else {
+            panic!("covered scopes should collapse into one canonical scope");
+        };
+        assert_eq!(scope.local_ports().values(), &[8443]);
+        assert!(scope.remote_addresses().is_empty());
+    }
+
+    #[test]
+    fn host_rule_set_rejects_excessive_expansion_after_canonicalization() {
+        let scopes = (0..=MAX_HOST_RULE_SCOPES)
+            .map(|index| {
+                local_port_scope_with_remote_addresses(
+                    10000 + index as u16,
+                    [Ipv4Addr::new(
+                        198,
+                        51,
+                        (index / 256) as u8,
+                        (index % 256) as u8,
+                    )],
+                )
+            })
+            .collect();
+
+        let error = TransparentInterceptionHostRuleSet::new(scopes)
+            .expect_err("excessive expansion should be rejected");
+
+        assert!(matches!(
+            error,
+            TransparentInterceptionSetupProjectionError::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn host_rule_set_explicit_local_ports_are_unique_across_disjoint_scopes() {
+        let rules = TransparentInterceptionHostRuleSet::new(vec![
+            owner_local_port_scope(8443, 1000),
+            owner_local_port_scope(8443, 1001),
+            owner_local_port_scope(9443, 1002),
+        ])
+        .expect("owner-disjoint local port scopes should remain valid");
+
+        assert_eq!(rules.explicit_local_ports(), Some(vec![8443, 9443]));
+    }
+
+    fn local_port_scope(local_port: u16) -> TransparentInterceptionHostRuleScope {
+        TransparentInterceptionHostRuleScope::new(
+            TransparentInterceptionPortScope::only(vec![local_port]),
+            TransparentInterceptionPortScope::any(),
+            TransparentInterceptionRemoteAddressScope::empty(),
+        )
+        .expect("test scope should contain a local port")
+    }
+
+    fn local_port_scope_with_remote_addresses<const N: usize>(
+        local_port: u16,
+        remote_addresses: [Ipv4Addr; N],
+    ) -> TransparentInterceptionHostRuleScope {
+        TransparentInterceptionHostRuleScope::new(
+            TransparentInterceptionPortScope::only(vec![local_port]),
+            TransparentInterceptionPortScope::any(),
+            TransparentInterceptionRemoteAddressScope::new(remote_addresses.to_vec(), Vec::new()),
+        )
+        .expect("test scope should contain a local port")
+    }
+
+    fn owner_local_port_scope(local_port: u16, uid: u32) -> TransparentInterceptionHostRuleScope {
+        TransparentInterceptionHostRuleScope::with_socket_owners(
+            TransparentInterceptionPortScope::only(vec![local_port]),
+            TransparentInterceptionPortScope::any(),
+            TransparentInterceptionRemoteAddressScope::empty(),
+            TransparentInterceptionSocketOwnerScope::new(vec![uid], Vec::new()),
+        )
+        .expect("test scope should contain local port and owner constraints")
     }
 }

@@ -1,5 +1,5 @@
 use ::runtime::TransparentInterceptionOutboundProxyPlan;
-use interception::TransparentInterceptionHostRuleScope;
+use interception::TransparentInterceptionHostRuleSet;
 use transparent_linux::{
     OutboundRedirectLifecyclePlan, TransparentLinuxResources, cleanup_all_policy_route_ip_commands,
 };
@@ -71,7 +71,7 @@ impl NftablesOutboundTransparentProxy {
 
     pub(in crate::transparent_interception) fn activate(
         mut self,
-        setup_scope: TransparentInterceptionHostRuleScope,
+        setup_scope: TransparentInterceptionHostRuleSet,
     ) -> Result<NftablesOutboundTransparentProxyGuard, TransparentInterceptionError> {
         let plan = outbound_lifecycle_plan(&self.outbound_plan, setup_scope)?;
         let proxy_plan = prepare_outbound_proxy_lifecycle(
@@ -171,9 +171,9 @@ impl Drop for NftablesOutboundTransparentProxyGuard {
 
 fn outbound_lifecycle_plan(
     outbound_plan: &TransparentInterceptionOutboundProxyPlan,
-    setup_scope: TransparentInterceptionHostRuleScope,
+    setup_scope: TransparentInterceptionHostRuleSet,
 ) -> Result<OutboundRedirectLifecyclePlan, TransparentInterceptionError> {
-    OutboundRedirectLifecyclePlan::from_spec_and_scope(
+    OutboundRedirectLifecyclePlan::from_spec_and_rule_set(
         outbound_plan.outbound_redirect_artifact().clone(),
         setup_scope,
     )
@@ -322,7 +322,7 @@ mod tests {
         }
     }
 
-    fn setup_scope() -> TransparentInterceptionHostRuleScope {
+    fn setup_scope() -> TransparentInterceptionHostRuleSet {
         let selector = Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -338,7 +338,7 @@ mod tests {
         )
         .expect("test selector should project")
         {
-            TransparentInterceptionSetupPlan::HostRules(scope) => scope,
+            TransparentInterceptionSetupPlan::HostRules(rules) => rules,
             _ => panic!("test selector should project to host rules"),
         }
     }

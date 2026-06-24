@@ -1,7 +1,7 @@
 use std::{io::Write, os::unix::net::UnixStream, path::PathBuf, sync::Arc};
 
 use exporter::WebhookConnectionOptions;
-use interception::TransparentInterceptionHostRuleScope;
+use interception::TransparentInterceptionHostRuleSet;
 use parsers::Http1ParserFactory;
 use pipeline::{
     CapturePipeline, PipelinePolicySet, PipelineRunOptions, PipelineRuntimeMetrics, PipelineSummary,
@@ -169,7 +169,7 @@ struct BlockingCaptureRun {
     spool: Arc<FjallSpool>,
     policy_set: PipelinePolicySet,
     enforcement_planner: RuntimeEnforcementPlanner,
-    transparent_interception_setup_scope: Option<TransparentInterceptionHostRuleScope>,
+    transparent_interception_setup_scope: Option<TransparentInterceptionHostRuleSet>,
     transparent_interception: TransparentInterceptionRuntime,
     pipeline_metrics: PipelineRuntimeMetrics,
     capture_provider_preflight: CaptureProviderPreflight,

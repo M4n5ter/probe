@@ -9,7 +9,7 @@ mod probe;
 use ::runtime::{
     TransparentInterceptionInboundTproxyPlan, TransparentInterceptionOutboundProxyPlan,
 };
-use interception::TransparentInterceptionHostRuleScope;
+use interception::TransparentInterceptionHostRuleSet;
 
 use self::{
     command::{SystemIp, SystemNft},
@@ -84,9 +84,9 @@ pub(super) fn resolve_outbound(
 
 pub(super) fn validate_inbound_tproxy_setup_scope(
     inbound_plan: &TransparentInterceptionInboundTproxyPlan,
-    setup_scope: &TransparentInterceptionHostRuleScope,
+    setup_scope: &TransparentInterceptionHostRuleSet,
 ) -> Result<(), super::TransparentInterceptionError> {
-    InboundTproxyLifecyclePlan::from_spec_and_scope(
+    InboundTproxyLifecyclePlan::from_spec_and_rule_set(
         InboundTproxyArtifactSpec::new(
             TransparentLinuxResources::reserved(),
             inbound_plan.listen_port().get(),
@@ -99,9 +99,9 @@ pub(super) fn validate_inbound_tproxy_setup_scope(
 
 pub(super) fn validate_outbound_redirect_setup_scope(
     outbound_plan: &TransparentInterceptionOutboundProxyPlan,
-    setup_scope: &TransparentInterceptionHostRuleScope,
+    setup_scope: &TransparentInterceptionHostRuleSet,
 ) -> Result<(), super::TransparentInterceptionError> {
-    OutboundRedirectLifecyclePlan::from_spec_and_scope(
+    OutboundRedirectLifecyclePlan::from_spec_and_rule_set(
         outbound_plan.outbound_redirect_artifact().clone(),
         setup_scope.clone(),
     )

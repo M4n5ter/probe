@@ -5,11 +5,11 @@ mod selectors;
 pub use model::{
     TransparentInterceptionClassifierSelector, TransparentInterceptionClassifierTerm,
     TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
-    TransparentInterceptionHostRuleScope, TransparentInterceptionPortScope,
-    TransparentInterceptionProcessScope, TransparentInterceptionProcessScopeExpression,
-    TransparentInterceptionRemoteAddressScope, TransparentInterceptionSetupDirection,
-    TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError,
-    TransparentInterceptionSocketOwnerScope,
+    TransparentInterceptionHostRuleScope, TransparentInterceptionHostRuleSet,
+    TransparentInterceptionPortScope, TransparentInterceptionProcessScope,
+    TransparentInterceptionProcessScopeExpression, TransparentInterceptionRemoteAddressScope,
+    TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan,
+    TransparentInterceptionSetupProjectionError, TransparentInterceptionSocketOwnerScope,
 };
 pub use selectors::{
     TransparentInterceptionSetupSelectorSources, TransparentInterceptionSetupSelectors,

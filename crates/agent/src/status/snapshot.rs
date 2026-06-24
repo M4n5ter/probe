@@ -379,7 +379,7 @@ mod tests {
         assert_eq!(
             status_capability(&value, "transparent_flow_classifier")["reason"],
             json!(
-                "transparent flow classifier backend is not configured; not/ref transparent interception selectors and any selectors that cannot be represented as one setup-time host-rule scope require flow-aware classification before rule installation"
+                "transparent flow classifier backend is not configured; not/ref transparent interception selectors and any selectors with classifier-only or unconstrained setup branches require flow-aware classification before rule installation"
             )
         );
         Ok(())
