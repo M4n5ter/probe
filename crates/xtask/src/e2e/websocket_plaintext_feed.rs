@@ -5,9 +5,8 @@ use storage::{FjallSpool, StoredEvent};
 
 use super::harness::{decode_envelope, e2e_error, run_agent_with_max_events, run_with_temp_root};
 use super::plaintext_assertions::{
-    assert_bytes_event, assert_connection_closed, assert_connection_opened,
-    assert_no_http_body_chunks_after, assert_no_protocol_errors, assert_policy_alert,
-    decode_capture_events, export_event_position, has_header,
+    assert_no_http_body_chunks_after, assert_no_protocol_errors, assert_ordered_export_positions,
+    assert_plaintext_feed_records, assert_policy_alert, export_event_position, has_header,
 };
 use super::plaintext_scenario::{
     PlaintextFeedCase, PlaintextFeedRecord, PlaintextFlow, PlaintextProcess,
@@ -91,19 +90,7 @@ fn scenario() -> PlaintextFeedCase {
 }
 
 fn write_feed(scenario: &PlaintextFeedCase, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let request = websocket_upgrade_request();
-    let response = websocket_upgrade_response();
-    let frame = websocket_text_frame(FRAME_PAYLOAD);
-    scenario.write_feed_records(
-        path,
-        [
-            PlaintextFeedRecord::connection_opened(),
-            PlaintextFeedRecord::bytes(Direction::Outbound, 0, request),
-            PlaintextFeedRecord::bytes(Direction::Inbound, 0, response.clone()),
-            PlaintextFeedRecord::bytes(Direction::Inbound, u64::try_from(response.len())?, frame),
-            PlaintextFeedRecord::connection_closed(),
-        ],
-    )
+    scenario.write_feed_records(path, feed_records()?)
 }
 
 fn websocket_upgrade_request() -> Vec<u8> {
@@ -128,6 +115,21 @@ fn websocket_text_frame(payload: &[u8]) -> Vec<u8> {
     frame.push(len);
     frame.extend_from_slice(payload);
     frame
+}
+
+fn feed_records() -> Result<Vec<PlaintextFeedRecord>, Box<dyn std::error::Error>> {
+    let response = websocket_upgrade_response();
+    Ok(vec![
+        PlaintextFeedRecord::connection_opened(),
+        PlaintextFeedRecord::bytes(Direction::Outbound, 0, websocket_upgrade_request()),
+        PlaintextFeedRecord::bytes(Direction::Inbound, 0, response.clone()),
+        PlaintextFeedRecord::bytes(
+            Direction::Inbound,
+            u64::try_from(response.len())?,
+            websocket_text_frame(FRAME_PAYLOAD),
+        ),
+        PlaintextFeedRecord::connection_closed(),
+    ])
 }
 
 fn write_policy_bundle(path: &Path) -> Result<(), std::io::Error> {
@@ -199,41 +201,7 @@ fn assert_ingress_events(
     events: &[StoredEvent],
     scenario: &PlaintextFeedCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let capture_events = decode_capture_events(events, WEBSOCKET_FEED_EVENT_COUNT, CONTEXT)?;
-    let [opened, request, response, frame, closed] = capture_events.as_slice() else {
-        unreachable!("decode_capture_events already checked the event count");
-    };
-
-    assert_connection_opened(opened, scenario, CONTEXT)?;
-    assert_bytes_event(
-        request,
-        scenario,
-        Direction::Outbound,
-        0,
-        websocket_upgrade_request().as_slice(),
-        CONTEXT,
-        "upgrade request",
-    )?;
-    let upgrade_response = websocket_upgrade_response();
-    assert_bytes_event(
-        response,
-        scenario,
-        Direction::Inbound,
-        0,
-        upgrade_response.as_slice(),
-        CONTEXT,
-        "upgrade response",
-    )?;
-    assert_bytes_event(
-        frame,
-        scenario,
-        Direction::Inbound,
-        u64::try_from(upgrade_response.len())?,
-        websocket_text_frame(FRAME_PAYLOAD).as_slice(),
-        CONTEXT,
-        "websocket frame",
-    )?;
-    assert_connection_closed(closed, scenario, CONTEXT)
+    assert_plaintext_feed_records(events, scenario, &feed_records()?, CONTEXT)
 }
 
 fn assert_websocket_exports(
@@ -304,18 +272,17 @@ fn assert_websocket_exports(
         export_event_position(envelopes, scenario, CONTEXT, "connection closed", |kind| {
             matches!(kind, EventKind::ConnectionClosed)
         })?;
-
-    if !(opened_index < request_index
-        && request_index < response_index
-        && response_index < handoff_index
-        && handoff_index < frame_index
-        && frame_index < closed_index)
-    {
-        return Err(e2e_error(format!(
-            "websocket export order was opened={opened_index}, request={request_index}, response={response_index}, handoff={handoff_index}, frame={frame_index}, closed={closed_index}"
-        ))
-        .into());
-    }
+    assert_ordered_export_positions(
+        CONTEXT,
+        &[
+            ("connection opened", opened_index),
+            ("HTTP upgrade request", request_index),
+            ("HTTP 101 response", response_index),
+            ("WebSocket handoff", handoff_index),
+            ("WebSocket frame", frame_index),
+            ("connection closed", closed_index),
+        ],
+    )?;
 
     let expected_policy_version = expected_policy_version();
     assert_policy_alert(

@@ -5,6 +5,7 @@ use super::super::{
     admin_policy_reload::run as run_admin_policy_reload,
     ebpf_process_loopback::run as run_ebpf_process_loopback,
     file_exporter::run as run_file_exporter,
+    gap_plaintext_feed::run as run_gap_plaintext_feed,
     libpcap_loopback::run as run_libpcap_loopback,
     plaintext_feed::run as run_plaintext_feed,
     remote_enforcement_policy::run as run_remote_enforcement_policy,
@@ -108,6 +109,11 @@ const E2E_CASES: &[E2eCase] = &[
         name: "e2e-sse-plaintext-feed",
         requirement: E2eRequirement::User,
         run: run_sse_plaintext_feed,
+    },
+    E2eCase {
+        name: "e2e-gap-plaintext-feed",
+        requirement: E2eRequirement::User,
+        run: run_gap_plaintext_feed,
     },
     E2eCase {
         name: "e2e-websocket-plaintext-feed",
@@ -234,6 +240,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
         cases: E2eProfileCases::Named(&[
             "e2e-plaintext-feed",
             "e2e-sse-plaintext-feed",
+            "e2e-gap-plaintext-feed",
             "e2e-websocket-plaintext-feed",
             "e2e-webhook-exporter",
             "e2e-file-exporter",
@@ -297,6 +304,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
         cases: E2eProfileCases::Named(&[
             "e2e-plaintext-feed",
             "e2e-sse-plaintext-feed",
+            "e2e-gap-plaintext-feed",
             "e2e-websocket-plaintext-feed",
             "e2e-webhook-exporter",
             "e2e-file-exporter",
@@ -458,6 +466,7 @@ mod tests {
             cases: ExpectedProfileCases::Named(&[
                 "e2e-plaintext-feed",
                 "e2e-sse-plaintext-feed",
+                "e2e-gap-plaintext-feed",
                 "e2e-websocket-plaintext-feed",
                 "e2e-webhook-exporter",
                 "e2e-file-exporter",
@@ -523,6 +532,7 @@ mod tests {
             cases: ExpectedProfileCases::Named(&[
                 "e2e-plaintext-feed",
                 "e2e-sse-plaintext-feed",
+                "e2e-gap-plaintext-feed",
                 "e2e-websocket-plaintext-feed",
                 "e2e-webhook-exporter",
                 "e2e-file-exporter",

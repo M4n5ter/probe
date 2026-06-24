@@ -503,6 +503,30 @@ mod tests {
     }
 
     #[test]
+    fn reads_plaintext_feed_gap_json_lines() -> Result<(), Box<dyn std::error::Error>> {
+        let input = plaintext_gap_fixture();
+        let mut provider = JsonLinesPlaintextFeedProvider::new(Cursor::new(input), "fixture");
+
+        let Some(CaptureEvent::Gap(gap)) = provider.next()? else {
+            panic!("expected plaintext gap");
+        };
+
+        assert_eq!(gap.origin.source(), CaptureSource::ExternalPlaintextFeed);
+        assert_eq!(gap.timestamp.monotonic_ns, 2);
+        assert_eq!(gap.timestamp.wall_time_unix_ns, 3);
+        assert_eq!(gap.flow.id.0, "external_plaintext_feed:fixture-conn");
+        assert_eq!(gap.flow.local.port, 50000);
+        assert_eq!(gap.flow.remote.port, 443);
+        assert_eq!(gap.flow.attribution_confidence, 42);
+        assert_eq!(gap.gap.direction, Direction::Inbound);
+        assert_eq!(gap.gap.expected_offset, 17);
+        assert_eq!(gap.gap.next_offset, Some(23));
+        assert_eq!(gap.gap.reason, "fixture gap");
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn rejects_unknown_json_fields() {
         let input = r#"
 {"type":"bytes","timestamp":{"monotonic_ns":1,"wall_time_unix_ns":1},"connection":{"connection_id":"fixture-conn","local":{"address":"127.0.0.1","port":50000},"remote":{"address":"127.0.0.1","port":443},"protocol":"tcp","start_monotonic_ns":1,"attribution_confidence":42},"direction":"outbound","stream_offset":0,"bytes":[71],"unexpected":true}
@@ -561,10 +585,70 @@ mod tests {
         assert!(error.to_string().contains("exceeds"));
     }
 
-    fn plaintext_feed_fixture() -> &'static str {
-        r#"
-{"type":"bytes","timestamp":{"monotonic_ns":1,"wall_time_unix_ns":1},"connection":{"connection_id":"fixture-conn","local":{"address":"127.0.0.1","port":50000},"remote":{"address":"127.0.0.1","port":443},"protocol":"tcp","start_monotonic_ns":1,"socket_cookie":99,"attribution_confidence":42,"process":{"pid":123,"tgid":123,"start_time_ticks":456,"boot_id":"boot","exe_path":"/usr/bin/feed","cmdline_hash":"hash","uid":1000,"gid":1000,"name":"feed","cmdline":["feed"]}},"direction":"outbound","stream_offset":7,"bytes":[71,69,84,32,47,102,101,101,100,32,72,84,84,80,47,49,46,49,13,10,13,10],"degraded":true,"degradation_reason":"json feed test"}
-"#
+    fn plaintext_feed_fixture() -> String {
+        json_line(serde_json::json!({
+            "type": "bytes",
+            "timestamp": fixture_timestamp(1, 1),
+            "connection": fixture_connection(),
+            "direction": "outbound",
+            "stream_offset": 7,
+            "bytes": b"GET /feed HTTP/1.1\r\n\r\n",
+            "degraded": true,
+            "degradation_reason": "json feed test",
+        }))
+    }
+
+    fn plaintext_gap_fixture() -> String {
+        json_line(serde_json::json!({
+            "type": "gap",
+            "timestamp": fixture_timestamp(2, 3),
+            "connection": fixture_connection(),
+            "direction": "inbound",
+            "expected_offset": 17,
+            "next_offset": 23,
+            "reason": "fixture gap",
+        }))
+    }
+
+    fn fixture_timestamp(monotonic_ns: u64, wall_time_unix_ns: i64) -> serde_json::Value {
+        serde_json::json!({
+            "monotonic_ns": monotonic_ns,
+            "wall_time_unix_ns": wall_time_unix_ns,
+        })
+    }
+
+    fn fixture_connection() -> serde_json::Value {
+        serde_json::json!({
+            "connection_id": "fixture-conn",
+            "local": {
+                "address": "127.0.0.1",
+                "port": 50000,
+            },
+            "remote": {
+                "address": "127.0.0.1",
+                "port": 443,
+            },
+            "protocol": "tcp",
+            "start_monotonic_ns": 1,
+            "socket_cookie": 99,
+            "attribution_confidence": 42,
+            "process": {
+                "pid": 123,
+                "tgid": 123,
+                "start_time_ticks": 456,
+                "boot_id": "boot",
+                "exe_path": "/usr/bin/feed",
+                "cmdline_hash": "hash",
+                "uid": 1000,
+                "gid": 1000,
+                "name": "feed",
+                "cmdline": ["feed"],
+            },
+        })
+    }
+
+    fn json_line(value: serde_json::Value) -> String {
+        format!("{value}\n")
     }
 
     fn timestamp_suffix() -> u128 {

@@ -4,7 +4,7 @@ use storage::StoredEvent;
 
 use super::{
     harness::{decode_capture_event, e2e_error},
-    plaintext_scenario::PlaintextFeedCase,
+    plaintext_scenario::{PlaintextFeedCase, PlaintextFeedRecord},
 };
 
 pub(crate) fn decode_capture_events(
@@ -24,6 +24,19 @@ pub(crate) fn decode_capture_events(
         capture_events.len()
     ))
     .into())
+}
+
+pub(crate) fn assert_plaintext_feed_records(
+    events: &[StoredEvent],
+    scenario: &PlaintextFeedCase,
+    expected_records: &[PlaintextFeedRecord],
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let capture_events = decode_capture_events(events, expected_records.len(), context)?;
+    for (index, (event, expected)) in capture_events.iter().zip(expected_records).enumerate() {
+        assert_plaintext_feed_record(event, scenario, expected, context, index)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn assert_connection_opened(
@@ -84,6 +97,30 @@ pub(crate) fn assert_bytes_event(
     .into())
 }
 
+pub(crate) fn assert_gap_event(
+    event: &CaptureEvent,
+    scenario: &PlaintextFeedCase,
+    direction: Direction,
+    expected_offset: u64,
+    next_offset: Option<u64>,
+    reason: &str,
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(
+        event,
+        CaptureEvent::Gap(gap)
+            if is_expected_plaintext_origin(gap.origin.source(), gap.origin.provider())
+                && gap.flow.id.0 == scenario.expected_flow_id()
+                && gap.gap.direction == direction
+                && gap.gap.expected_offset == expected_offset
+                && gap.gap.next_offset == next_offset
+                && gap.gap.reason == reason
+    ) {
+        return Ok(());
+    }
+    Err(e2e_error(format!("missing expected {context} ingress gap event")).into())
+}
+
 pub(crate) fn export_event_position(
     envelopes: &[EventEnvelope],
     scenario: &PlaintextFeedCase,
@@ -107,6 +144,21 @@ pub(crate) fn export_event_position(
         .into());
     };
     Ok(*position)
+}
+
+pub(crate) fn assert_ordered_export_positions(
+    context: &str,
+    positions: &[(&str, usize)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if positions.windows(2).all(|pair| pair[0].1 < pair[1].1) {
+        return Ok(());
+    }
+    let order = positions
+        .iter()
+        .map(|(label, position)| format!("{label}={position}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(e2e_error(format!("{context} export order was {order}")).into())
 }
 
 pub(crate) fn has_header(headers: &[(String, String)], name: &str, value: &str) -> bool {
@@ -186,4 +238,44 @@ pub(crate) fn assert_no_http_body_chunks_after(
 
 fn is_expected_plaintext_origin(source: CaptureSource, provider: CaptureProviderKind) -> bool {
     source == CaptureSource::ExternalPlaintextFeed && provider == CaptureProviderKind::Plaintext
+}
+
+fn assert_plaintext_feed_record(
+    event: &CaptureEvent,
+    scenario: &PlaintextFeedCase,
+    expected: &PlaintextFeedRecord,
+    context: &str,
+    index: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match expected {
+        PlaintextFeedRecord::ConnectionOpened => assert_connection_opened(event, scenario, context),
+        PlaintextFeedRecord::Bytes {
+            direction,
+            stream_offset,
+            bytes,
+        } => assert_bytes_event(
+            event,
+            scenario,
+            *direction,
+            *stream_offset,
+            bytes.as_slice(),
+            context,
+            &format!("record {index}"),
+        ),
+        PlaintextFeedRecord::Gap {
+            direction,
+            expected_offset,
+            next_offset,
+            reason,
+        } => assert_gap_event(
+            event,
+            scenario,
+            *direction,
+            *expected_offset,
+            *next_offset,
+            reason,
+            context,
+        ),
+        PlaintextFeedRecord::ConnectionClosed => assert_connection_closed(event, scenario, context),
+    }
 }

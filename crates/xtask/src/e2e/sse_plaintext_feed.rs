@@ -5,9 +5,8 @@ use storage::{FjallSpool, StoredEvent};
 
 use super::harness::{decode_envelope, e2e_error, run_agent_with_max_events, run_with_temp_root};
 use super::plaintext_assertions::{
-    assert_bytes_event, assert_connection_closed, assert_connection_opened,
-    assert_no_protocol_errors, assert_policy_alert, decode_capture_events, export_event_position,
-    has_header,
+    assert_no_protocol_errors, assert_ordered_export_positions, assert_plaintext_feed_records,
+    assert_policy_alert, export_event_position, has_header,
 };
 use super::plaintext_scenario::{
     PlaintextFeedCase, PlaintextFeedRecord, PlaintextFlow, PlaintextProcess,
@@ -92,23 +91,7 @@ fn scenario() -> PlaintextFeedCase {
 }
 
 fn write_feed(scenario: &PlaintextFeedCase, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let request = sse_request();
-    let first_response = sse_response_with_first_event();
-    let second_response = sse_second_event();
-    scenario.write_feed_records(
-        path,
-        [
-            PlaintextFeedRecord::connection_opened(),
-            PlaintextFeedRecord::bytes(Direction::Outbound, 0, request),
-            PlaintextFeedRecord::bytes(Direction::Inbound, 0, first_response.clone()),
-            PlaintextFeedRecord::bytes(
-                Direction::Inbound,
-                u64::try_from(first_response.len())?,
-                second_response,
-            ),
-            PlaintextFeedRecord::connection_closed(),
-        ],
-    )
+    scenario.write_feed_records(path, feed_records()?)
 }
 
 fn sse_request() -> Vec<u8> {
@@ -139,6 +122,21 @@ fn first_event_body() -> &'static str {
 
 fn second_event_body() -> &'static str {
     "event: done\nid: 43\nretry: 1500\ndata: goodbye\n\n"
+}
+
+fn feed_records() -> Result<Vec<PlaintextFeedRecord>, Box<dyn std::error::Error>> {
+    let first_response = sse_response_with_first_event();
+    Ok(vec![
+        PlaintextFeedRecord::connection_opened(),
+        PlaintextFeedRecord::bytes(Direction::Outbound, 0, sse_request()),
+        PlaintextFeedRecord::bytes(Direction::Inbound, 0, first_response.clone()),
+        PlaintextFeedRecord::bytes(
+            Direction::Inbound,
+            u64::try_from(first_response.len())?,
+            sse_second_event(),
+        ),
+        PlaintextFeedRecord::connection_closed(),
+    ])
 }
 
 fn write_policy_bundle(path: &Path) -> Result<(), std::io::Error> {
@@ -213,47 +211,16 @@ fn assert_ingress_events(
     events: &[StoredEvent],
     scenario: &PlaintextFeedCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let capture_events = decode_capture_events(events, SSE_FEED_EVENT_COUNT, CONTEXT)?;
-    let [opened, request, response, second_event, closed] = capture_events.as_slice() else {
-        unreachable!("decode_capture_events already checked the event count");
-    };
-
-    assert_connection_opened(opened, scenario, CONTEXT)?;
-    assert_bytes_event(
-        request,
-        scenario,
-        Direction::Outbound,
-        0,
-        sse_request().as_slice(),
-        CONTEXT,
-        "request",
-    )?;
-    let first_response = sse_response_with_first_event();
-    assert_bytes_event(
-        response,
-        scenario,
-        Direction::Inbound,
-        0,
-        first_response.as_slice(),
-        CONTEXT,
-        "response headers and first event",
-    )?;
-    assert_bytes_event(
-        second_event,
-        scenario,
-        Direction::Inbound,
-        u64::try_from(first_response.len())?,
-        sse_second_event().as_slice(),
-        CONTEXT,
-        "second event",
-    )?;
-    assert_connection_closed(closed, scenario, CONTEXT)
+    assert_plaintext_feed_records(events, scenario, &feed_records()?, CONTEXT)
 }
 
 fn assert_sse_exports(
     envelopes: &[EventEnvelope],
     scenario: &PlaintextFeedCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let second_body = sse_second_event();
+    let second_body_offset = u64::try_from(first_event_body().len())?;
+    let end_body_offset = second_body_offset.saturating_add(u64::try_from(second_body.len())?);
     let opened_index =
         export_event_position(envelopes, scenario, CONTEXT, "connection opened", |kind| {
             matches!(kind, EventKind::ConnectionOpened)
@@ -309,9 +276,6 @@ fn assert_sse_exports(
                         && event.data == FIRST_EVENT_DATA
             )
         })?;
-    let second_body = sse_second_event();
-    let second_body_offset = u64::try_from(first_event_body().len())?;
-    let end_body_offset = second_body_offset.saturating_add(u64::try_from(second_body.len())?);
     let second_body_index = export_event_position(
         envelopes,
         scenario,
@@ -358,21 +322,20 @@ fn assert_sse_exports(
         export_event_position(envelopes, scenario, CONTEXT, "connection closed", |kind| {
             matches!(kind, EventKind::ConnectionClosed)
         })?;
-
-    if !(opened_index < request_index
-        && request_index < response_index
-        && response_index < first_body_index
-        && first_body_index < first_sse_index
-        && first_sse_index < second_body_index
-        && second_body_index < second_sse_index
-        && second_sse_index < end_body_index
-        && end_body_index < closed_index)
-    {
-        return Err(e2e_error(format!(
-            "SSE export order was opened={opened_index}, request={request_index}, response={response_index}, first_body={first_body_index}, first_sse={first_sse_index}, second_body={second_body_index}, second_sse={second_sse_index}, end={end_body_index}, closed={closed_index}"
-        ))
-        .into());
-    }
+    assert_ordered_export_positions(
+        CONTEXT,
+        &[
+            ("connection opened", opened_index),
+            ("HTTP SSE request", request_index),
+            ("HTTP SSE response", response_index),
+            ("first SSE body chunk", first_body_index),
+            ("first SSE event", first_sse_index),
+            ("second SSE body chunk", second_body_index),
+            ("second SSE event", second_sse_index),
+            ("SSE stream end", end_body_index),
+            ("connection closed", closed_index),
+        ],
+    )?;
 
     let expected_policy_version = expected_policy_version();
     assert_policy_alert(

@@ -122,6 +122,20 @@ impl PlaintextFeedCase {
                 "stream_offset": stream_offset,
                 "bytes": bytes,
             }),
+            PlaintextFeedRecord::Gap {
+                direction,
+                expected_offset,
+                next_offset,
+                reason,
+            } => serde_json::json!({
+                "type": "gap",
+                "timestamp": feed_timestamp(monotonic_ns),
+                "connection": connection,
+                "direction": direction,
+                "expected_offset": expected_offset,
+                "next_offset": next_offset,
+                "reason": reason,
+            }),
             PlaintextFeedRecord::ConnectionClosed => serde_json::json!({
                 "type": "connection_closed",
                 "timestamp": feed_timestamp(monotonic_ns),
@@ -277,12 +291,19 @@ end
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlaintextFeedRecord {
     ConnectionOpened,
     Bytes {
         direction: Direction,
         stream_offset: u64,
         bytes: Vec<u8>,
+    },
+    Gap {
+        direction: Direction,
+        expected_offset: u64,
+        next_offset: Option<u64>,
+        reason: &'static str,
     },
     ConnectionClosed,
 }
@@ -297,6 +318,20 @@ impl PlaintextFeedRecord {
             direction,
             stream_offset,
             bytes,
+        }
+    }
+
+    pub(crate) fn gap(
+        direction: Direction,
+        expected_offset: u64,
+        next_offset: Option<u64>,
+        reason: &'static str,
+    ) -> Self {
+        Self::Gap {
+            direction,
+            expected_offset,
+            next_offset,
+            reason,
         }
     }
 
