@@ -1,19 +1,18 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pipeline::PipelineRuntimeMetricsSnapshot;
-use probe_config::{CaptureBackend, CaptureSelection};
-use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, RuntimeMode};
-use runtime::{CapturePlanMode, RuntimePlan};
+use probe_core::{CapabilityMatrix, RuntimeMode};
+use runtime::RuntimePlan;
 use serde::Serialize;
 
 use crate::configured_enforcement::ActiveEnforcementPolicy;
 use crate::export::ExportWorkerRuntimeSnapshot;
-use crate::tls_plaintext::{
-    TlsDecryptHintRuntimeSnapshot, TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot,
-};
+use crate::tls_plaintext::{TlsDecryptHintRuntimeSnapshot, TlsPlaintextRuntimeSnapshot};
 use crate::transparent_interception::TransparentProxyRuntimeSnapshot;
 
 use super::{
+    capabilities::capabilities_with_runtime,
+    capture::{CaptureStatusSnapshot, capture_status},
     enforcement::{
         EnforcementStatusSnapshot, enforcement_status_with_active_policy,
         enforcement_status_with_transparent_proxy,
@@ -51,16 +50,9 @@ pub struct HealthSnapshot {
     pub reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CaptureStatusSnapshot {
-    pub selection: CaptureSelection,
-    pub selected_backend: Option<CaptureBackend>,
-    pub mode: CapturePlanMode,
-    pub reason: Option<String>,
-}
-
 #[derive(Clone, Default)]
 pub struct RuntimeStatusInput {
+    pub capture: Option<crate::capture_provider::CaptureProviderRuntimeSnapshot>,
     pub enforcement: EnforcementRuntimeStatusInput,
     pub export_worker: Option<ExportWorkerRuntimeSnapshot>,
     pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
@@ -118,6 +110,7 @@ fn build_status_snapshot_at_with_runtime(
         ingress_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_ingress_sequence),
         export_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_export_sequence),
     };
+    let capture = capture_status(plan, runtime.capture.clone());
     let policy = policy_status(plan);
     let transparent_proxy = runtime.transparent_proxy.clone();
     let enforcement = match &runtime.enforcement {
@@ -128,7 +121,11 @@ fn build_status_snapshot_at_with_runtime(
             enforcement_status_with_active_policy(plan, active_policy, transparent_proxy.clone())
         }
     };
-    let capabilities = capabilities_with_runtime(plan, runtime.tls_plaintext.as_ref());
+    let capabilities = capabilities_with_runtime(
+        plan,
+        runtime.capture.as_ref(),
+        runtime.tls_plaintext.as_ref(),
+    );
     let tls = tls_status(
         plan,
         &capabilities,
@@ -150,19 +147,21 @@ fn build_status_snapshot_at_with_runtime(
         transparent_proxy,
         runtime.pipeline,
     );
-    let health = health_snapshot(plan, &spool_status, &exporters, &policy, &enforcement, &tls);
+    let health = health_snapshot(
+        &capture,
+        &spool_status,
+        &exporters,
+        &policy,
+        &enforcement,
+        &tls,
+    );
 
     AgentStatusSnapshot {
         generated_unix_ns,
         agent_id: plan.config.agent_id.clone(),
         config_version: plan.config.config_version.clone(),
         health,
-        capture: CaptureStatusSnapshot {
-            selection: plan.capture.selection,
-            selected_backend: plan.capture.selected_backend,
-            mode: plan.capture.mode,
-            reason: plan.capture.reason.clone(),
-        },
+        capture,
         policy,
         enforcement,
         tls,
@@ -172,36 +171,6 @@ fn build_status_snapshot_at_with_runtime(
         exporters,
         metrics,
     }
-}
-
-fn capabilities_with_runtime(
-    plan: &RuntimePlan,
-    tls_plaintext: Option<&TlsPlaintextRuntimeSnapshot>,
-) -> CapabilityMatrix {
-    let Some(runtime) = tls_plaintext else {
-        return plan.capabilities.clone();
-    };
-    if runtime.mode != TlsPlaintextRuntimeMode::Disabled {
-        return plan.capabilities.clone();
-    }
-    CapabilityMatrix::new(
-        plan.capabilities
-            .states()
-            .iter()
-            .cloned()
-            .map(|capability| {
-                if capability.kind == CapabilityKind::LibsslUprobe {
-                    CapabilityState::unavailable(
-                        CapabilityKind::LibsslUprobe,
-                        runtime.reason.clone().unwrap_or_else(|| {
-                            "TLS plaintext instrumentation is disabled".to_string()
-                        }),
-                    )
-                } else {
-                    capability
-                }
-            }),
-    )
 }
 
 fn current_unix_time_ns() -> u64 {
@@ -221,14 +190,14 @@ mod tests {
     };
     use super::*;
     use probe_config::{
-        EnforcementPolicyManifest, EnforcementPolicySourceConfig, TlsMaterialConfig,
-        TlsMaterialKind,
+        CaptureSelection, EnforcementPolicyManifest, EnforcementPolicySourceConfig,
+        TlsMaterialConfig, TlsMaterialKind,
     };
     use probe_core::{
         Action, CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector,
         ProtectiveActionProfile, Selector, TrafficSelector,
     };
-    use runtime::{ExportFailureBackoffPlan, ExportWorkerPlan};
+    use runtime::{ExportFailureBackoffPlan, ExportWorkerPlan, RuntimePlan};
     use serde_json::json;
     use storage::SpoolSnapshot;
 

@@ -193,7 +193,7 @@ mod tests {
 
         let provider = registry.capture_provider(CaptureBackend::Ebpf);
 
-        assert_eq!(provider.mode, RuntimeMode::Unavailable);
+        assert_eq!(provider.capability_mode, RuntimeMode::Unavailable);
         assert!(
             provider
                 .reason

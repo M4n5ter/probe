@@ -10,6 +10,9 @@ pub struct CapturePlan {
     pub fallback_backends: Vec<LiveCaptureBackend>,
     pub selected_backend: Option<CaptureBackend>,
     pub selected_provider: Option<CaptureProviderDescriptor>,
+    pub selected_provider_runtime_mode: Option<RuntimeMode>,
+    pub selected_evidence_mode: Option<CaptureEvidenceMode>,
+    pub evidence_reason: Option<String>,
     pub mode: CapturePlanMode,
     pub candidates: Vec<CaptureProviderDescriptor>,
     pub reason: Option<String>,
@@ -24,7 +27,7 @@ impl CapturePlan {
 
         let selected_provider = candidates
             .iter()
-            .find(|candidate| candidate.selectable_for(config.capture.selection))
+            .find(|candidate| candidate.openable())
             .cloned();
         let selected_backend = selected_provider.as_ref().map(|provider| provider.backend);
         let mode = selected_provider
@@ -32,32 +35,68 @@ impl CapturePlan {
             .map_or(CapturePlanMode::Unavailable, |provider| {
                 provider.plan_mode()
             });
-        let reason = selected_backend
-            .is_none()
-            .then(|| match config.capture.selection {
-                CaptureSelection::Replay => {
-                    "replay capture provider is not available in this build/runtime".to_string()
-                }
-                CaptureSelection::PlaintextFeed => {
-                    "plaintext feed capture provider is not available in this build/runtime"
-                        .to_string()
-                }
-                CaptureSelection::CaptureEventFeed => {
-                    "capture event feed provider is not available in this build/runtime".to_string()
-                }
-                CaptureSelection::Auto | CaptureSelection::Ebpf | CaptureSelection::Libpcap => {
-                    "no live capture provider is available in this build/runtime".to_string()
-                }
-            });
+        let reason = capture_plan_reason(config.capture.selection, selected_backend);
 
         Self {
             selection: config.capture.selection,
             fallback_backends: config.capture.fallback_backends.clone(),
             selected_backend,
+            selected_provider_runtime_mode: selected_provider
+                .as_ref()
+                .map(|provider| provider.runtime_mode),
+            selected_evidence_mode: selected_provider
+                .as_ref()
+                .map(|provider| provider.evidence_mode),
+            evidence_reason: selected_provider
+                .as_ref()
+                .and_then(|provider| provider.evidence_reason.clone()),
             selected_provider,
             mode,
             candidates,
             reason,
+        }
+    }
+
+    pub fn live_provider_open_candidates(&self) -> Vec<CaptureProviderDescriptor> {
+        match self.selection {
+            CaptureSelection::Auto => self
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.live() && candidate.openable())
+                .cloned()
+                .collect(),
+            CaptureSelection::Ebpf | CaptureSelection::Libpcap => {
+                self.selected_provider.iter().cloned().collect()
+            }
+            CaptureSelection::PlaintextFeed
+            | CaptureSelection::CaptureEventFeed
+            | CaptureSelection::Replay => Vec::new(),
+        }
+    }
+}
+
+fn capture_plan_reason(
+    selection: CaptureSelection,
+    selected_backend: Option<CaptureBackend>,
+) -> Option<String> {
+    selected_backend
+        .is_none()
+        .then(|| unavailable_capture_reason(selection))
+}
+
+fn unavailable_capture_reason(selection: CaptureSelection) -> String {
+    match selection {
+        CaptureSelection::Replay => {
+            "replay capture provider is not available in this build/runtime".to_string()
+        }
+        CaptureSelection::PlaintextFeed => {
+            "plaintext feed capture provider is not available in this build/runtime".to_string()
+        }
+        CaptureSelection::CaptureEventFeed => {
+            "capture event feed provider is not available in this build/runtime".to_string()
+        }
+        CaptureSelection::Auto | CaptureSelection::Ebpf | CaptureSelection::Libpcap => {
+            "no live capture provider is available in this build/runtime".to_string()
         }
     }
 }
@@ -72,12 +111,21 @@ pub enum CapturePlanMode {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureEvidenceMode {
+    Nominal,
+    BestEffort,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureProviderDescriptor {
     pub backend: CaptureBackend,
     pub builder: CaptureProviderBuilder,
-    pub mode: RuntimeMode,
-    pub selection_policy: CaptureProviderSelectionPolicy,
+    pub runtime_mode: RuntimeMode,
+    pub capability_mode: RuntimeMode,
+    pub evidence_mode: CaptureEvidenceMode,
+    pub evidence_reason: Option<String>,
     pub reason: Option<String>,
 }
 
@@ -86,8 +134,10 @@ impl CaptureProviderDescriptor {
         Self {
             backend,
             builder,
-            mode: RuntimeMode::Available,
-            selection_policy: CaptureProviderSelectionPolicy::AvailableOnly,
+            runtime_mode: RuntimeMode::Available,
+            capability_mode: RuntimeMode::Available,
+            evidence_mode: CaptureEvidenceMode::Nominal,
+            evidence_reason: None,
             reason: None,
         }
     }
@@ -100,9 +150,11 @@ impl CaptureProviderDescriptor {
         Self {
             backend,
             builder,
-            mode: RuntimeMode::Degraded,
-            selection_policy: CaptureProviderSelectionPolicy::AvailableOnly,
-            reason: Some(reason.into()),
+            runtime_mode: RuntimeMode::Available,
+            capability_mode: RuntimeMode::Degraded,
+            evidence_mode: CaptureEvidenceMode::BestEffort,
+            evidence_reason: Some(reason.into()),
+            reason: None,
         }
     }
 
@@ -114,14 +166,17 @@ impl CaptureProviderDescriptor {
         Self {
             backend,
             builder,
-            mode: RuntimeMode::Unavailable,
-            selection_policy: CaptureProviderSelectionPolicy::AvailableOnly,
+            runtime_mode: RuntimeMode::Unavailable,
+            capability_mode: RuntimeMode::Unavailable,
+            evidence_mode: CaptureEvidenceMode::Nominal,
+            evidence_reason: None,
             reason: Some(reason.into()),
         }
     }
 
-    pub fn allow_explicit_degraded(mut self) -> Self {
-        self.selection_policy = CaptureProviderSelectionPolicy::AllowExplicitDegraded;
+    pub fn with_best_effort_evidence(mut self, reason: impl Into<String>) -> Self {
+        self.evidence_mode = CaptureEvidenceMode::BestEffort;
+        self.evidence_reason = Some(reason.into());
         self
     }
 
@@ -138,12 +193,13 @@ impl CaptureProviderDescriptor {
     }
 
     pub fn state(&self) -> CapabilityState {
-        match self.mode {
+        match self.capability_mode {
             RuntimeMode::Available => CapabilityState::available(self.capability()),
             RuntimeMode::Degraded => CapabilityState::degraded(
                 self.capability(),
-                self.reason
+                self.evidence_reason
                     .as_deref()
+                    .or(self.reason.as_deref())
                     .unwrap_or("capture provider is degraded"),
             ),
             RuntimeMode::Unavailable => CapabilityState::unavailable(
@@ -155,58 +211,33 @@ impl CaptureProviderDescriptor {
         }
     }
 
-    pub(super) fn selectable_for(&self, selection: CaptureSelection) -> bool {
-        if !self.builder.supports(self.backend) {
-            return false;
-        }
-        match selection {
-            CaptureSelection::Auto => self.selection_policy.auto_selectable(self.mode),
-            CaptureSelection::Ebpf
-            | CaptureSelection::Libpcap
-            | CaptureSelection::PlaintextFeed
-            | CaptureSelection::CaptureEventFeed
-            | CaptureSelection::Replay => self.selection_policy.explicit_selectable(self.mode),
-        }
+    pub(super) fn openable(&self) -> bool {
+        self.builder.supports(self.backend) && self.runtime_mode != RuntimeMode::Unavailable
     }
 
     pub(super) fn unselectable_reason(&self) -> String {
-        self.reason.clone().unwrap_or_else(|| {
-            format!(
-                "{:?} capture provider is not available in this build/runtime",
-                self.backend
-            )
-        })
+        self.reason
+            .clone()
+            .or_else(|| self.evidence_reason.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "{:?} capture provider is not available in this build/runtime",
+                    self.backend
+                )
+            })
     }
 
     pub(super) fn normalized(mut self) -> Self {
-        if self.mode != RuntimeMode::Unavailable && !self.builder.supports(self.backend) {
-            self.mode = RuntimeMode::Unavailable;
+        if self.capability_mode != RuntimeMode::Unavailable && !self.builder.supports(self.backend)
+        {
+            self.runtime_mode = RuntimeMode::Unavailable;
+            self.capability_mode = RuntimeMode::Unavailable;
             self.reason = Some(format!(
                 "{:?} builder cannot construct {:?} capture provider",
                 self.builder, self.backend
             ));
         }
         self
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CaptureProviderSelectionPolicy {
-    AvailableOnly,
-    AllowExplicitDegraded,
-}
-
-impl CaptureProviderSelectionPolicy {
-    fn auto_selectable(self, mode: RuntimeMode) -> bool {
-        mode == RuntimeMode::Available
-    }
-
-    fn explicit_selectable(self, mode: RuntimeMode) -> bool {
-        match self {
-            Self::AvailableOnly => mode == RuntimeMode::Available,
-            Self::AllowExplicitDegraded => mode != RuntimeMode::Unavailable,
-        }
     }
 }
 
@@ -346,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_selection_skips_degraded_ebpf_and_uses_available_libpcap()
+    fn auto_selection_prefers_degraded_ebpf_before_available_libpcap()
     -> Result<(), Box<dyn std::error::Error>> {
         let registry = ProviderRegistry::new(
             vec![
@@ -354,8 +385,7 @@ mod tests {
                     CaptureBackend::Ebpf,
                     CaptureProviderBuilder::Ebpf,
                     "eBPF observation provider does not capture payload",
-                )
-                .allow_explicit_degraded(),
+                ),
                 capture_provider(
                     CaptureBackend::Libpcap,
                     CaptureProviderBuilder::Libpcap,
@@ -369,22 +399,60 @@ mod tests {
         let plan = CapturePlan::resolve(&config, &registry);
 
         assert_eq!(plan.mode, CapturePlanMode::Live);
-        assert_eq!(plan.selected_backend, Some(CaptureBackend::Libpcap));
+        assert_eq!(plan.selected_backend, Some(CaptureBackend::Ebpf));
+        assert_eq!(
+            plan.selected_provider_runtime_mode,
+            Some(RuntimeMode::Available)
+        );
+        assert_eq!(
+            plan.selected_evidence_mode,
+            Some(CaptureEvidenceMode::BestEffort)
+        );
+        assert_eq!(
+            plan.selected_provider
+                .as_ref()
+                .map(|provider| provider.capability_mode),
+            Some(RuntimeMode::Degraded)
+        );
+        assert!(
+            plan.evidence_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("does not capture payload"))
+        );
+        assert_eq!(plan.reason, None);
         Ok(())
     }
 
     #[test]
-    fn explicit_degraded_provider_with_selection_policy_is_selectable()
+    fn available_provider_can_expose_best_effort_evidence_without_degrading_capability() {
+        let descriptor = CaptureProviderDescriptor::available(
+            CaptureBackend::Libpcap,
+            CaptureProviderBuilder::Libpcap,
+        )
+        .with_best_effort_evidence("bounded stream assembly is best-effort");
+
+        assert_eq!(descriptor.capability_mode, RuntimeMode::Available);
+        assert_eq!(descriptor.runtime_mode, RuntimeMode::Available);
+        assert_eq!(descriptor.evidence_mode, CaptureEvidenceMode::BestEffort);
+        assert_eq!(
+            descriptor.evidence_reason.as_deref(),
+            Some("bounded stream assembly is best-effort")
+        );
+        assert_eq!(
+            descriptor.state(),
+            CapabilityState::available(CapabilityKind::Libpcap)
+        );
+    }
+
+    #[test]
+    fn explicit_degraded_provider_is_selectable_by_runtime_availability()
     -> Result<(), Box<dyn std::error::Error>> {
         let registry = ProviderRegistry::new(
-            vec![
-                CaptureProviderDescriptor::degraded(
-                    CaptureBackend::Ebpf,
-                    CaptureProviderBuilder::Ebpf,
-                    "eBPF observation provider does not capture payload",
-                )
-                .allow_explicit_degraded(),
-            ],
+            vec![CaptureProviderDescriptor::degraded(
+                CaptureBackend::Ebpf,
+                CaptureProviderBuilder::Ebpf,
+                "eBPF observation provider does not capture payload",
+            )],
             test_platform_capabilities(),
         );
         let mut config = AgentConfig::default();
@@ -395,9 +463,17 @@ mod tests {
         assert_eq!(plan.mode, CapturePlanMode::Live);
         assert_eq!(plan.selected_backend, Some(CaptureBackend::Ebpf));
         assert_eq!(
+            plan.selected_provider_runtime_mode,
+            Some(RuntimeMode::Available)
+        );
+        assert_eq!(
+            plan.selected_evidence_mode,
+            Some(CaptureEvidenceMode::BestEffort)
+        );
+        assert_eq!(
             plan.selected_provider
                 .as_ref()
-                .map(|provider| provider.mode),
+                .map(|provider| provider.capability_mode),
             Some(RuntimeMode::Degraded)
         );
         Ok(())

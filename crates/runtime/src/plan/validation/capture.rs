@@ -19,7 +19,7 @@ pub(super) fn validate_config(
         return;
     };
     let provider = registry.capture_provider(backend);
-    if !provider.selectable_for(config.capture.selection) {
+    if !provider.openable() {
         violations.push(ConfigViolation {
             field: "capture.selection".to_string(),
             reason: provider.unselectable_reason(),
@@ -38,25 +38,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicit_degraded_provider_without_selection_policy_is_rejected() {
+    fn explicit_degraded_provider_is_accepted_when_runtime_available()
+    -> Result<(), Box<dyn std::error::Error>> {
         let registry = ProviderRegistry::new(
             vec![CaptureProviderDescriptor::degraded(
                 CaptureBackend::Libpcap,
                 CaptureProviderBuilder::Libpcap,
-                "libpcap provider cannot open the configured device",
+                "libpcap stream assembly is best-effort",
             )],
             test_platform_capabilities(),
         );
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
 
-        let error = validation_error(config, &registry);
-
-        assert_violation(
-            &error,
-            "capture.selection",
-            "libpcap provider cannot open the configured device",
-        );
+        validate_runtime_config(&config, &registry)?;
+        Ok(())
     }
 
     #[test]

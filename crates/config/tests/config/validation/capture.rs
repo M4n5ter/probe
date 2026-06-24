@@ -18,6 +18,22 @@ fallback_backends = []
             .contains("auto capture selection requires at least one live fallback backend")
     );
 
+    let duplicate_fallback = AgentConfig::from_toml_str(
+        r#"
+[capture]
+fallback_backends = ["ebpf", "ebpf", "libpcap"]
+"#,
+    )?;
+
+    let duplicate_fallback_error = duplicate_fallback
+        .validate_basic()
+        .expect_err("duplicate fallback backends must be rejected");
+    assert!(
+        duplicate_fallback_error
+            .to_string()
+            .contains("capture fallback backend Ebpf is duplicated")
+    );
+
     let config = AgentConfig::from_toml_str(
         r#"
 [capture]

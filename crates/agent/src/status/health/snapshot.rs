@@ -1,11 +1,12 @@
 use probe_core::RuntimeMode;
-use runtime::{CapturePlanMode, RuntimePlan};
+use runtime::{CaptureEvidenceMode, CapturePlanMode};
 
 use crate::transparent_interception::{
     TransparentProxyHealthProbeMode, TransparentProxyRuntimeMode,
 };
 
 use super::super::{
+    capture::CaptureStatusSnapshot,
     enforcement::{EnforcementPolicySourceStatusSnapshot, EnforcementStatusSnapshot},
     export::ExporterStatusSnapshot,
     policy::{PolicyStatusMode, PolicyStatusSnapshot},
@@ -15,7 +16,7 @@ use super::super::{
 };
 
 pub(in crate::status) fn health_snapshot(
-    plan: &RuntimePlan,
+    capture: &CaptureStatusSnapshot,
     spool: &SpoolStatusSnapshot,
     exporters: &[ExporterStatusSnapshot],
     policy: &PolicyStatusSnapshot,
@@ -23,7 +24,7 @@ pub(in crate::status) fn health_snapshot(
     tls: &TlsStatusSnapshot,
 ) -> HealthSnapshot {
     fold_health_contributions(
-        std::iter::once(capture_health_contribution(plan))
+        std::iter::once(capture_health_contribution(capture))
             .chain(std::iter::once(spool_health_contribution(spool)))
             .chain(exporters.iter().map(exporter_health_contribution))
             .chain(std::iter::once(policy_health_contribution(policy)))
@@ -37,13 +38,21 @@ pub(in crate::status) fn health_snapshot(
     )
 }
 
-fn capture_health_contribution(plan: &RuntimePlan) -> HealthContribution {
-    if plan.capture.mode == CapturePlanMode::Unavailable {
+fn capture_health_contribution(capture: &CaptureStatusSnapshot) -> HealthContribution {
+    if capture.mode == CapturePlanMode::Unavailable {
         return HealthContribution::unavailable(
-            plan.capture
+            capture
                 .reason
                 .clone()
                 .unwrap_or_else(|| "capture plan is unavailable".to_string()),
+        );
+    }
+    if capture.evidence_mode == Some(CaptureEvidenceMode::BestEffort) {
+        return HealthContribution::degraded(
+            capture
+                .evidence_reason
+                .clone()
+                .unwrap_or_else(|| "capture evidence is best-effort".to_string()),
         );
     }
     HealthContribution::available()
@@ -243,5 +252,51 @@ fn merge_health_mode(current: RuntimeMode, next: RuntimeMode) -> RuntimeMode {
         (RuntimeMode::Unavailable, _) | (_, RuntimeMode::Unavailable) => RuntimeMode::Unavailable,
         (RuntimeMode::Degraded, _) | (_, RuntimeMode::Degraded) => RuntimeMode::Degraded,
         (RuntimeMode::Available, RuntimeMode::Available) => RuntimeMode::Available,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use probe_config::{CaptureBackend, CaptureSelection};
+    use runtime::CapturePlanMode;
+
+    use super::*;
+
+    #[test]
+    fn degraded_selected_capture_provider_degrades_health() {
+        let capture = CaptureStatusSnapshot {
+            selection: CaptureSelection::Auto,
+            selected_backend: Some(CaptureBackend::Ebpf),
+            provider_runtime_mode: Some(RuntimeMode::Available),
+            mode: CapturePlanMode::Live,
+            reason: None,
+            evidence_mode: Some(CaptureEvidenceMode::BestEffort),
+            evidence_reason: Some("eBPF provider is best-effort".to_string()),
+            open_failures: Vec::new(),
+        };
+
+        let health = fold_health_contributions([capture_health_contribution(&capture)]);
+
+        assert_eq!(health.mode, RuntimeMode::Degraded);
+        assert_eq!(health.reasons, ["eBPF provider is best-effort"]);
+    }
+
+    #[test]
+    fn available_selected_capture_provider_keeps_health_available() {
+        let capture = CaptureStatusSnapshot {
+            selection: CaptureSelection::Auto,
+            selected_backend: Some(CaptureBackend::Libpcap),
+            provider_runtime_mode: Some(RuntimeMode::Available),
+            mode: CapturePlanMode::Live,
+            reason: None,
+            evidence_mode: Some(CaptureEvidenceMode::Nominal),
+            evidence_reason: None,
+            open_failures: Vec::new(),
+        };
+
+        let health = fold_health_contributions([capture_health_contribution(&capture)]);
+
+        assert_eq!(health.mode, RuntimeMode::Available);
+        assert!(health.reasons.is_empty());
     }
 }

@@ -4,12 +4,13 @@ use capture::{
     EbpfProcessObservationProvider, EbpfResolvedSocketFlow, EbpfSocketFlowLookup,
     EbpfSocketFlowResolver, LibpcapProvider, MultiplexedProvider, ProcessResolver, ResolvedProcess,
 };
-use probe_config::CaptureBackend;
+use probe_config::{CaptureBackend, CaptureSelection};
 use probe_core::{CapabilityKind, RuntimeMode, TcpConnection};
-use runtime::{RuntimeError, RuntimePlan};
+use runtime::{CaptureProviderDescriptor, RuntimeError, RuntimePlan};
 
 use crate::{
     capture_event_feed::load_capture_event_feed_provider,
+    capture_provider::{CaptureProviderOpenFailureSnapshot, CaptureProviderRuntimeSnapshot},
     capture_registry::libpcap_config_from_agent,
     error::AgentError,
     plaintext_feed::load_plaintext_feed_provider,
@@ -22,6 +23,11 @@ use crate::{
 
 pub(crate) struct CaptureProviderPreflight {
     session_secret_auto_binding: TlsSessionSecretAutoBindingBuild,
+}
+
+pub(crate) struct BuiltCaptureProvider {
+    pub(crate) provider: Box<dyn CaptureProvider>,
+    pub(crate) runtime: CaptureProviderRuntimeSnapshot,
 }
 
 impl CaptureProviderPreflight {
@@ -41,10 +47,38 @@ pub(crate) fn build_capture_provider(
     plan: &RuntimePlan,
     tls_plaintext_runtime: Option<&TlsPlaintextRuntimeState>,
     preflight: CaptureProviderPreflight,
-) -> Result<Box<dyn CaptureProvider>, AgentError> {
+) -> Result<BuiltCaptureProvider, AgentError> {
     match plan.capture.selected_backend {
-        Some(CaptureBackend::PlaintextFeed) => build_plaintext_feed_provider(plan),
-        Some(CaptureBackend::CaptureEventFeed) => build_capture_event_feed_provider(plan),
+        Some(CaptureBackend::PlaintextFeed) => Ok(BuiltCaptureProvider {
+            provider: build_plaintext_feed_provider(plan)?,
+            runtime: CaptureProviderRuntimeSnapshot {
+                selected_backend: CaptureBackend::PlaintextFeed,
+                plan_mode: plan.capture.mode,
+                provider_runtime_mode: RuntimeMode::Available,
+                evidence_mode: plan
+                    .capture
+                    .selected_evidence_mode
+                    .unwrap_or(runtime::CaptureEvidenceMode::Nominal),
+                evidence_reason: plan.capture.evidence_reason.clone(),
+                reason: None,
+                open_failures: Vec::new(),
+            },
+        }),
+        Some(CaptureBackend::CaptureEventFeed) => Ok(BuiltCaptureProvider {
+            provider: build_capture_event_feed_provider(plan)?,
+            runtime: CaptureProviderRuntimeSnapshot {
+                selected_backend: CaptureBackend::CaptureEventFeed,
+                plan_mode: plan.capture.mode,
+                provider_runtime_mode: RuntimeMode::Available,
+                evidence_mode: plan
+                    .capture
+                    .selected_evidence_mode
+                    .unwrap_or(runtime::CaptureEvidenceMode::Nominal),
+                evidence_reason: plan.capture.evidence_reason.clone(),
+                reason: None,
+                open_failures: Vec::new(),
+            },
+        }),
         _ => build_live_capture_provider(
             plan,
             tls_plaintext_runtime,
@@ -57,27 +91,103 @@ fn build_live_capture_provider(
     plan: &RuntimePlan,
     tls_plaintext_runtime: Option<&TlsPlaintextRuntimeState>,
     session_secret_auto_binding: TlsSessionSecretAutoBindingBuild,
-) -> Result<Box<dyn CaptureProvider>, AgentError> {
+) -> Result<BuiltCaptureProvider, AgentError> {
     plan.require_live_capture()?;
-    let primary = match plan.capture.selected_backend {
-        Some(CaptureBackend::Ebpf) => build_ebpf_capture_provider(plan),
-        Some(CaptureBackend::Libpcap) => Ok(Box::new(LibpcapProvider::open_with_process_resolver(
+    let outcome = build_live_primary_with_fallback(plan)?;
+    let descriptor = outcome.descriptor;
+    let primary = session_secret_auto_binding.wrap(outcome.provider);
+    let provider = with_tls_plaintext_provider(plan, primary, tls_plaintext_runtime)?;
+    Ok(BuiltCaptureProvider {
+        provider,
+        runtime: CaptureProviderRuntimeSnapshot {
+            selected_backend: descriptor.backend,
+            plan_mode: descriptor.plan_mode(),
+            provider_runtime_mode: descriptor.runtime_mode,
+            evidence_mode: descriptor.evidence_mode,
+            evidence_reason: descriptor.evidence_reason,
+            reason: descriptor.reason,
+            open_failures: outcome.open_failures,
+        },
+    })
+}
+
+fn build_live_primary_with_fallback(
+    plan: &RuntimePlan,
+) -> Result<LiveCaptureOpenOutcome<Box<dyn CaptureProvider>>, AgentError> {
+    open_live_backend_with_fallback(plan, |backend| build_live_capture_backend(plan, backend))
+}
+
+#[derive(Debug)]
+struct LiveCaptureOpenOutcome<T> {
+    provider: T,
+    descriptor: CaptureProviderDescriptor,
+    open_failures: Vec<CaptureProviderOpenFailureSnapshot>,
+}
+
+fn open_live_backend_with_fallback<T>(
+    plan: &RuntimePlan,
+    mut open_backend: impl FnMut(CaptureBackend) -> Result<T, AgentError>,
+) -> Result<LiveCaptureOpenOutcome<T>, AgentError> {
+    let mut failures = Vec::new();
+    for descriptor in plan.capture.live_provider_open_candidates() {
+        let backend = descriptor.backend;
+        match open_backend(backend) {
+            Ok(provider) => {
+                return Ok(LiveCaptureOpenOutcome {
+                    provider,
+                    descriptor,
+                    open_failures: failures,
+                });
+            }
+            Err(error) if plan.config.capture.selection == CaptureSelection::Auto => {
+                failures.push(CaptureProviderOpenFailureSnapshot {
+                    backend,
+                    reason: error.to_string(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
+        reason: live_capture_failure_reason(plan, failures),
+    }))
+}
+
+fn build_live_capture_backend(
+    plan: &RuntimePlan,
+    backend: CaptureBackend,
+) -> Result<Box<dyn CaptureProvider>, AgentError> {
+    match backend {
+        CaptureBackend::Ebpf => build_ebpf_capture_provider(plan),
+        CaptureBackend::Libpcap => Ok(Box::new(LibpcapProvider::open_with_process_resolver(
             libpcap_config_from_agent(&plan.config),
             procfs_tcp_process_resolver_for_plan(plan),
         )?) as Box<dyn CaptureProvider>),
-        Some(backend) => Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
+        backend => Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
             reason: format!("{backend:?} capture provider is selected but has no agent builder"),
         })),
-        None => Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
-            reason: plan
-                .capture
-                .reason
-                .clone()
-                .unwrap_or_else(|| "capture plan did not select a live backend".to_string()),
-        })),
-    }?;
-    let primary = session_secret_auto_binding.wrap(primary);
-    with_tls_plaintext_provider(plan, primary, tls_plaintext_runtime)
+    }
+}
+
+fn live_capture_failure_reason(
+    plan: &RuntimePlan,
+    failures: Vec<CaptureProviderOpenFailureSnapshot>,
+) -> String {
+    if failures.is_empty() {
+        return plan
+            .capture
+            .reason
+            .clone()
+            .unwrap_or_else(|| "capture plan did not select a live backend".to_string());
+    }
+    format!(
+        "all auto live capture providers failed to open: {}",
+        failures
+            .into_iter()
+            .map(|failure| format!("{:?}: {}", failure.backend, failure.reason))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
 }
 
 fn with_tls_plaintext_provider(
@@ -250,5 +360,104 @@ impl EbpfSocketFlowResolver for ProcfsTcpProcessResolver {
 
     fn invalidate_cached_resolution(&mut self) {
         self.resolver.invalidate_snapshot();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
+    use probe_core::{CapabilityKind, CapabilityState};
+    use runtime::{
+        CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
+    };
+
+    use super::*;
+
+    #[test]
+    fn auto_capture_open_falls_back_after_degraded_ebpf_open_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = auto_plan_with_degraded_ebpf_and_available_libpcap()?;
+        let mut attempted = Vec::new();
+
+        let outcome = open_live_backend_with_fallback(&plan, |backend| {
+            attempted.push(backend);
+            match backend {
+                CaptureBackend::Ebpf => Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
+                    reason: "eBPF attach failed".to_string(),
+                })),
+                CaptureBackend::Libpcap => Ok(backend),
+                backend => panic!("unexpected backend {backend:?}"),
+            }
+        })?;
+
+        assert_eq!(attempted, [CaptureBackend::Ebpf, CaptureBackend::Libpcap]);
+        assert_eq!(outcome.provider, CaptureBackend::Libpcap);
+        assert_eq!(outcome.descriptor.backend, CaptureBackend::Libpcap);
+        assert_eq!(outcome.open_failures.len(), 1);
+        assert_eq!(outcome.open_failures[0].backend, CaptureBackend::Ebpf);
+        assert!(
+            outcome.open_failures[0]
+                .reason
+                .contains("eBPF attach failed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_capture_open_does_not_fallback_after_ebpf_open_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Ebpf;
+        let plan = plan_with_registry(config)?;
+        let mut attempted = Vec::new();
+
+        let error = open_live_backend_with_fallback(&plan, |backend| {
+            attempted.push(backend);
+            Err::<CaptureBackend, _>(AgentError::Runtime(RuntimeError::NoLiveCapture {
+                reason: "eBPF attach failed".to_string(),
+            }))
+        })
+        .expect_err("explicit eBPF must fail fast");
+
+        assert_eq!(attempted, [CaptureBackend::Ebpf]);
+        assert!(error.to_string().contains("eBPF attach failed"));
+        Ok(())
+    }
+
+    fn auto_plan_with_degraded_ebpf_and_available_libpcap()
+    -> Result<RuntimePlan, runtime::RuntimeError> {
+        plan_with_registry(AgentConfig::default())
+    }
+
+    fn plan_with_registry(config: AgentConfig) -> Result<RuntimePlan, runtime::RuntimeError> {
+        RuntimePlan::build(
+            config,
+            &ProviderRegistry::new(
+                vec![
+                    CaptureProviderDescriptor::degraded(
+                        CaptureBackend::Ebpf,
+                        CaptureProviderBuilder::Ebpf,
+                        "eBPF provider is best-effort",
+                    ),
+                    CaptureProviderDescriptor::available(
+                        CaptureBackend::Libpcap,
+                        CaptureProviderBuilder::Libpcap,
+                    ),
+                ],
+                test_platform_capabilities(),
+            ),
+        )
+    }
+
+    fn test_platform_capabilities() -> Vec<CapabilityState> {
+        vec![
+            CapabilityState::available(CapabilityKind::Http1),
+            CapabilityState::available(CapabilityKind::Sse),
+            CapabilityState::available(CapabilityKind::WebSocketHandoff),
+            CapabilityState::available(CapabilityKind::WebSocketFrame),
+            CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
+            CapabilityState::available(CapabilityKind::DryRunEnforcement),
+            CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
+        ]
     }
 }

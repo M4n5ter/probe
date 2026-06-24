@@ -25,6 +25,7 @@ use super::{
     protocol::{AdminRequest, AdminResponse, enforcement_policy_reload_source, read_admin_request},
     socket::{AdminError, AdminServerConfig, bind_admin_socket},
 };
+use crate::capture_provider::CaptureProviderRuntimeState;
 use crate::configured_enforcement::EnforcementRuntimeState;
 use crate::export::ExportWorkerRuntimeState;
 use crate::status::{
@@ -40,6 +41,7 @@ const ADMIN_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Default)]
 pub struct AdminRuntimeState {
+    pub capture: CaptureProviderRuntimeState,
     pub enforcement: Option<EnforcementRuntimeState>,
     pub enforcement_reload_gate: EnforcementReloadGate,
     pub export_worker: Option<ExportWorkerRuntimeState>,
@@ -278,6 +280,7 @@ fn build_admin_status_snapshot(
         plan,
         collect_running_spool_status(plan, spool),
         RuntimeStatusInput {
+            capture: runtime_state.capture.snapshot(),
             enforcement: runtime_state.enforcement.as_ref().map_or(
                 EnforcementRuntimeStatusInput::OfflineInspect,
                 |state| EnforcementRuntimeStatusInput::Runtime {

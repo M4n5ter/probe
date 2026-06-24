@@ -1,3 +1,5 @@
+mod capabilities;
+mod capture;
 mod enforcement;
 mod export;
 mod health;

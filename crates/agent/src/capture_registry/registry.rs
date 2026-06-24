@@ -155,7 +155,6 @@ fn ebpf_provider_descriptor_from_object_report(
             object.summary(),
         ),
     )
-    .allow_explicit_degraded()
 }
 
 fn procfs_socket_attribution_capability(capabilities: &[CapabilityState]) -> CapabilityState {
@@ -176,6 +175,9 @@ fn libpcap_provider_descriptor(config: &LibpcapConfig) -> CaptureProviderDescrip
         Ok(()) => CaptureProviderDescriptor::available(
             CaptureBackend::Libpcap,
             CaptureProviderBuilder::Libpcap,
+        )
+        .with_best_effort_evidence(
+            "libpcap uses bounded best-effort TCP stream assembly and does not provide full TCP window/SACK recovery, kernel lost-event feedback, IPv6 extension/fragment recovery, snaplen truncation repair, or strong process attribution",
         ),
         Err(error) => CaptureProviderDescriptor::unavailable(
             CaptureBackend::Libpcap,
@@ -218,7 +220,7 @@ mod tests {
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
         assert_eq!(descriptor.builder, CaptureProviderBuilder::Unimplemented);
-        assert_eq!(descriptor.mode, RuntimeMode::Unavailable);
+        assert_eq!(descriptor.capability_mode, RuntimeMode::Unavailable);
         let reason = descriptor
             .reason
             .expect("eBPF descriptor should explain why it is unavailable");
@@ -243,7 +245,7 @@ mod tests {
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
         assert_eq!(descriptor.builder, CaptureProviderBuilder::Unimplemented);
-        assert_eq!(descriptor.mode, RuntimeMode::Unavailable);
+        assert_eq!(descriptor.capability_mode, RuntimeMode::Unavailable);
         let reason = descriptor
             .reason
             .expect("eBPF descriptor should explain why it is unavailable");
@@ -271,7 +273,7 @@ mod tests {
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
         assert_eq!(descriptor.builder, CaptureProviderBuilder::Unimplemented);
-        assert_eq!(descriptor.mode, RuntimeMode::Unavailable);
+        assert_eq!(descriptor.capability_mode, RuntimeMode::Unavailable);
         let reason = descriptor
             .reason
             .expect("eBPF descriptor should explain why it is unavailable");
@@ -303,7 +305,7 @@ mod tests {
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
         assert_eq!(descriptor.builder, CaptureProviderBuilder::Unimplemented);
-        assert_eq!(descriptor.mode, RuntimeMode::Unavailable);
+        assert_eq!(descriptor.capability_mode, RuntimeMode::Unavailable);
         let reason = descriptor
             .reason
             .expect("eBPF descriptor should explain why contract preflight failed");
@@ -326,10 +328,11 @@ mod tests {
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
         assert_eq!(descriptor.builder, CaptureProviderBuilder::Ebpf);
-        assert_eq!(descriptor.mode, RuntimeMode::Degraded);
+        assert_eq!(descriptor.capability_mode, RuntimeMode::Degraded);
+        assert_eq!(descriptor.runtime_mode, RuntimeMode::Available);
         let reason = descriptor
-            .reason
-            .expect("eBPF descriptor should explain why capture provider is degraded");
+            .evidence_reason
+            .expect("eBPF descriptor should explain why capture evidence is best-effort");
         assert!(reason.contains("optional SO_COOKIE"));
         assert!(reason.contains("complete kernel traffic capture"));
         assert!(reason.contains("selector-authorized"));
@@ -362,7 +365,7 @@ mod tests {
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
         assert_eq!(descriptor.builder, CaptureProviderBuilder::Ebpf);
-        assert_eq!(descriptor.mode, RuntimeMode::Unavailable);
+        assert_eq!(descriptor.capability_mode, RuntimeMode::Unavailable);
         let reason = descriptor
             .reason
             .expect("eBPF descriptor should explain missing procfs socket attribution");
