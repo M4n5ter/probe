@@ -106,6 +106,71 @@ enabled = true
 }
 
 #[test]
+fn validation_rejects_invalid_capture_event_feed_config() -> Result<(), Box<dyn std::error::Error>>
+{
+    let unused_path = AgentConfig::from_toml_str(
+        r#"
+[capture.capture_event_feed]
+path = "/tmp/capture-events.jsonl"
+"#,
+    )?;
+    let error = unused_path
+        .validate_basic()
+        .expect_err("capture event feed path must belong to the selected backend");
+    assert!(
+        error
+            .to_string()
+            .contains("capture.capture_event_feed.path")
+    );
+
+    let unused_follow = AgentConfig::from_toml_str(
+        r#"
+[capture.capture_event_feed]
+follow = true
+"#,
+    )?;
+    let error = unused_follow
+        .validate_basic()
+        .expect_err("capture event feed follow mode must belong to the selected backend");
+    assert!(
+        error
+            .to_string()
+            .contains("capture.capture_event_feed.follow")
+    );
+
+    let unused_explicit_false_follow = AgentConfig::from_toml_str(
+        r#"
+[capture.capture_event_feed]
+follow = false
+"#,
+    )?;
+    let error = unused_explicit_false_follow
+        .validate_basic()
+        .expect_err("explicit capture event feed follow mode must belong to the selected backend");
+    assert!(
+        error
+            .to_string()
+            .contains("capture.capture_event_feed.follow")
+    );
+
+    let missing_path = AgentConfig::from_toml_str(
+        r#"
+[capture]
+selection = "capture_event_feed"
+"#,
+    )?;
+    let error = missing_path
+        .validate_basic()
+        .expect_err("capture event feed must set a path");
+    assert!(
+        error
+            .to_string()
+            .contains("capture.capture_event_feed.path")
+    );
+    Ok(())
+}
+
+#[test]
 fn validation_ignores_unused_libpcap_fields() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
         r#"

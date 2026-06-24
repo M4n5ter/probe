@@ -10,8 +10,8 @@ mod tls;
 pub use admin::AdminConfig;
 pub use agent::AgentConfig;
 pub use capture::{
-    CaptureBackend, CaptureConfig, CaptureSelection, EbpfCaptureConfig, LibpcapCaptureConfig,
-    LiveCaptureBackend, PlaintextFeedCaptureConfig,
+    CaptureBackend, CaptureConfig, CaptureEventFeedCaptureConfig, CaptureSelection,
+    EbpfCaptureConfig, LibpcapCaptureConfig, LiveCaptureBackend, PlaintextFeedCaptureConfig,
 };
 pub use enforcement::{
     ConnectionEnforcementBackendConfig, DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD,

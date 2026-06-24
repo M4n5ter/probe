@@ -24,30 +24,13 @@ impl CapturePlan {
 
         let selected_provider = candidates
             .iter()
-            .find(|candidate| {
-                candidate.selectable_for(config.capture.selection)
-                    && match config.capture.selection {
-                        CaptureSelection::Replay => candidate.backend == CaptureBackend::Replay,
-                        CaptureSelection::PlaintextFeed => {
-                            candidate.backend == CaptureBackend::PlaintextFeed
-                        }
-                        CaptureSelection::Auto
-                        | CaptureSelection::Ebpf
-                        | CaptureSelection::Libpcap => candidate.live(),
-                    }
-            })
+            .find(|candidate| candidate.selectable_for(config.capture.selection))
             .cloned();
         let selected_backend = selected_provider.as_ref().map(|provider| provider.backend);
         let mode = selected_provider
             .as_ref()
             .map_or(CapturePlanMode::Unavailable, |provider| {
-                if provider.live() {
-                    CapturePlanMode::Live
-                } else if provider.plaintext_feed() {
-                    CapturePlanMode::PlaintextFeed
-                } else {
-                    CapturePlanMode::Replay
-                }
+                provider.plan_mode()
             });
         let reason = selected_backend
             .is_none()
@@ -58,6 +41,9 @@ impl CapturePlan {
                 CaptureSelection::PlaintextFeed => {
                     "plaintext feed capture provider is not available in this build/runtime"
                         .to_string()
+                }
+                CaptureSelection::CaptureEventFeed => {
+                    "capture event feed provider is not available in this build/runtime".to_string()
                 }
                 CaptureSelection::Auto | CaptureSelection::Ebpf | CaptureSelection::Libpcap => {
                     "no live capture provider is available in this build/runtime".to_string()
@@ -81,6 +67,7 @@ impl CapturePlan {
 pub enum CapturePlanMode {
     Live,
     PlaintextFeed,
+    CaptureEventFeed,
     Replay,
     Unavailable,
 }
@@ -146,8 +133,8 @@ impl CaptureProviderDescriptor {
         matches!(self.backend, CaptureBackend::Ebpf | CaptureBackend::Libpcap)
     }
 
-    pub fn plaintext_feed(&self) -> bool {
-        self.backend == CaptureBackend::PlaintextFeed
+    pub fn plan_mode(&self) -> CapturePlanMode {
+        capture_backend_plan_mode(self.backend)
     }
 
     pub fn state(&self) -> CapabilityState {
@@ -177,6 +164,7 @@ impl CaptureProviderDescriptor {
             CaptureSelection::Ebpf
             | CaptureSelection::Libpcap
             | CaptureSelection::PlaintextFeed
+            | CaptureSelection::CaptureEventFeed
             | CaptureSelection::Replay => self.selection_policy.explicit_selectable(self.mode),
         }
     }
@@ -229,6 +217,7 @@ pub enum CaptureProviderBuilder {
     Ebpf,
     Libpcap,
     PlaintextFeed,
+    CaptureEventFeed,
     Unimplemented,
 }
 
@@ -240,6 +229,7 @@ impl CaptureProviderBuilder {
                 | (Self::Ebpf, CaptureBackend::Ebpf)
                 | (Self::Libpcap, CaptureBackend::Libpcap)
                 | (Self::PlaintextFeed, CaptureBackend::PlaintextFeed)
+                | (Self::CaptureEventFeed, CaptureBackend::CaptureEventFeed)
         )
     }
 }
@@ -262,7 +252,17 @@ fn capture_backend_capability(backend: CaptureBackend) -> CapabilityKind {
         CaptureBackend::Ebpf => CapabilityKind::Ebpf,
         CaptureBackend::Libpcap => CapabilityKind::Libpcap,
         CaptureBackend::PlaintextFeed => CapabilityKind::ExternalPlaintextFeed,
+        CaptureBackend::CaptureEventFeed => CapabilityKind::CaptureEventFeed,
         CaptureBackend::Replay => CapabilityKind::ReplayCapture,
+    }
+}
+
+fn capture_backend_plan_mode(backend: CaptureBackend) -> CapturePlanMode {
+    match backend {
+        CaptureBackend::Ebpf | CaptureBackend::Libpcap => CapturePlanMode::Live,
+        CaptureBackend::PlaintextFeed => CapturePlanMode::PlaintextFeed,
+        CaptureBackend::CaptureEventFeed => CapturePlanMode::CaptureEventFeed,
+        CaptureBackend::Replay => CapturePlanMode::Replay,
     }
 }
 
@@ -421,6 +421,30 @@ mod tests {
 
         assert_eq!(plan.mode, CapturePlanMode::PlaintextFeed);
         assert_eq!(plan.selected_backend, Some(CaptureBackend::PlaintextFeed));
+        Ok(())
+    }
+
+    #[test]
+    fn capture_event_feed_resolves_to_feed_mode() -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::CaptureEventFeed,
+                CaptureProviderBuilder::CaptureEventFeed,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::CaptureEventFeed;
+        config.capture.capture_event_feed.path = Some("/tmp/capture-events.jsonl".into());
+
+        let plan = CapturePlan::resolve(&config, &registry);
+
+        assert_eq!(plan.mode, CapturePlanMode::CaptureEventFeed);
+        assert_eq!(
+            plan.selected_backend,
+            Some(CaptureBackend::CaptureEventFeed)
+        );
         Ok(())
     }
 

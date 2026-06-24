@@ -11,6 +11,7 @@ pub struct CaptureConfig {
     pub ebpf: EbpfCaptureConfig,
     pub libpcap: LibpcapCaptureConfig,
     pub plaintext_feed: PlaintextFeedCaptureConfig,
+    pub capture_event_feed: CaptureEventFeedCaptureConfig,
     pub deep_observe_selector: Option<Selector>,
 }
 
@@ -22,6 +23,7 @@ impl Default for CaptureConfig {
             ebpf: EbpfCaptureConfig::default(),
             libpcap: LibpcapCaptureConfig::default(),
             plaintext_feed: PlaintextFeedCaptureConfig::default(),
+            capture_event_feed: CaptureEventFeedCaptureConfig::default(),
             deep_observe_selector: None,
         }
     }
@@ -65,6 +67,19 @@ pub struct PlaintextFeedCaptureConfig {
     pub path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct CaptureEventFeedCaptureConfig {
+    pub path: Option<PathBuf>,
+    pub follow: Option<bool>,
+}
+
+impl CaptureEventFeedCaptureConfig {
+    pub fn follow_enabled(&self) -> bool {
+        self.follow.unwrap_or(false)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureSelection {
@@ -72,6 +87,7 @@ pub enum CaptureSelection {
     Ebpf,
     Libpcap,
     PlaintextFeed,
+    CaptureEventFeed,
     Replay,
 }
 
@@ -82,6 +98,7 @@ impl CaptureSelection {
             Self::Ebpf => Some(CaptureBackend::Ebpf),
             Self::Libpcap => Some(CaptureBackend::Libpcap),
             Self::PlaintextFeed => Some(CaptureBackend::PlaintextFeed),
+            Self::CaptureEventFeed => Some(CaptureBackend::CaptureEventFeed),
             Self::Replay => Some(CaptureBackend::Replay),
         }
     }
@@ -93,6 +110,7 @@ pub enum CaptureBackend {
     Ebpf,
     Libpcap,
     PlaintextFeed,
+    CaptureEventFeed,
     Replay,
 }
 

@@ -1,3 +1,4 @@
+mod capture_event_feed;
 mod libpcap;
 mod plaintext_feed;
 mod selection;
@@ -10,4 +11,5 @@ pub(super) fn validate(capture: &CaptureConfig, violations: &mut Vec<ConfigViola
         libpcap::validate(&capture.libpcap, violations);
     }
     plaintext_feed::validate(capture, violations);
+    capture_event_feed::validate(capture, violations);
 }

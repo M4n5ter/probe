@@ -1,4 +1,4 @@
-use crate::{CaptureConfig, CaptureSelection, ConfigViolation, LiveCaptureBackend};
+use crate::{CaptureBackend, CaptureConfig, CaptureSelection, ConfigViolation, LiveCaptureBackend};
 
 pub(super) fn validate(capture: &CaptureConfig, violations: &mut Vec<ConfigViolation>) {
     if capture.selection == CaptureSelection::Auto && capture.fallback_backends.is_empty() {
@@ -11,13 +11,11 @@ pub(super) fn validate(capture: &CaptureConfig, violations: &mut Vec<ConfigViola
 }
 
 pub(super) fn uses_libpcap(capture: &CaptureConfig) -> bool {
-    match capture.selection {
-        CaptureSelection::Libpcap => true,
-        CaptureSelection::Auto => capture
+    match capture.selection.explicit_backend() {
+        Some(CaptureBackend::Libpcap) => true,
+        Some(_) => false,
+        None => capture
             .fallback_backends
             .contains(&LiveCaptureBackend::Libpcap),
-        CaptureSelection::Ebpf | CaptureSelection::PlaintextFeed | CaptureSelection::Replay => {
-            false
-        }
     }
 }

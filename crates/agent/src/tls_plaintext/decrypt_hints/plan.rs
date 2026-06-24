@@ -79,6 +79,7 @@ impl<'a> TlsSessionSecretAutoBindingPlan<'a> {
         match plan.capture.mode {
             CapturePlanMode::Live => Self::Enabled(materials),
             CapturePlanMode::PlaintextFeed
+            | CapturePlanMode::CaptureEventFeed
             | CapturePlanMode::Replay
             | CapturePlanMode::Unavailable => Self::Disabled,
         }

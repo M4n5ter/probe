@@ -71,6 +71,10 @@ fn default_capture_provider_descriptors(
             CaptureBackend::PlaintextFeed,
             CaptureProviderBuilder::PlaintextFeed,
         ),
+        CaptureProviderDescriptor::available(
+            CaptureBackend::CaptureEventFeed,
+            CaptureProviderBuilder::CaptureEventFeed,
+        ),
         libpcap_provider_descriptor(&libpcap_config_from_agent(config)),
     ]
 }

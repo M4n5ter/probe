@@ -1,5 +1,6 @@
 mod admin_enforcement_reload;
 mod admin_policy_reload;
+mod capture_loss_event_feed;
 mod ebpf_process_loopback;
 mod file_exporter;
 mod gap_plaintext_feed;

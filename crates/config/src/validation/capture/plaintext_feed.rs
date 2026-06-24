@@ -1,8 +1,8 @@
-use crate::{CaptureConfig, CaptureSelection, ConfigViolation};
+use crate::{CaptureBackend, CaptureConfig, ConfigViolation};
 
 pub(super) fn validate(capture: &CaptureConfig, violations: &mut Vec<ConfigViolation>) {
-    match capture.selection {
-        CaptureSelection::PlaintextFeed => {
+    match capture.selection.explicit_backend() {
+        Some(CaptureBackend::PlaintextFeed) => {
             if capture.plaintext_feed.path.is_none() {
                 violations.push(ConfigViolation {
                     field: "capture.plaintext_feed.path".to_string(),
@@ -10,10 +10,7 @@ pub(super) fn validate(capture: &CaptureConfig, violations: &mut Vec<ConfigViola
                 });
             }
         }
-        CaptureSelection::Auto
-        | CaptureSelection::Ebpf
-        | CaptureSelection::Libpcap
-        | CaptureSelection::Replay => {
+        Some(_) | None => {
             if capture.plaintext_feed.path.is_some() {
                 violations.push(ConfigViolation {
                     field: "capture.plaintext_feed.path".to_string(),

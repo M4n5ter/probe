@@ -1,9 +1,10 @@
 use std::{
     fs::File,
-    io::{self, BufRead, BufReader},
+    io::{BufRead, BufReader},
     path::Path,
 };
 
+use crate::json_lines::{JsonLinesEof, JsonLinesRead, JsonLinesReader};
 use capture::{
     CaptureError, CaptureEvent, CapturePoll, CaptureProvider, PlaintextChunk, PlaintextConnection,
     PlaintextEvent, PlaintextGap, PlaintextSource,
@@ -42,10 +43,7 @@ pub fn load_plaintext_feed_provider(
 
 #[derive(Debug)]
 pub struct JsonLinesPlaintextFeedProvider<R> {
-    reader: R,
-    path: String,
-    line_number: usize,
-    line_buffer: String,
+    reader: JsonLinesReader<R>,
 }
 
 impl<R> JsonLinesPlaintextFeedProvider<R>
@@ -54,41 +52,24 @@ where
 {
     fn new(reader: R, path: impl Into<String>) -> Self {
         Self {
-            reader,
-            path: path.into(),
-            line_number: 0,
-            line_buffer: String::new(),
+            reader: JsonLinesReader::new(
+                reader,
+                path,
+                "plaintext feed",
+                MAX_PLAINTEXT_FEED_LINE_BYTES,
+            ),
         }
     }
 
-    fn read_next_event(&mut self) -> Result<Option<PlaintextEvent>, PlaintextFeedReadError> {
-        loop {
-            self.line_buffer.clear();
-            let bytes_read = read_bounded_line(
-                &mut self.reader,
-                &mut self.line_buffer,
-                MAX_PLAINTEXT_FEED_LINE_BYTES,
-            )
-            .map_err(|source| PlaintextFeedReadError::ReadLine {
-                path: self.path.clone(),
-                line: self.line_number.saturating_add(1),
-                source,
-            })?;
-            if bytes_read == 0 {
-                return Ok(None);
-            }
-            self.line_number = self.line_number.saturating_add(1);
-            if self.line_buffer.trim().is_empty() {
-                continue;
-            }
-            let event = serde_json::from_str::<PlaintextFeedJsonEvent>(&self.line_buffer).map_err(
-                |source| PlaintextFeedReadError::InvalidJsonLine {
-                    path: self.path.clone(),
-                    line: self.line_number,
-                    source,
-                },
-            )?;
-            return Ok(Some(event.into()));
+    fn read_next_event(
+        &mut self,
+    ) -> Result<Option<PlaintextEvent>, crate::json_lines::JsonLinesError> {
+        match self
+            .reader
+            .read::<PlaintextFeedJsonEvent>(JsonLinesEof::Finish)?
+        {
+            JsonLinesRead::Item(event) => Ok(Some(event.into())),
+            JsonLinesRead::Idle | JsonLinesRead::Finished => Ok(None),
         }
     }
 }
@@ -117,22 +98,6 @@ where
             })
             .map_err(|error| CaptureError::provider(PROVIDER_NAME, error.to_string()))
     }
-}
-
-#[derive(Debug, Error)]
-enum PlaintextFeedReadError {
-    #[error("failed to read plaintext feed {path}:{line}: {source}")]
-    ReadLine {
-        path: String,
-        line: usize,
-        source: std::io::Error,
-    },
-    #[error("invalid plaintext feed {path}:{line}: {source}")]
-    InvalidJsonLine {
-        path: String,
-        line: usize,
-        source: serde_json::Error,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,48 +378,6 @@ impl From<PlaintextFeedJsonTimestamp> for Timestamp {
             wall_time_unix_ns: value.wall_time_unix_ns,
         }
     }
-}
-
-fn read_bounded_line<R>(reader: &mut R, output: &mut String, max_bytes: usize) -> io::Result<usize>
-where
-    R: BufRead,
-{
-    let mut bytes = Vec::new();
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            break;
-        }
-        let take = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |position| position + 1);
-        if bytes.len().saturating_add(take) > max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("plaintext feed line exceeds {max_bytes} bytes"),
-            ));
-        }
-        let line_ended = available[..take].ends_with(b"\n");
-        bytes.extend_from_slice(&available[..take]);
-        reader.consume(take);
-        if line_ended {
-            break;
-        }
-    }
-
-    if bytes.is_empty() {
-        return Ok(0);
-    }
-
-    let text = String::from_utf8(bytes).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("plaintext feed line is not UTF-8: {error}"),
-        )
-    })?;
-    output.push_str(&text);
-    Ok(output.len())
 }
 
 #[cfg(test)]

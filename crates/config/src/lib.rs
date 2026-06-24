@@ -5,8 +5,8 @@ mod validation;
 
 pub use error::{ConfigError, ConfigValidationError, ConfigViolation};
 pub use model::{
-    AdminConfig, AgentConfig, CaptureBackend, CaptureConfig, CaptureSelection,
-    CompressionCodecName, ConnectionEnforcementBackendConfig,
+    AdminConfig, AgentConfig, CaptureBackend, CaptureConfig, CaptureEventFeedCaptureConfig,
+    CaptureSelection, CompressionCodecName, ConnectionEnforcementBackendConfig,
     DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK, DEFAULT_EXPORT_FAILURE_BACKOFF_INITIAL_MS,
     DEFAULT_EXPORT_FAILURE_BACKOFF_MAX_MS, DEFAULT_EXPORT_FAILURE_BACKOFF_MULTIPLIER,
     DEFAULT_EXPORT_RETENTION_PRUNE_BATCH_LIMIT, DEFAULT_EXPORT_RETENTION_SWEEP_INTERVAL_MS,

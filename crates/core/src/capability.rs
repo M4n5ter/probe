@@ -11,6 +11,7 @@ pub enum CapabilityKind {
     LibsslUprobe,
     TlsSessionSecretRecordDecrypt,
     ExternalPlaintextFeed,
+    CaptureEventFeed,
     Http1,
     Sse,
     #[serde(rename = "websocket_handoff")]
@@ -40,6 +41,7 @@ impl CapabilityKind {
             Self::LibsslUprobe => "libssl_uprobe",
             Self::TlsSessionSecretRecordDecrypt => "tls_session_secret_record_decrypt",
             Self::ExternalPlaintextFeed => "external_plaintext_feed",
+            Self::CaptureEventFeed => "capture_event_feed",
             Self::Http1 => "http1",
             Self::Sse => "sse",
             Self::WebSocketHandoff => "websocket_handoff",
@@ -199,6 +201,7 @@ mod tests {
             CapabilityKind::LibsslUprobe,
             CapabilityKind::TlsSessionSecretRecordDecrypt,
             CapabilityKind::ExternalPlaintextFeed,
+            CapabilityKind::CaptureEventFeed,
             CapabilityKind::Http1,
             CapabilityKind::Sse,
             CapabilityKind::WebSocketHandoff,

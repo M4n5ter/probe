@@ -9,6 +9,7 @@ use probe_core::{CapabilityKind, RuntimeMode, TcpConnection};
 use runtime::{RuntimeError, RuntimePlan};
 
 use crate::{
+    capture_event_feed::load_capture_event_feed_provider,
     capture_registry::libpcap_config_from_agent,
     error::AgentError,
     plaintext_feed::load_plaintext_feed_provider,
@@ -43,6 +44,7 @@ pub(crate) fn build_capture_provider(
 ) -> Result<Box<dyn CaptureProvider>, AgentError> {
     match plan.capture.selected_backend {
         Some(CaptureBackend::PlaintextFeed) => build_plaintext_feed_provider(plan),
+        Some(CaptureBackend::CaptureEventFeed) => build_capture_event_feed_provider(plan),
         _ => build_live_capture_provider(
             plan,
             tls_plaintext_runtime,
@@ -158,6 +160,21 @@ fn build_plaintext_feed_provider(
             )
         })?;
     Ok(Box::new(load_plaintext_feed_provider(path)?))
+}
+
+fn build_capture_event_feed_provider(
+    plan: &RuntimePlan,
+) -> Result<Box<dyn CaptureProvider>, AgentError> {
+    let config = &plan.config.capture.capture_event_feed;
+    let path = config.path.as_ref().ok_or_else(|| {
+        AgentError::UnsupportedRunConfig(
+            "capture_event_feed capture requires capture.capture_event_feed.path".to_string(),
+        )
+    })?;
+    Ok(Box::new(load_capture_event_feed_provider(
+        path,
+        config.follow_enabled(),
+    )?))
 }
 
 fn procfs_tcp_process_resolver_for_plan(plan: &RuntimePlan) -> Option<Box<dyn ProcessResolver>> {

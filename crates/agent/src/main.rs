@@ -1,4 +1,5 @@
 mod admin;
+mod capture_event_feed;
 mod capture_provider;
 mod capture_registry;
 mod check;
@@ -8,6 +9,7 @@ mod configured_policy;
 mod connection_enforcement;
 mod error;
 mod export;
+mod json_lines;
 mod live_agent;
 mod periodic_worker;
 mod plaintext_feed;
