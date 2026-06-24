@@ -418,6 +418,10 @@ mod tests {
                 ingress_records_recovered: 1,
                 ingress_records_processed: 3,
                 export_events_written: 7,
+                capture_loss: pipeline::CaptureLossRuntimeMetricsSnapshot {
+                    events: 2,
+                    lost_events: 11,
+                },
                 policy: pipeline::PolicyRuntimeMetricsSnapshot {
                     evaluations: 2,
                     selector_misses: 1,
@@ -467,6 +471,14 @@ mod tests {
         assert_eq!(
             value["metrics"]["pipeline"]["policy"]["selector_misses"],
             json!(1)
+        );
+        assert_eq!(
+            value["metrics"]["pipeline"]["capture_loss"]["events"],
+            json!(2)
+        );
+        assert_eq!(
+            value["metrics"]["pipeline"]["capture_loss"]["lost_events"],
+            json!(11)
         );
         assert_eq!(
             value["metrics"]["pipeline"]["enforcement"]["dry_run"],

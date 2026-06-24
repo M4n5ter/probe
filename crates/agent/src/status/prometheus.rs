@@ -406,6 +406,31 @@ fn write_pipeline(output: &mut String, snapshot: &AgentStatusSnapshot) {
 
     write_family(
         output,
+        "sssa_pipeline_capture_loss_events_total",
+        "counter",
+        "Provider capture loss events observed by the running pipeline.",
+    );
+    write_sample(
+        output,
+        "sssa_pipeline_capture_loss_events_total",
+        &[],
+        metrics.capture_loss.events,
+    );
+    write_family(
+        output,
+        "sssa_pipeline_capture_lost_events_total",
+        "counter",
+        "Provider-reported capture events lost before the running pipeline could observe them.",
+    );
+    write_sample(
+        output,
+        "sssa_pipeline_capture_lost_events_total",
+        &[],
+        metrics.capture_loss.lost_events,
+    );
+
+    write_family(
+        output,
         "sssa_pipeline_policy_events_total",
         "counter",
         "Policy runtime events by kind.",
@@ -534,6 +559,10 @@ fn escape_label_value(value: &str) -> String {
 mod tests {
     use std::{collections::BTreeMap, path::PathBuf};
 
+    use pipeline::{
+        CaptureLossRuntimeMetricsSnapshot, EnforcementRuntimeMetricsSnapshot,
+        PipelineRuntimeMetricsSnapshot, PolicyRuntimeMetricsSnapshot,
+    };
     use storage::SpoolSnapshot;
 
     use super::super::{
@@ -631,6 +660,48 @@ mod tests {
         assert!(metrics.contains("sssa_transparent_proxy_relays_total{outcome=\"rejected\"} 5\n"));
         assert!(metrics.contains("sssa_transparent_proxy_failures_total{kind=\"relay\"} 7\n"));
         assert!(metrics.contains("sssa_transparent_proxy_failures_total{kind=\"listener\"} 11\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn render_prometheus_metrics_includes_capture_loss_counters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/sssa-spool")),
+            Vec::new(),
+        )?;
+        let snapshot = build_status_snapshot_with_runtime(
+            &plan,
+            SpoolStatusInput::available(
+                PathBuf::from("/tmp/sssa-spool"),
+                SpoolSnapshot {
+                    last_ingress_sequence: 0,
+                    last_export_sequence: 0,
+                },
+                BTreeMap::from([("primary".to_string(), 0)]),
+            ),
+            RuntimeStatusInput {
+                pipeline: Some(PipelineRuntimeMetricsSnapshot {
+                    capture_events_read: 3,
+                    ingress_records_journaled: 3,
+                    ingress_records_recovered: 0,
+                    ingress_records_processed: 3,
+                    export_events_written: 2,
+                    capture_loss: CaptureLossRuntimeMetricsSnapshot {
+                        events: 2,
+                        lost_events: 17,
+                    },
+                    policy: PolicyRuntimeMetricsSnapshot::default(),
+                    enforcement: EnforcementRuntimeMetricsSnapshot::default(),
+                }),
+                ..RuntimeStatusInput::default()
+            },
+        );
+
+        let metrics = render_prometheus_metrics(&snapshot);
+
+        assert!(metrics.contains("sssa_pipeline_capture_loss_events_total 2\n"));
+        assert!(metrics.contains("sssa_pipeline_capture_lost_events_total 17\n"));
         Ok(())
     }
 }

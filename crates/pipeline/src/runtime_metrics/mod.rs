@@ -1,6 +1,6 @@
 mod metrics;
 
 pub use metrics::{
-    EnforcementRuntimeMetricsSnapshot, PipelineRuntimeMetrics, PipelineRuntimeMetricsSnapshot,
-    PolicyRuntimeMetricsSnapshot,
+    CaptureLossRuntimeMetricsSnapshot, EnforcementRuntimeMetricsSnapshot, PipelineRuntimeMetrics,
+    PipelineRuntimeMetricsSnapshot, PolicyRuntimeMetricsSnapshot,
 };

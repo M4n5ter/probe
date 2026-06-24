@@ -18,6 +18,8 @@ struct PipelineRuntimeMetricsInner {
     ingress_records_recovered: AtomicCounter,
     ingress_records_processed: AtomicCounter,
     export_events_written: AtomicCounter,
+    capture_loss_events: AtomicCounter,
+    capture_lost_events: AtomicCounter,
     policy_evaluations: AtomicCounter,
     policy_selector_misses: AtomicCounter,
     policy_alerts: AtomicCounter,
@@ -39,8 +41,15 @@ pub struct PipelineRuntimeMetricsSnapshot {
     pub ingress_records_recovered: u64,
     pub ingress_records_processed: u64,
     pub export_events_written: u64,
+    pub capture_loss: CaptureLossRuntimeMetricsSnapshot,
     pub policy: PolicyRuntimeMetricsSnapshot,
     pub enforcement: EnforcementRuntimeMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct CaptureLossRuntimeMetricsSnapshot {
+    pub events: u64,
+    pub lost_events: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -73,6 +82,10 @@ impl PipelineRuntimeMetrics {
             ingress_records_recovered: self.inner.ingress_records_recovered.load(),
             ingress_records_processed: self.inner.ingress_records_processed.load(),
             export_events_written: self.inner.export_events_written.load(),
+            capture_loss: CaptureLossRuntimeMetricsSnapshot {
+                events: self.inner.capture_loss_events.load(),
+                lost_events: self.inner.capture_lost_events.load(),
+            },
             policy: PolicyRuntimeMetricsSnapshot {
                 evaluations: self.inner.policy_evaluations.load(),
                 selector_misses: self.inner.policy_selector_misses.load(),
@@ -132,6 +145,11 @@ impl PipelineRuntimeMetrics {
 
     pub(crate) fn record_export_event_written(&self) {
         self.inner.export_events_written.increment();
+    }
+
+    pub(crate) fn record_capture_loss(&self, lost_events: u64) {
+        self.inner.capture_loss_events.increment();
+        self.inner.capture_lost_events.add(lost_events);
     }
 
     pub(crate) fn record_policy_evaluation(&self) {
@@ -217,5 +235,18 @@ mod tests {
                 + enforcement.applied
         );
         assert_eq!(enforcement.decisions, 7);
+    }
+
+    #[test]
+    fn capture_loss_sums_events_and_lost_events() {
+        let metrics = PipelineRuntimeMetrics::default();
+
+        metrics.record_capture_loss(2);
+        metrics.record_capture_loss(5);
+
+        let capture_loss = metrics.snapshot().capture_loss;
+
+        assert_eq!(capture_loss.events, 2);
+        assert_eq!(capture_loss.lost_events, 7);
     }
 }

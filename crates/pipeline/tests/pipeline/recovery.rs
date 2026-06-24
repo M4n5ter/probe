@@ -13,8 +13,8 @@ use storage::SpoolPayload;
 use tempfile::tempdir;
 
 use super::fixture::{
-    SequenceProvider, captured_bytes, captured_bytes_with_direction, connection_closed,
-    demo_flow_with_ports, exported_envelopes,
+    SequenceProvider, capture_loss, captured_bytes, captured_bytes_with_direction,
+    connection_closed, demo_flow_with_ports, exported_envelopes,
 };
 
 #[test]
@@ -111,6 +111,27 @@ fn recover_ingress_journal_counts_duplicate_policy_replay_as_evaluation_not_pers
     assert_eq!(snapshot.policy.evaluations, 2);
     assert_eq!(snapshot.policy.alerts, 1);
     assert_eq!(snapshot.export_events_written, 2);
+    Ok(())
+}
+
+#[test]
+fn recover_ingress_journal_does_not_count_capture_loss_as_live_provider_metrics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let event = capture_loss(7);
+    spool.append_ingress(capture_event_payload(&event)?)?;
+    let metrics = PipelineRuntimeMetrics::default();
+
+    let first = recover_without_policy_and_metrics(&spool, metrics.clone())?;
+    let repeated = recover_without_policy_and_metrics(&spool, metrics.clone())?;
+
+    assert_eq!(first.ingress_records_recovered, 1);
+    assert_eq!(first.export_events_written, 1);
+    assert_eq!(repeated.export_events_written, 0);
+    let capture_loss = metrics.snapshot().capture_loss;
+    assert_eq!(capture_loss.events, 0);
+    assert_eq!(capture_loss.lost_events, 0);
     Ok(())
 }
 
@@ -379,8 +400,16 @@ fn capture_event_payload(event: &CaptureEvent) -> Result<SpoolPayload, serde_jso
 }
 
 fn recover_without_policy(spool: &storage::FjallSpool) -> Result<PipelineSummary, PipelineError> {
+    recover_without_policy_and_metrics(spool, PipelineRuntimeMetrics::default())
+}
+
+fn recover_without_policy_and_metrics(
+    spool: &storage::FjallSpool,
+    metrics: PipelineRuntimeMetrics,
+) -> Result<PipelineSummary, PipelineError> {
     let mut parser_factory = Http1ParserFactory::default();
-    let mut pipeline = CapturePipeline::new(spool, &mut parser_factory, Vec::new(), "test");
+    let mut pipeline = CapturePipeline::new(spool, &mut parser_factory, Vec::new(), "test")
+        .with_runtime_metrics(metrics);
     pipeline.recover_ingress_journal_until_idle(16)
 }
 

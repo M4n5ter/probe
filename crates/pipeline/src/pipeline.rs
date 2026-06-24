@@ -351,12 +351,20 @@ where
         capture_event: CaptureEvent,
         summary: &mut PipelineSummary,
     ) -> Result<(), PipelineError> {
+        let capture_lost_events = match &capture_event {
+            CaptureEvent::Loss(loss) => Some(loss.loss.lost_events),
+            _ => None,
+        };
         let ingress_sequence = self.append_capture_event(&capture_event)?;
         summary.ingress_records_journaled = summary.ingress_records_journaled.saturating_add(1);
         if let Some(metrics) = &self.runtime_metrics {
             metrics.record_ingress_record_journaled();
         }
-        self.process_journaled_capture_event(capture_event, ingress_sequence, summary)
+        self.process_journaled_capture_event(capture_event, ingress_sequence, summary)?;
+        if let (Some(metrics), Some(lost_events)) = (&self.runtime_metrics, capture_lost_events) {
+            metrics.record_capture_loss(lost_events);
+        }
+        Ok(())
     }
 
     fn process_journaled_capture_event(

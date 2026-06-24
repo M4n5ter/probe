@@ -1,6 +1,6 @@
 use capture::{PlaintextChunk, PlaintextEventProvider, PlaintextSource, ReplayProvider};
 use parsers::Http1ParserFactory;
-use pipeline::CapturePipeline;
+use pipeline::{CapturePipeline, PipelineRuntimeMetrics};
 use probe_core::{
     CaptureProviderKind, CaptureSource, Direction, EventEmission, EventKind, Timestamp,
 };
@@ -101,7 +101,9 @@ fn capture_loss_writes_degraded_export_without_parser_events()
     let spool = storage::FjallSpool::open(temp.path())?;
     let mut parser_factory = Http1ParserFactory::default();
     let mut provider = SequenceProvider::new(vec![capture_loss(7)]);
-    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
+    let metrics = PipelineRuntimeMetrics::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test")
+        .with_runtime_metrics(metrics.clone());
 
     let summary = pipeline.run_provider(&mut provider)?;
 
@@ -125,5 +127,8 @@ fn capture_loss_writes_degraded_export_without_parser_events()
             .destructive_enforcement_rejection_reason()
             .is_some_and(|reason| reason.contains("lost observations"))
     );
+    let capture_loss = metrics.snapshot().capture_loss;
+    assert_eq!(capture_loss.events, 1);
+    assert_eq!(capture_loss.lost_events, 7);
     Ok(())
 }

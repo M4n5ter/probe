@@ -440,6 +440,14 @@ mod tests {
             json!(1)
         );
         assert_eq!(
+            response["metrics"]["pipeline"]["capture_loss"]["events"],
+            json!(0)
+        );
+        assert_eq!(
+            response["metrics"]["pipeline"]["capture_loss"]["lost_events"],
+            json!(0)
+        );
+        assert_eq!(
             response["metrics"]["transparent_proxy"]["active_relays"],
             json!(0)
         );
@@ -475,6 +483,8 @@ mod tests {
         );
         assert!(metrics.contains("sssa_pipeline_capture_events_read_total 1\n"));
         assert!(metrics.contains("sssa_pipeline_export_events_written_total 1\n"));
+        assert!(metrics.contains("sssa_pipeline_capture_loss_events_total 0\n"));
+        assert!(metrics.contains("sssa_pipeline_capture_lost_events_total 0\n"));
         assert!(metrics.contains("sssa_export_sink_lag{sink=\"primary\"} 1\n"));
         assert!(metrics.contains(
             "sssa_capability_state{capability=\"replay_capture\",mode=\"available\"} 1\n"
