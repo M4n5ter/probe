@@ -6,7 +6,10 @@ use capture::{
 };
 use probe_config::{CaptureBackend, CaptureSelection};
 use probe_core::{CapabilityKind, RuntimeMode, TcpConnection};
-use runtime::{CaptureProviderDescriptor, RuntimeError, RuntimePlan};
+use runtime::{
+    CaptureProviderDescriptor, RuntimeError, RuntimePlan,
+    TransparentInterceptionMitmPlaintextBridgePlan,
+};
 
 use crate::{
     capture_event_feed::load_capture_event_feed_provider,
@@ -37,6 +40,7 @@ impl CaptureProviderPreflight {
     ) -> Result<Self, AgentError> {
         let session_secret_auto_binding =
             build_tls_session_secret_auto_binding_with_runtime(plan, tls_decrypt_hint_runtime)?;
+        preflight_mitm_plaintext_bridge_provider(plan)?;
         Ok(Self {
             session_secret_auto_binding,
         })
@@ -97,6 +101,7 @@ fn build_live_capture_provider(
     let descriptor = outcome.descriptor;
     let primary = session_secret_auto_binding.wrap(outcome.provider);
     let provider = with_tls_plaintext_provider(plan, primary, tls_plaintext_runtime)?;
+    let provider = with_mitm_plaintext_bridge_provider(plan, provider)?;
     Ok(BuiltCaptureProvider {
         provider,
         runtime: CaptureProviderRuntimeSnapshot {
@@ -220,6 +225,32 @@ fn with_tls_plaintext_provider(
             ])))
         }
         TlsPlaintextInstrumentationBuild::Disabled { .. } => Ok(primary),
+    }
+}
+
+fn with_mitm_plaintext_bridge_provider(
+    plan: &RuntimePlan,
+    primary: Box<dyn CaptureProvider>,
+) -> Result<Box<dyn CaptureProvider>, AgentError> {
+    match &plan.enforcement.interception.mitm.plaintext_bridge {
+        TransparentInterceptionMitmPlaintextBridgePlan::Disabled => Ok(primary),
+        TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed { path, follow } => {
+            let bridge = load_capture_event_feed_provider(path, *follow)?;
+            Ok(Box::new(CaptureMultiplexer::from_providers([
+                MultiplexedProvider::required(primary),
+                MultiplexedProvider::best_effort(Box::new(bridge)),
+            ])))
+        }
+    }
+}
+
+fn preflight_mitm_plaintext_bridge_provider(plan: &RuntimePlan) -> Result<(), AgentError> {
+    match &plan.enforcement.interception.mitm.plaintext_bridge {
+        TransparentInterceptionMitmPlaintextBridgePlan::Disabled => Ok(()),
+        TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed { path, follow } => {
+            let _ = load_capture_event_feed_provider(path, *follow)?;
+            Ok(())
+        }
     }
 }
 
@@ -365,11 +396,24 @@ impl EbpfSocketFlowResolver for ProcfsTcpProcessResolver {
 
 #[cfg(test)]
 mod tests {
-    use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
-    use probe_core::{CapabilityKind, CapabilityState};
+    use std::{collections::VecDeque, fs, io::Write, path::PathBuf};
+
+    use capture::{CaptureEvent, CapturePoll, CapturedLoss};
+    use probe_config::{
+        AgentConfig, CaptureBackend, CaptureSelection, TlsMaterialConfig, TlsMaterialKind,
+        TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmPlaintextBridgeModeConfig,
+        TransparentInterceptionStrategyConfig,
+    };
+    use probe_core::{
+        CapabilityKind, CapabilityState, CaptureLoss, CaptureOrigin, CaptureSource, Direction,
+        EnforcementEvidence, EnforcementMode, ProcessSelector, Selector, Timestamp,
+        TrafficSelector,
+    };
     use runtime::{
         CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
     };
+    use tempfile::{NamedTempFile, tempdir};
 
     use super::*;
 
@@ -424,6 +468,92 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn mitm_plaintext_bridge_fans_capture_event_feed_into_live_provider()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bridge_file = NamedTempFile::new()?;
+        let bridge_path = bridge_file.path().to_path_buf();
+        fs::write(
+            &bridge_path,
+            format!("{}\n", serde_json::to_string(&loss_event("mitm bridge"))?),
+        )?;
+        let mut plan = plan_with_mitm_plaintext_bridge(bridge_path)?;
+        set_mitm_plaintext_bridge_follow(&mut plan, false);
+        let primary = Box::new(VecProvider::new([loss_event("primary")]));
+
+        let mut provider = with_mitm_plaintext_bridge_provider(&plan, primary)?;
+
+        assert_loss_reason(provider.next()?, "primary");
+        assert_loss_reason(provider.next()?, "mitm bridge");
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn mitm_plaintext_bridge_defaults_to_follow_live_feed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let bridge_file = NamedTempFile::new()?;
+        let bridge_path = bridge_file.path().to_path_buf();
+        let mut plan = plan_with_mitm_plaintext_bridge(bridge_path.clone())?;
+        let TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed { follow, .. } =
+            &mut plan.enforcement.interception.mitm.plaintext_bridge
+        else {
+            panic!("expected capture-event MITM bridge plan");
+        };
+        assert!(*follow);
+        let primary = Box::new(VecProvider::new([]));
+
+        let mut provider = with_mitm_plaintext_bridge_provider(&plan, primary)?;
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Idle));
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&bridge_path)?
+            .write_all(
+                format!("{}\n", serde_json::to_string(&loss_event("late mitm"))?).as_bytes(),
+            )?;
+        assert_loss_reason(provider.next()?, "late mitm");
+        Ok(())
+    }
+
+    #[test]
+    fn mitm_plaintext_bridge_missing_file_fails_during_capture_preflight()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let bridge_path = tempdir
+            .path()
+            .join("missing-mitm-bridge-capture-events.jsonl");
+        let plan = plan_with_mitm_plaintext_bridge(bridge_path.clone())?;
+
+        let error = match CaptureProviderPreflight::build(&plan, None) {
+            Ok(_) => panic!("missing MITM plaintext bridge feed must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to open capture event feed")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&bridge_path.display().to_string())
+        );
+        Ok(())
+    }
+
+    fn set_mitm_plaintext_bridge_follow(plan: &mut RuntimePlan, follow: bool) {
+        let TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed {
+            follow: planned_follow,
+            ..
+        } = &mut plan.enforcement.interception.mitm.plaintext_bridge
+        else {
+            panic!("expected capture-event MITM bridge plan");
+        };
+        *planned_follow = follow;
+    }
+
     fn auto_plan_with_degraded_ebpf_and_available_libpcap()
     -> Result<RuntimePlan, runtime::RuntimeError> {
         plan_with_registry(AgentConfig::default())
@@ -449,6 +579,66 @@ mod tests {
         )
     }
 
+    fn plan_with_mitm_plaintext_bridge(
+        bridge_path: PathBuf,
+    ) -> Result<RuntimePlan, runtime::RuntimeError> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::External;
+        config
+            .enforcement
+            .interception
+            .mitm
+            .backend_readiness_probe
+            .target = Some("127.0.0.1:15002".to_string());
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path = Some(bridge_path);
+        config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
+        config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        config.tls.materials = vec![
+            TlsMaterialConfig {
+                id: Some("mitm-ca".to_string()),
+                kind: TlsMaterialKind::MitmCaCertificate,
+                path: "/etc/sssa/mitm-ca.pem".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("mitm-ca-key".to_string()),
+                kind: TlsMaterialKind::MitmCaPrivateKey,
+                path: "/etc/sssa/mitm-ca.key".into(),
+            },
+        ];
+        RuntimePlan::build(
+            config,
+            &ProviderRegistry::new(
+                vec![
+                    CaptureProviderDescriptor::available(
+                        CaptureBackend::Libpcap,
+                        CaptureProviderBuilder::Libpcap,
+                    ),
+                    CaptureProviderDescriptor::available(
+                        CaptureBackend::CaptureEventFeed,
+                        CaptureProviderBuilder::CaptureEventFeed,
+                    ),
+                ],
+                mitm_bridge_platform_capabilities(),
+            ),
+        )
+    }
+
     fn test_platform_capabilities() -> Vec<CapabilityState> {
         vec![
             CapabilityState::available(CapabilityKind::Http1),
@@ -459,5 +649,66 @@ mod tests {
             CapabilityState::available(CapabilityKind::DryRunEnforcement),
             CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
         ]
+    }
+
+    fn mitm_bridge_platform_capabilities() -> Vec<CapabilityState> {
+        let mut capabilities = test_platform_capabilities();
+        capabilities.push(CapabilityState::available(
+            CapabilityKind::TransparentInterception,
+        ));
+        capabilities.push(CapabilityState::available(CapabilityKind::L7Mitm));
+        capabilities
+    }
+
+    struct VecProvider {
+        events: VecDeque<CaptureEvent>,
+    }
+
+    impl VecProvider {
+        fn new(events: impl IntoIterator<Item = CaptureEvent>) -> Self {
+            Self {
+                events: events.into_iter().collect(),
+            }
+        }
+    }
+
+    impl CaptureProvider for VecProvider {
+        fn name(&self) -> &'static str {
+            "test_primary"
+        }
+
+        fn capabilities(&self) -> Vec<CapabilityState> {
+            Vec::new()
+        }
+
+        fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(self
+                .events
+                .pop_front()
+                .map(CapturePoll::event)
+                .unwrap_or(CapturePoll::Finished))
+        }
+    }
+
+    fn loss_event(reason: &str) -> CaptureEvent {
+        CaptureEvent::Loss(CapturedLoss {
+            timestamp: Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            origin: CaptureOrigin::from_source(CaptureSource::ExternalPlaintextFeed),
+            enforcement_evidence: EnforcementEvidence::default(),
+            loss: CaptureLoss {
+                lost_events: 1,
+                reason: reason.to_string(),
+            },
+        })
+    }
+
+    fn assert_loss_reason(event: Option<CaptureEvent>, reason: &str) {
+        let Some(CaptureEvent::Loss(loss)) = event else {
+            panic!("expected capture loss event, got {event:?}");
+        };
+        assert_eq!(loss.loss.reason, reason);
     }
 }

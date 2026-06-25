@@ -145,13 +145,16 @@ mod tests {
 
     use probe_config::{
         CaptureSelection, TlsMaterialConfig, TlsMaterialKind,
-        TransparentInterceptionMitmBackendConfig, TransparentInterceptionStrategyConfig,
+        TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmPlaintextBridgeModeConfig,
+        TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
         CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector, RuntimeMode,
         Selector, TrafficSelector,
     };
     use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, PlatformProbeResults};
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -257,6 +260,35 @@ mod tests {
     }
 
     #[test]
+    fn missing_external_mitm_plaintext_bridge_reports_l7_mitm_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let mut config = AgentConfig::default();
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        let target = listener.local_addr()?;
+        config.enforcement.interception.proxy.listen_port = Some(target.port());
+        configure_external_mitm_backend(&mut config, target);
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path = Some(missing_bridge_path()?);
+
+        let capabilities = capability_matrix_for_config(&config);
+        let l7_mitm = capabilities
+            .reported_state(CapabilityKind::L7Mitm)
+            .expect("L7 MITM capability should be reported");
+
+        assert_eq!(l7_mitm.mode, RuntimeMode::Unavailable);
+        assert!(
+            l7_mitm.reason.as_deref().is_some_and(
+                |reason| reason.contains("plaintext bridge capture-event feed is not openable")
+            ),
+            "{l7_mitm:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn invalid_external_mitm_contract_reports_l7_mitm_unavailable() {
         let mut config = AgentConfig::default();
         config.enforcement.interception.strategy =
@@ -356,5 +388,9 @@ mod tests {
                 path: "/etc/sssa/mitm-ca.key".into(),
             },
         ];
+    }
+
+    fn missing_bridge_path() -> Result<std::path::PathBuf, std::io::Error> {
+        Ok(tempdir()?.path().join("missing-mitm-bridge.jsonl"))
     }
 }

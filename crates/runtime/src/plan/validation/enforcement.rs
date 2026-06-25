@@ -1,5 +1,5 @@
 use probe_config::{AgentConfig, ConfigViolation};
-use probe_core::EnforcementMode;
+use probe_core::{CapabilityKind, EnforcementMode};
 
 use crate::plan::{
     capture::{CapturePlan, CapturePlanMode},
@@ -118,15 +118,22 @@ fn enforcement_capability_checks(config: &AgentConfig) -> Vec<EnforcementCapabil
             requirement,
         });
     }
-    for requirement in EnforcementCapabilityPlan::requirements_for_interception_strategy(
-        config.enforcement.interception.strategy,
+    for requirement in EnforcementCapabilityPlan::requirements_for_interception_config(
+        &config.enforcement.interception,
     ) {
         checks.push(EnforcementCapabilityCheck {
-            field: "enforcement.interception.strategy",
+            field: interception_capability_field(requirement.capability),
             requirement,
         });
     }
     checks
+}
+
+fn interception_capability_field(capability: CapabilityKind) -> &'static str {
+    match capability {
+        CapabilityKind::CaptureEventFeed => "enforcement.interception.mitm.plaintext_bridge.mode",
+        _ => "enforcement.interception.strategy",
+    }
 }
 
 struct EnforcementCapabilityCheck {
@@ -140,6 +147,7 @@ mod tests {
         CaptureBackend, CaptureSelection, CompressionCodecName, ConfigValidationError,
         ConnectionEnforcementBackendConfig, ExporterConfig, ExporterTransportConfig,
         TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
         TransparentInterceptionStrategyConfig,
     };
@@ -425,6 +433,48 @@ mod tests {
         let error = validation_error(config, &registry);
 
         assert_violation(&error, "enforcement.interception.strategy", "L7 MITM");
+    }
+
+    #[test]
+    fn mitm_plaintext_bridge_requires_capture_event_feed_capability() {
+        let capabilities = transparent_interception_capabilities()
+            .into_iter()
+            .map(|state| {
+                if state.kind == CapabilityKind::L7Mitm {
+                    CapabilityState::available(CapabilityKind::L7Mitm)
+                } else {
+                    state
+                }
+            })
+            .collect::<Vec<_>>();
+        let registry = ProviderRegistry::new(vec![live_capture_provider()], capabilities);
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_external_mitm_backend(&mut config);
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path =
+            Some("/run/sssa/mitm-capture-events.jsonl".into());
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(
+            &error,
+            "enforcement.interception.mitm.plaintext_bridge.mode",
+            "capture-event feed provider",
+        );
     }
 
     #[test]

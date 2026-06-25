@@ -1,6 +1,7 @@
 use std::{
     net::{IpAddr, SocketAddr},
     num::NonZeroU16,
+    path::PathBuf,
 };
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,7 @@ pub const MAX_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS: u64 = 5_000;
 pub struct TransparentInterceptionMitmConfig {
     pub backend: TransparentInterceptionMitmBackendConfig,
     pub backend_readiness_probe: TransparentInterceptionMitmBackendReadinessProbeConfig,
+    pub plaintext_bridge: TransparentInterceptionMitmPlaintextBridgeConfig,
     pub ca_certificate_ref: Option<String>,
     pub ca_private_key_ref: Option<String>,
     pub leaf_certificate_chain_refs: Vec<String>,
@@ -30,6 +32,7 @@ impl TransparentInterceptionMitmConfig {
     pub fn is_configured(&self) -> bool {
         self.backend != TransparentInterceptionMitmBackendConfig::None
             || self.backend_readiness_probe.is_configured()
+            || self.plaintext_bridge.is_configured()
             || self.ca_certificate_ref.is_some()
             || self.ca_private_key_ref.is_some()
             || !self.leaf_certificate_chain_refs.is_empty()
@@ -77,6 +80,34 @@ pub enum TransparentInterceptionMitmBackendConfig {
     External,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransparentInterceptionMitmPlaintextBridgeConfig {
+    pub mode: TransparentInterceptionMitmPlaintextBridgeModeConfig,
+    pub path: Option<PathBuf>,
+    pub follow: Option<bool>,
+}
+
+impl TransparentInterceptionMitmPlaintextBridgeConfig {
+    pub fn is_configured(&self) -> bool {
+        self.mode != TransparentInterceptionMitmPlaintextBridgeModeConfig::None
+            || self.path.is_some()
+            || self.follow.is_some()
+    }
+
+    pub fn follow_enabled(&self) -> bool {
+        self.follow.unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparentInterceptionMitmPlaintextBridgeModeConfig {
+    #[default]
+    None,
+    CaptureEventFeed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransparentInterceptionMitmBackendIntent {
     Disabled,
@@ -88,6 +119,12 @@ pub enum TransparentInterceptionMitmBackendIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransparentInterceptionMitmBackendReadinessProbeIntent {
     TcpConnect { target: SocketAddr, timeout_ms: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransparentInterceptionMitmPlaintextBridgeIntent {
+    Disabled,
+    CaptureEventFeed { path: PathBuf, follow: bool },
 }
 
 pub type TransparentInterceptionMitmIntentViolation = TransparentInterceptionIntentViolation;
@@ -125,6 +162,24 @@ impl EnforcementInterceptionConfig {
                 "external MITM backend readiness probe should be present when validation succeeds",
             ),
         })
+    }
+
+    pub fn mitm_plaintext_bridge_intent(
+        &self,
+    ) -> Result<
+        TransparentInterceptionMitmPlaintextBridgeIntent,
+        Vec<TransparentInterceptionMitmIntentViolation>,
+    > {
+        if !self.strategy.is_mitm() {
+            return Ok(TransparentInterceptionMitmPlaintextBridgeIntent::Disabled);
+        }
+
+        let mut violations = Vec::new();
+        let intent = validate_mitm_plaintext_bridge(&self.mitm.plaintext_bridge, &mut violations);
+        if !violations.is_empty() {
+            return Err(violations);
+        }
+        Ok(intent)
     }
 }
 
@@ -207,6 +262,48 @@ fn validate_mitm_backend_readiness_probe_timeout(
                 "external MITM backend readiness probe timeout must be between {MIN_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS} and {MAX_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS}"
             ),
         ));
+    }
+}
+
+fn validate_mitm_plaintext_bridge(
+    bridge: &TransparentInterceptionMitmPlaintextBridgeConfig,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) -> TransparentInterceptionMitmPlaintextBridgeIntent {
+    match bridge.mode {
+        TransparentInterceptionMitmPlaintextBridgeModeConfig::None => {
+            if bridge.path.is_some() {
+                violations.push(intent_violation(
+                    "enforcement.interception.mitm.plaintext_bridge.path",
+                    "MITM plaintext bridge path requires plaintext_bridge.mode = \"capture_event_feed\"",
+                ));
+            }
+            if bridge.follow.is_some() {
+                violations.push(intent_violation(
+                    "enforcement.interception.mitm.plaintext_bridge.follow",
+                    "MITM plaintext bridge follow mode requires plaintext_bridge.mode = \"capture_event_feed\"",
+                ));
+            }
+            TransparentInterceptionMitmPlaintextBridgeIntent::Disabled
+        }
+        TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed => {
+            let Some(path) = &bridge.path else {
+                violations.push(intent_violation(
+                    "enforcement.interception.mitm.plaintext_bridge.path",
+                    "capture-event MITM plaintext bridge requires a JSON-lines capture event path",
+                ));
+                return TransparentInterceptionMitmPlaintextBridgeIntent::Disabled;
+            };
+            if path.as_os_str().is_empty() {
+                violations.push(intent_violation(
+                    "enforcement.interception.mitm.plaintext_bridge.path",
+                    "capture-event MITM plaintext bridge path must not be empty",
+                ));
+            }
+            TransparentInterceptionMitmPlaintextBridgeIntent::CaptureEventFeed {
+                path: path.clone(),
+                follow: bridge.follow_enabled(),
+            }
+        }
     }
 }
 

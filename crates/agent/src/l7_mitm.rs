@@ -7,8 +7,11 @@ use std::{
 use probe_config::{
     AgentConfig, TransparentInterceptionMitmBackendIntent,
     TransparentInterceptionMitmBackendReadinessProbeIntent,
+    TransparentInterceptionMitmPlaintextBridgeIntent,
 };
 use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
+
+use crate::capture_event_feed::load_capture_event_feed_provider;
 
 pub(crate) struct L7MitmRuntime {
     capability: CapabilityState,
@@ -36,6 +39,9 @@ fn resolve_with_probe(
     }
     if let Err(error) = config.validate_l7_mitm_contract() {
         return unavailable(format!("L7 MITM backend contract is invalid: {error}"));
+    }
+    if let Err(error) = probe_plaintext_bridge(config) {
+        return unavailable(error);
     }
     if let Err(error) = probe_external_backend(config, tcp_probe) {
         return unavailable(error);
@@ -84,6 +90,32 @@ fn probe_external_backend(
     Ok(())
 }
 
+fn probe_plaintext_bridge(config: &AgentConfig) -> Result<(), String> {
+    let bridge = config
+        .enforcement
+        .interception
+        .mitm_plaintext_bridge_intent()
+        .map_err(|violations| {
+            violations
+                .into_iter()
+                .map(|violation| format!("{}: {}", violation.field(), violation.reason()))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })?;
+    match bridge {
+        TransparentInterceptionMitmPlaintextBridgeIntent::Disabled => Ok(()),
+        TransparentInterceptionMitmPlaintextBridgeIntent::CaptureEventFeed { path, follow } => {
+            let _ = load_capture_event_feed_provider(&path, follow).map_err(|error| {
+                format!(
+                    "external L7 MITM plaintext bridge capture-event feed is not openable at {}: {error}",
+                    path.display()
+                )
+            })?;
+            Ok(())
+        }
+    }
+}
+
 fn unavailable(reason: impl Into<String>) -> L7MitmRuntime {
     L7MitmRuntime {
         capability: CapabilityState::unavailable(CapabilityKind::L7Mitm, reason),
@@ -96,9 +128,11 @@ mod tests {
 
     use probe_config::{
         AgentConfig, TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionStrategyConfig,
     };
     use probe_core::RuntimeMode;
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -119,6 +153,27 @@ mod tests {
                 .is_some_and(|reason| reason.contains("readiness probe failed")),
             "{capability:?}"
         );
+    }
+
+    #[test]
+    fn missing_plaintext_bridge_reports_l7_mitm_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = external_mitm_config("127.0.0.1:15002");
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path = Some(missing_bridge_path()?);
+
+        let runtime = resolve_with_probe(&config, |_target, _timeout| Ok(()));
+
+        let capability = runtime.capability();
+        assert_eq!(capability.mode, RuntimeMode::Unavailable);
+        assert!(
+            capability.reason.as_deref().is_some_and(
+                |reason| reason.contains("plaintext bridge capture-event feed is not openable")
+            ),
+            "{capability:?}"
+        );
+        Ok(())
     }
 
     fn external_mitm_config(target: &str) -> AgentConfig {
@@ -152,5 +207,9 @@ mod tests {
             },
         ];
         config
+    }
+
+    fn missing_bridge_path() -> Result<std::path::PathBuf, std::io::Error> {
+        Ok(tempdir()?.path().join("missing-mitm-bridge.jsonl"))
     }
 }

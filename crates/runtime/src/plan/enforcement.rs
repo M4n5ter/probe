@@ -6,7 +6,8 @@ use probe_config::{
     TransparentInterceptionL7ModeConfig, TransparentInterceptionMitmBackendConfig,
     TransparentInterceptionMitmBackendIntent,
     TransparentInterceptionMitmBackendReadinessProbeIntent,
-    TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
+    TransparentInterceptionMitmPlaintextBridgeIntent, TransparentInterceptionOutboundProxyIntent,
+    TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent,
     TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
     TransparentInterceptionProxyIntentViolation, TransparentInterceptionProxyModeConfig,
@@ -135,8 +136,8 @@ impl EnforcementInterceptionPlan {
             classification: TransparentInterceptionClassificationPlan::from_capabilities(
                 capabilities,
             ),
-            capabilities: EnforcementCapabilityPlan::from_interception_strategy(
-                strategy,
+            capabilities: EnforcementCapabilityPlan::from_interception_config(
+                &config.enforcement.interception,
                 capabilities,
             ),
             selector_configured: config.enforcement.interception.selector.is_some(),
@@ -292,6 +293,7 @@ impl TransparentInterceptionExecutionPlan {
 pub struct TransparentInterceptionMitmPlan {
     pub backend: TransparentInterceptionMitmBackendConfig,
     pub backend_readiness_probe: TransparentInterceptionMitmBackendReadinessProbePlan,
+    pub plaintext_bridge: TransparentInterceptionMitmPlaintextBridgePlan,
     pub ca_certificate: Option<TlsMaterialPlan>,
     pub ca_private_key: Option<TlsMaterialPlan>,
     pub leaf_certificate_chain: Vec<TlsMaterialPlan>,
@@ -313,6 +315,13 @@ impl TransparentInterceptionMitmPlan {
                         .mitm_backend_intent()
                         .expect("MITM backend contract should be validated before planning"),
                 ),
+            plaintext_bridge: TransparentInterceptionMitmPlaintextBridgePlan::from_intent(
+                config
+                    .enforcement
+                    .interception
+                    .mitm_plaintext_bridge_intent()
+                    .expect("MITM plaintext bridge contract should be validated before planning"),
+            ),
             ca_certificate: mitm.ca_certificate_ref.as_deref().and_then(|reference| {
                 mitm_tls_material_from_ref(
                     reference,
@@ -366,6 +375,24 @@ impl TransparentInterceptionMitmBackendReadinessProbePlan {
                         timeout_ms,
                     } => Self::TcpConnect { target, timeout_ms },
                 }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum TransparentInterceptionMitmPlaintextBridgePlan {
+    Disabled,
+    CaptureEventFeed { path: PathBuf, follow: bool },
+}
+
+impl TransparentInterceptionMitmPlaintextBridgePlan {
+    fn from_intent(intent: TransparentInterceptionMitmPlaintextBridgeIntent) -> Self {
+        match intent {
+            TransparentInterceptionMitmPlaintextBridgeIntent::Disabled => Self::Disabled,
+            TransparentInterceptionMitmPlaintextBridgeIntent::CaptureEventFeed { path, follow } => {
+                Self::CaptureEventFeed { path, follow }
             }
         }
     }
@@ -649,6 +676,22 @@ impl EnforcementCapabilityPlan {
         requirements
     }
 
+    pub(super) fn requirements_for_interception_config(
+        config: &EnforcementInterceptionConfig,
+    ) -> Vec<EnforcementCapabilityRequirement> {
+        let mut requirements = Self::requirements_for_interception_strategy(config.strategy);
+        if matches!(
+            config.mitm_plaintext_bridge_intent(),
+            Ok(TransparentInterceptionMitmPlaintextBridgeIntent::CaptureEventFeed { .. })
+        ) {
+            requirements.push(EnforcementCapabilityRequirement {
+                capability: CapabilityKind::CaptureEventFeed,
+                unavailable_reason: "MITM plaintext bridge requires the capture-event feed provider",
+            });
+        }
+        requirements
+    }
+
     fn from_mode(mode: EnforcementMode, capabilities: &CapabilityMatrix) -> Self {
         Self::requirement_for_mode(mode).map_or(Self::NotRequired, |requirement| {
             Self::required(
@@ -674,11 +717,11 @@ impl EnforcementCapabilityPlan {
         })
     }
 
-    fn from_interception_strategy(
-        strategy: TransparentInterceptionStrategyConfig,
+    fn from_interception_config(
+        config: &EnforcementInterceptionConfig,
         capabilities: &CapabilityMatrix,
     ) -> Vec<RequiredCapabilityPlan> {
-        Self::requirements_for_interception_strategy(strategy)
+        Self::requirements_for_interception_config(config)
             .into_iter()
             .map(|requirement| RequiredCapabilityPlan::from_requirement(requirement, capabilities))
             .collect()
@@ -740,7 +783,9 @@ mod tests {
 
     use probe_config::{
         AgentConfig, ConnectionEnforcementBackendConfig, TlsMaterialConfig, TlsMaterialKind,
-        TransparentInterceptionMitmBackendConfig, TransparentInterceptionStrategyConfig,
+        TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmPlaintextBridgeModeConfig,
+        TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
         CapabilityMatrix, CapabilityState, Direction, ProcessSelector, Selector, TrafficSelector,
@@ -1031,6 +1076,10 @@ mod tests {
             }
         );
         assert_eq!(
+            plan.interception.mitm.plaintext_bridge,
+            TransparentInterceptionMitmPlaintextBridgePlan::Disabled
+        );
+        assert_eq!(
             plan.interception
                 .mitm
                 .ca_certificate
@@ -1050,6 +1099,94 @@ mod tests {
             plan.interception.execution.outbound_redirect_plan(),
             TransparentInterceptionOutboundRedirectPlan::Planned { .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn enforcement_plan_reports_external_mitm_plaintext_bridge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_external_mitm_backend(&mut config);
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path =
+            Some("/run/sssa/mitm-capture-events.jsonl".into());
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let capabilities = CapabilityMatrix::new([
+            CapabilityState::available(CapabilityKind::TransparentInterception),
+            CapabilityState::available(CapabilityKind::L7Mitm),
+            CapabilityState::available(CapabilityKind::CaptureEventFeed),
+        ]);
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        assert_eq!(
+            plan.interception.capabilities,
+            vec![
+                RequiredCapabilityPlan {
+                    capability: CapabilityKind::TransparentInterception,
+                    mode: RuntimeMode::Available,
+                },
+                RequiredCapabilityPlan {
+                    capability: CapabilityKind::L7Mitm,
+                    mode: RuntimeMode::Available,
+                },
+                RequiredCapabilityPlan {
+                    capability: CapabilityKind::CaptureEventFeed,
+                    mode: RuntimeMode::Available,
+                },
+            ]
+        );
+        assert_eq!(
+            plan.interception.mitm.plaintext_bridge,
+            TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed {
+                path: "/run/sssa/mitm-capture-events.jsonl".into(),
+                follow: true,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enforcement_plan_preserves_explicit_finite_mitm_plaintext_bridge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_external_mitm_backend(&mut config);
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path =
+            Some("/run/sssa/finite-mitm-capture-events.jsonl".into());
+        config.enforcement.interception.mitm.plaintext_bridge.follow = Some(false);
+        let capabilities = CapabilityMatrix::new([
+            CapabilityState::available(CapabilityKind::TransparentInterception),
+            CapabilityState::available(CapabilityKind::L7Mitm),
+            CapabilityState::available(CapabilityKind::CaptureEventFeed),
+        ]);
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        assert_eq!(
+            plan.interception.mitm.plaintext_bridge,
+            TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed {
+                path: "/run/sssa/finite-mitm-capture-events.jsonl".into(),
+                follow: false,
+            }
+        );
         Ok(())
     }
 

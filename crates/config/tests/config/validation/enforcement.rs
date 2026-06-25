@@ -184,6 +184,59 @@ path = "/etc/sssa/upstream-ca.pem"
 }
 
 #[test]
+fn validation_accepts_external_mitm_plaintext_bridge() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(&external_mitm_bridge_fixture(
+        r#"
+[enforcement.interception.mitm.plaintext_bridge]
+mode = "capture_event_feed"
+path = "/run/sssa/mitm-capture-events.jsonl"
+follow = true
+"#,
+    ))?;
+
+    config.validate_basic()?;
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_incomplete_external_mitm_plaintext_bridge()
+-> Result<(), Box<dyn std::error::Error>> {
+    let missing_path = AgentConfig::from_toml_str(&external_mitm_bridge_fixture(
+        r#"
+[enforcement.interception.mitm.plaintext_bridge]
+mode = "capture_event_feed"
+"#,
+    ))?;
+    let error = missing_path
+        .validate_basic()
+        .expect_err("capture-event MITM plaintext bridge must have a path");
+    let violations = validation_violations(&error);
+
+    assert!(violations.iter().any(|violation| {
+        violation.field == "enforcement.interception.mitm.plaintext_bridge.path"
+            && violation
+                .reason
+                .contains("requires a JSON-lines capture event path")
+    }));
+
+    let path_without_mode = AgentConfig::from_toml_str(&external_mitm_bridge_fixture(
+        r#"
+[enforcement.interception.mitm.plaintext_bridge]
+path = "/run/sssa/mitm-capture-events.jsonl"
+"#,
+    ))?;
+    let error = path_without_mode
+        .validate_basic()
+        .expect_err("MITM plaintext bridge path must require explicit mode");
+    let violations = validation_violations(&error);
+
+    assert!(violations.iter().any(|violation| violation.field
+        == "enforcement.interception.mitm.plaintext_bridge.path"
+        && violation.reason.contains("plaintext_bridge.mode")));
+    Ok(())
+}
+
+#[test]
 fn validation_rejects_external_mitm_without_readiness_target()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
@@ -471,4 +524,37 @@ fn validation_violations(error: &ConfigError) -> &[ConfigViolation] {
         panic!("expected validation error, got {error}");
     };
     error.violations()
+}
+
+fn external_mitm_bridge_fixture(bridge: &str) -> String {
+    format!(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+backend = "external"
+ca_certificate_ref = "mitm-ca"
+ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.backend_readiness_probe]
+target = "127.0.0.1:15002"
+
+{bridge}
+
+[[tls.materials]]
+id = "mitm-ca"
+kind = "mitm_ca_certificate"
+path = "/etc/sssa/mitm-ca.pem"
+
+[[tls.materials]]
+id = "mitm-ca-key"
+kind = "mitm_ca_private_key"
+path = "/etc/sssa/mitm-ca.key"
+"#
+    )
 }

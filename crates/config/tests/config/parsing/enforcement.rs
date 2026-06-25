@@ -233,6 +233,41 @@ path = "/etc/sssa/upstream-ca.pem"
 }
 
 #[test]
+fn parses_external_mitm_plaintext_bridge() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.mitm.plaintext_bridge]
+mode = "capture_event_feed"
+path = "/run/sssa/mitm-capture-events.jsonl"
+follow = true
+"#,
+    )?;
+
+    assert_eq!(
+        config.enforcement.interception.mitm.plaintext_bridge.mode,
+        TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed
+    );
+    assert_eq!(
+        config
+            .enforcement
+            .interception
+            .mitm
+            .plaintext_bridge
+            .path
+            .as_deref(),
+        Some(std::path::Path::new("/run/sssa/mitm-capture-events.jsonl"))
+    );
+    assert_eq!(
+        config.enforcement.interception.mitm.plaintext_bridge.follow,
+        Some(true)
+    );
+    Ok(())
+}
+
+#[test]
 fn parses_external_outbound_proxy_self_bypass_contract() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
         r#"

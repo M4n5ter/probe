@@ -14,7 +14,9 @@ pub use mitm::{
     TransparentInterceptionMitmBackendIntent,
     TransparentInterceptionMitmBackendReadinessProbeConfig,
     TransparentInterceptionMitmBackendReadinessProbeIntent, TransparentInterceptionMitmConfig,
-    TransparentInterceptionMitmIntentViolation,
+    TransparentInterceptionMitmIntentViolation, TransparentInterceptionMitmPlaintextBridgeConfig,
+    TransparentInterceptionMitmPlaintextBridgeIntent,
+    TransparentInterceptionMitmPlaintextBridgeModeConfig,
 };
 pub use policy::{
     EnforcementPolicyConfig, EnforcementPolicyManifest, EnforcementPolicySourceConfig,
