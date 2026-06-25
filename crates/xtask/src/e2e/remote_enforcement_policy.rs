@@ -99,6 +99,7 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     config.enforcement.selector = Some(config_selector());
     config.enforcement.policy.source = EnforcementPolicySourceConfig::Remote {
         endpoint: manifest_server.endpoint(),
+        max_body_bytes: None,
     };
     fs::write(&config_path, toml::to_string(&config)?)?;
 

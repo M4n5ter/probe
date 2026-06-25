@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use ::enforcement::EnforcementBackend;
 use probe_config::{ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig};
 use probe_core::EnforcementMode;
@@ -12,8 +10,7 @@ use runtime::{
 use serde::Serialize;
 
 use crate::configured_enforcement::{
-    LoadedEnforcementPolicySource, LoadedEnforcementPolicySourceOriginRef,
-    build_configured_enforcement_check_with_backend,
+    LoadedEnforcementPolicySourceSnapshot, build_configured_enforcement_check_with_backend,
 };
 
 use super::report::CheckError;
@@ -78,13 +75,6 @@ pub struct LoadedEnforcementPolicySnapshot {
     pub protective_actions: probe_core::ProtectiveActionProfile,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum LoadedEnforcementPolicySourceSnapshot {
-    Local { path: PathBuf },
-    Remote { endpoint: String },
-}
-
 pub(super) async fn check_enforcement(
     plan: &RuntimePlan,
     backend: Option<Box<dyn EnforcementBackend>>,
@@ -110,7 +100,7 @@ pub(super) async fn check_enforcement(
             active: Some(LoadedEnforcementPolicySnapshot {
                 id: source.manifest.id.clone(),
                 version: source.manifest.version.clone(),
-                source: loaded_enforcement_policy_source_snapshot(source),
+                source: source.snapshot(),
                 selector_configured: source.manifest.selector.is_some(),
                 protective_actions: source.manifest.protective_actions.clone(),
             }),
@@ -143,21 +133,4 @@ pub(super) async fn check_enforcement(
         manifest_selector_configured: active_policy.manifest_selector_configured(),
         policy,
     })
-}
-
-fn loaded_enforcement_policy_source_snapshot(
-    source: &LoadedEnforcementPolicySource,
-) -> LoadedEnforcementPolicySourceSnapshot {
-    match source.origin() {
-        LoadedEnforcementPolicySourceOriginRef::LocalPath(path) => {
-            LoadedEnforcementPolicySourceSnapshot::Local {
-                path: path.to_path_buf(),
-            }
-        }
-        LoadedEnforcementPolicySourceOriginRef::RemoteEndpoint(endpoint) => {
-            LoadedEnforcementPolicySourceSnapshot::Remote {
-                endpoint: endpoint.to_string(),
-            }
-        }
-    }
 }

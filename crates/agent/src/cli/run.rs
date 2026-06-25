@@ -672,6 +672,7 @@ protective_actions = ["alert"]
         let mut config = config_with_unopenable_libpcap(spool_path.clone());
         config.enforcement.policy.source = EnforcementPolicySourceConfig::Remote {
             endpoint: "http://127.0.0.1:1/enforcement".to_string(),
+            max_body_bytes: None,
         };
         fs::write(&config_path, toml::to_string(&config)?)?;
 

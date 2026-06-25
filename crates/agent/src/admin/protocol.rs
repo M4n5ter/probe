@@ -3,10 +3,7 @@ use thiserror::Error;
 use tokio::{io::AsyncReadExt, net::UnixStream};
 
 use crate::{
-    configured_enforcement::{
-        ActiveEnforcementPolicy, LoadedEnforcementPolicySource,
-        LoadedEnforcementPolicySourceOriginRef,
-    },
+    configured_enforcement::{ActiveEnforcementPolicy, LoadedEnforcementPolicySourceSnapshot},
     configured_policy::ConfiguredPolicySource,
     status::MetricsSnapshot,
 };
@@ -62,13 +59,6 @@ pub(super) enum EnforcementPolicyReloadSource {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub(super) enum LoadedEnforcementPolicySourceSnapshot {
-    Local { path: std::path::PathBuf },
-    Remote { endpoint: String },
-}
-
-#[derive(Debug, Serialize)]
 pub(super) struct EnforcementPolicyManifestSnapshot {
     id: String,
     version: String,
@@ -83,7 +73,7 @@ pub(super) fn enforcement_policy_reload_source(
         .policy_source()
         .map_or(EnforcementPolicyReloadSource::NotConfigured, |source| {
             EnforcementPolicyReloadSource::Loaded {
-                source: loaded_enforcement_policy_source_snapshot(source),
+                source: source.snapshot(),
                 manifest: EnforcementPolicyManifestSnapshot {
                     id: source.manifest.id.clone(),
                     version: source.manifest.version.clone(),
@@ -92,23 +82,6 @@ pub(super) fn enforcement_policy_reload_source(
                 },
             }
         })
-}
-
-fn loaded_enforcement_policy_source_snapshot(
-    source: &LoadedEnforcementPolicySource,
-) -> LoadedEnforcementPolicySourceSnapshot {
-    match source.origin() {
-        LoadedEnforcementPolicySourceOriginRef::LocalPath(path) => {
-            LoadedEnforcementPolicySourceSnapshot::Local {
-                path: path.to_path_buf(),
-            }
-        }
-        LoadedEnforcementPolicySourceOriginRef::RemoteEndpoint(endpoint) => {
-            LoadedEnforcementPolicySourceSnapshot::Remote {
-                endpoint: endpoint.to_string(),
-            }
-        }
-    }
 }
 
 pub(super) async fn read_admin_request(

@@ -283,6 +283,8 @@ mod tests {
             false,
             &EnforcementPolicySourcePlan::Remote {
                 endpoint: "http://127.0.0.1:9/enforcement".to_string(),
+                max_body_bytes: runtime::RemoteEnforcementPolicyBodyLimitBytes::from_config(None)
+                    .expect("default remote enforcement policy body limit must be valid"),
             },
             &[EnforcementExecutionSurface::Connection],
             None,

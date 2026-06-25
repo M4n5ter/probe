@@ -1,5 +1,6 @@
 mod capture;
 mod enforcement;
+mod enforcement_policy_source;
 mod error;
 mod export;
 mod interception_scope;
@@ -15,15 +16,15 @@ pub use capture::{
 };
 pub use enforcement::{
     EnforcementCapabilityPlan, EnforcementConnectionPlan, EnforcementExecutionSurface,
-    EnforcementInterceptionPlan, EnforcementPlan, EnforcementPolicySourceKind,
-    EnforcementPolicySourcePlan, RequiredCapabilityPlan, TransparentInterceptionClassificationPlan,
-    TransparentInterceptionExecutionPlan, TransparentInterceptionInboundTproxyPlan,
-    TransparentInterceptionMitmBackendReadinessProbePlan,
+    EnforcementInterceptionPlan, EnforcementPlan, RequiredCapabilityPlan,
+    TransparentInterceptionClassificationPlan, TransparentInterceptionExecutionPlan,
+    TransparentInterceptionInboundTproxyPlan, TransparentInterceptionMitmBackendReadinessProbePlan,
     TransparentInterceptionMitmPlaintextBridgePlan, TransparentInterceptionMitmPlan,
     TransparentInterceptionNftablesPlan, TransparentInterceptionOutboundProxyPlan,
     TransparentInterceptionOutboundRedirectPlan, TransparentInterceptionProxyHealthProbePlan,
     TransparentInterceptionProxyPlan, TransparentInterceptionProxyPlanError,
 };
+pub use enforcement_policy_source::{EnforcementPolicySourceKind, EnforcementPolicySourcePlan};
 pub use error::RuntimeError;
 pub use export::{
     ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
@@ -39,6 +40,7 @@ pub use interception_scope::{
     TransparentInterceptionProjectedPortScopePlan,
     TransparentInterceptionProjectedRemoteAddressScopePlan,
 };
+pub use probe_config::RemoteEnforcementPolicyBodyLimitBytes;
 pub use registry::{PlatformProbeResults, ProviderRegistry};
 pub use runtime_plan::{RuntimePlan, validate_static_runtime_config};
 pub use storage::{ExportRetentionPlan, IngressRetentionPlan, StoragePlan, StorageRetentionPlan};

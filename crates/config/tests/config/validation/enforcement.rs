@@ -37,6 +37,16 @@ endpoint = "{endpoint}"
         config.validate_basic()?;
     }
 
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.policy.source]
+kind = "remote"
+endpoint = "https://control.example/enforcement"
+max_body_bytes = 33554432
+"#,
+    )?;
+    config.validate_basic()?;
+
     for (endpoint, reason) in [
         (
             "http://control.example/enforcement",
@@ -65,6 +75,33 @@ endpoint = "{endpoint}"
         let error = config
             .validate_basic()
             .expect_err("invalid remote enforcement endpoint must be rejected");
+        assert!(
+            error.to_string().contains(reason),
+            "expected {reason:?} in {error}"
+        );
+    }
+
+    for (max_body_bytes, reason) in [
+        (
+            0,
+            "remote enforcement policy max_body_bytes must be greater than zero",
+        ),
+        (
+            MAX_REMOTE_ENFORCEMENT_POLICY_BODY_LIMIT_BYTES + 1,
+            "remote enforcement policy max_body_bytes cannot exceed",
+        ),
+    ] {
+        let config = AgentConfig::from_toml_str(&format!(
+            r#"
+[enforcement.policy.source]
+kind = "remote"
+endpoint = "https://control.example/enforcement"
+max_body_bytes = {max_body_bytes}
+"#
+        ))?;
+        let error = config
+            .validate_basic()
+            .expect_err("invalid remote enforcement body limit must be rejected");
         assert!(
             error.to_string().contains(reason),
             "expected {reason:?} in {error}"

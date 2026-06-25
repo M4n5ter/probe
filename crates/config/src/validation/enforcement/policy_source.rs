@@ -1,6 +1,9 @@
 use url::Url;
 
-use crate::{ConfigViolation, EnforcementPolicySourceConfig};
+use crate::{
+    ConfigViolation, EnforcementPolicySourceConfig, RemoteEnforcementPolicyBodyLimitBytes,
+    RemoteEnforcementPolicyBodyLimitError,
+};
 
 pub(super) fn validate(
     source: &EnforcementPolicySourceConfig,
@@ -24,7 +27,10 @@ pub(super) fn validate(
                 });
             }
         }
-        EnforcementPolicySourceConfig::Remote { endpoint } => {
+        EnforcementPolicySourceConfig::Remote {
+            endpoint,
+            max_body_bytes,
+        } => {
             if endpoint.trim().is_empty() {
                 violations.push(ConfigViolation {
                     field: "enforcement.policy.source.endpoint".to_string(),
@@ -33,6 +39,7 @@ pub(super) fn validate(
             } else {
                 validate_remote_endpoint(endpoint, violations);
             }
+            validate_remote_body_limit(*max_body_bytes, violations);
         }
     }
 }
@@ -80,4 +87,24 @@ fn loopback_host(host: &str) -> bool {
         || normalized
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+fn validate_remote_body_limit(max_body_bytes: Option<u64>, violations: &mut Vec<ConfigViolation>) {
+    if let Err(error) = RemoteEnforcementPolicyBodyLimitBytes::from_config(max_body_bytes) {
+        violations.push(ConfigViolation {
+            field: "enforcement.policy.source.max_body_bytes".to_string(),
+            reason: remote_body_limit_violation_reason(error),
+        });
+    }
+}
+
+fn remote_body_limit_violation_reason(error: RemoteEnforcementPolicyBodyLimitError) -> String {
+    match error {
+        RemoteEnforcementPolicyBodyLimitError::Zero => {
+            "remote enforcement policy max_body_bytes must be greater than zero".to_string()
+        }
+        RemoteEnforcementPolicyBodyLimitError::ExceedsMaximum { max, .. } => {
+            format!("remote enforcement policy max_body_bytes cannot exceed {max}")
+        }
+    }
 }

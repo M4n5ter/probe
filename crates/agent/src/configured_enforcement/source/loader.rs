@@ -14,11 +14,12 @@ use hyper_util::{
 use probe_config::EnforcementPolicyManifest;
 use runtime::EnforcementPolicySourcePlan;
 use rustls::pki_types::CertificateDer;
+use serde::Serialize;
 use thiserror::Error;
 
 use probe_io::{BoundedFileError, BoundedFileErrorKind, read_bounded_regular_file_to_string};
 
-pub const MAX_ENFORCEMENT_POLICY_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+pub const LOCAL_ENFORCEMENT_POLICY_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const REMOTE_ENFORCEMENT_POLICY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_ENFORCEMENT_POLICY_ACCEPT: &str = "application/toml, text/plain;q=0.9, */*;q=0.1";
 type RemotePolicyHttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>;
@@ -37,43 +38,72 @@ impl LoadedEnforcementPolicySource {
         }
     }
 
-    pub fn remote(endpoint: impl Into<String>, manifest: EnforcementPolicyManifest) -> Self {
+    pub fn remote(
+        endpoint: impl Into<String>,
+        max_body_bytes: u64,
+        manifest: EnforcementPolicyManifest,
+    ) -> Self {
         Self {
-            origin: LoadedEnforcementPolicySourceOrigin::RemoteEndpoint(endpoint.into()),
+            origin: LoadedEnforcementPolicySourceOrigin::RemoteEndpoint {
+                endpoint: endpoint.into(),
+                max_body_bytes,
+            },
             manifest,
         }
     }
 
-    pub fn origin(&self) -> LoadedEnforcementPolicySourceOriginRef<'_> {
+    pub fn snapshot(&self) -> LoadedEnforcementPolicySourceSnapshot {
         match &self.origin {
             LoadedEnforcementPolicySourceOrigin::LocalPath(path) => {
-                LoadedEnforcementPolicySourceOriginRef::LocalPath(path)
+                LoadedEnforcementPolicySourceSnapshot::Local {
+                    path: path.to_path_buf(),
+                }
             }
-            LoadedEnforcementPolicySourceOrigin::RemoteEndpoint(endpoint) => {
-                LoadedEnforcementPolicySourceOriginRef::RemoteEndpoint(endpoint)
-            }
+            LoadedEnforcementPolicySourceOrigin::RemoteEndpoint {
+                endpoint,
+                max_body_bytes,
+            } => LoadedEnforcementPolicySourceSnapshot::Remote {
+                endpoint: endpoint.clone(),
+                max_body_bytes: *max_body_bytes,
+            },
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoadedEnforcementPolicySourceOriginRef<'a> {
-    LocalPath(&'a Path),
-    RemoteEndpoint(&'a str),
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum LoadedEnforcementPolicySourceSnapshot {
+    Local {
+        path: PathBuf,
+    },
+    Remote {
+        endpoint: String,
+        max_body_bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LoadedEnforcementPolicySourceOrigin {
     LocalPath(PathBuf),
-    RemoteEndpoint(String),
+    RemoteEndpoint {
+        endpoint: String,
+        max_body_bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnforcementPolicySourceInspection {
     NotConfigured,
-    LocalMetadata { manifest: EnforcementPolicyManifest },
-    RemoteConfigured { endpoint: String },
-    Unavailable { reason: String },
+    LocalMetadata {
+        manifest: EnforcementPolicyManifest,
+    },
+    RemoteConfigured {
+        endpoint: String,
+        max_body_bytes: u64,
+    },
+    Unavailable {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -157,10 +187,16 @@ pub async fn load_enforcement_policy_source(
                 manifest,
             )))
         }
-        EnforcementPolicySourcePlan::Remote { endpoint } => {
-            let manifest = fetch_remote_enforcement_policy_manifest(endpoint).await?;
+        EnforcementPolicySourcePlan::Remote {
+            endpoint,
+            max_body_bytes,
+        } => {
+            let max_body_bytes = max_body_bytes.get();
+            let manifest =
+                fetch_remote_enforcement_policy_manifest(endpoint, max_body_bytes).await?;
             Ok(Some(LoadedEnforcementPolicySource::remote(
                 endpoint.clone(),
+                max_body_bytes,
                 manifest,
             )))
         }
@@ -180,11 +216,13 @@ pub fn inspect_enforcement_policy_source(
                 },
             }
         }
-        EnforcementPolicySourcePlan::Remote { endpoint } => {
-            EnforcementPolicySourceInspection::RemoteConfigured {
-                endpoint: endpoint.clone(),
-            }
-        }
+        EnforcementPolicySourcePlan::Remote {
+            endpoint,
+            max_body_bytes,
+        } => EnforcementPolicySourceInspection::RemoteConfigured {
+            endpoint: endpoint.clone(),
+            max_body_bytes: max_body_bytes.get(),
+        },
     }
 }
 
@@ -202,10 +240,12 @@ fn read_enforcement_policy_manifest(
 
 async fn fetch_remote_enforcement_policy_manifest(
     endpoint: &str,
+    max_body_bytes: u64,
 ) -> Result<EnforcementPolicyManifest, EnforcementPolicySourceError> {
     fetch_remote_enforcement_policy_manifest_with_timeout(
         endpoint,
         REMOTE_ENFORCEMENT_POLICY_FETCH_TIMEOUT,
+        max_body_bytes,
     )
     .await
 }
@@ -213,6 +253,7 @@ async fn fetch_remote_enforcement_policy_manifest(
 async fn fetch_remote_enforcement_policy_manifest_with_timeout(
     endpoint: &str,
     timeout: Duration,
+    max_body_bytes: u64,
 ) -> Result<EnforcementPolicyManifest, EnforcementPolicySourceError> {
     let client = remote_policy_http_client()?;
     let request = Request::builder()
@@ -227,7 +268,7 @@ async fn fetch_remote_enforcement_policy_manifest_with_timeout(
 
     let content = tokio::time::timeout(
         timeout,
-        fetch_remote_enforcement_policy_content(endpoint, client, request),
+        fetch_remote_enforcement_policy_content(endpoint, client, request, max_body_bytes),
     )
     .await
     .map_err(|_| EnforcementPolicySourceError::RemoteTimeout {
@@ -246,6 +287,7 @@ async fn fetch_remote_enforcement_policy_content(
     endpoint: &str,
     client: RemotePolicyHttpClient,
     request: Request<Empty<Bytes>>,
+    max_body_bytes: u64,
 ) -> Result<String, EnforcementPolicySourceError> {
     let response = client.request(request).await.map_err(|source| {
         EnforcementPolicySourceError::RemoteFetch {
@@ -271,11 +313,11 @@ async fn fetch_remote_enforcement_policy_content(
     })? {
         if let Ok(chunk) = frame.into_data() {
             let new_size = body.len().saturating_add(chunk.len()) as u64;
-            if new_size > MAX_ENFORCEMENT_POLICY_SOURCE_BYTES {
+            if new_size > max_body_bytes {
                 return Err(EnforcementPolicySourceError::RemoteTooLarge {
                     endpoint: endpoint.to_string(),
                     size: new_size,
-                    limit: MAX_ENFORCEMENT_POLICY_SOURCE_BYTES,
+                    limit: max_body_bytes,
                 });
             }
             body.extend_from_slice(&chunk);
@@ -343,7 +385,7 @@ fn validate_enforcement_policy_manifest(
 }
 
 fn read_regular_policy_file(path: &Path) -> Result<String, EnforcementPolicySourceError> {
-    read_bounded_regular_file_to_string(path, MAX_ENFORCEMENT_POLICY_SOURCE_BYTES)
+    read_bounded_regular_file_to_string(path, LOCAL_ENFORCEMENT_POLICY_SOURCE_BYTES)
         .map_err(enforcement_policy_file_error)
 }
 
@@ -404,6 +446,8 @@ mod tests {
 
     use super::*;
 
+    const TEST_REMOTE_BODY_LIMIT_BYTES: u64 = 4096;
+
     #[tokio::test]
     async fn remote_source_fetches_and_validates_manifest() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -416,15 +460,16 @@ mod tests {
         let body = toml::to_string(&manifest)?;
         let (_server, endpoint) = remote_enforcement_source(200, body).await;
 
-        let loaded = load_enforcement_policy_source(&EnforcementPolicySourcePlan::Remote {
-            endpoint: endpoint.clone(),
-        })
-        .await?
-        .expect("remote source should load a manifest");
+        let loaded = load_enforcement_policy_source(&remote_plan(endpoint.clone()))
+            .await?
+            .expect("remote source should load a manifest");
 
         assert_eq!(
-            loaded.origin(),
-            LoadedEnforcementPolicySourceOriginRef::RemoteEndpoint(endpoint.as_str())
+            loaded.snapshot(),
+            LoadedEnforcementPolicySourceSnapshot::Remote {
+                endpoint: endpoint.clone(),
+                max_body_bytes: TEST_REMOTE_BODY_LIMIT_BYTES,
+            }
         );
         assert_eq!(loaded.manifest.id, "managed-apps");
         assert_eq!(
@@ -465,6 +510,7 @@ mod tests {
         let error = fetch_remote_enforcement_policy_manifest_with_timeout(
             &endpoint,
             Duration::from_millis(30),
+            TEST_REMOTE_BODY_LIMIT_BYTES,
         )
         .await
         .expect_err("the timeout must cover delayed response bodies");
@@ -482,11 +528,9 @@ mod tests {
     async fn remote_source_rejects_error_status() -> Result<(), Box<dyn std::error::Error>> {
         let (_server, endpoint) = remote_enforcement_source(503, "").await;
 
-        let error = load_enforcement_policy_source(&EnforcementPolicySourcePlan::Remote {
-            endpoint: endpoint.clone(),
-        })
-        .await
-        .expect_err("remote status errors must reject the source");
+        let error = load_enforcement_policy_source(&remote_plan(endpoint.clone()))
+            .await
+            .expect_err("remote status errors must reject the source");
 
         assert!(matches!(
             error,
@@ -498,19 +542,24 @@ mod tests {
 
     #[tokio::test]
     async fn remote_source_rejects_oversized_manifest() -> Result<(), Box<dyn std::error::Error>> {
-        let body = "x".repeat(MAX_ENFORCEMENT_POLICY_SOURCE_BYTES as usize + 1);
+        const BODY_LIMIT: u64 = 64;
+        let body = "x".repeat(BODY_LIMIT as usize + 1);
         let (_server, endpoint) = remote_enforcement_source(200, body).await;
 
         let error = load_enforcement_policy_source(&EnforcementPolicySourcePlan::Remote {
             endpoint: endpoint.clone(),
+            max_body_bytes: test_body_limit(BODY_LIMIT),
         })
         .await
         .expect_err("oversized remote manifests must be rejected");
 
         assert!(matches!(
             error,
-            EnforcementPolicySourceError::RemoteTooLarge { endpoint: actual, .. }
-                if actual == endpoint
+            EnforcementPolicySourceError::RemoteTooLarge {
+                endpoint: actual,
+                size: 65,
+                limit: BODY_LIMIT,
+            } if actual == endpoint
         ));
         Ok(())
     }
@@ -521,11 +570,15 @@ mod tests {
 
         let inspection = inspect_enforcement_policy_source(&EnforcementPolicySourcePlan::Remote {
             endpoint: endpoint.clone(),
+            max_body_bytes: test_body_limit(TEST_REMOTE_BODY_LIMIT_BYTES),
         });
 
         assert_eq!(
             inspection,
-            EnforcementPolicySourceInspection::RemoteConfigured { endpoint }
+            EnforcementPolicySourceInspection::RemoteConfigured {
+                endpoint,
+                max_body_bytes: TEST_REMOTE_BODY_LIMIT_BYTES,
+            }
         );
     }
 
@@ -549,5 +602,17 @@ mod tests {
             .await;
         let endpoint = format!("{}/enforcement", server.uri());
         (server, endpoint)
+    }
+
+    fn remote_plan(endpoint: String) -> EnforcementPolicySourcePlan {
+        EnforcementPolicySourcePlan::Remote {
+            endpoint,
+            max_body_bytes: test_body_limit(TEST_REMOTE_BODY_LIMIT_BYTES),
+        }
+    }
+
+    fn test_body_limit(limit: u64) -> runtime::RemoteEnforcementPolicyBodyLimitBytes {
+        runtime::RemoteEnforcementPolicyBodyLimitBytes::from_config(Some(limit))
+            .expect("test remote body limit should be valid")
     }
 }

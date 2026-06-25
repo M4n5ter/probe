@@ -138,9 +138,9 @@ mod tests {
 
     use crate::runtime_composition::{RuntimeComposition, build_runtime_composition_for_test};
 
-    use super::super::enforcement::{
-        EnforcementPolicyCheckMode, LoadedEnforcementPolicySourceSnapshot,
-    };
+    use crate::configured_enforcement::LoadedEnforcementPolicySourceSnapshot;
+
+    use super::super::enforcement::EnforcementPolicyCheckMode;
     use super::*;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -357,6 +357,7 @@ protective_actions = ["alert"]
         let mut config = config_with_policy(&policy_path)?;
         config.enforcement.policy.source = probe_config::EnforcementPolicySourceConfig::Remote {
             endpoint: endpoint.clone(),
+            max_body_bytes: None,
         };
         let plan = runtime_plan(config)?;
 
@@ -377,7 +378,8 @@ protective_actions = ["alert"]
         assert_eq!(
             active.source,
             LoadedEnforcementPolicySourceSnapshot::Remote {
-                endpoint: endpoint.clone()
+                endpoint: endpoint.clone(),
+                max_body_bytes: probe_config::DEFAULT_REMOTE_ENFORCEMENT_POLICY_BODY_LIMIT_BYTES,
             }
         );
         assert_eq!(active.protective_actions.actions(), &[Action::Reset]);
@@ -389,6 +391,10 @@ protective_actions = ["alert"]
         assert_eq!(
             value["enforcement"]["policy"]["active"]["source"]["endpoint"],
             json!(endpoint)
+        );
+        assert_eq!(
+            value["enforcement"]["policy"]["active"]["source"]["max_body_bytes"],
+            json!(probe_config::DEFAULT_REMOTE_ENFORCEMENT_POLICY_BODY_LIMIT_BYTES)
         );
         fs::remove_dir_all(temp)?;
         Ok(())

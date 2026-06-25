@@ -14,7 +14,7 @@ pub use capture::{
     EbpfCaptureConfig, LibpcapCaptureConfig, LiveCaptureBackend, PlaintextFeedCaptureConfig,
 };
 pub use enforcement::{
-    ConnectionEnforcementBackendConfig,
+    ConnectionEnforcementBackendConfig, DEFAULT_REMOTE_ENFORCEMENT_POLICY_BODY_LIMIT_BYTES,
     DEFAULT_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD,
     DEFAULT_TRANSPARENT_MITM_BACKEND_READINESS_INTERVAL_MS,
     DEFAULT_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS,
@@ -22,7 +22,8 @@ pub use enforcement::{
     DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS,
     DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS, EnforcementConfig,
     EnforcementInterceptionConfig, EnforcementPolicyConfig, EnforcementPolicyManifest,
-    EnforcementPolicySourceConfig, MAX_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD,
+    EnforcementPolicySourceConfig, MAX_REMOTE_ENFORCEMENT_POLICY_BODY_LIMIT_BYTES,
+    MAX_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD,
     MAX_TRANSPARENT_MITM_BACKEND_READINESS_INTERVAL_MS,
     MAX_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS,
     MAX_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD,
@@ -32,6 +33,7 @@ pub use enforcement::{
     MIN_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS,
     MIN_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD,
     MIN_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS, MIN_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS,
+    RemoteEnforcementPolicyBodyLimitBytes, RemoteEnforcementPolicyBodyLimitError,
     TransparentInterceptionDirectionConfig, TransparentInterceptionDisabledProxyIntent,
     TransparentInterceptionEnabledProxyIntent, TransparentInterceptionIntentViolation,
     TransparentInterceptionL7ModeConfig, TransparentInterceptionMitmBackendConfig,

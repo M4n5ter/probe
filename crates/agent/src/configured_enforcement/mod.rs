@@ -10,5 +10,5 @@ pub(crate) use builder::{
 pub(crate) use runtime::{EnforcementRuntimeState, RuntimeEnforcementPlanner};
 pub(crate) use source::{
     EnforcementPolicySourceInspection, LoadedEnforcementPolicySource,
-    LoadedEnforcementPolicySourceOriginRef, inspect_enforcement_policy_source,
+    LoadedEnforcementPolicySourceSnapshot, inspect_enforcement_policy_source,
 };

@@ -2,9 +2,8 @@ use std::{fmt, net::SocketAddr, num::NonZeroU16, path::PathBuf};
 
 use probe_config::{
     AgentConfig, ConnectionEnforcementBackendConfig, EnforcementInterceptionConfig,
-    EnforcementPolicySourceConfig, TlsMaterialKind, TransparentInterceptionDirectionConfig,
-    TransparentInterceptionL7ModeConfig, TransparentInterceptionMitmBackendConfig,
-    TransparentInterceptionMitmBackendIntent,
+    TlsMaterialKind, TransparentInterceptionDirectionConfig, TransparentInterceptionL7ModeConfig,
+    TransparentInterceptionMitmBackendConfig, TransparentInterceptionMitmBackendIntent,
     TransparentInterceptionMitmBackendReadinessProbeIntent,
     TransparentInterceptionMitmPlaintextBridgeIntent, TransparentInterceptionOutboundProxyIntent,
     TransparentInterceptionOutboundProxyModeIntent,
@@ -18,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use transparent_linux::{OutboundRedirectArtifactSpec, TransparentLinuxResources};
 
 use super::{
+    enforcement_policy_source::EnforcementPolicySourcePlan,
     interception_scope::TransparentInterceptionLocalSetupProjectionPlan,
     tls::{
         TlsMaterialPlan, mitm_tls_material_from_ref, mitm_tls_materials_by_id,
@@ -750,45 +750,6 @@ pub(super) struct EnforcementCapabilityRequirement {
     pub(super) unavailable_reason: &'static str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum EnforcementPolicySourcePlan {
-    None,
-    LocalManifest {
-        source_kind: EnforcementPolicySourceKind,
-        path: PathBuf,
-    },
-    Remote {
-        endpoint: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EnforcementPolicySourceKind {
-    File,
-    Directory,
-}
-
-impl EnforcementPolicySourcePlan {
-    fn from_config(source: &EnforcementPolicySourceConfig) -> Self {
-        match source {
-            EnforcementPolicySourceConfig::None => Self::None,
-            EnforcementPolicySourceConfig::File { path } => Self::LocalManifest {
-                source_kind: EnforcementPolicySourceKind::File,
-                path: path.clone(),
-            },
-            EnforcementPolicySourceConfig::Directory { path } => Self::LocalManifest {
-                source_kind: EnforcementPolicySourceKind::Directory,
-                path: path.join("manifest.toml"),
-            },
-            EnforcementPolicySourceConfig::Remote { endpoint } => Self::Remote {
-                endpoint: endpoint.clone(),
-            },
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
@@ -846,28 +807,6 @@ mod tests {
             EnforcementCapabilityPlan::Required {
                 capability: CapabilityKind::ConnectionEnforcement,
                 mode: RuntimeMode::Available,
-            }
-        );
-    }
-
-    #[test]
-    fn enforcement_plan_preserves_external_policy_source() {
-        let mut config = AgentConfig::default();
-        config.enforcement.selector = Some(Selector::default());
-        config.enforcement.policy.source = EnforcementPolicySourceConfig::Directory {
-            path: "/etc/sssa-probe/enforcement.d".into(),
-        };
-        let capabilities = CapabilityMatrix::new(test_platform_capabilities());
-
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
-
-        assert_eq!(plan.mode, EnforcementMode::AuditOnly);
-        assert!(plan.config_selector_configured);
-        assert_eq!(
-            plan.policy_source,
-            EnforcementPolicySourcePlan::LocalManifest {
-                source_kind: EnforcementPolicySourceKind::Directory,
-                path: "/etc/sssa-probe/enforcement.d/manifest.toml".into(),
             }
         );
     }

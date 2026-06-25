@@ -1,8 +1,6 @@
-use std::path::PathBuf;
-
 use crate::configured_enforcement::{
     ActiveEnforcementPolicy, EnforcementPolicySourceInspection, LoadedEnforcementPolicySource,
-    LoadedEnforcementPolicySourceOriginRef, inspect_enforcement_policy_source,
+    LoadedEnforcementPolicySourceSnapshot, inspect_enforcement_policy_source,
 };
 use crate::l7_mitm::L7MitmRuntimeSnapshot;
 use crate::transparent_interception::TransparentProxyRuntimeSnapshot;
@@ -84,22 +82,16 @@ pub enum EnforcementPolicySourceStatusSnapshot {
     },
     RemoteConfigured {
         endpoint: String,
+        max_body_bytes: u64,
         reason: String,
     },
     Loaded {
-        source: LoadedEnforcementPolicySourceStatusSnapshot,
+        source: LoadedEnforcementPolicySourceSnapshot,
         manifest: EnforcementPolicyManifestStatusSnapshot,
     },
     Unavailable {
         reason: String,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum LoadedEnforcementPolicySourceStatusSnapshot {
-    Local { path: PathBuf },
-    Remote { endpoint: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -231,9 +223,10 @@ fn offline_enforcement_policy_status(plan: &RuntimePlan) -> EnforcementPolicySta
                     .to_string(),
             )
         }
-        EnforcementPolicySourceInspection::RemoteConfigured { endpoint } => {
-            remote_configured_policy_status(plan, endpoint)
-        }
+        EnforcementPolicySourceInspection::RemoteConfigured {
+            endpoint,
+            max_body_bytes,
+        } => remote_configured_policy_status(plan, endpoint, max_body_bytes),
         EnforcementPolicySourceInspection::Unavailable { reason } => {
             unavailable_policy_status(reason)
         }
@@ -258,7 +251,7 @@ fn active_enforcement_policy_status(policy: &ActiveEnforcementPolicy) -> Enforce
         manifest_selector_configured,
         snapshot: EnforcementPolicyStatusSnapshot {
             source: EnforcementPolicySourceStatusSnapshot::Loaded {
-                source: loaded_enforcement_policy_source_status(source),
+                source: source.snapshot(),
                 manifest,
             },
         },
@@ -273,23 +266,6 @@ fn loaded_enforcement_policy_manifest_status(
         version: source.manifest.version.clone(),
         selector_configured: source.manifest.selector.is_some(),
         protective_actions: source.manifest.protective_actions.clone(),
-    }
-}
-
-fn loaded_enforcement_policy_source_status(
-    source: &LoadedEnforcementPolicySource,
-) -> LoadedEnforcementPolicySourceStatusSnapshot {
-    match source.origin() {
-        LoadedEnforcementPolicySourceOriginRef::LocalPath(path) => {
-            LoadedEnforcementPolicySourceStatusSnapshot::Local {
-                path: path.to_path_buf(),
-            }
-        }
-        LoadedEnforcementPolicySourceOriginRef::RemoteEndpoint(endpoint) => {
-            LoadedEnforcementPolicySourceStatusSnapshot::Remote {
-                endpoint: endpoint.to_string(),
-            }
-        }
     }
 }
 
@@ -323,6 +299,7 @@ fn local_metadata_policy_status(
 fn remote_configured_policy_status(
     plan: &RuntimePlan,
     endpoint: String,
+    max_body_bytes: u64,
 ) -> EnforcementPolicyStatus {
     EnforcementPolicyStatus {
         effective_selector_configured: plan.enforcement.config_selector_configured.then_some(true),
@@ -333,6 +310,7 @@ fn remote_configured_policy_status(
                     "remote enforcement policy source {endpoint} is configured, but offline status does not fetch remote policy"
                 ),
                 endpoint,
+                max_body_bytes,
             },
         },
     }
@@ -484,17 +462,25 @@ protective_actions = ["alert"]
         let mut config = config_with_storage_path("/tmp/sssa-spool".into());
         config.enforcement.policy.source = EnforcementPolicySourceConfig::Remote {
             endpoint: "https://control.example/enforcement".to_string(),
+            max_body_bytes: None,
         };
         let plan = runtime_plan_from_config(config, Vec::new())?;
 
         let status = enforcement_status(&plan);
 
-        let EnforcementPolicySourceStatusSnapshot::RemoteConfigured { reason, .. } =
-            &status.policy.source
+        let EnforcementPolicySourceStatusSnapshot::RemoteConfigured {
+            reason,
+            max_body_bytes,
+            ..
+        } = &status.policy.source
         else {
             panic!("remote enforcement source should be metadata-only offline");
         };
         assert!(reason.contains("offline status does not fetch remote policy"));
+        assert_eq!(
+            *max_body_bytes,
+            probe_config::DEFAULT_REMOTE_ENFORCEMENT_POLICY_BODY_LIMIT_BYTES
+        );
         assert_eq!(status.effective_selector_configured, None);
         Ok(())
     }
@@ -506,6 +492,7 @@ protective_actions = ["alert"]
         config.enforcement.selector = Some(Selector::default());
         config.enforcement.policy.source = EnforcementPolicySourceConfig::Remote {
             endpoint: "https://control.example/enforcement".to_string(),
+            max_body_bytes: Some(2 * 1024 * 1024),
         };
         let plan = runtime_plan_from_config(config, Vec::new())?;
 
@@ -513,7 +500,10 @@ protective_actions = ["alert"]
 
         assert!(matches!(
             status.policy.source,
-            EnforcementPolicySourceStatusSnapshot::RemoteConfigured { .. }
+            EnforcementPolicySourceStatusSnapshot::RemoteConfigured {
+                max_body_bytes: 2_097_152,
+                ..
+            }
         ));
         assert_eq!(status.effective_selector_configured, Some(true));
         Ok(())
@@ -526,6 +516,7 @@ protective_actions = ["alert"]
         let mut config = config_with_storage_path("/tmp/sssa-spool".into());
         config.enforcement.policy.source = EnforcementPolicySourceConfig::Remote {
             endpoint: endpoint.clone(),
+            max_body_bytes: Some(2 * 1024 * 1024),
         };
         let plan = runtime_plan_from_config(config, Vec::new())?;
         let manifest = EnforcementPolicyManifest {
@@ -535,7 +526,8 @@ protective_actions = ["alert"]
             protective_actions: ProtectiveActionProfile::new([Action::Reset])?,
         };
 
-        let policy_source = LoadedEnforcementPolicySource::remote(endpoint.clone(), manifest);
+        let policy_source =
+            LoadedEnforcementPolicySource::remote(endpoint.clone(), 2 * 1024 * 1024, manifest);
         let active_policy = ActiveEnforcementPolicy::new(
             None,
             policy_source.manifest.protective_actions.clone(),
@@ -545,13 +537,18 @@ protective_actions = ["alert"]
         let status = enforcement_status_with_active_policy(&plan, &active_policy, None, None);
 
         let EnforcementPolicySourceStatusSnapshot::Loaded {
-            source: LoadedEnforcementPolicySourceStatusSnapshot::Remote { endpoint: actual },
+            source:
+                LoadedEnforcementPolicySourceSnapshot::Remote {
+                    endpoint: actual,
+                    max_body_bytes,
+                },
             manifest,
         } = &status.policy.source
         else {
             panic!("remote loaded enforcement source should keep its origin");
         };
         assert_eq!(actual, &endpoint);
+        assert_eq!(*max_body_bytes, 2_097_152);
         assert_eq!(manifest.id, "managed-apps");
         assert_eq!(manifest.version, "remote-test");
         assert_eq!(manifest.protective_actions.actions(), &[Action::Reset]);
@@ -561,6 +558,10 @@ protective_actions = ["alert"]
         assert_eq!(
             value["policy"]["source"]["source"]["endpoint"],
             json!(endpoint)
+        );
+        assert_eq!(
+            value["policy"]["source"]["source"]["max_body_bytes"],
+            json!(2_097_152)
         );
         Ok(())
     }
