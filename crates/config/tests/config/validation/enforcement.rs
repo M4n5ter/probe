@@ -233,6 +233,37 @@ path = "/run/sssa/mitm-capture-events.jsonl"
     assert!(violations.iter().any(|violation| violation.field
         == "enforcement.interception.mitm.plaintext_bridge.path"
         && violation.reason.contains("plaintext_bridge.mode")));
+
+    let follow_without_mode = AgentConfig::from_toml_str(&external_mitm_bridge_fixture(
+        r#"
+[enforcement.interception.mitm.plaintext_bridge]
+follow = true
+"#,
+    ))?;
+    let error = follow_without_mode
+        .validate_basic()
+        .expect_err("MITM plaintext bridge follow mode must require explicit mode");
+    let violations = validation_violations(&error);
+
+    assert!(violations.iter().any(|violation| violation.field
+        == "enforcement.interception.mitm.plaintext_bridge.follow"
+        && violation.reason.contains("plaintext_bridge.mode")));
+
+    let empty_path = AgentConfig::from_toml_str(&external_mitm_bridge_fixture(
+        r#"
+[enforcement.interception.mitm.plaintext_bridge]
+mode = "capture_event_feed"
+path = ""
+"#,
+    ))?;
+    let error = empty_path
+        .validate_basic()
+        .expect_err("MITM plaintext bridge path must not be empty");
+    let violations = validation_violations(&error);
+
+    assert!(violations.iter().any(|violation| violation.field
+        == "enforcement.interception.mitm.plaintext_bridge.path"
+        && violation.reason.contains("must not be empty")));
     Ok(())
 }
 

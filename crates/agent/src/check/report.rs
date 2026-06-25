@@ -124,6 +124,7 @@ mod tests {
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig,
         TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
@@ -145,6 +146,8 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    const MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH: &str = "/run/sssa/mitm-capture-events.jsonl";
 
     #[tokio::test]
     async fn check_report_loads_enabled_policy_bundle() -> Result<(), Box<dyn std::error::Error>> {
@@ -676,7 +679,7 @@ protective_actions = ["alert"]
         config.enforcement.interception.proxy.self_bypass =
             probe_config::TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
         config.enforcement.interception.proxy.listen_port = Some(15002);
-        configure_external_mitm_backend(&mut config);
+        configure_external_mitm_plaintext_bridge(&mut config, false);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -690,6 +693,7 @@ protective_actions = ["alert"]
             &runtime_registry(vec![
                 CapabilityState::available(CapabilityKind::TransparentInterception),
                 CapabilityState::available(CapabilityKind::L7Mitm),
+                CapabilityState::available(CapabilityKind::CaptureEventFeed),
             ]),
         )?;
 
@@ -737,8 +741,32 @@ protective_actions = ["alert"]
             json!("mitm-ca")
         );
         assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["plaintext_bridge"]["mode"],
+            json!("capture_event_feed")
+        );
+        assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["plaintext_bridge"]["path"],
+            json!(MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH)
+        );
+        assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["plaintext_bridge"]["follow"],
+            json!(false)
+        );
+        assert_eq!(
             value["enforcement"]["interception"]["mitm"]["ca_certificate"]["id"],
             json!("mitm-ca")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["mitm"]["plaintext_bridge"]["mode"],
+            json!("capture_event_feed")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["mitm"]["plaintext_bridge"]["path"],
+            json!(MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH)
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["mitm"]["plaintext_bridge"]["follow"],
+            json!(false)
         );
         assert_eq!(
             interception_capability(&value, "transparent_interception")["mode"],
@@ -746,6 +774,10 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             interception_capability(&value, "l7_mitm")["mode"],
+            json!("available")
+        );
+        assert_eq!(
+            interception_capability(&value, "capture_event_feed")["mode"],
             json!("available")
         );
         assert_eq!(
@@ -1006,6 +1038,15 @@ protective_actions = ["alert"]
                 path: "/etc/sssa/mitm-ca.key".into(),
             },
         ];
+    }
+
+    fn configure_external_mitm_plaintext_bridge(config: &mut AgentConfig, follow: bool) {
+        configure_external_mitm_backend(config);
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path =
+            Some(MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH.into());
+        config.enforcement.interception.mitm.plaintext_bridge.follow = Some(follow);
     }
 
     fn config_with_policy(path: &Path) -> Result<AgentConfig, probe_config::ConfigError> {

@@ -407,7 +407,7 @@ mod tests {
     };
     use probe_core::{
         CapabilityKind, CapabilityState, CaptureLoss, CaptureOrigin, CaptureSource, Direction,
-        EnforcementEvidence, EnforcementMode, ProcessSelector, Selector, Timestamp,
+        EnforcementEvidence, EnforcementMode, ProcessSelector, RuntimeMode, Selector, Timestamp,
         TrafficSelector,
     };
     use runtime::{
@@ -485,6 +485,35 @@ mod tests {
 
         assert_loss_reason(provider.next()?, "primary");
         assert_loss_reason(provider.next()?, "mitm bridge");
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn mitm_plaintext_bridge_read_error_does_not_stop_primary_live_provider()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bridge_file = NamedTempFile::new()?;
+        let bridge_path = bridge_file.path().to_path_buf();
+        fs::write(&bridge_path, "not-json\n")?;
+        let mut plan = plan_with_mitm_plaintext_bridge(bridge_path)?;
+        set_mitm_plaintext_bridge_follow(&mut plan, false);
+        let primary = Box::new(VecProvider::new([
+            loss_event("primary before bridge error"),
+            loss_event("primary after bridge error"),
+        ]));
+
+        let mut provider = with_mitm_plaintext_bridge_provider(&plan, primary)?;
+
+        assert_loss_reason(provider.next()?, "primary before bridge error");
+        assert_loss_reason(provider.next()?, "primary after bridge error");
+        let bridge_capability = provider_capability(&*provider, CapabilityKind::CaptureEventFeed);
+        assert_eq!(bridge_capability.mode, RuntimeMode::Unavailable);
+        let reason = bridge_capability
+            .reason
+            .as_deref()
+            .expect("disabled bridge should report a reason");
+        assert!(reason.contains("best-effort capture provider capture_event_feed_jsonl disabled"));
+        assert!(reason.contains("capture provider capture_event_feed_jsonl failed"));
         assert!(provider.next()?.is_none());
         Ok(())
     }
@@ -710,5 +739,16 @@ mod tests {
             panic!("expected capture loss event, got {event:?}");
         };
         assert_eq!(loss.loss.reason, reason);
+    }
+
+    fn provider_capability(
+        provider: &dyn CaptureProvider,
+        kind: CapabilityKind,
+    ) -> CapabilityState {
+        provider
+            .capabilities()
+            .into_iter()
+            .find(|capability| capability.kind == kind)
+            .unwrap_or_else(|| panic!("missing provider capability {kind:?}"))
     }
 }

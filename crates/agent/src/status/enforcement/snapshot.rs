@@ -353,7 +353,7 @@ fn enforcement_policy_manifest_status(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::PathBuf};
 
     use probe_config::{EnforcementPolicyManifest, EnforcementPolicySourceConfig};
     use probe_core::{
@@ -367,6 +367,8 @@ mod tests {
     };
     use super::*;
     use crate::runtime_composition::{RuntimeComposition, build_runtime_composition_for_test};
+
+    const MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH: &str = "/run/sssa/mitm-capture-events.jsonl";
 
     #[test]
     fn enforcement_status_reports_metadata_only_policy_source()
@@ -808,6 +810,65 @@ protective_actions = ["alert"]
     }
 
     #[test]
+    fn enforce_status_reports_external_mitm_plaintext_bridge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bridge_path = PathBuf::from(MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH);
+        let plan = runtime_plan_from_config(
+            config_with_external_mitm_plaintext_bridge(bridge_path.clone()),
+            vec![
+                probe_core::CapabilityState::available(CapabilityKind::TransparentInterception),
+                probe_core::CapabilityState::available(CapabilityKind::L7Mitm),
+                probe_core::CapabilityState::available(CapabilityKind::CaptureEventFeed),
+            ],
+        )?;
+
+        let status = enforcement_status(&plan);
+        let value = serde_json::to_value(&status)?;
+
+        assert_eq!(
+            status.interception.mitm.plaintext_bridge,
+            runtime::TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed {
+                path: bridge_path,
+                follow: false,
+            }
+        );
+        assert_eq!(value["interception"]["mitm"]["backend"], json!("external"));
+        assert_eq!(
+            value["interception"]["mitm"]["backend_readiness_probe"]["mode"],
+            json!("tcp_connect")
+        );
+        assert_eq!(
+            value["interception"]["mitm"]["backend_readiness_probe"]["target"],
+            json!("127.0.0.1:15002")
+        );
+        assert_eq!(
+            value["interception"]["mitm"]["plaintext_bridge"]["mode"],
+            json!("capture_event_feed")
+        );
+        assert_eq!(
+            value["interception"]["mitm"]["plaintext_bridge"]["path"],
+            json!(MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH)
+        );
+        assert_eq!(
+            value["interception"]["mitm"]["plaintext_bridge"]["follow"],
+            json!(false)
+        );
+        assert_eq!(
+            interception_capability(&value, "transparent_interception")["mode"],
+            json!("available")
+        );
+        assert_eq!(
+            interception_capability(&value, "l7_mitm")["mode"],
+            json!("available")
+        );
+        assert_eq!(
+            interception_capability(&value, "capture_event_feed")["mode"],
+            json!("available")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn enforce_status_reports_outbound_redirect_artifact() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut config = config_with_storage_path("/tmp/sssa-spool".into());
@@ -975,6 +1036,67 @@ protective_actions = ["alert"]
 
     fn enforcement_status(plan: &RuntimePlan) -> EnforcementStatusSnapshot {
         enforcement_status_with_transparent_proxy(plan, None)
+    }
+
+    fn config_with_external_mitm_plaintext_bridge(
+        bridge_path: PathBuf,
+    ) -> probe_config::AgentConfig {
+        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        config.capture.selection = probe_config::CaptureSelection::Libpcap;
+        config.exporters.clear();
+        config.enforcement.mode = probe_core::EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            probe_config::TransparentInterceptionStrategyConfig::OutboundTransparentMitm;
+        config.enforcement.interception.proxy.self_bypass =
+            probe_config::TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        config.enforcement.interception.mitm.backend =
+            probe_config::TransparentInterceptionMitmBackendConfig::External;
+        config
+            .enforcement
+            .interception
+            .mitm
+            .backend_readiness_probe
+            .target = Some("127.0.0.1:15002".to_string());
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            probe_config::TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path = Some(bridge_path);
+        config.enforcement.interception.mitm.plaintext_bridge.follow = Some(false);
+        config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
+        config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        config.tls.materials = vec![
+            probe_config::TlsMaterialConfig {
+                id: Some("mitm-ca".to_string()),
+                kind: probe_config::TlsMaterialKind::MitmCaCertificate,
+                path: "/etc/sssa/mitm-ca.pem".into(),
+            },
+            probe_config::TlsMaterialConfig {
+                id: Some("mitm-ca-key".to_string()),
+                kind: probe_config::TlsMaterialKind::MitmCaPrivateKey,
+                path: "/etc/sssa/mitm-ca.key".into(),
+            },
+        ];
+        config
+    }
+
+    fn interception_capability<'a>(
+        value: &'a serde_json::Value,
+        capability: &str,
+    ) -> &'a serde_json::Value {
+        value["interception"]["capabilities"]
+            .as_array()
+            .expect("interception capabilities should serialize as an array")
+            .iter()
+            .find(|state| state["capability"] == json!(capability))
+            .unwrap_or_else(|| panic!("missing interception capability {capability}"))
     }
 
     fn build_test_runtime_composition(
