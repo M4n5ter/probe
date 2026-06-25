@@ -62,7 +62,68 @@ pub enum TransparentInterceptionStrategyConfig {
     None,
     InboundTproxy,
     OutboundTransparentProxy,
+    InboundTproxyMitm,
+    OutboundTransparentMitm,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparentInterceptionDirectionConfig {
+    InboundTproxy,
+    OutboundTransparentProxy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparentInterceptionL7ModeConfig {
+    Passthrough,
+    Mitm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransparentInterceptionStrategyDescriptor {
+    strategy: TransparentInterceptionStrategyConfig,
+    direction: TransparentInterceptionDirectionConfig,
+    l7_mode: TransparentInterceptionL7ModeConfig,
+}
+
+impl TransparentInterceptionStrategyDescriptor {
+    pub fn strategy(self) -> TransparentInterceptionStrategyConfig {
+        self.strategy
+    }
+
+    pub fn direction(self) -> TransparentInterceptionDirectionConfig {
+        self.direction
+    }
+
+    pub fn l7_mode(self) -> TransparentInterceptionL7ModeConfig {
+        self.l7_mode
+    }
+}
+
+const TRANSPARENT_INTERCEPTION_STRATEGY_DESCRIPTORS: [TransparentInterceptionStrategyDescriptor;
+    4] = [
+    TransparentInterceptionStrategyDescriptor {
+        strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
+        direction: TransparentInterceptionDirectionConfig::InboundTproxy,
+        l7_mode: TransparentInterceptionL7ModeConfig::Passthrough,
+    },
+    TransparentInterceptionStrategyDescriptor {
+        strategy: TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
+        direction: TransparentInterceptionDirectionConfig::OutboundTransparentProxy,
+        l7_mode: TransparentInterceptionL7ModeConfig::Passthrough,
+    },
+    TransparentInterceptionStrategyDescriptor {
+        strategy: TransparentInterceptionStrategyConfig::InboundTproxyMitm,
+        direction: TransparentInterceptionDirectionConfig::InboundTproxy,
+        l7_mode: TransparentInterceptionL7ModeConfig::Mitm,
+    },
+    TransparentInterceptionStrategyDescriptor {
+        strategy: TransparentInterceptionStrategyConfig::OutboundTransparentMitm,
+        direction: TransparentInterceptionDirectionConfig::OutboundTransparentProxy,
+        l7_mode: TransparentInterceptionL7ModeConfig::Mitm,
+    },
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransparentInterceptionProxyIntent {
@@ -75,10 +136,8 @@ impl TransparentInterceptionProxyIntent {
     pub fn strategy(&self) -> TransparentInterceptionStrategyConfig {
         match self {
             Self::Disabled(_) => TransparentInterceptionStrategyConfig::None,
-            Self::InboundTproxy(_) => TransparentInterceptionStrategyConfig::InboundTproxy,
-            Self::OutboundTransparentProxy(_) => {
-                TransparentInterceptionStrategyConfig::OutboundTransparentProxy
-            }
+            Self::InboundTproxy(proxy) => proxy.strategy(),
+            Self::OutboundTransparentProxy(proxy) => proxy.strategy(),
         }
     }
 
@@ -141,12 +200,22 @@ impl TransparentInterceptionDisabledProxyIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentInterceptionEnabledProxyIntent {
+    strategy: TransparentInterceptionStrategyConfig,
+    l7_mode: TransparentInterceptionL7ModeConfig,
     mode: TransparentInterceptionProxyModeConfig,
     listen_port: NonZeroU16,
     health_probe: TransparentInterceptionProxyHealthProbeIntent,
 }
 
 impl TransparentInterceptionEnabledProxyIntent {
+    pub fn strategy(&self) -> TransparentInterceptionStrategyConfig {
+        self.strategy
+    }
+
+    pub fn l7_mode(&self) -> TransparentInterceptionL7ModeConfig {
+        self.l7_mode
+    }
+
     pub fn mode(&self) -> TransparentInterceptionProxyModeConfig {
         self.mode
     }
@@ -162,11 +231,21 @@ impl TransparentInterceptionEnabledProxyIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentInterceptionOutboundProxyIntent {
+    strategy: TransparentInterceptionStrategyConfig,
+    l7_mode: TransparentInterceptionL7ModeConfig,
     mode: TransparentInterceptionOutboundProxyModeIntent,
     listen_port: NonZeroU16,
 }
 
 impl TransparentInterceptionOutboundProxyIntent {
+    pub fn strategy(&self) -> TransparentInterceptionStrategyConfig {
+        self.strategy
+    }
+
+    pub fn l7_mode(&self) -> TransparentInterceptionL7ModeConfig {
+        self.l7_mode
+    }
+
     pub fn mode(&self) -> TransparentInterceptionProxyModeConfig {
         self.mode.mode()
     }
@@ -251,8 +330,47 @@ impl TransparentInterceptionProxyIntentViolation {
 }
 
 impl TransparentInterceptionStrategyConfig {
+    pub fn from_parts(
+        direction: TransparentInterceptionDirectionConfig,
+        l7_mode: TransparentInterceptionL7ModeConfig,
+    ) -> Self {
+        TRANSPARENT_INTERCEPTION_STRATEGY_DESCRIPTORS
+            .iter()
+            .copied()
+            .find(|descriptor| {
+                descriptor.direction() == direction && descriptor.l7_mode() == l7_mode
+            })
+            .expect("transparent interception strategy descriptor table is exhaustive")
+            .strategy()
+    }
+
     pub fn is_enabled(self) -> bool {
-        !matches!(self, Self::None)
+        self.descriptor().is_some()
+    }
+
+    pub fn is_outbound(self) -> bool {
+        self.descriptor().is_some_and(|descriptor| {
+            descriptor.direction()
+                == TransparentInterceptionDirectionConfig::OutboundTransparentProxy
+        })
+    }
+
+    pub fn is_mitm(self) -> bool {
+        self.descriptor()
+            .is_some_and(|descriptor| descriptor.l7_mode().is_mitm())
+    }
+
+    pub fn descriptor(self) -> Option<TransparentInterceptionStrategyDescriptor> {
+        TRANSPARENT_INTERCEPTION_STRATEGY_DESCRIPTORS
+            .iter()
+            .copied()
+            .find(|descriptor| descriptor.strategy() == self)
+    }
+}
+
+impl TransparentInterceptionL7ModeConfig {
+    pub fn is_mitm(self) -> bool {
+        matches!(self, Self::Mitm)
     }
 }
 
@@ -278,6 +396,14 @@ impl EnforcementInterceptionConfig {
             violations.push(intent_violation(
                 "enforcement.interception.proxy.mode",
                 "managed TCP relay proxy mode requires an enabled transparent interception strategy",
+            ));
+        }
+        if self.strategy.is_mitm()
+            && self.proxy.mode == TransparentInterceptionProxyModeConfig::ManagedTcpRelay
+        {
+            violations.push(intent_violation(
+                "enforcement.interception.proxy.mode",
+                "MITM interception requires an explicit L7 backend; managed_tcp_relay is only a plain TCP relay",
             ));
         }
         let self_bypass_contract = resolve_self_bypass_contract(self);
@@ -307,17 +433,18 @@ impl EnforcementInterceptionConfig {
             },
             None => TransparentInterceptionProxyHealthProbeIntent::Disabled,
         };
-        let intent = match self.strategy {
-            TransparentInterceptionStrategyConfig::None => {
-                TransparentInterceptionProxyIntent::Disabled(
-                    TransparentInterceptionDisabledProxyIntent {
-                        mode: self.proxy.mode,
-                        listen_port,
-                        health_probe,
-                    },
-                )
-            }
-            TransparentInterceptionStrategyConfig::InboundTproxy => {
+        let intent = match self.strategy.descriptor() {
+            None => TransparentInterceptionProxyIntent::Disabled(
+                TransparentInterceptionDisabledProxyIntent {
+                    mode: self.proxy.mode,
+                    listen_port,
+                    health_probe,
+                },
+            ),
+            Some(descriptor)
+                if descriptor.direction()
+                    == TransparentInterceptionDirectionConfig::InboundTproxy =>
+            {
                 let Some(listen_port) = listen_port else {
                     return Err(vec![intent_violation(
                         "enforcement.interception.proxy.listen_port",
@@ -326,13 +453,18 @@ impl EnforcementInterceptionConfig {
                 };
                 TransparentInterceptionProxyIntent::InboundTproxy(
                     TransparentInterceptionEnabledProxyIntent {
+                        strategy: descriptor.strategy(),
+                        l7_mode: descriptor.l7_mode(),
                         mode: self.proxy.mode,
                         listen_port,
                         health_probe,
                     },
                 )
             }
-            TransparentInterceptionStrategyConfig::OutboundTransparentProxy => {
+            Some(descriptor)
+                if descriptor.direction()
+                    == TransparentInterceptionDirectionConfig::OutboundTransparentProxy =>
+            {
                 let Some(listen_port) = listen_port else {
                     return Err(vec![intent_violation(
                         "enforcement.interception.proxy.listen_port",
@@ -347,9 +479,15 @@ impl EnforcementInterceptionConfig {
                     )]);
                 };
                 TransparentInterceptionProxyIntent::OutboundTransparentProxy(
-                    TransparentInterceptionOutboundProxyIntent { mode, listen_port },
+                    TransparentInterceptionOutboundProxyIntent {
+                        strategy: descriptor.strategy(),
+                        l7_mode: descriptor.l7_mode(),
+                        mode,
+                        listen_port,
+                    },
                 )
             }
+            Some(_) => unreachable!("transparent interception descriptor direction is exhaustive"),
         };
         Ok(intent)
     }
@@ -383,7 +521,7 @@ fn validate_transparent_proxy_health_probe(
             "transparent proxy health probe requires an enabled interception strategy",
         ));
     }
-    if interception.strategy == TransparentInterceptionStrategyConfig::OutboundTransparentProxy {
+    if interception.strategy.is_outbound() {
         violations.push(intent_violation(
             "enforcement.interception.proxy.health_probe.target",
             "transparent proxy health probe is currently executable for inbound TPROXY only",
@@ -459,7 +597,7 @@ fn resolve_self_bypass_contract(
 ) -> TransparentProxySelfBypassContract {
     let self_bypass = interception.proxy.self_bypass;
 
-    if interception.strategy != TransparentInterceptionStrategyConfig::OutboundTransparentProxy {
+    if !interception.strategy.is_outbound() {
         if self_bypass == TransparentInterceptionProxySelfBypassConfig::UsesReservedMark {
             return TransparentProxySelfBypassContract::Violation(intent_violation(
                 "enforcement.interception.proxy.self_bypass",
@@ -622,4 +760,57 @@ pub struct EnforcementPolicyManifest {
     pub version: String,
     pub selector: Option<Selector>,
     pub protective_actions: ProtectiveActionProfile,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transparent_interception_strategy_descriptors_round_trip() {
+        let strategies = [
+            (
+                TransparentInterceptionStrategyConfig::InboundTproxy,
+                TransparentInterceptionDirectionConfig::InboundTproxy,
+                TransparentInterceptionL7ModeConfig::Passthrough,
+            ),
+            (
+                TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
+                TransparentInterceptionDirectionConfig::OutboundTransparentProxy,
+                TransparentInterceptionL7ModeConfig::Passthrough,
+            ),
+            (
+                TransparentInterceptionStrategyConfig::InboundTproxyMitm,
+                TransparentInterceptionDirectionConfig::InboundTproxy,
+                TransparentInterceptionL7ModeConfig::Mitm,
+            ),
+            (
+                TransparentInterceptionStrategyConfig::OutboundTransparentMitm,
+                TransparentInterceptionDirectionConfig::OutboundTransparentProxy,
+                TransparentInterceptionL7ModeConfig::Mitm,
+            ),
+        ];
+
+        for (strategy, direction, l7_mode) in strategies {
+            let descriptor = strategy.descriptor().expect("enabled strategy descriptor");
+
+            assert_eq!(descriptor.strategy(), strategy);
+            assert_eq!(descriptor.direction(), direction);
+            assert_eq!(descriptor.l7_mode(), l7_mode);
+            assert_eq!(
+                TransparentInterceptionStrategyConfig::from_parts(direction, l7_mode),
+                strategy
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_transparent_interception_strategy_has_no_descriptor() {
+        let strategy = TransparentInterceptionStrategyConfig::None;
+
+        assert!(!strategy.is_enabled());
+        assert!(!strategy.is_outbound());
+        assert!(!strategy.is_mitm());
+        assert_eq!(strategy.descriptor(), None);
+    }
 }

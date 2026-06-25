@@ -4,9 +4,10 @@ use ::enforcement::EnforcementBackend;
 use probe_config::{ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig};
 use probe_core::EnforcementMode;
 use runtime::{
-    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionClassificationPlan,
-    TransparentInterceptionLocalSetupProjectionPlan, TransparentInterceptionNftablesPlan,
-    TransparentInterceptionOutboundRedirectPlan, TransparentInterceptionProxyPlan,
+    EnforcementCapabilityPlan, RequiredCapabilityPlan, RuntimePlan,
+    TransparentInterceptionClassificationPlan, TransparentInterceptionLocalSetupProjectionPlan,
+    TransparentInterceptionNftablesPlan, TransparentInterceptionOutboundRedirectPlan,
+    TransparentInterceptionProxyPlan,
 };
 use serde::Serialize;
 
@@ -51,7 +52,7 @@ pub struct EnforcementInterceptionCheckSnapshot {
     pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
     pub classification: TransparentInterceptionClassificationPlan,
     pub selector_configured: bool,
-    pub capability: EnforcementCapabilityPlan,
+    pub capabilities: Vec<RequiredCapabilityPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -133,7 +134,7 @@ pub(super) async fn check_enforcement(
             local_setup_projection: plan.enforcement.interception.local_setup_projection.clone(),
             classification: plan.enforcement.interception.classification.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,
-            capability: plan.enforcement.interception.capability.clone(),
+            capabilities: plan.enforcement.interception.capabilities.clone(),
         },
         effective_selector_configured: active_policy.effective_selector_configured(),
         config_selector_configured: enforcement.config_selector_configured,

@@ -16,7 +16,7 @@ pub use capture::{
 pub use enforcement::{
     EnforcementCapabilityPlan, EnforcementConnectionPlan, EnforcementExecutionSurface,
     EnforcementInterceptionPlan, EnforcementPlan, EnforcementPolicySourceKind,
-    EnforcementPolicySourcePlan, TransparentInterceptionClassificationPlan,
+    EnforcementPolicySourcePlan, RequiredCapabilityPlan, TransparentInterceptionClassificationPlan,
     TransparentInterceptionExecutionPlan, TransparentInterceptionInboundTproxyPlan,
     TransparentInterceptionNftablesPlan, TransparentInterceptionOutboundProxyPlan,
     TransparentInterceptionOutboundRedirectPlan, TransparentInterceptionProxyHealthProbePlan,

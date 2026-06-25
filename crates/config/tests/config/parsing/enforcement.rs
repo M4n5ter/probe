@@ -48,6 +48,67 @@ remote_addresses = []
 }
 
 #[test]
+fn parses_outbound_transparent_mitm_strategy() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "outbound_transparent_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+self_bypass = "uses_reserved_mark"
+listen_port = 15002
+"#,
+    )?;
+
+    assert_eq!(
+        config.enforcement.interception.strategy,
+        TransparentInterceptionStrategyConfig::OutboundTransparentMitm
+    );
+    assert_eq!(
+        config.enforcement.interception.proxy.mode,
+        TransparentInterceptionProxyModeConfig::External
+    );
+    assert_eq!(
+        config.enforcement.interception.proxy.self_bypass,
+        TransparentInterceptionProxySelfBypassConfig::UsesReservedMark
+    );
+    assert_eq!(
+        config.enforcement.interception.proxy.listen_port,
+        Some(15002)
+    );
+    Ok(())
+}
+
+#[test]
+fn parses_inbound_tproxy_mitm_strategy() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+listen_port = 15003
+"#,
+    )?;
+
+    assert_eq!(
+        config.enforcement.interception.strategy,
+        TransparentInterceptionStrategyConfig::InboundTproxyMitm
+    );
+    assert_eq!(
+        config.enforcement.interception.proxy.mode,
+        TransparentInterceptionProxyModeConfig::External
+    );
+    assert_eq!(
+        config.enforcement.interception.proxy.listen_port,
+        Some(15003)
+    );
+    Ok(())
+}
+
+#[test]
 fn parses_external_outbound_proxy_self_bypass_contract() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
         r#"

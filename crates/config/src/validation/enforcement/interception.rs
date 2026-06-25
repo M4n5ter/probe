@@ -97,6 +97,32 @@ mod tests {
     }
 
     #[test]
+    fn mitm_strategy_rejects_managed_tcp_relay() {
+        for strategy in [
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm,
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm,
+        ] {
+            let mut violations = Vec::new();
+            validate(
+                &EnforcementInterceptionConfig {
+                    strategy,
+                    selector: None,
+                    proxy: TransparentInterceptionProxyConfig {
+                        mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+                        listen_port: Some(15001),
+                        ..TransparentInterceptionProxyConfig::default()
+                    },
+                },
+                &mut violations,
+            );
+
+            assert!(violations.iter().any(|violation| violation.field
+                == "enforcement.interception.proxy.mode"
+                && violation.reason.contains("plain TCP relay")));
+        }
+    }
+
+    #[test]
     fn health_probe_requires_enabled_strategy_and_valid_target() {
         let mut violations = Vec::new();
         validate(

@@ -9,7 +9,7 @@ use interception::{
     TransparentInterceptionSetupProjectionError, TransparentInterceptionSetupSelectorSources,
     TransparentInterceptionSetupSelectors, TransparentInterceptionSocketOwnerScope,
 };
-use probe_config::TransparentInterceptionStrategyConfig;
+use probe_config::{TransparentInterceptionDirectionConfig, TransparentInterceptionStrategyConfig};
 use probe_core::{ProcessSelector, Selector, TrafficSelector};
 use serde::{Deserialize, Serialize};
 
@@ -124,12 +124,14 @@ impl TransparentInterceptionLocalSetupProjectionPlan {
         enforcement_selector: Option<&Selector>,
         interception_selector: Option<&Selector>,
     ) -> Self {
-        match strategy {
-            TransparentInterceptionStrategyConfig::None => Self::NotConfigured,
-            TransparentInterceptionStrategyConfig::InboundTproxy => {
+        let Some(descriptor) = strategy.descriptor() else {
+            return Self::NotConfigured;
+        };
+        match descriptor.direction() {
+            TransparentInterceptionDirectionConfig::InboundTproxy => {
                 Self::from_inbound_selectors(enforcement_selector, interception_selector)
             }
-            TransparentInterceptionStrategyConfig::OutboundTransparentProxy => {
+            TransparentInterceptionDirectionConfig::OutboundTransparentProxy => {
                 Self::from_outbound_selectors(enforcement_selector, interception_selector)
             }
         }

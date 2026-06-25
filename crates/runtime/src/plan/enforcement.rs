@@ -2,7 +2,8 @@ use std::{fmt, net::SocketAddr, num::NonZeroU16, path::PathBuf};
 
 use probe_config::{
     AgentConfig, ConnectionEnforcementBackendConfig, EnforcementInterceptionConfig,
-    EnforcementPolicySourceConfig, TransparentInterceptionOutboundProxyIntent,
+    EnforcementPolicySourceConfig, TransparentInterceptionDirectionConfig,
+    TransparentInterceptionL7ModeConfig, TransparentInterceptionOutboundProxyIntent,
     TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent,
     TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
@@ -95,7 +96,7 @@ pub struct EnforcementInterceptionPlan {
     pub nftables: TransparentInterceptionNftablesPlan,
     pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
     pub classification: TransparentInterceptionClassificationPlan,
-    pub capability: EnforcementCapabilityPlan,
+    pub capabilities: Vec<RequiredCapabilityPlan>,
     pub selector_configured: bool,
 }
 
@@ -124,7 +125,7 @@ impl EnforcementInterceptionPlan {
             classification: TransparentInterceptionClassificationPlan::from_capabilities(
                 capabilities,
             ),
-            capability: EnforcementCapabilityPlan::from_interception_strategy(
+            capabilities: EnforcementCapabilityPlan::from_interception_strategy(
                 strategy,
                 capabilities,
             ),
@@ -206,7 +207,7 @@ impl fmt::Display for TransparentInterceptionProxyPlanError {
 impl std::error::Error for TransparentInterceptionProxyPlanError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "strategy")]
+#[serde(rename_all = "snake_case", tag = "direction")]
 pub enum TransparentInterceptionExecutionPlan {
     Disabled,
     InboundTproxy(TransparentInterceptionInboundTproxyPlan),
@@ -235,6 +236,7 @@ impl TransparentInterceptionExecutionPlan {
             TransparentInterceptionProxyIntent::Disabled(_) => Self::Disabled,
             TransparentInterceptionProxyIntent::InboundTproxy(proxy) => {
                 Self::InboundTproxy(TransparentInterceptionInboundTproxyPlan {
+                    l7_mode: proxy.l7_mode(),
                     proxy_mode: proxy.mode(),
                     listen_port: proxy.listen_port(),
                     health_probe: TransparentInterceptionProxyHealthProbePlan::from_intent(
@@ -253,9 +255,15 @@ impl TransparentInterceptionExecutionPlan {
     pub fn strategy(&self) -> TransparentInterceptionStrategyConfig {
         match self {
             Self::Disabled => TransparentInterceptionStrategyConfig::None,
-            Self::InboundTproxy(_) => TransparentInterceptionStrategyConfig::InboundTproxy,
-            Self::OutboundTransparentProxy(_) => {
-                TransparentInterceptionStrategyConfig::OutboundTransparentProxy
+            Self::InboundTproxy(plan) => TransparentInterceptionStrategyConfig::from_parts(
+                TransparentInterceptionDirectionConfig::InboundTproxy,
+                plan.l7_mode,
+            ),
+            Self::OutboundTransparentProxy(plan) => {
+                TransparentInterceptionStrategyConfig::from_parts(
+                    TransparentInterceptionDirectionConfig::OutboundTransparentProxy,
+                    plan.l7_mode,
+                )
             }
         }
     }
@@ -272,12 +280,17 @@ impl TransparentInterceptionExecutionPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransparentInterceptionInboundTproxyPlan {
+    l7_mode: TransparentInterceptionL7ModeConfig,
     proxy_mode: TransparentInterceptionProxyModeConfig,
     listen_port: NonZeroU16,
     health_probe: TransparentInterceptionProxyHealthProbePlan,
 }
 
 impl TransparentInterceptionInboundTproxyPlan {
+    pub fn l7_mode(&self) -> TransparentInterceptionL7ModeConfig {
+        self.l7_mode
+    }
+
     pub fn proxy_mode(&self) -> TransparentInterceptionProxyModeConfig {
         self.proxy_mode
     }
@@ -293,6 +306,7 @@ impl TransparentInterceptionInboundTproxyPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransparentInterceptionOutboundProxyPlan {
+    l7_mode: TransparentInterceptionL7ModeConfig,
     lifecycle: TransparentInterceptionOutboundProxyLifecyclePlan,
     outbound_redirect_artifact: OutboundRedirectArtifactSpec,
 }
@@ -303,6 +317,7 @@ impl TransparentInterceptionOutboundProxyPlan {
         nftables: &TransparentInterceptionNftablesPlan,
     ) -> Self {
         Self {
+            l7_mode: proxy.l7_mode(),
             lifecycle: TransparentInterceptionOutboundProxyLifecyclePlan::from_intent(
                 *proxy.lifecycle(),
             ),
@@ -311,6 +326,10 @@ impl TransparentInterceptionOutboundProxyPlan {
                 proxy.listen_port().get(),
             ),
         }
+    }
+
+    pub fn l7_mode(&self) -> TransparentInterceptionL7ModeConfig {
+        self.l7_mode
     }
 
     pub fn proxy_mode(&self) -> TransparentInterceptionProxyModeConfig {
@@ -465,6 +484,24 @@ pub enum EnforcementCapabilityPlan {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequiredCapabilityPlan {
+    pub capability: CapabilityKind,
+    pub mode: RuntimeMode,
+}
+
+impl RequiredCapabilityPlan {
+    fn from_requirement(
+        requirement: EnforcementCapabilityRequirement,
+        capabilities: &CapabilityMatrix,
+    ) -> Self {
+        Self {
+            capability: requirement.capability,
+            mode: capabilities.mode(requirement.capability),
+        }
+    }
+}
+
 impl EnforcementCapabilityPlan {
     pub(super) fn requirement_for_mode(
         mode: EnforcementMode,
@@ -493,24 +530,30 @@ impl EnforcementCapabilityPlan {
         }
     }
 
-    pub(super) fn requirement_for_interception_strategy(
+    pub(super) fn requirements_for_interception_strategy(
         strategy: TransparentInterceptionStrategyConfig,
-    ) -> Option<EnforcementCapabilityRequirement> {
-        match strategy {
-            TransparentInterceptionStrategyConfig::InboundTproxy => {
-                Some(EnforcementCapabilityRequirement {
-                    capability: CapabilityKind::TransparentInterception,
-                    unavailable_reason: "transparent interception backend is not available in this build/runtime",
-                })
-            }
-            TransparentInterceptionStrategyConfig::OutboundTransparentProxy => {
-                Some(EnforcementCapabilityRequirement {
-                    capability: CapabilityKind::TransparentInterception,
-                    unavailable_reason: "outbound transparent proxy backend is not available in this build/runtime",
-                })
-            }
-            TransparentInterceptionStrategyConfig::None => None,
+    ) -> Vec<EnforcementCapabilityRequirement> {
+        let Some(descriptor) = strategy.descriptor() else {
+            return Vec::new();
+        };
+        let mut requirements = vec![EnforcementCapabilityRequirement {
+            capability: CapabilityKind::TransparentInterception,
+            unavailable_reason: match descriptor.direction() {
+                TransparentInterceptionDirectionConfig::InboundTproxy => {
+                    "transparent interception backend is not available in this build/runtime"
+                }
+                TransparentInterceptionDirectionConfig::OutboundTransparentProxy => {
+                    "outbound transparent proxy backend is not available in this build/runtime"
+                }
+            },
+        }];
+        if descriptor.l7_mode().is_mitm() {
+            requirements.push(EnforcementCapabilityRequirement {
+                capability: CapabilityKind::L7Mitm,
+                unavailable_reason: "L7 MITM backend is not available in this build/runtime",
+            });
         }
+        requirements
     }
 
     fn from_mode(mode: EnforcementMode, capabilities: &CapabilityMatrix) -> Self {
@@ -541,16 +584,11 @@ impl EnforcementCapabilityPlan {
     fn from_interception_strategy(
         strategy: TransparentInterceptionStrategyConfig,
         capabilities: &CapabilityMatrix,
-    ) -> Self {
-        Self::requirement_for_interception_strategy(strategy).map_or(
-            Self::NotRequired,
-            |requirement| {
-                Self::required(
-                    requirement.capability,
-                    capabilities.mode(requirement.capability),
-                )
-            },
-        )
+    ) -> Vec<RequiredCapabilityPlan> {
+        Self::requirements_for_interception_strategy(strategy)
+            .into_iter()
+            .map(|requirement| RequiredCapabilityPlan::from_requirement(requirement, capabilities))
+            .collect()
     }
 
     fn required(capability: CapabilityKind, mode: RuntimeMode) -> Self {
@@ -766,11 +804,11 @@ mod tests {
             TransparentInterceptionOutboundRedirectPlan::NotConfigured
         );
         assert_eq!(
-            plan.interception.capability,
-            EnforcementCapabilityPlan::Required {
+            plan.interception.capabilities,
+            vec![RequiredCapabilityPlan {
                 capability: CapabilityKind::TransparentInterception,
                 mode: RuntimeMode::Available,
-            }
+            }]
         );
         assert_eq!(
             plan.interception.classification.process_classifier,
@@ -814,11 +852,11 @@ mod tests {
             TransparentInterceptionLocalSetupProjectionPlan::HostRules { .. }
         ));
         assert_eq!(
-            plan.interception.capability,
-            EnforcementCapabilityPlan::Required {
+            plan.interception.capabilities,
+            vec![RequiredCapabilityPlan {
                 capability: CapabilityKind::TransparentInterception,
                 mode: RuntimeMode::Unavailable,
-            }
+            }]
         );
         assert_eq!(
             plan.interception.execution.outbound_redirect_plan(),
@@ -834,6 +872,61 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn enforcement_plan_reports_outbound_mitm_capability_requirements() {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm;
+        config.enforcement.interception.proxy.self_bypass =
+            TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let capabilities = CapabilityMatrix::new([
+            CapabilityState::available(CapabilityKind::TransparentInterception),
+            CapabilityState::unavailable(CapabilityKind::L7Mitm, "not wired"),
+        ]);
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        assert_eq!(
+            plan.interception.strategy,
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm
+        );
+        assert_eq!(
+            plan.interception.proxy.mode,
+            TransparentInterceptionProxyModeConfig::External
+        );
+        assert_eq!(
+            plan.interception.proxy.self_bypass,
+            TransparentInterceptionProxySelfBypassConfig::UsesReservedMark
+        );
+        assert_eq!(
+            plan.interception.capabilities,
+            vec![
+                RequiredCapabilityPlan {
+                    capability: CapabilityKind::TransparentInterception,
+                    mode: RuntimeMode::Available,
+                },
+                RequiredCapabilityPlan {
+                    capability: CapabilityKind::L7Mitm,
+                    mode: RuntimeMode::Unavailable,
+                },
+            ]
+        );
+        assert!(matches!(
+            plan.interception.execution.outbound_redirect_plan(),
+            TransparentInterceptionOutboundRedirectPlan::Planned { .. }
+        ));
     }
 
     #[test]

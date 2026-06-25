@@ -533,8 +533,8 @@ protective_actions = ["alert"]
             )
         );
         assert_eq!(
-            value["enforcement"]["interception"]["capability"]["kind"],
-            json!("not_required")
+            value["enforcement"]["interception"]["capabilities"],
+            json!([])
         );
         assert_eq!(
             value["enforcement"]["effective_selector_configured"],
@@ -660,6 +660,67 @@ protective_actions = ["alert"]
         assert_eq!(
             value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["proxy_bypass_mark"],
             json!(0x5353_4102)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_exposes_outbound_mitm_capability_requirements()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm;
+        config.enforcement.interception.proxy.self_bypass =
+            probe_config::TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let plan = RuntimePlan::build(
+            config,
+            &runtime_registry(vec![
+                CapabilityState::available(CapabilityKind::TransparentInterception),
+                CapabilityState::available(CapabilityKind::L7Mitm),
+            ]),
+        )?;
+
+        let report = build_check_report(plan, None).await?;
+        let value = serde_json::to_value(report)?;
+
+        assert_eq!(
+            value["enforcement"]["interception"]["strategy"],
+            json!("outbound_transparent_mitm")
+        );
+        assert_eq!(
+            value["plan"]["enforcement"]["interception"]["strategy"],
+            json!("outbound_transparent_mitm")
+        );
+        assert_eq!(
+            value["plan"]["enforcement"]["interception"]["execution"]["direction"],
+            json!("outbound_transparent_proxy")
+        );
+        assert_eq!(
+            value["plan"]["enforcement"]["interception"]["execution"]["l7_mode"],
+            json!("mitm")
+        );
+        assert_eq!(
+            interception_capability(&value, "transparent_interception")["mode"],
+            json!("available")
+        );
+        assert_eq!(
+            interception_capability(&value, "l7_mitm")["mode"],
+            json!("available")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["outbound_redirect"]["kind"],
+            json!("planned")
         );
         Ok(())
     }
@@ -877,6 +938,18 @@ protective_actions = ["alert"]
             .iter()
             .find(|state| state["kind"] == json!(kind))
             .unwrap_or_else(|| panic!("missing serialized capability {kind}"))
+    }
+
+    fn interception_capability<'a>(
+        value: &'a serde_json::Value,
+        capability: &str,
+    ) -> &'a serde_json::Value {
+        value["enforcement"]["interception"]["capabilities"]
+            .as_array()
+            .expect("interception capabilities should serialize as an array")
+            .iter()
+            .find(|state| state["capability"] == json!(capability))
+            .unwrap_or_else(|| panic!("missing interception capability {capability}"))
     }
 
     fn config_with_policy(path: &Path) -> Result<AgentConfig, probe_config::ConfigError> {

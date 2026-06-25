@@ -118,7 +118,7 @@ fn enforcement_capability_checks(config: &AgentConfig) -> Vec<EnforcementCapabil
             requirement,
         });
     }
-    if let Some(requirement) = EnforcementCapabilityPlan::requirement_for_interception_strategy(
+    for requirement in EnforcementCapabilityPlan::requirements_for_interception_strategy(
         config.enforcement.interception.strategy,
     ) {
         checks.push(EnforcementCapabilityCheck {
@@ -139,7 +139,8 @@ mod tests {
     use probe_config::{
         CaptureBackend, CaptureSelection, CompressionCodecName, ConfigValidationError,
         ConnectionEnforcementBackendConfig, ExporterConfig, ExporterTransportConfig,
-        TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
+        TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
+        TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
         CapabilityKind, CapabilityState, Direction, ProcessSelector, RuntimeMode, Selector,
@@ -367,6 +368,60 @@ mod tests {
         let error = validation_error(config, &registry);
 
         assert_violation(&error, "enforcement.interception.strategy", "not built");
+    }
+
+    #[test]
+    fn outbound_transparent_mitm_requires_l7_mitm_capability() {
+        let registry = ProviderRegistry::new(
+            vec![live_capture_provider()],
+            transparent_interception_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm;
+        config.enforcement.interception.proxy.self_bypass =
+            TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(&error, "enforcement.interception.strategy", "L7 MITM");
+    }
+
+    #[test]
+    fn inbound_tproxy_mitm_requires_l7_mitm_capability() {
+        let registry = ProviderRegistry::new(
+            vec![live_capture_provider()],
+            transparent_interception_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(&error, "enforcement.interception.strategy", "L7 MITM");
     }
 
     #[test]

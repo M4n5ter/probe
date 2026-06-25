@@ -8,9 +8,10 @@ use crate::transparent_interception::TransparentProxyRuntimeSnapshot;
 use probe_config::{ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig};
 use probe_core::{CapabilityKind, EnforcementMode, ProtectiveActionProfile, RuntimeMode};
 use runtime::{
-    EnforcementCapabilityPlan, RuntimePlan, TransparentInterceptionClassificationPlan,
-    TransparentInterceptionLocalSetupProjectionPlan, TransparentInterceptionNftablesPlan,
-    TransparentInterceptionOutboundRedirectPlan, TransparentInterceptionProxyPlan,
+    EnforcementCapabilityPlan, RequiredCapabilityPlan, RuntimePlan,
+    TransparentInterceptionClassificationPlan, TransparentInterceptionLocalSetupProjectionPlan,
+    TransparentInterceptionNftablesPlan, TransparentInterceptionOutboundRedirectPlan,
+    TransparentInterceptionProxyPlan,
 };
 use serde::Serialize;
 
@@ -42,7 +43,7 @@ pub struct EnforcementInterceptionStatusSnapshot {
     pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
     pub classification: TransparentInterceptionClassificationPlan,
     pub selector_configured: bool,
-    pub capability: EnforcementCapabilityStatusSnapshot,
+    pub capabilities: Vec<RequiredCapabilityPlan>,
     pub runtime_proxy: Option<TransparentProxyRuntimeSnapshot>,
 }
 
@@ -166,7 +167,7 @@ fn enforcement_status_with_source(
             local_setup_projection: plan.enforcement.interception.local_setup_projection.clone(),
             classification: plan.enforcement.interception.classification.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,
-            capability: enforcement_capability_status(&plan.enforcement.interception.capability),
+            capabilities: plan.enforcement.interception.capabilities.clone(),
             runtime_proxy: transparent_proxy,
         },
         policy: policy.snapshot,
@@ -698,11 +699,11 @@ protective_actions = ["alert"]
             runtime::TransparentInterceptionLocalSetupProjectionPlan::HostRules { .. }
         ));
         assert_eq!(
-            status.interception.capability,
-            EnforcementCapabilityStatusSnapshot::Required {
+            status.interception.capabilities,
+            vec![RequiredCapabilityPlan {
                 capability: CapabilityKind::TransparentInterception,
                 mode: RuntimeMode::Available,
-            }
+            }]
         );
         assert_eq!(
             status.interception.classification.process_classifier.kind,
@@ -798,7 +799,7 @@ protective_actions = ["alert"]
             )
         );
         assert_eq!(
-            value["interception"]["capability"]["capability"],
+            value["interception"]["capabilities"][0]["capability"],
             json!("transparent_interception")
         );
         Ok(())
@@ -837,10 +838,13 @@ protective_actions = ["alert"]
             status.interception.local_setup_projection,
             runtime::TransparentInterceptionLocalSetupProjectionPlan::HostRules { .. }
         ));
-        assert!(matches!(
-            status.interception.capability,
-            EnforcementCapabilityStatusSnapshot::Required { .. }
-        ));
+        assert_eq!(
+            status.interception.capabilities,
+            vec![RequiredCapabilityPlan {
+                capability: CapabilityKind::TransparentInterception,
+                mode: RuntimeMode::Available,
+            }]
+        );
         assert_eq!(
             value["interception"]["outbound_redirect"]["kind"],
             json!("planned")
