@@ -16,6 +16,7 @@ members = [
     "crates/parsers",
     "crates/pipeline",
     "crates/policy",
+    "crates/probe-http",
     "crates/probe-io",
     "crates/proto",
     "crates/runtime",

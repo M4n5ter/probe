@@ -213,7 +213,7 @@ async fn handle_admin_request(
     match request {
         AdminRequest::ReloadPolicies => {
             match reload_policies(
-                &plan.config,
+                plan,
                 &runtime_state.policy_set,
                 &runtime_state.policy_reload_gate,
             )
@@ -605,9 +605,12 @@ mod tests {
         };
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
         let plan = Arc::new(runtime_plan_from_config(config)?);
-        let configured =
-            crate::configured_enforcement::build_configured_enforcement_with_backend(&plan, None)
-                .await?;
+        let configured = crate::configured_enforcement::build_configured_enforcement_with_backend(
+            &plan,
+            None,
+            crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
+        )
+        .await?;
         let (mut planner_view, runtime_state) =
             EnforcementRuntimeState::from_planner(configured.planner, configured.active_policy);
         let initial_decision = enforcement_decision(&mut planner_view, Action::Deny, 80)?;

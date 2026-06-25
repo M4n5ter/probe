@@ -226,7 +226,9 @@ fn write_agent_config(inputs: AgentConfigInputs<'_>) -> Result<(), Box<dyn std::
     config.admin.socket_path = inputs.admin_socket_path.to_path_buf();
     config.policies.push(PolicyConfig {
         id: POLICY_ID.to_string(),
-        path: inputs.policy_path.to_path_buf(),
+        source: probe_config::PolicySourceConfig::LocalDirectory {
+            path: inputs.policy_path.to_path_buf(),
+        },
         enabled: true,
         selector: None,
     });

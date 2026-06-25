@@ -1,21 +1,19 @@
-use std::path::PathBuf;
-
 use crate::{
     configured_enforcement::ConfiguredEnforcementError,
     configured_policy::{
-        ConfiguredPolicyError, LoadedConfiguredPolicy, configured_policy_selection,
-        load_configured_policies,
+        ConfiguredPolicyError, LoadedConfiguredPolicy, PolicySourceSnapshot,
+        configured_policy_selection, load_configured_policies_with_context,
     },
 };
 use ::enforcement::EnforcementBackend;
 use policy::PolicyHook;
-use probe_config::AgentConfig;
 use runtime::RuntimePlan;
 use serde::Serialize;
 use thiserror::Error;
 
 use super::enforcement::{EnforcementCheckSnapshot, check_enforcement};
 use super::tls::{TlsCheckError, TlsCheckSnapshot, check_tls};
+use crate::control_plane_http::policy_source_load_context_from_plan;
 
 #[derive(Debug, Error)]
 pub enum CheckError {
@@ -62,7 +60,7 @@ pub enum PolicyCheckMode {
 pub struct LoadedPolicySnapshot {
     pub id: String,
     pub version: String,
-    pub path: PathBuf,
+    pub source: PolicySourceSnapshot,
     pub selector_configured: bool,
     pub registered_hooks: Vec<PolicyHook>,
 }
@@ -73,7 +71,7 @@ pub async fn build_check_report(
 ) -> Result<CheckReport, CheckError> {
     let enforcement = check_enforcement(&plan, backend).await?;
     let tls = check_tls(&plan)?;
-    let policy = check_policy(&plan.config)?;
+    let policy = check_policy(&plan).await?;
     Ok(CheckReport {
         plan,
         tls,
@@ -82,10 +80,13 @@ pub async fn build_check_report(
     })
 }
 
-fn check_policy(config: &AgentConfig) -> Result<PolicyCheckSnapshot, CheckError> {
+async fn check_policy(plan: &RuntimePlan) -> Result<PolicyCheckSnapshot, CheckError> {
+    let config = &plan.config;
     let selection = configured_policy_selection(config);
     let enabled_count = selection.enabled.len() as u64;
-    let policies = load_configured_policies(config)?;
+    let policies =
+        load_configured_policies_with_context(config, policy_source_load_context_from_plan(plan))
+            .await?;
     if policies.is_empty() {
         return Ok(PolicyCheckSnapshot {
             mode: PolicyCheckMode::Inactive,
@@ -108,7 +109,7 @@ fn loaded_policy_snapshot(policy: &LoadedConfiguredPolicy) -> LoadedPolicySnapsh
     LoadedPolicySnapshot {
         id: manifest.id.clone(),
         version: manifest.version.clone(),
-        path: policy.source.path.clone(),
+        source: policy.source.source.clone(),
         selector_configured: policy.source.selector_configured,
         registered_hooks: manifest.hooks.clone(),
     }
@@ -163,7 +164,10 @@ mod tests {
         let active = report.policy.active.first().expect("loaded policy");
         assert_eq!(active.id, "guard");
         assert_eq!(active.version, "bundle-test");
-        assert_eq!(active.path, policy_path);
+        assert_eq!(
+            active.source,
+            PolicySourceSnapshot::LocalDirectory { path: policy_path }
+        );
         assert!(!active.selector_configured);
         assert!(
             active
@@ -201,7 +205,9 @@ mod tests {
         config.policies[0].id = "first".to_string();
         config.policies.push(probe_config::PolicyConfig {
             id: "second".to_string(),
-            path: second_path.clone(),
+            source: probe_config::PolicySourceConfig::LocalDirectory {
+                path: second_path.clone(),
+            },
             enabled: true,
             selector: Some(Selector::default()),
         });
@@ -220,8 +226,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["first", "second"]
         );
-        assert_eq!(report.policy.active[0].path, first_path);
-        assert_eq!(report.policy.active[1].path, second_path);
+        assert_eq!(
+            report.policy.active[0].source,
+            PolicySourceSnapshot::LocalDirectory { path: first_path }
+        );
+        assert_eq!(
+            report.policy.active[1].source,
+            PolicySourceSnapshot::LocalDirectory { path: second_path }
+        );
         assert!(!report.policy.active[0].selector_configured);
         assert!(report.policy.active[1].selector_configured);
         fs::remove_dir_all(temp)?;
@@ -1091,6 +1103,9 @@ selection = "replay"
 [[policies]]
 id = "guard"
 enabled = true
+
+[policies.source]
+kind = "local_directory"
 path = "{}"
 
 [[exporters]]

@@ -13,10 +13,9 @@ flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 http = "1.4"
 http-body-util = "0.1"
 hyper = { version = "1.10", features = ["client", "http1"] }
-hyper-rustls = "0.27"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
-probe-io = { path = "../probe-io" }
 probe-core = { path = "../core" }
+probe-http = { path = "../probe-http" }
 proto = { version = "0.1.0", path = "../proto" }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 rustls = "0.23"

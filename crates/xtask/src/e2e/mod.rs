@@ -14,6 +14,7 @@ mod plaintext_export_batches;
 mod plaintext_feed;
 mod plaintext_scenario;
 mod remote_enforcement_policy;
+mod remote_policy_bundle;
 mod sse_plaintext_feed;
 mod suite;
 mod tls_material_auto_binding_loopback;

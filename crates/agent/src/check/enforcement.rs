@@ -12,6 +12,7 @@ use serde::Serialize;
 use crate::configured_enforcement::{
     LoadedEnforcementPolicySourceSnapshot, build_configured_enforcement_check_with_backend,
 };
+use crate::control_plane_http::enforcement_policy_source_load_context_from_plan;
 
 use super::report::CheckError;
 
@@ -79,7 +80,12 @@ pub(super) async fn check_enforcement(
     plan: &RuntimePlan,
     backend: Option<Box<dyn EnforcementBackend>>,
 ) -> Result<EnforcementCheckSnapshot, CheckError> {
-    let check = build_configured_enforcement_check_with_backend(plan, backend).await?;
+    let check = build_configured_enforcement_check_with_backend(
+        plan,
+        backend,
+        enforcement_policy_source_load_context_from_plan(plan),
+    )
+    .await?;
     let composition =
         check
             .setup_error

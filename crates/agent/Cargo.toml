@@ -18,6 +18,7 @@ pipeline = { path = "../pipeline" }
 policy = { path = "../policy" }
 probe-core = { path = "../core" }
 probe-config = { path = "../config" }
+probe-http = { path = "../probe-http" }
 probe-io = { path = "../probe-io" }
 proto = { path = "../proto" }
 runtime = { path = "../runtime" }
@@ -34,7 +35,6 @@ socket2 = { version = "0.6.4", features = ["all"] }
 transparent-linux = { path = "../transparent-linux" }
 hyper = { version = "1.10", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
-hyper-rustls = "0.27"
 http-body-util = "0.1"
 http = "1.4"
 rustls = "0.23"

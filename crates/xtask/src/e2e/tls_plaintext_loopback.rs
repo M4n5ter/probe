@@ -564,7 +564,9 @@ fn write_agent_config(
     config.admin.socket_path = paths.admin_socket.clone();
     config.policies.push(PolicyConfig {
         id: POLICY_ID.to_string(),
-        path: paths.policy.clone(),
+        source: probe_config::PolicySourceConfig::LocalDirectory {
+            path: paths.policy.clone(),
+        },
         enabled: true,
         selector: None,
     });

@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use pipeline::{PipelinePolicy, PipelinePolicySet};
 use policy::PolicyRuntime;
 use probe_config::{AgentConfig, PolicyConfig};
@@ -7,31 +5,33 @@ use probe_core::CompiledSelector;
 use serde::Serialize;
 use thiserror::Error;
 
+use super::source::PolicySourceLoadContext;
+
 #[derive(Debug, Error)]
 pub enum ConfiguredPolicyError {
-    #[error("invalid policy source for {id} at {path}: {reason}")]
+    #[error("invalid policy source for {id} at {source_ref}: {reason}")]
     InvalidPolicySource {
         id: String,
-        path: String,
+        source_ref: String,
         reason: String,
     },
-    #[error("failed to read policy file for {id} at {path}: {source}")]
+    #[error("failed to read policy file for {id} at {source_ref}: {source}")]
     ReadPolicy {
         id: String,
-        path: String,
+        source_ref: String,
         source: std::io::Error,
     },
-    #[error("failed to initialize policy {id} at {path}: {source}")]
+    #[error("failed to initialize policy {id} at {source_ref}: {source}")]
     PolicyLoad {
         id: String,
-        path: String,
+        source_ref: String,
         #[source]
         source: policy::PolicyError,
     },
-    #[error("invalid policy selector for {id} at {path}: {source}")]
+    #[error("invalid policy selector for {id} at {source_ref}: {source}")]
     Selector {
         id: String,
-        path: String,
+        source_ref: String,
         #[source]
         source: probe_core::SelectorError,
     },
@@ -46,7 +46,7 @@ pub struct ConfiguredPolicySelection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConfiguredPolicySource {
     pub id: String,
-    pub path: PathBuf,
+    pub source: super::source::PolicySourceSnapshot,
     pub selector_configured: bool,
 }
 
@@ -85,19 +85,29 @@ pub fn configured_policy_selection(config: &AgentConfig) -> ConfiguredPolicySele
     }
 }
 
-pub fn load_configured_policies(
+#[cfg(test)]
+pub async fn load_configured_policies(
     config: &AgentConfig,
 ) -> Result<Vec<LoadedConfiguredPolicy>, ConfiguredPolicyError> {
-    enabled_policies(config)
-        .into_iter()
-        .map(read_configured_policy)
-        .collect()
+    load_configured_policies_with_context(config, PolicySourceLoadContext::default()).await
 }
 
-pub fn load_configured_pipeline_policies(
+pub async fn load_configured_policies_with_context(
     config: &AgentConfig,
+    context: PolicySourceLoadContext,
+) -> Result<Vec<LoadedConfiguredPolicy>, ConfiguredPolicyError> {
+    let mut policies = Vec::new();
+    for policy in enabled_policies(config) {
+        policies.push(read_configured_policy(policy, context).await?);
+    }
+    Ok(policies)
+}
+
+pub async fn load_configured_pipeline_policies_with_context(
+    config: &AgentConfig,
+    context: PolicySourceLoadContext,
 ) -> Result<LoadedPipelinePolicies, ConfiguredPolicyError> {
-    let policies = load_configured_policies(config)?;
+    let policies = load_configured_policies_with_context(config, context).await?;
     let sources = policies
         .iter()
         .map(|policy| policy.source.clone())
@@ -109,9 +119,11 @@ pub fn load_configured_pipeline_policies(
     Ok(LoadedPipelinePolicies { policies, sources })
 }
 
-fn read_configured_policy(
+async fn read_configured_policy(
     policy: &PolicyConfig,
+    context: PolicySourceLoadContext,
 ) -> Result<LoadedConfiguredPolicy, ConfiguredPolicyError> {
+    let source_ref = configured_policy_source(policy).source.reference();
     let selector = policy
         .selector
         .as_ref()
@@ -120,22 +132,26 @@ fn read_configured_policy(
                 .compile()
                 .map_err(|source| ConfiguredPolicyError::Selector {
                     id: policy.id.clone(),
-                    path: policy.path.display().to_string(),
+                    source_ref: source_ref.clone(),
                     source,
                 })
         })
         .transpose()?;
-    let source = super::source::load_policy_source(policy)?;
-    let runtime = PolicyRuntime::from_source_with_required_hooks(source.manifest, &source.source)
+    let source = super::source::load_policy_source_with_context(policy, context).await?;
+    let runtime = PolicyRuntime::from_source_with_required_hooks(source.manifest, &source.main)
         .map_err(|source| ConfiguredPolicyError::PolicyLoad {
-        id: policy.id.clone(),
-        path: policy.path.display().to_string(),
-        source,
-    })?;
+            id: policy.id.clone(),
+            source_ref: source_ref.clone(),
+            source,
+        })?;
 
     Ok(LoadedConfiguredPolicy {
         runtime,
-        source: configured_policy_source(policy),
+        source: ConfiguredPolicySource {
+            id: policy.id.clone(),
+            source: source.source,
+            selector_configured: policy.selector.is_some(),
+        },
         selector,
     })
 }
@@ -143,7 +159,7 @@ fn read_configured_policy(
 fn configured_policy_source(policy: &PolicyConfig) -> ConfiguredPolicySource {
     ConfiguredPolicySource {
         id: policy.id.clone(),
-        path: policy.path.clone(),
+        source: super::source::PolicySourceSnapshot::from(&policy.source),
         selector_configured: policy.selector.is_some(),
     }
 }
@@ -167,7 +183,7 @@ mod tests {
     use parsers::Http1ParserFactory;
     use pipeline::CapturePipeline;
     use policy::{PolicyError, PolicyHook};
-    use probe_config::{AgentConfig, PolicyConfig};
+    use probe_config::{AgentConfig, PolicyConfig, PolicySourceConfig};
     use probe_core::{
         AddressPort, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
         ProcessContext, ProcessIdentity, ProcessSelector, Selector, Timestamp, TrafficSelector,
@@ -175,32 +191,36 @@ mod tests {
     };
 
     use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     const OVERSIZED_TEST_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
-    #[test]
-    fn load_configured_policies_rejects_incomplete_bundle_source()
+    #[tokio::test]
+    async fn load_configured_policies_rejects_incomplete_bundle_source()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-incomplete-bundle")?;
         let policy_path = temp.join("policy-dir");
         fs::create_dir_all(&policy_path)?;
         let config = config_with_policy(&policy_path)?;
 
-        let Err(error) = load_configured_policies(&config) else {
+        let Err(error) = load_configured_policies(&config).await else {
             panic!("directory policy source must fail");
         };
 
         assert!(matches!(
             error,
-            ConfiguredPolicyError::InvalidPolicySource { id, path, .. }
-                if id == "guard" && path == policy_path.display().to_string()
+            ConfiguredPolicyError::InvalidPolicySource { id, source_ref, .. }
+                if id == "guard" && source_ref == policy_path.display().to_string()
         ));
         fs::remove_dir_all(temp)?;
         Ok(())
     }
 
-    #[test]
-    fn load_configured_policies_loads_bundle_manifest_and_main()
+    #[tokio::test]
+    async fn load_configured_policies_loads_bundle_manifest_and_main()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-bundle")?;
         let policy_path = temp.join("guard.bundle");
@@ -217,7 +237,7 @@ end
         )?;
         let config = config_with_policy(&policy_path)?;
 
-        let loaded = load_configured_policies(&config)?;
+        let loaded = load_configured_policies(&config).await?;
         let loaded_policy = loaded.first().expect("configured policy");
 
         assert_eq!(loaded_policy.runtime.manifest().id, "guard");
@@ -238,8 +258,137 @@ end
         Ok(())
     }
 
-    #[test]
-    fn load_configured_policies_rejects_bundle_id_mismatch()
+    #[tokio::test]
+    async fn load_configured_policies_fetches_remote_bundle_document()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("configured-policy-remote-bundle")?;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/policies/guard"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                remote_policy_bundle_document(
+                    "guard",
+                    "remote-test",
+                    r#"
+function on_http_request_headers(event)
+  return probe.emit_alert("remote " .. event.kind.target)
+end
+"#,
+                ),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = config_with_remote_policy(format!("{}/policies/guard", server.uri()), None);
+
+        let loaded = load_configured_policies(&config).await?;
+
+        let loaded_policy = loaded.first().expect("configured policy");
+        assert_eq!(loaded_policy.runtime.manifest().id, "guard");
+        assert_eq!(loaded_policy.runtime.manifest().version, "remote-test");
+        assert_eq!(
+            loaded_policy.source.source,
+            super::super::source::PolicySourceSnapshot::RemoteBundle {
+                endpoint: format!("{}/policies/guard", server.uri()),
+                max_body_bytes: probe_config::DEFAULT_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES,
+            }
+        );
+        assert_eq!(
+            policy_alert_versions(
+                &temp.join("remote-spool"),
+                loaded,
+                flow_with_remote_port(80)
+            )?,
+            vec!["guard@remote-test"]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_configured_policies_rejects_oversized_remote_bundle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/policies/guard"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                remote_policy_bundle_document(
+                    "guard",
+                    "remote-test",
+                    "function on_http_request_headers(_) return {} end",
+                ),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config =
+            config_with_remote_policy(format!("{}/policies/guard", server.uri()), Some(64));
+
+        let Err(error) = load_configured_policies(&config).await else {
+            panic!("oversized remote policy bundle must fail");
+        };
+
+        assert!(
+            matches!(error, ConfiguredPolicyError::InvalidPolicySource { ref reason, .. } if reason.contains("too large")),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_configured_policies_rejects_invalid_remote_body_limit_without_fetch() {
+        let endpoint = "https://policy.example.test/policies/guard".to_string();
+        let config = config_with_remote_policy(endpoint.clone(), Some(0));
+
+        let Err(error) = load_configured_policies(&config).await else {
+            panic!("invalid remote policy body limit must fail");
+        };
+
+        assert!(
+            matches!(
+                error,
+                ConfiguredPolicyError::InvalidPolicySource {
+                    ref source_ref,
+                    ref reason,
+                    ..
+                } if source_ref == &endpoint
+                    && reason.contains("max_body_bytes must be greater than zero")
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_configured_policies_rejects_remote_source_above_size_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let oversized_source = "x".repeat(1024 * 1024 + 1);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/policies/guard"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                remote_policy_bundle_document("guard", "remote-test", &oversized_source),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = config_with_remote_policy(
+            format!("{}/policies/guard", server.uri()),
+            Some(2 * 1024 * 1024),
+        );
+
+        let Err(error) = load_configured_policies(&config).await else {
+            panic!("oversized remote policy source must fail");
+        };
+
+        assert!(
+            matches!(error, ConfiguredPolicyError::InvalidPolicySource { ref reason, .. } if reason.contains("remote policy bundle source") && reason.contains("exceeding")),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_configured_policies_rejects_bundle_id_mismatch()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-bundle-id-mismatch")?;
         let policy_path = temp.join("guard.bundle");
@@ -252,7 +401,7 @@ end
         )?;
         let config = config_with_policy(&policy_path)?;
 
-        let Err(error) = load_configured_policies(&config) else {
+        let Err(error) = load_configured_policies(&config).await else {
             panic!("bundle id mismatch must fail configured policy loading");
         };
 
@@ -263,8 +412,8 @@ end
         Ok(())
     }
 
-    #[test]
-    fn load_configured_policies_rejects_bundle_missing_declared_hook()
+    #[tokio::test]
+    async fn load_configured_policies_rejects_bundle_missing_declared_hook()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-bundle-missing-hook")?;
         let policy_path = temp.join("guard.bundle");
@@ -277,7 +426,7 @@ end
         )?;
         let config = config_with_policy(&policy_path)?;
 
-        let Err(error) = load_configured_policies(&config) else {
+        let Err(error) = load_configured_policies(&config).await else {
             panic!("bundle missing a declared hook must fail configured policy loading");
         };
 
@@ -295,8 +444,8 @@ end
     }
 
     #[cfg(unix)]
-    #[test]
-    fn load_configured_policies_rejects_symlinked_bundle_main()
+    #[tokio::test]
+    async fn load_configured_policies_rejects_symlinked_bundle_main()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-bundle-main-symlink")?;
         let policy_path = temp.join("guard.bundle");
@@ -316,7 +465,7 @@ end
         std::os::unix::fs::symlink(&external_source, policy_path.join("main.lua"))?;
         let config = config_with_policy(&policy_path)?;
 
-        let Err(error) = load_configured_policies(&config) else {
+        let Err(error) = load_configured_policies(&config).await else {
             panic!("bundle symlinked main.lua must fail configured policy loading");
         };
 
@@ -327,8 +476,8 @@ end
         Ok(())
     }
 
-    #[test]
-    fn load_configured_policies_rejects_source_above_size_limit()
+    #[tokio::test]
+    async fn load_configured_policies_rejects_source_above_size_limit()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-too-large")?;
         let policy_path = temp.join("guard.bundle");
@@ -345,7 +494,7 @@ hooks = ["on_http_request_headers"]
         file.set_len(OVERSIZED_TEST_FILE_BYTES)?;
         let config = config_with_policy(&policy_path)?;
 
-        let Err(error) = load_configured_policies(&config) else {
+        let Err(error) = load_configured_policies(&config).await else {
             panic!("oversized policy source must fail");
         };
 
@@ -357,8 +506,8 @@ hooks = ["on_http_request_headers"]
         Ok(())
     }
 
-    #[test]
-    fn loaded_configured_policy_selector_scopes_pipeline_execution()
+    #[tokio::test]
+    async fn loaded_configured_policy_selector_scopes_pipeline_execution()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-selector")?;
         let policy_path = temp.join("guard.bundle");
@@ -385,7 +534,7 @@ end
         assert_eq!(
             policy_alert_versions(
                 &temp.join("miss-spool"),
-                load_configured_policies(&config)?,
+                load_configured_policies(&config).await?,
                 flow_with_remote_port(80)
             )?,
             Vec::<String>::new()
@@ -393,7 +542,7 @@ end
         assert_eq!(
             policy_alert_versions(
                 &temp.join("hit-spool"),
-                load_configured_policies(&config)?,
+                load_configured_policies(&config).await?,
                 flow_with_remote_port(443)
             )?,
             vec!["guard@bundle-test"]
@@ -402,8 +551,8 @@ end
         Ok(())
     }
 
-    #[test]
-    fn load_configured_policies_runs_multiple_enabled_bundles_in_config_order()
+    #[tokio::test]
+    async fn load_configured_policies_runs_multiple_enabled_bundles_in_config_order()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-multiple-run")?;
         let first_path = temp.join("first.bundle");
@@ -434,12 +583,12 @@ end
         config.policies[0].id = "first".to_string();
         config.policies.push(PolicyConfig {
             id: "second".to_string(),
-            path: second_path,
+            source: probe_config::PolicySourceConfig::LocalDirectory { path: second_path },
             enabled: true,
             selector: None,
         });
 
-        let loaded = load_configured_policies(&config)?;
+        let loaded = load_configured_policies(&config).await?;
 
         assert_eq!(
             policy_alert_versions(&temp.join("spool"), loaded, flow_with_remote_port(80))?,
@@ -458,7 +607,7 @@ end
         let mut config = config_with_policy(&first_path)?;
         config.policies.push(PolicyConfig {
             id: "second".to_string(),
-            path: second_path,
+            source: probe_config::PolicySourceConfig::LocalDirectory { path: second_path },
             enabled: true,
             selector: None,
         });
@@ -566,6 +715,9 @@ selection = "replay"
 [[policies]]
 id = "guard"
 enabled = true
+
+[policies.source]
+kind = "local_directory"
 path = "{}"
 
 [[exporters]]
@@ -576,6 +728,33 @@ codec = "none"
 "#,
             path.display()
         ))
+    }
+
+    fn config_with_remote_policy(endpoint: String, max_body_bytes: Option<u64>) -> AgentConfig {
+        let mut config = AgentConfig::default();
+        config.policies.push(PolicyConfig {
+            id: "guard".to_string(),
+            source: PolicySourceConfig::RemoteBundle {
+                endpoint,
+                max_body_bytes,
+            },
+            enabled: true,
+            selector: None,
+        });
+        config
+    }
+
+    fn remote_policy_bundle_document(id: &str, version: &str, source: &str) -> String {
+        format!(
+            r#"
+source = {source:?}
+
+[manifest]
+id = "{id}"
+version = "{version}"
+hooks = ["on_http_request_headers"]
+"#
+        )
     }
 
     fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {

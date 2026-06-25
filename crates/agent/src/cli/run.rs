@@ -466,7 +466,9 @@ protective_actions = ["alert"]
         config.storage.path = spool_path.clone();
         config.policies.push(PolicyConfig {
             id: "guard".to_string(),
-            path: missing_policy_path,
+            source: probe_config::PolicySourceConfig::LocalDirectory {
+                path: missing_policy_path,
+            },
             enabled: true,
             selector: None,
         });
@@ -534,13 +536,17 @@ end
         config.policies = vec![
             PolicyConfig {
                 id: "first".to_string(),
-                path: first_policy_path,
+                source: probe_config::PolicySourceConfig::LocalDirectory {
+                    path: first_policy_path,
+                },
                 enabled: true,
                 selector: None,
             },
             PolicyConfig {
                 id: "second".to_string(),
-                path: second_policy_path,
+                source: probe_config::PolicySourceConfig::LocalDirectory {
+                    path: second_policy_path,
+                },
                 enabled: true,
                 selector: None,
             },
@@ -581,7 +587,9 @@ end
         config.enforcement.mode = EnforcementMode::Enforce;
         config.policies.push(PolicyConfig {
             id: "guard".to_string(),
-            path: missing_policy_path,
+            source: probe_config::PolicySourceConfig::LocalDirectory {
+                path: missing_policy_path,
+            },
             enabled: true,
             selector: None,
         });
@@ -748,7 +756,7 @@ end
         config.enforcement.mode = EnforcementMode::DryRun;
         config.policies.push(PolicyConfig {
             id: "deny-recovered".to_string(),
-            path: policy_path,
+            source: probe_config::PolicySourceConfig::LocalDirectory { path: policy_path },
             enabled: true,
             selector: None,
         });

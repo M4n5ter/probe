@@ -1,16 +1,4 @@
-use std::{
-    fs,
-    io::{ErrorKind, Read, Write},
-    net::{TcpListener, TcpStream},
-    path::Path,
-    process::ExitCode,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    thread,
-    time::Duration,
-};
+use std::{fs, path::Path, process::ExitCode};
 
 use capture::CaptureEvent;
 use probe_config::{EnforcementPolicyManifest, EnforcementPolicySourceConfig};
@@ -22,7 +10,8 @@ use probe_core::{
 use storage::{FjallSpool, StoredEvent};
 
 use super::harness::{
-    decode_capture_event, decode_envelope, e2e_error, run_agent_with_max_events, run_with_temp_root,
+    HttpSourceServer, decode_capture_event, decode_envelope, e2e_error, run_agent_with_max_events,
+    run_with_temp_root,
 };
 use super::plaintext_scenario::{
     PlaintextFeedCase, PlaintextFeedRecord, PlaintextFlow, PlaintextProcess,
@@ -58,7 +47,6 @@ const CONFIG_MISS_REQUEST_TARGET: &str = "/remote-enforcement/config-miss";
 const PROFILE_MISS_REQUEST_TARGET: &str = "/remote-enforcement/profile-miss";
 const POLICY_REASON_PREFIX: &str = "remote manifest scoped protection";
 const MANIFEST_REQUEST_TARGET: &str = "/enforcement";
-const REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) fn run() -> ExitCode {
     match run_inner() {
@@ -86,7 +74,11 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cases = remote_cases();
     write_feed(&cases, &feed_path)?;
     write_policy_bundle(&policy_path)?;
-    let manifest_server = ManifestServer::spawn(toml::to_string(&enforcement_manifest()?)?)?;
+    let manifest_server = HttpSourceServer::spawn(
+        MANIFEST_REQUEST_TARGET,
+        "application/toml",
+        toml::to_string(&enforcement_manifest()?)?,
+    )?;
 
     let mut config = cases[0].feed.agent_config_with_policy(
         feed_path,
@@ -548,142 +540,4 @@ fn assert_single_event(
 
 fn expected_policy_version() -> String {
     format!("{POLICY_ID}@{POLICY_VERSION}")
-}
-
-struct ManifestServer {
-    endpoint: String,
-    request_count: Arc<AtomicUsize>,
-    stop_requested: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<Result<(), String>>>,
-}
-
-impl ManifestServer {
-    fn spawn(body: String) -> Result<Self, Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        listener.set_nonblocking(true)?;
-        let endpoint = format!(
-            "http://{}{}",
-            listener.local_addr()?,
-            MANIFEST_REQUEST_TARGET
-        );
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let request_count_for_thread = Arc::clone(&request_count);
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let stop_requested_for_thread = Arc::clone(&stop_requested);
-        let handle = thread::spawn(move || {
-            while !stop_requested_for_thread.load(Ordering::Relaxed) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(accepted) => accepted,
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    Err(error) => return Err(error.to_string()),
-                };
-                stream
-                    .set_read_timeout(Some(REQUEST_IO_TIMEOUT))
-                    .map_err(|error| error.to_string())?;
-                stream
-                    .set_write_timeout(Some(REQUEST_IO_TIMEOUT))
-                    .map_err(|error| error.to_string())?;
-                let (method, target) = read_manifest_request(&mut stream)?;
-                if method != "GET" || target != MANIFEST_REQUEST_TARGET {
-                    let response =
-                        "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-                    stream
-                        .write_all(response.as_bytes())
-                        .map_err(|error| error.to_string())?;
-                    return Err(format!("unexpected manifest request {method} {target}"));
-                }
-                let response = manifest_response(&body);
-                stream
-                    .write_all(response.as_bytes())
-                    .map_err(|error| error.to_string())?;
-                request_count_for_thread.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(())
-        });
-
-        Ok(Self {
-            endpoint,
-            request_count,
-            stop_requested,
-            handle: Some(handle),
-        })
-    }
-
-    fn endpoint(&self) -> String {
-        self.endpoint.clone()
-    }
-
-    fn finish(mut self) -> Result<usize, Box<dyn std::error::Error>> {
-        self.stop_and_join()
-            .map_err(|error| e2e_error(format!("manifest server failed: {error}")))?;
-        Ok(self.request_count.load(Ordering::Relaxed))
-    }
-
-    fn stop_and_join(&mut self) -> Result<(), String> {
-        self.stop_requested.store(true, Ordering::Relaxed);
-        let Some(handle) = self.handle.take() else {
-            return Ok(());
-        };
-        handle
-            .join()
-            .map_err(|_| "manifest server thread panicked".to_string())?
-    }
-}
-
-impl Drop for ManifestServer {
-    fn drop(&mut self) {
-        if let Err(error) = self.stop_and_join() {
-            eprintln!("manifest server cleanup failed: {error}");
-        }
-    }
-}
-
-fn read_manifest_request(stream: &mut TcpStream) -> Result<(String, String), String> {
-    let mut bytes = Vec::new();
-    loop {
-        let mut buffer = [0; 1024];
-        let read = stream
-            .read(&mut buffer)
-            .map_err(|error| error.to_string())?;
-        if read == 0 {
-            return Err("connection closed before manifest request headers completed".to_string());
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-        if header_end(&bytes).is_some() {
-            break;
-        }
-    }
-    let headers = String::from_utf8_lossy(&bytes);
-    let line = headers
-        .lines()
-        .next()
-        .ok_or_else(|| "manifest request is missing request line".to_string())?;
-    let mut parts = line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| "manifest request line is missing method".to_string())?;
-    let target = parts
-        .next()
-        .ok_or_else(|| "manifest request line is missing target".to_string())?;
-    let version = parts
-        .next()
-        .ok_or_else(|| "manifest request line is missing version".to_string())?;
-    if !version.starts_with("HTTP/") || parts.next().is_some() {
-        return Err(format!("invalid manifest request line {line}"));
-    }
-    Ok((method.to_string(), target.to_string()))
-}
-
-fn manifest_response(body: &str) -> String {
-    format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/toml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    )
-}
-
-fn header_end(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }

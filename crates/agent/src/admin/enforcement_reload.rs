@@ -8,6 +8,7 @@ use crate::configured_enforcement::{
     ActiveEnforcementPolicy, ConfiguredEnforcementError, EnforcementRuntimeState,
     load_configured_enforcement_policy_runtime,
 };
+use crate::control_plane_http::enforcement_policy_source_load_context_from_plan;
 
 #[derive(Clone, Default)]
 pub(crate) struct EnforcementReloadGate {
@@ -49,6 +50,7 @@ pub(super) async fn reload_enforcement_policy(
     let loaded = load_configured_enforcement_policy_runtime(
         plan.config.enforcement.selector.clone(),
         &plan.enforcement.policy_source,
+        enforcement_policy_source_load_context_from_plan(plan),
     )
     .await?;
     runtime_state.replace(loaded.clone());
@@ -100,9 +102,12 @@ mod tests {
             path: manifest_path.clone(),
         };
         let plan = RuntimePlan::build(config, &replay_registry())?;
-        let configured =
-            crate::configured_enforcement::build_configured_enforcement_with_backend(&plan, None)
-                .await?;
+        let configured = crate::configured_enforcement::build_configured_enforcement_with_backend(
+            &plan,
+            None,
+            crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
+        )
+        .await?;
         let (mut planner_view, runtime_state) =
             EnforcementRuntimeState::from_planner(configured.planner, configured.active_policy);
         assert_eq!(
@@ -138,6 +143,7 @@ mod tests {
             crate::configured_enforcement::load_configured_enforcement_policy_runtime(
                 None,
                 &runtime::EnforcementPolicySourcePlan::None,
+                crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
             )
             .await?;
         let (_, runtime_state) = EnforcementRuntimeState::from_planner(planner, active_policy);

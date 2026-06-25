@@ -1,22 +1,31 @@
 use std::{
     fs::{self, Metadata},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use policy::{PolicyHook, PolicyManifest};
-use probe_config::PolicyConfig;
+use probe_config::{
+    DEFAULT_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES, PolicyConfig, PolicySourceConfig,
+    RemotePolicyBundleBodyLimitBytes, RemotePolicyBundleBodyLimitError,
+};
 use probe_core::RuntimeMode;
-use serde::Serialize;
+use probe_http::HttpConnectionOptions;
+use serde::{Deserialize, Serialize};
 
 use probe_io::{
     BoundedFileError, BoundedFileErrorKind, check_bounded_regular_file,
     read_bounded_regular_file_to_string,
 };
 
+use crate::remote_source::{RemoteTextFetchConfig, RemoteTextFetchError, fetch_remote_text};
+
 use super::super::ConfiguredPolicyError;
 
 pub const MAX_POLICY_SOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_POLICY_MANIFEST_BYTES: u64 = 64 * 1024;
+const REMOTE_POLICY_BUNDLE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_POLICY_BUNDLE_ACCEPT: &str = "application/toml, text/plain;q=0.9, */*;q=0.1";
 
 const BUNDLE_MANIFEST_FILE: &str = "manifest.toml";
 const BUNDLE_MAIN_FILE: &str = "main.lua";
@@ -24,6 +33,7 @@ const BUNDLE_MAIN_FILE: &str = "main.lua";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicySourceInspection {
     pub mode: RuntimeMode,
+    pub source: PolicySourceSnapshot,
     pub manifest: Option<PolicyManifestMetadata>,
     pub reason: Option<String>,
 }
@@ -35,31 +45,106 @@ pub struct PolicyManifestMetadata {
 }
 
 pub struct LoadedPolicySource {
+    pub source: PolicySourceSnapshot,
     pub manifest: PolicyManifest,
-    pub source: String,
+    pub main: String,
 }
 
-pub fn load_policy_source(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicySourceLoadContext {
+    remote_http_connection: HttpConnectionOptions,
+}
+
+impl PolicySourceLoadContext {
+    pub fn with_remote_http_connection(remote_http_connection: HttpConnectionOptions) -> Self {
+        Self {
+            remote_http_connection,
+        }
+    }
+
+    pub fn remote_http_connection(self) -> HttpConnectionOptions {
+        self.remote_http_connection
+    }
+}
+
+impl Default for PolicySourceLoadContext {
+    fn default() -> Self {
+        Self {
+            remote_http_connection: HttpConnectionOptions::new(REMOTE_POLICY_BUNDLE_FETCH_TIMEOUT),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PolicySourceSnapshot {
+    LocalDirectory {
+        path: PathBuf,
+    },
+    RemoteBundle {
+        endpoint: String,
+        max_body_bytes: u64,
+    },
+}
+
+impl PolicySourceSnapshot {
+    pub fn reference(&self) -> String {
+        match self {
+            Self::LocalDirectory { path } => path.display().to_string(),
+            Self::RemoteBundle { endpoint, .. } => endpoint.clone(),
+        }
+    }
+}
+
+impl From<&PolicySourceConfig> for PolicySourceSnapshot {
+    fn from(source: &PolicySourceConfig) -> Self {
+        source_snapshot(source)
+    }
+}
+
+pub async fn load_policy_source_with_context(
     policy: &PolicyConfig,
+    context: PolicySourceLoadContext,
 ) -> Result<LoadedPolicySource, ConfiguredPolicyError> {
-    read_policy_bundle_directory(&policy.path, policy.id.as_str())
+    read_policy_source(&policy.source, policy.id.as_str(), context)
+        .await
         .map_err(|error| error.into_configured_error(policy))
 }
 
-pub fn inspect_policy_source(path: &Path, expected_id: &str) -> PolicySourceInspection {
-    match inspect_policy_bundle_directory(path, expected_id) {
-        Ok(manifest) => PolicySourceInspection {
-            mode: RuntimeMode::Available,
-            manifest: Some(PolicyManifestMetadata {
-                id: manifest.id,
-                version: manifest.version,
-            }),
-            reason: None,
-        },
-        Err(error) => PolicySourceInspection {
-            mode: RuntimeMode::Unavailable,
+pub fn inspect_policy_source(
+    source: &PolicySourceSnapshot,
+    expected_id: &str,
+) -> PolicySourceInspection {
+    match source {
+        PolicySourceSnapshot::RemoteBundle { .. } => PolicySourceInspection {
+            mode: RuntimeMode::Degraded,
+            source: source.clone(),
             manifest: None,
-            reason: Some(error.reason()),
+            reason: Some(
+                "remote policy bundle source is configured, but offline status does not fetch remote policy"
+                    .to_string(),
+            ),
+        },
+        PolicySourceSnapshot::LocalDirectory { path } => {
+            match inspect_policy_bundle_directory(path, expected_id) {
+                Ok(manifest) => PolicySourceInspection {
+                    mode: RuntimeMode::Available,
+                    source: PolicySourceSnapshot::LocalDirectory {
+                        path: path.to_path_buf(),
+                    },
+                    manifest: Some(PolicyManifestMetadata {
+                        id: manifest.id,
+                        version: manifest.version,
+                    }),
+                    reason: None,
+                },
+                Err(error) => PolicySourceInspection {
+                    mode: RuntimeMode::Unavailable,
+                    source: source.clone(),
+                    manifest: None,
+                    reason: Some(error.reason()),
+                },
+            }
         },
     }
 }
@@ -81,9 +166,15 @@ fn read_policy_bundle_directory(
     ensure_policy_bundle_directory(root)?;
     let manifest = read_policy_manifest(&manifest_path(root))
         .and_then(|manifest| validate_policy_manifest(manifest, expected_id))?;
-    let source = read_regular_policy_file(&main_path(root), MAX_POLICY_SOURCE_BYTES, "source")?;
+    let main = read_regular_policy_file(&main_path(root), MAX_POLICY_SOURCE_BYTES, "source")?;
 
-    Ok(LoadedPolicySource { manifest, source })
+    Ok(LoadedPolicySource {
+        source: PolicySourceSnapshot::LocalDirectory {
+            path: root.to_path_buf(),
+        },
+        manifest,
+        main,
+    })
 }
 
 fn inspect_policy_bundle_directory(
@@ -95,6 +186,109 @@ fn inspect_policy_bundle_directory(
     let manifest = validate_policy_manifest(manifest, expected_id)?;
     check_regular_policy_file(&main_path(root), MAX_POLICY_SOURCE_BYTES, "source")?;
     Ok(manifest)
+}
+
+async fn read_policy_source(
+    source: &PolicySourceConfig,
+    expected_id: &str,
+    context: PolicySourceLoadContext,
+) -> Result<LoadedPolicySource, PolicySourceValidationError> {
+    match source {
+        PolicySourceConfig::LocalDirectory { path } => {
+            read_policy_bundle_directory(path, expected_id)
+        }
+        PolicySourceConfig::RemoteBundle {
+            endpoint,
+            max_body_bytes,
+        } => read_remote_policy_bundle(endpoint, *max_body_bytes, expected_id, context).await,
+    }
+}
+
+fn source_snapshot(source: &PolicySourceConfig) -> PolicySourceSnapshot {
+    match source {
+        PolicySourceConfig::LocalDirectory { path } => PolicySourceSnapshot::LocalDirectory {
+            path: path.to_path_buf(),
+        },
+        PolicySourceConfig::RemoteBundle {
+            endpoint,
+            max_body_bytes,
+        } => PolicySourceSnapshot::RemoteBundle {
+            endpoint: endpoint.clone(),
+            max_body_bytes: max_body_bytes.unwrap_or(DEFAULT_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES),
+        },
+    }
+}
+
+async fn read_remote_policy_bundle(
+    endpoint: &str,
+    max_body_bytes: Option<u64>,
+    expected_id: &str,
+    context: PolicySourceLoadContext,
+) -> Result<LoadedPolicySource, PolicySourceValidationError> {
+    let max_body_bytes = remote_body_limit(max_body_bytes)
+        .map_err(|source| PolicySourceValidationError::RemoteBodyLimit {
+            endpoint: endpoint.to_string(),
+            source,
+        })?
+        .get();
+    let content = fetch_remote_text(
+        endpoint,
+        RemoteTextFetchConfig {
+            accept: REMOTE_POLICY_BUNDLE_ACCEPT,
+            timeout: REMOTE_POLICY_BUNDLE_FETCH_TIMEOUT,
+            max_body_bytes,
+            connection: context.remote_http_connection,
+        },
+    )
+    .await
+    .map_err(|source| PolicySourceValidationError::RemoteFetch {
+        endpoint: endpoint.to_string(),
+        source,
+    })?;
+    let bundle = toml::from_str::<RemotePolicyBundleDocument>(&content).map_err(|source| {
+        PolicySourceValidationError::RemoteBundleToml {
+            endpoint: endpoint.to_string(),
+            source,
+        }
+    })?;
+    validate_remote_policy_source_size(endpoint, &bundle.source)?;
+    let manifest = validate_policy_manifest(bundle.manifest, expected_id)?;
+    Ok(LoadedPolicySource {
+        source: PolicySourceSnapshot::RemoteBundle {
+            endpoint: endpoint.to_string(),
+            max_body_bytes,
+        },
+        manifest,
+        main: bundle.source,
+    })
+}
+
+fn validate_remote_policy_source_size(
+    endpoint: &str,
+    source: &str,
+) -> Result<(), PolicySourceValidationError> {
+    let size = source.len() as u64;
+    if size > MAX_POLICY_SOURCE_BYTES {
+        return Err(PolicySourceValidationError::RemoteSourceTooLarge {
+            endpoint: endpoint.to_string(),
+            size,
+            limit: MAX_POLICY_SOURCE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn remote_body_limit(
+    max_body_bytes: Option<u64>,
+) -> Result<RemotePolicyBundleBodyLimitBytes, RemotePolicyBundleBodyLimitError> {
+    RemotePolicyBundleBodyLimitBytes::from_config(max_body_bytes)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemotePolicyBundleDocument {
+    manifest: PolicyManifest,
+    source: String,
 }
 
 fn read_policy_manifest(path: &Path) -> Result<PolicyManifest, PolicySourceValidationError> {
@@ -288,6 +482,23 @@ enum PolicySourceValidationError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    RemoteFetch {
+        endpoint: String,
+        source: RemoteTextFetchError,
+    },
+    RemoteBodyLimit {
+        endpoint: String,
+        source: RemotePolicyBundleBodyLimitError,
+    },
+    RemoteBundleToml {
+        endpoint: String,
+        source: toml::de::Error,
+    },
+    RemoteSourceTooLarge {
+        endpoint: String,
+        size: u64,
+        limit: u64,
+    },
     InvalidManifest {
         reason: String,
     },
@@ -346,6 +557,24 @@ impl PolicySourceValidationError {
                     path.display()
                 )
             }
+            Self::RemoteFetch { endpoint, source } => {
+                format!("failed to fetch remote policy bundle {endpoint}: {source}")
+            }
+            Self::RemoteBodyLimit { endpoint, source } => {
+                format!("invalid remote policy bundle body limit for {endpoint}: {source}")
+            }
+            Self::RemoteBundleToml { endpoint, source } => {
+                format!("failed to parse remote policy bundle {endpoint}: {source}")
+            }
+            Self::RemoteSourceTooLarge {
+                endpoint,
+                size,
+                limit,
+            } => {
+                format!(
+                    "remote policy bundle source {endpoint} is {size} bytes, exceeding the {limit} byte limit"
+                )
+            }
             Self::InvalidManifest { reason } => format!("invalid policy bundle manifest: {reason}"),
             Self::ManifestIdMismatch { expected, actual } => format!(
                 "policy bundle manifest id {actual} does not match configured policy id {expected}"
@@ -354,17 +583,18 @@ impl PolicySourceValidationError {
     }
 
     fn into_configured_error(self, policy: &PolicyConfig) -> ConfiguredPolicyError {
+        let source_ref = source_snapshot(&policy.source).reference();
         match self {
             Self::Inspect { path, source }
             | Self::Open { path, source }
             | Self::Read { path, source } => ConfiguredPolicyError::ReadPolicy {
                 id: policy.id.clone(),
-                path: path.display().to_string(),
+                source_ref: path.display().to_string(),
                 source,
             },
             error => ConfiguredPolicyError::InvalidPolicySource {
                 id: policy.id.clone(),
-                path: policy.path.display().to_string(),
+                source_ref,
                 reason: error.reason(),
             },
         }

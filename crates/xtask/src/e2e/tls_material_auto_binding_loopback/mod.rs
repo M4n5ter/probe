@@ -270,7 +270,9 @@ fn write_agent_config(
     config.tls.plaintext.decrypt_hints.refresh_interval_ms = MATERIAL_REFRESH_INTERVAL_MS;
     config.policies.push(PolicyConfig {
         id: POLICY_ID.to_string(),
-        path: policy_path.to_path_buf(),
+        source: probe_config::PolicySourceConfig::LocalDirectory {
+            path: policy_path.to_path_buf(),
+        },
         enabled: true,
         selector: None,
     });

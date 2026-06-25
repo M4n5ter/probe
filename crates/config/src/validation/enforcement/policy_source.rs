@@ -1,9 +1,9 @@
-use url::Url;
-
 use crate::{
     ConfigViolation, EnforcementPolicySourceConfig, RemoteEnforcementPolicyBodyLimitBytes,
     RemoteEnforcementPolicyBodyLimitError,
 };
+
+use super::super::remote_endpoint::validate_remote_endpoint;
 
 pub(super) fn validate(
     source: &EnforcementPolicySourceConfig,
@@ -37,56 +37,16 @@ pub(super) fn validate(
                     reason: "remote enforcement policy endpoint cannot be empty".to_string(),
                 });
             } else {
-                validate_remote_endpoint(endpoint, violations);
+                validate_remote_endpoint(
+                    endpoint,
+                    "enforcement.policy.source.endpoint",
+                    "remote enforcement policy",
+                    violations,
+                );
             }
             validate_remote_body_limit(*max_body_bytes, violations);
         }
     }
-}
-
-fn validate_remote_endpoint(endpoint: &str, violations: &mut Vec<ConfigViolation>) {
-    let Ok(url) = Url::parse(endpoint) else {
-        violations.push(ConfigViolation {
-            field: "enforcement.policy.source.endpoint".to_string(),
-            reason: "remote enforcement policy endpoint must be an absolute URL".to_string(),
-        });
-        return;
-    };
-
-    if !url.username().is_empty() || url.password().is_some() {
-        violations.push(ConfigViolation {
-            field: "enforcement.policy.source.endpoint".to_string(),
-            reason: "remote enforcement policy endpoint must not contain credentials".to_string(),
-        });
-    }
-    if remote_endpoint_uses_allowed_transport(&url) {
-        return;
-    }
-    violations.push(ConfigViolation {
-        field: "enforcement.policy.source.endpoint".to_string(),
-        reason:
-            "remote enforcement policy endpoint must use HTTPS, except loopback HTTP for local testing"
-                .to_string(),
-    });
-}
-
-fn remote_endpoint_uses_allowed_transport(url: &Url) -> bool {
-    match url.scheme() {
-        "https" => true,
-        "http" => url.host_str().is_some_and(loopback_host),
-        _ => false,
-    }
-}
-
-fn loopback_host(host: &str) -> bool {
-    let normalized = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    normalized.eq_ignore_ascii_case("localhost")
-        || normalized
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
 }
 
 fn validate_remote_body_limit(max_body_bytes: Option<u64>, violations: &mut Vec<ConfigViolation>) {

@@ -12,6 +12,7 @@ use super::super::{
     mitm_plaintext_bridge::run as run_mitm_plaintext_bridge_live_sidecar,
     plaintext_feed::run as run_plaintext_feed,
     remote_enforcement_policy::run as run_remote_enforcement_policy,
+    remote_policy_bundle::run as run_remote_policy_bundle,
     sse_plaintext_feed::run as run_sse_plaintext_feed,
     tls_material_auto_binding_loopback::{
         run as run_tls_session_secret_auto_binding_loopback,
@@ -144,6 +145,11 @@ const E2E_CASES: &[E2eCase] = &[
         run: run_remote_enforcement_policy,
     },
     E2eCase {
+        name: "e2e-remote-policy-bundle",
+        requirement: E2eRequirement::User,
+        run: run_remote_policy_bundle,
+    },
+    E2eCase {
         name: "e2e-libpcap-loopback",
         requirement: E2eRequirement::RootCapNetRaw,
         run: run_libpcap_loopback,
@@ -264,6 +270,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-webhook-exporter",
             "e2e-file-exporter",
             "e2e-remote-enforcement-policy",
+            "e2e-remote-policy-bundle",
         ]),
     },
     E2eProfile {
@@ -331,6 +338,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-webhook-exporter",
             "e2e-file-exporter",
             "e2e-remote-enforcement-policy",
+            "e2e-remote-policy-bundle",
             "e2e-libpcap-loopback",
             "e2e-libpcap-websocket-loopback",
             "e2e-admin-policy-reload",
@@ -496,6 +504,7 @@ mod tests {
                 "e2e-webhook-exporter",
                 "e2e-file-exporter",
                 "e2e-remote-enforcement-policy",
+                "e2e-remote-policy-bundle",
             ]),
         },
         ExpectedProfile {
@@ -565,6 +574,7 @@ mod tests {
                 "e2e-webhook-exporter",
                 "e2e-file-exporter",
                 "e2e-remote-enforcement-policy",
+                "e2e-remote-policy-bundle",
                 "e2e-libpcap-loopback",
                 "e2e-libpcap-websocket-loopback",
                 "e2e-admin-policy-reload",

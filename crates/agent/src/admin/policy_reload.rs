@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use pipeline::PipelinePolicySet;
-use probe_config::AgentConfig;
+use runtime::RuntimePlan;
 use tokio::sync::Mutex;
 
 use crate::configured_policy::{
-    ConfiguredPolicyError, ConfiguredPolicySource, load_configured_pipeline_policies,
+    ConfiguredPolicyError, ConfiguredPolicySource, load_configured_pipeline_policies_with_context,
 };
+use crate::control_plane_http::policy_source_load_context_from_plan;
 
 #[derive(Clone)]
 pub(crate) struct PolicyReloadGate {
@@ -27,12 +28,16 @@ pub(super) struct PolicyReloadSummary {
 }
 
 pub(super) async fn reload_policies(
-    config: &AgentConfig,
+    plan: &RuntimePlan,
     policy_set: &PipelinePolicySet,
     gate: &PolicyReloadGate,
 ) -> Result<PolicyReloadSummary, ConfiguredPolicyError> {
     let _reload_guard = gate.inner.lock().await;
-    let loaded = load_configured_pipeline_policies(config)?;
+    let loaded = load_configured_pipeline_policies_with_context(
+        &plan.config,
+        policy_source_load_context_from_plan(plan),
+    )
+    .await?;
     let loaded_count = loaded.policies.len() as u64;
     let policies = loaded.sources;
     policy_set.replace(loaded.policies);
@@ -75,7 +80,9 @@ mod tests {
     };
 
     use super::super::{AdminRuntimeState, AdminServerConfig, spawn_admin_server};
-    use crate::configured_policy::load_configured_pipeline_policies;
+    use crate::configured_policy::{
+        PolicySourceLoadContext, load_configured_pipeline_policies_with_context,
+    };
 
     #[tokio::test]
     async fn admin_reload_policies_swaps_active_pipeline_policy_set()
@@ -88,11 +95,18 @@ mod tests {
         let mut config = config_with_storage_path(spool_path.clone());
         config.policies.push(PolicyConfig {
             id: "guard".to_string(),
-            path: policy_path.clone(),
+            source: probe_config::PolicySourceConfig::LocalDirectory {
+                path: policy_path.clone(),
+            },
             ..PolicyConfig::default()
         });
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
-        let policy_set = load_configured_pipeline_policies(&config)?.into_policy_set();
+        let policy_set = load_configured_pipeline_policies_with_context(
+            &config,
+            PolicySourceLoadContext::default(),
+        )
+        .await?
+        .into_policy_set();
         run_policy_request(spool.as_ref(), policy_set.clone(), "/before", 1)?;
         let plan = Arc::new(runtime_plan_from_config(config)?);
         let server = spawn_admin_server(
@@ -136,11 +150,18 @@ mod tests {
         let mut config = config_with_storage_path(spool_path.clone());
         config.policies.push(PolicyConfig {
             id: "guard".to_string(),
-            path: policy_path.clone(),
+            source: probe_config::PolicySourceConfig::LocalDirectory {
+                path: policy_path.clone(),
+            },
             ..PolicyConfig::default()
         });
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
-        let policy_set = load_configured_pipeline_policies(&config)?.into_policy_set();
+        let policy_set = load_configured_pipeline_policies_with_context(
+            &config,
+            PolicySourceLoadContext::default(),
+        )
+        .await?
+        .into_policy_set();
         let plan = Arc::new(runtime_plan_from_config(config)?);
         let server = spawn_admin_server(
             Arc::clone(&plan),

@@ -1,7 +1,6 @@
-use std::path::{Path, PathBuf};
-
 use crate::configured_policy::{
-    ConfiguredPolicySource, configured_policy_selection, inspect_policy_source,
+    ConfiguredPolicySource, PolicySourceSnapshot, configured_policy_selection,
+    inspect_policy_source,
 };
 use probe_core::RuntimeMode;
 use runtime::RuntimePlan;
@@ -27,10 +26,10 @@ pub enum PolicyStatusMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyBundleStatusSnapshot {
     pub id: String,
-    pub path: PathBuf,
+    pub source: PolicySourceSnapshot,
     pub selector_configured: bool,
     pub policy_version: Option<String>,
-    pub source: PolicySourceStatusSnapshot,
+    pub inspection: PolicySourceStatusSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -63,32 +62,24 @@ pub(in crate::status) fn policy_status(plan: &RuntimePlan) -> PolicyStatusSnapsh
         .enabled
         .into_iter()
         .map(|policy| {
-            let source = policy_source_status(&policy.path, &policy.id);
+            let source = policy_source_status(&policy.source, &policy.id);
             policy_bundle_status(policy, source)
         })
         .collect::<Vec<_>>();
-    let unavailable_reasons = active
-        .iter()
-        .filter(|policy| policy.source.mode != RuntimeMode::Available)
-        .map(|policy| {
-            format!(
-                "{}: {}",
-                policy.id,
-                policy
-                    .source
-                    .reason
-                    .as_deref()
-                    .unwrap_or("policy source metadata is unavailable")
-            )
-        })
-        .collect::<Vec<_>>();
+    let unavailable_reasons = source_reasons(
+        &active,
+        RuntimeMode::Unavailable,
+        "policy source metadata is unavailable",
+    );
+    let degraded_reasons = source_reasons(
+        &active,
+        RuntimeMode::Degraded,
+        "policy source metadata is degraded",
+    );
     let (mode, reason) = if unavailable_reasons.is_empty() {
         (
             PolicyStatusMode::MetadataOnly,
-            Some(
-                "policy source metadata is available, but offline status does not load or execute policy source"
-                    .to_string(),
-            ),
+            Some(metadata_only_reason(degraded_reasons)),
         )
     } else {
         (
@@ -106,16 +97,43 @@ pub(in crate::status) fn policy_status(plan: &RuntimePlan) -> PolicyStatusSnapsh
     }
 }
 
+fn source_reasons(
+    active: &[PolicyBundleStatusSnapshot],
+    mode: RuntimeMode,
+    fallback: &'static str,
+) -> Vec<String> {
+    active
+        .iter()
+        .filter(|policy| policy.inspection.mode == mode)
+        .map(|policy| {
+            format!(
+                "{}: {}",
+                policy.id,
+                policy.inspection.reason.as_deref().unwrap_or(fallback)
+            )
+        })
+        .collect()
+}
+
+fn metadata_only_reason(degraded_reasons: Vec<String>) -> String {
+    let base = "policy source metadata is available, but offline status does not load or execute policy source";
+    if degraded_reasons.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}; {}", degraded_reasons.join("; "))
+    }
+}
+
 fn policy_bundle_status(
     policy: ConfiguredPolicySource,
     source: PolicySourceStatus,
 ) -> PolicyBundleStatusSnapshot {
     PolicyBundleStatusSnapshot {
         id: policy.id,
-        path: policy.path,
+        source: policy.source,
         selector_configured: policy.selector_configured,
         policy_version: source.policy_version,
-        source: source.snapshot,
+        inspection: source.snapshot,
     }
 }
 
@@ -124,8 +142,8 @@ struct PolicySourceStatus {
     policy_version: Option<String>,
 }
 
-fn policy_source_status(path: &Path, expected_id: &str) -> PolicySourceStatus {
-    let inspection = inspect_policy_source(path, expected_id);
+fn policy_source_status(source: &PolicySourceSnapshot, expected_id: &str) -> PolicySourceStatus {
+    let inspection = inspect_policy_source(source, expected_id);
     let policy_version = inspection
         .manifest
         .map(|manifest| format!("{}@{}", manifest.id, manifest.version));
@@ -144,7 +162,7 @@ fn policy_source_status(path: &Path, expected_id: &str) -> PolicySourceStatus {
 mod tests {
     use std::fs;
 
-    use probe_config::PolicyConfig;
+    use probe_config::{PolicyConfig, PolicySourceConfig};
     use probe_core::{RuntimeMode, Selector};
     use serde_json::json;
 
@@ -163,7 +181,7 @@ mod tests {
         let mut config = config_with_storage_path(temp.join("spool"));
         config.policies = vec![PolicyConfig {
             id: "guard".to_string(),
-            path: policy_path.clone(),
+            source: local_source(policy_path.clone()),
             enabled: true,
             selector: Some(Selector::default()),
         }];
@@ -207,7 +225,7 @@ hooks = ["on_http_request_headers"]
         let mut config = config_with_storage_path(temp.join("spool"));
         config.policies = vec![PolicyConfig {
             id: "guard".to_string(),
-            path: policy_path.clone(),
+            source: local_source(policy_path.clone()),
             enabled: true,
             selector: Some(Selector::default()),
         }];
@@ -218,14 +236,20 @@ hooks = ["on_http_request_headers"]
         assert_eq!(status.mode, PolicyStatusMode::MetadataOnly);
         let active_bundle = status.active.first().expect("active bundle");
         assert_eq!(active_bundle.id, "guard");
-        assert_eq!(active_bundle.path, policy_path);
+        assert_eq!(
+            active_bundle.source,
+            PolicySourceSnapshot::LocalDirectory { path: policy_path }
+        );
         assert!(active_bundle.selector_configured);
         assert_eq!(
             active_bundle.policy_version.as_deref(),
             Some("guard@bundle-test")
         );
-        assert_eq!(active_bundle.source.mode, RuntimeMode::Available);
-        assert_eq!(active_bundle.source.check, PolicySourceCheck::MetadataOnly);
+        assert_eq!(active_bundle.inspection.mode, RuntimeMode::Available);
+        assert_eq!(
+            active_bundle.inspection.check,
+            PolicySourceCheck::MetadataOnly
+        );
         assert!(
             status
                 .reason
@@ -248,13 +272,13 @@ hooks = ["on_http_request_headers"]
         config.policies = vec![
             PolicyConfig {
                 id: "first".to_string(),
-                path: first_path.clone(),
+                source: local_source(first_path.clone()),
                 enabled: true,
                 selector: Some(Selector::default()),
             },
             PolicyConfig {
                 id: "second".to_string(),
-                path: second_path.clone(),
+                source: local_source(second_path.clone()),
                 enabled: true,
                 selector: None,
             },
@@ -268,14 +292,20 @@ hooks = ["on_http_request_headers"]
         assert_eq!(status.enabled_count, 2);
         assert_eq!(status.active.len(), 2);
         assert_eq!(status.active[0].id, "first");
-        assert_eq!(status.active[0].path, first_path);
+        assert_eq!(
+            status.active[0].source,
+            PolicySourceSnapshot::LocalDirectory { path: first_path }
+        );
         assert_eq!(
             status.active[0].policy_version.as_deref(),
             Some("first@bundle-test")
         );
         assert!(status.active[0].selector_configured);
         assert_eq!(status.active[1].id, "second");
-        assert_eq!(status.active[1].path, second_path);
+        assert_eq!(
+            status.active[1].source,
+            PolicySourceSnapshot::LocalDirectory { path: second_path }
+        );
         assert_eq!(
             status.active[1].policy_version.as_deref(),
             Some("second@bundle-test")
@@ -285,7 +315,7 @@ hooks = ["on_http_request_headers"]
             status
                 .active
                 .iter()
-                .all(|policy| policy.source.mode == RuntimeMode::Available)
+                .all(|policy| policy.inspection.mode == RuntimeMode::Available)
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -299,7 +329,7 @@ hooks = ["on_http_request_headers"]
         let mut config = config_with_storage_path(temp.join("spool"));
         config.policies = vec![PolicyConfig {
             id: "missing".to_string(),
-            path: missing_policy,
+            source: local_source(missing_policy),
             enabled: true,
             selector: None,
         }];
@@ -337,7 +367,7 @@ hooks = ["on_http_request_headers"]
         let mut config = config_with_storage_path(temp.join("spool"));
         config.policies = vec![PolicyConfig {
             id: "guard".to_string(),
-            path: policy_path,
+            source: local_source(policy_path),
             enabled: true,
             selector: None,
         }];
@@ -351,6 +381,53 @@ hooks = ["on_http_request_headers"]
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("exceeding"))
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn remote_policy_source_is_metadata_only_in_offline_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-remote-policy")?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.policies = vec![PolicyConfig {
+            id: "guard".to_string(),
+            source: PolicySourceConfig::RemoteBundle {
+                endpoint: "https://control.example/policies/guard".to_string(),
+                max_body_bytes: Some(2 * 1024 * 1024),
+            },
+            enabled: true,
+            selector: None,
+        }];
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+
+        let status = policy_status(&plan);
+
+        assert_eq!(status.mode, PolicyStatusMode::MetadataOnly);
+        assert_eq!(status.active.len(), 1);
+        let active = status.active.first().expect("active policy");
+        assert_eq!(
+            active.source,
+            PolicySourceSnapshot::RemoteBundle {
+                endpoint: "https://control.example/policies/guard".to_string(),
+                max_body_bytes: 2_097_152,
+            }
+        );
+        assert_eq!(active.policy_version, None);
+        assert_eq!(active.inspection.mode, RuntimeMode::Degraded);
+        assert!(
+            active
+                .inspection
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("offline status does not fetch"))
+        );
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("guard: remote policy bundle source"))
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -370,5 +447,9 @@ hooks = ["on_http_request_headers"]
         )?;
         fs::write(path.join("main.lua"), "function on_http_request_headers(")?;
         Ok(())
+    }
+
+    fn local_source(path: std::path::PathBuf) -> PolicySourceConfig {
+        PolicySourceConfig::LocalDirectory { path }
     }
 }

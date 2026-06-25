@@ -1,19 +1,9 @@
-use std::{
-    fmt,
-    future::Future,
-    io::{self, Cursor},
-    net::{SocketAddr, TcpStream as StdTcpStream},
-    num::NonZeroU32,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::{fmt, io::Cursor, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{
-    Method, Request, Uri,
+    Method, Request,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use http_body_util::{BodyExt, Full};
@@ -21,24 +11,20 @@ use hyper::{
     Response,
     body::{Body, Incoming},
 };
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
-    client::legacy::{
-        Client,
-        connect::{Connection, HttpConnector},
-    },
-    rt::{TokioExecutor, TokioIo},
+    client::legacy::{Client, connect::Connection},
+    rt::TokioExecutor,
 };
-use probe_io::{TcpConnectOptions, TcpSocketMark, connect_tcp};
+use probe_http::{
+    HttpConnectionOptions, ProbeHttpsConnector, https_connector, root_cert_store_with_native_roots,
+};
 use proto::BatchEnvelope;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::net::{TcpStream, lookup_host};
 use tower_service::Service;
 
 use crate::{BatchExporter, CompressionCodec, ExportAck, ExportError, WebhookAck};
 
 const RESERVED_WEBHOOK_HEADERS: &[&str] = &["content-type", "idempotency-key", "x-sssa-codec"];
-const WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_WEBHOOK_ACK_RESPONSE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
@@ -75,8 +61,7 @@ impl WebhookExporter {
         tls: WebhookTlsConfig,
         connection: WebhookConnectionOptions,
     ) -> Result<Self, ExportError> {
-        let connector = WebhookHttpConnector::new(connection);
-        let transport = HyperWebhookTransport::with_connector(connector, tls)?;
+        let transport = HyperWebhookTransport::with_connection_options(tls, connection)?;
         Self::with_transport(endpoint, codec, headers, transport)
     }
 
@@ -95,40 +80,7 @@ impl WebhookExporter {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WebhookConnectionOptions {
-    connect_timeout: Duration,
-    socket_mark: Option<TcpSocketMark>,
-}
-
-impl WebhookConnectionOptions {
-    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
-        self.connect_timeout = connect_timeout;
-        self
-    }
-
-    pub fn with_socket_mark(mut self, mark: NonZeroU32) -> Self {
-        self.socket_mark = Some(TcpSocketMark::new(mark));
-        self
-    }
-
-    fn connect_options(self) -> TcpConnectOptions {
-        let mut options = TcpConnectOptions::new(self.connect_timeout);
-        if let Some(mark) = self.socket_mark {
-            options = options.with_socket_mark(mark);
-        }
-        options
-    }
-}
-
-impl Default for WebhookConnectionOptions {
-    fn default() -> Self {
-        Self {
-            connect_timeout: WEBHOOK_CONNECT_TIMEOUT,
-            socket_mark: None,
-        }
-    }
-}
+pub type WebhookConnectionOptions = HttpConnectionOptions;
 
 #[async_trait]
 trait WebhookTransport: fmt::Debug + Send + Sync {
@@ -151,35 +103,9 @@ struct WebhookResponse {
     body: String,
 }
 
-#[derive(Clone, Debug)]
-struct WebhookHttpConnector {
-    connection: WebhookConnectionOptions,
-}
-
-impl WebhookHttpConnector {
-    fn new(connection: WebhookConnectionOptions) -> Self {
-        Self { connection }
-    }
-}
-
-impl Service<Uri> for WebhookHttpConnector {
-    type Response = TokioIo<TcpStream>;
-    type Error = io::Error;
-    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
-
-    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, uri: Uri) -> Self::Future {
-        let connection = self.connection;
-        Box::pin(async move { connect_uri(uri, connection).await.map(TokioIo::new) })
-    }
-}
-
 #[derive(Clone)]
-struct HyperWebhookTransport<C = HttpConnector> {
-    client: Client<HttpsConnector<C>, Full<Bytes>>,
+struct HyperWebhookTransport<C = ProbeHttpsConnector> {
+    client: Client<C, Full<Bytes>>,
 }
 
 impl<C> fmt::Debug for HyperWebhookTransport<C> {
@@ -192,97 +118,31 @@ impl<C> fmt::Debug for HyperWebhookTransport<C> {
 
 impl HyperWebhookTransport {
     fn with_tls_config(tls: WebhookTlsConfig) -> Result<Self, ExportError> {
-        let connector = default_webhook_connector(tls)?;
-        let client = Client::builder(TokioExecutor::new()).build(connector);
-        Ok(Self { client })
+        Self::with_connection_options(tls, WebhookConnectionOptions::default())
     }
 }
 
 impl<C> HyperWebhookTransport<C>
 where
-    C: Service<Uri> + Clone + Send + 'static,
+    C: Service<http::Uri> + Clone + Send + 'static,
     C::Response: hyper::rt::Read + hyper::rt::Write + Connection + Unpin + Send + 'static,
-    C::Future: Send + 'static,
+    C::Future: Send + Unpin + 'static,
     C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    fn with_connector(connector: C, tls: WebhookTlsConfig) -> Result<Self, ExportError> {
-        let tls = webhook_tls_config(tls)?;
-        let connector = HttpsConnectorBuilder::new()
-            .with_tls_config(tls)
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(connector);
+    fn from_connector(connector: C) -> Self {
         let client = Client::builder(TokioExecutor::new()).build(connector);
-        Ok(Self { client })
+        Self { client }
     }
 }
 
-fn default_webhook_connector(
-    tls: WebhookTlsConfig,
-) -> Result<HttpsConnector<HttpConnector>, ExportError> {
-    let tls = webhook_tls_config(tls)?;
-    Ok(HttpsConnectorBuilder::new()
-        .with_tls_config(tls)
-        .https_or_http()
-        .enable_http1()
-        .build())
-}
-
-async fn connect_uri(uri: Uri, connection: WebhookConnectionOptions) -> io::Result<TcpStream> {
-    let (host, port) = endpoint_host_port(&uri)?;
-    let addresses = lookup_host((host.as_str(), port))
-        .await?
-        .collect::<Vec<_>>();
-    let mut last_error = None;
-    for address in addresses {
-        match connect_address(address, connection).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last_error = Some(error),
-        }
+impl HyperWebhookTransport<ProbeHttpsConnector> {
+    fn with_connection_options(
+        tls: WebhookTlsConfig,
+        connection: WebhookConnectionOptions,
+    ) -> Result<Self, ExportError> {
+        let tls = webhook_tls_config(tls)?;
+        Ok(Self::from_connector(https_connector(tls, connection)))
     }
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            format!("no socket addresses resolved for {host}:{port}"),
-        )
-    }))
-}
-
-fn endpoint_host_port(uri: &Uri) -> io::Result<(String, u16)> {
-    let scheme = uri.scheme_str().unwrap_or("http");
-    let default_port = match scheme {
-        "http" => 80,
-        "https" => 443,
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unsupported webhook HTTP scheme {other}"),
-            ));
-        }
-    };
-    let host = uri.host().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "webhook HTTP endpoint is missing a host",
-        )
-    })?;
-    Ok((host.to_string(), uri.port_u16().unwrap_or(default_port)))
-}
-
-async fn connect_address(
-    address: SocketAddr,
-    connection: WebhookConnectionOptions,
-) -> io::Result<TcpStream> {
-    let options = connection.connect_options();
-    let stream = tokio::task::spawn_blocking(move || connect_tcp(address, options))
-        .await
-        .map_err(|source| io::Error::other(source.to_string()))??;
-    stream_to_tokio(stream)
-}
-
-fn stream_to_tokio(stream: StdTcpStream) -> io::Result<TcpStream> {
-    stream.set_nonblocking(true)?;
-    TcpStream::from_std(stream)
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -316,14 +176,11 @@ fn webhook_tls_config_with_native_roots(
         trust_anchor_pems,
         identity_pem,
     } = tls;
-    let mut roots = rustls::RootCertStore::empty();
-    for certificate in native_roots {
-        roots
-            .add(certificate)
-            .map_err(|source| ExportError::InvalidWebhookTlsMaterial {
-                reason: source.to_string(),
-            })?;
-    }
+    let mut roots = root_cert_store_with_native_roots(native_roots).map_err(|source| {
+        ExportError::InvalidWebhookTlsMaterial {
+            reason: source.to_string(),
+        }
+    })?;
     for pem in trust_anchor_pems {
         let certificates = parse_certificates(&pem)?;
         if certificates.is_empty() {
@@ -399,9 +256,9 @@ impl BatchExporter for WebhookExporter {
 #[async_trait]
 impl<C> WebhookTransport for HyperWebhookTransport<C>
 where
-    C: Service<Uri> + Clone + Send + Sync + 'static,
+    C: Service<http::Uri> + Clone + Send + Sync + 'static,
     C::Response: hyper::rt::Read + hyper::rt::Write + Connection + Unpin + Send + 'static,
-    C::Future: Send + 'static,
+    C::Future: Send + Unpin + 'static,
     C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     async fn send(&self, request: WebhookRequest) -> Result<WebhookResponse, ExportError> {
@@ -516,7 +373,6 @@ fn reserved_webhook_header(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_service::Service;
 
     #[test]
     fn webhook_exporter_rejects_invalid_headers() {
@@ -578,54 +434,6 @@ mod tests {
         let result = webhook_tls_config_with_native_roots(WebhookTlsConfig::default(), Vec::new());
 
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn endpoint_host_port_uses_scheme_defaults() -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(
-            endpoint_host_port(&"https://collector.example/batches".parse::<Uri>()?)?,
-            ("collector.example".to_string(), 443)
-        );
-        assert_eq!(
-            endpoint_host_port(&"http://collector.example/batches".parse::<Uri>()?)?,
-            ("collector.example".to_string(), 80)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn endpoint_host_port_preserves_explicit_port() -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(
-            endpoint_host_port(&"https://collector.example:8443/batches".parse::<Uri>()?)?,
-            ("collector.example".to_string(), 8443)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn endpoint_host_port_rejects_unsupported_scheme() -> Result<(), Box<dyn std::error::Error>> {
-        let error = endpoint_host_port(&"ftp://collector.example/batches".parse::<Uri>()?)
-            .expect_err("unsupported scheme should fail");
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("unsupported"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn default_webhook_connector_does_not_reject_https_scheme() {
-        let mut connector = default_webhook_connector(WebhookTlsConfig::default())
-            .expect("default TLS connector should build");
-        let uri = "https://127.0.0.1:9/batches"
-            .parse::<Uri>()
-            .expect("test URI should parse");
-
-        let error = connector
-            .call(uri)
-            .await
-            .expect_err("the unused local port should reject the connection");
-
-        assert!(!error.to_string().contains("scheme is not http"));
     }
 
     #[tokio::test]

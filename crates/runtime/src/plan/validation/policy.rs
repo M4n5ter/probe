@@ -15,7 +15,9 @@ pub(super) fn validate_config(config: &AgentConfig, violations: &mut Vec<ConfigV
 
 #[cfg(test)]
 mod tests {
-    use probe_config::{CaptureBackend, CaptureSelection, ConfigValidationError, PolicyConfig};
+    use probe_config::{
+        CaptureBackend, CaptureSelection, ConfigValidationError, PolicyConfig, PolicySourceConfig,
+    };
     use probe_core::{CapabilityKind, CapabilityState, RuntimeMode, Selector};
 
     use crate::plan::{
@@ -40,7 +42,9 @@ mod tests {
         config.capture.selection = CaptureSelection::Replay;
         config.policies = vec![PolicyConfig {
             id: "guard".to_string(),
-            path: "/tmp/guard.lua".into(),
+            source: PolicySourceConfig::LocalDirectory {
+                path: "/tmp/guard.bundle".into(),
+            },
             selector: Some(Selector::All {
                 selectors: Vec::new(),
             }),

@@ -3,26 +3,20 @@ use std::{
     time::Duration,
 };
 
-use http::{Method, Request, StatusCode, header::ACCEPT};
-use http_body_util::{BodyExt, Empty};
-use hyper::body::Bytes;
-use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
-    rt::TokioExecutor,
-};
+use http::StatusCode;
 use probe_config::EnforcementPolicyManifest;
+use probe_http::HttpConnectionOptions;
 use runtime::EnforcementPolicySourcePlan;
-use rustls::pki_types::CertificateDer;
 use serde::Serialize;
 use thiserror::Error;
 
 use probe_io::{BoundedFileError, BoundedFileErrorKind, read_bounded_regular_file_to_string};
 
+use crate::remote_source::{RemoteTextFetchConfig, RemoteTextFetchError, fetch_remote_text};
+
 pub const LOCAL_ENFORCEMENT_POLICY_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const REMOTE_ENFORCEMENT_POLICY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_ENFORCEMENT_POLICY_ACCEPT: &str = "application/toml, text/plain;q=0.9, */*;q=0.1";
-type RemotePolicyHttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedEnforcementPolicySource {
@@ -89,6 +83,33 @@ enum LoadedEnforcementPolicySourceOrigin {
         endpoint: String,
         max_body_bytes: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnforcementPolicySourceLoadContext {
+    remote_http_connection: HttpConnectionOptions,
+}
+
+impl EnforcementPolicySourceLoadContext {
+    pub fn with_remote_http_connection(remote_http_connection: HttpConnectionOptions) -> Self {
+        Self {
+            remote_http_connection,
+        }
+    }
+
+    pub fn remote_http_connection(self) -> HttpConnectionOptions {
+        self.remote_http_connection
+    }
+}
+
+impl Default for EnforcementPolicySourceLoadContext {
+    fn default() -> Self {
+        Self {
+            remote_http_connection: HttpConnectionOptions::new(
+                REMOTE_ENFORCEMENT_POLICY_FETCH_TIMEOUT,
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,8 +196,53 @@ pub enum EnforcementPolicySourceError {
     InvalidManifest { reason: String },
 }
 
-pub async fn load_enforcement_policy_source(
+impl EnforcementPolicySourceError {
+    fn from_remote_fetch(endpoint: &str, error: RemoteTextFetchError) -> Self {
+        match error {
+            RemoteTextFetchError::Client { reason } => Self::RemoteClient { reason },
+            RemoteTextFetchError::Fetch { reason } => Self::RemoteFetch {
+                endpoint: endpoint.to_string(),
+                reason,
+            },
+            RemoteTextFetchError::Timeout { timeout_ms } => Self::RemoteTimeout {
+                endpoint: endpoint.to_string(),
+                timeout_ms,
+            },
+            RemoteTextFetchError::Status { status } => Self::RemoteStatus {
+                endpoint: endpoint.to_string(),
+                status,
+            },
+            RemoteTextFetchError::Read { reason } => Self::RemoteRead {
+                endpoint: endpoint.to_string(),
+                reason,
+            },
+            RemoteTextFetchError::TooLarge { size, limit } => Self::RemoteTooLarge {
+                endpoint: endpoint.to_string(),
+                size,
+                limit,
+            },
+            RemoteTextFetchError::Utf8 { source } => Self::RemoteUtf8 {
+                endpoint: endpoint.to_string(),
+                source,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+async fn load_enforcement_policy_source(
     source: &EnforcementPolicySourcePlan,
+) -> Result<Option<LoadedEnforcementPolicySource>, EnforcementPolicySourceError> {
+    load_enforcement_policy_source_with_context(
+        source,
+        EnforcementPolicySourceLoadContext::default(),
+    )
+    .await
+}
+
+pub async fn load_enforcement_policy_source_with_context(
+    source: &EnforcementPolicySourcePlan,
+    context: EnforcementPolicySourceLoadContext,
 ) -> Result<Option<LoadedEnforcementPolicySource>, EnforcementPolicySourceError> {
     match source {
         EnforcementPolicySourcePlan::None => Ok(None),
@@ -192,8 +258,12 @@ pub async fn load_enforcement_policy_source(
             max_body_bytes,
         } => {
             let max_body_bytes = max_body_bytes.get();
-            let manifest =
-                fetch_remote_enforcement_policy_manifest(endpoint, max_body_bytes).await?;
+            let manifest = fetch_remote_enforcement_policy_manifest(
+                endpoint,
+                max_body_bytes,
+                context.remote_http_connection,
+            )
+            .await?;
             Ok(Some(LoadedEnforcementPolicySource::remote(
                 endpoint.clone(),
                 max_body_bytes,
@@ -241,11 +311,13 @@ fn read_enforcement_policy_manifest(
 async fn fetch_remote_enforcement_policy_manifest(
     endpoint: &str,
     max_body_bytes: u64,
+    connection: HttpConnectionOptions,
 ) -> Result<EnforcementPolicyManifest, EnforcementPolicySourceError> {
     fetch_remote_enforcement_policy_manifest_with_timeout(
         endpoint,
         REMOTE_ENFORCEMENT_POLICY_FETCH_TIMEOUT,
         max_body_bytes,
+        connection,
     )
     .await
 }
@@ -254,111 +326,25 @@ async fn fetch_remote_enforcement_policy_manifest_with_timeout(
     endpoint: &str,
     timeout: Duration,
     max_body_bytes: u64,
+    connection: HttpConnectionOptions,
 ) -> Result<EnforcementPolicyManifest, EnforcementPolicySourceError> {
-    let client = remote_policy_http_client()?;
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(endpoint)
-        .header(ACCEPT, REMOTE_ENFORCEMENT_POLICY_ACCEPT)
-        .body(Empty::<Bytes>::new())
-        .map_err(|source| EnforcementPolicySourceError::RemoteFetch {
-            endpoint: endpoint.to_string(),
-            reason: source.to_string(),
-        })?;
-
-    let content = tokio::time::timeout(
-        timeout,
-        fetch_remote_enforcement_policy_content(endpoint, client, request, max_body_bytes),
+    let content = fetch_remote_text(
+        endpoint,
+        RemoteTextFetchConfig {
+            accept: REMOTE_ENFORCEMENT_POLICY_ACCEPT,
+            timeout,
+            max_body_bytes,
+            connection,
+        },
     )
     .await
-    .map_err(|_| EnforcementPolicySourceError::RemoteTimeout {
-        endpoint: endpoint.to_string(),
-        timeout_ms: timeout.as_millis(),
-    })??;
+    .map_err(|error| EnforcementPolicySourceError::from_remote_fetch(endpoint, error))?;
     toml::from_str::<EnforcementPolicyManifest>(&content)
         .map_err(|source| EnforcementPolicySourceError::RemoteManifestToml {
             endpoint: endpoint.to_string(),
             source,
         })
         .and_then(validate_enforcement_policy_manifest)
-}
-
-async fn fetch_remote_enforcement_policy_content(
-    endpoint: &str,
-    client: RemotePolicyHttpClient,
-    request: Request<Empty<Bytes>>,
-    max_body_bytes: u64,
-) -> Result<String, EnforcementPolicySourceError> {
-    let response = client.request(request).await.map_err(|source| {
-        EnforcementPolicySourceError::RemoteFetch {
-            endpoint: endpoint.to_string(),
-            reason: source.to_string(),
-        }
-    })?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(EnforcementPolicySourceError::RemoteStatus {
-            endpoint: endpoint.to_string(),
-            status,
-        });
-    }
-
-    let mut body = Vec::new();
-    let mut incoming = response.into_body();
-    while let Some(frame) = incoming.frame().await.transpose().map_err(|source| {
-        EnforcementPolicySourceError::RemoteRead {
-            endpoint: endpoint.to_string(),
-            reason: source.to_string(),
-        }
-    })? {
-        if let Ok(chunk) = frame.into_data() {
-            let new_size = body.len().saturating_add(chunk.len()) as u64;
-            if new_size > max_body_bytes {
-                return Err(EnforcementPolicySourceError::RemoteTooLarge {
-                    endpoint: endpoint.to_string(),
-                    size: new_size,
-                    limit: max_body_bytes,
-                });
-            }
-            body.extend_from_slice(&chunk);
-        }
-    }
-    let content =
-        String::from_utf8(body).map_err(|source| EnforcementPolicySourceError::RemoteUtf8 {
-            endpoint: endpoint.to_string(),
-            source,
-        })?;
-    Ok(content)
-}
-
-fn remote_policy_http_client() -> Result<RemotePolicyHttpClient, EnforcementPolicySourceError> {
-    let tls = remote_policy_tls_config()?;
-    let connector = HttpsConnectorBuilder::new()
-        .with_tls_config(tls)
-        .https_or_http()
-        .enable_http1()
-        .build();
-    Ok(Client::builder(TokioExecutor::new()).build(connector))
-}
-
-fn remote_policy_tls_config() -> Result<rustls::ClientConfig, EnforcementPolicySourceError> {
-    remote_policy_tls_config_with_native_roots(rustls_native_certs::load_native_certs().certs)
-}
-
-fn remote_policy_tls_config_with_native_roots(
-    native_roots: Vec<CertificateDer<'static>>,
-) -> Result<rustls::ClientConfig, EnforcementPolicySourceError> {
-    let mut roots = rustls::RootCertStore::empty();
-    for certificate in native_roots {
-        roots
-            .add(certificate)
-            .map_err(|source| EnforcementPolicySourceError::RemoteClient {
-                reason: source.to_string(),
-            })?;
-    }
-    Ok(rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth())
 }
 
 fn validate_enforcement_policy_manifest(
@@ -511,6 +497,7 @@ mod tests {
             &endpoint,
             Duration::from_millis(30),
             TEST_REMOTE_BODY_LIMIT_BYTES,
+            HttpConnectionOptions::new(Duration::from_millis(30)),
         )
         .await
         .expect_err("the timeout must cover delayed response bodies");
@@ -580,13 +567,6 @@ mod tests {
                 max_body_bytes: TEST_REMOTE_BODY_LIMIT_BYTES,
             }
         );
-    }
-
-    #[test]
-    fn remote_policy_tls_config_allows_empty_native_roots() {
-        let result = remote_policy_tls_config_with_native_roots(Vec::new());
-
-        assert!(result.is_ok());
     }
 
     async fn remote_enforcement_source(

@@ -3,6 +3,7 @@ mod capture;
 mod enforcement;
 mod export;
 mod policy;
+mod remote_endpoint;
 mod storage;
 
 use crate::{AgentConfig, ConfigValidationError, tls};

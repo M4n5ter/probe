@@ -58,7 +58,11 @@ pub use export::{
     ExportWorkerRuntimeConfig, ExportWorkerScheduleConfig, ExporterConfig, ExporterTlsConfig,
     ExporterTransportConfig, ExporterWorkerConfig,
 };
-pub use policy::PolicyConfig;
+pub use policy::{
+    DEFAULT_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES, MAX_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES,
+    PolicyConfig, PolicySourceConfig, RemotePolicyBundleBodyLimitBytes,
+    RemotePolicyBundleBodyLimitError,
+};
 pub use storage::{
     DEFAULT_EXPORT_RETENTION_PRUNE_BATCH_LIMIT, DEFAULT_EXPORT_RETENTION_SWEEP_INTERVAL_MS,
     DEFAULT_INGRESS_RETENTION_PRUNE_BATCH_LIMIT, DEFAULT_INGRESS_RETENTION_SWEEP_INTERVAL_MS,

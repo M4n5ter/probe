@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use probe_config::{AgentConfig, CaptureSelection, PolicyConfig};
+use probe_config::{AgentConfig, CaptureSelection, PolicyConfig, PolicySourceConfig};
 use probe_core::{CaptureProviderKind, CaptureSource, Direction, EventEnvelope};
 
 pub(crate) const PLAINTEXT_FEED_EVENT_COUNT: usize = 3;
@@ -64,10 +64,25 @@ impl PlaintextFeedCase {
         spool_path: PathBuf,
         policy_id: impl Into<String>,
     ) -> AgentConfig {
+        self.agent_config_with_policy_source(
+            feed_path,
+            PolicySourceConfig::LocalDirectory { path: policy_path },
+            spool_path,
+            policy_id,
+        )
+    }
+
+    pub(crate) fn agent_config_with_policy_source(
+        &self,
+        feed_path: PathBuf,
+        policy_source: PolicySourceConfig,
+        spool_path: PathBuf,
+        policy_id: impl Into<String>,
+    ) -> AgentConfig {
         let mut config = self.agent_config(feed_path, spool_path);
         config.policies.push(PolicyConfig {
             id: policy_id.into(),
-            path: policy_path,
+            source: policy_source,
             enabled: true,
             selector: None,
         });
@@ -262,12 +277,33 @@ end
         policy_path: PathBuf,
         spool_path: PathBuf,
     ) -> AgentConfig {
-        self.feed
-            .agent_config_with_policy(feed_path, policy_path, spool_path, self.policy_id)
+        self.agent_config_with_policy_source(
+            feed_path,
+            PolicySourceConfig::LocalDirectory { path: policy_path },
+            spool_path,
+        )
+    }
+
+    pub(crate) fn agent_config_with_policy_source(
+        &self,
+        feed_path: PathBuf,
+        policy_source: PolicySourceConfig,
+        spool_path: PathBuf,
+    ) -> AgentConfig {
+        self.feed.agent_config_with_policy_source(
+            feed_path,
+            policy_source,
+            spool_path,
+            self.policy_id,
+        )
     }
 
     pub(crate) fn expected_flow_id(&self) -> String {
         self.feed.expected_flow_id()
+    }
+
+    pub(crate) fn feed_case(&self) -> &PlaintextFeedCase {
+        &self.feed
     }
 
     pub(crate) fn request_bytes(&self) -> Vec<u8> {

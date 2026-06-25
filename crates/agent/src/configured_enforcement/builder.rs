@@ -15,7 +15,8 @@ use crate::transparent_interception::{
 };
 
 use super::source::{
-    EnforcementPolicySourceError, LoadedEnforcementPolicySource, load_enforcement_policy_source,
+    EnforcementPolicySourceError, EnforcementPolicySourceLoadContext,
+    LoadedEnforcementPolicySource, load_enforcement_policy_source_with_context,
 };
 
 #[derive(Debug, Error)]
@@ -101,8 +102,11 @@ pub struct ConfiguredEnforcementCheck {
 pub async fn build_configured_enforcement_with_backend(
     plan: &RuntimePlan,
     backend: Option<Box<dyn EnforcementBackend>>,
+    policy_source_context: EnforcementPolicySourceLoadContext,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
-    let check = build_configured_enforcement_check_with_backend(plan, backend).await?;
+    let check =
+        build_configured_enforcement_check_with_backend(plan, backend, policy_source_context)
+            .await?;
     if let Some(error) = check.setup_error {
         return Err(error.into());
     }
@@ -112,6 +116,7 @@ pub async fn build_configured_enforcement_with_backend(
 pub async fn build_configured_enforcement_check_with_backend(
     plan: &RuntimePlan,
     backend: Option<Box<dyn EnforcementBackend>>,
+    policy_source_context: EnforcementPolicySourceLoadContext,
 ) -> Result<ConfiguredEnforcementCheck, ConfiguredEnforcementError> {
     let mut configured = build_configured_enforcement_from_parts(
         plan.enforcement.mode,
@@ -120,6 +125,7 @@ pub async fn build_configured_enforcement_check_with_backend(
         &plan.enforcement.policy_source,
         &plan.enforcement.execution_surfaces,
         backend,
+        policy_source_context,
     )
     .await?;
     let setup_selectors = TransparentInterceptionSetupSelectors::from_sources(
@@ -158,11 +164,16 @@ async fn build_configured_enforcement_from_parts(
     policy_source_plan: &EnforcementPolicySourcePlan,
     execution_surfaces: &[EnforcementExecutionSurface],
     backend: Option<Box<dyn EnforcementBackend>>,
+    policy_source_context: EnforcementPolicySourceLoadContext,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
     validate_enforcement_execution(mode, execution_surfaces, backend.is_some())?;
 
-    let policy_runtime =
-        load_configured_enforcement_policy_runtime(config_selector, policy_source_plan).await?;
+    let policy_runtime = load_configured_enforcement_policy_runtime(
+        config_selector,
+        policy_source_plan,
+        policy_source_context,
+    )
+    .await?;
     let planner = scoped_enforcement_planner(
         mode,
         policy_runtime.planner_policy().clone(),
@@ -181,8 +192,11 @@ async fn build_configured_enforcement_from_parts(
 pub(crate) async fn load_configured_enforcement_policy_runtime(
     config_selector: Option<Selector>,
     policy_source_plan: &EnforcementPolicySourcePlan,
+    policy_source_context: EnforcementPolicySourceLoadContext,
 ) -> Result<ActiveEnforcementPolicy, ConfiguredEnforcementError> {
-    let policy_source = load_enforcement_policy_source(policy_source_plan).await?;
+    let policy_source =
+        load_enforcement_policy_source_with_context(policy_source_plan, policy_source_context)
+            .await?;
     let effective_selector = effective_selector(
         config_selector,
         policy_source
@@ -288,6 +302,7 @@ mod tests {
             },
             &[EnforcementExecutionSurface::Connection],
             None,
+            EnforcementPolicySourceLoadContext::default(),
         )
         .await
         {
@@ -310,6 +325,7 @@ mod tests {
             &EnforcementPolicySourcePlan::None,
             &[EnforcementExecutionSurface::Connection],
             Some(Box::new(ApplyingBackend)),
+            EnforcementPolicySourceLoadContext::default(),
         )
         .await?;
         let trigger = outbound_event();
@@ -346,6 +362,7 @@ mod tests {
             &EnforcementPolicySourcePlan::None,
             &[EnforcementExecutionSurface::TransparentInterception],
             None,
+            EnforcementPolicySourceLoadContext::default(),
         )
         .await?;
         let trigger = outbound_event();
@@ -394,7 +411,13 @@ mod tests {
             plan.enforcement.interception.local_setup_projection,
             TransparentInterceptionLocalSetupProjectionPlan::RequiresProcessClassifier { .. }
         ));
-        let error = match build_configured_enforcement_with_backend(&plan, None).await {
+        let error = match build_configured_enforcement_with_backend(
+            &plan,
+            None,
+            EnforcementPolicySourceLoadContext::default(),
+        )
+        .await
+        {
             Ok(_) => panic!("process-scoped setup must require classifier support"),
             Err(error) => error,
         };
@@ -445,7 +468,13 @@ mod tests {
             plan.enforcement.interception.local_setup_projection,
             TransparentInterceptionLocalSetupProjectionPlan::HostRules { .. }
         ));
-        let error = match build_configured_enforcement_with_backend(&plan, None).await {
+        let error = match build_configured_enforcement_with_backend(
+            &plan,
+            None,
+            EnforcementPolicySourceLoadContext::default(),
+        )
+        .await
+        {
             Ok(_) => panic!("manifest process selector must require classifier support"),
             Err(error) => error,
         };
@@ -496,7 +525,13 @@ mod tests {
             plan.enforcement.interception.local_setup_projection,
             TransparentInterceptionLocalSetupProjectionPlan::Unsupported { .. }
         ));
-        let error = match build_configured_enforcement_with_backend(&plan, None).await {
+        let error = match build_configured_enforcement_with_backend(
+            &plan,
+            None,
+            EnforcementPolicySourceLoadContext::default(),
+        )
+        .await
+        {
             Ok(_) => panic!("manifest must not supply the only setup host constraint"),
             Err(error) => error,
         };

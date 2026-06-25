@@ -279,7 +279,9 @@ fn write_agent_config(
     };
     config.policies.push(PolicyConfig {
         id: POLICY_ID.to_string(),
-        path: policy_path.to_path_buf(),
+        source: probe_config::PolicySourceConfig::LocalDirectory {
+            path: policy_path.to_path_buf(),
+        },
         enabled: true,
         selector: None,
     });

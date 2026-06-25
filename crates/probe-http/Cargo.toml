@@ -1,0 +1,18 @@
+[package]
+name = "probe-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+http = "1.4"
+hyper-rustls = "0.27"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+probe-io = { path = "../probe-io" }
+rustls = "0.23"
+tokio = { version = "1.52.3", features = ["net", "rt"] }
+tower-service = "0.3"
+
+[lints]
+workspace = true

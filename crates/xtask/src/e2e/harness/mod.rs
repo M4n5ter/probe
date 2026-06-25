@@ -1,5 +1,6 @@
 mod build;
 mod codec;
+mod http_source;
 mod netns;
 mod process;
 mod temp;
@@ -8,6 +9,7 @@ pub(crate) use build::{
     debug_binary, ensure_e2e_packages_built, run_agent_with_max_events, trusted_system_command,
 };
 pub(crate) use codec::{decode_capture_event, decode_envelope};
+pub(crate) use http_source::HttpSourceServer;
 pub(crate) use netns::{
     reexec_current_case_in_fresh_network_namespace, verify_fresh_network_namespace,
 };

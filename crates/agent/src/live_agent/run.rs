@@ -7,7 +7,7 @@ use pipeline::{
     CapturePipeline, PipelinePolicySet, PipelineRunOptions, PipelineRuntimeMetrics, PipelineSummary,
 };
 use probe_config::AgentConfig;
-use runtime::{RuntimePlan, TransparentInterceptionExecutionPlan, validate_static_runtime_config};
+use runtime::{RuntimePlan, validate_static_runtime_config};
 use storage::FjallSpool;
 
 use crate::{
@@ -19,7 +19,11 @@ use crate::{
         EnforcementRuntimeState, RuntimeEnforcementPlanner,
         build_configured_enforcement_with_backend,
     },
-    configured_policy::load_configured_pipeline_policies,
+    configured_policy::load_configured_pipeline_policies_with_context,
+    control_plane_http::{
+        enforcement_policy_source_load_context_from_plan, policy_source_load_context_from_plan,
+        webhook_connection_options_from_plan,
+    },
     error::AgentError,
     export::{
         ExportDrainError, ExportWorker, ExportWorkerConfig,
@@ -65,8 +69,16 @@ pub(crate) async fn run_live_agent(
     let tls_decrypt_hint_runtime = TlsDecryptHintRuntimeState::for_plan(&plan);
     let capture_provider_preflight =
         CaptureProviderPreflight::build(&plan, Some(&tls_decrypt_hint_runtime), &l7_mitm_runtime)?;
-    let enforcement = build_configured_enforcement_with_backend(&plan, enforcement_backend).await?;
-    let policies = load_configured_pipeline_policies(&plan.config)?;
+    let enforcement_policy_load_context = enforcement_policy_source_load_context_from_plan(&plan);
+    let enforcement = build_configured_enforcement_with_backend(
+        &plan,
+        enforcement_backend,
+        enforcement_policy_load_context,
+    )
+    .await?;
+    let policy_load_context = policy_source_load_context_from_plan(&plan);
+    let policies =
+        load_configured_pipeline_policies_with_context(&plan.config, policy_load_context).await?;
     let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
     let webhook_connection = webhook_connection_options_from_plan(&plan);
     let export_worker =
@@ -378,19 +390,6 @@ fn export_worker_config_from_plan(
         &plan.export,
         webhook_connection,
     )
-}
-
-fn webhook_connection_options_from_plan(plan: &RuntimePlan) -> WebhookConnectionOptions {
-    match &plan.enforcement.interception.execution {
-        TransparentInterceptionExecutionPlan::OutboundTransparentProxy(outbound) => {
-            WebhookConnectionOptions::default()
-                .with_socket_mark(outbound.outbound_redirect_artifact().proxy_bypass_mark)
-        }
-        TransparentInterceptionExecutionPlan::Disabled
-        | TransparentInterceptionExecutionPlan::InboundTproxy(_) => {
-            WebhookConnectionOptions::default()
-        }
-    }
 }
 
 fn storage_retention_worker_config_from_plan(
