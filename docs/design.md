@@ -351,6 +351,7 @@ TLS 明文与协议能力：
 
 - `l7_mitm`
   - Runtime status：Unavailable。
+  - 已实现：runtime capability matrix 会以 unavailable 状态报告该目标能力，避免后续配置或策略把缺失的 MITM backend 误读为隐式可用。
   - 目标：作为独立 plaintext/enforcement backend 接入，而不是证书导入的隐式副作用。
   - 目标：只允许显式启用、selector-scoped、capability-gated，并输出独立 health/status/audit。
   - 边界：默认全机透明 MITM 被拒绝；proxy-first 也不是默认主采集路径。

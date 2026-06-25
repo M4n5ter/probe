@@ -125,6 +125,7 @@ fn default_platform_capabilities(
     [
         libssl_uprobe_capability,
         CapabilityState::available(CapabilityKind::TlsSessionSecretRecordDecrypt),
+        default_l7_mitm_capability(),
         CapabilityState::available(CapabilityKind::Http1),
         CapabilityState::available(CapabilityKind::Sse),
         CapabilityState::available(CapabilityKind::WebSocketHandoff),
@@ -171,6 +172,13 @@ fn default_libssl_uprobe_capability() -> CapabilityState {
     CapabilityState::unavailable(
         CapabilityKind::LibsslUprobe,
         "libssl uprobe discovery, attach planning, ABI, capture adapter, userspace uprobe loader, and eBPF producer exist, but no agent runtime composition root supplied a TLS plaintext provider capability",
+    )
+}
+
+fn default_l7_mitm_capability() -> CapabilityState {
+    CapabilityState::unavailable(
+        CapabilityKind::L7Mitm,
+        "L7 MITM is a target plaintext/enforcement backend, but no executable selector-scoped MITM backend is configured or implemented; default whole-machine transparent MITM is rejected",
     )
 }
 
@@ -258,6 +266,23 @@ mod tests {
             matrix.mode(CapabilityKind::WebSocketFrame),
             RuntimeMode::Available
         );
+    }
+
+    #[test]
+    fn l7_mitm_is_reported_as_unavailable_target_capability() {
+        let registry = ProviderRegistry::with_default_platform(vec![capture_provider(
+            CaptureBackend::Replay,
+            CaptureProviderBuilder::Replay,
+            RuntimeMode::Available,
+        )]);
+        let state = registry.capability_matrix().state(CapabilityKind::L7Mitm);
+
+        assert_eq!(state.mode, RuntimeMode::Unavailable);
+        let reason = state
+            .reason
+            .expect("L7 MITM target capability should explain why it is unavailable");
+        assert!(reason.contains("selector-scoped MITM backend"));
+        assert!(reason.contains("default whole-machine transparent MITM is rejected"));
     }
 
     fn capture_provider(

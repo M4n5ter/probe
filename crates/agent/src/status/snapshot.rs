@@ -680,6 +680,37 @@ mod tests {
     }
 
     #[test]
+    fn status_snapshot_reports_l7_mitm_as_unavailable_target_capability()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan(
+            PathBuf::from("/tmp/sssa-spool"),
+            vec![CapabilityState::unavailable(
+                CapabilityKind::L7Mitm,
+                "selector-scoped MITM backend is not implemented",
+            )],
+        )?;
+        let snapshot = build_status_snapshot_at(
+            &plan,
+            available_spool_input(PathBuf::from("/tmp/sssa-spool")),
+            42,
+        );
+
+        assert_eq!(
+            snapshot.capabilities.mode(CapabilityKind::L7Mitm),
+            RuntimeMode::Unavailable
+        );
+        let value = serde_json::to_value(&snapshot)?;
+        let state = status_capability(&value, "l7_mitm");
+        assert_eq!(state["mode"], json!("unavailable"));
+        assert!(
+            state["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("selector-scoped MITM backend"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tls_plaintext_runtime_disabled_degrades_status_capability_and_health()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
