@@ -8,6 +8,11 @@ use serde::Serialize;
 
 use crate::transparent_interception::TransparentInterceptionIpFamily;
 
+pub(crate) use crate::tcp_health::{
+    TcpHealthMode as TransparentProxyHealthProbeMode,
+    TcpHealthSnapshot as TransparentProxyHealthProbeSnapshot,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct TransparentProxyRuntimeSnapshot {
     pub mode: TransparentProxyRuntimeMode,
@@ -40,35 +45,6 @@ impl TransparentProxyRuntimeMode {
             TransparentInterceptionProxyModeConfig::ManagedTcpRelay => Self::Configured,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum TransparentProxyHealthProbeMode {
-    Disabled,
-    Pending,
-    Healthy,
-    Unhealthy,
-}
-
-impl TransparentProxyHealthProbeMode {
-    pub(crate) fn wire_name(self) -> &'static str {
-        match self {
-            Self::Disabled => "disabled",
-            Self::Pending => "pending",
-            Self::Healthy => "healthy",
-            Self::Unhealthy => "unhealthy",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct TransparentProxyHealthProbeSnapshot {
-    pub mode: TransparentProxyHealthProbeMode,
-    pub check_successes: u64,
-    pub check_failures: u64,
-    pub consecutive_failures: u64,
-    pub last_failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -116,10 +92,10 @@ impl TransparentProxyRuntime {
                 None,
             ),
         };
-        let health_probe = health_probe_plan
-            .map_or_else(TransparentProxyHealthProbeSnapshot::disabled, |plan| {
-                TransparentProxyHealthProbeSnapshot::from_plan(plan)
-            });
+        let health_probe = health_probe_plan.map_or_else(
+            TransparentProxyHealthProbeSnapshot::disabled,
+            health_probe_snapshot,
+        );
         let health_probe_failure_threshold =
             health_probe_plan.map_or(1, health_probe_failure_threshold);
         Self::new(mode, health_probe, health_probe_failure_threshold)
@@ -218,37 +194,16 @@ impl TransparentProxyRuntime {
 
     pub(super) fn record_health_probe_success(&self) {
         let mut state = self.handle.lock();
-        if state.snapshot.health_probe.mode == TransparentProxyHealthProbeMode::Disabled {
-            return;
-        }
-        state.snapshot.health_probe.check_successes = state
-            .snapshot
-            .health_probe
-            .check_successes
-            .saturating_add(1);
-        state.snapshot.health_probe.consecutive_failures = 0;
-        state.snapshot.health_probe.last_failure_reason = None;
-        state.snapshot.health_probe.mode = TransparentProxyHealthProbeMode::Healthy;
+        state.snapshot.health_probe.record_success();
     }
 
     pub(super) fn record_health_probe_failure(&self, reason: impl Into<String>) {
         let mut state = self.handle.lock();
-        if state.snapshot.health_probe.mode == TransparentProxyHealthProbeMode::Disabled {
-            return;
-        }
-        state.snapshot.health_probe.check_failures =
-            state.snapshot.health_probe.check_failures.saturating_add(1);
-        state.snapshot.health_probe.consecutive_failures = state
+        let failure_threshold = state.health_probe_failure_threshold;
+        state
             .snapshot
             .health_probe
-            .consecutive_failures
-            .saturating_add(1);
-        state.snapshot.health_probe.last_failure_reason = Some(reason.into());
-        if state.snapshot.health_probe.consecutive_failures
-            >= u64::from(state.health_probe_failure_threshold)
-        {
-            state.snapshot.health_probe.mode = TransparentProxyHealthProbeMode::Unhealthy;
-        }
+            .record_failure(failure_threshold, reason);
     }
 
     pub(super) fn record_listener_failure(&self, family: TransparentInterceptionIpFamily) {
@@ -285,27 +240,13 @@ impl TransparentProxyRuntime {
     }
 }
 
-impl TransparentProxyHealthProbeSnapshot {
-    fn disabled() -> Self {
-        Self {
-            mode: TransparentProxyHealthProbeMode::Disabled,
-            check_successes: 0,
-            check_failures: 0,
-            consecutive_failures: 0,
-            last_failure_reason: None,
-        }
-    }
-
-    fn from_plan(plan: &TransparentInterceptionProxyHealthProbePlan) -> Self {
-        let mode = if plan.is_enabled() {
-            TransparentProxyHealthProbeMode::Pending
-        } else {
-            TransparentProxyHealthProbeMode::Disabled
-        };
-        Self {
-            mode,
-            ..Self::disabled()
-        }
+fn health_probe_snapshot(
+    plan: &TransparentInterceptionProxyHealthProbePlan,
+) -> TransparentProxyHealthProbeSnapshot {
+    if plan.is_enabled() {
+        TransparentProxyHealthProbeSnapshot::pending()
+    } else {
+        TransparentProxyHealthProbeSnapshot::disabled()
     }
 }
 

@@ -1,6 +1,7 @@
 use std::{
     io,
     net::{SocketAddr, TcpStream},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -10,18 +11,60 @@ use probe_config::{
     TransparentInterceptionMitmPlaintextBridgeIntent,
 };
 use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
+use serde::Serialize;
 
-use crate::capture_event_feed::load_capture_event_feed_provider;
+use crate::{
+    capture_event_feed::load_capture_event_feed_provider,
+    tcp_health::{TcpHealthProbeObserver, TcpHealthProbePlan, start_tcp_health_probe},
+};
 
+pub(crate) use crate::tcp_health::{
+    TcpHealthMode as L7MitmBackendHealthMode, TcpHealthProbeGuard as L7MitmBackendHealthProbeGuard,
+    TcpHealthSnapshot as L7MitmBackendHealthSnapshot,
+};
+
+#[derive(Clone)]
 pub(crate) struct L7MitmRuntime {
     capability: CapabilityState,
+    backend_health_probe: Option<L7MitmBackendHealthProbePlan>,
+    handle: L7MitmRuntimeHandle,
 }
 
 impl L7MitmRuntime {
     pub(crate) fn capability(&self) -> CapabilityState {
         self.capability.clone()
     }
+
+    pub(crate) fn handle(&self) -> L7MitmRuntimeHandle {
+        self.handle.clone()
+    }
+
+    pub(crate) fn start_backend_health_probe(&self) -> Option<L7MitmBackendHealthProbeGuard> {
+        start_tcp_health_probe(
+            self.backend_health_probe,
+            self.handle.clone(),
+            || Ok(()),
+            "L7 MITM backend health probe thread panicked",
+        )
+    }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct L7MitmRuntimeSnapshot {
+    pub backend_health: L7MitmBackendHealthSnapshot,
+}
+
+#[derive(Clone)]
+pub(crate) struct L7MitmRuntimeHandle {
+    inner: Arc<Mutex<L7MitmRuntimeState>>,
+}
+
+struct L7MitmRuntimeState {
+    snapshot: L7MitmRuntimeSnapshot,
+    backend_health_failure_threshold: u32,
+}
+
+type L7MitmBackendHealthProbePlan = TcpHealthProbePlan;
 
 pub(crate) fn resolve(config: &AgentConfig) -> L7MitmRuntime {
     resolve_with_probe(config, connect_tcp)
@@ -43,9 +86,10 @@ fn resolve_with_probe(
     if let Err(error) = probe_plaintext_bridge(config) {
         return unavailable(error);
     }
-    if let Err(error) = probe_external_backend(config, tcp_probe) {
-        return unavailable(error);
-    }
+    let backend_health_probe = match probe_external_backend(config, tcp_probe) {
+        Ok(plan) => plan,
+        Err(error) => return unavailable(error),
+    };
 
     L7MitmRuntime {
         capability: CapabilityState {
@@ -56,6 +100,11 @@ fn resolve_with_probe(
                     .to_string(),
             ),
         },
+        handle: L7MitmRuntimeHandle::new(
+            L7MitmBackendHealthSnapshot::initial_success(),
+            backend_health_probe.failure_threshold,
+        ),
+        backend_health_probe: Some(backend_health_probe.into_plan()),
     }
 }
 
@@ -66,7 +115,7 @@ fn connect_tcp(target: SocketAddr, timeout: Duration) -> io::Result<()> {
 fn probe_external_backend(
     config: &AgentConfig,
     tcp_probe: impl FnOnce(SocketAddr, Duration) -> io::Result<()>,
-) -> Result<(), String> {
+) -> Result<ResolvedL7MitmBackendHealthProbe, String> {
     let readiness_probe = config
         .enforcement
         .interception
@@ -82,12 +131,22 @@ fn probe_external_backend(
     else {
         return Err("external L7 MITM backend contract is missing".to_string());
     };
-    let TransparentInterceptionMitmBackendReadinessProbeIntent::TcpConnect { target, timeout_ms } =
-        readiness_probe;
-    tcp_probe(target, Duration::from_millis(timeout_ms)).map_err(|error| {
+    let TransparentInterceptionMitmBackendReadinessProbeIntent::TcpConnect {
+        target,
+        interval_ms,
+        timeout_ms,
+        failure_threshold,
+    } = readiness_probe;
+    let timeout = Duration::from_millis(timeout_ms);
+    tcp_probe(target, timeout).map_err(|error| {
         format!("external L7 MITM backend readiness probe failed for {target}: {error}")
     })?;
-    Ok(())
+    Ok(ResolvedL7MitmBackendHealthProbe {
+        target,
+        interval: Duration::from_millis(interval_ms),
+        timeout,
+        failure_threshold,
+    })
 }
 
 fn probe_plaintext_bridge(config: &AgentConfig) -> Result<(), String> {
@@ -119,12 +178,76 @@ fn probe_plaintext_bridge(config: &AgentConfig) -> Result<(), String> {
 fn unavailable(reason: impl Into<String>) -> L7MitmRuntime {
     L7MitmRuntime {
         capability: CapabilityState::unavailable(CapabilityKind::L7Mitm, reason),
+        backend_health_probe: None,
+        handle: L7MitmRuntimeHandle::new(L7MitmBackendHealthSnapshot::disabled(), 1),
+    }
+}
+
+struct ResolvedL7MitmBackendHealthProbe {
+    target: SocketAddr,
+    interval: Duration,
+    timeout: Duration,
+    failure_threshold: u32,
+}
+
+impl ResolvedL7MitmBackendHealthProbe {
+    fn into_plan(self) -> L7MitmBackendHealthProbePlan {
+        TcpHealthProbePlan::new(self.target, self.interval, self.timeout)
+            .with_initial_delay(self.interval)
+    }
+}
+
+impl L7MitmRuntimeHandle {
+    fn new(
+        backend_health: L7MitmBackendHealthSnapshot,
+        backend_health_failure_threshold: u32,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(L7MitmRuntimeState {
+                snapshot: L7MitmRuntimeSnapshot { backend_health },
+                backend_health_failure_threshold,
+            })),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> L7MitmRuntimeSnapshot {
+        self.lock().snapshot.clone()
+    }
+
+    fn record_backend_health_success(&self) {
+        let mut state = self.lock();
+        state.snapshot.backend_health.record_success();
+    }
+
+    fn record_backend_health_failure(&self, reason: impl Into<String>) {
+        let mut state = self.lock();
+        let failure_threshold = state.backend_health_failure_threshold;
+        state
+            .snapshot
+            .backend_health
+            .record_failure(failure_threshold, reason);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, L7MitmRuntimeState> {
+        self.inner
+            .lock()
+            .expect("L7 MITM runtime state should not be poisoned")
+    }
+}
+
+impl TcpHealthProbeObserver for L7MitmRuntimeHandle {
+    fn record_tcp_health_success(&self) {
+        self.record_backend_health_success();
+    }
+
+    fn record_tcp_health_failure(&self, reason: String) {
+        self.record_backend_health_failure(reason);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::ErrorKind;
+    use std::{io::ErrorKind, net::TcpListener, thread, time::Instant};
 
     use probe_config::{
         AgentConfig, TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
@@ -176,6 +299,110 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn successful_readiness_probe_initializes_backend_health_runtime() {
+        let config = external_mitm_config("127.0.0.1:15002");
+
+        let runtime = resolve_with_probe(&config, |target, timeout| {
+            assert_eq!(
+                target,
+                "127.0.0.1:15002"
+                    .parse()
+                    .expect("test MITM target should parse")
+            );
+            assert_eq!(timeout, Duration::from_millis(200));
+            Ok(())
+        });
+
+        let capability = runtime.capability();
+        assert_eq!(capability.mode, RuntimeMode::Available);
+        let probe = runtime
+            .backend_health_probe
+            .as_ref()
+            .expect("available external MITM runtime should start backend health probe");
+        assert_eq!(probe.interval(), Duration::from_millis(1_000));
+        assert_eq!(probe.timeout(), Duration::from_millis(200));
+        let health = runtime.handle().snapshot().backend_health;
+        assert_eq!(health.mode, L7MitmBackendHealthMode::Healthy);
+        assert_eq!(health.check_successes, 1);
+        assert_eq!(health.check_failures, 0);
+    }
+
+    #[test]
+    fn backend_health_probe_marks_unhealthy_after_failure_threshold() {
+        let handle = L7MitmRuntimeHandle::new(L7MitmBackendHealthSnapshot::initial_success(), 2);
+
+        handle.record_backend_health_failure("connection refused");
+        let health = handle.snapshot().backend_health;
+        assert_eq!(health.mode, L7MitmBackendHealthMode::Healthy);
+        assert_eq!(health.check_failures, 1);
+        assert_eq!(health.consecutive_failures, 1);
+
+        handle.record_backend_health_failure("connection refused");
+        let health = handle.snapshot().backend_health;
+        assert_eq!(health.mode, L7MitmBackendHealthMode::Unhealthy);
+        assert_eq!(health.check_failures, 2);
+        assert_eq!(health.consecutive_failures, 2);
+        assert_eq!(
+            health.last_failure_reason.as_deref(),
+            Some("connection refused")
+        );
+    }
+
+    #[test]
+    fn backend_health_probe_success_clears_unhealthy_state() {
+        let handle = L7MitmRuntimeHandle::new(L7MitmBackendHealthSnapshot::initial_success(), 1);
+
+        handle.record_backend_health_failure("connection refused");
+        assert_eq!(
+            handle.snapshot().backend_health.mode,
+            L7MitmBackendHealthMode::Unhealthy
+        );
+
+        handle.record_backend_health_success();
+
+        let health = handle.snapshot().backend_health;
+        assert_eq!(health.mode, L7MitmBackendHealthMode::Healthy);
+        assert_eq!(health.check_successes, 2);
+        assert_eq!(health.check_failures, 1);
+        assert_eq!(health.consecutive_failures, 0);
+        assert_eq!(health.last_failure_reason, None);
+    }
+
+    #[test]
+    fn backend_health_probe_thread_records_checks_and_stops()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = closed_loopback_target()?;
+        let handle = L7MitmRuntimeHandle::new(L7MitmBackendHealthSnapshot::initial_success(), 1);
+        let runtime = L7MitmRuntime {
+            capability: CapabilityState {
+                kind: CapabilityKind::L7Mitm,
+                mode: RuntimeMode::Available,
+                reason: None,
+            },
+            backend_health_probe: Some(TcpHealthProbePlan::new(
+                target,
+                Duration::from_millis(5),
+                Duration::from_millis(10),
+            )),
+            handle: handle.clone(),
+        };
+        let guard = runtime
+            .start_backend_health_probe()
+            .expect("configured backend health probe should start");
+
+        wait_until(Duration::from_secs(1), || {
+            handle.snapshot().backend_health.check_failures > 0
+        })?;
+        guard.stop()?;
+
+        let health = handle.snapshot().backend_health;
+        assert_eq!(health.mode, L7MitmBackendHealthMode::Unhealthy);
+        assert!(health.check_failures > 0);
+        assert!(health.consecutive_failures > 0);
+        Ok(())
+    }
+
     fn external_mitm_config(target: &str) -> AgentConfig {
         let mut config = AgentConfig::default();
         let target: SocketAddr = target
@@ -211,5 +438,26 @@ mod tests {
 
     fn missing_bridge_path() -> Result<std::path::PathBuf, std::io::Error> {
         Ok(tempdir()?.path().join("missing-mitm-bridge.jsonl"))
+    }
+
+    fn closed_loopback_target() -> Result<SocketAddr, std::io::Error> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let target = listener.local_addr()?;
+        drop(listener);
+        Ok(target)
+    }
+
+    fn wait_until(
+        timeout: Duration,
+        mut condition: impl FnMut() -> bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if condition() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Err("condition did not become true before timeout".into())
     }
 }

@@ -5,17 +5,33 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{EnforcementInterceptionConfig, normalized_ip_address};
+use super::{
+    EnforcementInterceptionConfig,
+    health_probe::{
+        DEFAULT_TCP_HEALTH_PROBE_FAILURE_THRESHOLD, DEFAULT_TCP_HEALTH_PROBE_INTERVAL_MS,
+        DEFAULT_TCP_HEALTH_PROBE_TIMEOUT_MS, MAX_TCP_HEALTH_PROBE_FAILURE_THRESHOLD,
+        MAX_TCP_HEALTH_PROBE_INTERVAL_MS, MAX_TCP_HEALTH_PROBE_TIMEOUT_MS,
+        MIN_TCP_HEALTH_PROBE_FAILURE_THRESHOLD, MIN_TCP_HEALTH_PROBE_INTERVAL_MS,
+        MIN_TCP_HEALTH_PROBE_TIMEOUT_MS, TcpHealthProbeTimingFields,
+        validate_tcp_health_probe_timing,
+    },
+    normalized_ip_address,
+};
 
-pub const DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS: u64 = 1_000;
-pub const DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS: u64 = 200;
-pub const DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD: u32 = 3;
-pub const MIN_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS: u64 = 100;
-pub const MAX_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS: u64 = 60_000;
-pub const MIN_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS: u64 = 10;
-pub const MAX_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS: u64 = 5_000;
-pub const MIN_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD: u32 = 1;
-pub const MAX_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD: u32 = 100;
+pub const DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS: u64 =
+    DEFAULT_TCP_HEALTH_PROBE_INTERVAL_MS;
+pub const DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS: u64 =
+    DEFAULT_TCP_HEALTH_PROBE_TIMEOUT_MS;
+pub const DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD: u32 =
+    DEFAULT_TCP_HEALTH_PROBE_FAILURE_THRESHOLD;
+pub const MIN_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS: u64 = MIN_TCP_HEALTH_PROBE_INTERVAL_MS;
+pub const MAX_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS: u64 = MAX_TCP_HEALTH_PROBE_INTERVAL_MS;
+pub const MIN_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS: u64 = MIN_TCP_HEALTH_PROBE_TIMEOUT_MS;
+pub const MAX_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS: u64 = MAX_TCP_HEALTH_PROBE_TIMEOUT_MS;
+pub const MIN_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD: u32 =
+    MIN_TCP_HEALTH_PROBE_FAILURE_THRESHOLD;
+pub const MAX_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD: u32 =
+    MAX_TCP_HEALTH_PROBE_FAILURE_THRESHOLD;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -523,36 +539,18 @@ fn validate_transparent_proxy_health_probe(
             "managed TCP relay health probe target must not point at the local relay listener",
         ));
     }
-    validate_health_probe_range(
-        "enforcement.interception.proxy.health_probe.interval_ms",
+    validate_tcp_health_probe_timing(
+        TcpHealthProbeTimingFields {
+            interval_ms: "enforcement.interception.proxy.health_probe.interval_ms",
+            timeout_ms: "enforcement.interception.proxy.health_probe.timeout_ms",
+            failure_threshold: "enforcement.interception.proxy.health_probe.failure_threshold",
+        },
+        "transparent proxy health probe",
         health_probe.interval_ms,
-        MIN_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS,
-        MAX_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS,
-        "transparent proxy health probe interval",
-        violations,
-    );
-    validate_health_probe_range(
-        "enforcement.interception.proxy.health_probe.timeout_ms",
         health_probe.timeout_ms,
-        MIN_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS,
-        MAX_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS,
-        "transparent proxy health probe timeout",
+        health_probe.failure_threshold,
         violations,
     );
-    validate_health_probe_range(
-        "enforcement.interception.proxy.health_probe.failure_threshold",
-        u64::from(health_probe.failure_threshold),
-        u64::from(MIN_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD),
-        u64::from(MAX_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD),
-        "transparent proxy health probe failure threshold",
-        violations,
-    );
-    if health_probe.timeout_ms > health_probe.interval_ms {
-        violations.push(intent_violation(
-            "enforcement.interception.proxy.health_probe.timeout_ms",
-            "transparent proxy health probe timeout must not exceed interval",
-        ));
-    }
     parsed_target
 }
 
@@ -600,22 +598,6 @@ fn resolve_self_bypass_contract(
             "enforcement.interception.proxy.self_bypass",
             "external outbound transparent proxy requires self_bypass = \"uses_reserved_mark\" so its upstream and control-plane sockets can bypass the agent-owned OUTPUT redirect",
         )),
-    }
-}
-
-fn validate_health_probe_range(
-    field: &'static str,
-    value: u64,
-    min: u64,
-    max: u64,
-    label: &str,
-    violations: &mut Vec<TransparentInterceptionProxyIntentViolation>,
-) {
-    if !(min..=max).contains(&value) {
-        violations.push(intent_violation(
-            field,
-            format!("{label} must be between {min} and {max}"),
-        ));
     }
 }
 

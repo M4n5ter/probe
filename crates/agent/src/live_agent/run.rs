@@ -25,6 +25,7 @@ use crate::{
         ExportDrainError, ExportWorker, ExportWorkerConfig,
         drain_planned_sinks_with_webhook_connection,
     },
+    l7_mitm::L7MitmBackendHealthProbeGuard,
     runtime_composition::build_runtime_composition,
     shutdown,
     storage_retention::{
@@ -59,7 +60,7 @@ pub(crate) async fn run_live_agent(
     } = options;
     validate_static_runtime_config(&agent_config)?;
     let runtime = build_runtime_composition(agent_config)?;
-    let (plan, enforcement_backend, transparent_interception) = runtime.into_run_parts();
+    let (plan, enforcement_backend, l7_mitm, transparent_interception) = runtime.into_run_parts();
     let tls_decrypt_hint_runtime = TlsDecryptHintRuntimeState::for_plan(&plan);
     let capture_provider_preflight =
         CaptureProviderPreflight::build(&plan, Some(&tls_decrypt_hint_runtime))?;
@@ -86,6 +87,7 @@ pub(crate) async fn run_live_agent(
         policy_set: policy_set.clone(),
         tls_decrypt_hints: Some(tls_decrypt_hint_runtime.clone()),
         tls_plaintext: Some(tls_plaintext_runtime.clone()),
+        l7_mitm: Some(l7_mitm.handle()),
         transparent_proxy: Some(transparent_proxy_runtime.clone()),
         ..AdminRuntimeState::default()
     };
@@ -99,6 +101,7 @@ pub(crate) async fn run_live_agent(
             )
         })
         .transpose()?;
+    let l7_mitm_health_probe = l7_mitm.start_backend_health_probe();
     let export_worker = export_worker.map(|worker| worker.spawn(Arc::clone(&spool)));
     let storage_retention_config = storage_retention_worker_config_from_plan(&plan);
     println!(
@@ -150,6 +153,7 @@ pub(crate) async fn run_live_agent(
     if let Some(worker) = storage_retention_worker {
         worker.stop().await;
     }
+    let l7_mitm_health_result = stop_l7_mitm_backend_health_probe(l7_mitm_health_probe);
     let drain_result = drain_planned_sinks_with_webhook_connection(
         spool.as_ref(),
         &plan.config.agent_id,
@@ -157,7 +161,12 @@ pub(crate) async fn run_live_agent(
         webhook_connection,
     )
     .await;
-    let summary = merge_run_results(summary_result, interception_cleanup_result, drain_result)?;
+    let summary = merge_run_results(
+        summary_result,
+        interception_cleanup_result,
+        l7_mitm_health_result,
+        drain_result,
+    )?;
     println!(
         "agent stopped after reading {} capture events, journaling {} ingress records, processing {} ingress records ({} recovered), and storing {} export events",
         summary.capture_events_read,
@@ -270,6 +279,15 @@ fn deactivate_transparent_interception_guard(
     }
 }
 
+fn stop_l7_mitm_backend_health_probe(
+    guard: Option<L7MitmBackendHealthProbeGuard>,
+) -> Result<(), AgentError> {
+    match guard {
+        Some(guard) => guard.stop().map_err(AgentError::L7MitmRuntime),
+        None => Ok(()),
+    }
+}
+
 fn signal_readiness(readiness: ReadinessSignal) -> Result<(), AgentError> {
     match readiness {
         ReadinessSignal::None => Ok(()),
@@ -296,33 +314,54 @@ fn merge_run_results(
         (),
         crate::transparent_interception::TransparentInterceptionError,
     >,
+    l7_mitm_health_result: Result<(), AgentError>,
     drain_result: Result<(), ExportDrainError>,
 ) -> Result<PipelineSummary, AgentError> {
-    match (summary_result, interception_cleanup_result, drain_result) {
-        (Ok(summary), Ok(()), Ok(())) => Ok(summary),
-        (Err(error), Ok(()), Ok(())) => Err(error),
-        (Ok(_), Err(error), Ok(())) => Err(error.into()),
-        (Ok(_), Ok(()), Err(error)) => Err(error.into()),
-        (Err(run_error), Err(cleanup_error), Ok(())) => {
-            eprintln!("transparent interception cleanup failed after run error: {cleanup_error}");
-            Err(run_error)
+    let summary = match summary_result {
+        Ok(summary) => summary,
+        Err(run_error) => {
+            if let Err(cleanup_error) = interception_cleanup_result {
+                eprintln!(
+                    "transparent interception cleanup failed after run error: {cleanup_error}"
+                );
+            }
+            if let Err(health_error) = l7_mitm_health_result {
+                eprintln!(
+                    "L7 MITM backend health probe cleanup failed after run error: {health_error}"
+                );
+            }
+            if let Err(export_error) = drain_result {
+                eprintln!("tail export drain failed after run error: {export_error}");
+            }
+            return Err(run_error);
         }
-        (Err(run_error), Ok(()), Err(export_error)) => {
-            eprintln!("tail export drain failed after run error: {export_error}");
-            Err(run_error)
+    };
+    if let Err(cleanup_error) = interception_cleanup_result {
+        if let Err(health_error) = l7_mitm_health_result {
+            eprintln!(
+                "L7 MITM backend health probe cleanup failed after transparent interception cleanup error: {health_error}"
+            );
         }
-        (Ok(_), Err(cleanup_error), Err(export_error)) => {
+        if let Err(export_error) = drain_result {
+            eprintln!("transparent interception cleanup failed: {cleanup_error}");
             eprintln!(
                 "tail export drain failed after transparent interception cleanup error: {export_error}"
             );
-            Err(cleanup_error.into())
         }
-        (Err(run_error), Err(cleanup_error), Err(export_error)) => {
-            eprintln!("transparent interception cleanup failed after run error: {cleanup_error}");
-            eprintln!("tail export drain failed after run error: {export_error}");
-            Err(run_error)
-        }
+        return Err(cleanup_error.into());
     }
+    if let Err(health_error) = l7_mitm_health_result {
+        if let Err(export_error) = drain_result {
+            eprintln!(
+                "tail export drain failed after L7 MITM backend health cleanup error: {export_error}"
+            );
+        }
+        return Err(health_error);
+    }
+    if let Err(export_error) = drain_result {
+        return Err(export_error.into());
+    }
+    Ok(summary)
 }
 
 fn export_worker_config_from_plan(

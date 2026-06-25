@@ -13,13 +13,15 @@ use std::{
 use socket2::{SockAddr, Socket};
 
 use super::{
-    connect::{TransparentProxyUpstreamConnectPlan, connect_tcp, tcp_connect_failure_reason},
+    connect::{TransparentProxyUpstreamConnectPlan, connect_tcp},
     proxy_error, proxy_io_error,
     registry::{RelayRegistry, RelaySlot, shutdown_streams},
     state::TransparentProxyRuntime,
     target::TransparentProxyTargetRecovery,
 };
-use crate::transparent_interception::TransparentInterceptionError;
+use crate::{
+    tcp_health::tcp_connect_failure_reason, transparent_interception::TransparentInterceptionError,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 

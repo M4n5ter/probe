@@ -4,6 +4,7 @@ use crate::configured_enforcement::{
     ActiveEnforcementPolicy, EnforcementPolicySourceInspection, LoadedEnforcementPolicySource,
     LoadedEnforcementPolicySourceOriginRef, inspect_enforcement_policy_source,
 };
+use crate::l7_mitm::L7MitmRuntimeSnapshot;
 use crate::transparent_interception::TransparentProxyRuntimeSnapshot;
 use probe_config::{ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig};
 use probe_core::{CapabilityKind, EnforcementMode, ProtectiveActionProfile, RuntimeMode};
@@ -45,6 +46,7 @@ pub struct EnforcementInterceptionStatusSnapshot {
     pub classification: TransparentInterceptionClassificationPlan,
     pub selector_configured: bool,
     pub capabilities: Vec<RequiredCapabilityPlan>,
+    pub runtime_l7_mitm: Option<L7MitmRuntimeSnapshot>,
     pub runtime_proxy: Option<TransparentProxyRuntimeSnapshot>,
 }
 
@@ -110,11 +112,13 @@ pub struct EnforcementPolicyManifestStatusSnapshot {
 
 pub(in crate::status) fn enforcement_status_with_transparent_proxy(
     plan: &RuntimePlan,
+    l7_mitm: Option<L7MitmRuntimeSnapshot>,
     transparent_proxy: Option<TransparentProxyRuntimeSnapshot>,
 ) -> EnforcementStatusSnapshot {
     enforcement_status_with_source(
         plan,
         EnforcementPolicyStatusSource::Offline,
+        l7_mitm,
         transparent_proxy,
     )
 }
@@ -122,11 +126,13 @@ pub(in crate::status) fn enforcement_status_with_transparent_proxy(
 pub(in crate::status) fn enforcement_status_with_active_policy(
     plan: &RuntimePlan,
     policy: &ActiveEnforcementPolicy,
+    l7_mitm: Option<L7MitmRuntimeSnapshot>,
     transparent_proxy: Option<TransparentProxyRuntimeSnapshot>,
 ) -> EnforcementStatusSnapshot {
     enforcement_status_with_source(
         plan,
         EnforcementPolicyStatusSource::Active(policy),
+        l7_mitm,
         transparent_proxy,
     )
 }
@@ -134,6 +140,7 @@ pub(in crate::status) fn enforcement_status_with_active_policy(
 fn enforcement_status_with_source(
     plan: &RuntimePlan,
     source: EnforcementPolicyStatusSource<'_>,
+    l7_mitm: Option<L7MitmRuntimeSnapshot>,
     transparent_proxy: Option<TransparentProxyRuntimeSnapshot>,
 ) -> EnforcementStatusSnapshot {
     let configured_mode = plan.enforcement.mode;
@@ -170,6 +177,7 @@ fn enforcement_status_with_source(
             classification: plan.enforcement.interception.classification.clone(),
             selector_configured: plan.enforcement.interception.selector_configured,
             capabilities: plan.enforcement.interception.capabilities.clone(),
+            runtime_l7_mitm: l7_mitm,
             runtime_proxy: transparent_proxy,
         },
         policy: policy.snapshot,
@@ -534,7 +542,7 @@ protective_actions = ["alert"]
             Some(policy_source),
         )?;
 
-        let status = enforcement_status_with_active_policy(&plan, &active_policy, None);
+        let status = enforcement_status_with_active_policy(&plan, &active_policy, None, None);
 
         let EnforcementPolicySourceStatusSnapshot::Loaded {
             source: LoadedEnforcementPolicySourceStatusSnapshot::Remote { endpoint: actual },
@@ -842,6 +850,18 @@ protective_actions = ["alert"]
             json!("127.0.0.1:15002")
         );
         assert_eq!(
+            value["interception"]["mitm"]["backend_readiness_probe"]["interval_ms"],
+            json!(1_000)
+        );
+        assert_eq!(
+            value["interception"]["mitm"]["backend_readiness_probe"]["timeout_ms"],
+            json!(200)
+        );
+        assert_eq!(
+            value["interception"]["mitm"]["backend_readiness_probe"]["failure_threshold"],
+            json!(3)
+        );
+        assert_eq!(
             value["interception"]["mitm"]["plaintext_bridge"]["mode"],
             json!("capture_event_feed")
         );
@@ -1035,7 +1055,7 @@ protective_actions = ["alert"]
     }
 
     fn enforcement_status(plan: &RuntimePlan) -> EnforcementStatusSnapshot {
-        enforcement_status_with_transparent_proxy(plan, None)
+        enforcement_status_with_transparent_proxy(plan, None, None)
     }
 
     fn config_with_external_mitm_plaintext_bridge(

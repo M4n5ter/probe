@@ -28,6 +28,7 @@ use super::{
 use crate::capture_provider::CaptureProviderRuntimeState;
 use crate::configured_enforcement::EnforcementRuntimeState;
 use crate::export::ExportWorkerRuntimeState;
+use crate::l7_mitm::L7MitmRuntimeHandle;
 use crate::status::{
     AgentStatusSnapshot, EnforcementRuntimeStatusInput, PROMETHEUS_TEXT_CONTENT_TYPE,
     RuntimeStatusInput, build_status_snapshot_with_runtime, collect_running_spool_status,
@@ -50,6 +51,7 @@ pub struct AdminRuntimeState {
     pub policy_set: PipelinePolicySet,
     pub tls_decrypt_hints: Option<TlsDecryptHintRuntimeState>,
     pub tls_plaintext: Option<TlsPlaintextRuntimeState>,
+    pub l7_mitm: Option<L7MitmRuntimeHandle>,
     pub transparent_proxy: Option<TransparentProxyRuntimeHandle>,
 }
 
@@ -303,6 +305,10 @@ fn build_admin_status_snapshot(
                 .tls_plaintext
                 .as_ref()
                 .map(TlsPlaintextRuntimeState::snapshot),
+            l7_mitm: runtime_state
+                .l7_mitm
+                .as_ref()
+                .map(L7MitmRuntimeHandle::snapshot),
             transparent_proxy: runtime_state
                 .transparent_proxy
                 .as_ref()
@@ -417,6 +423,7 @@ mod tests {
             plan.enforcement.interception.execution.clone(),
         )
         .proxy_runtime_handle();
+        let l7_mitm_runtime = crate::l7_mitm::resolve(&plan.config).handle();
         let server = spawn_admin_server(
             Arc::clone(&plan),
             Arc::clone(&spool),
@@ -425,6 +432,7 @@ mod tests {
             },
             AdminRuntimeState {
                 pipeline: Some(pipeline_metrics),
+                l7_mitm: Some(l7_mitm_runtime),
                 transparent_proxy: Some(transparent_proxy_runtime),
                 ..AdminRuntimeState::default()
             },
@@ -451,6 +459,10 @@ mod tests {
             json!(0)
         );
         assert_eq!(
+            response["metrics"]["l7_mitm"]["backend_health"]["mode"],
+            json!("disabled")
+        );
+        assert_eq!(
             response["metrics"]["transparent_proxy"]["active_relays"],
             json!(0)
         );
@@ -463,6 +475,11 @@ mod tests {
 
         assert_eq!(
             response["snapshot"]["enforcement"]["interception"]["runtime_proxy"]["mode"],
+            json!("disabled")
+        );
+        assert_eq!(
+            response["snapshot"]["enforcement"]["interception"]["runtime_l7_mitm"]["backend_health"]
+                ["mode"],
             json!("disabled")
         );
 
@@ -478,7 +495,9 @@ mod tests {
             .as_str()
             .expect("prometheus metrics should be returned as text");
         assert!(metrics.contains("sssa_pipeline_metrics_available 1\n"));
+        assert!(metrics.contains("sssa_l7_mitm_metrics_available 1\n"));
         assert!(metrics.contains("sssa_transparent_proxy_metrics_available 1\n"));
+        assert!(metrics.contains("sssa_l7_mitm_backend_health_mode{mode=\"disabled\"} 1\n"));
         assert!(
             metrics.contains(
                 "sssa_transparent_proxy_upstream_connects_total{outcome=\"success\"} 0\n"

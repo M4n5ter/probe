@@ -1,31 +1,24 @@
 use std::{
     fmt,
-    net::{IpAddr, SocketAddr, TcpStream},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::{self, JoinHandle},
+    net::{IpAddr, SocketAddr},
     time::Duration,
 };
 
 use ::runtime::TransparentInterceptionProxyHealthProbePlan;
 
 use super::{
-    LocalAddressInventory, ManagedTransparentProxyPlan, connect::tcp_connect_failure_reason,
-    proxy_error, state::TransparentProxyRuntime,
+    LocalAddressInventory, ManagedTransparentProxyPlan, proxy_error, state::TransparentProxyRuntime,
+};
+use crate::tcp_health::{
+    TcpHealthProbeGuard, TcpHealthProbeObserver, TcpHealthProbePlan, start_tcp_health_probe,
 };
 use crate::transparent_interception::{
     TransparentInterceptionError, TransparentInterceptionIpFamily,
 };
 
-const HEALTH_PROBE_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
-
 #[derive(Debug)]
 pub(in crate::transparent_interception) struct TransparentProxyHealthProbePlan {
-    target: SocketAddr,
-    interval: Duration,
-    timeout: Duration,
+    tcp: TcpHealthProbePlan,
     self_target_guard: Option<ManagedRelaySelfTargetGuard>,
 }
 
@@ -43,10 +36,9 @@ impl fmt::Debug for ManagedRelaySelfTargetGuard {
     }
 }
 
-pub(in crate::transparent_interception) struct TransparentProxyHealthProbeGuard {
-    shutdown_requested: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
+pub(in crate::transparent_interception) struct TransparentProxyHealthProbeGuard(
+    TcpHealthProbeGuard,
+);
 
 pub(super) fn prepare_health_probe(
     health_probe: &TransparentInterceptionProxyHealthProbePlan,
@@ -65,9 +57,11 @@ pub(super) fn prepare_health_probe(
     let self_target_guard =
         prepare_managed_relay_self_target_guard(managed, *target, load_local_addresses)?;
     Ok(Some(TransparentProxyHealthProbePlan {
-        target: *target,
-        interval: Duration::from_millis(*interval_ms),
-        timeout: Duration::from_millis(*timeout_ms),
+        tcp: TcpHealthProbePlan::new(
+            *target,
+            Duration::from_millis(*interval_ms),
+            Duration::from_millis(*timeout_ms),
+        ),
         self_target_guard,
     }))
 }
@@ -156,72 +150,52 @@ pub(super) fn start_health_probe(
     runtime: TransparentProxyRuntime,
 ) -> Option<TransparentProxyHealthProbeGuard> {
     let plan = plan?;
-    let shutdown_requested = Arc::new(AtomicBool::new(false));
-    let shutdown = Arc::clone(&shutdown_requested);
-    let thread = thread::spawn(move || run_health_probe(plan, shutdown, runtime));
-    Some(TransparentProxyHealthProbeGuard {
-        shutdown_requested,
-        thread: Some(thread),
-    })
+    let tcp = plan.tcp;
+    let self_target_guard = plan.self_target_guard;
+    start_tcp_health_probe(
+        Some(tcp),
+        runtime,
+        move || validate_self_target(&self_target_guard).map_err(|error| error.to_string()),
+        "transparent proxy health probe thread panicked",
+    )
+    .map(TransparentProxyHealthProbeGuard)
 }
 
 impl TransparentProxyHealthProbeGuard {
     pub(in crate::transparent_interception) fn stop(
-        mut self,
+        self,
     ) -> Result<(), TransparentInterceptionError> {
-        self.shutdown_requested.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            thread
-                .join()
-                .map_err(|_| proxy_error("transparent proxy health probe thread panicked"))?;
-        }
-        Ok(())
+        self.0.stop().map_err(proxy_error)
     }
 }
 
-impl Drop for TransparentProxyHealthProbeGuard {
-    fn drop(&mut self) {
-        self.shutdown_requested.store(true, Ordering::SeqCst);
+impl TcpHealthProbeObserver for TransparentProxyRuntime {
+    fn record_tcp_health_success(&self) {
+        self.record_health_probe_success();
+    }
+
+    fn record_tcp_health_failure(&self, reason: String) {
+        self.record_health_probe_failure(reason);
     }
 }
 
-fn run_health_probe(
-    plan: TransparentProxyHealthProbePlan,
-    shutdown_requested: Arc<AtomicBool>,
-    runtime: TransparentProxyRuntime,
-) {
-    while !shutdown_requested.load(Ordering::SeqCst) {
-        run_health_probe_check(&plan, &runtime);
-        sleep_until_next_probe(plan.interval, &shutdown_requested);
+fn validate_self_target(
+    self_target_guard: &Option<ManagedRelaySelfTargetGuard>,
+) -> Result<(), TransparentInterceptionError> {
+    if let Some(guard) = self_target_guard {
+        guard.ensure_target_is_not_local()?;
     }
+    Ok(())
 }
 
+#[cfg(test)]
 fn run_health_probe_check(
     plan: &TransparentProxyHealthProbePlan,
     runtime: &TransparentProxyRuntime,
 ) {
-    if let Some(guard) = &plan.self_target_guard
-        && let Err(error) = guard.ensure_target_is_not_local()
-    {
-        runtime.record_health_probe_failure(error.to_string());
-        return;
-    }
-    match TcpStream::connect_timeout(&plan.target, plan.timeout) {
-        Ok(stream) => {
-            drop(stream);
-            runtime.record_health_probe_success();
-        }
-        Err(error) => runtime.record_health_probe_failure(tcp_connect_failure_reason(&error)),
-    }
-}
-
-fn sleep_until_next_probe(interval: Duration, shutdown_requested: &AtomicBool) {
-    let mut remaining = interval;
-    while !remaining.is_zero() && !shutdown_requested.load(Ordering::SeqCst) {
-        let sleep_for = remaining.min(HEALTH_PROBE_STOP_POLL_INTERVAL);
-        thread::sleep(sleep_for);
-        remaining = remaining.saturating_sub(sleep_for);
-    }
+    let pre_connect_check =
+        || validate_self_target(&plan.self_target_guard).map_err(|error| error.to_string());
+    crate::tcp_health::run_tcp_health_probe_check_for_test(&plan.tcp, runtime, &pre_connect_check);
 }
 
 #[cfg(test)]
@@ -326,7 +300,7 @@ mod tests {
         .expect("remote target on relay port should be a valid probe")
         .expect("health probe should be enabled");
 
-        assert_eq!(plan.target, "192.0.2.10:15001".parse()?);
+        assert_eq!(plan.tcp.target(), "192.0.2.10:15001".parse()?);
         Ok(())
     }
 
@@ -384,7 +358,7 @@ mod tests {
         )?
         .expect("health probe should be enabled");
 
-        assert_eq!(plan.target, "[2001:db8::10]:15001".parse()?);
+        assert_eq!(plan.tcp.target(), "[2001:db8::10]:15001".parse()?);
         Ok(())
     }
 
@@ -436,9 +410,7 @@ mod tests {
         self_target_guard: Option<ManagedRelaySelfTargetGuard>,
     ) -> TransparentProxyHealthProbePlan {
         TransparentProxyHealthProbePlan {
-            target,
-            interval: Duration::from_millis(500),
-            timeout,
+            tcp: TcpHealthProbePlan::new(target, Duration::from_millis(500), timeout),
             self_target_guard,
         }
     }

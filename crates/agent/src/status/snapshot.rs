@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use crate::configured_enforcement::ActiveEnforcementPolicy;
 use crate::export::ExportWorkerRuntimeSnapshot;
+use crate::l7_mitm::L7MitmRuntimeSnapshot;
 use crate::tls_plaintext::{TlsDecryptHintRuntimeSnapshot, TlsPlaintextRuntimeSnapshot};
 use crate::transparent_interception::TransparentProxyRuntimeSnapshot;
 
@@ -58,6 +59,7 @@ pub struct RuntimeStatusInput {
     pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
     pub tls_decrypt_hints: Option<TlsDecryptHintRuntimeSnapshot>,
     pub tls_plaintext: Option<TlsPlaintextRuntimeSnapshot>,
+    pub l7_mitm: Option<L7MitmRuntimeSnapshot>,
     pub transparent_proxy: Option<TransparentProxyRuntimeSnapshot>,
 }
 
@@ -113,12 +115,20 @@ fn build_status_snapshot_at_with_runtime(
     let capture = capture_status(plan, runtime.capture.clone());
     let policy = policy_status(plan);
     let transparent_proxy = runtime.transparent_proxy.clone();
+    let l7_mitm = runtime.l7_mitm.clone();
     let enforcement = match &runtime.enforcement {
-        EnforcementRuntimeStatusInput::OfflineInspect => {
-            enforcement_status_with_transparent_proxy(plan, transparent_proxy.clone())
-        }
+        EnforcementRuntimeStatusInput::OfflineInspect => enforcement_status_with_transparent_proxy(
+            plan,
+            l7_mitm.clone(),
+            transparent_proxy.clone(),
+        ),
         EnforcementRuntimeStatusInput::Runtime { active_policy } => {
-            enforcement_status_with_active_policy(plan, active_policy, transparent_proxy.clone())
+            enforcement_status_with_active_policy(
+                plan,
+                active_policy,
+                l7_mitm.clone(),
+                transparent_proxy.clone(),
+            )
         }
     };
     let capabilities = capabilities_with_runtime(
@@ -144,6 +154,7 @@ fn build_status_snapshot_at_with_runtime(
         &spool_status,
         &exporters,
         runtime.export_worker.as_ref(),
+        l7_mitm,
         transparent_proxy,
         runtime.pipeline,
     );
@@ -524,10 +535,6 @@ mod tests {
         assert_eq!(
             value["enforcement"]["interception"]["runtime_proxy"]["upstream_connects"]["connect_failures"],
             json!(17)
-        );
-        assert_eq!(
-            value["enforcement"]["interception"]["runtime_proxy"]["health_probe"]["mode"],
-            json!("healthy")
         );
         assert_eq!(
             value["metrics"]["transparent_proxy"]["health_probe"]["check_failures"],

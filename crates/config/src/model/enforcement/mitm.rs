@@ -7,13 +7,34 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    EnforcementInterceptionConfig, TransparentInterceptionIntentViolation, intent_violation,
-    normalized_ip_address,
+    EnforcementInterceptionConfig, TransparentInterceptionIntentViolation,
+    health_probe::{
+        DEFAULT_TCP_HEALTH_PROBE_FAILURE_THRESHOLD, DEFAULT_TCP_HEALTH_PROBE_INTERVAL_MS,
+        DEFAULT_TCP_HEALTH_PROBE_TIMEOUT_MS, MAX_TCP_HEALTH_PROBE_FAILURE_THRESHOLD,
+        MAX_TCP_HEALTH_PROBE_INTERVAL_MS, MAX_TCP_HEALTH_PROBE_TIMEOUT_MS,
+        MIN_TCP_HEALTH_PROBE_FAILURE_THRESHOLD, MIN_TCP_HEALTH_PROBE_INTERVAL_MS,
+        MIN_TCP_HEALTH_PROBE_TIMEOUT_MS, TcpHealthProbeTimingFields,
+        validate_tcp_health_probe_timing,
+    },
+    intent_violation, normalized_ip_address,
 };
 
-pub const DEFAULT_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS: u64 = 200;
-pub const MIN_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS: u64 = 10;
-pub const MAX_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS: u64 =
+    DEFAULT_TCP_HEALTH_PROBE_TIMEOUT_MS;
+pub const DEFAULT_TRANSPARENT_MITM_BACKEND_READINESS_INTERVAL_MS: u64 =
+    DEFAULT_TCP_HEALTH_PROBE_INTERVAL_MS;
+pub const DEFAULT_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD: u32 =
+    DEFAULT_TCP_HEALTH_PROBE_FAILURE_THRESHOLD;
+pub const MIN_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS: u64 = MIN_TCP_HEALTH_PROBE_TIMEOUT_MS;
+pub const MAX_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS: u64 = MAX_TCP_HEALTH_PROBE_TIMEOUT_MS;
+pub const MIN_TRANSPARENT_MITM_BACKEND_READINESS_INTERVAL_MS: u64 =
+    MIN_TCP_HEALTH_PROBE_INTERVAL_MS;
+pub const MAX_TRANSPARENT_MITM_BACKEND_READINESS_INTERVAL_MS: u64 =
+    MAX_TCP_HEALTH_PROBE_INTERVAL_MS;
+pub const MIN_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD: u32 =
+    MIN_TCP_HEALTH_PROBE_FAILURE_THRESHOLD;
+pub const MAX_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD: u32 =
+    MAX_TCP_HEALTH_PROBE_FAILURE_THRESHOLD;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -53,13 +74,18 @@ impl TransparentInterceptionMitmConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct TransparentInterceptionMitmBackendReadinessProbeConfig {
     pub target: Option<String>,
+    pub interval_ms: u64,
     pub timeout_ms: u64,
+    pub failure_threshold: u32,
 }
 
 impl TransparentInterceptionMitmBackendReadinessProbeConfig {
     pub fn is_configured(&self) -> bool {
         self.target.is_some()
+            || self.interval_ms != DEFAULT_TRANSPARENT_MITM_BACKEND_READINESS_INTERVAL_MS
             || self.timeout_ms != DEFAULT_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS
+            || self.failure_threshold
+                != DEFAULT_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD
     }
 }
 
@@ -67,7 +93,9 @@ impl Default for TransparentInterceptionMitmBackendReadinessProbeConfig {
     fn default() -> Self {
         Self {
             target: None,
+            interval_ms: DEFAULT_TRANSPARENT_MITM_BACKEND_READINESS_INTERVAL_MS,
             timeout_ms: DEFAULT_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS,
+            failure_threshold: DEFAULT_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD,
         }
     }
 }
@@ -118,7 +146,12 @@ pub enum TransparentInterceptionMitmBackendIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransparentInterceptionMitmBackendReadinessProbeIntent {
-    TcpConnect { target: SocketAddr, timeout_ms: u64 },
+    TcpConnect {
+        target: SocketAddr,
+        interval_ms: u64,
+        timeout_ms: u64,
+        failure_threshold: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,11 +222,13 @@ fn validate_mitm_backend_readiness_probe(
     violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
 ) -> Option<TransparentInterceptionMitmBackendReadinessProbeIntent> {
     let target = validate_mitm_backend_readiness_probe_target(proxy_listen_port, probe, violations);
-    validate_mitm_backend_readiness_probe_timeout(probe, violations);
+    validate_mitm_backend_readiness_probe_ranges(probe, violations);
     target.map(
         |target| TransparentInterceptionMitmBackendReadinessProbeIntent::TcpConnect {
             target,
+            interval_ms: probe.interval_ms,
             timeout_ms: probe.timeout_ms,
+            failure_threshold: probe.failure_threshold,
         },
     )
 }
@@ -248,21 +283,22 @@ fn validate_mitm_backend_readiness_probe_target(
     parsed_target
 }
 
-fn validate_mitm_backend_readiness_probe_timeout(
+fn validate_mitm_backend_readiness_probe_ranges(
     probe: &TransparentInterceptionMitmBackendReadinessProbeConfig,
     violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
 ) {
-    if !(MIN_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS
-        ..=MAX_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS)
-        .contains(&probe.timeout_ms)
-    {
-        violations.push(intent_violation(
-            "enforcement.interception.mitm.backend_readiness_probe.timeout_ms",
-            format!(
-                "external MITM backend readiness probe timeout must be between {MIN_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS} and {MAX_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS}"
-            ),
-        ));
-    }
+    validate_tcp_health_probe_timing(
+        TcpHealthProbeTimingFields {
+            interval_ms: "enforcement.interception.mitm.backend_readiness_probe.interval_ms",
+            timeout_ms: "enforcement.interception.mitm.backend_readiness_probe.timeout_ms",
+            failure_threshold: "enforcement.interception.mitm.backend_readiness_probe.failure_threshold",
+        },
+        "external MITM backend readiness probe",
+        probe.interval_ms,
+        probe.timeout_ms,
+        probe.failure_threshold,
+        violations,
+    );
 }
 
 fn validate_mitm_plaintext_bridge(

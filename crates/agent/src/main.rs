@@ -18,6 +18,7 @@ mod runtime_composition;
 mod shutdown;
 mod status;
 mod storage_retention;
+mod tcp_health;
 mod tls_material;
 mod tls_plaintext;
 mod transparent_interception;

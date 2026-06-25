@@ -4,7 +4,9 @@ use serde::Serialize;
 
 use crate::{
     export::ExportWorkerRuntimeSnapshot,
-    transparent_interception::{TransparentProxyHealthProbeMode, TransparentProxyRuntimeSnapshot},
+    l7_mitm::L7MitmRuntimeSnapshot,
+    tcp_health::{TcpHealthMode, TcpHealthSnapshot},
+    transparent_interception::TransparentProxyRuntimeSnapshot,
 };
 
 use super::{
@@ -17,6 +19,7 @@ pub struct MetricsSnapshot {
     pub capabilities: CapabilityMetricsSnapshot,
     pub spool: SpoolMetricsSnapshot,
     pub export: ExportMetricsSnapshot,
+    pub l7_mitm: Option<L7MitmMetricsSnapshot>,
     pub transparent_proxy: Option<TransparentProxyMetricsSnapshot>,
     pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
 }
@@ -42,22 +45,27 @@ pub struct ExportMetricsSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct L7MitmMetricsSnapshot {
+    pub backend_health: TcpHealthMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TcpHealthMetricsSnapshot {
+    pub mode: TcpHealthMode,
+    pub check_successes: u64,
+    pub check_failures: u64,
+    pub consecutive_failures: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct TransparentProxyMetricsSnapshot {
-    pub health_probe: TransparentProxyHealthProbeMetricsSnapshot,
+    pub health_probe: TcpHealthMetricsSnapshot,
     pub upstream_connects: TransparentProxyUpstreamConnectMetricsSnapshot,
     pub active_relays: u64,
     pub accepted_relays: u64,
     pub rejected_relays: u64,
     pub relay_failures: u64,
     pub listener_failures: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct TransparentProxyHealthProbeMetricsSnapshot {
-    pub mode: TransparentProxyHealthProbeMode,
-    pub check_successes: u64,
-    pub check_failures: u64,
-    pub consecutive_failures: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -71,6 +79,7 @@ pub(in crate::status) fn metrics_snapshot(
     spool: &SpoolStatusSnapshot,
     exporters: &[ExporterStatusSnapshot],
     export_worker: Option<&ExportWorkerRuntimeSnapshot>,
+    l7_mitm: Option<L7MitmRuntimeSnapshot>,
     transparent_proxy: Option<TransparentProxyRuntimeSnapshot>,
     pipeline: Option<PipelineRuntimeMetricsSnapshot>,
 ) -> MetricsSnapshot {
@@ -85,8 +94,15 @@ pub(in crate::status) fn metrics_snapshot(
             total_lag: total_export_lag(exporters),
             backing_off_sink_count: export_worker.map(|_| backing_off_exporter_count(exporters)),
         },
+        l7_mitm: l7_mitm.map(l7_mitm_metrics),
         transparent_proxy: transparent_proxy.map(transparent_proxy_metrics),
         pipeline,
+    }
+}
+
+fn l7_mitm_metrics(runtime: L7MitmRuntimeSnapshot) -> L7MitmMetricsSnapshot {
+    L7MitmMetricsSnapshot {
+        backend_health: tcp_health_metrics(runtime.backend_health),
     }
 }
 
@@ -94,12 +110,7 @@ fn transparent_proxy_metrics(
     proxy: TransparentProxyRuntimeSnapshot,
 ) -> TransparentProxyMetricsSnapshot {
     TransparentProxyMetricsSnapshot {
-        health_probe: TransparentProxyHealthProbeMetricsSnapshot {
-            mode: proxy.health_probe.mode,
-            check_successes: proxy.health_probe.check_successes,
-            check_failures: proxy.health_probe.check_failures,
-            consecutive_failures: proxy.health_probe.consecutive_failures,
-        },
+        health_probe: tcp_health_metrics(proxy.health_probe),
         upstream_connects: TransparentProxyUpstreamConnectMetricsSnapshot {
             connect_successes: proxy.upstream_connects.connect_successes,
             connect_failures: proxy.upstream_connects.connect_failures,
@@ -109,6 +120,15 @@ fn transparent_proxy_metrics(
         rejected_relays: proxy.rejected_relays,
         relay_failures: proxy.relay_failures,
         listener_failures: proxy.listener_failures,
+    }
+}
+
+fn tcp_health_metrics(health: TcpHealthSnapshot) -> TcpHealthMetricsSnapshot {
+    TcpHealthMetricsSnapshot {
+        mode: health.mode,
+        check_successes: health.check_successes,
+        check_failures: health.check_failures,
+        consecutive_failures: health.consecutive_failures,
     }
 }
 

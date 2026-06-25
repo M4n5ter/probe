@@ -1,6 +1,7 @@
 use probe_core::RuntimeMode;
 use runtime::{CaptureEvidenceMode, CapturePlanMode};
 
+use crate::l7_mitm::L7MitmBackendHealthMode;
 use crate::transparent_interception::{
     TransparentProxyHealthProbeMode, TransparentProxyRuntimeMode,
 };
@@ -31,6 +32,7 @@ pub(in crate::status) fn health_snapshot(
             .chain(std::iter::once(enforcement_health_contribution(
                 enforcement,
             )))
+            .chain(std::iter::once(l7_mitm_health_contribution(enforcement)))
             .chain(std::iter::once(transparent_proxy_health_contribution(
                 enforcement,
             )))
@@ -142,6 +144,28 @@ fn enforcement_policy_reason(enforcement: &EnforcementStatusSnapshot, fallback: 
         || format!("enforcement policy: {fallback}"),
         |reason| format!("enforcement policy: {reason}"),
     )
+}
+
+fn l7_mitm_health_contribution(enforcement: &EnforcementStatusSnapshot) -> HealthContribution {
+    let Some(runtime) = &enforcement.interception.runtime_l7_mitm else {
+        return HealthContribution::available();
+    };
+    let health = &runtime.backend_health;
+    match health.mode {
+        L7MitmBackendHealthMode::Unhealthy => {
+            let reason = health
+                .last_failure_reason
+                .as_deref()
+                .unwrap_or("probe failed");
+            HealthContribution::degraded(format!(
+                "L7 MITM backend health probe unhealthy after {} consecutive failure(s): {reason}",
+                health.consecutive_failures
+            ))
+        }
+        L7MitmBackendHealthMode::Disabled
+        | L7MitmBackendHealthMode::Pending
+        | L7MitmBackendHealthMode::Healthy => HealthContribution::available(),
+    }
 }
 
 fn transparent_proxy_health_contribution(

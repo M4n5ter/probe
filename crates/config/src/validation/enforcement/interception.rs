@@ -196,11 +196,17 @@ fn validate_mitm_material_ref_list(
 #[cfg(test)]
 mod tests {
     use crate::{
-        EnforcementInterceptionConfig, MAX_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD,
+        EnforcementInterceptionConfig, MAX_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD,
+        MAX_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS,
+        MAX_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD,
         MAX_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS,
-        MIN_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS, TransparentInterceptionProxyConfig,
-        TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionProxyModeConfig,
-        TransparentInterceptionProxySelfBypassConfig, TransparentInterceptionStrategyConfig,
+        MIN_TRANSPARENT_MITM_BACKEND_READINESS_INTERVAL_MS,
+        MIN_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS, TlsMaterialConfig, TlsMaterialKind,
+        TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmBackendReadinessProbeConfig, TransparentInterceptionMitmConfig,
+        TransparentInterceptionProxyConfig, TransparentInterceptionProxyHealthProbeConfig,
+        TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
+        TransparentInterceptionStrategyConfig,
     };
 
     use super::*;
@@ -446,10 +452,117 @@ mod tests {
             == "enforcement.interception.proxy.health_probe.failure_threshold"));
     }
 
+    #[test]
+    fn health_probe_timeout_must_not_exceed_interval() {
+        let mut violations = Vec::new();
+        validate_interception(
+            &EnforcementInterceptionConfig {
+                strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
+                proxy: TransparentInterceptionProxyConfig {
+                    listen_port: Some(15001),
+                    health_probe: TransparentInterceptionProxyHealthProbeConfig {
+                        target: Some("127.0.0.1:18080".to_string()),
+                        interval_ms: 500,
+                        timeout_ms: 600,
+                        failure_threshold: 1,
+                    },
+                    ..TransparentInterceptionProxyConfig::default()
+                },
+                ..EnforcementInterceptionConfig::default()
+            },
+            &mut violations,
+        );
+
+        assert!(violations.iter().any(|violation| violation.field
+            == "enforcement.interception.proxy.health_probe.timeout_ms"
+            && violation.reason.contains("must not exceed interval")));
+    }
+
+    #[test]
+    fn mitm_backend_readiness_probe_timing_uses_bounded_runtime_values() {
+        let mut violations = Vec::new();
+        let interception = EnforcementInterceptionConfig {
+            strategy: TransparentInterceptionStrategyConfig::InboundTproxyMitm,
+            proxy: TransparentInterceptionProxyConfig {
+                listen_port: Some(15002),
+                ..TransparentInterceptionProxyConfig::default()
+            },
+            mitm: TransparentInterceptionMitmConfig {
+                backend: TransparentInterceptionMitmBackendConfig::External,
+                backend_readiness_probe: TransparentInterceptionMitmBackendReadinessProbeConfig {
+                    target: Some("127.0.0.1:15002".to_string()),
+                    interval_ms: MIN_TRANSPARENT_MITM_BACKEND_READINESS_INTERVAL_MS - 1,
+                    timeout_ms: MAX_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS + 1,
+                    failure_threshold: MAX_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD + 1,
+                },
+                ca_certificate_ref: Some("mitm-ca".to_string()),
+                ca_private_key_ref: Some("mitm-ca-key".to_string()),
+                ..TransparentInterceptionMitmConfig::default()
+            },
+            ..EnforcementInterceptionConfig::default()
+        };
+        validate(&interception, &tls_config_with_mitm_ca(), &mut violations);
+
+        assert!(violations.iter().any(|violation| violation.field
+            == "enforcement.interception.mitm.backend_readiness_probe.interval_ms"));
+        assert!(violations.iter().any(|violation| violation.field
+            == "enforcement.interception.mitm.backend_readiness_probe.timeout_ms"));
+        assert!(violations.iter().any(|violation| violation.field
+            == "enforcement.interception.mitm.backend_readiness_probe.failure_threshold"));
+    }
+
+    #[test]
+    fn mitm_backend_readiness_probe_timeout_must_not_exceed_interval() {
+        let mut violations = Vec::new();
+        let interception = EnforcementInterceptionConfig {
+            strategy: TransparentInterceptionStrategyConfig::InboundTproxyMitm,
+            proxy: TransparentInterceptionProxyConfig {
+                listen_port: Some(15002),
+                ..TransparentInterceptionProxyConfig::default()
+            },
+            mitm: TransparentInterceptionMitmConfig {
+                backend: TransparentInterceptionMitmBackendConfig::External,
+                backend_readiness_probe: TransparentInterceptionMitmBackendReadinessProbeConfig {
+                    target: Some("127.0.0.1:15002".to_string()),
+                    interval_ms: 500,
+                    timeout_ms: 600,
+                    failure_threshold: 1,
+                },
+                ca_certificate_ref: Some("mitm-ca".to_string()),
+                ca_private_key_ref: Some("mitm-ca-key".to_string()),
+                ..TransparentInterceptionMitmConfig::default()
+            },
+            ..EnforcementInterceptionConfig::default()
+        };
+        validate(&interception, &tls_config_with_mitm_ca(), &mut violations);
+
+        assert!(violations.iter().any(|violation| violation.field
+            == "enforcement.interception.mitm.backend_readiness_probe.timeout_ms"
+            && violation.reason.contains("must not exceed interval")));
+    }
+
     fn validate_interception(
         interception: &EnforcementInterceptionConfig,
         violations: &mut Vec<ConfigViolation>,
     ) {
         validate(interception, &TlsConfig::default(), violations);
+    }
+
+    fn tls_config_with_mitm_ca() -> TlsConfig {
+        TlsConfig {
+            materials: vec![
+                TlsMaterialConfig {
+                    id: Some("mitm-ca".to_string()),
+                    kind: TlsMaterialKind::MitmCaCertificate,
+                    path: "/etc/sssa/mitm-ca.pem".into(),
+                },
+                TlsMaterialConfig {
+                    id: Some("mitm-ca-key".to_string()),
+                    kind: TlsMaterialKind::MitmCaPrivateKey,
+                    path: "/etc/sssa/mitm-ca.key".into(),
+                },
+            ],
+            ..TlsConfig::default()
+        }
     }
 }

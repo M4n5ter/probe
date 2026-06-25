@@ -59,6 +59,8 @@ pub(crate) enum AgentError {
     CaptureEventFeed(#[from] CaptureEventFeedLoadError),
     #[error("TLS decrypt hint error: {0}")]
     TlsDecryptHints(#[from] TlsDecryptHintError),
+    #[error("L7 MITM runtime error: {0}")]
+    L7MitmRuntime(String),
     #[error("admin error: {0}")]
     Admin(#[from] crate::admin::AdminError),
     #[error("{0}")]

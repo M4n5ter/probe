@@ -2,8 +2,10 @@ use std::fmt::Write as _;
 
 use probe_core::RuntimeMode;
 
+use super::metrics::TcpHealthMetricsSnapshot;
 use crate::{
-    status::AgentStatusSnapshot, transparent_interception::TransparentProxyHealthProbeMode,
+    l7_mitm::L7MitmBackendHealthMode, status::AgentStatusSnapshot, tcp_health::TcpHealthMode,
+    transparent_interception::TransparentProxyHealthProbeMode,
 };
 
 pub(crate) const PROMETHEUS_TEXT_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -19,6 +21,13 @@ const TRANSPARENT_PROXY_HEALTH_PROBE_MODES: [TransparentProxyHealthProbeMode; 4]
     TransparentProxyHealthProbeMode::Pending,
     TransparentProxyHealthProbeMode::Healthy,
     TransparentProxyHealthProbeMode::Unhealthy,
+];
+
+const L7_MITM_BACKEND_HEALTH_MODES: [L7MitmBackendHealthMode; 4] = [
+    L7MitmBackendHealthMode::Disabled,
+    L7MitmBackendHealthMode::Pending,
+    L7MitmBackendHealthMode::Healthy,
+    L7MitmBackendHealthMode::Unhealthy,
 ];
 
 pub(crate) fn render_prometheus_metrics(snapshot: &AgentStatusSnapshot) -> String {
@@ -57,6 +66,7 @@ pub(crate) fn render_prometheus_metrics(snapshot: &AgentStatusSnapshot) -> Strin
     write_capabilities(&mut output, snapshot);
     write_spool(&mut output, snapshot);
     write_export(&mut output, snapshot);
+    write_l7_mitm(&mut output, snapshot);
     write_transparent_proxy(&mut output, snapshot);
     write_pipeline(&mut output, snapshot);
 
@@ -212,6 +222,35 @@ fn write_export(output: &mut String, snapshot: &AgentStatusSnapshot) {
     }
 }
 
+fn write_l7_mitm(output: &mut String, snapshot: &AgentStatusSnapshot) {
+    write_family(
+        output,
+        "sssa_l7_mitm_metrics_available",
+        "gauge",
+        "Whether L7 MITM runtime metrics are present in this snapshot.",
+    );
+    write_sample(
+        output,
+        "sssa_l7_mitm_metrics_available",
+        &[],
+        u64::from(snapshot.metrics.l7_mitm.is_some()),
+    );
+
+    let Some(metrics) = snapshot.metrics.l7_mitm else {
+        return;
+    };
+
+    write_tcp_health(
+        output,
+        "sssa_l7_mitm_backend_health_mode",
+        "External L7 MITM backend health probe mode as a one-hot gauge.",
+        "sssa_l7_mitm_backend_health_checks_total",
+        "External L7 MITM backend health probe checks by outcome.",
+        &L7_MITM_BACKEND_HEALTH_MODES,
+        metrics.backend_health,
+    );
+}
+
 fn write_transparent_proxy(output: &mut String, snapshot: &AgentStatusSnapshot) {
     write_family(
         output,
@@ -243,38 +282,14 @@ fn write_transparent_proxy(output: &mut String, snapshot: &AgentStatusSnapshot) 
         metrics.active_relays,
     );
 
-    write_family(
+    write_tcp_health(
         output,
         "sssa_transparent_proxy_health_probe_mode",
-        "gauge",
         "Configured transparent proxy active health probe mode as a one-hot gauge.",
-    );
-    for mode in TRANSPARENT_PROXY_HEALTH_PROBE_MODES {
-        write_sample(
-            output,
-            "sssa_transparent_proxy_health_probe_mode",
-            &[("mode", mode.wire_name())],
-            u64::from(metrics.health_probe.mode == mode),
-        );
-    }
-
-    write_family(
-        output,
         "sssa_transparent_proxy_health_probe_checks_total",
-        "counter",
         "Configured transparent proxy active health probe checks by outcome.",
-    );
-    write_sample(
-        output,
-        "sssa_transparent_proxy_health_probe_checks_total",
-        &[("outcome", "success")],
-        metrics.health_probe.check_successes,
-    );
-    write_sample(
-        output,
-        "sssa_transparent_proxy_health_probe_checks_total",
-        &[("outcome", "failure")],
-        metrics.health_probe.check_failures,
+        &TRANSPARENT_PROXY_HEALTH_PROBE_MODES,
+        metrics.health_probe,
     );
 
     write_family(
@@ -332,6 +347,40 @@ fn write_transparent_proxy(output: &mut String, snapshot: &AgentStatusSnapshot) 
         "sssa_transparent_proxy_failures_total",
         &[("kind", "listener")],
         metrics.listener_failures,
+    );
+}
+
+fn write_tcp_health(
+    output: &mut String,
+    mode_metric: &str,
+    mode_help: &str,
+    checks_metric: &str,
+    checks_help: &str,
+    modes: &[TcpHealthMode],
+    health: TcpHealthMetricsSnapshot,
+) {
+    write_family(output, mode_metric, "gauge", mode_help);
+    for mode in modes {
+        write_sample(
+            output,
+            mode_metric,
+            &[("mode", mode.wire_name())],
+            u64::from(health.mode == *mode),
+        );
+    }
+
+    write_family(output, checks_metric, "counter", checks_help);
+    write_sample(
+        output,
+        checks_metric,
+        &[("outcome", "success")],
+        health.check_successes,
+    );
+    write_sample(
+        output,
+        checks_metric,
+        &[("outcome", "failure")],
+        health.check_failures,
     );
 }
 
@@ -571,6 +620,9 @@ mod tests {
         spool::SpoolStatusInput,
     };
     use super::*;
+    use crate::l7_mitm::{
+        L7MitmBackendHealthMode, L7MitmBackendHealthSnapshot, L7MitmRuntimeSnapshot,
+    };
     use crate::transparent_interception::{
         TransparentProxyHealthProbeMode, TransparentProxyRuntimeMode,
         TransparentProxyRuntimeSnapshot,
@@ -660,6 +712,55 @@ mod tests {
         assert!(metrics.contains("sssa_transparent_proxy_relays_total{outcome=\"rejected\"} 5\n"));
         assert!(metrics.contains("sssa_transparent_proxy_failures_total{kind=\"relay\"} 7\n"));
         assert!(metrics.contains("sssa_transparent_proxy_failures_total{kind=\"listener\"} 11\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn render_prometheus_metrics_includes_l7_mitm_backend_health_counters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/sssa-spool")),
+            Vec::new(),
+        )?;
+        let snapshot = build_status_snapshot_with_runtime(
+            &plan,
+            SpoolStatusInput::available(
+                PathBuf::from("/tmp/sssa-spool"),
+                SpoolSnapshot {
+                    last_ingress_sequence: 0,
+                    last_export_sequence: 0,
+                },
+                BTreeMap::from([("primary".to_string(), 0)]),
+            ),
+            RuntimeStatusInput {
+                l7_mitm: Some(L7MitmRuntimeSnapshot {
+                    backend_health: L7MitmBackendHealthSnapshot {
+                        mode: L7MitmBackendHealthMode::Unhealthy,
+                        check_successes: 5,
+                        check_failures: 7,
+                        consecutive_failures: 3,
+                        last_failure_reason: Some("connection refused".to_string()),
+                    },
+                }),
+                ..RuntimeStatusInput::default()
+            },
+        );
+
+        let metrics = render_prometheus_metrics(&snapshot);
+
+        assert_eq!(snapshot.health.mode, RuntimeMode::Degraded);
+        assert!(snapshot.health.reasons.iter().any(|reason| {
+            reason.contains("L7 MITM backend health probe unhealthy")
+                && reason.contains("connection refused")
+        }));
+        assert!(metrics.contains("sssa_l7_mitm_metrics_available 1\n"));
+        assert!(metrics.contains("sssa_l7_mitm_backend_health_mode{mode=\"unhealthy\"} 1\n"));
+        assert!(
+            metrics.contains("sssa_l7_mitm_backend_health_checks_total{outcome=\"success\"} 5\n")
+        );
+        assert!(
+            metrics.contains("sssa_l7_mitm_backend_health_checks_total{outcome=\"failure\"} 7\n")
+        );
         Ok(())
     }
 

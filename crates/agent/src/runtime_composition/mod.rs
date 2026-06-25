@@ -14,6 +14,7 @@ use crate::{
 pub(crate) struct RuntimeComposition {
     plan: RuntimePlan,
     connection_enforcement: ConnectionEnforcementRuntime,
+    l7_mitm: L7MitmRuntime,
     transparent_interception: TransparentInterceptionRuntime,
 }
 
@@ -33,11 +34,13 @@ impl RuntimeComposition {
     ) -> (
         RuntimePlan,
         Option<Box<dyn EnforcementBackend>>,
+        L7MitmRuntime,
         TransparentInterceptionRuntime,
     ) {
         (
             self.plan,
             self.connection_enforcement.into_backend(),
+            self.l7_mitm,
             self.transparent_interception,
         )
     }
@@ -57,6 +60,7 @@ pub(crate) fn build_runtime_composition(
     build_runtime_composition_from_registry(
         config,
         connection_enforcement,
+        l7_mitm,
         transparent_interception,
         registry,
     )
@@ -65,6 +69,7 @@ pub(crate) fn build_runtime_composition(
 fn build_runtime_composition_from_registry(
     config: AgentConfig,
     connection_enforcement: ConnectionEnforcementRuntime,
+    l7_mitm: L7MitmRuntime,
     transparent_interception: TransparentInterceptionRuntime,
     registry: ProviderRegistry,
 ) -> Result<RuntimeComposition, AgentError> {
@@ -72,6 +77,7 @@ fn build_runtime_composition_from_registry(
     Ok(RuntimeComposition {
         plan,
         connection_enforcement,
+        l7_mitm,
         transparent_interception,
     })
 }
@@ -82,12 +88,13 @@ pub(crate) fn build_runtime_composition_for_test(
     capture_providers: Vec<runtime::CaptureProviderDescriptor>,
     platform: runtime::PlatformProbeResults,
 ) -> Result<RuntimeComposition, AgentError> {
-    let (connection_enforcement, _l7_mitm, transparent_interception) =
+    let (connection_enforcement, l7_mitm, transparent_interception) =
         execution_runtimes_for_config(&config);
     let registry = ProviderRegistry::with_platform_probes(capture_providers, platform);
     build_runtime_composition_from_registry(
         config,
         connection_enforcement,
+        l7_mitm,
         transparent_interception,
         registry,
     )

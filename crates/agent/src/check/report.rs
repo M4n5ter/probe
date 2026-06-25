@@ -729,12 +729,36 @@ protective_actions = ["alert"]
             json!("127.0.0.1:15002")
         );
         assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["interval_ms"],
+            json!(1_000)
+        );
+        assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["timeout_ms"],
+            json!(200)
+        );
+        assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["failure_threshold"],
+            json!(3)
+        );
+        assert_eq!(
             value["enforcement"]["interception"]["mitm"]["backend"],
             json!("external")
         );
         assert_eq!(
             value["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["mode"],
             json!("tcp_connect")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["interval_ms"],
+            json!(1_000)
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["timeout_ms"],
+            json!(200)
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["failure_threshold"],
+            json!(3)
         );
         assert_eq!(
             value["plan"]["enforcement"]["interception"]["mitm"]["ca_certificate"]["id"],

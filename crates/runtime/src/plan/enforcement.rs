@@ -361,7 +361,12 @@ impl TransparentInterceptionMitmPlan {
 #[serde(rename_all = "snake_case", tag = "mode")]
 pub enum TransparentInterceptionMitmBackendReadinessProbePlan {
     Disabled,
-    TcpConnect { target: SocketAddr, timeout_ms: u64 },
+    TcpConnect {
+        target: SocketAddr,
+        interval_ms: u64,
+        timeout_ms: u64,
+        failure_threshold: u32,
+    },
 }
 
 impl TransparentInterceptionMitmBackendReadinessProbePlan {
@@ -372,8 +377,15 @@ impl TransparentInterceptionMitmBackendReadinessProbePlan {
                 match readiness_probe {
                     TransparentInterceptionMitmBackendReadinessProbeIntent::TcpConnect {
                         target,
+                        interval_ms,
                         timeout_ms,
-                    } => Self::TcpConnect { target, timeout_ms },
+                        failure_threshold,
+                    } => Self::TcpConnect {
+                        target,
+                        interval_ms,
+                        timeout_ms,
+                        failure_threshold,
+                    },
                 }
             }
         }
@@ -1072,7 +1084,9 @@ mod tests {
             plan.interception.mitm.backend_readiness_probe,
             TransparentInterceptionMitmBackendReadinessProbePlan::TcpConnect {
                 target: "127.0.0.1:15002".parse()?,
+                interval_ms: 1_000,
                 timeout_ms: 200,
+                failure_threshold: 3,
             }
         );
         assert_eq!(
