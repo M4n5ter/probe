@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_external_mitm_plaintext_bridge_reports_l7_mitm_unavailable()
+    fn missing_external_mitm_plaintext_bridge_openability_is_deferred_to_capture_preflight()
     -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let mut config = AgentConfig::default();
@@ -285,11 +285,12 @@ mod tests {
             .reported_state(CapabilityKind::L7Mitm)
             .expect("L7 MITM capability should be reported");
 
-        assert_eq!(l7_mitm.mode, RuntimeMode::Unavailable);
+        assert_eq!(l7_mitm.mode, RuntimeMode::Available);
         assert!(
-            l7_mitm.reason.as_deref().is_some_and(
-                |reason| reason.contains("plaintext bridge capture-event feed is not openable")
-            ),
+            l7_mitm
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("external selector-scoped")),
             "{l7_mitm:?}"
         );
         Ok(())

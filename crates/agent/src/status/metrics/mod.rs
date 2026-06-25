@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::{
     export::ExportWorkerRuntimeSnapshot,
-    l7_mitm::L7MitmRuntimeSnapshot,
+    l7_mitm::{L7MitmPlaintextBridgeMode, L7MitmRuntimeSnapshot},
     tcp_health::{TcpHealthMode, TcpHealthSnapshot},
     transparent_interception::TransparentProxyRuntimeSnapshot,
 };
@@ -47,6 +47,12 @@ pub struct ExportMetricsSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct L7MitmMetricsSnapshot {
     pub backend_health: TcpHealthMetricsSnapshot,
+    pub plaintext_bridge: L7MitmPlaintextBridgeMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct L7MitmPlaintextBridgeMetricsSnapshot {
+    pub mode: L7MitmPlaintextBridgeMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -103,6 +109,9 @@ pub(in crate::status) fn metrics_snapshot(
 fn l7_mitm_metrics(runtime: L7MitmRuntimeSnapshot) -> L7MitmMetricsSnapshot {
     L7MitmMetricsSnapshot {
         backend_health: tcp_health_metrics(runtime.backend_health),
+        plaintext_bridge: L7MitmPlaintextBridgeMetricsSnapshot {
+            mode: runtime.plaintext_bridge.mode,
+        },
     }
 }
 

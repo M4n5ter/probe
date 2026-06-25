@@ -1,7 +1,7 @@
 use probe_core::RuntimeMode;
 use runtime::{CaptureEvidenceMode, CapturePlanMode};
 
-use crate::l7_mitm::L7MitmBackendHealthMode;
+use crate::l7_mitm::{L7MitmBackendHealthMode, L7MitmPlaintextBridgeMode};
 use crate::transparent_interception::{
     TransparentProxyHealthProbeMode, TransparentProxyRuntimeMode,
 };
@@ -150,21 +150,30 @@ fn l7_mitm_health_contribution(enforcement: &EnforcementStatusSnapshot) -> Healt
     let Some(runtime) = &enforcement.interception.runtime_l7_mitm else {
         return HealthContribution::available();
     };
+    let mut reasons = Vec::new();
     let health = &runtime.backend_health;
-    match health.mode {
-        L7MitmBackendHealthMode::Unhealthy => {
-            let reason = health
-                .last_failure_reason
-                .as_deref()
-                .unwrap_or("probe failed");
-            HealthContribution::degraded(format!(
-                "L7 MITM backend health probe unhealthy after {} consecutive failure(s): {reason}",
-                health.consecutive_failures
-            ))
-        }
-        L7MitmBackendHealthMode::Disabled
-        | L7MitmBackendHealthMode::Pending
-        | L7MitmBackendHealthMode::Healthy => HealthContribution::available(),
+    if health.mode == L7MitmBackendHealthMode::Unhealthy {
+        let reason = health
+            .last_failure_reason
+            .as_deref()
+            .unwrap_or("probe failed");
+        reasons.push(format!(
+            "L7 MITM backend health probe unhealthy after {} consecutive failure(s): {reason}",
+            health.consecutive_failures
+        ));
+    }
+    if runtime.plaintext_bridge.mode == L7MitmPlaintextBridgeMode::DisabledAfterError {
+        let reason = runtime
+            .plaintext_bridge
+            .disable_reason
+            .as_deref()
+            .unwrap_or("bridge provider disabled");
+        reasons.push(format!("L7 MITM plaintext bridge degraded: {reason}"));
+    }
+    if reasons.is_empty() {
+        HealthContribution::available()
+    } else {
+        HealthContribution::degraded(reasons.join("; "))
     }
 }
 

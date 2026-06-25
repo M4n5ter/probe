@@ -4,7 +4,9 @@ use probe_core::RuntimeMode;
 
 use super::metrics::TcpHealthMetricsSnapshot;
 use crate::{
-    l7_mitm::L7MitmBackendHealthMode, status::AgentStatusSnapshot, tcp_health::TcpHealthMode,
+    l7_mitm::{L7MitmBackendHealthMode, L7MitmPlaintextBridgeMode},
+    status::AgentStatusSnapshot,
+    tcp_health::TcpHealthMode,
     transparent_interception::TransparentProxyHealthProbeMode,
 };
 
@@ -28,6 +30,14 @@ const L7_MITM_BACKEND_HEALTH_MODES: [L7MitmBackendHealthMode; 4] = [
     L7MitmBackendHealthMode::Pending,
     L7MitmBackendHealthMode::Healthy,
     L7MitmBackendHealthMode::Unhealthy,
+];
+
+const L7_MITM_PLAINTEXT_BRIDGE_MODES: [L7MitmPlaintextBridgeMode; 5] = [
+    L7MitmPlaintextBridgeMode::NotConfigured,
+    L7MitmPlaintextBridgeMode::Configured,
+    L7MitmPlaintextBridgeMode::Ready,
+    L7MitmPlaintextBridgeMode::Active,
+    L7MitmPlaintextBridgeMode::DisabledAfterError,
 ];
 
 pub(crate) fn render_prometheus_metrics(snapshot: &AgentStatusSnapshot) -> String {
@@ -249,6 +259,21 @@ fn write_l7_mitm(output: &mut String, snapshot: &AgentStatusSnapshot) {
         &L7_MITM_BACKEND_HEALTH_MODES,
         metrics.backend_health,
     );
+
+    write_family(
+        output,
+        "sssa_l7_mitm_plaintext_bridge_mode",
+        "gauge",
+        "External L7 MITM plaintext bridge runtime mode as a one-hot gauge.",
+    );
+    for mode in L7_MITM_PLAINTEXT_BRIDGE_MODES {
+        write_sample(
+            output,
+            "sssa_l7_mitm_plaintext_bridge_mode",
+            &[("mode", mode.wire_name())],
+            u64::from(metrics.plaintext_bridge.mode == mode),
+        );
+    }
 }
 
 fn write_transparent_proxy(output: &mut String, snapshot: &AgentStatusSnapshot) {
@@ -621,7 +646,8 @@ mod tests {
     };
     use super::*;
     use crate::l7_mitm::{
-        L7MitmBackendHealthMode, L7MitmBackendHealthSnapshot, L7MitmRuntimeSnapshot,
+        L7MitmBackendHealthMode, L7MitmBackendHealthSnapshot, L7MitmPlaintextBridgeMode,
+        L7MitmPlaintextBridgeSnapshot, L7MitmRuntimeSnapshot,
     };
     use crate::transparent_interception::{
         TransparentProxyHealthProbeMode, TransparentProxyRuntimeMode,
@@ -741,6 +767,10 @@ mod tests {
                         consecutive_failures: 3,
                         last_failure_reason: Some("connection refused".to_string()),
                     },
+                    plaintext_bridge: L7MitmPlaintextBridgeSnapshot {
+                        mode: L7MitmPlaintextBridgeMode::DisabledAfterError,
+                        disable_reason: Some("feed parse error".to_string()),
+                    },
                 }),
                 ..RuntimeStatusInput::default()
             },
@@ -752,9 +782,15 @@ mod tests {
         assert!(snapshot.health.reasons.iter().any(|reason| {
             reason.contains("L7 MITM backend health probe unhealthy")
                 && reason.contains("connection refused")
+                && reason.contains("L7 MITM plaintext bridge degraded")
+                && reason.contains("feed parse error")
         }));
         assert!(metrics.contains("sssa_l7_mitm_metrics_available 1\n"));
         assert!(metrics.contains("sssa_l7_mitm_backend_health_mode{mode=\"unhealthy\"} 1\n"));
+        assert!(
+            metrics
+                .contains("sssa_l7_mitm_plaintext_bridge_mode{mode=\"disabled_after_error\"} 1\n")
+        );
         assert!(
             metrics.contains("sssa_l7_mitm_backend_health_checks_total{outcome=\"success\"} 5\n")
         );

@@ -1,3 +1,5 @@
 mod feed;
 
-pub(crate) use feed::{CaptureEventFeedLoadError, load_capture_event_feed_provider};
+pub(crate) use feed::{
+    CaptureEventFeedLoadError, JsonLinesCaptureEventFeedProvider, load_capture_event_feed_provider,
+};

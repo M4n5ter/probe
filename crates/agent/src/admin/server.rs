@@ -463,6 +463,10 @@ mod tests {
             json!("disabled")
         );
         assert_eq!(
+            response["metrics"]["l7_mitm"]["plaintext_bridge"]["mode"],
+            json!("not_configured")
+        );
+        assert_eq!(
             response["metrics"]["transparent_proxy"]["active_relays"],
             json!(0)
         );
@@ -482,6 +486,11 @@ mod tests {
                 ["mode"],
             json!("disabled")
         );
+        assert_eq!(
+            response["snapshot"]["enforcement"]["interception"]["runtime_l7_mitm"]["plaintext_bridge"]
+                ["mode"],
+            json!("not_configured")
+        );
 
         let response =
             send_admin_request(&socket_path, json!({ "command": "prometheus_metrics" })).await?;
@@ -498,6 +507,9 @@ mod tests {
         assert!(metrics.contains("sssa_l7_mitm_metrics_available 1\n"));
         assert!(metrics.contains("sssa_transparent_proxy_metrics_available 1\n"));
         assert!(metrics.contains("sssa_l7_mitm_backend_health_mode{mode=\"disabled\"} 1\n"));
+        assert!(
+            metrics.contains("sssa_l7_mitm_plaintext_bridge_mode{mode=\"not_configured\"} 1\n")
+        );
         assert!(
             metrics.contains(
                 "sssa_transparent_proxy_upstream_connects_total{outcome=\"success\"} 0\n"

@@ -11,12 +11,9 @@ use probe_config::{
     TransparentInterceptionMitmPlaintextBridgeIntent,
 };
 use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::{
-    capture_event_feed::load_capture_event_feed_provider,
-    tcp_health::{TcpHealthProbeObserver, TcpHealthProbePlan, start_tcp_health_probe},
-};
+use crate::tcp_health::{TcpHealthProbeObserver, TcpHealthProbePlan, start_tcp_health_probe};
 
 pub(crate) use crate::tcp_health::{
     TcpHealthMode as L7MitmBackendHealthMode, TcpHealthProbeGuard as L7MitmBackendHealthProbeGuard,
@@ -52,6 +49,66 @@ impl L7MitmRuntime {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct L7MitmRuntimeSnapshot {
     pub backend_health: L7MitmBackendHealthSnapshot,
+    pub plaintext_bridge: L7MitmPlaintextBridgeSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct L7MitmPlaintextBridgeSnapshot {
+    pub mode: L7MitmPlaintextBridgeMode,
+    pub disable_reason: Option<String>,
+}
+
+impl L7MitmPlaintextBridgeSnapshot {
+    fn not_configured() -> Self {
+        Self {
+            mode: L7MitmPlaintextBridgeMode::NotConfigured,
+            disable_reason: None,
+        }
+    }
+
+    fn configured() -> Self {
+        Self {
+            mode: L7MitmPlaintextBridgeMode::Configured,
+            disable_reason: None,
+        }
+    }
+
+    fn record_ready(&mut self) {
+        self.mode = L7MitmPlaintextBridgeMode::Ready;
+        self.disable_reason = None;
+    }
+
+    fn record_active(&mut self) {
+        self.mode = L7MitmPlaintextBridgeMode::Active;
+        self.disable_reason = None;
+    }
+
+    fn record_disabled_after_error(&mut self, reason: impl Into<String>) {
+        self.mode = L7MitmPlaintextBridgeMode::DisabledAfterError;
+        self.disable_reason = Some(reason.into());
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum L7MitmPlaintextBridgeMode {
+    NotConfigured,
+    Configured,
+    Ready,
+    Active,
+    DisabledAfterError,
+}
+
+impl L7MitmPlaintextBridgeMode {
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::Configured => "configured",
+            Self::Ready => "ready",
+            Self::Active => "active",
+            Self::DisabledAfterError => "disabled_after_error",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -78,17 +135,22 @@ fn resolve_with_probe(
     if !interception.strategy.is_mitm() {
         return unavailable(
             "L7 MITM backend is not configured; select a MITM interception strategy to require it",
+            L7MitmPlaintextBridgeSnapshot::not_configured(),
         );
     }
+    let plaintext_bridge = match resolve_plaintext_bridge(config) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return unavailable(error, L7MitmPlaintextBridgeSnapshot::not_configured()),
+    };
     if let Err(error) = config.validate_l7_mitm_contract() {
-        return unavailable(format!("L7 MITM backend contract is invalid: {error}"));
-    }
-    if let Err(error) = probe_plaintext_bridge(config) {
-        return unavailable(error);
-    }
+        return unavailable(
+            format!("L7 MITM backend contract is invalid: {error}"),
+            plaintext_bridge,
+        );
+    };
     let backend_health_probe = match probe_external_backend(config, tcp_probe) {
         Ok(plan) => plan,
-        Err(error) => return unavailable(error),
+        Err(error) => return unavailable(error, plaintext_bridge),
     };
 
     L7MitmRuntime {
@@ -102,6 +164,7 @@ fn resolve_with_probe(
         },
         handle: L7MitmRuntimeHandle::new(
             L7MitmBackendHealthSnapshot::initial_success(),
+            plaintext_bridge,
             backend_health_probe.failure_threshold,
         ),
         backend_health_probe: Some(backend_health_probe.into_plan()),
@@ -149,7 +212,7 @@ fn probe_external_backend(
     })
 }
 
-fn probe_plaintext_bridge(config: &AgentConfig) -> Result<(), String> {
+fn resolve_plaintext_bridge(config: &AgentConfig) -> Result<L7MitmPlaintextBridgeSnapshot, String> {
     let bridge = config
         .enforcement
         .interception
@@ -162,24 +225,27 @@ fn probe_plaintext_bridge(config: &AgentConfig) -> Result<(), String> {
                 .join("; ")
         })?;
     match bridge {
-        TransparentInterceptionMitmPlaintextBridgeIntent::Disabled => Ok(()),
-        TransparentInterceptionMitmPlaintextBridgeIntent::CaptureEventFeed { path, follow } => {
-            let _ = load_capture_event_feed_provider(&path, follow).map_err(|error| {
-                format!(
-                    "external L7 MITM plaintext bridge capture-event feed is not openable at {}: {error}",
-                    path.display()
-                )
-            })?;
-            Ok(())
+        TransparentInterceptionMitmPlaintextBridgeIntent::Disabled => {
+            Ok(L7MitmPlaintextBridgeSnapshot::not_configured())
+        }
+        TransparentInterceptionMitmPlaintextBridgeIntent::CaptureEventFeed { .. } => {
+            Ok(L7MitmPlaintextBridgeSnapshot::configured())
         }
     }
 }
 
-fn unavailable(reason: impl Into<String>) -> L7MitmRuntime {
+fn unavailable(
+    reason: impl Into<String>,
+    plaintext_bridge: L7MitmPlaintextBridgeSnapshot,
+) -> L7MitmRuntime {
     L7MitmRuntime {
         capability: CapabilityState::unavailable(CapabilityKind::L7Mitm, reason),
         backend_health_probe: None,
-        handle: L7MitmRuntimeHandle::new(L7MitmBackendHealthSnapshot::disabled(), 1),
+        handle: L7MitmRuntimeHandle::new(
+            L7MitmBackendHealthSnapshot::disabled(),
+            plaintext_bridge,
+            1,
+        ),
     }
 }
 
@@ -200,14 +266,31 @@ impl ResolvedL7MitmBackendHealthProbe {
 impl L7MitmRuntimeHandle {
     fn new(
         backend_health: L7MitmBackendHealthSnapshot,
+        plaintext_bridge: L7MitmPlaintextBridgeSnapshot,
         backend_health_failure_threshold: u32,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(L7MitmRuntimeState {
-                snapshot: L7MitmRuntimeSnapshot { backend_health },
+                snapshot: L7MitmRuntimeSnapshot {
+                    backend_health,
+                    plaintext_bridge,
+                },
                 backend_health_failure_threshold,
             })),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        backend_health: L7MitmBackendHealthSnapshot,
+        plaintext_bridge: L7MitmPlaintextBridgeSnapshot,
+        backend_health_failure_threshold: u32,
+    ) -> Self {
+        Self::new(
+            backend_health,
+            plaintext_bridge,
+            backend_health_failure_threshold,
+        )
     }
 
     pub(crate) fn snapshot(&self) -> L7MitmRuntimeSnapshot {
@@ -226,6 +309,24 @@ impl L7MitmRuntimeHandle {
             .snapshot
             .backend_health
             .record_failure(failure_threshold, reason);
+    }
+
+    pub(crate) fn record_plaintext_bridge_disabled(&self, reason: impl Into<String>) {
+        let mut state = self.lock();
+        state
+            .snapshot
+            .plaintext_bridge
+            .record_disabled_after_error(reason);
+    }
+
+    pub(crate) fn record_plaintext_bridge_ready(&self) {
+        let mut state = self.lock();
+        state.snapshot.plaintext_bridge.record_ready();
+    }
+
+    pub(crate) fn record_plaintext_bridge_active(&self) {
+        let mut state = self.lock();
+        state.snapshot.plaintext_bridge.record_active();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, L7MitmRuntimeState> {
@@ -279,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_plaintext_bridge_reports_l7_mitm_unavailable()
+    fn configured_plaintext_bridge_waits_for_capture_preflight()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut config = external_mitm_config("127.0.0.1:15002");
         config.enforcement.interception.mitm.plaintext_bridge.mode =
@@ -289,13 +390,30 @@ mod tests {
         let runtime = resolve_with_probe(&config, |_target, _timeout| Ok(()));
 
         let capability = runtime.capability();
+        assert_eq!(capability.mode, RuntimeMode::Available);
+        let bridge = runtime.handle().snapshot().plaintext_bridge;
+        assert_eq!(bridge.mode, L7MitmPlaintextBridgeMode::Configured);
+        assert_eq!(bridge.disable_reason, None);
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_backend_preserves_configured_plaintext_bridge_intent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = external_mitm_config("127.0.0.1:15002");
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path = Some(missing_bridge_path()?);
+
+        let runtime = resolve_with_probe(&config, |_target, _timeout| {
+            Err(io::Error::new(ErrorKind::ConnectionRefused, "closed"))
+        });
+
+        let capability = runtime.capability();
         assert_eq!(capability.mode, RuntimeMode::Unavailable);
-        assert!(
-            capability.reason.as_deref().is_some_and(
-                |reason| reason.contains("plaintext bridge capture-event feed is not openable")
-            ),
-            "{capability:?}"
-        );
+        let bridge = runtime.handle().snapshot().plaintext_bridge;
+        assert_eq!(bridge.mode, L7MitmPlaintextBridgeMode::Configured);
+        assert_eq!(bridge.disable_reason, None);
         Ok(())
     }
 
@@ -326,11 +444,18 @@ mod tests {
         assert_eq!(health.mode, L7MitmBackendHealthMode::Healthy);
         assert_eq!(health.check_successes, 1);
         assert_eq!(health.check_failures, 0);
+        let bridge = runtime.handle().snapshot().plaintext_bridge;
+        assert_eq!(bridge.mode, L7MitmPlaintextBridgeMode::NotConfigured);
+        assert_eq!(bridge.disable_reason, None);
     }
 
     #[test]
     fn backend_health_probe_marks_unhealthy_after_failure_threshold() {
-        let handle = L7MitmRuntimeHandle::new(L7MitmBackendHealthSnapshot::initial_success(), 2);
+        let handle = L7MitmRuntimeHandle::new(
+            L7MitmBackendHealthSnapshot::initial_success(),
+            L7MitmPlaintextBridgeSnapshot::not_configured(),
+            2,
+        );
 
         handle.record_backend_health_failure("connection refused");
         let health = handle.snapshot().backend_health;
@@ -351,7 +476,11 @@ mod tests {
 
     #[test]
     fn backend_health_probe_success_clears_unhealthy_state() {
-        let handle = L7MitmRuntimeHandle::new(L7MitmBackendHealthSnapshot::initial_success(), 1);
+        let handle = L7MitmRuntimeHandle::new(
+            L7MitmBackendHealthSnapshot::initial_success(),
+            L7MitmPlaintextBridgeSnapshot::not_configured(),
+            1,
+        );
 
         handle.record_backend_health_failure("connection refused");
         assert_eq!(
@@ -373,7 +502,11 @@ mod tests {
     fn backend_health_probe_thread_records_checks_and_stops()
     -> Result<(), Box<dyn std::error::Error>> {
         let target = closed_loopback_target()?;
-        let handle = L7MitmRuntimeHandle::new(L7MitmBackendHealthSnapshot::initial_success(), 1);
+        let handle = L7MitmRuntimeHandle::new(
+            L7MitmBackendHealthSnapshot::initial_success(),
+            L7MitmPlaintextBridgeSnapshot::not_configured(),
+            1,
+        );
         let runtime = L7MitmRuntime {
             capability: CapabilityState {
                 kind: CapabilityKind::L7Mitm,

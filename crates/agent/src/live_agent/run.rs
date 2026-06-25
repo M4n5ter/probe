@@ -25,7 +25,7 @@ use crate::{
         ExportDrainError, ExportWorker, ExportWorkerConfig,
         drain_planned_sinks_with_webhook_connection,
     },
-    l7_mitm::L7MitmBackendHealthProbeGuard,
+    l7_mitm::{L7MitmBackendHealthProbeGuard, L7MitmRuntimeHandle},
     runtime_composition::build_runtime_composition,
     shutdown,
     storage_retention::{
@@ -61,9 +61,10 @@ pub(crate) async fn run_live_agent(
     validate_static_runtime_config(&agent_config)?;
     let runtime = build_runtime_composition(agent_config)?;
     let (plan, enforcement_backend, l7_mitm, transparent_interception) = runtime.into_run_parts();
+    let l7_mitm_runtime = l7_mitm.handle();
     let tls_decrypt_hint_runtime = TlsDecryptHintRuntimeState::for_plan(&plan);
     let capture_provider_preflight =
-        CaptureProviderPreflight::build(&plan, Some(&tls_decrypt_hint_runtime))?;
+        CaptureProviderPreflight::build(&plan, Some(&tls_decrypt_hint_runtime), &l7_mitm_runtime)?;
     let enforcement = build_configured_enforcement_with_backend(&plan, enforcement_backend).await?;
     let policies = load_configured_pipeline_policies(&plan.config)?;
     let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
@@ -87,7 +88,7 @@ pub(crate) async fn run_live_agent(
         policy_set: policy_set.clone(),
         tls_decrypt_hints: Some(tls_decrypt_hint_runtime.clone()),
         tls_plaintext: Some(tls_plaintext_runtime.clone()),
-        l7_mitm: Some(l7_mitm.handle()),
+        l7_mitm: Some(l7_mitm_runtime.clone()),
         transparent_proxy: Some(transparent_proxy_runtime.clone()),
         ..AdminRuntimeState::default()
     };
@@ -124,6 +125,7 @@ pub(crate) async fn run_live_agent(
         capture_provider_preflight,
         capture_runtime,
         tls_plaintext_runtime,
+        l7_mitm_runtime,
         storage_retention_config,
         shutdown_requested: Arc::clone(&shutdown_requested),
         max_events,
@@ -189,6 +191,7 @@ struct BlockingCaptureRun {
     capture_provider_preflight: CaptureProviderPreflight,
     capture_runtime: CaptureProviderRuntimeState,
     tls_plaintext_runtime: TlsPlaintextRuntimeState,
+    l7_mitm_runtime: L7MitmRuntimeHandle,
     storage_retention_config: Option<StorageRetentionWorkerConfig>,
     shutdown_requested: shutdown::ShutdownFlag,
     max_events: Option<u64>,
@@ -215,6 +218,7 @@ impl BlockingCaptureRun {
             capture_provider_preflight,
             capture_runtime,
             tls_plaintext_runtime,
+            l7_mitm_runtime,
             mut storage_retention_config,
             shutdown_requested,
             max_events,
@@ -245,6 +249,7 @@ impl BlockingCaptureRun {
             let built_provider = build_capture_provider(
                 &plan,
                 Some(&tls_plaintext_runtime),
+                &l7_mitm_runtime,
                 capture_provider_preflight,
             )?;
             capture_runtime.record(built_provider.runtime);
