@@ -8,6 +8,7 @@ mod harness;
 mod libpcap_loopback;
 mod libpcap_websocket_loopback;
 mod loopback;
+mod mitm_plaintext_bridge;
 mod plaintext_assertions;
 mod plaintext_export_batches;
 mod plaintext_feed;

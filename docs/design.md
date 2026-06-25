@@ -368,8 +368,10 @@ TLS 明文与协议能力：
     TPROXY original-destination recovery，也不证明 downstream/upstream TLS handshake、SNI/ALPN routing 或 plaintext extraction 成功。
   - 边界：capture-event plaintext bridge 只接收 external proxy 输出的统一 capture events；仍需独立实现 client trust/install instructions、
     periodic external proxy health、L7 lifecycle、proxy-side policy hook 和 MITM audit event。
-  - 验收：尚无 L7 MITM backend E2E；验证覆盖配置解析、material ref 校验、readiness fail-closed、relay 伪装拒绝、
-    双 capability plan、status/check report 和 runtime validation。
+  - 验收：`xtask e2e-mitm-plaintext-bridge-live-sidecar` 在 fresh network namespace 中覆盖 libpcap live primary
+    与运行期追加的 MITM capture-event plaintext bridge sidecar 同时进入 parser/policy/spool/export pipeline。
+  - 验收：配置解析、material ref 校验、readiness fail-closed、relay 伪装拒绝、双 capability plan、status/check report
+    和 runtime validation 均有覆盖。
 
 - `http1` / `sse` / `websocket_handoff` / `websocket_frame`
   - Runtime status：Available。
@@ -1937,7 +1939,8 @@ MITM 不是证书导入的隐式副作用，也不是默认全机采集路径。
 - MITM backend 必须 capability-gated、selector-scoped，并与 libssl uprobe instrumentation、keylog/session decrypt hints 和 exporter
   trust material 保持独立。
 - Agent 可验证 external MITM contract、material refs 和 TCP listener readiness，并把 selector 命中流量导向 external listener；
-  它还没有管理 L7 proxy 进程，也没有把被代理后的明文接回 parser/policy pipeline。
+  它还没有管理 L7 proxy 进程或真实 TLS MITM 数据面。
+- 配置 capture-event plaintext bridge 时，external proxy 输出的 typed capture events 可进入 parser/policy pipeline。
 
 ## 12. 协议解析抽象
 
@@ -3977,7 +3980,7 @@ benchmark 参数：
 | Libpcap live capture | `e2e-libpcap-loopback`、`e2e-libpcap-websocket-loopback` | root/CAP_NET_RAW | loopback 明文 HTTP/WebSocket 进入统一 pipeline。 | 完整 TCP 栈恢复、强进程归因。 |
 | eBPF process observation | `e2e-ebpf-process-loopback` | root/bpffs | load/attach、procfs、allow map、bounded syscall sample。 | 强 payload、ringbuf saturation、flow loss reconstruction。 |
 | TLS plaintext | TLS plaintext/material cases | root/bpffs 或 CAP_NET_RAW | libssl plaintext、TLS 1.3 auto-binding、durable output。 | TLS 1.2、unbounded resync、L7 MITM proxy/data-plane。 |
-| Enforcement / interception | enforcement 与 transparent cases | user 或 root/net-admin | dry-run、manifest reload、TPROXY/transparent lifecycle、external MITM contract。 | 默认 destructive action、完整 L7 MITM E2E。 |
+| Enforcement / interception | enforcement、transparent、MITM bridge cases | user 或 root/net-admin | dry-run、manifest reload、TPROXY/transparent lifecycle、external MITM contract 配置/状态/readiness gate、MITM plaintext bridge live fan-in。 | 默认 destructive action、agent-managed L7 MITM proxy/data-plane。 |
 
 ### 端到端 fixture
 
@@ -5238,8 +5241,9 @@ metrics/status 与 Prometheus counters。
 ## 32. 被拒绝或推迟的方案
 
 显式 MITM backend 必须按 selector 生效、受 capability gate 约束，并与 eBPF、libpcap、plaintext provider 主线并行。external
-MITM backend contract 和 capture-event plaintext bridge 已进入配置、规划、能力报告和 live provider fan-in；agent-managed L7 proxy
-进程、proxy-side policy hook、trust/install lifecycle 和完整 MITM E2E 仍未完成。默认全机 MITM 和 proxy-first 主采集路径不进入目标设计。
+MITM backend contract 已进入配置、规划、能力报告和 readiness gate 覆盖；capture-event plaintext bridge 的 live provider
+fan-in 已有 E2E 验证。agent-managed L7 proxy 进程、proxy-side policy hook、trust/install lifecycle 和真实 TLS MITM
+数据面仍未完成。默认全机 MITM 和 proxy-first 主采集路径不进入目标设计。
 
 - 默认全机透明 MITM：拒绝。
   侵入性、安全边界、证书注入和故障半径过大。

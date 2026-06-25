@@ -9,6 +9,7 @@ use super::super::{
     gap_plaintext_feed::run as run_gap_plaintext_feed,
     libpcap_loopback::run as run_libpcap_loopback,
     libpcap_websocket_loopback::run as run_libpcap_websocket_loopback,
+    mitm_plaintext_bridge::run as run_mitm_plaintext_bridge_live_sidecar,
     plaintext_feed::run as run_plaintext_feed,
     remote_enforcement_policy::run as run_remote_enforcement_policy,
     sse_plaintext_feed::run as run_sse_plaintext_feed,
@@ -242,6 +243,11 @@ const E2E_CASES: &[E2eCase] = &[
         requirement: E2eRequirement::RootNetAdmin,
         run: run_transparent_outbound_owner_proxy_loopback,
     },
+    E2eCase {
+        name: "e2e-mitm-plaintext-bridge-live-sidecar",
+        requirement: E2eRequirement::RootNetAdmin,
+        run: run_mitm_plaintext_bridge_live_sidecar,
+    },
 ];
 
 const E2E_PROFILES: &[E2eProfile] = &[
@@ -303,6 +309,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-transparent-outbound-proxy-loopback",
             "e2e-transparent-outbound-external-proxy-loopback",
             "e2e-transparent-outbound-owner-proxy-loopback",
+            "e2e-mitm-plaintext-bridge-live-sidecar",
         ]),
     },
     E2eProfile {
@@ -343,6 +350,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-transparent-outbound-proxy-loopback",
             "e2e-transparent-outbound-external-proxy-loopback",
             "e2e-transparent-outbound-owner-proxy-loopback",
+            "e2e-mitm-plaintext-bridge-live-sidecar",
         ]),
     },
 ];
@@ -533,6 +541,7 @@ mod tests {
                 "e2e-transparent-outbound-proxy-loopback",
                 "e2e-transparent-outbound-external-proxy-loopback",
                 "e2e-transparent-outbound-owner-proxy-loopback",
+                "e2e-mitm-plaintext-bridge-live-sidecar",
             ]),
         },
         ExpectedProfile {
@@ -575,6 +584,7 @@ mod tests {
                 "e2e-transparent-outbound-proxy-loopback",
                 "e2e-transparent-outbound-external-proxy-loopback",
                 "e2e-transparent-outbound-owner-proxy-loopback",
+                "e2e-mitm-plaintext-bridge-live-sidecar",
             ]),
         },
     ];
