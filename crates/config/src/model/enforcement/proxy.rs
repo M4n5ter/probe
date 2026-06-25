@@ -1,11 +1,11 @@
 use std::{
     net::{IpAddr, SocketAddr},
     num::NonZeroU16,
-    path::PathBuf,
 };
 
-use probe_core::{EnforcementMode, ProtectiveActionProfile, Selector};
 use serde::{Deserialize, Serialize};
+
+use super::{EnforcementInterceptionConfig, normalized_ip_address};
 
 pub const DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS: u64 = 200;
@@ -16,45 +16,6 @@ pub const MIN_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS: u64 = 10;
 pub const MAX_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS: u64 = 5_000;
 pub const MIN_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD: u32 = 1;
 pub const MAX_TRANSPARENT_PROXY_HEALTH_PROBE_FAILURE_THRESHOLD: u32 = 100;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct EnforcementConfig {
-    pub mode: EnforcementMode,
-    pub backend: ConnectionEnforcementBackendConfig,
-    pub selector: Option<Selector>,
-    pub interception: EnforcementInterceptionConfig,
-    pub policy: EnforcementPolicyConfig,
-}
-
-impl Default for EnforcementConfig {
-    fn default() -> Self {
-        Self {
-            mode: EnforcementMode::AuditOnly,
-            backend: ConnectionEnforcementBackendConfig::None,
-            selector: None,
-            interception: EnforcementInterceptionConfig::default(),
-            policy: EnforcementPolicyConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConnectionEnforcementBackendConfig {
-    #[default]
-    None,
-    LinuxSocketDestroy,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct EnforcementInterceptionConfig {
-    pub strategy: TransparentInterceptionStrategyConfig,
-    pub selector: Option<Selector>,
-    pub proxy: TransparentInterceptionProxyConfig,
-    pub mitm: TransparentInterceptionMitmConfig,
-}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,44 +40,6 @@ pub enum TransparentInterceptionDirectionConfig {
 pub enum TransparentInterceptionL7ModeConfig {
     Passthrough,
     Mitm,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct TransparentInterceptionMitmConfig {
-    pub backend: TransparentInterceptionMitmBackendConfig,
-    pub ca_certificate_ref: Option<String>,
-    pub ca_private_key_ref: Option<String>,
-    pub leaf_certificate_chain_refs: Vec<String>,
-    pub leaf_private_key_ref: Option<String>,
-    pub upstream_trust_anchor_refs: Vec<String>,
-}
-
-impl TransparentInterceptionMitmConfig {
-    pub fn is_configured(&self) -> bool {
-        self.backend != TransparentInterceptionMitmBackendConfig::None
-            || self.ca_certificate_ref.is_some()
-            || self.ca_private_key_ref.is_some()
-            || !self.leaf_certificate_chain_refs.is_empty()
-            || self.leaf_private_key_ref.is_some()
-            || !self.upstream_trust_anchor_refs.is_empty()
-    }
-
-    pub fn has_ca_material_pair(&self) -> bool {
-        self.ca_certificate_ref.is_some() && self.ca_private_key_ref.is_some()
-    }
-
-    pub fn has_leaf_material_pair(&self) -> bool {
-        !self.leaf_certificate_chain_refs.is_empty() && self.leaf_private_key_ref.is_some()
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TransparentInterceptionMitmBackendConfig {
-    #[default]
-    None,
-    External,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,12 +276,12 @@ pub enum TransparentInterceptionProxyHealthProbeIntent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransparentInterceptionProxyIntentViolation {
+pub struct TransparentInterceptionIntentViolation {
     field: &'static str,
     reason: String,
 }
 
-impl TransparentInterceptionProxyIntentViolation {
+impl TransparentInterceptionIntentViolation {
     pub fn field(&self) -> &'static str {
         self.field
     }
@@ -367,6 +290,8 @@ impl TransparentInterceptionProxyIntentViolation {
         &self.reason
     }
 }
+
+pub type TransparentInterceptionProxyIntentViolation = TransparentInterceptionIntentViolation;
 
 impl TransparentInterceptionStrategyConfig {
     pub fn from_parts(
@@ -708,21 +633,11 @@ fn is_local_listener_address(address: IpAddr) -> bool {
     }
 }
 
-fn normalized_ip_address(address: IpAddr) -> IpAddr {
-    match address {
-        IpAddr::V4(_) => address,
-        IpAddr::V6(address) => address
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(address)),
-    }
-}
-
-fn intent_violation(
+pub(super) fn intent_violation(
     field: &'static str,
     reason: impl Into<String>,
 ) -> TransparentInterceptionProxyIntentViolation {
-    TransparentInterceptionProxyIntentViolation {
+    TransparentInterceptionIntentViolation {
         field,
         reason: reason.into(),
     }
@@ -768,37 +683,6 @@ impl TransparentInterceptionProxyHealthProbeConfig {
     pub fn is_enabled(&self) -> bool {
         self.target.is_some()
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct EnforcementPolicyConfig {
-    pub source: EnforcementPolicySourceConfig,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
-pub enum EnforcementPolicySourceConfig {
-    #[default]
-    None,
-    File {
-        path: PathBuf,
-    },
-    Directory {
-        path: PathBuf,
-    },
-    Remote {
-        endpoint: String,
-    },
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct EnforcementPolicyManifest {
-    pub id: String,
-    pub version: String,
-    pub selector: Option<Selector>,
-    pub protective_actions: ProtectiveActionProfile,
 }
 
 #[cfg(test)]

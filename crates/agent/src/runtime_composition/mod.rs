@@ -141,6 +141,8 @@ fn provider_registry_for_runtimes(
 
 #[cfg(test)]
 mod tests {
+    use std::net::{SocketAddr, TcpListener};
+
     use probe_config::{
         CaptureSelection, TlsMaterialConfig, TlsMaterialKind,
         TransparentInterceptionMitmBackendConfig, TransparentInterceptionStrategyConfig,
@@ -229,12 +231,15 @@ mod tests {
     }
 
     #[test]
-    fn external_mitm_contract_reports_l7_mitm_available() {
+    fn external_mitm_contract_reports_l7_mitm_available() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
         let mut config = AgentConfig::default();
         config.enforcement.interception.strategy =
             TransparentInterceptionStrategyConfig::InboundTproxyMitm;
-        config.enforcement.interception.proxy.listen_port = Some(15002);
-        configure_external_mitm_backend(&mut config);
+        let target = listener.local_addr()?;
+        config.enforcement.interception.proxy.listen_port = Some(target.port());
+        configure_external_mitm_backend(&mut config, target);
 
         let capabilities = capability_matrix_for_config(&config);
         let l7_mitm = capabilities
@@ -248,6 +253,7 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("external selector-scoped"))
         );
+        Ok(())
     }
 
     #[test]
@@ -258,6 +264,12 @@ mod tests {
         config.enforcement.interception.proxy.listen_port = Some(15002);
         config.enforcement.interception.mitm.backend =
             TransparentInterceptionMitmBackendConfig::External;
+        config
+            .enforcement
+            .interception
+            .mitm
+            .backend_readiness_probe
+            .target = Some("127.0.0.1:15002".to_string());
         config.enforcement.interception.mitm.ca_certificate_ref = Some("missing-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref =
             Some("missing-ca-key".to_string());
@@ -321,9 +333,15 @@ mod tests {
         }
     }
 
-    fn configure_external_mitm_backend(config: &mut AgentConfig) {
+    fn configure_external_mitm_backend(config: &mut AgentConfig, target: SocketAddr) {
         config.enforcement.interception.mitm.backend =
             TransparentInterceptionMitmBackendConfig::External;
+        config
+            .enforcement
+            .interception
+            .mitm
+            .backend_readiness_probe
+            .target = Some(target.to_string());
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.tls.materials = vec![

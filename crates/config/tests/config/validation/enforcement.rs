@@ -158,6 +158,10 @@ ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
 upstream_trust_anchor_refs = ["upstream-ca"]
 
+[enforcement.interception.mitm.backend_readiness_probe]
+target = "127.0.0.1:15002"
+timeout_ms = 250
+
 [[tls.materials]]
 id = "mitm-ca"
 kind = "mitm_ca_certificate"
@@ -176,6 +180,140 @@ path = "/etc/sssa/upstream-ca.pem"
     )?;
 
     config.validate_basic()?;
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_external_mitm_without_readiness_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+backend = "external"
+ca_certificate_ref = "mitm-ca"
+ca_private_key_ref = "mitm-ca-key"
+
+[[tls.materials]]
+id = "mitm-ca"
+kind = "mitm_ca_certificate"
+path = "/etc/sssa/mitm-ca.pem"
+
+[[tls.materials]]
+id = "mitm-ca-key"
+kind = "mitm_ca_private_key"
+path = "/etc/sssa/mitm-ca.key"
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("external MITM backend must have a readiness target");
+    let violations = validation_violations(&error);
+
+    assert!(violations.iter().any(|violation| violation.field
+        == "enforcement.interception.mitm.backend_readiness_probe.target"));
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_invalid_external_mitm_readiness_probe()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+backend = "external"
+ca_certificate_ref = "mitm-ca"
+ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.backend_readiness_probe]
+target = "localhost:15002"
+timeout_ms = 0
+
+[[tls.materials]]
+id = "mitm-ca"
+kind = "mitm_ca_certificate"
+path = "/etc/sssa/mitm-ca.pem"
+
+[[tls.materials]]
+id = "mitm-ca-key"
+kind = "mitm_ca_private_key"
+path = "/etc/sssa/mitm-ca.key"
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("external MITM readiness probe must be an IP socket target");
+    let violations = validation_violations(&error);
+
+    assert!(violations.iter().any(|violation| violation.field
+        == "enforcement.interception.mitm.backend_readiness_probe.target"
+        && violation.reason.contains("IP socket address")));
+    assert!(violations.iter().any(|violation| violation.field
+        == "enforcement.interception.mitm.backend_readiness_probe.timeout_ms"));
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_external_mitm_readiness_target_that_does_not_match_redirect_listener()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+backend = "external"
+ca_certificate_ref = "mitm-ca"
+ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.backend_readiness_probe]
+target = "192.0.2.10:15003"
+
+[[tls.materials]]
+id = "mitm-ca"
+kind = "mitm_ca_certificate"
+path = "/etc/sssa/mitm-ca.pem"
+
+[[tls.materials]]
+id = "mitm-ca-key"
+kind = "mitm_ca_private_key"
+path = "/etc/sssa/mitm-ca.key"
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("external MITM readiness probe must target the local redirect listener");
+    let violations = validation_violations(&error);
+
+    assert!(violations.iter().any(|violation| violation.field
+        == "enforcement.interception.mitm.backend_readiness_probe.target"
+        && violation.reason.contains("loopback IP address")));
+    assert!(violations.iter().any(|violation| {
+        violation.field == "enforcement.interception.mitm.backend_readiness_probe.target"
+            && violation
+                .reason
+                .contains("target port must match proxy listen_port")
+    }));
     Ok(())
 }
 
@@ -219,6 +357,9 @@ listen_port = 15002
 backend = "external"
 ca_certificate_ref = "collector-ca"
 ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.backend_readiness_probe]
+target = "127.0.0.1:15002"
 
 [[tls.materials]]
 id = "collector-ca"
@@ -323,4 +464,11 @@ target = "{target}"
         );
     }
     Ok(())
+}
+
+fn validation_violations(error: &ConfigError) -> &[ConfigViolation] {
+    let ConfigError::Validation(error) = error else {
+        panic!("expected validation error, got {error}");
+    };
+    error.violations()
 }

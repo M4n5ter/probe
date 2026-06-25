@@ -128,6 +128,10 @@ leaf_certificate_chain_refs = ["leaf-cert"]
 leaf_private_key_ref = "leaf-key"
 upstream_trust_anchor_refs = ["upstream-ca"]
 
+[enforcement.interception.mitm.backend_readiness_probe]
+target = "127.0.0.1:15002"
+timeout_ms = 250
+
 [[tls.materials]]
 id = "mitm-ca"
 kind = "mitm_ca_certificate"
@@ -166,6 +170,24 @@ path = "/etc/sssa/upstream-ca.pem"
     assert_eq!(
         config.enforcement.interception.mitm.ca_private_key_ref,
         Some("mitm-ca-key".to_string())
+    );
+    assert_eq!(
+        config
+            .enforcement
+            .interception
+            .mitm
+            .backend_readiness_probe
+            .target,
+        Some("127.0.0.1:15002".to_string())
+    );
+    assert_eq!(
+        config
+            .enforcement
+            .interception
+            .mitm
+            .backend_readiness_probe
+            .timeout_ms,
+        250
     );
     assert_eq!(
         config

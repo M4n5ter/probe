@@ -717,8 +717,20 @@ protective_actions = ["alert"]
             json!("external")
         );
         assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["mode"],
+            json!("tcp_connect")
+        );
+        assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["target"],
+            json!("127.0.0.1:15002")
+        );
+        assert_eq!(
             value["enforcement"]["interception"]["mitm"]["backend"],
             json!("external")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["mode"],
+            json!("tcp_connect")
         );
         assert_eq!(
             value["plan"]["enforcement"]["interception"]["mitm"]["ca_certificate"]["id"],
@@ -974,6 +986,12 @@ protective_actions = ["alert"]
     fn configure_external_mitm_backend(config: &mut AgentConfig) {
         config.enforcement.interception.mitm.backend =
             TransparentInterceptionMitmBackendConfig::External;
+        config
+            .enforcement
+            .interception
+            .mitm
+            .backend_readiness_probe
+            .target = Some("127.0.0.1:15002".to_string());
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.tls.materials = vec![

@@ -4,6 +4,8 @@ use probe_config::{
     AgentConfig, ConnectionEnforcementBackendConfig, EnforcementInterceptionConfig,
     EnforcementPolicySourceConfig, TlsMaterialKind, TransparentInterceptionDirectionConfig,
     TransparentInterceptionL7ModeConfig, TransparentInterceptionMitmBackendConfig,
+    TransparentInterceptionMitmBackendIntent,
+    TransparentInterceptionMitmBackendReadinessProbeIntent,
     TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent,
     TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
@@ -289,6 +291,7 @@ impl TransparentInterceptionExecutionPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransparentInterceptionMitmPlan {
     pub backend: TransparentInterceptionMitmBackendConfig,
+    pub backend_readiness_probe: TransparentInterceptionMitmBackendReadinessProbePlan,
     pub ca_certificate: Option<TlsMaterialPlan>,
     pub ca_private_key: Option<TlsMaterialPlan>,
     pub leaf_certificate_chain: Vec<TlsMaterialPlan>,
@@ -302,6 +305,14 @@ impl TransparentInterceptionMitmPlan {
         let materials_by_id = mitm_tls_materials_by_id(&config.tls.materials);
         Self {
             backend: mitm.backend,
+            backend_readiness_probe:
+                TransparentInterceptionMitmBackendReadinessProbePlan::from_intent(
+                    config
+                        .enforcement
+                        .interception
+                        .mitm_backend_intent()
+                        .expect("MITM backend contract should be validated before planning"),
+                ),
             ca_certificate: mitm.ca_certificate_ref.as_deref().and_then(|reference| {
                 mitm_tls_material_from_ref(
                     reference,
@@ -333,6 +344,29 @@ impl TransparentInterceptionMitmPlan {
                 TlsMaterialKind::MitmUpstreamTrustAnchor,
                 &materials_by_id,
             ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum TransparentInterceptionMitmBackendReadinessProbePlan {
+    Disabled,
+    TcpConnect { target: SocketAddr, timeout_ms: u64 },
+}
+
+impl TransparentInterceptionMitmBackendReadinessProbePlan {
+    fn from_intent(intent: TransparentInterceptionMitmBackendIntent) -> Self {
+        match intent {
+            TransparentInterceptionMitmBackendIntent::Disabled => Self::Disabled,
+            TransparentInterceptionMitmBackendIntent::External { readiness_probe } => {
+                match readiness_probe {
+                    TransparentInterceptionMitmBackendReadinessProbeIntent::TcpConnect {
+                        target,
+                        timeout_ms,
+                    } => Self::TcpConnect { target, timeout_ms },
+                }
+            }
         }
     }
 }
@@ -935,7 +969,8 @@ mod tests {
     }
 
     #[test]
-    fn enforcement_plan_reports_outbound_mitm_capability_requirements() {
+    fn enforcement_plan_reports_outbound_mitm_capability_requirements()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut config = AgentConfig::default();
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
@@ -989,6 +1024,13 @@ mod tests {
             TransparentInterceptionMitmBackendConfig::External
         );
         assert_eq!(
+            plan.interception.mitm.backend_readiness_probe,
+            TransparentInterceptionMitmBackendReadinessProbePlan::TcpConnect {
+                target: "127.0.0.1:15002".parse()?,
+                timeout_ms: 200,
+            }
+        );
+        assert_eq!(
             plan.interception
                 .mitm
                 .ca_certificate
@@ -1008,6 +1050,7 @@ mod tests {
             plan.interception.execution.outbound_redirect_plan(),
             TransparentInterceptionOutboundRedirectPlan::Planned { .. }
         ));
+        Ok(())
     }
 
     #[test]
@@ -1117,6 +1160,12 @@ mod tests {
     fn configure_external_mitm_backend(config: &mut AgentConfig) {
         config.enforcement.interception.mitm.backend =
             TransparentInterceptionMitmBackendConfig::External;
+        config
+            .enforcement
+            .interception
+            .mitm
+            .backend_readiness_probe
+            .target = Some("127.0.0.1:15002".to_string());
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.tls.materials = vec![

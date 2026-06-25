@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::{
     ConfigViolation, EnforcementInterceptionConfig, TlsConfig, TlsMaterialKind,
-    TransparentInterceptionMitmBackendConfig, TransparentInterceptionMitmConfig,
+    TransparentInterceptionIntentViolation, TransparentInterceptionMitmConfig,
 };
 
 pub(super) fn validate(
@@ -28,14 +28,7 @@ fn validate_transparent_proxy_intent(
     violations: &mut Vec<ConfigViolation>,
 ) {
     if let Err(intent_violations) = interception.transparent_proxy_intent() {
-        violations.extend(
-            intent_violations
-                .into_iter()
-                .map(|violation| ConfigViolation {
-                    field: violation.field().to_string(),
-                    reason: violation.reason().to_string(),
-                }),
-        );
+        extend_intent_violations(violations, intent_violations);
     }
 }
 
@@ -55,15 +48,32 @@ fn validate_mitm_config(
         return;
     }
 
-    if mitm.backend != TransparentInterceptionMitmBackendConfig::External {
-        violations.push(ConfigViolation {
-            field: "enforcement.interception.mitm.backend".to_string(),
-            reason: "MITM interception requires enforcement.interception.mitm.backend = \"external\" until a managed L7 backend exists".to_string(),
-        });
-    }
-
+    validate_mitm_backend_intent(interception, violations);
     validate_mitm_material_shape(mitm, violations);
     validate_mitm_material_refs(mitm, tls, violations);
+}
+
+fn validate_mitm_backend_intent(
+    interception: &EnforcementInterceptionConfig,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if let Err(intent_violations) = interception.mitm_backend_intent() {
+        extend_intent_violations(violations, intent_violations);
+    }
+}
+
+fn extend_intent_violations(
+    violations: &mut Vec<ConfigViolation>,
+    intent_violations: Vec<TransparentInterceptionIntentViolation>,
+) {
+    violations.extend(
+        intent_violations
+            .into_iter()
+            .map(|violation| ConfigViolation {
+                field: violation.field().to_string(),
+                reason: violation.reason().to_string(),
+            }),
+    );
 }
 
 fn validate_mitm_material_shape(
