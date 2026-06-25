@@ -31,6 +31,7 @@ pub use model::{
     TlsPlaintextDecryptHintConfig, TlsPlaintextInstrumentationConfig,
     TransparentInterceptionDirectionConfig, TransparentInterceptionDisabledProxyIntent,
     TransparentInterceptionEnabledProxyIntent, TransparentInterceptionL7ModeConfig,
+    TransparentInterceptionMitmBackendConfig, TransparentInterceptionMitmConfig,
     TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent, TransparentInterceptionProxyConfig,
     TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionProxyHealthProbeIntent,

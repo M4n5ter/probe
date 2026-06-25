@@ -115,6 +115,7 @@ pub struct TlsMaterialPlan {
 
 pub type TlsPlaintextMaterialPlan = TlsMaterialPlan;
 pub type ExportTlsMaterialPlan = TlsMaterialPlan;
+pub type MitmTlsMaterialPlan = TlsMaterialPlan;
 
 pub(super) fn export_tls_materials_by_id(
     materials: &[TlsMaterialConfig],
@@ -126,6 +127,12 @@ fn tls_plaintext_materials_by_id(
     materials: &[TlsMaterialConfig],
 ) -> BTreeMap<&str, TlsPlaintextMaterialPlan> {
     tls_materials_by_id(materials, is_plaintext_tls_material)
+}
+
+pub(super) fn mitm_tls_materials_by_id(
+    materials: &[TlsMaterialConfig],
+) -> BTreeMap<&str, MitmTlsMaterialPlan> {
+    tls_materials_by_id(materials, is_mitm_tls_material)
 }
 
 fn tls_materials_by_id(
@@ -166,6 +173,17 @@ fn is_plaintext_tls_material(kind: TlsMaterialKind) -> bool {
     )
 }
 
+fn is_mitm_tls_material(kind: TlsMaterialKind) -> bool {
+    matches!(
+        kind,
+        TlsMaterialKind::MitmCaCertificate
+            | TlsMaterialKind::MitmCaPrivateKey
+            | TlsMaterialKind::MitmLeafCertificate
+            | TlsMaterialKind::MitmLeafPrivateKey
+            | TlsMaterialKind::MitmUpstreamTrustAnchor
+    )
+}
+
 fn tls_plaintext_materials_from_refs(
     refs: &[String],
     expected_kind: TlsMaterialKind,
@@ -175,6 +193,29 @@ fn tls_plaintext_materials_from_refs(
         .filter_map(|reference| materials_by_id.get(reference.as_str()))
         .filter(|material| material.kind == expected_kind)
         .cloned()
+        .collect()
+}
+
+pub(super) fn mitm_tls_material_from_ref(
+    reference: &str,
+    expected_kind: TlsMaterialKind,
+    materials_by_id: &BTreeMap<&str, MitmTlsMaterialPlan>,
+) -> Option<MitmTlsMaterialPlan> {
+    materials_by_id
+        .get(reference)
+        .filter(|material| material.kind == expected_kind)
+        .cloned()
+}
+
+pub(super) fn mitm_tls_materials_from_refs(
+    refs: &[String],
+    expected_kind: TlsMaterialKind,
+    materials_by_id: &BTreeMap<&str, MitmTlsMaterialPlan>,
+) -> Vec<MitmTlsMaterialPlan> {
+    refs.iter()
+        .filter_map(|reference| {
+            mitm_tls_material_from_ref(reference, expected_kind, materials_by_id)
+        })
         .collect()
 }
 

@@ -6,8 +6,8 @@ use probe_core::EnforcementMode;
 use runtime::{
     EnforcementCapabilityPlan, RequiredCapabilityPlan, RuntimePlan,
     TransparentInterceptionClassificationPlan, TransparentInterceptionLocalSetupProjectionPlan,
-    TransparentInterceptionNftablesPlan, TransparentInterceptionOutboundRedirectPlan,
-    TransparentInterceptionProxyPlan,
+    TransparentInterceptionMitmPlan, TransparentInterceptionNftablesPlan,
+    TransparentInterceptionOutboundRedirectPlan, TransparentInterceptionProxyPlan,
 };
 use serde::Serialize;
 
@@ -48,6 +48,7 @@ pub struct EnforcementInterceptionCheckSnapshot {
     pub strategy: TransparentInterceptionStrategyConfig,
     pub proxy: TransparentInterceptionProxyPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
+    pub mitm: TransparentInterceptionMitmPlan,
     pub outbound_redirect: TransparentInterceptionOutboundRedirectPlan,
     pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
     pub classification: TransparentInterceptionClassificationPlan,
@@ -126,6 +127,7 @@ pub(super) async fn check_enforcement(
             strategy: plan.enforcement.interception.strategy,
             proxy: plan.enforcement.interception.proxy.clone(),
             nftables: plan.enforcement.interception.nftables.clone(),
+            mitm: plan.enforcement.interception.mitm.clone(),
             outbound_redirect: plan
                 .enforcement
                 .interception

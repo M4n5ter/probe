@@ -109,6 +109,108 @@ listen_port = 15003
 }
 
 #[test]
+fn parses_external_mitm_backend_material_contract() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "outbound_transparent_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+self_bypass = "uses_reserved_mark"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+backend = "external"
+ca_certificate_ref = "mitm-ca"
+ca_private_key_ref = "mitm-ca-key"
+leaf_certificate_chain_refs = ["leaf-cert"]
+leaf_private_key_ref = "leaf-key"
+upstream_trust_anchor_refs = ["upstream-ca"]
+
+[[tls.materials]]
+id = "mitm-ca"
+kind = "mitm_ca_certificate"
+path = "/etc/sssa/mitm-ca.pem"
+
+[[tls.materials]]
+id = "mitm-ca-key"
+kind = "mitm_ca_private_key"
+path = "/etc/sssa/mitm-ca.key"
+
+[[tls.materials]]
+id = "leaf-cert"
+kind = "mitm_leaf_certificate"
+path = "/etc/sssa/leaf.pem"
+
+[[tls.materials]]
+id = "leaf-key"
+kind = "mitm_leaf_private_key"
+path = "/etc/sssa/leaf.key"
+
+[[tls.materials]]
+id = "upstream-ca"
+kind = "mitm_upstream_trust_anchor"
+path = "/etc/sssa/upstream-ca.pem"
+"#,
+    )?;
+
+    assert_eq!(
+        config.enforcement.interception.mitm.backend,
+        TransparentInterceptionMitmBackendConfig::External
+    );
+    assert_eq!(
+        config.enforcement.interception.mitm.ca_certificate_ref,
+        Some("mitm-ca".to_string())
+    );
+    assert_eq!(
+        config.enforcement.interception.mitm.ca_private_key_ref,
+        Some("mitm-ca-key".to_string())
+    );
+    assert_eq!(
+        config
+            .enforcement
+            .interception
+            .mitm
+            .leaf_certificate_chain_refs,
+        vec!["leaf-cert"]
+    );
+    assert_eq!(
+        config.enforcement.interception.mitm.leaf_private_key_ref,
+        Some("leaf-key".to_string())
+    );
+    assert_eq!(
+        config
+            .enforcement
+            .interception
+            .mitm
+            .upstream_trust_anchor_refs,
+        vec!["upstream-ca"]
+    );
+    assert_eq!(
+        config.tls.materials[0].kind,
+        TlsMaterialKind::MitmCaCertificate
+    );
+    assert_eq!(
+        config.tls.materials[1].kind,
+        TlsMaterialKind::MitmCaPrivateKey
+    );
+    assert_eq!(
+        config.tls.materials[2].kind,
+        TlsMaterialKind::MitmLeafCertificate
+    );
+    assert_eq!(
+        config.tls.materials[3].kind,
+        TlsMaterialKind::MitmLeafPrivateKey
+    );
+    assert_eq!(
+        config.tls.materials[4].kind,
+        TlsMaterialKind::MitmUpstreamTrustAnchor
+    );
+    Ok(())
+}
+
+#[test]
 fn parses_external_outbound_proxy_self_bypass_contract() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
         r#"

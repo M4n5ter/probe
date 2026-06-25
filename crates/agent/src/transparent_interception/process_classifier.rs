@@ -350,6 +350,7 @@ mod tests {
                 listen_port: Some(15001),
                 ..TransparentInterceptionProxyConfig::default()
             },
+            ..EnforcementInterceptionConfig::default()
         };
         let execution_plan =
             ::runtime::TransparentInterceptionExecutionPlan::try_from_config(&config)

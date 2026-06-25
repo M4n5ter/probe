@@ -220,6 +220,7 @@ mod tests {
                 listen_port: Some(15001),
                 ..TransparentInterceptionProxyConfig::default()
             },
+            ..EnforcementInterceptionConfig::default()
         };
         let manifest_selector = Selector::term(
             ProcessSelector::default(),
@@ -259,6 +260,7 @@ mod tests {
                 listen_port: Some(15001),
                 ..TransparentInterceptionProxyConfig::default()
             },
+            ..EnforcementInterceptionConfig::default()
         };
         let selector = Selector::term(
             ProcessSelector {
@@ -359,6 +361,7 @@ mod tests {
                 listen_port: Some(15001),
                 ..TransparentInterceptionProxyConfig::default()
             },
+            ..EnforcementInterceptionConfig::default()
         }
     }
 

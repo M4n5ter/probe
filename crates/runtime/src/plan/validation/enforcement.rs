@@ -139,6 +139,7 @@ mod tests {
     use probe_config::{
         CaptureBackend, CaptureSelection, CompressionCodecName, ConfigValidationError,
         ConnectionEnforcementBackendConfig, ExporterConfig, ExporterTransportConfig,
+        TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
         TransparentInterceptionStrategyConfig,
     };
@@ -384,6 +385,7 @@ mod tests {
         config.enforcement.interception.proxy.self_bypass =
             TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
         config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_external_mitm_backend(&mut config);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -410,6 +412,7 @@ mod tests {
         config.enforcement.interception.strategy =
             TransparentInterceptionStrategyConfig::InboundTproxyMitm;
         config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_external_mitm_backend(&mut config);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -702,6 +705,7 @@ mod tests {
             CapabilityState::available(CapabilityKind::DryRunEnforcement),
             CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
             CapabilityState::unavailable(CapabilityKind::TransparentInterception, "not built"),
+            CapabilityState::unavailable(CapabilityKind::L7Mitm, "L7 MITM not built"),
         ]
     }
 
@@ -730,6 +734,25 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    fn configure_external_mitm_backend(config: &mut AgentConfig) {
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::External;
+        config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
+        config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+        config.tls.materials = vec![
+            TlsMaterialConfig {
+                id: Some("mitm-ca".to_string()),
+                kind: TlsMaterialKind::MitmCaCertificate,
+                path: "/etc/sssa/mitm-ca.pem".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("mitm-ca-key".to_string()),
+                kind: TlsMaterialKind::MitmCaPrivateKey,
+                path: "/etc/sssa/mitm-ca.key".into(),
+            },
+        ];
     }
 
     fn transparent_interception_capabilities() -> Vec<CapabilityState> {

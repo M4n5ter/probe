@@ -53,6 +53,7 @@ pub struct EnforcementInterceptionConfig {
     pub strategy: TransparentInterceptionStrategyConfig,
     pub selector: Option<Selector>,
     pub proxy: TransparentInterceptionProxyConfig,
+    pub mitm: TransparentInterceptionMitmConfig,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +79,44 @@ pub enum TransparentInterceptionDirectionConfig {
 pub enum TransparentInterceptionL7ModeConfig {
     Passthrough,
     Mitm,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransparentInterceptionMitmConfig {
+    pub backend: TransparentInterceptionMitmBackendConfig,
+    pub ca_certificate_ref: Option<String>,
+    pub ca_private_key_ref: Option<String>,
+    pub leaf_certificate_chain_refs: Vec<String>,
+    pub leaf_private_key_ref: Option<String>,
+    pub upstream_trust_anchor_refs: Vec<String>,
+}
+
+impl TransparentInterceptionMitmConfig {
+    pub fn is_configured(&self) -> bool {
+        self.backend != TransparentInterceptionMitmBackendConfig::None
+            || self.ca_certificate_ref.is_some()
+            || self.ca_private_key_ref.is_some()
+            || !self.leaf_certificate_chain_refs.is_empty()
+            || self.leaf_private_key_ref.is_some()
+            || !self.upstream_trust_anchor_refs.is_empty()
+    }
+
+    pub fn has_ca_material_pair(&self) -> bool {
+        self.ca_certificate_ref.is_some() && self.ca_private_key_ref.is_some()
+    }
+
+    pub fn has_leaf_material_pair(&self) -> bool {
+        !self.leaf_certificate_chain_refs.is_empty() && self.leaf_private_key_ref.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparentInterceptionMitmBackendConfig {
+    #[default]
+    None,
+    External,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

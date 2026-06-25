@@ -10,6 +10,7 @@ mod connection_enforcement;
 mod error;
 mod export;
 mod json_lines;
+mod l7_mitm;
 mod live_agent;
 mod periodic_worker;
 mod plaintext_feed;

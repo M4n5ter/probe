@@ -123,6 +123,7 @@ mod tests {
 
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig,
+        TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
@@ -675,6 +676,7 @@ protective_actions = ["alert"]
         config.enforcement.interception.proxy.self_bypass =
             probe_config::TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
         config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_external_mitm_backend(&mut config);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -709,6 +711,22 @@ protective_actions = ["alert"]
         assert_eq!(
             value["plan"]["enforcement"]["interception"]["execution"]["l7_mode"],
             json!("mitm")
+        );
+        assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend"],
+            json!("external")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["mitm"]["backend"],
+            json!("external")
+        );
+        assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["ca_certificate"]["id"],
+            json!("mitm-ca")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["mitm"]["ca_certificate"]["id"],
+            json!("mitm-ca")
         );
         assert_eq!(
             interception_capability(&value, "transparent_interception")["mode"],
@@ -885,6 +903,7 @@ protective_actions = ["alert"]
                 ),
                 transparent_flow_classifier:
                     PlatformProbeResults::default_transparent_flow_classifier(),
+                l7_mitm: CapabilityState::unavailable(CapabilityKind::L7Mitm, "not configured"),
                 libssl_uprobe: CapabilityState::unavailable(
                     CapabilityKind::LibsslUprobe,
                     "not configured",
@@ -950,6 +969,25 @@ protective_actions = ["alert"]
             .iter()
             .find(|state| state["capability"] == json!(capability))
             .unwrap_or_else(|| panic!("missing interception capability {capability}"))
+    }
+
+    fn configure_external_mitm_backend(config: &mut AgentConfig) {
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::External;
+        config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
+        config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+        config.tls.materials = vec![
+            TlsMaterialConfig {
+                id: Some("mitm-ca".to_string()),
+                kind: TlsMaterialKind::MitmCaCertificate,
+                path: "/etc/sssa/mitm-ca.pem".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("mitm-ca-key".to_string()),
+                kind: TlsMaterialKind::MitmCaPrivateKey,
+                path: "/etc/sssa/mitm-ca.key".into(),
+            },
+        ];
     }
 
     fn config_with_policy(path: &Path) -> Result<AgentConfig, probe_config::ConfigError> {

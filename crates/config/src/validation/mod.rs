@@ -16,9 +16,20 @@ pub(crate) fn validate_config(config: &AgentConfig) -> Result<(), ConfigValidati
     export::validate_runtime(&config.export, &mut violations);
     export::validate_exporters(&config.exporters, &config.tls, &mut violations);
     policy::validate(&config.policies, &mut violations);
-    enforcement::validate(&config.enforcement, &mut violations);
+    enforcement::validate(&config.enforcement, &config.tls, &mut violations);
     admin::validate(&config.admin, &mut violations);
 
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigValidationError::new(violations))
+    }
+}
+
+pub(crate) fn validate_l7_mitm_contract(config: &AgentConfig) -> Result<(), ConfigValidationError> {
+    let mut violations = Vec::new();
+    tls::validate_tls_material_registry(&config.tls, &mut violations);
+    enforcement::validate_l7_mitm_contract(&config.enforcement, &config.tls, &mut violations);
     if violations.is_empty() {
         Ok(())
     } else {

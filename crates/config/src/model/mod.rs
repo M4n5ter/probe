@@ -24,6 +24,7 @@ pub use enforcement::{
     MIN_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS, MIN_TRANSPARENT_PROXY_HEALTH_PROBE_TIMEOUT_MS,
     TransparentInterceptionDirectionConfig, TransparentInterceptionDisabledProxyIntent,
     TransparentInterceptionEnabledProxyIntent, TransparentInterceptionL7ModeConfig,
+    TransparentInterceptionMitmBackendConfig, TransparentInterceptionMitmConfig,
     TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent, TransparentInterceptionProxyConfig,
     TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionProxyHealthProbeIntent,

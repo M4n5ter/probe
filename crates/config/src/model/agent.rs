@@ -28,6 +28,10 @@ impl AgentConfig {
     pub fn validate_basic(&self) -> Result<(), ConfigError> {
         validation::validate_config(self).map_err(ConfigError::Validation)
     }
+
+    pub fn validate_l7_mitm_contract(&self) -> Result<(), ConfigError> {
+        validation::validate_l7_mitm_contract(self).map_err(ConfigError::Validation)
+    }
 }
 
 impl Default for AgentConfig {

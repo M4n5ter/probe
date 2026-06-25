@@ -68,6 +68,7 @@ pub struct TlsMaterialStatusSnapshot {
 pub enum TlsMaterialPurpose {
     TrustOrIdentity,
     DecryptHint,
+    Mitm,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -162,6 +163,11 @@ fn material_purpose(kind: TlsMaterialKind) -> TlsMaterialPurpose {
         TlsMaterialKind::TrustAnchor
         | TlsMaterialKind::ClientCertificate
         | TlsMaterialKind::ClientPrivateKey => TlsMaterialPurpose::TrustOrIdentity,
+        TlsMaterialKind::MitmCaCertificate
+        | TlsMaterialKind::MitmCaPrivateKey
+        | TlsMaterialKind::MitmLeafCertificate
+        | TlsMaterialKind::MitmLeafPrivateKey
+        | TlsMaterialKind::MitmUpstreamTrustAnchor => TlsMaterialPurpose::Mitm,
         TlsMaterialKind::KeyLogFile | TlsMaterialKind::SessionSecretFile => {
             TlsMaterialPurpose::DecryptHint
         }

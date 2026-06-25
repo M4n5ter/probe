@@ -17,6 +17,7 @@ pub struct PlatformProbeResults {
     pub transparent_interception: CapabilityState,
     pub transparent_process_classifier: CapabilityState,
     pub transparent_flow_classifier: CapabilityState,
+    pub l7_mitm: CapabilityState,
     pub libssl_uprobe: CapabilityState,
 }
 
@@ -29,6 +30,7 @@ impl PlatformProbeResults {
             transparent_interception: default_transparent_interception_capability(),
             transparent_process_classifier: Self::default_transparent_process_classifier(),
             transparent_flow_classifier: Self::default_transparent_flow_classifier(),
+            l7_mitm: default_l7_mitm_capability(),
             libssl_uprobe: default_libssl_uprobe_capability(),
         }
     }
@@ -69,6 +71,7 @@ impl ProviderRegistry {
                 platform.transparent_interception,
                 platform.transparent_process_classifier,
                 platform.transparent_flow_classifier,
+                platform.l7_mitm,
                 platform.libssl_uprobe,
             )
             .into_iter()
@@ -120,12 +123,13 @@ fn default_platform_capabilities(
     transparent_interception_capability: CapabilityState,
     transparent_process_classifier_capability: CapabilityState,
     transparent_flow_classifier_capability: CapabilityState,
+    l7_mitm_capability: CapabilityState,
     libssl_uprobe_capability: CapabilityState,
 ) -> impl IntoIterator<Item = CapabilityState> {
     [
         libssl_uprobe_capability,
         CapabilityState::available(CapabilityKind::TlsSessionSecretRecordDecrypt),
-        default_l7_mitm_capability(),
+        l7_mitm_capability,
         CapabilityState::available(CapabilityKind::Http1),
         CapabilityState::available(CapabilityKind::Sse),
         CapabilityState::available(CapabilityKind::WebSocketHandoff),

@@ -19,6 +19,13 @@ pub(crate) fn validate_tls(
     }
 }
 
+pub(crate) fn validate_tls_material_registry(
+    tls: &TlsConfig,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    validate_tls_materials(tls, violations);
+}
+
 pub(crate) fn materials_by_id(tls: &TlsConfig) -> BTreeMap<&str, TlsMaterialKind> {
     tls.materials
         .iter()

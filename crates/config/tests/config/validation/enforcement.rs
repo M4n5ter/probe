@@ -140,6 +140,106 @@ listen_port = 15001
 }
 
 #[test]
+fn validation_accepts_external_mitm_backend_material_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "outbound_transparent_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+self_bypass = "uses_reserved_mark"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+backend = "external"
+ca_certificate_ref = "mitm-ca"
+ca_private_key_ref = "mitm-ca-key"
+upstream_trust_anchor_refs = ["upstream-ca"]
+
+[[tls.materials]]
+id = "mitm-ca"
+kind = "mitm_ca_certificate"
+path = "/etc/sssa/mitm-ca.pem"
+
+[[tls.materials]]
+id = "mitm-ca-key"
+kind = "mitm_ca_private_key"
+path = "/etc/sssa/mitm-ca.key"
+
+[[tls.materials]]
+id = "upstream-ca"
+kind = "mitm_upstream_trust_anchor"
+path = "/etc/sssa/upstream-ca.pem"
+"#,
+    )?;
+
+    config.validate_basic()?;
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_incomplete_external_mitm_backend_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let missing_backend = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+listen_port = 15002
+"#,
+    )?;
+    let error = missing_backend
+        .validate_basic()
+        .expect_err("MITM strategy must require explicit backend and certificate material");
+    assert!(
+        error
+            .to_string()
+            .contains("enforcement.interception.mitm.backend")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("requires either a CA certificate/private key pair")
+    );
+
+    let wrong_kind = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+backend = "external"
+ca_certificate_ref = "collector-ca"
+ca_private_key_ref = "mitm-ca-key"
+
+[[tls.materials]]
+id = "collector-ca"
+kind = "trust_anchor"
+path = "/etc/sssa/collector-ca.pem"
+
+[[tls.materials]]
+id = "mitm-ca-key"
+kind = "mitm_ca_private_key"
+path = "/etc/sssa/mitm-ca.key"
+"#,
+    )?;
+    let error = wrong_kind
+        .validate_basic()
+        .expect_err("MITM material refs must point at MITM material kinds");
+    assert!(error.to_string().contains("expected MitmCaCertificate"));
+
+    Ok(())
+}
+
+#[test]
 fn validation_rejects_reserved_mark_self_bypass_outside_external_outbound_proxy()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(

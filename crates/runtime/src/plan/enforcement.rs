@@ -2,9 +2,9 @@ use std::{fmt, net::SocketAddr, num::NonZeroU16, path::PathBuf};
 
 use probe_config::{
     AgentConfig, ConnectionEnforcementBackendConfig, EnforcementInterceptionConfig,
-    EnforcementPolicySourceConfig, TransparentInterceptionDirectionConfig,
-    TransparentInterceptionL7ModeConfig, TransparentInterceptionOutboundProxyIntent,
-    TransparentInterceptionOutboundProxyModeIntent,
+    EnforcementPolicySourceConfig, TlsMaterialKind, TransparentInterceptionDirectionConfig,
+    TransparentInterceptionL7ModeConfig, TransparentInterceptionMitmBackendConfig,
+    TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent,
     TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
     TransparentInterceptionProxyIntentViolation, TransparentInterceptionProxyModeConfig,
@@ -14,7 +14,13 @@ use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, EnforcementM
 use serde::{Deserialize, Serialize};
 use transparent_linux::{OutboundRedirectArtifactSpec, TransparentLinuxResources};
 
-use super::interception_scope::TransparentInterceptionLocalSetupProjectionPlan;
+use super::{
+    interception_scope::TransparentInterceptionLocalSetupProjectionPlan,
+    tls::{
+        TlsMaterialPlan, mitm_tls_material_from_ref, mitm_tls_materials_by_id,
+        mitm_tls_materials_from_refs,
+    },
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPlan {
@@ -94,6 +100,7 @@ pub struct EnforcementInterceptionPlan {
     pub proxy: TransparentInterceptionProxyPlan,
     pub execution: TransparentInterceptionExecutionPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
+    pub mitm: TransparentInterceptionMitmPlan,
     pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
     pub classification: TransparentInterceptionClassificationPlan,
     pub capabilities: Vec<RequiredCapabilityPlan>,
@@ -116,6 +123,7 @@ impl EnforcementInterceptionPlan {
             proxy: TransparentInterceptionProxyPlan::from_intent(&intent),
             execution,
             nftables,
+            mitm: TransparentInterceptionMitmPlan::from_config(config),
             local_setup_projection:
                 TransparentInterceptionLocalSetupProjectionPlan::from_strategy_and_selectors(
                     strategy,
@@ -274,6 +282,57 @@ impl TransparentInterceptionExecutionPlan {
             Self::Disabled | Self::InboundTproxy(_) => {
                 TransparentInterceptionOutboundRedirectPlan::NotConfigured
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionMitmPlan {
+    pub backend: TransparentInterceptionMitmBackendConfig,
+    pub ca_certificate: Option<TlsMaterialPlan>,
+    pub ca_private_key: Option<TlsMaterialPlan>,
+    pub leaf_certificate_chain: Vec<TlsMaterialPlan>,
+    pub leaf_private_key: Option<TlsMaterialPlan>,
+    pub upstream_trust_anchors: Vec<TlsMaterialPlan>,
+}
+
+impl TransparentInterceptionMitmPlan {
+    fn from_config(config: &AgentConfig) -> Self {
+        let mitm = &config.enforcement.interception.mitm;
+        let materials_by_id = mitm_tls_materials_by_id(&config.tls.materials);
+        Self {
+            backend: mitm.backend,
+            ca_certificate: mitm.ca_certificate_ref.as_deref().and_then(|reference| {
+                mitm_tls_material_from_ref(
+                    reference,
+                    TlsMaterialKind::MitmCaCertificate,
+                    &materials_by_id,
+                )
+            }),
+            ca_private_key: mitm.ca_private_key_ref.as_deref().and_then(|reference| {
+                mitm_tls_material_from_ref(
+                    reference,
+                    TlsMaterialKind::MitmCaPrivateKey,
+                    &materials_by_id,
+                )
+            }),
+            leaf_certificate_chain: mitm_tls_materials_from_refs(
+                &mitm.leaf_certificate_chain_refs,
+                TlsMaterialKind::MitmLeafCertificate,
+                &materials_by_id,
+            ),
+            leaf_private_key: mitm.leaf_private_key_ref.as_deref().and_then(|reference| {
+                mitm_tls_material_from_ref(
+                    reference,
+                    TlsMaterialKind::MitmLeafPrivateKey,
+                    &materials_by_id,
+                )
+            }),
+            upstream_trust_anchors: mitm_tls_materials_from_refs(
+                &mitm.upstream_trust_anchor_refs,
+                TlsMaterialKind::MitmUpstreamTrustAnchor,
+                &materials_by_id,
+            ),
         }
     }
 }
@@ -646,7 +705,8 @@ mod tests {
     use std::num::NonZeroU32;
 
     use probe_config::{
-        AgentConfig, ConnectionEnforcementBackendConfig, TransparentInterceptionStrategyConfig,
+        AgentConfig, ConnectionEnforcementBackendConfig, TlsMaterialConfig, TlsMaterialKind,
+        TransparentInterceptionMitmBackendConfig, TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
         CapabilityMatrix, CapabilityState, Direction, ProcessSelector, Selector, TrafficSelector,
@@ -883,6 +943,7 @@ mod tests {
         config.enforcement.interception.proxy.self_bypass =
             TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
         config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_external_mitm_backend(&mut config);
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -922,6 +983,26 @@ mod tests {
                     mode: RuntimeMode::Unavailable,
                 },
             ]
+        );
+        assert_eq!(
+            plan.interception.mitm.backend,
+            TransparentInterceptionMitmBackendConfig::External
+        );
+        assert_eq!(
+            plan.interception
+                .mitm
+                .ca_certificate
+                .as_ref()
+                .map(|material| material.id.as_str()),
+            Some("mitm-ca")
+        );
+        assert_eq!(
+            plan.interception
+                .mitm
+                .ca_private_key
+                .as_ref()
+                .map(|material| material.id.as_str()),
+            Some("mitm-ca-key")
         );
         assert!(matches!(
             plan.interception.execution.outbound_redirect_plan(),
@@ -1004,6 +1085,7 @@ mod tests {
             CapabilityState::unavailable(CapabilityKind::TransparentInterception, "not built"),
             CapabilityState::unavailable(CapabilityKind::TransparentProcessClassifier, "not built"),
             CapabilityState::unavailable(CapabilityKind::TransparentFlowClassifier, "not built"),
+            CapabilityState::unavailable(CapabilityKind::L7Mitm, "not built"),
         ]
     }
 
@@ -1030,5 +1112,24 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    fn configure_external_mitm_backend(config: &mut AgentConfig) {
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::External;
+        config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
+        config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+        config.tls.materials = vec![
+            TlsMaterialConfig {
+                id: Some("mitm-ca".to_string()),
+                kind: TlsMaterialKind::MitmCaCertificate,
+                path: "/etc/sssa/mitm-ca.pem".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("mitm-ca-key".to_string()),
+                kind: TlsMaterialKind::MitmCaPrivateKey,
+                path: "/etc/sssa/mitm-ca.key".into(),
+            },
+        ];
     }
 }

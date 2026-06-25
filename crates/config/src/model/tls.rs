@@ -84,6 +84,11 @@ pub enum TlsMaterialKind {
     TrustAnchor,
     ClientCertificate,
     ClientPrivateKey,
+    MitmCaCertificate,
+    MitmCaPrivateKey,
+    MitmLeafCertificate,
+    MitmLeafPrivateKey,
+    MitmUpstreamTrustAnchor,
     KeyLogFile,
     SessionSecretFile,
 }

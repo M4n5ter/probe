@@ -10,8 +10,8 @@ use probe_core::{CapabilityKind, EnforcementMode, ProtectiveActionProfile, Runti
 use runtime::{
     EnforcementCapabilityPlan, RequiredCapabilityPlan, RuntimePlan,
     TransparentInterceptionClassificationPlan, TransparentInterceptionLocalSetupProjectionPlan,
-    TransparentInterceptionNftablesPlan, TransparentInterceptionOutboundRedirectPlan,
-    TransparentInterceptionProxyPlan,
+    TransparentInterceptionMitmPlan, TransparentInterceptionNftablesPlan,
+    TransparentInterceptionOutboundRedirectPlan, TransparentInterceptionProxyPlan,
 };
 use serde::Serialize;
 
@@ -38,6 +38,7 @@ pub struct EnforcementConnectionStatusSnapshot {
 pub struct EnforcementInterceptionStatusSnapshot {
     pub strategy: TransparentInterceptionStrategyConfig,
     pub proxy: TransparentInterceptionProxyPlan,
+    pub mitm: TransparentInterceptionMitmPlan,
     pub nftables: TransparentInterceptionNftablesPlan,
     pub outbound_redirect: TransparentInterceptionOutboundRedirectPlan,
     pub local_setup_projection: TransparentInterceptionLocalSetupProjectionPlan,
@@ -158,6 +159,7 @@ fn enforcement_status_with_source(
         interception: EnforcementInterceptionStatusSnapshot {
             strategy: plan.enforcement.interception.strategy,
             proxy: plan.enforcement.interception.proxy.clone(),
+            mitm: plan.enforcement.interception.mitm.clone(),
             nftables: plan.enforcement.interception.nftables.clone(),
             outbound_redirect: plan
                 .enforcement
@@ -997,6 +999,10 @@ protective_actions = ["alert"]
                     runtime::PlatformProbeResults::default_transparent_process_classifier(),
                 transparent_flow_classifier:
                     runtime::PlatformProbeResults::default_transparent_flow_classifier(),
+                l7_mitm: probe_core::CapabilityState::unavailable(
+                    CapabilityKind::L7Mitm,
+                    "not configured",
+                ),
                 libssl_uprobe: probe_core::CapabilityState::unavailable(
                     CapabilityKind::LibsslUprobe,
                     "not configured",

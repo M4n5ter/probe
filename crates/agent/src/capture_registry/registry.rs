@@ -16,6 +16,7 @@ use crate::transparent_interception::TransparentInterceptionProcessClassifier;
 pub fn default_provider_registry(
     config: &AgentConfig,
     connection_enforcement_capability: CapabilityState,
+    l7_mitm_capability: CapabilityState,
     transparent_interception_capability: CapabilityState,
 ) -> ProviderRegistry {
     let ebpf_host = EbpfHostProbe::probe(&EbpfHostProbeConfig::default());
@@ -35,6 +36,7 @@ pub fn default_provider_registry(
             transparent_process_classifier,
             transparent_flow_classifier: PlatformProbeResults::default_transparent_flow_classifier(
             ),
+            l7_mitm: l7_mitm_capability,
             libssl_uprobe,
         },
     )
@@ -381,6 +383,7 @@ mod tests {
                 CapabilityKind::ConnectionEnforcement,
                 "connection-level enforcement backend is not configured",
             ),
+            CapabilityState::unavailable(CapabilityKind::L7Mitm, "not configured"),
             CapabilityState::unavailable(
                 CapabilityKind::TransparentInterception,
                 "transparent interception backend is not configured",
@@ -402,6 +405,7 @@ mod tests {
                 CapabilityKind::ConnectionEnforcement,
                 "connection-level enforcement backend is not configured",
             ),
+            CapabilityState::unavailable(CapabilityKind::L7Mitm, "not configured"),
             CapabilityState::unavailable(
                 CapabilityKind::TransparentInterception,
                 "transparent interception backend is not configured",

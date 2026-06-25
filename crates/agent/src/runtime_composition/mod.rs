@@ -7,6 +7,7 @@ use crate::{
     capture_registry::default_provider_registry,
     connection_enforcement::{self, ConnectionEnforcementRuntime},
     error::AgentError,
+    l7_mitm::{self, L7MitmRuntime},
     transparent_interception::{self, TransparentInterceptionRuntime},
 };
 
@@ -45,9 +46,14 @@ impl RuntimeComposition {
 pub(crate) fn build_runtime_composition(
     config: AgentConfig,
 ) -> Result<RuntimeComposition, AgentError> {
-    let (connection_enforcement, transparent_interception) = execution_runtimes_for_config(&config);
-    let registry =
-        provider_registry_for_runtimes(&config, &connection_enforcement, &transparent_interception);
+    let (connection_enforcement, l7_mitm, transparent_interception) =
+        execution_runtimes_for_config(&config);
+    let registry = provider_registry_for_runtimes(
+        &config,
+        &connection_enforcement,
+        &l7_mitm,
+        &transparent_interception,
+    );
     build_runtime_composition_from_registry(
         config,
         connection_enforcement,
@@ -76,7 +82,8 @@ pub(crate) fn build_runtime_composition_for_test(
     capture_providers: Vec<runtime::CaptureProviderDescriptor>,
     platform: runtime::PlatformProbeResults,
 ) -> Result<RuntimeComposition, AgentError> {
-    let (connection_enforcement, transparent_interception) = execution_runtimes_for_config(&config);
+    let (connection_enforcement, _l7_mitm, transparent_interception) =
+        execution_runtimes_for_config(&config);
     let registry = ProviderRegistry::with_platform_probes(capture_providers, platform);
     build_runtime_composition_from_registry(
         config,
@@ -87,14 +94,24 @@ pub(crate) fn build_runtime_composition_for_test(
 }
 
 pub(crate) fn capability_matrix_for_config(config: &AgentConfig) -> CapabilityMatrix {
-    let (connection_enforcement, transparent_interception) = execution_runtimes_for_config(config);
-    provider_registry_for_runtimes(config, &connection_enforcement, &transparent_interception)
-        .capability_matrix()
+    let (connection_enforcement, l7_mitm, transparent_interception) =
+        execution_runtimes_for_config(config);
+    provider_registry_for_runtimes(
+        config,
+        &connection_enforcement,
+        &l7_mitm,
+        &transparent_interception,
+    )
+    .capability_matrix()
 }
 
 fn execution_runtimes_for_config(
     config: &AgentConfig,
-) -> (ConnectionEnforcementRuntime, TransparentInterceptionRuntime) {
+) -> (
+    ConnectionEnforcementRuntime,
+    L7MitmRuntime,
+    TransparentInterceptionRuntime,
+) {
     let transparent_interception_execution =
         TransparentInterceptionExecutionPlan::try_from_config(&config.enforcement.interception);
     let transparent_interception = match transparent_interception_execution {
@@ -103,6 +120,7 @@ fn execution_runtimes_for_config(
     };
     (
         connection_enforcement::resolve(config.enforcement.backend),
+        l7_mitm::resolve(config),
         transparent_interception,
     )
 }
@@ -110,18 +128,23 @@ fn execution_runtimes_for_config(
 fn provider_registry_for_runtimes(
     config: &AgentConfig,
     connection_enforcement: &ConnectionEnforcementRuntime,
+    l7_mitm: &L7MitmRuntime,
     transparent_interception: &TransparentInterceptionRuntime,
 ) -> ProviderRegistry {
     default_provider_registry(
         config,
         connection_enforcement.capability(),
+        l7_mitm.capability(),
         transparent_interception.capability(),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use probe_config::{CaptureSelection, TransparentInterceptionStrategyConfig};
+    use probe_config::{
+        CaptureSelection, TlsMaterialConfig, TlsMaterialKind,
+        TransparentInterceptionMitmBackendConfig, TransparentInterceptionStrategyConfig,
+    };
     use probe_core::{
         CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector, RuntimeMode,
         Selector, TrafficSelector,
@@ -205,6 +228,76 @@ mod tests {
         assert!(error.to_string().contains("health_probe.target"));
     }
 
+    #[test]
+    fn external_mitm_contract_reports_l7_mitm_available() {
+        let mut config = AgentConfig::default();
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_external_mitm_backend(&mut config);
+
+        let capabilities = capability_matrix_for_config(&config);
+        let l7_mitm = capabilities
+            .reported_state(CapabilityKind::L7Mitm)
+            .expect("L7 MITM capability should be reported");
+
+        assert_eq!(l7_mitm.mode, RuntimeMode::Available);
+        assert!(
+            l7_mitm
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("external selector-scoped"))
+        );
+    }
+
+    #[test]
+    fn invalid_external_mitm_contract_reports_l7_mitm_unavailable() {
+        let mut config = AgentConfig::default();
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::External;
+        config.enforcement.interception.mitm.ca_certificate_ref = Some("missing-ca".to_string());
+        config.enforcement.interception.mitm.ca_private_key_ref =
+            Some("missing-ca-key".to_string());
+
+        let capabilities = capability_matrix_for_config(&config);
+        let l7_mitm = capabilities
+            .reported_state(CapabilityKind::L7Mitm)
+            .expect("L7 MITM capability should be reported");
+
+        assert_eq!(l7_mitm.mode, RuntimeMode::Unavailable);
+        assert!(
+            l7_mitm
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("missing-ca")),
+            "{l7_mitm:?}"
+        );
+    }
+
+    #[test]
+    fn mitm_strategy_without_external_backend_reports_l7_mitm_unavailable() {
+        let mut config = AgentConfig::default();
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+
+        let capabilities = capability_matrix_for_config(&config);
+        let l7_mitm = capabilities
+            .reported_state(CapabilityKind::L7Mitm)
+            .expect("L7 MITM capability should be reported");
+
+        assert_eq!(l7_mitm.mode, RuntimeMode::Unavailable);
+        assert!(
+            l7_mitm
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("backend = \"external\""))
+        );
+    }
+
     fn test_platform_probes() -> PlatformProbeResults {
         PlatformProbeResults {
             procfs_socket: Vec::new(),
@@ -220,10 +313,30 @@ mod tests {
                 PlatformProbeResults::default_transparent_process_classifier(),
             transparent_flow_classifier: PlatformProbeResults::default_transparent_flow_classifier(
             ),
+            l7_mitm: CapabilityState::unavailable(CapabilityKind::L7Mitm, "not configured"),
             libssl_uprobe: CapabilityState::unavailable(
                 CapabilityKind::LibsslUprobe,
                 "not configured",
             ),
         }
+    }
+
+    fn configure_external_mitm_backend(config: &mut AgentConfig) {
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::External;
+        config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
+        config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+        config.tls.materials = vec![
+            TlsMaterialConfig {
+                id: Some("mitm-ca".to_string()),
+                kind: TlsMaterialKind::MitmCaCertificate,
+                path: "/etc/sssa/mitm-ca.pem".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("mitm-ca-key".to_string()),
+                kind: TlsMaterialKind::MitmCaPrivateKey,
+                path: "/etc/sssa/mitm-ca.key".into(),
+            },
+        ];
     }
 }
