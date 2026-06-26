@@ -31,7 +31,7 @@ use super::{
 const INTERFACE: &str = "any";
 const POLICY_ID: &str = "tls-plaintext-e2e-policy";
 const POLICY_VERSION: &str = "e2e";
-const REQUESTS: usize = 1;
+const REQUESTS: usize = 2;
 const REQUEST_BODY_BYTES: usize = 48;
 const POST_WRITE_DELAY_MS: u64 = 500;
 const FIXTURE_EXE_GLOB: &str = "**/sssa-e2e-dynssl-fixture";
@@ -56,9 +56,7 @@ pub(crate) fn run() -> ExitCode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DynamicLibraryPaths {
     process_ready: PathBuf,
-    load_start: PathBuf,
-    library_ready: PathBuf,
-    exchange_start: PathBuf,
+    phases: [DynSslPhasePaths; 2],
     agent_ready_socket: PathBuf,
     admin_socket: PathBuf,
     policy: PathBuf,
@@ -66,16 +64,34 @@ struct DynamicLibraryPaths {
     spool: PathBuf,
     tls_server_cert: PathBuf,
     tls_server_key: PathBuf,
-    copied_libssl: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DynSslPhasePaths {
+    libssl: PathBuf,
+    load_start: PathBuf,
+    library_ready: PathBuf,
+    exchange_start: PathBuf,
 }
 
 impl DynamicLibraryPaths {
     fn new(root: &Path) -> Self {
         Self {
             process_ready: root.join("dynssl-process.ready"),
-            load_start: root.join("dynssl-load.start"),
-            library_ready: root.join("dynssl-library.ready"),
-            exchange_start: root.join("dynssl-exchange.start"),
+            phases: [
+                DynSslPhasePaths {
+                    libssl: root.join("libssl-sssa-e2e.so.3"),
+                    load_start: root.join("dynssl-load.start"),
+                    library_ready: root.join("dynssl-library.ready"),
+                    exchange_start: root.join("dynssl-exchange.start"),
+                },
+                DynSslPhasePaths {
+                    libssl: root.join("libssl-sssa-e2e-replacement.so.3"),
+                    load_start: root.join("dynssl-replacement-load.start"),
+                    library_ready: root.join("dynssl-replacement-library.ready"),
+                    exchange_start: root.join("dynssl-replacement-exchange.start"),
+                },
+            ],
             agent_ready_socket: root.join("agent.ready.sock"),
             admin_socket: root.join("admin.sock"),
             policy: root.join("tls-plaintext-e2e-policy.bundle"),
@@ -83,7 +99,6 @@ impl DynamicLibraryPaths {
             spool: root.join("spool"),
             tls_server_cert: root.join("server.crt"),
             tls_server_key: root.join("server.key"),
-            copied_libssl: root.join("libssl-sssa-e2e.so.3"),
         }
     }
 }
@@ -123,7 +138,9 @@ fn run_at(root: &Path, tls_object_path: &Path) -> Result<(), Box<dyn std::error:
     write_policy_bundle(&paths.policy)?;
     write_agent_config(&paths, tls_object_path, listen_port)?;
     write_server_certificate(&paths.tls_server_cert, &paths.tls_server_key)?;
-    copy_libssl_for_mapping(&paths.copied_libssl)?;
+    for phase in &paths.phases {
+        copy_libssl_for_mapping(&phase.libssl)?;
+    }
 
     let supervisor = ChildSupervisor::new()?;
     let mut server = supervisor.watch(
@@ -148,8 +165,10 @@ fn run_at(root: &Path, tls_object_path: &Path) -> Result<(), Box<dyn std::error:
         0,
     )?;
 
-    start_dynssl_phase(&paths.load_start, &process_ready.start_nonce)?;
-    let library_ready = wait_for_dynssl_ready(fixture.child_mut(), &paths.library_ready)?;
+    let primary_phase = &paths.phases[0];
+    let replacement_phase = &paths.phases[1];
+    start_dynssl_phase(&primary_phase.load_start, &process_ready.start_nonce)?;
+    let library_ready = wait_for_dynssl_ready(fixture.child_mut(), &primary_phase.library_ready)?;
     if library_ready.pid != process_ready.pid {
         return Err(e2e_error(format!(
             "dynamic libssl fixture changed pid from {} to {}",
@@ -160,10 +179,10 @@ fn run_at(root: &Path, tls_object_path: &Path) -> Result<(), Box<dyn std::error:
     let mapped_path = library_ready.libssl_path.as_ref().ok_or_else(|| {
         e2e_error(format!(
             "dynamic libssl ready file {} did not contain libssl_path",
-            paths.library_ready.display()
+            primary_phase.library_ready.display()
         ))
     })?;
-    wait_for_tls_plaintext_active_target_path_after_sequence(
+    let primary_active_status = wait_for_tls_plaintext_active_target_path_after_sequence(
         agent.child_mut(),
         &paths.admin_socket,
         process_ready.pid,
@@ -171,7 +190,63 @@ fn run_at(root: &Path, tls_object_path: &Path) -> Result<(), Box<dyn std::error:
         empty_status.sequence,
     )?;
 
-    start_dynssl_phase(&paths.exchange_start, &library_ready.start_nonce)?;
+    start_dynssl_phase(&primary_phase.exchange_start, &library_ready.start_nonce)?;
+    wait_for_agent_policy_progress(agent.child_mut(), &paths.admin_socket, 1)?;
+
+    start_dynssl_phase(&replacement_phase.load_start, &library_ready.start_nonce)?;
+    let replacement_ready =
+        wait_for_dynssl_ready(fixture.child_mut(), &replacement_phase.library_ready)?;
+    if replacement_ready.pid != process_ready.pid {
+        return Err(e2e_error(format!(
+            "dynamic libssl fixture changed pid from {} to {} during replacement",
+            process_ready.pid, replacement_ready.pid
+        ))
+        .into());
+    }
+    let replacement_mapped_path = replacement_ready.libssl_path.as_ref().ok_or_else(|| {
+        e2e_error(format!(
+            "dynamic libssl replacement ready file {} did not contain libssl_path",
+            replacement_phase.library_ready.display()
+        ))
+    })?;
+    if replacement_mapped_path == mapped_path {
+        return Err(e2e_error(format!(
+            "dynamic libssl replacement reused mapped path {}",
+            replacement_mapped_path.display()
+        ))
+        .into());
+    }
+    let replacement_active_status = wait_for_tls_plaintext_active_target_path_after_sequence(
+        agent.child_mut(),
+        &paths.admin_socket,
+        process_ready.pid,
+        replacement_mapped_path,
+        primary_active_status.sequence,
+    )?;
+    let primary_mapping_visible = proc_maps_contains_path(process_ready.pid, mapped_path)?;
+    if primary_mapping_visible
+        && !replacement_active_status.has_active_target_path(process_ready.pid, mapped_path)
+    {
+        return Err(e2e_error(format!(
+            "dynamic libssl primary mapping {} remained visible after replacement, but admin status did not retain it as an active target",
+            mapped_path.display()
+        ))
+        .into());
+    }
+    if !primary_mapping_visible
+        && replacement_active_status.has_active_target_path(process_ready.pid, mapped_path)
+    {
+        return Err(e2e_error(format!(
+            "dynamic libssl primary mapping {} disappeared after replacement, but admin status still retained it as an active target",
+            mapped_path.display()
+        ))
+        .into());
+    }
+
+    start_dynssl_phase(
+        &replacement_phase.exchange_start,
+        &replacement_ready.start_nonce,
+    )?;
     let fixture_result = wait_for_child_exit(
         fixture.child_mut(),
         DYNSSL_FIXTURE_TIMEOUT,
@@ -211,19 +286,15 @@ fn spawn_dynssl_fixture(
     request_body_bytes: usize,
 ) -> Result<Child, Box<dyn std::error::Error>> {
     let mut command = Command::new(debug_binary("sssa-e2e-dynssl-fixture")?);
-    let child = run_in_own_process_group(&mut command)
+    let command = run_in_own_process_group(&mut command)
         .arg("--server-addr")
         .arg(server_addr.to_string())
-        .arg("--libssl")
-        .arg(&paths.copied_libssl)
         .arg("--process-ready-file")
-        .arg(&paths.process_ready)
-        .arg("--load-start-file")
-        .arg(&paths.load_start)
-        .arg("--library-ready-file")
-        .arg(&paths.library_ready)
-        .arg("--exchange-start-file")
-        .arg(&paths.exchange_start)
+        .arg(&paths.process_ready);
+    for phase in &paths.phases {
+        append_dynssl_phase_args(command, phase);
+    }
+    let child = command
         .arg("--request-index")
         .arg("0")
         .arg("--request-body-bytes")
@@ -235,6 +306,18 @@ fn spawn_dynssl_fixture(
         .stderr(Stdio::inherit())
         .spawn()?;
     Ok(child)
+}
+
+fn append_dynssl_phase_args(command: &mut Command, phase: &DynSslPhasePaths) {
+    command
+        .arg("--phase-libssl")
+        .arg(&phase.libssl)
+        .arg("--phase-load-start-file")
+        .arg(&phase.load_start)
+        .arg("--phase-library-ready-file")
+        .arg(&phase.library_ready)
+        .arg("--phase-exchange-start-file")
+        .arg(&phase.exchange_start);
 }
 
 fn spawn_openssl_server(
@@ -381,6 +464,19 @@ fn parse_dynssl_ready(path: &Path) -> Result<DynSslReady, Box<dyn std::error::Er
         start_nonce,
         libssl_path: ready_value(&content, "libssl_path").map(PathBuf::from),
     })
+}
+
+fn proc_maps_contains_path(pid: u32, mapped_path: &Path) -> Result<bool, std::io::Error> {
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps"))?;
+    let mapped_path = mapped_path.to_string_lossy();
+    Ok(maps
+        .lines()
+        .filter_map(proc_maps_pathname)
+        .any(|pathname| pathname == mapped_path.as_ref()))
+}
+
+fn proc_maps_pathname(line: &str) -> Option<&str> {
+    line.split_whitespace().nth(5)
 }
 
 fn start_dynssl_phase(start_path: &Path, start_nonce: &str) -> Result<(), std::io::Error> {

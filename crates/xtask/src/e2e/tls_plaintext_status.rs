@@ -281,7 +281,7 @@ impl TlsPlaintextAttachStatus {
             .any(|target| target.pid == fixture_pid)
     }
 
-    fn has_active_target_path(&self, fixture_pid: u32, mapped_path: &Path) -> bool {
+    pub(super) fn has_active_target_path(&self, fixture_pid: u32, mapped_path: &Path) -> bool {
         self.active_targets
             .iter()
             .any(|target| target.pid == fixture_pid && target.mapped_path == mapped_path)
