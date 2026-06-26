@@ -31,6 +31,7 @@ struct PipelineRuntimeMetricsInner {
     enforcement_selector_miss: AtomicCounter,
     enforcement_unsupported: AtomicCounter,
     enforcement_failed: AtomicCounter,
+    enforcement_delegated: AtomicCounter,
     enforcement_applied: AtomicCounter,
 }
 
@@ -70,6 +71,7 @@ pub struct EnforcementRuntimeMetricsSnapshot {
     pub selector_miss: u64,
     pub unsupported: u64,
     pub failed: u64,
+    pub delegated: u64,
     pub applied: u64,
 }
 
@@ -104,6 +106,7 @@ impl PipelineRuntimeMetrics {
         let selector_miss = self.inner.enforcement_selector_miss.load();
         let unsupported = self.inner.enforcement_unsupported.load();
         let failed = self.inner.enforcement_failed.load();
+        let delegated = self.inner.enforcement_delegated.load();
         let applied = self.inner.enforcement_applied.load();
         EnforcementRuntimeMetricsSnapshot {
             decisions: [
@@ -113,6 +116,7 @@ impl PipelineRuntimeMetrics {
                 selector_miss,
                 unsupported,
                 failed,
+                delegated,
                 applied,
             ]
             .into_iter()
@@ -123,6 +127,7 @@ impl PipelineRuntimeMetrics {
             selector_miss,
             unsupported,
             failed,
+            delegated,
             applied,
         }
     }
@@ -180,6 +185,7 @@ impl PipelineRuntimeMetrics {
             EnforcementOutcome::SelectorMiss => self.inner.enforcement_selector_miss.increment(),
             EnforcementOutcome::Unsupported => self.inner.enforcement_unsupported.increment(),
             EnforcementOutcome::Failed => self.inner.enforcement_failed.increment(),
+            EnforcementOutcome::Delegated => self.inner.enforcement_delegated.increment(),
             EnforcementOutcome::Applied => self.inner.enforcement_applied.increment(),
         }
     }
@@ -220,6 +226,7 @@ mod tests {
         metrics.record_enforcement_decision(EnforcementOutcome::SelectorMiss);
         metrics.record_enforcement_decision(EnforcementOutcome::Unsupported);
         metrics.record_enforcement_decision(EnforcementOutcome::Failed);
+        metrics.record_enforcement_decision(EnforcementOutcome::Delegated);
         metrics.record_enforcement_decision(EnforcementOutcome::Applied);
 
         let enforcement = metrics.snapshot().enforcement;
@@ -232,9 +239,10 @@ mod tests {
                 + enforcement.selector_miss
                 + enforcement.unsupported
                 + enforcement.failed
+                + enforcement.delegated
                 + enforcement.applied
         );
-        assert_eq!(enforcement.decisions, 7);
+        assert_eq!(enforcement.decisions, 8);
     }
 
     #[test]

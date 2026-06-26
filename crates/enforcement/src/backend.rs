@@ -69,3 +69,75 @@ where
         self.as_mut().apply(request)
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxySideEnforcementHookDecision {
+    result: ProxySideEnforcementHookResult,
+    reason: String,
+}
+
+impl ProxySideEnforcementHookDecision {
+    pub fn delegated(reason: impl Into<String>) -> Self {
+        Self {
+            result: ProxySideEnforcementHookResult::Delegated,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn unsupported(reason: impl Into<String>) -> Self {
+        Self {
+            result: ProxySideEnforcementHookResult::Unsupported,
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn into_enforcement_parts(
+        self,
+        requested_action: Action,
+        surface: &str,
+    ) -> (EnforcementOutcome, Action, String) {
+        match self.result {
+            ProxySideEnforcementHookResult::Delegated => (
+                EnforcementOutcome::Delegated,
+                requested_action,
+                format!(
+                    "{surface} accepted delegated enforcement action: {}",
+                    self.reason
+                ),
+            ),
+            ProxySideEnforcementHookResult::Unsupported => (
+                EnforcementOutcome::Unsupported,
+                Action::Observe,
+                format!(
+                    "{surface} cannot delegate enforcement action: {}",
+                    self.reason
+                ),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxySideEnforcementHookResult {
+    Delegated,
+    Unsupported,
+}
+
+pub trait ProxySideEnforcementHook: Send {
+    fn delegate(
+        &mut self,
+        request: EnforcementBackendRequest<'_>,
+    ) -> Result<ProxySideEnforcementHookDecision, EnforcementError>;
+}
+
+impl<T> ProxySideEnforcementHook for Box<T>
+where
+    T: ProxySideEnforcementHook + ?Sized,
+{
+    fn delegate(
+        &mut self,
+        request: EnforcementBackendRequest<'_>,
+    ) -> Result<ProxySideEnforcementHookDecision, EnforcementError> {
+        self.as_mut().delegate(request)
+    }
+}

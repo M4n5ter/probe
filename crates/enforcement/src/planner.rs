@@ -5,7 +5,7 @@ use probe_core::{
 };
 use thiserror::Error;
 
-use crate::{EnforcementBackend, EnforcementBackendRequest, TargetScope};
+use crate::{EnforcementBackend, EnforcementBackendRequest, ProxySideEnforcementHook, TargetScope};
 
 #[derive(Debug, Error)]
 pub enum EnforcementError {
@@ -145,6 +145,20 @@ impl ScopedEnforcementPlanner {
         })
     }
 
+    pub fn with_proxy_side_policy_hook(
+        policy: PlannerPolicy,
+        surface: ProxySideEnforcementSurface,
+        hook: impl ProxySideEnforcementHook + 'static,
+    ) -> Result<Self, EnforcementError> {
+        Ok(Self {
+            execution: EnforcementExecution::ProxySideHook {
+                surface,
+                hook: Box::new(hook),
+            },
+            policy,
+        })
+    }
+
     pub fn mode(&self) -> EnforcementMode {
         self.execution.mode()
     }
@@ -228,6 +242,19 @@ impl ScopedEnforcementPlanner {
         request: EnforcementPlanRequest<'_>,
     ) -> (EnforcementOutcome, Action, String) {
         let verdict = request.verdict;
+        if self.execution.requires_complete_enforcement_evidence()
+            && let Some(reason) = destructive_enforcement_evidence_rejection_reason(request.trigger)
+        {
+            return (
+                EnforcementOutcome::Unsupported,
+                Action::Observe,
+                format!(
+                    "policy requested {:?}, but trigger evidence cannot safely drive destructive enforcement: {reason}: {}",
+                    verdict.action, verdict.reason
+                ),
+            );
+        }
+
         match &mut self.execution {
             EnforcementExecution::Disabled => (
                 EnforcementOutcome::Disabled,
@@ -254,18 +281,6 @@ impl ScopedEnforcementPlanner {
                 ),
             ),
             EnforcementExecution::Enforce(backend) => {
-                if let Some(reason) =
-                    destructive_enforcement_evidence_rejection_reason(request.trigger)
-                {
-                    return (
-                        EnforcementOutcome::Unsupported,
-                        Action::Observe,
-                        format!(
-                            "policy requested {:?}, but trigger evidence cannot safely drive destructive enforcement: {reason}: {}",
-                            verdict.action, verdict.reason
-                        ),
-                    );
-                }
                 match backend.apply(EnforcementBackendRequest {
                     verdict,
                     trigger: request.trigger,
@@ -284,6 +299,17 @@ impl ScopedEnforcementPlanner {
                     verdict.reason
                 ),
             ),
+            EnforcementExecution::ProxySideHook { surface, hook } => {
+                match hook.delegate(EnforcementBackendRequest {
+                    verdict,
+                    trigger: request.trigger,
+                }) {
+                    Ok(decision) => {
+                        decision.into_enforcement_parts(verdict.action, surface.description())
+                    }
+                    Err(error) => failed_decision_parts(verdict, &error),
+                }
+            }
         }
     }
 }
@@ -294,6 +320,10 @@ enum EnforcementExecution {
     DryRun,
     Enforce(Box<dyn EnforcementBackend>),
     SetupTimeOnly(SetupTimeEnforcementSurface),
+    ProxySideHook {
+        surface: ProxySideEnforcementSurface,
+        hook: Box<dyn ProxySideEnforcementHook>,
+    },
 }
 
 impl EnforcementExecution {
@@ -311,8 +341,14 @@ impl EnforcementExecution {
             Self::Disabled => EnforcementMode::Disabled,
             Self::AuditOnly => EnforcementMode::AuditOnly,
             Self::DryRun => EnforcementMode::DryRun,
-            Self::Enforce(_) | Self::SetupTimeOnly(_) => EnforcementMode::Enforce,
+            Self::Enforce(_) | Self::SetupTimeOnly(_) | Self::ProxySideHook { .. } => {
+                EnforcementMode::Enforce
+            }
         }
+    }
+
+    fn requires_complete_enforcement_evidence(&self) -> bool {
+        matches!(self, Self::Enforce(_) | Self::ProxySideHook { .. })
     }
 }
 
@@ -325,6 +361,19 @@ impl SetupTimeEnforcementSurface {
     fn description(self) -> &'static str {
         match self {
             Self::TransparentInterception => "transparent interception",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProxySideEnforcementSurface {
+    L7Mitm,
+}
+
+impl ProxySideEnforcementSurface {
+    fn description(self) -> &'static str {
+        match self {
+            Self::L7Mitm => "L7 MITM proxy-side policy hook",
         }
     }
 }
@@ -366,7 +415,7 @@ mod tests {
         VerdictScope,
     };
 
-    use crate::EnforcementBackendDecision;
+    use crate::{EnforcementBackendDecision, ProxySideEnforcementHookDecision};
 
     use super::*;
 
@@ -723,6 +772,148 @@ mod tests {
     }
 
     #[test]
+    fn proxy_side_hook_delegates_allowed_actions_to_l7_mitm_surface()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = PlannerPolicy::compile(None, ProtectiveActionProfile::new([Action::Deny])?)?;
+        let mut planner = ScopedEnforcementPlanner::with_proxy_side_policy_hook(
+            policy,
+            ProxySideEnforcementSurface::L7Mitm,
+            DelegatingProxyHook,
+        )?;
+        let trigger = request_event(Direction::Outbound);
+        let verdict = Verdict {
+            action: Action::Deny,
+            scope: VerdictScope::Flow,
+            reason: "block inside MITM policy hook".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+
+        let decision = planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("protective verdict should be delegated to the proxy surface");
+
+        assert_eq!(decision.mode, EnforcementMode::Enforce);
+        assert_eq!(decision.outcome, EnforcementOutcome::Delegated);
+        assert_eq!(decision.requested_action, Action::Deny);
+        assert_eq!(decision.effective_action, Action::Deny);
+        assert!(decision.selector_matched);
+        assert!(decision.reason.contains("accepted delegated enforcement"));
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_side_hook_still_obeys_scope_and_action_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = PlannerPolicy::compile(
+            Some(&remote_port_selector(443)),
+            ProtectiveActionProfile::new([Action::Deny])?,
+        )?;
+        let mut planner = ScopedEnforcementPlanner::with_proxy_side_policy_hook(
+            policy,
+            ProxySideEnforcementSurface::L7Mitm,
+            DelegatingProxyHook,
+        )?;
+
+        let out_of_scope = evaluate_plan(&mut planner, Action::Deny, 80)?;
+        assert_eq!(out_of_scope.outcome, EnforcementOutcome::SelectorMiss);
+        assert_eq!(out_of_scope.effective_action, Action::Observe);
+        assert!(!out_of_scope.selector_matched);
+
+        let unsupported_action = evaluate_plan(&mut planner, Action::Reset, 443)?;
+        assert_eq!(unsupported_action.outcome, EnforcementOutcome::Unsupported);
+        assert_eq!(unsupported_action.effective_action, Action::Observe);
+        assert!(unsupported_action.selector_matched);
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_side_hook_rejects_observation_only_evidence_before_hook()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hook = CountingProxyHook::default();
+        let policy = PlannerPolicy::compile(None, ProtectiveActionProfile::new([Action::Deny])?)?;
+        let mut planner = ScopedEnforcementPlanner::with_proxy_side_policy_hook(
+            policy,
+            ProxySideEnforcementSurface::L7Mitm,
+            hook.clone(),
+        )?;
+        let trigger = request_event(Direction::Outbound)
+            .with_degraded(true)
+            .with_enforcement_evidence(EnforcementEvidence::observation_only_with_detail(
+                ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
+                "test eBPF syscall payload snapshot",
+            ));
+        let verdict = Verdict {
+            action: Action::Deny,
+            scope: VerdictScope::Flow,
+            reason: "block inside MITM policy hook".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+
+        let decision = planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("protective verdict should produce unsupported audit");
+
+        assert_eq!(decision.outcome, EnforcementOutcome::Unsupported);
+        assert_eq!(decision.effective_action, Action::Observe);
+        assert!(
+            decision
+                .reason
+                .contains("cannot prove complete socket payload")
+        );
+        assert_eq!(hook.calls(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_side_hook_can_decline_delegation_without_failing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = PlannerPolicy::compile(None, ProtectiveActionProfile::new([Action::Deny])?)?;
+        let mut planner = ScopedEnforcementPlanner::with_proxy_side_policy_hook(
+            policy,
+            ProxySideEnforcementSurface::L7Mitm,
+            UnsupportedProxyHook,
+        )?;
+        let trigger = request_event(Direction::Outbound);
+        let verdict = Verdict {
+            action: Action::Deny,
+            scope: VerdictScope::Flow,
+            reason: "block inside MITM policy hook".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+
+        let decision = planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("protective verdict should produce unsupported audit");
+
+        assert_eq!(decision.outcome, EnforcementOutcome::Unsupported);
+        assert_eq!(decision.effective_action, Action::Observe);
+        assert!(decision.selector_matched);
+        assert!(
+            decision
+                .reason
+                .contains("cannot delegate enforcement action")
+        );
+        assert!(
+            decision
+                .reason
+                .contains("hook has no matching in-flight request")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn enforce_mode_records_backend_error_as_failed_decision()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut planner = ScopedEnforcementPlanner::with_backend(
@@ -859,6 +1050,56 @@ mod tests {
         ) -> Result<EnforcementBackendDecision, EnforcementError> {
             Err(EnforcementError::Backend(
                 "planned backend failure".to_string(),
+            ))
+        }
+    }
+
+    struct DelegatingProxyHook;
+
+    impl ProxySideEnforcementHook for DelegatingProxyHook {
+        fn delegate(
+            &mut self,
+            request: EnforcementBackendRequest<'_>,
+        ) -> Result<ProxySideEnforcementHookDecision, EnforcementError> {
+            Ok(ProxySideEnforcementHookDecision::delegated(format!(
+                "hook accepted {:?}",
+                request.verdict.action
+            )))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingProxyHook {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl CountingProxyHook {
+        fn calls(&self) -> usize {
+            *self.calls.lock().expect("fake proxy hook state poisoned")
+        }
+    }
+
+    impl ProxySideEnforcementHook for CountingProxyHook {
+        fn delegate(
+            &mut self,
+            _request: EnforcementBackendRequest<'_>,
+        ) -> Result<ProxySideEnforcementHookDecision, EnforcementError> {
+            *self.calls.lock().expect("fake proxy hook state poisoned") += 1;
+            Ok(ProxySideEnforcementHookDecision::delegated(
+                "hook accepted request",
+            ))
+        }
+    }
+
+    struct UnsupportedProxyHook;
+
+    impl ProxySideEnforcementHook for UnsupportedProxyHook {
+        fn delegate(
+            &mut self,
+            _request: EnforcementBackendRequest<'_>,
+        ) -> Result<ProxySideEnforcementHookDecision, EnforcementError> {
+            Ok(ProxySideEnforcementHookDecision::unsupported(
+                "hook has no matching in-flight request",
             ))
         }
     }

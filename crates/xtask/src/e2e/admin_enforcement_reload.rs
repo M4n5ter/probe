@@ -439,6 +439,7 @@ fn outcome_name(outcome: EnforcementOutcome) -> &'static str {
         EnforcementOutcome::SelectorMiss => "selector_miss",
         EnforcementOutcome::Unsupported => "unsupported",
         EnforcementOutcome::Failed => "failed",
+        EnforcementOutcome::Delegated => "delegated",
         EnforcementOutcome::Applied => "applied",
     }
 }

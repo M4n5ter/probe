@@ -115,6 +115,7 @@ pub enum EnforcementOutcome {
     SelectorMiss,
     Unsupported,
     Failed,
+    Delegated,
     Applied,
 }
 

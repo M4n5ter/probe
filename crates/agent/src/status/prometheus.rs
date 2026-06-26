@@ -595,6 +595,12 @@ fn write_pipeline(output: &mut String, snapshot: &AgentStatusSnapshot) {
     write_sample(
         output,
         "traffic_probe_pipeline_enforcement_decisions_total",
+        &[("outcome", "delegated")],
+        metrics.enforcement.delegated,
+    );
+    write_sample(
+        output,
+        "traffic_probe_pipeline_enforcement_decisions_total",
         &[("outcome", "applied")],
         metrics.enforcement.applied,
     );
@@ -861,6 +867,61 @@ mod tests {
 
         assert!(metrics.contains("traffic_probe_pipeline_capture_loss_events_total 2\n"));
         assert!(metrics.contains("traffic_probe_pipeline_capture_lost_events_total 17\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn render_prometheus_metrics_includes_enforcement_outcome_counters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
+            Vec::new(),
+        )?;
+        let snapshot = build_status_snapshot_with_runtime(
+            &plan,
+            SpoolStatusInput::available(
+                PathBuf::from("/tmp/traffic-probe-spool"),
+                SpoolSnapshot {
+                    last_ingress_sequence: 0,
+                    last_export_sequence: 0,
+                },
+                BTreeMap::from([("primary".to_string(), 0)]),
+            ),
+            RuntimeStatusInput {
+                pipeline: Some(PipelineRuntimeMetricsSnapshot {
+                    enforcement: EnforcementRuntimeMetricsSnapshot {
+                        decisions: 8,
+                        disabled: 1,
+                        audit_only: 1,
+                        dry_run: 1,
+                        selector_miss: 1,
+                        unsupported: 1,
+                        failed: 1,
+                        delegated: 1,
+                        applied: 1,
+                    },
+                    ..PipelineRuntimeMetricsSnapshot::default()
+                }),
+                ..RuntimeStatusInput::default()
+            },
+        );
+
+        let metrics = render_prometheus_metrics(&snapshot);
+
+        for outcome in [
+            "disabled",
+            "audit_only",
+            "dry_run",
+            "selector_miss",
+            "unsupported",
+            "failed",
+            "delegated",
+            "applied",
+        ] {
+            assert!(metrics.contains(&format!(
+                "traffic_probe_pipeline_enforcement_decisions_total{{outcome=\"{outcome}\"}} 1\n"
+            )));
+        }
         Ok(())
     }
 }

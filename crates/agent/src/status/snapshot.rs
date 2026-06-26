@@ -417,6 +417,7 @@ mod tests {
                     selector_miss: 0,
                     unsupported: 0,
                     failed: 0,
+                    delegated: 0,
                     applied: 0,
                 },
             }),
