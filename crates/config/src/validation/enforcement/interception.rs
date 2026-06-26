@@ -49,6 +49,7 @@ fn validate_mitm_config(
 
     validate_mitm_backend_intent(interception, violations);
     validate_mitm_plaintext_bridge_intent(interception, violations);
+    validate_mitm_policy_hook_intent(interception, violations);
     validate_mitm_material_shape(mitm, violations);
     validate_mitm_material_refs(mitm, tls, violations);
 }
@@ -67,6 +68,15 @@ fn validate_mitm_plaintext_bridge_intent(
     violations: &mut Vec<ConfigViolation>,
 ) {
     if let Err(intent_violations) = interception.mitm_plaintext_bridge_intent() {
+        extend_intent_violations(violations, intent_violations);
+    }
+}
+
+fn validate_mitm_policy_hook_intent(
+    interception: &EnforcementInterceptionConfig,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if let Err(intent_violations) = interception.mitm_policy_hook_intent() {
         extend_intent_violations(violations, intent_violations);
     }
 }
@@ -203,9 +213,10 @@ mod tests {
         MIN_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS, TlsMaterialConfig, TlsMaterialKind,
         TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig, TransparentInterceptionMitmConfig,
-        TransparentInterceptionProxyConfig, TransparentInterceptionProxyHealthProbeConfig,
-        TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
-        TransparentInterceptionStrategyConfig,
+        TransparentInterceptionMitmPolicyHookConfig,
+        TransparentInterceptionMitmPolicyHookModeConfig, TransparentInterceptionProxyConfig,
+        TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionProxyModeConfig,
+        TransparentInterceptionProxySelfBypassConfig, TransparentInterceptionStrategyConfig,
     };
 
     use super::*;
@@ -541,6 +552,76 @@ mod tests {
         assert!(violations.iter().any(|violation| violation.field
             == "enforcement.interception.mitm.backend.readiness_probe.timeout_ms"
             && violation.reason.contains("must not exceed interval")));
+    }
+
+    #[test]
+    fn mitm_policy_hook_requires_loopback_http_endpoint() {
+        let mut violations = Vec::new();
+        let interception = EnforcementInterceptionConfig {
+            strategy: TransparentInterceptionStrategyConfig::InboundTproxyMitm,
+            proxy: TransparentInterceptionProxyConfig {
+                listen_port: Some(15002),
+                ..TransparentInterceptionProxyConfig::default()
+            },
+            mitm: TransparentInterceptionMitmConfig {
+                backend: TransparentInterceptionMitmBackendConfig::external(
+                    TransparentInterceptionMitmBackendReadinessProbeConfig {
+                        target: Some("127.0.0.1:15002".to_string()),
+                        ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+                    },
+                ),
+                policy_hook: TransparentInterceptionMitmPolicyHookConfig {
+                    mode: TransparentInterceptionMitmPolicyHookModeConfig::HttpJson,
+                    endpoint: Some("https://192.0.2.10:15002/enforce".to_string()),
+                    ..TransparentInterceptionMitmPolicyHookConfig::default()
+                },
+                ca_certificate_ref: Some("mitm-ca".to_string()),
+                ca_private_key_ref: Some("mitm-ca-key".to_string()),
+                ..TransparentInterceptionMitmConfig::default()
+            },
+            ..EnforcementInterceptionConfig::default()
+        };
+        validate(&interception, &tls_config_with_mitm_ca(), &mut violations);
+
+        assert!(violations.iter().any(|violation| violation.field
+            == "enforcement.interception.mitm.policy_hook.endpoint"
+            && violation.reason.contains("http scheme")));
+        assert!(violations.iter().any(|violation| violation.field
+            == "enforcement.interception.mitm.policy_hook.endpoint"
+            && violation.reason.contains("loopback IP")));
+    }
+
+    #[test]
+    fn disabled_mitm_policy_hook_rejects_endpoint_overrides() {
+        let mut violations = Vec::new();
+        let interception = EnforcementInterceptionConfig {
+            strategy: TransparentInterceptionStrategyConfig::InboundTproxyMitm,
+            proxy: TransparentInterceptionProxyConfig {
+                listen_port: Some(15002),
+                ..TransparentInterceptionProxyConfig::default()
+            },
+            mitm: TransparentInterceptionMitmConfig {
+                backend: TransparentInterceptionMitmBackendConfig::external(
+                    TransparentInterceptionMitmBackendReadinessProbeConfig {
+                        target: Some("127.0.0.1:15002".to_string()),
+                        ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+                    },
+                ),
+                policy_hook: TransparentInterceptionMitmPolicyHookConfig {
+                    endpoint: Some("http://127.0.0.1:15002/enforce".to_string()),
+                    ..TransparentInterceptionMitmPolicyHookConfig::default()
+                },
+                ca_certificate_ref: Some("mitm-ca".to_string()),
+                ca_private_key_ref: Some("mitm-ca-key".to_string()),
+                ..TransparentInterceptionMitmConfig::default()
+            },
+            ..EnforcementInterceptionConfig::default()
+        };
+        validate(&interception, &tls_config_with_mitm_ca(), &mut violations);
+
+        assert!(violations.iter().any(|violation| violation.field
+            == "enforcement.interception.mitm.policy_hook.endpoint"
+            && violation.reason.contains("policy_hook.mode")));
     }
 
     fn validate_interception(

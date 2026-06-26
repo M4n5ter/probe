@@ -1,13 +1,16 @@
 use enforcement::{
-    EnforcementBackend, EnforcementError, PlannerPolicy, ScopedEnforcementPlanner,
-    SetupTimeEnforcementSurface,
+    EnforcementBackend, EnforcementError, PlannerPolicy, ProxySideEnforcementSurface,
+    ScopedEnforcementPlanner, SetupTimeEnforcementSurface,
 };
 use interception::{
     TransparentInterceptionHostRuleSet, TransparentInterceptionSetupSelectorSources,
     TransparentInterceptionSetupSelectors,
 };
 use probe_core::{EnforcementMode, ProtectiveActionProfile, Selector};
-use runtime::{EnforcementExecutionSurface, EnforcementPolicySourcePlan, RuntimePlan};
+use runtime::{
+    EnforcementExecutionSurface, EnforcementPolicySourcePlan, RuntimePlan,
+    TransparentInterceptionExecutionPlan, TransparentInterceptionMitmPolicyHookPlan,
+};
 use thiserror::Error;
 
 use crate::transparent_interception::{
@@ -27,6 +30,8 @@ pub enum ConfiguredEnforcementError {
     Source(#[source] Box<EnforcementPolicySourceError>),
     #[error("{0}")]
     TransparentInterception(#[from] TransparentInterceptionError),
+    #[error("{0}")]
+    L7MitmPolicyHook(#[from] crate::l7_mitm::L7MitmPolicyHookError),
     #[error("enforcement execution backend is not available in this build/runtime")]
     ExecutionBackendUnavailable,
 }
@@ -119,12 +124,13 @@ pub async fn build_configured_enforcement_check_with_backend(
     policy_source_context: EnforcementPolicySourceLoadContext,
 ) -> Result<ConfiguredEnforcementCheck, ConfiguredEnforcementError> {
     let mut configured = build_configured_enforcement_from_parts(
-        plan.enforcement.mode,
-        plan.config.enforcement.selector.clone(),
-        plan.enforcement.config_selector_configured,
-        &plan.enforcement.policy_source,
-        &plan.enforcement.execution_surfaces,
-        backend,
+        ConfiguredEnforcementParts {
+            mode: plan.enforcement.mode,
+            config_selector: plan.config.enforcement.selector.clone(),
+            config_selector_configured: plan.enforcement.config_selector_configured,
+            policy_source_plan: &plan.enforcement.policy_source,
+            execution: ConfiguredEnforcementExecution::from_plan(plan, backend),
+        },
         policy_source_context,
     )
     .await?;
@@ -157,33 +163,33 @@ pub async fn build_configured_enforcement_check_with_backend(
     })
 }
 
-async fn build_configured_enforcement_from_parts(
+struct ConfiguredEnforcementParts<'a> {
     mode: EnforcementMode,
     config_selector: Option<Selector>,
     config_selector_configured: bool,
-    policy_source_plan: &EnforcementPolicySourcePlan,
-    execution_surfaces: &[EnforcementExecutionSurface],
-    backend: Option<Box<dyn EnforcementBackend>>,
+    policy_source_plan: &'a EnforcementPolicySourcePlan,
+    execution: ConfiguredEnforcementExecution<'a>,
+}
+
+async fn build_configured_enforcement_from_parts(
+    parts: ConfiguredEnforcementParts<'_>,
     policy_source_context: EnforcementPolicySourceLoadContext,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
-    validate_enforcement_execution(mode, execution_surfaces, backend.is_some())?;
+    parts.execution.validate(parts.mode)?;
 
     let policy_runtime = load_configured_enforcement_policy_runtime(
-        config_selector,
-        policy_source_plan,
+        parts.config_selector,
+        parts.policy_source_plan,
         policy_source_context,
     )
     .await?;
-    let planner = scoped_enforcement_planner(
-        mode,
-        policy_runtime.planner_policy().clone(),
-        execution_surfaces,
-        backend,
-    )?;
+    let planner = parts
+        .execution
+        .into_planner(parts.mode, policy_runtime.planner_policy().clone())?;
     Ok(ConfiguredEnforcement {
         planner,
-        mode,
-        config_selector_configured,
+        mode: parts.mode,
+        config_selector_configured: parts.config_selector_configured,
         active_policy: policy_runtime,
         transparent_interception_setup_scope: None,
     })
@@ -212,45 +218,89 @@ pub(crate) async fn load_configured_enforcement_policy_runtime(
         .map_err(ConfiguredEnforcementError::Planner)
 }
 
-fn scoped_enforcement_planner(
-    mode: EnforcementMode,
-    policy: PlannerPolicy,
-    execution_surfaces: &[EnforcementExecutionSurface],
-    backend: Option<Box<dyn EnforcementBackend>>,
-) -> Result<ScopedEnforcementPlanner, ConfiguredEnforcementError> {
-    if mode != EnforcementMode::Enforce {
-        return ScopedEnforcementPlanner::with_planner_policy(mode, policy)
-            .map_err(ConfiguredEnforcementError::Planner);
+fn mitm_policy_hook_connection_options_from_plan(
+    plan: &RuntimePlan,
+) -> crate::l7_mitm::L7MitmPolicyHookConnectionOptions {
+    match &plan.enforcement.interception.execution {
+        TransparentInterceptionExecutionPlan::OutboundTransparentProxy(outbound) => {
+            crate::l7_mitm::L7MitmPolicyHookConnectionOptions::default()
+                .with_socket_mark(outbound.outbound_redirect_artifact().proxy_bypass_mark)
+        }
+        TransparentInterceptionExecutionPlan::Disabled
+        | TransparentInterceptionExecutionPlan::InboundTproxy(_) => {
+            crate::l7_mitm::L7MitmPolicyHookConnectionOptions::default()
+        }
     }
-
-    if let Some(backend) = backend {
-        return ScopedEnforcementPlanner::with_backend_policy(policy, backend)
-            .map_err(ConfiguredEnforcementError::Planner);
-    }
-
-    if execution_surfaces == [EnforcementExecutionSurface::TransparentInterception] {
-        return ScopedEnforcementPlanner::with_setup_time_policy(
-            policy,
-            SetupTimeEnforcementSurface::TransparentInterception,
-        )
-        .map_err(ConfiguredEnforcementError::Planner);
-    }
-
-    Err(ConfiguredEnforcementError::ExecutionBackendUnavailable)
 }
 
-fn validate_enforcement_execution(
-    mode: EnforcementMode,
-    execution_surfaces: &[EnforcementExecutionSurface],
-    backend_present: bool,
-) -> Result<(), ConfiguredEnforcementError> {
-    if mode != EnforcementMode::Enforce || backend_present {
-        return Ok(());
+enum ConfiguredEnforcementExecution<'a> {
+    Unavailable,
+    ConnectionBackend(Box<dyn EnforcementBackend>),
+    TransparentInterceptionSetup,
+    L7MitmProxyHook {
+        policy_hook: &'a TransparentInterceptionMitmPolicyHookPlan,
+        connection: crate::l7_mitm::L7MitmPolicyHookConnectionOptions,
+    },
+}
+
+impl<'a> ConfiguredEnforcementExecution<'a> {
+    fn from_plan(plan: &'a RuntimePlan, backend: Option<Box<dyn EnforcementBackend>>) -> Self {
+        if let Some(backend) = backend {
+            return Self::ConnectionBackend(backend);
+        }
+        match plan.enforcement.execution_surface {
+            Some(EnforcementExecutionSurface::TransparentInterceptionSetup) => {
+                Self::TransparentInterceptionSetup
+            }
+            Some(EnforcementExecutionSurface::L7MitmProxyHook) => Self::L7MitmProxyHook {
+                policy_hook: &plan.enforcement.interception.mitm.policy_hook,
+                connection: mitm_policy_hook_connection_options_from_plan(plan),
+            },
+            Some(EnforcementExecutionSurface::Connection) | None => Self::Unavailable,
+        }
     }
-    if execution_surfaces == [EnforcementExecutionSurface::TransparentInterception] {
-        return Ok(());
+
+    fn validate(&self, mode: EnforcementMode) -> Result<(), ConfiguredEnforcementError> {
+        if mode != EnforcementMode::Enforce || !matches!(self, Self::Unavailable) {
+            return Ok(());
+        }
+        Err(ConfiguredEnforcementError::ExecutionBackendUnavailable)
     }
-    Err(ConfiguredEnforcementError::ExecutionBackendUnavailable)
+
+    fn into_planner(
+        self,
+        mode: EnforcementMode,
+        policy: PlannerPolicy,
+    ) -> Result<ScopedEnforcementPlanner, ConfiguredEnforcementError> {
+        if mode != EnforcementMode::Enforce {
+            return ScopedEnforcementPlanner::with_planner_policy(mode, policy)
+                .map_err(ConfiguredEnforcementError::Planner);
+        }
+        match self {
+            Self::ConnectionBackend(backend) => {
+                ScopedEnforcementPlanner::with_backend_policy(policy, backend)
+                    .map_err(ConfiguredEnforcementError::Planner)
+            }
+            Self::TransparentInterceptionSetup => ScopedEnforcementPlanner::with_setup_time_policy(
+                policy,
+                SetupTimeEnforcementSurface::TransparentInterception,
+            )
+            .map_err(ConfiguredEnforcementError::Planner),
+            Self::L7MitmProxyHook {
+                policy_hook,
+                connection,
+            } => {
+                let hook = crate::l7_mitm::policy_hook_from_plan(policy_hook, connection)?;
+                ScopedEnforcementPlanner::with_proxy_side_policy_hook(
+                    policy,
+                    ProxySideEnforcementSurface::L7Mitm,
+                    hook,
+                )
+                .map_err(ConfiguredEnforcementError::Planner)
+            }
+            Self::Unavailable => Err(ConfiguredEnforcementError::ExecutionBackendUnavailable),
+        }
+    }
 }
 
 fn effective_selector(
@@ -268,13 +318,24 @@ fn effective_selector(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::{SocketAddr, TcpListener, TcpStream},
+        thread::{self, JoinHandle},
+    };
+
     use enforcement::{
         EnforcementBackend, EnforcementBackendDecision, EnforcementBackendRequest,
         EnforcementPlanRequest, EnforcementPlanner,
     };
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicyManifest,
-        EnforcementPolicySourceConfig, TransparentInterceptionStrategyConfig,
+        EnforcementPolicySourceConfig, TlsMaterialConfig, TlsMaterialKind,
+        TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmBackendReadinessProbeConfig,
+        TransparentInterceptionMitmPolicyHookConfig,
+        TransparentInterceptionMitmPolicyHookModeConfig,
+        TransparentInterceptionProxySelfBypassConfig, TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
         Action, AddressPort, CapabilityKind, CapabilityState, CaptureOrigin, CaptureSource,
@@ -284,24 +345,28 @@ mod tests {
     };
     use runtime::{
         CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry,
-        TransparentInterceptionLocalSetupProjectionPlan,
+        TransparentInterceptionExecutionPlan, TransparentInterceptionLocalSetupProjectionPlan,
+        TransparentInterceptionMitmPolicyHookEndpointPlan,
+        TransparentInterceptionMitmPolicyHookPlan,
     };
 
     use super::*;
 
     #[tokio::test]
     async fn enforce_without_backend_fails_before_loading_policy_source() {
+        let policy_source_plan = EnforcementPolicySourcePlan::Remote {
+            endpoint: "http://127.0.0.1:9/enforcement".to_string(),
+            max_body_bytes: runtime::RemoteEnforcementPolicyBodyLimitBytes::from_config(None)
+                .expect("default remote enforcement policy body limit must be valid"),
+        };
         let error = match build_configured_enforcement_from_parts(
-            EnforcementMode::Enforce,
-            None,
-            false,
-            &EnforcementPolicySourcePlan::Remote {
-                endpoint: "http://127.0.0.1:9/enforcement".to_string(),
-                max_body_bytes: runtime::RemoteEnforcementPolicyBodyLimitBytes::from_config(None)
-                    .expect("default remote enforcement policy body limit must be valid"),
+            ConfiguredEnforcementParts {
+                mode: EnforcementMode::Enforce,
+                config_selector: None,
+                config_selector_configured: false,
+                policy_source_plan: &policy_source_plan,
+                execution: ConfiguredEnforcementExecution::Unavailable,
             },
-            &[EnforcementExecutionSurface::Connection],
-            None,
             EnforcementPolicySourceLoadContext::default(),
         )
         .await
@@ -319,12 +384,15 @@ mod tests {
     #[tokio::test]
     async fn enforce_uses_injected_backend() -> Result<(), Box<dyn std::error::Error>> {
         let mut configured = build_configured_enforcement_from_parts(
-            EnforcementMode::Enforce,
-            None,
-            false,
-            &EnforcementPolicySourcePlan::None,
-            &[EnforcementExecutionSurface::Connection],
-            Some(Box::new(ApplyingBackend)),
+            ConfiguredEnforcementParts {
+                mode: EnforcementMode::Enforce,
+                config_selector: None,
+                config_selector_configured: false,
+                policy_source_plan: &EnforcementPolicySourcePlan::None,
+                execution: ConfiguredEnforcementExecution::ConnectionBackend(Box::new(
+                    ApplyingBackend,
+                )),
+            },
             EnforcementPolicySourceLoadContext::default(),
         )
         .await?;
@@ -356,12 +424,13 @@ mod tests {
     async fn transparent_interception_enforce_records_per_flow_verdicts_as_setup_time_only()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut configured = build_configured_enforcement_from_parts(
-            EnforcementMode::Enforce,
-            None,
-            false,
-            &EnforcementPolicySourcePlan::None,
-            &[EnforcementExecutionSurface::TransparentInterception],
-            None,
+            ConfiguredEnforcementParts {
+                mode: EnforcementMode::Enforce,
+                config_selector: None,
+                config_selector_configured: false,
+                policy_source_plan: &EnforcementPolicySourcePlan::None,
+                execution: ConfiguredEnforcementExecution::TransparentInterceptionSetup,
+            },
             EnforcementPolicySourceLoadContext::default(),
         )
         .await?;
@@ -386,6 +455,145 @@ mod tests {
         assert_eq!(decision.outcome, EnforcementOutcome::Unsupported);
         assert_eq!(decision.effective_action, Action::Observe);
         assert!(decision.reason.contains("setup-time enforcement surface"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn l7_mitm_proxy_hook_execution_surface_delegates_to_configured_hook()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hook_server =
+            spawn_policy_hook(r#"{"outcome":"delegated","reason":"proxy hook accepted"}"#)?;
+        let mitm_policy_hook = TransparentInterceptionMitmPolicyHookPlan::HttpJson {
+            endpoint: policy_hook_endpoint_plan(&hook_server.endpoint, hook_server.address),
+            timeout_ms: 1_000,
+            max_response_bytes: 4_096,
+        };
+        let mut configured = build_configured_enforcement_from_parts(
+            ConfiguredEnforcementParts {
+                mode: EnforcementMode::Enforce,
+                config_selector: None,
+                config_selector_configured: false,
+                policy_source_plan: &EnforcementPolicySourcePlan::None,
+                execution: ConfiguredEnforcementExecution::L7MitmProxyHook {
+                    policy_hook: &mitm_policy_hook,
+                    connection: crate::l7_mitm::L7MitmPolicyHookConnectionOptions::default(),
+                },
+            },
+            EnforcementPolicySourceLoadContext::default(),
+        )
+        .await?;
+        let trigger = outbound_event();
+        let verdict = Verdict {
+            action: Action::Deny,
+            scope: VerdictScope::Flow,
+            reason: "managed policy".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+
+        let decision = configured
+            .planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("protective verdict must produce an enforcement decision");
+
+        assert_eq!(decision.outcome, EnforcementOutcome::Delegated);
+        assert_eq!(decision.effective_action, Action::Deny);
+        let body = hook_server
+            .server
+            .join()
+            .expect("server thread should not panic")
+            .map_err(std::io::Error::other)?;
+        assert!(body.contains("\"requested_action\":\"deny\""));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn l7_mitm_proxy_hook_composition_preserves_transparent_setup_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hook_server =
+            spawn_policy_hook(r#"{"outcome":"delegated","reason":"proxy hook accepted"}"#)?;
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        configure_external_mitm_policy_hook(&mut config, &hook_server.endpoint);
+        let plan = RuntimePlan::build(config, &transparent_interception_registry())?;
+        assert_eq!(
+            plan.enforcement.execution_surface,
+            Some(EnforcementExecutionSurface::L7MitmProxyHook)
+        );
+
+        let mut check = build_configured_enforcement_check_with_backend(
+            &plan,
+            None,
+            EnforcementPolicySourceLoadContext::default(),
+        )
+        .await?;
+
+        assert!(check.setup_error.is_none());
+        assert!(
+            check
+                .configured
+                .transparent_interception_setup_scope
+                .is_some()
+        );
+        let trigger = outbound_event();
+        let verdict = Verdict {
+            action: Action::Deny,
+            scope: VerdictScope::Flow,
+            reason: "managed policy".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+        let decision = check
+            .configured
+            .planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("protective verdict must produce an enforcement decision");
+
+        assert_eq!(decision.outcome, EnforcementOutcome::Delegated);
+        assert_eq!(decision.effective_action, Action::Deny);
+        hook_server
+            .server
+            .join()
+            .expect("server thread should not panic")
+            .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_mitm_policy_hook_connection_uses_proxy_bypass_mark()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = outbound_mitm_policy_hook_plan()?;
+        let TransparentInterceptionExecutionPlan::OutboundTransparentProxy(outbound) =
+            &plan.enforcement.interception.execution
+        else {
+            panic!("outbound MITM plan must use outbound transparent proxy execution");
+        };
+
+        let connection = mitm_policy_hook_connection_options_from_plan(&plan);
+
+        assert_eq!(
+            connection,
+            crate::l7_mitm::L7MitmPolicyHookConnectionOptions::default()
+                .with_socket_mark(outbound.outbound_redirect_artifact().proxy_bypass_mark)
+        );
         Ok(())
     }
 
@@ -558,6 +766,125 @@ mod tests {
         }
     }
 
+    struct SpawnedPolicyHook {
+        endpoint: String,
+        address: SocketAddr,
+        server: JoinHandle<Result<String, String>>,
+    }
+
+    fn spawn_policy_hook(response_body: &'static str) -> Result<SpawnedPolicyHook, std::io::Error> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let endpoint = format!("http://{address}/enforce");
+        let server = thread::spawn(move || -> Result<String, String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let request_body = read_request_body(&stream)?;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(request_body)
+        });
+        Ok(SpawnedPolicyHook {
+            endpoint,
+            address,
+            server,
+        })
+    }
+
+    fn policy_hook_endpoint_plan(
+        endpoint: &str,
+        address: SocketAddr,
+    ) -> TransparentInterceptionMitmPolicyHookEndpointPlan {
+        TransparentInterceptionMitmPolicyHookEndpointPlan {
+            endpoint: endpoint.to_string(),
+            address,
+            authority: address.to_string(),
+            path_and_query: "/enforce".to_string(),
+        }
+    }
+
+    fn outbound_mitm_policy_hook_plan() -> Result<RuntimePlan, runtime::RuntimeError> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        config.enforcement.interception.proxy.self_bypass =
+            TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        configure_external_mitm_policy_hook(&mut config, "http://127.0.0.1:16000/enforce");
+        RuntimePlan::build(config, &transparent_interception_registry())
+    }
+
+    fn configure_external_mitm_policy_hook(config: &mut AgentConfig, endpoint: &str) {
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::external(
+                TransparentInterceptionMitmBackendReadinessProbeConfig {
+                    target: Some("127.0.0.1:15002".to_string()),
+                    ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+                },
+            );
+        config.enforcement.interception.mitm.policy_hook =
+            TransparentInterceptionMitmPolicyHookConfig {
+                mode: TransparentInterceptionMitmPolicyHookModeConfig::HttpJson,
+                endpoint: Some(endpoint.to_string()),
+                ..TransparentInterceptionMitmPolicyHookConfig::default()
+            };
+        config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
+        config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+        config.tls.materials = vec![
+            TlsMaterialConfig {
+                id: Some("mitm-ca".to_string()),
+                kind: TlsMaterialKind::MitmCaCertificate,
+                path: "/etc/traffic-probe/mitm-ca.pem".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("mitm-ca-key".to_string()),
+                kind: TlsMaterialKind::MitmCaPrivateKey,
+                path: "/etc/traffic-probe/mitm-ca.key".into(),
+            },
+        ];
+    }
+
+    fn read_request_body(stream: &TcpStream) -> Result<String, String> {
+        let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .map_err(|error| error.to_string())?;
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("Content-Length:") {
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        let mut body = vec![0_u8; content_length.ok_or("missing content length")?];
+        reader
+            .read_exact(&mut body)
+            .map_err(|error| error.to_string())?;
+        String::from_utf8(body).map_err(|error| error.to_string())
+    }
+
     fn outbound_event() -> EventEnvelope {
         EventEnvelope::from_flow(
             Timestamp {
@@ -590,6 +917,7 @@ mod tests {
                 CapabilityState::available(CapabilityKind::DryRunEnforcement),
                 CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
                 CapabilityState::available(CapabilityKind::TransparentInterception),
+                CapabilityState::available(CapabilityKind::L7Mitm),
             ],
         )
     }

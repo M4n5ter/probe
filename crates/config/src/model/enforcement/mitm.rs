@@ -5,6 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use super::{
     EnforcementInterceptionConfig, TransparentInterceptionIntentViolation,
@@ -35,12 +36,19 @@ pub const MIN_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD: u32 =
     MIN_TCP_HEALTH_PROBE_FAILURE_THRESHOLD;
 pub const MAX_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD: u32 =
     MAX_TCP_HEALTH_PROBE_FAILURE_THRESHOLD;
+pub const DEFAULT_TRANSPARENT_MITM_POLICY_HOOK_TIMEOUT_MS: u64 = 250;
+pub const MIN_TRANSPARENT_MITM_POLICY_HOOK_TIMEOUT_MS: u64 = 1;
+pub const MAX_TRANSPARENT_MITM_POLICY_HOOK_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_TRANSPARENT_MITM_POLICY_HOOK_MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+pub const MIN_TRANSPARENT_MITM_POLICY_HOOK_MAX_RESPONSE_BYTES: u64 = 1;
+pub const MAX_TRANSPARENT_MITM_POLICY_HOOK_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TransparentInterceptionMitmConfig {
     pub backend: TransparentInterceptionMitmBackendConfig,
     pub plaintext_bridge: TransparentInterceptionMitmPlaintextBridgeConfig,
+    pub policy_hook: TransparentInterceptionMitmPolicyHookConfig,
     pub ca_certificate_ref: Option<String>,
     pub ca_private_key_ref: Option<String>,
     pub leaf_certificate_chain_refs: Vec<String>,
@@ -52,6 +60,7 @@ impl TransparentInterceptionMitmConfig {
     pub fn is_configured(&self) -> bool {
         self.backend.is_configured()
             || self.plaintext_bridge.is_configured()
+            || self.policy_hook.is_configured()
             || self.ca_certificate_ref.is_some()
             || self.ca_private_key_ref.is_some()
             || !self.leaf_certificate_chain_refs.is_empty()
@@ -179,6 +188,43 @@ pub enum TransparentInterceptionMitmPlaintextBridgeModeConfig {
     CaptureEventFeed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransparentInterceptionMitmPolicyHookConfig {
+    pub mode: TransparentInterceptionMitmPolicyHookModeConfig,
+    pub endpoint: Option<String>,
+    pub timeout_ms: u64,
+    pub max_response_bytes: u64,
+}
+
+impl TransparentInterceptionMitmPolicyHookConfig {
+    pub fn is_configured(&self) -> bool {
+        self.mode != TransparentInterceptionMitmPolicyHookModeConfig::None
+            || self.endpoint.is_some()
+            || self.timeout_ms != DEFAULT_TRANSPARENT_MITM_POLICY_HOOK_TIMEOUT_MS
+            || self.max_response_bytes != DEFAULT_TRANSPARENT_MITM_POLICY_HOOK_MAX_RESPONSE_BYTES
+    }
+}
+
+impl Default for TransparentInterceptionMitmPolicyHookConfig {
+    fn default() -> Self {
+        Self {
+            mode: TransparentInterceptionMitmPolicyHookModeConfig::None,
+            endpoint: None,
+            timeout_ms: DEFAULT_TRANSPARENT_MITM_POLICY_HOOK_TIMEOUT_MS,
+            max_response_bytes: DEFAULT_TRANSPARENT_MITM_POLICY_HOOK_MAX_RESPONSE_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparentInterceptionMitmPolicyHookModeConfig {
+    #[default]
+    None,
+    HttpJson,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransparentInterceptionMitmBackendIntent {
     Disabled,
@@ -212,6 +258,24 @@ pub enum TransparentInterceptionMitmBackendReadinessProbeIntent {
 pub enum TransparentInterceptionMitmPlaintextBridgeIntent {
     Disabled,
     CaptureEventFeed { path: PathBuf, follow: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransparentInterceptionMitmPolicyHookIntent {
+    Disabled,
+    HttpJson {
+        endpoint: TransparentInterceptionMitmPolicyHookEndpointIntent,
+        timeout_ms: u64,
+        max_response_bytes: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransparentInterceptionMitmPolicyHookEndpointIntent {
+    pub endpoint: String,
+    pub address: SocketAddr,
+    pub authority: String,
+    pub path_and_query: String,
 }
 
 pub type TransparentInterceptionMitmIntentViolation = TransparentInterceptionIntentViolation;
@@ -287,6 +351,24 @@ impl EnforcementInterceptionConfig {
 
         let mut violations = Vec::new();
         let intent = validate_mitm_plaintext_bridge(&self.mitm.plaintext_bridge, &mut violations);
+        if !violations.is_empty() {
+            return Err(violations);
+        }
+        Ok(intent)
+    }
+
+    pub fn mitm_policy_hook_intent(
+        &self,
+    ) -> Result<
+        TransparentInterceptionMitmPolicyHookIntent,
+        Vec<TransparentInterceptionMitmIntentViolation>,
+    > {
+        if !self.strategy.is_mitm() {
+            return Ok(TransparentInterceptionMitmPolicyHookIntent::Disabled);
+        }
+
+        let mut violations = Vec::new();
+        let intent = validate_mitm_policy_hook(&self.mitm.policy_hook, &mut violations);
         if !violations.is_empty() {
             return Err(violations);
         }
@@ -462,6 +544,199 @@ fn validate_mitm_plaintext_bridge(
                 follow: bridge.follow_enabled(),
             }
         }
+    }
+}
+
+fn validate_mitm_policy_hook(
+    hook: &TransparentInterceptionMitmPolicyHookConfig,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) -> TransparentInterceptionMitmPolicyHookIntent {
+    match hook.mode {
+        TransparentInterceptionMitmPolicyHookModeConfig::None => {
+            if hook.endpoint.is_some() {
+                violations.push(intent_violation(
+                    "enforcement.interception.mitm.policy_hook.endpoint",
+                    "MITM policy hook endpoint requires policy_hook.mode = \"http_json\"",
+                ));
+            }
+            if hook.timeout_ms != DEFAULT_TRANSPARENT_MITM_POLICY_HOOK_TIMEOUT_MS {
+                violations.push(intent_violation(
+                    "enforcement.interception.mitm.policy_hook.timeout_ms",
+                    "MITM policy hook timeout requires policy_hook.mode = \"http_json\"",
+                ));
+            }
+            if hook.max_response_bytes != DEFAULT_TRANSPARENT_MITM_POLICY_HOOK_MAX_RESPONSE_BYTES {
+                violations.push(intent_violation(
+                    "enforcement.interception.mitm.policy_hook.max_response_bytes",
+                    "MITM policy hook response limit requires policy_hook.mode = \"http_json\"",
+                ));
+            }
+            TransparentInterceptionMitmPolicyHookIntent::Disabled
+        }
+        TransparentInterceptionMitmPolicyHookModeConfig::HttpJson => {
+            validate_mitm_policy_hook_ranges(hook, violations);
+            let Some(endpoint) = &hook.endpoint else {
+                violations.push(intent_violation(
+                    "enforcement.interception.mitm.policy_hook.endpoint",
+                    "HTTP JSON MITM policy hook requires a loopback endpoint",
+                ));
+                return TransparentInterceptionMitmPolicyHookIntent::Disabled;
+            };
+            let Some(endpoint) = validate_mitm_policy_hook_endpoint(endpoint, violations) else {
+                return TransparentInterceptionMitmPolicyHookIntent::Disabled;
+            };
+            TransparentInterceptionMitmPolicyHookIntent::HttpJson {
+                endpoint,
+                timeout_ms: hook.timeout_ms,
+                max_response_bytes: hook.max_response_bytes,
+            }
+        }
+    }
+}
+
+fn validate_mitm_policy_hook_ranges(
+    hook: &TransparentInterceptionMitmPolicyHookConfig,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) {
+    if !(MIN_TRANSPARENT_MITM_POLICY_HOOK_TIMEOUT_MS..=MAX_TRANSPARENT_MITM_POLICY_HOOK_TIMEOUT_MS)
+        .contains(&hook.timeout_ms)
+    {
+        violations.push(intent_violation(
+            "enforcement.interception.mitm.policy_hook.timeout_ms",
+            format!(
+                "MITM policy hook timeout_ms must be between {MIN_TRANSPARENT_MITM_POLICY_HOOK_TIMEOUT_MS} and {MAX_TRANSPARENT_MITM_POLICY_HOOK_TIMEOUT_MS}"
+            ),
+        ));
+    }
+    if !(MIN_TRANSPARENT_MITM_POLICY_HOOK_MAX_RESPONSE_BYTES
+        ..=MAX_TRANSPARENT_MITM_POLICY_HOOK_MAX_RESPONSE_BYTES)
+        .contains(&hook.max_response_bytes)
+    {
+        violations.push(intent_violation(
+            "enforcement.interception.mitm.policy_hook.max_response_bytes",
+            format!(
+                "MITM policy hook max_response_bytes must be between {MIN_TRANSPARENT_MITM_POLICY_HOOK_MAX_RESPONSE_BYTES} and {MAX_TRANSPARENT_MITM_POLICY_HOOK_MAX_RESPONSE_BYTES}"
+            ),
+        ));
+    }
+}
+
+fn validate_mitm_policy_hook_endpoint(
+    endpoint: &str,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) -> Option<TransparentInterceptionMitmPolicyHookEndpointIntent> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        violations.push(intent_violation(
+            "enforcement.interception.mitm.policy_hook.endpoint",
+            "HTTP JSON MITM policy hook endpoint must not be empty",
+        ));
+        return None;
+    }
+    let parsed = match Url::parse(endpoint) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            violations.push(intent_violation(
+                "enforcement.interception.mitm.policy_hook.endpoint",
+                "HTTP JSON MITM policy hook endpoint must be a valid URL",
+            ));
+            return None;
+        }
+    };
+    if parsed.scheme() != "http" {
+        violations.push(intent_violation(
+            "enforcement.interception.mitm.policy_hook.endpoint",
+            "HTTP JSON MITM policy hook endpoint must use the http scheme",
+        ));
+    }
+    if parsed.username() != "" || parsed.password().is_some() {
+        violations.push(intent_violation(
+            "enforcement.interception.mitm.policy_hook.endpoint",
+            "HTTP JSON MITM policy hook endpoint must not include credentials",
+        ));
+    }
+    if parsed.fragment().is_some() {
+        violations.push(intent_violation(
+            "enforcement.interception.mitm.policy_hook.endpoint",
+            "HTTP JSON MITM policy hook endpoint must not include a fragment",
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+        .and_then(|host| host.parse::<IpAddr>().ok());
+    let address = match host {
+        Some(address) if is_loopback_address(address) => Some(normalized_ip_address(address)),
+        Some(_) => {
+            violations.push(intent_violation(
+                "enforcement.interception.mitm.policy_hook.endpoint",
+                "HTTP JSON MITM policy hook endpoint host must be a loopback IP address",
+            ));
+            None
+        }
+        None => {
+            violations.push(intent_violation(
+                "enforcement.interception.mitm.policy_hook.endpoint",
+                "HTTP JSON MITM policy hook endpoint host must be an IP address",
+            ));
+            None
+        }
+    };
+    match explicit_url_port(endpoint) {
+        Some(0) => {
+            violations.push(intent_violation(
+                "enforcement.interception.mitm.policy_hook.endpoint",
+                "HTTP JSON MITM policy hook endpoint port must be non-zero",
+            ));
+            None
+        }
+        Some(port) => {
+            address.map(|address| policy_hook_endpoint_intent(endpoint, address, port, &parsed))
+        }
+        None => {
+            violations.push(intent_violation(
+                "enforcement.interception.mitm.policy_hook.endpoint",
+                "HTTP JSON MITM policy hook endpoint must include an explicit port",
+            ));
+            None
+        }
+    }
+}
+
+fn explicit_url_port(endpoint: &str) -> Option<u16> {
+    let endpoint_authority = endpoint
+        .split_once("://")?
+        .1
+        .split(['/', '?', '#'])
+        .next()?;
+    let authority = endpoint_authority
+        .rsplit_once('@')
+        .map_or(endpoint_authority, |(_, host)| host);
+    let port = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split_once(']')?.1.strip_prefix(':')?
+    } else {
+        authority.rsplit_once(':')?.1
+    };
+    port.parse::<u16>().ok()
+}
+
+fn policy_hook_endpoint_intent(
+    endpoint: &str,
+    address: IpAddr,
+    port: u16,
+    parsed: &Url,
+) -> TransparentInterceptionMitmPolicyHookEndpointIntent {
+    let address = SocketAddr::new(address, port);
+    let mut path_and_query = parsed.path().to_string();
+    if let Some(query) = parsed.query() {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
+    }
+    TransparentInterceptionMitmPolicyHookEndpointIntent {
+        endpoint: endpoint.to_string(),
+        address,
+        authority: address.to_string(),
+        path_and_query,
     }
 }
 

@@ -318,6 +318,51 @@ follow = true
 }
 
 #[test]
+fn parses_external_mitm_policy_hook() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "outbound_transparent_mitm"
+
+[enforcement.interception.mitm.policy_hook]
+mode = "http_json"
+endpoint = "http://127.0.0.1:15002/enforce"
+timeout_ms = 500
+max_response_bytes = 32768
+"#,
+    )?;
+
+    assert_eq!(
+        config.enforcement.interception.mitm.policy_hook.mode,
+        TransparentInterceptionMitmPolicyHookModeConfig::HttpJson
+    );
+    assert_eq!(
+        config
+            .enforcement
+            .interception
+            .mitm
+            .policy_hook
+            .endpoint
+            .as_deref(),
+        Some("http://127.0.0.1:15002/enforce")
+    );
+    assert_eq!(
+        config.enforcement.interception.mitm.policy_hook.timeout_ms,
+        500
+    );
+    assert_eq!(
+        config
+            .enforcement
+            .interception
+            .mitm
+            .policy_hook
+            .max_response_bytes,
+        32768
+    );
+    Ok(())
+}
+
+#[test]
 fn parses_external_outbound_proxy_self_bypass_contract() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
         r#"

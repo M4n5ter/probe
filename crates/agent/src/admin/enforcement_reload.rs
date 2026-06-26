@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use runtime::{EnforcementExecutionSurface, RuntimePlan};
+use runtime::{RuntimePlan, TransparentInterceptionExecutionPlan};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -60,11 +60,10 @@ pub(super) async fn reload_enforcement_policy(
 }
 
 fn reject_setup_time_interception_reload(plan: &RuntimePlan) -> Result<(), EnforcementReloadError> {
-    if plan
-        .enforcement
-        .execution_surfaces
-        .contains(&EnforcementExecutionSurface::TransparentInterception)
-    {
+    if !matches!(
+        plan.enforcement.interception.execution,
+        TransparentInterceptionExecutionPlan::Disabled
+    ) {
         return Err(EnforcementReloadError::SetupTimeInterception);
     }
     Ok(())
@@ -75,7 +74,11 @@ mod tests {
     use enforcement::{EnforcementPlanRequest, EnforcementPlanner, ScopedEnforcementPlanner};
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicyManifest,
-        EnforcementPolicySourceConfig, TransparentInterceptionStrategyConfig,
+        EnforcementPolicySourceConfig, TlsMaterialConfig, TlsMaterialKind,
+        TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmBackendReadinessProbeConfig,
+        TransparentInterceptionMitmPolicyHookConfig,
+        TransparentInterceptionMitmPolicyHookModeConfig, TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
         Action, AddressPort, CapabilityKind, CapabilityState, CaptureOrigin, CaptureSource,
@@ -85,7 +88,8 @@ mod tests {
         TransportProtocol, Verdict, VerdictScope,
     };
     use runtime::{
-        CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
+        CaptureProviderBuilder, CaptureProviderDescriptor, EnforcementExecutionSurface,
+        ProviderRegistry, RuntimePlan,
     };
 
     use super::*;
@@ -166,6 +170,42 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn mitm_policy_hook_plan_with_setup_rules_rejects_online_reload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = mitm_policy_hook_interception_plan()?;
+        assert_eq!(
+            plan.enforcement.execution_surface,
+            Some(EnforcementExecutionSurface::L7MitmProxyHook)
+        );
+        let planner = ScopedEnforcementPlanner::new(EnforcementMode::AuditOnly, None)?;
+        let active_policy =
+            crate::configured_enforcement::load_configured_enforcement_policy_runtime(
+                None,
+                &runtime::EnforcementPolicySourcePlan::None,
+                crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
+            )
+            .await?;
+        let (_, runtime_state) = EnforcementRuntimeState::from_planner(planner, active_policy);
+
+        let error = match reload_enforcement_policy(
+            &plan,
+            Some(&runtime_state),
+            &EnforcementReloadGate::default(),
+        )
+        .await
+        {
+            Ok(_) => panic!("MITM hook setup-time host rules cannot be reloaded by planner swap"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            EnforcementReloadError::SetupTimeInterception
+        ));
+        Ok(())
+    }
+
     fn config_with_storage_path(storage_path: std::path::PathBuf) -> AgentConfig {
         AgentConfig {
             capture: probe_config::CaptureConfig {
@@ -195,6 +235,51 @@ mod tests {
                 ..TrafficSelector::default()
             },
         ));
+        RuntimePlan::build(config, &transparent_interception_registry())
+    }
+
+    fn mitm_policy_hook_interception_plan() -> Result<RuntimePlan, runtime::RuntimeError> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::external(
+                TransparentInterceptionMitmBackendReadinessProbeConfig {
+                    target: Some("127.0.0.1:15002".to_string()),
+                    ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+                },
+            );
+        config.enforcement.interception.mitm.policy_hook =
+            TransparentInterceptionMitmPolicyHookConfig {
+                mode: TransparentInterceptionMitmPolicyHookModeConfig::HttpJson,
+                endpoint: Some("http://127.0.0.1:15002/enforce".to_string()),
+                ..TransparentInterceptionMitmPolicyHookConfig::default()
+            };
+        config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
+        config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+        config.tls.materials = vec![
+            TlsMaterialConfig {
+                id: Some("mitm-ca".to_string()),
+                kind: TlsMaterialKind::MitmCaCertificate,
+                path: "/etc/traffic-probe/mitm-ca.pem".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("mitm-ca-key".to_string()),
+                kind: TlsMaterialKind::MitmCaPrivateKey,
+                path: "/etc/traffic-probe/mitm-ca.key".into(),
+            },
+        ];
         RuntimePlan::build(config, &transparent_interception_registry())
     }
 
@@ -234,6 +319,7 @@ mod tests {
             CapabilityState::available(CapabilityKind::WebSocketHandoff),
             CapabilityState::available(CapabilityKind::WebSocketFrame),
             CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
+            CapabilityState::available(CapabilityKind::L7Mitm),
             CapabilityState::available(CapabilityKind::DryRunEnforcement),
             CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
             CapabilityState::unavailable(CapabilityKind::TransparentInterception, "not built"),

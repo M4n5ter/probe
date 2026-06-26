@@ -4,7 +4,7 @@ use probe_core::{CapabilityKind, EnforcementMode};
 use crate::plan::{
     capture::{CapturePlan, CapturePlanMode},
     enforcement::{
-        EnforcementCapabilityPlan, EnforcementCapabilityRequirement, enabled_execution_surfaces,
+        EnforcementCapabilityPlan, EnforcementCapabilityRequirement, configured_execution_surfaces,
     },
     registry::ProviderRegistry,
 };
@@ -47,10 +47,10 @@ pub(super) fn validate_static_config(config: &AgentConfig, violations: &mut Vec<
         });
     }
     if config.enforcement.mode == EnforcementMode::Enforce {
-        match enabled_execution_surfaces(config).len() {
+        match configured_execution_surfaces(config).len() {
             0 => violations.push(ConfigViolation {
                 field: "enforcement.mode".to_string(),
-                reason: "enforce mode requires at least one enforcement execution surface: connection backend or transparent interception strategy".to_string(),
+                reason: "enforce mode requires at least one enforcement execution surface: connection backend, transparent interception setup, or L7 MITM proxy hook".to_string(),
             }),
             1 => {}
             _ => violations.push(ConfigViolation {
@@ -579,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn enforce_enforcement_rejects_multiple_execution_surfaces() {
+    fn enforce_enforcement_rejects_multiple_execution_surface() {
         let registry = ProviderRegistry::new(
             vec![live_capture_provider()],
             connection_and_transparent_interception_capabilities(),

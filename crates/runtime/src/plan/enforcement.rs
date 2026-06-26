@@ -7,8 +7,10 @@ use probe_config::{
     TransparentInterceptionMitmBackendIntent,
     TransparentInterceptionMitmBackendReadinessProbeIntent,
     TransparentInterceptionMitmManagedProcessIntent,
-    TransparentInterceptionMitmPlaintextBridgeIntent, TransparentInterceptionOutboundProxyIntent,
-    TransparentInterceptionOutboundProxyModeIntent,
+    TransparentInterceptionMitmPlaintextBridgeIntent,
+    TransparentInterceptionMitmPolicyHookEndpointIntent,
+    TransparentInterceptionMitmPolicyHookIntent, TransparentInterceptionMitmPolicyHookModeConfig,
+    TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent,
     TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
     TransparentInterceptionProxyIntentViolation, TransparentInterceptionProxyModeConfig,
@@ -30,7 +32,7 @@ use super::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPlan {
     pub mode: EnforcementMode,
-    pub execution_surfaces: Vec<EnforcementExecutionSurface>,
+    pub execution_surface: Option<EnforcementExecutionSurface>,
     pub mode_capability: EnforcementCapabilityPlan,
     pub connection: EnforcementConnectionPlan,
     pub interception: EnforcementInterceptionPlan,
@@ -42,7 +44,7 @@ impl EnforcementPlan {
     pub(super) fn resolve(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
         Self {
             mode: config.enforcement.mode,
-            execution_surfaces: enabled_execution_surfaces(config),
+            execution_surface: selected_execution_surface(config),
             mode_capability: EnforcementCapabilityPlan::from_mode(
                 config.enforcement.mode,
                 capabilities,
@@ -61,10 +63,13 @@ impl EnforcementPlan {
 #[serde(rename_all = "snake_case")]
 pub enum EnforcementExecutionSurface {
     Connection,
-    TransparentInterception,
+    TransparentInterceptionSetup,
+    L7MitmProxyHook,
 }
 
-pub(super) fn enabled_execution_surfaces(config: &AgentConfig) -> Vec<EnforcementExecutionSurface> {
+pub(super) fn configured_execution_surfaces(
+    config: &AgentConfig,
+) -> Vec<EnforcementExecutionSurface> {
     if config.enforcement.mode != EnforcementMode::Enforce {
         return Vec::new();
     }
@@ -74,9 +79,24 @@ pub(super) fn enabled_execution_surfaces(config: &AgentConfig) -> Vec<Enforcemen
         surfaces.push(EnforcementExecutionSurface::Connection);
     }
     if config.enforcement.interception.strategy.is_enabled() {
-        surfaces.push(EnforcementExecutionSurface::TransparentInterception);
+        if config.enforcement.interception.mitm.policy_hook.mode
+            == TransparentInterceptionMitmPolicyHookModeConfig::HttpJson
+        {
+            surfaces.push(EnforcementExecutionSurface::L7MitmProxyHook);
+        } else {
+            surfaces.push(EnforcementExecutionSurface::TransparentInterceptionSetup);
+        }
     }
     surfaces
+}
+
+fn selected_execution_surface(config: &AgentConfig) -> Option<EnforcementExecutionSurface> {
+    let mut surfaces = configured_execution_surfaces(config);
+    if surfaces.len() == 1 {
+        surfaces.pop()
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +315,7 @@ impl TransparentInterceptionExecutionPlan {
 pub struct TransparentInterceptionMitmPlan {
     pub backend: TransparentInterceptionMitmBackendPlan,
     pub plaintext_bridge: TransparentInterceptionMitmPlaintextBridgePlan,
+    pub policy_hook: TransparentInterceptionMitmPolicyHookPlan,
     pub ca_certificate: Option<TlsMaterialPlan>,
     pub ca_private_key: Option<TlsMaterialPlan>,
     pub leaf_certificate_chain: Vec<TlsMaterialPlan>,
@@ -330,6 +351,13 @@ impl TransparentInterceptionMitmPlan {
                     .interception
                     .mitm_plaintext_bridge_intent()
                     .expect("MITM plaintext bridge contract should be validated before planning"),
+            ),
+            policy_hook: TransparentInterceptionMitmPolicyHookPlan::from_intent(
+                config
+                    .enforcement
+                    .interception
+                    .mitm_policy_hook_intent()
+                    .expect("MITM policy hook contract should be validated before planning"),
             ),
             ca_certificate: mitm.ca_certificate_ref.as_deref().and_then(|reference| {
                 mitm_tls_material_from_ref(
@@ -474,6 +502,53 @@ impl TransparentInterceptionMitmPlaintextBridgePlan {
             TransparentInterceptionMitmPlaintextBridgeIntent::CaptureEventFeed { path, follow } => {
                 Self::CaptureEventFeed { path, follow }
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum TransparentInterceptionMitmPolicyHookPlan {
+    Disabled,
+    HttpJson {
+        endpoint: TransparentInterceptionMitmPolicyHookEndpointPlan,
+        timeout_ms: u64,
+        max_response_bytes: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionMitmPolicyHookEndpointPlan {
+    pub endpoint: String,
+    pub address: SocketAddr,
+    pub authority: String,
+    pub path_and_query: String,
+}
+
+impl TransparentInterceptionMitmPolicyHookEndpointPlan {
+    fn from_intent(intent: TransparentInterceptionMitmPolicyHookEndpointIntent) -> Self {
+        Self {
+            endpoint: intent.endpoint,
+            address: intent.address,
+            authority: intent.authority,
+            path_and_query: intent.path_and_query,
+        }
+    }
+}
+
+impl TransparentInterceptionMitmPolicyHookPlan {
+    fn from_intent(intent: TransparentInterceptionMitmPolicyHookIntent) -> Self {
+        match intent {
+            TransparentInterceptionMitmPolicyHookIntent::Disabled => Self::Disabled,
+            TransparentInterceptionMitmPolicyHookIntent::HttpJson {
+                endpoint,
+                timeout_ms,
+                max_response_bytes,
+            } => Self::HttpJson {
+                endpoint: TransparentInterceptionMitmPolicyHookEndpointPlan::from_intent(endpoint),
+                timeout_ms,
+                max_response_bytes,
+            },
         }
     }
 }
@@ -822,13 +897,17 @@ pub(super) struct EnforcementCapabilityRequirement {
 mod tests {
     use std::num::NonZeroU32;
 
+    use crate::plan::{
+        CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
+    };
     use probe_config::{
-        AgentConfig, ConnectionEnforcementBackendConfig, TlsMaterialConfig, TlsMaterialKind,
-        TransparentInterceptionMitmBackendConfig,
+        AgentConfig, CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig,
+        TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
         TransparentInterceptionMitmManagedProcessConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
-        TransparentInterceptionStrategyConfig,
+        TransparentInterceptionMitmPolicyHookConfig,
+        TransparentInterceptionMitmPolicyHookModeConfig, TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
         CapabilityMatrix, CapabilityState, Direction, ProcessSelector, Selector, TrafficSelector,
@@ -869,8 +948,8 @@ mod tests {
             ConnectionEnforcementBackendConfig::LinuxSocketDestroy
         );
         assert_eq!(
-            plan.execution_surfaces,
-            vec![EnforcementExecutionSurface::Connection]
+            plan.execution_surface,
+            Some(EnforcementExecutionSurface::Connection)
         );
         assert_eq!(
             plan.connection.capability,
@@ -920,8 +999,8 @@ mod tests {
             TransparentInterceptionStrategyConfig::InboundTproxy
         );
         assert_eq!(
-            plan.execution_surfaces,
-            vec![EnforcementExecutionSurface::TransparentInterception]
+            plan.execution_surface,
+            Some(EnforcementExecutionSurface::TransparentInterceptionSetup)
         );
         assert!(plan.interception.selector_configured);
         assert!(matches!(
@@ -1230,6 +1309,109 @@ mod tests {
     }
 
     #[test]
+    fn enforcement_plan_uses_l7_mitm_proxy_hook_execution_surface()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm;
+        config.enforcement.interception.proxy.self_bypass =
+            TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        configure_external_mitm_backend(&mut config);
+        config.enforcement.interception.mitm.policy_hook =
+            TransparentInterceptionMitmPolicyHookConfig {
+                mode: TransparentInterceptionMitmPolicyHookModeConfig::HttpJson,
+                endpoint: Some("http://[::ffff:127.0.0.1]:15002/enforce?mode=strict".to_string()),
+                timeout_ms: 500,
+                max_response_bytes: 32 * 1024,
+            };
+        let capabilities = CapabilityMatrix::new([
+            CapabilityState::available(CapabilityKind::TransparentInterception),
+            CapabilityState::available(CapabilityKind::L7Mitm),
+        ]);
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        assert_eq!(
+            plan.execution_surface,
+            Some(EnforcementExecutionSurface::L7MitmProxyHook)
+        );
+        assert_eq!(
+            plan.interception.mitm.policy_hook,
+            TransparentInterceptionMitmPolicyHookPlan::HttpJson {
+                endpoint: TransparentInterceptionMitmPolicyHookEndpointPlan {
+                    endpoint: "http://[::ffff:127.0.0.1]:15002/enforce?mode=strict".to_string(),
+                    address: "127.0.0.1:15002".parse()?,
+                    authority: "127.0.0.1:15002".to_string(),
+                    path_and_query: "/enforce?mode=strict".to_string(),
+                },
+                timeout_ms: 500,
+                max_response_bytes: 32 * 1024,
+            }
+        );
+        assert!(matches!(
+            plan.interception.execution.outbound_redirect_plan(),
+            TransparentInterceptionOutboundRedirectPlan::Planned { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_plan_accepts_explicit_default_http_policy_hook_port()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm;
+        config.enforcement.interception.proxy.self_bypass =
+            TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        configure_external_mitm_backend(&mut config);
+        config.enforcement.interception.mitm.policy_hook =
+            TransparentInterceptionMitmPolicyHookConfig {
+                mode: TransparentInterceptionMitmPolicyHookModeConfig::HttpJson,
+                endpoint: Some("http://127.0.0.1:80/enforce".to_string()),
+                ..TransparentInterceptionMitmPolicyHookConfig::default()
+            };
+
+        let plan = RuntimePlan::build(config, &mitm_registry())?;
+
+        assert_eq!(
+            plan.enforcement.interception.mitm.policy_hook,
+            TransparentInterceptionMitmPolicyHookPlan::HttpJson {
+                endpoint: TransparentInterceptionMitmPolicyHookEndpointPlan {
+                    endpoint: "http://127.0.0.1:80/enforce".to_string(),
+                    address: "127.0.0.1:80".parse()?,
+                    authority: "127.0.0.1:80".to_string(),
+                    path_and_query: "/enforce".to_string(),
+                },
+                timeout_ms: probe_config::DEFAULT_TRANSPARENT_MITM_POLICY_HOOK_TIMEOUT_MS,
+                max_response_bytes:
+                    probe_config::DEFAULT_TRANSPARENT_MITM_POLICY_HOOK_MAX_RESPONSE_BYTES,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
     fn enforcement_plan_preserves_explicit_finite_mitm_plaintext_bridge()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut config = AgentConfig::default();
@@ -1406,5 +1588,24 @@ mod tests {
         config.enforcement.interception.mitm.backend =
             TransparentInterceptionMitmBackendConfig::managed_process(readiness_probe, process);
         configure_mitm_materials(config);
+    }
+
+    fn mitm_registry() -> ProviderRegistry {
+        ProviderRegistry::new(
+            vec![CaptureProviderDescriptor::available(
+                CaptureBackend::Libpcap,
+                CaptureProviderBuilder::Libpcap,
+            )],
+            vec![
+                CapabilityState::available(CapabilityKind::Libpcap),
+                CapabilityState::available(CapabilityKind::Http1),
+                CapabilityState::available(CapabilityKind::Sse),
+                CapabilityState::available(CapabilityKind::WebSocketHandoff),
+                CapabilityState::available(CapabilityKind::WebSocketFrame),
+                CapabilityState::available(CapabilityKind::DryRunEnforcement),
+                CapabilityState::available(CapabilityKind::TransparentInterception),
+                CapabilityState::available(CapabilityKind::L7Mitm),
+            ],
+        )
     }
 }

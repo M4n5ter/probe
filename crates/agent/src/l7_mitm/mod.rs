@@ -2,6 +2,7 @@ mod audit;
 mod backend;
 mod lifecycle;
 mod listener_owner;
+mod policy_hook;
 mod state;
 
 use probe_config::AgentConfig;
@@ -14,6 +15,10 @@ pub(crate) use crate::tcp_health::{
 pub(crate) use audit::NoopL7MitmAuditSink;
 pub(crate) use audit::{DurableL7MitmAuditSink, L7MitmAuditSink};
 pub(crate) use lifecycle::{L7MitmBackendLifecycleGuard, start_backend_lifecycle};
+pub(crate) use policy_hook::{
+    L7MitmPolicyHookConnectionOptions, L7MitmPolicyHookError,
+    hook_from_plan as policy_hook_from_plan,
+};
 pub(crate) use state::{
     L7MitmPlaintextBridgeMode, L7MitmPlaintextBridgeSnapshot, L7MitmRuntime, L7MitmRuntimeHandle,
     L7MitmRuntimeSnapshot,
