@@ -13,6 +13,7 @@ const REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) struct HttpSourceServer {
     endpoint: String,
+    listen_port: u16,
     request_count: Arc<AtomicUsize>,
     stop_requested: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<Result<(), String>>>,
@@ -33,6 +34,7 @@ impl HttpSourceServer {
         }
 
         let listener = TcpListener::bind("127.0.0.1:0")?;
+        let listen_port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
         let endpoint = format!("http://{}{}", listener.local_addr()?, target);
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -77,6 +79,7 @@ impl HttpSourceServer {
 
         Ok(Self {
             endpoint,
+            listen_port,
             request_count,
             stop_requested,
             handle: Some(handle),
@@ -85,6 +88,10 @@ impl HttpSourceServer {
 
     pub(crate) fn endpoint(&self) -> String {
         self.endpoint.clone()
+    }
+
+    pub(crate) fn listen_port(&self) -> u16 {
+        self.listen_port
     }
 
     pub(crate) fn finish(mut self) -> Result<usize, Box<dyn std::error::Error>> {

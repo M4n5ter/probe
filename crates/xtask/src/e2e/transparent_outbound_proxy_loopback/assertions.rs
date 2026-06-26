@@ -14,8 +14,8 @@ use super::super::{
 use super::commands::{ip_output, ip_route_table_output, nft_command, nft_output};
 use super::fixtures::{ExternalProxyReport, ProxyFixtureReport, UpstreamReport};
 use super::{
-    CLIENT_PAYLOAD, LOOPBACK_ADDR, OUTBOUND_BYPASS_MARK, OutboundProxyE2eMode, PROXY_PORT,
-    SERVER_RESPONSE, TPROXY_MARK, TPROXY_ROUTE_TABLE, UPSTREAM_PORT,
+    CLIENT_PAYLOAD, LOOPBACK_ADDR, OUTBOUND_BYPASS_MARK, OutboundProxyE2eCase,
+    OutboundProxyE2eMode, PROXY_PORT, SERVER_RESPONSE, TPROXY_MARK, TPROXY_ROUTE_TABLE,
 };
 
 const METRICS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -156,7 +156,7 @@ fn metric_u64(
 }
 
 pub(super) fn assert_outbound_redirect_table_installed(
-    webhook_port: u16,
+    remote_ports: &[u16],
     mode: OutboundProxyE2eMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listing = nft_output(["list", "table", "inet", "sssa_probe"])?;
@@ -166,16 +166,11 @@ pub(super) fn assert_outbound_redirect_table_installed(
         format!("meta mark {} return", outbound_bypass_mark_text()),
         format!("ip daddr {LOOPBACK_ADDR}"),
         format!("redirect to :{PROXY_PORT}"),
+        expected_tcp_dport_snippet(remote_ports)?,
     ];
-    match mode {
-        OutboundProxyE2eMode::ManagedRelay | OutboundProxyE2eMode::ExternalProxy => {
-            expected_snippets.push(format!("tcp dport {{ {UPSTREAM_PORT}, {webhook_port} }}"));
-        }
-        OutboundProxyE2eMode::OwnerScopedManagedRelay => {
-            expected_snippets.push(format!("meta skuid {}", super::OWNER_SCOPED_CLIENT_UID));
-            expected_snippets.push(format!("meta skgid {}", super::OWNER_SCOPED_CLIENT_GID));
-            expected_snippets.push(format!("tcp dport {UPSTREAM_PORT}"));
-        }
+    if mode == OutboundProxyE2eMode::OwnerScopedManagedRelay {
+        expected_snippets.push(format!("meta skuid {}", super::OWNER_SCOPED_CLIENT_UID));
+        expected_snippets.push(format!("meta skgid {}", super::OWNER_SCOPED_CLIENT_GID));
     }
     for snippet in expected_snippets {
         if !listing.contains(&snippet) {
@@ -186,6 +181,24 @@ pub(super) fn assert_outbound_redirect_table_installed(
         }
     }
     Ok(())
+}
+
+fn expected_tcp_dport_snippet(remote_ports: &[u16]) -> Result<String, Box<dyn std::error::Error>> {
+    let mut ports = remote_ports.to_vec();
+    ports.sort_unstable();
+    ports.dedup();
+    match ports.as_slice() {
+        [] => Err(e2e_error("outbound transparent proxy expected no redirect ports").into()),
+        [port] => Ok(format!("tcp dport {port}")),
+        _ => Ok(format!(
+            "tcp dport {{ {} }}",
+            ports
+                .into_iter()
+                .map(|port| port.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 fn outbound_bypass_mark_text() -> String {
@@ -310,7 +323,7 @@ pub(super) fn assert_client_received_server_response(
 
 pub(super) fn assert_webhook_batches(
     batches: &[ReceivedBatch],
-    mode: OutboundProxyE2eMode,
+    case: OutboundProxyE2eCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if batches.is_empty() {
         return Err(e2e_error("webhook receiver captured no batches").into());
@@ -325,7 +338,7 @@ pub(super) fn assert_webhook_batches(
         batch
             .headers
             .get("x-sssa-e2e")
-            .is_some_and(|value| value == mode.header_value())
+            .is_some_and(|value| value == case.header_value)
     }) {
         return Err(e2e_error("webhook receiver did not observe configured header").into());
     }

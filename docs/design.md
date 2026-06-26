@@ -531,6 +531,8 @@ TLS 明文与协议能力：
 - `xtask e2e-transparent-outbound-owner-proxy-loopback` 覆盖 UID/GID-only selector 生成 `meta skuid`/`meta skgid` socket-owner rule。
 - `xtask e2e-transparent-outbound-owner-proxy-loopback` 覆盖匹配 owner 的 client 被 redirect。
 - `xtask e2e-transparent-outbound-owner-proxy-loopback` 覆盖非匹配 owner client 直连且不增加 relay 计数。
+- `xtask e2e-transparent-outbound-remote-policy-bundle-loopback` 覆盖 active OUTPUT redirect 下的 remote policy bundle reload
+  control-plane bypass；若 remote GET 被 proxy 自捕获，relay metrics 会出现额外 relay。
 - `xtask e2e-transparent-linux-outbound-redirect-artifact-netns` 覆盖 explicit artifact spec 与 outbound host-rule set 生成 OUTPUT/dstnat artifact。
 - `xtask e2e-transparent-linux-outbound-redirect-artifact-netns` 覆盖真实 `nft --check`、安装、规则列出断言和清理。
 - agent 单元测试覆盖 outbound nft check failure 不会安装规则或启动 proxy。
@@ -2506,6 +2508,9 @@ agent-owned control-plane bypass：
   socket-owner rule。
 - 该测试验证匹配 owner 的 client 流量被 redirect。
 - 该测试验证同一 upstream 地址/端口上的非匹配 owner client 直连且不增加 relay 计数。
+- `xtask e2e-transparent-outbound-remote-policy-bundle-loopback` 在 active OUTPUT redirect 下触发 admin `reload_policies`。
+- 该测试验证 remote policy bundle GET 使用 agent-owned proxy bypass mark。
+- 该测试同时断言 remote source request count 和 relay metrics，避免 unmarked GET 经 managed relay 转发时伪装成成功 reload。
 
 当前 artifact E2E：
 
@@ -5118,9 +5123,10 @@ Linux artifact 语法/安装验收误报为真实 agent runtime E2E 能力。新
   - `e2e-transparent-outbound-proxy-loopback`
   - `e2e-transparent-outbound-external-proxy-loopback`
   - `e2e-transparent-outbound-owner-proxy-loopback`
+  - `e2e-transparent-outbound-remote-policy-bundle-loopback`
   - 权限：root/net-admin。
   - 覆盖：OUTPUT redirect、managed/external proxy self-bypass、webhook control-plane bypass、
-    UID/GID socket-owner-scoped outbound selector 和 cleanup。
+    remote policy bundle reload control-plane bypass、UID/GID socket-owner-scoped outbound selector 和 cleanup。
   - 边界：不证明非 UID/GID-only process selector、flow-aware outbound setup 或完整 L7 MITM lifecycle。
 
 - Linux artifacts

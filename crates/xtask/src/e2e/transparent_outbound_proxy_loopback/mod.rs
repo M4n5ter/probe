@@ -7,11 +7,11 @@ use std::{env, fs, net::Ipv4Addr, path::Path, process::ExitCode, time::Duration}
 
 use super::{
     harness::{
-        ChildSupervisor, UnixSocketReadySignal, e2e_error, ensure_e2e_packages_built,
-        reexec_current_case_in_fresh_network_namespace, run_with_temp_root, stop_running_child,
-        verify_fresh_network_namespace,
+        ChildSupervisor, HttpSourceServer, UnixSocketReadySignal, e2e_error,
+        ensure_e2e_packages_built, reexec_current_case_in_fresh_network_namespace,
+        run_with_temp_root, stop_running_child, verify_fresh_network_namespace,
     },
-    loopback::{spawn_agent, wait_for_agent_ready},
+    loopback::{send_admin_request, spawn_agent, wait_for_agent_ready},
     webhook_receiver::WebhookBatchReceiver,
 };
 use assertions::{
@@ -21,7 +21,10 @@ use assertions::{
     assert_webhook_batches,
 };
 use commands::{ip, require_root};
-use config::{write_agent_config, write_policy_bundle};
+use config::{
+    PolicySourceFixture, redirected_remote_ports, remote_policy_bundle_document,
+    write_agent_config, write_policy_bundle,
+};
 use fixtures::{ProxyFixture, ProxyFixtureReport, UpstreamReport, UpstreamServer, run_client};
 
 const IN_NETNS_ENV: &str = "SSSA_PROBE_E2E_TRANSPARENT_OUTBOUND_PROXY_NETNS";
@@ -39,24 +42,30 @@ const OWNER_SCOPED_CLIENT_GID: u32 = 65_534;
 const SERVER_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
+const REMOTE_POLICY_BUNDLE_TARGET: &str = "/policies/outbound-proxy-e2e-policy";
+const REMOTE_POLICY_BUNDLE_REQUESTS: usize = 2;
 
 pub(crate) fn run() -> ExitCode {
-    run_mode(OutboundProxyE2eMode::ManagedRelay)
+    run_case(OutboundProxyE2eCase::MANAGED_RELAY)
 }
 
 pub(crate) fn run_external() -> ExitCode {
-    run_mode(OutboundProxyE2eMode::ExternalProxy)
+    run_case(OutboundProxyE2eCase::EXTERNAL_PROXY)
 }
 
 pub(crate) fn run_owner_scoped() -> ExitCode {
-    run_mode(OutboundProxyE2eMode::OwnerScopedManagedRelay)
+    run_case(OutboundProxyE2eCase::OWNER_SCOPED_MANAGED_RELAY)
 }
 
-fn run_mode(mode: OutboundProxyE2eMode) -> ExitCode {
-    match run_outer(mode) {
+pub(crate) fn run_remote_policy_bundle() -> ExitCode {
+    run_case(OutboundProxyE2eCase::REMOTE_POLICY_BUNDLE)
+}
+
+fn run_case(case: OutboundProxyE2eCase) -> ExitCode {
+    match run_outer(case) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{} failed: {error}", mode.label());
+            eprintln!("{} failed: {error}", case.label);
             ExitCode::FAILURE
         }
     }
@@ -76,46 +85,6 @@ struct ClientOwner {
 }
 
 impl OutboundProxyE2eMode {
-    fn case_name(self) -> &'static str {
-        match self {
-            Self::ManagedRelay => "e2e-transparent-outbound-proxy-loopback",
-            Self::ExternalProxy => "e2e-transparent-outbound-external-proxy-loopback",
-            Self::OwnerScopedManagedRelay => "e2e-transparent-outbound-owner-proxy-loopback",
-        }
-    }
-
-    fn temp_root(self) -> &'static str {
-        match self {
-            Self::ManagedRelay => "transparent-outbound-proxy-loopback",
-            Self::ExternalProxy => "out-ext",
-            Self::OwnerScopedManagedRelay => "out-owner",
-        }
-    }
-
-    fn agent_id(self) -> &'static str {
-        match self {
-            Self::ManagedRelay => "e2e-transparent-outbound-proxy-agent",
-            Self::ExternalProxy => "e2e-transparent-outbound-external-proxy-agent",
-            Self::OwnerScopedManagedRelay => "e2e-transparent-outbound-owner-proxy-agent",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::ManagedRelay => "e2e transparent outbound managed proxy loopback",
-            Self::ExternalProxy => "e2e transparent outbound external proxy loopback",
-            Self::OwnerScopedManagedRelay => "e2e transparent outbound owner-scoped proxy loopback",
-        }
-    }
-
-    fn header_value(self) -> &'static str {
-        match self {
-            Self::ManagedRelay => "transparent-outbound-proxy",
-            Self::ExternalProxy => "transparent-outbound-external-proxy",
-            Self::OwnerScopedManagedRelay => "transparent-outbound-owner-proxy",
-        }
-    }
-
     fn client_owner(self) -> Option<ClientOwner> {
         match self {
             Self::OwnerScopedManagedRelay => Some(ClientOwner {
@@ -127,29 +96,96 @@ impl OutboundProxyE2eMode {
     }
 }
 
-fn run_outer(mode: OutboundProxyE2eMode) -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolicySourceKind {
+    LocalDirectory,
+    RemoteBundle,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutboundProxyE2eCase {
+    case_name: &'static str,
+    temp_root: &'static str,
+    agent_id: &'static str,
+    label: &'static str,
+    header_value: &'static str,
+    proxy_mode: OutboundProxyE2eMode,
+    policy_source: PolicySourceKind,
+}
+
+impl OutboundProxyE2eCase {
+    const MANAGED_RELAY: Self = Self {
+        case_name: "e2e-transparent-outbound-proxy-loopback",
+        temp_root: "transparent-outbound-proxy-loopback",
+        agent_id: "e2e-transparent-outbound-proxy-agent",
+        label: "e2e transparent outbound managed proxy loopback",
+        header_value: "transparent-outbound-proxy",
+        proxy_mode: OutboundProxyE2eMode::ManagedRelay,
+        policy_source: PolicySourceKind::LocalDirectory,
+    };
+
+    const EXTERNAL_PROXY: Self = Self {
+        case_name: "e2e-transparent-outbound-external-proxy-loopback",
+        temp_root: "out-ext",
+        agent_id: "e2e-transparent-outbound-external-proxy-agent",
+        label: "e2e transparent outbound external proxy loopback",
+        header_value: "transparent-outbound-external-proxy",
+        proxy_mode: OutboundProxyE2eMode::ExternalProxy,
+        policy_source: PolicySourceKind::LocalDirectory,
+    };
+
+    const OWNER_SCOPED_MANAGED_RELAY: Self = Self {
+        case_name: "e2e-transparent-outbound-owner-proxy-loopback",
+        temp_root: "out-owner",
+        agent_id: "e2e-transparent-outbound-owner-proxy-agent",
+        label: "e2e transparent outbound owner-scoped proxy loopback",
+        header_value: "transparent-outbound-owner-proxy",
+        proxy_mode: OutboundProxyE2eMode::OwnerScopedManagedRelay,
+        policy_source: PolicySourceKind::LocalDirectory,
+    };
+
+    const REMOTE_POLICY_BUNDLE: Self = Self {
+        case_name: "e2e-transparent-outbound-remote-policy-bundle-loopback",
+        temp_root: "out-remote-policy",
+        agent_id: "e2e-transparent-outbound-remote-policy-agent",
+        label: "e2e transparent outbound remote policy bundle loopback",
+        header_value: "transparent-outbound-remote-policy",
+        proxy_mode: OutboundProxyE2eMode::ManagedRelay,
+        policy_source: PolicySourceKind::RemoteBundle,
+    };
+
+    fn reload_policy_after_activation(self) -> bool {
+        self.policy_source == PolicySourceKind::RemoteBundle
+    }
+
+    fn client_owner(self) -> Option<ClientOwner> {
+        self.proxy_mode.client_owner()
+    }
+}
+
+fn run_outer(case: OutboundProxyE2eCase) -> Result<(), Box<dyn std::error::Error>> {
     if env::var_os(IN_NETNS_ENV).is_some() {
         require_root()?;
         verify_fresh_network_namespace(IN_NETNS_ENV)?;
-        run_inner(mode)
+        run_inner(case)
     } else {
         ensure_e2e_packages_built(["agent"])?;
         require_root()?;
         reexec_current_case_in_fresh_network_namespace(
             IN_NETNS_ENV,
-            mode.case_name(),
+            case.case_name,
             "network-namespace outbound transparent proxy e2e",
         )
     }
 }
 
-fn run_inner(mode: OutboundProxyE2eMode) -> Result<(), Box<dyn std::error::Error>> {
-    run_with_temp_root(mode.temp_root(), |root| run_at(root, mode))?;
-    println!("{} passed", mode.label());
+fn run_inner(case: OutboundProxyE2eCase) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_temp_root(case.temp_root, |root| run_at(root, case))?;
+    println!("{} passed", case.label);
     Ok(())
 }
 
-fn run_at(root: &Path, mode: OutboundProxyE2eMode) -> Result<(), Box<dyn std::error::Error>> {
+fn run_at(root: &Path, case: OutboundProxyE2eCase) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(root)?;
     ip(["link", "set", "lo", "up"])?;
 
@@ -159,29 +195,38 @@ fn run_at(root: &Path, mode: OutboundProxyE2eMode) -> Result<(), Box<dyn std::er
     let ready_socket_path = root.join("agent.ready.sock");
     let policy_path = root.join("outbound-proxy-e2e-policy.bundle");
 
-    write_policy_bundle(&policy_path)?;
+    let (policy_source, remote_policy_source) = prepare_policy_source(case, &policy_path)?;
     let webhook_receiver = WebhookBatchReceiver::spawn()?;
+    let remote_ports = redirected_remote_ports(
+        case.proxy_mode,
+        webhook_receiver.listen_port(),
+        &policy_source,
+    );
     write_agent_config(
         &config_path,
         &spool_path,
         &admin_socket_path,
-        &policy_path,
+        policy_source,
         webhook_receiver.endpoint(),
-        webhook_receiver.listen_port(),
-        mode,
+        &remote_ports,
+        case,
     )?;
 
     let supervisor = ChildSupervisor::new()?;
     let upstream = UpstreamServer::spawn()?;
-    let proxy_fixture = ProxyFixture::spawn(mode)?;
+    let proxy_fixture = ProxyFixture::spawn(case.proxy_mode)?;
     let mut ready_signal = UnixSocketReadySignal::bind(ready_socket_path)?;
     let mut agent = supervisor.watch(spawn_agent(&config_path, &ready_signal)?, "agent");
     wait_for_agent_ready(agent.child_mut(), &mut ready_signal)?;
-    assert_outbound_redirect_table_installed(webhook_receiver.listen_port(), mode)?;
+    assert_outbound_redirect_table_installed(&remote_ports, case.proxy_mode)?;
+    let remote_policy_reload = reload_remote_policy_if_configured(
+        case.reload_policy_after_activation(),
+        &admin_socket_path,
+    );
 
-    let client_response = run_client(mode.client_owner());
+    let client_response = run_client(case.client_owner());
     let upstream_report = upstream.join();
-    let unmatched_owner_bypass = match (&client_response, &upstream_report, mode) {
+    let unmatched_owner_bypass = match (&client_response, &upstream_report, case.proxy_mode) {
         (Ok(_), Ok(_), OutboundProxyE2eMode::OwnerScopedManagedRelay) => {
             assert_unmatched_owner_reaches_upstream_directly()
         }
@@ -194,17 +239,18 @@ fn run_at(root: &Path, mode: OutboundProxyE2eMode) -> Result<(), Box<dyn std::er
     };
     let proxy_metrics = match (&client_response, &upstream_report, &webhook_wait) {
         (Ok(_), Ok(_), Ok(())) => {
-            assert_proxy_relay_metrics(agent.child_mut(), &admin_socket_path, mode)
+            assert_proxy_relay_metrics(agent.child_mut(), &admin_socket_path, case.proxy_mode)
         }
         _ => Ok(()),
     };
     let agent_result = stop_running_child(agent.child_mut(), "agent");
     agent.unwatch();
     let cleanup_result = assert_transparent_interception_cleanup();
+    let remote_policy_source_result = assert_remote_policy_source_requests(remote_policy_source);
     let webhook_result = match webhook_wait {
         Ok(()) => webhook_receiver
             .join()
-            .and_then(|batches| assert_webhook_batches(&batches, mode)),
+            .and_then(|batches| assert_webhook_batches(&batches, case)),
         Err(error) => Err(error),
     };
 
@@ -213,6 +259,8 @@ fn run_at(root: &Path, mode: OutboundProxyE2eMode) -> Result<(), Box<dyn std::er
         upstream_report,
         unmatched_owner_bypass,
         proxy_fixture_report,
+        remote_policy_reload,
+        remote_policy_source_result,
         webhook_result,
         proxy_metrics,
         agent_result,
@@ -220,11 +268,37 @@ fn run_at(root: &Path, mode: OutboundProxyE2eMode) -> Result<(), Box<dyn std::er
     })
 }
 
+fn prepare_policy_source<'a>(
+    case: OutboundProxyE2eCase,
+    policy_path: &'a Path,
+) -> Result<(PolicySourceFixture<'a>, Option<HttpSourceServer>), Box<dyn std::error::Error>> {
+    match case.policy_source {
+        PolicySourceKind::LocalDirectory => {
+            write_policy_bundle(policy_path)?;
+            Ok((PolicySourceFixture::LocalDirectory(policy_path), None))
+        }
+        PolicySourceKind::RemoteBundle => {
+            let source = HttpSourceServer::spawn(
+                REMOTE_POLICY_BUNDLE_TARGET,
+                "application/toml",
+                remote_policy_bundle_document(),
+            )?;
+            let fixture = PolicySourceFixture::RemoteBundle {
+                endpoint: source.endpoint(),
+                listen_port: source.listen_port(),
+            };
+            Ok((fixture, Some(source)))
+        }
+    }
+}
+
 struct RunResults {
     client_response: Result<Vec<u8>, Box<dyn std::error::Error>>,
     upstream_report: Result<UpstreamReport, Box<dyn std::error::Error>>,
     unmatched_owner_bypass: Result<(), Box<dyn std::error::Error>>,
     proxy_fixture_report: Result<ProxyFixtureReport, Box<dyn std::error::Error>>,
+    remote_policy_reload: Result<(), Box<dyn std::error::Error>>,
+    remote_policy_source_result: Result<(), Box<dyn std::error::Error>>,
     webhook_result: Result<(), Box<dyn std::error::Error>>,
     proxy_metrics: Result<(), Box<dyn std::error::Error>>,
     agent_result: Result<(), Box<dyn std::error::Error>>,
@@ -237,6 +311,8 @@ fn merge_run_results(results: RunResults) -> Result<(), Box<dyn std::error::Erro
         upstream_report,
         unmatched_owner_bypass,
         proxy_fixture_report,
+        remote_policy_reload,
+        remote_policy_source_result,
         webhook_result,
         proxy_metrics,
         agent_result,
@@ -265,6 +341,12 @@ fn merge_run_results(results: RunResults) -> Result<(), Box<dyn std::error::Erro
         unmatched_owner_bypass,
         &mut errors,
     );
+    record_result("remote policy reload", remote_policy_reload, &mut errors);
+    record_result(
+        "remote policy source requests",
+        remote_policy_source_result,
+        &mut errors,
+    );
     match proxy_fixture_report {
         Ok(report) => record_result(
             "proxy fixture assertion",
@@ -286,6 +368,45 @@ fn merge_run_results(results: RunResults) -> Result<(), Box<dyn std::error::Erro
     } else {
         Err(e2e_error(errors.join("; ")).into())
     }
+}
+
+fn reload_remote_policy_if_configured(
+    enabled: bool,
+    admin_socket_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !enabled {
+        return Ok(());
+    }
+    let response = send_admin_request(
+        admin_socket_path,
+        serde_json::json!({ "command": "reload_policies" }),
+    )?;
+    if response["kind"] == serde_json::json!("policy_reload")
+        && response["loaded_count"] == serde_json::json!(1)
+    {
+        Ok(())
+    } else {
+        Err(e2e_error(format!(
+            "unexpected remote policy reload response: {response}"
+        ))
+        .into())
+    }
+}
+
+fn assert_remote_policy_source_requests(
+    remote_policy_source: Option<HttpSourceServer>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(source) = remote_policy_source else {
+        return Ok(());
+    };
+    let requests = source.finish()?;
+    if requests == REMOTE_POLICY_BUNDLE_REQUESTS {
+        return Ok(());
+    }
+    Err(e2e_error(format!(
+        "expected {REMOTE_POLICY_BUNDLE_REQUESTS} remote policy bundle GETs, got {requests}"
+    ))
+    .into())
 }
 
 fn assert_unmatched_owner_reaches_upstream_directly() -> Result<(), Box<dyn std::error::Error>> {
