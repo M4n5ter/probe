@@ -1,3 +1,4 @@
+mod audit;
 mod backend;
 mod lifecycle;
 mod listener_owner;
@@ -9,6 +10,9 @@ pub(crate) use crate::tcp_health::{
     TcpHealthMode as L7MitmBackendHealthMode, TcpHealthProbeGuard as L7MitmBackendHealthProbeGuard,
     TcpHealthSnapshot as L7MitmBackendHealthSnapshot,
 };
+#[cfg(test)]
+pub(crate) use audit::NoopL7MitmAuditSink;
+pub(crate) use audit::{DurableL7MitmAuditSink, L7MitmAuditSink};
 pub(crate) use lifecycle::{L7MitmBackendLifecycleGuard, start_backend_lifecycle};
 pub(crate) use state::{
     L7MitmPlaintextBridgeMode, L7MitmPlaintextBridgeSnapshot, L7MitmRuntime, L7MitmRuntimeHandle,

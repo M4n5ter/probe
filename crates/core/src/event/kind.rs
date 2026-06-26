@@ -29,6 +29,8 @@ pub enum EventKind {
     PolicyVerdict(Verdict),
     PolicyRuntimeError(PolicyRuntimeError),
     EnforcementDecision(EnforcementDecision),
+    #[serde(rename = "l7_mitm_audit")]
+    L7MitmAudit(L7MitmAuditEvent),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,6 +51,7 @@ pub enum EventType {
     PolicyVerdict,
     PolicyRuntimeError,
     EnforcementDecision,
+    L7MitmAudit,
 }
 
 impl EventType {
@@ -70,6 +73,7 @@ impl EventType {
             Self::PolicyVerdict => "policy_verdict",
             Self::PolicyRuntimeError => "policy_runtime_error",
             Self::EnforcementDecision => "enforcement_decision",
+            Self::L7MitmAudit => "l7_mitm_audit",
         }
     }
 }
@@ -101,6 +105,7 @@ impl FromStr for EventType {
             "policy_verdict" => Ok(Self::PolicyVerdict),
             "policy_runtime_error" => Ok(Self::PolicyRuntimeError),
             "enforcement_decision" => Ok(Self::EnforcementDecision),
+            "l7_mitm_audit" => Ok(Self::L7MitmAudit),
             _ => Err(UnknownEventType {
                 value: value.to_string(),
             }),
@@ -157,6 +162,7 @@ impl EventKind {
             Self::PolicyVerdict(_) => EventType::PolicyVerdict,
             Self::PolicyRuntimeError(_) => EventType::PolicyRuntimeError,
             Self::EnforcementDecision(_) => EventType::EnforcementDecision,
+            Self::L7MitmAudit(_) => EventType::L7MitmAudit,
         }
     }
 
@@ -178,7 +184,8 @@ impl EventKind {
             | Self::PolicyAlert(_)
             | Self::PolicyVerdict(_)
             | Self::PolicyRuntimeError(_)
-            | Self::EnforcementDecision(_) => None,
+            | Self::EnforcementDecision(_)
+            | Self::L7MitmAudit(_) => None,
         }
     }
 
@@ -250,7 +257,7 @@ pub struct WebSocketFrame {
     pub payload_fingerprint: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum WebSocketOpcode {
     Continuation,
@@ -309,13 +316,171 @@ pub struct PolicyRuntimeError {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+pub enum L7MitmAuditEvent {
+    External {
+        event: L7MitmExternalBackendAudit,
+    },
+    ManagedProcess {
+        event: L7MitmManagedProcessBackendAudit,
+    },
+}
+
+impl L7MitmAuditEvent {
+    pub fn phase(&self) -> L7MitmAuditPhase {
+        match self {
+            Self::External { event } => event.phase(),
+            Self::ManagedProcess { event } => event.phase(),
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::External { event } => event.reason(),
+            Self::ManagedProcess { event } => event.reason(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
+pub enum L7MitmExternalBackendAudit {
+    BackendStarting {
+        readiness_probe: L7MitmReadinessProbeAudit,
+    },
+    BackendHealthProbeStarted {
+        readiness_probe: L7MitmReadinessProbeAudit,
+    },
+    BackendStopping {
+        readiness_probe: L7MitmReadinessProbeAudit,
+    },
+    BackendStopped {
+        readiness_probe: L7MitmReadinessProbeAudit,
+    },
+    BackendStopFailed {
+        readiness_probe: L7MitmReadinessProbeAudit,
+        reason: String,
+    },
+}
+
+impl L7MitmExternalBackendAudit {
+    fn phase(&self) -> L7MitmAuditPhase {
+        match self {
+            Self::BackendStarting { .. } => L7MitmAuditPhase::BackendStarting,
+            Self::BackendHealthProbeStarted { .. } => L7MitmAuditPhase::BackendHealthProbeStarted,
+            Self::BackendStopping { .. } => L7MitmAuditPhase::BackendStopping,
+            Self::BackendStopped { .. } => L7MitmAuditPhase::BackendStopped,
+            Self::BackendStopFailed { .. } => L7MitmAuditPhase::BackendStopFailed,
+        }
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::BackendStopFailed { reason, .. } => Some(reason),
+            Self::BackendStarting { .. }
+            | Self::BackendHealthProbeStarted { .. }
+            | Self::BackendStopping { .. }
+            | Self::BackendStopped { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
+pub enum L7MitmManagedProcessBackendAudit {
+    BackendStarting {
+        readiness_probe: L7MitmReadinessProbeAudit,
+        process: L7MitmManagedProcessAudit,
+    },
+    BackendReady {
+        readiness_probe: L7MitmReadinessProbeAudit,
+        process: L7MitmManagedProcessAudit,
+    },
+    BackendStartFailed {
+        readiness_probe: L7MitmReadinessProbeAudit,
+        process: L7MitmManagedProcessAudit,
+        reason: String,
+    },
+    BackendStopping {
+        readiness_probe: L7MitmReadinessProbeAudit,
+        process: L7MitmManagedProcessAudit,
+    },
+    BackendStopped {
+        readiness_probe: L7MitmReadinessProbeAudit,
+        process: L7MitmManagedProcessAudit,
+    },
+    BackendStopFailed {
+        readiness_probe: L7MitmReadinessProbeAudit,
+        process: L7MitmManagedProcessAudit,
+        reason: String,
+    },
+}
+
+impl L7MitmManagedProcessBackendAudit {
+    fn phase(&self) -> L7MitmAuditPhase {
+        match self {
+            Self::BackendStarting { .. } => L7MitmAuditPhase::BackendStarting,
+            Self::BackendReady { .. } => L7MitmAuditPhase::BackendReady,
+            Self::BackendStartFailed { .. } => L7MitmAuditPhase::BackendStartFailed,
+            Self::BackendStopping { .. } => L7MitmAuditPhase::BackendStopping,
+            Self::BackendStopped { .. } => L7MitmAuditPhase::BackendStopped,
+            Self::BackendStopFailed { .. } => L7MitmAuditPhase::BackendStopFailed,
+        }
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::BackendStartFailed { reason, .. } | Self::BackendStopFailed { reason, .. } => {
+                Some(reason)
+            }
+            Self::BackendStarting { .. }
+            | Self::BackendReady { .. }
+            | Self::BackendStopping { .. }
+            | Self::BackendStopped { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum L7MitmAuditPhase {
+    BackendStarting,
+    BackendHealthProbeStarted,
+    BackendReady,
+    BackendStartFailed,
+    BackendStopping,
+    BackendStopped,
+    BackendStopFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct L7MitmReadinessProbeAudit {
+    pub target: String,
+    pub interval_ms: u64,
+    pub timeout_ms: u64,
+    pub failure_threshold: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct L7MitmManagedProcessAudit {
+    pub program: String,
+    pub args_count: u64,
+    pub working_dir: Option<String>,
+    pub process_group: Option<i32>,
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
 
     use crate::{
         Action, BodyChunk, CaptureLoss, Direction, DomainEvent, EnforcementDecision,
-        EnforcementMode, EnforcementOutcome, EventKind, EventType, Gap, HttpHeaders, OpaqueStream,
+        EnforcementMode, EnforcementOutcome, EventKind, EventType, Gap, HttpHeaders,
+        L7MitmAuditEvent, L7MitmExternalBackendAudit, L7MitmManagedProcessAudit,
+        L7MitmManagedProcessBackendAudit, L7MitmReadinessProbeAudit, OpaqueStream,
         PolicyRuntimeError, ProtocolError, SseEvent, Verdict, VerdictScope, WebSocketFrame,
         WebSocketHandoff, WebSocketOpcode,
     };
@@ -379,7 +544,7 @@ mod tests {
         }
     }
 
-    fn event_type_wire_cases() -> [(EventType, &'static str); 16] {
+    fn event_type_wire_cases() -> [(EventType, &'static str); 17] {
         [
             (EventType::ConnectionOpened, "connection_opened"),
             (EventType::ConnectionClosed, "connection_closed"),
@@ -397,10 +562,11 @@ mod tests {
             (EventType::PolicyVerdict, "policy_verdict"),
             (EventType::PolicyRuntimeError, "policy_runtime_error"),
             (EventType::EnforcementDecision, "enforcement_decision"),
+            (EventType::L7MitmAudit, "l7_mitm_audit"),
         ]
     }
 
-    fn event_kind_wire_cases() -> [EventKind; 16] {
+    fn event_kind_wire_cases() -> [EventKind; 17] {
         [
             EventKind::ConnectionOpened,
             EventKind::ConnectionClosed,
@@ -504,6 +670,61 @@ mod tests {
                 selector_matched: true,
                 reason: "dry run".to_string(),
             }),
+            EventKind::L7MitmAudit(L7MitmAuditEvent::ManagedProcess {
+                event: L7MitmManagedProcessBackendAudit::BackendReady {
+                    readiness_probe: readiness_probe_audit(),
+                    process: managed_process_audit(),
+                },
+            }),
         ]
+    }
+
+    #[test]
+    fn l7_mitm_audit_wire_shape_is_backend_specific() -> Result<(), Box<dyn std::error::Error>> {
+        let external = EventKind::L7MitmAudit(L7MitmAuditEvent::External {
+            event: L7MitmExternalBackendAudit::BackendHealthProbeStarted {
+                readiness_probe: readiness_probe_audit(),
+            },
+        });
+        let managed = EventKind::L7MitmAudit(L7MitmAuditEvent::ManagedProcess {
+            event: L7MitmManagedProcessBackendAudit::BackendStartFailed {
+                readiness_probe: readiness_probe_audit(),
+                process: managed_process_audit(),
+                reason: "readiness failed".to_string(),
+            },
+        });
+
+        let external = serde_json::to_value(&external)?;
+        assert_eq!(external["type"], "l7_mitm_audit");
+        assert_eq!(external["backend"], "external");
+        assert_eq!(external["event"]["phase"], "backend_health_probe_started");
+        assert!(external["event"].get("process").is_none());
+        assert!(external["event"].get("reason").is_none());
+
+        let managed = serde_json::to_value(&managed)?;
+        assert_eq!(managed["type"], "l7_mitm_audit");
+        assert_eq!(managed["backend"], "managed_process");
+        assert_eq!(managed["event"]["phase"], "backend_start_failed");
+        assert_eq!(managed["event"]["reason"], "readiness failed");
+        assert_eq!(managed["event"]["process"]["args_count"], 2);
+        Ok(())
+    }
+
+    fn readiness_probe_audit() -> L7MitmReadinessProbeAudit {
+        L7MitmReadinessProbeAudit {
+            target: "127.0.0.1:15002".to_string(),
+            interval_ms: 1_000,
+            timeout_ms: 100,
+            failure_threshold: 3,
+        }
+    }
+
+    fn managed_process_audit() -> L7MitmManagedProcessAudit {
+        L7MitmManagedProcessAudit {
+            program: "/usr/local/bin/sssa-mitm-proxy".to_string(),
+            args_count: 2,
+            working_dir: None,
+            process_group: Some(42),
+        }
     }
 }

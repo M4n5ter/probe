@@ -81,6 +81,7 @@ impl PreparedMitmBackend {
     }
 }
 
+#[derive(Debug)]
 pub(super) enum MitmBackendConfig {
     External {
         target: String,

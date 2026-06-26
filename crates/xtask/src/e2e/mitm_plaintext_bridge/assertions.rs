@@ -2,7 +2,10 @@ use std::{collections::BTreeSet, path::Path, path::PathBuf};
 
 use capture::CaptureEvent;
 use e2e_support::mitm_bridge;
-use probe_core::{CaptureProviderKind, CaptureSource, Direction, EventEnvelope, EventKind};
+use probe_core::{
+    CaptureProviderKind, CaptureSource, Direction, EventEnvelope, EventKind, L7MitmAuditEvent,
+    L7MitmAuditPhase, L7MitmExternalBackendAudit, L7MitmManagedProcessBackendAudit,
+};
 use serde_json::json;
 use storage::{FjallSpool, StoredEvent};
 
@@ -41,7 +44,11 @@ pub(super) fn assert_mitm_backend_runtime(
     assert_l7_mitm_runtime_status(case, &response)
 }
 
-pub(super) fn assert_spool_outputs(spool_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) fn assert_spool_outputs(
+    case: MitmBackendCase,
+    backend: &PreparedMitmBackend,
+    spool_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let spool = FjallSpool::open(spool_path)?;
     let ingress = spool.read_ingress_batch_after(0, 512)?;
     if ingress.is_empty() {
@@ -58,6 +65,7 @@ pub(super) fn assert_spool_outputs(spool_path: &Path) -> Result<(), Box<dyn std:
     assert_expected_bridge_export(&envelopes)?;
     assert_expected_libpcap_export(&envelopes)?;
     assert_expected_libpcap_policy_alerts(&envelopes)?;
+    assert_expected_l7_mitm_audit(case, backend, &envelopes)?;
 
     println!(
         "e2e MITM plaintext bridge live sidecar observed {} ingress records and {} export records",
@@ -228,6 +236,110 @@ fn assert_expected_libpcap_policy_alerts(
     Err(e2e_error(format!(
         "missing libpcap primary policy alerts; expected at least {:?}, observed {:?}",
         expected, observed
+    ))
+    .into())
+}
+
+fn assert_expected_l7_mitm_audit(
+    case: MitmBackendCase,
+    backend: &PreparedMitmBackend,
+    envelopes: &[EventEnvelope],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let audit_envelopes = envelopes
+        .iter()
+        .filter(|envelope| matches!(envelope.kind(), EventKind::L7MitmAudit(_)))
+        .collect::<Vec<_>>();
+    if audit_envelopes.is_empty() {
+        return Err(e2e_error("missing durable L7 MITM audit events").into());
+    }
+    if !audit_envelopes.iter().all(|envelope| {
+        envelope.origin().source() == CaptureSource::L7MitmControlPlane
+            && envelope.origin().provider() == CaptureProviderKind::Interception
+    }) {
+        return Err(e2e_error("L7 MITM audit events used the wrong provider origin").into());
+    }
+
+    let events = audit_envelopes
+        .iter()
+        .map(|envelope| match envelope.kind() {
+            EventKind::L7MitmAudit(event) => event,
+            _ => unreachable!("audit_envelopes only contains L7 MITM audit events"),
+        })
+        .collect::<Vec<_>>();
+    let phases = events
+        .iter()
+        .map(|event| event.phase())
+        .collect::<BTreeSet<_>>();
+    let required = BTreeSet::from([
+        L7MitmAuditPhase::BackendStarting,
+        L7MitmAuditPhase::BackendStopping,
+        L7MitmAuditPhase::BackendStopped,
+    ]);
+    if !phases.is_superset(&required) {
+        return Err(e2e_error(format!(
+            "missing L7 MITM lifecycle audit phases; expected at least {:?}, observed {:?}",
+            required, phases
+        ))
+        .into());
+    }
+    match (case, &backend.config) {
+        (MitmBackendCase::External, MitmBackendConfig::External { target }) => {
+            assert_expected_external_l7_mitm_audit(&events, target)?;
+        }
+        (MitmBackendCase::ManagedProcess, MitmBackendConfig::ManagedProcess { target, .. }) => {
+            assert_expected_managed_l7_mitm_audit(&events, target)?;
+        }
+        (case, config) => {
+            return Err(e2e_error(format!(
+                "MITM backend case/config mismatch: case={case:?}, config={config:?}"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn assert_expected_external_l7_mitm_audit(
+    events: &[&L7MitmAuditEvent],
+    target: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let has_health_probe_started = events.iter().any(|event| {
+        matches!(
+            event,
+            L7MitmAuditEvent::External {
+                event: L7MitmExternalBackendAudit::BackendHealthProbeStarted { readiness_probe },
+            } if readiness_probe.target == target
+        )
+    });
+    if has_health_probe_started {
+        return Ok(());
+    }
+    Err(e2e_error(format!(
+        "missing external L7 MITM backend_health_probe_started audit for target {target}"
+    ))
+    .into())
+}
+
+fn assert_expected_managed_l7_mitm_audit(
+    events: &[&L7MitmAuditEvent],
+    target: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let has_ready = events.iter().any(|event| {
+        matches!(
+            event,
+            L7MitmAuditEvent::ManagedProcess {
+                event: L7MitmManagedProcessBackendAudit::BackendReady {
+                    readiness_probe,
+                    process,
+                },
+            } if readiness_probe.target == target && process.process_group.is_some()
+        )
+    });
+    if has_ready {
+        return Ok(());
+    }
+    Err(e2e_error(format!(
+        "missing managed-process L7 MITM backend_ready audit with process group for target {target}"
     ))
     .into())
 }

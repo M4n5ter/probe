@@ -80,7 +80,8 @@ impl PolicyHook {
             | EventType::PolicyAlert
             | EventType::PolicyVerdict
             | EventType::PolicyRuntimeError
-            | EventType::EnforcementDecision => None,
+            | EventType::EnforcementDecision
+            | EventType::L7MitmAudit => None,
         }
     }
 }
@@ -850,6 +851,7 @@ mod tests {
             EventType::PolicyVerdict,
             EventType::PolicyRuntimeError,
             EventType::EnforcementDecision,
+            EventType::L7MitmAudit,
         ] {
             assert_eq!(PolicyHook::from_event_type(event_type), None);
         }

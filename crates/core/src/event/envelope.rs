@@ -546,6 +546,7 @@ fn subject_accepts_kind(subject: &EventSubject, kind: &EventKind) -> bool {
     matches!(
         (subject, kind),
         (EventSubject::Provider, EventKind::CaptureLoss(_))
+            | (EventSubject::Provider, EventKind::L7MitmAudit(_))
             | (EventSubject::Flow { .. }, EventKind::ConnectionOpened)
             | (EventSubject::Flow { .. }, EventKind::ConnectionClosed)
             | (EventSubject::Flow { .. }, EventKind::HttpRequestHeaders(_))

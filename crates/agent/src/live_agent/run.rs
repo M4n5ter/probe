@@ -29,7 +29,10 @@ use crate::{
         ExportDrainError, ExportWorker, ExportWorkerConfig,
         drain_planned_sinks_with_webhook_connection,
     },
-    l7_mitm::{L7MitmBackendLifecycleGuard, L7MitmRuntime, start_backend_lifecycle},
+    l7_mitm::{
+        DurableL7MitmAuditSink, L7MitmAuditSink, L7MitmBackendLifecycleGuard, L7MitmRuntime,
+        start_backend_lifecycle,
+    },
     runtime_composition::build_runtime_composition,
     shutdown,
     storage_retention::{
@@ -190,11 +193,11 @@ pub(crate) async fn run_live_agent(
     )?;
     println!(
         "agent stopped after reading {} capture events, journaling {} ingress records, processing {} ingress records ({} recovered), and storing {} export events",
-        summary.capture_events_read,
-        summary.ingress_records_journaled,
-        summary.ingress_records_processed,
-        summary.ingress_records_recovered,
-        summary.export_events_written
+        summary.pipeline.capture_events_read,
+        summary.pipeline.ingress_records_journaled,
+        summary.pipeline.ingress_records_processed,
+        summary.pipeline.ingress_records_recovered,
+        summary.durable_export_events_written
     );
     Ok(())
 }
@@ -218,11 +221,16 @@ struct BlockingCaptureRun {
 }
 
 struct BlockingCaptureRunOutput {
-    summary_result: Result<PipelineSummary, AgentError>,
+    summary_result: Result<LiveAgentRunSummary, AgentError>,
     interception_cleanup_result:
         Result<(), crate::transparent_interception::TransparentInterceptionError>,
     l7_mitm_cleanup_result: Result<(), AgentError>,
     storage_retention_worker: Option<StorageRetentionWorkerHandle>,
+}
+
+struct LiveAgentRunSummary {
+    pipeline: PipelineSummary,
+    durable_export_events_written: u64,
 }
 
 impl BlockingCaptureRun {
@@ -247,6 +255,12 @@ impl BlockingCaptureRun {
         let mut active_interception_guard = ActiveInterceptionGuard::default();
         let mut storage_retention_worker = None;
         let l7_mitm_runtime = l7_mitm.handle();
+        let export_event_metrics = pipeline_metrics.clone();
+        let l7_mitm_audit: Arc<dyn L7MitmAuditSink> = Arc::new(DurableL7MitmAuditSink::new(
+            Arc::clone(&spool),
+            plan.config.config_version.clone(),
+            pipeline_metrics.clone(),
+        ));
         let summary_result = (|| {
             let mut parser_factory = Http1ParserFactory::default();
             let mut pipeline = CapturePipeline::new(
@@ -268,6 +282,7 @@ impl BlockingCaptureRun {
             active_interception_guard.l7_mitm_backend = start_backend_lifecycle(
                 &plan.enforcement.interception.mitm.backend,
                 l7_mitm_runtime.clone(),
+                Arc::clone(&l7_mitm_audit),
                 &shutdown_requested,
             )
             .map_err(AgentError::L7MitmRuntime)?;
@@ -294,6 +309,10 @@ impl BlockingCaptureRun {
         })();
         let (interception_cleanup_result, l7_mitm_cleanup_result) =
             active_interception_guard.stop();
+        let summary_result = summary_result.map(|pipeline| LiveAgentRunSummary {
+            pipeline,
+            durable_export_events_written: export_event_metrics.snapshot().export_events_written,
+        });
         BlockingCaptureRunOutput {
             summary_result,
             interception_cleanup_result,
@@ -370,14 +389,14 @@ fn signal_unix_socket(path: PathBuf) -> Result<(), AgentError> {
 }
 
 fn merge_run_results(
-    summary_result: Result<PipelineSummary, AgentError>,
+    summary_result: Result<LiveAgentRunSummary, AgentError>,
     interception_cleanup_result: Result<
         (),
         crate::transparent_interception::TransparentInterceptionError,
     >,
     l7_mitm_backend_lifecycle_cleanup_result: Result<(), AgentError>,
     drain_result: Result<(), ExportDrainError>,
-) -> Result<PipelineSummary, AgentError> {
+) -> Result<LiveAgentRunSummary, AgentError> {
     let summary = match summary_result {
         Ok(summary) => summary,
         Err(run_error) => {

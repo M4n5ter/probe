@@ -250,7 +250,8 @@ impl<'a> PolicyEventKindView<'a> {
             | EventKind::PolicyAlert(_)
             | EventKind::PolicyVerdict(_)
             | EventKind::PolicyRuntimeError(_)
-            | EventKind::EnforcementDecision(_) => {
+            | EventKind::EnforcementDecision(_)
+            | EventKind::L7MitmAudit(_) => {
                 return None;
             }
         };
@@ -467,6 +468,7 @@ fn source_name(source: CaptureSource) -> &'static str {
         CaptureSource::LibsslUprobe => "libssl_uprobe",
         CaptureSource::TlsSessionSecret => "tls_session_secret",
         CaptureSource::ExternalPlaintextFeed => "external_plaintext_feed",
+        CaptureSource::L7MitmControlPlane => "l7_mitm_control_plane",
         CaptureSource::Replay => "replay",
         CaptureSource::Mock => "mock",
     }
@@ -478,6 +480,7 @@ fn provider_name(provider: CaptureProviderKind) -> &'static str {
         CaptureProviderKind::Ebpf => "ebpf",
         CaptureProviderKind::Libpcap => "libpcap",
         CaptureProviderKind::Plaintext => "plaintext",
+        CaptureProviderKind::Interception => "interception",
     }
 }
 

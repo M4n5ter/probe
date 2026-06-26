@@ -170,7 +170,7 @@ fn run_at(root: &Path, case: MitmBackendCase) -> Result<(), Box<dyn std::error::
         managed_backend_cleanup: managed_backend_cleanup_result,
     };
     let spool_result = if phases.completed_pipeline() {
-        assert_spool_outputs(&spool_path)
+        assert_spool_outputs(case, &mitm_backend, &spool_path)
     } else {
         skipped_after_upstream_failure()
     };

@@ -20,10 +20,13 @@ use probe_core::{
     EventProvenance, FlowIdentity, PolicyEmissionStage, PolicyRuntimeError, SpoolPayloadSchema,
     Timestamp, Verdict,
 };
-use storage::{AppendOutcome, DurableSpool, IngressCursorOwner, SpoolPayload};
+use storage::{DurableSpool, IngressCursorOwner, SpoolPayload};
 use thiserror::Error;
 
-use crate::runtime_metrics::PipelineRuntimeMetrics;
+use crate::{
+    export_event_writer::{ExportEventWriteError, ExportEventWriter},
+    runtime_metrics::PipelineRuntimeMetrics,
+};
 
 pub const PARSER_INGRESS_CURSOR_OWNER: IngressCursorOwner = IngressCursorOwner::new("parser");
 
@@ -43,6 +46,15 @@ pub enum PipelineError {
         expected: &'static str,
         actual: String,
     },
+}
+
+impl From<ExportEventWriteError> for PipelineError {
+    fn from(error: ExportEventWriteError) -> Self {
+        match error {
+            ExportEventWriteError::Json(error) => Self::Json(error),
+            ExportEventWriteError::Storage(error) => Self::Storage(error),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -716,16 +728,9 @@ where
     }
 
     fn append_envelope(&self, envelope: &EventEnvelope) -> Result<bool, PipelineError> {
-        let payload = serde_json::to_vec(envelope)?;
-        let outcome = self.spool.append_export_once(
-            &envelope.id().0,
-            SpoolPayload::new(SpoolPayloadSchema::EventEnvelopeSubjectOriginJson, payload),
-        )?;
-        let appended = matches!(outcome, AppendOutcome::Appended(_));
-        if appended && let Some(metrics) = &self.runtime_metrics {
-            metrics.record_export_event_written();
-        }
-        Ok(appended)
+        Ok(ExportEventWriter::new(self.spool)
+            .with_runtime_metrics(self.runtime_metrics.clone())
+            .append_once(envelope)?)
     }
 }
 

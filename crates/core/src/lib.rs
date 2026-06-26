@@ -13,9 +13,11 @@ pub use capability::{
 pub use event::{
     BodyChunk, CaptureLoss, CaptureOrigin, CaptureProviderKind, CaptureSource, Direction,
     DomainEvent, EnforcementEvidence, EventEmission, EventEnvelope, EventId, EventKind,
-    EventProvenance, EventSubject, EventType, Gap, HttpHeaders, ObservationOnlyReason,
-    OpaqueStream, PolicyEmissionStage, PolicyRuntimeError, ProtocolError, SseEvent, Timestamp,
-    UnknownEventType, WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
+    EventProvenance, EventSubject, EventType, Gap, HttpHeaders, L7MitmAuditEvent, L7MitmAuditPhase,
+    L7MitmExternalBackendAudit, L7MitmManagedProcessAudit, L7MitmManagedProcessBackendAudit,
+    L7MitmReadinessProbeAudit, ObservationOnlyReason, OpaqueStream, PolicyEmissionStage,
+    PolicyRuntimeError, ProtocolError, SseEvent, Timestamp, UnknownEventType, WebSocketFrame,
+    WebSocketHandoff, WebSocketOpcode,
 };
 pub use identity::{
     AddressPort, FlowContext, FlowIdentity, ProcessContext, ProcessGeneration, ProcessIdentity,
