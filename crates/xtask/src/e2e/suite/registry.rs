@@ -12,6 +12,8 @@ use super::super::{
     mitm_plaintext_bridge::{
         run as run_mitm_plaintext_bridge_live_sidecar,
         run_managed as run_managed_mitm_plaintext_bridge_live_sidecar,
+        run_managed_outbound as run_managed_outbound_mitm_plaintext_bridge_live_sidecar,
+        run_outbound as run_outbound_mitm_plaintext_bridge_live_sidecar,
     },
     plaintext_feed::run as run_plaintext_feed,
     remote_enforcement_policy::run as run_remote_enforcement_policy,
@@ -276,6 +278,16 @@ const E2E_CASES: &[E2eCase] = &[
         requirement: E2eRequirement::RootNetAdmin,
         run: run_managed_mitm_plaintext_bridge_live_sidecar,
     },
+    E2eCase {
+        name: "e2e-outbound-mitm-plaintext-bridge-live-sidecar",
+        requirement: E2eRequirement::RootNetAdmin,
+        run: run_outbound_mitm_plaintext_bridge_live_sidecar,
+    },
+    E2eCase {
+        name: "e2e-managed-outbound-mitm-plaintext-bridge-live-sidecar",
+        requirement: E2eRequirement::RootNetAdmin,
+        run: run_managed_outbound_mitm_plaintext_bridge_live_sidecar,
+    },
 ];
 
 const E2E_PROFILES: &[E2eProfile] = &[
@@ -342,6 +354,8 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-transparent-outbound-remote-policy-bundle-loopback",
             "e2e-mitm-plaintext-bridge-live-sidecar",
             "e2e-managed-mitm-plaintext-bridge-live-sidecar",
+            "e2e-outbound-mitm-plaintext-bridge-live-sidecar",
+            "e2e-managed-outbound-mitm-plaintext-bridge-live-sidecar",
         ]),
     },
     E2eProfile {
@@ -387,6 +401,8 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-transparent-outbound-remote-policy-bundle-loopback",
             "e2e-mitm-plaintext-bridge-live-sidecar",
             "e2e-managed-mitm-plaintext-bridge-live-sidecar",
+            "e2e-outbound-mitm-plaintext-bridge-live-sidecar",
+            "e2e-managed-outbound-mitm-plaintext-bridge-live-sidecar",
         ]),
     },
 ];
@@ -582,6 +598,8 @@ mod tests {
                 "e2e-transparent-outbound-remote-policy-bundle-loopback",
                 "e2e-mitm-plaintext-bridge-live-sidecar",
                 "e2e-managed-mitm-plaintext-bridge-live-sidecar",
+                "e2e-outbound-mitm-plaintext-bridge-live-sidecar",
+                "e2e-managed-outbound-mitm-plaintext-bridge-live-sidecar",
             ]),
         },
         ExpectedProfile {
@@ -629,6 +647,8 @@ mod tests {
                 "e2e-transparent-outbound-remote-policy-bundle-loopback",
                 "e2e-mitm-plaintext-bridge-live-sidecar",
                 "e2e-managed-mitm-plaintext-bridge-live-sidecar",
+                "e2e-outbound-mitm-plaintext-bridge-live-sidecar",
+                "e2e-managed-outbound-mitm-plaintext-bridge-live-sidecar",
             ]),
         },
     ];

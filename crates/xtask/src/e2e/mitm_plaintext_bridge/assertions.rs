@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    net::{Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -7,6 +8,7 @@ use std::{
 
 use capture::CaptureEvent;
 use e2e_support::mitm_bridge;
+use probe_config::TransparentInterceptionStrategyConfig;
 use probe_core::{
     CaptureProviderKind, CaptureSource, Direction, EventEnvelope, EventKind, L7MitmAuditEvent,
     L7MitmAuditPhase, L7MitmExternalBackendAudit, L7MitmManagedProcessBackendAudit,
@@ -16,7 +18,8 @@ use storage::{FjallSpool, StoredEvent};
 
 use super::{
     backend::{
-        MitmBackendCase, MitmBackendConfig, PreparedMitmBackend, wait_for_managed_backend_pid,
+        MitmBackendConfig, MitmBackendKind, MitmBridgeCase, MitmBridgeDirection,
+        PreparedMitmBackend, wait_for_managed_backend_pid,
     },
     feed::{
         E2E_EXPORT_CURSOR_OWNER, EXPECTED_POLICY_VERSION, expected_bridge_policy_alert_message,
@@ -30,9 +33,10 @@ use crate::e2e::{
 };
 
 const HEALTH_TRANSITION_TIMEOUT: Duration = Duration::from_secs(5);
+const OUTBOUND_REDIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) fn assert_mitm_backend_runtime(
-    case: MitmBackendCase,
+    case: MitmBridgeCase,
     admin_socket_path: &Path,
     backend: &PreparedMitmBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -52,11 +56,11 @@ pub(super) fn assert_mitm_backend_runtime(
 }
 
 pub(super) fn exercise_l7_mitm_health_transition(
-    case: MitmBackendCase,
+    case: MitmBridgeCase,
     backend: &mut PreparedMitmBackend,
     admin_socket_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if case != MitmBackendCase::External {
+    if case.backend() != MitmBackendKind::External {
         return Ok(());
     }
     wait_for_l7_mitm_backend_health(admin_socket_path, "healthy")?;
@@ -66,8 +70,25 @@ pub(super) fn exercise_l7_mitm_health_transition(
     wait_for_l7_mitm_backend_health(admin_socket_path, "healthy")
 }
 
+pub(super) fn assert_outbound_redirect_reaches_mitm_backend(
+    case: MitmBridgeCase,
+    intercept_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if case.direction() != MitmBridgeDirection::Outbound {
+        return Ok(());
+    }
+    let target = SocketAddr::from((Ipv4Addr::LOCALHOST, intercept_port));
+    TcpStream::connect_timeout(&target, OUTBOUND_REDIRECT_CONNECT_TIMEOUT).map_err(|error| {
+        e2e_error(format!(
+            "{} outbound MITM redirect did not connect through selector port {intercept_port}: {error}",
+            case.case_name()
+        ))
+    })?;
+    Ok(())
+}
+
 pub(super) fn assert_spool_outputs(
-    case: MitmBackendCase,
+    case: MitmBridgeCase,
     backend: &PreparedMitmBackend,
     spool_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -120,14 +141,14 @@ fn wait_for_l7_mitm_backend_health(
 }
 
 fn assert_backend_status(
-    case: MitmBackendCase,
+    case: MitmBridgeCase,
     backend: &PreparedMitmBackend,
     response: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let status_backend = &response["snapshot"]["enforcement"]["interception"]["mitm"]["backend"];
-    let expected_mode = match case {
-        MitmBackendCase::External => "external",
-        MitmBackendCase::ManagedProcess => "managed_process",
+    let expected_mode = match case.backend() {
+        MitmBackendKind::External => "external",
+        MitmBackendKind::ManagedProcess => "managed_process",
     };
     if status_backend["mode"] != json!(expected_mode) {
         return Err(e2e_error(format!(
@@ -152,9 +173,24 @@ fn assert_backend_status(
 }
 
 fn assert_l7_mitm_runtime_status(
-    case: MitmBackendCase,
+    case: MitmBridgeCase,
     response: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let status_strategy = &response["snapshot"]["enforcement"]["interception"]["strategy"];
+    let expected_strategy = match case.direction() {
+        MitmBridgeDirection::Inbound => TransparentInterceptionStrategyConfig::InboundTproxyMitm,
+        MitmBridgeDirection::Outbound => {
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm
+        }
+    };
+    if *status_strategy != json!(expected_strategy) {
+        return Err(e2e_error(format!(
+            "{} expected L7 MITM strategy {:?}, got {status_strategy}",
+            case.case_name(),
+            expected_strategy
+        ))
+        .into());
+    }
     let runtime = &response["snapshot"]["enforcement"]["interception"]["runtime_l7_mitm"];
     if runtime["backend_health"]["mode"] != json!("healthy") {
         return Err(e2e_error(format!(
@@ -285,7 +321,7 @@ fn assert_expected_libpcap_policy_alerts(
 }
 
 fn assert_expected_l7_mitm_audit(
-    case: MitmBackendCase,
+    case: MitmBridgeCase,
     backend: &PreparedMitmBackend,
     envelopes: &[EventEnvelope],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -319,7 +355,7 @@ fn assert_expected_l7_mitm_audit(
         L7MitmAuditPhase::BackendStopping,
         L7MitmAuditPhase::BackendStopped,
     ]);
-    if case == MitmBackendCase::External {
+    if case.backend() == MitmBackendKind::External {
         required.insert(L7MitmAuditPhase::BackendUnhealthy);
         required.insert(L7MitmAuditPhase::BackendRecovered);
     }
@@ -330,16 +366,16 @@ fn assert_expected_l7_mitm_audit(
         ))
         .into());
     }
-    match (case, &backend.config) {
-        (MitmBackendCase::External, MitmBackendConfig::External { target }) => {
+    match (case.backend(), &backend.config) {
+        (MitmBackendKind::External, MitmBackendConfig::External { target }) => {
             assert_expected_external_l7_mitm_audit(&events, target)?;
         }
-        (MitmBackendCase::ManagedProcess, MitmBackendConfig::ManagedProcess { target, .. }) => {
+        (MitmBackendKind::ManagedProcess, MitmBackendConfig::ManagedProcess { target, .. }) => {
             assert_expected_managed_l7_mitm_audit(&events, target)?;
         }
-        (case, config) => {
+        (backend_kind, config) => {
             return Err(e2e_error(format!(
-                "MITM backend case/config mismatch: case={case:?}, config={config:?}"
+                "MITM backend case/config mismatch: backend={backend_kind:?}, config={config:?}"
             ))
             .into());
         }

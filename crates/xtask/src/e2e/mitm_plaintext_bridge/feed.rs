@@ -4,7 +4,7 @@ use capture::CaptureEvent;
 use e2e_support::mitm_bridge;
 use probe_core::EventEnvelope;
 
-use super::backend::MitmBackendCase;
+use super::backend::{MitmBackendKind, MitmBridgeCase};
 
 pub(super) const E2E_EXPORT_CURSOR_OWNER: &str = "e2e-mitm-bridge";
 pub(super) const POLICY_ID: &str = "mitm-bridge-e2e-policy";
@@ -17,24 +17,24 @@ pub(super) const RESPONSE_BODY_BYTES: usize = 32;
 pub(super) const WRITE_CHUNKS: usize = 2;
 
 pub(super) fn initialize_bridge_feed(
-    case: MitmBackendCase,
+    case: MitmBridgeCase,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match case {
-        MitmBackendCase::External => {
+    match case.backend() {
+        MitmBackendKind::External => {
             mitm_bridge::create_empty_capture_event_feed(path).map_err(Into::into)
         }
-        MitmBackendCase::ManagedProcess => Ok(()),
+        MitmBackendKind::ManagedProcess => Ok(()),
     }
 }
 
 pub(super) fn append_bridge_feed_from_harness(
-    case: MitmBackendCase,
+    case: MitmBridgeCase,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match case {
-        MitmBackendCase::External => mitm_bridge::append_capture_event_feed(path),
-        MitmBackendCase::ManagedProcess => Ok(()),
+    match case.backend() {
+        MitmBackendKind::External => mitm_bridge::append_capture_event_feed(path),
+        MitmBackendKind::ManagedProcess => Ok(()),
     }
 }
 

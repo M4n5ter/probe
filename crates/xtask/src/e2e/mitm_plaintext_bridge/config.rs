@@ -6,12 +6,12 @@ use probe_config::{
     TransparentInterceptionMitmBackendReadinessProbeConfig,
     TransparentInterceptionMitmManagedProcessConfig,
     TransparentInterceptionMitmPlaintextBridgeModeConfig, TransparentInterceptionProxyModeConfig,
-    TransparentInterceptionStrategyConfig,
+    TransparentInterceptionProxySelfBypassConfig, TransparentInterceptionStrategyConfig,
 };
 use probe_core::{Direction, EnforcementMode, ProcessSelector, Selector, TrafficSelector};
 
 use super::{
-    backend::{MitmBackendCase, MitmBackendConfig},
+    backend::{MitmBackendConfig, MitmBridgeCase, MitmBridgeDirection},
     feed::{
         POLICY_ALERT_PREFIX, POLICY_ID, POLICY_VERSION, REQUEST_BODY_BYTES, REQUESTS,
         RESPONSE_BODY_BYTES, WRITE_CHUNKS,
@@ -23,7 +23,7 @@ const AGENT_ID: &str = "e2e-mitm-bridge-agent";
 const INTERFACE: &str = "any";
 
 pub(super) struct AgentConfigInputs<'a> {
-    pub(super) case: MitmBackendCase,
+    pub(super) case: MitmBridgeCase,
     pub(super) config_path: &'a Path,
     pub(super) policy_path: &'a Path,
     pub(super) bridge_feed_path: &'a Path,
@@ -75,17 +75,13 @@ pub(super) fn write_agent_config(
         selector: None,
     });
     config.enforcement.mode = EnforcementMode::Enforce;
-    config.enforcement.interception.strategy =
-        TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+    config.enforcement.interception.strategy = interception_strategy(inputs.case.direction());
     config.enforcement.interception.proxy.mode = TransparentInterceptionProxyModeConfig::External;
+    config.enforcement.interception.proxy.self_bypass = proxy_self_bypass(inputs.case.direction());
     config.enforcement.interception.proxy.listen_port = Some(inputs.proxy_port);
-    config.enforcement.interception.selector = Some(Selector::term(
-        ProcessSelector::default(),
-        TrafficSelector {
-            local_ports: vec![inputs.intercept_port],
-            directions: vec![Direction::Inbound],
-            ..TrafficSelector::default()
-        },
+    config.enforcement.interception.selector = Some(interception_selector(
+        inputs.case.direction(),
+        inputs.intercept_port,
     ));
     config.enforcement.interception.mitm.backend = match inputs.mitm_backend {
         MitmBackendConfig::External { target } => {
@@ -128,6 +124,48 @@ pub(super) fn write_agent_config(
     ];
     fs::write(inputs.config_path, toml::to_string(&config)?)?;
     Ok(())
+}
+
+fn interception_strategy(direction: MitmBridgeDirection) -> TransparentInterceptionStrategyConfig {
+    match direction {
+        MitmBridgeDirection::Inbound => TransparentInterceptionStrategyConfig::InboundTproxyMitm,
+        MitmBridgeDirection::Outbound => {
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm
+        }
+    }
+}
+
+fn proxy_self_bypass(
+    direction: MitmBridgeDirection,
+) -> TransparentInterceptionProxySelfBypassConfig {
+    match direction {
+        MitmBridgeDirection::Inbound => TransparentInterceptionProxySelfBypassConfig::None,
+        MitmBridgeDirection::Outbound => {
+            TransparentInterceptionProxySelfBypassConfig::UsesReservedMark
+        }
+    }
+}
+
+fn interception_selector(direction: MitmBridgeDirection, port: u16) -> Selector {
+    match direction {
+        MitmBridgeDirection::Inbound => Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![port],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ),
+        MitmBridgeDirection::Outbound => Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![port],
+                directions: vec![Direction::Outbound],
+                remote_addresses: vec!["127.0.0.1".to_string()],
+                ..TrafficSelector::default()
+            },
+        ),
+    }
 }
 
 pub(super) fn write_policy_bundle(path: &Path) -> Result<(), std::io::Error> {

@@ -20,11 +20,20 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use super::super::harness::{debug_binary, e2e_error};
 
-pub(super) const EXTERNAL_CASE_NAME: &str = "e2e-mitm-plaintext-bridge-live-sidecar";
-pub(super) const MANAGED_CASE_NAME: &str = "e2e-managed-mitm-plaintext-bridge-live-sidecar";
-pub(super) const EXTERNAL_IN_NETNS_ENV: &str = "TRAFFIC_PROBE_E2E_MITM_PLAINTEXT_BRIDGE_NETNS";
-pub(super) const MANAGED_IN_NETNS_ENV: &str =
+pub(super) const EXTERNAL_INBOUND_CASE_NAME: &str = "e2e-mitm-plaintext-bridge-live-sidecar";
+pub(super) const MANAGED_INBOUND_CASE_NAME: &str = "e2e-managed-mitm-plaintext-bridge-live-sidecar";
+pub(super) const EXTERNAL_OUTBOUND_CASE_NAME: &str =
+    "e2e-outbound-mitm-plaintext-bridge-live-sidecar";
+pub(super) const MANAGED_OUTBOUND_CASE_NAME: &str =
+    "e2e-managed-outbound-mitm-plaintext-bridge-live-sidecar";
+pub(super) const EXTERNAL_INBOUND_IN_NETNS_ENV: &str =
+    "TRAFFIC_PROBE_E2E_MITM_PLAINTEXT_BRIDGE_NETNS";
+pub(super) const MANAGED_INBOUND_IN_NETNS_ENV: &str =
     "TRAFFIC_PROBE_E2E_MANAGED_MITM_PLAINTEXT_BRIDGE_NETNS";
+pub(super) const EXTERNAL_OUTBOUND_IN_NETNS_ENV: &str =
+    "TRAFFIC_PROBE_E2E_OUTBOUND_MITM_PLAINTEXT_BRIDGE_NETNS";
+pub(super) const MANAGED_OUTBOUND_IN_NETNS_ENV: &str =
+    "TRAFFIC_PROBE_E2E_MANAGED_OUTBOUND_MITM_PLAINTEXT_BRIDGE_NETNS";
 
 const DEFAULT_INTERCEPT_PORT: u16 = 65_529;
 const DEFAULT_MANAGED_BACKEND_PORT: u16 = 65_521;
@@ -33,44 +42,84 @@ const EXTERNAL_BACKEND_REBIND_TIMEOUT: Duration = Duration::from_secs(2);
 const EXTERNAL_BACKEND_LISTEN_BACKLOG: i32 = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum MitmBackendCase {
+pub(super) enum MitmBridgeCase {
+    ExternalInbound,
+    ManagedInbound,
+    ExternalOutbound,
+    ManagedOutbound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MitmBridgeDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MitmBackendKind {
     External,
     ManagedProcess,
 }
 
-impl MitmBackendCase {
+impl MitmBridgeCase {
     pub(super) const fn case_name(self) -> &'static str {
         match self {
-            Self::External => EXTERNAL_CASE_NAME,
-            Self::ManagedProcess => MANAGED_CASE_NAME,
+            Self::ExternalInbound => EXTERNAL_INBOUND_CASE_NAME,
+            Self::ManagedInbound => MANAGED_INBOUND_CASE_NAME,
+            Self::ExternalOutbound => EXTERNAL_OUTBOUND_CASE_NAME,
+            Self::ManagedOutbound => MANAGED_OUTBOUND_CASE_NAME,
         }
     }
 
     pub(super) const fn netns_env(self) -> &'static str {
         match self {
-            Self::External => EXTERNAL_IN_NETNS_ENV,
-            Self::ManagedProcess => MANAGED_IN_NETNS_ENV,
+            Self::ExternalInbound => EXTERNAL_INBOUND_IN_NETNS_ENV,
+            Self::ManagedInbound => MANAGED_INBOUND_IN_NETNS_ENV,
+            Self::ExternalOutbound => EXTERNAL_OUTBOUND_IN_NETNS_ENV,
+            Self::ManagedOutbound => MANAGED_OUTBOUND_IN_NETNS_ENV,
         }
     }
 
     pub(super) const fn temp_root_name(self) -> &'static str {
         match self {
-            Self::External => "mitm-bridge",
-            Self::ManagedProcess => "managed-mitm-bridge",
+            Self::ExternalInbound => "mitm-bridge",
+            Self::ManagedInbound => "managed-mitm-bridge",
+            Self::ExternalOutbound => "outbound-mitm-bridge",
+            Self::ManagedOutbound => "managed-outbound-mitm-bridge",
         }
     }
 
     pub(super) const fn failure_label(self) -> &'static str {
         match self {
-            Self::External => "e2e MITM plaintext bridge live sidecar",
-            Self::ManagedProcess => "e2e managed MITM plaintext bridge live sidecar",
+            Self::ExternalInbound => "e2e MITM plaintext bridge live sidecar",
+            Self::ManagedInbound => "e2e managed MITM plaintext bridge live sidecar",
+            Self::ExternalOutbound => "e2e outbound MITM plaintext bridge live sidecar",
+            Self::ManagedOutbound => "e2e managed outbound MITM plaintext bridge live sidecar",
         }
     }
 
     pub(super) const fn success_label(self) -> &'static str {
         match self {
-            Self::External => "e2e MITM plaintext bridge live sidecar passed",
-            Self::ManagedProcess => "e2e managed MITM plaintext bridge live sidecar passed",
+            Self::ExternalInbound => "e2e MITM plaintext bridge live sidecar passed",
+            Self::ManagedInbound => "e2e managed MITM plaintext bridge live sidecar passed",
+            Self::ExternalOutbound => "e2e outbound MITM plaintext bridge live sidecar passed",
+            Self::ManagedOutbound => {
+                "e2e managed outbound MITM plaintext bridge live sidecar passed"
+            }
+        }
+    }
+
+    pub(super) const fn backend(self) -> MitmBackendKind {
+        match self {
+            Self::ExternalInbound | Self::ExternalOutbound => MitmBackendKind::External,
+            Self::ManagedInbound | Self::ManagedOutbound => MitmBackendKind::ManagedProcess,
+        }
+    }
+
+    pub(super) const fn direction(self) -> MitmBridgeDirection {
+        match self {
+            Self::ExternalInbound | Self::ManagedInbound => MitmBridgeDirection::Inbound,
+            Self::ExternalOutbound | Self::ManagedOutbound => MitmBridgeDirection::Outbound,
         }
     }
 }
@@ -198,14 +247,14 @@ pub(super) enum MitmBackendConfig {
 }
 
 pub(super) fn prepare_mitm_backend(
-    case: MitmBackendCase,
+    case: MitmBridgeCase,
     root: &Path,
     bridge_feed_path: &Path,
     used_ports: impl IntoIterator<Item = u16>,
 ) -> Result<PreparedMitmBackend, Box<dyn std::error::Error>> {
-    match case {
-        MitmBackendCase::External => prepare_external_backend(),
-        MitmBackendCase::ManagedProcess => {
+    match case.backend() {
+        MitmBackendKind::External => prepare_external_backend(),
+        MitmBackendKind::ManagedProcess => {
             prepare_managed_backend(root, bridge_feed_path, used_ports)
         }
     }

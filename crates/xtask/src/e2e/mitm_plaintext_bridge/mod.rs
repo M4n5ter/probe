@@ -10,10 +10,11 @@ use std::{
 };
 
 use assertions::{
-    assert_mitm_backend_runtime, assert_spool_outputs, exercise_l7_mitm_health_transition,
+    assert_mitm_backend_runtime, assert_outbound_redirect_reaches_mitm_backend,
+    assert_spool_outputs, exercise_l7_mitm_health_transition,
 };
 use backend::{
-    MitmBackendCase, cleanup_managed_backend, prepare_mitm_backend, unused_intercept_port,
+    MitmBridgeCase, cleanup_managed_backend, prepare_mitm_backend, unused_intercept_port,
 };
 use config::{AgentConfigInputs, fixture_config, write_agent_config, write_policy_bundle};
 use feed::{
@@ -36,14 +37,22 @@ use super::{
 };
 
 pub(crate) fn run() -> ExitCode {
-    run_case(MitmBackendCase::External)
+    run_case(MitmBridgeCase::ExternalInbound)
 }
 
 pub(crate) fn run_managed() -> ExitCode {
-    run_case(MitmBackendCase::ManagedProcess)
+    run_case(MitmBridgeCase::ManagedInbound)
 }
 
-fn run_case(case: MitmBackendCase) -> ExitCode {
+pub(crate) fn run_outbound() -> ExitCode {
+    run_case(MitmBridgeCase::ExternalOutbound)
+}
+
+pub(crate) fn run_managed_outbound() -> ExitCode {
+    run_case(MitmBridgeCase::ManagedOutbound)
+}
+
+fn run_case(case: MitmBridgeCase) -> ExitCode {
     match run_outer(case) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -53,7 +62,7 @@ fn run_case(case: MitmBackendCase) -> ExitCode {
     }
 }
 
-fn run_outer(case: MitmBackendCase) -> Result<(), Box<dyn std::error::Error>> {
+fn run_outer(case: MitmBridgeCase) -> Result<(), Box<dyn std::error::Error>> {
     if env::var_os(case.netns_env()).is_some() {
         require_root()?;
         verify_fresh_network_namespace(case.netns_env())?;
@@ -70,7 +79,7 @@ fn run_outer(case: MitmBackendCase) -> Result<(), Box<dyn std::error::Error>> {
     )
 }
 
-fn run_inner(case: MitmBackendCase) -> Result<(), Box<dyn std::error::Error>> {
+fn run_inner(case: MitmBridgeCase) -> Result<(), Box<dyn std::error::Error>> {
     let root = create_temp_root(case.temp_root_name())?;
     match run_at(&root, case) {
         Ok(()) => {
@@ -85,7 +94,7 @@ fn run_inner(case: MitmBackendCase) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn run_at(root: &Path, case: MitmBackendCase) -> Result<(), Box<dyn std::error::Error>> {
+fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(root)?;
     let fixture_ready_path = root.join("fixture.ready");
     let fixture_start_path = root.join("fixture.start");
@@ -129,32 +138,56 @@ fn run_at(root: &Path, case: MitmBackendCase) -> Result<(), Box<dyn std::error::
     let backend_status = run_after_success([&agent_ready], || {
         assert_mitm_backend_runtime(case, &admin_socket_path, &mitm_backend)
     });
-    let fixture_start = run_after_success([&agent_ready, &backend_status], || {
-        start_http1_loopback_fixture(&fixture_start_path, &fixture_ready.start_nonce)
+    let outbound_redirect = run_after_success([&agent_ready, &backend_status], || {
+        assert_outbound_redirect_reaches_mitm_backend(case, intercept_port)
     });
-    let primary_progress =
-        run_after_success([&agent_ready, &backend_status, &fixture_start], || {
+    let fixture_start =
+        run_after_success([&agent_ready, &backend_status, &outbound_redirect], || {
+            start_http1_loopback_fixture(&fixture_start_path, &fixture_ready.start_nonce)
+        });
+    let primary_progress = run_after_success(
+        [
+            &agent_ready,
+            &backend_status,
+            &outbound_redirect,
+            &fixture_start,
+        ],
+        || {
             wait_for_agent_policy_progress(
                 agent.child_mut(),
                 &admin_socket_path,
                 expected_libpcap_targets().len() as u64,
             )
-        });
-    let bridge_feed_append = run_after_success([&primary_progress], || {
+        },
+    );
+    let bridge_feed_append = run_after_success([&outbound_redirect, &primary_progress], || {
         append_bridge_feed_from_harness(case, &bridge_feed_path)
     });
-    let bridge_progress = run_after_success([&primary_progress, &bridge_feed_append], || {
-        wait_for_agent_policy_progress(
-            agent.child_mut(),
-            &admin_socket_path,
-            expected_policy_alert_messages().len() as u64,
-        )
-    });
-    let health_transition =
-        run_after_success([&agent_ready, &backend_status, &bridge_progress], || {
-            exercise_l7_mitm_health_transition(case, &mut mitm_backend, &admin_socket_path)
-        });
-    let fixture_result = if all_succeeded([&agent_ready, &backend_status, &fixture_start]) {
+    let bridge_progress = run_after_success(
+        [&outbound_redirect, &primary_progress, &bridge_feed_append],
+        || {
+            wait_for_agent_policy_progress(
+                agent.child_mut(),
+                &admin_socket_path,
+                expected_policy_alert_messages().len() as u64,
+            )
+        },
+    );
+    let health_transition = run_after_success(
+        [
+            &agent_ready,
+            &backend_status,
+            &outbound_redirect,
+            &bridge_progress,
+        ],
+        || exercise_l7_mitm_health_transition(case, &mut mitm_backend, &admin_socket_path),
+    );
+    let fixture_result = if all_succeeded([
+        &agent_ready,
+        &backend_status,
+        &outbound_redirect,
+        &fixture_start,
+    ]) {
         wait_for_http1_loopback_fixture_exit(fixture.child_mut())
     } else {
         stop_running_child(fixture.child_mut(), "fixture")
@@ -168,6 +201,7 @@ fn run_at(root: &Path, case: MitmBackendCase) -> Result<(), Box<dyn std::error::
         fixture: fixture_result,
         agent_ready,
         backend_status,
+        outbound_redirect,
         fixture_start,
         primary_progress,
         bridge_feed_append,
@@ -189,6 +223,7 @@ struct MitmBridgePhases {
     fixture: RunResult,
     agent_ready: RunResult,
     backend_status: RunResult,
+    outbound_redirect: RunResult,
     fixture_start: RunResult,
     primary_progress: RunResult,
     bridge_feed_append: RunResult,
@@ -204,6 +239,7 @@ impl MitmBridgePhases {
             &self.fixture,
             &self.agent_ready,
             &self.backend_status,
+            &self.outbound_redirect,
             &self.fixture_start,
             &self.primary_progress,
             &self.bridge_feed_append,
@@ -214,11 +250,12 @@ impl MitmBridgePhases {
         ])
     }
 
-    fn into_labeled_results(self, spool: RunResult) -> [LabeledRunResult; 11] {
+    fn into_labeled_results(self, spool: RunResult) -> [LabeledRunResult; 12] {
         [
             ("fixture", self.fixture),
             ("agent readiness", self.agent_ready),
             ("MITM backend runtime status", self.backend_status),
+            ("outbound MITM redirect", self.outbound_redirect),
             ("fixture start", self.fixture_start),
             ("agent primary policy progress", self.primary_progress),
             ("MITM bridge feed append", self.bridge_feed_append),
