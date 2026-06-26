@@ -10,8 +10,9 @@ use capture::CaptureEvent;
 use e2e_support::mitm_bridge;
 use probe_config::TransparentInterceptionStrategyConfig;
 use probe_core::{
-    CaptureProviderKind, CaptureSource, Direction, EventEnvelope, EventKind, L7MitmAuditEvent,
-    L7MitmAuditPhase, L7MitmExternalBackendAudit, L7MitmManagedProcessBackendAudit,
+    Action, CaptureProviderKind, CaptureSource, Direction, EnforcementMode, EnforcementOutcome,
+    EventEnvelope, EventKind, L7MitmAuditEvent, L7MitmAuditPhase, L7MitmExternalBackendAudit,
+    L7MitmManagedProcessBackendAudit, VerdictScope,
 };
 use serde_json::json;
 use storage::{FjallSpool, StoredEvent};
@@ -22,9 +23,10 @@ use super::{
         PreparedMitmBackend, wait_for_managed_backend_pid,
     },
     feed::{
-        E2E_EXPORT_CURSOR_OWNER, EXPECTED_POLICY_VERSION, expected_bridge_policy_alert_message,
-        expected_libpcap_targets, expected_policy_alert_message, is_bridge_flow,
-        is_bridge_ingress_bytes,
+        E2E_EXPORT_CURSOR_OWNER, ENFORCEMENT_MANIFEST_ID, ENFORCEMENT_MANIFEST_VERSION,
+        EXPECTED_POLICY_VERSION, POLICY_HOOK_REASON_PREFIX, POLICY_HOOK_RESPONSE_REASON,
+        expected_bridge_policy_alert_message, expected_libpcap_targets,
+        expected_policy_alert_message, is_bridge_flow, is_bridge_ingress_bytes,
     },
 };
 use crate::e2e::{
@@ -52,7 +54,8 @@ pub(super) fn assert_mitm_backend_runtime(
 
     let response = send_admin_request(admin_socket_path, json!({"command": "status"}))?;
     assert_backend_status(case, backend, &response)?;
-    assert_l7_mitm_runtime_status(case, &response)
+    assert_l7_mitm_runtime_status(case, &response)?;
+    assert_policy_hook_enforcement_manifest_status(case, &response)
 }
 
 pub(super) fn exercise_l7_mitm_health_transition(
@@ -108,6 +111,7 @@ pub(super) fn assert_spool_outputs(
     assert_expected_bridge_export(&envelopes)?;
     assert_expected_libpcap_export(&envelopes)?;
     assert_expected_libpcap_policy_alerts(&envelopes)?;
+    assert_expected_policy_hook_decision(case, &envelopes)?;
     assert_expected_l7_mitm_audit(case, backend, &envelopes)?;
 
     println!(
@@ -207,6 +211,32 @@ fn assert_l7_mitm_runtime_status(
         .into());
     }
     Ok(())
+}
+
+fn assert_policy_hook_enforcement_manifest_status(
+    case: MitmBridgeCase,
+    response: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !case.policy_hook_enabled() {
+        return Ok(());
+    }
+    let enforcement = &response["snapshot"]["enforcement"];
+    let source = &enforcement["policy"]["source"];
+    let manifest = &source["manifest"];
+    if source["mode"] == json!("loaded")
+        && source["source"]["kind"] == json!("local")
+        && manifest["id"] == json!(ENFORCEMENT_MANIFEST_ID)
+        && manifest["version"] == json!(ENFORCEMENT_MANIFEST_VERSION)
+        && manifest["selector_configured"] == json!(false)
+        && manifest["protective_actions"] == json!(["deny"])
+        && enforcement["manifest_selector_configured"] == json!(false)
+    {
+        return Ok(());
+    }
+    Err(e2e_error(format!(
+        "unexpected MITM policy hook enforcement manifest status: {enforcement}"
+    ))
+    .into())
 }
 
 fn assert_livestream_ingress(events: &[StoredEvent]) -> Result<(), Box<dyn std::error::Error>> {
@@ -318,6 +348,95 @@ fn assert_expected_libpcap_policy_alerts(
         expected, observed
     ))
     .into())
+}
+
+fn assert_expected_policy_hook_decision(
+    case: MitmBridgeCase,
+    envelopes: &[EventEnvelope],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !case.policy_hook_enabled() {
+        return Ok(());
+    }
+    assert_expected_policy_hook_verdict(envelopes)?;
+    assert_expected_delegated_policy_hook_decision(envelopes)
+}
+
+fn assert_expected_policy_hook_verdict(
+    envelopes: &[EventEnvelope],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let matches = envelopes
+        .iter()
+        .filter(|envelope| {
+            is_bridge_flow(envelope)
+                && envelope.policy_version() == Some(EXPECTED_POLICY_VERSION)
+                && matches!(
+                    envelope.kind(),
+                    EventKind::PolicyVerdict(verdict)
+                        if verdict.action == Action::Deny
+                            && verdict.scope == VerdictScope::Request
+                            && verdict.reason == expected_policy_hook_reason()
+                            && verdict.confidence == 100
+                )
+        })
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        return Ok(());
+    }
+    Err(e2e_error(format!(
+        "expected exactly one MITM policy hook verdict, got {}",
+        matches.len()
+    ))
+    .into())
+}
+
+fn assert_expected_delegated_policy_hook_decision(
+    envelopes: &[EventEnvelope],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let observed = envelopes
+        .iter()
+        .filter_map(|envelope| {
+            if !is_bridge_flow(envelope)
+                || envelope.policy_version() != Some(EXPECTED_POLICY_VERSION)
+            {
+                return None;
+            }
+            match envelope.kind() {
+                EventKind::EnforcementDecision(decision) => Some(format!("{decision:?}")),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let matches = envelopes
+        .iter()
+        .filter(|envelope| {
+            is_bridge_flow(envelope)
+                && envelope.policy_version() == Some(EXPECTED_POLICY_VERSION)
+                && matches!(
+                    envelope.kind(),
+                    EventKind::EnforcementDecision(decision)
+                        if decision.mode == EnforcementMode::Enforce
+                            && decision.outcome == EnforcementOutcome::Delegated
+                            && decision.requested_action == Action::Deny
+                            && decision.effective_action == Action::Deny
+                            && decision.scope == VerdictScope::Request
+                            && decision.selector_matched
+                            && decision.reason.contains("accepted delegated enforcement action")
+                            && decision.reason.contains(POLICY_HOOK_RESPONSE_REASON)
+                )
+        })
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        return Ok(());
+    }
+    Err(e2e_error(format!(
+        "expected exactly one delegated MITM policy hook enforcement decision, got {}; observed bridge decisions: {observed:?}",
+        matches.len(),
+    ))
+    .into())
+}
+
+fn expected_policy_hook_reason() -> String {
+    format!("{POLICY_HOOK_REASON_PREFIX}{}", mitm_bridge::REQUEST_TARGET)
 }
 
 fn assert_expected_l7_mitm_audit(

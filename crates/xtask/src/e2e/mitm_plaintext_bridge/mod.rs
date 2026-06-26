@@ -2,6 +2,7 @@ mod assertions;
 mod backend;
 mod config;
 mod feed;
+mod policy_hook;
 
 use std::{
     env, fs,
@@ -21,6 +22,7 @@ use feed::{
     append_bridge_feed_from_harness, expected_libpcap_targets, expected_policy_alert_messages,
     initialize_bridge_feed,
 };
+use policy_hook::{MitmPolicyHookServer, assert_policy_hook_requests};
 
 use super::{
     harness::{
@@ -30,7 +32,8 @@ use super::{
     },
     loopback::{
         LabeledRunResult, RunResult, merge_labeled_run_results, spawn_agent,
-        spawn_http1_loopback_fixture, start_http1_loopback_fixture, wait_for_agent_policy_progress,
+        spawn_http1_loopback_fixture, start_http1_loopback_fixture,
+        wait_for_agent_enforcement_decision_count_at_least, wait_for_agent_policy_progress,
         wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
         wait_for_http1_loopback_fixture_ready,
     },
@@ -42,6 +45,10 @@ pub(crate) fn run() -> ExitCode {
 
 pub(crate) fn run_managed() -> ExitCode {
     run_case(MitmBridgeCase::ManagedInbound)
+}
+
+pub(crate) fn run_policy_hook() -> ExitCode {
+    run_case(MitmBridgeCase::ExternalInboundPolicyHook)
 }
 
 pub(crate) fn run_outbound() -> ExitCode {
@@ -101,11 +108,19 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
     let agent_ready_socket_path = root.join("agent.ready.sock");
     let admin_socket_path = root.join("admin.sock");
     let policy_path = root.join("mitm-bridge-e2e-policy.bundle");
+    let enforcement_manifest_path = root.join("mitm-bridge-enforcement.toml");
     let bridge_feed_path = root.join("mitm-bridge-capture-events.jsonl");
     let config_path = root.join("agent.toml");
     let spool_path = root.join("spool");
 
-    write_policy_bundle(&policy_path)?;
+    write_policy_bundle(&policy_path, case)?;
+    if case.policy_hook_enabled() {
+        config::write_enforcement_manifest(&enforcement_manifest_path)?;
+    }
+    let policy_hook_server = case
+        .policy_hook_enabled()
+        .then(MitmPolicyHookServer::start)
+        .transpose()?;
 
     let supervisor = ChildSupervisor::new()?;
     let mut fixture = supervisor.watch(
@@ -123,11 +138,17 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
         case,
         config_path: &config_path,
         policy_path: &policy_path,
+        enforcement_manifest_path: case
+            .policy_hook_enabled()
+            .then_some(enforcement_manifest_path.as_path()),
         bridge_feed_path: &bridge_feed_path,
         spool_path: &spool_path,
         admin_socket_path: &admin_socket_path,
         capture_port: fixture_ready.listen_port,
         mitm_backend: &mitm_backend.config,
+        policy_hook_endpoint: policy_hook_server
+            .as_ref()
+            .map(MitmPolicyHookServer::endpoint),
         proxy_port: mitm_backend.proxy_port,
         intercept_port,
     })?;
@@ -182,6 +203,26 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
         ],
         || exercise_l7_mitm_health_transition(case, &mut mitm_backend, &admin_socket_path),
     );
+    let policy_hook_decision = run_after_success(
+        [
+            &agent_ready,
+            &backend_status,
+            &outbound_redirect,
+            &bridge_progress,
+        ],
+        || {
+            if case.policy_hook_enabled() {
+                wait_for_agent_enforcement_decision_count_at_least(
+                    agent.child_mut(),
+                    &admin_socket_path,
+                    1,
+                )
+                .map(|_| ())
+            } else {
+                Ok(())
+            }
+        },
+    );
     let fixture_result = if all_succeeded([
         &agent_ready,
         &backend_status,
@@ -197,6 +238,17 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
     agent.unwatch();
     let managed_backend_cleanup_result =
         cleanup_managed_backend(mitm_backend.managed_pid_file(), agent_result.is_ok());
+    let policy_hook_requests = run_after_success(
+        [
+            &agent_ready,
+            &backend_status,
+            &outbound_redirect,
+            &bridge_progress,
+            &policy_hook_decision,
+            &agent_result,
+        ],
+        || assert_policy_hook_requests(case, policy_hook_server.as_ref()),
+    );
     let phases = MitmBridgePhases {
         fixture: fixture_result,
         agent_ready,
@@ -207,6 +259,8 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
         bridge_feed_append,
         bridge_progress,
         health_transition,
+        policy_hook_decision,
+        policy_hook_requests,
         agent: agent_result,
         managed_backend_cleanup: managed_backend_cleanup_result,
     };
@@ -229,6 +283,8 @@ struct MitmBridgePhases {
     bridge_feed_append: RunResult,
     bridge_progress: RunResult,
     health_transition: RunResult,
+    policy_hook_decision: RunResult,
+    policy_hook_requests: RunResult,
     agent: RunResult,
     managed_backend_cleanup: RunResult,
 }
@@ -245,12 +301,14 @@ impl MitmBridgePhases {
             &self.bridge_feed_append,
             &self.bridge_progress,
             &self.health_transition,
+            &self.policy_hook_decision,
+            &self.policy_hook_requests,
             &self.agent,
             &self.managed_backend_cleanup,
         ])
     }
 
-    fn into_labeled_results(self, spool: RunResult) -> [LabeledRunResult; 12] {
+    fn into_labeled_results(self, spool: RunResult) -> [LabeledRunResult; 14] {
         [
             ("fixture", self.fixture),
             ("agent readiness", self.agent_ready),
@@ -261,6 +319,8 @@ impl MitmBridgePhases {
             ("MITM bridge feed append", self.bridge_feed_append),
             ("agent MITM bridge policy progress", self.bridge_progress),
             ("L7 MITM backend health transition", self.health_transition),
+            ("MITM policy hook decision", self.policy_hook_decision),
+            ("MITM policy hook requests", self.policy_hook_requests),
             ("agent", self.agent),
             ("managed MITM backend cleanup", self.managed_backend_cleanup),
             ("spool assertion", spool),

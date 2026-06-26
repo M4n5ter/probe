@@ -21,6 +21,8 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use super::super::harness::{debug_binary, e2e_error};
 
 pub(super) const EXTERNAL_INBOUND_CASE_NAME: &str = "e2e-mitm-plaintext-bridge-live-sidecar";
+pub(super) const POLICY_HOOK_INBOUND_CASE_NAME: &str =
+    "e2e-mitm-policy-hook-plaintext-bridge-live-sidecar";
 pub(super) const MANAGED_INBOUND_CASE_NAME: &str = "e2e-managed-mitm-plaintext-bridge-live-sidecar";
 pub(super) const EXTERNAL_OUTBOUND_CASE_NAME: &str =
     "e2e-outbound-mitm-plaintext-bridge-live-sidecar";
@@ -28,6 +30,8 @@ pub(super) const MANAGED_OUTBOUND_CASE_NAME: &str =
     "e2e-managed-outbound-mitm-plaintext-bridge-live-sidecar";
 pub(super) const EXTERNAL_INBOUND_IN_NETNS_ENV: &str =
     "TRAFFIC_PROBE_E2E_MITM_PLAINTEXT_BRIDGE_NETNS";
+pub(super) const POLICY_HOOK_INBOUND_IN_NETNS_ENV: &str =
+    "TRAFFIC_PROBE_E2E_MITM_POLICY_HOOK_PLAINTEXT_BRIDGE_NETNS";
 pub(super) const MANAGED_INBOUND_IN_NETNS_ENV: &str =
     "TRAFFIC_PROBE_E2E_MANAGED_MITM_PLAINTEXT_BRIDGE_NETNS";
 pub(super) const EXTERNAL_OUTBOUND_IN_NETNS_ENV: &str =
@@ -44,6 +48,7 @@ const EXTERNAL_BACKEND_LISTEN_BACKLOG: i32 = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MitmBridgeCase {
     ExternalInbound,
+    ExternalInboundPolicyHook,
     ManagedInbound,
     ExternalOutbound,
     ManagedOutbound,
@@ -65,6 +70,7 @@ impl MitmBridgeCase {
     pub(super) const fn case_name(self) -> &'static str {
         match self {
             Self::ExternalInbound => EXTERNAL_INBOUND_CASE_NAME,
+            Self::ExternalInboundPolicyHook => POLICY_HOOK_INBOUND_CASE_NAME,
             Self::ManagedInbound => MANAGED_INBOUND_CASE_NAME,
             Self::ExternalOutbound => EXTERNAL_OUTBOUND_CASE_NAME,
             Self::ManagedOutbound => MANAGED_OUTBOUND_CASE_NAME,
@@ -74,6 +80,7 @@ impl MitmBridgeCase {
     pub(super) const fn netns_env(self) -> &'static str {
         match self {
             Self::ExternalInbound => EXTERNAL_INBOUND_IN_NETNS_ENV,
+            Self::ExternalInboundPolicyHook => POLICY_HOOK_INBOUND_IN_NETNS_ENV,
             Self::ManagedInbound => MANAGED_INBOUND_IN_NETNS_ENV,
             Self::ExternalOutbound => EXTERNAL_OUTBOUND_IN_NETNS_ENV,
             Self::ManagedOutbound => MANAGED_OUTBOUND_IN_NETNS_ENV,
@@ -83,6 +90,7 @@ impl MitmBridgeCase {
     pub(super) const fn temp_root_name(self) -> &'static str {
         match self {
             Self::ExternalInbound => "mitm-bridge",
+            Self::ExternalInboundPolicyHook => "mitm-policy-hook-bridge",
             Self::ManagedInbound => "managed-mitm-bridge",
             Self::ExternalOutbound => "outbound-mitm-bridge",
             Self::ManagedOutbound => "managed-outbound-mitm-bridge",
@@ -92,6 +100,7 @@ impl MitmBridgeCase {
     pub(super) const fn failure_label(self) -> &'static str {
         match self {
             Self::ExternalInbound => "e2e MITM plaintext bridge live sidecar",
+            Self::ExternalInboundPolicyHook => "e2e MITM policy hook plaintext bridge live sidecar",
             Self::ManagedInbound => "e2e managed MITM plaintext bridge live sidecar",
             Self::ExternalOutbound => "e2e outbound MITM plaintext bridge live sidecar",
             Self::ManagedOutbound => "e2e managed outbound MITM plaintext bridge live sidecar",
@@ -101,6 +110,9 @@ impl MitmBridgeCase {
     pub(super) const fn success_label(self) -> &'static str {
         match self {
             Self::ExternalInbound => "e2e MITM plaintext bridge live sidecar passed",
+            Self::ExternalInboundPolicyHook => {
+                "e2e MITM policy hook plaintext bridge live sidecar passed"
+            }
             Self::ManagedInbound => "e2e managed MITM plaintext bridge live sidecar passed",
             Self::ExternalOutbound => "e2e outbound MITM plaintext bridge live sidecar passed",
             Self::ManagedOutbound => {
@@ -111,16 +123,24 @@ impl MitmBridgeCase {
 
     pub(super) const fn backend(self) -> MitmBackendKind {
         match self {
-            Self::ExternalInbound | Self::ExternalOutbound => MitmBackendKind::External,
+            Self::ExternalInbound | Self::ExternalInboundPolicyHook | Self::ExternalOutbound => {
+                MitmBackendKind::External
+            }
             Self::ManagedInbound | Self::ManagedOutbound => MitmBackendKind::ManagedProcess,
         }
     }
 
     pub(super) const fn direction(self) -> MitmBridgeDirection {
         match self {
-            Self::ExternalInbound | Self::ManagedInbound => MitmBridgeDirection::Inbound,
+            Self::ExternalInbound | Self::ExternalInboundPolicyHook | Self::ManagedInbound => {
+                MitmBridgeDirection::Inbound
+            }
             Self::ExternalOutbound | Self::ManagedOutbound => MitmBridgeDirection::Outbound,
         }
+    }
+
+    pub(super) const fn policy_hook_enabled(self) -> bool {
+        matches!(self, Self::ExternalInboundPolicyHook)
     }
 }
 

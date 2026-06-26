@@ -1,19 +1,25 @@
 use std::{fs, path::Path};
 
+use e2e_support::mitm_bridge;
 use probe_config::{
-    AgentConfig, CaptureSelection, PolicyConfig, TlsMaterialConfig, TlsMaterialKind,
-    TransparentInterceptionMitmBackendConfig,
+    AgentConfig, CaptureSelection, EnforcementPolicyManifest, EnforcementPolicySourceConfig,
+    PolicyConfig, TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
     TransparentInterceptionMitmBackendReadinessProbeConfig,
     TransparentInterceptionMitmManagedProcessConfig,
-    TransparentInterceptionMitmPlaintextBridgeModeConfig, TransparentInterceptionProxyModeConfig,
+    TransparentInterceptionMitmPlaintextBridgeModeConfig,
+    TransparentInterceptionMitmPolicyHookModeConfig, TransparentInterceptionProxyModeConfig,
     TransparentInterceptionProxySelfBypassConfig, TransparentInterceptionStrategyConfig,
 };
-use probe_core::{Direction, EnforcementMode, ProcessSelector, Selector, TrafficSelector};
+use probe_core::{
+    Action, Direction, EnforcementMode, ProcessSelector, ProtectiveActionProfile, Selector,
+    TrafficSelector,
+};
 
 use super::{
     backend::{MitmBackendConfig, MitmBridgeCase, MitmBridgeDirection},
     feed::{
-        POLICY_ALERT_PREFIX, POLICY_ID, POLICY_VERSION, REQUEST_BODY_BYTES, REQUESTS,
+        ENFORCEMENT_MANIFEST_ID, ENFORCEMENT_MANIFEST_VERSION, POLICY_ALERT_PREFIX,
+        POLICY_HOOK_REASON_PREFIX, POLICY_ID, POLICY_VERSION, REQUEST_BODY_BYTES, REQUESTS,
         RESPONSE_BODY_BYTES, WRITE_CHUNKS,
     },
 };
@@ -26,11 +32,13 @@ pub(super) struct AgentConfigInputs<'a> {
     pub(super) case: MitmBridgeCase,
     pub(super) config_path: &'a Path,
     pub(super) policy_path: &'a Path,
+    pub(super) enforcement_manifest_path: Option<&'a Path>,
     pub(super) bridge_feed_path: &'a Path,
     pub(super) spool_path: &'a Path,
     pub(super) admin_socket_path: &'a Path,
     pub(super) capture_port: u16,
     pub(super) mitm_backend: &'a MitmBackendConfig,
+    pub(super) policy_hook_endpoint: Option<String>,
     pub(super) proxy_port: u16,
     pub(super) intercept_port: u16,
 }
@@ -75,6 +83,11 @@ pub(super) fn write_agent_config(
         selector: None,
     });
     config.enforcement.mode = EnforcementMode::Enforce;
+    if let Some(path) = inputs.enforcement_manifest_path {
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: path.to_path_buf(),
+        };
+    }
     config.enforcement.interception.strategy = interception_strategy(inputs.case.direction());
     config.enforcement.interception.proxy.mode = TransparentInterceptionProxyModeConfig::External;
     config.enforcement.interception.proxy.self_bypass = proxy_self_bypass(inputs.case.direction());
@@ -110,6 +123,18 @@ pub(super) fn write_agent_config(
     config.enforcement.interception.mitm.plaintext_bridge.follow = Some(true);
     config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
     config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+    if let Some(endpoint) = inputs.policy_hook_endpoint {
+        config.enforcement.interception.mitm.policy_hook.mode =
+            TransparentInterceptionMitmPolicyHookModeConfig::HttpJson;
+        config.enforcement.interception.mitm.policy_hook.endpoint = Some(endpoint);
+        config.enforcement.interception.mitm.policy_hook.timeout_ms = 1_000;
+        config
+            .enforcement
+            .interception
+            .mitm
+            .policy_hook
+            .max_response_bytes = 4096;
+    }
     config.tls.materials = vec![
         TlsMaterialConfig {
             id: Some("mitm-ca".to_string()),
@@ -168,7 +193,7 @@ fn interception_selector(direction: MitmBridgeDirection, port: u16) -> Selector 
     }
 }
 
-pub(super) fn write_policy_bundle(path: &Path) -> Result<(), std::io::Error> {
+pub(super) fn write_policy_bundle(path: &Path, case: MitmBridgeCase) -> Result<(), std::io::Error> {
     fs::create_dir_all(path)?;
     fs::write(
         path.join("manifest.toml"),
@@ -180,16 +205,49 @@ hooks = ["on_http_request_headers"]
 "#
         ),
     )?;
-    fs::write(
-        path.join("main.lua"),
+    let protected_target = mitm_bridge::REQUEST_TARGET;
+    let source = if case.policy_hook_enabled() {
+        format!(
+            r#"
+function on_http_request_headers(event)
+  local target = event.kind.target or ""
+  local alert = probe.emit_alert("{POLICY_ALERT_PREFIX}" .. target)
+  if target ~= "{protected_target}" then
+    return alert
+  end
+  return {{
+    alert,
+    probe.verdict({{
+      action = "deny",
+      scope = "request",
+      reason = "{POLICY_HOOK_REASON_PREFIX}" .. target,
+      confidence = 100,
+    }}),
+  }}
+end
+"#,
+        )
+    } else {
         format!(
             r#"
 function on_http_request_headers(event)
   return probe.emit_alert("{POLICY_ALERT_PREFIX}" .. event.kind.target)
 end
 "#,
-        ),
-    )
+        )
+    };
+    fs::write(path.join("main.lua"), source)
+}
+
+pub(super) fn write_enforcement_manifest(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = EnforcementPolicyManifest {
+        id: ENFORCEMENT_MANIFEST_ID.to_string(),
+        version: ENFORCEMENT_MANIFEST_VERSION.to_string(),
+        selector: None,
+        protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
+    };
+    fs::write(path, toml::to_string(&manifest)?)?;
+    Ok(())
 }
 
 fn mitm_readiness_probe(target: String) -> TransparentInterceptionMitmBackendReadinessProbeConfig {
