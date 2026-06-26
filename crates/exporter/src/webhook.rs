@@ -15,6 +15,10 @@ use hyper_util::{
     client::legacy::{Client, connect::Connection},
     rt::TokioExecutor,
 };
+use probe_core::{
+    RESERVED_WEBHOOK_HEADERS, WEBHOOK_CODEC_HEADER, WEBHOOK_CONTENT_TYPE_HEADER,
+    WEBHOOK_CONTENT_TYPE_PROTOBUF, WEBHOOK_IDEMPOTENCY_KEY_HEADER,
+};
 use probe_http::{
     HttpConnectionOptions, ProbeHttpsConnector, https_connector, root_cert_store_with_native_roots,
 };
@@ -24,7 +28,6 @@ use tower_service::Service;
 
 use crate::{BatchExporter, CompressionCodec, ExportAck, ExportError, WebhookAck};
 
-const RESERVED_WEBHOOK_HEADERS: &[&str] = &["content-type", "idempotency-key", "x-sssa-codec"];
 const MAX_WEBHOOK_ACK_RESPONSE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
@@ -285,9 +288,9 @@ impl WebhookRequest {
         let mut request = Request::builder()
             .method(Method::POST)
             .uri(endpoint)
-            .header("content-type", "application/x-protobuf")
-            .header("x-sssa-codec", codec.wire_name())
-            .header("idempotency-key", batch_id)
+            .header(WEBHOOK_CONTENT_TYPE_HEADER, WEBHOOK_CONTENT_TYPE_PROTOBUF)
+            .header(WEBHOOK_CODEC_HEADER, codec.wire_name())
+            .header(WEBHOOK_IDEMPOTENCY_KEY_HEADER, batch_id)
             .body(Full::new(body))
             .map_err(|source| ExportError::HttpTransport {
                 reason: source.to_string(),
@@ -390,12 +393,12 @@ mod tests {
         let result = WebhookExporter::with_headers(
             "https://collector.example/batches",
             CompressionCodec::Zstd,
-            [("x-sssa-codec".to_string(), "none".to_string())],
+            [("x-traffic-probe-codec".to_string(), "none".to_string())],
         );
 
         assert!(matches!(
             result,
-            Err(ExportError::ReservedHeaderName { name }) if name == "x-sssa-codec"
+            Err(ExportError::ReservedHeaderName { name }) if name == "x-traffic-probe-codec"
         ));
     }
 

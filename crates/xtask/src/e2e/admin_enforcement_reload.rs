@@ -201,7 +201,7 @@ hooks = ["on_http_request_headers"]
             r#"
 function on_http_request_headers(event)
   local target = event.kind.target or ""
-  if string.sub(target, 1, 10) ~= "/sssa-e2e/" then
+  if string.sub(target, 1, 10) ~= "/traffic-probe-e2e/" then
     return nil
   end
   local local_port = event.flow.local_endpoint.port or 0
@@ -406,7 +406,7 @@ fn expected_enforcement_decision_facts(listen_ports: [u16; 2]) -> Vec<Enforcemen
             outcome: "dry_run",
             effective_action: "observe",
             selector_matched: true,
-            reason: format!("{POLICY_REASON_PREFIX} /sssa-e2e/0"),
+            reason: format!("{POLICY_REASON_PREFIX} /traffic-probe-e2e/0"),
         },
         EnforcementDecisionFact {
             policy_version: EXPECTED_POLICY_VERSION.to_string(),
@@ -415,7 +415,7 @@ fn expected_enforcement_decision_facts(listen_ports: [u16; 2]) -> Vec<Enforcemen
             outcome: "dry_run",
             effective_action: "observe",
             selector_matched: true,
-            reason: format!("{POLICY_REASON_PREFIX} /sssa-e2e/0"),
+            reason: format!("{POLICY_REASON_PREFIX} /traffic-probe-e2e/0"),
         },
     ]
 }
@@ -444,7 +444,7 @@ fn outcome_name(outcome: EnforcementOutcome) -> &'static str {
 }
 
 fn matched_policy_reason(reason: &str) -> Option<String> {
-    let expected = format!("{POLICY_REASON_PREFIX} /sssa-e2e/0");
+    let expected = format!("{POLICY_REASON_PREFIX} /traffic-probe-e2e/0");
     reason.contains(&expected).then_some(expected)
 }
 

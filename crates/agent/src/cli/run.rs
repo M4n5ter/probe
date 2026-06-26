@@ -28,10 +28,10 @@ use crate::{
 };
 
 const REPLAY_POLICY_SOURCE_BYTES: u64 = 1024 * 1024;
-const READY_SOCKET_ENV: &str = "SSSA_PROBE_READY_SOCKET";
+const READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_READY_SOCKET";
 
 #[derive(Debug, Parser)]
-#[command(name = "sssa-probe")]
+#[command(name = "traffic-probe")]
 #[command(about = "Process-level traffic probe agent")]
 struct Cli {
     #[command(subcommand)]
@@ -808,14 +808,14 @@ end
     fn config_with_unopenable_libpcap(spool_path: PathBuf) -> AgentConfig {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
-        config.capture.libpcap.interface = Some("sssa-probe-missing-test-interface".to_string());
+        config.capture.libpcap.interface = Some("traffic-probe-missing-test-interface".to_string());
         config.storage.path = spool_path;
         config
     }
 
     fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {
         let path = std::env::temp_dir().join(format!(
-            "sssa-probe-main-{name}-{}-{}",
+            "traffic-probe-main-{name}-{}-{}",
             std::process::id(),
             wall_time_unix_ns()
         ));

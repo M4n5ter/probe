@@ -436,12 +436,12 @@ mod tests {
             TlsMaterialConfig {
                 id: Some("mitm-ca".to_string()),
                 kind: TlsMaterialKind::MitmCaCertificate,
-                path: "/etc/sssa/mitm-ca.pem".into(),
+                path: "/etc/traffic-probe/mitm-ca.pem".into(),
             },
             TlsMaterialConfig {
                 id: Some("mitm-ca-key".to_string()),
                 kind: TlsMaterialKind::MitmCaPrivateKey,
-                path: "/etc/sssa/mitm-ca.key".into(),
+                path: "/etc/traffic-probe/mitm-ca.key".into(),
             },
         ];
     }

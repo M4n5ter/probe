@@ -149,7 +149,8 @@ mod tests {
         matchers::{method, path},
     };
 
-    const MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH: &str = "/run/sssa/mitm-capture-events.jsonl";
+    const MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH: &str =
+        "/run/traffic-probe/mitm-capture-events.jsonl";
 
     #[tokio::test]
     async fn check_report_loads_enabled_policy_bundle() -> Result<(), Box<dyn std::error::Error>> {
@@ -497,7 +498,7 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             value["enforcement"]["interception"]["nftables"]["table_name"],
-            json!("sssa_probe")
+            json!("traffic_probe")
         );
         assert_eq!(
             value["enforcement"]["interception"]["outbound_redirect"]["kind"],
@@ -682,7 +683,7 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["proxy_bypass_mark"],
-            json!(0x5353_4102)
+            json!(0x5450_0102)
         );
         Ok(())
     }
@@ -921,7 +922,7 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["proxy_bypass_mark"],
-            json!(0x5353_4102)
+            json!(0x5450_0102)
         );
         Ok(())
     }
@@ -1126,12 +1127,12 @@ protective_actions = ["alert"]
             TlsMaterialConfig {
                 id: Some("mitm-ca".to_string()),
                 kind: TlsMaterialKind::MitmCaCertificate,
-                path: "/etc/sssa/mitm-ca.pem".into(),
+                path: "/etc/traffic-probe/mitm-ca.pem".into(),
             },
             TlsMaterialConfig {
                 id: Some("mitm-ca-key".to_string()),
                 kind: TlsMaterialKind::MitmCaPrivateKey,
-                path: "/etc/sssa/mitm-ca.key".into(),
+                path: "/etc/traffic-probe/mitm-ca.key".into(),
             },
         ];
     }

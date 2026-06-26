@@ -1,6 +1,6 @@
-use crate::{ConfigViolation, ExporterConfig};
+use probe_core::RESERVED_WEBHOOK_HEADERS;
 
-const RESERVED_EXPORTER_HEADERS: &[&str] = &["content-type", "idempotency-key", "x-sssa-codec"];
+use crate::{ConfigViolation, ExporterConfig};
 
 pub(super) fn validate_header(
     exporter: &ExporterConfig,
@@ -19,7 +19,7 @@ pub(super) fn validate_header(
             reason: "exporter header name is not a valid HTTP token".to_string(),
         });
     }
-    if RESERVED_EXPORTER_HEADERS
+    if RESERVED_WEBHOOK_HEADERS
         .iter()
         .any(|reserved| name.eq_ignore_ascii_case(reserved))
     {

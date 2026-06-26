@@ -592,7 +592,7 @@ mod tests {
         let audit = Arc::new(RecordingL7MitmAuditSink::default());
         let audit_sink: Arc<dyn L7MitmAuditSink> = audit.clone();
         let process = TransparentInterceptionMitmManagedProcessPlan {
-            program: "/usr/local/bin/sssa-mitm-proxy".into(),
+            program: "/usr/local/bin/traffic-probe-mitm-proxy".into(),
             args: vec!["--listen".to_string(), "127.0.0.1:15002".to_string()],
             working_dir: None,
         };

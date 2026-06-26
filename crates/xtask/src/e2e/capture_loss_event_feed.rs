@@ -213,13 +213,13 @@ fn assert_prometheus_metrics(admin_socket_path: &Path) -> Result<(), Box<dyn std
             "prometheus metrics response omitted text: {response}"
         ))
     })?;
-    if !metrics.contains("sssa_pipeline_capture_loss_events_total 1\n") {
+    if !metrics.contains("traffic_probe_pipeline_capture_loss_events_total 1\n") {
         return Err(e2e_error(format!(
             "prometheus metrics omitted capture loss event counter: {metrics}"
         ))
         .into());
     }
-    let lost_events = format!("sssa_pipeline_capture_lost_events_total {LOST_EVENTS}\n");
+    let lost_events = format!("traffic_probe_pipeline_capture_lost_events_total {LOST_EVENTS}\n");
     if !metrics.contains(&lost_events) {
         return Err(e2e_error(format!(
             "prometheus metrics omitted capture lost event counter: {metrics}"

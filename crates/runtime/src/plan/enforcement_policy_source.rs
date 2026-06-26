@@ -58,20 +58,20 @@ mod tests {
     fn policy_source_plan_resolves_local_manifest_paths() {
         assert_eq!(
             EnforcementPolicySourcePlan::from_config(&EnforcementPolicySourceConfig::File {
-                path: "/etc/sssa-probe/enforcement.toml".into(),
+                path: "/etc/traffic-probe/enforcement.toml".into(),
             }),
             EnforcementPolicySourcePlan::LocalManifest {
                 source_kind: EnforcementPolicySourceKind::File,
-                path: "/etc/sssa-probe/enforcement.toml".into(),
+                path: "/etc/traffic-probe/enforcement.toml".into(),
             }
         );
         assert_eq!(
             EnforcementPolicySourcePlan::from_config(&EnforcementPolicySourceConfig::Directory {
-                path: "/etc/sssa-probe/enforcement.d".into(),
+                path: "/etc/traffic-probe/enforcement.d".into(),
             }),
             EnforcementPolicySourcePlan::LocalManifest {
                 source_kind: EnforcementPolicySourceKind::Directory,
-                path: "/etc/sssa-probe/enforcement.d/manifest.toml".into(),
+                path: "/etc/traffic-probe/enforcement.d/manifest.toml".into(),
             }
         );
     }

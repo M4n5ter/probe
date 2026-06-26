@@ -223,14 +223,14 @@ mod tests {
 
     #[test]
     fn status_snapshot_reports_sink_lag_and_health() -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
+        let mut config = config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool"));
         config.storage.retention.ingress.max_age_ms = Some(120_000);
         config.storage.retention.ingress.max_records = Some(10_000);
         config.storage.retention.ingress.sweep_interval_ms = 7_000;
         config.storage.retention.ingress.prune_batch_limit = 256;
         let plan = runtime_plan_from_config(config, Vec::new())?;
         let spool = SpoolStatusInput::available(
-            PathBuf::from("/tmp/sssa-spool"),
+            PathBuf::from("/tmp/traffic-probe-spool"),
             SpoolSnapshot {
                 last_ingress_sequence: 7,
                 last_export_sequence: 5,
@@ -324,14 +324,14 @@ mod tests {
     fn status_snapshot_serializes_transparent_classifier_capabilities()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = runtime_plan_from_config(
-            config_with_storage_path(PathBuf::from("/tmp/sssa-spool")),
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
             vec![
                 runtime::PlatformProbeResults::default_transparent_process_classifier(),
                 runtime::PlatformProbeResults::default_transparent_flow_classifier(),
             ],
         )?;
         let spool = SpoolStatusInput::available(
-            PathBuf::from("/tmp/sssa-spool"),
+            PathBuf::from("/tmp/traffic-probe-spool"),
             SpoolSnapshot {
                 last_ingress_sequence: 0,
                 last_export_sequence: 0,
@@ -370,7 +370,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = runtime_plan_with_exporter()?;
         let spool = SpoolStatusInput::available(
-            PathBuf::from("/tmp/sssa-spool"),
+            PathBuf::from("/tmp/traffic-probe-spool"),
             SpoolSnapshot {
                 last_ingress_sequence: 0,
                 last_export_sequence: 5,
@@ -494,7 +494,7 @@ mod tests {
 
         let snapshot = build_status_snapshot_at_with_runtime(
             &plan,
-            available_spool_input(PathBuf::from("/tmp/sssa-spool")),
+            available_spool_input(PathBuf::from("/tmp/traffic-probe-spool")),
             42,
             runtime,
         );
@@ -564,7 +564,7 @@ mod tests {
 
         let snapshot = build_status_snapshot_at_with_runtime(
             &plan,
-            available_spool_input(PathBuf::from("/tmp/sssa-spool")),
+            available_spool_input(PathBuf::from("/tmp/traffic-probe-spool")),
             42,
             runtime,
         );
@@ -607,7 +607,7 @@ mod tests {
 
         let snapshot = build_status_snapshot_at_with_runtime(
             &plan,
-            available_spool_input(PathBuf::from("/tmp/sssa-spool")),
+            available_spool_input(PathBuf::from("/tmp/traffic-probe-spool")),
             42,
             runtime,
         );
@@ -624,7 +624,7 @@ mod tests {
     fn uninitialized_spool_makes_status_unavailable() -> Result<(), Box<dyn std::error::Error>> {
         let plan = runtime_plan_with_exporter()?;
         let spool = SpoolStatusInput::unavailable(
-            PathBuf::from("/tmp/missing-sssa-spool"),
+            PathBuf::from("/tmp/missing-traffic-probe-spool"),
             "spool is not initialized",
         );
 
@@ -647,7 +647,7 @@ mod tests {
     fn busy_spool_makes_status_degraded() -> Result<(), Box<dyn std::error::Error>> {
         let plan = runtime_plan_with_exporter()?;
         let spool = SpoolStatusInput::degraded(
-            PathBuf::from("/tmp/busy-sssa-spool"),
+            PathBuf::from("/tmp/busy-traffic-probe-spool"),
             "spool database is locked by another process",
         );
 
@@ -664,14 +664,14 @@ mod tests {
     fn degraded_capabilities_do_not_force_active_health() -> Result<(), Box<dyn std::error::Error>>
     {
         let plan = runtime_plan(
-            PathBuf::from("/tmp/sssa-spool"),
+            PathBuf::from("/tmp/traffic-probe-spool"),
             vec![CapabilityState::degraded(
                 CapabilityKind::LuaJit,
                 "config reload is not implemented",
             )],
         )?;
         let spool = SpoolStatusInput::available(
-            PathBuf::from("/tmp/sssa-spool"),
+            PathBuf::from("/tmp/traffic-probe-spool"),
             SpoolSnapshot {
                 last_ingress_sequence: 0,
                 last_export_sequence: 0,
@@ -690,7 +690,7 @@ mod tests {
     fn status_snapshot_reports_l7_mitm_as_unavailable_target_capability()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = runtime_plan(
-            PathBuf::from("/tmp/sssa-spool"),
+            PathBuf::from("/tmp/traffic-probe-spool"),
             vec![CapabilityState::unavailable(
                 CapabilityKind::L7Mitm,
                 "selector-scoped MITM backend is not implemented",
@@ -698,7 +698,7 @@ mod tests {
         )?;
         let snapshot = build_status_snapshot_at(
             &plan,
-            available_spool_input(PathBuf::from("/tmp/sssa-spool")),
+            available_spool_input(PathBuf::from("/tmp/traffic-probe-spool")),
             42,
         );
 
@@ -720,14 +720,14 @@ mod tests {
     #[test]
     fn tls_plaintext_runtime_disabled_degrades_status_capability_and_health()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
+        let mut config = config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool"));
         config.capture.selection = CaptureSelection::Libpcap;
         config.tls.plaintext.instrumentation.enabled = true;
         config
             .tls
             .plaintext
             .instrumentation
-            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+            .libssl_uprobe_object_path = Some("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o".into());
         config.tls.plaintext.instrumentation.reconcile_interval_ms = 2_500;
         let plan = runtime_plan_from_config(
             config,
@@ -737,7 +737,7 @@ mod tests {
             )],
         )?;
         let spool = SpoolStatusInput::available(
-            PathBuf::from("/tmp/sssa-spool"),
+            PathBuf::from("/tmp/traffic-probe-spool"),
             SpoolSnapshot {
                 last_ingress_sequence: 0,
                 last_export_sequence: 0,
@@ -793,11 +793,11 @@ mod tests {
     fn tls_plaintext_runtime_not_configured_does_not_degrade_health()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = runtime_plan_from_config(
-            config_with_storage_path(PathBuf::from("/tmp/sssa-spool")),
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
             Vec::new(),
         )?;
         let spool = SpoolStatusInput::available(
-            PathBuf::from("/tmp/sssa-spool"),
+            PathBuf::from("/tmp/traffic-probe-spool"),
             SpoolSnapshot {
                 last_ingress_sequence: 0,
                 last_export_sequence: 0,
@@ -827,7 +827,7 @@ mod tests {
     {
         let plan = runtime_plan_with_exporter()?;
         let spool = SpoolStatusInput::available(
-            PathBuf::from("/tmp/sssa-spool"),
+            PathBuf::from("/tmp/traffic-probe-spool"),
             SpoolSnapshot {
                 last_ingress_sequence: 0,
                 last_export_sequence: 5,
@@ -949,11 +949,11 @@ mod tests {
     }
 
     fn runtime_plan_with_exporter() -> Result<RuntimePlan, runtime::RuntimeError> {
-        runtime_plan(PathBuf::from("/tmp/sssa-spool"), Vec::new())
+        runtime_plan(PathBuf::from("/tmp/traffic-probe-spool"), Vec::new())
     }
 
     fn runtime_plan_with_managed_transparent_proxy() -> Result<RuntimePlan, runtime::RuntimeError> {
-        let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
+        let mut config = config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool"));
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =

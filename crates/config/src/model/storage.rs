@@ -33,7 +33,7 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            path: PathBuf::from("/var/lib/sssa-probe/spool"),
+            path: PathBuf::from("/var/lib/traffic-probe/spool"),
             retention: StorageRetentionConfig::default(),
         }
     }

@@ -45,13 +45,13 @@ pub(crate) fn render_prometheus_metrics(snapshot: &AgentStatusSnapshot) -> Strin
 
     write_family(
         &mut output,
-        "sssa_agent_info",
+        "traffic_probe_agent_info",
         "gauge",
         "Static labels describing the running agent.",
     );
     write_sample(
         &mut output,
-        "sssa_agent_info",
+        "traffic_probe_agent_info",
         &[
             ("agent_id", &snapshot.agent_id),
             ("config_version", &snapshot.config_version),
@@ -61,13 +61,13 @@ pub(crate) fn render_prometheus_metrics(snapshot: &AgentStatusSnapshot) -> Strin
 
     write_family(
         &mut output,
-        "sssa_status_generated_unix_time_ns",
+        "traffic_probe_status_generated_unix_time_ns",
         "gauge",
         "Unix timestamp when this status snapshot was generated, in nanoseconds.",
     );
     write_sample(
         &mut output,
-        "sssa_status_generated_unix_time_ns",
+        "traffic_probe_status_generated_unix_time_ns",
         &[],
         snapshot.generated_unix_ns,
     );
@@ -86,14 +86,14 @@ pub(crate) fn render_prometheus_metrics(snapshot: &AgentStatusSnapshot) -> Strin
 fn write_health(output: &mut String, snapshot: &AgentStatusSnapshot) {
     write_family(
         output,
-        "sssa_agent_health_mode",
+        "traffic_probe_agent_health_mode",
         "gauge",
         "Current agent health mode as a one-hot gauge.",
     );
     for mode in RUNTIME_MODES {
         write_sample(
             output,
-            "sssa_agent_health_mode",
+            "traffic_probe_agent_health_mode",
             &[("mode", mode.wire_name())],
             u64::from(snapshot.health.mode == mode),
         );
@@ -103,14 +103,14 @@ fn write_health(output: &mut String, snapshot: &AgentStatusSnapshot) {
 fn write_capabilities(output: &mut String, snapshot: &AgentStatusSnapshot) {
     write_family(
         output,
-        "sssa_capability_modes",
+        "traffic_probe_capability_modes",
         "gauge",
         "Number of capabilities by runtime mode.",
     );
     for (mode, count) in capability_counts_by_mode(snapshot) {
         write_sample(
             output,
-            "sssa_capability_modes",
+            "traffic_probe_capability_modes",
             &[("mode", mode.wire_name())],
             count,
         );
@@ -118,7 +118,7 @@ fn write_capabilities(output: &mut String, snapshot: &AgentStatusSnapshot) {
 
     write_family(
         output,
-        "sssa_capability_state",
+        "traffic_probe_capability_state",
         "gauge",
         "Per-capability runtime mode as a one-hot gauge.",
     );
@@ -126,7 +126,7 @@ fn write_capabilities(output: &mut String, snapshot: &AgentStatusSnapshot) {
         for mode in RUNTIME_MODES {
             write_sample(
                 output,
-                "sssa_capability_state",
+                "traffic_probe_capability_state",
                 &[
                     ("capability", capability.kind.wire_name()),
                     ("mode", mode.wire_name()),
@@ -158,34 +158,44 @@ fn write_spool(output: &mut String, snapshot: &AgentStatusSnapshot) {
     if let Some(sequence) = snapshot.metrics.spool.ingress_last_sequence {
         write_family(
             output,
-            "sssa_spool_ingress_last_sequence",
+            "traffic_probe_spool_ingress_last_sequence",
             "gauge",
             "Last durable ingress sequence observed in the spool.",
         );
-        write_sample(output, "sssa_spool_ingress_last_sequence", &[], sequence);
+        write_sample(
+            output,
+            "traffic_probe_spool_ingress_last_sequence",
+            &[],
+            sequence,
+        );
     }
 
     if let Some(sequence) = snapshot.metrics.spool.export_last_sequence {
         write_family(
             output,
-            "sssa_spool_export_last_sequence",
+            "traffic_probe_spool_export_last_sequence",
             "gauge",
             "Last durable export sequence observed in the spool.",
         );
-        write_sample(output, "sssa_spool_export_last_sequence", &[], sequence);
+        write_sample(
+            output,
+            "traffic_probe_spool_export_last_sequence",
+            &[],
+            sequence,
+        );
     }
 }
 
 fn write_export(output: &mut String, snapshot: &AgentStatusSnapshot) {
     write_family(
         output,
-        "sssa_export_sinks",
+        "traffic_probe_export_sinks",
         "gauge",
         "Number of configured export sinks.",
     );
     write_sample(
         output,
-        "sssa_export_sinks",
+        "traffic_probe_export_sinks",
         &[],
         snapshot.metrics.export.sink_count,
     );
@@ -193,21 +203,21 @@ fn write_export(output: &mut String, snapshot: &AgentStatusSnapshot) {
     if let Some(lag) = snapshot.metrics.export.total_lag {
         write_family(
             output,
-            "sssa_export_total_lag",
+            "traffic_probe_export_total_lag",
             "gauge",
             "Total export queue lag across sinks with known cursors.",
         );
-        write_sample(output, "sssa_export_total_lag", &[], lag);
+        write_sample(output, "traffic_probe_export_total_lag", &[], lag);
     }
 
     if let Some(count) = snapshot.metrics.export.backing_off_sink_count {
         write_family(
             output,
-            "sssa_export_backing_off_sinks",
+            "traffic_probe_export_backing_off_sinks",
             "gauge",
             "Number of export sinks currently backing off.",
         );
-        write_sample(output, "sssa_export_backing_off_sinks", &[], count);
+        write_sample(output, "traffic_probe_export_backing_off_sinks", &[], count);
     }
 
     let mut wrote_lag_family = false;
@@ -216,7 +226,7 @@ fn write_export(output: &mut String, snapshot: &AgentStatusSnapshot) {
             if !wrote_lag_family {
                 write_family(
                     output,
-                    "sssa_export_sink_lag",
+                    "traffic_probe_export_sink_lag",
                     "gauge",
                     "Per-sink export queue lag for sinks with known cursors.",
                 );
@@ -224,7 +234,7 @@ fn write_export(output: &mut String, snapshot: &AgentStatusSnapshot) {
             }
             write_sample(
                 output,
-                "sssa_export_sink_lag",
+                "traffic_probe_export_sink_lag",
                 &[("sink", &exporter.id)],
                 lag,
             );
@@ -235,13 +245,13 @@ fn write_export(output: &mut String, snapshot: &AgentStatusSnapshot) {
 fn write_l7_mitm(output: &mut String, snapshot: &AgentStatusSnapshot) {
     write_family(
         output,
-        "sssa_l7_mitm_metrics_available",
+        "traffic_probe_l7_mitm_metrics_available",
         "gauge",
         "Whether L7 MITM runtime metrics are present in this snapshot.",
     );
     write_sample(
         output,
-        "sssa_l7_mitm_metrics_available",
+        "traffic_probe_l7_mitm_metrics_available",
         &[],
         u64::from(snapshot.metrics.l7_mitm.is_some()),
     );
@@ -252,9 +262,9 @@ fn write_l7_mitm(output: &mut String, snapshot: &AgentStatusSnapshot) {
 
     write_tcp_health(
         output,
-        "sssa_l7_mitm_backend_health_mode",
+        "traffic_probe_l7_mitm_backend_health_mode",
         "L7 MITM backend health probe mode as a one-hot gauge.",
-        "sssa_l7_mitm_backend_health_checks_total",
+        "traffic_probe_l7_mitm_backend_health_checks_total",
         "L7 MITM backend health probe checks by outcome.",
         &L7_MITM_BACKEND_HEALTH_MODES,
         metrics.backend_health,
@@ -262,14 +272,14 @@ fn write_l7_mitm(output: &mut String, snapshot: &AgentStatusSnapshot) {
 
     write_family(
         output,
-        "sssa_l7_mitm_plaintext_bridge_mode",
+        "traffic_probe_l7_mitm_plaintext_bridge_mode",
         "gauge",
         "L7 MITM plaintext bridge runtime mode as a one-hot gauge.",
     );
     for mode in L7_MITM_PLAINTEXT_BRIDGE_MODES {
         write_sample(
             output,
-            "sssa_l7_mitm_plaintext_bridge_mode",
+            "traffic_probe_l7_mitm_plaintext_bridge_mode",
             &[("mode", mode.wire_name())],
             u64::from(metrics.plaintext_bridge.mode == mode),
         );
@@ -279,13 +289,13 @@ fn write_l7_mitm(output: &mut String, snapshot: &AgentStatusSnapshot) {
 fn write_transparent_proxy(output: &mut String, snapshot: &AgentStatusSnapshot) {
     write_family(
         output,
-        "sssa_transparent_proxy_metrics_available",
+        "traffic_probe_transparent_proxy_metrics_available",
         "gauge",
         "Whether transparent proxy runtime metrics are present in this snapshot.",
     );
     write_sample(
         output,
-        "sssa_transparent_proxy_metrics_available",
+        "traffic_probe_transparent_proxy_metrics_available",
         &[],
         u64::from(snapshot.metrics.transparent_proxy.is_some()),
     );
@@ -296,22 +306,22 @@ fn write_transparent_proxy(output: &mut String, snapshot: &AgentStatusSnapshot) 
 
     write_family(
         output,
-        "sssa_transparent_proxy_active_relays",
+        "traffic_probe_transparent_proxy_active_relays",
         "gauge",
         "Active managed transparent proxy relay count.",
     );
     write_sample(
         output,
-        "sssa_transparent_proxy_active_relays",
+        "traffic_probe_transparent_proxy_active_relays",
         &[],
         metrics.active_relays,
     );
 
     write_tcp_health(
         output,
-        "sssa_transparent_proxy_health_probe_mode",
+        "traffic_probe_transparent_proxy_health_probe_mode",
         "Configured transparent proxy active health probe mode as a one-hot gauge.",
-        "sssa_transparent_proxy_health_probe_checks_total",
+        "traffic_probe_transparent_proxy_health_probe_checks_total",
         "Configured transparent proxy active health probe checks by outcome.",
         &TRANSPARENT_PROXY_HEALTH_PROBE_MODES,
         metrics.health_probe,
@@ -319,57 +329,57 @@ fn write_transparent_proxy(output: &mut String, snapshot: &AgentStatusSnapshot) 
 
     write_family(
         output,
-        "sssa_transparent_proxy_upstream_connects_total",
+        "traffic_probe_transparent_proxy_upstream_connects_total",
         "counter",
         "Managed transparent proxy upstream connect attempts by outcome.",
     );
     write_sample(
         output,
-        "sssa_transparent_proxy_upstream_connects_total",
+        "traffic_probe_transparent_proxy_upstream_connects_total",
         &[("outcome", "success")],
         metrics.upstream_connects.connect_successes,
     );
     write_sample(
         output,
-        "sssa_transparent_proxy_upstream_connects_total",
+        "traffic_probe_transparent_proxy_upstream_connects_total",
         &[("outcome", "failure")],
         metrics.upstream_connects.connect_failures,
     );
 
     write_family(
         output,
-        "sssa_transparent_proxy_relays_total",
+        "traffic_probe_transparent_proxy_relays_total",
         "counter",
         "Managed transparent proxy relays by outcome.",
     );
     write_sample(
         output,
-        "sssa_transparent_proxy_relays_total",
+        "traffic_probe_transparent_proxy_relays_total",
         &[("outcome", "accepted")],
         metrics.accepted_relays,
     );
     write_sample(
         output,
-        "sssa_transparent_proxy_relays_total",
+        "traffic_probe_transparent_proxy_relays_total",
         &[("outcome", "rejected")],
         metrics.rejected_relays,
     );
 
     write_family(
         output,
-        "sssa_transparent_proxy_failures_total",
+        "traffic_probe_transparent_proxy_failures_total",
         "counter",
         "Managed transparent proxy failures by kind.",
     );
     write_sample(
         output,
-        "sssa_transparent_proxy_failures_total",
+        "traffic_probe_transparent_proxy_failures_total",
         &[("kind", "relay")],
         metrics.relay_failures,
     );
     write_sample(
         output,
-        "sssa_transparent_proxy_failures_total",
+        "traffic_probe_transparent_proxy_failures_total",
         &[("kind", "listener")],
         metrics.listener_failures,
     );
@@ -412,13 +422,13 @@ fn write_tcp_health(
 fn write_pipeline(output: &mut String, snapshot: &AgentStatusSnapshot) {
     write_family(
         output,
-        "sssa_pipeline_metrics_available",
+        "traffic_probe_pipeline_metrics_available",
         "gauge",
         "Whether online pipeline runtime metrics are present in this snapshot.",
     );
     write_sample(
         output,
-        "sssa_pipeline_metrics_available",
+        "traffic_probe_pipeline_metrics_available",
         &[],
         u64::from(snapshot.metrics.pipeline.is_some()),
     );
@@ -429,162 +439,162 @@ fn write_pipeline(output: &mut String, snapshot: &AgentStatusSnapshot) {
 
     write_family(
         output,
-        "sssa_pipeline_capture_events_read_total",
+        "traffic_probe_pipeline_capture_events_read_total",
         "counter",
         "Capture events read by the running pipeline.",
     );
     write_sample(
         output,
-        "sssa_pipeline_capture_events_read_total",
+        "traffic_probe_pipeline_capture_events_read_total",
         &[],
         metrics.capture_events_read,
     );
 
     write_family(
         output,
-        "sssa_pipeline_ingress_records_total",
+        "traffic_probe_pipeline_ingress_records_total",
         "counter",
         "Ingress journal records by pipeline stage.",
     );
     write_sample(
         output,
-        "sssa_pipeline_ingress_records_total",
+        "traffic_probe_pipeline_ingress_records_total",
         &[("stage", "journaled")],
         metrics.ingress_records_journaled,
     );
     write_sample(
         output,
-        "sssa_pipeline_ingress_records_total",
+        "traffic_probe_pipeline_ingress_records_total",
         &[("stage", "recovered")],
         metrics.ingress_records_recovered,
     );
     write_sample(
         output,
-        "sssa_pipeline_ingress_records_total",
+        "traffic_probe_pipeline_ingress_records_total",
         &[("stage", "processed")],
         metrics.ingress_records_processed,
     );
 
     write_family(
         output,
-        "sssa_pipeline_export_events_written_total",
+        "traffic_probe_pipeline_export_events_written_total",
         "counter",
         "Export events written by the running pipeline.",
     );
     write_sample(
         output,
-        "sssa_pipeline_export_events_written_total",
+        "traffic_probe_pipeline_export_events_written_total",
         &[],
         metrics.export_events_written,
     );
 
     write_family(
         output,
-        "sssa_pipeline_capture_loss_events_total",
+        "traffic_probe_pipeline_capture_loss_events_total",
         "counter",
         "Provider capture loss events observed by the running pipeline.",
     );
     write_sample(
         output,
-        "sssa_pipeline_capture_loss_events_total",
+        "traffic_probe_pipeline_capture_loss_events_total",
         &[],
         metrics.capture_loss.events,
     );
     write_family(
         output,
-        "sssa_pipeline_capture_lost_events_total",
+        "traffic_probe_pipeline_capture_lost_events_total",
         "counter",
         "Provider-reported capture events lost before the running pipeline could observe them.",
     );
     write_sample(
         output,
-        "sssa_pipeline_capture_lost_events_total",
+        "traffic_probe_pipeline_capture_lost_events_total",
         &[],
         metrics.capture_loss.lost_events,
     );
 
     write_family(
         output,
-        "sssa_pipeline_policy_events_total",
+        "traffic_probe_pipeline_policy_events_total",
         "counter",
         "Policy runtime events by kind.",
     );
     write_sample(
         output,
-        "sssa_pipeline_policy_events_total",
+        "traffic_probe_pipeline_policy_events_total",
         &[("kind", "evaluation")],
         metrics.policy.evaluations,
     );
     write_sample(
         output,
-        "sssa_pipeline_policy_events_total",
+        "traffic_probe_pipeline_policy_events_total",
         &[("kind", "selector_miss")],
         metrics.policy.selector_misses,
     );
     write_sample(
         output,
-        "sssa_pipeline_policy_events_total",
+        "traffic_probe_pipeline_policy_events_total",
         &[("kind", "alert")],
         metrics.policy.alerts,
     );
     write_sample(
         output,
-        "sssa_pipeline_policy_events_total",
+        "traffic_probe_pipeline_policy_events_total",
         &[("kind", "verdict")],
         metrics.policy.verdicts,
     );
     write_sample(
         output,
-        "sssa_pipeline_policy_events_total",
+        "traffic_probe_pipeline_policy_events_total",
         &[("kind", "error")],
         metrics.policy.errors,
     );
 
     write_family(
         output,
-        "sssa_pipeline_enforcement_decisions_total",
+        "traffic_probe_pipeline_enforcement_decisions_total",
         "counter",
         "Enforcement decisions by outcome.",
     );
     write_sample(
         output,
-        "sssa_pipeline_enforcement_decisions_total",
+        "traffic_probe_pipeline_enforcement_decisions_total",
         &[("outcome", "disabled")],
         metrics.enforcement.disabled,
     );
     write_sample(
         output,
-        "sssa_pipeline_enforcement_decisions_total",
+        "traffic_probe_pipeline_enforcement_decisions_total",
         &[("outcome", "audit_only")],
         metrics.enforcement.audit_only,
     );
     write_sample(
         output,
-        "sssa_pipeline_enforcement_decisions_total",
+        "traffic_probe_pipeline_enforcement_decisions_total",
         &[("outcome", "dry_run")],
         metrics.enforcement.dry_run,
     );
     write_sample(
         output,
-        "sssa_pipeline_enforcement_decisions_total",
+        "traffic_probe_pipeline_enforcement_decisions_total",
         &[("outcome", "selector_miss")],
         metrics.enforcement.selector_miss,
     );
     write_sample(
         output,
-        "sssa_pipeline_enforcement_decisions_total",
+        "traffic_probe_pipeline_enforcement_decisions_total",
         &[("outcome", "unsupported")],
         metrics.enforcement.unsupported,
     );
     write_sample(
         output,
-        "sssa_pipeline_enforcement_decisions_total",
+        "traffic_probe_pipeline_enforcement_decisions_total",
         &[("outcome", "failed")],
         metrics.enforcement.failed,
     );
     write_sample(
         output,
-        "sssa_pipeline_enforcement_decisions_total",
+        "traffic_probe_pipeline_enforcement_decisions_total",
         &[("outcome", "applied")],
         metrics.enforcement.applied,
     );
@@ -656,13 +666,13 @@ mod tests {
 
     #[test]
     fn render_prometheus_metrics_escapes_label_values() -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
+        let mut config = config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool"));
         config.agent_id = "agent\"\\\nnext".to_string();
         let plan = runtime_plan_from_config(config, Vec::new())?;
         let snapshot = build_status_snapshot(
             &plan,
             SpoolStatusInput::available(
-                PathBuf::from("/tmp/sssa-spool"),
+                PathBuf::from("/tmp/traffic-probe-spool"),
                 SpoolSnapshot {
                     last_ingress_sequence: 0,
                     last_export_sequence: 0,
@@ -673,7 +683,7 @@ mod tests {
 
         let metrics = render_prometheus_metrics(&snapshot);
 
-        assert!(metrics.contains("sssa_agent_info{agent_id=\"agent\\\"\\\\\\nnext\""));
+        assert!(metrics.contains("traffic_probe_agent_info{agent_id=\"agent\\\"\\\\\\nnext\""));
         Ok(())
     }
 
@@ -681,13 +691,13 @@ mod tests {
     fn render_prometheus_metrics_includes_transparent_proxy_counters()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = runtime_plan_from_config(
-            config_with_storage_path(PathBuf::from("/tmp/sssa-spool")),
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
             Vec::new(),
         )?;
         let snapshot = build_status_snapshot_with_runtime(
             &plan,
             SpoolStatusInput::available(
-                PathBuf::from("/tmp/sssa-spool"),
+                PathBuf::from("/tmp/traffic-probe-spool"),
                 SpoolSnapshot {
                     last_ingress_sequence: 0,
                     last_export_sequence: 0,
@@ -715,29 +725,40 @@ mod tests {
 
         let metrics = render_prometheus_metrics(&snapshot);
 
-        assert!(metrics.contains("sssa_transparent_proxy_metrics_available 1\n"));
-        assert!(metrics.contains("sssa_transparent_proxy_active_relays 2\n"));
-        assert!(metrics.contains("sssa_transparent_proxy_health_probe_mode{mode=\"healthy\"} 1\n"));
-        assert!(metrics.contains(
-            "sssa_transparent_proxy_health_probe_checks_total{outcome=\"success\"} 19\n"
-        ));
-        assert!(metrics.contains(
-            "sssa_transparent_proxy_health_probe_checks_total{outcome=\"failure\"} 23\n"
-        ));
+        assert!(metrics.contains("traffic_probe_transparent_proxy_metrics_available 1\n"));
+        assert!(metrics.contains("traffic_probe_transparent_proxy_active_relays 2\n"));
         assert!(
             metrics.contains(
-                "sssa_transparent_proxy_upstream_connects_total{outcome=\"success\"} 13\n"
+                "traffic_probe_transparent_proxy_health_probe_mode{mode=\"healthy\"} 1\n"
             )
+        );
+        assert!(metrics.contains(
+            "traffic_probe_transparent_proxy_health_probe_checks_total{outcome=\"success\"} 19\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_transparent_proxy_health_probe_checks_total{outcome=\"failure\"} 23\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_transparent_proxy_upstream_connects_total{outcome=\"success\"} 13\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_transparent_proxy_upstream_connects_total{outcome=\"failure\"} 17\n"
+        ));
+        assert!(
+            metrics
+                .contains("traffic_probe_transparent_proxy_relays_total{outcome=\"accepted\"} 3\n")
         );
         assert!(
-            metrics.contains(
-                "sssa_transparent_proxy_upstream_connects_total{outcome=\"failure\"} 17\n"
-            )
+            metrics
+                .contains("traffic_probe_transparent_proxy_relays_total{outcome=\"rejected\"} 5\n")
         );
-        assert!(metrics.contains("sssa_transparent_proxy_relays_total{outcome=\"accepted\"} 3\n"));
-        assert!(metrics.contains("sssa_transparent_proxy_relays_total{outcome=\"rejected\"} 5\n"));
-        assert!(metrics.contains("sssa_transparent_proxy_failures_total{kind=\"relay\"} 7\n"));
-        assert!(metrics.contains("sssa_transparent_proxy_failures_total{kind=\"listener\"} 11\n"));
+        assert!(
+            metrics.contains("traffic_probe_transparent_proxy_failures_total{kind=\"relay\"} 7\n")
+        );
+        assert!(
+            metrics
+                .contains("traffic_probe_transparent_proxy_failures_total{kind=\"listener\"} 11\n")
+        );
         Ok(())
     }
 
@@ -745,13 +766,13 @@ mod tests {
     fn render_prometheus_metrics_includes_l7_mitm_backend_health_counters()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = runtime_plan_from_config(
-            config_with_storage_path(PathBuf::from("/tmp/sssa-spool")),
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
             Vec::new(),
         )?;
         let snapshot = build_status_snapshot_with_runtime(
             &plan,
             SpoolStatusInput::available(
-                PathBuf::from("/tmp/sssa-spool"),
+                PathBuf::from("/tmp/traffic-probe-spool"),
                 SpoolSnapshot {
                     last_ingress_sequence: 0,
                     last_export_sequence: 0,
@@ -785,18 +806,19 @@ mod tests {
                 && reason.contains("L7 MITM plaintext bridge degraded")
                 && reason.contains("feed parse error")
         }));
-        assert!(metrics.contains("sssa_l7_mitm_metrics_available 1\n"));
-        assert!(metrics.contains("sssa_l7_mitm_backend_health_mode{mode=\"unhealthy\"} 1\n"));
+        assert!(metrics.contains("traffic_probe_l7_mitm_metrics_available 1\n"));
         assert!(
-            metrics
-                .contains("sssa_l7_mitm_plaintext_bridge_mode{mode=\"disabled_after_error\"} 1\n")
+            metrics.contains("traffic_probe_l7_mitm_backend_health_mode{mode=\"unhealthy\"} 1\n")
         );
-        assert!(
-            metrics.contains("sssa_l7_mitm_backend_health_checks_total{outcome=\"success\"} 5\n")
-        );
-        assert!(
-            metrics.contains("sssa_l7_mitm_backend_health_checks_total{outcome=\"failure\"} 7\n")
-        );
+        assert!(metrics.contains(
+            "traffic_probe_l7_mitm_plaintext_bridge_mode{mode=\"disabled_after_error\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_l7_mitm_backend_health_checks_total{outcome=\"success\"} 5\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_l7_mitm_backend_health_checks_total{outcome=\"failure\"} 7\n"
+        ));
         Ok(())
     }
 
@@ -804,13 +826,13 @@ mod tests {
     fn render_prometheus_metrics_includes_capture_loss_counters()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = runtime_plan_from_config(
-            config_with_storage_path(PathBuf::from("/tmp/sssa-spool")),
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
             Vec::new(),
         )?;
         let snapshot = build_status_snapshot_with_runtime(
             &plan,
             SpoolStatusInput::available(
-                PathBuf::from("/tmp/sssa-spool"),
+                PathBuf::from("/tmp/traffic-probe-spool"),
                 SpoolSnapshot {
                     last_ingress_sequence: 0,
                     last_export_sequence: 0,
@@ -837,8 +859,8 @@ mod tests {
 
         let metrics = render_prometheus_metrics(&snapshot);
 
-        assert!(metrics.contains("sssa_pipeline_capture_loss_events_total 2\n"));
-        assert!(metrics.contains("sssa_pipeline_capture_lost_events_total 17\n"));
+        assert!(metrics.contains("traffic_probe_pipeline_capture_loss_events_total 2\n"));
+        assert!(metrics.contains("traffic_probe_pipeline_capture_lost_events_total 17\n"));
         Ok(())
     }
 }

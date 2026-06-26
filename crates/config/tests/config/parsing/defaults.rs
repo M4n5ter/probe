@@ -5,7 +5,7 @@ use probe_core::EnforcementMode;
 fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str("")?;
 
-    assert_eq!(config.agent_id, "sssa-probe");
+    assert_eq!(config.agent_id, "traffic-probe");
     assert_eq!(config.capture.selection, CaptureSelection::Auto);
     assert_eq!(
         config.capture.fallback_backends,

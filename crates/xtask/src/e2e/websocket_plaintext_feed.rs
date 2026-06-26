@@ -77,8 +77,8 @@ fn scenario() -> PlaintextFeedCase {
             PlaintextProcess::new(
                 422,
                 755,
-                "sssa-e2e-websocket",
-                "/usr/bin/sssa-e2e-websocket",
+                "traffic-probe-e2e-websocket",
+                "/usr/bin/traffic-probe-e2e-websocket",
                 "websocket-hash",
             ),
         ),

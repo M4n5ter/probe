@@ -273,7 +273,7 @@ fn upgrade_request(connection_index: usize) -> Vec<u8> {
          Sec-WebSocket-Key: {RFC_SAMPLE_WEBSOCKET_KEY}\r\n\
          Sec-WebSocket-Version: 13\r\n\
          Sec-WebSocket-Protocol: {SUBPROTOCOL}\r\n\
-         X-SSSA-E2E-WebSocket: {connection_index}\r\n\
+         X-Traffic-Probe-E2E-WebSocket: {connection_index}\r\n\
          \r\n"
     )
     .into_bytes()
@@ -305,7 +305,7 @@ fn deterministic_payload(connection_index: usize, payload_bytes: usize) -> Vec<u
     if payload_bytes == 2 {
         return b"hi".to_vec();
     }
-    let pattern = format!("sssa-websocket-{connection_index}-");
+    let pattern = format!("traffic-probe-websocket-{connection_index}-");
     let pattern = pattern.as_bytes();
     let mut payload = Vec::with_capacity(payload_bytes);
     while payload.len() < payload_bytes {
@@ -363,7 +363,7 @@ fn validate_upgrade_request(
         &format!("Sec-WebSocket-Key: {RFC_SAMPLE_WEBSOCKET_KEY}"),
         "Sec-WebSocket-Version: 13",
         &format!("Sec-WebSocket-Protocol: {SUBPROTOCOL}"),
-        &format!("X-SSSA-E2E-WebSocket: {connection_index}"),
+        &format!("X-Traffic-Probe-E2E-WebSocket: {connection_index}"),
     ] {
         if !message.contains(expected) {
             return Err(WebSocketLoopbackError::InvalidMessage(format!(

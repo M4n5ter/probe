@@ -306,12 +306,12 @@ mod tests {
             TlsMaterialConfig {
                 id: Some("client-cert".to_string()),
                 kind: TlsMaterialKind::ClientCertificate,
-                path: PathBuf::from("/etc/sssa/client.pem"),
+                path: PathBuf::from("/etc/traffic-probe/client.pem"),
             },
             TlsMaterialConfig {
                 id: Some("client-key".to_string()),
                 kind: TlsMaterialKind::ClientPrivateKey,
-                path: PathBuf::from("/etc/sssa/client.key"),
+                path: PathBuf::from("/etc/traffic-probe/client.key"),
             },
             TlsMaterialConfig {
                 id: Some("keylog".to_string()),
@@ -351,12 +351,12 @@ mod tests {
                     client_certificates: vec![export_tls_material(
                         "client-cert",
                         TlsMaterialKind::ClientCertificate,
-                        "/etc/sssa/client.pem",
+                        "/etc/traffic-probe/client.pem",
                     )],
                     client_private_key: Some(export_tls_material(
                         "client-key",
                         TlsMaterialKind::ClientPrivateKey,
-                        "/etc/sssa/client.key",
+                        "/etc/traffic-probe/client.key",
                     )),
                 },
                 worker: ExportSinkWorkerPlan {
@@ -373,7 +373,7 @@ mod tests {
             exporters: vec![ExporterConfig {
                 id: "local-file".to_string(),
                 transport: ExporterTransportConfig::File {
-                    path: PathBuf::from("/var/lib/sssa/export.jsonl"),
+                    path: PathBuf::from("/var/lib/traffic-probe/export.jsonl"),
                 },
                 codec: CompressionCodecName::Gzip,
                 worker: ExporterWorkerConfig {
@@ -389,7 +389,7 @@ mod tests {
             plan.sinks,
             vec![ExportSinkPlan::File(FileExportSinkPlan {
                 id: "local-file".to_string(),
-                path: PathBuf::from("/var/lib/sssa/export.jsonl"),
+                path: PathBuf::from("/var/lib/traffic-probe/export.jsonl"),
                 codec: CompressionCodecName::Gzip,
                 worker: ExportSinkWorkerPlan {
                     batches_per_tick_override: Some(4),

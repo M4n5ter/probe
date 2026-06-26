@@ -45,101 +45,101 @@ const FCNTL_CMD_OFFSET: usize = 24;
 const F_DUPFD: u64 = 0;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 
-#[map(name = "SSSA_EVENTS")]
-static SSSA_EVENTS: RingBuf = RingBuf::with_byte_size(EBPF_RING_BUFFER_BYTES, 0);
+#[map(name = "TRAFFIC_PROBE_EVENTS")]
+static TRAFFIC_PROBE_EVENTS: RingBuf = RingBuf::with_byte_size(EBPF_RING_BUFFER_BYTES, 0);
 
-#[map(name = "SSSA_ALLOWED_SOCKET_FDS")]
-static SSSA_ALLOWED_SOCKET_FDS: LruHashMap<EbpfSocketFdKey, EbpfSocketPayloadAllowance> =
+#[map(name = "TRAFFIC_PROBE_ALLOWED_SOCKET_FDS")]
+static TRAFFIC_PROBE_ALLOWED_SOCKET_FDS: LruHashMap<EbpfSocketFdKey, EbpfSocketPayloadAllowance> =
     LruHashMap::with_max_entries(EBPF_ALLOWED_SOCKET_FDS_MAX_ENTRIES, 0);
 
-#[map(name = "SSSA_FD_TABLE_EPOCHS")]
-static SSSA_FD_TABLE_EPOCHS: HashMap<u32, u64> =
+#[map(name = "TRAFFIC_PROBE_FD_TABLE_EPOCHS")]
+static TRAFFIC_PROBE_FD_TABLE_EPOCHS: HashMap<u32, u64> =
     HashMap::with_max_entries(EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES, 0);
 
-#[map(name = "SSSA_PENDING_ACCEPTS")]
-static SSSA_PENDING_ACCEPTS: HashMap<u64, EbpfPendingSocketAcceptAttempt> =
+#[map(name = "TRAFFIC_PROBE_PENDING_ACCEPTS")]
+static TRAFFIC_PROBE_PENDING_ACCEPTS: HashMap<u64, EbpfPendingSocketAcceptAttempt> =
     HashMap::with_max_entries(EBPF_PENDING_ACCEPTS_MAX_ENTRIES, 0);
 
-#[map(name = "SSSA_PENDING_WRITES")]
-static SSSA_PENDING_WRITES: HashMap<u64, EbpfPendingSocketWriteSample> =
+#[map(name = "TRAFFIC_PROBE_PENDING_WRITES")]
+static TRAFFIC_PROBE_PENDING_WRITES: HashMap<u64, EbpfPendingSocketWriteSample> =
     HashMap::with_max_entries(EBPF_PENDING_WRITES_MAX_ENTRIES, 0);
 
-#[map(name = "SSSA_PENDING_WRITE_SCRATCH")]
-static SSSA_PENDING_WRITE_SCRATCH: PerCpuArray<EbpfPendingSocketWriteSample> =
+#[map(name = "TRAFFIC_PROBE_PENDING_WRITE_SCRATCH")]
+static TRAFFIC_PROBE_PENDING_WRITE_SCRATCH: PerCpuArray<EbpfPendingSocketWriteSample> =
     PerCpuArray::with_max_entries(EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES, 0);
 
-#[map(name = "SSSA_PENDING_READS")]
-static SSSA_PENDING_READS: HashMap<u64, EbpfPendingSocketReadAttempt> =
+#[map(name = "TRAFFIC_PROBE_PENDING_READS")]
+static TRAFFIC_PROBE_PENDING_READS: HashMap<u64, EbpfPendingSocketReadAttempt> =
     HashMap::with_max_entries(EBPF_PENDING_READS_MAX_ENTRIES, 0);
 
-#[map(name = "SSSA_PROCESS_EVENT_SCRATCH")]
-static SSSA_PROCESS_EVENT_SCRATCH: PerCpuArray<EbpfSocketWriteSampleRecord> =
+#[map(name = "TRAFFIC_PROBE_PROCESS_EVENT_SCRATCH")]
+static TRAFFIC_PROBE_PROCESS_EVENT_SCRATCH: PerCpuArray<EbpfSocketWriteSampleRecord> =
     PerCpuArray::with_max_entries(EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES, 0);
 
-#[map(name = "SSSA_PROCESS_READ_EVENT_SCRATCH")]
-static SSSA_PROCESS_READ_EVENT_SCRATCH: PerCpuArray<EbpfSocketReadSampleRecord> =
+#[map(name = "TRAFFIC_PROBE_PROCESS_READ_EVENT_SCRATCH")]
+static TRAFFIC_PROBE_PROCESS_READ_EVENT_SCRATCH: PerCpuArray<EbpfSocketReadSampleRecord> =
     PerCpuArray::with_max_entries(EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES, 0);
 
-#[map(name = "SSSA_PROCESS_OUTPUT_LOSSES")]
-static SSSA_PROCESS_OUTPUT_LOSSES: PerCpuArray<u64> =
+#[map(name = "TRAFFIC_PROBE_PROCESS_OUTPUT_LOSSES")]
+static TRAFFIC_PROBE_PROCESS_OUTPUT_LOSSES: PerCpuArray<u64> =
     PerCpuArray::with_max_entries(EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES, 0);
 
 #[tracepoint(name = "sys_enter_connect", category = "syscalls")]
-pub fn sssa_sys_enter_connect(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_connect(ctx: TracePointContext) -> u32 {
     emit_connect_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_accept", category = "syscalls")]
-pub fn sssa_sys_enter_accept(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_accept(ctx: TracePointContext) -> u32 {
     record_accept_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_accept", category = "syscalls")]
-pub fn sssa_sys_exit_accept(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_exit_accept(ctx: TracePointContext) -> u32 {
     emit_accept_observation(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_accept4", category = "syscalls")]
-pub fn sssa_sys_enter_accept4(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_accept4(ctx: TracePointContext) -> u32 {
     record_accept_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_accept4", category = "syscalls")]
-pub fn sssa_sys_exit_accept4(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_exit_accept4(ctx: TracePointContext) -> u32 {
     emit_accept_observation(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_close", category = "syscalls")]
-pub fn sssa_sys_enter_close(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_close(ctx: TracePointContext) -> u32 {
     emit_close_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_dup", category = "syscalls")]
-pub fn sssa_sys_enter_dup(_ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_dup(_ctx: TracePointContext) -> u32 {
     invalidate_current_fd_table();
     0
 }
 
 #[tracepoint(name = "sys_enter_dup2", category = "syscalls")]
-pub fn sssa_sys_enter_dup2(_ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_dup2(_ctx: TracePointContext) -> u32 {
     invalidate_current_fd_table();
     0
 }
 
 #[tracepoint(name = "sys_enter_dup3", category = "syscalls")]
-pub fn sssa_sys_enter_dup3(_ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_dup3(_ctx: TracePointContext) -> u32 {
     invalidate_current_fd_table();
     0
 }
 
 #[tracepoint(name = "sys_enter_fcntl", category = "syscalls")]
-pub fn sssa_sys_enter_fcntl(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_fcntl(ctx: TracePointContext) -> u32 {
     if fcntl_may_create_fd(&ctx) {
         invalidate_current_fd_table();
     }
@@ -147,13 +147,13 @@ pub fn sssa_sys_enter_fcntl(ctx: TracePointContext) -> u32 {
 }
 
 #[tracepoint(name = "sys_enter_close_range", category = "syscalls")]
-pub fn sssa_sys_enter_close_range(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_close_range(ctx: TracePointContext) -> u32 {
     emit_close_range_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sched_process_exit", category = "sched")]
-pub fn sssa_sched_process_exit(_ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sched_process_exit(_ctx: TracePointContext) -> u32 {
     if current_pid() == current_tgid() {
         invalidate_current_fd_table();
     }
@@ -161,103 +161,103 @@ pub fn sssa_sched_process_exit(_ctx: TracePointContext) -> u32 {
 }
 
 #[tracepoint(name = "sched_process_exec", category = "sched")]
-pub fn sssa_sched_process_exec(_ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sched_process_exec(_ctx: TracePointContext) -> u32 {
     invalidate_current_fd_table();
     0
 }
 
 #[tracepoint(name = "sys_enter_write", category = "syscalls")]
-pub fn sssa_sys_enter_write(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_write(ctx: TracePointContext) -> u32 {
     record_write_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_write", category = "syscalls")]
-pub fn sssa_sys_exit_write(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_exit_write(ctx: TracePointContext) -> u32 {
     emit_write_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_sendto", category = "syscalls")]
-pub fn sssa_sys_enter_sendto(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_sendto(ctx: TracePointContext) -> u32 {
     record_write_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_sendto", category = "syscalls")]
-pub fn sssa_sys_exit_sendto(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_exit_sendto(ctx: TracePointContext) -> u32 {
     emit_write_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_writev", category = "syscalls")]
-pub fn sssa_sys_enter_writev(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_writev(ctx: TracePointContext) -> u32 {
     record_writev_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_writev", category = "syscalls")]
-pub fn sssa_sys_exit_writev(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_exit_writev(ctx: TracePointContext) -> u32 {
     emit_write_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_sendmsg", category = "syscalls")]
-pub fn sssa_sys_enter_sendmsg(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_sendmsg(ctx: TracePointContext) -> u32 {
     record_sendmsg_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_sendmsg", category = "syscalls")]
-pub fn sssa_sys_exit_sendmsg(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_exit_sendmsg(ctx: TracePointContext) -> u32 {
     emit_write_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_read", category = "syscalls")]
-pub fn sssa_sys_enter_read(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_read(ctx: TracePointContext) -> u32 {
     record_read_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_read", category = "syscalls")]
-pub fn sssa_sys_exit_read(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_exit_read(ctx: TracePointContext) -> u32 {
     emit_read_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_recvfrom", category = "syscalls")]
-pub fn sssa_sys_enter_recvfrom(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_recvfrom(ctx: TracePointContext) -> u32 {
     record_read_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_recvfrom", category = "syscalls")]
-pub fn sssa_sys_exit_recvfrom(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_exit_recvfrom(ctx: TracePointContext) -> u32 {
     emit_read_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_readv", category = "syscalls")]
-pub fn sssa_sys_enter_readv(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_readv(ctx: TracePointContext) -> u32 {
     record_readv_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_readv", category = "syscalls")]
-pub fn sssa_sys_exit_readv(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_exit_readv(ctx: TracePointContext) -> u32 {
     emit_read_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_recvmsg", category = "syscalls")]
-pub fn sssa_sys_enter_recvmsg(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_enter_recvmsg(ctx: TracePointContext) -> u32 {
     record_recvmsg_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_recvmsg", category = "syscalls")]
-pub fn sssa_sys_exit_recvmsg(ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sys_exit_recvmsg(ctx: TracePointContext) -> u32 {
     emit_read_sample(ctx);
     0
 }
@@ -285,15 +285,15 @@ fn record_accept_attempt(ctx: TracePointContext) {
         return;
     };
     let key = bpf_get_current_pid_tgid();
-    let _ = SSSA_PENDING_ACCEPTS.insert(&key, &attempt, 0);
+    let _ = TRAFFIC_PROBE_PENDING_ACCEPTS.insert(&key, &attempt, 0);
 }
 
 fn emit_accept_observation(ctx: TracePointContext) {
     let key = bpf_get_current_pid_tgid();
-    let Some(attempt) = (unsafe { SSSA_PENDING_ACCEPTS.get(&key).copied() }) else {
+    let Some(attempt) = (unsafe { TRAFFIC_PROBE_PENDING_ACCEPTS.get(&key).copied() }) else {
         return;
     };
-    let _ = SSSA_PENDING_ACCEPTS.remove(&key);
+    let _ = TRAFFIC_PROBE_PENDING_ACCEPTS.remove(&key);
     let Some(accept) = accept_observation_from_result(&ctx, attempt) else {
         return;
     };
@@ -380,30 +380,30 @@ fn record_write_payload_attempt(source: payload::PayloadAttemptSource) {
         return;
     }
     let key = bpf_get_current_pid_tgid();
-    let _ = SSSA_PENDING_WRITES.insert(&key, pending, 0);
+    let _ = TRAFFIC_PROBE_PENDING_WRITES.insert(&key, pending, 0);
 }
 
 fn emit_write_sample(ctx: TracePointContext) {
     let key = bpf_get_current_pid_tgid();
-    let Some(pending_ptr) = SSSA_PENDING_WRITES.get_ptr_mut(&key) else {
+    let Some(pending_ptr) = TRAFFIC_PROBE_PENDING_WRITES.get_ptr_mut(&key) else {
         return;
     };
     let pending = unsafe { &mut *pending_ptr };
     if !is_allowed_socket_payload(pending.fd, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE) {
-        let _ = SSSA_PENDING_WRITES.remove(&key);
+        let _ = TRAFFIC_PROBE_PENDING_WRITES.remove(&key);
         return;
     }
     if trim_write_sample_to_result(&ctx, pending).is_none() {
-        let _ = SSSA_PENDING_WRITES.remove(&key);
+        let _ = TRAFFIC_PROBE_PENDING_WRITES.remove(&key);
         return;
     };
     let Some(event) = scratch_event() else {
-        let _ = SSSA_PENDING_WRITES.remove(&key);
+        let _ = TRAFFIC_PROBE_PENDING_WRITES.remove(&key);
         return;
     };
     event.clear_sample();
     if !copy_captured_write_prefix(event, pending) {
-        let _ = SSSA_PENDING_WRITES.remove(&key);
+        let _ = TRAFFIC_PROBE_PENDING_WRITES.remove(&key);
         return;
     }
     event.overwrite_socket_write_sampled_metadata(
@@ -412,7 +412,7 @@ fn emit_write_sample(ctx: TracePointContext) {
         pending.flags,
     );
     submit_process_event(event);
-    let _ = SSSA_PENDING_WRITES.remove(&key);
+    let _ = TRAFFIC_PROBE_PENDING_WRITES.remove(&key);
 }
 
 fn record_read_attempt(ctx: TracePointContext) {
@@ -444,38 +444,38 @@ fn record_read_payload_attempt(source: payload::PayloadAttemptSource) {
         return;
     };
     let key = bpf_get_current_pid_tgid();
-    let _ = SSSA_PENDING_READS.insert(&key, &attempt, 0);
+    let _ = TRAFFIC_PROBE_PENDING_READS.insert(&key, &attempt, 0);
 }
 
 fn emit_read_sample(ctx: TracePointContext) {
     let key = bpf_get_current_pid_tgid();
-    let Some(attempt) = (unsafe { SSSA_PENDING_READS.get(&key).copied() }) else {
+    let Some(attempt) = (unsafe { TRAFFIC_PROBE_PENDING_READS.get(&key).copied() }) else {
         return;
     };
     if !is_allowed_socket_payload(attempt.fd, EBPF_SOCKET_PAYLOAD_ALLOW_READ) {
-        let _ = SSSA_PENDING_READS.remove(&key);
+        let _ = TRAFFIC_PROBE_PENDING_READS.remove(&key);
         return;
     }
     let Some(event) = read_scratch_event() else {
-        let _ = SSSA_PENDING_READS.remove(&key);
+        let _ = TRAFFIC_PROBE_PENDING_READS.remove(&key);
         return;
     };
     if capture_read_sample_from_result(&ctx, attempt, event).is_none() {
-        let _ = SSSA_PENDING_READS.remove(&key);
+        let _ = TRAFFIC_PROBE_PENDING_READS.remove(&key);
         return;
     }
     submit_process_event(event);
-    let _ = SSSA_PENDING_READS.remove(&key);
+    let _ = TRAFFIC_PROBE_PENDING_READS.remove(&key);
 }
 
 fn submit_process_event<T>(event: &T) {
-    if SSSA_EVENTS.output(event, 0).is_err() {
+    if TRAFFIC_PROBE_EVENTS.output(event, 0).is_err() {
         record_process_output_loss();
     }
 }
 
 fn record_process_output_loss() {
-    let Some(losses) = SSSA_PROCESS_OUTPUT_LOSSES.get_ptr_mut(0) else {
+    let Some(losses) = TRAFFIC_PROBE_PROCESS_OUTPUT_LOSSES.get_ptr_mut(0) else {
         return;
     };
     unsafe {
@@ -484,17 +484,17 @@ fn record_process_output_loss() {
 }
 
 fn pending_write_scratch() -> Option<&'static mut EbpfPendingSocketWriteSample> {
-    let ptr = SSSA_PENDING_WRITE_SCRATCH.get_ptr_mut(0)?;
+    let ptr = TRAFFIC_PROBE_PENDING_WRITE_SCRATCH.get_ptr_mut(0)?;
     Some(unsafe { &mut *ptr })
 }
 
 fn scratch_event() -> Option<&'static mut EbpfSocketWriteSampleRecord> {
-    let ptr = SSSA_PROCESS_EVENT_SCRATCH.get_ptr_mut(0)?;
+    let ptr = TRAFFIC_PROBE_PROCESS_EVENT_SCRATCH.get_ptr_mut(0)?;
     Some(unsafe { &mut *ptr })
 }
 
 fn read_scratch_event() -> Option<&'static mut EbpfSocketReadSampleRecord> {
-    let ptr = SSSA_PROCESS_READ_EVENT_SCRATCH.get_ptr_mut(0)?;
+    let ptr = TRAFFIC_PROBE_PROCESS_READ_EVENT_SCRATCH.get_ptr_mut(0)?;
     Some(unsafe { &mut *ptr })
 }
 
@@ -531,7 +531,7 @@ fn is_allowed_socket_payload(fd: i32, direction: u8) -> bool {
     }
     let tgid = current_tgid();
     let key = EbpfSocketFdKey::new(tgid, fd);
-    let Some(allowance) = (unsafe { SSSA_ALLOWED_SOCKET_FDS.get(&key).copied() }) else {
+    let Some(allowance) = (unsafe { TRAFFIC_PROBE_ALLOWED_SOCKET_FDS.get(&key).copied() }) else {
         return false;
     };
     allowance.fd_table_epoch != 0
@@ -544,13 +544,13 @@ fn untrack_socket_fd(fd: i32) {
         return;
     }
     let key = EbpfSocketFdKey::new(current_tgid(), fd);
-    let _ = SSSA_ALLOWED_SOCKET_FDS.remove(&key);
+    let _ = TRAFFIC_PROBE_ALLOWED_SOCKET_FDS.remove(&key);
 }
 
 fn invalidate_current_fd_table() {
     let tgid = current_tgid();
     let next_epoch = next_fd_table_epoch(tgid);
-    let _ = SSSA_FD_TABLE_EPOCHS.insert(&tgid, &next_epoch, 0);
+    let _ = TRAFFIC_PROBE_FD_TABLE_EPOCHS.insert(&tgid, &next_epoch, 0);
 }
 
 fn ensure_fd_table_epoch(tgid: u32) -> u64 {
@@ -558,7 +558,10 @@ fn ensure_fd_table_epoch(tgid: u32) -> u64 {
         return epoch;
     }
     let epoch = next_fd_table_epoch(tgid);
-    if SSSA_FD_TABLE_EPOCHS.insert(&tgid, &epoch, 0).is_ok() {
+    if TRAFFIC_PROBE_FD_TABLE_EPOCHS
+        .insert(&tgid, &epoch, 0)
+        .is_ok()
+    {
         epoch
     } else {
         0
@@ -574,7 +577,7 @@ fn next_fd_table_epoch(tgid: u32) -> u64 {
 }
 
 fn current_fd_table_epoch(tgid: u32) -> Option<u64> {
-    unsafe { SSSA_FD_TABLE_EPOCHS.get(&tgid).copied() }
+    unsafe { TRAFFIC_PROBE_FD_TABLE_EPOCHS.get(&tgid).copied() }
 }
 
 fn fcntl_may_create_fd(ctx: &TracePointContext) -> bool {

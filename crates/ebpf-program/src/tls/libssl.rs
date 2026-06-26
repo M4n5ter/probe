@@ -18,100 +18,100 @@ use ebpf_abi::{
     EbpfTlsPlaintextEvent, EbpfTlsPlaintextEventMetadata, EbpfTlsPlaintextMetadata,
 };
 
-#[map(name = "SSSA_TLS_CALLS")]
-static SSSA_TLS_CALLS: HashMap<EbpfTlsCallKey, EbpfTlsCallState> =
+#[map(name = "TRAFFIC_PROBE_TLS_CALLS")]
+static TRAFFIC_PROBE_TLS_CALLS: HashMap<EbpfTlsCallKey, EbpfTlsCallState> =
     HashMap::with_max_entries(EBPF_TLS_CALLS_MAX_ENTRIES, 0);
 
-#[map(name = "SSSA_TLS_FDS")]
-static SSSA_TLS_FDS: LruHashMap<EbpfTlsFdKey, i32> =
+#[map(name = "TRAFFIC_PROBE_TLS_FDS")]
+static TRAFFIC_PROBE_TLS_FDS: LruHashMap<EbpfTlsFdKey, i32> =
     LruHashMap::with_max_entries(EBPF_TLS_FDS_MAX_ENTRIES, 0);
 
-#[map(name = "SSSA_TLS_OFFSETS")]
-static SSSA_TLS_OFFSETS: LruHashMap<EbpfTlsOffsetKey, u64> =
+#[map(name = "TRAFFIC_PROBE_TLS_OFFSETS")]
+static TRAFFIC_PROBE_TLS_OFFSETS: LruHashMap<EbpfTlsOffsetKey, u64> =
     LruHashMap::with_max_entries(EBPF_TLS_OFFSETS_MAX_ENTRIES, 0);
 
-#[map(name = "SSSA_TLS_STATE_EPOCHS")]
-static SSSA_TLS_STATE_EPOCHS: HashMap<u32, u64> =
+#[map(name = "TRAFFIC_PROBE_TLS_STATE_EPOCHS")]
+static TRAFFIC_PROBE_TLS_STATE_EPOCHS: HashMap<u32, u64> =
     HashMap::with_max_entries(EBPF_TLS_STATE_EPOCHS_MAX_ENTRIES, 0);
 
-#[map(name = "SSSA_TLS_EVENT_SCRATCH")]
-static SSSA_TLS_EVENT_SCRATCH: PerCpuArray<EbpfTlsPlaintextEvent> =
+#[map(name = "TRAFFIC_PROBE_TLS_EVENT_SCRATCH")]
+static TRAFFIC_PROBE_TLS_EVENT_SCRATCH: PerCpuArray<EbpfTlsPlaintextEvent> =
     PerCpuArray::with_max_entries(EBPF_TLS_EVENT_SCRATCH_MAX_ENTRIES, 0);
 
 #[uprobe]
-pub fn sssa_ssl_set_fd(ctx: ProbeContext) -> u32 {
+pub fn traffic_probe_ssl_set_fd(ctx: ProbeContext) -> u32 {
     ssl_set_fd_enter(ctx);
     0
 }
 
 #[uretprobe]
-pub fn sssa_ssl_set_fd_exit(ctx: RetProbeContext) -> u32 {
+pub fn traffic_probe_ssl_set_fd_exit(ctx: RetProbeContext) -> u32 {
     ssl_set_fd_exit(ctx);
     0
 }
 
 #[uprobe]
-pub fn sssa_ssl_clear(ctx: ProbeContext) -> u32 {
+pub fn traffic_probe_ssl_clear(ctx: ProbeContext) -> u32 {
     ssl_clear_enter(ctx);
     0
 }
 
 #[uretprobe]
-pub fn sssa_ssl_clear_exit(ctx: RetProbeContext) -> u32 {
+pub fn traffic_probe_ssl_clear_exit(ctx: RetProbeContext) -> u32 {
     ssl_clear_exit(ctx);
     0
 }
 
 #[uprobe]
-pub fn sssa_ssl_free(ctx: ProbeContext) -> u32 {
+pub fn traffic_probe_ssl_free(ctx: ProbeContext) -> u32 {
     ssl_free(ctx);
     0
 }
 
 #[uprobe]
-pub fn sssa_ssl_read_enter(ctx: ProbeContext) -> u32 {
+pub fn traffic_probe_ssl_read_enter(ctx: ProbeContext) -> u32 {
     ssl_read_enter(ctx);
     0
 }
 
 #[uretprobe]
-pub fn sssa_ssl_read_exit(ctx: RetProbeContext) -> u32 {
+pub fn traffic_probe_ssl_read_exit(ctx: RetProbeContext) -> u32 {
     ssl_read_exit(ctx);
     0
 }
 
 #[uprobe]
-pub fn sssa_ssl_write_enter(ctx: ProbeContext) -> u32 {
+pub fn traffic_probe_ssl_write_enter(ctx: ProbeContext) -> u32 {
     ssl_write_enter(ctx);
     0
 }
 
 #[uretprobe]
-pub fn sssa_ssl_write_exit(ctx: RetProbeContext) -> u32 {
+pub fn traffic_probe_ssl_write_exit(ctx: RetProbeContext) -> u32 {
     ssl_write_exit(ctx);
     0
 }
 
 #[uprobe]
-pub fn sssa_ssl_read_ex_enter(ctx: ProbeContext) -> u32 {
+pub fn traffic_probe_ssl_read_ex_enter(ctx: ProbeContext) -> u32 {
     ssl_read_ex_enter(ctx);
     0
 }
 
 #[uretprobe]
-pub fn sssa_ssl_read_ex_exit(ctx: RetProbeContext) -> u32 {
+pub fn traffic_probe_ssl_read_ex_exit(ctx: RetProbeContext) -> u32 {
     ssl_read_ex_exit(ctx);
     0
 }
 
 #[uprobe]
-pub fn sssa_ssl_write_ex_enter(ctx: ProbeContext) -> u32 {
+pub fn traffic_probe_ssl_write_ex_enter(ctx: ProbeContext) -> u32 {
     ssl_write_ex_enter(ctx);
     0
 }
 
 #[uretprobe]
-pub fn sssa_ssl_write_ex_exit(ctx: RetProbeContext) -> u32 {
+pub fn traffic_probe_ssl_write_ex_exit(ctx: RetProbeContext) -> u32 {
     ssl_write_ex_exit(ctx);
     0
 }
@@ -362,13 +362,13 @@ fn store_call(mut state: EbpfTlsCallState) {
     };
     state.state_epoch = state_epoch;
     let key = EbpfTlsCallKey::new(pid_tgid);
-    let _ = SSSA_TLS_CALLS.insert(&key, &state, 0);
+    let _ = TRAFFIC_PROBE_TLS_CALLS.insert(&key, &state, 0);
 }
 
 fn take_call() -> Option<EbpfTlsCallState> {
     let key = EbpfTlsCallKey::new(bpf_get_current_pid_tgid());
-    let state = unsafe { SSSA_TLS_CALLS.get(&key).copied() };
-    let _ = SSSA_TLS_CALLS.remove(&key);
+    let state = unsafe { TRAFFIC_PROBE_TLS_CALLS.get(&key).copied() };
+    let _ = TRAFFIC_PROBE_TLS_CALLS.remove(&key);
     state
 }
 
@@ -477,13 +477,13 @@ fn read_payload_sample(
 }
 
 fn scratch_event() -> Option<&'static mut EbpfTlsPlaintextEvent> {
-    let ptr = SSSA_TLS_EVENT_SCRATCH.get_ptr_mut(0)?;
+    let ptr = TRAFFIC_PROBE_TLS_EVENT_SCRATCH.get_ptr_mut(0)?;
     Some(unsafe { &mut *ptr })
 }
 
 fn fd_for(tgid: u32, state_epoch: u64, ssl_pointer: u64) -> (i32, u16) {
     let key = EbpfTlsFdKey::new(tgid, state_epoch, ssl_pointer);
-    match unsafe { SSSA_TLS_FDS.get(&key) } {
+    match unsafe { TRAFFIC_PROBE_TLS_FDS.get(&key) } {
         Some(fd) => (*fd, EBPF_TLS_PLAINTEXT_FD_VALID),
         None => (-1, 0),
     }
@@ -497,22 +497,22 @@ fn next_stream_offset(
     original_len: u32,
 ) -> u64 {
     let key = EbpfTlsOffsetKey::new(tgid, direction.wire_value(), state_epoch, ssl_pointer);
-    let current = unsafe { SSSA_TLS_OFFSETS.get(&key).copied().unwrap_or(0) };
+    let current = unsafe { TRAFFIC_PROBE_TLS_OFFSETS.get(&key).copied().unwrap_or(0) };
     let next = current.saturating_add(u64::from(original_len));
-    let _ = SSSA_TLS_OFFSETS.insert(&key, &next, 0);
+    let _ = TRAFFIC_PROBE_TLS_OFFSETS.insert(&key, &next, 0);
     current
 }
 
 fn associate_fd(tgid: u32, state_epoch: u64, ssl_pointer: u64, fd: i32) {
     reset_offsets(tgid, state_epoch, ssl_pointer);
     let key = EbpfTlsFdKey::new(tgid, state_epoch, ssl_pointer);
-    let _ = SSSA_TLS_FDS.insert(&key, &fd, 0);
+    let _ = TRAFFIC_PROBE_TLS_FDS.insert(&key, &fd, 0);
 }
 
 fn cleanup_tls_state(tgid: u32, state_epoch: u64, ssl_pointer: u64) {
     reset_offsets(tgid, state_epoch, ssl_pointer);
     let key = EbpfTlsFdKey::new(tgid, state_epoch, ssl_pointer);
-    let _ = SSSA_TLS_FDS.remove(&key);
+    let _ = TRAFFIC_PROBE_TLS_FDS.remove(&key);
 }
 
 fn reset_offsets(tgid: u32, state_epoch: u64, ssl_pointer: u64) {
@@ -522,12 +522,12 @@ fn reset_offsets(tgid: u32, state_epoch: u64, ssl_pointer: u64) {
 
 fn remove_offset(tgid: u32, state_epoch: u64, ssl_pointer: u64, direction: EbpfTlsDirection) {
     let key = EbpfTlsOffsetKey::new(tgid, direction.wire_value(), state_epoch, ssl_pointer);
-    let _ = SSSA_TLS_OFFSETS.remove(&key);
+    let _ = TRAFFIC_PROBE_TLS_OFFSETS.remove(&key);
 }
 
 fn current_state_epoch() -> Option<u64> {
     let key = EBPF_TLS_STATE_EPOCH_KEY;
-    let epoch = unsafe { SSSA_TLS_STATE_EPOCHS.get(&key).copied()? };
+    let epoch = unsafe { TRAFFIC_PROBE_TLS_STATE_EPOCHS.get(&key).copied()? };
     (epoch != 0).then_some(epoch)
 }
 

@@ -31,7 +31,7 @@ impl TlsPlaintextExpectations {
 
     fn targets(self) -> BTreeSet<String> {
         (0..self.request_count)
-            .map(|request| format!("/sssa-e2e/{request}"))
+            .map(|request| format!("/traffic-probe-e2e/{request}"))
             .collect()
     }
 

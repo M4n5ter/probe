@@ -782,7 +782,7 @@ mod tests {
 
     fn managed_process_audit() -> L7MitmManagedProcessAudit {
         L7MitmManagedProcessAudit {
-            program: "/usr/local/bin/sssa-mitm-proxy".to_string(),
+            program: "/usr/local/bin/traffic-probe-mitm-proxy".to_string(),
             args_count: 2,
             working_dir: None,
             process_group: Some(42),

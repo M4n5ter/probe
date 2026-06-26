@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn exporter_status_reports_per_sink_worker_quota() -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
+        let mut config = config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool"));
         config.exporters[0].worker.batches_per_tick = Some(2);
         let plan = runtime_plan_from_config(config, Vec::new())?;
         let spool = available_spool_status(0, 0);
@@ -505,7 +505,7 @@ mod tests {
 
     #[test]
     fn export_status_reports_retention_without_sinks() -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = config_with_storage_path(PathBuf::from("/tmp/sssa-spool"));
+        let mut config = config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool"));
         config.exporters.clear();
         config.storage.retention.export.max_age_ms = Some(60_000);
         config.storage.retention.export.max_records = Some(50_000);
@@ -531,7 +531,7 @@ mod tests {
     fn exporter_status_reports_runtime_backoff_snapshot() -> Result<(), Box<dyn std::error::Error>>
     {
         let plan = runtime_plan_from_config(
-            config_with_storage_path(PathBuf::from("/tmp/sssa-spool")),
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
             Vec::new(),
         )?;
         let spool = available_spool_status(0, 5);
@@ -576,7 +576,7 @@ mod tests {
     fn cursor_beyond_high_water_marks_exporter_unavailable()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = runtime_plan_from_config(
-            config_with_storage_path(PathBuf::from("/tmp/sssa-spool")),
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
             Vec::new(),
         )?;
         let spool = available_spool_status(0, 5);
@@ -654,7 +654,7 @@ mod tests {
         export_last_sequence: u64,
     ) -> SpoolStatusSnapshot {
         SpoolStatusSnapshot {
-            path: PathBuf::from("/tmp/sssa-spool"),
+            path: PathBuf::from("/tmp/traffic-probe-spool"),
             mode: RuntimeMode::Available,
             reason: None,
             ingress_retention: Default::default(),

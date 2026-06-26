@@ -82,8 +82,8 @@ fn scenario() -> PlaintextFeedCase {
             PlaintextProcess::new(
                 423,
                 756,
-                "sssa-e2e-sse",
-                "/usr/bin/sssa-e2e-sse",
+                "traffic-probe-e2e-sse",
+                "/usr/bin/traffic-probe-e2e-sse",
                 "sse-hash",
             ),
         ),

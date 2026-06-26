@@ -14,7 +14,7 @@ use super::{
 };
 
 const USAGE: &str = "\
-usage: sssa-e2e-fixture <scenario> [options]
+usage: traffic-probe-e2e-fixture <scenario> [options]
 
 Scenarios:
   http1-loopback        Start a local TCP server and client in this process, then exchange deterministic HTTP/1 traffic.
@@ -843,7 +843,11 @@ mod tests {
     fn cli_help_is_successful_report() -> Result<(), Box<dyn Error>> {
         let report = run(["--help".to_string()])?;
 
-        assert!(report.to_string().contains("usage: sssa-e2e-fixture"));
+        assert!(
+            report
+                .to_string()
+                .contains("usage: traffic-probe-e2e-fixture")
+        );
         Ok(())
     }
 

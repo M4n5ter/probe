@@ -71,8 +71,8 @@ fn scenario() -> PlaintextFeedCase {
             PlaintextProcess::new(
                 424,
                 757,
-                "sssa-e2e-gap",
-                "/usr/bin/sssa-e2e-gap",
+                "traffic-probe-e2e-gap",
+                "/usr/bin/traffic-probe-e2e-gap",
                 "gap-hash",
             ),
         ),

@@ -54,7 +54,10 @@ pub(super) fn write_agent_config(
         id: COLLECTOR_SINK.to_string(),
         transport: ExporterTransportConfig::Webhook {
             endpoint: webhook_endpoint,
-            headers: BTreeMap::from([("x-sssa-e2e".to_string(), case.header_value.to_string())]),
+            headers: BTreeMap::from([(
+                "x-traffic-probe-e2e".to_string(),
+                case.header_value.to_string(),
+            )]),
             tls: Default::default(),
         },
         codec: CompressionCodecName::None,

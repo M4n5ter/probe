@@ -150,11 +150,11 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "destroy table inet sssa_probe",
-                "add table inet sssa_probe",
-                "add chain inet sssa_probe outbound_transparent_proxy { type nat hook output priority dstnat; policy accept; }",
-                "add rule inet sssa_probe outbound_transparent_proxy meta mark 0x53534102 return",
-                "add rule inet sssa_probe outbound_transparent_proxy meta l4proto tcp meta nfproto ipv4 tcp dport 443 ip daddr 203.0.113.10 redirect to :15001",
+                "destroy table inet traffic_probe",
+                "add table inet traffic_probe",
+                "add chain inet traffic_probe outbound_transparent_proxy { type nat hook output priority dstnat; policy accept; }",
+                "add rule inet traffic_probe outbound_transparent_proxy meta mark 0x54500102 return",
+                "add rule inet traffic_probe outbound_transparent_proxy meta l4proto tcp meta nfproto ipv4 tcp dport 443 ip daddr 203.0.113.10 redirect to :15001",
             ]
         );
     }
@@ -195,12 +195,12 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "destroy table inet sssa_probe",
-                "add table inet sssa_probe",
-                "add chain inet sssa_probe outbound_transparent_proxy { type nat hook output priority dstnat; policy accept; }",
-                "add rule inet sssa_probe outbound_transparent_proxy meta mark 0x53534102 return",
-                "add rule inet sssa_probe outbound_transparent_proxy meta l4proto tcp meta nfproto ipv4 tcp dport 443 ip daddr 203.0.113.10 redirect to :15001",
-                "add rule inet sssa_probe outbound_transparent_proxy meta l4proto tcp meta nfproto ipv4 tcp dport 444 ip daddr 203.0.113.20 redirect to :15001",
+                "destroy table inet traffic_probe",
+                "add table inet traffic_probe",
+                "add chain inet traffic_probe outbound_transparent_proxy { type nat hook output priority dstnat; policy accept; }",
+                "add rule inet traffic_probe outbound_transparent_proxy meta mark 0x54500102 return",
+                "add rule inet traffic_probe outbound_transparent_proxy meta l4proto tcp meta nfproto ipv4 tcp dport 443 ip daddr 203.0.113.10 redirect to :15001",
+                "add rule inet traffic_probe outbound_transparent_proxy meta l4proto tcp meta nfproto ipv4 tcp dport 444 ip daddr 203.0.113.20 redirect to :15001",
             ]
         );
     }

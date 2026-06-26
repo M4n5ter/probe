@@ -9,15 +9,15 @@ use aya_ebpf::{
 };
 use ebpf_abi::{EBPF_RING_BUFFER_BYTES, EBPF_TLS_OUTPUT_LOSSES_MAX_ENTRIES, EbpfTlsPlaintextEvent};
 
-#[map(name = "SSSA_EVENTS")]
-static SSSA_EVENTS: RingBuf = RingBuf::with_byte_size(EBPF_RING_BUFFER_BYTES, 0);
+#[map(name = "TRAFFIC_PROBE_EVENTS")]
+static TRAFFIC_PROBE_EVENTS: RingBuf = RingBuf::with_byte_size(EBPF_RING_BUFFER_BYTES, 0);
 
-#[map(name = "SSSA_TLS_OUTPUT_LOSSES")]
-static SSSA_TLS_OUTPUT_LOSSES: PerCpuArray<u64> =
+#[map(name = "TRAFFIC_PROBE_TLS_OUTPUT_LOSSES")]
+static TRAFFIC_PROBE_TLS_OUTPUT_LOSSES: PerCpuArray<u64> =
     PerCpuArray::with_max_entries(EBPF_TLS_OUTPUT_LOSSES_MAX_ENTRIES, 0);
 
 pub(crate) unsafe fn submit_tls_plaintext_event(event: *const EbpfTlsPlaintextEvent) {
-    let Some(mut entry) = SSSA_EVENTS.reserve::<EbpfTlsPlaintextEvent>(0) else {
+    let Some(mut entry) = TRAFFIC_PROBE_EVENTS.reserve::<EbpfTlsPlaintextEvent>(0) else {
         record_tls_output_loss();
         return;
     };
@@ -28,7 +28,7 @@ pub(crate) unsafe fn submit_tls_plaintext_event(event: *const EbpfTlsPlaintextEv
 }
 
 fn record_tls_output_loss() {
-    let Some(losses) = SSSA_TLS_OUTPUT_LOSSES.get_ptr_mut(0) else {
+    let Some(losses) = TRAFFIC_PROBE_TLS_OUTPUT_LOSSES.get_ptr_mut(0) else {
         return;
     };
     unsafe {

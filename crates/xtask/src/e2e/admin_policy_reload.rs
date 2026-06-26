@@ -170,7 +170,7 @@ hooks = ["on_http_request_headers"]
             r#"
 function on_http_request_headers(event)
   local target = event.kind.target or ""
-  if string.sub(target, 1, 10) == "/sssa-e2e/" then
+  if string.sub(target, 1, 10) == "/traffic-probe-e2e/" then
     return probe.emit_alert("{alert_prefix}" .. target)
   end
 end
@@ -303,12 +303,12 @@ fn expected_policy_alert_facts(listen_ports: [u16; 2]) -> BTreeSet<PolicyAlertFa
         .map(|request| PolicyAlertFact {
             policy_version: old_version.clone(),
             listen_port: first_port,
-            message: format!("{OLD_POLICY_ALERT_PREFIX}/sssa-e2e/{request}"),
+            message: format!("{OLD_POLICY_ALERT_PREFIX}/traffic-probe-e2e/{request}"),
         })
         .chain((0..SECOND_REQUESTS).map(|request| PolicyAlertFact {
             policy_version: new_version.clone(),
             listen_port: second_port,
-            message: format!("{NEW_POLICY_ALERT_PREFIX}/sssa-e2e/{request}"),
+            message: format!("{NEW_POLICY_ALERT_PREFIX}/traffic-probe-e2e/{request}"),
         }))
         .collect()
 }

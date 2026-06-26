@@ -90,11 +90,11 @@ pub(crate) fn validate_traffic_config(config: &HttpTrafficConfig) -> Result<(), 
 pub(crate) fn request(request_index: usize, body_bytes: usize) -> Vec<u8> {
     let body = deterministic_body("request", request_index, body_bytes);
     let header = format!(
-        "POST /sssa-e2e/{request_index} HTTP/1.1\r\n\
+        "POST /traffic-probe-e2e/{request_index} HTTP/1.1\r\n\
          Host: 127.0.0.1\r\n\
-         User-Agent: sssa-e2e-fixture\r\n\
+         User-Agent: traffic-probe-e2e-fixture\r\n\
          Connection: close\r\n\
-         X-SSSA-E2E-Request: {request_index}\r\n\
+         X-Traffic-Probe-E2E-Request: {request_index}\r\n\
          Content-Length: {}\r\n\
          \r\n",
         body.len()
@@ -107,7 +107,7 @@ pub(crate) fn response(request_index: usize, body_bytes: usize) -> Vec<u8> {
     let header = format!(
         "HTTP/1.1 200 OK\r\n\
          Connection: close\r\n\
-         X-SSSA-E2E-Response: {request_index}\r\n\
+         X-Traffic-Probe-E2E-Response: {request_index}\r\n\
          Content-Length: {}\r\n\
          \r\n",
         body.len()
@@ -122,8 +122,8 @@ pub(crate) fn validate_request(
 ) -> Result<(), HttpMessageError> {
     validate_http_message(
         bytes,
-        &format!("POST /sssa-e2e/{request_index} HTTP/1.1"),
-        &format!("X-SSSA-E2E-Request: {request_index}"),
+        &format!("POST /traffic-probe-e2e/{request_index} HTTP/1.1"),
+        &format!("X-Traffic-Probe-E2E-Request: {request_index}"),
         expected_body_bytes,
     )
 }
@@ -136,7 +136,7 @@ pub(crate) fn validate_response(
     validate_http_message(
         bytes,
         "HTTP/1.1 200 OK",
-        &format!("X-SSSA-E2E-Response: {request_index}"),
+        &format!("X-Traffic-Probe-E2E-Response: {request_index}"),
         expected_body_bytes,
     )
 }
@@ -171,7 +171,7 @@ pub(crate) fn chunk_size(bytes_len: usize, chunks: usize) -> usize {
 }
 
 fn deterministic_body(label: &str, request_index: usize, len: usize) -> Vec<u8> {
-    let pattern = format!("sssa-e2e-{label}-{request_index}-");
+    let pattern = format!("traffic-probe-e2e-{label}-{request_index}-");
     let pattern = pattern.as_bytes();
     let mut body = Vec::with_capacity(len);
     while body.len() < len {

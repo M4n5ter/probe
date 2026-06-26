@@ -32,7 +32,7 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://example.invalid/sssa-probe"
+repository = "https://example.invalid/traffic-probe"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

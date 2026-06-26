@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "sssa-e2e-fixture"
+name = "traffic-probe-e2e-fixture"
 path = "src/main.rs"
 
 [lints]

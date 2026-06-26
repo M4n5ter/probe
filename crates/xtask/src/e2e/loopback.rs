@@ -20,10 +20,10 @@ const FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
 const AGENT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const AGENT_PROGRESS_STABLE_POLLS: u8 = 3;
-const FIXTURE_PROCESS_NAME_PREFIX: &str = "sssa-e2e";
-const FIXTURE_BINARY_NAME: &str = "sssa-e2e-fixture";
+const FIXTURE_PROCESS_NAME_PREFIX: &str = "traffic-probe-e2e";
+const FIXTURE_BINARY_NAME: &str = "traffic-probe-e2e-fixture";
 
-pub(crate) const AGENT_READY_SOCKET_ENV: &str = "SSSA_PROBE_READY_SOCKET";
+pub(crate) const AGENT_READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_READY_SOCKET";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Http1LoopbackFixtureConfig {

@@ -56,7 +56,7 @@ pub(super) fn expected_policy_alert_messages() -> std::collections::BTreeSet<Str
 
 pub(super) fn expected_libpcap_targets() -> std::collections::BTreeSet<String> {
     (0..REQUESTS)
-        .map(|request| format!("/sssa-e2e/{request}"))
+        .map(|request| format!("/traffic-probe-e2e/{request}"))
         .collect()
 }
 

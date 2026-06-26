@@ -137,27 +137,27 @@ timeout_ms = 250
 [[tls.materials]]
 id = "mitm-ca"
 kind = "mitm_ca_certificate"
-path = "/etc/sssa/mitm-ca.pem"
+path = "/etc/traffic-probe/mitm-ca.pem"
 
 [[tls.materials]]
 id = "mitm-ca-key"
 kind = "mitm_ca_private_key"
-path = "/etc/sssa/mitm-ca.key"
+path = "/etc/traffic-probe/mitm-ca.key"
 
 [[tls.materials]]
 id = "leaf-cert"
 kind = "mitm_leaf_certificate"
-path = "/etc/sssa/leaf.pem"
+path = "/etc/traffic-probe/leaf.pem"
 
 [[tls.materials]]
 id = "leaf-key"
 kind = "mitm_leaf_private_key"
-path = "/etc/sssa/leaf.key"
+path = "/etc/traffic-probe/leaf.key"
 
 [[tls.materials]]
 id = "upstream-ca"
 kind = "mitm_upstream_trust_anchor"
-path = "/etc/sssa/upstream-ca.pem"
+path = "/etc/traffic-probe/upstream-ca.pem"
 "#,
     )?;
 
@@ -242,19 +242,19 @@ target = "127.0.0.1:15002"
 timeout_ms = 250
 
 [enforcement.interception.mitm.backend.process]
-program = "/usr/local/bin/sssa-mitm-proxy"
+program = "/usr/local/bin/traffic-probe-mitm-proxy"
 args = ["--listen", "127.0.0.1:15002"]
-working_dir = "/run/sssa"
+working_dir = "/run/traffic-probe"
 
 [[tls.materials]]
 id = "mitm-ca"
 kind = "mitm_ca_certificate"
-path = "/etc/sssa/mitm-ca.pem"
+path = "/etc/traffic-probe/mitm-ca.pem"
 
 [[tls.materials]]
 id = "mitm-ca-key"
 kind = "mitm_ca_private_key"
-path = "/etc/sssa/mitm-ca.key"
+path = "/etc/traffic-probe/mitm-ca.key"
 "#,
     )?;
 
@@ -265,7 +265,9 @@ path = "/etc/sssa/mitm-ca.key"
     };
     assert_eq!(
         process.program.as_deref(),
-        Some(std::path::Path::new("/usr/local/bin/sssa-mitm-proxy"))
+        Some(std::path::Path::new(
+            "/usr/local/bin/traffic-probe-mitm-proxy"
+        ))
     );
     assert_eq!(
         process.args,
@@ -273,7 +275,7 @@ path = "/etc/sssa/mitm-ca.key"
     );
     assert_eq!(
         process.working_dir.as_deref(),
-        Some(std::path::Path::new("/run/sssa"))
+        Some(std::path::Path::new("/run/traffic-probe"))
     );
     Ok(())
 }
@@ -287,7 +289,7 @@ strategy = "inbound_tproxy_mitm"
 
 [enforcement.interception.mitm.plaintext_bridge]
 mode = "capture_event_feed"
-path = "/run/sssa/mitm-capture-events.jsonl"
+path = "/run/traffic-probe/mitm-capture-events.jsonl"
 follow = true
 "#,
     )?;
@@ -304,7 +306,9 @@ follow = true
             .plaintext_bridge
             .path
             .as_deref(),
-        Some(std::path::Path::new("/run/sssa/mitm-capture-events.jsonl"))
+        Some(std::path::Path::new(
+            "/run/traffic-probe/mitm-capture-events.jsonl"
+        ))
     );
     assert_eq!(
         config.enforcement.interception.mitm.plaintext_bridge.follow,

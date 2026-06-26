@@ -29,8 +29,8 @@ const ALLOWED_CONNECTION_ID: &str = "xtask-e2e-remote-enforcement-allowed";
 const MANIFEST_MISS_CONNECTION_ID: &str = "xtask-e2e-remote-enforcement-manifest-miss";
 const CONFIG_MISS_CONNECTION_ID: &str = "xtask-e2e-remote-enforcement-config-miss";
 const PROFILE_MISS_CONNECTION_ID: &str = "xtask-e2e-remote-enforcement-profile-miss";
-const PROCESS_NAME: &str = "sssa-e2e-remote-enforcement";
-const CONFIG_ONLY_PROCESS_NAME: &str = "sssa-e2e-config-only-enforcement";
+const PROCESS_NAME: &str = "traffic-probe-e2e-remote-enforcement";
+const CONFIG_ONLY_PROCESS_NAME: &str = "traffic-probe-e2e-config-only-enforcement";
 const ALLOWED_LOCAL_PORT: u16 = 52_200;
 const MANIFEST_MISS_LOCAL_PORT: u16 = 52_201;
 const CONFIG_MISS_LOCAL_PORT: u16 = 52_202;
@@ -122,7 +122,7 @@ fn remote_cases() -> Vec<RemoteEnforcementCase> {
                     512,
                     901,
                     PROCESS_NAME,
-                    "/usr/bin/sssa-e2e-remote-enforcement",
+                    "/usr/bin/traffic-probe-e2e-remote-enforcement",
                     "remote-enforcement-hash",
                 ),
             ),
@@ -141,7 +141,7 @@ fn remote_cases() -> Vec<RemoteEnforcementCase> {
                     513,
                     902,
                     CONFIG_ONLY_PROCESS_NAME,
-                    "/usr/bin/sssa-e2e-config-only-enforcement",
+                    "/usr/bin/traffic-probe-e2e-config-only-enforcement",
                     "config-only-enforcement-hash",
                 ),
             ),
@@ -160,7 +160,7 @@ fn remote_cases() -> Vec<RemoteEnforcementCase> {
                     514,
                     903,
                     PROCESS_NAME,
-                    "/usr/bin/sssa-e2e-remote-enforcement",
+                    "/usr/bin/traffic-probe-e2e-remote-enforcement",
                     "remote-enforcement-hash",
                 ),
             ),
@@ -179,7 +179,7 @@ fn remote_cases() -> Vec<RemoteEnforcementCase> {
                     515,
                     904,
                     PROCESS_NAME,
-                    "/usr/bin/sssa-e2e-remote-enforcement",
+                    "/usr/bin/traffic-probe-e2e-remote-enforcement",
                     "remote-enforcement-hash",
                 ),
             ),

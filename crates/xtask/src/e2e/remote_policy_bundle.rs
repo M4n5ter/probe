@@ -96,8 +96,8 @@ fn scenario() -> PlaintextFeedScenario {
         PlaintextProcess::new(
             620,
             1_120,
-            "sssa-e2e-remote-policy",
-            "/usr/bin/sssa-e2e-remote-policy",
+            "traffic-probe-e2e-remote-policy",
+            "/usr/bin/traffic-probe-e2e-remote-policy",
             "remote-policy-hash",
         ),
     ))

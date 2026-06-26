@@ -559,7 +559,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         let path = std::env::temp_dir().join(format!(
-            "sssa-e2e-fixture-{name}-{}-{}",
+            "traffic-probe-e2e-fixture-{name}-{}-{}",
             std::process::id(),
             unique
         ));

@@ -1,4 +1,4 @@
-pub const EBPF_EVENTS_MAP_NAME: &str = "SSSA_EVENTS";
+pub const EBPF_EVENTS_MAP_NAME: &str = "TRAFFIC_PROBE_EVENTS";
 pub const EBPF_UPROBE_SECTION_NAME: &str = "uprobe";
 pub const EBPF_URETPROBE_SECTION_NAME: &str = "uretprobe";
 

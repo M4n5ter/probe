@@ -101,7 +101,7 @@ mod tests {
         let temp = tempdir()?;
         fs::write(
             temp.path().join(SPOOL_MARKER_FILE),
-            b"not-an-sssa-probe-spool\n",
+            b"not-a-traffic-probe-spool\n",
         )?;
 
         let error = FjallSpool::probe(temp.path()).expect_err("invalid marker must fail fast");
@@ -116,7 +116,7 @@ mod tests {
         let temp = tempdir()?;
         fs::write(
             temp.path().join(SPOOL_MARKER_FILE),
-            b"not-an-sssa-probe-spool\n",
+            b"not-a-traffic-probe-spool\n",
         )?;
 
         let error = match FjallSpool::open(temp.path()) {

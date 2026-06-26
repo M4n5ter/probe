@@ -552,7 +552,7 @@ mod tests {
             .tls
             .plaintext
             .instrumentation
-            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+            .libssl_uprobe_object_path = Some("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o".into());
         config.tls.plaintext.instrumentation.reconcile_interval_ms = 2_500;
         let plan = runtime_plan(config)?;
 
@@ -561,7 +561,7 @@ mod tests {
         let value = serde_json::to_value(report)?;
         assert_eq!(
             value["tls"]["plaintext"]["instrumentation"]["libssl_uprobe_object_path"],
-            json!("/opt/sssa/ebpf-tls-plaintext.bpf.o")
+            json!("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o")
         );
         assert_eq!(
             value["tls"]["plaintext"]["instrumentation"]["reconcile_interval_ms"],

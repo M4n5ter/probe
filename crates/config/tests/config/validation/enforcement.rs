@@ -204,17 +204,17 @@ timeout_ms = 250
 [[tls.materials]]
 id = "mitm-ca"
 kind = "mitm_ca_certificate"
-path = "/etc/sssa/mitm-ca.pem"
+path = "/etc/traffic-probe/mitm-ca.pem"
 
 [[tls.materials]]
 id = "mitm-ca-key"
 kind = "mitm_ca_private_key"
-path = "/etc/sssa/mitm-ca.key"
+path = "/etc/traffic-probe/mitm-ca.key"
 
 [[tls.materials]]
 id = "upstream-ca"
 kind = "mitm_upstream_trust_anchor"
-path = "/etc/sssa/upstream-ca.pem"
+path = "/etc/traffic-probe/upstream-ca.pem"
 "#,
     )?;
 
@@ -246,18 +246,18 @@ target = "127.0.0.1:15002"
 timeout_ms = 250
 
 [enforcement.interception.mitm.backend.process]
-program = "/usr/local/bin/sssa-mitm-proxy"
+program = "/usr/local/bin/traffic-probe-mitm-proxy"
 args = ["--listen", "127.0.0.1:15002"]
 
 [[tls.materials]]
 id = "mitm-ca"
 kind = "mitm_ca_certificate"
-path = "/etc/sssa/mitm-ca.pem"
+path = "/etc/traffic-probe/mitm-ca.pem"
 
 [[tls.materials]]
 id = "mitm-ca-key"
 kind = "mitm_ca_private_key"
-path = "/etc/sssa/mitm-ca.key"
+path = "/etc/traffic-probe/mitm-ca.key"
 "#,
     )?;
 
@@ -290,12 +290,12 @@ target = "127.0.0.1:15002"
 [[tls.materials]]
 id = "mitm-ca"
 kind = "mitm_ca_certificate"
-path = "/etc/sssa/mitm-ca.pem"
+path = "/etc/traffic-probe/mitm-ca.pem"
 
 [[tls.materials]]
 id = "mitm-ca-key"
 kind = "mitm_ca_private_key"
-path = "/etc/sssa/mitm-ca.key"
+path = "/etc/traffic-probe/mitm-ca.key"
 "#,
     )?;
     let error = missing_program
@@ -327,17 +327,17 @@ mode = "external"
 target = "127.0.0.1:15002"
 
 [enforcement.interception.mitm.backend.process]
-program = "/usr/local/bin/sssa-mitm-proxy"
+program = "/usr/local/bin/traffic-probe-mitm-proxy"
 
 [[tls.materials]]
 id = "mitm-ca"
 kind = "mitm_ca_certificate"
-path = "/etc/sssa/mitm-ca.pem"
+path = "/etc/traffic-probe/mitm-ca.pem"
 
 [[tls.materials]]
 id = "mitm-ca-key"
 kind = "mitm_ca_private_key"
-path = "/etc/sssa/mitm-ca.key"
+path = "/etc/traffic-probe/mitm-ca.key"
 "#,
     )
     .expect_err("external MITM backend must not accept managed process payload");
@@ -368,18 +368,18 @@ mode = "managed_process"
 target = "127.0.0.1:15002"
 
 [enforcement.interception.mitm.backend.process]
-program = "sssa-mitm-proxy"
-working_dir = "run/sssa"
+program = "traffic-probe-mitm-proxy"
+working_dir = "run/traffic-probe"
 
 [[tls.materials]]
 id = "mitm-ca"
 kind = "mitm_ca_certificate"
-path = "/etc/sssa/mitm-ca.pem"
+path = "/etc/traffic-probe/mitm-ca.pem"
 
 [[tls.materials]]
 id = "mitm-ca-key"
 kind = "mitm_ca_private_key"
-path = "/etc/sssa/mitm-ca.key"
+path = "/etc/traffic-probe/mitm-ca.key"
 "#,
     )?;
     let error = relative_paths
@@ -402,7 +402,7 @@ fn validation_accepts_external_mitm_plaintext_bridge() -> Result<(), Box<dyn std
         r#"
 [enforcement.interception.mitm.plaintext_bridge]
 mode = "capture_event_feed"
-path = "/run/sssa/mitm-capture-events.jsonl"
+path = "/run/traffic-probe/mitm-capture-events.jsonl"
 follow = true
 "#,
     ))?;
@@ -435,7 +435,7 @@ mode = "capture_event_feed"
     let path_without_mode = AgentConfig::from_toml_str(&external_mitm_bridge_fixture(
         r#"
 [enforcement.interception.mitm.plaintext_bridge]
-path = "/run/sssa/mitm-capture-events.jsonl"
+path = "/run/traffic-probe/mitm-capture-events.jsonl"
 "#,
     ))?;
     let error = path_without_mode
@@ -502,12 +502,12 @@ mode = "external"
 [[tls.materials]]
 id = "mitm-ca"
 kind = "mitm_ca_certificate"
-path = "/etc/sssa/mitm-ca.pem"
+path = "/etc/traffic-probe/mitm-ca.pem"
 
 [[tls.materials]]
 id = "mitm-ca-key"
 kind = "mitm_ca_private_key"
-path = "/etc/sssa/mitm-ca.key"
+path = "/etc/traffic-probe/mitm-ca.key"
 "#,
     )?;
 
@@ -547,12 +547,12 @@ timeout_ms = 0
 [[tls.materials]]
 id = "mitm-ca"
 kind = "mitm_ca_certificate"
-path = "/etc/sssa/mitm-ca.pem"
+path = "/etc/traffic-probe/mitm-ca.pem"
 
 [[tls.materials]]
 id = "mitm-ca-key"
 kind = "mitm_ca_private_key"
-path = "/etc/sssa/mitm-ca.key"
+path = "/etc/traffic-probe/mitm-ca.key"
 "#,
     )?;
 
@@ -594,12 +594,12 @@ target = "192.0.2.10:15003"
 [[tls.materials]]
 id = "mitm-ca"
 kind = "mitm_ca_certificate"
-path = "/etc/sssa/mitm-ca.pem"
+path = "/etc/traffic-probe/mitm-ca.pem"
 
 [[tls.materials]]
 id = "mitm-ca-key"
 kind = "mitm_ca_private_key"
-path = "/etc/sssa/mitm-ca.key"
+path = "/etc/traffic-probe/mitm-ca.key"
 "#,
     )?;
 
@@ -669,12 +669,12 @@ target = "127.0.0.1:15002"
 [[tls.materials]]
 id = "collector-ca"
 kind = "trust_anchor"
-path = "/etc/sssa/collector-ca.pem"
+path = "/etc/traffic-probe/collector-ca.pem"
 
 [[tls.materials]]
 id = "mitm-ca-key"
 kind = "mitm_ca_private_key"
-path = "/etc/sssa/mitm-ca.key"
+path = "/etc/traffic-probe/mitm-ca.key"
 "#,
     )?;
     let error = wrong_kind
@@ -803,12 +803,12 @@ target = "127.0.0.1:15002"
 [[tls.materials]]
 id = "mitm-ca"
 kind = "mitm_ca_certificate"
-path = "/etc/sssa/mitm-ca.pem"
+path = "/etc/traffic-probe/mitm-ca.pem"
 
 [[tls.materials]]
 id = "mitm-ca-key"
 kind = "mitm_ca_private_key"
-path = "/etc/sssa/mitm-ca.key"
+path = "/etc/traffic-probe/mitm-ca.key"
 "#
     )
 }

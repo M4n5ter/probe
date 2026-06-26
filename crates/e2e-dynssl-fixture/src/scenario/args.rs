@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 const USAGE: &str = "\
-usage: sssa-e2e-dynssl-fixture [options]
+usage: traffic-probe-e2e-dynssl-fixture [options]
 
 Options:
   --server-addr ADDR

@@ -16,7 +16,7 @@ use super::harness::{
 };
 
 const CASE_NAME: &str = "e2e-transparent-linux-outbound-redirect-artifact-netns";
-const IN_NETNS_ENV: &str = "SSSA_E2E_TRANSPARENT_LINUX_OUTBOUND_REDIRECT_ARTIFACT_NETNS";
+const IN_NETNS_ENV: &str = "TRAFFIC_PROBE_E2E_TRANSPARENT_LINUX_OUTBOUND_REDIRECT_ARTIFACT_NETNS";
 const PROXY_PORT: u16 = 15001;
 
 pub(crate) fn run() -> ExitCode {
@@ -110,7 +110,7 @@ fn verify_installed_rules_and_cleanup(
     nft: &Path,
     cleanup: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let listing = nft_output(nft, ["list", "table", "inet", "sssa_probe"], None)?;
+    let listing = nft_output(nft, ["list", "table", "inet", "traffic_probe"], None)?;
     nft_success(listing.clone(), "nft list table")?;
     assert_installed_rules(&String::from_utf8_lossy(&listing.stdout))?;
     nft_success(
@@ -130,7 +130,7 @@ fn assert_installed_rules(listing: &str) -> Result<(), Box<dyn std::error::Error
     for expected in [
         "chain outbound_transparent_proxy",
         "type nat hook output priority dstnat; policy accept;",
-        "meta mark 0x53534102 return",
+        "meta mark 0x54500102 return",
         "tcp dport 443",
         "ip daddr 203.0.113.10",
         "redirect to :15001",
@@ -146,7 +146,7 @@ fn assert_installed_rules(listing: &str) -> Result<(), Box<dyn std::error::Error
 }
 
 fn assert_cleanup_removed_table(nft: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let output = nft_output(nft, ["list", "table", "inet", "sssa_probe"], None)?;
+    let output = nft_output(nft, ["list", "table", "inet", "traffic_probe"], None)?;
     if output.status.success() {
         return Err(e2e_error(format!(
             "outbound redirect artifact cleanup left owned table behind: {}",

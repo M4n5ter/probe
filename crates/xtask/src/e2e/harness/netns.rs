@@ -6,7 +6,7 @@ use std::{
 
 use super::{e2e_error, trusted_system_command, wall_time_unix_ns};
 
-const NETNS_REEXEC_MAGIC: &str = "sssa-probe-e2e-netns-reexec";
+const NETNS_REEXEC_MAGIC: &str = "traffic-probe-e2e-netns-reexec";
 
 pub(crate) fn reexec_current_case_in_fresh_network_namespace(
     marker_env: &'static str,
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn netns_reexec_envelope_rejects_trailing_data() {
-        let input = format!("{NETNS_REEXEC_MAGIC}\nSSSA_TEST\nnet:[1]\ntoken\nextra\n");
+        let input = format!("{NETNS_REEXEC_MAGIC}\nTRAFFIC_PROBE_TEST\nnet:[1]\ntoken\nextra\n");
         let error = parse_netns_reexec_envelope(&input).expect_err("trailing data must fail");
 
         assert!(error.to_string().contains("trailing data"));
@@ -158,11 +158,11 @@ mod tests {
 
     #[test]
     fn netns_reexec_envelope_parses_parent_netns_and_token() {
-        let input = netns_reexec_envelope("SSSA_TEST", "net:[1]", "token");
+        let input = netns_reexec_envelope("TRAFFIC_PROBE_TEST", "net:[1]", "token");
 
         let envelope = parse_netns_reexec_envelope(&input).expect("envelope should parse");
 
-        assert_eq!(envelope.marker_env, "SSSA_TEST");
+        assert_eq!(envelope.marker_env, "TRAFFIC_PROBE_TEST");
         assert_eq!(envelope.parent_netns, "net:[1]");
         assert_eq!(envelope.token, "token");
     }

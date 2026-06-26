@@ -159,7 +159,7 @@ pub(super) fn assert_outbound_redirect_table_installed(
     remote_ports: &[u16],
     mode: OutboundProxyE2eMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let listing = nft_output(["list", "table", "inet", "sssa_probe"])?;
+    let listing = nft_output(["list", "table", "inet", "traffic_probe"])?;
     let mut expected_snippets = vec![
         "chain outbound_transparent_proxy".to_string(),
         "type nat hook output priority dstnat; policy accept;".to_string(),
@@ -213,7 +213,7 @@ pub(super) fn assert_transparent_interception_cleanup() -> Result<(), Box<dyn st
 
 fn assert_owned_table_removed() -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new(nft_command()?)
-        .args(["list", "table", "inet", "sssa_probe"])
+        .args(["list", "table", "inet", "traffic_probe"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -337,7 +337,7 @@ pub(super) fn assert_webhook_batches(
     if !batches.iter().all(|batch| {
         batch
             .headers
-            .get("x-sssa-e2e")
+            .get("x-traffic-probe-e2e")
             .is_some_and(|value| value == case.header_value)
     }) {
         return Err(e2e_error("webhook receiver did not observe configured header").into());

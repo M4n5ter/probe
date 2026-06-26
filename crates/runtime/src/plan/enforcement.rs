@@ -948,16 +948,16 @@ mod tests {
                 failure_threshold: 2,
             }
         );
-        assert_eq!(plan.interception.nftables.table_name, "sssa_probe");
-        assert_eq!(plan.interception.nftables.inbound_tproxy_mark, 0x5353_4101);
+        assert_eq!(plan.interception.nftables.table_name, "traffic_probe");
+        assert_eq!(plan.interception.nftables.inbound_tproxy_mark, 0x5450_0101);
         assert_eq!(
             plan.interception.nftables.outbound_proxy_bypass_mark,
-            NonZeroU32::new(0x5353_4102)
+            NonZeroU32::new(0x5450_0102)
                 .expect("test outbound proxy bypass mark should be non-zero")
         );
         assert_eq!(
             plan.interception.nftables.inbound_tproxy_route_table,
-            53_534
+            45_100
         );
         assert_eq!(
             plan.interception.execution.outbound_redirect_plan(),
@@ -1022,12 +1022,12 @@ mod tests {
             plan.interception.execution.outbound_redirect_plan(),
             TransparentInterceptionOutboundRedirectPlan::Planned {
                 artifact: OutboundRedirectArtifactSpec {
-                    table_name: "sssa_probe".to_string(),
+                    table_name: "traffic_probe".to_string(),
                     chain_name: "outbound_transparent_proxy".to_string(),
                     hook: "output".to_string(),
                     priority: "dstnat".to_string(),
                     proxy_port: 15001,
-                    proxy_bypass_mark: NonZeroU32::new(0x5353_4102)
+                    proxy_bypass_mark: NonZeroU32::new(0x5450_0102)
                         .expect("test outbound proxy bypass mark should be non-zero"),
                 }
             }
@@ -1160,13 +1160,16 @@ mod tests {
         );
         assert_eq!(
             process.program,
-            PathBuf::from("/usr/local/bin/sssa-mitm-proxy")
+            PathBuf::from("/usr/local/bin/traffic-probe-mitm-proxy")
         );
         assert_eq!(
             process.args,
             vec!["--listen".to_string(), "127.0.0.1:15002".to_string()]
         );
-        assert_eq!(process.working_dir, Some(PathBuf::from("/run/sssa")));
+        assert_eq!(
+            process.working_dir,
+            Some(PathBuf::from("/run/traffic-probe"))
+        );
         Ok(())
     }
 
@@ -1182,7 +1185,7 @@ mod tests {
         config.enforcement.interception.mitm.plaintext_bridge.mode =
             TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
         config.enforcement.interception.mitm.plaintext_bridge.path =
-            Some("/run/sssa/mitm-capture-events.jsonl".into());
+            Some("/run/traffic-probe/mitm-capture-events.jsonl".into());
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -1219,7 +1222,7 @@ mod tests {
         assert_eq!(
             plan.interception.mitm.plaintext_bridge,
             TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed {
-                path: "/run/sssa/mitm-capture-events.jsonl".into(),
+                path: "/run/traffic-probe/mitm-capture-events.jsonl".into(),
                 follow: true,
             }
         );
@@ -1238,7 +1241,7 @@ mod tests {
         config.enforcement.interception.mitm.plaintext_bridge.mode =
             TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
         config.enforcement.interception.mitm.plaintext_bridge.path =
-            Some("/run/sssa/finite-mitm-capture-events.jsonl".into());
+            Some("/run/traffic-probe/finite-mitm-capture-events.jsonl".into());
         config.enforcement.interception.mitm.plaintext_bridge.follow = Some(false);
         let capabilities = CapabilityMatrix::new([
             CapabilityState::available(CapabilityKind::TransparentInterception),
@@ -1251,7 +1254,7 @@ mod tests {
         assert_eq!(
             plan.interception.mitm.plaintext_bridge,
             TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed {
-                path: "/run/sssa/finite-mitm-capture-events.jsonl".into(),
+                path: "/run/traffic-probe/finite-mitm-capture-events.jsonl".into(),
                 follow: false,
             }
         );
@@ -1302,7 +1305,7 @@ mod tests {
         );
         assert_eq!(
             outbound.outbound_redirect_artifact().proxy_bypass_mark,
-            NonZeroU32::new(0x5353_4102)
+            NonZeroU32::new(0x5450_0102)
                 .expect("test outbound proxy bypass mark should be non-zero")
         );
     }
@@ -1380,12 +1383,12 @@ mod tests {
             TlsMaterialConfig {
                 id: Some("mitm-ca".to_string()),
                 kind: TlsMaterialKind::MitmCaCertificate,
-                path: "/etc/sssa/mitm-ca.pem".into(),
+                path: "/etc/traffic-probe/mitm-ca.pem".into(),
             },
             TlsMaterialConfig {
                 id: Some("mitm-ca-key".to_string()),
                 kind: TlsMaterialKind::MitmCaPrivateKey,
-                path: "/etc/sssa/mitm-ca.key".into(),
+                path: "/etc/traffic-probe/mitm-ca.key".into(),
             },
         ];
     }
@@ -1396,9 +1399,9 @@ mod tests {
             ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
         };
         let process = TransparentInterceptionMitmManagedProcessConfig {
-            program: Some("/usr/local/bin/sssa-mitm-proxy".into()),
+            program: Some("/usr/local/bin/traffic-probe-mitm-proxy".into()),
             args: vec!["--listen".to_string(), "127.0.0.1:15002".to_string()],
-            working_dir: Some("/run/sssa".into()),
+            working_dir: Some("/run/traffic-probe".into()),
         };
         config.enforcement.interception.mitm.backend =
             TransparentInterceptionMitmBackendConfig::managed_process(readiness_probe, process);

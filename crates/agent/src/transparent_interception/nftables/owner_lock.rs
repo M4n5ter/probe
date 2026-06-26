@@ -8,7 +8,7 @@ use rustix::fs::{FlockOperation, flock};
 
 use crate::transparent_interception::TransparentInterceptionError;
 
-const LOCK_DIR: &str = "/run/sssa-probe/transparent-interception";
+const LOCK_DIR: &str = "/run/traffic-probe/transparent-interception";
 
 pub(super) trait NftablesOwnerLock: Send {
     fn acquire(
@@ -128,11 +128,11 @@ mod tests {
             directory: temp.path().to_path_buf(),
         };
 
-        let guard = first.acquire("sssa_probe")?;
-        let path = temp.path().join("sssa_probe.lock");
+        let guard = first.acquire("traffic_probe")?;
+        let path = temp.path().join("traffic_probe.lock");
         assert!(path.exists());
 
-        let error = match second.acquire("sssa_probe") {
+        let error = match second.acquire("traffic_probe") {
             Ok(_) => panic!("same owner must be single-writer"),
             Err(error) => error,
         };
@@ -140,7 +140,7 @@ mod tests {
         assert!(error.to_string().contains("already active"));
         drop(guard);
         assert!(path.exists());
-        second.acquire("sssa_probe")?;
+        second.acquire("traffic_probe")?;
         Ok(())
     }
 }

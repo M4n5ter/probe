@@ -22,8 +22,9 @@ use super::super::harness::{debug_binary, e2e_error};
 
 pub(super) const EXTERNAL_CASE_NAME: &str = "e2e-mitm-plaintext-bridge-live-sidecar";
 pub(super) const MANAGED_CASE_NAME: &str = "e2e-managed-mitm-plaintext-bridge-live-sidecar";
-pub(super) const EXTERNAL_IN_NETNS_ENV: &str = "SSSA_PROBE_E2E_MITM_PLAINTEXT_BRIDGE_NETNS";
-pub(super) const MANAGED_IN_NETNS_ENV: &str = "SSSA_PROBE_E2E_MANAGED_MITM_PLAINTEXT_BRIDGE_NETNS";
+pub(super) const EXTERNAL_IN_NETNS_ENV: &str = "TRAFFIC_PROBE_E2E_MITM_PLAINTEXT_BRIDGE_NETNS";
+pub(super) const MANAGED_IN_NETNS_ENV: &str =
+    "TRAFFIC_PROBE_E2E_MANAGED_MITM_PLAINTEXT_BRIDGE_NETNS";
 
 const DEFAULT_INTERCEPT_PORT: u16 = 65_529;
 const DEFAULT_MANAGED_BACKEND_PORT: u16 = 65_521;
@@ -298,7 +299,7 @@ fn prepare_managed_backend(
         proxy_port: target.port(),
         config: MitmBackendConfig::ManagedProcess {
             target: target.to_string(),
-            program: debug_binary("sssa-e2e-fixture")?,
+            program: debug_binary("traffic-probe-e2e-fixture")?,
             args: vec![
                 "managed-mitm-backend".to_string(),
                 "--listen-addr".to_string(),

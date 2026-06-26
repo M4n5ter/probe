@@ -606,7 +606,7 @@ mod tests {
             Some("node-a")
         );
         assert_eq!(
-            request_header(&request, "x-sssa-codec").as_deref(),
+            request_header(&request, "x-traffic-probe-codec").as_deref(),
             Some("none")
         );
         assert_eq!(
@@ -731,7 +731,10 @@ mod tests {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
-        std::env::temp_dir().join(format!("sssa-probe-{name}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "traffic-probe-{name}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 
     fn export_plan_with_trust_anchor(path: PathBuf) -> ExportPlan {

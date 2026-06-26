@@ -448,6 +448,7 @@ fn target_file_name(path: &Path) -> Result<&OsStr, ExportError> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
+    use probe_core::SpoolPayloadSchema;
     use proto::BatchEnvelope;
     use rustix::{
         fs::chown,
@@ -471,7 +472,7 @@ mod tests {
                 sequence: 7,
                 payload_format: proto::PayloadFormat::Json as i32,
                 payload: br#"{"id":"event-1"}"#.to_vec(),
-                payload_schema: "sssa.probe.event_envelope.subject_origin.json".to_string(),
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
             }],
         };
 
@@ -723,7 +724,7 @@ mod tests {
                 sequence: 1,
                 payload_format: proto::PayloadFormat::Json as i32,
                 payload: br#"{"id":"event-1"}"#.to_vec(),
-                payload_schema: "sssa.probe.event_envelope.subject_origin.json".to_string(),
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
             }],
         }
     }

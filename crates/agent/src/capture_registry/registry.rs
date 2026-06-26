@@ -289,13 +289,13 @@ mod tests {
     fn ebpf_provider_descriptor_reports_contract_preflight_failure() {
         let descriptor = ebpf_provider_descriptor_from_object_report(
             EbpfObjectProbeReport {
-                object_path: PathBuf::from("/tmp/sssa-invalid-contract.bpf.o"),
+                object_path: PathBuf::from("/tmp/traffic-probe-invalid-contract.bpf.o"),
                 object: EbpfProbeCheck::Available,
                 contract: EbpfObjectContractReport {
                     status: EbpfProbeCheck::Available,
                     maps: vec![EbpfObjectContractCheck {
-                        name: "SSSA_EVENTS".to_string(),
-                        check: EbpfProbeCheck::unavailable("missing eBPF map SSSA_EVENTS"),
+                        name: "TRAFFIC_PROBE_EVENTS".to_string(),
+                        check: EbpfProbeCheck::unavailable("missing eBPF map TRAFFIC_PROBE_EVENTS"),
                     }],
                     programs: Vec::new(),
                 },
@@ -312,14 +312,14 @@ mod tests {
             .reason
             .expect("eBPF descriptor should explain why contract preflight failed");
         assert!(reason.contains("eBPF object contract preflight via aya-obj failed"));
-        assert!(reason.contains("missing eBPF map SSSA_EVENTS"));
+        assert!(reason.contains("missing eBPF map TRAFFIC_PROBE_EVENTS"));
     }
 
     #[test]
     fn ebpf_provider_descriptor_exposes_degraded_observation_provider_after_object_preflight() {
         let descriptor = ebpf_provider_descriptor_from_object_report(
             EbpfObjectProbeReport {
-                object_path: PathBuf::from("/tmp/sssa-valid-contract.bpf.o"),
+                object_path: PathBuf::from("/tmp/traffic-probe-valid-contract.bpf.o"),
                 object: EbpfProbeCheck::Available,
                 contract: available_process_probe_contract_report(),
                 programs: Vec::<EbpfObjectProgram>::new(),
@@ -356,7 +356,7 @@ mod tests {
     fn ebpf_provider_descriptor_requires_procfs_socket_attribution_after_object_preflight() {
         let descriptor = ebpf_provider_descriptor_from_object_report(
             EbpfObjectProbeReport {
-                object_path: PathBuf::from("/tmp/sssa-valid-contract.bpf.o"),
+                object_path: PathBuf::from("/tmp/traffic-probe-valid-contract.bpf.o"),
                 object: EbpfProbeCheck::Available,
                 contract: available_process_probe_contract_report(),
                 programs: Vec::<EbpfObjectProgram>::new(),
@@ -481,7 +481,7 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
         let path = std::env::temp_dir().join(format!(
-            "sssa-probe-capture-registry-{name}-{}-{wall_time_unix_ns}",
+            "traffic-probe-capture-registry-{name}-{}-{wall_time_unix_ns}",
             std::process::id()
         ));
         if path.exists() {

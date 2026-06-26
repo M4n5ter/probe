@@ -86,7 +86,7 @@ mod tests {
     fn marked_connect_sets_socket_mark() -> Result<(), Box<dyn std::error::Error>> {
         assert!(geteuid().is_root(), "test requires root/CAP_NET_ADMIN");
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let mark = TcpSocketMark::new(NonZeroU32::new(0x5353_4102).expect("non-zero mark"));
+        let mark = TcpSocketMark::new(NonZeroU32::new(0x5450_0102).expect("non-zero mark"));
 
         let upstream = connect_tcp(
             listener.local_addr()?,

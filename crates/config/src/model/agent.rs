@@ -37,7 +37,7 @@ impl AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            agent_id: "sssa-probe".to_string(),
+            agent_id: "traffic-probe".to_string(),
             config_version: "local".to_string(),
             capture: CaptureConfig::default(),
             storage: StorageConfig::default(),

@@ -28,15 +28,15 @@ use signal_hook::{
     iterator::Signals,
 };
 
-const IN_NETNS_ENV: &str = "SSSA_PROBE_E2E_TRANSPARENT_TPROXY_NETNS";
-const CLIENT_OWNER_ENV: &str = "SSSA_PROBE_E2E_TRANSPARENT_TPROXY_CLIENT_OWNER";
-const HOST_IFACE: &str = "sssa0h";
-const CLIENT_IFACE: &str = "sssa0c";
+const IN_NETNS_ENV: &str = "TRAFFIC_PROBE_E2E_TRANSPARENT_TPROXY_NETNS";
+const CLIENT_OWNER_ENV: &str = "TRAFFIC_PROBE_E2E_TRANSPARENT_TPROXY_CLIENT_OWNER";
+const HOST_IFACE: &str = "tprobe0h";
+const CLIENT_IFACE: &str = "tprobe0c";
 const HOST_ADDR: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 1);
 const CLIENT_ADDR: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 2);
 const PROXY_PORT: u16 = 15001;
-const TPROXY_MARK: &str = "0x53534101";
-const TPROXY_ROUTE_TABLE: &str = "53534";
+const TPROXY_MARK: &str = "0x54500101";
+const TPROXY_ROUTE_TABLE: &str = "45100";
 const PROCESS_SCOPED_LISTENER_NAME: &str = "xtask";
 const MISMATCHING_PROCESS_SCOPED_LISTENER_NAME: &str = "not-xtask";
 const UPSTREAM_SCENARIOS: [UpstreamScenario; 2] = [
@@ -710,7 +710,7 @@ fn record_result(
 
 fn assert_tproxy_table_removed() -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new(nft_command()?)
-        .args(["list", "table", "inet", "sssa_probe"])
+        .args(["list", "table", "inet", "traffic_probe"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;

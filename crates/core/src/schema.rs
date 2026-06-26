@@ -21,9 +21,9 @@ impl SpoolPayloadSchemaError {
 }
 
 impl SpoolPayloadSchema {
-    pub const CAPTURE_EVENT_ORIGIN_JSON: &'static str = "sssa.probe.capture_event.origin.json";
+    pub const CAPTURE_EVENT_ORIGIN_JSON: &'static str = "traffic.probe.capture_event.origin.json";
     pub const EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON: &'static str =
-        "sssa.probe.event_envelope.subject_origin.json";
+        "traffic.probe.event_envelope.subject_origin.json";
 
     pub fn from_wire(value: impl AsRef<str>) -> Result<Self, SpoolPayloadSchemaError> {
         let value = value.as_ref();
@@ -86,9 +86,9 @@ mod tests {
 
     #[test]
     fn old_capture_event_schema_name_is_rejected() {
-        let error = SpoolPayloadSchema::from_wire("sssa.probe.capture_event.json")
+        let error = SpoolPayloadSchema::from_wire("traffic.probe.capture_event.json")
             .expect_err("old capture event schema name must fail");
 
-        assert_eq!(error.value(), "sssa.probe.capture_event.json");
+        assert_eq!(error.value(), "traffic.probe.capture_event.json");
     }
 }

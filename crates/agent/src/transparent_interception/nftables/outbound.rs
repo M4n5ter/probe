@@ -254,11 +254,11 @@ mod tests {
 
         let nft_scripts = nft.scripts();
         assert_eq!(nft_scripts.len(), 1);
-        assert!(nft_scripts[0].contains("destroy table inet sssa_probe"));
+        assert!(nft_scripts[0].contains("destroy table inet traffic_probe"));
         let ip_args = ip.args();
         assert_eq!(
             ip_args[0],
-            string_args(["rule", "del", "fwmark", "0x53534101", "lookup", "53534"])
+            string_args(["rule", "del", "fwmark", "0x54500101", "lookup", "45100"])
         );
         assert_eq!(
             ip_args[1],
@@ -270,7 +270,7 @@ mod tests {
                 "dev",
                 "lo",
                 "table",
-                "53534"
+                "45100"
             ])
         );
         assert_eq!(
@@ -280,15 +280,15 @@ mod tests {
                 "rule",
                 "del",
                 "fwmark",
-                "0x53534101",
+                "0x54500101",
                 "lookup",
-                "53534"
+                "45100"
             ])
         );
         assert_eq!(
             ip_args[3],
             string_args([
-                "-6", "route", "del", "local", "::/0", "dev", "lo", "table", "53534"
+                "-6", "route", "del", "local", "::/0", "dev", "lo", "table", "45100"
             ])
         );
         Ok(())

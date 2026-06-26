@@ -16,7 +16,7 @@ pub(crate) fn create_temp_root(name: &str) -> Result<PathBuf, std::io::Error> {
     let base = env::temp_dir();
     for attempt in 0..128 {
         let path = base.join(format!(
-            "sssa-probe-e2e-{name}-{}-{}-{attempt}",
+            "traffic-probe-e2e-{name}-{}-{}-{attempt}",
             std::process::id(),
             wall_time_unix_ns()
         ));

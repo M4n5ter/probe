@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn connection_options_preserve_socket_mark() {
-        let mark = NonZeroU32::new(0x5353_4102).expect("non-zero mark");
+        let mark = NonZeroU32::new(0x5450_0102).expect("non-zero mark");
 
         let options = HttpConnectionOptions::new(Duration::from_secs(3)).with_socket_mark(mark);
 

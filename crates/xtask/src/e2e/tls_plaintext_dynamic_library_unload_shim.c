@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 
-#define SSSA_E2E_REAL_TLS_ENGINE_ENV "SSSA_E2E_REAL_TLS_ENGINE_PATH"
+#define TRAFFIC_PROBE_E2E_REAL_TLS_ENGINE_ENV "TRAFFIC_PROBE_E2E_REAL_TLS_ENGINE_PATH"
 
 typedef const void *(*TLS_client_method_fn)(void);
 typedef void *(*SSL_CTX_new_fn)(const void *);
@@ -19,7 +19,7 @@ static void *real_libssl;
 
 static void *real_symbol(const char *name) {
     if (real_libssl == NULL) {
-        const char *path = getenv(SSSA_E2E_REAL_TLS_ENGINE_ENV);
+        const char *path = getenv(TRAFFIC_PROBE_E2E_REAL_TLS_ENGINE_ENV);
         if (path == NULL || path[0] == '\0') {
             return NULL;
         }

@@ -213,7 +213,7 @@ mod tests {
 
     fn available_tls_plaintext_object_report() -> EbpfObjectProbeReport {
         EbpfObjectProbeReport {
-            object_path: PathBuf::from("/tmp/sssa-tls-plaintext.bpf.o"),
+            object_path: PathBuf::from("/tmp/traffic-probe-tls-plaintext.bpf.o"),
             object: EbpfProbeCheck::Available,
             contract: EbpfObjectContractReport {
                 status: EbpfProbeCheck::Available,
@@ -231,7 +231,7 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
         let path = std::env::temp_dir().join(format!(
-            "sssa-probe-libssl-uprobe-capability-{name}-{}-{wall_time_unix_ns}",
+            "traffic-probe-libssl-uprobe-capability-{name}-{}-{wall_time_unix_ns}",
             std::process::id()
         ));
         if path.exists() {

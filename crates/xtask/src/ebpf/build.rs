@@ -12,7 +12,7 @@ const BPF_TARGET: &str = "bpfel-unknown-none";
 const BPF_LINKER: &str = "bpf-linker";
 const EBPF_MANIFEST: &str = "crates/ebpf-program/Cargo.toml";
 const EBPF_TARGET_DIR: &str = "target/ebpf";
-const EBPF_BUILD_STAMP: &str = "sssa-ebpf-build.stamp";
+const EBPF_BUILD_STAMP: &str = "traffic-probe-ebpf-build.stamp";
 const EBPF_PROCESS_ARTIFACT: &str = "bpfel-unknown-none/release/ebpf-program";
 const EBPF_TLS_PLAINTEXT_ARTIFACT: &str = "bpfel-unknown-none/release/ebpf-tls-plaintext";
 

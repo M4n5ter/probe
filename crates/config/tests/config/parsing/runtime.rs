@@ -24,7 +24,7 @@ read_timeout_ms = 250
 buffer_size = 1048576
 
 [storage]
-path = "/tmp/sssa-spool"
+path = "/tmp/traffic-probe-spool"
 
 [storage.retention.export]
 max_age_ms = 60000
@@ -72,7 +72,7 @@ path = "/etc/ssl/certs/ca.pem"
 
 [tls.plaintext.instrumentation]
 enabled = true
-libssl_uprobe_object_path = "/opt/sssa/ebpf-tls-plaintext.bpf.o"
+libssl_uprobe_object_path = "/opt/traffic-probe/ebpf-tls-plaintext.bpf.o"
 
 [tls.plaintext.instrumentation.selector]
 op = "match"
@@ -97,11 +97,11 @@ backend = "linux_socket_destroy"
 
 [enforcement.policy.source]
 kind = "file"
-path = "/etc/sssa-probe/enforcement.toml"
+path = "/etc/traffic-probe/enforcement.toml"
 
 [admin]
 enabled = true
-socket_path = "/run/sssa-probe/admin.sock"
+socket_path = "/run/traffic-probe/admin.sock"
 "#,
     )?;
 
@@ -115,7 +115,10 @@ socket_path = "/run/sssa-probe/admin.sock"
     assert!(!config.capture.libpcap.immediate_mode);
     assert_eq!(config.capture.libpcap.read_timeout_ms, 250);
     assert_eq!(config.capture.libpcap.buffer_size, Some(1_048_576));
-    assert_eq!(config.storage.path, PathBuf::from("/tmp/sssa-spool"));
+    assert_eq!(
+        config.storage.path,
+        PathBuf::from("/tmp/traffic-probe-spool")
+    );
     assert_eq!(config.storage.retention.ingress.max_age_ms, Some(120_000));
     assert_eq!(config.storage.retention.ingress.max_records, Some(10_000));
     assert_eq!(config.storage.retention.ingress.sweep_interval_ms, 7_000);
@@ -153,7 +156,7 @@ socket_path = "/run/sssa-probe/admin.sock"
             .plaintext
             .instrumentation
             .libssl_uprobe_object_path,
-        Some(PathBuf::from("/opt/sssa/ebpf-tls-plaintext.bpf.o"))
+        Some(PathBuf::from("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o"))
     );
     assert!(config.tls.plaintext.instrumentation.selector.is_some());
     assert_eq!(config.capture.plaintext_feed.path, None);
@@ -165,13 +168,13 @@ socket_path = "/run/sssa-probe/admin.sock"
     assert_eq!(
         config.enforcement.policy.source,
         EnforcementPolicySourceConfig::File {
-            path: PathBuf::from("/etc/sssa-probe/enforcement.toml"),
+            path: PathBuf::from("/etc/traffic-probe/enforcement.toml"),
         }
     );
     assert!(config.admin.enabled);
     assert_eq!(
         config.admin.socket_path,
-        PathBuf::from("/run/sssa-probe/admin.sock")
+        PathBuf::from("/run/traffic-probe/admin.sock")
     );
     Ok(())
 }
@@ -183,7 +186,7 @@ fn parses_file_exporter_transport() -> Result<(), Box<dyn std::error::Error>> {
 [[exporters]]
 id = "local-file"
 transport = "file"
-path = "/tmp/sssa-export.jsonl"
+path = "/tmp/traffic-probe-export.jsonl"
 codec = "gzip"
 "#,
     )?;
@@ -193,7 +196,7 @@ codec = "gzip"
     assert_eq!(
         config.exporters[0].transport,
         ExporterTransportConfig::File {
-            path: PathBuf::from("/tmp/sssa-export.jsonl"),
+            path: PathBuf::from("/tmp/traffic-probe-export.jsonl"),
         }
     );
     config.validate_basic()?;
@@ -223,7 +226,7 @@ fn exporter_config_serializes_to_parseable_flat_toml() -> Result<(), Box<dyn std
             ExporterConfig {
                 id: "local-file".to_string(),
                 transport: ExporterTransportConfig::File {
-                    path: PathBuf::from("/tmp/sssa-export.jsonl"),
+                    path: PathBuf::from("/tmp/traffic-probe-export.jsonl"),
                 },
                 codec: CompressionCodecName::None,
                 worker: ExporterWorkerConfig::default(),
@@ -244,7 +247,7 @@ fn exporter_config_serializes_to_parseable_flat_toml() -> Result<(), Box<dyn std
     assert!(rendered.contains("transport = \"webhook\""));
     assert!(rendered.contains("endpoint = \"https://collector.example/batches\""));
     assert!(rendered.contains("transport = \"file\""));
-    assert!(rendered.contains("path = \"/tmp/sssa-export.jsonl\""));
+    assert!(rendered.contains("path = \"/tmp/traffic-probe-export.jsonl\""));
 
     let roundtrip = AgentConfig::from_toml_str(&rendered)?;
 

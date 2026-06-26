@@ -234,7 +234,7 @@ mod tests {
             .tls
             .plaintext
             .instrumentation
-            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+            .libssl_uprobe_object_path = Some("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o".into());
         config.tls.plaintext.instrumentation.reconcile_interval_ms = 2500;
         let capabilities = capability_matrix_with_libssl(RuntimeMode::Available);
 
@@ -244,7 +244,7 @@ mod tests {
         assert!(plan.plaintext.instrumentation.selector_configured);
         assert_eq!(
             plan.plaintext.instrumentation.libssl_uprobe_object_path,
-            Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into())
+            Some("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o".into())
         );
         assert_eq!(plan.plaintext.instrumentation.reconcile_interval_ms, 2500);
         assert_eq!(
@@ -266,7 +266,7 @@ mod tests {
             .tls
             .plaintext
             .instrumentation
-            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+            .libssl_uprobe_object_path = Some("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o".into());
         let capabilities = capability_matrix_with_libssl(RuntimeMode::Degraded);
 
         let plan = TlsPlan::resolve(&config, &capabilities);

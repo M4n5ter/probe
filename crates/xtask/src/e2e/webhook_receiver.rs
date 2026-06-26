@@ -228,7 +228,7 @@ fn decode_received_batch(request: &HttpRequest) -> Result<ReceivedBatch, String>
 }
 
 fn codec_from_header(request: &HttpRequest) -> Result<CompressionCodec, String> {
-    let codec = required_header(request, "x-sssa-codec")?;
+    let codec = required_header(request, "x-traffic-probe-codec")?;
     CompressionCodec::from_wire_name(&codec)
         .ok_or_else(|| format!("unsupported webhook codec {codec}"))
 }

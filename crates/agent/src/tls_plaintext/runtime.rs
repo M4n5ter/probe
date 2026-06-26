@@ -438,7 +438,7 @@ mod tests {
             .tls
             .plaintext
             .instrumentation
-            .libssl_uprobe_object_path = Some("/opt/sssa/ebpf-tls-plaintext.bpf.o".into());
+            .libssl_uprobe_object_path = Some("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o".into());
         let plan = runtime_plan_from_config(
             config,
             vec![CapabilityState::degraded(

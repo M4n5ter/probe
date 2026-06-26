@@ -15,12 +15,12 @@ session_secret_refs = ["session-secrets"]
 [[tls.materials]]
 id = "ssl-keys"
 kind = "key_log_file"
-path = "/var/lib/sssa-probe/sslkeylog.log"
+path = "/var/lib/traffic-probe/sslkeylog.log"
 
 [[tls.materials]]
 id = "session-secrets"
 kind = "session_secret_file"
-path = "/var/lib/sssa-probe/session-secrets.jsonl"
+path = "/var/lib/traffic-probe/session-secrets.jsonl"
 "#,
     )?;
 
@@ -87,7 +87,7 @@ remote_addresses = []
             "libssl_uprobe_object_path",
             r#"
 [tls.plaintext]
-libssl_uprobe_object_path = "/opt/sssa/ebpf-tls-plaintext.bpf.o"
+libssl_uprobe_object_path = "/opt/traffic-probe/ebpf-tls-plaintext.bpf.o"
 "#,
         ),
         (

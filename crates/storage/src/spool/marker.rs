@@ -2,9 +2,9 @@ use std::{fs, io::ErrorKind, path::Path};
 
 use super::StorageError;
 
-pub(super) const SPOOL_MARKER_FILE: &str = "sssa-spool-format";
-pub(super) const SPOOL_MARKER_CONTENT: &[u8] = b"sssa-probe-spool\n";
-pub(super) const SPOOL_READY_FILE: &str = "sssa-spool-ready";
+pub(super) const SPOOL_MARKER_FILE: &str = "traffic-probe-spool-format";
+pub(super) const SPOOL_MARKER_CONTENT: &[u8] = b"traffic-probe-spool\n";
+pub(super) const SPOOL_READY_FILE: &str = "traffic-probe-spool-ready";
 const SPOOL_READY_CONTENT: &[u8] = b"ready\n";
 
 pub(super) fn ensure_spool_markers(path: &Path) -> Result<(), StorageError> {

@@ -368,7 +368,7 @@ end
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("sssa-{name}-{unique}"));
+        let path = std::env::temp_dir().join(format!("traffic-probe-{name}-{unique}"));
         if path.exists() {
             fs::remove_dir_all(&path)?;
         }

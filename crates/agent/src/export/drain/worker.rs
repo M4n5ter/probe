@@ -545,7 +545,7 @@ mod tests {
         let requests = server.join_requests()?;
         assert_eq!(requests.len(), 2);
         assert_eq!(
-            request_header(&requests[0], "x-sssa-codec").as_deref(),
+            request_header(&requests[0], "x-traffic-probe-codec").as_deref(),
             Some("none")
         );
         assert_eq!(
@@ -777,7 +777,10 @@ mod tests {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
-        std::env::temp_dir().join(format!("sssa-probe-{name}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "traffic-probe-{name}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 
     async fn wait_for_export_cursor(

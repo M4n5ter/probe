@@ -137,7 +137,7 @@ hooks = ["on_http_request_headers"]
         r#"
 function on_http_request_headers(event)
   local target = event.kind.target or ""
-  if string.sub(target, 1, 10) == "/sssa-e2e/" then
+  if string.sub(target, 1, 10) == "/traffic-probe-e2e/" then
     return probe.emit_alert("libpcap policy observed " .. target)
   end
 end
@@ -288,7 +288,7 @@ fn assert_expected_policy_alerts(
 
 fn expected_targets() -> BTreeSet<String> {
     (0..REQUESTS)
-        .map(|request| format!("/sssa-e2e/{request}"))
+        .map(|request| format!("/traffic-probe-e2e/{request}"))
         .collect()
 }
 

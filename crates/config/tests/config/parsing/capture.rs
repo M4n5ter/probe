@@ -10,14 +10,14 @@ fn parses_external_plaintext_feed_config() -> Result<(), Box<dyn std::error::Err
 selection = "plaintext_feed"
 
 [capture.plaintext_feed]
-path = "/tmp/sssa-plaintext-feed.jsonl"
+path = "/tmp/traffic-probe-plaintext-feed.jsonl"
 "#,
     )?;
 
     assert_eq!(config.capture.selection, CaptureSelection::PlaintextFeed);
     assert_eq!(
         config.capture.plaintext_feed.path,
-        Some(PathBuf::from("/tmp/sssa-plaintext-feed.jsonl"))
+        Some(PathBuf::from("/tmp/traffic-probe-plaintext-feed.jsonl"))
     );
     config.validate_basic()?;
     Ok(())
@@ -31,7 +31,7 @@ fn parses_capture_event_feed_config() -> Result<(), Box<dyn std::error::Error>> 
 selection = "capture_event_feed"
 
 [capture.capture_event_feed]
-path = "/tmp/sssa-capture-events.jsonl"
+path = "/tmp/traffic-probe-capture-events.jsonl"
 follow = true
 "#,
     )?;
@@ -39,7 +39,7 @@ follow = true
     assert_eq!(config.capture.selection, CaptureSelection::CaptureEventFeed);
     assert_eq!(
         config.capture.capture_event_feed.path,
-        Some(PathBuf::from("/tmp/sssa-capture-events.jsonl"))
+        Some(PathBuf::from("/tmp/traffic-probe-capture-events.jsonl"))
     );
     assert_eq!(config.capture.capture_event_feed.follow, Some(true));
     config.validate_basic()?;
@@ -54,14 +54,14 @@ fn parses_ebpf_object_config() -> Result<(), Box<dyn std::error::Error>> {
 selection = "ebpf"
 
 [capture.ebpf]
-object_path = "/opt/sssa/sssa_probe.bpf.o"
+object_path = "/opt/traffic-probe/traffic_probe.bpf.o"
 "#,
     )?;
 
     assert_eq!(config.capture.selection, CaptureSelection::Ebpf);
     assert_eq!(
         config.capture.ebpf.object_path,
-        Some(PathBuf::from("/opt/sssa/sssa_probe.bpf.o"))
+        Some(PathBuf::from("/opt/traffic-probe/traffic_probe.bpf.o"))
     );
     config.validate_basic()?;
     Ok(())

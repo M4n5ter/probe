@@ -467,8 +467,8 @@ impl Default for PlaintextProcess {
         Self {
             pid: 123,
             start_time_ticks: 456,
-            name: "sssa-e2e",
-            exe_path: "/usr/bin/sssa-e2e",
+            name: "traffic-probe-e2e",
+            exe_path: "/usr/bin/traffic-probe-e2e",
             cmdline_hash: "hash",
         }
     }

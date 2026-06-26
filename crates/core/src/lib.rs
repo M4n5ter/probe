@@ -6,6 +6,7 @@ mod schema;
 mod selector;
 mod socket;
 mod verdict;
+mod webhook;
 
 pub use capability::{
     CapabilityKind, CapabilityMatrix, CapabilityRequirement, CapabilityState, RuntimeMode,
@@ -33,4 +34,8 @@ pub use socket::{TcpConnection, TcpEndpoint};
 pub use verdict::{
     Action, EnforcementDecision, EnforcementMode, EnforcementOutcome, ProtectiveActionError,
     ProtectiveActionProfile, Verdict, VerdictScope,
+};
+pub use webhook::{
+    RESERVED_WEBHOOK_HEADERS, WEBHOOK_CODEC_HEADER, WEBHOOK_CONTENT_TYPE_HEADER,
+    WEBHOOK_CONTENT_TYPE_PROTOBUF, WEBHOOK_IDEMPOTENCY_KEY_HEADER,
 };

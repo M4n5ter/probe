@@ -82,8 +82,8 @@ fn scenario() -> PlaintextFeedScenario {
         PlaintextProcess::new(
             322,
             655,
-            "sssa-e2e-file-export",
-            "/usr/bin/sssa-e2e-file-export",
+            "traffic-probe-e2e-file-export",
+            "/usr/bin/traffic-probe-e2e-file-export",
             "file-export-hash",
         ),
     ))

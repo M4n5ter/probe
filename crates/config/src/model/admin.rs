@@ -13,7 +13,7 @@ impl Default for AdminConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            socket_path: PathBuf::from("/run/sssa-probe/admin.sock"),
+            socket_path: PathBuf::from("/run/traffic-probe/admin.sock"),
         }
     }
 }

@@ -459,7 +459,7 @@ mod tests {
         config.enforcement.interception.mitm.plaintext_bridge.mode =
             TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
         config.enforcement.interception.mitm.plaintext_bridge.path =
-            Some("/run/sssa/mitm-capture-events.jsonl".into());
+            Some("/run/traffic-probe/mitm-capture-events.jsonl".into());
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -801,12 +801,12 @@ mod tests {
             TlsMaterialConfig {
                 id: Some("mitm-ca".to_string()),
                 kind: TlsMaterialKind::MitmCaCertificate,
-                path: "/etc/sssa/mitm-ca.pem".into(),
+                path: "/etc/traffic-probe/mitm-ca.pem".into(),
             },
             TlsMaterialConfig {
                 id: Some("mitm-ca-key".to_string()),
                 kind: TlsMaterialKind::MitmCaPrivateKey,
-                path: "/etc/sssa/mitm-ca.key".into(),
+                path: "/etc/traffic-probe/mitm-ca.key".into(),
             },
         ];
     }

@@ -354,7 +354,8 @@ mod tests {
     use super::*;
     use crate::runtime_composition::{RuntimeComposition, build_runtime_composition_for_test};
 
-    const MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH: &str = "/run/sssa/mitm-capture-events.jsonl";
+    const MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH: &str =
+        "/run/traffic-probe/mitm-capture-events.jsonl";
 
     #[test]
     fn enforcement_status_reports_metadata_only_policy_source()
@@ -459,7 +460,7 @@ protective_actions = ["alert"]
     #[test]
     fn remote_enforcement_policy_source_is_metadata_only_in_offline_status()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        let mut config = config_with_storage_path("/tmp/traffic-probe-spool".into());
         config.enforcement.policy.source = EnforcementPolicySourceConfig::Remote {
             endpoint: "https://control.example/enforcement".to_string(),
             max_body_bytes: None,
@@ -488,7 +489,7 @@ protective_actions = ["alert"]
     #[test]
     fn remote_enforcement_policy_source_preserves_config_selector_in_offline_status()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        let mut config = config_with_storage_path("/tmp/traffic-probe-spool".into());
         config.enforcement.selector = Some(Selector::default());
         config.enforcement.policy.source = EnforcementPolicySourceConfig::Remote {
             endpoint: "https://control.example/enforcement".to_string(),
@@ -513,7 +514,7 @@ protective_actions = ["alert"]
     fn loaded_remote_enforcement_policy_status_reports_source_origin()
     -> Result<(), Box<dyn std::error::Error>> {
         let endpoint = "https://control.example/enforcement".to_string();
-        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        let mut config = config_with_storage_path("/tmp/traffic-probe-spool".into());
         config.enforcement.policy.source = EnforcementPolicySourceConfig::Remote {
             endpoint: endpoint.clone(),
             max_body_bytes: Some(2 * 1024 * 1024),
@@ -568,7 +569,7 @@ protective_actions = ["alert"]
 
     #[test]
     fn dry_run_enforcement_status_requires_capability() -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        let mut config = config_with_storage_path("/tmp/traffic-probe-spool".into());
         config.enforcement.mode = probe_core::EnforcementMode::DryRun;
         let plan = runtime_plan_from_config(
             config,
@@ -593,7 +594,7 @@ protective_actions = ["alert"]
     #[test]
     fn enforce_status_reports_connection_enforcement_capability()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        let mut config = config_with_storage_path("/tmp/traffic-probe-spool".into());
         config.capture.selection = probe_config::CaptureSelection::Libpcap;
         config.enforcement.mode = probe_core::EnforcementMode::Enforce;
         config.enforcement.backend =
@@ -635,7 +636,7 @@ protective_actions = ["alert"]
     #[test]
     fn enforce_status_reports_transparent_interception_plan()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        let mut config = config_with_storage_path("/tmp/traffic-probe-spool".into());
         config.capture.selection = probe_config::CaptureSelection::Libpcap;
         config.enforcement.mode = probe_core::EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
@@ -697,10 +698,10 @@ protective_actions = ["alert"]
             probe_config::TransparentInterceptionProxySelfBypassConfig::None
         );
         assert_eq!(status.interception.proxy.listen_port, Some(15001));
-        assert_eq!(status.interception.nftables.table_name, "sssa_probe");
+        assert_eq!(status.interception.nftables.table_name, "traffic_probe");
         assert_eq!(
             status.interception.nftables.inbound_tproxy_route_table,
-            53_534
+            45_100
         );
         assert_eq!(
             status.interception.outbound_redirect,
@@ -761,19 +762,19 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             value["interception"]["nftables"]["table_name"],
-            json!("sssa_probe")
+            json!("traffic_probe")
         );
         assert_eq!(
             value["interception"]["nftables"]["inbound_tproxy_mark"],
-            json!(0x5353_4101)
+            json!(0x5450_0101)
         );
         assert_eq!(
             value["interception"]["nftables"]["outbound_proxy_bypass_mark"],
-            json!(0x5353_4102)
+            json!(0x5450_0102)
         );
         assert_eq!(
             value["interception"]["nftables"]["inbound_tproxy_route_table"],
-            json!(53_534)
+            json!(45_100)
         );
         assert_eq!(
             value["interception"]["outbound_redirect"]["kind"],
@@ -929,7 +930,7 @@ protective_actions = ["alert"]
     #[test]
     fn enforce_status_reports_outbound_redirect_artifact() -> Result<(), Box<dyn std::error::Error>>
     {
-        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        let mut config = config_with_storage_path("/tmp/traffic-probe-spool".into());
         config.capture.selection = probe_config::CaptureSelection::Libpcap;
         config.exporters.clear();
         config.enforcement.mode = probe_core::EnforcementMode::Enforce;
@@ -980,7 +981,7 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             value["interception"]["outbound_redirect"]["artifact"]["proxy_bypass_mark"],
-            json!(0x5353_4102)
+            json!(0x5450_0102)
         );
         Ok(())
     }
@@ -988,7 +989,7 @@ protective_actions = ["alert"]
     #[test]
     fn enforce_status_reports_external_outbound_proxy_self_bypass_contract()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        let mut config = config_with_storage_path("/tmp/traffic-probe-spool".into());
         config.capture.selection = probe_config::CaptureSelection::Libpcap;
         config.exporters.clear();
         config.enforcement.mode = probe_core::EnforcementMode::Enforce;
@@ -1035,7 +1036,7 @@ protective_actions = ["alert"]
     #[test]
     fn enforce_status_reports_process_classifier_setup_scope()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        let mut config = config_with_storage_path("/tmp/traffic-probe-spool".into());
         config.capture.selection = probe_config::CaptureSelection::Libpcap;
         config.enforcement.mode = probe_core::EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
@@ -1099,7 +1100,7 @@ protective_actions = ["alert"]
     fn config_with_external_mitm_plaintext_bridge(
         bridge_path: PathBuf,
     ) -> probe_config::AgentConfig {
-        let mut config = config_with_storage_path("/tmp/sssa-spool".into());
+        let mut config = config_with_storage_path("/tmp/traffic-probe-spool".into());
         config.capture.selection = probe_config::CaptureSelection::Libpcap;
         config.exporters.clear();
         config.enforcement.mode = probe_core::EnforcementMode::Enforce;
@@ -1134,12 +1135,12 @@ protective_actions = ["alert"]
             probe_config::TlsMaterialConfig {
                 id: Some("mitm-ca".to_string()),
                 kind: probe_config::TlsMaterialKind::MitmCaCertificate,
-                path: "/etc/sssa/mitm-ca.pem".into(),
+                path: "/etc/traffic-probe/mitm-ca.pem".into(),
             },
             probe_config::TlsMaterialConfig {
                 id: Some("mitm-ca-key".to_string()),
                 kind: probe_config::TlsMaterialKind::MitmCaPrivateKey,
-                path: "/etc/sssa/mitm-ca.key".into(),
+                path: "/etc/traffic-probe/mitm-ca.key".into(),
             },
         ];
         config

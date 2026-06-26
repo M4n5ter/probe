@@ -170,16 +170,16 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "destroy table inet sssa_probe",
-                "add table inet sssa_probe",
-                "add chain inet sssa_probe inbound_tproxy { type filter hook prerouting priority mangle; policy accept; }",
-                "add rule inet sssa_probe inbound_tproxy meta l4proto tcp meta nfproto ipv4 tcp dport 8443 ip saddr 203.0.113.10 tproxy ip to :15001 meta mark set 0x53534101",
+                "destroy table inet traffic_probe",
+                "add table inet traffic_probe",
+                "add chain inet traffic_probe inbound_tproxy { type filter hook prerouting priority mangle; policy accept; }",
+                "add rule inet traffic_probe inbound_tproxy meta l4proto tcp meta nfproto ipv4 tcp dport 8443 ip saddr 203.0.113.10 tproxy ip to :15001 meta mark set 0x54500101",
             ]
         );
         assert_eq!(
             plan.setup_ip_commands(),
             vec![
-                vec!["rule", "add", "fwmark", "0x53534101", "lookup", "53534"],
+                vec!["rule", "add", "fwmark", "0x54500101", "lookup", "45100"],
                 vec![
                     "route",
                     "replace",
@@ -188,7 +188,7 @@ mod tests {
                     "dev",
                     "lo",
                     "table",
-                    "53534"
+                    "45100"
                 ],
             ]
         );
@@ -230,11 +230,11 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "destroy table inet sssa_probe",
-                "add table inet sssa_probe",
-                "add chain inet sssa_probe inbound_tproxy { type filter hook prerouting priority mangle; policy accept; }",
-                "add rule inet sssa_probe inbound_tproxy meta l4proto tcp meta nfproto ipv4 tcp dport 8443 ip saddr 203.0.113.10 tproxy ip to :15001 meta mark set 0x53534101",
-                "add rule inet sssa_probe inbound_tproxy meta l4proto tcp meta nfproto ipv4 tcp dport 9443 ip saddr 203.0.113.20 tproxy ip to :15001 meta mark set 0x53534101",
+                "destroy table inet traffic_probe",
+                "add table inet traffic_probe",
+                "add chain inet traffic_probe inbound_tproxy { type filter hook prerouting priority mangle; policy accept; }",
+                "add rule inet traffic_probe inbound_tproxy meta l4proto tcp meta nfproto ipv4 tcp dport 8443 ip saddr 203.0.113.10 tproxy ip to :15001 meta mark set 0x54500101",
+                "add rule inet traffic_probe inbound_tproxy meta l4proto tcp meta nfproto ipv4 tcp dport 9443 ip saddr 203.0.113.20 tproxy ip to :15001 meta mark set 0x54500101",
             ]
         );
     }
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(
             plan.setup_ip_commands(),
             vec![
-                vec!["rule", "add", "fwmark", "0x53534101", "lookup", "53534"],
+                vec!["rule", "add", "fwmark", "0x54500101", "lookup", "45100"],
                 vec![
                     "route",
                     "replace",
@@ -267,19 +267,19 @@ mod tests {
                     "dev",
                     "lo",
                     "table",
-                    "53534"
+                    "45100"
                 ],
                 vec![
                     "-6",
                     "rule",
                     "add",
                     "fwmark",
-                    "0x53534101",
+                    "0x54500101",
                     "lookup",
-                    "53534"
+                    "45100"
                 ],
                 vec![
-                    "-6", "route", "replace", "local", "::/0", "dev", "lo", "table", "53534"
+                    "-6", "route", "replace", "local", "::/0", "dev", "lo", "table", "45100"
                 ],
             ]
         );
@@ -318,7 +318,7 @@ mod tests {
         )
         .expect("outbound plan should be valid");
 
-        assert_eq!(inbound_plan.owner_name(), "sssa_probe");
+        assert_eq!(inbound_plan.owner_name(), "traffic_probe");
         assert_eq!(outbound_plan.owner_name(), inbound_plan.owner_name());
     }
 

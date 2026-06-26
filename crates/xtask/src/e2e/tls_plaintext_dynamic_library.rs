@@ -34,12 +34,12 @@ const POLICY_VERSION: &str = "e2e";
 const REQUESTS: usize = 2;
 const REQUEST_BODY_BYTES: usize = 48;
 const POST_WRITE_DELAY_MS: u64 = 500;
-const FIXTURE_EXE_GLOB: &str = "**/sssa-e2e-dynssl-fixture";
+const FIXTURE_EXE_GLOB: &str = "**/traffic-probe-e2e-dynssl-fixture";
 const TLS_RECONCILE_INTERVAL_MS: u64 = 100;
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const DYNSSL_FIXTURE_TIMEOUT: Duration = Duration::from_secs(20);
-const UNLOADABLE_LIBSSL_ENGINE_ENV: &str = "SSSA_E2E_REAL_TLS_ENGINE_PATH";
+const UNLOADABLE_LIBSSL_ENGINE_ENV: &str = "TRAFFIC_PROBE_E2E_REAL_TLS_ENGINE_PATH";
 
 pub(crate) fn run() -> ExitCode {
     run_scenario(DynamicLibraryScenario::SystemCopy)
@@ -159,13 +159,13 @@ impl DynamicLibraryPaths {
             process_ready: root.join("dynssl-process.ready"),
             phases: [
                 DynSslPhasePaths {
-                    libssl: root.join("libssl-sssa-e2e.so.3"),
+                    libssl: root.join("libssl-traffic-probe-e2e.so.3"),
                     load_start: root.join("dynssl-load.start"),
                     library_ready: root.join("dynssl-library.ready"),
                     exchange_start: root.join("dynssl-exchange.start"),
                 },
                 DynSslPhasePaths {
-                    libssl: root.join("libssl-sssa-e2e-replacement.so.3"),
+                    libssl: root.join("libssl-traffic-probe-e2e-replacement.so.3"),
                     load_start: root.join("dynssl-replacement-load.start"),
                     library_ready: root.join("dynssl-replacement-library.ready"),
                     exchange_start: root.join("dynssl-replacement-exchange.start"),
@@ -356,7 +356,7 @@ fn spawn_dynssl_fixture(
     request_body_bytes: usize,
     scenario: DynamicLibraryScenario,
 ) -> Result<Child, Box<dyn std::error::Error>> {
-    let mut command = Command::new(debug_binary("sssa-e2e-dynssl-fixture")?);
+    let mut command = Command::new(debug_binary("traffic-probe-e2e-dynssl-fixture")?);
     let command = run_in_own_process_group(&mut command)
         .arg("--server-addr")
         .arg(server_addr.to_string())
@@ -421,7 +421,7 @@ fn write_server_certificate(cert_path: &Path, key_path: &Path) -> Result<(), std
         .arg(key_path)
         .arg("-out")
         .arg(cert_path)
-        .args(["-days", "1", "-subj", "/CN=sssa-e2e-dynssl"])
+        .args(["-days", "1", "-subj", "/CN=traffic-probe-e2e-dynssl"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -686,7 +686,7 @@ hooks = ["on_http_request_headers"]
         r#"
 function on_http_request_headers(event)
   local target = event.kind.target or ""
-  if string.sub(target, 1, 10) == "/sssa-e2e/" then
+  if string.sub(target, 1, 10) == "/traffic-probe-e2e/" then
     return probe.emit_alert("tls plaintext policy observed " .. target)
   end
 end

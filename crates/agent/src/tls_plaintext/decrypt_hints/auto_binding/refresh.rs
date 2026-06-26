@@ -105,7 +105,7 @@ impl TlsSessionSecretMaterialRefresh {
             Err(error) => {
                 let reason = error.to_string();
                 tracing::warn!(
-                    target: "sssa_probe::tls_session_secret",
+                    target: "traffic_probe::tls_session_secret",
                     error = %reason,
                     "skipping TLS session-secret material refresh"
                 );

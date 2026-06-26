@@ -503,25 +503,27 @@ mod tests {
         let metrics = response["metrics"]
             .as_str()
             .expect("prometheus metrics should be returned as text");
-        assert!(metrics.contains("sssa_pipeline_metrics_available 1\n"));
-        assert!(metrics.contains("sssa_l7_mitm_metrics_available 1\n"));
-        assert!(metrics.contains("sssa_transparent_proxy_metrics_available 1\n"));
-        assert!(metrics.contains("sssa_l7_mitm_backend_health_mode{mode=\"disabled\"} 1\n"));
+        assert!(metrics.contains("traffic_probe_pipeline_metrics_available 1\n"));
+        assert!(metrics.contains("traffic_probe_l7_mitm_metrics_available 1\n"));
+        assert!(metrics.contains("traffic_probe_transparent_proxy_metrics_available 1\n"));
         assert!(
-            metrics.contains("sssa_l7_mitm_plaintext_bridge_mode{mode=\"not_configured\"} 1\n")
+            metrics.contains("traffic_probe_l7_mitm_backend_health_mode{mode=\"disabled\"} 1\n")
         );
         assert!(
             metrics.contains(
-                "sssa_transparent_proxy_upstream_connects_total{outcome=\"success\"} 0\n"
+                "traffic_probe_l7_mitm_plaintext_bridge_mode{mode=\"not_configured\"} 1\n"
             )
         );
-        assert!(metrics.contains("sssa_pipeline_capture_events_read_total 1\n"));
-        assert!(metrics.contains("sssa_pipeline_export_events_written_total 1\n"));
-        assert!(metrics.contains("sssa_pipeline_capture_loss_events_total 0\n"));
-        assert!(metrics.contains("sssa_pipeline_capture_lost_events_total 0\n"));
-        assert!(metrics.contains("sssa_export_sink_lag{sink=\"primary\"} 1\n"));
         assert!(metrics.contains(
-            "sssa_capability_state{capability=\"replay_capture\",mode=\"available\"} 1\n"
+            "traffic_probe_transparent_proxy_upstream_connects_total{outcome=\"success\"} 0\n"
+        ));
+        assert!(metrics.contains("traffic_probe_pipeline_capture_events_read_total 1\n"));
+        assert!(metrics.contains("traffic_probe_pipeline_export_events_written_total 1\n"));
+        assert!(metrics.contains("traffic_probe_pipeline_capture_loss_events_total 0\n"));
+        assert!(metrics.contains("traffic_probe_pipeline_capture_lost_events_total 0\n"));
+        assert!(metrics.contains("traffic_probe_export_sink_lag{sink=\"primary\"} 1\n"));
+        assert!(metrics.contains(
+            "traffic_probe_capability_state{capability=\"replay_capture\",mode=\"available\"} 1\n"
         ));
         server.stop().await;
         drop(spool);

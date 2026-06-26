@@ -86,7 +86,7 @@ fn flow() -> FlowContext {
             tgid: 44_001,
             start_time_ticks: 90_001,
             boot_id: "e2e-boot".to_string(),
-            exe_path: "/usr/bin/sssa-e2e-mitm-bridge".to_string(),
+            exe_path: "/usr/bin/traffic-probe-e2e-mitm-bridge".to_string(),
             cmdline_hash: "mitm-bridge-cmdline-hash".to_string(),
             uid: 1000,
             gid: 1000,
@@ -95,8 +95,8 @@ fn flow() -> FlowContext {
             container_id: None,
             runtime_hint: None,
         },
-        name: "sssa-e2e-mitm-bridge".to_string(),
-        cmdline: vec!["sssa-e2e-mitm-bridge".to_string()],
+        name: "traffic-probe-e2e-mitm-bridge".to_string(),
+        cmdline: vec!["traffic-probe-e2e-mitm-bridge".to_string()],
     };
     FlowContext {
         id: FlowIdentity(FLOW_ID.to_string()),

@@ -170,8 +170,8 @@ fn is_expected_tls_plaintext_request_bytes(event: &CaptureEvent, listen_port: u1
         && bytes
             .bytes
             .as_ref()
-            .windows("POST /sssa-e2e/0".len())
-            .any(|window| window == b"POST /sssa-e2e/0")
+            .windows("POST /traffic-probe-e2e/0".len())
+            .any(|window| window == b"POST /traffic-probe-e2e/0")
 }
 
 fn provider_event_summary(events: &[CaptureEvent], listen_port: u16) -> String {
@@ -316,7 +316,7 @@ impl LoopbackFlowResolver {
                 tgid: lookup.tgid,
                 start_time_ticks: self.start_time_ticks,
                 boot_id: "e2e".to_string(),
-                exe_path: "sssa-e2e-fixture".to_string(),
+                exe_path: "traffic-probe-e2e-fixture".to_string(),
                 cmdline_hash: "e2e".to_string(),
                 uid: 0,
                 gid: 0,
@@ -325,8 +325,8 @@ impl LoopbackFlowResolver {
                 container_id: None,
                 runtime_hint: None,
             },
-            name: "sssa-e2e-fixture".to_string(),
-            cmdline: vec!["sssa-e2e-fixture".to_string()],
+            name: "traffic-probe-e2e-fixture".to_string(),
+            cmdline: vec!["traffic-probe-e2e-fixture".to_string()],
         }
     }
 

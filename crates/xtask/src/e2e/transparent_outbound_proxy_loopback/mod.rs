@@ -27,13 +27,13 @@ use config::{
 };
 use fixtures::{ProxyFixture, ProxyFixtureReport, UpstreamReport, UpstreamServer, run_client};
 
-const IN_NETNS_ENV: &str = "SSSA_PROBE_E2E_TRANSPARENT_OUTBOUND_PROXY_NETNS";
+const IN_NETNS_ENV: &str = "TRAFFIC_PROBE_E2E_TRANSPARENT_OUTBOUND_PROXY_NETNS";
 const LOOPBACK_ADDR: Ipv4Addr = Ipv4Addr::LOCALHOST;
 const UPSTREAM_PORT: u16 = 18082;
 const PROXY_PORT: u16 = 15001;
-const OUTBOUND_BYPASS_MARK: u32 = 0x5353_4102;
-const TPROXY_MARK: &str = "0x53534101";
-const TPROXY_ROUTE_TABLE: &str = "53534";
+const OUTBOUND_BYPASS_MARK: u32 = 0x5450_0102;
+const TPROXY_MARK: &str = "0x54500101";
+const TPROXY_ROUTE_TABLE: &str = "45100";
 const CLIENT_PAYLOAD: &[u8] =
     b"GET /transparent-outbound-proxy-e2e HTTP/1.1\r\nHost: outbound-proxy.test\r\n\r\n";
 const SERVER_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\noutbound-proxy\n";

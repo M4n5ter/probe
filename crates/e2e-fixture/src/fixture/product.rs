@@ -409,7 +409,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         let path = std::env::temp_dir().join(format!(
-            "sssa-product-fixture-{name}-{}-{unique}",
+            "traffic-probe-product-fixture-{name}-{}-{unique}",
             std::process::id()
         ));
         if path.exists() {

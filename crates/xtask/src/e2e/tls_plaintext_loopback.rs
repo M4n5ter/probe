@@ -36,7 +36,7 @@ const REQUEST_BODY_BYTES: usize = 48;
 const RESPONSE_BODY_BYTES: usize = 24;
 const WRITE_CHUNKS: usize = 1;
 const POST_EXCHANGE_DELAY_MS: u64 = 500;
-const FIXTURE_EXE_GLOB: &str = "**/sssa-e2e-fixture";
+const FIXTURE_EXE_GLOB: &str = "**/traffic-probe-e2e-fixture";
 const TLS_RECONCILE_INTERVAL_MS: u64 = 100;
 
 pub(crate) fn run() -> ExitCode {
@@ -509,7 +509,7 @@ hooks = ["on_http_request_headers"]
         r#"
 function on_http_request_headers(event)
   local target = event.kind.target or ""
-  if string.sub(target, 1, 10) == "/sssa-e2e/" then
+  if string.sub(target, 1, 10) == "/traffic-probe-e2e/" then
     return probe.emit_alert("tls plaintext policy observed " .. target)
   end
 end

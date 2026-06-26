@@ -83,8 +83,8 @@ fn scenario() -> PlaintextFeedScenario {
         PlaintextProcess::new(
             321,
             654,
-            "sssa-e2e-export",
-            "/usr/bin/sssa-e2e-export",
+            "traffic-probe-e2e-export",
+            "/usr/bin/traffic-probe-e2e-export",
             "export-hash",
         ),
     ))
@@ -104,7 +104,10 @@ fn write_agent_config(
         id: COLLECTOR_SINK.to_string(),
         transport: ExporterTransportConfig::Webhook {
             endpoint,
-            headers: BTreeMap::from([("x-sssa-e2e".to_string(), "webhook-exporter".to_string())]),
+            headers: BTreeMap::from([(
+                "x-traffic-probe-e2e".to_string(),
+                "webhook-exporter".to_string(),
+            )]),
             tls: Default::default(),
         },
         codec: compression_codec_name(TEST_CODEC),
@@ -127,7 +130,7 @@ fn assert_webhook_batches(
     if !batches.iter().all(|batch| {
         batch
             .headers
-            .get("x-sssa-e2e")
+            .get("x-traffic-probe-e2e")
             .is_some_and(|value| value == "webhook-exporter")
     }) {
         return Err(e2e_error("webhook receiver did not observe configured header").into());

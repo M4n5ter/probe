@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn reads_plaintext_feed_json_lines() -> Result<(), Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!(
-            "sssa-plaintext-feed-{}-{}.jsonl",
+            "traffic-probe-plaintext-feed-{}-{}.jsonl",
             std::process::id(),
             timestamp_suffix()
         ));
