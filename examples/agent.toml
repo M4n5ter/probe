@@ -1,0 +1,161 @@
+# Probe agent example configuration.
+#
+# This file is intentionally safe by default:
+# - capture selection is automatic; eBPF is attempted only when its object path
+#   is configured and host prerequisites pass, otherwise libpcap can be used as
+#   the live fallback;
+# - enforcement is audit-only and has no destructive backend;
+# - transparent interception and MITM are disabled;
+# - no exporter sink is configured.
+#
+# Validate it with:
+#   cargo run -p agent --locked -- check --config examples/agent.toml
+
+agent_id = "probe-local"
+config_version = "example"
+
+[capture]
+# "auto" tries the configured live fallback backends in order.
+# For non-privileged JSONL input, use "plaintext_feed" or "capture_event_feed"
+# and set the matching path below.
+selection = "auto"
+fallback_backends = ["ebpf", "libpcap"]
+
+[capture.ebpf]
+# eBPF process observation requires an explicit built object path.
+# Build it with `cargo run -p xtask --locked -- ebpf-build`, then point this
+# field at the generated object or at the installed object path for production.
+# object_path = "target/ebpf/bpfel-unknown-none/release/ebpf-program"
+
+[capture.libpcap]
+# Leave interface unset to let libpcap choose a default device. Use "any" or
+# a concrete interface such as "lo" or "eth0" when the deployment needs it.
+# interface = "any"
+bpf_filter = "tcp"
+snaplen = 65535
+promisc = false
+immediate_mode = true
+read_timeout_ms = 1000
+
+[capture.plaintext_feed]
+# Non-privileged JSONL plaintext input for development or controlled bridges.
+# path = "/var/lib/probe/plaintext-feed.jsonl"
+
+[capture.capture_event_feed]
+# Typed CaptureEvent JSONL input. follow=true keeps the agent online and waits
+# for appended records.
+# path = "/var/lib/probe/capture-events.jsonl"
+# follow = true
+
+[storage]
+# The agent needs this directory to exist before a live run. The README uses
+# check/status examples that can run even when the path is not present.
+path = "/var/lib/traffic-probe/spool"
+
+[storage.retention.ingress]
+# Retention limits are optional. Leave unset for unbounded retention and rely
+# on external disk management.
+# max_age_ms = 86400000
+# max_records = 1000000
+sweep_interval_ms = 1000
+prune_batch_limit = 1024
+
+[storage.retention.export]
+# max_age_ms = 86400000
+# max_records = 1000000
+sweep_interval_ms = 1000
+prune_batch_limit = 1024
+
+[export.worker]
+enabled = true
+
+[export.worker.schedule]
+mode = "fixed_interval_bounded"
+interval_ms = 1000
+batches_per_sink_per_tick = 1
+sink_timeout_ms = 10000
+
+[export.worker.schedule.failure_backoff]
+initial_ms = 30000
+max_ms = 300000
+multiplier = 2
+
+# Add one or more exporters when a collector or local archive is ready.
+#
+# [[exporters]]
+# id = "local-file"
+# transport = "file"
+# path = "/var/lib/probe/export.jsonl"
+# codec = "zstd"
+#
+# [[exporters]]
+# id = "primary-webhook"
+# transport = "webhook"
+# endpoint = "https://collector.example/probe/batches"
+# codec = "zstd"
+# headers = { x_probe_node = "probe-local" }
+#
+# [exporters.tls]
+# trust_anchor_refs = ["collector-ca"]
+
+[tls.plaintext.instrumentation]
+# libssl uprobe plaintext requires eBPF host prerequisites, an eBPF TLS object,
+# and a selector that scopes the instrumentation target.
+enabled = false
+# libssl_uprobe_object_path = "/opt/probe/ebpf-tls-plaintext"
+reconcile_interval_ms = 1000
+
+[tls.plaintext.decrypt_hints]
+# Reference material ids from [[tls.materials]] when key log or session secret
+# based TLS 1.3 decryption is configured.
+key_log_refs = []
+session_secret_refs = []
+refresh_interval_ms = 1000
+
+# [[tls.materials]]
+# id = "collector-ca"
+# kind = "trust_anchor"
+# path = "/etc/probe/certs/collector-ca.pem"
+#
+# [[tls.materials]]
+# id = "browser-keylog"
+# kind = "key_log_file"
+# path = "/var/lib/probe/tls/browser.keys"
+
+[enforcement]
+# "audit_only" records protective verdicts without applying them.
+# Use "dry_run" to exercise planner decisions, and "enforce" only with an
+# explicit backend, selector, policy source, and operational approval.
+mode = "audit_only"
+backend = "none"
+
+[enforcement.policy.source]
+kind = "none"
+# kind = "file"
+# path = "/etc/probe/enforcement.toml"
+# kind = "remote"
+# endpoint = "http://127.0.0.1:9000/enforcement.toml"
+# max_body_bytes = 16777216
+
+[enforcement.interception]
+# Transparent interception and MITM require root/net-admin and should be scoped
+# with selectors. Keep disabled unless the host lifecycle is intentionally
+# managed by Probe.
+strategy = "none"
+
+[enforcement.interception.proxy]
+mode = "external"
+self_bypass = "none"
+
+[enforcement.interception.mitm.backend]
+mode = "disabled"
+
+[enforcement.interception.mitm.plaintext_bridge]
+mode = "none"
+
+[enforcement.interception.mitm.policy_hook]
+mode = "none"
+
+[admin]
+enabled = false
+socket_path = "/run/traffic-probe/admin.sock"
