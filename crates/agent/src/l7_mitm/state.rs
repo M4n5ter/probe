@@ -4,7 +4,7 @@ use probe_core::{CapabilityKind, CapabilityState};
 use serde::{Deserialize, Serialize};
 
 use super::L7MitmBackendHealthSnapshot;
-use crate::tcp_health::TcpHealthProbeObserver;
+use crate::tcp_health::TcpHealthMode;
 
 #[derive(Clone)]
 pub(crate) struct L7MitmRuntime {
@@ -97,6 +97,15 @@ struct L7MitmRuntimeState {
     backend_health_failure_threshold: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum L7MitmBackendHealthTransition {
+    BecameUnhealthy {
+        consecutive_failures: u64,
+        reason: String,
+    },
+    Recovered,
+}
+
 impl L7MitmRuntimeHandle {
     pub(super) fn new(
         backend_health: L7MitmBackendHealthSnapshot,
@@ -131,18 +140,42 @@ impl L7MitmRuntimeHandle {
         self.lock().snapshot.clone()
     }
 
-    pub(super) fn record_backend_health_success(&self) {
+    pub(super) fn record_backend_health_success(&self) -> Option<L7MitmBackendHealthTransition> {
         let mut state = self.lock();
+        let previous_mode = state.snapshot.backend_health.mode;
         state.snapshot.backend_health.record_success();
+        if previous_mode == TcpHealthMode::Unhealthy
+            && state.snapshot.backend_health.mode == TcpHealthMode::Healthy
+        {
+            Some(L7MitmBackendHealthTransition::Recovered)
+        } else {
+            None
+        }
     }
 
-    pub(super) fn record_backend_health_failure(&self, reason: impl Into<String>) {
+    pub(super) fn record_backend_health_failure(
+        &self,
+        reason: impl Into<String>,
+    ) -> Option<L7MitmBackendHealthTransition> {
         let mut state = self.lock();
         let failure_threshold = state.backend_health_failure_threshold;
+        let previous_mode = state.snapshot.backend_health.mode;
         state
             .snapshot
             .backend_health
             .record_failure(failure_threshold, reason);
+        let current = &state.snapshot.backend_health;
+        if previous_mode != TcpHealthMode::Unhealthy && current.mode == TcpHealthMode::Unhealthy {
+            Some(L7MitmBackendHealthTransition::BecameUnhealthy {
+                consecutive_failures: current.consecutive_failures,
+                reason: current
+                    .last_failure_reason
+                    .clone()
+                    .expect("unhealthy backend health should keep the last failure reason"),
+            })
+        } else {
+            None
+        }
     }
 
     pub(crate) fn record_plaintext_bridge_disabled(&self, reason: impl Into<String>) {
@@ -167,16 +200,6 @@ impl L7MitmRuntimeHandle {
         self.inner
             .lock()
             .expect("L7 MITM runtime state should not be poisoned")
-    }
-}
-
-impl TcpHealthProbeObserver for L7MitmRuntimeHandle {
-    fn record_tcp_health_success(&self) {
-        self.record_backend_health_success();
-    }
-
-    fn record_tcp_health_failure(&self, reason: String) {
-        self.record_backend_health_failure(reason);
     }
 }
 
@@ -207,13 +230,22 @@ mod tests {
             2,
         );
 
-        handle.record_backend_health_failure("connection refused");
+        assert_eq!(
+            handle.record_backend_health_failure("connection refused"),
+            None
+        );
         let health = handle.snapshot().backend_health;
         assert_eq!(health.mode, L7MitmBackendHealthMode::Healthy);
         assert_eq!(health.check_failures, 1);
         assert_eq!(health.consecutive_failures, 1);
 
-        handle.record_backend_health_failure("connection refused");
+        assert_eq!(
+            handle.record_backend_health_failure("connection refused"),
+            Some(L7MitmBackendHealthTransition::BecameUnhealthy {
+                consecutive_failures: 2,
+                reason: "connection refused".to_string(),
+            })
+        );
         let health = handle.snapshot().backend_health;
         assert_eq!(health.mode, L7MitmBackendHealthMode::Unhealthy);
         assert_eq!(health.check_failures, 2);
@@ -221,6 +253,10 @@ mod tests {
         assert_eq!(
             health.last_failure_reason.as_deref(),
             Some("connection refused")
+        );
+        assert_eq!(
+            handle.record_backend_health_failure("connection refused"),
+            None
         );
     }
 
@@ -232,13 +268,22 @@ mod tests {
             1,
         );
 
-        handle.record_backend_health_failure("connection refused");
+        assert_eq!(
+            handle.record_backend_health_failure("connection refused"),
+            Some(L7MitmBackendHealthTransition::BecameUnhealthy {
+                consecutive_failures: 1,
+                reason: "connection refused".to_string(),
+            })
+        );
         assert_eq!(
             handle.snapshot().backend_health.mode,
             L7MitmBackendHealthMode::Unhealthy
         );
 
-        handle.record_backend_health_success();
+        assert_eq!(
+            handle.record_backend_health_success(),
+            Some(L7MitmBackendHealthTransition::Recovered)
+        );
 
         let health = handle.snapshot().backend_health;
         assert_eq!(health.mode, L7MitmBackendHealthMode::Healthy);
@@ -246,5 +291,6 @@ mod tests {
         assert_eq!(health.check_failures, 1);
         assert_eq!(health.consecutive_failures, 0);
         assert_eq!(health.last_failure_reason, None);
+        assert_eq!(handle.record_backend_health_success(), None);
     }
 }

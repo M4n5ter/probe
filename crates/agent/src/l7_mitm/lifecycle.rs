@@ -6,10 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use probe_core::{
-    L7MitmAuditEvent, L7MitmExternalBackendAudit, L7MitmManagedProcessAudit,
-    L7MitmManagedProcessBackendAudit, L7MitmReadinessProbeAudit,
-};
+use probe_core::L7MitmAuditEvent;
 use runtime::{
     TransparentInterceptionMitmBackendPlan, TransparentInterceptionMitmManagedProcessPlan,
 };
@@ -19,7 +16,11 @@ use rustix::{
 };
 
 use super::{
-    L7MitmAuditSink, L7MitmBackendHealthProbeGuard,
+    L7MitmBackendHealthProbeGuard,
+    audit::{
+        L7MitmAuditContext, L7MitmAuditSink, L7MitmBackendHealthAuditObserver,
+        L7MitmExternalAuditContext, L7MitmManagedProcessAuditContext,
+    },
     backend::{L7MitmBackendHealthProbe, backend_health_probe, connect_tcp},
     listener_owner::require_listener_owned_by_process_group,
     state::L7MitmRuntimeHandle,
@@ -110,9 +111,12 @@ fn external(
 ) -> Result<Option<L7MitmBackendLifecycleGuard>, String> {
     let audit_context = L7MitmExternalAuditContext::new(&health_probe_plan);
     record_audit(&audit, audit_context.backend_starting_event())?;
+    let health_context = L7MitmAuditContext::External(audit_context.clone());
+    let health_observer =
+        L7MitmBackendHealthAuditObserver::new(runtime, Arc::clone(&audit), health_context.clone());
     let health_probe = start_tcp_health_probe(
         Some(health_probe_plan.into_plan()),
-        runtime,
+        health_observer,
         || Ok(()),
         "L7 MITM backend health probe thread panicked",
     );
@@ -123,7 +127,7 @@ fn external(
         health_probe: Some(health_probe),
         managed_process: None,
         audit: Arc::clone(&audit),
-        audit_context: L7MitmAuditContext::External(audit_context.clone()),
+        audit_context: health_context,
         cleanup_complete: false,
     };
     if let Err(error) = record_audit(&audit, audit_context.backend_health_probe_started_event()) {
@@ -183,9 +187,12 @@ fn managed_process(
     let child = Arc::clone(&managed_process.child);
     let process_group = managed_process.process_group;
     let target = readiness_probe.target;
+    let health_context = L7MitmAuditContext::ManagedProcess(audit_context.clone());
+    let health_observer =
+        L7MitmBackendHealthAuditObserver::new(runtime, Arc::clone(&audit), health_context.clone());
     let health_probe = start_tcp_health_probe(
         Some(readiness_probe.into_plan()),
-        runtime,
+        health_observer,
         move || ensure_managed_process_owns_readiness_listener(&child, process_group, target),
         "L7 MITM managed backend health probe thread panicked",
     );
@@ -193,188 +200,9 @@ fn managed_process(
         health_probe,
         managed_process: Some(managed_process),
         audit,
-        audit_context: L7MitmAuditContext::ManagedProcess(audit_context),
+        audit_context: health_context,
         cleanup_complete: false,
     })
-}
-
-#[derive(Clone)]
-enum L7MitmAuditContext {
-    External(L7MitmExternalAuditContext),
-    ManagedProcess(L7MitmManagedProcessAuditContext),
-}
-
-impl L7MitmAuditContext {
-    fn backend_stopping_event(&self) -> L7MitmAuditEvent {
-        match self {
-            Self::External(context) => context.backend_stopping_event(),
-            Self::ManagedProcess(context) => context.backend_stopping_event(),
-        }
-    }
-
-    fn backend_stopped_event(&self) -> L7MitmAuditEvent {
-        match self {
-            Self::External(context) => context.backend_stopped_event(),
-            Self::ManagedProcess(context) => context.backend_stopped_event(),
-        }
-    }
-
-    fn backend_stop_failed_event(&self, reason: String) -> L7MitmAuditEvent {
-        match self {
-            Self::External(context) => context.backend_stop_failed_event(reason),
-            Self::ManagedProcess(context) => context.backend_stop_failed_event(reason),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct L7MitmExternalAuditContext {
-    readiness_probe: L7MitmReadinessProbeAudit,
-}
-
-impl L7MitmExternalAuditContext {
-    fn new(readiness_probe: &L7MitmBackendHealthProbe) -> Self {
-        Self {
-            readiness_probe: readiness_probe_audit(readiness_probe),
-        }
-    }
-
-    fn backend_starting_event(&self) -> L7MitmAuditEvent {
-        L7MitmAuditEvent::External {
-            event: L7MitmExternalBackendAudit::BackendStarting {
-                readiness_probe: self.readiness_probe.clone(),
-            },
-        }
-    }
-
-    fn backend_health_probe_started_event(&self) -> L7MitmAuditEvent {
-        L7MitmAuditEvent::External {
-            event: L7MitmExternalBackendAudit::BackendHealthProbeStarted {
-                readiness_probe: self.readiness_probe.clone(),
-            },
-        }
-    }
-
-    fn backend_stopping_event(&self) -> L7MitmAuditEvent {
-        L7MitmAuditEvent::External {
-            event: L7MitmExternalBackendAudit::BackendStopping {
-                readiness_probe: self.readiness_probe.clone(),
-            },
-        }
-    }
-
-    fn backend_stopped_event(&self) -> L7MitmAuditEvent {
-        L7MitmAuditEvent::External {
-            event: L7MitmExternalBackendAudit::BackendStopped {
-                readiness_probe: self.readiness_probe.clone(),
-            },
-        }
-    }
-
-    fn backend_stop_failed_event(&self, reason: String) -> L7MitmAuditEvent {
-        L7MitmAuditEvent::External {
-            event: L7MitmExternalBackendAudit::BackendStopFailed {
-                readiness_probe: self.readiness_probe.clone(),
-                reason,
-            },
-        }
-    }
-}
-
-#[derive(Clone)]
-struct L7MitmManagedProcessAuditContext {
-    readiness_probe: L7MitmReadinessProbeAudit,
-    process: L7MitmManagedProcessAudit,
-}
-
-impl L7MitmManagedProcessAuditContext {
-    fn new(
-        process: &TransparentInterceptionMitmManagedProcessPlan,
-        readiness_probe: &L7MitmBackendHealthProbe,
-        process_group: Option<Pid>,
-    ) -> Self {
-        Self {
-            readiness_probe: readiness_probe_audit(readiness_probe),
-            process: L7MitmManagedProcessAudit {
-                program: process.program.display().to_string(),
-                args_count: u64::try_from(process.args.len()).unwrap_or(u64::MAX),
-                working_dir: process
-                    .working_dir
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
-                process_group: process_group.map(Pid::as_raw_pid),
-            },
-        }
-    }
-
-    fn backend_starting_event(&self) -> L7MitmAuditEvent {
-        L7MitmAuditEvent::ManagedProcess {
-            event: L7MitmManagedProcessBackendAudit::BackendStarting {
-                readiness_probe: self.readiness_probe.clone(),
-                process: self.process.clone(),
-            },
-        }
-    }
-
-    fn backend_ready_event(&self) -> L7MitmAuditEvent {
-        L7MitmAuditEvent::ManagedProcess {
-            event: L7MitmManagedProcessBackendAudit::BackendReady {
-                readiness_probe: self.readiness_probe.clone(),
-                process: self.process.clone(),
-            },
-        }
-    }
-
-    fn backend_start_failed_event(&self, reason: String) -> L7MitmAuditEvent {
-        L7MitmAuditEvent::ManagedProcess {
-            event: L7MitmManagedProcessBackendAudit::BackendStartFailed {
-                readiness_probe: self.readiness_probe.clone(),
-                process: self.process.clone(),
-                reason,
-            },
-        }
-    }
-
-    fn backend_stopping_event(&self) -> L7MitmAuditEvent {
-        L7MitmAuditEvent::ManagedProcess {
-            event: L7MitmManagedProcessBackendAudit::BackendStopping {
-                readiness_probe: self.readiness_probe.clone(),
-                process: self.process.clone(),
-            },
-        }
-    }
-
-    fn backend_stopped_event(&self) -> L7MitmAuditEvent {
-        L7MitmAuditEvent::ManagedProcess {
-            event: L7MitmManagedProcessBackendAudit::BackendStopped {
-                readiness_probe: self.readiness_probe.clone(),
-                process: self.process.clone(),
-            },
-        }
-    }
-
-    fn backend_stop_failed_event(&self, reason: String) -> L7MitmAuditEvent {
-        L7MitmAuditEvent::ManagedProcess {
-            event: L7MitmManagedProcessBackendAudit::BackendStopFailed {
-                readiness_probe: self.readiness_probe.clone(),
-                process: self.process.clone(),
-                reason,
-            },
-        }
-    }
-}
-
-fn readiness_probe_audit(readiness_probe: &L7MitmBackendHealthProbe) -> L7MitmReadinessProbeAudit {
-    L7MitmReadinessProbeAudit {
-        target: readiness_probe.target.to_string(),
-        interval_ms: duration_millis(readiness_probe.interval),
-        timeout_ms: duration_millis(readiness_probe.timeout),
-        failure_threshold: readiness_probe.failure_threshold,
-    }
-}
-
-fn duration_millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn record_audit(audit: &Arc<dyn L7MitmAuditSink>, event: L7MitmAuditEvent) -> Result<(), String> {
@@ -888,16 +716,13 @@ mod tests {
             handle: handle.clone(),
         };
         let shutdown = crate::shutdown::new_flag();
-        let guard = start_backend_lifecycle(
-            &backend,
-            runtime.handle(),
-            Arc::new(NoopL7MitmAuditSink),
-            &shutdown,
-        )?
-        .expect("configured backend health probe should start");
+        let audit = Arc::new(RecordingL7MitmAuditSink::default());
+        let audit_sink: Arc<dyn L7MitmAuditSink> = audit.clone();
+        let guard = start_backend_lifecycle(&backend, runtime.handle(), audit_sink, &shutdown)?
+            .expect("configured backend health probe should start");
 
         wait_until(Duration::from_secs(1), || {
-            handle.snapshot().backend_health.check_failures > 0
+            audit.phases().contains(&L7MitmAuditPhase::BackendUnhealthy)
         })?;
         guard.stop()?;
 
@@ -905,6 +730,16 @@ mod tests {
         assert_eq!(health.mode, L7MitmBackendHealthMode::Unhealthy);
         assert!(health.check_failures > 0);
         assert!(health.consecutive_failures > 0);
+        assert_eq!(
+            audit.phases(),
+            vec![
+                L7MitmAuditPhase::BackendStarting,
+                L7MitmAuditPhase::BackendHealthProbeStarted,
+                L7MitmAuditPhase::BackendUnhealthy,
+                L7MitmAuditPhase::BackendStopping,
+                L7MitmAuditPhase::BackendStopped,
+            ]
+        );
         Ok(())
     }
 

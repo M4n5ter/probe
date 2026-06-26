@@ -352,6 +352,14 @@ pub enum L7MitmExternalBackendAudit {
     BackendHealthProbeStarted {
         readiness_probe: L7MitmReadinessProbeAudit,
     },
+    BackendUnhealthy {
+        readiness_probe: L7MitmReadinessProbeAudit,
+        consecutive_failures: u64,
+        reason: String,
+    },
+    BackendRecovered {
+        readiness_probe: L7MitmReadinessProbeAudit,
+    },
     BackendStopping {
         readiness_probe: L7MitmReadinessProbeAudit,
     },
@@ -369,6 +377,8 @@ impl L7MitmExternalBackendAudit {
         match self {
             Self::BackendStarting { .. } => L7MitmAuditPhase::BackendStarting,
             Self::BackendHealthProbeStarted { .. } => L7MitmAuditPhase::BackendHealthProbeStarted,
+            Self::BackendUnhealthy { .. } => L7MitmAuditPhase::BackendUnhealthy,
+            Self::BackendRecovered { .. } => L7MitmAuditPhase::BackendRecovered,
             Self::BackendStopping { .. } => L7MitmAuditPhase::BackendStopping,
             Self::BackendStopped { .. } => L7MitmAuditPhase::BackendStopped,
             Self::BackendStopFailed { .. } => L7MitmAuditPhase::BackendStopFailed,
@@ -377,9 +387,12 @@ impl L7MitmExternalBackendAudit {
 
     fn reason(&self) -> Option<&str> {
         match self {
-            Self::BackendStopFailed { reason, .. } => Some(reason),
+            Self::BackendUnhealthy { reason, .. } | Self::BackendStopFailed { reason, .. } => {
+                Some(reason)
+            }
             Self::BackendStarting { .. }
             | Self::BackendHealthProbeStarted { .. }
+            | Self::BackendRecovered { .. }
             | Self::BackendStopping { .. }
             | Self::BackendStopped { .. } => None,
         }
@@ -394,6 +407,16 @@ pub enum L7MitmManagedProcessBackendAudit {
         process: L7MitmManagedProcessAudit,
     },
     BackendReady {
+        readiness_probe: L7MitmReadinessProbeAudit,
+        process: L7MitmManagedProcessAudit,
+    },
+    BackendUnhealthy {
+        readiness_probe: L7MitmReadinessProbeAudit,
+        process: L7MitmManagedProcessAudit,
+        consecutive_failures: u64,
+        reason: String,
+    },
+    BackendRecovered {
         readiness_probe: L7MitmReadinessProbeAudit,
         process: L7MitmManagedProcessAudit,
     },
@@ -422,6 +445,8 @@ impl L7MitmManagedProcessBackendAudit {
         match self {
             Self::BackendStarting { .. } => L7MitmAuditPhase::BackendStarting,
             Self::BackendReady { .. } => L7MitmAuditPhase::BackendReady,
+            Self::BackendUnhealthy { .. } => L7MitmAuditPhase::BackendUnhealthy,
+            Self::BackendRecovered { .. } => L7MitmAuditPhase::BackendRecovered,
             Self::BackendStartFailed { .. } => L7MitmAuditPhase::BackendStartFailed,
             Self::BackendStopping { .. } => L7MitmAuditPhase::BackendStopping,
             Self::BackendStopped { .. } => L7MitmAuditPhase::BackendStopped,
@@ -431,11 +456,12 @@ impl L7MitmManagedProcessBackendAudit {
 
     fn reason(&self) -> Option<&str> {
         match self {
-            Self::BackendStartFailed { reason, .. } | Self::BackendStopFailed { reason, .. } => {
-                Some(reason)
-            }
+            Self::BackendUnhealthy { reason, .. }
+            | Self::BackendStartFailed { reason, .. }
+            | Self::BackendStopFailed { reason, .. } => Some(reason),
             Self::BackendStarting { .. }
             | Self::BackendReady { .. }
+            | Self::BackendRecovered { .. }
             | Self::BackendStopping { .. }
             | Self::BackendStopped { .. } => None,
         }
@@ -448,6 +474,8 @@ pub enum L7MitmAuditPhase {
     BackendStarting,
     BackendHealthProbeStarted,
     BackendReady,
+    BackendUnhealthy,
+    BackendRecovered,
     BackendStartFailed,
     BackendStopping,
     BackendStopped,
@@ -479,7 +507,7 @@ mod tests {
     use crate::{
         Action, BodyChunk, CaptureLoss, Direction, DomainEvent, EnforcementDecision,
         EnforcementMode, EnforcementOutcome, EventKind, EventType, Gap, HttpHeaders,
-        L7MitmAuditEvent, L7MitmExternalBackendAudit, L7MitmManagedProcessAudit,
+        L7MitmAuditEvent, L7MitmAuditPhase, L7MitmExternalBackendAudit, L7MitmManagedProcessAudit,
         L7MitmManagedProcessBackendAudit, L7MitmReadinessProbeAudit, OpaqueStream,
         PolicyRuntimeError, ProtocolError, SseEvent, Verdict, VerdictScope, WebSocketFrame,
         WebSocketHandoff, WebSocketOpcode,
@@ -707,6 +735,39 @@ mod tests {
         assert_eq!(managed["event"]["phase"], "backend_start_failed");
         assert_eq!(managed["event"]["reason"], "readiness failed");
         assert_eq!(managed["event"]["process"]["args_count"], 2);
+        Ok(())
+    }
+
+    #[test]
+    fn l7_mitm_health_transition_audit_preserves_reason_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let unhealthy = L7MitmAuditEvent::External {
+            event: L7MitmExternalBackendAudit::BackendUnhealthy {
+                readiness_probe: readiness_probe_audit(),
+                consecutive_failures: 3,
+                reason: "connection refused".to_string(),
+            },
+        };
+        let recovered = L7MitmAuditEvent::ManagedProcess {
+            event: L7MitmManagedProcessBackendAudit::BackendRecovered {
+                readiness_probe: readiness_probe_audit(),
+                process: managed_process_audit(),
+            },
+        };
+
+        assert_eq!(unhealthy.phase(), L7MitmAuditPhase::BackendUnhealthy);
+        assert_eq!(unhealthy.reason(), Some("connection refused"));
+        assert_eq!(recovered.phase(), L7MitmAuditPhase::BackendRecovered);
+        assert_eq!(recovered.reason(), None);
+
+        let unhealthy = serde_json::to_value(EventKind::L7MitmAudit(unhealthy))?;
+        assert_eq!(unhealthy["event"]["phase"], "backend_unhealthy");
+        assert_eq!(unhealthy["event"]["consecutive_failures"], 3);
+        assert_eq!(unhealthy["event"]["reason"], "connection refused");
+
+        let recovered = serde_json::to_value(EventKind::L7MitmAudit(recovered))?;
+        assert_eq!(recovered["event"]["phase"], "backend_recovered");
+        assert!(recovered["event"].get("reason").is_none());
         Ok(())
     }
 
