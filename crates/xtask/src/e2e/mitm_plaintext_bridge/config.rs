@@ -89,7 +89,9 @@ pub(super) fn write_agent_config(
     ));
     config.enforcement.interception.mitm.backend = match inputs.mitm_backend {
         MitmBackendConfig::External { target } => {
-            TransparentInterceptionMitmBackendConfig::external(mitm_readiness_probe(target.clone()))
+            TransparentInterceptionMitmBackendConfig::external(external_mitm_readiness_probe(
+                target.clone(),
+            ))
         }
         MitmBackendConfig::ManagedProcess {
             target,
@@ -157,4 +159,14 @@ fn mitm_readiness_probe(target: String) -> TransparentInterceptionMitmBackendRea
         target: Some(target),
         ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
     }
+}
+
+fn external_mitm_readiness_probe(
+    target: String,
+) -> TransparentInterceptionMitmBackendReadinessProbeConfig {
+    let mut probe = mitm_readiness_probe(target);
+    probe.interval_ms = 100;
+    probe.timeout_ms = 10;
+    probe.failure_threshold = 1;
+    probe
 }

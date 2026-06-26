@@ -3,7 +3,12 @@ use std::{
     fs, io,
     net::{Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -11,6 +16,7 @@ use rustix::{
     io::Errno,
     process::{Pid, Signal, kill_process_group},
 };
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use super::super::harness::{debug_binary, e2e_error};
 
@@ -22,6 +28,8 @@ pub(super) const MANAGED_IN_NETNS_ENV: &str = "SSSA_PROBE_E2E_MANAGED_MITM_PLAIN
 const DEFAULT_INTERCEPT_PORT: u16 = 65_529;
 const DEFAULT_MANAGED_BACKEND_PORT: u16 = 65_521;
 const MANAGED_BACKEND_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const EXTERNAL_BACKEND_REBIND_TIMEOUT: Duration = Duration::from_secs(2);
+const EXTERNAL_BACKEND_LISTEN_BACKLOG: i32 = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MitmBackendCase {
@@ -69,7 +77,7 @@ impl MitmBackendCase {
 pub(super) struct PreparedMitmBackend {
     pub(super) config: MitmBackendConfig,
     pub(super) proxy_port: u16,
-    _external_listener: Option<TcpListener>,
+    external_backend: Option<ExternalMitmBackend>,
 }
 
 impl PreparedMitmBackend {
@@ -77,6 +85,100 @@ impl PreparedMitmBackend {
         match &self.config {
             MitmBackendConfig::ManagedProcess { pid_file, .. } => Some(pid_file),
             MitmBackendConfig::External { .. } => None,
+        }
+    }
+
+    pub(super) fn pause_external_listener(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        match self.external_backend.as_mut() {
+            Some(backend) => backend.pause(),
+            None => {
+                Err(e2e_error("cannot pause managed MITM backend as an external listener").into())
+            }
+        }
+    }
+
+    pub(super) fn resume_external_listener(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        match self.external_backend.as_mut() {
+            Some(backend) => backend.resume(),
+            None => {
+                Err(e2e_error("cannot resume managed MITM backend as an external listener").into())
+            }
+        }
+    }
+}
+
+struct ExternalMitmBackend {
+    target: SocketAddr,
+    listener: Option<ExternalMitmListener>,
+}
+
+impl ExternalMitmBackend {
+    fn start(listener: TcpListener) -> Result<Self, Box<dyn std::error::Error>> {
+        let target = listener.local_addr()?;
+        Ok(Self {
+            target,
+            listener: Some(ExternalMitmListener::start(listener)?),
+        })
+    }
+
+    fn target(&self) -> SocketAddr {
+        self.target
+    }
+
+    fn pause(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(listener) = self.listener.take() {
+            listener.stop()?;
+        }
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.listener.is_none() {
+            let listener = bind_external_listener_with_retry(self.target)?;
+            self.listener = Some(ExternalMitmListener::start(listener)?);
+        }
+        Ok(())
+    }
+}
+
+struct ExternalMitmListener {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl ExternalMitmListener {
+    fn start(listener: TcpListener) -> Result<Self, Box<dyn std::error::Error>> {
+        listener.set_nonblocking(true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread =
+            thread::spawn(move || accept_external_backend_connections(listener, thread_stop));
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    fn stop(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.stop.store(true, Ordering::Relaxed);
+        match self
+            .thread
+            .take()
+            .expect("external backend thread already joined")
+            .join()
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(e2e_error("external MITM backend accept thread panicked").into()),
+        }
+    }
+}
+
+impl Drop for ExternalMitmListener {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -173,14 +275,15 @@ pub(super) fn cleanup_managed_backend(
 }
 
 fn prepare_external_backend() -> Result<PreparedMitmBackend, Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-    let target = listener.local_addr()?;
+    let listener = bind_reusable_tcp_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let backend = ExternalMitmBackend::start(listener)?;
+    let target = backend.target();
     Ok(PreparedMitmBackend {
         config: MitmBackendConfig::External {
             target: target.to_string(),
         },
         proxy_port: target.port(),
-        _external_listener: Some(listener),
+        external_backend: Some(backend),
     })
 }
 
@@ -207,7 +310,7 @@ fn prepare_managed_backend(
             ],
             pid_file,
         },
-        _external_listener: None,
+        external_backend: None,
     })
 }
 
@@ -234,6 +337,50 @@ fn managed_backend_target(
         }
     }
     Err(e2e_error("failed to find a free deterministic managed MITM backend port").into())
+}
+
+fn bind_external_listener_with_retry(
+    target: SocketAddr,
+) -> Result<TcpListener, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + EXTERNAL_BACKEND_REBIND_TIMEOUT;
+    loop {
+        match bind_reusable_tcp_listener(target) {
+            Ok(listener) => return Ok(listener),
+            Err(error) if is_address_in_use(&error) && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn bind_reusable_tcp_listener(target: SocketAddr) -> io::Result<TcpListener> {
+    let socket = Socket::new(
+        Domain::for_address(target),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&SockAddr::from(target))?;
+    socket.listen(EXTERNAL_BACKEND_LISTEN_BACKLOG)?;
+    Ok(TcpListener::from(socket))
+}
+
+fn accept_external_backend_connections(
+    listener: TcpListener,
+    stop: Arc<AtomicBool>,
+) -> io::Result<()> {
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _peer)) => drop(stream),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn is_address_in_use(error: &io::Error) -> bool {

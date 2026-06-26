@@ -9,7 +9,9 @@ use std::{
     process::{Command, ExitCode},
 };
 
-use assertions::{assert_mitm_backend_runtime, assert_spool_outputs};
+use assertions::{
+    assert_mitm_backend_runtime, assert_spool_outputs, exercise_l7_mitm_health_transition,
+};
 use backend::{
     MitmBackendCase, cleanup_managed_backend, prepare_mitm_backend, unused_intercept_port,
 };
@@ -103,7 +105,7 @@ fn run_at(root: &Path, case: MitmBackendCase) -> Result<(), Box<dyn std::error::
     );
     let fixture_ready =
         wait_for_http1_loopback_fixture_ready(fixture.child_mut(), &fixture_ready_path)?;
-    let mitm_backend =
+    let mut mitm_backend =
         prepare_mitm_backend(case, root, &bridge_feed_path, [fixture_ready.listen_port])?;
     initialize_bridge_feed(case, &bridge_feed_path)?;
     let intercept_port =
@@ -148,6 +150,10 @@ fn run_at(root: &Path, case: MitmBackendCase) -> Result<(), Box<dyn std::error::
             expected_policy_alert_messages().len() as u64,
         )
     });
+    let health_transition =
+        run_after_success([&agent_ready, &backend_status, &bridge_progress], || {
+            exercise_l7_mitm_health_transition(case, &mut mitm_backend, &admin_socket_path)
+        });
     let fixture_result = if all_succeeded([&agent_ready, &backend_status, &fixture_start]) {
         wait_for_http1_loopback_fixture_exit(fixture.child_mut())
     } else {
@@ -166,6 +172,7 @@ fn run_at(root: &Path, case: MitmBackendCase) -> Result<(), Box<dyn std::error::
         primary_progress,
         bridge_feed_append,
         bridge_progress,
+        health_transition,
         agent: agent_result,
         managed_backend_cleanup: managed_backend_cleanup_result,
     };
@@ -186,6 +193,7 @@ struct MitmBridgePhases {
     primary_progress: RunResult,
     bridge_feed_append: RunResult,
     bridge_progress: RunResult,
+    health_transition: RunResult,
     agent: RunResult,
     managed_backend_cleanup: RunResult,
 }
@@ -200,12 +208,13 @@ impl MitmBridgePhases {
             &self.primary_progress,
             &self.bridge_feed_append,
             &self.bridge_progress,
+            &self.health_transition,
             &self.agent,
             &self.managed_backend_cleanup,
         ])
     }
 
-    fn into_labeled_results(self, spool: RunResult) -> [LabeledRunResult; 10] {
+    fn into_labeled_results(self, spool: RunResult) -> [LabeledRunResult; 11] {
         [
             ("fixture", self.fixture),
             ("agent readiness", self.agent_ready),
@@ -214,6 +223,7 @@ impl MitmBridgePhases {
             ("agent primary policy progress", self.primary_progress),
             ("MITM bridge feed append", self.bridge_feed_append),
             ("agent MITM bridge policy progress", self.bridge_progress),
+            ("L7 MITM backend health transition", self.health_transition),
             ("agent", self.agent),
             ("managed MITM backend cleanup", self.managed_backend_cleanup),
             ("spool assertion", spool),

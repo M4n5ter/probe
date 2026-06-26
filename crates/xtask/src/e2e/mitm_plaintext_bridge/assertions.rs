@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, path::Path, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
+};
 
 use capture::CaptureEvent;
 use e2e_support::mitm_bridge;
@@ -24,6 +29,8 @@ use crate::e2e::{
     loopback::{assert_no_policy_runtime_errors, send_admin_request},
 };
 
+const HEALTH_TRANSITION_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub(super) fn assert_mitm_backend_runtime(
     case: MitmBackendCase,
     admin_socket_path: &Path,
@@ -42,6 +49,21 @@ pub(super) fn assert_mitm_backend_runtime(
     let response = send_admin_request(admin_socket_path, json!({"command": "status"}))?;
     assert_backend_status(case, backend, &response)?;
     assert_l7_mitm_runtime_status(case, &response)
+}
+
+pub(super) fn exercise_l7_mitm_health_transition(
+    case: MitmBackendCase,
+    backend: &mut PreparedMitmBackend,
+    admin_socket_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if case != MitmBackendCase::External {
+        return Ok(());
+    }
+    wait_for_l7_mitm_backend_health(admin_socket_path, "healthy")?;
+    backend.pause_external_listener()?;
+    wait_for_l7_mitm_backend_health(admin_socket_path, "unhealthy")?;
+    backend.resume_external_listener()?;
+    wait_for_l7_mitm_backend_health(admin_socket_path, "healthy")
 }
 
 pub(super) fn assert_spool_outputs(
@@ -73,6 +95,28 @@ pub(super) fn assert_spool_outputs(
         envelopes.len()
     );
     Ok(())
+}
+
+fn wait_for_l7_mitm_backend_health(
+    admin_socket_path: &Path,
+    expected_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + HEALTH_TRANSITION_TIMEOUT;
+    loop {
+        let response = send_admin_request(admin_socket_path, json!({"command": "status"}))?;
+        let runtime =
+            response["snapshot"]["enforcement"]["interception"]["runtime_l7_mitm"].clone();
+        if runtime["backend_health"]["mode"] == json!(expected_mode) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(e2e_error(format!(
+                "timed out waiting for L7 MITM backend health mode {expected_mode}, last runtime: {runtime}"
+            ))
+            .into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn assert_backend_status(
@@ -270,11 +314,15 @@ fn assert_expected_l7_mitm_audit(
         .iter()
         .map(|event| event.phase())
         .collect::<BTreeSet<_>>();
-    let required = BTreeSet::from([
+    let mut required = BTreeSet::from([
         L7MitmAuditPhase::BackendStarting,
         L7MitmAuditPhase::BackendStopping,
         L7MitmAuditPhase::BackendStopped,
     ]);
+    if case == MitmBackendCase::External {
+        required.insert(L7MitmAuditPhase::BackendUnhealthy);
+        required.insert(L7MitmAuditPhase::BackendRecovered);
+    }
     if !phases.is_superset(&required) {
         return Err(e2e_error(format!(
             "missing L7 MITM lifecycle audit phases; expected at least {:?}, observed {:?}",
@@ -311,11 +359,36 @@ fn assert_expected_external_l7_mitm_audit(
             } if readiness_probe.target == target
         )
     });
-    if has_health_probe_started {
+    let has_unhealthy = events.iter().any(|event| {
+        matches!(
+            event,
+            L7MitmAuditEvent::External {
+                event:
+                    L7MitmExternalBackendAudit::BackendUnhealthy {
+                        readiness_probe,
+                        consecutive_failures,
+                        reason,
+                    },
+            } if readiness_probe.target == target
+                && *consecutive_failures > 0
+                && !reason.is_empty()
+        )
+    });
+    let has_recovered = events.iter().any(|event| {
+        matches!(
+            event,
+            L7MitmAuditEvent::External {
+                event: L7MitmExternalBackendAudit::BackendRecovered { readiness_probe },
+            } if readiness_probe.target == target
+        )
+    });
+    if has_health_probe_started && has_unhealthy && has_recovered {
         return Ok(());
     }
     Err(e2e_error(format!(
-        "missing external L7 MITM backend_health_probe_started audit for target {target}"
+        "missing external L7 MITM audit payload for target {target}: \
+         health_probe_started={has_health_probe_started}, unhealthy={has_unhealthy}, \
+         recovered={has_recovered}"
     ))
     .into())
 }
