@@ -1,0 +1,233 @@
+use std::{collections::BTreeSet, path::Path, path::PathBuf};
+
+use capture::CaptureEvent;
+use e2e_support::mitm_bridge;
+use probe_core::{CaptureProviderKind, CaptureSource, Direction, EventEnvelope, EventKind};
+use serde_json::json;
+use storage::{FjallSpool, StoredEvent};
+
+use super::{
+    backend::{
+        MitmBackendCase, MitmBackendConfig, PreparedMitmBackend, wait_for_managed_backend_pid,
+    },
+    feed::{
+        E2E_EXPORT_CURSOR_OWNER, EXPECTED_POLICY_VERSION, expected_bridge_policy_alert_message,
+        expected_libpcap_targets, expected_policy_alert_message, is_bridge_flow,
+        is_bridge_ingress_bytes,
+    },
+};
+use crate::e2e::{
+    harness::{decode_capture_event, decode_envelope, e2e_error},
+    loopback::{assert_no_policy_runtime_errors, send_admin_request},
+};
+
+pub(super) fn assert_mitm_backend_runtime(
+    case: MitmBackendCase,
+    admin_socket_path: &Path,
+    backend: &PreparedMitmBackend,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(pid_file) = backend.managed_pid_file() {
+        let pid = wait_for_managed_backend_pid(pid_file)?;
+        if !PathBuf::from(format!("/proc/{pid}")).try_exists()? {
+            return Err(e2e_error(format!(
+                "managed MITM backend pid {pid} was reported but is not visible in procfs"
+            ))
+            .into());
+        }
+    }
+
+    let response = send_admin_request(admin_socket_path, json!({"command": "status"}))?;
+    assert_backend_status(case, backend, &response)?;
+    assert_l7_mitm_runtime_status(case, &response)
+}
+
+pub(super) fn assert_spool_outputs(spool_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let spool = FjallSpool::open(spool_path)?;
+    let ingress = spool.read_ingress_batch_after(0, 512)?;
+    if ingress.is_empty() {
+        return Err(e2e_error("expected MITM bridge ingress records, got none").into());
+    }
+    assert_livestream_ingress(&ingress)?;
+
+    let envelopes = spool
+        .read_export_batch(E2E_EXPORT_CURSOR_OWNER, 512)?
+        .iter()
+        .map(decode_envelope)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_no_policy_runtime_errors(&envelopes)?;
+    assert_expected_bridge_export(&envelopes)?;
+    assert_expected_libpcap_export(&envelopes)?;
+    assert_expected_libpcap_policy_alerts(&envelopes)?;
+
+    println!(
+        "e2e MITM plaintext bridge live sidecar observed {} ingress records and {} export records",
+        ingress.len(),
+        envelopes.len()
+    );
+    Ok(())
+}
+
+fn assert_backend_status(
+    case: MitmBackendCase,
+    backend: &PreparedMitmBackend,
+    response: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status_backend = &response["snapshot"]["enforcement"]["interception"]["mitm"]["backend"];
+    let expected_mode = match case {
+        MitmBackendCase::External => "external",
+        MitmBackendCase::ManagedProcess => "managed_process",
+    };
+    if status_backend["mode"] != json!(expected_mode) {
+        return Err(e2e_error(format!(
+            "MITM backend status mode mismatch: expected {expected_mode}, got {status_backend}"
+        ))
+        .into());
+    }
+
+    match &backend.config {
+        MitmBackendConfig::External { target }
+        | MitmBackendConfig::ManagedProcess { target, .. } => {
+            if status_backend["readiness_probe"]["target"] != json!(target) {
+                return Err(e2e_error(format!(
+                    "MITM backend readiness target mismatch: expected {target}, got {status_backend}"
+                ))
+                .into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn assert_l7_mitm_runtime_status(
+    case: MitmBackendCase,
+    response: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = &response["snapshot"]["enforcement"]["interception"]["runtime_l7_mitm"];
+    if runtime["backend_health"]["mode"] != json!("healthy") {
+        return Err(e2e_error(format!(
+            "{} expected healthy L7 MITM backend runtime, got {runtime}",
+            case.case_name()
+        ))
+        .into());
+    }
+    if runtime["plaintext_bridge"]["mode"] != json!("active") {
+        return Err(e2e_error(format!(
+            "{} expected active L7 MITM plaintext bridge, got {runtime}",
+            case.case_name()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn assert_livestream_ingress(events: &[StoredEvent]) -> Result<(), Box<dyn std::error::Error>> {
+    let capture_events = events
+        .iter()
+        .map(decode_capture_event)
+        .collect::<Result<Vec<_>, _>>()?;
+    if !capture_events.iter().any(is_bridge_ingress_bytes) {
+        return Err(e2e_error("missing MITM bridge capture-event feed ingress bytes").into());
+    }
+    if !capture_events.iter().any(|event| {
+        matches!(
+            event,
+            CaptureEvent::Bytes(bytes)
+                if bytes.origin.source() == CaptureSource::Libpcap
+                    && bytes.origin.provider() == CaptureProviderKind::Libpcap
+                    && bytes.degraded
+        )
+    }) {
+        return Err(e2e_error("missing required libpcap primary ingress bytes").into());
+    }
+    Ok(())
+}
+
+fn assert_expected_bridge_export(
+    envelopes: &[EventEnvelope],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request_found = envelopes.iter().any(|envelope| {
+        is_bridge_flow(envelope)
+            && matches!(
+                envelope.kind(),
+                EventKind::HttpRequestHeaders(headers)
+                    if headers.method.as_deref() == Some("GET")
+                        && headers.target.as_deref() == Some(mitm_bridge::REQUEST_TARGET)
+            )
+    });
+    if !request_found {
+        return Err(e2e_error("missing MITM bridge parsed HTTP request").into());
+    }
+
+    let bridge_alert = expected_bridge_policy_alert_message();
+    let alert_found = envelopes.iter().any(|envelope| {
+        is_bridge_flow(envelope)
+            && envelope.policy_version() == Some(EXPECTED_POLICY_VERSION)
+            && matches!(
+                envelope.kind(),
+                EventKind::PolicyAlert(alert) if alert.message == bridge_alert
+            )
+    });
+    if !alert_found {
+        return Err(e2e_error("missing MITM bridge policy alert").into());
+    }
+    Ok(())
+}
+
+fn assert_expected_libpcap_export(
+    envelopes: &[EventEnvelope],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let observed = envelopes
+        .iter()
+        .filter_map(|envelope| match envelope.kind() {
+            EventKind::HttpRequestHeaders(headers)
+                if envelope.origin().source() == CaptureSource::Libpcap
+                    && envelope.origin().provider() == CaptureProviderKind::Libpcap
+                    && headers.direction == Direction::Outbound
+                    && headers.method.as_deref() == Some("POST") =>
+            {
+                headers.target.clone()
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let expected = expected_libpcap_targets();
+    if observed.is_superset(&expected) {
+        return Ok(());
+    }
+    Err(e2e_error(format!(
+        "missing libpcap primary HTTP request targets; expected at least {:?}, observed {:?}",
+        expected, observed
+    ))
+    .into())
+}
+
+fn assert_expected_libpcap_policy_alerts(
+    envelopes: &[EventEnvelope],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let observed = envelopes
+        .iter()
+        .filter_map(|envelope| match envelope.kind() {
+            EventKind::PolicyAlert(alert)
+                if envelope.origin().source() == CaptureSource::Libpcap
+                    && envelope.origin().provider() == CaptureProviderKind::Libpcap
+                    && envelope.policy_version() == Some(EXPECTED_POLICY_VERSION) =>
+            {
+                Some(alert.message.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let expected = expected_libpcap_targets()
+        .into_iter()
+        .map(expected_policy_alert_message)
+        .collect::<BTreeSet<_>>();
+    if observed.is_superset(&expected) {
+        return Ok(());
+    }
+    Err(e2e_error(format!(
+        "missing libpcap primary policy alerts; expected at least {:?}, observed {:?}",
+        expected, observed
+    ))
+    .into())
+}

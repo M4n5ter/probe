@@ -9,7 +9,10 @@ use super::super::{
     gap_plaintext_feed::run as run_gap_plaintext_feed,
     libpcap_loopback::run as run_libpcap_loopback,
     libpcap_websocket_loopback::run as run_libpcap_websocket_loopback,
-    mitm_plaintext_bridge::run as run_mitm_plaintext_bridge_live_sidecar,
+    mitm_plaintext_bridge::{
+        run as run_mitm_plaintext_bridge_live_sidecar,
+        run_managed as run_managed_mitm_plaintext_bridge_live_sidecar,
+    },
     plaintext_feed::run as run_plaintext_feed,
     remote_enforcement_policy::run as run_remote_enforcement_policy,
     remote_policy_bundle::run as run_remote_policy_bundle,
@@ -268,6 +271,11 @@ const E2E_CASES: &[E2eCase] = &[
         requirement: E2eRequirement::RootNetAdmin,
         run: run_mitm_plaintext_bridge_live_sidecar,
     },
+    E2eCase {
+        name: "e2e-managed-mitm-plaintext-bridge-live-sidecar",
+        requirement: E2eRequirement::RootNetAdmin,
+        run: run_managed_mitm_plaintext_bridge_live_sidecar,
+    },
 ];
 
 const E2E_PROFILES: &[E2eProfile] = &[
@@ -333,6 +341,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-transparent-outbound-owner-proxy-loopback",
             "e2e-transparent-outbound-remote-policy-bundle-loopback",
             "e2e-mitm-plaintext-bridge-live-sidecar",
+            "e2e-managed-mitm-plaintext-bridge-live-sidecar",
         ]),
     },
     E2eProfile {
@@ -377,6 +386,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-transparent-outbound-owner-proxy-loopback",
             "e2e-transparent-outbound-remote-policy-bundle-loopback",
             "e2e-mitm-plaintext-bridge-live-sidecar",
+            "e2e-managed-mitm-plaintext-bridge-live-sidecar",
         ]),
     },
 ];
@@ -571,6 +581,7 @@ mod tests {
                 "e2e-transparent-outbound-owner-proxy-loopback",
                 "e2e-transparent-outbound-remote-policy-bundle-loopback",
                 "e2e-mitm-plaintext-bridge-live-sidecar",
+                "e2e-managed-mitm-plaintext-bridge-live-sidecar",
             ]),
         },
         ExpectedProfile {
@@ -617,6 +628,7 @@ mod tests {
                 "e2e-transparent-outbound-owner-proxy-loopback",
                 "e2e-transparent-outbound-remote-policy-bundle-loopback",
                 "e2e-mitm-plaintext-bridge-live-sidecar",
+                "e2e-managed-mitm-plaintext-bridge-live-sidecar",
             ]),
         },
     ];

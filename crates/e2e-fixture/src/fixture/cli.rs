@@ -1,9 +1,10 @@
-use std::{error::Error, fmt, path::PathBuf};
+use std::{error::Error, fmt, net::SocketAddr, path::PathBuf};
 
 use super::{
     http::HttpTrafficConfig,
     http1::{Http1IoMode, Http1LoopbackConfig, Http1LoopbackError, Http1LoopbackReport},
     loopback::{LoopbackCoordination, LoopbackRunOptions},
+    managed_mitm::{ManagedMitmBackendConfig, ManagedMitmBackendError},
     product::{ProductLoopbackConfig, ProductLoopbackError, ProductLoopbackReport},
     tls::{TlsHttp1LoopbackConfig, TlsHttp1LoopbackError, TlsHttp1LoopbackReport},
     websocket::{
@@ -20,11 +21,15 @@ Scenarios:
   tls-http1-loopback    Start a local OpenSSL/libssl TLS server and client in this process, then exchange deterministic HTTP/1 traffic.
   websocket-loopback    Start a local TCP server and client in this process, then exchange a deterministic HTTP Upgrade and WebSocket text frame.
   product-loopback      Run HTTP/1, WebSocket, and TLS HTTP/1 loopback traffic in one process for end-to-end product validation.
+  managed-mitm-backend  Run a managed L7 MITM backend fixture for agent lifecycle validation.
 
 Options:
   --listen-port PORT
+  --listen-addr ADDR
   --ready-file PATH
   --start-file PATH
+  --pid-file PATH
+  --bridge-feed-file PATH
   --requests N                 (http1-loopback, tls-http1-loopback, and product-loopback)
   --request-body-bytes N       (http1-loopback, tls-http1-loopback, and product-loopback)
   --response-body-bytes N      (http1-loopback, tls-http1-loopback, and product-loopback)
@@ -83,6 +88,15 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> Result<FixtureRepor
             let report = super::product::run_product_loopback(config)?;
             Ok(FixtureReport::ProductLoopback(report))
         }
+        "managed-mitm-backend" => {
+            let scenario_args = args.collect::<Vec<_>>();
+            if has_help(&scenario_args) {
+                return Ok(FixtureReport::Help(USAGE));
+            }
+            let config = parse_managed_mitm_backend(scenario_args)?;
+            super::managed_mitm::run_managed_mitm_backend(config)?;
+            Ok(FixtureReport::ManagedMitmBackend)
+        }
         _ => Err(FixtureError::usage(format!(
             "unknown scenario {scenario}\n\n{USAGE}"
         ))),
@@ -95,6 +109,7 @@ pub(crate) enum FixtureReport {
     TlsHttp1Loopback(TlsHttp1LoopbackReport),
     WebSocketLoopback(WebSocketLoopbackReport),
     ProductLoopback(ProductLoopbackReport),
+    ManagedMitmBackend,
 }
 
 impl fmt::Display for FixtureReport {
@@ -105,6 +120,10 @@ impl fmt::Display for FixtureReport {
             Self::TlsHttp1Loopback(report) => write!(formatter, "{report}"),
             Self::WebSocketLoopback(report) => write!(formatter, "{report}"),
             Self::ProductLoopback(report) => write!(formatter, "{report}"),
+            Self::ManagedMitmBackend => {
+                writeln!(formatter, "scenario=managed-mitm-backend")?;
+                writeln!(formatter, "result=ok")
+            }
         }
     }
 }
@@ -116,6 +135,7 @@ pub(crate) enum FixtureError {
     TlsScenario(TlsHttp1LoopbackError),
     WebSocketScenario(WebSocketLoopbackError),
     ProductScenario(ProductLoopbackError),
+    ManagedMitmBackendScenario(ManagedMitmBackendError),
 }
 
 impl FixtureError {
@@ -132,6 +152,7 @@ impl fmt::Display for FixtureError {
             Self::TlsScenario(error) => write!(formatter, "{error}"),
             Self::WebSocketScenario(error) => write!(formatter, "{error}"),
             Self::ProductScenario(error) => write!(formatter, "{error}"),
+            Self::ManagedMitmBackendScenario(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -144,6 +165,7 @@ impl Error for FixtureError {
             Self::TlsScenario(error) => Some(error),
             Self::WebSocketScenario(error) => Some(error),
             Self::ProductScenario(error) => Some(error),
+            Self::ManagedMitmBackendScenario(error) => Some(error),
         }
     }
 }
@@ -169,6 +191,12 @@ impl From<WebSocketLoopbackError> for FixtureError {
 impl From<ProductLoopbackError> for FixtureError {
     fn from(error: ProductLoopbackError) -> Self {
         Self::ProductScenario(error)
+    }
+}
+
+impl From<ManagedMitmBackendError> for FixtureError {
+    fn from(error: ManagedMitmBackendError) -> Self {
+        Self::ManagedMitmBackendScenario(error)
     }
 }
 
@@ -305,6 +333,60 @@ fn parse_product_loopback(
         run: run.finish()?,
         http_io_mode: http_io_mode.unwrap_or_default(),
         accept_read_delay_ms,
+    })
+}
+
+fn parse_managed_mitm_backend(
+    args: impl IntoIterator<Item = String>,
+) -> Result<ManagedMitmBackendConfig, FixtureError> {
+    let mut listen_addr = None;
+    let mut pid_file = None;
+    let mut bridge_feed_file = None;
+    let mut args = args.into_iter();
+    while let Some(option) = args.next() {
+        if option == "--help" || option == "-h" {
+            return Err(FixtureError::usage(USAGE));
+        }
+        let Some(value) = args.next() else {
+            return Err(FixtureError::usage(format!(
+                "missing value for {option}\n\n{USAGE}"
+            )));
+        };
+        match option.as_str() {
+            "--listen-addr" => listen_addr = Some(parse_socket_addr(&option, &value)?),
+            "--pid-file" => pid_file = Some(PathBuf::from(value)),
+            "--bridge-feed-file" => bridge_feed_file = Some(PathBuf::from(value)),
+            _ => {
+                return Err(FixtureError::usage(format!(
+                    "unknown option {option}\n\n{USAGE}"
+                )));
+            }
+        }
+    }
+    let listen_addr = listen_addr.ok_or_else(|| {
+        FixtureError::usage(format!(
+            "managed-mitm-backend requires --listen-addr\n\n{USAGE}"
+        ))
+    })?;
+    let pid_file = pid_file.ok_or_else(|| {
+        FixtureError::usage(format!(
+            "managed-mitm-backend requires --pid-file\n\n{USAGE}"
+        ))
+    })?;
+    let bridge_feed_file = bridge_feed_file.ok_or_else(|| {
+        FixtureError::usage(format!(
+            "managed-mitm-backend requires --bridge-feed-file\n\n{USAGE}"
+        ))
+    })?;
+    if pid_file == bridge_feed_file {
+        return Err(FixtureError::usage(format!(
+            "--pid-file and --bridge-feed-file must be different paths\n\n{USAGE}"
+        )));
+    }
+    Ok(ManagedMitmBackendConfig {
+        listen_addr,
+        pid_file,
+        bridge_feed_file,
     })
 }
 
@@ -481,6 +563,14 @@ fn parse_u16(option: &str, value: &str) -> Result<u16, FixtureError> {
 
 fn parse_u64(option: &str, value: &str) -> Result<u64, FixtureError> {
     value.parse::<u64>().map_err(|error| {
+        FixtureError::usage(format!(
+            "invalid value for {option}: {value}: {error}\n\n{USAGE}"
+        ))
+    })
+}
+
+fn parse_socket_addr(option: &str, value: &str) -> Result<SocketAddr, FixtureError> {
+    value.parse::<SocketAddr>().map_err(|error| {
         FixtureError::usage(format!(
             "invalid value for {option}: {value}: {error}\n\n{USAGE}"
         ))
@@ -666,6 +756,57 @@ mod tests {
             error
                 .to_string()
                 .contains("use --websocket-connections for product-loopback")
+        );
+    }
+
+    #[test]
+    fn cli_parses_managed_mitm_backend_options() -> Result<(), Box<dyn Error>> {
+        let config = parse_managed_mitm_backend([
+            "--listen-addr".to_string(),
+            "127.0.0.1:65521".to_string(),
+            "--pid-file".to_string(),
+            "/tmp/backend.pid".to_string(),
+            "--bridge-feed-file".to_string(),
+            "/tmp/bridge.jsonl".to_string(),
+        ])?;
+
+        assert_eq!(config.listen_addr, "127.0.0.1:65521".parse::<SocketAddr>()?);
+        assert_eq!(config.pid_file, PathBuf::from("/tmp/backend.pid"));
+        assert_eq!(config.bridge_feed_file, PathBuf::from("/tmp/bridge.jsonl"));
+        Ok(())
+    }
+
+    #[test]
+    fn cli_rejects_incomplete_managed_mitm_backend_options() {
+        let error = parse_managed_mitm_backend([
+            "--listen-addr".to_string(),
+            "127.0.0.1:65521".to_string(),
+        ])
+        .expect_err("managed MITM backend fixture must require all material paths");
+
+        assert!(
+            error
+                .to_string()
+                .contains("managed-mitm-backend requires --pid-file")
+        );
+    }
+
+    #[test]
+    fn cli_rejects_aliased_managed_mitm_backend_paths() {
+        let error = parse_managed_mitm_backend([
+            "--listen-addr".to_string(),
+            "127.0.0.1:65521".to_string(),
+            "--pid-file".to_string(),
+            "/tmp/managed".to_string(),
+            "--bridge-feed-file".to_string(),
+            "/tmp/managed".to_string(),
+        ])
+        .expect_err("managed MITM backend fixture must keep pid and feed files separate");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--pid-file and --bridge-feed-file must be different paths")
         );
     }
 

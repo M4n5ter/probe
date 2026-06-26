@@ -538,9 +538,11 @@ name = "e2e-fixture"
 version = "0.1.0"
 dependencies = [
  "e2e-libssl-ffi",
+ "e2e-support",
  "openssl",
  "rustix",
  "socket2",
+ "tempfile",
 ]
 
 [[package]]
@@ -550,6 +552,15 @@ dependencies = [
  "foreign-types",
  "openssl",
  "openssl-sys",
+]
+
+[[package]]
+name = "e2e-support"
+version = "0.1.0"
+dependencies = [
+ "capture",
+ "probe-core",
+ "serde_json",
 ]
 
 [[package]]
@@ -2910,6 +2921,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "capture",
+ "e2e-support",
  "ebpf-object",
  "exporter",
  "interception",

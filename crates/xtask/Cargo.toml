@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 capture = { version = "0.1.0", path = "../capture" }
 ebpf-object = { version = "0.1.0", path = "../ebpf-object" }
+e2e-support = { version = "0.1.0", path = "../e2e-support" }
 exporter = { version = "0.1.0", path = "../exporter" }
 interception = { version = "0.1.0", path = "../interception" }
 probe-config = { version = "0.1.0", path = "../config" }
