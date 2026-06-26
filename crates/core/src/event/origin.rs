@@ -15,6 +15,7 @@ pub enum CaptureSource {
     LibsslUprobe,
     TlsSessionSecret,
     ExternalPlaintextFeed,
+    L7MitmPlaintext,
     L7MitmControlPlane,
     Replay,
     Mock,
@@ -32,7 +33,7 @@ impl CaptureSource {
             Self::LibsslUprobe | Self::TlsSessionSecret | Self::ExternalPlaintextFeed => {
                 CaptureProviderKind::Plaintext
             }
-            Self::L7MitmControlPlane => CaptureProviderKind::Interception,
+            Self::L7MitmPlaintext | Self::L7MitmControlPlane => CaptureProviderKind::Interception,
             Self::Replay | Self::Mock => CaptureProviderKind::Replay,
         }
     }
@@ -116,6 +117,7 @@ mod tests {
         assert!(CaptureSource::LibsslUprobe.is_live_host_observation());
         assert!(!CaptureSource::TlsSessionSecret.is_live_host_observation());
         assert!(!CaptureSource::ExternalPlaintextFeed.is_live_host_observation());
+        assert!(!CaptureSource::L7MitmPlaintext.is_live_host_observation());
         assert!(!CaptureSource::L7MitmControlPlane.is_live_host_observation());
         assert!(!CaptureSource::Replay.is_live_host_observation());
         assert!(!CaptureSource::Mock.is_live_host_observation());
@@ -130,6 +132,10 @@ mod tests {
         assert_eq!(
             CaptureOrigin::from_source(CaptureSource::EbpfSyscall).provider(),
             CaptureProviderKind::Ebpf
+        );
+        assert_eq!(
+            CaptureOrigin::from_source(CaptureSource::L7MitmPlaintext).provider(),
+            CaptureProviderKind::Interception
         );
         assert_eq!(
             CaptureOrigin::from_source(CaptureSource::L7MitmControlPlane).provider(),

@@ -37,16 +37,16 @@ pub fn is_ingress_bytes(event: &CaptureEvent) -> bool {
     matches!(
         event,
         CaptureEvent::Bytes(bytes)
-            if bytes.origin.source() == CaptureSource::ExternalPlaintextFeed
-                && bytes.origin.provider() == CaptureProviderKind::Plaintext
+            if bytes.origin.source() == CaptureSource::L7MitmPlaintext
+                && bytes.origin.provider() == CaptureProviderKind::Interception
                 && bytes.flow.id.0 == FLOW_ID
                 && bytes.bytes.as_ref() == REQUEST_BYTES
     )
 }
 
 pub fn is_flow(envelope: &EventEnvelope) -> bool {
-    envelope.origin().source() == CaptureSource::ExternalPlaintextFeed
-        && envelope.origin().provider() == CaptureProviderKind::Plaintext
+    envelope.origin().source() == CaptureSource::L7MitmPlaintext
+        && envelope.origin().provider() == CaptureProviderKind::Interception
         && envelope.flow().is_some_and(|flow| flow.id.0 == FLOW_ID)
 }
 
@@ -117,7 +117,7 @@ fn flow() -> FlowContext {
 }
 
 fn origin() -> CaptureOrigin {
-    CaptureOrigin::from_source(CaptureSource::ExternalPlaintextFeed)
+    CaptureOrigin::from_source(CaptureSource::L7MitmPlaintext)
 }
 
 fn timestamp(monotonic_ns: u64) -> Timestamp {

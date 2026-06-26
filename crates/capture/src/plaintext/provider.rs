@@ -64,6 +64,7 @@ impl CaptureProvider for PlaintextEventProvider {
             PlaintextSource::ExternalPlaintextFeed => "plaintext_event_external_feed",
             PlaintextSource::LibsslUprobe => "plaintext_event_libssl_uprobe",
             PlaintextSource::TlsSessionSecret => "plaintext_event_tls_session_secret",
+            PlaintextSource::L7MitmPlaintext => "plaintext_event_l7_mitm_plaintext",
         }
     }
 
@@ -72,6 +73,7 @@ impl CaptureProvider for PlaintextEventProvider {
             PlaintextSource::ExternalPlaintextFeed => CapabilityKind::ExternalPlaintextFeed,
             PlaintextSource::LibsslUprobe => CapabilityKind::LibsslUprobe,
             PlaintextSource::TlsSessionSecret => CapabilityKind::TlsSessionSecretRecordDecrypt,
+            PlaintextSource::L7MitmPlaintext => CapabilityKind::L7Mitm,
         })]
     }
 
@@ -114,6 +116,12 @@ mod tests {
                 capture_source: CaptureSource::TlsSessionSecret,
                 capability: CapabilityKind::TlsSessionSecretRecordDecrypt,
                 name: "plaintext_event_tls_session_secret",
+            },
+            SourceCase {
+                source: PlaintextSource::L7MitmPlaintext,
+                capture_source: CaptureSource::L7MitmPlaintext,
+                capability: CapabilityKind::L7Mitm,
+                name: "plaintext_event_l7_mitm_plaintext",
             },
         ] {
             let mut provider = PlaintextEventProvider::from_chunks(

@@ -14,7 +14,10 @@ use runtime::{
 };
 
 use crate::{
-    capture_event_feed::{JsonLinesCaptureEventFeedProvider, load_capture_event_feed_provider},
+    capture_event_feed::{
+        JsonLinesCaptureEventFeedProvider, load_capture_event_feed_provider,
+        load_l7_mitm_capture_event_feed_provider,
+    },
     capture_provider::{CaptureProviderOpenFailureSnapshot, CaptureProviderRuntimeSnapshot},
     capture_registry::libpcap_config_from_agent,
     error::AgentError,
@@ -297,7 +300,7 @@ fn preflight_mitm_plaintext_bridge_provider(
             ) {
                 return Ok(MitmPlaintextBridgePreflight::DeferredUntilBackendReady);
             }
-            let provider = load_capture_event_feed_provider(path, *follow)?;
+            let provider = load_l7_mitm_capture_event_feed_provider(path, *follow)?;
             l7_mitm_runtime.record_plaintext_bridge_ready();
             Ok(MitmPlaintextBridgePreflight::Open(provider))
         }
@@ -329,7 +332,7 @@ fn open_deferred_mitm_plaintext_bridge_provider(
     else {
         return Ok(None);
     };
-    let provider = load_capture_event_feed_provider(path, *follow)?;
+    let provider = load_l7_mitm_capture_event_feed_provider(path, *follow)?;
     l7_mitm_runtime.record_plaintext_bridge_ready();
     Ok(Some(provider))
 }
@@ -562,7 +565,10 @@ mod tests {
         let bridge_path = bridge_file.path().to_path_buf();
         fs::write(
             &bridge_path,
-            format!("{}\n", serde_json::to_string(&loss_event("mitm bridge"))?),
+            format!(
+                "{}\n",
+                serde_json::to_string(&mitm_loss_event("mitm bridge"))?
+            ),
         )?;
         let mut plan = plan_with_mitm_plaintext_bridge(bridge_path.clone())?;
         set_mitm_plaintext_bridge_follow(&mut plan, false);
@@ -583,6 +589,44 @@ mod tests {
         assert_eq!(
             l7_mitm_runtime.snapshot().plaintext_bridge.mode,
             L7MitmPlaintextBridgeMode::Active
+        );
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn mitm_plaintext_bridge_rejects_non_mitm_origin() -> Result<(), Box<dyn std::error::Error>> {
+        let bridge_file = NamedTempFile::new()?;
+        let bridge_path = bridge_file.path().to_path_buf();
+        fs::write(
+            &bridge_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&loss_event("wrong bridge source"))?
+            ),
+        )?;
+        let mut plan = plan_with_mitm_plaintext_bridge(bridge_path)?;
+        set_mitm_plaintext_bridge_follow(&mut plan, false);
+        let primary = Box::new(VecProvider::new([
+            loss_event("primary before bridge error"),
+            loss_event("primary after bridge error"),
+        ]));
+        let l7_mitm_runtime = configured_l7_mitm_runtime();
+        let bridge = opened_mitm_plaintext_bridge(&plan, &l7_mitm_runtime)?;
+
+        let mut provider =
+            with_mitm_plaintext_bridge_provider(&plan, primary, &l7_mitm_runtime, Some(bridge))?;
+
+        assert_loss_reason(provider.next()?, "primary before bridge error");
+        assert_loss_reason(provider.next()?, "primary after bridge error");
+        let bridge = l7_mitm_runtime.snapshot().plaintext_bridge;
+        assert_eq!(bridge.mode, L7MitmPlaintextBridgeMode::DisabledAfterError);
+        assert!(
+            bridge
+                .disable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("requires source L7MitmPlaintext")),
+            "{bridge:?}"
         );
         assert!(provider.next()?.is_none());
         Ok(())
@@ -652,7 +696,11 @@ mod tests {
             .append(true)
             .open(&bridge_path)?
             .write_all(
-                format!("{}\n", serde_json::to_string(&loss_event("late mitm"))?).as_bytes(),
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&mitm_loss_event("late mitm"))?
+                )
+                .as_bytes(),
             )?;
         assert_loss_reason(provider.next()?, "late mitm");
         Ok(())
@@ -709,7 +757,10 @@ mod tests {
 
         fs::write(
             &bridge_path,
-            format!("{}\n", serde_json::to_string(&loss_event("managed mitm"))?),
+            format!(
+                "{}\n",
+                serde_json::to_string(&mitm_loss_event("managed mitm"))?
+            ),
         )?;
         let bridge = preflight
             .into_provider(&plan, &l7_mitm_runtime)?
@@ -960,12 +1011,20 @@ mod tests {
     }
 
     fn loss_event(reason: &str) -> CaptureEvent {
+        loss_event_with_source(reason, CaptureSource::ExternalPlaintextFeed)
+    }
+
+    fn mitm_loss_event(reason: &str) -> CaptureEvent {
+        loss_event_with_source(reason, CaptureSource::L7MitmPlaintext)
+    }
+
+    fn loss_event_with_source(reason: &str, source: CaptureSource) -> CaptureEvent {
         CaptureEvent::Loss(CapturedLoss {
             timestamp: Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
-            origin: CaptureOrigin::from_source(CaptureSource::ExternalPlaintextFeed),
+            origin: CaptureOrigin::from_source(source),
             enforcement_evidence: EnforcementEvidence::default(),
             loss: CaptureLoss {
                 lost_events: 1,

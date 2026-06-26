@@ -6,7 +6,7 @@ use std::{
 
 use crate::json_lines::{JsonLinesEof, JsonLinesRead, JsonLinesReader};
 use capture::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider};
-use probe_core::{CapabilityKind, CapabilityState};
+use probe_core::{CapabilityKind, CapabilityState, CaptureOrigin, CaptureSource};
 use thiserror::Error;
 
 const MAX_CAPTURE_EVENT_FEED_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -25,14 +25,38 @@ pub(crate) fn load_capture_event_feed_provider(
     path: &Path,
     follow: bool,
 ) -> Result<JsonLinesCaptureEventFeedProvider<BufReader<File>>, CaptureEventFeedLoadError> {
+    load_capture_event_feed_provider_with_contract(
+        path,
+        follow,
+        CaptureEventFeedOriginContract::Any,
+    )
+}
+
+pub(crate) fn load_l7_mitm_capture_event_feed_provider(
+    path: &Path,
+    follow: bool,
+) -> Result<JsonLinesCaptureEventFeedProvider<BufReader<File>>, CaptureEventFeedLoadError> {
+    load_capture_event_feed_provider_with_contract(
+        path,
+        follow,
+        CaptureEventFeedOriginContract::RequiredSource(CaptureSource::L7MitmPlaintext),
+    )
+}
+
+fn load_capture_event_feed_provider_with_contract(
+    path: &Path,
+    follow: bool,
+    origin_contract: CaptureEventFeedOriginContract,
+) -> Result<JsonLinesCaptureEventFeedProvider<BufReader<File>>, CaptureEventFeedLoadError> {
     let file = File::open(path).map_err(|source| CaptureEventFeedLoadError::OpenFile {
         path: path.display().to_string(),
         source,
     })?;
-    Ok(JsonLinesCaptureEventFeedProvider::new(
+    Ok(JsonLinesCaptureEventFeedProvider::with_origin_contract(
         BufReader::new(file),
         path.display().to_string(),
         follow,
+        origin_contract,
     ))
 }
 
@@ -40,13 +64,34 @@ pub(crate) fn load_capture_event_feed_provider(
 pub(crate) struct JsonLinesCaptureEventFeedProvider<R> {
     reader: JsonLinesReader<R>,
     follow: bool,
+    origin_contract: CaptureEventFeedOriginContract,
 }
 
 impl<R> JsonLinesCaptureEventFeedProvider<R>
 where
     R: BufRead,
 {
+    #[cfg(test)]
     fn new(reader: R, path: impl Into<String>, follow: bool) -> Self {
+        Self::with_origin_contract(reader, path, follow, CaptureEventFeedOriginContract::Any)
+    }
+
+    #[cfg(test)]
+    fn l7_mitm_bridge(reader: R, path: impl Into<String>, follow: bool) -> Self {
+        Self::with_origin_contract(
+            reader,
+            path,
+            follow,
+            CaptureEventFeedOriginContract::RequiredSource(CaptureSource::L7MitmPlaintext),
+        )
+    }
+
+    fn with_origin_contract(
+        reader: R,
+        path: impl Into<String>,
+        follow: bool,
+        origin_contract: CaptureEventFeedOriginContract,
+    ) -> Self {
         Self {
             reader: JsonLinesReader::new(
                 reader,
@@ -55,21 +100,68 @@ where
                 MAX_CAPTURE_EVENT_FEED_LINE_BYTES,
             ),
             follow,
+            origin_contract,
         }
     }
 
-    fn read_next_poll(&mut self) -> Result<CapturePoll, crate::json_lines::JsonLinesError> {
+    fn read_next_poll(&mut self) -> Result<CapturePoll, CaptureEventFeedReadError> {
         let eof = if self.follow {
             JsonLinesEof::Follow
         } else {
             JsonLinesEof::Finish
         };
         match self.reader.read::<CaptureEvent>(eof)? {
-            JsonLinesRead::Item(event) => Ok(CapturePoll::event(event)),
+            JsonLinesRead::Item(event) => {
+                self.origin_contract.validate(&event)?;
+                Ok(CapturePoll::event(event))
+            }
             JsonLinesRead::Idle => Ok(CapturePoll::Idle),
             JsonLinesRead::Finished => Ok(CapturePoll::Finished),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureEventFeedOriginContract {
+    Any,
+    RequiredSource(CaptureSource),
+}
+
+impl CaptureEventFeedOriginContract {
+    fn validate(self, event: &CaptureEvent) -> Result<(), CaptureEventFeedReadError> {
+        match self {
+            Self::Any => Ok(()),
+            Self::RequiredSource(expected) => {
+                let actual = capture_event_origin(event).source();
+                if actual == expected {
+                    Ok(())
+                } else {
+                    Err(CaptureEventFeedReadError::SourceMismatch { expected, actual })
+                }
+            }
+        }
+    }
+}
+
+fn capture_event_origin(event: &CaptureEvent) -> CaptureOrigin {
+    match event {
+        CaptureEvent::Bytes(bytes) => bytes.origin,
+        CaptureEvent::Gap(gap) => gap.origin,
+        CaptureEvent::Loss(loss) => loss.origin,
+        CaptureEvent::ConnectionOpened { origin, .. }
+        | CaptureEvent::ConnectionClosed { origin, .. } => *origin,
+    }
+}
+
+#[derive(Debug, Error)]
+enum CaptureEventFeedReadError {
+    #[error(transparent)]
+    JsonLines(#[from] crate::json_lines::JsonLinesError),
+    #[error("capture event feed requires source {expected:?}, got {actual:?}")]
+    SourceMismatch {
+        expected: CaptureSource,
+        actual: CaptureSource,
+    },
 }
 
 impl<R> CaptureProvider for JsonLinesCaptureEventFeedProvider<R>
@@ -186,6 +278,26 @@ mod tests {
     }
 
     #[test]
+    fn l7_mitm_bridge_feed_rejects_non_mitm_sources() -> Result<(), Box<dyn std::error::Error>> {
+        let event = capture_loss_event_with_source(1, CaptureSource::ExternalPlaintextFeed);
+        let input = json_line(&event)?;
+        let mut provider =
+            JsonLinesCaptureEventFeedProvider::l7_mitm_bridge(Cursor::new(input), "fixture", false);
+
+        let error = provider
+            .next()
+            .expect_err("MITM bridge feed must fail closed on mismatched source");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires source L7MitmPlaintext"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rejects_lines_over_the_size_limit() {
         let input = "x".repeat(MAX_CAPTURE_EVENT_FEED_LINE_BYTES + 1);
         let mut provider =
@@ -199,13 +311,17 @@ mod tests {
     }
 
     fn capture_loss_event(lost_events: u64) -> CaptureEvent {
+        capture_loss_event_with_source(lost_events, CaptureSource::EbpfSyscall)
+    }
+
+    fn capture_loss_event_with_source(lost_events: u64, source: CaptureSource) -> CaptureEvent {
         let reason = "deterministic provider loss fixture".to_string();
         CaptureEvent::Loss(CapturedLoss {
             timestamp: Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 2,
             },
-            origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
+            origin: CaptureOrigin::from_source(source),
             enforcement_evidence: EnforcementEvidence::observation_only_with_detail(
                 ObservationOnlyReason::ProviderCaptureLoss,
                 reason.clone(),

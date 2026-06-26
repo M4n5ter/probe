@@ -12,6 +12,7 @@ pub enum PlaintextSource {
     ExternalPlaintextFeed,
     LibsslUprobe,
     TlsSessionSecret,
+    L7MitmPlaintext,
 }
 
 impl PlaintextSource {
@@ -20,6 +21,7 @@ impl PlaintextSource {
             Self::ExternalPlaintextFeed => CaptureSource::ExternalPlaintextFeed,
             Self::LibsslUprobe => CaptureSource::LibsslUprobe,
             Self::TlsSessionSecret => CaptureSource::TlsSessionSecret,
+            Self::L7MitmPlaintext => CaptureSource::L7MitmPlaintext,
         }
     }
 }
@@ -243,25 +245,39 @@ mod tests {
 
     #[test]
     fn plaintext_event_source_controls_capture_source() {
-        let event = PlaintextEvent::bytes(
-            PlaintextSource::TlsSessionSecret,
-            PlaintextChunk::new(
-                Timestamp {
-                    monotonic_ns: 1,
-                    wall_time_unix_ns: 1,
-                },
-                demo_flow(),
-                Direction::Outbound,
-                b"GET / HTTP/1.1\r\n\r\n",
+        for case in [
+            (
+                PlaintextSource::TlsSessionSecret,
+                CaptureSource::TlsSessionSecret,
+                CaptureProviderKind::Plaintext,
             ),
-        );
+            (
+                PlaintextSource::L7MitmPlaintext,
+                CaptureSource::L7MitmPlaintext,
+                CaptureProviderKind::Interception,
+            ),
+        ] {
+            let (plaintext_source, capture_source, provider_kind) = case;
+            let event = PlaintextEvent::bytes(
+                plaintext_source,
+                PlaintextChunk::new(
+                    Timestamp {
+                        monotonic_ns: 1,
+                        wall_time_unix_ns: 1,
+                    },
+                    demo_flow(),
+                    Direction::Outbound,
+                    b"GET / HTTP/1.1\r\n\r\n",
+                ),
+            );
 
-        let CaptureEvent::Bytes(bytes) = CaptureEvent::from(event) else {
-            panic!("expected plaintext bytes");
-        };
+            let CaptureEvent::Bytes(bytes) = CaptureEvent::from(event) else {
+                panic!("expected plaintext bytes");
+            };
 
-        assert_eq!(bytes.origin.source(), CaptureSource::TlsSessionSecret);
-        assert_eq!(bytes.origin.provider(), CaptureProviderKind::Plaintext);
+            assert_eq!(bytes.origin.source(), capture_source);
+            assert_eq!(bytes.origin.provider(), provider_kind);
+        }
     }
 
     fn demo_flow() -> FlowContext {
