@@ -21,7 +21,9 @@ pub use mitm::{
     TransparentInterceptionMitmBackendIntent,
     TransparentInterceptionMitmBackendReadinessProbeConfig,
     TransparentInterceptionMitmBackendReadinessProbeIntent, TransparentInterceptionMitmConfig,
-    TransparentInterceptionMitmIntentViolation, TransparentInterceptionMitmPlaintextBridgeConfig,
+    TransparentInterceptionMitmIntentViolation, TransparentInterceptionMitmManagedProcessConfig,
+    TransparentInterceptionMitmManagedProcessIntent,
+    TransparentInterceptionMitmPlaintextBridgeConfig,
     TransparentInterceptionMitmPlaintextBridgeIntent,
     TransparentInterceptionMitmPlaintextBridgeModeConfig,
 };

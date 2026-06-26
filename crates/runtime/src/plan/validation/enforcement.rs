@@ -147,6 +147,7 @@ mod tests {
         CaptureBackend, CaptureSelection, CompressionCodecName, ConfigValidationError,
         ConnectionEnforcementBackendConfig, ExporterConfig, ExporterTransportConfig,
         TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmBackendReadinessProbeConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
         TransparentInterceptionStrategyConfig,
@@ -788,13 +789,12 @@ mod tests {
 
     fn configure_external_mitm_backend(config: &mut AgentConfig) {
         config.enforcement.interception.mitm.backend =
-            TransparentInterceptionMitmBackendConfig::External;
-        config
-            .enforcement
-            .interception
-            .mitm
-            .backend_readiness_probe
-            .target = Some("127.0.0.1:15002".to_string());
+            TransparentInterceptionMitmBackendConfig::external(
+                TransparentInterceptionMitmBackendReadinessProbeConfig {
+                    target: Some("127.0.0.1:15002".to_string()),
+                    ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+                },
+            );
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.tls.materials = vec![

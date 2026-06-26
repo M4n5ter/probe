@@ -1,10 +1,12 @@
 use std::{fmt, net::SocketAddr, num::NonZeroU16, path::PathBuf};
 
 use probe_config::{
-    AgentConfig, ConnectionEnforcementBackendConfig, EnforcementInterceptionConfig,
-    TlsMaterialKind, TransparentInterceptionDirectionConfig, TransparentInterceptionL7ModeConfig,
-    TransparentInterceptionMitmBackendConfig, TransparentInterceptionMitmBackendIntent,
+    AgentConfig, ConfigError, ConfigValidationError, ConfigViolation,
+    ConnectionEnforcementBackendConfig, EnforcementInterceptionConfig, TlsMaterialKind,
+    TransparentInterceptionDirectionConfig, TransparentInterceptionL7ModeConfig,
+    TransparentInterceptionMitmBackendIntent,
     TransparentInterceptionMitmBackendReadinessProbeIntent,
+    TransparentInterceptionMitmManagedProcessIntent,
     TransparentInterceptionMitmPlaintextBridgeIntent, TransparentInterceptionOutboundProxyIntent,
     TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent,
@@ -291,8 +293,7 @@ impl TransparentInterceptionExecutionPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransparentInterceptionMitmPlan {
-    pub backend: TransparentInterceptionMitmBackendConfig,
-    pub backend_readiness_probe: TransparentInterceptionMitmBackendReadinessProbePlan,
+    pub backend: TransparentInterceptionMitmBackendPlan,
     pub plaintext_bridge: TransparentInterceptionMitmPlaintextBridgePlan,
     pub ca_certificate: Option<TlsMaterialPlan>,
     pub ca_private_key: Option<TlsMaterialPlan>,
@@ -302,19 +303,27 @@ pub struct TransparentInterceptionMitmPlan {
 }
 
 impl TransparentInterceptionMitmPlan {
+    pub fn try_from_config(config: &AgentConfig) -> Result<Self, ConfigValidationError> {
+        config
+            .validate_l7_mitm_contract()
+            .map_err(config_validation_error)?;
+        Ok(Self::from_validated_config(config))
+    }
+
     fn from_config(config: &AgentConfig) -> Self {
+        Self::from_validated_config(config)
+    }
+
+    fn from_validated_config(config: &AgentConfig) -> Self {
         let mitm = &config.enforcement.interception.mitm;
         let materials_by_id = mitm_tls_materials_by_id(&config.tls.materials);
+        let backend_intent = config
+            .enforcement
+            .interception
+            .mitm_backend_intent()
+            .expect("MITM backend contract should be validated before planning");
         Self {
-            backend: mitm.backend,
-            backend_readiness_probe:
-                TransparentInterceptionMitmBackendReadinessProbePlan::from_intent(
-                    config
-                        .enforcement
-                        .interception
-                        .mitm_backend_intent()
-                        .expect("MITM backend contract should be validated before planning"),
-                ),
+            backend: TransparentInterceptionMitmBackendPlan::from_intent(backend_intent),
             plaintext_bridge: TransparentInterceptionMitmPlaintextBridgePlan::from_intent(
                 config
                     .enforcement
@@ -357,10 +366,74 @@ impl TransparentInterceptionMitmPlan {
     }
 }
 
+fn config_validation_error(error: ConfigError) -> ConfigValidationError {
+    match error {
+        ConfigError::Validation(error) => error,
+        ConfigError::Toml(error) => ConfigValidationError::new(vec![ConfigViolation {
+            field: "config".to_string(),
+            reason: error.to_string(),
+        }]),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum TransparentInterceptionMitmBackendPlan {
+    Disabled,
+    External {
+        readiness_probe: TransparentInterceptionMitmBackendReadinessProbePlan,
+    },
+    ManagedProcess {
+        process: TransparentInterceptionMitmManagedProcessPlan,
+        readiness_probe: TransparentInterceptionMitmBackendReadinessProbePlan,
+    },
+}
+
+impl TransparentInterceptionMitmBackendPlan {
+    fn from_intent(intent: TransparentInterceptionMitmBackendIntent) -> Self {
+        match intent {
+            TransparentInterceptionMitmBackendIntent::Disabled => Self::Disabled,
+            TransparentInterceptionMitmBackendIntent::External { readiness_probe } => {
+                Self::External {
+                    readiness_probe:
+                        TransparentInterceptionMitmBackendReadinessProbePlan::from_intent(
+                            readiness_probe,
+                        ),
+                }
+            }
+            TransparentInterceptionMitmBackendIntent::ManagedProcess {
+                process,
+                readiness_probe,
+            } => Self::ManagedProcess {
+                process: TransparentInterceptionMitmManagedProcessPlan::from_intent(process),
+                readiness_probe: TransparentInterceptionMitmBackendReadinessProbePlan::from_intent(
+                    readiness_probe,
+                ),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionMitmManagedProcessPlan {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub working_dir: Option<PathBuf>,
+}
+
+impl TransparentInterceptionMitmManagedProcessPlan {
+    fn from_intent(intent: TransparentInterceptionMitmManagedProcessIntent) -> Self {
+        Self {
+            program: intent.program,
+            args: intent.args,
+            working_dir: intent.working_dir,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "mode")]
 pub enum TransparentInterceptionMitmBackendReadinessProbePlan {
-    Disabled,
     TcpConnect {
         target: SocketAddr,
         interval_ms: u64,
@@ -370,24 +443,19 @@ pub enum TransparentInterceptionMitmBackendReadinessProbePlan {
 }
 
 impl TransparentInterceptionMitmBackendReadinessProbePlan {
-    fn from_intent(intent: TransparentInterceptionMitmBackendIntent) -> Self {
+    fn from_intent(intent: TransparentInterceptionMitmBackendReadinessProbeIntent) -> Self {
         match intent {
-            TransparentInterceptionMitmBackendIntent::Disabled => Self::Disabled,
-            TransparentInterceptionMitmBackendIntent::External { readiness_probe } => {
-                match readiness_probe {
-                    TransparentInterceptionMitmBackendReadinessProbeIntent::TcpConnect {
-                        target,
-                        interval_ms,
-                        timeout_ms,
-                        failure_threshold,
-                    } => Self::TcpConnect {
-                        target,
-                        interval_ms,
-                        timeout_ms,
-                        failure_threshold,
-                    },
-                }
-            }
+            TransparentInterceptionMitmBackendReadinessProbeIntent::TcpConnect {
+                target,
+                interval_ms,
+                timeout_ms,
+                failure_threshold,
+            } => Self::TcpConnect {
+                target,
+                interval_ms,
+                timeout_ms,
+                failure_threshold,
+            },
         }
     }
 }
@@ -757,6 +825,8 @@ mod tests {
     use probe_config::{
         AgentConfig, ConnectionEnforcementBackendConfig, TlsMaterialConfig, TlsMaterialKind,
         TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmBackendReadinessProbeConfig,
+        TransparentInterceptionMitmManagedProcessConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionStrategyConfig,
     };
@@ -1017,15 +1087,13 @@ mod tests {
         );
         assert_eq!(
             plan.interception.mitm.backend,
-            TransparentInterceptionMitmBackendConfig::External
-        );
-        assert_eq!(
-            plan.interception.mitm.backend_readiness_probe,
-            TransparentInterceptionMitmBackendReadinessProbePlan::TcpConnect {
-                target: "127.0.0.1:15002".parse()?,
-                interval_ms: 1_000,
-                timeout_ms: 200,
-                failure_threshold: 3,
+            TransparentInterceptionMitmBackendPlan::External {
+                readiness_probe: TransparentInterceptionMitmBackendReadinessProbePlan::TcpConnect {
+                    target: "127.0.0.1:15002".parse()?,
+                    interval_ms: 1_000,
+                    timeout_ms: 200,
+                    failure_threshold: 3,
+                },
             }
         );
         assert_eq!(
@@ -1052,6 +1120,53 @@ mod tests {
             plan.interception.execution.outbound_redirect_plan(),
             TransparentInterceptionOutboundRedirectPlan::Planned { .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn enforcement_plan_preserves_managed_process_mitm_backend()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_managed_process_mitm_backend(&mut config);
+        let capabilities = CapabilityMatrix::new([
+            CapabilityState::available(CapabilityKind::TransparentInterception),
+            CapabilityState::available(CapabilityKind::L7Mitm),
+        ]);
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        let TransparentInterceptionMitmBackendPlan::ManagedProcess {
+            process,
+            readiness_probe,
+        } = &plan.interception.mitm.backend
+        else {
+            panic!(
+                "managed MITM backend plan should be preserved: {:?}",
+                plan.interception.mitm.backend
+            );
+        };
+        assert_eq!(
+            readiness_probe,
+            &TransparentInterceptionMitmBackendReadinessProbePlan::TcpConnect {
+                target: "127.0.0.1:15002".parse()?,
+                interval_ms: 1_000,
+                timeout_ms: 200,
+                failure_threshold: 3,
+            }
+        );
+        assert_eq!(
+            process.program,
+            PathBuf::from("/usr/local/bin/sssa-mitm-proxy")
+        );
+        assert_eq!(
+            process.args,
+            vec!["--listen".to_string(), "127.0.0.1:15002".to_string()]
+        );
+        assert_eq!(process.working_dir, Some(PathBuf::from("/run/sssa")));
         Ok(())
     }
 
@@ -1249,13 +1364,16 @@ mod tests {
 
     fn configure_external_mitm_backend(config: &mut AgentConfig) {
         config.enforcement.interception.mitm.backend =
-            TransparentInterceptionMitmBackendConfig::External;
-        config
-            .enforcement
-            .interception
-            .mitm
-            .backend_readiness_probe
-            .target = Some("127.0.0.1:15002".to_string());
+            TransparentInterceptionMitmBackendConfig::external(
+                TransparentInterceptionMitmBackendReadinessProbeConfig {
+                    target: Some("127.0.0.1:15002".to_string()),
+                    ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+                },
+            );
+        configure_mitm_materials(config);
+    }
+
+    fn configure_mitm_materials(config: &mut AgentConfig) {
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.tls.materials = vec![
@@ -1270,5 +1388,20 @@ mod tests {
                 path: "/etc/sssa/mitm-ca.key".into(),
             },
         ];
+    }
+
+    fn configure_managed_process_mitm_backend(config: &mut AgentConfig) {
+        let readiness_probe = TransparentInterceptionMitmBackendReadinessProbeConfig {
+            target: Some("127.0.0.1:15002".to_string()),
+            ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+        };
+        let process = TransparentInterceptionMitmManagedProcessConfig {
+            program: Some("/usr/local/bin/sssa-mitm-proxy".into()),
+            args: vec!["--listen".to_string(), "127.0.0.1:15002".to_string()],
+            working_dir: Some("/run/sssa".into()),
+        };
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::managed_process(readiness_probe, process);
+        configure_mitm_materials(config);
     }
 }

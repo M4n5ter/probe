@@ -29,7 +29,7 @@ use crate::{
         ExportDrainError, ExportWorker, ExportWorkerConfig,
         drain_planned_sinks_with_webhook_connection,
     },
-    l7_mitm::{L7MitmBackendHealthProbeGuard, L7MitmRuntimeHandle},
+    l7_mitm::{L7MitmBackendLifecycleGuard, L7MitmRuntime, start_backend_lifecycle},
     runtime_composition::build_runtime_composition,
     shutdown,
     storage_retention::{
@@ -114,7 +114,6 @@ pub(crate) async fn run_live_agent(
             )
         })
         .transpose()?;
-    let l7_mitm_health_probe = l7_mitm.start_backend_health_probe();
     let export_worker = export_worker.map(|worker| worker.spawn(Arc::clone(&spool)));
     let storage_retention_config = storage_retention_worker_config_from_plan(&plan);
     println!(
@@ -137,7 +136,7 @@ pub(crate) async fn run_live_agent(
         capture_provider_preflight,
         capture_runtime,
         tls_plaintext_runtime,
-        l7_mitm_runtime,
+        l7_mitm,
         storage_retention_config,
         shutdown_requested: Arc::clone(&shutdown_requested),
         max_events,
@@ -151,15 +150,24 @@ pub(crate) async fn run_live_agent(
     if let Some(worker) = export_worker {
         worker.stop().await;
     }
-    let (summary_result, interception_cleanup_result, storage_retention_worker) = match blocking_run
-    {
-        Ok(output) => (
-            output.summary_result,
-            output.interception_cleanup_result,
-            output.storage_retention_worker,
-        ),
+    let (
+        summary_result,
+        interception_cleanup_result,
+        l7_mitm_cleanup_result,
+        storage_retention_worker,
+    ) = match blocking_run {
+        Ok(output) => {
+            let l7_mitm_cleanup_result = output.l7_mitm_cleanup_result;
+            (
+                output.summary_result,
+                output.interception_cleanup_result,
+                l7_mitm_cleanup_result,
+                output.storage_retention_worker,
+            )
+        }
         Err(error) => (
             Err(AgentError::CaptureTaskJoin(error.to_string())),
+            Ok(()),
             Ok(()),
             None,
         ),
@@ -167,7 +175,6 @@ pub(crate) async fn run_live_agent(
     if let Some(worker) = storage_retention_worker {
         worker.stop().await;
     }
-    let l7_mitm_health_result = stop_l7_mitm_backend_health_probe(l7_mitm_health_probe);
     let drain_result = drain_planned_sinks_with_webhook_connection(
         spool.as_ref(),
         &plan.config.agent_id,
@@ -178,7 +185,7 @@ pub(crate) async fn run_live_agent(
     let summary = merge_run_results(
         summary_result,
         interception_cleanup_result,
-        l7_mitm_health_result,
+        l7_mitm_cleanup_result,
         drain_result,
     )?;
     println!(
@@ -203,7 +210,7 @@ struct BlockingCaptureRun {
     capture_provider_preflight: CaptureProviderPreflight,
     capture_runtime: CaptureProviderRuntimeState,
     tls_plaintext_runtime: TlsPlaintextRuntimeState,
-    l7_mitm_runtime: L7MitmRuntimeHandle,
+    l7_mitm: L7MitmRuntime,
     storage_retention_config: Option<StorageRetentionWorkerConfig>,
     shutdown_requested: shutdown::ShutdownFlag,
     max_events: Option<u64>,
@@ -214,6 +221,7 @@ struct BlockingCaptureRunOutput {
     summary_result: Result<PipelineSummary, AgentError>,
     interception_cleanup_result:
         Result<(), crate::transparent_interception::TransparentInterceptionError>,
+    l7_mitm_cleanup_result: Result<(), AgentError>,
     storage_retention_worker: Option<StorageRetentionWorkerHandle>,
 }
 
@@ -230,14 +238,15 @@ impl BlockingCaptureRun {
             capture_provider_preflight,
             capture_runtime,
             tls_plaintext_runtime,
-            l7_mitm_runtime,
+            l7_mitm,
             mut storage_retention_config,
             shutdown_requested,
             max_events,
             readiness,
         } = self;
-        let mut transparent_interception_guard = None;
+        let mut active_interception_guard = ActiveInterceptionGuard::default();
         let mut storage_retention_worker = None;
+        let l7_mitm_runtime = l7_mitm.handle();
         let summary_result = (|| {
             let mut parser_factory = Http1ParserFactory::default();
             let mut pipeline = CapturePipeline::new(
@@ -256,8 +265,12 @@ impl BlockingCaptureRun {
                 .take()
                 .map(|config| spawn_storage_retention_workers(Arc::clone(&spool), config));
             let mut pipeline = pipeline.with_enforcement_planner(&mut enforcement_planner);
-            transparent_interception_guard =
-                transparent_interception.activate(transparent_interception_setup_scope)?;
+            active_interception_guard.l7_mitm_backend = start_backend_lifecycle(
+                &plan.enforcement.interception.mitm.backend,
+                l7_mitm_runtime.clone(),
+                &shutdown_requested,
+            )
+            .map_err(AgentError::L7MitmRuntime)?;
             let built_provider = build_capture_provider(
                 &plan,
                 Some(&tls_plaintext_runtime),
@@ -266,6 +279,8 @@ impl BlockingCaptureRun {
             )?;
             capture_runtime.record(built_provider.runtime);
             let mut provider = built_provider.provider;
+            active_interception_guard.transparent_interception =
+                transparent_interception.activate(transparent_interception_setup_scope)?;
             signal_readiness(readiness)?;
             let capture_summary = pipeline.run_provider_with_options(
                 provider.as_mut(),
@@ -277,31 +292,60 @@ impl BlockingCaptureRun {
             summary.merge(capture_summary);
             Ok::<_, AgentError>(summary)
         })();
-        let interception_cleanup_result =
-            deactivate_transparent_interception_guard(transparent_interception_guard);
+        let (interception_cleanup_result, l7_mitm_cleanup_result) =
+            active_interception_guard.stop();
         BlockingCaptureRunOutput {
             summary_result,
             interception_cleanup_result,
+            l7_mitm_cleanup_result,
             storage_retention_worker,
         }
     }
 }
 
-fn deactivate_transparent_interception_guard(
-    guard: Option<TransparentInterceptionGuard>,
-) -> Result<(), crate::transparent_interception::TransparentInterceptionError> {
-    match guard {
-        Some(guard) => guard.deactivate(),
-        None => Ok(()),
+#[derive(Default)]
+struct ActiveInterceptionGuard {
+    transparent_interception: Option<TransparentInterceptionGuard>,
+    l7_mitm_backend: Option<L7MitmBackendLifecycleGuard>,
+}
+
+impl ActiveInterceptionGuard {
+    fn stop(
+        mut self,
+    ) -> (
+        Result<(), crate::transparent_interception::TransparentInterceptionError>,
+        Result<(), AgentError>,
+    ) {
+        self.stop_inner()
+    }
+
+    fn stop_inner(
+        &mut self,
+    ) -> (
+        Result<(), crate::transparent_interception::TransparentInterceptionError>,
+        Result<(), AgentError>,
+    ) {
+        let interception_result = match self.transparent_interception.take() {
+            Some(guard) => guard.deactivate(),
+            None => Ok(()),
+        };
+        let l7_mitm_result = match self.l7_mitm_backend.take() {
+            Some(guard) => guard.stop().map_err(AgentError::L7MitmRuntime),
+            None => Ok(()),
+        };
+        (interception_result, l7_mitm_result)
     }
 }
 
-fn stop_l7_mitm_backend_health_probe(
-    guard: Option<L7MitmBackendHealthProbeGuard>,
-) -> Result<(), AgentError> {
-    match guard {
-        Some(guard) => guard.stop().map_err(AgentError::L7MitmRuntime),
-        None => Ok(()),
+impl Drop for ActiveInterceptionGuard {
+    fn drop(&mut self) {
+        let (interception_result, l7_mitm_result) = self.stop_inner();
+        if let Err(error) = interception_result {
+            eprintln!("transparent interception cleanup failed during drop: {error}");
+        }
+        if let Err(error) = l7_mitm_result {
+            eprintln!("L7 MITM backend cleanup failed during drop: {error}");
+        }
     }
 }
 
@@ -331,7 +375,7 @@ fn merge_run_results(
         (),
         crate::transparent_interception::TransparentInterceptionError,
     >,
-    l7_mitm_health_result: Result<(), AgentError>,
+    l7_mitm_backend_lifecycle_cleanup_result: Result<(), AgentError>,
     drain_result: Result<(), ExportDrainError>,
 ) -> Result<PipelineSummary, AgentError> {
     let summary = match summary_result {
@@ -342,9 +386,9 @@ fn merge_run_results(
                     "transparent interception cleanup failed after run error: {cleanup_error}"
                 );
             }
-            if let Err(health_error) = l7_mitm_health_result {
+            if let Err(l7_mitm_error) = l7_mitm_backend_lifecycle_cleanup_result {
                 eprintln!(
-                    "L7 MITM backend health probe cleanup failed after run error: {health_error}"
+                    "L7 MITM backend lifecycle cleanup failed after run error: {l7_mitm_error}"
                 );
             }
             if let Err(export_error) = drain_result {
@@ -354,9 +398,9 @@ fn merge_run_results(
         }
     };
     if let Err(cleanup_error) = interception_cleanup_result {
-        if let Err(health_error) = l7_mitm_health_result {
+        if let Err(l7_mitm_error) = l7_mitm_backend_lifecycle_cleanup_result {
             eprintln!(
-                "L7 MITM backend health probe cleanup failed after transparent interception cleanup error: {health_error}"
+                "L7 MITM backend lifecycle cleanup failed after transparent interception cleanup error: {l7_mitm_error}"
             );
         }
         if let Err(export_error) = drain_result {
@@ -367,13 +411,13 @@ fn merge_run_results(
         }
         return Err(cleanup_error.into());
     }
-    if let Err(health_error) = l7_mitm_health_result {
+    if let Err(l7_mitm_error) = l7_mitm_backend_lifecycle_cleanup_result {
         if let Err(export_error) = drain_result {
             eprintln!(
-                "tail export drain failed after L7 MITM backend health cleanup error: {export_error}"
+                "tail export drain failed after L7 MITM backend lifecycle cleanup error: {export_error}"
             );
         }
-        return Err(health_error);
+        return Err(l7_mitm_error);
     }
     if let Err(export_error) = drain_result {
         return Err(export_error.into());

@@ -40,16 +40,6 @@ impl TcpHealthProbePlan {
     pub(crate) fn target(&self) -> SocketAddr {
         self.target
     }
-
-    #[cfg(test)]
-    pub(crate) fn interval(&self) -> Duration {
-        self.interval
-    }
-
-    #[cfg(test)]
-    pub(crate) fn timeout(&self) -> Duration {
-        self.timeout
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

@@ -11,8 +11,10 @@ use std::{
 use capture::{CaptureEvent, CapturedBytes, EnforcementEvidencePropagation};
 use probe_config::{
     AgentConfig, CaptureSelection, PolicyConfig, TlsMaterialConfig, TlsMaterialKind,
-    TransparentInterceptionMitmBackendConfig, TransparentInterceptionMitmPlaintextBridgeModeConfig,
-    TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
+    TransparentInterceptionMitmBackendConfig,
+    TransparentInterceptionMitmBackendReadinessProbeConfig,
+    TransparentInterceptionMitmPlaintextBridgeModeConfig, TransparentInterceptionProxyModeConfig,
+    TransparentInterceptionStrategyConfig,
 };
 use probe_core::{
     AddressPort, CaptureOrigin, CaptureProviderKind, CaptureSource, Direction, EnforcementEvidence,
@@ -246,13 +248,12 @@ fn write_agent_config(inputs: AgentConfigInputs<'_>) -> Result<(), Box<dyn std::
         },
     ));
     config.enforcement.interception.mitm.backend =
-        TransparentInterceptionMitmBackendConfig::External;
-    config
-        .enforcement
-        .interception
-        .mitm
-        .backend_readiness_probe
-        .target = Some(inputs.mitm_backend_target);
+        TransparentInterceptionMitmBackendConfig::external(
+            TransparentInterceptionMitmBackendReadinessProbeConfig {
+                target: Some(inputs.mitm_backend_target),
+                ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+            },
+        );
     config.enforcement.interception.mitm.plaintext_bridge.mode =
         TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
     config.enforcement.interception.mitm.plaintext_bridge.path =

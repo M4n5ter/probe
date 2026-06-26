@@ -153,6 +153,8 @@ mod tests {
     use probe_config::{
         CaptureSelection, TlsMaterialConfig, TlsMaterialKind,
         TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmBackendReadinessProbeConfig,
+        TransparentInterceptionMitmManagedProcessConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionStrategyConfig,
     };
@@ -267,6 +269,53 @@ mod tests {
     }
 
     #[test]
+    fn l7_mitm_capability_ignores_transparent_proxy_contract_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let mut config = AgentConfig::default();
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm;
+        config.enforcement.interception.proxy.mode =
+            probe_config::TransparentInterceptionProxyModeConfig::ManagedTcpRelay;
+        let target = listener.local_addr()?;
+        config.enforcement.interception.proxy.listen_port = Some(target.port());
+        configure_external_mitm_backend(&mut config, target);
+
+        let capabilities = capability_matrix_for_config(&config);
+        let l7_mitm = capabilities
+            .reported_state(CapabilityKind::L7Mitm)
+            .expect("L7 MITM capability should be reported");
+
+        assert_eq!(l7_mitm.mode, RuntimeMode::Available);
+        Ok(())
+    }
+
+    #[test]
+    fn managed_process_mitm_contract_reports_l7_mitm_available()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_managed_process_mitm_backend(&mut config)?;
+
+        let capabilities = capability_matrix_for_config(&config);
+        let l7_mitm = capabilities
+            .reported_state(CapabilityKind::L7Mitm)
+            .expect("L7 MITM capability should be reported");
+
+        assert_eq!(l7_mitm.mode, RuntimeMode::Available);
+        assert!(
+            l7_mitm
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("agent-managed selector-scoped")),
+            "{l7_mitm:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn missing_external_mitm_plaintext_bridge_openability_is_deferred_to_capture_preflight()
     -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -303,13 +352,12 @@ mod tests {
             TransparentInterceptionStrategyConfig::InboundTproxyMitm;
         config.enforcement.interception.proxy.listen_port = Some(15002);
         config.enforcement.interception.mitm.backend =
-            TransparentInterceptionMitmBackendConfig::External;
-        config
-            .enforcement
-            .interception
-            .mitm
-            .backend_readiness_probe
-            .target = Some("127.0.0.1:15002".to_string());
+            TransparentInterceptionMitmBackendConfig::external(
+                TransparentInterceptionMitmBackendReadinessProbeConfig {
+                    target: Some("127.0.0.1:15002".to_string()),
+                    ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+                },
+            );
         config.enforcement.interception.mitm.ca_certificate_ref = Some("missing-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref =
             Some("missing-ca-key".to_string());
@@ -330,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn mitm_strategy_without_external_backend_reports_l7_mitm_unavailable() {
+    fn mitm_strategy_without_explicit_backend_reports_l7_mitm_unavailable() {
         let mut config = AgentConfig::default();
         config.enforcement.interception.strategy =
             TransparentInterceptionStrategyConfig::InboundTproxyMitm;
@@ -342,12 +390,9 @@ mod tests {
             .expect("L7 MITM capability should be reported");
 
         assert_eq!(l7_mitm.mode, RuntimeMode::Unavailable);
-        assert!(
-            l7_mitm
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("backend = \"external\""))
-        );
+        assert!(l7_mitm.reason.as_deref().is_some_and(|reason| {
+            reason.contains("backend.mode = \"external\" or \"managed_process\"")
+        }));
     }
 
     fn test_platform_probes() -> PlatformProbeResults {
@@ -375,13 +420,16 @@ mod tests {
 
     fn configure_external_mitm_backend(config: &mut AgentConfig, target: SocketAddr) {
         config.enforcement.interception.mitm.backend =
-            TransparentInterceptionMitmBackendConfig::External;
-        config
-            .enforcement
-            .interception
-            .mitm
-            .backend_readiness_probe
-            .target = Some(target.to_string());
+            TransparentInterceptionMitmBackendConfig::external(
+                TransparentInterceptionMitmBackendReadinessProbeConfig {
+                    target: Some(target.to_string()),
+                    ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+                },
+            );
+        configure_mitm_materials(config);
+    }
+
+    fn configure_mitm_materials(config: &mut AgentConfig) {
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.tls.materials = vec![
@@ -396,6 +444,27 @@ mod tests {
                 path: "/etc/sssa/mitm-ca.key".into(),
             },
         ];
+    }
+
+    fn configure_managed_process_mitm_backend(
+        config: &mut AgentConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let target: SocketAddr = "127.0.0.1:15002"
+            .parse()
+            .expect("test MITM target should parse");
+        let readiness_probe = TransparentInterceptionMitmBackendReadinessProbeConfig {
+            target: Some(target.to_string()),
+            ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+        };
+        let process = TransparentInterceptionMitmManagedProcessConfig {
+            program: Some(std::env::current_exe()?),
+            args: vec!["--listen".to_string(), "127.0.0.1:15002".to_string()],
+            working_dir: None,
+        };
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::managed_process(readiness_probe, process);
+        configure_mitm_materials(config);
+        Ok(())
     }
 
     fn missing_bridge_path() -> Result<std::path::PathBuf, std::io::Error> {

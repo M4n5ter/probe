@@ -190,12 +190,14 @@ self_bypass = "uses_reserved_mark"
 listen_port = 15002
 
 [enforcement.interception.mitm]
-backend = "external"
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
 upstream_trust_anchor_refs = ["upstream-ca"]
 
-[enforcement.interception.mitm.backend_readiness_probe]
+[enforcement.interception.mitm.backend]
+mode = "external"
+
+[enforcement.interception.mitm.backend.readiness_probe]
 target = "127.0.0.1:15002"
 timeout_ms = 250
 
@@ -217,6 +219,180 @@ path = "/etc/sssa/upstream-ca.pem"
     )?;
 
     config.validate_basic()?;
+    Ok(())
+}
+
+#[test]
+fn validation_accepts_managed_process_mitm_backend_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+ca_certificate_ref = "mitm-ca"
+ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.backend]
+mode = "managed_process"
+
+[enforcement.interception.mitm.backend.readiness_probe]
+target = "127.0.0.1:15002"
+timeout_ms = 250
+
+[enforcement.interception.mitm.backend.process]
+program = "/usr/local/bin/sssa-mitm-proxy"
+args = ["--listen", "127.0.0.1:15002"]
+
+[[tls.materials]]
+id = "mitm-ca"
+kind = "mitm_ca_certificate"
+path = "/etc/sssa/mitm-ca.pem"
+
+[[tls.materials]]
+id = "mitm-ca-key"
+kind = "mitm_ca_private_key"
+path = "/etc/sssa/mitm-ca.key"
+"#,
+    )?;
+
+    config.validate_basic()?;
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_incomplete_managed_process_mitm_backend_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let missing_program = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+ca_certificate_ref = "mitm-ca"
+ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.backend]
+mode = "managed_process"
+
+[enforcement.interception.mitm.backend.readiness_probe]
+target = "127.0.0.1:15002"
+
+[[tls.materials]]
+id = "mitm-ca"
+kind = "mitm_ca_certificate"
+path = "/etc/sssa/mitm-ca.pem"
+
+[[tls.materials]]
+id = "mitm-ca-key"
+kind = "mitm_ca_private_key"
+path = "/etc/sssa/mitm-ca.key"
+"#,
+    )?;
+    let error = missing_program
+        .validate_basic()
+        .expect_err("managed MITM backend must require a program");
+    let violations = validation_violations(&error);
+
+    assert!(violations.iter().any(|violation| violation.field
+        == "enforcement.interception.mitm.backend.process.program"
+        && violation.reason.contains("requires a program path")));
+
+    let external_with_managed_process = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+ca_certificate_ref = "mitm-ca"
+ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.backend]
+mode = "external"
+
+[enforcement.interception.mitm.backend.readiness_probe]
+target = "127.0.0.1:15002"
+
+[enforcement.interception.mitm.backend.process]
+program = "/usr/local/bin/sssa-mitm-proxy"
+
+[[tls.materials]]
+id = "mitm-ca"
+kind = "mitm_ca_certificate"
+path = "/etc/sssa/mitm-ca.pem"
+
+[[tls.materials]]
+id = "mitm-ca-key"
+kind = "mitm_ca_private_key"
+path = "/etc/sssa/mitm-ca.key"
+"#,
+    )
+    .expect_err("external MITM backend must not accept managed process payload");
+
+    assert!(
+        external_with_managed_process
+            .to_string()
+            .contains("unknown field")
+    );
+
+    let relative_paths = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+ca_certificate_ref = "mitm-ca"
+ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.backend]
+mode = "managed_process"
+
+[enforcement.interception.mitm.backend.readiness_probe]
+target = "127.0.0.1:15002"
+
+[enforcement.interception.mitm.backend.process]
+program = "sssa-mitm-proxy"
+working_dir = "run/sssa"
+
+[[tls.materials]]
+id = "mitm-ca"
+kind = "mitm_ca_certificate"
+path = "/etc/sssa/mitm-ca.pem"
+
+[[tls.materials]]
+id = "mitm-ca-key"
+kind = "mitm_ca_private_key"
+path = "/etc/sssa/mitm-ca.key"
+"#,
+    )?;
+    let error = relative_paths
+        .validate_basic()
+        .expect_err("managed MITM backend paths must be absolute");
+    let violations = validation_violations(&error);
+
+    assert!(violations.iter().any(|violation| violation.field
+        == "enforcement.interception.mitm.backend.process.program"
+        && violation.reason.contains("must be absolute")));
+    assert!(violations.iter().any(|violation| violation.field
+        == "enforcement.interception.mitm.backend.process.working_dir"
+        && violation.reason.contains("must be absolute")));
     Ok(())
 }
 
@@ -317,9 +493,11 @@ mode = "external"
 listen_port = 15002
 
 [enforcement.interception.mitm]
-backend = "external"
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.backend]
+mode = "external"
 
 [[tls.materials]]
 id = "mitm-ca"
@@ -339,7 +517,7 @@ path = "/etc/sssa/mitm-ca.key"
     let violations = validation_violations(&error);
 
     assert!(violations.iter().any(|violation| violation.field
-        == "enforcement.interception.mitm.backend_readiness_probe.target"));
+        == "enforcement.interception.mitm.backend.readiness_probe.target"));
     Ok(())
 }
 
@@ -356,11 +534,13 @@ mode = "external"
 listen_port = 15002
 
 [enforcement.interception.mitm]
-backend = "external"
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
 
-[enforcement.interception.mitm.backend_readiness_probe]
+[enforcement.interception.mitm.backend]
+mode = "external"
+
+[enforcement.interception.mitm.backend.readiness_probe]
 target = "localhost:15002"
 timeout_ms = 0
 
@@ -382,10 +562,10 @@ path = "/etc/sssa/mitm-ca.key"
     let violations = validation_violations(&error);
 
     assert!(violations.iter().any(|violation| violation.field
-        == "enforcement.interception.mitm.backend_readiness_probe.target"
+        == "enforcement.interception.mitm.backend.readiness_probe.target"
         && violation.reason.contains("IP socket address")));
     assert!(violations.iter().any(|violation| violation.field
-        == "enforcement.interception.mitm.backend_readiness_probe.timeout_ms"));
+        == "enforcement.interception.mitm.backend.readiness_probe.timeout_ms"));
     Ok(())
 }
 
@@ -402,11 +582,13 @@ mode = "external"
 listen_port = 15002
 
 [enforcement.interception.mitm]
-backend = "external"
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
 
-[enforcement.interception.mitm.backend_readiness_probe]
+[enforcement.interception.mitm.backend]
+mode = "external"
+
+[enforcement.interception.mitm.backend.readiness_probe]
 target = "192.0.2.10:15003"
 
 [[tls.materials]]
@@ -427,10 +609,10 @@ path = "/etc/sssa/mitm-ca.key"
     let violations = validation_violations(&error);
 
     assert!(violations.iter().any(|violation| violation.field
-        == "enforcement.interception.mitm.backend_readiness_probe.target"
+        == "enforcement.interception.mitm.backend.readiness_probe.target"
         && violation.reason.contains("loopback IP address")));
     assert!(violations.iter().any(|violation| {
-        violation.field == "enforcement.interception.mitm.backend_readiness_probe.target"
+        violation.field == "enforcement.interception.mitm.backend.readiness_probe.target"
             && violation
                 .reason
                 .contains("target port must match proxy listen_port")
@@ -475,11 +657,13 @@ mode = "external"
 listen_port = 15002
 
 [enforcement.interception.mitm]
-backend = "external"
 ca_certificate_ref = "collector-ca"
 ca_private_key_ref = "mitm-ca-key"
 
-[enforcement.interception.mitm.backend_readiness_probe]
+[enforcement.interception.mitm.backend]
+mode = "external"
+
+[enforcement.interception.mitm.backend.readiness_probe]
 target = "127.0.0.1:15002"
 
 [[tls.materials]]
@@ -605,11 +789,13 @@ mode = "external"
 listen_port = 15002
 
 [enforcement.interception.mitm]
-backend = "external"
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
 
-[enforcement.interception.mitm.backend_readiness_probe]
+[enforcement.interception.mitm.backend]
+mode = "external"
+
+[enforcement.interception.mitm.backend.readiness_probe]
 target = "127.0.0.1:15002"
 
 {bridge}

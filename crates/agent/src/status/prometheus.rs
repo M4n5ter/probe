@@ -253,9 +253,9 @@ fn write_l7_mitm(output: &mut String, snapshot: &AgentStatusSnapshot) {
     write_tcp_health(
         output,
         "sssa_l7_mitm_backend_health_mode",
-        "External L7 MITM backend health probe mode as a one-hot gauge.",
+        "L7 MITM backend health probe mode as a one-hot gauge.",
         "sssa_l7_mitm_backend_health_checks_total",
-        "External L7 MITM backend health probe checks by outcome.",
+        "L7 MITM backend health probe checks by outcome.",
         &L7_MITM_BACKEND_HEALTH_MODES,
         metrics.backend_health,
     );
@@ -264,7 +264,7 @@ fn write_l7_mitm(output: &mut String, snapshot: &AgentStatusSnapshot) {
         output,
         "sssa_l7_mitm_plaintext_bridge_mode",
         "gauge",
-        "External L7 MITM plaintext bridge runtime mode as a one-hot gauge.",
+        "L7 MITM plaintext bridge runtime mode as a one-hot gauge.",
     );
     for mode in L7_MITM_PLAINTEXT_BRIDGE_MODES {
         write_sample(

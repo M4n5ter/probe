@@ -18,11 +18,13 @@ pub use enforcement::{
     EnforcementCapabilityPlan, EnforcementConnectionPlan, EnforcementExecutionSurface,
     EnforcementInterceptionPlan, EnforcementPlan, RequiredCapabilityPlan,
     TransparentInterceptionClassificationPlan, TransparentInterceptionExecutionPlan,
-    TransparentInterceptionInboundTproxyPlan, TransparentInterceptionMitmBackendReadinessProbePlan,
-    TransparentInterceptionMitmPlaintextBridgePlan, TransparentInterceptionMitmPlan,
-    TransparentInterceptionNftablesPlan, TransparentInterceptionOutboundProxyPlan,
-    TransparentInterceptionOutboundRedirectPlan, TransparentInterceptionProxyHealthProbePlan,
-    TransparentInterceptionProxyPlan, TransparentInterceptionProxyPlanError,
+    TransparentInterceptionInboundTproxyPlan, TransparentInterceptionMitmBackendPlan,
+    TransparentInterceptionMitmBackendReadinessProbePlan,
+    TransparentInterceptionMitmManagedProcessPlan, TransparentInterceptionMitmPlaintextBridgePlan,
+    TransparentInterceptionMitmPlan, TransparentInterceptionNftablesPlan,
+    TransparentInterceptionOutboundProxyPlan, TransparentInterceptionOutboundRedirectPlan,
+    TransparentInterceptionProxyHealthProbePlan, TransparentInterceptionProxyPlan,
+    TransparentInterceptionProxyPlanError,
 };
 pub use enforcement_policy_source::{EnforcementPolicySourceKind, EnforcementPolicySourcePlan};
 pub use error::RuntimeError;

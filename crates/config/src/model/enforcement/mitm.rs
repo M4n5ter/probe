@@ -40,7 +40,6 @@ pub const MAX_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD: u32 =
 #[serde(default, deny_unknown_fields)]
 pub struct TransparentInterceptionMitmConfig {
     pub backend: TransparentInterceptionMitmBackendConfig,
-    pub backend_readiness_probe: TransparentInterceptionMitmBackendReadinessProbeConfig,
     pub plaintext_bridge: TransparentInterceptionMitmPlaintextBridgeConfig,
     pub ca_certificate_ref: Option<String>,
     pub ca_private_key_ref: Option<String>,
@@ -51,8 +50,7 @@ pub struct TransparentInterceptionMitmConfig {
 
 impl TransparentInterceptionMitmConfig {
     pub fn is_configured(&self) -> bool {
-        self.backend != TransparentInterceptionMitmBackendConfig::None
-            || self.backend_readiness_probe.is_configured()
+        self.backend.is_configured()
             || self.plaintext_bridge.is_configured()
             || self.ca_certificate_ref.is_some()
             || self.ca_private_key_ref.is_some()
@@ -100,12 +98,57 @@ impl Default for TransparentInterceptionMitmBackendReadinessProbeConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TransparentInterceptionMitmBackendConfig {
     #[default]
-    None,
-    External,
+    Disabled,
+    External {
+        #[serde(default)]
+        readiness_probe: TransparentInterceptionMitmBackendReadinessProbeConfig,
+    },
+    ManagedProcess {
+        #[serde(default)]
+        readiness_probe: TransparentInterceptionMitmBackendReadinessProbeConfig,
+        #[serde(default)]
+        process: TransparentInterceptionMitmManagedProcessConfig,
+    },
+}
+
+impl TransparentInterceptionMitmBackendConfig {
+    pub fn external(
+        readiness_probe: TransparentInterceptionMitmBackendReadinessProbeConfig,
+    ) -> Self {
+        Self::External { readiness_probe }
+    }
+
+    pub fn managed_process(
+        readiness_probe: TransparentInterceptionMitmBackendReadinessProbeConfig,
+        process: TransparentInterceptionMitmManagedProcessConfig,
+    ) -> Self {
+        Self::ManagedProcess {
+            readiness_probe,
+            process,
+        }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransparentInterceptionMitmManagedProcessConfig {
+    pub program: Option<PathBuf>,
+    pub args: Vec<String>,
+    pub working_dir: Option<PathBuf>,
+}
+
+impl TransparentInterceptionMitmManagedProcessConfig {
+    pub fn is_configured(&self) -> bool {
+        self.program.is_some() || !self.args.is_empty() || self.working_dir.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +185,17 @@ pub enum TransparentInterceptionMitmBackendIntent {
     External {
         readiness_probe: TransparentInterceptionMitmBackendReadinessProbeIntent,
     },
+    ManagedProcess {
+        process: TransparentInterceptionMitmManagedProcessIntent,
+        readiness_probe: TransparentInterceptionMitmBackendReadinessProbeIntent,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransparentInterceptionMitmManagedProcessIntent {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub working_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,27 +228,51 @@ impl EnforcementInterceptionConfig {
         }
 
         let mut violations = Vec::new();
-        if self.mitm.backend != TransparentInterceptionMitmBackendConfig::External {
-            violations.push(intent_violation(
-                "enforcement.interception.mitm.backend",
-                "MITM interception requires enforcement.interception.mitm.backend = \"external\" until a managed L7 backend exists",
-            ));
-        }
-        let readiness_probe = validate_mitm_backend_readiness_probe(
-            self.proxy.listen_port.and_then(NonZeroU16::new),
-            &self.mitm.backend_readiness_probe,
-            &mut violations,
-        );
+        let backend = match &self.mitm.backend {
+            TransparentInterceptionMitmBackendConfig::Disabled => {
+                violations.push(intent_violation(
+                    "enforcement.interception.mitm.backend.mode",
+                    "MITM interception requires enforcement.interception.mitm.backend.mode = \"external\" or \"managed_process\"",
+                ));
+                None
+            }
+            TransparentInterceptionMitmBackendConfig::External { readiness_probe } => {
+                let readiness_probe = validate_mitm_backend_readiness_probe(
+                    self.proxy.listen_port.and_then(NonZeroU16::new),
+                    readiness_probe,
+                    &mut violations,
+                );
+                readiness_probe.map(|readiness_probe| {
+                    TransparentInterceptionMitmBackendIntent::External { readiness_probe }
+                })
+            }
+            TransparentInterceptionMitmBackendConfig::ManagedProcess {
+                process,
+                readiness_probe,
+            } => {
+                let process = validate_mitm_managed_process(process, &mut violations);
+                let readiness_probe = validate_mitm_backend_readiness_probe(
+                    self.proxy.listen_port.and_then(NonZeroU16::new),
+                    readiness_probe,
+                    &mut violations,
+                );
+                match (process, readiness_probe) {
+                    (Some(process), Some(readiness_probe)) => {
+                        Some(TransparentInterceptionMitmBackendIntent::ManagedProcess {
+                            process,
+                            readiness_probe,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+        };
 
         if !violations.is_empty() {
             return Err(violations);
         }
 
-        Ok(TransparentInterceptionMitmBackendIntent::External {
-            readiness_probe: readiness_probe.expect(
-                "external MITM backend readiness probe should be present when validation succeeds",
-            ),
-        })
+        backend.ok_or_else(Vec::new)
     }
 
     pub fn mitm_plaintext_bridge_intent(
@@ -214,6 +292,50 @@ impl EnforcementInterceptionConfig {
         }
         Ok(intent)
     }
+}
+
+fn validate_mitm_managed_process(
+    process: &TransparentInterceptionMitmManagedProcessConfig,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) -> Option<TransparentInterceptionMitmManagedProcessIntent> {
+    let Some(program) = &process.program else {
+        violations.push(intent_violation(
+            "enforcement.interception.mitm.backend.process.program",
+            "managed MITM backend requires a program path",
+        ));
+        return None;
+    };
+    if program.as_os_str().is_empty() {
+        violations.push(intent_violation(
+            "enforcement.interception.mitm.backend.process.program",
+            "managed MITM backend program path must not be empty",
+        ));
+        return None;
+    }
+    if !program.is_absolute() {
+        violations.push(intent_violation(
+            "enforcement.interception.mitm.backend.process.program",
+            "managed MITM backend program path must be absolute",
+        ));
+    }
+    if let Some(working_dir) = &process.working_dir {
+        if working_dir.as_os_str().is_empty() {
+            violations.push(intent_violation(
+                "enforcement.interception.mitm.backend.process.working_dir",
+                "managed MITM backend working_dir must not be empty",
+            ));
+        } else if !working_dir.is_absolute() {
+            violations.push(intent_violation(
+                "enforcement.interception.mitm.backend.process.working_dir",
+                "managed MITM backend working_dir must be absolute",
+            ));
+        }
+    }
+    Some(TransparentInterceptionMitmManagedProcessIntent {
+        program: program.clone(),
+        args: process.args.clone(),
+        working_dir: process.working_dir.clone(),
+    })
 }
 
 fn validate_mitm_backend_readiness_probe(
@@ -240,8 +362,8 @@ fn validate_mitm_backend_readiness_probe_target(
 ) -> Option<SocketAddr> {
     let Some(target) = &probe.target else {
         violations.push(intent_violation(
-            "enforcement.interception.mitm.backend_readiness_probe.target",
-            "external MITM backend requires a TCP readiness probe target",
+            "enforcement.interception.mitm.backend.readiness_probe.target",
+            "MITM backend requires a TCP readiness probe target",
         ));
         return None;
     };
@@ -249,23 +371,23 @@ fn validate_mitm_backend_readiness_probe_target(
     let parsed_target = match target.parse::<SocketAddr>() {
         Ok(address) if address.port() == 0 => {
             violations.push(intent_violation(
-                "enforcement.interception.mitm.backend_readiness_probe.target",
-                "external MITM backend readiness probe target must use a non-zero port",
+                "enforcement.interception.mitm.backend.readiness_probe.target",
+                "MITM backend readiness probe target must use a non-zero port",
             ));
             None
         }
         Ok(address) if !is_loopback_address(address.ip()) => {
             violations.push(intent_violation(
-                "enforcement.interception.mitm.backend_readiness_probe.target",
-                "external MITM backend readiness probe target must use a loopback IP address",
+                "enforcement.interception.mitm.backend.readiness_probe.target",
+                "MITM backend readiness probe target must use a loopback IP address",
             ));
             Some(address)
         }
         Ok(address) => Some(address),
         Err(_) => {
             violations.push(intent_violation(
-                "enforcement.interception.mitm.backend_readiness_probe.target",
-                "external MITM backend readiness probe target must be an IP socket address",
+                "enforcement.interception.mitm.backend.readiness_probe.target",
+                "MITM backend readiness probe target must be an IP socket address",
             ));
             None
         }
@@ -275,8 +397,8 @@ fn validate_mitm_backend_readiness_probe_target(
         && target.port() != listen_port.get()
     {
         violations.push(intent_violation(
-            "enforcement.interception.mitm.backend_readiness_probe.target",
-            "external MITM backend readiness probe target port must match proxy listen_port",
+            "enforcement.interception.mitm.backend.readiness_probe.target",
+            "MITM backend readiness probe target port must match proxy listen_port",
         ));
     }
 
@@ -289,11 +411,11 @@ fn validate_mitm_backend_readiness_probe_ranges(
 ) {
     validate_tcp_health_probe_timing(
         TcpHealthProbeTimingFields {
-            interval_ms: "enforcement.interception.mitm.backend_readiness_probe.interval_ms",
-            timeout_ms: "enforcement.interception.mitm.backend_readiness_probe.timeout_ms",
-            failure_threshold: "enforcement.interception.mitm.backend_readiness_probe.failure_threshold",
+            interval_ms: "enforcement.interception.mitm.backend.readiness_probe.interval_ms",
+            timeout_ms: "enforcement.interception.mitm.backend.readiness_probe.timeout_ms",
+            failure_threshold: "enforcement.interception.mitm.backend.readiness_probe.failure_threshold",
         },
-        "external MITM backend readiness probe",
+        "MITM backend readiness probe",
         probe.interval_ms,
         probe.timeout_ms,
         probe.failure_threshold,

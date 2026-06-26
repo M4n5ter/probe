@@ -121,14 +121,16 @@ self_bypass = "uses_reserved_mark"
 listen_port = 15002
 
 [enforcement.interception.mitm]
-backend = "external"
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
 leaf_certificate_chain_refs = ["leaf-cert"]
 leaf_private_key_ref = "leaf-key"
 upstream_trust_anchor_refs = ["upstream-ca"]
 
-[enforcement.interception.mitm.backend_readiness_probe]
+[enforcement.interception.mitm.backend]
+mode = "external"
+
+[enforcement.interception.mitm.backend.readiness_probe]
 target = "127.0.0.1:15002"
 timeout_ms = 250
 
@@ -159,10 +161,11 @@ path = "/etc/sssa/upstream-ca.pem"
 "#,
     )?;
 
-    assert_eq!(
-        config.enforcement.interception.mitm.backend,
-        TransparentInterceptionMitmBackendConfig::External
-    );
+    let TransparentInterceptionMitmBackendConfig::External { readiness_probe } =
+        &config.enforcement.interception.mitm.backend
+    else {
+        panic!("expected external MITM backend");
+    };
     assert_eq!(
         config.enforcement.interception.mitm.ca_certificate_ref,
         Some("mitm-ca".to_string())
@@ -171,24 +174,8 @@ path = "/etc/sssa/upstream-ca.pem"
         config.enforcement.interception.mitm.ca_private_key_ref,
         Some("mitm-ca-key".to_string())
     );
-    assert_eq!(
-        config
-            .enforcement
-            .interception
-            .mitm
-            .backend_readiness_probe
-            .target,
-        Some("127.0.0.1:15002".to_string())
-    );
-    assert_eq!(
-        config
-            .enforcement
-            .interception
-            .mitm
-            .backend_readiness_probe
-            .timeout_ms,
-        250
-    );
+    assert_eq!(readiness_probe.target.as_deref(), Some("127.0.0.1:15002"));
+    assert_eq!(readiness_probe.timeout_ms, 250);
     assert_eq!(
         config
             .enforcement
@@ -228,6 +215,65 @@ path = "/etc/sssa/upstream-ca.pem"
     assert_eq!(
         config.tls.materials[4].kind,
         TlsMaterialKind::MitmUpstreamTrustAnchor
+    );
+    Ok(())
+}
+
+#[test]
+fn parses_managed_process_mitm_backend_contract() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+ca_certificate_ref = "mitm-ca"
+ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.backend]
+mode = "managed_process"
+
+[enforcement.interception.mitm.backend.readiness_probe]
+target = "127.0.0.1:15002"
+timeout_ms = 250
+
+[enforcement.interception.mitm.backend.process]
+program = "/usr/local/bin/sssa-mitm-proxy"
+args = ["--listen", "127.0.0.1:15002"]
+working_dir = "/run/sssa"
+
+[[tls.materials]]
+id = "mitm-ca"
+kind = "mitm_ca_certificate"
+path = "/etc/sssa/mitm-ca.pem"
+
+[[tls.materials]]
+id = "mitm-ca-key"
+kind = "mitm_ca_private_key"
+path = "/etc/sssa/mitm-ca.key"
+"#,
+    )?;
+
+    let TransparentInterceptionMitmBackendConfig::ManagedProcess { process, .. } =
+        &config.enforcement.interception.mitm.backend
+    else {
+        panic!("expected managed-process MITM backend");
+    };
+    assert_eq!(
+        process.program.as_deref(),
+        Some(std::path::Path::new("/usr/local/bin/sssa-mitm-proxy"))
+    );
+    assert_eq!(
+        process.args,
+        vec!["--listen".to_string(), "127.0.0.1:15002".to_string()]
+    );
+    assert_eq!(
+        process.working_dir.as_deref(),
+        Some(std::path::Path::new("/run/sssa"))
     );
     Ok(())
 }

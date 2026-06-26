@@ -19,7 +19,6 @@ pub(super) fn validate_l7_mitm_contract(
     tls: &TlsConfig,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    validate_transparent_proxy_intent(interception, violations);
     validate_mitm_config(interception, tls, violations);
 }
 
@@ -488,13 +487,15 @@ mod tests {
                 ..TransparentInterceptionProxyConfig::default()
             },
             mitm: TransparentInterceptionMitmConfig {
-                backend: TransparentInterceptionMitmBackendConfig::External,
-                backend_readiness_probe: TransparentInterceptionMitmBackendReadinessProbeConfig {
-                    target: Some("127.0.0.1:15002".to_string()),
-                    interval_ms: MIN_TRANSPARENT_MITM_BACKEND_READINESS_INTERVAL_MS - 1,
-                    timeout_ms: MAX_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS + 1,
-                    failure_threshold: MAX_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD + 1,
-                },
+                backend: TransparentInterceptionMitmBackendConfig::external(
+                    TransparentInterceptionMitmBackendReadinessProbeConfig {
+                        target: Some("127.0.0.1:15002".to_string()),
+                        interval_ms: MIN_TRANSPARENT_MITM_BACKEND_READINESS_INTERVAL_MS - 1,
+                        timeout_ms: MAX_TRANSPARENT_MITM_BACKEND_READINESS_TIMEOUT_MS + 1,
+                        failure_threshold: MAX_TRANSPARENT_MITM_BACKEND_READINESS_FAILURE_THRESHOLD
+                            + 1,
+                    },
+                ),
                 ca_certificate_ref: Some("mitm-ca".to_string()),
                 ca_private_key_ref: Some("mitm-ca-key".to_string()),
                 ..TransparentInterceptionMitmConfig::default()
@@ -504,11 +505,11 @@ mod tests {
         validate(&interception, &tls_config_with_mitm_ca(), &mut violations);
 
         assert!(violations.iter().any(|violation| violation.field
-            == "enforcement.interception.mitm.backend_readiness_probe.interval_ms"));
+            == "enforcement.interception.mitm.backend.readiness_probe.interval_ms"));
         assert!(violations.iter().any(|violation| violation.field
-            == "enforcement.interception.mitm.backend_readiness_probe.timeout_ms"));
+            == "enforcement.interception.mitm.backend.readiness_probe.timeout_ms"));
         assert!(violations.iter().any(|violation| violation.field
-            == "enforcement.interception.mitm.backend_readiness_probe.failure_threshold"));
+            == "enforcement.interception.mitm.backend.readiness_probe.failure_threshold"));
     }
 
     #[test]
@@ -521,13 +522,14 @@ mod tests {
                 ..TransparentInterceptionProxyConfig::default()
             },
             mitm: TransparentInterceptionMitmConfig {
-                backend: TransparentInterceptionMitmBackendConfig::External,
-                backend_readiness_probe: TransparentInterceptionMitmBackendReadinessProbeConfig {
-                    target: Some("127.0.0.1:15002".to_string()),
-                    interval_ms: 500,
-                    timeout_ms: 600,
-                    failure_threshold: 1,
-                },
+                backend: TransparentInterceptionMitmBackendConfig::external(
+                    TransparentInterceptionMitmBackendReadinessProbeConfig {
+                        target: Some("127.0.0.1:15002".to_string()),
+                        interval_ms: 500,
+                        timeout_ms: 600,
+                        failure_threshold: 1,
+                    },
+                ),
                 ca_certificate_ref: Some("mitm-ca".to_string()),
                 ca_private_key_ref: Some("mitm-ca-key".to_string()),
                 ..TransparentInterceptionMitmConfig::default()
@@ -537,7 +539,7 @@ mod tests {
         validate(&interception, &tls_config_with_mitm_ca(), &mut violations);
 
         assert!(violations.iter().any(|violation| violation.field
-            == "enforcement.interception.mitm.backend_readiness_probe.timeout_ms"
+            == "enforcement.interception.mitm.backend.readiness_probe.timeout_ms"
             && violation.reason.contains("must not exceed interval")));
     }
 

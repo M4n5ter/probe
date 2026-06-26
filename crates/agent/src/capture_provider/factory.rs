@@ -9,7 +9,7 @@ use capture::{
 use probe_config::{CaptureBackend, CaptureSelection};
 use probe_core::{CapabilityKind, RuntimeMode, TcpConnection};
 use runtime::{
-    CaptureProviderDescriptor, RuntimeError, RuntimePlan,
+    CaptureProviderDescriptor, RuntimeError, RuntimePlan, TransparentInterceptionMitmBackendPlan,
     TransparentInterceptionMitmPlaintextBridgePlan,
 };
 
@@ -31,7 +31,13 @@ type CaptureEventFeedProvider = JsonLinesCaptureEventFeedProvider<BufReader<File
 
 pub(crate) struct CaptureProviderPreflight {
     session_secret_auto_binding: TlsSessionSecretAutoBindingBuild,
-    mitm_plaintext_bridge: Option<CaptureEventFeedProvider>,
+    mitm_plaintext_bridge: MitmPlaintextBridgePreflight,
+}
+
+enum MitmPlaintextBridgePreflight {
+    NotConfigured,
+    Open(CaptureEventFeedProvider),
+    DeferredUntilBackendReady,
 }
 
 pub(crate) struct BuiltCaptureProvider {
@@ -108,7 +114,7 @@ fn build_live_capture_provider(
     tls_plaintext_runtime: Option<&TlsPlaintextRuntimeState>,
     l7_mitm_runtime: &L7MitmRuntimeHandle,
     session_secret_auto_binding: TlsSessionSecretAutoBindingBuild,
-    mitm_plaintext_bridge: Option<CaptureEventFeedProvider>,
+    mitm_plaintext_bridge: MitmPlaintextBridgePreflight,
 ) -> Result<BuiltCaptureProvider, AgentError> {
     plan.require_live_capture()?;
     let outcome = build_live_primary_with_fallback(plan)?;
@@ -119,7 +125,7 @@ fn build_live_capture_provider(
         plan,
         provider,
         l7_mitm_runtime,
-        mitm_plaintext_bridge,
+        mitm_plaintext_bridge.into_provider(plan, l7_mitm_runtime)?,
     )?;
     Ok(BuiltCaptureProvider {
         provider,
@@ -279,15 +285,53 @@ fn with_mitm_plaintext_bridge_provider(
 fn preflight_mitm_plaintext_bridge_provider(
     plan: &RuntimePlan,
     l7_mitm_runtime: &L7MitmRuntimeHandle,
-) -> Result<Option<CaptureEventFeedProvider>, AgentError> {
+) -> Result<MitmPlaintextBridgePreflight, AgentError> {
     match &plan.enforcement.interception.mitm.plaintext_bridge {
-        TransparentInterceptionMitmPlaintextBridgePlan::Disabled => Ok(None),
+        TransparentInterceptionMitmPlaintextBridgePlan::Disabled => {
+            Ok(MitmPlaintextBridgePreflight::NotConfigured)
+        }
         TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed { path, follow } => {
+            if matches!(
+                plan.enforcement.interception.mitm.backend,
+                TransparentInterceptionMitmBackendPlan::ManagedProcess { .. }
+            ) {
+                return Ok(MitmPlaintextBridgePreflight::DeferredUntilBackendReady);
+            }
             let provider = load_capture_event_feed_provider(path, *follow)?;
             l7_mitm_runtime.record_plaintext_bridge_ready();
-            Ok(Some(provider))
+            Ok(MitmPlaintextBridgePreflight::Open(provider))
         }
     }
+}
+
+impl MitmPlaintextBridgePreflight {
+    fn into_provider(
+        self,
+        plan: &RuntimePlan,
+        l7_mitm_runtime: &L7MitmRuntimeHandle,
+    ) -> Result<Option<CaptureEventFeedProvider>, AgentError> {
+        match self {
+            Self::NotConfigured => Ok(None),
+            Self::Open(provider) => Ok(Some(provider)),
+            Self::DeferredUntilBackendReady => {
+                open_deferred_mitm_plaintext_bridge_provider(plan, l7_mitm_runtime)
+            }
+        }
+    }
+}
+
+fn open_deferred_mitm_plaintext_bridge_provider(
+    plan: &RuntimePlan,
+    l7_mitm_runtime: &L7MitmRuntimeHandle,
+) -> Result<Option<CaptureEventFeedProvider>, AgentError> {
+    let TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed { path, follow } =
+        &plan.enforcement.interception.mitm.plaintext_bridge
+    else {
+        return Ok(None);
+    };
+    let provider = load_capture_event_feed_provider(path, *follow)?;
+    l7_mitm_runtime.record_plaintext_bridge_ready();
+    Ok(Some(provider))
 }
 
 fn build_ebpf_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProvider>, AgentError> {
@@ -438,6 +482,8 @@ mod tests {
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, TlsMaterialConfig, TlsMaterialKind,
         TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmBackendReadinessProbeConfig,
+        TransparentInterceptionMitmManagedProcessConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionStrategyConfig,
     };
@@ -522,8 +568,7 @@ mod tests {
         set_mitm_plaintext_bridge_follow(&mut plan, false);
         let primary = Box::new(VecProvider::new([loss_event("primary")]));
         let l7_mitm_runtime = configured_l7_mitm_runtime();
-        let bridge = preflight_mitm_plaintext_bridge_provider(&plan, &l7_mitm_runtime)?
-            .expect("configured MITM plaintext bridge should open during preflight");
+        let bridge = opened_mitm_plaintext_bridge(&plan, &l7_mitm_runtime)?;
         assert_eq!(
             l7_mitm_runtime.snapshot().plaintext_bridge.mode,
             L7MitmPlaintextBridgeMode::Ready
@@ -556,8 +601,7 @@ mod tests {
             loss_event("primary after bridge error"),
         ]));
         let l7_mitm_runtime = configured_l7_mitm_runtime();
-        let bridge = preflight_mitm_plaintext_bridge_provider(&plan, &l7_mitm_runtime)?
-            .expect("configured MITM plaintext bridge should open during preflight");
+        let bridge = opened_mitm_plaintext_bridge(&plan, &l7_mitm_runtime)?;
 
         let mut provider =
             with_mitm_plaintext_bridge_provider(&plan, primary, &l7_mitm_runtime, Some(bridge))?;
@@ -598,8 +642,7 @@ mod tests {
         assert!(*follow);
         let primary = Box::new(VecProvider::new([]));
         let l7_mitm_runtime = configured_l7_mitm_runtime();
-        let bridge = preflight_mitm_plaintext_bridge_provider(&plan, &l7_mitm_runtime)?
-            .expect("configured MITM plaintext bridge should open during preflight");
+        let bridge = opened_mitm_plaintext_bridge(&plan, &l7_mitm_runtime)?;
 
         let mut provider =
             with_mitm_plaintext_bridge_provider(&plan, primary, &l7_mitm_runtime, Some(bridge))?;
@@ -643,6 +686,42 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn managed_mitm_plaintext_bridge_is_deferred_until_backend_readiness()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let bridge_path = tempdir
+            .path()
+            .join("managed-mitm-bridge-capture-events.jsonl");
+        let plan = plan_with_managed_mitm_plaintext_bridge(bridge_path.clone())?;
+
+        let l7_mitm_runtime = configured_l7_mitm_runtime();
+        let preflight = preflight_mitm_plaintext_bridge_provider(&plan, &l7_mitm_runtime)?;
+
+        assert!(matches!(
+            preflight,
+            MitmPlaintextBridgePreflight::DeferredUntilBackendReady
+        ));
+        assert_eq!(
+            l7_mitm_runtime.snapshot().plaintext_bridge.mode,
+            L7MitmPlaintextBridgeMode::Configured
+        );
+
+        fs::write(
+            &bridge_path,
+            format!("{}\n", serde_json::to_string(&loss_event("managed mitm"))?),
+        )?;
+        let bridge = preflight
+            .into_provider(&plan, &l7_mitm_runtime)?
+            .expect("managed backend should open bridge after readiness");
+        assert_eq!(
+            l7_mitm_runtime.snapshot().plaintext_bridge.mode,
+            L7MitmPlaintextBridgeMode::Ready
+        );
+        drop(bridge);
+        Ok(())
+    }
+
     fn set_mitm_plaintext_bridge_follow(plan: &mut RuntimePlan, follow: bool) {
         let TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed {
             follow: planned_follow,
@@ -652,6 +731,23 @@ mod tests {
             panic!("expected capture-event MITM bridge plan");
         };
         *planned_follow = follow;
+    }
+
+    fn opened_mitm_plaintext_bridge(
+        plan: &RuntimePlan,
+        l7_mitm_runtime: &L7MitmRuntimeHandle,
+    ) -> Result<CaptureEventFeedProvider, AgentError> {
+        match preflight_mitm_plaintext_bridge_provider(plan, l7_mitm_runtime)? {
+            MitmPlaintextBridgePreflight::Open(provider) => Ok(provider),
+            MitmPlaintextBridgePreflight::NotConfigured => Err(AgentError::UnsupportedRunConfig(
+                "expected configured MITM plaintext bridge".to_string(),
+            )),
+            MitmPlaintextBridgePreflight::DeferredUntilBackendReady => {
+                Err(AgentError::UnsupportedRunConfig(
+                    "expected external MITM plaintext bridge to open during preflight".to_string(),
+                ))
+            }
+        }
     }
 
     fn configured_l7_mitm_runtime() -> L7MitmRuntimeHandle {
@@ -700,13 +796,75 @@ mod tests {
             TransparentInterceptionStrategyConfig::InboundTproxyMitm;
         config.enforcement.interception.proxy.listen_port = Some(15002);
         config.enforcement.interception.mitm.backend =
-            TransparentInterceptionMitmBackendConfig::External;
-        config
-            .enforcement
-            .interception
-            .mitm
-            .backend_readiness_probe
-            .target = Some("127.0.0.1:15002".to_string());
+            TransparentInterceptionMitmBackendConfig::external(
+                TransparentInterceptionMitmBackendReadinessProbeConfig {
+                    target: Some("127.0.0.1:15002".to_string()),
+                    ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+                },
+            );
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path = Some(bridge_path);
+        config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
+        config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        config.tls.materials = vec![
+            TlsMaterialConfig {
+                id: Some("mitm-ca".to_string()),
+                kind: TlsMaterialKind::MitmCaCertificate,
+                path: "/etc/sssa/mitm-ca.pem".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("mitm-ca-key".to_string()),
+                kind: TlsMaterialKind::MitmCaPrivateKey,
+                path: "/etc/sssa/mitm-ca.key".into(),
+            },
+        ];
+        RuntimePlan::build(
+            config,
+            &ProviderRegistry::new(
+                vec![
+                    CaptureProviderDescriptor::available(
+                        CaptureBackend::Libpcap,
+                        CaptureProviderBuilder::Libpcap,
+                    ),
+                    CaptureProviderDescriptor::available(
+                        CaptureBackend::CaptureEventFeed,
+                        CaptureProviderBuilder::CaptureEventFeed,
+                    ),
+                ],
+                mitm_bridge_platform_capabilities(),
+            ),
+        )
+    }
+
+    fn plan_with_managed_mitm_plaintext_bridge(
+        bridge_path: PathBuf,
+    ) -> Result<RuntimePlan, runtime::RuntimeError> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        let readiness_probe = TransparentInterceptionMitmBackendReadinessProbeConfig {
+            target: Some("127.0.0.1:15002".to_string()),
+            ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+        };
+        let process = TransparentInterceptionMitmManagedProcessConfig {
+            program: Some("/bin/true".into()),
+            args: Vec::new(),
+            working_dir: None,
+        };
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::managed_process(readiness_probe, process);
         config.enforcement.interception.mitm.plaintext_bridge.mode =
             TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
         config.enforcement.interception.mitm.plaintext_bridge.path = Some(bridge_path);

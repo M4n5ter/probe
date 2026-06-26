@@ -125,6 +125,7 @@ mod tests {
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig,
         TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmBackendReadinessProbeConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionStrategyConfig,
     };
@@ -735,47 +736,47 @@ protective_actions = ["alert"]
             json!("mitm")
         );
         assert_eq!(
-            value["plan"]["enforcement"]["interception"]["mitm"]["backend"],
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend"]["mode"],
             json!("external")
         );
         assert_eq!(
-            value["plan"]["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["mode"],
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend"]["readiness_probe"]["mode"],
             json!("tcp_connect")
         );
         assert_eq!(
-            value["plan"]["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["target"],
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend"]["readiness_probe"]["target"],
             json!("127.0.0.1:15002")
         );
         assert_eq!(
-            value["plan"]["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["interval_ms"],
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend"]["readiness_probe"]["interval_ms"],
             json!(1_000)
         );
         assert_eq!(
-            value["plan"]["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["timeout_ms"],
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend"]["readiness_probe"]["timeout_ms"],
             json!(200)
         );
         assert_eq!(
-            value["plan"]["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["failure_threshold"],
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend"]["readiness_probe"]["failure_threshold"],
             json!(3)
         );
         assert_eq!(
-            value["enforcement"]["interception"]["mitm"]["backend"],
+            value["enforcement"]["interception"]["mitm"]["backend"]["mode"],
             json!("external")
         );
         assert_eq!(
-            value["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["mode"],
+            value["enforcement"]["interception"]["mitm"]["backend"]["readiness_probe"]["mode"],
             json!("tcp_connect")
         );
         assert_eq!(
-            value["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["interval_ms"],
+            value["enforcement"]["interception"]["mitm"]["backend"]["readiness_probe"]["interval_ms"],
             json!(1_000)
         );
         assert_eq!(
-            value["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["timeout_ms"],
+            value["enforcement"]["interception"]["mitm"]["backend"]["readiness_probe"]["timeout_ms"],
             json!(200)
         );
         assert_eq!(
-            value["enforcement"]["interception"]["mitm"]["backend_readiness_probe"]["failure_threshold"],
+            value["enforcement"]["interception"]["mitm"]["backend"]["readiness_probe"]["failure_threshold"],
             json!(3)
         );
         assert_eq!(
@@ -825,6 +826,60 @@ protective_actions = ["alert"]
         assert_eq!(
             value["enforcement"]["interception"]["outbound_redirect"]["kind"],
             json!("planned")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_report_exposes_managed_process_mitm_backend()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm;
+        config.enforcement.interception.proxy.self_bypass =
+            probe_config::TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_managed_process_mitm_plaintext_bridge(&mut config, false);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        let plan = RuntimePlan::build(
+            config,
+            &runtime_registry(vec![
+                CapabilityState::available(CapabilityKind::TransparentInterception),
+                CapabilityState::available(CapabilityKind::L7Mitm),
+                CapabilityState::available(CapabilityKind::CaptureEventFeed),
+            ]),
+        )?;
+
+        let value = serde_json::to_value(build_check_report(plan, None).await?)?;
+
+        assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend"]["mode"],
+            json!("managed_process")
+        );
+        assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend"]["process"]["program"],
+            json!("/bin/true")
+        );
+        assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["backend"]["process"]["args"],
+            json!(["--listen", "127.0.0.1:15002"])
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["mitm"]["backend"]["mode"],
+            json!("managed_process")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["mitm"]["backend"]["readiness_probe"]["target"],
+            json!("127.0.0.1:15002")
         );
         Ok(())
     }
@@ -1059,13 +1114,12 @@ protective_actions = ["alert"]
 
     fn configure_external_mitm_backend(config: &mut AgentConfig) {
         config.enforcement.interception.mitm.backend =
-            TransparentInterceptionMitmBackendConfig::External;
-        config
-            .enforcement
-            .interception
-            .mitm
-            .backend_readiness_probe
-            .target = Some("127.0.0.1:15002".to_string());
+            TransparentInterceptionMitmBackendConfig::external(
+                TransparentInterceptionMitmBackendReadinessProbeConfig {
+                    target: Some("127.0.0.1:15002".to_string()),
+                    ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+                },
+            );
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.tls.materials = vec![
@@ -1089,6 +1143,21 @@ protective_actions = ["alert"]
         config.enforcement.interception.mitm.plaintext_bridge.path =
             Some(MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH.into());
         config.enforcement.interception.mitm.plaintext_bridge.follow = Some(follow);
+    }
+
+    fn configure_managed_process_mitm_plaintext_bridge(config: &mut AgentConfig, follow: bool) {
+        configure_external_mitm_plaintext_bridge(config, follow);
+        let readiness_probe = TransparentInterceptionMitmBackendReadinessProbeConfig {
+            target: Some("127.0.0.1:15002".to_string()),
+            ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+        };
+        let process = probe_config::TransparentInterceptionMitmManagedProcessConfig {
+            program: Some("/bin/true".into()),
+            args: vec!["--listen".to_string(), "127.0.0.1:15002".to_string()],
+            working_dir: None,
+        };
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::managed_process(readiness_probe, process);
     }
 
     fn config_with_policy(path: &Path) -> Result<AgentConfig, probe_config::ConfigError> {

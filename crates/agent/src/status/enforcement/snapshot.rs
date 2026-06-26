@@ -841,25 +841,28 @@ protective_actions = ["alert"]
                 follow: false,
             }
         );
-        assert_eq!(value["interception"]["mitm"]["backend"], json!("external"));
         assert_eq!(
-            value["interception"]["mitm"]["backend_readiness_probe"]["mode"],
+            value["interception"]["mitm"]["backend"]["mode"],
+            json!("external")
+        );
+        assert_eq!(
+            value["interception"]["mitm"]["backend"]["readiness_probe"]["mode"],
             json!("tcp_connect")
         );
         assert_eq!(
-            value["interception"]["mitm"]["backend_readiness_probe"]["target"],
+            value["interception"]["mitm"]["backend"]["readiness_probe"]["target"],
             json!("127.0.0.1:15002")
         );
         assert_eq!(
-            value["interception"]["mitm"]["backend_readiness_probe"]["interval_ms"],
+            value["interception"]["mitm"]["backend"]["readiness_probe"]["interval_ms"],
             json!(1_000)
         );
         assert_eq!(
-            value["interception"]["mitm"]["backend_readiness_probe"]["timeout_ms"],
+            value["interception"]["mitm"]["backend"]["readiness_probe"]["timeout_ms"],
             json!(200)
         );
         assert_eq!(
-            value["interception"]["mitm"]["backend_readiness_probe"]["failure_threshold"],
+            value["interception"]["mitm"]["backend"]["readiness_probe"]["failure_threshold"],
             json!(3)
         );
         assert_eq!(
@@ -885,6 +888,40 @@ protective_actions = ["alert"]
         assert_eq!(
             interception_capability(&value, "capture_event_feed")["mode"],
             json!("available")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_status_reports_managed_process_mitm_backend()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bridge_path = PathBuf::from(MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH);
+        let plan = runtime_plan_from_config(
+            config_with_managed_process_mitm_plaintext_bridge(bridge_path),
+            vec![
+                probe_core::CapabilityState::available(CapabilityKind::TransparentInterception),
+                probe_core::CapabilityState::available(CapabilityKind::L7Mitm),
+                probe_core::CapabilityState::available(CapabilityKind::CaptureEventFeed),
+            ],
+        )?;
+
+        let value = serde_json::to_value(enforcement_status(&plan))?;
+
+        assert_eq!(
+            value["interception"]["mitm"]["backend"]["mode"],
+            json!("managed_process")
+        );
+        assert_eq!(
+            value["interception"]["mitm"]["backend"]["process"]["program"],
+            json!("/bin/true")
+        );
+        assert_eq!(
+            value["interception"]["mitm"]["backend"]["process"]["args"],
+            json!(["--listen", "127.0.0.1:15002"])
+        );
+        assert_eq!(
+            value["interception"]["mitm"]["backend"]["readiness_probe"]["target"],
+            json!("127.0.0.1:15002")
         );
         Ok(())
     }
@@ -1072,13 +1109,13 @@ protective_actions = ["alert"]
             probe_config::TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
         config.enforcement.interception.proxy.listen_port = Some(15002);
         config.enforcement.interception.mitm.backend =
-            probe_config::TransparentInterceptionMitmBackendConfig::External;
-        config
-            .enforcement
-            .interception
-            .mitm
-            .backend_readiness_probe
-            .target = Some("127.0.0.1:15002".to_string());
+            probe_config::TransparentInterceptionMitmBackendConfig::external(
+                probe_config::TransparentInterceptionMitmBackendReadinessProbeConfig {
+                    target: Some("127.0.0.1:15002".to_string()),
+                    ..probe_config::TransparentInterceptionMitmBackendReadinessProbeConfig::default(
+                    )
+                },
+            );
         config.enforcement.interception.mitm.plaintext_bridge.mode =
             probe_config::TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
         config.enforcement.interception.mitm.plaintext_bridge.path = Some(bridge_path);
@@ -1105,6 +1142,28 @@ protective_actions = ["alert"]
                 path: "/etc/sssa/mitm-ca.key".into(),
             },
         ];
+        config
+    }
+
+    fn config_with_managed_process_mitm_plaintext_bridge(
+        bridge_path: PathBuf,
+    ) -> probe_config::AgentConfig {
+        let mut config = config_with_external_mitm_plaintext_bridge(bridge_path);
+        let readiness_probe =
+            probe_config::TransparentInterceptionMitmBackendReadinessProbeConfig {
+                target: Some("127.0.0.1:15002".to_string()),
+                ..probe_config::TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+            };
+        let process = probe_config::TransparentInterceptionMitmManagedProcessConfig {
+            program: Some("/bin/true".into()),
+            args: vec!["--listen".to_string(), "127.0.0.1:15002".to_string()],
+            working_dir: None,
+        };
+        config.enforcement.interception.mitm.backend =
+            probe_config::TransparentInterceptionMitmBackendConfig::managed_process(
+                readiness_probe,
+                process,
+            );
         config
     }
 
