@@ -243,7 +243,9 @@ fn serve_websocket(
     })
 }
 
-fn validate_traffic_config(config: &WebSocketTrafficConfig) -> Result<(), WebSocketLoopbackError> {
+pub(super) fn validate_traffic_config(
+    config: &WebSocketTrafficConfig,
+) -> Result<(), WebSocketLoopbackError> {
     if config.connections == 0 || config.connections > MAX_CONNECTIONS {
         return Err(WebSocketLoopbackError::InvalidConfig(format!(
             "connections must be in 1..={MAX_CONNECTIONS}"

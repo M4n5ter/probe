@@ -3811,8 +3811,8 @@ metrics 必须覆盖：
   - 不负责：host workspace 默认检查和用户态业务逻辑。
 
 - `e2e-fixture`
-  - 负责：deterministic loopback traffic target；当前提供 HTTP/1、OpenSSL/libssl TLS HTTP/1 和 WebSocket
-    client/server 同进程场景。
+  - 负责：deterministic loopback traffic target；提供 HTTP/1、OpenSSL/libssl TLS HTTP/1、WebSocket
+    client/server 同进程场景，以及组合这些流量族的 product loopback driver。
   - 不负责：capture/provider 实现、断言 harness、生产运行逻辑。
 
 - `proto`
@@ -4110,6 +4110,21 @@ benchmark 参数：
 - `--write-chunks` 可拆分 upgrade request 和 text frame 写入。
 - 该场景复用 `--listen-port`、`--ready-file`/`--start-file`、`--connect-write-delay-ms` 和 `--post-exchange-delay-ms`。
 - 因此 libpcap/eBPF/MITM harness 可用同一两阶段 readiness 语义驱动它。
+
+#### `product-loopback` fixture
+
+- 命令：
+  `cargo run -p e2e-fixture --locked -- product-loopback --requests 1 --request-body-bytes 64 --response-body-bytes 32 --websocket-connections 1 --frame-payload-bytes 2 --write-chunks 2`
+- 在同一进程中顺序运行 HTTP/1、WebSocket 和 OpenSSL/libssl TLS HTTP/1 loopback 流量。
+- 输出同一 PID 下三个子场景的 listener、请求/连接数量、write chunk 和字节计数。
+- `--requests`、`--request-body-bytes` 和 `--response-body-bytes` 同时作用于 plain HTTP/1 与 TLS HTTP/1。
+- `--write-chunks` 同时作用于 plain HTTP/1、WebSocket 和 TLS HTTP/1。
+- `--websocket-connections` 和 `--frame-payload-bytes` 控制 WebSocket 子场景。
+- `--io-mode` 和 `--accept-read-delay-ms` 只作用于 product driver 中的 plain HTTP/1 子场景。
+- `--ready-file`/`--start-file` 在 product 进程级别生效；ready file 暴露 PID、scenario 和 start nonce，让 eBPF/libssl
+  attach harness 可先完成进程级准备，再放行全部流量。
+- `product-loopback` 不接受 `--listen-port`，因为它会为每个子场景分配独立 loopback listener。
+- 该 fixture 是产品级 traffic generator，不替代 `xtask` 对 agent durable output、admin surface 或 policy/export 结果的断言。
 
 ### Non-privileged agent E2E
 

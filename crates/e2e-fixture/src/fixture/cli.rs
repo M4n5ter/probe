@@ -4,6 +4,7 @@ use super::{
     http::HttpTrafficConfig,
     http1::{Http1IoMode, Http1LoopbackConfig, Http1LoopbackError, Http1LoopbackReport},
     loopback::{LoopbackCoordination, LoopbackRunOptions},
+    product::{ProductLoopbackConfig, ProductLoopbackError, ProductLoopbackReport},
     tls::{TlsHttp1LoopbackConfig, TlsHttp1LoopbackError, TlsHttp1LoopbackReport},
     websocket::{
         WebSocketLoopbackConfig, WebSocketLoopbackError, WebSocketLoopbackReport,
@@ -18,20 +19,22 @@ Scenarios:
   http1-loopback        Start a local TCP server and client in this process, then exchange deterministic HTTP/1 traffic.
   tls-http1-loopback    Start a local OpenSSL/libssl TLS server and client in this process, then exchange deterministic HTTP/1 traffic.
   websocket-loopback    Start a local TCP server and client in this process, then exchange a deterministic HTTP Upgrade and WebSocket text frame.
+  product-loopback      Run HTTP/1, WebSocket, and TLS HTTP/1 loopback traffic in one process for end-to-end product validation.
 
 Options:
   --listen-port PORT
   --ready-file PATH
   --start-file PATH
-  --requests N                 (http1-loopback and tls-http1-loopback)
-  --request-body-bytes N       (http1-loopback and tls-http1-loopback)
-  --response-body-bytes N      (http1-loopback and tls-http1-loopback)
+  --requests N                 (http1-loopback, tls-http1-loopback, and product-loopback)
+  --request-body-bytes N       (http1-loopback, tls-http1-loopback, and product-loopback)
+  --response-body-bytes N      (http1-loopback, tls-http1-loopback, and product-loopback)
   --connections N              (websocket-loopback only)
-  --frame-payload-bytes N      (websocket-loopback only)
+  --websocket-connections N    (product-loopback only)
+  --frame-payload-bytes N      (websocket-loopback and product-loopback)
   --write-chunks N
-  --io-mode read-write|send-recv|readv-writev|sendmsg-recvmsg  (http1-loopback only)
+  --io-mode read-write|send-recv|readv-writev|sendmsg-recvmsg  (http1-loopback and product-loopback plain HTTP)
   --connect-write-delay-ms N
-  --accept-read-delay-ms N       (http1-loopback only)
+  --accept-read-delay-ms N       (http1-loopback and product-loopback plain HTTP)
   --post-exchange-delay-ms N
 ";
 
@@ -71,6 +74,15 @@ pub(crate) fn run(args: impl IntoIterator<Item = String>) -> Result<FixtureRepor
             let report = super::websocket::run_websocket_loopback(config)?;
             Ok(FixtureReport::WebSocketLoopback(report))
         }
+        "product-loopback" => {
+            let scenario_args = args.collect::<Vec<_>>();
+            if has_help(&scenario_args) {
+                return Ok(FixtureReport::Help(USAGE));
+            }
+            let config = parse_product_loopback(scenario_args)?;
+            let report = super::product::run_product_loopback(config)?;
+            Ok(FixtureReport::ProductLoopback(report))
+        }
         _ => Err(FixtureError::usage(format!(
             "unknown scenario {scenario}\n\n{USAGE}"
         ))),
@@ -82,6 +94,7 @@ pub(crate) enum FixtureReport {
     Http1Loopback(Http1LoopbackReport),
     TlsHttp1Loopback(TlsHttp1LoopbackReport),
     WebSocketLoopback(WebSocketLoopbackReport),
+    ProductLoopback(ProductLoopbackReport),
 }
 
 impl fmt::Display for FixtureReport {
@@ -91,6 +104,7 @@ impl fmt::Display for FixtureReport {
             Self::Http1Loopback(report) => write!(formatter, "{report}"),
             Self::TlsHttp1Loopback(report) => write!(formatter, "{report}"),
             Self::WebSocketLoopback(report) => write!(formatter, "{report}"),
+            Self::ProductLoopback(report) => write!(formatter, "{report}"),
         }
     }
 }
@@ -101,6 +115,7 @@ pub(crate) enum FixtureError {
     Http1Scenario(Http1LoopbackError),
     TlsScenario(TlsHttp1LoopbackError),
     WebSocketScenario(WebSocketLoopbackError),
+    ProductScenario(ProductLoopbackError),
 }
 
 impl FixtureError {
@@ -116,6 +131,7 @@ impl fmt::Display for FixtureError {
             Self::Http1Scenario(error) => write!(formatter, "{error}"),
             Self::TlsScenario(error) => write!(formatter, "{error}"),
             Self::WebSocketScenario(error) => write!(formatter, "{error}"),
+            Self::ProductScenario(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -127,6 +143,7 @@ impl Error for FixtureError {
             Self::Http1Scenario(error) => Some(error),
             Self::TlsScenario(error) => Some(error),
             Self::WebSocketScenario(error) => Some(error),
+            Self::ProductScenario(error) => Some(error),
         }
     }
 }
@@ -146,6 +163,12 @@ impl From<TlsHttp1LoopbackError> for FixtureError {
 impl From<WebSocketLoopbackError> for FixtureError {
     fn from(error: WebSocketLoopbackError) -> Self {
         Self::WebSocketScenario(error)
+    }
+}
+
+impl From<ProductLoopbackError> for FixtureError {
+    fn from(error: ProductLoopbackError) -> Self {
+        Self::ProductScenario(error)
     }
 }
 
@@ -186,7 +209,7 @@ fn parse_websocket_loopback(
                 "missing value for {option}\n\n{USAGE}"
             )));
         };
-        if run.parse_option(&option, &value)? {
+        if run.parse_option(&option, &value, ListenPortPolicy::Allow)? {
             continue;
         }
         match option.as_str() {
@@ -215,6 +238,73 @@ fn parse_websocket_loopback(
     Ok(WebSocketLoopbackConfig {
         traffic,
         run: run.finish()?,
+    })
+}
+
+fn parse_product_loopback(
+    args: impl IntoIterator<Item = String>,
+) -> Result<ProductLoopbackConfig, FixtureError> {
+    let mut http = HttpTrafficConfig::default();
+    let mut websocket = WebSocketTrafficConfig::default();
+    let mut run = ParsedLoopbackRunOptions::default();
+    let mut http_io_mode = None;
+    let mut accept_read_delay_ms = 0;
+    let mut args = args.into_iter();
+    while let Some(option) = args.next() {
+        if option == "--help" || option == "-h" {
+            return Err(FixtureError::usage(USAGE));
+        }
+        let Some(value) = args.next() else {
+            return Err(FixtureError::usage(format!(
+                "missing value for {option}\n\n{USAGE}"
+            )));
+        };
+        if run.parse_option(&option, &value, ListenPortPolicy::RejectProduct)? {
+            continue;
+        }
+        match option.as_str() {
+            "--requests" => http.requests = parse_usize(&option, &value)?,
+            "--request-body-bytes" => http.request_body_bytes = parse_usize(&option, &value)?,
+            "--response-body-bytes" => http.response_body_bytes = parse_usize(&option, &value)?,
+            "--write-chunks" => {
+                let chunks = parse_usize(&option, &value)?;
+                http.write_chunks = chunks;
+                websocket.write_chunks = chunks;
+            }
+            "--websocket-connections" => {
+                websocket.connections = parse_usize(&option, &value)?;
+            }
+            "--frame-payload-bytes" => {
+                websocket.frame_payload_bytes = parse_usize(&option, &value)?;
+            }
+            "--io-mode" => {
+                http_io_mode = Some(Http1IoMode::parse(&value).ok_or_else(|| {
+                    FixtureError::usage(format!(
+                        "invalid value for {option}: {value}; expected read-write, send-recv, readv-writev, or sendmsg-recvmsg\n\n{USAGE}"
+                    ))
+                })?);
+            }
+            "--accept-read-delay-ms" => {
+                accept_read_delay_ms = parse_u64(&option, &value)?;
+            }
+            "--connections" => {
+                return Err(FixtureError::usage(format!(
+                    "{option} is only supported by websocket-loopback; use --websocket-connections for product-loopback\n\n{USAGE}"
+                )));
+            }
+            _ => {
+                return Err(FixtureError::usage(format!(
+                    "unknown option {option}\n\n{USAGE}"
+                )));
+            }
+        }
+    }
+    Ok(ProductLoopbackConfig {
+        http,
+        websocket,
+        run: run.finish()?,
+        http_io_mode: http_io_mode.unwrap_or_default(),
+        accept_read_delay_ms,
     })
 }
 
@@ -249,7 +339,7 @@ fn parse_http_loopback_args(
                 "missing value for {option}\n\n{USAGE}"
             )));
         };
-        if run.parse_option(&option, &value)? {
+        if run.parse_option(&option, &value, ListenPortPolicy::Allow)? {
             continue;
         }
         match option.as_str() {
@@ -296,9 +386,21 @@ struct ParsedLoopbackRunOptions {
 }
 
 impl ParsedLoopbackRunOptions {
-    fn parse_option(&mut self, option: &str, value: &str) -> Result<bool, FixtureError> {
+    fn parse_option(
+        &mut self,
+        option: &str,
+        value: &str,
+        listen_port_policy: ListenPortPolicy,
+    ) -> Result<bool, FixtureError> {
         match option {
-            "--listen-port" => self.run.listen_port = parse_u16(option, value)?,
+            "--listen-port" => match listen_port_policy {
+                ListenPortPolicy::Allow => self.run.listen_port = parse_u16(option, value)?,
+                ListenPortPolicy::RejectProduct => {
+                    return Err(FixtureError::usage(format!(
+                        "{option} is not supported by product-loopback because it starts multiple loopback listeners\n\n{USAGE}"
+                    )));
+                }
+            },
             "--connect-write-delay-ms" => {
                 self.run.connect_write_delay_ms = parse_u64(option, value)?;
             }
@@ -316,6 +418,12 @@ impl ParsedLoopbackRunOptions {
         self.run.coordination = parse_coordination(self.ready_file, self.start_file)?;
         Ok(self.run)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenPortPolicy {
+    Allow,
+    RejectProduct,
 }
 
 fn reject_plain_http_option(
@@ -526,6 +634,42 @@ mod tests {
     }
 
     #[test]
+    fn cli_rejects_product_fixed_listen_port() {
+        let error = match run([
+            "product-loopback".to_string(),
+            "--listen-port".to_string(),
+            "18080".to_string(),
+        ]) {
+            Ok(_) => panic!("product fixture must allocate one port per child scenario"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("--listen-port is not supported by product-loopback")
+        );
+    }
+
+    #[test]
+    fn cli_rejects_product_websocket_connections_alias() {
+        let error = match run([
+            "product-loopback".to_string(),
+            "--connections".to_string(),
+            "2".to_string(),
+        ]) {
+            Ok(_) => panic!("product fixture must use explicit websocket option"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("use --websocket-connections for product-loopback")
+        );
+    }
+
+    #[test]
     fn cli_rejects_incomplete_two_phase_coordination() {
         let error = parse_http1_loopback(["--ready-file".to_string(), "/tmp/ready".to_string()])
             .expect_err("incomplete coordination must fail");
@@ -563,11 +707,55 @@ mod tests {
     }
 
     #[test]
+    fn cli_runs_product_loopback() -> Result<(), Box<dyn Error>> {
+        let report = run([
+            "product-loopback".to_string(),
+            "--requests".to_string(),
+            "2".to_string(),
+            "--request-body-bytes".to_string(),
+            "8".to_string(),
+            "--response-body-bytes".to_string(),
+            "8".to_string(),
+            "--websocket-connections".to_string(),
+            "2".to_string(),
+            "--frame-payload-bytes".to_string(),
+            "3".to_string(),
+            "--write-chunks".to_string(),
+            "3".to_string(),
+            "--io-mode".to_string(),
+            "send-recv".to_string(),
+        ])?;
+        let output = report.to_string();
+
+        assert!(output.contains("scenario=product-loopback"));
+        assert!(output.contains("http1.listen_addr="));
+        assert!(output.contains("http1.requests=2"));
+        assert!(output.contains("http1.write_chunks=3"));
+        assert!(output.contains("http1.io_mode=send-recv"));
+        assert!(output.contains("http1.server_bytes_read="));
+        assert!(output.contains("http1.server_bytes_written="));
+        assert!(output.contains("websocket.listen_addr="));
+        assert!(output.contains("websocket.connections=2"));
+        assert!(output.contains("websocket.write_chunks=3"));
+        assert!(output.contains("websocket.frame_payload_bytes=3"));
+        assert!(output.contains("websocket.server_bytes_read="));
+        assert!(output.contains("websocket.server_bytes_written="));
+        assert!(output.contains("tls_http1.listen_addr="));
+        assert!(output.contains("tls_http1.requests=2"));
+        assert!(output.contains("tls_http1.write_chunks=3"));
+        assert!(output.contains("tls_http1.server_bytes_read="));
+        assert!(output.contains("tls_http1.server_bytes_written="));
+        assert!(output.contains("total_client_bytes_written="));
+        assert!(output.contains("total_client_bytes_read="));
+        assert!(output.contains("result=ok"));
+        Ok(())
+    }
+
+    #[test]
     fn scenario_help_is_successful_report() -> Result<(), Box<dyn Error>> {
         let report = run(["tls-http1-loopback".to_string(), "--help".to_string()])?;
 
         assert!(report.to_string().contains("tls-http1-loopback"));
-        assert!(report.to_string().contains("http1-loopback only"));
         Ok(())
     }
 }

@@ -99,6 +99,30 @@ pub(crate) fn coordinate_start(
     coordination: &LoopbackCoordination,
     listen_addr: SocketAddr,
 ) -> Result<(), LoopbackError> {
+    coordinate_with_ready_file(coordination, |start_nonce| {
+        format!(
+            "pid={}\nlisten_addr={listen_addr}\nstart_nonce={start_nonce}\n",
+            std::process::id()
+        )
+    })
+}
+
+pub(crate) fn coordinate_process_start(
+    coordination: &LoopbackCoordination,
+    scenario: &str,
+) -> Result<(), LoopbackError> {
+    coordinate_with_ready_file(coordination, |start_nonce| {
+        format!(
+            "pid={}\nscenario={scenario}\nstart_nonce={start_nonce}\n",
+            std::process::id()
+        )
+    })
+}
+
+fn coordinate_with_ready_file(
+    coordination: &LoopbackCoordination,
+    ready_content: impl FnOnce(&str) -> String,
+) -> Result<(), LoopbackError> {
     match coordination {
         LoopbackCoordination::Immediate => {}
         LoopbackCoordination::TwoPhase {
@@ -106,15 +130,8 @@ pub(crate) fn coordinate_start(
             start_file,
         } => {
             let start_nonce = coordination_nonce();
-            publish_ready_file(
-                ready_file,
-                format!(
-                    "pid={}\nlisten_addr={listen_addr}\nstart_nonce={start_nonce}\n",
-                    std::process::id()
-                )
-                .as_bytes(),
-            )
-            .map_err(|source| io_error("publish ready file", source))?;
+            publish_ready_file(ready_file, ready_content(&start_nonce).as_bytes())
+                .map_err(|source| io_error("publish ready file", source))?;
             wait_for_start_file(start_file, &start_nonce)?;
         }
     }
