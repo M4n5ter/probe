@@ -23,7 +23,7 @@ use super::{
     },
     tls_plaintext_assertions::{TlsPlaintextExpectations, assert_spool_outputs_for_pid},
     tls_plaintext_status::{
-        wait_for_tls_plaintext_active_target_path_after_sequence,
+        TlsPlaintextAttachStatus, wait_for_tls_plaintext_active_target_path_after_sequence,
         wait_for_tls_plaintext_no_active_target_after_sequence,
     },
 };
@@ -39,18 +39,96 @@ const TLS_RECONCILE_INTERVAL_MS: u64 = 100;
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const DYNSSL_FIXTURE_TIMEOUT: Duration = Duration::from_secs(20);
+const UNLOADABLE_LIBSSL_ENGINE_ENV: &str = "SSSA_E2E_REAL_TLS_ENGINE_PATH";
 
 pub(crate) fn run() -> ExitCode {
-    match run_inner() {
+    run_scenario(DynamicLibraryScenario::SystemCopy)
+}
+
+pub(crate) fn run_unloadable() -> ExitCode {
+    run_scenario(DynamicLibraryScenario::UnloadableShim)
+}
+
+fn run_scenario(scenario: DynamicLibraryScenario) -> ExitCode {
+    match run_inner(scenario) {
         Ok(()) => {
-            println!("e2e TLS plaintext dynamic library loopback passed");
+            println!("{}", scenario.success_message());
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("e2e TLS plaintext dynamic library loopback failed: {error}");
+            eprintln!("{}: {error}", scenario.failure_message());
             ExitCode::FAILURE
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicLibraryScenario {
+    SystemCopy,
+    UnloadableShim,
+}
+
+impl DynamicLibraryScenario {
+    fn temp_root(self) -> &'static str {
+        match self {
+            Self::SystemCopy => "tls-plaintext-dynamic-library-loopback",
+            Self::UnloadableShim => "tls-dynlib-unload",
+        }
+    }
+
+    fn success_message(self) -> &'static str {
+        match self {
+            Self::SystemCopy => "e2e TLS plaintext dynamic library loopback passed",
+            Self::UnloadableShim => "e2e TLS plaintext dynamic library unload loopback passed",
+        }
+    }
+
+    fn failure_message(self) -> &'static str {
+        match self {
+            Self::SystemCopy => "e2e TLS plaintext dynamic library loopback failed",
+            Self::UnloadableShim => "e2e TLS plaintext dynamic library unload loopback failed",
+        }
+    }
+
+    fn config_version(self) -> &'static str {
+        match self {
+            Self::SystemCopy => "e2e-tls-plaintext-dynamic-library-loopback",
+            Self::UnloadableShim => "e2e-tls-plaintext-dynamic-library-unload-loopback",
+        }
+    }
+
+    fn primary_mapping_expectation(self) -> PrimaryMappingExpectation {
+        match self {
+            Self::SystemCopy => PrimaryMappingExpectation::MayRemain,
+            Self::UnloadableShim => PrimaryMappingExpectation::MustDisappear,
+        }
+    }
+
+    fn prepare_libssl_artifacts(
+        self,
+        paths: &DynamicLibraryPaths,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::SystemCopy => {
+                for phase in &paths.phases {
+                    copy_libssl_for_mapping(&phase.libssl)?;
+                }
+            }
+            Self::UnloadableShim => {
+                copy_real_tls_engine(&paths.tls_engine)?;
+                for phase in &paths.phases {
+                    compile_unloadable_libssl_shim(&phase.libssl)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimaryMappingExpectation {
+    MayRemain,
+    MustDisappear,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +142,7 @@ struct DynamicLibraryPaths {
     spool: PathBuf,
     tls_server_cert: PathBuf,
     tls_server_key: PathBuf,
+    tls_engine: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +178,7 @@ impl DynamicLibraryPaths {
             spool: root.join("spool"),
             tls_server_cert: root.join("server.crt"),
             tls_server_key: root.join("server.key"),
+            tls_engine: root.join("tls-engine.so.3"),
         }
     }
 }
@@ -110,12 +190,12 @@ struct DynSslReady {
     libssl_path: Option<PathBuf>,
 }
 
-fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
+fn run_inner(scenario: DynamicLibraryScenario) -> Result<(), Box<dyn std::error::Error>> {
     ensure_e2e_packages_built(["agent", "e2e-dynssl-fixture"])?;
     let tls_object_path = crate::ebpf::ensure_tls_plaintext_artifact_ready().map_err(e2e_error)?;
 
-    let root = create_temp_root("tls-plaintext-dynamic-library-loopback")?;
-    let result = run_at(&root, &tls_object_path);
+    let root = create_temp_root(scenario.temp_root())?;
+    let result = run_at(&root, &tls_object_path, scenario);
     match result {
         Ok(()) => {
             fs::remove_dir_all(&root)?;
@@ -128,7 +208,11 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn run_at(root: &Path, tls_object_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn run_at(
+    root: &Path,
+    tls_object_path: &Path,
+    scenario: DynamicLibraryScenario,
+) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(root)?;
     let paths = DynamicLibraryPaths::new(root);
     let listen_port = available_loopback_port()?;
@@ -136,11 +220,9 @@ fn run_at(root: &Path, tls_object_path: &Path) -> Result<(), Box<dyn std::error:
     let expectations = TlsPlaintextExpectations::new(REQUESTS);
 
     write_policy_bundle(&paths.policy)?;
-    write_agent_config(&paths, tls_object_path, listen_port)?;
+    write_agent_config(&paths, tls_object_path, listen_port, scenario)?;
     write_server_certificate(&paths.tls_server_cert, &paths.tls_server_key)?;
-    for phase in &paths.phases {
-        copy_libssl_for_mapping(&phase.libssl)?;
-    }
+    scenario.prepare_libssl_artifacts(&paths)?;
 
     let supervisor = ChildSupervisor::new()?;
     let mut server = supervisor.watch(
@@ -150,7 +232,7 @@ fn run_at(root: &Path, tls_object_path: &Path) -> Result<(), Box<dyn std::error:
     wait_for_server_ready(server.child_mut(), server_addr)?;
 
     let mut fixture = supervisor.watch(
-        spawn_dynssl_fixture(&paths, server_addr, REQUEST_BODY_BYTES)?,
+        spawn_dynssl_fixture(&paths, server_addr, REQUEST_BODY_BYTES, scenario)?,
         "dynamic libssl fixture",
     );
     let process_ready = wait_for_dynssl_ready(fixture.child_mut(), &paths.process_ready)?;
@@ -223,25 +305,13 @@ fn run_at(root: &Path, tls_object_path: &Path) -> Result<(), Box<dyn std::error:
         replacement_mapped_path,
         primary_active_status.sequence,
     )?;
-    let primary_mapping_visible = proc_maps_contains_path(process_ready.pid, mapped_path)?;
-    if primary_mapping_visible
-        && !replacement_active_status.has_active_target_path(process_ready.pid, mapped_path)
-    {
-        return Err(e2e_error(format!(
-            "dynamic libssl primary mapping {} remained visible after replacement, but admin status did not retain it as an active target",
-            mapped_path.display()
-        ))
-        .into());
-    }
-    if !primary_mapping_visible
-        && replacement_active_status.has_active_target_path(process_ready.pid, mapped_path)
-    {
-        return Err(e2e_error(format!(
-            "dynamic libssl primary mapping {} disappeared after replacement, but admin status still retained it as an active target",
-            mapped_path.display()
-        ))
-        .into());
-    }
+    assert_primary_mapping_after_replacement(
+        scenario.primary_mapping_expectation(),
+        process_ready.pid,
+        mapped_path,
+        replacement_mapped_path,
+        &replacement_active_status,
+    )?;
 
     start_dynssl_phase(
         &replacement_phase.exchange_start,
@@ -284,6 +354,7 @@ fn spawn_dynssl_fixture(
     paths: &DynamicLibraryPaths,
     server_addr: SocketAddr,
     request_body_bytes: usize,
+    scenario: DynamicLibraryScenario,
 ) -> Result<Child, Box<dyn std::error::Error>> {
     let mut command = Command::new(debug_binary("sssa-e2e-dynssl-fixture")?);
     let command = run_in_own_process_group(&mut command)
@@ -293,6 +364,9 @@ fn spawn_dynssl_fixture(
         .arg(&paths.process_ready);
     for phase in &paths.phases {
         append_dynssl_phase_args(command, phase);
+    }
+    if scenario == DynamicLibraryScenario::UnloadableShim {
+        command.env(UNLOADABLE_LIBSSL_ENGINE_ENV, &paths.tls_engine);
     }
     let child = command
         .arg("--request-index")
@@ -367,6 +441,12 @@ fn copy_libssl_for_mapping(target: &Path) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+fn copy_real_tls_engine(target: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let source = resolve_libssl_so()?;
+    fs::copy(&source, target)?;
+    Ok(())
+}
+
 fn resolve_libssl_so() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let output = Command::new(ldconfig_command()?).arg("-p").output()?;
     if output.status.success() {
@@ -408,6 +488,43 @@ fn ldconfig_command() -> Result<PathBuf, std::io::Error> {
         ],
         "ldconfig",
     )
+}
+
+fn compile_unloadable_libssl_shim(target: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let source = target.with_file_name(format!(
+        "{}.c",
+        target
+            .file_name()
+            .ok_or_else(|| e2e_error(format!(
+                "libssl shim target {} has no file name",
+                target.display()
+            )))?
+            .to_string_lossy()
+    ));
+    fs::write(&source, UNLOADABLE_LIBSSL_SHIM_SOURCE)?;
+    let status = Command::new(cc_command()?)
+        .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-O2"])
+        .arg("-o")
+        .arg(target)
+        .arg(&source)
+        .arg("-ldl")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(e2e_error(format!(
+        "C compiler failed to build unloadable libssl shim {} from {} with {status}",
+        target.display(),
+        source.display()
+    ))
+    .into())
+}
+
+fn cc_command() -> Result<PathBuf, std::io::Error> {
+    trusted_system_command(["/usr/bin/cc", "/bin/cc", "/usr/bin/gcc", "/bin/gcc"], "cc")
 }
 
 fn wait_for_server_ready(
@@ -479,6 +596,59 @@ fn proc_maps_pathname(line: &str) -> Option<&str> {
     line.split_whitespace().nth(5)
 }
 
+fn assert_primary_mapping_after_replacement(
+    expectation: PrimaryMappingExpectation,
+    pid: u32,
+    mapped_path: &Path,
+    replacement_mapped_path: &Path,
+    replacement_active_status: &TlsPlaintextAttachStatus,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let primary_mapping_visible = proc_maps_contains_path(pid, mapped_path)?;
+    let primary_target_active = replacement_active_status.has_active_target_path(pid, mapped_path);
+    match expectation {
+        PrimaryMappingExpectation::MayRemain if primary_mapping_visible && !primary_target_active => {
+            Err(e2e_error(format!(
+                "dynamic libssl primary mapping {} remained visible after replacement, but admin status did not retain it as an active target",
+                mapped_path.display()
+            ))
+            .into())
+        }
+        PrimaryMappingExpectation::MayRemain if !primary_mapping_visible && primary_target_active => {
+            Err(e2e_error(format!(
+                "dynamic libssl primary mapping {} disappeared after replacement, but admin status still retained it as an active target",
+                mapped_path.display()
+            ))
+            .into())
+        }
+        PrimaryMappingExpectation::MustDisappear if primary_mapping_visible => {
+            Err(e2e_error(format!(
+                "unloadable dynamic libssl primary mapping {} remained visible after replacement",
+                mapped_path.display()
+            ))
+            .into())
+        }
+        PrimaryMappingExpectation::MustDisappear if primary_target_active => {
+            Err(e2e_error(format!(
+                "unloadable dynamic libssl primary mapping {} disappeared after replacement, but admin status still retained it as an active target",
+                mapped_path.display()
+            ))
+            .into())
+        }
+        PrimaryMappingExpectation::MustDisappear
+            if replacement_active_status.active_target_paths_for_pid(pid)
+                != vec![replacement_mapped_path.to_path_buf()] =>
+        {
+            Err(e2e_error(format!(
+                "unloadable dynamic libssl expected only replacement active target {} after replacement, got {:?}",
+                replacement_mapped_path.display(),
+                replacement_active_status.active_target_paths_for_pid(pid)
+            ))
+            .into())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn start_dynssl_phase(start_path: &Path, start_nonce: &str) -> Result<(), std::io::Error> {
     publish_atomic_file(
         start_path,
@@ -528,10 +698,11 @@ fn write_agent_config(
     paths: &DynamicLibraryPaths,
     tls_object_path: &Path,
     listen_port: u16,
+    scenario: DynamicLibraryScenario,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = AgentConfig {
         agent_id: "e2e-tls-plaintext-dynamic-library-agent".to_string(),
-        config_version: "e2e-tls-plaintext-dynamic-library-loopback".to_string(),
+        config_version: scenario.config_version().to_string(),
         ..AgentConfig::default()
     };
     config.capture.selection = CaptureSelection::Libpcap;
@@ -571,3 +742,6 @@ fn write_agent_config(
     fs::write(&paths.config, toml::to_string(&config)?)?;
     Ok(())
 }
+
+const UNLOADABLE_LIBSSL_SHIM_SOURCE: &str =
+    include_str!("tls_plaintext_dynamic_library_unload_shim.c");

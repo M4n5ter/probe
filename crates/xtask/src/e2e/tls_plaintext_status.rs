@@ -287,6 +287,14 @@ impl TlsPlaintextAttachStatus {
             .any(|target| target.pid == fixture_pid && target.mapped_path == mapped_path)
     }
 
+    pub(super) fn active_target_paths_for_pid(&self, fixture_pid: u32) -> Vec<PathBuf> {
+        self.active_targets
+            .iter()
+            .filter(|target| target.pid == fixture_pid)
+            .map(|target| target.mapped_path.clone())
+            .collect()
+    }
+
     fn has_detached_target(&self, fixture_pid: u32) -> bool {
         self.detached_targets
             .iter()

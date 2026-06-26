@@ -20,7 +20,10 @@ use super::super::{
         run_key_log_refresh as run_tls_key_log_material_refresh_auto_binding_loopback,
         run_refresh as run_tls_session_secret_material_refresh_auto_binding_loopback,
     },
-    tls_plaintext_dynamic_library::run as run_tls_plaintext_dynamic_library_loopback,
+    tls_plaintext_dynamic_library::{
+        run as run_tls_plaintext_dynamic_library_loopback,
+        run_unloadable as run_tls_plaintext_dynamic_library_unload_loopback,
+    },
     tls_plaintext_loopback::{
         run as run_tls_plaintext_loopback, run_dynamic as run_tls_plaintext_dynamic_loopback,
         run_target_lifecycle as run_tls_plaintext_target_lifecycle_loopback,
@@ -201,6 +204,11 @@ const E2E_CASES: &[E2eCase] = &[
         run: run_tls_plaintext_dynamic_library_loopback,
     },
     E2eCase {
+        name: "e2e-tls-plaintext-dynamic-library-unload-loopback",
+        requirement: E2eRequirement::RootBpffs,
+        run: run_tls_plaintext_dynamic_library_unload_loopback,
+    },
+    E2eCase {
         name: "e2e-tls-session-secret-auto-binding-loopback",
         requirement: E2eRequirement::RootCapNetRaw,
         run: run_tls_session_secret_auto_binding_loopback,
@@ -310,6 +318,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-tls-plaintext-dynamic-loopback",
             "e2e-tls-plaintext-target-lifecycle-loopback",
             "e2e-tls-plaintext-dynamic-library-loopback",
+            "e2e-tls-plaintext-dynamic-library-unload-loopback",
         ]),
     },
     E2eProfile {
@@ -356,6 +365,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-tls-plaintext-dynamic-loopback",
             "e2e-tls-plaintext-target-lifecycle-loopback",
             "e2e-tls-plaintext-dynamic-library-loopback",
+            "e2e-tls-plaintext-dynamic-library-unload-loopback",
             "e2e-tls-session-secret-auto-binding-loopback",
             "e2e-tls-session-secret-material-refresh-auto-binding-loopback",
             "e2e-tls-keylog-auto-binding-loopback",
@@ -546,6 +556,7 @@ mod tests {
                 "e2e-tls-plaintext-dynamic-loopback",
                 "e2e-tls-plaintext-target-lifecycle-loopback",
                 "e2e-tls-plaintext-dynamic-library-loopback",
+                "e2e-tls-plaintext-dynamic-library-unload-loopback",
             ]),
         },
         ExpectedProfile {
@@ -594,6 +605,7 @@ mod tests {
                 "e2e-tls-plaintext-dynamic-loopback",
                 "e2e-tls-plaintext-target-lifecycle-loopback",
                 "e2e-tls-plaintext-dynamic-library-loopback",
+                "e2e-tls-plaintext-dynamic-library-unload-loopback",
                 "e2e-tls-session-secret-auto-binding-loopback",
                 "e2e-tls-session-secret-material-refresh-auto-binding-loopback",
                 "e2e-tls-keylog-auto-binding-loopback",
