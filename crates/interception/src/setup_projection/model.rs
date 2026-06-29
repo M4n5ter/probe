@@ -97,10 +97,17 @@ enum TransparentInterceptionPortScopeKind {
     Only(Vec<u16>),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentInterceptionRemoteAddressScope {
     ipv4: Vec<Ipv4Addr>,
     ipv6: Vec<Ipv6Addr>,
+    family_scope: TransparentInterceptionRemoteAddressFamilyScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransparentInterceptionRemoteAddressFamilyScope {
+    Any,
+    Only { ipv4: bool, ipv6: bool },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -141,7 +148,7 @@ impl TransparentInterceptionHostRuleScope {
     ) -> Result<Self, TransparentInterceptionSetupProjectionError> {
         if local_ports.is_any()
             && remote_ports.is_any()
-            && remote_addresses.is_empty()
+            && remote_addresses.is_any()
             && socket_owners.is_any()
         {
             return Err(TransparentInterceptionSetupProjectionError::UnconstrainedSelector);
@@ -419,15 +426,40 @@ impl TransparentInterceptionPortScope {
 
 impl TransparentInterceptionRemoteAddressScope {
     pub fn new(ipv4: Vec<Ipv4Addr>, ipv6: Vec<Ipv6Addr>) -> Self {
-        Self { ipv4, ipv6 }
+        let family_scope = if ipv4.is_empty() && ipv6.is_empty() {
+            TransparentInterceptionRemoteAddressFamilyScope::Any
+        } else {
+            TransparentInterceptionRemoteAddressFamilyScope::Only {
+                ipv4: false,
+                ipv6: false,
+            }
+        };
+        Self {
+            ipv4,
+            ipv6,
+            family_scope,
+        }
     }
 
-    pub fn empty() -> Self {
+    pub fn any() -> Self {
         Self::default()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.ipv4.is_empty() && self.ipv6.is_empty()
+    pub fn any_ipv4() -> Self {
+        Self::with_family_wildcards(true, false, Vec::new(), Vec::new())
+    }
+
+    pub fn any_ipv6() -> Self {
+        Self::with_family_wildcards(false, true, Vec::new(), Vec::new())
+    }
+
+    pub fn is_any(&self) -> bool {
+        self.ipv4.is_empty()
+            && self.ipv6.is_empty()
+            && matches!(
+                self.family_scope,
+                TransparentInterceptionRemoteAddressFamilyScope::Any
+            )
     }
 
     pub fn ipv4(&self) -> &[Ipv4Addr] {
@@ -438,15 +470,55 @@ impl TransparentInterceptionRemoteAddressScope {
         &self.ipv6
     }
 
+    pub fn ipv4_any(&self) -> bool {
+        match self.family_scope {
+            TransparentInterceptionRemoteAddressFamilyScope::Any => true,
+            TransparentInterceptionRemoteAddressFamilyScope::Only { ipv4, .. } => ipv4,
+        }
+    }
+
+    pub fn ipv6_any(&self) -> bool {
+        match self.family_scope {
+            TransparentInterceptionRemoteAddressFamilyScope::Any => true,
+            TransparentInterceptionRemoteAddressFamilyScope::Only { ipv6, .. } => ipv6,
+        }
+    }
+
+    fn with_family_wildcards(
+        ipv4_any: bool,
+        ipv6_any: bool,
+        ipv4: Vec<Ipv4Addr>,
+        ipv6: Vec<Ipv6Addr>,
+    ) -> Self {
+        let family_scope = if ipv4_any && ipv6_any && ipv4.is_empty() && ipv6.is_empty() {
+            TransparentInterceptionRemoteAddressFamilyScope::Any
+        } else {
+            TransparentInterceptionRemoteAddressFamilyScope::Only {
+                ipv4: ipv4_any,
+                ipv6: ipv6_any,
+            }
+        };
+        Self {
+            ipv4,
+            ipv6,
+            family_scope,
+        }
+    }
+
     fn equivalent_to(&self, other: &Self) -> bool {
-        same_values(&self.ipv4, &other.ipv4) && same_values(&self.ipv6, &other.ipv6)
+        self.family_scope == other.family_scope
+            && same_values(&self.ipv4, &other.ipv4)
+            && same_values(&self.ipv6, &other.ipv6)
     }
 
     fn contains_scope(&self, other: &Self) -> bool {
-        self.is_empty()
-            || (!other.is_empty()
-                && other.ipv4.iter().all(|address| self.ipv4.contains(address))
-                && other.ipv6.iter().all(|address| self.ipv6.contains(address)))
+        remote_family_scope_contains(self.ipv4_any(), &self.ipv4, other.ipv4_any(), &other.ipv4)
+            && remote_family_scope_contains(
+                self.ipv6_any(),
+                &self.ipv6,
+                other.ipv6_any(),
+                &other.ipv6,
+            )
     }
 
     fn traffic_selector_values(&self) -> Vec<String> {
@@ -457,6 +529,16 @@ impl TransparentInterceptionRemoteAddressScope {
             .chain(self.ipv6.iter().copied().map(IpAddr::V6))
             .map(|address| address.to_string())
             .collect()
+    }
+}
+
+impl Default for TransparentInterceptionRemoteAddressScope {
+    fn default() -> Self {
+        Self {
+            ipv4: Vec::new(),
+            ipv6: Vec::new(),
+            family_scope: TransparentInterceptionRemoteAddressFamilyScope::Any,
+        }
     }
 }
 
@@ -543,14 +625,26 @@ fn union_remote_address_scopes<'a>(
 ) -> TransparentInterceptionRemoteAddressScope {
     let mut ipv4 = Vec::new();
     let mut ipv6 = Vec::new();
+    let mut ipv4_any = false;
+    let mut ipv6_any = false;
     for scope in scopes {
-        if scope.is_empty() {
-            return TransparentInterceptionRemoteAddressScope::empty();
+        if scope.is_any() {
+            return TransparentInterceptionRemoteAddressScope::any();
         }
-        push_unique_all(&mut ipv4, scope.ipv4());
-        push_unique_all(&mut ipv6, scope.ipv6());
+        if scope.ipv4_any() {
+            ipv4_any = true;
+            ipv4.clear();
+        } else if !ipv4_any {
+            push_unique_all(&mut ipv4, scope.ipv4());
+        }
+        if scope.ipv6_any() {
+            ipv6_any = true;
+            ipv6.clear();
+        } else if !ipv6_any {
+            push_unique_all(&mut ipv6, scope.ipv6());
+        }
     }
-    TransparentInterceptionRemoteAddressScope::new(ipv4, ipv6)
+    TransparentInterceptionRemoteAddressScope::with_family_wildcards(ipv4_any, ipv6_any, ipv4, ipv6)
 }
 
 fn compact_host_rule_scopes(
@@ -606,6 +700,18 @@ fn owner_values_contain(left: &[u32], right: &[u32]) -> bool {
     left.is_empty() || (!right.is_empty() && right.iter().all(|value| left.contains(value)))
 }
 
+fn remote_family_scope_contains<T>(
+    left_any: bool,
+    left_values: &[T],
+    right_any: bool,
+    right_values: &[T],
+) -> bool
+where
+    T: Eq,
+{
+    left_any || (!right_any && right_values.iter().all(|value| left_values.contains(value)))
+}
+
 fn all_equivalent_by<T, F>(values: &[T], equivalent: F) -> bool
 where
     F: Fn(&T, &T) -> bool,
@@ -649,7 +755,43 @@ mod tests {
             panic!("covered scopes should collapse into one canonical scope");
         };
         assert_eq!(scope.local_ports().values(), &[8443]);
-        assert!(scope.remote_addresses().is_empty());
+        assert!(scope.remote_addresses().is_any());
+    }
+
+    #[test]
+    fn host_rule_set_preserves_single_family_remote_wildcard() {
+        let rules =
+            TransparentInterceptionHostRuleSet::new(vec![local_port_scope_with_remote_scope(
+                8443,
+                TransparentInterceptionRemoteAddressScope::any_ipv4(),
+            )])
+            .expect("single-family wildcard scope should form host rules");
+
+        let [scope] = rules.scopes() else {
+            panic!("single family scope should remain one scope");
+        };
+        assert!(scope.remote_addresses().ipv4_any());
+        assert!(!scope.remote_addresses().ipv6_any());
+    }
+
+    #[test]
+    fn host_rule_set_merges_both_family_remote_wildcards() {
+        let rules = TransparentInterceptionHostRuleSet::new(vec![
+            local_port_scope_with_remote_scope(
+                8443,
+                TransparentInterceptionRemoteAddressScope::any_ipv4(),
+            ),
+            local_port_scope_with_remote_scope(
+                8443,
+                TransparentInterceptionRemoteAddressScope::any_ipv6(),
+            ),
+        ])
+        .expect("both family wildcard scopes should form host rules");
+
+        let [scope] = rules.scopes() else {
+            panic!("same-port family wildcard scopes should merge");
+        };
+        assert!(scope.remote_addresses().is_any());
     }
 
     #[test]
@@ -693,7 +835,7 @@ mod tests {
         TransparentInterceptionHostRuleScope::new(
             TransparentInterceptionPortScope::only(vec![local_port]),
             TransparentInterceptionPortScope::any(),
-            TransparentInterceptionRemoteAddressScope::empty(),
+            TransparentInterceptionRemoteAddressScope::any(),
         )
         .expect("test scope should contain a local port")
     }
@@ -702,10 +844,20 @@ mod tests {
         local_port: u16,
         remote_addresses: [Ipv4Addr; N],
     ) -> TransparentInterceptionHostRuleScope {
+        local_port_scope_with_remote_scope(
+            local_port,
+            TransparentInterceptionRemoteAddressScope::new(remote_addresses.to_vec(), Vec::new()),
+        )
+    }
+
+    fn local_port_scope_with_remote_scope(
+        local_port: u16,
+        remote_addresses: TransparentInterceptionRemoteAddressScope,
+    ) -> TransparentInterceptionHostRuleScope {
         TransparentInterceptionHostRuleScope::new(
             TransparentInterceptionPortScope::only(vec![local_port]),
             TransparentInterceptionPortScope::any(),
-            TransparentInterceptionRemoteAddressScope::new(remote_addresses.to_vec(), Vec::new()),
+            remote_addresses,
         )
         .expect("test scope should contain a local port")
     }
@@ -714,7 +866,7 @@ mod tests {
         TransparentInterceptionHostRuleScope::with_socket_owners(
             TransparentInterceptionPortScope::only(vec![local_port]),
             TransparentInterceptionPortScope::any(),
-            TransparentInterceptionRemoteAddressScope::empty(),
+            TransparentInterceptionRemoteAddressScope::any(),
             TransparentInterceptionSocketOwnerScope::new(vec![uid], Vec::new()),
         )
         .expect("test scope should contain local port and owner constraints")

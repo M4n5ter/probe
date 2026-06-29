@@ -167,23 +167,15 @@ fn rules_for_remote_addresses(
     addresses: &TransparentInterceptionRemoteAddressScope,
 ) -> Vec<NftRule> {
     let mut rules = Vec::new();
-    match (addresses.ipv4().is_empty(), addresses.ipv6().is_empty()) {
-        (true, true) => {
-            rules.push(traffic_projection.rule(NftFamily::Ipv4, None));
-            rules.push(traffic_projection.rule(NftFamily::Ipv6, None));
-        }
-        (false, true) => rules
-            .push(traffic_projection.rule(NftFamily::Ipv4, Some(string_values(addresses.ipv4())))),
-        (true, false) => rules
-            .push(traffic_projection.rule(NftFamily::Ipv6, Some(string_values(addresses.ipv6())))),
-        (false, false) => {
-            rules.push(
-                traffic_projection.rule(NftFamily::Ipv4, Some(string_values(addresses.ipv4()))),
-            );
-            rules.push(
-                traffic_projection.rule(NftFamily::Ipv6, Some(string_values(addresses.ipv6()))),
-            );
-        }
+    if addresses.ipv4_any() {
+        rules.push(traffic_projection.rule(NftFamily::Ipv4, None));
+    } else if !addresses.ipv4().is_empty() {
+        rules.push(traffic_projection.rule(NftFamily::Ipv4, Some(string_values(addresses.ipv4()))));
+    }
+    if addresses.ipv6_any() {
+        rules.push(traffic_projection.rule(NftFamily::Ipv6, None));
+    } else if !addresses.ipv6().is_empty() {
+        rules.push(traffic_projection.rule(NftFamily::Ipv6, Some(string_values(addresses.ipv6()))));
     }
     rules
 }
@@ -269,6 +261,18 @@ mod tests {
     }
 
     #[test]
+    fn host_rule_scope_with_ipv4_family_wildcard_renders_only_ipv4_rule() {
+        let expressions = match_expressions(scope_with_remote_scope(
+            TransparentInterceptionRemoteAddressScope::any_ipv4(),
+        ));
+
+        assert_eq!(
+            expressions,
+            vec!["meta l4proto tcp meta nfproto ipv4 tcp dport { 8443, 9443 } tcp sport 443",]
+        );
+    }
+
+    #[test]
     fn outbound_host_rule_scope_renders_destination_matches() {
         let expressions = NftSelectorProjection::outbound_redirect(outbound_scope())
             .into_rules()
@@ -318,10 +322,16 @@ mod tests {
                 _ => panic!("unexpected test address"),
             }
         }
+        scope_with_remote_scope(TransparentInterceptionRemoteAddressScope::new(ipv4, ipv6))
+    }
+
+    fn scope_with_remote_scope(
+        remote_addresses: TransparentInterceptionRemoteAddressScope,
+    ) -> TransparentInterceptionHostRuleScope {
         TransparentInterceptionHostRuleScope::new(
             TransparentInterceptionPortScope::only(vec![8443, 9443]),
             TransparentInterceptionPortScope::only(vec![443]),
-            TransparentInterceptionRemoteAddressScope::new(ipv4, ipv6),
+            remote_addresses,
         )
         .expect("test scope should contain host-rule constraints")
     }

@@ -49,6 +49,7 @@ use super::super::{
     },
     transparent_tproxy_loopback::{
         run as run_transparent_tproxy_loopback,
+        run_process_derived as run_transparent_tproxy_process_derived_loopback,
         run_process_scoped as run_transparent_tproxy_process_loopback,
     },
     webhook_exporter::run as run_webhook_exporter,
@@ -270,6 +271,11 @@ const E2E_CASES: &[E2eCase] = &[
         run: E2eCaseRun::ExitCode(run_transparent_tproxy_process_loopback),
     },
     E2eCase {
+        name: "e2e-transparent-tproxy-process-derived-loopback",
+        requirement: E2eRequirement::RootNetAdmin,
+        run: E2eCaseRun::ExitCode(run_transparent_tproxy_process_derived_loopback),
+    },
+    E2eCase {
         name: "e2e-transparent-linux-outbound-redirect-artifact-netns",
         requirement: E2eRequirement::RootNetAdmin,
         run: E2eCaseRun::ExitCode(run_transparent_linux_outbound_redirect_artifact),
@@ -395,6 +401,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
         cases: E2eProfileCases::Named(&[
             "e2e-transparent-tproxy-loopback",
             "e2e-transparent-tproxy-process-loopback",
+            "e2e-transparent-tproxy-process-derived-loopback",
             "e2e-transparent-outbound-proxy-loopback",
             "e2e-transparent-outbound-external-proxy-loopback",
             "e2e-transparent-outbound-owner-proxy-loopback",
@@ -447,6 +454,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-tls-keylog-material-refresh-auto-binding-loopback",
             "e2e-transparent-tproxy-loopback",
             "e2e-transparent-tproxy-process-loopback",
+            "e2e-transparent-tproxy-process-derived-loopback",
             "e2e-transparent-outbound-proxy-loopback",
             "e2e-transparent-outbound-external-proxy-loopback",
             "e2e-transparent-outbound-owner-proxy-loopback",
@@ -649,6 +657,7 @@ mod tests {
             cases: ExpectedProfileCases::Named(&[
                 "e2e-transparent-tproxy-loopback",
                 "e2e-transparent-tproxy-process-loopback",
+                "e2e-transparent-tproxy-process-derived-loopback",
                 "e2e-transparent-outbound-proxy-loopback",
                 "e2e-transparent-outbound-external-proxy-loopback",
                 "e2e-transparent-outbound-owner-proxy-loopback",
@@ -703,6 +712,7 @@ mod tests {
                 "e2e-tls-keylog-material-refresh-auto-binding-loopback",
                 "e2e-transparent-tproxy-loopback",
                 "e2e-transparent-tproxy-process-loopback",
+                "e2e-transparent-tproxy-process-derived-loopback",
                 "e2e-transparent-outbound-proxy-loopback",
                 "e2e-transparent-outbound-external-proxy-loopback",
                 "e2e-transparent-outbound-owner-proxy-loopback",

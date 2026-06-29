@@ -19,6 +19,10 @@ impl TransparentProxyUpstreamConnectPlan {
             proxy_bypass_mark,
         }
     }
+
+    pub(super) fn proxy_bypass_mark(&self) -> Option<TcpSocketMark> {
+        self.proxy_bypass_mark
+    }
 }
 
 pub(super) fn connect_tcp(
@@ -26,7 +30,7 @@ pub(super) fn connect_tcp(
     plan: TransparentProxyUpstreamConnectPlan,
 ) -> io::Result<TcpStream> {
     let mut options = TcpConnectOptions::new(plan.timeout);
-    if let Some(mark) = plan.proxy_bypass_mark {
+    if let Some(mark) = plan.proxy_bypass_mark() {
         options = options.with_socket_mark(mark);
     }
     connect_tcp_with_options(target, options)

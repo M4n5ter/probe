@@ -163,6 +163,18 @@ impl ProcfsSocketResolver {
             .identify_tcp_listeners_by_local_port_in_snapshot(local_port, snapshot)
     }
 
+    pub fn resolve_tcp_listeners(&mut self) -> Result<TcpListenerProcessLookup, AttributionError> {
+        self.refresh_snapshot_if_needed()?;
+        let Some(snapshot) = self.snapshot.as_ref().map(|cached| &cached.snapshot) else {
+            return Ok(TcpListenerProcessLookup {
+                listeners: Vec::new(),
+                unattributed_socket_inodes: Vec::new(),
+            });
+        };
+        self.attributor
+            .identify_tcp_listeners_in_snapshot(None, snapshot)
+    }
+
     pub fn resolve_tcp_fd(
         &mut self,
         lookup: SocketFdLookup,
@@ -264,6 +276,14 @@ impl ProcfsSocketAttributor {
         local_port: u16,
         snapshot: &ProcfsSocketSnapshot,
     ) -> Result<TcpListenerProcessLookup, AttributionError> {
+        self.identify_tcp_listeners_in_snapshot(Some(local_port), snapshot)
+    }
+
+    fn identify_tcp_listeners_in_snapshot(
+        &self,
+        local_port: Option<u16>,
+        snapshot: &ProcfsSocketSnapshot,
+    ) -> Result<TcpListenerProcessLookup, AttributionError> {
         if let Some(error) = snapshot
             .optional_table_errors
             .get(&ProcfsTcpTableFamily::Ipv6)
@@ -282,7 +302,7 @@ impl ProcfsSocketAttributor {
         for listener in snapshot
             .tcp_listeners
             .iter()
-            .filter(|listener| listener.local.port == local_port)
+            .filter(|listener| local_port.is_none_or(|port| listener.local.port == port))
         {
             let Some(pids) = snapshot.inode_pids.get(&listener.inode) else {
                 push_unique(&mut unattributed_socket_inodes, listener.inode);
@@ -671,6 +691,31 @@ mod tests {
                 .iter()
                 .all(|listener| listener.socket_inode == 424_242)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_tcp_listeners_across_all_local_ports() -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[
+            tcp_line(0, "0100007F:20FB", "00000000:0000", "0A", 424_242),
+            tcp_line(1, "0100007F:24E3", "00000000:0000", "0A", 535_353),
+            tcp_line(2, "0100007F:2AFB", "00000000:0000", "0A", 646_464),
+        ])?;
+        proc.write_process_with_socket(321, "first-listener", 424_242)?;
+        proc.write_process_with_socket(654, "second-listener", 535_353)?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners()?;
+
+        assert_eq!(lookup.unattributed_socket_inodes, vec![646_464]);
+        let mut listeners = lookup
+            .listeners
+            .iter()
+            .map(|listener| (listener.local.port, listener.process.identity.pid))
+            .collect::<Vec<_>>();
+        listeners.sort_unstable();
+        assert_eq!(listeners, vec![(8443, 321), (9443, 654)]);
         Ok(())
     }
 

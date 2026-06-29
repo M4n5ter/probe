@@ -202,6 +202,7 @@ fn run_health_probe_check(
 mod tests {
     use std::{
         net::{Ipv4Addr, TcpListener},
+        num::NonZeroU32,
         sync::Arc,
     };
 
@@ -419,7 +420,10 @@ mod tests {
         ManagedTransparentProxyPlan {
             listen_port: 15001,
             families: vec![TransparentInterceptionIpFamily::Ipv4],
-            relay_plan: crate::transparent_interception::proxy::relay::TransparentProxyRelayPlan::inbound_tproxy(15001),
+            relay_plan: crate::transparent_interception::proxy::relay::TransparentProxyRelayPlan::inbound_tproxy(
+                15001,
+                proxy_bypass_mark(),
+            ),
         }
     }
 
@@ -486,5 +490,9 @@ mod tests {
             },
             ..EnforcementInterceptionConfig::default()
         }
+    }
+
+    fn proxy_bypass_mark() -> NonZeroU32 {
+        NonZeroU32::new(0x5450_0102).expect("test proxy bypass mark should be non-zero")
     }
 }

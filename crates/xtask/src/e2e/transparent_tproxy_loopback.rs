@@ -71,6 +71,10 @@ pub(crate) fn run_process_scoped() -> ExitCode {
     run_mode(TproxyE2eMode::ProcessScoped)
 }
 
+pub(crate) fn run_process_derived() -> ExitCode {
+    run_mode(TproxyE2eMode::ProcessDerived)
+}
+
 fn run_mode(mode: TproxyE2eMode) -> ExitCode {
     match run_outer(mode) {
         Ok(()) => ExitCode::SUCCESS,
@@ -85,6 +89,7 @@ fn run_mode(mode: TproxyE2eMode) -> ExitCode {
 enum TproxyE2eMode {
     HostRules,
     ProcessScoped,
+    ProcessDerived,
 }
 
 impl TproxyE2eMode {
@@ -92,6 +97,7 @@ impl TproxyE2eMode {
         match self {
             Self::HostRules => "e2e-transparent-tproxy-loopback",
             Self::ProcessScoped => "e2e-transparent-tproxy-process-loopback",
+            Self::ProcessDerived => "e2e-transparent-tproxy-process-derived-loopback",
         }
     }
 
@@ -99,6 +105,7 @@ impl TproxyE2eMode {
         match self {
             Self::HostRules => "e2e-transparent-tproxy-agent",
             Self::ProcessScoped => "e2e-transparent-tproxy-process-agent",
+            Self::ProcessDerived => "e2e-transparent-tproxy-process-derived-agent",
         }
     }
 
@@ -110,6 +117,7 @@ impl TproxyE2eMode {
         match self {
             Self::HostRules => "transparent-tproxy-loopback",
             Self::ProcessScoped => "transparent-tproxy-process-loopback",
+            Self::ProcessDerived => "tproxy-process-derived",
         }
     }
 
@@ -117,18 +125,47 @@ impl TproxyE2eMode {
         match self {
             Self::HostRules => "e2e transparent TPROXY loopback",
             Self::ProcessScoped => "e2e transparent TPROXY process-scoped loopback",
+            Self::ProcessDerived => "e2e transparent TPROXY process-derived listener loopback",
         }
     }
 
     fn process_selector(self) -> ProcessSelector {
         match self {
             Self::HostRules => ProcessSelector::default(),
-            Self::ProcessScoped => process_name_selector(PROCESS_SCOPED_LISTENER_NAME),
+            Self::ProcessScoped | Self::ProcessDerived => {
+                process_name_selector(PROCESS_SCOPED_LISTENER_NAME)
+            }
         }
     }
 
+    fn traffic_selector(self) -> TrafficSelector {
+        let mut traffic = TrafficSelector {
+            directions: vec![Direction::Inbound],
+            ..TrafficSelector::default()
+        };
+        match self {
+            Self::HostRules | Self::ProcessScoped => {
+                traffic.local_ports = UPSTREAM_SCENARIOS
+                    .iter()
+                    .map(|scenario| scenario.port)
+                    .collect();
+                traffic.remote_addresses = vec![CLIENT_ADDR.to_string()];
+            }
+            Self::ProcessDerived => {}
+        }
+        traffic
+    }
+
     fn requires_fail_closed_probe(self) -> bool {
-        matches!(self, Self::ProcessScoped)
+        matches!(self, Self::ProcessScoped | Self::ProcessDerived)
+    }
+
+    fn mismatched_process_failure(self) -> &'static str {
+        match self {
+            Self::HostRules => "",
+            Self::ProcessScoped => "does not match the process selector",
+            Self::ProcessDerived => "no attributed TCP listeners matching the process selector",
+        }
     }
 }
 
@@ -180,7 +217,7 @@ fn run_at(root: &Path, mode: TproxyE2eMode) -> Result<(), Box<dyn std::error::Er
     wait_for_client_namespace_ready(client_namespace.child_mut())?;
     let _network = IsolatedNetwork::setup(client_pid)?;
     if mode.requires_fail_closed_probe() {
-        assert_mismatched_process_selector_fails_closed(root, &supervisor)?;
+        assert_mismatched_process_selector_fails_closed(root, &supervisor, mode)?;
     }
     let upstreams = UPSTREAM_SCENARIOS
         .iter()
@@ -218,6 +255,7 @@ fn run_at(root: &Path, mode: TproxyE2eMode) -> Result<(), Box<dyn std::error::Er
 fn assert_mismatched_process_selector_fails_closed(
     root: &Path,
     supervisor: &ChildSupervisor,
+    mode: TproxyE2eMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = root.join("mismatch.toml");
     let spool_path = root.join("spool-mismatch");
@@ -225,7 +263,7 @@ fn assert_mismatched_process_selector_fails_closed(
     write_agent_config(
         &config_path,
         &spool_path,
-        TproxyE2eMode::ProcessScoped,
+        mode,
         process_name_selector(MISMATCHING_PROCESS_SCOPED_LISTENER_NAME),
     )?;
     let listeners = bind_listener_probe_ports()?;
@@ -237,7 +275,7 @@ fn assert_mismatched_process_selector_fails_closed(
     assert_agent_fails_before_ready(
         agent.child_mut(),
         &mut ready_signal,
-        "does not match the process selector",
+        mode.mismatched_process_failure(),
     )?;
     agent.unwatch();
     drop(listeners);
@@ -282,18 +320,8 @@ fn write_agent_config(
         listen_port: Some(PROXY_PORT),
         ..TransparentInterceptionProxyConfig::default()
     };
-    config.enforcement.interception.selector = Some(Selector::term(
-        process_selector,
-        TrafficSelector {
-            local_ports: UPSTREAM_SCENARIOS
-                .iter()
-                .map(|scenario| scenario.port)
-                .collect(),
-            directions: vec![Direction::Inbound],
-            remote_addresses: vec![CLIENT_ADDR.to_string()],
-            ..TrafficSelector::default()
-        },
-    ));
+    config.enforcement.interception.selector =
+        Some(Selector::term(process_selector, mode.traffic_selector()));
     std::fs::write(path, toml::to_string(&config)?)?;
     Ok(())
 }

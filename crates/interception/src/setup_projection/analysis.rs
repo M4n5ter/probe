@@ -1139,7 +1139,7 @@ mod tests {
         let error = TransparentInterceptionHostRuleScope::new(
             TransparentInterceptionPortScope::any(),
             TransparentInterceptionPortScope::any(),
-            TransparentInterceptionRemoteAddressScope::empty(),
+            TransparentInterceptionRemoteAddressScope::any(),
         )
         .expect_err("empty host-rule scope would render broad host rules");
 

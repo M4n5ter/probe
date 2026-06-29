@@ -113,6 +113,7 @@ impl NftablesTransparentInterception {
                 .into_iter()
                 .map(TransparentInterceptionIpFamily::from)
                 .collect(),
+            plan.proxy_bypass_mark(),
             local_address_inventory(self.ip.clone()),
         )?;
         let setup_script = plan.setup_nft_script();

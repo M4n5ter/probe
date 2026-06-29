@@ -72,9 +72,10 @@ pub(in crate::transparent_interception) struct TransparentProxyGuard {
 pub(in crate::transparent_interception) fn prepare_proxy_lifecycle(
     inbound_plan: &TransparentInterceptionInboundTproxyPlan,
     families: Vec<TransparentInterceptionIpFamily>,
+    proxy_bypass_mark: NonZeroU32,
     load_local_addresses: LocalAddressInventory,
 ) -> Result<TransparentProxyLifecyclePlan, TransparentInterceptionError> {
-    let proxy = prepare_proxy_plan(inbound_plan, families)?;
+    let proxy = prepare_proxy_plan(inbound_plan, families, proxy_bypass_mark)?;
     let health_probe = prepare_health_probe(
         inbound_plan.health_probe(),
         proxy.managed(),
@@ -143,6 +144,7 @@ struct ManagedTransparentProxyGuard {
 fn prepare_proxy_plan(
     inbound_plan: &TransparentInterceptionInboundTproxyPlan,
     families: Vec<TransparentInterceptionIpFamily>,
+    proxy_bypass_mark: NonZeroU32,
 ) -> Result<TransparentProxyLifecycleProxyPlan, TransparentInterceptionError> {
     let TransparentInterceptionProxyModeConfig::ManagedTcpRelay = inbound_plan.proxy_mode() else {
         return Ok(TransparentProxyLifecycleProxyPlan::External);
@@ -158,6 +160,7 @@ fn prepare_proxy_plan(
             families,
             relay_plan: relay::TransparentProxyRelayPlan::inbound_tproxy(
                 inbound_plan.listen_port().get(),
+                proxy_bypass_mark,
             ),
         },
     ))
@@ -316,8 +319,13 @@ mod tests {
             panic!("test transparent interception config should use inbound TPROXY");
         };
 
-        let plan = prepare_proxy_lifecycle(&inbound_plan, Vec::new(), Arc::new(|| Ok(Vec::new())))
-            .expect("external mode without health probe should be prepared");
+        let plan = prepare_proxy_lifecycle(
+            &inbound_plan,
+            Vec::new(),
+            proxy_bypass_mark(),
+            Arc::new(|| Ok(Vec::new())),
+        )
+        .expect("external mode without health probe should be prepared");
         let guard = start_proxy_lifecycle(
             plan,
             TransparentProxyRuntime::for_execution_plan(&execution_plan),
@@ -382,13 +390,21 @@ mod tests {
             panic!("test transparent interception config should use inbound TPROXY");
         };
 
-        let error =
-            match prepare_proxy_lifecycle(&inbound_plan, Vec::new(), Arc::new(|| Ok(Vec::new()))) {
-                Ok(_) => panic!("managed relay should require at least one listener family"),
-                Err(error) => error,
-            };
+        let error = match prepare_proxy_lifecycle(
+            &inbound_plan,
+            Vec::new(),
+            proxy_bypass_mark(),
+            Arc::new(|| Ok(Vec::new())),
+        ) {
+            Ok(_) => panic!("managed relay should require at least one listener family"),
+            Err(error) => error,
+        };
 
         assert!(error.to_string().contains("at least one listener family"));
+    }
+
+    fn proxy_bypass_mark() -> NonZeroU32 {
+        NonZeroU32::new(0x5450_0102).expect("test proxy bypass mark should be non-zero")
     }
 
     #[test]

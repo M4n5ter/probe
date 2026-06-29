@@ -30,6 +30,10 @@ impl TransparentLinuxResources {
             inbound_tproxy_route_table: TRANSPARENT_INTERCEPTION_INBOUND_TPROXY_ROUTE_TABLE,
         }
     }
+
+    pub fn proxy_bypass_mark(&self) -> NonZeroU32 {
+        self.outbound_proxy_bypass_mark
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,13 +66,14 @@ impl OutboundRedirectArtifactSpec {
         resources: TransparentLinuxResources,
         proxy_port: u16,
     ) -> Self {
+        let proxy_bypass_mark = resources.proxy_bypass_mark();
         Self {
             table_name: resources.table_name,
             chain_name: TRANSPARENT_INTERCEPTION_OUTBOUND_CHAIN.to_string(),
             hook: TRANSPARENT_INTERCEPTION_OUTPUT_HOOK.to_string(),
             priority: TRANSPARENT_INTERCEPTION_DSTNAT_PRIORITY.to_string(),
             proxy_port,
-            proxy_bypass_mark: resources.outbound_proxy_bypass_mark,
+            proxy_bypass_mark,
         }
     }
 }

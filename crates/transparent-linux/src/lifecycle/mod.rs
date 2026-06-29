@@ -33,9 +33,9 @@ pub enum TransparentLinuxPlanError {
     )]
     ProxyPortInInterceptedLocalPorts { proxy_port: u16 },
     #[error(
-        "transparent interception requires an explicit local port scope for proxy listen port {proxy_port}; wildcard local port interception needs a complete proxy self-bypass lifecycle first"
+        "transparent interception requires an explicit local port scope because wildcard local port interception would include proxy listen port {proxy_port}"
     )]
-    WildcardLocalPortsRequireProxyBypass { proxy_port: u16 },
+    WildcardLocalPortsIncludeProxyPort { proxy_port: u16 },
     #[error(
         "outbound transparent proxy redirect requires an explicit remote port scope for proxy listen port {proxy_port}; wildcard remote port interception needs flow-aware outbound scope resolution before rule installation"
     )]

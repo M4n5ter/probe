@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use interception::TransparentInterceptionHostRuleSet;
 #[cfg(test)]
 use interception::{TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan};
@@ -13,6 +15,7 @@ pub struct InboundTproxyLifecyclePlan {
     table_name: String,
     proxy_port: u16,
     mark: u32,
+    proxy_bypass_mark: NonZeroU32,
     route_table: u32,
     rules: Vec<NftRule>,
 }
@@ -23,11 +26,13 @@ impl InboundTproxyLifecyclePlan {
         setup_rules: TransparentInterceptionHostRuleSet,
     ) -> Result<Self, TransparentLinuxPlanError> {
         let proxy_port = spec.proxy_port;
+        let resources = spec.resources;
+        let proxy_bypass_mark = resources.proxy_bypass_mark();
         let mut rules = Vec::new();
         for setup_scope in setup_rules.scopes() {
             if setup_scope.local_ports().is_any() {
                 return Err(
-                    TransparentLinuxPlanError::WildcardLocalPortsRequireProxyBypass { proxy_port },
+                    TransparentLinuxPlanError::WildcardLocalPortsIncludeProxyPort { proxy_port },
                 );
             }
             if setup_scope.local_ports().contains(proxy_port) {
@@ -38,10 +43,11 @@ impl InboundTproxyLifecyclePlan {
             rules.extend(NftSelectorProjection::inbound_tproxy(setup_scope.clone()).into_rules());
         }
         Ok(Self {
-            table_name: spec.resources.table_name,
+            table_name: resources.table_name,
             proxy_port,
-            mark: spec.resources.inbound_tproxy_mark,
-            route_table: spec.resources.inbound_tproxy_route_table,
+            mark: resources.inbound_tproxy_mark,
+            proxy_bypass_mark,
+            route_table: resources.inbound_tproxy_route_table,
             rules,
         })
     }
@@ -51,6 +57,7 @@ impl InboundTproxyLifecyclePlan {
             format!("destroy table inet {}", self.table_name),
             format!("add table inet {}", self.table_name),
             self.add_chain_command(),
+            self.add_proxy_bypass_rule_command(),
         ];
         lines.extend(self.rules.iter().map(|rule| self.add_rule_command(rule)));
         lines.join("\n") + "\n"
@@ -86,6 +93,10 @@ impl InboundTproxyLifecyclePlan {
 
     pub fn cleanup_all_ip_commands(&self) -> Vec<Vec<String>> {
         cleanup_all_policy_route_ip_commands(self.mark, self.route_table)
+    }
+
+    pub fn proxy_bypass_mark(&self) -> NonZeroU32 {
+        self.proxy_bypass_mark
     }
 
     pub fn owner_name(&self) -> &str {
@@ -132,6 +143,14 @@ impl InboundTproxyLifecyclePlan {
             hex_mark(self.mark),
         )
     }
+
+    fn add_proxy_bypass_rule_command(&self) -> String {
+        format!(
+            "add rule inet {} inbound_tproxy meta mark {} return",
+            self.table_name,
+            hex_mark(self.proxy_bypass_mark.get())
+        )
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +192,7 @@ mod tests {
                 "destroy table inet traffic_probe",
                 "add table inet traffic_probe",
                 "add chain inet traffic_probe inbound_tproxy { type filter hook prerouting priority mangle; policy accept; }",
+                "add rule inet traffic_probe inbound_tproxy meta mark 0x54500102 return",
                 "add rule inet traffic_probe inbound_tproxy meta l4proto tcp meta nfproto ipv4 tcp dport 8443 ip saddr 203.0.113.10 tproxy ip to :15001 meta mark set 0x54500101",
             ]
         );
@@ -233,6 +253,7 @@ mod tests {
                 "destroy table inet traffic_probe",
                 "add table inet traffic_probe",
                 "add chain inet traffic_probe inbound_tproxy { type filter hook prerouting priority mangle; policy accept; }",
+                "add rule inet traffic_probe inbound_tproxy meta mark 0x54500102 return",
                 "add rule inet traffic_probe inbound_tproxy meta l4proto tcp meta nfproto ipv4 tcp dport 8443 ip saddr 203.0.113.10 tproxy ip to :15001 meta mark set 0x54500101",
                 "add rule inet traffic_probe inbound_tproxy meta l4proto tcp meta nfproto ipv4 tcp dport 9443 ip saddr 203.0.113.20 tproxy ip to :15001 meta mark set 0x54500101",
             ]
@@ -346,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_local_ports_require_proxy_bypass() {
+    fn wildcard_local_ports_include_proxy_port() {
         let config = interception_config(Some(Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -364,7 +385,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            TransparentLinuxPlanError::WildcardLocalPortsRequireProxyBypass { proxy_port: 15001 }
+            TransparentLinuxPlanError::WildcardLocalPortsIncludeProxyPort { proxy_port: 15001 }
         ));
     }
 

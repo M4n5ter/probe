@@ -1,7 +1,14 @@
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, Ipv6Addr},
+};
+
 use attribution::ProcfsSocketResolver;
 use interception::{
-    TransparentInterceptionHostRuleBoundary, TransparentInterceptionHostRuleSet,
+    TransparentInterceptionHostRuleBoundary, TransparentInterceptionHostRuleScope,
+    TransparentInterceptionHostRuleSet, TransparentInterceptionPortScope,
     TransparentInterceptionProcessScope, TransparentInterceptionProcessScopeExpression,
+    TransparentInterceptionRemoteAddressScope,
 };
 use probe_core::{
     CapabilityKind, CapabilityState, CompiledSelector, Direction, ProcessContext, RuntimeMode,
@@ -30,7 +37,7 @@ impl TransparentInterceptionProcessClassifier {
         match resolver.probe_tcp_listener_process_attribution() {
             Ok(()) => CapabilityState::degraded(
                 CapabilityKind::TransparentProcessClassifier,
-                "setup-time procfs listener classification can prove all visible TCP listener holder processes for explicit local ports when procfs TCP tables and fd owner scan are complete, but it is not a dynamic cgroup/owner mark classifier and cannot track listener changes after rules are installed",
+                "setup-time procfs listener classification can derive or prove inbound TCP listener ports for process-scoped transparent interception when procfs TCP tables and fd owner scan are complete, but it is not a dynamic cgroup/owner mark classifier and cannot track listener changes after rules are installed",
             ),
             Err(error) => CapabilityState::unavailable(
                 CapabilityKind::TransparentProcessClassifier,
@@ -55,12 +62,10 @@ impl TransparentInterceptionProcessClassifier {
             }
         }
 
-        let TransparentInterceptionHostRuleBoundary::HostRules(rules) = host_rule_boundary else {
-            return Err(setup_error(
-                "transparent process classifier requires a host-rule boundary before rules can be installed",
-            ));
-        };
         let matcher = ProcessScopeMatcher::compile(process_scope.expression())?;
+        let TransparentInterceptionHostRuleBoundary::HostRules(rules) = host_rule_boundary else {
+            return self.derived_listener_host_rule_scope(&matcher);
+        };
 
         let Some(local_ports) = rules.explicit_local_ports() else {
             return Err(setup_error(
@@ -71,6 +76,81 @@ impl TransparentInterceptionProcessClassifier {
             self.require_matching_listener(port, &matcher)?;
         }
         Ok(rules)
+    }
+
+    fn derived_listener_host_rule_scope(
+        &mut self,
+        matcher: &ProcessScopeMatcher,
+    ) -> Result<TransparentInterceptionHostRuleSet, TransparentInterceptionError> {
+        let lookup = self.resolver.resolve_tcp_listeners().map_err(|error| {
+            setup_error(format!(
+                "transparent process classifier failed to inspect TCP listeners: {error}",
+            ))
+        })?;
+        if !lookup.unattributed_socket_inodes.is_empty() {
+            return Err(setup_error(format!(
+                "transparent process classifier cannot derive process-scoped host rules while unattributed TCP listener socket inodes are visible: {:?}",
+                lookup.unattributed_socket_inodes
+            )));
+        }
+
+        let mut ports = BTreeMap::<(u16, DerivedListenerRuleFamily), DerivedPortMatch>::new();
+        for listener in lookup.listeners {
+            for family in DerivedListenerRuleFamily::from_listener_address(listener.local.address)
+                .iter()
+                .copied()
+            {
+                let entry = ports.entry((listener.local.port, family)).or_default();
+                if matcher.matches(&listener.process) {
+                    entry.has_matching_holder = true;
+                } else {
+                    entry.non_matching_holder.get_or_insert_with(|| {
+                        format!(
+                            "pid={}, name={}",
+                            listener.process.identity.pid, listener.process.name
+                        )
+                    });
+                }
+            }
+        }
+
+        let mut matching_ipv4_ports = Vec::new();
+        let mut matching_ipv6_ports = Vec::new();
+        for ((port, family), port_match) in ports {
+            if !port_match.has_matching_holder {
+                continue;
+            }
+            if let Some(holder) = port_match.non_matching_holder {
+                return Err(setup_error(format!(
+                    "transparent process classifier cannot derive a safe host rule for local port {port}; the port also has a non-matching TCP listener holder: {holder}"
+                )));
+            }
+            match family {
+                DerivedListenerRuleFamily::Ipv4 => matching_ipv4_ports.push(port),
+                DerivedListenerRuleFamily::Ipv6 => matching_ipv6_ports.push(port),
+            }
+        }
+        if matching_ipv4_ports.is_empty() && matching_ipv6_ports.is_empty() {
+            return Err(setup_error(
+                "transparent process classifier found no attributed TCP listeners matching the process selector",
+            ));
+        }
+
+        let mut scopes = Vec::new();
+        if !matching_ipv4_ports.is_empty() {
+            scopes.push(derived_listener_scope(
+                matching_ipv4_ports,
+                TransparentInterceptionRemoteAddressScope::any_ipv4(),
+            )?);
+        }
+        if !matching_ipv6_ports.is_empty() {
+            scopes.push(derived_listener_scope(
+                matching_ipv6_ports,
+                TransparentInterceptionRemoteAddressScope::any_ipv6(),
+            )?);
+        }
+        TransparentInterceptionHostRuleSet::new(scopes)
+            .map_err(|error| setup_error(error.to_string()))
     }
 
     fn require_matching_listener(
@@ -107,6 +187,40 @@ impl TransparentInterceptionProcessClassifier {
         }
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct DerivedPortMatch {
+    has_matching_holder: bool,
+    non_matching_holder: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DerivedListenerRuleFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl DerivedListenerRuleFamily {
+    fn from_listener_address(address: IpAddr) -> &'static [Self] {
+        match address {
+            IpAddr::V4(_) => &[Self::Ipv4],
+            IpAddr::V6(address) if address == Ipv6Addr::UNSPECIFIED => &[Self::Ipv4, Self::Ipv6],
+            IpAddr::V6(_) => &[Self::Ipv6],
+        }
+    }
+}
+
+fn derived_listener_scope(
+    local_ports: Vec<u16>,
+    remote_addresses: TransparentInterceptionRemoteAddressScope,
+) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionError> {
+    TransparentInterceptionHostRuleScope::new(
+        TransparentInterceptionPortScope::only(local_ports),
+        TransparentInterceptionPortScope::any(),
+        remote_addresses,
+    )
+    .map_err(|error| setup_error(error.to_string()))
 }
 
 impl Default for TransparentInterceptionProcessClassifier {
@@ -230,7 +344,7 @@ mod tests {
             capability
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("all visible TCP listener holder processes"))
+                .is_some_and(|reason| reason.contains("derive or prove inbound TCP listener ports"))
         );
         Ok(())
     }
@@ -278,6 +392,162 @@ mod tests {
         )?;
 
         assert_eq!(result, scope);
+        Ok(())
+    }
+
+    #[test]
+    fn process_classifier_derives_host_rules_for_process_only_matching_listeners()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[
+            tcp_line(0, "0100007F:20FB", "00000000:0000", "0A", 424_242),
+            tcp_line(1, "0100007F:24E3", "00000000:0000", "0A", 535_353),
+        ])?;
+        proc.write_process_with_socket(321, "demo-listener", 424_242)?;
+        proc.write_process_with_socket(654, "other-listener", 535_353)?;
+        let mut classifier = TransparentInterceptionProcessClassifier::with_resolver(
+            ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path()),
+        );
+
+        let result = classifier.executable_host_rule_scope(
+            "needs process classifier".to_string(),
+            TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary,
+            process_only_scope(ProcessSelector {
+                names: vec!["demo-listener".to_string()],
+                ..ProcessSelector::default()
+            })?,
+            &CapabilityState::degraded(CapabilityKind::TransparentProcessClassifier, "procfs"),
+        )?;
+
+        let scope = single_scope(&result);
+        assert_eq!(scope.local_ports().only_values(), Some(&[8443][..]));
+        assert!(scope.remote_addresses().ipv4_any());
+        assert!(!scope.remote_addresses().ipv6_any());
+        Ok(())
+    }
+
+    #[test]
+    fn process_classifier_derives_dual_family_rules_for_ipv6_wildcard_listener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[])?;
+        proc.write_tcp6_table(&[tcp_line(
+            0,
+            "00000000000000000000000000000000:20FB",
+            "00000000000000000000000000000000:0000",
+            "0A",
+            424_242,
+        )])?;
+        proc.write_process_with_socket(321, "demo-listener", 424_242)?;
+        let mut classifier = TransparentInterceptionProcessClassifier::with_resolver(
+            ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path()),
+        );
+
+        let result = classifier.executable_host_rule_scope(
+            "needs process classifier".to_string(),
+            TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary,
+            process_only_scope(ProcessSelector {
+                names: vec!["demo-listener".to_string()],
+                ..ProcessSelector::default()
+            })?,
+            &CapabilityState::degraded(CapabilityKind::TransparentProcessClassifier, "procfs"),
+        )?;
+
+        let scope = single_scope(&result);
+        assert_eq!(scope.local_ports().only_values(), Some(&[8443][..]));
+        assert!(scope.remote_addresses().is_any());
+        Ok(())
+    }
+
+    #[test]
+    fn process_classifier_rejects_process_only_mixed_listener_holders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[tcp_line(0, "0100007F:20FB", "00000000:0000", "0A", 424_242)])?;
+        proc.write_process_with_socket(321, "demo-listener", 424_242)?;
+        proc.write_process_with_socket(654, "other-listener", 424_242)?;
+        let mut classifier = TransparentInterceptionProcessClassifier::with_resolver(
+            ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path()),
+        );
+
+        let error = classifier
+            .executable_host_rule_scope(
+                "needs process classifier".to_string(),
+                TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary,
+                process_only_scope(ProcessSelector {
+                    names: vec!["demo-listener".to_string()],
+                    ..ProcessSelector::default()
+                })?,
+                &CapabilityState::degraded(CapabilityKind::TransparentProcessClassifier, "procfs"),
+            )
+            .expect_err("mixed listener holders must not produce process-only host rules");
+
+        assert!(
+            error
+                .to_string()
+                .contains("non-matching TCP listener holder")
+        );
+        assert!(error.to_string().contains("pid=654"));
+        Ok(())
+    }
+
+    #[test]
+    fn process_classifier_rejects_process_only_when_any_listener_is_unattributed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[
+            tcp_line(0, "0100007F:20FB", "00000000:0000", "0A", 424_242),
+            tcp_line(1, "0100007F:24E3", "00000000:0000", "0A", 535_353),
+        ])?;
+        proc.write_process_with_socket(321, "demo-listener", 424_242)?;
+        let mut classifier = TransparentInterceptionProcessClassifier::with_resolver(
+            ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path()),
+        );
+
+        let error = classifier
+            .executable_host_rule_scope(
+                "needs process classifier".to_string(),
+                TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary,
+                process_only_scope(ProcessSelector {
+                    names: vec!["demo-listener".to_string()],
+                    ..ProcessSelector::default()
+                })?,
+                &CapabilityState::degraded(CapabilityKind::TransparentProcessClassifier, "procfs"),
+            )
+            .expect_err("unattributed listener must fail closed for process-only setup");
+
+        assert!(error.to_string().contains("unattributed TCP listener"));
+        assert!(error.to_string().contains("535353"));
+        Ok(())
+    }
+
+    #[test]
+    fn process_classifier_rejects_process_only_without_matching_listener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[tcp_line(0, "0100007F:20FB", "00000000:0000", "0A", 424_242)])?;
+        proc.write_process_with_socket(321, "other-listener", 424_242)?;
+        let mut classifier = TransparentInterceptionProcessClassifier::with_resolver(
+            ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path()),
+        );
+
+        let error = classifier
+            .executable_host_rule_scope(
+                "needs process classifier".to_string(),
+                TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary,
+                process_only_scope(ProcessSelector {
+                    names: vec!["demo-listener".to_string()],
+                    ..ProcessSelector::default()
+                })?,
+                &CapabilityState::degraded(CapabilityKind::TransparentProcessClassifier, "procfs"),
+            )
+            .expect_err("process-only setup requires at least one matching listener");
+
+        assert!(
+            error
+                .to_string()
+                .contains("no attributed TCP listeners matching")
+        );
         Ok(())
     }
 
@@ -383,14 +653,31 @@ mod tests {
     fn process_scope(
         process: ProcessSelector,
     ) -> Result<TransparentInterceptionProcessScope, Box<dyn std::error::Error>> {
-        let selector = Selector::term(
+        process_scope_from_selector(Selector::term(
             process,
             TrafficSelector {
                 local_ports: vec![8443],
                 directions: vec![Direction::Inbound],
                 ..TrafficSelector::default()
             },
-        );
+        ))
+    }
+
+    fn process_only_scope(
+        process: ProcessSelector,
+    ) -> Result<TransparentInterceptionProcessScope, Box<dyn std::error::Error>> {
+        process_scope_from_selector(Selector::term(
+            process,
+            TrafficSelector {
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ))
+    }
+
+    fn process_scope_from_selector(
+        selector: Selector,
+    ) -> Result<TransparentInterceptionProcessScope, Box<dyn std::error::Error>> {
         match TransparentInterceptionSetupPlan::from_selector(
             Some(&selector),
             TransparentInterceptionSetupDirection::Inbound,
@@ -406,7 +693,7 @@ mod tests {
         let scope = TransparentInterceptionHostRuleScope::new(
             TransparentInterceptionPortScope::only(vec![local_port]),
             TransparentInterceptionPortScope::any(),
-            TransparentInterceptionRemoteAddressScope::default(),
+            TransparentInterceptionRemoteAddressScope::any(),
         )
         .expect("test scope should contain a local port");
         TransparentInterceptionHostRuleSet::single(scope)
@@ -477,6 +764,13 @@ mod tests {
         fn write_tcp_table(&self, lines: &[String]) -> Result<(), std::io::Error> {
             fs::write(
                 self.root.path().join("net/tcp"),
+                format!("{}{}", tcp_header(), lines.join("")),
+            )
+        }
+
+        fn write_tcp6_table(&self, lines: &[String]) -> Result<(), std::io::Error> {
+            fs::write(
+                self.root.path().join("net/tcp6"),
                 format!("{}{}", tcp_header(), lines.join("")),
             )
         }

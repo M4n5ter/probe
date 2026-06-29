@@ -105,11 +105,14 @@ pub(super) struct TransparentProxyRelayPlan {
 }
 
 impl TransparentProxyRelayPlan {
-    pub(super) fn inbound_tproxy(listen_port: u16) -> Self {
+    pub(super) fn inbound_tproxy(listen_port: u16, proxy_bypass_mark: NonZeroU32) -> Self {
         Self {
             target_recovery: TransparentProxyTargetRecovery::TproxyLocalAddress,
             self_relay_guard: TransparentProxySelfRelayGuard::RejectSamePort { listen_port },
-            upstream_connect: TransparentProxyUpstreamConnectPlan::new(CONNECT_TIMEOUT, None),
+            upstream_connect: TransparentProxyUpstreamConnectPlan::new(
+                CONNECT_TIMEOUT,
+                Some(probe_io::TcpSocketMark::new(proxy_bypass_mark)),
+            ),
         }
     }
 
@@ -296,6 +299,7 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::{Ipv4Addr, SocketAddr, TcpListener},
+        num::NonZeroU32,
     };
 
     use probe_config::{
@@ -403,6 +407,17 @@ mod tests {
     }
 
     #[test]
+    fn inbound_tproxy_upstream_connect_uses_proxy_bypass_mark() {
+        let mark = proxy_bypass_mark();
+        let plan = TransparentProxyRelayPlan::inbound_tproxy(15001, mark);
+
+        assert_eq!(
+            plan.upstream_connect.proxy_bypass_mark(),
+            Some(probe_io::TcpSocketMark::new(mark))
+        );
+    }
+
+    #[test]
     fn upstream_connect_success_records_connect_metrics() -> Result<(), Box<dyn std::error::Error>>
     {
         let runtime = TransparentProxyRuntime::for_test_config(&managed_interception_config());
@@ -472,7 +487,7 @@ mod tests {
         let relay = spawn_relay(
             Socket::from(downstream),
             SockAddr::from(peer),
-            TransparentProxyRelayPlan::inbound_tproxy(0),
+            unmarked_tproxy_relay_plan(0),
             shutdown_requested,
             registry,
             slot,
@@ -503,6 +518,18 @@ mod tests {
                 ..TransparentInterceptionProxyConfig::default()
             },
             ..EnforcementInterceptionConfig::default()
+        }
+    }
+
+    fn proxy_bypass_mark() -> NonZeroU32 {
+        NonZeroU32::new(0x5450_0102).expect("test proxy bypass mark should be non-zero")
+    }
+
+    fn unmarked_tproxy_relay_plan(listen_port: u16) -> TransparentProxyRelayPlan {
+        TransparentProxyRelayPlan {
+            target_recovery: TransparentProxyTargetRecovery::TproxyLocalAddress,
+            self_relay_guard: TransparentProxySelfRelayGuard::RejectSamePort { listen_port },
+            upstream_connect: TransparentProxyUpstreamConnectPlan::new(CONNECT_TIMEOUT, None),
         }
     }
 }
