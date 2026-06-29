@@ -172,7 +172,10 @@ strategy = "none"
 # ca_certificate_ref = "mitm-ca"
 # ca_private_key_ref = "mitm-ca-key"
 # CA-backed product proxy TLS termination requires downstream clients to send
-# DNS SNI. Or use a fixed leaf certificate instead of the CA pair:
+# DNS SNI. The product proxy also uses that SNI as the upstream TLS server name
+# when upstream TLS is enabled, but it still connects to the configured or
+# recovered target instead of routing by hostname. Or use a fixed leaf
+# certificate instead of the CA pair:
 # leaf_certificate_chain_refs = ["mitm-leaf"]
 # leaf_private_key_ref = "mitm-leaf-key"
 # upstream_trust_anchor_refs = ["upstream-ca"]

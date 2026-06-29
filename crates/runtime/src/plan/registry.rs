@@ -8,9 +8,9 @@ const DEFAULT_L7_MITM_UNAVAILABLE_REASON: &str = concat!(
     "L7 MITM control-plane support exists for selector-scoped external or managed backends, ",
     "readiness probes, operator-managed client trust contracts, material refs, ",
     "plaintext bridge provenance, product proxy downstream and upstream TLS relay, ",
-    "and proxy-side policy hooks, ",
+    "downstream SNI propagation to upstream TLS server names, and proxy-side policy hooks, ",
     "but no MITM backend is configured; default whole-machine transparent MITM is rejected, ",
-    "and transparent HTTPS MITM E2E, ALPN-aware routing, SNI-based upstream routing, strong original attribution, ",
+    "and transparent HTTPS MITM E2E, ALPN-aware routing, hostname-to-upstream target routing, strong original attribution, ",
     "and automatic client trust store installation remain unavailable"
 );
 

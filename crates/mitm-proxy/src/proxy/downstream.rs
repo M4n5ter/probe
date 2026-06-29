@@ -39,6 +39,15 @@ pub(super) enum DownstreamStream {
     Tls(Box<TlsServerStream>),
 }
 
+impl DownstreamStream {
+    pub(super) fn tls_server_name(&self) -> Option<&str> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Tls(stream) => stream.conn.server_name(),
+        }
+    }
+}
+
 impl Read for DownstreamStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         match self {

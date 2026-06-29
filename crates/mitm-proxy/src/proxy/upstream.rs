@@ -11,7 +11,7 @@ use crate::{
     MitmProxyError,
     error::io_error,
     http::HttpMessage,
-    tls::{TlsClientStream, TlsUpstreamConnector, UpstreamTlsConfig},
+    tls::{TlsClientStream, TlsUpstreamConnector, UpstreamTlsConfig, UpstreamTlsNameCandidates},
 };
 
 pub(crate) struct UpstreamConnector {
@@ -35,6 +35,7 @@ impl UpstreamConnector {
         &self,
         target: SocketAddr,
         request: &HttpMessage,
+        downstream_tls_server_name: Option<&str>,
         timeout: Duration,
     ) -> Result<UpstreamConnection, MitmProxyError> {
         let tls_authority = self
@@ -52,7 +53,10 @@ impl UpstreamConnector {
         configure_stream(&stream, timeout)?;
         match &self.tls {
             Some(tls) => tls
-                .connect(stream, tls_authority)
+                .connect(
+                    stream,
+                    UpstreamTlsNameCandidates::observed(downstream_tls_server_name, tls_authority),
+                )
                 .map(Box::new)
                 .map(UpstreamConnection::Tls),
             None => Ok(UpstreamConnection::Plain(stream)),

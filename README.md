@@ -96,8 +96,10 @@ upstream TLS relay with native roots or imported trust anchors, strategy-specifi
 target recovery, outbound upstream socket-mark bypass, and a loopback HTTP JSON
 policy hook for proxy-side enforcement delegation.
 CA-backed dynamic certificate mode requires downstream TLS clients to send DNS
-SNI; it only selects the downstream certificate and does not perform upstream
-SNI-based routing.
+SNI. When upstream TLS is enabled, the product proxy uses that SNI as the
+upstream TLS server name unless an explicit upstream server name is pinned; it
+still connects to the configured or recovered target and does not perform
+hostname-to-upstream target routing.
 The first-party `product_proxy` backend derives its proxy CLI from typed MITM
 readiness, bridge, policy hook, CA or leaf TLS material refs, and upstream trust
 material refs.
@@ -117,8 +119,9 @@ The following are intentional boundaries of the current implementation:
   operator-managed contract.
 - No claim that crate-level downstream/upstream TLS relay proves full
   transparent HTTPS MITM; transparent rule-path end-to-end validation,
-  ALPN-aware routing, SNI-based upstream routing, strong original attribution,
-  and automatic trust-store mutation remain explicit capability boundaries.
+  ALPN-aware routing, hostname-to-upstream target routing, strong original
+  attribution, and automatic trust-store mutation remain explicit capability
+  boundaries.
 - No hidden long-term raw traffic retention.
 - No HTTP/2, HTTP/3, or QUIC parser yet.
 - WebSocket support emits handoff, frame metadata, and 16 MiB bounded
