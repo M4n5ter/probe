@@ -64,6 +64,30 @@ pub(super) fn read_events(
     )
 }
 
+pub(super) fn output_loss_gap_events(
+    tracked_flows: &TrackedEbpfFlows,
+    timestamp: Timestamp,
+    lost_events: u64,
+) -> Vec<CaptureEvent> {
+    tracked_flows
+        .active_payload_loss_targets()
+        .flat_map(|tracked| {
+            tracked
+                .payload_directions()
+                .directions()
+                .map(move |direction| {
+                    ebpf_output_loss_gap(
+                        timestamp,
+                        tracked.flow.clone(),
+                        direction,
+                        stream_offset(tracked, direction),
+                        lost_events,
+                    )
+                })
+        })
+        .collect()
+}
+
 struct PayloadSample<'a> {
     timestamp: Timestamp,
     direction: Direction,
@@ -175,6 +199,35 @@ fn ebpf_payload_gap(
             direction,
             expected_offset,
             next_offset,
+            reason,
+        },
+    })
+}
+
+fn ebpf_output_loss_gap(
+    timestamp: Timestamp,
+    flow: FlowContext,
+    direction: Direction,
+    expected_offset: u64,
+    lost_events: u64,
+) -> CaptureEvent {
+    let reason = format!(
+        "eBPF process observation output ring buffer lost {lost_events} event(s) while this flow is currently tracked; affected flow, time, bytes, and next stream offset are unknown"
+    );
+    let enforcement_evidence = EnforcementEvidence::observation_only_with_detail(
+        ObservationOnlyReason::ProviderCaptureLoss,
+        reason.clone(),
+    );
+    CaptureEvent::Gap(CapturedGap {
+        timestamp,
+        flow,
+        origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
+        enforcement_evidence,
+        enforcement_evidence_propagation: EnforcementEvidencePropagation::Flow,
+        gap: Gap {
+            direction,
+            expected_offset,
+            next_offset: None,
             reason,
         },
     })
@@ -399,6 +452,53 @@ mod tests {
         );
 
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn output_loss_gaps_fan_out_to_active_payload_directions_without_advancing_offsets() {
+        let mut tracked = tracked_flow(7);
+        let _ = write_events(
+            &mut tracked,
+            &write_observation(7, 5, b"GET /", false, false),
+            timestamp(1),
+        );
+
+        let events = output_loss_gap_events(&tracked, timestamp(2), 3);
+
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| matches!(
+            event,
+            CaptureEvent::Gap(gap)
+                if gap.origin.source() == CaptureSource::EbpfSyscall
+                    && gap.enforcement_evidence
+                        .destructive_enforcement_rejection_reason()
+                        .is_some_and(|reason| reason.contains("lost observations"))
+                    && gap.gap.next_offset.is_none()
+                    && gap.gap.reason.contains("lost 3 event(s)")
+                    && gap.gap.reason.contains("affected flow, time, bytes")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CaptureEvent::Gap(gap)
+                if gap.gap.direction == Direction::Outbound
+                    && gap.gap.expected_offset == 5
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CaptureEvent::Gap(gap)
+                if gap.gap.direction == Direction::Inbound
+                    && gap.gap.expected_offset == 0
+        )));
+
+        let outbound = write_events(
+            &mut tracked,
+            &write_observation(7, 1, b"x", false, false),
+            timestamp(3),
+        );
+        let [CaptureEvent::Bytes(bytes)] = outbound.as_slice() else {
+            panic!("expected outbound bytes after output loss fan-out: {outbound:?}");
+        };
+        assert_eq!(bytes.stream_offset, 5);
     }
 
     fn tracked_flow(fd: i32) -> TrackedEbpfFlows {

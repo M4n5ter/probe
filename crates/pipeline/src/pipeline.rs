@@ -17,8 +17,8 @@ use parsers::{ParserInput, ProtocolParserFactory};
 use policy::{PolicyHook, PolicyOutcome, PolicyRuntime, hook_for_event};
 use probe_core::{
     CompiledSelector, EnforcementDecision, EnforcementEvidence, EventEnvelope, EventKind,
-    EventProvenance, FlowIdentity, PolicyEmissionStage, PolicyRuntimeError, SpoolPayloadSchema,
-    Timestamp, Verdict,
+    EventProvenance, FlowIdentity, ObservationOnlyReason, PolicyEmissionStage, PolicyRuntimeError,
+    SpoolPayloadSchema, Timestamp, Verdict,
 };
 use storage::{DurableSpool, IngressCursorOwner, SpoolPayload};
 use thiserror::Error;
@@ -141,16 +141,14 @@ impl FlowEvidenceTracker {
         evidence: &EnforcementEvidence,
         propagation: EnforcementEvidencePropagation,
     ) -> EnforcementEvidence {
+        let effective = strongest_enforcement_evidence(self.current(flow_id), evidence);
         if propagation.is_flow_carried()
             && matches!(evidence, EnforcementEvidence::ObservationOnly { .. })
         {
-            return self
-                .checkpoint_blockers
-                .entry(flow_id.clone())
-                .or_insert_with(|| evidence.clone())
-                .clone();
+            self.checkpoint_blockers
+                .insert(flow_id.clone(), effective.clone());
         }
-        strongest_enforcement_evidence(self.current(flow_id), evidence)
+        effective
     }
 
     fn current(&self, flow_id: &FlowIdentity) -> EnforcementEvidence {
@@ -173,10 +171,21 @@ fn strongest_enforcement_evidence(
     current: EnforcementEvidence,
     incoming: &EnforcementEvidence,
 ) -> EnforcementEvidence {
-    if matches!(current, EnforcementEvidence::ObservationOnly { .. }) {
+    if enforcement_evidence_priority(&current) >= enforcement_evidence_priority(incoming) {
         current
     } else {
         incoming.clone()
+    }
+}
+
+fn enforcement_evidence_priority(evidence: &EnforcementEvidence) -> u8 {
+    match evidence {
+        EnforcementEvidence::DestructiveAllowed => 0,
+        EnforcementEvidence::ObservationOnly { reason, .. } => match reason {
+            ObservationOnlyReason::EbpfSyscallPayloadSnapshot => 1,
+            ObservationOnlyReason::EbpfUnresolvedFlow => 2,
+            ObservationOnlyReason::ProviderCaptureLoss => 3,
+        },
     }
 }
 

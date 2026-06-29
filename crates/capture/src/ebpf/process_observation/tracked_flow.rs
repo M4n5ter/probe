@@ -62,6 +62,13 @@ impl TrackedEbpfFlows {
             .collect()
     }
 
+    pub(super) fn active_payload_loss_targets(&self) -> impl Iterator<Item = &TrackedEbpfFlow> {
+        self.recency_order
+            .iter()
+            .filter_map(|key| self.by_descriptor.get(key))
+            .filter(|tracked| !tracked.payload_directions.is_empty())
+    }
+
     pub(super) fn get_write_mut(
         &mut self,
         write: &EbpfSocketWriteObservation,
@@ -141,6 +148,10 @@ impl TrackedEbpfFlows {
 impl TrackedEbpfFlow {
     fn allows_payload(&self, direction: Direction) -> bool {
         self.payload_directions.allows(direction)
+    }
+
+    pub(super) fn payload_directions(&self) -> PayloadDirections {
+        self.payload_directions
     }
 }
 

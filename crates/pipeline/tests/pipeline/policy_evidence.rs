@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use super::fixture::{
     SequenceProvider, connection_closed, demo_flow_with_ports,
     event_local_observation_only_ebpf_unresolved_gap, exported_envelopes,
-    flow_carried_observation_only_ebpf_syscall_gap,
+    flow_carried_observation_only_ebpf_syscall_gap, flow_carried_provider_capture_loss_gap,
     observation_only_ebpf_syscall_bytes_with_direction,
 };
 
@@ -103,6 +103,47 @@ end
         )
     }));
     assert_unsupported_reset(&envelopes, "eBPF syscall payload snapshot");
+    assert_no_apply(metrics);
+    Ok(())
+}
+
+#[test]
+fn provider_capture_loss_upgrades_weaker_flow_evidence() -> Result<(), Box<dyn std::error::Error>> {
+    let flow = demo_flow_with_ports(50_000, 80, 47);
+    let (envelopes, metrics) = run_reset_policy(
+        vec![
+            observation_only_ebpf_syscall_bytes_with_direction(
+                flow.clone(),
+                Direction::Outbound,
+                b"GET /loss HTTP/1.1\r\nHost: test\r\n\r\n",
+            ),
+            flow_carried_provider_capture_loss_gap(flow),
+        ],
+        PolicyHook::Gap,
+        r#"
+function on_gap(_)
+  return probe.verdict({
+action = "reset",
+scope = "flow",
+reason = "matched provider loss gap",
+confidence = 100,
+  })
+end
+"#,
+    )?;
+
+    assert!(envelopes.iter().any(|envelope| {
+        matches!(
+            envelope.kind(),
+            EventKind::Gap(gap)
+                if gap.reason.contains("provider output loss")
+                    && envelope
+                        .enforcement_evidence()
+                        .destructive_enforcement_rejection_reason()
+                        .is_some_and(|reason| reason.contains("lost observations"))
+        )
+    }));
+    assert_unsupported_reset(&envelopes, "lost observations");
     assert_no_apply(metrics);
     Ok(())
 }

@@ -18,7 +18,7 @@ use super::super::{
     flow_start::{PendingEbpfFlowResolution, PendingEbpfFlowStart},
     observation_source::{EbpfObservationSource, ProbeObservationSource},
     payload_authorization::SocketPayloadSampleAuthorization,
-    payload_bridge::{read_events, write_events},
+    payload_bridge::{output_loss_gap_events, read_events, write_events},
     payload_direction::PayloadDirections,
     tracked_flow::TrackedEbpfFlows,
 };
@@ -72,7 +72,7 @@ impl EbpfProcessObservationProvider {
             return self.poll_pending_flow_resolution();
         }
         if self.output_loss.should_check_during_drain()
-            && let Some(event) = self.output_loss_event()?
+            && let Some(event) = self.output_loss_events()?
         {
             return Ok(CapturePoll::event(event));
         }
@@ -80,7 +80,7 @@ impl EbpfProcessObservationProvider {
             self.output_loss.record_observation();
             return self.poll_observation(observation);
         }
-        if let Some(event) = self.output_loss_event()? {
+        if let Some(event) = self.output_loss_events()? {
             return Ok(CapturePoll::event(event));
         }
         Ok(if self.stop_when_idle {
@@ -205,12 +205,20 @@ impl EbpfProcessObservationProvider {
         Ok(())
     }
 
-    fn output_loss_event(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
+    fn output_loss_events(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
         let count = self.observations.process_output_loss_count()?;
-        Ok(self
-            .output_loss
-            .checkpoint(count)
-            .map(|lost_events| output_loss_event(self.clock.next_timestamp(), lost_events)))
+        let Some(lost_events) = self.output_loss.checkpoint(count) else {
+            return Ok(None);
+        };
+        let timestamp = self.clock.next_timestamp();
+        self.pending_events
+            .push_back(output_loss_event(timestamp, lost_events));
+        self.pending_events.extend(output_loss_gap_events(
+            &self.tracked_flows,
+            timestamp,
+            lost_events,
+        ));
+        Ok(self.pending_events.pop_front())
     }
 
     fn close_event(&mut self, close: &EbpfCloseTracepointObservation) -> Option<CaptureEvent> {
@@ -250,7 +258,7 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider emits connect and accept/accept4 flow-start observations, selector-authorized always-degraded outbound single-buffer and bounded iovec-prefix syscall argument samples plus inbound single-buffer and bounded iovec-prefix syscall result samples, best-effort close/plain close_range descriptor lifecycle events, and output ring-buffer failure conversion to degraded capture_loss events; payload beyond the bounded iovec scan window or sample buffer, partial-write retry semantics, and flow-specific lost-event reconstruction are not implemented",
+            "eBPF provider emits connect and accept/accept4 flow-start observations, selector-authorized always-degraded outbound single-buffer and bounded iovec-prefix syscall argument samples plus inbound single-buffer and bounded iovec-prefix syscall result samples, best-effort close/plain close_range descriptor lifecycle events, output ring-buffer failure conversion to degraded capture_loss events, and conservative unknown-offset gap fan-out to active tracked payload flows; payload beyond the bounded iovec scan window or sample buffer, partial-write retry semantics, and precise flow-specific lost-event reconstruction are not implemented",
         )]
     }
 
@@ -691,6 +699,54 @@ mod tests {
     }
 
     #[test]
+    fn output_loss_fans_out_unknown_gaps_to_active_payload_flows() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let source = OutputLossObservationSource {
+            observations: VecDeque::from([connect_observation(process, 7, remote)]),
+            counts: VecDeque::from([2, 2]),
+        };
+        let selector = Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Inbound, Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            static_resolver(local, remote),
+            Some(selector),
+        );
+
+        let (_, opened_flow) = expect_connection_opened(&mut provider)?;
+        let loss = expect_output_loss(provider.poll_next()?);
+        assert_eq!(loss.loss.lost_events, 2);
+
+        let first_gap = expect_gap_event(provider.poll_next()?);
+        let second_gap = expect_gap_event(provider.poll_next()?);
+        let gaps = [first_gap, second_gap];
+
+        assert!(gaps.iter().all(|gap| gap.flow.id == opened_flow.id));
+        assert!(gaps.iter().all(|gap| gap.gap.next_offset.is_none()));
+        assert!(
+            gaps.iter()
+                .all(|gap| gap.gap.reason.contains("affected flow, time, bytes"))
+        );
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.gap.direction == Direction::Inbound)
+        );
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.gap.direction == Direction::Outbound)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn interleaves_output_loss_during_observation_drain() -> TestResult {
         let process = observed_process(101, 100);
         let source = OutputLossObservationSource {
@@ -798,6 +854,16 @@ mod tests {
             panic!("expected output loss event, got {event:?}");
         };
         loss
+    }
+
+    fn expect_gap_event(poll: CapturePoll) -> crate::CapturedGap {
+        let CapturePoll::Event(event) = poll else {
+            panic!("expected gap event, got {poll:?}");
+        };
+        let CaptureEvent::Gap(gap) = *event else {
+            panic!("expected gap event, got {event:?}");
+        };
+        gap
     }
 
     fn provider_from_observations(

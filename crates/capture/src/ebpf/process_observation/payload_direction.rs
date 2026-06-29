@@ -28,6 +28,12 @@ impl PayloadDirections {
         self.mask & direction_bit(direction) != 0
     }
 
+    pub(super) fn directions(self) -> impl Iterator<Item = Direction> {
+        [Direction::Inbound, Direction::Outbound]
+            .into_iter()
+            .filter(move |direction| self.allows(*direction))
+    }
+
     pub(super) fn is_empty(self) -> bool {
         self.mask == 0
     }

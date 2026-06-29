@@ -84,7 +84,7 @@ TLS plaintext / session secret 现状：
 当前明确缺口：
 
 - unbounded scatter/gather continuation。
-- flow-specific lost-event reconstruction。
+- precise flow-specific lost-event reconstruction。
 - 强 socket lifetime。
 - 内置 TLS MITM 明文数据面、proxy 内部保护动作执行和 trust/install lifecycle。
 - 完整 TCP 栈恢复。
@@ -274,6 +274,8 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
   - 已实现：best-effort descriptor close/plain close_range 到 `ConnectionClosed` lifecycle event。
   - 已实现：unresolved connect/accept 到 degraded `Gap` 的 provider wiring。
   - 已实现：output ringbuf write failure counter 到 degraded `capture_loss` event 的转换。
+  - 已实现：process output loss delta 会对 active tracked payload flows 发出 conservative unknown-offset `Gap` fan-out，
+    用于让 parser/policy/export 看到这些 flow 可能受到 provider loss 影响。
   - 已实现：成功 procfs fd lookup 在 live fd 且权限允许时，可把 `SO_COOKIE` 传播到 flow identity。
   - 已实现：outbound sample 只有 write direction 被授权时，才在 syscall enter 通过 allow gate 后捕获 bounded prefix。
   - 已实现：outbound syscall exit 只根据实际返回长度裁剪或降级，避免 exit 后重读可变用户 buffer。
@@ -286,8 +288,8 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
   - 边界：capability 和 evidence mode 仍是 degraded/best-effort。
   - 边界：outbound sample 不是内核已发送字节的强证明，inbound sample 也只是 syscall 返回后的用户 buffer 观察，不等于完整 socket 流。
   - 边界：`SO_COOKIE` 只增强成功 fd lookup 后的身份，不解决 fd 关闭后才解析、dup/fork/fd passing 或 lost event。
-  - 边界：output ringbuf failure 只能报告 provider 级 loss count，不知道丢失事件属于哪个 flow，也不能重建 parser state。
-  - 缺口：unbounded scatter/gather continuation、flow-specific lost-event reconstruction、partial-write retry 语义和完整
+  - 边界：output ringbuf failure 的 flow fan-out 是保守影响信号，不知道具体丢失事件、字节范围或 next offset，也不能重建 parser state。
+  - 缺口：unbounded scatter/gather continuation、precise flow-specific lost-event reconstruction、partial-write retry 语义和完整
     kernel/socket-path traffic capture program 尚未完成。
   - 缺口：descriptor close/plain close_range + fd-table epoch 是保守生命周期边界，不是强 socket lifetime。
   - fallback 语义：`auto` 会优先规划可构建的 degraded eBPF provider，并在 evidence fields/health 保留降级原因。
@@ -1419,16 +1421,16 @@ BTF 或 eBPF 主程序不可用时：
 - Object preflight
   - `ebpf-object` 使用 `aya-obj` 解析 object，并按 process/TLS artifact 类型执行 strict contract 校验。
   - process artifact 和 TLS plaintext artifact 分开校验，避免 process loader 夹带 TLS maps/programs。
-  - 仍缺 flow-specific lost-event reconstruction 和完整 kernel/socket-path capture 验收。
+  - 仍缺 precise flow-specific lost-event reconstruction 和完整 kernel/socket-path capture 验收。
 - Shared ABI
   - `ebpf-abi` 定义 ringbuf envelope、公共 header decoder、ABI revision、process observation records 和 TLS plaintext sample records。
   - bounded sample record 必须表达 original length、captured length、truncated/read-failed flags 和 gap 语义。
-  - 仍缺 kernel-side socket cookie、fd-table identity、flow-specific lost-event record 和 unbounded scatter/gather collector。
+  - 仍缺 kernel-side socket cookie、fd-table identity、precise flow-specific lost-event record 和 unbounded scatter/gather collector。
 - Kernel object
   - `ebpf-program` 生成独立 process observation artifact 和 TLS plaintext artifact。
   - process artifact 已覆盖 connect/accept/close/close_range、fd lifecycle epoch、bounded outbound/inbound syscall samples 和 process output loss counter。
   - TLS artifact 已覆盖 libssl plaintext uprobe producer、TLS state maps、stream offset 和 TLS output loss counter。
-  - 仍缺强 fd lifecycle、fd-table identity、payload continuation、完整 kernel traffic capture 和 flow-specific lost-event reconstruction。
+  - 仍缺强 fd lifecycle、fd-table identity、payload continuation、完整 kernel traffic capture 和 precise flow-specific lost-event reconstruction。
 - Userspace loader/provider
   - `capture::EbpfProcessObservationProbe` load/attach process tracepoints、打开 ringbuf/allow map/loss counter，并解码 typed observation。
   - provider 把 connect/accept observation 经 procfs resolver 转成 `ConnectionOpened`，按 selector 写入 allow map，并输出 degraded bytes/gap/lifecycle/loss events。
@@ -1436,7 +1438,7 @@ BTF 或 eBPF 主程序不可用时：
 - Attribution bridge
   - connect/accept observation + TGID/thread PID/fd lookup 转成单个 `ConnectionOpened`。
   - agent procfs resolver 支持 thread fd、TGID fallback、`NStgid` alias、process hint 和可选 `SO_COOKIE`。
-  - 仍缺 kernel-side socket-cookie/fd-table identity、exit/error event 和 flow-specific lost-event reconstruction。
+  - 仍缺 kernel-side socket-cookie/fd-table identity、exit/error event 和 precise flow-specific lost-event reconstruction。
 - Build gate
   - `xtask check-ebpf` 执行 eBPF fmt、BPF target clippy、locked release build 和 object contract preflight。
   - `xtask e2e-ebpf-process-loopback` 在 root/bpffs 下覆盖 process artifact attach、ringbuf、procfs attribution、HTTP parser、policy 和 durable spool readback。
@@ -1557,8 +1559,10 @@ vector syscall 设计刻意保守：
 loss 与 fallback 边界：
 
 - output ringbuf write failure 已能转换为 provider 级 degraded `capture_loss` event。
-- `capture_loss` 不知道具体丢失 flow，也不能重建 parser state。
-- flow-specific lost-event reconstruction 还没有完成。
+- process output loss delta 会对 active tracked payload flows 额外发出 `next_offset = None` 的 conservative `Gap` fan-out，
+  表示这些 flow 可能受到 provider loss 影响。
+- `capture_loss` 仍不知道具体丢失 flow；flow fan-out 也不知道具体丢失字节范围，不能重建 parser state。
+- precise flow-specific lost-event reconstruction 还没有完成。
 - partial-write retry 语义还没有完成。
 - 完整 kernel-side traffic capture program 还没有完成。
 - 因此 `ebpf` provider descriptor 在 host、object、contract 和 procfs socket attribution preflight 都通过后，仍是 degraded capability /
@@ -2851,7 +2855,8 @@ flowchart LR
   sample 和 inbound single-buffer/bounded iovec-prefix syscall result sample 到 always-degraded
   `CapturedBytes`/`Gap` 的 payload bridge、best-effort descriptor close/close_range 到 `ConnectionClosed` lifecycle event、
   unresolved connect/accept 到 degraded `Gap` 的 provider path，以及 output ringbuf failure counter 到 degraded `capture_loss`
-  event 的转换已存在。超出 bounded iovec scan window/sample buffer 的 continuation、flow-specific lost-event reconstruction 和完整
+  event 的转换和 active tracked payload flow 的 conservative unknown-offset `Gap` fan-out 已存在。超出 bounded iovec scan window/sample buffer
+  的 continuation、precise flow-specific lost-event reconstruction 和完整
   kernel-side capture program 完成前，host/object/contract/procfs socket attribution preflight 成功仍然是 degraded capability /
   best-effort evidence；`auto` 会优先规划这个 eBPF provider，运行期 open 失败才继续尝试后续 live fallback，并把证据降级原因和 open failure 分别暴露给
   status/health。
@@ -3949,13 +3954,14 @@ metrics 必须覆盖：
   - 负责 bounded sample：selector-authorized outbound/inbound single-buffer 或 bounded iovec-prefix sample 到
     always-degraded `CapturedBytes`/`Gap` 的 payload bridge。
   - 负责 loss bridge：process/TLS output ringbuf failure delta 到 provider-scoped degraded
-    `CapturedLoss`/`EventKind::CaptureLoss`。
+    `CapturedLoss`/`EventKind::CaptureLoss`；process provider 还会对 active tracked payload flows 发出 conservative
+    unknown-offset `Gap` fan-out。
   - 负责 TLS plaintext：libssl uprobe discovery/attach plan、libssl plaintext sample-source provider adapter。
   - 负责 TLS material/decrypt core：TLS 1.3 session-secret protected-record decrypt core、keylog record 归一化、
     ServerHello observed cipher suite 补齐、plaintext event bridge、binding planner、ciphertext stream adapter、
     显式 flow-binding decrypt core、显式绑定 decrypting provider adapter 和自动绑定 provider adapter。
   - 不负责：parser/policy/export 语义、agent composition root 策略和 material IO。
-  - 不声明：超出 bounded scan/sample 的 payload continuation、flow-specific lost-event reconstruction、强
+  - 不声明：超出 bounded scan/sample 的 payload continuation、precise flow-specific lost-event reconstruction、强
     socket-lifetime close、unbounded/general record sequence resync 和 TLS 1.2 key block decrypt。
 
 - `config`
@@ -4179,8 +4185,9 @@ benchmark 参数：
     selector-authorized outbound single-buffer/bounded iovec-prefix syscall argument sample 与 inbound
     single-buffer/bounded iovec-prefix syscall result sample 到 always-degraded `CapturedBytes`/`Gap` 的 payload
     bridge、best-effort descriptor close/close_range 到 `ConnectionClosed` lifecycle event、unresolved connect/accept 到
-    degraded `Gap` 的 provider path，以及 output ringbuf failure delta 到 degraded `capture_loss` export event 的
-    provider/pipeline path。fd resolution retry 不在 provider poll path 内 sleep，而是保留 pending resolution 并在后续 poll 中继续尝试。
+    degraded `Gap` 的 provider path、output ringbuf failure delta 到 degraded `capture_loss` export event 的
+    provider/pipeline path，以及 active tracked payload flow 的 conservative unknown-offset `Gap` fan-out。fd resolution retry
+    不在 provider poll path 内 sleep，而是保留 pending resolution 并在后续 poll 中继续尝试。
   - TLS plaintext sidecar：libssl plaintext sample ABI、capture bridge、userspace uprobe loader/provider、agent startup attach
     planning、agent concrete sidecar owner、按 `tls.plaintext.instrumentation.reconcile_interval_ms` 执行的周期性 process
     scan/reconcile、attach target reconcile diff model、concrete provider reconcile 方法、procfs fd-to-flow resolver、
@@ -4191,7 +4198,7 @@ benchmark 参数：
     覆盖同 PID 运行中 `dlopen` 第一份 libssl、产生 durable plaintext output、释放第一份 `Library`
     handle、再加载第二份 libssl mapped path、等待第二个 target active，并再次产生 durable plaintext output。
   - Missing：TLS lifecycle 缺口见 [Remaining TLS lifecycle gaps](#remaining-tls-lifecycle-gaps)；超出 bounded scan/sample 的
-    payload continuation、flow-specific lost-event reconstruction 和完整 kernel-side capture program 仍未完成。
+    payload continuation、precise flow-specific lost-event reconstruction 和完整 kernel-side capture program 仍未完成。
 - 显式 `plaintext_feed`：从 `capture.plaintext_feed.path` 指向的 JSON-lines 文件流式读取外部明文 record，用于验证已解密明文路径。该模式不是 live capture
   fallback，也不自动和 libpcap/eBPF 合并。
 
@@ -4509,7 +4516,7 @@ Enforcement/interception 验证面不覆盖默认 destructive action。
 - 证明 HTTP parser、policy 和 durable output 的真实特权闭环。
 - 不把 syscall argument/result snapshot 提升为强 payload proof。
 - 不覆盖真实 ringbuf saturation。
-- 不覆盖 flow-specific lost-event reconstruction。
+- 不覆盖 precise flow-specific lost-event reconstruction。
 
 - `e2e-tls-plaintext-provider-loopback` 必须先运行 `cargo run -p xtask --locked -- ebpf-build` 和 `cargo build -p xtask -p
   e2e-fixture --locked`，并在 root/bpffs 环境下运行 `sudo target/debug/xtask e2e-tls-plaintext-provider-loopback`。该入口启动同进程
@@ -4688,7 +4695,7 @@ Enforcement/interception 验证面不覆盖默认 destructive action。
 
 - 内核最终发送/接收完整字节。
 - 完整 socket lifetime。
-- flow-specific lost-event reconstruction。
+- precise flow-specific lost-event reconstruction。
 
 该验收仍保持 eBPF provider 为 degraded：它证明“可观测并可解析”，不把这些观察提升为强 payload 或强 lifecycle 证明。
 
@@ -4737,12 +4744,13 @@ Enforcement/interception 验证面不覆盖默认 destructive action。
 #### Loss conversion
 
 - provider/pipeline 单元测试覆盖 process/TLS output loss delta 到 provider-scoped degraded `capture_loss` export event。
+- process provider 单元测试覆盖 output loss 后 active tracked payload flow 的 conservative unknown-offset `Gap` fan-out。
 - Lua policy 不对 `capture_loss` 开放 hook。
 
 #### Remaining privileged gaps
 
 - 真实 ringbuf saturation 仍需 privileged/e2e 覆盖。
-- flow-specific lost-event reconstruction 仍需 privileged/e2e 覆盖。
+- precise flow-specific lost-event reconstruction 仍需 privileged/e2e 覆盖。
 
 #### Selector 与 discovery
 

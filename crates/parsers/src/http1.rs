@@ -84,6 +84,9 @@ impl ProtocolParser for Http1Parser {
                 }
                 if self.handoff.is_none() {
                     self.state_mut(direction).reset();
+                    if next_offset.is_none() {
+                        self.pending_response_contexts.clear();
+                    }
                 }
                 ParserOutput::from_events(vec![gap_event(
                     direction,
@@ -1419,6 +1422,37 @@ mod tests {
         assert!(
             matches!(output.events().first(), Some(EventKind::Gap(gap)) if gap.reason == "lost bytes")
         );
+    }
+
+    #[test]
+    fn unknown_gap_clears_pending_response_context() {
+        let mut parser = Http1Parser::default();
+        parser.ingest(
+            Direction::Outbound,
+            b"HEAD /server HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        );
+
+        ProtocolParser::ingest(
+            &mut parser,
+            ParserInput::Gap {
+                direction: Direction::Inbound,
+                expected_offset: 0,
+                next_offset: None,
+                reason: "provider output loss",
+            },
+        );
+        let events = parser.ingest(
+            Direction::Inbound,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        );
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EventKind::HttpBodyChunk(chunk)
+                if chunk.direction == Direction::Inbound
+                    && chunk.data.as_ref() == b"hello"
+                    && chunk.end_stream
+        )));
     }
 
     #[test]

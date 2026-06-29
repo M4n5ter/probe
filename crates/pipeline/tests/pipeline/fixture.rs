@@ -79,6 +79,29 @@ pub(super) fn flow_carried_observation_only_ebpf_syscall_gap(flow: FlowContext) 
     })
 }
 
+pub(super) fn flow_carried_provider_capture_loss_gap(flow: FlowContext) -> CaptureEvent {
+    let reason = "test provider output loss impacted active flow";
+    CaptureEvent::Gap(capture::CapturedGap {
+        timestamp: Timestamp {
+            monotonic_ns: 1,
+            wall_time_unix_ns: 1,
+        },
+        flow,
+        origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
+        enforcement_evidence: EnforcementEvidence::observation_only_with_detail(
+            ObservationOnlyReason::ProviderCaptureLoss,
+            reason,
+        ),
+        enforcement_evidence_propagation: capture::EnforcementEvidencePropagation::Flow,
+        gap: Gap {
+            direction: Direction::Outbound,
+            expected_offset: 5,
+            next_offset: None,
+            reason: reason.to_string(),
+        },
+    })
+}
+
 pub(super) fn event_local_observation_only_ebpf_unresolved_gap(flow: FlowContext) -> CaptureEvent {
     let reason = "test eBPF unresolved flow gap";
     CaptureEvent::Gap(capture::CapturedGap {
