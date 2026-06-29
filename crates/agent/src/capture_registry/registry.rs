@@ -89,7 +89,7 @@ fn ebpf_provider_descriptor(
     if !host.kernel_prerequisites_available() {
         return CaptureProviderDescriptor::unavailable(
             CaptureBackend::Ebpf,
-            CaptureProviderBuilder::Unimplemented,
+            CaptureProviderBuilder::Ebpf,
             format!("host prerequisites are not available: {}", host.summary()),
         );
     }
@@ -97,7 +97,7 @@ fn ebpf_provider_descriptor(
     let Some(object_path) = object_path else {
         return CaptureProviderDescriptor::unavailable(
             CaptureBackend::Ebpf,
-            CaptureProviderBuilder::Unimplemented,
+            CaptureProviderBuilder::Ebpf,
             format!(
                 "capture.ebpf.object_path is not configured; host probe: {}",
                 host.summary()
@@ -118,7 +118,7 @@ fn ebpf_provider_descriptor_from_object_report(
     if !object.object_available() {
         return CaptureProviderDescriptor::unavailable(
             CaptureBackend::Ebpf,
-            CaptureProviderBuilder::Unimplemented,
+            CaptureProviderBuilder::Ebpf,
             format!(
                 "eBPF object preflight via aya-obj failed: {}",
                 object.summary()
@@ -128,7 +128,7 @@ fn ebpf_provider_descriptor_from_object_report(
     if !object.preflight_available() {
         return CaptureProviderDescriptor::unavailable(
             CaptureBackend::Ebpf,
-            CaptureProviderBuilder::Unimplemented,
+            CaptureProviderBuilder::Ebpf,
             format!(
                 "eBPF object contract preflight via aya-obj failed: {}",
                 object.summary()
@@ -221,7 +221,7 @@ mod tests {
         );
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
-        assert_eq!(descriptor.builder, CaptureProviderBuilder::Unimplemented);
+        assert_eq!(descriptor.builder, CaptureProviderBuilder::Ebpf);
         assert_eq!(descriptor.capability_mode, RuntimeMode::Unavailable);
         let reason = descriptor
             .reason
@@ -246,7 +246,7 @@ mod tests {
         );
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
-        assert_eq!(descriptor.builder, CaptureProviderBuilder::Unimplemented);
+        assert_eq!(descriptor.builder, CaptureProviderBuilder::Ebpf);
         assert_eq!(descriptor.capability_mode, RuntimeMode::Unavailable);
         let reason = descriptor
             .reason
@@ -274,7 +274,7 @@ mod tests {
         );
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
-        assert_eq!(descriptor.builder, CaptureProviderBuilder::Unimplemented);
+        assert_eq!(descriptor.builder, CaptureProviderBuilder::Ebpf);
         assert_eq!(descriptor.capability_mode, RuntimeMode::Unavailable);
         let reason = descriptor
             .reason
@@ -306,7 +306,7 @@ mod tests {
         );
 
         assert_eq!(descriptor.backend, CaptureBackend::Ebpf);
-        assert_eq!(descriptor.builder, CaptureProviderBuilder::Unimplemented);
+        assert_eq!(descriptor.builder, CaptureProviderBuilder::Ebpf);
         assert_eq!(descriptor.capability_mode, RuntimeMode::Unavailable);
         let reason = descriptor
             .reason

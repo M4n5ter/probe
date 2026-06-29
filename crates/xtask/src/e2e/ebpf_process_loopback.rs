@@ -37,6 +37,8 @@ const RESPONSE_BODY_BYTES: usize = 32;
 const WRITE_CHUNKS: usize = 1;
 const CONNECT_WRITE_DELAY_MS: u64 = 2_000;
 const ACCEPT_READ_DELAY_MS: u64 = 2_000;
+const MIN_CAPTURE_EVENTS_FOR_HTTP_EXCHANGE: u64 = 8;
+const MIN_EXPORT_EVENTS_FOR_HTTP_EXCHANGE: u64 = 14;
 
 pub(crate) fn run() -> ExitCode {
     match run_inner() {
@@ -129,8 +131,8 @@ fn run_at(
             agent.child_mut(),
             &admin_socket_path,
             expected_policy_alert_messages().len() as u64,
-            expected_capture_event_floor(io_mode),
-            expected_export_event_floor(io_mode),
+            MIN_CAPTURE_EVENTS_FOR_HTTP_EXCHANGE,
+            MIN_EXPORT_EVENTS_FOR_HTTP_EXCHANGE,
         ),
         Err(_) => Ok(()),
     };
@@ -143,20 +145,6 @@ fn run_at(
     merge_run_results(fixture_result, progress_result, agent_result, spool_result)?;
 
     Ok(())
-}
-
-fn expected_capture_event_floor(io_mode: Http1FixtureIoMode) -> u64 {
-    match io_mode {
-        Http1FixtureIoMode::ReadvWritev | Http1FixtureIoMode::SendmsgRecvmsg => 12,
-        Http1FixtureIoMode::ReadWrite | Http1FixtureIoMode::SendRecv => 10,
-    }
-}
-
-fn expected_export_event_floor(io_mode: Http1FixtureIoMode) -> u64 {
-    match io_mode {
-        Http1FixtureIoMode::ReadvWritev | Http1FixtureIoMode::SendmsgRecvmsg => 18,
-        Http1FixtureIoMode::ReadWrite | Http1FixtureIoMode::SendRecv => 16,
-    }
 }
 
 fn fixture_config() -> PlainHttp1LoopbackFixtureConfig {
@@ -272,6 +260,7 @@ fn assert_spool_outputs(
     assert_expected_lifecycle_exports(&envelopes, listen_port)?;
     assert_expected_requests(&envelopes)?;
     assert_expected_responses(&envelopes)?;
+    assert_expected_body_chunks(&envelopes, listen_port)?;
     assert_expected_policy_alerts(&envelopes)?;
 
     println!(
@@ -631,6 +620,59 @@ fn assert_expected_responses(
 ) -> Result<(), Box<dyn std::error::Error>> {
     assert_expected_response_direction(envelopes, Direction::Inbound)?;
     assert_expected_response_direction(envelopes, Direction::Outbound)
+}
+
+fn assert_expected_body_chunks(
+    envelopes: &[EventEnvelope],
+    listen_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (side, direction) in [
+        (FlowSide::Client, Direction::Outbound),
+        (FlowSide::Server, Direction::Inbound),
+        (FlowSide::Server, Direction::Outbound),
+        (FlowSide::Client, Direction::Inbound),
+    ] {
+        if envelopes
+            .iter()
+            .any(|envelope| is_expected_body_chunk_envelope(envelope, listen_port, side, direction))
+        {
+            continue;
+        }
+        return Err(e2e_error(format!(
+            "missing eBPF {side:?} {direction:?} HTTP body chunk export event for fixture flow"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn is_expected_body_chunk_envelope(
+    envelope: &EventEnvelope,
+    listen_port: u16,
+    side: FlowSide,
+    direction: Direction,
+) -> bool {
+    let EventKind::HttpBodyChunk(chunk) = envelope.kind() else {
+        return false;
+    };
+    let Some(flow) = envelope.flow() else {
+        return false;
+    };
+    envelope.origin().source() == CaptureSource::EbpfSyscall
+        && envelope.origin().provider() == CaptureProviderKind::Ebpf
+        && envelope.degraded()
+        && matches!(
+            &envelope.enforcement_evidence(),
+            EnforcementEvidence::ObservationOnly {
+                reason: ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
+                ..
+            }
+        )
+        && chunk.direction == direction
+        && !chunk.data.is_empty()
+        && matches_expected_side(flow.local.port, flow.remote.port, listen_port, side)
+        && flow.attribution_confidence > 0
+        && is_fixture_process(&flow.process)
 }
 
 fn assert_expected_response_direction(
