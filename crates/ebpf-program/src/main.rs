@@ -18,21 +18,21 @@ use aya_ebpf::{
 };
 use ebpf_abi::{
     EBPF_ALLOWED_SOCKET_FDS_MAX_ENTRIES, EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES,
-    EBPF_PENDING_ACCEPTS_MAX_ENTRIES, EBPF_PENDING_READS_MAX_ENTRIES,
-    EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES, EBPF_PENDING_WRITES_MAX_ENTRIES,
-    EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES, EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES,
-    EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES, EBPF_RING_BUFFER_BYTES,
-    EBPF_SOCKET_FD_GENERATIONS_MAX_ENTRIES, EBPF_SOCKET_PAYLOAD_ALLOW_READ,
+    EBPF_PENDING_ACCEPTS_MAX_ENTRIES, EBPF_PENDING_CONNECTS_MAX_ENTRIES,
+    EBPF_PENDING_READS_MAX_ENTRIES, EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES,
+    EBPF_PENDING_WRITES_MAX_ENTRIES, EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES,
+    EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES, EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES,
+    EBPF_RING_BUFFER_BYTES, EBPF_SOCKET_FD_GENERATIONS_MAX_ENTRIES, EBPF_SOCKET_PAYLOAD_ALLOW_READ,
     EBPF_SOCKET_PAYLOAD_ALLOW_WRITE, EbpfAcceptTracepointRecord, EbpfCloseObservation,
     EbpfCloseRangeTracepointRecord, EbpfCloseTracepointRecord, EbpfConnectTracepointRecord,
-    EbpfPendingSocketAcceptAttempt, EbpfPendingSocketReadAttempt, EbpfPendingSocketWriteSample,
-    EbpfProcessProbeMetadata, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
-    EbpfSocketReadSampleRecord, EbpfSocketWriteSampleRecord,
+    EbpfPendingSocketAcceptAttempt, EbpfPendingSocketConnectAttempt, EbpfPendingSocketReadAttempt,
+    EbpfPendingSocketWriteSample, EbpfProcessProbeMetadata, EbpfSocketFdKey,
+    EbpfSocketPayloadAllowance, EbpfSocketReadSampleRecord, EbpfSocketWriteSampleRecord,
 };
 
 use accept::{accept_attempt_from_tracepoint, accept_observation_from_result};
 use close::{close_observation_from_tracepoint, close_range_observation_from_tracepoint};
-use connect::connect_observation_from_tracepoint;
+use connect::{connect_attempt_from_tracepoint, connect_observation_from_result};
 use read::{
     capture_read_sample_from_result, pending_read_attempt_from_source, read_source_from_tracepoint,
     readv_source_from_tracepoint, recvmsg_source_from_tracepoint,
@@ -60,6 +60,10 @@ static TRAFFIC_PROBE_FD_TABLE_EPOCHS: HashMap<u32, u64> =
 #[map(name = "TRAFFIC_PROBE_SOCKET_FD_GENERATIONS")]
 static TRAFFIC_PROBE_SOCKET_FD_GENERATIONS: HashMap<EbpfSocketFdKey, u64> =
     HashMap::with_max_entries(EBPF_SOCKET_FD_GENERATIONS_MAX_ENTRIES, 0);
+
+#[map(name = "TRAFFIC_PROBE_PENDING_CONNECTS")]
+static TRAFFIC_PROBE_PENDING_CONNECTS: HashMap<u64, EbpfPendingSocketConnectAttempt> =
+    HashMap::with_max_entries(EBPF_PENDING_CONNECTS_MAX_ENTRIES, 0);
 
 #[map(name = "TRAFFIC_PROBE_PENDING_ACCEPTS")]
 static TRAFFIC_PROBE_PENDING_ACCEPTS: HashMap<u64, EbpfPendingSocketAcceptAttempt> =
@@ -91,7 +95,13 @@ static TRAFFIC_PROBE_PROCESS_OUTPUT_LOSSES: PerCpuArray<u64> =
 
 #[tracepoint(name = "sys_enter_connect", category = "syscalls")]
 pub fn traffic_probe_sys_enter_connect(ctx: TracePointContext) -> u32 {
-    emit_connect_attempt(ctx);
+    record_connect_attempt(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_exit_connect", category = "syscalls")]
+pub fn traffic_probe_sys_exit_connect(ctx: TracePointContext) -> u32 {
+    emit_connect_observation(ctx);
     0
 }
 
@@ -267,8 +277,23 @@ pub fn traffic_probe_sys_exit_recvmsg(ctx: TracePointContext) -> u32 {
     0
 }
 
-fn emit_connect_attempt(ctx: TracePointContext) {
-    let connect = connect_observation_from_tracepoint(&ctx);
+fn record_connect_attempt(ctx: TracePointContext) {
+    let Some(attempt) = connect_attempt_from_tracepoint(&ctx) else {
+        return;
+    };
+    let key = bpf_get_current_pid_tgid();
+    let _ = TRAFFIC_PROBE_PENDING_CONNECTS.insert(&key, &attempt, 0);
+}
+
+fn emit_connect_observation(ctx: TracePointContext) {
+    let key = bpf_get_current_pid_tgid();
+    let Some(attempt) = (unsafe { TRAFFIC_PROBE_PENDING_CONNECTS.get(&key).copied() }) else {
+        return;
+    };
+    let _ = TRAFFIC_PROBE_PENDING_CONNECTS.remove(&key);
+    let Some(connect) = connect_observation_from_result(&ctx, attempt) else {
+        return;
+    };
     let metadata = process_metadata(&ctx);
     let lease = open_socket_fd_lease(metadata.tgid, connect.observation.fd);
     let observation = connect
@@ -325,10 +350,10 @@ fn emit_close_attempt(ctx: TracePointContext) {
         return;
     };
     let metadata = process_metadata(&ctx);
-    let close = EbpfCloseObservation::observed(
-        close.fd,
-        current_socket_fd_generation(metadata.tgid, close.fd).unwrap_or(0),
-    );
+    let Some(fd_generation) = close_socket_fd_generation(metadata.tgid, close.fd) else {
+        return;
+    };
+    let close = EbpfCloseObservation::observed(close.fd, fd_generation);
     untrack_socket_fd(close.fd);
     let event = EbpfCloseTracepointRecord::close_tracepoint_observed(
         metadata.pid,
@@ -561,7 +586,7 @@ fn allowed_socket_payload_lease(fd: i32, direction: u8) -> Option<SocketFdLease>
         || allowance.fd_generation == 0
         || !allowance.allows(direction)
         || current_fd_table_epoch(tgid).is_none_or(|epoch| epoch != allowance.fd_table_epoch)
-        || current_socket_fd_generation(tgid, fd)
+        || current_active_socket_fd_generation(tgid, fd)
             .is_none_or(|generation| generation != allowance.fd_generation)
     {
         return None;
@@ -613,16 +638,27 @@ fn next_socket_fd_generation(tgid: u32, fd: i32) -> Option<u64> {
         return None;
     }
     let key = EbpfSocketFdKey::new(tgid, fd);
-    let mut next_generation = current_socket_fd_generation(tgid, fd)
-        .unwrap_or(0)
-        .wrapping_add(1);
-    if next_generation == 0 {
-        next_generation = 1;
-    }
+    let next_generation = next_active_socket_fd_generation(current_socket_fd_generation(tgid, fd));
     TRAFFIC_PROBE_SOCKET_FD_GENERATIONS
         .insert(&key, &next_generation, 0)
         .ok()?;
     Some(next_generation)
+}
+
+fn close_socket_fd_generation(tgid: u32, fd: i32) -> Option<u64> {
+    if fd < 0 {
+        return None;
+    }
+    let generation = current_active_socket_fd_generation(tgid, fd)?;
+    let inactive_generation = inactive_socket_fd_generation(generation);
+    let key = EbpfSocketFdKey::new(tgid, fd);
+    let _ = TRAFFIC_PROBE_SOCKET_FD_GENERATIONS.insert(&key, &inactive_generation, 0);
+    Some(generation)
+}
+
+fn current_active_socket_fd_generation(tgid: u32, fd: i32) -> Option<u64> {
+    let generation = current_socket_fd_generation(tgid, fd)?;
+    is_active_socket_fd_generation(generation).then_some(generation)
 }
 
 fn current_socket_fd_generation(tgid: u32, fd: i32) -> Option<u64> {
@@ -634,6 +670,38 @@ fn current_socket_fd_generation(tgid: u32, fd: i32) -> Option<u64> {
             .get(&EbpfSocketFdKey::new(tgid, fd))
             .copied()
     }
+}
+
+fn next_active_socket_fd_generation(current: Option<u64>) -> u64 {
+    let mut next_generation = current.unwrap_or(0).wrapping_add(1);
+    if next_generation == 0 {
+        next_generation = 1;
+    }
+    if !is_active_socket_fd_generation(next_generation) {
+        next_generation = next_generation.wrapping_add(1);
+        if next_generation == 0 {
+            next_generation = 1;
+        }
+    }
+    next_generation
+}
+
+fn inactive_socket_fd_generation(active_generation: u64) -> u64 {
+    let mut inactive_generation = active_generation.wrapping_add(1);
+    if inactive_generation == 0 {
+        inactive_generation = 2;
+    }
+    if is_active_socket_fd_generation(inactive_generation) {
+        inactive_generation = inactive_generation.wrapping_add(1);
+        if inactive_generation == 0 {
+            inactive_generation = 2;
+        }
+    }
+    inactive_generation
+}
+
+fn is_active_socket_fd_generation(generation: u64) -> bool {
+    generation != 0 && generation & 1 == 1
 }
 
 fn next_fd_table_epoch(tgid: u32) -> u64 {
@@ -711,6 +779,17 @@ mod tests {
         assert!(!fcntl_cmd_may_create_fd(2));
         assert!(!fcntl_cmd_may_create_fd(3));
         assert!(!fcntl_cmd_may_create_fd(4));
+    }
+
+    #[test]
+    fn socket_fd_generation_parity_tracks_active_descriptors() {
+        assert_eq!(next_active_socket_fd_generation(None), 1);
+        assert_eq!(next_active_socket_fd_generation(Some(1)), 3);
+        assert_eq!(inactive_socket_fd_generation(3), 4);
+        assert_eq!(next_active_socket_fd_generation(Some(4)), 5);
+        assert!(is_active_socket_fd_generation(5));
+        assert!(!is_active_socket_fd_generation(4));
+        assert!(!is_active_socket_fd_generation(0));
     }
 }
 

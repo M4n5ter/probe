@@ -17,7 +17,7 @@ use super::{
 };
 
 const SCENARIO: &str = "http1-loopback";
-const VECTOR_FIRST_PAYLOAD_SLICE_BYTES: usize = 160;
+const VECTOR_FIRST_PAYLOAD_SLICE_BYTES: usize = 192;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Http1LoopbackConfig {

@@ -26,6 +26,7 @@ use super::super::{
 const DEFAULT_RESOLUTION_RETRIES: u32 = 20;
 const DEFAULT_RESOLUTION_RETRY_SLEEP: Duration = Duration::from_millis(5);
 const MAX_TRACKED_EBPF_FLOWS: usize = 8192;
+const MAX_PENDING_EBPF_FLOW_RESOLUTIONS: usize = 8192;
 
 pub struct EbpfProcessObservationProvider {
     observations: Box<dyn EbpfObservationSource>,
@@ -36,7 +37,7 @@ pub struct EbpfProcessObservationProvider {
     stop_when_idle: bool,
     deep_observe_selector: Option<CompiledSelector>,
     tracked_flows: TrackedEbpfFlows,
-    pending_flow: Option<PendingEbpfFlowResolution>,
+    pending_flows: VecDeque<PendingEbpfFlowResolution>,
     pending_events: VecDeque<CaptureEvent>,
     output_loss: OutputLossTracker,
 }
@@ -58,7 +59,7 @@ impl EbpfProcessObservationProvider {
             stop_when_idle: false,
             deep_observe_selector,
             tracked_flows: TrackedEbpfFlows::bounded(MAX_TRACKED_EBPF_FLOWS),
-            pending_flow: None,
+            pending_flows: VecDeque::new(),
             pending_events: VecDeque::new(),
             output_loss: OutputLossTracker::default(),
         })
@@ -67,9 +68,6 @@ impl EbpfProcessObservationProvider {
     fn poll_event(&mut self) -> Result<CapturePoll, CaptureError> {
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(CapturePoll::event(event));
-        }
-        if self.pending_flow.is_some() {
-            return self.poll_pending_flow_resolution();
         }
         if self.output_loss.should_check_during_drain()
             && let Some(event) = self.output_loss_events()?
@@ -82,6 +80,9 @@ impl EbpfProcessObservationProvider {
         }
         if let Some(event) = self.output_loss_events()? {
             return Ok(CapturePoll::event(event));
+        }
+        if !self.pending_flows.is_empty() {
+            return self.poll_pending_flow_resolution();
         }
         Ok(if self.stop_when_idle {
             CapturePoll::Finished
@@ -147,19 +148,37 @@ impl EbpfProcessObservationProvider {
                 flow_start.invalid_descriptor_lease_gap(timestamp),
             ));
         }
-        self.pending_flow = Some(PendingEbpfFlowResolution::new(flow_start, timestamp));
-        self.poll_pending_flow_resolution()
+        self.poll_pending_flow_resolution_attempt(PendingEbpfFlowResolution::new(
+            flow_start, timestamp,
+        ))
     }
 
     fn poll_pending_flow_resolution(&mut self) -> Result<CapturePoll, CaptureError> {
-        let Some(mut pending) = self.pending_flow.take() else {
-            return Ok(CapturePoll::Idle);
-        };
+        let pending_count = self.pending_flows.len();
+        for _ in 0..pending_count {
+            let Some(pending) = self.pending_flows.pop_front() else {
+                return Ok(CapturePoll::Idle);
+            };
+            if pending
+                .retry_at
+                .is_some_and(|retry_at| Instant::now() < retry_at)
+            {
+                self.pending_flows.push_back(pending);
+                continue;
+            }
+            return self.poll_pending_flow_resolution_attempt(pending);
+        }
+        Ok(CapturePoll::Idle)
+    }
+
+    fn poll_pending_flow_resolution_attempt(
+        &mut self,
+        mut pending: PendingEbpfFlowResolution,
+    ) -> Result<CapturePoll, CaptureError> {
         if let Some(retry_at) = pending.retry_at
             && Instant::now() < retry_at
         {
-            self.pending_flow = Some(pending);
-            return Ok(CapturePoll::Idle);
+            return Ok(self.queue_pending_flow_resolution(pending));
         }
         if let Some(event) = pending
             .flow_start
@@ -179,8 +198,21 @@ impl EbpfProcessObservationProvider {
         pending.attempts_completed = pending.attempts_completed.saturating_add(1);
         pending.retry_at = Some(Instant::now() + self.resolution_retry_sleep);
         self.resolver.invalidate_cached_resolution();
-        self.pending_flow = Some(pending);
-        Ok(CapturePoll::Progress)
+        Ok(self.queue_pending_flow_resolution(pending))
+    }
+
+    fn queue_pending_flow_resolution(&mut self, pending: PendingEbpfFlowResolution) -> CapturePoll {
+        if self.pending_flows.len() < MAX_PENDING_EBPF_FLOW_RESOLUTIONS {
+            self.pending_flows.push_back(pending);
+            return CapturePoll::Progress;
+        }
+        let reason = format!(
+            "{}; pending flow resolution queue is full",
+            pending
+                .flow_start
+                .unresolved_reason(pending.attempts_completed)
+        );
+        CapturePoll::event(pending.flow_start.unresolved_gap(pending.timestamp, reason))
     }
 
     fn track_flow_start_event(
@@ -263,7 +295,7 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider emits connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded iovec-prefix syscall argument samples plus inbound single-buffer and bounded iovec-prefix syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, output ring-buffer failure conversion to degraded capture_loss events, and conservative unknown-offset gap fan-out to active tracked payload flows; payload beyond the bounded iovec scan window or sample buffer, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
+            "eBPF provider emits result-gated connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded first-readable-iovec syscall argument samples plus inbound single-buffer and bounded first-readable-iovec syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, output ring-buffer failure conversion to degraded capture_loss events, and conservative unknown-offset gap fan-out to active tracked payload flows; payload beyond the first readable iovec segment, bounded scan window, or sample buffer, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
         )]
     }
 
@@ -316,7 +348,7 @@ mod tests {
                 stop_when_idle: true,
                 deep_observe_selector,
                 tracked_flows: TrackedEbpfFlows::bounded(MAX_TRACKED_EBPF_FLOWS),
-                pending_flow: None,
+                pending_flows: VecDeque::new(),
                 pending_events: VecDeque::new(),
                 output_loss: OutputLossTracker::default(),
             }
@@ -702,6 +734,69 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_flow_resolution_does_not_block_later_flow_start() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let observations = [
+            connect_observation(process.clone(), 7, remote),
+            connect_observation(process, 8, remote),
+        ];
+        let resolver = Box::new(FdSelectiveResolver {
+            unresolved_fd: 7,
+            resolved: EbpfResolvedSocketFlow {
+                process: demo_process(),
+                confidence: 90,
+                connection: TcpConnection::new(local, remote),
+                socket_cookie: None,
+            },
+        });
+        let mut provider =
+            EbpfProcessObservationProvider::from_observations_for_test(observations, resolver);
+        provider.resolution_retries = 1;
+
+        let (_, flow) = expect_connection_opened(&mut provider)?;
+        assert_eq!(flow.local.port, 50_000);
+        assert_eq!(flow.remote.port, 443);
+
+        let Some(CaptureEvent::Gap(gap)) = provider.next()? else {
+            panic!("expected unresolved flow gap after later flow start");
+        };
+        assert!(gap.gap.reason.contains("fd=7"));
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn full_pending_flow_resolution_queue_emits_gap() -> TestResult {
+        let (_, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let observation = connect_observation(process.clone(), 7, remote);
+        let mut provider = EbpfProcessObservationProvider::from_observations_for_test(
+            [observation],
+            Box::new(StaticResolver { resolved: None }),
+        );
+        provider.resolution_retries = 1;
+        for fd in 0..MAX_PENDING_EBPF_FLOW_RESOLUTIONS {
+            provider.pending_flows.push_back(pending_connect_resolution(
+                process.clone(),
+                1000 + fd as i32,
+                remote,
+            ));
+        }
+
+        let Some(CaptureEvent::Gap(gap)) = provider.next()? else {
+            panic!("expected degraded gap when pending flow queue is full");
+        };
+        assert!(
+            gap.gap
+                .reason
+                .contains("pending flow resolution queue is full")
+        );
+        assert!(gap.gap.reason.contains("fd=7"));
+        Ok(())
+    }
+
+    #[test]
     fn emits_output_loss_delta_through_poll() -> TestResult {
         let source = OutputLossObservationSource {
             observations: VecDeque::new(),
@@ -839,6 +934,23 @@ mod tests {
         ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError> {
             self.calls = self.calls.saturating_add(1);
             if self.calls == 1 {
+                return Ok(None);
+            }
+            Ok(Some(self.resolved.clone()))
+        }
+    }
+
+    struct FdSelectiveResolver {
+        unresolved_fd: i32,
+        resolved: EbpfResolvedSocketFlow,
+    }
+
+    impl EbpfSocketFlowResolver for FdSelectiveResolver {
+        fn resolve_socket_flow(
+            &mut self,
+            lookup: EbpfSocketFlowLookup,
+        ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError> {
+            if lookup.fd == self.unresolved_fd {
                 return Ok(None);
             }
             Ok(Some(self.resolved.clone()))
@@ -999,6 +1111,24 @@ mod tests {
         remote: TcpEndpoint,
     ) -> EbpfProcessObservation {
         connect_observation_with_lease(process, fd, remote, 9, 10)
+    }
+
+    fn pending_connect_resolution(
+        process: EbpfObservedProcess,
+        fd: i32,
+        remote: TcpEndpoint,
+    ) -> PendingEbpfFlowResolution {
+        let EbpfProcessObservation::Connect(connect) = connect_observation(process, fd, remote)
+        else {
+            unreachable!("connect_observation always creates a connect observation");
+        };
+        PendingEbpfFlowResolution::new(
+            PendingEbpfFlowStart::Connect(connect),
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+        )
     }
 
     fn connect_observation_with_lease(

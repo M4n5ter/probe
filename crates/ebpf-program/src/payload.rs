@@ -288,9 +288,8 @@ pub(crate) fn read_payload_prefix_from_iovec<const SAMPLE_BYTES: usize>(
 
     let iovecs_to_scan = core::cmp::min(attempt.iovlen, PAYLOAD_IOVEC_SCAN_LIMIT);
     let mut index = 0u64;
-    let mut captured_len = 0u32;
     while index < PAYLOAD_IOVEC_SCAN_LIMIT {
-        if index >= iovecs_to_scan || captured_len >= copy_limit {
+        if index >= iovecs_to_scan {
             break;
         }
         let Some((user_buffer, readable_len)) = read_iovec_entry(attempt.user_iovec, index) else {
@@ -305,26 +304,26 @@ pub(crate) fn read_payload_prefix_from_iovec<const SAMPLE_BYTES: usize>(
             *flags |= read_failed_flag;
             return 0;
         }
-        let remaining_len = copy_limit.saturating_sub(captured_len);
-        let readable_len = core::cmp::min(clamp_u64_to_u32(readable_len), remaining_len);
+        let readable_len = core::cmp::min(clamp_u64_to_u32(readable_len), copy_limit);
         if readable_len == 0 {
             index += 1;
             continue;
         }
-        let read_result =
-            append_user_payload_prefix(user_buffer, captured_len, readable_len, buffer);
-        if read_result != 0 {
-            *flags |= read_failed_flag;
-            return 0;
-        }
-        captured_len = captured_len.saturating_add(readable_len);
-        index += 1;
+        return read_user_payload_prefix(
+            user_buffer,
+            readable_len,
+            expected_len_or_zero,
+            buffer,
+            flags,
+            truncated_flag,
+            read_failed_flag,
+        );
     }
 
-    if expected_len_or_zero != 0 && captured_len < expected_len_or_zero {
+    if expected_len_or_zero != 0 {
         *flags |= truncated_flag;
     }
-    captured_len as u16
+    0
 }
 
 pub(crate) fn clamp_u64_to_u32(value: u64) -> u32 {
@@ -351,74 +350,6 @@ fn read_user_bytes<const N: usize>(address: u64) -> Option<[u8; N]> {
     let mut bytes = [0; N];
     unsafe { bpf_probe_read_user_buf(address as *const u8, &mut bytes) }.ok()?;
     Some(bytes)
-}
-
-#[inline(always)]
-fn append_user_payload_prefix<const SAMPLE_BYTES: usize>(
-    user_buffer: u64,
-    captured_offset: u32,
-    captured_len: u32,
-    buffer: &mut [u8; SAMPLE_BYTES],
-) -> i64 {
-    if captured_len == 0 {
-        return 0;
-    }
-    let sample_capacity = clamp_usize_to_u32(SAMPLE_BYTES);
-    let Some(end) = captured_offset.checked_add(captured_len) else {
-        return -1;
-    };
-    if end > sample_capacity {
-        return -1;
-    }
-    let base = buffer.as_mut_ptr();
-    let mut index = 0u32;
-    while index < sample_capacity {
-        if index >= captured_len {
-            break;
-        }
-        let Some(source) = user_buffer.checked_add(u64::from(index)) else {
-            return -1;
-        };
-        let mut byte = 0u8;
-        let read_result = unsafe {
-            r#gen::bpf_probe_read_user(
-                core::ptr::addr_of_mut!(byte) as *mut c_void,
-                1,
-                source as *const c_void,
-            )
-        };
-        if read_result != 0 {
-            return read_result;
-        }
-        let Some(output_offset) = captured_offset.checked_add(index) else {
-            return -1;
-        };
-        if output_offset >= sample_capacity {
-            return -1;
-        }
-        let bounded_output_offset = output_offset as u8;
-        if !write_payload_byte::<SAMPLE_BYTES>(base, bounded_output_offset, byte) {
-            return -1;
-        }
-        index = index.saturating_add(1);
-    }
-    0
-}
-
-#[inline(never)]
-fn write_payload_byte<const SAMPLE_BYTES: usize>(
-    base: *mut u8,
-    output_offset: u8,
-    byte: u8,
-) -> bool {
-    let output_offset = u32::from(output_offset);
-    if output_offset >= clamp_usize_to_u32(SAMPLE_BYTES) {
-        return false;
-    }
-    unsafe {
-        *base.add(output_offset as usize) = byte;
-    }
-    true
 }
 
 fn tracepoint_u64(ctx: &TracePointContext, offset: usize) -> Option<u64> {

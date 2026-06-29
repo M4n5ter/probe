@@ -2,23 +2,49 @@ use aya_ebpf::programs::TracePointContext;
 use ebpf_abi::{
     EBPF_SOCKET_FLOW_REMOTE_ENDPOINT_VALID, EBPF_SOCKET_FLOW_SOCKADDR_READ_FAILED,
     EBPF_SOCKET_FLOW_UNSUPPORTED_ADDRESS_FAMILY, EbpfConnectObservation,
+    EbpfPendingSocketConnectAttempt,
 };
 
-use crate::sockaddr::{SockaddrReadBounds, UserSockaddrEndpoint, read_user_sockaddr_endpoint};
+use crate::{
+    payload::syscall_result_from_tracepoint,
+    sockaddr::{SockaddrReadBounds, UserSockaddrEndpoint, read_user_sockaddr_endpoint},
+};
 
 const CONNECT_FD_OFFSET: usize = 16;
 const CONNECT_USER_SOCKADDR_OFFSET: usize = 24;
 const CONNECT_ADDRLEN_OFFSET: usize = 32;
+const EINTR: i64 = 4;
+const EINPROGRESS: i64 = 115;
 
 pub(crate) struct ConnectObservationResult {
     pub observation: EbpfConnectObservation,
     pub flags: u16,
 }
 
-pub(crate) fn connect_observation_from_tracepoint(
+pub(crate) fn connect_attempt_from_tracepoint(
     ctx: &TracePointContext,
-) -> ConnectObservationResult {
-    connect_observation(connect_tracepoint_args(ctx))
+) -> Option<EbpfPendingSocketConnectAttempt> {
+    let result = connect_observation(connect_tracepoint_args(ctx));
+    if result.observation.fd < 0 {
+        return None;
+    }
+    Some(EbpfPendingSocketConnectAttempt {
+        observation: result.observation,
+        flags: result.flags,
+        _reserved: [0; 6],
+    })
+}
+
+pub(crate) fn connect_observation_from_result(
+    ctx: &TracePointContext,
+    attempt: EbpfPendingSocketConnectAttempt,
+) -> Option<ConnectObservationResult> {
+    connect_result_may_open_flow(syscall_result_from_tracepoint(ctx)?).then_some(
+        ConnectObservationResult {
+            observation: attempt.observation,
+            flags: attempt.flags,
+        },
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -96,5 +122,23 @@ fn remote_endpoint(
 impl ConnectObservationResult {
     fn with_flags(self, flags: u16) -> Self {
         Self { flags, ..self }
+    }
+}
+
+fn connect_result_may_open_flow(result: i64) -> bool {
+    matches!(result, 0) || result == -EINPROGRESS || result == -EINTR
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_result_opens_flow_only_when_connection_can_continue() {
+        assert!(connect_result_may_open_flow(0));
+        assert!(connect_result_may_open_flow(-EINPROGRESS));
+        assert!(connect_result_may_open_flow(-EINTR));
+        assert!(!connect_result_may_open_flow(-111));
+        assert!(!connect_result_may_open_flow(-101));
     }
 }

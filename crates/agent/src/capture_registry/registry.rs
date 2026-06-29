@@ -153,7 +153,7 @@ fn ebpf_provider_descriptor_from_object_report(
         CaptureBackend::Ebpf,
         CaptureProviderBuilder::Ebpf,
         format!(
-            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, live fd lookups can carry optional SO_COOKIE when pidfd_getfd is permitted and the duplicated fd inode still matches, and the process observation provider can emit connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded iovec-prefix syscall argument samples and inbound single-buffer and bounded iovec-prefix syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, output ring-buffer failure conversion to degraded capture_loss events, plus conservative unknown-offset gap fan-out to active tracked payload flows, but payload beyond the bounded iovec scan window or sample buffer, precise flow-specific lost-event reconstruction, kernel socket-object lifetime, and complete kernel traffic capture are not implemented",
+            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, live fd lookups can carry optional SO_COOKIE when pidfd_getfd is permitted and the duplicated fd inode still matches, and the process observation provider can emit result-gated connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded first-readable-iovec syscall argument samples and inbound single-buffer and bounded first-readable-iovec syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, output ring-buffer failure conversion to degraded capture_loss events, plus conservative unknown-offset gap fan-out to active tracked payload flows, but payload beyond the first readable iovec segment, bounded scan window, or sample buffer, precise flow-specific lost-event reconstruction, kernel socket-object lifetime, and complete kernel traffic capture are not implemented",
             object.summary(),
         ),
     )
@@ -338,13 +338,13 @@ mod tests {
         assert!(reason.contains("optional SO_COOKIE"));
         assert!(reason.contains("complete kernel traffic capture"));
         assert!(reason.contains("selector-authorized"));
+        assert!(reason.contains("payload beyond the first readable iovec segment"));
         assert!(reason.contains(
-            "always-degraded outbound single-buffer and bounded iovec-prefix syscall argument samples"
+            "always-degraded outbound single-buffer and bounded first-readable-iovec syscall argument samples"
         ));
-        assert!(
-            reason
-                .contains("inbound single-buffer and bounded iovec-prefix syscall result samples")
-        );
+        assert!(reason.contains(
+            "inbound single-buffer and bounded first-readable-iovec syscall result samples"
+        ));
         assert!(reason.contains("capture_loss events"));
         assert!(reason.contains("unknown-offset gap fan-out"));
         assert!(reason.contains("precise flow-specific lost-event reconstruction"));
