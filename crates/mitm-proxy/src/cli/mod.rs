@@ -33,6 +33,10 @@ pub struct Cli {
     pub tls_certificate_chain: Option<PathBuf>,
     #[arg(long)]
     pub tls_private_key: Option<PathBuf>,
+    #[arg(long)]
+    pub tls_ca_certificate: Option<PathBuf>,
+    #[arg(long)]
+    pub tls_ca_private_key: Option<PathBuf>,
     #[arg(long, default_value_t = TargetRecovery::AcceptedLocal)]
     pub target_recovery: TargetRecovery,
     #[arg(long, default_value_t = RequestDirection::Outbound)]
@@ -91,18 +95,12 @@ impl TryFrom<Cli> for MitmProxyConfig {
                 "policy_hook_path must be an absolute path".to_string(),
             ));
         }
-        let tls = match (value.tls_certificate_chain, value.tls_private_key) {
-            (Some(certificate_chain), Some(private_key)) => {
-                Some(TlsTerminationConfig::new(certificate_chain, private_key))
-            }
-            (None, None) => None,
-            _ => {
-                return Err(MitmProxyError::InvalidConfig(
-                    "tls_certificate_chain and tls_private_key must be configured together"
-                        .to_string(),
-                ));
-            }
-        };
+        let tls = tls_termination_config(
+            value.tls_certificate_chain,
+            value.tls_private_key,
+            value.tls_ca_certificate,
+            value.tls_ca_private_key,
+        )?;
         if !value.upstream_tls
             && (!value.upstream_trust_anchor.is_empty() || value.upstream_server_name.is_some())
         {
@@ -130,6 +128,44 @@ impl TryFrom<Cli> for MitmProxyConfig {
             io_timeout: Duration::from_millis(value.io_timeout_ms),
             action_timeout: Duration::from_millis(value.action_timeout_ms),
         })
+    }
+}
+
+fn tls_termination_config(
+    certificate_chain: Option<PathBuf>,
+    private_key: Option<PathBuf>,
+    ca_certificate: Option<PathBuf>,
+    ca_private_key: Option<PathBuf>,
+) -> Result<Option<TlsTerminationConfig>, MitmProxyError> {
+    let has_static_pair = certificate_chain.is_some() && private_key.is_some();
+    let has_ca_pair = ca_certificate.is_some() && ca_private_key.is_some();
+    if has_static_pair && has_ca_pair {
+        return Err(MitmProxyError::InvalidConfig(
+            "configure either tls_certificate_chain/tls_private_key or tls_ca_certificate/tls_ca_private_key, not both".to_string(),
+        ));
+    }
+    match (
+        certificate_chain,
+        private_key,
+        ca_certificate,
+        ca_private_key,
+    ) {
+        (Some(certificate_chain), Some(private_key), None, None) => Ok(Some(
+            TlsTerminationConfig::new(certificate_chain, private_key),
+        )),
+        (None, None, Some(ca_certificate), Some(ca_private_key)) => Ok(Some(
+            TlsTerminationConfig::from_ca(ca_certificate, ca_private_key),
+        )),
+        (None, None, None, None) => Ok(None),
+        (Some(_), None, _, _) | (None, Some(_), _, _) => Err(MitmProxyError::InvalidConfig(
+            "tls_certificate_chain and tls_private_key must be configured together".to_string(),
+        )),
+        (_, _, Some(_), None) | (_, _, None, Some(_)) => Err(MitmProxyError::InvalidConfig(
+            "tls_ca_certificate and tls_ca_private_key must be configured together".to_string(),
+        )),
+        _ => Err(MitmProxyError::InvalidConfig(
+            "invalid TLS termination configuration".to_string(),
+        )),
     }
 }
 
@@ -174,8 +210,64 @@ mod tests {
         let tls = config
             .tls
             .expect("complete TLS termination config should be preserved");
-        assert_eq!(tls.certificate_chain, Path::new("/tmp/server.pem"));
-        assert_eq!(tls.private_key, Path::new("/tmp/server.key"));
+        assert_eq!(
+            tls,
+            TlsTerminationConfig::new(
+                Path::new("/tmp/server.pem").to_path_buf(),
+                Path::new("/tmp/server.key").to_path_buf()
+            )
+        );
+    }
+
+    #[test]
+    fn tls_ca_certificate_and_private_key_build_dynamic_tls_config() {
+        let config = MitmProxyConfig::try_from(Cli {
+            tls_ca_certificate: Some(Path::new("/tmp/mitm-ca.pem").to_path_buf()),
+            tls_ca_private_key: Some(Path::new("/tmp/mitm-ca.key").to_path_buf()),
+            ..minimal_cli()
+        })
+        .expect("complete dynamic TLS termination config should parse");
+
+        let tls = config
+            .tls
+            .expect("complete dynamic TLS termination config should be preserved");
+        assert_eq!(
+            tls,
+            TlsTerminationConfig::from_ca(
+                Path::new("/tmp/mitm-ca.pem").to_path_buf(),
+                Path::new("/tmp/mitm-ca.key").to_path_buf()
+            )
+        );
+    }
+
+    #[test]
+    fn tls_ca_certificate_and_private_key_must_be_configured_together() {
+        let error = MitmProxyConfig::try_from(Cli {
+            tls_ca_certificate: Some(Path::new("/tmp/mitm-ca.pem").to_path_buf()),
+            tls_ca_private_key: None,
+            ..minimal_cli()
+        })
+        .expect_err("partial dynamic TLS termination config must be rejected");
+
+        assert!(
+            matches!(error, MitmProxyError::InvalidConfig(reason) if reason.contains("tls_ca_certificate"))
+        );
+    }
+
+    #[test]
+    fn tls_static_and_ca_modes_are_mutually_exclusive() {
+        let error = MitmProxyConfig::try_from(Cli {
+            tls_certificate_chain: Some(Path::new("/tmp/server.pem").to_path_buf()),
+            tls_private_key: Some(Path::new("/tmp/server.key").to_path_buf()),
+            tls_ca_certificate: Some(Path::new("/tmp/mitm-ca.pem").to_path_buf()),
+            tls_ca_private_key: Some(Path::new("/tmp/mitm-ca.key").to_path_buf()),
+            ..minimal_cli()
+        })
+        .expect_err("ambiguous TLS termination config must be rejected");
+
+        assert!(
+            matches!(error, MitmProxyError::InvalidConfig(reason) if reason.contains("not both"))
+        );
     }
 
     #[test]
@@ -230,6 +322,8 @@ mod tests {
             upstream_socket_mark: None,
             tls_certificate_chain: None,
             tls_private_key: None,
+            tls_ca_certificate: None,
+            tls_ca_private_key: None,
             target_recovery: TargetRecovery::AcceptedLocal,
             request_direction: RequestDirection::Outbound,
             policy_hook_listen: None,

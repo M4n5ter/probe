@@ -170,10 +170,19 @@ fn validate_product_proxy_contract(
             reason: "product MITM proxy backend requires policy_hook.mode = \"http_json\" so proxy-side protective actions use the typed hook contract".to_string(),
         });
     }
-    if mitm.leaf_certificate_chain_refs.len() != 1 || mitm.leaf_private_key_ref.is_none() {
+    let has_ca_pair = mitm.has_ca_material_pair();
+    let has_leaf_material =
+        !mitm.leaf_certificate_chain_refs.is_empty() || mitm.leaf_private_key_ref.is_some();
+    let has_static_leaf =
+        mitm.leaf_certificate_chain_refs.len() == 1 && mitm.leaf_private_key_ref.is_some();
+    let has_exactly_one_tls_source = matches!(
+        (has_ca_pair, has_leaf_material, has_static_leaf),
+        (true, false, false) | (false, true, true)
+    );
+    if !has_exactly_one_tls_source {
         violations.push(ConfigViolation {
             field: "enforcement.interception.mitm.leaf_certificate_chain_refs".to_string(),
-            reason: "product MITM proxy backend requires exactly one leaf certificate chain ref and one leaf private key ref".to_string(),
+            reason: "product MITM proxy backend requires exactly one TLS termination source: a CA certificate/private key pair for dynamic SNI certificates or one leaf certificate/private key pair for static TLS termination".to_string(),
         });
     }
 }
@@ -693,6 +702,41 @@ mod tests {
             && violation.reason.contains("absolute plaintext bridge path")));
     }
 
+    #[test]
+    fn product_proxy_accepts_ca_tls_termination_source() {
+        let mut violations = Vec::new();
+        let mut interception = product_proxy_interception();
+        interception.mitm.leaf_certificate_chain_refs.clear();
+        interception.mitm.leaf_private_key_ref = None;
+        interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
+        interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+
+        validate(&interception, &tls_config_with_mitm_ca(), &mut violations);
+
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn product_proxy_rejects_ambiguous_tls_termination_sources() {
+        let mut violations = Vec::new();
+        let mut interception = product_proxy_interception();
+        interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
+        interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+
+        validate(
+            &interception,
+            &tls_config_with_mitm_ca_and_leaf(),
+            &mut violations,
+        );
+
+        assert!(violations.iter().any(|violation| {
+            violation.field == "enforcement.interception.mitm.leaf_certificate_chain_refs"
+                && violation
+                    .reason
+                    .contains("exactly one TLS termination source")
+        }));
+    }
+
     fn validate_interception(
         interception: &EnforcementInterceptionConfig,
         violations: &mut Vec<ConfigViolation>,
@@ -773,5 +817,13 @@ mod tests {
             ],
             ..TlsConfig::default()
         }
+    }
+
+    fn tls_config_with_mitm_ca_and_leaf() -> TlsConfig {
+        let mut config = tls_config_with_mitm_ca();
+        config
+            .materials
+            .extend(tls_config_with_mitm_leaf().materials);
+        config
     }
 }

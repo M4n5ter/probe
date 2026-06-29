@@ -675,6 +675,91 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_ca_tls_listener_signs_sni_leaf_and_feeds_plaintext_http()
+    -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let (ca_certificate_chain, ca_private_key, trusted_ca_certificate) =
+            write_test_ca(root.path())?;
+        let upstream =
+            upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\ndynamic-tls")?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                Some(TlsTerminationConfig::from_ca(
+                    ca_certificate_chain,
+                    ca_private_key,
+                )),
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let mut stream =
+            tls_client_stream_with_name(listen, trusted_ca_certificate, "dynamic.example")?;
+        let request = b"GET /dynamic HTTP/1.1\r\nHost: dynamic.example\r\n\r\n";
+        stream.write_all(request)?;
+        stream.flush()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\ndynamic-tls"
+        );
+        assert!(feed_has_bytes(&feed_path, Direction::Outbound, request)?);
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_ca_tls_listener_rejects_clients_without_sni() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let (ca_certificate_chain, ca_private_key, trusted_ca_certificate) =
+            write_test_ca(root.path())?;
+        let upstream = upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                Some(TlsTerminationConfig::from_ca(
+                    ca_certificate_chain,
+                    ca_private_key,
+                )),
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let mut stream =
+            tls_client_stream_without_sni(listen, trusted_ca_certificate, "dynamic.example")?;
+        let result = stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: dynamic.example\r\n\r\n")
+            .and_then(|_| stream.flush())
+            .and_then(|_| {
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response)
+            });
+        guard.stop()?;
+
+        assert!(result.is_err(), "dynamic CA mode must require SNI");
+        assert!(!feed_path.exists() || fs::read_to_string(&feed_path)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn tls_listener_relays_plaintext_http_to_tls_upstream() -> Result<(), Box<dyn Error>> {
         let root = tempdir()?;
         let feed_path = root.path().join("mitm-feed.jsonl");
@@ -838,18 +923,67 @@ mod tests {
         ))
     }
 
+    fn write_test_ca(
+        root: &std::path::Path,
+    ) -> Result<(PathBuf, PathBuf, CertificateDer<'static>), Box<dyn Error>> {
+        let signing_key = rcgen::KeyPair::generate()?;
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let certificate = params.self_signed(&signing_key)?;
+        let certificate_path = root.join("mitm-ca.pem");
+        let private_key_path = root.join("mitm-ca.key");
+        fs::write(&certificate_path, certificate.pem())?;
+        fs::write(&private_key_path, signing_key.serialize_pem())?;
+        Ok((
+            certificate_path,
+            private_key_path,
+            certificate.der().clone(),
+        ))
+    }
+
     fn tls_client_stream(
         target: SocketAddr,
         trusted_certificate: CertificateDer<'static>,
     ) -> Result<StreamOwned<ClientConnection, TcpStream>, Box<dyn Error>> {
+        tls_client_stream_with_name(target, trusted_certificate, "localhost")
+    }
+
+    fn tls_client_stream_with_name(
+        target: SocketAddr,
+        trusted_certificate: CertificateDer<'static>,
+        server_name: &str,
+    ) -> Result<StreamOwned<ClientConnection, TcpStream>, Box<dyn Error>> {
+        tls_client_stream_with_sni(target, trusted_certificate, server_name, true)
+    }
+
+    fn tls_client_stream_without_sni(
+        target: SocketAddr,
+        trusted_certificate: CertificateDer<'static>,
+        server_name: &str,
+    ) -> Result<StreamOwned<ClientConnection, TcpStream>, Box<dyn Error>> {
+        tls_client_stream_with_sni(target, trusted_certificate, server_name, false)
+    }
+
+    fn tls_client_stream_with_sni(
+        target: SocketAddr,
+        trusted_certificate: CertificateDer<'static>,
+        server_name: &str,
+        enable_sni: bool,
+    ) -> Result<StreamOwned<ClientConnection, TcpStream>, Box<dyn Error>> {
         let mut roots = RootCertStore::empty();
         roots.add(trusted_certificate)?;
         let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let config = ClientConfig::builder_with_provider(crypto_provider)
+        let mut config = ClientConfig::builder_with_provider(crypto_provider)
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let server_name = ServerName::try_from("localhost")?;
+        config.enable_sni = enable_sni;
+        let server_name = ServerName::try_from(server_name.to_string())?;
         let connection = ClientConnection::new(Arc::new(config), server_name)?;
         let stream = TcpStream::connect(target)?;
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;

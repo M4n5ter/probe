@@ -416,6 +416,8 @@ impl TransparentInterceptionMitmPlan {
             nftables,
             plaintext_bridge: &plaintext_bridge,
             policy_hook: &policy_hook,
+            ca_certificate: ca_certificate.as_ref(),
+            ca_private_key: ca_private_key.as_ref(),
             leaf_certificate_chain: &leaf_certificate_chain,
             leaf_private_key: leaf_private_key.as_ref(),
             upstream_trust_anchors: &upstream_trust_anchors,
@@ -486,6 +488,8 @@ struct MitmBackendPlanningContext<'a> {
     nftables: &'a TransparentInterceptionNftablesPlan,
     plaintext_bridge: &'a TransparentInterceptionMitmPlaintextBridgePlan,
     policy_hook: &'a TransparentInterceptionMitmPolicyHookPlan,
+    ca_certificate: Option<&'a TlsMaterialPlan>,
+    ca_private_key: Option<&'a TlsMaterialPlan>,
     leaf_certificate_chain: &'a [TlsMaterialPlan],
     leaf_private_key: Option<&'a TlsMaterialPlan>,
     upstream_trust_anchors: &'a [TlsMaterialPlan],
@@ -501,9 +505,26 @@ impl<'a> MitmBackendPlanningContext<'a> {
             interception: ProductProxyInterception::from_strategy(self.strategy, self.nftables),
             plaintext_bridge: self.plaintext_bridge,
             policy_hook: self.policy_hook,
-            leaf_certificate_chain: self.leaf_certificate_chain,
-            leaf_private_key: self.leaf_private_key,
+            tls_termination_source: self.tls_termination_source(),
             upstream_trust_anchors: self.upstream_trust_anchors,
+        }
+    }
+
+    fn tls_termination_source(&self) -> ProductProxyTlsTerminationSource<'a> {
+        match (self.ca_certificate, self.ca_private_key) {
+            (Some(certificate), Some(private_key)) => ProductProxyTlsTerminationSource::DynamicCa {
+                certificate,
+                private_key,
+            },
+            (None, None) => ProductProxyTlsTerminationSource::StaticLeaf {
+                certificate_chain: self.leaf_certificate_chain.first().expect(
+                    "product proxy MITM validation should require one leaf certificate chain",
+                ),
+                private_key: self
+                    .leaf_private_key
+                    .expect("product proxy MITM validation should require a leaf key"),
+            },
+            _ => panic!("product proxy MITM validation should require complete TLS material pairs"),
         }
     }
 }
@@ -629,9 +650,19 @@ struct ProductProxyCliBuilder<'a> {
     interception: ProductProxyInterception,
     plaintext_bridge: &'a TransparentInterceptionMitmPlaintextBridgePlan,
     policy_hook: &'a TransparentInterceptionMitmPolicyHookPlan,
-    leaf_certificate_chain: &'a [TlsMaterialPlan],
-    leaf_private_key: Option<&'a TlsMaterialPlan>,
+    tls_termination_source: ProductProxyTlsTerminationSource<'a>,
     upstream_trust_anchors: &'a [TlsMaterialPlan],
+}
+
+enum ProductProxyTlsTerminationSource<'a> {
+    DynamicCa {
+        certificate: &'a TlsMaterialPlan,
+        private_key: &'a TlsMaterialPlan,
+    },
+    StaticLeaf {
+        certificate_chain: &'a TlsMaterialPlan,
+        private_key: &'a TlsMaterialPlan,
+    },
 }
 
 impl ProductProxyCliBuilder<'_> {
@@ -671,19 +702,28 @@ impl ProductProxyCliBuilder<'_> {
                 timeout_ms.to_string(),
             ]);
         }
-        let leaf_certificate = self
-            .leaf_certificate_chain
-            .first()
-            .expect("product proxy MITM validation should require one leaf certificate chain");
-        let leaf_private_key = self
-            .leaf_private_key
-            .expect("product proxy MITM validation should require a leaf key");
-        args.extend([
-            "--tls-certificate-chain".to_string(),
-            leaf_certificate.path.display().to_string(),
-            "--tls-private-key".to_string(),
-            leaf_private_key.path.display().to_string(),
-        ]);
+        match self.tls_termination_source {
+            ProductProxyTlsTerminationSource::DynamicCa {
+                certificate,
+                private_key,
+            } => args.extend([
+                "--tls-ca-certificate".to_string(),
+                certificate.path.display().to_string(),
+                "--tls-ca-private-key".to_string(),
+                private_key.path.display().to_string(),
+            ]),
+            ProductProxyTlsTerminationSource::StaticLeaf {
+                certificate_chain,
+                private_key,
+            } => {
+                args.extend([
+                    "--tls-certificate-chain".to_string(),
+                    certificate_chain.path.display().to_string(),
+                    "--tls-private-key".to_string(),
+                    private_key.path.display().to_string(),
+                ]);
+            }
+        }
         for trust_anchor in self.upstream_trust_anchors {
             args.extend([
                 "--upstream-trust-anchor".to_string(),
@@ -1573,10 +1613,10 @@ mod tests {
                 "/mitm-policy-hook".to_string(),
                 "--action-timeout-ms".to_string(),
                 "250".to_string(),
-                "--tls-certificate-chain".to_string(),
-                "/etc/traffic-probe/mitm-leaf.pem".to_string(),
-                "--tls-private-key".to_string(),
-                "/etc/traffic-probe/mitm-leaf.key".to_string(),
+                "--tls-ca-certificate".to_string(),
+                "/etc/traffic-probe/mitm-ca.pem".to_string(),
+                "--tls-ca-private-key".to_string(),
+                "/etc/traffic-probe/mitm-ca.key".to_string(),
                 "--upstream-trust-anchor".to_string(),
                 "/etc/traffic-probe/upstream-ca.pem".to_string(),
             ]
@@ -1585,6 +1625,65 @@ mod tests {
             process.working_dir,
             Some(PathBuf::from("/run/traffic-probe"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn product_proxy_mitm_backend_synthesizes_static_leaf_tls_args()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_product_proxy_mitm_backend(&mut config);
+        config.enforcement.interception.mitm.ca_certificate_ref = None;
+        config.enforcement.interception.mitm.ca_private_key_ref = None;
+        config
+            .enforcement
+            .interception
+            .mitm
+            .leaf_certificate_chain_refs = vec!["mitm-leaf".to_string()];
+        config.enforcement.interception.mitm.leaf_private_key_ref =
+            Some("mitm-leaf-key".to_string());
+        config.tls.materials.extend([
+            TlsMaterialConfig {
+                id: Some("mitm-leaf".to_string()),
+                kind: TlsMaterialKind::MitmLeafCertificate,
+                path: "/etc/traffic-probe/mitm-leaf.pem".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("mitm-leaf-key".to_string()),
+                kind: TlsMaterialKind::MitmLeafPrivateKey,
+                path: "/etc/traffic-probe/mitm-leaf.key".into(),
+            },
+        ]);
+        let capabilities = CapabilityMatrix::new([
+            CapabilityState::available(CapabilityKind::TransparentInterception),
+            CapabilityState::available(CapabilityKind::L7Mitm),
+            CapabilityState::available(CapabilityKind::CaptureEventFeed),
+        ]);
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let TransparentInterceptionMitmBackendPlan::ProductProxy { process, .. } =
+            &plan.interception.mitm.backend
+        else {
+            panic!(
+                "product MITM proxy plan should be preserved: {:?}",
+                plan.interception.mitm.backend
+            );
+        };
+
+        assert!(args_contain_pair(
+            &process.args,
+            "--tls-certificate-chain",
+            "/etc/traffic-probe/mitm-leaf.pem"
+        ));
+        assert!(args_contain_pair(
+            &process.args,
+            "--tls-private-key",
+            "/etc/traffic-probe/mitm-leaf.key"
+        ));
         Ok(())
     }
 
@@ -1996,13 +2095,8 @@ mod tests {
                 endpoint: Some("http://127.0.0.1:15003/mitm-policy-hook".to_string()),
                 ..TransparentInterceptionMitmPolicyHookConfig::default()
             };
-        config
-            .enforcement
-            .interception
-            .mitm
-            .leaf_certificate_chain_refs = vec!["mitm-leaf".to_string()];
-        config.enforcement.interception.mitm.leaf_private_key_ref =
-            Some("mitm-leaf-key".to_string());
+        config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
+        config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config
             .enforcement
             .interception
@@ -2010,14 +2104,14 @@ mod tests {
             .upstream_trust_anchor_refs = vec!["upstream-ca".to_string()];
         config.tls.materials = vec![
             TlsMaterialConfig {
-                id: Some("mitm-leaf".to_string()),
-                kind: TlsMaterialKind::MitmLeafCertificate,
-                path: "/etc/traffic-probe/mitm-leaf.pem".into(),
+                id: Some("mitm-ca".to_string()),
+                kind: TlsMaterialKind::MitmCaCertificate,
+                path: "/etc/traffic-probe/mitm-ca.pem".into(),
             },
             TlsMaterialConfig {
-                id: Some("mitm-leaf-key".to_string()),
-                kind: TlsMaterialKind::MitmLeafPrivateKey,
-                path: "/etc/traffic-probe/mitm-leaf.key".into(),
+                id: Some("mitm-ca-key".to_string()),
+                kind: TlsMaterialKind::MitmCaPrivateKey,
+                path: "/etc/traffic-probe/mitm-ca.key".into(),
             },
             TlsMaterialConfig {
                 id: Some("upstream-ca".to_string()),

@@ -10,7 +10,7 @@ const DEFAULT_L7_MITM_UNAVAILABLE_REASON: &str = concat!(
     "plaintext bridge provenance, product proxy downstream and upstream TLS relay, ",
     "and proxy-side policy hooks, ",
     "but no MITM backend is configured; default whole-machine transparent MITM is rejected, ",
-    "and transparent HTTPS MITM E2E, dynamic SNI/ALPN routing, strong original attribution, ",
+    "and transparent HTTPS MITM E2E, ALPN-aware routing, SNI-based upstream routing, strong original attribution, ",
     "and automatic client trust store installation remain unavailable"
 );
 

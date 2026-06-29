@@ -1,34 +1,59 @@
 use std::{
+    collections::{HashMap, VecDeque},
     fs::File,
     io::BufReader,
     net::TcpStream,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
+use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, Issuer, KeyPair};
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
+    crypto::CryptoProvider,
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName},
+    server::{ClientHello, ResolvesServerCert},
+    sign::CertifiedKey,
 };
 
 use crate::{MitmProxyError, error::io_error};
 
 pub(crate) type TlsClientStream = StreamOwned<ClientConnection, TcpStream>;
 pub(crate) type TlsServerStream = StreamOwned<ServerConnection, TcpStream>;
+const DYNAMIC_CERT_CACHE_CAPACITY: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TlsTerminationConfig {
-    pub certificate_chain: PathBuf,
-    pub private_key: PathBuf,
+pub enum TlsTerminationConfig {
+    Static(TlsStaticTerminationConfig),
+    DynamicCa(TlsDynamicCaTerminationConfig),
 }
 
 impl TlsTerminationConfig {
     pub fn new(certificate_chain: PathBuf, private_key: PathBuf) -> Self {
-        Self {
+        Self::Static(TlsStaticTerminationConfig {
             certificate_chain,
             private_key,
-        }
+        })
     }
+
+    pub fn from_ca(certificate_chain: PathBuf, private_key: PathBuf) -> Self {
+        Self::DynamicCa(TlsDynamicCaTerminationConfig {
+            certificate_chain,
+            private_key,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlsStaticTerminationConfig {
+    pub certificate_chain: PathBuf,
+    pub private_key: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlsDynamicCaTerminationConfig {
+    pub certificate_chain: PathBuf,
+    pub private_key: PathBuf,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -52,15 +77,25 @@ pub(crate) struct TlsTerminator {
 
 impl TlsTerminator {
     pub(crate) fn from_config(config: &TlsTerminationConfig) -> Result<Self, MitmProxyError> {
-        let certificate_chain = load_certificate_chain(&config.certificate_chain)?;
-        let private_key = load_private_key(&config.private_key)?;
         let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let server_config = ServerConfig::builder_with_provider(crypto_provider)
+        let builder = ServerConfig::builder_with_provider(Arc::clone(&crypto_provider))
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .map_err(tls_error("configure MITM proxy TLS protocol versions"))?
-            .with_no_client_auth()
-            .with_single_cert(certificate_chain, private_key)
-            .map_err(tls_error("configure MITM proxy TLS certificate"))?;
+            .with_no_client_auth();
+        let server_config = match config {
+            TlsTerminationConfig::Static(config) => {
+                let certificate_chain = load_certificate_chain(&config.certificate_chain)?;
+                let private_key = load_private_key(&config.private_key)?;
+                builder
+                    .with_single_cert(certificate_chain, private_key)
+                    .map_err(tls_error("configure MITM proxy TLS certificate"))?
+            }
+            TlsTerminationConfig::DynamicCa(config) => {
+                let resolver =
+                    DynamicCaCertResolver::from_config(config, Arc::clone(&crypto_provider))?;
+                builder.with_cert_resolver(Arc::new(resolver))
+            }
+        };
         Ok(Self {
             config: Arc::new(server_config),
         })
@@ -80,6 +115,114 @@ impl TlsTerminator {
             }
         }
         Ok(StreamOwned::new(connection, stream))
+    }
+}
+
+struct DynamicCaCertResolver {
+    issuer: Issuer<'static, KeyPair>,
+    certificate_chain: Vec<CertificateDer<'static>>,
+    crypto_provider: Arc<CryptoProvider>,
+    cache: Mutex<DynamicCertCache>,
+}
+
+impl DynamicCaCertResolver {
+    fn from_config(
+        config: &TlsDynamicCaTerminationConfig,
+        crypto_provider: Arc<CryptoProvider>,
+    ) -> Result<Self, MitmProxyError> {
+        let certificate_chain = load_certificate_chain(&config.certificate_chain)?;
+        let issuer_certificate = certificate_chain
+            .first()
+            .ok_or_else(|| {
+                MitmProxyError::Tls(format!(
+                    "dynamic TLS CA certificate chain {} did not contain any certificates",
+                    config.certificate_chain.display()
+                ))
+            })?
+            .clone();
+        validate_ca_certificate(&issuer_certificate, &config.certificate_chain)?;
+        validate_ca_key_pair(&issuer_certificate, &config.private_key, &crypto_provider)?;
+        let signing_key = load_rcgen_key_pair(&config.private_key)?;
+        let issuer = Issuer::from_ca_cert_der(&issuer_certificate, signing_key)
+            .map_err(rcgen_error("parse MITM proxy dynamic TLS CA certificate"))?;
+        Ok(Self {
+            issuer,
+            certificate_chain,
+            crypto_provider,
+            cache: Mutex::new(DynamicCertCache::default()),
+        })
+    }
+
+    fn certified_key_for_sni(&self, server_name: &str) -> Option<Arc<CertifiedKey>> {
+        let server_name = server_name.to_ascii_lowercase();
+        if let Some(certified_key) = self.cache.lock().ok()?.get(&server_name) {
+            return Some(Arc::clone(certified_key));
+        }
+        let certified_key = Arc::new(self.generate_certified_key(&server_name).ok()?);
+        let mut cache = self.cache.lock().ok()?;
+        if let Some(existing) = cache.get(&server_name) {
+            return Some(Arc::clone(existing));
+        }
+        cache.insert(server_name, Arc::clone(&certified_key));
+        Some(certified_key)
+    }
+
+    fn generate_certified_key(&self, server_name: &str) -> Result<CertifiedKey, MitmProxyError> {
+        let signing_key = KeyPair::generate().map_err(rcgen_error(
+            "generate MITM proxy dynamic TLS leaf private key",
+        ))?;
+        let mut params = CertificateParams::new(vec![server_name.to_string()]).map_err(
+            rcgen_error("build MITM proxy dynamic TLS leaf certificate params"),
+        )?;
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_certificate = params
+            .signed_by(&signing_key, &self.issuer)
+            .map_err(rcgen_error("sign MITM proxy dynamic TLS leaf certificate"))?;
+        let mut certificate_chain = vec![leaf_certificate.der().clone()];
+        certificate_chain.extend(self.certificate_chain.iter().cloned());
+        let private_key =
+            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+        CertifiedKey::from_der(certificate_chain, private_key, &self.crypto_provider).map_err(
+            tls_error("configure MITM proxy dynamic TLS leaf certificate"),
+        )
+    }
+}
+
+#[derive(Default)]
+struct DynamicCertCache {
+    certificates: HashMap<String, Arc<CertifiedKey>>,
+    insertion_order: VecDeque<String>,
+}
+
+impl DynamicCertCache {
+    fn get(&self, server_name: &str) -> Option<&Arc<CertifiedKey>> {
+        self.certificates.get(server_name)
+    }
+
+    fn insert(&mut self, server_name: String, certified_key: Arc<CertifiedKey>) {
+        self.insertion_order.push_back(server_name.clone());
+        self.certificates.insert(server_name, certified_key);
+        while self.certificates.len() > DYNAMIC_CERT_CACHE_CAPACITY {
+            if let Some(expired) = self.insertion_order.pop_front() {
+                self.certificates.remove(&expired);
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for DynamicCaCertResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DynamicCaCertResolver")
+            .field("certificate_chain_len", &self.certificate_chain.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolvesServerCert for DynamicCaCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let server_name = client_hello.server_name()?;
+        self.certified_key_for_sni(server_name)
     }
 }
 
@@ -201,6 +344,69 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, MitmProxyErro
         })
 }
 
+fn validate_ca_certificate(
+    certificate: &CertificateDer<'_>,
+    path: &Path,
+) -> Result<(), MitmProxyError> {
+    let (remaining, certificate) = x509_parser::parse_x509_certificate(certificate.as_ref())
+        .map_err(x509_error("parse MITM proxy dynamic TLS CA certificate"))?;
+    if !remaining.is_empty() {
+        return Err(MitmProxyError::Tls(format!(
+            "dynamic TLS CA certificate {} contains trailing DER bytes",
+            path.display()
+        )));
+    }
+    let basic_constraints = certificate
+        .basic_constraints()
+        .map_err(x509_error(
+            "parse MITM proxy dynamic TLS CA basic constraints",
+        ))?
+        .ok_or_else(|| {
+            MitmProxyError::Tls(format!(
+                "dynamic TLS CA certificate {} must include CA basic constraints",
+                path.display()
+            ))
+        })?;
+    if !basic_constraints.value.ca {
+        return Err(MitmProxyError::Tls(format!(
+            "dynamic TLS CA certificate {} must have CA:TRUE basic constraints",
+            path.display()
+        )));
+    }
+    let key_usage = certificate
+        .key_usage()
+        .map_err(x509_error("parse MITM proxy dynamic TLS CA key usage"))?
+        .ok_or_else(|| {
+            MitmProxyError::Tls(format!(
+                "dynamic TLS CA certificate {} must include keyCertSign key usage",
+                path.display()
+            ))
+        })?;
+    if !key_usage.value.key_cert_sign() {
+        return Err(MitmProxyError::Tls(format!(
+            "dynamic TLS CA certificate {} must allow keyCertSign",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_ca_key_pair(
+    certificate: &CertificateDer<'static>,
+    private_key_path: &Path,
+    crypto_provider: &CryptoProvider,
+) -> Result<(), MitmProxyError> {
+    let private_key = load_private_key(private_key_path)?;
+    CertifiedKey::from_der(vec![certificate.clone()], private_key, crypto_provider)
+        .map(|_| ())
+        .map_err(tls_error("validate MITM proxy dynamic TLS CA key pair"))
+}
+
+fn load_rcgen_key_pair(path: &Path) -> Result<KeyPair, MitmProxyError> {
+    let private_key = load_private_key(path)?;
+    KeyPair::try_from(&private_key).map_err(rcgen_error("parse MITM proxy TLS private key"))
+}
+
 fn pem_reader(path: &Path, action: &'static str) -> Result<BufReader<File>, MitmProxyError> {
     File::open(path)
         .map(BufReader::new)
@@ -211,9 +417,20 @@ fn tls_error(action: &'static str) -> impl FnOnce(rustls::Error) -> MitmProxyErr
     move |error| MitmProxyError::Tls(format!("{action}: {error}"))
 }
 
+fn rcgen_error(action: &'static str) -> impl FnOnce(rcgen::Error) -> MitmProxyError {
+    move |error| MitmProxyError::Tls(format!("{action}: {error}"))
+}
+
+fn x509_error<E: std::fmt::Display>(action: &'static str) -> impl FnOnce(E) -> MitmProxyError {
+    move |error| MitmProxyError::Tls(format!("{action}: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use tempfile::tempdir;
 
@@ -239,5 +456,68 @@ mod tests {
             "{error}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn dynamic_ca_rejects_non_ca_certificate() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let certified_key = rcgen::generate_simple_self_signed(["localhost".to_string()])?;
+        let certificate_path = root.path().join("leaf.pem");
+        let private_key_path = root.path().join("leaf.key");
+        fs::write(&certificate_path, certified_key.cert.pem())?;
+        fs::write(&private_key_path, certified_key.signing_key.serialize_pem())?;
+        let config = TlsTerminationConfig::from_ca(certificate_path, private_key_path);
+
+        let error = match TlsTerminator::from_config(&config) {
+            Ok(_) => return Err("dynamic CA mode must reject non-CA certificates".into()),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("CA basic constraints")
+                || error.to_string().contains("CA:TRUE"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_ca_rejects_mismatched_ca_private_key() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let (certificate_path, _first_key_path) = write_test_ca(root.path(), "first")?;
+        let (_other_certificate_path, other_key_path) = write_test_ca(root.path(), "other")?;
+        let config = TlsTerminationConfig::from_ca(certificate_path, other_key_path);
+
+        let error = match TlsTerminator::from_config(&config) {
+            Ok(_) => return Err("dynamic CA mode must reject mismatched CA private keys".into()),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("key pair")
+                || error.to_string().contains("inconsistent keys"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    fn write_test_ca(
+        root: &Path,
+        name: &str,
+    ) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+        let signing_key = rcgen::KeyPair::generate()?;
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let certificate = params.self_signed(&signing_key)?;
+        let certificate_path = root.join(format!("{name}-ca.pem"));
+        let private_key_path = root.join(format!("{name}-ca.key"));
+        fs::write(&certificate_path, certificate.pem())?;
+        fs::write(&private_key_path, signing_key.serialize_pem())?;
+        Ok((certificate_path, private_key_path))
     }
 }

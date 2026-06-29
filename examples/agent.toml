@@ -123,6 +123,16 @@ refresh_interval_ms = 1000
 # path = "/var/lib/probe/tls/browser.keys"
 #
 # [[tls.materials]]
+# id = "mitm-ca"
+# kind = "mitm_ca_certificate"
+# path = "/etc/probe/certs/mitm-ca.pem"
+#
+# [[tls.materials]]
+# id = "mitm-ca-key"
+# kind = "mitm_ca_private_key"
+# path = "/etc/probe/certs/mitm-ca.key"
+#
+# [[tls.materials]]
 # id = "mitm-leaf"
 # kind = "mitm_leaf_certificate"
 # path = "/etc/probe/certs/mitm-leaf-chain.pem"
@@ -159,6 +169,10 @@ kind = "none"
 strategy = "none"
 
 # [enforcement.interception.mitm]
+# ca_certificate_ref = "mitm-ca"
+# ca_private_key_ref = "mitm-ca-key"
+# CA-backed product proxy TLS termination requires downstream clients to send
+# DNS SNI. Or use a fixed leaf certificate instead of the CA pair:
 # leaf_certificate_chain_refs = ["mitm-leaf"]
 # leaf_private_key_ref = "mitm-leaf-key"
 # upstream_trust_anchor_refs = ["upstream-ca"]

@@ -170,7 +170,7 @@ fn capability_reason(mitm: &TransparentInterceptionMitmPlan) -> String {
             "agent-managed selector-scoped L7 MITM backend process contract is configured and executable; run will spawn the process and require its configured readiness endpoint before installing transparent interception rules"
         }
         TransparentInterceptionMitmBackendPlan::ProductProxy { .. } => {
-            "agent-managed product L7 MITM proxy is configured with typed bridge, policy hook, and leaf certificate material; run will spawn the resolved proxy command and require its configured readiness endpoint before installing transparent interception rules"
+            "agent-managed product L7 MITM proxy is configured with typed bridge, policy hook, and CA-backed dynamic SNI or static leaf TLS material; run will spawn the resolved proxy command and require its configured readiness endpoint before installing transparent interception rules"
         }
         TransparentInterceptionMitmBackendPlan::Disabled => "L7 MITM backend is disabled",
     };
