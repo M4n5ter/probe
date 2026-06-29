@@ -123,7 +123,7 @@ fn parse_listener_inodes(
         if state != TCP_LISTEN_STATE {
             continue;
         }
-        if local.address == target_address && local.port == target.port() {
+        if listener_endpoint_matches(local, target_address, target.port()) {
             let inode = fields[9].parse::<u64>().map_err(|error| {
                 format!(
                     "invalid TCP socket inode in {} for readiness listener lookup: {error}",
@@ -134,6 +134,20 @@ fn parse_listener_inodes(
         }
     }
     Ok(inodes)
+}
+
+fn listener_endpoint_matches(local: TcpEndpoint, target_address: IpAddr, target_port: u16) -> bool {
+    local.port == target_port
+        && (local.address == target_address
+            || listener_address_matches_wildcard(local.address, target_address))
+}
+
+fn listener_address_matches_wildcard(local_address: IpAddr, target_address: IpAddr) -> bool {
+    match (local_address, target_address) {
+        (IpAddr::V4(local), IpAddr::V4(_)) => local == Ipv4Addr::UNSPECIFIED,
+        (IpAddr::V6(local), IpAddr::V6(_)) => local == Ipv6Addr::UNSPECIFIED,
+        _ => false,
+    }
 }
 
 fn owner_pids_for_socket_inode(proc_root: &Path, inode: u64) -> Result<BTreeSet<u32>, String> {
@@ -411,6 +425,30 @@ header
                 .expect("test IPv6 listener address should parse"),
         )
         .expect("listener table should parse");
+
+        assert_eq!(inodes.into_iter().collect::<Vec<_>>(), vec![424242]);
+    }
+
+    #[test]
+    fn parses_wildcard_listener_for_readiness_target() {
+        let table = TcpTable {
+            family: TcpTableFamily::Ipv4,
+            path: PathBuf::from("/proc/net/tcp"),
+            optional: false,
+        };
+        let content = "\
+header
+   0: 00000000:3A9A 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 424242 1 0000000000000000
+";
+
+        let inodes = parse_listener_inodes(
+            &table,
+            content,
+            "127.0.0.1:15002"
+                .parse()
+                .expect("test IPv4 listener address should parse"),
+        )
+        .expect("wildcard listener table should parse");
 
         assert_eq!(inodes.into_iter().collect::<Vec<_>>(), vec![424242]);
     }

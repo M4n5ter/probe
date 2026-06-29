@@ -16,6 +16,8 @@ pub struct Cli {
     #[arg(long)]
     pub listen: SocketAddr,
     #[arg(long)]
+    pub transparent_listen: bool,
+    #[arg(long)]
     pub feed: PathBuf,
     #[arg(long)]
     pub pid_file: Option<PathBuf>,
@@ -114,6 +116,7 @@ impl TryFrom<Cli> for MitmProxyConfig {
         });
         Ok(MitmProxyConfig {
             listen: value.listen,
+            transparent_listen: value.transparent_listen,
             feed_path: value.feed,
             pid_file: value.pid_file,
             upstream: value.upstream,
@@ -310,9 +313,21 @@ mod tests {
         assert_eq!(mark.get(), 0x5450_0102);
     }
 
+    #[test]
+    fn transparent_listen_flag_is_preserved() {
+        let config = MitmProxyConfig::try_from(Cli {
+            transparent_listen: true,
+            ..minimal_cli()
+        })
+        .expect("transparent listen should parse");
+
+        assert!(config.transparent_listen);
+    }
+
     fn minimal_cli() -> Cli {
         Cli {
             listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 15_001)),
+            transparent_listen: false,
             feed: Path::new("/tmp/mitm-feed.jsonl").to_path_buf(),
             pid_file: None,
             upstream: None,

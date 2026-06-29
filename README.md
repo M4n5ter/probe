@@ -95,6 +95,11 @@ termination with static leaf material or CA-backed dynamic SNI certificates,
 upstream TLS relay with native roots or imported trust anchors, strategy-specific
 target recovery, outbound upstream socket-mark bypass, and a loopback HTTP JSON
 policy hook for proxy-side enforcement delegation.
+The first-party product proxy also has a transparent inbound HTTPS E2E path:
+TPROXY routes the client connection to the proxy, the proxy terminates
+downstream TLS with CA-backed dynamic SNI certificates, delegates a protective
+decision to the HTTP JSON hook, emits plaintext bridge events, returns the
+proxy-side deny response, and records the durable delegated decision.
 CA-backed dynamic certificate mode requires downstream TLS clients to send DNS
 SNI. When upstream TLS is enabled, the product proxy uses that SNI as the
 upstream TLS server name unless an explicit upstream server name is pinned; it
@@ -117,11 +122,10 @@ The following are intentional boundaries of the current implementation:
 - No default whole-host transparent MITM.
 - No automatic mutation of client trust stores; MITM client trust is an explicit
   operator-managed contract.
-- No claim that crate-level downstream/upstream TLS relay proves full
-  transparent HTTPS MITM; transparent rule-path end-to-end validation,
+- Transparent inbound HTTPS MITM is covered for the product proxy deny path.
   ALPN-aware routing, hostname-to-upstream target routing, strong original
-  attribution, and automatic trust-store mutation remain explicit capability
-  boundaries.
+  attribution, automatic trust-store mutation, and a general transparent
+  allow-path upstream routing matrix remain explicit capability boundaries.
 - No hidden long-term raw traffic retention.
 - No HTTP/2, HTTP/3, or QUIC parser yet.
 - WebSocket support emits handoff, frame metadata, and 16 MiB bounded

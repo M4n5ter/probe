@@ -1,12 +1,13 @@
 mod downstream;
 #[cfg(test)]
 mod fixtures;
+mod listener;
 mod policy_hook;
 mod upstream;
 
 use std::{
     fs::OpenOptions,
-    io::{self, Read, Write},
+    io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     num::NonZeroU32,
     path::PathBuf,
@@ -32,6 +33,7 @@ use crate::{
 };
 
 use self::downstream::{DownstreamAcceptor, DownstreamIo};
+use self::listener::ProxyListeners;
 use self::policy_hook::spawn_policy_hook_listener;
 use self::upstream::UpstreamConnector;
 
@@ -40,6 +42,7 @@ const ACCEPT_IDLE_SLEEP: Duration = Duration::from_millis(20);
 #[derive(Clone, Debug)]
 pub struct MitmProxyConfig {
     pub listen: SocketAddr,
+    pub transparent_listen: bool,
     pub feed_path: PathBuf,
     pub pid_file: Option<PathBuf>,
     pub upstream: Option<SocketAddr>,
@@ -155,11 +158,6 @@ struct ProxyState {
     flow_factory: Arc<FlowFactory>,
 }
 
-struct ProxyListeners {
-    data: TcpListener,
-    policy_hook: Option<TcpListener>,
-}
-
 fn validate_config(config: &MitmProxyConfig) -> Result<(), MitmProxyError> {
     if !config.listen.ip().is_loopback() {
         return Err(MitmProxyError::InvalidConfig(format!(
@@ -180,37 +178,6 @@ fn validate_config(config: &MitmProxyConfig) -> Result<(), MitmProxyError> {
         ));
     }
     Ok(())
-}
-
-impl ProxyListeners {
-    fn bind(config: &MitmProxyConfig) -> Result<Self, MitmProxyError> {
-        Ok(Self {
-            data: bind_listener(config.listen)
-                .map_err(io_error("bind MITM proxy data listener"))?,
-            policy_hook: config
-                .policy_hook_listen
-                .map(bind_listener)
-                .transpose()
-                .map_err(io_error("bind MITM proxy policy hook listener"))?,
-        })
-    }
-
-    #[cfg(test)]
-    fn from_bound(data: TcpListener, policy_hook: Option<TcpListener>) -> Result<Self, io::Error> {
-        Ok(Self {
-            data: prepare_listener(data)?,
-            policy_hook: policy_hook.map(prepare_listener).transpose()?,
-        })
-    }
-}
-
-fn bind_listener(listen: SocketAddr) -> io::Result<TcpListener> {
-    prepare_listener(TcpListener::bind(listen)?)
-}
-
-fn prepare_listener(listener: TcpListener) -> io::Result<TcpListener> {
-    listener.set_nonblocking(true)?;
-    Ok(listener)
 }
 
 fn write_pid_file(path: Option<&PathBuf>) -> Result<(), MitmProxyError> {

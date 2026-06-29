@@ -3,6 +3,8 @@ mod backend;
 mod config;
 mod feed;
 mod policy_hook;
+mod tls;
+mod transparent_tls;
 
 use std::{
     env, fs,
@@ -13,10 +15,11 @@ use std::{
 use assertions::{
     assert_backend_owned_policy_hook_execution, assert_mitm_backend_runtime,
     assert_outbound_redirect_reaches_mitm_backend, assert_spool_outputs,
-    exercise_l7_mitm_health_transition, exercise_managed_mitm_data_plane,
+    exercise_l7_mitm_health_transition, exercise_managed_plaintext_data_plane,
 };
 use backend::{
-    MitmBridgeCase, cleanup_managed_backend, prepare_mitm_backend, unused_intercept_port,
+    MitmBridgeCase, MitmDataPlaneExercise, MitmPolicyHookOwner, cleanup_managed_backend,
+    prepare_mitm_backend, unused_intercept_port,
 };
 use config::{AgentConfigInputs, fixture_config, write_agent_config, write_policy_bundle};
 use feed::{
@@ -24,6 +27,7 @@ use feed::{
     initialize_bridge_feed,
 };
 use policy_hook::{MitmPolicyHookServer, assert_policy_hook_requests};
+use transparent_tls::exercise_product_proxy_transparent_tls_path;
 
 use super::{
     harness::{
@@ -52,8 +56,8 @@ pub(crate) fn run_managed_policy_hook() -> ExitCode {
     run_case(MitmBridgeCase::ManagedInboundPolicyHook)
 }
 
-pub(crate) fn run_managed_proxy_policy_hook() -> ExitCode {
-    run_case(MitmBridgeCase::ManagedProxyInboundPolicyHook)
+pub(crate) fn run_product_proxy_transparent_https_policy_hook() -> ExitCode {
+    run_case(MitmBridgeCase::ProductProxyTransparentHttpsPolicyHook)
 }
 
 pub(crate) fn run_policy_hook() -> ExitCode {
@@ -79,6 +83,10 @@ fn run_case(case: MitmBridgeCase) -> ExitCode {
 }
 
 fn run_outer(case: MitmBridgeCase) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var_os(transparent_tls::CLIENT_OWNER_ENV).is_some() {
+        require_root()?;
+        return transparent_tls::run_client_namespace_owner();
+    }
     if env::var_os(case.netns_env()).is_some() {
         require_root()?;
         verify_fresh_network_namespace(case.netns_env())?;
@@ -87,7 +95,7 @@ fn run_outer(case: MitmBridgeCase) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     ensure_e2e_packages_built(["agent", "e2e-fixture"])?;
-    if case.product_proxy_backend() {
+    if case.backend() == backend::MitmBackendKind::ProductProxy {
         ensure_e2e_packages_built(["mitm-proxy"])?;
     }
     require_root()?;
@@ -124,13 +132,13 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
     let bridge_feed_path = root.join("mitm-bridge-capture-events.jsonl");
     let config_path = root.join("agent.toml");
     let spool_path = root.join("spool");
+    let mitm_ca = tls::write_mitm_ca(root)?;
 
     write_policy_bundle(&policy_path, case)?;
-    if case.policy_hook_enabled() {
+    if case.spec().policy_hook.enabled() {
         config::write_enforcement_manifest(&enforcement_manifest_path)?;
     }
-    let policy_hook_server = case
-        .external_policy_hook_server_enabled()
+    let policy_hook_server = (case.spec().policy_hook == MitmPolicyHookOwner::ExternalServer)
         .then(MitmPolicyHookServer::start)
         .transpose()?;
 
@@ -151,9 +159,13 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
         config_path: &config_path,
         policy_path: &policy_path,
         enforcement_manifest_path: case
-            .policy_hook_enabled()
+            .spec()
+            .policy_hook
+            .enabled()
             .then_some(enforcement_manifest_path.as_path()),
         bridge_feed_path: &bridge_feed_path,
+        mitm_ca_certificate_path: &mitm_ca.certificate_path,
+        mitm_ca_private_key_path: &mitm_ca.private_key_path,
         spool_path: &spool_path,
         admin_socket_path: &admin_socket_path,
         capture_port: fixture_ready.listen_port,
@@ -194,24 +206,24 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
             )
         },
     );
-    let managed_data_plane = run_after_success(
+    let backend_data_plane = run_after_success(
         [
             &agent_ready,
             &backend_status,
             &outbound_redirect,
             &primary_progress,
         ],
-        || exercise_managed_mitm_data_plane(case, &mitm_backend, intercept_port),
+        || exercise_backend_data_plane(case, &supervisor, intercept_port, &mitm_ca, &mitm_backend),
     );
     let bridge_feed_append = run_after_success(
-        [&outbound_redirect, &primary_progress, &managed_data_plane],
+        [&outbound_redirect, &primary_progress, &backend_data_plane],
         || append_bridge_feed_from_harness(case, &bridge_feed_path),
     );
     let bridge_progress = run_after_success(
         [
             &outbound_redirect,
             &primary_progress,
-            &managed_data_plane,
+            &backend_data_plane,
             &bridge_feed_append,
         ],
         || {
@@ -227,7 +239,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
             &agent_ready,
             &backend_status,
             &outbound_redirect,
-            &managed_data_plane,
+            &backend_data_plane,
             &bridge_progress,
         ],
         || exercise_l7_mitm_health_transition(case, &mut mitm_backend, &admin_socket_path),
@@ -237,11 +249,11 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
             &agent_ready,
             &backend_status,
             &outbound_redirect,
-            &managed_data_plane,
+            &backend_data_plane,
             &bridge_progress,
         ],
         || {
-            if case.policy_hook_enabled() {
+            if case.spec().policy_hook.enabled() {
                 wait_for_agent_enforcement_decision_count_at_least(
                     agent.child_mut(),
                     &admin_socket_path,
@@ -298,7 +310,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
         fixture_start,
         primary_progress,
         bridge_feed_append,
-        managed_data_plane,
+        backend_data_plane,
         bridge_progress,
         health_transition,
         policy_hook_decision,
@@ -316,6 +328,24 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
     merge_labeled_run_results(phases.into_labeled_results(spool_result))
 }
 
+fn exercise_backend_data_plane(
+    case: MitmBridgeCase,
+    supervisor: &ChildSupervisor,
+    intercept_port: u16,
+    mitm_ca: &tls::MitmCaMaterial,
+    mitm_backend: &backend::PreparedMitmBackend,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match case.spec().data_plane {
+        MitmDataPlaneExercise::None => Ok(()),
+        MitmDataPlaneExercise::ManagedPlaintext => {
+            exercise_managed_plaintext_data_plane(case, mitm_backend, intercept_port)
+        }
+        MitmDataPlaneExercise::ProductProxyTransparentTls => {
+            exercise_product_proxy_transparent_tls_path(case, supervisor, intercept_port, mitm_ca)
+        }
+    }
+}
+
 struct MitmBridgePhases {
     fixture: RunResult,
     agent_ready: RunResult,
@@ -324,7 +354,7 @@ struct MitmBridgePhases {
     fixture_start: RunResult,
     primary_progress: RunResult,
     bridge_feed_append: RunResult,
-    managed_data_plane: RunResult,
+    backend_data_plane: RunResult,
     bridge_progress: RunResult,
     health_transition: RunResult,
     policy_hook_decision: RunResult,
@@ -343,7 +373,7 @@ impl MitmBridgePhases {
             &self.outbound_redirect,
             &self.fixture_start,
             &self.primary_progress,
-            &self.managed_data_plane,
+            &self.backend_data_plane,
             &self.bridge_feed_append,
             &self.bridge_progress,
             &self.health_transition,
@@ -363,7 +393,7 @@ impl MitmBridgePhases {
             ("outbound MITM redirect", self.outbound_redirect),
             ("fixture start", self.fixture_start),
             ("agent primary policy progress", self.primary_progress),
-            ("managed MITM data plane", self.managed_data_plane),
+            ("MITM backend data plane", self.backend_data_plane),
             ("MITM bridge feed append", self.bridge_feed_append),
             ("agent MITM bridge policy progress", self.bridge_progress),
             ("L7 MITM backend health transition", self.health_transition),

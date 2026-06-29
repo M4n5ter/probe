@@ -23,14 +23,14 @@ use storage::{FjallSpool, StoredEvent};
 use super::{
     backend::{
         MitmBackendConfig, MitmBackendKind, MitmBridgeCase, MitmBridgeDirection,
-        PreparedMitmBackend, wait_for_managed_backend_pid,
+        MitmPolicyHookOwner, PreparedMitmBackend, wait_for_managed_backend_pid,
     },
     feed::{
         E2E_EXPORT_CURSOR_OWNER, ENFORCEMENT_MANIFEST_ID, ENFORCEMENT_MANIFEST_VERSION,
         EXPECTED_POLICY_VERSION, POLICY_HOOK_REASON_PREFIX, POLICY_HOOK_RESPONSE_REASON,
         expected_bridge_policy_alert_message, expected_libpcap_targets,
         expected_policy_alert_message, is_bridge_flow, is_bridge_ingress_bytes,
-        is_product_proxy_deny_response_bytes, product_proxy_deny_response_bytes,
+        is_product_proxy_deny_response_bytes,
     },
 };
 use crate::e2e::{
@@ -95,32 +95,21 @@ pub(super) fn assert_outbound_redirect_reaches_mitm_backend(
     Ok(())
 }
 
-pub(super) fn exercise_managed_mitm_data_plane(
+pub(super) fn exercise_managed_plaintext_data_plane(
     case: MitmBridgeCase,
     backend: &PreparedMitmBackend,
     intercept_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if case.backend() != MitmBackendKind::ManagedProcess {
-        return Ok(());
+        return Err(e2e_error(format!(
+            "{} expected managed-process MITM backend for plaintext data-plane exercise",
+            case.case_name()
+        ))
+        .into());
     }
     let target = managed_data_plane_target(case, backend, intercept_port)?;
-    let mut stream =
-        TcpStream::connect_timeout(&target, MANAGED_DATA_PLANE_TIMEOUT).map_err(|error| {
-            e2e_error(format!(
-                "{} managed MITM data-plane canary could not connect to {target}: {error}",
-                case.case_name()
-            ))
-        })?;
-    stream.set_read_timeout(Some(MANAGED_DATA_PLANE_TIMEOUT))?;
-    stream.set_write_timeout(Some(MANAGED_DATA_PLANE_TIMEOUT))?;
-    stream.write_all(mitm_bridge::REQUEST_BYTES)?;
-    stream.shutdown(Shutdown::Write)?;
-
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    let expected = if case.product_proxy_backend() {
-        product_proxy_deny_response_bytes()
-    } else if case.backend_owned_policy_hook_enabled() {
+    let response = plaintext_managed_data_plane_response(case, target)?;
+    let expected = if case.spec().policy_hook == MitmPolicyHookOwner::ManagedFixture {
         mitm_bridge::DENY_RESPONSE_BYTES.to_vec()
     } else {
         mitm_bridge::PASSTHROUGH_RESPONSE_BYTES.to_vec()
@@ -150,11 +139,35 @@ fn managed_data_plane_target(
             MitmBackendConfig::External { .. } => {
                 Err(e2e_error("managed data-plane canary received an external backend").into())
             }
+            MitmBackendConfig::ProductProxy { .. } => {
+                Err(e2e_error("managed data-plane canary received a product proxy backend").into())
+            }
         },
         MitmBridgeDirection::Outbound => {
             Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, intercept_port)))
         }
     }
+}
+
+fn plaintext_managed_data_plane_response(
+    case: MitmBridgeCase,
+    target: SocketAddr,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut stream =
+        TcpStream::connect_timeout(&target, MANAGED_DATA_PLANE_TIMEOUT).map_err(|error| {
+            e2e_error(format!(
+                "{} managed MITM data-plane canary could not connect to {target}: {error}",
+                case.case_name()
+            ))
+        })?;
+    stream.set_read_timeout(Some(MANAGED_DATA_PLANE_TIMEOUT))?;
+    stream.set_write_timeout(Some(MANAGED_DATA_PLANE_TIMEOUT))?;
+    stream.write_all(mitm_bridge::REQUEST_BYTES)?;
+    stream.shutdown(Shutdown::Write)?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    Ok(response)
 }
 
 pub(super) fn assert_spool_outputs(
@@ -193,7 +206,7 @@ pub(super) fn assert_backend_owned_policy_hook_execution(
     case: MitmBridgeCase,
     backend: &PreparedMitmBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !case.fixture_action_report_enabled() {
+    if case.spec().policy_hook != MitmPolicyHookOwner::ManagedFixture {
         return Ok(());
     }
     let Some(action_report_file) = backend.action_report_file.as_ref() else {
@@ -264,6 +277,7 @@ fn assert_backend_status(
     let expected_mode = match case.backend() {
         MitmBackendKind::External => "external",
         MitmBackendKind::ManagedProcess => "managed_process",
+        MitmBackendKind::ProductProxy => "product_proxy",
     };
     if status_backend["mode"] != json!(expected_mode) {
         return Err(e2e_error(format!(
@@ -274,7 +288,8 @@ fn assert_backend_status(
 
     match &backend.config {
         MitmBackendConfig::External { target }
-        | MitmBackendConfig::ManagedProcess { target, .. } => {
+        | MitmBackendConfig::ManagedProcess { target, .. }
+        | MitmBackendConfig::ProductProxy { target, .. } => {
             if status_backend["readiness_probe"]["target"] != json!(target) {
                 return Err(e2e_error(format!(
                     "MITM backend readiness target mismatch: expected {target}, got {status_backend}"
@@ -328,7 +343,7 @@ fn assert_policy_hook_enforcement_manifest_status(
     case: MitmBridgeCase,
     response: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !case.policy_hook_enabled() {
+    if !case.spec().policy_hook.enabled() {
         return Ok(());
     }
     let enforcement = &response["snapshot"]["enforcement"];
@@ -364,10 +379,10 @@ fn assert_livestream_ingress(
     {
         return Err(e2e_error("missing MITM bridge capture-event feed ingress bytes").into());
     }
-    if case.product_proxy_backend()
+    if case.backend() == MitmBackendKind::ProductProxy
         && !capture_events
             .iter()
-            .any(is_product_proxy_deny_response_bytes)
+            .any(|event| is_product_proxy_deny_response_bytes(case, event))
     {
         return Err(
             e2e_error("missing product MITM proxy deny response plaintext feed bytes").into(),
@@ -481,7 +496,7 @@ fn assert_expected_policy_hook_decision(
     case: MitmBridgeCase,
     envelopes: &[EventEnvelope],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !case.policy_hook_enabled() {
+    if !case.spec().policy_hook.enabled() {
         return Ok(());
     }
     assert_expected_policy_hook_verdict(case, envelopes)?;
@@ -626,7 +641,11 @@ fn assert_expected_l7_mitm_audit(
         (MitmBackendKind::External, MitmBackendConfig::External { target }) => {
             assert_expected_external_l7_mitm_audit(&events, target)?;
         }
-        (MitmBackendKind::ManagedProcess, MitmBackendConfig::ManagedProcess { target, .. }) => {
+        (
+            MitmBackendKind::ManagedProcess | MitmBackendKind::ProductProxy,
+            MitmBackendConfig::ManagedProcess { target, .. }
+            | MitmBackendConfig::ProductProxy { target, .. },
+        ) => {
             assert_expected_managed_l7_mitm_audit(&events, target)?;
         }
         (backend_kind, config) => {

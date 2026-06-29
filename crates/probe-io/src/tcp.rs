@@ -1,11 +1,26 @@
 use std::{
     io,
-    net::{SocketAddr, TcpStream},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream},
     num::NonZeroU32,
     time::Duration,
 };
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransparentTcpFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl TransparentTcpFamily {
+    pub fn for_address(address: SocketAddr) -> Self {
+        match address {
+            SocketAddr::V4(_) => Self::Ipv4,
+            SocketAddr::V6(_) => Self::Ipv6,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TcpSocketMark(NonZeroU32);
@@ -51,6 +66,60 @@ pub fn connect_tcp(target: SocketAddr, options: TcpConnectOptions) -> io::Result
     }
     socket.connect_timeout(&SockAddr::from(target), options.timeout)?;
     Ok(TcpStream::from(socket))
+}
+
+pub fn bind_transparent_tcp_listener(
+    family: TransparentTcpFamily,
+    port: u16,
+    backlog: i32,
+) -> io::Result<TcpListener> {
+    bind_transparent_tcp_socket(family, port, backlog).map(TcpListener::from)
+}
+
+pub fn bind_transparent_tcp_socket(
+    family: TransparentTcpFamily,
+    port: u16,
+    backlog: i32,
+) -> io::Result<Socket> {
+    let socket = transparent_tcp_socket(family)?;
+    socket.set_reuse_address(true)?;
+    bind_transparent_tcp_socket_address(&socket, family, port)?;
+    socket.listen(backlog)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+fn transparent_tcp_socket(family: TransparentTcpFamily) -> io::Result<Socket> {
+    match family {
+        TransparentTcpFamily::Ipv4 => Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)),
+        TransparentTcpFamily::Ipv6 => Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)),
+    }
+}
+
+fn bind_transparent_tcp_socket_address(
+    socket: &Socket,
+    family: TransparentTcpFamily,
+    port: u16,
+) -> io::Result<()> {
+    match family {
+        TransparentTcpFamily::Ipv4 => {
+            socket.set_ip_transparent_v4(true)?;
+            socket.bind(&SockAddr::from(SocketAddrV4::new(
+                Ipv4Addr::UNSPECIFIED,
+                port,
+            )))
+        }
+        TransparentTcpFamily::Ipv6 => {
+            socket.set_only_v6(true)?;
+            socket.set_ip_transparent_v6(true)?;
+            socket.bind(&SockAddr::from(SocketAddrV6::new(
+                Ipv6Addr::UNSPECIFIED,
+                port,
+                0,
+                0,
+            )))
+        }
+    }
 }
 
 #[cfg(test)]

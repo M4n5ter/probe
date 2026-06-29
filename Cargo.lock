@@ -3169,6 +3169,7 @@ dependencies = [
  "probe-config",
  "probe-core",
  "proto",
+ "rcgen",
  "rustix",
  "serde_json",
  "signal-hook",

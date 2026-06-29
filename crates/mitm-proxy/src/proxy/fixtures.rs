@@ -34,6 +34,7 @@ pub(super) fn test_config(
 ) -> MitmProxyConfig {
     MitmProxyConfig {
         listen,
+        transparent_listen: false,
         feed_path: feed_path.to_path_buf(),
         pid_file: None,
         upstream,

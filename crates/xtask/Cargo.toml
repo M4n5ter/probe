@@ -22,6 +22,7 @@ storage = { version = "0.1.0", path = "../storage" }
 toml = "1.1"
 transparent-linux = { version = "0.1.0", path = "../transparent-linux" }
 enforcement = { version = "0.1.0", path = "../enforcement" }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 [lints]
 workspace = true

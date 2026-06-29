@@ -8,8 +8,9 @@ use probe_config::{
     TransparentInterceptionMitmClientTrustModeConfig,
     TransparentInterceptionMitmManagedProcessConfig,
     TransparentInterceptionMitmPlaintextBridgeModeConfig,
-    TransparentInterceptionMitmPolicyHookModeConfig, TransparentInterceptionProxyModeConfig,
-    TransparentInterceptionProxySelfBypassConfig, TransparentInterceptionStrategyConfig,
+    TransparentInterceptionMitmPolicyHookModeConfig, TransparentInterceptionMitmProductProxyConfig,
+    TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
+    TransparentInterceptionStrategyConfig,
 };
 use probe_core::{
     Action, Direction, EnforcementMode, ProcessSelector, ProtectiveActionProfile, Selector,
@@ -35,6 +36,8 @@ pub(super) struct AgentConfigInputs<'a> {
     pub(super) policy_path: &'a Path,
     pub(super) enforcement_manifest_path: Option<&'a Path>,
     pub(super) bridge_feed_path: &'a Path,
+    pub(super) mitm_ca_certificate_path: &'a Path,
+    pub(super) mitm_ca_private_key_path: &'a Path,
     pub(super) spool_path: &'a Path,
     pub(super) admin_socket_path: &'a Path,
     pub(super) capture_port: u16,
@@ -116,6 +119,15 @@ pub(super) fn write_agent_config(
                 working_dir: None,
             },
         ),
+        MitmBackendConfig::ProductProxy { target, program } => {
+            TransparentInterceptionMitmBackendConfig::product_proxy(
+                mitm_readiness_probe(target.clone()),
+                TransparentInterceptionMitmProductProxyConfig {
+                    program: Some(program.clone()),
+                    working_dir: None,
+                },
+            )
+        }
     };
     config.enforcement.interception.mitm.plaintext_bridge.mode =
         TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
@@ -142,12 +154,12 @@ pub(super) fn write_agent_config(
         TlsMaterialConfig {
             id: Some("mitm-ca".to_string()),
             kind: TlsMaterialKind::MitmCaCertificate,
-            path: inputs.config_path.with_file_name("mitm-ca.pem"),
+            path: inputs.mitm_ca_certificate_path.to_path_buf(),
         },
         TlsMaterialConfig {
             id: Some("mitm-ca-key".to_string()),
             kind: TlsMaterialKind::MitmCaPrivateKey,
-            path: inputs.config_path.with_file_name("mitm-ca.key"),
+            path: inputs.mitm_ca_private_key_path.to_path_buf(),
         },
     ];
     fs::write(inputs.config_path, toml::to_string(&config)?)?;
@@ -209,7 +221,7 @@ hooks = ["on_http_request_headers"]
         ),
     )?;
     let protected_target = mitm_bridge::REQUEST_TARGET;
-    let source = if case.policy_hook_enabled() {
+    let source = if case.spec().policy_hook.enabled() {
         format!(
             r#"
 function on_http_request_headers(event)

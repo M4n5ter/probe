@@ -442,6 +442,7 @@ impl TransparentInterceptionMitmPlan {
 struct ProductProxyInterception {
     request_direction: Direction,
     target_recovery: ProductProxyTargetRecovery,
+    transparent_listen: bool,
     upstream_socket_mark: Option<NonZeroU32>,
 }
 
@@ -454,11 +455,13 @@ impl ProductProxyInterception {
             TransparentInterceptionStrategyConfig::InboundTproxyMitm => Self {
                 request_direction: Direction::Inbound,
                 target_recovery: ProductProxyTargetRecovery::AcceptedLocal,
+                transparent_listen: true,
                 upstream_socket_mark: None,
             },
             TransparentInterceptionStrategyConfig::OutboundTransparentMitm => Self {
                 request_direction: Direction::Outbound,
                 target_recovery: ProductProxyTargetRecovery::LinuxOriginalDestination,
+                transparent_listen: false,
                 upstream_socket_mark: Some(nftables.outbound_proxy_bypass_mark),
             },
             unsupported => {
@@ -681,6 +684,9 @@ impl ProductProxyCliBuilder<'_> {
             direction_cli_value(self.interception.request_direction).to_string(),
             "--upstream-tls".to_string(),
         ];
+        if self.interception.transparent_listen {
+            args.push("--transparent-listen".to_string());
+        }
         if let Some(mark) = self.interception.upstream_socket_mark {
             args.extend([
                 "--upstream-socket-mark".to_string(),
@@ -1607,6 +1613,7 @@ mod tests {
                 "--request-direction".to_string(),
                 "inbound".to_string(),
                 "--upstream-tls".to_string(),
+                "--transparent-listen".to_string(),
                 "--policy-hook-listen".to_string(),
                 "127.0.0.1:15003".to_string(),
                 "--policy-hook-path".to_string(),
@@ -1729,6 +1736,7 @@ mod tests {
             "--upstream-socket-mark",
             "0x54500102"
         ));
+        assert!(!process.args.iter().any(|arg| arg == "--transparent-listen"));
         Ok(())
     }
 

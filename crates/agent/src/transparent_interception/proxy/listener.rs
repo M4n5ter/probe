@@ -1,6 +1,6 @@
 use std::{
     io,
-    net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddrV4, SocketAddrV6, TcpStream},
+    net::{Shutdown, TcpStream},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use socket2::Socket;
 
 use super::{
     proxy_io_error,
@@ -78,55 +78,17 @@ fn transparent_listener(
     family: TransparentInterceptionIpFamily,
     port: u16,
 ) -> Result<Socket, TransparentInterceptionError> {
-    let socket = match family {
-        TransparentInterceptionIpFamily::Ipv4 => {
-            Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-                .map_err(proxy_io_error("create IPv4 transparent listener"))?
-        }
-        TransparentInterceptionIpFamily::Ipv6 => {
-            Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))
-                .map_err(proxy_io_error("create IPv6 transparent listener"))?
-        }
-    };
-    socket
-        .set_reuse_address(true)
-        .map_err(proxy_io_error("set transparent listener reuse address"))?;
+    probe_io::bind_transparent_tcp_socket(transparent_tcp_family(family), port, 256)
+        .map_err(proxy_io_error("bind transparent listener"))
+}
+
+fn transparent_tcp_family(
+    family: TransparentInterceptionIpFamily,
+) -> probe_io::TransparentTcpFamily {
     match family {
-        TransparentInterceptionIpFamily::Ipv4 => {
-            socket
-                .set_ip_transparent_v4(true)
-                .map_err(proxy_io_error("set IPv4 IP_TRANSPARENT"))?;
-            socket
-                .bind(&SockAddr::from(SocketAddrV4::new(
-                    Ipv4Addr::UNSPECIFIED,
-                    port,
-                )))
-                .map_err(proxy_io_error("bind IPv4 transparent listener"))?;
-        }
-        TransparentInterceptionIpFamily::Ipv6 => {
-            socket
-                .set_only_v6(true)
-                .map_err(proxy_io_error("set IPv6-only transparent listener"))?;
-            socket
-                .set_ip_transparent_v6(true)
-                .map_err(proxy_io_error("set IPv6 IP_TRANSPARENT"))?;
-            socket
-                .bind(&SockAddr::from(SocketAddrV6::new(
-                    Ipv6Addr::UNSPECIFIED,
-                    port,
-                    0,
-                    0,
-                )))
-                .map_err(proxy_io_error("bind IPv6 transparent listener"))?;
-        }
+        TransparentInterceptionIpFamily::Ipv4 => probe_io::TransparentTcpFamily::Ipv4,
+        TransparentInterceptionIpFamily::Ipv6 => probe_io::TransparentTcpFamily::Ipv6,
     }
-    socket
-        .listen(256)
-        .map_err(proxy_io_error("listen on transparent listener"))?;
-    socket
-        .set_nonblocking(true)
-        .map_err(proxy_io_error("set transparent listener nonblocking"))?;
-    Ok(socket)
 }
 
 fn listener_loop(

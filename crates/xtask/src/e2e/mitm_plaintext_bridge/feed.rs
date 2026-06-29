@@ -30,7 +30,7 @@ pub(super) fn initialize_bridge_feed(
         MitmBackendKind::External => {
             mitm_bridge::create_empty_capture_event_feed(path).map_err(Into::into)
         }
-        MitmBackendKind::ManagedProcess => Ok(()),
+        MitmBackendKind::ManagedProcess | MitmBackendKind::ProductProxy => Ok(()),
     }
 }
 
@@ -40,7 +40,7 @@ pub(super) fn append_bridge_feed_from_harness(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match case.backend() {
         MitmBackendKind::External => mitm_bridge::append_capture_event_feed(path),
-        MitmBackendKind::ManagedProcess => Ok(()),
+        MitmBackendKind::ManagedProcess | MitmBackendKind::ProductProxy => Ok(()),
     }
 }
 
@@ -54,22 +54,29 @@ pub(super) fn product_proxy_deny_response_bytes() -> Vec<u8> {
 }
 
 pub(super) fn is_bridge_ingress_bytes(case: MitmBridgeCase, event: &CaptureEvent) -> bool {
-    if !case.product_proxy_backend() {
+    if case.backend() != MitmBackendKind::ProductProxy {
         return mitm_bridge::is_ingress_bytes(event);
     }
-    is_l7_mitm_plaintext_bytes(event, Direction::Outbound, mitm_bridge::REQUEST_BYTES)
-}
-
-pub(super) fn is_product_proxy_deny_response_bytes(event: &CaptureEvent) -> bool {
     is_l7_mitm_plaintext_bytes(
         event,
-        Direction::Inbound,
+        product_proxy_request_direction(case),
+        mitm_bridge::REQUEST_BYTES,
+    )
+}
+
+pub(super) fn is_product_proxy_deny_response_bytes(
+    case: MitmBridgeCase,
+    event: &CaptureEvent,
+) -> bool {
+    is_l7_mitm_plaintext_bytes(
+        event,
+        product_proxy_response_direction(case),
         product_proxy_deny_response_bytes().as_slice(),
     )
 }
 
 pub(super) fn is_bridge_flow(case: MitmBridgeCase, envelope: &EventEnvelope) -> bool {
-    if !case.product_proxy_backend() {
+    if case.backend() != MitmBackendKind::ProductProxy {
         return mitm_bridge::is_flow(envelope);
     }
     is_l7_mitm_plaintext_origin(envelope)
@@ -89,6 +96,20 @@ fn is_l7_mitm_plaintext_bytes(event: &CaptureEvent, direction: Direction, expect
 fn is_l7_mitm_plaintext_origin(envelope: &EventEnvelope) -> bool {
     envelope.origin().source() == CaptureSource::L7MitmPlaintext
         && envelope.origin().provider() == CaptureProviderKind::Interception
+}
+
+fn product_proxy_request_direction(case: MitmBridgeCase) -> Direction {
+    match case.direction() {
+        super::backend::MitmBridgeDirection::Inbound => Direction::Inbound,
+        super::backend::MitmBridgeDirection::Outbound => Direction::Outbound,
+    }
+}
+
+fn product_proxy_response_direction(case: MitmBridgeCase) -> Direction {
+    match product_proxy_request_direction(case) {
+        Direction::Inbound => Direction::Outbound,
+        Direction::Outbound => Direction::Inbound,
+    }
 }
 
 pub(super) fn expected_policy_alert_messages() -> std::collections::BTreeSet<String> {
