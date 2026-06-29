@@ -398,6 +398,11 @@ mod tests {
                 ingress_records_recovered: 1,
                 ingress_records_processed: 3,
                 export_events_written: 7,
+                events: pipeline::EventRuntimeMetricsSnapshot {
+                    total: 7,
+                    degraded: 2,
+                    gaps: 1,
+                },
                 capture_loss: pipeline::CaptureLossRuntimeMetricsSnapshot {
                     events: 2,
                     lost_events: 11,
@@ -457,6 +462,9 @@ mod tests {
             value["metrics"]["pipeline"]["capture_loss"]["events"],
             json!(2)
         );
+        assert_eq!(value["metrics"]["pipeline"]["events"]["total"], json!(7));
+        assert_eq!(value["metrics"]["pipeline"]["events"]["degraded"], json!(2));
+        assert_eq!(value["metrics"]["pipeline"]["events"]["gaps"], json!(1));
         assert_eq!(
             value["metrics"]["pipeline"]["capture_loss"]["lost_events"],
             json!(11)

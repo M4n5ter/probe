@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use probe_core::EnforcementOutcome;
+use probe_core::{EnforcementOutcome, EventEnvelope, EventKind};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Default)]
@@ -18,6 +18,8 @@ struct PipelineRuntimeMetricsInner {
     ingress_records_recovered: AtomicCounter,
     ingress_records_processed: AtomicCounter,
     export_events_written: AtomicCounter,
+    degraded_event_envelopes: AtomicCounter,
+    gap_event_envelopes: AtomicCounter,
     capture_loss_events: AtomicCounter,
     capture_lost_events: AtomicCounter,
     policy_evaluations: AtomicCounter,
@@ -42,9 +44,17 @@ pub struct PipelineRuntimeMetricsSnapshot {
     pub ingress_records_recovered: u64,
     pub ingress_records_processed: u64,
     pub export_events_written: u64,
+    pub events: EventRuntimeMetricsSnapshot,
     pub capture_loss: CaptureLossRuntimeMetricsSnapshot,
     pub policy: PolicyRuntimeMetricsSnapshot,
     pub enforcement: EnforcementRuntimeMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct EventRuntimeMetricsSnapshot {
+    pub total: u64,
+    pub degraded: u64,
+    pub gaps: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -78,12 +88,18 @@ pub struct EnforcementRuntimeMetricsSnapshot {
 impl PipelineRuntimeMetrics {
     pub fn snapshot(&self) -> PipelineRuntimeMetricsSnapshot {
         let enforcement = self.enforcement_snapshot();
+        let export_events_written = self.inner.export_events_written.load();
         PipelineRuntimeMetricsSnapshot {
             capture_events_read: self.inner.capture_events_read.load(),
             ingress_records_journaled: self.inner.ingress_records_journaled.load(),
             ingress_records_recovered: self.inner.ingress_records_recovered.load(),
             ingress_records_processed: self.inner.ingress_records_processed.load(),
-            export_events_written: self.inner.export_events_written.load(),
+            export_events_written,
+            events: EventRuntimeMetricsSnapshot {
+                total: export_events_written,
+                degraded: self.inner.degraded_event_envelopes.load(),
+                gaps: self.inner.gap_event_envelopes.load(),
+            },
             capture_loss: CaptureLossRuntimeMetricsSnapshot {
                 events: self.inner.capture_loss_events.load(),
                 lost_events: self.inner.capture_lost_events.load(),
@@ -148,8 +164,14 @@ impl PipelineRuntimeMetrics {
         self.inner.ingress_records_processed.increment();
     }
 
-    pub(crate) fn record_export_event_written(&self) {
+    pub(crate) fn record_export_event_envelope(&self, envelope: &EventEnvelope) {
         self.inner.export_events_written.increment();
+        if envelope.degraded() {
+            self.inner.degraded_event_envelopes.increment();
+        }
+        if matches!(envelope.kind(), EventKind::Gap(_)) {
+            self.inner.gap_event_envelopes.increment();
+        }
     }
 
     pub(crate) fn record_capture_loss(&self, lost_events: u64) {

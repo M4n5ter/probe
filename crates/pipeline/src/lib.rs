@@ -8,6 +8,7 @@ pub use pipeline::{
     PipelineRunOptions, PipelineSummary,
 };
 pub use runtime_metrics::{
-    CaptureLossRuntimeMetricsSnapshot, EnforcementRuntimeMetricsSnapshot, PipelineRuntimeMetrics,
-    PipelineRuntimeMetricsSnapshot, PolicyRuntimeMetricsSnapshot,
+    CaptureLossRuntimeMetricsSnapshot, EnforcementRuntimeMetricsSnapshot,
+    EventRuntimeMetricsSnapshot, PipelineRuntimeMetrics, PipelineRuntimeMetricsSnapshot,
+    PolicyRuntimeMetricsSnapshot,
 };

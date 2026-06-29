@@ -6,7 +6,11 @@ use probe_core::{
 };
 use tempfile::tempdir;
 
-use super::fixture::{SequenceProvider, capture_loss, demo_flow_with_ports, exported_envelopes};
+use super::fixture::{
+    SequenceProvider, capture_loss, demo_flow_with_ports, exported_envelopes,
+    flow_carried_observation_only_ebpf_syscall_gap,
+    observation_only_ebpf_syscall_bytes_with_direction,
+};
 
 #[test]
 fn replay_provider_writes_ingress_and_export_lanes() -> Result<(), Box<dyn std::error::Error>> {
@@ -95,6 +99,45 @@ fn plaintext_event_provider_writes_ingress_and_http_export_events()
 }
 
 #[test]
+fn runtime_metrics_count_degraded_and_gap_event_envelopes() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let mut parser_factory = Http1ParserFactory::default();
+    let flow = demo_flow_with_ports(50_000, 80, 41);
+    let mut provider = SequenceProvider::new(vec![
+        observation_only_ebpf_syscall_bytes_with_direction(
+            flow.clone(),
+            Direction::Outbound,
+            b"GET /degraded HTTP/1.1\r\nHost: example\r\n\r\n",
+        ),
+        flow_carried_observation_only_ebpf_syscall_gap(flow),
+    ]);
+    let metrics = PipelineRuntimeMetrics::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test")
+        .with_runtime_metrics(metrics.clone());
+
+    let summary = pipeline.run_provider(&mut provider)?;
+
+    assert_eq!(summary.export_events_written, 2);
+    let envelopes = exported_envelopes(&spool)?;
+    assert_eq!(envelopes.len(), 2);
+    assert!(envelopes.iter().any(|envelope| envelope.degraded()
+        && matches!(envelope.kind(), EventKind::HttpRequestHeaders(headers)
+                    if headers.target.as_deref() == Some("/degraded"))));
+    assert!(
+        envelopes
+            .iter()
+            .any(|envelope| envelope.degraded() && matches!(envelope.kind(), EventKind::Gap(_)))
+    );
+    let events = metrics.snapshot().events;
+    assert_eq!(events.total, 2);
+    assert_eq!(events.degraded, 2);
+    assert_eq!(events.gaps, 1);
+    Ok(())
+}
+
+#[test]
 fn capture_loss_writes_degraded_export_without_parser_events()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
@@ -130,5 +173,9 @@ fn capture_loss_writes_degraded_export_without_parser_events()
     let capture_loss = metrics.snapshot().capture_loss;
     assert_eq!(capture_loss.events, 1);
     assert_eq!(capture_loss.lost_events, 7);
+    let events = metrics.snapshot().events;
+    assert_eq!(events.total, 1);
+    assert_eq!(events.degraded, 1);
+    assert_eq!(events.gaps, 0);
     Ok(())
 }

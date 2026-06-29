@@ -1096,9 +1096,14 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 - 当前覆盖 capture read。
 - 当前覆盖 ingress journal/recovery/processed。
 - 当前覆盖 export event writes。
+- 当前覆盖已持久化 event envelope 的 total、degraded 和 gap 分类计数。
 - 当前覆盖 policy evaluation/selector miss。
 - 当前覆盖 persisted policy alert/verdict/error。
 - 当前覆盖 persisted enforcement decision outcome counters。
+- `metrics.pipeline.events.total` 与 `export_events_written` 使用同一写入成功事实源。
+- `metrics.pipeline.events.degraded` 只统计已写入 export queue 且 `EventEnvelope::degraded() == true` 的 envelope。
+- `metrics.pipeline.events.gaps` 只统计已写入 export queue 且 `EventKind::Gap` 的 envelope。
+- Prometheus 使用 `traffic_probe_pipeline_event_envelopes_total{class="all|degraded|gap"}` 暴露同一事实。
 - policy runtime error 会作为 `policy_runtime_error` audit event 写入 export queue。
 - policy runtime error 带 `policy_version` 和 typed `event_type`。
 - policy runtime error 不阻止同一原始事件上的其它 policy 继续运行。
@@ -5114,6 +5119,7 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 - policy alert/verdict/runtime error 表示对应 audit/export event 新写入。
 - enforcement decision outcome 表示对应 audit/export event 新写入。
 - 重复 recovery dedup 不会重复增加 persisted output counters。
+- pipeline 集成测试覆盖 degraded HTTP envelope、gap envelope 和 provider-level `capture_loss` envelope 的 runtime event 分类计数。
 
 #### Policy reload metrics 覆盖
 
@@ -5142,6 +5148,7 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 #### Status 与 Prometheus 覆盖
 
 - status 测试覆盖 runtime snapshot 注入到 `metrics.pipeline` JSON。
+- status 测试覆盖 `metrics.pipeline.events.total/degraded/gaps` JSON 字段。
 - offline/unknown 时 `metrics.pipeline` 保持 `null`。
 - transparent proxy state/registry/relay/health-probe/status/Prometheus/admin 测试覆盖 managed relay mode。
 - 覆盖 listener family、配置化 active probe 状态、upstream connect counters 和 last failure reason 进入 admin status。
@@ -5152,6 +5159,7 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 - active probe 连续失败达到阈值会把整体 health 降为 degraded。
 - upstream connect failure 只作为 per-flow connect telemetry，不增加 relay failure counter，也不改变整体 health。
 - admin 测试通过真实 pipeline 产生非零计数后，覆盖 metrics envelope 和 Prometheus text exposition 都从共享 runtime state 读取在线 metrics。
+- Prometheus 测试覆盖 `traffic_probe_pipeline_event_envelopes_total{class="all|degraded|gap"}`。
 
 #### Metrics 边界
 

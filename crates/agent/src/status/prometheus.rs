@@ -490,6 +490,31 @@ fn write_pipeline(output: &mut String, snapshot: &AgentStatusSnapshot) {
 
     write_family(
         output,
+        "traffic_probe_pipeline_event_envelopes_total",
+        "counter",
+        "Export event envelopes written by classification.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_pipeline_event_envelopes_total",
+        &[("class", "all")],
+        metrics.events.total,
+    );
+    write_sample(
+        output,
+        "traffic_probe_pipeline_event_envelopes_total",
+        &[("class", "degraded")],
+        metrics.events.degraded,
+    );
+    write_sample(
+        output,
+        "traffic_probe_pipeline_event_envelopes_total",
+        &[("class", "gap")],
+        metrics.events.gaps,
+    );
+
+    write_family(
+        output,
         "traffic_probe_pipeline_capture_loss_events_total",
         "counter",
         "Provider capture loss events observed by the running pipeline.",
@@ -651,7 +676,7 @@ mod tests {
 
     use pipeline::{
         CaptureLossRuntimeMetricsSnapshot, EnforcementRuntimeMetricsSnapshot,
-        PipelineRuntimeMetricsSnapshot, PolicyRuntimeMetricsSnapshot,
+        EventRuntimeMetricsSnapshot, PipelineRuntimeMetricsSnapshot, PolicyRuntimeMetricsSnapshot,
     };
     use storage::SpoolSnapshot;
 
@@ -852,6 +877,11 @@ mod tests {
                     ingress_records_recovered: 0,
                     ingress_records_processed: 3,
                     export_events_written: 2,
+                    events: EventRuntimeMetricsSnapshot {
+                        total: 2,
+                        degraded: 1,
+                        gaps: 1,
+                    },
                     capture_loss: CaptureLossRuntimeMetricsSnapshot {
                         events: 2,
                         lost_events: 17,
@@ -867,6 +897,16 @@ mod tests {
 
         assert!(metrics.contains("traffic_probe_pipeline_capture_loss_events_total 2\n"));
         assert!(metrics.contains("traffic_probe_pipeline_capture_lost_events_total 17\n"));
+        assert!(
+            metrics.contains("traffic_probe_pipeline_event_envelopes_total{class=\"all\"} 2\n")
+        );
+        assert!(
+            metrics
+                .contains("traffic_probe_pipeline_event_envelopes_total{class=\"degraded\"} 1\n")
+        );
+        assert!(
+            metrics.contains("traffic_probe_pipeline_event_envelopes_total{class=\"gap\"} 1\n")
+        );
         Ok(())
     }
 
