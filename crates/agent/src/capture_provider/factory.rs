@@ -297,6 +297,7 @@ fn preflight_mitm_plaintext_bridge_provider(
             if matches!(
                 plan.enforcement.interception.mitm.backend,
                 TransparentInterceptionMitmBackendPlan::ManagedProcess { .. }
+                    | TransparentInterceptionMitmBackendPlan::ProductProxy { .. }
             ) {
                 return Ok(MitmPlaintextBridgePreflight::DeferredUntilBackendReady);
             }

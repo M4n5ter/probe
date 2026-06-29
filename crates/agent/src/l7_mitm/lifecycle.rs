@@ -52,7 +52,8 @@ pub(crate) fn start_backend_lifecycle(
             backend_health_probe(backend).expect("external MITM backend should have health probe"),
             audit,
         ),
-        TransparentInterceptionMitmBackendPlan::ManagedProcess { process, .. } => managed_process(
+        TransparentInterceptionMitmBackendPlan::ManagedProcess { process, .. }
+        | TransparentInterceptionMitmBackendPlan::ProductProxy { process, .. } => managed_process(
             process.clone(),
             backend_health_probe(backend)
                 .expect("managed MITM backend should have readiness probe"),

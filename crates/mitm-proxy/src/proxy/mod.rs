@@ -1,6 +1,9 @@
+mod downstream;
+mod policy_hook;
+
 use std::{
     fs::OpenOptions,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     sync::{
@@ -12,8 +15,7 @@ use std::{
 };
 
 use clap::ValueEnum;
-use probe_core::{Action, Direction, EventEnvelope, Verdict};
-use serde::{Deserialize, Serialize};
+use probe_core::Direction;
 use socket2::Socket;
 
 use crate::{
@@ -21,8 +23,12 @@ use crate::{
     error::io_error,
     feed::{CaptureEventFeedWriter, FlowOffsets},
     flow::{FlowFactory, FlowRegistry, ProxyAction},
-    http::{HttpMessage, read_http_message, write_empty_response, write_json_response},
+    http::{HttpMessage, read_http_message, write_empty_response},
+    tls::TlsTerminationConfig,
 };
+
+use self::downstream::{DownstreamAcceptor, DownstreamIo};
+use self::policy_hook::spawn_policy_hook_listener;
 
 const ACCEPT_IDLE_SLEEP: Duration = Duration::from_millis(20);
 
@@ -32,6 +38,7 @@ pub struct MitmProxyConfig {
     pub feed_path: PathBuf,
     pub pid_file: Option<PathBuf>,
     pub upstream: Option<SocketAddr>,
+    pub tls: Option<TlsTerminationConfig>,
     pub target_recovery: TargetRecovery,
     pub request_direction: Direction,
     pub policy_hook_listen: Option<SocketAddr>,
@@ -64,28 +71,32 @@ pub struct MitmProxyGuard {
 impl MitmProxyGuard {
     pub fn start(config: MitmProxyConfig) -> Result<Self, MitmProxyError> {
         validate_config(&config)?;
-        let data_listener =
-            bind_listener(config.listen).map_err(io_error("bind MITM proxy data listener"))?;
-        let hook_listener = config
-            .policy_hook_listen
-            .map(bind_listener)
-            .transpose()
-            .map_err(io_error("bind MITM proxy policy hook listener"))?;
+        let listeners = ProxyListeners::bind(&config)?;
+        Self::start_with_listeners(config, listeners)
+    }
+
+    fn start_with_listeners(
+        config: MitmProxyConfig,
+        listeners: ProxyListeners,
+    ) -> Result<Self, MitmProxyError> {
+        validate_config(&config)?;
+        let downstream = DownstreamAcceptor::from_tls_config(config.tls.as_ref())?;
         write_pid_file(config.pid_file.as_ref())?;
         let feed = Arc::new(CaptureEventFeedWriter::create(&config.feed_path)?);
         let state = Arc::new(ProxyState {
             config: Arc::new(config),
+            downstream,
             feed,
             registry: Arc::new(FlowRegistry::default()),
             flow_factory: Arc::new(FlowFactory::new()),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut threads = vec![spawn_data_listener(
-            data_listener,
+            listeners.data,
             Arc::clone(&state),
             Arc::clone(&shutdown),
         )];
-        if let Some(listener) = hook_listener {
+        if let Some(listener) = listeners.policy_hook {
             threads.push(spawn_policy_hook_listener(
                 listener,
                 state,
@@ -125,9 +136,15 @@ pub fn run_forever(config: MitmProxyConfig) -> Result<(), MitmProxyError> {
 
 struct ProxyState {
     config: Arc<MitmProxyConfig>,
+    downstream: DownstreamAcceptor,
     feed: Arc<CaptureEventFeedWriter>,
     registry: Arc<FlowRegistry>,
     flow_factory: Arc<FlowFactory>,
+}
+
+struct ProxyListeners {
+    data: TcpListener,
+    policy_hook: Option<TcpListener>,
 }
 
 fn validate_config(config: &MitmProxyConfig) -> Result<(), MitmProxyError> {
@@ -152,8 +169,33 @@ fn validate_config(config: &MitmProxyConfig) -> Result<(), MitmProxyError> {
     Ok(())
 }
 
-fn bind_listener(listen: SocketAddr) -> std::io::Result<TcpListener> {
-    let listener = TcpListener::bind(listen)?;
+impl ProxyListeners {
+    fn bind(config: &MitmProxyConfig) -> Result<Self, MitmProxyError> {
+        Ok(Self {
+            data: bind_listener(config.listen)
+                .map_err(io_error("bind MITM proxy data listener"))?,
+            policy_hook: config
+                .policy_hook_listen
+                .map(bind_listener)
+                .transpose()
+                .map_err(io_error("bind MITM proxy policy hook listener"))?,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_bound(data: TcpListener, policy_hook: Option<TcpListener>) -> Result<Self, io::Error> {
+        Ok(Self {
+            data: prepare_listener(data)?,
+            policy_hook: policy_hook.map(prepare_listener).transpose()?,
+        })
+    }
+}
+
+fn bind_listener(listen: SocketAddr) -> io::Result<TcpListener> {
+    prepare_listener(TcpListener::bind(listen)?)
+}
+
+fn prepare_listener(listener: TcpListener) -> io::Result<TcpListener> {
     listener.set_nonblocking(true)?;
     Ok(listener)
 }
@@ -177,14 +219,6 @@ fn spawn_data_listener(
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<Result<(), MitmProxyError>> {
     thread::spawn(move || accept_data_connections(listener, state, shutdown))
-}
-
-fn spawn_policy_hook_listener(
-    listener: TcpListener,
-    state: Arc<ProxyState>,
-    shutdown: Arc<AtomicBool>,
-) -> JoinHandle<Result<(), MitmProxyError>> {
-    thread::spawn(move || accept_policy_hook_connections(listener, state, shutdown))
 }
 
 fn accept_data_connections(
@@ -211,44 +245,28 @@ fn accept_data_connections(
     Ok(())
 }
 
-fn accept_policy_hook_connections(
-    listener: TcpListener,
-    state: Arc<ProxyState>,
-    shutdown: Arc<AtomicBool>,
-) -> Result<(), MitmProxyError> {
-    while !shutdown.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _peer)) => {
-                let state = Arc::clone(&state);
-                thread::spawn(move || {
-                    if let Err(error) = handle_policy_hook_connection(stream, state) {
-                        eprintln!("MITM proxy policy hook connection failed: {error}");
-                    }
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(ACCEPT_IDLE_SLEEP);
-            }
-            Err(source) => {
-                return Err(io_error("accept MITM proxy policy hook connection")(source));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn handle_data_connection(
-    mut downstream: TcpStream,
+    downstream: TcpStream,
     state: Arc<ProxyState>,
 ) -> Result<(), MitmProxyError> {
     configure_stream(&downstream, state.config.io_timeout)?;
-    let Some(request) = read_http_message(&mut downstream, state.config.max_request_bytes)? else {
-        return Ok(());
-    };
     let peer = downstream
         .peer_addr()
         .map_err(io_error("read MITM proxy downstream peer address"))?;
     let target = recover_target(&downstream, &state.config)?;
+    let mut downstream = state.downstream.accept(downstream)?;
+    handle_http_connection(&mut downstream, peer, target, state)
+}
+
+fn handle_http_connection(
+    mut downstream: &mut impl DownstreamIo,
+    peer: SocketAddr,
+    target: SocketAddr,
+    state: Arc<ProxyState>,
+) -> Result<(), MitmProxyError> {
+    let Some(request) = read_http_message(downstream, state.config.max_request_bytes)? else {
+        return Ok(());
+    };
     let flow = state
         .flow_factory
         .flow(peer, target, state.config.request_direction);
@@ -283,113 +301,9 @@ fn handle_data_connection(
             &mut offsets,
         )?,
     }
-    state.feed.connection_closed(flow)
-}
-
-fn handle_policy_hook_connection(
-    mut stream: TcpStream,
-    state: Arc<ProxyState>,
-) -> Result<(), MitmProxyError> {
-    configure_stream(&stream, state.config.io_timeout)?;
-    let request = match read_http_message(&mut stream, state.config.max_request_bytes) {
-        Ok(Some(request)) => request,
-        Ok(None) => return Ok(()),
-        Err(error) => {
-            write_json_response(&mut stream, 400, unsupported_response(error.to_string()))?;
-            return Ok(());
-        }
-    };
-    if request.method != "POST" || request.path != state.config.policy_hook_path {
-        write_json_response(
-            &mut stream,
-            200,
-            unsupported_response(format!(
-                "expected POST {}, got {} {}",
-                state.config.policy_hook_path, request.method, request.path
-            )),
-        )?;
-        return Ok(());
-    }
-    let body = match serde_json::from_slice::<PolicyHookRequest>(&request.body) {
-        Ok(body) => body,
-        Err(error) => {
-            write_json_response(&mut stream, 400, unsupported_response(error.to_string()))?;
-            return Ok(());
-        }
-    };
-    if body.verdict.action != body.requested_action {
-        write_json_response(
-            &mut stream,
-            200,
-            unsupported_response(format!(
-                "verdict action {:?} did not match requested action {:?}",
-                body.verdict.action, body.requested_action
-            )),
-        )?;
-        return Ok(());
-    }
-    let Some(flow) = body.trigger.flow() else {
-        write_json_response(
-            &mut stream,
-            200,
-            unsupported_response("policy hook trigger did not contain a flow"),
-        )?;
-        return Ok(());
-    };
-    match body.requested_action {
-        Action::Deny => {
-            let reason = Some(body.verdict.reason);
-            if state.registry.deny(&flow.id.0, reason.clone()) {
-                write_json_response(&mut stream, 200, delegated_response(Action::Deny, reason))
-            } else {
-                write_json_response(
-                    &mut stream,
-                    200,
-                    unsupported_response(format!(
-                        "flow {} is not pending in MITM proxy",
-                        flow.id.0
-                    )),
-                )
-            }
-        }
-        action => write_json_response(
-            &mut stream,
-            200,
-            unsupported_response(format!("MITM proxy does not support action {action:?}")),
-        ),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct PolicyHookRequest {
-    requested_action: Action,
-    verdict: Verdict,
-    trigger: EventEnvelope,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-enum PolicyHookResponse {
-    Delegated {
-        executed_action: Action,
-        reason: Option<String>,
-    },
-    Unsupported {
-        reason: String,
-    },
-}
-
-fn delegated_response(action: Action, reason: Option<String>) -> PolicyHookResponse {
-    PolicyHookResponse::Delegated {
-        executed_action: action,
-        reason,
-    }
-}
-
-fn unsupported_response(reason: impl Into<String>) -> PolicyHookResponse {
-    PolicyHookResponse::Unsupported {
-        reason: reason.into(),
-    }
+    let finish_result = downstream.finish();
+    let close_result = state.feed.connection_closed(flow);
+    finish_result.and(close_result)
 }
 
 fn configure_stream(stream: &TcpStream, timeout: Duration) -> Result<(), MitmProxyError> {
@@ -439,7 +353,7 @@ fn linux_original_destination(downstream: &TcpStream) -> Result<SocketAddr, Mitm
 }
 
 fn write_deny_response(
-    downstream: &mut TcpStream,
+    downstream: &mut impl Write,
     state: &ProxyState,
     flow: &probe_core::FlowContext,
     offsets: &mut FlowOffsets,
@@ -459,7 +373,7 @@ fn write_deny_response(
 }
 
 fn forward_or_gateway_response(
-    downstream: &mut TcpStream,
+    downstream: &mut impl Write,
     target: SocketAddr,
     request: HttpMessage,
     state: &ProxyState,
@@ -497,7 +411,7 @@ fn forward_or_gateway_response(
 
 fn relay_response(
     upstream: &mut TcpStream,
-    downstream: &mut TcpStream,
+    downstream: &mut impl Write,
     feed: &CaptureEventFeedWriter,
     flow: &probe_core::FlowContext,
     offsets: &mut FlowOffsets,
@@ -556,13 +470,19 @@ mod tests {
         fs,
         io::{Read, Write},
         net::{Ipv4Addr, Shutdown, TcpListener},
-        path::PathBuf,
+        path::{Path, PathBuf},
+        sync::Arc,
         thread,
     };
 
     use capture::CaptureEvent;
     use probe_core::{
-        CaptureOrigin, CaptureSource, EventKind, FlowContext, HttpHeaders, Timestamp, VerdictScope,
+        Action, CaptureOrigin, CaptureSource, EventEnvelope, EventKind, FlowContext, HttpHeaders,
+        Timestamp, Verdict, VerdictScope,
+    };
+    use rustls::{
+        ClientConfig, ClientConnection, RootCertStore, StreamOwned,
+        pki_types::{CertificateDer, ServerName},
     };
     use tempfile::tempdir;
 
@@ -572,21 +492,22 @@ mod tests {
     fn policy_hook_can_deny_pending_http_flow() -> Result<(), Box<dyn Error>> {
         let root = tempdir()?;
         let feed_path = root.path().join("mitm-feed.jsonl");
-        let listen = unused_loopback_addr()?;
-        let policy_hook_listen = unused_loopback_addr()?;
-        let guard = MitmProxyGuard::start(MitmProxyConfig {
-            listen,
-            feed_path: feed_path.clone(),
-            pid_file: None,
-            upstream: None,
-            target_recovery: TargetRecovery::AcceptedLocal,
-            request_direction: Direction::Outbound,
-            policy_hook_listen: Some(policy_hook_listen),
-            policy_hook_path: "/mitm-policy-hook".to_string(),
-            max_request_bytes: 65_536,
-            io_timeout: Duration::from_secs(2),
-            action_timeout: Duration::from_secs(2),
-        })?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let policy_hook_listener = bound_loopback_listener()?;
+        let policy_hook_listen = policy_hook_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                None,
+                None,
+                Some(policy_hook_listen),
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            Some(policy_hook_listener),
+        )?;
 
         let client = thread::spawn(move || -> Result<Vec<u8>, String> {
             let mut stream = TcpStream::connect(listen).map_err(|error| error.to_string())?;
@@ -628,21 +549,22 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nallowed",
             Duration::from_millis(500),
         )?;
-        let listen = unused_loopback_addr()?;
-        let policy_hook_listen = unused_loopback_addr()?;
-        let guard = MitmProxyGuard::start(MitmProxyConfig {
-            listen,
-            feed_path: feed_path.clone(),
-            pid_file: None,
-            upstream: Some(upstream),
-            target_recovery: TargetRecovery::AcceptedLocal,
-            request_direction: Direction::Outbound,
-            policy_hook_listen: Some(policy_hook_listen),
-            policy_hook_path: "/mitm-policy-hook".to_string(),
-            max_request_bytes: 65_536,
-            io_timeout: Duration::from_secs(2),
-            action_timeout: Duration::from_millis(50),
-        })?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let policy_hook_listener = bound_loopback_listener()?;
+        let policy_hook_listen = policy_hook_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                None,
+                Some(policy_hook_listen),
+                Duration::from_millis(50),
+            ),
+            data_listener,
+            Some(policy_hook_listener),
+        )?;
 
         let client = thread::spawn(move || -> Result<Vec<u8>, String> {
             let mut stream = TcpStream::connect(listen).map_err(|error| error.to_string())?;
@@ -682,20 +604,20 @@ mod tests {
         let root = tempdir()?;
         let feed_path = root.path().join("mitm-feed.jsonl");
         let upstream = upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")?;
-        let listen = unused_loopback_addr()?;
-        let guard = MitmProxyGuard::start(MitmProxyConfig {
-            listen,
-            feed_path: feed_path.clone(),
-            pid_file: None,
-            upstream: Some(upstream),
-            target_recovery: TargetRecovery::AcceptedLocal,
-            request_direction: Direction::Outbound,
-            policy_hook_listen: None,
-            policy_hook_path: "/mitm-policy-hook".to_string(),
-            max_request_bytes: 65_536,
-            io_timeout: Duration::from_secs(2),
-            action_timeout: Duration::from_secs(2),
-        })?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                None,
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
 
         let mut stream = TcpStream::connect(listen)?;
         stream.write_all(b"GET /ok HTTP/1.1\r\nHost: example.test\r\n\r\n")?;
@@ -716,16 +638,127 @@ mod tests {
         Ok(())
     }
 
-    fn unused_loopback_addr() -> Result<SocketAddr, Box<dyn Error>> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        Ok(listener.local_addr()?)
+    #[test]
+    fn tls_listener_terminates_client_tls_and_feeds_plaintext_http() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let (certificate_chain, private_key, trusted_certificate) =
+            write_test_certificate(root.path())?;
+        let upstream = upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nfrom-tls")?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                Some(TlsTerminationConfig::new(certificate_chain, private_key)),
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let mut stream = tls_client_stream(listen, trusted_certificate)?;
+        let request = b"GET /tls HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        stream.write_all(request)?;
+        stream.flush()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nfrom-tls"
+        );
+        assert!(feed_has_bytes(&feed_path, Direction::Outbound, request)?);
+        assert!(feed_has_bytes(
+            &feed_path,
+            Direction::Inbound,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nfrom-tls"
+        )?);
+        Ok(())
+    }
+
+    fn test_config(
+        listen: SocketAddr,
+        feed_path: &Path,
+        upstream: Option<SocketAddr>,
+        tls: Option<TlsTerminationConfig>,
+        policy_hook_listen: Option<SocketAddr>,
+        action_timeout: Duration,
+    ) -> MitmProxyConfig {
+        MitmProxyConfig {
+            listen,
+            feed_path: feed_path.to_path_buf(),
+            pid_file: None,
+            upstream,
+            tls,
+            target_recovery: TargetRecovery::AcceptedLocal,
+            request_direction: Direction::Outbound,
+            policy_hook_listen,
+            policy_hook_path: "/mitm-policy-hook".to_string(),
+            max_request_bytes: 65_536,
+            io_timeout: Duration::from_secs(2),
+            action_timeout,
+        }
+    }
+
+    fn start_test_proxy(
+        config: MitmProxyConfig,
+        data: TcpListener,
+        policy_hook: Option<TcpListener>,
+    ) -> Result<MitmProxyGuard, Box<dyn Error>> {
+        Ok(MitmProxyGuard::start_with_listeners(
+            config,
+            ProxyListeners::from_bound(data, policy_hook)?,
+        )?)
+    }
+
+    fn bound_loopback_listener() -> Result<TcpListener, Box<dyn Error>> {
+        Ok(TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?)
+    }
+
+    fn write_test_certificate(
+        root: &std::path::Path,
+    ) -> Result<(PathBuf, PathBuf, CertificateDer<'static>), Box<dyn Error>> {
+        let certified_key = rcgen::generate_simple_self_signed(["localhost".to_string()])?;
+        let certificate_path = root.join("server.pem");
+        let private_key_path = root.join("server.key");
+        fs::write(&certificate_path, certified_key.cert.pem())?;
+        fs::write(&private_key_path, certified_key.signing_key.serialize_pem())?;
+        Ok((
+            certificate_path,
+            private_key_path,
+            certified_key.cert.der().clone(),
+        ))
+    }
+
+    fn tls_client_stream(
+        target: SocketAddr,
+        trusted_certificate: CertificateDer<'static>,
+    ) -> Result<StreamOwned<ClientConnection, TcpStream>, Box<dyn Error>> {
+        let mut roots = RootCertStore::empty();
+        roots.add(trusted_certificate)?;
+        let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = ClientConfig::builder_with_provider(crypto_provider)
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = ServerName::try_from("localhost")?;
+        let connection = ClientConnection::new(Arc::new(config), server_name)?;
+        let stream = TcpStream::connect(target)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        Ok(StreamOwned::new(connection, stream))
     }
 
     fn wait_for_flow(feed_path: &PathBuf) -> Result<FlowContext, Box<dyn Error>> {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
             if let Ok(content) = fs::read_to_string(feed_path) {
-                for line in content.lines() {
+                for line in complete_feed_lines(&content) {
                     let event = serde_json::from_str::<CaptureEvent>(line)?;
                     if let CaptureEvent::Bytes(bytes) = event {
                         return Ok(bytes.flow);
@@ -735,6 +768,17 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         Err("timed out waiting for MITM proxy feed flow".into())
+    }
+
+    fn complete_feed_lines(content: &str) -> impl Iterator<Item = &str> {
+        let complete = if content.ends_with('\n') {
+            content
+        } else {
+            content
+                .rsplit_once('\n')
+                .map_or("", |(complete, _)| complete)
+        };
+        complete.lines()
     }
 
     fn feed_has_bytes(

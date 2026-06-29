@@ -121,6 +121,16 @@ refresh_interval_ms = 1000
 # id = "browser-keylog"
 # kind = "key_log_file"
 # path = "/var/lib/probe/tls/browser.keys"
+#
+# [[tls.materials]]
+# id = "mitm-leaf"
+# kind = "mitm_leaf_certificate"
+# path = "/etc/probe/certs/mitm-leaf-chain.pem"
+#
+# [[tls.materials]]
+# id = "mitm-leaf-key"
+# kind = "mitm_leaf_private_key"
+# path = "/etc/probe/certs/mitm-leaf.key"
 
 [enforcement]
 # "audit_only" records protective verdicts without applying them.
@@ -143,12 +153,27 @@ kind = "none"
 # managed by Probe.
 strategy = "none"
 
+# [enforcement.interception.mitm]
+# leaf_certificate_chain_refs = ["mitm-leaf"]
+# leaf_private_key_ref = "mitm-leaf-key"
+
 [enforcement.interception.proxy]
 mode = "external"
 self_bypass = "none"
 
 [enforcement.interception.mitm.backend]
 mode = "disabled"
+# For the first-party product proxy, set mode = "product_proxy" and configure
+# readiness_probe.target to the proxy listen endpoint. RuntimePlan derives the
+# proxy's --listen, --feed, --policy-hook-*, and --tls-* arguments from typed
+# MITM config instead of treating raw process args as material ownership.
+#
+# [enforcement.interception.mitm.backend.process]
+# program = "/usr/local/bin/traffic-probe-mitm-proxy"
+# working_dir = "/run/traffic-probe"
+#
+# [enforcement.interception.mitm.backend.readiness_probe]
+# target = "127.0.0.1:15001"
 
 [enforcement.interception.mitm.client_trust]
 # MITM strategies require "operator_managed" so client trust installation is an
@@ -157,9 +182,16 @@ mode = "none"
 
 [enforcement.interception.mitm.plaintext_bridge]
 mode = "none"
+# Product proxy mode requires:
+# mode = "capture_event_feed"
+# path = "/var/lib/probe/mitm-feed.jsonl"
+# follow = true
 
 [enforcement.interception.mitm.policy_hook]
 mode = "none"
+# Product proxy mode requires:
+# mode = "http_json"
+# endpoint = "http://127.0.0.1:15002/mitm-policy-hook"
 
 [admin]
 enabled = false

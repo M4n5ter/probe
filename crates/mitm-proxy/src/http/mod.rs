@@ -1,7 +1,4 @@
-use std::{
-    io::{Read, Write},
-    net::TcpStream,
-};
+use std::io::{Read, Write};
 
 use serde::Serialize;
 
@@ -16,7 +13,7 @@ pub(crate) struct HttpMessage {
 }
 
 pub(crate) fn read_http_message(
-    stream: &mut TcpStream,
+    stream: &mut impl Read,
     max_bytes: usize,
 ) -> Result<Option<HttpMessage>, MitmProxyError> {
     let mut raw = Vec::new();
@@ -52,7 +49,7 @@ pub(crate) fn read_http_message(
 }
 
 pub(crate) fn write_json_response(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     status: u16,
     body: impl Serialize,
 ) -> Result<(), MitmProxyError> {
@@ -67,7 +64,7 @@ pub(crate) fn write_json_response(
 }
 
 pub(crate) fn write_empty_response(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     status: u16,
 ) -> Result<(), MitmProxyError> {
     write_response(
@@ -80,7 +77,7 @@ pub(crate) fn write_empty_response(
 }
 
 fn write_response(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     status: u16,
     reason: &str,
     body: &[u8],
@@ -102,7 +99,7 @@ fn write_response(
 }
 
 fn read_until_headers_complete(
-    stream: &mut TcpStream,
+    stream: &mut impl Read,
     raw: &mut Vec<u8>,
     max_bytes: usize,
 ) -> Result<(), MitmProxyError> {
@@ -115,7 +112,7 @@ fn read_until_headers_complete(
 }
 
 fn read_more(
-    stream: &mut TcpStream,
+    stream: &mut impl Read,
     raw: &mut Vec<u8>,
     max_bytes: usize,
 ) -> Result<usize, MitmProxyError> {

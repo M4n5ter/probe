@@ -65,6 +65,7 @@ pub use model::{
     TransparentInterceptionMitmPolicyHookConfig,
     TransparentInterceptionMitmPolicyHookEndpointIntent,
     TransparentInterceptionMitmPolicyHookIntent, TransparentInterceptionMitmPolicyHookModeConfig,
+    TransparentInterceptionMitmProductProxyConfig, TransparentInterceptionMitmProductProxyIntent,
     TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent, TransparentInterceptionProxyConfig,
     TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionProxyHealthProbeIntent,

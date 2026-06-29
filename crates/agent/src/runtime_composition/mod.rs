@@ -191,7 +191,8 @@ mod tests {
             .expect("default L7 MITM capability should explain why it is unavailable");
         assert!(reason.contains("control-plane support exists"));
         assert!(reason.contains("no MITM backend is configured"));
-        assert!(reason.contains("built-in TLS MITM data-plane"));
+        assert!(reason.contains("product proxy downstream TLS termination"));
+        assert!(reason.contains("upstream TLS relay"));
     }
 
     #[test]
@@ -411,7 +412,8 @@ mod tests {
 
         assert_eq!(l7_mitm.mode, RuntimeMode::Unavailable);
         assert!(l7_mitm.reason.as_deref().is_some_and(|reason| {
-            reason.contains("backend.mode = \"external\" or \"managed_process\"")
+            reason
+                .contains("backend.mode = \"external\", \"managed_process\", or \"product_proxy\"")
         }));
     }
 

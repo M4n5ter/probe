@@ -295,6 +295,72 @@ path = "/etc/traffic-probe/mitm-ca.key"
 }
 
 #[test]
+fn parses_product_proxy_mitm_backend_contract() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "inbound_tproxy_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+leaf_certificate_chain_refs = ["mitm-leaf"]
+leaf_private_key_ref = "mitm-leaf-key"
+
+[enforcement.interception.mitm.client_trust]
+mode = "operator_managed"
+
+[enforcement.interception.mitm.plaintext_bridge]
+mode = "capture_event_feed"
+path = "/run/traffic-probe/mitm-feed.jsonl"
+
+[enforcement.interception.mitm.policy_hook]
+mode = "http_json"
+endpoint = "http://127.0.0.1:15003/mitm-policy-hook"
+
+[enforcement.interception.mitm.backend]
+mode = "product_proxy"
+
+[enforcement.interception.mitm.backend.readiness_probe]
+target = "127.0.0.1:15002"
+
+[enforcement.interception.mitm.backend.process]
+program = "/usr/local/bin/traffic-probe-mitm-proxy"
+working_dir = "/run/traffic-probe"
+
+[[tls.materials]]
+id = "mitm-leaf"
+kind = "mitm_leaf_certificate"
+path = "/etc/traffic-probe/mitm-leaf.pem"
+
+[[tls.materials]]
+id = "mitm-leaf-key"
+kind = "mitm_leaf_private_key"
+path = "/etc/traffic-probe/mitm-leaf.key"
+"#,
+    )?;
+
+    let TransparentInterceptionMitmBackendConfig::ProductProxy { process, .. } =
+        &config.enforcement.interception.mitm.backend
+    else {
+        panic!("expected product-proxy MITM backend");
+    };
+    assert_eq!(
+        process.program.as_deref(),
+        Some(std::path::Path::new(
+            "/usr/local/bin/traffic-probe-mitm-proxy"
+        ))
+    );
+    assert_eq!(
+        process.working_dir.as_deref(),
+        Some(std::path::Path::new("/run/traffic-probe"))
+    );
+    Ok(())
+}
+
+#[test]
 fn parses_external_mitm_plaintext_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
         r#"

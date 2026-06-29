@@ -93,7 +93,8 @@ fn preflight_backend(
         TransparentInterceptionMitmBackendPlan::External { readiness_probe } => {
             resolve_external_backend(readiness_probe, tcp_probe)?;
         }
-        TransparentInterceptionMitmBackendPlan::ManagedProcess { process, .. } => {
+        TransparentInterceptionMitmBackendPlan::ManagedProcess { process, .. }
+        | TransparentInterceptionMitmBackendPlan::ProductProxy { process, .. } => {
             verify_managed_process_preflight(process)?;
         }
         TransparentInterceptionMitmBackendPlan::Disabled => {
@@ -122,6 +123,9 @@ pub(super) fn backend_health_probe(
         TransparentInterceptionMitmBackendPlan::External { readiness_probe }
         | TransparentInterceptionMitmBackendPlan::ManagedProcess {
             readiness_probe, ..
+        }
+        | TransparentInterceptionMitmBackendPlan::ProductProxy {
+            readiness_probe, ..
         } => Some(backend_health_probe_from_readiness(readiness_probe)),
         TransparentInterceptionMitmBackendPlan::Disabled => None,
     }
@@ -149,7 +153,8 @@ fn initial_health(backend: &TransparentInterceptionMitmBackendPlan) -> L7MitmBac
         TransparentInterceptionMitmBackendPlan::External { .. } => {
             L7MitmBackendHealthSnapshot::initial_success()
         }
-        TransparentInterceptionMitmBackendPlan::ManagedProcess { .. } => {
+        TransparentInterceptionMitmBackendPlan::ManagedProcess { .. }
+        | TransparentInterceptionMitmBackendPlan::ProductProxy { .. } => {
             L7MitmBackendHealthSnapshot::pending()
         }
         TransparentInterceptionMitmBackendPlan::Disabled => L7MitmBackendHealthSnapshot::disabled(),
@@ -163,6 +168,9 @@ fn capability_reason(mitm: &TransparentInterceptionMitmPlan) -> String {
         }
         TransparentInterceptionMitmBackendPlan::ManagedProcess { .. } => {
             "agent-managed selector-scoped L7 MITM backend process contract is configured and executable; run will spawn the process and require its configured readiness endpoint before installing transparent interception rules"
+        }
+        TransparentInterceptionMitmBackendPlan::ProductProxy { .. } => {
+            "agent-managed product L7 MITM proxy is configured with typed bridge, policy hook, and leaf certificate material; run will spawn the resolved proxy command and require its configured readiness endpoint before installing transparent interception rules"
         }
         TransparentInterceptionMitmBackendPlan::Disabled => "L7 MITM backend is disabled",
     };
@@ -331,7 +339,8 @@ mod tests {
             .expect("default L7 MITM capability should explain why it is unavailable");
         assert!(reason.contains("control-plane support exists"));
         assert!(reason.contains("no MITM backend is configured"));
-        assert!(reason.contains("built-in TLS MITM data-plane"));
+        assert!(reason.contains("product proxy downstream TLS termination"));
+        assert!(reason.contains("upstream TLS relay"));
         assert_eq!(
             runtime.handle().snapshot().plaintext_bridge.mode,
             L7MitmPlaintextBridgeMode::NotConfigured

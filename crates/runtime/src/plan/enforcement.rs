@@ -10,13 +10,16 @@ use probe_config::{
     TransparentInterceptionMitmPlaintextBridgeIntent,
     TransparentInterceptionMitmPolicyHookEndpointIntent,
     TransparentInterceptionMitmPolicyHookIntent, TransparentInterceptionMitmPolicyHookModeConfig,
-    TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
+    TransparentInterceptionMitmProductProxyIntent, TransparentInterceptionOutboundProxyIntent,
+    TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent,
     TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
     TransparentInterceptionProxyIntentViolation, TransparentInterceptionProxyModeConfig,
     TransparentInterceptionProxySelfBypassConfig, TransparentInterceptionStrategyConfig,
 };
-use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState, EnforcementMode, RuntimeMode};
+use probe_core::{
+    CapabilityKind, CapabilityMatrix, CapabilityState, Direction, EnforcementMode, RuntimeMode,
+};
 use serde::{Deserialize, Serialize};
 use transparent_linux::{OutboundRedirectArtifactSpec, TransparentLinuxResources};
 
@@ -344,61 +347,85 @@ impl TransparentInterceptionMitmPlan {
             .interception
             .mitm_backend_intent()
             .expect("MITM backend contract should be validated before planning");
+        let client_trust = TransparentInterceptionMitmClientTrustPlan::from_intent(
+            config
+                .enforcement
+                .interception
+                .mitm_client_trust_intent()
+                .expect("MITM client trust contract should be validated before planning"),
+        );
+        let plaintext_bridge = TransparentInterceptionMitmPlaintextBridgePlan::from_intent(
+            config
+                .enforcement
+                .interception
+                .mitm_plaintext_bridge_intent()
+                .expect("MITM plaintext bridge contract should be validated before planning"),
+        );
+        let policy_hook = TransparentInterceptionMitmPolicyHookPlan::from_intent(
+            config
+                .enforcement
+                .interception
+                .mitm_policy_hook_intent()
+                .expect("MITM policy hook contract should be validated before planning"),
+        );
+        let ca_certificate = mitm.ca_certificate_ref.as_deref().and_then(|reference| {
+            mitm_tls_material_from_ref(
+                reference,
+                TlsMaterialKind::MitmCaCertificate,
+                &materials_by_id,
+            )
+        });
+        let ca_private_key = mitm.ca_private_key_ref.as_deref().and_then(|reference| {
+            mitm_tls_material_from_ref(
+                reference,
+                TlsMaterialKind::MitmCaPrivateKey,
+                &materials_by_id,
+            )
+        });
+        let leaf_certificate_chain = mitm_tls_materials_from_refs(
+            &mitm.leaf_certificate_chain_refs,
+            TlsMaterialKind::MitmLeafCertificate,
+            &materials_by_id,
+        );
+        let leaf_private_key = mitm.leaf_private_key_ref.as_deref().and_then(|reference| {
+            mitm_tls_material_from_ref(
+                reference,
+                TlsMaterialKind::MitmLeafPrivateKey,
+                &materials_by_id,
+            )
+        });
+        let upstream_trust_anchors = mitm_tls_materials_from_refs(
+            &mitm.upstream_trust_anchor_refs,
+            TlsMaterialKind::MitmUpstreamTrustAnchor,
+            &materials_by_id,
+        );
+        let backend = TransparentInterceptionMitmBackendPlan::from_intent(
+            backend_intent,
+            product_proxy_request_direction(config.enforcement.interception.strategy),
+            &plaintext_bridge,
+            &policy_hook,
+            &leaf_certificate_chain,
+            leaf_private_key.as_ref(),
+        );
         Self {
-            backend: TransparentInterceptionMitmBackendPlan::from_intent(backend_intent),
-            client_trust: TransparentInterceptionMitmClientTrustPlan::from_intent(
-                config
-                    .enforcement
-                    .interception
-                    .mitm_client_trust_intent()
-                    .expect("MITM client trust contract should be validated before planning"),
-            ),
-            plaintext_bridge: TransparentInterceptionMitmPlaintextBridgePlan::from_intent(
-                config
-                    .enforcement
-                    .interception
-                    .mitm_plaintext_bridge_intent()
-                    .expect("MITM plaintext bridge contract should be validated before planning"),
-            ),
-            policy_hook: TransparentInterceptionMitmPolicyHookPlan::from_intent(
-                config
-                    .enforcement
-                    .interception
-                    .mitm_policy_hook_intent()
-                    .expect("MITM policy hook contract should be validated before planning"),
-            ),
-            ca_certificate: mitm.ca_certificate_ref.as_deref().and_then(|reference| {
-                mitm_tls_material_from_ref(
-                    reference,
-                    TlsMaterialKind::MitmCaCertificate,
-                    &materials_by_id,
-                )
-            }),
-            ca_private_key: mitm.ca_private_key_ref.as_deref().and_then(|reference| {
-                mitm_tls_material_from_ref(
-                    reference,
-                    TlsMaterialKind::MitmCaPrivateKey,
-                    &materials_by_id,
-                )
-            }),
-            leaf_certificate_chain: mitm_tls_materials_from_refs(
-                &mitm.leaf_certificate_chain_refs,
-                TlsMaterialKind::MitmLeafCertificate,
-                &materials_by_id,
-            ),
-            leaf_private_key: mitm.leaf_private_key_ref.as_deref().and_then(|reference| {
-                mitm_tls_material_from_ref(
-                    reference,
-                    TlsMaterialKind::MitmLeafPrivateKey,
-                    &materials_by_id,
-                )
-            }),
-            upstream_trust_anchors: mitm_tls_materials_from_refs(
-                &mitm.upstream_trust_anchor_refs,
-                TlsMaterialKind::MitmUpstreamTrustAnchor,
-                &materials_by_id,
-            ),
+            backend,
+            client_trust,
+            plaintext_bridge,
+            policy_hook,
+            ca_certificate,
+            ca_private_key,
+            leaf_certificate_chain,
+            leaf_private_key,
+            upstream_trust_anchors,
         }
+    }
+}
+
+fn product_proxy_request_direction(strategy: TransparentInterceptionStrategyConfig) -> Direction {
+    match strategy {
+        TransparentInterceptionStrategyConfig::InboundTproxyMitm => Direction::Inbound,
+        TransparentInterceptionStrategyConfig::OutboundTransparentMitm => Direction::Outbound,
+        _ => Direction::Outbound,
     }
 }
 
@@ -439,10 +466,21 @@ pub enum TransparentInterceptionMitmBackendPlan {
         process: TransparentInterceptionMitmManagedProcessPlan,
         readiness_probe: TransparentInterceptionMitmBackendReadinessProbePlan,
     },
+    ProductProxy {
+        process: TransparentInterceptionMitmManagedProcessPlan,
+        readiness_probe: TransparentInterceptionMitmBackendReadinessProbePlan,
+    },
 }
 
 impl TransparentInterceptionMitmBackendPlan {
-    fn from_intent(intent: TransparentInterceptionMitmBackendIntent) -> Self {
+    fn from_intent(
+        intent: TransparentInterceptionMitmBackendIntent,
+        request_direction: Direction,
+        plaintext_bridge: &TransparentInterceptionMitmPlaintextBridgePlan,
+        policy_hook: &TransparentInterceptionMitmPolicyHookPlan,
+        leaf_certificate_chain: &[TlsMaterialPlan],
+        leaf_private_key: Option<&TlsMaterialPlan>,
+    ) -> Self {
         match intent {
             TransparentInterceptionMitmBackendIntent::Disabled => Self::Disabled,
             TransparentInterceptionMitmBackendIntent::External { readiness_probe } => {
@@ -462,6 +500,27 @@ impl TransparentInterceptionMitmBackendPlan {
                     readiness_probe,
                 ),
             },
+            TransparentInterceptionMitmBackendIntent::ProductProxy {
+                process,
+                readiness_probe,
+            } => {
+                let readiness_probe =
+                    TransparentInterceptionMitmBackendReadinessProbePlan::from_intent(
+                        readiness_probe,
+                    );
+                Self::ProductProxy {
+                    process: TransparentInterceptionMitmManagedProcessPlan::from_product_proxy(
+                        process,
+                        &readiness_probe,
+                        request_direction,
+                        plaintext_bridge,
+                        policy_hook,
+                        leaf_certificate_chain,
+                        leaf_private_key,
+                    ),
+                    readiness_probe,
+                }
+            }
         }
     }
 }
@@ -480,6 +539,66 @@ impl TransparentInterceptionMitmManagedProcessPlan {
             args: intent.args,
             working_dir: intent.working_dir,
         }
+    }
+
+    fn from_product_proxy(
+        intent: TransparentInterceptionMitmProductProxyIntent,
+        readiness_probe: &TransparentInterceptionMitmBackendReadinessProbePlan,
+        request_direction: Direction,
+        plaintext_bridge: &TransparentInterceptionMitmPlaintextBridgePlan,
+        policy_hook: &TransparentInterceptionMitmPolicyHookPlan,
+        leaf_certificate_chain: &[TlsMaterialPlan],
+        leaf_private_key: Option<&TlsMaterialPlan>,
+    ) -> Self {
+        let mut args = vec![
+            "--listen".to_string(),
+            readiness_probe.target().to_string(),
+            "--feed".to_string(),
+            plaintext_bridge
+                .capture_event_feed_path()
+                .display()
+                .to_string(),
+            "--request-direction".to_string(),
+            direction_cli_value(request_direction).to_string(),
+        ];
+        if let TransparentInterceptionMitmPolicyHookPlan::HttpJson {
+            endpoint,
+            timeout_ms,
+            ..
+        } = policy_hook
+        {
+            args.extend([
+                "--policy-hook-listen".to_string(),
+                endpoint.address.to_string(),
+                "--policy-hook-path".to_string(),
+                endpoint.path_and_query.clone(),
+                "--action-timeout-ms".to_string(),
+                timeout_ms.to_string(),
+            ]);
+        }
+        let leaf_certificate = leaf_certificate_chain
+            .first()
+            .expect("product proxy MITM validation should require one leaf certificate chain");
+        let leaf_private_key =
+            leaf_private_key.expect("product proxy MITM validation should require a leaf key");
+        args.extend([
+            "--tls-certificate-chain".to_string(),
+            leaf_certificate.path.display().to_string(),
+            "--tls-private-key".to_string(),
+            leaf_private_key.path.display().to_string(),
+        ]);
+        Self {
+            program: intent.program,
+            args,
+            working_dir: intent.working_dir,
+        }
+    }
+}
+
+fn direction_cli_value(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Inbound => "inbound",
+        Direction::Outbound => "outbound",
     }
 }
 
@@ -510,6 +629,12 @@ impl TransparentInterceptionMitmBackendReadinessProbePlan {
             },
         }
     }
+
+    fn target(&self) -> SocketAddr {
+        match self {
+            Self::TcpConnect { target, .. } => *target,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -525,6 +650,15 @@ impl TransparentInterceptionMitmPlaintextBridgePlan {
             TransparentInterceptionMitmPlaintextBridgeIntent::Disabled => Self::Disabled,
             TransparentInterceptionMitmPlaintextBridgeIntent::CaptureEventFeed { path, follow } => {
                 Self::CaptureEventFeed { path, follow }
+            }
+        }
+    }
+
+    fn capture_event_feed_path(&self) -> &PathBuf {
+        match self {
+            Self::CaptureEventFeed { path, .. } => path,
+            Self::Disabled => {
+                panic!("product proxy MITM validation should require capture_event_feed bridge")
             }
         }
     }
@@ -932,7 +1066,8 @@ mod tests {
         TransparentInterceptionMitmManagedProcessConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionMitmPolicyHookConfig,
-        TransparentInterceptionMitmPolicyHookModeConfig, TransparentInterceptionStrategyConfig,
+        TransparentInterceptionMitmPolicyHookModeConfig,
+        TransparentInterceptionMitmProductProxyConfig, TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
         CapabilityMatrix, CapabilityState, Direction, ProcessSelector, Selector, TrafficSelector,
@@ -1282,6 +1417,109 @@ mod tests {
     }
 
     #[test]
+    fn product_proxy_mitm_backend_synthesizes_cli_from_typed_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_product_proxy_mitm_backend(&mut config);
+        let capabilities = CapabilityMatrix::new([
+            CapabilityState::available(CapabilityKind::TransparentInterception),
+            CapabilityState::available(CapabilityKind::L7Mitm),
+            CapabilityState::available(CapabilityKind::CaptureEventFeed),
+        ]);
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        let TransparentInterceptionMitmBackendPlan::ProductProxy {
+            process,
+            readiness_probe,
+        } = &plan.interception.mitm.backend
+        else {
+            panic!(
+                "product MITM proxy plan should be preserved: {:?}",
+                plan.interception.mitm.backend
+            );
+        };
+        assert_eq!(
+            readiness_probe,
+            &TransparentInterceptionMitmBackendReadinessProbePlan::TcpConnect {
+                target: "127.0.0.1:15002".parse()?,
+                interval_ms: 1_000,
+                timeout_ms: 200,
+                failure_threshold: 3,
+            }
+        );
+        assert_eq!(
+            process.program,
+            PathBuf::from("/usr/local/bin/traffic-probe-mitm-proxy")
+        );
+        assert_eq!(
+            process.args,
+            vec![
+                "--listen".to_string(),
+                "127.0.0.1:15002".to_string(),
+                "--feed".to_string(),
+                "/run/traffic-probe/mitm-feed.jsonl".to_string(),
+                "--request-direction".to_string(),
+                "inbound".to_string(),
+                "--policy-hook-listen".to_string(),
+                "127.0.0.1:15003".to_string(),
+                "--policy-hook-path".to_string(),
+                "/mitm-policy-hook".to_string(),
+                "--action-timeout-ms".to_string(),
+                "250".to_string(),
+                "--tls-certificate-chain".to_string(),
+                "/etc/traffic-probe/mitm-leaf.pem".to_string(),
+                "--tls-private-key".to_string(),
+                "/etc/traffic-probe/mitm-leaf.key".to_string(),
+            ]
+        );
+        assert_eq!(
+            process.working_dir,
+            Some(PathBuf::from("/run/traffic-probe"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_product_proxy_mitm_backend_synthesizes_outbound_direction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm;
+        config.enforcement.interception.proxy.self_bypass =
+            TransparentInterceptionProxySelfBypassConfig::UsesReservedMark;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_product_proxy_mitm_backend(&mut config);
+        let capabilities = CapabilityMatrix::new([
+            CapabilityState::available(CapabilityKind::TransparentInterception),
+            CapabilityState::available(CapabilityKind::L7Mitm),
+            CapabilityState::available(CapabilityKind::CaptureEventFeed),
+        ]);
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let TransparentInterceptionMitmBackendPlan::ProductProxy { process, .. } =
+            &plan.interception.mitm.backend
+        else {
+            panic!(
+                "product MITM proxy plan should be preserved: {:?}",
+                plan.interception.mitm.backend
+            );
+        };
+
+        assert!(args_contain_pair(
+            &process.args,
+            "--request-direction",
+            "outbound"
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn enforcement_plan_reports_external_mitm_plaintext_bridge()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut config = AgentConfig::default();
@@ -1619,6 +1857,55 @@ mod tests {
         config.enforcement.interception.mitm.backend =
             TransparentInterceptionMitmBackendConfig::managed_process(readiness_probe, process);
         configure_mitm_materials(config);
+    }
+
+    fn configure_product_proxy_mitm_backend(config: &mut AgentConfig) {
+        let readiness_probe = TransparentInterceptionMitmBackendReadinessProbeConfig {
+            target: Some("127.0.0.1:15002".to_string()),
+            ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+        };
+        let process = TransparentInterceptionMitmProductProxyConfig {
+            program: Some("/usr/local/bin/traffic-probe-mitm-proxy".into()),
+            working_dir: Some("/run/traffic-probe".into()),
+        };
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::product_proxy(readiness_probe, process);
+        config.enforcement.interception.mitm.client_trust.mode =
+            TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path =
+            Some("/run/traffic-probe/mitm-feed.jsonl".into());
+        config.enforcement.interception.mitm.policy_hook =
+            TransparentInterceptionMitmPolicyHookConfig {
+                mode: TransparentInterceptionMitmPolicyHookModeConfig::HttpJson,
+                endpoint: Some("http://127.0.0.1:15003/mitm-policy-hook".to_string()),
+                ..TransparentInterceptionMitmPolicyHookConfig::default()
+            };
+        config
+            .enforcement
+            .interception
+            .mitm
+            .leaf_certificate_chain_refs = vec!["mitm-leaf".to_string()];
+        config.enforcement.interception.mitm.leaf_private_key_ref =
+            Some("mitm-leaf-key".to_string());
+        config.tls.materials = vec![
+            TlsMaterialConfig {
+                id: Some("mitm-leaf".to_string()),
+                kind: TlsMaterialKind::MitmLeafCertificate,
+                path: "/etc/traffic-probe/mitm-leaf.pem".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("mitm-leaf-key".to_string()),
+                kind: TlsMaterialKind::MitmLeafPrivateKey,
+                path: "/etc/traffic-probe/mitm-leaf.key".into(),
+            },
+        ];
+    }
+
+    fn args_contain_pair(args: &[String], flag: &str, value: &str) -> bool {
+        args.windows(2)
+            .any(|pair| pair[0] == flag && pair[1] == value)
     }
 
     fn mitm_registry() -> ProviderRegistry {

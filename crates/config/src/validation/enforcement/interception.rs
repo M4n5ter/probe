@@ -2,7 +2,9 @@ use std::collections::HashSet;
 
 use crate::{
     ConfigViolation, EnforcementInterceptionConfig, TlsConfig, TlsMaterialKind,
-    TransparentInterceptionIntentViolation, TransparentInterceptionMitmConfig,
+    TransparentInterceptionIntentViolation, TransparentInterceptionMitmBackendConfig,
+    TransparentInterceptionMitmConfig, TransparentInterceptionMitmPlaintextBridgeModeConfig,
+    TransparentInterceptionMitmPolicyHookModeConfig,
 };
 
 pub(super) fn validate(
@@ -52,6 +54,7 @@ fn validate_mitm_config(
     validate_mitm_plaintext_bridge_intent(interception, violations);
     validate_mitm_policy_hook_intent(interception, violations);
     validate_mitm_material_shape(mitm, violations);
+    validate_product_proxy_contract(mitm, violations);
     validate_mitm_material_refs(mitm, tls, violations);
 }
 
@@ -130,6 +133,47 @@ fn validate_mitm_material_shape(
         violations.push(ConfigViolation {
             field: "enforcement.interception.mitm".to_string(),
             reason: "MITM interception requires either a CA certificate/private key pair or a leaf certificate/private key pair".to_string(),
+        });
+    }
+}
+
+fn validate_product_proxy_contract(
+    mitm: &TransparentInterceptionMitmConfig,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if !matches!(
+        mitm.backend,
+        TransparentInterceptionMitmBackendConfig::ProductProxy { .. }
+    ) {
+        return;
+    }
+
+    if mitm.plaintext_bridge.mode
+        != TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed
+    {
+        violations.push(ConfigViolation {
+            field: "enforcement.interception.mitm.plaintext_bridge.mode".to_string(),
+            reason: "product MITM proxy backend requires plaintext_bridge.mode = \"capture_event_feed\" so the generated proxy feed is the typed bridge source".to_string(),
+        });
+    }
+    if let Some(path) = &mitm.plaintext_bridge.path
+        && !path.is_absolute()
+    {
+        violations.push(ConfigViolation {
+            field: "enforcement.interception.mitm.plaintext_bridge.path".to_string(),
+            reason: "product MITM proxy backend requires an absolute plaintext bridge path so the agent and spawned proxy share the same feed file".to_string(),
+        });
+    }
+    if mitm.policy_hook.mode != TransparentInterceptionMitmPolicyHookModeConfig::HttpJson {
+        violations.push(ConfigViolation {
+            field: "enforcement.interception.mitm.policy_hook.mode".to_string(),
+            reason: "product MITM proxy backend requires policy_hook.mode = \"http_json\" so proxy-side protective actions use the typed hook contract".to_string(),
+        });
+    }
+    if mitm.leaf_certificate_chain_refs.len() != 1 || mitm.leaf_private_key_ref.is_none() {
+        violations.push(ConfigViolation {
+            field: "enforcement.interception.mitm.leaf_certificate_chain_refs".to_string(),
+            reason: "product MITM proxy backend requires exactly one leaf certificate chain ref and one leaf private key ref".to_string(),
         });
     }
 }
@@ -223,6 +267,8 @@ mod tests {
         MIN_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS, TlsMaterialConfig, TlsMaterialKind,
         TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig, TransparentInterceptionMitmConfig,
+        TransparentInterceptionMitmPlaintextBridgeConfig,
+        TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionMitmPolicyHookConfig,
         TransparentInterceptionMitmPolicyHookModeConfig, TransparentInterceptionProxyConfig,
         TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionProxyModeConfig,
@@ -634,11 +680,63 @@ mod tests {
             && violation.reason.contains("policy_hook.mode")));
     }
 
+    #[test]
+    fn product_proxy_requires_absolute_plaintext_bridge_path() {
+        let mut violations = Vec::new();
+        let mut interception = product_proxy_interception();
+        interception.mitm.plaintext_bridge.path = Some("relative/mitm-feed.jsonl".into());
+
+        validate(&interception, &tls_config_with_mitm_leaf(), &mut violations);
+
+        assert!(violations.iter().any(|violation| violation.field
+            == "enforcement.interception.mitm.plaintext_bridge.path"
+            && violation.reason.contains("absolute plaintext bridge path")));
+    }
+
     fn validate_interception(
         interception: &EnforcementInterceptionConfig,
         violations: &mut Vec<ConfigViolation>,
     ) {
         validate(interception, &TlsConfig::default(), violations);
+    }
+
+    fn product_proxy_interception() -> EnforcementInterceptionConfig {
+        EnforcementInterceptionConfig {
+            strategy: TransparentInterceptionStrategyConfig::InboundTproxyMitm,
+            proxy: TransparentInterceptionProxyConfig {
+                listen_port: Some(15002),
+                ..TransparentInterceptionProxyConfig::default()
+            },
+            mitm: TransparentInterceptionMitmConfig {
+                backend: TransparentInterceptionMitmBackendConfig::product_proxy(
+                    TransparentInterceptionMitmBackendReadinessProbeConfig {
+                        target: Some("127.0.0.1:15002".to_string()),
+                        ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+                    },
+                    crate::TransparentInterceptionMitmProductProxyConfig {
+                        program: Some("/usr/local/bin/traffic-probe-mitm-proxy".into()),
+                        working_dir: Some("/run/traffic-probe".into()),
+                    },
+                ),
+                client_trust: crate::TransparentInterceptionMitmClientTrustConfig {
+                    mode: crate::TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged,
+                },
+                plaintext_bridge: TransparentInterceptionMitmPlaintextBridgeConfig {
+                    mode: TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed,
+                    path: Some("/run/traffic-probe/mitm-feed.jsonl".into()),
+                    follow: Some(true),
+                },
+                policy_hook: TransparentInterceptionMitmPolicyHookConfig {
+                    mode: TransparentInterceptionMitmPolicyHookModeConfig::HttpJson,
+                    endpoint: Some("http://127.0.0.1:15003/mitm-policy-hook".to_string()),
+                    ..TransparentInterceptionMitmPolicyHookConfig::default()
+                },
+                leaf_certificate_chain_refs: vec!["mitm-leaf".to_string()],
+                leaf_private_key_ref: Some("mitm-leaf-key".to_string()),
+                ..TransparentInterceptionMitmConfig::default()
+            },
+            ..EnforcementInterceptionConfig::default()
+        }
     }
 
     fn tls_config_with_mitm_ca() -> TlsConfig {
@@ -653,6 +751,24 @@ mod tests {
                     id: Some("mitm-ca-key".to_string()),
                     kind: TlsMaterialKind::MitmCaPrivateKey,
                     path: "/etc/traffic-probe/mitm-ca.key".into(),
+                },
+            ],
+            ..TlsConfig::default()
+        }
+    }
+
+    fn tls_config_with_mitm_leaf() -> TlsConfig {
+        TlsConfig {
+            materials: vec![
+                TlsMaterialConfig {
+                    id: Some("mitm-leaf".to_string()),
+                    kind: TlsMaterialKind::MitmLeafCertificate,
+                    path: "/etc/traffic-probe/mitm-leaf.pem".into(),
+                },
+                TlsMaterialConfig {
+                    id: Some("mitm-leaf-key".to_string()),
+                    kind: TlsMaterialKind::MitmLeafPrivateKey,
+                    path: "/etc/traffic-probe/mitm-leaf.key".into(),
                 },
             ],
             ..TlsConfig::default()

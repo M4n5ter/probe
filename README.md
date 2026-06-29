@@ -62,7 +62,7 @@ exporters, status APIs, and tests.
 | --- | --- |
 | Capture | eBPF-first live capture, libpcap fallback, external plaintext feed, capture-event feed, and replay. |
 | Attribution | procfs process and socket attribution with explicit best-effort boundaries. |
-| TLS plaintext | libssl uprobe plaintext, TLS 1.3 key log/session secret material, auto-binding, and plaintext bridge paths. |
+| TLS plaintext | libssl uprobe plaintext, TLS 1.3 key log/session secret material, auto-binding, plaintext bridge paths, and explicit MITM proxy TLS termination. |
 | Protocols | HTTP/1.x request/response/body events, SSE events, WebSocket upgrade handoff, frame metadata, and 16 MiB bounded message metadata. |
 | Policy | Lua policy hooks, typed verdicts, policy bundle loading, remote policy bundle support, and manual admin reload. |
 | Enforcement | audit-only, dry-run, scoped connection enforcement, Linux socket destroy backend, transparent interception lifecycle, and proxy-side policy hook. |
@@ -90,8 +90,11 @@ Probe does not silently upgrade weak evidence into strong guarantees.
 Probe reserves MITM for explicit, scoped deployments. It supports inbound
 TPROXY and outbound transparent proxy lifecycle planning, external or
 agent-managed backend contracts, capture-event plaintext bridge provenance,
-explicit operator-managed client trust, and a loopback HTTP JSON policy hook
-for proxy-side enforcement delegation.
+explicit operator-managed client trust, product proxy downstream TLS
+termination, and a loopback HTTP JSON policy hook for proxy-side enforcement
+delegation.
+The first-party `product_proxy` backend derives its proxy CLI from typed MITM
+readiness, bridge, policy hook, and leaf certificate material refs.
 
 This keeps MITM out of the default capture path while still allowing operators
 to build controlled proxy/MITM deployments with auditable boundaries.
@@ -106,6 +109,9 @@ The following are intentional boundaries of the current implementation:
 - No default whole-host transparent MITM.
 - No automatic mutation of client trust stores; MITM client trust is an explicit
   operator-managed contract.
+- No claim that downstream TLS termination proves full transparent HTTPS MITM;
+  upstream TLS relay and transparent HTTPS end-to-end validation are still
+  explicit capability boundaries.
 - No hidden long-term raw traffic retention.
 - No HTTP/2, HTTP/3, or QUIC parser yet.
 - WebSocket support emits handoff, frame metadata, and 16 MiB bounded

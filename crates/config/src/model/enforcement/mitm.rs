@@ -144,6 +144,12 @@ pub enum TransparentInterceptionMitmBackendConfig {
         #[serde(default)]
         process: TransparentInterceptionMitmManagedProcessConfig,
     },
+    ProductProxy {
+        #[serde(default)]
+        readiness_probe: TransparentInterceptionMitmBackendReadinessProbeConfig,
+        #[serde(default)]
+        process: TransparentInterceptionMitmProductProxyConfig,
+    },
 }
 
 impl TransparentInterceptionMitmBackendConfig {
@@ -158,6 +164,16 @@ impl TransparentInterceptionMitmBackendConfig {
         process: TransparentInterceptionMitmManagedProcessConfig,
     ) -> Self {
         Self::ManagedProcess {
+            readiness_probe,
+            process,
+        }
+    }
+
+    pub fn product_proxy(
+        readiness_probe: TransparentInterceptionMitmBackendReadinessProbeConfig,
+        process: TransparentInterceptionMitmProductProxyConfig,
+    ) -> Self {
+        Self::ProductProxy {
             readiness_probe,
             process,
         }
@@ -179,6 +195,19 @@ pub struct TransparentInterceptionMitmManagedProcessConfig {
 impl TransparentInterceptionMitmManagedProcessConfig {
     pub fn is_configured(&self) -> bool {
         self.program.is_some() || !self.args.is_empty() || self.working_dir.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransparentInterceptionMitmProductProxyConfig {
+    pub program: Option<PathBuf>,
+    pub working_dir: Option<PathBuf>,
+}
+
+impl TransparentInterceptionMitmProductProxyConfig {
+    pub fn is_configured(&self) -> bool {
+        self.program.is_some() || self.working_dir.is_some()
     }
 }
 
@@ -257,12 +286,22 @@ pub enum TransparentInterceptionMitmBackendIntent {
         process: TransparentInterceptionMitmManagedProcessIntent,
         readiness_probe: TransparentInterceptionMitmBackendReadinessProbeIntent,
     },
+    ProductProxy {
+        process: TransparentInterceptionMitmProductProxyIntent,
+        readiness_probe: TransparentInterceptionMitmBackendReadinessProbeIntent,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentInterceptionMitmManagedProcessIntent {
     pub program: PathBuf,
     pub args: Vec<String>,
+    pub working_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransparentInterceptionMitmProductProxyIntent {
+    pub program: PathBuf,
     pub working_dir: Option<PathBuf>,
 }
 
@@ -324,7 +363,7 @@ impl EnforcementInterceptionConfig {
             TransparentInterceptionMitmBackendConfig::Disabled => {
                 violations.push(intent_violation(
                     "enforcement.interception.mitm.backend.mode",
-                    "MITM interception requires enforcement.interception.mitm.backend.mode = \"external\" or \"managed_process\"",
+                    "MITM interception requires enforcement.interception.mitm.backend.mode = \"external\", \"managed_process\", or \"product_proxy\"",
                 ));
                 None
             }
@@ -351,6 +390,26 @@ impl EnforcementInterceptionConfig {
                 match (process, readiness_probe) {
                     (Some(process), Some(readiness_probe)) => {
                         Some(TransparentInterceptionMitmBackendIntent::ManagedProcess {
+                            process,
+                            readiness_probe,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            TransparentInterceptionMitmBackendConfig::ProductProxy {
+                process,
+                readiness_probe,
+            } => {
+                let process = validate_mitm_product_proxy_process(process, &mut violations);
+                let readiness_probe = validate_mitm_backend_readiness_probe(
+                    self.proxy.listen_port.and_then(NonZeroU16::new),
+                    readiness_probe,
+                    &mut violations,
+                );
+                match (process, readiness_probe) {
+                    (Some(process), Some(readiness_probe)) => {
+                        Some(TransparentInterceptionMitmBackendIntent::ProductProxy {
                             process,
                             readiness_probe,
                         })
@@ -444,44 +503,95 @@ fn validate_mitm_managed_process(
     process: &TransparentInterceptionMitmManagedProcessConfig,
     violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
 ) -> Option<TransparentInterceptionMitmManagedProcessIntent> {
-    let Some(program) = &process.program else {
+    let program = validate_mitm_process_program(
+        &process.program,
+        "enforcement.interception.mitm.backend.process.program",
+        "managed MITM backend",
+        violations,
+    )?;
+    validate_mitm_process_working_dir(
+        &process.working_dir,
+        "enforcement.interception.mitm.backend.process.working_dir",
+        "managed MITM backend",
+        violations,
+    );
+    Some(TransparentInterceptionMitmManagedProcessIntent {
+        program,
+        args: process.args.clone(),
+        working_dir: process.working_dir.clone(),
+    })
+}
+
+fn validate_mitm_product_proxy_process(
+    process: &TransparentInterceptionMitmProductProxyConfig,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) -> Option<TransparentInterceptionMitmProductProxyIntent> {
+    let program = validate_mitm_process_program(
+        &process.program,
+        "enforcement.interception.mitm.backend.process.program",
+        "product MITM proxy",
+        violations,
+    )?;
+    validate_mitm_process_working_dir(
+        &process.working_dir,
+        "enforcement.interception.mitm.backend.process.working_dir",
+        "product MITM proxy",
+        violations,
+    );
+    Some(TransparentInterceptionMitmProductProxyIntent {
+        program,
+        working_dir: process.working_dir.clone(),
+    })
+}
+
+fn validate_mitm_process_program(
+    program: &Option<PathBuf>,
+    field: &'static str,
+    label: &'static str,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) -> Option<PathBuf> {
+    let Some(program) = program else {
         violations.push(intent_violation(
-            "enforcement.interception.mitm.backend.process.program",
-            "managed MITM backend requires a program path",
+            field,
+            format!("{label} requires a program path"),
         ));
         return None;
     };
     if program.as_os_str().is_empty() {
         violations.push(intent_violation(
-            "enforcement.interception.mitm.backend.process.program",
-            "managed MITM backend program path must not be empty",
+            field,
+            format!("{label} program path must not be empty"),
         ));
         return None;
     }
     if !program.is_absolute() {
         violations.push(intent_violation(
-            "enforcement.interception.mitm.backend.process.program",
-            "managed MITM backend program path must be absolute",
+            field,
+            format!("{label} program path must be absolute"),
         ));
     }
-    if let Some(working_dir) = &process.working_dir {
+    Some(program.clone())
+}
+
+fn validate_mitm_process_working_dir(
+    working_dir: &Option<PathBuf>,
+    field: &'static str,
+    label: &'static str,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) {
+    if let Some(working_dir) = working_dir {
         if working_dir.as_os_str().is_empty() {
             violations.push(intent_violation(
-                "enforcement.interception.mitm.backend.process.working_dir",
-                "managed MITM backend working_dir must not be empty",
+                field,
+                format!("{label} working_dir must not be empty"),
             ));
         } else if !working_dir.is_absolute() {
             violations.push(intent_violation(
-                "enforcement.interception.mitm.backend.process.working_dir",
-                "managed MITM backend working_dir must be absolute",
+                field,
+                format!("{label} working_dir must be absolute"),
             ));
         }
     }
-    Some(TransparentInterceptionMitmManagedProcessIntent {
-        program: program.clone(),
-        args: process.args.clone(),
-        working_dir: process.working_dir.clone(),
-    })
 }
 
 fn validate_mitm_backend_readiness_probe(

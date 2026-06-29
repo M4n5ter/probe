@@ -17,6 +17,8 @@ pub enum MitmProxyError {
     Json(#[from] serde_json::Error),
     #[error("invalid MITM proxy HTTP message: {0}")]
     Http(String),
+    #[error("MITM proxy TLS failed: {0}")]
+    Tls(String),
     #[error("MITM proxy worker thread panicked")]
     ThreadPanic,
 }
