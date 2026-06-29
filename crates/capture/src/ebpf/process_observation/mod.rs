@@ -17,8 +17,9 @@ pub(crate) use bridge::{
     unresolved_accept_gap_from_observation, unresolved_connect_gap_from_observation,
 };
 pub use probe::{
-    EbpfProcessObservationProbe, EbpfProcessObservationProbeConfig,
-    EbpfProcessObservationProbeError,
+    EbpfProcessObservationLinkOwnershipSnapshot, EbpfProcessObservationProbe,
+    EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeError,
+    EbpfProcessObservationProgramLinkOwnershipSnapshot,
 };
 pub use provider::EbpfProcessObservationProvider;
 pub use types::{

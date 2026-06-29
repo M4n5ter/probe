@@ -12,7 +12,8 @@ use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider};
 
 use super::super::{
     EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfProcessObservation,
-    EbpfProcessObservationProbe, EbpfProcessObservationProbeConfig, EbpfSocketFlowResolver,
+    EbpfProcessObservationLinkOwnershipSnapshot, EbpfProcessObservationProbe,
+    EbpfProcessObservationProbeConfig, EbpfSocketFlowResolver,
     bridge::output_loss_event,
     clock::EbpfObservationClock,
     flow_start::{PendingEbpfFlowResolution, PendingEbpfFlowStart},
@@ -40,6 +41,7 @@ pub struct EbpfProcessObservationProvider {
     pending_flows: VecDeque<PendingEbpfFlowResolution>,
     pending_events: VecDeque<CaptureEvent>,
     output_loss: OutputLossTracker,
+    link_ownership: EbpfProcessObservationLinkOwnershipSnapshot,
 }
 
 impl EbpfProcessObservationProvider {
@@ -50,6 +52,7 @@ impl EbpfProcessObservationProvider {
     ) -> Result<Self, CaptureError> {
         let probe = EbpfProcessObservationProbe::load(config)
             .map_err(|error| CaptureError::provider("ebpf", error.to_string()))?;
+        let link_ownership = probe.link_ownership();
         Ok(Self {
             observations: Box::new(ProbeObservationSource { probe }),
             resolver,
@@ -62,7 +65,12 @@ impl EbpfProcessObservationProvider {
             pending_flows: VecDeque::new(),
             pending_events: VecDeque::new(),
             output_loss: OutputLossTracker::default(),
+            link_ownership,
         })
+    }
+
+    pub fn link_ownership(&self) -> EbpfProcessObservationLinkOwnershipSnapshot {
+        self.link_ownership.clone()
     }
 
     fn poll_event(&mut self) -> Result<CapturePoll, CaptureError> {
@@ -351,6 +359,7 @@ mod tests {
                 pending_flows: VecDeque::new(),
                 pending_events: VecDeque::new(),
                 output_loss: OutputLossTracker::default(),
+                link_ownership: EbpfProcessObservationLinkOwnershipSnapshot::unreported(),
             }
         }
 

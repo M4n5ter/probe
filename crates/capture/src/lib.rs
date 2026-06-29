@@ -13,10 +13,11 @@ pub use ebpf::{
     EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
     EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfHostProbe,
     EbpfHostProbeConfig, EbpfHostProbeReport, EbpfObservedProcess, EbpfProcessObservation,
-    EbpfProcessObservationProbe, EbpfProcessObservationProbeConfig,
-    EbpfProcessObservationProbeError, EbpfProcessObservationProvider, EbpfResolvedSocketFlow,
-    EbpfSocketEndpoint, EbpfSocketFlowLookup, EbpfSocketFlowResolver, EbpfSocketReadObservation,
-    EbpfSocketWriteObservation, UnprivilegedBpfStatus,
+    EbpfProcessObservationLinkOwnershipSnapshot, EbpfProcessObservationProbe,
+    EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeError,
+    EbpfProcessObservationProgramLinkOwnershipSnapshot, EbpfProcessObservationProvider,
+    EbpfResolvedSocketFlow, EbpfSocketEndpoint, EbpfSocketFlowLookup, EbpfSocketFlowResolver,
+    EbpfSocketReadObservation, EbpfSocketWriteObservation, UnprivilegedBpfStatus,
 };
 pub use event::{
     CaptureEvent, CapturedBytes, CapturedGap, CapturedLoss, EnforcementEvidencePropagation,

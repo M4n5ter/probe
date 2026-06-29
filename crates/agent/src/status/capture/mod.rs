@@ -3,7 +3,9 @@ use probe_core::RuntimeMode;
 use runtime::{CaptureEvidenceMode, CapturePlanMode, RuntimePlan};
 use serde::Serialize;
 
-use crate::capture_provider::CaptureProviderRuntimeSnapshot;
+use crate::capture_provider::{
+    CaptureProviderRuntimeDetailsSnapshot, CaptureProviderRuntimeSnapshot,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CaptureStatusSnapshot {
@@ -15,6 +17,7 @@ pub struct CaptureStatusSnapshot {
     pub evidence_mode: Option<CaptureEvidenceMode>,
     pub evidence_reason: Option<String>,
     pub open_failures: Vec<CaptureOpenFailureStatusSnapshot>,
+    pub provider: Option<CaptureProviderRuntimeDetailsSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -44,6 +47,7 @@ pub(in crate::status) fn capture_status(
                     reason: failure.reason,
                 })
                 .collect(),
+            provider: runtime.provider,
         },
         None => CaptureStatusSnapshot {
             selection: plan.capture.selection,
@@ -54,6 +58,7 @@ pub(in crate::status) fn capture_status(
             evidence_mode: plan.capture.selected_evidence_mode,
             evidence_reason: plan.capture.evidence_reason.clone(),
             open_failures: Vec::new(),
+            provider: None,
         },
     }
 }
@@ -104,6 +109,7 @@ mod tests {
                     reason: "eBPF attach failed".to_string(),
                 },
             ],
+            provider: None,
         };
 
         let status = capture_status(&plan, Some(runtime));
@@ -114,6 +120,66 @@ mod tests {
         assert_eq!(status.reason, None);
         assert_eq!(status.open_failures.len(), 1);
         assert_eq!(status.open_failures[0].backend, CaptureBackend::Ebpf);
+        Ok(())
+    }
+
+    #[test]
+    fn capture_status_reports_ebpf_process_link_ownership() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let plan = auto_plan_with_degraded_ebpf_and_available_libpcap()?;
+        let runtime = CaptureProviderRuntimeSnapshot {
+            selected_backend: CaptureBackend::Ebpf,
+            plan_mode: CapturePlanMode::Live,
+            provider_runtime_mode: RuntimeMode::Degraded,
+            evidence_mode: CaptureEvidenceMode::BestEffort,
+            evidence_reason: Some("eBPF provider is best-effort".to_string()),
+            reason: Some("kernel socket-object lifetime is best-effort".to_string()),
+            open_failures: Vec::new(),
+            provider: Some(
+                crate::capture_provider::CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(
+                    capture::EbpfProcessObservationLinkOwnershipSnapshot::owned_by_programs([
+                        capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
+                            "connect_enter",
+                            "syscalls",
+                            "sys_enter_connect",
+                            1,
+                        ),
+                        capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
+                            "connect_exit",
+                            "syscalls",
+                            "sys_exit_connect",
+                            1,
+                        ),
+                    ]),
+                ),
+            ),
+        };
+
+        let status = capture_status(&plan, Some(runtime));
+
+        let value = serde_json::to_value(&status)?;
+        let provider = &value["provider"];
+        assert_eq!(
+            provider["kind"],
+            serde_json::json!("ebpf_process_observation")
+        );
+        assert_eq!(
+            provider["link_ownership"]["mode"],
+            serde_json::json!("available")
+        );
+        assert_eq!(provider["link_ownership"]["owned_link_count"], 2);
+        assert_eq!(
+            provider["link_ownership"]["programs"][0]["program_name"],
+            serde_json::json!("connect_enter")
+        );
+        assert_eq!(
+            provider["link_ownership"]["programs"][0]["category"],
+            serde_json::json!("syscalls")
+        );
+        assert_eq!(
+            provider["link_ownership"]["programs"][0]["tracepoint_name"],
+            serde_json::json!("sys_enter_connect")
+        );
         Ok(())
     }
 

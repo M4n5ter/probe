@@ -5,8 +5,10 @@ pub use host::{EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport, Unprivil
 pub use process_observation::{
     EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
     EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
-    EbpfProcessObservation, EbpfProcessObservationProbe, EbpfProcessObservationProbeConfig,
-    EbpfProcessObservationProbeError, EbpfProcessObservationProvider, EbpfResolvedSocketFlow,
-    EbpfSocketEndpoint, EbpfSocketFlowLookup, EbpfSocketFlowResolver, EbpfSocketReadObservation,
+    EbpfProcessObservation, EbpfProcessObservationLinkOwnershipSnapshot,
+    EbpfProcessObservationProbe, EbpfProcessObservationProbeConfig,
+    EbpfProcessObservationProbeError, EbpfProcessObservationProgramLinkOwnershipSnapshot,
+    EbpfProcessObservationProvider, EbpfResolvedSocketFlow, EbpfSocketEndpoint,
+    EbpfSocketFlowLookup, EbpfSocketFlowResolver, EbpfSocketReadObservation,
     EbpfSocketWriteObservation,
 };

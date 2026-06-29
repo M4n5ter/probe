@@ -86,6 +86,97 @@ pub struct EbpfProcessObservationProbe {
     events: RingBuf<MapData>,
     allowed_socket_fds: SocketAllowMap,
     output_losses: OutputLossMap,
+    link_ownership: EbpfProcessObservationLinkOwnershipSnapshot,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EbpfProcessObservationLinkOwnershipSnapshot {
+    programs: Vec<EbpfProcessObservationProgramLinkOwnershipSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EbpfProcessObservationProgramLinkOwnershipSnapshot {
+    program_name: &'static str,
+    category: &'static str,
+    tracepoint_name: &'static str,
+    owned_link_count: usize,
+}
+
+impl EbpfProcessObservationLinkOwnershipSnapshot {
+    pub fn unreported() -> Self {
+        Self::default()
+    }
+
+    pub fn from_attached_tracepoints(
+        specs: impl IntoIterator<Item = EbpfProcessTracepointSpec>,
+    ) -> Self {
+        Self::owned_by_programs(
+            specs
+                .into_iter()
+                .map(EbpfProcessObservationProgramLinkOwnershipSnapshot::from_spec),
+        )
+    }
+
+    pub fn owned_by_programs(
+        programs: impl IntoIterator<Item = EbpfProcessObservationProgramLinkOwnershipSnapshot>,
+    ) -> Self {
+        let programs = programs
+            .into_iter()
+            .filter(|program| program.owned_link_count > 0)
+            .collect::<Vec<_>>();
+        Self { programs }
+    }
+
+    pub fn is_reported(&self) -> bool {
+        self.owned_link_count() > 0
+    }
+
+    pub fn owned_link_count(&self) -> usize {
+        self.programs
+            .iter()
+            .map(|program| program.owned_link_count)
+            .sum()
+    }
+
+    pub fn into_programs(self) -> Vec<EbpfProcessObservationProgramLinkOwnershipSnapshot> {
+        self.programs
+    }
+}
+
+impl EbpfProcessObservationProgramLinkOwnershipSnapshot {
+    pub fn new(
+        program_name: &'static str,
+        category: &'static str,
+        tracepoint_name: &'static str,
+        owned_link_count: usize,
+    ) -> Self {
+        Self {
+            program_name,
+            category,
+            tracepoint_name,
+            owned_link_count,
+        }
+    }
+
+    fn from_spec(spec: EbpfProcessTracepointSpec) -> Self {
+        Self::new(spec.program_name, spec.category, spec.tracepoint_name, 1)
+    }
+
+    pub fn program_name(&self) -> &'static str {
+        self.program_name
+    }
+
+    pub fn category(&self) -> &'static str {
+        self.category
+    }
+
+    pub fn tracepoint_name(&self) -> &'static str {
+        self.tracepoint_name
+    }
+
+    pub fn owned_link_count(&self) -> usize {
+        self.owned_link_count
+    }
 }
 
 impl EbpfProcessObservationProbe {
@@ -107,8 +198,10 @@ impl EbpfProcessObservationProbe {
     ) -> Result<Self, EbpfProcessObservationProbeError> {
         let mut ebpf = Ebpf::load(object.bytes())
             .map_err(|source| EbpfProcessObservationProbeError::Load { source })?;
+        let mut attached_tracepoints = Vec::new();
         for spec in EBPF_PROCESS_TRACEPOINT_SPECS {
             load_and_attach_tracepoint(&mut ebpf, spec)?;
+            attached_tracepoints.push(spec);
         }
         let events = open_events_ringbuf(&mut ebpf)?;
         let allowed_socket_fds = open_socket_allow_map(&mut ebpf)?;
@@ -118,7 +211,14 @@ impl EbpfProcessObservationProbe {
             events,
             allowed_socket_fds,
             output_losses,
+            link_ownership: EbpfProcessObservationLinkOwnershipSnapshot::from_attached_tracepoints(
+                attached_tracepoints,
+            ),
         })
+    }
+
+    pub fn link_ownership(&self) -> EbpfProcessObservationLinkOwnershipSnapshot {
+        self.link_ownership.clone()
     }
 
     pub fn next_observation(
@@ -770,6 +870,36 @@ mod tests {
             observation => panic!("unexpected observation: {observation:?}"),
         }
         Ok(())
+    }
+
+    #[test]
+    fn link_ownership_snapshot_reports_committed_tracepoint_links() {
+        let ownership = EbpfProcessObservationLinkOwnershipSnapshot::from_attached_tracepoints(
+            EBPF_PROCESS_TRACEPOINT_SPECS,
+        );
+
+        assert!(ownership.is_reported());
+        assert_eq!(
+            ownership.owned_link_count(),
+            EBPF_PROCESS_TRACEPOINT_SPECS.len()
+        );
+        let programs = ownership.into_programs();
+        assert_eq!(programs.len(), EBPF_PROCESS_TRACEPOINT_SPECS.len());
+        assert_eq!(
+            programs
+                .iter()
+                .map(|program| (
+                    program.program_name(),
+                    program.category(),
+                    program.tracepoint_name(),
+                    program.owned_link_count()
+                ))
+                .collect::<Vec<_>>(),
+            EBPF_PROCESS_TRACEPOINT_SPECS
+                .iter()
+                .map(|spec| (spec.program_name, spec.category, spec.tracepoint_name, 1))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

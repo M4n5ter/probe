@@ -350,6 +350,7 @@ mod tests {
             evidence_mode: Some(CaptureEvidenceMode::BestEffort),
             evidence_reason: Some("eBPF provider is best-effort".to_string()),
             open_failures: Vec::new(),
+            provider: None,
         };
 
         let health = fold_health_contributions([capture_health_contribution(&capture)]);
@@ -369,6 +370,7 @@ mod tests {
             evidence_mode: Some(CaptureEvidenceMode::Nominal),
             evidence_reason: None,
             open_failures: Vec::new(),
+            provider: None,
         };
 
         let health = fold_health_contributions([capture_health_contribution(&capture)]);

@@ -317,9 +317,14 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
   - 已实现：返回长度超过已捕获 prefix、scan limit 或 sample buffer 的部分表达为 gap。
   - 已实现：connect/accept fd 归因首轮会立即尝试；未解析 flow-start 会进入有界 pending queue，
     在 ringbuf drain 空闲时轮转 retry，避免单个 fd 解析失败阻塞后续 live observation。
+  - 已实现：eBPF process observation provider 成功打开后，online capture status 的 `capture.provider` 报告
+    `ebpf_process_observation` provider details；其中 `link_ownership` 按 program、tracepoint category/name 和 link count
+    报告 userspace loader 已提交并持有的 tracepoint links。
   - 边界：capability 和 evidence mode 仍是 degraded/best-effort。
   - 边界：outbound sample 不是内核已发送字节的强证明，inbound sample 也只是 syscall 返回后的用户 buffer 观察，不等于完整 socket 流。
   - 边界：descriptor lease 是进程 fd 级错配防护，不等同于 kernel socket object identity。
+  - 边界：process eBPF `link_ownership` 只证明 loader 成功提交并仍持有 tracepoint link handles；
+    它不是动态 per-link firing/liveness probe，也不证明任意 socket-object lifetime。
   - 边界：`SO_COOKIE` 只增强成功 fd lookup 后的身份，不解决 fd 关闭后才解析、dup/fork/fd passing 或 lost event。
   - 边界：output ringbuf failure 的 flow fan-out 是保守影响信号，不知道具体丢失事件、字节范围或 next offset，也不能重建 parser state。
   - 缺口：unbounded scatter/gather continuation、precise flow-specific lost-event reconstruction、partial-write retry 语义和完整
@@ -1695,6 +1700,9 @@ loss 与 fallback 边界：
 - host probe、object 解析、contract preflight 或 procfs socket attribution 不可用时，plan-time 才进入后续 live fallback。
 - 运行期 Aya load/attach/open 失败时，`auto` 继续尝试后续 live backend。
 - runtime open failure 会记录到 status `capture.open_failures`。
+- process eBPF open 成功时，online status `capture.provider.kind = "ebpf_process_observation"`，
+  `capture.provider.link_ownership` 报告 loader 已提交并持有的 tracepoint links。
+- process eBPF `link_ownership` 不是动态 per-link kernel liveness，也不证明强 socket-object lifetime。
 - agent composition root 只探测一次 procfs socket attribution，并把同一份 `CapabilityState` 同时用于 eBPF descriptor 和 capability matrix，避免二者分叉。
 
 其中 `close_range` 的生命周期处理是“双层保守”：kernel 侧总是提升 TGID epoch 让旧 payload allow fail closed；只有合法 range 且 `flags == 0` 时才输出
@@ -3945,6 +3953,8 @@ Status snapshot：
 - 输出可复用的 JSON snapshot。
 - snapshot 包含 health。
 - snapshot 包含 capture status。
+- 在线 capture status 对 backend-specific runtime facts 使用 `capture.provider`；process eBPF provider 通过该字段暴露
+  tracepoint link ownership。
 - snapshot 包含 policy status。
 - snapshot 包含 enforcement status。
 - snapshot 包含 TLS plaintext/material status。

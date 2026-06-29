@@ -1,18 +1,17 @@
 use std::{fs::File, io::BufReader};
 
-use attribution::ProcfsSocketResolver;
-use capture::{
-    CaptureError, CaptureMultiplexer, CaptureProvider, EbpfProcessObservationProbeConfig,
-    EbpfProcessObservationProvider, EbpfResolvedSocketFlow, EbpfSocketFlowLookup,
-    EbpfSocketFlowResolver, LibpcapProvider, MultiplexedProvider, ProcessResolver, ResolvedProcess,
-};
+use capture::{CaptureMultiplexer, CaptureProvider, LibpcapProvider, MultiplexedProvider};
 use probe_config::{CaptureBackend, CaptureSelection};
-use probe_core::{CapabilityKind, RuntimeMode, TcpConnection};
+use probe_core::RuntimeMode;
 use runtime::{
     CaptureProviderDescriptor, RuntimeError, RuntimePlan, TransparentInterceptionMitmBackendPlan,
     TransparentInterceptionMitmPlaintextBridgePlan,
 };
 
+use super::{
+    OpenedLiveCaptureBackend, ebpf::build_ebpf_capture_provider,
+    procfs_resolver::procfs_tcp_process_resolver_for_plan,
+};
 use crate::{
     capture_event_feed::{
         JsonLinesCaptureEventFeedProvider, load_capture_event_feed_provider,
@@ -85,6 +84,7 @@ pub(crate) fn build_capture_provider(
                 evidence_reason: plan.capture.evidence_reason.clone(),
                 reason: None,
                 open_failures: Vec::new(),
+                provider: None,
             },
         }),
         Some(CaptureBackend::CaptureEventFeed) => Ok(BuiltCaptureProvider {
@@ -100,6 +100,7 @@ pub(crate) fn build_capture_provider(
                 evidence_reason: plan.capture.evidence_reason.clone(),
                 reason: None,
                 open_failures: Vec::new(),
+                provider: None,
             },
         }),
         _ => build_live_capture_provider(
@@ -122,7 +123,11 @@ fn build_live_capture_provider(
     plan.require_live_capture()?;
     let outcome = build_live_primary_with_fallback(plan)?;
     let descriptor = outcome.descriptor;
-    let primary = session_secret_auto_binding.wrap(outcome.provider);
+    let OpenedLiveCaptureBackend {
+        provider: primary,
+        provider_details,
+    } = outcome.provider;
+    let primary = session_secret_auto_binding.wrap(primary);
     let provider = with_tls_plaintext_provider(plan, primary, tls_plaintext_runtime)?;
     let provider = with_mitm_plaintext_bridge_provider(
         plan,
@@ -140,13 +145,14 @@ fn build_live_capture_provider(
             evidence_reason: descriptor.evidence_reason,
             reason: descriptor.reason,
             open_failures: outcome.open_failures,
+            provider: provider_details,
         },
     })
 }
 
 fn build_live_primary_with_fallback(
     plan: &RuntimePlan,
-) -> Result<LiveCaptureOpenOutcome<Box<dyn CaptureProvider>>, AgentError> {
+) -> Result<LiveCaptureOpenOutcome<OpenedLiveCaptureBackend>, AgentError> {
     open_live_backend_with_fallback(plan, |backend| build_live_capture_backend(plan, backend))
 }
 
@@ -189,13 +195,16 @@ fn open_live_backend_with_fallback<T>(
 fn build_live_capture_backend(
     plan: &RuntimePlan,
     backend: CaptureBackend,
-) -> Result<Box<dyn CaptureProvider>, AgentError> {
+) -> Result<OpenedLiveCaptureBackend, AgentError> {
     match backend {
         CaptureBackend::Ebpf => build_ebpf_capture_provider(plan),
-        CaptureBackend::Libpcap => Ok(Box::new(LibpcapProvider::open_with_process_resolver(
-            libpcap_config_from_agent(&plan.config),
-            procfs_tcp_process_resolver_for_plan(plan),
-        )?) as Box<dyn CaptureProvider>),
+        CaptureBackend::Libpcap => Ok(OpenedLiveCaptureBackend {
+            provider: Box::new(LibpcapProvider::open_with_process_resolver(
+                libpcap_config_from_agent(&plan.config),
+                procfs_tcp_process_resolver_for_plan(plan),
+            )?) as Box<dyn CaptureProvider>,
+            provider_details: None,
+        }),
         backend => Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
             reason: format!("{backend:?} capture provider is selected but has no agent builder"),
         })),
@@ -338,38 +347,6 @@ fn open_deferred_mitm_plaintext_bridge_provider(
     Ok(Some(provider))
 }
 
-fn build_ebpf_capture_provider(plan: &RuntimePlan) -> Result<Box<dyn CaptureProvider>, AgentError> {
-    let object_path = plan
-        .config
-        .capture
-        .ebpf
-        .object_path
-        .clone()
-        .ok_or_else(|| {
-            AgentError::UnsupportedRunConfig(
-                "ebpf capture requires capture.ebpf.object_path".to_string(),
-            )
-        })?;
-    let deep_observe_selector = plan
-        .config
-        .capture
-        .deep_observe_selector
-        .as_ref()
-        .map(|selector| {
-            selector.compile().map_err(|source| {
-                AgentError::UnsupportedRunConfig(format!(
-                    "invalid capture.deep_observe_selector: {source}"
-                ))
-            })
-        })
-        .transpose()?;
-    Ok(Box::new(EbpfProcessObservationProvider::open(
-        EbpfProcessObservationProbeConfig::new(object_path),
-        Box::<ProcfsTcpProcessResolver>::default(),
-        deep_observe_selector,
-    )?))
-}
-
 fn build_plaintext_feed_provider(
     plan: &RuntimePlan,
 ) -> Result<Box<dyn CaptureProvider>, AgentError> {
@@ -402,87 +379,11 @@ fn build_capture_event_feed_provider(
     )?))
 }
 
-fn procfs_tcp_process_resolver_for_plan(plan: &RuntimePlan) -> Option<Box<dyn ProcessResolver>> {
-    (plan
-        .capabilities
-        .mode(CapabilityKind::ProcfsSocketAttribution)
-        != RuntimeMode::Unavailable)
-        .then(|| Box::<ProcfsTcpProcessResolver>::default() as Box<dyn ProcessResolver>)
-}
-
-struct ProcfsTcpProcessResolver {
-    resolver: ProcfsSocketResolver,
-}
-
-impl Default for ProcfsTcpProcessResolver {
-    fn default() -> Self {
-        Self {
-            resolver: ProcfsSocketResolver::new(),
-        }
-    }
-}
-
-impl ProcessResolver for ProcfsTcpProcessResolver {
-    fn resolve_tcp_process(
-        &mut self,
-        connection: TcpConnection,
-    ) -> Result<Option<ResolvedProcess>, CaptureError> {
-        self.resolver
-            .resolve_tcp_connection(connection)
-            .map(|resolved| {
-                resolved.map(|resolved| ResolvedProcess {
-                    process: resolved.process,
-                    confidence: resolved.confidence,
-                })
-            })
-            .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
-    }
-
-    fn invalidate_cached_resolution(&mut self) {
-        self.resolver.invalidate_snapshot();
-    }
-}
-
-impl EbpfSocketFlowResolver for ProcfsTcpProcessResolver {
-    fn resolve_socket_flow(
-        &mut self,
-        lookup: EbpfSocketFlowLookup,
-    ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError> {
-        self.resolver
-            .resolve_tcp_fd(attribution::SocketFdLookup {
-                tgid: lookup.tgid,
-                thread_pid: lookup.thread_pid,
-                fd: lookup.fd,
-                expected_remote_endpoint: lookup.expected_remote_endpoint,
-                process_hint: lookup
-                    .process_hint
-                    .map(|hint| attribution::SocketProcessHint {
-                        name: hint.name,
-                        uid: hint.uid,
-                        gid: hint.gid,
-                    }),
-            })
-            .map(|resolved| {
-                resolved.map(|resolved| EbpfResolvedSocketFlow {
-                    process: resolved.process,
-                    confidence: resolved.confidence,
-                    connection: resolved.connection,
-                    socket_cookie: resolved.socket_cookie,
-                })
-            })
-            .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
-    }
-
-    fn invalidate_cached_resolution(&mut self) {
-        self.resolver.invalidate_snapshot();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::VecDeque, fs, io::Write, path::PathBuf};
 
-    use capture::{CaptureEvent, CapturePoll, CapturedLoss};
+    use capture::{CaptureError, CaptureEvent, CapturePoll, CapturedLoss};
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, TlsMaterialConfig, TlsMaterialKind,
         TransparentInterceptionMitmBackendConfig,

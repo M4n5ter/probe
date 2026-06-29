@@ -80,6 +80,7 @@ mod tests {
                 backend: CaptureBackend::Ebpf,
                 reason: "eBPF attach failed".to_string(),
             }],
+            provider: None,
         };
 
         let capabilities = capabilities_with_runtime(&plan, Some(&runtime), None);
