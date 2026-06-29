@@ -20,6 +20,7 @@ use crate::{MitmProxyError, authority::UpstreamAuthorityCandidates, error::io_er
 
 pub(crate) type TlsClientStream = StreamOwned<ClientConnection, TcpStream>;
 pub(crate) type TlsServerStream = StreamOwned<ServerConnection, TcpStream>;
+const HTTP11_ALPN: &[u8] = b"http/1.1";
 const DYNAMIC_CERT_CACHE_CAPACITY: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,9 +87,12 @@ impl TlsTerminator {
             TlsTerminationConfig::Static(config) => {
                 let certificate_chain = load_certificate_chain(&config.certificate_chain)?;
                 let private_key = load_private_key(&config.private_key)?;
-                builder
-                    .with_single_cert(certificate_chain, private_key)
-                    .map_err(tls_error("configure MITM proxy TLS certificate"))?
+                let resolver = StaticCertResolver::new(
+                    certificate_chain,
+                    private_key,
+                    Arc::clone(&crypto_provider),
+                )?;
+                builder.with_cert_resolver(Arc::new(resolver))
             }
             TlsTerminationConfig::DynamicCa(config) => {
                 let resolver =
@@ -96,6 +100,8 @@ impl TlsTerminator {
                 builder.with_cert_resolver(Arc::new(resolver))
             }
         };
+        let mut server_config = server_config;
+        server_config.alpn_protocols = http1_alpn_protocols();
         Ok(Self {
             config: Arc::new(server_config),
         })
@@ -114,7 +120,44 @@ impl TlsTerminator {
                 ));
             }
         }
+        ensure_supported_alpn(
+            connection.alpn_protocol(),
+            "MITM proxy downstream TLS client",
+        )?;
         Ok(StreamOwned::new(connection, stream))
+    }
+}
+
+struct StaticCertResolver {
+    certified_key: Arc<CertifiedKey>,
+}
+
+impl StaticCertResolver {
+    fn new(
+        certificate_chain: Vec<CertificateDer<'static>>,
+        private_key: PrivateKeyDer<'static>,
+        crypto_provider: Arc<CryptoProvider>,
+    ) -> Result<Self, MitmProxyError> {
+        let certified_key =
+            CertifiedKey::from_der(certificate_chain, private_key, &crypto_provider)
+                .map_err(tls_error("configure MITM proxy TLS certificate"))?;
+        Ok(Self {
+            certified_key: Arc::new(certified_key),
+        })
+    }
+}
+
+impl std::fmt::Debug for StaticCertResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StaticCertResolver")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolvesServerCert for StaticCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        client_hello_allows_http1(&client_hello).then(|| Arc::clone(&self.certified_key))
     }
 }
 
@@ -221,6 +264,9 @@ impl std::fmt::Debug for DynamicCaCertResolver {
 
 impl ResolvesServerCert for DynamicCaCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        if !client_hello_allows_http1(&client_hello) {
+            return None;
+        }
         let server_name = client_hello.server_name()?;
         self.certified_key_for_sni(server_name)
     }
@@ -235,13 +281,14 @@ impl TlsUpstreamConnector {
     pub(crate) fn from_config(config: &UpstreamTlsConfig) -> Result<Self, MitmProxyError> {
         let roots = load_upstream_roots(&config.trust_anchors)?;
         let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let client_config = ClientConfig::builder_with_provider(crypto_provider)
+        let mut client_config = ClientConfig::builder_with_provider(crypto_provider)
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .map_err(tls_error(
                 "configure MITM proxy upstream TLS protocol versions",
             ))?
             .with_root_certificates(roots)
             .with_no_client_auth();
+        client_config.alpn_protocols = http1_alpn_protocols();
         Ok(Self {
             config: Arc::new(client_config),
             server_name: config.server_name.clone(),
@@ -274,7 +321,34 @@ impl TlsUpstreamConnector {
                 ));
             }
         }
+        ensure_supported_alpn(connection.alpn_protocol(), "MITM proxy upstream TLS server")?;
         Ok(StreamOwned::new(connection, stream))
+    }
+}
+
+fn http1_alpn_protocols() -> Vec<Vec<u8>> {
+    vec![HTTP11_ALPN.to_vec()]
+}
+
+fn client_hello_allows_http1(client_hello: &ClientHello<'_>) -> bool {
+    match client_hello.alpn() {
+        None => true,
+        Some(protocols) => protocols
+            .into_iter()
+            .any(|protocol| protocol == HTTP11_ALPN),
+    }
+}
+
+fn ensure_supported_alpn(
+    negotiated: Option<&[u8]>,
+    peer: &'static str,
+) -> Result<(), MitmProxyError> {
+    match negotiated {
+        None | Some(HTTP11_ALPN) => Ok(()),
+        Some(protocol) => Err(MitmProxyError::Tls(format!(
+            "{peer} negotiated unsupported ALPN protocol {:?}",
+            String::from_utf8_lossy(protocol)
+        ))),
     }
 }
 

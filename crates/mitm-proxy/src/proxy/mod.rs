@@ -761,6 +761,79 @@ mod tests {
     }
 
     #[test]
+    fn tls_listener_negotiates_http1_alpn() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let (certificate_chain, private_key, trusted_certificate) =
+            write_test_certificate(root.path())?;
+        let upstream = upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nwith-alpn")?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                Some(TlsTerminationConfig::new(certificate_chain, private_key)),
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let mut stream =
+            tls_client_stream_with_alpn(listen, trusted_certificate, vec![b"http/1.1".to_vec()])?;
+        let request = b"GET /alpn HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        stream.write_all(request)?;
+        stream.flush()?;
+        assert_eq!(stream.conn.alpn_protocol(), Some(b"http/1.1".as_slice()));
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nwith-alpn"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tls_listener_rejects_h2_only_clients() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let (certificate_chain, private_key, trusted_certificate) =
+            write_test_certificate(root.path())?;
+        let upstream = upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                Some(TlsTerminationConfig::new(certificate_chain, private_key)),
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let mut stream =
+            tls_client_stream_with_alpn(listen, trusted_certificate, vec![b"h2".to_vec()])?;
+        let result = stream
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .and_then(|_| stream.flush());
+        guard.stop()?;
+
+        assert!(result.is_err(), "h2-only client must fail closed");
+        assert!(!feed_path.exists() || fs::read_to_string(&feed_path)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn dynamic_ca_tls_listener_signs_sni_leaf_and_feeds_plaintext_http()
     -> Result<(), Box<dyn Error>> {
         let root = tempdir()?;
@@ -852,7 +925,7 @@ mod tests {
         let feed_path = root.path().join("mitm-feed.jsonl");
         let (upstream_certificate_chain, upstream_private_key, _trusted_upstream_certificate) =
             write_test_certificate_for_name(root.path(), "upstream", "host-upstream.example")?;
-        let (upstream, observed_upstream_sni) = tls_upstream_server_record_sni(
+        let (upstream, observed_upstream_handshake) = tls_upstream_server_record_handshake(
             b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nhost-upstream",
             upstream_certificate_chain.clone(),
             upstream_private_key,
@@ -889,7 +962,9 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nhost-upstream"
         );
         assert_eq!(
-            observed_upstream_sni.recv_timeout(Duration::from_secs(2))?,
+            observed_upstream_handshake
+                .recv_timeout(Duration::from_secs(2))?
+                .server_name,
             Some("host-upstream.example".to_string())
         );
         assert!(feed_has_bytes(
@@ -955,6 +1030,57 @@ mod tests {
     }
 
     #[test]
+    fn tls_listener_negotiates_http1_alpn_with_tls_upstream() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let (certificate_chain, private_key, trusted_certificate) =
+            write_test_certificate(root.path())?;
+        let (upstream, observed_upstream_handshake) = tls_upstream_server_record_handshake(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nupstream-alpn",
+            certificate_chain.clone(),
+            private_key.clone(),
+        )?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let mut config = test_config(
+            listen,
+            &feed_path,
+            Some(upstream),
+            Some(TlsTerminationConfig::new(
+                certificate_chain.clone(),
+                private_key,
+            )),
+            None,
+            Duration::from_secs(2),
+        );
+        config.upstream_tls = Some(UpstreamTlsConfig::new(vec![certificate_chain], None));
+        let guard = start_test_proxy(config, data_listener, None)?;
+
+        let mut stream = tls_client_stream(listen, trusted_certificate)?;
+        let request = format!(
+            "GET /tls-upstream-alpn HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+            upstream.port()
+        );
+        stream.write_all(request.as_bytes())?;
+        stream.flush()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nupstream-alpn"
+        );
+        assert_eq!(
+            observed_upstream_handshake
+                .recv_timeout(Duration::from_secs(2))?
+                .alpn_protocol,
+            Some(b"http/1.1".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn dynamic_ca_tls_listener_uses_downstream_sni_for_upstream_tls_without_http_host()
     -> Result<(), Box<dyn Error>> {
         let root = tempdir()?;
@@ -963,7 +1089,7 @@ mod tests {
             write_test_ca(root.path())?;
         let (upstream_certificate_chain, upstream_private_key, _trusted_upstream_certificate) =
             write_test_certificate_for_name(root.path(), "upstream", "sni-upstream.example")?;
-        let (upstream, observed_upstream_sni) = tls_upstream_server_record_sni(
+        let (upstream, observed_upstream_handshake) = tls_upstream_server_record_handshake(
             b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nsni-upstream",
             upstream_certificate_chain.clone(),
             upstream_private_key,
@@ -1001,7 +1127,9 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nsni-upstream"
         );
         assert_eq!(
-            observed_upstream_sni.recv_timeout(Duration::from_secs(2))?,
+            observed_upstream_handshake
+                .recv_timeout(Duration::from_secs(2))?
+                .server_name,
             Some("sni-upstream.example".to_string())
         );
         assert!(feed_has_bytes(&feed_path, Direction::Outbound, request)?);

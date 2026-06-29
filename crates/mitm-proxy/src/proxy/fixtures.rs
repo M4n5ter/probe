@@ -24,7 +24,13 @@ use super::{
 };
 use crate::{http::read_http_message, tls::TlsTerminationConfig};
 
-pub(super) type ObservedSniReceiver = mpsc::Receiver<Option<String>>;
+pub(super) type ObservedTlsHandshakeReceiver = mpsc::Receiver<ObservedTlsHandshake>;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ObservedTlsHandshake {
+    pub(super) server_name: Option<String>,
+    pub(super) alpn_protocol: Option<Vec<u8>>,
+}
 
 pub(super) fn test_config(
     listen: SocketAddr,
@@ -144,6 +150,36 @@ fn tls_client_stream_with_sni(
     server_name: &str,
     enable_sni: bool,
 ) -> Result<StreamOwned<ClientConnection, TcpStream>, Box<dyn Error>> {
+    tls_client_stream_with_sni_and_alpn(
+        target,
+        trusted_certificate,
+        server_name,
+        enable_sni,
+        Vec::new(),
+    )
+}
+
+pub(super) fn tls_client_stream_with_alpn(
+    target: SocketAddr,
+    trusted_certificate: CertificateDer<'static>,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<StreamOwned<ClientConnection, TcpStream>, Box<dyn Error>> {
+    tls_client_stream_with_sni_and_alpn(
+        target,
+        trusted_certificate,
+        "localhost",
+        true,
+        alpn_protocols,
+    )
+}
+
+fn tls_client_stream_with_sni_and_alpn(
+    target: SocketAddr,
+    trusted_certificate: CertificateDer<'static>,
+    server_name: &str,
+    enable_sni: bool,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<StreamOwned<ClientConnection, TcpStream>, Box<dyn Error>> {
     let mut roots = RootCertStore::empty();
     roots.add(trusted_certificate)?;
     let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
@@ -152,6 +188,7 @@ fn tls_client_stream_with_sni(
         .with_root_certificates(roots)
         .with_no_client_auth();
     config.enable_sni = enable_sni;
+    config.alpn_protocols = alpn_protocols;
     let server_name = ServerName::try_from(server_name.to_string())?;
     let connection = ClientConnection::new(Arc::new(config), server_name)?;
     let stream = TcpStream::connect(target)?;
@@ -293,13 +330,13 @@ pub(super) fn tls_upstream_server(
     )
 }
 
-pub(super) fn tls_upstream_server_record_sni(
+pub(super) fn tls_upstream_server_record_handshake(
     response: &'static [u8],
     certificate_chain: PathBuf,
     private_key: PathBuf,
-) -> Result<(SocketAddr, ObservedSniReceiver), Box<dyn Error>> {
+) -> Result<(SocketAddr, ObservedTlsHandshakeReceiver), Box<dyn Error>> {
     let (sender, receiver) = mpsc::channel();
-    let target = tls_upstream_server_with_shutdown_and_sni(
+    let target = tls_upstream_server_with_shutdown_and_observer(
         response,
         certificate_chain,
         private_key,
@@ -334,7 +371,7 @@ fn tls_upstream_server_with_shutdown(
     private_key: PathBuf,
     shutdown: TlsUpstreamShutdown,
 ) -> Result<SocketAddr, Box<dyn Error>> {
-    tls_upstream_server_with_shutdown_and_sni(
+    tls_upstream_server_with_shutdown_and_observer(
         response,
         certificate_chain,
         private_key,
@@ -343,12 +380,12 @@ fn tls_upstream_server_with_shutdown(
     )
 }
 
-fn tls_upstream_server_with_shutdown_and_sni(
+fn tls_upstream_server_with_shutdown_and_observer(
     response: &'static [u8],
     certificate_chain: PathBuf,
     private_key: PathBuf,
     shutdown: TlsUpstreamShutdown,
-    observed_sni: Option<mpsc::Sender<Option<String>>>,
+    observed_handshake: Option<mpsc::Sender<ObservedTlsHandshake>>,
 ) -> Result<SocketAddr, Box<dyn Error>> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let target = listener.local_addr()?;
@@ -363,8 +400,11 @@ fn tls_upstream_server_with_shutdown_and_sni(
         let Ok(mut stream) = terminator.accept(stream) else {
             return;
         };
-        if let Some(observed_sni) = observed_sni {
-            let _ = observed_sni.send(stream.conn.server_name().map(str::to_string));
+        if let Some(observed_handshake) = observed_handshake {
+            let _ = observed_handshake.send(ObservedTlsHandshake {
+                server_name: stream.conn.server_name().map(str::to_string),
+                alpn_protocol: stream.conn.alpn_protocol().map(<[u8]>::to_vec),
+            });
         }
         if read_http_message(&mut stream, 65_536)
             .ok()

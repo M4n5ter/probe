@@ -93,8 +93,8 @@ agent-managed backend contracts, capture-event plaintext bridge provenance,
 explicit operator-managed client trust, product proxy downstream TLS
 termination with static leaf material or CA-backed dynamic SNI certificates,
 upstream TLS relay with native roots or imported trust anchors, strategy-specific
-target recovery, outbound upstream socket-mark bypass, and a loopback HTTP JSON
-policy hook for proxy-side enforcement delegation.
+target recovery, HTTP/1.1 ALPN gating, outbound upstream socket-mark bypass,
+and a loopback HTTP JSON policy hook for proxy-side enforcement delegation.
 The first-party product proxy also has a transparent inbound HTTPS E2E path:
 TPROXY routes the client connection to the proxy, the proxy terminates
 downstream TLS with CA-backed dynamic SNI certificates, delegates a protective
@@ -125,10 +125,10 @@ The following are intentional boundaries of the current implementation:
 - No automatic mutation of client trust stores; MITM client trust is an explicit
   operator-managed contract.
 - Transparent inbound HTTPS MITM is covered for product proxy routed allow and
-  deny paths. ALPN-aware routing, wildcard or DNS-discovered upstream route
-  selection, strong original attribution, automatic trust-store mutation, and
-  non-HTTP transparent allow-path matrices remain explicit capability
-  boundaries.
+  deny paths. Product proxy TLS advertises and gates HTTP/1.1 ALPN; ALPN-based
+  multi-protocol routing, wildcard or DNS-discovered upstream route selection,
+  strong original attribution, automatic trust-store mutation, and non-HTTP
+  transparent allow-path matrices remain explicit capability boundaries.
 - No hidden long-term raw traffic retention.
 - No HTTP/2, HTTP/3, or QUIC parser yet.
 - WebSocket support emits handoff, frame metadata, and 16 MiB bounded
