@@ -9,12 +9,13 @@ use probe_config::{AgentConfig, TransparentInterceptionMitmPlaintextBridgeIntent
 use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
 use runtime::{
     TransparentInterceptionMitmBackendPlan, TransparentInterceptionMitmBackendReadinessProbePlan,
-    TransparentInterceptionMitmManagedProcessPlan, TransparentInterceptionMitmPlan,
-    default_l7_mitm_unavailable_reason,
+    TransparentInterceptionMitmClientTrustPlan, TransparentInterceptionMitmManagedProcessPlan,
+    TransparentInterceptionMitmPlan, default_l7_mitm_unavailable_reason,
 };
 
 use super::{
-    L7MitmBackendHealthSnapshot, L7MitmPlaintextBridgeSnapshot, L7MitmRuntime, state::unavailable,
+    L7MitmBackendHealthSnapshot, L7MitmClientTrustMaterialMode, L7MitmClientTrustSnapshot,
+    L7MitmPlaintextBridgeSnapshot, L7MitmRuntime, state::unavailable,
 };
 use crate::tcp_health::TcpHealthProbePlan;
 
@@ -30,40 +31,50 @@ pub(super) fn resolve_with_probe(
     if !interception.strategy.is_mitm() {
         return unavailable(
             default_l7_mitm_unavailable_reason(),
+            L7MitmClientTrustSnapshot::disabled(),
             L7MitmPlaintextBridgeSnapshot::not_configured(),
         );
     }
     let plaintext_bridge = match resolve_plaintext_bridge(config) {
         Ok(snapshot) => snapshot,
-        Err(error) => return unavailable(error, L7MitmPlaintextBridgeSnapshot::not_configured()),
+        Err(error) => {
+            return unavailable(
+                error,
+                L7MitmClientTrustSnapshot::disabled(),
+                L7MitmPlaintextBridgeSnapshot::not_configured(),
+            );
+        }
     };
     let mitm = match TransparentInterceptionMitmPlan::try_from_config(config) {
         Ok(plan) => plan,
         Err(error) => {
             return unavailable(
                 format!("L7 MITM backend contract is invalid: {error}"),
+                L7MitmClientTrustSnapshot::disabled(),
                 plaintext_bridge,
             );
         }
     };
+    let client_trust = client_trust_snapshot(&mitm);
     if let Err(error) = preflight_backend(&mitm.backend, tcp_probe) {
-        return unavailable(error, plaintext_bridge);
+        return unavailable(error, client_trust, plaintext_bridge);
     }
     let backend = &mitm.backend;
     let initial_backend_health = initial_health(backend);
     let failure_threshold = backend_health_probe(backend)
         .expect("available L7 MITM backend should have a health probe")
         .failure_threshold;
-    let capability_reason = capability_reason(backend);
+    let capability_reason = capability_reason(&mitm);
 
     L7MitmRuntime {
         capability: CapabilityState {
             kind: CapabilityKind::L7Mitm,
             mode: RuntimeMode::Available,
-            reason: Some(capability_reason.to_string()),
+            reason: Some(capability_reason),
         },
         handle: super::state::L7MitmRuntimeHandle::new(
             initial_backend_health,
+            client_trust,
             plaintext_bridge,
             failure_threshold,
         ),
@@ -145,8 +156,8 @@ fn initial_health(backend: &TransparentInterceptionMitmBackendPlan) -> L7MitmBac
     }
 }
 
-fn capability_reason(backend: &TransparentInterceptionMitmBackendPlan) -> &'static str {
-    match backend {
+fn capability_reason(mitm: &TransparentInterceptionMitmPlan) -> String {
+    let backend_reason = match &mitm.backend {
         TransparentInterceptionMitmBackendPlan::External { .. } => {
             "external selector-scoped L7 MITM backend contract is configured and its configured readiness endpoint is reachable; agent redirects matching flows to the configured listener port but does not manage the L7 proxy process or prove per-family transparent listener behavior yet"
         }
@@ -154,6 +165,39 @@ fn capability_reason(backend: &TransparentInterceptionMitmBackendPlan) -> &'stat
             "agent-managed selector-scoped L7 MITM backend process contract is configured and executable; run will spawn the process and require its configured readiness endpoint before installing transparent interception rules"
         }
         TransparentInterceptionMitmBackendPlan::Disabled => "L7 MITM backend is disabled",
+    };
+    let trust_reason = match mitm.client_trust {
+        TransparentInterceptionMitmClientTrustPlan::OperatorManaged => {
+            "client trust installation is operator-managed and explicit"
+        }
+        TransparentInterceptionMitmClientTrustPlan::Disabled => {
+            "client trust installation is not configured"
+        }
+    };
+    format!("{backend_reason}; {trust_reason}")
+}
+
+fn client_trust_snapshot(mitm: &TransparentInterceptionMitmPlan) -> L7MitmClientTrustSnapshot {
+    match mitm.client_trust {
+        TransparentInterceptionMitmClientTrustPlan::Disabled => {
+            L7MitmClientTrustSnapshot::disabled()
+        }
+        TransparentInterceptionMitmClientTrustPlan::OperatorManaged => {
+            L7MitmClientTrustSnapshot::operator_managed(client_trust_material_mode(mitm))
+        }
+    }
+}
+
+fn client_trust_material_mode(
+    mitm: &TransparentInterceptionMitmPlan,
+) -> L7MitmClientTrustMaterialMode {
+    let has_ca_pair = mitm.ca_certificate.is_some() && mitm.ca_private_key.is_some();
+    let has_leaf_pair = !mitm.leaf_certificate_chain.is_empty() && mitm.leaf_private_key.is_some();
+    match (has_ca_pair, has_leaf_pair) {
+        (true, true) => L7MitmClientTrustMaterialMode::CaAndLeafCertificateChain,
+        (true, false) => L7MitmClientTrustMaterialMode::CaCertificateAuthority,
+        (false, true) => L7MitmClientTrustMaterialMode::LeafCertificateChain,
+        (false, false) => L7MitmClientTrustMaterialMode::None,
     }
 }
 
@@ -271,7 +315,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::l7_mitm::{L7MitmBackendHealthMode, L7MitmPlaintextBridgeMode};
+    use crate::l7_mitm::{
+        L7MitmBackendHealthMode, L7MitmClientTrustMaterialMode, L7MitmClientTrustMode,
+        L7MitmPlaintextBridgeMode,
+    };
 
     #[test]
     fn default_config_reports_unconfigured_control_plane_boundary() {
@@ -307,6 +354,12 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("readiness probe failed")),
             "{capability:?}"
+        );
+        let client_trust = runtime.handle().snapshot().client_trust;
+        assert_eq!(client_trust.mode, L7MitmClientTrustMode::OperatorManaged);
+        assert_eq!(
+            client_trust.material,
+            L7MitmClientTrustMaterialMode::CaCertificateAuthority
         );
     }
 
@@ -375,7 +428,20 @@ mod tests {
         assert_eq!(health.mode, L7MitmBackendHealthMode::Healthy);
         assert_eq!(health.check_successes, 1);
         assert_eq!(health.check_failures, 0);
-        let bridge = runtime.handle().snapshot().plaintext_bridge;
+        let snapshot = runtime.handle().snapshot();
+        let client_trust = snapshot.client_trust;
+        assert_eq!(client_trust.mode, L7MitmClientTrustMode::OperatorManaged);
+        assert_eq!(
+            client_trust.material,
+            L7MitmClientTrustMaterialMode::CaCertificateAuthority
+        );
+        assert!(
+            client_trust
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("operator-managed"))
+        );
+        let bridge = snapshot.plaintext_bridge;
         assert_eq!(bridge.mode, L7MitmPlaintextBridgeMode::NotConfigured);
         assert_eq!(bridge.disable_reason, None);
     }
@@ -466,6 +532,8 @@ mod tests {
                     ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
                 },
             );
+        config.enforcement.interception.mitm.client_trust.mode =
+            probe_config::TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.tls.materials = vec![

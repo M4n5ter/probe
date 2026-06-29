@@ -127,6 +127,9 @@ leaf_certificate_chain_refs = ["leaf-cert"]
 leaf_private_key_ref = "leaf-key"
 upstream_trust_anchor_refs = ["upstream-ca"]
 
+[enforcement.interception.mitm.client_trust]
+mode = "operator_managed"
+
 [enforcement.interception.mitm.backend]
 mode = "external"
 
@@ -173,6 +176,10 @@ path = "/etc/traffic-probe/upstream-ca.pem"
     assert_eq!(
         config.enforcement.interception.mitm.ca_private_key_ref,
         Some("mitm-ca-key".to_string())
+    );
+    assert_eq!(
+        config.enforcement.interception.mitm.client_trust.mode,
+        TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged
     );
     assert_eq!(readiness_probe.target.as_deref(), Some("127.0.0.1:15002"));
     assert_eq!(readiness_probe.timeout_ms, 250);
@@ -234,6 +241,9 @@ listen_port = 15002
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
 
+[enforcement.interception.mitm.client_trust]
+mode = "operator_managed"
+
 [enforcement.interception.mitm.backend]
 mode = "managed_process"
 
@@ -263,6 +273,10 @@ path = "/etc/traffic-probe/mitm-ca.key"
     else {
         panic!("expected managed-process MITM backend");
     };
+    assert_eq!(
+        config.enforcement.interception.mitm.client_trust.mode,
+        TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged
+    );
     assert_eq!(
         process.program.as_deref(),
         Some(std::path::Path::new(

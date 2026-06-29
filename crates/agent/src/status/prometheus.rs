@@ -4,7 +4,10 @@ use probe_core::RuntimeMode;
 
 use super::metrics::TcpHealthMetricsSnapshot;
 use crate::{
-    l7_mitm::{L7MitmBackendHealthMode, L7MitmPlaintextBridgeMode},
+    l7_mitm::{
+        L7MitmBackendHealthMode, L7MitmClientTrustMaterialMode, L7MitmClientTrustMode,
+        L7MitmPlaintextBridgeMode,
+    },
     status::AgentStatusSnapshot,
     tcp_health::TcpHealthMode,
     transparent_interception::TransparentProxyHealthProbeMode,
@@ -38,6 +41,18 @@ const L7_MITM_PLAINTEXT_BRIDGE_MODES: [L7MitmPlaintextBridgeMode; 5] = [
     L7MitmPlaintextBridgeMode::Ready,
     L7MitmPlaintextBridgeMode::Active,
     L7MitmPlaintextBridgeMode::DisabledAfterError,
+];
+
+const L7_MITM_CLIENT_TRUST_MODES: [L7MitmClientTrustMode; 2] = [
+    L7MitmClientTrustMode::Disabled,
+    L7MitmClientTrustMode::OperatorManaged,
+];
+
+const L7_MITM_CLIENT_TRUST_MATERIAL_MODES: [L7MitmClientTrustMaterialMode; 4] = [
+    L7MitmClientTrustMaterialMode::None,
+    L7MitmClientTrustMaterialMode::CaCertificateAuthority,
+    L7MitmClientTrustMaterialMode::LeafCertificateChain,
+    L7MitmClientTrustMaterialMode::CaAndLeafCertificateChain,
 ];
 
 pub(crate) fn render_prometheus_metrics(snapshot: &AgentStatusSnapshot) -> String {
@@ -270,18 +285,53 @@ fn write_l7_mitm(output: &mut String, snapshot: &AgentStatusSnapshot) {
         metrics.backend_health,
     );
 
-    write_family(
+    write_one_hot_enum(
+        output,
+        "traffic_probe_l7_mitm_client_trust_mode",
+        "L7 MITM client trust ownership mode as a one-hot gauge.",
+        "mode",
+        &L7_MITM_CLIENT_TRUST_MODES,
+        metrics.client_trust.mode,
+        L7MitmClientTrustMode::wire_name,
+    );
+    write_one_hot_enum(
+        output,
+        "traffic_probe_l7_mitm_client_trust_material",
+        "L7 MITM client trust material shape as a one-hot gauge.",
+        "material",
+        &L7_MITM_CLIENT_TRUST_MATERIAL_MODES,
+        metrics.client_trust.material,
+        L7MitmClientTrustMaterialMode::wire_name,
+    );
+    write_one_hot_enum(
         output,
         "traffic_probe_l7_mitm_plaintext_bridge_mode",
-        "gauge",
         "L7 MITM plaintext bridge runtime mode as a one-hot gauge.",
+        "mode",
+        &L7_MITM_PLAINTEXT_BRIDGE_MODES,
+        metrics.plaintext_bridge.mode,
+        L7MitmPlaintextBridgeMode::wire_name,
     );
-    for mode in L7_MITM_PLAINTEXT_BRIDGE_MODES {
+}
+
+fn write_one_hot_enum<T>(
+    output: &mut String,
+    name: &str,
+    help: &str,
+    label: &str,
+    values: &[T],
+    selected: T,
+    wire_name: impl Fn(T) -> &'static str,
+) where
+    T: Copy + PartialEq,
+{
+    write_family(output, name, "gauge", help);
+    for value in values {
         write_sample(
             output,
-            "traffic_probe_l7_mitm_plaintext_bridge_mode",
-            &[("mode", mode.wire_name())],
-            u64::from(metrics.plaintext_bridge.mode == mode),
+            name,
+            &[(label, wire_name(*value))],
+            u64::from(selected == *value),
         );
     }
 }
@@ -687,8 +737,8 @@ mod tests {
     };
     use super::*;
     use crate::l7_mitm::{
-        L7MitmBackendHealthMode, L7MitmBackendHealthSnapshot, L7MitmPlaintextBridgeMode,
-        L7MitmPlaintextBridgeSnapshot, L7MitmRuntimeSnapshot,
+        L7MitmBackendHealthMode, L7MitmBackendHealthSnapshot, L7MitmClientTrustSnapshot,
+        L7MitmPlaintextBridgeMode, L7MitmPlaintextBridgeSnapshot, L7MitmRuntimeSnapshot,
     };
     use crate::transparent_interception::{
         TransparentProxyHealthProbeMode, TransparentProxyRuntimeMode,
@@ -819,6 +869,7 @@ mod tests {
                         consecutive_failures: 3,
                         last_failure_reason: Some("connection refused".to_string()),
                     },
+                    client_trust: L7MitmClientTrustSnapshot::disabled(),
                     plaintext_bridge: L7MitmPlaintextBridgeSnapshot {
                         mode: L7MitmPlaintextBridgeMode::DisabledAfterError,
                         disable_reason: Some("feed parse error".to_string()),
@@ -840,6 +891,10 @@ mod tests {
         assert!(metrics.contains("traffic_probe_l7_mitm_metrics_available 1\n"));
         assert!(
             metrics.contains("traffic_probe_l7_mitm_backend_health_mode{mode=\"unhealthy\"} 1\n")
+        );
+        assert!(metrics.contains("traffic_probe_l7_mitm_client_trust_mode{mode=\"disabled\"} 1\n"));
+        assert!(
+            metrics.contains("traffic_probe_l7_mitm_client_trust_material{material=\"none\"} 1\n")
         );
         assert!(metrics.contains(
             "traffic_probe_l7_mitm_plaintext_bridge_mode{mode=\"disabled_after_error\"} 1\n"

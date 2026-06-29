@@ -148,6 +148,7 @@ mod tests {
         ConnectionEnforcementBackendConfig, ExporterConfig, ExporterTransportConfig,
         TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
+        TransparentInterceptionMitmClientTrustModeConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
         TransparentInterceptionStrategyConfig,
@@ -797,6 +798,8 @@ mod tests {
             );
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+        config.enforcement.interception.mitm.client_trust.mode =
+            TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
         config.tls.materials = vec![
             TlsMaterialConfig {
                 id: Some("mitm-ca".to_string()),

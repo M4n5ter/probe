@@ -25,7 +25,71 @@ impl L7MitmRuntime {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct L7MitmRuntimeSnapshot {
     pub backend_health: L7MitmBackendHealthSnapshot,
+    pub client_trust: L7MitmClientTrustSnapshot,
     pub plaintext_bridge: L7MitmPlaintextBridgeSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct L7MitmClientTrustSnapshot {
+    pub mode: L7MitmClientTrustMode,
+    pub material: L7MitmClientTrustMaterialMode,
+    pub reason: Option<String>,
+}
+
+impl L7MitmClientTrustSnapshot {
+    pub(crate) fn disabled() -> Self {
+        Self {
+            mode: L7MitmClientTrustMode::Disabled,
+            material: L7MitmClientTrustMaterialMode::None,
+            reason: None,
+        }
+    }
+
+    pub(crate) fn operator_managed(material: L7MitmClientTrustMaterialMode) -> Self {
+        Self {
+            mode: L7MitmClientTrustMode::OperatorManaged,
+            material,
+            reason: Some(
+                "client trust installation is operator-managed; agent validates MITM material refs and reports material source status but does not mutate client trust stores".to_string(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum L7MitmClientTrustMode {
+    Disabled,
+    OperatorManaged,
+}
+
+impl L7MitmClientTrustMode {
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::OperatorManaged => "operator_managed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum L7MitmClientTrustMaterialMode {
+    None,
+    CaCertificateAuthority,
+    LeafCertificateChain,
+    CaAndLeafCertificateChain,
+}
+
+impl L7MitmClientTrustMaterialMode {
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CaCertificateAuthority => "ca_certificate_authority",
+            Self::LeafCertificateChain => "leaf_certificate_chain",
+            Self::CaAndLeafCertificateChain => "ca_and_leaf_certificate_chain",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -109,6 +173,7 @@ pub(super) enum L7MitmBackendHealthTransition {
 impl L7MitmRuntimeHandle {
     pub(super) fn new(
         backend_health: L7MitmBackendHealthSnapshot,
+        client_trust: L7MitmClientTrustSnapshot,
         plaintext_bridge: L7MitmPlaintextBridgeSnapshot,
         backend_health_failure_threshold: u32,
     ) -> Self {
@@ -116,6 +181,7 @@ impl L7MitmRuntimeHandle {
             inner: Arc::new(Mutex::new(L7MitmRuntimeState {
                 snapshot: L7MitmRuntimeSnapshot {
                     backend_health,
+                    client_trust,
                     plaintext_bridge,
                 },
                 backend_health_failure_threshold,
@@ -131,6 +197,7 @@ impl L7MitmRuntimeHandle {
     ) -> Self {
         Self::new(
             backend_health,
+            L7MitmClientTrustSnapshot::disabled(),
             plaintext_bridge,
             backend_health_failure_threshold,
         )
@@ -205,12 +272,14 @@ impl L7MitmRuntimeHandle {
 
 pub(super) fn unavailable(
     reason: impl Into<String>,
+    client_trust: L7MitmClientTrustSnapshot,
     plaintext_bridge: L7MitmPlaintextBridgeSnapshot,
 ) -> L7MitmRuntime {
     L7MitmRuntime {
         capability: CapabilityState::unavailable(CapabilityKind::L7Mitm, reason),
         handle: L7MitmRuntimeHandle::new(
             L7MitmBackendHealthSnapshot::disabled(),
+            client_trust,
             plaintext_bridge,
             1,
         ),
@@ -226,6 +295,7 @@ mod tests {
     fn backend_health_probe_marks_unhealthy_after_failure_threshold() {
         let handle = L7MitmRuntimeHandle::new(
             L7MitmBackendHealthSnapshot::initial_success(),
+            L7MitmClientTrustSnapshot::disabled(),
             L7MitmPlaintextBridgeSnapshot::not_configured(),
             2,
         );
@@ -264,6 +334,7 @@ mod tests {
     fn backend_health_probe_success_clears_unhealthy_state() {
         let handle = L7MitmRuntimeHandle::new(
             L7MitmBackendHealthSnapshot::initial_success(),
+            L7MitmClientTrustSnapshot::disabled(),
             L7MitmPlaintextBridgeSnapshot::not_configured(),
             1,
         );

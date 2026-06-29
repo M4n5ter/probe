@@ -5,6 +5,7 @@ use probe_config::{
     AgentConfig, CaptureSelection, EnforcementPolicyManifest, EnforcementPolicySourceConfig,
     PolicyConfig, TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
     TransparentInterceptionMitmBackendReadinessProbeConfig,
+    TransparentInterceptionMitmClientTrustModeConfig,
     TransparentInterceptionMitmManagedProcessConfig,
     TransparentInterceptionMitmPlaintextBridgeModeConfig,
     TransparentInterceptionMitmPolicyHookModeConfig, TransparentInterceptionProxyModeConfig,
@@ -121,6 +122,8 @@ pub(super) fn write_agent_config(
     config.enforcement.interception.mitm.plaintext_bridge.path =
         Some(inputs.bridge_feed_path.to_path_buf());
     config.enforcement.interception.mitm.plaintext_bridge.follow = Some(true);
+    config.enforcement.interception.mitm.client_trust.mode =
+        TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
     config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
     config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
     if let Some(endpoint) = inputs.policy_hook_endpoint {

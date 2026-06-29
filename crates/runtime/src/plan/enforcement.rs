@@ -6,7 +6,7 @@ use probe_config::{
     TransparentInterceptionDirectionConfig, TransparentInterceptionL7ModeConfig,
     TransparentInterceptionMitmBackendIntent,
     TransparentInterceptionMitmBackendReadinessProbeIntent,
-    TransparentInterceptionMitmManagedProcessIntent,
+    TransparentInterceptionMitmClientTrustIntent, TransparentInterceptionMitmManagedProcessIntent,
     TransparentInterceptionMitmPlaintextBridgeIntent,
     TransparentInterceptionMitmPolicyHookEndpointIntent,
     TransparentInterceptionMitmPolicyHookIntent, TransparentInterceptionMitmPolicyHookModeConfig,
@@ -314,6 +314,7 @@ impl TransparentInterceptionExecutionPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransparentInterceptionMitmPlan {
     pub backend: TransparentInterceptionMitmBackendPlan,
+    pub client_trust: TransparentInterceptionMitmClientTrustPlan,
     pub plaintext_bridge: TransparentInterceptionMitmPlaintextBridgePlan,
     pub policy_hook: TransparentInterceptionMitmPolicyHookPlan,
     pub ca_certificate: Option<TlsMaterialPlan>,
@@ -345,6 +346,13 @@ impl TransparentInterceptionMitmPlan {
             .expect("MITM backend contract should be validated before planning");
         Self {
             backend: TransparentInterceptionMitmBackendPlan::from_intent(backend_intent),
+            client_trust: TransparentInterceptionMitmClientTrustPlan::from_intent(
+                config
+                    .enforcement
+                    .interception
+                    .mitm_client_trust_intent()
+                    .expect("MITM client trust contract should be validated before planning"),
+            ),
             plaintext_bridge: TransparentInterceptionMitmPlaintextBridgePlan::from_intent(
                 config
                     .enforcement
@@ -401,6 +409,22 @@ fn config_validation_error(error: ConfigError) -> ConfigValidationError {
             field: "config".to_string(),
             reason: error.to_string(),
         }]),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum TransparentInterceptionMitmClientTrustPlan {
+    Disabled,
+    OperatorManaged,
+}
+
+impl TransparentInterceptionMitmClientTrustPlan {
+    fn from_intent(intent: TransparentInterceptionMitmClientTrustIntent) -> Self {
+        match intent {
+            TransparentInterceptionMitmClientTrustIntent::Disabled => Self::Disabled,
+            TransparentInterceptionMitmClientTrustIntent::OperatorManaged => Self::OperatorManaged,
+        }
     }
 }
 
@@ -904,6 +928,7 @@ mod tests {
         AgentConfig, CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig,
         TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
+        TransparentInterceptionMitmClientTrustModeConfig,
         TransparentInterceptionMitmManagedProcessConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionMitmPolicyHookConfig,
@@ -1178,6 +1203,10 @@ mod tests {
         assert_eq!(
             plan.interception.mitm.plaintext_bridge,
             TransparentInterceptionMitmPlaintextBridgePlan::Disabled
+        );
+        assert_eq!(
+            plan.interception.mitm.client_trust,
+            TransparentInterceptionMitmClientTrustPlan::OperatorManaged
         );
         assert_eq!(
             plan.interception
@@ -1559,6 +1588,8 @@ mod tests {
     }
 
     fn configure_mitm_materials(config: &mut AgentConfig) {
+        config.enforcement.interception.mitm.client_trust.mode =
+            TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.tls.materials = vec![

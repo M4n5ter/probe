@@ -4,7 +4,10 @@ use serde::Serialize;
 
 use crate::{
     export::ExportWorkerRuntimeSnapshot,
-    l7_mitm::{L7MitmPlaintextBridgeMode, L7MitmRuntimeSnapshot},
+    l7_mitm::{
+        L7MitmClientTrustMaterialMode, L7MitmClientTrustMode, L7MitmPlaintextBridgeMode,
+        L7MitmRuntimeSnapshot,
+    },
     tcp_health::{TcpHealthMode, TcpHealthSnapshot},
     transparent_interception::TransparentProxyRuntimeSnapshot,
 };
@@ -47,7 +50,14 @@ pub struct ExportMetricsSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct L7MitmMetricsSnapshot {
     pub backend_health: TcpHealthMetricsSnapshot,
+    pub client_trust: L7MitmClientTrustMetricsSnapshot,
     pub plaintext_bridge: L7MitmPlaintextBridgeMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct L7MitmClientTrustMetricsSnapshot {
+    pub mode: L7MitmClientTrustMode,
+    pub material: L7MitmClientTrustMaterialMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -109,6 +119,10 @@ pub(in crate::status) fn metrics_snapshot(
 fn l7_mitm_metrics(runtime: L7MitmRuntimeSnapshot) -> L7MitmMetricsSnapshot {
     L7MitmMetricsSnapshot {
         backend_health: tcp_health_metrics(runtime.backend_health),
+        client_trust: L7MitmClientTrustMetricsSnapshot {
+            mode: runtime.client_trust.mode,
+            material: runtime.client_trust.material,
+        },
         plaintext_bridge: L7MitmPlaintextBridgeMetricsSnapshot {
             mode: runtime.plaintext_bridge.mode,
         },

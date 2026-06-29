@@ -82,14 +82,16 @@ Probe does not silently upgrade weak evidence into strong guarantees.
 - Linux socket destroy verifies the current procfs socket owner before invoking
   a trusted system `ss -K` path.
 - Transparent interception and L7 MITM are explicit strategies with separate
-  readiness, self-bypass, material, lifecycle, and audit contracts.
+  readiness, self-bypass, client-trust, material, lifecycle, and audit
+  contracts.
 
 ## L7 MITM And Proxy Integration
 
 Probe reserves MITM for explicit, scoped deployments. It supports inbound
 TPROXY and outbound transparent proxy lifecycle planning, external or
 agent-managed backend contracts, capture-event plaintext bridge provenance,
-and a loopback HTTP JSON policy hook for proxy-side enforcement delegation.
+explicit operator-managed client trust, and a loopback HTTP JSON policy hook
+for proxy-side enforcement delegation.
 
 This keeps MITM out of the default capture path while still allowing operators
 to build controlled proxy/MITM deployments with auditable boundaries.
@@ -102,6 +104,8 @@ procfs, libpcap, eBPF support, and standard networking tools.
 The following are intentional boundaries of the current implementation:
 
 - No default whole-host transparent MITM.
+- No automatic mutation of client trust stores; MITM client trust is an explicit
+  operator-managed contract.
 - No hidden long-term raw traffic retention.
 - No HTTP/2, HTTP/3, or QUIC parser yet.
 - WebSocket support emits handoff, frame metadata, and 16 MiB bounded

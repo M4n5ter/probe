@@ -741,6 +741,10 @@ protective_actions = ["alert"]
             json!("external")
         );
         assert_eq!(
+            value["plan"]["enforcement"]["interception"]["mitm"]["client_trust"]["mode"],
+            json!("operator_managed")
+        );
+        assert_eq!(
             value["plan"]["enforcement"]["interception"]["mitm"]["backend"]["readiness_probe"]["mode"],
             json!("tcp_connect")
         );
@@ -763,6 +767,10 @@ protective_actions = ["alert"]
         assert_eq!(
             value["enforcement"]["interception"]["mitm"]["backend"]["mode"],
             json!("external")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["mitm"]["client_trust"]["mode"],
+            json!("operator_managed")
         );
         assert_eq!(
             value["enforcement"]["interception"]["mitm"]["backend"]["readiness_probe"]["mode"],
@@ -1123,6 +1131,8 @@ protective_actions = ["alert"]
             );
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+        config.enforcement.interception.mitm.client_trust.mode =
+            probe_config::TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
         config.tls.materials = vec![
             TlsMaterialConfig {
                 id: Some("mitm-ca".to_string()),

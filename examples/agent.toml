@@ -150,6 +150,11 @@ self_bypass = "none"
 [enforcement.interception.mitm.backend]
 mode = "disabled"
 
+[enforcement.interception.mitm.client_trust]
+# MITM strategies require "operator_managed" so client trust installation is an
+# explicit deployment responsibility. Keep "none" while MITM is disabled.
+mode = "none"
+
 [enforcement.interception.mitm.plaintext_bridge]
 mode = "none"
 

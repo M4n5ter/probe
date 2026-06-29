@@ -194,6 +194,9 @@ ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
 upstream_trust_anchor_refs = ["upstream-ca"]
 
+[enforcement.interception.mitm.client_trust]
+mode = "operator_managed"
+
 [enforcement.interception.mitm.backend]
 mode = "external"
 
@@ -223,6 +226,51 @@ path = "/etc/traffic-probe/upstream-ca.pem"
 }
 
 #[test]
+fn validation_rejects_mitm_without_explicit_client_trust() -> Result<(), Box<dyn std::error::Error>>
+{
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.interception]
+strategy = "outbound_transparent_mitm"
+
+[enforcement.interception.proxy]
+mode = "external"
+self_bypass = "uses_reserved_mark"
+listen_port = 15002
+
+[enforcement.interception.mitm]
+ca_certificate_ref = "mitm-ca"
+ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.backend]
+mode = "external"
+
+[enforcement.interception.mitm.backend.readiness_probe]
+target = "127.0.0.1:15002"
+
+[[tls.materials]]
+id = "mitm-ca"
+kind = "mitm_ca_certificate"
+path = "/etc/traffic-probe/mitm-ca.pem"
+
+[[tls.materials]]
+id = "mitm-ca-key"
+kind = "mitm_ca_private_key"
+path = "/etc/traffic-probe/mitm-ca.key"
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("MITM client trust ownership must be explicit");
+    assert!(validation_violations(&error).iter().any(|violation| {
+        violation.field == "enforcement.interception.mitm.client_trust.mode"
+            && violation.reason.contains("operator_managed")
+    }));
+    Ok(())
+}
+
+#[test]
 fn validation_accepts_managed_process_mitm_backend_contract()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
@@ -237,6 +285,9 @@ listen_port = 15002
 [enforcement.interception.mitm]
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.client_trust]
+mode = "operator_managed"
 
 [enforcement.interception.mitm.backend]
 mode = "managed_process"
@@ -281,6 +332,9 @@ listen_port = 15002
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
 
+[enforcement.interception.mitm.client_trust]
+mode = "operator_managed"
+
 [enforcement.interception.mitm.backend]
 mode = "managed_process"
 
@@ -319,6 +373,9 @@ listen_port = 15002
 [enforcement.interception.mitm]
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.client_trust]
+mode = "operator_managed"
 
 [enforcement.interception.mitm.backend]
 mode = "external"
@@ -360,6 +417,9 @@ listen_port = 15002
 [enforcement.interception.mitm]
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.client_trust]
+mode = "operator_managed"
 
 [enforcement.interception.mitm.backend]
 mode = "managed_process"
@@ -496,6 +556,9 @@ listen_port = 15002
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
 
+[enforcement.interception.mitm.client_trust]
+mode = "operator_managed"
+
 [enforcement.interception.mitm.backend]
 mode = "external"
 
@@ -536,6 +599,9 @@ listen_port = 15002
 [enforcement.interception.mitm]
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.client_trust]
+mode = "operator_managed"
 
 [enforcement.interception.mitm.backend]
 mode = "external"
@@ -584,6 +650,9 @@ listen_port = 15002
 [enforcement.interception.mitm]
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.client_trust]
+mode = "operator_managed"
 
 [enforcement.interception.mitm.backend]
 mode = "external"
@@ -659,6 +728,9 @@ listen_port = 15002
 [enforcement.interception.mitm]
 ca_certificate_ref = "collector-ca"
 ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.client_trust]
+mode = "operator_managed"
 
 [enforcement.interception.mitm.backend]
 mode = "external"
@@ -791,6 +863,9 @@ listen_port = 15002
 [enforcement.interception.mitm]
 ca_certificate_ref = "mitm-ca"
 ca_private_key_ref = "mitm-ca-key"
+
+[enforcement.interception.mitm.client_trust]
+mode = "operator_managed"
 
 [enforcement.interception.mitm.backend]
 mode = "external"

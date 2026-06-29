@@ -6,10 +6,11 @@ use super::capture::{CaptureProviderBuilder, CaptureProviderDescriptor};
 
 const DEFAULT_L7_MITM_UNAVAILABLE_REASON: &str = concat!(
     "L7 MITM control-plane support exists for selector-scoped external or managed backends, ",
-    "readiness probes, material refs, plaintext bridge provenance, and proxy-side policy hooks, ",
+    "readiness probes, operator-managed client trust contracts, material refs, ",
+    "plaintext bridge provenance, and proxy-side policy hooks, ",
     "but no MITM backend is configured; default whole-machine transparent MITM is rejected, ",
     "and built-in TLS MITM data-plane, proxy-internal action execution, ",
-    "and trust/install lifecycle are unavailable"
+    "and automatic client trust store installation are unavailable"
 );
 
 pub fn default_l7_mitm_unavailable_reason() -> &'static str {

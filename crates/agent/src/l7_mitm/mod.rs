@@ -20,6 +20,7 @@ pub(crate) use policy_hook::{
     hook_from_plan as policy_hook_from_plan,
 };
 pub(crate) use state::{
+    L7MitmClientTrustMaterialMode, L7MitmClientTrustMode, L7MitmClientTrustSnapshot,
     L7MitmPlaintextBridgeMode, L7MitmPlaintextBridgeSnapshot, L7MitmRuntime, L7MitmRuntimeHandle,
     L7MitmRuntimeSnapshot,
 };

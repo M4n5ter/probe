@@ -266,6 +266,8 @@ mod tests {
                 endpoint: Some("http://127.0.0.1:15002/enforce".to_string()),
                 ..TransparentInterceptionMitmPolicyHookConfig::default()
             };
+        config.enforcement.interception.mitm.client_trust.mode =
+            probe_config::TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.tls.materials = vec![

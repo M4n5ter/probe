@@ -47,6 +47,7 @@ pub const MAX_TRANSPARENT_MITM_POLICY_HOOK_MAX_RESPONSE_BYTES: u64 = 1024 * 1024
 #[serde(default, deny_unknown_fields)]
 pub struct TransparentInterceptionMitmConfig {
     pub backend: TransparentInterceptionMitmBackendConfig,
+    pub client_trust: TransparentInterceptionMitmClientTrustConfig,
     pub plaintext_bridge: TransparentInterceptionMitmPlaintextBridgeConfig,
     pub policy_hook: TransparentInterceptionMitmPolicyHookConfig,
     pub ca_certificate_ref: Option<String>,
@@ -59,6 +60,7 @@ pub struct TransparentInterceptionMitmConfig {
 impl TransparentInterceptionMitmConfig {
     pub fn is_configured(&self) -> bool {
         self.backend.is_configured()
+            || self.client_trust.is_configured()
             || self.plaintext_bridge.is_configured()
             || self.policy_hook.is_configured()
             || self.ca_certificate_ref.is_some()
@@ -75,6 +77,26 @@ impl TransparentInterceptionMitmConfig {
     pub fn has_leaf_material_pair(&self) -> bool {
         !self.leaf_certificate_chain_refs.is_empty() && self.leaf_private_key_ref.is_some()
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransparentInterceptionMitmClientTrustConfig {
+    pub mode: TransparentInterceptionMitmClientTrustModeConfig,
+}
+
+impl TransparentInterceptionMitmClientTrustConfig {
+    pub fn is_configured(&self) -> bool {
+        self.mode != TransparentInterceptionMitmClientTrustModeConfig::None
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparentInterceptionMitmClientTrustModeConfig {
+    #[default]
+    None,
+    OperatorManaged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,6 +283,12 @@ pub enum TransparentInterceptionMitmPlaintextBridgeIntent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransparentInterceptionMitmClientTrustIntent {
+    Disabled,
+    OperatorManaged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransparentInterceptionMitmPolicyHookIntent {
     Disabled,
     HttpJson {
@@ -357,6 +385,24 @@ impl EnforcementInterceptionConfig {
         Ok(intent)
     }
 
+    pub fn mitm_client_trust_intent(
+        &self,
+    ) -> Result<
+        TransparentInterceptionMitmClientTrustIntent,
+        Vec<TransparentInterceptionMitmIntentViolation>,
+    > {
+        if !self.strategy.is_mitm() {
+            return Ok(TransparentInterceptionMitmClientTrustIntent::Disabled);
+        }
+
+        let mut violations = Vec::new();
+        let intent = validate_mitm_client_trust(&self.mitm.client_trust, &mut violations);
+        if !violations.is_empty() {
+            return Err(violations);
+        }
+        Ok(intent)
+    }
+
     pub fn mitm_policy_hook_intent(
         &self,
     ) -> Result<
@@ -373,6 +419,24 @@ impl EnforcementInterceptionConfig {
             return Err(violations);
         }
         Ok(intent)
+    }
+}
+
+fn validate_mitm_client_trust(
+    client_trust: &TransparentInterceptionMitmClientTrustConfig,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) -> TransparentInterceptionMitmClientTrustIntent {
+    match client_trust.mode {
+        TransparentInterceptionMitmClientTrustModeConfig::None => {
+            violations.push(intent_violation(
+                "enforcement.interception.mitm.client_trust.mode",
+                "MITM interception requires client_trust.mode = \"operator_managed\" so client trust installation is explicit",
+            ));
+            TransparentInterceptionMitmClientTrustIntent::Disabled
+        }
+        TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged => {
+            TransparentInterceptionMitmClientTrustIntent::OperatorManaged
+        }
     }
 }
 

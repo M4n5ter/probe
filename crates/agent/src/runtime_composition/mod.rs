@@ -154,6 +154,7 @@ mod tests {
         CaptureSelection, TlsMaterialConfig, TlsMaterialKind,
         TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
+        TransparentInterceptionMitmClientTrustModeConfig,
         TransparentInterceptionMitmManagedProcessConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionStrategyConfig,
@@ -378,6 +379,8 @@ mod tests {
         config.enforcement.interception.mitm.ca_certificate_ref = Some("missing-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref =
             Some("missing-ca-key".to_string());
+        config.enforcement.interception.mitm.client_trust.mode =
+            TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
 
         let capabilities = capability_matrix_for_config(&config);
         let l7_mitm = capabilities
@@ -447,6 +450,8 @@ mod tests {
     }
 
     fn configure_mitm_materials(config: &mut AgentConfig) {
+        config.enforcement.interception.mitm.client_trust.mode =
+            TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.tls.materials = vec![

@@ -696,6 +696,7 @@ mod tests {
         let target = closed_loopback_target()?;
         let handle = L7MitmRuntimeHandle::new(
             L7MitmBackendHealthSnapshot::initial_success(),
+            crate::l7_mitm::L7MitmClientTrustSnapshot::disabled(),
             L7MitmPlaintextBridgeSnapshot::not_configured(),
             1,
         );
@@ -767,6 +768,8 @@ mod tests {
         };
         config.enforcement.interception.mitm.backend =
             TransparentInterceptionMitmBackendConfig::managed_process(readiness_probe, process);
+        config.enforcement.interception.mitm.client_trust.mode =
+            probe_config::TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.tls.materials = vec![

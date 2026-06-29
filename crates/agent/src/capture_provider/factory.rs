@@ -856,6 +856,8 @@ mod tests {
         config.enforcement.interception.mitm.plaintext_bridge.mode =
             TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
         config.enforcement.interception.mitm.plaintext_bridge.path = Some(bridge_path);
+        config.enforcement.interception.mitm.client_trust.mode =
+            probe_config::TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.enforcement.interception.selector = Some(Selector::term(
@@ -919,6 +921,8 @@ mod tests {
         config.enforcement.interception.mitm.plaintext_bridge.mode =
             TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
         config.enforcement.interception.mitm.plaintext_bridge.path = Some(bridge_path);
+        config.enforcement.interception.mitm.client_trust.mode =
+            probe_config::TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
         config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
         config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
         config.enforcement.interception.selector = Some(Selector::term(

@@ -48,6 +48,7 @@ fn validate_mitm_config(
     }
 
     validate_mitm_backend_intent(interception, violations);
+    validate_mitm_client_trust_intent(interception, violations);
     validate_mitm_plaintext_bridge_intent(interception, violations);
     validate_mitm_policy_hook_intent(interception, violations);
     validate_mitm_material_shape(mitm, violations);
@@ -68,6 +69,15 @@ fn validate_mitm_plaintext_bridge_intent(
     violations: &mut Vec<ConfigViolation>,
 ) {
     if let Err(intent_violations) = interception.mitm_plaintext_bridge_intent() {
+        extend_intent_violations(violations, intent_violations);
+    }
+}
+
+fn validate_mitm_client_trust_intent(
+    interception: &EnforcementInterceptionConfig,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if let Err(intent_violations) = interception.mitm_client_trust_intent() {
         extend_intent_violations(violations, intent_violations);
     }
 }
