@@ -17,7 +17,10 @@ use crate::error::AgentError;
 use super::{
     flow_resolver::{AttachedLibsslProcessRegistry, ProcfsLibsslFlowResolver},
     planning::LibsslUprobeAttachPlanner,
-    sidecar::{LibsslUprobePlaintextReconcileObserver, LibsslUprobePlaintextSidecar},
+    sidecar::{
+        LibsslUprobePlaintextReconcileFailure, LibsslUprobePlaintextReconcileObserver,
+        LibsslUprobePlaintextSidecar,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -29,6 +32,7 @@ pub(crate) struct TlsPlaintextRuntimeState {
 pub struct TlsPlaintextRuntimeSnapshot {
     pub mode: TlsPlaintextRuntimeMode,
     pub reason: Option<String>,
+    pub reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot,
     pub last_reconcile: Option<TlsPlaintextReconcileRuntimeSnapshot>,
 }
 
@@ -37,6 +41,7 @@ impl TlsPlaintextRuntimeSnapshot {
         Self {
             mode: TlsPlaintextRuntimeMode::NotConfigured,
             reason: None,
+            reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::available(),
             last_reconcile: None,
         }
     }
@@ -45,6 +50,7 @@ impl TlsPlaintextRuntimeSnapshot {
         Self {
             mode: TlsPlaintextRuntimeMode::Enabled,
             reason: None,
+            reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::available(),
             last_reconcile: None,
         }
     }
@@ -53,9 +59,88 @@ impl TlsPlaintextRuntimeSnapshot {
         Self {
             mode: TlsPlaintextRuntimeMode::Disabled,
             reason: Some(reason.into()),
+            reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::available(),
             last_reconcile: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextReconcileHealthRuntimeSnapshot {
+    mode: TlsPlaintextReconcileHealthMode,
+    consecutive_failures: u64,
+    last_attempt: Option<TlsPlaintextReconcileAttemptRuntimeSnapshot>,
+}
+
+impl TlsPlaintextReconcileHealthRuntimeSnapshot {
+    pub(crate) fn available() -> Self {
+        Self {
+            mode: TlsPlaintextReconcileHealthMode::Available,
+            consecutive_failures: 0,
+            last_attempt: None,
+        }
+    }
+
+    pub(crate) fn success(sequence: u64, observed_unix_ns: u64) -> Self {
+        Self {
+            mode: TlsPlaintextReconcileHealthMode::Available,
+            consecutive_failures: 0,
+            last_attempt: Some(TlsPlaintextReconcileAttemptRuntimeSnapshot::Succeeded {
+                sequence,
+                observed_unix_ns,
+            }),
+        }
+    }
+
+    pub(crate) fn failure(
+        sequence: u64,
+        observed_unix_ns: u64,
+        consecutive_failures: u64,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            mode: TlsPlaintextReconcileHealthMode::Degraded,
+            consecutive_failures,
+            last_attempt: Some(TlsPlaintextReconcileAttemptRuntimeSnapshot::Failed {
+                sequence,
+                observed_unix_ns,
+                reason: reason.into(),
+            }),
+        }
+    }
+
+    pub(crate) fn mode(&self) -> TlsPlaintextReconcileHealthMode {
+        self.mode
+    }
+
+    pub(crate) fn consecutive_failures(&self) -> u64 {
+        self.consecutive_failures
+    }
+
+    pub(crate) fn last_attempt(&self) -> Option<&TlsPlaintextReconcileAttemptRuntimeSnapshot> {
+        self.last_attempt.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsPlaintextReconcileHealthMode {
+    Available,
+    Degraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum TlsPlaintextReconcileAttemptRuntimeSnapshot {
+    Succeeded {
+        sequence: u64,
+        observed_unix_ns: u64,
+    },
+    Failed {
+        sequence: u64,
+        observed_unix_ns: u64,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -240,6 +325,7 @@ impl TlsPlaintextRuntimeState {
         Self::from_snapshot(TlsPlaintextRuntimeSnapshot {
             mode: TlsPlaintextRuntimeMode::Pending,
             reason: Some("TLS plaintext instrumentation has not been built yet".to_string()),
+            reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::available(),
             last_reconcile: None,
         })
     }
@@ -270,6 +356,7 @@ impl TlsPlaintextRuntimeState {
         *inner = TlsPlaintextRuntimeSnapshot {
             mode: TlsPlaintextRuntimeMode::Disabled,
             reason: Some(reason.into()),
+            reconcile_health: inner.reconcile_health.clone(),
             last_reconcile: inner.last_reconcile.clone(),
         };
     }
@@ -291,9 +378,14 @@ impl TlsPlaintextRuntimeState {
             .last_reconcile
             .as_ref()
             .map_or(1, |last| last.sequence.saturating_add(1));
+        let attempt_sequence = next_reconcile_attempt_sequence(&inner);
         *inner = TlsPlaintextRuntimeSnapshot {
             mode: TlsPlaintextRuntimeMode::Enabled,
             reason: None,
+            reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::success(
+                attempt_sequence,
+                observed_unix_ns,
+            ),
             last_reconcile: Some(
                 TlsPlaintextReconcileRuntimeSnapshot::from_reconcile_success(
                     result,
@@ -304,11 +396,91 @@ impl TlsPlaintextRuntimeState {
         };
     }
 
+    fn record_reconcile_failure(&self, reason: impl Into<String>) {
+        self.record_reconcile_failure_at(reason, current_unix_time_ns());
+    }
+
+    fn record_reconcile_failure_at(&self, reason: impl Into<String>, observed_unix_ns: u64) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let attempt_sequence = next_reconcile_attempt_sequence(&inner);
+        let consecutive_failures = inner
+            .reconcile_health
+            .consecutive_failures
+            .saturating_add(1);
+        inner.reconcile_health = TlsPlaintextReconcileHealthRuntimeSnapshot::failure(
+            attempt_sequence,
+            observed_unix_ns,
+            consecutive_failures,
+            reason,
+        );
+    }
+
+    fn record_reconcile_failure_and_disable(
+        &self,
+        failure_reason: impl Into<String>,
+        disable_reason: impl Into<String>,
+    ) {
+        self.record_reconcile_failure_and_disable_at(
+            failure_reason,
+            disable_reason,
+            current_unix_time_ns(),
+        );
+    }
+
+    fn record_reconcile_failure_and_disable_at(
+        &self,
+        failure_reason: impl Into<String>,
+        disable_reason: impl Into<String>,
+        observed_unix_ns: u64,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let attempt_sequence = next_reconcile_attempt_sequence(&inner);
+        let consecutive_failures = inner
+            .reconcile_health
+            .consecutive_failures
+            .saturating_add(1);
+        let last_reconcile = inner.last_reconcile.clone();
+        *inner = TlsPlaintextRuntimeSnapshot {
+            mode: TlsPlaintextRuntimeMode::Disabled,
+            reason: Some(disable_reason.into()),
+            reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::failure(
+                attempt_sequence,
+                observed_unix_ns,
+                consecutive_failures,
+                failure_reason,
+            ),
+            last_reconcile,
+        };
+    }
+
     pub(crate) fn snapshot(&self) -> TlsPlaintextRuntimeSnapshot {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+}
+
+fn next_reconcile_attempt_sequence(snapshot: &TlsPlaintextRuntimeSnapshot) -> u64 {
+    snapshot
+        .reconcile_health
+        .last_attempt
+        .as_ref()
+        .map_or(1, |attempt| {
+            reconcile_attempt_sequence(attempt).saturating_add(1)
+        })
+}
+
+fn reconcile_attempt_sequence(attempt: &TlsPlaintextReconcileAttemptRuntimeSnapshot) -> u64 {
+    match attempt {
+        TlsPlaintextReconcileAttemptRuntimeSnapshot::Succeeded { sequence, .. }
+        | TlsPlaintextReconcileAttemptRuntimeSnapshot::Failed { sequence, .. } => *sequence,
     }
 }
 
@@ -434,6 +606,10 @@ impl LibsslUprobePlaintextReconcileObserver for TlsPlaintextRuntimeState {
     fn record_reconcile_success(&self, result: &LibsslUprobePlaintextReconcile) {
         TlsPlaintextRuntimeState::record_reconcile_success(self, result.clone());
     }
+
+    fn record_reconcile_failure(&self, failure: LibsslUprobePlaintextReconcileFailure) {
+        record_runtime_reconcile_failure(self, failure);
+    }
 }
 
 fn current_unix_time_ns() -> u64 {
@@ -454,6 +630,28 @@ impl LibsslUprobePlaintextReconcileObserver for LibsslRuntimeReconcileObserver {
         self.attached_processes.replace_from_reconcile(result);
         if let Some(runtime_state) = &self.runtime_state {
             runtime_state.record_reconcile_success(result.clone());
+        }
+    }
+
+    fn record_reconcile_failure(&self, failure: LibsslUprobePlaintextReconcileFailure) {
+        if let Some(runtime_state) = &self.runtime_state {
+            record_runtime_reconcile_failure(runtime_state, failure);
+        }
+    }
+}
+
+fn record_runtime_reconcile_failure(
+    runtime_state: &TlsPlaintextRuntimeState,
+    failure: LibsslUprobePlaintextReconcileFailure,
+) {
+    match failure {
+        LibsslUprobePlaintextReconcileFailure::Recoverable { reason } => {
+            runtime_state.record_reconcile_failure(reason);
+        }
+        LibsslUprobePlaintextReconcileFailure::Fatal { reason } => {
+            let disable_reason =
+                format!("TLS plaintext sidecar disabled after fatal reconcile error: {reason}");
+            runtime_state.record_reconcile_failure_and_disable(reason, disable_reason);
         }
     }
 }
@@ -495,6 +693,12 @@ mod tests {
         let snapshot = runtime.snapshot();
         assert_eq!(snapshot.mode, TlsPlaintextRuntimeMode::NotConfigured);
         assert!(snapshot.reason.is_none());
+        assert_eq!(
+            snapshot.reconcile_health.mode,
+            TlsPlaintextReconcileHealthMode::Available
+        );
+        assert_eq!(snapshot.reconcile_health.consecutive_failures, 0);
+        assert!(snapshot.reconcile_health.last_attempt.is_none());
         Ok(())
     }
 
@@ -527,6 +731,11 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("has not been built yet"))
         );
+        assert_eq!(
+            snapshot.reconcile_health.mode,
+            TlsPlaintextReconcileHealthMode::Available
+        );
+        assert!(snapshot.reconcile_health.last_attempt.is_none());
         Ok(())
     }
 
@@ -551,6 +760,17 @@ mod tests {
             snapshot.reason.as_deref(),
             Some("best-effort capture provider libssl_uprobe_plaintext disabled after error: boom")
         );
+        assert_eq!(
+            snapshot.reconcile_health.mode,
+            TlsPlaintextReconcileHealthMode::Available
+        );
+        assert_eq!(snapshot.reconcile_health.consecutive_failures, 0);
+        let attempt = snapshot
+            .reconcile_health
+            .last_attempt
+            .as_ref()
+            .expect("last successful reconcile attempt should be retained after disable");
+        assert_succeeded_reconcile_attempt(attempt, 2, 200);
         let reconcile = snapshot
             .last_reconcile
             .expect("last successful reconcile should be retained after disable");
@@ -569,6 +789,70 @@ mod tests {
         assert_eq!(reconcile.targets.active.targets.len(), 5);
         assert_eq!(reconcile.targets.active.omitted, 0);
         assert_eq!(reconcile.targets.active.targets[0].pid, 3_000);
+    }
+
+    #[test]
+    fn tls_plaintext_runtime_state_records_reconcile_failure_health() {
+        let runtime = TlsPlaintextRuntimeState::pending();
+        runtime.record_instrumentation_build(&TlsPlaintextInstrumentationBuild::Enabled(Box::new(
+            NoopCaptureProvider,
+        )));
+        runtime.record_reconcile_success_at(reconcile_result(1, 0, 1), 100);
+        runtime.record_reconcile_failure_and_disable_at(
+            "capture provider libssl_uprobe_plaintext failed: attach failed",
+            "best-effort capture provider libssl_uprobe_plaintext disabled after error: attach failed",
+            200,
+        );
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.mode, TlsPlaintextRuntimeMode::Disabled);
+        assert_eq!(
+            snapshot.reason.as_deref(),
+            Some(
+                "best-effort capture provider libssl_uprobe_plaintext disabled after error: attach failed"
+            )
+        );
+        assert_eq!(
+            snapshot.reconcile_health.mode,
+            TlsPlaintextReconcileHealthMode::Degraded
+        );
+        assert_eq!(snapshot.reconcile_health.consecutive_failures, 1);
+        let attempt = snapshot
+            .reconcile_health
+            .last_attempt
+            .expect("failed reconcile attempt should be recorded");
+        assert_failed_reconcile_attempt(&attempt, 2, 200, "attach failed");
+        assert_eq!(
+            snapshot
+                .last_reconcile
+                .expect("last successful reconcile should remain available")
+                .sequence,
+            1
+        );
+    }
+
+    #[test]
+    fn tls_plaintext_runtime_state_clears_reconcile_failure_after_success() {
+        let runtime = TlsPlaintextRuntimeState::pending();
+        runtime.record_instrumentation_build(&TlsPlaintextInstrumentationBuild::Enabled(Box::new(
+            NoopCaptureProvider,
+        )));
+        runtime.record_reconcile_failure_at("planning failed", 100);
+        runtime.record_reconcile_failure_at("attach failed", 200);
+        runtime.record_reconcile_success_at(reconcile_result(1, 0, 1), 300);
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.mode, TlsPlaintextRuntimeMode::Enabled);
+        assert_eq!(
+            snapshot.reconcile_health.mode,
+            TlsPlaintextReconcileHealthMode::Available
+        );
+        assert_eq!(snapshot.reconcile_health.consecutive_failures, 0);
+        let attempt = snapshot
+            .reconcile_health
+            .last_attempt
+            .expect("successful reconcile attempt should be recorded");
+        assert_succeeded_reconcile_attempt(&attempt, 3, 300);
     }
 
     #[test]
@@ -690,6 +974,41 @@ mod tests {
             platform_capabilities,
         );
         RuntimePlan::build(config, &registry)
+    }
+
+    fn assert_succeeded_reconcile_attempt(
+        attempt: &TlsPlaintextReconcileAttemptRuntimeSnapshot,
+        expected_sequence: u64,
+        expected_observed_unix_ns: u64,
+    ) {
+        let TlsPlaintextReconcileAttemptRuntimeSnapshot::Succeeded {
+            sequence,
+            observed_unix_ns,
+        } = attempt
+        else {
+            panic!("expected succeeded reconcile attempt, got {attempt:?}");
+        };
+        assert_eq!(*sequence, expected_sequence);
+        assert_eq!(*observed_unix_ns, expected_observed_unix_ns);
+    }
+
+    fn assert_failed_reconcile_attempt(
+        attempt: &TlsPlaintextReconcileAttemptRuntimeSnapshot,
+        expected_sequence: u64,
+        expected_observed_unix_ns: u64,
+        expected_reason_fragment: &str,
+    ) {
+        let TlsPlaintextReconcileAttemptRuntimeSnapshot::Failed {
+            sequence,
+            observed_unix_ns,
+            reason,
+        } = attempt
+        else {
+            panic!("expected failed reconcile attempt, got {attempt:?}");
+        };
+        assert_eq!(*sequence, expected_sequence);
+        assert_eq!(*observed_unix_ns, expected_observed_unix_ns);
+        assert!(reason.contains(expected_reason_fragment));
     }
 
     fn reconcile_result(

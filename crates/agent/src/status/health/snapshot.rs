@@ -218,6 +218,12 @@ fn tls_health_contribution(tls: &TlsStatusSnapshot) -> HealthContribution {
     let Some(runtime) = &tls.plaintext.instrumentation.runtime else {
         return HealthContribution::available();
     };
+    tls_plaintext_runtime_health_contribution(runtime)
+}
+
+fn tls_plaintext_runtime_health_contribution(
+    runtime: &crate::tls_plaintext::TlsPlaintextRuntimeSnapshot,
+) -> HealthContribution {
     match runtime.mode {
         crate::tls_plaintext::TlsPlaintextRuntimeMode::Disabled => HealthContribution::degraded(
             runtime
@@ -230,9 +236,43 @@ fn tls_health_contribution(tls: &TlsStatusSnapshot) -> HealthContribution {
                 "TLS plaintext instrumentation has not been built yet".to_string()
             }))
         }
-        crate::tls_plaintext::TlsPlaintextRuntimeMode::NotConfigured
-        | crate::tls_plaintext::TlsPlaintextRuntimeMode::Enabled => HealthContribution::available(),
+        crate::tls_plaintext::TlsPlaintextRuntimeMode::Enabled => {
+            match runtime.reconcile_health.mode() {
+                crate::tls_plaintext::TlsPlaintextReconcileHealthMode::Available => {
+                    HealthContribution::available()
+                }
+                crate::tls_plaintext::TlsPlaintextReconcileHealthMode::Degraded => {
+                    HealthContribution::degraded(tls_reconcile_health_reason(runtime))
+                }
+            }
+        }
+        crate::tls_plaintext::TlsPlaintextRuntimeMode::NotConfigured => {
+            HealthContribution::available()
+        }
     }
+}
+
+fn tls_reconcile_health_reason(
+    runtime: &crate::tls_plaintext::TlsPlaintextRuntimeSnapshot,
+) -> String {
+    let failures = runtime.reconcile_health.consecutive_failures();
+    runtime
+        .reconcile_health
+        .last_attempt()
+        .map_or_else(
+            || "TLS plaintext reconcile loop is degraded".to_string(),
+            |attempt| match attempt {
+                crate::tls_plaintext::TlsPlaintextReconcileAttemptRuntimeSnapshot::Succeeded {
+                    ..
+                } => "TLS plaintext reconcile loop is degraded".to_string(),
+                crate::tls_plaintext::TlsPlaintextReconcileAttemptRuntimeSnapshot::Failed {
+                    reason,
+                    ..
+                } => format!(
+                    "TLS plaintext reconcile loop failed after {failures} consecutive failure(s): {reason}"
+                ),
+            },
+        )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +334,10 @@ mod tests {
     use runtime::CapturePlanMode;
 
     use super::*;
+    use crate::tls_plaintext::{
+        TlsPlaintextReconcileHealthRuntimeSnapshot, TlsPlaintextRuntimeMode,
+        TlsPlaintextRuntimeSnapshot,
+    };
 
     #[test]
     fn degraded_selected_capture_provider_degrades_health() {
@@ -331,5 +375,36 @@ mod tests {
 
         assert_eq!(health.mode, RuntimeMode::Available);
         assert!(health.reasons.is_empty());
+    }
+
+    #[test]
+    fn enabled_tls_plaintext_runtime_with_failed_reconcile_degrades_health() {
+        let runtime = TlsPlaintextRuntimeSnapshot {
+            mode: TlsPlaintextRuntimeMode::Enabled,
+            reason: None,
+            reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::failure(
+                5,
+                100,
+                2,
+                "dynamic libssl uprobe attach planning failed",
+            ),
+            last_reconcile: None,
+        };
+
+        let health = tls_plaintext_runtime_health_contribution(&runtime);
+
+        assert_eq!(health.mode, RuntimeMode::Degraded);
+        assert!(
+            health
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("2 consecutive failure(s)"))
+        );
+        assert!(
+            health
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("attach planning failed"))
+        );
     }
 }

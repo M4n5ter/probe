@@ -11,6 +11,10 @@ pub(crate) use decrypt_hints::{
     load_tls_session_secret_auto_binding_material,
 };
 pub(crate) use runtime::{
-    TlsPlaintextInstrumentationBuild, TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot,
+    TlsPlaintextInstrumentationBuild, TlsPlaintextReconcileAttemptRuntimeSnapshot,
+    TlsPlaintextReconcileHealthMode, TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot,
     TlsPlaintextRuntimeState, build_tls_plaintext_instrumentation,
 };
+
+#[cfg(test)]
+pub(crate) use runtime::TlsPlaintextReconcileHealthRuntimeSnapshot;

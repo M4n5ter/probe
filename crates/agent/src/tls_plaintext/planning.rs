@@ -22,6 +22,13 @@ impl LibsslUprobeAttachPlanner {
     pub(super) fn from_results(
         results: impl IntoIterator<Item = LibsslUprobeAttachPlanResult>,
     ) -> Self {
+        Self::from_planner_results(results.into_iter().map(Ok))
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_planner_results(
+        results: impl IntoIterator<Item = Result<LibsslUprobeAttachPlanResult, AgentError>>,
+    ) -> Self {
         Self {
             source: LibsslUprobeAttachPlannerSource::Static {
                 results: std::cell::RefCell::new(results.into_iter().collect()),
@@ -36,10 +43,10 @@ impl LibsslUprobeAttachPlanner {
                 Ok(attach_plan_result_from_report(report))
             }
             #[cfg(test)]
-            LibsslUprobeAttachPlannerSource::Static { results } => Ok(results
+            LibsslUprobeAttachPlannerSource::Static { results } => results
                 .borrow_mut()
                 .pop_front()
-                .expect("static attach planner result exhausted")),
+                .expect("static attach planner result exhausted"),
         }
     }
 }
@@ -50,7 +57,9 @@ enum LibsslUprobeAttachPlannerSource {
     },
     #[cfg(test)]
     Static {
-        results: std::cell::RefCell<std::collections::VecDeque<LibsslUprobeAttachPlanResult>>,
+        results: std::cell::RefCell<
+            std::collections::VecDeque<Result<LibsslUprobeAttachPlanResult, AgentError>>,
+        >,
     },
 }
 

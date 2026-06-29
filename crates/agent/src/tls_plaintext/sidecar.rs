@@ -26,6 +26,39 @@ impl LibsslUprobePlaintextSidecarProvider for LibsslUprobePlaintextProvider {
 
 pub(super) trait LibsslUprobePlaintextReconcileObserver {
     fn record_reconcile_success(&self, result: &LibsslUprobePlaintextReconcile);
+    fn record_reconcile_failure(&self, failure: LibsslUprobePlaintextReconcileFailure);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LibsslUprobePlaintextReconcileFailure {
+    Recoverable { reason: String },
+    Fatal { reason: String },
+}
+
+impl LibsslUprobePlaintextReconcileFailure {
+    fn recoverable(error: &CaptureError) -> Self {
+        Self::Recoverable {
+            reason: error.to_string(),
+        }
+    }
+
+    fn fatal(error: &CaptureError) -> Self {
+        Self::Fatal {
+            reason: error.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    fn reason(&self) -> &str {
+        match self {
+            Self::Recoverable { reason } | Self::Fatal { reason } => reason,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_fatal(&self) -> bool {
+        matches!(self, Self::Fatal { .. })
+    }
 }
 
 pub(super) struct LibsslUprobePlaintextSidecar<P = LibsslUprobePlaintextProvider>
@@ -77,24 +110,58 @@ where
         if !self.schedule.take_due(Instant::now()) {
             return Ok(());
         }
-        let next_plan = self
-            .planner
-            .plan()
-            .map_err(|error| {
-                CaptureError::provider(
-                    "libssl_uprobe_plaintext",
-                    format!("dynamic libssl uprobe attach planning failed: {error}"),
-                )
-            })?
-            .map_err(|blocked| {
-                CaptureError::provider("libssl_uprobe_plaintext", blocked.into_reason())
-            })?;
-        let result = self.provider.reconcile_libssl_uprobes(next_plan)?;
-        if let Some(observer) = &self.reconcile_observer {
-            observer.record_reconcile_success(&result);
+        let next_plan = match self.plan_due_reconcile() {
+            DueReconcilePlan::Ready(next_plan) => next_plan,
+            DueReconcilePlan::Blocked(error) => {
+                self.record_reconcile_failure(LibsslUprobePlaintextReconcileFailure::recoverable(
+                    &error,
+                ));
+                return Ok(());
+            }
+            DueReconcilePlan::Failed(error) => {
+                self.record_reconcile_failure(LibsslUprobePlaintextReconcileFailure::fatal(&error));
+                return Err(error);
+            }
+        };
+        match self.provider.reconcile_libssl_uprobes(next_plan) {
+            Ok(reconcile) => {
+                if let Some(observer) = &self.reconcile_observer {
+                    observer.record_reconcile_success(&reconcile);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.record_reconcile_failure(LibsslUprobePlaintextReconcileFailure::fatal(&error));
+                Err(error)
+            }
         }
-        Ok(())
     }
+
+    fn plan_due_reconcile(&mut self) -> DueReconcilePlan {
+        match self.planner.plan() {
+            Ok(Ok(next_plan)) => DueReconcilePlan::Ready(next_plan),
+            Ok(Err(blocked)) => DueReconcilePlan::Blocked(CaptureError::provider(
+                "libssl_uprobe_plaintext",
+                blocked.into_reason(),
+            )),
+            Err(error) => DueReconcilePlan::Failed(CaptureError::provider(
+                "libssl_uprobe_plaintext",
+                format!("dynamic libssl uprobe attach planning failed: {error}"),
+            )),
+        }
+    }
+
+    fn record_reconcile_failure(&self, failure: LibsslUprobePlaintextReconcileFailure) {
+        if let Some(observer) = &self.reconcile_observer {
+            observer.record_reconcile_failure(failure);
+        }
+    }
+}
+
+enum DueReconcilePlan {
+    Ready(LibsslUprobeAttachPlan),
+    Blocked(CaptureError),
+    Failed(CaptureError),
 }
 
 impl<P> CaptureProvider for LibsslUprobePlaintextSidecar<P>
@@ -178,12 +245,12 @@ mod tests {
     fn sidecar_reconciles_due_plan_before_polling_provider()
     -> Result<(), Box<dyn std::error::Error>> {
         let reconciled = Rc::new(Cell::new(false));
-        let polled_after_reconcile = Rc::new(Cell::new(false));
+        let polled = Rc::new(Cell::new(false));
         let mut sidecar = LibsslUprobePlaintextSidecar::with_schedule(
             FakeSidecarProvider {
                 reconciled: Rc::clone(&reconciled),
-                polled: Rc::clone(&polled_after_reconcile),
-                reconcile_result: empty_reconcile_result(),
+                polled: Rc::clone(&polled),
+                reconcile_result: Ok(empty_reconcile_result()),
             },
             LibsslUprobeAttachPlanner::from_results([Ok(empty_attach_plan())]),
             FixedIntervalSchedule::due_at(Duration::from_millis(10), Instant::now()),
@@ -194,49 +261,141 @@ mod tests {
 
         assert_eq!(poll, CapturePoll::Idle);
         assert!(reconciled.get());
-        assert!(polled_after_reconcile.get());
+        assert!(polled.get());
         Ok(())
     }
 
     #[test]
-    fn sidecar_stops_polling_when_due_planning_is_blocked() {
+    fn sidecar_records_blocked_planning_and_keeps_polling_provider() {
         let reconciled = Rc::new(Cell::new(false));
         let polled = Rc::new(Cell::new(false));
+        let observed_success = Rc::new(RefCell::new(None));
+        let observed_failure = Rc::new(RefCell::new(None));
         let mut sidecar = LibsslUprobePlaintextSidecar::with_schedule(
             FakeSidecarProvider {
-                reconciled,
+                reconciled: Rc::clone(&reconciled),
                 polled: Rc::clone(&polled),
-                reconcile_result: empty_reconcile_result(),
+                reconcile_result: Ok(empty_reconcile_result()),
             },
             LibsslUprobeAttachPlanner::from_results([Err(LibsslUprobeAttachPlanBlocked::new(
                 "blocked",
             ))]),
             FixedIntervalSchedule::due_at(Duration::from_millis(10), Instant::now()),
-            None,
+            Some(Box::new(FakeReconcileObserver {
+                observed_success: Rc::clone(&observed_success),
+                observed_failure: Rc::clone(&observed_failure),
+            })),
+        );
+
+        let poll = sidecar
+            .poll_next()
+            .expect("blocked planning should not disable the best-effort sidecar");
+
+        assert_eq!(poll, CapturePoll::Idle);
+        assert!(!reconciled.get());
+        assert!(polled.get());
+        assert!(observed_success.borrow().is_none());
+        assert!(
+            observed_failure
+                .borrow()
+                .as_ref()
+                .is_some_and(|failure| !failure.is_fatal() && failure.reason().contains("blocked"))
+        );
+    }
+
+    #[test]
+    fn sidecar_treats_planner_error_as_fatal() {
+        let observed_success = Rc::new(RefCell::new(None));
+        let observed_failure = Rc::new(RefCell::new(None));
+        let polled = Rc::new(Cell::new(false));
+        let mut sidecar = LibsslUprobePlaintextSidecar::with_schedule(
+            FakeSidecarProvider {
+                reconciled: Rc::new(Cell::new(false)),
+                polled: Rc::clone(&polled),
+                reconcile_result: Ok(empty_reconcile_result()),
+            },
+            LibsslUprobeAttachPlanner::from_planner_results([Err(
+                crate::error::AgentError::UnsupportedRunConfig("planner failed".to_string()),
+            )]),
+            FixedIntervalSchedule::due_at(Duration::from_millis(10), Instant::now()),
+            Some(Box::new(FakeReconcileObserver {
+                observed_success: Rc::clone(&observed_success),
+                observed_failure: Rc::clone(&observed_failure),
+            })),
         );
 
         let error = sidecar
             .poll_next()
-            .expect_err("blocked planning should disable the best-effort sidecar");
+            .expect_err("planner errors should disable the best-effort sidecar");
 
-        assert!(error.to_string().contains("blocked"));
+        assert!(error.to_string().contains("planner failed"));
+        assert!(observed_success.borrow().is_none());
+        assert!(observed_failure.borrow().as_ref().is_some_and(
+            |failure| failure.is_fatal() && failure.reason().contains("planner failed")
+        ));
         assert!(!polled.get());
+    }
+
+    #[test]
+    fn sidecar_recovers_after_transient_blocked_planning() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let reconciled = Rc::new(Cell::new(false));
+        let polled = Rc::new(Cell::new(false));
+        let observed_success = Rc::new(RefCell::new(None));
+        let observed_failure = Rc::new(RefCell::new(None));
+        let mut sidecar = LibsslUprobePlaintextSidecar::with_schedule(
+            FakeSidecarProvider {
+                reconciled: Rc::clone(&reconciled),
+                polled: Rc::clone(&polled),
+                reconcile_result: Ok(reconcile_result(1, 0, 1)),
+            },
+            LibsslUprobeAttachPlanner::from_results([
+                Err(LibsslUprobeAttachPlanBlocked::new("transient blocked")),
+                Ok(empty_attach_plan()),
+            ]),
+            FixedIntervalSchedule::due_at(Duration::ZERO, Instant::now()),
+            Some(Box::new(FakeReconcileObserver {
+                observed_success: Rc::clone(&observed_success),
+                observed_failure: Rc::clone(&observed_failure),
+            })),
+        );
+
+        assert_eq!(sidecar.poll_next()?, CapturePoll::Idle);
+        assert!(!reconciled.get());
+        assert!(polled.get());
+        assert!(observed_failure.borrow().as_ref().is_some_and(
+            |failure| !failure.is_fatal() && failure.reason().contains("transient blocked")
+        ));
+
+        polled.set(false);
+        assert_eq!(sidecar.poll_next()?, CapturePoll::Idle);
+
+        assert!(reconciled.get());
+        assert!(polled.get());
+        let reconcile = observed_success
+            .borrow()
+            .clone()
+            .expect("successful reconcile should be reported after transient planning failure");
+        assert_eq!(reconcile.attached_target_count(), 1);
+        Ok(())
     }
 
     #[test]
     fn sidecar_reports_successful_reconcile_to_observer() -> Result<(), Box<dyn std::error::Error>>
     {
         let observed = Rc::new(RefCell::new(None));
+        let observed_failure = Rc::new(RefCell::new(None));
         let mut sidecar = LibsslUprobePlaintextSidecar::with_schedule(
             FakeSidecarProvider {
                 reconciled: Rc::new(Cell::new(false)),
                 polled: Rc::new(Cell::new(false)),
-                reconcile_result: reconcile_result(2, 1, 3),
+                reconcile_result: Ok(reconcile_result(2, 1, 3)),
             },
             LibsslUprobeAttachPlanner::from_results([Ok(empty_attach_plan())]),
             FixedIntervalSchedule::due_at(Duration::from_millis(10), Instant::now()),
             Some(Box::new(FakeReconcileObserver {
-                observed: Rc::clone(&observed),
+                observed_success: Rc::clone(&observed),
+                observed_failure: Rc::clone(&observed_failure),
             })),
         );
 
@@ -250,22 +409,59 @@ mod tests {
         assert_eq!(reconcile.attached_target_count(), 2);
         assert_eq!(reconcile.detached_target_count(), 1);
         assert_eq!(reconcile.active_target_count(), 3);
+        assert!(observed_failure.borrow().is_none());
         Ok(())
+    }
+
+    #[test]
+    fn sidecar_reports_failed_reconcile_to_observer() {
+        let observed_success = Rc::new(RefCell::new(None));
+        let observed_failure = Rc::new(RefCell::new(None));
+        let polled = Rc::new(Cell::new(false));
+        let mut sidecar = LibsslUprobePlaintextSidecar::with_schedule(
+            FakeSidecarProvider {
+                reconciled: Rc::new(Cell::new(false)),
+                polled: Rc::clone(&polled),
+                reconcile_result: Err("attach failed"),
+            },
+            LibsslUprobeAttachPlanner::from_results([Ok(empty_attach_plan())]),
+            FixedIntervalSchedule::due_at(Duration::from_millis(10), Instant::now()),
+            Some(Box::new(FakeReconcileObserver {
+                observed_success: Rc::clone(&observed_success),
+                observed_failure: Rc::clone(&observed_failure),
+            })),
+        );
+
+        let error = sidecar
+            .poll_next()
+            .expect_err("failed reconcile should disable the best-effort sidecar");
+
+        assert!(error.to_string().contains("attach failed"));
+        assert!(observed_success.borrow().is_none());
+        assert!(observed_failure.borrow().as_ref().is_some_and(
+            |failure| failure.is_fatal() && failure.reason().contains("attach failed")
+        ));
+        assert!(!polled.get());
     }
 
     struct FakeSidecarProvider {
         reconciled: Rc<Cell<bool>>,
         polled: Rc<Cell<bool>>,
-        reconcile_result: LibsslUprobePlaintextReconcile,
+        reconcile_result: Result<LibsslUprobePlaintextReconcile, &'static str>,
     }
 
     struct FakeReconcileObserver {
-        observed: Rc<RefCell<Option<LibsslUprobePlaintextReconcile>>>,
+        observed_success: Rc<RefCell<Option<LibsslUprobePlaintextReconcile>>>,
+        observed_failure: Rc<RefCell<Option<LibsslUprobePlaintextReconcileFailure>>>,
     }
 
     impl LibsslUprobePlaintextReconcileObserver for FakeReconcileObserver {
         fn record_reconcile_success(&self, result: &LibsslUprobePlaintextReconcile) {
-            *self.observed.borrow_mut() = Some(result.clone());
+            *self.observed_success.borrow_mut() = Some(result.clone());
+        }
+
+        fn record_reconcile_failure(&self, failure: LibsslUprobePlaintextReconcileFailure) {
+            *self.observed_failure.borrow_mut() = Some(failure);
         }
     }
 
@@ -275,7 +471,9 @@ mod tests {
             _next_plan: LibsslUprobeAttachPlan,
         ) -> Result<LibsslUprobePlaintextReconcile, CaptureError> {
             self.reconciled.set(true);
-            Ok(self.reconcile_result.clone())
+            self.reconcile_result
+                .clone()
+                .map_err(|reason| CaptureError::provider("fake_tls_sidecar", reason.to_string()))
         }
     }
 
@@ -289,7 +487,7 @@ mod tests {
         }
 
         fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
-            self.polled.set(self.reconciled.get());
+            self.polled.set(true);
             Ok(CapturePoll::Idle)
         }
     }
