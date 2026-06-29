@@ -339,7 +339,7 @@ mod tests {
             .expect("default L7 MITM capability should explain why it is unavailable");
         assert!(reason.contains("control-plane support exists"));
         assert!(reason.contains("no MITM backend is configured"));
-        assert!(reason.contains("product proxy downstream TLS termination"));
+        assert!(reason.contains("product proxy downstream and upstream TLS relay"));
         assert!(reason.contains("upstream TLS relay"));
         assert_eq!(
             runtime.handle().snapshot().plaintext_bridge.mode,

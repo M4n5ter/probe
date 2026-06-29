@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, time::Duration};
 
 use clap::Parser;
 use probe_core::Direction;
@@ -6,7 +6,7 @@ use probe_core::Direction;
 use crate::{
     MitmProxyError,
     proxy::{MitmProxyConfig, TargetRecovery},
-    tls::TlsTerminationConfig,
+    tls::{TlsTerminationConfig, UpstreamTlsConfig},
 };
 
 #[derive(Debug, Parser)]
@@ -21,6 +21,14 @@ pub struct Cli {
     pub pid_file: Option<PathBuf>,
     #[arg(long)]
     pub upstream: Option<SocketAddr>,
+    #[arg(long)]
+    pub upstream_tls: bool,
+    #[arg(long)]
+    pub upstream_trust_anchor: Vec<PathBuf>,
+    #[arg(long)]
+    pub upstream_server_name: Option<String>,
+    #[arg(long, value_parser = parse_socket_mark)]
+    pub upstream_socket_mark: Option<NonZeroU32>,
     #[arg(long)]
     pub tls_certificate_chain: Option<PathBuf>,
     #[arg(long)]
@@ -95,11 +103,24 @@ impl TryFrom<Cli> for MitmProxyConfig {
                 ));
             }
         };
+        if !value.upstream_tls
+            && (!value.upstream_trust_anchor.is_empty() || value.upstream_server_name.is_some())
+        {
+            return Err(MitmProxyError::InvalidConfig(
+                "upstream TLS trust anchors and server name require upstream_tls = true"
+                    .to_string(),
+            ));
+        }
+        let upstream_tls = value.upstream_tls.then(|| {
+            UpstreamTlsConfig::new(value.upstream_trust_anchor, value.upstream_server_name)
+        });
         Ok(MitmProxyConfig {
             listen: value.listen,
             feed_path: value.feed,
             pid_file: value.pid_file,
             upstream: value.upstream,
+            upstream_tls,
+            upstream_socket_mark: value.upstream_socket_mark,
             tls,
             target_recovery: value.target_recovery,
             request_direction: value.request_direction.into(),
@@ -110,6 +131,15 @@ impl TryFrom<Cli> for MitmProxyConfig {
             action_timeout: Duration::from_millis(value.action_timeout_ms),
         })
     }
+}
+
+fn parse_socket_mark(value: &str) -> Result<NonZeroU32, String> {
+    let mark = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(|| value.parse::<u32>(), |hex| u32::from_str_radix(hex, 16))
+        .map_err(|error| format!("invalid socket mark {value:?}: {error}"))?;
+    NonZeroU32::new(mark).ok_or_else(|| "socket mark must be non-zero".to_string())
 }
 
 #[cfg(test)]
@@ -148,12 +178,56 @@ mod tests {
         assert_eq!(tls.private_key, Path::new("/tmp/server.key"));
     }
 
+    #[test]
+    fn upstream_tls_builds_connector_config() {
+        let config = MitmProxyConfig::try_from(Cli {
+            upstream_tls: true,
+            upstream_trust_anchor: vec![Path::new("/tmp/upstream-ca.pem").to_path_buf()],
+            upstream_server_name: Some("upstream.test".to_string()),
+            ..minimal_cli()
+        })
+        .expect("upstream TLS config should parse");
+
+        let upstream_tls = config
+            .upstream_tls
+            .expect("upstream TLS config should be preserved");
+        assert_eq!(
+            upstream_tls.trust_anchors,
+            vec![Path::new("/tmp/upstream-ca.pem").to_path_buf()]
+        );
+        assert_eq!(upstream_tls.server_name.as_deref(), Some("upstream.test"));
+    }
+
+    #[test]
+    fn upstream_tls_details_require_upstream_tls_mode() {
+        let error = MitmProxyConfig::try_from(Cli {
+            upstream_trust_anchor: vec![Path::new("/tmp/upstream-ca.pem").to_path_buf()],
+            ..minimal_cli()
+        })
+        .expect_err("trust anchors without upstream TLS mode should be rejected");
+
+        assert!(
+            matches!(error, MitmProxyError::InvalidConfig(reason) if reason.contains("require upstream_tls"))
+        );
+    }
+
+    #[test]
+    fn upstream_socket_mark_accepts_hex_value() {
+        let mark = parse_socket_mark("0x54500102").expect("hex socket mark should parse");
+
+        assert_eq!(mark.get(), 0x5450_0102);
+    }
+
     fn minimal_cli() -> Cli {
         Cli {
             listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 15_001)),
             feed: Path::new("/tmp/mitm-feed.jsonl").to_path_buf(),
             pid_file: None,
             upstream: None,
+            upstream_tls: false,
+            upstream_trust_anchor: Vec::new(),
+            upstream_server_name: None,
+            upstream_socket_mark: None,
             tls_certificate_chain: None,
             tls_private_key: None,
             target_recovery: TargetRecovery::AcceptedLocal,

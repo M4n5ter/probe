@@ -131,6 +131,11 @@ refresh_interval_ms = 1000
 # id = "mitm-leaf-key"
 # kind = "mitm_leaf_private_key"
 # path = "/etc/probe/certs/mitm-leaf.key"
+#
+# [[tls.materials]]
+# id = "upstream-ca"
+# kind = "mitm_upstream_trust_anchor"
+# path = "/etc/probe/certs/upstream-ca.pem"
 
 [enforcement]
 # "audit_only" records protective verdicts without applying them.
@@ -156,6 +161,7 @@ strategy = "none"
 # [enforcement.interception.mitm]
 # leaf_certificate_chain_refs = ["mitm-leaf"]
 # leaf_private_key_ref = "mitm-leaf-key"
+# upstream_trust_anchor_refs = ["upstream-ca"]
 
 [enforcement.interception.proxy]
 mode = "external"
@@ -165,8 +171,10 @@ self_bypass = "none"
 mode = "disabled"
 # For the first-party product proxy, set mode = "product_proxy" and configure
 # readiness_probe.target to the proxy listen endpoint. RuntimePlan derives the
-# proxy's --listen, --feed, --policy-hook-*, and --tls-* arguments from typed
-# MITM config instead of treating raw process args as material ownership.
+# proxy's --listen, --feed, --target-recovery, --policy-hook-*, --tls-*,
+# --upstream-tls, --upstream-trust-anchor, and outbound --upstream-socket-mark
+# arguments from typed MITM config instead of treating raw process args as
+# material ownership.
 #
 # [enforcement.interception.mitm.backend.process]
 # program = "/usr/local/bin/traffic-probe-mitm-proxy"

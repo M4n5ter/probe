@@ -13,8 +13,10 @@ path = "src/main.rs"
 capture = { path = "../capture" }
 clap = { version = "4.6", features = ["derive"] }
 probe-core = { path = "../core" }
+probe-io = { path = "../probe-io" }
 rustix = { version = "1.1", features = ["process"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs = "0.8"
 rustls-pemfile = "2.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

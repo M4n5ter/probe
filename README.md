@@ -91,10 +91,12 @@ Probe reserves MITM for explicit, scoped deployments. It supports inbound
 TPROXY and outbound transparent proxy lifecycle planning, external or
 agent-managed backend contracts, capture-event plaintext bridge provenance,
 explicit operator-managed client trust, product proxy downstream TLS
-termination, and a loopback HTTP JSON policy hook for proxy-side enforcement
-delegation.
+termination, upstream TLS relay with native roots or imported trust anchors,
+strategy-specific target recovery, outbound upstream socket-mark bypass, and a
+loopback HTTP JSON policy hook for proxy-side enforcement delegation.
 The first-party `product_proxy` backend derives its proxy CLI from typed MITM
-readiness, bridge, policy hook, and leaf certificate material refs.
+readiness, bridge, policy hook, leaf certificate material refs, and upstream
+trust material refs.
 
 This keeps MITM out of the default capture path while still allowing operators
 to build controlled proxy/MITM deployments with auditable boundaries.
@@ -109,9 +111,10 @@ The following are intentional boundaries of the current implementation:
 - No default whole-host transparent MITM.
 - No automatic mutation of client trust stores; MITM client trust is an explicit
   operator-managed contract.
-- No claim that downstream TLS termination proves full transparent HTTPS MITM;
-  upstream TLS relay and transparent HTTPS end-to-end validation are still
-  explicit capability boundaries.
+- No claim that crate-level downstream/upstream TLS relay proves full
+  transparent HTTPS MITM; transparent rule-path end-to-end validation, dynamic
+  SNI/ALPN routing, strong original attribution, and automatic trust-store
+  mutation remain explicit capability boundaries.
 - No hidden long-term raw traffic retention.
 - No HTTP/2, HTTP/3, or QUIC parser yet.
 - WebSocket support emits handoff, frame metadata, and 16 MiB bounded

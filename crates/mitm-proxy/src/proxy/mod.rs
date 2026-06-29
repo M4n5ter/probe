@@ -1,10 +1,12 @@
 mod downstream;
 mod policy_hook;
+mod upstream;
 
 use std::{
     fs::OpenOptions,
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    num::NonZeroU32,
     path::PathBuf,
     sync::{
         Arc,
@@ -23,12 +25,13 @@ use crate::{
     error::io_error,
     feed::{CaptureEventFeedWriter, FlowOffsets},
     flow::{FlowFactory, FlowRegistry, ProxyAction},
-    http::{HttpMessage, read_http_message, write_empty_response},
-    tls::TlsTerminationConfig,
+    http::{HttpMessage, read_http_message, relay_http_response, write_empty_response},
+    tls::{TlsTerminationConfig, UpstreamTlsConfig},
 };
 
 use self::downstream::{DownstreamAcceptor, DownstreamIo};
 use self::policy_hook::spawn_policy_hook_listener;
+use self::upstream::UpstreamConnector;
 
 const ACCEPT_IDLE_SLEEP: Duration = Duration::from_millis(20);
 
@@ -38,6 +41,8 @@ pub struct MitmProxyConfig {
     pub feed_path: PathBuf,
     pub pid_file: Option<PathBuf>,
     pub upstream: Option<SocketAddr>,
+    pub upstream_tls: Option<UpstreamTlsConfig>,
+    pub upstream_socket_mark: Option<NonZeroU32>,
     pub tls: Option<TlsTerminationConfig>,
     pub target_recovery: TargetRecovery,
     pub request_direction: Direction,
@@ -81,11 +86,16 @@ impl MitmProxyGuard {
     ) -> Result<Self, MitmProxyError> {
         validate_config(&config)?;
         let downstream = DownstreamAcceptor::from_tls_config(config.tls.as_ref())?;
+        let upstream = UpstreamConnector::from_config(
+            config.upstream_tls.as_ref(),
+            config.upstream_socket_mark,
+        )?;
         write_pid_file(config.pid_file.as_ref())?;
         let feed = Arc::new(CaptureEventFeedWriter::create(&config.feed_path)?);
         let state = Arc::new(ProxyState {
             config: Arc::new(config),
             downstream,
+            upstream,
             feed,
             registry: Arc::new(FlowRegistry::default()),
             flow_factory: Arc::new(FlowFactory::new()),
@@ -137,6 +147,7 @@ pub fn run_forever(config: MitmProxyConfig) -> Result<(), MitmProxyError> {
 struct ProxyState {
     config: Arc<MitmProxyConfig>,
     downstream: DownstreamAcceptor,
+    upstream: UpstreamConnector,
     feed: Arc<CaptureEventFeedWriter>,
     registry: Arc<FlowRegistry>,
     flow_factory: Arc<FlowFactory>,
@@ -384,20 +395,18 @@ fn forward_or_gateway_response(
     if is_self_target(target, config.listen) {
         return write_empty_response(downstream, 200);
     }
-    match TcpStream::connect_timeout(&target, config.io_timeout) {
+    match state.upstream.connect(target, &request, config.io_timeout) {
         Ok(mut upstream) => {
-            configure_stream(&upstream, config.io_timeout)?;
             upstream
                 .write_all(&request.raw)
                 .map_err(io_error("write MITM proxy upstream request"))?;
             upstream
                 .flush()
                 .map_err(io_error("flush MITM proxy upstream request"))?;
-            upstream
-                .shutdown(std::net::Shutdown::Write)
-                .map_err(io_error("shutdown MITM proxy upstream request"))?;
+            upstream.finish_request()?;
             relay_response(
                 &mut upstream,
+                &request,
                 downstream,
                 &state.feed,
                 flow,
@@ -410,35 +419,21 @@ fn forward_or_gateway_response(
 }
 
 fn relay_response(
-    upstream: &mut TcpStream,
+    upstream: &mut impl Read,
+    request: &HttpMessage,
     downstream: &mut impl Write,
     feed: &CaptureEventFeedWriter,
     flow: &probe_core::FlowContext,
     offsets: &mut FlowOffsets,
     direction: Direction,
 ) -> Result<(), MitmProxyError> {
-    let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        match upstream.read(&mut buffer) {
-            Ok(0) => return Ok(()),
-            Ok(read) => {
-                let offset = offsets.record(direction, read);
-                feed.bytes(flow, direction, offset, &buffer[..read])?;
-                downstream
-                    .write_all(&buffer[..read])
-                    .map_err(io_error("write MITM proxy downstream response"))?;
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Ok(());
-            }
-            Err(source) => return Err(io_error("read MITM proxy upstream response")(source)),
-        }
-    }
+    relay_http_response(upstream, request, |bytes| {
+        let offset = offsets.record(direction, bytes.len());
+        feed.bytes(flow, direction, offset, bytes)?;
+        downstream
+            .write_all(bytes)
+            .map_err(io_error("write MITM proxy downstream response"))
+    })
 }
 
 fn deny_response_bytes(body: &str) -> Vec<u8> {
@@ -630,11 +625,10 @@ mod tests {
             String::from_utf8_lossy(&response),
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
         );
-        assert!(feed_has_bytes(
-            &feed_path,
-            Direction::Inbound,
+        assert_eq!(
+            feed_direction_bytes(&feed_path, Direction::Inbound)?,
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
-        )?);
+        );
         Ok(())
     }
 
@@ -673,11 +667,118 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nfrom-tls"
         );
         assert!(feed_has_bytes(&feed_path, Direction::Outbound, request)?);
+        assert_eq!(
+            feed_direction_bytes(&feed_path, Direction::Inbound)?,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nfrom-tls"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tls_listener_relays_plaintext_http_to_tls_upstream() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let (certificate_chain, private_key, trusted_certificate) =
+            write_test_certificate(root.path())?;
+        let upstream = tls_upstream_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nfrom-upstream",
+            certificate_chain.clone(),
+            private_key.clone(),
+        )?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let mut config = test_config(
+            listen,
+            &feed_path,
+            Some(upstream),
+            Some(TlsTerminationConfig::new(
+                certificate_chain.clone(),
+                private_key,
+            )),
+            None,
+            Duration::from_secs(2),
+        );
+        config.upstream_tls = Some(UpstreamTlsConfig::new(vec![certificate_chain], None));
+        let guard = start_test_proxy(config, data_listener, None)?;
+
+        let mut stream = tls_client_stream(listen, trusted_certificate)?;
+        let request = format!(
+            "GET /tls-upstream HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+            upstream.port()
+        );
+        stream.write_all(request.as_bytes())?;
+        stream.flush()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nfrom-upstream"
+        );
         assert!(feed_has_bytes(
             &feed_path,
-            Direction::Inbound,
-            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nfrom-tls"
+            Direction::Outbound,
+            request.as_bytes()
         )?);
+        assert_eq!(
+            feed_direction_bytes(&feed_path, Direction::Inbound)?,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nfrom-upstream"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tls_upstream_keep_alive_response_completes_by_http_framing() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let (certificate_chain, private_key, trusted_certificate) =
+            write_test_certificate(root.path())?;
+        let upstream = tls_upstream_keep_alive_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nkeepalive",
+            certificate_chain.clone(),
+            private_key.clone(),
+            Duration::from_secs(4),
+        )?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let mut config = test_config(
+            listen,
+            &feed_path,
+            Some(upstream),
+            Some(TlsTerminationConfig::new(
+                certificate_chain.clone(),
+                private_key,
+            )),
+            None,
+            Duration::from_secs(2),
+        );
+        config.io_timeout = Duration::from_secs(5);
+        config.upstream_tls = Some(UpstreamTlsConfig::new(vec![certificate_chain], None));
+        let guard = start_test_proxy(config, data_listener, None)?;
+
+        let started = std::time::Instant::now();
+        let mut stream = tls_client_stream(listen, trusted_certificate)?;
+        stream.write_all(
+            format!(
+                "GET /tls-keep-alive HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+                upstream.port()
+            )
+            .as_bytes(),
+        )?;
+        stream.flush()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "response relay should complete before upstream keep-alive closes"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nkeepalive"
+        );
         Ok(())
     }
 
@@ -694,6 +795,8 @@ mod tests {
             feed_path: feed_path.to_path_buf(),
             pid_file: None,
             upstream,
+            upstream_tls: None,
+            upstream_socket_mark: None,
             tls,
             target_recovery: TargetRecovery::AcceptedLocal,
             request_direction: Direction::Outbound,
@@ -798,6 +901,22 @@ mod tests {
         Ok(false)
     }
 
+    fn feed_direction_bytes(
+        feed_path: &PathBuf,
+        direction: Direction,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut bytes = Vec::new();
+        for line in fs::read_to_string(feed_path)?.lines() {
+            let event = serde_json::from_str::<CaptureEvent>(line)?;
+            if let CaptureEvent::Bytes(chunk) = event
+                && chunk.direction == direction
+            {
+                bytes.extend_from_slice(chunk.bytes.as_ref());
+            }
+        }
+        Ok(bytes)
+    }
+
     fn send_policy_hook_deny(target: SocketAddr, flow: FlowContext) -> Result<(), Box<dyn Error>> {
         let response = send_policy_hook_deny_response(target, flow)?;
         assert!(response.contains(r#""outcome":"delegated""#), "{response}");
@@ -853,6 +972,78 @@ mod tests {
 
     fn upstream_server(response: &'static [u8]) -> Result<SocketAddr, Box<dyn Error>> {
         delayed_upstream_server(response, Duration::ZERO)
+    }
+
+    fn tls_upstream_server(
+        response: &'static [u8],
+        certificate_chain: PathBuf,
+        private_key: PathBuf,
+    ) -> Result<SocketAddr, Box<dyn Error>> {
+        tls_upstream_server_with_shutdown(
+            response,
+            certificate_chain,
+            private_key,
+            TlsUpstreamShutdown::CloseNotify,
+        )
+    }
+
+    fn tls_upstream_keep_alive_server(
+        response: &'static [u8],
+        certificate_chain: PathBuf,
+        private_key: PathBuf,
+        hold_open: Duration,
+    ) -> Result<SocketAddr, Box<dyn Error>> {
+        tls_upstream_server_with_shutdown(
+            response,
+            certificate_chain,
+            private_key,
+            TlsUpstreamShutdown::HoldOpen(hold_open),
+        )
+    }
+
+    enum TlsUpstreamShutdown {
+        CloseNotify,
+        HoldOpen(Duration),
+    }
+
+    fn tls_upstream_server_with_shutdown(
+        response: &'static [u8],
+        certificate_chain: PathBuf,
+        private_key: PathBuf,
+        shutdown: TlsUpstreamShutdown,
+    ) -> Result<SocketAddr, Box<dyn Error>> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let target = listener.local_addr()?;
+        thread::spawn(move || {
+            let Ok((stream, _peer)) = listener.accept() else {
+                return;
+            };
+            let config = TlsTerminationConfig::new(certificate_chain, private_key);
+            let Ok(terminator) = crate::tls::TlsTerminator::from_config(&config) else {
+                return;
+            };
+            let Ok(mut stream) = terminator.accept(stream) else {
+                return;
+            };
+            if read_http_message(&mut stream, 65_536)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                let _ = stream.write_all(response);
+                match shutdown {
+                    TlsUpstreamShutdown::CloseNotify => {
+                        stream.conn.send_close_notify();
+                        let _ = stream.flush();
+                    }
+                    TlsUpstreamShutdown::HoldOpen(duration) => {
+                        let _ = stream.flush();
+                        thread::sleep(duration);
+                    }
+                }
+            }
+        });
+        Ok(target)
     }
 
     fn delayed_upstream_server(

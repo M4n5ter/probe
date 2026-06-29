@@ -1,4 +1,9 @@
-use std::{fmt, net::SocketAddr, num::NonZeroU16, path::PathBuf};
+use std::{
+    fmt,
+    net::SocketAddr,
+    num::{NonZeroU16, NonZeroU32},
+    path::PathBuf,
+};
 
 use probe_config::{
     AgentConfig, ConfigError, ConfigValidationError, ConfigViolation,
@@ -146,12 +151,13 @@ impl EnforcementInterceptionPlan {
         let nftables = TransparentInterceptionNftablesPlan::reserved();
         let execution =
             TransparentInterceptionExecutionPlan::from_intent_with_nftables(&intent, &nftables);
+        let mitm = TransparentInterceptionMitmPlan::from_config(config, &nftables);
         Self {
             strategy,
             proxy: TransparentInterceptionProxyPlan::from_intent(&intent),
             execution,
             nftables,
-            mitm: TransparentInterceptionMitmPlan::from_config(config),
+            mitm,
             local_setup_projection:
                 TransparentInterceptionLocalSetupProjectionPlan::from_strategy_and_selectors(
                     strategy,
@@ -332,14 +338,20 @@ impl TransparentInterceptionMitmPlan {
         config
             .validate_l7_mitm_contract()
             .map_err(config_validation_error)?;
-        Ok(Self::from_validated_config(config))
+        Ok(Self::from_validated_config(
+            config,
+            &TransparentInterceptionNftablesPlan::reserved(),
+        ))
     }
 
-    fn from_config(config: &AgentConfig) -> Self {
-        Self::from_validated_config(config)
+    fn from_config(config: &AgentConfig, nftables: &TransparentInterceptionNftablesPlan) -> Self {
+        Self::from_validated_config(config, nftables)
     }
 
-    fn from_validated_config(config: &AgentConfig) -> Self {
+    fn from_validated_config(
+        config: &AgentConfig,
+        nftables: &TransparentInterceptionNftablesPlan,
+    ) -> Self {
         let mitm = &config.enforcement.interception.mitm;
         let materials_by_id = mitm_tls_materials_by_id(&config.tls.materials);
         let backend_intent = config
@@ -399,14 +411,17 @@ impl TransparentInterceptionMitmPlan {
             TlsMaterialKind::MitmUpstreamTrustAnchor,
             &materials_by_id,
         );
-        let backend = TransparentInterceptionMitmBackendPlan::from_intent(
-            backend_intent,
-            product_proxy_request_direction(config.enforcement.interception.strategy),
-            &plaintext_bridge,
-            &policy_hook,
-            &leaf_certificate_chain,
-            leaf_private_key.as_ref(),
-        );
+        let backend_context = MitmBackendPlanningContext {
+            strategy: config.enforcement.interception.strategy,
+            nftables,
+            plaintext_bridge: &plaintext_bridge,
+            policy_hook: &policy_hook,
+            leaf_certificate_chain: &leaf_certificate_chain,
+            leaf_private_key: leaf_private_key.as_ref(),
+            upstream_trust_anchors: &upstream_trust_anchors,
+        };
+        let backend =
+            TransparentInterceptionMitmBackendPlan::from_intent(backend_intent, backend_context);
         Self {
             backend,
             client_trust,
@@ -421,11 +436,75 @@ impl TransparentInterceptionMitmPlan {
     }
 }
 
-fn product_proxy_request_direction(strategy: TransparentInterceptionStrategyConfig) -> Direction {
-    match strategy {
-        TransparentInterceptionStrategyConfig::InboundTproxyMitm => Direction::Inbound,
-        TransparentInterceptionStrategyConfig::OutboundTransparentMitm => Direction::Outbound,
-        _ => Direction::Outbound,
+#[derive(Clone, Copy)]
+struct ProductProxyInterception {
+    request_direction: Direction,
+    target_recovery: ProductProxyTargetRecovery,
+    upstream_socket_mark: Option<NonZeroU32>,
+}
+
+impl ProductProxyInterception {
+    fn from_strategy(
+        strategy: TransparentInterceptionStrategyConfig,
+        nftables: &TransparentInterceptionNftablesPlan,
+    ) -> Self {
+        match strategy {
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm => Self {
+                request_direction: Direction::Inbound,
+                target_recovery: ProductProxyTargetRecovery::AcceptedLocal,
+                upstream_socket_mark: None,
+            },
+            TransparentInterceptionStrategyConfig::OutboundTransparentMitm => Self {
+                request_direction: Direction::Outbound,
+                target_recovery: ProductProxyTargetRecovery::LinuxOriginalDestination,
+                upstream_socket_mark: Some(nftables.outbound_proxy_bypass_mark),
+            },
+            unsupported => {
+                panic!("product proxy MITM does not support interception strategy {unsupported:?}")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProductProxyTargetRecovery {
+    AcceptedLocal,
+    LinuxOriginalDestination,
+}
+
+impl ProductProxyTargetRecovery {
+    fn cli_value(self) -> &'static str {
+        match self {
+            Self::AcceptedLocal => "accepted-local",
+            Self::LinuxOriginalDestination => "linux-original-destination",
+        }
+    }
+}
+
+struct MitmBackendPlanningContext<'a> {
+    strategy: TransparentInterceptionStrategyConfig,
+    nftables: &'a TransparentInterceptionNftablesPlan,
+    plaintext_bridge: &'a TransparentInterceptionMitmPlaintextBridgePlan,
+    policy_hook: &'a TransparentInterceptionMitmPolicyHookPlan,
+    leaf_certificate_chain: &'a [TlsMaterialPlan],
+    leaf_private_key: Option<&'a TlsMaterialPlan>,
+    upstream_trust_anchors: &'a [TlsMaterialPlan],
+}
+
+impl<'a> MitmBackendPlanningContext<'a> {
+    fn product_proxy_cli_builder(
+        &'a self,
+        readiness_probe: &'a TransparentInterceptionMitmBackendReadinessProbePlan,
+    ) -> ProductProxyCliBuilder<'a> {
+        ProductProxyCliBuilder {
+            readiness_probe,
+            interception: ProductProxyInterception::from_strategy(self.strategy, self.nftables),
+            plaintext_bridge: self.plaintext_bridge,
+            policy_hook: self.policy_hook,
+            leaf_certificate_chain: self.leaf_certificate_chain,
+            leaf_private_key: self.leaf_private_key,
+            upstream_trust_anchors: self.upstream_trust_anchors,
+        }
     }
 }
 
@@ -475,11 +554,7 @@ pub enum TransparentInterceptionMitmBackendPlan {
 impl TransparentInterceptionMitmBackendPlan {
     fn from_intent(
         intent: TransparentInterceptionMitmBackendIntent,
-        request_direction: Direction,
-        plaintext_bridge: &TransparentInterceptionMitmPlaintextBridgePlan,
-        policy_hook: &TransparentInterceptionMitmPolicyHookPlan,
-        leaf_certificate_chain: &[TlsMaterialPlan],
-        leaf_private_key: Option<&TlsMaterialPlan>,
+        context: MitmBackendPlanningContext<'_>,
     ) -> Self {
         match intent {
             TransparentInterceptionMitmBackendIntent::Disabled => Self::Disabled,
@@ -508,15 +583,11 @@ impl TransparentInterceptionMitmBackendPlan {
                     TransparentInterceptionMitmBackendReadinessProbePlan::from_intent(
                         readiness_probe,
                     );
+                let cli_builder = context.product_proxy_cli_builder(&readiness_probe);
                 Self::ProductProxy {
                     process: TransparentInterceptionMitmManagedProcessPlan::from_product_proxy(
                         process,
-                        &readiness_probe,
-                        request_direction,
-                        plaintext_bridge,
-                        policy_hook,
-                        leaf_certificate_chain,
-                        leaf_private_key,
+                        cli_builder,
                     ),
                     readiness_probe,
                 }
@@ -543,29 +614,53 @@ impl TransparentInterceptionMitmManagedProcessPlan {
 
     fn from_product_proxy(
         intent: TransparentInterceptionMitmProductProxyIntent,
-        readiness_probe: &TransparentInterceptionMitmBackendReadinessProbePlan,
-        request_direction: Direction,
-        plaintext_bridge: &TransparentInterceptionMitmPlaintextBridgePlan,
-        policy_hook: &TransparentInterceptionMitmPolicyHookPlan,
-        leaf_certificate_chain: &[TlsMaterialPlan],
-        leaf_private_key: Option<&TlsMaterialPlan>,
+        cli_builder: ProductProxyCliBuilder<'_>,
     ) -> Self {
+        Self {
+            program: intent.program,
+            args: cli_builder.args(),
+            working_dir: intent.working_dir,
+        }
+    }
+}
+
+struct ProductProxyCliBuilder<'a> {
+    readiness_probe: &'a TransparentInterceptionMitmBackendReadinessProbePlan,
+    interception: ProductProxyInterception,
+    plaintext_bridge: &'a TransparentInterceptionMitmPlaintextBridgePlan,
+    policy_hook: &'a TransparentInterceptionMitmPolicyHookPlan,
+    leaf_certificate_chain: &'a [TlsMaterialPlan],
+    leaf_private_key: Option<&'a TlsMaterialPlan>,
+    upstream_trust_anchors: &'a [TlsMaterialPlan],
+}
+
+impl ProductProxyCliBuilder<'_> {
+    fn args(&self) -> Vec<String> {
         let mut args = vec![
             "--listen".to_string(),
-            readiness_probe.target().to_string(),
+            self.readiness_probe.target().to_string(),
             "--feed".to_string(),
-            plaintext_bridge
+            self.plaintext_bridge
                 .capture_event_feed_path()
                 .display()
                 .to_string(),
+            "--target-recovery".to_string(),
+            self.interception.target_recovery.cli_value().to_string(),
             "--request-direction".to_string(),
-            direction_cli_value(request_direction).to_string(),
+            direction_cli_value(self.interception.request_direction).to_string(),
+            "--upstream-tls".to_string(),
         ];
+        if let Some(mark) = self.interception.upstream_socket_mark {
+            args.extend([
+                "--upstream-socket-mark".to_string(),
+                format!("0x{:x}", mark.get()),
+            ]);
+        }
         if let TransparentInterceptionMitmPolicyHookPlan::HttpJson {
             endpoint,
             timeout_ms,
             ..
-        } = policy_hook
+        } = self.policy_hook
         {
             args.extend([
                 "--policy-hook-listen".to_string(),
@@ -576,22 +671,26 @@ impl TransparentInterceptionMitmManagedProcessPlan {
                 timeout_ms.to_string(),
             ]);
         }
-        let leaf_certificate = leaf_certificate_chain
+        let leaf_certificate = self
+            .leaf_certificate_chain
             .first()
             .expect("product proxy MITM validation should require one leaf certificate chain");
-        let leaf_private_key =
-            leaf_private_key.expect("product proxy MITM validation should require a leaf key");
+        let leaf_private_key = self
+            .leaf_private_key
+            .expect("product proxy MITM validation should require a leaf key");
         args.extend([
             "--tls-certificate-chain".to_string(),
             leaf_certificate.path.display().to_string(),
             "--tls-private-key".to_string(),
             leaf_private_key.path.display().to_string(),
         ]);
-        Self {
-            program: intent.program,
-            args,
-            working_dir: intent.working_dir,
+        for trust_anchor in self.upstream_trust_anchors {
+            args.extend([
+                "--upstream-trust-anchor".to_string(),
+                trust_anchor.path.display().to_string(),
+            ]);
         }
+        args
     }
 }
 
@@ -1463,8 +1562,11 @@ mod tests {
                 "127.0.0.1:15002".to_string(),
                 "--feed".to_string(),
                 "/run/traffic-probe/mitm-feed.jsonl".to_string(),
+                "--target-recovery".to_string(),
+                "accepted-local".to_string(),
                 "--request-direction".to_string(),
                 "inbound".to_string(),
+                "--upstream-tls".to_string(),
                 "--policy-hook-listen".to_string(),
                 "127.0.0.1:15003".to_string(),
                 "--policy-hook-path".to_string(),
@@ -1475,6 +1577,8 @@ mod tests {
                 "/etc/traffic-probe/mitm-leaf.pem".to_string(),
                 "--tls-private-key".to_string(),
                 "/etc/traffic-probe/mitm-leaf.key".to_string(),
+                "--upstream-trust-anchor".to_string(),
+                "/etc/traffic-probe/upstream-ca.pem".to_string(),
             ]
         );
         assert_eq!(
@@ -1515,6 +1619,16 @@ mod tests {
             &process.args,
             "--request-direction",
             "outbound"
+        ));
+        assert!(args_contain_pair(
+            &process.args,
+            "--target-recovery",
+            "linux-original-destination"
+        ));
+        assert!(args_contain_pair(
+            &process.args,
+            "--upstream-socket-mark",
+            "0x54500102"
         ));
         Ok(())
     }
@@ -1889,6 +2003,11 @@ mod tests {
             .leaf_certificate_chain_refs = vec!["mitm-leaf".to_string()];
         config.enforcement.interception.mitm.leaf_private_key_ref =
             Some("mitm-leaf-key".to_string());
+        config
+            .enforcement
+            .interception
+            .mitm
+            .upstream_trust_anchor_refs = vec!["upstream-ca".to_string()];
         config.tls.materials = vec![
             TlsMaterialConfig {
                 id: Some("mitm-leaf".to_string()),
@@ -1899,6 +2018,11 @@ mod tests {
                 id: Some("mitm-leaf-key".to_string()),
                 kind: TlsMaterialKind::MitmLeafPrivateKey,
                 path: "/etc/traffic-probe/mitm-leaf.key".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("upstream-ca".to_string()),
+                kind: TlsMaterialKind::MitmUpstreamTrustAnchor,
+                path: "/etc/traffic-probe/upstream-ca.pem".into(),
             },
         ];
     }
