@@ -9,9 +9,9 @@ use probe_io::{TcpConnectOptions, TcpSocketMark, connect_tcp};
 
 use crate::{
     MitmProxyError,
+    authority::ObservedAuthority,
     error::io_error,
-    http::HttpMessage,
-    tls::{TlsClientStream, TlsUpstreamConnector, UpstreamTlsConfig, UpstreamTlsNameCandidates},
+    tls::{TlsClientStream, TlsUpstreamConnector, UpstreamTlsConfig},
 };
 
 pub(crate) struct UpstreamConnector {
@@ -34,16 +34,9 @@ impl UpstreamConnector {
     pub(crate) fn connect(
         &self,
         target: SocketAddr,
-        request: &HttpMessage,
-        downstream_tls_server_name: Option<&str>,
+        authority: ObservedAuthority<'_>,
         timeout: Duration,
     ) -> Result<UpstreamConnection, MitmProxyError> {
-        let tls_authority = self
-            .tls
-            .as_ref()
-            .map(|_| request.authority())
-            .transpose()?
-            .flatten();
         let mut options = TcpConnectOptions::new(timeout);
         if let Some(mark) = self.socket_mark {
             options = options.with_socket_mark(mark);
@@ -53,14 +46,15 @@ impl UpstreamConnector {
         configure_stream(&stream, timeout)?;
         match &self.tls {
             Some(tls) => tls
-                .connect(
-                    stream,
-                    UpstreamTlsNameCandidates::observed(downstream_tls_server_name, tls_authority),
-                )
+                .connect(stream, authority.candidates())
                 .map(Box::new)
                 .map(UpstreamConnection::Tls),
             None => Ok(UpstreamConnection::Plain(stream)),
         }
+    }
+
+    pub(crate) fn uses_tls(&self) -> bool {
+        self.tls.is_some()
     }
 }
 

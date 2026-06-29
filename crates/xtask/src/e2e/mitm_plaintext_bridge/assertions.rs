@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fs,
     io::{Read, Write},
     net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream},
@@ -30,7 +30,8 @@ use super::{
         EXPECTED_POLICY_VERSION, POLICY_HOOK_REASON_PREFIX, POLICY_HOOK_RESPONSE_REASON,
         expected_bridge_policy_alert_message, expected_libpcap_targets,
         expected_policy_alert_message, is_bridge_flow, is_bridge_ingress_bytes,
-        is_product_proxy_deny_response_bytes,
+        is_product_proxy_allow_request_bytes, is_product_proxy_deny_response_bytes,
+        product_proxy_response_direction,
     },
 };
 use crate::e2e::{
@@ -382,6 +383,28 @@ fn assert_livestream_ingress(
     if case.backend() == MitmBackendKind::ProductProxy
         && !capture_events
             .iter()
+            .any(|event| is_product_proxy_allow_request_bytes(case, event))
+    {
+        return Err(e2e_error(
+            "missing product MITM proxy routed allow request plaintext feed bytes",
+        )
+        .into());
+    }
+    if case.backend() == MitmBackendKind::ProductProxy
+        && !l7_mitm_plaintext_stream_contains(
+            &capture_events,
+            product_proxy_response_direction(case),
+            mitm_bridge::ALLOW_RESPONSE_BYTES,
+        )
+    {
+        return Err(e2e_error(
+            "missing product MITM proxy routed allow response plaintext feed bytes",
+        )
+        .into());
+    }
+    if case.backend() == MitmBackendKind::ProductProxy
+        && !capture_events
+            .iter()
             .any(|event| is_product_proxy_deny_response_bytes(case, event))
     {
         return Err(
@@ -400,6 +423,53 @@ fn assert_livestream_ingress(
         return Err(e2e_error("missing required libpcap primary ingress bytes").into());
     }
     Ok(())
+}
+
+fn l7_mitm_plaintext_stream_contains(
+    events: &[CaptureEvent],
+    direction: Direction,
+    expected: &[u8],
+) -> bool {
+    let mut streams: HashMap<String, Vec<(u64, &[u8])>> = HashMap::new();
+    for event in events {
+        let CaptureEvent::Bytes(bytes) = event else {
+            continue;
+        };
+        if bytes.origin.source() != CaptureSource::L7MitmPlaintext
+            || bytes.origin.provider() != CaptureProviderKind::Interception
+            || bytes.direction != direction
+        {
+            continue;
+        }
+        streams
+            .entry(bytes.flow.id.0.clone())
+            .or_default()
+            .push((bytes.stream_offset, bytes.bytes.as_ref()));
+    }
+
+    streams.values_mut().any(|chunks| {
+        chunks.sort_by_key(|(offset, _)| *offset);
+        let mut assembled = Vec::new();
+        let mut next_offset = 0;
+        for (offset, bytes) in chunks {
+            if *offset != next_offset {
+                if *offset != 0 {
+                    continue;
+                }
+                assembled.clear();
+                next_offset = 0;
+            }
+            assembled.extend_from_slice(bytes);
+            next_offset += bytes.len() as u64;
+            if assembled
+                .windows(expected.len())
+                .any(|window| window == expected)
+            {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 fn assert_expected_bridge_export(

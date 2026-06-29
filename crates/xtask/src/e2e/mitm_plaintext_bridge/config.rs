@@ -9,6 +9,7 @@ use probe_config::{
     TransparentInterceptionMitmManagedProcessConfig,
     TransparentInterceptionMitmPlaintextBridgeModeConfig,
     TransparentInterceptionMitmPolicyHookModeConfig, TransparentInterceptionMitmProductProxyConfig,
+    TransparentInterceptionMitmProductProxyUpstreamRouteConfig,
     TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
     TransparentInterceptionStrategyConfig,
 };
@@ -119,15 +120,21 @@ pub(super) fn write_agent_config(
                 working_dir: None,
             },
         ),
-        MitmBackendConfig::ProductProxy { target, program } => {
-            TransparentInterceptionMitmBackendConfig::product_proxy(
-                mitm_readiness_probe(target.clone()),
-                TransparentInterceptionMitmProductProxyConfig {
-                    program: Some(program.clone()),
-                    working_dir: None,
-                },
-            )
-        }
+        MitmBackendConfig::ProductProxy {
+            target,
+            program,
+            upstream_route,
+        } => TransparentInterceptionMitmBackendConfig::product_proxy(
+            mitm_readiness_probe(target.clone()),
+            TransparentInterceptionMitmProductProxyConfig {
+                program: Some(program.clone()),
+                working_dir: None,
+                upstream_routes: vec![TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
+                    host: upstream_route.host.clone(),
+                    target: upstream_route.target.to_string(),
+                }],
+            },
+        ),
     };
     config.enforcement.interception.mitm.plaintext_bridge.mode =
         TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
@@ -150,7 +157,7 @@ pub(super) fn write_agent_config(
             .policy_hook
             .max_response_bytes = 4096;
     }
-    config.tls.materials = vec![
+    let mut tls_materials = vec![
         TlsMaterialConfig {
             id: Some("mitm-ca".to_string()),
             kind: TlsMaterialKind::MitmCaCertificate,
@@ -162,6 +169,19 @@ pub(super) fn write_agent_config(
             path: inputs.mitm_ca_private_key_path.to_path_buf(),
         },
     ];
+    if let MitmBackendConfig::ProductProxy { upstream_route, .. } = inputs.mitm_backend {
+        config
+            .enforcement
+            .interception
+            .mitm
+            .upstream_trust_anchor_refs = vec!["product-upstream-ca".to_string()];
+        tls_materials.push(TlsMaterialConfig {
+            id: Some("product-upstream-ca".to_string()),
+            kind: TlsMaterialKind::MitmUpstreamTrustAnchor,
+            path: upstream_route.certificate_path.clone(),
+        });
+    }
+    config.tls.materials = tls_materials;
     fs::write(inputs.config_path, toml::to_string(&config)?)?;
     Ok(())
 }

@@ -19,7 +19,9 @@ use rustls::{
     pki_types::{CertificateDer, ServerName},
 };
 
-use super::{MitmProxyConfig, MitmProxyGuard, ProxyListeners, TargetRecovery};
+use super::{
+    MitmProxyConfig, MitmProxyGuard, ProxyListeners, TargetRecovery, UpstreamTargetRoutes,
+};
 use crate::{http::read_http_message, tls::TlsTerminationConfig};
 
 pub(super) type ObservedSniReceiver = mpsc::Receiver<Option<String>>;
@@ -38,6 +40,7 @@ pub(super) fn test_config(
         feed_path: feed_path.to_path_buf(),
         pid_file: None,
         upstream,
+        upstream_routes: UpstreamTargetRoutes::default(),
         upstream_tls: None,
         upstream_socket_mark: None,
         tls,

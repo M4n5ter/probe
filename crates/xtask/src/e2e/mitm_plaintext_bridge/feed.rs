@@ -64,6 +64,17 @@ pub(super) fn is_bridge_ingress_bytes(case: MitmBridgeCase, event: &CaptureEvent
     )
 }
 
+pub(super) fn is_product_proxy_allow_request_bytes(
+    case: MitmBridgeCase,
+    event: &CaptureEvent,
+) -> bool {
+    is_l7_mitm_plaintext_bytes(
+        event,
+        product_proxy_request_direction(case),
+        mitm_bridge::ALLOW_REQUEST_BYTES,
+    )
+}
+
 pub(super) fn is_product_proxy_deny_response_bytes(
     case: MitmBridgeCase,
     event: &CaptureEvent,
@@ -98,14 +109,14 @@ fn is_l7_mitm_plaintext_origin(envelope: &EventEnvelope) -> bool {
         && envelope.origin().provider() == CaptureProviderKind::Interception
 }
 
-fn product_proxy_request_direction(case: MitmBridgeCase) -> Direction {
+pub(super) fn product_proxy_request_direction(case: MitmBridgeCase) -> Direction {
     match case.direction() {
         super::backend::MitmBridgeDirection::Inbound => Direction::Inbound,
         super::backend::MitmBridgeDirection::Outbound => Direction::Outbound,
     }
 }
 
-fn product_proxy_response_direction(case: MitmBridgeCase) -> Direction {
+pub(super) fn product_proxy_response_direction(case: MitmBridgeCase) -> Direction {
     match product_proxy_request_direction(case) {
         Direction::Inbound => Direction::Outbound,
         Direction::Outbound => Direction::Inbound,

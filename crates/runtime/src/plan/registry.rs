@@ -8,11 +8,13 @@ const DEFAULT_L7_MITM_UNAVAILABLE_REASON: &str = concat!(
     "L7 MITM control-plane support exists for selector-scoped external or managed backends, ",
     "readiness probes, operator-managed client trust contracts, material refs, ",
     "plaintext bridge provenance, product proxy downstream and upstream TLS relay, ",
-    "downstream SNI propagation to upstream TLS server names, proxy-side policy hooks, ",
-    "and product proxy transparent inbound HTTPS deny-path validation, ",
+    "downstream SNI propagation to upstream TLS server names, explicit product proxy ",
+    "host-to-upstream routes, proxy-side policy hooks, ",
+    "and product proxy transparent inbound HTTPS routed allow-path and deny-path validation, ",
     "but no MITM backend is configured; default whole-machine transparent MITM is rejected, ",
-    "and ALPN-aware routing, hostname-to-upstream target routing, strong original attribution, ",
-    "automatic client trust store installation, and general transparent allow-path upstream routing remain unavailable"
+    "and ALPN-aware routing, wildcard or DNS-discovered upstream route selection, ",
+    "strong original attribution, automatic client trust store installation, ",
+    "and non-HTTP transparent allow-path matrices remain unavailable"
 );
 
 pub fn default_l7_mitm_unavailable_reason() -> &'static str {

@@ -1,8 +1,9 @@
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     num::NonZeroU16,
 };
 
+use probe_core::socket_addr_points_to_listener;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -15,7 +16,6 @@ use super::{
         MIN_TCP_HEALTH_PROBE_TIMEOUT_MS, TcpHealthProbeTimingFields,
         validate_tcp_health_probe_timing,
     },
-    normalized_ip_address,
 };
 
 pub const DEFAULT_TRANSPARENT_PROXY_HEALTH_PROBE_INTERVAL_MS: u64 =
@@ -605,14 +605,10 @@ fn health_probe_target_matches_managed_relay_listener(
     target: SocketAddr,
     listen_port: u16,
 ) -> bool {
-    target.port() == listen_port && is_local_listener_address(target.ip())
-}
-
-fn is_local_listener_address(address: IpAddr) -> bool {
-    match normalized_ip_address(address) {
-        IpAddr::V4(address) => address.is_loopback() || address.is_unspecified(),
-        IpAddr::V6(address) => address.is_loopback() || address.is_unspecified(),
-    }
+    socket_addr_points_to_listener(
+        target,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port),
+    )
 }
 
 pub(super) fn intent_violation(

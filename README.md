@@ -98,16 +98,18 @@ policy hook for proxy-side enforcement delegation.
 The first-party product proxy also has a transparent inbound HTTPS E2E path:
 TPROXY routes the client connection to the proxy, the proxy terminates
 downstream TLS with CA-backed dynamic SNI certificates, delegates a protective
-decision to the HTTP JSON hook, emits plaintext bridge events, returns the
-proxy-side deny response, and records the durable delegated decision.
+decision to the HTTP JSON hook, routes explicit allow-path hosts to configured
+upstream targets, emits plaintext bridge events, returns proxy-side responses,
+and records durable delegated decisions.
 CA-backed dynamic certificate mode requires downstream TLS clients to send DNS
 SNI. When upstream TLS is enabled, the product proxy uses that SNI as the
 upstream TLS server name unless an explicit upstream server name is pinned; it
-still connects to the configured or recovered target and does not perform
-hostname-to-upstream target routing.
+can also use the reconciled SNI or HTTP Host to select an explicit
+host-to-upstream route. Host/SNI mismatches fail closed, and route misses fall
+back to the configured or recovered target.
 The first-party `product_proxy` backend derives its proxy CLI from typed MITM
-readiness, bridge, policy hook, CA or leaf TLS material refs, and upstream trust
-material refs.
+readiness, bridge, policy hook, CA or leaf TLS material refs, upstream trust
+material refs, and host route tables.
 
 This keeps MITM out of the default capture path while still allowing operators
 to build controlled proxy/MITM deployments with auditable boundaries.
@@ -122,10 +124,11 @@ The following are intentional boundaries of the current implementation:
 - No default whole-host transparent MITM.
 - No automatic mutation of client trust stores; MITM client trust is an explicit
   operator-managed contract.
-- Transparent inbound HTTPS MITM is covered for the product proxy deny path.
-  ALPN-aware routing, hostname-to-upstream target routing, strong original
-  attribution, automatic trust-store mutation, and a general transparent
-  allow-path upstream routing matrix remain explicit capability boundaries.
+- Transparent inbound HTTPS MITM is covered for product proxy routed allow and
+  deny paths. ALPN-aware routing, wildcard or DNS-discovered upstream route
+  selection, strong original attribution, automatic trust-store mutation, and
+  non-HTTP transparent allow-path matrices remain explicit capability
+  boundaries.
 - No hidden long-term raw traffic retention.
 - No HTTP/2, HTTP/3, or QUIC parser yet.
 - WebSocket support emits handoff, frame metadata, and 16 MiB bounded

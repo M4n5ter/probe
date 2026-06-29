@@ -5,7 +5,7 @@ use probe_core::Direction;
 
 use crate::{
     MitmProxyError,
-    proxy::{MitmProxyConfig, TargetRecovery},
+    proxy::{MitmProxyConfig, TargetRecovery, UpstreamTargetRoute, UpstreamTargetRoutes},
     tls::{TlsTerminationConfig, UpstreamTlsConfig},
 };
 
@@ -23,6 +23,8 @@ pub struct Cli {
     pub pid_file: Option<PathBuf>,
     #[arg(long)]
     pub upstream: Option<SocketAddr>,
+    #[arg(long = "upstream-route", value_parser = parse_upstream_route)]
+    pub upstream_routes: Vec<UpstreamTargetRoute>,
     #[arg(long)]
     pub upstream_tls: bool,
     #[arg(long)]
@@ -114,12 +116,14 @@ impl TryFrom<Cli> for MitmProxyConfig {
         let upstream_tls = value.upstream_tls.then(|| {
             UpstreamTlsConfig::new(value.upstream_trust_anchor, value.upstream_server_name)
         });
+        let upstream_routes = UpstreamTargetRoutes::from_routes(value.upstream_routes)?;
         Ok(MitmProxyConfig {
             listen: value.listen,
             transparent_listen: value.transparent_listen,
             feed_path: value.feed,
             pid_file: value.pid_file,
             upstream: value.upstream,
+            upstream_routes,
             upstream_tls,
             upstream_socket_mark: value.upstream_socket_mark,
             tls,
@@ -179,6 +183,10 @@ fn parse_socket_mark(value: &str) -> Result<NonZeroU32, String> {
         .map_or_else(|| value.parse::<u32>(), |hex| u32::from_str_radix(hex, 16))
         .map_err(|error| format!("invalid socket mark {value:?}: {error}"))?;
     NonZeroU32::new(mark).ok_or_else(|| "socket mark must be non-zero".to_string())
+}
+
+fn parse_upstream_route(value: &str) -> Result<UpstreamTargetRoute, String> {
+    UpstreamTargetRoute::parse_cli_value(value).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -307,6 +315,60 @@ mod tests {
     }
 
     #[test]
+    fn upstream_routes_build_route_table() {
+        let route = parse_upstream_route("Example.Test=127.0.0.1:8443")
+            .expect("route argument should parse");
+        let config = MitmProxyConfig::try_from(Cli {
+            upstream_routes: vec![route],
+            ..minimal_cli()
+        })
+        .expect("route table should build");
+
+        assert_eq!(
+            config
+                .upstream_routes
+                .target_for_observed_authority(crate::authority::ObservedAuthority::from_parts(
+                    None,
+                    Some("example.test")
+                ))
+                .expect("route lookup should succeed"),
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 8443)))
+        );
+    }
+
+    #[test]
+    fn upstream_routes_reject_invalid_arguments() {
+        for value in [
+            "missing-separator",
+            "bad_host=127.0.0.1:8443",
+            "ok=bad",
+            "ok.example=127.0.0.1:0",
+        ] {
+            assert!(
+                parse_upstream_route(value).is_err(),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_routes_reject_duplicate_hosts() {
+        let route =
+            parse_upstream_route("example.test=127.0.0.1:8443").expect("first route should parse");
+        let duplicate = parse_upstream_route("EXAMPLE.TEST=127.0.0.1:8444")
+            .expect("duplicate route argument should parse before table validation");
+        let error = MitmProxyConfig::try_from(Cli {
+            upstream_routes: vec![route, duplicate],
+            ..minimal_cli()
+        })
+        .expect_err("duplicate route hosts must be rejected");
+
+        assert!(
+            matches!(error, MitmProxyError::InvalidConfig(reason) if reason.contains("duplicate upstream route host"))
+        );
+    }
+
+    #[test]
     fn upstream_socket_mark_accepts_hex_value() {
         let mark = parse_socket_mark("0x54500102").expect("hex socket mark should parse");
 
@@ -331,6 +393,7 @@ mod tests {
             feed: Path::new("/tmp/mitm-feed.jsonl").to_path_buf(),
             pid_file: None,
             upstream: None,
+            upstream_routes: Vec::new(),
             upstream_tls: false,
             upstream_trust_anchor: Vec::new(),
             upstream_server_name: None,

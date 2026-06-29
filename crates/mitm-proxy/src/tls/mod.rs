@@ -16,7 +16,7 @@ use rustls::{
     sign::CertifiedKey,
 };
 
-use crate::{MitmProxyError, error::io_error};
+use crate::{MitmProxyError, authority::UpstreamAuthorityCandidates, error::io_error};
 
 pub(crate) type TlsClientStream = StreamOwned<ClientConnection, TcpStream>;
 pub(crate) type TlsServerStream = StreamOwned<ServerConnection, TcpStream>;
@@ -69,93 +69,6 @@ impl UpstreamTlsConfig {
             server_name,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct UpstreamTlsNameCandidates<'a> {
-    configured_server_name: Option<&'a str>,
-    downstream_tls_server_name: Option<&'a str>,
-    http_host: Option<&'a str>,
-}
-
-impl<'a> UpstreamTlsNameCandidates<'a> {
-    pub(crate) fn observed(
-        downstream_tls_server_name: Option<&'a str>,
-        http_host: Option<&'a str>,
-    ) -> Self {
-        Self {
-            downstream_tls_server_name,
-            http_host,
-            ..Self::default()
-        }
-    }
-
-    fn with_configured_server_name(mut self, configured_server_name: Option<&'a str>) -> Self {
-        self.configured_server_name = configured_server_name;
-        self
-    }
-
-    fn resolve(self) -> Result<ServerName<'static>, MitmProxyError> {
-        let candidate = self
-            .ordered_candidates()
-            .into_iter()
-            .flatten()
-            .try_fold(None, |selected, candidate| {
-                selected_name_or_error(selected, candidate).map(Some)
-            })?
-            .ok_or_else(|| {
-                MitmProxyError::Tls(
-                    "upstream TLS requires a configured server name, downstream TLS SNI, or a single valid HTTP Host header".to_string(),
-                )
-            })?;
-        ServerName::try_from(candidate.name.to_string()).map_err(|error| {
-            MitmProxyError::Tls(format!(
-                "invalid upstream TLS server name {:?}: {error}",
-                candidate.name
-            ))
-        })
-    }
-
-    fn ordered_candidates(self) -> [Option<UpstreamTlsNameCandidate<'a>>; 3] {
-        [
-            self.configured_server_name
-                .map(|name| UpstreamTlsNameCandidate {
-                    label: "configured upstream TLS server name",
-                    name,
-                }),
-            self.downstream_tls_server_name
-                .map(|name| UpstreamTlsNameCandidate {
-                    label: "downstream TLS SNI",
-                    name,
-                }),
-            self.http_host.map(|name| UpstreamTlsNameCandidate {
-                label: "HTTP Host",
-                name,
-            }),
-        ]
-    }
-}
-
-#[derive(Clone, Copy)]
-struct UpstreamTlsNameCandidate<'a> {
-    label: &'static str,
-    name: &'a str,
-}
-
-fn selected_name_or_error<'a>(
-    selected: Option<UpstreamTlsNameCandidate<'a>>,
-    candidate: UpstreamTlsNameCandidate<'a>,
-) -> Result<UpstreamTlsNameCandidate<'a>, MitmProxyError> {
-    let Some(selected) = selected else {
-        return Ok(candidate);
-    };
-    if selected.name.eq_ignore_ascii_case(candidate.name) {
-        return Ok(selected);
-    }
-    Err(MitmProxyError::Tls(format!(
-        "{} {:?} does not match {} {:?}",
-        candidate.label, candidate.name, selected.label, selected.name
-    )))
 }
 
 pub(crate) struct TlsTerminator {
@@ -338,11 +251,16 @@ impl TlsUpstreamConnector {
     pub(crate) fn connect(
         &self,
         mut stream: TcpStream,
-        name_candidates: UpstreamTlsNameCandidates<'_>,
+        name_candidates: UpstreamAuthorityCandidates<'_>,
     ) -> Result<TlsClientStream, MitmProxyError> {
         let server_name = name_candidates
             .with_configured_server_name(self.server_name.as_deref())
-            .resolve()?;
+            .resolve_required()?;
+        let server_name = ServerName::try_from(server_name.to_string()).map_err(|error| {
+            MitmProxyError::Tls(format!(
+                "invalid upstream TLS server name {server_name:?}: {error}"
+            ))
+        })?;
         let mut connection = ClientConnection::new(Arc::clone(&self.config), server_name).map_err(
             tls_error("create MITM proxy upstream TLS client connection"),
         )?;
@@ -498,6 +416,8 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use crate::authority::UpstreamAuthorityCandidates;
+
     use super::*;
 
     #[test]
@@ -526,9 +446,9 @@ mod tests {
     fn upstream_tls_server_name_uses_downstream_sni_without_http_host()
     -> Result<(), Box<dyn std::error::Error>> {
         let server_name =
-            UpstreamTlsNameCandidates::observed(Some("sni.example"), None).resolve()?;
+            UpstreamAuthorityCandidates::observed(Some("sni.example"), None).resolve_required()?;
 
-        assert_eq!(server_name.to_str().as_ref(), "sni.example");
+        assert_eq!(server_name, "sni.example");
         Ok(())
     }
 
@@ -536,17 +456,18 @@ mod tests {
     fn upstream_tls_server_name_uses_http_host_without_downstream_sni()
     -> Result<(), Box<dyn std::error::Error>> {
         let server_name =
-            UpstreamTlsNameCandidates::observed(None, Some("host.example")).resolve()?;
+            UpstreamAuthorityCandidates::observed(None, Some("host.example")).resolve_required()?;
 
-        assert_eq!(server_name.to_str().as_ref(), "host.example");
+        assert_eq!(server_name, "host.example");
         Ok(())
     }
 
     #[test]
     fn upstream_tls_server_name_rejects_downstream_sni_http_host_mismatch() {
-        let error = UpstreamTlsNameCandidates::observed(Some("sni.example"), Some("host.example"))
-            .resolve()
-            .expect_err("SNI and HTTP Host mismatch must fail closed");
+        let error =
+            UpstreamAuthorityCandidates::observed(Some("sni.example"), Some("host.example"))
+                .resolve_required()
+                .expect_err("SNI and HTTP Host mismatch must fail closed");
 
         assert!(
             error
@@ -558,9 +479,9 @@ mod tests {
 
     #[test]
     fn upstream_tls_server_name_rejects_configured_name_mismatch() {
-        let error = UpstreamTlsNameCandidates::observed(Some("sni.example"), None)
+        let error = UpstreamAuthorityCandidates::observed(Some("sni.example"), None)
             .with_configured_server_name(Some("pinned.example"))
-            .resolve()
+            .resolve_required()
             .expect_err("configured upstream TLS name must pin observed SNI");
 
         assert!(

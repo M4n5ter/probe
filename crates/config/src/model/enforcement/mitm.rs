@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     num::NonZeroU16,
     path::PathBuf,
@@ -6,6 +7,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use url::Url;
+
+use probe_core::{UpstreamRoute, UpstreamRouteHost, socket_addr_points_to_listener};
 
 use super::{
     EnforcementInterceptionConfig, TransparentInterceptionIntentViolation,
@@ -203,12 +206,20 @@ impl TransparentInterceptionMitmManagedProcessConfig {
 pub struct TransparentInterceptionMitmProductProxyConfig {
     pub program: Option<PathBuf>,
     pub working_dir: Option<PathBuf>,
+    pub upstream_routes: Vec<TransparentInterceptionMitmProductProxyUpstreamRouteConfig>,
 }
 
 impl TransparentInterceptionMitmProductProxyConfig {
     pub fn is_configured(&self) -> bool {
-        self.program.is_some() || self.working_dir.is_some()
+        self.program.is_some() || self.working_dir.is_some() || !self.upstream_routes.is_empty()
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
+    pub host: String,
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +314,13 @@ pub struct TransparentInterceptionMitmManagedProcessIntent {
 pub struct TransparentInterceptionMitmProductProxyIntent {
     pub program: PathBuf,
     pub working_dir: Option<PathBuf>,
+    pub upstream_routes: Vec<TransparentInterceptionMitmProductProxyUpstreamRouteIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransparentInterceptionMitmProductProxyUpstreamRouteIntent {
+    pub host: String,
+    pub target: SocketAddr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,6 +427,11 @@ impl EnforcementInterceptionConfig {
                 );
                 match (process, readiness_probe) {
                     (Some(process), Some(readiness_probe)) => {
+                        validate_mitm_product_proxy_routes_do_not_target_listener(
+                            &process.upstream_routes,
+                            &readiness_probe,
+                            &mut violations,
+                        );
                         Some(TransparentInterceptionMitmBackendIntent::ProductProxy {
                             process,
                             readiness_probe,
@@ -538,10 +561,109 @@ fn validate_mitm_product_proxy_process(
         "product MITM proxy",
         violations,
     );
+    let upstream_routes = validate_mitm_product_proxy_upstream_routes(
+        &process.upstream_routes,
+        "enforcement.interception.mitm.backend.process.upstream_routes",
+        violations,
+    );
     Some(TransparentInterceptionMitmProductProxyIntent {
         program,
         working_dir: process.working_dir.clone(),
+        upstream_routes,
     })
+}
+
+fn validate_mitm_product_proxy_upstream_routes(
+    routes: &[TransparentInterceptionMitmProductProxyUpstreamRouteConfig],
+    field: &'static str,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) -> Vec<TransparentInterceptionMitmProductProxyUpstreamRouteIntent> {
+    let mut intents = Vec::new();
+    let mut seen_hosts = HashSet::new();
+    for (index, route) in routes.iter().enumerate() {
+        let host = validate_product_proxy_upstream_route_host(route, field, index, violations);
+        let target = validate_product_proxy_upstream_route_target(route, field, index, violations);
+        let Some(host) = host else {
+            continue;
+        };
+        if !seen_hosts.insert(host.clone()) {
+            violations.push(intent_violation(
+                field,
+                format!("product MITM proxy upstream route host {host} is duplicated"),
+            ));
+        }
+        if let Some(target) = target {
+            intents.push(TransparentInterceptionMitmProductProxyUpstreamRouteIntent {
+                host: host.as_str().to_string(),
+                target,
+            });
+        }
+    }
+    intents
+}
+
+fn validate_mitm_product_proxy_routes_do_not_target_listener(
+    routes: &[TransparentInterceptionMitmProductProxyUpstreamRouteIntent],
+    readiness_probe: &TransparentInterceptionMitmBackendReadinessProbeIntent,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) {
+    let TransparentInterceptionMitmBackendReadinessProbeIntent::TcpConnect { target, .. } =
+        readiness_probe;
+    for route in routes {
+        if socket_addr_points_to_listener(route.target, *target) {
+            violations.push(intent_violation(
+                "enforcement.interception.mitm.backend.process.upstream_routes",
+                format!(
+                    "product MITM proxy upstream route host {:?} target must not point back to the proxy listener",
+                    route.host
+                ),
+            ));
+        }
+    }
+}
+
+fn validate_product_proxy_upstream_route_host(
+    route: &TransparentInterceptionMitmProductProxyUpstreamRouteConfig,
+    field: &'static str,
+    index: usize,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) -> Option<UpstreamRouteHost> {
+    let host = route.host.trim();
+    if host.is_empty() {
+        violations.push(intent_violation(
+            field,
+            format!("product MITM proxy upstream route {index} host must not be empty"),
+        ));
+        return None;
+    }
+    match UpstreamRouteHost::parse(host) {
+        Ok(host) => Some(host),
+        Err(error) => {
+            violations.push(intent_violation(
+                field,
+                format!("product MITM proxy upstream route {index} {error}"),
+            ));
+            None
+        }
+    }
+}
+
+fn validate_product_proxy_upstream_route_target(
+    route: &TransparentInterceptionMitmProductProxyUpstreamRouteConfig,
+    field: &'static str,
+    index: usize,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) -> Option<SocketAddr> {
+    match UpstreamRoute::parse_target(&route.target) {
+        Ok(target) => Some(target),
+        Err(error) => {
+            violations.push(intent_violation(
+                field,
+                format!("product MITM proxy upstream route {index} {error}"),
+            ));
+            None
+        }
+    }
 }
 
 fn validate_mitm_process_program(

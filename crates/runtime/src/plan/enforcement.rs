@@ -15,8 +15,9 @@ use probe_config::{
     TransparentInterceptionMitmPlaintextBridgeIntent,
     TransparentInterceptionMitmPolicyHookEndpointIntent,
     TransparentInterceptionMitmPolicyHookIntent, TransparentInterceptionMitmPolicyHookModeConfig,
-    TransparentInterceptionMitmProductProxyIntent, TransparentInterceptionOutboundProxyIntent,
-    TransparentInterceptionOutboundProxyModeIntent,
+    TransparentInterceptionMitmProductProxyIntent,
+    TransparentInterceptionMitmProductProxyUpstreamRouteIntent,
+    TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent,
     TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
     TransparentInterceptionProxyIntentViolation, TransparentInterceptionProxyModeConfig,
@@ -640,9 +641,10 @@ impl TransparentInterceptionMitmManagedProcessPlan {
         intent: TransparentInterceptionMitmProductProxyIntent,
         cli_builder: ProductProxyCliBuilder<'_>,
     ) -> Self {
+        let args = cli_builder.args(&intent.upstream_routes);
         Self {
             program: intent.program,
-            args: cli_builder.args(),
+            args,
             working_dir: intent.working_dir,
         }
     }
@@ -669,7 +671,10 @@ enum ProductProxyTlsTerminationSource<'a> {
 }
 
 impl ProductProxyCliBuilder<'_> {
-    fn args(&self) -> Vec<String> {
+    fn args(
+        &self,
+        upstream_routes: &[TransparentInterceptionMitmProductProxyUpstreamRouteIntent],
+    ) -> Vec<String> {
         let mut args = vec![
             "--listen".to_string(),
             self.readiness_probe.target().to_string(),
@@ -691,6 +696,12 @@ impl ProductProxyCliBuilder<'_> {
             args.extend([
                 "--upstream-socket-mark".to_string(),
                 format!("0x{:x}", mark.get()),
+            ]);
+        }
+        for route in upstream_routes {
+            args.extend([
+                "--upstream-route".to_string(),
+                upstream_route_cli_value(route),
             ]);
         }
         if let TransparentInterceptionMitmPolicyHookPlan::HttpJson {
@@ -738,6 +749,12 @@ impl ProductProxyCliBuilder<'_> {
         }
         args
     }
+}
+
+fn upstream_route_cli_value(
+    route: &TransparentInterceptionMitmProductProxyUpstreamRouteIntent,
+) -> String {
+    format!("{}={}", route.host, route.target)
 }
 
 fn direction_cli_value(direction: Direction) -> &'static str {
@@ -1212,7 +1229,9 @@ mod tests {
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionMitmPolicyHookConfig,
         TransparentInterceptionMitmPolicyHookModeConfig,
-        TransparentInterceptionMitmProductProxyConfig, TransparentInterceptionStrategyConfig,
+        TransparentInterceptionMitmProductProxyConfig,
+        TransparentInterceptionMitmProductProxyUpstreamRouteConfig,
+        TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
         CapabilityMatrix, CapabilityState, Direction, ProcessSelector, Selector, TrafficSelector,
@@ -1695,6 +1714,49 @@ mod tests {
     }
 
     #[test]
+    fn product_proxy_mitm_backend_synthesizes_upstream_route_args()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_product_proxy_mitm_backend(&mut config);
+        let TransparentInterceptionMitmBackendConfig::ProductProxy { process, .. } =
+            &mut config.enforcement.interception.mitm.backend
+        else {
+            panic!("test fixture should use product proxy");
+        };
+        process.upstream_routes =
+            vec![TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
+                host: "Route.Example".to_string(),
+                target: "127.0.0.1:18443".to_string(),
+            }];
+        let capabilities = CapabilityMatrix::new([
+            CapabilityState::available(CapabilityKind::TransparentInterception),
+            CapabilityState::available(CapabilityKind::L7Mitm),
+            CapabilityState::available(CapabilityKind::CaptureEventFeed),
+        ]);
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let TransparentInterceptionMitmBackendPlan::ProductProxy { process, .. } =
+            &plan.interception.mitm.backend
+        else {
+            panic!(
+                "product MITM proxy plan should be preserved: {:?}",
+                plan.interception.mitm.backend
+            );
+        };
+
+        assert!(args_contain_pair(
+            &process.args,
+            "--upstream-route",
+            "route.example=127.0.0.1:18443"
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn outbound_product_proxy_mitm_backend_synthesizes_outbound_direction()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut config = AgentConfig::default();
@@ -2088,6 +2150,7 @@ mod tests {
         let process = TransparentInterceptionMitmProductProxyConfig {
             program: Some("/usr/local/bin/traffic-probe-mitm-proxy".into()),
             working_dir: Some("/run/traffic-probe".into()),
+            upstream_routes: Vec::new(),
         };
         config.enforcement.interception.mitm.backend =
             TransparentInterceptionMitmBackendConfig::product_proxy(readiness_probe, process);

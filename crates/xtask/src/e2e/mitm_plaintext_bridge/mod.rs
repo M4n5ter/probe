@@ -341,7 +341,13 @@ fn exercise_backend_data_plane(
             exercise_managed_plaintext_data_plane(case, mitm_backend, intercept_port)
         }
         MitmDataPlaneExercise::ProductProxyTransparentTls => {
-            exercise_product_proxy_transparent_tls_path(case, supervisor, intercept_port, mitm_ca)
+            exercise_product_proxy_transparent_tls_path(
+                case,
+                supervisor,
+                intercept_port,
+                mitm_ca,
+                mitm_backend,
+            )
         }
     }
 }

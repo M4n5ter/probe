@@ -1,3 +1,4 @@
+mod authority;
 mod cli;
 mod error;
 mod feed;
@@ -8,7 +9,9 @@ mod tls;
 
 pub use cli::Cli;
 pub use error::MitmProxyError;
-pub use proxy::{MitmProxyConfig, MitmProxyGuard, TargetRecovery};
+pub use proxy::{
+    MitmProxyConfig, MitmProxyGuard, TargetRecovery, UpstreamTargetRoute, UpstreamTargetRoutes,
+};
 pub use tls::{TlsTerminationConfig, UpstreamTlsConfig};
 
 pub fn run_cli() -> Result<(), MitmProxyError> {

@@ -38,6 +38,8 @@ pub use mitm::{
     TransparentInterceptionMitmPolicyHookEndpointIntent,
     TransparentInterceptionMitmPolicyHookIntent, TransparentInterceptionMitmPolicyHookModeConfig,
     TransparentInterceptionMitmProductProxyConfig, TransparentInterceptionMitmProductProxyIntent,
+    TransparentInterceptionMitmProductProxyUpstreamRouteConfig,
+    TransparentInterceptionMitmProductProxyUpstreamRouteIntent,
 };
 pub use policy::{
     DEFAULT_REMOTE_ENFORCEMENT_POLICY_BODY_LIMIT_BYTES, EnforcementPolicyConfig,

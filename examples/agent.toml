@@ -173,9 +173,9 @@ strategy = "none"
 # ca_private_key_ref = "mitm-ca-key"
 # CA-backed product proxy TLS termination requires downstream clients to send
 # DNS SNI. The product proxy also uses that SNI as the upstream TLS server name
-# when upstream TLS is enabled, but it still connects to the configured or
-# recovered target instead of routing by hostname. Or use a fixed leaf
-# certificate instead of the CA pair:
+# when upstream TLS is enabled, unless upstream_server_name is pinned. Explicit
+# upstream routes can map reconciled SNI/HTTP Host values to upstream IP socket
+# targets. Or use a fixed leaf certificate instead of the CA pair:
 # leaf_certificate_chain_refs = ["mitm-leaf"]
 # leaf_private_key_ref = "mitm-leaf-key"
 # upstream_trust_anchor_refs = ["upstream-ca"]
@@ -196,6 +196,10 @@ mode = "disabled"
 # [enforcement.interception.mitm.backend.process]
 # program = "/usr/local/bin/traffic-probe-mitm-proxy"
 # working_dir = "/run/traffic-probe"
+#
+# [[enforcement.interception.mitm.backend.process.upstream_routes]]
+# host = "service.example.com"
+# target = "127.0.0.1:18443"
 #
 # [enforcement.interception.mitm.backend.readiness_probe]
 # target = "127.0.0.1:15001"

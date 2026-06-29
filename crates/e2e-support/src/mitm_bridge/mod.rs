@@ -20,6 +20,11 @@ pub const POLICY_HOOK_ACCEPT: &str = "application/json";
 pub const POLICY_HOOK_RESPONSE_REASON: &str = "e2e MITM policy hook delegated deny";
 pub const REQUEST_BYTES: &[u8] =
     b"GET /mitm-bridge/e2e HTTP/1.1\r\nHost: mitm-bridge.e2e.test\r\n\r\n";
+pub const ALLOW_REQUEST_TARGET: &str = "/mitm-bridge/allow";
+pub const ALLOW_REQUEST_BYTES: &[u8] =
+    b"GET /mitm-bridge/allow HTTP/1.1\r\nHost: mitm-bridge.e2e.test\r\n\r\n";
+pub const ALLOW_RESPONSE_BYTES: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\nrouted-upstream";
 pub const PASSTHROUGH_RESPONSE_BYTES: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 pub const DENY_RESPONSE_BYTES: &[u8] =

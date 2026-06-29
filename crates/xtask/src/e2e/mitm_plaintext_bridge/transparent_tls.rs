@@ -1,5 +1,6 @@
 use std::{
-    io::Write,
+    fs,
+    io::{self, Write},
     net::Ipv4Addr,
     process::{Child, Command, Stdio},
     thread,
@@ -14,7 +15,7 @@ use signal_hook::{
 use e2e_support::mitm_bridge;
 
 use super::{
-    backend::MitmBridgeCase,
+    backend::{MitmBridgeCase, PreparedMitmBackend, ProductProxyUpstreamRoute},
     feed::product_proxy_deny_response_bytes,
     tls::{MitmCaMaterial, SERVER_NAME},
 };
@@ -31,6 +32,7 @@ const HOST_ADDR: Ipv4Addr = Ipv4Addr::new(10, 89, 0, 1);
 const CLIENT_ADDR: Ipv4Addr = Ipv4Addr::new(10, 89, 0, 2);
 const CLIENT_NAMESPACE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+const UPSTREAM_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) fn run_client_namespace_owner() -> Result<(), Box<dyn std::error::Error>> {
     ip(["link", "set", "lo", "up"])?;
@@ -44,6 +46,7 @@ pub(super) fn exercise_product_proxy_transparent_tls_path(
     supervisor: &ChildSupervisor,
     intercept_port: u16,
     mitm_ca: &MitmCaMaterial,
+    mitm_backend: &PreparedMitmBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut client_namespace = supervisor.watch(
         spawn_client_namespace_owner(case)?,
@@ -52,7 +55,24 @@ pub(super) fn exercise_product_proxy_transparent_tls_path(
     let client_pid = client_namespace.child_mut().id();
     wait_for_client_namespace_ready(client_namespace.child_mut())?;
     let _network = IsolatedClientNetwork::setup(client_pid)?;
-    let response = run_tls_client(client_pid, intercept_port, mitm_ca)?;
+    let upstream_route = product_proxy_upstream_route(mitm_backend)?;
+    let upstream = ProductProxyTlsUpstreamServer::start(upstream_route)?;
+    let response = run_tls_client(
+        client_pid,
+        intercept_port,
+        mitm_ca,
+        mitm_bridge::ALLOW_REQUEST_BYTES,
+    );
+    let upstream_result = upstream.wait();
+    let response = response?;
+    assert_tls_client_received_allow_response(&response)?;
+    upstream_result?;
+    let response = run_tls_client(
+        client_pid,
+        intercept_port,
+        mitm_ca,
+        mitm_bridge::REQUEST_BYTES,
+    )?;
     assert_tls_client_received_deny_response(&response)?;
     let client_namespace_result = stop_running_child(
         client_namespace.child_mut(),
@@ -60,6 +80,20 @@ pub(super) fn exercise_product_proxy_transparent_tls_path(
     );
     client_namespace.unwatch();
     client_namespace_result
+}
+
+fn product_proxy_upstream_route(
+    mitm_backend: &PreparedMitmBackend,
+) -> Result<&ProductProxyUpstreamRoute, Box<dyn std::error::Error>> {
+    match &mitm_backend.config {
+        super::backend::MitmBackendConfig::ProductProxy { upstream_route, .. } => {
+            Ok(upstream_route)
+        }
+        config => Err(e2e_error(format!(
+            "product proxy transparent TLS exercise received non-product backend {config:?}"
+        ))
+        .into()),
+    }
 }
 
 fn spawn_client_namespace_owner(case: MitmBridgeCase) -> Result<Child, Box<dyn std::error::Error>> {
@@ -152,6 +186,7 @@ fn run_tls_client(
     client_pid: u32,
     intercept_port: u16,
     mitm_ca: &MitmCaMaterial,
+    request: &[u8],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let connect = format!("{HOST_ADDR}:{intercept_port}");
     let mut child = Command::new(nsenter_command()?)
@@ -175,8 +210,8 @@ fn run_tls_client(
         .stdin
         .take()
         .ok_or_else(|| e2e_error("failed to open openssl s_client stdin"))?
-        .write_all(mitm_bridge::REQUEST_BYTES)?;
-    let output = wait_with_timeout(child, CLIENT_TIMEOUT)?;
+        .write_all(request)?;
+    let output = wait_child_with_timeout(child, CLIENT_TIMEOUT, "MITM transparent TLS client")?;
     if output.status.success() {
         Ok(output.stdout)
     } else {
@@ -187,6 +222,75 @@ fn run_tls_client(
         ))
         .into())
     }
+}
+
+struct ProductProxyTlsUpstreamServer {
+    child: Option<Child>,
+}
+
+impl ProductProxyTlsUpstreamServer {
+    fn start(route: &ProductProxyUpstreamRoute) -> Result<Self, Box<dyn std::error::Error>> {
+        let target = route.target.to_string();
+        let mut child = Command::new(openssl_command()?)
+            .args(["s_server", "-accept", &target])
+            .arg("-cert")
+            .arg(&route.certificate_path)
+            .arg("-key")
+            .arg(&route.private_key_path)
+            .args(["-HTTP", "-quiet", "-naccept", "1"])
+            .current_dir(&route.document_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        wait_for_upstream_tls_server_ready(&mut child, route.target)?;
+        Ok(Self { child: Some(child) })
+    }
+
+    fn wait(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let output = wait_child_with_timeout(
+            self.child
+                .take()
+                .ok_or_else(|| e2e_error("product proxy upstream TLS fixture already waited"))?,
+            CLIENT_TIMEOUT,
+            "product proxy upstream TLS fixture",
+        )?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(e2e_error(format!(
+            "product proxy upstream TLS fixture failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into())
+    }
+}
+
+impl Drop for ProductProxyTlsUpstreamServer {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn assert_tls_client_received_allow_response(
+    response: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if response == mitm_bridge::ALLOW_RESPONSE_BYTES {
+        return Ok(());
+    }
+    Err(e2e_error(format!(
+        "MITM transparent TLS allow response mismatch: expected {:?}, got {:?}",
+        String::from_utf8_lossy(mitm_bridge::ALLOW_RESPONSE_BYTES),
+        String::from_utf8_lossy(response)
+    ))
+    .into())
 }
 
 fn assert_tls_client_received_deny_response(
@@ -204,9 +308,61 @@ fn assert_tls_client_received_deny_response(
     .into())
 }
 
-fn wait_with_timeout(
+fn wait_for_upstream_tls_server_ready(
+    child: &mut Child,
+    target: std::net::SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + UPSTREAM_READY_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(e2e_error(format!(
+                "product proxy upstream TLS fixture exited before readiness with {status}"
+            ))
+            .into());
+        }
+        if tcp_listen_port_is_ready(target.port())? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(e2e_error(format!(
+                "timed out waiting for product proxy upstream TLS fixture to listen on {target}"
+            ))
+            .into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn tcp_listen_port_is_ready(port: u16) -> io::Result<bool> {
+    Ok(proc_tcp_has_listen_port("/proc/net/tcp", port)?
+        || proc_tcp_has_listen_port("/proc/net/tcp6", port)?)
+}
+
+fn proc_tcp_has_listen_port(path: &str, port: u16) -> io::Result<bool> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let port_suffix = format!(":{port:04X}");
+    Ok(content.lines().skip(1).any(|line| {
+        let mut fields = line.split_whitespace();
+        let _slot = fields.next();
+        let Some(local_address) = fields.next() else {
+            return false;
+        };
+        let _remote_address = fields.next();
+        let Some(state) = fields.next() else {
+            return false;
+        };
+        state == "0A" && local_address.ends_with(&port_suffix)
+    }))
+}
+
+fn wait_child_with_timeout(
     mut child: Child,
     timeout: Duration,
+    label: &str,
 ) -> Result<std::process::Output, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -216,11 +372,9 @@ fn wait_with_timeout(
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(e2e_error(format!(
-                "MITM transparent TLS client timed out after {}ms",
-                timeout.as_millis()
-            ))
-            .into());
+            return Err(
+                e2e_error(format!("{label} timed out after {}ms", timeout.as_millis())).into(),
+            );
         }
         thread::sleep(Duration::from_millis(20));
     }

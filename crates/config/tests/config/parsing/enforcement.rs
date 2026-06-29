@@ -330,6 +330,10 @@ target = "127.0.0.1:15002"
 program = "/usr/local/bin/traffic-probe-mitm-proxy"
 working_dir = "/run/traffic-probe"
 
+[[enforcement.interception.mitm.backend.process.upstream_routes]]
+host = "Route.Example"
+target = "127.0.0.1:18443"
+
 [[tls.materials]]
 id = "mitm-leaf"
 kind = "mitm_leaf_certificate"
@@ -357,6 +361,9 @@ path = "/etc/traffic-probe/mitm-leaf.key"
         process.working_dir.as_deref(),
         Some(std::path::Path::new("/run/traffic-probe"))
     );
+    assert_eq!(process.upstream_routes.len(), 1);
+    assert_eq!(process.upstream_routes[0].host, "Route.Example");
+    assert_eq!(process.upstream_routes[0].target, "127.0.0.1:18443");
     Ok(())
 }
 

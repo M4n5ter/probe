@@ -57,6 +57,8 @@ pub use enforcement::{
     TransparentInterceptionMitmPolicyHookEndpointIntent,
     TransparentInterceptionMitmPolicyHookIntent, TransparentInterceptionMitmPolicyHookModeConfig,
     TransparentInterceptionMitmProductProxyConfig, TransparentInterceptionMitmProductProxyIntent,
+    TransparentInterceptionMitmProductProxyUpstreamRouteConfig,
+    TransparentInterceptionMitmProductProxyUpstreamRouteIntent,
     TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent, TransparentInterceptionProxyConfig,
     TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionProxyHealthProbeIntent,

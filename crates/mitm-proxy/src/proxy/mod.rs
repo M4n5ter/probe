@@ -3,12 +3,13 @@ mod downstream;
 mod fixtures;
 mod listener;
 mod policy_hook;
+mod route;
 mod upstream;
 
 use std::{
     fs::OpenOptions,
     io::{Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     num::NonZeroU32,
     path::PathBuf,
     sync::{
@@ -20,11 +21,12 @@ use std::{
 };
 
 use clap::ValueEnum;
-use probe_core::Direction;
+use probe_core::{Direction, socket_addr_points_to_listener};
 use socket2::Socket;
 
 use crate::{
     MitmProxyError,
+    authority::ObservedAuthority,
     error::io_error,
     feed::{CaptureEventFeedWriter, FlowOffsets},
     flow::{FlowFactory, FlowRegistry, ProxyAction},
@@ -46,6 +48,7 @@ pub struct MitmProxyConfig {
     pub feed_path: PathBuf,
     pub pid_file: Option<PathBuf>,
     pub upstream: Option<SocketAddr>,
+    pub upstream_routes: UpstreamTargetRoutes,
     pub upstream_tls: Option<UpstreamTlsConfig>,
     pub upstream_socket_mark: Option<NonZeroU32>,
     pub tls: Option<TlsTerminationConfig>,
@@ -57,6 +60,8 @@ pub struct MitmProxyConfig {
     pub io_timeout: Duration,
     pub action_timeout: Duration,
 }
+
+pub use self::route::{UpstreamTargetRoute, UpstreamTargetRoutes};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum TargetRecovery {
@@ -176,6 +181,13 @@ fn validate_config(config: &MitmProxyConfig) -> Result<(), MitmProxyError> {
         return Err(MitmProxyError::InvalidConfig(
             "max_request_bytes must be greater than zero".to_string(),
         ));
+    }
+    for (host, target) in config.upstream_routes.iter() {
+        if socket_addr_points_to_listener(target, config.listen) {
+            return Err(MitmProxyError::InvalidConfig(format!(
+                "upstream route {host:?} target must not point back to the MITM proxy listener"
+            )));
+        }
     }
     Ok(())
 }
@@ -371,15 +383,23 @@ fn forward_or_gateway_response(
     offsets: &mut FlowOffsets,
 ) -> Result<(), MitmProxyError> {
     let config = &state.config;
-    if is_self_target(target, config.listen) {
+    let authority = match observed_authority_for_request(
+        config,
+        &state.upstream,
+        downstream_tls_server_name,
+        &request,
+    ) {
+        Ok(authority) => authority,
+        Err(_) => return write_empty_response(downstream, 502),
+    };
+    let target = match upstream_target_for_request(config, target, authority) {
+        Ok(target) => target,
+        Err(_) => return write_empty_response(downstream, 502),
+    };
+    if socket_addr_points_to_listener(target, config.listen) {
         return write_empty_response(downstream, 200);
     }
-    match state.upstream.connect(
-        target,
-        &request,
-        downstream_tls_server_name,
-        config.io_timeout,
-    ) {
+    match state.upstream.connect(target, authority, config.io_timeout) {
         Ok(mut upstream) => {
             upstream
                 .write_all(&request.raw)
@@ -400,6 +420,33 @@ fn forward_or_gateway_response(
         }
         Err(_) => write_empty_response(downstream, 502),
     }
+}
+
+fn upstream_target_for_request(
+    config: &MitmProxyConfig,
+    recovered_target: SocketAddr,
+    authority: ObservedAuthority<'_>,
+) -> Result<SocketAddr, MitmProxyError> {
+    if config.upstream_routes.is_empty() {
+        return Ok(recovered_target);
+    }
+    Ok(config
+        .upstream_routes
+        .target_for_observed_authority(authority)?
+        .unwrap_or(recovered_target))
+}
+
+fn observed_authority_for_request<'a>(
+    config: &MitmProxyConfig,
+    upstream: &UpstreamConnector,
+    downstream_tls_server_name: Option<&'a str>,
+    request: &'a HttpMessage,
+) -> Result<ObservedAuthority<'a>, MitmProxyError> {
+    ObservedAuthority::from_request(
+        downstream_tls_server_name,
+        request,
+        !config.upstream_routes.is_empty() || upstream.uses_tls(),
+    )
 }
 
 fn relay_response(
@@ -433,13 +480,6 @@ fn response_direction(request_direction: Direction) -> Direction {
         Direction::Inbound => Direction::Outbound,
         Direction::Outbound => Direction::Inbound,
     }
-}
-
-fn is_self_target(target: SocketAddr, listen: SocketAddr) -> bool {
-    target.port() == listen.port()
-        && (target.ip() == listen.ip()
-            || target.ip().is_loopback() && listen.ip().is_loopback()
-            || target.ip() == Ipv4Addr::UNSPECIFIED)
 }
 
 #[cfg(test)]
@@ -604,6 +644,76 @@ mod tests {
         assert_eq!(
             feed_direction_bytes(&feed_path, Direction::Inbound)?,
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_route_uses_http_host_to_select_target() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let route_target = upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nrouted")?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let mut config = test_config(listen, &feed_path, None, None, None, Duration::from_secs(2));
+        config.upstream_routes = UpstreamTargetRoutes::from_routes([UpstreamTargetRoute::new(
+            "Route.Example",
+            route_target,
+        )?])?;
+        let guard = start_test_proxy(config, data_listener, None)?;
+
+        let mut stream = TcpStream::connect(listen)?;
+        stream.write_all(b"GET /route HTTP/1.1\r\nHost: route.example\r\n\r\n")?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nrouted"
+        );
+        assert!(feed_has_bytes(
+            &feed_path,
+            Direction::Outbound,
+            b"GET /route HTTP/1.1\r\nHost: route.example\r\n\r\n"
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_route_miss_falls_back_for_unsupported_http_authority() -> Result<(), Box<dyn Error>>
+    {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let fallback_target =
+            upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nfallback")?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let mut config = test_config(
+            listen,
+            &feed_path,
+            Some(fallback_target),
+            None,
+            None,
+            Duration::from_secs(2),
+        );
+        config.upstream_routes = UpstreamTargetRoutes::from_routes([UpstreamTargetRoute::new(
+            "Route.Example",
+            "127.0.0.1:8443".parse()?,
+        )?])?;
+        let guard = start_test_proxy(config, data_listener, None)?;
+
+        let mut stream = TcpStream::connect(listen)?;
+        stream.write_all(b"GET /fallback HTTP/1.1\r\nHost: [::1]:8443\r\n\r\n")?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nfallback"
         );
         Ok(())
     }

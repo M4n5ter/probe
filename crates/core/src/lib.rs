@@ -30,7 +30,10 @@ pub use selector::{
     CompiledSelector, ProcessSelector, Selector, SelectorError, SelectorRegistry, SelectorTerm,
     TrafficSelector,
 };
-pub use socket::{TcpConnection, TcpEndpoint};
+pub use socket::{
+    TcpConnection, TcpEndpoint, UpstreamRoute, UpstreamRouteError, UpstreamRouteHost,
+    socket_addr_points_to_listener,
+};
 pub use verdict::{
     Action, EnforcementDecision, EnforcementExecutionEvidence, EnforcementMode, EnforcementOutcome,
     ProtectiveActionError, ProtectiveActionProfile, ProxySideEnforcementSurface, Verdict,

@@ -21,6 +21,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use e2e_support::mitm_bridge;
 
 use super::super::harness::{debug_binary, e2e_error};
+use super::tls;
 
 pub(super) const EXTERNAL_INBOUND_CASE_NAME: &str = "e2e-mitm-plaintext-bridge-live-sidecar";
 pub(super) const POLICY_HOOK_INBOUND_CASE_NAME: &str =
@@ -378,7 +379,17 @@ pub(super) enum MitmBackendConfig {
     ProductProxy {
         target: String,
         program: PathBuf,
+        upstream_route: ProductProxyUpstreamRoute,
     },
+}
+
+#[derive(Debug)]
+pub(super) struct ProductProxyUpstreamRoute {
+    pub(super) host: String,
+    pub(super) target: SocketAddr,
+    pub(super) certificate_path: PathBuf,
+    pub(super) private_key_path: PathBuf,
+    pub(super) document_root: PathBuf,
 }
 
 pub(super) fn prepare_mitm_backend(
@@ -392,7 +403,7 @@ pub(super) fn prepare_mitm_backend(
         MitmBackendKind::ManagedProcess => {
             prepare_managed_process_backend(case, root, bridge_feed_path, used_ports)
         }
-        MitmBackendKind::ProductProxy => prepare_product_proxy_backend(used_ports),
+        MitmBackendKind::ProductProxy => prepare_product_proxy_backend(root, used_ports),
     }
 }
 
@@ -513,12 +524,20 @@ fn prepare_managed_process_backend(
 }
 
 fn prepare_product_proxy_backend(
+    root: &Path,
     used_ports: impl IntoIterator<Item = u16>,
 ) -> Result<PreparedMitmBackend, Box<dyn std::error::Error>> {
     let used_ports = used_ports.into_iter().collect::<BTreeSet<_>>();
     let target = managed_backend_target(used_ports.iter().copied())?;
     let policy_hook_target =
         managed_policy_hook_target(used_ports.iter().copied().chain([target.port()]))?;
+    let upstream_target = product_proxy_upstream_target(
+        used_ports
+            .iter()
+            .copied()
+            .chain([target.port(), policy_hook_target.port()]),
+    )?;
+    let upstream_route = prepare_product_proxy_upstream_route(root, upstream_target)?;
     Ok(PreparedMitmBackend {
         proxy_port: target.port(),
         policy_hook_endpoint: Some(format!(
@@ -529,8 +548,41 @@ fn prepare_product_proxy_backend(
         config: MitmBackendConfig::ProductProxy {
             target: target.to_string(),
             program: debug_binary("traffic-probe-mitm-proxy")?,
+            upstream_route,
         },
         external_backend: None,
+    })
+}
+
+fn product_proxy_upstream_target(
+    used_ports: impl IntoIterator<Item = u16>,
+) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    deterministic_loopback_target(
+        DEFAULT_MANAGED_BACKEND_PORT - 10,
+        used_ports,
+        "product proxy upstream",
+    )
+}
+
+fn prepare_product_proxy_upstream_route(
+    root: &Path,
+    target: SocketAddr,
+) -> Result<ProductProxyUpstreamRoute, Box<dyn std::error::Error>> {
+    let material = tls::write_upstream_server_certificate(root)?;
+    let document_root = root.join("product-proxy-upstream");
+    let response_path = document_root.join("mitm-bridge").join("allow");
+    fs::create_dir_all(
+        response_path
+            .parent()
+            .ok_or_else(|| e2e_error("product proxy upstream response path has no parent"))?,
+    )?;
+    fs::write(&response_path, mitm_bridge::ALLOW_RESPONSE_BYTES)?;
+    Ok(ProductProxyUpstreamRoute {
+        host: tls::SERVER_NAME.to_string(),
+        target,
+        certificate_path: material.certificate_path.clone(),
+        private_key_path: material.private_key_path,
+        document_root,
     })
 }
 

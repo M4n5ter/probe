@@ -717,6 +717,111 @@ mod tests {
     }
 
     #[test]
+    fn product_proxy_accepts_upstream_routes() {
+        let mut violations = Vec::new();
+        let mut interception = product_proxy_interception();
+        let TransparentInterceptionMitmBackendConfig::ProductProxy { process, .. } =
+            &mut interception.mitm.backend
+        else {
+            panic!("test fixture should use product proxy");
+        };
+        process.upstream_routes = vec![
+            crate::TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
+                host: "Route.Example".to_string(),
+                target: "127.0.0.1:18443".to_string(),
+            },
+        ];
+
+        validate(&interception, &tls_config_with_mitm_leaf(), &mut violations);
+        let intent = interception
+            .mitm_backend_intent()
+            .expect("valid product proxy route should produce an intent");
+
+        let crate::TransparentInterceptionMitmBackendIntent::ProductProxy { process, .. } = intent
+        else {
+            panic!("expected product proxy intent");
+        };
+        assert!(violations.is_empty(), "{violations:?}");
+        assert_eq!(process.upstream_routes[0].host, "route.example");
+        assert_eq!(
+            process.upstream_routes[0].target,
+            "127.0.0.1:18443".parse().expect("test target")
+        );
+    }
+
+    #[test]
+    fn product_proxy_rejects_invalid_upstream_routes() {
+        let mut violations = Vec::new();
+        let mut interception = product_proxy_interception();
+        let TransparentInterceptionMitmBackendConfig::ProductProxy { process, .. } =
+            &mut interception.mitm.backend
+        else {
+            panic!("test fixture should use product proxy");
+        };
+        process.upstream_routes = vec![
+            crate::TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
+                host: "example.test".to_string(),
+                target: "127.0.0.1:18443".to_string(),
+            },
+            crate::TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
+                host: "EXAMPLE.TEST".to_string(),
+                target: "not-a-socket".to_string(),
+            },
+            crate::TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
+                host: "bad_host".to_string(),
+                target: "127.0.0.1:0".to_string(),
+            },
+        ];
+
+        validate(&interception, &tls_config_with_mitm_leaf(), &mut violations);
+
+        assert!(violations.iter().any(|violation| {
+            violation.field == "enforcement.interception.mitm.backend.process.upstream_routes"
+                && violation.reason.contains("duplicated")
+        }));
+        assert!(violations.iter().any(|violation| {
+            violation.field == "enforcement.interception.mitm.backend.process.upstream_routes"
+                && violation.reason.contains("IP socket address")
+        }));
+        assert!(violations.iter().any(|violation| {
+            violation.field == "enforcement.interception.mitm.backend.process.upstream_routes"
+                && violation.reason.contains("ASCII letters")
+        }));
+        assert!(violations.iter().any(|violation| {
+            violation.field == "enforcement.interception.mitm.backend.process.upstream_routes"
+                && violation.reason.contains("port must be non-zero")
+        }));
+    }
+
+    #[test]
+    fn product_proxy_rejects_upstream_routes_that_target_proxy_listener() {
+        let mut violations = Vec::new();
+        let mut interception = product_proxy_interception();
+        let TransparentInterceptionMitmBackendConfig::ProductProxy { process, .. } =
+            &mut interception.mitm.backend
+        else {
+            panic!("test fixture should use product proxy");
+        };
+        process.upstream_routes = vec![
+            crate::TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
+                host: "loop.example".to_string(),
+                target: "127.0.0.1:15002".to_string(),
+            },
+            crate::TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
+                host: "wildcard.example".to_string(),
+                target: "[::]:15002".to_string(),
+            },
+        ];
+
+        validate(&interception, &tls_config_with_mitm_leaf(), &mut violations);
+
+        assert!(violations.iter().any(|violation| {
+            violation.field == "enforcement.interception.mitm.backend.process.upstream_routes"
+                && violation.reason.contains("must not point back")
+        }));
+    }
+
+    #[test]
     fn product_proxy_rejects_ambiguous_tls_termination_sources() {
         let mut violations = Vec::new();
         let mut interception = product_proxy_interception();
@@ -760,6 +865,7 @@ mod tests {
                     crate::TransparentInterceptionMitmProductProxyConfig {
                         program: Some("/usr/local/bin/traffic-probe-mitm-proxy".into()),
                         working_dir: Some("/run/traffic-probe".into()),
+                        upstream_routes: Vec::new(),
                     },
                 ),
                 client_trust: crate::TransparentInterceptionMitmClientTrustConfig {
