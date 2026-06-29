@@ -51,6 +51,7 @@ fn pending_read_buffer_attempt(attempt: PayloadBufferAttempt) -> EbpfPendingSock
     EbpfPendingSocketReadAttempt {
         fd: attempt.fd,
         requested_len,
+        fd_generation: 0,
         readable_len: clamp_u64_to_u32(attempt.readable_len),
         logical_len_flags,
         user_buffer: attempt.user_buffer,
@@ -61,6 +62,7 @@ fn pending_read_iovec_attempt(attempt: PayloadIovecAttempt) -> EbpfPendingSocket
     EbpfPendingSocketReadAttempt {
         fd: attempt.fd,
         requested_len: 0,
+        fd_generation: 0,
         readable_len: clamp_u64_to_u32(attempt.iovlen),
         logical_len_flags: EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN
             | EBPF_PENDING_SOCKET_READ_SOURCE_IOVEC,
@@ -89,6 +91,7 @@ pub(crate) fn capture_read_sample_from_result(
         EbpfSocketReadMetadata {
             fd: attempt.fd,
             original_len,
+            fd_generation: attempt.fd_generation,
             captured_len,
         },
         flags,
@@ -169,6 +172,7 @@ mod tests {
         });
 
         assert_eq!(attempt.fd, 7);
+        assert_eq!(attempt.fd_generation, 0);
         assert_eq!(attempt.requested_len, 0);
         assert_eq!(attempt.readable_len, 9);
         assert_eq!(
@@ -187,6 +191,7 @@ mod tests {
         EbpfPendingSocketReadAttempt {
             fd: 7,
             requested_len,
+            fd_generation: 0,
             readable_len,
             logical_len_flags,
             user_buffer: 0,

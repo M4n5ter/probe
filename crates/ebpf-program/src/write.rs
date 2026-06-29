@@ -110,6 +110,7 @@ pub(crate) fn pending_write_metadata(
     EbpfSocketWriteMetadata {
         fd: pending.fd,
         original_len: pending.original_len,
+        fd_generation: pending.fd_generation,
         captured_len: pending.captured_len,
     }
 }
@@ -123,8 +124,10 @@ fn reset_pending_write_sample(
 ) {
     pending.fd = fd;
     pending.original_len = original_len;
+    pending.fd_generation = 0;
     pending.captured_len = captured_len;
     pending.flags = flags;
+    pending._reserved = 0;
     pending.buffer = [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES];
 }
 
@@ -207,8 +210,10 @@ mod tests {
         let mut pending = EbpfPendingSocketWriteSample {
             fd: 0,
             original_len: 0,
+            fd_generation: 0,
             captured_len: 0,
             flags: 0,
+            _reserved: 0,
             buffer: [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES],
         };
         reset_pending_write_sample(&mut pending, 7, original_len, captured.len() as u16, flags);

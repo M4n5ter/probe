@@ -74,7 +74,7 @@ fn capability_from_object_report(
     CapabilityState::degraded(
         CapabilityKind::LibsslUprobe,
         format!(
-            "eBPF TLS plaintext object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, resolved live fd lookups can carry optional SO_COOKIE when pidfd_getfd is permitted and the duplicated fd inode still matches, agent libssl plaintext sidecar wiring can run startup attach plus periodic process scan/reconcile with last-reconcile target counts, capture-bounded target snapshots, per-target last-reconcile state, per-target userspace uprobe link ownership, observed timestamp, and reconcile-loop health with last attempt outcome and consecutive failure count, and TLS output loss can fan out conservative unknown-offset gaps to plaintext flows observed since the previous output-loss checkpoint, but kernel link liveness/firing heartbeat, strong fd ownership, low-latency provider multiplexing, precise flow-specific lost-event reconstruction, and privileged ringbuf saturation e2e coverage remain best-effort",
+            "eBPF TLS plaintext object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, resolved live fd lookups can carry optional SO_COOKIE when pidfd_getfd is permitted and the duplicated fd inode still matches, agent libssl plaintext sidecar wiring can run startup attach plus periodic process scan/reconcile with last-reconcile target counts, capture-bounded target snapshots, per-target last-reconcile state, per-target userspace uprobe link ownership, observed timestamp, and reconcile-loop health with last attempt outcome and consecutive failure count, and TLS output loss can fan out conservative unknown-offset gaps to plaintext flows observed since the previous output-loss checkpoint, but kernel link liveness/firing heartbeat, TLS fd-to-flow ownership, low-latency provider multiplexing, precise flow-specific lost-event reconstruction, and privileged ringbuf saturation e2e coverage remain best-effort",
             object.summary()
         ),
     )
@@ -171,7 +171,7 @@ mod tests {
         assert!(reason.contains("TLS output loss"));
         assert!(reason.contains("unknown-offset gaps"));
         assert!(reason.contains("kernel link liveness/firing heartbeat"));
-        assert!(reason.contains("strong fd ownership"));
+        assert!(reason.contains("TLS fd-to-flow ownership"));
         assert!(reason.contains("precise flow-specific lost-event reconstruction"));
         assert!(reason.contains("privileged ringbuf saturation e2e coverage"));
         assert!(reason.contains("provider multiplexing"));

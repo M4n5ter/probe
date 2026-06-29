@@ -9,6 +9,7 @@ const CLOSE_RANGE_FLAGS_OFFSET: usize = 32;
 pub fn close_observation_from_tracepoint(ctx: &TracePointContext) -> Option<EbpfCloseObservation> {
     Some(EbpfCloseObservation::observed(
         tracepoint_u64(ctx, CLOSE_FD_OFFSET)? as i32,
+        0,
     ))
 }
 

@@ -251,7 +251,10 @@ mod tests {
         AddressPort, FlowIdentity, ProcessContext, ProcessIdentity, TransportProtocol,
     };
 
-    use super::super::{EbpfObservedProcess, payload_direction::PayloadDirections};
+    use super::super::{
+        EbpfObservedProcess, descriptor_lease::DescriptorLease,
+        payload_direction::PayloadDirections,
+    };
     use super::*;
 
     #[test]
@@ -513,7 +516,11 @@ mod tests {
         payload_directions: PayloadDirections,
     ) -> TrackedEbpfFlows {
         let mut tracked = TrackedEbpfFlows::bounded(8);
-        tracked.insert_flow(100, fd, flow(&format!("flow-{fd}")), payload_directions);
+        tracked.insert_flow(
+            DescriptorLease::new(100, fd, 1, 10).expect("test descriptor lease should be valid"),
+            flow(&format!("flow-{fd}")),
+            payload_directions,
+        );
         tracked
     }
 
@@ -527,6 +534,7 @@ mod tests {
         EbpfSocketWriteObservation {
             process: observed_process(),
             fd,
+            fd_generation: 10,
             original_len,
             buffer: payload.to_vec(),
             truncated,
@@ -544,6 +552,7 @@ mod tests {
         EbpfSocketReadObservation {
             process: observed_process(),
             fd,
+            fd_generation: 10,
             original_len,
             buffer: payload.to_vec(),
             truncated,

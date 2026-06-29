@@ -104,6 +104,10 @@ pub const EBPF_FD_TABLE_EPOCHS_MAP_NAME: &str = "TRAFFIC_PROBE_FD_TABLE_EPOCHS";
 pub const EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES: u32 = 8192;
 pub const EBPF_FD_TABLE_EPOCH_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
 pub const EBPF_FD_TABLE_EPOCH_VALUE_BYTES: u32 = core::mem::size_of::<u64>() as u32;
+pub const EBPF_SOCKET_FD_GENERATIONS_MAP_NAME: &str = "TRAFFIC_PROBE_SOCKET_FD_GENERATIONS";
+pub const EBPF_SOCKET_FD_GENERATIONS_MAX_ENTRIES: u32 = 8192;
+pub const EBPF_SOCKET_FD_GENERATION_KEY_BYTES: u32 = core::mem::size_of::<EbpfSocketFdKey>() as u32;
+pub const EBPF_SOCKET_FD_GENERATION_VALUE_BYTES: u32 = core::mem::size_of::<u64>() as u32;
 pub const EBPF_PENDING_ACCEPTS_MAP_NAME: &str = "TRAFFIC_PROBE_PENDING_ACCEPTS";
 pub const EBPF_PENDING_ACCEPTS_MAX_ENTRIES: u32 = 8192;
 pub const EBPF_PENDING_ACCEPT_KEY_BYTES: u32 = core::mem::size_of::<u64>() as u32;
@@ -319,7 +323,7 @@ pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 29] = [
     },
 ];
 
-pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 10] = [
+pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 11] = [
     EbpfMapSpec {
         name: EBPF_EVENTS_MAP_NAME,
         kind: EbpfMapKind::Ringbuf,
@@ -342,6 +346,14 @@ pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 10] = [
         key_size: EBPF_FD_TABLE_EPOCH_KEY_BYTES,
         value_size: EBPF_FD_TABLE_EPOCH_VALUE_BYTES,
         max_entries: EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES,
+        map_flags: 0,
+    },
+    EbpfMapSpec {
+        name: EBPF_SOCKET_FD_GENERATIONS_MAP_NAME,
+        kind: EbpfMapKind::Hash,
+        key_size: EBPF_SOCKET_FD_GENERATION_KEY_BYTES,
+        value_size: EBPF_SOCKET_FD_GENERATION_VALUE_BYTES,
+        max_entries: EBPF_SOCKET_FD_GENERATIONS_MAX_ENTRIES,
         map_flags: 0,
     },
     EbpfMapSpec {
@@ -502,14 +514,16 @@ impl EbpfSocketFdKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EbpfSocketPayloadAllowance {
     pub fd_table_epoch: u64,
+    pub fd_generation: u64,
     pub direction_mask: u8,
     pub _reserved: [u8; 7],
 }
 
 impl EbpfSocketPayloadAllowance {
-    pub const fn new(fd_table_epoch: u64, direction_mask: u8) -> Self {
+    pub const fn new(fd_table_epoch: u64, fd_generation: u64, direction_mask: u8) -> Self {
         Self {
             fd_table_epoch,
+            fd_generation,
             direction_mask,
             _reserved: [0; 7],
         }
@@ -517,6 +531,7 @@ impl EbpfSocketPayloadAllowance {
 
     pub fn to_bpfel_bytes(self) -> [u8; core::mem::size_of::<Self>()] {
         let epoch = self.fd_table_epoch.to_le_bytes();
+        let generation = self.fd_generation.to_le_bytes();
         [
             epoch[0],
             epoch[1],
@@ -526,6 +541,14 @@ impl EbpfSocketPayloadAllowance {
             epoch[5],
             epoch[6],
             epoch[7],
+            generation[0],
+            generation[1],
+            generation[2],
+            generation[3],
+            generation[4],
+            generation[5],
+            generation[6],
+            generation[7],
             self.direction_mask,
             self._reserved[0],
             self._reserved[1],
@@ -556,8 +579,10 @@ pub struct EbpfPendingSocketAcceptAttempt {
 pub struct EbpfPendingSocketWriteSample {
     pub fd: i32,
     pub original_len: u32,
+    pub fd_generation: u64,
     pub captured_len: u16,
     pub flags: u16,
+    pub _reserved: u32,
     pub buffer: [u8; EBPF_SOCKET_WRITE_SAMPLE_BYTES],
 }
 
@@ -566,6 +591,7 @@ pub struct EbpfPendingSocketWriteSample {
 pub struct EbpfPendingSocketReadAttempt {
     pub fd: i32,
     pub requested_len: u32,
+    pub fd_generation: u64,
     pub readable_len: u32,
     pub logical_len_flags: u32,
     pub user_buffer: u64,
@@ -580,7 +606,7 @@ mod tests {
 
     #[test]
     fn process_map_specs_are_unique_and_layout_complete() {
-        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 10);
+        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 11);
         assert_unique(EBPF_PROCESS_MAP_SPECS.map(|spec| spec.name));
 
         let allow_map = process_map(EBPF_ALLOWED_SOCKET_FDS_MAP_NAME);
@@ -592,6 +618,17 @@ mod tests {
         assert_eq!(epoch_map.kind, EbpfMapKind::Hash);
         assert_eq!(epoch_map.key_size, EBPF_FD_TABLE_EPOCH_KEY_BYTES);
         assert_eq!(epoch_map.value_size, EBPF_FD_TABLE_EPOCH_VALUE_BYTES);
+
+        let fd_generation_map = process_map(EBPF_SOCKET_FD_GENERATIONS_MAP_NAME);
+        assert_eq!(fd_generation_map.kind, EbpfMapKind::Hash);
+        assert_eq!(
+            fd_generation_map.key_size,
+            EBPF_SOCKET_FD_GENERATION_KEY_BYTES
+        );
+        assert_eq!(
+            fd_generation_map.value_size,
+            EBPF_SOCKET_FD_GENERATION_VALUE_BYTES
+        );
 
         let pending_accepts = process_map(EBPF_PENDING_ACCEPTS_MAP_NAME);
         assert_eq!(pending_accepts.kind, EbpfMapKind::Hash);
@@ -642,8 +679,12 @@ mod tests {
             [0x04, 0x03, 0x02, 0x01, 0xfe, 0xff, 0xff, 0xff]
         );
         assert_eq!(
-            EbpfSocketPayloadAllowance::new(0x0102_0304_0506_0708, EBPF_SOCKET_PAYLOAD_ALLOW_READ)
-                .to_bpfel_bytes(),
+            EbpfSocketPayloadAllowance::new(
+                0x0102_0304_0506_0708,
+                0x1112_1314_1516_1718,
+                EBPF_SOCKET_PAYLOAD_ALLOW_READ,
+            )
+            .to_bpfel_bytes(),
             [
                 0x08,
                 0x07,
@@ -653,6 +694,14 @@ mod tests {
                 0x03,
                 0x02,
                 0x01,
+                0x18,
+                0x17,
+                0x16,
+                0x15,
+                0x14,
+                0x13,
+                0x12,
+                0x11,
                 EBPF_SOCKET_PAYLOAD_ALLOW_READ,
                 0,
                 0,
@@ -682,13 +731,15 @@ mod tests {
 
     #[test]
     fn pending_socket_write_sample_layout_is_stable() {
-        assert_eq!(size_of::<EbpfPendingSocketWriteSample>(), 268);
-        assert_eq!(align_of::<EbpfPendingSocketWriteSample>(), 4);
+        assert_eq!(size_of::<EbpfPendingSocketWriteSample>(), 280);
+        assert_eq!(align_of::<EbpfPendingSocketWriteSample>(), 8);
         assert_eq!(offset_of!(EbpfPendingSocketWriteSample, fd), 0);
         assert_eq!(offset_of!(EbpfPendingSocketWriteSample, original_len), 4);
-        assert_eq!(offset_of!(EbpfPendingSocketWriteSample, captured_len), 8);
-        assert_eq!(offset_of!(EbpfPendingSocketWriteSample, flags), 10);
-        assert_eq!(offset_of!(EbpfPendingSocketWriteSample, buffer), 12);
+        assert_eq!(offset_of!(EbpfPendingSocketWriteSample, fd_generation), 8);
+        assert_eq!(offset_of!(EbpfPendingSocketWriteSample, captured_len), 16);
+        assert_eq!(offset_of!(EbpfPendingSocketWriteSample, flags), 18);
+        assert_eq!(offset_of!(EbpfPendingSocketWriteSample, _reserved), 20);
+        assert_eq!(offset_of!(EbpfPendingSocketWriteSample, buffer), 24);
     }
 
     #[test]
@@ -706,13 +757,15 @@ mod tests {
 
     #[test]
     fn socket_payload_allowance_layout_is_stable() {
-        assert_eq!(size_of::<EbpfSocketPayloadAllowance>(), 16);
+        assert_eq!(size_of::<EbpfSocketPayloadAllowance>(), 24);
         assert_eq!(align_of::<EbpfSocketPayloadAllowance>(), 8);
         assert_eq!(offset_of!(EbpfSocketPayloadAllowance, fd_table_epoch), 0);
-        assert_eq!(offset_of!(EbpfSocketPayloadAllowance, direction_mask), 8);
-        assert_eq!(offset_of!(EbpfSocketPayloadAllowance, _reserved), 9);
+        assert_eq!(offset_of!(EbpfSocketPayloadAllowance, fd_generation), 8);
+        assert_eq!(offset_of!(EbpfSocketPayloadAllowance, direction_mask), 16);
+        assert_eq!(offset_of!(EbpfSocketPayloadAllowance, _reserved), 17);
         let allowance = EbpfSocketPayloadAllowance::new(
             9,
+            10,
             EBPF_SOCKET_PAYLOAD_ALLOW_READ | EBPF_SOCKET_PAYLOAD_ALLOW_WRITE,
         );
         assert!(allowance.allows(EBPF_SOCKET_PAYLOAD_ALLOW_READ));
@@ -724,16 +777,17 @@ mod tests {
     fn pending_socket_read_attempt_layout_is_stable() {
         assert_eq!(EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN, 1 << 0);
         assert_eq!(EBPF_PENDING_SOCKET_READ_SOURCE_IOVEC, 1 << 1);
-        assert_eq!(size_of::<EbpfPendingSocketReadAttempt>(), 24);
+        assert_eq!(size_of::<EbpfPendingSocketReadAttempt>(), 32);
         assert_eq!(align_of::<EbpfPendingSocketReadAttempt>(), 8);
         assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, fd), 0);
         assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, requested_len), 4);
-        assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, readable_len), 8);
+        assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, fd_generation), 8);
+        assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, readable_len), 16);
         assert_eq!(
             offset_of!(EbpfPendingSocketReadAttempt, logical_len_flags),
-            12
+            20
         );
-        assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, user_buffer), 16);
+        assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, user_buffer), 24);
     }
 
     fn process_map(name: &'static str) -> EbpfMapSpec {

@@ -34,12 +34,7 @@ impl EbpfObservationSource for ProbeObservationSource {
         authorization: SocketPayloadSampleAuthorization,
     ) -> Result<(), CaptureError> {
         self.probe
-            .allow_socket_payload_sample(
-                authorization.tgid(),
-                authorization.fd(),
-                authorization.fd_table_epoch(),
-                authorization.payload_directions().to_abi_mask(),
-            )
+            .allow_socket_payload_sample(authorization)
             .map_err(|error| CaptureError::provider("ebpf", error.to_string()))
     }
 

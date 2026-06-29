@@ -22,7 +22,8 @@ use ebpf_abi::{
     EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES, EBPF_PENDING_WRITES_MAX_ENTRIES,
     EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES, EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES,
     EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES, EBPF_RING_BUFFER_BYTES,
-    EBPF_SOCKET_PAYLOAD_ALLOW_READ, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE, EbpfAcceptTracepointRecord,
+    EBPF_SOCKET_FD_GENERATIONS_MAX_ENTRIES, EBPF_SOCKET_PAYLOAD_ALLOW_READ,
+    EBPF_SOCKET_PAYLOAD_ALLOW_WRITE, EbpfAcceptTracepointRecord, EbpfCloseObservation,
     EbpfCloseRangeTracepointRecord, EbpfCloseTracepointRecord, EbpfConnectTracepointRecord,
     EbpfPendingSocketAcceptAttempt, EbpfPendingSocketReadAttempt, EbpfPendingSocketWriteSample,
     EbpfProcessProbeMetadata, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
@@ -55,6 +56,10 @@ static TRAFFIC_PROBE_ALLOWED_SOCKET_FDS: LruHashMap<EbpfSocketFdKey, EbpfSocketP
 #[map(name = "TRAFFIC_PROBE_FD_TABLE_EPOCHS")]
 static TRAFFIC_PROBE_FD_TABLE_EPOCHS: HashMap<u32, u64> =
     HashMap::with_max_entries(EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES, 0);
+
+#[map(name = "TRAFFIC_PROBE_SOCKET_FD_GENERATIONS")]
+static TRAFFIC_PROBE_SOCKET_FD_GENERATIONS: HashMap<EbpfSocketFdKey, u64> =
+    HashMap::with_max_entries(EBPF_SOCKET_FD_GENERATIONS_MAX_ENTRIES, 0);
 
 #[map(name = "TRAFFIC_PROBE_PENDING_ACCEPTS")]
 static TRAFFIC_PROBE_PENDING_ACCEPTS: HashMap<u64, EbpfPendingSocketAcceptAttempt> =
@@ -265,9 +270,10 @@ pub fn traffic_probe_sys_exit_recvmsg(ctx: TracePointContext) -> u32 {
 fn emit_connect_attempt(ctx: TracePointContext) {
     let connect = connect_observation_from_tracepoint(&ctx);
     let metadata = process_metadata(&ctx);
+    let lease = open_socket_fd_lease(metadata.tgid, connect.observation.fd);
     let observation = connect
         .observation
-        .with_fd_table_epoch(ensure_fd_table_epoch(metadata.tgid));
+        .with_descriptor_lease(lease.fd_table_epoch, lease.fd_generation);
     let event = EbpfConnectTracepointRecord::connect_tracepoint_observed(
         metadata.pid,
         metadata.tgid,
@@ -298,9 +304,10 @@ fn emit_accept_observation(ctx: TracePointContext) {
         return;
     };
     let metadata = process_metadata(&ctx);
+    let lease = open_socket_fd_lease(metadata.tgid, accept.observation.fd);
     let observation = accept
         .observation
-        .with_fd_table_epoch(ensure_fd_table_epoch(metadata.tgid));
+        .with_descriptor_lease(lease.fd_table_epoch, lease.fd_generation);
     let event = EbpfAcceptTracepointRecord::accept_tracepoint_observed(
         metadata.pid,
         metadata.tgid,
@@ -317,8 +324,12 @@ fn emit_close_attempt(ctx: TracePointContext) {
     let Some(close) = close_observation_from_tracepoint(&ctx) else {
         return;
     };
-    untrack_socket_fd(close.fd);
     let metadata = process_metadata(&ctx);
+    let close = EbpfCloseObservation::observed(
+        close.fd,
+        current_socket_fd_generation(metadata.tgid, close.fd).unwrap_or(0),
+    );
+    untrack_socket_fd(close.fd);
     let event = EbpfCloseTracepointRecord::close_tracepoint_observed(
         metadata.pid,
         metadata.tgid,
@@ -370,15 +381,17 @@ fn record_sendmsg_attempt(ctx: TracePointContext) {
 }
 
 fn record_write_payload_attempt(source: payload::PayloadAttemptSource) {
-    if !is_allowed_socket_payload(source.fd, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE) {
+    let Some(lease) = allowed_socket_payload_lease(source.fd, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE)
+    else {
         return;
-    }
+    };
     let Some(pending) = pending_write_scratch() else {
         return;
     };
     if capture_write_sample_from_source(source, pending).is_none() {
         return;
     }
+    pending.fd_generation = lease.fd_generation;
     let key = bpf_get_current_pid_tgid();
     let _ = TRAFFIC_PROBE_PENDING_WRITES.insert(&key, pending, 0);
 }
@@ -389,7 +402,9 @@ fn emit_write_sample(ctx: TracePointContext) {
         return;
     };
     let pending = unsafe { &mut *pending_ptr };
-    if !is_allowed_socket_payload(pending.fd, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE) {
+    if allowed_socket_payload_lease(pending.fd, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE)
+        .is_none_or(|lease| lease.fd_generation != pending.fd_generation)
+    {
         let _ = TRAFFIC_PROBE_PENDING_WRITES.remove(&key);
         return;
     }
@@ -437,12 +452,14 @@ fn record_recvmsg_attempt(ctx: TracePointContext) {
 }
 
 fn record_read_payload_attempt(source: payload::PayloadAttemptSource) {
-    if !is_allowed_socket_payload(source.fd, EBPF_SOCKET_PAYLOAD_ALLOW_READ) {
-        return;
-    }
-    let Some(attempt) = pending_read_attempt_from_source(source) else {
+    let Some(lease) = allowed_socket_payload_lease(source.fd, EBPF_SOCKET_PAYLOAD_ALLOW_READ)
+    else {
         return;
     };
+    let Some(mut attempt) = pending_read_attempt_from_source(source) else {
+        return;
+    };
+    attempt.fd_generation = lease.fd_generation;
     let key = bpf_get_current_pid_tgid();
     let _ = TRAFFIC_PROBE_PENDING_READS.insert(&key, &attempt, 0);
 }
@@ -452,7 +469,9 @@ fn emit_read_sample(ctx: TracePointContext) {
     let Some(attempt) = (unsafe { TRAFFIC_PROBE_PENDING_READS.get(&key).copied() }) else {
         return;
     };
-    if !is_allowed_socket_payload(attempt.fd, EBPF_SOCKET_PAYLOAD_ALLOW_READ) {
+    if allowed_socket_payload_lease(attempt.fd, EBPF_SOCKET_PAYLOAD_ALLOW_READ)
+        .is_none_or(|lease| lease.fd_generation != attempt.fd_generation)
+    {
         let _ = TRAFFIC_PROBE_PENDING_READS.remove(&key);
         return;
     }
@@ -525,18 +544,32 @@ fn process_metadata(ctx: &impl EbpfContext) -> EbpfProcessProbeMetadata {
     }
 }
 
-fn is_allowed_socket_payload(fd: i32, direction: u8) -> bool {
+#[derive(Clone, Copy)]
+struct SocketFdLease {
+    fd_table_epoch: u64,
+    fd_generation: u64,
+}
+
+fn allowed_socket_payload_lease(fd: i32, direction: u8) -> Option<SocketFdLease> {
     if fd < 0 {
-        return false;
+        return None;
     }
     let tgid = current_tgid();
     let key = EbpfSocketFdKey::new(tgid, fd);
-    let Some(allowance) = (unsafe { TRAFFIC_PROBE_ALLOWED_SOCKET_FDS.get(&key).copied() }) else {
-        return false;
-    };
-    allowance.fd_table_epoch != 0
-        && allowance.allows(direction)
-        && current_fd_table_epoch(tgid).is_some_and(|epoch| epoch == allowance.fd_table_epoch)
+    let allowance = (unsafe { TRAFFIC_PROBE_ALLOWED_SOCKET_FDS.get(&key).copied() })?;
+    if allowance.fd_table_epoch == 0
+        || allowance.fd_generation == 0
+        || !allowance.allows(direction)
+        || current_fd_table_epoch(tgid).is_none_or(|epoch| epoch != allowance.fd_table_epoch)
+        || current_socket_fd_generation(tgid, fd)
+            .is_none_or(|generation| generation != allowance.fd_generation)
+    {
+        return None;
+    }
+    Some(SocketFdLease {
+        fd_table_epoch: allowance.fd_table_epoch,
+        fd_generation: allowance.fd_generation,
+    })
 }
 
 fn untrack_socket_fd(fd: i32) {
@@ -565,6 +598,41 @@ fn ensure_fd_table_epoch(tgid: u32) -> u64 {
         epoch
     } else {
         0
+    }
+}
+
+fn open_socket_fd_lease(tgid: u32, fd: i32) -> SocketFdLease {
+    SocketFdLease {
+        fd_table_epoch: ensure_fd_table_epoch(tgid),
+        fd_generation: next_socket_fd_generation(tgid, fd).unwrap_or(0),
+    }
+}
+
+fn next_socket_fd_generation(tgid: u32, fd: i32) -> Option<u64> {
+    if fd < 0 {
+        return None;
+    }
+    let key = EbpfSocketFdKey::new(tgid, fd);
+    let mut next_generation = current_socket_fd_generation(tgid, fd)
+        .unwrap_or(0)
+        .wrapping_add(1);
+    if next_generation == 0 {
+        next_generation = 1;
+    }
+    TRAFFIC_PROBE_SOCKET_FD_GENERATIONS
+        .insert(&key, &next_generation, 0)
+        .ok()?;
+    Some(next_generation)
+}
+
+fn current_socket_fd_generation(tgid: u32, fd: i32) -> Option<u64> {
+    if fd < 0 {
+        return None;
+    }
+    unsafe {
+        TRAFFIC_PROBE_SOCKET_FD_GENERATIONS
+            .get(&EbpfSocketFdKey::new(tgid, fd))
+            .copied()
     }
 }
 
@@ -613,14 +681,16 @@ mod tests {
             0,
             0,
             [0; 16],
-            EbpfSocketWriteSample::new(0, 0, 0, [0x7f; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
+            EbpfSocketWriteSample::new(0, 0, 0, 0, [0x7f; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
             0,
         );
         let mut pending = EbpfPendingSocketWriteSample {
             fd: 7,
             original_len: 3,
+            fd_generation: 10,
             captured_len: 3,
             flags: 0,
+            _reserved: 0,
             buffer: [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES],
         };
         pending.buffer[..5].copy_from_slice(b"GET /");

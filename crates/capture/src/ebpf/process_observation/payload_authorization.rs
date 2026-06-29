@@ -1,73 +1,48 @@
 use probe_core::{CompiledSelector, Direction, FlowContext};
 
-use super::payload_direction::PayloadDirections;
+use super::{descriptor_lease::DescriptorLease, payload_direction::PayloadDirections};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SocketPayloadSampleAuthorization {
-    tgid: u32,
-    fd: i32,
-    fd_table_epoch: u64,
+    lease: DescriptorLease,
     payload_directions: PayloadDirections,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SocketPayloadSampleSource {
-    tgid: u32,
-    fd: i32,
-    fd_table_epoch: u64,
-}
-
-impl SocketPayloadSampleSource {
-    pub(super) const fn new(tgid: u32, fd: i32, fd_table_epoch: u64) -> Self {
-        Self {
-            tgid,
-            fd,
-            fd_table_epoch,
-        }
-    }
 }
 
 impl SocketPayloadSampleAuthorization {
     pub(super) fn from_selector(
-        source: SocketPayloadSampleSource,
+        lease: DescriptorLease,
         flow: &FlowContext,
         selector: Option<&CompiledSelector>,
     ) -> Option<Self> {
         let selector = selector?;
-        Self::new(source, payload_directions_for_flow(flow, selector))
+        Self::new(lease, payload_directions_for_flow(flow, selector))
     }
 
     pub(super) fn tgid(self) -> u32 {
-        self.tgid
+        self.lease.tgid()
     }
 
     pub(super) fn fd(self) -> i32 {
-        self.fd
+        self.lease.fd()
     }
 
     pub(super) fn fd_table_epoch(self) -> u64 {
-        self.fd_table_epoch
+        self.lease.fd_table_epoch()
+    }
+
+    pub(super) fn fd_generation(self) -> u64 {
+        self.lease.fd_generation()
     }
 
     pub(super) fn payload_directions(self) -> PayloadDirections {
         self.payload_directions
     }
 
-    fn new(
-        source: SocketPayloadSampleSource,
-        payload_directions: PayloadDirections,
-    ) -> Option<Self> {
-        let authorization = Self {
-            tgid: source.tgid,
-            fd: source.fd,
-            fd_table_epoch: source.fd_table_epoch,
+    fn new(lease: DescriptorLease, payload_directions: PayloadDirections) -> Option<Self> {
+        (!payload_directions.is_empty()).then_some(Self {
+            lease,
             payload_directions,
-        };
-        authorization.is_valid().then_some(authorization)
-    }
-
-    fn is_valid(self) -> bool {
-        self.fd >= 0 && self.fd_table_epoch != 0 && !self.payload_directions.is_empty()
+        })
     }
 }
 
@@ -103,6 +78,7 @@ mod tests {
         assert_eq!(authorization.tgid(), 100);
         assert_eq!(authorization.fd(), 7);
         assert_eq!(authorization.fd_table_epoch(), 9);
+        assert_eq!(authorization.fd_generation(), 10);
         assert!(
             authorization
                 .payload_directions()
@@ -166,23 +142,36 @@ mod tests {
     }
 
     #[test]
-    fn authorization_rejects_invalid_descriptor_or_epoch() -> Result<(), Box<dyn std::error::Error>>
+    fn authorization_rejects_invalid_descriptor_or_lease() -> Result<(), Box<dyn std::error::Error>>
     {
         let selector = selector([Direction::Outbound], 443)?;
-        let invalid_fd = SocketPayloadSampleSource::new(100, -1, 9);
-        let invalid_epoch = SocketPayloadSampleSource::new(100, 7, 0);
 
         assert!(
-            SocketPayloadSampleAuthorization::from_selector(invalid_fd, &flow(), Some(&selector))
+            DescriptorLease::new(100, -1, 9, 10)
+                .and_then(|lease| SocketPayloadSampleAuthorization::from_selector(
+                    lease,
+                    &flow(),
+                    Some(&selector),
+                ))
                 .is_none()
         );
         assert!(
-            SocketPayloadSampleAuthorization::from_selector(
-                invalid_epoch,
-                &flow(),
-                Some(&selector),
-            )
-            .is_none()
+            DescriptorLease::new(100, 7, 0, 10)
+                .and_then(|lease| SocketPayloadSampleAuthorization::from_selector(
+                    lease,
+                    &flow(),
+                    Some(&selector),
+                ))
+                .is_none()
+        );
+        assert!(
+            DescriptorLease::new(100, 7, 9, 0)
+                .and_then(|lease| SocketPayloadSampleAuthorization::from_selector(
+                    lease,
+                    &flow(),
+                    Some(&selector),
+                ))
+                .is_none()
         );
         Ok(())
     }
@@ -213,8 +202,8 @@ mod tests {
         .compile()?)
     }
 
-    fn source() -> SocketPayloadSampleSource {
-        SocketPayloadSampleSource::new(100, 7, 9)
+    fn source() -> DescriptorLease {
+        DescriptorLease::new(100, 7, 9, 10).expect("test descriptor lease should be valid")
     }
 
     fn flow() -> FlowContext {

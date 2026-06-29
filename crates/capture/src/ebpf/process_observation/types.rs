@@ -55,6 +55,7 @@ pub struct EbpfConnectTracepointObservation {
     pub fd: i32,
     pub addrlen: u32,
     pub fd_table_epoch: u64,
+    pub fd_generation: u64,
     pub endpoint: EbpfSocketEndpoint,
 }
 
@@ -65,6 +66,7 @@ pub struct EbpfAcceptTracepointObservation {
     pub listen_fd: i32,
     pub addrlen: u32,
     pub fd_table_epoch: u64,
+    pub fd_generation: u64,
     pub endpoint: EbpfSocketEndpoint,
 }
 
@@ -72,6 +74,7 @@ pub struct EbpfAcceptTracepointObservation {
 pub struct EbpfCloseTracepointObservation {
     pub process: EbpfObservedProcess,
     pub fd: i32,
+    pub fd_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +88,7 @@ pub struct EbpfCloseRangeTracepointObservation {
 pub struct EbpfSocketWriteObservation {
     pub process: EbpfObservedProcess,
     pub fd: i32,
+    pub fd_generation: u64,
     pub original_len: u32,
     pub buffer: Vec<u8>,
     pub truncated: bool,
@@ -95,6 +99,7 @@ pub struct EbpfSocketWriteObservation {
 pub struct EbpfSocketReadObservation {
     pub process: EbpfObservedProcess,
     pub fd: i32,
+    pub fd_generation: u64,
     pub original_len: u32,
     pub buffer: Vec<u8>,
     pub truncated: bool,

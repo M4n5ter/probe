@@ -4,11 +4,13 @@ use crate::bounded_recency::BoundedRecencyMap;
 
 use super::{
     EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfSocketReadObservation,
-    EbpfSocketWriteObservation, payload_direction::PayloadDirections,
+    EbpfSocketWriteObservation,
+    descriptor_lease::{DescriptorLease, DescriptorLeaseKey},
+    payload_direction::PayloadDirections,
 };
 
 pub(super) struct TrackedEbpfFlows {
-    by_descriptor: BoundedRecencyMap<EbpfDescriptorKey, TrackedEbpfFlow>,
+    by_lease: BoundedRecencyMap<DescriptorLeaseKey, TrackedEbpfFlow>,
 }
 
 pub(super) struct TrackedEbpfFlow {
@@ -21,25 +23,24 @@ pub(super) struct TrackedEbpfFlow {
 impl TrackedEbpfFlows {
     pub(super) fn bounded(max_tracked_flows: usize) -> Self {
         Self {
-            by_descriptor: BoundedRecencyMap::new(max_tracked_flows),
+            by_lease: BoundedRecencyMap::new(max_tracked_flows),
         }
     }
 
     pub(super) fn insert_flow(
         &mut self,
-        tgid: u32,
-        fd: i32,
+        lease: DescriptorLease,
         flow: FlowContext,
         payload_directions: PayloadDirections,
     ) {
-        self.insert(EbpfDescriptorKey::new(tgid, fd), flow, payload_directions);
+        self.insert(lease.key(), flow, payload_directions);
     }
 
     pub(super) fn remove_close(
         &mut self,
         close: &EbpfCloseTracepointObservation,
     ) -> Option<TrackedEbpfFlow> {
-        self.remove(EbpfDescriptorKey::from_close(close))
+        self.remove(DescriptorLeaseKey::from_close(close)?)
     }
 
     pub(super) fn remove_close_range(
@@ -47,19 +48,19 @@ impl TrackedEbpfFlows {
         close_range: &EbpfCloseRangeTracepointObservation,
     ) -> Vec<TrackedEbpfFlow> {
         let mut keys = self
-            .by_descriptor
+            .by_lease
             .keys()
             .copied()
             .filter(|key| key.is_in_close_range(close_range))
             .collect::<Vec<_>>();
-        keys.sort_by_key(|key| key.fd);
+        keys.sort_by_key(|key| (key.fd(), key.fd_generation()));
         keys.into_iter()
             .filter_map(|key| self.remove(key))
             .collect()
     }
 
     pub(super) fn active_payload_loss_targets(&self) -> impl Iterator<Item = &TrackedEbpfFlow> {
-        self.by_descriptor
+        self.by_lease
             .values_by_recency()
             .filter(|tracked| !tracked.payload_directions.is_empty())
     }
@@ -68,23 +69,23 @@ impl TrackedEbpfFlows {
         &mut self,
         write: &EbpfSocketWriteObservation,
     ) -> Option<&mut TrackedEbpfFlow> {
-        self.get_recent_mut(EbpfDescriptorKey::from_write(write), Direction::Outbound)
+        self.get_recent_mut(DescriptorLeaseKey::from_write(write)?, Direction::Outbound)
     }
 
     pub(super) fn get_read_mut(
         &mut self,
         read: &EbpfSocketReadObservation,
     ) -> Option<&mut TrackedEbpfFlow> {
-        self.get_recent_mut(EbpfDescriptorKey::from_read(read), Direction::Inbound)
+        self.get_recent_mut(DescriptorLeaseKey::from_read(read)?, Direction::Inbound)
     }
 
     fn insert(
         &mut self,
-        key: EbpfDescriptorKey,
+        key: DescriptorLeaseKey,
         flow: FlowContext,
         payload_directions: PayloadDirections,
     ) {
-        self.by_descriptor.insert(
+        self.by_lease.insert(
             key,
             TrackedEbpfFlow {
                 flow,
@@ -95,24 +96,24 @@ impl TrackedEbpfFlows {
         );
     }
 
-    fn remove(&mut self, key: EbpfDescriptorKey) -> Option<TrackedEbpfFlow> {
-        self.by_descriptor.remove(&key)
+    fn remove(&mut self, key: DescriptorLeaseKey) -> Option<TrackedEbpfFlow> {
+        self.by_lease.remove(&key)
     }
 
     fn get_recent_mut(
         &mut self,
-        key: EbpfDescriptorKey,
+        key: DescriptorLeaseKey,
         required_direction: Direction,
     ) -> Option<&mut TrackedEbpfFlow> {
         if !self
-            .by_descriptor
+            .by_lease
             .get(&key)
             .is_some_and(|tracked| tracked.allows_payload(required_direction))
         {
             return None;
         }
-        self.by_descriptor.refresh(&key);
-        self.by_descriptor.get_mut(&key)
+        self.by_lease.refresh(&key);
+        self.by_lease.get_mut(&key)
     }
 }
 
@@ -126,36 +127,6 @@ impl TrackedEbpfFlow {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct EbpfDescriptorKey {
-    tgid: u32,
-    fd: i32,
-}
-
-impl EbpfDescriptorKey {
-    const fn new(tgid: u32, fd: i32) -> Self {
-        Self { tgid, fd }
-    }
-
-    fn from_close(close: &EbpfCloseTracepointObservation) -> Self {
-        Self::new(close.process.tgid, close.fd)
-    }
-
-    fn from_write(write: &EbpfSocketWriteObservation) -> Self {
-        Self::new(write.process.tgid, write.fd)
-    }
-
-    fn from_read(read: &EbpfSocketReadObservation) -> Self {
-        Self::new(read.process.tgid, read.fd)
-    }
-
-    fn is_in_close_range(self, close_range: &EbpfCloseRangeTracepointObservation) -> bool {
-        self.tgid == close_range.process.tgid
-            && self.fd >= 0
-            && (close_range.first_fd..=close_range.last_fd).contains(&(self.fd as u32))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use probe_core::{
@@ -164,7 +135,7 @@ mod tests {
 
     use super::super::{
         EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfObservedProcess,
-        EbpfSocketReadObservation,
+        EbpfSocketReadObservation, descriptor_lease::DescriptorLease,
     };
     use super::*;
 
@@ -276,8 +247,7 @@ mod tests {
     fn tracked_flows_do_not_refresh_descriptor_on_unallowed_payload_direction() {
         let mut tracked = TrackedEbpfFlows::bounded(2);
         tracked.insert_flow(
-            100,
-            7,
+            descriptor_lease(100, 7, 1),
             flow("fd-7"),
             PayloadDirections::from_directions([Direction::Outbound]),
         );
@@ -344,8 +314,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tracked_flows_bind_payload_and_close_to_descriptor_generation() {
+        let mut tracked = TrackedEbpfFlows::bounded(4);
+        insert_flow_for_descriptor_generation(&mut tracked, 7, 1, flow("fd-7-generation-1"));
+        insert_flow_for_descriptor_generation(&mut tracked, 7, 2, flow("fd-7-generation-2"));
+
+        assert_eq!(
+            tracked
+                .get_write_mut(&write_observation_with_generation(7, 1))
+                .expect("generation 1 write should match generation 1 flow")
+                .flow
+                .id,
+            FlowIdentity("fd-7-generation-1".to_string())
+        );
+        assert_eq!(
+            tracked
+                .remove_close(&close_observation_with_generation(7, 1))
+                .expect("generation 1 close should only remove generation 1")
+                .flow
+                .id,
+            FlowIdentity("fd-7-generation-1".to_string())
+        );
+        assert_eq!(
+            tracked
+                .remove_close(&close_observation_with_generation(7, 2))
+                .expect("generation 2 flow should remain after generation 1 close")
+                .flow
+                .id,
+            FlowIdentity("fd-7-generation-2".to_string())
+        );
+    }
+
     fn insert_flow_for_descriptor(tracked: &mut TrackedEbpfFlows, fd: i32, flow: FlowContext) {
-        insert_flow_for_process_descriptor(tracked, 100, fd, flow);
+        insert_flow_for_descriptor_generation(tracked, fd, 1, flow);
+    }
+
+    fn insert_flow_for_descriptor_generation(
+        tracked: &mut TrackedEbpfFlows,
+        fd: i32,
+        fd_generation: u64,
+        flow: FlowContext,
+    ) {
+        insert_flow_for_process_descriptor_generation(tracked, 100, fd, fd_generation, flow);
     }
 
     fn insert_flow_for_process_descriptor(
@@ -354,22 +365,52 @@ mod tests {
         fd: i32,
         flow: FlowContext,
     ) {
+        insert_flow_for_process_descriptor_generation(tracked, tgid, fd, 1, flow);
+    }
+
+    fn insert_flow_for_process_descriptor_generation(
+        tracked: &mut TrackedEbpfFlows,
+        tgid: u32,
+        fd: i32,
+        fd_generation: u64,
+        flow: FlowContext,
+    ) {
         tracked.insert_flow(
-            tgid,
-            fd,
+            descriptor_lease(tgid, fd, fd_generation),
             flow,
             PayloadDirections::from_directions([Direction::Outbound, Direction::Inbound]),
         );
     }
 
+    fn descriptor_lease(tgid: u32, fd: i32, fd_generation: u64) -> DescriptorLease {
+        DescriptorLease::new(tgid, fd, 1, fd_generation)
+            .expect("test descriptor lease should be valid")
+    }
+
     fn close_observation(fd: i32) -> EbpfCloseTracepointObservation {
-        close_observation_for_process(100, fd)
+        close_observation_with_generation(fd, 1)
     }
 
     fn close_observation_for_process(tgid: u32, fd: i32) -> EbpfCloseTracepointObservation {
+        close_observation_for_process_generation(tgid, fd, 1)
+    }
+
+    fn close_observation_with_generation(
+        fd: i32,
+        fd_generation: u64,
+    ) -> EbpfCloseTracepointObservation {
+        close_observation_for_process_generation(100, fd, fd_generation)
+    }
+
+    fn close_observation_for_process_generation(
+        tgid: u32,
+        fd: i32,
+        fd_generation: u64,
+    ) -> EbpfCloseTracepointObservation {
         EbpfCloseTracepointObservation {
             process: observed_process_for_tgid(tgid),
             fd,
+            fd_generation,
         }
     }
 
@@ -382,9 +423,17 @@ mod tests {
     }
 
     fn write_observation(fd: i32) -> EbpfSocketWriteObservation {
+        write_observation_with_generation(fd, 1)
+    }
+
+    fn write_observation_with_generation(
+        fd: i32,
+        fd_generation: u64,
+    ) -> EbpfSocketWriteObservation {
         EbpfSocketWriteObservation {
             process: observed_process(),
             fd,
+            fd_generation,
             original_len: 5,
             buffer: b"hello".to_vec(),
             truncated: false,
@@ -396,6 +445,7 @@ mod tests {
         EbpfSocketReadObservation {
             process: observed_process(),
             fd,
+            fd_generation: 1,
             original_len: 5,
             buffer: b"hello".to_vec(),
             truncated: false,

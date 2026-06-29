@@ -7,7 +7,7 @@ use crate::{CaptureError, CaptureEvent};
 use super::{
     EbpfAcceptTracepointObservation, EbpfConnectTracepointObservation, EbpfSocketFlowResolver,
     accept_opened_event_from_observation, connect_opened_event_from_observation,
-    payload_authorization::SocketPayloadSampleSource, unresolved_accept_gap_from_observation,
+    descriptor_lease::DescriptorLease, unresolved_accept_gap_from_observation,
     unresolved_connect_gap_from_observation,
 };
 
@@ -74,8 +74,35 @@ impl PendingEbpfFlowStart {
         }
     }
 
-    pub(super) fn payload_source(&self) -> SocketPayloadSampleSource {
-        SocketPayloadSampleSource::new(self.tgid(), self.fd(), self.fd_table_epoch())
+    pub(super) fn invalid_descriptor_lease_gap(&self, timestamp: Timestamp) -> CaptureEvent {
+        self.unresolved_gap(timestamp, self.invalid_descriptor_lease_reason())
+    }
+
+    pub(super) fn descriptor_lease(&self) -> Option<DescriptorLease> {
+        DescriptorLease::new(
+            self.tgid(),
+            self.fd(),
+            self.fd_table_epoch(),
+            self.fd_generation(),
+        )
+    }
+
+    fn invalid_descriptor_lease_reason(&self) -> String {
+        format!(
+            "eBPF flow-start observation did not carry a valid descriptor lease; tgid={}, thread_pid={}, fd={}, fd_table_epoch={}, fd_generation={}",
+            self.tgid(),
+            self.thread_pid(),
+            self.fd(),
+            self.fd_table_epoch(),
+            self.fd_generation()
+        )
+    }
+
+    fn thread_pid(&self) -> u32 {
+        match self {
+            Self::Connect(connect) => connect.process.pid,
+            Self::Accept(accept) => accept.process.pid,
+        }
     }
 
     pub(super) fn tgid(&self) -> u32 {
@@ -96,6 +123,13 @@ impl PendingEbpfFlowStart {
         match self {
             Self::Connect(connect) => connect.fd_table_epoch,
             Self::Accept(accept) => accept.fd_table_epoch,
+        }
+    }
+
+    fn fd_generation(&self) -> u64 {
+        match self {
+            Self::Connect(connect) => connect.fd_generation,
+            Self::Accept(accept) => accept.fd_generation,
         }
     }
 }

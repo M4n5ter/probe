@@ -292,6 +292,7 @@ mod tests {
             fd: 7,
             addrlen: 16,
             fd_table_epoch: 0,
+            fd_generation: 10,
             endpoint: EbpfSocketEndpoint::Remote(expected_remote),
         };
         let mut resolver = ExpectedSocketResolver {
@@ -363,6 +364,7 @@ mod tests {
             fd: 7,
             addrlen: 0,
             fd_table_epoch: 0,
+            fd_generation: 10,
             endpoint: EbpfSocketEndpoint::SockaddrReadFailed,
         };
         let mut resolver = ExpectedSocketResolver {
@@ -408,6 +410,7 @@ mod tests {
             listen_fd: 3,
             addrlen: 16,
             fd_table_epoch: 11,
+            fd_generation: 10,
             endpoint: EbpfSocketEndpoint::Remote(remote),
         };
         let mut resolver = ExpectedSocketResolver {

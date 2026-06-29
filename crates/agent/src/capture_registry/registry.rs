@@ -153,7 +153,7 @@ fn ebpf_provider_descriptor_from_object_report(
         CaptureBackend::Ebpf,
         CaptureProviderBuilder::Ebpf,
         format!(
-            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, live fd lookups can carry optional SO_COOKIE when pidfd_getfd is permitted and the duplicated fd inode still matches, and the process observation provider can emit connect and accept/accept4 flow-start observations, selector-authorized always-degraded outbound single-buffer and bounded iovec-prefix syscall argument samples and inbound single-buffer and bounded iovec-prefix syscall result samples, best-effort close/plain close_range descriptor lifecycle events, output ring-buffer failure conversion to degraded capture_loss events, plus conservative unknown-offset gap fan-out to active tracked payload flows, but payload beyond the bounded iovec scan window or sample buffer, precise flow-specific lost-event reconstruction, strong socket lifetime, and complete kernel traffic capture are not implemented",
+            "eBPF object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, live fd lookups can carry optional SO_COOKIE when pidfd_getfd is permitted and the duplicated fd inode still matches, and the process observation provider can emit connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded iovec-prefix syscall argument samples and inbound single-buffer and bounded iovec-prefix syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, output ring-buffer failure conversion to degraded capture_loss events, plus conservative unknown-offset gap fan-out to active tracked payload flows, but payload beyond the bounded iovec scan window or sample buffer, precise flow-specific lost-event reconstruction, kernel socket-object lifetime, and complete kernel traffic capture are not implemented",
             object.summary(),
         ),
     )
@@ -348,8 +348,10 @@ mod tests {
         assert!(reason.contains("capture_loss events"));
         assert!(reason.contains("unknown-offset gap fan-out"));
         assert!(reason.contains("precise flow-specific lost-event reconstruction"));
-        assert!(reason.contains("strong socket lifetime"));
-        assert!(reason.contains("best-effort close/plain close_range descriptor lifecycle events"));
+        assert!(reason.contains("descriptor leases"));
+        assert!(reason.contains("bound to descriptor generation"));
+        assert!(reason.contains("kernel socket-object lifetime"));
+        assert!(reason.contains("descriptor-generation close/plain close_range lifecycle events"));
         assert!(reason.contains("process observation provider"));
         assert!(reason.contains("procfs socket attribution is usable"));
     }

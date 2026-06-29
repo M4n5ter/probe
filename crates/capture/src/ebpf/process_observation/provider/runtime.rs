@@ -96,18 +96,10 @@ impl EbpfProcessObservationProvider {
     ) -> Result<CapturePoll, CaptureError> {
         match observation {
             EbpfProcessObservation::Connect(connect) => {
-                self.pending_flow = Some(PendingEbpfFlowResolution::new(
-                    PendingEbpfFlowStart::Connect(connect),
-                    self.clock.next_timestamp(),
-                ));
-                self.poll_pending_flow_resolution()
+                self.begin_flow_resolution(PendingEbpfFlowStart::Connect(connect))
             }
             EbpfProcessObservation::Accept(accept) => {
-                self.pending_flow = Some(PendingEbpfFlowResolution::new(
-                    PendingEbpfFlowStart::Accept(accept),
-                    self.clock.next_timestamp(),
-                ));
-                self.poll_pending_flow_resolution()
+                self.begin_flow_resolution(PendingEbpfFlowStart::Accept(accept))
             }
             EbpfProcessObservation::Close(close) => Ok(self
                 .close_event(&close)
@@ -143,6 +135,20 @@ impl EbpfProcessObservationProvider {
                     .unwrap_or(CapturePoll::Progress))
             }
         }
+    }
+
+    fn begin_flow_resolution(
+        &mut self,
+        flow_start: PendingEbpfFlowStart,
+    ) -> Result<CapturePoll, CaptureError> {
+        let timestamp = self.clock.next_timestamp();
+        if flow_start.descriptor_lease().is_none() {
+            return Ok(CapturePoll::event(
+                flow_start.invalid_descriptor_lease_gap(timestamp),
+            ));
+        }
+        self.pending_flow = Some(PendingEbpfFlowResolution::new(flow_start, timestamp));
+        self.poll_pending_flow_resolution()
     }
 
     fn poll_pending_flow_resolution(&mut self) -> Result<CapturePoll, CaptureError> {
@@ -183,8 +189,11 @@ impl EbpfProcessObservationProvider {
         event: &CaptureEvent,
     ) -> Result<(), CaptureError> {
         if let CaptureEvent::ConnectionOpened { flow, .. } = &event {
+            let Some(lease) = flow_start.descriptor_lease() else {
+                return Ok(());
+            };
             let authorization = SocketPayloadSampleAuthorization::from_selector(
-                flow_start.payload_source(),
+                lease,
                 flow,
                 self.deep_observe_selector.as_ref(),
             );
@@ -195,12 +204,8 @@ impl EbpfProcessObservationProvider {
                 self.observations
                     .allow_socket_payload_sample(authorization)?;
             }
-            self.tracked_flows.insert_flow(
-                flow_start.tgid(),
-                flow_start.fd(),
-                flow.clone(),
-                payload_directions,
-            );
+            self.tracked_flows
+                .insert_flow(lease, flow.clone(), payload_directions);
         }
         Ok(())
     }
@@ -258,7 +263,7 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider emits connect and accept/accept4 flow-start observations, selector-authorized always-degraded outbound single-buffer and bounded iovec-prefix syscall argument samples plus inbound single-buffer and bounded iovec-prefix syscall result samples, best-effort close/plain close_range descriptor lifecycle events, output ring-buffer failure conversion to degraded capture_loss events, and conservative unknown-offset gap fan-out to active tracked payload flows; payload beyond the bounded iovec scan window or sample buffer, partial-write retry semantics, and precise flow-specific lost-event reconstruction are not implemented",
+            "eBPF provider emits connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded iovec-prefix syscall argument samples plus inbound single-buffer and bounded iovec-prefix syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, output ring-buffer failure conversion to degraded capture_loss events, and conservative unknown-offset gap fan-out to active tracked payload flows; payload beyond the bounded iovec scan window or sample buffer, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
         )]
     }
 
@@ -385,6 +390,7 @@ mod tests {
             EbpfProcessObservation::Read(EbpfSocketReadObservation {
                 process,
                 fd: 7,
+                fd_generation: 10,
                 original_len: 5,
                 buffer: b"HTTP/".to_vec(),
                 truncated: false,
@@ -434,6 +440,7 @@ mod tests {
             EbpfProcessObservation::Read(EbpfSocketReadObservation {
                 process,
                 fd: 9,
+                fd_generation: 10,
                 original_len: 5,
                 buffer: b"GET /".to_vec(),
                 truncated: false,
@@ -648,6 +655,31 @@ mod tests {
     }
 
     #[test]
+    fn emits_gap_instead_of_unclosable_flow_for_invalid_descriptor_lease() -> TestResult {
+        let (_, remote) = outbound_loopback();
+        let observation =
+            connect_observation_with_lease(observed_process(101, 100), 7, remote, 9, 0);
+        let mut provider = provider_from_observations(
+            [
+                observation,
+                close_observation(observed_process(101, 100), 7),
+            ],
+            loopback_endpoint(50_000),
+            remote,
+        );
+
+        let Some(CaptureEvent::Gap(gap)) = provider.next()? else {
+            panic!("expected degraded gap event");
+        };
+
+        assert_eq!(gap.origin.source(), CaptureSource::EbpfSyscall);
+        assert!(gap.gap.reason.contains("valid descriptor lease"));
+        assert!(gap.gap.reason.contains("fd_generation=0"));
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn retries_fd_resolution() -> TestResult {
         let (local, remote) = outbound_loopback();
         let observation = connect_observation(observed_process(101, 100), 7, remote);
@@ -754,12 +786,18 @@ mod tests {
                 EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
                     process: process.clone(),
                     fd: 70,
+                    fd_generation: 10,
                 }),
                 EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
                     process: process.clone(),
                     fd: 71,
+                    fd_generation: 10,
                 }),
-                EbpfProcessObservation::Close(EbpfCloseTracepointObservation { process, fd: 72 }),
+                EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
+                    process,
+                    fd: 72,
+                    fd_generation: 10,
+                }),
             ]),
             counts: VecDeque::from([4]),
         };
@@ -960,11 +998,22 @@ mod tests {
         fd: i32,
         remote: TcpEndpoint,
     ) -> EbpfProcessObservation {
+        connect_observation_with_lease(process, fd, remote, 9, 10)
+    }
+
+    fn connect_observation_with_lease(
+        process: EbpfObservedProcess,
+        fd: i32,
+        remote: TcpEndpoint,
+        fd_table_epoch: u64,
+        fd_generation: u64,
+    ) -> EbpfProcessObservation {
         EbpfProcessObservation::Connect(EbpfConnectTracepointObservation {
             process,
             fd,
             addrlen: 16,
-            fd_table_epoch: 9,
+            fd_table_epoch,
+            fd_generation,
             endpoint: EbpfSocketEndpoint::Remote(remote),
         })
     }
@@ -978,6 +1027,7 @@ mod tests {
             fd,
             addrlen: 0,
             fd_table_epoch: 9,
+            fd_generation: 10,
             endpoint: EbpfSocketEndpoint::Missing,
         })
     }
@@ -994,12 +1044,17 @@ mod tests {
             listen_fd,
             addrlen: 16,
             fd_table_epoch: 9,
+            fd_generation: 10,
             endpoint: EbpfSocketEndpoint::Remote(remote),
         })
     }
 
     fn close_observation(process: EbpfObservedProcess, fd: i32) -> EbpfProcessObservation {
-        EbpfProcessObservation::Close(EbpfCloseTracepointObservation { process, fd })
+        EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
+            process,
+            fd,
+            fd_generation: 10,
+        })
     }
 
     fn close_range_observation(

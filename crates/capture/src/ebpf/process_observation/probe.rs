@@ -28,7 +28,7 @@ use super::{
     EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
     EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
     EbpfProcessObservation, EbpfSocketEndpoint, EbpfSocketReadObservation,
-    EbpfSocketWriteObservation,
+    EbpfSocketWriteObservation, payload_authorization::SocketPayloadSampleAuthorization,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,15 +130,16 @@ impl EbpfProcessObservationProbe {
         decode_process_observation(&item).map(Some)
     }
 
-    pub fn allow_socket_payload_sample(
+    pub(super) fn allow_socket_payload_sample(
         &mut self,
-        tgid: u32,
-        fd: i32,
-        fd_table_epoch: u64,
-        direction_mask: u8,
+        authorization: SocketPayloadSampleAuthorization,
     ) -> Result<(), EbpfProcessObservationProbeError> {
-        let key = EbpfSocketFdKey::new(tgid, fd).to_bpfel_bytes();
-        let allowance = EbpfSocketPayloadAllowance::new(fd_table_epoch, direction_mask);
+        let key = EbpfSocketFdKey::new(authorization.tgid(), authorization.fd()).to_bpfel_bytes();
+        let allowance = EbpfSocketPayloadAllowance::new(
+            authorization.fd_table_epoch(),
+            authorization.fd_generation(),
+            authorization.payload_directions().to_abi_mask(),
+        );
         self.allowed_socket_fds
             .insert(key, allowance.to_bpfel_bytes(), 0)
             .map_err(|source| EbpfProcessObservationProbeError::Map {
@@ -264,6 +265,7 @@ fn process_observation_from_event(
                     fd: connect.fd,
                     addrlen: connect.addrlen,
                     fd_table_epoch: connect.fd_table_epoch,
+                    fd_generation: connect.fd_generation,
                     endpoint: connect_endpoint_from_event(&event),
                 },
             ))
@@ -277,6 +279,7 @@ fn process_observation_from_event(
                     listen_fd: accept.listen_fd,
                     addrlen: accept.addrlen,
                     fd_table_epoch: accept.fd_table_epoch,
+                    fd_generation: accept.fd_generation,
                     endpoint: accept_endpoint_from_event(&event),
                 },
             ))
@@ -287,6 +290,7 @@ fn process_observation_from_event(
                 EbpfCloseTracepointObservation {
                     process: observed_process_from_event(&event),
                     fd: close.fd,
+                    fd_generation: close.fd_generation,
                 },
             ))
         }
@@ -305,6 +309,7 @@ fn process_observation_from_event(
             Ok(EbpfProcessObservation::Write(EbpfSocketWriteObservation {
                 process: observed_process_from_event(&event),
                 fd: sample.fd,
+                fd_generation: sample.fd_generation,
                 original_len: sample.original_len,
                 buffer: sample.buffer[..usize::from(sample.captured_len)].to_vec(),
                 truncated: event.flags() & EBPF_SOCKET_WRITE_TRUNCATED != 0,
@@ -316,6 +321,7 @@ fn process_observation_from_event(
             Ok(EbpfProcessObservation::Read(EbpfSocketReadObservation {
                 process: observed_process_from_event(&event),
                 fd: sample.fd,
+                fd_generation: sample.fd_generation,
                 original_len: sample.original_len,
                 buffer: sample.buffer[..usize::from(sample.captured_len)].to_vec(),
                 truncated: event.flags() & EBPF_SOCKET_READ_TRUNCATED != 0,
@@ -472,7 +478,7 @@ mod tests {
                 443,
                 [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             )
-            .with_fd_table_epoch(9),
+            .with_descriptor_lease(9, 10),
             EBPF_CONNECT_REMOTE_ENDPOINT_VALID,
         );
 
@@ -488,6 +494,7 @@ mod tests {
                 assert_eq!(connect.fd, 7);
                 assert_eq!(connect.addrlen, 16);
                 assert_eq!(connect.fd_table_epoch, 9);
+                assert_eq!(connect.fd_generation, 10);
                 assert_eq!(
                     connect.endpoint,
                     EbpfSocketEndpoint::Remote(TcpEndpoint::new(
@@ -518,7 +525,7 @@ mod tests {
                 50_000,
                 [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             )
-            .with_fd_table_epoch(12),
+            .with_descriptor_lease(12, 10),
             EBPF_ACCEPT_REMOTE_ENDPOINT_VALID,
         );
 
@@ -533,6 +540,7 @@ mod tests {
                 assert_eq!(accept.listen_fd, 3);
                 assert_eq!(accept.addrlen, 16);
                 assert_eq!(accept.fd_table_epoch, 12);
+                assert_eq!(accept.fd_generation, 10);
                 assert_eq!(
                     accept.endpoint,
                     EbpfSocketEndpoint::Remote(TcpEndpoint::new(
@@ -555,7 +563,7 @@ mod tests {
             33,
             44,
             nul_padded_command("curl"),
-            EbpfCloseObservation::observed(7),
+            EbpfCloseObservation::observed(7, 10),
         );
 
         let observation =
@@ -568,6 +576,7 @@ mod tests {
                 assert_eq!(close.process.gid, 44);
                 assert_eq!(close.process.command_lossy(), "curl");
                 assert_eq!(close.fd, 7);
+                assert_eq!(close.fd_generation, 10);
             }
             observation => panic!("unexpected observation: {observation:?}"),
         }
@@ -613,7 +622,7 @@ mod tests {
             33,
             44,
             nul_padded_command("curl"),
-            EbpfSocketWriteSample::new(7, 10, 5, buffer),
+            EbpfSocketWriteSample::new(7, 10, 10, 5, buffer),
             EBPF_SOCKET_WRITE_TRUNCATED,
         );
 
@@ -627,6 +636,7 @@ mod tests {
                 assert_eq!(write.process.gid, 44);
                 assert_eq!(write.process.command_lossy(), "curl");
                 assert_eq!(write.fd, 7);
+                assert_eq!(write.fd_generation, 10);
                 assert_eq!(write.original_len, 10);
                 assert_eq!(write.buffer, b"GET /");
                 assert!(write.truncated);
@@ -647,7 +657,7 @@ mod tests {
             33,
             44,
             nul_padded_command("curl"),
-            EbpfSocketReadSample::new(7, 10, 5, buffer),
+            EbpfSocketReadSample::new(7, 10, 10, 5, buffer),
             EBPF_SOCKET_READ_TRUNCATED,
         );
 
@@ -661,6 +671,7 @@ mod tests {
                 assert_eq!(read.process.gid, 44);
                 assert_eq!(read.process.command_lossy(), "curl");
                 assert_eq!(read.fd, 7);
+                assert_eq!(read.fd_generation, 10);
                 assert_eq!(read.original_len, 10);
                 assert_eq!(read.buffer, b"HTTP/");
                 assert!(read.truncated);
@@ -680,7 +691,7 @@ mod tests {
             33,
             44,
             nul_padded_command("curl"),
-            EbpfSocketWriteSample::new(7, 10, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
+            EbpfSocketWriteSample::new(7, 10, 10, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
             EBPF_SOCKET_WRITE_TRUNCATED,
         );
 
@@ -689,6 +700,7 @@ mod tests {
         match observation {
             EbpfProcessObservation::Write(write) => {
                 assert_eq!(write.fd, 7);
+                assert_eq!(write.fd_generation, 10);
                 assert_eq!(write.original_len, 10);
                 assert!(write.buffer.is_empty());
                 assert!(write.truncated);

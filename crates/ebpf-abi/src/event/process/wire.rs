@@ -70,8 +70,8 @@ pub struct EbpfAcceptObservation {
     pub address_family: u16,
     pub remote_port: u16,
     pub remote_address: [u8; 16],
-    pub reserved: u64,
     pub fd_table_epoch: u64,
+    pub fd_generation: u64,
 }
 
 impl EbpfAcceptObservation {
@@ -83,8 +83,8 @@ impl EbpfAcceptObservation {
             address_family: EBPF_ADDRESS_FAMILY_UNSPEC,
             remote_port: 0,
             remote_address: [0; 16],
-            reserved: 0,
             fd_table_epoch: 0,
+            fd_generation: 0,
         }
     }
 
@@ -103,14 +103,15 @@ impl EbpfAcceptObservation {
             address_family,
             remote_port,
             remote_address,
-            reserved: 0,
             fd_table_epoch: 0,
+            fd_generation: 0,
         }
     }
 
-    pub const fn with_fd_table_epoch(self, fd_table_epoch: u64) -> Self {
+    pub const fn with_descriptor_lease(self, fd_table_epoch: u64, fd_generation: u64) -> Self {
         Self {
             fd_table_epoch,
+            fd_generation,
             ..self
         }
     }
@@ -126,6 +127,7 @@ pub struct EbpfConnectObservation {
     pub remote_address: [u8; 16],
     pub reserved: u32,
     pub fd_table_epoch: u64,
+    pub fd_generation: u64,
 }
 
 impl EbpfConnectObservation {
@@ -138,6 +140,7 @@ impl EbpfConnectObservation {
             remote_address: [0; 16],
             reserved: 0,
             fd_table_epoch: 0,
+            fd_generation: 0,
         }
     }
 
@@ -156,12 +159,14 @@ impl EbpfConnectObservation {
             remote_address,
             reserved: 0,
             fd_table_epoch: 0,
+            fd_generation: 0,
         }
     }
 
-    pub const fn with_fd_table_epoch(self, fd_table_epoch: u64) -> Self {
+    pub const fn with_descriptor_lease(self, fd_table_epoch: u64, fd_generation: u64) -> Self {
         Self {
             fd_table_epoch,
+            fd_generation,
             ..self
         }
     }
@@ -172,11 +177,16 @@ impl EbpfConnectObservation {
 pub struct EbpfCloseObservation {
     pub fd: i32,
     pub reserved: u32,
+    pub fd_generation: u64,
 }
 
 impl EbpfCloseObservation {
-    pub const fn observed(fd: i32) -> Self {
-        Self { fd, reserved: 0 }
+    pub const fn observed(fd: i32, fd_generation: u64) -> Self {
+        Self {
+            fd,
+            reserved: 0,
+            fd_generation,
+        }
     }
 }
 
@@ -203,8 +213,9 @@ impl EbpfCloseRangeObservation {
 pub struct EbpfSocketWriteSample {
     pub fd: i32,
     pub original_len: u32,
+    pub fd_generation: u64,
     pub captured_len: u16,
-    pub reserved: u16,
+    pub reserved: [u8; 6],
     pub buffer: [u8; EBPF_SOCKET_WRITE_SAMPLE_BYTES],
 }
 
@@ -213,14 +224,16 @@ pub struct EbpfSocketWriteSample {
 pub struct EbpfSocketReadSample {
     pub fd: i32,
     pub original_len: u32,
+    pub fd_generation: u64,
     pub captured_len: u16,
-    pub reserved: u16,
+    pub reserved: [u8; 6],
     pub buffer: [u8; EBPF_SOCKET_READ_SAMPLE_BYTES],
 }
 
 impl EbpfSocketReadSample {
     pub const fn new(
         fd: i32,
+        fd_generation: u64,
         original_len: u32,
         captured_len: u16,
         buffer: [u8; EBPF_SOCKET_READ_SAMPLE_BYTES],
@@ -228,8 +241,9 @@ impl EbpfSocketReadSample {
         Self {
             fd,
             original_len,
+            fd_generation,
             captured_len,
-            reserved: 0,
+            reserved: [0; 6],
             buffer,
         }
     }
@@ -238,6 +252,7 @@ impl EbpfSocketReadSample {
 impl EbpfSocketWriteSample {
     pub const fn new(
         fd: i32,
+        fd_generation: u64,
         original_len: u32,
         captured_len: u16,
         buffer: [u8; EBPF_SOCKET_WRITE_SAMPLE_BYTES],
@@ -245,8 +260,9 @@ impl EbpfSocketWriteSample {
         Self {
             fd,
             original_len,
+            fd_generation,
             captured_len,
-            reserved: 0,
+            reserved: [0; 6],
             buffer,
         }
     }
@@ -426,7 +442,7 @@ impl EbpfSocketReadSampleRecord {
     }
 
     pub fn clear_sample(&mut self) {
-        self.sample = EbpfSocketReadSample::new(0, 0, 0, [0; EBPF_SOCKET_READ_SAMPLE_BYTES]);
+        self.sample = EbpfSocketReadSample::new(0, 0, 0, 0, [0; EBPF_SOCKET_READ_SAMPLE_BYTES]);
     }
 
     pub fn socket_read_buffer_mut(&mut self) -> &mut [u8; EBPF_SOCKET_READ_SAMPLE_BYTES] {
@@ -451,8 +467,9 @@ impl EbpfSocketReadSampleRecord {
         self.command = metadata.command;
         self.sample.fd = sample.fd;
         self.sample.original_len = sample.original_len;
+        self.sample.fd_generation = sample.fd_generation;
         self.sample.captured_len = sample.captured_len;
-        self.sample.reserved = 0;
+        self.sample.reserved = [0; 6];
     }
 }
 
@@ -482,7 +499,7 @@ impl EbpfSocketWriteSampleRecord {
     }
 
     pub fn clear_sample(&mut self) {
-        self.sample = EbpfSocketWriteSample::new(0, 0, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]);
+        self.sample = EbpfSocketWriteSample::new(0, 0, 0, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]);
     }
 
     pub fn socket_write_buffer_mut(&mut self) -> &mut [u8; EBPF_SOCKET_WRITE_SAMPLE_BYTES] {
@@ -507,8 +524,9 @@ impl EbpfSocketWriteSampleRecord {
         self.command = metadata.command;
         self.sample.fd = sample.fd;
         self.sample.original_len = sample.original_len;
+        self.sample.fd_generation = sample.fd_generation;
         self.sample.captured_len = sample.captured_len;
-        self.sample.reserved = 0;
+        self.sample.reserved = [0; 6];
     }
 }
 
@@ -738,6 +756,7 @@ pub struct EbpfProcessProbeMetadata {
 pub struct EbpfSocketWriteMetadata {
     pub fd: i32,
     pub original_len: u32,
+    pub fd_generation: u64,
     pub captured_len: u16,
 }
 
@@ -745,6 +764,7 @@ pub struct EbpfSocketWriteMetadata {
 pub struct EbpfSocketReadMetadata {
     pub fd: i32,
     pub original_len: u32,
+    pub fd_generation: u64,
     pub captured_len: u16,
 }
 
@@ -926,10 +946,10 @@ fn empty_process_probe_event(header: EbpfEventHeader, command: [u8; 16]) -> Ebpf
         command,
         accept: EbpfAcceptObservation::unavailable(0, 0, 0),
         connect: EbpfConnectObservation::unavailable(0, 0),
-        close: EbpfCloseObservation::observed(0),
+        close: EbpfCloseObservation::observed(0, 0),
         close_range: EbpfCloseRangeObservation::observed(0, 0),
-        socket_write: EbpfSocketWriteSample::new(0, 0, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
-        socket_read: EbpfSocketReadSample::new(0, 0, 0, [0; EBPF_SOCKET_READ_SAMPLE_BYTES]),
+        socket_write: EbpfSocketWriteSample::new(0, 0, 0, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
+        socket_read: EbpfSocketReadSample::new(0, 0, 0, 0, [0; EBPF_SOCKET_READ_SAMPLE_BYTES]),
     }
 }
 
@@ -943,8 +963,8 @@ fn decode_accept_observation(bytes: &[u8]) -> EbpfAcceptObservation {
         address_family: read_u16(bytes, 12),
         remote_port: read_u16(bytes, 14),
         remote_address,
-        reserved: read_u64(bytes, 32),
-        fd_table_epoch: read_u64(bytes, 40),
+        fd_table_epoch: read_u64(bytes, 32),
+        fd_generation: read_u64(bytes, 40),
     }
 }
 
@@ -955,8 +975,8 @@ fn encode_accept_observation(bytes: &mut [u8], accept: EbpfAcceptObservation) {
     write_u16(bytes, 12, accept.address_family);
     write_u16(bytes, 14, accept.remote_port);
     bytes[16..32].copy_from_slice(&accept.remote_address);
-    write_u64(bytes, 32, accept.reserved);
-    write_u64(bytes, 40, accept.fd_table_epoch);
+    write_u64(bytes, 32, accept.fd_table_epoch);
+    write_u64(bytes, 40, accept.fd_generation);
 }
 
 fn decode_connect_observation(bytes: &[u8]) -> EbpfConnectObservation {
@@ -970,6 +990,7 @@ fn decode_connect_observation(bytes: &[u8]) -> EbpfConnectObservation {
         remote_address,
         reserved: read_u32(bytes, 28),
         fd_table_epoch: read_u64(bytes, 32),
+        fd_generation: read_u64(bytes, 40),
     }
 }
 
@@ -979,20 +1000,23 @@ fn encode_connect_observation(bytes: &mut [u8], connect: EbpfConnectObservation)
     write_u16(bytes, 8, connect.address_family);
     write_u16(bytes, 10, connect.remote_port);
     bytes[12..28].copy_from_slice(&connect.remote_address);
-    write_u32(bytes, 28, connect.reserved);
+    write_u32(bytes, 28, 0);
     write_u64(bytes, 32, connect.fd_table_epoch);
+    write_u64(bytes, 40, connect.fd_generation);
 }
 
 fn decode_close_observation(bytes: &[u8]) -> EbpfCloseObservation {
     EbpfCloseObservation {
         fd: read_i32(bytes, 0),
         reserved: read_u32(bytes, 4),
+        fd_generation: read_u64(bytes, 8),
     }
 }
 
 fn encode_close_observation(bytes: &mut [u8], close: EbpfCloseObservation) {
     write_i32(bytes, 0, close.fd);
     write_u32(bytes, 4, close.reserved);
+    write_u64(bytes, 8, close.fd_generation);
 }
 
 fn decode_close_range_observation(bytes: &[u8]) -> EbpfCloseRangeObservation {
@@ -1011,12 +1035,15 @@ fn encode_close_range_observation(bytes: &mut [u8], close_range: EbpfCloseRangeO
 
 fn decode_socket_write_sample(bytes: &[u8]) -> EbpfSocketWriteSample {
     let mut buffer = [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES];
-    buffer.copy_from_slice(&bytes[12..12 + EBPF_SOCKET_WRITE_SAMPLE_BYTES]);
+    buffer.copy_from_slice(&bytes[24..24 + EBPF_SOCKET_WRITE_SAMPLE_BYTES]);
     EbpfSocketWriteSample {
         fd: read_i32(bytes, 0),
         original_len: read_u32(bytes, 4),
-        captured_len: read_u16(bytes, 8),
-        reserved: read_u16(bytes, 10),
+        fd_generation: read_u64(bytes, 8),
+        captured_len: read_u16(bytes, 16),
+        reserved: [
+            bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+        ],
         buffer,
     }
 }
@@ -1024,19 +1051,23 @@ fn decode_socket_write_sample(bytes: &[u8]) -> EbpfSocketWriteSample {
 fn encode_socket_write_sample(bytes: &mut [u8], sample: EbpfSocketWriteSample) {
     write_i32(bytes, 0, sample.fd);
     write_u32(bytes, 4, sample.original_len);
-    write_u16(bytes, 8, sample.captured_len);
-    write_u16(bytes, 10, sample.reserved);
-    bytes[12..12 + EBPF_SOCKET_WRITE_SAMPLE_BYTES].copy_from_slice(&sample.buffer);
+    write_u64(bytes, 8, sample.fd_generation);
+    write_u16(bytes, 16, sample.captured_len);
+    bytes[18..24].copy_from_slice(&sample.reserved);
+    bytes[24..24 + EBPF_SOCKET_WRITE_SAMPLE_BYTES].copy_from_slice(&sample.buffer);
 }
 
 fn decode_socket_read_sample(bytes: &[u8]) -> EbpfSocketReadSample {
     let mut buffer = [0; EBPF_SOCKET_READ_SAMPLE_BYTES];
-    buffer.copy_from_slice(&bytes[12..12 + EBPF_SOCKET_READ_SAMPLE_BYTES]);
+    buffer.copy_from_slice(&bytes[24..24 + EBPF_SOCKET_READ_SAMPLE_BYTES]);
     EbpfSocketReadSample {
         fd: read_i32(bytes, 0),
         original_len: read_u32(bytes, 4),
-        captured_len: read_u16(bytes, 8),
-        reserved: read_u16(bytes, 10),
+        fd_generation: read_u64(bytes, 8),
+        captured_len: read_u16(bytes, 16),
+        reserved: [
+            bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+        ],
         buffer,
     }
 }
@@ -1044,9 +1075,10 @@ fn decode_socket_read_sample(bytes: &[u8]) -> EbpfSocketReadSample {
 fn encode_socket_read_sample(bytes: &mut [u8], sample: EbpfSocketReadSample) {
     write_i32(bytes, 0, sample.fd);
     write_u32(bytes, 4, sample.original_len);
-    write_u16(bytes, 8, sample.captured_len);
-    write_u16(bytes, 10, sample.reserved);
-    bytes[12..12 + EBPF_SOCKET_READ_SAMPLE_BYTES].copy_from_slice(&sample.buffer);
+    write_u64(bytes, 8, sample.fd_generation);
+    write_u16(bytes, 16, sample.captured_len);
+    bytes[18..24].copy_from_slice(&sample.reserved);
+    bytes[24..24 + EBPF_SOCKET_READ_SAMPLE_BYTES].copy_from_slice(&sample.buffer);
 }
 
 fn validate_socket_write_sample(event: EbpfProcessProbeEvent) -> Result<(), EbpfEventDecodeError> {
@@ -1127,28 +1159,28 @@ mod tests {
     fn process_event_layout_fits_ringbuf_alignment() {
         assert_eq!(size_of::<EbpfAcceptObservation>(), 48);
         assert_eq!(align_of::<EbpfAcceptObservation>(), 8);
-        assert_eq!(size_of::<EbpfConnectObservation>(), 40);
+        assert_eq!(size_of::<EbpfConnectObservation>(), 48);
         assert_eq!(align_of::<EbpfConnectObservation>(), 8);
-        assert_eq!(size_of::<EbpfCloseObservation>(), 8);
-        assert_eq!(align_of::<EbpfCloseObservation>(), 4);
+        assert_eq!(size_of::<EbpfCloseObservation>(), 16);
+        assert_eq!(align_of::<EbpfCloseObservation>(), 8);
         assert_eq!(size_of::<EbpfCloseRangeObservation>(), 12);
         assert_eq!(align_of::<EbpfCloseRangeObservation>(), 4);
-        assert_eq!(size_of::<EbpfSocketWriteSample>(), 268);
-        assert_eq!(align_of::<EbpfSocketWriteSample>(), 4);
-        assert_eq!(size_of::<EbpfSocketReadSample>(), 268);
-        assert_eq!(align_of::<EbpfSocketReadSample>(), 4);
+        assert_eq!(size_of::<EbpfSocketWriteSample>(), 280);
+        assert_eq!(align_of::<EbpfSocketWriteSample>(), 8);
+        assert_eq!(size_of::<EbpfSocketReadSample>(), 280);
+        assert_eq!(align_of::<EbpfSocketReadSample>(), 8);
         assert_eq!(size_of::<EbpfAcceptTracepointRecord>(), 96);
         assert_eq!(align_of::<EbpfAcceptTracepointRecord>(), 8);
-        assert_eq!(size_of::<EbpfConnectTracepointRecord>(), 88);
+        assert_eq!(size_of::<EbpfConnectTracepointRecord>(), 96);
         assert_eq!(align_of::<EbpfConnectTracepointRecord>(), 8);
-        assert_eq!(size_of::<EbpfCloseTracepointRecord>(), 56);
-        assert_eq!(align_of::<EbpfCloseTracepointRecord>(), 4);
+        assert_eq!(size_of::<EbpfCloseTracepointRecord>(), 64);
+        assert_eq!(align_of::<EbpfCloseTracepointRecord>(), 8);
         assert_eq!(size_of::<EbpfCloseRangeTracepointRecord>(), 60);
         assert_eq!(align_of::<EbpfCloseRangeTracepointRecord>(), 4);
-        assert_eq!(size_of::<EbpfSocketWriteSampleRecord>(), 316);
-        assert_eq!(align_of::<EbpfSocketWriteSampleRecord>(), 4);
-        assert_eq!(size_of::<EbpfSocketReadSampleRecord>(), 316);
-        assert_eq!(align_of::<EbpfSocketReadSampleRecord>(), 4);
+        assert_eq!(size_of::<EbpfSocketWriteSampleRecord>(), 328);
+        assert_eq!(align_of::<EbpfSocketWriteSampleRecord>(), 8);
+        assert_eq!(size_of::<EbpfSocketReadSampleRecord>(), 328);
+        assert_eq!(align_of::<EbpfSocketReadSampleRecord>(), 8);
         assert_eq!(8 % align_of::<EbpfSocketWriteSampleRecord>(), 0);
         assert_eq!(8 % align_of::<EbpfSocketReadSampleRecord>(), 0);
     }
@@ -1171,8 +1203,8 @@ mod tests {
         assert_eq!(offset_of!(EbpfAcceptObservation, address_family), 12);
         assert_eq!(offset_of!(EbpfAcceptObservation, remote_port), 14);
         assert_eq!(offset_of!(EbpfAcceptObservation, remote_address), 16);
-        assert_eq!(offset_of!(EbpfAcceptObservation, reserved), 32);
-        assert_eq!(offset_of!(EbpfAcceptObservation, fd_table_epoch), 40);
+        assert_eq!(offset_of!(EbpfAcceptObservation, fd_table_epoch), 32);
+        assert_eq!(offset_of!(EbpfAcceptObservation, fd_generation), 40);
         assert_eq!(offset_of!(EbpfConnectObservation, fd), 0);
         assert_eq!(offset_of!(EbpfConnectObservation, addrlen), 4);
         assert_eq!(offset_of!(EbpfConnectObservation, address_family), 8);
@@ -1180,21 +1212,25 @@ mod tests {
         assert_eq!(offset_of!(EbpfConnectObservation, remote_address), 12);
         assert_eq!(offset_of!(EbpfConnectObservation, reserved), 28);
         assert_eq!(offset_of!(EbpfConnectObservation, fd_table_epoch), 32);
+        assert_eq!(offset_of!(EbpfConnectObservation, fd_generation), 40);
         assert_eq!(offset_of!(EbpfCloseObservation, fd), 0);
         assert_eq!(offset_of!(EbpfCloseObservation, reserved), 4);
+        assert_eq!(offset_of!(EbpfCloseObservation, fd_generation), 8);
         assert_eq!(offset_of!(EbpfCloseRangeObservation, first_fd), 0);
         assert_eq!(offset_of!(EbpfCloseRangeObservation, last_fd), 4);
         assert_eq!(offset_of!(EbpfCloseRangeObservation, reserved), 8);
         assert_eq!(offset_of!(EbpfSocketWriteSample, fd), 0);
         assert_eq!(offset_of!(EbpfSocketWriteSample, original_len), 4);
-        assert_eq!(offset_of!(EbpfSocketWriteSample, captured_len), 8);
-        assert_eq!(offset_of!(EbpfSocketWriteSample, reserved), 10);
-        assert_eq!(offset_of!(EbpfSocketWriteSample, buffer), 12);
+        assert_eq!(offset_of!(EbpfSocketWriteSample, fd_generation), 8);
+        assert_eq!(offset_of!(EbpfSocketWriteSample, captured_len), 16);
+        assert_eq!(offset_of!(EbpfSocketWriteSample, reserved), 18);
+        assert_eq!(offset_of!(EbpfSocketWriteSample, buffer), 24);
         assert_eq!(offset_of!(EbpfSocketReadSample, fd), 0);
         assert_eq!(offset_of!(EbpfSocketReadSample, original_len), 4);
-        assert_eq!(offset_of!(EbpfSocketReadSample, captured_len), 8);
-        assert_eq!(offset_of!(EbpfSocketReadSample, reserved), 10);
-        assert_eq!(offset_of!(EbpfSocketReadSample, buffer), 12);
+        assert_eq!(offset_of!(EbpfSocketReadSample, fd_generation), 8);
+        assert_eq!(offset_of!(EbpfSocketReadSample, captured_len), 16);
+        assert_eq!(offset_of!(EbpfSocketReadSample, reserved), 18);
+        assert_eq!(offset_of!(EbpfSocketReadSample, buffer), 24);
         assert_eq!(offset_of!(EbpfAcceptTracepointRecord, header), 0);
         assert_eq!(offset_of!(EbpfAcceptTracepointRecord, command), 32);
         assert_eq!(offset_of!(EbpfAcceptTracepointRecord, accept), 48);
@@ -1230,7 +1266,7 @@ mod tests {
                 443,
                 [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             )
-            .with_fd_table_epoch(9),
+            .with_descriptor_lease(9, 10),
             EBPF_CONNECT_REMOTE_ENDPOINT_VALID,
         );
 
@@ -1259,6 +1295,7 @@ mod tests {
         assert_eq!(connect.remote_port, 443);
         assert_eq!(connect.remote_address[0..4], [127, 0, 0, 1]);
         assert_eq!(connect.fd_table_epoch, 9);
+        assert_eq!(connect.fd_generation, 10);
         assert!(event.close_observation().is_none());
     }
 
@@ -1278,7 +1315,7 @@ mod tests {
                 50_000,
                 [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             )
-            .with_fd_table_epoch(12),
+            .with_descriptor_lease(12, 13),
             EBPF_ACCEPT_REMOTE_ENDPOINT_VALID,
         );
 
@@ -1308,6 +1345,7 @@ mod tests {
         assert_eq!(accept.remote_port, 50_000);
         assert_eq!(accept.remote_address[0..4], [127, 0, 0, 1]);
         assert_eq!(accept.fd_table_epoch, 12);
+        assert_eq!(accept.fd_generation, 13);
         assert!(event.connect_observation().is_none());
         assert!(event.close_observation().is_none());
     }
@@ -1320,7 +1358,7 @@ mod tests {
             33,
             44,
             *b"0123456789abcdef",
-            EbpfCloseObservation::observed(7),
+            EbpfCloseObservation::observed(7, 10),
         );
 
         assert_eq!(event.header.magic, EBPF_MAGIC);
@@ -1343,6 +1381,7 @@ mod tests {
             .close_observation()
             .expect("close event should expose close payload");
         assert_eq!(close.fd, 7);
+        assert_eq!(close.fd_generation, 10);
         assert!(event.connect_observation().is_none());
     }
 
@@ -1405,6 +1444,7 @@ mod tests {
             .socket_write_sample()
             .expect("write event should expose write sample");
         assert_eq!(sample.fd, 7);
+        assert_eq!(sample.fd_generation, 10);
         assert_eq!(sample.original_len, 5);
         assert_eq!(sample.captured_len, 5);
         assert_eq!(&sample.buffer[..5], b"GET /");
@@ -1421,7 +1461,7 @@ mod tests {
             0,
             0,
             [0; 16],
-            EbpfSocketWriteSample::new(-1, 0, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
+            EbpfSocketWriteSample::new(-1, 0, 0, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
             0,
         );
         event.clear_sample();
@@ -1437,6 +1477,7 @@ mod tests {
             EbpfSocketWriteMetadata {
                 fd: 7,
                 original_len: 5,
+                fd_generation: 10,
                 captured_len: 5,
             },
             0,
@@ -1466,6 +1507,7 @@ mod tests {
             .socket_read_sample()
             .expect("read event should expose read sample");
         assert_eq!(sample.fd, 7);
+        assert_eq!(sample.fd_generation, 10);
         assert_eq!(sample.original_len, 5);
         assert_eq!(sample.captured_len, 5);
         assert_eq!(&sample.buffer[..5], b"HTTP/");
@@ -1482,7 +1524,7 @@ mod tests {
             0,
             0,
             [0; 16],
-            EbpfSocketReadSample::new(-1, 0, 0, [0; EBPF_SOCKET_READ_SAMPLE_BYTES]),
+            EbpfSocketReadSample::new(-1, 0, 0, 0, [0; EBPF_SOCKET_READ_SAMPLE_BYTES]),
             0,
         );
         event.clear_sample();
@@ -1498,6 +1540,7 @@ mod tests {
             EbpfSocketReadMetadata {
                 fd: 7,
                 original_len: 5,
+                fd_generation: 10,
                 captured_len: 5,
             },
             0,
@@ -1532,7 +1575,8 @@ mod tests {
                     EBPF_ADDRESS_FAMILY_INET,
                     443,
                     [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                ),
+                )
+                .with_descriptor_lease(1, 10),
                 EBPF_CONNECT_REMOTE_ENDPOINT_VALID,
             ),
             EbpfProcessProbeEvent::accept_tracepoint_observed(
@@ -1549,7 +1593,7 @@ mod tests {
                     50_000,
                     [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 )
-                .with_fd_table_epoch(2),
+                .with_descriptor_lease(2, 11),
                 EBPF_ACCEPT_REMOTE_ENDPOINT_VALID,
             ),
             EbpfProcessProbeEvent::close_tracepoint_observed(
@@ -1558,7 +1602,7 @@ mod tests {
                 33,
                 44,
                 *b"0123456789abcdef",
-                EbpfCloseObservation::observed(7),
+                EbpfCloseObservation::observed(7, 10),
             ),
             EbpfProcessProbeEvent::close_range_tracepoint_observed(
                 11,
@@ -1574,7 +1618,7 @@ mod tests {
                 33,
                 44,
                 *b"0123456789abcdef",
-                EbpfSocketWriteSample::new(7, 5, 5, write_sample_bytes(b"HTTP/")),
+                EbpfSocketWriteSample::new(7, 10, 5, 5, write_sample_bytes(b"HTTP/")),
                 EBPF_SOCKET_WRITE_TRUNCATED,
             ),
             EbpfProcessProbeEvent::socket_read_sampled(
@@ -1583,7 +1627,7 @@ mod tests {
                 33,
                 44,
                 *b"0123456789abcdef",
-                EbpfSocketReadSample::new(7, 5, 5, read_sample_bytes(b"HTTP/")),
+                EbpfSocketReadSample::new(7, 10, 5, 5, read_sample_bytes(b"HTTP/")),
                 EBPF_SOCKET_READ_TRUNCATED,
             ),
         ]
@@ -1780,7 +1824,7 @@ mod tests {
             33,
             44,
             *b"0123456789abcdef",
-            EbpfSocketWriteSample::new(7, original_len, captured_len, buffer),
+            EbpfSocketWriteSample::new(7, 10, original_len, captured_len, buffer),
             flags,
         )
     }
@@ -1806,7 +1850,7 @@ mod tests {
             33,
             44,
             *b"0123456789abcdef",
-            EbpfSocketReadSample::new(7, original_len, captured_len, buffer),
+            EbpfSocketReadSample::new(7, 10, original_len, captured_len, buffer),
             flags,
         )
     }
