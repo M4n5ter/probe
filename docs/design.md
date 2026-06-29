@@ -3115,8 +3115,10 @@ MITM backend contract：
   该限制把 hook 定位为本机 control plane，避免在每流量 enforcement 路径中混入 DNS、远程网络可用性和额外 TLS trust 语义。
 - `interception.mitm.policy_hook.timeout_ms` 是 hook 调用的端到端 deadline。
   `max_response_bytes` 只限制响应 body；响应 header 有独立固定上限。
-  control endpoint 超时、连接失败、非 2xx HTTP status、缺少或重复 `Content-Length`、`chunked` 响应体、响应体超限或响应
-  JSON 无法解析都会生成 failed enforcement decision，不会被静默降级为允许转发。
+  control endpoint 超时、连接失败、非 2xx HTTP status、缺少 response body framing、重复 `Content-Length`、`Content-Length`
+  与 `Transfer-Encoding` 混用、非 `chunked` transfer coding、chunked framing 错误、响应体超限或响应 JSON 无法解析都会生成 failed
+  enforcement decision，不会被静默降级为允许转发。
+  Hook response 支持 `Content-Length` 和未压缩 `Transfer-Encoding: chunked`，便于对接常见本机 HTTP control endpoint。
 - hook request JSON 包含 `requested_action`、完整 `verdict` 和触发该 verdict 的 `EventEnvelope`。
   hook response JSON 使用 `outcome` 标签，支持 `delegated` 与 `unsupported`：
 

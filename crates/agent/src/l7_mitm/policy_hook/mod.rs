@@ -1,10 +1,6 @@
-use std::{
-    convert::TryFrom,
-    io::{self, Read, Write},
-    net::{SocketAddr, TcpStream},
-    num::NonZeroU32,
-    time::{Duration, Instant},
-};
+use std::{convert::TryFrom, io, num::NonZeroU32, time::Duration};
+
+mod http;
 
 use enforcement::{
     EnforcementBackendRequest, EnforcementError, ProxySideEnforcementHook,
@@ -18,7 +14,10 @@ use runtime::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
+use http::{
+    HookDeadline, HttpJsonEndpoint, HttpJsonHookHttpResponse, read_hook_response,
+    write_hook_request,
+};
 
 pub(crate) fn hook_from_plan(
     plan: &TransparentInterceptionMitmPolicyHookPlan,
@@ -138,22 +137,6 @@ impl ProxySideEnforcementHook for HttpJsonL7MitmPolicyHook {
     }
 }
 
-struct HttpJsonEndpoint {
-    address: SocketAddr,
-    authority: String,
-    path_and_query: String,
-}
-
-impl HttpJsonEndpoint {
-    fn from_plan(endpoint: &TransparentInterceptionMitmPolicyHookEndpointPlan) -> Self {
-        Self {
-            address: endpoint.address,
-            authority: endpoint.authority.clone(),
-            path_and_query: endpoint.path_and_query.clone(),
-        }
-    }
-}
-
 #[derive(Serialize)]
 struct HttpJsonHookRequest<'a> {
     requested_action: Action,
@@ -166,51 +149,6 @@ struct HttpJsonHookRequest<'a> {
 enum HttpJsonHookResponse {
     Delegated { reason: Option<String> },
     Unsupported { reason: Option<String> },
-}
-
-fn write_hook_request(
-    stream: &mut TcpStream,
-    endpoint: &HttpJsonEndpoint,
-    payload: &[u8],
-    deadline: &HookDeadline,
-) -> Result<(), L7MitmPolicyHookError> {
-    let head = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        endpoint.path_and_query,
-        endpoint.authority,
-        payload.len()
-    );
-    write_all_with_deadline(stream, head.as_bytes(), deadline)?;
-    write_all_with_deadline(stream, payload, deadline)?;
-    deadline.set_write_timeout(stream)?;
-    stream.flush()?;
-    Ok(())
-}
-
-#[derive(Debug)]
-struct HttpJsonHookHttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
-fn read_hook_response(
-    mut stream: TcpStream,
-    max_response_bytes: usize,
-    deadline: &HookDeadline,
-) -> Result<HttpJsonHookHttpResponse, L7MitmPolicyHookError> {
-    let ResponseHead {
-        status,
-        content_length,
-        prefetched_body,
-    } = read_response_head(&mut stream, deadline)?;
-    let body = read_response_body(
-        &mut stream,
-        prefetched_body,
-        content_length,
-        max_response_bytes,
-        deadline,
-    )?;
-    Ok(HttpJsonHookHttpResponse { status, body })
 }
 
 fn parse_hook_response(
@@ -237,211 +175,11 @@ fn parse_hook_response(
     }
 }
 
-#[derive(Debug)]
-struct ResponseHead {
-    status: u16,
-    content_length: usize,
-    prefetched_body: Vec<u8>,
-}
-
-fn read_response_head(
-    stream: &mut TcpStream,
-    deadline: &HookDeadline,
-) -> Result<ResponseHead, L7MitmPolicyHookError> {
-    let mut buffer = Vec::new();
-    let mut chunk = [0_u8; 512];
-    loop {
-        if let Some(header_end) = find_header_terminator(&buffer) {
-            if header_end > MAX_RESPONSE_HEADER_BYTES {
-                return Err(L7MitmPolicyHookError::InvalidResponse(format!(
-                    "response headers exceeded {MAX_RESPONSE_HEADER_BYTES} bytes"
-                )));
-            }
-            let head = parse_response_head(&buffer[..header_end])?;
-            return Ok(ResponseHead {
-                status: head.status,
-                content_length: head.content_length,
-                prefetched_body: buffer[header_end + 4..].to_vec(),
-            });
-        }
-        if buffer.len() > MAX_RESPONSE_HEADER_BYTES {
-            return Err(L7MitmPolicyHookError::InvalidResponse(format!(
-                "response headers exceeded {MAX_RESPONSE_HEADER_BYTES} bytes"
-            )));
-        }
-        deadline.set_read_timeout(stream)?;
-        let bytes_read = stream.read(&mut chunk)?;
-        if bytes_read == 0 {
-            return Err(L7MitmPolicyHookError::InvalidResponse(
-                "response ended before header terminator".to_string(),
-            ));
-        }
-        buffer.extend_from_slice(&chunk[..bytes_read]);
-    }
-}
-
-fn read_response_body(
-    stream: &mut TcpStream,
-    prefetched_body: Vec<u8>,
-    content_length: usize,
-    max_response_bytes: usize,
-    deadline: &HookDeadline,
-) -> Result<Vec<u8>, L7MitmPolicyHookError> {
-    if content_length > max_response_bytes {
-        return Err(L7MitmPolicyHookError::ResponseTooLarge {
-            limit: max_response_bytes,
-        });
-    }
-    let mut body = Vec::with_capacity(content_length);
-    body.extend_from_slice(&prefetched_body[..prefetched_body.len().min(content_length)]);
-    let mut chunk = [0_u8; 512];
-    while body.len() < content_length {
-        deadline.set_read_timeout(stream)?;
-        let remaining = content_length - body.len();
-        let read_capacity = remaining.min(chunk.len());
-        let bytes_read = stream.read(&mut chunk[..read_capacity])?;
-        if bytes_read == 0 {
-            return Err(L7MitmPolicyHookError::InvalidResponse(
-                "response ended before body was complete".to_string(),
-            ));
-        }
-        body.extend_from_slice(&chunk[..bytes_read]);
-    }
-    Ok(body)
-}
-
-fn find_header_terminator(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct ParsedResponseHead {
-    status: u16,
-    content_length: usize,
-}
-
-fn parse_response_head(head: &[u8]) -> Result<ParsedResponseHead, L7MitmPolicyHookError> {
-    let head = std::str::from_utf8(head).map_err(|error| {
-        L7MitmPolicyHookError::InvalidResponse(format!("response headers are not UTF-8: {error}"))
-    })?;
-    let mut lines = head.split("\r\n");
-    let status_line = lines
-        .next()
-        .ok_or_else(|| L7MitmPolicyHookError::InvalidResponse("missing status line".to_string()))?;
-    let status = parse_status(status_line)?;
-    let mut content_length = None;
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            return Err(L7MitmPolicyHookError::InvalidResponse(format!(
-                "malformed response header: {line}"
-            )));
-        };
-        if name.eq_ignore_ascii_case("transfer-encoding")
-            && value
-                .split(',')
-                .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
-        {
-            return Err(L7MitmPolicyHookError::InvalidResponse(
-                "chunked response bodies are not supported".to_string(),
-            ));
-        }
-        if name.eq_ignore_ascii_case("content-length") {
-            if content_length.is_some() {
-                return Err(L7MitmPolicyHookError::InvalidResponse(
-                    "duplicate Content-Length".to_string(),
-                ));
-            }
-            content_length = Some(value.trim().parse::<usize>().map_err(|error| {
-                L7MitmPolicyHookError::InvalidResponse(format!("invalid Content-Length: {error}"))
-            })?);
-        }
-    }
-    Ok(ParsedResponseHead {
-        status,
-        content_length: content_length.ok_or_else(|| {
-            L7MitmPolicyHookError::InvalidResponse("missing Content-Length".to_string())
-        })?,
-    })
-}
-
-fn parse_status(status_line: &str) -> Result<u16, L7MitmPolicyHookError> {
-    let mut parts = status_line.split_whitespace();
-    let version = parts.next();
-    let status = parts.next();
-    if version != Some("HTTP/1.1") && version != Some("HTTP/1.0") {
-        return Err(L7MitmPolicyHookError::InvalidResponse(
-            "status line must start with HTTP/1.1 or HTTP/1.0".to_string(),
-        ));
-    }
-    status
-        .ok_or_else(|| L7MitmPolicyHookError::InvalidResponse("missing status code".to_string()))?
-        .parse::<u16>()
-        .map_err(|error| {
-            L7MitmPolicyHookError::InvalidResponse(format!("invalid status code: {error}"))
-        })
-}
-
-struct HookDeadline {
-    expires_at: Instant,
-}
-
-impl HookDeadline {
-    fn after(timeout: Duration) -> Self {
-        Self {
-            expires_at: Instant::now()
-                .checked_add(timeout)
-                .expect("validated timeout must fit Instant"),
-        }
-    }
-
-    fn remaining(&self) -> Result<Duration, L7MitmPolicyHookError> {
-        self.expires_at
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or(L7MitmPolicyHookError::Timeout)
-    }
-
-    fn set_read_timeout(&self, stream: &TcpStream) -> Result<(), L7MitmPolicyHookError> {
-        stream.set_read_timeout(Some(self.remaining()?))?;
-        Ok(())
-    }
-
-    fn set_write_timeout(&self, stream: &TcpStream) -> Result<(), L7MitmPolicyHookError> {
-        stream.set_write_timeout(Some(self.remaining()?))?;
-        Ok(())
-    }
-}
-
-fn write_all_with_deadline(
-    stream: &mut TcpStream,
-    mut bytes: &[u8],
-    deadline: &HookDeadline,
-) -> Result<(), L7MitmPolicyHookError> {
-    while !bytes.is_empty() {
-        deadline.set_write_timeout(stream)?;
-        match stream.write(bytes) {
-            Ok(0) => {
-                return Err(L7MitmPolicyHookError::Io(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write MITM policy hook request",
-                )));
-            }
-            Ok(written) => bytes = &bytes[written..],
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{BufRead, BufReader},
-        net::TcpListener,
+        io::{BufRead, BufReader, Read, Write},
+        net::{SocketAddr, TcpListener, TcpStream},
         thread,
     };
 
@@ -493,7 +231,12 @@ mod tests {
             })
             .expect("deny verdict should be evaluated");
 
-        assert_eq!(decision.outcome, EnforcementOutcome::Delegated);
+        assert_eq!(
+            decision.outcome,
+            EnforcementOutcome::Delegated,
+            "{}",
+            decision.reason
+        );
         assert_eq!(decision.effective_action, Action::Deny);
         let body = server.join().expect("server thread should not panic")?;
         assert!(body.contains("\"requested_action\":\"deny\""));
@@ -578,7 +321,12 @@ mod tests {
             })
             .expect("deny verdict should be evaluated");
 
-        assert_eq!(decision.outcome, EnforcementOutcome::Delegated);
+        assert_eq!(
+            decision.outcome,
+            EnforcementOutcome::Delegated,
+            "{}",
+            decision.reason
+        );
         let head = server.join().expect("server thread should not panic")?;
         assert!(head.starts_with("POST /typed-hook?source=plan HTTP/1.1\r\n"));
         assert!(head.contains(&format!("Host: {}\r\n", endpoint.authority)));
@@ -644,25 +392,54 @@ mod tests {
     }
 
     #[test]
-    fn http_json_response_limit_applies_to_body() -> Result<(), Box<dyn std::error::Error>> {
+    fn http_json_hook_accepts_chunked_response_body() -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
-        let address = listener.local_addr()?;
+        let endpoint = endpoint_plan(listener.local_addr()?);
         let server = thread::spawn(move || -> Result<(), String> {
             let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
-            write_response(
-                &mut stream,
-                r#"{"outcome":"delegated","reason":"oversized"}"#,
+            let _ = read_request_body(&stream)?;
+            let first = "{\"outcome\":\"delegated\",\"reason\":\"";
+            let second = r#"chunked accepted"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x};part=one\r\n{}\r\n{:x}\r\n{}\r\n0\r\nX-Hook: done\r\n\r\n",
+                first.len(),
+                first,
+                second.len(),
+                second
             )
+            .map_err(|error| error.to_string())
         });
-        let stream = TcpStream::connect(address)?;
+        let hook = HttpJsonL7MitmPolicyHook::new(
+            &endpoint,
+            1_000,
+            4_096,
+            L7MitmPolicyHookConnectionOptions::default(),
+        )?;
+        let verdict = Verdict {
+            action: Action::Deny,
+            scope: VerdictScope::Flow,
+            reason: "blocked".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+        let trigger = outbound_event();
 
-        let error = read_hook_response(stream, 8, &test_deadline())
-            .expect_err("body must exceed configured limit");
+        let decision = planner_with_hook(hook)?
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("deny verdict should be evaluated");
 
-        assert!(matches!(
-            error,
-            L7MitmPolicyHookError::ResponseTooLarge { limit: 8 }
-        ));
+        assert_eq!(
+            decision.outcome,
+            EnforcementOutcome::Delegated,
+            "{}",
+            decision.reason
+        );
+        assert_eq!(decision.effective_action, Action::Deny);
+        assert!(decision.reason.contains("chunked accepted"));
         server.join().expect("server thread should not panic")?;
         Ok(())
     }
@@ -693,48 +470,6 @@ mod tests {
         let error = parse_hook_response(response).expect_err("invalid JSON must fail");
 
         assert!(matches!(error, L7MitmPolicyHookError::Deserialize(_)));
-    }
-
-    #[test]
-    fn http_json_response_rejects_chunked_even_after_content_length() {
-        let error = parse_response_head(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: gzip, chunked\r\n",
-        )
-        .expect_err("chunked response bodies must be rejected");
-
-        assert!(matches!(error, L7MitmPolicyHookError::InvalidResponse(_)));
-    }
-
-    #[test]
-    fn http_json_response_rejects_duplicate_content_length() {
-        let error =
-            parse_response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n")
-                .expect_err("duplicate content length must be rejected");
-
-        assert!(matches!(error, L7MitmPolicyHookError::InvalidResponse(_)));
-    }
-
-    #[test]
-    fn http_json_response_rejects_oversized_headers() -> Result<(), Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let address = listener.local_addr()?;
-        let server = thread::spawn(move || -> Result<(), String> {
-            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nX-Padding: {}\r\n",
-                "a".repeat(MAX_RESPONSE_HEADER_BYTES)
-            )
-            .map_err(|error| error.to_string())
-        });
-        let stream = TcpStream::connect(address)?;
-
-        let error = read_hook_response(stream, 4_096, &test_deadline())
-            .expect_err("oversized headers must fail before body parsing");
-
-        assert!(matches!(error, L7MitmPolicyHookError::InvalidResponse(_)));
-        server.join().expect("server thread should not panic")?;
-        Ok(())
     }
 
     fn planner_with_hook(
@@ -812,10 +547,6 @@ mod tests {
             body
         )
         .map_err(|error| error.to_string())
-    }
-
-    fn test_deadline() -> HookDeadline {
-        HookDeadline::after(Duration::from_secs(1))
     }
 
     fn outbound_event() -> EventEnvelope {
