@@ -290,6 +290,7 @@ fn build_libssl_uprobe_plaintext_provider(
         Box::new(ProcfsLibsslFlowResolver::new(attached_processes.clone())),
     ) {
         LibsslUprobePlaintextOpen::Enabled(provider) => {
+            let provider = *provider;
             Ok(TlsPlaintextInstrumentationBuild::enabled(
                 provider.with_output_selector(output_selector),
                 attach_planner,

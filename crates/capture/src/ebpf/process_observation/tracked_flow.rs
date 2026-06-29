@@ -1,6 +1,6 @@
-use std::collections::{HashMap, VecDeque};
-
 use probe_core::{Direction, FlowContext};
+
+use crate::bounded_recency::BoundedRecencyMap;
 
 use super::{
     EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfSocketReadObservation,
@@ -8,9 +8,7 @@ use super::{
 };
 
 pub(super) struct TrackedEbpfFlows {
-    by_descriptor: HashMap<EbpfDescriptorKey, TrackedEbpfFlow>,
-    recency_order: VecDeque<EbpfDescriptorKey>,
-    max_tracked_flows: usize,
+    by_descriptor: BoundedRecencyMap<EbpfDescriptorKey, TrackedEbpfFlow>,
 }
 
 pub(super) struct TrackedEbpfFlow {
@@ -23,9 +21,7 @@ pub(super) struct TrackedEbpfFlow {
 impl TrackedEbpfFlows {
     pub(super) fn bounded(max_tracked_flows: usize) -> Self {
         Self {
-            by_descriptor: HashMap::new(),
-            recency_order: VecDeque::new(),
-            max_tracked_flows,
+            by_descriptor: BoundedRecencyMap::new(max_tracked_flows),
         }
     }
 
@@ -63,9 +59,8 @@ impl TrackedEbpfFlows {
     }
 
     pub(super) fn active_payload_loss_targets(&self) -> impl Iterator<Item = &TrackedEbpfFlow> {
-        self.recency_order
-            .iter()
-            .filter_map(|key| self.by_descriptor.get(key))
+        self.by_descriptor
+            .values_by_recency()
             .filter(|tracked| !tracked.payload_directions.is_empty())
     }
 
@@ -89,15 +84,6 @@ impl TrackedEbpfFlows {
         flow: FlowContext,
         payload_directions: PayloadDirections,
     ) {
-        if self.max_tracked_flows == 0 {
-            return;
-        }
-        if self.by_descriptor.contains_key(&key) {
-            self.recency_order.retain(|tracked_key| *tracked_key != key);
-        } else {
-            self.evict_until_available();
-        }
-        self.recency_order.push_back(key);
         self.by_descriptor.insert(
             key,
             TrackedEbpfFlow {
@@ -110,9 +96,7 @@ impl TrackedEbpfFlows {
     }
 
     fn remove(&mut self, key: EbpfDescriptorKey) -> Option<TrackedEbpfFlow> {
-        let flow = self.by_descriptor.remove(&key)?;
-        self.recency_order.retain(|tracked_key| *tracked_key != key);
-        Some(flow)
+        self.by_descriptor.remove(&key)
     }
 
     fn get_recent_mut(
@@ -127,21 +111,8 @@ impl TrackedEbpfFlows {
         {
             return None;
         }
-        self.recency_order.retain(|tracked_key| *tracked_key != key);
-        self.recency_order.push_back(key);
+        self.by_descriptor.refresh(&key);
         self.by_descriptor.get_mut(&key)
-    }
-
-    fn evict_until_available(&mut self) {
-        while self.by_descriptor.len() >= self.max_tracked_flows {
-            let Some(evicted) = self.recency_order.pop_front() else {
-                self.by_descriptor.clear();
-                break;
-            };
-            if self.by_descriptor.remove(&evicted).is_some() {
-                break;
-            }
-        }
     }
 }
 

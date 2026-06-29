@@ -1,3 +1,4 @@
+mod bounded_recency;
 mod ebpf;
 mod event;
 mod libpcap;

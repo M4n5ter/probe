@@ -1,5 +1,6 @@
 mod attach;
 mod bridge;
+mod loss;
 mod probe;
 mod provider;
 mod record;
