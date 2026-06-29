@@ -1,6 +1,6 @@
 use std::{fs, path::Path, process::ExitCode};
 
-use probe_core::{Direction, EventEnvelope, EventKind, WebSocketOpcode};
+use probe_core::{Direction, EventEnvelope, EventKind, WebSocketMessageOpcode, WebSocketOpcode};
 use storage::{FjallSpool, StoredEvent};
 
 use super::harness::{decode_envelope, e2e_error, run_agent_with_max_events, run_with_temp_root};
@@ -19,7 +19,7 @@ use super::websocket_expectations::{
 const CONTEXT: &str = "websocket";
 const WEBSOCKET_FEED_EVENT_COUNT: usize = 5;
 const WEBSOCKET_CAPTURE_READ_LIMIT: usize = WEBSOCKET_FEED_EVENT_COUNT + 1;
-const WEBSOCKET_EXPORT_EVENT_COUNT: usize = 8;
+const WEBSOCKET_EXPORT_EVENT_COUNT: usize = 10;
 const E2E_EXPORT_CURSOR_OWNER: &str = "e2e";
 const AGENT_ID: &str = "e2e-websocket-agent";
 const CONFIG_VERSION: &str = "e2e-websocket-plaintext-feed";
@@ -28,6 +28,7 @@ const POLICY_ID: &str = "e2e-websocket-policy";
 const POLICY_VERSION: &str = "e2e";
 const HANDOFF_ALERT: &str = "websocket handoff /chat chat";
 const FRAME_ALERT: &str = "websocket frame text 2";
+const MESSAGE_ALERT: &str = "websocket message text 2";
 
 pub(crate) fn run() -> ExitCode {
     match run_inner() {
@@ -136,7 +137,7 @@ fn write_policy_bundle(path: &Path) -> Result<(), std::io::Error> {
             r#"
 id = "{POLICY_ID}"
 version = "{POLICY_VERSION}"
-hooks = ["on_websocket_handoff", "on_websocket_frame"]
+hooks = ["on_websocket_handoff", "on_websocket_frame", "on_websocket_message"]
 "#
         ),
     )?;
@@ -150,6 +151,12 @@ end
 function on_websocket_frame(event)
   return probe.emit_alert(
     "websocket frame " .. event.kind.opcode.kind .. " " .. tostring(event.kind.payload_len)
+  )
+end
+
+function on_websocket_message(event)
+  return probe.emit_alert(
+    "websocket message " .. event.kind.opcode.kind .. " " .. tostring(event.kind.payload_len)
   )
 end
 "#,
@@ -259,7 +266,22 @@ fn assert_websocket_exports(
                         && !frame.masked
                         && matches!(frame.opcode, WebSocketOpcode::Text)
                         && frame.payload_len == FRAME_PAYLOAD_LEN
-                        && frame.payload_fingerprint.as_slice()
+                && frame.payload_fingerprint.as_slice()
+                    == FRAME_PAYLOAD_FINGERPRINT.as_slice()
+            )
+        })?;
+    let message_index =
+        export_event_position(envelopes, scenario, CONTEXT, "WebSocket message", |kind| {
+            matches!(
+                kind,
+                EventKind::WebSocketMessage(message)
+                    if message.direction == Direction::Inbound
+                        && message.message_sequence == 1
+                        && message.first_frame_sequence == 1
+                        && message.final_frame_sequence == 1
+                        && matches!(message.opcode, WebSocketMessageOpcode::Text)
+                        && message.payload_len == FRAME_PAYLOAD_LEN
+                        && message.payload_fingerprint.as_slice()
                             == FRAME_PAYLOAD_FINGERPRINT.as_slice()
             )
         })?;
@@ -275,6 +297,7 @@ fn assert_websocket_exports(
             ("HTTP 101 response", response_index),
             ("WebSocket handoff", handoff_index),
             ("WebSocket frame", frame_index),
+            ("WebSocket message", message_index),
             ("connection closed", closed_index),
         ],
     )?;
@@ -293,6 +316,13 @@ fn assert_websocket_exports(
         &expected_policy_version,
         CONTEXT,
         FRAME_ALERT,
+    )?;
+    assert_policy_alert(
+        envelopes,
+        scenario,
+        &expected_policy_version,
+        CONTEXT,
+        MESSAGE_ALERT,
     )?;
     assert_no_protocol_errors_after_handoff(envelopes, handoff_index)?;
     Ok(())

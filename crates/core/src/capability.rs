@@ -20,6 +20,8 @@ pub enum CapabilityKind {
     WebSocketHandoff,
     #[serde(rename = "websocket_frame")]
     WebSocketFrame,
+    #[serde(rename = "websocket_message")]
+    WebSocketMessage,
     LuaJit,
     DurableSpool,
     IngressJournal,
@@ -49,6 +51,7 @@ impl CapabilityKind {
             Self::Sse => "sse",
             Self::WebSocketHandoff => "websocket_handoff",
             Self::WebSocketFrame => "websocket_frame",
+            Self::WebSocketMessage => "websocket_message",
             Self::LuaJit => "lua_jit",
             Self::DurableSpool => "durable_spool",
             Self::IngressJournal => "ingress_journal",
@@ -210,6 +213,7 @@ mod tests {
             CapabilityKind::Sse,
             CapabilityKind::WebSocketHandoff,
             CapabilityKind::WebSocketFrame,
+            CapabilityKind::WebSocketMessage,
             CapabilityKind::LuaJit,
             CapabilityKind::DurableSpool,
             CapabilityKind::IngressJournal,

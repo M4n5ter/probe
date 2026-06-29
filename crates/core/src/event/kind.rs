@@ -21,6 +21,8 @@ pub enum EventKind {
     WebSocketHandoff(WebSocketHandoff),
     #[serde(rename = "websocket_frame")]
     WebSocketFrame(WebSocketFrame),
+    #[serde(rename = "websocket_message")]
+    WebSocketMessage(WebSocketMessage),
     OpaqueStream(OpaqueStream),
     CaptureLoss(CaptureLoss),
     Gap(Gap),
@@ -43,6 +45,7 @@ pub enum EventType {
     SseEvent,
     WebSocketHandoff,
     WebSocketFrame,
+    WebSocketMessage,
     OpaqueStream,
     CaptureLoss,
     Gap,
@@ -65,6 +68,7 @@ impl EventType {
             Self::SseEvent => "sse_event",
             Self::WebSocketHandoff => "websocket_handoff",
             Self::WebSocketFrame => "websocket_frame",
+            Self::WebSocketMessage => "websocket_message",
             Self::OpaqueStream => "opaque_stream",
             Self::CaptureLoss => "capture_loss",
             Self::Gap => "gap",
@@ -97,6 +101,7 @@ impl FromStr for EventType {
             "sse_event" => Ok(Self::SseEvent),
             "websocket_handoff" => Ok(Self::WebSocketHandoff),
             "websocket_frame" => Ok(Self::WebSocketFrame),
+            "websocket_message" => Ok(Self::WebSocketMessage),
             "opaque_stream" => Ok(Self::OpaqueStream),
             "capture_loss" => Ok(Self::CaptureLoss),
             "gap" => Ok(Self::Gap),
@@ -154,6 +159,7 @@ impl EventKind {
             Self::SseEvent(_) => EventType::SseEvent,
             Self::WebSocketHandoff(_) => EventType::WebSocketHandoff,
             Self::WebSocketFrame(_) => EventType::WebSocketFrame,
+            Self::WebSocketMessage(_) => EventType::WebSocketMessage,
             Self::OpaqueStream(_) => EventType::OpaqueStream,
             Self::CaptureLoss(_) => EventType::CaptureLoss,
             Self::Gap(_) => EventType::Gap,
@@ -175,6 +181,7 @@ impl EventKind {
             Self::SseEvent(event) => Some(event.direction),
             Self::WebSocketHandoff(handoff) => Some(handoff.direction),
             Self::WebSocketFrame(frame) => Some(frame.direction),
+            Self::WebSocketMessage(message) => Some(message.direction),
             Self::OpaqueStream(stream) => Some(stream.direction),
             Self::CaptureLoss(_) => None,
             Self::Gap(gap) => Some(gap.direction),
@@ -255,6 +262,26 @@ pub struct WebSocketFrame {
     pub payload_len: u64,
     pub masked: bool,
     pub payload_fingerprint: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSocketMessage {
+    pub direction: Direction,
+    pub stream_sequence: u64,
+    pub message_sequence: u64,
+    pub first_frame_sequence: u64,
+    pub final_frame_sequence: u64,
+    pub opcode: WebSocketMessageOpcode,
+    pub payload_len: u64,
+    pub payload_fingerprint: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+pub enum WebSocketMessageOpcode {
+    Text,
+    Binary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -510,7 +537,7 @@ mod tests {
         L7MitmAuditEvent, L7MitmAuditPhase, L7MitmExternalBackendAudit, L7MitmManagedProcessAudit,
         L7MitmManagedProcessBackendAudit, L7MitmReadinessProbeAudit, OpaqueStream,
         PolicyRuntimeError, ProtocolError, SseEvent, Verdict, VerdictScope, WebSocketFrame,
-        WebSocketHandoff, WebSocketOpcode,
+        WebSocketHandoff, WebSocketMessage, WebSocketMessageOpcode, WebSocketOpcode,
     };
 
     #[test]
@@ -553,6 +580,26 @@ mod tests {
     }
 
     #[test]
+    fn websocket_message_wire_type_matches_stable_event_name() {
+        let kind = EventKind::WebSocketMessage(WebSocketMessage {
+            direction: Direction::Inbound,
+            stream_sequence: 1,
+            message_sequence: 2,
+            first_frame_sequence: 3,
+            final_frame_sequence: 4,
+            opcode: WebSocketMessageOpcode::Text,
+            payload_len: 5,
+            payload_fingerprint: vec![1, 2, 3],
+        });
+        let value = serde_json::to_value(&kind).expect("event kind must serialize");
+
+        assert_eq!(kind.event_type(), EventType::WebSocketMessage);
+        assert_eq!(kind.name(), EventType::WebSocketMessage.as_str());
+        assert_eq!(value["type"], EventType::WebSocketMessage.as_str());
+        assert_eq!(value["opcode"]["kind"], "text");
+    }
+
+    #[test]
     fn event_type_round_trips_wire_name() -> Result<(), Box<dyn std::error::Error>> {
         for (event_type, expected) in event_type_wire_cases() {
             let value = serde_json::to_value(event_type)?;
@@ -572,7 +619,7 @@ mod tests {
         }
     }
 
-    fn event_type_wire_cases() -> [(EventType, &'static str); 17] {
+    fn event_type_wire_cases() -> [(EventType, &'static str); 18] {
         [
             (EventType::ConnectionOpened, "connection_opened"),
             (EventType::ConnectionClosed, "connection_closed"),
@@ -582,6 +629,7 @@ mod tests {
             (EventType::SseEvent, "sse_event"),
             (EventType::WebSocketHandoff, "websocket_handoff"),
             (EventType::WebSocketFrame, "websocket_frame"),
+            (EventType::WebSocketMessage, "websocket_message"),
             (EventType::OpaqueStream, "opaque_stream"),
             (EventType::CaptureLoss, "capture_loss"),
             (EventType::Gap, "gap"),
@@ -594,7 +642,7 @@ mod tests {
         ]
     }
 
-    fn event_kind_wire_cases() -> [EventKind; 17] {
+    fn event_kind_wire_cases() -> [EventKind; 18] {
         [
             EventKind::ConnectionOpened,
             EventKind::ConnectionClosed,
@@ -651,6 +699,16 @@ mod tests {
                 opcode: WebSocketOpcode::Text,
                 payload_len: 5,
                 masked: false,
+                payload_fingerprint: vec![1, 2, 3],
+            }),
+            EventKind::WebSocketMessage(WebSocketMessage {
+                direction: Direction::Inbound,
+                stream_sequence: 1,
+                message_sequence: 1,
+                first_frame_sequence: 1,
+                final_frame_sequence: 1,
+                opcode: WebSocketMessageOpcode::Text,
+                payload_len: 5,
                 payload_fingerprint: vec![1, 2, 3],
             }),
             EventKind::OpaqueStream(OpaqueStream {

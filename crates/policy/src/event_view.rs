@@ -2,7 +2,8 @@ use probe_core::{
     AddressPort, BodyChunk, CaptureOrigin, CaptureProviderKind, CaptureSource, Direction,
     EnforcementEvidence, EventEnvelope, EventKind, EventType, FlowContext, Gap, HttpHeaders,
     ObservationOnlyReason, OpaqueStream, ProcessContext, ProcessIdentity, ProtocolError, SseEvent,
-    Timestamp, TransportProtocol, WebSocketFrame, WebSocketHandoff, WebSocketOpcode,
+    Timestamp, TransportProtocol, WebSocketFrame, WebSocketHandoff, WebSocketMessage,
+    WebSocketMessageOpcode, WebSocketOpcode,
 };
 use serde::Serialize;
 
@@ -213,6 +214,8 @@ enum PolicyEventKindView<'a> {
     WebSocketHandoff(PolicyWebSocketHandoffView<'a>),
     #[serde(rename = "websocket_frame")]
     WebSocketFrame(PolicyWebSocketFrameView<'a>),
+    #[serde(rename = "websocket_message")]
+    WebSocketMessage(PolicyWebSocketMessageView<'a>),
     OpaqueStream(PolicyOpaqueStreamView<'a>),
     Gap(PolicyGapView<'a>),
     ProtocolError(PolicyProtocolErrorView<'a>),
@@ -238,6 +241,9 @@ impl<'a> PolicyEventKindView<'a> {
             }
             EventKind::WebSocketFrame(frame) => {
                 Self::WebSocketFrame(PolicyWebSocketFrameView::from_frame(frame))
+            }
+            EventKind::WebSocketMessage(message) => {
+                Self::WebSocketMessage(PolicyWebSocketMessageView::from_message(message))
             }
             EventKind::OpaqueStream(stream) => {
                 Self::OpaqueStream(PolicyOpaqueStreamView::from_stream(stream))
@@ -380,6 +386,49 @@ impl<'a> PolicyWebSocketFrameView<'a> {
             payload_len: frame.payload_len,
             masked: frame.masked,
             payload_fingerprint: &frame.payload_fingerprint,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PolicyWebSocketMessageView<'a> {
+    direction: &'static str,
+    stream_sequence: u64,
+    message_sequence: u64,
+    first_frame_sequence: u64,
+    final_frame_sequence: u64,
+    opcode: PolicyWebSocketMessageOpcodeView,
+    payload_len: u64,
+    payload_fingerprint: &'a [u8],
+}
+
+impl<'a> PolicyWebSocketMessageView<'a> {
+    fn from_message(message: &'a WebSocketMessage) -> Self {
+        Self {
+            direction: direction_name(message.direction),
+            stream_sequence: message.stream_sequence,
+            message_sequence: message.message_sequence,
+            first_frame_sequence: message.first_frame_sequence,
+            final_frame_sequence: message.final_frame_sequence,
+            opcode: PolicyWebSocketMessageOpcodeView::from_opcode(message.opcode),
+            payload_len: message.payload_len,
+            payload_fingerprint: &message.payload_fingerprint,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PolicyWebSocketMessageOpcodeView {
+    Text,
+    Binary,
+}
+
+impl PolicyWebSocketMessageOpcodeView {
+    fn from_opcode(opcode: WebSocketMessageOpcode) -> Self {
+        match opcode {
+            WebSocketMessageOpcode::Text => Self::Text,
+            WebSocketMessageOpcode::Binary => Self::Binary,
         }
     }
 }

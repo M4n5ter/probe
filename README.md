@@ -63,7 +63,7 @@ exporters, status APIs, and tests.
 | Capture | eBPF-first live capture, libpcap fallback, external plaintext feed, capture-event feed, and replay. |
 | Attribution | procfs process and socket attribution with explicit best-effort boundaries. |
 | TLS plaintext | libssl uprobe plaintext, TLS 1.3 key log/session secret material, auto-binding, and plaintext bridge paths. |
-| Protocols | HTTP/1.x request/response/body events, SSE events, WebSocket upgrade handoff, and WebSocket frame metadata. |
+| Protocols | HTTP/1.x request/response/body events, SSE events, WebSocket upgrade handoff, frame metadata, and 16 MiB bounded message metadata. |
 | Policy | Lua policy hooks, typed verdicts, policy bundle loading, remote policy bundle support, and manual admin reload. |
 | Enforcement | audit-only, dry-run, scoped connection enforcement, Linux socket destroy backend, transparent interception lifecycle, and proxy-side policy hook. |
 | Storage | Fjall-backed ingress journal and export queue. |
@@ -104,8 +104,10 @@ The following are intentional boundaries of the current implementation:
 - No default whole-host transparent MITM.
 - No hidden long-term raw traffic retention.
 - No HTTP/2, HTTP/3, or QUIC parser yet.
-- WebSocket support emits handoff and frame metadata; it does not aggregate
-  full messages or decompress extension payloads.
+- WebSocket support emits handoff, frame metadata, and 16 MiB bounded
+  text/binary message metadata. Oversized messages keep frame metadata and
+  omit `websocket_message`; full message storage and extension decompression
+  are out of scope.
 - Linux socket destroy closes existing TCP sockets only. It is not pre-connect
   deny, UDP blocking, or payload-level blocking.
 - Some live capture paths remain best-effort by nature and expose that through

@@ -3,7 +3,8 @@ use std::{fs, path::Path, process::ExitCode};
 use capture::CaptureEvent;
 use probe_config::{AgentConfig, CaptureSelection, PolicyConfig};
 use probe_core::{
-    CaptureProviderKind, CaptureSource, Direction, EventEnvelope, EventKind, WebSocketOpcode,
+    CaptureProviderKind, CaptureSource, Direction, EventEnvelope, EventKind,
+    WebSocketMessageOpcode, WebSocketOpcode,
 };
 use storage::{FjallSpool, StoredEvent};
 
@@ -33,6 +34,7 @@ const POLICY_VERSION: &str = "e2e";
 const EXPECTED_POLICY_VERSION: &str = "libpcap-websocket-e2e-policy@e2e";
 const HANDOFF_ALERT: &str = "libpcap websocket handoff /chat chat";
 const FRAME_ALERT: &str = "libpcap websocket frame text 2";
+const MESSAGE_ALERT: &str = "libpcap websocket message text 2";
 
 pub(crate) fn run() -> ExitCode {
     match run_inner() {
@@ -96,7 +98,7 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let fixture_result = wait_for_http1_loopback_fixture_exit(fixture.child_mut());
     fixture.unwatch();
     let progress_result = match &fixture_result {
-        Ok(()) => wait_for_agent_policy_progress(agent.child_mut(), &admin_socket_path, 2),
+        Ok(()) => wait_for_agent_policy_progress(agent.child_mut(), &admin_socket_path, 3),
         Err(_) => Ok(()),
     };
     let agent_result = stop_running_child(agent.child_mut(), "agent");
@@ -129,7 +131,7 @@ fn write_policy_bundle(path: &Path) -> Result<(), std::io::Error> {
             r#"
 id = "{POLICY_ID}"
 version = "{POLICY_VERSION}"
-hooks = ["on_websocket_handoff", "on_websocket_frame"]
+hooks = ["on_websocket_handoff", "on_websocket_frame", "on_websocket_message"]
 "#
         ),
     )?;
@@ -143,6 +145,12 @@ end
 function on_websocket_frame(event)
   return probe.emit_alert(
     "libpcap websocket frame " .. event.kind.opcode.kind .. " " .. tostring(event.kind.payload_len)
+  )
+end
+
+function on_websocket_message(event)
+  return probe.emit_alert(
+    "libpcap websocket message " .. event.kind.opcode.kind .. " " .. tostring(event.kind.payload_len)
   )
 end
 "#,
@@ -283,8 +291,24 @@ fn assert_websocket_exports(envelopes: &[EventEnvelope]) -> Result<(), Box<dyn s
                         == FRAME_PAYLOAD_FINGERPRINT.as_slice()
         )
     })?;
+    assert_has_event(envelopes, "WebSocket message", |envelope| {
+        matches!(
+            envelope.kind(),
+            EventKind::WebSocketMessage(message)
+                if is_libpcap_event(envelope)
+                    && message.direction == Direction::Inbound
+                    && message.message_sequence == 1
+                    && message.first_frame_sequence == 1
+                    && message.final_frame_sequence == 1
+                    && matches!(message.opcode, WebSocketMessageOpcode::Text)
+                    && message.payload_len == FRAME_PAYLOAD_LEN
+                    && message.payload_fingerprint.as_slice()
+                        == FRAME_PAYLOAD_FINGERPRINT.as_slice()
+        )
+    })?;
     assert_policy_alert(envelopes, HANDOFF_ALERT)?;
     assert_policy_alert(envelopes, FRAME_ALERT)?;
+    assert_policy_alert(envelopes, MESSAGE_ALERT)?;
     assert_no_protocol_errors(envelopes)?;
     Ok(())
 }

@@ -147,6 +147,10 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::WebSocketHandoff),
         CapabilityState::available(CapabilityKind::WebSocketFrame),
         CapabilityState::degraded(
+            CapabilityKind::WebSocketMessage,
+            "WebSocket parser emits complete text/binary message metadata up to 16 MiB for non-extension payloads; oversized messages keep frame metadata and omit websocket_message, while extension-compressed payloads and full message storage are not supported",
+        ),
+        CapabilityState::degraded(
             CapabilityKind::LuaJit,
             "policy runtime is wired into replay and live capture, including multiple active bundles, runtime error audit, and manual admin policy bundle reload, but config reload, file watching, remote control-plane updates, and state migration are not implemented",
         ),
@@ -278,6 +282,10 @@ mod tests {
         assert_eq!(
             matrix.mode(CapabilityKind::WebSocketFrame),
             RuntimeMode::Available
+        );
+        assert_eq!(
+            matrix.mode(CapabilityKind::WebSocketMessage),
+            RuntimeMode::Degraded
         );
     }
 

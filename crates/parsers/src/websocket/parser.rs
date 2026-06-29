@@ -1,9 +1,13 @@
 use bytes::BytesMut;
-use probe_core::{Direction, EventKind, ProtocolError, WebSocketFrame, WebSocketOpcode};
+use probe_core::{
+    Direction, EventKind, ProtocolError, WebSocketFrame, WebSocketMessage, WebSocketMessageOpcode,
+    WebSocketOpcode,
+};
 
 use crate::{ParserInput, ParserOutput, ProtocolParser, gap_event};
 
 const MAX_WEBSOCKET_FRAME_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_WEBSOCKET_MESSAGE_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_WEBSOCKET_FRAME_HEADER_BYTES: usize = 14;
 const MASK_HASH_SCRATCH_BYTES: usize = 4096;
 
@@ -81,6 +85,7 @@ struct WebSocketDirectionState {
     header_buffer: BytesMut,
     pending: Option<PendingWebSocketFrame>,
     frame_sequence: u64,
+    messages: WebSocketMessageAggregator,
 }
 
 impl WebSocketDirectionState {
@@ -104,7 +109,9 @@ impl WebSocketDirectionState {
                 match parse_frame_header(&bytes[cursor..]) {
                     FrameHeaderParse::Complete { consumed, header } => {
                         cursor += consumed;
-                        self.pending = Some(PendingWebSocketFrame::new(header));
+                        if !self.accept_frame_header(direction, header, &mut events) {
+                            break;
+                        }
                         self.emit_completed_pending(direction, stream_sequence, &mut events);
                     }
                     FrameHeaderParse::Partial => {
@@ -128,7 +135,9 @@ impl WebSocketDirectionState {
                     FrameHeaderParse::Complete { consumed, header } => {
                         let payload_prefix = self.header_buffer.split_off(consumed);
                         self.header_buffer.clear();
-                        self.pending = Some(PendingWebSocketFrame::new(header));
+                        if !self.accept_frame_header(direction, header, &mut events) {
+                            break;
+                        }
                         if !payload_prefix.is_empty() {
                             self.consume_pending_payload(&payload_prefix);
                         }
@@ -161,23 +170,83 @@ impl WebSocketDirectionState {
                 reason: "incomplete websocket frame at connection close".to_string(),
             }));
             self.reset();
+        } else if !self.messages.is_checkpoint_safe() {
+            events.push(EventKind::ProtocolError(ProtocolError {
+                direction,
+                reason: "incomplete websocket message at connection close".to_string(),
+            }));
+            self.reset();
         }
     }
 
     fn reset(&mut self) {
         self.header_buffer.clear();
         self.pending = None;
+        self.messages.reset();
     }
 
     fn is_checkpoint_safe(&self) -> bool {
-        self.header_buffer.is_empty() && self.pending.is_none()
+        self.header_buffer.is_empty()
+            && self.pending.is_none()
+            && self.messages.is_checkpoint_safe()
+    }
+
+    fn accept_frame_header(
+        &mut self,
+        direction: Direction,
+        header: ParsedWebSocketHeader,
+        events: &mut Vec<EventKind>,
+    ) -> bool {
+        let frame_sequence = self.frame_sequence.saturating_add(1);
+        if let Err(reason) = self.prepare_message_state(&header) {
+            self.fail(direction, reason, events);
+            return false;
+        }
+        self.messages.on_frame_start(&header, frame_sequence);
+        self.pending = Some(PendingWebSocketFrame::new(header, frame_sequence));
+        true
+    }
+
+    fn prepare_message_state(&mut self, header: &ParsedWebSocketHeader) -> Result<(), String> {
+        match header.opcode {
+            WebSocketOpcode::Text | WebSocketOpcode::Binary => {
+                if !self.messages.is_checkpoint_safe() {
+                    return Err(
+                        "websocket data frame started before fragmented message completed"
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            WebSocketOpcode::Continuation => {
+                if self.messages.is_checkpoint_safe() {
+                    return Err("websocket continuation frame without open message".to_string());
+                }
+                Ok(())
+            }
+            WebSocketOpcode::Close | WebSocketOpcode::Ping | WebSocketOpcode::Pong => {
+                validate_control_frame(header)
+            }
+            WebSocketOpcode::Other { .. } if is_control_wire_opcode(header.wire_opcode) => {
+                validate_control_frame(header)
+            }
+            WebSocketOpcode::Other { .. } if !self.messages.is_checkpoint_safe() => {
+                Err("websocket data frame started before fragmented message completed".to_string())
+            }
+            WebSocketOpcode::Other { .. } => Ok(()),
+        }
     }
 
     fn consume_pending_payload(&mut self, bytes: &[u8]) -> usize {
         let Some(pending) = &mut self.pending else {
             return 0;
         };
-        pending.consume_payload(bytes)
+        let payload_offset = pending.consumed_payload_len;
+        let consumed = pending.consume_payload(bytes);
+        let mask_key = pending.mask_key;
+        self.messages
+            .on_payload_chunk(pending, &bytes[..consumed], mask_key, payload_offset);
+        consumed
     }
 
     fn emit_completed_pending(
@@ -193,11 +262,15 @@ impl WebSocketDirectionState {
             return;
         }
         let pending = self.pending.take().expect("pending frame must exist");
-        self.frame_sequence = self.frame_sequence.saturating_add(1);
+        let frame_sequence = pending.frame_sequence;
+        let message = self
+            .messages
+            .on_frame_complete(&pending, direction, stream_sequence);
+        self.frame_sequence = frame_sequence;
         events.push(EventKind::WebSocketFrame(WebSocketFrame {
             direction,
             stream_sequence,
-            frame_sequence: self.frame_sequence,
+            frame_sequence,
             fin: pending.fin,
             rsv1: pending.rsv1,
             rsv2: pending.rsv2,
@@ -207,6 +280,9 @@ impl WebSocketDirectionState {
             masked: pending.mask_key.is_some(),
             payload_fingerprint: pending.payload_fingerprint(),
         }));
+        if let Some(message) = message {
+            events.push(EventKind::WebSocketMessage(message));
+        }
     }
 
     fn fail(&mut self, direction: Direction, reason: String, events: &mut Vec<EventKind>) {
@@ -228,6 +304,7 @@ enum FrameHeaderParse {
 }
 
 struct ParsedWebSocketHeader {
+    wire_opcode: u8,
     fin: bool,
     rsv1: bool,
     rsv2: bool,
@@ -239,6 +316,7 @@ struct ParsedWebSocketHeader {
 
 #[derive(Debug)]
 struct PendingWebSocketFrame {
+    frame_sequence: u64,
     fin: bool,
     rsv1: bool,
     rsv2: bool,
@@ -251,8 +329,9 @@ struct PendingWebSocketFrame {
 }
 
 impl PendingWebSocketFrame {
-    fn new(header: ParsedWebSocketHeader) -> Self {
+    fn new(header: ParsedWebSocketHeader, frame_sequence: u64) -> Self {
         Self {
+            frame_sequence,
             fin: header.fin,
             rsv1: header.rsv1,
             rsv2: header.rsv2,
@@ -286,6 +365,157 @@ impl PendingWebSocketFrame {
         self.consumed_payload_len >= self.payload_len
     }
 
+    fn is_message_payload_frame(&self) -> bool {
+        matches!(
+            self.opcode,
+            WebSocketOpcode::Text | WebSocketOpcode::Binary | WebSocketOpcode::Continuation
+        )
+    }
+
+    fn completes_message(&self) -> bool {
+        self.fin && self.is_message_payload_frame()
+    }
+
+    fn payload_fingerprint(self) -> Vec<u8> {
+        self.hasher.finalize().as_bytes()[..16].to_vec()
+    }
+}
+
+#[derive(Debug, Default)]
+struct WebSocketMessageAggregator {
+    pending: Option<PendingWebSocketMessage>,
+    sequence: u64,
+}
+
+impl WebSocketMessageAggregator {
+    fn reset(&mut self) {
+        self.pending = None;
+    }
+
+    fn is_checkpoint_safe(&self) -> bool {
+        self.pending.is_none()
+    }
+
+    fn on_frame_start(&mut self, header: &ParsedWebSocketHeader, frame_sequence: u64) {
+        match header.opcode {
+            WebSocketOpcode::Text | WebSocketOpcode::Binary => {
+                if header.rsv1 || header.rsv2 || header.rsv3 {
+                    if !header.fin {
+                        self.pending = Some(PendingWebSocketMessage::skipping());
+                    }
+                    return;
+                }
+                self.pending = Some(PendingWebSocketMessage::aggregating(
+                    message_opcode_from_frame(header.opcode)
+                        .expect("data frame opcode should convert to a message opcode"),
+                    frame_sequence,
+                ));
+            }
+            WebSocketOpcode::Continuation => {
+                if header.rsv1 || header.rsv2 || header.rsv3 {
+                    self.skip();
+                }
+            }
+            WebSocketOpcode::Other { .. } if !is_control_wire_opcode(header.wire_opcode) => {
+                if !header.fin {
+                    self.skip();
+                }
+            }
+            WebSocketOpcode::Close
+            | WebSocketOpcode::Ping
+            | WebSocketOpcode::Pong
+            | WebSocketOpcode::Other { .. } => {}
+        }
+    }
+
+    fn on_payload_chunk(
+        &mut self,
+        frame: &PendingWebSocketFrame,
+        payload: &[u8],
+        mask_key: Option<[u8; 4]>,
+        payload_offset: u64,
+    ) {
+        if !frame.is_message_payload_frame() {
+            return;
+        }
+        let Some(PendingWebSocketMessage::Aggregating(message)) = self.pending.as_mut() else {
+            return;
+        };
+        let payload_len =
+            u64::try_from(payload.len()).expect("payload slice length should fit into u64");
+        let Some(next_payload_len) = message.payload_len.checked_add(payload_len) else {
+            self.skip();
+            return;
+        };
+        if next_payload_len > MAX_WEBSOCKET_MESSAGE_PAYLOAD_BYTES {
+            self.skip();
+            return;
+        }
+        update_payload_hash(&mut message.hasher, payload, mask_key, payload_offset);
+        message.payload_len = next_payload_len;
+    }
+
+    fn on_frame_complete(
+        &mut self,
+        frame: &PendingWebSocketFrame,
+        direction: Direction,
+        stream_sequence: u64,
+    ) -> Option<WebSocketMessage> {
+        if !frame.completes_message() {
+            return None;
+        }
+        let message = self.pending.take()?;
+        let PendingWebSocketMessage::Aggregating(message) = message else {
+            return None;
+        };
+        self.sequence = self.sequence.saturating_add(1);
+        Some(WebSocketMessage {
+            direction,
+            stream_sequence,
+            message_sequence: self.sequence,
+            first_frame_sequence: message.first_frame_sequence,
+            final_frame_sequence: frame.frame_sequence,
+            opcode: message.opcode,
+            payload_len: message.payload_len,
+            payload_fingerprint: message.payload_fingerprint(),
+        })
+    }
+
+    fn skip(&mut self) {
+        self.pending = Some(PendingWebSocketMessage::skipping());
+    }
+}
+
+#[derive(Debug)]
+enum PendingWebSocketMessage {
+    Aggregating(Box<AggregatingWebSocketMessage>),
+    Skipping,
+}
+
+impl PendingWebSocketMessage {
+    fn aggregating(opcode: WebSocketMessageOpcode, first_frame_sequence: u64) -> Self {
+        Self::Aggregating(Box::new(AggregatingWebSocketMessage {
+            opcode,
+            first_frame_sequence,
+            payload_len: 0,
+            hasher: blake3::Hasher::new(),
+        }))
+    }
+
+    fn skipping() -> Self {
+        Self::Skipping
+    }
+}
+
+#[derive(Debug)]
+struct AggregatingWebSocketMessage {
+    opcode: WebSocketMessageOpcode,
+    first_frame_sequence: u64,
+    payload_len: u64,
+    hasher: blake3::Hasher,
+}
+
+impl AggregatingWebSocketMessage {
     fn payload_fingerprint(self) -> Vec<u8> {
         self.hasher.finalize().as_bytes()[..16].to_vec()
     }
@@ -349,6 +579,7 @@ fn parse_frame_header(buffer: &[u8]) -> FrameHeaderParse {
     FrameHeaderParse::Complete {
         consumed: payload_start,
         header: ParsedWebSocketHeader {
+            wire_opcode: first & 0x0f,
             fin: first & 0x80 != 0,
             rsv1: first & 0x40 != 0,
             rsv2: first & 0x20 != 0,
@@ -357,6 +588,32 @@ fn parse_frame_header(buffer: &[u8]) -> FrameHeaderParse {
             payload_len,
             mask_key,
         },
+    }
+}
+
+fn validate_control_frame(header: &ParsedWebSocketHeader) -> Result<(), String> {
+    if !header.fin {
+        return Err("websocket control frame must not be fragmented".to_string());
+    }
+    if header.payload_len > 125 {
+        return Err("websocket control frame payload exceeds 125 bytes".to_string());
+    }
+    Ok(())
+}
+
+fn is_control_wire_opcode(wire_opcode: u8) -> bool {
+    wire_opcode >= 0x8
+}
+
+fn message_opcode_from_frame(opcode: WebSocketOpcode) -> Option<WebSocketMessageOpcode> {
+    match opcode {
+        WebSocketOpcode::Text => Some(WebSocketMessageOpcode::Text),
+        WebSocketOpcode::Binary => Some(WebSocketMessageOpcode::Binary),
+        WebSocketOpcode::Continuation
+        | WebSocketOpcode::Close
+        | WebSocketOpcode::Ping
+        | WebSocketOpcode::Pong
+        | WebSocketOpcode::Other { .. } => None,
     }
 }
 
@@ -418,7 +675,7 @@ mod tests {
             })
             .into_events();
 
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert!(matches!(
             &events[0],
             EventKind::WebSocketFrame(frame)
@@ -431,6 +688,18 @@ mod tests {
                     && frame.payload_len == 5
                     && !frame.masked
                     && frame.payload_fingerprint == payload_fingerprint(b"hello", None)
+        ));
+        assert!(matches!(
+            &events[1],
+            EventKind::WebSocketMessage(message)
+                if message.direction == Direction::Inbound
+                    && message.stream_sequence == 9
+                    && message.message_sequence == 1
+                    && message.first_frame_sequence == 1
+                    && message.final_frame_sequence == 1
+                    && message.opcode == WebSocketMessageOpcode::Text
+                    && message.payload_len == 5
+                    && message.payload_fingerprint == payload_fingerprint(b"hello", None)
         ));
         assert!(parser.is_checkpoint_safe());
     }
@@ -503,7 +772,253 @@ mod tests {
             .into_events();
 
         assert!(first.is_empty());
+        assert_eq!(second.len(), 2);
+    }
+
+    #[test]
+    fn websocket_parser_aggregates_fragmented_message_metadata() {
+        let mut parser = WebSocketFrameParser::new(4);
+
+        let first = parser
+            .ingest(ParserInput::Data {
+                direction: Direction::Inbound,
+                bytes: b"\x01\x02he",
+            })
+            .into_events();
+        assert_eq!(first.len(), 1);
+        assert!(!parser.is_checkpoint_safe());
+
+        let second = parser
+            .ingest(ParserInput::Data {
+                direction: Direction::Inbound,
+                bytes: b"\x80\x03llo",
+            })
+            .into_events();
+
+        assert_eq!(second.len(), 2);
+        assert!(matches!(
+            &second[1],
+            EventKind::WebSocketMessage(message)
+                if message.stream_sequence == 4
+                    && message.message_sequence == 1
+                    && message.first_frame_sequence == 1
+                    && message.final_frame_sequence == 2
+                    && message.opcode == WebSocketMessageOpcode::Text
+                    && message.payload_len == 5
+                    && message.payload_fingerprint == payload_fingerprint(b"hello", None)
+        ));
+        assert!(parser.is_checkpoint_safe());
+    }
+
+    #[test]
+    fn websocket_parser_does_not_hash_interleaved_control_frame_into_message() {
+        let mut parser = WebSocketFrameParser::new(4);
+
+        parser.ingest(ParserInput::Data {
+            direction: Direction::Inbound,
+            bytes: b"\x01\x02he",
+        });
+        let ping = parser
+            .ingest(ParserInput::Data {
+                direction: Direction::Inbound,
+                bytes: b"\x89\x01x",
+            })
+            .into_events();
+        let final_fragment = parser
+            .ingest(ParserInput::Data {
+                direction: Direction::Inbound,
+                bytes: b"\x80\x03llo",
+            })
+            .into_events();
+
+        assert_eq!(ping.len(), 1);
+        assert!(matches!(
+            &ping[0],
+            EventKind::WebSocketFrame(frame)
+                if frame.opcode == WebSocketOpcode::Ping
+                    && frame.payload_fingerprint == payload_fingerprint(b"x", None)
+        ));
+        assert!(matches!(
+            &final_fragment[1],
+            EventKind::WebSocketMessage(message)
+                if message.payload_fingerprint == payload_fingerprint(b"hello", None)
+        ));
+    }
+
+    #[test]
+    fn websocket_parser_skips_extension_payload_message_aggregation() {
+        let mut parser = WebSocketFrameParser::new(1);
+
+        let events = parser
+            .ingest(ParserInput::Data {
+                direction: Direction::Inbound,
+                bytes: b"\xc1\x05hello",
+            })
+            .into_events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            EventKind::WebSocketFrame(frame)
+                if frame.rsv1
+                    && frame.opcode == WebSocketOpcode::Text
+                    && frame.payload_len == 5
+        ));
+        assert!(parser.is_checkpoint_safe());
+    }
+
+    #[test]
+    fn websocket_parser_skips_fragmented_extension_message_aggregation() {
+        let mut parser = WebSocketFrameParser::new(1);
+
+        let first = parser
+            .ingest(ParserInput::Data {
+                direction: Direction::Inbound,
+                bytes: b"\x41\x02he",
+            })
+            .into_events();
+        let second = parser
+            .ingest(ParserInput::Data {
+                direction: Direction::Inbound,
+                bytes: b"\x80\x03llo",
+            })
+            .into_events();
+
+        assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
+        assert!(matches!(
+            &first[0],
+            EventKind::WebSocketFrame(frame)
+                if frame.rsv1
+                    && !frame.fin
+                    && frame.opcode == WebSocketOpcode::Text
+        ));
+        assert!(matches!(
+            &second[0],
+            EventKind::WebSocketFrame(frame)
+                if frame.fin
+                    && frame.opcode == WebSocketOpcode::Continuation
+        ));
+        assert!(parser.is_checkpoint_safe());
+    }
+
+    #[test]
+    fn websocket_parser_reports_incomplete_message_on_close() {
+        let mut parser = WebSocketFrameParser::new(1);
+
+        let events = parser
+            .ingest(ParserInput::Data {
+                direction: Direction::Inbound,
+                bytes: b"\x01\x02he",
+            })
+            .into_events();
+        assert_eq!(events.len(), 1);
+
+        let events = parser.ingest(ParserInput::ConnectionClosed).into_events();
+
+        assert!(matches!(
+            &events[0],
+            EventKind::ProtocolError(error)
+                if error.reason == "incomplete websocket message at connection close"
+        ));
+        assert!(parser.is_checkpoint_safe());
+    }
+
+    #[test]
+    fn websocket_parser_rejects_fragmented_control_frame() {
+        let mut parser = WebSocketFrameParser::new(1);
+
+        let events = parser
+            .ingest(ParserInput::Data {
+                direction: Direction::Inbound,
+                bytes: b"\x09\x00",
+            })
+            .into_events();
+
+        assert!(matches!(
+            &events[0],
+            EventKind::ProtocolError(error)
+                if error.reason == "websocket control frame must not be fragmented"
+        ));
+        assert!(parser.is_checkpoint_safe());
+    }
+
+    #[test]
+    fn websocket_parser_rejects_fragmented_reserved_control_frame() {
+        let mut parser = WebSocketFrameParser::new(1);
+
+        let events = parser
+            .ingest(ParserInput::Data {
+                direction: Direction::Inbound,
+                bytes: b"\x0b\x00",
+            })
+            .into_events();
+
+        assert!(matches!(
+            &events[0],
+            EventKind::ProtocolError(error)
+                if error.reason == "websocket control frame must not be fragmented"
+        ));
+        assert!(parser.is_checkpoint_safe());
+    }
+
+    #[test]
+    fn websocket_parser_omits_oversized_message_metadata_without_dropping_frame_metadata() {
+        let mut parser = WebSocketFrameParser::new(1);
+        let payload = vec![b'a'; MAX_WEBSOCKET_MESSAGE_PAYLOAD_BYTES as usize];
+        let mut first_frame = vec![0x01, 0x7f];
+        first_frame.extend_from_slice(&MAX_WEBSOCKET_MESSAGE_PAYLOAD_BYTES.to_be_bytes());
+        first_frame.extend_from_slice(&payload);
+
+        let first = parser
+            .ingest(ParserInput::Data {
+                direction: Direction::Inbound,
+                bytes: &first_frame,
+            })
+            .into_events();
+        let second = parser
+            .ingest(ParserInput::Data {
+                direction: Direction::Inbound,
+                bytes: b"\x80\x01x",
+            })
+            .into_events();
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert!(matches!(
+            &first[0],
+            EventKind::WebSocketFrame(frame)
+                if !frame.fin
+                    && frame.frame_sequence == 1
+                    && frame.payload_len == MAX_WEBSOCKET_MESSAGE_PAYLOAD_BYTES
+        ));
+        assert!(matches!(
+            &second[0],
+            EventKind::WebSocketFrame(frame)
+                if frame.fin
+                    && frame.frame_sequence == 2
+                    && frame.payload_len == 1
+        ));
+        assert!(parser.is_checkpoint_safe());
+    }
+
+    #[test]
+    fn websocket_parser_rejects_orphan_continuation_frame() {
+        let mut parser = WebSocketFrameParser::new(1);
+
+        let events = parser
+            .ingest(ParserInput::Data {
+                direction: Direction::Inbound,
+                bytes: b"\x80\x00",
+            })
+            .into_events();
+
+        assert!(matches!(
+            &events[0],
+            EventKind::ProtocolError(error)
+                if error.reason == "websocket continuation frame without open message"
+        ));
+        assert!(parser.is_checkpoint_safe());
     }
 
     #[test]

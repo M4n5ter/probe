@@ -52,8 +52,8 @@ end
     assert_eq!(summary.ingress_records_journaled, 3);
     assert_eq!(summary.ingress_records_processed, 3);
     assert!(
-        summary.export_events_written >= 5,
-        "request, response, handoff, policy alert, and websocket frame events should be exported"
+        summary.export_events_written >= 6,
+        "request, response, handoff, policy alert, websocket frame, and websocket message events should be exported"
     );
 
     let exported = spool.read_export_batch("sink", 16)?;
@@ -99,7 +99,22 @@ end
             )
         })
         .expect("websocket bytes after handoff should be parsed as frame metadata");
+    let message_index = envelopes
+        .iter()
+        .position(|envelope| {
+            matches!(
+                envelope.kind(),
+                EventKind::WebSocketMessage(message)
+                    if message.direction == Direction::Inbound
+                        && message.payload_len == 2
+                        && message.message_sequence == 1
+                        && message.first_frame_sequence == 1
+                        && message.final_frame_sequence == 1
+            )
+        })
+        .expect("websocket bytes after handoff should be parsed as message metadata");
     assert!(handoff_index < frame_index);
+    assert!(frame_index < message_index);
     assert!(
         !envelopes
             .iter()

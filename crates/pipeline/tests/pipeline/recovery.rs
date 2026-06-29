@@ -351,7 +351,7 @@ fn parser_cursor_waits_for_websocket_handoff_state_to_close()
 
     assert_eq!(summary.ingress_records_journaled, 3);
     assert_eq!(summary.ingress_records_processed, 3);
-    assert_eq!(summary.export_events_written, 4);
+    assert_eq!(summary.export_events_written, 5);
     assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 0);
 
     let mut second_provider = SequenceProvider::new(vec![connection_closed(flow)]);
