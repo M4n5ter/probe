@@ -178,6 +178,7 @@ fn parse_hook_response(
                 )));
             }
             Ok(ProxySideEnforcementHookDecision::delegated(
+                executed_action,
                 reason.unwrap_or_else(|| "policy hook accepted action".to_string()),
             ))
         }
@@ -202,9 +203,9 @@ mod tests {
         ScopedEnforcementPlanner,
     };
     use probe_core::{
-        AddressPort, CaptureOrigin, CaptureSource, Direction, EnforcementOutcome, EventKind,
-        FlowContext, FlowIdentity, OpaqueStream, ProcessContext, ProcessIdentity,
-        ProtectiveActionProfile, Timestamp, TransportProtocol, VerdictScope,
+        AddressPort, CaptureOrigin, CaptureSource, Direction, EnforcementExecutionEvidence,
+        EnforcementOutcome, EventKind, FlowContext, FlowIdentity, OpaqueStream, ProcessContext,
+        ProcessIdentity, ProtectiveActionProfile, Timestamp, TransportProtocol, VerdictScope,
     };
 
     use super::*;
@@ -252,6 +253,14 @@ mod tests {
             decision.reason
         );
         assert_eq!(decision.effective_action, Action::Deny);
+        assert_eq!(
+            decision.execution,
+            Some(EnforcementExecutionEvidence::ProxySideHook {
+                surface: ProxySideEnforcementSurface::L7Mitm,
+                executed_action: Action::Deny,
+                reason: "local proxy accepted".to_string(),
+            })
+        );
         let body = server.join().expect("server thread should not panic")?;
         assert!(body.contains("\"requested_action\":\"deny\""));
         Ok(())
@@ -293,6 +302,7 @@ mod tests {
 
         assert_eq!(decision.outcome, EnforcementOutcome::Unsupported);
         assert_eq!(decision.effective_action, Action::Observe);
+        assert_eq!(decision.execution, None);
         assert!(decision.reason.contains("reset unavailable"));
         server.join().expect("server thread should not panic")?;
         Ok(())
@@ -453,6 +463,14 @@ mod tests {
             decision.reason
         );
         assert_eq!(decision.effective_action, Action::Deny);
+        assert_eq!(
+            decision.execution,
+            Some(EnforcementExecutionEvidence::ProxySideHook {
+                surface: ProxySideEnforcementSurface::L7Mitm,
+                executed_action: Action::Deny,
+                reason: "chunked accepted".to_string(),
+            })
+        );
         assert!(decision.reason.contains("chunked accepted"));
         server.join().expect("server thread should not panic")?;
         Ok(())
@@ -497,6 +515,7 @@ mod tests {
 
         assert_eq!(decision.outcome, EnforcementOutcome::Failed);
         assert_eq!(decision.effective_action, Action::Observe);
+        assert_eq!(decision.execution, None);
         assert!(decision.reason.contains("executed_action Reset"));
         assert!(decision.reason.contains("requested_action Deny"));
         Ok(())
@@ -510,6 +529,7 @@ mod tests {
 
         assert_eq!(decision.outcome, EnforcementOutcome::Failed);
         assert_eq!(decision.effective_action, Action::Observe);
+        assert_eq!(decision.execution, None);
         assert!(decision.reason.contains("response JSON failed"));
         assert!(decision.reason.contains("executed_action"));
         Ok(())

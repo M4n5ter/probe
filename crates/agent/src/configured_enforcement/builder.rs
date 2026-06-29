@@ -339,9 +339,10 @@ mod tests {
     };
     use probe_core::{
         Action, AddressPort, CapabilityKind, CapabilityState, CaptureOrigin, CaptureSource,
-        Direction, EnforcementMode, EnforcementOutcome, EventEnvelope, EventKind, FlowContext,
-        FlowIdentity, OpaqueStream, ProcessContext, ProcessIdentity, ProcessSelector, Timestamp,
-        TrafficSelector, TransportProtocol, Verdict, VerdictScope,
+        Direction, EnforcementExecutionEvidence, EnforcementMode, EnforcementOutcome,
+        EventEnvelope, EventKind, FlowContext, FlowIdentity, OpaqueStream, ProcessContext,
+        ProcessIdentity, ProcessSelector, ProxySideEnforcementSurface, Timestamp, TrafficSelector,
+        TransportProtocol, Verdict, VerdictScope,
     };
     use runtime::{
         CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry,
@@ -502,6 +503,14 @@ mod tests {
 
         assert_eq!(decision.outcome, EnforcementOutcome::Delegated);
         assert_eq!(decision.effective_action, Action::Deny);
+        assert_eq!(
+            decision.execution,
+            Some(EnforcementExecutionEvidence::ProxySideHook {
+                surface: ProxySideEnforcementSurface::L7Mitm,
+                executed_action: Action::Deny,
+                reason: "proxy hook accepted".to_string(),
+            })
+        );
         let body = hook_server
             .server
             .join()

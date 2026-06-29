@@ -1,4 +1,5 @@
 mod backend;
+mod decision;
 mod planner;
 mod scope;
 
@@ -8,6 +9,7 @@ pub use backend::{
 };
 pub use planner::{
     EnforcementError, EnforcementPlanRequest, EnforcementPlanner, PlannerPolicy,
-    ProxySideEnforcementSurface, ScopedEnforcementPlanner, SetupTimeEnforcementSurface,
+    ScopedEnforcementPlanner, SetupTimeEnforcementSurface,
 };
+pub use probe_core::ProxySideEnforcementSurface;
 pub use scope::TargetScope;

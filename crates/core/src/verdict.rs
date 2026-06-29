@@ -119,6 +119,30 @@ pub enum EnforcementOutcome {
     Applied,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxySideEnforcementSurface {
+    L7Mitm,
+}
+
+impl ProxySideEnforcementSurface {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::L7Mitm => "L7 MITM proxy-side policy hook",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EnforcementExecutionEvidence {
+    ProxySideHook {
+        surface: ProxySideEnforcementSurface,
+        executed_action: Action,
+        reason: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Verdict {
@@ -150,5 +174,7 @@ pub struct EnforcementDecision {
     pub effective_action: Action,
     pub scope: VerdictScope,
     pub selector_matched: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<EnforcementExecutionEvidence>,
     pub reason: String,
 }

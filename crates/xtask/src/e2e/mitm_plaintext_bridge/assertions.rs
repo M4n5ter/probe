@@ -10,9 +10,10 @@ use capture::CaptureEvent;
 use e2e_support::mitm_bridge;
 use probe_config::TransparentInterceptionStrategyConfig;
 use probe_core::{
-    Action, CaptureProviderKind, CaptureSource, Direction, EnforcementMode, EnforcementOutcome,
-    EventEnvelope, EventKind, L7MitmAuditEvent, L7MitmAuditPhase, L7MitmExternalBackendAudit,
-    L7MitmManagedProcessBackendAudit, VerdictScope,
+    Action, CaptureProviderKind, CaptureSource, Direction, EnforcementExecutionEvidence,
+    EnforcementMode, EnforcementOutcome, EventEnvelope, EventKind, L7MitmAuditEvent,
+    L7MitmAuditPhase, L7MitmExternalBackendAudit, L7MitmManagedProcessBackendAudit,
+    ProxySideEnforcementSurface, VerdictScope,
 };
 use serde_json::json;
 use storage::{FjallSpool, StoredEvent};
@@ -420,6 +421,13 @@ fn assert_expected_delegated_policy_hook_decision(
                             && decision.effective_action == Action::Deny
                             && decision.scope == VerdictScope::Request
                             && decision.selector_matched
+                            && decision.execution == Some(
+                                EnforcementExecutionEvidence::ProxySideHook {
+                                    surface: ProxySideEnforcementSurface::L7Mitm,
+                                    executed_action: Action::Deny,
+                                    reason: POLICY_HOOK_RESPONSE_REASON.to_string(),
+                                }
+                            )
                             && decision.reason.contains("accepted delegated enforcement action")
                             && decision.reason.contains(POLICY_HOOK_RESPONSE_REASON)
                 )

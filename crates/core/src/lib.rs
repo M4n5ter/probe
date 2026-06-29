@@ -32,8 +32,9 @@ pub use selector::{
 };
 pub use socket::{TcpConnection, TcpEndpoint};
 pub use verdict::{
-    Action, EnforcementDecision, EnforcementMode, EnforcementOutcome, ProtectiveActionError,
-    ProtectiveActionProfile, Verdict, VerdictScope,
+    Action, EnforcementDecision, EnforcementExecutionEvidence, EnforcementMode, EnforcementOutcome,
+    ProtectiveActionError, ProtectiveActionProfile, ProxySideEnforcementSurface, Verdict,
+    VerdictScope,
 };
 pub use webhook::{
     RESERVED_WEBHOOK_HEADERS, WEBHOOK_CODEC_HEADER, WEBHOOK_CONTENT_TYPE_HEADER,

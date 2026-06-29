@@ -533,11 +533,12 @@ mod tests {
 
     use crate::{
         Action, BodyChunk, CaptureLoss, Direction, DomainEvent, EnforcementDecision,
-        EnforcementMode, EnforcementOutcome, EventKind, EventType, Gap, HttpHeaders,
-        L7MitmAuditEvent, L7MitmAuditPhase, L7MitmExternalBackendAudit, L7MitmManagedProcessAudit,
-        L7MitmManagedProcessBackendAudit, L7MitmReadinessProbeAudit, OpaqueStream,
-        PolicyRuntimeError, ProtocolError, SseEvent, Verdict, VerdictScope, WebSocketFrame,
-        WebSocketHandoff, WebSocketMessage, WebSocketMessageOpcode, WebSocketOpcode,
+        EnforcementExecutionEvidence, EnforcementMode, EnforcementOutcome, EventKind, EventType,
+        Gap, HttpHeaders, L7MitmAuditEvent, L7MitmAuditPhase, L7MitmExternalBackendAudit,
+        L7MitmManagedProcessAudit, L7MitmManagedProcessBackendAudit, L7MitmReadinessProbeAudit,
+        OpaqueStream, PolicyRuntimeError, ProtocolError, ProxySideEnforcementSurface, SseEvent,
+        Verdict, VerdictScope, WebSocketFrame, WebSocketHandoff, WebSocketMessage,
+        WebSocketMessageOpcode, WebSocketOpcode,
     };
 
     #[test]
@@ -617,6 +618,35 @@ mod tests {
 
             assert_eq!(value["type"], kind.event_type().as_str());
         }
+    }
+
+    #[test]
+    fn enforcement_decision_proxy_execution_evidence_has_stable_wire_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let kind = EventKind::EnforcementDecision(EnforcementDecision {
+            mode: EnforcementMode::Enforce,
+            outcome: EnforcementOutcome::Delegated,
+            requested_action: Action::Deny,
+            effective_action: Action::Deny,
+            scope: VerdictScope::Request,
+            selector_matched: true,
+            execution: Some(EnforcementExecutionEvidence::ProxySideHook {
+                surface: ProxySideEnforcementSurface::L7Mitm,
+                executed_action: Action::Deny,
+                reason: "proxy blocked request".to_string(),
+            }),
+            reason: "L7 MITM proxy-side policy hook accepted delegated enforcement action"
+                .to_string(),
+        });
+
+        let value = serde_json::to_value(&kind)?;
+
+        assert_eq!(value["type"], "enforcement_decision");
+        assert_eq!(value["execution"]["kind"], "proxy_side_hook");
+        assert_eq!(value["execution"]["surface"], "l7_mitm");
+        assert_eq!(value["execution"]["executed_action"], "deny");
+        assert_eq!(value["execution"]["reason"], "proxy blocked request");
+        Ok(())
     }
 
     fn event_type_wire_cases() -> [(EventType, &'static str); 18] {
@@ -754,6 +784,7 @@ mod tests {
                 effective_action: Action::Observe,
                 scope: VerdictScope::Flow,
                 selector_matched: true,
+                execution: None,
                 reason: "dry run".to_string(),
             }),
             EventKind::L7MitmAudit(L7MitmAuditEvent::ManagedProcess {

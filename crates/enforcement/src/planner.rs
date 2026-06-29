@@ -1,11 +1,14 @@
 use probe_core::{
     Action, EnforcementDecision, EnforcementMode, EnforcementOutcome, EventEnvelope,
-    ProcessContext, ProtectiveActionError, ProtectiveActionProfile, Selector, SelectorError,
-    Verdict,
+    ProcessContext, ProtectiveActionError, ProtectiveActionProfile, ProxySideEnforcementSurface,
+    Selector, SelectorError, Verdict,
 };
 use thiserror::Error;
 
-use crate::{EnforcementBackend, EnforcementBackendRequest, ProxySideEnforcementHook, TargetScope};
+use crate::{
+    EnforcementBackend, EnforcementBackendRequest, ProxySideEnforcementHook, TargetScope,
+    decision::EnforcementDecisionParts,
+};
 
 #[derive(Debug, Error)]
 pub enum EnforcementError {
@@ -194,6 +197,7 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
                 effective_action: Action::Observe,
                 scope: request.verdict.scope.clone(),
                 selector_matched: false,
+                execution: None,
                 reason: format!(
                     "policy requested {:?}, but trigger event is not flow-scoped and cannot drive connection-level enforcement: {}",
                     request.verdict.action, request.verdict.reason
@@ -202,8 +206,8 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
         }
 
         let selector_matched = self.policy.target_scope().matches_trigger(request.trigger);
-        let (outcome, effective_action, reason) = if !selector_matched {
-            (
+        let decision = if !selector_matched {
+            EnforcementDecisionParts::new(
                 EnforcementOutcome::SelectorMiss,
                 Action::Observe,
                 format!(
@@ -212,7 +216,7 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
                 ),
             )
         } else if !self.policy.contains_action(request.verdict.action) {
-            (
+            EnforcementDecisionParts::new(
                 EnforcementOutcome::Unsupported,
                 Action::Observe,
                 format!(
@@ -226,12 +230,13 @@ impl EnforcementPlanner for ScopedEnforcementPlanner {
 
         Some(EnforcementDecision {
             mode: self.mode(),
-            outcome,
+            outcome: decision.outcome,
             requested_action: request.verdict.action,
-            effective_action,
+            effective_action: decision.effective_action,
             scope: request.verdict.scope.clone(),
             selector_matched,
-            reason,
+            execution: decision.execution,
+            reason: decision.reason,
         })
     }
 }
@@ -240,12 +245,12 @@ impl ScopedEnforcementPlanner {
     fn decision_for_mode(
         &mut self,
         request: EnforcementPlanRequest<'_>,
-    ) -> (EnforcementOutcome, Action, String) {
+    ) -> EnforcementDecisionParts {
         let verdict = request.verdict;
         if self.execution.requires_complete_enforcement_evidence()
             && let Some(reason) = destructive_enforcement_evidence_rejection_reason(request.trigger)
         {
-            return (
+            return EnforcementDecisionParts::new(
                 EnforcementOutcome::Unsupported,
                 Action::Observe,
                 format!(
@@ -256,7 +261,7 @@ impl ScopedEnforcementPlanner {
         }
 
         match &mut self.execution {
-            EnforcementExecution::Disabled => (
+            EnforcementExecution::Disabled => EnforcementDecisionParts::new(
                 EnforcementOutcome::Disabled,
                 Action::Observe,
                 format!(
@@ -264,7 +269,7 @@ impl ScopedEnforcementPlanner {
                     verdict.action, verdict.reason
                 ),
             ),
-            EnforcementExecution::AuditOnly => (
+            EnforcementExecution::AuditOnly => EnforcementDecisionParts::new(
                 EnforcementOutcome::AuditOnly,
                 Action::Observe,
                 format!(
@@ -272,7 +277,7 @@ impl ScopedEnforcementPlanner {
                     verdict.action, verdict.reason
                 ),
             ),
-            EnforcementExecution::DryRun => (
+            EnforcementExecution::DryRun => EnforcementDecisionParts::new(
                 EnforcementOutcome::DryRun,
                 Action::Observe,
                 format!(
@@ -289,7 +294,7 @@ impl ScopedEnforcementPlanner {
                     Err(error) => failed_decision_parts(verdict, &error),
                 }
             }
-            EnforcementExecution::SetupTimeOnly(surface) => (
+            EnforcementExecution::SetupTimeOnly(surface) => EnforcementDecisionParts::new(
                 EnforcementOutcome::Unsupported,
                 Action::Observe,
                 format!(
@@ -304,9 +309,11 @@ impl ScopedEnforcementPlanner {
                     verdict,
                     trigger: request.trigger,
                 }) {
-                    Ok(decision) => {
-                        decision.into_enforcement_parts(verdict.action, surface.description())
-                    }
+                    Ok(decision) => match decision.into_enforcement_parts(verdict.action, *surface)
+                    {
+                        Ok(parts) => parts,
+                        Err(error) => failed_decision_parts(verdict, &error),
+                    },
                     Err(error) => failed_decision_parts(verdict, &error),
                 }
             }
@@ -365,28 +372,12 @@ impl SetupTimeEnforcementSurface {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProxySideEnforcementSurface {
-    L7Mitm,
-}
-
-impl ProxySideEnforcementSurface {
-    fn description(self) -> &'static str {
-        match self {
-            Self::L7Mitm => "L7 MITM proxy-side policy hook",
-        }
-    }
-}
-
 fn requires_enforcement(action: Action) -> bool {
     action.is_protective()
 }
 
-fn failed_decision_parts(
-    verdict: &Verdict,
-    error: &EnforcementError,
-) -> (EnforcementOutcome, Action, String) {
-    (
+fn failed_decision_parts(verdict: &Verdict, error: &EnforcementError) -> EnforcementDecisionParts {
+    EnforcementDecisionParts::new(
         EnforcementOutcome::Failed,
         Action::Observe,
         format!(
@@ -410,9 +401,9 @@ mod tests {
 
     use probe_core::{
         AddressPort, CaptureLoss, CaptureOrigin, CaptureSource, Direction, EnforcementEvidence,
-        EventKind, FlowContext, FlowIdentity, HttpHeaders, ObservationOnlyReason, ProcessContext,
-        ProcessIdentity, ProcessSelector, Selector, Timestamp, TrafficSelector, TransportProtocol,
-        VerdictScope,
+        EnforcementExecutionEvidence, EventKind, FlowContext, FlowIdentity, HttpHeaders,
+        ObservationOnlyReason, ProcessContext, ProcessIdentity, ProcessSelector, Selector,
+        Timestamp, TrafficSelector, TransportProtocol, VerdictScope,
     };
 
     use crate::{EnforcementBackendDecision, ProxySideEnforcementHookDecision};
@@ -801,7 +792,48 @@ mod tests {
         assert_eq!(decision.requested_action, Action::Deny);
         assert_eq!(decision.effective_action, Action::Deny);
         assert!(decision.selector_matched);
+        assert_eq!(
+            decision.execution,
+            Some(EnforcementExecutionEvidence::ProxySideHook {
+                surface: ProxySideEnforcementSurface::L7Mitm,
+                executed_action: Action::Deny,
+                reason: "hook accepted Deny".to_string(),
+            })
+        );
         assert!(decision.reason.contains("accepted delegated enforcement"));
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_side_hook_mismatched_execution_action_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = PlannerPolicy::compile(None, ProtectiveActionProfile::new([Action::Deny])?)?;
+        let mut planner = ScopedEnforcementPlanner::with_proxy_side_policy_hook(
+            policy,
+            ProxySideEnforcementSurface::L7Mitm,
+            MismatchedProxyHook,
+        )?;
+        let trigger = request_event(Direction::Outbound);
+        let verdict = Verdict {
+            action: Action::Deny,
+            scope: VerdictScope::Flow,
+            reason: "block inside MITM policy hook".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+
+        let decision = planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("protective verdict should produce failed enforcement audit");
+
+        assert_eq!(decision.outcome, EnforcementOutcome::Failed);
+        assert_eq!(decision.effective_action, Action::Observe);
+        assert_eq!(decision.execution, None);
+        assert!(decision.reason.contains("executed action Reset"));
+        assert!(decision.reason.contains("requested action Deny"));
         Ok(())
     }
 
@@ -1061,10 +1093,10 @@ mod tests {
             &mut self,
             request: EnforcementBackendRequest<'_>,
         ) -> Result<ProxySideEnforcementHookDecision, EnforcementError> {
-            Ok(ProxySideEnforcementHookDecision::delegated(format!(
-                "hook accepted {:?}",
-                request.verdict.action
-            )))
+            Ok(ProxySideEnforcementHookDecision::delegated(
+                request.verdict.action,
+                format!("hook accepted {:?}", request.verdict.action),
+            ))
         }
     }
 
@@ -1086,6 +1118,7 @@ mod tests {
         ) -> Result<ProxySideEnforcementHookDecision, EnforcementError> {
             *self.calls.lock().expect("fake proxy hook state poisoned") += 1;
             Ok(ProxySideEnforcementHookDecision::delegated(
+                _request.verdict.action,
                 "hook accepted request",
             ))
         }
@@ -1100,6 +1133,20 @@ mod tests {
         ) -> Result<ProxySideEnforcementHookDecision, EnforcementError> {
             Ok(ProxySideEnforcementHookDecision::unsupported(
                 "hook has no matching in-flight request",
+            ))
+        }
+    }
+
+    struct MismatchedProxyHook;
+
+    impl ProxySideEnforcementHook for MismatchedProxyHook {
+        fn delegate(
+            &mut self,
+            _request: EnforcementBackendRequest<'_>,
+        ) -> Result<ProxySideEnforcementHookDecision, EnforcementError> {
+            Ok(ProxySideEnforcementHookDecision::delegated(
+                Action::Reset,
+                "hook executed the wrong action",
             ))
         }
     }

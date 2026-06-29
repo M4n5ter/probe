@@ -1,6 +1,9 @@
-use probe_core::{Action, EnforcementOutcome, EventEnvelope, Verdict};
+use probe_core::{
+    Action, EnforcementExecutionEvidence, EnforcementOutcome, EventEnvelope,
+    ProxySideEnforcementSurface, Verdict,
+};
 
-use crate::EnforcementError;
+use crate::{EnforcementError, decision::EnforcementDecisionParts};
 
 pub struct EnforcementBackendRequest<'a> {
     pub verdict: &'a Verdict,
@@ -31,12 +34,14 @@ impl EnforcementBackendDecision {
     pub(crate) fn into_enforcement_parts(
         self,
         requested_action: Action,
-    ) -> (EnforcementOutcome, Action, String) {
+    ) -> EnforcementDecisionParts {
         match self.result {
-            EnforcementBackendResult::Applied => {
-                (EnforcementOutcome::Applied, requested_action, self.reason)
-            }
-            EnforcementBackendResult::Unsupported => (
+            EnforcementBackendResult::Applied => EnforcementDecisionParts::new(
+                EnforcementOutcome::Applied,
+                requested_action,
+                self.reason,
+            ),
+            EnforcementBackendResult::Unsupported => EnforcementDecisionParts::new(
                 EnforcementOutcome::Unsupported,
                 Action::Observe,
                 self.reason,
@@ -77,9 +82,9 @@ pub struct ProxySideEnforcementHookDecision {
 }
 
 impl ProxySideEnforcementHookDecision {
-    pub fn delegated(reason: impl Into<String>) -> Self {
+    pub fn delegated(executed_action: Action, reason: impl Into<String>) -> Self {
         Self {
-            result: ProxySideEnforcementHookResult::Delegated,
+            result: ProxySideEnforcementHookResult::Delegated { executed_action },
             reason: reason.into(),
         }
     }
@@ -94,32 +99,48 @@ impl ProxySideEnforcementHookDecision {
     pub(crate) fn into_enforcement_parts(
         self,
         requested_action: Action,
-        surface: &str,
-    ) -> (EnforcementOutcome, Action, String) {
+        surface: ProxySideEnforcementSurface,
+    ) -> Result<EnforcementDecisionParts, EnforcementError> {
         match self.result {
-            ProxySideEnforcementHookResult::Delegated => (
-                EnforcementOutcome::Delegated,
-                requested_action,
-                format!(
-                    "{surface} accepted delegated enforcement action: {}",
+            ProxySideEnforcementHookResult::Delegated { executed_action } => {
+                if executed_action != requested_action {
+                    return Err(EnforcementError::Backend(format!(
+                        "{} returned executed action {executed_action:?} for requested action {requested_action:?}",
+                        surface.description()
+                    )));
+                }
+                let reason = format!(
+                    "{} accepted delegated enforcement action: {}",
+                    surface.description(),
                     self.reason
-                ),
-            ),
-            ProxySideEnforcementHookResult::Unsupported => (
+                );
+                Ok(EnforcementDecisionParts::with_execution(
+                    EnforcementOutcome::Delegated,
+                    executed_action,
+                    reason,
+                    EnforcementExecutionEvidence::ProxySideHook {
+                        surface,
+                        executed_action,
+                        reason: self.reason,
+                    },
+                ))
+            }
+            ProxySideEnforcementHookResult::Unsupported => Ok(EnforcementDecisionParts::new(
                 EnforcementOutcome::Unsupported,
                 Action::Observe,
                 format!(
-                    "{surface} cannot delegate enforcement action: {}",
+                    "{} cannot delegate enforcement action: {}",
+                    surface.description(),
                     self.reason
                 ),
-            ),
+            )),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProxySideEnforcementHookResult {
-    Delegated,
+    Delegated { executed_action: Action },
     Unsupported,
 }
 
