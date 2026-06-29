@@ -7,7 +7,7 @@ use probe_core::{
 use crate::{CaptureEvent, CapturedBytes, CapturedGap, EnforcementEvidencePropagation};
 
 use super::{
-    EbpfSocketReadObservation, EbpfSocketWriteObservation,
+    EbpfProcessLifecycleKind, EbpfSocketReadObservation, EbpfSocketWriteObservation,
     tracked_flow::{TrackedEbpfFlow, TrackedEbpfFlows},
 };
 
@@ -70,7 +70,7 @@ pub(super) fn output_loss_gap_events(
     lost_events: u64,
 ) -> Vec<CaptureEvent> {
     tracked_flows
-        .active_payload_loss_targets()
+        .active_payload_gap_targets()
         .flat_map(|tracked| {
             tracked
                 .payload_directions()
@@ -82,6 +82,32 @@ pub(super) fn output_loss_gap_events(
                         direction,
                         stream_offset(tracked, direction),
                         lost_events,
+                    )
+                })
+        })
+        .collect()
+}
+
+pub(super) fn process_lifecycle_gap_events(
+    targets: Vec<&TrackedEbpfFlow>,
+    timestamp: Timestamp,
+    tgid: u32,
+    kind: EbpfProcessLifecycleKind,
+) -> Vec<CaptureEvent> {
+    targets
+        .into_iter()
+        .flat_map(|tracked| {
+            tracked
+                .payload_directions()
+                .directions()
+                .map(move |direction| {
+                    ebpf_process_lifecycle_gap(
+                        timestamp,
+                        tracked.flow.clone(),
+                        direction,
+                        stream_offset(tracked, direction),
+                        tgid,
+                        kind,
                     )
                 })
         })
@@ -216,6 +242,37 @@ fn ebpf_output_loss_gap(
     );
     let enforcement_evidence = EnforcementEvidence::observation_only_with_detail(
         ObservationOnlyReason::ProviderCaptureLoss,
+        reason.clone(),
+    );
+    CaptureEvent::Gap(CapturedGap {
+        timestamp,
+        flow,
+        origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
+        enforcement_evidence,
+        enforcement_evidence_propagation: EnforcementEvidencePropagation::Flow,
+        gap: Gap {
+            direction,
+            expected_offset,
+            next_offset: None,
+            reason,
+        },
+    })
+}
+
+fn ebpf_process_lifecycle_gap(
+    timestamp: Timestamp,
+    flow: FlowContext,
+    direction: Direction,
+    expected_offset: u64,
+    tgid: u32,
+    kind: EbpfProcessLifecycleKind,
+) -> CaptureEvent {
+    let reason = format!(
+        "eBPF process lifecycle boundary ({}) invalidated fd-table epoch for TGID {tgid}; affected bytes and next stream offset are unknown",
+        kind.boundary_description()
+    );
+    let enforcement_evidence = EnforcementEvidence::observation_only_with_detail(
+        ObservationOnlyReason::EbpfProcessLifecycleBoundary,
         reason.clone(),
     );
     CaptureEvent::Gap(CapturedGap {

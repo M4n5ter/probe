@@ -89,6 +89,10 @@ impl DescriptorLeaseKey {
         self.fd
     }
 
+    pub(super) const fn tgid(self) -> u32 {
+        self.tgid
+    }
+
     pub(super) const fn fd_generation(self) -> u64 {
         self.fd_generation
     }

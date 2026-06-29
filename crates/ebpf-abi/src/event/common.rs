@@ -1,5 +1,5 @@
 pub const EBPF_MAGIC: u32 = 0x4252_5054;
-pub const EBPF_ABI_REVISION: u16 = 12;
+pub const EBPF_ABI_REVISION: u16 = 13;
 pub const EBPF_RING_BUFFER_BYTES: u32 = 256 * 1024;
 pub const EBPF_EVENT_HEADER_BYTES: usize = core::mem::size_of::<EbpfEventHeader>();
 
@@ -13,6 +13,8 @@ pub enum EbpfEventKind {
     SocketReadSampled = 5,
     AcceptTracepointObserved = 6,
     CloseRangeTracepointObserved = 7,
+    ProcessExitObserved = 8,
+    ProcessExecObserved = 9,
 }
 
 impl EbpfEventKind {
@@ -25,6 +27,8 @@ impl EbpfEventKind {
             5 => Some(Self::SocketReadSampled),
             6 => Some(Self::AcceptTracepointObserved),
             7 => Some(Self::CloseRangeTracepointObserved),
+            8 => Some(Self::ProcessExitObserved),
+            9 => Some(Self::ProcessExecObserved),
             _ => None,
         }
     }
@@ -302,7 +306,15 @@ mod tests {
             EbpfEventKind::from_wire(7),
             Some(EbpfEventKind::CloseRangeTracepointObserved)
         );
-        assert_eq!(EbpfEventKind::from_wire(8), None);
+        assert_eq!(
+            EbpfEventKind::from_wire(8),
+            Some(EbpfEventKind::ProcessExitObserved)
+        );
+        assert_eq!(
+            EbpfEventKind::from_wire(9),
+            Some(EbpfEventKind::ProcessExecObserved)
+        );
+        assert_eq!(EbpfEventKind::from_wire(10), None);
     }
 
     #[test]

@@ -26,8 +26,9 @@ use ebpf_abi::{
     EBPF_SOCKET_PAYLOAD_ALLOW_WRITE, EbpfAcceptTracepointRecord, EbpfCloseObservation,
     EbpfCloseRangeTracepointRecord, EbpfCloseTracepointRecord, EbpfConnectTracepointRecord,
     EbpfPendingSocketAcceptAttempt, EbpfPendingSocketConnectAttempt, EbpfPendingSocketReadAttempt,
-    EbpfPendingSocketWriteSample, EbpfProcessProbeMetadata, EbpfSocketFdKey,
-    EbpfSocketPayloadAllowance, EbpfSocketReadSampleRecord, EbpfSocketWriteSampleRecord,
+    EbpfPendingSocketWriteSample, EbpfProcessLifecycleRecord, EbpfProcessProbeMetadata,
+    EbpfSocketFdKey, EbpfSocketPayloadAllowance, EbpfSocketReadSampleRecord,
+    EbpfSocketWriteSampleRecord,
 };
 
 use accept::{accept_attempt_from_tracepoint, accept_observation_from_result};
@@ -168,16 +169,18 @@ pub fn traffic_probe_sys_enter_close_range(ctx: TracePointContext) -> u32 {
 }
 
 #[tracepoint(name = "sched_process_exit", category = "sched")]
-pub fn traffic_probe_sched_process_exit(_ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sched_process_exit(ctx: TracePointContext) -> u32 {
     if current_pid() == current_tgid() {
         invalidate_current_fd_table();
+        emit_process_exit(ctx);
     }
     0
 }
 
 #[tracepoint(name = "sched_process_exec", category = "sched")]
-pub fn traffic_probe_sched_process_exec(_ctx: TracePointContext) -> u32 {
+pub fn traffic_probe_sched_process_exec(ctx: TracePointContext) -> u32 {
     invalidate_current_fd_table();
+    emit_process_exec(ctx);
     0
 }
 
@@ -380,6 +383,30 @@ fn emit_close_range_attempt(ctx: TracePointContext) {
         metadata.gid,
         metadata.command,
         close_range,
+    );
+    submit_process_event(&event);
+}
+
+fn emit_process_exit(ctx: TracePointContext) {
+    let metadata = process_metadata(&ctx);
+    let event = EbpfProcessLifecycleRecord::process_exit_observed(
+        metadata.pid,
+        metadata.tgid,
+        metadata.uid,
+        metadata.gid,
+        metadata.command,
+    );
+    submit_process_event(&event);
+}
+
+fn emit_process_exec(ctx: TracePointContext) {
+    let metadata = process_metadata(&ctx);
+    let event = EbpfProcessLifecycleRecord::process_exec_observed(
+        metadata.pid,
+        metadata.tgid,
+        metadata.uid,
+        metadata.gid,
+        metadata.command,
     );
     submit_process_event(&event);
 }

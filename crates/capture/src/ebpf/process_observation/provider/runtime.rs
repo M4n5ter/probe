@@ -11,7 +11,8 @@ use crate::output_loss::OutputLossTracker;
 use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider};
 
 use super::super::{
-    EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfProcessObservation,
+    EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation,
+    EbpfProcessLifecycleObservation, EbpfProcessObservation,
     EbpfProcessObservationLinkOwnershipSnapshot, EbpfProcessObservationProbe,
     EbpfProcessObservationProbeConfig, EbpfSocketFlowResolver,
     bridge::output_loss_event,
@@ -19,9 +20,11 @@ use super::super::{
     flow_start::{PendingEbpfFlowResolution, PendingEbpfFlowStart},
     observation_source::{EbpfObservationSource, ProbeObservationSource},
     payload_authorization::SocketPayloadSampleAuthorization,
-    payload_bridge::{output_loss_gap_events, read_events, write_events},
+    payload_bridge::{
+        output_loss_gap_events, process_lifecycle_gap_events, read_events, write_events,
+    },
     payload_direction::PayloadDirections,
-    tracked_flow::TrackedEbpfFlows,
+    tracked_flow::{TrackedEbpfFlow, TrackedEbpfFlows},
 };
 
 const DEFAULT_RESOLUTION_RETRIES: u32 = 20;
@@ -116,34 +119,31 @@ impl EbpfProcessObservationProvider {
                 .unwrap_or(CapturePoll::Progress)),
             EbpfProcessObservation::CloseRange(close_range) => {
                 let events = self.close_range_events(&close_range);
-                self.pending_events.extend(events);
-                Ok(self
-                    .pending_events
-                    .pop_front()
-                    .map(CapturePoll::event)
-                    .unwrap_or(CapturePoll::Progress))
+                Ok(self.queue_events(events))
+            }
+            EbpfProcessObservation::ProcessLifecycle(lifecycle) => {
+                let events = self.process_lifecycle_events(&lifecycle);
+                Ok(self.queue_events(events))
             }
             EbpfProcessObservation::Write(write) => {
                 let timestamp = self.clock.next_timestamp();
                 let events = write_events(&mut self.tracked_flows, &write, timestamp);
-                self.pending_events.extend(events);
-                Ok(self
-                    .pending_events
-                    .pop_front()
-                    .map(CapturePoll::event)
-                    .unwrap_or(CapturePoll::Progress))
+                Ok(self.queue_events(events))
             }
             EbpfProcessObservation::Read(read) => {
                 let timestamp = self.clock.next_timestamp();
                 let events = read_events(&mut self.tracked_flows, &read, timestamp);
-                self.pending_events.extend(events);
-                Ok(self
-                    .pending_events
-                    .pop_front()
-                    .map(CapturePoll::event)
-                    .unwrap_or(CapturePoll::Progress))
+                Ok(self.queue_events(events))
             }
         }
+    }
+
+    fn queue_events(&mut self, events: impl IntoIterator<Item = CaptureEvent>) -> CapturePoll {
+        self.pending_events.extend(events);
+        self.pending_events
+            .pop_front()
+            .map(CapturePoll::event)
+            .unwrap_or(CapturePoll::Progress)
     }
 
     fn begin_flow_resolution(
@@ -276,6 +276,67 @@ impl EbpfProcessObservationProvider {
         close_range: &EbpfCloseRangeTracepointObservation,
     ) -> Vec<CaptureEvent> {
         let removed = self.tracked_flows.remove_close_range(close_range);
+        self.connection_closed_events(removed)
+    }
+
+    fn process_lifecycle_events(
+        &mut self,
+        lifecycle: &EbpfProcessLifecycleObservation,
+    ) -> Vec<CaptureEvent> {
+        let has_pending = self.has_pending_flow_resolutions_for_tgid(lifecycle.process.tgid);
+        let active_payload_targets = self
+            .tracked_flows
+            .active_payload_gap_targets_for_tgid(lifecycle.process.tgid);
+        if !has_pending && active_payload_targets.is_empty() {
+            return Vec::new();
+        }
+        let timestamp = self.clock.next_timestamp();
+        let mut events = Self::cancel_pending_flow_resolutions_for_lifecycle(
+            &mut self.pending_flows,
+            lifecycle,
+            timestamp,
+        );
+        if active_payload_targets.is_empty() {
+            return events;
+        }
+        events.extend(process_lifecycle_gap_events(
+            active_payload_targets,
+            timestamp,
+            lifecycle.process.tgid,
+            lifecycle.kind,
+        ));
+        events
+    }
+
+    fn has_pending_flow_resolutions_for_tgid(&self, tgid: u32) -> bool {
+        self.pending_flows
+            .iter()
+            .any(|pending| pending.flow_start.tgid() == tgid)
+    }
+
+    fn cancel_pending_flow_resolutions_for_lifecycle(
+        pending_flows: &mut VecDeque<PendingEbpfFlowResolution>,
+        lifecycle: &EbpfProcessLifecycleObservation,
+        timestamp: Timestamp,
+    ) -> Vec<CaptureEvent> {
+        let mut retained = VecDeque::with_capacity(pending_flows.len());
+        let mut events = Vec::new();
+        while let Some(pending) = pending_flows.pop_front() {
+            if pending.flow_start.tgid() == lifecycle.process.tgid {
+                events.push(
+                    pending
+                        .flow_start
+                        .lifecycle_boundary_gap(timestamp, lifecycle.kind),
+                );
+            } else {
+                retained.push_back(pending);
+            }
+        }
+        *pending_flows = retained;
+        events
+    }
+
+    fn connection_closed_events(&mut self, removed: Vec<TrackedEbpfFlow>) -> Vec<CaptureEvent> {
         if removed.is_empty() {
             return Vec::new();
         }
@@ -303,7 +364,7 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider emits result-gated connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded first-readable-iovec syscall argument samples plus inbound single-buffer and bounded first-readable-iovec syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, output ring-buffer failure conversion to degraded capture_loss events, and conservative unknown-offset gap fan-out to active tracked payload flows; payload beyond the first readable iovec segment, bounded scan window, or sample buffer, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
+            "eBPF provider emits result-gated connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded first-readable-iovec syscall argument samples plus inbound single-buffer and bounded first-readable-iovec syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, TGID-level process exit/exec cancellation of pending flow resolution plus lifecycle boundary gaps for active payload-tracked flows, output ring-buffer failure conversion to degraded capture_loss events, and conservative unknown-offset gap fan-out to active tracked payload flows; payload beyond the first readable iovec segment, bounded scan window, or sample buffer, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
         )]
     }
 
@@ -319,8 +380,8 @@ mod tests {
     use crate::CaptureProviderKind;
 
     use probe_core::{
-        Direction, ProcessContext, ProcessIdentity, ProcessSelector, Selector, TcpConnection,
-        TcpEndpoint, TrafficSelector,
+        Direction, ObservationOnlyReason, ProcessContext, ProcessIdentity, ProcessSelector,
+        Selector, TcpConnection, TcpEndpoint, TrafficSelector,
     };
 
     use crate::ebpf::{
@@ -329,6 +390,8 @@ mod tests {
         EbpfResolvedSocketFlow, EbpfSocketEndpoint, EbpfSocketFlowLookup,
         EbpfSocketReadObservation,
     };
+
+    use super::super::super::EbpfProcessLifecycleKind;
 
     use super::*;
 
@@ -581,6 +644,144 @@ mod tests {
     }
 
     #[test]
+    fn emits_process_lifecycle_gaps_on_exit() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let observations = [
+            connect_observation(process.clone(), 7, remote),
+            process_exit_observation(process),
+        ];
+        let selector = deep_observe_selector([443], [Direction::Inbound, Direction::Outbound])?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            static_resolver(local, remote),
+            Some(selector),
+        );
+
+        let (_, opened) = expect_connection_opened(&mut provider)?;
+        let outbound = expect_gap(&mut provider)?;
+        let inbound = expect_gap(&mut provider)?;
+        let gaps = [outbound, inbound];
+
+        assert!(gaps.iter().all(|gap| gap.timestamp.monotonic_ns == 2));
+        assert!(gaps.iter().all(|gap| gap.flow.id == opened.id));
+        assert!(gaps.iter().all(|gap| gap.gap.next_offset.is_none()));
+        assert!(
+            gaps.iter()
+                .all(|gap| gap.gap.reason.contains("TGID leader exit"))
+        );
+        assert!(gaps.iter().all(|gap| gap.enforcement_evidence
+            == probe_core::EnforcementEvidence::observation_only_with_detail(
+                ObservationOnlyReason::EbpfProcessLifecycleBoundary,
+                gap.gap.reason.clone()
+            )));
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.gap.direction == Direction::Outbound)
+        );
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.gap.direction == Direction::Inbound)
+        );
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn emits_process_lifecycle_gap_on_exec() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let observations = [
+            connect_observation(process.clone(), 7, remote),
+            process_exec_observation(process),
+        ];
+        let selector = deep_observe_selector([443], [Direction::Outbound])?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            static_resolver(local, remote),
+            Some(selector),
+        );
+
+        let (_, opened) = expect_connection_opened(&mut provider)?;
+        let gap = expect_gap(&mut provider)?;
+
+        assert_eq!(gap.timestamp.monotonic_ns, 2);
+        assert_eq!(gap.flow.id, opened.id);
+        assert_eq!(gap.gap.direction, Direction::Outbound);
+        assert_eq!(gap.gap.expected_offset, 0);
+        assert_eq!(gap.gap.next_offset, None);
+        assert!(gap.gap.reason.contains("process exec"));
+        assert_eq!(
+            gap.enforcement_evidence,
+            probe_core::EnforcementEvidence::observation_only_with_detail(
+                ObservationOnlyReason::EbpfProcessLifecycleBoundary,
+                gap.gap.reason.clone()
+            )
+        );
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn process_lifecycle_does_not_remove_tracked_flow() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let observations = [
+            connect_observation(process.clone(), 7, remote),
+            process_exit_observation(process.clone()),
+            close_observation(process, 7),
+        ];
+        let selector = deep_observe_selector([443], [Direction::Outbound])?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            static_resolver(local, remote),
+            Some(selector),
+        );
+
+        let (_, opened) = expect_connection_opened(&mut provider)?;
+        let gap = expect_gap(&mut provider)?;
+        assert_eq!(gap.flow.id, opened.id);
+
+        let (timestamp, flow) = expect_connection_closed(&mut provider)?;
+        assert_eq!(timestamp.monotonic_ns, 3);
+        assert_eq!(flow.id, opened.id);
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn process_lifecycle_does_not_gap_or_close_other_tgid_flows() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let owner = observed_process(101, 100);
+        let other = observed_process(201, 200);
+        let observations = [
+            connect_observation(owner.clone(), 7, remote),
+            connect_observation(other.clone(), 8, remote),
+            process_exit_observation(owner),
+            close_observation(other, 8),
+        ];
+        let selector = deep_observe_selector([40_007, 40_008], [Direction::Outbound])?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            fd_distinct_resolver(local),
+            Some(selector),
+        );
+
+        let (_, first_opened) = expect_connection_opened(&mut provider)?;
+        let first_flow_id = first_opened.id.clone();
+        let (_, second_opened) = expect_connection_opened(&mut provider)?;
+        let second_flow_id = second_opened.id.clone();
+
+        let gap = expect_gap(&mut provider)?;
+        assert_eq!(gap.flow.id, first_flow_id);
+
+        let (_, closed) = expect_connection_closed(&mut provider)?;
+        assert_eq!(closed.id, second_flow_id);
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn does_not_close_different_fd_from_same_process() -> TestResult {
         let (local, remote) = outbound_loopback();
         let process = observed_process(101, 100);
@@ -739,6 +940,38 @@ mod tests {
 
         let (_, flow) = expect_connection_opened(&mut provider)?;
         assert_eq!(flow.local.port, 50_000);
+        Ok(())
+    }
+
+    #[test]
+    fn process_lifecycle_cancels_pending_flow_resolution_for_same_tgid() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let observations = [
+            connect_observation(process.clone(), 7, remote),
+            process_exec_observation(process),
+        ];
+        let resolver = Box::new(RetryResolver {
+            calls: 0,
+            resolved: EbpfResolvedSocketFlow {
+                process: demo_process(),
+                confidence: 90,
+                connection: TcpConnection::new(local, remote),
+                socket_cookie: None,
+            },
+        });
+        let mut provider =
+            EbpfProcessObservationProvider::from_observations_for_test(observations, resolver);
+        provider.resolution_retries = 1;
+        provider.resolution_retry_sleep = Duration::ZERO;
+
+        let gap = expect_gap(&mut provider)?;
+
+        assert_eq!(gap.timestamp.monotonic_ns, 2);
+        assert!(gap.gap.reason.contains("abandoned"));
+        assert!(gap.gap.reason.contains("process exec"));
+        assert!(gap.gap.reason.contains("fd=7"));
+        assert!(provider.next()?.is_none());
         Ok(())
     }
 
@@ -931,6 +1164,30 @@ mod tests {
         }
     }
 
+    struct FdDistinctResolver {
+        local: TcpEndpoint,
+    }
+
+    impl EbpfSocketFlowResolver for FdDistinctResolver {
+        fn resolve_socket_flow(
+            &mut self,
+            lookup: EbpfSocketFlowLookup,
+        ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError> {
+            let Ok(fd) = u16::try_from(lookup.fd) else {
+                return Ok(None);
+            };
+            Ok(Some(EbpfResolvedSocketFlow {
+                process: demo_process(),
+                confidence: 90,
+                connection: TcpConnection::new(
+                    self.local,
+                    loopback_endpoint(40_000_u16.saturating_add(fd)),
+                ),
+                socket_cookie: Some(u64::from(fd)),
+            }))
+        }
+    }
+
     struct RetryResolver {
         calls: u32,
         resolved: EbpfResolvedSocketFlow,
@@ -1103,6 +1360,15 @@ mod tests {
         }
     }
 
+    fn expect_gap(
+        provider: &mut EbpfProcessObservationProvider,
+    ) -> Result<crate::CapturedGap, CaptureError> {
+        match provider.next()? {
+            Some(CaptureEvent::Gap(gap)) => Ok(gap),
+            event => panic!("expected gap event, got {event:?}"),
+        }
+    }
+
     fn static_resolver(local: TcpEndpoint, remote: TcpEndpoint) -> Box<StaticResolver> {
         Box::new(StaticResolver {
             resolved: Some(EbpfResolvedSocketFlow {
@@ -1112,6 +1378,25 @@ mod tests {
                 socket_cookie: None,
             }),
         })
+    }
+
+    fn fd_distinct_resolver(local: TcpEndpoint) -> Box<FdDistinctResolver> {
+        Box::new(FdDistinctResolver { local })
+    }
+
+    fn deep_observe_selector(
+        remote_ports: impl IntoIterator<Item = u16>,
+        directions: impl IntoIterator<Item = Direction>,
+    ) -> Result<CompiledSelector, probe_core::SelectorError> {
+        Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: remote_ports.into_iter().collect(),
+                directions: directions.into_iter().collect(),
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()
     }
 
     fn connect_observation(
@@ -1205,6 +1490,20 @@ mod tests {
             process,
             first_fd,
             last_fd,
+        })
+    }
+
+    fn process_exit_observation(process: EbpfObservedProcess) -> EbpfProcessObservation {
+        EbpfProcessObservation::ProcessLifecycle(EbpfProcessLifecycleObservation {
+            process,
+            kind: EbpfProcessLifecycleKind::Exit,
+        })
+    }
+
+    fn process_exec_observation(process: EbpfObservedProcess) -> EbpfProcessObservation {
+        EbpfProcessObservation::ProcessLifecycle(EbpfProcessLifecycleObservation {
+            process,
+            kind: EbpfProcessLifecycleKind::Exec,
         })
     }
 

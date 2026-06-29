@@ -8,6 +8,7 @@ pub enum EbpfProcessObservation {
     Accept(EbpfAcceptTracepointObservation),
     Close(EbpfCloseTracepointObservation),
     CloseRange(EbpfCloseRangeTracepointObservation),
+    ProcessLifecycle(EbpfProcessLifecycleObservation),
     Write(EbpfSocketWriteObservation),
     Read(EbpfSocketReadObservation),
 }
@@ -23,6 +24,7 @@ impl EbpfProcessObservation {
             Self::Accept(observation) => &observation.process,
             Self::Close(observation) => &observation.process,
             Self::CloseRange(observation) => &observation.process,
+            Self::ProcessLifecycle(observation) => &observation.process,
             Self::Write(observation) => &observation.process,
             Self::Read(observation) => &observation.process,
         }
@@ -82,6 +84,28 @@ pub struct EbpfCloseRangeTracepointObservation {
     pub process: EbpfObservedProcess,
     pub first_fd: u32,
     pub last_fd: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EbpfProcessLifecycleObservation {
+    pub process: EbpfObservedProcess,
+    pub kind: EbpfProcessLifecycleKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EbpfProcessLifecycleKind {
+    Exit,
+    Exec,
+}
+
+impl EbpfProcessLifecycleKind {
+    pub(crate) const fn boundary_description(self) -> &'static str {
+        match self {
+            Self::Exit => "TGID leader exit",
+            Self::Exec => "process exec",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

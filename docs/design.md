@@ -50,7 +50,8 @@ libpcap/procfs 等 fallback 路径，并明确标注能力降级。
 
 eBPF / procfs 现状：
 
-- eBPF process observation 已覆盖 connect、accept/accept4、close 和 plain `flags == 0` close_range lifecycle。
+- eBPF process observation 已覆盖 connect、accept/accept4、close、plain `flags == 0` close_range，以及
+  TGID-level process exit/exec lifecycle。
 - `capture.deep_observe_selector` 可按方向授权 outbound `write(2)` / `sendto(2)` / `writev(2)` / `sendmsg(2)` 的
   single-buffer 或 bounded first-readable-iovec syscall argument sample。
 - 同一 selector 授权 inbound `read(2)` / `recvfrom(2)` / `readv(2)` / `recvmsg(2)` 的 single-buffer 或
@@ -289,7 +290,7 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
 - `ebpf`
   - Runtime status：host/object/contract/procfs preflight 可用时为 degraded；host、object、contract 或 procfs preflight 失败时为 unavailable。
   - 已实现：host probe、`aya-obj` object preflight、strict process artifact contract、shared ABI。
-  - 已实现：kernel connect enter/exit、accept/accept4、close/plain close_range 和 payload tracepoint observation。
+  - 已实现：kernel connect enter/exit、accept/accept4、close/plain close_range、process exit/exec 和 payload tracepoint observation。
   - 已实现：userspace `aya` loader、ringbuf decoder、TGID+thread PID+fd lookup 到 `ConnectionOpened` bridge。
   - 已实现：`capture.deep_observe_selector` 命中 flow 后，userspace 将 descriptor lease
     `(tgid, fd, flow-start fd-table epoch, per-fd generation, read/write direction mask)` 写入 allow map。
@@ -301,8 +302,10 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
     `CapturedBytes`/`Gap` bridge。
   - 已实现：payload bridge 和 close bridge 按 descriptor generation 匹配 tracked flow，避免同一 TGID+fd 复用时把
     payload 或 close lifecycle 归到旧连接或新连接。
-  - 已实现：best-effort descriptor close/plain close_range 到 `ConnectionClosed` lifecycle event；close 携带 descriptor
-    generation，close_range 按同 TGID fd range 终止已跟踪 flow。
+  - 已实现：best-effort descriptor close/plain close_range 到 `ConnectionClosed` lifecycle event。
+    close 携带 descriptor generation；close_range 按同 TGID fd range 终止已跟踪 flow。
+  - 已实现：process exit/exec 输出 lifecycle boundary `Gap`，用于让 active payload-tracked flow 显式暴露 fd-table
+    epoch continuity break。
   - 已实现：unresolved connect/accept 到 degraded `Gap` 的 provider wiring。
   - 已实现：output ringbuf write failure counter 到 degraded `capture_loss` event 的转换。
   - 已实现：process output loss delta 会对 active tracked payload flows 发出 conservative unknown-offset `Gap` fan-out，
@@ -323,13 +326,17 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
   - 边界：capability 和 evidence mode 仍是 degraded/best-effort。
   - 边界：outbound sample 不是内核已发送字节的强证明，inbound sample 也只是 syscall 返回后的用户 buffer 观察，不等于完整 socket 流。
   - 边界：descriptor lease 是进程 fd 级错配防护，不等同于 kernel socket object identity。
+  - 边界：process exit/exec lifecycle 不生成 `ConnectionClosed`。它只为 userspace 已跟踪且已授权 payload 的同 TGID flow
+    输出 unknown-offset `Gap`，并取消同 TGID 尚未完成 procfs resolution 的 pending connect/accept flow-start。pending
+    cancellation 使用 `EbpfUnresolvedFlow` evidence；tracked flow boundary 使用 `EbpfProcessLifecycleBoundary` evidence。
+    这些信号不补全未跟踪、已淘汰或丢失事件的 socket lifecycle。
   - 边界：process eBPF `link_ownership` 只证明 loader 成功提交并仍持有 tracepoint link handles；
     它不是动态 per-link firing/liveness probe，也不证明任意 socket-object lifetime。
   - 边界：`SO_COOKIE` 只增强成功 fd lookup 后的身份，不解决 fd 关闭后才解析、dup/fork/fd passing 或 lost event。
   - 边界：output ringbuf failure 的 flow fan-out 是保守影响信号，不知道具体丢失事件、字节范围或 next offset，也不能重建 parser state。
   - 缺口：unbounded scatter/gather continuation、precise flow-specific lost-event reconstruction、partial-write retry 语义和完整
     kernel/socket-path traffic capture program 尚未完成。
-  - 缺口：仍缺 kernel-side socket cookie、process exit/fd passing 的完整 socket-object lifetime。
+  - 缺口：仍缺 kernel-side socket cookie，以及 fork/dup/fd passing/unshare/lost-event 场景的完整 socket-object lifetime。
   - fallback 语义：`auto` 会优先规划可构建的 degraded eBPF provider，并在 evidence fields/health 保留降级原因。
   - fallback 语义：plan-time eBPF unavailable 会进入后续 libpcap fallback；run-time open/attach 失败会继续尝试后续 live provider，
     并在 status `capture.open_failures` 保留失败 backend 与原因。
@@ -1522,6 +1529,7 @@ eBPF 技术栈选择 Aya。理由：
 首批 eBPF attach 点：
 
 - connect/accept/close/close_range。
+- sched process exit/exec。
 - send/recv/read/write 相关 syscall 或 tracepoint。
 - FD、socket、process、flow 关联。
 - 暂不把 TC/XDP 作为当前数据面主线。
@@ -1545,21 +1553,24 @@ BTF 或 eBPF 主程序不可用时：
   - `ebpf-abi` 定义 ringbuf envelope、公共 header decoder、ABI revision、process observation records 和 TLS plaintext sample records。
   - bounded sample record 必须表达 original length、captured length、truncated/read-failed flags 和 gap 语义。
   - process records 携带 fd-table epoch 和 descriptor generation；payload allowance 同时校验两者。
+  - process lifecycle records 只携带公共 process metadata 和 command，具体语义由 typed event kind 表达。
   - 仍缺 kernel-side socket cookie、precise flow-specific lost-event record 和 unbounded scatter/gather collector。
 - Kernel object
   - `ebpf-program` 生成独立 process observation artifact 和 TLS plaintext artifact。
-  - process artifact 已覆盖 connect enter/exit、accept/close/close_range、fd-table epoch、per-fd descriptor generation、
-    bounded outbound/inbound syscall samples 和 process output loss counter。
+  - process artifact 已覆盖 connect enter/exit、accept/close/close_range、process exit/exec、fd-table epoch、per-fd
+    descriptor generation、bounded outbound/inbound syscall samples 和 process output loss counter。
   - TLS artifact 已覆盖 libssl plaintext uprobe producer、TLS state maps、stream offset 和 TLS output loss counter。
   - 仍缺 kernel socket-object lifetime、payload continuation、完整 kernel traffic capture 和 precise flow-specific lost-event reconstruction。
 - Userspace loader/provider
   - `capture::EbpfProcessObservationProbe` load/attach process tracepoints、打开 ringbuf/allow map/loss counter，并解码 typed observation。
-  - provider 把 connect/accept observation 经 procfs resolver 转成 `ConnectionOpened`，按 selector 写入 allow map，并输出 degraded bytes/gap/lifecycle/loss events。
+  - provider 把 connect/accept observation 经 procfs resolver 转成 `ConnectionOpened`，按 selector 写入 allow map，并输出
+    degraded bytes/gap、best-effort descriptor close lifecycle、lifecycle-boundary gap 和 loss events。
   - TLS plaintext provider 从 strict artifact preflight、typed attach plan 和 flow resolver 打开，并把 TLS samples bridge 到 `PlaintextEvent`。
 - Attribution bridge
   - connect/accept observation + TGID/thread PID/fd lookup 转成单个 `ConnectionOpened`。
   - agent procfs resolver 支持 thread fd、TGID fallback、`NStgid` alias、process hint 和可选 `SO_COOKIE`。
-  - descriptor lease 防止同 TGID+fd 复用造成 payload/close 错配；`SO_COOKIE` 只在成功 live fd lookup 后增强 flow identity。
+  - descriptor lease 防止同 TGID+fd 复用造成 payload/close 错配；process exit/exec 只按 TGID 标记 payload continuity boundary；
+    `SO_COOKIE` 只在成功 live fd lookup 后增强 flow identity。
   - 仍缺 kernel-side socket-cookie 和 precise flow-specific lost-event reconstruction。
 - Build gate
   - `xtask check-ebpf` 执行 eBPF fmt、BPF target clippy、locked release build 和 object contract preflight。
@@ -1593,11 +1604,15 @@ sequenceDiagram
         else selector misses
             Loader->>Loader: do not authorize kernel payload read
         end
-        Program->>Abi: ringbuf close or close_range event
-        Abi->>Loader: decoded close lifecycle observation
+        Program->>Abi: ringbuf close, close_range, process exit, or process exec event
+        Abi->>Loader: decoded lifecycle observation
         alt close lifecycle hits bounded tracker
             Loader->>Pipeline: best-effort ConnectionClosed
-        else close lifecycle is untracked or evicted
+        else process lifecycle hits active payload-tracked flow
+            Loader->>Pipeline: Gap with EbpfProcessLifecycleBoundary evidence
+        else process lifecycle hits pending flow-start resolution
+            Loader->>Pipeline: Gap with EbpfUnresolvedFlow evidence
+        else lifecycle is untracked or evicted
             Loader->>Loader: ignore descriptor lifecycle
         end
     else unresolved after retries
@@ -1630,6 +1645,8 @@ TGID epoch 用来在 fd-table 语义可能变化时 fail closed：
 - close_range 会提升 epoch。
 - TGID leader process exit 会提升 epoch。
 - process exec 会提升 epoch，并覆盖 `FD_CLOEXEC` 这类没有逐 fd close tracepoint 的关闭路径。
+- process exit/exec 同时输出 typed lifecycle observation，让 userspace 为同 TGID 下仍被 active payload-tracked 的 flow
+  输出 lifecycle boundary gap。
 - 普通 `close(fd)` 写入该 fd 的 inactive generation marker，并删除当前 TGID 下该 fd 的 allow。
 - 普通 `close(fd)` 不再提升全 TGID epoch，避免同进程其它 fd close 误杀活跃 flow。
 - epoch map 和 fd generation map 不做 LRU 淘汰。
@@ -1705,11 +1722,20 @@ loss 与 fallback 边界：
 - process eBPF `link_ownership` 不是动态 per-link kernel liveness，也不证明强 socket-object lifetime。
 - agent composition root 只探测一次 procfs socket attribution，并把同一份 `CapabilityState` 同时用于 eBPF descriptor 和 capability matrix，避免二者分叉。
 
-其中 `close_range` 的生命周期处理是“双层保守”：kernel 侧总是提升 TGID epoch 让旧 payload allow fail closed；只有合法 range 且 `flags == 0` 时才输出
-typed close_range observation。userspace provider 不重新查已关闭 fd，只关闭同 TGID 下 range 内已经由 connect/accept 建立过的 tracked flow。
-payload sample 和 plain close 必须匹配同一 descriptor generation。`CLOSE_RANGE_CLOEXEC` 只是设置 close-on-exec，不代表当前 fd 已关闭；
-`CLOSE_RANGE_UNSHARE` 会改变调用线程的 fd-table identity，不能安全映射到 TGID 级关闭。因此二者都不会生成 `ConnectionClosed`，只通过
-epoch 让后续深度采样保守降级。
+其中 `close_range` 的生命周期处理是“双层保守”：kernel 侧总是提升 TGID epoch 让旧 payload allow fail closed；
+只有合法 range 且 `flags == 0` 时才输出 typed close_range observation。userspace provider 不重新查已关闭 fd，
+只关闭同 TGID 下 range 内已经由 connect/accept 建立过的 tracked flow。
+
+payload sample 和 plain close 必须匹配同一 descriptor generation。`CLOSE_RANGE_CLOEXEC` 只是设置 close-on-exec，
+不代表当前 fd 已关闭；`CLOSE_RANGE_UNSHARE` 会改变调用线程的 fd-table identity，不能安全映射到 TGID 级关闭。
+因此二者都不会生成 `ConnectionClosed`，只通过 epoch 让后续深度采样保守降级。
+
+process exit/exec lifecycle 是 TGID-level fd-table continuity signal。kernel 在 TGID leader exit 或 process exec
+时输出 typed lifecycle observation 并提升 fd-table epoch。userspace provider 不把该信号伪造成 `ConnectionClosed`；
+它只对同 TGID 下仍在 bounded tracker 且具有 payload direction authorization 的 flow 输出 unknown-offset `Gap`。
+同 TGID 下尚未完成 procfs resolution 的 pending connect/accept flow-start 会被取消，并输出 unresolved-flow `Gap`，
+避免 lifecycle boundary 之后再解析出 stale `ConnectionOpened`。
+未解析、未跟踪、已被容量淘汰或 lifecycle event 自身丢失的 socket lifetime 不会被伪造。
 
 ## 10. libpcap fallback
 
@@ -1739,20 +1765,25 @@ fallback 能力边界：
   才能继续前进时，会先输出 `Gap` 再输出后续 bytes。事件仍必须标记 degraded：这里不是完整 TCP 栈，不处理 window/SACK 级恢复、内核 lost-event 反馈、IPv6
   extension/fragment 或 snaplen 截断修复。libpcap flow table 只承担方向/归因/生命周期缓存，不把 fallback 捕获伪装成强可靠 stream；端口复用、RST、双向 FIN、idle
   timeout 或容量淘汰会释放 flow cache，并通过 connection lifecycle event 让 pipeline 释放 parser state。
-- `agent` composition root 只在 libpcap provider 能按当前配置打开并安装 filter 时注入 available `Libpcap` descriptor；否则注入 unavailable
-  descriptor 并输出原因，`runtime` 只消费 descriptor 做 plan。live `LibpcapProvider` 由 `agent` 注入 procfs TCP process resolver；
-  resolver 通过共享 `TcpConnection`、`/proc/net/tcp`、可读取且可解析时的 `/proc/net/tcp6` 和 fd socket inode best-effort 归因，短 TTL 复用
-  socket snapshot，成功时提高 attribution confidence，失败时回退到 synthetic unknown identity。同一个 procfs resolver 也实现 eBPF socket
-  flow bridge 所需的 TGID+thread PID+fd 反向解析：先从 `/proc/<thread_pid>/fd/<fd>` 读取 socket inode，线程 fd 消失时回退到 TGID fd；live fd
-  在真实 `/proc` 上可通过 `pidfd_getfd` + `SO_COOKIE` 增强成功归因后的 flow identity；observed TGID 不可见时才尝试 `NStgid` alias，若 alias 不足但
-  eBPF process hint 存在，则只接受扫描完整且唯一的 fd/remote/name/uid/gid 候选；仍不满足时不根据 remote endpoint 猜测进程。eBPF provider 会把已解析
-  connect/accept flow 按 bounded descriptor lease `(tgid, fd, fd_generation)` 跟踪 payload attribution；payload sample 和 close
-  只命中同 generation 的 tracked flow，close_range 按同 TGID fd range 终止已跟踪 flow。容量淘汰的 tracked flow 后续 close lifecycle 会被忽略，
-  不会伪造 lifecycle。它不会读取已关闭 fd，也不等同于 kernel socket-object lifetime；dup/fork/fd passing、process exit、connect
-  exit/error、unshare fd-table 和 lost-event 语义仍需要后续 kernel-side socket cookie/refcount、FIN/RST 或进程生命周期信号补强。
-  `procfs_socket_attribution` 仍是 degraded capability：hidepid、权限、
-  PID/fd race 和 net namespace 边界会导致 lookup 失败；lookup 错误进入 capture degradation reason，eBPF flow-start observation
-  重试耗尽仍未匹配时输出 degraded `Gap`，flow attribution confidence 为 `0`，reason 携带 TGID、thread PID 和 fd。
+- `agent` composition root 只在 libpcap provider 能按当前配置打开并安装 filter 时注入 available `Libpcap` descriptor；
+  否则注入 unavailable descriptor 并输出原因，`runtime` 只消费 descriptor 做 plan。
+- live `LibpcapProvider` 由 `agent` 注入 procfs TCP process resolver。resolver 通过共享 `TcpConnection`、`/proc/net/tcp`、
+  可读取且可解析时的 `/proc/net/tcp6` 和 fd socket inode best-effort 归因；短 TTL socket snapshot 成功时提高
+  attribution confidence，失败时回退到 synthetic unknown identity。
+- 同一个 procfs resolver 也实现 eBPF socket flow bridge 所需的 TGID+thread PID+fd 反向解析：
+  先从 `/proc/<thread_pid>/fd/<fd>` 读取 socket inode，线程 fd 消失时回退到 TGID fd。
+- live fd 在真实 `/proc` 上可通过 `pidfd_getfd` + `SO_COOKIE` 增强成功归因后的 flow identity。
+  observed TGID 不可见时才尝试 `NStgid` alias；若 alias 不足但 eBPF process hint 存在，则只接受扫描完整且唯一的
+  fd/remote/name/uid/gid 候选；仍不满足时不根据 remote endpoint 猜测进程。
+- eBPF provider 会把已解析 connect/accept flow 按 bounded descriptor lease `(tgid, fd, fd_generation)` 跟踪 payload
+  attribution。payload sample 和 close 只命中同 generation 的 tracked flow；close_range 按同 TGID fd range 终止已跟踪
+  flow；process exit/exec 按同 TGID 为 active payload-tracked flow 输出 lifecycle boundary gap。
+- 容量淘汰的 tracked flow 后续 lifecycle 会被忽略，不会伪造 lifecycle。provider 不读取已关闭 fd，也不等同于
+  kernel socket-object lifetime；dup/fork/fd passing、connect exit/error、unshare fd-table 和 lost-event 语义仍需要后续
+  kernel-side socket cookie/refcount 或 FIN/RST 补强。
+- `procfs_socket_attribution` 仍是 degraded capability：hidepid、权限、PID/fd race 和 net namespace 边界会导致 lookup 失败。
+  lookup 错误进入 capture degradation reason；eBPF flow-start observation 重试耗尽仍未匹配时输出 degraded `Gap`，
+  flow attribution confidence 为 `0`，reason 携带 TGID、thread PID 和 fd。
 
 ## 11. TLS 与明文来源
 
@@ -2015,7 +2046,11 @@ process artifact 的 fd/epoch 语义：
 - `close` 输出 active fd generation 后写入 inactive generation marker，并删除 `(tgid, fd)` allow。
 - close_range 会提升 epoch，且只在合法 `flags == 0` range 上输出 typed observation。
 - dup、`fcntl` fd-dup commands、TGID leader process exit 和 process exec 会提升 epoch，让 delayed/stale allow fail closed。
-- connect/accept/close/close_range 使用具体小 record 输出，不再让所有 process event 都占用最大 payload。
+- TGID leader process exit 和 process exec 会输出 typed lifecycle observation。
+- userspace 会取消同 TGID 尚未完成 procfs resolution 的 pending connect/accept flow-start，并输出 unresolved-flow
+  gap。
+- userspace 会为同 TGID 的 active payload-tracked flow 输出 lifecycle boundary gap。
+- process observation records use per-kind record sizes; lifecycle records contain only header and command metadata.
 
 TLS artifact 维护 7 个 BPF maps：
 
@@ -3076,13 +3111,14 @@ flowchart LR
 - eBPF object 路径放在 `[capture.ebpf] object_path` 下。这个字段作为 `aya-obj` object preflight 输入；process observation runtime 使用
   strict process artifact contract，校验 ringbuf、allow map、fd-table epoch map、fd generation map、pending connect、pending accept、
   pending write/read、pending write scratch、process write/read event scratch 和 process output loss counter map shape，校验 connect enter/exit、
-  accept/accept4、close、
-  descriptor lease lifecycle、single-buffer/bounded first-readable-iovec payload tracepoint sections，并拒绝夹带 TLS maps/programs 的混装
+  accept/accept4、close、close_range、process exit/exec、descriptor lease lifecycle、single-buffer/bounded first-readable-iovec
+  payload tracepoint sections，并拒绝夹带 TLS maps/programs 的混装
   object。高层用户态 `aya` process observation loader、connect/accept observation 到单个 `ConnectionOpened` `CaptureEvent` 的纯转换
   bridge、`capture.deep_observe_selector` 按方向授权的 outbound single-buffer/bounded first-readable-iovec syscall argument
   sample 和 inbound single-buffer/bounded first-readable-iovec syscall result sample 到 always-degraded
-  `CapturedBytes`/`Gap` 的 payload bridge、descriptor-generation close/close_range 到 best-effort `ConnectionClosed` lifecycle event、
-  unresolved connect/accept 到 degraded `Gap` 的 provider path，以及 output ringbuf failure counter 到 degraded `capture_loss`
+  `CapturedBytes`/`Gap` 的 payload bridge、descriptor-generation close/close_range 到 best-effort `ConnectionClosed`
+  lifecycle event、TGID-level process exit/exec 到 lifecycle boundary `Gap`、unresolved connect/accept 到 degraded `Gap`
+  的 provider path，以及 output ringbuf failure counter 到 degraded `capture_loss`
   event 的转换和 active tracked payload flow 的 conservative unknown-offset `Gap` fan-out 已存在。超出首个可读 iovec segment、bounded scan window 或 sample buffer
   的 continuation、precise flow-specific lost-event reconstruction 和完整
   kernel-side capture program 完成前，host/object/contract/procfs socket attribution preflight 成功仍然是 degraded capability /
@@ -4194,7 +4230,8 @@ metrics 必须覆盖：
   - 负责基础 provider：capture provider trait、replay provider、external plaintext feed provider、libpcap provider。
   - 负责 eBPF 观测：host preflight、用户态 `aya` process observation loader、degraded process observation provider。
   - 负责事件桥接：connect/accept 到 `ConnectionOpened` 的纯转换，descriptor-generation close/close_range 到
-    best-effort `ConnectionClosed` lifecycle event，unresolved connect/accept 到 degraded `Gap` 的 provider path。
+    best-effort `ConnectionClosed` lifecycle event，TGID-level process exit/exec 到 lifecycle boundary `Gap`，
+    unresolved connect/accept 到 degraded `Gap` 的 provider path。
   - 负责 bounded sample：selector-authorized outbound/inbound single-buffer 或 bounded first-readable-iovec sample 到
     always-degraded `CapturedBytes`/`Gap` 的 payload bridge。
   - 负责 loss bridge：process/TLS output ringbuf failure delta 到 provider-scoped degraded
@@ -4428,7 +4465,8 @@ benchmark 参数：
     ringbuf decoder、procfs socket attribution 依赖检查、result-gated connect/accept observation 到 `ConnectionOpened` 的 bridge、
     selector-authorized outbound single-buffer/bounded first-readable-iovec syscall argument sample 与 inbound
     single-buffer/bounded first-readable-iovec syscall result sample 到 always-degraded `CapturedBytes`/`Gap` 的 payload
-    bridge、descriptor-generation close/close_range 到 best-effort `ConnectionClosed` lifecycle event、unresolved connect/accept 到
+    bridge、descriptor-generation close/close_range 到 best-effort `ConnectionClosed` lifecycle event、TGID-level
+    process exit/exec 到 lifecycle boundary `Gap`、unresolved connect/accept 到
     degraded `Gap` 的 provider path、output ringbuf failure delta 到 degraded `capture_loss` export event 的
     provider/pipeline path，以及 active tracked payload flow 的 conservative unknown-offset `Gap` fan-out。fd resolution
     首轮同步尝试；未解析项进入有界 pending queue，在 ringbuf drain 空闲时轮转 retry，队列满或 retry exhausted

@@ -25,6 +25,6 @@ pub use provider::EbpfProcessObservationProvider;
 pub use types::{
     EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
     EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
-    EbpfProcessObservation, EbpfSocketEndpoint, EbpfSocketReadObservation,
-    EbpfSocketWriteObservation,
+    EbpfProcessLifecycleKind, EbpfProcessLifecycleObservation, EbpfProcessObservation,
+    EbpfSocketEndpoint, EbpfSocketReadObservation, EbpfSocketWriteObservation,
 };

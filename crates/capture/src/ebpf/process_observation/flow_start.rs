@@ -5,10 +5,10 @@ use probe_core::Timestamp;
 use crate::{CaptureError, CaptureEvent};
 
 use super::{
-    EbpfAcceptTracepointObservation, EbpfConnectTracepointObservation, EbpfSocketFlowResolver,
-    accept_opened_event_from_observation, connect_opened_event_from_observation,
-    descriptor_lease::DescriptorLease, unresolved_accept_gap_from_observation,
-    unresolved_connect_gap_from_observation,
+    EbpfAcceptTracepointObservation, EbpfConnectTracepointObservation, EbpfProcessLifecycleKind,
+    EbpfSocketFlowResolver, accept_opened_event_from_observation,
+    connect_opened_event_from_observation, descriptor_lease::DescriptorLease,
+    unresolved_accept_gap_from_observation, unresolved_connect_gap_from_observation,
 };
 
 pub(super) struct PendingEbpfFlowResolution {
@@ -76,6 +76,23 @@ impl PendingEbpfFlowStart {
 
     pub(super) fn invalid_descriptor_lease_gap(&self, timestamp: Timestamp) -> CaptureEvent {
         self.unresolved_gap(timestamp, self.invalid_descriptor_lease_reason())
+    }
+
+    pub(super) fn lifecycle_boundary_gap(
+        &self,
+        timestamp: Timestamp,
+        kind: EbpfProcessLifecycleKind,
+    ) -> CaptureEvent {
+        self.unresolved_gap(
+            timestamp,
+            format!(
+                "eBPF flow-start observation was abandoned because {} invalidated the fd-table epoch before procfs socket resolution completed; tgid={}, thread_pid={}, fd={}",
+                kind.boundary_description(),
+                self.tgid(),
+                self.thread_pid(),
+                self.fd()
+            ),
+        )
     }
 
     pub(super) fn descriptor_lease(&self) -> Option<DescriptorLease> {

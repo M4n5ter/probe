@@ -184,7 +184,8 @@ fn enforcement_evidence_priority(evidence: &EnforcementEvidence) -> u8 {
         EnforcementEvidence::ObservationOnly { reason, .. } => match reason {
             ObservationOnlyReason::EbpfSyscallPayloadSnapshot => 1,
             ObservationOnlyReason::EbpfUnresolvedFlow => 2,
-            ObservationOnlyReason::ProviderCaptureLoss => 3,
+            ObservationOnlyReason::EbpfProcessLifecycleBoundary => 3,
+            ObservationOnlyReason::ProviderCaptureLoss => 4,
         },
     }
 }

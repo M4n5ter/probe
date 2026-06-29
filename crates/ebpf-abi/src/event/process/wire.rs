@@ -10,6 +10,7 @@ pub const EBPF_PROCESS_PROBE_MAX_RECORD_BYTES: usize = max_record_bytes([
     core::mem::size_of::<EbpfAcceptTracepointRecord>(),
     core::mem::size_of::<EbpfCloseTracepointRecord>(),
     core::mem::size_of::<EbpfCloseRangeTracepointRecord>(),
+    core::mem::size_of::<EbpfProcessLifecycleRecord>(),
     core::mem::size_of::<EbpfSocketWriteSampleRecord>(),
     core::mem::size_of::<EbpfSocketReadSampleRecord>(),
 ]);
@@ -21,6 +22,8 @@ pub const EBPF_CLOSE_TRACEPOINT_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfCloseTracepointRecord>();
 pub const EBPF_CLOSE_RANGE_TRACEPOINT_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfCloseRangeTracepointRecord>();
+pub const EBPF_PROCESS_LIFECYCLE_RECORD_BYTES: usize =
+    core::mem::size_of::<EbpfProcessLifecycleRecord>();
 pub const EBPF_SOCKET_WRITE_SAMPLE_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfSocketWriteSampleRecord>();
 pub const EBPF_SOCKET_WRITE_SAMPLE_BYTES: usize = 256;
@@ -49,7 +52,7 @@ pub const EBPF_ADDRESS_FAMILY_UNSPEC: u16 = 0;
 pub const EBPF_ADDRESS_FAMILY_INET: u16 = 2;
 pub const EBPF_ADDRESS_FAMILY_INET6: u16 = 10;
 
-const fn max_record_bytes(record_bytes: [usize; 6]) -> usize {
+const fn max_record_bytes(record_bytes: [usize; 7]) -> usize {
     let mut max = 0;
     let mut index = 0;
     while index < record_bytes.len() {
@@ -264,6 +267,70 @@ impl EbpfSocketWriteSample {
             captured_len,
             reserved: [0; 6],
             buffer,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfProcessLifecycleRecord {
+    header: EbpfEventHeader,
+    command: [u8; 16],
+}
+
+impl EbpfProcessLifecycleRecord {
+    pub fn process_exit_observed(
+        pid: u32,
+        tgid: u32,
+        uid: u32,
+        gid: u32,
+        command: [u8; 16],
+    ) -> Self {
+        Self::observed(
+            EbpfEventKind::ProcessExitObserved,
+            pid,
+            tgid,
+            uid,
+            gid,
+            command,
+        )
+    }
+
+    pub fn process_exec_observed(
+        pid: u32,
+        tgid: u32,
+        uid: u32,
+        gid: u32,
+        command: [u8; 16],
+    ) -> Self {
+        Self::observed(
+            EbpfEventKind::ProcessExecObserved,
+            pid,
+            tgid,
+            uid,
+            gid,
+            command,
+        )
+    }
+
+    fn observed(
+        kind: EbpfEventKind,
+        pid: u32,
+        tgid: u32,
+        uid: u32,
+        gid: u32,
+        command: [u8; 16],
+    ) -> Self {
+        Self {
+            header: EbpfEventHeader::new(
+                kind,
+                EBPF_PROCESS_LIFECYCLE_RECORD_BYTES as u16,
+                pid,
+                tgid,
+                uid,
+                gid,
+            ),
+            command,
         }
     }
 }
@@ -617,6 +684,26 @@ impl EbpfProcessProbeEvent {
         .into()
     }
 
+    pub fn process_exit_observed(
+        pid: u32,
+        tgid: u32,
+        uid: u32,
+        gid: u32,
+        command: [u8; 16],
+    ) -> Self {
+        EbpfProcessLifecycleRecord::process_exit_observed(pid, tgid, uid, gid, command).into()
+    }
+
+    pub fn process_exec_observed(
+        pid: u32,
+        tgid: u32,
+        uid: u32,
+        gid: u32,
+        command: [u8; 16],
+    ) -> Self {
+        EbpfProcessLifecycleRecord::process_exec_observed(pid, tgid, uid, gid, command).into()
+    }
+
     pub fn socket_write_sampled(
         pid: u32,
         tgid: u32,
@@ -724,6 +811,12 @@ impl From<EbpfCloseRangeTracepointRecord> for EbpfProcessProbeEvent {
         let mut event = empty_process_probe_event(record.header, record.command);
         event.close_range = record.close_range;
         event
+    }
+}
+
+impl From<EbpfProcessLifecycleRecord> for EbpfProcessProbeEvent {
+    fn from(record: EbpfProcessLifecycleRecord) -> Self {
+        empty_process_probe_event(record.header, record.command)
     }
 }
 
@@ -843,6 +936,7 @@ pub fn encode_process_probe_event(event: &EbpfProcessProbeEvent) -> EncodedProce
                 event.close_range,
             );
         }
+        Some(EbpfEventKind::ProcessExitObserved | EbpfEventKind::ProcessExecObserved) => {}
         Some(EbpfEventKind::SocketWriteSampled) => {
             encode_socket_write_sample(
                 &mut bytes[EBPF_PROCESS_PROBE_PAYLOAD_OFFSET..],
@@ -891,6 +985,8 @@ fn is_process_probe_kind(kind: EbpfEventKind) -> bool {
             | EbpfEventKind::AcceptTracepointObserved
             | EbpfEventKind::CloseTracepointObserved
             | EbpfEventKind::CloseRangeTracepointObserved
+            | EbpfEventKind::ProcessExitObserved
+            | EbpfEventKind::ProcessExecObserved
             | EbpfEventKind::SocketWriteSampled
             | EbpfEventKind::SocketReadSampled
     )
@@ -902,6 +998,9 @@ fn process_record_len(kind: EbpfEventKind) -> usize {
         EbpfEventKind::AcceptTracepointObserved => EBPF_ACCEPT_TRACEPOINT_RECORD_BYTES,
         EbpfEventKind::CloseTracepointObserved => EBPF_CLOSE_TRACEPOINT_RECORD_BYTES,
         EbpfEventKind::CloseRangeTracepointObserved => EBPF_CLOSE_RANGE_TRACEPOINT_RECORD_BYTES,
+        EbpfEventKind::ProcessExitObserved | EbpfEventKind::ProcessExecObserved => {
+            EBPF_PROCESS_LIFECYCLE_RECORD_BYTES
+        }
         EbpfEventKind::SocketWriteSampled => EBPF_SOCKET_WRITE_SAMPLE_RECORD_BYTES,
         EbpfEventKind::SocketReadSampled => EBPF_SOCKET_READ_SAMPLE_RECORD_BYTES,
         EbpfEventKind::LibsslPlaintextSampled => unreachable!("not a process probe kind"),
@@ -929,6 +1028,7 @@ fn decode_process_probe_payload(
         EbpfEventKind::CloseRangeTracepointObserved => {
             event.close_range = decode_close_range_observation(payload);
         }
+        EbpfEventKind::ProcessExitObserved | EbpfEventKind::ProcessExecObserved => {}
         EbpfEventKind::SocketWriteSampled => {
             event.socket_write = decode_socket_write_sample(payload);
         }
@@ -1165,6 +1265,8 @@ mod tests {
         assert_eq!(align_of::<EbpfCloseObservation>(), 8);
         assert_eq!(size_of::<EbpfCloseRangeObservation>(), 12);
         assert_eq!(align_of::<EbpfCloseRangeObservation>(), 4);
+        assert_eq!(size_of::<EbpfProcessLifecycleRecord>(), 48);
+        assert_eq!(align_of::<EbpfProcessLifecycleRecord>(), 4);
         assert_eq!(size_of::<EbpfSocketWriteSample>(), 280);
         assert_eq!(align_of::<EbpfSocketWriteSample>(), 8);
         assert_eq!(size_of::<EbpfSocketReadSample>(), 280);
@@ -1181,6 +1283,7 @@ mod tests {
         assert_eq!(align_of::<EbpfSocketWriteSampleRecord>(), 8);
         assert_eq!(size_of::<EbpfSocketReadSampleRecord>(), 328);
         assert_eq!(align_of::<EbpfSocketReadSampleRecord>(), 8);
+        assert_eq!(8 % align_of::<EbpfProcessLifecycleRecord>(), 0);
         assert_eq!(8 % align_of::<EbpfSocketWriteSampleRecord>(), 0);
         assert_eq!(8 % align_of::<EbpfSocketReadSampleRecord>(), 0);
     }
@@ -1243,6 +1346,8 @@ mod tests {
         assert_eq!(offset_of!(EbpfCloseRangeTracepointRecord, header), 0);
         assert_eq!(offset_of!(EbpfCloseRangeTracepointRecord, command), 32);
         assert_eq!(offset_of!(EbpfCloseRangeTracepointRecord, close_range), 48);
+        assert_eq!(offset_of!(EbpfProcessLifecycleRecord, header), 0);
+        assert_eq!(offset_of!(EbpfProcessLifecycleRecord, command), 32);
         assert_eq!(offset_of!(EbpfSocketWriteSampleRecord, header), 0);
         assert_eq!(offset_of!(EbpfSocketWriteSampleRecord, command), 32);
         assert_eq!(offset_of!(EbpfSocketWriteSampleRecord, sample), 48);
@@ -1424,6 +1529,60 @@ mod tests {
     }
 
     #[test]
+    fn process_exit_observed_populates_header_fields() {
+        let event =
+            EbpfProcessProbeEvent::process_exit_observed(11, 22, 33, 44, *b"0123456789abcdef");
+
+        assert_eq!(event.header.magic, EBPF_MAGIC);
+        assert_eq!(event.header.abi_revision, EBPF_ABI_REVISION);
+        assert_eq!(
+            event.header.kind(),
+            Some(EbpfEventKind::ProcessExitObserved)
+        );
+        assert_eq!(
+            usize::from(event.header.record_len),
+            EBPF_PROCESS_LIFECYCLE_RECORD_BYTES
+        );
+        assert_eq!(event.header.pid, 11);
+        assert_eq!(event.header.tgid, 22);
+        assert_eq!(event.header.uid, 33);
+        assert_eq!(event.header.gid, 44);
+        assert_eq!(&event.command, b"0123456789abcdef");
+        assert_eq!(event.header.flags, 0);
+        assert!(event.connect_observation().is_none());
+        assert!(event.accept_observation().is_none());
+        assert!(event.close_observation().is_none());
+        assert!(event.close_range_observation().is_none());
+    }
+
+    #[test]
+    fn process_exec_observed_populates_header_fields() {
+        let event =
+            EbpfProcessProbeEvent::process_exec_observed(11, 22, 33, 44, *b"0123456789abcdef");
+
+        assert_eq!(event.header.magic, EBPF_MAGIC);
+        assert_eq!(event.header.abi_revision, EBPF_ABI_REVISION);
+        assert_eq!(
+            event.header.kind(),
+            Some(EbpfEventKind::ProcessExecObserved)
+        );
+        assert_eq!(
+            usize::from(event.header.record_len),
+            EBPF_PROCESS_LIFECYCLE_RECORD_BYTES
+        );
+        assert_eq!(event.header.pid, 11);
+        assert_eq!(event.header.tgid, 22);
+        assert_eq!(event.header.uid, 33);
+        assert_eq!(event.header.gid, 44);
+        assert_eq!(&event.command, b"0123456789abcdef");
+        assert_eq!(event.header.flags, 0);
+        assert!(event.connect_observation().is_none());
+        assert!(event.accept_observation().is_none());
+        assert!(event.close_observation().is_none());
+        assert!(event.close_range_observation().is_none());
+    }
+
+    #[test]
     fn socket_write_sampled_populates_header_fields() {
         let event = sample_write_event(5, 5, 0);
 
@@ -1561,7 +1720,7 @@ mod tests {
         }
     }
 
-    fn sample_process_events() -> [EbpfProcessProbeEvent; 6] {
+    fn sample_process_events() -> [EbpfProcessProbeEvent; 8] {
         [
             EbpfProcessProbeEvent::connect_tracepoint_observed(
                 11,
@@ -1612,6 +1771,8 @@ mod tests {
                 *b"0123456789abcdef",
                 EbpfCloseRangeObservation::observed(7, 11),
             ),
+            EbpfProcessProbeEvent::process_exit_observed(11, 22, 33, 44, *b"0123456789abcdef"),
+            EbpfProcessProbeEvent::process_exec_observed(11, 22, 33, 44, *b"0123456789abcdef"),
             EbpfProcessProbeEvent::socket_write_sampled(
                 11,
                 22,

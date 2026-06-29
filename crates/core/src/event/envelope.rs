@@ -180,6 +180,7 @@ pub enum EnforcementEvidence {
 pub enum ObservationOnlyReason {
     EbpfSyscallPayloadSnapshot,
     EbpfUnresolvedFlow,
+    EbpfProcessLifecycleBoundary,
     ProviderCaptureLoss,
 }
 
@@ -226,6 +227,9 @@ impl ObservationOnlyReason {
             Self::EbpfUnresolvedFlow => {
                 "eBPF observation could not be resolved to a strong flow identity"
             }
+            Self::EbpfProcessLifecycleBoundary => {
+                "eBPF process lifecycle boundary invalidated payload observation continuity"
+            }
             Self::ProviderCaptureLoss => {
                 "capture provider reported lost observations; destructive enforcement cannot rely on this event"
             }
@@ -236,6 +240,7 @@ impl ObservationOnlyReason {
         match self {
             Self::EbpfSyscallPayloadSnapshot => "ebpf_syscall_payload_snapshot",
             Self::EbpfUnresolvedFlow => "ebpf_unresolved_flow",
+            Self::EbpfProcessLifecycleBoundary => "ebpf_process_lifecycle_boundary",
             Self::ProviderCaptureLoss => "provider_capture_loss",
         }
     }

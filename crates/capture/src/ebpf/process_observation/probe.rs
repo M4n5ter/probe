@@ -27,8 +27,9 @@ use thiserror::Error;
 use super::{
     EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
     EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
-    EbpfProcessObservation, EbpfSocketEndpoint, EbpfSocketReadObservation,
-    EbpfSocketWriteObservation, payload_authorization::SocketPayloadSampleAuthorization,
+    EbpfProcessLifecycleKind, EbpfProcessLifecycleObservation, EbpfProcessObservation,
+    EbpfSocketEndpoint, EbpfSocketReadObservation, EbpfSocketWriteObservation,
+    payload_authorization::SocketPayloadSampleAuthorization,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,6 +405,18 @@ fn process_observation_from_event(
                 },
             ))
         }
+        Some(ebpf_abi::EbpfEventKind::ProcessExitObserved) => Ok(
+            EbpfProcessObservation::ProcessLifecycle(EbpfProcessLifecycleObservation {
+                process: observed_process_from_event(&event),
+                kind: EbpfProcessLifecycleKind::Exit,
+            }),
+        ),
+        Some(ebpf_abi::EbpfEventKind::ProcessExecObserved) => Ok(
+            EbpfProcessObservation::ProcessLifecycle(EbpfProcessLifecycleObservation {
+                process: observed_process_from_event(&event),
+                kind: EbpfProcessLifecycleKind::Exec,
+            }),
+        ),
         Some(ebpf_abi::EbpfEventKind::SocketWriteSampled) => {
             let sample = socket_write_sample_from_event(&event);
             Ok(EbpfProcessObservation::Write(EbpfSocketWriteObservation {
@@ -706,6 +719,60 @@ mod tests {
                 assert_eq!(close_range.process.command_lossy(), "curl");
                 assert_eq!(close_range.first_fd, 7);
                 assert_eq!(close_range.last_fd, 11);
+            }
+            observation => panic!("unexpected observation: {observation:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn process_observation_decodes_process_exit_wire_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let event = EbpfProcessProbeEvent::process_exit_observed(
+            11,
+            22,
+            33,
+            44,
+            nul_padded_command("curl"),
+        );
+
+        let observation =
+            decode_process_observation(&ebpf_abi::encode_process_probe_event(&event))?;
+        match observation {
+            EbpfProcessObservation::ProcessLifecycle(lifecycle) => {
+                assert_eq!(lifecycle.process.pid, 11);
+                assert_eq!(lifecycle.process.tgid, 22);
+                assert_eq!(lifecycle.process.uid, 33);
+                assert_eq!(lifecycle.process.gid, 44);
+                assert_eq!(lifecycle.process.command_lossy(), "curl");
+                assert_eq!(lifecycle.kind, EbpfProcessLifecycleKind::Exit);
+            }
+            observation => panic!("unexpected observation: {observation:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn process_observation_decodes_process_exec_wire_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let event = EbpfProcessProbeEvent::process_exec_observed(
+            11,
+            22,
+            33,
+            44,
+            nul_padded_command("curl"),
+        );
+
+        let observation =
+            decode_process_observation(&ebpf_abi::encode_process_probe_event(&event))?;
+        match observation {
+            EbpfProcessObservation::ProcessLifecycle(lifecycle) => {
+                assert_eq!(lifecycle.process.pid, 11);
+                assert_eq!(lifecycle.process.tgid, 22);
+                assert_eq!(lifecycle.process.uid, 33);
+                assert_eq!(lifecycle.process.gid, 44);
+                assert_eq!(lifecycle.process.command_lossy(), "curl");
+                assert_eq!(lifecycle.kind, EbpfProcessLifecycleKind::Exec);
             }
             observation => panic!("unexpected observation: {observation:?}"),
         }

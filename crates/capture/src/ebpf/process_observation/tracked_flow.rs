@@ -59,7 +59,21 @@ impl TrackedEbpfFlows {
             .collect()
     }
 
-    pub(super) fn active_payload_loss_targets(&self) -> impl Iterator<Item = &TrackedEbpfFlow> {
+    pub(super) fn active_payload_gap_targets_for_tgid(&self, tgid: u32) -> Vec<&TrackedEbpfFlow> {
+        let mut keys = self
+            .by_lease
+            .keys()
+            .copied()
+            .filter(|key| key.tgid() == tgid)
+            .collect::<Vec<_>>();
+        keys.sort_by_key(|key| (key.fd(), key.fd_generation()));
+        keys.into_iter()
+            .filter_map(|key| self.by_lease.get(&key))
+            .filter(|tracked| !tracked.payload_directions.is_empty())
+            .collect()
+    }
+
+    pub(super) fn active_payload_gap_targets(&self) -> impl Iterator<Item = &TrackedEbpfFlow> {
         self.by_lease
             .values_by_recency()
             .filter(|tracked| !tracked.payload_directions.is_empty())
@@ -300,6 +314,46 @@ mod tests {
             tracked
                 .remove_close(&close_observation(3))
                 .expect("fd 3 should remain tracked")
+                .flow
+                .id,
+            FlowIdentity("fd-3".to_string())
+        );
+        assert_eq!(
+            tracked
+                .remove_close(&close_observation_for_process(200, 4))
+                .expect("different TGID fd should remain tracked")
+                .flow
+                .id,
+            FlowIdentity("other-tgid-fd-4".to_string())
+        );
+    }
+
+    #[test]
+    fn tracked_flows_find_process_payload_targets_in_fd_order_without_removing_them() {
+        let mut tracked = TrackedEbpfFlows::bounded(4);
+        insert_flow_for_descriptor(&mut tracked, 10, flow("fd-10"));
+        insert_flow_for_descriptor(&mut tracked, 4, flow("fd-4"));
+        insert_flow_for_process_descriptor(&mut tracked, 200, 4, flow("other-tgid-fd-4"));
+        insert_flow_for_descriptor(&mut tracked, 3, flow("fd-3"));
+
+        let targets = tracked.active_payload_gap_targets_for_tgid(100);
+
+        let target_ids = targets
+            .into_iter()
+            .map(|tracked| tracked.flow.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            target_ids,
+            vec![
+                FlowIdentity("fd-3".to_string()),
+                FlowIdentity("fd-4".to_string()),
+                FlowIdentity("fd-10".to_string())
+            ]
+        );
+        assert_eq!(
+            tracked
+                .remove_close(&close_observation(3))
+                .expect("matching TGID fd should remain tracked")
                 .flow
                 .id,
             FlowIdentity("fd-3".to_string())
