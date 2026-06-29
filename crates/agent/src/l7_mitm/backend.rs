@@ -10,6 +10,7 @@ use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
 use runtime::{
     TransparentInterceptionMitmBackendPlan, TransparentInterceptionMitmBackendReadinessProbePlan,
     TransparentInterceptionMitmManagedProcessPlan, TransparentInterceptionMitmPlan,
+    default_l7_mitm_unavailable_reason,
 };
 
 use super::{
@@ -28,7 +29,7 @@ pub(super) fn resolve_with_probe(
     let interception = &config.enforcement.interception;
     if !interception.strategy.is_mitm() {
         return unavailable(
-            "L7 MITM backend is not configured; select a MITM interception strategy to require it",
+            default_l7_mitm_unavailable_reason(),
             L7MitmPlaintextBridgeSnapshot::not_configured(),
         );
     }
@@ -271,6 +272,24 @@ mod tests {
 
     use super::*;
     use crate::l7_mitm::{L7MitmBackendHealthMode, L7MitmPlaintextBridgeMode};
+
+    #[test]
+    fn default_config_reports_unconfigured_control_plane_boundary() {
+        let runtime = resolve(&AgentConfig::default());
+
+        let capability = runtime.capability();
+        assert_eq!(capability.mode, RuntimeMode::Unavailable);
+        let reason = capability
+            .reason
+            .expect("default L7 MITM capability should explain why it is unavailable");
+        assert!(reason.contains("control-plane support exists"));
+        assert!(reason.contains("no MITM backend is configured"));
+        assert!(reason.contains("built-in TLS MITM data-plane"));
+        assert_eq!(
+            runtime.handle().snapshot().plaintext_bridge.mode,
+            L7MitmPlaintextBridgeMode::NotConfigured
+        );
+    }
 
     #[test]
     fn failed_readiness_probe_reports_l7_mitm_unavailable() {

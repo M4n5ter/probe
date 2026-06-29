@@ -177,6 +177,23 @@ mod tests {
     }
 
     #[test]
+    fn default_composition_reports_l7_mitm_control_plane_boundary() {
+        let capabilities = capability_matrix_for_config(&AgentConfig::default());
+        let l7_mitm = capabilities
+            .reported_state(CapabilityKind::L7Mitm)
+            .expect("L7 MITM capability should be reported");
+
+        assert_eq!(l7_mitm.mode, RuntimeMode::Unavailable);
+        let reason = l7_mitm
+            .reason
+            .as_deref()
+            .expect("default L7 MITM capability should explain why it is unavailable");
+        assert!(reason.contains("control-plane support exists"));
+        assert!(reason.contains("no MITM backend is configured"));
+        assert!(reason.contains("built-in TLS MITM data-plane"));
+    }
+
+    #[test]
     fn outbound_transparent_proxy_requires_available_interception_capability() {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;

@@ -4,6 +4,18 @@ use probe_core::{CapabilityKind, CapabilityMatrix, CapabilityState};
 
 use super::capture::{CaptureProviderBuilder, CaptureProviderDescriptor};
 
+const DEFAULT_L7_MITM_UNAVAILABLE_REASON: &str = concat!(
+    "L7 MITM control-plane support exists for selector-scoped external or managed backends, ",
+    "readiness probes, material refs, plaintext bridge provenance, and proxy-side policy hooks, ",
+    "but no MITM backend is configured; default whole-machine transparent MITM is rejected, ",
+    "and built-in TLS MITM data-plane, proxy-internal action execution, ",
+    "and trust/install lifecycle are unavailable"
+);
+
+pub fn default_l7_mitm_unavailable_reason() -> &'static str {
+    DEFAULT_L7_MITM_UNAVAILABLE_REASON
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRegistry {
     capture_providers: Vec<CaptureProviderDescriptor>,
@@ -180,10 +192,7 @@ fn default_libssl_uprobe_capability() -> CapabilityState {
 }
 
 fn default_l7_mitm_capability() -> CapabilityState {
-    CapabilityState::unavailable(
-        CapabilityKind::L7Mitm,
-        "L7 MITM is a target plaintext/enforcement backend, but no executable selector-scoped MITM backend is configured or implemented; default whole-machine transparent MITM is rejected",
-    )
+    CapabilityState::unavailable(CapabilityKind::L7Mitm, default_l7_mitm_unavailable_reason())
 }
 
 #[cfg(test)]
@@ -285,8 +294,10 @@ mod tests {
         let reason = state
             .reason
             .expect("L7 MITM target capability should explain why it is unavailable");
-        assert!(reason.contains("selector-scoped MITM backend"));
+        assert!(reason.contains("control-plane support exists"));
+        assert!(reason.contains("no MITM backend is configured"));
         assert!(reason.contains("default whole-machine transparent MITM is rejected"));
+        assert!(reason.contains("built-in TLS MITM data-plane"));
     }
 
     fn capture_provider(

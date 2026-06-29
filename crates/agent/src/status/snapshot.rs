@@ -702,7 +702,7 @@ mod tests {
             PathBuf::from("/tmp/traffic-probe-spool"),
             vec![CapabilityState::unavailable(
                 CapabilityKind::L7Mitm,
-                "selector-scoped MITM backend is not implemented",
+                "operator-visible L7 MITM unavailable reason",
             )],
         )?;
         let snapshot = build_status_snapshot_at(
@@ -721,7 +721,7 @@ mod tests {
         assert!(
             state["reason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("selector-scoped MITM backend"))
+                .is_some_and(|reason| reason == "operator-visible L7 MITM unavailable reason")
         );
         Ok(())
     }
