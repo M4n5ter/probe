@@ -304,7 +304,11 @@ where
     ) -> Result<PipelineSummary, PipelineError> {
         let mut summary = PipelineSummary::default();
         while options.should_poll_next_event(summary.capture_events_read) {
-            match provider.poll_next()? {
+            let poll = provider.poll_next()?;
+            if let Some(metrics) = &self.runtime_metrics {
+                metrics.record_capture_poll(&poll);
+            }
+            match poll {
                 CapturePoll::Event(capture_event) => {
                     summary.capture_events_read = summary.capture_events_read.saturating_add(1);
                     if let Some(metrics) = &self.runtime_metrics {

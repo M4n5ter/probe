@@ -580,6 +580,37 @@ fn write_pipeline(output: &mut String, snapshot: &AgentStatusSnapshot) {
 
     write_family(
         output,
+        "traffic_probe_pipeline_capture_polls_total",
+        "counter",
+        "Capture provider polls observed by the running pipeline.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_pipeline_capture_polls_total",
+        &[("outcome", "event")],
+        metrics.capture_polls.events,
+    );
+    write_sample(
+        output,
+        "traffic_probe_pipeline_capture_polls_total",
+        &[("outcome", "progress")],
+        metrics.capture_polls.progress,
+    );
+    write_sample(
+        output,
+        "traffic_probe_pipeline_capture_polls_total",
+        &[("outcome", "idle")],
+        metrics.capture_polls.idle,
+    );
+    write_sample(
+        output,
+        "traffic_probe_pipeline_capture_polls_total",
+        &[("outcome", "finished")],
+        metrics.capture_polls.finished,
+    );
+
+    write_family(
+        output,
         "traffic_probe_pipeline_capture_events_read_total",
         "counter",
         "Capture events read by the running pipeline.",
@@ -1116,6 +1147,13 @@ mod tests {
             ),
             RuntimeStatusInput {
                 pipeline: Some(PipelineRuntimeMetricsSnapshot {
+                    capture_polls: pipeline::CapturePollRuntimeMetricsSnapshot {
+                        total: 6,
+                        events: 3,
+                        progress: 1,
+                        idle: 1,
+                        finished: 1,
+                    },
                     capture_events_read: 3,
                     ingress_records_journaled: 3,
                     ingress_records_recovered: 0,
@@ -1139,6 +1177,20 @@ mod tests {
 
         let metrics = render_prometheus_metrics(&snapshot);
 
+        assert!(
+            metrics.contains("traffic_probe_pipeline_capture_polls_total{outcome=\"event\"} 3\n")
+        );
+        assert!(
+            metrics
+                .contains("traffic_probe_pipeline_capture_polls_total{outcome=\"progress\"} 1\n")
+        );
+        assert!(
+            metrics.contains("traffic_probe_pipeline_capture_polls_total{outcome=\"idle\"} 1\n")
+        );
+        assert!(
+            metrics
+                .contains("traffic_probe_pipeline_capture_polls_total{outcome=\"finished\"} 1\n")
+        );
         assert!(metrics.contains("traffic_probe_pipeline_capture_loss_events_total 2\n"));
         assert!(metrics.contains("traffic_probe_pipeline_capture_lost_events_total 17\n"));
         assert!(

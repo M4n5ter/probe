@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use capture::CapturePoll;
 use probe_core::{EnforcementOutcome, EventEnvelope, EventKind};
 use serde::Serialize;
 
@@ -13,6 +14,10 @@ pub struct PipelineRuntimeMetrics {
 
 #[derive(Debug, Default)]
 struct PipelineRuntimeMetricsInner {
+    capture_poll_events: AtomicCounter,
+    capture_poll_progress: AtomicCounter,
+    capture_poll_idle: AtomicCounter,
+    capture_poll_finished: AtomicCounter,
     capture_events_read: AtomicCounter,
     ingress_records_journaled: AtomicCounter,
     ingress_records_recovered: AtomicCounter,
@@ -39,6 +44,7 @@ struct PipelineRuntimeMetricsInner {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct PipelineRuntimeMetricsSnapshot {
+    pub capture_polls: CapturePollRuntimeMetricsSnapshot,
     pub capture_events_read: u64,
     pub ingress_records_journaled: u64,
     pub ingress_records_recovered: u64,
@@ -48,6 +54,15 @@ pub struct PipelineRuntimeMetricsSnapshot {
     pub capture_loss: CaptureLossRuntimeMetricsSnapshot,
     pub policy: PolicyRuntimeMetricsSnapshot,
     pub enforcement: EnforcementRuntimeMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct CapturePollRuntimeMetricsSnapshot {
+    pub total: u64,
+    pub events: u64,
+    pub progress: u64,
+    pub idle: u64,
+    pub finished: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -87,9 +102,11 @@ pub struct EnforcementRuntimeMetricsSnapshot {
 
 impl PipelineRuntimeMetrics {
     pub fn snapshot(&self) -> PipelineRuntimeMetricsSnapshot {
+        let capture_polls = self.capture_poll_snapshot();
         let enforcement = self.enforcement_snapshot();
         let export_events_written = self.inner.export_events_written.load();
         PipelineRuntimeMetricsSnapshot {
+            capture_polls,
             capture_events_read: self.inner.capture_events_read.load(),
             ingress_records_journaled: self.inner.ingress_records_journaled.load(),
             ingress_records_recovered: self.inner.ingress_records_recovered.load(),
@@ -112,6 +129,22 @@ impl PipelineRuntimeMetrics {
                 errors: self.inner.policy_errors.load(),
             },
             enforcement,
+        }
+    }
+
+    fn capture_poll_snapshot(&self) -> CapturePollRuntimeMetricsSnapshot {
+        let events = self.inner.capture_poll_events.load();
+        let progress = self.inner.capture_poll_progress.load();
+        let idle = self.inner.capture_poll_idle.load();
+        let finished = self.inner.capture_poll_finished.load();
+        CapturePollRuntimeMetricsSnapshot {
+            total: [events, progress, idle, finished]
+                .into_iter()
+                .fold(0_u64, u64::saturating_add),
+            events,
+            progress,
+            idle,
+            finished,
         }
     }
 
@@ -145,6 +178,15 @@ impl PipelineRuntimeMetrics {
             failed,
             delegated,
             applied,
+        }
+    }
+
+    pub(crate) fn record_capture_poll(&self, poll: &CapturePoll) {
+        match poll {
+            CapturePoll::Event(_) => self.inner.capture_poll_events.increment(),
+            CapturePoll::Progress => self.inner.capture_poll_progress.increment(),
+            CapturePoll::Idle => self.inner.capture_poll_idle.increment(),
+            CapturePoll::Finished => self.inner.capture_poll_finished.increment(),
         }
     }
 
@@ -239,6 +281,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capture_polls_sum_all_recorded_outcomes() {
+        let metrics = PipelineRuntimeMetrics::default();
+
+        metrics.record_capture_poll(&CapturePoll::event(capture_loss_event()));
+        metrics.record_capture_poll(&CapturePoll::Progress);
+        metrics.record_capture_poll(&CapturePoll::Idle);
+        metrics.record_capture_poll(&CapturePoll::Finished);
+
+        let polls = metrics.snapshot().capture_polls;
+
+        assert_eq!(
+            polls.total,
+            polls.events + polls.progress + polls.idle + polls.finished
+        );
+        assert_eq!(polls.events, 1);
+        assert_eq!(polls.progress, 1);
+        assert_eq!(polls.idle, 1);
+        assert_eq!(polls.finished, 1);
+        assert_eq!(polls.total, 4);
+    }
+
+    #[test]
     fn enforcement_decisions_sum_all_recorded_outcomes() {
         let metrics = PipelineRuntimeMetrics::default();
 
@@ -278,5 +342,20 @@ mod tests {
 
         assert_eq!(capture_loss.events, 2);
         assert_eq!(capture_loss.lost_events, 7);
+    }
+
+    fn capture_loss_event() -> capture::CaptureEvent {
+        capture::CaptureEvent::Loss(capture::CapturedLoss {
+            timestamp: probe_core::Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            origin: probe_core::CaptureOrigin::from_source(probe_core::CaptureSource::Replay),
+            enforcement_evidence: probe_core::EnforcementEvidence::default(),
+            loss: probe_core::CaptureLoss {
+                lost_events: 1,
+                reason: "test loss".to_string(),
+            },
+        })
     }
 }

@@ -45,6 +45,8 @@ libpcap/procfs 等 fallback 路径，并明确标注能力降级。
 - HTTP/1.x、SSE、WebSocket frame metadata 和 16 MiB 有界 message metadata 已可解析。
 - Lua policy 可产生 alert/verdict。
 - Fjall ingress/export lanes、webhook/file exporter、status/admin/metrics 已可持续运行和观测。
+- 在线 pipeline metrics 可观测 provider poll 活性、capture read、ingress/export 进展、policy/enforcement 输出和 provider-level
+  capture loss。
 
 eBPF / procfs 现状：
 
@@ -1209,16 +1211,20 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 #### Pipeline metrics
 
 - `PipelineRuntimeMetrics` 是 pipeline 运行态计数的 owner。
-- 当前覆盖 capture read。
-- 当前覆盖 ingress journal/recovery/processed。
-- 当前覆盖 export event writes。
-- 当前覆盖已持久化 event envelope 的 total、degraded 和 gap 分类计数。
-- 当前覆盖 policy evaluation/selector miss。
-- 当前覆盖 persisted policy alert/verdict/error。
-- 当前覆盖 persisted enforcement decision outcome counters。
+- pipeline metrics 覆盖 provider poll outcome、capture read、ingress journal/recovery/processed、export event writes、已持久化
+  event envelope 分类、policy evaluation/selector miss、persisted policy alert/verdict/error 和 persisted enforcement decision
+  outcome counters。
+- `metrics.pipeline.capture_polls.total` 是 `events + progress + idle + finished` 的饱和求和。
+- `metrics.pipeline.capture_polls.events` 统计 `CapturePoll::Event`。
+- `metrics.pipeline.capture_polls.progress` 统计 provider 主动报告进展但尚未产出 capture event 的 poll。
+- `metrics.pipeline.capture_polls.idle` 统计 provider 仍在线但暂时无可读输出的 poll。
+- `metrics.pipeline.capture_polls.finished` 统计 finite provider/replay source 的 EOF。
+- `metrics.pipeline.capture_events_read` 只统计进入 pipeline 处理的 capture event，不把 progress/idle/finished 算作 payload 输入。
 - `metrics.pipeline.events.total` 与 `export_events_written` 使用同一写入成功事实源。
 - `metrics.pipeline.events.degraded` 只统计已写入 export queue 且 `EventEnvelope::degraded() == true` 的 envelope。
 - `metrics.pipeline.events.gaps` 只统计已写入 export queue 且 `EventKind::Gap` 的 envelope。
+- Prometheus 使用 `traffic_probe_pipeline_capture_polls_total{outcome="event|progress|idle|finished"}` 暴露 provider poll
+  活性。
 - Prometheus 使用 `traffic_probe_pipeline_event_envelopes_total{class="all|degraded|gap"}` 暴露同一事实。
 - policy runtime error 会作为 `policy_runtime_error` audit event 写入 export queue。
 - policy runtime error 带 `policy_version` 和 typed `event_type`。
@@ -5396,6 +5402,7 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 #### Pipeline counters 覆盖
 
 - pipeline 集成测试覆盖 capture read、ingress journal/process、export writes 与 summary 对齐。
+- pipeline 集成测试覆盖 provider poll outcome counters，并区分 event、progress、idle 和 finished。
 - policy selector miss 和 evaluation 表示实际执行。
 - policy alert/verdict/runtime error 表示对应 audit/export event 新写入。
 - enforcement decision outcome 表示对应 audit/export event 新写入。
@@ -5429,6 +5436,7 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 #### Status 与 Prometheus 覆盖
 
 - status 测试覆盖 runtime snapshot 注入到 `metrics.pipeline` JSON。
+- status 测试覆盖 `metrics.pipeline.capture_polls.total/idle` JSON 字段。
 - status 测试覆盖 `metrics.pipeline.events.total/degraded/gaps` JSON 字段。
 - offline/unknown 时 `metrics.pipeline` 保持 `null`。
 - transparent proxy state/registry/relay/health-probe/status/Prometheus/admin 测试覆盖 managed relay mode。
@@ -5440,6 +5448,7 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 - active probe 连续失败达到阈值会把整体 health 降为 degraded。
 - upstream connect failure 只作为 per-flow connect telemetry，不增加 relay failure counter，也不改变整体 health。
 - admin 测试通过真实 pipeline 产生非零计数后，覆盖 metrics envelope 和 Prometheus text exposition 都从共享 runtime state 读取在线 metrics。
+- Prometheus 测试覆盖 `traffic_probe_pipeline_capture_polls_total{outcome="event|progress|idle|finished"}`。
 - Prometheus 测试覆盖 `traffic_probe_pipeline_event_envelopes_total{class="all|degraded|gap"}`。
 
 #### Metrics 边界
@@ -5899,7 +5908,7 @@ product proxy crate-level TLS behavior tests 证明下游 `http/1.1` ALPN negoti
 
 | 优先级 | 状态 | 目标 | 主要交付 | 验收信号 |
 | --- | --- | --- | --- | --- |
-| P0 | Active | 收敛主要缺口，避免 best-effort 被误读成强保证。 | kernel lifetime、loss reconstruction、TLS saturation 和 provider liveness。 | capability、metrics、export 和 E2E 状态一致。 |
+| P0 | Active | 收敛主要缺口，避免 best-effort 被误读成强保证。 | kernel lifetime、loss reconstruction、TLS saturation 和 kernel link liveness。 | capability、metrics、export 和 E2E 状态一致。 |
 | P1 | Active | 完成真实防护路径的能力边界。 | connection eBPF enforcement、transparent lifecycle、destructive recovery semantics。 | 显式 backend、selector gate、capability gate 和审计链可验证。 |
 | P2 | Active | 完成显式 L7 MITM backend 数据面。 | trust store、ALPN multi-protocol routing、wildcard routing、非 HTTP transparent allow path、proxy action 和 data-plane audit。 | 显式 MITM 有独立 health/status/audit/E2E。 |
 | P3 | Next | 扩展协议与外发面。 | HTTP/2 parser、WebSocket extension-aware message handling、gRPC/Kafka/OTLP exporter、远程配置源。 | 新 provider/parser/exporter 通过现有 trait 接入，不破坏四平面边界。 |
@@ -5907,7 +5916,9 @@ product proxy crate-level TLS behavior tests 证明下游 `http/1.1` ALPN negoti
 Roadmap 交付事实：
 
 - P0 聚焦 kernel socket-object lifetime、precise flow-specific lost-event reconstruction、
-  TLS ringbuf saturation E2E 和 per-link kernel liveness beyond provider activity。
+  TLS ringbuf saturation E2E，以及超出 provider poll activity 的 kernel link liveness。
+  `metrics.pipeline.capture_polls` 只能证明 provider poll loop activity，
+  不证明单个 eBPF link、socket-object 或 kernel-side observer 存活。
 - P2 聚焦自动 client trust store 安装、ALPN-based multi-protocol routing、通配或 DNS-discovered upstream route
   selection、非 HTTP transparent allow-path matrix、完整 proxy-side 动作执行和 data-plane audit。
 

@@ -397,6 +397,13 @@ mod tests {
                 )]),
             }),
             pipeline: Some(PipelineRuntimeMetricsSnapshot {
+                capture_polls: pipeline::CapturePollRuntimeMetricsSnapshot {
+                    total: 5,
+                    events: 2,
+                    progress: 1,
+                    idle: 1,
+                    finished: 1,
+                },
                 capture_events_read: 2,
                 ingress_records_journaled: 2,
                 ingress_records_recovered: 1,
@@ -443,6 +450,7 @@ mod tests {
             .as_ref()
             .expect("runtime pipeline metrics should be reported");
         assert_eq!(pipeline_metrics.export_events_written, 7);
+        assert_eq!(pipeline_metrics.capture_polls.progress, 1);
         assert_eq!(pipeline_metrics.policy.selector_misses, 1);
         assert_eq!(pipeline_metrics.enforcement.dry_run, 1);
         assert_eq!(
@@ -460,6 +468,14 @@ mod tests {
         );
         assert_eq!(
             value["metrics"]["pipeline"]["policy"]["selector_misses"],
+            json!(1)
+        );
+        assert_eq!(
+            value["metrics"]["pipeline"]["capture_polls"]["total"],
+            json!(5)
+        );
+        assert_eq!(
+            value["metrics"]["pipeline"]["capture_polls"]["idle"],
             json!(1)
         );
         assert_eq!(
