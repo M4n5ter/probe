@@ -123,7 +123,7 @@ impl HttpJsonL7MitmPolicyHook {
         )?;
         write_hook_request(&mut stream, &self.endpoint, &payload, &deadline)?;
         let response = read_hook_response(stream, self.max_response_bytes, &deadline)?;
-        parse_hook_response(response)
+        parse_hook_response(response, request.verdict.action)
     }
 }
 
@@ -147,12 +147,18 @@ struct HttpJsonHookRequest<'a> {
 #[derive(Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 enum HttpJsonHookResponse {
-    Delegated { reason: Option<String> },
-    Unsupported { reason: Option<String> },
+    Delegated {
+        executed_action: Action,
+        reason: Option<String>,
+    },
+    Unsupported {
+        reason: Option<String>,
+    },
 }
 
 fn parse_hook_response(
     response: HttpJsonHookHttpResponse,
+    requested_action: Action,
 ) -> Result<ProxySideEnforcementHookDecision, L7MitmPolicyHookError> {
     if !(200..300).contains(&response.status) {
         return Err(L7MitmPolicyHookError::Status {
@@ -162,7 +168,15 @@ fn parse_hook_response(
     match serde_json::from_slice::<HttpJsonHookResponse>(&response.body)
         .map_err(L7MitmPolicyHookError::Deserialize)?
     {
-        HttpJsonHookResponse::Delegated { reason } => {
+        HttpJsonHookResponse::Delegated {
+            executed_action,
+            reason,
+        } => {
+            if executed_action != requested_action {
+                return Err(L7MitmPolicyHookError::InvalidResponse(format!(
+                    "delegated response executed_action {executed_action:?} did not match requested_action {requested_action:?}"
+                )));
+            }
             Ok(ProxySideEnforcementHookDecision::delegated(
                 reason.unwrap_or_else(|| "policy hook accepted action".to_string()),
             ))
@@ -205,7 +219,7 @@ mod tests {
             let body = read_request_body(&stream)?;
             write_response(
                 &mut stream,
-                r#"{"outcome":"delegated","reason":"local proxy accepted"}"#,
+                r#"{"outcome":"delegated","executed_action":"deny","reason":"local proxy accepted"}"#,
             )?;
             Ok(body)
         });
@@ -295,7 +309,7 @@ mod tests {
             let (head, _) = read_request(&stream)?;
             write_response(
                 &mut stream,
-                r#"{"outcome":"delegated","reason":"mapped loopback accepted"}"#,
+                r#"{"outcome":"delegated","executed_action":"deny","reason":"mapped loopback accepted"}"#,
             )?;
             Ok(head)
         });
@@ -360,7 +374,7 @@ mod tests {
             write_response_with_connection(
                 &mut stream,
                 "keep-alive",
-                r#"{"outcome":"delegated","reason":"keep alive accepted"}"#,
+                r#"{"outcome":"delegated","executed_action":"deny","reason":"keep alive accepted"}"#,
             )?;
             Ok(stream)
         });
@@ -398,7 +412,7 @@ mod tests {
         let server = thread::spawn(move || -> Result<(), String> {
             let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
             let _ = read_request_body(&stream)?;
-            let first = "{\"outcome\":\"delegated\",\"reason\":\"";
+            let first = "{\"outcome\":\"delegated\",\"executed_action\":\"deny\",\"reason\":\"";
             let second = r#"chunked accepted"}"#;
             write!(
                 stream,
@@ -451,7 +465,8 @@ mod tests {
             body: Vec::new(),
         };
 
-        let error = parse_hook_response(response).expect_err("non-2xx status must fail");
+        let error =
+            parse_hook_response(response, Action::Deny).expect_err("non-2xx status must fail");
 
         assert!(matches!(
             error,
@@ -467,9 +482,37 @@ mod tests {
             body: b"bad".to_vec(),
         };
 
-        let error = parse_hook_response(response).expect_err("invalid JSON must fail");
+        let error =
+            parse_hook_response(response, Action::Deny).expect_err("invalid JSON must fail");
 
         assert!(matches!(error, L7MitmPolicyHookError::Deserialize(_)));
+    }
+
+    #[test]
+    fn http_json_hook_fails_decision_when_executed_action_does_not_match()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let decision = evaluate_hook_response(
+            r#"{"outcome":"delegated","executed_action":"reset","reason":"wrong action"}"#,
+        )?;
+
+        assert_eq!(decision.outcome, EnforcementOutcome::Failed);
+        assert_eq!(decision.effective_action, Action::Observe);
+        assert!(decision.reason.contains("executed_action Reset"));
+        assert!(decision.reason.contains("requested_action Deny"));
+        Ok(())
+    }
+
+    #[test]
+    fn http_json_hook_fails_decision_when_executed_action_is_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let decision =
+            evaluate_hook_response(r#"{"outcome":"delegated","reason":"missing action"}"#)?;
+
+        assert_eq!(decision.outcome, EnforcementOutcome::Failed);
+        assert_eq!(decision.effective_action, Action::Observe);
+        assert!(decision.reason.contains("response JSON failed"));
+        assert!(decision.reason.contains("executed_action"));
+        Ok(())
     }
 
     fn planner_with_hook(
@@ -483,6 +526,43 @@ mod tests {
             ProxySideEnforcementSurface::L7Mitm,
             hook,
         )
+    }
+
+    fn evaluate_hook_response(
+        response_body: &'static str,
+    ) -> Result<probe_core::EnforcementDecision, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let endpoint = endpoint_plan(listener.local_addr()?);
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let _ = read_request_body(&stream)?;
+            write_response(&mut stream, response_body)
+        });
+        let hook = HttpJsonL7MitmPolicyHook::new(
+            &endpoint,
+            1_000,
+            4_096,
+            L7MitmPolicyHookConnectionOptions::default(),
+        )?;
+        let verdict = Verdict {
+            action: Action::Deny,
+            scope: VerdictScope::Flow,
+            reason: "blocked".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+        let trigger = outbound_event();
+        let decision = planner_with_hook(hook)?
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &trigger,
+            })
+            .expect("deny verdict should be evaluated");
+        server
+            .join()
+            .expect("server thread should not panic")
+            .map_err(std::io::Error::other)?;
+        Ok(decision)
     }
 
     fn endpoint_plan(address: SocketAddr) -> TransparentInterceptionMitmPolicyHookEndpointPlan {

@@ -399,7 +399,7 @@ TLS 明文与协议能力：
     配置 policy hook 的 MITM strategy 在 RuntimePlan 中使用 `l7_mitm_proxy_hook` planner surface；
     透明接管 lifecycle 仍由 transparent interception plan 管理。
     root/net-admin E2E 会验证 Lua protective verdict 经 HTTP JSON hook 到达本机 proxy endpoint，
-    proxy 返回 `delegated` 后写入 durable `EnforcementDecision`。
+    proxy 返回带 `executed_action` 的 `delegated` 后写入 durable `EnforcementDecision`。
   - 可选 `plaintext_bridge.mode = "capture_event_feed"` 使用 JSON-lines `CaptureEvent` feed 作为 MITM plaintext bridge；
     bridge 作为 live capture sidecar 进入同一 parser/policy/spool/export pipeline，不替代主 live capture provider。
     bridge 写入的 flow 事件使用 `source = l7_mitm_plaintext` 与 `provider = interception`，
@@ -434,7 +434,7 @@ TLS 明文与协议能力：
     全族 transparent listener 都可用，不证明 TPROXY original-destination recovery，也不证明 downstream/upstream TLS
     handshake、SNI/ALPN routing 或 plaintext extraction 成功。
   - 边界：capture-event plaintext bridge 只接收 MITM backend/feed 提供的统一 capture events；policy hook transport 只证明 agent 能把
-    enforcement decision 委托给本机 MITM proxy，并记录 proxy 接受委托后的 durable decision。
+    protective verdict 委托给本机 MITM proxy，并记录 proxy 声明执行同一动作后的 durable decision。
     仍需独立实现内置 TLS MITM 数据面、proxy 内部动作执行和自动 client trust store 安装。
   - 验收：fresh network namespace E2E 覆盖入站/出站 MITM strategy 的 external backend：
     `xtask e2e-mitm-plaintext-bridge-live-sidecar` 和
@@ -444,7 +444,7 @@ TLS 明文与协议能力：
     经 OUTPUT redirect 到 MITM backend。
   - 验收：`xtask e2e-mitm-policy-hook-plaintext-bridge-live-sidecar` 使用同一 fresh network namespace
     入站 MITM bridge harness，验证 external enforcement manifest 的 protective action profile、Lua `deny`
-    verdict、本机 HTTP JSON policy hook request、proxy `delegated` response、agent enforcement metrics 以及
+    verdict、本机 HTTP JSON policy hook request、proxy `delegated`/`executed_action` response、agent enforcement metrics 以及
     durable `PolicyVerdict` / `EnforcementDecision` readback。
   - 验收：fresh network namespace E2E 覆盖入站/出站 MITM strategy 的 agent-managed backend：
     `xtask e2e-managed-mitm-plaintext-bridge-live-sidecar` 和
@@ -2473,13 +2473,16 @@ flowchart LR
 当前已实现 dry-run/audit enforcement、backend delegation boundary 和第一版显式 Linux socket destroy backend：`deny`、`reset`、
 `quarantine` 会生成 `EnforcementDecision` audit event；在 `audit_only`/`dry_run` 下 effective action 仍为 `observe`。`observe`、
 `alert` 不进入 enforcement planner，继续作为普通策略事件处理。`enforcement.selector` 复用 core typed selector，支持只对某些进程、服务、端口或方向启用防护范围。
-proxy-side enforcement 使用同一 `PlannerPolicy` 和 `EnforcementDecision` 契约。enforcement crate 中的 hook contract 只有在
-proxy-side hook 明确接受执行责任后才返回 `delegated` outcome；`effective_action` 保留策略请求的保护动作。
+proxy-side enforcement 使用同一 `PlannerPolicy` 和 `EnforcementDecision` 契约。enforcement crate 的通用 hook contract
+表达 proxy-side surface 返回 `delegated` 或 `unsupported`：
+`delegated` 的 `effective_action` 是策略请求的保护动作，`unsupported` 的 `effective_action` 是 `observe`。
 observation-only evidence 仍会在 hook 调用前被拒绝，避免不完整观测驱动破坏性动作。
 MITM proxy-side hook 通过本机 HTTP JSON control endpoint 把 planner decision 委托给 L7 MITM proxy。
-该入口消费 `EnforcementDecision.effective_action`：MITM/proxy 边界把 `observe`/`allow`/`alert` 解释为继续处理，
-把 `deny`、`reset`、`quarantine` 解释为代理可执行的保护动作。没有 decision 或 control transport 失败必须显式建模，
-不能被静默等同为允许转发。该入口不引入新的策略语言。
+hook request 携带 `requested_action`、完整 verdict 和触发 verdict 的 `EventEnvelope`。
+MITM/proxy 边界只接收保护动作；`observe`/`allow`/`alert` 不进入 enforcement planner。
+L7 MITM HTTP JSON adapter 要求代理返回 `delegated` 时携带与 `requested_action` 相同的 `executed_action`；
+不匹配、缺失字段或 control transport 失败都会生成 failed enforcement decision，不能被静默等同为允许转发。
+该入口不引入新的策略语言。
 
 无 backend 的 planner 构造器不会接受 `enforce`，只有显式注入 `EnforcementBackend` 的构造路径才能进入真实 enforce planner；`enforcement.mode =
 "enforce"` 会要求至少配置一个执行面，可选执行面是显式 connection backend、transparent interception setup-time surface 或
@@ -3202,12 +3205,14 @@ MITM backend contract：
   enforcement decision，不会被静默降级为允许转发。
   Hook response 支持 `Content-Length` 和未压缩 `Transfer-Encoding: chunked`，便于对接常见本机 HTTP control endpoint。
 - hook request JSON 包含 `requested_action`、完整 `verdict` 和触发该 verdict 的 `EventEnvelope`。
-  hook response JSON 使用 `outcome` 标签，支持 `delegated` 与 `unsupported`：
+  hook response JSON 使用 `outcome` 标签，支持 `delegated` 与 `unsupported`。
+  `delegated` 必须包含 `executed_action`，且该值必须等于 request 的 `requested_action`；
+  否则 agent 会把 response 视为无效，记录 failed enforcement decision：
 
-  | outcome | planner outcome | effective action | 语义 |
-  | --- | --- | --- | --- |
-  | `delegated` | `delegated` | policy requested action | MITM proxy 接受执行责任 |
-  | `unsupported` | `unsupported` | `observe` | MITM proxy 明确拒绝或无法执行该保护动作 |
+  | outcome | required fields | planner outcome | effective action | 语义 |
+  | --- | --- | --- | --- | --- |
+  | `delegated` | `executed_action` | `delegated` | policy requested action | MITM proxy 声明已执行请求的保护动作 |
+  | `unsupported` | none | `unsupported` | `observe` | MITM proxy 明确拒绝或无法执行该保护动作 |
 
 - 配置 policy hook 的 MITM strategy 在 RuntimePlan 中使用 `l7_mitm_proxy_hook` 作为 planner enforcement surface。
   透明接管仍由 `interception.execution` 和 `transparent-linux` artifact 负责；hook 只表达 proxy-side enforcement delegation。

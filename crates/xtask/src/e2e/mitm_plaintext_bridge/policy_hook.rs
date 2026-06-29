@@ -10,6 +10,7 @@ use std::{
 };
 
 use e2e_support::mitm_bridge;
+use probe_core::Action;
 use serde_json::{Value, json};
 
 use super::{
@@ -138,6 +139,21 @@ fn handle_policy_hook_request(
             return Ok(());
         }
     };
+    let Some(executed_action) = request
+        .body
+        .get("requested_action")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Action>(value).ok())
+    else {
+        return write_json_response(
+            &mut stream,
+            400,
+            json!({
+                "outcome": "unsupported",
+                "reason": "MITM policy hook request omitted requested_action"
+            }),
+        );
+    };
     requests
         .lock()
         .map_err(|_| io::Error::other("MITM policy hook request recorder was poisoned"))?
@@ -145,7 +161,11 @@ fn handle_policy_hook_request(
     write_json_response(
         &mut stream,
         200,
-        json!({"outcome": "delegated", "reason": POLICY_HOOK_RESPONSE_REASON}),
+        json!({
+            "outcome": "delegated",
+            "executed_action": executed_action,
+            "reason": POLICY_HOOK_RESPONSE_REASON
+        }),
     )
 }
 

@@ -461,8 +461,9 @@ mod tests {
     #[tokio::test]
     async fn l7_mitm_proxy_hook_execution_surface_delegates_to_configured_hook()
     -> Result<(), Box<dyn std::error::Error>> {
-        let hook_server =
-            spawn_policy_hook(r#"{"outcome":"delegated","reason":"proxy hook accepted"}"#)?;
+        let hook_server = spawn_policy_hook(
+            r#"{"outcome":"delegated","executed_action":"deny","reason":"proxy hook accepted"}"#,
+        )?;
         let mitm_policy_hook = TransparentInterceptionMitmPolicyHookPlan::HttpJson {
             endpoint: policy_hook_endpoint_plan(&hook_server.endpoint, hook_server.address),
             timeout_ms: 1_000,
@@ -513,8 +514,9 @@ mod tests {
     #[tokio::test]
     async fn l7_mitm_proxy_hook_composition_preserves_transparent_setup_scope()
     -> Result<(), Box<dyn std::error::Error>> {
-        let hook_server =
-            spawn_policy_hook(r#"{"outcome":"delegated","reason":"proxy hook accepted"}"#)?;
+        let hook_server = spawn_policy_hook(
+            r#"{"outcome":"delegated","executed_action":"deny","reason":"proxy hook accepted"}"#,
+        )?;
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
