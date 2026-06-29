@@ -501,7 +501,50 @@ fn assert_expected_bridge_export(
     if !alert_found {
         return Err(e2e_error("missing MITM bridge policy alert").into());
     }
-    Ok(())
+    assert_product_outbound_bridge_attribution(case, envelopes)
+}
+
+fn assert_product_outbound_bridge_attribution(
+    case: MitmBridgeCase,
+    envelopes: &[EventEnvelope],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if case != MitmBridgeCase::ProductProxyOutboundTransparentHttpsPolicyHook {
+        return Ok(());
+    }
+    if envelopes.iter().any(|envelope| {
+        is_bridge_flow(case, envelope)
+            && matches!(
+                envelope.kind(),
+                EventKind::HttpRequestHeaders(headers)
+                    if headers.target.as_deref() == Some(mitm_bridge::REQUEST_TARGET)
+            )
+            && envelope.flow().is_some_and(|flow| {
+                flow.attribution_confidence > 0
+                    && flow.process.name == "openssl"
+                    && flow.process.cmdline.iter().any(|arg| arg == "s_client")
+            })
+    }) {
+        return Ok(());
+    }
+
+    let observed = envelopes
+        .iter()
+        .filter(|envelope| is_bridge_flow(case, envelope))
+        .filter_map(EventEnvelope::flow)
+        .map(|flow| {
+            format!(
+                "{}:{} confidence={} hint={:?}",
+                flow.process.identity.pid,
+                flow.process.name,
+                flow.attribution_confidence,
+                flow.process.identity.runtime_hint
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    Err(e2e_error(format!(
+        "missing product outbound MITM original process attribution; observed bridge flows: {observed:?}"
+    ))
+    .into())
 }
 
 fn assert_expected_libpcap_export(

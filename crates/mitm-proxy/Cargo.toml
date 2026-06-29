@@ -10,6 +10,7 @@ name = "traffic-probe-mitm-proxy"
 path = "src/main.rs"
 
 [dependencies]
+attribution = { path = "../attribution" }
 capture = { path = "../capture" }
 clap = { version = "4.6", features = ["derive"] }
 probe-core = { path = "../core" }

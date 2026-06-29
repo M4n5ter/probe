@@ -1531,6 +1531,7 @@ dependencies = [
 name = "mitm-proxy"
 version = "0.1.0"
 dependencies = [
+ "attribution",
  "capture",
  "clap",
  "probe-core",

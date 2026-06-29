@@ -12,9 +12,10 @@ use std::{
     time::Instant,
 };
 
+use attribution::{AttributionError, ProcfsSocketResolver, SocketProcessContext};
 use probe_core::{
     AddressPort, Direction, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity,
-    TransportProtocol,
+    TcpConnection, TcpEndpoint, TransportProtocol,
 };
 
 #[derive(Debug)]
@@ -85,41 +86,148 @@ impl Drop for FlowRegistration {
 }
 
 pub(crate) struct FlowFactory {
-    process: ProcessContext,
+    fallback_process: ProcessContext,
+    attribution: FlowAttribution,
+    request_direction: Direction,
     started: Instant,
     next_flow: AtomicU64,
 }
 
 impl FlowFactory {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(request_direction: Direction) -> Self {
         Self {
-            process: current_process_context(),
+            fallback_process: current_process_context(),
+            attribution: FlowAttribution::for_direction(request_direction),
+            request_direction,
             started: Instant::now(),
             next_flow: AtomicU64::new(1),
         }
     }
 
-    pub(crate) fn flow(
-        &self,
-        peer: SocketAddr,
-        target: SocketAddr,
+    #[cfg(test)]
+    fn with_attributor(
         request_direction: Direction,
-    ) -> FlowContext {
+        attributor: impl FlowProcessAttributor + 'static,
+    ) -> Self {
+        Self {
+            fallback_process: current_process_context(),
+            attribution: FlowAttribution::OutboundProcfs(Mutex::new(Box::new(attributor))),
+            request_direction,
+            started: Instant::now(),
+            next_flow: AtomicU64::new(1),
+        }
+    }
+
+    pub(crate) fn flow(&self, peer: SocketAddr, target: SocketAddr) -> FlowContext {
         let sequence = self.next_flow.fetch_add(1, Ordering::Relaxed);
-        let (local, remote) = match request_direction {
+        let endpoints = FlowEndpoints::from_direction(self.request_direction, peer, target);
+        let local = address_port(endpoints.local);
+        let remote = address_port(endpoints.remote);
+        let started = monotonic_ns(self.started);
+        let resolved = self.attribution.resolve(endpoints);
+        let (process, attribution_confidence) = resolved
+            .map(|resolved| (resolved.process, resolved.confidence))
+            .unwrap_or_else(|| (self.fallback_process.clone(), 0));
+        let socket_cookie = None;
+        let id = if attribution_confidence > 0 {
+            FlowIdentity::stable(
+                &process.identity,
+                &local,
+                &remote,
+                TransportProtocol::Tcp,
+                started,
+                socket_cookie,
+            )
+        } else {
+            FlowIdentity(format!("l7_mitm:{sequence}"))
+        };
+        FlowContext {
+            id,
+            process,
+            local,
+            remote,
+            protocol: TransportProtocol::Tcp,
+            start_monotonic_ns: started,
+            socket_cookie,
+            attribution_confidence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FlowEndpoints {
+    local: SocketAddr,
+    remote: SocketAddr,
+}
+
+impl FlowEndpoints {
+    fn from_direction(direction: Direction, peer: SocketAddr, target: SocketAddr) -> Self {
+        let (local, remote) = match direction {
             Direction::Inbound => (target, peer),
             Direction::Outbound => (peer, target),
         };
-        FlowContext {
-            id: FlowIdentity(format!("l7_mitm:{sequence}")),
-            process: self.process.clone(),
-            local: address_port(local),
-            remote: address_port(remote),
-            protocol: TransportProtocol::Tcp,
-            start_monotonic_ns: monotonic_ns(self.started),
-            socket_cookie: None,
-            attribution_confidence: 0,
+        Self { local, remote }
+    }
+
+    fn connection(self) -> TcpConnection {
+        tcp_connection(self.local, self.remote)
+    }
+}
+
+enum FlowAttribution {
+    ProxyOnly,
+    OutboundProcfs(Mutex<Box<dyn FlowProcessAttributor>>),
+}
+
+impl FlowAttribution {
+    fn for_direction(direction: Direction) -> Self {
+        match direction {
+            Direction::Inbound => Self::ProxyOnly,
+            Direction::Outbound => {
+                Self::OutboundProcfs(Mutex::new(Box::new(ProcfsFlowProcessAttributor::new())))
+            }
         }
+    }
+
+    fn resolve(&self, endpoints: FlowEndpoints) -> Option<SocketProcessContext> {
+        match self {
+            Self::ProxyOnly => None,
+            Self::OutboundProcfs(attributor) => attributor
+                .lock()
+                .expect("flow process attributor mutex should not be poisoned")
+                .resolve(endpoints.connection())
+                .ok()
+                .flatten(),
+        }
+    }
+}
+
+trait FlowProcessAttributor: Send {
+    fn resolve(
+        &mut self,
+        connection: TcpConnection,
+    ) -> Result<Option<SocketProcessContext>, AttributionError>;
+}
+
+struct ProcfsFlowProcessAttributor {
+    resolver: ProcfsSocketResolver,
+}
+
+impl ProcfsFlowProcessAttributor {
+    fn new() -> Self {
+        Self {
+            resolver: ProcfsSocketResolver::new(),
+        }
+    }
+}
+
+impl FlowProcessAttributor for ProcfsFlowProcessAttributor {
+    fn resolve(
+        &mut self,
+        connection: TcpConnection,
+    ) -> Result<Option<SocketProcessContext>, AttributionError> {
+        self.resolver.invalidate_snapshot();
+        self.resolver.resolve_tcp_connection(connection)
     }
 }
 
@@ -159,6 +267,14 @@ fn address_port(address: SocketAddr) -> AddressPort {
     }
 }
 
+fn tcp_connection(local: SocketAddr, remote: SocketAddr) -> TcpConnection {
+    TcpConnection::new(tcp_endpoint(local), tcp_endpoint(remote))
+}
+
+fn tcp_endpoint(address: SocketAddr) -> TcpEndpoint {
+    TcpEndpoint::new(address.ip(), address.port())
+}
+
 fn monotonic_ns(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
@@ -177,7 +293,11 @@ fn cmdline_hash(cmdline: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        net::{TcpListener, TcpStream},
+        sync::Arc,
+        time::Duration,
+    };
 
     use super::*;
 
@@ -200,5 +320,125 @@ mod tests {
             registration.recv_timeout(Duration::from_secs(1)),
             Some(ProxyAction::Deny { reason }) if reason.as_deref() == Some("blocked")
         ));
+    }
+
+    #[test]
+    fn outbound_flow_prefers_procfs_socket_process_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let target = listener.local_addr()?;
+        let client = TcpStream::connect(target)?;
+        let peer = client.local_addr()?;
+        let (_accepted, _) = listener.accept()?;
+
+        let flow = FlowFactory::new(Direction::Outbound).flow(peer, target);
+
+        assert_eq!(flow.process.identity.pid, std::process::id());
+        assert!(
+            flow.attribution_confidence > 0,
+            "outbound flow should use procfs socket attribution, got {flow:?}"
+        );
+        assert_eq!(flow.local, address_port(peer));
+        assert_eq!(flow.remote, address_port(target));
+        Ok(())
+    }
+
+    #[test]
+    fn inbound_flow_keeps_proxy_process_fallback() {
+        let peer = "127.0.0.1:40000".parse().expect("peer");
+        let target = "127.0.0.1:50000".parse().expect("target");
+
+        let flow = FlowFactory::new(Direction::Inbound).flow(peer, target);
+
+        assert_eq!(flow.attribution_confidence, 0);
+        assert_eq!(
+            flow.process.identity.runtime_hint.as_deref(),
+            Some("l7_mitm_proxy")
+        );
+    }
+
+    #[test]
+    fn outbound_flow_uses_configured_attributor_context() {
+        let peer = "127.0.0.1:40000".parse().expect("peer");
+        let target = "127.0.0.1:50000".parse().expect("target");
+        let process = current_process_context();
+        let factory = FlowFactory::with_attributor(
+            Direction::Outbound,
+            FixedAttributor::hit(SocketProcessContext {
+                process: process.clone(),
+                confidence: 77,
+                socket_inode: 42,
+            }),
+        );
+
+        let flow = factory.flow(peer, target);
+
+        assert_eq!(flow.process, process);
+        assert_eq!(flow.attribution_confidence, 77);
+        assert_eq!(flow.local, address_port(peer));
+        assert_eq!(flow.remote, address_port(target));
+    }
+
+    #[test]
+    fn outbound_flow_falls_back_when_attributor_misses() {
+        let peer = "127.0.0.1:40000".parse().expect("peer");
+        let target = "127.0.0.1:50000".parse().expect("target");
+        let factory = FlowFactory::with_attributor(Direction::Outbound, FixedAttributor::miss());
+
+        let flow = factory.flow(peer, target);
+
+        assert_eq!(flow.attribution_confidence, 0);
+        assert_eq!(
+            flow.process.identity.runtime_hint.as_deref(),
+            Some("l7_mitm_proxy")
+        );
+    }
+
+    #[test]
+    fn outbound_flow_falls_back_when_attributor_errors() {
+        let peer = "127.0.0.1:40000".parse().expect("peer");
+        let target = "127.0.0.1:50000".parse().expect("target");
+        let factory = FlowFactory::with_attributor(Direction::Outbound, FixedAttributor::error());
+
+        let flow = factory.flow(peer, target);
+
+        assert_eq!(flow.attribution_confidence, 0);
+        assert_eq!(
+            flow.process.identity.runtime_hint.as_deref(),
+            Some("l7_mitm_proxy")
+        );
+    }
+
+    struct FixedAttributor {
+        result: Result<Option<SocketProcessContext>, AttributionError>,
+    }
+
+    impl FixedAttributor {
+        fn hit(context: SocketProcessContext) -> Self {
+            Self {
+                result: Ok(Some(context)),
+            }
+        }
+
+        fn miss() -> Self {
+            Self { result: Ok(None) }
+        }
+
+        fn error() -> Self {
+            Self {
+                result: Err(AttributionError::IncompleteSocketOwnerScan {
+                    reason: "fixed attribution error".to_string(),
+                }),
+            }
+        }
+    }
+
+    impl FlowProcessAttributor for FixedAttributor {
+        fn resolve(
+            &mut self,
+            _connection: TcpConnection,
+        ) -> Result<Option<SocketProcessContext>, AttributionError> {
+            self.result.clone()
+        }
     }
 }

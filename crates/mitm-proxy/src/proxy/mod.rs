@@ -102,13 +102,14 @@ impl MitmProxyGuard {
         )?;
         write_pid_file(config.pid_file.as_ref())?;
         let feed = Arc::new(CaptureEventFeedWriter::create(&config.feed_path)?);
+        let request_direction = config.request_direction;
         let state = Arc::new(ProxyState {
             config: Arc::new(config),
             downstream,
             upstream,
             feed,
             registry: Arc::new(FlowRegistry::default()),
-            flow_factory: Arc::new(FlowFactory::new()),
+            flow_factory: Arc::new(FlowFactory::new(request_direction)),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut threads = vec![spawn_data_listener(
@@ -267,9 +268,7 @@ fn handle_http_connection(
     let Some(request) = read_http_message(downstream, state.config.max_request_bytes)? else {
         return Ok(());
     };
-    let flow = state
-        .flow_factory
-        .flow(peer, target, state.config.request_direction);
+    let flow = state.flow_factory.flow(peer, target);
     let registration = state
         .config
         .policy_hook_listen
