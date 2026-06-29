@@ -30,6 +30,8 @@ Options:
   --start-file PATH
   --pid-file PATH
   --bridge-feed-file PATH
+  --policy-hook-listen-addr ADDR
+  --action-report-file PATH
   --requests N                 (http1-loopback, tls-http1-loopback, and product-loopback)
   --request-body-bytes N       (http1-loopback, tls-http1-loopback, and product-loopback)
   --response-body-bytes N      (http1-loopback, tls-http1-loopback, and product-loopback)
@@ -342,6 +344,8 @@ fn parse_managed_mitm_backend(
     let mut listen_addr = None;
     let mut pid_file = None;
     let mut bridge_feed_file = None;
+    let mut policy_hook_listen_addr = None;
+    let mut action_report_file = None;
     let mut args = args.into_iter();
     while let Some(option) = args.next() {
         if option == "--help" || option == "-h" {
@@ -356,6 +360,10 @@ fn parse_managed_mitm_backend(
             "--listen-addr" => listen_addr = Some(parse_socket_addr(&option, &value)?),
             "--pid-file" => pid_file = Some(PathBuf::from(value)),
             "--bridge-feed-file" => bridge_feed_file = Some(PathBuf::from(value)),
+            "--policy-hook-listen-addr" => {
+                policy_hook_listen_addr = Some(parse_socket_addr(&option, &value)?);
+            }
+            "--action-report-file" => action_report_file = Some(PathBuf::from(value)),
             _ => {
                 return Err(FixtureError::usage(format!(
                     "unknown option {option}\n\n{USAGE}"
@@ -383,10 +391,35 @@ fn parse_managed_mitm_backend(
             "--pid-file and --bridge-feed-file must be different paths\n\n{USAGE}"
         )));
     }
+    let policy_hook = match (policy_hook_listen_addr, action_report_file) {
+        (Some(listen_addr), Some(action_report_file)) => {
+            if action_report_file == pid_file || action_report_file == bridge_feed_file {
+                return Err(FixtureError::usage(format!(
+                    "--action-report-file must be distinct from --pid-file and --bridge-feed-file\n\n{USAGE}"
+                )));
+            }
+            Some(super::managed_mitm::ManagedMitmPolicyHookConfig {
+                listen_addr,
+                action_report_file,
+            })
+        }
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(FixtureError::usage(format!(
+                "--policy-hook-listen-addr requires --action-report-file\n\n{USAGE}"
+            )));
+        }
+        (None, Some(_)) => {
+            return Err(FixtureError::usage(format!(
+                "--action-report-file requires --policy-hook-listen-addr\n\n{USAGE}"
+            )));
+        }
+    };
     Ok(ManagedMitmBackendConfig {
         listen_addr,
         pid_file,
         bridge_feed_file,
+        policy_hook,
     })
 }
 
@@ -773,6 +806,36 @@ mod tests {
         assert_eq!(config.listen_addr, "127.0.0.1:65521".parse::<SocketAddr>()?);
         assert_eq!(config.pid_file, PathBuf::from("/tmp/backend.pid"));
         assert_eq!(config.bridge_feed_file, PathBuf::from("/tmp/bridge.jsonl"));
+        assert_eq!(config.policy_hook, None);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_parses_managed_mitm_backend_owned_policy_hook() -> Result<(), Box<dyn Error>> {
+        let config = parse_managed_mitm_backend([
+            "--listen-addr".to_string(),
+            "127.0.0.1:65521".to_string(),
+            "--pid-file".to_string(),
+            "/tmp/backend.pid".to_string(),
+            "--bridge-feed-file".to_string(),
+            "/tmp/bridge.jsonl".to_string(),
+            "--policy-hook-listen-addr".to_string(),
+            "127.0.0.1:65522".to_string(),
+            "--action-report-file".to_string(),
+            "/tmp/actions.json".to_string(),
+        ])?;
+
+        let policy_hook = config
+            .policy_hook
+            .expect("managed backend policy hook should be parsed");
+        assert_eq!(
+            policy_hook.listen_addr,
+            "127.0.0.1:65522".parse::<SocketAddr>()?
+        );
+        assert_eq!(
+            policy_hook.action_report_file,
+            PathBuf::from("/tmp/actions.json")
+        );
         Ok(())
     }
 
@@ -807,6 +870,27 @@ mod tests {
             error
                 .to_string()
                 .contains("--pid-file and --bridge-feed-file must be different paths")
+        );
+    }
+
+    #[test]
+    fn cli_rejects_incomplete_managed_mitm_policy_hook_options() {
+        let error = parse_managed_mitm_backend([
+            "--listen-addr".to_string(),
+            "127.0.0.1:65521".to_string(),
+            "--pid-file".to_string(),
+            "/tmp/backend.pid".to_string(),
+            "--bridge-feed-file".to_string(),
+            "/tmp/bridge.jsonl".to_string(),
+            "--policy-hook-listen-addr".to_string(),
+            "127.0.0.1:65522".to_string(),
+        ])
+        .expect_err("managed MITM backend policy hook must report action execution");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--policy-hook-listen-addr requires --action-report-file")
         );
     }
 

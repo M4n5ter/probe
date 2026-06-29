@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    fs,
     net::{Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     thread,
@@ -120,6 +121,50 @@ pub(super) fn assert_spool_outputs(
         ingress.len(),
         envelopes.len()
     );
+    Ok(())
+}
+
+pub(super) fn assert_backend_owned_policy_hook_execution(
+    case: MitmBridgeCase,
+    backend: &PreparedMitmBackend,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !case.backend_owned_policy_hook_enabled() {
+        return Ok(());
+    }
+    let Some(action_report_file) = backend.action_report_file.as_ref() else {
+        return Err(
+            e2e_error("backend-owned MITM policy hook case omitted action report file").into(),
+        );
+    };
+    let content = fs::read_to_string(action_report_file)?;
+    let reports = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let [report] = reports.as_slice() else {
+        return Err(e2e_error(format!(
+            "expected exactly one managed MITM action report, got {}: {reports:?}",
+            reports.len()
+        ))
+        .into());
+    };
+    let expected = [
+        ("flow_id", json!(mitm_bridge::FLOW_ID)),
+        ("target", json!(mitm_bridge::REQUEST_TARGET)),
+        ("requested_action", json!("deny")),
+        ("executed_action", json!("deny")),
+        ("reason", json!(POLICY_HOOK_RESPONSE_REASON)),
+    ];
+    for (field, expected) in expected {
+        if report[field] != expected {
+            return Err(e2e_error(format!(
+                "managed MITM action report {field} mismatch: expected {expected}, got {}; report={report}",
+                report[field]
+            ))
+            .into());
+        }
+    }
     Ok(())
 }
 

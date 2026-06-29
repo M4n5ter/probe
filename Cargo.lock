@@ -541,6 +541,7 @@ dependencies = [
  "e2e-support",
  "openssl",
  "rustix",
+ "serde_json",
  "socket2",
  "tempfile",
 ]

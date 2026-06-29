@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read, Write},
+    io,
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
@@ -9,9 +9,15 @@ use std::{
     time::Duration,
 };
 
-use e2e_support::mitm_bridge;
+use e2e_support::{
+    http_json::{
+        HttpJsonRequest as ObservedPolicyHookRequest, read_request as read_http_json_request,
+        write_response as write_json_response,
+    },
+    mitm_bridge,
+};
 use probe_core::Action;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::{
     backend::MitmBridgeCase,
@@ -19,10 +25,8 @@ use super::{
 };
 use crate::e2e::harness::e2e_error;
 
-const HOOK_PATH: &str = "/mitm-policy-hook";
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
-const READ_BUFFER_BYTES: usize = 4096;
 
 pub(super) struct MitmPolicyHookServer {
     target: SocketAddr,
@@ -52,7 +56,7 @@ impl MitmPolicyHookServer {
     }
 
     pub(super) fn endpoint(&self) -> String {
-        format!("http://{}{}", self.target, HOOK_PATH)
+        format!("http://{}{}", self.target, mitm_bridge::POLICY_HOOK_PATH)
     }
 
     pub(super) fn observed_requests(
@@ -88,7 +92,7 @@ pub(super) fn assert_policy_hook_requests(
     case: MitmBridgeCase,
     server: Option<&MitmPolicyHookServer>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !case.policy_hook_enabled() {
+    if !case.external_policy_hook_server_enabled() {
         return Ok(());
     }
     let Some(server) = server else {
@@ -134,7 +138,7 @@ fn handle_policy_hook_request(
             let _ = write_json_response(
                 &mut stream,
                 400,
-                json!({"outcome": "unsupported", "reason": error.to_string()}),
+                &json!({"outcome": "unsupported", "reason": error.to_string()}),
             );
             return Ok(());
         }
@@ -148,7 +152,7 @@ fn handle_policy_hook_request(
         return write_json_response(
             &mut stream,
             400,
-            json!({
+            &json!({
                 "outcome": "unsupported",
                 "reason": "MITM policy hook request omitted requested_action"
             }),
@@ -161,7 +165,7 @@ fn handle_policy_hook_request(
     write_json_response(
         &mut stream,
         200,
-        json!({
+        &json!({
             "outcome": "delegated",
             "executed_action": executed_action,
             "reason": POLICY_HOOK_RESPONSE_REASON
@@ -169,170 +173,28 @@ fn handle_policy_hook_request(
     )
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct ObservedPolicyHookRequest {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: Value,
-}
-
-fn read_http_json_request(stream: &mut TcpStream) -> io::Result<ObservedPolicyHookRequest> {
-    let mut buffer = Vec::new();
-    let mut chunk = [0_u8; READ_BUFFER_BYTES];
-    loop {
-        let read = stream.read(&mut chunk)?;
-        if read == 0 {
-            break;
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-        if complete_http_request_len(&buffer)?.is_some_and(|expected| buffer.len() >= expected) {
-            break;
-        }
-    }
-    let Some(header_end) = find_header_end(&buffer) else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "HTTP request omitted header terminator",
-        ));
-    };
-    let head = parse_http_head(&buffer[..header_end])?;
-    let content_length = parse_content_length(&buffer[..header_end])?;
-    let body_start = header_end + b"\r\n\r\n".len();
-    let body_end = body_start + content_length;
-    if buffer.len() < body_end {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "HTTP request body ended before Content-Length",
-        ));
-    }
-    let body = serde_json::from_slice(&buffer[body_start..body_end])
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    Ok(ObservedPolicyHookRequest {
-        method: head.method,
-        path: head.path,
-        headers: head.headers,
-        body,
-    })
-}
-
-fn complete_http_request_len(buffer: &[u8]) -> io::Result<Option<usize>> {
-    let Some(header_end) = find_header_end(buffer) else {
-        return Ok(None);
-    };
-    let content_length = parse_content_length(&buffer[..header_end])?;
-    Ok(Some(header_end + b"\r\n\r\n".len() + content_length))
-}
-
-fn find_header_end(buffer: &[u8]) -> Option<usize> {
-    buffer
-        .windows(b"\r\n\r\n".len())
-        .position(|window| window == b"\r\n\r\n")
-}
-
-struct ParsedHttpHead {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-}
-
-fn parse_http_head(head: &[u8]) -> io::Result<ParsedHttpHead> {
-    let head = std::str::from_utf8(head)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let mut lines = head.lines();
-    let Some(line) = lines.next() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "HTTP request omitted request line",
-        ));
-    };
-    let mut parts = line.split_whitespace();
-    let Some(method) = parts.next() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "HTTP request omitted method",
-        ));
-    };
-    let Some(path) = parts.next() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "HTTP request omitted path",
-        ));
-    };
-    if parts.next().is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "HTTP request omitted version",
-        ));
-    }
-    let headers = lines
-        .filter_map(|line| {
-            line.split_once(':')
-                .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
-        })
-        .collect::<Vec<_>>();
-    Ok(ParsedHttpHead {
-        method: method.to_string(),
-        path: path.to_string(),
-        headers,
-    })
-}
-
-fn parse_content_length(head: &[u8]) -> io::Result<usize> {
-    let head = std::str::from_utf8(head)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let mut lengths = head.lines().filter_map(|line| {
-        line.split_once(':').and_then(|(name, value)| {
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim())
-        })
-    });
-    let Some(raw) = lengths.next() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "HTTP request omitted Content-Length",
-        ));
-    };
-    if lengths.next().is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "HTTP request included duplicate Content-Length",
-        ));
-    }
-    raw.parse::<usize>()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-fn write_json_response(stream: &mut TcpStream, status: u16, body: Value) -> Result<(), io::Error> {
-    let body = serde_json::to_vec(&body).map_err(io::Error::other)?;
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        _ => "Error",
-    };
-    write!(
-        stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )?;
-    stream.write_all(&body)?;
-    stream.flush()
-}
-
 fn assert_hook_request_payload(
     request: &ObservedPolicyHookRequest,
     expected_host: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if request.method != "POST" || request.path != HOOK_PATH {
+    if request.method != mitm_bridge::POLICY_HOOK_METHOD
+        || request.path != mitm_bridge::POLICY_HOOK_PATH
+    {
         return Err(e2e_error(format!(
-            "MITM policy hook request target mismatch: expected POST {HOOK_PATH}, got {} {}; request={request:?}",
+            "MITM policy hook request target mismatch: expected {} {}, got {} {}; request={request:?}",
+            mitm_bridge::POLICY_HOOK_METHOD,
+            mitm_bridge::POLICY_HOOK_PATH,
             request.method, request.path
         ))
         .into());
     }
     assert_header(request, "host", expected_host)?;
-    assert_header(request, "content-type", "application/json")?;
-    assert_header(request, "accept", "application/json")?;
+    assert_header(
+        request,
+        "content-type",
+        mitm_bridge::POLICY_HOOK_CONTENT_TYPE,
+    )?;
+    assert_header(request, "accept", mitm_bridge::POLICY_HOOK_ACCEPT)?;
     let body = &request.body;
     let expected = [
         ("requested_action", &body["requested_action"], json!("deny")),

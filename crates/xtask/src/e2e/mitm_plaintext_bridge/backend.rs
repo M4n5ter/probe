@@ -18,12 +18,16 @@ use rustix::{
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+use e2e_support::mitm_bridge;
+
 use super::super::harness::{debug_binary, e2e_error};
 
 pub(super) const EXTERNAL_INBOUND_CASE_NAME: &str = "e2e-mitm-plaintext-bridge-live-sidecar";
 pub(super) const POLICY_HOOK_INBOUND_CASE_NAME: &str =
     "e2e-mitm-policy-hook-plaintext-bridge-live-sidecar";
 pub(super) const MANAGED_INBOUND_CASE_NAME: &str = "e2e-managed-mitm-plaintext-bridge-live-sidecar";
+pub(super) const MANAGED_POLICY_HOOK_INBOUND_CASE_NAME: &str =
+    "e2e-managed-mitm-policy-hook-plaintext-bridge-live-sidecar";
 pub(super) const EXTERNAL_OUTBOUND_CASE_NAME: &str =
     "e2e-outbound-mitm-plaintext-bridge-live-sidecar";
 pub(super) const MANAGED_OUTBOUND_CASE_NAME: &str =
@@ -34,6 +38,8 @@ pub(super) const POLICY_HOOK_INBOUND_IN_NETNS_ENV: &str =
     "TRAFFIC_PROBE_E2E_MITM_POLICY_HOOK_PLAINTEXT_BRIDGE_NETNS";
 pub(super) const MANAGED_INBOUND_IN_NETNS_ENV: &str =
     "TRAFFIC_PROBE_E2E_MANAGED_MITM_PLAINTEXT_BRIDGE_NETNS";
+pub(super) const MANAGED_POLICY_HOOK_INBOUND_IN_NETNS_ENV: &str =
+    "TRAFFIC_PROBE_E2E_MANAGED_MITM_POLICY_HOOK_PLAINTEXT_BRIDGE_NETNS";
 pub(super) const EXTERNAL_OUTBOUND_IN_NETNS_ENV: &str =
     "TRAFFIC_PROBE_E2E_OUTBOUND_MITM_PLAINTEXT_BRIDGE_NETNS";
 pub(super) const MANAGED_OUTBOUND_IN_NETNS_ENV: &str =
@@ -41,6 +47,7 @@ pub(super) const MANAGED_OUTBOUND_IN_NETNS_ENV: &str =
 
 const DEFAULT_INTERCEPT_PORT: u16 = 65_529;
 const DEFAULT_MANAGED_BACKEND_PORT: u16 = 65_521;
+const DEFAULT_MANAGED_POLICY_HOOK_PORT: u16 = 65_518;
 const MANAGED_BACKEND_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const EXTERNAL_BACKEND_REBIND_TIMEOUT: Duration = Duration::from_secs(2);
 const EXTERNAL_BACKEND_LISTEN_BACKLOG: i32 = 128;
@@ -50,6 +57,7 @@ pub(super) enum MitmBridgeCase {
     ExternalInbound,
     ExternalInboundPolicyHook,
     ManagedInbound,
+    ManagedInboundPolicyHook,
     ExternalOutbound,
     ManagedOutbound,
 }
@@ -72,6 +80,7 @@ impl MitmBridgeCase {
             Self::ExternalInbound => EXTERNAL_INBOUND_CASE_NAME,
             Self::ExternalInboundPolicyHook => POLICY_HOOK_INBOUND_CASE_NAME,
             Self::ManagedInbound => MANAGED_INBOUND_CASE_NAME,
+            Self::ManagedInboundPolicyHook => MANAGED_POLICY_HOOK_INBOUND_CASE_NAME,
             Self::ExternalOutbound => EXTERNAL_OUTBOUND_CASE_NAME,
             Self::ManagedOutbound => MANAGED_OUTBOUND_CASE_NAME,
         }
@@ -82,6 +91,7 @@ impl MitmBridgeCase {
             Self::ExternalInbound => EXTERNAL_INBOUND_IN_NETNS_ENV,
             Self::ExternalInboundPolicyHook => POLICY_HOOK_INBOUND_IN_NETNS_ENV,
             Self::ManagedInbound => MANAGED_INBOUND_IN_NETNS_ENV,
+            Self::ManagedInboundPolicyHook => MANAGED_POLICY_HOOK_INBOUND_IN_NETNS_ENV,
             Self::ExternalOutbound => EXTERNAL_OUTBOUND_IN_NETNS_ENV,
             Self::ManagedOutbound => MANAGED_OUTBOUND_IN_NETNS_ENV,
         }
@@ -92,6 +102,7 @@ impl MitmBridgeCase {
             Self::ExternalInbound => "mitm-bridge",
             Self::ExternalInboundPolicyHook => "mitm-policy-hook-bridge",
             Self::ManagedInbound => "managed-mitm-bridge",
+            Self::ManagedInboundPolicyHook => "managed-mitm-policy-hook-bridge",
             Self::ExternalOutbound => "outbound-mitm-bridge",
             Self::ManagedOutbound => "managed-outbound-mitm-bridge",
         }
@@ -102,6 +113,9 @@ impl MitmBridgeCase {
             Self::ExternalInbound => "e2e MITM plaintext bridge live sidecar",
             Self::ExternalInboundPolicyHook => "e2e MITM policy hook plaintext bridge live sidecar",
             Self::ManagedInbound => "e2e managed MITM plaintext bridge live sidecar",
+            Self::ManagedInboundPolicyHook => {
+                "e2e managed MITM policy hook plaintext bridge live sidecar"
+            }
             Self::ExternalOutbound => "e2e outbound MITM plaintext bridge live sidecar",
             Self::ManagedOutbound => "e2e managed outbound MITM plaintext bridge live sidecar",
         }
@@ -114,6 +128,9 @@ impl MitmBridgeCase {
                 "e2e MITM policy hook plaintext bridge live sidecar passed"
             }
             Self::ManagedInbound => "e2e managed MITM plaintext bridge live sidecar passed",
+            Self::ManagedInboundPolicyHook => {
+                "e2e managed MITM policy hook plaintext bridge live sidecar passed"
+            }
             Self::ExternalOutbound => "e2e outbound MITM plaintext bridge live sidecar passed",
             Self::ManagedOutbound => {
                 "e2e managed outbound MITM plaintext bridge live sidecar passed"
@@ -126,27 +143,43 @@ impl MitmBridgeCase {
             Self::ExternalInbound | Self::ExternalInboundPolicyHook | Self::ExternalOutbound => {
                 MitmBackendKind::External
             }
-            Self::ManagedInbound | Self::ManagedOutbound => MitmBackendKind::ManagedProcess,
+            Self::ManagedInbound | Self::ManagedInboundPolicyHook | Self::ManagedOutbound => {
+                MitmBackendKind::ManagedProcess
+            }
         }
     }
 
     pub(super) const fn direction(self) -> MitmBridgeDirection {
         match self {
-            Self::ExternalInbound | Self::ExternalInboundPolicyHook | Self::ManagedInbound => {
-                MitmBridgeDirection::Inbound
-            }
+            Self::ExternalInbound
+            | Self::ExternalInboundPolicyHook
+            | Self::ManagedInbound
+            | Self::ManagedInboundPolicyHook => MitmBridgeDirection::Inbound,
             Self::ExternalOutbound | Self::ManagedOutbound => MitmBridgeDirection::Outbound,
         }
     }
 
     pub(super) const fn policy_hook_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::ExternalInboundPolicyHook | Self::ManagedInboundPolicyHook
+        )
+    }
+
+    pub(super) const fn external_policy_hook_server_enabled(self) -> bool {
         matches!(self, Self::ExternalInboundPolicyHook)
+    }
+
+    pub(super) const fn backend_owned_policy_hook_enabled(self) -> bool {
+        matches!(self, Self::ManagedInboundPolicyHook)
     }
 }
 
 pub(super) struct PreparedMitmBackend {
     pub(super) config: MitmBackendConfig,
     pub(super) proxy_port: u16,
+    pub(super) policy_hook_endpoint: Option<String>,
+    pub(super) action_report_file: Option<PathBuf>,
     external_backend: Option<ExternalMitmBackend>,
 }
 
@@ -275,7 +308,7 @@ pub(super) fn prepare_mitm_backend(
     match case.backend() {
         MitmBackendKind::External => prepare_external_backend(),
         MitmBackendKind::ManagedProcess => {
-            prepare_managed_backend(root, bridge_feed_path, used_ports)
+            prepare_managed_backend(case, root, bridge_feed_path, used_ports)
         }
     }
 }
@@ -353,31 +386,56 @@ fn prepare_external_backend() -> Result<PreparedMitmBackend, Box<dyn std::error:
             target: target.to_string(),
         },
         proxy_port: target.port(),
+        policy_hook_endpoint: None,
+        action_report_file: None,
         external_backend: Some(backend),
     })
 }
 
 fn prepare_managed_backend(
+    case: MitmBridgeCase,
     root: &Path,
     bridge_feed_path: &Path,
     used_ports: impl IntoIterator<Item = u16>,
 ) -> Result<PreparedMitmBackend, Box<dyn std::error::Error>> {
-    let target = managed_backend_target(used_ports)?;
+    let used_ports = used_ports.into_iter().collect::<BTreeSet<_>>();
+    let target = managed_backend_target(used_ports.iter().copied())?;
     let pid_file = root.join("managed-mitm-backend.pid");
+    let action_report_file = case
+        .backend_owned_policy_hook_enabled()
+        .then(|| root.join("managed-mitm-actions.json"));
+    let policy_hook_target = case
+        .backend_owned_policy_hook_enabled()
+        .then(|| managed_policy_hook_target(used_ports.iter().copied().chain([target.port()])))
+        .transpose()?;
+    let mut args = vec![
+        "managed-mitm-backend".to_string(),
+        "--listen-addr".to_string(),
+        target.to_string(),
+        "--pid-file".to_string(),
+        pid_file.display().to_string(),
+        "--bridge-feed-file".to_string(),
+        bridge_feed_path.display().to_string(),
+    ];
+    if let (Some(policy_hook_target), Some(action_report_file)) =
+        (policy_hook_target, action_report_file.as_ref())
+    {
+        args.extend([
+            "--policy-hook-listen-addr".to_string(),
+            policy_hook_target.to_string(),
+            "--action-report-file".to_string(),
+            action_report_file.display().to_string(),
+        ]);
+    }
     Ok(PreparedMitmBackend {
         proxy_port: target.port(),
+        policy_hook_endpoint: policy_hook_target
+            .map(|target| format!("http://{target}{}", mitm_bridge::POLICY_HOOK_PATH)),
+        action_report_file,
         config: MitmBackendConfig::ManagedProcess {
             target: target.to_string(),
             program: debug_binary("traffic-probe-e2e-fixture")?,
-            args: vec![
-                "managed-mitm-backend".to_string(),
-                "--listen-addr".to_string(),
-                target.to_string(),
-                "--pid-file".to_string(),
-                pid_file.display().to_string(),
-                "--bridge-feed-file".to_string(),
-                bridge_feed_path.display().to_string(),
-            ],
+            args,
             pid_file,
         },
         external_backend: None,
@@ -387,12 +445,30 @@ fn prepare_managed_backend(
 fn managed_backend_target(
     used_ports: impl IntoIterator<Item = u16>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
-    let used_ports = used_ports.into_iter().collect::<BTreeSet<_>>();
-    for port in [
+    deterministic_loopback_target(
         DEFAULT_MANAGED_BACKEND_PORT,
-        DEFAULT_MANAGED_BACKEND_PORT - 1,
-        DEFAULT_MANAGED_BACKEND_PORT - 2,
-    ] {
+        used_ports,
+        "managed MITM backend",
+    )
+}
+
+fn managed_policy_hook_target(
+    used_ports: impl IntoIterator<Item = u16>,
+) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    deterministic_loopback_target(
+        DEFAULT_MANAGED_POLICY_HOOK_PORT,
+        used_ports,
+        "managed MITM policy hook",
+    )
+}
+
+fn deterministic_loopback_target(
+    default_port: u16,
+    used_ports: impl IntoIterator<Item = u16>,
+    label: &str,
+) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let used_ports = used_ports.into_iter().collect::<BTreeSet<_>>();
+    for port in [default_port, default_port - 1, default_port - 2] {
         if used_ports.contains(&port) {
             continue;
         }
@@ -406,7 +482,7 @@ fn managed_backend_target(
             Err(error) => return Err(error.into()),
         }
     }
-    Err(e2e_error("failed to find a free deterministic managed MITM backend port").into())
+    Err(e2e_error(format!("failed to find a free deterministic {label} port")).into())
 }
 
 fn bind_external_listener_with_retry(

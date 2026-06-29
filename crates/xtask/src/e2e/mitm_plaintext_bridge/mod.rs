@@ -11,8 +11,9 @@ use std::{
 };
 
 use assertions::{
-    assert_mitm_backend_runtime, assert_outbound_redirect_reaches_mitm_backend,
-    assert_spool_outputs, exercise_l7_mitm_health_transition,
+    assert_backend_owned_policy_hook_execution, assert_mitm_backend_runtime,
+    assert_outbound_redirect_reaches_mitm_backend, assert_spool_outputs,
+    exercise_l7_mitm_health_transition,
 };
 use backend::{
     MitmBridgeCase, cleanup_managed_backend, prepare_mitm_backend, unused_intercept_port,
@@ -45,6 +46,10 @@ pub(crate) fn run() -> ExitCode {
 
 pub(crate) fn run_managed() -> ExitCode {
     run_case(MitmBridgeCase::ManagedInbound)
+}
+
+pub(crate) fn run_managed_policy_hook() -> ExitCode {
+    run_case(MitmBridgeCase::ManagedInboundPolicyHook)
 }
 
 pub(crate) fn run_policy_hook() -> ExitCode {
@@ -118,7 +123,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
         config::write_enforcement_manifest(&enforcement_manifest_path)?;
     }
     let policy_hook_server = case
-        .policy_hook_enabled()
+        .external_policy_hook_server_enabled()
         .then(MitmPolicyHookServer::start)
         .transpose()?;
 
@@ -148,7 +153,8 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
         mitm_backend: &mitm_backend.config,
         policy_hook_endpoint: policy_hook_server
             .as_ref()
-            .map(MitmPolicyHookServer::endpoint),
+            .map(MitmPolicyHookServer::endpoint)
+            .or_else(|| mitm_backend.policy_hook_endpoint.clone()),
         proxy_port: mitm_backend.proxy_port,
         intercept_port,
     })?;
@@ -249,6 +255,17 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
         ],
         || assert_policy_hook_requests(case, policy_hook_server.as_ref()),
     );
+    let backend_policy_hook_execution = run_after_success(
+        [
+            &agent_ready,
+            &backend_status,
+            &outbound_redirect,
+            &bridge_progress,
+            &policy_hook_decision,
+            &agent_result,
+        ],
+        || assert_backend_owned_policy_hook_execution(case, &mitm_backend),
+    );
     let phases = MitmBridgePhases {
         fixture: fixture_result,
         agent_ready,
@@ -261,6 +278,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
         health_transition,
         policy_hook_decision,
         policy_hook_requests,
+        backend_policy_hook_execution,
         agent: agent_result,
         managed_backend_cleanup: managed_backend_cleanup_result,
     };
@@ -285,6 +303,7 @@ struct MitmBridgePhases {
     health_transition: RunResult,
     policy_hook_decision: RunResult,
     policy_hook_requests: RunResult,
+    backend_policy_hook_execution: RunResult,
     agent: RunResult,
     managed_backend_cleanup: RunResult,
 }
@@ -303,12 +322,13 @@ impl MitmBridgePhases {
             &self.health_transition,
             &self.policy_hook_decision,
             &self.policy_hook_requests,
+            &self.backend_policy_hook_execution,
             &self.agent,
             &self.managed_backend_cleanup,
         ])
     }
 
-    fn into_labeled_results(self, spool: RunResult) -> [LabeledRunResult; 14] {
+    fn into_labeled_results(self, spool: RunResult) -> [LabeledRunResult; 15] {
         [
             ("fixture", self.fixture),
             ("agent readiness", self.agent_ready),
@@ -321,6 +341,10 @@ impl MitmBridgePhases {
             ("L7 MITM backend health transition", self.health_transition),
             ("MITM policy hook decision", self.policy_hook_decision),
             ("MITM policy hook requests", self.policy_hook_requests),
+            (
+                "backend-owned MITM policy hook execution",
+                self.backend_policy_hook_execution,
+            ),
             ("agent", self.agent),
             ("managed MITM backend cleanup", self.managed_backend_cleanup),
             ("spool assertion", spool),

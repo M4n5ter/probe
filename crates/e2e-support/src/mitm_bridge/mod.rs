@@ -13,6 +13,11 @@ use probe_core::{
 
 pub const FLOW_ID: &str = "mitm_bridge:e2e-flow";
 pub const REQUEST_TARGET: &str = "/mitm-bridge/e2e";
+pub const POLICY_HOOK_METHOD: &str = "POST";
+pub const POLICY_HOOK_PATH: &str = "/mitm-policy-hook";
+pub const POLICY_HOOK_CONTENT_TYPE: &str = "application/json";
+pub const POLICY_HOOK_ACCEPT: &str = "application/json";
+pub const POLICY_HOOK_RESPONSE_REASON: &str = "e2e MITM policy hook delegated deny";
 pub const REQUEST_BYTES: &[u8] =
     b"GET /mitm-bridge/e2e HTTP/1.1\r\nHost: mitm-bridge.e2e.test\r\n\r\n";
 
