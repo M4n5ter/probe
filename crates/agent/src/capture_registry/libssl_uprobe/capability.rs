@@ -3,6 +3,29 @@ use ebpf_object::{EbpfObjectArtifact, EbpfObjectProbe, EbpfObjectProbeReport};
 use probe_config::AgentConfig;
 use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
 
+const LIBSSL_UPROBE_IMPLEMENTED_FACTS: &[&str] = &[
+    "eBPF TLS plaintext object preflight via aya-obj succeeded",
+    "procfs socket attribution is usable",
+    "resolved live fd lookups can carry optional SO_COOKIE when pidfd_getfd is permitted and the duplicated fd inode still matches",
+    "agent libssl plaintext sidecar can run startup attach plus periodic process scan and reconcile",
+    "runtime status reports last-reconcile target counts",
+    "runtime status reports capture-bounded target snapshots",
+    "runtime status reports per-target last-reconcile state",
+    "runtime status reports per-target userspace uprobe link ownership",
+    "runtime status reports observed reconcile timestamp",
+    "runtime status reports reconcile-loop health with last attempt outcome and consecutive failure count",
+    "runtime status reports provider activity counters with last progress/event/loss signal",
+    "TLS output loss can fan out conservative unknown-offset gaps to plaintext flows observed since the previous output-loss checkpoint",
+];
+
+const LIBSSL_UPROBE_BEST_EFFORT_GAPS: &[&str] = &[
+    "per-link kernel liveness beyond provider activity",
+    "TLS fd-to-flow ownership",
+    "low-latency provider multiplexing",
+    "precise flow-specific lost-event reconstruction",
+    "privileged ringbuf saturation e2e coverage",
+];
+
 pub(in crate::capture_registry) fn capability(
     config: &AgentConfig,
     host: &EbpfHostProbeReport,
@@ -73,11 +96,22 @@ fn capability_from_object_report(
     }
     CapabilityState::degraded(
         CapabilityKind::LibsslUprobe,
-        format!(
-            "eBPF TLS plaintext object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, resolved live fd lookups can carry optional SO_COOKIE when pidfd_getfd is permitted and the duplicated fd inode still matches, agent libssl plaintext sidecar wiring can run startup attach plus periodic process scan/reconcile with last-reconcile target counts, capture-bounded target snapshots, per-target last-reconcile state, per-target userspace uprobe link ownership, observed timestamp, and reconcile-loop health with last attempt outcome and consecutive failure count, and TLS output loss can fan out conservative unknown-offset gaps to plaintext flows observed since the previous output-loss checkpoint, but kernel link liveness/firing heartbeat, TLS fd-to-flow ownership, low-latency provider multiplexing, precise flow-specific lost-event reconstruction, and privileged ringbuf saturation e2e coverage remain best-effort",
-            object.summary()
-        ),
+        degraded_capability_reason(&object),
     )
+}
+
+fn degraded_capability_reason(object: &EbpfObjectProbeReport) -> String {
+    format!(
+        "{} ({}); implemented facts: {}; remaining best-effort gaps: {}",
+        LIBSSL_UPROBE_IMPLEMENTED_FACTS[0],
+        object.summary(),
+        render_reason_items(LIBSSL_UPROBE_IMPLEMENTED_FACTS),
+        render_reason_items(LIBSSL_UPROBE_BEST_EFFORT_GAPS)
+    )
+}
+
+fn render_reason_items(items: &[&str]) -> String {
+    items.join("; ")
 }
 
 #[cfg(test)]
@@ -157,24 +191,14 @@ mod tests {
         let reason = capability
             .reason
             .expect("degraded TLS capability must explain the remaining lifecycle gap");
-        assert!(reason.contains("eBPF TLS plaintext object preflight via aya-obj succeeded"));
-        assert!(reason.contains("procfs socket attribution is usable"));
-        assert!(reason.contains("optional SO_COOKIE"));
-        assert!(reason.contains("startup attach plus periodic process scan/reconcile"));
-        assert!(reason.contains("last-reconcile target counts"));
-        assert!(reason.contains("capture-bounded target snapshots"));
-        assert!(reason.contains("per-target last-reconcile state"));
-        assert!(reason.contains("per-target userspace uprobe link ownership"));
-        assert!(reason.contains("observed timestamp"));
-        assert!(reason.contains("reconcile-loop health"));
-        assert!(reason.contains("consecutive failure count"));
-        assert!(reason.contains("TLS output loss"));
-        assert!(reason.contains("unknown-offset gaps"));
-        assert!(reason.contains("kernel link liveness/firing heartbeat"));
-        assert!(reason.contains("TLS fd-to-flow ownership"));
-        assert!(reason.contains("precise flow-specific lost-event reconstruction"));
-        assert!(reason.contains("privileged ringbuf saturation e2e coverage"));
-        assert!(reason.contains("provider multiplexing"));
+        assert!(reason.contains("implemented facts:"));
+        assert!(reason.contains("remaining best-effort gaps:"));
+        for fact in LIBSSL_UPROBE_IMPLEMENTED_FACTS {
+            assert!(reason.contains(fact), "missing implemented fact: {fact}");
+        }
+        for gap in LIBSSL_UPROBE_BEST_EFFORT_GAPS {
+            assert!(reason.contains(gap), "missing best-effort gap: {gap}");
+        }
     }
 
     #[test]

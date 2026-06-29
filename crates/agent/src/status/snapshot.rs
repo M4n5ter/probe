@@ -22,7 +22,7 @@ use super::{
         ExportStatusSnapshot, ExporterStatusSnapshot, export_status, exporter_statuses_with_runtime,
     },
     health::health_snapshot,
-    metrics::{MetricsSnapshot, metrics_snapshot},
+    metrics::{MetricsSnapshot, MetricsSnapshotInput, metrics_snapshot},
     policy::{PolicyStatusSnapshot, policy_status},
     spool::{SpoolStatusInput, SpoolStatusSnapshot},
     tls::{TlsStatusSnapshot, tls_status},
@@ -149,15 +149,16 @@ fn build_status_snapshot_at_with_runtime(
         &spool.export_cursors,
         runtime.export_worker.as_ref(),
     );
-    let metrics = metrics_snapshot(
-        &capabilities,
-        &spool_status,
-        &exporters,
-        runtime.export_worker.as_ref(),
+    let metrics = metrics_snapshot(MetricsSnapshotInput {
+        capabilities: &capabilities,
+        spool: &spool_status,
+        exporters: &exporters,
+        export_worker: runtime.export_worker.as_ref(),
         l7_mitm,
         transparent_proxy,
-        runtime.pipeline,
-    );
+        tls_plaintext: runtime.tls_plaintext,
+        pipeline: runtime.pipeline,
+    });
     let health = health_snapshot(
         &capture,
         &spool_status,
@@ -214,7 +215,10 @@ mod tests {
 
     use crate::{
         configured_enforcement::ActiveEnforcementPolicy,
-        tls_plaintext::{TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot},
+        tls_plaintext::{
+            TlsPlaintextProviderActivityRuntimeSnapshot, TlsPlaintextProviderSignalRuntimeSnapshot,
+            TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot,
+        },
         transparent_interception::{
             TransparentProxyHealthProbeMode, TransparentProxyRuntimeMode,
             TransparentProxyRuntimeSnapshot,
@@ -794,6 +798,83 @@ mod tests {
                 .reasons
                 .iter()
                 .any(|reason| reason.contains("produced no attachable targets"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tls_plaintext_runtime_activity_is_reported_in_status_metrics_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool"));
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.tls.plaintext.instrumentation.enabled = true;
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path = Some("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o".into());
+        let plan = runtime_plan_from_config(
+            config,
+            vec![CapabilityState::degraded(
+                CapabilityKind::LibsslUprobe,
+                "libssl uprobe preflight passed but runtime remains best-effort",
+            )],
+        )?;
+        let spool = SpoolStatusInput::available(
+            PathBuf::from("/tmp/traffic-probe-spool"),
+            SpoolSnapshot {
+                last_ingress_sequence: 0,
+                last_export_sequence: 0,
+            },
+            BTreeMap::new(),
+        );
+        let mut tls_plaintext = TlsPlaintextRuntimeSnapshot::enabled();
+        tls_plaintext.provider_activity = TlsPlaintextProviderActivityRuntimeSnapshot {
+            progress_signals: 2,
+            capture_events: 3,
+            output_loss_events: 5,
+            lost_events: 17,
+            last_signal: Some(TlsPlaintextProviderSignalRuntimeSnapshot::OutputLoss {
+                sequence: 10,
+                observed_unix_ns: 99,
+                capture_timestamp: probe_core::Timestamp {
+                    monotonic_ns: 7,
+                    wall_time_unix_ns: 8,
+                },
+                lost_events: 11,
+            }),
+        };
+        let runtime = RuntimeStatusInput {
+            tls_plaintext: Some(tls_plaintext),
+            ..RuntimeStatusInput::default()
+        };
+
+        let snapshot = build_status_snapshot_at_with_runtime(&plan, spool, 42, runtime);
+
+        let tls_metrics = snapshot
+            .metrics
+            .tls_plaintext
+            .expect("enabled TLS plaintext runtime should expose activity metrics");
+        assert_eq!(tls_metrics.provider_activity.progress_signals, 2);
+        assert_eq!(tls_metrics.provider_activity.capture_events, 3);
+        assert_eq!(tls_metrics.provider_activity.output_loss_events, 5);
+        assert_eq!(tls_metrics.provider_activity.lost_events, 17);
+        assert_eq!(
+            tls_metrics
+                .provider_activity
+                .last_signal
+                .expect("last activity signal should be projected")
+                .kind,
+            "output_loss"
+        );
+        let value = serde_json::to_value(&snapshot)?;
+        assert_eq!(
+            value["metrics"]["tls_plaintext"]["provider_activity"]["last_signal"]["kind"],
+            json!("output_loss")
+        );
+        assert_eq!(
+            value["metrics"]["tls_plaintext"]["provider_activity"]["lost_events"],
+            json!(17)
         );
         Ok(())
     }

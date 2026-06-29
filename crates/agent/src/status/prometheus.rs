@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use probe_core::RuntimeMode;
 
-use super::metrics::TcpHealthMetricsSnapshot;
+use super::metrics::{TcpHealthMetricsSnapshot, TlsPlaintextMetricsSnapshot};
 use crate::{
     l7_mitm::{
         L7MitmBackendHealthMode, L7MitmClientTrustMaterialMode, L7MitmClientTrustMode,
@@ -93,6 +93,7 @@ pub(crate) fn render_prometheus_metrics(snapshot: &AgentStatusSnapshot) -> Strin
     write_export(&mut output, snapshot);
     write_l7_mitm(&mut output, snapshot);
     write_transparent_proxy(&mut output, snapshot);
+    write_tls_plaintext(&mut output, snapshot);
     write_pipeline(&mut output, snapshot);
 
     output
@@ -435,6 +436,96 @@ fn write_transparent_proxy(output: &mut String, snapshot: &AgentStatusSnapshot) 
     );
 }
 
+fn write_tls_plaintext(output: &mut String, snapshot: &AgentStatusSnapshot) {
+    write_family(
+        output,
+        "traffic_probe_tls_plaintext_activity_metrics_available",
+        "gauge",
+        "Whether TLS plaintext provider activity metrics are present in this snapshot.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_tls_plaintext_activity_metrics_available",
+        &[],
+        u64::from(snapshot.metrics.tls_plaintext.is_some()),
+    );
+
+    let Some(metrics) = snapshot.metrics.tls_plaintext else {
+        return;
+    };
+
+    write_tls_plaintext_activity(output, metrics);
+}
+
+fn write_tls_plaintext_activity(output: &mut String, metrics: TlsPlaintextMetricsSnapshot) {
+    let activity = metrics.provider_activity;
+    write_family(
+        output,
+        "traffic_probe_tls_plaintext_provider_signals_total",
+        "counter",
+        "TLS plaintext provider activity signals by kind.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_tls_plaintext_provider_signals_total",
+        &[("kind", "progress")],
+        activity.progress_signals,
+    );
+    write_sample(
+        output,
+        "traffic_probe_tls_plaintext_provider_signals_total",
+        &[("kind", "capture_event")],
+        activity.capture_events,
+    );
+    write_sample(
+        output,
+        "traffic_probe_tls_plaintext_provider_signals_total",
+        &[("kind", "output_loss")],
+        activity.output_loss_events,
+    );
+
+    write_family(
+        output,
+        "traffic_probe_tls_plaintext_lost_events_total",
+        "counter",
+        "TLS plaintext output ring buffer events lost by the provider.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_tls_plaintext_lost_events_total",
+        &[],
+        activity.lost_events,
+    );
+
+    let Some(last_signal) = activity.last_signal else {
+        return;
+    };
+    write_family(
+        output,
+        "traffic_probe_tls_plaintext_provider_last_signal_sequence",
+        "gauge",
+        "Latest TLS plaintext provider activity signal sequence.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_tls_plaintext_provider_last_signal_sequence",
+        &[("kind", last_signal.kind)],
+        last_signal.sequence,
+    );
+    write_family(
+        output,
+        "traffic_probe_tls_plaintext_provider_last_signal_unix_time_ns",
+        "gauge",
+        "Unix timestamp when the latest TLS plaintext provider activity signal was observed, in nanoseconds.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_tls_plaintext_provider_last_signal_unix_time_ns",
+        &[("kind", last_signal.kind)],
+        last_signal.observed_unix_ns,
+    );
+}
+
 fn write_tcp_health(
     output: &mut String,
     mode_metric: &str,
@@ -740,6 +831,10 @@ mod tests {
         L7MitmBackendHealthMode, L7MitmBackendHealthSnapshot, L7MitmClientTrustSnapshot,
         L7MitmPlaintextBridgeMode, L7MitmPlaintextBridgeSnapshot, L7MitmRuntimeSnapshot,
     };
+    use crate::tls_plaintext::{
+        TlsPlaintextProviderActivityRuntimeSnapshot, TlsPlaintextProviderSignalRuntimeSnapshot,
+        TlsPlaintextRuntimeSnapshot,
+    };
     use crate::transparent_interception::{
         TransparentProxyHealthProbeMode, TransparentProxyRuntimeMode,
         TransparentProxyRuntimeSnapshot,
@@ -905,6 +1000,100 @@ mod tests {
         assert!(metrics.contains(
             "traffic_probe_l7_mitm_backend_health_checks_total{outcome=\"failure\"} 7\n"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn render_prometheus_metrics_includes_tls_plaintext_activity_counters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
+            Vec::new(),
+        )?;
+        let mut tls_plaintext = TlsPlaintextRuntimeSnapshot::enabled();
+        tls_plaintext.provider_activity = TlsPlaintextProviderActivityRuntimeSnapshot {
+            progress_signals: 2,
+            capture_events: 3,
+            output_loss_events: 5,
+            lost_events: 17,
+            last_signal: Some(TlsPlaintextProviderSignalRuntimeSnapshot::OutputLoss {
+                sequence: 10,
+                observed_unix_ns: 99,
+                capture_timestamp: probe_core::Timestamp {
+                    monotonic_ns: 7,
+                    wall_time_unix_ns: 8,
+                },
+                lost_events: 11,
+            }),
+        };
+        let snapshot = build_status_snapshot_with_runtime(
+            &plan,
+            SpoolStatusInput::available(
+                PathBuf::from("/tmp/traffic-probe-spool"),
+                SpoolSnapshot {
+                    last_ingress_sequence: 0,
+                    last_export_sequence: 0,
+                },
+                BTreeMap::from([("primary".to_string(), 0)]),
+            ),
+            RuntimeStatusInput {
+                tls_plaintext: Some(tls_plaintext),
+                ..RuntimeStatusInput::default()
+            },
+        );
+
+        let metrics = render_prometheus_metrics(&snapshot);
+
+        assert!(metrics.contains("traffic_probe_tls_plaintext_activity_metrics_available 1\n"));
+        assert!(
+            metrics.contains(
+                "traffic_probe_tls_plaintext_provider_signals_total{kind=\"progress\"} 2\n"
+            )
+        );
+        assert!(metrics.contains(
+            "traffic_probe_tls_plaintext_provider_signals_total{kind=\"capture_event\"} 3\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_tls_plaintext_provider_signals_total{kind=\"output_loss\"} 5\n"
+        ));
+        assert!(metrics.contains("traffic_probe_tls_plaintext_lost_events_total 17\n"));
+        assert!(metrics.contains(
+            "traffic_probe_tls_plaintext_provider_last_signal_sequence{kind=\"output_loss\"} 10\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_tls_plaintext_provider_last_signal_unix_time_ns{kind=\"output_loss\"} 99\n"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn render_prometheus_metrics_hides_tls_plaintext_activity_when_not_configured()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
+            Vec::new(),
+        )?;
+        let snapshot = build_status_snapshot_with_runtime(
+            &plan,
+            SpoolStatusInput::available(
+                PathBuf::from("/tmp/traffic-probe-spool"),
+                SpoolSnapshot {
+                    last_ingress_sequence: 0,
+                    last_export_sequence: 0,
+                },
+                BTreeMap::from([("primary".to_string(), 0)]),
+            ),
+            RuntimeStatusInput {
+                tls_plaintext: Some(TlsPlaintextRuntimeSnapshot::not_configured()),
+                ..RuntimeStatusInput::default()
+            },
+        );
+
+        let metrics = render_prometheus_metrics(&snapshot);
+
+        assert!(metrics.contains("traffic_probe_tls_plaintext_activity_metrics_available 0\n"));
+        assert!(!metrics.contains("traffic_probe_tls_plaintext_provider_signals_total"));
+        assert!(!metrics.contains("traffic_probe_tls_plaintext_lost_events_total"));
         Ok(())
     }
 

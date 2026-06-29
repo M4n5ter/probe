@@ -4,7 +4,7 @@ use std::{
 };
 
 use capture::{
-    CaptureProvider, LibsslUprobeAttachLinkOwnershipSnapshot,
+    CaptureEvent, CaptureProvider, LibsslUprobeAttachLinkOwnershipSnapshot,
     LibsslUprobeAttachProgramLinkOwnershipSnapshot, LibsslUprobeAttachTargetSnapshot,
     LibsslUprobePlaintextOpen, LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
     LibsslUprobePlaintextReconcile, LibsslUprobeReconcileTargetBucket,
@@ -18,9 +18,10 @@ use crate::error::AgentError;
 use super::{
     flow_resolver::{AttachedLibsslProcessRegistry, ProcfsLibsslFlowResolver},
     planning::LibsslUprobeAttachPlanner,
+    provider_activity::TlsPlaintextProviderActivityRuntimeSnapshot,
     sidecar::{
-        LibsslUprobePlaintextReconcileFailure, LibsslUprobePlaintextReconcileObserver,
-        LibsslUprobePlaintextSidecar,
+        LibsslUprobePlaintextReconcileFailure, LibsslUprobePlaintextSidecar,
+        LibsslUprobePlaintextSidecarObserver,
     },
 };
 
@@ -33,6 +34,7 @@ pub(crate) struct TlsPlaintextRuntimeState {
 pub struct TlsPlaintextRuntimeSnapshot {
     pub mode: TlsPlaintextRuntimeMode,
     pub reason: Option<String>,
+    pub provider_activity: TlsPlaintextProviderActivityRuntimeSnapshot,
     pub reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot,
     pub last_reconcile: Option<TlsPlaintextReconcileRuntimeSnapshot>,
 }
@@ -42,6 +44,7 @@ impl TlsPlaintextRuntimeSnapshot {
         Self {
             mode: TlsPlaintextRuntimeMode::NotConfigured,
             reason: None,
+            provider_activity: TlsPlaintextProviderActivityRuntimeSnapshot::default(),
             reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::available(),
             last_reconcile: None,
         }
@@ -51,6 +54,7 @@ impl TlsPlaintextRuntimeSnapshot {
         Self {
             mode: TlsPlaintextRuntimeMode::Enabled,
             reason: None,
+            provider_activity: TlsPlaintextProviderActivityRuntimeSnapshot::default(),
             reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::available(),
             last_reconcile: None,
         }
@@ -60,6 +64,7 @@ impl TlsPlaintextRuntimeSnapshot {
         Self {
             mode: TlsPlaintextRuntimeMode::Disabled,
             reason: Some(reason.into()),
+            provider_activity: TlsPlaintextProviderActivityRuntimeSnapshot::default(),
             reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::available(),
             last_reconcile: None,
         }
@@ -383,6 +388,7 @@ impl TlsPlaintextRuntimeState {
         Self::from_snapshot(TlsPlaintextRuntimeSnapshot {
             mode: TlsPlaintextRuntimeMode::Pending,
             reason: Some("TLS plaintext instrumentation has not been built yet".to_string()),
+            provider_activity: TlsPlaintextProviderActivityRuntimeSnapshot::default(),
             reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::available(),
             last_reconcile: None,
         })
@@ -414,6 +420,7 @@ impl TlsPlaintextRuntimeState {
         *inner = TlsPlaintextRuntimeSnapshot {
             mode: TlsPlaintextRuntimeMode::Disabled,
             reason: Some(reason.into()),
+            provider_activity: inner.provider_activity.clone(),
             reconcile_health: inner.reconcile_health.clone(),
             last_reconcile: inner.last_reconcile.clone(),
         };
@@ -440,6 +447,7 @@ impl TlsPlaintextRuntimeState {
         *inner = TlsPlaintextRuntimeSnapshot {
             mode: TlsPlaintextRuntimeMode::Enabled,
             reason: None,
+            provider_activity: inner.provider_activity.clone(),
             reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::success(
                 attempt_sequence,
                 observed_unix_ns,
@@ -504,9 +512,11 @@ impl TlsPlaintextRuntimeState {
             .consecutive_failures
             .saturating_add(1);
         let last_reconcile = inner.last_reconcile.clone();
+        let provider_activity = inner.provider_activity.clone();
         *inner = TlsPlaintextRuntimeSnapshot {
             mode: TlsPlaintextRuntimeMode::Disabled,
             reason: Some(disable_reason.into()),
+            provider_activity,
             reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::failure(
                 attempt_sequence,
                 observed_unix_ns,
@@ -515,6 +525,32 @@ impl TlsPlaintextRuntimeState {
             ),
             last_reconcile,
         };
+    }
+
+    fn record_provider_progress(&self) {
+        self.record_provider_progress_at(current_unix_time_ns());
+    }
+
+    fn record_provider_progress_at(&self, observed_unix_ns: u64) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.provider_activity.record_progress(observed_unix_ns);
+    }
+
+    fn record_provider_event(&self, event: &CaptureEvent) {
+        self.record_provider_event_at(event, current_unix_time_ns());
+    }
+
+    fn record_provider_event_at(&self, event: &CaptureEvent, observed_unix_ns: u64) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner
+            .provider_activity
+            .record_event(event, observed_unix_ns);
     }
 
     pub(crate) fn snapshot(&self) -> TlsPlaintextRuntimeSnapshot {
@@ -594,7 +630,7 @@ fn build_libssl_uprobe_plaintext_provider(
                 provider.with_output_selector(output_selector),
                 attach_planner,
                 Duration::from_millis(plan.tls.plaintext.instrumentation.reconcile_interval_ms),
-                Some(Box::new(LibsslRuntimeReconcileObserver {
+                Some(Box::new(LibsslRuntimeObserver {
                     runtime_state: runtime_state.cloned(),
                     attached_processes,
                 })),
@@ -635,13 +671,13 @@ impl TlsPlaintextInstrumentationBuild {
         provider: LibsslUprobePlaintextProvider,
         attach_planner: LibsslUprobeAttachPlanner,
         reconcile_interval: Duration,
-        reconcile_observer: Option<Box<dyn LibsslUprobePlaintextReconcileObserver>>,
+        observer: Option<Box<dyn LibsslUprobePlaintextSidecarObserver>>,
     ) -> Self {
         Self::Enabled(Box::new(LibsslUprobePlaintextSidecar::after(
             provider,
             attach_planner,
             reconcile_interval,
-            reconcile_observer,
+            observer,
         )))
     }
 
@@ -660,16 +696,6 @@ impl TlsPlaintextInstrumentationBuild {
     }
 }
 
-impl LibsslUprobePlaintextReconcileObserver for TlsPlaintextRuntimeState {
-    fn record_reconcile_success(&self, result: &LibsslUprobePlaintextReconcile) {
-        TlsPlaintextRuntimeState::record_reconcile_success(self, result.clone());
-    }
-
-    fn record_reconcile_failure(&self, failure: LibsslUprobePlaintextReconcileFailure) {
-        record_runtime_reconcile_failure(self, failure);
-    }
-}
-
 fn current_unix_time_ns() -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -678,12 +704,12 @@ fn current_unix_time_ns() -> u64 {
     u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
-struct LibsslRuntimeReconcileObserver {
+struct LibsslRuntimeObserver {
     runtime_state: Option<TlsPlaintextRuntimeState>,
     attached_processes: AttachedLibsslProcessRegistry,
 }
 
-impl LibsslUprobePlaintextReconcileObserver for LibsslRuntimeReconcileObserver {
+impl LibsslUprobePlaintextSidecarObserver for LibsslRuntimeObserver {
     fn record_reconcile_success(&self, result: &LibsslUprobePlaintextReconcile) {
         self.attached_processes.replace_from_reconcile(result);
         if let Some(runtime_state) = &self.runtime_state {
@@ -694,6 +720,18 @@ impl LibsslUprobePlaintextReconcileObserver for LibsslRuntimeReconcileObserver {
     fn record_reconcile_failure(&self, failure: LibsslUprobePlaintextReconcileFailure) {
         if let Some(runtime_state) = &self.runtime_state {
             record_runtime_reconcile_failure(runtime_state, failure);
+        }
+    }
+
+    fn record_provider_progress(&self) {
+        if let Some(runtime_state) = &self.runtime_state {
+            runtime_state.record_provider_progress();
+        }
+    }
+
+    fn record_provider_event(&self, event: &CaptureEvent) {
+        if let Some(runtime_state) = &self.runtime_state {
+            runtime_state.record_provider_event(event);
         }
     }
 }

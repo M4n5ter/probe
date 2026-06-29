@@ -382,6 +382,7 @@ mod tests {
         let runtime = TlsPlaintextRuntimeSnapshot {
             mode: TlsPlaintextRuntimeMode::Enabled,
             reason: None,
+            provider_activity: Default::default(),
             reconcile_health: TlsPlaintextReconcileHealthRuntimeSnapshot::failure(
                 5,
                 100,

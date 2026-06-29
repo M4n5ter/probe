@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use capture::{
-    CaptureError, CapturePoll, CaptureProvider, LibsslUprobeAttachPlan,
+    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, LibsslUprobeAttachPlan,
     LibsslUprobePlaintextProvider, LibsslUprobePlaintextReconcile,
 };
 use probe_core::CapabilityState;
@@ -24,9 +24,11 @@ impl LibsslUprobePlaintextSidecarProvider for LibsslUprobePlaintextProvider {
     }
 }
 
-pub(super) trait LibsslUprobePlaintextReconcileObserver {
-    fn record_reconcile_success(&self, result: &LibsslUprobePlaintextReconcile);
-    fn record_reconcile_failure(&self, failure: LibsslUprobePlaintextReconcileFailure);
+pub(super) trait LibsslUprobePlaintextSidecarObserver {
+    fn record_reconcile_success(&self, _result: &LibsslUprobePlaintextReconcile) {}
+    fn record_reconcile_failure(&self, _failure: LibsslUprobePlaintextReconcileFailure) {}
+    fn record_provider_progress(&self) {}
+    fn record_provider_event(&self, _event: &CaptureEvent) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +70,7 @@ where
     provider: P,
     planner: LibsslUprobeAttachPlanner,
     schedule: FixedIntervalSchedule,
-    reconcile_observer: Option<Box<dyn LibsslUprobePlaintextReconcileObserver>>,
+    observer: Option<Box<dyn LibsslUprobePlaintextSidecarObserver>>,
 }
 
 impl LibsslUprobePlaintextSidecar<LibsslUprobePlaintextProvider> {
@@ -76,13 +78,13 @@ impl LibsslUprobePlaintextSidecar<LibsslUprobePlaintextProvider> {
         provider: LibsslUprobePlaintextProvider,
         planner: LibsslUprobeAttachPlanner,
         interval: Duration,
-        reconcile_observer: Option<Box<dyn LibsslUprobePlaintextReconcileObserver>>,
+        observer: Option<Box<dyn LibsslUprobePlaintextSidecarObserver>>,
     ) -> Self {
         Self {
             provider,
             planner,
             schedule: FixedIntervalSchedule::after(interval),
-            reconcile_observer,
+            observer,
         }
     }
 }
@@ -96,13 +98,13 @@ where
         provider: P,
         planner: LibsslUprobeAttachPlanner,
         schedule: FixedIntervalSchedule,
-        reconcile_observer: Option<Box<dyn LibsslUprobePlaintextReconcileObserver>>,
+        observer: Option<Box<dyn LibsslUprobePlaintextSidecarObserver>>,
     ) -> Self {
         Self {
             provider,
             planner,
             schedule,
-            reconcile_observer,
+            observer,
         }
     }
 
@@ -125,7 +127,7 @@ where
         };
         match self.provider.reconcile_libssl_uprobes(next_plan) {
             Ok(reconcile) => {
-                if let Some(observer) = &self.reconcile_observer {
+                if let Some(observer) = &self.observer {
                     observer.record_reconcile_success(&reconcile);
                 }
                 Ok(())
@@ -152,8 +154,19 @@ where
     }
 
     fn record_reconcile_failure(&self, failure: LibsslUprobePlaintextReconcileFailure) {
-        if let Some(observer) = &self.reconcile_observer {
+        if let Some(observer) = &self.observer {
             observer.record_reconcile_failure(failure);
+        }
+    }
+
+    fn record_provider_poll(&self, poll: &CapturePoll) {
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        match poll {
+            CapturePoll::Event(event) => observer.record_provider_event(event),
+            CapturePoll::Progress => observer.record_provider_progress(),
+            CapturePoll::Idle | CapturePoll::Finished => {}
         }
     }
 }
@@ -178,7 +191,9 @@ where
 
     fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
         self.reconcile_if_due()?;
-        self.provider.poll_next()
+        let poll = self.provider.poll_next()?;
+        self.record_provider_poll(&poll);
+        Ok(poll)
     }
 }
 
@@ -414,6 +429,31 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_reports_provider_progress_to_observer() -> Result<(), Box<dyn std::error::Error>> {
+        let observed_progress = Rc::new(Cell::new(0));
+        let observed_events = Rc::new(Cell::new(0));
+        let mut sidecar = LibsslUprobePlaintextSidecar::with_schedule(
+            ProgressSidecarProvider,
+            LibsslUprobeAttachPlanner::from_results([Ok(empty_attach_plan())]),
+            FixedIntervalSchedule::due_at(
+                Duration::from_secs(60),
+                Instant::now() + Duration::from_secs(60),
+            ),
+            Some(Box::new(FakeProviderObserver {
+                observed_progress: Rc::clone(&observed_progress),
+                observed_events: Rc::clone(&observed_events),
+            })),
+        );
+
+        let poll = sidecar.poll_next()?;
+
+        assert_eq!(poll, CapturePoll::Progress);
+        assert_eq!(observed_progress.get(), 1);
+        assert_eq!(observed_events.get(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn sidecar_reports_failed_reconcile_to_observer() {
         let observed_success = Rc::new(RefCell::new(None));
         let observed_failure = Rc::new(RefCell::new(None));
@@ -455,13 +495,55 @@ mod tests {
         observed_failure: Rc<RefCell<Option<LibsslUprobePlaintextReconcileFailure>>>,
     }
 
-    impl LibsslUprobePlaintextReconcileObserver for FakeReconcileObserver {
+    struct FakeProviderObserver {
+        observed_progress: Rc<Cell<u64>>,
+        observed_events: Rc<Cell<u64>>,
+    }
+
+    impl LibsslUprobePlaintextSidecarObserver for FakeReconcileObserver {
         fn record_reconcile_success(&self, result: &LibsslUprobePlaintextReconcile) {
             *self.observed_success.borrow_mut() = Some(result.clone());
         }
 
         fn record_reconcile_failure(&self, failure: LibsslUprobePlaintextReconcileFailure) {
             *self.observed_failure.borrow_mut() = Some(failure);
+        }
+    }
+
+    impl LibsslUprobePlaintextSidecarObserver for FakeProviderObserver {
+        fn record_provider_progress(&self) {
+            self.observed_progress
+                .set(self.observed_progress.get().saturating_add(1));
+        }
+
+        fn record_provider_event(&self, _event: &CaptureEvent) {
+            self.observed_events
+                .set(self.observed_events.get().saturating_add(1));
+        }
+    }
+
+    struct ProgressSidecarProvider;
+
+    impl LibsslUprobePlaintextSidecarProvider for ProgressSidecarProvider {
+        fn reconcile_libssl_uprobes(
+            &mut self,
+            _next_plan: LibsslUprobeAttachPlan,
+        ) -> Result<LibsslUprobePlaintextReconcile, CaptureError> {
+            Ok(empty_reconcile_result())
+        }
+    }
+
+    impl CaptureProvider for ProgressSidecarProvider {
+        fn name(&self) -> &'static str {
+            "progress_tls_sidecar"
+        }
+
+        fn capabilities(&self) -> Vec<CapabilityState> {
+            Vec::new()
+        }
+
+        fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(CapturePoll::Progress)
         }
     }
 

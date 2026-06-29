@@ -9,6 +9,10 @@ use crate::{
         L7MitmRuntimeSnapshot,
     },
     tcp_health::{TcpHealthMode, TcpHealthSnapshot},
+    tls_plaintext::{
+        TlsPlaintextProviderActivityRuntimeSnapshot, TlsPlaintextProviderSignalRuntimeSnapshot,
+        TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot,
+    },
     transparent_interception::TransparentProxyRuntimeSnapshot,
 };
 
@@ -24,6 +28,7 @@ pub struct MetricsSnapshot {
     pub export: ExportMetricsSnapshot,
     pub l7_mitm: Option<L7MitmMetricsSnapshot>,
     pub transparent_proxy: Option<TransparentProxyMetricsSnapshot>,
+    pub tls_plaintext: Option<TlsPlaintextMetricsSnapshot>,
     pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
 }
 
@@ -90,29 +95,56 @@ pub struct TransparentProxyUpstreamConnectMetricsSnapshot {
     pub connect_failures: u64,
 }
 
-pub(in crate::status) fn metrics_snapshot(
-    capabilities: &CapabilityMatrix,
-    spool: &SpoolStatusSnapshot,
-    exporters: &[ExporterStatusSnapshot],
-    export_worker: Option<&ExportWorkerRuntimeSnapshot>,
-    l7_mitm: Option<L7MitmRuntimeSnapshot>,
-    transparent_proxy: Option<TransparentProxyRuntimeSnapshot>,
-    pipeline: Option<PipelineRuntimeMetricsSnapshot>,
-) -> MetricsSnapshot {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextMetricsSnapshot {
+    pub provider_activity: TlsPlaintextProviderActivityMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextProviderActivityMetricsSnapshot {
+    pub progress_signals: u64,
+    pub capture_events: u64,
+    pub output_loss_events: u64,
+    pub lost_events: u64,
+    pub last_signal: Option<TlsPlaintextProviderSignalMetricsSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextProviderSignalMetricsSnapshot {
+    pub kind: &'static str,
+    pub sequence: u64,
+    pub observed_unix_ns: u64,
+}
+
+pub(in crate::status) struct MetricsSnapshotInput<'a> {
+    pub capabilities: &'a CapabilityMatrix,
+    pub spool: &'a SpoolStatusSnapshot,
+    pub exporters: &'a [ExporterStatusSnapshot],
+    pub export_worker: Option<&'a ExportWorkerRuntimeSnapshot>,
+    pub l7_mitm: Option<L7MitmRuntimeSnapshot>,
+    pub transparent_proxy: Option<TransparentProxyRuntimeSnapshot>,
+    pub tls_plaintext: Option<TlsPlaintextRuntimeSnapshot>,
+    pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
+}
+
+pub(in crate::status) fn metrics_snapshot(input: MetricsSnapshotInput<'_>) -> MetricsSnapshot {
     MetricsSnapshot {
-        capabilities: capability_metrics(capabilities),
+        capabilities: capability_metrics(input.capabilities),
         spool: SpoolMetricsSnapshot {
-            ingress_last_sequence: spool.ingress_last_sequence,
-            export_last_sequence: spool.export_last_sequence,
+            ingress_last_sequence: input.spool.ingress_last_sequence,
+            export_last_sequence: input.spool.export_last_sequence,
         },
         export: ExportMetricsSnapshot {
-            sink_count: exporters.len() as u64,
-            total_lag: total_export_lag(exporters),
-            backing_off_sink_count: export_worker.map(|_| backing_off_exporter_count(exporters)),
+            sink_count: input.exporters.len() as u64,
+            total_lag: total_export_lag(input.exporters),
+            backing_off_sink_count: input
+                .export_worker
+                .map(|_| backing_off_exporter_count(input.exporters)),
         },
-        l7_mitm: l7_mitm.map(l7_mitm_metrics),
-        transparent_proxy: transparent_proxy.map(transparent_proxy_metrics),
-        pipeline,
+        l7_mitm: input.l7_mitm.map(l7_mitm_metrics),
+        transparent_proxy: input.transparent_proxy.map(transparent_proxy_metrics),
+        tls_plaintext: input.tls_plaintext.and_then(tls_plaintext_metrics),
+        pipeline: input.pipeline,
     }
 }
 
@@ -152,6 +184,42 @@ fn tcp_health_metrics(health: TcpHealthSnapshot) -> TcpHealthMetricsSnapshot {
         check_successes: health.check_successes,
         check_failures: health.check_failures,
         consecutive_failures: health.consecutive_failures,
+    }
+}
+
+fn tls_plaintext_metrics(
+    runtime: TlsPlaintextRuntimeSnapshot,
+) -> Option<TlsPlaintextMetricsSnapshot> {
+    if runtime.mode == TlsPlaintextRuntimeMode::NotConfigured {
+        return None;
+    }
+    Some(TlsPlaintextMetricsSnapshot {
+        provider_activity: tls_plaintext_provider_activity_metrics(runtime.provider_activity),
+    })
+}
+
+fn tls_plaintext_provider_activity_metrics(
+    activity: TlsPlaintextProviderActivityRuntimeSnapshot,
+) -> TlsPlaintextProviderActivityMetricsSnapshot {
+    TlsPlaintextProviderActivityMetricsSnapshot {
+        progress_signals: activity.progress_signals,
+        capture_events: activity.capture_events,
+        output_loss_events: activity.output_loss_events,
+        lost_events: activity.lost_events,
+        last_signal: activity
+            .last_signal
+            .as_ref()
+            .map(tls_plaintext_provider_signal_metrics),
+    }
+}
+
+fn tls_plaintext_provider_signal_metrics(
+    signal: &TlsPlaintextProviderSignalRuntimeSnapshot,
+) -> TlsPlaintextProviderSignalMetricsSnapshot {
+    TlsPlaintextProviderSignalMetricsSnapshot {
+        kind: signal.kind(),
+        sequence: signal.sequence(),
+        observed_unix_ns: signal.observed_unix_ns(),
     }
 }
 
