@@ -139,7 +139,8 @@ pub const EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME: &str = "TRAFFIC_PROBE_PROCESS_OUT
 pub const EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES: u32 = 1;
 pub const EBPF_PROCESS_OUTPUT_LOSS_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
 pub const EBPF_PROCESS_OUTPUT_LOSS_VALUE_BYTES: u32 = core::mem::size_of::<u64>() as u32;
-pub const EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN: u32 = 1;
+pub const EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN: u32 = 1 << 0;
+pub const EBPF_PENDING_SOCKET_READ_SOURCE_IOVEC: u32 = 1 << 1;
 
 pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 29] = [
     EbpfProcessTracepointSpec {
@@ -721,6 +722,8 @@ mod tests {
 
     #[test]
     fn pending_socket_read_attempt_layout_is_stable() {
+        assert_eq!(EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN, 1 << 0);
+        assert_eq!(EBPF_PENDING_SOCKET_READ_SOURCE_IOVEC, 1 << 1);
         assert_eq!(size_of::<EbpfPendingSocketReadAttempt>(), 24);
         assert_eq!(align_of::<EbpfPendingSocketReadAttempt>(), 8);
         assert_eq!(offset_of!(EbpfPendingSocketReadAttempt, fd), 0);

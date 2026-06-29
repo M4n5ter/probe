@@ -25,6 +25,35 @@ pub(crate) struct PayloadBufferAttempt {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PayloadIovecAttempt {
+    pub fd: i32,
+    pub user_iovec: u64,
+    pub iovlen: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayloadSamplePlan {
+    Buffer(PayloadBufferAttempt),
+    Iovec(PayloadIovecAttempt),
+}
+
+impl PayloadSamplePlan {
+    pub(crate) fn fd(self) -> i32 {
+        match self {
+            Self::Buffer(attempt) => attempt.fd,
+            Self::Iovec(attempt) => attempt.fd,
+        }
+    }
+
+    pub(crate) fn logical_len(self) -> PayloadLogicalLen {
+        match self {
+            Self::Buffer(attempt) => attempt.logical_len,
+            Self::Iovec(_) => PayloadLogicalLen::UnknownUntilExit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PayloadLogicalLen {
     Known(u64),
     UnknownUntilExit,
@@ -103,65 +132,37 @@ pub(crate) fn msghdr_payload_source_from_tracepoint(
 }
 
 #[inline(always)]
-pub(crate) fn payload_buffer_attempt_from_source(
+pub(crate) fn payload_sample_plan_from_source(
     source: PayloadAttemptSource,
-) -> Option<PayloadBufferAttempt> {
+) -> Option<PayloadSamplePlan> {
     match source.kind {
-        PayloadAttemptKind::SingleBuffer => Some(PayloadBufferAttempt {
+        PayloadAttemptKind::SingleBuffer => Some(PayloadSamplePlan::Buffer(PayloadBufferAttempt {
             fd: source.fd,
             user_buffer: source.user_pointer,
             readable_len: source.count,
             logical_len: PayloadLogicalLen::Known(source.count),
-        }),
+        })),
         PayloadAttemptKind::Iovec => {
-            first_non_empty_iovec_payload_attempt(source.fd, source.user_pointer, source.count)
+            iovec_payload_attempt(source.fd, source.user_pointer, source.count)
         }
         PayloadAttemptKind::Msghdr => {
             let user_iovec = read_user_u64(source.user_pointer + USER_MSGHDR_IOV_OFFSET)?;
             let iovlen = read_user_u64(source.user_pointer + USER_MSGHDR_IOVLEN_OFFSET)?;
-            first_non_empty_iovec_payload_attempt(source.fd, user_iovec, iovlen)
+            iovec_payload_attempt(source.fd, user_iovec, iovlen)
         }
     }
 }
 
 #[inline(always)]
-fn first_non_empty_iovec_payload_attempt(
-    fd: i32,
-    user_iovec: u64,
-    iovlen: u64,
-) -> Option<PayloadBufferAttempt> {
+fn iovec_payload_attempt(fd: i32, user_iovec: u64, iovlen: u64) -> Option<PayloadSamplePlan> {
     if user_iovec == 0 || iovlen == 0 {
         return None;
     }
-    let iovecs_to_scan = core::cmp::min(iovlen, PAYLOAD_IOVEC_SCAN_LIMIT);
-    let mut index = 0u64;
-    while index < PAYLOAD_IOVEC_SCAN_LIMIT {
-        if index >= iovecs_to_scan {
-            break;
-        }
-        let iovec_address = user_iovec.checked_add(index.saturating_mul(USER_IOVEC_BYTES))?;
-        let user_buffer = read_user_u64(iovec_address + USER_IOVEC_BASE_OFFSET)?;
-        let readable_len = read_user_u64(iovec_address + USER_IOVEC_LEN_OFFSET)?;
-        if readable_len == 0 {
-            index += 1;
-            continue;
-        }
-        if user_buffer == 0 {
-            return None;
-        }
-        return Some(PayloadBufferAttempt {
-            fd,
-            user_buffer,
-            readable_len,
-            logical_len: PayloadLogicalLen::UnknownUntilExit,
-        });
-    }
-    Some(PayloadBufferAttempt {
+    Some(PayloadSamplePlan::Iovec(PayloadIovecAttempt {
         fd,
-        user_buffer: 0,
-        readable_len: 0,
-        logical_len: PayloadLogicalLen::UnknownUntilExit,
-    })
+        user_iovec,
+        iovlen,
+    }))
 }
 
 pub(crate) fn syscall_result_from_tracepoint(ctx: &TracePointContext) -> Option<i64> {
@@ -239,6 +240,93 @@ pub(crate) fn read_payload_prefix_from_attempt<const SAMPLE_BYTES: usize>(
     )
 }
 
+#[inline(always)]
+pub(crate) fn read_payload_prefix_from_plan<const SAMPLE_BYTES: usize>(
+    plan: PayloadSamplePlan,
+    expected_len_or_zero: u32,
+    buffer: &mut [u8; SAMPLE_BYTES],
+    flags: &mut u16,
+    read_flag_bits: u32,
+) -> u16 {
+    match plan {
+        PayloadSamplePlan::Buffer(attempt) => read_payload_prefix_from_attempt(
+            attempt,
+            expected_len_or_zero,
+            buffer,
+            flags,
+            read_flag_bits,
+        ),
+        PayloadSamplePlan::Iovec(attempt) => read_payload_prefix_from_iovec(
+            attempt,
+            expected_len_or_zero,
+            buffer,
+            flags,
+            read_flag_bits,
+        ),
+    }
+}
+
+#[inline(always)]
+pub(crate) fn read_payload_prefix_from_iovec<const SAMPLE_BYTES: usize>(
+    attempt: PayloadIovecAttempt,
+    expected_len_or_zero: u32,
+    buffer: &mut [u8; SAMPLE_BYTES],
+    flags: &mut u16,
+    read_flag_bits: u32,
+) -> u16 {
+    let truncated_flag = (read_flag_bits & 0xffff) as u16;
+    let read_failed_flag = (read_flag_bits >> 16) as u16;
+    let sample_capacity = clamp_usize_to_u32(SAMPLE_BYTES);
+    let copy_limit = if expected_len_or_zero == 0 {
+        sample_capacity
+    } else {
+        core::cmp::min(expected_len_or_zero, sample_capacity)
+    };
+    if copy_limit == 0 {
+        return 0;
+    }
+
+    let iovecs_to_scan = core::cmp::min(attempt.iovlen, PAYLOAD_IOVEC_SCAN_LIMIT);
+    let mut index = 0u64;
+    let mut captured_len = 0u32;
+    while index < PAYLOAD_IOVEC_SCAN_LIMIT {
+        if index >= iovecs_to_scan || captured_len >= copy_limit {
+            break;
+        }
+        let Some((user_buffer, readable_len)) = read_iovec_entry(attempt.user_iovec, index) else {
+            *flags |= read_failed_flag;
+            return 0;
+        };
+        if readable_len == 0 {
+            index += 1;
+            continue;
+        }
+        if user_buffer == 0 {
+            *flags |= read_failed_flag;
+            return 0;
+        }
+        let remaining_len = copy_limit.saturating_sub(captured_len);
+        let readable_len = core::cmp::min(clamp_u64_to_u32(readable_len), remaining_len);
+        if readable_len == 0 {
+            index += 1;
+            continue;
+        }
+        let read_result =
+            append_user_payload_prefix(user_buffer, captured_len, readable_len, buffer);
+        if read_result != 0 {
+            *flags |= read_failed_flag;
+            return 0;
+        }
+        captured_len = captured_len.saturating_add(readable_len);
+        index += 1;
+    }
+
+    if expected_len_or_zero != 0 && captured_len < expected_len_or_zero {
+        *flags |= truncated_flag;
+    }
+    captured_len as u16
+}
+
 pub(crate) fn clamp_u64_to_u32(value: u64) -> u32 {
     core::cmp::min(value, u64::from(u32::MAX)) as u32
 }
@@ -252,10 +340,85 @@ fn read_user_u64(address: u64) -> Option<u64> {
     Some(u64::from_ne_bytes(bytes))
 }
 
+fn read_iovec_entry(user_iovec: u64, index: u64) -> Option<(u64, u64)> {
+    let iovec_address = user_iovec.checked_add(index.saturating_mul(USER_IOVEC_BYTES))?;
+    let user_buffer = read_user_u64(iovec_address + USER_IOVEC_BASE_OFFSET)?;
+    let readable_len = read_user_u64(iovec_address + USER_IOVEC_LEN_OFFSET)?;
+    Some((user_buffer, readable_len))
+}
+
 fn read_user_bytes<const N: usize>(address: u64) -> Option<[u8; N]> {
     let mut bytes = [0; N];
     unsafe { bpf_probe_read_user_buf(address as *const u8, &mut bytes) }.ok()?;
     Some(bytes)
+}
+
+#[inline(always)]
+fn append_user_payload_prefix<const SAMPLE_BYTES: usize>(
+    user_buffer: u64,
+    captured_offset: u32,
+    captured_len: u32,
+    buffer: &mut [u8; SAMPLE_BYTES],
+) -> i64 {
+    if captured_len == 0 {
+        return 0;
+    }
+    let sample_capacity = clamp_usize_to_u32(SAMPLE_BYTES);
+    let Some(end) = captured_offset.checked_add(captured_len) else {
+        return -1;
+    };
+    if end > sample_capacity {
+        return -1;
+    }
+    let base = buffer.as_mut_ptr();
+    let mut index = 0u32;
+    while index < sample_capacity {
+        if index >= captured_len {
+            break;
+        }
+        let Some(source) = user_buffer.checked_add(u64::from(index)) else {
+            return -1;
+        };
+        let mut byte = 0u8;
+        let read_result = unsafe {
+            r#gen::bpf_probe_read_user(
+                core::ptr::addr_of_mut!(byte) as *mut c_void,
+                1,
+                source as *const c_void,
+            )
+        };
+        if read_result != 0 {
+            return read_result;
+        }
+        let Some(output_offset) = captured_offset.checked_add(index) else {
+            return -1;
+        };
+        if output_offset >= sample_capacity {
+            return -1;
+        }
+        let bounded_output_offset = output_offset as u8;
+        if !write_payload_byte::<SAMPLE_BYTES>(base, bounded_output_offset, byte) {
+            return -1;
+        }
+        index = index.saturating_add(1);
+    }
+    0
+}
+
+#[inline(never)]
+fn write_payload_byte<const SAMPLE_BYTES: usize>(
+    base: *mut u8,
+    output_offset: u8,
+    byte: u8,
+) -> bool {
+    let output_offset = u32::from(output_offset);
+    if output_offset >= clamp_usize_to_u32(SAMPLE_BYTES) {
+        return false;
+    }
+    unsafe {
+        *base.add(output_offset as usize) = byte;
+    }
+    true
 }
 
 fn tracepoint_u64(ctx: &TracePointContext, offset: usize) -> Option<u64> {

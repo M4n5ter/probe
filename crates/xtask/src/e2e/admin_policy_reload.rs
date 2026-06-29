@@ -170,7 +170,8 @@ hooks = ["on_http_request_headers"]
             r#"
 function on_http_request_headers(event)
   local target = event.kind.target or ""
-  if string.sub(target, 1, 10) == "/traffic-probe-e2e/" then
+  local prefix = "/traffic-probe-e2e/"
+  if string.sub(target, 1, #prefix) == prefix then
     return probe.emit_alert("{alert_prefix}" .. target)
   end
 end

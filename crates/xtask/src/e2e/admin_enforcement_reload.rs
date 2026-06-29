@@ -201,7 +201,8 @@ hooks = ["on_http_request_headers"]
             r#"
 function on_http_request_headers(event)
   local target = event.kind.target or ""
-  if string.sub(target, 1, 10) ~= "/traffic-probe-e2e/" then
+  local prefix = "/traffic-probe-e2e/"
+  if string.sub(target, 1, #prefix) ~= prefix then
     return nil
   end
   local local_port = event.flow.local_endpoint.port or 0

@@ -5,9 +5,9 @@ use ebpf_abi::{
 };
 
 use super::payload::{
-    PayloadAttemptSource, PayloadBufferAttempt, PayloadLogicalLen, clamp_u64_to_u32,
+    PayloadAttemptSource, PayloadLogicalLen, PayloadSamplePlan, clamp_u64_to_u32,
     iovec_payload_source_from_tracepoint, msghdr_payload_source_from_tracepoint,
-    payload_buffer_attempt_from_source, payload_read_flag_bits, read_payload_prefix_from_attempt,
+    payload_read_flag_bits, payload_sample_plan_from_source, read_payload_prefix_from_plan,
     single_buffer_payload_source_from_tracepoint, syscall_result_from_tracepoint,
 };
 
@@ -33,24 +33,24 @@ pub(crate) fn capture_write_sample_from_source(
     source: PayloadAttemptSource,
     pending: &mut EbpfPendingSocketWriteSample,
 ) -> Option<()> {
-    let attempt = payload_buffer_attempt_from_source(source)?;
-    capture_write_sample_from_attempt(attempt, pending);
+    let plan = payload_sample_plan_from_source(source)?;
+    capture_write_sample_from_plan(plan, pending);
     Some(())
 }
 
-fn capture_write_sample_from_attempt(
-    attempt: PayloadBufferAttempt,
+fn capture_write_sample_from_plan(
+    plan: PayloadSamplePlan,
     pending: &mut EbpfPendingSocketWriteSample,
 ) {
     let mut flags = 0;
-    let expected_len = match attempt.logical_len {
+    let expected_len = match plan.logical_len() {
         PayloadLogicalLen::Known(logical_len) => Some(clamp_u64_to_u32(logical_len)),
         PayloadLogicalLen::UnknownUntilExit => None,
     };
     let pending_original_len = expected_len.unwrap_or(0);
-    reset_pending_write_sample(pending, attempt.fd, pending_original_len, 0, flags);
-    pending.captured_len = read_payload_prefix_from_attempt(
-        attempt,
+    reset_pending_write_sample(pending, plan.fd(), pending_original_len, 0, flags);
+    pending.captured_len = read_payload_prefix_from_plan(
+        plan,
         expected_len.unwrap_or(0),
         &mut pending.buffer,
         &mut flags,

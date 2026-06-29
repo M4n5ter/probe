@@ -1,14 +1,15 @@
 use aya_ebpf::programs::TracePointContext;
 use ebpf_abi::{
-    EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN, EBPF_SOCKET_READ_READ_FAILED,
-    EBPF_SOCKET_READ_TRUNCATED, EbpfPendingSocketReadAttempt, EbpfSocketReadMetadata,
-    EbpfSocketReadSampleRecord,
+    EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN, EBPF_PENDING_SOCKET_READ_SOURCE_IOVEC,
+    EBPF_SOCKET_READ_READ_FAILED, EBPF_SOCKET_READ_TRUNCATED, EbpfPendingSocketReadAttempt,
+    EbpfSocketReadMetadata, EbpfSocketReadSampleRecord,
 };
 
 use super::payload::{
-    PayloadAttemptSource, PayloadBufferAttempt, PayloadLogicalLen, clamp_u64_to_u32,
-    iovec_payload_source_from_tracepoint, msghdr_payload_source_from_tracepoint,
-    payload_buffer_attempt_from_source, payload_read_flag_bits, read_payload_prefix_from_attempt,
+    PayloadAttemptSource, PayloadBufferAttempt, PayloadIovecAttempt, PayloadLogicalLen,
+    PayloadSamplePlan, clamp_u64_to_u32, iovec_payload_source_from_tracepoint,
+    msghdr_payload_source_from_tracepoint, payload_read_flag_bits, payload_sample_plan_from_source,
+    read_payload_prefix_from_attempt, read_payload_prefix_from_iovec,
     single_buffer_payload_source_from_tracepoint, syscall_result_from_tracepoint,
 };
 
@@ -31,11 +32,18 @@ pub(crate) fn recvmsg_source_from_tracepoint(
 pub(crate) fn pending_read_attempt_from_source(
     source: PayloadAttemptSource,
 ) -> Option<EbpfPendingSocketReadAttempt> {
-    let attempt = payload_buffer_attempt_from_source(source)?;
-    Some(pending_read_attempt(attempt))
+    let plan = payload_sample_plan_from_source(source)?;
+    Some(pending_read_attempt(plan))
 }
 
-fn pending_read_attempt(attempt: PayloadBufferAttempt) -> EbpfPendingSocketReadAttempt {
+fn pending_read_attempt(plan: PayloadSamplePlan) -> EbpfPendingSocketReadAttempt {
+    match plan {
+        PayloadSamplePlan::Buffer(attempt) => pending_read_buffer_attempt(attempt),
+        PayloadSamplePlan::Iovec(attempt) => pending_read_iovec_attempt(attempt),
+    }
+}
+
+fn pending_read_buffer_attempt(attempt: PayloadBufferAttempt) -> EbpfPendingSocketReadAttempt {
     let (requested_len, logical_len_flags) = match attempt.logical_len {
         PayloadLogicalLen::Known(logical_len) => (clamp_u64_to_u32(logical_len), 0),
         PayloadLogicalLen::UnknownUntilExit => (0, EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN),
@@ -46,6 +54,17 @@ fn pending_read_attempt(attempt: PayloadBufferAttempt) -> EbpfPendingSocketReadA
         readable_len: clamp_u64_to_u32(attempt.readable_len),
         logical_len_flags,
         user_buffer: attempt.user_buffer,
+    }
+}
+
+fn pending_read_iovec_attempt(attempt: PayloadIovecAttempt) -> EbpfPendingSocketReadAttempt {
+    EbpfPendingSocketReadAttempt {
+        fd: attempt.fd,
+        requested_len: 0,
+        readable_len: clamp_u64_to_u32(attempt.iovlen),
+        logical_len_flags: EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN
+            | EBPF_PENDING_SOCKET_READ_SOURCE_IOVEC,
+        user_buffer: attempt.user_iovec,
     }
 }
 
@@ -64,18 +83,7 @@ pub(crate) fn capture_read_sample_from_result(
     }
     let mut flags = 0;
     event.clear_sample();
-    let captured_len = read_payload_prefix_from_attempt(
-        PayloadBufferAttempt {
-            fd: attempt.fd,
-            user_buffer: attempt.user_buffer,
-            readable_len: u64::from(attempt.readable_len),
-            logical_len: PayloadLogicalLen::Known(u64::from(original_len)),
-        },
-        original_len,
-        event.socket_read_buffer_mut(),
-        &mut flags,
-        payload_read_flag_bits(EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_READ_READ_FAILED),
-    );
+    let captured_len = capture_read_payload_prefix(attempt, original_len, event, &mut flags);
     event.overwrite_socket_read_sampled_metadata(
         super::process_metadata(ctx),
         EbpfSocketReadMetadata {
@@ -86,6 +94,41 @@ pub(crate) fn capture_read_sample_from_result(
         flags,
     );
     Some(captured_len)
+}
+
+fn capture_read_payload_prefix(
+    attempt: EbpfPendingSocketReadAttempt,
+    original_len: u32,
+    event: &mut EbpfSocketReadSampleRecord,
+    flags: &mut u16,
+) -> u16 {
+    let read_flag_bits =
+        payload_read_flag_bits(EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_READ_READ_FAILED);
+    if attempt.logical_len_flags & EBPF_PENDING_SOCKET_READ_SOURCE_IOVEC != 0 {
+        return read_payload_prefix_from_iovec(
+            PayloadIovecAttempt {
+                fd: attempt.fd,
+                user_iovec: attempt.user_buffer,
+                iovlen: u64::from(attempt.readable_len),
+            },
+            original_len,
+            event.socket_read_buffer_mut(),
+            flags,
+            read_flag_bits,
+        );
+    }
+    read_payload_prefix_from_attempt(
+        PayloadBufferAttempt {
+            fd: attempt.fd,
+            user_buffer: attempt.user_buffer,
+            readable_len: u64::from(attempt.readable_len),
+            logical_len: PayloadLogicalLen::Known(u64::from(original_len)),
+        },
+        original_len,
+        event.socket_read_buffer_mut(),
+        flags,
+        read_flag_bits,
+    )
 }
 
 fn read_original_len(attempt: EbpfPendingSocketReadAttempt, returned_len: i64) -> u32 {
@@ -115,6 +158,25 @@ mod tests {
         let attempt = pending_read(0, 0, EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN);
 
         assert_eq!(read_original_len(attempt, 9), 9);
+    }
+
+    #[test]
+    fn pending_iovec_attempt_keeps_iovec_source_for_exit_sampling() {
+        let attempt = pending_read_iovec_attempt(PayloadIovecAttempt {
+            fd: 7,
+            user_iovec: 0x1000,
+            iovlen: 9,
+        });
+
+        assert_eq!(attempt.fd, 7);
+        assert_eq!(attempt.requested_len, 0);
+        assert_eq!(attempt.readable_len, 9);
+        assert_eq!(
+            attempt.logical_len_flags,
+            EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN | EBPF_PENDING_SOCKET_READ_SOURCE_IOVEC
+        );
+        assert_eq!(attempt.user_buffer, 0x1000);
+        assert_eq!(read_original_len(attempt, 11), 11);
     }
 
     fn pending_read(
