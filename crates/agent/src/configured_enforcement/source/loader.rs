@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -6,7 +7,7 @@ use std::{
 use http::StatusCode;
 use probe_config::EnforcementPolicyManifest;
 use probe_http::HttpConnectionOptions;
-use runtime::EnforcementPolicySourcePlan;
+use runtime::{EnforcementPolicySourceKind, EnforcementPolicySourcePlan};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -150,6 +151,10 @@ pub enum EnforcementPolicySourceError {
     Symlink { path: PathBuf },
     #[error("enforcement policy source is not a regular file: {path}")]
     NotRegular { path: PathBuf },
+    #[error("enforcement policy source directory path is a symlink: {path}")]
+    DirectorySymlink { path: PathBuf },
+    #[error("enforcement policy source directory is not a directory: {path}")]
+    DirectoryNotDirectory { path: PathBuf },
     #[error("enforcement policy source is too large: {path} has {size} bytes, limit {limit}")]
     TooLarge {
         path: PathBuf,
@@ -246,8 +251,8 @@ pub async fn load_enforcement_policy_source_with_context(
 ) -> Result<Option<LoadedEnforcementPolicySource>, EnforcementPolicySourceError> {
     match source {
         EnforcementPolicySourcePlan::None => Ok(None),
-        EnforcementPolicySourcePlan::LocalManifest { path, .. } => {
-            let manifest = read_enforcement_policy_manifest(path)?;
+        EnforcementPolicySourcePlan::LocalManifest { source_kind, path } => {
+            let manifest = read_enforcement_policy_manifest_source(*source_kind, path)?;
             Ok(Some(LoadedEnforcementPolicySource::local(
                 path.clone(),
                 manifest,
@@ -278,8 +283,8 @@ pub fn inspect_enforcement_policy_source(
 ) -> EnforcementPolicySourceInspection {
     match source {
         EnforcementPolicySourcePlan::None => EnforcementPolicySourceInspection::NotConfigured,
-        EnforcementPolicySourcePlan::LocalManifest { path, .. } => {
-            match read_enforcement_policy_manifest(path) {
+        EnforcementPolicySourcePlan::LocalManifest { source_kind, path } => {
+            match read_enforcement_policy_manifest_source(*source_kind, path) {
                 Ok(manifest) => EnforcementPolicySourceInspection::LocalMetadata { manifest },
                 Err(error) => EnforcementPolicySourceInspection::Unavailable {
                     reason: error.to_string(),
@@ -294,6 +299,54 @@ pub fn inspect_enforcement_policy_source(
             max_body_bytes: max_body_bytes.get(),
         },
     }
+}
+
+fn read_enforcement_policy_manifest_source(
+    source_kind: EnforcementPolicySourceKind,
+    path: &Path,
+) -> Result<EnforcementPolicyManifest, EnforcementPolicySourceError> {
+    validate_local_manifest_source_path(source_kind, path)?;
+    read_enforcement_policy_manifest(path)
+}
+
+fn validate_local_manifest_source_path(
+    source_kind: EnforcementPolicySourceKind,
+    path: &Path,
+) -> Result<(), EnforcementPolicySourceError> {
+    if source_kind == EnforcementPolicySourceKind::Directory {
+        validate_manifest_directory(path)?;
+    }
+    Ok(())
+}
+
+fn validate_manifest_directory(path: &Path) -> Result<(), EnforcementPolicySourceError> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let metadata = fs::symlink_metadata(directory).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            EnforcementPolicySourceError::NotFound {
+                path: path.to_path_buf(),
+            }
+        } else {
+            EnforcementPolicySourceError::Inspect {
+                path: directory.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(EnforcementPolicySourceError::DirectorySymlink {
+            path: directory.to_path_buf(),
+        });
+    }
+    if !metadata.is_dir() {
+        return Err(EnforcementPolicySourceError::DirectoryNotDirectory {
+            path: directory.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 fn read_enforcement_policy_manifest(
@@ -419,6 +472,8 @@ fn enforcement_policy_file_error(error: BoundedFileError) -> EnforcementPolicySo
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::symlink;
+
     use probe_config::EnforcementPolicyManifest;
     use probe_core::{Action, ProtectiveActionProfile};
     use tokio::{
@@ -433,6 +488,30 @@ mod tests {
     use super::*;
 
     const TEST_REMOTE_BODY_LIMIT_BYTES: u64 = 4096;
+
+    #[tokio::test]
+    async fn directory_source_rejects_symlink_manifest_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let real_dir = temp.path().join("real.d");
+        let symlink_dir = temp.path().join("enforcement.d");
+        std::fs::create_dir_all(&real_dir)?;
+        write_enforcement_manifest(&real_dir.join("manifest.toml"))?;
+        symlink(&real_dir, &symlink_dir)?;
+
+        let error = load_enforcement_policy_source(&EnforcementPolicySourcePlan::LocalManifest {
+            source_kind: EnforcementPolicySourceKind::Directory,
+            path: symlink_dir.join("manifest.toml"),
+        })
+        .await
+        .expect_err("directory source must reject symlink manifest directory");
+
+        assert!(matches!(
+            error,
+            EnforcementPolicySourceError::DirectorySymlink { path } if path == symlink_dir
+        ));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn remote_source_fetches_and_validates_manifest() -> Result<(), Box<dyn std::error::Error>>
@@ -594,5 +673,16 @@ mod tests {
     fn test_body_limit(limit: u64) -> runtime::RemoteEnforcementPolicyBodyLimitBytes {
         runtime::RemoteEnforcementPolicyBodyLimitBytes::from_config(Some(limit))
             .expect("test remote body limit should be valid")
+    }
+
+    fn write_enforcement_manifest(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = EnforcementPolicyManifest {
+            id: "managed-apps".to_string(),
+            version: "test-version".to_string(),
+            selector: None,
+            protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
+        };
+        std::fs::write(path, toml::to_string(&manifest)?)?;
+        Ok(())
     }
 }

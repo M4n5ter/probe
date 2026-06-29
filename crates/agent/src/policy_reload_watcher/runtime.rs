@@ -2,27 +2,22 @@ use std::{
     collections::BTreeSet,
     fs, io,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use pipeline::PipelinePolicySet;
 use probe_config::{AgentConfig, PolicySourceConfig};
 use runtime::RuntimePlan;
 use thiserror::Error;
-use tokio::{
-    sync::{Notify, mpsc},
-    task::JoinHandle,
-};
 use tracing::{info, warn};
 
 use crate::policy_reload::{PolicyReloadGate, reload_policies};
-
-const WATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+use crate::reload_watcher::{
+    ReloadFuture, ReloadWatchPath, ReloadWatcherError, ReloadWatcherHandle, absolute_path,
+    spawn_reload_watcher,
+};
 
 #[derive(Debug, Error)]
 pub(crate) enum PolicyReloadWatcherError {
@@ -45,28 +40,12 @@ pub(crate) enum PolicyReloadWatcherError {
 }
 
 pub(crate) struct PolicyReloadWatcherHandle {
-    shutdown: WatcherShutdown,
-    task: JoinHandle<()>,
+    inner: ReloadWatcherHandle,
 }
 
 impl PolicyReloadWatcherHandle {
-    pub(crate) async fn stop(mut self) {
-        self.shutdown.request();
-        match tokio::time::timeout(WATCHER_SHUTDOWN_TIMEOUT, &mut self.task).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) if !error.is_cancelled() => {
-                warn!("policy reload watcher stopped with error: {error}");
-            }
-            Ok(Err(_)) => {}
-            Err(_) => {
-                self.task.abort();
-                if let Err(error) = self.task.await
-                    && !error.is_cancelled()
-                {
-                    warn!("policy reload watcher stopped with error: {error}");
-                }
-            }
-        }
+    pub(crate) async fn stop(self) {
+        self.inner.stop().await;
     }
 }
 
@@ -83,88 +62,56 @@ pub(crate) fn spawn_watcher(
         return Ok(None);
     }
     let watch_roots = local_policy_bundle_watch_roots(&targets);
+    let watch_paths = policy_reload_watch_paths(&watch_roots, &targets)?;
     let bundle_paths = Arc::new(
         targets
             .iter()
             .map(|target| target.bundle_path.clone())
             .collect::<Vec<_>>(),
     );
-
-    let (event_sender, event_receiver) = mpsc::channel(1);
-    let mut watcher = RecommendedWatcher::new(
-        {
-            let bundle_paths = Arc::clone(&bundle_paths);
-            move |event| {
-                if notify_event_requests_reload(event, &bundle_paths) {
-                    let _ = event_sender.try_send(());
-                }
-            }
-        },
-        Config::default().with_follow_symlinks(false),
-    )
-    .map_err(PolicyReloadWatcherError::Create)?;
-
-    for path in &watch_roots {
-        watcher
-            .watch(path, RecursiveMode::NonRecursive)
-            .map_err(|source| PolicyReloadWatcherError::WatchPath {
-                path: path.clone(),
-                source,
-            })?;
-    }
-    watch_initial_bundle_dirs(&mut watcher, &targets)?;
-
-    let shutdown = WatcherShutdown::default();
-    let task_shutdown = shutdown.clone();
     let debounce = Duration::from_millis(plan.config.policy_reload.debounce_ms);
-    let task = tokio::spawn(async move {
-        run_watcher(
-            watcher,
-            event_receiver,
-            WatcherReloadContext {
-                plan,
-                policy_set,
-                gate,
-                debounce,
-                targets,
-                shutdown: task_shutdown,
-            },
-        )
-        .await;
-    });
+    let inner = spawn_reload_watcher(
+        "policy reload watcher",
+        watch_paths,
+        debounce,
+        move |event| notify_event_requests_reload(event, &bundle_paths),
+        WatcherReloadContext {
+            plan,
+            policy_set,
+            gate,
+            targets,
+        },
+        reload_after_quiet_period,
+    )
+    .map_err(policy_reload_watcher_error)?;
 
-    Ok(Some(PolicyReloadWatcherHandle { shutdown, task }))
+    Ok(Some(PolicyReloadWatcherHandle { inner }))
 }
 
 struct WatcherReloadContext {
     plan: Arc<RuntimePlan>,
     policy_set: PipelinePolicySet,
     gate: PolicyReloadGate,
-    debounce: Duration,
     targets: Vec<LocalPolicyBundleWatchTarget>,
-    shutdown: WatcherShutdown,
 }
 
-async fn run_watcher(
-    mut watcher: RecommendedWatcher,
-    mut events: mpsc::Receiver<()>,
-    context: WatcherReloadContext,
-) {
-    while !context.shutdown.is_requested() {
-        tokio::select! {
-            event = events.recv() => {
-                if event.is_none() {
-                    break;
-                }
-                if !wait_for_quiet_period(&mut events, context.debounce, &context.shutdown).await {
-                    break;
-                }
-                refresh_bundle_dir_watches(&mut watcher, &context.targets);
-                reload_after_policy_change(&context).await;
-            }
-            () = context.shutdown.notified() => break,
+fn policy_reload_watcher_error(error: ReloadWatcherError) -> PolicyReloadWatcherError {
+    match error {
+        ReloadWatcherError::Create(source) => PolicyReloadWatcherError::Create(source),
+        ReloadWatcherError::WatchPath { path, source } => {
+            PolicyReloadWatcherError::WatchPath { path, source }
         }
     }
+}
+
+fn reload_after_quiet_period<'a>(
+    watcher: &'a mut RecommendedWatcher,
+    context: &'a WatcherReloadContext,
+) -> ReloadFuture<'a> {
+    Box::pin(async move {
+        refresh_bundle_dir_watches(watcher, &context.targets);
+        reload_after_policy_change(context).await;
+    })
 }
 
 fn notify_event_requests_reload(event: notify::Result<Event>, bundle_paths: &[PathBuf]) -> bool {
@@ -190,32 +137,6 @@ fn path_matches_any_bundle(path: &Path, bundle_paths: &[PathBuf]) -> bool {
     bundle_paths
         .iter()
         .any(|bundle| path.starts_with(bundle) || bundle.starts_with(path))
-}
-
-fn watch_initial_bundle_dirs(
-    watcher: &mut RecommendedWatcher,
-    targets: &[LocalPolicyBundleWatchTarget],
-) -> Result<(), PolicyReloadWatcherError> {
-    for target in targets {
-        let is_directory = is_non_symlink_directory(&target.bundle_path).map_err(|source| {
-            PolicyReloadWatcherError::InspectPath {
-                path: target.bundle_path.clone(),
-                source,
-            }
-        })?;
-        if !is_directory {
-            return Err(PolicyReloadWatcherError::InvalidBundleRoot {
-                path: target.bundle_path.clone(),
-            });
-        }
-        watcher
-            .watch(&target.bundle_path, RecursiveMode::Recursive)
-            .map_err(|source| PolicyReloadWatcherError::WatchPath {
-                path: target.bundle_path.clone(),
-                source,
-            })?;
-    }
-    Ok(())
 }
 
 fn refresh_bundle_dir_watches(
@@ -251,24 +172,6 @@ fn is_non_symlink_directory(path: &Path) -> Result<bool, io::Error> {
     Ok(metadata.is_dir())
 }
 
-async fn wait_for_quiet_period(
-    events: &mut mpsc::Receiver<()>,
-    debounce: Duration,
-    shutdown: &WatcherShutdown,
-) -> bool {
-    loop {
-        tokio::select! {
-            () = tokio::time::sleep(debounce) => return true,
-            event = events.recv() => {
-                if event.is_none() {
-                    return false;
-                }
-            }
-            () = shutdown.notified() => return false,
-        }
-    }
-}
-
 async fn reload_after_policy_change(context: &WatcherReloadContext) {
     match reload_policies(&context.plan, &context.policy_set, &context.gate).await {
         Ok(summary) => {
@@ -287,30 +190,6 @@ async fn reload_after_policy_change(context: &WatcherReloadContext) {
 struct LocalPolicyBundleWatchTarget {
     bundle_path: PathBuf,
     watch_root: PathBuf,
-}
-
-#[derive(Clone, Default)]
-struct WatcherShutdown {
-    requested: Arc<AtomicBool>,
-    notify: Arc<Notify>,
-}
-
-impl WatcherShutdown {
-    fn request(&self) {
-        self.requested.store(true, Ordering::Relaxed);
-        self.notify.notify_one();
-    }
-
-    fn is_requested(&self) -> bool {
-        self.requested.load(Ordering::Relaxed)
-    }
-
-    async fn notified(&self) {
-        if self.is_requested() {
-            return;
-        }
-        self.notify.notified().await;
-    }
 }
 
 fn local_policy_bundle_watch_targets(config: &AgentConfig) -> Vec<LocalPolicyBundleWatchTarget> {
@@ -354,14 +233,30 @@ fn local_policy_bundle_watch_roots(targets: &[LocalPolicyBundleWatchTarget]) -> 
         .collect()
 }
 
-fn absolute_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
+fn policy_reload_watch_paths(
+    watch_roots: &[PathBuf],
+    targets: &[LocalPolicyBundleWatchTarget],
+) -> Result<Vec<ReloadWatchPath>, PolicyReloadWatcherError> {
+    let mut paths = watch_roots
+        .iter()
+        .cloned()
+        .map(ReloadWatchPath::non_recursive)
+        .collect::<Vec<_>>();
+    for target in targets {
+        let is_directory = is_non_symlink_directory(&target.bundle_path).map_err(|source| {
+            PolicyReloadWatcherError::InspectPath {
+                path: target.bundle_path.clone(),
+                source,
+            }
+        })?;
+        if !is_directory {
+            return Err(PolicyReloadWatcherError::InvalidBundleRoot {
+                path: target.bundle_path.clone(),
+            });
+        }
+        paths.push(ReloadWatchPath::recursive(target.bundle_path.clone()));
     }
+    Ok(paths)
 }
 
 #[cfg(test)]

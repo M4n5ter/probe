@@ -111,6 +111,94 @@ max_body_bytes = {max_body_bytes}
 }
 
 #[test]
+fn validation_accepts_enforcement_policy_reload_watcher_config()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.policy.source]
+kind = "file"
+path = "/etc/probe/enforcement.toml"
+
+[enforcement.policy.reload]
+watch_local_manifest = true
+debounce_ms = 250
+"#,
+    )?;
+
+    config.validate_basic()?;
+
+    assert!(config.enforcement.policy.reload.watch_local_manifest);
+    assert_eq!(config.enforcement.policy.reload.debounce_ms, 250);
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_invalid_enforcement_policy_reload_debounce()
+-> Result<(), Box<dyn std::error::Error>> {
+    for debounce_ms in [
+        MIN_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS - 1,
+        MAX_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS + 1,
+    ] {
+        let config = AgentConfig::from_toml_str(&format!(
+            r#"
+[enforcement.policy.source]
+kind = "file"
+path = "/etc/probe/enforcement.toml"
+
+[enforcement.policy.reload]
+watch_local_manifest = true
+debounce_ms = {debounce_ms}
+"#,
+        ))?;
+
+        let error = config
+            .validate_basic()
+            .expect_err("invalid enforcement reload debounce must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("enforcement policy reload watcher debounce_ms must be between")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_enforcement_policy_reload_watcher_without_local_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    for source in [
+        r#"
+[enforcement.policy.source]
+kind = "none"
+"#,
+        r#"
+[enforcement.policy.source]
+kind = "remote"
+endpoint = "https://control.example/enforcement"
+"#,
+    ] {
+        let config = AgentConfig::from_toml_str(&format!(
+            r#"
+{source}
+
+[enforcement.policy.reload]
+watch_local_manifest = true
+"#,
+        ))?;
+
+        let error = config
+            .validate_basic()
+            .expect_err("enforcement reload watcher must require a local source");
+
+        assert!(error.to_string().contains(
+            "enforcement policy reload watcher requires a local file or directory source"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
 fn validation_rejects_incomplete_transparent_interception_config()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(

@@ -1,5 +1,7 @@
 use crate::{
-    ConfigViolation, EnforcementPolicySourceConfig, RemoteEnforcementPolicyBodyLimitBytes,
+    ConfigViolation, EnforcementPolicyReloadConfig, EnforcementPolicySourceConfig,
+    MAX_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+    MIN_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS, RemoteEnforcementPolicyBodyLimitBytes,
     RemoteEnforcementPolicyBodyLimitError,
 };
 
@@ -46,6 +48,37 @@ pub(super) fn validate(
             }
             validate_remote_body_limit(*max_body_bytes, violations);
         }
+    }
+}
+
+pub(super) fn validate_reload(
+    source: &EnforcementPolicySourceConfig,
+    reload: &EnforcementPolicyReloadConfig,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    if reload.watch_local_manifest
+        && !matches!(
+            source,
+            EnforcementPolicySourceConfig::File { .. }
+                | EnforcementPolicySourceConfig::Directory { .. }
+        )
+    {
+        violations.push(ConfigViolation {
+            field: "enforcement.policy.reload.watch_local_manifest".to_string(),
+            reason: "enforcement policy reload watcher requires a local file or directory source"
+                .to_string(),
+        });
+    }
+    if !(MIN_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS
+        ..=MAX_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS)
+        .contains(&reload.debounce_ms)
+    {
+        violations.push(ConfigViolation {
+            field: "enforcement.policy.reload.debounce_ms".to_string(),
+            reason: format!(
+                "enforcement policy reload watcher debounce_ms must be between {MIN_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS} and {MAX_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS}"
+            ),
+        });
     }
 }
 

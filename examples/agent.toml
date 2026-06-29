@@ -158,9 +158,18 @@ backend = "none"
 kind = "none"
 # kind = "file"
 # path = "/etc/probe/enforcement.toml"
+# kind = "directory"
+# path = "/etc/probe/enforcement.d"
 # kind = "remote"
 # endpoint = "http://127.0.0.1:9000/enforcement.toml"
 # max_body_bytes = 16777216
+
+[enforcement.policy.reload]
+# Watches only local file/directory manifest sources from the current runtime
+# plan. Remote policy sources can be reloaded manually through the admin
+# command, but are not polled or watched in the background.
+watch_local_manifest = false
+debounce_ms = 500
 
 [enforcement.interception]
 # Transparent interception and MITM require root/net-admin and should be scoped

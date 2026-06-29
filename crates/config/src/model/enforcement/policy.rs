@@ -5,6 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub const DEFAULT_REMOTE_ENFORCEMENT_POLICY_BODY_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_REMOTE_ENFORCEMENT_POLICY_BODY_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+pub const DEFAULT_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS: u64 = 500;
+pub const MIN_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS: u64 = 50;
+pub const MAX_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
@@ -80,6 +83,23 @@ impl std::error::Error for RemoteEnforcementPolicyBodyLimitError {}
 #[serde(default, deny_unknown_fields)]
 pub struct EnforcementPolicyConfig {
     pub source: EnforcementPolicySourceConfig,
+    pub reload: EnforcementPolicyReloadConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnforcementPolicyReloadConfig {
+    pub watch_local_manifest: bool,
+    pub debounce_ms: u64,
+}
+
+impl Default for EnforcementPolicyReloadConfig {
+    fn default() -> Self {
+        Self {
+            watch_local_manifest: false,
+            debounce_ms: DEFAULT_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +178,17 @@ mod tests {
         assert!(deserialize_body_limit(0).is_err());
         assert!(
             deserialize_body_limit(MAX_REMOTE_ENFORCEMENT_POLICY_BODY_LIMIT_BYTES + 1).is_err()
+        );
+    }
+
+    #[test]
+    fn enforcement_policy_reload_config_defaults_to_no_background_watch() {
+        assert_eq!(
+            EnforcementPolicyReloadConfig::default(),
+            EnforcementPolicyReloadConfig {
+                watch_local_manifest: false,
+                debounce_ms: DEFAULT_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+            }
         );
     }
 

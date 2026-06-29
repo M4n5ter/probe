@@ -11,7 +11,7 @@ use runtime::{RuntimePlan, validate_static_runtime_config};
 use storage::FjallSpool;
 
 use crate::{
-    admin::{AdminRuntimeState, AdminServerConfig, spawn_admin_server},
+    admin::{AdminRuntimeState, AdminServerConfig, AdminServerHandle, spawn_admin_server},
     capture_provider::{
         CaptureProviderPreflight, CaptureProviderRuntimeState, build_capture_provider,
     },
@@ -24,6 +24,7 @@ use crate::{
         enforcement_policy_source_load_context_from_plan, policy_source_load_context_from_plan,
         webhook_connection_options_from_plan,
     },
+    enforcement_reload_watcher::{self, EnforcementReloadWatcherHandle},
     error::AgentError,
     export::{
         ExportDrainError, ExportWorker, ExportWorkerConfig,
@@ -33,7 +34,7 @@ use crate::{
         DurableL7MitmAuditSink, L7MitmAuditSink, L7MitmBackendLifecycleGuard, L7MitmRuntime,
         start_backend_lifecycle,
     },
-    policy_reload_watcher,
+    policy_reload_watcher::{self, PolicyReloadWatcherHandle},
     runtime_composition::build_runtime_composition,
     shutdown,
     storage_retention::{
@@ -98,7 +99,7 @@ pub(crate) async fn run_live_agent(
     let transparent_proxy_runtime = transparent_interception.proxy_runtime_handle();
     let admin_runtime_state = AdminRuntimeState {
         capture: capture_runtime.clone(),
-        enforcement: Some(enforcement_runtime),
+        enforcement: Some(enforcement_runtime.clone()),
         export_worker: export_worker.as_ref().map(ExportWorker::runtime_state),
         pipeline: Some(pipeline_metrics.clone()),
         policy_set: policy_set.clone(),
@@ -119,16 +120,30 @@ pub(crate) async fn run_live_agent(
             )
         })
         .transpose()?;
-    let policy_reload_watcher = match policy_reload_watcher::spawn_watcher(
+    let mut background_services = BackgroundServices::new(admin_server);
+    match policy_reload_watcher::spawn_watcher(
         Arc::clone(&plan_handle),
         policy_set.clone(),
         admin_runtime_state.policy_reload_gate.clone(),
     ) {
-        Ok(watcher) => watcher,
+        Ok(watcher) => {
+            background_services.policy_reload_watcher = watcher;
+        }
         Err(error) => {
-            if let Some(server) = admin_server {
-                server.stop().await;
-            }
+            background_services.stop().await;
+            return Err(error.into());
+        }
+    };
+    match enforcement_reload_watcher::spawn_watcher(
+        Arc::clone(&plan_handle),
+        enforcement_runtime,
+        admin_runtime_state.enforcement_reload_gate.clone(),
+    ) {
+        Ok(watcher) => {
+            background_services.enforcement_reload_watcher = watcher;
+        }
+        Err(error) => {
+            background_services.stop().await;
             return Err(error.into());
         }
     };
@@ -162,12 +177,7 @@ pub(crate) async fn run_live_agent(
     };
     let blocking_run = tokio::task::spawn_blocking(|| blocking_run.run()).await;
     shutdown_signal_task.abort();
-    if let Some(server) = admin_server {
-        server.stop().await;
-    }
-    if let Some(watcher) = policy_reload_watcher {
-        watcher.stop().await;
-    }
+    background_services.stop().await;
     if let Some(worker) = export_worker {
         worker.stop().await;
     }
@@ -218,6 +228,34 @@ pub(crate) async fn run_live_agent(
         summary.durable_export_events_written
     );
     Ok(())
+}
+
+struct BackgroundServices {
+    admin_server: Option<AdminServerHandle>,
+    policy_reload_watcher: Option<PolicyReloadWatcherHandle>,
+    enforcement_reload_watcher: Option<EnforcementReloadWatcherHandle>,
+}
+
+impl BackgroundServices {
+    fn new(admin_server: Option<AdminServerHandle>) -> Self {
+        Self {
+            admin_server,
+            policy_reload_watcher: None,
+            enforcement_reload_watcher: None,
+        }
+    }
+
+    async fn stop(&mut self) {
+        if let Some(watcher) = self.enforcement_reload_watcher.take() {
+            watcher.stop().await;
+        }
+        if let Some(watcher) = self.policy_reload_watcher.take() {
+            watcher.stop().await;
+        }
+        if let Some(server) = self.admin_server.take() {
+            server.stop().await;
+        }
+    }
 }
 
 struct BlockingCaptureRun {

@@ -3,9 +3,9 @@ use thiserror::Error;
 use crate::{
     capture_event_feed::CaptureEventFeedLoadError, check::CheckError,
     configured_enforcement::ConfiguredEnforcementError, configured_policy::ConfiguredPolicyError,
-    export::ExportDrainError, plaintext_feed::PlaintextFeedLoadError,
-    policy_reload_watcher::PolicyReloadWatcherError, tls_plaintext::TlsDecryptHintError,
-    transparent_interception::TransparentInterceptionError,
+    enforcement_reload_watcher::EnforcementReloadWatcherError, export::ExportDrainError,
+    plaintext_feed::PlaintextFeedLoadError, policy_reload_watcher::PolicyReloadWatcherError,
+    tls_plaintext::TlsDecryptHintError, transparent_interception::TransparentInterceptionError,
 };
 
 #[derive(Debug, Error)]
@@ -64,6 +64,8 @@ pub(crate) enum AgentError {
     L7MitmRuntime(String),
     #[error("policy reload watcher error: {0}")]
     PolicyReloadWatcher(#[from] PolicyReloadWatcherError),
+    #[error("enforcement policy reload watcher error: {0}")]
+    EnforcementReloadWatcher(#[from] EnforcementReloadWatcherError),
     #[error("admin error: {0}")]
     Admin(#[from] crate::admin::AdminError),
     #[error("{0}")]

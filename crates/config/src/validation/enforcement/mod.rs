@@ -10,6 +10,11 @@ pub(super) fn validate(
 ) {
     interception::validate(&enforcement.interception, tls, violations);
     policy_source::validate(&enforcement.policy.source, violations);
+    policy_source::validate_reload(
+        &enforcement.policy.source,
+        &enforcement.policy.reload,
+        violations,
+    );
 }
 
 pub(crate) fn validate_l7_mitm_contract(

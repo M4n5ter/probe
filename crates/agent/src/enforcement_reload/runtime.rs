@@ -15,12 +15,12 @@ pub(crate) struct EnforcementReloadGate {
     inner: Arc<Mutex<()>>,
 }
 
-pub(super) struct EnforcementReloadSummary {
+pub(crate) struct EnforcementReloadSummary {
     pub active_policy: ActiveEnforcementPolicy,
 }
 
 #[derive(Debug, Error)]
-pub(super) enum EnforcementReloadError {
+pub(crate) enum EnforcementReloadError {
     #[error("enforcement runtime state is not available")]
     RuntimeStateUnavailable,
     #[error(
@@ -39,12 +39,18 @@ impl From<ConfiguredEnforcementError> for EnforcementReloadError {
     }
 }
 
-pub(super) async fn reload_enforcement_policy(
+pub(crate) fn validate_enforcement_policy_reload_plan(
+    plan: &RuntimePlan,
+) -> Result<(), EnforcementReloadError> {
+    reject_setup_time_interception_reload(plan)
+}
+
+pub(crate) async fn reload_enforcement_policy(
     plan: &RuntimePlan,
     runtime_state: Option<&EnforcementRuntimeState>,
     gate: &EnforcementReloadGate,
 ) -> Result<EnforcementReloadSummary, EnforcementReloadError> {
-    reject_setup_time_interception_reload(plan)?;
+    validate_enforcement_policy_reload_plan(plan)?;
     let runtime_state = runtime_state.ok_or(EnforcementReloadError::RuntimeStateUnavailable)?;
     let _reload_guard = gate.inner.lock().await;
     let loaded = load_configured_enforcement_policy_runtime(
