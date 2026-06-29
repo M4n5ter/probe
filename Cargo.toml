@@ -14,6 +14,7 @@ members = [
     "crates/enforcement",
     "crates/exporter",
     "crates/interception",
+    "crates/mitm-proxy",
     "crates/parsers",
     "crates/pipeline",
     "crates/policy",

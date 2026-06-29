@@ -52,6 +52,10 @@ pub(crate) fn run_managed_policy_hook() -> ExitCode {
     run_case(MitmBridgeCase::ManagedInboundPolicyHook)
 }
 
+pub(crate) fn run_managed_proxy_policy_hook() -> ExitCode {
+    run_case(MitmBridgeCase::ManagedProxyInboundPolicyHook)
+}
+
 pub(crate) fn run_policy_hook() -> ExitCode {
     run_case(MitmBridgeCase::ExternalInboundPolicyHook)
 }
@@ -83,6 +87,9 @@ fn run_outer(case: MitmBridgeCase) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     ensure_e2e_packages_built(["agent", "e2e-fixture"])?;
+    if case.product_proxy_backend() {
+        ensure_e2e_packages_built(["mitm-proxy"])?;
+    }
     require_root()?;
     reexec_current_case_in_fresh_network_namespace(
         case.netns_env(),

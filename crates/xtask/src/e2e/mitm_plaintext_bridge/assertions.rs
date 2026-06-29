@@ -30,6 +30,7 @@ use super::{
         EXPECTED_POLICY_VERSION, POLICY_HOOK_REASON_PREFIX, POLICY_HOOK_RESPONSE_REASON,
         expected_bridge_policy_alert_message, expected_libpcap_targets,
         expected_policy_alert_message, is_bridge_flow, is_bridge_ingress_bytes,
+        is_product_proxy_deny_response_bytes, product_proxy_deny_response_bytes,
     },
 };
 use crate::e2e::{
@@ -117,18 +118,20 @@ pub(super) fn exercise_managed_mitm_data_plane(
 
     let mut response = Vec::new();
     stream.read_to_end(&mut response)?;
-    let expected = if case.backend_owned_policy_hook_enabled() {
-        mitm_bridge::DENY_RESPONSE_BYTES
+    let expected = if case.product_proxy_backend() {
+        product_proxy_deny_response_bytes()
+    } else if case.backend_owned_policy_hook_enabled() {
+        mitm_bridge::DENY_RESPONSE_BYTES.to_vec()
     } else {
-        mitm_bridge::PASSTHROUGH_RESPONSE_BYTES
+        mitm_bridge::PASSTHROUGH_RESPONSE_BYTES.to_vec()
     };
-    if response == expected {
+    if response == expected.as_slice() {
         return Ok(());
     }
     Err(e2e_error(format!(
         "{} managed MITM data-plane response mismatch: expected {:?}, got {:?}",
         case.case_name(),
-        String::from_utf8_lossy(expected),
+        String::from_utf8_lossy(&expected),
         String::from_utf8_lossy(&response)
     ))
     .into())
@@ -164,7 +167,7 @@ pub(super) fn assert_spool_outputs(
     if ingress.is_empty() {
         return Err(e2e_error("expected MITM bridge ingress records, got none").into());
     }
-    assert_livestream_ingress(&ingress)?;
+    assert_livestream_ingress(case, &ingress)?;
 
     let envelopes = spool
         .read_export_batch(E2E_EXPORT_CURSOR_OWNER, 512)?
@@ -172,7 +175,7 @@ pub(super) fn assert_spool_outputs(
         .map(decode_envelope)
         .collect::<Result<Vec<_>, _>>()?;
     assert_no_policy_runtime_errors(&envelopes)?;
-    assert_expected_bridge_export(&envelopes)?;
+    assert_expected_bridge_export(case, &envelopes)?;
     assert_expected_libpcap_export(&envelopes)?;
     assert_expected_libpcap_policy_alerts(&envelopes)?;
     assert_expected_policy_hook_decision(case, &envelopes)?;
@@ -190,7 +193,7 @@ pub(super) fn assert_backend_owned_policy_hook_execution(
     case: MitmBridgeCase,
     backend: &PreparedMitmBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !case.backend_owned_policy_hook_enabled() {
+    if !case.fixture_action_report_enabled() {
         return Ok(());
     }
     let Some(action_report_file) = backend.action_report_file.as_ref() else {
@@ -347,13 +350,28 @@ fn assert_policy_hook_enforcement_manifest_status(
     .into())
 }
 
-fn assert_livestream_ingress(events: &[StoredEvent]) -> Result<(), Box<dyn std::error::Error>> {
+fn assert_livestream_ingress(
+    case: MitmBridgeCase,
+    events: &[StoredEvent],
+) -> Result<(), Box<dyn std::error::Error>> {
     let capture_events = events
         .iter()
         .map(decode_capture_event)
         .collect::<Result<Vec<_>, _>>()?;
-    if !capture_events.iter().any(is_bridge_ingress_bytes) {
+    if !capture_events
+        .iter()
+        .any(|event| is_bridge_ingress_bytes(case, event))
+    {
         return Err(e2e_error("missing MITM bridge capture-event feed ingress bytes").into());
+    }
+    if case.product_proxy_backend()
+        && !capture_events
+            .iter()
+            .any(is_product_proxy_deny_response_bytes)
+    {
+        return Err(
+            e2e_error("missing product MITM proxy deny response plaintext feed bytes").into(),
+        );
     }
     if !capture_events.iter().any(|event| {
         matches!(
@@ -370,10 +388,11 @@ fn assert_livestream_ingress(events: &[StoredEvent]) -> Result<(), Box<dyn std::
 }
 
 fn assert_expected_bridge_export(
+    case: MitmBridgeCase,
     envelopes: &[EventEnvelope],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let request_found = envelopes.iter().any(|envelope| {
-        is_bridge_flow(envelope)
+        is_bridge_flow(case, envelope)
             && matches!(
                 envelope.kind(),
                 EventKind::HttpRequestHeaders(headers)
@@ -387,7 +406,7 @@ fn assert_expected_bridge_export(
 
     let bridge_alert = expected_bridge_policy_alert_message();
     let alert_found = envelopes.iter().any(|envelope| {
-        is_bridge_flow(envelope)
+        is_bridge_flow(case, envelope)
             && envelope.policy_version() == Some(EXPECTED_POLICY_VERSION)
             && matches!(
                 envelope.kind(),
@@ -465,17 +484,18 @@ fn assert_expected_policy_hook_decision(
     if !case.policy_hook_enabled() {
         return Ok(());
     }
-    assert_expected_policy_hook_verdict(envelopes)?;
-    assert_expected_delegated_policy_hook_decision(envelopes)
+    assert_expected_policy_hook_verdict(case, envelopes)?;
+    assert_expected_delegated_policy_hook_decision(case, envelopes)
 }
 
 fn assert_expected_policy_hook_verdict(
+    case: MitmBridgeCase,
     envelopes: &[EventEnvelope],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let matches = envelopes
         .iter()
         .filter(|envelope| {
-            is_bridge_flow(envelope)
+            is_bridge_flow(case, envelope)
                 && envelope.policy_version() == Some(EXPECTED_POLICY_VERSION)
                 && matches!(
                     envelope.kind(),
@@ -498,12 +518,14 @@ fn assert_expected_policy_hook_verdict(
 }
 
 fn assert_expected_delegated_policy_hook_decision(
+    case: MitmBridgeCase,
     envelopes: &[EventEnvelope],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let expected_execution_reason = case.policy_hook_execution_reason();
     let observed = envelopes
         .iter()
         .filter_map(|envelope| {
-            if !is_bridge_flow(envelope)
+            if !is_bridge_flow(case, envelope)
                 || envelope.policy_version() != Some(EXPECTED_POLICY_VERSION)
             {
                 return None;
@@ -517,7 +539,7 @@ fn assert_expected_delegated_policy_hook_decision(
     let matches = envelopes
         .iter()
         .filter(|envelope| {
-            is_bridge_flow(envelope)
+            is_bridge_flow(case, envelope)
                 && envelope.policy_version() == Some(EXPECTED_POLICY_VERSION)
                 && matches!(
                     envelope.kind(),
@@ -532,11 +554,11 @@ fn assert_expected_delegated_policy_hook_decision(
                                 EnforcementExecutionEvidence::ProxySideHook {
                                     surface: ProxySideEnforcementSurface::L7Mitm,
                                     executed_action: Action::Deny,
-                                    reason: POLICY_HOOK_RESPONSE_REASON.to_string(),
+                                    reason: expected_execution_reason.to_string(),
                                 }
                             )
                             && decision.reason.contains("accepted delegated enforcement action")
-                            && decision.reason.contains(POLICY_HOOK_RESPONSE_REASON)
+                            && decision.reason.contains(expected_execution_reason)
                 )
         })
         .collect::<Vec<_>>();

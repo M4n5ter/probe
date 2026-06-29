@@ -2,7 +2,7 @@ use std::path::Path;
 
 use capture::CaptureEvent;
 use e2e_support::mitm_bridge;
-use probe_core::EventEnvelope;
+use probe_core::{CaptureProviderKind, CaptureSource, Direction, EventEnvelope};
 
 use super::backend::{MitmBackendKind, MitmBridgeCase};
 
@@ -15,6 +15,8 @@ pub(super) const EXPECTED_POLICY_VERSION: &str = "mitm-bridge-e2e-policy@e2e";
 pub(super) const POLICY_ALERT_PREFIX: &str = "mitm bridge policy observed ";
 pub(super) const POLICY_HOOK_REASON_PREFIX: &str = "mitm bridge policy hook delegated ";
 pub(super) const POLICY_HOOK_RESPONSE_REASON: &str = mitm_bridge::POLICY_HOOK_RESPONSE_REASON;
+pub(super) const POLICY_HOOK_PRODUCT_PROXY_RESPONSE_REASON: &str =
+    "mitm bridge policy hook delegated /mitm-bridge/e2e";
 pub(super) const REQUESTS: usize = 1;
 pub(super) const REQUEST_BODY_BYTES: usize = 64;
 pub(super) const RESPONSE_BODY_BYTES: usize = 32;
@@ -42,12 +44,51 @@ pub(super) fn append_bridge_feed_from_harness(
     }
 }
 
-pub(super) fn is_bridge_ingress_bytes(event: &CaptureEvent) -> bool {
-    mitm_bridge::is_ingress_bytes(event)
+pub(super) fn product_proxy_deny_response_bytes() -> Vec<u8> {
+    format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        POLICY_HOOK_PRODUCT_PROXY_RESPONSE_REASON.len(),
+        POLICY_HOOK_PRODUCT_PROXY_RESPONSE_REASON
+    )
+    .into_bytes()
 }
 
-pub(super) fn is_bridge_flow(envelope: &EventEnvelope) -> bool {
-    mitm_bridge::is_flow(envelope)
+pub(super) fn is_bridge_ingress_bytes(case: MitmBridgeCase, event: &CaptureEvent) -> bool {
+    if !case.product_proxy_backend() {
+        return mitm_bridge::is_ingress_bytes(event);
+    }
+    is_l7_mitm_plaintext_bytes(event, Direction::Outbound, mitm_bridge::REQUEST_BYTES)
+}
+
+pub(super) fn is_product_proxy_deny_response_bytes(event: &CaptureEvent) -> bool {
+    is_l7_mitm_plaintext_bytes(
+        event,
+        Direction::Inbound,
+        product_proxy_deny_response_bytes().as_slice(),
+    )
+}
+
+pub(super) fn is_bridge_flow(case: MitmBridgeCase, envelope: &EventEnvelope) -> bool {
+    if !case.product_proxy_backend() {
+        return mitm_bridge::is_flow(envelope);
+    }
+    is_l7_mitm_plaintext_origin(envelope)
+}
+
+fn is_l7_mitm_plaintext_bytes(event: &CaptureEvent, direction: Direction, expected: &[u8]) -> bool {
+    matches!(
+        event,
+        CaptureEvent::Bytes(bytes)
+            if bytes.origin.source() == CaptureSource::L7MitmPlaintext
+                && bytes.origin.provider() == CaptureProviderKind::Interception
+                && bytes.direction == direction
+                && bytes.bytes.as_ref() == expected
+    )
+}
+
+fn is_l7_mitm_plaintext_origin(envelope: &EventEnvelope) -> bool {
+    envelope.origin().source() == CaptureSource::L7MitmPlaintext
+        && envelope.origin().provider() == CaptureProviderKind::Interception
 }
 
 pub(super) fn expected_policy_alert_messages() -> std::collections::BTreeSet<String> {

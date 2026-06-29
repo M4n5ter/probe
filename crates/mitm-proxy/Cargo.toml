@@ -1,0 +1,26 @@
+[package]
+name = "mitm-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "traffic-probe-mitm-proxy"
+path = "src/main.rs"
+
+[dependencies]
+capture = { path = "../capture" }
+clap = { version = "4.6", features = ["derive"] }
+probe-core = { path = "../core" }
+rustix = { version = "1.1", features = ["process"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+socket2 = { version = "0.6", features = ["all"] }
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints]
+workspace = true

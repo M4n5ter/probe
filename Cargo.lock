@@ -1405,6 +1405,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mitm-proxy"
+version = "0.1.0"
+dependencies = [
+ "capture",
+ "clap",
+ "probe-core",
+ "rustix",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mlua"
 version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
