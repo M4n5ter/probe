@@ -2939,6 +2939,7 @@ dependencies = [
  "capture",
  "e2e-support",
  "ebpf-object",
+ "enforcement",
  "exporter",
  "interception",
  "probe-config",

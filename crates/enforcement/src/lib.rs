@@ -1,5 +1,6 @@
 mod backend;
 mod decision;
+pub mod linux_socket_destroy;
 mod planner;
 mod scope;
 

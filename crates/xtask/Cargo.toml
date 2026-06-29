@@ -21,6 +21,7 @@ socket2 = { version = "0.6.4", features = ["all"] }
 storage = { version = "0.1.0", path = "../storage" }
 toml = "1.1"
 transparent-linux = { version = "0.1.0", path = "../transparent-linux" }
+enforcement = { version = "0.1.0", path = "../enforcement" }
 
 [lints]
 workspace = true

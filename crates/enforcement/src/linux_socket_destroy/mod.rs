@@ -1,5 +1,6 @@
 use std::{
     fs, io,
+    net::{Ipv4Addr, TcpListener, TcpStream},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -11,20 +12,20 @@ use probe_core::FlowContext;
 
 const SS_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub(super) trait SsKill {
+pub trait SsKill {
     fn kill(&mut self, request: &SsKillRequest) -> io::Result<SsKillResult>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SsKillRequest {
-    pub(super) local_address: String,
-    pub(super) local_port: u16,
-    pub(super) remote_address: String,
-    pub(super) remote_port: u16,
+pub struct SsKillRequest {
+    pub local_address: String,
+    pub local_port: u16,
+    pub remote_address: String,
+    pub remote_port: u16,
 }
 
 impl SsKillRequest {
-    pub(super) fn from_flow(flow: &FlowContext) -> Self {
+    pub fn from_flow(flow: &FlowContext) -> Self {
         Self {
             local_address: flow.local.address.clone(),
             local_port: flow.local.port,
@@ -33,7 +34,7 @@ impl SsKillRequest {
         }
     }
 
-    pub(super) fn args(&self) -> Vec<String> {
+    pub fn args(&self) -> Vec<String> {
         vec![
             "-H".to_string(),
             "-K".to_string(),
@@ -54,12 +55,12 @@ impl SsKillRequest {
     }
 }
 
-pub(super) struct SystemSsKill {
+pub struct SystemSsKill {
     command: PathBuf,
 }
 
 impl SystemSsKill {
-    pub(super) fn new(command: PathBuf) -> Self {
+    pub fn new(command: PathBuf) -> Self {
         Self { command }
     }
 }
@@ -76,20 +77,20 @@ impl SsKill for SystemSsKill {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SsKillResult {
-    pub(super) success: bool,
-    pub(super) stdout: Vec<u8>,
-    pub(super) stderr: Vec<u8>,
+pub struct SsKillResult {
+    pub success: bool,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 impl SsKillResult {
-    pub(super) fn closed_any_socket(&self) -> bool {
+    pub fn closed_any_socket(&self) -> bool {
         String::from_utf8_lossy(&self.stdout)
             .lines()
             .any(is_socket_destroy_output_row)
     }
 
-    pub(super) fn failure_reason(&self) -> String {
+    pub fn failure_reason(&self) -> String {
         let stderr = String::from_utf8_lossy(trim_ascii_whitespace(&self.stderr));
         if stderr.is_empty() {
             "ss -K failed without stderr".to_string()
@@ -99,7 +100,7 @@ impl SsKillResult {
     }
 }
 
-pub(super) fn find_ss_command() -> Option<PathBuf> {
+pub fn find_ss_command() -> Option<PathBuf> {
     trusted_ss_paths()
         .into_iter()
         .find(|candidate| is_executable_file(candidate))
@@ -114,11 +115,7 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-pub(super) fn is_root() -> bool {
-    rustix::process::geteuid().as_raw() == 0
-}
-
-pub(super) fn ss_supports_kill(command: &Path) -> bool {
+pub fn ss_supports_kill(command: &Path) -> bool {
     let Ok(output) = Command::new(command).arg("--help").output() else {
         return false;
     };
@@ -126,6 +123,41 @@ pub(super) fn ss_supports_kill(command: &Path) -> bool {
     help.extend_from_slice(&output.stderr);
     let help = String::from_utf8_lossy(&help);
     help.contains("-K") && help.contains("--kill")
+}
+
+fn run_loopback_kill_self_test(command: &Path) -> io::Result<SsKillResult> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let target = listener.local_addr()?;
+    let client = TcpStream::connect(target)?;
+    let (server, _peer) = listener.accept()?;
+    client.set_read_timeout(Some(SS_KILL_TIMEOUT))?;
+    client.set_write_timeout(Some(SS_KILL_TIMEOUT))?;
+    server.set_read_timeout(Some(SS_KILL_TIMEOUT))?;
+    server.set_write_timeout(Some(SS_KILL_TIMEOUT))?;
+
+    let client_addr = client.local_addr()?;
+    let request = SsKillRequest {
+        local_address: client_addr.ip().to_string(),
+        local_port: client_addr.port(),
+        remote_address: target.ip().to_string(),
+        remote_port: target.port(),
+    };
+    let result = SystemSsKill::new(command.to_path_buf()).kill(&request);
+    drop(server);
+    drop(client);
+    result
+}
+
+pub fn check_loopback_socket_destroy_support(command: &Path) -> Result<(), String> {
+    let result = run_loopback_kill_self_test(command)
+        .map_err(|error| format!("failed to run ss -K loopback self-test: {error}"))?;
+    if !result.success {
+        return Err(result.failure_reason());
+    }
+    if !result.closed_any_socket() {
+        return Err("ss -K loopback self-test did not report a destroyed TCP socket".to_string());
+    }
+    Ok(())
 }
 
 fn run_ss_kill_with_timeout(command: &mut Command) -> io::Result<std::process::Output> {

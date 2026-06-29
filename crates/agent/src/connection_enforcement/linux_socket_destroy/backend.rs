@@ -1,10 +1,10 @@
-use enforcement::{EnforcementBackend, EnforcementBackendDecision, EnforcementBackendRequest};
+use enforcement::{
+    EnforcementBackend, EnforcementBackendDecision, EnforcementBackendRequest,
+    linux_socket_destroy::{SsKill, SsKillRequest},
+};
 use probe_core::TransportProtocol;
 
-use super::{
-    owner::{FlowOwnerVerification, FlowOwnerVerifier},
-    ss::{SsKill, SsKillRequest},
-};
+use super::owner::{FlowOwnerVerification, FlowOwnerVerifier};
 
 pub(super) struct LinuxSocketDestroyBackend<R, V> {
     runner: R,
@@ -98,8 +98,8 @@ mod tests {
         ProcessIdentity, ProtectiveActionProfile, Timestamp, Verdict, VerdictScope,
     };
 
-    use super::super::ss::SsKillResult;
     use super::*;
+    use enforcement::linux_socket_destroy::SsKillResult;
 
     #[test]
     fn linux_socket_destroy_backend_invokes_ss_for_owner_verified_flow()

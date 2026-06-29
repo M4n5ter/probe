@@ -1,12 +1,12 @@
 mod backend;
 mod owner;
 mod probe;
-mod ss;
+
+use enforcement::linux_socket_destroy::SystemSsKill;
 
 use backend::LinuxSocketDestroyBackend;
 use owner::ProcfsFlowOwnerVerifier;
 use probe::{LinuxSocketDestroyProbe, LinuxSocketDestroyProbeResult};
-use ss::SystemSsKill;
 
 use super::ConnectionEnforcementRuntime;
 
@@ -18,7 +18,10 @@ pub(super) fn resolve() -> ConnectionEnforcementRuntime {
                     SystemSsKill::new(command),
                     ProcfsFlowOwnerVerifier::default(),
                 ),
-                "linux socket destroy entrypoint is available with procfs owner verification; each flow may still return unsupported if the event is not from live host capture, the socket is gone, owner verification fails, or the kernel/namespace does not report a destroyed socket",
+                "linux socket destroy entrypoint passed active loopback self-test and uses procfs owner verification; \
+                 each flow may still return unsupported if the event is not from live host capture, observation evidence \
+                 is not destructive-safe, the target socket is gone, owner verification fails, or ss -K does not report \
+                 a destroyed matching socket",
             )
         }
         LinuxSocketDestroyProbeResult::Unavailable(capability) => {

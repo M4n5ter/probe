@@ -6,6 +6,7 @@ use std::{
 
 mod registry;
 
+use super::E2eOutcome;
 use registry::{E2eCase, SuiteSelection};
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
@@ -203,6 +204,8 @@ fn run_cases(cases: Vec<&'static E2eCase>) -> ExitCode {
 
     println!("running {} e2e case(s)", cases.len());
     let started_at = Instant::now();
+    let mut passed = 0_usize;
+    let mut skipped = 0_usize;
     for (index, case) in cases.iter().enumerate() {
         println!(
             "[{}/{}] {} ({})",
@@ -212,28 +215,50 @@ fn run_cases(cases: Vec<&'static E2eCase>) -> ExitCode {
             case.requirement.label()
         );
         let case_started_at = Instant::now();
-        let status = (case.run)();
-        if status != ExitCode::SUCCESS {
-            eprintln!(
-                "e2e suite failed at {} after {}",
-                case.name,
-                format_duration(case_started_at.elapsed())
-            );
-            return ExitCode::FAILURE;
+        match case.run.run() {
+            E2eOutcome::Passed => {
+                passed += 1;
+                println!(
+                    "[{}/{}] {} passed in {}",
+                    index + 1,
+                    cases.len(),
+                    case.name,
+                    format_duration(case_started_at.elapsed())
+                );
+            }
+            E2eOutcome::Skipped(reason) => {
+                skipped += 1;
+                println!(
+                    "[{}/{}] {} skipped in {}: {}",
+                    index + 1,
+                    cases.len(),
+                    case.name,
+                    format_duration(case_started_at.elapsed()),
+                    reason
+                );
+            }
+            E2eOutcome::Failed => {
+                eprintln!(
+                    "e2e suite failed at {} after {}",
+                    case.name,
+                    format_duration(case_started_at.elapsed())
+                );
+                return ExitCode::FAILURE;
+            }
         }
-        println!(
-            "[{}/{}] {} passed in {}",
-            index + 1,
-            cases.len(),
-            case.name,
-            format_duration(case_started_at.elapsed())
-        );
     }
 
-    println!(
-        "e2e suite passed in {}",
-        format_duration(started_at.elapsed())
-    );
+    if skipped == 0 {
+        println!(
+            "e2e suite passed: {passed} passed in {}",
+            format_duration(started_at.elapsed())
+        );
+    } else {
+        println!(
+            "e2e suite completed with skips: {passed} passed, {skipped} skipped in {}",
+            format_duration(started_at.elapsed())
+        );
+    }
     ExitCode::SUCCESS
 }
 

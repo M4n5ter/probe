@@ -15,7 +15,8 @@ pub(crate) use netns::{
 };
 pub(crate) use process::{
     ChildSupervisor, UnixSocketReadySignal, run_in_own_process_group, stop_running_child,
-    wait_for_child_exit, wait_for_file_or_child_exit, wait_for_ready_signal_or_child_exit,
+    wait_for_child_exit, wait_for_child_status, wait_for_file_or_child_exit,
+    wait_for_ready_signal_or_child_exit,
 };
 pub(crate) use temp::{
     create_temp_root, publish_atomic_file, run_with_temp_root, wall_time_unix_ns,

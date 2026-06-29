@@ -7,8 +7,10 @@ mod gap_plaintext_feed;
 mod harness;
 mod libpcap_loopback;
 mod libpcap_websocket_loopback;
+mod linux_socket_destroy_enforcement;
 mod loopback;
 mod mitm_plaintext_bridge;
+mod outcome;
 mod plaintext_assertions;
 mod plaintext_export_batches;
 mod plaintext_feed;
@@ -31,4 +33,5 @@ mod webhook_receiver;
 mod websocket_expectations;
 mod websocket_plaintext_feed;
 
+pub(crate) use outcome::E2eOutcome;
 pub(crate) use suite::{case_names, run as run_suite, run_case_by_name};

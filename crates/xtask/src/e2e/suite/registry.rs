@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, process::ExitCode};
 
 use super::super::{
+    E2eOutcome,
     admin_enforcement_reload::run as run_admin_enforcement_reload,
     admin_policy_reload::run as run_admin_policy_reload,
     capture_loss_event_feed::run as run_capture_loss_event_feed,
@@ -9,6 +10,7 @@ use super::super::{
     gap_plaintext_feed::run as run_gap_plaintext_feed,
     libpcap_loopback::run as run_libpcap_loopback,
     libpcap_websocket_loopback::run as run_libpcap_websocket_loopback,
+    linux_socket_destroy_enforcement::run as run_linux_socket_destroy_enforcement,
     mitm_plaintext_bridge::{
         run as run_mitm_plaintext_bridge_live_sidecar,
         run_managed as run_managed_mitm_plaintext_bridge_live_sidecar,
@@ -88,7 +90,22 @@ impl E2eRequirement {
 pub(super) struct E2eCase {
     pub(super) name: &'static str,
     pub(super) requirement: E2eRequirement,
-    pub(super) run: fn() -> ExitCode,
+    pub(super) run: E2eCaseRun,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum E2eCaseRun {
+    ExitCode(fn() -> ExitCode),
+    Outcome(fn() -> E2eOutcome),
+}
+
+impl E2eCaseRun {
+    pub(super) fn run(self) -> E2eOutcome {
+        match self {
+            Self::ExitCode(run) => E2eOutcome::from_exit_code(run()),
+            Self::Outcome(run) => run(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,192 +136,197 @@ const E2E_CASES: &[E2eCase] = &[
     E2eCase {
         name: "e2e-plaintext-feed",
         requirement: E2eRequirement::User,
-        run: run_plaintext_feed,
+        run: E2eCaseRun::ExitCode(run_plaintext_feed),
     },
     E2eCase {
         name: "e2e-sse-plaintext-feed",
         requirement: E2eRequirement::User,
-        run: run_sse_plaintext_feed,
+        run: E2eCaseRun::ExitCode(run_sse_plaintext_feed),
     },
     E2eCase {
         name: "e2e-gap-plaintext-feed",
         requirement: E2eRequirement::User,
-        run: run_gap_plaintext_feed,
+        run: E2eCaseRun::ExitCode(run_gap_plaintext_feed),
     },
     E2eCase {
         name: "e2e-capture-loss-event-feed",
         requirement: E2eRequirement::User,
-        run: run_capture_loss_event_feed,
+        run: E2eCaseRun::ExitCode(run_capture_loss_event_feed),
     },
     E2eCase {
         name: "e2e-websocket-plaintext-feed",
         requirement: E2eRequirement::User,
-        run: run_websocket_plaintext_feed,
+        run: E2eCaseRun::ExitCode(run_websocket_plaintext_feed),
     },
     E2eCase {
         name: "e2e-webhook-exporter",
         requirement: E2eRequirement::User,
-        run: run_webhook_exporter,
+        run: E2eCaseRun::ExitCode(run_webhook_exporter),
     },
     E2eCase {
         name: "e2e-file-exporter",
         requirement: E2eRequirement::User,
-        run: run_file_exporter,
+        run: E2eCaseRun::ExitCode(run_file_exporter),
     },
     E2eCase {
         name: "e2e-remote-enforcement-policy",
         requirement: E2eRequirement::User,
-        run: run_remote_enforcement_policy,
+        run: E2eCaseRun::ExitCode(run_remote_enforcement_policy),
     },
     E2eCase {
         name: "e2e-remote-policy-bundle",
         requirement: E2eRequirement::User,
-        run: run_remote_policy_bundle,
+        run: E2eCaseRun::ExitCode(run_remote_policy_bundle),
     },
     E2eCase {
         name: "e2e-libpcap-loopback",
         requirement: E2eRequirement::RootCapNetRaw,
-        run: run_libpcap_loopback,
+        run: E2eCaseRun::ExitCode(run_libpcap_loopback),
     },
     E2eCase {
         name: "e2e-libpcap-websocket-loopback",
         requirement: E2eRequirement::RootCapNetRaw,
-        run: run_libpcap_websocket_loopback,
+        run: E2eCaseRun::ExitCode(run_libpcap_websocket_loopback),
     },
     E2eCase {
         name: "e2e-admin-policy-reload",
         requirement: E2eRequirement::RootCapNetRaw,
-        run: run_admin_policy_reload,
+        run: E2eCaseRun::ExitCode(run_admin_policy_reload),
     },
     E2eCase {
         name: "e2e-admin-enforcement-reload",
         requirement: E2eRequirement::RootCapNetRaw,
-        run: run_admin_enforcement_reload,
+        run: E2eCaseRun::ExitCode(run_admin_enforcement_reload),
+    },
+    E2eCase {
+        name: "e2e-linux-socket-destroy-enforcement",
+        requirement: E2eRequirement::RootCapNetRaw,
+        run: E2eCaseRun::Outcome(run_linux_socket_destroy_enforcement),
     },
     E2eCase {
         name: "e2e-ebpf-process-loopback",
         requirement: E2eRequirement::RootBpffs,
-        run: run_ebpf_process_loopback,
+        run: E2eCaseRun::ExitCode(run_ebpf_process_loopback),
     },
     E2eCase {
         name: "e2e-tls-plaintext-provider-loopback",
         requirement: E2eRequirement::RootBpffs,
-        run: run_tls_plaintext_provider_loopback,
+        run: E2eCaseRun::ExitCode(run_tls_plaintext_provider_loopback),
     },
     E2eCase {
         name: "e2e-tls-plaintext-loopback",
         requirement: E2eRequirement::RootBpffs,
-        run: run_tls_plaintext_loopback,
+        run: E2eCaseRun::ExitCode(run_tls_plaintext_loopback),
     },
     E2eCase {
         name: "e2e-tls-plaintext-dynamic-loopback",
         requirement: E2eRequirement::RootBpffs,
-        run: run_tls_plaintext_dynamic_loopback,
+        run: E2eCaseRun::ExitCode(run_tls_plaintext_dynamic_loopback),
     },
     E2eCase {
         name: "e2e-tls-plaintext-target-lifecycle-loopback",
         requirement: E2eRequirement::RootBpffs,
-        run: run_tls_plaintext_target_lifecycle_loopback,
+        run: E2eCaseRun::ExitCode(run_tls_plaintext_target_lifecycle_loopback),
     },
     E2eCase {
         name: "e2e-tls-plaintext-dynamic-library-loopback",
         requirement: E2eRequirement::RootBpffs,
-        run: run_tls_plaintext_dynamic_library_loopback,
+        run: E2eCaseRun::ExitCode(run_tls_plaintext_dynamic_library_loopback),
     },
     E2eCase {
         name: "e2e-tls-plaintext-dynamic-library-unload-loopback",
         requirement: E2eRequirement::RootBpffs,
-        run: run_tls_plaintext_dynamic_library_unload_loopback,
+        run: E2eCaseRun::ExitCode(run_tls_plaintext_dynamic_library_unload_loopback),
     },
     E2eCase {
         name: "e2e-tls-session-secret-auto-binding-loopback",
         requirement: E2eRequirement::RootCapNetRaw,
-        run: run_tls_session_secret_auto_binding_loopback,
+        run: E2eCaseRun::ExitCode(run_tls_session_secret_auto_binding_loopback),
     },
     E2eCase {
         name: "e2e-tls-session-secret-material-refresh-auto-binding-loopback",
         requirement: E2eRequirement::RootCapNetRaw,
-        run: run_tls_session_secret_material_refresh_auto_binding_loopback,
+        run: E2eCaseRun::ExitCode(run_tls_session_secret_material_refresh_auto_binding_loopback),
     },
     E2eCase {
         name: "e2e-tls-keylog-auto-binding-loopback",
         requirement: E2eRequirement::RootCapNetRaw,
-        run: run_tls_key_log_auto_binding_loopback,
+        run: E2eCaseRun::ExitCode(run_tls_key_log_auto_binding_loopback),
     },
     E2eCase {
         name: "e2e-tls-keylog-material-refresh-auto-binding-loopback",
         requirement: E2eRequirement::RootCapNetRaw,
-        run: run_tls_key_log_material_refresh_auto_binding_loopback,
+        run: E2eCaseRun::ExitCode(run_tls_key_log_material_refresh_auto_binding_loopback),
     },
     E2eCase {
         name: "e2e-transparent-tproxy-loopback",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_transparent_tproxy_loopback,
+        run: E2eCaseRun::ExitCode(run_transparent_tproxy_loopback),
     },
     E2eCase {
         name: "e2e-transparent-tproxy-process-loopback",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_transparent_tproxy_process_loopback,
+        run: E2eCaseRun::ExitCode(run_transparent_tproxy_process_loopback),
     },
     E2eCase {
         name: "e2e-transparent-linux-outbound-redirect-artifact-netns",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_transparent_linux_outbound_redirect_artifact,
+        run: E2eCaseRun::ExitCode(run_transparent_linux_outbound_redirect_artifact),
     },
     E2eCase {
         name: "e2e-transparent-outbound-proxy-loopback",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_transparent_outbound_proxy_loopback,
+        run: E2eCaseRun::ExitCode(run_transparent_outbound_proxy_loopback),
     },
     E2eCase {
         name: "e2e-transparent-outbound-external-proxy-loopback",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_transparent_outbound_external_proxy_loopback,
+        run: E2eCaseRun::ExitCode(run_transparent_outbound_external_proxy_loopback),
     },
     E2eCase {
         name: "e2e-transparent-outbound-owner-proxy-loopback",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_transparent_outbound_owner_proxy_loopback,
+        run: E2eCaseRun::ExitCode(run_transparent_outbound_owner_proxy_loopback),
     },
     E2eCase {
         name: "e2e-transparent-outbound-remote-policy-bundle-loopback",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_transparent_outbound_remote_policy_bundle_loopback,
+        run: E2eCaseRun::ExitCode(run_transparent_outbound_remote_policy_bundle_loopback),
     },
     E2eCase {
         name: "e2e-mitm-plaintext-bridge-live-sidecar",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_mitm_plaintext_bridge_live_sidecar,
+        run: E2eCaseRun::ExitCode(run_mitm_plaintext_bridge_live_sidecar),
     },
     E2eCase {
         name: "e2e-mitm-policy-hook-plaintext-bridge-live-sidecar",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_mitm_policy_hook_plaintext_bridge_live_sidecar,
+        run: E2eCaseRun::ExitCode(run_mitm_policy_hook_plaintext_bridge_live_sidecar),
     },
     E2eCase {
         name: "e2e-managed-mitm-plaintext-bridge-live-sidecar",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_managed_mitm_plaintext_bridge_live_sidecar,
+        run: E2eCaseRun::ExitCode(run_managed_mitm_plaintext_bridge_live_sidecar),
     },
     E2eCase {
         name: "e2e-managed-mitm-policy-hook-plaintext-bridge-live-sidecar",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_managed_mitm_policy_hook_plaintext_bridge_live_sidecar,
+        run: E2eCaseRun::ExitCode(run_managed_mitm_policy_hook_plaintext_bridge_live_sidecar),
     },
     E2eCase {
         name: "e2e-managed-mitm-proxy-policy-hook-plaintext-bridge-live-sidecar",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_managed_mitm_proxy_policy_hook_plaintext_bridge_live_sidecar,
+        run: E2eCaseRun::ExitCode(run_managed_mitm_proxy_policy_hook_plaintext_bridge_live_sidecar),
     },
     E2eCase {
         name: "e2e-outbound-mitm-plaintext-bridge-live-sidecar",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_outbound_mitm_plaintext_bridge_live_sidecar,
+        run: E2eCaseRun::ExitCode(run_outbound_mitm_plaintext_bridge_live_sidecar),
     },
     E2eCase {
         name: "e2e-managed-outbound-mitm-plaintext-bridge-live-sidecar",
         requirement: E2eRequirement::RootNetAdmin,
-        run: run_managed_outbound_mitm_plaintext_bridge_live_sidecar,
+        run: E2eCaseRun::ExitCode(run_managed_outbound_mitm_plaintext_bridge_live_sidecar),
     },
 ];
 
@@ -334,6 +356,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-libpcap-websocket-loopback",
             "e2e-admin-policy-reload",
             "e2e-admin-enforcement-reload",
+            "e2e-linux-socket-destroy-enforcement",
             "e2e-tls-session-secret-auto-binding-loopback",
             "e2e-tls-session-secret-material-refresh-auto-binding-loopback",
             "e2e-tls-keylog-auto-binding-loopback",
@@ -403,6 +426,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-libpcap-websocket-loopback",
             "e2e-admin-policy-reload",
             "e2e-admin-enforcement-reload",
+            "e2e-linux-socket-destroy-enforcement",
             "e2e-ebpf-process-loopback",
             "e2e-tls-plaintext-provider-loopback",
             "e2e-tls-plaintext-loopback",
@@ -584,6 +608,7 @@ mod tests {
                 "e2e-libpcap-websocket-loopback",
                 "e2e-admin-policy-reload",
                 "e2e-admin-enforcement-reload",
+                "e2e-linux-socket-destroy-enforcement",
                 "e2e-tls-session-secret-auto-binding-loopback",
                 "e2e-tls-session-secret-material-refresh-auto-binding-loopback",
                 "e2e-tls-keylog-auto-binding-loopback",
@@ -655,6 +680,7 @@ mod tests {
                 "e2e-libpcap-websocket-loopback",
                 "e2e-admin-policy-reload",
                 "e2e-admin-enforcement-reload",
+                "e2e-linux-socket-destroy-enforcement",
                 "e2e-ebpf-process-loopback",
                 "e2e-tls-plaintext-provider-loopback",
                 "e2e-tls-plaintext-loopback",

@@ -203,6 +203,24 @@ pub(crate) fn wait_for_child_exit(
     }
 }
 
+pub(crate) fn wait_for_child_status(
+    child: &mut Child,
+    timeout: Duration,
+    name: &'static str,
+) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+    match wait_for_exit(child, timeout)? {
+        Some(status) => Ok(status),
+        None => {
+            send_sigkill(child)?;
+            let status = child.wait()?;
+            Err(e2e_error(format!(
+                "{name} did not exit within {timeout:?}; killed with {status}",
+            ))
+            .into())
+        }
+    }
+}
+
 pub(crate) fn stop_running_child(
     child: &mut Child,
     name: &'static str,
