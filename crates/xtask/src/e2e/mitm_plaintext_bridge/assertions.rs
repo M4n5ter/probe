@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeSet,
     fs,
-    net::{Ipv4Addr, SocketAddr, TcpStream},
+    io::{Read, Write},
+    net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -38,6 +39,7 @@ use crate::e2e::{
 
 const HEALTH_TRANSITION_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTBOUND_REDIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const MANAGED_DATA_PLANE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) fn assert_mitm_backend_runtime(
     case: MitmBridgeCase,
@@ -90,6 +92,66 @@ pub(super) fn assert_outbound_redirect_reaches_mitm_backend(
         ))
     })?;
     Ok(())
+}
+
+pub(super) fn exercise_managed_mitm_data_plane(
+    case: MitmBridgeCase,
+    backend: &PreparedMitmBackend,
+    intercept_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if case.backend() != MitmBackendKind::ManagedProcess {
+        return Ok(());
+    }
+    let target = managed_data_plane_target(case, backend, intercept_port)?;
+    let mut stream =
+        TcpStream::connect_timeout(&target, MANAGED_DATA_PLANE_TIMEOUT).map_err(|error| {
+            e2e_error(format!(
+                "{} managed MITM data-plane canary could not connect to {target}: {error}",
+                case.case_name()
+            ))
+        })?;
+    stream.set_read_timeout(Some(MANAGED_DATA_PLANE_TIMEOUT))?;
+    stream.set_write_timeout(Some(MANAGED_DATA_PLANE_TIMEOUT))?;
+    stream.write_all(mitm_bridge::REQUEST_BYTES)?;
+    stream.shutdown(Shutdown::Write)?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let expected = if case.backend_owned_policy_hook_enabled() {
+        mitm_bridge::DENY_RESPONSE_BYTES
+    } else {
+        mitm_bridge::PASSTHROUGH_RESPONSE_BYTES
+    };
+    if response == expected {
+        return Ok(());
+    }
+    Err(e2e_error(format!(
+        "{} managed MITM data-plane response mismatch: expected {:?}, got {:?}",
+        case.case_name(),
+        String::from_utf8_lossy(expected),
+        String::from_utf8_lossy(&response)
+    ))
+    .into())
+}
+
+fn managed_data_plane_target(
+    case: MitmBridgeCase,
+    backend: &PreparedMitmBackend,
+    intercept_port: u16,
+) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    match case.direction() {
+        MitmBridgeDirection::Inbound => match &backend.config {
+            MitmBackendConfig::ManagedProcess { target, .. } => {
+                target.parse::<SocketAddr>().map_err(Into::into)
+            }
+            MitmBackendConfig::External { .. } => {
+                Err(e2e_error("managed data-plane canary received an external backend").into())
+            }
+        },
+        MitmBridgeDirection::Outbound => {
+            Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, intercept_port)))
+        }
+    }
 }
 
 pub(super) fn assert_spool_outputs(

@@ -20,6 +20,10 @@ pub const POLICY_HOOK_ACCEPT: &str = "application/json";
 pub const POLICY_HOOK_RESPONSE_REASON: &str = "e2e MITM policy hook delegated deny";
 pub const REQUEST_BYTES: &[u8] =
     b"GET /mitm-bridge/e2e HTTP/1.1\r\nHost: mitm-bridge.e2e.test\r\n\r\n";
+pub const PASSTHROUGH_RESPONSE_BYTES: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+pub const DENY_RESPONSE_BYTES: &[u8] =
+    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 pub fn create_empty_capture_event_feed(path: &Path) -> Result<(), io::Error> {
     OpenOptions::new().write(true).create_new(true).open(path)?;

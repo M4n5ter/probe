@@ -2,7 +2,7 @@ use std::{
     error::Error,
     fmt,
     fs::OpenOptions,
-    io::{self, Write},
+    io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     thread,
@@ -21,6 +21,8 @@ use serde_json::{Value, json};
 use super::loopback::{LoopbackError, bind_loopback_listener};
 
 const SCENARIO: &str = "managed-mitm-backend";
+const DATA_PLANE_READ_TIMEOUT: Duration = Duration::from_millis(200);
+const MAX_DATA_PLANE_REQUEST_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManagedMitmBackendConfig {
@@ -100,8 +102,12 @@ pub(crate) fn run_managed_mitm_backend(
 
     let mut state = ManagedMitmState::default();
     loop {
-        let accepted_mitm =
-            accept_mitm_connection(&listener, &config.bridge_feed_file, &mut state)?;
+        let accepted_mitm = accept_mitm_connection(
+            &listener,
+            &config.bridge_feed_file,
+            config.policy_hook.is_some(),
+            &mut state,
+        )?;
         let accepted_hook = match (&policy_hook_listener, &config.policy_hook) {
             (Some(listener), Some(policy_hook)) => {
                 accept_policy_hook_connection(listener, policy_hook, &mut state)?
@@ -114,31 +120,118 @@ pub(crate) fn run_managed_mitm_backend(
     }
 }
 
-#[derive(Default)]
-struct ManagedMitmState {
-    flow_ready: bool,
-    action_report_written: bool,
+#[derive(Debug, Default)]
+enum ManagedMitmState {
+    #[default]
+    Waiting,
+    PassthroughComplete,
+    PendingDeny {
+        downstream: TcpStream,
+    },
+    DenyReported,
 }
 
 fn accept_mitm_connection(
     listener: &TcpListener,
     bridge_feed_file: &Path,
+    policy_hook_enabled: bool,
     state: &mut ManagedMitmState,
 ) -> Result<bool, ManagedMitmBackendError> {
     match listener.accept() {
         Ok((stream, _peer)) => {
-            drop(stream);
-            if !state.flow_ready {
-                mitm_bridge::append_capture_event_feed(bridge_feed_file)
-                    .map_err(ManagedMitmBackendError::Feed)?;
-                state.flow_ready = true;
-            }
+            handle_mitm_connection(stream, bridge_feed_file, policy_hook_enabled, state)?;
             Ok(true)
         }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
         Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
         Err(source) => Err(io_error("accept managed MITM readiness connection", source)),
     }
+}
+
+fn handle_mitm_connection(
+    mut stream: TcpStream,
+    bridge_feed_file: &Path,
+    policy_hook_enabled: bool,
+    state: &mut ManagedMitmState,
+) -> Result<(), ManagedMitmBackendError> {
+    configure_mitm_stream(&stream)?;
+    let Some(request) = read_data_plane_request(&mut stream)? else {
+        return Ok(());
+    };
+    validate_data_plane_request(&request)?;
+    if !matches!(state, ManagedMitmState::Waiting) {
+        return Err(ManagedMitmBackendError::Invalid(
+            "managed MITM backend already owns a plaintext bridge flow".to_string(),
+        ));
+    }
+    mitm_bridge::append_capture_event_feed(bridge_feed_file)
+        .map_err(ManagedMitmBackendError::Feed)?;
+    if policy_hook_enabled {
+        *state = ManagedMitmState::PendingDeny { downstream: stream };
+    } else {
+        write_data_plane_response(stream, mitm_bridge::PASSTHROUGH_RESPONSE_BYTES)?;
+        *state = ManagedMitmState::PassthroughComplete;
+    }
+    Ok(())
+}
+
+fn configure_mitm_stream(stream: &TcpStream) -> Result<(), ManagedMitmBackendError> {
+    stream
+        .set_read_timeout(Some(DATA_PLANE_READ_TIMEOUT))
+        .map_err(|source| io_error("set managed MITM data-plane read timeout", source))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|source| io_error("set managed MITM data-plane write timeout", source))
+}
+
+fn read_data_plane_request(
+    stream: &mut TcpStream,
+) -> Result<Option<Vec<u8>>, ManagedMitmBackendError> {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) if request.is_empty() => return Ok(None),
+            Ok(0) => break,
+            Ok(read) => {
+                request.extend_from_slice(&buffer[..read]);
+                if request.len() > MAX_DATA_PLANE_REQUEST_BYTES {
+                    return Err(ManagedMitmBackendError::Invalid(format!(
+                        "managed MITM data-plane request exceeded {MAX_DATA_PLANE_REQUEST_BYTES} bytes"
+                    )));
+                }
+                if request
+                    .windows(b"\r\n\r\n".len())
+                    .any(|window| window == b"\r\n\r\n")
+                {
+                    break;
+                }
+            }
+            Err(error) if request.is_empty() && is_empty_readiness_probe(&error) => {
+                return Ok(None);
+            }
+            Err(source) => return Err(io_error("read managed MITM data-plane request", source)),
+        }
+    }
+    Ok(Some(request))
+}
+
+fn is_empty_readiness_probe(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
+}
+
+fn validate_data_plane_request(request: &[u8]) -> Result<(), ManagedMitmBackendError> {
+    if request == mitm_bridge::REQUEST_BYTES {
+        return Ok(());
+    }
+    Err(ManagedMitmBackendError::Invalid(format!(
+        "managed MITM backend expected HTTP request {:?}, got {:?}",
+        String::from_utf8_lossy(mitm_bridge::REQUEST_BYTES),
+        String::from_utf8_lossy(request)
+    )))
 }
 
 fn accept_policy_hook_connection(
@@ -187,8 +280,9 @@ fn handle_policy_hook_request(
     let decision = validate_policy_hook_request(&request, expected_host.as_str(), state);
     match decision {
         Ok(report) => {
+            complete_pending_deny(state)?;
             write_policy_action_report(&policy_hook.action_report_file, &report)?;
-            state.action_report_written = true;
+            *state = ManagedMitmState::DenyReported;
             write_policy_hook_response(
                 &mut stream,
                 200,
@@ -207,6 +301,29 @@ fn handle_policy_hook_request(
     }
 }
 
+fn complete_pending_deny(state: &mut ManagedMitmState) -> Result<(), ManagedMitmBackendError> {
+    let previous = std::mem::replace(state, ManagedMitmState::DenyReported);
+    let ManagedMitmState::PendingDeny { downstream } = previous else {
+        *state = previous;
+        return Err(ManagedMitmBackendError::Invalid(
+            "managed MITM backend has no pending downstream request to deny".to_string(),
+        ));
+    };
+    write_data_plane_response(downstream, mitm_bridge::DENY_RESPONSE_BYTES)
+}
+
+fn write_data_plane_response(
+    mut stream: TcpStream,
+    response: &[u8],
+) -> Result<(), ManagedMitmBackendError> {
+    stream
+        .write_all(response)
+        .map_err(|source| io_error("write managed MITM data-plane response", source))?;
+    stream
+        .flush()
+        .map_err(|source| io_error("flush managed MITM data-plane response", source))
+}
+
 #[derive(Debug)]
 struct PolicyActionReport {
     flow_id: String,
@@ -221,11 +338,21 @@ fn validate_policy_hook_request(
     expected_host: &str,
     state: &ManagedMitmState,
 ) -> Result<PolicyActionReport, String> {
-    if !state.flow_ready {
-        return Err("managed MITM backend has not observed a plaintext bridge flow".to_string());
-    }
-    if state.action_report_written {
-        return Err("managed MITM backend already executed a policy action".to_string());
+    match state {
+        ManagedMitmState::Waiting => {
+            return Err(
+                "managed MITM backend has not observed a plaintext bridge flow".to_string(),
+            );
+        }
+        ManagedMitmState::PassthroughComplete => {
+            return Err(
+                "managed MITM backend has no pending downstream request to deny".to_string(),
+            );
+        }
+        ManagedMitmState::DenyReported => {
+            return Err("managed MITM backend already executed a policy action".to_string());
+        }
+        ManagedMitmState::PendingDeny { .. } => {}
     }
 
     validate_policy_hook_http_contract(request, expected_host)?;
@@ -379,7 +506,11 @@ fn io_error(action: &'static str, source: io::Error) -> ManagedMitmBackendError 
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, fs};
+    use std::{
+        error::Error,
+        fs,
+        net::{Ipv4Addr, TcpListener, TcpStream},
+    };
 
     use serde_json::json;
 
@@ -412,10 +543,7 @@ mod tests {
 
     #[test]
     fn policy_hook_action_report_requires_owned_flow() -> Result<(), Box<dyn Error>> {
-        let state = ManagedMitmState {
-            flow_ready: true,
-            action_report_written: false,
-        };
+        let (state, _client) = pending_deny_state()?;
 
         let report =
             validate_policy_hook_request(&policy_hook_request(), policy_hook_host(), &state)?;
@@ -429,11 +557,8 @@ mod tests {
     }
 
     #[test]
-    fn policy_hook_action_report_requires_endpoint_contract() {
-        let state = ManagedMitmState {
-            flow_ready: true,
-            action_report_written: false,
-        };
+    fn policy_hook_action_report_requires_endpoint_contract() -> Result<(), Box<dyn Error>> {
+        let (state, _client) = pending_deny_state()?;
         let request = HttpJsonRequest {
             path: "/wrong-policy-hook".to_string(),
             ..policy_hook_request()
@@ -443,6 +568,15 @@ mod tests {
             .expect_err("policy hook must reject the wrong endpoint");
 
         assert!(error.contains("expected POST /mitm-policy-hook"));
+        Ok(())
+    }
+
+    fn pending_deny_state() -> Result<(ManagedMitmState, TcpStream), Box<dyn Error>> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let (downstream, _peer) = listener.accept()?;
+
+        Ok((ManagedMitmState::PendingDeny { downstream }, client))
     }
 
     fn policy_hook_request() -> HttpJsonRequest {

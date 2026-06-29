@@ -13,7 +13,7 @@ use std::{
 use assertions::{
     assert_backend_owned_policy_hook_execution, assert_mitm_backend_runtime,
     assert_outbound_redirect_reaches_mitm_backend, assert_spool_outputs,
-    exercise_l7_mitm_health_transition,
+    exercise_l7_mitm_health_transition, exercise_managed_mitm_data_plane,
 };
 use backend::{
     MitmBridgeCase, cleanup_managed_backend, prepare_mitm_backend, unused_intercept_port,
@@ -187,11 +187,26 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
             )
         },
     );
-    let bridge_feed_append = run_after_success([&outbound_redirect, &primary_progress], || {
-        append_bridge_feed_from_harness(case, &bridge_feed_path)
-    });
+    let managed_data_plane = run_after_success(
+        [
+            &agent_ready,
+            &backend_status,
+            &outbound_redirect,
+            &primary_progress,
+        ],
+        || exercise_managed_mitm_data_plane(case, &mitm_backend, intercept_port),
+    );
+    let bridge_feed_append = run_after_success(
+        [&outbound_redirect, &primary_progress, &managed_data_plane],
+        || append_bridge_feed_from_harness(case, &bridge_feed_path),
+    );
     let bridge_progress = run_after_success(
-        [&outbound_redirect, &primary_progress, &bridge_feed_append],
+        [
+            &outbound_redirect,
+            &primary_progress,
+            &managed_data_plane,
+            &bridge_feed_append,
+        ],
         || {
             wait_for_agent_policy_progress(
                 agent.child_mut(),
@@ -205,6 +220,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
             &agent_ready,
             &backend_status,
             &outbound_redirect,
+            &managed_data_plane,
             &bridge_progress,
         ],
         || exercise_l7_mitm_health_transition(case, &mut mitm_backend, &admin_socket_path),
@@ -214,6 +230,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
             &agent_ready,
             &backend_status,
             &outbound_redirect,
+            &managed_data_plane,
             &bridge_progress,
         ],
         || {
@@ -274,6 +291,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
         fixture_start,
         primary_progress,
         bridge_feed_append,
+        managed_data_plane,
         bridge_progress,
         health_transition,
         policy_hook_decision,
@@ -299,6 +317,7 @@ struct MitmBridgePhases {
     fixture_start: RunResult,
     primary_progress: RunResult,
     bridge_feed_append: RunResult,
+    managed_data_plane: RunResult,
     bridge_progress: RunResult,
     health_transition: RunResult,
     policy_hook_decision: RunResult,
@@ -317,6 +336,7 @@ impl MitmBridgePhases {
             &self.outbound_redirect,
             &self.fixture_start,
             &self.primary_progress,
+            &self.managed_data_plane,
             &self.bridge_feed_append,
             &self.bridge_progress,
             &self.health_transition,
@@ -328,7 +348,7 @@ impl MitmBridgePhases {
         ])
     }
 
-    fn into_labeled_results(self, spool: RunResult) -> [LabeledRunResult; 15] {
+    fn into_labeled_results(self, spool: RunResult) -> [LabeledRunResult; 16] {
         [
             ("fixture", self.fixture),
             ("agent readiness", self.agent_ready),
@@ -336,6 +356,7 @@ impl MitmBridgePhases {
             ("outbound MITM redirect", self.outbound_redirect),
             ("fixture start", self.fixture_start),
             ("agent primary policy progress", self.primary_progress),
+            ("managed MITM data plane", self.managed_data_plane),
             ("MITM bridge feed append", self.bridge_feed_append),
             ("agent MITM bridge policy progress", self.bridge_progress),
             ("L7 MITM backend health transition", self.health_transition),
