@@ -380,6 +380,7 @@ mod tests {
                     device_minor: 1,
                     inode: u64::from(pid),
                     deleted: false,
+                    link_ownership: capture::LibsslUprobeAttachLinkOwnershipSnapshot::unreported(),
                 }
             })
             .collect::<Vec<_>>();

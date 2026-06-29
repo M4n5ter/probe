@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use probe_core::ProcessGeneration;
 
 use super::{
@@ -125,6 +127,89 @@ pub struct LibsslUprobeAttachTargetSnapshot {
     pub device_minor: u32,
     pub inode: u64,
     pub deleted: bool,
+    pub link_ownership: LibsslUprobeAttachLinkOwnershipSnapshot,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibsslUprobeAttachLinkOwnershipSnapshot {
+    programs: Vec<LibsslUprobeAttachProgramLinkOwnershipSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibsslUprobeAttachProgramLinkOwnershipSnapshot {
+    program_name: &'static str,
+    owned_link_count: usize,
+}
+
+impl LibsslUprobeAttachLinkOwnershipSnapshot {
+    pub fn unreported() -> Self {
+        Self::default()
+    }
+
+    pub fn owned_by_programs(
+        programs: impl IntoIterator<Item = LibsslUprobeAttachProgramLinkOwnershipSnapshot>,
+    ) -> Self {
+        Self::owned_by_program_counts(
+            programs
+                .into_iter()
+                .map(|program| (program.program_name, program.owned_link_count)),
+        )
+    }
+
+    pub fn owned_by_program_counts(
+        program_counts: impl IntoIterator<Item = (&'static str, usize)>,
+    ) -> Self {
+        let mut count_by_program = BTreeMap::new();
+        for (program_name, owned_link_count) in program_counts {
+            if owned_link_count == 0 {
+                continue;
+            }
+            *count_by_program.entry(program_name).or_insert(0) += owned_link_count;
+        }
+        Self {
+            programs: count_by_program
+                .into_iter()
+                .map(|(program_name, owned_link_count)| {
+                    LibsslUprobeAttachProgramLinkOwnershipSnapshot {
+                        program_name,
+                        owned_link_count,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    pub fn is_reported(&self) -> bool {
+        self.owned_link_count() > 0
+    }
+
+    pub fn owned_link_count(&self) -> usize {
+        self.programs
+            .iter()
+            .map(|program| program.owned_link_count)
+            .sum::<usize>()
+    }
+
+    pub fn into_programs(self) -> Vec<LibsslUprobeAttachProgramLinkOwnershipSnapshot> {
+        self.programs
+    }
+}
+
+impl LibsslUprobeAttachProgramLinkOwnershipSnapshot {
+    pub fn new(program_name: &'static str, owned_link_count: usize) -> Self {
+        Self {
+            program_name,
+            owned_link_count,
+        }
+    }
+
+    pub fn program_name(&self) -> &'static str {
+        self.program_name
+    }
+
+    pub fn owned_link_count(&self) -> usize {
+        self.owned_link_count
+    }
 }
 
 impl From<LibsslUprobeAttachTargetId> for LibsslUprobeAttachTargetSnapshot {
@@ -138,6 +223,7 @@ impl From<LibsslUprobeAttachTargetId> for LibsslUprobeAttachTargetSnapshot {
             device_minor: target.library.identity.device_minor,
             inode: target.library.identity.inode,
             deleted: target.library.deleted,
+            link_ownership: LibsslUprobeAttachLinkOwnershipSnapshot::unreported(),
         }
     }
 }
@@ -450,6 +536,43 @@ mod tests {
 
         assert!(!plan.has_attachable_probes());
         assert_eq!(plan.degraded_reasons(), &[reason]);
+    }
+
+    #[test]
+    fn attach_link_ownership_normalizes_program_counts() {
+        let ownership = LibsslUprobeAttachLinkOwnershipSnapshot::owned_by_program_counts([
+            ("tls_write_entry", 2),
+            ("tls_read_entry", 0),
+            ("tls_write_entry", 3),
+            ("tls_read_entry", 1),
+        ]);
+
+        assert!(ownership.is_reported());
+        assert_eq!(ownership.owned_link_count(), 6);
+        let programs = ownership.into_programs();
+        assert_eq!(
+            programs
+                .iter()
+                .map(|program| (program.program_name(), program.owned_link_count()))
+                .collect::<Vec<_>>(),
+            vec![("tls_read_entry", 1), ("tls_write_entry", 5)]
+        );
+    }
+
+    #[test]
+    fn attach_link_ownership_treats_empty_or_zero_counts_as_unreported() {
+        let empty = LibsslUprobeAttachLinkOwnershipSnapshot::owned_by_program_counts([]);
+        let zero = LibsslUprobeAttachLinkOwnershipSnapshot::owned_by_program_counts([(
+            "tls_read_entry",
+            0,
+        )]);
+
+        assert!(!empty.is_reported());
+        assert_eq!(empty.owned_link_count(), 0);
+        assert!(empty.into_programs().is_empty());
+        assert!(!zero.is_reported());
+        assert_eq!(zero.owned_link_count(), 0);
+        assert!(zero.into_programs().is_empty());
     }
 
     fn discovery_report(

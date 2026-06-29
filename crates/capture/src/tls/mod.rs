@@ -12,9 +12,10 @@ pub use attach_inventory::{
     plan_libssl_uprobes_for_processes,
 };
 pub use attach_plan::{
-    LibsslUprobeAttachKind, LibsslUprobeAttachPlan, LibsslUprobeAttachPoint,
-    LibsslUprobeAttachProcess, LibsslUprobeAttachRecipe, LibsslUprobeAttachTarget,
-    LibsslUprobeAttachTargetId, LibsslUprobeAttachTargetSnapshot,
+    LibsslUprobeAttachKind, LibsslUprobeAttachLinkOwnershipSnapshot, LibsslUprobeAttachPlan,
+    LibsslUprobeAttachPoint, LibsslUprobeAttachProcess,
+    LibsslUprobeAttachProgramLinkOwnershipSnapshot, LibsslUprobeAttachRecipe,
+    LibsslUprobeAttachTarget, LibsslUprobeAttachTargetId, LibsslUprobeAttachTargetSnapshot,
 };
 pub(in crate::tls) use attach_reconcile::{LibsslUprobeAttachState, LibsslUprobeReconcileReport};
 pub(in crate::tls) use discovery::LibsslUprobeProcessVerifier;

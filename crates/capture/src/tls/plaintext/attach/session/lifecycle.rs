@@ -14,6 +14,10 @@ use crate::tls::plaintext::attach::{
     error::LibsslUprobeAttachError, recipe::LibsslUprobeAttachRecipeRequest,
     summary::LibsslUprobeAttachSummary,
 };
+use crate::tls::{
+    LibsslUprobeAttachLinkOwnershipSnapshot, LibsslUprobeAttachTargetId,
+    LibsslUprobeAttachTargetSnapshot,
+};
 
 #[derive(Default)]
 pub(in crate::tls::plaintext) struct LibsslUprobeAttachSession {
@@ -24,8 +28,16 @@ pub(in crate::tls::plaintext) struct LibsslUprobeAttachSession {
 impl LibsslUprobeAttachSession {
     pub(in crate::tls::plaintext) fn attached_targets(
         &self,
-    ) -> impl Iterator<Item = crate::tls::LibsslUprobeAttachTargetId> + '_ {
+    ) -> impl Iterator<Item = LibsslUprobeAttachTargetId> + '_ {
         self.attached_links.targets()
+    }
+
+    pub(in crate::tls::plaintext) fn target_snapshot_with_link_ownership(
+        &self,
+        target: LibsslUprobeAttachTargetId,
+    ) -> LibsslUprobeAttachTargetSnapshot {
+        let link_ownership = self.attached_links.target_link_ownership(&target);
+        target_snapshot_with_link_ownership(target, link_ownership)
     }
 
     pub(in crate::tls::plaintext) fn attach_uprobes(
@@ -112,10 +124,20 @@ impl LibsslUprobeAttachSession {
     pub(in crate::tls::plaintext) fn detach_targets_best_effort(
         &mut self,
         ebpf: &mut Ebpf,
-        targets: impl IntoIterator<Item = crate::tls::LibsslUprobeAttachTargetId>,
+        targets: impl IntoIterator<Item = LibsslUprobeAttachTargetId>,
     ) -> Result<(), LibsslUprobeAttachError> {
         self.attached_links
             .detach_targets_best_effort(ebpf, targets)
+    }
+}
+
+fn target_snapshot_with_link_ownership(
+    target: LibsslUprobeAttachTargetId,
+    link_ownership: LibsslUprobeAttachLinkOwnershipSnapshot,
+) -> LibsslUprobeAttachTargetSnapshot {
+    LibsslUprobeAttachTargetSnapshot {
+        link_ownership,
+        ..LibsslUprobeAttachTargetSnapshot::from(target)
     }
 }
 

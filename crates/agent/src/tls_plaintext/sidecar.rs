@@ -519,6 +519,7 @@ mod tests {
                 device_minor: 1,
                 inode: index as u64 + 1,
                 deleted: false,
+                link_ownership: capture::LibsslUprobeAttachLinkOwnershipSnapshot::unreported(),
             })
             .collect::<Vec<_>>();
         LibsslUprobeReconcileTargetBucket::new(targets)

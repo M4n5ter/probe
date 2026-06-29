@@ -242,12 +242,12 @@ impl LibsslUprobePlaintextProbe {
             )?;
             let committed_targets = summary.committed_targets().collect::<Vec<_>>();
             attached_count = committed_targets.len();
-            attached_targets = reconcile_target_bucket(committed_targets);
+            attached_targets = self.reconcile_owned_target_bucket(committed_targets);
             attach_summary = Some(summary);
         }
         let active_target_ids = self.attach_session.attached_targets().collect::<Vec<_>>();
         let active_count = active_target_ids.len();
-        let active_targets = reconcile_target_bucket(active_target_ids);
+        let active_targets = self.reconcile_owned_target_bucket(active_target_ids);
         if let Some(reason) = attach_summary.as_ref().and_then(|summary| {
             unresolvable_reconcile_attach_reason(summary, attached_count, active_count)
         }) {
@@ -286,6 +286,16 @@ impl LibsslUprobePlaintextProbe {
 
     fn current_attach_state(&self) -> LibsslUprobeAttachState {
         LibsslUprobeAttachState::from_targets(self.attach_session.attached_targets())
+    }
+
+    fn reconcile_owned_target_bucket(
+        &self,
+        targets: impl IntoIterator<Item = LibsslUprobeAttachTargetId>,
+    ) -> LibsslUprobeReconcileTargetBucket {
+        LibsslUprobeReconcileTargetBucket::new(targets.into_iter().map(|target| {
+            self.attach_session
+                .target_snapshot_with_link_ownership(target)
+        }))
     }
 
     fn enable_tls_state_epoch(&mut self) -> Result<(), LibsslUprobePlaintextProbeError> {

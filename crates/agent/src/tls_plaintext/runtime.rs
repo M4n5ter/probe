@@ -4,8 +4,9 @@ use std::{
 };
 
 use capture::{
-    CaptureProvider, LibsslUprobeAttachTargetSnapshot, LibsslUprobePlaintextOpen,
-    LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
+    CaptureProvider, LibsslUprobeAttachLinkOwnershipSnapshot,
+    LibsslUprobeAttachProgramLinkOwnershipSnapshot, LibsslUprobeAttachTargetSnapshot,
+    LibsslUprobePlaintextOpen, LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
     LibsslUprobePlaintextReconcile, LibsslUprobeReconcileTargetBucket,
 };
 use probe_core::RuntimeMode;
@@ -182,6 +183,7 @@ pub struct TlsPlaintextReconcileTargetRuntimeSnapshot {
     pub inode: u64,
     pub deleted: bool,
     pub reconcile_state: TlsPlaintextTargetReconcileStateRuntimeSnapshot,
+    pub link_ownership: TlsPlaintextTargetLinkOwnershipRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -197,6 +199,20 @@ pub enum TlsPlaintextTargetReconcileState {
     Attached,
     Active,
     Detached,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextTargetLinkOwnershipRuntimeSnapshot {
+    pub mode: RuntimeMode,
+    pub owned_link_count: u64,
+    pub programs: Vec<TlsPlaintextTargetLinkProgramRuntimeSnapshot>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextTargetLinkProgramRuntimeSnapshot {
+    pub program_name: &'static str,
+    pub owned_link_count: u64,
 }
 
 impl TlsPlaintextReconcileRuntimeSnapshot {
@@ -267,6 +283,9 @@ impl TlsPlaintextReconcileTargetRuntimeSnapshot {
             inode: target.inode,
             deleted: target.deleted,
             reconcile_state,
+            link_ownership: TlsPlaintextTargetLinkOwnershipRuntimeSnapshot::from_capture(
+                target.link_ownership,
+            ),
         }
     }
 }
@@ -301,6 +320,45 @@ impl TlsPlaintextTargetReconcileStateRuntimeSnapshot {
                 "target was detached because it was absent from the latest attach plan".to_string(),
             ),
         }
+    }
+}
+
+impl TlsPlaintextTargetLinkOwnershipRuntimeSnapshot {
+    fn from_capture(link_ownership: LibsslUprobeAttachLinkOwnershipSnapshot) -> Self {
+        let owned_link_count = link_ownership.owned_link_count();
+        if !link_ownership.is_reported() {
+            return Self {
+                mode: RuntimeMode::Unavailable,
+                owned_link_count: 0,
+                programs: Vec::new(),
+                reason: Some(
+                    "no committed libssl uprobe link ownership was reported for this target"
+                        .to_string(),
+                ),
+            };
+        }
+        Self {
+            mode: RuntimeMode::Available,
+            owned_link_count: owned_link_count as u64,
+            programs: link_ownership
+                .into_programs()
+                .into_iter()
+                .map(link_program_snapshot)
+                .collect(),
+            reason: Some(
+                "userspace attach session holds committed libssl uprobe links for this target"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+fn link_program_snapshot(
+    program: LibsslUprobeAttachProgramLinkOwnershipSnapshot,
+) -> TlsPlaintextTargetLinkProgramRuntimeSnapshot {
+    TlsPlaintextTargetLinkProgramRuntimeSnapshot {
+        program_name: program.program_name(),
+        owned_link_count: program.owned_link_count() as u64,
     }
 }
 
@@ -659,7 +717,8 @@ fn record_runtime_reconcile_failure(
 #[cfg(test)]
 mod tests {
     use capture::{
-        CaptureError, CapturePoll, LibsslUprobeAttachTargetSnapshot,
+        CaptureError, CapturePoll, LibsslUprobeAttachLinkOwnershipSnapshot,
+        LibsslUprobeAttachProgramLinkOwnershipSnapshot, LibsslUprobeAttachTargetSnapshot,
         LibsslUprobeReconcileTargetBucket, MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET,
     };
     use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
@@ -901,6 +960,38 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_runtime_snapshot_serializes_target_link_ownership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = TlsPlaintextReconcileRuntimeSnapshot::from_reconcile_success(
+            reconcile_result_with_active_link_ownership(),
+            1,
+            100,
+        );
+
+        let value = serde_json::to_value(snapshot)?;
+        let link_ownership = &value["targets"]["active"]["targets"][0]["link_ownership"];
+
+        assert_eq!(link_ownership["mode"], serde_json::json!("available"));
+        assert_eq!(link_ownership["owned_link_count"], serde_json::json!(3));
+        assert!(
+            link_ownership["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("userspace attach session holds"))
+        );
+        assert_eq!(
+            link_ownership["programs"][0]["program_name"],
+            "tls_read_entry"
+        );
+        assert_eq!(link_ownership["programs"][0]["owned_link_count"], 1);
+        assert_eq!(
+            link_ownership["programs"][1]["program_name"],
+            "tls_write_entry"
+        );
+        assert_eq!(link_ownership["programs"][1]["owned_link_count"], 2);
+        Ok(())
+    }
+
+    #[test]
     fn reconcile_runtime_snapshot_marks_detached_target_reconcile_state_unavailable()
     -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = TlsPlaintextReconcileRuntimeSnapshot::from_reconcile_success(
@@ -1023,26 +1114,41 @@ mod tests {
         }
     }
 
+    fn reconcile_result_with_active_link_ownership() -> LibsslUprobePlaintextReconcile {
+        let mut active = target_snapshot("active", 3_000);
+        active.link_ownership = LibsslUprobeAttachLinkOwnershipSnapshot::owned_by_programs([
+            LibsslUprobeAttachProgramLinkOwnershipSnapshot::new("tls_read_entry", 1),
+            LibsslUprobeAttachProgramLinkOwnershipSnapshot::new("tls_write_entry", 2),
+        ]);
+        LibsslUprobePlaintextReconcile {
+            attached_targets: target_snapshots("attached", 1_000, 0),
+            detached_targets: target_snapshots("detached", 2_000, 0),
+            active_targets: LibsslUprobeReconcileTargetBucket::new([active]),
+        }
+    }
+
     fn target_snapshots(
         kind: &str,
         first_pid: u32,
         count: usize,
     ) -> LibsslUprobeReconcileTargetBucket {
         let targets = (0..count)
-            .map(|index| {
-                let pid = first_pid + index as u32;
-                LibsslUprobeAttachTargetSnapshot {
-                    pid,
-                    start_time_ticks: u64::from(pid) * 100,
-                    mapped_path: format!("/usr/lib/{kind}-{pid}.so").into(),
-                    read_path: format!("/proc/{pid}/root/usr/lib/{kind}.so").into(),
-                    device_major: 8,
-                    device_minor: 1,
-                    inode: u64::from(pid),
-                    deleted: false,
-                }
-            })
+            .map(|index| target_snapshot(kind, first_pid + index as u32))
             .collect::<Vec<_>>();
         LibsslUprobeReconcileTargetBucket::new(targets)
+    }
+
+    fn target_snapshot(kind: &str, pid: u32) -> LibsslUprobeAttachTargetSnapshot {
+        LibsslUprobeAttachTargetSnapshot {
+            pid,
+            start_time_ticks: u64::from(pid) * 100,
+            mapped_path: format!("/usr/lib/{kind}-{pid}.so").into(),
+            read_path: format!("/proc/{pid}/root/usr/lib/{kind}.so").into(),
+            device_major: 8,
+            device_minor: 1,
+            inode: u64::from(pid),
+            deleted: false,
+            link_ownership: LibsslUprobeAttachLinkOwnershipSnapshot::unreported(),
+        }
     }
 }
