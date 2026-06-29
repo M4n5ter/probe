@@ -60,6 +60,10 @@ pub(crate) fn run_product_proxy_transparent_https_policy_hook() -> ExitCode {
     run_case(MitmBridgeCase::ProductProxyTransparentHttpsPolicyHook)
 }
 
+pub(crate) fn run_product_proxy_outbound_transparent_https_policy_hook() -> ExitCode {
+    run_case(MitmBridgeCase::ProductProxyOutboundTransparentHttpsPolicyHook)
+}
+
 pub(crate) fn run_policy_hook() -> ExitCode {
     run_case(MitmBridgeCase::ExternalInboundPolicyHook)
 }
@@ -149,11 +153,15 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
     );
     let fixture_ready =
         wait_for_http1_loopback_fixture_ready(fixture.child_mut(), &fixture_ready_path)?;
-    let mut mitm_backend =
-        prepare_mitm_backend(case, root, &bridge_feed_path, [fixture_ready.listen_port])?;
+    let intercept_port = unused_intercept_port([fixture_ready.listen_port]);
+    let mut mitm_backend = prepare_mitm_backend(
+        case,
+        root,
+        &bridge_feed_path,
+        [fixture_ready.listen_port, intercept_port],
+        intercept_port,
+    )?;
     initialize_bridge_feed(case, &bridge_feed_path)?;
-    let intercept_port =
-        unused_intercept_port([mitm_backend.proxy_port, fixture_ready.listen_port]);
     write_agent_config(AgentConfigInputs {
         case,
         config_path: &config_path,

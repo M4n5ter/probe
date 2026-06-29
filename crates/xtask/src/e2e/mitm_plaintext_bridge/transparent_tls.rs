@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::{self, Write},
-    net::Ipv4Addr,
+    net::{Ipv4Addr, SocketAddr},
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -15,7 +15,10 @@ use signal_hook::{
 use e2e_support::mitm_bridge;
 
 use super::{
-    backend::{MitmBridgeCase, PreparedMitmBackend, ProductProxyUpstreamRoute},
+    backend::{
+        MitmBackendConfig, MitmBridgeCase, MitmBridgeDirection, PreparedMitmBackend,
+        ProductProxyUpstreamRoute,
+    },
     feed::product_proxy_deny_response_bytes,
     tls::{MitmCaMaterial, SERVER_NAME},
 };
@@ -48,6 +51,29 @@ pub(super) fn exercise_product_proxy_transparent_tls_path(
     mitm_ca: &MitmCaMaterial,
     mitm_backend: &PreparedMitmBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    match case.direction() {
+        MitmBridgeDirection::Inbound => exercise_inbound_product_proxy_transparent_tls_path(
+            case,
+            supervisor,
+            intercept_port,
+            mitm_ca,
+            mitm_backend,
+        ),
+        MitmBridgeDirection::Outbound => exercise_outbound_product_proxy_transparent_tls_path(
+            intercept_port,
+            mitm_ca,
+            mitm_backend,
+        ),
+    }
+}
+
+fn exercise_inbound_product_proxy_transparent_tls_path(
+    case: MitmBridgeCase,
+    supervisor: &ChildSupervisor,
+    intercept_port: u16,
+    mitm_ca: &MitmCaMaterial,
+    mitm_backend: &PreparedMitmBackend,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut client_namespace = supervisor.watch(
         spawn_client_namespace_owner(case)?,
         "MITM transparent TLS client namespace",
@@ -56,39 +82,47 @@ pub(super) fn exercise_product_proxy_transparent_tls_path(
     wait_for_client_namespace_ready(client_namespace.child_mut())?;
     let _network = IsolatedClientNetwork::setup(client_pid)?;
     let upstream_route = product_proxy_upstream_route(mitm_backend)?;
-    let upstream = ProductProxyTlsUpstreamServer::start(upstream_route)?;
-    let response = run_tls_client(
-        client_pid,
-        intercept_port,
-        mitm_ca,
-        mitm_bridge::ALLOW_REQUEST_BYTES,
-    );
-    let upstream_result = upstream.wait();
-    let response = response?;
-    assert_tls_client_received_allow_response(&response)?;
-    upstream_result?;
-    let response = run_tls_client(
-        client_pid,
-        intercept_port,
-        mitm_ca,
-        mitm_bridge::REQUEST_BYTES,
-    )?;
-    assert_tls_client_received_deny_response(&response)?;
+    let exchange_result = exercise_product_proxy_tls_exchange(upstream_route, |request| {
+        run_client_netns_tls_client(client_pid, intercept_port, mitm_ca, request)
+    });
     let client_namespace_result = stop_running_child(
         client_namespace.child_mut(),
         "MITM transparent TLS client namespace",
     );
     client_namespace.unwatch();
-    client_namespace_result
+    exchange_result.and(client_namespace_result)
+}
+
+fn exercise_outbound_product_proxy_transparent_tls_path(
+    intercept_port: u16,
+    mitm_ca: &MitmCaMaterial,
+    mitm_backend: &PreparedMitmBackend,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_route = product_proxy_upstream_route(mitm_backend)?;
+    exercise_product_proxy_tls_exchange(upstream_route, |request| {
+        run_local_tls_client(intercept_port, mitm_ca, request)
+    })
+}
+
+fn exercise_product_proxy_tls_exchange(
+    upstream_route: &ProductProxyUpstreamRoute,
+    mut run_client: impl FnMut(&[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream = ProductProxyTlsUpstreamServer::start(upstream_route)?;
+    let response = run_client(mitm_bridge::ALLOW_REQUEST_BYTES);
+    let upstream_result = upstream.wait();
+    let response = response?;
+    assert_tls_client_received_allow_response(&response)?;
+    upstream_result?;
+    let response = run_client(mitm_bridge::REQUEST_BYTES)?;
+    assert_tls_client_received_deny_response(&response)
 }
 
 fn product_proxy_upstream_route(
     mitm_backend: &PreparedMitmBackend,
 ) -> Result<&ProductProxyUpstreamRoute, Box<dyn std::error::Error>> {
     match &mitm_backend.config {
-        super::backend::MitmBackendConfig::ProductProxy { upstream_route, .. } => {
-            Ok(upstream_route)
-        }
+        MitmBackendConfig::ProductProxy { upstream_route, .. } => Ok(upstream_route),
         config => Err(e2e_error(format!(
             "product proxy transparent TLS exercise received non-product backend {config:?}"
         ))
@@ -182,14 +216,15 @@ impl Drop for IsolatedClientNetwork {
     }
 }
 
-fn run_tls_client(
+fn run_client_netns_tls_client(
     client_pid: u32,
     intercept_port: u16,
     mitm_ca: &MitmCaMaterial,
     request: &[u8],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let connect = format!("{HOST_ADDR}:{intercept_port}");
-    let mut child = Command::new(nsenter_command()?)
+    let mut command = Command::new(nsenter_command()?);
+    command
         .args(["--target", &client_pid.to_string(), "--net", "--"])
         .arg(openssl_command()?)
         .args([
@@ -204,8 +239,39 @@ fn run_tls_client(
         .args(["-quiet"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    run_tls_client_command(&mut command, request)
+}
+
+fn run_local_tls_client(
+    intercept_port: u16,
+    mitm_ca: &MitmCaMaterial,
+    request: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let connect = SocketAddr::from((Ipv4Addr::LOCALHOST, intercept_port)).to_string();
+    let mut command = Command::new(openssl_command()?);
+    command
+        .args([
+            "s_client",
+            "-connect",
+            &connect,
+            "-servername",
+            SERVER_NAME,
+            "-CAfile",
+        ])
+        .arg(&mitm_ca.certificate_path)
+        .args(["-quiet"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    run_tls_client_command(&mut command, request)
+}
+
+fn run_tls_client_command(
+    command: &mut Command,
+    request: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut child = command.spawn()?;
     child
         .stdin
         .take()

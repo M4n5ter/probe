@@ -31,6 +31,8 @@ pub(super) const MANAGED_POLICY_HOOK_INBOUND_CASE_NAME: &str =
     "e2e-managed-mitm-policy-hook-plaintext-bridge-live-sidecar";
 pub(super) const PRODUCT_PROXY_TRANSPARENT_HTTPS_POLICY_HOOK_CASE_NAME: &str =
     "e2e-product-mitm-proxy-transparent-https-policy-hook";
+pub(super) const PRODUCT_PROXY_OUTBOUND_TRANSPARENT_HTTPS_POLICY_HOOK_CASE_NAME: &str =
+    "e2e-product-outbound-mitm-proxy-transparent-https-policy-hook";
 pub(super) const EXTERNAL_OUTBOUND_CASE_NAME: &str =
     "e2e-outbound-mitm-plaintext-bridge-live-sidecar";
 pub(super) const MANAGED_OUTBOUND_CASE_NAME: &str =
@@ -54,6 +56,7 @@ const DEFAULT_MANAGED_POLICY_HOOK_PORT: u16 = 65_518;
 const MANAGED_BACKEND_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const EXTERNAL_BACKEND_REBIND_TIMEOUT: Duration = Duration::from_secs(2);
 const EXTERNAL_BACKEND_LISTEN_BACKLOG: i32 = 128;
+const EXTERNAL_BACKEND_BIND_ATTEMPTS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MitmBridgeCase {
@@ -62,6 +65,7 @@ pub(super) enum MitmBridgeCase {
     ManagedInbound,
     ManagedInboundPolicyHook,
     ProductProxyTransparentHttpsPolicyHook,
+    ProductProxyOutboundTransparentHttpsPolicyHook,
     ExternalOutbound,
     ManagedOutbound,
 }
@@ -150,6 +154,12 @@ impl MitmBridgeCase {
                 policy_hook: MitmPolicyHookOwner::ProductProxy,
                 data_plane: MitmDataPlaneExercise::ProductProxyTransparentTls,
             },
+            Self::ProductProxyOutboundTransparentHttpsPolicyHook => MitmBridgeCaseSpec {
+                backend: MitmBackendKind::ProductProxy,
+                direction: MitmBridgeDirection::Outbound,
+                policy_hook: MitmPolicyHookOwner::ProductProxy,
+                data_plane: MitmDataPlaneExercise::ProductProxyTransparentTls,
+            },
             Self::ExternalOutbound => MitmBridgeCaseSpec {
                 backend: MitmBackendKind::External,
                 direction: MitmBridgeDirection::Outbound,
@@ -174,6 +184,9 @@ impl MitmBridgeCase {
             Self::ProductProxyTransparentHttpsPolicyHook => {
                 PRODUCT_PROXY_TRANSPARENT_HTTPS_POLICY_HOOK_CASE_NAME
             }
+            Self::ProductProxyOutboundTransparentHttpsPolicyHook => {
+                PRODUCT_PROXY_OUTBOUND_TRANSPARENT_HTTPS_POLICY_HOOK_CASE_NAME
+            }
             Self::ExternalOutbound => EXTERNAL_OUTBOUND_CASE_NAME,
             Self::ManagedOutbound => MANAGED_OUTBOUND_CASE_NAME,
         }
@@ -188,6 +201,9 @@ impl MitmBridgeCase {
             Self::ProductProxyTransparentHttpsPolicyHook => {
                 "TRAFFIC_PROBE_E2E_PRODUCT_MITM_PROXY_TRANSPARENT_HTTPS_POLICY_HOOK_NETNS"
             }
+            Self::ProductProxyOutboundTransparentHttpsPolicyHook => {
+                "TRAFFIC_PROBE_E2E_PRODUCT_OUTBOUND_MITM_PROXY_TRANSPARENT_HTTPS_POLICY_HOOK_NETNS"
+            }
             Self::ExternalOutbound => EXTERNAL_OUTBOUND_IN_NETNS_ENV,
             Self::ManagedOutbound => MANAGED_OUTBOUND_IN_NETNS_ENV,
         }
@@ -200,6 +216,7 @@ impl MitmBridgeCase {
             Self::ManagedInbound => "managed-mitm-bridge",
             Self::ManagedInboundPolicyHook => "managed-mitm-policy-hook-bridge",
             Self::ProductProxyTransparentHttpsPolicyHook => "product-mitm-https",
+            Self::ProductProxyOutboundTransparentHttpsPolicyHook => "product-outbound-mitm-https",
             Self::ExternalOutbound => "outbound-mitm-bridge",
             Self::ManagedOutbound => "managed-outbound-mitm-bridge",
         }
@@ -215,6 +232,9 @@ impl MitmBridgeCase {
             }
             Self::ProductProxyTransparentHttpsPolicyHook => {
                 "e2e product MITM proxy transparent HTTPS policy hook"
+            }
+            Self::ProductProxyOutboundTransparentHttpsPolicyHook => {
+                "e2e product outbound MITM proxy transparent HTTPS policy hook"
             }
             Self::ExternalOutbound => "e2e outbound MITM plaintext bridge live sidecar",
             Self::ManagedOutbound => "e2e managed outbound MITM plaintext bridge live sidecar",
@@ -233,6 +253,9 @@ impl MitmBridgeCase {
             }
             Self::ProductProxyTransparentHttpsPolicyHook => {
                 "e2e product MITM proxy transparent HTTPS policy hook passed"
+            }
+            Self::ProductProxyOutboundTransparentHttpsPolicyHook => {
+                "e2e product outbound MITM proxy transparent HTTPS policy hook passed"
             }
             Self::ExternalOutbound => "e2e outbound MITM plaintext bridge live sidecar passed",
             Self::ManagedOutbound => {
@@ -397,13 +420,16 @@ pub(super) fn prepare_mitm_backend(
     root: &Path,
     bridge_feed_path: &Path,
     used_ports: impl IntoIterator<Item = u16>,
+    intercept_port: u16,
 ) -> Result<PreparedMitmBackend, Box<dyn std::error::Error>> {
     match case.backend() {
-        MitmBackendKind::External => prepare_external_backend(),
+        MitmBackendKind::External => prepare_external_backend(used_ports),
         MitmBackendKind::ManagedProcess => {
             prepare_managed_process_backend(case, root, bridge_feed_path, used_ports)
         }
-        MitmBackendKind::ProductProxy => prepare_product_proxy_backend(root, used_ports),
+        MitmBackendKind::ProductProxy => {
+            prepare_product_proxy_backend(case, root, used_ports, intercept_port)
+        }
     }
 }
 
@@ -471,8 +497,10 @@ pub(super) fn cleanup_managed_backend(
     .into())
 }
 
-fn prepare_external_backend() -> Result<PreparedMitmBackend, Box<dyn std::error::Error>> {
-    let listener = bind_reusable_tcp_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+fn prepare_external_backend(
+    used_ports: impl IntoIterator<Item = u16>,
+) -> Result<PreparedMitmBackend, Box<dyn std::error::Error>> {
+    let listener = bind_external_backend_listener(used_ports)?;
     let backend = ExternalMitmBackend::start(listener)?;
     let target = backend.target();
     Ok(PreparedMitmBackend {
@@ -484,6 +512,19 @@ fn prepare_external_backend() -> Result<PreparedMitmBackend, Box<dyn std::error:
         action_report_file: None,
         external_backend: Some(backend),
     })
+}
+
+fn bind_external_backend_listener(
+    used_ports: impl IntoIterator<Item = u16>,
+) -> Result<TcpListener, Box<dyn std::error::Error>> {
+    let used_ports = used_ports.into_iter().collect::<BTreeSet<_>>();
+    for _ in 0..EXTERNAL_BACKEND_BIND_ATTEMPTS {
+        let listener = bind_reusable_tcp_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+        if !used_ports.contains(&listener.local_addr()?.port()) {
+            return Ok(listener);
+        }
+    }
+    Err(e2e_error("external MITM backend allocator kept selecting reserved ports").into())
 }
 
 fn prepare_managed_process_backend(
@@ -524,14 +565,18 @@ fn prepare_managed_process_backend(
 }
 
 fn prepare_product_proxy_backend(
+    case: MitmBridgeCase,
     root: &Path,
     used_ports: impl IntoIterator<Item = u16>,
+    intercept_port: u16,
 ) -> Result<PreparedMitmBackend, Box<dyn std::error::Error>> {
     let used_ports = used_ports.into_iter().collect::<BTreeSet<_>>();
     let target = managed_backend_target(used_ports.iter().copied())?;
     let policy_hook_target =
         managed_policy_hook_target(used_ports.iter().copied().chain([target.port()]))?;
     let upstream_target = product_proxy_upstream_target(
+        case,
+        intercept_port,
         used_ports
             .iter()
             .copied()
@@ -555,8 +600,13 @@ fn prepare_product_proxy_backend(
 }
 
 fn product_proxy_upstream_target(
+    case: MitmBridgeCase,
+    intercept_port: u16,
     used_ports: impl IntoIterator<Item = u16>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    if case.direction() == MitmBridgeDirection::Outbound {
+        return Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, intercept_port)));
+    }
     deterministic_loopback_target(
         DEFAULT_MANAGED_BACKEND_PORT - 10,
         used_ports,
