@@ -21,7 +21,6 @@ use pipeline::{PipelinePolicySet, PipelineRuntimeMetrics};
 
 use super::{
     enforcement_reload::{EnforcementReloadGate, reload_enforcement_policy},
-    policy_reload::{PolicyReloadGate, reload_policies},
     protocol::{AdminRequest, AdminResponse, enforcement_policy_reload_source, read_admin_request},
     socket::{AdminError, AdminServerConfig, bind_admin_socket},
 };
@@ -29,6 +28,7 @@ use crate::capture_provider::CaptureProviderRuntimeState;
 use crate::configured_enforcement::EnforcementRuntimeState;
 use crate::export::ExportWorkerRuntimeState;
 use crate::l7_mitm::L7MitmRuntimeHandle;
+use crate::policy_reload::{PolicyReloadGate, reload_policies};
 use crate::status::{
     AgentStatusSnapshot, EnforcementRuntimeStatusInput, PROMETHEUS_TEXT_CONTENT_TYPE,
     RuntimeStatusInput, build_status_snapshot_with_runtime, collect_running_spool_status,

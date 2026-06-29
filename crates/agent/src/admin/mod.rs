@@ -1,5 +1,4 @@
 mod enforcement_reload;
-mod policy_reload;
 mod protocol;
 mod server;
 mod socket;

@@ -15,6 +15,8 @@ mod l7_mitm;
 mod live_agent;
 mod periodic_worker;
 mod plaintext_feed;
+mod policy_reload;
+mod policy_reload_watcher;
 mod remote_source;
 mod runtime_composition;
 mod shutdown;

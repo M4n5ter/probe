@@ -4,7 +4,8 @@ use crate::{
     capture_event_feed::CaptureEventFeedLoadError, check::CheckError,
     configured_enforcement::ConfiguredEnforcementError, configured_policy::ConfiguredPolicyError,
     export::ExportDrainError, plaintext_feed::PlaintextFeedLoadError,
-    tls_plaintext::TlsDecryptHintError, transparent_interception::TransparentInterceptionError,
+    policy_reload_watcher::PolicyReloadWatcherError, tls_plaintext::TlsDecryptHintError,
+    transparent_interception::TransparentInterceptionError,
 };
 
 #[derive(Debug, Error)]
@@ -61,6 +62,8 @@ pub(crate) enum AgentError {
     TlsDecryptHints(#[from] TlsDecryptHintError),
     #[error("L7 MITM runtime error: {0}")]
     L7MitmRuntime(String),
+    #[error("policy reload watcher error: {0}")]
+    PolicyReloadWatcher(#[from] PolicyReloadWatcherError),
     #[error("admin error: {0}")]
     Admin(#[from] crate::admin::AdminError),
     #[error("{0}")]

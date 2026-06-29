@@ -75,9 +75,10 @@ pub use export::{
     ExporterTransportConfig, ExporterWorkerConfig,
 };
 pub use policy::{
-    DEFAULT_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES, MAX_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES,
-    PolicyConfig, PolicySourceConfig, RemotePolicyBundleBodyLimitBytes,
-    RemotePolicyBundleBodyLimitError,
+    DEFAULT_POLICY_RELOAD_WATCH_DEBOUNCE_MS, DEFAULT_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES,
+    MAX_POLICY_RELOAD_WATCH_DEBOUNCE_MS, MAX_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES,
+    MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS, PolicyConfig, PolicyReloadConfig, PolicySourceConfig,
+    RemotePolicyBundleBodyLimitBytes, RemotePolicyBundleBodyLimitError,
 };
 pub use storage::{
     DEFAULT_EXPORT_RETENTION_PRUNE_BATCH_LIMIT, DEFAULT_EXPORT_RETENTION_SWEEP_INTERVAL_MS,

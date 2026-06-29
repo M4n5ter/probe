@@ -33,6 +33,7 @@ use crate::{
         DurableL7MitmAuditSink, L7MitmAuditSink, L7MitmBackendLifecycleGuard, L7MitmRuntime,
         start_backend_lifecycle,
     },
+    policy_reload_watcher,
     runtime_composition::build_runtime_composition,
     shutdown,
     storage_retention::{
@@ -107,16 +108,30 @@ pub(crate) async fn run_live_agent(
         transparent_proxy: Some(transparent_proxy_runtime.clone()),
         ..AdminRuntimeState::default()
     };
+    let plan_handle = Arc::new(plan.clone());
     let admin_server = admin_server_config_from_plan(&plan)
         .map(|config| {
             spawn_admin_server(
-                Arc::new(plan.clone()),
+                Arc::clone(&plan_handle),
                 Arc::clone(&spool),
                 config,
                 admin_runtime_state.clone(),
             )
         })
         .transpose()?;
+    let policy_reload_watcher = match policy_reload_watcher::spawn_watcher(
+        Arc::clone(&plan_handle),
+        policy_set.clone(),
+        admin_runtime_state.policy_reload_gate.clone(),
+    ) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            if let Some(server) = admin_server {
+                server.stop().await;
+            }
+            return Err(error.into());
+        }
+    };
     let export_worker = export_worker.map(|worker| worker.spawn(Arc::clone(&spool)));
     let storage_retention_config = storage_retention_worker_config_from_plan(&plan);
     println!(
@@ -149,6 +164,9 @@ pub(crate) async fn run_live_agent(
     shutdown_signal_task.abort();
     if let Some(server) = admin_server {
         server.stop().await;
+    }
+    if let Some(watcher) = policy_reload_watcher {
+        watcher.stop().await;
     }
     if let Some(worker) = export_worker {
         worker.stop().await;

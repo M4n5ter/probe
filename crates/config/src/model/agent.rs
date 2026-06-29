@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AdminConfig, CaptureConfig, ConfigError, EnforcementConfig, ExportRuntimeConfig,
-    ExporterConfig, PolicyConfig, StorageConfig, TlsConfig, validation,
+    ExporterConfig, PolicyConfig, PolicyReloadConfig, StorageConfig, TlsConfig, validation,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,6 +14,7 @@ pub struct AgentConfig {
     pub storage: StorageConfig,
     pub export: ExportRuntimeConfig,
     pub exporters: Vec<ExporterConfig>,
+    pub policy_reload: PolicyReloadConfig,
     pub policies: Vec<PolicyConfig>,
     pub tls: TlsConfig,
     pub enforcement: EnforcementConfig,
@@ -43,6 +44,7 @@ impl Default for AgentConfig {
             storage: StorageConfig::default(),
             export: ExportRuntimeConfig::default(),
             exporters: Vec::new(),
+            policy_reload: PolicyReloadConfig::default(),
             policies: Vec::new(),
             tls: TlsConfig::default(),
             enforcement: EnforcementConfig::default(),

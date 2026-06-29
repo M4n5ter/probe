@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    ConfigViolation, PolicyConfig, PolicySourceConfig, RemotePolicyBundleBodyLimitBytes,
+    ConfigViolation, MAX_POLICY_RELOAD_WATCH_DEBOUNCE_MS, MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+    PolicyConfig, PolicyReloadConfig, PolicySourceConfig, RemotePolicyBundleBodyLimitBytes,
     RemotePolicyBundleBodyLimitError,
 };
 
@@ -19,6 +20,19 @@ pub(super) fn validate(policies: &[PolicyConfig], violations: &mut Vec<ConfigVio
         if policy.enabled {
             validate_policy_source(policy, violations);
         }
+    }
+}
+
+pub(super) fn validate_reload(reload: &PolicyReloadConfig, violations: &mut Vec<ConfigViolation>) {
+    if !(MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS..=MAX_POLICY_RELOAD_WATCH_DEBOUNCE_MS)
+        .contains(&reload.debounce_ms)
+    {
+        violations.push(ConfigViolation {
+            field: "policy_reload.debounce_ms".to_string(),
+            reason: format!(
+                "policy reload watcher debounce_ms must be between {MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS} and {MAX_POLICY_RELOAD_WATCH_DEBOUNCE_MS}"
+            ),
+        });
     }
 }
 

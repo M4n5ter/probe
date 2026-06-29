@@ -157,3 +157,54 @@ max_body_bytes = {max_body_bytes}
     }
     Ok(())
 }
+
+#[test]
+fn validation_accepts_policy_reload_watcher_config() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[policy_reload]
+watch_local_bundles = true
+debounce_ms = 250
+
+[[policies]]
+id = "guard"
+enabled = true
+
+[policies.source]
+kind = "local_directory"
+path = "/tmp/guard.bundle"
+"#,
+    )?;
+
+    config.validate_basic()?;
+    assert!(config.policy_reload.watch_local_bundles);
+    assert_eq!(config.policy_reload.debounce_ms, 250);
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_invalid_policy_reload_debounce() -> Result<(), Box<dyn std::error::Error>> {
+    for debounce_ms in [
+        MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS - 1,
+        MAX_POLICY_RELOAD_WATCH_DEBOUNCE_MS + 1,
+    ] {
+        let config = AgentConfig::from_toml_str(&format!(
+            r#"
+[policy_reload]
+watch_local_bundles = true
+debounce_ms = {debounce_ms}
+"#
+        ))?;
+
+        let error = config
+            .validate_basic()
+            .expect_err("invalid policy reload debounce must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("policy reload watcher debounce_ms must be between"),
+            "unexpected error: {error}"
+        );
+    }
+    Ok(())
+}

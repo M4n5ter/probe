@@ -22,12 +22,12 @@ impl Default for PolicyReloadGate {
     }
 }
 
-pub(super) struct PolicyReloadSummary {
+pub(crate) struct PolicyReloadSummary {
     pub loaded_count: u64,
     pub policies: Vec<ConfiguredPolicySource>,
 }
 
-pub(super) async fn reload_policies(
+pub(crate) async fn reload_policies(
     plan: &RuntimePlan,
     policy_set: &PipelinePolicySet,
     gate: &PolicyReloadGate,
@@ -79,7 +79,7 @@ mod tests {
         net::UnixStream,
     };
 
-    use super::super::{AdminRuntimeState, AdminServerConfig, spawn_admin_server};
+    use crate::admin::{AdminRuntimeState, AdminServerConfig, spawn_admin_server};
     use crate::configured_policy::{
         PolicySourceLoadContext, load_configured_pipeline_policies_with_context,
     };

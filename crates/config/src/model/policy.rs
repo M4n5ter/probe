@@ -5,6 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub const DEFAULT_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+pub const DEFAULT_POLICY_RELOAD_WATCH_DEBOUNCE_MS: u64 = 500;
+pub const MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS: u64 = 50;
+pub const MAX_POLICY_RELOAD_WATCH_DEBOUNCE_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
@@ -76,6 +79,22 @@ impl fmt::Display for RemotePolicyBundleBodyLimitError {
 }
 
 impl std::error::Error for RemotePolicyBundleBodyLimitError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyReloadConfig {
+    pub watch_local_bundles: bool,
+    pub debounce_ms: u64,
+}
+
+impl Default for PolicyReloadConfig {
+    fn default() -> Self {
+        Self {
+            watch_local_bundles: false,
+            debounce_ms: DEFAULT_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -166,6 +185,17 @@ mod tests {
         );
         assert!(deserialize_body_limit(0).is_err());
         assert!(deserialize_body_limit(MAX_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn policy_reload_config_defaults_to_no_background_watch() {
+        assert_eq!(
+            PolicyReloadConfig::default(),
+            PolicyReloadConfig {
+                watch_local_bundles: false,
+                debounce_ms: DEFAULT_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+            }
+        );
     }
 
     fn deserialize_body_limit(
