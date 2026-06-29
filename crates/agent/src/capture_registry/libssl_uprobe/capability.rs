@@ -74,7 +74,7 @@ fn capability_from_object_report(
     CapabilityState::degraded(
         CapabilityKind::LibsslUprobe,
         format!(
-            "eBPF TLS plaintext object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, resolved live fd lookups can carry optional SO_COOKIE when pidfd_getfd is permitted and the duplicated fd inode still matches, agent libssl plaintext sidecar wiring can run startup attach plus periodic process scan/reconcile with last-reconcile target counts, capture-bounded target snapshots, and observed timestamp, and TLS output loss can fan out conservative unknown-offset gaps to plaintext flows observed since the previous output-loss checkpoint, but per-target provider health, strong fd ownership, low-latency provider multiplexing, precise flow-specific lost-event reconstruction, and privileged ringbuf saturation e2e coverage remain best-effort",
+            "eBPF TLS plaintext object preflight via aya-obj succeeded ({}), procfs socket attribution is usable, resolved live fd lookups can carry optional SO_COOKIE when pidfd_getfd is permitted and the duplicated fd inode still matches, agent libssl plaintext sidecar wiring can run startup attach plus periodic process scan/reconcile with last-reconcile target counts, capture-bounded target snapshots, per-target last-reconcile state, and observed timestamp, and TLS output loss can fan out conservative unknown-offset gaps to plaintext flows observed since the previous output-loss checkpoint, but continuous per-target health after reconcile, strong fd ownership, low-latency provider multiplexing, precise flow-specific lost-event reconstruction, and privileged ringbuf saturation e2e coverage remain best-effort",
             object.summary()
         ),
     )
@@ -163,10 +163,11 @@ mod tests {
         assert!(reason.contains("startup attach plus periodic process scan/reconcile"));
         assert!(reason.contains("last-reconcile target counts"));
         assert!(reason.contains("capture-bounded target snapshots"));
+        assert!(reason.contains("per-target last-reconcile state"));
         assert!(reason.contains("observed timestamp"));
         assert!(reason.contains("TLS output loss"));
         assert!(reason.contains("unknown-offset gaps"));
-        assert!(reason.contains("per-target provider health"));
+        assert!(reason.contains("continuous per-target health after reconcile"));
         assert!(reason.contains("strong fd ownership"));
         assert!(reason.contains("precise flow-specific lost-event reconstruction"));
         assert!(reason.contains("privileged ringbuf saturation e2e coverage"));

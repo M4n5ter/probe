@@ -8,6 +8,7 @@ use capture::{
     LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
     LibsslUprobePlaintextReconcile, LibsslUprobeReconcileTargetBucket,
 };
+use probe_core::RuntimeMode;
 use runtime::RuntimePlan;
 use serde::Serialize;
 
@@ -95,6 +96,22 @@ pub struct TlsPlaintextReconcileTargetRuntimeSnapshot {
     pub device_minor: u32,
     pub inode: u64,
     pub deleted: bool,
+    pub reconcile_state: TlsPlaintextTargetReconcileStateRuntimeSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TlsPlaintextTargetReconcileStateRuntimeSnapshot {
+    pub mode: RuntimeMode,
+    pub state: TlsPlaintextTargetReconcileState,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsPlaintextTargetReconcileState {
+    Attached,
+    Active,
+    Detached,
 }
 
 impl TlsPlaintextReconcileRuntimeSnapshot {
@@ -112,9 +129,18 @@ impl TlsPlaintextReconcileRuntimeSnapshot {
                 active: result.active_target_count() as u64,
             },
             targets: TlsPlaintextReconcileTargetsRuntimeSnapshot {
-                attached: target_bucket(result.attached_targets),
-                detached: target_bucket(result.detached_targets),
-                active: target_bucket(result.active_targets),
+                attached: target_bucket(
+                    result.attached_targets,
+                    TlsPlaintextTargetReconcileStateRuntimeSnapshot::attached(),
+                ),
+                detached: target_bucket(
+                    result.detached_targets,
+                    TlsPlaintextTargetReconcileStateRuntimeSnapshot::detached(),
+                ),
+                active: target_bucket(
+                    result.active_targets,
+                    TlsPlaintextTargetReconcileStateRuntimeSnapshot::active(),
+                ),
             },
         }
     }
@@ -122,12 +148,18 @@ impl TlsPlaintextReconcileRuntimeSnapshot {
 
 fn target_bucket(
     bucket: LibsslUprobeReconcileTargetBucket,
+    reconcile_state: TlsPlaintextTargetReconcileStateRuntimeSnapshot,
 ) -> TlsPlaintextReconcileTargetBucketRuntimeSnapshot {
     let omitted = bucket.omitted_count();
     let targets = bucket
         .into_targets()
         .into_iter()
-        .map(TlsPlaintextReconcileTargetRuntimeSnapshot::from)
+        .map(|target| {
+            TlsPlaintextReconcileTargetRuntimeSnapshot::from_target_reconcile_state(
+                target,
+                reconcile_state.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     TlsPlaintextReconcileTargetBucketRuntimeSnapshot {
         omitted: omitted as u64,
@@ -135,8 +167,11 @@ fn target_bucket(
     }
 }
 
-impl From<LibsslUprobeAttachTargetSnapshot> for TlsPlaintextReconcileTargetRuntimeSnapshot {
-    fn from(target: LibsslUprobeAttachTargetSnapshot) -> Self {
+impl TlsPlaintextReconcileTargetRuntimeSnapshot {
+    fn from_target_reconcile_state(
+        target: LibsslUprobeAttachTargetSnapshot,
+        reconcile_state: TlsPlaintextTargetReconcileStateRuntimeSnapshot,
+    ) -> Self {
         Self {
             pid: target.pid,
             start_time_ticks: target.start_time_ticks,
@@ -146,6 +181,40 @@ impl From<LibsslUprobeAttachTargetSnapshot> for TlsPlaintextReconcileTargetRunti
             device_minor: target.device_minor,
             inode: target.inode,
             deleted: target.deleted,
+            reconcile_state,
+        }
+    }
+}
+
+impl TlsPlaintextTargetReconcileStateRuntimeSnapshot {
+    fn attached() -> Self {
+        Self {
+            mode: RuntimeMode::Available,
+            state: TlsPlaintextTargetReconcileState::Attached,
+            reason: Some(
+                "target reached committed libssl uprobe links during the latest reconcile"
+                    .to_string(),
+            ),
+        }
+    }
+
+    fn active() -> Self {
+        Self {
+            mode: RuntimeMode::Available,
+            state: TlsPlaintextTargetReconcileState::Active,
+            reason: Some(
+                "target had committed libssl uprobe links after the latest reconcile".to_string(),
+            ),
+        }
+    }
+
+    fn detached() -> Self {
+        Self {
+            mode: RuntimeMode::Unavailable,
+            state: TlsPlaintextTargetReconcileState::Detached,
+            reason: Some(
+                "target was detached because it was absent from the latest attach plan".to_string(),
+            ),
         }
     }
 }
@@ -530,7 +599,47 @@ mod tests {
             value["targets"]["active"]["targets"][0]["inode"],
             serde_json::json!(3000)
         );
+        assert_eq!(
+            value["targets"]["active"]["targets"][0]["reconcile_state"]["mode"],
+            serde_json::json!("available")
+        );
+        assert_eq!(
+            value["targets"]["active"]["targets"][0]["reconcile_state"]["state"],
+            serde_json::json!("active")
+        );
+        assert!(
+            value["targets"]["active"]["targets"][0]["reconcile_state"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("committed libssl uprobe links"))
+        );
         assert_eq!(value["targets"]["active"]["omitted"], serde_json::json!(0));
+        Ok(())
+    }
+
+    #[test]
+    fn reconcile_runtime_snapshot_marks_detached_target_reconcile_state_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = TlsPlaintextReconcileRuntimeSnapshot::from_reconcile_success(
+            reconcile_result(0, 1, 0),
+            1,
+            100,
+        );
+
+        let value = serde_json::to_value(snapshot)?;
+
+        assert_eq!(
+            value["targets"]["detached"]["targets"][0]["reconcile_state"]["mode"],
+            serde_json::json!("unavailable")
+        );
+        assert_eq!(
+            value["targets"]["detached"]["targets"][0]["reconcile_state"]["state"],
+            serde_json::json!("detached")
+        );
+        assert!(
+            value["targets"]["detached"]["targets"][0]["reconcile_state"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("absent from the latest attach plan"))
+        );
         Ok(())
     }
 
