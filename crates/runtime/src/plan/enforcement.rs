@@ -1276,7 +1276,8 @@ mod tests {
     };
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig,
-        TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
+        EnforcementPolicySourceConfig, TlsMaterialConfig, TlsMaterialKind,
+        TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
         TransparentInterceptionMitmClientTrustModeConfig,
         TransparentInterceptionMitmManagedProcessConfig,
@@ -2071,6 +2072,9 @@ mod tests {
                 endpoint: Some("http://127.0.0.1:80/enforce".to_string()),
                 ..TransparentInterceptionMitmPolicyHookConfig::default()
             };
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: "/etc/probe/enforcement.toml".into(),
+        };
 
         let plan = RuntimePlan::build(config, &mitm_registry())?;
 

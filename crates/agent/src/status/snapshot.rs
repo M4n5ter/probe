@@ -735,8 +735,8 @@ mod tests {
         let plan = runtime_plan(
             PathBuf::from("/tmp/traffic-probe-spool"),
             vec![CapabilityState::degraded(
-                CapabilityKind::LuaJit,
-                "config reload is not implemented",
+                CapabilityKind::PolicyRuntime,
+                "policy state migration is not implemented",
             )],
         )?;
         let spool = SpoolStatusInput::available(
