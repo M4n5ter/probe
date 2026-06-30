@@ -654,9 +654,10 @@ TLS 明文与协议能力：
   - 已实现：显式 `enforcement.backend = "linux_socket_destroy"`。
   - 已实现：固定系统路径 `ss -K` TCP socket destroy backend、启动期 loopback socket destroy self-test、执行前 procfs socket owner
     复核和 status/backend reporting。
+  - 已实现：active self-test 同时要求 `ss -K` 报告 destroyed socket row，且真实 loopback probe connection 被中断。
   - 边界：默认 `backend = "none"` 不要求 connection capability。
   - 边界：probe 确认 Linux、受信系统路径中的 `ss -K` 入口、root 执行上下文、procfs socket attribution 入口，
-    以及当前 namespace/kernel 对本机 loopback TCP socket destroy 的实际支持。
+    以及当前 namespace/kernel 对本机 loopback TCP socket destroy 的可观察执行语义。
   - 边界：每条 flow 仍可能因不是 live host observation、携带 observation-only evidence、当前 socket owner 无法复核或已不匹配、
     目标 socket 已关闭或匹配窗口消失而返回 `unsupported`。
   - 边界：后端执行错误会记录为 `failed`。
@@ -2686,7 +2687,8 @@ L7 MITM proxy hook。`enforce` 还要求 resolved capture plan 为 live host cap
 registry 使用同一份 capability，`run`/`check` 使用同一份 backend factory，避免 plan validation 和 executable backend construction 分叉。
 
 该 probe 会检查 Linux、固定系统路径中的 `ss` 命令、`-K/--kill` 支持、root 执行上下文、procfs socket attribution
-入口，以及当前 namespace/kernel 是否会报告销毁了本机 loopback TCP socket；全部满足时才把 `connection_enforcement` 标为 available。
+入口，以及当前 namespace/kernel 是否会报告销毁了本机 loopback TCP socket，并真实中断 probe connection；
+全部满足时才把 `connection_enforcement` 标为 available。
 该 capability 表示 socket destroy 入口和当前运行环境的最小执行语义成立，不表示任意目标 socket 都必然能被销毁。
 该 backend 只接受 live host observation source（当前为 eBPF syscall、libpcap、libssl uprobe），拒绝 replay/mock/external plaintext
 feed 事件以避免恢复或离线输入误杀当前 socket。

@@ -18,7 +18,8 @@ pub(super) fn resolve() -> ConnectionEnforcementRuntime {
                     SystemSsKill::new(command),
                     ProcfsFlowOwnerVerifier::default(),
                 ),
-                "linux socket destroy entrypoint passed active loopback self-test and uses procfs owner verification; \
+                "linux socket destroy entrypoint reported a destroyed loopback TCP socket and interrupted the probe connection; \
+                 runtime enforcement uses procfs owner verification; \
                  each flow may still return unsupported if the event is not from live host capture, observation evidence \
                  is not destructive-safe, the target socket is gone, owner verification fails, or ss -K does not report \
                  a destroyed matching socket",
