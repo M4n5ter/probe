@@ -128,10 +128,10 @@ The following are intentional boundaries of the current implementation:
   operator-managed contract.
 - Transparent inbound and outbound HTTPS MITM are covered for product proxy
   routed allow and deny paths. Product proxy TLS advertises and gates HTTP/1.1
-  ALPN; ALPN-based multi-protocol routing, wildcard or DNS-discovered upstream
-  route selection, strong original attribution, automatic trust-store mutation,
-  and non-HTTP transparent allow-path matrices remain explicit capability
-  boundaries.
+  ALPN. Exact and suffix-wildcard upstream routes are supported;
+  ALPN-based multi-protocol routing, DNS-discovered upstream route selection,
+  strong original attribution, automatic trust-store mutation, and non-HTTP
+  transparent allow-path matrices remain explicit capability boundaries.
 - No hidden long-term raw traffic retention.
 - No HTTP/2, HTTP/3, or QUIC parser yet.
 - WebSocket support emits handoff, frame metadata, and 16 MiB bounded

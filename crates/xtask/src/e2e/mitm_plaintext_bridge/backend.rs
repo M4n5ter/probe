@@ -136,8 +136,39 @@ impl MitmPolicyHookExercise {
 pub(super) enum MitmDataPlaneExercise {
     None,
     ManagedPlaintext,
-    ProductProxyTransparentTls,
-    ProductProxyTransparentTlsWebSocket,
+    ProductProxyTransparentTls {
+        upstream_route: MitmProductProxyRouteExercise,
+    },
+    ProductProxyTransparentTlsWebSocket {
+        upstream_route: MitmProductProxyRouteExercise,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MitmProductProxyRouteExercise {
+    ExactServerName,
+    WildcardE2eSuffix,
+}
+
+impl MitmProductProxyRouteExercise {
+    pub(super) const fn host(self) -> &'static str {
+        match self {
+            Self::ExactServerName => tls::SERVER_NAME,
+            Self::WildcardE2eSuffix => "*.e2e.test",
+        }
+    }
+}
+
+impl MitmDataPlaneExercise {
+    pub(super) const fn product_proxy_upstream_route_host(self) -> Option<&'static str> {
+        match self {
+            Self::ProductProxyTransparentTls { upstream_route }
+            | Self::ProductProxyTransparentTlsWebSocket { upstream_route } => {
+                Some(upstream_route.host())
+            }
+            Self::None | Self::ManagedPlaintext => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,25 +210,33 @@ impl MitmBridgeCase {
                 backend: MitmBackendKind::ProductProxy,
                 direction: MitmBridgeDirection::Inbound,
                 policy_hook: MitmPolicyHookExercise::ProductProxyDelegatedDeny,
-                data_plane: MitmDataPlaneExercise::ProductProxyTransparentTls,
+                data_plane: MitmDataPlaneExercise::ProductProxyTransparentTls {
+                    upstream_route: MitmProductProxyRouteExercise::ExactServerName,
+                },
             },
             Self::ProductProxyOutboundTransparentHttpsPolicyHook => MitmBridgeCaseSpec {
                 backend: MitmBackendKind::ProductProxy,
                 direction: MitmBridgeDirection::Outbound,
                 policy_hook: MitmPolicyHookExercise::ProductProxyDelegatedDeny,
-                data_plane: MitmDataPlaneExercise::ProductProxyTransparentTls,
+                data_plane: MitmDataPlaneExercise::ProductProxyTransparentTls {
+                    upstream_route: MitmProductProxyRouteExercise::ExactServerName,
+                },
             },
             Self::ProductProxyTransparentHttpsWebSocket => MitmBridgeCaseSpec {
                 backend: MitmBackendKind::ProductProxy,
                 direction: MitmBridgeDirection::Inbound,
                 policy_hook: MitmPolicyHookExercise::ProductProxyEndpointOnly,
-                data_plane: MitmDataPlaneExercise::ProductProxyTransparentTlsWebSocket,
+                data_plane: MitmDataPlaneExercise::ProductProxyTransparentTlsWebSocket {
+                    upstream_route: MitmProductProxyRouteExercise::WildcardE2eSuffix,
+                },
             },
             Self::ProductProxyOutboundTransparentHttpsWebSocket => MitmBridgeCaseSpec {
                 backend: MitmBackendKind::ProductProxy,
                 direction: MitmBridgeDirection::Outbound,
                 policy_hook: MitmPolicyHookExercise::ProductProxyEndpointOnly,
-                data_plane: MitmDataPlaneExercise::ProductProxyTransparentTlsWebSocket,
+                data_plane: MitmDataPlaneExercise::ProductProxyTransparentTlsWebSocket {
+                    upstream_route: MitmProductProxyRouteExercise::ExactServerName,
+                },
             },
             Self::ExternalOutbound => MitmBridgeCaseSpec {
                 backend: MitmBackendKind::External,
@@ -475,7 +514,7 @@ pub(super) enum MitmBackendConfig {
 
 #[derive(Debug)]
 pub(super) struct ProductProxyUpstreamRoute {
-    pub(super) host: String,
+    pub(super) route_host: String,
     pub(super) target: SocketAddr,
     pub(super) certificate_path: PathBuf,
     pub(super) private_key_path: PathBuf,
@@ -658,7 +697,7 @@ fn prepare_product_proxy_backend(
             .chain([target.port()])
             .chain(policy_hook_target.map(|target| target.port())),
     )?;
-    let upstream_route = prepare_product_proxy_upstream_route(root, upstream_target)?;
+    let upstream_route = prepare_product_proxy_upstream_route(root, case, upstream_target)?;
     Ok(PreparedMitmBackend {
         proxy_port: target.port(),
         policy_hook_endpoint: policy_hook_target
@@ -690,9 +729,15 @@ fn product_proxy_upstream_target(
 
 fn prepare_product_proxy_upstream_route(
     root: &Path,
+    case: MitmBridgeCase,
     target: SocketAddr,
 ) -> Result<ProductProxyUpstreamRoute, Box<dyn std::error::Error>> {
     let material = tls::write_upstream_server_certificate(root)?;
+    let route_host = case
+        .spec()
+        .data_plane
+        .product_proxy_upstream_route_host()
+        .ok_or_else(|| e2e_error("product proxy backend requires a product proxy data plane"))?;
     let document_root = root.join("product-proxy-upstream");
     let response_path = document_root.join("mitm-bridge").join("allow");
     fs::create_dir_all(
@@ -702,7 +747,7 @@ fn prepare_product_proxy_upstream_route(
     )?;
     fs::write(&response_path, mitm_bridge::ALLOW_RESPONSE_BYTES)?;
     Ok(ProductProxyUpstreamRoute {
-        host: tls::SERVER_NAME.to_string(),
+        route_host: route_host.to_string(),
         target,
         certificate_path: material.certificate_path.clone(),
         private_key_path: material.private_key_path,

@@ -130,7 +130,7 @@ pub(super) fn write_agent_config(
                 program: Some(program.clone()),
                 working_dir: None,
                 upstream_routes: vec![TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
-                    host: upstream_route.host.clone(),
+                    host: upstream_route.route_host.clone(),
                     target: upstream_route.target.to_string(),
                 }],
             },

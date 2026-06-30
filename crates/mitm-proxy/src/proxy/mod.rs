@@ -202,7 +202,7 @@ fn validate_config(config: &MitmProxyConfig) -> Result<(), MitmProxyError> {
     for (host, target) in config.upstream_routes.iter() {
         if socket_addr_points_to_listener(target, config.listen) {
             return Err(MitmProxyError::InvalidConfig(format!(
-                "upstream route {host:?} target must not point back to the MITM proxy listener"
+                "upstream route {host} target must not point back to the MITM proxy listener"
             )));
         }
     }
@@ -1327,6 +1327,40 @@ mod tests {
             &feed_path,
             Direction::Outbound,
             b"GET /route HTTP/1.1\r\nHost: route.example\r\n\r\n"
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn wildcard_upstream_route_uses_http_host_to_select_target() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let route_target =
+            upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\nwildcard-routed")?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let mut config = test_config(listen, &feed_path, None, None, None, Duration::from_secs(2));
+        config.upstream_routes = UpstreamTargetRoutes::from_routes([UpstreamTargetRoute::new(
+            "*.Route.Example",
+            route_target,
+        )?])?;
+        let guard = start_test_proxy(config, data_listener, None)?;
+
+        let mut stream = TcpStream::connect(listen)?;
+        stream.write_all(b"GET /route HTTP/1.1\r\nHost: api.route.example\r\n\r\n")?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\nwildcard-routed"
+        );
+        assert!(feed_has_bytes(
+            &feed_path,
+            Direction::Outbound,
+            b"GET /route HTTP/1.1\r\nHost: api.route.example\r\n\r\n"
         )?);
         Ok(())
     }

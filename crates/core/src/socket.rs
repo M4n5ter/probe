@@ -86,21 +86,71 @@ impl FromStr for UpstreamRouteHost {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum UpstreamRouteHostPattern {
+    Exact(UpstreamRouteHost),
+    WildcardSuffix(UpstreamRouteHost),
+}
+
+impl UpstreamRouteHostPattern {
+    pub fn parse(pattern: impl AsRef<str>) -> Result<Self, UpstreamRouteError> {
+        let pattern = pattern.as_ref().trim();
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            return Ok(Self::WildcardSuffix(UpstreamRouteHost::parse(suffix)?));
+        }
+        if pattern.starts_with('*') {
+            return Err(invalid_route_host(
+                pattern,
+                "wildcard host patterns must use '*.suffix'",
+            ));
+        }
+        Ok(Self::Exact(UpstreamRouteHost::parse(pattern)?))
+    }
+
+    pub fn matches(&self, host: &UpstreamRouteHost) -> bool {
+        match self {
+            Self::Exact(pattern) => pattern == host,
+            Self::WildcardSuffix(suffix) => host_matches_wildcard_suffix(host, suffix),
+        }
+    }
+}
+
+impl fmt::Display for UpstreamRouteHostPattern {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exact(host) => write!(formatter, "{host}"),
+            Self::WildcardSuffix(suffix) => write!(formatter, "*.{suffix}"),
+        }
+    }
+}
+
+impl FromStr for UpstreamRouteHostPattern {
+    type Err = UpstreamRouteError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamRoute {
-    host: UpstreamRouteHost,
+    host: UpstreamRouteHostPattern,
     target: SocketAddr,
 }
 
 impl UpstreamRoute {
     pub fn new(host: impl AsRef<str>, target: SocketAddr) -> Result<Self, UpstreamRouteError> {
+        Self::from_parts(UpstreamRouteHostPattern::parse(host)?, target)
+    }
+
+    pub fn from_parts(
+        host: UpstreamRouteHostPattern,
+        target: SocketAddr,
+    ) -> Result<Self, UpstreamRouteError> {
         if target.port() == 0 {
             return Err(UpstreamRouteError::ZeroTargetPort);
         }
-        Ok(Self {
-            host: UpstreamRouteHost::parse(host)?,
-            target,
-        })
+        Ok(Self { host, target })
     }
 
     pub fn parse_cli_value(value: &str) -> Result<Self, UpstreamRouteError> {
@@ -120,7 +170,7 @@ impl UpstreamRoute {
         Ok(target)
     }
 
-    pub fn host(&self) -> &UpstreamRouteHost {
+    pub fn host_pattern(&self) -> &UpstreamRouteHostPattern {
         &self.host
     }
 
@@ -195,6 +245,17 @@ fn invalid_route_host(host: &str, reason: &'static str) -> UpstreamRouteError {
     }
 }
 
+fn host_matches_wildcard_suffix(host: &UpstreamRouteHost, suffix: &UpstreamRouteHost) -> bool {
+    let host = host.as_str();
+    let suffix = suffix.as_str();
+    host.len() > suffix.len()
+        && host.ends_with(suffix)
+        && host
+            .as_bytes()
+            .get(host.len() - suffix.len() - 1)
+            .is_some_and(|byte| *byte == b'.')
+}
+
 fn normalized_ip_address(address: IpAddr) -> IpAddr {
     match address {
         IpAddr::V4(_) => address,
@@ -242,6 +303,28 @@ mod tests {
                 "{host:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn upstream_route_host_pattern_supports_wildcard_suffixes() {
+        let pattern = UpstreamRouteHostPattern::parse("*.Example.Test")
+            .expect("wildcard route pattern should parse");
+        let child = UpstreamRouteHost::parse("api.example.test").expect("child host");
+        let nested = UpstreamRouteHost::parse("v1.api.example.test").expect("nested host");
+        let apex = UpstreamRouteHost::parse("example.test").expect("apex host");
+
+        assert_eq!(pattern.to_string(), "*.example.test");
+        assert!(pattern.matches(&child));
+        assert!(pattern.matches(&nested));
+        assert!(!pattern.matches(&apex));
+    }
+
+    #[test]
+    fn upstream_route_host_pattern_rejects_bare_wildcard() {
+        let error = UpstreamRouteHostPattern::parse("*")
+            .expect_err("bare wildcard route pattern must be rejected");
+
+        assert!(error.to_string().contains("*.suffix"));
     }
 
     #[test]

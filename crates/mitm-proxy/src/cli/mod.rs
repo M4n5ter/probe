@@ -318,8 +318,10 @@ mod tests {
     fn upstream_routes_build_route_table() {
         let route = parse_upstream_route("Example.Test=127.0.0.1:8443")
             .expect("route argument should parse");
+        let wildcard_route = parse_upstream_route("*.Route.Example=127.0.0.1:9443")
+            .expect("wildcard route argument should parse");
         let config = MitmProxyConfig::try_from(Cli {
-            upstream_routes: vec![route],
+            upstream_routes: vec![route, wildcard_route],
             ..minimal_cli()
         })
         .expect("route table should build");
@@ -333,6 +335,16 @@ mod tests {
                 ))
                 .expect("route lookup should succeed"),
             Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 8443)))
+        );
+        assert_eq!(
+            config
+                .upstream_routes
+                .target_for_observed_authority(crate::authority::ObservedAuthority::from_parts(
+                    None,
+                    Some("api.route.example")
+                ))
+                .expect("wildcard route lookup should succeed"),
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9443)))
         );
     }
 

@@ -36,19 +36,19 @@ impl MitmDataPlaneScenario {
     pub(super) const fn uses_product_proxy_transparent_tls(self) -> bool {
         matches!(
             self.exercise,
-            MitmDataPlaneExercise::ProductProxyTransparentTls
-                | MitmDataPlaneExercise::ProductProxyTransparentTlsWebSocket
+            MitmDataPlaneExercise::ProductProxyTransparentTls { .. }
+                | MitmDataPlaneExercise::ProductProxyTransparentTlsWebSocket { .. }
         )
     }
 
     pub(super) const fn protocol(self) -> MitmDataPlaneProtocol {
         match self.exercise {
-            MitmDataPlaneExercise::ProductProxyTransparentTlsWebSocket => {
+            MitmDataPlaneExercise::ProductProxyTransparentTlsWebSocket { .. } => {
                 MitmDataPlaneProtocol::WebSocket
             }
             MitmDataPlaneExercise::None
             | MitmDataPlaneExercise::ManagedPlaintext
-            | MitmDataPlaneExercise::ProductProxyTransparentTls => {
+            | MitmDataPlaneExercise::ProductProxyTransparentTls { .. } => {
                 MitmDataPlaneProtocol::BridgeHttp
             }
         }

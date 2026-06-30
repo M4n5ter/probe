@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use probe_core::{UpstreamRoute, UpstreamRouteHost, socket_addr_points_to_listener};
+use probe_core::{UpstreamRoute, UpstreamRouteHostPattern, socket_addr_points_to_listener};
 
 use super::{
     EnforcementInterceptionConfig, TransparentInterceptionIntentViolation,
@@ -317,11 +317,7 @@ pub struct TransparentInterceptionMitmProductProxyIntent {
     pub upstream_routes: Vec<TransparentInterceptionMitmProductProxyUpstreamRouteIntent>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransparentInterceptionMitmProductProxyUpstreamRouteIntent {
-    pub host: String,
-    pub target: SocketAddr,
-}
+pub type TransparentInterceptionMitmProductProxyUpstreamRouteIntent = UpstreamRoute;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransparentInterceptionMitmBackendReadinessProbeIntent {
@@ -593,10 +589,13 @@ fn validate_mitm_product_proxy_upstream_routes(
             ));
         }
         if let Some(target) = target {
-            intents.push(TransparentInterceptionMitmProductProxyUpstreamRouteIntent {
-                host: host.as_str().to_string(),
-                target,
-            });
+            match UpstreamRoute::from_parts(host, target) {
+                Ok(route) => intents.push(route),
+                Err(error) => violations.push(intent_violation(
+                    field,
+                    format!("product MITM proxy upstream route {index} {error}"),
+                )),
+            }
         }
     }
     intents
@@ -610,12 +609,12 @@ fn validate_mitm_product_proxy_routes_do_not_target_listener(
     let TransparentInterceptionMitmBackendReadinessProbeIntent::TcpConnect { target, .. } =
         readiness_probe;
     for route in routes {
-        if socket_addr_points_to_listener(route.target, *target) {
+        if socket_addr_points_to_listener(route.target(), *target) {
             violations.push(intent_violation(
                 "enforcement.interception.mitm.backend.process.upstream_routes",
                 format!(
-                    "product MITM proxy upstream route host {:?} target must not point back to the proxy listener",
-                    route.host
+                    "product MITM proxy upstream route host {} target must not point back to the proxy listener",
+                    route.host_pattern()
                 ),
             ));
         }
@@ -627,7 +626,7 @@ fn validate_product_proxy_upstream_route_host(
     field: &'static str,
     index: usize,
     violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
-) -> Option<UpstreamRouteHost> {
+) -> Option<UpstreamRouteHostPattern> {
     let host = route.host.trim();
     if host.is_empty() {
         violations.push(intent_violation(
@@ -636,7 +635,7 @@ fn validate_product_proxy_upstream_route_host(
         ));
         return None;
     }
-    match UpstreamRouteHost::parse(host) {
+    match UpstreamRouteHostPattern::parse(host) {
         Ok(host) => Some(host),
         Err(error) => {
             violations.push(intent_violation(

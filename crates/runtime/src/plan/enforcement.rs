@@ -699,10 +699,7 @@ impl ProductProxyCliBuilder<'_> {
             ]);
         }
         for route in upstream_routes {
-            args.extend([
-                "--upstream-route".to_string(),
-                upstream_route_cli_value(route),
-            ]);
+            args.extend(["--upstream-route".to_string(), route.cli_value()]);
         }
         if let TransparentInterceptionMitmPolicyHookPlan::HttpJson {
             endpoint,
@@ -749,12 +746,6 @@ impl ProductProxyCliBuilder<'_> {
         }
         args
     }
-}
-
-fn upstream_route_cli_value(
-    route: &TransparentInterceptionMitmProductProxyUpstreamRouteIntent,
-) -> String {
-    format!("{}={}", route.host, route.target)
 }
 
 fn direction_cli_value(direction: Direction) -> &'static str {
@@ -1729,7 +1720,7 @@ mod tests {
         };
         process.upstream_routes =
             vec![TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
-                host: "Route.Example".to_string(),
+                host: "*.Route.Example".to_string(),
                 target: "127.0.0.1:18443".to_string(),
             }];
         let capabilities = CapabilityMatrix::new([
@@ -1751,7 +1742,7 @@ mod tests {
         assert!(args_contain_pair(
             &process.args,
             "--upstream-route",
-            "route.example=127.0.0.1:18443"
+            "*.route.example=127.0.0.1:18443"
         ));
         Ok(())
     }

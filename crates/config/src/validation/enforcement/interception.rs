@@ -730,6 +730,10 @@ mod tests {
                 host: "Route.Example".to_string(),
                 target: "127.0.0.1:18443".to_string(),
             },
+            crate::TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
+                host: "*.Route.Example".to_string(),
+                target: "127.0.0.1:18444".to_string(),
+            },
         ];
 
         validate(&interception, &tls_config_with_mitm_leaf(), &mut violations);
@@ -742,10 +746,21 @@ mod tests {
             panic!("expected product proxy intent");
         };
         assert!(violations.is_empty(), "{violations:?}");
-        assert_eq!(process.upstream_routes[0].host, "route.example");
         assert_eq!(
-            process.upstream_routes[0].target,
+            process.upstream_routes[0].host_pattern().to_string(),
+            "route.example"
+        );
+        assert_eq!(
+            process.upstream_routes[0].target(),
             "127.0.0.1:18443".parse().expect("test target")
+        );
+        assert_eq!(
+            process.upstream_routes[1].host_pattern().to_string(),
+            "*.route.example"
+        );
+        assert_eq!(
+            process.upstream_routes[1].target(),
+            "127.0.0.1:18444".parse().expect("test target")
         );
     }
 
@@ -790,6 +805,30 @@ mod tests {
         assert!(violations.iter().any(|violation| {
             violation.field == "enforcement.interception.mitm.backend.process.upstream_routes"
                 && violation.reason.contains("port must be non-zero")
+        }));
+    }
+
+    #[test]
+    fn product_proxy_rejects_bare_wildcard_upstream_route() {
+        let mut violations = Vec::new();
+        let mut interception = product_proxy_interception();
+        let TransparentInterceptionMitmBackendConfig::ProductProxy { process, .. } =
+            &mut interception.mitm.backend
+        else {
+            panic!("test fixture should use product proxy");
+        };
+        process.upstream_routes = vec![
+            crate::TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
+                host: "*".to_string(),
+                target: "127.0.0.1:18443".to_string(),
+            },
+        ];
+
+        validate(&interception, &tls_config_with_mitm_leaf(), &mut violations);
+
+        assert!(violations.iter().any(|violation| {
+            violation.field == "enforcement.interception.mitm.backend.process.upstream_routes"
+                && violation.reason.contains("*.suffix")
         }));
     }
 

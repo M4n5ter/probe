@@ -32,7 +32,7 @@ pub use selector::{
 };
 pub use socket::{
     TcpConnection, TcpEndpoint, UpstreamRoute, UpstreamRouteError, UpstreamRouteHost,
-    socket_addr_points_to_listener,
+    UpstreamRouteHostPattern, socket_addr_points_to_listener,
 };
 pub use verdict::{
     Action, EnforcementDecision, EnforcementExecutionEvidence, EnforcementMode, EnforcementOutcome,

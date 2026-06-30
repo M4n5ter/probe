@@ -184,7 +184,9 @@ strategy = "none"
 # DNS SNI. The product proxy also uses that SNI as the upstream TLS server name
 # when upstream TLS is enabled, unless upstream_server_name is pinned. Explicit
 # upstream routes can map reconciled SNI/HTTP Host values to upstream IP socket
-# targets. Or use a fixed leaf certificate instead of the CA pair:
+# targets. Route hosts accept exact DNS names or "*.suffix" wildcard patterns;
+# wildcard routes match child and nested names, not the apex. Or use a fixed
+# leaf certificate instead of the CA pair:
 # leaf_certificate_chain_refs = ["mitm-leaf"]
 # leaf_private_key_ref = "mitm-leaf-key"
 # upstream_trust_anchor_refs = ["upstream-ca"]
@@ -209,6 +211,10 @@ mode = "disabled"
 # [[enforcement.interception.mitm.backend.process.upstream_routes]]
 # host = "service.example.com"
 # target = "127.0.0.1:18443"
+#
+# [[enforcement.interception.mitm.backend.process.upstream_routes]]
+# host = "*.tenant.example.com"
+# target = "127.0.0.1:18444"
 #
 # [enforcement.interception.mitm.backend.readiness_probe]
 # target = "127.0.0.1:15001"
