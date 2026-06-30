@@ -5595,15 +5595,39 @@ loss event 的端到端同步。
 
 ### 端到端验收
 
-`xtask e2e-suite` 是当前端到端验证的统一入口。默认 `cargo run -p xtask --locked -- e2e-suite` 等价于 `--profile baseline`，覆盖 plaintext
-feed、typed capture-event feed/provider loss、flow-level gap/degraded 语义、SSE streaming response、WebSocket handoff/frame、
-webhook exporter、file exporter、remote policy bundle 和 remote enforcement manifest。`cargo run -p xtask --locked -- e2e-suite --list` 会列出全部
-case 及其 host capability requirement；`--list-profiles` 会列出命名验证 profile、权限需求和展开后的 case 列表；`--profile <name>` 运行一个命名
-profile，且不能与 `--case`、`--include-privileged` 或 `--only-privileged` 混用，避免 profile 语义被调用方隐式改写。`product` profile
-是当前产品能力全链路验收入口，按 registry canonical order 显式列出产品级端到端 case；artifact acceptance 这类验证归入独立 `linux-artifacts` profile，避免把
-Linux artifact 语法/安装验收误报为真实 agent runtime E2E 能力。新增 case 必须显式进入某个 profile 或引入有理由的例外。`--case <name>` 可定向运行单个或多个 case，
-且不能与 privilege selection flag 混用；`--include-privileged` 复用 `product` profile 的全量 case selection；`--only-privileged`
-只运行特权 case。已有 `e2e-*` 命令只作为定向调试入口；它们也通过同一个 suite case registry 分发，因此 case 名称、执行入口、顺序和 privilege gate 只有一个事实源。
+`xtask e2e-suite` 是当前端到端验证的统一入口。
+
+入口语义：
+
+- `cargo run -p xtask --locked -- e2e-suite`
+  - 等价于 `--profile baseline`。
+  - 覆盖 plaintext feed、typed capture-event feed/provider loss、flow-level gap/degraded 语义、
+    SSE streaming response、WebSocket handoff/frame、webhook/file exporter、remote policy bundle
+    和 remote enforcement manifest。
+- `cargo run -p xtask --locked -- e2e-suite --list`
+  - 列出全部 case 及其 host capability requirement。
+- `cargo run -p xtask --locked -- e2e-suite --list-profiles`
+  - 列出命名验证 profile、权限需求和展开后的 case 列表。
+- `cargo run -p xtask --locked -- e2e-suite --profile <name>`
+  - 运行一个命名 profile。
+- `cargo run -p xtask --locked -- e2e-suite --case <name>`
+  - 定向运行一个或多个 case。
+  - case 名称与原 `e2e-*` 命令一致。
+
+profile 不变量：
+
+- `--profile <name>` 不能与 `--case`、`--include-privileged` 或 `--only-privileged` 混用。
+- `--case <name>` 不能与 privilege selection flag 混用。
+- `--include-privileged` 复用 `product` profile 的全量 case selection。
+- `--only-privileged` 只运行特权 case。
+- 已有 `e2e-*` 命令只作为定向调试入口。
+- case 名称、执行入口、顺序和 privilege gate 只有 suite case registry 一个事实源。
+
+`product` profile 是当前产品能力全链路验收入口。它由 `baseline`、`live-core`、`process-ebpf`、
+`tls-plaintext`、`transparent-interception` 和 `linux-artifacts` profile 组合生成，避免产品级验收清单与能力 profile 漂移。
+
+artifact acceptance case 保留自己的边界：它可以属于 `product` 验收，但不声明真实 agent runtime E2E 能力。
+新增 case 必须显式进入某个 profile 或引入有理由的例外。
 
 - `e2e-suite`
   - 默认权限：user。
@@ -5614,11 +5638,11 @@ Linux artifact 语法/安装验收误报为真实 agent runtime E2E 能力。新
   - 语义：当前产品能力全链路验证入口，显式运行产品级端到端 case。
   - 覆盖：replay/plaintext、live libpcap HTTP/WebSocket、admin reload、eBPF process observation、
     TLS plaintext/material、transparent interception、product MITM HTTP policy-hook path 和
-    product MITM WebSocket tunnel path。
+    product MITM WebSocket tunnel path，以及 transparent Linux artifact acceptance。
 - `e2e-suite --include-privileged`
   - 默认权限：取决于 case。
   - 语义：运行 `product` profile，包括 baseline、libpcap HTTP/WebSocket loopback、admin reload live capture、
-    eBPF process observation、libssl plaintext 和 transparent interception。
+    eBPF process observation、libssl plaintext、transparent interception 和 transparent Linux artifact acceptance。
 - `e2e-suite --only-privileged`
   - 默认权限：root/CAP_NET_RAW、root/bpffs 或 root/net-admin。
   - 语义：只跑需要 host capability 的真实主机场景。
@@ -5659,7 +5683,7 @@ Linux artifact 语法/安装验收误报为真实 agent runtime E2E 能力。新
   - 边界：不声明真实 agent runtime 成功闭环。
 - `product`
   - 默认权限：user、root/CAP_NET_RAW、root/bpffs、root/net-admin。
-  - 覆盖：产品级端到端 case。
+  - 覆盖：由所有命名能力 profile 展开得到的产品级端到端 case。
   - 用途：阶段提交前或发布前的产品级验收入口。
 
 ### Suite 代表性 case
