@@ -191,10 +191,10 @@ but does not execute them.
 
 ### Minimal Policy And Webhook Wiring
 
-A deployable configuration has three explicit contracts: where events come
-from, which Lua hooks inspect them, and how the collector acknowledges durable
-export batches. Probe does not infer these contracts from endpoint names or
-policy filenames.
+Use this section when wiring the first real integration. A deployable
+configuration has three explicit contracts: where events come from, which Lua
+hooks inspect them, and how the collector acknowledges durable export batches.
+Probe does not infer these contracts from endpoint names or policy filenames.
 
 ```text
 /etc/probe/agent.toml
@@ -231,6 +231,21 @@ id = "http-guard"
 version = "2026-06-30"
 hooks = ["on_http_request_headers", "on_websocket_message"]
 ```
+
+Lua contract:
+
+- `agent run` loads a policy bundle directory, not a loose Lua file.
+- `manifest.toml` names the hooks Probe may call; each named hook must exist as
+  a global Lua function in `main.lua`.
+- Each hook receives one typed `event` table. Common metadata is on `event`;
+  protocol fields are on `event.kind`.
+- A hook may return `nil`, one outcome, or an array of outcomes.
+- `probe.emit_alert(message)` creates audit telemetry.
+- `probe.verdict { ... }` requests a protective action. It becomes destructive
+  only when enforcement mode, selector, backend, and policy allow it.
+- The sandbox keeps policy code bounded. `table`, `string`, `math`, and `bit`
+  are available; host APIs such as `io`, `os`, `require`, `debug`, `ffi`, and
+  `loadfile` are unavailable.
 
 Lua source:
 
@@ -272,17 +287,39 @@ function on_websocket_message(event)
 end
 ```
 
+Endpoint quick rules:
+
+- Export webhook (`exporters.<id>.endpoint`):
+  absolute `http://` or `https://` URL with a host. URL credentials are
+  rejected. Exporter TLS refs require `https://`.
+- Remote Lua policy (`policies.source.endpoint`):
+  `https://` for remote endpoints; loopback `http://` is allowed only for
+  local testing. URL credentials are rejected.
+- Remote enforcement policy (`enforcement.policy.source.endpoint`):
+  same transport rule as remote Lua policy bundles.
+- MITM policy hook (`enforcement.interception.mitm.policy_hook.endpoint`):
+  loopback IP `http://` URL with an explicit non-zero port, such as
+  `http://127.0.0.1:15002/mitm-policy-hook`. Hostnames, credentials,
+  fragments, missing ports, and `https://` are rejected.
+
 Webhook receiver contract:
 
-| Part | Requirement |
-| --- | --- |
-| Endpoint URL | Absolute `http://` or `https://` URL with scheme and host. URL credentials are rejected. TLS refs require `https://`. |
-| Method | `POST` to the configured path and query. |
-| `content-type` | `application/x-protobuf`. |
-| `x-traffic-probe-codec` | `none`, `zstd`, `gzip`, or `deflate`; decode the body by this header. |
-| `idempotency-key` | The export batch id; use it for deduplication. |
-| Body | `BatchEnvelope` protobuf bytes, compressed according to `x-traffic-probe-codec`. |
-| ACK body | UTF-8 JSON no larger than 64 KiB. |
+- Endpoint URL:
+  absolute `http://` or `https://` URL with scheme and host. URL credentials
+  are rejected. TLS refs require `https://`.
+- Method:
+  `POST` to the configured path and query.
+- `content-type`:
+  `application/x-protobuf`.
+- `x-traffic-probe-codec`:
+  `none`, `zstd`, `gzip`, or `deflate`; decode the body by this header.
+- `idempotency-key`:
+  the export batch id; use it for deduplication.
+- Body:
+  `BatchEnvelope` protobuf bytes, compressed according to
+  `x-traffic-probe-codec`.
+- ACK body:
+  UTF-8 JSON no larger than 64 KiB.
 
 ACK JSON:
 
@@ -299,6 +336,35 @@ Return `accepted = true` only after the receiver durably stores every record up
 to `acked_cursor`. Probe retries the batch when the status is non-2xx, the body
 is not valid ACK JSON, `batch_id` does not match, `accepted = false`, or
 `acked_cursor` is outside the request sequence range.
+
+Receiver algorithm:
+
+```text
+verify POST, content-type, idempotency-key, and x-traffic-probe-codec
+decode the body according to x-traffic-probe-codec
+decode BatchEnvelope using docs/export-batch.proto
+verify BatchEnvelope.batch_id matches idempotency-key
+durably upsert records by batch_id and EventRecord.sequence
+return accepted=true with the last contiguous durable sequence
+```
+
+For the first collector interop test, use `codec = "none"` or `--codec none`
+so the receiver only needs protobuf decoding. Enable `zstd`, `gzip`, or
+`deflate` after the receiver handles `x-traffic-probe-codec`.
+
+`agent replay --policy` is a debugging entry point: it accepts one Lua file and
+wraps it in a synthetic replay manifest. Use it to verify a receiver without
+live-capture privileges:
+
+```bash
+cargo run -p agent --locked -- replay \
+  --input examples/replay.http \
+  --spool target/probe-demo/webhook-replay-spool \
+  --policy examples/policies/http-alert/main.lua \
+  --webhook http://127.0.0.1:9000/batches \
+  --codec none \
+  --agent-id probe-webhook-demo
+```
 
 ### Capture
 

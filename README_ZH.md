@@ -171,8 +171,9 @@ cargo run -p agent --locked -- status --config ./agent.toml
 
 ### 最小 Policy 与 Webhook 接线
 
-可部署配置需要显式描述三份契约：event 从哪里来、哪些 Lua hook 检查它们、collector
-如何确认 durable export batch。Probe 不会从 endpoint 名称或 policy 文件名推断这些契约。
+第一次接入真实系统时先看这一节。可部署配置需要显式描述三份契约：event 从哪里来、哪些 Lua
+hook 检查它们、collector 如何确认 durable export batch。Probe 不会从 endpoint 名称或
+policy 文件名推断这些契约。
 
 ```text
 /etc/probe/agent.toml
@@ -209,6 +210,20 @@ id = "http-guard"
 version = "2026-06-30"
 hooks = ["on_http_request_headers", "on_websocket_message"]
 ```
+
+Lua 契约：
+
+- `agent run` 加载 policy bundle 目录，而不是单个 Lua 文件。
+- `manifest.toml` 声明 Probe 可以调用哪些 hook；每个 hook 都必须在
+  `main.lua` 中实现为同名全局 Lua 函数。
+- 每个 hook 接收一个 typed `event` table。通用 metadata 在 `event` 上，
+  协议字段在 `event.kind` 上。
+- hook 可以返回 `nil`、一个 outcome，或 outcome 数组。
+- `probe.emit_alert(message)` 产生审计 telemetry。
+- `probe.verdict { ... }` 请求防护动作。只有 enforcement mode、selector、
+  backend 和 policy 都允许时，它才会变成 destructive action。
+- sandbox 会限制 policy 代码边界。可用标准库是 `table`、`string`、`math` 和 `bit`；
+  `io`、`os`、`require`、`debug`、`ffi`、`loadfile` 等 host API 不可用。
 
 Lua source：
 
@@ -250,17 +265,38 @@ function on_websocket_message(event)
 end
 ```
 
+endpoint 速查规则：
+
+- Export webhook（`exporters.<id>.endpoint`）：
+  带 host 的绝对 `http://` 或 `https://` URL。URL credentials 会被拒绝。
+  配置 exporter TLS refs 时必须使用 `https://`。
+- Remote Lua policy（`policies.source.endpoint`）：
+  remote endpoint 使用 `https://`；只有本地测试允许 loopback `http://`。
+  URL credentials 会被拒绝。
+- Remote enforcement policy（`enforcement.policy.source.endpoint`）：
+  与 remote Lua policy bundle 使用相同 transport 规则。
+- MITM policy hook（`enforcement.interception.mitm.policy_hook.endpoint`）：
+  带显式非零端口的 loopback IP `http://` URL，例如
+  `http://127.0.0.1:15002/mitm-policy-hook`。hostname、credentials、fragment、
+  缺失端口和 `https://` 都会被拒绝。
+
 webhook receiver contract：
 
-| Part | Requirement |
-| --- | --- |
-| Endpoint URL | 带 scheme 和 host 的 absolute `http://` 或 `https://` URL。URL credentials 会被拒绝。TLS refs 要求 `https://`。 |
-| Method | 对配置的 path 和 query 发起 `POST`。 |
-| `content-type` | `application/x-protobuf`。 |
-| `x-traffic-probe-codec` | `none`、`zstd`、`gzip` 或 `deflate`；receiver 按这个 header 解码 body。 |
-| `idempotency-key` | export batch id；receiver 应用它做 deduplication。 |
-| Body | `BatchEnvelope` protobuf bytes，并按 `x-traffic-probe-codec` 压缩。 |
-| ACK body | 不超过 64 KiB 的 UTF-8 JSON。 |
+- Endpoint URL：
+  带 scheme 和 host 的 absolute `http://` 或 `https://` URL。
+  URL credentials 会被拒绝。TLS refs 要求 `https://`。
+- Method：
+  对配置的 path 和 query 发起 `POST`。
+- `content-type`：
+  `application/x-protobuf`。
+- `x-traffic-probe-codec`：
+  `none`、`zstd`、`gzip` 或 `deflate`；receiver 按这个 header 解码 body。
+- `idempotency-key`：
+  export batch id；receiver 应用它做 deduplication。
+- Body：
+  `BatchEnvelope` protobuf bytes，并按 `x-traffic-probe-codec` 压缩。
+- ACK body：
+  不超过 64 KiB 的 UTF-8 JSON。
 
 ACK JSON：
 
@@ -273,9 +309,37 @@ ACK JSON：
 }
 ```
 
-receiver 只有在 durable 存储了 `acked_cursor` 之前的所有 record 后，才应返回
+receiver 只有在 durable 存储了截至并包含 `acked_cursor` 的所有 record 后，才应返回
 `accepted = true`。状态码非 2xx、body 不是合法 ACK JSON、`batch_id` 不匹配、
 `accepted = false` 或 `acked_cursor` 超出请求 sequence 范围时，Probe 会重试该 batch。
+
+receiver algorithm：
+
+```text
+verify POST, content-type, idempotency-key, and x-traffic-probe-codec
+decode the body according to x-traffic-probe-codec
+decode BatchEnvelope using docs/export-batch.proto
+verify BatchEnvelope.batch_id matches idempotency-key
+durably upsert records by batch_id and EventRecord.sequence
+return accepted=true with the last contiguous durable sequence
+```
+
+第一次做 collector interop 时，可以使用 `codec = "none"` 或 `--codec none`，
+这样 receiver 只需要先处理 protobuf 解码。等 receiver 支持 `x-traffic-probe-codec` 后，
+再启用 `zstd`、`gzip` 或 `deflate`。
+
+`agent replay --policy` 是调试入口：它接受单个 Lua 文件，并包一层 synthetic replay
+manifest。可以用它在不需要 live-capture 权限的情况下验证 receiver：
+
+```bash
+cargo run -p agent --locked -- replay \
+  --input examples/replay.http \
+  --spool target/probe-demo/webhook-replay-spool \
+  --policy examples/policies/http-alert/main.lua \
+  --webhook http://127.0.0.1:9000/batches \
+  --codec none \
+  --agent-id probe-webhook-demo
+```
 
 ### Capture
 

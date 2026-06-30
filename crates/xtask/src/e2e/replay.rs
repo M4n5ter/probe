@@ -5,8 +5,8 @@ use probe_core::{CaptureProviderKind, CaptureSource, Direction, EventEnvelope, E
 use storage::FjallSpool;
 
 use super::harness::{
-    cargo_executable, decode_capture_event, decode_envelope, e2e_error, run_with_temp_root,
-    workspace_root,
+    debug_binary, decode_capture_event, decode_envelope, e2e_error, ensure_e2e_packages_built,
+    run_with_temp_root, workspace_root,
 };
 
 const AGENT_ID: &str = "e2e-replay-agent";
@@ -52,9 +52,11 @@ fn run_agent_replay(
     policy_path: &Path,
     spool_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new(cargo_executable())
+    ensure_e2e_packages_built(["agent"])?;
+    let agent = debug_binary("agent")?;
+    let output = Command::new(&agent)
         .current_dir(workspace_root()?)
-        .args(["run", "-p", "agent", "--locked", "--", "replay", "--input"])
+        .args(["replay", "--input"])
         .arg(input_path)
         .arg("--spool")
         .arg(spool_path)
@@ -62,7 +64,13 @@ fn run_agent_replay(
         .arg(policy_path)
         .arg("--agent-id")
         .arg(AGENT_ID)
-        .output()?;
+        .output()
+        .map_err(|source| {
+            e2e_error(format!(
+                "failed to run agent replay via {}: {source}",
+                agent.display()
+            ))
+        })?;
     if output.status.success() {
         return Ok(());
     }

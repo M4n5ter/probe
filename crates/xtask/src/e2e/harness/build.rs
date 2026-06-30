@@ -25,13 +25,21 @@ pub(crate) fn run_agent_with_max_events(
     config_path: &Path,
     max_events: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_e2e_package_built("agent")?;
     let max_events = max_events.to_string();
-    let status = Command::new(cargo_executable())
+    let agent = debug_binary("agent")?;
+    let status = Command::new(&agent)
         .current_dir(workspace_root()?)
-        .args(["run", "-p", "agent", "--locked", "--", "run", "--config"])
+        .args(["run", "--config"])
         .arg(config_path)
         .args(["--max-events", &max_events])
-        .status()?;
+        .status()
+        .map_err(|source| {
+            e2e_error(format!(
+                "failed to run agent via {}: {source}",
+                agent.display()
+            ))
+        })?;
     if status.success() {
         return Ok(());
     }
@@ -114,6 +122,7 @@ fn cargo_build_command_for_package(package: &str) -> Result<Command, io::Error> 
         None => Command::new(cargo_executable()),
     };
     command
+        .current_dir(workspace_root()?)
         .args(["build", "-p", package, "--locked", "--quiet"])
         .stdin(Stdio::null());
     Ok(command)
