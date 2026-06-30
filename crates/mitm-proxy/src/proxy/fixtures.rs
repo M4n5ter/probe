@@ -308,6 +308,35 @@ pub(super) fn send_policy_hook_deny_response_for_sequence(
     flow: FlowContext,
     stream_sequence: u64,
 ) -> Result<String, Box<dyn Error>> {
+    let body = policy_hook_deny_body(flow, stream_sequence)?.to_string();
+    let request = format!(
+        "POST /mitm-policy-hook HTTP/1.1\r\nHost: {target}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    send_policy_hook_request(target, request.as_bytes())
+}
+
+pub(super) fn send_chunked_policy_hook_deny_response(
+    target: SocketAddr,
+    flow: FlowContext,
+) -> Result<String, Box<dyn Error>> {
+    let body = policy_hook_deny_body(flow, 1)?.to_string();
+    let split = body.len() / 2;
+    let (first, second) = body.split_at(split);
+    let request = format!(
+        "POST /mitm-policy-hook HTTP/1.1\r\nHost: {target}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+        first.len(),
+        first,
+        second.len(),
+        second
+    );
+    send_policy_hook_request(target, request.as_bytes())
+}
+
+fn policy_hook_deny_body(
+    flow: FlowContext,
+    stream_sequence: u64,
+) -> Result<serde_json::Value, Box<dyn Error>> {
     let trigger = EventEnvelope::from_flow(
         Timestamp {
             monotonic_ns: 1,
@@ -327,7 +356,7 @@ pub(super) fn send_policy_hook_deny_response_for_sequence(
             headers: Vec::new(),
         }),
     );
-    let body = serde_json::json!({
+    Ok(serde_json::json!({
         "requested_action": Action::Deny,
         "verdict": Verdict {
             action: Action::Deny,
@@ -337,14 +366,12 @@ pub(super) fn send_policy_hook_deny_response_for_sequence(
             ttl_ms: None,
         },
         "trigger": trigger,
-    })
-    .to_string();
-    let request = format!(
-        "POST /mitm-policy-hook HTTP/1.1\r\nHost: {target}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
+    }))
+}
+
+fn send_policy_hook_request(target: SocketAddr, request: &[u8]) -> Result<String, Box<dyn Error>> {
     let mut stream = TcpStream::connect(target)?;
-    stream.write_all(request.as_bytes())?;
+    stream.write_all(request)?;
     stream.shutdown(Shutdown::Write)?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;

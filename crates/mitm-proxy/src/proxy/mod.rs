@@ -627,6 +627,60 @@ mod tests {
     }
 
     #[test]
+    fn policy_hook_accepts_chunked_json_deny_request() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let policy_hook_listener = bound_loopback_listener()?;
+        let policy_hook_listen = policy_hook_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                None,
+                None,
+                Some(policy_hook_listen),
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            Some(policy_hook_listener),
+        )?;
+
+        let client = thread::spawn(move || -> Result<Vec<u8>, String> {
+            let mut stream = TcpStream::connect(listen).map_err(|error| error.to_string())?;
+            stream
+                .write_all(b"GET /blocked HTTP/1.1\r\nHost: example.test\r\n\r\n")
+                .map_err(|error| error.to_string())?;
+            stream
+                .shutdown(Shutdown::Write)
+                .map_err(|error| error.to_string())?;
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .map_err(|error| error.to_string())?;
+            Ok(response)
+        });
+        let flow = wait_for_flow(&feed_path)?;
+        let hook_response = send_chunked_policy_hook_deny_response(policy_hook_listen, flow)?;
+
+        let response = client
+            .join()
+            .map_err(|_| "client thread panicked")?
+            .map_err(std::io::Error::other)?;
+        guard.stop()?;
+
+        assert!(hook_response.contains(r#""outcome":"delegated""#));
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(feed_has_bytes(
+            &feed_path,
+            Direction::Inbound,
+            deny_response_bytes("blocked by test").as_slice()
+        )?);
+        Ok(())
+    }
+
+    #[test]
     fn policy_hook_rejects_deny_after_action_timeout() -> Result<(), Box<dyn Error>> {
         let root = tempdir()?;
         let feed_path = root.path().join("mitm-feed.jsonl");
@@ -719,6 +773,42 @@ mod tests {
             feed_direction_bytes(&feed_path, Direction::Inbound)?,
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn chunked_http_request_is_forwarded_to_upstream() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let upstream = upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nchunked")?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                None,
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let request = b"POST /chunked HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let mut stream = TcpStream::connect(listen)?;
+        stream.write_all(request)?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nchunked"
+        );
+        assert!(feed_has_bytes(&feed_path, Direction::Outbound, request)?);
         Ok(())
     }
 
