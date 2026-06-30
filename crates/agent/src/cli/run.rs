@@ -578,13 +578,25 @@ end
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("run-unsupported-enforce-before-policy")?;
         let config_path = temp.join("agent.toml");
+        let enforcement_path = temp.join("enforcement.toml");
         let missing_policy_path = temp.join("missing-policy.bundle");
         let spool_path = temp.join("spool");
 
+        fs::write(
+            &enforcement_path,
+            r#"
+id = "managed-apps"
+version = "test-version"
+protective_actions = ["deny"]
+"#,
+        )?;
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Replay;
         config.storage.path = spool_path.clone();
         config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: enforcement_path,
+        };
         config.policies.push(PolicyConfig {
             id: "guard".to_string(),
             source: probe_config::PolicySourceConfig::LocalDirectory {

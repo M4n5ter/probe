@@ -1,143 +1,111 @@
 # Probe
 
-[English](README.md)
+[English](README.md) · [设计文档](docs/design.md) ·
+[安全默认配置](examples/agent.toml) ·
+[本地演示配置](examples/local-agent.toml)
 
-Probe 是一个 Linux 进程级网络流量探针，用于安全遥测、协议可见性和受控防护。
+Probe 是一个 Linux 进程级网络流量探针，用于安全遥测、协议可见性、证据持久化、外发和受控防护。
 
-它在主机上观测流量，将流量关联到进程和 socket，解析协议语义，执行策略判断，
-持久化证据，并导出结构化事件。它适合无法依赖旁路镜像、专用硬件、sidecar
+它在主机上观测流量，将流量关联到进程和 socket，解析协议语义，执行 Lua policy，写入 durable
+event evidence，并导出结构化 batch。它面向无法依赖旁路镜像、专用硬件、service-mesh sidecar
 或业务 SDK 的服务器环境。
 
-Probe 已经可以在受控 Linux 环境中用于开发和验证，但还不是一键式生产 appliance。
-privileged live capture、transparent interception 和 MITM 部署仍需要明确的主机配置
-和 operator 管理的信任决策。
+Probe 现在已经可以在受控 Linux 环境中正常试用和集成。它还不是一键式生产 appliance：
+privileged live capture、transparent interception 和 MITM 都需要明确的主机配置、operator
+管理的信任决策和 capability check。
 
-## 为什么需要 Probe
+## 当前能做什么
 
-很多网络安全系统从 packet 开始建模。Probe 从 process 开始建模。
-
-这会改变系统边界：
-
-- 流量只有能归因到进程、socket、方向和运行时能力时才真正有价值；
-- TLS 可见性不是单一功能，uprobe 明文、key log/session material、plaintext feed
-  和显式 MITM 拥有不同的信任边界；
-- 防护必须有作用域，可以广泛观测主机，但只对选中的应用启用深度拦截或阻断；
-- policy 和 export 需要 typed evidence，而不是隐藏丢失和 fallback 的原始包转储。
-
-Probe 会暴露 capability gap 和 degraded evidence，不把 best-effort 采集伪装成完整观测。
-
-## 当前可用能力
-
-- Capture：
-  replay、plaintext JSONL feed、typed capture-event feed、libpcap live capture，
-  以及在 object path 和主机前置条件满足时的 eBPF capability path selection。
-- Attribution：
-  best-effort procfs process/socket attribution，并对 race、权限、PID reuse、
-  namespace gap 给出 degraded state。
-- TLS visibility：
-  TLS 1.3 key log/session-secret material、libssl uprobe plaintext sidecar、
-  plaintext bridge feed 和显式 MITM proxy TLS termination。
-- Protocol：
-  HTTP/1.x request/response/body event、SSE event、WebSocket upgrade handoff、
-  frame metadata 和有界 message metadata。
-- Policy：
-  Lua policy bundle、typed verdict、本地和远程 policy source、runtime error audit
-  和 admin-triggered reload。
-- Enforcement：
-  audit-only、dry-run、scoped TCP connection destroy、transparent interception
-  lifecycle 和 proxy-side policy hook delegation。
-- MITM proxy：
-  selector-scoped inbound TPROXY 与 outbound transparent MITM；first-party
-  product proxy 支持 HTTP/1.1 TLS relay、host route、opt-in DNS discovery、
-  WebSocket tunnel、plaintext feed 和 delegated deny response。
-- Storage：
-  Fjall-backed ingress journal、export queue、per-sink cursor、retention controls，
-  以及带明确 parser-state 边界的 recovery。
-- Export：
-  webhook 和 file transport，并支持 `none`、`zstd`、`gzip`、`deflate` 压缩选择。
-- Operations：
-  capability report、RuntimePlan validation、JSON status snapshot、health、metrics、
-  admin socket 和 E2E profile。
-
-## 系统结构
-
-```mermaid
-flowchart LR
-    Config[Agent TOML] --> Plan[Runtime Plan]
-    Plan --> Capability[Capability Registry]
-    Plan --> Capture[Capture Provider]
-    Capture --> Attribution[Process / Socket Attribution]
-    Attribution --> Parser[HTTP / SSE / WebSocket Parsers]
-    Parser --> Policy[Lua Policy]
-    Policy --> Spool[Fjall Ingress Journal]
-    Spool --> Export[Webhook / File Export]
-    Policy --> Enforce[Scoped Enforcement]
-    Enforce --> Status[Status / Audit / Metrics]
-```
-
-核心事件契约是 `EventEnvelope`。它携带 origin、provenance、flow/process context、
-degradation state、enforcement evidence 和 typed event payload。policy、durable storage、
-export、runtime status 和测试都使用同一契约。
-
-## 安全模型
-
-Probe 不会把弱证据静默提升为强保证：
-
-- payload gap、provider loss、fallback 和 unsupported runtime capability 都会表现为
-  degraded event、capability state、metric 和 status；
-- destructive enforcement 默认关闭；
-- 真实 connection enforcement 需要显式配置、selector match、允许的 protective action、
-  live-host evidence 和 backend capability；
-- Linux socket destroy 只有在 capability check 和 live socket self-test 通过后才会执行，
-  并会重新复核当前 procfs socket owner，再通过受信系统路径 `ss -K` 关闭已存在 TCP
-  socket；
-- transparent interception 和 MITM 是显式 strategy，并拥有独立的 readiness、self-bypass、
-  client-trust、material、lifecycle 和 audit contract。
-
-## 选择运行模式
-
-- Replay：
-  将已捕获 JSONL 输入重新经过 parser、policy、spool 和 export。不需要 live-capture
-  权限，使用 `agent replay ...`。
-- Plaintext feed：
-  用确定性 plaintext input 做开发、测试、SDK 或 bridge integration。配置
-  `capture.selection = "plaintext_feed"`。
-- Capture-event feed：
-  接收 MITM bridge 或外部采集器输出的 typed `CaptureEvent` JSONL。配置
+- 无 root 体验完整 parser/policy/spool/export 闭环：
+  使用 `examples/local-agent.toml`，通过 plaintext feed 和 file exporter 跑本地 demo。
+- 重新处理已捕获字节流：
+  使用 `agent replay`，输入 raw HTTP 文件，可选 Lua policy。
+- 接入确定性的外部输入：
+  使用 `capture.selection = "plaintext_feed"` 或
   `capture.selection = "capture_event_feed"`。
-- Libpcap live：
-  在 eBPF 不可用或未配置时采集主机流量。需要 root 或 CAP_NET_RAW，使用
-  `capture.selection = "libpcap"` 或 auto fallback。
-- eBPF process observation：
-  使用内核辅助的 process-aware capture。需要 root/bpffs、built eBPF object 和
-  `capture.ebpf.object_path`。
-- TLS plaintext sidecar：
-  attach best-effort libssl plaintext instrumentation。需要 root/bpffs、built eBPF object
-  和 `tls.plaintext.instrumentation`。
-- Transparent interception：
-  对 scoped inbound/outbound connection 做 steering。需要 root/net-admin 和
-  `enforcement.interception`。
-- L7 MITM product proxy：
-  对 scoped TLS 做 termination、upstream relay、plaintext bridge event 输出和
-  proxy-side policy delegation。需要 root/net-admin、operator-managed client trust 和
-  `enforcement.interception.mitm`。
+- 采集 live traffic：
+  libpcap 需要 root/CAP_NET_RAW；eBPF 需要 object path 和主机前置条件。
+- 观察 TLS 流量：
+  使用 key log/session-secret material、libssl uprobe plaintext
+  instrumentation、显式 plaintext bridge 或 scoped MITM。
+- 导出事件：
+  使用 webhook 或 file sink，并选择 `none`、`zstd`、`gzip`、`deflate` 压缩。
+- 执行策略：
+  使用本地或远程 Lua policy bundle 处理 typed event 和 verdict。
+- 保护选定应用：
+  使用 audit-only、dry-run、scoped TCP connection destroy、transparent
+  interception 或 MITM policy hook。
 
-## 构建
+capability model 是显式契约。provider 不可用或证据降级时，`agent capabilities`、`agent check`
+和 `agent status` 会直接报告，而不是把 best-effort observation 伪装成完整观测。
 
-前置条件：
+## 快速开始
 
-- Linux 和 procfs；
-- 支持 edition 2024 的 Rust stable；
-- libpcap live capture 需要 `libpcap` development package；
-- privileged live capture、eBPF、socket destroy、transparent interception 或 MITM 测试需要
-  root 或对应 Linux capability；
-- 构建 eBPF object 需要带 `rust-src` 的 nightly Rust 和 `bpf-linker`。
+Debian 或 Ubuntu 主机上，先安装默认 build 需要的原生依赖：
+
+```bash
+sudo apt-get install -y libpcap-dev pkg-config
+```
 
 构建主 binary：
 
 ```bash
 cargo build -p agent -p xtask --locked
 ```
+
+查看当前主机能力：
+
+```bash
+cargo run -p agent --locked -- capabilities
+```
+
+运行非特权本地 demo：
+
+```bash
+rm -rf target/probe-demo
+mkdir -p target/probe-demo
+
+cargo run -p agent --locked -- check --config examples/local-agent.toml
+cargo run -p agent --locked -- run --config examples/local-agent.toml --max-events 3
+wc -l target/probe-demo/export.jsonl
+head -n 1 target/probe-demo/export.jsonl
+```
+
+这条路径会读取 [examples/plaintext-feed.jsonl](examples/plaintext-feed.jsonl)，加载
+[examples/policies/http-alert](examples/policies/http-alert)，把事件写入
+`target/probe-demo/spool`，并向 `target/probe-demo/export.jsonl` 追加一个 file-export batch。
+
+file exporter 写出的是 JSON Lines batch record。每一行包含 metadata，以及 base64 编码的
+protobuf batch envelope；payload 是否压缩由 codec 决定。它面向 collector 和后续工具消费，
+不是漂亮的人类可读事件日志。
+
+在不需要 live-capture 权限的情况下 replay raw HTTP bytes：
+
+```bash
+rm -rf target/probe-demo/replay-spool
+
+cargo run -p agent --locked -- replay \
+  --input examples/replay.http \
+  --spool target/probe-demo/replay-spool \
+  --policy examples/policies/http-alert/main.lua \
+  --agent-id probe-replay-demo
+```
+
+运行非特权 E2E baseline：
+
+```bash
+cargo run -p xtask --locked -- e2e-suite --profile baseline
+```
+
+## 安装要求
+
+通用要求：
+
+- Linux 和 procfs；
+- 支持 edition 2024 的 stable Rust；
+- 默认 agent build 需要 `libpcap` development headers 和 `pkg-config`；
+- live capture、eBPF、socket destroy、transparent interception 或 MITM 测试需要 root 或对应 Linux capability；
+- 只有构建 eBPF artifact 时才需要带 `rust-src` 的 nightly Rust 和 `bpf-linker`。
 
 运行 MITM E2E 时构建 first-party MITM proxy 和 fixture：
 
@@ -153,59 +121,55 @@ cargo install bpf-linker
 cargo run -p xtask --locked -- ebpf-build
 ```
 
-构建完成后，在 agent 配置中显式填写 object path，例如 process observation 使用
-`capture.ebpf.object_path`，libssl plaintext instrumentation 使用
-`tls.plaintext.instrumentation.libssl_uprobe_object_path`。
+构建后，在 agent 配置中设置生成的 object path：
 
-## 第一次运行
+- process observation：`capture.ebpf.object_path`；
+- libssl plaintext instrumentation：
+  `tls.plaintext.instrumentation.libssl_uprobe_object_path`。
 
-查看主机能力：
+## 选择运行模式
 
-```bash
-cargo run -p agent --locked -- capabilities
-```
+- `agent replay`：
+  将单个 raw byte stream 经过 parser、policy、spool 和可选 webhook export；
+  不需要 live-capture 权限。
+- `plaintext_feed`：
+  使用可读 JSONL 做开发、SDK、测试、bridge 或可信 plaintext handoff。
+- `capture_event_feed`：
+  接收 MITM bridge 或外部采集器输出的 typed `CaptureEvent` JSONL；
+  `follow = true` 可以让 agent 保持在线。
+- `libpcap`：
+  eBPF 不可用或未配置时的 live packet capture；需要 root 或 CAP_NET_RAW。
+- `ebpf`：
+  kernel-assisted process-aware observation；需要 root/bpffs 和已构建 eBPF object。
+- libssl uprobe：
+  针对选定 libssl 进程的 best-effort TLS plaintext sidecar；需要
+  root/bpffs、已构建 eBPF object 和显式 selector。
+- Transparent interception：
+  对 scoped inbound/outbound traffic 做 steering；需要 root/net-admin 和显式 selector。
+- Product MITM proxy：
+  scoped TLS termination、upstream relay、plaintext bridge 和 proxy-side policy hook；
+  需要 root/net-admin、certificate material 和 operator-managed client trust。
 
-校验安全默认示例配置：
+## 配置 Probe
 
-```bash
-cargo run -p agent --locked -- check --config examples/agent.toml
-```
+从以下文件开始：
 
-查看示例配置会生成的 runtime status：
+- [examples/local-agent.toml](examples/local-agent.toml)：可直接运行的本地 demo；
+- [examples/agent.toml](examples/agent.toml)：带注释的安全默认服务器模板。
 
-```bash
-cargo run -p agent --locked -- status --config examples/agent.toml
-```
-
-示例配置刻意保守：`capture.selection = "auto"`、audit-only enforcement、禁用 MITM、
-不配置 destructive backend，也不配置 exporter sink。在主机权限和路径未配置前，
-status 可能会如实报告 live capture 或 spool directory unavailable。
-
-运行非特权 plaintext pipeline E2E：
-
-```bash
-cargo run -p xtask --locked -- e2e-plaintext-feed
-```
-
-通过 plaintext input 验证 WebSocket parser：
-
-```bash
-cargo run -p xtask --locked -- e2e-websocket-plaintext-feed
-```
-
-运行 privileged libpcap loopback E2E：
+运行前校验配置：
 
 ```bash
-sudo target/debug/xtask e2e-libpcap-loopback
+cargo run -p agent --locked -- check --config ./agent.toml
+cargo run -p agent --locked -- status --config ./agent.toml
 ```
 
-## 配置指南
-
-从 [examples/agent.toml](examples/agent.toml) 开始。该文件带注释，并且默认安全。
+`check` 会校验 runtime plan 和配置的 policy。`status` 是副作用较轻的状态快照；
+它会报告本地 policy bundle 的 metadata，但不会执行 policy source。
 
 ### Capture
 
-自动选择会按顺序尝试配置的 fallback backend：
+自动 live selection 会按顺序尝试 fallback backend：
 
 ```toml
 [capture]
@@ -224,7 +188,54 @@ immediate_mode = true
 read_timeout_ms = 1000
 ```
 
-受控 plaintext 输入可以使用 capture-event feed：
+plaintext feed 是确定性输入，不需要 live capture：
+
+```toml
+[capture]
+selection = "plaintext_feed"
+
+[capture.plaintext_feed]
+path = "/var/lib/probe/plaintext-feed.jsonl"
+```
+
+plaintext feed 是 JSON Lines：一行一条 event。每个 event 都重复 `connection` 对象，
+这样 feed 可以 append 或 replay，不依赖隐藏进程状态。`bytes` event 使用数字 byte array、
+direction 和 stream offset：
+
+```json
+{
+  "type": "bytes",
+  "timestamp": { "monotonic_ns": 2, "wall_time_unix_ns": 2 },
+  "connection": {
+    "connection_id": "local-demo-conn",
+    "local": { "address": "127.0.0.1", "port": 51100 },
+    "remote": { "address": "127.0.0.1", "port": 8081 },
+    "protocol": "tcp",
+    "start_monotonic_ns": 1,
+    "attribution_confidence": 100,
+    "process": {
+      "pid": 4242,
+      "tgid": 4242,
+      "start_time_ticks": 1000,
+      "boot_id": "local-demo",
+      "exe_path": "/usr/bin/probe-demo-client",
+      "cmdline_hash": "local-demo-client",
+      "uid": 1000,
+      "gid": 1000,
+      "name": "probe-demo-client",
+      "cmdline": ["probe-demo-client"]
+    }
+  },
+  "direction": "outbound",
+  "stream_offset": 0,
+  "bytes": [71, 69, 84, 32, 47, 100, 101, 109, 111]
+}
+```
+
+`connection_opened`、`connection_closed` 和 `gap` event 使用同一 connection 形状。
+`gap` 包含 `expected_offset`、可选 `next_offset` 和 `reason`。
+
+capture-event feed 接收 typed capture event，并可以 follow append：
 
 ```toml
 [capture]
@@ -237,7 +248,7 @@ follow = true
 
 ### Storage
 
-live run 和 export queue 需要 spool：
+live run 和 exporter cursor 需要 Fjall spool：
 
 ```toml
 [storage]
@@ -257,7 +268,7 @@ active parser state 不会序列化，因此 recovery 是保守能力，并在 c
 
 ### Export
 
-启用 export worker 并配置一个或多个 sink：
+长运行 agent 应启用 worker，并配置一个或多个 sink：
 
 ```toml
 [export.worker]
@@ -285,35 +296,175 @@ headers = { x_probe_node = "probe-local" }
 
 支持的 codec 是 `none`、`zstd`、`gzip` 和 `deflate`；默认是 `zstd`。
 webhook sink 可以引用 `[[tls.materials]]` 中的 trust anchor 和 client identity。
+file sink 会创建私有 `0600` 文件，并拒绝不安全的父目录。
+
+#### Webhook Receiver Contract
+
+webhook `endpoint` 必须是带 scheme 和 host 的绝对 `http://` 或 `https://` URL。
+URL credentials 会被拒绝；部署认证应使用显式 exporter headers 或 TLS material refs。
+Probe 对每个 export batch 发送：
+
+- method：`POST`；
+- request target：配置的 endpoint path 和 query；
+- `content-type: application/x-protobuf`；
+- `x-traffic-probe-codec: none | zstd | gzip | deflate`；
+- `idempotency-key: <batch_id>`；
+- body：`proto::BatchEnvelope` protobuf message，并按 codec header 压缩。
+
+`BatchEnvelope` 包含 `batch_id`、`agent_id`、`codec` 和重复的 `EventRecord`。
+每个 event record 包含单调 export `sequence`、event id、JSON `EventEnvelope` payload，
+以及 payload schema `traffic.probe.event_envelope.subject_origin.json`。
+
+receiver response 必须是 UTF-8 JSON，并且不超过 64 KiB：
+
+```json
+{
+  "batch_id": "probe-local:primary-webhook:1-4",
+  "accepted": true,
+  "acked_cursor": 4,
+  "reason": null
+}
+```
+
+accepted batch 必须返回 `acked_cursor`，并且 cursor 必须落在 batch sequence 范围内。
+完整消费 batch 时应返回最后一个 sequence。未知 JSON 字段会被忽略，因此 receiver
+可以附带本地 metadata，而不会改变 acknowledgement contract。非 2xx HTTP status、
+无效 JSON、`accepted = false`、batch id mismatch、缺少 cursor 或 cursor 越界都会让
+sink 保持 unacked，worker 会按 backoff policy 重试。
+
+自定义 exporter `headers` 可以携带部署 metadata，但不能覆盖保留协议头：
+`content-type`、`idempotency-key`、`x-traffic-probe-codec`。
 
 ### Policy
 
-Policy bundle 是普通 runtime input：
+`agent run` 使用 policy bundle。本地 bundle 是包含 `manifest.toml` 和 `main.lua` 的目录：
+
+```text
+policy/
+  manifest.toml
+  main.lua
+```
+
+manifest 示例：
+
+```toml
+id = "http-alert"
+version = "example"
+hooks = ["on_http_request_headers"]
+```
+
+source 示例：
+
+```lua
+function on_http_request_headers(event)
+  local method = event.kind.method or "UNKNOWN"
+  local target = event.kind.target or "/"
+  return probe.emit_alert("HTTP request " .. method .. " " .. target)
+end
+```
+
+在 agent config 中引用 bundle：
 
 ```toml
 [[policies]]
-id = "app-policy"
+id = "http-alert"
 enabled = true
 
 [policies.source]
 kind = "local_directory"
-path = "/etc/probe/policies/app"
+path = "/etc/probe/policies/http-alert"
 ```
 
-Enforcement manifest 可以来自本地文件、目录或远程 endpoint：
+远程 policy bundle 是 bounded TOML document：
 
 ```toml
-[enforcement.policy.source]
-kind = "remote"
-endpoint = "http://127.0.0.1:9000/enforcement.toml"
+[[policies]]
+id = "http-alert"
+enabled = true
+
+[policies.source]
+kind = "remote_bundle"
+endpoint = "https://policy.example/bundles/http-alert.toml"
 max_body_bytes = 16777216
 ```
 
-启用 admin surface 后可以手动 reload。local manifest watcher 需要显式开启。
+`agent replay --policy` 是刻意不同的调试入口：它接受单个 Lua 文件，并包一层 synthetic replay
+manifest。
 
-### TLS Materials
+#### Lua Policy Contract
 
-TLS material reference 会被 exporter、TLS decrypt hint 和 MITM 共享：
+policy manifest 声明启用哪些 Lua hook。支持的 hook 名称是：
+
+```text
+on_connection_opened
+on_connection_closed
+on_http_request_headers
+on_http_response_headers
+on_http_body_chunk
+on_sse_event
+on_websocket_handoff
+on_websocket_frame
+on_websocket_message
+on_opaque_stream
+on_gap
+on_protocol_error
+```
+
+每个 hook 接收一个 `event` table。通用字段包括：
+
+- `event.id`；
+- `event.event_type`；
+- `event.direction`，如果该 event 有方向；
+- `event.timestamp.monotonic_ns` 和 `event.timestamp.wall_time_unix_ns`；
+- `event.origin.source` 和 `event.origin.provider`；
+- `event.flow.id`、`event.flow.process`、`event.flow.local_endpoint`、
+  `event.flow.remote_endpoint`；
+- `event.degraded`；
+- `event.enforcement_evidence.kind`；
+- `event.kind`，字段由 `event.event_type` 决定。
+
+对于 `on_http_request_headers`，`event.kind` 包含 `method`、`target`、`version`、
+`headers`、`direction` 和 `stream_sequence`。WebSocket hook 暴露 handoff、frame
+和有界 message metadata；payload fingerprint 是 byte array，不保留 plaintext payload。
+
+hook 可以返回：
+
+- `nil`，表示没有 outcome；
+- `probe.emit_alert("message")`；
+- `probe.verdict { action = "...", scope = "...", reason = "...", confidence = 100 }`；
+- 包含多个 alert 或 verdict outcome 的数组。
+
+示例：
+
+```lua
+function on_http_request_headers(event)
+  if event.kind.method == "POST" and event.kind.target == "/admin" then
+    return {
+      probe.emit_alert("admin POST observed"),
+      probe.verdict {
+        action = "reset",
+        scope = "flow",
+        reason = "admin endpoint is not allowed",
+        confidence = 95,
+        ttl_ms = 60000
+      }
+    }
+  end
+end
+```
+
+verdict action 是 `allow`、`observe`、`alert`、`deny`、`reset`、`quarantine`；
+protective enforcement 只会应用配置化 enforcement policy 和 runtime backend 允许的动作。
+scope 是 `flow`、`request`、`response`、`chunk`。
+
+Lua runtime 是 sandbox。`require`、`io`、`os`、`package`、`debug`、`ffi`、`jit`、
+`dofile`、`loadfile`、`load`、`collectgarbage` 等 host capability 不可用。
+policy 受 instruction 和 memory budget 限制；runtime error 会被审计为 policy runtime
+error event，不会被当作成功 verdict。
+
+### TLS Material
+
+TLS material reference 由 exporter、TLS decrypt hint 和 MITM 共享：
 
 ```toml
 [[tls.materials]]
@@ -342,8 +493,7 @@ kind = "mitm_upstream_trust_anchor"
 path = "/etc/probe/certs/upstream-ca.pem"
 ```
 
-best-effort libssl plaintext instrumentation 必须显式开启。应配置 selector 来避免过宽
-attachment；省略 selector 时，provider 会考虑所有可 attach 的 libssl process：
+best-effort libssl plaintext instrumentation 必须显式开启。应配置 selector，避免过宽 attachment：
 
 ```toml
 [tls.plaintext.instrumentation]
@@ -365,13 +515,13 @@ container_ids = []
 [tls.plaintext.instrumentation.selector.term.traffic]
 local_ports = []
 remote_ports = [443]
-directions = []
+directions = ["outbound"]
 remote_addresses = []
 ```
 
 ### Enforcement 与 MITM
 
-Enforcement 默认从 audit-only 开始：
+Enforcement 从 audit-only 开始：
 
 ```toml
 [enforcement]
@@ -379,13 +529,59 @@ mode = "audit_only"
 backend = "none"
 ```
 
-dry-run 可以在没有 destructive backend 的情况下验证 planner decision。Connection enforcement
-应配置 selector，避免过宽匹配；如果没有配置 selector，policy trigger 可能会宽范围命中。
-enforce mode 只有在 policy 允许 protective action 且已配置 backend 支持该动作时才会应用。
-transparent interception setup 额外要求显式 local selector。Linux socket destroy 只关闭已存在
-的 TCP socket；它不是 pre-connect deny，也不是 UDP blocking。
+`dry_run` 用来在不执行 destructive backend 的情况下验证 planner decision。只有在显式配置
+backend、selector、policy source 并完成运维审批后，才应使用 `enforce`。
 
-Selector 由 process 和 traffic 维度组合：
+Lua policy 产生 event-level alert 和 verdict request。Enforcement policy manifest 是独立
+control input，用来定义允许应用哪些 protective action，以及可选的 process/traffic selector：
+
+```toml
+[enforcement.policy.source]
+kind = "file"
+path = "/etc/probe/enforcement.toml"
+```
+
+enforcement manifest 是 TOML。可运行模板在
+[`examples/enforcement.toml`](examples/enforcement.toml)：
+
+```toml
+id = "managed-apps"
+version = "2026-06-30"
+protective_actions = ["deny", "reset"]
+
+[selector]
+op = "match"
+
+[selector.term.process]
+pids = []
+names = []
+exe_path_globs = ["/usr/bin/curl"]
+cmdline_regexes = []
+systemd_services = []
+container_ids = []
+
+[selector.term.traffic]
+local_ports = []
+remote_ports = [443]
+directions = ["outbound"]
+remote_addresses = []
+```
+
+支持的 source kind：
+
+- `none`，不启用配置化 enforcement policy input，且不能与 `mode = "enforce"` 搭配；
+- `file`，`path` 直接指向一个 manifest；
+- `directory`，`path` 指向包含 `manifest.toml` 的目录；
+- `remote`，`endpoint` 返回一个 bounded TOML manifest，可选 `max_body_bytes`
+  限制 response body。
+
+remote endpoint 必须是不含 credentials 的 absolute URL。除本地测试使用的 loopback HTTP
+endpoint 外，必须使用 HTTPS。
+
+`protective_actions` 只接受 `deny`、`reset` 和 `quarantine`。这样 destructive action
+profile 会保持显式，并与 Lua event policy logic 分离。
+
+Selector 组合 process 和 traffic 维度：
 
 ```toml
 [enforcement.interception.selector]
@@ -402,17 +598,42 @@ container_ids = []
 [enforcement.interception.selector.term.traffic]
 local_ports = []
 remote_ports = [443]
-directions = []
+directions = ["outbound"]
 remote_addresses = []
 ```
 
-Transparent MITM 是独立显式 strategy。它需要 root/net-admin、operator-managed client trust、
+Linux socket destroy 只关闭已存在的 TCP socket。它不是 pre-connect deny、UDP blocking，
+也不是 payload-level blocking。
+
+Transparent MITM 是独立 strategy。它需要 root/net-admin、operator-managed client trust、
 certificate material refs、proxy listener 设置、backend readiness、plaintext bridge 配置和
-scoped selector。下面的片段展示 inbound product-proxy 形态：
+scoped selector。下面的 fragment 假设前面的 TLS material refs 已经配置：
 
 ```toml
 [enforcement]
 mode = "enforce"
+backend = "none"
+
+[enforcement.policy.source]
+kind = "file"
+path = "/etc/probe/enforcement.toml"
+
+[enforcement.interception.selector]
+op = "match"
+
+[enforcement.interception.selector.term.process]
+pids = []
+names = []
+exe_path_globs = []
+cmdline_regexes = []
+systemd_services = []
+container_ids = []
+
+[enforcement.interception.selector.term.traffic]
+local_ports = [443]
+remote_ports = []
+directions = ["inbound"]
+remote_addresses = []
 
 [enforcement.interception]
 strategy = "inbound_tproxy_mitm"
@@ -453,49 +674,61 @@ mode = "http_json"
 endpoint = "http://127.0.0.1:15002/mitm-policy-hook"
 ```
 
-first-party product proxy 支持 exact 和 suffix-wildcard upstream route。
-opt-in DNS discovery 可以作为 fallback；默认拒绝 IANA special-purpose/special-use address，
-除非 operator 显式允许。
-CA-backed dynamic certificate mode 要求下游 client 发送 DNS SNI。启用 upstream TLS 时，
-agent-managed product proxy 会使用 reconcile 后的 SNI 作为 upstream TLS server name。固定
-upstream target 不能和 route table 或 DNS discovery 组合。Host/SNI mismatch 会 fail
-closed；route 未命中时，可以先经过显式 DNS discovery，再回退 recovered target。
+first-party product proxy 支持 exact 和 suffix-wildcard upstream route。opt-in DNS discovery
+可作为 fallback；默认拒绝 IANA special-purpose/special-use address，除非显式允许。
+CA-backed dynamic certificate mode 要求下游 client 发送 DNS SNI。Host/SNI mismatch 会 fail
+closed。
 
-## 运维入口
+### Admin 与 Status
 
-`agent` binary 暴露五个运维命令：
+需要 online reload 时启用 admin socket：
+
+```toml
+[admin]
+enabled = true
+socket_path = "/run/traffic-probe/admin.sock"
+```
+
+admin reload 会先校验新 policy 或 enforcement state，再替换 runtime state。本地 policy bundle
+watcher 需要显式开启：
+
+```toml
+[policy_reload]
+watch_local_bundles = true
+debounce_ms = 500
+```
+
+## 运维命令
 
 ```bash
 agent capabilities
 agent check --config ./agent.toml
 agent status --config ./agent.toml
 agent run --config ./agent.toml
-agent replay \
-  --input ./traffic.jsonl \
-  --spool ./spool \
-  --direction outbound \
-  --policy ./policy.bundle
+agent replay --input ./traffic.http --spool ./spool --policy ./policy.lua
 ```
 
-`capabilities`、`check` 和 `status` 返回适合自动化消费的 JSON。`run` 启动 live agent。
-`replay` 不需要 live capture 权限，会把输入接入同一 parser、policy、spool 和 export 路径。
+`capabilities`、`check` 和 `status` 返回适合自动化消费的 JSON。`run` 启动配置化 agent。
+`replay` 将单个 byte stream 接入同一 parser、policy、spool 和可选 webhook path，不需要
+live-capture 权限。
 
 ## 验证
 
-E2E registry 按能力声明组织：
+E2E profile 按 capability claim 组织：
 
-- `baseline` 覆盖 replay、plaintext feed、loss/gap event、HTTP/SSE/WebSocket、
-  webhook/file export 和 remote policy input。
-- `live-core`、`process-ebpf` 和 `tls-plaintext` 覆盖 privileged libpcap、admin reload、
-  socket destroy、TLS material auto-binding、eBPF process observation 和 libssl plaintext
-  lifecycle。
-- `transparent-interception` 覆盖 inbound TPROXY、outbound transparent proxy、
-  MITM plaintext bridge、proxy-side policy hook、product proxy routed/DNS HTTPS 和
-  WebSocket tunnel path。
-- `linux-artifacts` 和 `product` 提供 Linux artifact acceptance 以及组合 product
-  capability profile。
+- `baseline` 以普通用户运行，覆盖 replay、plaintext feed、gap/loss event、
+  HTTP/SSE/WebSocket、webhook/file export 和 remote policy input。
+- `live-core` 需要 root 或 CAP_NET_RAW，覆盖 libpcap loopback、admin reload、
+  socket destroy 和 TLS key log/session-secret material。
+- `process-ebpf` 需要 root/bpffs，覆盖 eBPF process observation。
+- `tls-plaintext` 需要 root/bpffs，覆盖 libssl plaintext provider 和 attach lifecycle。
+- `transparent-interception` 需要 root/net-admin，覆盖 inbound TPROXY、outbound proxy、
+  MITM plaintext bridge、policy hook 和 product proxy HTTPS/WebSocket path。
+- `linux-artifacts` 需要 root/net-admin，覆盖 Linux transparent interception artifact
+  acceptance。
+- `product` 组合 user、live、eBPF、TLS、interception、MITM 和 Linux artifact suite。
 
-列出 E2E case 和 profile：
+列出 case 和 profile：
 
 ```bash
 cargo run -p xtask --locked -- e2e-suite --list
@@ -536,38 +769,23 @@ Probe 不声明以下能力：
 
 ## 仓库结构
 
-- `crates/core`：
-  共享事件契约、selector、process/flow identity、verdict 和 capability model。
-- `crates/config`：
-  TOML 配置模型和校验。
-- `crates/runtime`：
-  Runtime plan model 和 capability validation。
-- `crates/capture`：
-  Capture provider、eBPF/libpcap 路径、TLS plaintext bridge 和 capture evidence。
-- `crates/parsers`：
-  Parser trait，以及 HTTP/SSE/WebSocket 实现。
-- `crates/policy`：
-  Lua policy runtime 和 event view。
-- `crates/enforcement`：
-  Scoped enforcement planner 和 backend/hook contract。
-- `crates/pipeline`：
-  capture/parser/policy/spool 执行 pipeline。
-- `crates/agent`：
-  Runtime composition、config loading、status/admin surface 和 live agent。
-- `crates/storage`：
-  Fjall durable spool 和 cursor-backed queue。
-- `crates/exporter`：
-  Export batch、codec、webhook transport 和 file transport。
-- `crates/mitm-proxy`：
-  First-party L7 MITM product proxy。
-- `crates/transparent-linux`：
-  Linux transparent interception artifact planning。
-- `crates/xtask`：
-  端到端验证 harness。
-- `examples/agent.toml`：
-  带注释的安全默认 agent 配置。
-- `docs/design.md`：
-  中文设计源和验证矩阵。
+| 路径 | 职责 |
+| --- | --- |
+| `crates/core` | event contract、selector、process/flow identity、verdict、capability model |
+| `crates/config` | TOML config model 和 validation |
+| `crates/runtime` | runtime plan 和 capability validation |
+| `crates/capture` | capture provider、eBPF/libpcap path、TLS plaintext bridge |
+| `crates/parsers` | parser trait 和 HTTP/SSE/WebSocket implementation |
+| `crates/policy` | Lua policy runtime 和 event view |
+| `crates/enforcement` | scoped enforcement planner 和 backend/hook contract |
+| `crates/pipeline` | capture-to-parser-to-policy-to-spool execution |
+| `crates/agent` | runtime composition、config loading、status/admin surface |
+| `crates/storage` | Fjall durable spool 和 cursor-backed queue |
+| `crates/exporter` | export batch、codec、webhook transport、file transport |
+| `crates/mitm-proxy` | first-party L7 MITM product proxy |
+| `crates/transparent-linux` | Linux transparent interception artifact planning |
+| `crates/xtask` | end-to-end validation harness |
+| `examples` | 可运行 demo input 和带注释 config template |
 
 ## 贡献
 
@@ -590,7 +808,7 @@ cargo test --workspace --locked
 
 ## License
 
-本项目采用双协议授权，你可以任选其一：
+Probe 采用双协议授权，你可以任选其一：
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT License ([LICENSE-MIT](LICENSE-MIT))

@@ -1,0 +1,38 @@
+agent_id = "probe-demo"
+config_version = "local-demo"
+
+[capture]
+selection = "plaintext_feed"
+
+[capture.plaintext_feed]
+path = "examples/plaintext-feed.jsonl"
+
+[storage]
+path = "target/probe-demo/spool"
+
+[export.worker]
+# The local demo runs with --max-events, so tail drain is enough and avoids a
+# background worker in the quick-start path.
+enabled = false
+
+[[exporters]]
+id = "local-file"
+transport = "file"
+path = "target/probe-demo/export.jsonl"
+codec = "none"
+
+[[policies]]
+id = "http-alert"
+enabled = true
+
+[policies.source]
+kind = "local_directory"
+path = "examples/policies/http-alert"
+
+[enforcement]
+mode = "audit_only"
+backend = "none"
+
+[enforcement.policy.source]
+kind = "file"
+path = "examples/enforcement.toml"

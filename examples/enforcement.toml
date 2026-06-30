@@ -1,0 +1,20 @@
+id = "managed-apps"
+version = "example"
+protective_actions = ["deny", "reset"]
+
+[selector]
+op = "match"
+
+[selector.term.process]
+pids = []
+names = []
+exe_path_globs = ["/usr/bin/curl"]
+cmdline_regexes = []
+systemd_services = []
+container_ids = []
+
+[selector.term.traffic]
+local_ports = []
+remote_ports = [443]
+directions = ["outbound"]
+remote_addresses = []

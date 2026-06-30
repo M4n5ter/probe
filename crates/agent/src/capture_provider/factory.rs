@@ -385,8 +385,8 @@ mod tests {
 
     use capture::{CaptureError, CaptureEvent, CapturePoll, CapturedLoss};
     use probe_config::{
-        AgentConfig, CaptureBackend, CaptureSelection, TlsMaterialConfig, TlsMaterialKind,
-        TransparentInterceptionMitmBackendConfig,
+        AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicySourceConfig,
+        TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
         TransparentInterceptionMitmManagedProcessConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
@@ -770,6 +770,9 @@ mod tests {
                 ..TrafficSelector::default()
             },
         ));
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: "/tmp/traffic-probe-enforcement.toml".into(),
+        };
         config.tls.materials = vec![
             TlsMaterialConfig {
                 id: Some("mitm-ca".to_string()),
@@ -835,6 +838,9 @@ mod tests {
                 ..TrafficSelector::default()
             },
         ));
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: "/tmp/traffic-probe-enforcement.toml".into(),
+        };
         config.tls.materials = vec![
             TlsMaterialConfig {
                 id: Some("mitm-ca".to_string()),

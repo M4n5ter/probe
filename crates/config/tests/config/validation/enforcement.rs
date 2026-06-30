@@ -111,6 +111,29 @@ max_body_bytes = {max_body_bytes}
 }
 
 #[test]
+fn validation_rejects_enforce_without_enforcement_policy_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement]
+mode = "enforce"
+backend = "linux_socket_destroy"
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("enforce mode must require an explicit policy source");
+
+    assert!(
+        error
+            .to_string()
+            .contains("enforce mode requires an explicit enforcement policy source")
+    );
+    Ok(())
+}
+
+#[test]
 fn validation_accepts_enforcement_policy_reload_watcher_config()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(

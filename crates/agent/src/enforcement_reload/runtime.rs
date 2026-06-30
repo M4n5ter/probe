@@ -241,6 +241,9 @@ mod tests {
                 ..TrafficSelector::default()
             },
         ));
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: "/tmp/traffic-probe-enforcement.toml".into(),
+        };
         RuntimePlan::build(config, &transparent_interception_registry())
     }
 
@@ -259,6 +262,9 @@ mod tests {
                 ..TrafficSelector::default()
             },
         ));
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: "/tmp/traffic-probe-enforcement.toml".into(),
+        };
         config.enforcement.interception.mitm.backend =
             TransparentInterceptionMitmBackendConfig::external(
                 TransparentInterceptionMitmBackendReadinessProbeConfig {

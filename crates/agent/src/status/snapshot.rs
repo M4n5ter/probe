@@ -1112,6 +1112,9 @@ mod tests {
                 ..TrafficSelector::default()
             },
         ));
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: "/tmp/traffic-probe-enforcement.toml".into(),
+        };
         config.enforcement.interception.proxy = probe_config::TransparentInterceptionProxyConfig {
             mode: probe_config::TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
             listen_port: Some(15001),

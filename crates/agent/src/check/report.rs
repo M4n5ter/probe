@@ -584,6 +584,7 @@ protective_actions = ["alert"]
     #[tokio::test]
     async fn check_report_exposes_process_classifier_setup_block()
     -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-process-classifier-setup")?;
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -601,6 +602,7 @@ protective_actions = ["alert"]
                 ..TrafficSelector::default()
             },
         ));
+        attach_enforcement_policy_source(&mut config, &temp)?;
         let plan = RuntimePlan::build(
             config,
             &runtime_registry(vec![CapabilityState::available(
@@ -633,12 +635,14 @@ protective_actions = ["alert"]
                 ["process"]["names"],
             json!(["curl"])
         );
+        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[tokio::test]
     async fn check_report_exposes_outbound_redirect_artifact()
     -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-outbound-redirect")?;
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -655,6 +659,7 @@ protective_actions = ["alert"]
                 ..TrafficSelector::default()
             },
         ));
+        attach_enforcement_policy_source(&mut config, &temp)?;
         let (plan, backend) = build_test_runtime_composition(config)?.into_enforcement_parts();
 
         let report = build_check_report(plan, backend).await?;
@@ -685,12 +690,14 @@ protective_actions = ["alert"]
             value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["proxy_bypass_mark"],
             json!(0x5450_0102)
         );
+        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[tokio::test]
     async fn check_report_exposes_outbound_mitm_capability_requirements()
     -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-outbound-mitm-capabilities")?;
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -708,6 +715,7 @@ protective_actions = ["alert"]
                 ..TrafficSelector::default()
             },
         ));
+        attach_enforcement_policy_source(&mut config, &temp)?;
         let plan = RuntimePlan::build(
             config,
             &runtime_registry(vec![
@@ -836,12 +844,14 @@ protective_actions = ["alert"]
             value["enforcement"]["interception"]["outbound_redirect"]["kind"],
             json!("planned")
         );
+        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[tokio::test]
     async fn check_report_exposes_managed_process_mitm_backend()
     -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-managed-process-mitm")?;
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -859,6 +869,7 @@ protective_actions = ["alert"]
                 ..TrafficSelector::default()
             },
         ));
+        attach_enforcement_policy_source(&mut config, &temp)?;
         let plan = RuntimePlan::build(
             config,
             &runtime_registry(vec![
@@ -890,12 +901,14 @@ protective_actions = ["alert"]
             value["enforcement"]["interception"]["mitm"]["backend"]["readiness_probe"]["target"],
             json!("127.0.0.1:15002")
         );
+        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[tokio::test]
     async fn check_report_exposes_external_outbound_proxy_self_bypass_contract()
     -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-external-outbound-self-bypass")?;
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -914,6 +927,7 @@ protective_actions = ["alert"]
                 ..TrafficSelector::default()
             },
         ));
+        attach_enforcement_policy_source(&mut config, &temp)?;
         let (plan, backend) = build_test_runtime_composition(config)?.into_enforcement_parts();
 
         let report = build_check_report(plan, backend).await?;
@@ -932,12 +946,14 @@ protective_actions = ["alert"]
             value["enforcement"]["interception"]["outbound_redirect"]["artifact"]["proxy_bypass_mark"],
             json!(0x5450_0102)
         );
+        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[tokio::test]
     async fn check_report_exposes_outbound_process_scope_requirement()
     -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-outbound-process-scope")?;
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -957,6 +973,7 @@ protective_actions = ["alert"]
                 ..TrafficSelector::default()
             },
         ));
+        attach_enforcement_policy_source(&mut config, &temp)?;
         let (plan, backend) = build_test_runtime_composition(config)?.into_enforcement_parts();
 
         let report = build_check_report(plan, backend).await?;
@@ -979,6 +996,7 @@ protective_actions = ["alert"]
             value["enforcement"]["interception"]["outbound_redirect"]["kind"],
             json!("planned")
         );
+        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
@@ -1010,6 +1028,7 @@ protective_actions = ["alert"]
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.backend = ConnectionEnforcementBackendConfig::LinuxSocketDestroy;
+        attach_enforcement_policy_source(&mut config, &temp)?;
         let plan = runtime_plan_with_connection_enforcement(config)?;
 
         let error = build_check_report(plan, None)
@@ -1169,6 +1188,24 @@ protective_actions = ["alert"]
         };
         config.enforcement.interception.mitm.backend =
             TransparentInterceptionMitmBackendConfig::managed_process(readiness_probe, process);
+    }
+
+    fn attach_enforcement_policy_source(
+        config: &mut AgentConfig,
+        temp: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp.join("enforcement.toml");
+        fs::write(
+            &path,
+            r#"
+id = "managed-apps"
+version = "test-version"
+protective_actions = ["deny"]
+"#,
+        )?;
+        config.enforcement.policy.source =
+            probe_config::EnforcementPolicySourceConfig::File { path };
+        Ok(())
     }
 
     fn config_with_policy(path: &Path) -> Result<AgentConfig, probe_config::ConfigError> {

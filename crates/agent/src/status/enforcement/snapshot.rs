@@ -599,6 +599,7 @@ protective_actions = ["alert"]
         config.enforcement.mode = probe_core::EnforcementMode::Enforce;
         config.enforcement.backend =
             probe_config::ConnectionEnforcementBackendConfig::LinuxSocketDestroy;
+        attach_test_enforcement_policy_source(&mut config);
         let plan = runtime_plan_from_config(
             config,
             vec![probe_core::CapabilityState::available(
@@ -670,6 +671,7 @@ protective_actions = ["alert"]
                 ..TrafficSelector::default()
             },
         ));
+        attach_test_enforcement_policy_source(&mut config);
         let plan = runtime_plan_from_config(
             config,
             vec![
@@ -951,6 +953,7 @@ protective_actions = ["alert"]
                 ..TrafficSelector::default()
             },
         ));
+        attach_test_enforcement_policy_source(&mut config);
         let plan = build_test_runtime_composition(config)?.into_plan();
 
         let status = enforcement_status(&plan);
@@ -1012,6 +1015,7 @@ protective_actions = ["alert"]
                 ..TrafficSelector::default()
             },
         ));
+        attach_test_enforcement_policy_source(&mut config);
         let plan = build_test_runtime_composition(config)?.into_plan();
 
         let status = enforcement_status(&plan);
@@ -1057,6 +1061,7 @@ protective_actions = ["alert"]
                 ..TrafficSelector::default()
             },
         ));
+        attach_test_enforcement_policy_source(&mut config);
         let plan = runtime_plan_from_config(
             config,
             vec![probe_core::CapabilityState::available(
@@ -1101,6 +1106,12 @@ protective_actions = ["alert"]
         enforcement_status_with_transparent_proxy(plan, None, None)
     }
 
+    fn attach_test_enforcement_policy_source(config: &mut probe_config::AgentConfig) {
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: "/tmp/traffic-probe-enforcement.toml".into(),
+        };
+    }
+
     fn config_with_external_mitm_plaintext_bridge(
         bridge_path: PathBuf,
     ) -> probe_config::AgentConfig {
@@ -1137,6 +1148,7 @@ protective_actions = ["alert"]
                 ..TrafficSelector::default()
             },
         ));
+        attach_test_enforcement_policy_source(&mut config);
         config.tls.materials = vec![
             probe_config::TlsMaterialConfig {
                 id: Some("mitm-ca".to_string()),

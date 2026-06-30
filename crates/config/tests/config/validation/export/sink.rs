@@ -108,6 +108,43 @@ headers = { "bad header" = "value", good = "bad\nvalue" }
 }
 
 #[test]
+fn validation_rejects_invalid_webhook_endpoint_urls() -> Result<(), Box<dyn std::error::Error>> {
+    for (endpoint, reason) in [
+        ("/relative", "webhook endpoint must be an absolute URL"),
+        (
+            "collector.example/batches",
+            "webhook endpoint must be an absolute URL",
+        ),
+        (
+            "https://user:password@collector.example/batches",
+            "webhook endpoint must not contain credentials",
+        ),
+        (
+            "ftp://collector.example/batches",
+            "webhook endpoint must use HTTP or HTTPS",
+        ),
+    ] {
+        let config = AgentConfig::from_toml_str(&format!(
+            r#"
+[[exporters]]
+id = "primary"
+transport = "webhook"
+endpoint = "{endpoint}"
+"#
+        ))?;
+
+        let error = config
+            .validate_basic()
+            .expect_err("invalid webhook endpoint must be rejected");
+        assert!(
+            error.to_string().contains(reason),
+            "expected {reason:?} in {error}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn validation_rejects_empty_file_exporter_path() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
         r#"

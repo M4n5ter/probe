@@ -4,6 +4,7 @@ use crate::{
     ConfigViolation, ExporterConfig, ExporterTransportConfig, TlsConfig, TlsMaterialKind,
     validation::export::{headers, tls},
 };
+use url::Url;
 
 const REPLAY_WEBHOOK_SINK_ID: &str = "replay-webhook";
 
@@ -58,12 +59,7 @@ fn validate_transport(
             for (name, value) in configured_headers {
                 headers::validate_header(exporter, name, value, violations);
             }
-            if endpoint.trim().is_empty() {
-                violations.push(ConfigViolation {
-                    field: format!("exporters.{}.endpoint", exporter.id),
-                    reason: "webhook endpoint cannot be empty".to_string(),
-                });
-            }
+            validate_webhook_endpoint(exporter, endpoint, violations);
             tls::validate_exporter_tls(
                 exporter,
                 endpoint,
@@ -80,5 +76,48 @@ fn validate_transport(
                 });
             }
         }
+    }
+}
+
+fn validate_webhook_endpoint(
+    exporter: &ExporterConfig,
+    endpoint: &str,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    let field = format!("exporters.{}.endpoint", exporter.id);
+    if endpoint.trim().is_empty() {
+        violations.push(ConfigViolation {
+            field,
+            reason: "webhook endpoint cannot be empty".to_string(),
+        });
+        return;
+    }
+
+    let Ok(url) = Url::parse(endpoint) else {
+        violations.push(ConfigViolation {
+            field,
+            reason: "webhook endpoint must be an absolute URL".to_string(),
+        });
+        return;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        violations.push(ConfigViolation {
+            field,
+            reason: "webhook endpoint must not contain credentials".to_string(),
+        });
+        return;
+    }
+    if !matches!(url.scheme(), "http" | "https") {
+        violations.push(ConfigViolation {
+            field,
+            reason: "webhook endpoint must use HTTP or HTTPS".to_string(),
+        });
+        return;
+    }
+    if url.host_str().is_none() {
+        violations.push(ConfigViolation {
+            field,
+            reason: "webhook endpoint must include a host".to_string(),
+        });
     }
 }

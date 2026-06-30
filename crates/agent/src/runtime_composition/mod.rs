@@ -151,7 +151,7 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
 
     use probe_config::{
-        CaptureSelection, TlsMaterialConfig, TlsMaterialKind,
+        CaptureSelection, EnforcementPolicySourceConfig, TlsMaterialConfig, TlsMaterialKind,
         TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
         TransparentInterceptionMitmClientTrustModeConfig,
@@ -213,6 +213,9 @@ mod tests {
                 ..TrafficSelector::default()
             },
         ));
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: "/tmp/traffic-probe-enforcement.toml".into(),
+        };
         let error = match build_runtime_composition_for_test(
             config,
             vec![CaptureProviderDescriptor::available(

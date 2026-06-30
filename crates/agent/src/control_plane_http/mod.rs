@@ -115,6 +115,9 @@ mod tests {
                 ..probe_core::TrafficSelector::default()
             },
         ));
+        config.enforcement.policy.source = probe_config::EnforcementPolicySourceConfig::File {
+            path: "/tmp/traffic-probe-enforcement.toml".into(),
+        };
         RuntimePlan::build(config, &libpcap_registry())
     }
 

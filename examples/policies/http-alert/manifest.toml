@@ -1,0 +1,3 @@
+id = "http-alert"
+version = "example"
+hooks = ["on_http_request_headers"]

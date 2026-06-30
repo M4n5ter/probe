@@ -34,6 +34,8 @@ pub enum ConfiguredEnforcementError {
     L7MitmPolicyHook(#[from] crate::l7_mitm::L7MitmPolicyHookError),
     #[error("enforcement execution backend is not available in this build/runtime")]
     ExecutionBackendUnavailable,
+    #[error("enforce mode requires an explicit enforcement policy source")]
+    PolicySourceRequiredForEnforce,
 }
 
 impl From<EnforcementPolicySourceError> for ConfiguredEnforcementError {
@@ -176,6 +178,7 @@ async fn build_configured_enforcement_from_parts(
     policy_source_context: EnforcementPolicySourceLoadContext,
 ) -> Result<ConfiguredEnforcement, ConfiguredEnforcementError> {
     parts.execution.validate(parts.mode)?;
+    validate_enforce_policy_source(parts.mode, parts.policy_source_plan)?;
 
     let policy_runtime = load_configured_enforcement_policy_runtime(
         parts.config_selector,
@@ -193,6 +196,18 @@ async fn build_configured_enforcement_from_parts(
         active_policy: policy_runtime,
         transparent_interception_setup_scope: None,
     })
+}
+
+fn validate_enforce_policy_source(
+    mode: EnforcementMode,
+    policy_source_plan: &EnforcementPolicySourcePlan,
+) -> Result<(), ConfiguredEnforcementError> {
+    if mode == EnforcementMode::Enforce
+        && matches!(policy_source_plan, EnforcementPolicySourcePlan::None)
+    {
+        return Err(ConfiguredEnforcementError::PolicySourceRequiredForEnforce);
+    }
+    Ok(())
 }
 
 pub(crate) async fn load_configured_enforcement_policy_runtime(
@@ -321,6 +336,7 @@ mod tests {
     use std::{
         io::{BufRead, BufReader, Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
+        path::{Path, PathBuf},
         thread::{self, JoinHandle},
     };
 
@@ -383,13 +399,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforce_uses_injected_backend() -> Result<(), Box<dyn std::error::Error>> {
-        let mut configured = build_configured_enforcement_from_parts(
+    async fn enforce_requires_policy_source() {
+        let error = match build_configured_enforcement_from_parts(
             ConfiguredEnforcementParts {
                 mode: EnforcementMode::Enforce,
                 config_selector: None,
                 config_selector_configured: false,
                 policy_source_plan: &EnforcementPolicySourcePlan::None,
+                execution: ConfiguredEnforcementExecution::ConnectionBackend(Box::new(
+                    ApplyingBackend,
+                )),
+            },
+            EnforcementPolicySourceLoadContext::default(),
+        )
+        .await
+        {
+            Ok(_) => panic!("enforce mode must require an explicit policy source"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ConfiguredEnforcementError::PolicySourceRequiredForEnforce
+        ));
+    }
+
+    #[tokio::test]
+    async fn enforce_uses_injected_backend() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let policy_source_plan = test_enforcement_policy_source_plan(temp.path())?;
+        let mut configured = build_configured_enforcement_from_parts(
+            ConfiguredEnforcementParts {
+                mode: EnforcementMode::Enforce,
+                config_selector: None,
+                config_selector_configured: false,
+                policy_source_plan: &policy_source_plan,
                 execution: ConfiguredEnforcementExecution::ConnectionBackend(Box::new(
                     ApplyingBackend,
                 )),
@@ -424,12 +468,14 @@ mod tests {
     #[tokio::test]
     async fn transparent_interception_enforce_records_per_flow_verdicts_as_setup_time_only()
     -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let policy_source_plan = test_enforcement_policy_source_plan(temp.path())?;
         let mut configured = build_configured_enforcement_from_parts(
             ConfiguredEnforcementParts {
                 mode: EnforcementMode::Enforce,
                 config_selector: None,
                 config_selector_configured: false,
-                policy_source_plan: &EnforcementPolicySourcePlan::None,
+                policy_source_plan: &policy_source_plan,
                 execution: ConfiguredEnforcementExecution::TransparentInterceptionSetup,
             },
             EnforcementPolicySourceLoadContext::default(),
@@ -462,6 +508,8 @@ mod tests {
     #[tokio::test]
     async fn l7_mitm_proxy_hook_execution_surface_delegates_to_configured_hook()
     -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let policy_source_plan = test_enforcement_policy_source_plan(temp.path())?;
         let hook_server = spawn_policy_hook(
             r#"{"outcome":"delegated","executed_action":"deny","reason":"proxy hook accepted"}"#,
         )?;
@@ -475,7 +523,7 @@ mod tests {
                 mode: EnforcementMode::Enforce,
                 config_selector: None,
                 config_selector_configured: false,
-                policy_source_plan: &EnforcementPolicySourcePlan::None,
+                policy_source_plan: &policy_source_plan,
                 execution: ConfiguredEnforcementExecution::L7MitmProxyHook {
                     policy_hook: &mitm_policy_hook,
                     connection: crate::l7_mitm::L7MitmPolicyHookConnectionOptions::default(),
@@ -523,6 +571,7 @@ mod tests {
     #[tokio::test]
     async fn l7_mitm_proxy_hook_composition_preserves_transparent_setup_scope()
     -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
         let hook_server = spawn_policy_hook(
             r#"{"outcome":"delegated","executed_action":"deny","reason":"proxy hook accepted"}"#,
         )?;
@@ -540,6 +589,7 @@ mod tests {
                 ..TrafficSelector::default()
             },
         ));
+        configure_test_enforcement_policy_source(&mut config, temp.path())?;
         configure_external_mitm_policy_hook(&mut config, &hook_server.endpoint);
         let plan = RuntimePlan::build(config, &transparent_interception_registry())?;
         assert_eq!(
@@ -591,7 +641,8 @@ mod tests {
     #[test]
     fn outbound_mitm_policy_hook_connection_uses_proxy_bypass_mark()
     -> Result<(), Box<dyn std::error::Error>> {
-        let plan = outbound_mitm_policy_hook_plan()?;
+        let temp = tempfile::tempdir()?;
+        let plan = outbound_mitm_policy_hook_plan(temp.path())?;
         let TransparentInterceptionExecutionPlan::OutboundTransparentProxy(outbound) =
             &plan.enforcement.interception.execution
         else {
@@ -611,6 +662,7 @@ mod tests {
     #[tokio::test]
     async fn local_process_scoped_transparent_interception_fails_at_setup_composition()
     -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -624,6 +676,7 @@ mod tests {
             },
             TrafficSelector::default(),
         ));
+        configure_test_enforcement_policy_source(&mut config, temp.path())?;
 
         let plan = RuntimePlan::build(config, &transparent_interception_registry())?;
         assert!(matches!(
@@ -649,20 +702,16 @@ mod tests {
     async fn manifest_selector_can_narrow_but_not_make_setup_process_scoped()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
-        let manifest_path = temp.path().join("manifest.toml");
-        let manifest = EnforcementPolicyManifest {
-            id: "managed-apps".to_string(),
-            version: "test-version".to_string(),
-            selector: Some(Selector::term(
+        let manifest_path = write_test_enforcement_manifest_with_selector(
+            temp.path(),
+            Some(Selector::term(
                 ProcessSelector {
                     names: vec!["curl".to_string()],
                     ..ProcessSelector::default()
                 },
                 TrafficSelector::default(),
             )),
-            protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
-        };
-        std::fs::write(&manifest_path, toml::to_string(&manifest)?)?;
+        )?;
 
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
@@ -706,11 +755,9 @@ mod tests {
     async fn manifest_selector_cannot_supply_the_only_setup_host_constraint()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
-        let manifest_path = temp.path().join("manifest.toml");
-        let manifest = EnforcementPolicyManifest {
-            id: "managed-apps".to_string(),
-            version: "test-version".to_string(),
-            selector: Some(Selector::term(
+        let manifest_path = write_test_enforcement_manifest_with_selector(
+            temp.path(),
+            Some(Selector::term(
                 ProcessSelector::default(),
                 TrafficSelector {
                     local_ports: vec![8443],
@@ -718,9 +765,7 @@ mod tests {
                     ..TrafficSelector::default()
                 },
             )),
-            protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
-        };
-        std::fs::write(&manifest_path, toml::to_string(&manifest)?)?;
+        )?;
 
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
@@ -761,6 +806,45 @@ mod tests {
                 .contains("at least one host-rule constraint")
         );
         Ok(())
+    }
+
+    fn test_enforcement_policy_source_plan(
+        dir: &Path,
+    ) -> Result<EnforcementPolicySourcePlan, Box<dyn std::error::Error>> {
+        let path = write_test_enforcement_manifest(dir)?;
+        Ok(EnforcementPolicySourcePlan::LocalManifest {
+            source_kind: runtime::EnforcementPolicySourceKind::File,
+            path,
+        })
+    }
+
+    fn configure_test_enforcement_policy_source(
+        config: &mut AgentConfig,
+        dir: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: write_test_enforcement_manifest(dir)?,
+        };
+        Ok(())
+    }
+
+    fn write_test_enforcement_manifest(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        write_test_enforcement_manifest_with_selector(dir, None)
+    }
+
+    fn write_test_enforcement_manifest_with_selector(
+        dir: &Path,
+        selector: Option<Selector>,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let path = dir.join("manifest.toml");
+        let manifest = EnforcementPolicyManifest {
+            id: "managed-apps".to_string(),
+            version: "test-version".to_string(),
+            selector,
+            protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
+        };
+        std::fs::write(&path, toml::to_string(&manifest)?)?;
+        Ok(path)
     }
 
     struct ApplyingBackend;
@@ -818,7 +902,9 @@ mod tests {
         }
     }
 
-    fn outbound_mitm_policy_hook_plan() -> Result<RuntimePlan, runtime::RuntimeError> {
+    fn outbound_mitm_policy_hook_plan(
+        policy_source_dir: &Path,
+    ) -> Result<RuntimePlan, Box<dyn std::error::Error>> {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -835,8 +921,12 @@ mod tests {
                 ..TrafficSelector::default()
             },
         ));
+        configure_test_enforcement_policy_source(&mut config, policy_source_dir)?;
         configure_external_mitm_policy_hook(&mut config, "http://127.0.0.1:16000/enforce");
-        RuntimePlan::build(config, &transparent_interception_registry())
+        Ok(RuntimePlan::build(
+            config,
+            &transparent_interception_registry(),
+        )?)
     }
 
     fn configure_external_mitm_policy_hook(config: &mut AgentConfig, endpoint: &str) {

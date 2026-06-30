@@ -1,149 +1,58 @@
 # Probe
 
-[简体中文](README_ZH.md)
+[简体中文](README_ZH.md) · [Design](docs/design.md) ·
+[Safe default config](examples/agent.toml) ·
+[Local demo config](examples/local-agent.toml)
 
 Probe is a Linux process-level traffic probe for security telemetry, protocol
-visibility, and controlled enforcement.
+visibility, durable evidence, export, and controlled enforcement.
 
-It observes traffic on the host, ties it back to processes and sockets, parses
-protocol semantics, evaluates policy, persists evidence, and exports structured
-events. It is built for servers where packet mirrors, special hardware,
-sidecars, or application SDKs are not the right deployment model.
+It observes traffic on a host, attributes it to processes and sockets, parses
+protocol semantics, evaluates Lua policy, writes durable event evidence, and
+exports structured batches. It is designed for servers where packet mirrors,
+special hardware, service-mesh sidecars, or application SDKs are not the right
+deployment model.
 
-Probe is developer-ready for controlled Linux environments. It is not a
-one-command production appliance yet: privileged live capture, transparent
-interception, and MITM deployments still need deliberate host setup and
-operator-owned trust decisions.
+Probe is usable today in controlled Linux environments. It is not a turnkey
+production appliance: privileged live capture, transparent interception, and
+MITM require explicit host setup, operator-owned trust decisions, and capability
+checks.
 
-## Why Probe
+## What You Can Do Today
 
-Most network security systems begin with packets. Probe begins with the
-process.
+- Try the full parser/policy/spool/export loop without root:
+  use `examples/local-agent.toml` with the plaintext feed and file exporter.
+- Re-process captured bytes:
+  use `agent replay` with a raw HTTP input file and optional Lua policy.
+- Consume deterministic external input:
+  use `capture.selection = "plaintext_feed"` or
+  `capture.selection = "capture_event_feed"`.
+- Capture live traffic:
+  use libpcap with root/CAP_NET_RAW, or eBPF when the object path and host
+  prerequisites are present.
+- Inspect TLS traffic:
+  use key log/session-secret material, libssl uprobe plaintext
+  instrumentation, explicit plaintext bridges, or scoped MITM.
+- Export events:
+  use webhook or file sinks with `none`, `zstd`, `gzip`, or `deflate`
+  compression.
+- Apply policy:
+  use local or remote Lua policy bundles for typed events and verdicts.
+- Protect selected applications:
+  use audit-only, dry-run, scoped TCP connection destroy, transparent
+  interception, or MITM policy hooks.
 
-That changes the model:
+The capability model is intentionally explicit. If a provider is unavailable or
+evidence is degraded, `agent capabilities`, `agent check`, and `agent status`
+say so instead of treating best-effort observation as complete.
 
-- traffic is useful only when it can be attributed to a process, socket,
-  direction, and runtime capability;
-- TLS visibility is not one feature, because uprobe plaintext, key log/session
-  material, plaintext feeds, and explicit MITM have different trust boundaries;
-- enforcement must be scoped, so the host can be observed broadly while deeper
-  interception or blocking applies only to selected applications;
-- policy and export need typed evidence, not opaque packet dumps that hide loss
-  and fallback.
+## Quick Start
 
-Probe exposes capability gaps and degraded evidence instead of pretending that
-best-effort capture is complete.
+On Debian or Ubuntu hosts, install the native build dependency first:
 
-## What Works Today
-
-- Capture:
-  replay, plaintext JSONL feed, typed capture-event feed, libpcap live capture,
-  and eBPF-capability path selection when object paths and host prerequisites
-  are present.
-- Attribution:
-  best-effort procfs process/socket attribution with explicit degraded states
-  for races, permissions, PID reuse, and namespace gaps.
-- TLS visibility:
-  TLS 1.3 key log/session-secret material, libssl uprobe plaintext sidecar,
-  plaintext bridge feeds, and explicit MITM proxy TLS termination.
-- Protocols:
-  HTTP/1.x request/response/body events, SSE events, WebSocket upgrade handoff,
-  frame metadata, and bounded message metadata.
-- Policy:
-  Lua policy bundles, typed verdicts, local and remote policy sources, runtime
-  error audit, and admin-triggered reloads.
-- Enforcement:
-  audit-only, dry-run, scoped TCP connection destroy, transparent interception
-  lifecycle, and proxy-side policy hook delegation.
-- MITM proxy:
-  selector-scoped inbound TPROXY and outbound transparent MITM with first-party
-  product proxy HTTP/1.1 TLS relay, host routes, opt-in DNS discovery,
-  WebSocket tunnel coverage, plaintext feed, and delegated deny responses.
-- Storage:
-  Fjall-backed ingress journal, export queue, per-sink cursors, retention
-  controls, and recovery with documented parser-state limits.
-- Export:
-  webhook and file transports with selectable `none`, `zstd`, `gzip`, or
-  `deflate` compression.
-- Operations:
-  capability reports, runtime plan validation, JSON status snapshots, health,
-  metrics, admin socket, and E2E profiles.
-
-## How It Fits Together
-
-```mermaid
-flowchart LR
-    Config[Agent TOML] --> Plan[Runtime Plan]
-    Plan --> Capability[Capability Registry]
-    Plan --> Capture[Capture Provider]
-    Capture --> Attribution[Process / Socket Attribution]
-    Attribution --> Parser[HTTP / SSE / WebSocket Parsers]
-    Parser --> Policy[Lua Policy]
-    Policy --> Spool[Fjall Ingress Journal]
-    Spool --> Export[Webhook / File Export]
-    Policy --> Enforce[Scoped Enforcement]
-    Enforce --> Status[Status / Audit / Metrics]
+```bash
+sudo apt-get install -y libpcap-dev pkg-config
 ```
-
-The central event contract is `EventEnvelope`. It carries origin, provenance,
-flow/process context, degradation state, enforcement evidence, and typed event
-payloads. The same contract is used by policy, durable storage, export,
-runtime status, and tests.
-
-## Safety Model
-
-Probe does not silently promote weak evidence into strong guarantees:
-
-- payload gaps, provider loss, fallback, and unsupported runtime capabilities
-  are represented as degraded events, capability states, metrics, and status;
-- destructive enforcement is disabled by default;
-- real connection enforcement requires explicit configuration, selector match,
-  an allowed protective action, live-host evidence, and backend capability;
-- Linux socket destroy runs only after capability checks and a live socket
-  self-test, revalidates the current procfs socket owner, and then invokes the
-  trusted system `ss -K` path for existing TCP sockets;
-- transparent interception and MITM are explicit strategies with separate
-  readiness, self-bypass, client-trust, material, lifecycle, and audit
-  contracts.
-
-## Choose A Run Mode
-
-- Replay:
-  re-process captured JSONL input through parser, policy, spool, and export
-  paths. It needs no live-capture privilege and uses `agent replay ...`.
-- Plaintext feed:
-  use deterministic plaintext input for development, tests, SDKs, or bridges.
-  Configure `capture.selection = "plaintext_feed"`.
-- Capture-event feed:
-  accept typed `CaptureEvent` JSONL from MITM bridges or external collectors.
-  Configure `capture.selection = "capture_event_feed"`.
-- Libpcap live:
-  capture host traffic when eBPF is unavailable or not configured. It needs
-  root or CAP_NET_RAW and uses `capture.selection = "libpcap"` or auto fallback.
-- eBPF process observation:
-  use kernel-assisted process-aware capture. It needs root/bpffs, a built eBPF
-  object, and `capture.ebpf.object_path`.
-- TLS plaintext sidecar:
-  attach best-effort libssl plaintext instrumentation. It needs root/bpffs,
-  a built eBPF object, and `tls.plaintext.instrumentation`.
-- Transparent interception:
-  steer scoped inbound/outbound connections. It needs root/net-admin and
-  `enforcement.interception`.
-- L7 MITM product proxy:
-  terminate scoped TLS, relay upstream traffic, emit plaintext bridge events,
-  and delegate proxy-side policy decisions. It needs root/net-admin,
-  operator-managed client trust, and `enforcement.interception.mitm`.
-
-## Build
-
-Requirements:
-
-- Linux with procfs;
-- Rust stable with edition 2024 support;
-- `libpcap` development package for libpcap live capture;
-- root or matching Linux capabilities for privileged live capture,
-  eBPF, socket destroy, transparent interception, or MITM tests;
-- nightly Rust with `rust-src` and `bpf-linker` when building eBPF objects.
 
 Build the main binaries:
 
@@ -151,7 +60,65 @@ Build the main binaries:
 cargo build -p agent -p xtask --locked
 ```
 
-Build the first-party MITM proxy and test fixture when running MITM E2E cases:
+Inspect what this host can support:
+
+```bash
+cargo run -p agent --locked -- capabilities
+```
+
+Run the non-privileged local demo:
+
+```bash
+rm -rf target/probe-demo
+mkdir -p target/probe-demo
+
+cargo run -p agent --locked -- check --config examples/local-agent.toml
+cargo run -p agent --locked -- run --config examples/local-agent.toml --max-events 3
+wc -l target/probe-demo/export.jsonl
+head -n 1 target/probe-demo/export.jsonl
+```
+
+That path reads [examples/plaintext-feed.jsonl](examples/plaintext-feed.jsonl),
+loads [examples/policies/http-alert](examples/policies/http-alert), stores
+events in `target/probe-demo/spool`, and appends one file-export batch to
+`target/probe-demo/export.jsonl`.
+
+The file exporter writes JSON Lines batch records. Each line carries metadata
+plus a base64-encoded protobuf batch envelope, optionally compressed by the
+configured codec. It is meant for collectors and tooling, not as a pretty event
+log.
+
+Replay raw HTTP bytes without live-capture privileges:
+
+```bash
+rm -rf target/probe-demo/replay-spool
+
+cargo run -p agent --locked -- replay \
+  --input examples/replay.http \
+  --spool target/probe-demo/replay-spool \
+  --policy examples/policies/http-alert/main.lua \
+  --agent-id probe-replay-demo
+```
+
+Run the non-privileged E2E baseline:
+
+```bash
+cargo run -p xtask --locked -- e2e-suite --profile baseline
+```
+
+## Install Requirements
+
+Common requirements:
+
+- Linux with procfs;
+- stable Rust with edition 2024 support;
+- `libpcap` development headers and `pkg-config` for the default agent build;
+- root or matching Linux capabilities for live capture, eBPF, socket destroy,
+  transparent interception, or MITM tests;
+- nightly Rust with `rust-src` and `bpf-linker` only when building eBPF
+  artifacts.
+
+Build the first-party MITM proxy and fixture when running MITM E2E cases:
 
 ```bash
 cargo build -p agent -p e2e-fixture -p mitm-proxy -p xtask --locked
@@ -165,62 +132,64 @@ cargo install bpf-linker
 cargo run -p xtask --locked -- ebpf-build
 ```
 
-After building eBPF artifacts, point the agent configuration at the generated
-object path, for example `capture.ebpf.object_path` for process observation or
-`tls.plaintext.instrumentation.libssl_uprobe_object_path` for libssl plaintext
-instrumentation.
+After building eBPF artifacts, set the generated object path in the agent
+configuration:
 
-## First Run
+- process observation: `capture.ebpf.object_path`;
+- libssl plaintext instrumentation:
+  `tls.plaintext.instrumentation.libssl_uprobe_object_path`.
 
-Inspect host capabilities:
+## Choose A Run Mode
+
+- `agent replay`:
+  re-process one raw byte stream through parser, policy, spool, and optional
+  webhook export. It needs no live-capture privilege.
+- `plaintext_feed`:
+  use file-readable JSONL for development, SDKs, tests, bridges, or trusted
+  plaintext handoff.
+- `capture_event_feed`:
+  accept typed `CaptureEvent` JSONL from MITM bridges or external collectors.
+  `follow = true` can keep the agent online.
+- `libpcap`:
+  live packet capture when eBPF is unavailable or not configured. It needs root
+  or CAP_NET_RAW.
+- `ebpf`:
+  kernel-assisted process-aware observation. It needs root/bpffs and a built
+  eBPF object.
+- libssl uprobe:
+  best-effort TLS plaintext sidecar for selected libssl processes. It needs
+  root/bpffs, a built eBPF object, and an explicit selector.
+- Transparent interception:
+  scoped inbound/outbound steering before or around application traffic. It
+  needs root/net-admin and explicit selectors.
+- Product MITM proxy:
+  scoped TLS termination, upstream relay, plaintext bridge, and proxy-side
+  policy hook. It needs root/net-admin, certificate material, and
+  operator-managed client trust.
+
+## Configure Probe
+
+Start from one of these files:
+
+- [examples/local-agent.toml](examples/local-agent.toml) for a runnable local
+  demo;
+- [examples/agent.toml](examples/agent.toml) for a commented safe-default
+  server template.
+
+Validate a config before running it:
 
 ```bash
-cargo run -p agent --locked -- capabilities
+cargo run -p agent --locked -- check --config ./agent.toml
+cargo run -p agent --locked -- status --config ./agent.toml
 ```
 
-Validate the safe example configuration:
-
-```bash
-cargo run -p agent --locked -- check --config examples/agent.toml
-```
-
-Inspect the runtime status that the example would produce:
-
-```bash
-cargo run -p agent --locked -- status --config examples/agent.toml
-```
-
-The example is intentionally conservative. It uses `capture.selection = "auto"`,
-audit-only enforcement, no MITM, no destructive backend, and no exporter sink.
-Status may report unavailable live capture or missing spool directories until
-host permissions and paths are configured.
-
-Run a non-privileged plaintext pipeline E2E:
-
-```bash
-cargo run -p xtask --locked -- e2e-plaintext-feed
-```
-
-Run WebSocket parser coverage through plaintext input:
-
-```bash
-cargo run -p xtask --locked -- e2e-websocket-plaintext-feed
-```
-
-Run a privileged libpcap loopback E2E:
-
-```bash
-sudo target/debug/xtask e2e-libpcap-loopback
-```
-
-## Configuration Guide
-
-Start from [examples/agent.toml](examples/agent.toml). It is commented and safe
-by default.
+`check` validates the runtime plan and configured policy. `status` is a
+side-effect-light status snapshot; it reports metadata for local policy bundles
+but does not execute them.
 
 ### Capture
 
-Automatic selection tries configured fallback backends in order:
+Automatic live selection tries configured fallback backends in order:
 
 ```toml
 [capture]
@@ -239,7 +208,57 @@ immediate_mode = true
 read_timeout_ms = 1000
 ```
 
-For controlled plaintext input:
+Plaintext feed mode is deterministic and does not require live capture:
+
+```toml
+[capture]
+selection = "plaintext_feed"
+
+[capture.plaintext_feed]
+path = "/var/lib/probe/plaintext-feed.jsonl"
+```
+
+The plaintext feed is JSON Lines: one event per line. Each event repeats the
+`connection` object so a feed can be appended or replayed without hidden
+process state. A `bytes` event uses a numeric byte array, a direction, and a
+stream offset:
+
+```json
+{
+  "type": "bytes",
+  "timestamp": { "monotonic_ns": 2, "wall_time_unix_ns": 2 },
+  "connection": {
+    "connection_id": "local-demo-conn",
+    "local": { "address": "127.0.0.1", "port": 51100 },
+    "remote": { "address": "127.0.0.1", "port": 8081 },
+    "protocol": "tcp",
+    "start_monotonic_ns": 1,
+    "attribution_confidence": 100,
+    "process": {
+      "pid": 4242,
+      "tgid": 4242,
+      "start_time_ticks": 1000,
+      "boot_id": "local-demo",
+      "exe_path": "/usr/bin/probe-demo-client",
+      "cmdline_hash": "local-demo-client",
+      "uid": 1000,
+      "gid": 1000,
+      "name": "probe-demo-client",
+      "cmdline": ["probe-demo-client"]
+    }
+  },
+  "direction": "outbound",
+  "stream_offset": 0,
+  "bytes": [71, 69, 84, 32, 47, 100, 101, 109, 111]
+}
+```
+
+`connection_opened`, `connection_closed`, and `gap` events use the same
+connection shape. `gap` includes `expected_offset`, optional `next_offset`, and
+`reason`.
+
+Capture-event feed mode accepts typed capture events and can follow appended
+records:
 
 ```toml
 [capture]
@@ -252,7 +271,7 @@ follow = true
 
 ### Storage
 
-The spool is required for live runs and export queueing:
+Live runs and exporter cursors need a Fjall spool:
 
 ```toml
 [storage]
@@ -268,12 +287,12 @@ prune_batch_limit = 1024
 ```
 
 Ingress recovery replays persisted capture events before opening a new capture
-provider. Active parser state is not serialized, so recovery is conservative
-and reported as degraded in the capability model.
+provider. Active parser state is not serialized, so recovery is conservative and
+reported as degraded in the capability model.
 
 ### Export
 
-Enable the export worker and configure one or more sinks:
+Enable the worker for long-running agents and configure one or more sinks:
 
 ```toml
 [export.worker]
@@ -300,36 +319,185 @@ headers = { x_probe_node = "probe-local" }
 ```
 
 Supported codecs are `none`, `zstd`, `gzip`, and `deflate`; `zstd` is the
-default. Webhook sinks can reference TLS trust anchors and client identities
-from `[[tls.materials]]`.
+default. Webhook sinks can reference trust anchors and client identities from
+`[[tls.materials]]`. File sinks create private `0600` files and reject unsafe
+parent directories.
+
+#### Webhook Receiver Contract
+
+A webhook `endpoint` must be an absolute `http://` or `https://` URL including
+scheme and host. URL credentials are rejected; use explicit exporter headers or
+TLS material refs for deployment authentication. Probe sends each export batch
+as:
+
+- method: `POST`;
+- request target: the configured endpoint path and query;
+- `content-type: application/x-protobuf`;
+- `x-traffic-probe-codec: none | zstd | gzip | deflate`;
+- `idempotency-key: <batch_id>`;
+- body: a `proto::BatchEnvelope` protobuf message, compressed by the codec
+  header.
+
+`BatchEnvelope` contains `batch_id`, `agent_id`, `codec`, and repeated
+`EventRecord` entries. Each event record carries a monotonic export `sequence`,
+the event id, a JSON `EventEnvelope` payload, and the payload schema
+`traffic.probe.event_envelope.subject_origin.json`.
+
+Receiver responses must be UTF-8 JSON and no larger than 64 KiB:
+
+```json
+{
+  "batch_id": "probe-local:primary-webhook:1-4",
+  "accepted": true,
+  "acked_cursor": 4,
+  "reason": null
+}
+```
+
+For an accepted batch, `acked_cursor` is required and must be within the batch
+sequence range. A receiver that consumed the whole batch should return the last
+sequence. Unknown JSON fields are ignored, so receivers may attach local
+metadata without changing the acknowledgement contract. Non-2xx HTTP status,
+invalid JSON, `accepted = false`, batch id mismatch, missing cursor, or an
+out-of-range cursor keeps the sink unacked and lets the worker retry according
+to its backoff policy.
+
+Custom exporter `headers` may add deployment metadata, but cannot override the
+reserved protocol headers: `content-type`, `idempotency-key`, or
+`x-traffic-probe-codec`.
 
 ### Policy
 
-Policy bundles are normal runtime inputs:
+`agent run` uses policy bundles. A local bundle is a directory with
+`manifest.toml` and `main.lua`:
+
+```text
+policy/
+  manifest.toml
+  main.lua
+```
+
+Example manifest:
+
+```toml
+id = "http-alert"
+version = "example"
+hooks = ["on_http_request_headers"]
+```
+
+Example source:
+
+```lua
+function on_http_request_headers(event)
+  local method = event.kind.method or "UNKNOWN"
+  local target = event.kind.target or "/"
+  return probe.emit_alert("HTTP request " .. method .. " " .. target)
+end
+```
+
+Reference the bundle from agent config:
 
 ```toml
 [[policies]]
-id = "app-policy"
+id = "http-alert"
 enabled = true
 
 [policies.source]
 kind = "local_directory"
-path = "/etc/probe/policies/app"
+path = "/etc/probe/policies/http-alert"
 ```
 
-Enforcement manifests can be local, directory-backed, or remote:
+Remote policy bundles are supported as bounded TOML documents:
 
 ```toml
-[enforcement.policy.source]
-kind = "remote"
-endpoint = "http://127.0.0.1:9000/enforcement.toml"
+[[policies]]
+id = "http-alert"
+enabled = true
+
+[policies.source]
+kind = "remote_bundle"
+endpoint = "https://policy.example/bundles/http-alert.toml"
 max_body_bytes = 16777216
 ```
 
-Manual reloads are available through the admin surface when enabled. Local
-manifest watching is opt-in.
+`agent replay --policy` is intentionally different: it accepts one Lua file for
+local debugging and wraps it in a synthetic replay manifest.
 
-### TLS Materials
+#### Lua Policy Contract
+
+Policy manifests declare which Lua hooks are active. Supported hook names are:
+
+```text
+on_connection_opened
+on_connection_closed
+on_http_request_headers
+on_http_response_headers
+on_http_body_chunk
+on_sse_event
+on_websocket_handoff
+on_websocket_frame
+on_websocket_message
+on_opaque_stream
+on_gap
+on_protocol_error
+```
+
+Each hook receives one `event` table. Common fields are:
+
+- `event.id`;
+- `event.event_type`;
+- `event.direction`, when the event has a direction;
+- `event.timestamp.monotonic_ns` and `event.timestamp.wall_time_unix_ns`;
+- `event.origin.source` and `event.origin.provider`;
+- `event.flow.id`, `event.flow.process`, `event.flow.local_endpoint`, and
+  `event.flow.remote_endpoint`;
+- `event.degraded`;
+- `event.enforcement_evidence.kind`;
+- `event.kind`, whose fields depend on `event.event_type`.
+
+For `on_http_request_headers`, `event.kind` includes `method`, `target`,
+`version`, `headers`, `direction`, and `stream_sequence`. WebSocket hooks expose
+handoff, frame, and bounded message metadata; payload fingerprints are byte
+arrays, not retained plaintext payloads.
+
+A hook may return:
+
+- `nil` for no outcome;
+- `probe.emit_alert("message")`;
+- `probe.verdict { action = "...", scope = "...", reason = "...", confidence = 100 }`;
+- an array containing multiple alert or verdict outcomes.
+
+Example:
+
+```lua
+function on_http_request_headers(event)
+  if event.kind.method == "POST" and event.kind.target == "/admin" then
+    return {
+      probe.emit_alert("admin POST observed"),
+      probe.verdict {
+        action = "reset",
+        scope = "flow",
+        reason = "admin endpoint is not allowed",
+        confidence = 95,
+        ttl_ms = 60000
+      }
+    }
+  end
+end
+```
+
+Verdict actions are `allow`, `observe`, `alert`, `deny`, `reset`, and
+`quarantine`; protective enforcement only applies to actions allowed by the
+configured enforcement policy and runtime backend. Scopes are `flow`, `request`,
+`response`, and `chunk`.
+
+The Lua runtime is sandboxed. Host capabilities such as `require`, `io`, `os`,
+`package`, `debug`, `ffi`, `jit`, `dofile`, `loadfile`, `load`, and
+`collectgarbage` are unavailable. Policies run with instruction and memory
+budgets; runtime errors are audited as policy runtime error events instead of
+being treated as successful verdicts.
+
+### TLS Material
 
 TLS material references are shared by exporters, TLS decrypt hints, and MITM:
 
@@ -361,8 +529,7 @@ path = "/etc/probe/certs/upstream-ca.pem"
 ```
 
 Best-effort libssl plaintext instrumentation is explicit. Configure a selector
-to avoid broad attachment; omitting the selector lets the provider consider
-every attachable libssl process:
+to avoid broad attachment:
 
 ```toml
 [tls.plaintext.instrumentation]
@@ -384,7 +551,7 @@ container_ids = []
 [tls.plaintext.instrumentation.selector.term.traffic]
 local_ports = []
 remote_ports = [443]
-directions = []
+directions = ["outbound"]
 remote_addresses = []
 ```
 
@@ -398,13 +565,61 @@ mode = "audit_only"
 backend = "none"
 ```
 
-Dry-run can exercise planner decisions without a destructive backend. Connection
-enforcement should configure a selector to avoid broad matches; if no selector
-is configured, policy triggers can match broadly. Enforce mode applies only when
-a policy allows the protective action and the configured backend supports it.
-Transparent interception setup additionally requires an explicit local selector.
-Linux socket destroy closes existing TCP sockets only; it is not pre-connect
-deny or UDP blocking.
+Use `dry_run` to exercise planner decisions without applying a destructive
+backend. Use `enforce` only with an explicit backend, selector, policy source,
+and operational approval.
+
+Lua policies emit event-level alerts and verdict requests. Enforcement policy
+manifests are a separate control input that defines which protective actions may
+be applied and, optionally, which process/traffic selector can use them:
+
+```toml
+[enforcement.policy.source]
+kind = "file"
+path = "/etc/probe/enforcement.toml"
+```
+
+An enforcement manifest is TOML. A runnable template is available at
+[`examples/enforcement.toml`](examples/enforcement.toml):
+
+```toml
+id = "managed-apps"
+version = "2026-06-30"
+protective_actions = ["deny", "reset"]
+
+[selector]
+op = "match"
+
+[selector.term.process]
+pids = []
+names = []
+exe_path_globs = ["/usr/bin/curl"]
+cmdline_regexes = []
+systemd_services = []
+container_ids = []
+
+[selector.term.traffic]
+local_ports = []
+remote_ports = [443]
+directions = ["outbound"]
+remote_addresses = []
+```
+
+Supported source kinds are:
+
+- `none`, which disables configured enforcement policy input and is not valid
+  with `mode = "enforce"`;
+- `file`, where `path` points directly to one manifest;
+- `directory`, where `path` points to a directory containing `manifest.toml`;
+- `remote`, where `endpoint` returns one bounded TOML manifest and optional
+  `max_body_bytes` caps the response body.
+
+Remote endpoints must be absolute URLs without credentials. HTTPS is required
+except for loopback HTTP endpoints used in local testing.
+
+`protective_actions` accepts only `deny`, `reset`, and `quarantine`. This keeps
+the destructive action profile explicit and separate from Lua event policy
+logic.
 
 Selectors combine process and traffic dimensions:
 
@@ -423,18 +638,43 @@ container_ids = []
 [enforcement.interception.selector.term.traffic]
 local_ports = []
 remote_ports = [443]
-directions = []
+directions = ["outbound"]
 remote_addresses = []
 ```
 
-Transparent MITM is a separate, explicit strategy. It requires root/net-admin,
+Linux socket destroy closes existing TCP sockets only. It is not pre-connect
+deny, UDP blocking, or payload-level blocking.
+
+Transparent MITM is a separate strategy. It requires root/net-admin,
 operator-managed client trust, certificate material refs, proxy listener
 settings, backend readiness, plaintext bridge configuration, and a scoped
-selector. The fragment below shows an inbound product-proxy shape:
+selector. The fragment below assumes the TLS material refs above are configured:
 
 ```toml
 [enforcement]
 mode = "enforce"
+backend = "none"
+
+[enforcement.policy.source]
+kind = "file"
+path = "/etc/probe/enforcement.toml"
+
+[enforcement.interception.selector]
+op = "match"
+
+[enforcement.interception.selector.term.process]
+pids = []
+names = []
+exe_path_globs = []
+cmdline_regexes = []
+systemd_services = []
+container_ids = []
+
+[enforcement.interception.selector.term.traffic]
+local_ports = [443]
+remote_ports = []
+directions = ["inbound"]
+remote_addresses = []
 
 [enforcement.interception]
 strategy = "inbound_tproxy_mitm"
@@ -479,48 +719,62 @@ The first-party product proxy supports exact and suffix-wildcard upstream
 routes. Opt-in DNS discovery can be used as a fallback and rejects IANA
 special-purpose/special-use addresses by default unless explicitly allowed.
 CA-backed dynamic certificate mode requires downstream clients to send DNS SNI.
-When upstream TLS is enabled, the agent-managed product proxy uses the
-reconciled SNI as the upstream TLS server name. A fixed upstream target cannot
-be combined with route tables or DNS discovery. Host/SNI mismatches fail closed;
-route misses can fall through explicit DNS discovery before falling back to the
-recovered target.
+Host/SNI mismatches fail closed.
 
-## Operations
+### Admin And Status
 
-The `agent` binary exposes five operational commands:
+Enable the admin socket when online reloads are needed:
+
+```toml
+[admin]
+enabled = true
+socket_path = "/run/traffic-probe/admin.sock"
+```
+
+Admin reloads validate new policy or enforcement state before swapping runtime
+state. Local policy bundle watching is opt-in:
+
+```toml
+[policy_reload]
+watch_local_bundles = true
+debounce_ms = 500
+```
+
+## Operational Commands
 
 ```bash
 agent capabilities
 agent check --config ./agent.toml
 agent status --config ./agent.toml
 agent run --config ./agent.toml
-agent replay \
-  --input ./traffic.jsonl \
-  --spool ./spool \
-  --direction outbound \
-  --policy ./policy.bundle
+agent replay --input ./traffic.http --spool ./spool --policy ./policy.lua
 ```
 
-`capabilities`, `check`, and `status` return JSON designed for automation.
-`run` starts the configured live agent. `replay` runs captured input through the
-same parser, policy, spool, and export path without live capture privileges.
+`capabilities`, `check`, and `status` return JSON for automation. `run` starts
+the configured agent. `replay` sends one byte stream through the same parser,
+policy, spool, and optional webhook path without live-capture privileges.
 
 ## Verification
 
-The E2E registry is organized around capability claims:
+E2E profiles are organized around capability claims:
 
-- `baseline` covers replay, plaintext feed, loss/gap events, HTTP/SSE/WebSocket,
-  webhook/file export, and remote policy inputs.
-- `live-core`, `process-ebpf`, and `tls-plaintext` cover privileged libpcap,
-  admin reload, socket destroy, TLS material auto-binding, eBPF process
-  observation, and libssl plaintext lifecycle.
-- `transparent-interception` covers inbound TPROXY, outbound transparent proxy,
-  MITM plaintext bridge, proxy-side policy hook, product proxy routed/DNS
-  HTTPS, and WebSocket tunnel paths.
-- `linux-artifacts` and `product` provide Linux artifact acceptance and the
-  combined product capability profile.
+- `baseline` runs as a normal user and covers replay, plaintext feed,
+  gap/loss events, HTTP/SSE/WebSocket, webhook/file export, and remote policy
+  inputs.
+- `live-core` needs root or CAP_NET_RAW and covers libpcap loopback, admin
+  reload, socket destroy, and TLS key log/session-secret material.
+- `process-ebpf` needs root/bpffs and covers eBPF process observation.
+- `tls-plaintext` needs root/bpffs and covers the libssl plaintext provider
+  and attach lifecycle.
+- `transparent-interception` needs root/net-admin and covers inbound TPROXY,
+  outbound proxy, MITM plaintext bridge, policy hook, and product proxy
+  HTTPS/WebSocket paths.
+- `linux-artifacts` needs root/net-admin and covers Linux transparent
+  interception artifact acceptance.
+- `product` combines the user, live, eBPF, TLS, interception, MITM, and Linux
+  artifact suites.
 
-List E2E cases and profiles:
+List cases and profiles:
 
 ```bash
 cargo run -p xtask --locked -- e2e-suite --list
@@ -547,59 +801,41 @@ routing, or live sockets.
 
 ## Boundaries
 
-Probe intentionally does not claim the following:
+Probe does not claim these capabilities:
 
-- no default whole-host transparent MITM;
-- no automatic client trust store mutation;
-- no HTTP/2, HTTP/3, or QUIC parser yet;
-- no strong original attribution for every MITM path;
-- no non-HTTP transparent allow-path matrix beyond covered WebSocket tunnel
+- default whole-host transparent MITM;
+- automatic client trust store mutation;
+- HTTP/2, HTTP/3, or QUIC parsing;
+- strong original attribution for every MITM path;
+- a non-HTTP transparent allow-path matrix beyond covered WebSocket tunnel
   behavior;
-- no pre-connect deny, UDP blocking, or payload-level blocking through Linux
-  socket destroy;
-- no hidden long-term raw traffic retention;
-- no claim that best-effort live capture is complete when the runtime reports
-  degraded evidence.
+- pre-connect deny, UDP blocking, or payload-level blocking through Linux socket
+  destroy;
+- hidden long-term raw traffic retention;
+- complete best-effort live capture when the runtime reports degraded evidence.
 
 The detailed design source, capability facts, and verification matrix are in
 [docs/design.md](docs/design.md).
 
 ## Repository Layout
 
-- `crates/core`:
-  shared event contracts, selectors, process/flow identity, verdicts, and
-  capability model.
-- `crates/config`:
-  TOML configuration model and validation.
-- `crates/runtime`:
-  runtime plan model and capability validation.
-- `crates/capture`:
-  capture providers, eBPF/libpcap paths, TLS plaintext bridge, and capture
-  evidence.
-- `crates/parsers`:
-  parser traits and HTTP/SSE/WebSocket implementations.
-- `crates/policy`:
-  Lua policy runtime and event views.
-- `crates/enforcement`:
-  scoped enforcement planner and backend/hook contracts.
-- `crates/pipeline`:
-  capture-to-parser-to-policy-to-spool execution pipeline.
-- `crates/agent`:
-  runtime composition, config loading, status/admin surfaces, and live agent.
-- `crates/storage`:
-  Fjall durable spool and cursor-backed queues.
-- `crates/exporter`:
-  export batch, codecs, webhook transport, and file transport.
-- `crates/mitm-proxy`:
-  first-party L7 MITM product proxy.
-- `crates/transparent-linux`:
-  Linux transparent interception artifact planning.
-- `crates/xtask`:
-  end-to-end validation harness.
-- `examples/agent.toml`:
-  commented safe-default agent configuration.
-- `docs/design.md`:
-  Chinese design source and verification matrix.
+| Path | Responsibility |
+| --- | --- |
+| `crates/core` | event contracts, selectors, process/flow identity, verdicts, capability model |
+| `crates/config` | TOML configuration model and validation |
+| `crates/runtime` | runtime plan and capability validation |
+| `crates/capture` | capture providers, eBPF/libpcap paths, TLS plaintext bridge |
+| `crates/parsers` | parser traits and HTTP/SSE/WebSocket implementations |
+| `crates/policy` | Lua policy runtime and event views |
+| `crates/enforcement` | scoped enforcement planner and backend/hook contracts |
+| `crates/pipeline` | capture-to-parser-to-policy-to-spool execution |
+| `crates/agent` | runtime composition, config loading, status/admin surfaces |
+| `crates/storage` | Fjall durable spool and cursor-backed queues |
+| `crates/exporter` | export batches, codecs, webhook transport, file transport |
+| `crates/mitm-proxy` | first-party L7 MITM product proxy |
+| `crates/transparent-linux` | Linux transparent interception artifact planning |
+| `crates/xtask` | end-to-end validation harness |
+| `examples` | runnable demo inputs and commented config templates |
 
 ## Contributing
 
@@ -622,9 +858,7 @@ cargo test --workspace --locked
 
 ## License
 
-Licensed under either of:
+Probe is dual-licensed under either:
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT License ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.

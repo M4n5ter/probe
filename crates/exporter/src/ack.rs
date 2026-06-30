@@ -10,7 +10,6 @@ pub struct ExportAck {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WebhookAck {
     pub batch_id: String,
     pub accepted: bool,
@@ -95,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn webhook_ack_rejects_event_id_cursor_substitutes() {
+    fn webhook_ack_ignores_receiver_metadata() {
         let source = r#"{
             "batch_id": "batch-1",
             "accepted": true,
@@ -104,7 +103,12 @@ mod tests {
             "reason": null
         }"#;
 
-        assert!(serde_json::from_str::<WebhookAck>(source).is_err());
+        let ack = serde_json::from_str::<WebhookAck>(source)
+            .expect("receiver metadata should not affect cursor acknowledgements");
+
+        assert_eq!(ack.batch_id, "batch-1");
+        assert!(ack.accepted);
+        assert_eq!(ack.acked_cursor, Some(1));
     }
 
     #[test]
