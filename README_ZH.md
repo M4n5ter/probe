@@ -173,9 +173,9 @@ cargo run -p agent --locked -- status --config ./agent.toml
 
 ### 最小 Policy 与 Webhook 接线
 
-第一次接入真实系统时先看这一节。可部署配置需要显式描述三份契约：event 从哪里来、哪些 Lua
-hook 检查它们、collector 如何确认 durable export batch。Probe 不会从 endpoint 名称或
-policy 文件名推断这些契约。
+第一次接入真实系统时先看这一节。可部署配置需要显式描述四份契约：event 从哪里来、durable
+state 存在哪里、哪些 Lua hook 检查 typed event、collector 如何确认 export batch。Probe
+不会从 endpoint 名称或 policy 文件名推断这些契约。
 
 ```text
 /etc/probe/agent.toml
@@ -183,9 +183,21 @@ policy 文件名推断这些契约。
 /etc/probe/policies/http-guard/main.lua
 ```
 
+先使用确定性输入和未压缩 webhook 做 interop。receiver 通过后，再把
+`capture.selection` 切到 live backend，并把 `codec = "zstd"` 或其它支持的 codec 打开。
+
 agent config：
 
 ```toml
+[capture]
+selection = "plaintext_feed"
+
+[capture.plaintext_feed]
+path = "/var/lib/probe/plaintext-feed.jsonl"
+
+[storage]
+path = "/var/lib/probe/spool"
+
 [export.worker]
 enabled = true
 
@@ -193,7 +205,7 @@ enabled = true
 id = "primary-webhook"
 transport = "webhook"
 endpoint = "https://collector.example/probe/batches"
-codec = "zstd"
+codec = "none"
 headers = { x_probe_node = "edge-a" }
 
 [[policies]]
@@ -203,6 +215,10 @@ enabled = true
 [policies.source]
 kind = "local_directory"
 path = "/etc/probe/policies/http-guard"
+
+[enforcement]
+mode = "audit_only"
+backend = "none"
 ```
 
 policy manifest：
@@ -213,7 +229,7 @@ version = "2026-06-30"
 hooks = ["on_http_request_headers", "on_websocket_message"]
 ```
 
-Lua 契约：
+Lua policy 写法：
 
 - `agent run` 加载 policy bundle 目录，而不是单个 Lua 文件。
 - `manifest.toml` 声明 Probe 可以调用哪些 hook；每个 hook 都必须在
@@ -267,14 +283,17 @@ function on_websocket_message(event)
 end
 ```
 
-endpoint 速查规则：
+endpoint 格式要求：
 
 - Export webhook（`exporters.<id>.endpoint`）：
-  带 host 的绝对 `http://` 或 `https://` URL。URL credentials 会被拒绝。
+  带 scheme 和 host 的 absolute `http://` 或 `https://` URL，例如
+  `https://collector.example/probe/batches`，或本地测试用的
+  `http://127.0.0.1:9000/batches`。URL credentials 会被拒绝。
   配置 exporter TLS refs 时必须使用 `https://`。
 - Remote Lua policy（`policies.source.endpoint`）：
-  remote endpoint 使用 `https://`；只有本地测试允许 loopback `http://`。
-  URL credentials 会被拒绝。
+  非本地 endpoint 使用 `https://`，例如
+  `https://policy.example/bundles/http-guard.toml`。只有本地测试允许 loopback
+  `http://`。URL credentials 会被拒绝。
 - Remote enforcement policy（`enforcement.policy.source.endpoint`）：
   与 remote Lua policy bundle 使用相同 transport 规则。
 - MITM policy hook（`enforcement.interception.mitm.policy_hook.endpoint`）：
@@ -476,57 +495,15 @@ file sink 会创建私有 `0600` 文件，并拒绝不安全的父目录。
 
 #### Webhook Receiver Setup
 
-webhook `endpoint` 必须是带 scheme 和 host 的绝对 `http://` 或 `https://` URL。
-URL credentials 会被拒绝；部署认证应使用显式 exporter headers 或 TLS material refs。
-
-自定义 exporter `headers` 可以携带部署 metadata，但不能覆盖保留协议头：
-`content-type`、`idempotency-key`、`x-traffic-probe-codec`。
-
-request format、acknowledgement 规则、retry 语义和 protobuf schema 见
-[docs/webhook-receiver_ZH.md](docs/webhook-receiver_ZH.md)。batch schema 也以
-[docs/export-batch.proto](docs/export-batch.proto) 形式提供。exporter、remote policy、
-remote enforcement 和 MITM hook HTTP surface 的 endpoint 规则见
+第一套接入章节已经给出 webhook request、ACK 和 retry contract。完整 receiver 参考见
+[docs/webhook-receiver_ZH.md](docs/webhook-receiver_ZH.md)，batch schema 见
+[docs/export-batch.proto](docs/export-batch.proto)，所有 HTTP surface 的 endpoint 规则见
 [docs/http-endpoints_ZH.md](docs/http-endpoints_ZH.md)。
 
 ### Policy
 
-`agent run` 使用 policy bundle。本地 bundle 是包含 `manifest.toml` 和 `main.lua` 的目录：
-
-```text
-policy/
-  manifest.toml
-  main.lua
-```
-
-manifest 示例：
-
-```toml
-id = "http-alert"
-version = "example"
-hooks = ["on_http_request_headers"]
-```
-
-source 示例：
-
-```lua
-function on_http_request_headers(event)
-  local method = event.kind.method or "UNKNOWN"
-  local target = event.kind.target or "/"
-  return probe.emit_alert("HTTP request " .. method .. " " .. target)
-end
-```
-
-在 agent config 中引用 bundle：
-
-```toml
-[[policies]]
-id = "http-alert"
-enabled = true
-
-[policies.source]
-kind = "local_directory"
-path = "/etc/probe/policies/http-alert"
-```
+`agent run` 使用 policy bundle。本地 bundle 是包含 `manifest.toml` 和 `main.lua` 的目录；
+第一套接入章节已经给出完整例子。
 
 远程 policy bundle 在配置中声明为 bounded TOML document；response schema 和示例见
 [docs/lua-policy_ZH.md](docs/lua-policy_ZH.md)：
@@ -544,26 +521,6 @@ max_body_bytes = 16777216
 
 `agent replay --policy` 是刻意不同的调试入口：它接受单个 Lua 文件，并包一层 synthetic replay
 manifest。
-
-hook 可以返回 `nil`、一个 alert/verdict outcome，或多个 outcome。一个最小 request
-policy 可以同时产生 alert 和 protective verdict：
-
-```lua
-function on_http_request_headers(event)
-  if event.kind.method == "POST" and event.kind.target == "/admin" then
-    return {
-      probe.emit_alert("admin POST observed"),
-      probe.verdict {
-        action = "reset",
-        scope = "flow",
-        reason = "admin endpoint is not allowed",
-        confidence = 95,
-        ttl_ms = 60000
-      }
-    }
-  end
-end
-```
 
 完整 hook 表、event 字段参考、sandbox contract、outcome model 和实用 Lua 写法见
 [docs/lua-policy_ZH.md](docs/lua-policy_ZH.md)。

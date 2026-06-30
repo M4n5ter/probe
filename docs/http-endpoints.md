@@ -20,6 +20,14 @@ exporter TLS material is configured, the endpoint must use `https://`.
 The request and acknowledgement contract is documented in
 [webhook-receiver.md](webhook-receiver.md).
 
+Examples:
+
+| URL | Result |
+| --- | --- |
+| `https://collector.example/probe/batches` | Accepted. |
+| `http://127.0.0.1:9000/batches` | Accepted for local or private deployments. |
+| `https://user:pass@collector.example/probe/batches` | Rejected because URL credentials are not allowed. |
+
 ## Remote Policy Bundle
 
 Field: `policies.source.endpoint`
@@ -32,6 +40,14 @@ Allowed URL:
 
 The response body is bounded by `max_body_bytes`.
 
+Examples:
+
+| URL | Result |
+| --- | --- |
+| `https://policy.example/bundles/http-guard.toml` | Accepted. |
+| `http://127.0.0.1:9000/http-guard.toml` | Accepted for local testing. |
+| `http://policy.example/bundles/http-guard.toml` | Rejected for non-local transport. |
+
 ## Remote Enforcement Manifest
 
 Field: `enforcement.policy.source.endpoint`
@@ -43,6 +59,14 @@ Allowed URL:
 - URL credentials are rejected.
 
 The response body is bounded by `max_body_bytes`.
+
+Examples:
+
+| URL | Result |
+| --- | --- |
+| `https://policy.example/probe/enforcement.toml` | Accepted. |
+| `http://127.0.0.1:9000/enforcement.toml` | Accepted for local testing. |
+| `https://user:pass@policy.example/probe/enforcement.toml` | Rejected because URL credentials are not allowed. |
 
 ## MITM Policy Hook
 
@@ -57,3 +81,12 @@ Allowed URL:
 
 `http://localhost:15002/...` is rejected because the hook contract requires a
 loopback IP address, not a hostname.
+
+Examples:
+
+| URL | Result |
+| --- | --- |
+| `http://127.0.0.1:15002/mitm-policy-hook` | Accepted. |
+| `http://[::1]:15002/mitm-policy-hook` | Accepted. |
+| `http://localhost:15002/mitm-policy-hook` | Rejected because the host is not an IP address. |
+| `https://127.0.0.1:15002/mitm-policy-hook` | Rejected because the hook uses loopback HTTP. |

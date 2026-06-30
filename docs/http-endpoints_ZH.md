@@ -19,6 +19,14 @@ endpoint 必须使用 `https://`。
 request 和 acknowledgement contract 见
 [webhook-receiver_ZH.md](webhook-receiver_ZH.md)。
 
+示例：
+
+| URL | 结果 |
+| --- | --- |
+| `https://collector.example/probe/batches` | 接受。 |
+| `http://127.0.0.1:9000/batches` | 本地或私有部署可接受。 |
+| `https://user:pass@collector.example/probe/batches` | 拒绝，因为 URL credentials 不允许。 |
+
 ## Remote Policy Bundle
 
 字段：`policies.source.endpoint`
@@ -31,6 +39,14 @@ request 和 acknowledgement contract 见
 
 response body 受 `max_body_bytes` 限制。
 
+示例：
+
+| URL | 结果 |
+| --- | --- |
+| `https://policy.example/bundles/http-guard.toml` | 接受。 |
+| `http://127.0.0.1:9000/http-guard.toml` | 本地测试可接受。 |
+| `http://policy.example/bundles/http-guard.toml` | 拒绝，因为非本地传输必须使用 HTTPS。 |
+
 ## Remote Enforcement Manifest
 
 字段：`enforcement.policy.source.endpoint`
@@ -42,6 +58,14 @@ response body 受 `max_body_bytes` 限制。
 - URL credentials 会被拒绝。
 
 response body 受 `max_body_bytes` 限制。
+
+示例：
+
+| URL | 结果 |
+| --- | --- |
+| `https://policy.example/probe/enforcement.toml` | 接受。 |
+| `http://127.0.0.1:9000/enforcement.toml` | 本地测试可接受。 |
+| `https://user:pass@policy.example/probe/enforcement.toml` | 拒绝，因为 URL credentials 不允许。 |
 
 ## MITM Policy Hook
 
@@ -56,3 +80,12 @@ response body 受 `max_body_bytes` 限制。
 
 `http://localhost:15002/...` 会被拒绝，因为 hook contract 要求 loopback IP address，
 而不是 hostname。
+
+示例：
+
+| URL | 结果 |
+| --- | --- |
+| `http://127.0.0.1:15002/mitm-policy-hook` | 接受。 |
+| `http://[::1]:15002/mitm-policy-hook` | 接受。 |
+| `http://localhost:15002/mitm-policy-hook` | 拒绝，因为 host 不是 IP address。 |
+| `https://127.0.0.1:15002/mitm-policy-hook` | 拒绝，因为 hook 使用 loopback HTTP。 |

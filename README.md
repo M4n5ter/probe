@@ -193,10 +193,11 @@ but does not execute them.
 
 ### Minimal Policy And Webhook Wiring
 
-Use this section when wiring the first real integration. A deployable
-configuration has three explicit contracts: where events come from, which Lua
-hooks inspect them, and how the collector acknowledges durable export batches.
-Probe does not infer these contracts from endpoint names or policy filenames.
+Use this section when wiring the first real integration. A deployable setup
+must state four contracts explicitly: where events come from, where durable
+state is stored, which Lua hooks inspect typed events, and how the collector
+acknowledges export batches. Probe does not infer these contracts from endpoint
+names or policy filenames.
 
 ```text
 /etc/probe/agent.toml
@@ -204,9 +205,22 @@ Probe does not infer these contracts from endpoint names or policy filenames.
 /etc/probe/policies/http-guard/main.lua
 ```
 
+Start with deterministic input and an uncompressed webhook. Once the receiver
+passes interop, switch `capture.selection` to the live backend and set
+`codec = "zstd"` or another supported codec.
+
 Agent config:
 
 ```toml
+[capture]
+selection = "plaintext_feed"
+
+[capture.plaintext_feed]
+path = "/var/lib/probe/plaintext-feed.jsonl"
+
+[storage]
+path = "/var/lib/probe/spool"
+
 [export.worker]
 enabled = true
 
@@ -214,7 +228,7 @@ enabled = true
 id = "primary-webhook"
 transport = "webhook"
 endpoint = "https://collector.example/probe/batches"
-codec = "zstd"
+codec = "none"
 headers = { x_probe_node = "edge-a" }
 
 [[policies]]
@@ -224,6 +238,10 @@ enabled = true
 [policies.source]
 kind = "local_directory"
 path = "/etc/probe/policies/http-guard"
+
+[enforcement]
+mode = "audit_only"
+backend = "none"
 ```
 
 Policy manifest:
@@ -234,7 +252,7 @@ version = "2026-06-30"
 hooks = ["on_http_request_headers", "on_websocket_message"]
 ```
 
-Lua contract:
+How Lua policy should be written:
 
 - `agent run` loads a policy bundle directory, not a loose Lua file.
 - `manifest.toml` names the hooks Probe may call; each named hook must exist as
@@ -289,14 +307,17 @@ function on_websocket_message(event)
 end
 ```
 
-Endpoint quick rules:
+Endpoint format requirements:
 
 - Export webhook (`exporters.<id>.endpoint`):
-  absolute `http://` or `https://` URL with a host. URL credentials are
+  absolute `http://` or `https://` URL with a scheme and host, such as
+  `https://collector.example/probe/batches` or
+  `http://127.0.0.1:9000/batches` for local testing. URL credentials are
   rejected. Exporter TLS refs require `https://`.
 - Remote Lua policy (`policies.source.endpoint`):
-  `https://` for remote endpoints; loopback `http://` is allowed only for
-  local testing. URL credentials are rejected.
+  `https://` for non-local endpoints, such as
+  `https://policy.example/bundles/http-guard.toml`. Loopback `http://` is
+  allowed only for local testing. URL credentials are rejected.
 - Remote enforcement policy (`enforcement.policy.source.endpoint`):
   same transport rule as remote Lua policy bundles.
 - MITM policy hook (`enforcement.interception.mitm.policy_hook.endpoint`):
@@ -506,61 +527,16 @@ parent directories.
 
 #### Webhook Receiver Setup
 
-A webhook `endpoint` must be an absolute `http://` or `https://` URL including
-scheme and host. URL credentials are rejected; use explicit exporter headers or
-TLS material refs for deployment authentication.
-
-Custom exporter `headers` may add deployment metadata, but cannot override the
-reserved protocol headers: `content-type`, `idempotency-key`, or
-`x-traffic-probe-codec`.
-
-The request format, acknowledgement rules, retry semantics, and protobuf schema
-are documented in
-[docs/webhook-receiver.md](docs/webhook-receiver.md). The batch schema is also
-available as [docs/export-batch.proto](docs/export-batch.proto). Endpoint rules
-for exporter, remote policy, remote enforcement, and MITM hook HTTP surfaces are
-documented in [docs/http-endpoints.md](docs/http-endpoints.md).
+The first integration section shows the webhook request, ACK, and retry
+contract. The full receiver reference is in
+[docs/webhook-receiver.md](docs/webhook-receiver.md), the batch schema is in
+[docs/export-batch.proto](docs/export-batch.proto), and endpoint rules for all
+HTTP surfaces are in [docs/http-endpoints.md](docs/http-endpoints.md).
 
 ### Policy
 
-`agent run` uses policy bundles. A local bundle is a directory with
-`manifest.toml` and `main.lua`:
-
-```text
-policy/
-  manifest.toml
-  main.lua
-```
-
-Example manifest:
-
-```toml
-id = "http-alert"
-version = "example"
-hooks = ["on_http_request_headers"]
-```
-
-Example source:
-
-```lua
-function on_http_request_headers(event)
-  local method = event.kind.method or "UNKNOWN"
-  local target = event.kind.target or "/"
-  return probe.emit_alert("HTTP request " .. method .. " " .. target)
-end
-```
-
-Reference the bundle from agent config:
-
-```toml
-[[policies]]
-id = "http-alert"
-enabled = true
-
-[policies.source]
-kind = "local_directory"
-path = "/etc/probe/policies/http-alert"
-```
+`agent run` uses policy bundles: a local bundle is a directory with
+`manifest.toml` and `main.lua`, as shown in the first integration section.
 
 Remote policy bundles are configured as bounded TOML documents; the response
 schema and example are in [docs/lua-policy.md](docs/lua-policy.md):
@@ -578,26 +554,6 @@ max_body_bytes = 16777216
 
 `agent replay --policy` is intentionally different: it accepts one Lua file for
 local debugging and wraps it in a synthetic replay manifest.
-
-Hooks return `nil`, one alert/verdict outcome, or an array of outcomes. A
-minimal request policy can emit both an alert and a protective verdict:
-
-```lua
-function on_http_request_headers(event)
-  if event.kind.method == "POST" and event.kind.target == "/admin" then
-    return {
-      probe.emit_alert("admin POST observed"),
-      probe.verdict {
-        action = "reset",
-        scope = "flow",
-        reason = "admin endpoint is not allowed",
-        confidence = 95,
-        ttl_ms = 60000
-      }
-    }
-  end
-end
-```
 
 The full hook table, event field reference, sandbox contract, outcome model, and
 practical Lua patterns are documented in [docs/lua-policy.md](docs/lua-policy.md).
