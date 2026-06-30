@@ -44,6 +44,15 @@ impl HttpMessage {
     pub(crate) fn is_head(&self) -> bool {
         self.method.eq_ignore_ascii_case("HEAD")
     }
+
+    pub(crate) fn explicit_keep_alive(&self) -> bool {
+        connection_tokens(&self.headers).any(|token| token.eq_ignore_ascii_case("keep-alive"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HttpResponseRelay {
+    pub(crate) close_downstream: bool,
 }
 
 pub(crate) fn read_http_message(
@@ -87,9 +96,10 @@ pub(crate) fn relay_http_response(
     stream: &mut impl Read,
     request: &HttpMessage,
     mut emit: impl FnMut(&[u8]) -> Result<(), MitmProxyError>,
-) -> Result<(), MitmProxyError> {
+) -> Result<HttpResponseRelay, MitmProxyError> {
     let ResponseHead {
         head,
+        close_downstream,
         body_framing,
         prefetched_body,
     } = read_response_head(stream, request.is_head())?;
@@ -97,7 +107,7 @@ pub(crate) fn relay_http_response(
     match body_framing {
         ResponseBodyFraming::NoBody => {
             if prefetched_body.is_empty() {
-                Ok(())
+                Ok(HttpResponseRelay { close_downstream })
             } else {
                 Err(MitmProxyError::Http(
                     "HTTP response included a body where none is allowed".to_string(),
@@ -105,9 +115,13 @@ pub(crate) fn relay_http_response(
             }
         }
         ResponseBodyFraming::ContentLength(content_length) => {
-            relay_content_length_body(stream, prefetched_body, content_length, emit)
+            relay_content_length_body(stream, prefetched_body, content_length, emit)?;
+            Ok(HttpResponseRelay { close_downstream })
         }
-        ResponseBodyFraming::Chunked => relay_chunked_body(stream, prefetched_body, emit),
+        ResponseBodyFraming::Chunked => {
+            relay_chunked_body(stream, prefetched_body, emit)?;
+            Ok(HttpResponseRelay { close_downstream })
+        }
     }
 }
 
@@ -141,6 +155,7 @@ pub(crate) fn write_empty_response(
 
 struct ResponseHead {
     head: Vec<u8>,
+    close_downstream: bool,
     body_framing: ResponseBodyFraming,
     prefetched_body: Vec<u8>,
 }
@@ -168,6 +183,7 @@ fn read_response_head(
             let parsed = parse_response_head(&raw[..header_end], request_is_head)?;
             return Ok(ResponseHead {
                 head: raw[..head_end].to_vec(),
+                close_downstream: parsed.close_downstream,
                 body_framing: parsed.body_framing,
                 prefetched_body: raw[head_end..].to_vec(),
             });
@@ -186,7 +202,19 @@ fn read_response_head(
 }
 
 struct ParsedResponseHead {
+    close_downstream: bool,
     body_framing: ResponseBodyFraming,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpResponseVersion {
+    Http10,
+    Http11,
+}
+
+struct ParsedStatus {
+    version: HttpResponseVersion,
+    code: u16,
 }
 
 fn parse_response_head(
@@ -206,25 +234,31 @@ fn parse_response_head(
         .map(parse_header)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ParsedResponseHead {
-        body_framing: response_body_framing(status, request_is_head, &headers)?,
+        close_downstream: response_connection_closes(status.version, &headers),
+        body_framing: response_body_framing(status.code, request_is_head, &headers)?,
     })
 }
 
-fn parse_status(status_line: &str) -> Result<u16, MitmProxyError> {
+fn parse_status(status_line: &str) -> Result<ParsedStatus, MitmProxyError> {
     let mut parts = status_line.split_whitespace();
     let version = parts
         .next()
         .ok_or_else(|| MitmProxyError::Http("HTTP response version is missing".to_string()))?;
-    if version != "HTTP/1.0" && version != "HTTP/1.1" {
-        return Err(MitmProxyError::Http(format!(
-            "unsupported HTTP response version {version}"
-        )));
-    }
-    parts
+    let version = match version {
+        "HTTP/1.0" => HttpResponseVersion::Http10,
+        "HTTP/1.1" => HttpResponseVersion::Http11,
+        _ => {
+            return Err(MitmProxyError::Http(format!(
+                "unsupported HTTP response version {version}"
+            )));
+        }
+    };
+    let code = parts
         .next()
         .ok_or_else(|| MitmProxyError::Http("HTTP response status code is missing".to_string()))?
         .parse::<u16>()
-        .map_err(|error| MitmProxyError::Http(format!("invalid HTTP response status: {error}")))
+        .map_err(|error| MitmProxyError::Http(format!("invalid HTTP response status: {error}")))?;
+    Ok(ParsedStatus { version, code })
 }
 
 fn response_body_framing(
@@ -268,6 +302,28 @@ fn transfer_encodings(headers: &[(String, String)]) -> Vec<String> {
         .filter(|encoding| !encoding.is_empty())
         .map(str::to_ascii_lowercase)
         .collect()
+}
+
+fn response_connection_closes(version: HttpResponseVersion, headers: &[(String, String)]) -> bool {
+    let mut keep_alive = false;
+    for token in connection_tokens(headers) {
+        if token.eq_ignore_ascii_case("close") {
+            return true;
+        }
+        if token.eq_ignore_ascii_case("keep-alive") {
+            keep_alive = true;
+        }
+    }
+    version == HttpResponseVersion::Http10 && !keep_alive
+}
+
+fn connection_tokens(headers: &[(String, String)]) -> impl Iterator<Item = &str> {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
 }
 
 fn relay_content_length_body(
@@ -471,8 +527,11 @@ fn read_until_headers_complete(
     max_bytes: usize,
 ) -> Result<(), MitmProxyError> {
     while find_header_terminator(raw).is_none() {
-        if read_more(stream, raw, max_bytes)? == 0 {
-            break;
+        match read_more(stream, raw, max_bytes) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if raw.is_empty() && error_is_read_timeout(&error) => break,
+            Err(error) => return Err(error),
         }
     }
     Ok(())
@@ -495,6 +554,17 @@ fn read_more(
         .map_err(io_error("read MITM proxy HTTP message"))?;
     raw.extend_from_slice(&buffer[..read]);
     Ok(read)
+}
+
+fn error_is_read_timeout(error: &MitmProxyError) -> bool {
+    matches!(
+        error,
+        MitmProxyError::Io { source, .. }
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    )
 }
 
 struct ParsedHead {

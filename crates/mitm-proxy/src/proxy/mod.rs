@@ -29,8 +29,11 @@ use crate::{
     authority::ObservedAuthority,
     error::io_error,
     feed::{CaptureEventFeedWriter, FlowOffsets},
-    flow::{FlowFactory, FlowRegistry, ProxyAction},
-    http::{HttpMessage, read_http_message, relay_http_response, write_empty_response},
+    flow::{FlowFactory, FlowRegistry, PendingActionKey, ProxyAction},
+    http::{
+        HttpMessage, HttpResponseRelay, read_http_message, relay_http_response,
+        write_empty_response,
+    },
     tls::{TlsTerminationConfig, UpstreamTlsConfig},
 };
 
@@ -164,6 +167,17 @@ struct ProxyState {
     flow_factory: Arc<FlowFactory>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DownstreamDisposition {
+    Continue,
+    Close,
+}
+
+struct SequencedHttpRequest {
+    message: HttpMessage,
+    sequence: u64,
+}
+
 fn validate_config(config: &MitmProxyConfig) -> Result<(), MitmProxyError> {
     if !config.listen.ip().is_loopback() {
         return Err(MitmProxyError::InvalidConfig(format!(
@@ -259,28 +273,78 @@ fn handle_data_connection(
 }
 
 fn handle_http_connection(
-    mut downstream: &mut impl DownstreamIo,
+    downstream: &mut impl DownstreamIo,
     peer: SocketAddr,
     target: SocketAddr,
     downstream_tls_server_name: Option<&str>,
     state: Arc<ProxyState>,
 ) -> Result<(), MitmProxyError> {
-    let Some(request) = read_http_message(downstream, state.config.max_request_bytes)? else {
+    let Some(first_request) = read_http_message(downstream, state.config.max_request_bytes)? else {
         return Ok(());
     };
     let flow = state.flow_factory.flow(peer, target);
-    let registration = state
-        .config
-        .policy_hook_listen
-        .map(|_| state.registry.register(flow.id.clone()));
     let mut offsets = FlowOffsets::default();
     state.feed.connection_opened(&flow)?;
-    let request_offset = offsets.record(state.config.request_direction, request.raw.len());
+
+    let mut request_sequence = 0_u64;
+    let mut next_request = Some(first_request);
+    let result = loop {
+        let request = match next_request.take() {
+            Some(request) => request,
+            None => match read_http_message(downstream, state.config.max_request_bytes) {
+                Ok(Some(request)) => request,
+                Ok(None) => break Ok(()),
+                Err(error) => break Err(error),
+            },
+        };
+        request_sequence = request_sequence.saturating_add(1);
+        let disposition = match handle_http_request(
+            downstream,
+            target,
+            downstream_tls_server_name,
+            SequencedHttpRequest {
+                message: request,
+                sequence: request_sequence,
+            },
+            &state,
+            &flow,
+            &mut offsets,
+        ) {
+            Ok(disposition) => disposition,
+            Err(error) => break Err(error),
+        };
+        if disposition == DownstreamDisposition::Close {
+            break Ok(());
+        }
+    };
+
+    let finish_result = downstream.finish();
+    let close_result = state.feed.connection_closed(flow);
+    result.and(finish_result).and(close_result)
+}
+
+fn handle_http_request(
+    downstream: &mut impl Write,
+    target: SocketAddr,
+    downstream_tls_server_name: Option<&str>,
+    request: SequencedHttpRequest,
+    state: &ProxyState,
+    flow: &probe_core::FlowContext,
+    offsets: &mut FlowOffsets,
+) -> Result<DownstreamDisposition, MitmProxyError> {
+    let registration = state.config.policy_hook_listen.map(|_| {
+        state.registry.register(PendingActionKey::request(
+            flow.id.clone(),
+            state.config.request_direction,
+            request.sequence,
+        ))
+    });
+    let request_offset = offsets.record(state.config.request_direction, request.message.raw.len());
     state.feed.bytes(
-        &flow,
+        flow,
         state.config.request_direction,
         request_offset,
-        &request.raw,
+        &request.message.raw,
     )?;
 
     let action = match registration {
@@ -289,21 +353,19 @@ fn handle_http_connection(
     };
     match action {
         Some(ProxyAction::Deny { reason }) => {
-            write_deny_response(&mut downstream, &state, &flow, &mut offsets, reason)?
+            write_deny_response(downstream, state, flow, offsets, reason)?;
+            Ok(DownstreamDisposition::Close)
         }
         None => forward_or_gateway_response(
-            &mut downstream,
+            downstream,
             target,
             downstream_tls_server_name,
-            request,
-            &state,
-            &flow,
-            &mut offsets,
-        )?,
+            request.message,
+            state,
+            flow,
+            offsets,
+        ),
     }
-    let finish_result = downstream.finish();
-    let close_result = state.feed.connection_closed(flow);
-    finish_result.and(close_result)
 }
 
 fn configure_stream(stream: &TcpStream, timeout: Duration) -> Result<(), MitmProxyError> {
@@ -380,8 +442,9 @@ fn forward_or_gateway_response(
     state: &ProxyState,
     flow: &probe_core::FlowContext,
     offsets: &mut FlowOffsets,
-) -> Result<(), MitmProxyError> {
+) -> Result<DownstreamDisposition, MitmProxyError> {
     let config = &state.config;
+    let request_keep_alive = request.explicit_keep_alive();
     let authority = match observed_authority_for_request(
         config,
         &state.upstream,
@@ -389,14 +452,18 @@ fn forward_or_gateway_response(
         &request,
     ) {
         Ok(authority) => authority,
-        Err(_) => return write_empty_response(downstream, 502),
+        Err(_) => {
+            return write_empty_response(downstream, 502).map(|()| DownstreamDisposition::Close);
+        }
     };
     let target = match upstream_target_for_request(config, target, authority) {
         Ok(target) => target,
-        Err(_) => return write_empty_response(downstream, 502),
+        Err(_) => {
+            return write_empty_response(downstream, 502).map(|()| DownstreamDisposition::Close);
+        }
     };
     if socket_addr_points_to_listener(target, config.listen) {
-        return write_empty_response(downstream, 200);
+        return write_empty_response(downstream, 200).map(|()| DownstreamDisposition::Close);
     }
     match state.upstream.connect(target, authority, config.io_timeout) {
         Ok(mut upstream) => {
@@ -407,7 +474,7 @@ fn forward_or_gateway_response(
                 .flush()
                 .map_err(io_error("flush MITM proxy upstream request"))?;
             upstream.finish_request()?;
-            relay_response(
+            let relay = relay_response(
                 &mut upstream,
                 &request,
                 downstream,
@@ -415,9 +482,17 @@ fn forward_or_gateway_response(
                 flow,
                 offsets,
                 response_direction(config.request_direction),
-            )
+            )?;
+            downstream
+                .flush()
+                .map_err(io_error("flush MITM proxy downstream response"))?;
+            Ok(if request_keep_alive && !relay.close_downstream {
+                DownstreamDisposition::Continue
+            } else {
+                DownstreamDisposition::Close
+            })
         }
-        Err(_) => write_empty_response(downstream, 502),
+        Err(_) => write_empty_response(downstream, 502).map(|()| DownstreamDisposition::Close),
     }
 }
 
@@ -456,7 +531,7 @@ fn relay_response(
     flow: &probe_core::FlowContext,
     offsets: &mut FlowOffsets,
     direction: Direction,
-) -> Result<(), MitmProxyError> {
+) -> Result<HttpResponseRelay, MitmProxyError> {
     relay_http_response(upstream, request, |bytes| {
         let offset = offsets.record(direction, bytes.len());
         feed.bytes(flow, direction, offset, bytes)?;
@@ -487,7 +562,7 @@ mod tests {
         error::Error,
         fs,
         io::{Read, Write},
-        net::{Shutdown, TcpStream},
+        net::{Shutdown, SocketAddr, TcpListener, TcpStream},
         thread,
         time::Duration,
     };
@@ -644,6 +719,271 @@ mod tests {
             feed_direction_bytes(&feed_path, Direction::Inbound)?,
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_keep_alive_allows_sequential_requests_on_one_downstream_connection()
+    -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let upstream = sequential_upstream_server([
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo".as_slice(),
+        ])?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                None,
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let first_request =
+            b"GET /one HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n";
+        let first_response = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none";
+        let second_request = b"GET /two HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let second_response = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo";
+        let mut stream = TcpStream::connect(listen)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(first_request)?;
+        stream.flush()?;
+        let mut response = vec![0_u8; first_response.len()];
+        stream.read_exact(&mut response)?;
+        assert_eq!(response, first_response);
+
+        stream.write_all(second_request)?;
+        stream.flush()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(response, second_response);
+        assert!(feed_has_bytes(
+            &feed_path,
+            Direction::Outbound,
+            first_request
+        )?);
+        assert!(feed_has_bytes(
+            &feed_path,
+            Direction::Outbound,
+            second_request
+        )?);
+        let response_bytes = feed_direction_bytes(&feed_path, Direction::Inbound)?;
+        assert!(
+            response_bytes
+                .windows(first_response.len())
+                .any(|window| window == first_response)
+        );
+        assert!(
+            response_bytes
+                .windows(second_response.len())
+                .any(|window| window == second_response)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn idle_keep_alive_connection_closes_with_lifecycle_event() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let upstream = upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none")?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let mut config = test_config(
+            listen,
+            &feed_path,
+            Some(upstream),
+            None,
+            None,
+            Duration::from_secs(2),
+        );
+        config.io_timeout = Duration::from_millis(150);
+        let guard = start_test_proxy(config, data_listener, None)?;
+
+        let request = b"GET /one HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n";
+        let expected_response = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none";
+        let mut stream = TcpStream::connect(listen)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(request)?;
+        stream.flush()?;
+        let flow = wait_for_flow(&feed_path)?;
+        let mut response = vec![0_u8; expected_response.len()];
+        stream.read_exact(&mut response)?;
+        assert_eq!(response, expected_response);
+
+        let mut remaining = Vec::new();
+        stream.read_to_end(&mut remaining)?;
+        guard.stop()?;
+
+        assert!(remaining.is_empty());
+        assert!(feed_has_connection_closed(&feed_path, flow.id.0.as_str())?);
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_connection_close_response_closes_downstream() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let upstream = sequential_upstream_server([
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\none".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo".as_slice(),
+        ])?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                None,
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let first_request =
+            b"GET /one HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n";
+        let first_response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\none";
+        let second_request = b"GET /two HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let mut stream = TcpStream::connect(listen)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(first_request)?;
+        stream.flush()?;
+        let mut response = vec![0_u8; first_response.len()];
+        stream.read_exact(&mut response)?;
+        assert_eq!(response, first_response);
+
+        let _ = stream.write_all(second_request);
+        let _ = stream.flush();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert!(response.is_empty());
+        assert!(!feed_has_bytes(
+            &feed_path,
+            Direction::Outbound,
+            second_request
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn http10_response_without_keep_alive_closes_downstream() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let upstream = sequential_upstream_server([
+            b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\none".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo".as_slice(),
+        ])?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                None,
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let first_request =
+            b"GET /one HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n";
+        let first_response = b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\none";
+        let second_request = b"GET /two HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let mut stream = TcpStream::connect(listen)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(first_request)?;
+        stream.flush()?;
+        let mut response = vec![0_u8; first_response.len()];
+        stream.read_exact(&mut response)?;
+        assert_eq!(response, first_response);
+
+        let _ = stream.write_all(second_request);
+        let _ = stream.flush();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert!(response.is_empty());
+        assert!(!feed_has_bytes(
+            &feed_path,
+            Direction::Outbound,
+            second_request
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn late_policy_hook_deny_does_not_apply_to_later_keep_alive_request()
+    -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let upstream = sequential_upstream_server([
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo".as_slice(),
+        ])?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let policy_hook_listener = bound_loopback_listener()?;
+        let policy_hook_listen = policy_hook_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                None,
+                Some(policy_hook_listen),
+                Duration::from_secs(1),
+            ),
+            data_listener,
+            Some(policy_hook_listener),
+        )?;
+
+        let first_request =
+            b"GET /one HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n";
+        let first_response = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none";
+        let second_request = b"GET /two HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let second_response = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo";
+        let mut stream = TcpStream::connect(listen)?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.write_all(first_request)?;
+        stream.flush()?;
+        let flow = wait_for_flow(&feed_path)?;
+        let mut response = vec![0_u8; first_response.len()];
+        stream.read_exact(&mut response)?;
+        assert_eq!(response, first_response);
+
+        stream.write_all(second_request)?;
+        stream.flush()?;
+        wait_for_bytes(&feed_path, Direction::Outbound, second_request)?;
+        let hook_response =
+            send_policy_hook_deny_response_for_sequence(policy_hook_listen, flow, 1)?;
+        assert!(
+            hook_response.contains(r#""outcome":"unsupported""#)
+                && hook_response.contains("is not pending in MITM proxy"),
+            "{hook_response}"
+        );
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(response, second_response);
         Ok(())
     }
 
@@ -1187,5 +1527,28 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nkeepalive"
         );
         Ok(())
+    }
+
+    fn sequential_upstream_server<const N: usize>(
+        responses: [&'static [u8]; N],
+    ) -> Result<SocketAddr, Box<dyn Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let target = listener.local_addr()?;
+        thread::spawn(move || {
+            for response in responses {
+                let Ok((mut stream, _peer)) = listener.accept() else {
+                    return;
+                };
+                if read_http_message(&mut stream, 65_536)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    let _ = stream.write_all(response);
+                    let _ = stream.flush();
+                }
+            }
+        });
+        Ok(target)
     }
 }

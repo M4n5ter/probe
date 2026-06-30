@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     MitmProxyError,
     error::io_error,
+    flow::PendingActionKey,
     http::{read_http_message, write_json_response},
 };
 
@@ -95,11 +96,11 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ProxyState>) -> Result<()
         return Ok(());
     }
 
-    let Some(flow) = body.trigger.flow() else {
+    let Some(key) = PendingActionKey::from_trigger(&body.trigger) else {
         write_json_response(
             &mut stream,
             200,
-            unsupported_response("policy hook trigger did not contain a flow"),
+            unsupported_response("policy hook trigger did not contain an HTTP request flow"),
         )?;
         return Ok(());
     };
@@ -107,15 +108,15 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ProxyState>) -> Result<()
     match body.requested_action {
         Action::Deny => {
             let reason = Some(body.verdict.reason);
-            if state.registry.deny(&flow.id.0, reason.clone()) {
+            if state.registry.deny(&key, reason.clone()) {
                 write_json_response(&mut stream, 200, delegated_response(Action::Deny, reason))
             } else {
                 write_json_response(
                     &mut stream,
                     200,
                     unsupported_response(format!(
-                        "flow {} is not pending in MITM proxy",
-                        flow.id.0
+                        "request {} is not pending in MITM proxy",
+                        key.describe()
                     )),
                 )
             }

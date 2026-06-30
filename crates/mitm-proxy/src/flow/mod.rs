@@ -14,8 +14,8 @@ use std::{
 
 use attribution::{AttributionError, ProcfsSocketResolver, SocketProcessContext};
 use probe_core::{
-    AddressPort, Direction, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity,
-    TcpConnection, TcpEndpoint, TransportProtocol,
+    AddressPort, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity, ProcessContext,
+    ProcessIdentity, TcpConnection, TcpEndpoint, TransportProtocol,
 };
 
 #[derive(Debug)]
@@ -23,47 +23,87 @@ pub(crate) enum ProxyAction {
     Deny { reason: Option<String> },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PendingActionKey {
+    flow_id: FlowIdentity,
+    direction: Direction,
+    stream_sequence: u64,
+}
+
+impl PendingActionKey {
+    pub(crate) fn request(
+        flow_id: FlowIdentity,
+        direction: Direction,
+        stream_sequence: u64,
+    ) -> Self {
+        Self {
+            flow_id,
+            direction,
+            stream_sequence,
+        }
+    }
+
+    pub(crate) fn from_trigger(trigger: &EventEnvelope) -> Option<Self> {
+        let flow = trigger.flow()?;
+        match trigger.kind() {
+            EventKind::HttpRequestHeaders(headers) => Some(Self::request(
+                flow.id.clone(),
+                headers.direction,
+                headers.stream_sequence,
+            )),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "{} {:?} stream {}",
+            self.flow_id.0, self.direction, self.stream_sequence
+        )
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct FlowRegistry {
-    flows: Mutex<HashMap<String, Sender<ProxyAction>>>,
+    pending: Mutex<HashMap<PendingActionKey, Sender<ProxyAction>>>,
 }
 
 impl FlowRegistry {
-    pub(crate) fn register(self: &Arc<Self>, flow_id: FlowIdentity) -> FlowRegistration {
+    pub(crate) fn register(self: &Arc<Self>, key: PendingActionKey) -> FlowRegistration {
         let (sender, receiver) = mpsc::channel();
-        self.flows
+        self.pending
             .lock()
             .expect("flow registry mutex should not be poisoned")
-            .insert(flow_id.0.clone(), sender);
+            .insert(key.clone(), sender);
         FlowRegistration {
             registry: Arc::clone(self),
-            flow_id,
+            key,
             receiver,
         }
     }
 
-    pub(crate) fn deny(&self, flow_id: &str, reason: Option<String>) -> bool {
-        let mut flows = self
-            .flows
+    pub(crate) fn deny(&self, key: &PendingActionKey, reason: Option<String>) -> bool {
+        let mut pending = self
+            .pending
             .lock()
             .expect("flow registry mutex should not be poisoned");
-        let Some(sender) = flows.remove(flow_id) else {
+        let Some(sender) = pending.remove(key) else {
             return false;
         };
         sender.send(ProxyAction::Deny { reason }).is_ok()
     }
 
-    fn remove(&self, flow_id: &FlowIdentity) {
-        self.flows
+    fn remove(&self, key: &PendingActionKey) {
+        self.pending
             .lock()
             .expect("flow registry mutex should not be poisoned")
-            .remove(&flow_id.0);
+            .remove(key);
     }
 }
 
 pub(crate) struct FlowRegistration {
     registry: Arc<FlowRegistry>,
-    flow_id: FlowIdentity,
+    key: PendingActionKey,
     receiver: Receiver<ProxyAction>,
 }
 
@@ -72,7 +112,7 @@ impl FlowRegistration {
         match self.receiver.recv_timeout(timeout) {
             Ok(action) => Some(action),
             Err(_) => {
-                self.registry.remove(&self.flow_id);
+                self.registry.remove(&self.key);
                 self.receiver.try_recv().ok()
             }
         }
@@ -81,7 +121,7 @@ impl FlowRegistration {
 
 impl Drop for FlowRegistration {
     fn drop(&mut self) {
-        self.registry.remove(&self.flow_id);
+        self.registry.remove(&self.key);
     }
 }
 
@@ -304,18 +344,39 @@ mod tests {
     #[test]
     fn timeout_closes_pending_flow() {
         let registry = Arc::new(FlowRegistry::default());
-        let registration = Arc::clone(&registry).register(FlowIdentity("flow-1".to_string()));
+        let key =
+            PendingActionKey::request(FlowIdentity("flow-1".to_string()), Direction::Outbound, 1);
+        let registration = Arc::clone(&registry).register(key.clone());
 
         assert!(registration.recv_timeout(Duration::ZERO).is_none());
-        assert!(!registry.deny("flow-1", Some("too late".to_string())));
+        assert!(!registry.deny(&key, Some("too late".to_string())));
     }
 
     #[test]
     fn deny_before_timeout_is_delivered() {
         let registry = Arc::new(FlowRegistry::default());
-        let registration = Arc::clone(&registry).register(FlowIdentity("flow-1".to_string()));
+        let key =
+            PendingActionKey::request(FlowIdentity("flow-1".to_string()), Direction::Outbound, 1);
+        let registration = Arc::clone(&registry).register(key.clone());
 
-        assert!(registry.deny("flow-1", Some("blocked".to_string())));
+        assert!(registry.deny(&key, Some("blocked".to_string())));
+        assert!(matches!(
+            registration.recv_timeout(Duration::from_secs(1)),
+            Some(ProxyAction::Deny { reason }) if reason.as_deref() == Some("blocked")
+        ));
+    }
+
+    #[test]
+    fn request_pending_keys_do_not_alias_on_sequence() {
+        let registry = Arc::new(FlowRegistry::default());
+        let first =
+            PendingActionKey::request(FlowIdentity("flow-1".to_string()), Direction::Outbound, 1);
+        let second =
+            PendingActionKey::request(FlowIdentity("flow-1".to_string()), Direction::Outbound, 2);
+        let registration = Arc::clone(&registry).register(second.clone());
+
+        assert!(!registry.deny(&first, Some("stale".to_string())));
+        assert!(registry.deny(&second, Some("blocked".to_string())));
         assert!(matches!(
             registration.recv_timeout(Duration::from_secs(1)),
             Some(ProxyAction::Deny { reason }) if reason.as_deref() == Some("blocked")

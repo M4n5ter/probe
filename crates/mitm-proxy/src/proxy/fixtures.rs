@@ -241,6 +241,36 @@ pub(super) fn feed_has_bytes(
     Ok(false)
 }
 
+pub(super) fn wait_for_bytes(
+    feed_path: &PathBuf,
+    direction: Direction,
+    expected: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if feed_path.try_exists()? && feed_has_bytes(feed_path, direction, expected)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Err("timed out waiting for MITM proxy feed bytes".into())
+}
+
+pub(super) fn feed_has_connection_closed(
+    feed_path: &PathBuf,
+    flow_id: &str,
+) -> Result<bool, Box<dyn Error>> {
+    for line in fs::read_to_string(feed_path)?.lines() {
+        let event = serde_json::from_str::<CaptureEvent>(line)?;
+        if let CaptureEvent::ConnectionClosed { flow, .. } = event
+            && flow.id.0 == flow_id
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn feed_direction_bytes(
     feed_path: &PathBuf,
     direction: Direction,
@@ -270,6 +300,14 @@ pub(super) fn send_policy_hook_deny_response(
     target: SocketAddr,
     flow: FlowContext,
 ) -> Result<String, Box<dyn Error>> {
+    send_policy_hook_deny_response_for_sequence(target, flow, 1)
+}
+
+pub(super) fn send_policy_hook_deny_response_for_sequence(
+    target: SocketAddr,
+    flow: FlowContext,
+    stream_sequence: u64,
+) -> Result<String, Box<dyn Error>> {
     let trigger = EventEnvelope::from_flow(
         Timestamp {
             monotonic_ns: 1,
@@ -280,7 +318,7 @@ pub(super) fn send_policy_hook_deny_response(
         "test-config",
         EventKind::HttpRequestHeaders(HttpHeaders {
             direction: Direction::Outbound,
-            stream_sequence: 1,
+            stream_sequence,
             method: Some("GET".to_string()),
             target: Some("/blocked".to_string()),
             status: None,
