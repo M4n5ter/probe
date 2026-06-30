@@ -100,10 +100,11 @@ E2E paths. Inbound TPROXY can route a client connection to the proxy; outbound
 OUTPUT redirect can route a host-originated connection to the same proxy while
 proxy-owned upstream sockets bypass recapture through the reserved mark. In
 both directions, the proxy terminates downstream TLS with CA-backed dynamic SNI
-certificates, delegates protective decisions to the HTTP JSON hook, routes
-explicit allow-path hosts to configured upstream targets, emits plaintext bridge
-events for forwarded responses and proxy-generated deny/gateway responses,
-returns proxy-side responses, and records durable delegated decisions.
+certificates, delegates protective decisions to the HTTP JSON hook, resolves
+allow-path upstream targets from explicit routes or opt-in DNS discovery, emits
+plaintext bridge events for forwarded responses and proxy-generated
+deny/gateway responses, returns proxy-side responses, and records durable
+delegated decisions.
 CA-backed dynamic certificate mode requires downstream TLS clients to send DNS
 SNI. When upstream TLS is enabled, the product proxy uses that SNI as the
 upstream TLS server name unless an explicit upstream server name is pinned; it
@@ -133,13 +134,12 @@ The following are intentional boundaries of the current implementation:
 - No automatic mutation of client trust stores; MITM client trust is an explicit
   operator-managed contract.
 - Transparent inbound and outbound HTTPS MITM are covered for product proxy
-  routed allow and deny paths. Product proxy TLS advertises and gates HTTP/1.1
-  ALPN. Exact and suffix-wildcard upstream routes are supported;
-  explicit opt-in DNS upstream discovery is supported at the product proxy data
-  plane with IANA special-purpose/special-use address filtering enabled by
-  default. ALPN-based multi-protocol routing, strong original attribution,
-  automatic trust-store mutation, and non-HTTP transparent allow-path matrices
-  remain explicit capability boundaries.
+  routed and DNS-discovered allow/deny paths. Product proxy TLS advertises and
+  gates HTTP/1.1 ALPN. Exact and suffix-wildcard upstream routes are supported;
+  explicit opt-in DNS upstream discovery uses IANA special-purpose/special-use
+  address filtering by default. ALPN-based multi-protocol routing, strong
+  original attribution, automatic trust-store mutation, and non-HTTP
+  transparent allow-path matrices remain explicit capability boundaries.
 - No hidden long-term raw traffic retention.
 - No HTTP/2, HTTP/3, or QUIC parser yet.
 - WebSocket support emits handoff, frame metadata, and 16 MiB bounded

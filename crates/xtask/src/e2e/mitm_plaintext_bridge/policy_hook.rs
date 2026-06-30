@@ -20,7 +20,7 @@ use probe_core::Action;
 use serde_json::json;
 
 use super::{
-    backend::MitmBridgeCase,
+    case::MitmBridgeCase,
     feed::{POLICY_HOOK_REASON_PREFIX, POLICY_HOOK_RESPONSE_REASON},
 };
 use crate::e2e::harness::e2e_error;

@@ -3,7 +3,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(super) const SERVER_NAME: &str = "mitm-bridge.e2e.test";
+use e2e_support::mitm_bridge;
+
+pub(super) const SERVER_NAME: &str = mitm_bridge::REQUEST_HOST;
+pub(super) const DNS_DISCOVERY_SERVER_NAME: &str = "localhost";
 
 pub(super) struct MitmCaMaterial {
     pub(super) certificate_path: PathBuf,
@@ -37,8 +40,9 @@ pub(super) fn write_mitm_ca(root: &Path) -> Result<MitmCaMaterial, Box<dyn std::
 
 pub(super) fn write_upstream_server_certificate(
     root: &Path,
+    server_name: &str,
 ) -> Result<UpstreamServerMaterial, Box<dyn std::error::Error>> {
-    let certified_key = rcgen::generate_simple_self_signed([SERVER_NAME.to_string()])?;
+    let certified_key = rcgen::generate_simple_self_signed([server_name.to_string()])?;
     let certificate_path = root.join("upstream-server.pem");
     let private_key_path = root.join("upstream-server.key");
     fs::write(&certificate_path, certified_key.cert.pem())?;

@@ -1,8 +1,8 @@
 use probe_core::{Direction, EventEnvelope, EventKind, WebSocketMessageOpcode, WebSocketOpcode};
 
 use super::{
-    backend::MitmBridgeCase,
     bridge_assertions::{assert_expected_bridge_policy_alert, assert_no_bridge_protocol_errors},
+    case::MitmBridgeCase,
     feed::{is_bridge_flow, product_proxy_request_direction, product_proxy_response_direction},
     websocket,
 };

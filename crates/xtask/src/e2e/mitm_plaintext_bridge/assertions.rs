@@ -21,11 +21,9 @@ use serde_json::json;
 use storage::{FjallSpool, StoredEvent};
 
 use super::{
-    backend::{
-        MitmBackendConfig, MitmBackendKind, MitmBridgeCase, MitmBridgeDirection,
-        PreparedMitmBackend, wait_for_managed_backend_pid,
-    },
+    backend::{MitmBackendConfig, PreparedMitmBackend, wait_for_managed_backend_pid},
     bridge_assertions::assert_expected_bridge_policy_alert,
+    case::{MitmBackendKind, MitmBridgeCase, MitmBridgeDirection},
     data_plane::{self, MitmDataPlaneProtocol},
     feed::{
         E2E_EXPORT_CURSOR_OWNER, ENFORCEMENT_MANIFEST_ID, ENFORCEMENT_MANIFEST_VERSION,

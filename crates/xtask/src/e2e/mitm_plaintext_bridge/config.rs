@@ -9,6 +9,8 @@ use probe_config::{
     TransparentInterceptionMitmManagedProcessConfig,
     TransparentInterceptionMitmPlaintextBridgeModeConfig,
     TransparentInterceptionMitmPolicyHookModeConfig, TransparentInterceptionMitmProductProxyConfig,
+    TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig,
+    TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig,
     TransparentInterceptionMitmProductProxyUpstreamRouteConfig,
     TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
     TransparentInterceptionStrategyConfig,
@@ -19,7 +21,8 @@ use probe_core::{
 };
 
 use super::{
-    backend::{MitmBackendConfig, MitmBridgeCase, MitmBridgeDirection},
+    backend::{MitmBackendConfig, ProductProxyUpstream, ProductProxyUpstreamSelection},
+    case::{MitmBridgeCase, MitmBridgeDirection},
     feed::{
         ENFORCEMENT_MANIFEST_ID, ENFORCEMENT_MANIFEST_VERSION, POLICY_ALERT_PREFIX,
         POLICY_HOOK_REASON_PREFIX, POLICY_ID, POLICY_VERSION, REQUEST_BODY_BYTES, REQUESTS,
@@ -123,19 +126,15 @@ pub(super) fn write_agent_config(
         MitmBackendConfig::ProductProxy {
             target,
             program,
-            upstream_route,
+            upstream,
         } => TransparentInterceptionMitmBackendConfig::product_proxy(
             mitm_readiness_probe(target.clone()),
             TransparentInterceptionMitmProductProxyConfig {
                 program: Some(program.clone()),
                 working_dir: None,
                 application_protocols: None,
-                upstream_discovery:
-                    probe_config::TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig::default(),
-                upstream_routes: vec![TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
-                    host: upstream_route.route_host.clone(),
-                    target: upstream_route.target.to_string(),
-                }],
+                upstream_discovery: product_proxy_upstream_discovery_config(upstream),
+                upstream_routes: product_proxy_upstream_route_config(upstream),
             },
         ),
     };
@@ -172,7 +171,7 @@ pub(super) fn write_agent_config(
             path: inputs.mitm_ca_private_key_path.to_path_buf(),
         },
     ];
-    if let MitmBackendConfig::ProductProxy { upstream_route, .. } = inputs.mitm_backend {
+    if let MitmBackendConfig::ProductProxy { upstream, .. } = inputs.mitm_backend {
         config
             .enforcement
             .interception
@@ -181,12 +180,44 @@ pub(super) fn write_agent_config(
         tls_materials.push(TlsMaterialConfig {
             id: Some("product-upstream-ca".to_string()),
             kind: TlsMaterialKind::MitmUpstreamTrustAnchor,
-            path: upstream_route.certificate_path.clone(),
+            path: upstream.certificate_path.clone(),
         });
     }
     config.tls.materials = tls_materials;
     fs::write(inputs.config_path, toml::to_string(&config)?)?;
     Ok(())
+}
+
+fn product_proxy_upstream_discovery_config(
+    upstream: &ProductProxyUpstream,
+) -> TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig {
+    match &upstream.selection {
+        ProductProxyUpstreamSelection::Route { .. } => {
+            TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig::default()
+        }
+        ProductProxyUpstreamSelection::DnsDiscovery {
+            default_port,
+            allow_special_use_addresses,
+        } => TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig {
+            mode: TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig::Dns,
+            default_port: Some(*default_port),
+            allow_special_use_addresses: *allow_special_use_addresses,
+        },
+    }
+}
+
+fn product_proxy_upstream_route_config(
+    upstream: &ProductProxyUpstream,
+) -> Vec<TransparentInterceptionMitmProductProxyUpstreamRouteConfig> {
+    match &upstream.selection {
+        ProductProxyUpstreamSelection::Route { host } => {
+            vec![TransparentInterceptionMitmProductProxyUpstreamRouteConfig {
+                host: host.clone(),
+                target: upstream.target.to_string(),
+            }]
+        }
+        ProductProxyUpstreamSelection::DnsDiscovery { .. } => Vec::new(),
+    }
 }
 
 fn interception_strategy(direction: MitmBridgeDirection) -> TransparentInterceptionStrategyConfig {

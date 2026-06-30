@@ -1,4 +1,3 @@
-use super::tls::SERVER_NAME;
 use crate::e2e::websocket_expectations::{
     FRAME_PAYLOAD, REQUEST_TARGET, RFC_SAMPLE_WEBSOCKET_ACCEPT, RFC_SAMPLE_WEBSOCKET_KEY,
     SUBPROTOCOL,
@@ -8,9 +7,9 @@ pub(super) const TARGET: &str = REQUEST_TARGET;
 pub(super) const SUBPROTOCOL_NAME: &str = SUBPROTOCOL;
 pub(super) const ACCEPT: &str = RFC_SAMPLE_WEBSOCKET_ACCEPT;
 
-pub(super) fn upgrade_request_bytes() -> Vec<u8> {
+pub(super) fn upgrade_request_bytes(server_name: &str) -> Vec<u8> {
     format!(
-        "GET {REQUEST_TARGET} HTTP/1.1\r\nHost: {SERVER_NAME}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: {RFC_SAMPLE_WEBSOCKET_KEY}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: {SUBPROTOCOL}\r\n\r\n"
+        "GET {REQUEST_TARGET} HTTP/1.1\r\nHost: {server_name}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: {RFC_SAMPLE_WEBSOCKET_KEY}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: {SUBPROTOCOL}\r\n\r\n"
     )
     .into_bytes()
 }

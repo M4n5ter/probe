@@ -3,8 +3,8 @@ use std::borrow::Cow;
 use e2e_support::mitm_bridge;
 
 use super::{
-    backend::{MitmBridgeCase, MitmDataPlaneExercise},
-    websocket,
+    case::{MitmBridgeCase, MitmDataPlaneExercise},
+    tls, websocket,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +54,13 @@ impl MitmDataPlaneScenario {
         }
     }
 
+    pub(super) const fn server_name(self) -> &'static str {
+        match self.exercise.product_proxy_server_name() {
+            Some(server_name) => server_name,
+            None => tls::SERVER_NAME,
+        }
+    }
+
     pub(super) fn request_target(self) -> &'static str {
         match self.protocol() {
             MitmDataPlaneProtocol::BridgeHttp => mitm_bridge::REQUEST_TARGET,
@@ -63,8 +70,16 @@ impl MitmDataPlaneScenario {
 
     pub(super) fn request_bytes(self) -> Cow<'static, [u8]> {
         match self.protocol() {
-            MitmDataPlaneProtocol::BridgeHttp => Cow::Borrowed(mitm_bridge::REQUEST_BYTES),
-            MitmDataPlaneProtocol::WebSocket => Cow::Owned(websocket::upgrade_request_bytes()),
+            MitmDataPlaneProtocol::BridgeHttp => {
+                mitm_bridge::request_bytes_for_host(self.server_name())
+            }
+            MitmDataPlaneProtocol::WebSocket => {
+                Cow::Owned(websocket::upgrade_request_bytes(self.server_name()))
+            }
         }
+    }
+
+    pub(super) fn allow_request_bytes(self) -> Cow<'static, [u8]> {
+        mitm_bridge::allow_request_bytes_for_host(self.server_name())
     }
 }

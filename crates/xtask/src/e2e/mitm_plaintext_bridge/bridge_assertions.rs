@@ -1,7 +1,7 @@
 use probe_core::{EventEnvelope, EventKind};
 
 use super::{
-    backend::MitmBridgeCase,
+    case::MitmBridgeCase,
     feed::{EXPECTED_POLICY_VERSION, expected_bridge_policy_alert_message, is_bridge_flow},
 };
 use crate::e2e::harness::e2e_error;

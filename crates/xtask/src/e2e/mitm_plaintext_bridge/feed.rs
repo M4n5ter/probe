@@ -5,7 +5,7 @@ use e2e_support::mitm_bridge;
 use probe_core::{CaptureProviderKind, CaptureSource, Direction, EventEnvelope};
 
 use super::{
-    backend::{MitmBackendKind, MitmBridgeCase},
+    case::{MitmBackendKind, MitmBridgeCase, MitmBridgeDirection},
     data_plane,
 };
 
@@ -74,7 +74,7 @@ pub(super) fn is_product_proxy_allow_request_bytes(
     is_l7_mitm_plaintext_bytes(
         event,
         product_proxy_request_direction(case),
-        mitm_bridge::ALLOW_REQUEST_BYTES,
+        data_plane::scenario(case).allow_request_bytes().as_ref(),
     )
 }
 
@@ -114,8 +114,8 @@ fn is_l7_mitm_plaintext_origin(envelope: &EventEnvelope) -> bool {
 
 pub(super) fn product_proxy_request_direction(case: MitmBridgeCase) -> Direction {
     match case.direction() {
-        super::backend::MitmBridgeDirection::Inbound => Direction::Inbound,
-        super::backend::MitmBridgeDirection::Outbound => Direction::Outbound,
+        MitmBridgeDirection::Inbound => Direction::Inbound,
+        MitmBridgeDirection::Outbound => Direction::Outbound,
     }
 }
 

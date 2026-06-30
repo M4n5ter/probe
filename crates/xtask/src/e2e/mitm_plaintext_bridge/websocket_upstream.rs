@@ -13,7 +13,7 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
 };
 
-use super::{backend::ProductProxyUpstreamRoute, websocket};
+use super::{backend::ProductProxyUpstream, websocket};
 use crate::e2e::harness::e2e_error;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,11 +26,15 @@ pub(super) struct ProductProxyTlsWebSocketUpstreamServer {
 
 impl ProductProxyTlsWebSocketUpstreamServer {
     pub(super) fn start(
-        route: &ProductProxyUpstreamRoute,
+        upstream: &ProductProxyUpstream,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let config = Arc::new(websocket_tls_server_config(route)?);
-        let listener = TcpListener::bind(route.target)?;
-        let thread = thread::spawn(move || serve_websocket_tls_upstream(listener, config));
+        let config = Arc::new(websocket_tls_server_config(upstream)?);
+        let listener = TcpListener::bind(upstream.target)?;
+        let expected_request = websocket::upgrade_request_bytes(&upstream.server_name);
+        let thread = thread::spawn({
+            let expected_request = expected_request.clone();
+            move || serve_websocket_tls_upstream(listener, config, expected_request)
+        });
         Ok(Self {
             thread: Some(thread),
         })
@@ -62,10 +66,10 @@ impl Drop for ProductProxyTlsWebSocketUpstreamServer {
 }
 
 fn websocket_tls_server_config(
-    route: &ProductProxyUpstreamRoute,
+    upstream: &ProductProxyUpstream,
 ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-    let certificate_chain = load_certificate_chain(&route.certificate_path)?;
-    let private_key = load_private_key(&route.private_key_path)?;
+    let certificate_chain = load_certificate_chain(&upstream.certificate_path)?;
+    let private_key = load_private_key(&upstream.private_key_path)?;
     let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     Ok(ServerConfig::builder_with_provider(crypto_provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
@@ -102,6 +106,7 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, Box<dyn std::
 fn serve_websocket_tls_upstream(
     listener: TcpListener,
     config: Arc<ServerConfig>,
+    expected_request: Vec<u8>,
 ) -> UpstreamThreadResult {
     let stream = accept_websocket_tls_upstream_connection(listener)?;
     stream.set_read_timeout(Some(TIMEOUT))?;
@@ -109,7 +114,7 @@ fn serve_websocket_tls_upstream(
     let connection = ServerConnection::new(config)?;
     let mut stream = StreamOwned::new(connection, stream);
     let request = read_websocket_upgrade_request(&mut stream)?;
-    assert_websocket_upstream_received_request(&request)?;
+    assert_websocket_upstream_received_request(&request, &expected_request)?;
     stream.write_all(&websocket::upgrade_response_bytes())?;
     stream.write_all(&websocket::text_frame_bytes())?;
     stream.flush()?;
@@ -166,14 +171,16 @@ fn read_websocket_upgrade_request(
     }
 }
 
-fn assert_websocket_upstream_received_request(request: &[u8]) -> UpstreamThreadResult {
-    let expected = websocket::upgrade_request_bytes();
+fn assert_websocket_upstream_received_request(
+    request: &[u8],
+    expected: &[u8],
+) -> UpstreamThreadResult {
     if request == expected {
         return Ok(());
     }
     Err(e2e_error(format!(
         "expected {:?}, got {:?}",
-        String::from_utf8_lossy(&expected),
+        String::from_utf8_lossy(expected),
         String::from_utf8_lossy(request)
     ))
     .into())

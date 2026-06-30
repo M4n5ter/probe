@@ -1,6 +1,7 @@
 mod assertions;
 mod backend;
 mod bridge_assertions;
+mod case;
 mod config;
 mod data_plane;
 mod feed;
@@ -22,9 +23,8 @@ use assertions::{
     assert_outbound_redirect_reaches_mitm_backend, assert_spool_outputs,
     exercise_l7_mitm_health_transition, exercise_managed_plaintext_data_plane,
 };
-use backend::{
-    MitmBridgeCase, cleanup_managed_backend, prepare_mitm_backend, unused_intercept_port,
-};
+use backend::{cleanup_managed_backend, prepare_mitm_backend, unused_intercept_port};
+use case::{MitmBackendKind, MitmBridgeCase};
 use config::{AgentConfigInputs, fixture_config, write_agent_config, write_policy_bundle};
 use feed::{
     append_bridge_feed_from_harness, expected_libpcap_targets,
@@ -66,6 +66,14 @@ pub(crate) fn run_product_proxy_transparent_https_policy_hook() -> ExitCode {
 
 pub(crate) fn run_product_proxy_outbound_transparent_https_policy_hook() -> ExitCode {
     run_case(MitmBridgeCase::ProductProxyOutboundTransparentHttpsPolicyHook)
+}
+
+pub(crate) fn run_product_proxy_transparent_https_dns_discovery() -> ExitCode {
+    run_case(MitmBridgeCase::ProductProxyTransparentHttpsDnsDiscovery)
+}
+
+pub(crate) fn run_product_proxy_outbound_transparent_https_dns_discovery() -> ExitCode {
+    run_case(MitmBridgeCase::ProductProxyOutboundTransparentHttpsDnsDiscovery)
 }
 
 pub(crate) fn run_product_proxy_transparent_https_websocket() -> ExitCode {
@@ -111,7 +119,7 @@ fn run_outer(case: MitmBridgeCase) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     ensure_e2e_packages_built(["agent", "e2e-fixture"])?;
-    if case.backend() == backend::MitmBackendKind::ProductProxy {
+    if case.backend() == MitmBackendKind::ProductProxy {
         ensure_e2e_packages_built(["mitm-proxy"])?;
     }
     require_root()?;

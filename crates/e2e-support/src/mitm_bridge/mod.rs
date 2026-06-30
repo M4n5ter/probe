@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fs::OpenOptions,
     io::{self, Write},
     path::Path,
@@ -12,6 +13,7 @@ use probe_core::{
 };
 
 pub const FLOW_ID: &str = "mitm_bridge:e2e-flow";
+pub const REQUEST_HOST: &str = "mitm-bridge.e2e.test";
 pub const REQUEST_TARGET: &str = "/mitm-bridge/e2e";
 pub const POLICY_HOOK_METHOD: &str = "POST";
 pub const POLICY_HOOK_PATH: &str = "/mitm-policy-hook";
@@ -29,6 +31,23 @@ pub const PASSTHROUGH_RESPONSE_BYTES: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 pub const DENY_RESPONSE_BYTES: &[u8] =
     b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+pub fn request_bytes_for_host(host: &str) -> Cow<'static, [u8]> {
+    request_bytes_for_host_with_default(REQUEST_TARGET, host, REQUEST_HOST, REQUEST_BYTES)
+}
+
+pub fn allow_request_bytes_for_host(host: &str) -> Cow<'static, [u8]> {
+    request_bytes_for_host_with_default(
+        ALLOW_REQUEST_TARGET,
+        host,
+        REQUEST_HOST,
+        ALLOW_REQUEST_BYTES,
+    )
+}
+
+pub fn http_request_bytes(target: &str, host: &str) -> Vec<u8> {
+    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes()
+}
 
 pub fn create_empty_capture_event_feed(path: &Path) -> Result<(), io::Error> {
     OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -138,5 +157,35 @@ fn timestamp(monotonic_ns: u64) -> Timestamp {
     Timestamp {
         monotonic_ns,
         wall_time_unix_ns: i64::try_from(monotonic_ns).unwrap_or(i64::MAX),
+    }
+}
+
+fn request_bytes_for_host_with_default(
+    target: &'static str,
+    host: &str,
+    default_host: &'static str,
+    default_bytes: &'static [u8],
+) -> Cow<'static, [u8]> {
+    if host == default_host {
+        Cow::Borrowed(default_bytes)
+    } else {
+        Cow::Owned(http_request_bytes(target, host))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_request_bytes_match_builder() {
+        assert_eq!(
+            http_request_bytes(REQUEST_TARGET, REQUEST_HOST),
+            REQUEST_BYTES
+        );
+        assert_eq!(
+            http_request_bytes(ALLOW_REQUEST_TARGET, REQUEST_HOST),
+            ALLOW_REQUEST_BYTES
+        );
     }
 }

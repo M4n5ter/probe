@@ -15,13 +15,11 @@ use signal_hook::{
 use e2e_support::mitm_bridge;
 
 use super::{
-    backend::{
-        MitmBackendConfig, MitmBridgeCase, MitmBridgeDirection, PreparedMitmBackend,
-        ProductProxyUpstreamRoute,
-    },
+    backend::{MitmBackendConfig, PreparedMitmBackend, ProductProxyUpstream},
+    case::{MitmBridgeCase, MitmBridgeDirection},
     data_plane::{self, MitmDataPlaneProtocol},
     feed::product_proxy_deny_response_bytes,
-    tls::{MitmCaMaterial, SERVER_NAME},
+    tls::MitmCaMaterial,
     websocket,
     websocket_upstream::ProductProxyTlsWebSocketUpstreamServer,
 };
@@ -85,9 +83,15 @@ fn exercise_inbound_product_proxy_transparent_tls_path(
     let client_pid = client_namespace.child_mut().id();
     wait_for_client_namespace_ready(client_namespace.child_mut())?;
     let _network = IsolatedClientNetwork::setup(client_pid)?;
-    let upstream_route = product_proxy_upstream_route(mitm_backend)?;
-    let exchange_result = exercise_product_proxy_tls_exchange(case, upstream_route, |request| {
-        run_client_netns_tls_client(client_pid, intercept_port, mitm_ca, request)
+    let upstream = product_proxy_upstream(mitm_backend)?;
+    let exchange_result = exercise_product_proxy_tls_exchange(case, upstream, |request| {
+        run_client_netns_tls_client(
+            client_pid,
+            intercept_port,
+            mitm_ca,
+            &upstream.server_name,
+            request,
+        )
     });
     let client_namespace_result = stop_running_child(
         client_namespace.child_mut(),
@@ -103,15 +107,15 @@ fn exercise_outbound_product_proxy_transparent_tls_path(
     mitm_ca: &MitmCaMaterial,
     mitm_backend: &PreparedMitmBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let upstream_route = product_proxy_upstream_route(mitm_backend)?;
-    exercise_product_proxy_tls_exchange(case, upstream_route, |request| {
-        run_local_tls_client(intercept_port, mitm_ca, request)
+    let upstream = product_proxy_upstream(mitm_backend)?;
+    exercise_product_proxy_tls_exchange(case, upstream, |request| {
+        run_local_tls_client(intercept_port, mitm_ca, &upstream.server_name, request)
     })
 }
 
 fn exercise_product_proxy_tls_exchange(
     case: MitmBridgeCase,
-    upstream_route: &ProductProxyUpstreamRoute,
+    upstream: &ProductProxyUpstream,
     run_client: impl FnMut(&[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let scenario = data_plane::scenario(case);
@@ -124,45 +128,49 @@ fn exercise_product_proxy_tls_exchange(
     }
     match scenario.protocol() {
         MitmDataPlaneProtocol::BridgeHttp => {
-            exercise_product_proxy_http_tls_exchange(upstream_route, run_client)
+            exercise_product_proxy_http_tls_exchange(case, upstream, run_client)
         }
         MitmDataPlaneProtocol::WebSocket => {
-            exercise_product_proxy_websocket_tls_exchange(upstream_route, run_client)
+            exercise_product_proxy_websocket_tls_exchange(case, upstream, run_client)
         }
     }
 }
 
 fn exercise_product_proxy_http_tls_exchange(
-    upstream_route: &ProductProxyUpstreamRoute,
+    case: MitmBridgeCase,
+    upstream: &ProductProxyUpstream,
     mut run_client: impl FnMut(&[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let upstream = ProductProxyTlsUpstreamServer::start(upstream_route)?;
-    let response = run_client(mitm_bridge::ALLOW_REQUEST_BYTES);
-    let upstream_result = upstream.wait();
+    let scenario = data_plane::scenario(case);
+    let upstream_server = ProductProxyTlsUpstreamServer::start(upstream)?;
+    let response = run_client(scenario.allow_request_bytes().as_ref());
+    let upstream_result = upstream_server.wait();
     let response = response?;
     assert_tls_client_received_allow_response(&response)?;
     upstream_result?;
-    let response = run_client(mitm_bridge::REQUEST_BYTES)?;
+    let response = run_client(scenario.request_bytes().as_ref())?;
     assert_tls_client_received_deny_response(&response)
 }
 
 fn exercise_product_proxy_websocket_tls_exchange(
-    upstream_route: &ProductProxyUpstreamRoute,
+    case: MitmBridgeCase,
+    upstream: &ProductProxyUpstream,
     mut run_client: impl FnMut(&[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let upstream = ProductProxyTlsWebSocketUpstreamServer::start(upstream_route)?;
-    let response = run_client(&websocket::upgrade_request_bytes());
-    let upstream_result = upstream.wait();
+    let upstream_server = ProductProxyTlsWebSocketUpstreamServer::start(upstream)?;
+    let request = data_plane::scenario(case).request_bytes();
+    let response = run_client(request.as_ref());
+    let upstream_result = upstream_server.wait();
     let response = response?;
     assert_tls_client_received_websocket_response(&response)?;
     upstream_result
 }
 
-fn product_proxy_upstream_route(
+fn product_proxy_upstream(
     mitm_backend: &PreparedMitmBackend,
-) -> Result<&ProductProxyUpstreamRoute, Box<dyn std::error::Error>> {
+) -> Result<&ProductProxyUpstream, Box<dyn std::error::Error>> {
     match &mitm_backend.config {
-        MitmBackendConfig::ProductProxy { upstream_route, .. } => Ok(upstream_route),
+        MitmBackendConfig::ProductProxy { upstream, .. } => Ok(upstream),
         config => Err(e2e_error(format!(
             "product proxy transparent TLS exercise received non-product backend {config:?}"
         ))
@@ -260,6 +268,7 @@ fn run_client_netns_tls_client(
     client_pid: u32,
     intercept_port: u16,
     mitm_ca: &MitmCaMaterial,
+    server_name: &str,
     request: &[u8],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let connect = format!("{HOST_ADDR}:{intercept_port}");
@@ -272,7 +281,7 @@ fn run_client_netns_tls_client(
             "-connect",
             &connect,
             "-servername",
-            SERVER_NAME,
+            server_name,
             "-CAfile",
         ])
         .arg(&mitm_ca.certificate_path)
@@ -286,6 +295,7 @@ fn run_client_netns_tls_client(
 fn run_local_tls_client(
     intercept_port: u16,
     mitm_ca: &MitmCaMaterial,
+    server_name: &str,
     request: &[u8],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let connect = SocketAddr::from((Ipv4Addr::LOCALHOST, intercept_port)).to_string();
@@ -296,7 +306,7 @@ fn run_local_tls_client(
             "-connect",
             &connect,
             "-servername",
-            SERVER_NAME,
+            server_name,
             "-CAfile",
         ])
         .arg(&mitm_ca.certificate_path)
@@ -335,21 +345,21 @@ struct ProductProxyTlsUpstreamServer {
 }
 
 impl ProductProxyTlsUpstreamServer {
-    fn start(route: &ProductProxyUpstreamRoute) -> Result<Self, Box<dyn std::error::Error>> {
-        let target = route.target.to_string();
+    fn start(upstream: &ProductProxyUpstream) -> Result<Self, Box<dyn std::error::Error>> {
+        let target = upstream.target.to_string();
         let mut child = Command::new(openssl_command()?)
             .args(["s_server", "-accept", &target])
             .arg("-cert")
-            .arg(&route.certificate_path)
+            .arg(&upstream.certificate_path)
             .arg("-key")
-            .arg(&route.private_key_path)
+            .arg(&upstream.private_key_path)
             .args(["-HTTP", "-quiet", "-naccept", "1"])
-            .current_dir(&route.document_root)
+            .current_dir(&upstream.document_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        wait_for_upstream_tls_server_ready(&mut child, route.target)?;
+        wait_for_upstream_tls_server_ready(&mut child, upstream.target)?;
         Ok(Self { child: Some(child) })
     }
 
