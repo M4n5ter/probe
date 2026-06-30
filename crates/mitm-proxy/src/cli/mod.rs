@@ -1,11 +1,19 @@
-use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{
+    net::SocketAddr,
+    num::{NonZeroU16, NonZeroU32},
+    path::PathBuf,
+    time::Duration,
+};
 
 use clap::Parser;
 use probe_core::{ApplicationProtocol, ApplicationProtocolPolicy, Direction};
 
 use crate::{
     MitmProxyError,
-    proxy::{MitmProxyConfig, TargetRecovery, UpstreamTargetRoute, UpstreamTargetRoutes},
+    proxy::{
+        MitmProxyConfig, TargetRecovery, UpstreamDiscovery, UpstreamTargetRoute,
+        UpstreamTargetRoutes,
+    },
     tls::{TlsTerminationConfig, UpstreamTlsConfig},
 };
 
@@ -25,6 +33,12 @@ pub struct Cli {
     pub upstream: Option<SocketAddr>,
     #[arg(long = "upstream-route", value_parser = parse_upstream_route)]
     pub upstream_routes: Vec<UpstreamTargetRoute>,
+    #[arg(long)]
+    pub upstream_dns_discovery: bool,
+    #[arg(long, value_parser = parse_nonzero_u16)]
+    pub upstream_dns_default_port: Option<NonZeroU16>,
+    #[arg(long)]
+    pub upstream_dns_allow_special_use_addresses: bool,
     #[arg(long)]
     pub upstream_tls: bool,
     #[arg(long)]
@@ -118,6 +132,29 @@ impl TryFrom<Cli> for MitmProxyConfig {
         let upstream_tls = value.upstream_tls.then(|| {
             UpstreamTlsConfig::new(value.upstream_trust_anchor, value.upstream_server_name)
         });
+        if !value.upstream_dns_discovery
+            && (value.upstream_dns_default_port.is_some()
+                || value.upstream_dns_allow_special_use_addresses)
+        {
+            return Err(MitmProxyError::InvalidConfig(
+                "upstream DNS discovery fields require upstream_dns_discovery = true".to_string(),
+            ));
+        }
+        if value.upstream.is_some()
+            && (!value.upstream_routes.is_empty() || value.upstream_dns_discovery)
+        {
+            return Err(MitmProxyError::InvalidConfig(
+                "upstream cannot be combined with upstream routes or DNS discovery".to_string(),
+            ));
+        }
+        let upstream_discovery = if value.upstream_dns_discovery {
+            UpstreamDiscovery::Dns {
+                default_port: value.upstream_dns_default_port,
+                allow_special_use_addresses: value.upstream_dns_allow_special_use_addresses,
+            }
+        } else {
+            UpstreamDiscovery::Disabled
+        };
         let upstream_routes = UpstreamTargetRoutes::from_routes(value.upstream_routes)?;
         let application_protocols = if value.alpn.is_empty() {
             ApplicationProtocolPolicy::default()
@@ -132,6 +169,7 @@ impl TryFrom<Cli> for MitmProxyConfig {
             pid_file: value.pid_file,
             upstream: value.upstream,
             upstream_routes,
+            upstream_discovery,
             upstream_tls,
             upstream_socket_mark: value.upstream_socket_mark,
             tls,
@@ -192,6 +230,13 @@ fn parse_socket_mark(value: &str) -> Result<NonZeroU32, String> {
         .map_or_else(|| value.parse::<u32>(), |hex| u32::from_str_radix(hex, 16))
         .map_err(|error| format!("invalid socket mark {value:?}: {error}"))?;
     NonZeroU32::new(mark).ok_or_else(|| "socket mark must be non-zero".to_string())
+}
+
+fn parse_nonzero_u16(value: &str) -> Result<NonZeroU16, String> {
+    value
+        .parse::<u16>()
+        .map_err(|error| format!("invalid non-zero u16 value {value:?}: {error}"))
+        .and_then(|port| NonZeroU16::new(port).ok_or_else(|| "value must be non-zero".to_string()))
 }
 
 fn parse_application_protocol(value: &str) -> Result<ApplicationProtocol, String> {
@@ -360,6 +405,93 @@ mod tests {
     }
 
     #[test]
+    fn upstream_dns_discovery_builds_resolver_config() {
+        let config = MitmProxyConfig::try_from(Cli {
+            upstream_dns_discovery: true,
+            upstream_dns_default_port: Some(NonZeroU16::new(443).expect("non-zero port")),
+            ..minimal_cli()
+        })
+        .expect("DNS discovery config should parse");
+
+        assert_eq!(
+            config.upstream_discovery,
+            UpstreamDiscovery::Dns {
+                default_port: NonZeroU16::new(443),
+                allow_special_use_addresses: false
+            }
+        );
+    }
+
+    #[test]
+    fn upstream_dns_special_use_policy_is_explicit() {
+        let config = MitmProxyConfig::try_from(Cli {
+            upstream_dns_discovery: true,
+            upstream_dns_allow_special_use_addresses: true,
+            ..minimal_cli()
+        })
+        .expect("DNS discovery config should parse");
+
+        assert_eq!(
+            config.upstream_discovery,
+            UpstreamDiscovery::Dns {
+                default_port: None,
+                allow_special_use_addresses: true
+            }
+        );
+    }
+
+    #[test]
+    fn upstream_dns_default_port_requires_discovery_mode() {
+        for cli in [
+            Cli {
+                upstream_dns_default_port: Some(NonZeroU16::new(443).expect("non-zero port")),
+                ..minimal_cli()
+            },
+            Cli {
+                upstream_dns_allow_special_use_addresses: true,
+                ..minimal_cli()
+            },
+        ] {
+            let error = MitmProxyConfig::try_from(cli)
+                .expect_err("dangling DNS discovery fields should be rejected");
+            assert!(
+                matches!(error, MitmProxyError::InvalidConfig(reason) if reason.contains("upstream_dns_discovery"))
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_dns_default_port_rejects_zero() {
+        let error = parse_nonzero_u16("0").expect_err("zero DNS default port should be rejected");
+
+        assert!(error.contains("non-zero"));
+    }
+
+    #[test]
+    fn fixed_upstream_rejects_route_and_dns_discovery_combinations() {
+        let route = parse_upstream_route("Example.Test=127.0.0.1:8443")
+            .expect("route argument should parse");
+        for cli in [
+            Cli {
+                upstream: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 8443))),
+                upstream_routes: vec![route],
+                ..minimal_cli()
+            },
+            Cli {
+                upstream: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 8443))),
+                upstream_dns_discovery: true,
+                ..minimal_cli()
+            },
+        ] {
+            let error =
+                MitmProxyConfig::try_from(cli).expect_err("ambiguous upstream config must fail");
+            assert!(
+                matches!(error, MitmProxyError::InvalidConfig(reason) if reason.contains("cannot be combined"))
+            );
+        }
+    }
+
+    #[test]
     fn upstream_routes_build_route_table() {
         let route = parse_upstream_route("Example.Test=127.0.0.1:8443")
             .expect("route argument should parse");
@@ -451,6 +583,9 @@ mod tests {
             pid_file: None,
             upstream: None,
             upstream_routes: Vec::new(),
+            upstream_dns_discovery: false,
+            upstream_dns_default_port: None,
+            upstream_dns_allow_special_use_addresses: false,
             upstream_tls: false,
             upstream_trust_anchor: Vec::new(),
             upstream_server_name: None,

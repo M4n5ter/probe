@@ -786,6 +786,67 @@ mod tests {
     }
 
     #[test]
+    fn product_proxy_accepts_upstream_dns_discovery() {
+        let mut violations = Vec::new();
+        let mut interception = product_proxy_interception();
+        let TransparentInterceptionMitmBackendConfig::ProductProxy { process, .. } =
+            &mut interception.mitm.backend
+        else {
+            panic!("test fixture should use product proxy");
+        };
+        process.upstream_discovery =
+            crate::TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig {
+                mode:
+                    crate::TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig::Dns,
+                default_port: std::num::NonZeroU16::new(443),
+                allow_special_use_addresses: true,
+            };
+
+        validate(&interception, &tls_config_with_mitm_leaf(), &mut violations);
+        let intent = interception
+            .mitm_backend_intent()
+            .expect("valid product proxy DNS discovery should produce an intent");
+
+        let crate::TransparentInterceptionMitmBackendIntent::ProductProxy { process, .. } = intent
+        else {
+            panic!("expected product proxy intent");
+        };
+        assert!(violations.is_empty(), "{violations:?}");
+        assert_eq!(
+            process.upstream_discovery,
+            crate::TransparentInterceptionMitmProductProxyUpstreamDiscoveryIntent::Dns {
+                default_port: std::num::NonZeroU16::new(443),
+                allow_special_use_addresses: true
+            }
+        );
+    }
+
+    #[test]
+    fn product_proxy_rejects_dangling_upstream_dns_default_port() {
+        let mut violations = Vec::new();
+        let mut interception = product_proxy_interception();
+        let TransparentInterceptionMitmBackendConfig::ProductProxy { process, .. } =
+            &mut interception.mitm.backend
+        else {
+            panic!("test fixture should use product proxy");
+        };
+        process.upstream_discovery =
+            crate::TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig {
+                mode:
+                    crate::TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig::None,
+                default_port: std::num::NonZeroU16::new(443),
+                allow_special_use_addresses: false,
+            };
+
+        validate(&interception, &tls_config_with_mitm_leaf(), &mut violations);
+
+        assert!(violations.iter().any(|violation| {
+            violation.field == "enforcement.interception.mitm.backend.process.upstream_discovery"
+                && violation.reason.contains("mode = \"dns\"")
+        }));
+    }
+
+    #[test]
     fn product_proxy_rejects_empty_application_protocols() {
         let mut violations = Vec::new();
         let mut interception = product_proxy_interception();
@@ -947,6 +1008,8 @@ mod tests {
                         program: Some("/usr/local/bin/traffic-probe-mitm-proxy".into()),
                         working_dir: Some("/run/traffic-probe".into()),
                         application_protocols: None,
+                        upstream_discovery:
+                            crate::TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig::default(),
                         upstream_routes: Vec::new(),
                     },
                 ),

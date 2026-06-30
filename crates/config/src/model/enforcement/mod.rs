@@ -38,6 +38,9 @@ pub use mitm::{
     TransparentInterceptionMitmPolicyHookEndpointIntent,
     TransparentInterceptionMitmPolicyHookIntent, TransparentInterceptionMitmPolicyHookModeConfig,
     TransparentInterceptionMitmProductProxyConfig, TransparentInterceptionMitmProductProxyIntent,
+    TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig,
+    TransparentInterceptionMitmProductProxyUpstreamDiscoveryIntent,
+    TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig,
     TransparentInterceptionMitmProductProxyUpstreamRouteConfig,
     TransparentInterceptionMitmProductProxyUpstreamRouteIntent,
 };

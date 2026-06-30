@@ -41,6 +41,7 @@ use crate::{
 use self::downstream::{DownstreamAcceptor, DownstreamStream};
 use self::listener::ProxyListeners;
 use self::policy_hook::spawn_policy_hook_listener;
+use self::route::upstream_targets_for_request;
 use self::tunnel::relay_upgraded_tunnel;
 use self::upstream::UpstreamConnector;
 
@@ -54,6 +55,7 @@ pub struct MitmProxyConfig {
     pub pid_file: Option<PathBuf>,
     pub upstream: Option<SocketAddr>,
     pub upstream_routes: UpstreamTargetRoutes,
+    pub upstream_discovery: UpstreamDiscovery,
     pub upstream_tls: Option<UpstreamTlsConfig>,
     pub upstream_socket_mark: Option<NonZeroU32>,
     pub tls: Option<TlsTerminationConfig>,
@@ -67,7 +69,7 @@ pub struct MitmProxyConfig {
     pub action_timeout: Duration,
 }
 
-pub use self::route::{UpstreamTargetRoute, UpstreamTargetRoutes};
+pub use self::route::{UpstreamDiscovery, UpstreamTargetRoute, UpstreamTargetRoutes};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum TargetRecovery {
@@ -202,6 +204,13 @@ fn validate_config(config: &MitmProxyConfig) -> Result<(), MitmProxyError> {
     if config.max_request_bytes == 0 {
         return Err(MitmProxyError::InvalidConfig(
             "max_request_bytes must be greater than zero".to_string(),
+        ));
+    }
+    if config.upstream.is_some()
+        && (!config.upstream_routes.is_empty() || config.upstream_discovery.is_enabled())
+    {
+        return Err(MitmProxyError::InvalidConfig(
+            "fixed upstream cannot be combined with upstream routes or DNS discovery".to_string(),
         ));
     }
     for (host, target) in config.upstream_routes.iter() {
@@ -483,19 +492,33 @@ fn forward_or_gateway_response(
                 .map(|()| DownstreamDisposition::Close);
         }
     };
-    let target = match upstream_target_for_request(config, target, authority) {
-        Ok(target) => target,
+    let targets = match upstream_targets_for_request(
+        target,
+        authority,
+        &config.upstream_routes,
+        config.upstream_discovery,
+    ) {
+        Ok(targets) => targets,
         Err(_) => {
             return write_generated_empty_response(downstream, state, flow, offsets, 502)
                 .map(|()| DownstreamDisposition::Close);
         }
     };
-    if socket_addr_points_to_listener(target, config.listen) {
+    if targets
+        .iter()
+        .all(|target| socket_addr_points_to_listener(*target, config.listen))
+    {
         return write_generated_empty_response(downstream, state, flow, offsets, 200)
             .map(|()| DownstreamDisposition::Close);
     }
-    match state.upstream.connect(target, authority, config.io_timeout) {
-        Ok(mut upstream) => {
+    match state.upstream.connect_first(
+        targets
+            .into_iter()
+            .filter(|target| !socket_addr_points_to_listener(*target, config.listen)),
+        authority,
+        config.io_timeout,
+    ) {
+        Ok(Some(mut upstream)) => {
             upstream
                 .write_all(&request.raw)
                 .map_err(io_error("write MITM proxy upstream request"))?;
@@ -539,23 +562,9 @@ fn forward_or_gateway_response(
                 ),
             }
         }
-        Err(_) => write_generated_empty_response(downstream, state, flow, offsets, 502)
+        Ok(None) | Err(_) => write_generated_empty_response(downstream, state, flow, offsets, 502)
             .map(|()| DownstreamDisposition::Close),
     }
-}
-
-fn upstream_target_for_request(
-    config: &MitmProxyConfig,
-    recovered_target: SocketAddr,
-    authority: ObservedAuthority<'_>,
-) -> Result<SocketAddr, MitmProxyError> {
-    if config.upstream_routes.is_empty() {
-        return Ok(recovered_target);
-    }
-    Ok(config
-        .upstream_routes
-        .target_for_observed_authority(authority)?
-        .unwrap_or(recovered_target))
 }
 
 fn observed_authority_for_request<'a>(
@@ -567,7 +576,9 @@ fn observed_authority_for_request<'a>(
     ObservedAuthority::from_request(
         downstream_tls_server_name,
         request,
-        !config.upstream_routes.is_empty() || upstream.uses_tls(),
+        !config.upstream_routes.is_empty()
+            || config.upstream_discovery.is_enabled()
+            || upstream.uses_tls(),
     )
 }
 
@@ -636,11 +647,12 @@ mod tests {
         fs,
         io::{Read, Write},
         net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+        num::NonZeroU16,
         thread,
         time::Duration,
     };
 
-    use probe_core::Direction;
+    use probe_core::{ApplicationProtocolPolicy, Direction};
     use tempfile::tempdir;
 
     use super::fixtures::*;
@@ -1448,30 +1460,21 @@ mod tests {
     }
 
     #[test]
-    fn upstream_route_miss_falls_back_for_unsupported_http_authority() -> Result<(), Box<dyn Error>>
-    {
+    fn upstream_dns_discovery_uses_observed_http_host() -> Result<(), Box<dyn Error>> {
         let root = tempdir()?;
         let feed_path = root.path().join("mitm-feed.jsonl");
-        let fallback_target =
-            upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nfallback")?;
+        let upstream = upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nresolved")?;
         let data_listener = bound_loopback_listener()?;
         let listen = data_listener.local_addr()?;
-        let mut config = test_config(
-            listen,
-            &feed_path,
-            Some(fallback_target),
-            None,
-            None,
-            Duration::from_secs(2),
-        );
-        config.upstream_routes = UpstreamTargetRoutes::from_routes([UpstreamTargetRoute::new(
-            "Route.Example",
-            "127.0.0.1:8443".parse()?,
-        )?])?;
+        let mut config = test_config(listen, &feed_path, None, None, None, Duration::from_secs(2));
+        config.upstream_discovery = UpstreamDiscovery::Dns {
+            default_port: NonZeroU16::new(upstream.port()),
+            allow_special_use_addresses: true,
+        };
         let guard = start_test_proxy(config, data_listener, None)?;
 
         let mut stream = TcpStream::connect(listen)?;
-        stream.write_all(b"GET /fallback HTTP/1.1\r\nHost: [::1]:8443\r\n\r\n")?;
+        stream.write_all(b"GET /dns HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")?;
         stream.shutdown(Shutdown::Write)?;
         let mut response = Vec::new();
         stream.read_to_end(&mut response)?;
@@ -1479,7 +1482,74 @@ mod tests {
 
         assert_eq!(
             String::from_utf8_lossy(&response),
-            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nfallback"
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nresolved"
+        );
+        assert!(feed_has_bytes(
+            &feed_path,
+            Direction::Outbound,
+            b"GET /dns HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_upstream_route_takes_precedence_over_dns_discovery() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let dns_target = upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ndns")?;
+        let route_target = upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nroute")?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let mut config = test_config(listen, &feed_path, None, None, None, Duration::from_secs(2));
+        config.upstream_discovery = UpstreamDiscovery::Dns {
+            default_port: NonZeroU16::new(dns_target.port()),
+            allow_special_use_addresses: true,
+        };
+        config.upstream_routes = UpstreamTargetRoutes::from_routes([UpstreamTargetRoute::new(
+            "localhost",
+            route_target,
+        )?])?;
+        let guard = start_test_proxy(config, data_listener, None)?;
+
+        let mut stream = TcpStream::connect(listen)?;
+        stream.write_all(b"GET /route-first HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nroute"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_connect_tries_next_candidate_after_failure() -> Result<(), Box<dyn Error>> {
+        let upstream = upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnext")?;
+        let unreachable_listener = bound_loopback_listener()?;
+        let unreachable = unreachable_listener.local_addr()?;
+        assert_ne!(unreachable, upstream);
+        drop(unreachable_listener);
+        let connector =
+            UpstreamConnector::from_config(None, None, &ApplicationProtocolPolicy::default())?;
+        let mut connection = connector
+            .connect_first(
+                [unreachable, upstream],
+                ObservedAuthority::from_parts(None, None),
+                Duration::from_millis(200),
+            )?
+            .expect("second candidate should connect");
+
+        connection.write_all(b"GET /candidate HTTP/1.1\r\nHost: example.test\r\n\r\n")?;
+        connection.finish_request()?;
+        let mut response = Vec::new();
+        connection.read_to_end(&mut response)?;
+
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnext"
         );
         Ok(())
     }

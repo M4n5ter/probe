@@ -210,6 +210,7 @@ pub struct TransparentInterceptionMitmProductProxyConfig {
     pub program: Option<PathBuf>,
     pub working_dir: Option<PathBuf>,
     pub application_protocols: Option<Vec<ApplicationProtocol>>,
+    pub upstream_discovery: TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig,
     pub upstream_routes: Vec<TransparentInterceptionMitmProductProxyUpstreamRouteConfig>,
 }
 
@@ -218,8 +219,33 @@ impl TransparentInterceptionMitmProductProxyConfig {
         self.program.is_some()
             || self.working_dir.is_some()
             || self.application_protocols.is_some()
+            || self.upstream_discovery.is_configured()
             || !self.upstream_routes.is_empty()
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig {
+    pub mode: TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig,
+    pub default_port: Option<NonZeroU16>,
+    pub allow_special_use_addresses: bool,
+}
+
+impl TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig {
+    pub fn is_configured(&self) -> bool {
+        self.mode != TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig::None
+            || self.default_port.is_some()
+            || self.allow_special_use_addresses
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig {
+    #[default]
+    None,
+    Dns,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,7 +348,17 @@ pub struct TransparentInterceptionMitmProductProxyIntent {
     pub program: PathBuf,
     pub working_dir: Option<PathBuf>,
     pub application_protocols: ApplicationProtocolPolicy,
+    pub upstream_discovery: TransparentInterceptionMitmProductProxyUpstreamDiscoveryIntent,
     pub upstream_routes: Vec<TransparentInterceptionMitmProductProxyUpstreamRouteIntent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransparentInterceptionMitmProductProxyUpstreamDiscoveryIntent {
+    Disabled,
+    Dns {
+        default_port: Option<NonZeroU16>,
+        allow_special_use_addresses: bool,
+    },
 }
 
 pub type TransparentInterceptionMitmProductProxyUpstreamRouteIntent = UpstreamRoute;
@@ -575,10 +611,13 @@ fn validate_mitm_product_proxy_process(
         "enforcement.interception.mitm.backend.process.application_protocols",
         violations,
     )?;
+    let upstream_discovery =
+        validate_mitm_product_proxy_upstream_discovery(&process.upstream_discovery, violations)?;
     Some(TransparentInterceptionMitmProductProxyIntent {
         program,
         working_dir: process.working_dir.clone(),
         application_protocols,
+        upstream_discovery,
         upstream_routes,
     })
 }
@@ -597,6 +636,30 @@ fn validate_mitm_product_proxy_application_protocols(
                 None
             }
         },
+    }
+}
+
+fn validate_mitm_product_proxy_upstream_discovery(
+    discovery: &TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) -> Option<TransparentInterceptionMitmProductProxyUpstreamDiscoveryIntent> {
+    match discovery.mode {
+        TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig::None => {
+            if discovery.default_port.is_some() || discovery.allow_special_use_addresses {
+                violations.push(intent_violation(
+                    "enforcement.interception.mitm.backend.process.upstream_discovery",
+                    "product MITM proxy upstream DNS discovery fields require upstream_discovery.mode = \"dns\"",
+                ));
+                return None;
+            }
+            Some(TransparentInterceptionMitmProductProxyUpstreamDiscoveryIntent::Disabled)
+        }
+        TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig::Dns => Some(
+            TransparentInterceptionMitmProductProxyUpstreamDiscoveryIntent::Dns {
+                default_port: discovery.default_port,
+                allow_special_use_addresses: discovery.allow_special_use_addresses,
+            },
+        ),
     }
 }
 

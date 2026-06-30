@@ -20,7 +20,8 @@ use rustls::{
 };
 
 use super::{
-    MitmProxyConfig, MitmProxyGuard, ProxyListeners, TargetRecovery, UpstreamTargetRoutes,
+    MitmProxyConfig, MitmProxyGuard, ProxyListeners, TargetRecovery, UpstreamDiscovery,
+    UpstreamTargetRoutes,
 };
 use crate::{http::read_http_message, tls::TlsTerminationConfig};
 
@@ -48,6 +49,7 @@ pub(super) fn test_config(
         pid_file: None,
         upstream,
         upstream_routes: UpstreamTargetRoutes::default(),
+        upstream_discovery: UpstreamDiscovery::Disabled,
         upstream_tls: None,
         upstream_socket_mark: None,
         tls,

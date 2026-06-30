@@ -326,13 +326,18 @@ mode = "product_proxy"
 [enforcement.interception.mitm.backend.readiness_probe]
 target = "127.0.0.1:15002"
 
-[enforcement.interception.mitm.backend.process]
-program = "/usr/local/bin/traffic-probe-mitm-proxy"
-working_dir = "/run/traffic-probe"
-application_protocols = ["http1"]
+	[enforcement.interception.mitm.backend.process]
+	program = "/usr/local/bin/traffic-probe-mitm-proxy"
+	working_dir = "/run/traffic-probe"
+	application_protocols = ["http1"]
 
-[[enforcement.interception.mitm.backend.process.upstream_routes]]
-host = "Route.Example"
+	[enforcement.interception.mitm.backend.process.upstream_discovery]
+	mode = "dns"
+	default_port = 443
+	allow_special_use_addresses = true
+
+	[[enforcement.interception.mitm.backend.process.upstream_routes]]
+	host = "Route.Example"
 target = "127.0.0.1:18443"
 
 [[tls.materials]]
@@ -366,6 +371,15 @@ path = "/etc/traffic-probe/mitm-leaf.key"
         process.application_protocols,
         Some(vec![ApplicationProtocol::Http1])
     );
+    assert_eq!(
+        process.upstream_discovery.mode,
+        TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig::Dns
+    );
+    assert_eq!(
+        process.upstream_discovery.default_port,
+        std::num::NonZeroU16::new(443)
+    );
+    assert!(process.upstream_discovery.allow_special_use_addresses);
     assert_eq!(process.upstream_routes.len(), 1);
     assert_eq!(process.upstream_routes[0].host, "Route.Example");
     assert_eq!(process.upstream_routes[0].target, "127.0.0.1:18443");

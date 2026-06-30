@@ -2,7 +2,7 @@ use std::{
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpStream},
     num::NonZeroU32,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use probe_core::ApplicationProtocolPolicy;
@@ -14,6 +14,8 @@ use crate::{
     error::io_error,
     tls::{TlsClientStream, TlsUpstreamConnector, UpstreamTlsConfig},
 };
+
+const MAX_UPSTREAM_CONNECT_CANDIDATES: usize = 8;
 
 pub(crate) struct UpstreamConnector {
     tls: Option<TlsUpstreamConnector>,
@@ -54,6 +56,32 @@ impl UpstreamConnector {
                 .map(Box::new)
                 .map(UpstreamConnection::Tls),
             None => Ok(UpstreamConnection::Plain(stream)),
+        }
+    }
+
+    pub(crate) fn connect_first(
+        &self,
+        targets: impl IntoIterator<Item = SocketAddr>,
+        authority: ObservedAuthority<'_>,
+        timeout: Duration,
+    ) -> Result<Option<UpstreamConnection>, MitmProxyError> {
+        let mut last_error = None;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        for target in targets.into_iter().take(MAX_UPSTREAM_CONNECT_CANDIDATES) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining == Duration::ZERO {
+                break;
+            }
+            match self.connect(target, authority, remaining) {
+                Ok(connection) => return Ok(Some(connection)),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(None),
         }
     }
 

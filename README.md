@@ -108,11 +108,16 @@ CA-backed dynamic certificate mode requires downstream TLS clients to send DNS
 SNI. When upstream TLS is enabled, the product proxy uses that SNI as the
 upstream TLS server name unless an explicit upstream server name is pinned; it
 can also use the reconciled SNI or HTTP Host to select an explicit
-host-to-upstream route. Host/SNI mismatches fail closed, and route misses fall
-back to the configured or recovered target.
+host-to-upstream route. A configured fixed upstream cannot be combined with
+route tables or DNS discovery; route tables may use DNS discovery as an
+explicit fallback.
+Host/SNI mismatches fail closed; in route mode, route misses may fall through
+explicit opt-in DNS upstream discovery before falling back to the recovered
+target. DNS discovery rejects IANA special-purpose/special-use address ranges
+by default unless the operator explicitly allows them.
 The first-party `product_proxy` backend derives its proxy CLI from typed MITM
 readiness, bridge, policy hook, CA or leaf TLS material refs, upstream trust
-material refs, and host route tables.
+material refs, host route tables, and upstream discovery policy.
 
 This keeps MITM out of the default capture path while still allowing operators
 to build controlled proxy/MITM deployments with auditable boundaries.
@@ -130,9 +135,11 @@ The following are intentional boundaries of the current implementation:
 - Transparent inbound and outbound HTTPS MITM are covered for product proxy
   routed allow and deny paths. Product proxy TLS advertises and gates HTTP/1.1
   ALPN. Exact and suffix-wildcard upstream routes are supported;
-  ALPN-based multi-protocol routing, DNS-discovered upstream route selection,
-  strong original attribution, automatic trust-store mutation, and non-HTTP
-  transparent allow-path matrices remain explicit capability boundaries.
+  explicit opt-in DNS upstream discovery is supported at the product proxy data
+  plane with IANA special-purpose/special-use address filtering enabled by
+  default. ALPN-based multi-protocol routing, strong original attribution,
+  automatic trust-store mutation, and non-HTTP transparent allow-path matrices
+  remain explicit capability boundaries.
 - No hidden long-term raw traffic retention.
 - No HTTP/2, HTTP/3, or QUIC parser yet.
 - WebSocket support emits handoff, frame metadata, and 16 MiB bounded
