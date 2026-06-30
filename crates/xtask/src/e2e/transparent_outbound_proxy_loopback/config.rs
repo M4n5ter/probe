@@ -1,36 +1,46 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use probe_config::{
-    AgentConfig, CaptureSelection, CompressionCodecName, ExportFailureBackoffConfig,
-    ExportWorkerScheduleConfig, ExporterConfig, ExporterTransportConfig, PolicyConfig,
-    TransparentInterceptionProxyConfig, TransparentInterceptionProxyModeConfig,
-    TransparentInterceptionStrategyConfig,
+    AgentConfig, CaptureSelection, CompressionCodecName, EnforcementPolicyManifest,
+    EnforcementPolicySourceConfig, ExportFailureBackoffConfig, ExportWorkerScheduleConfig,
+    ExporterConfig, ExporterTransportConfig, PolicyConfig, TransparentInterceptionProxyConfig,
+    TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
 };
-use probe_core::{Direction, EnforcementMode, ProcessSelector, Selector, TrafficSelector};
+use probe_core::{
+    Action, Direction, EnforcementMode, ProcessSelector, ProtectiveActionProfile, Selector,
+    TrafficSelector,
+};
 
 use super::{LOOPBACK_ADDR, OutboundProxyE2eCase, OutboundProxyE2eMode, PROXY_PORT, UPSTREAM_PORT};
 
 const COLLECTOR_SINK: &str = "collector";
 const POLICY_ID: &str = "outbound-proxy-e2e-policy";
 const POLICY_VERSION: &str = "e2e";
+const ENFORCEMENT_MANIFEST_ID: &str = "e2e-transparent-outbound-enforcement";
+const ENFORCEMENT_MANIFEST_VERSION: &str = "e2e";
 
 pub(super) enum PolicySourceFixture<'a> {
     LocalDirectory(&'a Path),
     RemoteBundle { endpoint: String, listen_port: u16 },
 }
 
+pub(super) struct AgentConfigInputs<'a> {
+    pub(super) path: &'a Path,
+    pub(super) spool_path: &'a Path,
+    pub(super) admin_socket_path: &'a Path,
+    pub(super) enforcement_manifest_path: &'a Path,
+    pub(super) policy_source: PolicySourceFixture<'a>,
+    pub(super) webhook_endpoint: String,
+    pub(super) remote_ports: &'a [u16],
+    pub(super) case: OutboundProxyE2eCase,
+}
+
 pub(super) fn write_agent_config(
-    path: &Path,
-    spool_path: &Path,
-    admin_socket_path: &Path,
-    policy_source: PolicySourceFixture<'_>,
-    webhook_endpoint: String,
-    remote_ports: &[u16],
-    case: OutboundProxyE2eCase,
+    inputs: AgentConfigInputs<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = AgentConfig {
-        agent_id: case.agent_id.to_string(),
-        config_version: case.case_name.to_string(),
+        agent_id: inputs.case.agent_id.to_string(),
+        config_version: inputs.case.case_name.to_string(),
         ..AgentConfig::default()
     };
     config.capture.selection = CaptureSelection::Libpcap;
@@ -38,7 +48,7 @@ pub(super) fn write_agent_config(
     config.capture.libpcap.bpf_filter =
         format!("tcp and (port {UPSTREAM_PORT} or port {PROXY_PORT})");
     config.capture.libpcap.read_timeout_ms = 100;
-    config.storage.path = spool_path.to_path_buf();
+    config.storage.path = inputs.spool_path.to_path_buf();
     config.export.worker.enabled = true;
     config.export.worker.schedule = ExportWorkerScheduleConfig::FixedIntervalBounded {
         interval_ms: 100,
@@ -53,10 +63,10 @@ pub(super) fn write_agent_config(
     config.exporters.push(ExporterConfig {
         id: COLLECTOR_SINK.to_string(),
         transport: ExporterTransportConfig::Webhook {
-            endpoint: webhook_endpoint,
+            endpoint: inputs.webhook_endpoint,
             headers: BTreeMap::from([(
                 "x-traffic-probe-e2e".to_string(),
-                case.header_value.to_string(),
+                inputs.case.header_value.to_string(),
             )]),
             tls: Default::default(),
         },
@@ -64,10 +74,10 @@ pub(super) fn write_agent_config(
         worker: Default::default(),
     });
     config.admin.enabled = true;
-    config.admin.socket_path = admin_socket_path.to_path_buf();
+    config.admin.socket_path = inputs.admin_socket_path.to_path_buf();
     config.policies.push(PolicyConfig {
         id: POLICY_ID.to_string(),
-        source: match policy_source {
+        source: match inputs.policy_source {
             PolicySourceFixture::LocalDirectory(path) => {
                 probe_config::PolicySourceConfig::LocalDirectory {
                     path: path.to_path_buf(),
@@ -84,9 +94,30 @@ pub(super) fn write_agent_config(
         selector: None,
     });
     config.enforcement.mode = EnforcementMode::Enforce;
+    let selector = Selector::term(
+        process_selector(inputs.case.proxy_mode),
+        TrafficSelector {
+            remote_ports: inputs.remote_ports.to_vec(),
+            directions: vec![Direction::Outbound],
+            remote_addresses: vec![LOOPBACK_ADDR.to_string()],
+            ..TrafficSelector::default()
+        },
+    );
+    super::super::enforcement_manifest::write_enforcement_policy_manifest(
+        inputs.enforcement_manifest_path,
+        &EnforcementPolicyManifest {
+            id: ENFORCEMENT_MANIFEST_ID.to_string(),
+            version: ENFORCEMENT_MANIFEST_VERSION.to_string(),
+            selector: None,
+            protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
+        },
+    )?;
+    config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+        path: inputs.enforcement_manifest_path.to_path_buf(),
+    };
     config.enforcement.interception.strategy =
         TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
-    config.enforcement.interception.proxy = match case.proxy_mode {
+    config.enforcement.interception.proxy = match inputs.case.proxy_mode {
         OutboundProxyE2eMode::ManagedRelay | OutboundProxyE2eMode::OwnerScopedManagedRelay => {
             TransparentInterceptionProxyConfig {
                 mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
@@ -102,16 +133,8 @@ pub(super) fn write_agent_config(
             ..TransparentInterceptionProxyConfig::default()
         },
     };
-    config.enforcement.interception.selector = Some(Selector::term(
-        process_selector(case.proxy_mode),
-        TrafficSelector {
-            remote_ports: remote_ports.to_vec(),
-            directions: vec![Direction::Outbound],
-            remote_addresses: vec![LOOPBACK_ADDR.to_string()],
-            ..TrafficSelector::default()
-        },
-    ));
-    fs::write(path, toml::to_string(&config)?)?;
+    config.enforcement.interception.selector = Some(selector);
+    fs::write(inputs.path, toml::to_string(&config)?)?;
     Ok(())
 }
 

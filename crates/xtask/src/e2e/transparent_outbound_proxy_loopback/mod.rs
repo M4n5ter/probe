@@ -22,7 +22,7 @@ use assertions::{
 };
 use commands::{ip, require_root};
 use config::{
-    PolicySourceFixture, redirected_remote_ports, remote_policy_bundle_document,
+    AgentConfigInputs, PolicySourceFixture, redirected_remote_ports, remote_policy_bundle_document,
     write_agent_config, write_policy_bundle,
 };
 use fixtures::{ProxyFixture, ProxyFixtureReport, UpstreamReport, UpstreamServer, run_client};
@@ -194,6 +194,7 @@ fn run_at(root: &Path, case: OutboundProxyE2eCase) -> Result<(), Box<dyn std::er
     let admin_socket_path = root.join("admin.sock");
     let ready_socket_path = root.join("agent.ready.sock");
     let policy_path = root.join("outbound-proxy-e2e-policy.bundle");
+    let enforcement_manifest_path = root.join("enforcement.toml");
 
     let (policy_source, remote_policy_source) = prepare_policy_source(case, &policy_path)?;
     let webhook_receiver = WebhookBatchReceiver::spawn()?;
@@ -202,15 +203,16 @@ fn run_at(root: &Path, case: OutboundProxyE2eCase) -> Result<(), Box<dyn std::er
         webhook_receiver.listen_port(),
         &policy_source,
     );
-    write_agent_config(
-        &config_path,
-        &spool_path,
-        &admin_socket_path,
+    write_agent_config(AgentConfigInputs {
+        path: &config_path,
+        spool_path: &spool_path,
+        admin_socket_path: &admin_socket_path,
+        enforcement_manifest_path: &enforcement_manifest_path,
         policy_source,
-        webhook_receiver.endpoint(),
-        &remote_ports,
+        webhook_endpoint: webhook_receiver.endpoint(),
+        remote_ports: &remote_ports,
         case,
-    )?;
+    })?;
 
     let supervisor = ChildSupervisor::new()?;
     let upstream = UpstreamServer::spawn()?;

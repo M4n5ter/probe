@@ -21,7 +21,10 @@ const AGENT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const AGENT_PROGRESS_STABLE_POLLS: u8 = 3;
 const FIXTURE_PROCESS_NAME_PREFIX: &str = "traffic-probe-e2e";
+const FIXTURE_PROCESS_TASK_COMM: &str = "traffic-probe-e";
 const FIXTURE_BINARY_NAME: &str = "traffic-probe-e2e-fixture";
+const DYNSSL_FIXTURE_BINARY_NAME: &str = "traffic-probe-e2e-dynssl-fixture";
+const FIXTURE_BINARY_NAMES: [&str; 2] = [FIXTURE_BINARY_NAME, DYNSSL_FIXTURE_BINARY_NAME];
 
 pub(crate) const AGENT_READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_READY_SOCKET";
 
@@ -537,17 +540,25 @@ pub(crate) fn assert_no_policy_runtime_errors(
 
 pub(crate) fn is_fixture_process(process: &ProcessContext) -> bool {
     process.identity.pid > 0
-        && (process.name.starts_with(FIXTURE_PROCESS_NAME_PREFIX)
+        && (is_fixture_process_name(&process.name)
             || process
                 .identity
                 .exe_path
                 .rsplit('/')
                 .next()
-                .is_some_and(|name| name == FIXTURE_BINARY_NAME)
+                .is_some_and(is_fixture_binary_name)
             || process
                 .cmdline
                 .iter()
-                .any(|arg| arg.contains(FIXTURE_BINARY_NAME)))
+                .any(|arg| FIXTURE_BINARY_NAMES.iter().any(|name| arg.contains(name))))
+}
+
+fn is_fixture_process_name(name: &str) -> bool {
+    name.starts_with(FIXTURE_PROCESS_NAME_PREFIX) || name == FIXTURE_PROCESS_TASK_COMM
+}
+
+fn is_fixture_binary_name(name: &str) -> bool {
+    FIXTURE_BINARY_NAMES.contains(&name)
 }
 
 fn parse_fixture_ready(
@@ -729,4 +740,83 @@ pub(crate) fn send_admin_request(
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     Ok(serde_json::from_str(&line)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use probe_core::ProcessIdentity;
+
+    use super::*;
+
+    #[test]
+    fn fixture_process_matcher_accepts_linux_task_comm_truncation() {
+        assert!(is_fixture_process(&process_context(
+            42,
+            "traffic-probe-e",
+            "",
+            []
+        )));
+    }
+
+    #[test]
+    fn fixture_process_matcher_accepts_dynamic_fixture_cmdline() {
+        assert!(is_fixture_process(&process_context(
+            42,
+            "openssl",
+            "",
+            ["/workspace/traffic-probe-e2e-dynssl-fixture"]
+        )));
+    }
+
+    #[test]
+    fn fixture_process_matcher_accepts_dynamic_fixture_exe_path() {
+        assert!(is_fixture_process(&process_context(
+            42,
+            "openssl",
+            "/tmp/e2e/traffic-probe-e2e-dynssl-fixture",
+            []
+        )));
+    }
+
+    #[test]
+    fn fixture_process_matcher_rejects_unknown_or_synthetic_processes() {
+        assert!(!is_fixture_process(&process_context(
+            0,
+            "traffic-probe-e",
+            "",
+            []
+        )));
+        assert!(!is_fixture_process(&process_context(
+            42,
+            "traffic-probe",
+            "",
+            []
+        )));
+    }
+
+    fn process_context<const N: usize>(
+        pid: u32,
+        name: &str,
+        exe_path: &str,
+        cmdline: [&str; N],
+    ) -> ProcessContext {
+        ProcessContext {
+            identity: ProcessIdentity {
+                pid,
+                tgid: pid,
+                start_time_ticks: 1,
+                boot_id: "boot".to_string(),
+                exe_path: exe_path.to_string(),
+                cmdline_hash: "cmdline".to_string(),
+                uid: 1000,
+                gid: 1000,
+                cgroup: None,
+                systemd_service: None,
+                container_id: None,
+                runtime_hint: None,
+            },
+            name: name.to_string(),
+            cmdline: cmdline.into_iter().map(ToOwned::to_owned).collect(),
+        }
+    }
 }

@@ -169,6 +169,114 @@ cargo run -p agent --locked -- status --config ./agent.toml
 `check` 会校验 runtime plan 和配置的 policy。`status` 是副作用较轻的状态快照；
 它会报告本地 policy bundle 的 metadata，但不会执行 policy source。
 
+### 最小 Policy 与 Webhook 接线
+
+可部署配置需要显式描述三份契约：event 从哪里来、哪些 Lua hook 检查它们、collector
+如何确认 durable export batch。Probe 不会从 endpoint 名称或 policy 文件名推断这些契约。
+
+```text
+/etc/probe/agent.toml
+/etc/probe/policies/http-guard/manifest.toml
+/etc/probe/policies/http-guard/main.lua
+```
+
+agent config：
+
+```toml
+[export.worker]
+enabled = true
+
+[[exporters]]
+id = "primary-webhook"
+transport = "webhook"
+endpoint = "https://collector.example/probe/batches"
+codec = "zstd"
+headers = { x_probe_node = "edge-a" }
+
+[[policies]]
+id = "http-guard"
+enabled = true
+
+[policies.source]
+kind = "local_directory"
+path = "/etc/probe/policies/http-guard"
+```
+
+policy manifest：
+
+```toml
+id = "http-guard"
+version = "2026-06-30"
+hooks = ["on_http_request_headers", "on_websocket_message"]
+```
+
+Lua source：
+
+```lua
+local function header(event, wanted)
+  wanted = string.lower(wanted)
+  for _, pair in ipairs(event.kind.headers or {}) do
+    if string.lower(pair[1]) == wanted then
+      return pair[2]
+    end
+  end
+  return nil
+end
+
+function on_http_request_headers(event)
+  local host = header(event, "host") or "-"
+  local target = event.kind.target or "/"
+
+  if event.kind.method == "POST" and target == "/admin" then
+    return {
+      probe.emit_alert("admin POST on " .. host),
+      probe.verdict {
+        action = "reset",
+        scope = "flow",
+        reason = "admin endpoint is not allowed",
+        confidence = 95,
+        ttl_ms = 60000
+      }
+    }
+  end
+
+  return probe.emit_alert("HTTP request " .. target .. " on " .. host)
+end
+
+function on_websocket_message(event)
+  if event.kind.opcode.kind == "text" and event.kind.payload_len > 65536 then
+    return probe.emit_alert("large websocket text message")
+  end
+end
+```
+
+webhook receiver contract：
+
+| Part | Requirement |
+| --- | --- |
+| Endpoint URL | 带 scheme 和 host 的 absolute `http://` 或 `https://` URL。URL credentials 会被拒绝。TLS refs 要求 `https://`。 |
+| Method | 对配置的 path 和 query 发起 `POST`。 |
+| `content-type` | `application/x-protobuf`。 |
+| `x-traffic-probe-codec` | `none`、`zstd`、`gzip` 或 `deflate`；receiver 按这个 header 解码 body。 |
+| `idempotency-key` | export batch id；receiver 应用它做 deduplication。 |
+| Body | `BatchEnvelope` protobuf bytes，并按 `x-traffic-probe-codec` 压缩。 |
+| ACK body | 不超过 64 KiB 的 UTF-8 JSON。 |
+
+ACK JSON：
+
+```json
+{
+  "batch_id": "probe-local:primary-webhook:1-4",
+  "accepted": true,
+  "acked_cursor": 4,
+  "reason": null
+}
+```
+
+receiver 只有在 durable 存储了 `acked_cursor` 之前的所有 record 后，才应返回
+`accepted = true`。状态码非 2xx、body 不是合法 ACK JSON、`batch_id` 不匹配、
+`accepted = false` 或 `acked_cursor` 超出请求 sequence 范围时，Probe 会重试该 batch。
+
 ### Capture
 
 自动 live selection 会按顺序尝试 fallback backend：

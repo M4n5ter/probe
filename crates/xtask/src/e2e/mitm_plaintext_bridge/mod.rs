@@ -159,9 +159,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
     let mitm_ca = tls::write_mitm_ca(root)?;
 
     write_policy_bundle(&policy_path, case)?;
-    if case.spec().policy_hook.enabled() {
-        config::write_enforcement_manifest(&enforcement_manifest_path)?;
-    }
+    config::write_enforcement_manifest(&enforcement_manifest_path)?;
     let policy_hook_server = case
         .spec()
         .policy_hook
@@ -189,11 +187,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
         case,
         config_path: &config_path,
         policy_path: &policy_path,
-        enforcement_manifest_path: case
-            .spec()
-            .policy_hook
-            .enabled()
-            .then_some(enforcement_manifest_path.as_path()),
+        enforcement_manifest_path: Some(enforcement_manifest_path.as_path()),
         bridge_feed_path: &bridge_feed_path,
         mitm_ca_certificate_path: &mitm_ca.certificate_path,
         mitm_ca_private_key_path: &mitm_ca.private_key_path,

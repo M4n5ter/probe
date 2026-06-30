@@ -189,6 +189,117 @@ cargo run -p agent --locked -- status --config ./agent.toml
 side-effect-light status snapshot; it reports metadata for local policy bundles
 but does not execute them.
 
+### Minimal Policy And Webhook Wiring
+
+A deployable configuration has three explicit contracts: where events come
+from, which Lua hooks inspect them, and how the collector acknowledges durable
+export batches. Probe does not infer these contracts from endpoint names or
+policy filenames.
+
+```text
+/etc/probe/agent.toml
+/etc/probe/policies/http-guard/manifest.toml
+/etc/probe/policies/http-guard/main.lua
+```
+
+Agent config:
+
+```toml
+[export.worker]
+enabled = true
+
+[[exporters]]
+id = "primary-webhook"
+transport = "webhook"
+endpoint = "https://collector.example/probe/batches"
+codec = "zstd"
+headers = { x_probe_node = "edge-a" }
+
+[[policies]]
+id = "http-guard"
+enabled = true
+
+[policies.source]
+kind = "local_directory"
+path = "/etc/probe/policies/http-guard"
+```
+
+Policy manifest:
+
+```toml
+id = "http-guard"
+version = "2026-06-30"
+hooks = ["on_http_request_headers", "on_websocket_message"]
+```
+
+Lua source:
+
+```lua
+local function header(event, wanted)
+  wanted = string.lower(wanted)
+  for _, pair in ipairs(event.kind.headers or {}) do
+    if string.lower(pair[1]) == wanted then
+      return pair[2]
+    end
+  end
+  return nil
+end
+
+function on_http_request_headers(event)
+  local host = header(event, "host") or "-"
+  local target = event.kind.target or "/"
+
+  if event.kind.method == "POST" and target == "/admin" then
+    return {
+      probe.emit_alert("admin POST on " .. host),
+      probe.verdict {
+        action = "reset",
+        scope = "flow",
+        reason = "admin endpoint is not allowed",
+        confidence = 95,
+        ttl_ms = 60000
+      }
+    }
+  end
+
+  return probe.emit_alert("HTTP request " .. target .. " on " .. host)
+end
+
+function on_websocket_message(event)
+  if event.kind.opcode.kind == "text" and event.kind.payload_len > 65536 then
+    return probe.emit_alert("large websocket text message")
+  end
+end
+```
+
+Webhook receiver contract:
+
+| Part | Requirement |
+| --- | --- |
+| Endpoint URL | Absolute `http://` or `https://` URL with scheme and host. URL credentials are rejected. TLS refs require `https://`. |
+| Method | `POST` to the configured path and query. |
+| `content-type` | `application/x-protobuf`. |
+| `x-traffic-probe-codec` | `none`, `zstd`, `gzip`, or `deflate`; decode the body by this header. |
+| `idempotency-key` | The export batch id; use it for deduplication. |
+| Body | `BatchEnvelope` protobuf bytes, compressed according to `x-traffic-probe-codec`. |
+| ACK body | UTF-8 JSON no larger than 64 KiB. |
+
+ACK JSON:
+
+```json
+{
+  "batch_id": "probe-local:primary-webhook:1-4",
+  "accepted": true,
+  "acked_cursor": 4,
+  "reason": null
+}
+```
+
+Return `accepted = true` only after the receiver durably stores every record up
+to `acked_cursor`. Probe retries the batch when the status is non-2xx, the body
+is not valid ACK JSON, `batch_id` does not match, `accepted = false`, or
+`acked_cursor` is outside the request sequence range.
+
 ### Capture
 
 Automatic live selection tries configured fallback backends in order:

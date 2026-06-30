@@ -19,10 +19,14 @@ use super::{
     loopback::{spawn_agent, wait_for_agent_ready},
 };
 use probe_config::{
-    AgentConfig, CaptureSelection, TransparentInterceptionProxyConfig,
-    TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
+    AgentConfig, CaptureSelection, EnforcementPolicyManifest, EnforcementPolicySourceConfig,
+    TransparentInterceptionProxyConfig, TransparentInterceptionProxyModeConfig,
+    TransparentInterceptionStrategyConfig,
 };
-use probe_core::{Direction, EnforcementMode, ProcessSelector, Selector, TrafficSelector};
+use probe_core::{
+    Action, Direction, EnforcementMode, ProcessSelector, ProtectiveActionProfile, Selector,
+    TrafficSelector,
+};
 use signal_hook::{
     consts::signal::{SIGINT, SIGTERM},
     iterator::Signals,
@@ -37,6 +41,8 @@ const CLIENT_ADDR: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 2);
 const PROXY_PORT: u16 = 15001;
 const TPROXY_MARK: &str = "0x54500101";
 const TPROXY_ROUTE_TABLE: &str = "45100";
+const ENFORCEMENT_MANIFEST_ID: &str = "e2e-transparent-tproxy-enforcement";
+const ENFORCEMENT_MANIFEST_VERSION: &str = "e2e";
 const PROCESS_SCOPED_LISTENER_NAME: &str = "xtask";
 const MISMATCHING_PROCESS_SCOPED_LISTENER_NAME: &str = "not-xtask";
 const UPSTREAM_SCENARIOS: [UpstreamScenario; 2] = [
@@ -206,10 +212,17 @@ fn run_inner(mode: TproxyE2eMode) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_at(root: &Path, mode: TproxyE2eMode) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = root.join("agent.toml");
+    let enforcement_manifest_path = root.join("enforcement.toml");
     let spool_path = root.join("spool");
     let ready_socket_path = root.join("agent.ready.sock");
 
-    write_agent_config(&config_path, &spool_path, mode, mode.process_selector())?;
+    write_agent_config(
+        &config_path,
+        &spool_path,
+        &enforcement_manifest_path,
+        mode,
+        mode.process_selector(),
+    )?;
     let supervisor = ChildSupervisor::new()?;
     let mut client_namespace =
         supervisor.watch(spawn_client_namespace_owner(mode)?, "client namespace");
@@ -258,11 +271,13 @@ fn assert_mismatched_process_selector_fails_closed(
     mode: TproxyE2eMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = root.join("mismatch.toml");
+    let enforcement_manifest_path = root.join("mismatch-enforcement.toml");
     let spool_path = root.join("spool-mismatch");
     let ready_socket_path = root.join("mismatch.sock");
     write_agent_config(
         &config_path,
         &spool_path,
+        &enforcement_manifest_path,
         mode,
         process_name_selector(MISMATCHING_PROCESS_SCOPED_LISTENER_NAME),
     )?;
@@ -294,6 +309,7 @@ fn bind_listener_probe_ports() -> Result<Vec<TcpListener>, Box<dyn std::error::E
 fn write_agent_config(
     path: &Path,
     spool_path: &Path,
+    enforcement_manifest_path: &Path,
     mode: TproxyE2eMode,
     process_selector: ProcessSelector,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -314,14 +330,26 @@ fn write_agent_config(
     config.storage.path = spool_path.to_path_buf();
     config.export.worker.enabled = false;
     config.enforcement.mode = EnforcementMode::Enforce;
+    let selector = Selector::term(process_selector, mode.traffic_selector());
+    super::enforcement_manifest::write_enforcement_policy_manifest(
+        enforcement_manifest_path,
+        &EnforcementPolicyManifest {
+            id: ENFORCEMENT_MANIFEST_ID.to_string(),
+            version: ENFORCEMENT_MANIFEST_VERSION.to_string(),
+            selector: None,
+            protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
+        },
+    )?;
+    config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+        path: enforcement_manifest_path.to_path_buf(),
+    };
     config.enforcement.interception.strategy = TransparentInterceptionStrategyConfig::InboundTproxy;
     config.enforcement.interception.proxy = TransparentInterceptionProxyConfig {
         mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
         listen_port: Some(PROXY_PORT),
         ..TransparentInterceptionProxyConfig::default()
     };
-    config.enforcement.interception.selector =
-        Some(Selector::term(process_selector, mode.traffic_selector()));
+    config.enforcement.interception.selector = Some(selector);
     std::fs::write(path, toml::to_string(&config)?)?;
     Ok(())
 }
