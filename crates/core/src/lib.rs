@@ -2,6 +2,7 @@ mod capability;
 mod event;
 mod identity;
 mod procfs;
+mod protocol;
 mod schema;
 mod selector;
 mod socket;
@@ -25,6 +26,10 @@ pub use identity::{
     TransportProtocol,
 };
 pub use procfs::{LinuxProcStat, LinuxProcStatParseError, parse_linux_proc_stat};
+pub use protocol::{
+    ApplicationProtocol, ApplicationProtocolParseError, ApplicationProtocolPolicy,
+    ApplicationProtocolPolicyError,
+};
 pub use schema::{SpoolPayloadSchema, SpoolPayloadSchemaError};
 pub use selector::{
     CompiledSelector, ProcessSelector, Selector, SelectorError, SelectorRegistry, SelectorTerm,

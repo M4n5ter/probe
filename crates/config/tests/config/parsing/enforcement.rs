@@ -1,5 +1,5 @@
 use probe_config::*;
-use probe_core::Action;
+use probe_core::{Action, ApplicationProtocol};
 
 #[test]
 fn parses_transparent_interception_strategy() -> Result<(), Box<dyn std::error::Error>> {
@@ -329,6 +329,7 @@ target = "127.0.0.1:15002"
 [enforcement.interception.mitm.backend.process]
 program = "/usr/local/bin/traffic-probe-mitm-proxy"
 working_dir = "/run/traffic-probe"
+application_protocols = ["http1"]
 
 [[enforcement.interception.mitm.backend.process.upstream_routes]]
 host = "Route.Example"
@@ -360,6 +361,10 @@ path = "/etc/traffic-probe/mitm-leaf.key"
     assert_eq!(
         process.working_dir.as_deref(),
         Some(std::path::Path::new("/run/traffic-probe"))
+    );
+    assert_eq!(
+        process.application_protocols,
+        Some(vec![ApplicationProtocol::Http1])
     );
     assert_eq!(process.upstream_routes.len(), 1);
     assert_eq!(process.upstream_routes[0].host, "Route.Example");

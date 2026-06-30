@@ -11,8 +11,8 @@ use std::{
 
 use capture::CaptureEvent;
 use probe_core::{
-    Action, CaptureOrigin, CaptureSource, Direction, EventEnvelope, EventKind, FlowContext,
-    HttpHeaders, Timestamp, Verdict, VerdictScope,
+    Action, ApplicationProtocolPolicy, CaptureOrigin, CaptureSource, Direction, EventEnvelope,
+    EventKind, FlowContext, HttpHeaders, Timestamp, Verdict, VerdictScope,
 };
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, StreamOwned,
@@ -51,6 +51,7 @@ pub(super) fn test_config(
         upstream_tls: None,
         upstream_socket_mark: None,
         tls,
+        application_protocols: ApplicationProtocolPolicy::default(),
         target_recovery: TargetRecovery::AcceptedLocal,
         request_direction: Direction::Outbound,
         policy_hook_listen,
@@ -563,7 +564,9 @@ fn tls_upstream_server_with_shutdown_and_observer(
             return;
         };
         let config = TlsTerminationConfig::new(certificate_chain, private_key);
-        let Ok(terminator) = crate::tls::TlsTerminator::from_config(&config) else {
+        let Ok(terminator) =
+            crate::tls::TlsTerminator::from_config(&config, &ApplicationProtocolPolicy::default())
+        else {
             return;
         };
         let Ok(mut stream) = terminator.accept(stream) else {

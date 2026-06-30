@@ -24,7 +24,8 @@ use probe_config::{
     TransparentInterceptionProxySelfBypassConfig, TransparentInterceptionStrategyConfig,
 };
 use probe_core::{
-    CapabilityKind, CapabilityMatrix, CapabilityState, Direction, EnforcementMode, RuntimeMode,
+    ApplicationProtocolPolicy, CapabilityKind, CapabilityMatrix, CapabilityState, Direction,
+    EnforcementMode, RuntimeMode,
 };
 use serde::{Deserialize, Serialize};
 use transparent_linux::{OutboundRedirectArtifactSpec, TransparentLinuxResources};
@@ -572,6 +573,7 @@ pub enum TransparentInterceptionMitmBackendPlan {
     },
     ProductProxy {
         process: TransparentInterceptionMitmManagedProcessPlan,
+        application_protocols: ApplicationProtocolPolicy,
         readiness_probe: TransparentInterceptionMitmBackendReadinessProbePlan,
     },
 }
@@ -608,12 +610,14 @@ impl TransparentInterceptionMitmBackendPlan {
                     TransparentInterceptionMitmBackendReadinessProbePlan::from_intent(
                         readiness_probe,
                     );
+                let application_protocols = process.application_protocols.clone();
                 let cli_builder = context.product_proxy_cli_builder(&readiness_probe);
                 Self::ProductProxy {
                     process: TransparentInterceptionMitmManagedProcessPlan::from_product_proxy(
                         process,
                         cli_builder,
                     ),
+                    application_protocols,
                     readiness_probe,
                 }
             }
@@ -641,7 +645,7 @@ impl TransparentInterceptionMitmManagedProcessPlan {
         intent: TransparentInterceptionMitmProductProxyIntent,
         cli_builder: ProductProxyCliBuilder<'_>,
     ) -> Self {
-        let args = cli_builder.args(&intent.upstream_routes);
+        let args = cli_builder.args(&intent.application_protocols, &intent.upstream_routes);
         Self {
             program: intent.program,
             args,
@@ -673,6 +677,7 @@ enum ProductProxyTlsTerminationSource<'a> {
 impl ProductProxyCliBuilder<'_> {
     fn args(
         &self,
+        application_protocols: &ApplicationProtocolPolicy,
         upstream_routes: &[TransparentInterceptionMitmProductProxyUpstreamRouteIntent],
     ) -> Vec<String> {
         let mut args = vec![
@@ -689,6 +694,9 @@ impl ProductProxyCliBuilder<'_> {
             direction_cli_value(self.interception.request_direction).to_string(),
             "--upstream-tls".to_string(),
         ];
+        for protocol in application_protocols.protocols() {
+            args.extend(["--alpn".to_string(), protocol.alpn_name().to_string()]);
+        }
         if self.interception.transparent_listen {
             args.push("--transparent-listen".to_string());
         }
@@ -1590,6 +1598,7 @@ mod tests {
 
         let TransparentInterceptionMitmBackendPlan::ProductProxy {
             process,
+            application_protocols,
             readiness_probe,
         } = &plan.interception.mitm.backend
         else {
@@ -1612,6 +1621,10 @@ mod tests {
             PathBuf::from("/usr/local/bin/traffic-probe-mitm-proxy")
         );
         assert_eq!(
+            application_protocols.protocols(),
+            [probe_core::ApplicationProtocol::Http1]
+        );
+        assert_eq!(
             process.args,
             vec![
                 "--listen".to_string(),
@@ -1623,6 +1636,8 @@ mod tests {
                 "--request-direction".to_string(),
                 "inbound".to_string(),
                 "--upstream-tls".to_string(),
+                "--alpn".to_string(),
+                "http/1.1".to_string(),
                 "--transparent-listen".to_string(),
                 "--policy-hook-listen".to_string(),
                 "127.0.0.1:15003".to_string(),
@@ -2141,6 +2156,7 @@ mod tests {
         let process = TransparentInterceptionMitmProductProxyConfig {
             program: Some("/usr/local/bin/traffic-probe-mitm-proxy".into()),
             working_dir: Some("/run/traffic-probe".into()),
+            application_protocols: None,
             upstream_routes: Vec::new(),
         };
         config.enforcement.interception.mitm.backend =

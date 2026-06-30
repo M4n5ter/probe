@@ -8,7 +8,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use probe_core::{UpstreamRoute, UpstreamRouteHostPattern, socket_addr_points_to_listener};
+use probe_core::{
+    ApplicationProtocol, ApplicationProtocolPolicy, UpstreamRoute, UpstreamRouteHostPattern,
+    socket_addr_points_to_listener,
+};
 
 use super::{
     EnforcementInterceptionConfig, TransparentInterceptionIntentViolation,
@@ -206,12 +209,16 @@ impl TransparentInterceptionMitmManagedProcessConfig {
 pub struct TransparentInterceptionMitmProductProxyConfig {
     pub program: Option<PathBuf>,
     pub working_dir: Option<PathBuf>,
+    pub application_protocols: Option<Vec<ApplicationProtocol>>,
     pub upstream_routes: Vec<TransparentInterceptionMitmProductProxyUpstreamRouteConfig>,
 }
 
 impl TransparentInterceptionMitmProductProxyConfig {
     pub fn is_configured(&self) -> bool {
-        self.program.is_some() || self.working_dir.is_some() || !self.upstream_routes.is_empty()
+        self.program.is_some()
+            || self.working_dir.is_some()
+            || self.application_protocols.is_some()
+            || !self.upstream_routes.is_empty()
     }
 }
 
@@ -314,6 +321,7 @@ pub struct TransparentInterceptionMitmManagedProcessIntent {
 pub struct TransparentInterceptionMitmProductProxyIntent {
     pub program: PathBuf,
     pub working_dir: Option<PathBuf>,
+    pub application_protocols: ApplicationProtocolPolicy,
     pub upstream_routes: Vec<TransparentInterceptionMitmProductProxyUpstreamRouteIntent>,
 }
 
@@ -562,11 +570,34 @@ fn validate_mitm_product_proxy_process(
         "enforcement.interception.mitm.backend.process.upstream_routes",
         violations,
     );
+    let application_protocols = validate_mitm_product_proxy_application_protocols(
+        &process.application_protocols,
+        "enforcement.interception.mitm.backend.process.application_protocols",
+        violations,
+    )?;
     Some(TransparentInterceptionMitmProductProxyIntent {
         program,
         working_dir: process.working_dir.clone(),
+        application_protocols,
         upstream_routes,
     })
+}
+
+fn validate_mitm_product_proxy_application_protocols(
+    configured: &Option<Vec<ApplicationProtocol>>,
+    field: &'static str,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) -> Option<ApplicationProtocolPolicy> {
+    match configured {
+        None => Some(ApplicationProtocolPolicy::default()),
+        Some(protocols) => match ApplicationProtocolPolicy::new(protocols.iter().copied()) {
+            Ok(policy) => Some(policy),
+            Err(error) => {
+                violations.push(intent_violation(field, error.to_string()));
+                None
+            }
+        },
+    }
 }
 
 fn validate_mitm_product_proxy_upstream_routes(

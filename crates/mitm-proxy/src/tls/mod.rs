@@ -7,6 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use probe_core::{ApplicationProtocol, ApplicationProtocolPolicy};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, Issuer, KeyPair};
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
@@ -20,7 +21,6 @@ use crate::{MitmProxyError, authority::UpstreamAuthorityCandidates, error::io_er
 
 pub(crate) type TlsClientStream = StreamOwned<ClientConnection, TcpStream>;
 pub(crate) type TlsServerStream = StreamOwned<ServerConnection, TcpStream>;
-const HTTP11_ALPN: &[u8] = b"http/1.1";
 const DYNAMIC_CERT_CACHE_CAPACITY: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,10 +74,14 @@ impl UpstreamTlsConfig {
 
 pub(crate) struct TlsTerminator {
     config: Arc<ServerConfig>,
+    application_protocols: ApplicationProtocolPolicy,
 }
 
 impl TlsTerminator {
-    pub(crate) fn from_config(config: &TlsTerminationConfig) -> Result<Self, MitmProxyError> {
+    pub(crate) fn from_config(
+        config: &TlsTerminationConfig,
+        application_protocols: &ApplicationProtocolPolicy,
+    ) -> Result<Self, MitmProxyError> {
         let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let builder = ServerConfig::builder_with_provider(Arc::clone(&crypto_provider))
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
@@ -91,19 +95,24 @@ impl TlsTerminator {
                     certificate_chain,
                     private_key,
                     Arc::clone(&crypto_provider),
+                    application_protocols.clone(),
                 )?;
                 builder.with_cert_resolver(Arc::new(resolver))
             }
             TlsTerminationConfig::DynamicCa(config) => {
-                let resolver =
-                    DynamicCaCertResolver::from_config(config, Arc::clone(&crypto_provider))?;
+                let resolver = DynamicCaCertResolver::from_config(
+                    config,
+                    Arc::clone(&crypto_provider),
+                    application_protocols.clone(),
+                )?;
                 builder.with_cert_resolver(Arc::new(resolver))
             }
         };
         let mut server_config = server_config;
-        server_config.alpn_protocols = http1_alpn_protocols();
+        server_config.alpn_protocols = tls_alpn_protocols(application_protocols);
         Ok(Self {
             config: Arc::new(server_config),
+            application_protocols: application_protocols.clone(),
         })
     }
 
@@ -123,6 +132,7 @@ impl TlsTerminator {
         ensure_supported_alpn(
             connection.alpn_protocol(),
             "MITM proxy downstream TLS client",
+            &self.application_protocols,
         )?;
         Ok(StreamOwned::new(connection, stream))
     }
@@ -130,6 +140,7 @@ impl TlsTerminator {
 
 struct StaticCertResolver {
     certified_key: Arc<CertifiedKey>,
+    application_protocols: ApplicationProtocolPolicy,
 }
 
 impl StaticCertResolver {
@@ -137,12 +148,14 @@ impl StaticCertResolver {
         certificate_chain: Vec<CertificateDer<'static>>,
         private_key: PrivateKeyDer<'static>,
         crypto_provider: Arc<CryptoProvider>,
+        application_protocols: ApplicationProtocolPolicy,
     ) -> Result<Self, MitmProxyError> {
         let certified_key =
             CertifiedKey::from_der(certificate_chain, private_key, &crypto_provider)
                 .map_err(tls_error("configure MITM proxy TLS certificate"))?;
         Ok(Self {
             certified_key: Arc::new(certified_key),
+            application_protocols,
         })
     }
 }
@@ -157,7 +170,8 @@ impl std::fmt::Debug for StaticCertResolver {
 
 impl ResolvesServerCert for StaticCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        client_hello_allows_http1(&client_hello).then(|| Arc::clone(&self.certified_key))
+        client_hello_allows_configured_protocols(&client_hello, &self.application_protocols)
+            .then(|| Arc::clone(&self.certified_key))
     }
 }
 
@@ -165,6 +179,7 @@ struct DynamicCaCertResolver {
     issuer: Issuer<'static, KeyPair>,
     certificate_chain: Vec<CertificateDer<'static>>,
     crypto_provider: Arc<CryptoProvider>,
+    application_protocols: ApplicationProtocolPolicy,
     cache: Mutex<DynamicCertCache>,
 }
 
@@ -172,6 +187,7 @@ impl DynamicCaCertResolver {
     fn from_config(
         config: &TlsDynamicCaTerminationConfig,
         crypto_provider: Arc<CryptoProvider>,
+        application_protocols: ApplicationProtocolPolicy,
     ) -> Result<Self, MitmProxyError> {
         let certificate_chain = load_certificate_chain(&config.certificate_chain)?;
         let issuer_certificate = certificate_chain
@@ -192,6 +208,7 @@ impl DynamicCaCertResolver {
             issuer,
             certificate_chain,
             crypto_provider,
+            application_protocols,
             cache: Mutex::new(DynamicCertCache::default()),
         })
     }
@@ -264,7 +281,7 @@ impl std::fmt::Debug for DynamicCaCertResolver {
 
 impl ResolvesServerCert for DynamicCaCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        if !client_hello_allows_http1(&client_hello) {
+        if !client_hello_allows_configured_protocols(&client_hello, &self.application_protocols) {
             return None;
         }
         let server_name = client_hello.server_name()?;
@@ -274,11 +291,15 @@ impl ResolvesServerCert for DynamicCaCertResolver {
 
 pub(crate) struct TlsUpstreamConnector {
     config: Arc<ClientConfig>,
+    application_protocols: ApplicationProtocolPolicy,
     server_name: Option<String>,
 }
 
 impl TlsUpstreamConnector {
-    pub(crate) fn from_config(config: &UpstreamTlsConfig) -> Result<Self, MitmProxyError> {
+    pub(crate) fn from_config(
+        config: &UpstreamTlsConfig,
+        application_protocols: &ApplicationProtocolPolicy,
+    ) -> Result<Self, MitmProxyError> {
         let roots = load_upstream_roots(&config.trust_anchors)?;
         let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut client_config = ClientConfig::builder_with_provider(crypto_provider)
@@ -288,9 +309,10 @@ impl TlsUpstreamConnector {
             ))?
             .with_root_certificates(roots)
             .with_no_client_auth();
-        client_config.alpn_protocols = http1_alpn_protocols();
+        client_config.alpn_protocols = tls_alpn_protocols(application_protocols);
         Ok(Self {
             config: Arc::new(client_config),
+            application_protocols: application_protocols.clone(),
             server_name: config.server_name.clone(),
         })
     }
@@ -321,35 +343,70 @@ impl TlsUpstreamConnector {
                 ));
             }
         }
-        ensure_supported_alpn(connection.alpn_protocol(), "MITM proxy upstream TLS server")?;
+        ensure_supported_alpn(
+            connection.alpn_protocol(),
+            "MITM proxy upstream TLS server",
+            &self.application_protocols,
+        )?;
         Ok(StreamOwned::new(connection, stream))
     }
 }
 
-fn http1_alpn_protocols() -> Vec<Vec<u8>> {
-    vec![HTTP11_ALPN.to_vec()]
-}
-
-fn client_hello_allows_http1(client_hello: &ClientHello<'_>) -> bool {
-    match client_hello.alpn() {
-        None => true,
-        Some(protocols) => protocols
-            .into_iter()
-            .any(|protocol| protocol == HTTP11_ALPN),
-    }
+fn client_hello_allows_configured_protocols(
+    client_hello: &ClientHello<'_>,
+    application_protocols: &ApplicationProtocolPolicy,
+) -> bool {
+    client_hello.alpn().map_or_else(
+        || missing_tls_alpn_supported(application_protocols),
+        |protocols| {
+            protocols
+                .into_iter()
+                .any(|protocol| tls_alpn_supported(application_protocols, protocol))
+        },
+    )
 }
 
 fn ensure_supported_alpn(
     negotiated: Option<&[u8]>,
     peer: &'static str,
+    application_protocols: &ApplicationProtocolPolicy,
 ) -> Result<(), MitmProxyError> {
-    match negotiated {
-        None | Some(HTTP11_ALPN) => Ok(()),
-        Some(protocol) => Err(MitmProxyError::Tls(format!(
+    if negotiated.map_or_else(
+        || missing_tls_alpn_supported(application_protocols),
+        |protocol| tls_alpn_supported(application_protocols, protocol),
+    ) {
+        Ok(())
+    } else if let Some(protocol) = negotiated {
+        Err(MitmProxyError::Tls(format!(
             "{peer} negotiated unsupported ALPN protocol {:?}",
             String::from_utf8_lossy(protocol)
-        ))),
+        )))
+    } else {
+        Err(MitmProxyError::Tls(format!(
+            "{peer} did not negotiate a supported ALPN protocol"
+        )))
     }
+}
+
+fn tls_alpn_protocols(application_protocols: &ApplicationProtocolPolicy) -> Vec<Vec<u8>> {
+    application_protocols
+        .protocols()
+        .iter()
+        .map(|protocol| protocol.alpn_name().as_bytes().to_vec())
+        .collect()
+}
+
+fn tls_alpn_supported(application_protocols: &ApplicationProtocolPolicy, protocol: &[u8]) -> bool {
+    application_protocols
+        .protocols()
+        .iter()
+        .any(|allowed| allowed.alpn_name().as_bytes() == protocol)
+}
+
+fn missing_tls_alpn_supported(application_protocols: &ApplicationProtocolPolicy) -> bool {
+    application_protocols
+        .protocols()
+        .contains(&ApplicationProtocol::Http1)
 }
 
 fn load_upstream_roots(paths: &[PathBuf]) -> Result<RootCertStore, MitmProxyError> {
@@ -502,10 +559,12 @@ mod tests {
         fs::write(&empty_anchor, "")?;
         let config = UpstreamTlsConfig::new(vec![empty_anchor], None);
 
-        let error = match TlsUpstreamConnector::from_config(&config) {
-            Ok(_) => return Err("empty upstream trust anchor should fail".into()),
-            Err(error) => error,
-        };
+        let error =
+            match TlsUpstreamConnector::from_config(&config, &ApplicationProtocolPolicy::default())
+            {
+                Ok(_) => return Err("empty upstream trust anchor should fail".into()),
+                Err(error) => error,
+            };
 
         assert!(
             error
@@ -576,7 +635,8 @@ mod tests {
         fs::write(&private_key_path, certified_key.signing_key.serialize_pem())?;
         let config = TlsTerminationConfig::from_ca(certificate_path, private_key_path);
 
-        let error = match TlsTerminator::from_config(&config) {
+        let error = match TlsTerminator::from_config(&config, &ApplicationProtocolPolicy::default())
+        {
             Ok(_) => return Err("dynamic CA mode must reject non-CA certificates".into()),
             Err(error) => error,
         };
@@ -596,7 +656,8 @@ mod tests {
         let (_other_certificate_path, other_key_path) = write_test_ca(root.path(), "other")?;
         let config = TlsTerminationConfig::from_ca(certificate_path, other_key_path);
 
-        let error = match TlsTerminator::from_config(&config) {
+        let error = match TlsTerminator::from_config(&config, &ApplicationProtocolPolicy::default())
+        {
             Ok(_) => return Err("dynamic CA mode must reject mismatched CA private keys".into()),
             Err(error) => error,
         };

@@ -9,10 +9,10 @@ const DEFAULT_L7_MITM_UNAVAILABLE_REASON: &str = concat!(
     "readiness probes, operator-managed client trust contracts, material refs, ",
     "plaintext bridge provenance, product proxy downstream and upstream TLS relay, ",
     "downstream SNI propagation to upstream TLS server names, explicit product proxy ",
-    "host-to-upstream routes, HTTP/1.1 ALPN gating, proxy-side policy hooks, ",
+    "host-to-upstream routes, typed HTTP/1.1 ALPN policy, proxy-side policy hooks, ",
     "and product proxy transparent inbound/outbound HTTPS routed allow-path and deny-path validation, ",
     "but no MITM backend is configured; default whole-machine transparent MITM is rejected, ",
-    "and ALPN-based multi-protocol routing, DNS-discovered upstream route selection, ",
+    "and HTTP/2+ ALPN dispatch/routing, DNS-discovered upstream route selection, ",
     "strong original attribution, automatic client trust store installation, ",
     "and non-HTTP transparent allow-path matrices remain unavailable"
 );

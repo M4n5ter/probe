@@ -22,7 +22,7 @@ use std::{
 };
 
 use clap::ValueEnum;
-use probe_core::{Direction, socket_addr_points_to_listener};
+use probe_core::{ApplicationProtocolPolicy, Direction, socket_addr_points_to_listener};
 use socket2::Socket;
 
 use crate::{
@@ -57,6 +57,7 @@ pub struct MitmProxyConfig {
     pub upstream_tls: Option<UpstreamTlsConfig>,
     pub upstream_socket_mark: Option<NonZeroU32>,
     pub tls: Option<TlsTerminationConfig>,
+    pub application_protocols: ApplicationProtocolPolicy,
     pub target_recovery: TargetRecovery,
     pub request_direction: Direction,
     pub policy_hook_listen: Option<SocketAddr>,
@@ -100,10 +101,14 @@ impl MitmProxyGuard {
         listeners: ProxyListeners,
     ) -> Result<Self, MitmProxyError> {
         validate_config(&config)?;
-        let downstream = DownstreamAcceptor::from_tls_config(config.tls.as_ref())?;
+        let downstream = DownstreamAcceptor::from_tls_config(
+            config.tls.as_ref(),
+            &config.application_protocols,
+        )?;
         let upstream = UpstreamConnector::from_config(
             config.upstream_tls.as_ref(),
             config.upstream_socket_mark,
+            &config.application_protocols,
         )?;
         write_pid_file(config.pid_file.as_ref())?;
         let feed = Arc::new(CaptureEventFeedWriter::create(&config.feed_path)?);

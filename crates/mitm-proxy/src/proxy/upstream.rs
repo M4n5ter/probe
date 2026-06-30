@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use probe_core::ApplicationProtocolPolicy;
 use probe_io::{TcpConnectOptions, TcpSocketMark, connect_tcp};
 
 use crate::{
@@ -23,8 +24,11 @@ impl UpstreamConnector {
     pub(crate) fn from_config(
         config: Option<&UpstreamTlsConfig>,
         socket_mark: Option<NonZeroU32>,
+        application_protocols: &ApplicationProtocolPolicy,
     ) -> Result<Self, MitmProxyError> {
-        let tls = config.map(TlsUpstreamConnector::from_config).transpose()?;
+        let tls = config
+            .map(|config| TlsUpstreamConnector::from_config(config, application_protocols))
+            .transpose()?;
         Ok(Self {
             tls,
             socket_mark: socket_mark.map(TcpSocketMark::new),

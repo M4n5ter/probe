@@ -10,6 +10,7 @@ use crate::{
     error::io_error,
     tls::{TlsServerStream, TlsTerminationConfig, TlsTerminator},
 };
+use probe_core::ApplicationProtocolPolicy;
 
 pub(super) struct DownstreamAcceptor {
     tls: Option<Arc<TlsTerminator>>,
@@ -18,10 +19,11 @@ pub(super) struct DownstreamAcceptor {
 impl DownstreamAcceptor {
     pub(super) fn from_tls_config(
         tls: Option<&TlsTerminationConfig>,
+        application_protocols: &ApplicationProtocolPolicy,
     ) -> Result<Self, MitmProxyError> {
         Ok(Self {
             tls: tls
-                .map(TlsTerminator::from_config)
+                .map(|tls| TlsTerminator::from_config(tls, application_protocols))
                 .transpose()?
                 .map(Arc::new),
         })

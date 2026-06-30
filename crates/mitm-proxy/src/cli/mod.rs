@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, time::Duration};
 
 use clap::Parser;
-use probe_core::Direction;
+use probe_core::{ApplicationProtocol, ApplicationProtocolPolicy, Direction};
 
 use crate::{
     MitmProxyError,
@@ -33,6 +33,8 @@ pub struct Cli {
     pub upstream_server_name: Option<String>,
     #[arg(long, value_parser = parse_socket_mark)]
     pub upstream_socket_mark: Option<NonZeroU32>,
+    #[arg(long = "alpn", value_parser = parse_application_protocol)]
+    pub alpn: Vec<ApplicationProtocol>,
     #[arg(long)]
     pub tls_certificate_chain: Option<PathBuf>,
     #[arg(long)]
@@ -117,6 +119,12 @@ impl TryFrom<Cli> for MitmProxyConfig {
             UpstreamTlsConfig::new(value.upstream_trust_anchor, value.upstream_server_name)
         });
         let upstream_routes = UpstreamTargetRoutes::from_routes(value.upstream_routes)?;
+        let application_protocols = if value.alpn.is_empty() {
+            ApplicationProtocolPolicy::default()
+        } else {
+            ApplicationProtocolPolicy::new(value.alpn)
+                .map_err(|error| MitmProxyError::InvalidConfig(error.to_string()))?
+        };
         Ok(MitmProxyConfig {
             listen: value.listen,
             transparent_listen: value.transparent_listen,
@@ -127,6 +135,7 @@ impl TryFrom<Cli> for MitmProxyConfig {
             upstream_tls,
             upstream_socket_mark: value.upstream_socket_mark,
             tls,
+            application_protocols,
             target_recovery: value.target_recovery,
             request_direction: value.request_direction.into(),
             policy_hook_listen: value.policy_hook_listen,
@@ -183,6 +192,10 @@ fn parse_socket_mark(value: &str) -> Result<NonZeroU32, String> {
         .map_or_else(|| value.parse::<u32>(), |hex| u32::from_str_radix(hex, 16))
         .map_err(|error| format!("invalid socket mark {value:?}: {error}"))?;
     NonZeroU32::new(mark).ok_or_else(|| "socket mark must be non-zero".to_string())
+}
+
+fn parse_application_protocol(value: &str) -> Result<ApplicationProtocol, String> {
+    ApplicationProtocol::from_wire_name(value).map_err(|error| error.to_string())
 }
 
 fn parse_upstream_route(value: &str) -> Result<UpstreamTargetRoute, String> {
@@ -302,6 +315,38 @@ mod tests {
     }
 
     #[test]
+    fn application_protocol_policy_defaults_to_http1() {
+        let config = MitmProxyConfig::try_from(minimal_cli()).expect("minimal config should parse");
+
+        assert_eq!(
+            config.application_protocols.protocols(),
+            [ApplicationProtocol::Http1]
+        );
+    }
+
+    #[test]
+    fn application_protocol_policy_preserves_explicit_http1() {
+        let config = MitmProxyConfig::try_from(Cli {
+            alpn: vec![parse_application_protocol("http/1.1").expect("http1 ALPN should parse")],
+            ..minimal_cli()
+        })
+        .expect("explicit http1 ALPN should parse");
+
+        assert_eq!(
+            config.application_protocols.protocols(),
+            [ApplicationProtocol::Http1]
+        );
+    }
+
+    #[test]
+    fn application_protocol_policy_rejects_unsupported_protocols() {
+        let error = parse_application_protocol("h2")
+            .expect_err("unsupported application protocol should be rejected");
+
+        assert!(error.contains("unsupported application protocol"));
+    }
+
+    #[test]
     fn upstream_tls_details_require_upstream_tls_mode() {
         let error = MitmProxyConfig::try_from(Cli {
             upstream_trust_anchor: vec![Path::new("/tmp/upstream-ca.pem").to_path_buf()],
@@ -410,6 +455,7 @@ mod tests {
             upstream_trust_anchor: Vec::new(),
             upstream_server_name: None,
             upstream_socket_mark: None,
+            alpn: Vec::new(),
             tls_certificate_chain: None,
             tls_private_key: None,
             tls_ca_certificate: None,
