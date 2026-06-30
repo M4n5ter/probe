@@ -18,6 +18,7 @@ mod plaintext_feed;
 mod plaintext_scenario;
 mod remote_enforcement_policy;
 mod remote_policy_bundle;
+mod remote_policy_polling;
 mod replay;
 mod sse_plaintext_feed;
 mod suite;

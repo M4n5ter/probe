@@ -308,6 +308,24 @@ max_body_bytes = 16777216
 Remote policy endpoints must be HTTPS, except loopback HTTP endpoints used for
 local testing. Credentials in URLs are rejected.
 
+The endpoint response body is one TOML document. The `source` field carries the
+Lua source that would otherwise be stored in `main.lua`; the `[manifest]` table
+uses the same schema as a local `manifest.toml`. Unknown top-level or manifest
+fields are rejected.
+
+```toml
+source = '''
+function on_http_request_headers(event)
+  return probe.emit_alert("HTTP " .. event.kind.method .. " " .. event.kind.target)
+end
+'''
+
+[manifest]
+id = "http-guard"
+version = "2026-06-30"
+hooks = ["on_http_request_headers"]
+```
+
 Validate before running:
 
 ```bash

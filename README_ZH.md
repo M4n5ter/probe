@@ -99,6 +99,8 @@ cargo run -p agent --locked -- replay \
 cargo run -p xtask --locked -- e2e-suite --profile baseline
 ```
 
+真实 collector 或 policy rollout 从 [最小 Policy 与 Webhook 接线](#最小-policy-与-webhook-接线) 开始。
+
 ## 安装要求
 
 通用要求：
@@ -526,7 +528,8 @@ kind = "local_directory"
 path = "/etc/probe/policies/http-alert"
 ```
 
-远程 policy bundle 是 bounded TOML document：
+远程 policy bundle 在配置中声明为 bounded TOML document；response schema 和示例见
+[docs/lua-policy_ZH.md](docs/lua-policy_ZH.md)：
 
 ```toml
 [[policies]]
@@ -848,7 +851,7 @@ live-capture 权限。
 E2E profile 按 capability claim 组织：
 
 - `baseline` 以普通用户运行，覆盖 replay、plaintext feed、gap/loss event、
-  HTTP/SSE/WebSocket、webhook/file export 和 remote policy input。
+  HTTP/SSE/WebSocket、webhook/file export，以及一次性和后台 polling remote policy input。
 - `live-core` 需要 root 或 CAP_NET_RAW，覆盖 libpcap loopback、admin reload、
   socket destroy 和 TLS key log/session-secret material。
 - `process-ebpf` 需要 root/bpffs，覆盖 eBPF process observation。

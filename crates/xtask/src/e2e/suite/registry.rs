@@ -28,6 +28,7 @@ use super::super::{
     plaintext_feed::run as run_plaintext_feed,
     remote_enforcement_policy::run as run_remote_enforcement_policy,
     remote_policy_bundle::run as run_remote_policy_bundle,
+    remote_policy_polling::run as run_remote_policy_polling,
     replay::run as run_replay,
     sse_plaintext_feed::run as run_sse_plaintext_feed,
     tls_material_auto_binding_loopback::{
@@ -191,6 +192,11 @@ const E2E_CASES: &[E2eCase] = &[
         name: "e2e-remote-policy-bundle",
         requirement: E2eRequirement::User,
         run: E2eCaseRun::ExitCode(run_remote_policy_bundle),
+    },
+    E2eCase {
+        name: "e2e-remote-policy-polling",
+        requirement: E2eRequirement::User,
+        run: E2eCaseRun::ExitCode(run_remote_policy_polling),
     },
     E2eCase {
         name: "e2e-libpcap-loopback",
@@ -391,6 +397,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-file-exporter",
             "e2e-remote-enforcement-policy",
             "e2e-remote-policy-bundle",
+            "e2e-remote-policy-polling",
         ]),
     },
     E2eProfile {
@@ -654,6 +661,7 @@ mod tests {
                 "e2e-file-exporter",
                 "e2e-remote-enforcement-policy",
                 "e2e-remote-policy-bundle",
+                "e2e-remote-policy-polling",
             ]),
         },
         ExpectedProfile {
@@ -740,6 +748,7 @@ mod tests {
                 "e2e-file-exporter",
                 "e2e-remote-enforcement-policy",
                 "e2e-remote-policy-bundle",
+                "e2e-remote-policy-polling",
                 "e2e-libpcap-loopback",
                 "e2e-libpcap-websocket-loopback",
                 "e2e-admin-policy-reload",

@@ -108,6 +108,8 @@ Run the non-privileged E2E baseline:
 cargo run -p xtask --locked -- e2e-suite --profile baseline
 ```
 
+For real collector or policy rollout, start with [Minimal Policy And Webhook Wiring](#minimal-policy-and-webhook-wiring).
+
 ## Install Requirements
 
 Common requirements:
@@ -560,7 +562,8 @@ kind = "local_directory"
 path = "/etc/probe/policies/http-alert"
 ```
 
-Remote policy bundles are supported as bounded TOML documents:
+Remote policy bundles are configured as bounded TOML documents; the response
+schema and example are in [docs/lua-policy.md](docs/lua-policy.md):
 
 ```toml
 [[policies]]
@@ -891,8 +894,8 @@ policy, spool, and optional webhook path without live-capture privileges.
 E2E profiles are organized around capability claims:
 
 - `baseline` runs as a normal user and covers replay, plaintext feed,
-  gap/loss events, HTTP/SSE/WebSocket, webhook/file export, and remote policy
-  inputs.
+  gap/loss events, HTTP/SSE/WebSocket, webhook/file export, and one-shot plus
+  polled remote policy inputs.
 - `live-core` needs root or CAP_NET_RAW and covers libpcap loopback, admin
   reload, socket destroy, and TLS key log/session-secret material.
 - `process-ebpf` needs root/bpffs and covers eBPF process observation.

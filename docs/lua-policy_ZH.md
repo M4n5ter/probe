@@ -298,6 +298,23 @@ max_body_bytes = 16777216
 
 remote policy endpoint 必须使用 HTTPS；本地测试用 loopback HTTP 例外。URL credentials 会被拒绝。
 
+endpoint response body 是一个 TOML document。`source` 字段携带原本会放在
+`main.lua` 中的 Lua source；`[manifest]` 表使用与本地 `manifest.toml` 相同的 schema。
+未知的顶层字段或 manifest 字段会被拒绝。
+
+```toml
+source = '''
+function on_http_request_headers(event)
+  return probe.emit_alert("HTTP " .. event.kind.method .. " " .. event.kind.target)
+end
+'''
+
+[manifest]
+id = "http-guard"
+version = "2026-06-30"
+hooks = ["on_http_request_headers"]
+```
+
 运行前校验：
 
 ```bash

@@ -110,7 +110,8 @@ multiplier = 2
 #
 # Use kind = "remote_bundle" when the bundle is served as one bounded TOML
 # document. Remote policy endpoints require HTTPS, except loopback HTTP for
-# local tests.
+# local tests. The response body must contain source = '''...''' and a
+# [manifest] table; see docs/lua-policy.md.
 # kind = "remote_bundle"
 # endpoint = "https://policy.example/probe/http-guard.toml"
 # max_body_bytes = 16777216

@@ -2,7 +2,7 @@ use std::{
     io::{ErrorKind, Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -15,6 +15,7 @@ pub(crate) struct HttpSourceServer {
     endpoint: String,
     listen_port: u16,
     request_count: Arc<AtomicUsize>,
+    body: Arc<Mutex<String>>,
     stop_requested: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<Result<(), String>>>,
 }
@@ -39,6 +40,8 @@ impl HttpSourceServer {
         let endpoint = format!("http://{}{}", listener.local_addr()?, target);
         let request_count = Arc::new(AtomicUsize::new(0));
         let request_count_for_thread = Arc::clone(&request_count);
+        let body = Arc::new(Mutex::new(body));
+        let body_for_thread = Arc::clone(&body);
         let stop_requested = Arc::new(AtomicBool::new(false));
         let stop_requested_for_thread = Arc::clone(&stop_requested);
         let handle = thread::spawn(move || {
@@ -68,6 +71,10 @@ impl HttpSourceServer {
                         "unexpected HTTP source request {method} {request_target}"
                     ));
                 }
+                let body = body_for_thread
+                    .lock()
+                    .map_err(|_| "HTTP source body lock was poisoned".to_string())?
+                    .clone();
                 let response = http_response(content_type, &body);
                 stream
                     .write_all(response.as_bytes())
@@ -81,6 +88,7 @@ impl HttpSourceServer {
             endpoint,
             listen_port,
             request_count,
+            body,
             stop_requested,
             handle: Some(handle),
         })
@@ -92,6 +100,18 @@ impl HttpSourceServer {
 
     pub(crate) fn listen_port(&self) -> u16 {
         self.listen_port
+    }
+
+    pub(crate) fn request_count(&self) -> usize {
+        self.request_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn replace_body(&self, body: String) -> Result<(), Box<dyn std::error::Error>> {
+        *self
+            .body
+            .lock()
+            .map_err(|_| super::e2e_error("HTTP source body lock was poisoned"))? = body;
+        Ok(())
     }
 
     pub(crate) fn finish(mut self) -> Result<usize, Box<dyn std::error::Error>> {
