@@ -19,8 +19,11 @@ use super::{
         MitmBackendConfig, MitmBridgeCase, MitmBridgeDirection, PreparedMitmBackend,
         ProductProxyUpstreamRoute,
     },
+    data_plane::{self, MitmDataPlaneProtocol},
     feed::product_proxy_deny_response_bytes,
     tls::{MitmCaMaterial, SERVER_NAME},
+    websocket,
+    websocket_upstream::ProductProxyTlsWebSocketUpstreamServer,
 };
 use crate::e2e::harness::{
     ChildSupervisor, e2e_error, run_in_own_process_group, stop_running_child,
@@ -60,6 +63,7 @@ pub(super) fn exercise_product_proxy_transparent_tls_path(
             mitm_backend,
         ),
         MitmBridgeDirection::Outbound => exercise_outbound_product_proxy_transparent_tls_path(
+            case,
             intercept_port,
             mitm_ca,
             mitm_backend,
@@ -82,7 +86,7 @@ fn exercise_inbound_product_proxy_transparent_tls_path(
     wait_for_client_namespace_ready(client_namespace.child_mut())?;
     let _network = IsolatedClientNetwork::setup(client_pid)?;
     let upstream_route = product_proxy_upstream_route(mitm_backend)?;
-    let exchange_result = exercise_product_proxy_tls_exchange(upstream_route, |request| {
+    let exchange_result = exercise_product_proxy_tls_exchange(case, upstream_route, |request| {
         run_client_netns_tls_client(client_pid, intercept_port, mitm_ca, request)
     });
     let client_namespace_result = stop_running_child(
@@ -94,17 +98,41 @@ fn exercise_inbound_product_proxy_transparent_tls_path(
 }
 
 fn exercise_outbound_product_proxy_transparent_tls_path(
+    case: MitmBridgeCase,
     intercept_port: u16,
     mitm_ca: &MitmCaMaterial,
     mitm_backend: &PreparedMitmBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream_route = product_proxy_upstream_route(mitm_backend)?;
-    exercise_product_proxy_tls_exchange(upstream_route, |request| {
+    exercise_product_proxy_tls_exchange(case, upstream_route, |request| {
         run_local_tls_client(intercept_port, mitm_ca, request)
     })
 }
 
 fn exercise_product_proxy_tls_exchange(
+    case: MitmBridgeCase,
+    upstream_route: &ProductProxyUpstreamRoute,
+    run_client: impl FnMut(&[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let scenario = data_plane::scenario(case);
+    if !scenario.uses_product_proxy_transparent_tls() {
+        return Err(e2e_error(format!(
+            "{} is not a product proxy transparent TLS data-plane case",
+            case.case_name()
+        ))
+        .into());
+    }
+    match scenario.protocol() {
+        MitmDataPlaneProtocol::BridgeHttp => {
+            exercise_product_proxy_http_tls_exchange(upstream_route, run_client)
+        }
+        MitmDataPlaneProtocol::WebSocket => {
+            exercise_product_proxy_websocket_tls_exchange(upstream_route, run_client)
+        }
+    }
+}
+
+fn exercise_product_proxy_http_tls_exchange(
     upstream_route: &ProductProxyUpstreamRoute,
     mut run_client: impl FnMut(&[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -116,6 +144,18 @@ fn exercise_product_proxy_tls_exchange(
     upstream_result?;
     let response = run_client(mitm_bridge::REQUEST_BYTES)?;
     assert_tls_client_received_deny_response(&response)
+}
+
+fn exercise_product_proxy_websocket_tls_exchange(
+    upstream_route: &ProductProxyUpstreamRoute,
+    mut run_client: impl FnMut(&[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream = ProductProxyTlsWebSocketUpstreamServer::start(upstream_route)?;
+    let response = run_client(&websocket::upgrade_request_bytes());
+    let upstream_result = upstream.wait();
+    let response = response?;
+    assert_tls_client_received_websocket_response(&response)?;
+    upstream_result
 }
 
 fn product_proxy_upstream_route(
@@ -354,6 +394,21 @@ fn assert_tls_client_received_allow_response(
     Err(e2e_error(format!(
         "MITM transparent TLS allow response mismatch: expected {:?}, got {:?}",
         String::from_utf8_lossy(mitm_bridge::ALLOW_RESPONSE_BYTES),
+        String::from_utf8_lossy(response)
+    ))
+    .into())
+}
+
+fn assert_tls_client_received_websocket_response(
+    response: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected = websocket::response_with_frame_bytes();
+    if response == expected {
+        return Ok(());
+    }
+    Err(e2e_error(format!(
+        "MITM transparent TLS WebSocket response mismatch: expected {:?}, got {:?}",
+        String::from_utf8_lossy(&expected),
         String::from_utf8_lossy(response)
     ))
     .into())

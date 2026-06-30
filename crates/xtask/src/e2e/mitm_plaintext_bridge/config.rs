@@ -241,7 +241,7 @@ hooks = ["on_http_request_headers"]
         ),
     )?;
     let protected_target = mitm_bridge::REQUEST_TARGET;
-    let source = if case.spec().policy_hook.enabled() {
+    let source = if case.spec().policy_hook.expects_delegated_decision() {
         format!(
             r#"
 function on_http_request_headers(event)

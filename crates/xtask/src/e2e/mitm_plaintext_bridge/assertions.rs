@@ -23,16 +23,19 @@ use storage::{FjallSpool, StoredEvent};
 use super::{
     backend::{
         MitmBackendConfig, MitmBackendKind, MitmBridgeCase, MitmBridgeDirection,
-        MitmPolicyHookOwner, PreparedMitmBackend, wait_for_managed_backend_pid,
+        PreparedMitmBackend, wait_for_managed_backend_pid,
     },
+    bridge_assertions::assert_expected_bridge_policy_alert,
+    data_plane::{self, MitmDataPlaneProtocol},
     feed::{
         E2E_EXPORT_CURSOR_OWNER, ENFORCEMENT_MANIFEST_ID, ENFORCEMENT_MANIFEST_VERSION,
         EXPECTED_POLICY_VERSION, POLICY_HOOK_REASON_PREFIX, POLICY_HOOK_RESPONSE_REASON,
-        expected_bridge_policy_alert_message, expected_libpcap_targets,
-        expected_policy_alert_message, is_bridge_flow, is_bridge_ingress_bytes,
-        is_product_proxy_allow_request_bytes, is_product_proxy_deny_response_bytes,
-        product_proxy_response_direction,
+        expected_libpcap_targets, expected_policy_alert_message, is_bridge_flow,
+        is_bridge_ingress_bytes, is_product_proxy_allow_request_bytes,
+        is_product_proxy_deny_response_bytes, product_proxy_response_direction,
     },
+    websocket,
+    websocket_assertions::assert_expected_websocket_bridge_export,
 };
 use crate::e2e::{
     harness::{decode_capture_event, decode_envelope, e2e_error},
@@ -110,7 +113,7 @@ pub(super) fn exercise_managed_plaintext_data_plane(
     }
     let target = managed_data_plane_target(case, backend, intercept_port)?;
     let response = plaintext_managed_data_plane_response(case, target)?;
-    let expected = if case.spec().policy_hook == MitmPolicyHookOwner::ManagedFixture {
+    let expected = if case.spec().policy_hook.uses_managed_fixture() {
         mitm_bridge::DENY_RESPONSE_BYTES.to_vec()
     } else {
         mitm_bridge::PASSTHROUGH_RESPONSE_BYTES.to_vec()
@@ -207,7 +210,7 @@ pub(super) fn assert_backend_owned_policy_hook_execution(
     case: MitmBridgeCase,
     backend: &PreparedMitmBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if case.spec().policy_hook != MitmPolicyHookOwner::ManagedFixture {
+    if !case.spec().policy_hook.uses_managed_fixture() {
         return Ok(());
     }
     let Some(action_report_file) = backend.action_report_file.as_ref() else {
@@ -380,36 +383,15 @@ fn assert_livestream_ingress(
     {
         return Err(e2e_error("missing MITM bridge capture-event feed ingress bytes").into());
     }
-    if case.backend() == MitmBackendKind::ProductProxy
-        && !capture_events
-            .iter()
-            .any(|event| is_product_proxy_allow_request_bytes(case, event))
-    {
-        return Err(e2e_error(
-            "missing product MITM proxy routed allow request plaintext feed bytes",
-        )
-        .into());
-    }
-    if case.backend() == MitmBackendKind::ProductProxy
-        && !l7_mitm_plaintext_stream_contains(
-            &capture_events,
-            product_proxy_response_direction(case),
-            mitm_bridge::ALLOW_RESPONSE_BYTES,
-        )
-    {
-        return Err(e2e_error(
-            "missing product MITM proxy routed allow response plaintext feed bytes",
-        )
-        .into());
-    }
-    if case.backend() == MitmBackendKind::ProductProxy
-        && !capture_events
-            .iter()
-            .any(|event| is_product_proxy_deny_response_bytes(case, event))
-    {
-        return Err(
-            e2e_error("missing product MITM proxy deny response plaintext feed bytes").into(),
-        );
+    if case.backend() == MitmBackendKind::ProductProxy {
+        match data_plane::scenario(case).protocol() {
+            MitmDataPlaneProtocol::BridgeHttp => {
+                assert_product_proxy_http_livestream_ingress(case, &capture_events)?;
+            }
+            MitmDataPlaneProtocol::WebSocket => {
+                assert_product_proxy_websocket_livestream_ingress(case, &capture_events)?;
+            }
+        }
     }
     if !capture_events.iter().any(|event| {
         matches!(
@@ -421,6 +403,67 @@ fn assert_livestream_ingress(
         )
     }) {
         return Err(e2e_error("missing required libpcap primary ingress bytes").into());
+    }
+    Ok(())
+}
+
+fn assert_product_proxy_http_livestream_ingress(
+    case: MitmBridgeCase,
+    capture_events: &[CaptureEvent],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !capture_events
+        .iter()
+        .any(|event| is_product_proxy_allow_request_bytes(case, event))
+    {
+        return Err(e2e_error(
+            "missing product MITM proxy routed allow request plaintext feed bytes",
+        )
+        .into());
+    }
+    if !l7_mitm_plaintext_stream_contains(
+        capture_events,
+        product_proxy_response_direction(case),
+        mitm_bridge::ALLOW_RESPONSE_BYTES,
+    ) {
+        return Err(e2e_error(
+            "missing product MITM proxy routed allow response plaintext feed bytes",
+        )
+        .into());
+    }
+    if !capture_events
+        .iter()
+        .any(|event| is_product_proxy_deny_response_bytes(case, event))
+    {
+        return Err(
+            e2e_error("missing product MITM proxy deny response plaintext feed bytes").into(),
+        );
+    }
+    Ok(())
+}
+
+fn assert_product_proxy_websocket_livestream_ingress(
+    case: MitmBridgeCase,
+    capture_events: &[CaptureEvent],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response_direction = product_proxy_response_direction(case);
+    if !l7_mitm_plaintext_stream_contains(
+        capture_events,
+        response_direction,
+        &websocket::upgrade_response_bytes(),
+    ) {
+        return Err(e2e_error(
+            "missing product MITM proxy WebSocket 101 response plaintext feed bytes",
+        )
+        .into());
+    }
+    if !l7_mitm_plaintext_stream_contains(
+        capture_events,
+        response_direction,
+        &websocket::text_frame_bytes(),
+    ) {
+        return Err(
+            e2e_error("missing product MITM proxy WebSocket frame plaintext feed bytes").into(),
+        );
     }
     Ok(())
 }
@@ -476,31 +519,32 @@ fn assert_expected_bridge_export(
     case: MitmBridgeCase,
     envelopes: &[EventEnvelope],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if data_plane::scenario(case).protocol() == MitmDataPlaneProtocol::WebSocket {
+        assert_expected_websocket_bridge_export(case, envelopes)?;
+        return assert_product_outbound_bridge_attribution(case, envelopes);
+    }
+    assert_expected_http_bridge_export(case, envelopes)
+}
+
+fn assert_expected_http_bridge_export(
+    case: MitmBridgeCase,
+    envelopes: &[EventEnvelope],
+) -> Result<(), Box<dyn std::error::Error>> {
     let request_found = envelopes.iter().any(|envelope| {
         is_bridge_flow(case, envelope)
             && matches!(
                 envelope.kind(),
                 EventKind::HttpRequestHeaders(headers)
                     if headers.method.as_deref() == Some("GET")
-                        && headers.target.as_deref() == Some(mitm_bridge::REQUEST_TARGET)
+                        && headers.target.as_deref()
+                            == Some(data_plane::scenario(case).request_target())
             )
     });
     if !request_found {
         return Err(e2e_error("missing MITM bridge parsed HTTP request").into());
     }
 
-    let bridge_alert = expected_bridge_policy_alert_message();
-    let alert_found = envelopes.iter().any(|envelope| {
-        is_bridge_flow(case, envelope)
-            && envelope.policy_version() == Some(EXPECTED_POLICY_VERSION)
-            && matches!(
-                envelope.kind(),
-                EventKind::PolicyAlert(alert) if alert.message == bridge_alert
-            )
-    });
-    if !alert_found {
-        return Err(e2e_error("missing MITM bridge policy alert").into());
-    }
+    assert_expected_bridge_policy_alert(case, envelopes)?;
     assert_product_outbound_bridge_attribution(case, envelopes)
 }
 
@@ -508,7 +552,9 @@ fn assert_product_outbound_bridge_attribution(
     case: MitmBridgeCase,
     envelopes: &[EventEnvelope],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if case != MitmBridgeCase::ProductProxyOutboundTransparentHttpsPolicyHook {
+    if case.backend() != MitmBackendKind::ProductProxy
+        || case.direction() != MitmBridgeDirection::Outbound
+    {
         return Ok(());
     }
     if envelopes.iter().any(|envelope| {
@@ -516,7 +562,8 @@ fn assert_product_outbound_bridge_attribution(
             && matches!(
                 envelope.kind(),
                 EventKind::HttpRequestHeaders(headers)
-                    if headers.target.as_deref() == Some(mitm_bridge::REQUEST_TARGET)
+                    if headers.target.as_deref()
+                        == Some(data_plane::scenario(case).request_target())
             )
             && envelope.flow().is_some_and(|flow| {
                 flow.attribution_confidence > 0
@@ -609,11 +656,36 @@ fn assert_expected_policy_hook_decision(
     case: MitmBridgeCase,
     envelopes: &[EventEnvelope],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !case.spec().policy_hook.enabled() {
-        return Ok(());
+    if !case.spec().policy_hook.expects_delegated_decision() {
+        return assert_no_unexpected_policy_hook_decision(case, envelopes);
     }
     assert_expected_policy_hook_verdict(case, envelopes)?;
     assert_expected_delegated_policy_hook_decision(case, envelopes)
+}
+
+fn assert_no_unexpected_policy_hook_decision(
+    case: MitmBridgeCase,
+    envelopes: &[EventEnvelope],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let observed = envelopes
+        .iter()
+        .filter_map(|envelope| {
+            if !is_bridge_flow(case, envelope) {
+                return None;
+            }
+            match envelope.kind() {
+                EventKind::EnforcementDecision(decision) => Some(format!("{decision:?}")),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    if observed.is_empty() {
+        return Ok(());
+    }
+    Err(e2e_error(format!(
+        "unexpected MITM policy hook enforcement decisions for non-delegated case: {observed:?}"
+    ))
+    .into())
 }
 
 fn assert_expected_policy_hook_verdict(

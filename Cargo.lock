@@ -3342,6 +3342,8 @@ dependencies = [
  "proto",
  "rcgen",
  "rustix",
+ "rustls",
+ "rustls-pemfile",
  "serde_json",
  "signal-hook",
  "socket2",

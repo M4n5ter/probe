@@ -23,6 +23,8 @@ toml = "1.1"
 transparent-linux = { version = "0.1.0", path = "../transparent-linux" }
 enforcement = { version = "0.1.0", path = "../enforcement" }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-pemfile = "2.2"
 
 [lints]
 workspace = true

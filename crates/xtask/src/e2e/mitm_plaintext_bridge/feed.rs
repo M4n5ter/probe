@@ -4,7 +4,10 @@ use capture::CaptureEvent;
 use e2e_support::mitm_bridge;
 use probe_core::{CaptureProviderKind, CaptureSource, Direction, EventEnvelope};
 
-use super::backend::{MitmBackendKind, MitmBridgeCase};
+use super::{
+    backend::{MitmBackendKind, MitmBridgeCase},
+    data_plane,
+};
 
 pub(super) const E2E_EXPORT_CURSOR_OWNER: &str = "e2e-mitm-bridge";
 pub(super) const POLICY_ID: &str = "mitm-bridge-e2e-policy";
@@ -60,7 +63,7 @@ pub(super) fn is_bridge_ingress_bytes(case: MitmBridgeCase, event: &CaptureEvent
     is_l7_mitm_plaintext_bytes(
         event,
         product_proxy_request_direction(case),
-        mitm_bridge::REQUEST_BYTES,
+        data_plane::scenario(case).request_bytes().as_ref(),
     )
 }
 
@@ -123,11 +126,13 @@ pub(super) fn product_proxy_response_direction(case: MitmBridgeCase) -> Directio
     }
 }
 
-pub(super) fn expected_policy_alert_messages() -> std::collections::BTreeSet<String> {
+pub(super) fn expected_policy_alert_messages_for_case(
+    case: MitmBridgeCase,
+) -> std::collections::BTreeSet<String> {
     expected_libpcap_targets()
         .into_iter()
         .map(expected_policy_alert_message)
-        .chain([expected_bridge_policy_alert_message()])
+        .chain([expected_bridge_policy_alert_message(case)])
         .collect()
 }
 
@@ -141,6 +146,9 @@ pub(super) fn expected_policy_alert_message(target: String) -> String {
     format!("{POLICY_ALERT_PREFIX}{target}")
 }
 
-pub(super) fn expected_bridge_policy_alert_message() -> String {
-    format!("{POLICY_ALERT_PREFIX}{}", mitm_bridge::REQUEST_TARGET)
+pub(super) fn expected_bridge_policy_alert_message(case: MitmBridgeCase) -> String {
+    format!(
+        "{POLICY_ALERT_PREFIX}{}",
+        data_plane::scenario(case).request_target()
+    )
 }

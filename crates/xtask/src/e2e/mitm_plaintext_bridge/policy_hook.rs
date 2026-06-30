@@ -20,7 +20,7 @@ use probe_core::Action;
 use serde_json::json;
 
 use super::{
-    backend::{MitmBridgeCase, MitmPolicyHookOwner},
+    backend::MitmBridgeCase,
     feed::{POLICY_HOOK_REASON_PREFIX, POLICY_HOOK_RESPONSE_REASON},
 };
 use crate::e2e::harness::e2e_error;
@@ -92,7 +92,7 @@ pub(super) fn assert_policy_hook_requests(
     case: MitmBridgeCase,
     server: Option<&MitmPolicyHookServer>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if case.spec().policy_hook != MitmPolicyHookOwner::ExternalServer {
+    if !case.spec().policy_hook.uses_external_server() {
         return Ok(());
     }
     let Some(server) = server else {

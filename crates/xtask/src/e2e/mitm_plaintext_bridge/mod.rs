@@ -1,10 +1,15 @@
 mod assertions;
 mod backend;
+mod bridge_assertions;
 mod config;
+mod data_plane;
 mod feed;
 mod policy_hook;
 mod tls;
 mod transparent_tls;
+mod websocket;
+mod websocket_assertions;
+mod websocket_upstream;
 
 use std::{
     env, fs,
@@ -18,13 +23,12 @@ use assertions::{
     exercise_l7_mitm_health_transition, exercise_managed_plaintext_data_plane,
 };
 use backend::{
-    MitmBridgeCase, MitmDataPlaneExercise, MitmPolicyHookOwner, cleanup_managed_backend,
-    prepare_mitm_backend, unused_intercept_port,
+    MitmBridgeCase, cleanup_managed_backend, prepare_mitm_backend, unused_intercept_port,
 };
 use config::{AgentConfigInputs, fixture_config, write_agent_config, write_policy_bundle};
 use feed::{
-    append_bridge_feed_from_harness, expected_libpcap_targets, expected_policy_alert_messages,
-    initialize_bridge_feed,
+    append_bridge_feed_from_harness, expected_libpcap_targets,
+    expected_policy_alert_messages_for_case, initialize_bridge_feed,
 };
 use policy_hook::{MitmPolicyHookServer, assert_policy_hook_requests};
 use transparent_tls::exercise_product_proxy_transparent_tls_path;
@@ -62,6 +66,14 @@ pub(crate) fn run_product_proxy_transparent_https_policy_hook() -> ExitCode {
 
 pub(crate) fn run_product_proxy_outbound_transparent_https_policy_hook() -> ExitCode {
     run_case(MitmBridgeCase::ProductProxyOutboundTransparentHttpsPolicyHook)
+}
+
+pub(crate) fn run_product_proxy_transparent_https_websocket() -> ExitCode {
+    run_case(MitmBridgeCase::ProductProxyTransparentHttpsWebSocket)
+}
+
+pub(crate) fn run_product_proxy_outbound_transparent_https_websocket() -> ExitCode {
+    run_case(MitmBridgeCase::ProductProxyOutboundTransparentHttpsWebSocket)
 }
 
 pub(crate) fn run_policy_hook() -> ExitCode {
@@ -142,7 +154,10 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
     if case.spec().policy_hook.enabled() {
         config::write_enforcement_manifest(&enforcement_manifest_path)?;
     }
-    let policy_hook_server = (case.spec().policy_hook == MitmPolicyHookOwner::ExternalServer)
+    let policy_hook_server = case
+        .spec()
+        .policy_hook
+        .uses_external_server()
         .then(MitmPolicyHookServer::start)
         .transpose()?;
 
@@ -238,7 +253,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
             wait_for_agent_policy_progress(
                 agent.child_mut(),
                 &admin_socket_path,
-                expected_policy_alert_messages().len() as u64,
+                expected_policy_alert_messages_for_case(case).len() as u64,
             )
         },
     );
@@ -261,7 +276,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
             &bridge_progress,
         ],
         || {
-            if case.spec().policy_hook.enabled() {
+            if case.spec().policy_hook.expects_delegated_decision() {
                 wait_for_agent_enforcement_decision_count_at_least(
                     agent.child_mut(),
                     &admin_socket_path,
@@ -343,21 +358,28 @@ fn exercise_backend_data_plane(
     mitm_ca: &tls::MitmCaMaterial,
     mitm_backend: &backend::PreparedMitmBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match case.spec().data_plane {
-        MitmDataPlaneExercise::None => Ok(()),
-        MitmDataPlaneExercise::ManagedPlaintext => {
-            exercise_managed_plaintext_data_plane(case, mitm_backend, intercept_port)
-        }
-        MitmDataPlaneExercise::ProductProxyTransparentTls => {
-            exercise_product_proxy_transparent_tls_path(
-                case,
-                supervisor,
-                intercept_port,
-                mitm_ca,
-                mitm_backend,
-            )
-        }
+    let scenario = data_plane::scenario(case);
+    if scenario.is_none() {
+        return Ok(());
     }
+    if scenario.is_managed_plaintext() {
+        return exercise_managed_plaintext_data_plane(case, mitm_backend, intercept_port);
+    }
+    if scenario.uses_product_proxy_transparent_tls() {
+        return exercise_product_proxy_transparent_tls_path(
+            case,
+            supervisor,
+            intercept_port,
+            mitm_ca,
+            mitm_backend,
+        );
+    }
+    Err(e2e_error(format!(
+        "{} configured an unsupported MITM data-plane exercise {:?}",
+        case.case_name(),
+        case.spec().data_plane
+    ))
+    .into())
 }
 
 struct MitmBridgePhases {
