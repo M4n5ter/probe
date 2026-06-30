@@ -6,7 +6,8 @@ mod process;
 mod temp;
 
 pub(crate) use build::{
-    debug_binary, ensure_e2e_packages_built, run_agent_with_max_events, trusted_system_command,
+    cargo_executable, debug_binary, ensure_e2e_packages_built, run_agent_with_max_events,
+    trusted_system_command, workspace_root,
 };
 pub(crate) use codec::{decode_capture_event, decode_envelope};
 pub(crate) use http_source::HttpSourceServer;

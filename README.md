@@ -509,7 +509,7 @@ same parser, policy, spool, and export path without live capture privileges.
 
 The E2E registry is organized around capability claims:
 
-- `baseline` covers plaintext feed, loss/gap events, HTTP/SSE/WebSocket,
+- `baseline` covers replay, plaintext feed, loss/gap events, HTTP/SSE/WebSocket,
   webhook/file export, and remote policy inputs.
 - `live-core`, `process-ebpf`, and `tls-plaintext` cover privileged libpcap,
   admin reload, socket destroy, TLS material auto-binding, eBPF process

@@ -28,6 +28,7 @@ use super::super::{
     plaintext_feed::run as run_plaintext_feed,
     remote_enforcement_policy::run as run_remote_enforcement_policy,
     remote_policy_bundle::run as run_remote_policy_bundle,
+    replay::run as run_replay,
     sse_plaintext_feed::run as run_sse_plaintext_feed,
     tls_material_auto_binding_loopback::{
         run as run_tls_session_secret_auto_binding_loopback,
@@ -141,6 +142,11 @@ pub(super) enum E2eProfileId {
 }
 
 const E2E_CASES: &[E2eCase] = &[
+    E2eCase {
+        name: "e2e-replay",
+        requirement: E2eRequirement::User,
+        run: E2eCaseRun::ExitCode(run_replay),
+    },
     E2eCase {
         name: "e2e-plaintext-feed",
         requirement: E2eRequirement::User,
@@ -375,6 +381,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
         description: "non-privileged replay/plaintext/export/policy regression suite",
         include_in_product: true,
         cases: E2eProfileCases::Named(&[
+            "e2e-replay",
             "e2e-plaintext-feed",
             "e2e-sse-plaintext-feed",
             "e2e-gap-plaintext-feed",
@@ -637,6 +644,7 @@ mod tests {
             requirements: "user",
             description: "non-privileged replay/plaintext/export/policy regression suite",
             cases: ExpectedProfileCases::Named(&[
+                "e2e-replay",
                 "e2e-plaintext-feed",
                 "e2e-sse-plaintext-feed",
                 "e2e-gap-plaintext-feed",
@@ -722,6 +730,7 @@ mod tests {
             requirements: "user,root/CAP_NET_RAW,root/bpffs,root/net-admin",
             description: "full product capability and Linux artifact acceptance suite",
             cases: ExpectedProfileCases::Named(&[
+                "e2e-replay",
                 "e2e-plaintext-feed",
                 "e2e-sse-plaintext-feed",
                 "e2e-gap-plaintext-feed",

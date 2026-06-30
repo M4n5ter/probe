@@ -484,7 +484,7 @@ agent replay \
 
 E2E registry 按能力声明组织：
 
-- `baseline` 覆盖 plaintext feed、loss/gap event、HTTP/SSE/WebSocket、
+- `baseline` 覆盖 replay、plaintext feed、loss/gap event、HTTP/SSE/WebSocket、
   webhook/file export 和 remote policy input。
 - `live-core`、`process-ebpf` 和 `tls-plaintext` 覆盖 privileged libpcap、admin reload、
   socket destroy、TLS material auto-binding、eBPF process observation 和 libssl plaintext
