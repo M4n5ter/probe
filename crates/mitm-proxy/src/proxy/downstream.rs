@@ -1,7 +1,8 @@
 use std::{
     io::{Read, Write},
-    net::TcpStream,
+    net::{Shutdown, TcpStream},
     sync::Arc,
+    time::Duration,
 };
 
 use crate::{
@@ -46,6 +47,42 @@ impl DownstreamStream {
             Self::Tls(stream) => stream.conn.server_name(),
         }
     }
+
+    pub(super) fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), MitmProxyError> {
+        match self {
+            Self::Plain(stream) => stream.set_read_timeout(timeout),
+            Self::Tls(stream) => stream.sock.set_read_timeout(timeout),
+        }
+        .map_err(io_error("set MITM proxy downstream read timeout"))
+    }
+
+    pub(super) fn shutdown_write(&mut self) -> Result<(), MitmProxyError> {
+        match self {
+            Self::Plain(stream) => stream
+                .shutdown(Shutdown::Write)
+                .map_err(io_error("shutdown MITM proxy downstream write half")),
+            Self::Tls(stream) => {
+                stream.conn.send_close_notify();
+                stream
+                    .flush()
+                    .map_err(io_error("send MITM proxy downstream TLS close notify"))
+            }
+        }
+    }
+
+    pub(super) fn finish(&mut self) -> Result<(), MitmProxyError> {
+        match self {
+            Self::Plain(stream) => stream
+                .flush()
+                .map_err(io_error("flush MITM proxy plaintext downstream")),
+            Self::Tls(stream) => {
+                stream.conn.send_close_notify();
+                stream
+                    .flush()
+                    .map_err(io_error("send MITM proxy TLS close notify"))
+            }
+        }
+    }
 }
 
 impl Read for DownstreamStream {
@@ -69,26 +106,6 @@ impl Write for DownstreamStream {
         match self {
             Self::Plain(stream) => stream.flush(),
             Self::Tls(stream) => stream.flush(),
-        }
-    }
-}
-
-pub(super) trait DownstreamIo: Read + Write {
-    fn finish(&mut self) -> Result<(), MitmProxyError>;
-}
-
-impl DownstreamIo for DownstreamStream {
-    fn finish(&mut self) -> Result<(), MitmProxyError> {
-        match self {
-            Self::Plain(stream) => stream
-                .flush()
-                .map_err(io_error("flush MITM proxy plaintext downstream")),
-            Self::Tls(stream) => {
-                stream.conn.send_close_notify();
-                stream
-                    .flush()
-                    .map_err(io_error("send MITM proxy TLS close notify"))
-            }
         }
     }
 }

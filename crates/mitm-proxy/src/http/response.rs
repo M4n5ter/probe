@@ -7,7 +7,7 @@ use crate::{MitmProxyError, error::io_error};
 use super::{
     common::{
         MAX_CHUNK_LINE_BYTES, MAX_HEADER_BYTES, connection_tokens, find_header_terminator,
-        optional_content_length, parse_chunk_size, parse_header, transfer_encodings,
+        header_values, optional_content_length, parse_chunk_size, parse_header, transfer_encodings,
     },
     request::HttpMessage,
 };
@@ -15,8 +15,9 @@ use super::{
 const RESPONSE_IO_BUFFER_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HttpResponseRelay {
-    pub(crate) close_downstream: bool,
+pub(crate) enum HttpResponseRelay {
+    Http { close_downstream: bool },
+    UpgradeTunnel,
 }
 
 pub(crate) fn relay_http_response(
@@ -26,28 +27,42 @@ pub(crate) fn relay_http_response(
 ) -> Result<HttpResponseRelay, MitmProxyError> {
     let ResponseHead {
         head,
-        close_downstream,
-        body_framing,
+        mode,
         prefetched_body,
-    } = read_response_head(stream, request.is_head())?;
+    } = read_response_head(stream, request)?;
     emit(&head)?;
-    match body_framing {
-        ResponseBodyFraming::NoBody => {
+    match mode {
+        ResponseRelayMode::UpgradeTunnel => {
+            if !prefetched_body.is_empty() {
+                emit(&prefetched_body)?;
+            }
+            Ok(HttpResponseRelay::UpgradeTunnel)
+        }
+        ResponseRelayMode::Http {
+            close_downstream,
+            body_framing: ResponseBodyFraming::NoBody,
+        } => {
             if prefetched_body.is_empty() {
-                Ok(HttpResponseRelay { close_downstream })
+                Ok(HttpResponseRelay::Http { close_downstream })
             } else {
                 Err(MitmProxyError::Http(
                     "HTTP response included a body where none is allowed".to_string(),
                 ))
             }
         }
-        ResponseBodyFraming::ContentLength(content_length) => {
+        ResponseRelayMode::Http {
+            close_downstream,
+            body_framing: ResponseBodyFraming::ContentLength(content_length),
+        } => {
             relay_content_length_body(stream, prefetched_body, content_length, emit)?;
-            Ok(HttpResponseRelay { close_downstream })
+            Ok(HttpResponseRelay::Http { close_downstream })
         }
-        ResponseBodyFraming::Chunked => {
+        ResponseRelayMode::Http {
+            close_downstream,
+            body_framing: ResponseBodyFraming::Chunked,
+        } => {
             relay_chunked_body(stream, prefetched_body, emit)?;
-            Ok(HttpResponseRelay { close_downstream })
+            Ok(HttpResponseRelay::Http { close_downstream })
         }
     }
 }
@@ -82,9 +97,17 @@ pub(crate) fn write_empty_response(
 
 struct ResponseHead {
     head: Vec<u8>,
-    close_downstream: bool,
-    body_framing: ResponseBodyFraming,
+    mode: ResponseRelayMode,
     prefetched_body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseRelayMode {
+    Http {
+        close_downstream: bool,
+        body_framing: ResponseBodyFraming,
+    },
+    UpgradeTunnel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +119,7 @@ enum ResponseBodyFraming {
 
 fn read_response_head(
     stream: &mut impl Read,
-    request_is_head: bool,
+    request: &HttpMessage,
 ) -> Result<ResponseHead, MitmProxyError> {
     let mut raw = Vec::new();
     loop {
@@ -107,11 +130,10 @@ fn read_response_head(
                 )));
             }
             let head_end = header_end + 4;
-            let parsed = parse_response_head(&raw[..header_end], request_is_head)?;
+            let parsed = parse_response_head(&raw[..header_end], request)?;
             return Ok(ResponseHead {
                 head: raw[..head_end].to_vec(),
-                close_downstream: parsed.close_downstream,
-                body_framing: parsed.body_framing,
+                mode: parsed.mode,
                 prefetched_body: raw[head_end..].to_vec(),
             });
         }
@@ -129,8 +151,7 @@ fn read_response_head(
 }
 
 struct ParsedResponseHead {
-    close_downstream: bool,
-    body_framing: ResponseBodyFraming,
+    mode: ResponseRelayMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,7 +167,7 @@ struct ParsedStatus {
 
 fn parse_response_head(
     bytes: &[u8],
-    request_is_head: bool,
+    request: &HttpMessage,
 ) -> Result<ParsedResponseHead, MitmProxyError> {
     let head = std::str::from_utf8(bytes).map_err(|error| {
         MitmProxyError::Http(format!("HTTP response head is not UTF-8: {error}"))
@@ -160,10 +181,16 @@ fn parse_response_head(
         .filter(|line| !line.is_empty())
         .map(parse_header)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(ParsedResponseHead {
-        close_downstream: response_connection_closes(status.version, &headers),
-        body_framing: response_body_framing(status.code, request_is_head, &headers)?,
-    })
+    let close_downstream = response_connection_closes(status.version, &headers);
+    let mode = if response_switches_protocols(status.code, request, &headers)? {
+        ResponseRelayMode::UpgradeTunnel
+    } else {
+        ResponseRelayMode::Http {
+            close_downstream,
+            body_framing: response_body_framing(status.code, request.is_head(), &headers)?,
+        }
+    };
+    Ok(ParsedResponseHead { mode })
 }
 
 fn parse_status(status_line: &str) -> Result<ParsedStatus, MitmProxyError> {
@@ -231,6 +258,29 @@ fn response_connection_closes(version: HttpResponseVersion, headers: &[(String, 
         }
     }
     version == HttpResponseVersion::Http10 && !keep_alive
+}
+
+fn response_switches_protocols(
+    status: u16,
+    request: &HttpMessage,
+    headers: &[(String, String)],
+) -> Result<bool, MitmProxyError> {
+    if status != 101 {
+        return Ok(false);
+    }
+    if !request.requests_protocol_upgrade() {
+        return Err(MitmProxyError::Http(
+            "HTTP 101 response did not match an Upgrade request".to_string(),
+        ));
+    }
+    if !connection_tokens(headers).any(|token| token.eq_ignore_ascii_case("upgrade"))
+        || !header_values(headers, "upgrade").any(|value| !value.trim().is_empty())
+    {
+        return Err(MitmProxyError::Http(
+            "HTTP 101 response omitted Upgrade headers".to_string(),
+        ));
+    }
+    Ok(true)
 }
 
 fn relay_content_length_body(
@@ -467,6 +517,24 @@ mod tests {
             Ok(())
         })?;
 
+        assert_eq!(relayed, raw);
+        Ok(())
+    }
+
+    #[test]
+    fn relay_upgrade_response_preserves_prefetched_tunnel_bytes() -> Result<(), Box<dyn Error>> {
+        let mut request = b"GET /chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".as_slice();
+        let request = read_http_message(&mut request, 1024)?.expect("request should parse");
+        let raw = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n\x81\x02hi";
+        let mut response = raw.as_slice();
+        let mut relayed = Vec::new();
+
+        let relay = relay_http_response(&mut response, &request, |bytes| {
+            relayed.extend_from_slice(bytes);
+            Ok(())
+        })?;
+
+        assert_eq!(relay, HttpResponseRelay::UpgradeTunnel);
         assert_eq!(relayed, raw);
         Ok(())
     }

@@ -250,7 +250,10 @@ L7 MITM 能力事实：
 - 内置 `traffic-probe-mitm-proxy` 覆盖 HTTP plaintext data-plane、显式下游 TLS termination、
   CA-backed dynamic SNI certificate generation、upstream TLS relay、downstream SNI-derived upstream TLS
   server name、HTTP/1.1 ALPN advertise/gate、显式 host-to-upstream route、dynamic flow feed、
+  HTTP/1.1 101 Upgrade 后 raw byte tunnel、Upgrade request/response 预读 tunnel bytes 的保留与转发、
   proxy-side hook deny 执行、透明入站/出站 HTTPS routed allow/deny 规则路径和 durable delegated decision。
+- product proxy 在 Upgrade 后只负责 byte relay 与 `l7_mitm_plaintext` feed；WebSocket handoff、frame 和
+  message metadata 仍由统一 pipeline parser 负责。
 - 强原始归因、ALPN-based multi-protocol routing、通配或 DNS-discovered upstream route selection、
   自动 client trust store 安装和非 HTTP transparent allow-path matrix 仍缺失。
 
@@ -4570,6 +4573,9 @@ Enforcement 验证事实：
   server name、显式 host-to-upstream route、product proxy 透明入站/出站 HTTPS routed allow/deny path、
   backend-owned action report，以及 gated Linux socket destroy destructive path。
 - 已证明 product proxy HTTP/1.1 ALPN advertise/gate。
+- 已通过 product proxy crate-level data-plane tests 证明 HTTP/1.1 101 Upgrade 后 server-to-client
+  frame relay、client-to-server prefetched frame relay 和 plaintext feed；privileged product MITM E2E 证明
+  HTTP transparent allow/deny path，不单独作为透明 WebSocket path 证据。
 - 不证明 ALPN-based multi-protocol routing、通配或 DNS-discovered upstream route selection、强原始归因、
   自动 client trust store 安装、非 HTTP transparent allow-path matrix 或 pre-connect deny。
 
@@ -5955,6 +5961,10 @@ backend-owned hook、downstream deny response，以及显式 TLS certificate/pri
 downstream TLS termination 可由产品二进制持有；同一数据面验证 downstream SNI-derived upstream TLS server name、
 HTTP Host fallback、导入 trust anchor、HTTP response framing 和 upstream TLS relay。native root store 覆盖范围取决于宿主机
 trust store，不作为 crate-level 数据面证据。
+HTTP/1.1 Upgrade path 由 product proxy crate-level tests 覆盖：101 response 后的 server-to-client bytes 会继续
+relay 并写入 plaintext feed；Upgrade request header 后同一 read 中到达的 client-to-server bytes 会先作为
+prefetched tunnel bytes 保留，只有上游返回有效 101 后才转发并写入 feed。该路径保持 byte-level tunnel 语义，
+不在 proxy 内解析 WebSocket frame；WebSocket 语义事件仍由 parser/pipeline 生成。
 透明入站/出站 HTTPS product proxy routed allow/deny path 由 privileged netns E2E 覆盖。入站 case
 证明 TPROXY 规则路径，下游 TLS handshake、显式 host-to-upstream route、upstream TLS relay、HTTP JSON
 hook deny、代理侧 403、plaintext bridge、response plaintext bridge 和 durable delegated decision 属于同一

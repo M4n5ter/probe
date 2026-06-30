@@ -25,6 +25,7 @@ use super::{
 use crate::{http::read_http_message, tls::TlsTerminationConfig};
 
 pub(super) type ObservedTlsHandshakeReceiver = mpsc::Receiver<ObservedTlsHandshake>;
+pub(super) type ObservedClientFrameReceiver = mpsc::Receiver<Vec<u8>>;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ObservedTlsHandshake {
@@ -380,6 +381,108 @@ fn send_policy_hook_request(target: SocketAddr, request: &[u8]) -> Result<String
 
 pub(super) fn upstream_server(response: &'static [u8]) -> Result<SocketAddr, Box<dyn Error>> {
     delayed_upstream_server(response, Duration::ZERO)
+}
+
+pub(super) fn websocket_upstream_server(
+    frame: &'static [u8],
+) -> Result<SocketAddr, Box<dyn Error>> {
+    let (target, _receiver) = websocket_upstream_server_with_client_frame(frame, 0)?;
+    Ok(target)
+}
+
+pub(super) fn websocket_upstream_server_with_client_frame(
+    frame: &'static [u8],
+    client_frame_len: usize,
+) -> Result<(SocketAddr, ObservedClientFrameReceiver), Box<dyn Error>> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let target = listener.local_addr()?;
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        if let Ok((mut stream, _peer)) = listener.accept()
+            && read_http_message(&mut stream, 65_536)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            let _ = stream.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            );
+            let _ = stream.write_all(frame);
+            let _ = stream.flush();
+            if client_frame_len > 0 {
+                let mut client_frame = vec![0_u8; client_frame_len];
+                if stream.read_exact(&mut client_frame).is_ok() {
+                    let _ = sender.send(client_frame);
+                }
+            }
+        }
+    });
+    Ok((target, receiver))
+}
+
+pub(super) fn websocket_upstream_server_after_client_half_close(
+    frame: &'static [u8],
+    client_frame_len: usize,
+) -> Result<(SocketAddr, ObservedClientFrameReceiver), Box<dyn Error>> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let target = listener.local_addr()?;
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        if let Ok((mut stream, _peer)) = listener.accept() {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            if read_http_message(&mut stream, 65_536)
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                return;
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            );
+            let _ = stream.flush();
+            let mut client_frame = vec![0_u8; client_frame_len];
+            if stream.read_exact(&mut client_frame).is_err() {
+                return;
+            }
+            let mut eof = [0_u8; 1];
+            if stream.read(&mut eof).ok() != Some(0) {
+                return;
+            }
+            let _ = sender.send(client_frame);
+            let _ = stream.write_all(frame);
+            let _ = stream.flush();
+        }
+    });
+    Ok((target, receiver))
+}
+
+pub(super) fn upgrade_observer_upstream_server(
+    response: &'static [u8],
+    max_extra_bytes: usize,
+) -> Result<(SocketAddr, ObservedClientFrameReceiver), Box<dyn Error>> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let target = listener.local_addr()?;
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        if let Ok((mut stream, _peer)) = listener.accept() {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+            let Some(request) = read_http_message(&mut stream, 65_536).ok().flatten() else {
+                return;
+            };
+            let _ = stream.write_all(response);
+            let _ = stream.flush();
+            let mut observed = request.prefetched_tunnel_bytes;
+            if observed.is_empty() && max_extra_bytes > 0 {
+                let mut buffer = vec![0_u8; max_extra_bytes];
+                if let Ok(read) = stream.read(&mut buffer) {
+                    observed.extend_from_slice(&buffer[..read]);
+                }
+            }
+            let _ = sender.send(observed);
+        }
+    });
+    Ok((target, receiver))
 }
 
 pub(super) fn tls_upstream_server(

@@ -74,6 +74,28 @@ impl UpstreamConnection {
                 .map_err(io_error("flush MITM proxy upstream TLS request")),
         }
     }
+
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), MitmProxyError> {
+        match self {
+            Self::Plain(stream) => stream.set_read_timeout(timeout),
+            Self::Tls(stream) => stream.sock.set_read_timeout(timeout),
+        }
+        .map_err(io_error("set MITM proxy upstream read timeout"))
+    }
+
+    pub(crate) fn shutdown_write(&mut self) -> Result<(), MitmProxyError> {
+        match self {
+            Self::Plain(stream) => stream
+                .shutdown(Shutdown::Write)
+                .map_err(io_error("shutdown MITM proxy upstream write half")),
+            Self::Tls(stream) => {
+                stream.conn.send_close_notify();
+                stream
+                    .flush()
+                    .map_err(io_error("send MITM proxy upstream TLS close notify"))
+            }
+        }
+    }
 }
 
 impl Read for UpstreamConnection {

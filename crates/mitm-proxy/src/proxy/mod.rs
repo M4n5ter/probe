@@ -4,6 +4,7 @@ mod fixtures;
 mod listener;
 mod policy_hook;
 mod route;
+mod tunnel;
 mod upstream;
 
 use std::{
@@ -37,9 +38,10 @@ use crate::{
     tls::{TlsTerminationConfig, UpstreamTlsConfig},
 };
 
-use self::downstream::{DownstreamAcceptor, DownstreamIo};
+use self::downstream::{DownstreamAcceptor, DownstreamStream};
 use self::listener::ProxyListeners;
 use self::policy_hook::spawn_policy_hook_listener;
+use self::tunnel::relay_upgraded_tunnel;
 use self::upstream::UpstreamConnector;
 
 const ACCEPT_IDLE_SLEEP: Duration = Duration::from_millis(20);
@@ -261,10 +263,10 @@ fn handle_data_connection(
         .peer_addr()
         .map_err(io_error("read MITM proxy downstream peer address"))?;
     let target = recover_target(&downstream, &state.config)?;
-    let mut downstream = state.downstream.accept(downstream)?;
+    let downstream = state.downstream.accept(downstream)?;
     let downstream_tls_server_name = downstream.tls_server_name().map(str::to_string);
     handle_http_connection(
-        &mut downstream,
+        downstream,
         peer,
         target,
         downstream_tls_server_name.as_deref(),
@@ -273,13 +275,14 @@ fn handle_data_connection(
 }
 
 fn handle_http_connection(
-    downstream: &mut impl DownstreamIo,
+    mut downstream: DownstreamStream,
     peer: SocketAddr,
     target: SocketAddr,
     downstream_tls_server_name: Option<&str>,
     state: Arc<ProxyState>,
 ) -> Result<(), MitmProxyError> {
-    let Some(first_request) = read_http_message(downstream, state.config.max_request_bytes)? else {
+    let Some(first_request) = read_http_message(&mut downstream, state.config.max_request_bytes)?
+    else {
         return Ok(());
     };
     let flow = state.flow_factory.flow(peer, target);
@@ -291,7 +294,7 @@ fn handle_http_connection(
     let result = loop {
         let request = match next_request.take() {
             Some(request) => request,
-            None => match read_http_message(downstream, state.config.max_request_bytes) {
+            None => match read_http_message(&mut downstream, state.config.max_request_bytes) {
                 Ok(Some(request)) => request,
                 Ok(None) => break Ok(()),
                 Err(error) => break Err(error),
@@ -299,7 +302,7 @@ fn handle_http_connection(
         };
         request_sequence = request_sequence.saturating_add(1);
         let disposition = match handle_http_request(
-            downstream,
+            &mut downstream,
             target,
             downstream_tls_server_name,
             SequencedHttpRequest {
@@ -324,7 +327,7 @@ fn handle_http_connection(
 }
 
 fn handle_http_request(
-    downstream: &mut impl Write,
+    downstream: &mut DownstreamStream,
     target: SocketAddr,
     downstream_tls_server_name: Option<&str>,
     request: SequencedHttpRequest,
@@ -435,7 +438,7 @@ fn write_deny_response(
 }
 
 fn forward_or_gateway_response(
-    downstream: &mut impl Write,
+    downstream: &mut DownstreamStream,
     target: SocketAddr,
     downstream_tls_server_name: Option<&str>,
     request: HttpMessage,
@@ -445,6 +448,7 @@ fn forward_or_gateway_response(
 ) -> Result<DownstreamDisposition, MitmProxyError> {
     let config = &state.config;
     let request_keep_alive = request.explicit_keep_alive();
+    let has_prefetched_tunnel_bytes = !request.prefetched_tunnel_bytes.is_empty();
     let authority = match observed_authority_for_request(
         config,
         &state.upstream,
@@ -473,7 +477,9 @@ fn forward_or_gateway_response(
             upstream
                 .flush()
                 .map_err(io_error("flush MITM proxy upstream request"))?;
-            upstream.finish_request()?;
+            if !request.requests_protocol_upgrade() {
+                upstream.finish_request()?;
+            }
             let relay = relay_response(
                 &mut upstream,
                 &request,
@@ -486,11 +492,27 @@ fn forward_or_gateway_response(
             downstream
                 .flush()
                 .map_err(io_error("flush MITM proxy downstream response"))?;
-            Ok(if request_keep_alive && !relay.close_downstream {
-                DownstreamDisposition::Continue
-            } else {
-                DownstreamDisposition::Close
-            })
+            match relay {
+                HttpResponseRelay::UpgradeTunnel => {
+                    relay_upgraded_tunnel(
+                        downstream,
+                        &mut upstream,
+                        &state.feed,
+                        flow,
+                        offsets,
+                        config.request_direction,
+                        &request.prefetched_tunnel_bytes,
+                    )?;
+                    Ok(DownstreamDisposition::Close)
+                }
+                HttpResponseRelay::Http { close_downstream } => Ok(
+                    if request_keep_alive && !close_downstream && !has_prefetched_tunnel_bytes {
+                        DownstreamDisposition::Continue
+                    } else {
+                        DownstreamDisposition::Close
+                    },
+                ),
+            }
         }
         Err(_) => write_empty_response(downstream, 502).map(|()| DownstreamDisposition::Close),
     }
@@ -809,6 +831,205 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nchunked"
         );
         assert!(feed_has_bytes(&feed_path, Direction::Outbound, request)?);
+        Ok(())
+    }
+
+    #[test]
+    fn websocket_upgrade_tunnels_server_frame_and_feeds_plaintext() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let upstream = websocket_upstream_server(b"\x81\x02hi")?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                None,
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let request = b"GET /chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let expected_response = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n\x81\x02hi";
+        let mut stream = TcpStream::connect(listen)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(request)?;
+        stream.flush()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(response, expected_response);
+        assert!(feed_has_bytes(&feed_path, Direction::Outbound, request)?);
+        assert_eq!(
+            feed_direction_bytes(&feed_path, Direction::Inbound)?,
+            expected_response
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn websocket_upgrade_forwards_prefetched_client_frame() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let client_frame = b"\x81\x82\x01\x02\x03\x04ik";
+        let (upstream, received_client_frame) =
+            websocket_upstream_server_with_client_frame(b"\x81\x02ok", client_frame.len())?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                None,
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let request =
+            b"GET /chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let mut stream = TcpStream::connect(listen)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(request)?;
+        stream.write_all(client_frame)?;
+        stream.flush()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(
+            received_client_frame.recv_timeout(Duration::from_secs(2))?,
+            client_frame
+        );
+        assert!(feed_has_bytes(&feed_path, Direction::Outbound, request)?);
+        assert!(feed_has_bytes(
+            &feed_path,
+            Direction::Outbound,
+            client_frame
+        )?);
+        assert_eq!(
+            response,
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n\x81\x02ok"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn websocket_upgrade_relay_survives_client_write_half_close() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let client_frame = b"\x81\x82\x01\x02\x03\x04ik";
+        let server_frame = b"\x81\x02ok";
+        let (upstream, received_client_frame) =
+            websocket_upstream_server_after_client_half_close(server_frame, client_frame.len())?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                None,
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let request =
+            b"GET /chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let mut stream = TcpStream::connect(listen)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(request)?;
+        stream.write_all(client_frame)?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert_eq!(
+            received_client_frame.recv_timeout(Duration::from_secs(2))?,
+            client_frame
+        );
+        assert_eq!(
+            response,
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n\x81\x02ok"
+        );
+        assert!(feed_has_bytes(&feed_path, Direction::Outbound, request)?);
+        assert!(feed_has_bytes(
+            &feed_path,
+            Direction::Outbound,
+            client_frame
+        )?);
+        assert_eq!(
+            feed_direction_bytes(&feed_path, Direction::Inbound)?,
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n\x81\x02ok"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn websocket_prefetched_client_frame_is_withheld_without_101() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let client_frame = b"\x81\x82\x01\x02\x03\x04ik";
+        let (upstream, observed_extra_bytes) = upgrade_observer_upstream_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+            client_frame.len(),
+        )?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                None,
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let request =
+            b"GET /chat HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let expected_response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+        let mut stream = TcpStream::connect(listen)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(request)?;
+        stream.write_all(client_frame)?;
+        stream.flush()?;
+        let mut response = vec![0_u8; expected_response.len()];
+        stream.read_exact(&mut response)?;
+        let mut remaining = Vec::new();
+        let close_result = stream.read_to_end(&mut remaining);
+        guard.stop()?;
+
+        close_result?;
+        assert_eq!(response, expected_response);
+        assert!(remaining.is_empty());
+        assert_eq!(
+            observed_extra_bytes.recv_timeout(Duration::from_secs(2))?,
+            Vec::<u8>::new()
+        );
+        assert!(feed_has_bytes(&feed_path, Direction::Outbound, request)?);
+        assert!(!feed_has_bytes(
+            &feed_path,
+            Direction::Outbound,
+            client_frame
+        )?);
         Ok(())
     }
 

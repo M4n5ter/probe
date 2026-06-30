@@ -34,10 +34,8 @@ pub(super) fn optional_content_length(
 }
 
 pub(super) fn transfer_encodings(headers: &[(String, String)]) -> Vec<String> {
-    headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
-        .flat_map(|(_, value)| value.split(','))
+    header_values(headers, "transfer-encoding")
+        .flat_map(|value| value.split(','))
         .map(str::trim)
         .filter(|encoding| !encoding.is_empty())
         .map(str::to_ascii_lowercase)
@@ -45,12 +43,20 @@ pub(super) fn transfer_encodings(headers: &[(String, String)]) -> Vec<String> {
 }
 
 pub(super) fn connection_tokens(headers: &[(String, String)]) -> impl Iterator<Item = &str> {
-    headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
-        .flat_map(|(_, value)| value.split(','))
+    header_values(headers, "connection")
+        .flat_map(|value| value.split(','))
         .map(str::trim)
         .filter(|token| !token.is_empty())
+}
+
+pub(super) fn header_values<'a>(
+    headers: &'a [(String, String)],
+    header_name: &'a str,
+) -> impl Iterator<Item = &'a str> {
+    headers
+        .iter()
+        .filter(move |(name, _)| name.eq_ignore_ascii_case(header_name))
+        .map(|(_, value)| value.as_str())
 }
 
 pub(super) fn parse_chunk_size(line: &[u8]) -> Result<usize, MitmProxyError> {

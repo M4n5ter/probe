@@ -4,8 +4,8 @@ use crate::MitmProxyError;
 
 use super::common::{
     MAX_CHUNK_LINE_BYTES, MAX_HEADER_BYTES, connection_tokens, error_is_read_timeout,
-    find_header_terminator, optional_content_length, parse_chunk_size, parse_header, read_more,
-    transfer_encodings,
+    find_header_terminator, header_values, optional_content_length, parse_chunk_size, parse_header,
+    read_more, transfer_encodings,
 };
 
 #[derive(Debug)]
@@ -15,6 +15,7 @@ pub(crate) struct HttpMessage {
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
     pub(crate) raw: Vec<u8>,
+    pub(crate) prefetched_tunnel_bytes: Vec<u8>,
 }
 
 impl HttpMessage {
@@ -45,6 +46,10 @@ impl HttpMessage {
     pub(crate) fn explicit_keep_alive(&self) -> bool {
         connection_tokens(&self.headers).any(|token| token.eq_ignore_ascii_case("keep-alive"))
     }
+
+    pub(crate) fn requests_protocol_upgrade(&self) -> bool {
+        request_headers_protocol_upgrade(&self.headers)
+    }
 }
 
 pub(crate) fn read_http_message(
@@ -61,6 +66,7 @@ pub(crate) fn read_http_message(
     })?;
     let head = parse_head(&raw[..header_end])?;
     let body_start = header_end + 4;
+    let allow_tunnel_prefetch = request_headers_protocol_upgrade(&head.headers);
     let body = match request_body_framing(&head.headers)? {
         RequestBodyFraming::ContentLength(content_length) => read_content_length_message_body(
             stream,
@@ -68,17 +74,24 @@ pub(crate) fn read_http_message(
             body_start,
             content_length,
             max_bytes,
+            allow_tunnel_prefetch,
         )?,
-        RequestBodyFraming::Chunked => {
-            read_chunked_message_body(stream, &mut raw, body_start, max_bytes)?
-        }
+        RequestBodyFraming::Chunked => read_chunked_message_body(
+            stream,
+            &mut raw,
+            body_start,
+            max_bytes,
+            allow_tunnel_prefetch,
+        )?,
     };
+    let prefetched_tunnel_bytes = raw.split_off(body.raw_end);
     Ok(Some(HttpMessage {
         method: head.method,
         path: head.path,
         headers: head.headers,
-        body,
+        body: body.decoded,
         raw,
+        prefetched_tunnel_bytes,
     }))
 }
 
@@ -91,6 +104,11 @@ struct ParsedHead {
 enum RequestBodyFraming {
     ContentLength(usize),
     Chunked,
+}
+
+struct MessageBody {
+    decoded: Vec<u8>,
+    raw_end: usize,
 }
 
 fn read_until_headers_complete(
@@ -174,7 +192,8 @@ fn read_content_length_message_body(
     body_start: usize,
     content_length: usize,
     max_bytes: usize,
-) -> Result<Vec<u8>, MitmProxyError> {
+    allow_tunnel_prefetch: bool,
+) -> Result<MessageBody, MitmProxyError> {
     while raw.len().saturating_sub(body_start) < content_length {
         if read_more(stream, raw, max_bytes)? == 0 {
             return Err(MitmProxyError::Http(
@@ -183,12 +202,15 @@ fn read_content_length_message_body(
         }
     }
     let body_end = body_start + content_length;
-    if raw.len() > body_end {
+    if raw.len() > body_end && !allow_tunnel_prefetch {
         return Err(MitmProxyError::Http(
             "HTTP pipelining or read-ahead after the fixed body is not supported".to_string(),
         ));
     }
-    Ok(raw[body_start..body_end].to_vec())
+    Ok(MessageBody {
+        decoded: raw[body_start..body_end].to_vec(),
+        raw_end: body_end,
+    })
 }
 
 fn read_chunked_message_body(
@@ -196,7 +218,8 @@ fn read_chunked_message_body(
     raw: &mut Vec<u8>,
     body_start: usize,
     max_bytes: usize,
-) -> Result<Vec<u8>, MitmProxyError> {
+    allow_tunnel_prefetch: bool,
+) -> Result<MessageBody, MitmProxyError> {
     let mut cursor = body_start;
     let mut body = Vec::new();
     loop {
@@ -206,12 +229,15 @@ fn read_chunked_message_body(
         cursor = line_end + 2;
         if chunk_size == 0 {
             cursor = read_message_chunk_trailers(stream, raw, cursor, max_bytes)?;
-            if raw.len() > cursor {
+            if raw.len() > cursor && !allow_tunnel_prefetch {
                 return Err(MitmProxyError::Http(
                     "HTTP pipelining or read-ahead after chunked body is not supported".to_string(),
                 ));
             }
-            return Ok(body);
+            return Ok(MessageBody {
+                decoded: body,
+                raw_end: cursor,
+            });
         }
         let data_end = cursor
             .checked_add(chunk_size)
@@ -234,6 +260,11 @@ fn read_chunked_message_body(
         }
         cursor = delimiter_end;
     }
+}
+
+fn request_headers_protocol_upgrade(headers: &[(String, String)]) -> bool {
+    connection_tokens(headers).any(|token| token.eq_ignore_ascii_case("upgrade"))
+        && header_values(headers, "upgrade").any(|value| !value.trim().is_empty())
 }
 
 fn read_message_chunk_line(
@@ -454,6 +485,22 @@ mod tests {
                 .to_string()
                 .contains("HTTP request has both Content-Length and Transfer-Encoding")
         );
+    }
+
+    #[test]
+    fn upgrade_request_splits_prefetched_tunnel_bytes() -> Result<(), Box<dyn Error>> {
+        let request =
+            b"GET /chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n\x81\x02hi";
+        let mut stream = request.as_slice();
+
+        let message = read_http_message(&mut stream, 1024)?.expect("request should parse");
+
+        assert_eq!(
+            message.raw,
+            b"GET /chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+        );
+        assert_eq!(message.prefetched_tunnel_bytes, b"\x81\x02hi");
+        Ok(())
     }
 
     #[test]
