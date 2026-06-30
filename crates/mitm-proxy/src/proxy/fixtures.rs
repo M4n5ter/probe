@@ -230,7 +230,8 @@ pub(super) fn feed_has_bytes(
     direction: Direction,
     expected: &[u8],
 ) -> Result<bool, Box<dyn Error>> {
-    for line in fs::read_to_string(feed_path)?.lines() {
+    let content = fs::read_to_string(feed_path)?;
+    for line in complete_feed_lines(&content) {
         let event = serde_json::from_str::<CaptureEvent>(line)?;
         if let CaptureEvent::Bytes(bytes) = event
             && bytes.direction == direction

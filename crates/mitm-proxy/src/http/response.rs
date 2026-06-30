@@ -73,26 +73,26 @@ pub(crate) fn write_json_response(
     body: impl Serialize,
 ) -> Result<(), MitmProxyError> {
     let body = serde_json::to_vec(&body)?;
-    write_response(
+    write_simple_response(
         stream,
-        status,
-        status_reason(status),
-        &body,
-        "application/json",
+        simple_response_bytes(status, &body, "application/json"),
     )
 }
 
-pub(crate) fn write_empty_response(
-    stream: &mut impl Write,
-    status: u16,
-) -> Result<(), MitmProxyError> {
-    write_response(
-        stream,
-        status,
+pub(crate) fn empty_response_bytes(status: u16) -> Vec<u8> {
+    simple_response_bytes(status, &[], "application/octet-stream")
+}
+
+pub(crate) fn simple_response_bytes(status: u16, body: &[u8], content_type: &str) -> Vec<u8> {
+    let head = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status_reason(status),
-        &[],
-        "application/octet-stream",
-    )
+        body.len()
+    );
+    let mut response = Vec::with_capacity(head.len() + body.len());
+    response.extend_from_slice(head.as_bytes());
+    response.extend_from_slice(body);
+    response
 }
 
 struct ResponseHead {
@@ -445,23 +445,10 @@ fn read_response_more(
     Ok(read)
 }
 
-fn write_response(
-    stream: &mut impl Write,
-    status: u16,
-    reason: &str,
-    body: &[u8],
-    content_type: &str,
-) -> Result<(), MitmProxyError> {
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
+fn write_simple_response(stream: &mut impl Write, response: Vec<u8>) -> Result<(), MitmProxyError> {
     stream
-        .write_all(head.as_bytes())
-        .map_err(io_error("write MITM proxy HTTP response head"))?;
-    stream
-        .write_all(body)
-        .map_err(io_error("write MITM proxy HTTP response body"))?;
+        .write_all(&response)
+        .map_err(io_error("write MITM proxy HTTP response"))?;
     stream
         .flush()
         .map_err(io_error("flush MITM proxy HTTP response"))

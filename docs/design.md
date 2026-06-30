@@ -490,8 +490,8 @@ TLS 明文与协议能力：
     protective verdict 委托给本机 MITM proxy，并记录 proxy 声明执行同一动作后的 typed durable decision。
     managed backend-owned fixture 证明 HTTP data-plane、plaintext bridge feed 和 action execution contract 可由同一个 backend 进程持有；
     内置 `traffic-probe-mitm-proxy` 进一步证明 `product_proxy` 模式可生成 dynamic `l7_mitm_plaintext`
-    flow、写入 request plaintext feed 和 proxy-generated deny response plaintext feed、接收 proxy-side hook，
-    并在 deny verdict 下向 downstream 返回本地 403。
+    flow、写入 request plaintext feed、上游转发 response plaintext feed 和 proxy-generated deny/gateway
+    response plaintext feed、接收 proxy-side hook，并在 deny verdict 下向 downstream 返回本地 403。
     同一产品 proxy 支持显式配置证书链和私钥来终止下游 TLS；CA-backed dynamic certificate mode
     要求下游 TLS client 发送 DNS SNI。启用 upstream TLS 时，该 SNI 优先作为 upstream TLS server name；
     没有下游 TLS SNI 时，可使用单一有效 HTTP Host 作为 fallback。若 SNI 与 Host 同时存在但不一致，
@@ -506,6 +506,8 @@ TLS 明文与协议能力：
     两个方向都使用 operator-managed CA trust 完成下游 TLS handshake；allow path 根据 Host route
     转发到 upstream TLS server 并写入 request/response plaintext feed；deny path 触发 HTTP JSON hook
     的 deny verdict，返回代理侧 403，并写入 `l7_mitm_plaintext` feed 与 durable delegated decision。
+    无法连接 upstream 或无法生成有效 route/authority 时，proxy-generated gateway response 同样写入
+    `l7_mitm_plaintext` feed，避免 downstream 可见响应从 pipeline 中消失。
     同一透明规则路径也覆盖 WebSocket Upgrade + text frame tunnel：proxy 负责 byte relay 与 plaintext feed，
     parser/pipeline 负责 WebSocket handoff、frame、message 和 policy alert。
     TLS 连接只 advertise `http/1.1` ALPN；无 ALPN 的 legacy client 仍按 HTTP/1.x 处理，明确协商
@@ -5990,10 +5992,11 @@ enforcement crate 定义 proxy-side hook contract 和 `delegated` outcome；Runt
 该 decision 会记录 typed proxy-side execution evidence，表达本机 MITM proxy 对指定保护动作的执行声明；
 managed backend fixture 还验证 HTTP data-plane request bytes 会产生 `l7_mitm_plaintext` bridge event，
 并且 backend-owned deny 会向下游连接返回代理侧 deny response。
-正式 `traffic-probe-mitm-proxy` 还验证 dynamic flow id、request plaintext feed、proxy-generated deny response plaintext feed、
-backend-owned hook、downstream deny response，以及显式 TLS certificate/private-key 或 CA-backed dynamic SNI 配置下的
-downstream TLS termination 可由产品二进制持有；同一数据面验证 downstream SNI-derived upstream TLS server name、
-HTTP Host fallback、导入 trust anchor、HTTP response framing 和 upstream TLS relay。native root store 覆盖范围取决于宿主机
+正式 `traffic-probe-mitm-proxy` 还验证 dynamic flow id、request plaintext feed、
+proxy-generated deny response plaintext feed、proxy-generated gateway response plaintext feed、
+backend-owned hook、downstream deny response，以及显式 TLS certificate/private-key 或 CA-backed dynamic SNI
+配置下的 downstream TLS termination 可由产品二进制持有；同一数据面验证 downstream SNI-derived upstream TLS
+server name、HTTP Host fallback、导入 trust anchor、HTTP response framing 和 upstream TLS relay。native root store 覆盖范围取决于宿主机
 trust store，不作为 crate-level 数据面证据。
 HTTP/1.1 Upgrade path 由 product proxy crate-level tests 覆盖：101 response 后的 server-to-client bytes 会继续
 relay 并写入 plaintext feed；Upgrade request header 后同一 read 中到达的 client-to-server bytes 会先作为

@@ -32,8 +32,8 @@ use crate::{
     feed::{CaptureEventFeedWriter, FlowOffsets},
     flow::{FlowFactory, FlowRegistry, PendingActionKey, ProxyAction},
     http::{
-        HttpMessage, HttpResponseRelay, read_http_message, relay_http_response,
-        write_empty_response,
+        HttpMessage, HttpResponseRelay, empty_response_bytes, read_http_message,
+        relay_http_response, simple_response_bytes,
     },
     tls::{TlsTerminationConfig, UpstreamTlsConfig},
 };
@@ -425,16 +425,33 @@ fn write_deny_response(
     reason: Option<String>,
 ) -> Result<(), MitmProxyError> {
     let body = reason.unwrap_or_else(|| "request denied by local policy".to_string());
-    let response = deny_response_bytes(&body);
-    downstream
-        .write_all(&response)
-        .map_err(io_error("write MITM proxy deny response"))?;
-    downstream
-        .flush()
-        .map_err(io_error("flush MITM proxy deny response"))?;
+    let response = simple_response_bytes(403, body.as_bytes(), "text/plain");
+    write_generated_response(downstream, state, flow, offsets, &response)
+}
+
+fn write_generated_empty_response(
+    downstream: &mut impl Write,
+    state: &ProxyState,
+    flow: &probe_core::FlowContext,
+    offsets: &mut FlowOffsets,
+    status: u16,
+) -> Result<(), MitmProxyError> {
+    let response = empty_response_bytes(status);
+    write_generated_response(downstream, state, flow, offsets, &response)
+}
+
+fn write_generated_response(
+    downstream: &mut impl Write,
+    state: &ProxyState,
+    flow: &probe_core::FlowContext,
+    offsets: &mut FlowOffsets,
+    response: &[u8],
+) -> Result<(), MitmProxyError> {
     let direction = response_direction(state.config.request_direction);
-    let offset = offsets.record(direction, response.len());
-    state.feed.bytes(flow, direction, offset, &response)
+    let mut emitter =
+        DownstreamResponseEmitter::new(downstream, &state.feed, flow, offsets, direction);
+    emitter.emit(response)?;
+    emitter.flush("flush MITM proxy generated response")
 }
 
 fn forward_or_gateway_response(
@@ -457,17 +474,20 @@ fn forward_or_gateway_response(
     ) {
         Ok(authority) => authority,
         Err(_) => {
-            return write_empty_response(downstream, 502).map(|()| DownstreamDisposition::Close);
+            return write_generated_empty_response(downstream, state, flow, offsets, 502)
+                .map(|()| DownstreamDisposition::Close);
         }
     };
     let target = match upstream_target_for_request(config, target, authority) {
         Ok(target) => target,
         Err(_) => {
-            return write_empty_response(downstream, 502).map(|()| DownstreamDisposition::Close);
+            return write_generated_empty_response(downstream, state, flow, offsets, 502)
+                .map(|()| DownstreamDisposition::Close);
         }
     };
     if socket_addr_points_to_listener(target, config.listen) {
-        return write_empty_response(downstream, 200).map(|()| DownstreamDisposition::Close);
+        return write_generated_empty_response(downstream, state, flow, offsets, 200)
+            .map(|()| DownstreamDisposition::Close);
     }
     match state.upstream.connect(target, authority, config.io_timeout) {
         Ok(mut upstream) => {
@@ -514,7 +534,8 @@ fn forward_or_gateway_response(
                 ),
             }
         }
-        Err(_) => write_empty_response(downstream, 502).map(|()| DownstreamDisposition::Close),
+        Err(_) => write_generated_empty_response(downstream, state, flow, offsets, 502)
+            .map(|()| DownstreamDisposition::Close),
     }
 }
 
@@ -554,21 +575,46 @@ fn relay_response(
     offsets: &mut FlowOffsets,
     direction: Direction,
 ) -> Result<HttpResponseRelay, MitmProxyError> {
-    relay_http_response(upstream, request, |bytes| {
-        let offset = offsets.record(direction, bytes.len());
-        feed.bytes(flow, direction, offset, bytes)?;
-        downstream
-            .write_all(bytes)
-            .map_err(io_error("write MITM proxy downstream response"))
-    })
+    let mut emitter = DownstreamResponseEmitter::new(downstream, feed, flow, offsets, direction);
+    relay_http_response(upstream, request, |bytes| emitter.emit(bytes))
 }
 
-fn deny_response_bytes(body: &str) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .into_bytes()
+struct DownstreamResponseEmitter<'a, W: Write + ?Sized> {
+    downstream: &'a mut W,
+    feed: &'a CaptureEventFeedWriter,
+    flow: &'a probe_core::FlowContext,
+    offsets: &'a mut FlowOffsets,
+    direction: Direction,
+}
+
+impl<'a, W: Write + ?Sized> DownstreamResponseEmitter<'a, W> {
+    fn new(
+        downstream: &'a mut W,
+        feed: &'a CaptureEventFeedWriter,
+        flow: &'a probe_core::FlowContext,
+        offsets: &'a mut FlowOffsets,
+        direction: Direction,
+    ) -> Self {
+        Self {
+            downstream,
+            feed,
+            flow,
+            offsets,
+            direction,
+        }
+    }
+
+    fn emit(&mut self, bytes: &[u8]) -> Result<(), MitmProxyError> {
+        let offset = self.offsets.record(self.direction, bytes.len());
+        self.feed.bytes(self.flow, self.direction, offset, bytes)?;
+        self.downstream
+            .write_all(bytes)
+            .map_err(io_error("write MITM proxy downstream response"))
+    }
+
+    fn flush(&mut self, context: &'static str) -> Result<(), MitmProxyError> {
+        self.downstream.flush().map_err(io_error(context))
+    }
 }
 
 fn response_direction(request_direction: Direction) -> Direction {
@@ -640,11 +686,10 @@ mod tests {
         guard.stop()?;
 
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 403 Forbidden"));
-        assert!(feed_has_bytes(
-            &feed_path,
-            Direction::Inbound,
-            deny_response_bytes("blocked by test").as_slice()
-        )?);
+        assert_eq!(
+            feed_direction_bytes(&feed_path, Direction::Inbound)?,
+            response
+        );
         Ok(())
     }
 
@@ -694,11 +739,10 @@ mod tests {
 
         assert!(hook_response.contains(r#""outcome":"delegated""#));
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 403 Forbidden"));
-        assert!(feed_has_bytes(
-            &feed_path,
-            Direction::Inbound,
-            deny_response_bytes("blocked by test").as_slice()
-        )?);
+        assert_eq!(
+            feed_direction_bytes(&feed_path, Direction::Inbound)?,
+            response
+        );
         Ok(())
     }
 
@@ -757,6 +801,41 @@ mod tests {
             "{hook_response}"
         );
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_connect_failure_response_is_written_to_feed() -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let upstream = "127.0.0.1:0".parse()?;
+        let guard = start_test_proxy(
+            test_config(
+                listen,
+                &feed_path,
+                Some(upstream),
+                None,
+                None,
+                Duration::from_secs(2),
+            ),
+            data_listener,
+            None,
+        )?;
+
+        let mut stream = TcpStream::connect(listen)?;
+        stream.write_all(b"GET /gateway HTTP/1.1\r\nHost: example.test\r\n\r\n")?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        guard.stop()?;
+
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 502 Bad Gateway"));
+        assert_eq!(
+            feed_direction_bytes(&feed_path, Direction::Inbound)?,
+            response
+        );
         Ok(())
     }
 
@@ -1177,8 +1256,7 @@ mod tests {
 
         let _ = stream.write_all(second_request);
         let _ = stream.flush();
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
+        let response = read_to_end_or_connection_reset(&mut stream)?;
         guard.stop()?;
 
         assert!(response.is_empty());
@@ -1227,8 +1305,7 @@ mod tests {
 
         let _ = stream.write_all(second_request);
         let _ = stream.flush();
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
+        let response = read_to_end_or_connection_reset(&mut stream)?;
         guard.stop()?;
 
         assert!(response.is_empty());
@@ -1895,5 +1972,14 @@ mod tests {
             }
         });
         Ok(target)
+    }
+
+    fn read_to_end_or_connection_reset(stream: &mut TcpStream) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut response = Vec::new();
+        match stream.read_to_end(&mut response) {
+            Ok(_) => Ok(response),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => Ok(response),
+            Err(error) => Err(error.into()),
+        }
     }
 }

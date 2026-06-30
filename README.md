@@ -102,7 +102,8 @@ proxy-owned upstream sockets bypass recapture through the reserved mark. In
 both directions, the proxy terminates downstream TLS with CA-backed dynamic SNI
 certificates, delegates protective decisions to the HTTP JSON hook, routes
 explicit allow-path hosts to configured upstream targets, emits plaintext bridge
-events, returns proxy-side responses, and records durable delegated decisions.
+events for forwarded responses and proxy-generated deny/gateway responses,
+returns proxy-side responses, and records durable delegated decisions.
 CA-backed dynamic certificate mode requires downstream TLS clients to send DNS
 SNI. When upstream TLS is enabled, the product proxy uses that SNI as the
 upstream TLS server name unless an explicit upstream server name is pinned; it
