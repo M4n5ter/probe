@@ -177,6 +177,7 @@ async fn reload_after_policy_change(context: &WatcherReloadContext) {
         Ok(summary) => {
             info!(
                 loaded_count = summary.loaded_count,
+                active_set_updated = summary.active_set_updated,
                 "reloaded policy bundles after local bundle change"
             );
         }
@@ -288,6 +289,7 @@ mod tests {
             policy_reload: PolicyReloadConfig {
                 watch_local_bundles: true,
                 debounce_ms: 250,
+                ..PolicyReloadConfig::default()
             },
             policies: vec![
                 PolicyConfig {
@@ -367,6 +369,7 @@ mod tests {
         config.policy_reload = PolicyReloadConfig {
             watch_local_bundles: true,
             debounce_ms: MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+            ..PolicyReloadConfig::default()
         };
         config.policies.push(PolicyConfig {
             id: "guard".to_string(),
@@ -416,6 +419,7 @@ mod tests {
         config.policy_reload = PolicyReloadConfig {
             watch_local_bundles: true,
             debounce_ms: MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+            ..PolicyReloadConfig::default()
         };
         config.policies.push(PolicyConfig {
             id: "guard".to_string(),
@@ -461,6 +465,7 @@ mod tests {
         config.policy_reload = PolicyReloadConfig {
             watch_local_bundles: true,
             debounce_ms: MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+            ..PolicyReloadConfig::default()
         };
         config.policies.push(PolicyConfig {
             id: "guard".to_string(),

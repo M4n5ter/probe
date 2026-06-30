@@ -1,3 +1,3 @@
 mod runtime;
 
-pub(crate) use runtime::{PolicyReloadGate, reload_policies};
+pub(crate) use runtime::{PolicyReloadGate, ReloadablePolicySet, reload_policies};

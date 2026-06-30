@@ -834,13 +834,43 @@ socket_path = "/run/traffic-probe/admin.sock"
 ```
 
 Admin reloads validate new policy or enforcement state before swapping runtime
-state. Local policy bundle watching is opt-in:
+state. Local watching and remote polling are opt-in. Use local triggers for
+local sources:
 
 ```toml
 [policy_reload]
 watch_local_bundles = true
 debounce_ms = 500
+
+[enforcement.policy.source]
+kind = "file"
+path = "/etc/probe/enforcement.toml"
+
+[enforcement.policy.reload]
+watch_local_manifest = true
+debounce_ms = 500
 ```
+
+Use remote polling for remote sources:
+
+```toml
+[policy_reload]
+poll_remote_bundles = true
+remote_poll_interval_ms = 60000
+
+[enforcement.policy.source]
+kind = "remote"
+endpoint = "https://policy.example/probe/enforcement.toml"
+
+[enforcement.policy.reload]
+poll_remote_manifest = true
+remote_poll_interval_ms = 60000
+```
+
+Remote polling reloads the currently configured remote source on a fixed
+interval. Policy polling validates unchanged bundles but does not replace the
+active Lua VM when content is unchanged. A failed load keeps the previous active
+policy or enforcement manifest.
 
 ## Operational Commands
 

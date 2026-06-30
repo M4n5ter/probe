@@ -24,6 +24,7 @@ use crate::{
         enforcement_policy_source_load_context_from_plan, policy_source_load_context_from_plan,
         webhook_connection_options_from_plan,
     },
+    enforcement_reload_poller::{self, EnforcementReloadPollerHandle},
     enforcement_reload_watcher::{self, EnforcementReloadWatcherHandle},
     error::AgentError,
     export::{
@@ -34,6 +35,8 @@ use crate::{
         DurableL7MitmAuditSink, L7MitmAuditSink, L7MitmBackendLifecycleGuard, L7MitmRuntime,
         start_backend_lifecycle,
     },
+    policy_reload::ReloadablePolicySet,
+    policy_reload_poller::{self, PolicyReloadPollerHandle},
     policy_reload_watcher::{self, PolicyReloadWatcherHandle},
     runtime_composition::build_runtime_composition,
     shutdown,
@@ -84,12 +87,13 @@ pub(crate) async fn run_live_agent(
     let policy_load_context = policy_source_load_context_from_plan(&plan);
     let policies =
         load_configured_pipeline_policies_with_context(&plan.config, policy_load_context).await?;
+    let reloadable_policies = ReloadablePolicySet::from_loaded(policies);
     let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
     let webhook_connection = webhook_connection_options_from_plan(&plan);
     let export_worker =
         export_worker_config_from_plan(&plan, webhook_connection).map(ExportWorker::new);
     let pipeline_metrics = PipelineRuntimeMetrics::default();
-    let policy_set = policies.into_policy_set();
+    let policy_set = reloadable_policies.policy_set();
     let (enforcement_planner, enforcement_runtime) = EnforcementRuntimeState::from_planner(
         enforcement.planner,
         enforcement.active_policy.clone(),
@@ -102,6 +106,7 @@ pub(crate) async fn run_live_agent(
         enforcement: Some(enforcement_runtime.clone()),
         export_worker: export_worker.as_ref().map(ExportWorker::runtime_state),
         pipeline: Some(pipeline_metrics.clone()),
+        policy_reload_gate: reloadable_policies.reload_gate(),
         policy_set: policy_set.clone(),
         tls_decrypt_hints: Some(tls_decrypt_hint_runtime.clone()),
         tls_plaintext: Some(tls_plaintext_runtime.clone()),
@@ -134,14 +139,35 @@ pub(crate) async fn run_live_agent(
             return Err(error.into());
         }
     };
+    if let Some(poller) = policy_reload_poller::spawn_poller(
+        Arc::clone(&plan_handle),
+        policy_set.clone(),
+        admin_runtime_state.policy_reload_gate.clone(),
+    ) {
+        background_services.policy_reload_poller = Some(poller);
+    }
     match enforcement_reload_watcher::spawn_watcher(
         Arc::clone(&plan_handle),
-        enforcement_runtime,
+        enforcement_runtime.clone(),
         admin_runtime_state.enforcement_reload_gate.clone(),
     ) {
         Ok(watcher) => {
             background_services.enforcement_reload_watcher = watcher;
         }
+        Err(error) => {
+            background_services.stop().await;
+            return Err(error.into());
+        }
+    };
+    match enforcement_reload_poller::spawn_poller(
+        Arc::clone(&plan_handle),
+        enforcement_runtime,
+        admin_runtime_state.enforcement_reload_gate.clone(),
+    ) {
+        Ok(Some(poller)) => {
+            background_services.enforcement_reload_poller = Some(poller);
+        }
+        Ok(None) => {}
         Err(error) => {
             background_services.stop().await;
             return Err(error.into());
@@ -232,7 +258,9 @@ pub(crate) async fn run_live_agent(
 
 struct BackgroundServices {
     admin_server: Option<AdminServerHandle>,
+    policy_reload_poller: Option<PolicyReloadPollerHandle>,
     policy_reload_watcher: Option<PolicyReloadWatcherHandle>,
+    enforcement_reload_poller: Option<EnforcementReloadPollerHandle>,
     enforcement_reload_watcher: Option<EnforcementReloadWatcherHandle>,
 }
 
@@ -240,14 +268,22 @@ impl BackgroundServices {
     fn new(admin_server: Option<AdminServerHandle>) -> Self {
         Self {
             admin_server,
+            policy_reload_poller: None,
             policy_reload_watcher: None,
+            enforcement_reload_poller: None,
             enforcement_reload_watcher: None,
         }
     }
 
     async fn stop(&mut self) {
+        if let Some(poller) = self.enforcement_reload_poller.take() {
+            poller.stop().await;
+        }
         if let Some(watcher) = self.enforcement_reload_watcher.take() {
             watcher.stop().await;
+        }
+        if let Some(poller) = self.policy_reload_poller.take() {
+            poller.stop().await;
         }
         if let Some(watcher) = self.policy_reload_watcher.take() {
             watcher.stop().await;

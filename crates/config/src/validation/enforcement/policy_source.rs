@@ -1,6 +1,8 @@
 use crate::{
     ConfigViolation, EnforcementPolicyReloadConfig, EnforcementPolicySourceConfig,
+    MAX_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS,
     MAX_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+    MIN_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS,
     MIN_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS, RemoteEnforcementPolicyBodyLimitBytes,
     RemoteEnforcementPolicyBodyLimitError,
 };
@@ -56,6 +58,12 @@ pub(super) fn validate_reload(
     reload: &EnforcementPolicyReloadConfig,
     violations: &mut Vec<ConfigViolation>,
 ) {
+    if reload.watch_local_manifest && reload.poll_remote_manifest {
+        violations.push(ConfigViolation {
+            field: "enforcement.policy.reload".to_string(),
+            reason: "enforcement policy reload cannot watch a local manifest and poll a remote manifest at the same time because enforcement policy has a single source".to_string(),
+        });
+    }
     if reload.watch_local_manifest
         && !matches!(
             source,
@@ -69,6 +77,15 @@ pub(super) fn validate_reload(
                 .to_string(),
         });
     }
+    if reload.poll_remote_manifest
+        && !matches!(source, EnforcementPolicySourceConfig::Remote { .. })
+    {
+        violations.push(ConfigViolation {
+            field: "enforcement.policy.reload.poll_remote_manifest".to_string(),
+            reason: "remote enforcement policy polling requires a remote enforcement policy source"
+                .to_string(),
+        });
+    }
     if !(MIN_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS
         ..=MAX_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS)
         .contains(&reload.debounce_ms)
@@ -77,6 +94,17 @@ pub(super) fn validate_reload(
             field: "enforcement.policy.reload.debounce_ms".to_string(),
             reason: format!(
                 "enforcement policy reload watcher debounce_ms must be between {MIN_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS} and {MAX_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS}"
+            ),
+        });
+    }
+    if !(MIN_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS
+        ..=MAX_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS)
+        .contains(&reload.remote_poll_interval_ms)
+    {
+        violations.push(ConfigViolation {
+            field: "enforcement.policy.reload.remote_poll_interval_ms".to_string(),
+            reason: format!(
+                "remote enforcement policy poll interval must be between {MIN_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS} and {MAX_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS}"
             ),
         });
     }

@@ -5,26 +5,67 @@ use runtime::RuntimePlan;
 use tokio::sync::Mutex;
 
 use crate::configured_policy::{
-    ConfiguredPolicyError, ConfiguredPolicySource, load_configured_pipeline_policies_with_context,
+    ConfiguredPolicyContent, ConfiguredPolicyError, ConfiguredPolicySource, LoadedPipelinePolicies,
+    load_configured_pipeline_policies_with_context,
 };
 use crate::control_plane_http::policy_source_load_context_from_plan;
 
 #[derive(Clone)]
 pub(crate) struct PolicyReloadGate {
-    inner: Arc<Mutex<()>>,
+    inner: Arc<Mutex<PolicyReloadState>>,
+}
+
+#[derive(Default)]
+struct PolicyReloadState {
+    active_content: Option<Vec<ConfiguredPolicyContent>>,
 }
 
 impl Default for PolicyReloadGate {
     fn default() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(())),
+            inner: Arc::new(Mutex::new(PolicyReloadState::default())),
         }
+    }
+}
+
+impl PolicyReloadGate {
+    fn with_active_content(active_content: Vec<ConfiguredPolicyContent>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(PolicyReloadState {
+                active_content: Some(active_content),
+            })),
+        }
+    }
+}
+
+pub(crate) struct ReloadablePolicySet {
+    policy_set: PipelinePolicySet,
+    reload_gate: PolicyReloadGate,
+}
+
+impl ReloadablePolicySet {
+    pub(crate) fn from_loaded(loaded: LoadedPipelinePolicies) -> Self {
+        let reload_gate = PolicyReloadGate::with_active_content(loaded.content.clone());
+        let policy_set = loaded.into_policy_set();
+        Self {
+            policy_set,
+            reload_gate,
+        }
+    }
+
+    pub(crate) fn policy_set(&self) -> PipelinePolicySet {
+        self.policy_set.clone()
+    }
+
+    pub(crate) fn reload_gate(&self) -> PolicyReloadGate {
+        self.reload_gate.clone()
     }
 }
 
 pub(crate) struct PolicyReloadSummary {
     pub loaded_count: u64,
     pub policies: Vec<ConfiguredPolicySource>,
+    pub active_set_updated: bool,
 }
 
 pub(crate) async fn reload_policies(
@@ -32,7 +73,7 @@ pub(crate) async fn reload_policies(
     policy_set: &PipelinePolicySet,
     gate: &PolicyReloadGate,
 ) -> Result<PolicyReloadSummary, ConfiguredPolicyError> {
-    let _reload_guard = gate.inner.lock().await;
+    let mut state = gate.inner.lock().await;
     let loaded = load_configured_pipeline_policies_with_context(
         &plan.config,
         policy_source_load_context_from_plan(plan),
@@ -40,10 +81,18 @@ pub(crate) async fn reload_policies(
     .await?;
     let loaded_count = loaded.policies.len() as u64;
     let policies = loaded.sources;
-    policy_set.replace(loaded.policies);
+    let active_set_updated = state
+        .active_content
+        .as_ref()
+        .is_none_or(|active_content| active_content != &loaded.content);
+    if active_set_updated {
+        policy_set.replace(loaded.policies);
+        state.active_content = Some(loaded.content);
+    }
     Ok(PolicyReloadSummary {
         loaded_count,
         policies,
+        active_set_updated,
     })
 }
 

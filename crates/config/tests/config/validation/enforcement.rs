@@ -222,6 +222,125 @@ watch_local_manifest = true
 }
 
 #[test]
+fn validation_accepts_enforcement_policy_remote_reload_polling_config()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.policy.source]
+kind = "remote"
+endpoint = "https://control.example/enforcement"
+
+[enforcement.policy.reload]
+poll_remote_manifest = true
+remote_poll_interval_ms = 250
+"#,
+    )?;
+
+    config.validate_basic()?;
+
+    assert!(config.enforcement.policy.reload.poll_remote_manifest);
+    assert_eq!(
+        config.enforcement.policy.reload.remote_poll_interval_ms,
+        250
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_enforcement_policy_remote_reload_polling_without_remote_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    for source in [
+        r#"
+[enforcement.policy.source]
+kind = "none"
+"#,
+        r#"
+[enforcement.policy.source]
+kind = "file"
+path = "/etc/probe/enforcement.toml"
+"#,
+    ] {
+        let config = AgentConfig::from_toml_str(&format!(
+            r#"
+{source}
+
+[enforcement.policy.reload]
+poll_remote_manifest = true
+"#,
+        ))?;
+
+        let error = config
+            .validate_basic()
+            .expect_err("remote polling must require a remote source");
+
+        assert!(error.to_string().contains(
+            "remote enforcement policy polling requires a remote enforcement policy source"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_enforcement_policy_reload_watch_and_poll_together()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[enforcement.policy.source]
+kind = "remote"
+endpoint = "https://control.example/enforcement"
+
+[enforcement.policy.reload]
+watch_local_manifest = true
+poll_remote_manifest = true
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("enforcement reload cannot watch and poll one source");
+
+    assert!(
+        error.to_string().contains(
+            "enforcement policy reload cannot watch a local manifest and poll a remote manifest at the same time"
+        ),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_invalid_enforcement_policy_remote_reload_poll_interval()
+-> Result<(), Box<dyn std::error::Error>> {
+    for interval in [
+        MIN_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS - 1,
+        MAX_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS + 1,
+    ] {
+        let config = AgentConfig::from_toml_str(&format!(
+            r#"
+[enforcement.policy.source]
+kind = "remote"
+endpoint = "https://control.example/enforcement"
+
+[enforcement.policy.reload]
+poll_remote_manifest = true
+remote_poll_interval_ms = {interval}
+"#
+        ))?;
+
+        let error = config
+            .validate_basic()
+            .expect_err("invalid remote poll interval must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("remote enforcement policy poll interval must be between"),
+            "unexpected error: {error}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn validation_rejects_incomplete_transparent_interception_config()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(

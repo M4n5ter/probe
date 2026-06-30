@@ -3,6 +3,7 @@ use thiserror::Error;
 use crate::{
     capture_event_feed::CaptureEventFeedLoadError, check::CheckError,
     configured_enforcement::ConfiguredEnforcementError, configured_policy::ConfiguredPolicyError,
+    enforcement_reload::EnforcementReloadError,
     enforcement_reload_watcher::EnforcementReloadWatcherError, export::ExportDrainError,
     plaintext_feed::PlaintextFeedLoadError, policy_reload_watcher::PolicyReloadWatcherError,
     tls_plaintext::TlsDecryptHintError, transparent_interception::TransparentInterceptionError,
@@ -66,6 +67,8 @@ pub(crate) enum AgentError {
     PolicyReloadWatcher(#[from] PolicyReloadWatcherError),
     #[error("enforcement policy reload watcher error: {0}")]
     EnforcementReloadWatcher(#[from] EnforcementReloadWatcherError),
+    #[error("enforcement policy reload poller error: {0}")]
+    EnforcementReloadPoller(#[from] EnforcementReloadError),
     #[error("admin error: {0}")]
     Admin(#[from] crate::admin::AdminError),
     #[error("{0}")]

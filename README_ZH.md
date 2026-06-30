@@ -792,14 +792,42 @@ enabled = true
 socket_path = "/run/traffic-probe/admin.sock"
 ```
 
-admin reload 会先校验新 policy 或 enforcement state，再替换 runtime state。本地 policy bundle
-watcher 需要显式开启：
+admin reload 会先校验新 policy 或 enforcement state，再替换 runtime state。本地 watcher 和
+remote polling 都需要显式开启。本地 source 使用本地触发器：
 
 ```toml
 [policy_reload]
 watch_local_bundles = true
 debounce_ms = 500
+
+[enforcement.policy.source]
+kind = "file"
+path = "/etc/probe/enforcement.toml"
+
+[enforcement.policy.reload]
+watch_local_manifest = true
+debounce_ms = 500
 ```
+
+remote source 使用 remote polling：
+
+```toml
+[policy_reload]
+poll_remote_bundles = true
+remote_poll_interval_ms = 60000
+
+[enforcement.policy.source]
+kind = "remote"
+endpoint = "https://policy.example/probe/enforcement.toml"
+
+[enforcement.policy.reload]
+poll_remote_manifest = true
+remote_poll_interval_ms = 60000
+```
+
+remote polling 会按固定间隔重新加载当前配置的 remote source。policy polling 会校验未变化的
+bundle，但 content 未变化时不会替换 active Lua VM。加载失败会保留上一份 active policy 或
+enforcement manifest。
 
 ## 运维命令
 

@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    ConfigViolation, MAX_POLICY_RELOAD_WATCH_DEBOUNCE_MS, MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
-    PolicyConfig, PolicyReloadConfig, PolicySourceConfig, RemotePolicyBundleBodyLimitBytes,
-    RemotePolicyBundleBodyLimitError,
+    ConfigViolation, MAX_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS,
+    MAX_POLICY_RELOAD_WATCH_DEBOUNCE_MS, MIN_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS,
+    MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS, PolicyConfig, PolicyReloadConfig, PolicySourceConfig,
+    RemotePolicyBundleBodyLimitBytes, RemotePolicyBundleBodyLimitError,
+    has_enabled_remote_policy_bundle_source,
 };
 
 use super::remote_endpoint::validate_remote_endpoint;
@@ -23,7 +25,11 @@ pub(super) fn validate(policies: &[PolicyConfig], violations: &mut Vec<ConfigVio
     }
 }
 
-pub(super) fn validate_reload(reload: &PolicyReloadConfig, violations: &mut Vec<ConfigViolation>) {
+pub(super) fn validate_reload(
+    policies: &[PolicyConfig],
+    reload: &PolicyReloadConfig,
+    violations: &mut Vec<ConfigViolation>,
+) {
     if !(MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS..=MAX_POLICY_RELOAD_WATCH_DEBOUNCE_MS)
         .contains(&reload.debounce_ms)
     {
@@ -31,6 +37,22 @@ pub(super) fn validate_reload(reload: &PolicyReloadConfig, violations: &mut Vec<
             field: "policy_reload.debounce_ms".to_string(),
             reason: format!(
                 "policy reload watcher debounce_ms must be between {MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS} and {MAX_POLICY_RELOAD_WATCH_DEBOUNCE_MS}"
+            ),
+        });
+    }
+    if reload.poll_remote_bundles && !has_enabled_remote_policy_bundle_source(policies) {
+        violations.push(ConfigViolation {
+            field: "policy_reload.poll_remote_bundles".to_string(),
+            reason: "remote policy bundle polling requires at least one enabled remote policy bundle source".to_string(),
+        });
+    }
+    if !(MIN_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS..=MAX_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS)
+        .contains(&reload.remote_poll_interval_ms)
+    {
+        violations.push(ConfigViolation {
+            field: "policy_reload.remote_poll_interval_ms".to_string(),
+            reason: format!(
+                "remote policy bundle poll interval must be between {MIN_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS} and {MAX_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS}"
             ),
         });
     }

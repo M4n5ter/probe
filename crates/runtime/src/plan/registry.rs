@@ -157,7 +157,7 @@ fn default_platform_capabilities(
         ),
         CapabilityState::degraded(
             CapabilityKind::PolicyRuntime,
-            "policy runtime is wired into replay and live capture, including multiple active bundles, runtime error audit, manual admin policy bundle reload, and explicit local policy bundle watcher reload, but main config reload, remote control-plane updates, and policy state migration are not implemented",
+            "policy runtime is wired into replay and live capture, including multiple active bundles, runtime error audit, manual admin policy bundle reload, explicit local policy bundle watcher reload, and explicit remote policy bundle polling, but main config reload and policy state migration are not implemented",
         ),
         CapabilityState::degraded(
             CapabilityKind::DurableSpool,

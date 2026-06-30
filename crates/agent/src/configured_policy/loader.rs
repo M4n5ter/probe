@@ -53,6 +53,7 @@ pub struct ConfiguredPolicySource {
 pub struct LoadedConfiguredPolicy {
     pub runtime: PolicyRuntime,
     pub source: ConfiguredPolicySource,
+    pub content: ConfiguredPolicyContent,
     pub selector: Option<CompiledSelector>,
 }
 
@@ -65,12 +66,21 @@ impl LoadedConfiguredPolicy {
 pub struct LoadedPipelinePolicies {
     pub policies: Vec<PipelinePolicy>,
     pub sources: Vec<ConfiguredPolicySource>,
+    pub content: Vec<ConfiguredPolicyContent>,
 }
 
 impl LoadedPipelinePolicies {
     pub fn into_policy_set(self) -> PipelinePolicySet {
         PipelinePolicySet::new(self.policies)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredPolicyContent {
+    id: String,
+    source: super::source::PolicySourceSnapshot,
+    manifest: policy::PolicyManifest,
+    main: String,
 }
 
 pub fn configured_policy_selection(config: &AgentConfig) -> ConfiguredPolicySelection {
@@ -112,11 +122,19 @@ pub async fn load_configured_pipeline_policies_with_context(
         .iter()
         .map(|policy| policy.source.clone())
         .collect::<Vec<_>>();
+    let content = policies
+        .iter()
+        .map(|policy| policy.content.clone())
+        .collect::<Vec<_>>();
     let policies = policies
         .into_iter()
         .map(LoadedConfiguredPolicy::into_pipeline_policy)
         .collect::<Vec<_>>();
-    Ok(LoadedPipelinePolicies { policies, sources })
+    Ok(LoadedPipelinePolicies {
+        policies,
+        sources,
+        content,
+    })
 }
 
 async fn read_configured_policy(
@@ -138,6 +156,12 @@ async fn read_configured_policy(
         })
         .transpose()?;
     let source = super::source::load_policy_source_with_context(policy, context).await?;
+    let content = ConfiguredPolicyContent {
+        id: policy.id.clone(),
+        source: source.source.clone(),
+        manifest: source.manifest.clone(),
+        main: source.main.clone(),
+    };
     let runtime = PolicyRuntime::from_source_with_required_hooks(source.manifest, &source.main)
         .map_err(|source| ConfiguredPolicyError::PolicyLoad {
             id: policy.id.clone(),
@@ -152,6 +176,7 @@ async fn read_configured_policy(
             source: source.source,
             selector_configured: policy.selector.is_some(),
         },
+        content,
         selector,
     })
 }

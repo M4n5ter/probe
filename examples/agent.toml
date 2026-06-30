@@ -100,6 +100,30 @@ multiplier = 2
 # [exporters.tls]
 # trust_anchor_refs = ["collector-ca"]
 
+# [[policies]]
+# id = "http-guard"
+# enabled = true
+#
+# [policies.source]
+# kind = "local_directory"
+# path = "/etc/probe/policies/http-guard"
+#
+# Use kind = "remote_bundle" when the bundle is served as one bounded TOML
+# document. Remote policy endpoints require HTTPS, except loopback HTTP for
+# local tests.
+# kind = "remote_bundle"
+# endpoint = "https://policy.example/probe/http-guard.toml"
+# max_body_bytes = 16777216
+#
+# [policy_reload]
+# Local directory watching and remote bundle polling are both opt-in. Each
+# reload validates every enabled policy source before atomically swapping the
+# active policy set; failures keep the previous active set.
+# watch_local_bundles = false
+# debounce_ms = 500
+# poll_remote_bundles = false
+# remote_poll_interval_ms = 60000
+
 [tls.plaintext.instrumentation]
 # libssl uprobe plaintext requires eBPF host prerequisites, an eBPF TLS object,
 # and a selector that scopes the instrumentation target.
@@ -168,11 +192,13 @@ kind = "none"
 # max_body_bytes = 16777216
 
 [enforcement.policy.reload]
-# Watches only local file/directory manifest sources from the current runtime
-# plan. Remote policy sources can be reloaded manually through the admin
-# command, but are not polled or watched in the background.
+# Local file/directory watching and remote manifest polling are both opt-in.
+# Each reload validates and compiles the new manifest before swapping runtime
+# enforcement state; failures keep the previous active manifest and planner.
 watch_local_manifest = false
 debounce_ms = 500
+poll_remote_manifest = false
+remote_poll_interval_ms = 60000
 
 [enforcement.interception]
 # Transparent interception and MITM require root/net-admin and should be scoped

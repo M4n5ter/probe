@@ -8,6 +8,9 @@ pub const MAX_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_POLICY_RELOAD_WATCH_DEBOUNCE_MS: u64 = 500;
 pub const MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS: u64 = 50;
 pub const MAX_POLICY_RELOAD_WATCH_DEBOUNCE_MS: u64 = 60_000;
+pub const DEFAULT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS: u64 = 60_000;
+pub const MIN_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS: u64 = 50;
+pub const MAX_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS: u64 = 3_600_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
@@ -85,6 +88,8 @@ impl std::error::Error for RemotePolicyBundleBodyLimitError {}
 pub struct PolicyReloadConfig {
     pub watch_local_bundles: bool,
     pub debounce_ms: u64,
+    pub poll_remote_bundles: bool,
+    pub remote_poll_interval_ms: u64,
 }
 
 impl Default for PolicyReloadConfig {
@@ -92,6 +97,8 @@ impl Default for PolicyReloadConfig {
         Self {
             watch_local_bundles: false,
             debounce_ms: DEFAULT_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+            poll_remote_bundles: false,
+            remote_poll_interval_ms: DEFAULT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS,
         }
     }
 }
@@ -126,6 +133,12 @@ pub enum PolicySourceConfig {
         endpoint: String,
         max_body_bytes: Option<u64>,
     },
+}
+
+pub fn has_enabled_remote_policy_bundle_source(policies: &[PolicyConfig]) -> bool {
+    policies.iter().any(|policy| {
+        policy.enabled && matches!(policy.source, PolicySourceConfig::RemoteBundle { .. })
+    })
 }
 
 impl Default for PolicySourceConfig {
@@ -194,6 +207,8 @@ mod tests {
             PolicyReloadConfig {
                 watch_local_bundles: false,
                 debounce_ms: DEFAULT_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+                poll_remote_bundles: false,
+                remote_poll_interval_ms: DEFAULT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS,
             }
         );
     }

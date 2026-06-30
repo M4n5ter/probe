@@ -825,6 +825,7 @@ mod tests {
         EnforcementPolicyReloadConfig {
             watch_local_manifest: true,
             debounce_ms: MIN_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+            ..EnforcementPolicyReloadConfig::default()
         }
     }
 

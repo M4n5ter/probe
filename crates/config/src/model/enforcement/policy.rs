@@ -8,6 +8,9 @@ pub const MAX_REMOTE_ENFORCEMENT_POLICY_BODY_LIMIT_BYTES: u64 = 512 * 1024 * 102
 pub const DEFAULT_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS: u64 = 500;
 pub const MIN_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS: u64 = 50;
 pub const MAX_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS: u64 = 60_000;
+pub const DEFAULT_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS: u64 = 60_000;
+pub const MIN_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS: u64 = 50;
+pub const MAX_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS: u64 = 3_600_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
@@ -91,6 +94,8 @@ pub struct EnforcementPolicyConfig {
 pub struct EnforcementPolicyReloadConfig {
     pub watch_local_manifest: bool,
     pub debounce_ms: u64,
+    pub poll_remote_manifest: bool,
+    pub remote_poll_interval_ms: u64,
 }
 
 impl Default for EnforcementPolicyReloadConfig {
@@ -98,6 +103,8 @@ impl Default for EnforcementPolicyReloadConfig {
         Self {
             watch_local_manifest: false,
             debounce_ms: DEFAULT_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+            poll_remote_manifest: false,
+            remote_poll_interval_ms: DEFAULT_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS,
         }
     }
 }
@@ -188,6 +195,8 @@ mod tests {
             EnforcementPolicyReloadConfig {
                 watch_local_manifest: false,
                 debounce_ms: DEFAULT_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS,
+                poll_remote_manifest: false,
+                remote_poll_interval_ms: DEFAULT_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS,
             }
         );
     }

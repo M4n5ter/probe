@@ -208,3 +208,93 @@ debounce_ms = {debounce_ms}
     }
     Ok(())
 }
+
+#[test]
+fn validation_accepts_policy_remote_reload_polling_config() -> Result<(), Box<dyn std::error::Error>>
+{
+    let config = AgentConfig::from_toml_str(
+        r#"
+[policy_reload]
+poll_remote_bundles = true
+remote_poll_interval_ms = 250
+
+[[policies]]
+id = "guard"
+enabled = true
+
+[policies.source]
+kind = "remote_bundle"
+endpoint = "https://control.example/policies/guard"
+"#,
+    )?;
+
+    config.validate_basic()?;
+
+    assert!(config.policy_reload.poll_remote_bundles);
+    assert_eq!(config.policy_reload.remote_poll_interval_ms, 250);
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_policy_remote_reload_polling_without_remote_bundle()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[policy_reload]
+poll_remote_bundles = true
+
+[[policies]]
+id = "guard"
+enabled = true
+
+[policies.source]
+kind = "local_directory"
+path = "/tmp/guard.bundle"
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("remote polling must require an enabled remote bundle");
+
+    assert!(error.to_string().contains(
+        "remote policy bundle polling requires at least one enabled remote policy bundle source"
+    ));
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_invalid_policy_remote_reload_poll_interval()
+-> Result<(), Box<dyn std::error::Error>> {
+    for interval in [
+        MIN_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS - 1,
+        MAX_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS + 1,
+    ] {
+        let config = AgentConfig::from_toml_str(&format!(
+            r#"
+[policy_reload]
+poll_remote_bundles = true
+remote_poll_interval_ms = {interval}
+
+[[policies]]
+id = "guard"
+enabled = true
+
+[policies.source]
+kind = "remote_bundle"
+endpoint = "https://control.example/policies/guard"
+"#
+        ))?;
+
+        let error = config
+            .validate_basic()
+            .expect_err("invalid remote poll interval must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("remote policy bundle poll interval must be between"),
+            "unexpected error: {error}"
+        );
+    }
+    Ok(())
+}
