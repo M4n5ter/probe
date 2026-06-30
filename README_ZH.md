@@ -1,8 +1,10 @@
 # Probe
 
 [English](README.md) · [设计文档](docs/design.md) ·
-[安全默认配置](examples/agent.toml) ·
-[本地演示配置](examples/local-agent.toml)
+[Lua policy](docs/lua-policy_ZH.md) ·
+[Webhook receiver](docs/webhook-receiver_ZH.md) ·
+[HTTP endpoints](docs/http-endpoints_ZH.md) ·
+[安全默认配置](examples/agent.toml) · [本地演示配置](examples/local-agent.toml)
 
 Probe 是一个 Linux 进程级网络流量探针，用于安全遥测、协议可见性、证据持久化、外发和受控防护。
 
@@ -298,42 +300,19 @@ headers = { x_probe_node = "probe-local" }
 webhook sink 可以引用 `[[tls.materials]]` 中的 trust anchor 和 client identity。
 file sink 会创建私有 `0600` 文件，并拒绝不安全的父目录。
 
-#### Webhook Receiver Contract
+#### Webhook Receiver Setup
 
 webhook `endpoint` 必须是带 scheme 和 host 的绝对 `http://` 或 `https://` URL。
 URL credentials 会被拒绝；部署认证应使用显式 exporter headers 或 TLS material refs。
-Probe 对每个 export batch 发送：
-
-- method：`POST`；
-- request target：配置的 endpoint path 和 query；
-- `content-type: application/x-protobuf`；
-- `x-traffic-probe-codec: none | zstd | gzip | deflate`；
-- `idempotency-key: <batch_id>`；
-- body：`proto::BatchEnvelope` protobuf message，并按 codec header 压缩。
-
-`BatchEnvelope` 包含 `batch_id`、`agent_id`、`codec` 和重复的 `EventRecord`。
-每个 event record 包含单调 export `sequence`、event id、JSON `EventEnvelope` payload，
-以及 payload schema `traffic.probe.event_envelope.subject_origin.json`。
-
-receiver response 必须是 UTF-8 JSON，并且不超过 64 KiB：
-
-```json
-{
-  "batch_id": "probe-local:primary-webhook:1-4",
-  "accepted": true,
-  "acked_cursor": 4,
-  "reason": null
-}
-```
-
-accepted batch 必须返回 `acked_cursor`，并且 cursor 必须落在 batch sequence 范围内。
-完整消费 batch 时应返回最后一个 sequence。未知 JSON 字段会被忽略，因此 receiver
-可以附带本地 metadata，而不会改变 acknowledgement contract。非 2xx HTTP status、
-无效 JSON、`accepted = false`、batch id mismatch、缺少 cursor 或 cursor 越界都会让
-sink 保持 unacked，worker 会按 backoff policy 重试。
 
 自定义 exporter `headers` 可以携带部署 metadata，但不能覆盖保留协议头：
 `content-type`、`idempotency-key`、`x-traffic-probe-codec`。
+
+request format、acknowledgement 规则、retry 语义和 protobuf schema 见
+[docs/webhook-receiver_ZH.md](docs/webhook-receiver_ZH.md)。batch schema 也以
+[docs/export-batch.proto](docs/export-batch.proto) 形式提供。exporter、remote policy、
+remote enforcement 和 MITM hook HTTP surface 的 endpoint 规则见
+[docs/http-endpoints_ZH.md](docs/http-endpoints_ZH.md)。
 
 ### Policy
 
@@ -391,50 +370,8 @@ max_body_bytes = 16777216
 `agent replay --policy` 是刻意不同的调试入口：它接受单个 Lua 文件，并包一层 synthetic replay
 manifest。
 
-#### Lua Policy Contract
-
-policy manifest 声明启用哪些 Lua hook。支持的 hook 名称是：
-
-```text
-on_connection_opened
-on_connection_closed
-on_http_request_headers
-on_http_response_headers
-on_http_body_chunk
-on_sse_event
-on_websocket_handoff
-on_websocket_frame
-on_websocket_message
-on_opaque_stream
-on_gap
-on_protocol_error
-```
-
-每个 hook 接收一个 `event` table。通用字段包括：
-
-- `event.id`；
-- `event.event_type`；
-- `event.direction`，如果该 event 有方向；
-- `event.timestamp.monotonic_ns` 和 `event.timestamp.wall_time_unix_ns`；
-- `event.origin.source` 和 `event.origin.provider`；
-- `event.flow.id`、`event.flow.process`、`event.flow.local_endpoint`、
-  `event.flow.remote_endpoint`；
-- `event.degraded`；
-- `event.enforcement_evidence.kind`；
-- `event.kind`，字段由 `event.event_type` 决定。
-
-对于 `on_http_request_headers`，`event.kind` 包含 `method`、`target`、`version`、
-`headers`、`direction` 和 `stream_sequence`。WebSocket hook 暴露 handoff、frame
-和有界 message metadata；payload fingerprint 是 byte array，不保留 plaintext payload。
-
-hook 可以返回：
-
-- `nil`，表示没有 outcome；
-- `probe.emit_alert("message")`；
-- `probe.verdict { action = "...", scope = "...", reason = "...", confidence = 100 }`；
-- 包含多个 alert 或 verdict outcome 的数组。
-
-示例：
+hook 可以返回 `nil`、一个 alert/verdict outcome，或多个 outcome。一个最小 request
+policy 可以同时产生 alert 和 protective verdict：
 
 ```lua
 function on_http_request_headers(event)
@@ -453,14 +390,8 @@ function on_http_request_headers(event)
 end
 ```
 
-verdict action 是 `allow`、`observe`、`alert`、`deny`、`reset`、`quarantine`；
-protective enforcement 只会应用配置化 enforcement policy 和 runtime backend 允许的动作。
-scope 是 `flow`、`request`、`response`、`chunk`。
-
-Lua runtime 是 sandbox。`require`、`io`、`os`、`package`、`debug`、`ffi`、`jit`、
-`dofile`、`loadfile`、`load`、`collectgarbage` 等 host capability 不可用。
-policy 受 instruction 和 memory budget 限制；runtime error 会被审计为 policy runtime
-error event，不会被当作成功 verdict。
+完整 hook 表、event 字段参考、sandbox contract、outcome model 和实用 Lua 写法见
+[docs/lua-policy_ZH.md](docs/lua-policy_ZH.md)。
 
 ### TLS Material
 

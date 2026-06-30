@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package probe.export;
+
+message BatchEnvelope {
+  string batch_id = 1;
+  string agent_id = 2;
+  string codec = 3;
+  repeated EventRecord events = 4;
+}
+
+message EventRecord {
+  string event_id = 1;
+  uint64 sequence = 2;
+  PayloadFormat payload_format = 3;
+  bytes payload = 4;
+  string payload_schema = 5;
+}
+
+enum PayloadFormat {
+  PAYLOAD_FORMAT_JSON = 0;
+}

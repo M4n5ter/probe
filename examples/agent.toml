@@ -91,6 +91,8 @@ multiplier = 2
 # [[exporters]]
 # id = "primary-webhook"
 # transport = "webhook"
+# Webhook exporter endpoints must be absolute HTTP(S) URLs without credentials.
+# See docs/webhook-receiver.md for receiver ACK and protobuf contracts.
 # endpoint = "https://collector.example/probe/batches"
 # codec = "zstd"
 # headers = { x_probe_node = "probe-local" }
@@ -161,6 +163,7 @@ kind = "none"
 # kind = "directory"
 # path = "/etc/probe/enforcement.d"
 # kind = "remote"
+# Remote policy endpoints require HTTPS, except loopback HTTP for local tests.
 # endpoint = "http://127.0.0.1:9000/enforcement.toml"
 # max_body_bytes = 16777216
 
@@ -235,6 +238,7 @@ mode = "none"
 mode = "none"
 # Product proxy mode requires:
 # mode = "http_json"
+# MITM policy hook endpoints must use loopback IP HTTP URLs with explicit ports.
 # endpoint = "http://127.0.0.1:15002/mitm-policy-hook"
 
 [admin]

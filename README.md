@@ -1,8 +1,10 @@
 # Probe
 
 [简体中文](README_ZH.md) · [Design](docs/design.md) ·
-[Safe default config](examples/agent.toml) ·
-[Local demo config](examples/local-agent.toml)
+[Lua policy](docs/lua-policy.md) ·
+[Webhook receiver](docs/webhook-receiver.md) ·
+[HTTP endpoints](docs/http-endpoints.md) ·
+[Safe default config](examples/agent.toml) · [Local demo config](examples/local-agent.toml)
 
 Probe is a Linux process-level traffic probe for security telemetry, protocol
 visibility, durable evidence, export, and controlled enforcement.
@@ -323,48 +325,22 @@ default. Webhook sinks can reference trust anchors and client identities from
 `[[tls.materials]]`. File sinks create private `0600` files and reject unsafe
 parent directories.
 
-#### Webhook Receiver Contract
+#### Webhook Receiver Setup
 
 A webhook `endpoint` must be an absolute `http://` or `https://` URL including
 scheme and host. URL credentials are rejected; use explicit exporter headers or
-TLS material refs for deployment authentication. Probe sends each export batch
-as:
-
-- method: `POST`;
-- request target: the configured endpoint path and query;
-- `content-type: application/x-protobuf`;
-- `x-traffic-probe-codec: none | zstd | gzip | deflate`;
-- `idempotency-key: <batch_id>`;
-- body: a `proto::BatchEnvelope` protobuf message, compressed by the codec
-  header.
-
-`BatchEnvelope` contains `batch_id`, `agent_id`, `codec`, and repeated
-`EventRecord` entries. Each event record carries a monotonic export `sequence`,
-the event id, a JSON `EventEnvelope` payload, and the payload schema
-`traffic.probe.event_envelope.subject_origin.json`.
-
-Receiver responses must be UTF-8 JSON and no larger than 64 KiB:
-
-```json
-{
-  "batch_id": "probe-local:primary-webhook:1-4",
-  "accepted": true,
-  "acked_cursor": 4,
-  "reason": null
-}
-```
-
-For an accepted batch, `acked_cursor` is required and must be within the batch
-sequence range. A receiver that consumed the whole batch should return the last
-sequence. Unknown JSON fields are ignored, so receivers may attach local
-metadata without changing the acknowledgement contract. Non-2xx HTTP status,
-invalid JSON, `accepted = false`, batch id mismatch, missing cursor, or an
-out-of-range cursor keeps the sink unacked and lets the worker retry according
-to its backoff policy.
+TLS material refs for deployment authentication.
 
 Custom exporter `headers` may add deployment metadata, but cannot override the
 reserved protocol headers: `content-type`, `idempotency-key`, or
 `x-traffic-probe-codec`.
+
+The request format, acknowledgement rules, retry semantics, and protobuf schema
+are documented in
+[docs/webhook-receiver.md](docs/webhook-receiver.md). The batch schema is also
+available as [docs/export-batch.proto](docs/export-batch.proto). Endpoint rules
+for exporter, remote policy, remote enforcement, and MITM hook HTTP surfaces are
+documented in [docs/http-endpoints.md](docs/http-endpoints.md).
 
 ### Policy
 
@@ -423,51 +399,8 @@ max_body_bytes = 16777216
 `agent replay --policy` is intentionally different: it accepts one Lua file for
 local debugging and wraps it in a synthetic replay manifest.
 
-#### Lua Policy Contract
-
-Policy manifests declare which Lua hooks are active. Supported hook names are:
-
-```text
-on_connection_opened
-on_connection_closed
-on_http_request_headers
-on_http_response_headers
-on_http_body_chunk
-on_sse_event
-on_websocket_handoff
-on_websocket_frame
-on_websocket_message
-on_opaque_stream
-on_gap
-on_protocol_error
-```
-
-Each hook receives one `event` table. Common fields are:
-
-- `event.id`;
-- `event.event_type`;
-- `event.direction`, when the event has a direction;
-- `event.timestamp.monotonic_ns` and `event.timestamp.wall_time_unix_ns`;
-- `event.origin.source` and `event.origin.provider`;
-- `event.flow.id`, `event.flow.process`, `event.flow.local_endpoint`, and
-  `event.flow.remote_endpoint`;
-- `event.degraded`;
-- `event.enforcement_evidence.kind`;
-- `event.kind`, whose fields depend on `event.event_type`.
-
-For `on_http_request_headers`, `event.kind` includes `method`, `target`,
-`version`, `headers`, `direction`, and `stream_sequence`. WebSocket hooks expose
-handoff, frame, and bounded message metadata; payload fingerprints are byte
-arrays, not retained plaintext payloads.
-
-A hook may return:
-
-- `nil` for no outcome;
-- `probe.emit_alert("message")`;
-- `probe.verdict { action = "...", scope = "...", reason = "...", confidence = 100 }`;
-- an array containing multiple alert or verdict outcomes.
-
-Example:
+Hooks return `nil`, one alert/verdict outcome, or an array of outcomes. A
+minimal request policy can emit both an alert and a protective verdict:
 
 ```lua
 function on_http_request_headers(event)
@@ -486,16 +419,8 @@ function on_http_request_headers(event)
 end
 ```
 
-Verdict actions are `allow`, `observe`, `alert`, `deny`, `reset`, and
-`quarantine`; protective enforcement only applies to actions allowed by the
-configured enforcement policy and runtime backend. Scopes are `flow`, `request`,
-`response`, and `chunk`.
-
-The Lua runtime is sandboxed. Host capabilities such as `require`, `io`, `os`,
-`package`, `debug`, `ffi`, `jit`, `dofile`, `loadfile`, `load`, and
-`collectgarbage` are unavailable. Policies run with instruction and memory
-budgets; runtime errors are audited as policy runtime error events instead of
-being treated as successful verdicts.
+The full hook table, event field reference, sandbox contract, outcome model, and
+practical Lua patterns are documented in [docs/lua-policy.md](docs/lua-policy.md).
 
 ### TLS Material
 

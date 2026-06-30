@@ -123,7 +123,7 @@ mod tests {
         SpoolPayloadSchema, Timestamp, TransportProtocol,
     };
 
-    use crate::{BatchEnvelope, PayloadFormat};
+    use crate::{BatchEnvelope, EventRecord, PayloadFormat};
 
     #[test]
     fn encodes_and_decodes_batch_envelope() -> Result<(), Box<dyn std::error::Error>> {
@@ -158,6 +158,86 @@ mod tests {
             batch.events[0].payload_schema,
             SpoolPayloadSchema::EventEnvelopeSubjectOriginJson.as_str()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn published_export_batch_proto_matches_wire_contract() -> Result<(), String> {
+        let schema = include_str!("../../../docs/export-batch.proto");
+        let batch = export_batch_with_payload_format(PayloadFormat::Json as i32);
+
+        assert_exact_schema(
+            schema,
+            [
+                r#"syntax = "proto3";"#,
+                "package probe.export;",
+                "message BatchEnvelope {",
+                "string batch_id = 1;",
+                "string agent_id = 2;",
+                "string codec = 3;",
+                "repeated EventRecord events = 4;",
+                "}",
+                "message EventRecord {",
+                "string event_id = 1;",
+                "uint64 sequence = 2;",
+                "PayloadFormat payload_format = 3;",
+                "bytes payload = 4;",
+                "string payload_schema = 5;",
+                "}",
+                "enum PayloadFormat {",
+                "PAYLOAD_FORMAT_JSON = 0;",
+                "}",
+            ],
+        )?;
+        assert_eq!(PayloadFormat::Json as i32, 0);
+        assert_eq!(
+            batch.encode_to_vec(),
+            [
+                0x0a, 0x01, b'b', 0x12, 0x01, b'a', 0x1a, 0x04, b'n', b'o', b'n', b'e', 0x22, 0x0c,
+                0x0a, 0x01, b'e', 0x10, 0x07, 0x22, 0x02, 0x01, 0x02, 0x2a, 0x01, b's',
+            ]
+        );
+        assert_eq!(
+            export_batch_with_payload_format(1).encode_to_vec(),
+            [
+                0x0a, 0x01, b'b', 0x12, 0x01, b'a', 0x1a, 0x04, b'n', b'o', b'n', b'e', 0x22, 0x0e,
+                0x0a, 0x01, b'e', 0x10, 0x07, 0x18, 0x01, 0x22, 0x02, 0x01, 0x02, 0x2a, 0x01, b's',
+            ]
+        );
+        Ok(())
+    }
+
+    fn export_batch_with_payload_format(payload_format: i32) -> BatchEnvelope {
+        BatchEnvelope {
+            batch_id: "b".to_string(),
+            agent_id: "a".to_string(),
+            codec: "none".to_string(),
+            events: vec![EventRecord {
+                event_id: "e".to_string(),
+                sequence: 7,
+                payload_format,
+                payload: vec![1, 2],
+                payload_schema: "s".to_string(),
+            }],
+        }
+    }
+
+    fn assert_exact_schema<const N: usize>(
+        schema: &str,
+        expected: [&str; N],
+    ) -> Result<(), String> {
+        let lines = schema
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        if lines != expected {
+            return Err(format!(
+                "schema mismatch\nexpected:\n{}\nactual:\n{}",
+                expected.join("\n"),
+                lines.join("\n")
+            ));
+        }
         Ok(())
     }
 

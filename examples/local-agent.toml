@@ -26,6 +26,8 @@ id = "http-alert"
 enabled = true
 
 [policies.source]
+# Local policy bundles contain manifest.toml and main.lua.
+# See docs/lua-policy.md for hook names, event fields, and outcomes.
 kind = "local_directory"
 path = "examples/policies/http-alert"
 
