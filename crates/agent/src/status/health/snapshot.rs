@@ -1,3 +1,4 @@
+use pipeline::CaptureLossRuntimeMetricsSnapshot;
 use probe_core::RuntimeMode;
 use runtime::{CaptureEvidenceMode, CapturePlanMode};
 
@@ -23,9 +24,13 @@ pub(in crate::status) fn health_snapshot(
     policy: &PolicyStatusSnapshot,
     enforcement: &EnforcementStatusSnapshot,
     tls: &TlsStatusSnapshot,
+    capture_loss: Option<&CaptureLossRuntimeMetricsSnapshot>,
 ) -> HealthSnapshot {
     fold_health_contributions(
         std::iter::once(capture_health_contribution(capture))
+            .chain(std::iter::once(capture_loss_health_contribution(
+                capture_loss,
+            )))
             .chain(std::iter::once(spool_health_contribution(spool)))
             .chain(exporters.iter().map(exporter_health_contribution))
             .chain(std::iter::once(policy_health_contribution(policy)))
@@ -58,6 +63,21 @@ fn capture_health_contribution(capture: &CaptureStatusSnapshot) -> HealthContrib
         );
     }
     HealthContribution::available()
+}
+
+fn capture_loss_health_contribution(
+    loss: Option<&CaptureLossRuntimeMetricsSnapshot>,
+) -> HealthContribution {
+    let Some(loss) = loss else {
+        return HealthContribution::available();
+    };
+    if loss.events == 0 && loss.lost_events == 0 {
+        return HealthContribution::available();
+    }
+    HealthContribution::degraded(format!(
+        "capture provider reported {} loss event(s) covering {} lost event(s)",
+        loss.events, loss.lost_events
+    ))
 }
 
 fn spool_health_contribution(spool: &SpoolStatusSnapshot) -> HealthContribution {

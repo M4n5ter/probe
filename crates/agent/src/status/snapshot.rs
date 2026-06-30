@@ -149,6 +149,8 @@ fn build_status_snapshot_at_with_runtime(
         &spool.export_cursors,
         runtime.export_worker.as_ref(),
     );
+    let pipeline = runtime.pipeline;
+    let capture_loss = pipeline.as_ref().map(|metrics| &metrics.capture_loss);
     let metrics = metrics_snapshot(MetricsSnapshotInput {
         capabilities: &capabilities,
         spool: &spool_status,
@@ -157,7 +159,7 @@ fn build_status_snapshot_at_with_runtime(
         l7_mitm,
         transparent_proxy,
         tls_plaintext: runtime.tls_plaintext,
-        pipeline: runtime.pipeline,
+        pipeline,
     });
     let health = health_snapshot(
         &capture,
@@ -166,6 +168,7 @@ fn build_status_snapshot_at_with_runtime(
         &policy,
         &enforcement,
         &tls,
+        capture_loss,
     );
 
     AgentStatusSnapshot {
@@ -496,6 +499,43 @@ mod tests {
         assert_eq!(
             value["exporters"][0]["runtime"]["mode"],
             json!("backing_off")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_snapshot_degrades_health_for_capture_loss_metrics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_with_exporter()?;
+        let spool = SpoolStatusInput::available(
+            PathBuf::from("/tmp/traffic-probe-spool"),
+            SpoolSnapshot {
+                last_ingress_sequence: 0,
+                last_export_sequence: 0,
+            },
+            BTreeMap::new(),
+        );
+        let runtime = RuntimeStatusInput {
+            pipeline: Some(PipelineRuntimeMetricsSnapshot {
+                capture_loss: pipeline::CaptureLossRuntimeMetricsSnapshot {
+                    events: 0,
+                    lost_events: 11,
+                },
+                ..PipelineRuntimeMetricsSnapshot::default()
+            }),
+            ..RuntimeStatusInput::default()
+        };
+
+        let snapshot = build_status_snapshot_at_with_runtime(&plan, spool, 42, runtime);
+
+        assert_eq!(snapshot.health.mode, RuntimeMode::Degraded);
+        assert!(snapshot.health.reasons.iter().any(|reason| {
+            reason.contains("0 loss event(s)") && reason.contains("11 lost event(s)")
+        }));
+        let value = serde_json::to_value(&snapshot)?;
+        assert_eq!(
+            value["metrics"]["pipeline"]["capture_loss"]["lost_events"],
+            json!(11)
         );
         Ok(())
     }

@@ -66,6 +66,8 @@ eBPF / procfs 现状：
 - process eBPF provider 会把 output loss delta 保守投影到 active tracked payload flows；
   TLS plaintext provider 会把 output loss delta 保守投影到 previous output-loss checkpoint 之后观察到的 plaintext flows。
   二者都表达为 `next_offset = None` 的 flow-level `Gap`。
+- 在线 pipeline metrics 出现 capture loss 时，agent health 会降级并报告 loss event 数与 lost event 数；
+  这避免 provider poll loop 仍活跃时把 kernel/output loss 误读成完整采集。
 
 TLS plaintext / session secret 现状：
 
@@ -331,6 +333,8 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
   - 已实现：eBPF process observation provider 成功打开后，online capture status 的 `capture.provider` 报告
     `ebpf_process_observation` provider details；其中 `link_ownership` 按 program、tracepoint category/name 和 link count
     报告 userspace loader 已提交并持有的 tracepoint links。
+  - 已实现：pipeline runtime metrics 记录 capture loss event 与 lost event 总数；若在线 status 输入包含非零
+    capture loss，agent health 降级并在 reason 中报告对应计数。
   - 边界：capability 和 evidence mode 仍是 degraded/best-effort。
   - 边界：outbound sample 不是内核已发送字节的强证明，inbound sample 也只是 syscall 返回后的用户 buffer 观察，不等于完整 socket 流。
   - 边界：descriptor lease 是进程 fd 级错配防护，不等同于 kernel socket object identity。
