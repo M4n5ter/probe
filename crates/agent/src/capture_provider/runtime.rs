@@ -38,6 +38,7 @@ pub(crate) struct CaptureProviderOpenFailureSnapshot {
 pub(crate) enum CaptureProviderRuntimeDetailsSnapshot {
     EbpfProcessObservation {
         link_ownership: EbpfProcessObservationLinkOwnershipRuntimeSnapshot,
+        kernel_liveness: EbpfProcessObservationKernelLivenessRuntimeSnapshot,
         optional_tracepoint_pairs: Vec<EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot>,
     },
 }
@@ -59,6 +60,12 @@ pub(crate) struct EbpfProcessObservationLinkProgramRuntimeSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct EbpfProcessObservationKernelLivenessRuntimeSnapshot {
+    pub(crate) mode: RuntimeMode,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot {
     pub(crate) family_name: &'static str,
     pub(crate) mode: RuntimeMode,
@@ -72,14 +79,31 @@ pub(crate) struct EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot {
 impl CaptureProviderRuntimeDetailsSnapshot {
     pub(crate) fn ebpf_process_observation(probe: EbpfProcessObservationProbeSnapshot) -> Self {
         let (link_ownership, optional_tracepoint_pairs) = probe.into_parts();
+        let kernel_liveness =
+            EbpfProcessObservationKernelLivenessRuntimeSnapshot::from_capture(&link_ownership);
         Self::EbpfProcessObservation {
             link_ownership: EbpfProcessObservationLinkOwnershipRuntimeSnapshot::from_capture(
                 link_ownership,
             ),
+            kernel_liveness,
             optional_tracepoint_pairs: optional_tracepoint_pairs
                 .into_iter()
                 .map(EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot::from_capture)
                 .collect(),
+        }
+    }
+}
+
+impl EbpfProcessObservationKernelLivenessRuntimeSnapshot {
+    fn from_capture(link_ownership: &EbpfProcessObservationLinkOwnershipSnapshot) -> Self {
+        let reason = if link_ownership.is_reported() {
+            "process eBPF tracepoint link ownership does not prove kernel-side firing; active per-link liveness probing is not implemented"
+        } else {
+            "process eBPF kernel liveness cannot be evaluated without committed tracepoint link ownership"
+        };
+        Self {
+            mode: RuntimeMode::Unavailable,
+            reason: reason.to_string(),
         }
     }
 }

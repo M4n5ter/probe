@@ -179,6 +179,15 @@ mod tests {
         );
         assert_eq!(provider["link_ownership"]["owned_link_count"], 2);
         assert_eq!(
+            provider["kernel_liveness"]["mode"],
+            serde_json::json!("unavailable")
+        );
+        assert!(
+            provider["kernel_liveness"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("does not prove kernel-side firing"))
+        );
+        assert_eq!(
             provider["link_ownership"]["programs"][0]["program_name"],
             serde_json::json!("connect_enter")
         );

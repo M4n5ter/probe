@@ -842,12 +842,25 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
     );
     let Some(CaptureProviderRuntimeDetailsSnapshot::EbpfProcessObservation {
         link_ownership,
+        kernel_liveness,
         optional_tracepoint_pairs,
     }) = &snapshot.capture.provider
     else {
         write_sample(
             output,
             "traffic_probe_ebpf_process_observation_link_ownership_metrics_available",
+            &[],
+            0,
+        );
+        write_family(
+            output,
+            "traffic_probe_ebpf_process_observation_kernel_liveness_metrics_available",
+            "gauge",
+            "Whether eBPF process observation kernel liveness metrics are present in this snapshot.",
+        );
+        write_sample(
+            output,
+            "traffic_probe_ebpf_process_observation_kernel_liveness_metrics_available",
             &[],
             0,
         );
@@ -881,6 +894,28 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
         "traffic_probe_ebpf_process_observation_owned_links",
         &[],
         link_ownership.owned_link_count,
+    );
+
+    write_family(
+        output,
+        "traffic_probe_ebpf_process_observation_kernel_liveness_metrics_available",
+        "gauge",
+        "Whether eBPF process observation kernel liveness metrics are present in this snapshot.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_ebpf_process_observation_kernel_liveness_metrics_available",
+        &[],
+        1,
+    );
+    write_one_hot_enum(
+        output,
+        "traffic_probe_ebpf_process_observation_kernel_liveness_mode",
+        "Process eBPF kernel-side firing liveness mode as a one-hot gauge; unavailable means userspace link ownership is not being treated as kernel liveness proof.",
+        "mode",
+        &RUNTIME_MODES,
+        kernel_liveness.mode,
+        RuntimeMode::wire_name,
     );
 
     write_family(
@@ -1446,6 +1481,15 @@ mod tests {
         ));
         assert!(metrics.contains("traffic_probe_ebpf_process_observation_owned_links 2\n"));
         assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_kernel_liveness_metrics_available 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_kernel_liveness_mode{mode=\"available\"} 0\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_kernel_liveness_mode{mode=\"unavailable\"} 1\n"
+        ));
+        assert!(metrics.contains(
             "traffic_probe_ebpf_process_observation_program_owned_links{program_name=\"connect_enter\",category=\"syscalls\",tracepoint=\"sys_enter_connect\"} 1\n"
         ));
         assert!(metrics.contains(
@@ -1500,6 +1544,10 @@ mod tests {
         assert!(metrics.contains(
             "traffic_probe_ebpf_process_observation_link_ownership_metrics_available 0\n"
         ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_kernel_liveness_metrics_available 0\n"
+        ));
+        assert!(!metrics.contains("traffic_probe_ebpf_process_observation_kernel_liveness_mode{"));
         assert!(!metrics.contains("traffic_probe_ebpf_process_observation_owned_links"));
         assert!(!metrics.contains("traffic_probe_ebpf_process_observation_program_owned_links"));
         Ok(())
@@ -1553,6 +1601,12 @@ mod tests {
             "traffic_probe_ebpf_process_observation_link_ownership_mode{mode=\"unavailable\"} 1\n"
         ));
         assert!(metrics.contains("traffic_probe_ebpf_process_observation_owned_links 0\n"));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_kernel_liveness_metrics_available 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_kernel_liveness_mode{mode=\"unavailable\"} 1\n"
+        ));
         assert!(!metrics.contains("traffic_probe_ebpf_process_observation_program_owned_links{"));
         Ok(())
     }

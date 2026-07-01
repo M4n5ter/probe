@@ -911,8 +911,9 @@ through `traffic_probe_pipeline_enforcement_decisions_total` and
 `traffic_probe_pipeline_enforcement_execution_total`.
 Capture input activity includes the latest signal kind, sequence, and
 observation time without treating that activity as kernel link liveness. The
-eBPF provider status separately reports held tracepoint links and optional
-kernel tracepoint-pair availability, such as `sendfile` or `sendfile64`.
+eBPF provider status separately reports held tracepoint links, explicit kernel
+liveness proof status, and optional kernel tracepoint-pair availability, such as
+`sendfile` or `sendfile64`.
 The admin CLI sends the same JSON-lines commands over the Unix socket:
 
 ```bash

@@ -360,13 +360,17 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
   - 已实现：eBPF process observation provider 成功打开后，online capture status 的 `capture.provider` 报告
     `ebpf_process_observation` provider details；其中 `link_ownership` 按 program、tracepoint category/name 和 link count
     报告 userspace loader 已提交并持有的 tracepoint links。
+  - 已实现：`capture.provider.kernel_liveness` 是独立于 `link_ownership` 的 process eBPF kernel firing proof 状态。
+    当前 mode 为 `unavailable`，reason 明确说明 userspace-held tracepoint link handles 不等同于 kernel-side firing proof；
+    该字段用于避免把 link ownership 或 input activity 误读成 per-link kernel liveness。
   - 已实现：`capture.provider.optional_tracepoint_pairs` 报告当前 kernel 对 optional syscall family 的可用性。
     `sendfile` 和 `sendfile64` 以 enter/exit tracepoint pair 为单位报告；pair 完整存在时为 `available`，
     pair 完整缺失时为 `unavailable`，只存在一侧时 loader fail closed。
   - 已实现：Prometheus 暴露同一 link ownership fact，包括 metrics availability、ownership mode、总 owned link count
-    per-program owned link count，以及按 syscall family 聚合的 optional tracepoint pair mode；这些指标只表达
-    userspace-held committed link handles 和启动时 kernel tracepoint-pair probe result，不表达 per-link kernel
-    firing liveness。完整 enter/exit tracepoint tuple 留在 runtime status JSON 中用于诊断。
+    per-program owned link count，以及按 syscall family 聚合的 optional tracepoint pair mode；Prometheus 同时暴露
+    `kernel_liveness` metrics availability 和 one-hot mode。这些指标区分 userspace-held committed link handles、
+    启动时 kernel tracepoint-pair probe result 和 active kernel firing proof 的缺失。完整 enter/exit tracepoint tuple
+    留在 runtime status JSON 中用于诊断。
   - 已实现：pipeline runtime metrics 记录 capture loss event 与 lost event 总数；若在线 status 输入包含非零
     capture loss，agent health 降级并在 reason 中报告对应计数。
   - 边界：capability 和 evidence mode 仍是 degraded/best-effort。
@@ -377,7 +381,7 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
     cancellation 使用 `EbpfUnresolvedFlow` evidence；tracked flow boundary 使用 `EbpfProcessLifecycleBoundary` evidence。
     这些信号不补全未跟踪、已淘汰或丢失事件的 socket lifecycle。
   - 边界：process eBPF `link_ownership` 只证明 loader 成功提交并仍持有 tracepoint link handles；
-    它不是动态 per-link firing/liveness probe，也不证明任意 socket-object lifetime。
+    `kernel_liveness.mode = unavailable` 明确表示当前没有动态 per-link firing/liveness probe，也不证明任意 socket-object lifetime。
   - 边界：optional tracepoint pair availability 是启动时 tracefs probe 和 attach 结果，不代表该 syscall
     在目标 workload 中实际发生；缺失的 optional pair 只表示对应 syscall family 不会产生 kernel-transfer
     byte-count gap。
@@ -1417,8 +1421,13 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
   `traffic_probe_ebpf_process_observation_link_ownership_metrics_available 0`，不伪造 link count。
 - 当 provider details 存在但 link ownership 未上报时，metrics availability 为 `1`，
   mode 为 `unavailable`，owned link count 为 `0`。
-- 这些指标只表达 userspace-held committed link handles，不表达 per-link kernel firing liveness，
-  也不证明强 socket-object lifetime。
+- `traffic_probe_ebpf_process_observation_kernel_liveness_metrics_available` 表示当前 status snapshot
+  是否包含 process eBPF provider 的 kernel liveness 数值投影。
+- `traffic_probe_ebpf_process_observation_kernel_liveness_mode{mode="available|degraded|unavailable"}`
+  是 `capture.provider.kernel_liveness.mode` 的 one-hot gauge。当前实现固定为 `unavailable`，
+  因为系统没有 active per-link kernel firing probe。
+- 这些指标只表达 userspace-held committed link handles、启动时 tracepoint-pair availability 和 kernel liveness
+  证明是否存在；它们不证明强 socket-object lifetime。
 
 #### Event provenance
 
@@ -4295,8 +4304,9 @@ Status snapshot：
 - snapshot 包含 health。
 - snapshot 包含 capture status。
 - 在线 capture status 对 backend-specific runtime facts 使用 `capture.provider`；process eBPF provider 通过该字段暴露
-  tracepoint link ownership。
-- Prometheus 对 process eBPF provider 暴露同一 tracepoint link ownership 数值投影，但不把该投影视为 kernel liveness。
+  tracepoint link ownership、kernel liveness proof status 和 optional tracepoint pair availability。
+- Prometheus 对 process eBPF provider 暴露同一 tracepoint link ownership 与 kernel liveness 数值投影；
+  `kernel_liveness.mode = unavailable` 时不会把 link ownership 伪装成 kernel liveness。
 - snapshot 包含 policy status。
 - snapshot 包含 enforcement status。
 - snapshot 包含 TLS plaintext/material status。
