@@ -626,6 +626,8 @@ TLS 明文与协议能力：
   - Runtime status：Available。
   - 已实现：export lane、pipeline-generated stable event id 写入侧去重、per-sink cursor、schema-aware payload、
     protobuf batch envelope、record-level `stored_at_unix_ns`。
+  - 已实现：export drain 同时受 record count 与 payload bytes soft limit 约束；超过 bytes limit 时发送连续前缀，
+    单个超限 event 仍单独发送以保证 cursor 可推进。
   - 已实现：按 planned sinks cursor 下界执行 acked-prefix cleanup。
   - 已实现：按 retention deadline 退休过期连续前缀，按 `max_records` 保留最新后缀的容量 retention。
   - 边界：`append_export` 手工写入不走 dedup。
@@ -3373,6 +3375,13 @@ worker schedule 字段：
 | `batches_per_sink_per_tick` | `1` | worker 开启时必须大于 0 | 每轮对每个 sink 最多发送多少个 batch |
 | `sink_timeout_ms` | `10000` | worker 开启时必须大于 0 | 单个 sink 的 drain timeout |
 
+batch shape：
+
+- 单个 batch 最多读取 1024 条 export records。
+- 单个 batch 还受 16 MiB stored payload bytes soft limit 约束。
+- 当下一条 record 会超过 bytes limit 时，本 batch 只发送当前连续前缀。
+- 如果第一条 record 本身超过 bytes limit，它仍会作为单 event batch 发送，避免 cursor 被永久卡住。
+
 per-sink batch quota：
 
 - 单个 exporter 可用 `[exporters.worker] batches_per_tick` 覆盖本 sink 的每轮 batch quota。
@@ -4104,7 +4113,8 @@ Webhook status 使用 `target.transport = "webhook"`。
 - `replay` CLI 保留独立的 `replay-webhook` sink，便于本地调试不污染配置 sink cursor。
 - webhook 自定义 headers 可配置，但 `content-type`、`x-traffic-probe-codec` 和 `idempotency-key` 属于协议头，配置中禁止覆盖。
 - 当前 exporter worker 采用配置化固定间隔、全局/每 sink 每轮 batch budget、配置化 sink timeout 和内存态 per-sink exponential failure backoff 的
-  best-effort drain，并在每轮 drain 后按 planned sinks cursor 下界有界清理已全部确认的 export queue 前缀。若配置了
+  best-effort drain；每个 batch 受 1024 records 和 16 MiB stored payload bytes soft limit 约束，并在每轮 drain 后按 planned sinks
+  cursor 下界有界清理已全部确认的 export queue 前缀。若配置了
   `storage.retention.export.max_age_ms` 或 `max_records`，统一 storage retention worker 会按 `sweep_interval_ms` 维护 export
   queue 生命周期；exporter worker 和 tail drain 不执行 lifecycle retention，避免 exporter drain 层重新 owning storage lifecycle policy。
   tail drain 仍会尽力尝试所有 sink，不使用后台 worker 的 failure backoff。

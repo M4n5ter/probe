@@ -556,6 +556,10 @@ codec = "zstd"
 headers = { x_probe_node = "probe-local" }
 ```
 
+Each export batch is bounded by both record count and stored payload bytes:
+up to 1024 records and a 16 MiB payload-byte soft limit. A single larger event
+is still sent alone so the sink cursor can keep moving.
+
 Supported codecs are `none`, `zstd`, `gzip`, and `deflate`; `zstd` is the
 default. Webhook sinks can reference trust anchors and client identities from
 `[[tls.materials]]`. File sinks create private `0600` files and reject unsafe

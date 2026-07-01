@@ -6,6 +6,7 @@ use storage::{ExportSpool, StoredEvent};
 use super::{ExportDrainError, mode::SinkDrainMode};
 
 pub(super) const EXPORT_BATCH_LIMIT: usize = 1024;
+const EXPORT_BATCH_PAYLOAD_BYTES_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ExportDrainSummary {
@@ -61,14 +62,31 @@ pub(super) fn export_batch_from_events(
     codec: CompressionCodec,
     events: Vec<StoredEvent>,
 ) -> Result<Option<BatchEnvelope>, ExportDrainError> {
+    export_batch_from_events_with_payload_limit(
+        agent_id,
+        sink,
+        codec,
+        events,
+        EXPORT_BATCH_PAYLOAD_BYTES_LIMIT,
+    )
+}
+
+fn export_batch_from_events_with_payload_limit(
+    agent_id: &str,
+    sink: &str,
+    codec: CompressionCodec,
+    events: Vec<StoredEvent>,
+    payload_bytes_limit: usize,
+) -> Result<Option<BatchEnvelope>, ExportDrainError> {
     let Some(first_sequence) = events.first().map(|event| event.sequence) else {
         return Ok(None);
     };
-    let last_sequence = events
+    let selected_events = export_batch_payload_prefix(&events, payload_bytes_limit);
+    let last_sequence = selected_events
         .last()
         .map(|event| event.sequence)
         .expect("non-empty event batch has a last sequence");
-    for event in &events {
+    for event in selected_events {
         if event.payload.schema() != &SpoolPayloadSchema::EventEnvelopeSubjectOriginJson {
             return Err(ExportDrainError::UnsupportedSpoolPayloadSchema {
                 sequence: event.sequence,
@@ -81,12 +99,31 @@ pub(super) fn export_batch_from_events(
         export_batch_id(agent_id, sink, first_sequence, last_sequence),
         agent_id,
         codec.wire_name(),
-        events
+        selected_events
             .iter()
             .map(|event| (event.sequence, event.payload.bytes())),
     )
     .map(Some)
     .map_err(ExportDrainError::Proto)
+}
+
+fn export_batch_payload_prefix(
+    events: &[StoredEvent],
+    payload_bytes_limit: usize,
+) -> &[StoredEvent] {
+    let mut selected = 0;
+    let mut payload_bytes = 0usize;
+
+    for event in events {
+        let event_bytes = event.payload.bytes().len();
+        if selected > 0 && payload_bytes.saturating_add(event_bytes) > payload_bytes_limit {
+            break;
+        }
+        payload_bytes = payload_bytes.saturating_add(event_bytes);
+        selected += 1;
+    }
+
+    &events[..selected]
 }
 
 pub(in crate::export::drain) fn export_batch_id(
@@ -142,6 +179,77 @@ mod tests {
 
         assert_eq!(first_batch.batch_id, "agent-1:sink:1-2");
         assert_eq!(retry_batch.batch_id, "agent-1:sink:2-2");
+        Ok(())
+    }
+
+    #[test]
+    fn payload_byte_limit_bounds_batch_to_contiguous_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        append_export_event(&spool, "/one")?;
+        append_export_event(&spool, "/two")?;
+        append_export_event(&spool, "/three")?;
+
+        let events = spool.read_export_batch("sink", EXPORT_BATCH_LIMIT)?;
+        let limit = events[0].payload.bytes().len() + 1;
+        let first_batch = export_batch_from_events_with_payload_limit(
+            "agent-1",
+            "sink",
+            CompressionCodec::None,
+            events,
+            limit,
+        )?
+        .expect("initial batch");
+
+        spool.ack_export("sink", 1)?;
+        let retry_batch = export_batch_from_events_with_payload_limit(
+            "agent-1",
+            "sink",
+            CompressionCodec::None,
+            spool.read_export_batch("sink", EXPORT_BATCH_LIMIT)?,
+            limit,
+        )?
+        .expect("retry batch");
+
+        assert_eq!(first_batch.batch_id, "agent-1:sink:1-1");
+        assert_eq!(first_batch.events.len(), 1);
+        assert_eq!(retry_batch.batch_id, "agent-1:sink:2-2");
+        assert_eq!(retry_batch.events.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn payload_byte_limit_sends_single_oversized_event() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        append_export_event(&spool, "/oversized")?;
+        append_export_event(&spool, "/later")?;
+
+        let batch = export_batch_from_events_with_payload_limit(
+            "agent-1",
+            "sink",
+            CompressionCodec::None,
+            spool.read_export_batch("sink", EXPORT_BATCH_LIMIT)?,
+            0,
+        )?
+        .expect("oversized single-event batch");
+
+        assert_eq!(batch.batch_id, "agent-1:sink:1-1");
+        assert_eq!(batch.events.len(), 1);
+
+        spool.ack_export("sink", 1)?;
+        let next_batch = export_batch_from_events_with_payload_limit(
+            "agent-1",
+            "sink",
+            CompressionCodec::None,
+            spool.read_export_batch("sink", EXPORT_BATCH_LIMIT)?,
+            0,
+        )?
+        .expect("next single-event batch");
+
+        assert_eq!(next_batch.batch_id, "agent-1:sink:2-2");
+        assert_eq!(next_batch.events.len(), 1);
         Ok(())
     }
 
