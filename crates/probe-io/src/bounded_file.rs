@@ -190,6 +190,29 @@ impl BoundedFileErrorParts {
 }
 
 #[derive(Debug)]
+pub struct BoundedRegularFile {
+    path: PathBuf,
+    limit: u64,
+    file: File,
+    metadata: Metadata,
+}
+
+impl BoundedRegularFile {
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    pub fn read(self) -> Result<BoundedRegularFileRead, BoundedFileError> {
+        let bytes = read_limited_bytes(&self.path, self.limit, self.file)?;
+        validate_read_size(&self.path, self.limit, bytes.len() as u64)?;
+        Ok(BoundedRegularFileRead {
+            bytes,
+            metadata: self.metadata,
+        })
+    }
+}
+
+#[derive(Debug)]
 pub struct BoundedRegularFileRead {
     bytes: Vec<u8>,
     metadata: Metadata,
@@ -210,18 +233,20 @@ impl BoundedRegularFileRead {
 }
 
 pub fn check_bounded_regular_file(path: &Path, limit: u64) -> Result<(), BoundedFileError> {
+    inspect_bounded_regular_file(path, limit).map(|_| ())
+}
+
+pub fn inspect_bounded_regular_file(path: &Path, limit: u64) -> Result<Metadata, BoundedFileError> {
     let metadata = symlink_safe_metadata(path)?;
-    validate_regular_file(path, limit, &metadata)
+    validate_regular_file(path, limit, &metadata)?;
+    Ok(metadata)
 }
 
 pub fn read_bounded_regular_file(
     path: &Path,
     limit: u64,
 ) -> Result<BoundedRegularFileRead, BoundedFileError> {
-    let (file, metadata) = open_bounded_regular_file(path, limit)?;
-    let bytes = read_limited_bytes(path, limit, file)?;
-    validate_read_size(path, limit, bytes.len() as u64)?;
-    Ok(BoundedRegularFileRead { bytes, metadata })
+    open_bounded_regular_file(path, limit)?.read()
 }
 
 pub fn read_bounded_regular_file_to_string(
@@ -235,10 +260,10 @@ pub fn read_bounded_regular_file_to_string(
     })
 }
 
-fn open_bounded_regular_file(
+pub fn open_bounded_regular_file(
     path: &Path,
     limit: u64,
-) -> Result<(File, Metadata), BoundedFileError> {
+) -> Result<BoundedRegularFile, BoundedFileError> {
     check_bounded_regular_file(path, limit)?;
     let fd = open(
         path,
@@ -257,7 +282,12 @@ fn open_bounded_regular_file(
             source,
         })?;
     validate_regular_file(path, limit, &metadata)?;
-    Ok((file, metadata))
+    Ok(BoundedRegularFile {
+        path: path.to_path_buf(),
+        limit,
+        file,
+        metadata,
+    })
 }
 
 fn read_limited_bytes(path: &Path, limit: u64, file: File) -> Result<Vec<u8>, BoundedFileError> {
@@ -365,6 +395,18 @@ mod tests {
 
         assert_eq!(read.bytes(), b"hello");
         assert_eq!(read.metadata().len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_regular_file_inspector_returns_metadata() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let path = temp.path().join("input.txt");
+        fs::write(&path, b"hello")?;
+
+        let metadata = inspect_bounded_regular_file(&path, 64)?;
+
+        assert_eq!(metadata.len(), 5);
         Ok(())
     }
 

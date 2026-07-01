@@ -641,6 +641,10 @@ kind = "mitm_upstream_trust_anchor"
 path = "/etc/probe/certs/upstream-ca.pem"
 ```
 
+TLS material files must be owned by the agent effective uid, must be regular
+files, must be owner-readable, and must not grant group or other permissions.
+Use `0600` for writable private material and `0400` for read-only material.
+
 Best-effort libssl plaintext instrumentation is explicit. Configure a selector
 to avoid broad attachment:
 

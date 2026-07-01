@@ -3,7 +3,8 @@ mod tcp;
 
 pub use bounded_file::{
     BoundedFileError, BoundedFileErrorKind, BoundedFileErrorParts, BoundedFileSizeLimit,
-    BoundedRegularFileRead, check_bounded_regular_file, read_bounded_regular_file,
+    BoundedRegularFile, BoundedRegularFileRead, check_bounded_regular_file,
+    inspect_bounded_regular_file, open_bounded_regular_file, read_bounded_regular_file,
     read_bounded_regular_file_to_string,
 };
 pub use tcp::{

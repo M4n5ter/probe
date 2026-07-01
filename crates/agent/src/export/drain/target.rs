@@ -339,7 +339,8 @@ mod tests {
         collections::BTreeMap,
         fs,
         num::NonZeroU64,
-        path::PathBuf,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -370,9 +371,9 @@ mod tests {
         let trust_anchor = temp.join("ca.pem");
         let client_certificate = temp.join("client.pem");
         let client_private_key = temp.join("client.key");
-        fs::write(&trust_anchor, b"ca-pem")?;
-        fs::write(&client_certificate, b"cert-pem")?;
-        fs::write(&client_private_key, b"key-pem")?;
+        write_private_file(&trust_anchor, b"ca-pem")?;
+        write_private_file(&client_certificate, b"cert-pem")?;
+        write_private_file(&client_private_key, b"key-pem")?;
         let plan = ExportSinkTlsPlan {
             trust_anchors: vec![tls_material(
                 "collector-ca",
@@ -735,6 +736,11 @@ mod tests {
             "traffic-probe-{name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn write_private_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), std::io::Error> {
+        fs::write(path, contents)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
     }
 
     fn export_plan_with_trust_anchor(path: PathBuf) -> ExportPlan {

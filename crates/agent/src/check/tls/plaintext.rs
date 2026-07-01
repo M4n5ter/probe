@@ -313,7 +313,11 @@ impl From<TlsDecryptHintError> for TlsCheckError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+    };
 
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, TlsMaterialConfig, TlsMaterialKind,
@@ -331,7 +335,7 @@ mod tests {
         let temp = test_dir("check-tls-plaintext-materials")?;
         let key_log_path = temp.join("sslkeylog.log");
         let session_secret_path = temp.join("session-secret.bin");
-        fs::write(
+        write_private_file(
             &key_log_path,
             b"CLIENT_RANDOM 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111\n",
         )?;
@@ -340,7 +344,7 @@ mod tests {
             "00".repeat(32),
             "aa".repeat(32)
         );
-        fs::write(&session_secret_path, session_secret_material)?;
+        write_private_file(&session_secret_path, session_secret_material)?;
         let mut config = AgentConfig::default();
         config.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-keys".to_string()];
         config.tls.plaintext.decrypt_hints.session_secret_refs =
@@ -414,7 +418,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-keylog-only-live-auto-binding")?;
         let key_log_path = temp.join("sslkeylog.log");
-        fs::write(
+        write_private_file(
             &key_log_path,
             format!(
                 "CLIENT_TRAFFIC_SECRET_0 {} {}\n",
@@ -453,7 +457,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-live-keylog-partial-tail")?;
         let key_log_path = temp.join("sslkeylog.log");
-        fs::write(
+        write_private_file(
             &key_log_path,
             format!(
                 "CLIENT_TRAFFIC_SECRET_0 {} {}\nCLIENT_TRAFFIC_SECRET_0 {} aa",
@@ -575,7 +579,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-invalid-tls-keylog")?;
         let key_log_path = temp.join("sslkeylog.log");
-        fs::write(
+        write_private_file(
             &key_log_path,
             b"CLIENT_RANDOM 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f not-a-secret\n",
         )?;
@@ -610,7 +614,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-invalid-tls-session-secret")?;
         let session_secret_path = temp.join("session-secrets.jsonl");
-        fs::write(
+        write_private_file(
             &session_secret_path,
             format!(
                 r#"{{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"{}","secret":"not-a-secret"}}"#,
@@ -650,11 +654,11 @@ mod tests {
         let temp = test_dir("check-overlapping-tls-session-secrets")?;
         let first_path = temp.join("session-secrets-a.jsonl");
         let second_path = temp.join("session-secrets-b.jsonl");
-        fs::write(
+        write_private_file(
             &first_path,
             session_secret_material_with_window("00", "aa", 10, 30),
         )?;
-        fs::write(
+        write_private_file(
             &second_path,
             session_secret_material_with_window("00", "bb", 20, 40),
         )?;
@@ -701,7 +705,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-session-secret-without-live-material")?;
         let session_secret_path = temp.join("session-secrets.jsonl");
-        fs::write(
+        write_private_file(
             &session_secret_path,
             format!(
                 r#"{{"protocol":"tls12","secret_kind":"master_secret","client_random":"{}","secret":"{}"}}"#,
@@ -739,7 +743,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-plaintext-feed-session-secret-summary")?;
         let session_secret_path = temp.join("session-secrets.jsonl");
-        fs::write(
+        write_private_file(
             &session_secret_path,
             format!(
                 r#"{{"protocol":"tls12","secret_kind":"master_secret","client_random":"{}","secret":"{}"}}"#,
@@ -814,6 +818,11 @@ mod tests {
         }
         fs::create_dir_all(&path)?;
         Ok(path)
+    }
+
+    fn write_private_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), std::io::Error> {
+        fs::write(path, contents)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
     }
 
     fn session_secret_material_with_window(

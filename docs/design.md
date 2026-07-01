@@ -3905,20 +3905,21 @@ tail drain：
 
 ## 20. Secret 与 TLS materials 管理
 
-当前使用 filesystem backend + path-based file store abstraction。
+TLS material 使用 filesystem backend + path-based file store abstraction。
 
-目标默认行为：
+Filesystem backend contract：
 
-- root-owned 文件。
-- `0600` 权限。
-- 路径白名单。
-- 热加载校验。
+- material 必须是 non-symlink regular file。
+- material 大小不得超过 TLS material 上限。
+- material owner uid 必须等于 agent effective uid；agent 以 root 运行时即要求 root-owned。
+- material 必须设置 owner read bit。
+- material 不能包含 group/other permission bits；`0600` 是推荐写入形态，`0400` 也满足只读材料的读取契约。
 
-当前实现定义了 crate-local `TlsMaterialFileStore` trait，并提供 `FilesystemTlsMaterialStore` 作为默认 backend。`status` 的
-metadata-only source check、`check` 的 plaintext material 内容核验、planned webhook exporter 的 trust/client identity material
-读取都通过这个 path-based file store 边界。这样路径白名单、权限强校验和文件 backend 的 hardening 不需要让 exporter/check/status 分别实现一套。
+crate-local `TlsMaterialFileStore` trait 是 TLS material 的统一文件边界。`status` 的 metadata-only source check、`check`
+的 plaintext material 内容核验、planned webhook exporter 的 trust/client identity material 读取，都通过同一个 store 处理。
+路径 hardening、权限校验和文件 backend 行为不会分散到 exporter/check/status 各自实现。
 
-当前实现只完成第一版 filesystem material backend：
+Filesystem material backend 覆盖：
 
 - 配置校验保证 material id 唯一。
 - exporter refs 必须存在且 kind 匹配。
@@ -3934,14 +3935,18 @@ runtime plan 为每个 exporter 保留 resolved material 的 `id`、`kind` 和 `
 runtime plan 也会把 `interception.mitm` refs 解析成 typed material plan，并保留 backend readiness probe、plaintext bridge 与 policy hook，
 供 status/check/report 表达 MITM backend contract。
 
-filesystem store 拒绝缺失、symlink、目录、非 regular file 和超过当前大小上限的 material。活跃 webhook exporter 引用的 TLS material source
-不可用时，会把对应 exporter 和 health 标为 unavailable，并在原因中带上 material id/kind/path。planned webhook exporter 在实际 drain
-时先确认该 sink 有待发送 batch，再按 per-sink refs 通过同一 file store 边界读取 trust anchor/client identity PEM 并构造
-hyper-rustls transport；读取或 PEM 解析失败会让对应 drain 失败，空队列不会读取 secret bytes。
+filesystem store fail closed：缺失、symlink、目录、非 regular file、超过大小上限、owner 不匹配、owner 不可读或 group/other
+可访问的 material 都不可用。活跃 webhook exporter 引用的 TLS material source 不可用时，会把对应 exporter 和 health 标为
+unavailable，并在原因中带上 material id/kind/path。planned webhook exporter 在实际 drain 时先确认该 sink 有待发送 batch，
+再按 per-sink refs 通过同一 file store 边界读取 trust anchor/client identity PEM 并构造 hyper-rustls transport；读取或
+PEM 解析失败会让对应 drain 失败，空队列不会读取 secret bytes。
 
-尚未实现权限强校验、路径白名单、热加载和非 filesystem secret backend；接入 Vault/KMS/TPM 前，应先把 config/runtime material source
-从单一 `path` 提升为 typed source enum，再引入高一层的 secret material store 负责分发不同 source backend。不能把非文件 backend
-直接套在当前 `Path` contract 上。
+TLS material read path 先打开 bounded non-symlink regular file，再基于打开后的 fd metadata 校验 TLS material owner 与 permission
+policy；只有校验通过后才读取 secret bytes。metadata-only status check 只用于报告可用性，不承担活跃读取安全边界。
+
+路径白名单、热加载和非 filesystem secret backend 尚未实现。接入 Vault/KMS/TPM 前，应先把 config/runtime material source
+从单一 `path` 提升为 typed source enum，再引入高一层的 secret material store 负责分发不同 source backend。不能把非文件
+backend 直接套在当前 `Path` contract 上。
 
 敏感材料包括：
 

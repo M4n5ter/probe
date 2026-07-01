@@ -20,6 +20,14 @@ pub(crate) enum TlsMaterialFileStoreError {
     NotRegular,
     #[error("TLS material is too large: {size} bytes exceeds {limit} bytes")]
     TooLarge { size: u64, limit: u64 },
+    #[error(
+        "TLS material owner uid {owner_uid} does not match agent effective uid {effective_uid}"
+    )]
+    OwnerMismatch { owner_uid: u32, effective_uid: u32 },
+    #[error("TLS material owner read bit is not set; permissions are {mode:o}")]
+    OwnerUnreadable { mode: u32 },
+    #[error("TLS material has group/other permissions {mode:o}")]
+    InsecurePermissions { mode: u32 },
 }
 
 pub(crate) trait TlsMaterialFileStore: Send {

@@ -196,7 +196,7 @@ fn inspect_material_source(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, os::unix::fs::PermissionsExt};
 
     use probe_core::{CapabilityKind, CapabilityState, RuntimeMode, Selector};
     use serde_json::json;
@@ -213,6 +213,7 @@ mod tests {
         let temp = test_dir("status-tls-material")?;
         let material_path = temp.join("ca.pem");
         fs::write(&material_path, b"test trust anchor")?;
+        fs::set_permissions(&material_path, fs::Permissions::from_mode(0o600))?;
         let mut config = config_with_storage_path(temp.join("spool"));
         config.tls.materials = vec![probe_config::TlsMaterialConfig {
             id: Some("collector-ca".to_string()),
@@ -235,6 +236,36 @@ mod tests {
             json!("metadata_only")
         );
         assert_eq!(value["materials"][0]["purpose"], json!("trust_or_identity"));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tls_status_reports_insecure_material_as_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-tls-insecure-material")?;
+        let material_path = temp.join("ca.pem");
+        fs::write(&material_path, b"test trust anchor")?;
+        fs::set_permissions(&material_path, fs::Permissions::from_mode(0o644))?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.tls.materials = vec![probe_config::TlsMaterialConfig {
+            id: Some("collector-ca".to_string()),
+            kind: probe_config::TlsMaterialKind::TrustAnchor,
+            path: material_path.clone(),
+        }];
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+
+        let status = tls_status(&plan, &plan.capabilities, None, None);
+
+        let material = &status.materials[0];
+        assert_eq!(material.source.mode, RuntimeMode::Unavailable);
+        assert!(
+            material
+                .source
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("group/other permissions 644"))
+        );
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -391,6 +422,8 @@ mod tests {
         let session_secret_path = temp.join("session-secrets.jsonl");
         fs::write(&key_log_path, b"client random")?;
         fs::write(&session_secret_path, b"{\"secret\":\"test\"}\n")?;
+        fs::set_permissions(&key_log_path, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(&session_secret_path, fs::Permissions::from_mode(0o600))?;
         let mut config = config_with_storage_path(temp.join("spool"));
         config.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-keys".to_string()];
         config.tls.plaintext.decrypt_hints.session_secret_refs =
