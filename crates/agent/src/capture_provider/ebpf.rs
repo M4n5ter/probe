@@ -27,11 +27,13 @@ pub(super) fn build_ebpf_capture_provider(
         .deep_observe_selector
         .as_ref()
         .map(|selector| {
-            selector.compile().map_err(|source| {
-                AgentError::UnsupportedRunConfig(format!(
-                    "invalid capture.deep_observe_selector: {source}"
-                ))
-            })
+            selector
+                .compile_with_registry(&plan.config.selectors)
+                .map_err(|source| {
+                    AgentError::UnsupportedRunConfig(format!(
+                        "invalid capture.deep_observe_selector: {source}"
+                    ))
+                })
         })
         .transpose()?;
     let provider = EbpfProcessObservationProvider::open(

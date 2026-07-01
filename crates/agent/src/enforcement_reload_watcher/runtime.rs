@@ -749,9 +749,11 @@ mod tests {
 
     async fn empty_runtime_state() -> Result<EnforcementRuntimeState, Box<dyn std::error::Error>> {
         let planner = ScopedEnforcementPlanner::new(EnforcementMode::AuditOnly, None)?;
+        let selector_registry = probe_core::SelectorRegistry::default();
         let active_policy =
             crate::configured_enforcement::load_configured_enforcement_policy_runtime(
                 None,
+                &selector_registry,
                 &EnforcementPolicySourcePlan::None,
                 crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
             )
@@ -841,6 +843,7 @@ mod tests {
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
             version: version.to_string(),
+            selectors: Default::default(),
             selector: Some(Selector::term(
                 ProcessSelector::default(),
                 TrafficSelector {

@@ -1,7 +1,7 @@
 use pipeline::{PipelinePolicy, PipelinePolicySet};
 use policy::PolicyRuntime;
 use probe_config::{AgentConfig, PolicyConfig};
-use probe_core::CompiledSelector;
+use probe_core::{CompiledSelector, SelectorRegistry};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -108,7 +108,7 @@ pub async fn load_configured_policies_with_context(
 ) -> Result<Vec<LoadedConfiguredPolicy>, ConfiguredPolicyError> {
     let mut policies = Vec::new();
     for policy in enabled_policies(config) {
-        policies.push(read_configured_policy(policy, context).await?);
+        policies.push(read_configured_policy(policy, &config.selectors, context).await?);
     }
     Ok(policies)
 }
@@ -139,6 +139,7 @@ pub async fn load_configured_pipeline_policies_with_context(
 
 async fn read_configured_policy(
     policy: &PolicyConfig,
+    selector_registry: &SelectorRegistry,
     context: PolicySourceLoadContext,
 ) -> Result<LoadedConfiguredPolicy, ConfiguredPolicyError> {
     let source_ref = configured_policy_source(policy).source.reference();
@@ -147,7 +148,7 @@ async fn read_configured_policy(
         .as_ref()
         .map(|selector| {
             selector
-                .compile()
+                .compile_with_registry(selector_registry)
                 .map_err(|source| ConfiguredPolicyError::Selector {
                     id: policy.id.clone(),
                     source_ref: source_ref.clone(),

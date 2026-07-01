@@ -703,6 +703,38 @@ except for loopback HTTP endpoints used in local testing.
 the destructive action profile explicit and separate from Lua event policy
 logic.
 
+Named selectors can be declared once and referenced from capture, TLS,
+policy, enforcement, and transparent interception selectors:
+
+```toml
+[selectors.managed_https]
+op = "match"
+
+[selectors.managed_https.term.process]
+names = ["curl"]
+exe_path_globs = []
+cmdline_regexes = []
+systemd_services = []
+container_ids = []
+
+[selectors.managed_https.term.traffic]
+remote_ports = [443]
+directions = ["outbound"]
+remote_addresses = []
+
+[enforcement.interception.selector]
+op = "ref"
+name = "managed_https"
+```
+
+Enforcement manifests may also declare their own `[selectors.<name>]` registry.
+Manifest refs are resolved inside the manifest namespace before the agent
+combines them with the main config selector.
+
+Selector list fields default to empty lists when omitted. Empty process or
+traffic dimensions mean "do not constrain this dimension"; they are not parse
+errors.
+
 Selectors combine process and traffic dimensions:
 
 ```toml

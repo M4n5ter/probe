@@ -664,6 +664,36 @@ endpoint 外，必须使用 HTTPS。
 `protective_actions` 只接受 `deny`、`reset` 和 `quarantine`。这样 destructive action
 profile 会保持显式，并与 Lua event policy logic 分离。
 
+命名 selector 可以集中声明，并在 capture、TLS、policy、enforcement 和 transparent
+interception selector 中复用：
+
+```toml
+[selectors.managed_https]
+op = "match"
+
+[selectors.managed_https.term.process]
+names = ["curl"]
+exe_path_globs = []
+cmdline_regexes = []
+systemd_services = []
+container_ids = []
+
+[selectors.managed_https.term.traffic]
+remote_ports = [443]
+directions = ["outbound"]
+remote_addresses = []
+
+[enforcement.interception.selector]
+op = "ref"
+name = "managed_https"
+```
+
+Enforcement manifest 也可以声明自己的 `[selectors.<name>]` registry。manifest 中的
+ref 会先在 manifest 命名空间内解析，再与主配置 selector 合成。
+
+selector 的 list 字段省略时默认是空列表。空的 process 或 traffic 维度表示“不限制该维度”，
+不是解析错误。
+
 Selector 组合 process 和 traffic 维度：
 
 ```toml

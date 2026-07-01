@@ -8,7 +8,7 @@ pub(super) fn validate_config(
     violations: &mut Vec<ConfigViolation>,
 ) {
     if let Some(selector) = &config.capture.deep_observe_selector
-        && let Err(error) = selector.compile()
+        && let Err(error) = selector.resolve_refs_with_registry(&config.selectors)
     {
         violations.push(ConfigViolation {
             field: "capture.deep_observe_selector".to_string(),

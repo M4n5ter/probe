@@ -1,6 +1,6 @@
 use std::{fmt, path::PathBuf};
 
-use probe_core::{ProtectiveActionProfile, Selector};
+use probe_core::{ProtectiveActionProfile, Selector, SelectorRegistry};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub const DEFAULT_REMOTE_ENFORCEMENT_POLICY_BODY_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
@@ -131,6 +131,7 @@ pub enum EnforcementPolicySourceConfig {
 pub struct EnforcementPolicyManifest {
     pub id: String,
     pub version: String,
+    pub selectors: SelectorRegistry,
     pub selector: Option<Selector>,
     pub protective_actions: ProtectiveActionProfile,
 }

@@ -32,8 +32,8 @@ pub use protocol::{
 };
 pub use schema::{SpoolPayloadSchema, SpoolPayloadSchemaError};
 pub use selector::{
-    CompiledSelector, ProcessSelector, Selector, SelectorError, SelectorRegistry, SelectorTerm,
-    TrafficSelector,
+    CompiledSelector, ProcessSelector, ResolvedSelector, Selector, SelectorError, SelectorRegistry,
+    SelectorTerm, TrafficSelector,
 };
 pub use socket::{
     TcpConnection, TcpConnectionFromFlowError, TcpEndpoint, UpstreamRoute, UpstreamRouteError,

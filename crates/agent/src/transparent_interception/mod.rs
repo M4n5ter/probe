@@ -65,7 +65,7 @@ pub(crate) fn effective_setup_scope(
     if execution_plan.strategy() == TransparentInterceptionStrategyConfig::None {
         return Ok(None);
     }
-    if selectors.local_config_scope().is_none() {
+    if !selectors.local_config_scope_configured() {
         return Err(TransparentInterceptionError::Setup(
             MISSING_LOCAL_SETUP_SELECTOR.to_string(),
         ));
@@ -206,7 +206,8 @@ mod tests {
         TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
-        CapabilityKind, CapabilityState, Direction, ProcessSelector, Selector, TrafficSelector,
+        CapabilityKind, CapabilityState, Direction, ProcessSelector, ResolvedSelector, Selector,
+        TrafficSelector,
     };
 
     use super::*;
@@ -230,12 +231,14 @@ mod tests {
                 ..TrafficSelector::default()
             },
         );
+        let manifest_selector =
+            ResolvedSelector::new(manifest_selector).expect("test selector should be valid");
 
         let selectors = TransparentInterceptionSetupSelectors::from_sources(
             TransparentInterceptionSetupSelectorSources {
                 local_enforcement_selector: None,
                 effective_enforcement_selector: Some(&manifest_selector),
-                interception_selector: config.selector.as_ref(),
+                interception_selector: None,
             },
         );
         let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
@@ -273,11 +276,12 @@ mod tests {
                 ..TrafficSelector::default()
             },
         );
+        let selector = ResolvedSelector::new(selector).expect("test selector should be valid");
         let selectors = TransparentInterceptionSetupSelectors::from_sources(
             TransparentInterceptionSetupSelectorSources {
                 local_enforcement_selector: Some(&selector),
                 effective_enforcement_selector: Some(&selector),
-                interception_selector: config.selector.as_ref(),
+                interception_selector: None,
             },
         );
         let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
@@ -369,11 +373,16 @@ mod tests {
         selector: &Selector,
         config: &EnforcementInterceptionConfig,
     ) -> TransparentInterceptionSetupSelectors {
+        let selector =
+            ResolvedSelector::new(selector.clone()).expect("test selector should be valid");
+        let interception_selector = config.selector.clone().map(|selector| {
+            ResolvedSelector::new(selector).expect("test selector should be valid")
+        });
         TransparentInterceptionSetupSelectors::from_sources(
             TransparentInterceptionSetupSelectorSources {
-                local_enforcement_selector: Some(selector),
-                effective_enforcement_selector: Some(selector),
-                interception_selector: config.selector.as_ref(),
+                local_enforcement_selector: Some(&selector),
+                effective_enforcement_selector: Some(&selector),
+                interception_selector: interception_selector.as_ref(),
             },
         )
     }

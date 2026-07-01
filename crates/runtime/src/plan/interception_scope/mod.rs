@@ -10,7 +10,7 @@ use interception::{
     TransparentInterceptionSetupSelectors, TransparentInterceptionSocketOwnerScope,
 };
 use probe_config::{TransparentInterceptionDirectionConfig, TransparentInterceptionStrategyConfig};
-use probe_core::{ProcessSelector, Selector, TrafficSelector};
+use probe_core::{ProcessSelector, ResolvedSelector, TrafficSelector};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,8 +121,8 @@ pub struct TransparentInterceptionClassifierTermPlan {
 impl TransparentInterceptionLocalSetupProjectionPlan {
     pub(super) fn from_strategy_and_selectors(
         strategy: TransparentInterceptionStrategyConfig,
-        enforcement_selector: Option<&Selector>,
-        interception_selector: Option<&Selector>,
+        enforcement_selector: Option<&ResolvedSelector>,
+        interception_selector: Option<&ResolvedSelector>,
     ) -> Self {
         let Some(descriptor) = strategy.descriptor() else {
             return Self::NotConfigured;
@@ -138,8 +138,8 @@ impl TransparentInterceptionLocalSetupProjectionPlan {
     }
 
     fn from_inbound_selectors(
-        enforcement_selector: Option<&Selector>,
-        interception_selector: Option<&Selector>,
+        enforcement_selector: Option<&ResolvedSelector>,
+        interception_selector: Option<&ResolvedSelector>,
     ) -> Self {
         let selectors = TransparentInterceptionSetupSelectors::from_sources(
             TransparentInterceptionSetupSelectorSources {
@@ -154,8 +154,8 @@ impl TransparentInterceptionLocalSetupProjectionPlan {
     }
 
     fn from_outbound_selectors(
-        enforcement_selector: Option<&Selector>,
-        interception_selector: Option<&Selector>,
+        enforcement_selector: Option<&ResolvedSelector>,
+        interception_selector: Option<&ResolvedSelector>,
     ) -> Self {
         let selectors = TransparentInterceptionSetupSelectors::from_sources(
             TransparentInterceptionSetupSelectorSources {
@@ -337,7 +337,7 @@ impl TransparentInterceptionClassifierTermPlan {
 
 #[cfg(test)]
 mod tests {
-    use probe_core::{Direction, ProcessSelector, TrafficSelector};
+    use probe_core::{Direction, ProcessSelector, ResolvedSelector, Selector, TrafficSelector};
 
     use super::*;
 
@@ -686,9 +686,14 @@ mod tests {
                             ..TrafficSelector::default()
                         },
                     ),
-                    Selector::Ref {
-                        name: "external".to_string(),
-                    },
+                    Selector::term(
+                        ProcessSelector::default(),
+                        TrafficSelector {
+                            local_ports: vec![9443],
+                            directions: vec![Direction::Outbound],
+                            ..TrafficSelector::default()
+                        },
+                    ),
                 ],
             },
         );
@@ -729,29 +734,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn invalid_remote_address_is_unsupported() {
-        let scope = scope_for(
-            TransparentInterceptionStrategyConfig::InboundTproxy,
-            Selector::term(
-                ProcessSelector::default(),
-                TrafficSelector {
-                    remote_addresses: vec!["not an ip".to_string()],
-                    ..TrafficSelector::default()
-                },
-            ),
-        );
-
-        assert!(matches!(
-            scope,
-            TransparentInterceptionLocalSetupProjectionPlan::Unsupported { .. }
-        ));
-    }
-
     fn scope_for(
         strategy: TransparentInterceptionStrategyConfig,
         selector: Selector,
     ) -> TransparentInterceptionLocalSetupProjectionPlan {
+        let selector =
+            ResolvedSelector::new(selector).expect("test selector should be resolved and valid");
         TransparentInterceptionLocalSetupProjectionPlan::from_strategy_and_selectors(
             strategy,
             Some(&selector),

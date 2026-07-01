@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use probe_core::SelectorRegistry;
+
 use crate::{
     AdminConfig, CaptureConfig, ConfigError, EnforcementConfig, ExportRuntimeConfig,
     ExporterConfig, PolicyConfig, PolicyReloadConfig, StorageConfig, TlsConfig, validation,
@@ -16,6 +18,7 @@ pub struct AgentConfig {
     pub exporters: Vec<ExporterConfig>,
     pub policy_reload: PolicyReloadConfig,
     pub policies: Vec<PolicyConfig>,
+    pub selectors: SelectorRegistry,
     pub tls: TlsConfig,
     pub enforcement: EnforcementConfig,
     pub admin: AdminConfig,
@@ -46,6 +49,7 @@ impl Default for AgentConfig {
             exporters: Vec::new(),
             policy_reload: PolicyReloadConfig::default(),
             policies: Vec::new(),
+            selectors: SelectorRegistry::default(),
             tls: TlsConfig::default(),
             enforcement: EnforcementConfig::default(),
             admin: AdminConfig::default(),

@@ -10,6 +10,9 @@ use thiserror::Error;
 
 use crate::{Direction, EventEnvelope, FlowContext, ProcessContext};
 
+const MAX_RESOLVED_SELECTOR_NODES: usize = 4_096;
+const MAX_SELECTOR_REF_RESOLUTION_DEPTH: usize = 64;
+
 #[derive(Debug, Error)]
 pub enum SelectorError {
     #[error("invalid executable path glob: {0}")]
@@ -24,6 +27,12 @@ pub enum SelectorError {
     RecursiveNamedSelector(String),
     #[error("selector {0} requires at least one child")]
     EmptyComposite(&'static str),
+    #[error("resolved selector exceeds maximum expanded node count of {max}")]
+    ResolvedSelectorTooLarge { max: usize },
+    #[error("selector ref resolution exceeds maximum depth of {max}")]
+    SelectorRefResolutionTooDeep { max: usize },
+    #[error("resolved selector still contains named selector ref: {0}")]
+    UnresolvedNamedSelector(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +73,36 @@ impl Selector {
             node: CompiledSelectorNode::compile(self, registry, &mut resolving)?,
         })
     }
+
+    pub fn resolve_refs_with_registry(
+        &self,
+        registry: &SelectorRegistry,
+    ) -> Result<ResolvedSelector, SelectorError> {
+        let mut context = ResolveSelectorRefsContext::default();
+        ResolvedSelector::new(resolve_selector_refs(self, registry, &mut context, 0)?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSelector {
+    selector: Selector,
+}
+
+impl ResolvedSelector {
+    pub fn new(selector: Selector) -> Result<Self, SelectorError> {
+        let mut nodes = 0;
+        validate_resolved_selector(&selector, &mut nodes)?;
+        selector.compile()?;
+        Ok(Self { selector })
+    }
+
+    pub fn as_selector(&self) -> &Selector {
+        &self.selector
+    }
+
+    pub fn into_selector(self) -> Selector {
+        self.selector
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +112,7 @@ pub struct SelectorTerm {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SelectorRegistry {
     selectors: BTreeMap<String, Selector>,
 }
@@ -87,27 +127,45 @@ impl SelectorRegistry {
     pub fn get(&self, name: &str) -> Option<&Selector> {
         self.selectors.get(name)
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.selectors.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Selector)> {
+        self.selectors.iter()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessSelector {
+    #[serde(default)]
     pub pids: Vec<u32>,
     #[serde(default)]
     pub uids: Vec<u32>,
     #[serde(default)]
     pub gids: Vec<u32>,
+    #[serde(default)]
     pub names: Vec<String>,
+    #[serde(default)]
     pub exe_path_globs: Vec<String>,
+    #[serde(default)]
     pub cmdline_regexes: Vec<String>,
+    #[serde(default)]
     pub systemd_services: Vec<String>,
+    #[serde(default)]
     pub container_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrafficSelector {
+    #[serde(default)]
     pub local_ports: Vec<u16>,
+    #[serde(default)]
     pub remote_ports: Vec<u16>,
+    #[serde(default)]
     pub directions: Vec<Direction>,
+    #[serde(default)]
     pub remote_addresses: Vec<String>,
 }
 
@@ -264,6 +322,102 @@ impl CompiledSelectorNode {
             Self::Not(_) => true,
         }
     }
+}
+
+#[derive(Default)]
+struct ResolveSelectorRefsContext {
+    resolving: BTreeSet<String>,
+    nodes: usize,
+}
+
+impl ResolveSelectorRefsContext {
+    fn reserve_node(&mut self) -> Result<(), SelectorError> {
+        self.nodes = self.nodes.saturating_add(1);
+        if self.nodes > MAX_RESOLVED_SELECTOR_NODES {
+            return Err(SelectorError::ResolvedSelectorTooLarge {
+                max: MAX_RESOLVED_SELECTOR_NODES,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn resolve_selector_refs(
+    selector: &Selector,
+    registry: &SelectorRegistry,
+    context: &mut ResolveSelectorRefsContext,
+    depth: usize,
+) -> Result<Selector, SelectorError> {
+    if depth > MAX_SELECTOR_REF_RESOLUTION_DEPTH {
+        return Err(SelectorError::SelectorRefResolutionTooDeep {
+            max: MAX_SELECTOR_REF_RESOLUTION_DEPTH,
+        });
+    }
+    context.reserve_node()?;
+    match selector {
+        Selector::Match { term } => Ok(Selector::Match { term: term.clone() }),
+        Selector::All { selectors } => {
+            non_empty_selector_children("all", selectors)?;
+            selectors
+                .iter()
+                .map(|selector| resolve_selector_refs(selector, registry, context, depth + 1))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|selectors| Selector::All { selectors })
+        }
+        Selector::Any { selectors } => {
+            non_empty_selector_children("any", selectors)?;
+            selectors
+                .iter()
+                .map(|selector| resolve_selector_refs(selector, registry, context, depth + 1))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|selectors| Selector::Any { selectors })
+        }
+        Selector::Not { selector } => resolve_selector_refs(selector, registry, context, depth + 1)
+            .map(Box::new)
+            .map(|selector| Selector::Not { selector }),
+        Selector::Ref { name } => {
+            if !context.resolving.insert(name.clone()) {
+                return Err(SelectorError::RecursiveNamedSelector(name.clone()));
+            }
+            let target = registry
+                .get(name)
+                .ok_or_else(|| SelectorError::UnknownNamedSelector(name.clone()))?;
+            let resolved = resolve_selector_refs(target, registry, context, depth + 1);
+            context.resolving.remove(name);
+            resolved
+        }
+    }
+}
+
+fn validate_resolved_selector(selector: &Selector, nodes: &mut usize) -> Result<(), SelectorError> {
+    reserve_resolved_selector_node(nodes)?;
+    match selector {
+        Selector::Match { .. } => Ok(()),
+        Selector::All { selectors } => {
+            non_empty_selector_children("all", selectors)?;
+            selectors
+                .iter()
+                .try_for_each(|selector| validate_resolved_selector(selector, nodes))
+        }
+        Selector::Any { selectors } => {
+            non_empty_selector_children("any", selectors)?;
+            selectors
+                .iter()
+                .try_for_each(|selector| validate_resolved_selector(selector, nodes))
+        }
+        Selector::Not { selector } => validate_resolved_selector(selector, nodes),
+        Selector::Ref { name } => Err(SelectorError::UnresolvedNamedSelector(name.clone())),
+    }
+}
+
+fn reserve_resolved_selector_node(nodes: &mut usize) -> Result<(), SelectorError> {
+    *nodes = nodes.saturating_add(1);
+    if *nodes > MAX_RESOLVED_SELECTOR_NODES {
+        return Err(SelectorError::ResolvedSelectorTooLarge {
+            max: MAX_RESOLVED_SELECTOR_NODES,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -500,6 +654,17 @@ fn non_empty_composite<T>(name: &'static str, values: Vec<T>) -> Result<Vec<T>, 
         Err(SelectorError::EmptyComposite(name))
     } else {
         Ok(values)
+    }
+}
+
+fn non_empty_selector_children(
+    name: &'static str,
+    selectors: &[Selector],
+) -> Result<(), SelectorError> {
+    if selectors.is_empty() {
+        Err(SelectorError::EmptyComposite(name))
+    } else {
+        Ok(())
     }
 }
 
@@ -920,6 +1085,75 @@ mod tests {
         assert!(selector.matches_flow(&flow, Direction::Outbound));
         assert!(!selector.matches_flow(&flow, Direction::Inbound));
         Ok(())
+    }
+
+    #[test]
+    fn selector_refs_resolve_to_plain_selector_ast() -> Result<(), Box<dyn std::error::Error>> {
+        let registry = SelectorRegistry::new([(
+            "https".to_string(),
+            Selector::term(
+                ProcessSelector::default(),
+                TrafficSelector {
+                    remote_ports: vec![443],
+                    ..TrafficSelector::default()
+                },
+            ),
+        )]);
+        let selector = Selector::All {
+            selectors: vec![
+                Selector::Ref {
+                    name: "https".to_string(),
+                },
+                Selector::term(
+                    ProcessSelector {
+                        names: vec!["demo".to_string()],
+                        ..ProcessSelector::default()
+                    },
+                    TrafficSelector::default(),
+                ),
+            ],
+        };
+
+        let resolved = selector.resolve_refs_with_registry(&registry)?;
+
+        let Selector::All { selectors } = resolved.as_selector() else {
+            panic!("resolved selector should preserve all composition");
+        };
+        assert!(matches!(selectors[0], Selector::Match { .. }));
+        assert!(matches!(selectors[1], Selector::Match { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn selector_ref_resolution_rejects_excessive_expansion() {
+        let mut entries = Vec::new();
+        entries.push(("seed".to_string(), Selector::default()));
+        let mut previous = "seed".to_string();
+        for index in 0..16 {
+            let name = format!("wide-{index}");
+            entries.push((
+                name.clone(),
+                Selector::All {
+                    selectors: vec![
+                        Selector::Ref {
+                            name: previous.clone(),
+                        },
+                        Selector::Ref {
+                            name: previous.clone(),
+                        },
+                    ],
+                },
+            ));
+            previous = name;
+        }
+        let registry = SelectorRegistry::new(entries);
+
+        let result = Selector::Ref { name: previous }.resolve_refs_with_registry(&registry);
+
+        assert!(matches!(
+            result,
+            Err(SelectorError::ResolvedSelectorTooLarge { .. })
+        ));
     }
 
     #[test]

@@ -6,7 +6,9 @@ use interception::{
     TransparentInterceptionHostRuleSet, TransparentInterceptionSetupSelectorSources,
     TransparentInterceptionSetupSelectors,
 };
-use probe_core::{EnforcementMode, ProtectiveActionProfile, Selector};
+use probe_core::{
+    EnforcementMode, ProtectiveActionProfile, ResolvedSelector, Selector, SelectorRegistry,
+};
 use runtime::{
     EnforcementExecutionSurface, EnforcementPolicySourcePlan, RuntimePlan,
     TransparentInterceptionExecutionPlan, TransparentInterceptionMitmPolicyHookPlan,
@@ -46,19 +48,23 @@ impl From<EnforcementPolicySourceError> for ConfiguredEnforcementError {
 
 #[derive(Clone)]
 pub(crate) struct ActiveEnforcementPolicy {
-    effective_selector: Option<Selector>,
+    effective_selector: Option<ResolvedSelector>,
     planner_policy: PlannerPolicy,
     policy_source: Option<LoadedEnforcementPolicySource>,
 }
 
 impl ActiveEnforcementPolicy {
     pub(crate) fn new(
-        effective_selector: Option<Selector>,
+        effective_selector: Option<ResolvedSelector>,
         protective_actions: ProtectiveActionProfile,
         policy_source: Option<LoadedEnforcementPolicySource>,
     ) -> Result<Self, EnforcementError> {
-        let planner_policy =
-            PlannerPolicy::compile(effective_selector.as_ref(), protective_actions)?;
+        let planner_policy = PlannerPolicy::compile(
+            effective_selector
+                .as_ref()
+                .map(ResolvedSelector::as_selector),
+            protective_actions,
+        )?;
         Ok(Self {
             effective_selector,
             planner_policy,
@@ -66,7 +72,7 @@ impl ActiveEnforcementPolicy {
         })
     }
 
-    pub(crate) fn effective_selector(&self) -> Option<&Selector> {
+    pub(crate) fn effective_selector(&self) -> Option<&ResolvedSelector> {
         self.effective_selector.as_ref()
     }
 
@@ -129,6 +135,7 @@ pub async fn build_configured_enforcement_check_with_backend(
         ConfiguredEnforcementParts {
             mode: plan.enforcement.mode,
             config_selector: plan.config.enforcement.selector.clone(),
+            config_selector_registry: &plan.config.selectors,
             config_selector_configured: plan.enforcement.config_selector_configured,
             policy_source_plan: &plan.enforcement.policy_source,
             execution: ConfiguredEnforcementExecution::from_plan(plan, backend),
@@ -136,11 +143,19 @@ pub async fn build_configured_enforcement_check_with_backend(
         policy_source_context,
     )
     .await?;
+    let local_enforcement_selector = resolve_selector_refs(
+        plan.config.enforcement.selector.as_ref(),
+        &plan.config.selectors,
+    )?;
+    let interception_selector = resolve_selector_refs(
+        plan.config.enforcement.interception.selector.as_ref(),
+        &plan.config.selectors,
+    )?;
     let setup_selectors = TransparentInterceptionSetupSelectors::from_sources(
         TransparentInterceptionSetupSelectorSources {
-            local_enforcement_selector: plan.config.enforcement.selector.as_ref(),
+            local_enforcement_selector: local_enforcement_selector.as_ref(),
             effective_enforcement_selector: configured.active_policy.effective_selector(),
-            interception_selector: plan.config.enforcement.interception.selector.as_ref(),
+            interception_selector: interception_selector.as_ref(),
         },
     );
     let mut process_classifier = TransparentInterceptionProcessClassifier::new();
@@ -168,6 +183,7 @@ pub async fn build_configured_enforcement_check_with_backend(
 struct ConfiguredEnforcementParts<'a> {
     mode: EnforcementMode,
     config_selector: Option<Selector>,
+    config_selector_registry: &'a SelectorRegistry,
     config_selector_configured: bool,
     policy_source_plan: &'a EnforcementPolicySourcePlan,
     execution: ConfiguredEnforcementExecution<'a>,
@@ -182,6 +198,7 @@ async fn build_configured_enforcement_from_parts(
 
     let policy_runtime = load_configured_enforcement_policy_runtime(
         parts.config_selector,
+        parts.config_selector_registry,
         parts.policy_source_plan,
         policy_source_context,
     )
@@ -212,24 +229,37 @@ fn validate_enforce_policy_source(
 
 pub(crate) async fn load_configured_enforcement_policy_runtime(
     config_selector: Option<Selector>,
+    config_selector_registry: &SelectorRegistry,
     policy_source_plan: &EnforcementPolicySourcePlan,
     policy_source_context: EnforcementPolicySourceLoadContext,
 ) -> Result<ActiveEnforcementPolicy, ConfiguredEnforcementError> {
     let policy_source =
         load_enforcement_policy_source_with_context(policy_source_plan, policy_source_context)
             .await?;
-    let effective_selector = effective_selector(
-        config_selector,
-        policy_source
-            .as_ref()
-            .and_then(|source| source.manifest.selector.clone()),
-    );
+    let config_selector =
+        resolve_selector_refs(config_selector.as_ref(), config_selector_registry)?;
+    let policy_selector = policy_source
+        .as_ref()
+        .and_then(LoadedEnforcementPolicySource::resolved_selector)
+        .cloned();
+    let effective_selector = effective_selector(config_selector, policy_selector)?;
     let protective_actions = policy_source
         .as_ref()
         .map_or_else(ProtectiveActionProfile::default, |source| {
             source.manifest.protective_actions.clone()
         });
     ActiveEnforcementPolicy::new(effective_selector, protective_actions, policy_source)
+        .map_err(ConfiguredEnforcementError::Planner)
+}
+
+fn resolve_selector_refs(
+    selector: Option<&Selector>,
+    registry: &SelectorRegistry,
+) -> Result<Option<ResolvedSelector>, ConfiguredEnforcementError> {
+    selector
+        .map(|selector| selector.resolve_refs_with_registry(registry))
+        .transpose()
+        .map_err(EnforcementError::from)
         .map_err(ConfiguredEnforcementError::Planner)
 }
 
@@ -319,15 +349,18 @@ impl<'a> ConfiguredEnforcementExecution<'a> {
 }
 
 fn effective_selector(
-    config_selector: Option<Selector>,
-    policy_selector: Option<Selector>,
-) -> Option<Selector> {
+    config_selector: Option<ResolvedSelector>,
+    policy_selector: Option<ResolvedSelector>,
+) -> Result<Option<ResolvedSelector>, ConfiguredEnforcementError> {
     match (config_selector, policy_selector) {
-        (Some(config), Some(policy)) => Some(Selector::All {
-            selectors: vec![config, policy],
-        }),
-        (Some(selector), None) | (None, Some(selector)) => Some(selector),
-        (None, None) => None,
+        (Some(config), Some(policy)) => ResolvedSelector::new(Selector::All {
+            selectors: vec![config.into_selector(), policy.into_selector()],
+        })
+        .map(Some)
+        .map_err(EnforcementError::from)
+        .map_err(ConfiguredEnforcementError::Planner),
+        (Some(selector), None) | (None, Some(selector)) => Ok(Some(selector)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -376,10 +409,12 @@ mod tests {
             max_body_bytes: runtime::RemoteEnforcementPolicyBodyLimitBytes::from_config(None)
                 .expect("default remote enforcement policy body limit must be valid"),
         };
+        let selector_registry = probe_core::SelectorRegistry::default();
         let error = match build_configured_enforcement_from_parts(
             ConfiguredEnforcementParts {
                 mode: EnforcementMode::Enforce,
                 config_selector: None,
+                config_selector_registry: &selector_registry,
                 config_selector_configured: false,
                 policy_source_plan: &policy_source_plan,
                 execution: ConfiguredEnforcementExecution::Unavailable,
@@ -400,10 +435,12 @@ mod tests {
 
     #[tokio::test]
     async fn enforce_requires_policy_source() {
+        let selector_registry = probe_core::SelectorRegistry::default();
         let error = match build_configured_enforcement_from_parts(
             ConfiguredEnforcementParts {
                 mode: EnforcementMode::Enforce,
                 config_selector: None,
+                config_selector_registry: &selector_registry,
                 config_selector_configured: false,
                 policy_source_plan: &EnforcementPolicySourcePlan::None,
                 execution: ConfiguredEnforcementExecution::ConnectionBackend(Box::new(
@@ -428,10 +465,12 @@ mod tests {
     async fn enforce_uses_injected_backend() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let policy_source_plan = test_enforcement_policy_source_plan(temp.path())?;
+        let selector_registry = probe_core::SelectorRegistry::default();
         let mut configured = build_configured_enforcement_from_parts(
             ConfiguredEnforcementParts {
                 mode: EnforcementMode::Enforce,
                 config_selector: None,
+                config_selector_registry: &selector_registry,
                 config_selector_configured: false,
                 policy_source_plan: &policy_source_plan,
                 execution: ConfiguredEnforcementExecution::ConnectionBackend(Box::new(
@@ -470,10 +509,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let policy_source_plan = test_enforcement_policy_source_plan(temp.path())?;
+        let selector_registry = probe_core::SelectorRegistry::default();
         let mut configured = build_configured_enforcement_from_parts(
             ConfiguredEnforcementParts {
                 mode: EnforcementMode::Enforce,
                 config_selector: None,
+                config_selector_registry: &selector_registry,
                 config_selector_configured: false,
                 policy_source_plan: &policy_source_plan,
                 execution: ConfiguredEnforcementExecution::TransparentInterceptionSetup,
@@ -518,10 +559,12 @@ mod tests {
             timeout_ms: 1_000,
             max_response_bytes: 4_096,
         };
+        let selector_registry = probe_core::SelectorRegistry::default();
         let mut configured = build_configured_enforcement_from_parts(
             ConfiguredEnforcementParts {
                 mode: EnforcementMode::Enforce,
                 config_selector: None,
+                config_selector_registry: &selector_registry,
                 config_selector_configured: false,
                 policy_source_plan: &policy_source_plan,
                 execution: ConfiguredEnforcementExecution::L7MitmProxyHook {
@@ -565,6 +608,80 @@ mod tests {
             .expect("server thread should not panic")
             .map_err(std::io::Error::other)?;
         assert!(body.contains("\"requested_action\":\"deny\""));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enforcement_policy_refs_resolve_in_their_source_registry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let manifest_path = temp.path().join("manifest.toml");
+        let manifest = EnforcementPolicyManifest {
+            id: "managed-apps".to_string(),
+            version: "test-version".to_string(),
+            selectors: SelectorRegistry::new([(
+                "fixture-port".to_string(),
+                Selector::term(
+                    ProcessSelector::default(),
+                    TrafficSelector {
+                        remote_ports: vec![8080],
+                        directions: vec![Direction::Outbound],
+                        ..TrafficSelector::default()
+                    },
+                ),
+            )]),
+            selector: Some(Selector::Ref {
+                name: "fixture-port".to_string(),
+            }),
+            protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
+        };
+        std::fs::write(&manifest_path, toml::to_string(&manifest)?)?;
+        let policy_source_plan = EnforcementPolicySourcePlan::LocalManifest {
+            source_kind: runtime::EnforcementPolicySourceKind::File,
+            path: manifest_path,
+        };
+        let config_selector_registry = SelectorRegistry::new([(
+            "fixture-process".to_string(),
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["app".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        )]);
+        let mut configured = build_configured_enforcement_from_parts(
+            ConfiguredEnforcementParts {
+                mode: EnforcementMode::AuditOnly,
+                config_selector: Some(Selector::Ref {
+                    name: "fixture-process".to_string(),
+                }),
+                config_selector_registry: &config_selector_registry,
+                config_selector_configured: true,
+                policy_source_plan: &policy_source_plan,
+                execution: ConfiguredEnforcementExecution::Unavailable,
+            },
+            EnforcementPolicySourceLoadContext::default(),
+        )
+        .await?;
+        let verdict = Verdict {
+            action: Action::Deny,
+            scope: VerdictScope::Flow,
+            reason: "managed policy".to_string(),
+            confidence: 100,
+            ttl_ms: None,
+        };
+
+        let decision = configured
+            .planner
+            .evaluate(EnforcementPlanRequest {
+                verdict: &verdict,
+                trigger: &outbound_event(),
+            })
+            .expect("protective verdict must produce an enforcement decision");
+
+        assert_eq!(decision.outcome, EnforcementOutcome::AuditOnly);
+        assert!(decision.selector_matched);
         Ok(())
     }
 
@@ -840,6 +957,7 @@ mod tests {
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
             version: "test-version".to_string(),
+            selectors: Default::default(),
             selector,
             protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
         };

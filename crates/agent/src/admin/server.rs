@@ -640,6 +640,7 @@ mod tests {
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
             version: "test-version".to_string(),
+            selectors: Default::default(),
             selector: None,
             protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
         };
@@ -898,7 +899,8 @@ mod tests {
             });
         let effective_selector = policy_source
             .as_ref()
-            .and_then(|source| source.manifest.selector.clone());
+            .and_then(LoadedEnforcementPolicySource::resolved_selector)
+            .cloned();
         let active_policy = crate::configured_enforcement::ActiveEnforcementPolicy::new(
             effective_selector,
             protective_actions,
@@ -917,6 +919,7 @@ mod tests {
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
             version: version.to_string(),
+            selectors: Default::default(),
             selector: Some(Selector::term(
                 ProcessSelector::default(),
                 TrafficSelector {

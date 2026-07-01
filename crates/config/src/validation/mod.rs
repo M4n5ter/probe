@@ -4,6 +4,7 @@ mod enforcement;
 mod export;
 mod policy;
 mod remote_endpoint;
+mod selectors;
 mod storage;
 
 use crate::{AgentConfig, ConfigValidationError, tls};
@@ -18,6 +19,7 @@ pub(crate) fn validate_config(config: &AgentConfig) -> Result<(), ConfigValidati
     export::validate_exporters(&config.exporters, &config.tls, &mut violations);
     policy::validate(&config.policies, &mut violations);
     policy::validate_reload(&config.policies, &config.policy_reload, &mut violations);
+    selectors::validate(&config.selectors, &mut violations);
     enforcement::validate(&config.enforcement, &config.tls, &mut violations);
     admin::validate(&config.admin, &mut violations);
 

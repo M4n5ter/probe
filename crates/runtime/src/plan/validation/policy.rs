@@ -3,7 +3,7 @@ use probe_config::{AgentConfig, ConfigViolation};
 pub(super) fn validate_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
     for policy in config.policies.iter().filter(|policy| policy.enabled) {
         if let Some(selector) = &policy.selector
-            && let Err(error) = selector.compile()
+            && let Err(error) = selector.resolve_refs_with_registry(&config.selectors)
         {
             violations.push(ConfigViolation {
                 field: format!("policies.{}.selector", policy.id),

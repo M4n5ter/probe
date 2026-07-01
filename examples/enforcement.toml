@@ -2,10 +2,10 @@ id = "managed-apps"
 version = "example"
 protective_actions = ["deny", "reset"]
 
-[selector]
+[selectors.curl_https]
 op = "match"
 
-[selector.term.process]
+[selectors.curl_https.term.process]
 pids = []
 names = []
 exe_path_globs = ["/usr/bin/curl"]
@@ -13,8 +13,12 @@ cmdline_regexes = []
 systemd_services = []
 container_ids = []
 
-[selector.term.traffic]
+[selectors.curl_https.term.traffic]
 local_ports = []
 remote_ports = [443]
 directions = ["outbound"]
 remote_addresses = []
+
+[selector]
+op = "ref"
+name = "curl_https"

@@ -370,6 +370,7 @@ mod tests {
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
             version: "test-version".to_string(),
+            selectors: Default::default(),
             selector: Some(Selector::default()),
             protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
         };
@@ -528,6 +529,7 @@ protective_actions = ["alert"]
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
             version: "remote-test".to_string(),
+            selectors: Default::default(),
             selector: None,
             protective_actions: ProtectiveActionProfile::new([Action::Reset])?,
         };

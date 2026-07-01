@@ -26,7 +26,7 @@ use probe_config::{
 };
 use probe_core::{
     ApplicationProtocolPolicy, CapabilityKind, CapabilityMatrix, CapabilityState, Direction,
-    EnforcementMode, RuntimeMode,
+    EnforcementMode, ResolvedSelector, RuntimeMode, Selector,
 };
 use serde::{Deserialize, Serialize};
 use transparent_linux::{OutboundRedirectArtifactSpec, TransparentLinuxResources};
@@ -161,12 +161,7 @@ impl EnforcementInterceptionPlan {
             execution,
             nftables,
             mitm,
-            local_setup_projection:
-                TransparentInterceptionLocalSetupProjectionPlan::from_strategy_and_selectors(
-                    strategy,
-                    config.enforcement.selector.as_ref(),
-                    config.enforcement.interception.selector.as_ref(),
-                ),
+            local_setup_projection: local_setup_projection_from_config(strategy, config),
             classification: TransparentInterceptionClassificationPlan::from_capabilities(
                 capabilities,
             ),
@@ -177,6 +172,34 @@ impl EnforcementInterceptionPlan {
             selector_configured: config.enforcement.interception.selector.is_some(),
         }
     }
+}
+
+fn local_setup_projection_from_config(
+    strategy: TransparentInterceptionStrategyConfig,
+    config: &AgentConfig,
+) -> TransparentInterceptionLocalSetupProjectionPlan {
+    let enforcement_selector =
+        resolve_validated_config_selector(config.enforcement.selector.as_ref(), config);
+    let interception_selector = resolve_validated_config_selector(
+        config.enforcement.interception.selector.as_ref(),
+        config,
+    );
+    TransparentInterceptionLocalSetupProjectionPlan::from_strategy_and_selectors(
+        strategy,
+        enforcement_selector.as_ref(),
+        interception_selector.as_ref(),
+    )
+}
+
+fn resolve_validated_config_selector(
+    selector: Option<&Selector>,
+    config: &AgentConfig,
+) -> Option<ResolvedSelector> {
+    selector.map(|selector| {
+        selector
+            .resolve_refs_with_registry(&config.selectors)
+            .expect("config selector refs should be validated before runtime plan resolution")
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1304,6 +1327,7 @@ pub(super) struct EnforcementCapabilityRequirement {
 mod tests {
     use std::num::NonZeroU32;
 
+    use crate::plan::interception_scope::TransparentInterceptionProjectedPortScopePlan;
     use crate::plan::{
         CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
     };
@@ -1322,7 +1346,8 @@ mod tests {
         TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
-        CapabilityMatrix, CapabilityState, Direction, ProcessSelector, Selector, TrafficSelector,
+        CapabilityMatrix, CapabilityState, Direction, ProcessSelector, Selector, SelectorRegistry,
+        TrafficSelector,
     };
 
     use super::*;
@@ -1548,6 +1573,47 @@ mod tests {
                         .expect("test outbound proxy bypass mark should be non-zero"),
                 }
             }
+        );
+    }
+
+    #[test]
+    fn enforcement_plan_projects_named_selector_refs_to_host_rules() {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
+        config.enforcement.interception.proxy.mode =
+            TransparentInterceptionProxyModeConfig::ManagedTcpRelay;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.selectors = SelectorRegistry::new([(
+            "managed-https".to_string(),
+            Selector::term(
+                ProcessSelector::default(),
+                TrafficSelector {
+                    remote_ports: vec![443],
+                    directions: vec![Direction::Outbound],
+                    ..TrafficSelector::default()
+                },
+            ),
+        )]);
+        config.enforcement.interception.selector = Some(Selector::Ref {
+            name: "managed-https".to_string(),
+        });
+        let capabilities = CapabilityMatrix::new(test_platform_capabilities_with_interception(
+            RuntimeMode::Available,
+        ));
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        let TransparentInterceptionLocalSetupProjectionPlan::HostRules { scopes } =
+            plan.interception.local_setup_projection
+        else {
+            panic!("named selector ref should project to host rules");
+        };
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(
+            scopes[0].remote_ports,
+            TransparentInterceptionProjectedPortScopePlan::Only { ports: vec![443] }
         );
     }
 

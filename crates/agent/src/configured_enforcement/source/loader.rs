@@ -6,6 +6,7 @@ use std::{
 
 use http::StatusCode;
 use probe_config::EnforcementPolicyManifest;
+use probe_core::ResolvedSelector;
 use probe_http::HttpConnectionOptions;
 use runtime::{EnforcementPolicySourceKind, EnforcementPolicySourcePlan};
 use serde::Serialize;
@@ -23,13 +24,16 @@ const REMOTE_ENFORCEMENT_POLICY_ACCEPT: &str = "application/toml, text/plain;q=0
 pub struct LoadedEnforcementPolicySource {
     origin: LoadedEnforcementPolicySourceOrigin,
     pub manifest: EnforcementPolicyManifest,
+    resolved_selector: Option<ResolvedSelector>,
 }
 
 impl LoadedEnforcementPolicySource {
     pub fn local(path: impl Into<PathBuf>, manifest: EnforcementPolicyManifest) -> Self {
+        let resolved_selector = resolved_manifest_selector(&manifest);
         Self {
             origin: LoadedEnforcementPolicySourceOrigin::LocalPath(path.into()),
             manifest,
+            resolved_selector,
         }
     }
 
@@ -38,13 +42,19 @@ impl LoadedEnforcementPolicySource {
         max_body_bytes: u64,
         manifest: EnforcementPolicyManifest,
     ) -> Self {
+        let resolved_selector = resolved_manifest_selector(&manifest);
         Self {
             origin: LoadedEnforcementPolicySourceOrigin::RemoteEndpoint {
                 endpoint: endpoint.into(),
                 max_body_bytes,
             },
             manifest,
+            resolved_selector,
         }
+    }
+
+    pub fn resolved_selector(&self) -> Option<&ResolvedSelector> {
+        self.resolved_selector.as_ref()
     }
 
     pub fn snapshot(&self) -> LoadedEnforcementPolicySourceSnapshot {
@@ -63,6 +73,14 @@ impl LoadedEnforcementPolicySource {
             },
         }
     }
+}
+
+fn resolved_manifest_selector(manifest: &EnforcementPolicyManifest) -> Option<ResolvedSelector> {
+    manifest.selector.as_ref().map(|selector| {
+        selector
+            .resolve_refs_with_registry(&manifest.selectors)
+            .expect("enforcement policy manifest selector should be validated before loading")
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -413,9 +431,21 @@ fn validate_enforcement_policy_manifest(
             reason: "enforcement policy version cannot be empty".to_string(),
         });
     }
+    for (name, selector) in manifest.selectors.iter() {
+        if name.trim().is_empty() {
+            return Err(EnforcementPolicySourceError::InvalidManifest {
+                reason: "enforcement policy selector name cannot be empty".to_string(),
+            });
+        }
+        selector
+            .resolve_refs_with_registry(&manifest.selectors)
+            .map_err(|error| EnforcementPolicySourceError::InvalidManifest {
+                reason: format!("invalid enforcement policy selector {name}: {error}"),
+            })?;
+    }
     if let Some(selector) = &manifest.selector {
         selector
-            .compile()
+            .resolve_refs_with_registry(&manifest.selectors)
             .map_err(|error| EnforcementPolicySourceError::InvalidManifest {
                 reason: format!("invalid enforcement policy selector: {error}"),
             })?;
@@ -519,6 +549,7 @@ mod tests {
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
             version: "test-version".to_string(),
+            selectors: Default::default(),
             selector: None,
             protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
         };
@@ -549,6 +580,7 @@ mod tests {
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
             version: "test-version".to_string(),
+            selectors: Default::default(),
             selector: None,
             protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
         };
@@ -679,6 +711,7 @@ mod tests {
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
             version: "test-version".to_string(),
+            selectors: Default::default(),
             selector: None,
             protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
         };

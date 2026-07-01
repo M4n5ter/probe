@@ -13,7 +13,7 @@ use super::require_available;
 
 pub(super) fn validate_static_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
     if let Some(selector) = &config.enforcement.selector
-        && let Err(error) = selector.compile()
+        && let Err(error) = selector.resolve_refs_with_registry(&config.selectors)
     {
         violations.push(ConfigViolation {
             field: "enforcement.selector".to_string(),
@@ -21,7 +21,7 @@ pub(super) fn validate_static_config(config: &AgentConfig, violations: &mut Vec<
         });
     }
     if let Some(selector) = &config.enforcement.interception.selector
-        && let Err(error) = selector.compile()
+        && let Err(error) = selector.resolve_refs_with_registry(&config.selectors)
     {
         violations.push(ConfigViolation {
             field: "enforcement.interception.selector".to_string(),
@@ -145,8 +145,9 @@ struct EnforcementCapabilityCheck {
 mod tests {
     use probe_config::{
         CaptureBackend, CaptureSelection, CompressionCodecName, ConfigValidationError,
-        ConnectionEnforcementBackendConfig, ExporterConfig, ExporterTransportConfig,
-        TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
+        ConnectionEnforcementBackendConfig, EnforcementPolicySourceConfig, ExporterConfig,
+        ExporterTransportConfig, TlsMaterialConfig, TlsMaterialKind,
+        TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
         TransparentInterceptionMitmClientTrustModeConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
@@ -158,7 +159,10 @@ mod tests {
         TrafficSelector,
     };
 
-    use crate::plan::capture::{CaptureProviderBuilder, CaptureProviderDescriptor};
+    use crate::plan::{
+        RuntimePlan,
+        capture::{CaptureProviderBuilder, CaptureProviderDescriptor},
+    };
 
     use super::super::validate_runtime_config;
     use super::*;
@@ -630,6 +634,33 @@ mod tests {
     }
 
     #[test]
+    fn transparent_interception_over_budget_selector_is_rejected_before_plan_projection() {
+        let registry = ProviderRegistry::new(
+            vec![live_capture_provider()],
+            transparent_interception_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        enable_transparent_interception(
+            &mut config,
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+        );
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: "/tmp/enforcement-policy.toml".into(),
+        };
+        config.enforcement.interception.selector = Some(over_budget_selector());
+
+        let error = RuntimePlan::build(config, &registry)
+            .expect_err("over-budget selector should fail validation before plan projection");
+
+        assert!(
+            error.to_string().contains("maximum expanded node count"),
+            "error should report selector budget: {error}"
+        );
+    }
+
+    #[test]
     fn dry_run_enforcement_fails_closed_without_capability() {
         let cases = [
             (
@@ -694,6 +725,29 @@ mod tests {
         assert_violation(&error, "enforcement.selector", "at least one child");
     }
 
+    #[test]
+    fn enforcement_over_budget_selector_is_validated_by_runtime_validation() {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+        config.enforcement.selector = Some(over_budget_selector());
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(
+            &error,
+            "enforcement.selector",
+            "maximum expanded node count",
+        );
+    }
+
     fn validation_error(config: AgentConfig, registry: &ProviderRegistry) -> ConfigValidationError {
         validate_runtime_config(&config, registry).expect_err("config should be invalid")
     }
@@ -709,6 +763,14 @@ mod tests {
             "violation {field}: {} should contain {reason_fragment}",
             violation.reason
         );
+    }
+
+    fn over_budget_selector() -> Selector {
+        Selector::All {
+            selectors: (0..4_096)
+                .map(|_| Selector::term(ProcessSelector::default(), TrafficSelector::default()))
+                .collect(),
+        }
     }
 
     fn live_capture_provider() -> CaptureProviderDescriptor {

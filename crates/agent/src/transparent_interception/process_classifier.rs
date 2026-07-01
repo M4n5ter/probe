@@ -322,8 +322,8 @@ mod tests {
         TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
-        CapabilityKind, CapabilityState, Direction, ProcessSelector, RuntimeMode, Selector,
-        TrafficSelector,
+        CapabilityKind, CapabilityState, Direction, ProcessSelector, ResolvedSelector, RuntimeMode,
+        Selector, TrafficSelector,
     };
     use tempfile::TempDir;
 
@@ -625,13 +625,13 @@ mod tests {
         let execution_plan =
             ::runtime::TransparentInterceptionExecutionPlan::try_from_config(&config)
                 .expect("test transparent interception config should be valid");
-        let local_selector = process_selector(vec![8443, 9443]);
-        let final_selector = process_selector(vec![8443]);
+        let local_selector = resolved_process_selector(vec![8443, 9443]);
+        let final_selector = resolved_process_selector(vec![8443]);
         let selectors = TransparentInterceptionSetupSelectors::from_sources(
             TransparentInterceptionSetupSelectorSources {
                 local_enforcement_selector: Some(&local_selector),
                 effective_enforcement_selector: Some(&final_selector),
-                interception_selector: config.selector.as_ref(),
+                interception_selector: None,
             },
         );
 
@@ -711,8 +711,8 @@ mod tests {
         scope
     }
 
-    fn process_selector(local_ports: Vec<u16>) -> Selector {
-        Selector::term(
+    fn resolved_process_selector(local_ports: Vec<u16>) -> ResolvedSelector {
+        ResolvedSelector::new(Selector::term(
             ProcessSelector {
                 names: vec!["demo-listener".to_string()],
                 ..ProcessSelector::default()
@@ -722,7 +722,8 @@ mod tests {
                 directions: vec![Direction::Inbound],
                 ..TrafficSelector::default()
             },
-        )
+        ))
+        .expect("test selector should be valid")
     }
 
     fn degraded_process_classifier() -> TransparentInterceptionClassificationPlan {

@@ -651,7 +651,7 @@ fn compile_libssl_uprobe_selector(
         .instrumentation
         .selector
         .as_ref()
-        .map(|selector| selector.compile())
+        .map(|selector| selector.compile_with_registry(&plan.config.selectors))
         .transpose()
         .map_err(|source| {
             AgentError::UnsupportedRunConfig(format!(

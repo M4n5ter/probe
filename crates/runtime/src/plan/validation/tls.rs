@@ -10,7 +10,7 @@ use super::require_usable;
 
 pub(super) fn validate_static_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
     if let Some(selector) = &config.tls.plaintext.instrumentation.selector
-        && let Err(error) = selector.compile()
+        && let Err(error) = selector.resolve_refs_with_registry(&config.selectors)
     {
         violations.push(ConfigViolation {
             field: "tls.plaintext.instrumentation.selector".to_string(),

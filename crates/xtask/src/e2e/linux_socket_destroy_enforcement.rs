@@ -192,6 +192,7 @@ fn write_enforcement_manifest(
     let manifest = EnforcementPolicyManifest {
         id: MANIFEST_ID.to_string(),
         version: MANIFEST_VERSION.to_string(),
+        selectors: Default::default(),
         selector: Some(Selector::term(
             ProcessSelector {
                 exe_path_globs: vec![FIXTURE_EXE_GLOB.to_string()],

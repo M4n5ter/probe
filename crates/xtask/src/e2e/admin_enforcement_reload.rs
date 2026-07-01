@@ -236,6 +236,7 @@ fn write_enforcement_manifest(
     let manifest = EnforcementPolicyManifest {
         id: MANIFEST_ID.to_string(),
         version: version.to_string(),
+        selectors: Default::default(),
         selector: Some(Selector::term(
             ProcessSelector::default(),
             TrafficSelector {

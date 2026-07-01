@@ -108,6 +108,7 @@ pub(super) fn write_agent_config(
         &EnforcementPolicyManifest {
             id: ENFORCEMENT_MANIFEST_ID.to_string(),
             version: ENFORCEMENT_MANIFEST_VERSION.to_string(),
+            selectors: Default::default(),
             selector: None,
             protective_actions: ProtectiveActionProfile::new([Action::Deny])?,
         },

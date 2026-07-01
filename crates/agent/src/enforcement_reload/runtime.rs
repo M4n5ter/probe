@@ -55,6 +55,7 @@ pub(crate) async fn reload_enforcement_policy(
     let _reload_guard = gate.inner.lock().await;
     let loaded = load_configured_enforcement_policy_runtime(
         plan.config.enforcement.selector.clone(),
+        &plan.config.selectors,
         &plan.enforcement.policy_source,
         enforcement_policy_source_load_context_from_plan(plan),
     )
@@ -149,9 +150,11 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = transparent_interception_plan()?;
         let planner = ScopedEnforcementPlanner::new(EnforcementMode::AuditOnly, None)?;
+        let selector_registry = probe_core::SelectorRegistry::default();
         let active_policy =
             crate::configured_enforcement::load_configured_enforcement_policy_runtime(
                 None,
+                &selector_registry,
                 &runtime::EnforcementPolicySourcePlan::None,
                 crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
             )
@@ -185,9 +188,11 @@ mod tests {
             Some(EnforcementExecutionSurface::L7MitmProxyHook)
         );
         let planner = ScopedEnforcementPlanner::new(EnforcementMode::AuditOnly, None)?;
+        let selector_registry = probe_core::SelectorRegistry::default();
         let active_policy =
             crate::configured_enforcement::load_configured_enforcement_policy_runtime(
                 None,
+                &selector_registry,
                 &runtime::EnforcementPolicySourcePlan::None,
                 crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
             )
@@ -349,6 +354,7 @@ mod tests {
         let manifest = EnforcementPolicyManifest {
             id: "managed-apps".to_string(),
             version: version.to_string(),
+            selectors: Default::default(),
             selector: Some(Selector::term(
                 ProcessSelector::default(),
                 TrafficSelector {

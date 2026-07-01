@@ -284,6 +284,7 @@ fn enforcement_manifest() -> Result<EnforcementPolicyManifest, Box<dyn std::erro
     Ok(EnforcementPolicyManifest {
         id: MANIFEST_ID.to_string(),
         version: MANIFEST_VERSION.to_string(),
+        selectors: Default::default(),
         selector: Some(Selector::term(
             ProcessSelector {
                 names: vec![PROCESS_NAME.to_string()],
