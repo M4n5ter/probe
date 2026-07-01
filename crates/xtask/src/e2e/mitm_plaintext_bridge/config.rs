@@ -63,6 +63,7 @@ pub(super) fn fixture_config() -> PlainHttp1LoopbackFixtureConfig {
             post_exchange_delay_ms: 0,
         },
         accept_read_delay_ms: 0,
+        vector_first_payload_slice_bytes: None,
     }
 }
 

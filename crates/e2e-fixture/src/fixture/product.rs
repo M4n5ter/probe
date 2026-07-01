@@ -133,6 +133,7 @@ pub(crate) fn run_product_loopback(
         run: inner_run_options(&config.run),
         io_mode: config.http_io_mode,
         accept_read_delay_ms: config.accept_read_delay_ms,
+        vector_first_payload_slice_bytes: None,
     })?;
     let websocket = super::websocket::run_websocket_loopback(WebSocketLoopbackConfig {
         traffic: config.websocket,

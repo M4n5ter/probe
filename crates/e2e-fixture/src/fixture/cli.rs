@@ -40,6 +40,7 @@ Options:
   --frame-payload-bytes N      (websocket-loopback and product-loopback)
   --write-chunks N
   --io-mode read-write|send-recv|readv-writev|sendmsg-recvmsg|sendfile  (http1-loopback and product-loopback plain HTTP)
+  --vector-first-payload-slice-bytes N  (http1-loopback vector modes)
   --connect-write-delay-ms N
   --accept-read-delay-ms N       (http1-loopback and product-loopback plain HTTP)
   --post-exchange-delay-ms N
@@ -211,6 +212,7 @@ fn parse_http1_loopback(
         run: args.run,
         io_mode: args.io_mode.unwrap_or_default(),
         accept_read_delay_ms: args.accept_read_delay_ms,
+        vector_first_payload_slice_bytes: args.vector_first_payload_slice_bytes,
     })
 }
 
@@ -253,7 +255,7 @@ fn parse_websocket_loopback(
                     "{option} is only supported by HTTP loopback scenarios\n\n{USAGE}"
                 )));
             }
-            "--io-mode" | "--accept-read-delay-ms" => {
+            "--io-mode" | "--accept-read-delay-ms" | "--vector-first-payload-slice-bytes" => {
                 return Err(FixtureError::usage(format!(
                     "{option} is only supported by http1-loopback\n\n{USAGE}"
                 )));
@@ -320,6 +322,11 @@ fn parse_product_loopback(
             "--connections" => {
                 return Err(FixtureError::usage(format!(
                     "{option} is only supported by websocket-loopback; use --websocket-connections for product-loopback\n\n{USAGE}"
+                )));
+            }
+            "--vector-first-payload-slice-bytes" => {
+                return Err(FixtureError::usage(format!(
+                    "{option} is only supported by http1-loopback\n\n{USAGE}"
                 )));
             }
             _ => {
@@ -428,6 +435,7 @@ struct ParsedHttpLoopbackArgs {
     run: LoopbackRunOptions,
     io_mode: Option<Http1IoMode>,
     accept_read_delay_ms: u64,
+    vector_first_payload_slice_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,6 +452,7 @@ fn parse_http_loopback_args(
     let mut run = ParsedLoopbackRunOptions::default();
     let mut io_mode = None;
     let mut accept_read_delay_ms = 0;
+    let mut vector_first_payload_slice_bytes = None;
     let mut args = args.into_iter();
     while let Some(option) = args.next() {
         if option == "--help" || option == "-h" {
@@ -478,6 +487,10 @@ fn parse_http_loopback_args(
                     ))
                 })?);
             }
+            "--vector-first-payload-slice-bytes" => {
+                reject_plain_http_option(plain_http_options, &option)?;
+                vector_first_payload_slice_bytes = Some(parse_usize(&option, &value)?);
+            }
             _ => {
                 return Err(FixtureError::usage(format!(
                     "unknown option {option}\n\n{USAGE}"
@@ -490,6 +503,7 @@ fn parse_http_loopback_args(
         run: run.finish()?,
         io_mode,
         accept_read_delay_ms,
+        vector_first_payload_slice_bytes,
     })
 }
 
@@ -655,6 +669,7 @@ mod tests {
         assert_eq!(config.traffic.response_body_bytes, 64);
         assert_eq!(config.traffic.write_chunks, 3);
         assert_eq!(config.io_mode, Http1IoMode::ReadWrite);
+        assert_eq!(config.vector_first_payload_slice_bytes, None);
         Ok(())
     }
 
@@ -668,12 +683,18 @@ mod tests {
 
     #[test]
     fn cli_parses_vector_http_io_modes() -> Result<(), Box<dyn Error>> {
-        let readv = parse_http1_loopback(["--io-mode".to_string(), "readv-writev".to_string()])?;
+        let readv = parse_http1_loopback([
+            "--io-mode".to_string(),
+            "readv-writev".to_string(),
+            "--vector-first-payload-slice-bytes".to_string(),
+            "192".to_string(),
+        ])?;
         let sendmsg =
             parse_http1_loopback(["--io-mode".to_string(), "sendmsg-recvmsg".to_string()])?;
         let sendfile = parse_http1_loopback(["--io-mode".to_string(), "sendfile".to_string()])?;
 
         assert_eq!(readv.io_mode, Http1IoMode::ReadvWritev);
+        assert_eq!(readv.vector_first_payload_slice_bytes, Some(192));
         assert_eq!(sendmsg.io_mode, Http1IoMode::SendmsgRecvmsg);
         assert_eq!(sendfile.io_mode, Http1IoMode::Sendfile);
         Ok(())
@@ -755,6 +776,21 @@ mod tests {
             error
                 .to_string()
                 .contains("--accept-read-delay-ms is only supported by http1-loopback")
+        );
+    }
+
+    #[test]
+    fn cli_rejects_tls_http1_vector_slice_size() {
+        let error = parse_tls_http1_loopback([
+            "--vector-first-payload-slice-bytes".to_string(),
+            "192".to_string(),
+        ])
+        .expect_err("TLS fixture must not accept plain HTTP vector slice size");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--vector-first-payload-slice-bytes is only supported by http1-loopback")
         );
     }
 

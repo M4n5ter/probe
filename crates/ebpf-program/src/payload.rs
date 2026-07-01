@@ -15,6 +15,8 @@ const USER_MSGHDR_IOV_OFFSET: u64 = 16;
 const USER_MSGHDR_IOVLEN_OFFSET: u64 = 24;
 const USER_IOVEC_BYTES: u64 = 16;
 const PAYLOAD_IOVEC_SCAN_LIMIT: u64 = 3;
+const PAYLOAD_IOVEC_SECOND_CHUNK_OFFSET: usize = 64;
+const PAYLOAD_IOVEC_THIRD_CHUNK_OFFSET: usize = 128;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PayloadBufferAttempt {
@@ -288,6 +290,7 @@ pub(crate) fn read_payload_prefix_from_iovec<const SAMPLE_BYTES: usize>(
 
     let iovecs_to_scan = core::cmp::min(attempt.iovlen, PAYLOAD_IOVEC_SCAN_LIMIT);
     let mut index = 0u64;
+    let mut captured = 0u32;
     while index < PAYLOAD_IOVEC_SCAN_LIMIT {
         if index >= iovecs_to_scan {
             break;
@@ -304,26 +307,42 @@ pub(crate) fn read_payload_prefix_from_iovec<const SAMPLE_BYTES: usize>(
             *flags |= read_failed_flag;
             return 0;
         }
-        let readable_len = core::cmp::min(clamp_u64_to_u32(readable_len), copy_limit);
+        let remaining = copy_limit.saturating_sub(captured);
+        if remaining == 0 {
+            break;
+        }
+        let readable_len = core::cmp::min(clamp_u64_to_u32(readable_len), remaining);
         if readable_len == 0 {
             index += 1;
             continue;
         }
-        return read_user_payload_prefix(
-            user_buffer,
-            readable_len,
-            expected_len_or_zero,
-            buffer,
-            flags,
-            truncated_flag,
-            read_failed_flag,
-        );
+        let read_result = match captured as usize {
+            0 => read_user_payload_chunk_at::<SAMPLE_BYTES, 0>(user_buffer, readable_len, buffer),
+            PAYLOAD_IOVEC_SECOND_CHUNK_OFFSET => read_user_payload_chunk_at::<
+                SAMPLE_BYTES,
+                PAYLOAD_IOVEC_SECOND_CHUNK_OFFSET,
+            >(user_buffer, readable_len, buffer),
+            PAYLOAD_IOVEC_THIRD_CHUNK_OFFSET => read_user_payload_chunk_at::<
+                SAMPLE_BYTES,
+                PAYLOAD_IOVEC_THIRD_CHUNK_OFFSET,
+            >(user_buffer, readable_len, buffer),
+            _ => break,
+        };
+        if read_result == 0 {
+            *flags |= read_failed_flag;
+            return 0;
+        }
+        captured = captured.saturating_add(u32::from(read_result));
+        if captured >= copy_limit {
+            break;
+        }
+        index += 1;
     }
 
-    if expected_len_or_zero != 0 {
+    if expected_len_or_zero != 0 && captured < expected_len_or_zero {
         *flags |= truncated_flag;
     }
-    0
+    captured as u16
 }
 
 pub(crate) fn clamp_u64_to_u32(value: u64) -> u32 {
@@ -337,6 +356,34 @@ fn clamp_usize_to_u32(value: usize) -> u32 {
 fn read_user_u64(address: u64) -> Option<u64> {
     let bytes = read_user_bytes::<8>(address)?;
     Some(u64::from_ne_bytes(bytes))
+}
+
+#[inline(always)]
+fn read_user_payload_chunk_at<const SAMPLE_BYTES: usize, const OUTPUT_OFFSET: usize>(
+    user_buffer: u64,
+    readable_len: u32,
+    buffer: &mut [u8; SAMPLE_BYTES],
+) -> u16 {
+    let output_offset = OUTPUT_OFFSET as u32;
+    if readable_len == 0 || output_offset >= SAMPLE_BYTES as u32 {
+        return 0;
+    }
+    let capacity = (SAMPLE_BYTES as u32).saturating_sub(output_offset);
+    let captured_len = core::cmp::min(readable_len, capacity) as u16;
+    if captured_len == 0 {
+        return 0;
+    }
+    let read_result = unsafe {
+        r#gen::bpf_probe_read_user(
+            buffer.as_mut_ptr().add(OUTPUT_OFFSET) as *mut c_void,
+            u32::from(captured_len),
+            user_buffer as *const c_void,
+        )
+    };
+    if read_result != 0 {
+        return 0;
+    }
+    captured_len
 }
 
 fn read_iovec_entry(user_iovec: u64, index: u64) -> Option<(u64, u64)> {

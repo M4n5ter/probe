@@ -37,6 +37,7 @@ pub(crate) struct Http1LoopbackFixtureConfig {
 pub(crate) struct PlainHttp1LoopbackFixtureConfig {
     pub(crate) shared: Http1LoopbackFixtureConfig,
     pub(crate) accept_read_delay_ms: u64,
+    pub(crate) vector_first_payload_slice_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +114,7 @@ pub(crate) fn spawn_http1_loopback_fixture_with_io_mode(
                 PlainHttp1LoopbackFixtureOptions {
                     io_mode,
                     accept_read_delay_ms: config.accept_read_delay_ms,
+                    vector_first_payload_slice_bytes: config.vector_first_payload_slice_bytes,
                 },
             );
         },
@@ -155,6 +157,7 @@ pub(crate) fn spawn_websocket_loopback_fixture(
 struct PlainHttp1LoopbackFixtureOptions {
     io_mode: Http1FixtureIoMode,
     accept_read_delay_ms: u64,
+    vector_first_payload_slice_bytes: Option<usize>,
 }
 
 fn spawn_loopback_fixture(
@@ -209,6 +212,11 @@ fn append_plain_http1_loopback_fixture_args(
         .arg(options.io_mode.cli_value())
         .arg("--accept-read-delay-ms")
         .arg(options.accept_read_delay_ms.to_string());
+    if let Some(vector_first_payload_slice_bytes) = options.vector_first_payload_slice_bytes {
+        command
+            .arg("--vector-first-payload-slice-bytes")
+            .arg(vector_first_payload_slice_bytes.to_string());
+    }
 }
 
 fn append_websocket_loopback_fixture_args(

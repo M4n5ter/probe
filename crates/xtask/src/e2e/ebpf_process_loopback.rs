@@ -38,6 +38,8 @@ const RESPONSE_BODY_BYTES: usize = 32;
 const WRITE_CHUNKS: usize = 1;
 const CONNECT_WRITE_DELAY_MS: u64 = 2_000;
 const ACCEPT_READ_DELAY_MS: u64 = 2_000;
+const VECTOR_ALIGNED_FIRST_PAYLOAD_SLICE_BYTES: usize = 64;
+const VECTOR_UNALIGNED_FIRST_PAYLOAD_SLICE_BYTES: usize = 192;
 const MIN_CAPTURE_EVENTS_FOR_HTTP_EXCHANGE: u64 = 8;
 const MIN_EXPORT_EVENTS_FOR_HTTP_EXCHANGE: u64 = 14;
 const MIN_SENDFILE_EXPORT_EVENTS_FOR_HTTP_EXCHANGE: u64 = 8;
@@ -56,18 +58,12 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     ensure_e2e_packages_built(["agent", "e2e-fixture"])?;
     let ebpf_object_path = crate::ebpf::ensure_process_artifact_ready().map_err(e2e_error)?;
 
-    for io_mode in [
-        Http1FixtureIoMode::ReadWrite,
-        Http1FixtureIoMode::SendRecv,
-        Http1FixtureIoMode::ReadvWritev,
-        Http1FixtureIoMode::SendmsgRecvmsg,
-        Http1FixtureIoMode::Sendfile,
-    ] {
-        let root = create_temp_root(io_mode_temp_name(io_mode))?;
-        match run_at(&root, &ebpf_object_path, io_mode) {
+    for case in loopback_cases() {
+        let root = create_temp_root(case.name)?;
+        match run_at(&root, &ebpf_object_path, case) {
             Ok(()) => {
                 fs::remove_dir_all(&root)?;
-                println!("e2e eBPF process loopback {} passed", io_mode.cli_value());
+                println!("e2e eBPF process loopback {} passed", case.name);
             }
             Err(error) => {
                 eprintln!("e2e artifacts retained at {}", root.display());
@@ -79,20 +75,61 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn io_mode_temp_name(io_mode: Http1FixtureIoMode) -> &'static str {
-    match io_mode {
-        Http1FixtureIoMode::ReadWrite => "ebpf-process-loopback-read-write",
-        Http1FixtureIoMode::SendRecv => "ebpf-process-loopback-send-recv",
-        Http1FixtureIoMode::ReadvWritev => "ebpf-process-loopback-readv-writev",
-        Http1FixtureIoMode::SendmsgRecvmsg => "ebpf-process-loopback-sendmsg-recvmsg",
-        Http1FixtureIoMode::Sendfile => "ebpf-process-loopback-sendfile",
-    }
+#[derive(Debug, Clone, Copy)]
+struct LoopbackCase {
+    name: &'static str,
+    io_mode: Http1FixtureIoMode,
+    vector_first_payload_slice_bytes: Option<usize>,
+    vector_gap: VectorGapExpectation,
+}
+
+fn loopback_cases() -> [LoopbackCase; 6] {
+    [
+        LoopbackCase {
+            name: "ebpf-process-loopback-read-write",
+            io_mode: Http1FixtureIoMode::ReadWrite,
+            vector_first_payload_slice_bytes: None,
+            vector_gap: VectorGapExpectation::Absent,
+        },
+        LoopbackCase {
+            name: "ebpf-process-loopback-send-recv",
+            io_mode: Http1FixtureIoMode::SendRecv,
+            vector_first_payload_slice_bytes: None,
+            vector_gap: VectorGapExpectation::Absent,
+        },
+        LoopbackCase {
+            name: "ebpf-process-loopback-readv-writev",
+            io_mode: Http1FixtureIoMode::ReadvWritev,
+            vector_first_payload_slice_bytes: Some(VECTOR_ALIGNED_FIRST_PAYLOAD_SLICE_BYTES),
+            vector_gap: VectorGapExpectation::Absent,
+        },
+        LoopbackCase {
+            name: "ebpf-process-loopback-sendmsg-recvmsg",
+            io_mode: Http1FixtureIoMode::SendmsgRecvmsg,
+            vector_first_payload_slice_bytes: Some(VECTOR_ALIGNED_FIRST_PAYLOAD_SLICE_BYTES),
+            vector_gap: VectorGapExpectation::Absent,
+        },
+        LoopbackCase {
+            name: "ebpf-process-loopback-readv-writev-unaligned-vector",
+            io_mode: Http1FixtureIoMode::ReadvWritev,
+            vector_first_payload_slice_bytes: Some(VECTOR_UNALIGNED_FIRST_PAYLOAD_SLICE_BYTES),
+            vector_gap: VectorGapExpectation::Present {
+                expected_offset: VECTOR_UNALIGNED_FIRST_PAYLOAD_SLICE_BYTES as u64,
+            },
+        },
+        LoopbackCase {
+            name: "ebpf-process-loopback-sendfile",
+            io_mode: Http1FixtureIoMode::Sendfile,
+            vector_first_payload_slice_bytes: None,
+            vector_gap: VectorGapExpectation::Absent,
+        },
+    ]
 }
 
 fn run_at(
     root: &Path,
     ebpf_object_path: &Path,
-    io_mode: Http1FixtureIoMode,
+    case: LoopbackCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(root)?;
     let fixture_ready_path = root.join("fixture.ready");
@@ -109,8 +146,8 @@ fn run_at(
         spawn_http1_loopback_fixture_with_io_mode(
             &fixture_ready_path,
             &fixture_start_path,
-            fixture_config(),
-            io_mode,
+            fixture_config(case.vector_first_payload_slice_bytes),
+            case.io_mode,
         )?,
         "fixture",
     );
@@ -136,14 +173,14 @@ fn run_at(
             &admin_socket_path,
             expected_policy_alert_messages().len() as u64,
             MIN_CAPTURE_EVENTS_FOR_HTTP_EXCHANGE,
-            min_export_events_for_io_mode(io_mode),
+            expectations_for_case(case).min_export_events,
         ),
         Err(_) => Ok(()),
     };
     let agent_result = stop_running_child(agent.child_mut(), "agent");
     agent.unwatch();
     let spool_result = match (&fixture_result, &agent_result) {
-        (Ok(()), Ok(())) => assert_spool_outputs(&spool_path, fixture_ready.listen_port, io_mode),
+        (Ok(()), Ok(())) => assert_spool_outputs(&spool_path, fixture_ready.listen_port, case),
         _ => Ok(()),
     };
     merge_run_results(fixture_result, progress_result, agent_result, spool_result)?;
@@ -151,11 +188,9 @@ fn run_at(
     Ok(())
 }
 
-fn min_export_events_for_io_mode(io_mode: Http1FixtureIoMode) -> u64 {
-    expectations_for_io_mode(io_mode).min_export_events
-}
-
-fn fixture_config() -> PlainHttp1LoopbackFixtureConfig {
+fn fixture_config(
+    vector_first_payload_slice_bytes: Option<usize>,
+) -> PlainHttp1LoopbackFixtureConfig {
     PlainHttp1LoopbackFixtureConfig {
         shared: Http1LoopbackFixtureConfig {
             listen_port: None,
@@ -167,6 +202,7 @@ fn fixture_config() -> PlainHttp1LoopbackFixtureConfig {
             post_exchange_delay_ms: 0,
         },
         accept_read_delay_ms: ACCEPT_READ_DELAY_MS,
+        vector_first_payload_slice_bytes,
     }
 }
 
@@ -251,9 +287,9 @@ fn write_agent_config(
 fn assert_spool_outputs(
     spool_path: &Path,
     listen_port: u16,
-    io_mode: Http1FixtureIoMode,
+    case: LoopbackCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let expectations = expectations_for_io_mode(io_mode);
+    let expectations = expectations_for_case(case);
     let spool = FjallSpool::open(spool_path)?;
     let ingress = spool.read_ingress_batch_after(0, 256)?;
     if ingress.is_empty() {
@@ -336,25 +372,61 @@ fn assert_expected_vector_gaps(
     listen_port: u16,
     expectations: IoModeExpectations,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !expectations.expect_vector_gaps {
-        return Ok(());
-    }
+    let VectorGapExpectation::Present { expected_offset } = expectations.vector_gap else {
+        return assert_absent_vector_gaps(events, listen_port);
+    };
 
+    for (side, direction) in [
+        (FlowSide::Client, Direction::Outbound),
+        (FlowSide::Server, Direction::Inbound),
+    ] {
+        if !events.iter().any(|event| {
+            is_expected_payload_bytes_len_event(
+                event,
+                listen_port,
+                side,
+                direction,
+                expected_offset as usize,
+            )
+        }) {
+            return Err(e2e_error(format!(
+                "missing vector eBPF {side:?} {direction:?} payload prefix of {expected_offset} byte(s); observed {}",
+                ingress_summary(events, listen_port)
+            ))
+            .into());
+        }
+        if events.iter().any(|event| {
+            is_expected_gap_event(event, listen_port, side, direction, expected_offset)
+        }) {
+            continue;
+        }
+        return Err(e2e_error(format!(
+            "missing vector eBPF {side:?} {direction:?} truncated gap at offset {expected_offset}; observed {}",
+            ingress_summary(events, listen_port)
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn assert_absent_vector_gaps(
+    events: &[CaptureEvent],
+    listen_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
     for (side, direction) in [
         (FlowSide::Client, Direction::Outbound),
         (FlowSide::Server, Direction::Inbound),
     ] {
         if events
             .iter()
-            .any(|event| is_expected_gap_event(event, listen_port, side, direction))
+            .any(|event| is_unexpected_truncated_gap_event(event, listen_port, side, direction))
         {
-            continue;
+            return Err(e2e_error(format!(
+                "unexpected vector eBPF {side:?} {direction:?} truncated gap; observed {}",
+                ingress_summary(events, listen_port)
+            ))
+            .into());
         }
-        return Err(e2e_error(format!(
-            "missing vector eBPF {side:?} {direction:?} truncated gap; observed {}",
-            ingress_summary(events, listen_port)
-        ))
-        .into());
     }
     Ok(())
 }
@@ -363,7 +435,7 @@ fn assert_expected_vector_gaps(
 struct IoModeExpectations {
     min_export_events: u64,
     outbound_payload_evidence: ExpectedPayloadEvidence,
-    expect_vector_gaps: bool,
+    vector_gap: VectorGapExpectation,
 }
 
 impl IoModeExpectations {
@@ -373,6 +445,12 @@ impl IoModeExpectations {
             Direction::Inbound => ExpectedPayloadEvidence::Bytes,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorGapExpectation {
+    Absent,
+    Present { expected_offset: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,24 +465,24 @@ impl ExpectedPayloadEvidence {
     }
 }
 
-const fn expectations_for_io_mode(io_mode: Http1FixtureIoMode) -> IoModeExpectations {
-    match io_mode {
+const fn expectations_for_case(case: LoopbackCase) -> IoModeExpectations {
+    match case.io_mode {
         Http1FixtureIoMode::ReadWrite | Http1FixtureIoMode::SendRecv => IoModeExpectations {
             min_export_events: MIN_EXPORT_EVENTS_FOR_HTTP_EXCHANGE,
             outbound_payload_evidence: ExpectedPayloadEvidence::Bytes,
-            expect_vector_gaps: false,
+            vector_gap: case.vector_gap,
         },
         Http1FixtureIoMode::ReadvWritev | Http1FixtureIoMode::SendmsgRecvmsg => {
             IoModeExpectations {
                 min_export_events: MIN_EXPORT_EVENTS_FOR_HTTP_EXCHANGE,
                 outbound_payload_evidence: ExpectedPayloadEvidence::Bytes,
-                expect_vector_gaps: true,
+                vector_gap: case.vector_gap,
             }
         }
         Http1FixtureIoMode::Sendfile => IoModeExpectations {
             min_export_events: MIN_SENDFILE_EXPORT_EVENTS_FOR_HTTP_EXCHANGE,
             outbound_payload_evidence: ExpectedPayloadEvidence::KernelTransferGap,
-            expect_vector_gaps: false,
+            vector_gap: case.vector_gap,
         },
     }
 }
@@ -571,7 +649,39 @@ fn is_expected_payload_evidence_event(
     }
 }
 
+fn is_expected_payload_bytes_len_event(
+    event: &CaptureEvent,
+    listen_port: u16,
+    side: FlowSide,
+    direction: Direction,
+    expected_len: usize,
+) -> bool {
+    let CaptureEvent::Bytes(bytes) = event else {
+        return false;
+    };
+    is_expected_degraded_payload_event(event, listen_port, side, direction)
+        && bytes.bytes.len() == expected_len
+}
+
 fn is_expected_gap_event(
+    event: &CaptureEvent,
+    listen_port: u16,
+    side: FlowSide,
+    direction: Direction,
+    expected_offset: u64,
+) -> bool {
+    let CaptureEvent::Gap(gap) = event else {
+        return false;
+    };
+    is_unexpected_truncated_gap_event(event, listen_port, side, direction)
+        && gap.gap.expected_offset == expected_offset
+        && gap
+            .gap
+            .next_offset
+            .is_some_and(|next_offset| next_offset > expected_offset)
+}
+
+fn is_unexpected_truncated_gap_event(
     event: &CaptureEvent,
     listen_port: u16,
     side: FlowSide,

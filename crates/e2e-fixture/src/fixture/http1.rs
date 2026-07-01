@@ -21,7 +21,8 @@ use super::{
 };
 
 const SCENARIO: &str = "http1-loopback";
-const VECTOR_FIRST_PAYLOAD_SLICE_BYTES: usize = 192;
+const DEFAULT_VECTOR_FIRST_PAYLOAD_SLICE_BYTES: usize = 64;
+const MAX_VECTOR_FIRST_PAYLOAD_SLICE_BYTES: usize = 4096;
 static SENDFILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -30,6 +31,7 @@ pub(crate) struct Http1LoopbackConfig {
     pub run: LoopbackRunOptions,
     pub io_mode: Http1IoMode,
     pub accept_read_delay_ms: u64,
+    pub vector_first_payload_slice_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -62,6 +64,10 @@ impl Http1IoMode {
             "sendfile" => Some(Self::Sendfile),
             _ => None,
         }
+    }
+
+    const fn uses_vector_payload_slices(self) -> bool {
+        matches!(self, Self::ReadvWritev | Self::SendmsgRecvmsg)
     }
 }
 
@@ -153,13 +159,15 @@ pub(crate) fn run_http1_loopback(
     config: Http1LoopbackConfig,
 ) -> Result<Http1LoopbackReport, Http1LoopbackError> {
     http::validate_traffic_config(&config.traffic)?;
+    let io_mode = config.io_mode;
+    let vector_first_payload_slice_bytes =
+        vector_first_payload_slice_bytes(io_mode, config.vector_first_payload_slice_bytes)?;
     let listener = bind_loopback_listener(config.run.listen_port)?;
     let listen_addr = listener
         .local_addr()
         .map_err(|source| io_error("read listener address", source))?;
     coordinate_start(&config.run.coordination, listen_addr)?;
     let traffic = config.traffic;
-    let io_mode = config.io_mode;
     let accept_read_delay_ms = config.accept_read_delay_ms;
     let post_exchange_delay_ms = config.run.post_exchange_delay_ms;
     let server = thread::spawn(move || {
@@ -167,6 +175,7 @@ pub(crate) fn run_http1_loopback(
             listener,
             traffic,
             io_mode,
+            vector_first_payload_slice_bytes,
             accept_read_delay_ms,
             post_exchange_delay_ms,
         )
@@ -180,6 +189,7 @@ pub(crate) fn run_http1_loopback(
             request_index,
             &traffic,
             io_mode,
+            vector_first_payload_slice_bytes,
             config.run.connect_write_delay_ms,
             config.run.post_exchange_delay_ms,
         )?;
@@ -208,6 +218,7 @@ fn run_client_exchange(
     request_index: usize,
     config: &HttpTrafficConfig,
     io_mode: Http1IoMode,
+    vector_first_payload_slice_bytes: usize,
     connect_write_delay_ms: u64,
     post_exchange_delay_ms: u64,
 ) -> Result<ExchangeReport, Http1LoopbackError> {
@@ -223,12 +234,13 @@ fn run_client_exchange(
         &request,
         config.write_chunks,
         io_mode,
+        vector_first_payload_slice_bytes,
         "write HTTP fixture request chunk",
     )?;
     stream
         .shutdown(Shutdown::Write)
         .map_err(|source| io_error("half-close client write side", source))?;
-    let response = read_to_end(&stream, io_mode)
+    let response = read_to_end(&stream, io_mode, vector_first_payload_slice_bytes)
         .map_err(|source| io_error("read HTTP fixture response", source))?;
     http::validate_response(&response, request_index, config.response_body_bytes)?;
     delay_after_exchange(post_exchange_delay_ms);
@@ -242,6 +254,7 @@ fn serve_http1(
     listener: TcpListener,
     config: HttpTrafficConfig,
     io_mode: Http1IoMode,
+    vector_first_payload_slice_bytes: usize,
     accept_read_delay_ms: u64,
     post_exchange_delay_ms: u64,
 ) -> Result<ExchangeReport, Http1LoopbackError> {
@@ -251,7 +264,7 @@ fn serve_http1(
         let (stream, _) = accept_with_timeout(&listener)?;
         configure_stream(&stream)?;
         delay_before_accept_read(accept_read_delay_ms);
-        let request = read_to_end(&stream, io_mode)
+        let request = read_to_end(&stream, io_mode, vector_first_payload_slice_bytes)
             .map_err(|source| io_error("read HTTP fixture request", source))?;
         http::validate_request(&request, request_index, config.request_body_bytes)?;
         let response = http::response(request_index, config.response_body_bytes);
@@ -260,6 +273,7 @@ fn serve_http1(
             &response,
             1,
             io_mode,
+            vector_first_payload_slice_bytes,
             "write HTTP fixture response chunk",
         )?;
         delay_after_exchange(post_exchange_delay_ms);
@@ -277,12 +291,13 @@ fn write_in_chunks(
     bytes: &[u8],
     chunks: usize,
     io_mode: Http1IoMode,
+    vector_first_payload_slice_bytes: usize,
     action: &'static str,
 ) -> Result<(), Http1LoopbackError> {
     let chunk_size = http::chunk_size(bytes.len(), chunks);
     for chunk in bytes.chunks(chunk_size) {
-        let written =
-            write_chunk(stream, chunk, io_mode).map_err(|source| io_error(action, source))?;
+        let written = write_chunk(stream, chunk, io_mode, vector_first_payload_slice_bytes)
+            .map_err(|source| io_error(action, source))?;
         if written != chunk.len() {
             return Err(HttpMessageError::InvalidMessage(format!(
                 "partial fixture request chunk write: wrote {written} of {} bytes",
@@ -294,11 +309,16 @@ fn write_in_chunks(
     Ok(())
 }
 
-fn write_chunk(stream: &TcpStream, chunk: &[u8], io_mode: Http1IoMode) -> io::Result<usize> {
+fn write_chunk(
+    stream: &TcpStream,
+    chunk: &[u8],
+    io_mode: Http1IoMode,
+    vector_first_payload_slice_bytes: usize,
+) -> io::Result<usize> {
     match io_mode {
         Http1IoMode::ReadWrite => rustix::io::write(stream, chunk).map_err(Into::into),
         Http1IoMode::ReadvWritev => {
-            let slices = vector_write_slices(chunk);
+            let slices = vector_write_slices(chunk, vector_first_payload_slice_bytes);
             rustix::io::writev(stream, &slices).map_err(Into::into)
         }
         Http1IoMode::SendRecv => {
@@ -306,7 +326,7 @@ fn write_chunk(stream: &TcpStream, chunk: &[u8], io_mode: Http1IoMode) -> io::Re
         }
         Http1IoMode::SendmsgRecvmsg => {
             let mut control = rustix::net::SendAncillaryBuffer::default();
-            let slices = vector_write_slices(chunk);
+            let slices = vector_write_slices(chunk, vector_first_payload_slice_bytes);
             rustix::net::sendmsg(
                 stream,
                 &slices,
@@ -319,11 +339,20 @@ fn write_chunk(stream: &TcpStream, chunk: &[u8], io_mode: Http1IoMode) -> io::Re
     }
 }
 
-fn read_to_end(stream: &TcpStream, io_mode: Http1IoMode) -> io::Result<Vec<u8>> {
+fn read_to_end(
+    stream: &TcpStream,
+    io_mode: Http1IoMode,
+    vector_first_payload_slice_bytes: usize,
+) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
-        let read = read_chunk(stream, &mut buffer, io_mode)?;
+        let read = read_chunk(
+            stream,
+            &mut buffer,
+            io_mode,
+            vector_first_payload_slice_bytes,
+        )?;
         if read == 0 {
             return Ok(bytes);
         }
@@ -331,13 +360,19 @@ fn read_to_end(stream: &TcpStream, io_mode: Http1IoMode) -> io::Result<Vec<u8>> 
     }
 }
 
-fn read_chunk(stream: &TcpStream, buffer: &mut [u8], io_mode: Http1IoMode) -> io::Result<usize> {
+fn read_chunk(
+    stream: &TcpStream,
+    buffer: &mut [u8],
+    io_mode: Http1IoMode,
+    vector_first_payload_slice_bytes: usize,
+) -> io::Result<usize> {
     match io_mode {
         Http1IoMode::ReadWrite => rustix::io::read(stream, buffer).map_err(io::Error::from),
         Http1IoMode::Sendfile => rustix::io::read(stream, buffer).map_err(io::Error::from),
         Http1IoMode::ReadvWritev => {
             let mut empty = [];
-            let mut slices = vector_read_slices(&mut empty, buffer);
+            let mut slices =
+                vector_read_slices(&mut empty, buffer, vector_first_payload_slice_bytes);
             rustix::io::readv(stream, &mut slices).map_err(io::Error::from)
         }
         Http1IoMode::SendRecv => {
@@ -349,7 +384,8 @@ fn read_chunk(stream: &TcpStream, buffer: &mut [u8], io_mode: Http1IoMode) -> io
             let mut control_space: [MaybeUninit<u8>; 0] = [];
             let mut control = rustix::net::RecvAncillaryBuffer::new(&mut control_space);
             let mut empty = [];
-            let mut slices = vector_read_slices(&mut empty, buffer);
+            let mut slices =
+                vector_read_slices(&mut empty, buffer, vector_first_payload_slice_bytes);
             let received = rustix::net::recvmsg(
                 stream,
                 &mut slices,
@@ -410,8 +446,8 @@ fn sendfile_temp_path() -> PathBuf {
     ))
 }
 
-fn vector_write_slices(chunk: &[u8]) -> [IoSlice<'_>; 3] {
-    let first_len = vector_first_payload_slice_len(chunk.len());
+fn vector_write_slices(chunk: &[u8], vector_first_payload_slice_bytes: usize) -> [IoSlice<'_>; 3] {
+    let first_len = vector_first_payload_slice_len(chunk.len(), vector_first_payload_slice_bytes);
     [
         IoSlice::new(&chunk[..0]),
         IoSlice::new(&chunk[..first_len]),
@@ -422,8 +458,9 @@ fn vector_write_slices(chunk: &[u8]) -> [IoSlice<'_>; 3] {
 fn vector_read_slices<'a>(
     leading_empty: &'a mut [u8; 0],
     buffer: &'a mut [u8],
+    vector_first_payload_slice_bytes: usize,
 ) -> [IoSliceMut<'a>; 3] {
-    let first_len = vector_first_payload_slice_len(buffer.len());
+    let first_len = vector_first_payload_slice_len(buffer.len(), vector_first_payload_slice_bytes);
     let (first, second) = buffer.split_at_mut(first_len);
     [
         IoSliceMut::new(leading_empty),
@@ -432,8 +469,27 @@ fn vector_read_slices<'a>(
     ]
 }
 
-fn vector_first_payload_slice_len(len: usize) -> usize {
-    core::cmp::min(len, VECTOR_FIRST_PAYLOAD_SLICE_BYTES)
+fn vector_first_payload_slice_len(len: usize, vector_first_payload_slice_bytes: usize) -> usize {
+    core::cmp::min(len, vector_first_payload_slice_bytes)
+}
+
+fn vector_first_payload_slice_bytes(
+    io_mode: Http1IoMode,
+    value: Option<usize>,
+) -> Result<usize, HttpMessageError> {
+    if value.is_some() && !io_mode.uses_vector_payload_slices() {
+        return Err(HttpMessageError::InvalidConfig(
+            "vector-first-payload-slice-bytes is only valid with readv-writev or sendmsg-recvmsg io-mode"
+                .to_string(),
+        ));
+    }
+    let value = value.unwrap_or(DEFAULT_VECTOR_FIRST_PAYLOAD_SLICE_BYTES);
+    if value == 0 || value > MAX_VECTOR_FIRST_PAYLOAD_SLICE_BYTES {
+        return Err(HttpMessageError::InvalidConfig(format!(
+            "vector-first-payload-slice-bytes must be in 1..={MAX_VECTOR_FIRST_PAYLOAD_SLICE_BYTES}"
+        )));
+    }
+    Ok(value)
 }
 
 fn io_error(action: &'static str, source: io::Error) -> Http1LoopbackError {
@@ -464,6 +520,7 @@ mod tests {
             run: LoopbackRunOptions::default(),
             io_mode: Http1IoMode::ReadWrite,
             accept_read_delay_ms: 0,
+            vector_first_payload_slice_bytes: None,
         })?;
 
         assert_eq!(report.requests, 2);
@@ -500,6 +557,7 @@ mod tests {
             },
             io_mode: Http1IoMode::ReadWrite,
             accept_read_delay_ms: 0,
+            vector_first_payload_slice_bytes: None,
         };
         let handle = thread::spawn(move || {
             let report = run_http1_loopback(config);
@@ -546,6 +604,7 @@ mod tests {
             },
             io_mode: Http1IoMode::ReadWrite,
             accept_read_delay_ms: 0,
+            vector_first_payload_slice_bytes: None,
         };
 
         let error = run_http1_loopback(config).expect_err("stale start file must fail");
@@ -567,12 +626,31 @@ mod tests {
             run: LoopbackRunOptions::default(),
             io_mode: Http1IoMode::SendRecv,
             accept_read_delay_ms: 0,
+            vector_first_payload_slice_bytes: None,
         })?;
 
         assert_eq!(report.io_mode, Http1IoMode::SendRecv);
         assert_eq!(report.client_bytes_written, report.server_bytes_read);
         assert_eq!(report.client_bytes_read, report.server_bytes_written);
         Ok(())
+    }
+
+    #[test]
+    fn http1_loopback_rejects_vector_slice_size_for_non_vector_mode() {
+        let error = run_http1_loopback(Http1LoopbackConfig {
+            traffic: HttpTrafficConfig::default(),
+            run: LoopbackRunOptions::default(),
+            io_mode: Http1IoMode::ReadWrite,
+            accept_read_delay_ms: 0,
+            vector_first_payload_slice_bytes: Some(DEFAULT_VECTOR_FIRST_PAYLOAD_SLICE_BYTES),
+        })
+        .expect_err("scalar HTTP fixture mode must reject vector-only slice sizing");
+
+        assert!(
+            error
+                .to_string()
+                .contains("vector-first-payload-slice-bytes is only valid")
+        );
     }
 
     #[test]
@@ -587,6 +665,7 @@ mod tests {
             run: LoopbackRunOptions::default(),
             io_mode: Http1IoMode::Sendfile,
             accept_read_delay_ms: 0,
+            vector_first_payload_slice_bytes: None,
         })?;
 
         assert_eq!(report.io_mode, Http1IoMode::Sendfile);
@@ -601,13 +680,14 @@ mod tests {
             let report = run_http1_loopback(Http1LoopbackConfig {
                 traffic: HttpTrafficConfig {
                     requests: 1,
-                    request_body_bytes: VECTOR_FIRST_PAYLOAD_SLICE_BYTES + 64,
-                    response_body_bytes: VECTOR_FIRST_PAYLOAD_SLICE_BYTES + 32,
+                    request_body_bytes: DEFAULT_VECTOR_FIRST_PAYLOAD_SLICE_BYTES + 64,
+                    response_body_bytes: DEFAULT_VECTOR_FIRST_PAYLOAD_SLICE_BYTES + 32,
                     write_chunks: 1,
                 },
                 run: LoopbackRunOptions::default(),
                 io_mode,
                 accept_read_delay_ms: 0,
+                vector_first_payload_slice_bytes: None,
             })?;
 
             assert_eq!(report.io_mode, io_mode);
