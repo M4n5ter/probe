@@ -365,8 +365,10 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
     `ebpf_process_observation` provider details；其中 `link_ownership` 按 program、tracepoint category/name 和 link count
     报告 userspace loader 已提交并持有的 tracepoint links。
   - 已实现：`capture.provider.kernel_liveness` 是独立于 `link_ownership` 的 process eBPF kernel firing proof 状态。
-    当前 mode 为 `unavailable`，reason 明确说明 userspace-held tracepoint link handles 不等同于 kernel-side firing proof；
-    该字段用于避免把 link ownership 或 input activity 误读成 per-link kernel liveness。
+    未观察到 eBPF provider output 时 mode 为 `unavailable`，reason 明确说明 userspace-held tracepoint link handles
+    不等同于 kernel-side firing proof；观察到 eBPF capture event 或 output-loss event 后 mode 为 `degraded`，
+    reason 会报告 eBPF provider 的 capture/output-loss/lost event 计数。该字段证明运行期有 eBPF provider output
+    到达 userspace，但不证明 per-link firing coverage、完整 socket stream 或强 socket-object lifetime。
   - 已实现：`capture.provider.optional_tracepoint_pairs` 报告当前 kernel 对 optional syscall family 的可用性。
     `sendfile` 和 `sendfile64` 以 enter/exit tracepoint pair 为单位报告；pair 完整存在时为 `available`，
     pair 完整缺失时为 `unavailable`，只存在一侧时 loader fail closed。
@@ -385,7 +387,9 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
     cancellation 使用 `EbpfUnresolvedFlow` evidence；tracked flow boundary 使用 `EbpfProcessLifecycleBoundary` evidence。
     这些信号不补全未跟踪、已淘汰或丢失事件的 socket lifecycle。
   - 边界：process eBPF `link_ownership` 只证明 loader 成功提交并仍持有 tracepoint link handles；
-    `kernel_liveness.mode = unavailable` 明确表示当前没有动态 per-link firing/liveness probe，也不证明任意 socket-object lifetime。
+    `kernel_liveness.mode = degraded` 只表示运行期已观察到 eBPF provider output，不表示存在动态 per-link
+    firing/liveness probe，也不证明任意 socket-object lifetime。未观察到 eBPF provider output 时，
+    `kernel_liveness.mode = unavailable`。
   - 边界：optional tracepoint pair availability 是启动时 tracefs probe 和 attach 结果，不代表该 syscall
     在目标 workload 中实际发生；缺失的 optional pair 只表示对应 syscall family 不会产生 kernel-transfer
     byte-count gap。
@@ -1384,10 +1388,13 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 - `capture.input_activity` 是 pipeline input provider 的在线 activity snapshot。该 input provider 是 live primary backend
   加上 TLS decrypt-hint wrapper、TLS plaintext sidecar feed 和 MITM plaintext bridge feed 后，pipeline 实际消费的 capture source。
 - `metrics.capture_input` 是同一 runtime fact 的 metrics 投影，只保留 poll outcome、非 loss capture event、output loss event、
-  provider-reported lost event 和 last signal kind/sequence/observed timestamp。
+  provider-reported lost event、provider breakdown 和 last signal kind/sequence/observed timestamp。
 - `traffic_probe_capture_input_polls_total{outcome="event|progress|idle|finished"}` 暴露 capture input poll activity。
 - `traffic_probe_capture_input_events_total{class="capture|output_loss"}` 区分非 loss capture event 与 input-level loss event。
 - `traffic_probe_capture_input_lost_events_total` 暴露 input provider 报告的 lost event 总数。
+- `traffic_probe_capture_input_provider_events_total{provider="replay|ebpf|libpcap|plaintext|interception",class="capture|output_loss"}`
+  按 provider 区分 input event 来源。
+- `traffic_probe_capture_input_provider_lost_events_total{provider="..."}` 按 provider 暴露 lost event 总数。
 - `traffic_probe_capture_input_last_signal{kind="event|output_loss|progress|idle|finished"}` 以 one-hot gauge 表达最近一次 input
   signal。
 - `traffic_probe_capture_input_last_signal_sequence{kind="..."}` 暴露最近一次 input signal sequence。
@@ -1438,10 +1445,10 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 - `traffic_probe_ebpf_process_observation_kernel_liveness_metrics_available` 表示当前 status snapshot
   是否包含 process eBPF provider 的 kernel liveness 数值投影。
 - `traffic_probe_ebpf_process_observation_kernel_liveness_mode{mode="available|degraded|unavailable"}`
-  是 `capture.provider.kernel_liveness.mode` 的 one-hot gauge。当前实现固定为 `unavailable`，
-  因为系统没有 active per-link kernel firing probe。
-- 这些指标只表达 userspace-held committed link handles、启动时 tracepoint-pair availability 和 kernel liveness
-  证明是否存在；它们不证明强 socket-object lifetime。
+  是 `capture.provider.kernel_liveness.mode` 的 one-hot gauge。未观察到 eBPF provider output 时为 `unavailable`；
+  观察到 eBPF capture event 或 output-loss event 后为 `degraded`。系统没有 active per-link kernel firing probe。
+- 这些指标只表达 userspace-held committed link handles、启动时 tracepoint-pair availability、provider-level
+  eBPF output 是否被观察到，以及 kernel liveness 证明是否存在；它们不证明强 socket-object lifetime。
 
 #### Event provenance
 
@@ -4373,7 +4380,8 @@ Status snapshot：
 - 在线 capture status 对 backend-specific runtime facts 使用 `capture.provider`；process eBPF provider 通过该字段暴露
   tracepoint link ownership、kernel liveness proof status 和 optional tracepoint pair availability。
 - Prometheus 对 process eBPF provider 暴露同一 tracepoint link ownership 与 kernel liveness 数值投影；
-  `kernel_liveness.mode = unavailable` 时不会把 link ownership 伪装成 kernel liveness。
+  未观察到 eBPF provider output 时不会把 link ownership 伪装成 kernel liveness，观察到 provider output
+  后也只表达 provider-level degraded proof，不表达 per-link firing proof。
 - snapshot 包含 policy status。
 - snapshot 包含 enforcement status。
 - snapshot 包含 TLS plaintext/material status。
@@ -6027,8 +6035,8 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 - Prometheus 测试覆盖 `traffic_probe_pipeline_capture_polls_total{outcome="event|progress|idle|finished"}`。
 - Prometheus 测试覆盖 `traffic_probe_capture_input_polls_total{outcome="event|progress|idle|finished"}`、
   `traffic_probe_capture_input_events_total{class="capture|output_loss"}`、
-  `traffic_probe_capture_input_lost_events_total`、capture input last-signal one-hot gauge、
-  last-signal sequence 和 last-signal observed Unix time。
+  `traffic_probe_capture_input_lost_events_total`、provider-level capture/input loss counters、
+  capture input last-signal one-hot gauge、last-signal sequence 和 last-signal observed Unix time。
 - Prometheus 测试覆盖 `traffic_probe_ebpf_process_observation_link_ownership_metrics_available`、
   `traffic_probe_ebpf_process_observation_link_ownership_mode`、
   `traffic_probe_ebpf_process_observation_owned_links` 和

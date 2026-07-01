@@ -1,5 +1,5 @@
 use pipeline::PipelineRuntimeMetricsSnapshot;
-use probe_core::{CapabilityMatrix, RuntimeMode};
+use probe_core::{CapabilityMatrix, CaptureProviderKind, RuntimeMode};
 use serde::Serialize;
 
 use crate::{
@@ -54,13 +54,22 @@ pub struct ExportMetricsSnapshot {
     pub backing_off_sink_count: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CaptureInputMetricsSnapshot {
     pub polls: CaptureInputPollMetricsSnapshot,
     pub capture_events: u64,
     pub output_loss_events: u64,
     pub lost_events: u64,
+    pub providers: Vec<CaptureInputProviderMetricsSnapshot>,
     pub last_signal: Option<CaptureInputSignalMetricsSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CaptureInputProviderMetricsSnapshot {
+    pub provider: CaptureProviderKind,
+    pub capture_events: u64,
+    pub output_loss_events: u64,
+    pub lost_events: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -191,6 +200,16 @@ fn capture_input_metrics(
         capture_events: activity.capture_events,
         output_loss_events: activity.output_loss_events,
         lost_events: activity.lost_events,
+        providers: activity
+            .providers
+            .into_iter()
+            .map(|activity| CaptureInputProviderMetricsSnapshot {
+                provider: activity.provider,
+                capture_events: activity.capture_events,
+                output_loss_events: activity.output_loss_events,
+                lost_events: activity.lost_events,
+            })
+            .collect(),
         last_signal: activity
             .last_signal
             .map(|signal| CaptureInputSignalMetricsSnapshot {

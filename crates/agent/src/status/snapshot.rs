@@ -227,7 +227,8 @@ mod tests {
     use crate::{
         capture_provider::{
             CaptureInputActivityRuntimeSnapshot, CaptureInputPollActivityRuntimeSnapshot,
-            CaptureInputSignalRuntimeSnapshot, CaptureProviderRuntimeSnapshot,
+            CaptureInputProviderActivityRuntimeSnapshot, CaptureInputSignalRuntimeSnapshot,
+            CaptureProviderRuntimeSnapshot,
         },
         configured_enforcement::ActiveEnforcementPolicy,
         tls_plaintext::{
@@ -656,6 +657,20 @@ hooks = ["on_http_request_headers"]
                 capture_events: 1,
                 output_loss_events: 1,
                 lost_events: 3,
+                providers: vec![
+                    CaptureInputProviderActivityRuntimeSnapshot {
+                        provider: probe_core::CaptureProviderKind::Libpcap,
+                        capture_events: 1,
+                        output_loss_events: 0,
+                        lost_events: 0,
+                    },
+                    CaptureInputProviderActivityRuntimeSnapshot {
+                        provider: probe_core::CaptureProviderKind::Ebpf,
+                        capture_events: 0,
+                        output_loss_events: 1,
+                        lost_events: 3,
+                    },
+                ],
                 last_signal: Some(CaptureInputSignalRuntimeSnapshot::Idle {
                     sequence: 4,
                     observed_unix_ns: 99,
@@ -676,6 +691,14 @@ hooks = ["on_http_request_headers"]
             json!(1)
         );
         assert_eq!(value["metrics"]["capture_input"]["lost_events"], json!(3));
+        assert_eq!(
+            value["capture"]["input_activity"]["providers"][0]["provider"],
+            json!("libpcap")
+        );
+        assert_eq!(
+            value["metrics"]["capture_input"]["providers"][1]["provider"],
+            json!("ebpf")
+        );
         assert_eq!(
             value["metrics"]["capture_input"]["last_signal"]["kind"],
             json!("idle")

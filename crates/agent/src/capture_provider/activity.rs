@@ -16,7 +16,27 @@ pub(crate) struct CaptureInputActivityRuntimeSnapshot {
     pub(crate) capture_events: u64,
     pub(crate) output_loss_events: u64,
     pub(crate) lost_events: u64,
+    pub(crate) providers: Vec<CaptureInputProviderActivityRuntimeSnapshot>,
     pub(crate) last_signal: Option<CaptureInputSignalRuntimeSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct CaptureInputProviderActivityRuntimeSnapshot {
+    pub(crate) provider: CaptureProviderKind,
+    pub(crate) capture_events: u64,
+    pub(crate) output_loss_events: u64,
+    pub(crate) lost_events: u64,
+}
+
+impl CaptureInputActivityRuntimeSnapshot {
+    pub(crate) fn provider_activity(
+        &self,
+        provider: CaptureProviderKind,
+    ) -> Option<&CaptureInputProviderActivityRuntimeSnapshot> {
+        self.providers
+            .iter()
+            .find(|activity| activity.provider == provider)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -117,9 +137,7 @@ struct CaptureInputActivityRuntimeInner {
     poll_progress: AtomicCounter,
     poll_idle: AtomicCounter,
     poll_finished: AtomicCounter,
-    capture_events: AtomicCounter,
-    output_loss_events: AtomicCounter,
-    lost_events: AtomicCounter,
+    providers: CaptureInputProviderActivityCounters,
     last_signal: RwLock<Option<CaptureInputSignalRuntimeSnapshot>>,
 }
 
@@ -130,9 +148,7 @@ impl CaptureInputActivityRuntimeState {
         self.inner.poll_progress.reset();
         self.inner.poll_idle.reset();
         self.inner.poll_finished.reset();
-        self.inner.capture_events.reset();
-        self.inner.output_loss_events.reset();
-        self.inner.lost_events.reset();
+        self.inner.providers.reset();
         *self
             .inner
             .last_signal
@@ -185,6 +201,9 @@ impl CaptureInputActivityRuntimeState {
         let progress = self.inner.poll_progress.load();
         let idle = self.inner.poll_idle.load();
         let finished = self.inner.poll_finished.load();
+        let providers = self.inner.providers.snapshot();
+        let (capture_events, output_loss_events, lost_events) =
+            capture_event_totals_from_providers(&providers);
         CaptureInputActivityRuntimeSnapshot {
             polls: CaptureInputPollActivityRuntimeSnapshot {
                 total: [events, progress, idle, finished]
@@ -195,9 +214,10 @@ impl CaptureInputActivityRuntimeState {
                 idle,
                 finished,
             },
-            capture_events: self.inner.capture_events.load(),
-            output_loss_events: self.inner.output_loss_events.load(),
-            lost_events: self.inner.lost_events.load(),
+            capture_events,
+            output_loss_events,
+            lost_events,
+            providers,
             last_signal: self
                 .inner
                 .last_signal
@@ -215,8 +235,9 @@ impl CaptureInputActivityRuntimeState {
     ) -> CaptureInputSignalRuntimeSnapshot {
         match event {
             CaptureEvent::Loss(loss) => {
-                self.inner.output_loss_events.increment();
-                self.inner.lost_events.add(loss.loss.lost_events);
+                self.inner
+                    .providers
+                    .record_output_loss(loss.origin.provider(), loss.loss.lost_events);
                 CaptureInputSignalRuntimeSnapshot::OutputLoss {
                     sequence,
                     observed_unix_ns,
@@ -263,7 +284,7 @@ impl CaptureInputActivityRuntimeState {
         provider: CaptureProviderKind,
         event_wall_time_unix_ns: i64,
     ) -> CaptureInputSignalRuntimeSnapshot {
-        self.inner.capture_events.increment();
+        self.inner.providers.record_capture_event(provider);
         CaptureInputSignalRuntimeSnapshot::Event {
             sequence,
             observed_unix_ns,
@@ -309,6 +330,100 @@ impl CaptureProvider for ActivityObservedCaptureInput {
         let poll = self.inner.poll_next()?;
         self.activity.record_poll(&poll);
         Ok(poll)
+    }
+}
+
+fn capture_event_totals_from_providers(
+    providers: &[CaptureInputProviderActivityRuntimeSnapshot],
+) -> (u64, u64, u64) {
+    providers
+        .iter()
+        .fold((0_u64, 0_u64, 0_u64), |totals, provider| {
+            (
+                totals.0.saturating_add(provider.capture_events),
+                totals.1.saturating_add(provider.output_loss_events),
+                totals.2.saturating_add(provider.lost_events),
+            )
+        })
+}
+
+#[derive(Debug, Default)]
+struct CaptureInputProviderActivityCounters {
+    replay: CaptureInputProviderCounters,
+    ebpf: CaptureInputProviderCounters,
+    libpcap: CaptureInputProviderCounters,
+    plaintext: CaptureInputProviderCounters,
+    interception: CaptureInputProviderCounters,
+}
+
+impl CaptureInputProviderActivityCounters {
+    fn reset(&self) {
+        for (_, counters) in self.all_provider_counters() {
+            counters.reset();
+        }
+    }
+
+    fn record_capture_event(&self, provider: CaptureProviderKind) {
+        self.for_provider(provider).capture_events.increment();
+    }
+
+    fn record_output_loss(&self, provider: CaptureProviderKind, lost_events: u64) {
+        let counters = self.for_provider(provider);
+        counters.output_loss_events.increment();
+        counters.lost_events.add(lost_events);
+    }
+
+    fn snapshot(&self) -> Vec<CaptureInputProviderActivityRuntimeSnapshot> {
+        self.all_provider_counters()
+            .into_iter()
+            .filter_map(|(provider, counters)| counters.snapshot(provider))
+            .collect()
+    }
+
+    fn for_provider(&self, provider: CaptureProviderKind) -> &CaptureInputProviderCounters {
+        match provider {
+            CaptureProviderKind::Replay => &self.replay,
+            CaptureProviderKind::Ebpf => &self.ebpf,
+            CaptureProviderKind::Libpcap => &self.libpcap,
+            CaptureProviderKind::Plaintext => &self.plaintext,
+            CaptureProviderKind::Interception => &self.interception,
+        }
+    }
+
+    fn all_provider_counters(&self) -> [(CaptureProviderKind, &CaptureInputProviderCounters); 5] {
+        CaptureProviderKind::ALL.map(|provider| (provider, self.for_provider(provider)))
+    }
+}
+
+#[derive(Debug, Default)]
+struct CaptureInputProviderCounters {
+    capture_events: AtomicCounter,
+    output_loss_events: AtomicCounter,
+    lost_events: AtomicCounter,
+}
+
+impl CaptureInputProviderCounters {
+    fn reset(&self) {
+        self.capture_events.reset();
+        self.output_loss_events.reset();
+        self.lost_events.reset();
+    }
+
+    fn snapshot(
+        &self,
+        provider: CaptureProviderKind,
+    ) -> Option<CaptureInputProviderActivityRuntimeSnapshot> {
+        let capture_events = self.capture_events.load();
+        let output_loss_events = self.output_loss_events.load();
+        let lost_events = self.lost_events.load();
+        (capture_events > 0 || output_loss_events > 0 || lost_events > 0).then_some(
+            CaptureInputProviderActivityRuntimeSnapshot {
+                provider,
+                capture_events,
+                output_loss_events,
+                lost_events,
+            },
+        )
     }
 }
 
@@ -396,6 +511,18 @@ mod tests {
         assert_eq!(snapshot.capture_events, 1);
         assert_eq!(snapshot.output_loss_events, 1);
         assert_eq!(snapshot.lost_events, 3);
+        let libpcap = snapshot
+            .provider_activity(CaptureProviderKind::Libpcap)
+            .expect("libpcap provider activity");
+        assert_eq!(libpcap.capture_events, 1);
+        assert_eq!(libpcap.output_loss_events, 0);
+        assert_eq!(libpcap.lost_events, 0);
+        let ebpf = snapshot
+            .provider_activity(CaptureProviderKind::Ebpf)
+            .expect("eBPF provider activity");
+        assert_eq!(ebpf.capture_events, 0);
+        assert_eq!(ebpf.output_loss_events, 1);
+        assert_eq!(ebpf.lost_events, 3);
         assert!(matches!(
             snapshot.last_signal,
             Some(CaptureInputSignalRuntimeSnapshot::Finished {

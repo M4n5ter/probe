@@ -6,7 +6,7 @@ use capture::{
     EbpfProcessObservationOptionalTracepointPairState, EbpfProcessObservationProbeSnapshot,
 };
 use probe_config::CaptureBackend;
-use probe_core::RuntimeMode;
+use probe_core::{CaptureProviderKind, RuntimeMode};
 use runtime::{CaptureEvidenceMode, CapturePlanMode};
 use serde::Serialize;
 
@@ -92,6 +92,18 @@ impl CaptureProviderRuntimeDetailsSnapshot {
                 .collect(),
         }
     }
+
+    pub(crate) fn with_input_activity(
+        mut self,
+        input_activity: Option<&CaptureInputActivityRuntimeSnapshot>,
+    ) -> Self {
+        match &mut self {
+            Self::EbpfProcessObservation {
+                kernel_liveness, ..
+            } => kernel_liveness.apply_input_activity(input_activity),
+        }
+        self
+    }
 }
 
 impl EbpfProcessObservationKernelLivenessRuntimeSnapshot {
@@ -105,6 +117,22 @@ impl EbpfProcessObservationKernelLivenessRuntimeSnapshot {
             mode: RuntimeMode::Unavailable,
             reason: reason.to_string(),
         }
+    }
+
+    fn apply_input_activity(
+        &mut self,
+        input_activity: Option<&CaptureInputActivityRuntimeSnapshot>,
+    ) {
+        let Some(activity) = input_activity
+            .and_then(|activity| activity.provider_activity(CaptureProviderKind::Ebpf))
+        else {
+            return;
+        };
+        self.mode = RuntimeMode::Degraded;
+        self.reason = format!(
+            "observed eBPF provider output reaching userspace: {} capture events, {} output-loss events, {} lost events; this proves runtime kernel activity for this provider, but not per-link firing coverage or strong socket-object lifetime",
+            activity.capture_events, activity.output_loss_events, activity.lost_events,
+        );
     }
 }
 
@@ -271,6 +299,7 @@ mod tests {
             .input_activity_snapshot()
             .expect("recorded runtime should expose capture input activity");
         assert_eq!(activity.polls.total, 0);
+        assert!(activity.providers.is_empty());
         assert_eq!(
             runtime
                 .snapshot()

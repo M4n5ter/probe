@@ -6,9 +6,11 @@ mod runtime;
 
 use capture::CaptureProvider;
 
-#[cfg(test)]
-pub(crate) use activity::CaptureInputPollActivityRuntimeSnapshot;
 pub(crate) use activity::{CaptureInputActivityRuntimeSnapshot, CaptureInputSignalRuntimeSnapshot};
+#[cfg(test)]
+pub(crate) use activity::{
+    CaptureInputPollActivityRuntimeSnapshot, CaptureInputProviderActivityRuntimeSnapshot,
+};
 pub(super) use factory::{CaptureProviderPreflight, build_capture_provider};
 pub(crate) use runtime::{
     CaptureProviderOpenFailureSnapshot, CaptureProviderRuntimeDetailsSnapshot,

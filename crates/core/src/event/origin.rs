@@ -49,6 +49,26 @@ pub enum CaptureProviderKind {
     Interception,
 }
 
+impl CaptureProviderKind {
+    pub const ALL: [Self; 5] = [
+        Self::Replay,
+        Self::Ebpf,
+        Self::Libpcap,
+        Self::Plaintext,
+        Self::Interception,
+    ];
+
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Replay => "replay",
+            Self::Ebpf => "ebpf",
+            Self::Libpcap => "libpcap",
+            Self::Plaintext => "plaintext",
+            Self::Interception => "interception",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct CaptureOrigin {
     source: CaptureSource,
@@ -141,6 +161,14 @@ mod tests {
             CaptureOrigin::from_source(CaptureSource::L7MitmControlPlane).provider(),
             CaptureProviderKind::Interception
         );
+    }
+
+    #[test]
+    fn capture_provider_kind_round_trips_wire_name() -> Result<(), Box<dyn std::error::Error>> {
+        for provider in CaptureProviderKind::ALL {
+            assert_eq!(serde_json::to_value(provider)?, provider.wire_name());
+        }
+        Ok(())
     }
 
     #[test]

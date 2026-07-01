@@ -34,25 +34,30 @@ pub(in crate::status) fn capture_status(
     input_activity: Option<CaptureInputActivityRuntimeSnapshot>,
 ) -> CaptureStatusSnapshot {
     match runtime {
-        Some(runtime) => CaptureStatusSnapshot {
-            selection: plan.capture.selection,
-            selected_backend: Some(runtime.selected_backend),
-            provider_runtime_mode: Some(runtime.provider_runtime_mode),
-            mode: runtime.plan_mode,
-            reason: runtime.reason,
-            evidence_mode: Some(runtime.evidence_mode),
-            evidence_reason: runtime.evidence_reason,
-            open_failures: runtime
-                .open_failures
-                .into_iter()
-                .map(|failure| CaptureOpenFailureStatusSnapshot {
-                    backend: failure.backend,
-                    reason: failure.reason,
-                })
-                .collect(),
-            provider: runtime.provider,
-            input_activity,
-        },
+        Some(runtime) => {
+            let provider = runtime
+                .provider
+                .map(|provider| provider.with_input_activity(input_activity.as_ref()));
+            CaptureStatusSnapshot {
+                selection: plan.capture.selection,
+                selected_backend: Some(runtime.selected_backend),
+                provider_runtime_mode: Some(runtime.provider_runtime_mode),
+                mode: runtime.plan_mode,
+                reason: runtime.reason,
+                evidence_mode: Some(runtime.evidence_mode),
+                evidence_reason: runtime.evidence_reason,
+                open_failures: runtime
+                    .open_failures
+                    .into_iter()
+                    .map(|failure| CaptureOpenFailureStatusSnapshot {
+                        backend: failure.backend,
+                        reason: failure.reason,
+                    })
+                    .collect(),
+                provider,
+                input_activity,
+            }
+        }
         None => CaptureStatusSnapshot {
             selection: plan.capture.selection,
             selected_backend: plan.capture.selected_backend,
@@ -71,13 +76,17 @@ pub(in crate::status) fn capture_status(
 #[cfg(test)]
 mod tests {
     use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
-    use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
+    use probe_core::{CapabilityKind, CapabilityState, CaptureProviderKind, RuntimeMode};
     use runtime::{
         CapturePlanMode, CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry,
         RuntimePlan,
     };
 
     use super::*;
+    use crate::capture_provider::{
+        CaptureInputPollActivityRuntimeSnapshot, CaptureInputProviderActivityRuntimeSnapshot,
+        CaptureInputSignalRuntimeSnapshot,
+    };
 
     #[test]
     fn capture_status_reports_degraded_selected_provider() -> Result<(), Box<dyn std::error::Error>>
@@ -140,29 +149,7 @@ mod tests {
             evidence_reason: Some("eBPF provider is best-effort".to_string()),
             reason: Some("kernel socket-object lifetime is best-effort".to_string()),
             open_failures: Vec::new(),
-            provider: Some(
-                crate::capture_provider::CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(
-                    capture::EbpfProcessObservationProbeSnapshot::from_link_ownership_and_optional_pairs(
-                        capture::EbpfProcessObservationLinkOwnershipSnapshot::owned_by_programs([
-                            capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
-                                "connect_enter",
-                                "syscalls",
-                                "sys_enter_connect",
-                                1,
-                            ),
-                            capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
-                                "connect_exit",
-                                "syscalls",
-                                "sys_exit_connect",
-                                1,
-                            ),
-                        ]),
-                        [capture::EbpfProcessObservationOptionalTracepointPairSnapshot::attached(
-                            capture::EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS[0],
-                        )],
-                    ),
-                ),
-            ),
+            provider: Some(ebpf_process_observation_details()),
         };
 
         let status = capture_status(&plan, Some(runtime), None);
@@ -216,6 +203,96 @@ mod tests {
             serde_json::json!("sys_exit_sendfile")
         );
         Ok(())
+    }
+
+    #[test]
+    fn capture_status_reports_ebpf_kernel_activity_after_observed_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = auto_plan_with_degraded_ebpf_and_available_libpcap()?;
+        let runtime = CaptureProviderRuntimeSnapshot {
+            selected_backend: CaptureBackend::Ebpf,
+            plan_mode: CapturePlanMode::Live,
+            provider_runtime_mode: RuntimeMode::Degraded,
+            evidence_mode: CaptureEvidenceMode::BestEffort,
+            evidence_reason: Some("eBPF provider is best-effort".to_string()),
+            reason: Some("kernel socket-object lifetime is best-effort".to_string()),
+            open_failures: Vec::new(),
+            provider: Some(ebpf_process_observation_details()),
+        };
+        let input_activity = CaptureInputActivityRuntimeSnapshot {
+            polls: CaptureInputPollActivityRuntimeSnapshot {
+                total: 2,
+                events: 1,
+                progress: 1,
+                idle: 0,
+                finished: 0,
+            },
+            capture_events: 0,
+            output_loss_events: 1,
+            lost_events: 7,
+            providers: vec![CaptureInputProviderActivityRuntimeSnapshot {
+                provider: CaptureProviderKind::Ebpf,
+                capture_events: 0,
+                output_loss_events: 1,
+                lost_events: 7,
+            }],
+            last_signal: Some(CaptureInputSignalRuntimeSnapshot::OutputLoss {
+                sequence: 3,
+                observed_unix_ns: 100,
+                source: probe_core::CaptureSource::EbpfSyscall,
+                provider: CaptureProviderKind::Ebpf,
+                event_wall_time_unix_ns: 99,
+                lost_events: 7,
+            }),
+        };
+
+        let status = capture_status(&plan, Some(runtime), Some(input_activity));
+
+        let value = serde_json::to_value(&status)?;
+        let kernel_liveness = &value["provider"]["kernel_liveness"];
+        assert_eq!(kernel_liveness["mode"], serde_json::json!("degraded"));
+        assert!(
+            kernel_liveness["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("observed eBPF provider output"))
+        );
+        assert!(
+            kernel_liveness["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("0 capture events, 1 output-loss events"))
+        );
+        assert!(
+            kernel_liveness["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("not per-link firing coverage"))
+        );
+        Ok(())
+    }
+
+    fn ebpf_process_observation_details() -> CaptureProviderRuntimeDetailsSnapshot {
+        CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(
+            capture::EbpfProcessObservationProbeSnapshot::from_link_ownership_and_optional_pairs(
+                capture::EbpfProcessObservationLinkOwnershipSnapshot::owned_by_programs([
+                    capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
+                        "connect_enter",
+                        "syscalls",
+                        "sys_enter_connect",
+                        1,
+                    ),
+                    capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
+                        "connect_exit",
+                        "syscalls",
+                        "sys_exit_connect",
+                        1,
+                    ),
+                ]),
+                [
+                    capture::EbpfProcessObservationOptionalTracepointPairSnapshot::attached(
+                        capture::EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS[0],
+                    ),
+                ],
+            ),
+        )
     }
 
     fn auto_plan_with_degraded_ebpf_and_available_libpcap()

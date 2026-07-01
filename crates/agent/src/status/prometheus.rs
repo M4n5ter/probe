@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use probe_core::RuntimeMode;
+use probe_core::{CaptureProviderKind, RuntimeMode};
 
 use super::metrics::{TcpHealthMetricsSnapshot, TlsPlaintextMetricsSnapshot};
 use crate::{
@@ -1038,6 +1038,51 @@ fn write_capture_input(output: &mut String, snapshot: &AgentStatusSnapshot) {
 
     write_family(
         output,
+        "traffic_probe_capture_input_provider_events_total",
+        "counter",
+        "Capture input events by provider and class before pipeline processing.",
+    );
+    for provider in CaptureProviderKind::ALL {
+        let provider_activity = activity
+            .providers
+            .iter()
+            .find(|activity| activity.provider == provider);
+        write_sample(
+            output,
+            "traffic_probe_capture_input_provider_events_total",
+            &[("provider", provider.wire_name()), ("class", "capture")],
+            provider_activity.map_or(0, |activity| activity.capture_events),
+        );
+        write_sample(
+            output,
+            "traffic_probe_capture_input_provider_events_total",
+            &[("provider", provider.wire_name()), ("class", "output_loss")],
+            provider_activity.map_or(0, |activity| activity.output_loss_events),
+        );
+    }
+
+    write_family(
+        output,
+        "traffic_probe_capture_input_provider_lost_events_total",
+        "counter",
+        "Capture input reported lost events by provider before userspace observation.",
+    );
+    for provider in CaptureProviderKind::ALL {
+        let lost_events = activity
+            .providers
+            .iter()
+            .find(|activity| activity.provider == provider)
+            .map_or(0, |activity| activity.lost_events);
+        write_sample(
+            output,
+            "traffic_probe_capture_input_provider_lost_events_total",
+            &[("provider", provider.wire_name())],
+            lost_events,
+        );
+    }
+
+    write_family(
+        output,
         "traffic_probe_capture_input_last_signal",
         "gauge",
         "Capture input last observed signal as a one-hot gauge.",
@@ -1141,8 +1186,8 @@ mod tests {
     use super::*;
     use crate::capture_provider::{
         CaptureInputActivityRuntimeSnapshot, CaptureInputPollActivityRuntimeSnapshot,
-        CaptureInputSignalRuntimeSnapshot, CaptureProviderRuntimeDetailsSnapshot,
-        CaptureProviderRuntimeSnapshot,
+        CaptureInputProviderActivityRuntimeSnapshot, CaptureInputSignalRuntimeSnapshot,
+        CaptureProviderRuntimeDetailsSnapshot, CaptureProviderRuntimeSnapshot,
     };
     use crate::l7_mitm::{
         L7MitmBackendHealthMode, L7MitmBackendHealthSnapshot, L7MitmClientTrustSnapshot,
@@ -1464,6 +1509,32 @@ mod tests {
                         ),
                     )),
                 }),
+                capture_input: Some(CaptureInputActivityRuntimeSnapshot {
+                    polls: CaptureInputPollActivityRuntimeSnapshot {
+                        total: 1,
+                        events: 1,
+                        progress: 0,
+                        idle: 0,
+                        finished: 0,
+                    },
+                    capture_events: 0,
+                    output_loss_events: 1,
+                    lost_events: 3,
+                    providers: vec![CaptureInputProviderActivityRuntimeSnapshot {
+                        provider: probe_core::CaptureProviderKind::Ebpf,
+                        capture_events: 0,
+                        output_loss_events: 1,
+                        lost_events: 3,
+                    }],
+                    last_signal: Some(CaptureInputSignalRuntimeSnapshot::OutputLoss {
+                        sequence: 1,
+                        observed_unix_ns: 101,
+                        source: probe_core::CaptureSource::EbpfSyscall,
+                        provider: probe_core::CaptureProviderKind::Ebpf,
+                        event_wall_time_unix_ns: 99,
+                        lost_events: 3,
+                    }),
+                }),
                 ..RuntimeStatusInput::default()
             },
         );
@@ -1487,7 +1558,10 @@ mod tests {
             "traffic_probe_ebpf_process_observation_kernel_liveness_mode{mode=\"available\"} 0\n"
         ));
         assert!(metrics.contains(
-            "traffic_probe_ebpf_process_observation_kernel_liveness_mode{mode=\"unavailable\"} 1\n"
+            "traffic_probe_ebpf_process_observation_kernel_liveness_mode{mode=\"degraded\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_kernel_liveness_mode{mode=\"unavailable\"} 0\n"
         ));
         assert!(metrics.contains(
             "traffic_probe_ebpf_process_observation_program_owned_links{program_name=\"connect_enter\",category=\"syscalls\",tracepoint=\"sys_enter_connect\"} 1\n"
@@ -1650,6 +1724,20 @@ mod tests {
                     capture_events: 1,
                     output_loss_events: 1,
                     lost_events: 3,
+                    providers: vec![
+                        CaptureInputProviderActivityRuntimeSnapshot {
+                            provider: probe_core::CaptureProviderKind::Libpcap,
+                            capture_events: 1,
+                            output_loss_events: 0,
+                            lost_events: 0,
+                        },
+                        CaptureInputProviderActivityRuntimeSnapshot {
+                            provider: probe_core::CaptureProviderKind::Ebpf,
+                            capture_events: 0,
+                            output_loss_events: 1,
+                            lost_events: 3,
+                        },
+                    ],
                     last_signal: Some(CaptureInputSignalRuntimeSnapshot::OutputLoss {
                         sequence: 4,
                         observed_unix_ns: 101,
@@ -1681,6 +1769,15 @@ mod tests {
             metrics.contains("traffic_probe_capture_input_events_total{class=\"output_loss\"} 1\n")
         );
         assert!(metrics.contains("traffic_probe_capture_input_lost_events_total 3\n"));
+        assert!(metrics.contains(
+            "traffic_probe_capture_input_provider_events_total{provider=\"libpcap\",class=\"capture\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_capture_input_provider_events_total{provider=\"ebpf\",class=\"output_loss\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_capture_input_provider_lost_events_total{provider=\"ebpf\"} 3\n"
+        ));
         assert!(
             metrics.contains("traffic_probe_capture_input_last_signal{kind=\"output_loss\"} 1\n")
         );
