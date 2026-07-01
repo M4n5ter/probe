@@ -1031,7 +1031,8 @@ E2E profiles are organized around capability claims:
   outbound proxy, MITM plaintext bridge, policy hook, and product proxy
   HTTPS/WebSocket paths.
 - `linux-artifacts` needs root/net-admin and covers Linux transparent
-  interception artifact acceptance.
+  interception artifact acceptance, including socket-cgroup outbound rules when
+  a non-root cgroup v2 path and nft socket-cgroup resolver are available.
 - `product` combines the user, live, eBPF, TLS, interception, MITM, and Linux
   artifact suites.
 

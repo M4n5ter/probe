@@ -13,20 +13,38 @@ pub(crate) fn reexec_current_case_in_fresh_network_namespace(
     case_name: &'static str,
     failure_label: &'static str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    reexec_current_case_in_fresh_network_namespace_with_env(
+        marker_env,
+        case_name,
+        failure_label,
+        &[],
+    )
+}
+
+pub(crate) fn reexec_current_case_in_fresh_network_namespace_with_env(
+    marker_env: &'static str,
+    case_name: &'static str,
+    failure_label: &'static str,
+    extra_env: &[(&str, &str)],
+) -> Result<(), Box<dyn std::error::Error>> {
     let current_exe = env::current_exe()?;
     let parent_netns = current_network_namespace()?;
     let token = format!("{case_name}:{}:{}", std::process::id(), wall_time_unix_ns());
-    let mut child = Command::new(trusted_system_command(
+    let mut command = Command::new(trusted_system_command(
         ["/usr/bin/unshare", "/bin/unshare"],
         "unshare",
-    )?)
-    .arg("-n")
-    .arg("--")
-    .arg(current_exe)
-    .arg(case_name)
-    .env(marker_env, &token)
-    .stdin(Stdio::piped())
-    .spawn()?;
+    )?);
+    command
+        .arg("-n")
+        .arg("--")
+        .arg(current_exe)
+        .arg(case_name)
+        .env(marker_env, &token)
+        .stdin(Stdio::piped());
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn()?;
     let mut stdin = child
         .stdin
         .take()

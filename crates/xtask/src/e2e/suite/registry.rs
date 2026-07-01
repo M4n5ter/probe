@@ -53,7 +53,10 @@ use super::super::{
     },
     tls_plaintext_output_loss::run as run_tls_plaintext_output_loss,
     tls_plaintext_provider_loopback::run as run_tls_plaintext_provider_loopback,
-    transparent_linux_outbound_redirect_artifact::run as run_transparent_linux_outbound_redirect_artifact,
+    transparent_linux_outbound_redirect_artifact::{
+        run as run_transparent_linux_outbound_redirect_artifact,
+        run_cgroup as run_transparent_linux_outbound_cgroup_artifact,
+    },
     transparent_outbound_proxy_loopback::{
         run as run_transparent_outbound_proxy_loopback,
         run_external as run_transparent_outbound_external_proxy_loopback,
@@ -337,6 +340,11 @@ const E2E_CASES: &[E2eCase] = &[
         run: E2eCaseRun::ExitCode(run_transparent_linux_outbound_redirect_artifact),
     },
     E2eCase {
+        name: "e2e-transparent-linux-outbound-cgroup-artifact-netns",
+        requirement: E2eRequirement::RootNetAdmin,
+        run: E2eCaseRun::Outcome(run_transparent_linux_outbound_cgroup_artifact),
+    },
+    E2eCase {
         name: "e2e-transparent-outbound-proxy-loopback",
         requirement: E2eRequirement::RootNetAdmin,
         run: E2eCaseRun::ExitCode(run_transparent_outbound_proxy_loopback),
@@ -520,7 +528,10 @@ const E2E_PROFILES: &[E2eProfile] = &[
         name: "linux-artifacts",
         description: "root/net-admin transparent Linux artifact acceptance suite",
         include_in_product: true,
-        cases: E2eProfileCases::Named(&["e2e-transparent-linux-outbound-redirect-artifact-netns"]),
+        cases: E2eProfileCases::Named(&[
+            "e2e-transparent-linux-outbound-redirect-artifact-netns",
+            "e2e-transparent-linux-outbound-cgroup-artifact-netns",
+        ]),
     },
     E2eProfile {
         id: E2eProfileId::Product,
@@ -870,6 +881,7 @@ mod tests {
             description: "root/net-admin transparent Linux artifact acceptance suite",
             cases: ExpectedProfileCases::Named(&[
                 "e2e-transparent-linux-outbound-redirect-artifact-netns",
+                "e2e-transparent-linux-outbound-cgroup-artifact-netns",
             ]),
         },
         ExpectedProfile {
@@ -929,6 +941,7 @@ mod tests {
                 "e2e-outbound-mitm-plaintext-bridge-live-sidecar",
                 "e2e-managed-outbound-mitm-plaintext-bridge-live-sidecar",
                 "e2e-transparent-linux-outbound-redirect-artifact-netns",
+                "e2e-transparent-linux-outbound-cgroup-artifact-netns",
             ]),
         },
     ];
