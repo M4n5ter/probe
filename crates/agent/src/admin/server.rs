@@ -20,6 +20,7 @@ use tokio::{
 use pipeline::{PipelinePolicySet, PipelineRuntimeMetrics};
 
 use super::{
+    debug_dump::AdminDebugDump,
     protocol::{AdminRequest, AdminResponse, enforcement_policy_reload_source, read_admin_request},
     socket::{AdminError, AdminServerConfig, bind_admin_socket, bind_prometheus_listener},
 };
@@ -331,6 +332,12 @@ async fn handle_admin_request(
                 metrics: render_prometheus_metrics(&snapshot),
             }
         }
+        AdminRequest::DebugDump => {
+            let snapshot = build_admin_status_snapshot(plan, spool, runtime_state);
+            AdminResponse::DebugDump {
+                dump: Box::new(AdminDebugDump::new(snapshot)),
+            }
+        }
     }
 }
 
@@ -459,8 +466,66 @@ mod tests {
             client_response["snapshot"]["spool"]["export_last_sequence"],
             json!(1)
         );
+
         server.stop().await;
         assert!(!socket_path.exists());
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_debug_dump_returns_status_protocol_and_privacy_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-debug-dump")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        spool.append_export(SpoolPayload::new(
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
+            b"one",
+        ))?;
+        let plan = Arc::new(runtime_plan(spool_path)?);
+        let server = spawn_admin_server(
+            Arc::clone(&plan),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState::default(),
+        )?;
+
+        let response = send_admin_request(&socket_path, json!({ "command": "debug_dump" })).await?;
+
+        assert_eq!(response["kind"], json!("debug_dump"));
+        assert_eq!(
+            response["dump"]["status"]["spool"]["export_last_sequence"],
+            json!(1)
+        );
+        assert_eq!(response["dump"]["protocol"]["framing"], json!("json_lines"));
+        assert_eq!(
+            response["dump"]["protocol"]["request_max_bytes"],
+            json!(4096)
+        );
+        assert_eq!(
+            response["dump"]["protocol"]["commands"],
+            json!([
+                { "name": "status", "mutating": false },
+                { "name": "metrics", "mutating": false },
+                { "name": "prometheus_metrics", "mutating": false },
+                { "name": "debug_dump", "mutating": false },
+                { "name": "reload_policies", "mutating": true },
+                { "name": "reload_enforcement_policy", "mutating": true },
+            ])
+        );
+        assert_eq!(
+            response["dump"]["privacy"],
+            json!({
+                "includes_raw_config": false,
+                "includes_runtime_plan": true,
+                "includes_local_paths": true,
+                "includes_secret_material_bytes": false,
+            })
+        );
+        server.stop().await;
         drop(spool);
         fs::remove_dir_all(temp)?;
         Ok(())

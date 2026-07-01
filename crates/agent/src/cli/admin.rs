@@ -12,6 +12,7 @@ pub(super) enum AdminCliCommand {
     Status,
     Metrics,
     PrometheusMetrics,
+    DebugDump,
     ReloadPolicies,
     ReloadEnforcementPolicy,
 }
@@ -43,6 +44,7 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
         AdminCliCommand::Status => AdminRequest::Status,
         AdminCliCommand::Metrics => AdminRequest::Metrics,
         AdminCliCommand::PrometheusMetrics => AdminRequest::PrometheusMetrics,
+        AdminCliCommand::DebugDump => AdminRequest::DebugDump,
         AdminCliCommand::ReloadPolicies => AdminRequest::ReloadPolicies,
         AdminCliCommand::ReloadEnforcementPolicy => AdminRequest::ReloadEnforcementPolicy,
     }
@@ -62,6 +64,10 @@ mod tests {
         assert_eq!(
             admin_request(AdminCliCommand::PrometheusMetrics),
             AdminRequest::PrometheusMetrics
+        );
+        assert_eq!(
+            admin_request(AdminCliCommand::DebugDump),
+            AdminRequest::DebugDump
         );
         assert_eq!(
             admin_request(AdminCliCommand::ReloadPolicies),

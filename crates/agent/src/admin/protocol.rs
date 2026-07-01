@@ -8,16 +8,46 @@ use crate::{
     status::MetricsSnapshot,
 };
 
+use super::debug_dump::AdminDebugDump;
+
 const ADMIN_REQUEST_MAX_BYTES: usize = 4 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case", tag = "command")]
-pub(crate) enum AdminRequest {
-    Status,
-    Metrics,
-    PrometheusMetrics,
-    ReloadPolicies,
-    ReloadEnforcementPolicy,
+macro_rules! admin_requests {
+    ($( $variant:ident => { wire: $wire:literal, mutating: $mutating:literal } ),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+        #[serde(tag = "command")]
+        pub(crate) enum AdminRequest {
+            $(
+                #[serde(rename = $wire)]
+                $variant,
+            )+
+        }
+
+        impl AdminRequest {
+            pub(crate) const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub(crate) const fn wire_name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire,)+
+                }
+            }
+
+            pub(crate) const fn mutating(self) -> bool {
+                match self {
+                    $(Self::$variant => $mutating,)+
+                }
+            }
+        }
+    };
+}
+
+admin_requests! {
+    Status => { wire: "status", mutating: false },
+    Metrics => { wire: "metrics", mutating: false },
+    PrometheusMetrics => { wire: "prometheus_metrics", mutating: false },
+    DebugDump => { wire: "debug_dump", mutating: false },
+    ReloadPolicies => { wire: "reload_policies", mutating: true },
+    ReloadEnforcementPolicy => { wire: "reload_enforcement_policy", mutating: true },
 }
 
 #[derive(Debug, Serialize)]
@@ -33,6 +63,9 @@ pub(super) enum AdminResponse {
         content_type: &'static str,
         metrics: String,
     },
+    DebugDump {
+        dump: Box<AdminDebugDump>,
+    },
     PolicyReload {
         loaded_count: u64,
         policies: Vec<ConfiguredPolicySource>,
@@ -46,6 +79,34 @@ pub(super) enum AdminResponse {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct AdminProtocolSnapshot {
+    pub framing: &'static str,
+    pub request_max_bytes: usize,
+    pub commands: Vec<AdminCommandSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct AdminCommandSnapshot {
+    pub name: &'static str,
+    pub mutating: bool,
+}
+
+pub(super) fn admin_protocol_snapshot() -> AdminProtocolSnapshot {
+    AdminProtocolSnapshot {
+        framing: "json_lines",
+        request_max_bytes: ADMIN_REQUEST_MAX_BYTES,
+        commands: AdminRequest::ALL
+            .iter()
+            .copied()
+            .map(|command| AdminCommandSnapshot {
+                name: command.wire_name(),
+                mutating: command.mutating(),
+            })
+            .collect(),
+    }
 }
 
 #[derive(Debug, Serialize)]

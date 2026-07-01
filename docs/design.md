@@ -4357,9 +4357,12 @@ Admin socket：
 - JSON-lines 协议支持 `{"command":"status"}`。
 - JSON-lines 协议支持 `{"command":"metrics"}`。
 - JSON-lines 协议支持 `{"command":"prometheus_metrics"}`。
+- JSON-lines 协议支持 `{"command":"debug_dump"}`。
 - JSON-lines 协议支持 `{"command":"reload_policies"}`。
 - JSON-lines 协议支持 `{"command":"reload_enforcement_policy"}`。
-- `agent admin --socket <path> <command>` 是该 JSON-lines 协议的一等 CLI client；`status`、`metrics`、
+- `debug_dump` 复用在线 status snapshot builder，并附带 admin protocol inventory 和 privacy declaration；它包含 runtime
+  plan/status 字段和本地路径，但不包含 raw config 文本或 secret material 字节。
+- `agent admin --socket <path> <command>` 是该 JSON-lines 协议的一等 CLI client；`status`、`metrics`、`debug-dump`、
   `reload-policies` 和 `reload-enforcement-policy` 输出 JSON，`prometheus-metrics` 输出 text exposition。
 - admin socket parent directory 必须由部署层预创建。
 - parent directory 不能是 symlink。
@@ -4431,9 +4434,8 @@ Enforcement reload watcher：
 尚未实现：
 
 - 主配置 reload。
-- debug dump。
-- 后续主配置 reload 和 debug dump 应复用同一 status snapshot 构建器。
-- 后续主配置 reload 和 debug dump 必须承担运行中 agent 的在线状态查询语义。
+- 后续主配置 reload 应复用同一 status snapshot 构建器。
+- 后续主配置 reload 必须承担运行中 agent 的在线状态查询语义。
 
 能力：
 
@@ -4444,7 +4446,7 @@ Enforcement reload watcher：
 - spool status。
 - policy bundle reload。
 - future config reload。
-- future debug dump。
+- debug dump。
 - exporter status。
 
 默认不监听 TCP，降低攻击面。Prometheus metrics 可通过 admin socket adapter 获取，也可通过显式启用的 loopback-only HTTP listener 被
@@ -4721,8 +4723,8 @@ benchmark 参数：
   `check` 与 `run` 共用中性的 configured policy/enforcement composition helper，避免诊断入口和生产路径各自解释配置。policy snapshot 中的
   `registered_hooks` 表示 runtime 注册的支持 hook，不表示 Lua source 中实际定义的函数集合。
 - `status`：输出 runtime/admin/metrics snapshot。
-- `admin`：连接在线 admin Unix socket，执行 `status`、`metrics`、`prometheus-metrics`、`reload-policies` 或
-  `reload-enforcement-policy`。
+- `admin`：连接在线 admin Unix socket，执行 `status`、`metrics`、`prometheus-metrics`、`debug-dump`、
+  `reload-policies` 或 `reload-enforcement-policy`。
 - `replay`：用 pcap/spool 样本跑 parser/policy/exporter。
 - `capabilities`：输出 capability matrix；可选 `--config` 时按配置中的 provider-specific 输入做能力探测，否则使用默认配置。
 

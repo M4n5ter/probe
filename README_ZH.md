@@ -851,7 +851,15 @@ cargo run -p agent -- admin \
 cargo run -p agent -- admin \
   --socket /run/traffic-probe/admin.sock \
   prometheus-metrics
+
+cargo run -p agent -- admin \
+  --socket /run/traffic-probe/admin.sock \
+  debug-dump
 ```
+
+`debug-dump` 复用在线 status snapshot，并附带 admin protocol metadata。它包含
+runtime plan/status 字段和本地路径，但不包含 raw config 文本或 secret material
+字节。
 
 本地 watcher 和 remote polling 都需要显式开启。本地 source 使用本地触发器：
 

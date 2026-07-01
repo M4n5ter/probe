@@ -901,7 +901,15 @@ cargo run -p agent -- admin \
 cargo run -p agent -- admin \
   --socket /run/traffic-probe/admin.sock \
   prometheus-metrics
+
+cargo run -p agent -- admin \
+  --socket /run/traffic-probe/admin.sock \
+  debug-dump
 ```
+
+`debug-dump` reuses the online status snapshot and adds admin protocol metadata.
+It includes runtime plan/status fields and local paths, but not raw config text
+or secret material bytes.
 
 Local watching and remote polling are opt-in. Use local triggers for local
 sources:
