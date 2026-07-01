@@ -180,8 +180,8 @@ refresh_interval_ms = 1000
 # explicit backend, selector, policy source, and operational approval.
 mode = "audit_only"
 # backend = "linux_socket_destroy" requires root, procfs socket attribution, and
-# iproute2 `ss` at a trusted system path. The agent runs an active loopback
-# destroy self-test before reporting the capability as available.
+# Linux NETLINK_SOCK_DIAG/SOCK_DESTROY support. The agent runs an active
+# loopback destroy self-test before reporting the capability as available.
 backend = "none"
 
 [enforcement.policy.source]

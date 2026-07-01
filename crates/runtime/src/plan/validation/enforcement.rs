@@ -249,7 +249,7 @@ mod tests {
                     if state.kind == CapabilityKind::ConnectionEnforcement {
                         CapabilityState::unavailable(
                             CapabilityKind::ConnectionEnforcement,
-                            "linux socket destroy enforcement requires root because the ss child process must retain socket destroy privileges after exec",
+                            "linux socket destroy enforcement requires root and NETLINK_SOCK_DIAG SOCK_DESTROY support",
                         )
                     } else {
                         state

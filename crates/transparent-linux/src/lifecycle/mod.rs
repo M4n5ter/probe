@@ -13,18 +13,7 @@ pub use outbound::OutboundRedirectLifecyclePlan;
 pub use resources::{
     InboundTproxyArtifactSpec, OutboundRedirectArtifactSpec, TransparentLinuxResources,
 };
-
-pub fn cleanup_all_policy_route_ip_commands(mark: u32, route_table: u32) -> Vec<Vec<String>> {
-    TransparentLinuxIpFamily::all()
-        .into_iter()
-        .flat_map(|family| {
-            [
-                family.rule_command("del", mark, route_table),
-                family.route_command("del", route_table),
-            ]
-        })
-        .collect()
-}
+pub use route::{PolicyRouteOperation, cleanup_all_policy_route_operations};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransparentLinuxPlanError {

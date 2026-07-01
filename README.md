@@ -119,10 +119,29 @@ Common requirements:
 - `libpcap` development headers and `pkg-config` for the default agent build;
 - root or matching Linux capabilities for live capture, eBPF, socket destroy,
   transparent interception, or MITM tests;
-- `iproute2` with `ss` when enabling
-  `enforcement.backend = "linux_socket_destroy"`;
+- `nftables` package when running Linux transparent interception;
 - nightly Rust with `rust-src` and `bpf-linker` only when building eBPF
   artifacts.
+
+Common `nft` installation commands:
+
+```bash
+# Debian / Ubuntu
+sudo apt install nftables
+
+# Fedora / RHEL / Rocky / Alma
+sudo dnf install nftables
+
+# Arch
+sudo pacman -S nftables
+
+# Alpine
+sudo apk add nftables
+```
+
+When `nft` is missing, the agent capability probe reads `/etc/os-release`
+first, then probes common package managers on unknown distributions. The
+reported command omits `sudo` when the probe itself is already running as root.
 
 Build the first-party MITM proxy and fixture when running MITM E2E cases:
 
@@ -705,10 +724,10 @@ directions = ["outbound"]
 remote_addresses = []
 ```
 
-Linux socket destroy closes existing TCP sockets only. It uses `ss -K` from
-`iproute2`, discovered at trusted system paths and verified by an active
-loopback self-test before the capability is reported as available. It is not
-pre-connect deny, UDP blocking, or payload-level blocking.
+Linux socket destroy closes existing TCP sockets only. It uses
+`NETLINK_SOCK_DIAG` with `SOCK_DESTROY`, verified by an active loopback
+self-test before the capability is reported as available. It is not pre-connect
+deny, UDP blocking, or payload-level blocking.
 
 Transparent MITM is a separate strategy. It requires root/net-admin,
 operator-managed client trust, certificate material refs, proxy listener

@@ -1,7 +1,7 @@
 mod activation;
 mod command;
+mod host_routing;
 mod lifecycle;
-mod local_addresses;
 mod outbound;
 mod owner_lock;
 mod probe;
@@ -12,7 +12,8 @@ use ::runtime::{
 use interception::TransparentInterceptionHostRuleSet;
 
 use self::{
-    command::{SystemIp, SystemNft},
+    command::SystemNft,
+    host_routing::RtnetlinkHostRouting,
     probe::{NftablesInterceptionProbe, NftablesInterceptionProbeResult},
 };
 use super::{TransparentInterceptionRuntime, proxy::TransparentProxyRuntime};
@@ -31,12 +32,23 @@ pub(super) fn resolve(
     proxy_runtime: TransparentProxyRuntime,
 ) -> TransparentInterceptionRuntime {
     match NftablesInterceptionProbe::default().resolve() {
-        NftablesInterceptionProbeResult::Available { nft, ip } => {
+        NftablesInterceptionProbeResult::Available { nft } => {
+            let host_routing = match RtnetlinkHostRouting::new() {
+                Ok(host_routing) => host_routing,
+                Err(error) => {
+                    return TransparentInterceptionRuntime::unavailable(
+                        format!(
+                            "transparent interception requires RTNETLINK host routing access: {error}"
+                        ),
+                        proxy_runtime,
+                    );
+                }
+            };
             TransparentInterceptionRuntime::available(
                 NftablesTransparentInterception::new(
                     inbound_plan,
                     SystemNft::new(nft),
-                    ip.map(SystemIp::new),
+                    host_routing,
                     proxy_runtime.clone(),
                 ),
                 proxy_runtime,
@@ -59,12 +71,23 @@ pub(super) fn resolve_outbound(
     proxy_runtime: TransparentProxyRuntime,
 ) -> TransparentInterceptionRuntime {
     match NftablesInterceptionProbe::default().resolve() {
-        NftablesInterceptionProbeResult::Available { nft, ip } => {
+        NftablesInterceptionProbeResult::Available { nft } => {
+            let host_routing = match RtnetlinkHostRouting::new() {
+                Ok(host_routing) => host_routing,
+                Err(error) => {
+                    return TransparentInterceptionRuntime::unavailable(
+                        format!(
+                            "outbound transparent proxy requires RTNETLINK host routing access: {error}"
+                        ),
+                        proxy_runtime,
+                    );
+                }
+            };
             TransparentInterceptionRuntime::available(
                 NftablesOutboundTransparentProxy::new(
                     outbound_plan,
                     SystemNft::new(nft),
-                    ip.map(SystemIp::new),
+                    host_routing,
                     proxy_runtime.clone(),
                 ),
                 proxy_runtime,

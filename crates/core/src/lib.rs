@@ -36,8 +36,8 @@ pub use selector::{
     TrafficSelector,
 };
 pub use socket::{
-    TcpConnection, TcpEndpoint, UpstreamRoute, UpstreamRouteError, UpstreamRouteHost,
-    UpstreamRouteHostPattern, socket_addr_points_to_listener,
+    TcpConnection, TcpConnectionFromFlowError, TcpEndpoint, UpstreamRoute, UpstreamRouteError,
+    UpstreamRouteHost, UpstreamRouteHostPattern, socket_addr_points_to_listener,
 };
 pub use verdict::{
     Action, EnforcementDecision, EnforcementExecutionEvidence, EnforcementMode, EnforcementOutcome,

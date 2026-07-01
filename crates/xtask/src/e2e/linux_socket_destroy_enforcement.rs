@@ -1,8 +1,6 @@
 use std::{fs, path::Path, process::ExitStatus, time::Duration};
 
-use enforcement::linux_socket_destroy::{
-    check_loopback_socket_destroy_support, find_ss_command, ss_supports_kill,
-};
+use enforcement::linux_socket_destroy::check_socket_destroy_capability;
 use probe_config::{
     AgentConfig, CaptureSelection, ConnectionEnforcementBackendConfig, EnforcementPolicyManifest,
     EnforcementPolicySourceConfig, PolicyConfig,
@@ -80,19 +78,9 @@ fn run_inner() -> Result<RunOutcome, Box<dyn std::error::Error>> {
 }
 
 fn linux_socket_destroy_unavailable_reason() -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let Some(command) = find_ss_command() else {
-        return Ok(Some("trusted ss command is unavailable".to_string()));
-    };
-    if !ss_supports_kill(&command) {
+    if let Err(error) = check_socket_destroy_capability() {
         return Ok(Some(format!(
-            "ss command at {} does not advertise -K/--kill",
-            command.display()
-        )));
-    }
-    if let Err(error) = check_loopback_socket_destroy_support(&command) {
-        return Ok(Some(format!(
-            "ss command at {} failed active socket destroy support check: {error}",
-            command.display(),
+            "linux socket destroy enforcement capability is unavailable: {error}",
         )));
     }
     Ok(None)
@@ -286,7 +274,9 @@ fn assert_spool_outputs(
             || decision.scope != VerdictScope::Request
             || !decision.selector_matched
             || !decision.reason.contains(POLICY_REASON_PREFIX)
-            || !decision.reason.contains("ss -K destroyed TCP socket")
+            || !decision
+                .reason
+                .contains("netlink SOCK_DESTROY destroyed TCP socket")
         {
             return None;
         }

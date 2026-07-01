@@ -1,35 +1,18 @@
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use super::{
-    command::{CommandResult, IpCommand, NftCommand},
-    local_addresses,
+    command::{CommandResult, NftCommand},
+    host_routing::SharedHostRouting,
     owner_lock::{NftablesOwnerLock, NftablesOwnerLockGuard},
 };
 use crate::transparent_interception::{
     TransparentInterceptionError,
     proxy::{LocalAddressInventory, TransparentProxyGuard},
 };
+use transparent_linux::PolicyRouteOperation;
 
-pub(super) type SharedIpCommand = Arc<Mutex<Box<dyn IpCommand + Send>>>;
-
-pub(super) fn local_address_inventory(ip: Option<SharedIpCommand>) -> LocalAddressInventory {
-    Arc::new(move || {
-        let Some(ip) = ip.as_ref() else {
-            return Err(TransparentInterceptionError::Nftables(
-                "local address inventory requires ip at a trusted system path".to_string(),
-            ));
-        };
-        let mut ip = lock_ip_command(ip)?;
-        local_addresses::load(ip.as_mut())
-    })
-}
-
-pub(super) fn lock_ip_command(
-    ip: &SharedIpCommand,
-) -> Result<MutexGuard<'_, Box<dyn IpCommand + Send>>, TransparentInterceptionError> {
-    ip.lock().map_err(|_| {
-        TransparentInterceptionError::Nftables("ip command mutex is poisoned".to_string())
-    })
+pub(super) fn local_address_inventory(host_routing: SharedHostRouting) -> LocalAddressInventory {
+    Arc::new(move || host_routing.local_addresses())
 }
 
 pub(super) fn apply_nft_script(
@@ -72,15 +55,11 @@ pub(super) fn checked_nft_setup_owner(
     owner_lock.acquire(owner_name)
 }
 
-pub(super) fn apply_ip_command(
-    ip: &mut dyn IpCommand,
-    args: &[String],
-    command_name: &str,
+pub(super) fn apply_policy_route_operation(
+    host_routing: &SharedHostRouting,
+    operation: PolicyRouteOperation,
 ) -> Result<(), TransparentInterceptionError> {
-    let result = ip
-        .run(args)
-        .map_err(|error| TransparentInterceptionError::Nftables(error.to_string()))?;
-    command_success(result, command_name)
+    host_routing.apply_policy_route_operation(operation)
 }
 
 fn command_success(

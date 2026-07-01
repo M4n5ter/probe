@@ -1,10 +1,9 @@
-use std::net::IpAddr;
-
 use attribution::{AttributionError, ProcfsSocketResolver, SocketProcessContext};
-use probe_core::{AddressPort, EventEnvelope, ProcessIdentity, TcpConnection, TcpEndpoint};
+use probe_core::{EventEnvelope, ProcessIdentity, TcpConnection};
 
 pub(super) trait FlowOwnerVerifier {
-    fn verify(&mut self, event: &EventEnvelope) -> FlowOwnerVerification;
+    fn verify(&mut self, event: &EventEnvelope, connection: TcpConnection)
+    -> FlowOwnerVerification;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,15 +44,15 @@ impl<R> FlowOwnerVerifier for ProcfsFlowOwnerVerifier<R>
 where
     R: CurrentSocketOwnerResolver,
 {
-    fn verify(&mut self, event: &EventEnvelope) -> FlowOwnerVerification {
+    fn verify(
+        &mut self,
+        event: &EventEnvelope,
+        connection: TcpConnection,
+    ) -> FlowOwnerVerification {
         let Some(flow) = event.flow() else {
             return FlowOwnerVerification::unsupported(
                 "procfs owner verification requires a flow-scoped trigger event",
             );
-        };
-        let connection = match tcp_connection_from_flow(flow) {
-            Ok(connection) => connection,
-            Err(reason) => return FlowOwnerVerification::unsupported(reason),
         };
 
         self.resolver.invalidate_current_owner_snapshot();
@@ -116,26 +115,6 @@ impl CurrentSocketOwnerResolver for ProcfsSocketOwnerResolver {
     }
 }
 
-fn tcp_connection_from_flow(flow: &probe_core::FlowContext) -> Result<TcpConnection, String> {
-    Ok(TcpConnection::new(
-        tcp_endpoint_from_address_port(&flow.local, "local")?,
-        tcp_endpoint_from_address_port(&flow.remote, "remote")?,
-    ))
-}
-
-fn tcp_endpoint_from_address_port(
-    endpoint: &AddressPort,
-    label: &'static str,
-) -> Result<TcpEndpoint, String> {
-    let address = endpoint.address.parse::<IpAddr>().map_err(|error| {
-        format!(
-            "procfs owner verification cannot parse {label} address {}: {error}",
-            endpoint.address
-        )
-    })?;
-    Ok(TcpEndpoint::new(address, endpoint.port))
-}
-
 fn same_process_identity(expected: &ProcessIdentity, observed: &ProcessIdentity) -> bool {
     expected.tgid == observed.tgid && expected.stable_key() == observed.stable_key()
 }
@@ -158,7 +137,7 @@ mod tests {
 
     use probe_core::{
         AddressPort, CaptureOrigin, CaptureSource, Direction, EventKind, FlowContext, FlowIdentity,
-        OpaqueStream, ProcessContext, Timestamp, TransportProtocol,
+        OpaqueStream, ProcessContext, TcpEndpoint, Timestamp, TransportProtocol,
     };
 
     use super::*;
@@ -177,7 +156,7 @@ mod tests {
         )))]);
         let mut verifier = ProcfsFlowOwnerVerifier::new(resolver.clone());
 
-        let result = verifier.verify(&event);
+        let result = verifier.verify(&event, tcp_connection_from_event(&event));
 
         assert_eq!(
             result,
@@ -206,39 +185,13 @@ mod tests {
         )))]);
         let mut verifier = ProcfsFlowOwnerVerifier::new(resolver.clone());
 
-        let result = verifier.verify(&event);
+        let result = verifier.verify(&event, tcp_connection_from_event(&event));
 
         assert!(matches!(
             result,
             FlowOwnerVerification::Unsupported { reason } if reason.contains("does not match trigger process")
         ));
         assert_eq!(resolver.invalidate_count(), 1);
-    }
-
-    #[test]
-    fn procfs_owner_verifier_rejects_unparseable_flow_without_resolver_lookup() {
-        let event = event_with_process(process_context(42, 42, 7, "/usr/bin/app", "hash"));
-        let mut flow = event.flow().expect("test event is flow scoped").clone();
-        flow.local.address = "not-an-ip".to_string();
-        let event = EventEnvelope::from_flow(
-            event.timestamp(),
-            flow,
-            event.origin(),
-            event.config_version().to_string(),
-            event.kind().clone(),
-        );
-        let resolver = FakeSocketOwnerResolver::with_results([]);
-        let mut verifier = ProcfsFlowOwnerVerifier::new(resolver.clone());
-
-        let result = verifier.verify(&event);
-
-        assert!(matches!(
-            result,
-            FlowOwnerVerification::Unsupported { reason }
-                if reason.contains("cannot parse local address not-an-ip")
-        ));
-        assert!(resolver.requested_connections().is_empty());
-        assert_eq!(resolver.invalidate_count(), 0);
     }
 
     #[test]
@@ -250,7 +203,7 @@ mod tests {
         })]);
         let mut verifier = ProcfsFlowOwnerVerifier::new(resolver.clone());
 
-        let result = verifier.verify(&event);
+        let result = verifier.verify(&event, tcp_connection_from_event(&event));
 
         assert!(matches!(
             result,
@@ -367,6 +320,11 @@ mod tests {
                 reason: "test".to_string(),
             }),
         )
+    }
+
+    fn tcp_connection_from_event(event: &EventEnvelope) -> TcpConnection {
+        TcpConnection::from_flow_context(event.flow().expect("test event is flow scoped"))
+            .expect("test event should have a TCP flow")
     }
 
     fn process_identity(

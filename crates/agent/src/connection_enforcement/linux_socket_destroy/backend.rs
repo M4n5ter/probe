@@ -1,8 +1,8 @@
 use enforcement::{
     EnforcementBackend, EnforcementBackendDecision, EnforcementBackendRequest,
-    linux_socket_destroy::{SsKill, SsKillRequest},
+    linux_socket_destroy::{SocketDestroy, SocketDestroyOutcome, SocketDestroyRequest},
 };
-use probe_core::TransportProtocol;
+use probe_core::TcpConnection;
 
 use super::owner::{FlowOwnerVerification, FlowOwnerVerifier};
 
@@ -22,7 +22,7 @@ impl<R, V> LinuxSocketDestroyBackend<R, V> {
 
 impl<R, V> EnforcementBackend for LinuxSocketDestroyBackend<R, V>
 where
-    R: SsKill + Send,
+    R: SocketDestroy + Send,
     V: FlowOwnerVerifier + Send,
 {
     fn apply(
@@ -42,42 +42,43 @@ where
             ));
         };
 
-        if flow.protocol != TransportProtocol::Tcp {
-            return Ok(EnforcementBackendDecision::unsupported(format!(
-                "linux socket destroy enforcement only supports TCP flows; requested {:?}",
-                flow.protocol
-            )));
-        }
-
-        let (socket_inode, confidence) = match self.owner_verifier.verify(request.trigger) {
-            FlowOwnerVerification::Matched {
-                socket_inode,
-                confidence,
-            } => (socket_inode, confidence),
-            FlowOwnerVerification::Unsupported { reason } => {
-                return Ok(EnforcementBackendDecision::unsupported(reason));
+        let connection = match TcpConnection::from_flow_context(flow) {
+            Ok(connection) => connection,
+            Err(error) => {
+                return Ok(EnforcementBackendDecision::unsupported(format!(
+                    "linux socket destroy enforcement requires a TCP flow with IP endpoints: {error}"
+                )));
             }
         };
 
-        let command = SsKillRequest::from_flow(flow);
+        let (socket_inode, confidence) =
+            match self.owner_verifier.verify(request.trigger, connection) {
+                FlowOwnerVerification::Matched {
+                    socket_inode,
+                    confidence,
+                } => (socket_inode, confidence),
+                FlowOwnerVerification::Unsupported { reason } => {
+                    return Ok(EnforcementBackendDecision::unsupported(reason));
+                }
+            };
+
+        let command = SocketDestroyRequest::from_tcp_connection(connection);
         let result = self
             .runner
-            .kill(&command)
+            .destroy(&command)
             .map_err(|error| enforcement::EnforcementError::Backend(error.to_string()))?;
-        if !result.success {
-            return Err(enforcement::EnforcementError::Backend(
-                result.failure_reason(),
-            ));
-        }
-        if !result.closed_any_socket() {
-            return Ok(EnforcementBackendDecision::unsupported(format!(
-                "ss -K did not close a socket for flow {}",
-                flow.id.0
-            )));
-        }
+        let destroyed_count = match result {
+            SocketDestroyOutcome::Destroyed { count } => count,
+            SocketDestroyOutcome::NoMatchingSocket => {
+                return Ok(EnforcementBackendDecision::unsupported(format!(
+                    "netlink SOCK_DESTROY did not close a socket for flow {}",
+                    flow.id.0
+                )));
+            }
+        };
 
         Ok(EnforcementBackendDecision::applied(format!(
-            "ss -K destroyed TCP socket for flow {} using {:?} after procfs owner verification matched inode {} with confidence {}",
+            "netlink SOCK_DESTROY destroyed {destroyed_count} TCP socket(s) for flow {} using {:?} after procfs owner verification matched inode {} with confidence {}",
             flow.id.0, request.verdict.action, socket_inode, confidence
         )))
     }
@@ -95,20 +96,17 @@ mod tests {
     use probe_core::{
         Action, AddressPort, CaptureOrigin, CaptureSource, Direction, EnforcementDecision,
         EventEnvelope, EventKind, FlowContext, FlowIdentity, OpaqueStream, ProcessContext,
-        ProcessIdentity, ProtectiveActionProfile, Timestamp, Verdict, VerdictScope,
+        ProcessIdentity, ProtectiveActionProfile, TcpConnection, Timestamp, TransportProtocol,
+        Verdict, VerdictScope,
     };
 
     use super::*;
-    use enforcement::linux_socket_destroy::SsKillResult;
 
     #[test]
-    fn linux_socket_destroy_backend_invokes_ss_for_owner_verified_flow()
+    fn linux_socket_destroy_backend_invokes_socket_destroy_for_owner_verified_flow()
     -> Result<(), Box<dyn std::error::Error>> {
-        let runner = FakeSsKill::with_results([Ok(SsKillResult {
-            success: true,
-            stdout: b"ESTAB 0 0 127.0.0.1:41000 127.0.0.1:8080\n".to_vec(),
-            stderr: Vec::new(),
-        })]);
+        let runner =
+            FakeSocketDestroy::with_results([Ok(SocketDestroyOutcome::Destroyed { count: 1 })]);
         let verifier = FakeFlowOwnerVerifier::matched();
         let mut planner = planner_with_runner_and_verifier(runner.clone(), verifier.clone())?;
         let trigger = event_with_protocol(TransportProtocol::Tcp);
@@ -118,10 +116,10 @@ mod tests {
         let requests = runner.requests();
         assert_eq!(
             requests,
-            vec![SsKillRequest {
-                local_address: "127.0.0.1".to_string(),
+            vec![SocketDestroyRequest {
+                local_address: "127.0.0.1".parse()?,
                 local_port: 41000,
-                remote_address: "127.0.0.1".to_string(),
+                remote_address: "127.0.0.1".parse()?,
                 remote_port: 8080,
             }]
         );
@@ -136,6 +134,18 @@ mod tests {
                     .clone()
             ]
         );
+        assert_eq!(
+            verifier.verified_connections(),
+            vec![
+                SocketDestroyRequest {
+                    local_address: "127.0.0.1".parse()?,
+                    local_port: 41000,
+                    remote_address: "127.0.0.1".parse()?,
+                    remote_port: 8080,
+                }
+                .tcp_connection()
+            ]
+        );
         assert_eq!(decision.outcome, probe_core::EnforcementOutcome::Applied);
         assert_eq!(decision.effective_action, Action::Reset);
         Ok(())
@@ -144,11 +154,7 @@ mod tests {
     #[test]
     fn linux_socket_destroy_backend_reports_no_matching_socket_as_unsupported()
     -> Result<(), Box<dyn std::error::Error>> {
-        let runner = FakeSsKill::with_results([Ok(SsKillResult {
-            success: true,
-            stdout: b"\n".to_vec(),
-            stderr: Vec::new(),
-        })]);
+        let runner = FakeSocketDestroy::with_results([Ok(SocketDestroyOutcome::NoMatchingSocket)]);
         let mut planner = planner_with_runner(runner)?;
         let trigger = event_with_protocol(TransportProtocol::Tcp);
 
@@ -165,7 +171,7 @@ mod tests {
     #[test]
     fn linux_socket_destroy_backend_requires_current_socket_owner_match()
     -> Result<(), Box<dyn std::error::Error>> {
-        let runner = FakeSsKill::with_results([]);
+        let runner = FakeSocketDestroy::with_results([]);
         let verifier = FakeFlowOwnerVerifier::unsupported("owner changed");
         let mut planner = planner_with_runner_and_verifier(runner.clone(), verifier.clone())?;
         let trigger = event_with_protocol(TransportProtocol::Tcp);
@@ -190,7 +196,7 @@ mod tests {
         );
         assert!(
             runner.requests().is_empty(),
-            "owner verification failure must not invoke ss -K"
+            "owner verification failure must not invoke socket destroy"
         );
         Ok(())
     }
@@ -198,7 +204,7 @@ mod tests {
     #[test]
     fn linux_socket_destroy_backend_rejects_non_tcp_flows() -> Result<(), Box<dyn std::error::Error>>
     {
-        let runner = FakeSsKill::with_results([]);
+        let runner = FakeSocketDestroy::with_results([]);
         let verifier = FakeFlowOwnerVerifier::matched();
         let mut planner = planner_with_runner_and_verifier(runner.clone(), verifier.clone())?;
         let trigger = event_with_protocol(TransportProtocol::Udp);
@@ -211,7 +217,7 @@ mod tests {
         );
         assert!(
             runner.requests().is_empty(),
-            "non-TCP flows must not invoke ss -K"
+            "non-TCP flows must not invoke socket destroy"
         );
         assert!(
             verifier.verified_flows().is_empty(),
@@ -221,9 +227,34 @@ mod tests {
     }
 
     #[test]
+    fn linux_socket_destroy_backend_rejects_invalid_flow_addresses_before_owner_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runner = FakeSocketDestroy::with_results([]);
+        let verifier = FakeFlowOwnerVerifier::matched();
+        let mut planner = planner_with_runner_and_verifier(runner.clone(), verifier.clone())?;
+        let trigger = event_with_invalid_local_address();
+
+        let decision = evaluate_protective(&mut planner, &trigger, Action::Reset)?;
+
+        assert_eq!(
+            decision.outcome,
+            probe_core::EnforcementOutcome::Unsupported
+        );
+        assert!(
+            runner.requests().is_empty(),
+            "invalid flow endpoints must not invoke socket destroy"
+        );
+        assert!(
+            verifier.verified_flows().is_empty(),
+            "invalid flow endpoints must not invoke owner verification"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn linux_socket_destroy_backend_rejects_replay_source() -> Result<(), Box<dyn std::error::Error>>
     {
-        let runner = FakeSsKill::with_results([]);
+        let runner = FakeSocketDestroy::with_results([]);
         let verifier = FakeFlowOwnerVerifier::matched();
         let mut planner = planner_with_runner_and_verifier(runner.clone(), verifier.clone())?;
         let trigger = event_with_protocol_and_source(TransportProtocol::Tcp, CaptureSource::Replay);
@@ -237,7 +268,7 @@ mod tests {
         assert_eq!(decision.effective_action, Action::Observe);
         assert!(
             runner.requests().is_empty(),
-            "replay events must not invoke ss -K"
+            "replay events must not invoke socket destroy"
         );
         assert!(
             verifier.verified_flows().is_empty(),
@@ -247,42 +278,47 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct FakeSsKill {
-        state: Arc<Mutex<FakeSsKillState>>,
+    struct FakeSocketDestroy {
+        state: Arc<Mutex<FakeSocketDestroyState>>,
     }
 
-    struct FakeSsKillState {
-        requests: Vec<SsKillRequest>,
-        results: VecDeque<io::Result<SsKillResult>>,
+    struct FakeSocketDestroyState {
+        requests: Vec<SocketDestroyRequest>,
+        results: VecDeque<io::Result<SocketDestroyOutcome>>,
     }
 
-    impl FakeSsKill {
-        fn with_results(results: impl IntoIterator<Item = io::Result<SsKillResult>>) -> Self {
+    impl FakeSocketDestroy {
+        fn with_results(
+            results: impl IntoIterator<Item = io::Result<SocketDestroyOutcome>>,
+        ) -> Self {
             Self {
-                state: Arc::new(Mutex::new(FakeSsKillState {
+                state: Arc::new(Mutex::new(FakeSocketDestroyState {
                     requests: Vec::new(),
                     results: results.into_iter().collect(),
                 })),
             }
         }
 
-        fn requests(&self) -> Vec<SsKillRequest> {
+        fn requests(&self) -> Vec<SocketDestroyRequest> {
             self.state
                 .lock()
-                .expect("fake ss state poisoned")
+                .expect("fake socket destroy state poisoned")
                 .requests
                 .clone()
         }
     }
 
-    impl SsKill for FakeSsKill {
-        fn kill(&mut self, request: &SsKillRequest) -> io::Result<SsKillResult> {
-            let mut state = self.state.lock().expect("fake ss state poisoned");
+    impl SocketDestroy for FakeSocketDestroy {
+        fn destroy(&mut self, request: &SocketDestroyRequest) -> io::Result<SocketDestroyOutcome> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("fake socket destroy state poisoned");
             state.requests.push(request.clone());
             state
                 .results
                 .pop_front()
-                .unwrap_or_else(|| panic!("missing fake ss -K result"))
+                .unwrap_or_else(|| panic!("missing fake socket destroy result"))
         }
     }
 
@@ -293,6 +329,7 @@ mod tests {
 
     struct FakeFlowOwnerVerifierState {
         verified_flows: Vec<String>,
+        verified_connections: Vec<TcpConnection>,
         results: VecDeque<FlowOwnerVerification>,
     }
 
@@ -312,6 +349,7 @@ mod tests {
             Self {
                 state: Arc::new(Mutex::new(FakeFlowOwnerVerifierState {
                     verified_flows: Vec::new(),
+                    verified_connections: Vec::new(),
                     results: results.into_iter().collect(),
                 })),
             }
@@ -324,16 +362,29 @@ mod tests {
                 .verified_flows
                 .clone()
         }
+
+        fn verified_connections(&self) -> Vec<TcpConnection> {
+            self.state
+                .lock()
+                .expect("fake owner verifier state poisoned")
+                .verified_connections
+                .clone()
+        }
     }
 
     impl FlowOwnerVerifier for FakeFlowOwnerVerifier {
-        fn verify(&mut self, event: &EventEnvelope) -> FlowOwnerVerification {
+        fn verify(
+            &mut self,
+            event: &EventEnvelope,
+            connection: TcpConnection,
+        ) -> FlowOwnerVerification {
             let mut state = self
                 .state
                 .lock()
                 .expect("fake owner verifier state poisoned");
             let flow = event.flow().expect("test trigger is flow scoped");
             state.verified_flows.push(flow.id.0.clone());
+            state.verified_connections.push(connection);
             state
                 .results
                 .pop_front()
@@ -342,13 +393,13 @@ mod tests {
     }
 
     fn planner_with_runner(
-        runner: FakeSsKill,
+        runner: FakeSocketDestroy,
     ) -> Result<ScopedEnforcementPlanner, enforcement::EnforcementError> {
         planner_with_runner_and_verifier(runner, FakeFlowOwnerVerifier::matched())
     }
 
     fn planner_with_runner_and_verifier(
-        runner: FakeSsKill,
+        runner: FakeSocketDestroy,
         verifier: FakeFlowOwnerVerifier,
     ) -> Result<ScopedEnforcementPlanner, enforcement::EnforcementError> {
         ScopedEnforcementPlanner::with_backend(
@@ -384,6 +435,19 @@ mod tests {
 
     fn event_with_protocol(protocol: TransportProtocol) -> EventEnvelope {
         event_with_protocol_and_source(protocol, CaptureSource::Libpcap)
+    }
+
+    fn event_with_invalid_local_address() -> EventEnvelope {
+        let event = event_with_protocol(TransportProtocol::Tcp);
+        let mut flow = event.flow().expect("test event is flow scoped").clone();
+        flow.local.address = "not-an-ip".to_string();
+        EventEnvelope::from_flow(
+            event.timestamp(),
+            flow,
+            event.origin(),
+            event.config_version().to_string(),
+            event.kind().clone(),
+        )
     }
 
     fn event_with_protocol_and_source(

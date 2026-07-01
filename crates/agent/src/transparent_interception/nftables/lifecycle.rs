@@ -1,9 +1,10 @@
 use super::{
     activation::{
-        SharedIpCommand, apply_ip_command, apply_nft_script, checked_nft_setup_owner,
-        local_address_inventory, lock_ip_command, stop_proxy_best_effort,
+        apply_nft_script, apply_policy_route_operation, checked_nft_setup_owner,
+        local_address_inventory, stop_proxy_best_effort,
     },
-    command::{IpCommand, NftCommand},
+    command::NftCommand,
+    host_routing::{HostRouting, SharedHostRouting},
     owner_lock::{NftablesOwnerLock, NftablesOwnerLockGuard, SystemNftablesOwnerLock},
 };
 use crate::transparent_interception::{
@@ -21,13 +22,15 @@ use interception::TransparentInterceptionHostRuleSet;
 use interception::{TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan};
 #[cfg(test)]
 use probe_config::EnforcementInterceptionConfig;
-use std::sync::{Arc, Mutex};
-use transparent_linux::{InboundTproxyArtifactSpec, InboundTproxyLifecyclePlan};
+use std::sync::Arc;
+use transparent_linux::{
+    InboundTproxyArtifactSpec, InboundTproxyLifecyclePlan, PolicyRouteOperation,
+};
 
 pub(in crate::transparent_interception) struct NftablesTransparentInterception {
     inbound_plan: TransparentInterceptionInboundTproxyPlan,
     nft: Box<dyn NftCommand + Send>,
-    ip: Option<SharedIpCommand>,
+    host_routing: SharedHostRouting,
     owner_lock: Box<dyn NftablesOwnerLock>,
     proxy_runtime: TransparentProxyRuntime,
 }
@@ -36,17 +39,17 @@ impl NftablesTransparentInterception {
     pub(super) fn new<N, I>(
         inbound_plan: TransparentInterceptionInboundTproxyPlan,
         nft: N,
-        ip: Option<I>,
+        host_routing: I,
         proxy_runtime: TransparentProxyRuntime,
     ) -> Self
     where
         N: NftCommand + Send + 'static,
-        I: IpCommand + Send + 'static,
+        I: HostRouting + Send + Sync + 'static,
     {
         Self::with_owner_lock(
             inbound_plan,
             nft,
-            ip,
+            host_routing,
             SystemNftablesOwnerLock::default(),
             proxy_runtime,
         )
@@ -55,29 +58,29 @@ impl NftablesTransparentInterception {
     fn with_owner_lock<N, I, L>(
         inbound_plan: TransparentInterceptionInboundTproxyPlan,
         nft: N,
-        ip: Option<I>,
+        host_routing: I,
         owner_lock: L,
         proxy_runtime: TransparentProxyRuntime,
     ) -> Self
     where
         N: NftCommand + Send + 'static,
-        I: IpCommand + Send + 'static,
+        I: HostRouting + Send + Sync + 'static,
         L: NftablesOwnerLock + 'static,
     {
         Self {
             inbound_plan,
             nft: Box::new(nft),
-            ip: ip.map(|ip| Arc::new(Mutex::new(Box::new(ip) as Box<dyn IpCommand + Send>))),
+            host_routing: Arc::new(host_routing),
             owner_lock: Box::new(owner_lock),
             proxy_runtime,
         }
     }
 
     #[cfg(test)]
-    fn new_for_test<N, I>(config: EnforcementInterceptionConfig, nft: N, ip: Option<I>) -> Self
+    fn new_for_test<N, I>(config: EnforcementInterceptionConfig, nft: N, host_routing: I) -> Self
     where
         N: NftCommand + Send + 'static,
-        I: IpCommand + Send + 'static,
+        I: HostRouting + Send + Sync + 'static,
     {
         let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
             .expect("test transparent interception config should be valid");
@@ -89,7 +92,7 @@ impl NftablesTransparentInterception {
         Self::with_owner_lock(
             inbound_plan,
             nft,
-            ip,
+            host_routing,
             super::owner_lock::NoopNftablesOwnerLock,
             proxy_runtime,
         )
@@ -114,7 +117,7 @@ impl NftablesTransparentInterception {
                 .map(TransparentInterceptionIpFamily::from)
                 .collect(),
             plan.proxy_bypass_mark(),
-            local_address_inventory(self.ip.clone()),
+            local_address_inventory(self.host_routing.clone()),
         )?;
         let setup_script = plan.setup_nft_script();
         let owner_lock = checked_nft_setup_owner(
@@ -147,40 +150,33 @@ impl NftablesTransparentInterception {
         &mut self,
         plan: &InboundTproxyLifecyclePlan,
     ) -> Result<(), TransparentInterceptionError> {
-        if plan.setup_ip_commands().is_empty() {
+        if plan.setup_policy_route_operations().is_empty() {
             return Ok(());
         }
-        let Some(ip) = self.ip.as_ref() else {
-            return Err(TransparentInterceptionError::Nftables(
-                "policy routing command is unavailable".to_string(),
-            ));
-        };
-        let mut ip = lock_ip_command(ip)?;
-        for command in plan.setup_ip_commands() {
-            apply_ip_command(ip.as_mut(), &command, "ip setup")?;
+        for operation in plan.setup_policy_route_operations() {
+            apply_policy_route_operation(&self.host_routing, operation)?;
         }
         Ok(())
     }
 
     fn cleanup_previous_owned_state_best_effort(&mut self, plan: &InboundTproxyLifecyclePlan) {
         let _ = apply_nft_script(self.nft.as_mut(), &plan.cleanup_nft_script(), "nft cleanup");
-        self.cleanup_ip_commands_best_effort(plan.cleanup_all_ip_commands());
+        self.cleanup_policy_route_operations_best_effort(
+            plan.cleanup_all_policy_route_operations(),
+        );
     }
 
     fn cleanup_active_plan_best_effort(&mut self, plan: &InboundTproxyLifecyclePlan) {
         let _ = apply_nft_script(self.nft.as_mut(), &plan.cleanup_nft_script(), "nft cleanup");
-        self.cleanup_ip_commands_best_effort(plan.cleanup_ip_commands());
+        self.cleanup_policy_route_operations_best_effort(plan.cleanup_policy_route_operations());
     }
 
-    fn cleanup_ip_commands_best_effort(&mut self, commands: Vec<Vec<String>>) {
-        let Some(ip) = self.ip.as_ref() else {
-            return;
-        };
-        let Ok(mut ip) = lock_ip_command(ip) else {
-            return;
-        };
-        for command in commands {
-            let _ = apply_ip_command(ip.as_mut(), &command, "ip cleanup");
+    fn cleanup_policy_route_operations_best_effort(
+        &mut self,
+        operations: Vec<PolicyRouteOperation>,
+    ) {
+        for operation in operations {
+            let _ = apply_policy_route_operation(&self.host_routing, operation);
         }
     }
 }
@@ -207,16 +203,9 @@ impl NftablesTransparentInterceptionGuard {
             "nft cleanup",
         );
         let mut route_result = Ok(());
-        if let Some(ip) = inner.ip.as_ref() {
-            match lock_ip_command(ip) {
-                Ok(mut ip) => {
-                    for command in self.plan.cleanup_ip_commands() {
-                        if let Err(error) = apply_ip_command(ip.as_mut(), &command, "ip cleanup") {
-                            route_result = Err(error);
-                        }
-                    }
-                }
-                Err(error) => route_result = Err(error),
+        for operation in self.plan.cleanup_policy_route_operations() {
+            if let Err(error) = apply_policy_route_operation(&inner.host_routing, operation) {
+                route_result = Err(error);
             }
         }
         self.inner = None;
@@ -241,7 +230,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         io,
-        net::{Ipv4Addr, TcpListener},
+        net::{IpAddr, Ipv4Addr, TcpListener},
         sync::{Arc, Mutex},
         thread,
         time::{Duration, Instant},
@@ -253,6 +242,7 @@ mod tests {
     };
     use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
     use runtime::TransparentInterceptionExecutionPlan;
+    use transparent_linux::TransparentLinuxIpFamily;
 
     use crate::transparent_interception::{
         TransparentProxyRuntimeHandle, nftables::owner_lock::NoopNftablesOwnerLock,
@@ -265,13 +255,16 @@ mod tests {
     fn activation_installs_routes_before_nft_and_cleanup_reverses_owned_state()
     -> Result<(), Box<dyn std::error::Error>> {
         let nft = FakeNft::succeeding();
-        let ip = FakeIp::succeeding();
+        let host_routing = FakeHostRouting::new();
         let config = inbound_config();
         let selector = setup_selector();
 
-        let guard =
-            NftablesTransparentInterception::new_for_test(config, nft.clone(), Some(ip.clone()))
-                .activate(setup_scope(&selector))?;
+        let guard = NftablesTransparentInterception::new_for_test(
+            config,
+            nft.clone(),
+            host_routing.clone(),
+        )
+        .activate(setup_scope(&selector))?;
         guard.deactivate()?;
 
         let nft_scripts = nft.scripts();
@@ -279,45 +272,38 @@ mod tests {
         assert!(nft_scripts[0].contains("destroy table inet traffic_probe"));
         assert!(nft_scripts[1].contains("add table inet traffic_probe"));
         assert!(nft_scripts[2].contains("destroy table inet traffic_probe"));
-        let ip_args = ip.args();
+        let operations = host_routing.operations();
         assert_eq!(
-            ip_args[0],
-            string_args(["rule", "del", "fwmark", "0x54500101", "lookup", "45100"])
+            operations[0],
+            PolicyRouteOperation::delete_fwmark_rule(
+                TransparentLinuxIpFamily::Ipv4,
+                0x54500101,
+                45100
+            )
         );
         assert_eq!(
-            ip_args[1],
-            string_args([
-                "route",
-                "del",
-                "local",
-                "0.0.0.0/0",
-                "dev",
-                "lo",
-                "table",
-                "45100"
-            ])
+            operations[1],
+            PolicyRouteOperation::delete_local_route(TransparentLinuxIpFamily::Ipv4, 45100)
         );
         assert_eq!(
-            ip_args[2],
-            string_args([
-                "-6",
-                "rule",
-                "del",
-                "fwmark",
-                "0x54500101",
-                "lookup",
-                "45100"
-            ])
+            operations[2],
+            PolicyRouteOperation::delete_fwmark_rule(
+                TransparentLinuxIpFamily::Ipv6,
+                0x54500101,
+                45100
+            )
         );
         assert_eq!(
-            ip_args[3],
-            string_args([
-                "-6", "route", "del", "local", "::/0", "dev", "lo", "table", "45100"
-            ])
+            operations[3],
+            PolicyRouteOperation::delete_local_route(TransparentLinuxIpFamily::Ipv6, 45100)
         );
         assert_eq!(
-            ip_args[4],
-            string_args(["rule", "add", "fwmark", "0x54500101", "lookup", "45100"])
+            operations[4],
+            PolicyRouteOperation::add_fwmark_rule(
+                TransparentLinuxIpFamily::Ipv4,
+                0x54500101,
+                45100
+            )
         );
         Ok(())
     }
@@ -326,13 +312,13 @@ mod tests {
     fn guard_drop_attempts_cleanup_when_deactivate_is_not_called()
     -> Result<(), Box<dyn std::error::Error>> {
         let nft = FakeNft::succeeding();
-        let ip = FakeIp::succeeding();
+        let host_routing = FakeHostRouting::new();
         let selector = setup_selector();
 
         let guard = NftablesTransparentInterception::new_for_test(
             inbound_config(),
             nft.clone(),
-            Some(ip.clone()),
+            host_routing.clone(),
         )
         .activate(setup_scope(&selector))?;
         drop(guard);
@@ -340,7 +326,7 @@ mod tests {
         let nft_scripts = nft.scripts();
         assert_eq!(nft_scripts.len(), 3);
         assert!(nft_scripts[2].contains("destroy table inet traffic_probe"));
-        assert!(ip.args().len() >= 8);
+        assert!(host_routing.operations().len() >= 8);
         Ok(())
     }
 
@@ -355,12 +341,12 @@ mod tests {
             }),
             Ok(success()),
         ]);
-        let ip = FakeIp::succeeding();
+        let host_routing = FakeHostRouting::new();
 
         let error = match NftablesTransparentInterception::new_for_test(
             inbound_config(),
             nft.clone(),
-            Some(ip),
+            host_routing,
         )
         .activate(setup_scope(&setup_selector()))
         {
@@ -379,12 +365,12 @@ mod tests {
             stdout: Vec::new(),
             stderr: b"syntax rejected".to_vec(),
         })]);
-        let ip = FakeIp::succeeding();
+        let host_routing = FakeHostRouting::new();
 
         let error = match NftablesTransparentInterception::new_for_test(
             inbound_config(),
             nft.clone(),
-            Some(ip.clone()),
+            host_routing.clone(),
         )
         .activate(setup_scope(&setup_selector()))
         {
@@ -395,14 +381,14 @@ mod tests {
         assert!(error.to_string().contains("syntax rejected"));
         assert_eq!(nft.checked_scripts().len(), 1);
         assert!(nft.scripts().is_empty());
-        assert!(ip.args().is_empty());
+        assert!(host_routing.operations().is_empty());
     }
 
     #[test]
     fn activation_starts_configured_health_probe() -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let nft = FakeNft::succeeding();
-        let ip = FakeIp::succeeding();
+        let host_routing = FakeHostRouting::new();
         let mut config = inbound_config();
         config.proxy.health_probe = TransparentInterceptionProxyHealthProbeConfig {
             target: Some(listener.local_addr()?.to_string()),
@@ -421,7 +407,7 @@ mod tests {
         let lifecycle = NftablesTransparentInterception::with_owner_lock(
             inbound_plan,
             nft,
-            Some(ip),
+            host_routing,
             NoopNftablesOwnerLock,
             runtime,
         );
@@ -437,11 +423,8 @@ mod tests {
     #[test]
     fn activation_rejects_health_probe_target_on_local_relay_listener_before_host_mutation() {
         let nft = FakeNft::succeeding();
-        let ip = FakeIp::with_results([Ok(CommandResult {
-            success: true,
-            stdout: br#"[{"addr_info":[{"local":"192.0.2.10"}]}]"#.to_vec(),
-            stderr: Vec::new(),
-        })]);
+        let host_routing =
+            FakeHostRouting::with_local_addresses([IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]);
         let mut config = inbound_config();
         config.proxy.mode = probe_config::TransparentInterceptionProxyModeConfig::ManagedTcpRelay;
         config.proxy.health_probe = TransparentInterceptionProxyHealthProbeConfig {
@@ -454,7 +437,7 @@ mod tests {
         let error = match NftablesTransparentInterception::new_for_test(
             config,
             nft.clone(),
-            Some(ip.clone()),
+            host_routing.clone(),
         )
         .activate(setup_scope(&setup_selector()))
         {
@@ -464,14 +447,14 @@ mod tests {
 
         assert!(error.to_string().contains("local relay listener"));
         assert!(nft.scripts().is_empty());
-        assert_eq!(ip.args(), vec![string_args(["-j", "address", "show"])]);
+        assert!(host_routing.operations().is_empty());
     }
 
     #[test]
     fn startup_cleanup_removes_all_owned_route_families_before_projected_install()
     -> Result<(), Box<dyn std::error::Error>> {
         let nft = FakeNft::succeeding();
-        let ip = FakeIp::succeeding();
+        let host_routing = FakeHostRouting::new();
         let selector = Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -482,63 +465,50 @@ mod tests {
             },
         );
 
-        let guard =
-            NftablesTransparentInterception::new_for_test(inbound_config(), nft, Some(ip.clone()))
-                .activate(setup_scope(&selector))?;
+        let guard = NftablesTransparentInterception::new_for_test(
+            inbound_config(),
+            nft,
+            host_routing.clone(),
+        )
+        .activate(setup_scope(&selector))?;
         guard.deactivate()?;
 
-        let ip_args = ip.args();
+        let operations = host_routing.operations();
         assert_eq!(
-            ip_args[0],
-            string_args(["rule", "del", "fwmark", "0x54500101", "lookup", "45100"])
+            operations[0],
+            PolicyRouteOperation::delete_fwmark_rule(
+                TransparentLinuxIpFamily::Ipv4,
+                0x54500101,
+                45100
+            )
         );
         assert_eq!(
-            ip_args[1],
-            string_args([
-                "route",
-                "del",
-                "local",
-                "0.0.0.0/0",
-                "dev",
-                "lo",
-                "table",
-                "45100"
-            ])
+            operations[1],
+            PolicyRouteOperation::delete_local_route(TransparentLinuxIpFamily::Ipv4, 45100)
         );
         assert_eq!(
-            ip_args[2],
-            string_args([
-                "-6",
-                "rule",
-                "del",
-                "fwmark",
-                "0x54500101",
-                "lookup",
-                "45100"
-            ])
+            operations[2],
+            PolicyRouteOperation::delete_fwmark_rule(
+                TransparentLinuxIpFamily::Ipv6,
+                0x54500101,
+                45100
+            )
         );
         assert_eq!(
-            ip_args[3],
-            string_args([
-                "-6", "route", "del", "local", "::/0", "dev", "lo", "table", "45100"
-            ])
+            operations[3],
+            PolicyRouteOperation::delete_local_route(TransparentLinuxIpFamily::Ipv6, 45100)
         );
         assert_eq!(
-            ip_args[4],
-            string_args(["rule", "add", "fwmark", "0x54500101", "lookup", "45100"])
+            operations[4],
+            PolicyRouteOperation::add_fwmark_rule(
+                TransparentLinuxIpFamily::Ipv4,
+                0x54500101,
+                45100
+            )
         );
         assert_eq!(
-            ip_args[5],
-            string_args([
-                "route",
-                "replace",
-                "local",
-                "0.0.0.0/0",
-                "dev",
-                "lo",
-                "table",
-                "45100"
-            ])
+            operations[5],
+            PolicyRouteOperation::replace_local_route(TransparentLinuxIpFamily::Ipv4, 45100)
         );
         Ok(())
     }
@@ -576,10 +546,6 @@ mod tests {
             TransparentInterceptionSetupPlan::HostRules(rules) => rules,
             _ => panic!("test selector should project to host rules"),
         }
-    }
-
-    fn string_args<const N: usize>(args: [&str; N]) -> Vec<String> {
-        args.into_iter().map(ToString::to_string).collect()
     }
 
     fn success() -> CommandResult {
@@ -679,39 +645,58 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct FakeIp {
-        state: Arc<Mutex<FakeIpState>>,
+    struct FakeHostRouting {
+        state: Arc<Mutex<FakeHostRoutingState>>,
     }
 
-    struct FakeIpState {
-        args: Vec<Vec<String>>,
-        results: VecDeque<io::Result<CommandResult>>,
+    struct FakeHostRoutingState {
+        local_addresses: Vec<IpAddr>,
+        operations: Vec<PolicyRouteOperation>,
     }
 
-    impl FakeIp {
-        fn succeeding() -> Self {
-            Self::with_results(std::iter::repeat_with(|| Ok(success())).take(16))
+    impl FakeHostRouting {
+        fn new() -> Self {
+            Self::with_local_addresses([])
         }
 
-        fn with_results(results: impl IntoIterator<Item = io::Result<CommandResult>>) -> Self {
+        fn with_local_addresses(addresses: impl IntoIterator<Item = IpAddr>) -> Self {
             Self {
-                state: Arc::new(Mutex::new(FakeIpState {
-                    args: Vec::new(),
-                    results: results.into_iter().collect(),
+                state: Arc::new(Mutex::new(FakeHostRoutingState {
+                    local_addresses: addresses.into_iter().collect(),
+                    operations: Vec::new(),
                 })),
             }
         }
 
-        fn args(&self) -> Vec<Vec<String>> {
-            self.state.lock().expect("fake ip lock").args.clone()
+        fn operations(&self) -> Vec<PolicyRouteOperation> {
+            self.state
+                .lock()
+                .expect("fake host routing lock")
+                .operations
+                .clone()
         }
     }
 
-    impl IpCommand for FakeIp {
-        fn run(&mut self, args: &[String]) -> io::Result<CommandResult> {
-            let mut state = self.state.lock().expect("fake ip lock");
-            state.args.push(args.to_vec());
-            state.results.pop_front().unwrap_or_else(|| Ok(success()))
+    impl HostRouting for FakeHostRouting {
+        fn local_addresses(&self) -> Result<Vec<IpAddr>, TransparentInterceptionError> {
+            Ok(self
+                .state
+                .lock()
+                .expect("fake host routing lock")
+                .local_addresses
+                .clone())
+        }
+
+        fn apply_policy_route_operation(
+            &self,
+            operation: PolicyRouteOperation,
+        ) -> Result<(), TransparentInterceptionError> {
+            self.state
+                .lock()
+                .expect("fake host routing lock")
+                .operations
+                .push(operation);
+            Ok(())
         }
     }
 }

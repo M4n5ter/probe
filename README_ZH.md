@@ -109,9 +109,27 @@ cargo run -p xtask --locked -- e2e-suite --profile baseline
 - 支持 edition 2024 的 stable Rust；
 - 默认 agent build 需要 `libpcap` development headers 和 `pkg-config`；
 - live capture、eBPF、socket destroy、transparent interception 或 MITM 测试需要 root 或对应 Linux capability；
-- 启用 `enforcement.backend = "linux_socket_destroy"` 时需要带 `ss` 的
-  `iproute2`；
+- 运行 Linux transparent interception 时需要 `nftables` package；
 - 只有构建 eBPF artifact 时才需要带 `rust-src` 的 nightly Rust 和 `bpf-linker`。
+
+常见 `nft` 安装命令：
+
+```bash
+# Debian / Ubuntu
+sudo apt install nftables
+
+# Fedora / RHEL / Rocky / Alma
+sudo dnf install nftables
+
+# Arch
+sudo pacman -S nftables
+
+# Alpine
+sudo apk add nftables
+```
+
+`nft` 缺失时，agent capability probe 会先读取 `/etc/os-release`，未知发行版再探测常见
+package manager。probe 自身已经以 root 运行时，报告的安装命令不会带 `sudo`。
 
 运行 MITM E2E 时构建 first-party MITM proxy 和 fixture：
 
@@ -667,9 +685,9 @@ directions = ["outbound"]
 remote_addresses = []
 ```
 
-Linux socket destroy 只关闭已存在的 TCP socket。它使用 `iproute2` 提供的
-`ss -K`，agent 只接受受信系统路径中的命令，并在 capability 可用前执行 active loopback
-self-test。它不是 pre-connect deny、UDP blocking，也不是 payload-level blocking。
+Linux socket destroy 只关闭已存在的 TCP socket。它使用 `NETLINK_SOCK_DIAG`
+和 `SOCK_DESTROY`，并在 capability 可用前执行 active loopback self-test。
+它不是 pre-connect deny、UDP blocking，也不是 payload-level blocking。
 
 Transparent MITM 是独立 strategy。它需要 root/net-admin、operator-managed client trust、
 certificate material refs、proxy listener 设置、backend readiness、plaintext bridge 配置和

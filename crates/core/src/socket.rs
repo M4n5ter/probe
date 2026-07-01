@@ -1,13 +1,13 @@
 use std::{
     fmt,
-    net::{IpAddr, SocketAddr},
+    net::{AddrParseError, IpAddr, SocketAddr},
     str::FromStr,
 };
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::identity::AddressPort;
+use crate::identity::{AddressPort, FlowContext, TransportProtocol};
 
 impl From<TcpEndpoint> for AddressPort {
     fn from(endpoint: TcpEndpoint) -> Self {
@@ -40,6 +40,45 @@ impl TcpConnection {
     pub fn new(local: TcpEndpoint, remote: TcpEndpoint) -> Self {
         Self { local, remote }
     }
+
+    pub fn from_flow_context(flow: &FlowContext) -> Result<Self, TcpConnectionFromFlowError> {
+        if flow.protocol != TransportProtocol::Tcp {
+            return Err(TcpConnectionFromFlowError::UnsupportedTransport {
+                protocol: flow.protocol,
+            });
+        }
+        Ok(Self::new(
+            tcp_endpoint_from_address_port(&flow.local, "local")?,
+            tcp_endpoint_from_address_port(&flow.remote, "remote")?,
+        ))
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum TcpConnectionFromFlowError {
+    #[error("tcp connection requires TCP flow, got {protocol:?}")]
+    UnsupportedTransport { protocol: TransportProtocol },
+
+    #[error("cannot parse {label} address {value}: {source}")]
+    InvalidEndpointAddress {
+        label: &'static str,
+        value: String,
+        source: AddrParseError,
+    },
+}
+
+fn tcp_endpoint_from_address_port(
+    endpoint: &AddressPort,
+    label: &'static str,
+) -> Result<TcpEndpoint, TcpConnectionFromFlowError> {
+    let address = endpoint.address.parse::<IpAddr>().map_err(|source| {
+        TcpConnectionFromFlowError::InvalidEndpointAddress {
+            label,
+            value: endpoint.address.clone(),
+            source,
+        }
+    })?;
+    Ok(TcpEndpoint::new(address, endpoint.port))
 }
 
 pub fn socket_addr_points_to_listener(target: SocketAddr, listener: SocketAddr) -> bool {
@@ -287,6 +326,9 @@ fn is_unspecified(address: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        AddressPort, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, TransportProtocol,
+    };
 
     #[test]
     fn upstream_route_host_normalization_is_case_insensitive_and_strict() {
@@ -358,5 +400,86 @@ mod tests {
             "127.0.0.1:15003".parse().expect("target"),
             "127.0.0.1:15002".parse().expect("listener")
         ));
+    }
+
+    #[test]
+    fn tcp_connection_from_flow_context_parses_tcp_ip_endpoints() {
+        let flow = tcp_flow("192.0.2.10", 41000, "198.51.100.20", 443);
+
+        assert_eq!(
+            TcpConnection::from_flow_context(&flow).expect("TCP flow should parse"),
+            TcpConnection::new(
+                TcpEndpoint::new("192.0.2.10".parse().expect("local IP"), 41000),
+                TcpEndpoint::new("198.51.100.20".parse().expect("remote IP"), 443),
+            )
+        );
+    }
+
+    #[test]
+    fn tcp_connection_from_flow_context_rejects_non_tcp_flow() {
+        let mut flow = tcp_flow("192.0.2.10", 41000, "198.51.100.20", 443);
+        flow.protocol = TransportProtocol::Udp;
+
+        assert!(matches!(
+            TcpConnection::from_flow_context(&flow),
+            Err(TcpConnectionFromFlowError::UnsupportedTransport {
+                protocol: TransportProtocol::Udp
+            })
+        ));
+    }
+
+    #[test]
+    fn tcp_connection_from_flow_context_rejects_invalid_endpoint_address() {
+        let flow = tcp_flow("not-an-ip", 41000, "198.51.100.20", 443);
+
+        assert!(matches!(
+            TcpConnection::from_flow_context(&flow),
+            Err(TcpConnectionFromFlowError::InvalidEndpointAddress {
+                label: "local",
+                value,
+                ..
+            }) if value == "not-an-ip"
+        ));
+    }
+
+    fn tcp_flow(
+        local_address: &str,
+        local_port: u16,
+        remote_address: &str,
+        remote_port: u16,
+    ) -> FlowContext {
+        FlowContext {
+            id: FlowIdentity("flow-1".to_string()),
+            process: ProcessContext {
+                identity: ProcessIdentity {
+                    pid: 42,
+                    tgid: 42,
+                    start_time_ticks: 1,
+                    boot_id: "boot".to_string(),
+                    exe_path: "/usr/bin/app".to_string(),
+                    cmdline_hash: "hash".to_string(),
+                    uid: 1000,
+                    gid: 1000,
+                    cgroup: None,
+                    systemd_service: None,
+                    container_id: None,
+                    runtime_hint: None,
+                },
+                name: "app".to_string(),
+                cmdline: vec!["app".to_string()],
+            },
+            local: AddressPort {
+                address: local_address.to_string(),
+                port: local_port,
+            },
+            remote: AddressPort {
+                address: remote_address.to_string(),
+                port: remote_port,
+            },
+            protocol: TransportProtocol::Tcp,
+            start_monotonic_ns: 1,
+            socket_cookie: None,
+            attribution_confidence: 100,
+        }
     }
 }

@@ -5,8 +5,8 @@ use interception::TransparentInterceptionHostRuleSet;
 use interception::{TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan};
 
 use super::{
-    InboundTproxyArtifactSpec, TransparentLinuxIpFamily, TransparentLinuxPlanError,
-    cleanup_all_policy_route_ip_commands, hex_mark,
+    InboundTproxyArtifactSpec, PolicyRouteOperation, TransparentLinuxIpFamily,
+    TransparentLinuxPlanError, cleanup_all_policy_route_operations, hex_mark,
     projection::{NftFamily, NftRule, NftSelectorProjection},
 };
 
@@ -67,32 +67,32 @@ impl InboundTproxyLifecyclePlan {
         format!("destroy table inet {}\n", self.table_name)
     }
 
-    pub fn setup_ip_commands(&self) -> Vec<Vec<String>> {
+    pub fn setup_policy_route_operations(&self) -> Vec<PolicyRouteOperation> {
         self.policy_route_families()
             .into_iter()
             .flat_map(|family| {
                 [
-                    family.rule_command("add", self.mark, self.route_table),
-                    family.route_command("replace", self.route_table),
+                    PolicyRouteOperation::add_fwmark_rule(family, self.mark, self.route_table),
+                    PolicyRouteOperation::replace_local_route(family, self.route_table),
                 ]
             })
             .collect()
     }
 
-    pub fn cleanup_ip_commands(&self) -> Vec<Vec<String>> {
+    pub fn cleanup_policy_route_operations(&self) -> Vec<PolicyRouteOperation> {
         self.policy_route_families()
             .into_iter()
             .flat_map(|family| {
                 [
-                    family.rule_command("del", self.mark, self.route_table),
-                    family.route_command("del", self.route_table),
+                    PolicyRouteOperation::delete_fwmark_rule(family, self.mark, self.route_table),
+                    PolicyRouteOperation::delete_local_route(family, self.route_table),
                 ]
             })
             .collect()
     }
 
-    pub fn cleanup_all_ip_commands(&self) -> Vec<Vec<String>> {
-        cleanup_all_policy_route_ip_commands(self.mark, self.route_table)
+    pub fn cleanup_all_policy_route_operations(&self) -> Vec<PolicyRouteOperation> {
+        cleanup_all_policy_route_operations(self.mark, self.route_table)
     }
 
     pub fn proxy_bypass_mark(&self) -> NonZeroU32 {
@@ -197,19 +197,14 @@ mod tests {
             ]
         );
         assert_eq!(
-            plan.setup_ip_commands(),
+            plan.setup_policy_route_operations(),
             vec![
-                vec!["rule", "add", "fwmark", "0x54500101", "lookup", "45100"],
-                vec![
-                    "route",
-                    "replace",
-                    "local",
-                    "0.0.0.0/0",
-                    "dev",
-                    "lo",
-                    "table",
-                    "45100"
-                ],
+                PolicyRouteOperation::add_fwmark_rule(
+                    TransparentLinuxIpFamily::Ipv4,
+                    0x54500101,
+                    45100
+                ),
+                PolicyRouteOperation::replace_local_route(TransparentLinuxIpFamily::Ipv4, 45100),
             ]
         );
     }
@@ -277,31 +272,20 @@ mod tests {
         .expect("selector should be projectable");
 
         assert_eq!(
-            plan.setup_ip_commands(),
+            plan.setup_policy_route_operations(),
             vec![
-                vec!["rule", "add", "fwmark", "0x54500101", "lookup", "45100"],
-                vec![
-                    "route",
-                    "replace",
-                    "local",
-                    "0.0.0.0/0",
-                    "dev",
-                    "lo",
-                    "table",
-                    "45100"
-                ],
-                vec![
-                    "-6",
-                    "rule",
-                    "add",
-                    "fwmark",
-                    "0x54500101",
-                    "lookup",
-                    "45100"
-                ],
-                vec![
-                    "-6", "route", "replace", "local", "::/0", "dev", "lo", "table", "45100"
-                ],
+                PolicyRouteOperation::add_fwmark_rule(
+                    TransparentLinuxIpFamily::Ipv4,
+                    0x54500101,
+                    45100
+                ),
+                PolicyRouteOperation::replace_local_route(TransparentLinuxIpFamily::Ipv4, 45100),
+                PolicyRouteOperation::add_fwmark_rule(
+                    TransparentLinuxIpFamily::Ipv6,
+                    0x54500101,
+                    45100
+                ),
+                PolicyRouteOperation::replace_local_route(TransparentLinuxIpFamily::Ipv6, 45100),
             ]
         );
     }

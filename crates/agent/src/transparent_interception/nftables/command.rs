@@ -14,10 +14,6 @@ pub(super) trait NftCommand {
     fn check(&mut self, script: &str) -> io::Result<CommandResult>;
 }
 
-pub(super) trait IpCommand {
-    fn run(&mut self, args: &[String]) -> io::Result<CommandResult>;
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CommandResult {
     pub(super) success: bool,
@@ -59,30 +55,8 @@ impl NftCommand for SystemNft {
     }
 }
 
-pub(super) struct SystemIp {
-    command: PathBuf,
-}
-
-impl SystemIp {
-    pub(super) fn new(command: PathBuf) -> Self {
-        Self { command }
-    }
-}
-
-impl IpCommand for SystemIp {
-    fn run(&mut self, args: &[String]) -> io::Result<CommandResult> {
-        run_command(Command::new(&self.command).args(args))
-    }
-}
-
 pub(super) fn find_nft_command() -> Option<PathBuf> {
     trusted_nft_paths()
-        .into_iter()
-        .find(|candidate| is_executable_file(candidate))
-}
-
-pub(super) fn find_ip_command() -> Option<PathBuf> {
-    trusted_ip_paths()
         .into_iter()
         .find(|candidate| is_executable_file(candidate))
 }
@@ -93,10 +67,6 @@ pub(super) fn is_root() -> bool {
 
 fn trusted_nft_paths() -> impl IntoIterator<Item = PathBuf> {
     ["/usr/sbin/nft", "/usr/bin/nft", "/sbin/nft", "/bin/nft"].map(PathBuf::from)
-}
-
-fn trusted_ip_paths() -> impl IntoIterator<Item = PathBuf> {
-    ["/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip", "/bin/ip"].map(PathBuf::from)
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -118,11 +88,6 @@ fn run_with_script(command: &mut Command, script: &str) -> io::Result<CommandRes
     stdin.write_all(script.as_bytes())?;
     drop(stdin);
     wait_with_timeout(child)
-}
-
-fn run_command(command: &mut Command) -> io::Result<CommandResult> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    wait_with_timeout(command.spawn()?)
 }
 
 fn wait_with_timeout(mut child: std::process::Child) -> io::Result<CommandResult> {

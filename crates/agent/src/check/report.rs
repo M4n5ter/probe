@@ -204,12 +204,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let error = ConfigValidationError::new(vec![ConfigViolation {
             field: "enforcement.backend".to_string(),
-            reason: "linux socket destroy enforcement requires ss at a trusted system path"
+            reason: "linux socket destroy enforcement requires netlink SOCK_DESTROY support"
                 .to_string(),
         }]);
         let capabilities = CapabilityMatrix::new([CapabilityState::unavailable(
             CapabilityKind::ConnectionEnforcement,
-            "linux socket destroy enforcement requires ss at a trusted system path",
+            "linux socket destroy enforcement requires netlink SOCK_DESTROY support",
         )]);
 
         let report = build_invalid_config_report(&error, capabilities);
@@ -222,7 +222,7 @@ mod tests {
         );
         assert_eq!(
             value["validation"]["violations"][0]["reason"],
-            json!("linux socket destroy enforcement requires ss at a trusted system path")
+            json!("linux socket destroy enforcement requires netlink SOCK_DESTROY support")
         );
         assert_eq!(
             value["capabilities"]["states"][0]["kind"],
@@ -234,7 +234,7 @@ mod tests {
         );
         assert_eq!(
             value["capabilities"]["states"][0]["reason"],
-            json!("linux socket destroy enforcement requires ss at a trusted system path")
+            json!("linux socket destroy enforcement requires netlink SOCK_DESTROY support")
         );
         Ok(())
     }
