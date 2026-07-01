@@ -1562,7 +1562,7 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 - 每个 bundle 应用自己的 selector。
 - 每个 bundle 有独立的 `runtime_error_disable_threshold`；默认 `3`，`0` 表示只审计 runtime error 而不自动禁用。
 - 每个 bundle 产出带 `policy_version` 的 alert/verdict/enforcement audit event。
-- `check` 和 `run` 会显式加载 source、校验 manifest、编译 Lua 并验证声明 hook。
+- `check` 和 `run` 会显式加载 source、校验 manifest、执行 main Lua source、对声明 module 做语法预检，并验证声明 hook。
 - offline `status` 只做 source metadata/manifest 可见性检查，不执行 Lua，并报告配置的 runtime error disable threshold。
 - online admin status 会叠加运行中 policy runtime state，报告连续 runtime error 计数和 disabled reason。
 - remote policy bundle source 在 offline `status` 中不发网络请求，只报告 endpoint 和 body budget metadata。
@@ -2707,7 +2707,7 @@ Manifest contract：
 | `id` | policy 身份。 | 必须与 runtime config 中的 `policies[].id` 一致。 |
 | `version` | policy 版本。 | 进入 `policy_version`，用于 alert/verdict/enforcement audit event。 |
 | `hooks` | Lua callback 列表。 | 使用 typed policy hook enum；callback name 见下方。 |
-| `modules` | bundle-local Lua module name 列表。 | 每个 name 必须是 dotted Lua identifier；最多 64 个；本地映射到 `modules/<segments>.lua`，远端必须有同名 `[[modules]]` source。 |
+| `modules` | bundle-local Lua module name 列表。 | 每个 name 必须是 dotted Lua identifier；最多 64 个；本地映射到 `modules/<segments>.lua`，远端必须有同名 `[[modules]]` source；所有声明 module 在激活前做语法预检；module source 是 Lua chunk，用 `return` 返回 module value。 |
 
 Manifest hook names：
 
@@ -2732,7 +2732,7 @@ checksum/signature 和非 manifest 声明的 bundle-local `lib/` 都是目标能
 1. 读取 source。
 2. 校验 manifest。
 3. 读取并校验 manifest 声明的 bundle-local modules。
-4. 在独立 Lua VM 中安装受限 module loader 并编译 Lua source。
+4. 在独立 Lua VM 中安装受限 module loader，执行 main Lua source 以安装 hook，并对所有声明 module 做语法预检；module body 仍在首次 `require` 时执行。
 5. 校验 manifest 声明的每个 hook 都在 Lua VM 中定义为函数。
 6. 通过后原子切换 active policy set。
 7. 失败时不切换当前 active policy set。

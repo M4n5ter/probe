@@ -41,6 +41,10 @@ Bundle-local modules are loaded with `require("guard.matcher")`. Module names
 must be dotted Lua identifiers and map to `modules/guard/matcher.lua` in local
 bundles. Undeclared modules, duplicate module names, symlinked module files, and
 oversized module sources are rejected. A bundle may declare up to 64 modules.
+Every declared module is syntax-checked before the bundle becomes active, but
+module bodies still execute lazily on first `require`. Module source is a Lua
+chunk; return a module value explicitly with `return M` rather than using a bare
+expression.
 
 ## Runtime Model
 

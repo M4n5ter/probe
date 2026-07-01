@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     fmt,
     str::FromStr,
     sync::{
@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
+use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use probe_core::{Action, DomainEvent, EventEnvelope, EventType, Verdict};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -249,6 +249,7 @@ impl PolicyRuntime {
         install_instruction_budget(&lua, Arc::clone(&instruction_budget))?;
         install_probe_api(&lua)?;
         remove_host_capabilities(&lua)?;
+        validate_bundle_modules(&lua, modules.as_ref())?;
         install_bundle_module_loader(&lua, modules)?;
         instruction_budget.store(limits.instruction_budget, Ordering::Relaxed);
         lua.load(source).set_name(&manifest.id).exec()?;
@@ -306,8 +307,8 @@ impl PolicyRuntime {
 
 fn build_module_registry(
     modules: Vec<PolicyModule>,
-) -> Result<Arc<HashMap<String, String>>, PolicyError> {
-    let mut registry = HashMap::with_capacity(modules.len());
+) -> Result<Arc<BTreeMap<String, String>>, PolicyError> {
+    let mut registry = BTreeMap::new();
     for module in modules {
         if registry
             .insert(module.name.clone(), module.source)
@@ -319,6 +320,22 @@ fn build_module_registry(
         }
     }
     Ok(Arc::new(registry))
+}
+
+fn validate_bundle_modules(
+    lua: &Lua,
+    modules: &BTreeMap<String, String>,
+) -> Result<(), mlua::Error> {
+    for (module, source) in modules {
+        compile_bundle_module(lua, module, source)?;
+    }
+    Ok(())
+}
+
+fn compile_bundle_module(lua: &Lua, module: &str, source: &str) -> Result<Function, mlua::Error> {
+    lua.load(source)
+        .set_name(format!("@policy-module:{module}"))
+        .into_function()
 }
 
 fn policy_stdlibs() -> StdLib {
@@ -396,7 +413,7 @@ fn remove_host_capabilities(lua: &Lua) -> Result<(), mlua::Error> {
 
 fn install_bundle_module_loader(
     lua: &Lua,
-    modules: Arc<HashMap<String, String>>,
+    modules: Arc<BTreeMap<String, String>>,
 ) -> Result<(), mlua::Error> {
     let cache = lua.create_table()?;
     lua.set_named_registry_value(POLICY_MODULE_CACHE_REGISTRY_KEY, cache)?;
@@ -422,10 +439,8 @@ fn install_bundle_module_loader(
             )));
         }
         loading.set(module.as_str(), true)?;
-        let loaded = match lua
-            .load(source.as_str())
-            .set_name(format!("@policy-module:{module}"))
-            .eval::<Value>()
+        let loaded = match compile_bundle_module(lua, module.as_str(), source)
+            .and_then(|function| function.call::<Value>(()))
         {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -995,6 +1010,73 @@ mod tests {
             result,
             Err(PolicyError::DuplicateModule { module }) if module == "guard.matcher"
         ));
+    }
+
+    #[test]
+    fn lua_policy_rejects_unused_bundle_module_syntax_error() {
+        let result = PolicyRuntime::from_bundle_with_required_hooks(
+            PolicyManifest {
+                id: "unused-broken-module".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::HttpRequestHeaders],
+            },
+            r#"
+            function on_http_request_headers(_)
+              return nil
+            end
+            "#,
+            vec![PolicyModule {
+                name: "guard.broken".to_string(),
+                source: "function broken(".to_string(),
+            }],
+        );
+
+        assert!(matches!(result, Err(PolicyError::Init(_))));
+    }
+
+    #[test]
+    fn lua_policy_rejects_expression_only_bundle_module_source() {
+        let result = PolicyRuntime::from_bundle_with_required_hooks(
+            PolicyManifest {
+                id: "expression-module".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::HttpRequestHeaders],
+            },
+            r#"
+            function on_http_request_headers(_)
+              return nil
+            end
+            "#,
+            vec![PolicyModule {
+                name: "guard.matcher".to_string(),
+                source: "{ matches = function(_) return true end }".to_string(),
+            }],
+        );
+
+        assert!(matches!(result, Err(PolicyError::Init(_))));
+    }
+
+    #[test]
+    fn lua_policy_does_not_execute_bundle_module_during_syntax_preflight()
+    -> Result<(), Box<dyn std::error::Error>> {
+        PolicyRuntime::from_bundle_with_required_hooks(
+            PolicyManifest {
+                id: "unused-runtime-broken-module".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::HttpRequestHeaders],
+            },
+            r#"
+            function on_http_request_headers(_)
+              return nil
+            end
+            "#,
+            vec![PolicyModule {
+                name: "guard.unused".to_string(),
+                source: r#"error("module body should stay lazy")"#.to_string(),
+            }],
+        )?;
+
+        Ok(())
     }
 
     #[test]
