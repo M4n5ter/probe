@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 
@@ -7,12 +7,16 @@ use crate::{
     error::AgentError,
 };
 
-#[derive(Debug, Clone, Copy, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub(super) enum AdminCliCommand {
     Status,
     Metrics,
     PrometheusMetrics,
     DebugDump,
+    PlanConfigReload {
+        #[arg(long)]
+        config: PathBuf,
+    },
     ReloadPolicies,
     ReloadEnforcementPolicy,
 }
@@ -21,6 +25,7 @@ pub(super) async fn run_admin_command(
     socket: &Path,
     command: AdminCliCommand,
 ) -> Result<(), AgentError> {
+    let print_prometheus = matches!(command, AdminCliCommand::PrometheusMetrics);
     let response = send_admin_json_request(socket, admin_request(command)).await?;
     if response.get("kind").and_then(|kind| kind.as_str()) == Some("error") {
         let message = response
@@ -29,7 +34,7 @@ pub(super) async fn run_admin_command(
             .unwrap_or("admin command returned an error");
         return Err(AgentError::AdminCommand(message.to_string()));
     }
-    if matches!(command, AdminCliCommand::PrometheusMetrics)
+    if print_prometheus
         && let Some(metrics) = response.get("metrics").and_then(|metrics| metrics.as_str())
     {
         print!("{metrics}");
@@ -45,6 +50,9 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
         AdminCliCommand::Metrics => AdminRequest::Metrics,
         AdminCliCommand::PrometheusMetrics => AdminRequest::PrometheusMetrics,
         AdminCliCommand::DebugDump => AdminRequest::DebugDump,
+        AdminCliCommand::PlanConfigReload { config } => {
+            AdminRequest::PlanConfigReload { path: config }
+        }
         AdminCliCommand::ReloadPolicies => AdminRequest::ReloadPolicies,
         AdminCliCommand::ReloadEnforcementPolicy => AdminRequest::ReloadEnforcementPolicy,
     }
@@ -68,6 +76,14 @@ mod tests {
         assert_eq!(
             admin_request(AdminCliCommand::DebugDump),
             AdminRequest::DebugDump
+        );
+        assert_eq!(
+            admin_request(AdminCliCommand::PlanConfigReload {
+                config: PathBuf::from("/tmp/agent.toml"),
+            }),
+            AdminRequest::PlanConfigReload {
+                path: PathBuf::from("/tmp/agent.toml"),
+            }
         );
         assert_eq!(
             admin_request(AdminCliCommand::ReloadPolicies),

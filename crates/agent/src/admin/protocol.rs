@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{io::AsyncReadExt, net::UnixStream};
@@ -8,46 +10,45 @@ use crate::{
     status::MetricsSnapshot,
 };
 
-use super::debug_dump::AdminDebugDump;
+use super::{config_reload::ConfigReloadPlanSnapshot, debug_dump::AdminDebugDump};
 
 const ADMIN_REQUEST_MAX_BYTES: usize = 4 * 1024;
 
 macro_rules! admin_requests {
-    ($( $variant:ident => { wire: $wire:literal, mutating: $mutating:literal } ),+ $(,)?) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+    (
+        $(
+            $variant:ident $( { $($field:ident : $field_ty:ty),+ $(,)? } )?
+                => ($name:literal, $mutating:literal)
+        ),+ $(,)?
+    ) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
         #[serde(tag = "command")]
         pub(crate) enum AdminRequest {
             $(
-                #[serde(rename = $wire)]
-                $variant,
+                #[serde(rename = $name)]
+                $variant $( { $($field: $field_ty),+ } )?,
             )+
         }
 
-        impl AdminRequest {
-            pub(crate) const ALL: &'static [Self] = &[$(Self::$variant),+];
-
-            pub(crate) const fn wire_name(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $wire,)+
-                }
-            }
-
-            pub(crate) const fn mutating(self) -> bool {
-                match self {
-                    $(Self::$variant => $mutating,)+
-                }
-            }
-        }
+        const ADMIN_COMMAND_SPECS: &[AdminCommandSpec] = &[
+            $(
+                AdminCommandSpec {
+                    name: $name,
+                    mutating: $mutating,
+                },
+            )+
+        ];
     };
 }
 
 admin_requests! {
-    Status => { wire: "status", mutating: false },
-    Metrics => { wire: "metrics", mutating: false },
-    PrometheusMetrics => { wire: "prometheus_metrics", mutating: false },
-    DebugDump => { wire: "debug_dump", mutating: false },
-    ReloadPolicies => { wire: "reload_policies", mutating: true },
-    ReloadEnforcementPolicy => { wire: "reload_enforcement_policy", mutating: true },
+    Status => ("status", false),
+    Metrics => ("metrics", false),
+    PrometheusMetrics => ("prometheus_metrics", false),
+    DebugDump => ("debug_dump", false),
+    PlanConfigReload { path: PathBuf } => ("plan_config_reload", false),
+    ReloadPolicies => ("reload_policies", true),
+    ReloadEnforcementPolicy => ("reload_enforcement_policy", true),
 }
 
 #[derive(Debug, Serialize)]
@@ -65,6 +66,9 @@ pub(super) enum AdminResponse {
     },
     DebugDump {
         dump: Box<AdminDebugDump>,
+    },
+    ConfigReloadPlan {
+        plan: Box<ConfigReloadPlanSnapshot>,
     },
     PolicyReload {
         loaded_count: u64,
@@ -98,15 +102,24 @@ pub(super) fn admin_protocol_snapshot() -> AdminProtocolSnapshot {
     AdminProtocolSnapshot {
         framing: "json_lines",
         request_max_bytes: ADMIN_REQUEST_MAX_BYTES,
-        commands: AdminRequest::ALL
+        commands: admin_command_specs()
             .iter()
-            .copied()
-            .map(|command| AdminCommandSnapshot {
-                name: command.wire_name(),
-                mutating: command.mutating(),
+            .map(|spec| AdminCommandSnapshot {
+                name: spec.name,
+                mutating: spec.mutating,
             })
             .collect(),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdminCommandSpec {
+    name: &'static str,
+    mutating: bool,
+}
+
+fn admin_command_specs() -> &'static [AdminCommandSpec] {
+    ADMIN_COMMAND_SPECS
 }
 
 #[derive(Debug, Serialize)]

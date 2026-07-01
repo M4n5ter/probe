@@ -43,6 +43,7 @@ fn collect_static_runtime_config_violations(
     config: &AgentConfig,
     violations: &mut Vec<ConfigViolation>,
 ) {
+    capture::validate_static_config(config, violations);
     tls::validate_static_config(config, violations);
     policy::validate_config(config, violations);
     enforcement::validate_static_config(config, violations);

@@ -883,19 +883,28 @@ listen_addr = "127.0.0.1:9464"
 ```
 
 Admin reloads validate new policy or enforcement state before swapping runtime
-state. The Prometheus listener is read-only, loopback-only, and serves only
-`GET /metrics`; control commands stay on the private Unix socket. Runtime
-status and metrics include capture input activity, pipeline
-progress, spool/export state, policy/enforcement counters, TLS plaintext
-activity, and proxy health. Capture input activity includes the latest signal
-kind, sequence, and observation time without treating that activity as kernel
-link liveness. The admin CLI sends the same JSON-lines commands over the Unix
-socket:
+state. Candidate main configs can also be parsed and statically validated, then
+reported as `no_change`, `restart_required`, or `invalid_candidate`; this is a
+planning surface, not live owner replacement for capture, export, TLS, admin, or
+interception resources, and it does not run setup-time active probes. Candidate
+config reads require a regular file, reject symlinks and oversized files, and do
+not echo raw config lines in parse errors. The Prometheus listener is read-only,
+loopback-only, and serves only `GET /metrics`;
+control commands stay on the private Unix socket. Runtime status and metrics
+include capture input activity, pipeline progress, spool/export state,
+policy/enforcement counters, TLS plaintext activity, and proxy health. Capture
+input activity includes the latest signal kind, sequence, and observation time
+without treating that activity as kernel link liveness. The admin CLI sends the
+same JSON-lines commands over the Unix socket:
 
 ```bash
 cargo run -p agent -- admin \
   --socket /run/traffic-probe/admin.sock \
   status
+
+cargo run -p agent -- admin \
+  --socket /run/traffic-probe/admin.sock \
+  plan-config-reload --config /etc/probe/agent.toml
 
 cargo run -p agent -- admin \
   --socket /run/traffic-probe/admin.sock \

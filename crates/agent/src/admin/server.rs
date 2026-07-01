@@ -20,6 +20,7 @@ use tokio::{
 use pipeline::{PipelinePolicySet, PipelineRuntimeMetrics};
 
 use super::{
+    config_reload::plan_config_reload,
     debug_dump::AdminDebugDump,
     protocol::{AdminRequest, AdminResponse, enforcement_policy_reload_source, read_admin_request},
     socket::{AdminError, AdminServerConfig, bind_admin_socket, bind_prometheus_listener},
@@ -338,6 +339,19 @@ async fn handle_admin_request(
                 dump: Box::new(AdminDebugDump::new(snapshot)),
             }
         }
+        AdminRequest::PlanConfigReload { path } => plan_config_reload_response(plan, path).await,
+    }
+}
+
+async fn plan_config_reload_response(plan: &RuntimePlan, path: PathBuf) -> AdminResponse {
+    let current_config = plan.config.clone();
+    match tokio::task::spawn_blocking(move || plan_config_reload(&current_config, &path)).await {
+        Ok(plan) => AdminResponse::ConfigReloadPlan {
+            plan: Box::new(plan),
+        },
+        Err(error) => AdminResponse::Error {
+            message: format!("config reload planning task failed: {error}"),
+        },
     }
 }
 
@@ -402,7 +416,7 @@ mod tests {
     use pipeline::{CapturePipeline, PipelineRuntimeMetrics};
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicyManifest,
-        EnforcementPolicySourceConfig, ExporterConfig,
+        EnforcementPolicySourceConfig, ExporterConfig, LiveCaptureBackend,
     };
     use probe_core::{
         Action, AddressPort, CapabilityKind, CapabilityState, CaptureOrigin, CaptureSource,
@@ -512,6 +526,7 @@ mod tests {
                 { "name": "metrics", "mutating": false },
                 { "name": "prometheus_metrics", "mutating": false },
                 { "name": "debug_dump", "mutating": false },
+                { "name": "plan_config_reload", "mutating": false },
                 { "name": "reload_policies", "mutating": true },
                 { "name": "reload_enforcement_policy", "mutating": true },
             ])
@@ -525,6 +540,67 @@ mod tests {
                 "includes_secret_material_bytes": false,
             })
         );
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_plan_config_reload_reports_restart_required_sections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-config-reload-plan")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let mut config = config_with_storage_path(spool_path.clone());
+        config.config_version = "current".to_string();
+        let plan = Arc::new(runtime_plan_from_config(config.clone())?);
+        let server = spawn_admin_server(
+            Arc::clone(&plan),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState::default(),
+        )?;
+        let mut candidate = config;
+        candidate.config_version = "candidate".to_string();
+        candidate.capture.fallback_backends = vec![LiveCaptureBackend::Libpcap];
+        let candidate_path = temp.join("candidate.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let response = send_admin_request(
+            &socket_path,
+            json!({
+                "command": "plan_config_reload",
+                "path": candidate_path,
+            }),
+        )
+        .await?;
+
+        assert_eq!(response["kind"], json!("config_reload_plan"));
+        assert_eq!(
+            response["plan"]["decision"]["kind"],
+            json!("restart_required")
+        );
+        assert_eq!(
+            response["plan"]["candidate_config_version"],
+            json!("candidate")
+        );
+        assert!(
+            response["plan"]["changed_sections"]
+                .as_array()
+                .expect("changed sections should be an array")
+                .iter()
+                .any(|change| change["section"] == json!("agent_identity"))
+        );
+        assert!(
+            response["plan"]["changed_sections"]
+                .as_array()
+                .expect("changed sections should be an array")
+                .iter()
+                .any(|change| change["section"] == json!("capture"))
+        );
+
         server.stop().await;
         drop(spool);
         fs::remove_dir_all(temp)?;

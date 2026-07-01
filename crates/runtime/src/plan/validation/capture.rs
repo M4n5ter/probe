@@ -2,11 +2,7 @@ use probe_config::{AgentConfig, ConfigViolation};
 
 use crate::plan::registry::ProviderRegistry;
 
-pub(super) fn validate_config(
-    config: &AgentConfig,
-    registry: &ProviderRegistry,
-    violations: &mut Vec<ConfigViolation>,
-) {
+pub(super) fn validate_static_config(config: &AgentConfig, violations: &mut Vec<ConfigViolation>) {
     if let Some(selector) = &config.capture.deep_observe_selector
         && let Err(error) = selector.resolve_refs_with_registry(&config.selectors)
     {
@@ -15,6 +11,13 @@ pub(super) fn validate_config(
             reason: error.to_string(),
         });
     }
+}
+
+pub(super) fn validate_config(
+    config: &AgentConfig,
+    registry: &ProviderRegistry,
+    violations: &mut Vec<ConfigViolation>,
+) {
     let Some(backend) = config.capture.selection.explicit_backend() else {
         return;
     };
@@ -34,7 +37,7 @@ mod tests {
 
     use crate::plan::capture::{CaptureProviderBuilder, CaptureProviderDescriptor};
 
-    use super::super::validate_runtime_config;
+    use super::super::{validate_runtime_config, validate_static_runtime_config_fields};
     use super::*;
 
     #[test]
@@ -123,6 +126,28 @@ mod tests {
             "capture.deep_observe_selector",
             "at least one child",
         );
+        assert_eq!(
+            violation_count(&error, "capture.deep_observe_selector"),
+            1,
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn capture_deep_observe_selector_is_part_of_static_validation() {
+        let mut config = AgentConfig::default();
+        config.capture.deep_observe_selector = Some(probe_core::Selector::All {
+            selectors: Vec::new(),
+        });
+
+        let error =
+            validate_static_runtime_config_fields(&config).expect_err("config should be invalid");
+
+        assert_violation(
+            &error,
+            "capture.deep_observe_selector",
+            "at least one child",
+        );
     }
 
     fn validation_error(config: AgentConfig, registry: &ProviderRegistry) -> ConfigValidationError {
@@ -140,6 +165,14 @@ mod tests {
             "violation {field}: {} should contain {reason_fragment}",
             violation.reason
         );
+    }
+
+    fn violation_count(error: &ConfigValidationError, field: &str) -> usize {
+        error
+            .violations()
+            .iter()
+            .filter(|violation| violation.field == field)
+            .count()
     }
 
     fn capture_provider(

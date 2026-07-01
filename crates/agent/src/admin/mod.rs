@@ -1,4 +1,5 @@
 mod client;
+mod config_reload;
 mod debug_dump;
 mod prometheus;
 mod protocol;
