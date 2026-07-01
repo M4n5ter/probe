@@ -45,8 +45,8 @@ libpcap/procfs 等 fallback 路径，并明确标注能力降级。
 - HTTP/1.x、SSE、WebSocket frame metadata 和 16 MiB 有界 message metadata 已可解析。
 - Lua policy 可产生 alert/verdict。
 - Fjall ingress/export lanes、webhook/file exporter、status/admin/metrics 已可持续运行和观测。
-- 在线 pipeline metrics 可观测 provider poll 活性、capture read、ingress/export 进展、policy/enforcement 输出和 provider-level
-  capture loss。
+- 在线 capture input activity 与 pipeline metrics 可观测 input poll 活性、capture read、ingress/export 进展、
+  policy/enforcement 输出和 provider-level capture loss。
 
 eBPF / procfs 现状：
 
@@ -1275,6 +1275,18 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 - `max_events` 便于对真实 live provider 做有界运行验证。
 
 #### Pipeline metrics
+
+- `capture.input_activity` 是 pipeline input provider 的在线 activity snapshot。该 input provider 是 live primary backend
+  加上 TLS decrypt-hint wrapper、TLS plaintext sidecar feed 和 MITM plaintext bridge feed 后，pipeline 实际消费的 capture source。
+- `metrics.capture_input` 是同一 runtime fact 的 metrics 投影，只保留 poll outcome、非 loss capture event、output loss event、
+  provider-reported lost event 和 last signal kind/sequence。
+- `traffic_probe_capture_input_polls_total{outcome="event|progress|idle|finished"}` 暴露 capture input poll activity。
+- `traffic_probe_capture_input_events_total{class="capture|output_loss"}` 区分非 loss capture event 与 input-level loss event。
+- `traffic_probe_capture_input_lost_events_total` 暴露 input provider 报告的 lost event 总数。
+- `traffic_probe_capture_input_last_signal{kind="event|output_loss|progress|idle|finished"}` 以 one-hot gauge 表达最近一次 input
+  signal。
+- capture input activity 不证明 eBPF per-link kernel liveness，也不证明强 socket-object lifetime。
+- offline/unknown 时 `capture.input_activity` 和 `metrics.capture_input` 保持 `null`。
 
 - `PipelineRuntimeMetrics` 是 pipeline 运行态计数的 owner。
 - pipeline metrics 覆盖 provider poll outcome、capture read、ingress journal/recovery/processed、export event writes、已持久化
@@ -5627,6 +5639,7 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 #### Status 与 Prometheus 覆盖
 
 - status 测试覆盖 runtime snapshot 注入到 `metrics.pipeline` JSON。
+- status 测试覆盖 capture input activity 注入到 `capture.input_activity` 与 `metrics.capture_input` JSON。
 - status 测试覆盖 `metrics.pipeline.capture_polls.total/idle` JSON 字段。
 - status 测试覆盖 `metrics.pipeline.events.total/degraded/gaps` JSON 字段。
 - offline/unknown 时 `metrics.pipeline` 保持 `null`。
@@ -5640,6 +5653,9 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 - upstream connect failure 只作为 per-flow connect telemetry，不增加 relay failure counter，也不改变整体 health。
 - admin 测试通过真实 pipeline 产生非零计数后，覆盖 metrics envelope 和 Prometheus text exposition 都从共享 runtime state 读取在线 metrics。
 - Prometheus 测试覆盖 `traffic_probe_pipeline_capture_polls_total{outcome="event|progress|idle|finished"}`。
+- Prometheus 测试覆盖 `traffic_probe_capture_input_polls_total{outcome="event|progress|idle|finished"}`、
+  `traffic_probe_capture_input_events_total{class="capture|output_loss"}`、
+  `traffic_probe_capture_input_lost_events_total` 和 capture input last-signal one-hot gauge。
 - Prometheus 测试覆盖 `traffic_probe_pipeline_event_envelopes_total{class="all|degraded|gap"}`。
 
 #### Metrics 边界

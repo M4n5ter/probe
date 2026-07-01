@@ -54,6 +54,7 @@ pub struct HealthSnapshot {
 #[derive(Clone, Default)]
 pub struct RuntimeStatusInput {
     pub capture: Option<crate::capture_provider::CaptureProviderRuntimeSnapshot>,
+    pub capture_input: Option<crate::capture_provider::CaptureInputActivityRuntimeSnapshot>,
     pub enforcement: EnforcementRuntimeStatusInput,
     pub export_worker: Option<ExportWorkerRuntimeSnapshot>,
     pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
@@ -112,7 +113,7 @@ fn build_status_snapshot_at_with_runtime(
         ingress_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_ingress_sequence),
         export_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_export_sequence),
     };
-    let capture = capture_status(plan, runtime.capture.clone());
+    let capture = capture_status(plan, runtime.capture.clone(), runtime.capture_input.clone());
     let policy = policy_status(plan);
     let transparent_proxy = runtime.transparent_proxy.clone();
     let l7_mitm = runtime.l7_mitm.clone();
@@ -150,9 +151,11 @@ fn build_status_snapshot_at_with_runtime(
         runtime.export_worker.as_ref(),
     );
     let pipeline = runtime.pipeline;
+    let capture_input_activity = capture.input_activity.clone();
     let capture_loss = pipeline.as_ref().map(|metrics| &metrics.capture_loss);
     let metrics = metrics_snapshot(MetricsSnapshotInput {
         capabilities: &capabilities,
+        capture_input: capture_input_activity,
         spool: &spool_status,
         exporters: &exporters,
         export_worker: runtime.export_worker.as_ref(),
@@ -205,18 +208,25 @@ mod tests {
     };
     use super::*;
     use probe_config::{
-        CaptureSelection, EnforcementPolicyManifest, EnforcementPolicySourceConfig,
+        CaptureBackend, CaptureSelection, EnforcementPolicyManifest, EnforcementPolicySourceConfig,
         TlsMaterialConfig, TlsMaterialKind,
     };
     use probe_core::{
         Action, CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector,
         ProtectiveActionProfile, Selector, TrafficSelector,
     };
-    use runtime::{ExportFailureBackoffPlan, ExportWorkerPlan, RuntimePlan};
+    use runtime::{
+        CaptureEvidenceMode, CapturePlanMode, ExportFailureBackoffPlan, ExportWorkerPlan,
+        RuntimePlan,
+    };
     use serde_json::json;
     use storage::SpoolSnapshot;
 
     use crate::{
+        capture_provider::{
+            CaptureInputActivityRuntimeSnapshot, CaptureInputPollActivityRuntimeSnapshot,
+            CaptureInputSignalRuntimeSnapshot, CaptureProviderRuntimeSnapshot,
+        },
         configured_enforcement::ActiveEnforcementPolicy,
         tls_plaintext::{
             TlsPlaintextProviderActivityRuntimeSnapshot, TlsPlaintextProviderSignalRuntimeSnapshot,
@@ -499,6 +509,63 @@ mod tests {
         assert_eq!(
             value["exporters"][0]["runtime"]["mode"],
             json!("backing_off")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_snapshot_reports_capture_input_activity() -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_with_exporter()?;
+        let spool = SpoolStatusInput::available(
+            PathBuf::from("/tmp/traffic-probe-spool"),
+            SpoolSnapshot {
+                last_ingress_sequence: 0,
+                last_export_sequence: 0,
+            },
+            BTreeMap::new(),
+        );
+        let runtime = RuntimeStatusInput {
+            capture: Some(CaptureProviderRuntimeSnapshot {
+                selected_backend: CaptureBackend::Libpcap,
+                plan_mode: CapturePlanMode::Live,
+                provider_runtime_mode: RuntimeMode::Available,
+                evidence_mode: CaptureEvidenceMode::BestEffort,
+                evidence_reason: Some("libpcap stream assembly is best-effort".to_string()),
+                reason: None,
+                open_failures: Vec::new(),
+                provider: None,
+            }),
+            capture_input: Some(CaptureInputActivityRuntimeSnapshot {
+                polls: CaptureInputPollActivityRuntimeSnapshot {
+                    total: 5,
+                    events: 2,
+                    progress: 1,
+                    idle: 1,
+                    finished: 1,
+                },
+                capture_events: 1,
+                output_loss_events: 1,
+                lost_events: 3,
+                last_signal: Some(CaptureInputSignalRuntimeSnapshot::Idle { sequence: 4 }),
+            }),
+            ..RuntimeStatusInput::default()
+        };
+
+        let snapshot = build_status_snapshot_at_with_runtime(&plan, spool, 42, runtime);
+
+        let value = serde_json::to_value(&snapshot)?;
+        assert_eq!(
+            value["capture"]["input_activity"]["polls"]["total"],
+            json!(5)
+        );
+        assert_eq!(
+            value["capture"]["input_activity"]["output_loss_events"],
+            json!(1)
+        );
+        assert_eq!(value["metrics"]["capture_input"]["lost_events"], json!(3));
+        assert_eq!(
+            value["metrics"]["capture_input"]["last_signal"]["kind"],
+            json!("idle")
         );
         Ok(())
     }

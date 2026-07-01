@@ -388,7 +388,7 @@ impl BlockingCaptureRun {
                 capture_provider_preflight,
             )?;
             capture_runtime.record(built_provider.runtime);
-            let mut provider = built_provider.provider;
+            let mut provider = capture_runtime.observe_capture_input(built_provider.provider);
             active_interception_guard.transparent_interception =
                 transparent_interception.activate(transparent_interception_setup_scope)?;
             signal_readiness(readiness)?;

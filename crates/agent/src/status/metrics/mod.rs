@@ -3,6 +3,7 @@ use probe_core::{CapabilityMatrix, RuntimeMode};
 use serde::Serialize;
 
 use crate::{
+    capture_provider::CaptureInputActivityRuntimeSnapshot,
     export::ExportWorkerRuntimeSnapshot,
     l7_mitm::{
         L7MitmClientTrustMaterialMode, L7MitmClientTrustMode, L7MitmPlaintextBridgeMode,
@@ -24,6 +25,7 @@ use super::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MetricsSnapshot {
     pub capabilities: CapabilityMetricsSnapshot,
+    pub capture_input: Option<CaptureInputMetricsSnapshot>,
     pub spool: SpoolMetricsSnapshot,
     pub export: ExportMetricsSnapshot,
     pub l7_mitm: Option<L7MitmMetricsSnapshot>,
@@ -50,6 +52,30 @@ pub struct ExportMetricsSnapshot {
     pub sink_count: u64,
     pub total_lag: Option<u64>,
     pub backing_off_sink_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CaptureInputMetricsSnapshot {
+    pub polls: CaptureInputPollMetricsSnapshot,
+    pub capture_events: u64,
+    pub output_loss_events: u64,
+    pub lost_events: u64,
+    pub last_signal: Option<CaptureInputSignalMetricsSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CaptureInputPollMetricsSnapshot {
+    pub total: u64,
+    pub events: u64,
+    pub progress: u64,
+    pub idle: u64,
+    pub finished: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CaptureInputSignalMetricsSnapshot {
+    pub kind: &'static str,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -118,6 +144,7 @@ pub struct TlsPlaintextProviderSignalMetricsSnapshot {
 
 pub(in crate::status) struct MetricsSnapshotInput<'a> {
     pub capabilities: &'a CapabilityMatrix,
+    pub capture_input: Option<CaptureInputActivityRuntimeSnapshot>,
     pub spool: &'a SpoolStatusSnapshot,
     pub exporters: &'a [ExporterStatusSnapshot],
     pub export_worker: Option<&'a ExportWorkerRuntimeSnapshot>,
@@ -130,6 +157,7 @@ pub(in crate::status) struct MetricsSnapshotInput<'a> {
 pub(in crate::status) fn metrics_snapshot(input: MetricsSnapshotInput<'_>) -> MetricsSnapshot {
     MetricsSnapshot {
         capabilities: capability_metrics(input.capabilities),
+        capture_input: input.capture_input.map(capture_input_metrics),
         spool: SpoolMetricsSnapshot {
             ingress_last_sequence: input.spool.ingress_last_sequence,
             export_last_sequence: input.spool.export_last_sequence,
@@ -145,6 +173,29 @@ pub(in crate::status) fn metrics_snapshot(input: MetricsSnapshotInput<'_>) -> Me
         transparent_proxy: input.transparent_proxy.map(transparent_proxy_metrics),
         tls_plaintext: input.tls_plaintext.and_then(tls_plaintext_metrics),
         pipeline: input.pipeline,
+    }
+}
+
+fn capture_input_metrics(
+    activity: CaptureInputActivityRuntimeSnapshot,
+) -> CaptureInputMetricsSnapshot {
+    CaptureInputMetricsSnapshot {
+        polls: CaptureInputPollMetricsSnapshot {
+            total: activity.polls.total,
+            events: activity.polls.events,
+            progress: activity.polls.progress,
+            idle: activity.polls.idle,
+            finished: activity.polls.finished,
+        },
+        capture_events: activity.capture_events,
+        output_loss_events: activity.output_loss_events,
+        lost_events: activity.lost_events,
+        last_signal: activity
+            .last_signal
+            .map(|signal| CaptureInputSignalMetricsSnapshot {
+                kind: signal.kind(),
+                sequence: signal.sequence(),
+            }),
     }
 }
 

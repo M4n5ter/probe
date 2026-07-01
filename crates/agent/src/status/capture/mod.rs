@@ -4,7 +4,8 @@ use runtime::{CaptureEvidenceMode, CapturePlanMode, RuntimePlan};
 use serde::Serialize;
 
 use crate::capture_provider::{
-    CaptureProviderRuntimeDetailsSnapshot, CaptureProviderRuntimeSnapshot,
+    CaptureInputActivityRuntimeSnapshot, CaptureProviderRuntimeDetailsSnapshot,
+    CaptureProviderRuntimeSnapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -18,6 +19,7 @@ pub struct CaptureStatusSnapshot {
     pub evidence_reason: Option<String>,
     pub open_failures: Vec<CaptureOpenFailureStatusSnapshot>,
     pub provider: Option<CaptureProviderRuntimeDetailsSnapshot>,
+    pub input_activity: Option<CaptureInputActivityRuntimeSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -29,6 +31,7 @@ pub struct CaptureOpenFailureStatusSnapshot {
 pub(in crate::status) fn capture_status(
     plan: &RuntimePlan,
     runtime: Option<CaptureProviderRuntimeSnapshot>,
+    input_activity: Option<CaptureInputActivityRuntimeSnapshot>,
 ) -> CaptureStatusSnapshot {
     match runtime {
         Some(runtime) => CaptureStatusSnapshot {
@@ -48,6 +51,7 @@ pub(in crate::status) fn capture_status(
                 })
                 .collect(),
             provider: runtime.provider,
+            input_activity,
         },
         None => CaptureStatusSnapshot {
             selection: plan.capture.selection,
@@ -59,6 +63,7 @@ pub(in crate::status) fn capture_status(
             evidence_reason: plan.capture.evidence_reason.clone(),
             open_failures: Vec::new(),
             provider: None,
+            input_activity: None,
         },
     }
 }
@@ -79,7 +84,7 @@ mod tests {
     {
         let plan = auto_plan_with_degraded_ebpf_and_available_libpcap()?;
 
-        let status = capture_status(&plan, None);
+        let status = capture_status(&plan, None, None);
 
         assert_eq!(status.selected_backend, Some(CaptureBackend::Ebpf));
         assert_eq!(status.provider_runtime_mode, Some(RuntimeMode::Available));
@@ -112,7 +117,7 @@ mod tests {
             provider: None,
         };
 
-        let status = capture_status(&plan, Some(runtime));
+        let status = capture_status(&plan, Some(runtime), None);
 
         assert_eq!(status.selected_backend, Some(CaptureBackend::Libpcap));
         assert_eq!(status.provider_runtime_mode, Some(RuntimeMode::Available));
@@ -155,7 +160,7 @@ mod tests {
             ),
         };
 
-        let status = capture_status(&plan, Some(runtime));
+        let status = capture_status(&plan, Some(runtime), None);
 
         let value = serde_json::to_value(&status)?;
         let provider = &value["provider"];

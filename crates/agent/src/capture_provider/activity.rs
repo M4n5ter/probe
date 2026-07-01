@@ -1,0 +1,447 @@
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
+
+use capture::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider};
+use probe_core::{CapabilityState, CaptureProviderKind, CaptureSource};
+use serde::Serialize;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct CaptureInputActivityRuntimeSnapshot {
+    pub(crate) polls: CaptureInputPollActivityRuntimeSnapshot,
+    pub(crate) capture_events: u64,
+    pub(crate) output_loss_events: u64,
+    pub(crate) lost_events: u64,
+    pub(crate) last_signal: Option<CaptureInputSignalRuntimeSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct CaptureInputPollActivityRuntimeSnapshot {
+    pub(crate) total: u64,
+    pub(crate) events: u64,
+    pub(crate) progress: u64,
+    pub(crate) idle: u64,
+    pub(crate) finished: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub(crate) enum CaptureInputSignalRuntimeSnapshot {
+    Event {
+        sequence: u64,
+        source: CaptureSource,
+        provider: CaptureProviderKind,
+        event_wall_time_unix_ns: i64,
+    },
+    OutputLoss {
+        sequence: u64,
+        source: CaptureSource,
+        provider: CaptureProviderKind,
+        event_wall_time_unix_ns: i64,
+        lost_events: u64,
+    },
+    Progress {
+        sequence: u64,
+    },
+    Idle {
+        sequence: u64,
+    },
+    Finished {
+        sequence: u64,
+    },
+}
+
+impl CaptureInputSignalRuntimeSnapshot {
+    pub(crate) const KINDS: [&'static str; 5] =
+        ["event", "output_loss", "progress", "idle", "finished"];
+
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Event { .. } => "event",
+            Self::OutputLoss { .. } => "output_loss",
+            Self::Progress { .. } => "progress",
+            Self::Idle { .. } => "idle",
+            Self::Finished { .. } => "finished",
+        }
+    }
+
+    pub(crate) fn sequence(&self) -> u64 {
+        match self {
+            Self::Event { sequence, .. }
+            | Self::OutputLoss { sequence, .. }
+            | Self::Progress { sequence }
+            | Self::Idle { sequence }
+            | Self::Finished { sequence } => *sequence,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct CaptureInputActivityRuntimeState {
+    inner: Arc<CaptureInputActivityRuntimeInner>,
+}
+
+#[derive(Default)]
+struct CaptureInputActivityRuntimeInner {
+    sequence: AtomicCounter,
+    poll_events: AtomicCounter,
+    poll_progress: AtomicCounter,
+    poll_idle: AtomicCounter,
+    poll_finished: AtomicCounter,
+    capture_events: AtomicCounter,
+    output_loss_events: AtomicCounter,
+    lost_events: AtomicCounter,
+    last_signal: RwLock<Option<CaptureInputSignalRuntimeSnapshot>>,
+}
+
+impl CaptureInputActivityRuntimeState {
+    pub(crate) fn reset(&self) {
+        self.inner.sequence.reset();
+        self.inner.poll_events.reset();
+        self.inner.poll_progress.reset();
+        self.inner.poll_idle.reset();
+        self.inner.poll_finished.reset();
+        self.inner.capture_events.reset();
+        self.inner.output_loss_events.reset();
+        self.inner.lost_events.reset();
+        *self
+            .inner
+            .last_signal
+            .write()
+            .expect("capture input activity lock poisoned") = None;
+    }
+
+    pub(crate) fn record_poll(&self, poll: &CapturePoll) {
+        let sequence = self.inner.sequence.increment();
+        let signal = match poll {
+            CapturePoll::Event(event) => {
+                self.inner.poll_events.increment();
+                self.record_event(event, sequence)
+            }
+            CapturePoll::Progress => {
+                self.inner.poll_progress.increment();
+                CaptureInputSignalRuntimeSnapshot::Progress { sequence }
+            }
+            CapturePoll::Idle => {
+                self.inner.poll_idle.increment();
+                CaptureInputSignalRuntimeSnapshot::Idle { sequence }
+            }
+            CapturePoll::Finished => {
+                self.inner.poll_finished.increment();
+                CaptureInputSignalRuntimeSnapshot::Finished { sequence }
+            }
+        };
+        *self
+            .inner
+            .last_signal
+            .write()
+            .expect("capture input activity lock poisoned") = Some(signal);
+    }
+
+    pub(crate) fn snapshot(&self) -> CaptureInputActivityRuntimeSnapshot {
+        let events = self.inner.poll_events.load();
+        let progress = self.inner.poll_progress.load();
+        let idle = self.inner.poll_idle.load();
+        let finished = self.inner.poll_finished.load();
+        CaptureInputActivityRuntimeSnapshot {
+            polls: CaptureInputPollActivityRuntimeSnapshot {
+                total: [events, progress, idle, finished]
+                    .into_iter()
+                    .fold(0_u64, u64::saturating_add),
+                events,
+                progress,
+                idle,
+                finished,
+            },
+            capture_events: self.inner.capture_events.load(),
+            output_loss_events: self.inner.output_loss_events.load(),
+            lost_events: self.inner.lost_events.load(),
+            last_signal: self
+                .inner
+                .last_signal
+                .read()
+                .expect("capture input activity lock poisoned")
+                .clone(),
+        }
+    }
+
+    fn record_event(
+        &self,
+        event: &CaptureEvent,
+        sequence: u64,
+    ) -> CaptureInputSignalRuntimeSnapshot {
+        match event {
+            CaptureEvent::Loss(loss) => {
+                self.inner.output_loss_events.increment();
+                self.inner.lost_events.add(loss.loss.lost_events);
+                CaptureInputSignalRuntimeSnapshot::OutputLoss {
+                    sequence,
+                    source: loss.origin.source(),
+                    provider: loss.origin.provider(),
+                    event_wall_time_unix_ns: loss.timestamp.wall_time_unix_ns,
+                    lost_events: loss.loss.lost_events,
+                }
+            }
+            CaptureEvent::Bytes(bytes) => self.event_signal(
+                sequence,
+                bytes.origin.source(),
+                bytes.origin.provider(),
+                bytes.timestamp.wall_time_unix_ns,
+            ),
+            CaptureEvent::Gap(gap) => self.event_signal(
+                sequence,
+                gap.origin.source(),
+                gap.origin.provider(),
+                gap.timestamp.wall_time_unix_ns,
+            ),
+            CaptureEvent::ConnectionOpened {
+                timestamp, origin, ..
+            }
+            | CaptureEvent::ConnectionClosed {
+                timestamp, origin, ..
+            } => self.event_signal(
+                sequence,
+                origin.source(),
+                origin.provider(),
+                timestamp.wall_time_unix_ns,
+            ),
+        }
+    }
+
+    fn event_signal(
+        &self,
+        sequence: u64,
+        source: CaptureSource,
+        provider: CaptureProviderKind,
+        event_wall_time_unix_ns: i64,
+    ) -> CaptureInputSignalRuntimeSnapshot {
+        self.inner.capture_events.increment();
+        CaptureInputSignalRuntimeSnapshot::Event {
+            sequence,
+            source,
+            provider,
+            event_wall_time_unix_ns,
+        }
+    }
+}
+
+pub(crate) struct ActivityObservedCaptureInput {
+    inner: Box<dyn CaptureProvider>,
+    activity: CaptureInputActivityRuntimeState,
+}
+
+impl ActivityObservedCaptureInput {
+    pub(crate) fn new(
+        inner: Box<dyn CaptureProvider>,
+        activity: CaptureInputActivityRuntimeState,
+    ) -> Self {
+        Self { inner, activity }
+    }
+}
+
+impl CaptureProvider for ActivityObservedCaptureInput {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn capabilities(&self) -> Vec<CapabilityState> {
+        self.inner.capabilities()
+    }
+
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+        let poll = self.inner.poll_next()?;
+        self.activity.record_poll(&poll);
+        Ok(poll)
+    }
+}
+
+#[derive(Debug, Default)]
+struct AtomicCounter(AtomicU64);
+
+impl AtomicCounter {
+    fn reset(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+
+    fn increment(&self) -> u64 {
+        self.add(1)
+    }
+
+    fn add(&self, delta: u64) -> u64 {
+        let previous = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(delta))
+            })
+            .unwrap_or_else(|value| value);
+        previous.saturating_add(delta)
+    }
+
+    fn load(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use probe_core::{
+        AddressPort, CaptureLoss, CaptureOrigin, EnforcementEvidence, FlowContext, FlowIdentity,
+        ObservationOnlyReason, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+    };
+
+    use super::*;
+
+    #[test]
+    fn observed_input_records_poll_event_and_loss_activity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activity = CaptureInputActivityRuntimeState::default();
+        let event = CaptureEvent::ConnectionOpened {
+            timestamp: timestamp(11),
+            flow: flow(),
+            origin: CaptureOrigin::from_source(CaptureSource::Libpcap),
+        };
+        let loss = CaptureEvent::Loss(capture::CapturedLoss {
+            timestamp: timestamp(17),
+            origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
+            enforcement_evidence: EnforcementEvidence::observation_only(
+                ObservationOnlyReason::ProviderCaptureLoss,
+            ),
+            loss: CaptureLoss {
+                lost_events: 3,
+                reason: "ringbuf reserve failed".to_string(),
+            },
+        });
+        let mut provider = ActivityObservedCaptureInput::new(
+            Box::new(FakeProvider::new([
+                CapturePoll::event(event.clone()),
+                CapturePoll::Progress,
+                CapturePoll::event(loss.clone()),
+                CapturePoll::Idle,
+                CapturePoll::Finished,
+            ])),
+            activity.clone(),
+        );
+
+        assert_eq!(provider.poll_next()?, CapturePoll::event(event));
+        assert_eq!(provider.poll_next()?, CapturePoll::Progress);
+        assert_eq!(provider.poll_next()?, CapturePoll::event(loss));
+        assert_eq!(provider.poll_next()?, CapturePoll::Idle);
+        assert_eq!(provider.poll_next()?, CapturePoll::Finished);
+
+        let snapshot = activity.snapshot();
+        assert_eq!(snapshot.polls.total, 5);
+        assert_eq!(snapshot.polls.events, 2);
+        assert_eq!(snapshot.polls.progress, 1);
+        assert_eq!(snapshot.polls.idle, 1);
+        assert_eq!(snapshot.polls.finished, 1);
+        assert_eq!(snapshot.capture_events, 1);
+        assert_eq!(snapshot.output_loss_events, 1);
+        assert_eq!(snapshot.lost_events, 3);
+        assert_eq!(
+            snapshot.last_signal,
+            Some(CaptureInputSignalRuntimeSnapshot::Finished { sequence: 5 })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observed_input_activity_saturates_loss_counters() {
+        let activity = CaptureInputActivityRuntimeState::default();
+
+        activity.record_poll(&CapturePoll::event(capture_loss(u64::MAX)));
+        activity.record_poll(&CapturePoll::event(capture_loss(1)));
+
+        let snapshot = activity.snapshot();
+        assert_eq!(snapshot.output_loss_events, 2);
+        assert_eq!(snapshot.lost_events, u64::MAX);
+    }
+
+    struct FakeProvider {
+        polls: VecDeque<CapturePoll>,
+    }
+
+    impl FakeProvider {
+        fn new(polls: impl IntoIterator<Item = CapturePoll>) -> Self {
+            Self {
+                polls: polls.into_iter().collect(),
+            }
+        }
+    }
+
+    impl CaptureProvider for FakeProvider {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn capabilities(&self) -> Vec<CapabilityState> {
+            Vec::new()
+        }
+
+        fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(self.polls.pop_front().unwrap_or(CapturePoll::Finished))
+        }
+    }
+
+    fn capture_loss(lost_events: u64) -> CaptureEvent {
+        CaptureEvent::Loss(capture::CapturedLoss {
+            timestamp: timestamp(17),
+            origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
+            enforcement_evidence: EnforcementEvidence::observation_only(
+                ObservationOnlyReason::ProviderCaptureLoss,
+            ),
+            loss: CaptureLoss {
+                lost_events,
+                reason: "ringbuf reserve failed".to_string(),
+            },
+        })
+    }
+
+    fn timestamp(monotonic_ns: u64) -> Timestamp {
+        Timestamp {
+            monotonic_ns,
+            wall_time_unix_ns: i64::try_from(monotonic_ns).expect("test timestamp fits i64"),
+        }
+    }
+
+    fn flow() -> FlowContext {
+        let process = ProcessIdentity {
+            pid: 1,
+            tgid: 1,
+            start_time_ticks: 1,
+            boot_id: "boot".to_string(),
+            exe_path: "probe-test".to_string(),
+            cmdline_hash: "hash".to_string(),
+            uid: 1000,
+            gid: 1000,
+            cgroup: None,
+            systemd_service: None,
+            container_id: None,
+            runtime_hint: None,
+        };
+        let local = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 41000,
+        };
+        let remote = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 8080,
+        };
+        FlowContext {
+            id: FlowIdentity::stable(&process, &local, &remote, TransportProtocol::Tcp, 1, None),
+            process: ProcessContext {
+                identity: process,
+                name: "probe-test".to_string(),
+                cmdline: vec!["probe-test".to_string()],
+            },
+            local,
+            remote,
+            protocol: TransportProtocol::Tcp,
+            start_monotonic_ns: 1,
+            socket_cookie: None,
+            attribution_confidence: 100,
+        }
+    }
+}

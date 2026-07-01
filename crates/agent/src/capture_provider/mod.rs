@@ -1,3 +1,4 @@
+mod activity;
 mod ebpf;
 mod factory;
 mod procfs_resolver;
@@ -5,6 +6,9 @@ mod runtime;
 
 use capture::CaptureProvider;
 
+#[cfg(test)]
+pub(crate) use activity::CaptureInputPollActivityRuntimeSnapshot;
+pub(crate) use activity::{CaptureInputActivityRuntimeSnapshot, CaptureInputSignalRuntimeSnapshot};
 pub(super) use factory::{CaptureProviderPreflight, build_capture_provider};
 pub(crate) use runtime::{
     CaptureProviderOpenFailureSnapshot, CaptureProviderRuntimeDetailsSnapshot,

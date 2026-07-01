@@ -344,6 +344,7 @@ pub(super) fn build_admin_status_snapshot(
         collect_running_spool_status(plan, spool),
         RuntimeStatusInput {
             capture: runtime_state.capture.snapshot(),
+            capture_input: runtime_state.capture.input_activity_snapshot(),
             enforcement: runtime_state.enforcement.as_ref().map_or(
                 EnforcementRuntimeStatusInput::OfflineInspect,
                 |state| EnforcementRuntimeStatusInput::Runtime {
@@ -403,7 +404,8 @@ mod tests {
         Timestamp, TrafficSelector, TransportProtocol, Verdict, VerdictScope,
     };
     use runtime::{
-        CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
+        CaptureEvidenceMode, CapturePlanMode, CaptureProviderBuilder, CaptureProviderDescriptor,
+        ProviderRegistry, RuntimePlan,
     };
     use serde_json::json;
     use storage::SpoolPayload;
@@ -478,6 +480,31 @@ mod tests {
             pipeline.run_provider(&mut provider)?;
         }
         let plan = Arc::new(runtime_plan(spool_path)?);
+        let capture_runtime = CaptureProviderRuntimeState::default();
+        capture_runtime.record(crate::capture_provider::CaptureProviderRuntimeSnapshot {
+            selected_backend: CaptureBackend::Replay,
+            plan_mode: CapturePlanMode::Replay,
+            provider_runtime_mode: RuntimeMode::Available,
+            evidence_mode: CaptureEvidenceMode::Nominal,
+            evidence_reason: None,
+            reason: None,
+            open_failures: Vec::new(),
+            provider: None,
+        });
+        let mut observed_capture_input =
+            capture_runtime.observe_capture_input(Box::new(ReplayProvider::new(
+                demo_flow(),
+                Direction::Outbound,
+                b"GET /capture-input HTTP/1.1\r\nHost: test\r\n\r\n",
+                Timestamp {
+                    monotonic_ns: 2,
+                    wall_time_unix_ns: 2,
+                },
+            )));
+        assert!(matches!(
+            observed_capture_input.poll_next()?,
+            capture::CapturePoll::Event(_)
+        ));
         let transparent_proxy_runtime = crate::transparent_interception::resolve(
             plan.enforcement.interception.execution.clone(),
         )
@@ -488,6 +515,7 @@ mod tests {
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState {
+                capture: capture_runtime,
                 pipeline: Some(pipeline_metrics),
                 l7_mitm: Some(l7_mitm_runtime),
                 transparent_proxy: Some(transparent_proxy_runtime),
@@ -514,6 +542,14 @@ mod tests {
         assert_eq!(
             response["metrics"]["pipeline"]["capture_loss"]["lost_events"],
             json!(0)
+        );
+        assert_eq!(
+            response["metrics"]["capture_input"]["polls"]["events"],
+            json!(1)
+        );
+        assert_eq!(
+            response["metrics"]["capture_input"]["last_signal"]["kind"],
+            json!("event")
         );
         assert_eq!(
             response["metrics"]["l7_mitm"]["backend_health"]["mode"],
@@ -548,6 +584,10 @@ mod tests {
                 ["mode"],
             json!("not_configured")
         );
+        assert_eq!(
+            response["snapshot"]["capture"]["input_activity"]["polls"]["events"],
+            json!(1)
+        );
 
         let response =
             send_admin_request(&socket_path, json!({ "command": "prometheus_metrics" })).await?;
@@ -575,6 +615,8 @@ mod tests {
             "traffic_probe_transparent_proxy_upstream_connects_total{outcome=\"success\"} 0\n"
         ));
         assert!(metrics.contains("traffic_probe_pipeline_capture_events_read_total 1\n"));
+        assert!(metrics.contains("traffic_probe_capture_input_activity_available 1\n"));
+        assert!(metrics.contains("traffic_probe_capture_input_polls_total{outcome=\"event\"} 1\n"));
         assert!(metrics.contains("traffic_probe_pipeline_export_events_written_total 1\n"));
         assert!(metrics.contains("traffic_probe_pipeline_capture_loss_events_total 0\n"));
         assert!(metrics.contains("traffic_probe_pipeline_capture_lost_events_total 0\n"));

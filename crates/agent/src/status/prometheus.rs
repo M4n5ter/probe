@@ -4,6 +4,7 @@ use probe_core::RuntimeMode;
 
 use super::metrics::{TcpHealthMetricsSnapshot, TlsPlaintextMetricsSnapshot};
 use crate::{
+    capture_provider::CaptureInputSignalRuntimeSnapshot,
     l7_mitm::{
         L7MitmBackendHealthMode, L7MitmClientTrustMaterialMode, L7MitmClientTrustMode,
         L7MitmPlaintextBridgeMode,
@@ -94,6 +95,7 @@ pub(crate) fn render_prometheus_metrics(snapshot: &AgentStatusSnapshot) -> Strin
     write_l7_mitm(&mut output, snapshot);
     write_transparent_proxy(&mut output, snapshot);
     write_tls_plaintext(&mut output, snapshot);
+    write_capture_input(&mut output, snapshot);
     write_pipeline(&mut output, snapshot);
 
     output
@@ -803,6 +805,108 @@ fn write_pipeline(output: &mut String, snapshot: &AgentStatusSnapshot) {
     );
 }
 
+fn write_capture_input(output: &mut String, snapshot: &AgentStatusSnapshot) {
+    write_family(
+        output,
+        "traffic_probe_capture_input_activity_available",
+        "gauge",
+        "Whether capture input activity is present in this snapshot.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_capture_input_activity_available",
+        &[],
+        u64::from(snapshot.metrics.capture_input.is_some()),
+    );
+
+    let Some(activity) = &snapshot.metrics.capture_input else {
+        return;
+    };
+
+    write_family(
+        output,
+        "traffic_probe_capture_input_polls_total",
+        "counter",
+        "Capture input polls by outcome.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_capture_input_polls_total",
+        &[("outcome", "event")],
+        activity.polls.events,
+    );
+    write_sample(
+        output,
+        "traffic_probe_capture_input_polls_total",
+        &[("outcome", "progress")],
+        activity.polls.progress,
+    );
+    write_sample(
+        output,
+        "traffic_probe_capture_input_polls_total",
+        &[("outcome", "idle")],
+        activity.polls.idle,
+    );
+    write_sample(
+        output,
+        "traffic_probe_capture_input_polls_total",
+        &[("outcome", "finished")],
+        activity.polls.finished,
+    );
+
+    write_family(
+        output,
+        "traffic_probe_capture_input_events_total",
+        "counter",
+        "Capture input events by class before pipeline processing.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_capture_input_events_total",
+        &[("class", "capture")],
+        activity.capture_events,
+    );
+    write_sample(
+        output,
+        "traffic_probe_capture_input_events_total",
+        &[("class", "output_loss")],
+        activity.output_loss_events,
+    );
+
+    write_family(
+        output,
+        "traffic_probe_capture_input_lost_events_total",
+        "counter",
+        "Capture input reported events lost before userspace observation.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_capture_input_lost_events_total",
+        &[],
+        activity.lost_events,
+    );
+
+    write_family(
+        output,
+        "traffic_probe_capture_input_last_signal",
+        "gauge",
+        "Capture input last observed signal as a one-hot gauge.",
+    );
+    for kind in CaptureInputSignalRuntimeSnapshot::KINDS {
+        write_sample(
+            output,
+            "traffic_probe_capture_input_last_signal",
+            &[("kind", kind)],
+            u64::from(
+                activity
+                    .last_signal
+                    .as_ref()
+                    .is_some_and(|signal| signal.kind == kind),
+            ),
+        );
+    }
+}
+
 fn write_family(output: &mut String, name: &str, metric_type: &str, help: &str) {
     writeln!(output, "# HELP {name} {help}").expect("writing to String cannot fail");
     writeln!(output, "# TYPE {name} {metric_type}").expect("writing to String cannot fail");
@@ -858,6 +962,10 @@ mod tests {
         spool::SpoolStatusInput,
     };
     use super::*;
+    use crate::capture_provider::{
+        CaptureInputActivityRuntimeSnapshot, CaptureInputPollActivityRuntimeSnapshot,
+        CaptureInputSignalRuntimeSnapshot, CaptureProviderRuntimeSnapshot,
+    };
     use crate::l7_mitm::{
         L7MitmBackendHealthMode, L7MitmBackendHealthSnapshot, L7MitmClientTrustSnapshot,
         L7MitmPlaintextBridgeMode, L7MitmPlaintextBridgeSnapshot, L7MitmRuntimeSnapshot,
@@ -870,6 +978,8 @@ mod tests {
         TransparentProxyHealthProbeMode, TransparentProxyRuntimeMode,
         TransparentProxyRuntimeSnapshot,
     };
+    use probe_config::CaptureBackend;
+    use runtime::{CaptureEvidenceMode, CapturePlanMode};
 
     #[test]
     fn render_prometheus_metrics_escapes_label_values() -> Result<(), Box<dyn std::error::Error>> {
@@ -1125,6 +1235,82 @@ mod tests {
         assert!(metrics.contains("traffic_probe_tls_plaintext_activity_metrics_available 0\n"));
         assert!(!metrics.contains("traffic_probe_tls_plaintext_provider_signals_total"));
         assert!(!metrics.contains("traffic_probe_tls_plaintext_lost_events_total"));
+        Ok(())
+    }
+
+    #[test]
+    fn render_prometheus_metrics_includes_capture_input_activity_counters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
+            Vec::new(),
+        )?;
+        let snapshot = build_status_snapshot_with_runtime(
+            &plan,
+            SpoolStatusInput::available(
+                PathBuf::from("/tmp/traffic-probe-spool"),
+                SpoolSnapshot {
+                    last_ingress_sequence: 0,
+                    last_export_sequence: 0,
+                },
+                BTreeMap::new(),
+            ),
+            RuntimeStatusInput {
+                capture: Some(CaptureProviderRuntimeSnapshot {
+                    selected_backend: CaptureBackend::Ebpf,
+                    plan_mode: CapturePlanMode::Live,
+                    provider_runtime_mode: RuntimeMode::Degraded,
+                    evidence_mode: CaptureEvidenceMode::BestEffort,
+                    evidence_reason: Some("eBPF provider is best-effort".to_string()),
+                    reason: Some("kernel observer is best-effort".to_string()),
+                    open_failures: Vec::new(),
+                    provider: None,
+                }),
+                capture_input: Some(CaptureInputActivityRuntimeSnapshot {
+                    polls: CaptureInputPollActivityRuntimeSnapshot {
+                        total: 5,
+                        events: 2,
+                        progress: 1,
+                        idle: 1,
+                        finished: 1,
+                    },
+                    capture_events: 1,
+                    output_loss_events: 1,
+                    lost_events: 3,
+                    last_signal: Some(CaptureInputSignalRuntimeSnapshot::OutputLoss {
+                        sequence: 4,
+                        source: probe_core::CaptureSource::EbpfSyscall,
+                        provider: probe_core::CaptureProviderKind::Ebpf,
+                        event_wall_time_unix_ns: 99,
+                        lost_events: 3,
+                    }),
+                }),
+                ..RuntimeStatusInput::default()
+            },
+        );
+
+        let metrics = render_prometheus_metrics(&snapshot);
+
+        assert!(metrics.contains("traffic_probe_capture_input_activity_available 1\n"));
+        assert!(metrics.contains("traffic_probe_capture_input_polls_total{outcome=\"event\"} 2\n"));
+        assert!(
+            metrics.contains("traffic_probe_capture_input_polls_total{outcome=\"progress\"} 1\n")
+        );
+        assert!(metrics.contains("traffic_probe_capture_input_polls_total{outcome=\"idle\"} 1\n"));
+        assert!(
+            metrics.contains("traffic_probe_capture_input_polls_total{outcome=\"finished\"} 1\n")
+        );
+        assert!(
+            metrics.contains("traffic_probe_capture_input_events_total{class=\"capture\"} 1\n")
+        );
+        assert!(
+            metrics.contains("traffic_probe_capture_input_events_total{class=\"output_loss\"} 1\n")
+        );
+        assert!(metrics.contains("traffic_probe_capture_input_lost_events_total 3\n"));
+        assert!(
+            metrics.contains("traffic_probe_capture_input_last_signal{kind=\"output_loss\"} 1\n")
+        );
+        assert!(metrics.contains("traffic_probe_capture_input_last_signal{kind=\"event\"} 0\n"));
         Ok(())
     }
 
