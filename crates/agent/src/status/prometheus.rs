@@ -4,7 +4,7 @@ use probe_core::RuntimeMode;
 
 use super::metrics::{TcpHealthMetricsSnapshot, TlsPlaintextMetricsSnapshot};
 use crate::{
-    capture_provider::CaptureInputSignalRuntimeSnapshot,
+    capture_provider::{CaptureInputSignalRuntimeSnapshot, CaptureProviderRuntimeDetailsSnapshot},
     l7_mitm::{
         L7MitmBackendHealthMode, L7MitmClientTrustMaterialMode, L7MitmClientTrustMode,
         L7MitmPlaintextBridgeMode,
@@ -95,6 +95,7 @@ pub(crate) fn render_prometheus_metrics(snapshot: &AgentStatusSnapshot) -> Strin
     write_l7_mitm(&mut output, snapshot);
     write_transparent_proxy(&mut output, snapshot);
     write_tls_plaintext(&mut output, snapshot);
+    write_capture_provider(&mut output, snapshot);
     write_capture_input(&mut output, snapshot);
     write_pipeline(&mut output, snapshot);
 
@@ -805,6 +806,74 @@ fn write_pipeline(output: &mut String, snapshot: &AgentStatusSnapshot) {
     );
 }
 
+fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
+    write_family(
+        output,
+        "traffic_probe_ebpf_process_observation_link_ownership_metrics_available",
+        "gauge",
+        "Whether eBPF process observation link ownership metrics are present in this snapshot.",
+    );
+    let Some(CaptureProviderRuntimeDetailsSnapshot::EbpfProcessObservation { link_ownership }) =
+        &snapshot.capture.provider
+    else {
+        write_sample(
+            output,
+            "traffic_probe_ebpf_process_observation_link_ownership_metrics_available",
+            &[],
+            0,
+        );
+        return;
+    };
+    write_sample(
+        output,
+        "traffic_probe_ebpf_process_observation_link_ownership_metrics_available",
+        &[],
+        1,
+    );
+
+    write_one_hot_enum(
+        output,
+        "traffic_probe_ebpf_process_observation_link_ownership_mode",
+        "Userspace-held eBPF process observation tracepoint link ownership mode as a one-hot gauge; this is not per-link kernel firing liveness.",
+        "mode",
+        &RUNTIME_MODES,
+        link_ownership.mode,
+        RuntimeMode::wire_name,
+    );
+
+    write_family(
+        output,
+        "traffic_probe_ebpf_process_observation_owned_links",
+        "gauge",
+        "Total userspace-held committed eBPF process observation tracepoint link handles.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_ebpf_process_observation_owned_links",
+        &[],
+        link_ownership.owned_link_count,
+    );
+
+    write_family(
+        output,
+        "traffic_probe_ebpf_process_observation_program_owned_links",
+        "gauge",
+        "Userspace-held committed eBPF process observation tracepoint link handles by program.",
+    );
+    for program in &link_ownership.programs {
+        write_sample(
+            output,
+            "traffic_probe_ebpf_process_observation_program_owned_links",
+            &[
+                ("program_name", program.program_name),
+                ("category", program.category),
+                ("tracepoint", program.tracepoint_name),
+            ],
+            program.owned_link_count,
+        );
+    }
+}
+
 fn write_capture_input(output: &mut String, snapshot: &AgentStatusSnapshot) {
     write_family(
         output,
@@ -991,7 +1060,8 @@ mod tests {
     use super::*;
     use crate::capture_provider::{
         CaptureInputActivityRuntimeSnapshot, CaptureInputPollActivityRuntimeSnapshot,
-        CaptureInputSignalRuntimeSnapshot, CaptureProviderRuntimeSnapshot,
+        CaptureInputSignalRuntimeSnapshot, CaptureProviderRuntimeDetailsSnapshot,
+        CaptureProviderRuntimeSnapshot,
     };
     use crate::l7_mitm::{
         L7MitmBackendHealthMode, L7MitmBackendHealthSnapshot, L7MitmClientTrustSnapshot,
@@ -1262,6 +1332,168 @@ mod tests {
         assert!(metrics.contains("traffic_probe_tls_plaintext_activity_metrics_available 0\n"));
         assert!(!metrics.contains("traffic_probe_tls_plaintext_provider_signals_total"));
         assert!(!metrics.contains("traffic_probe_tls_plaintext_lost_events_total"));
+        Ok(())
+    }
+
+    #[test]
+    fn render_prometheus_metrics_includes_ebpf_link_ownership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
+            Vec::new(),
+        )?;
+        let snapshot = build_status_snapshot_with_runtime(
+            &plan,
+            SpoolStatusInput::available(
+                PathBuf::from("/tmp/traffic-probe-spool"),
+                SpoolSnapshot {
+                    last_ingress_sequence: 0,
+                    last_export_sequence: 0,
+                },
+                BTreeMap::new(),
+            ),
+            RuntimeStatusInput {
+                capture: Some(CaptureProviderRuntimeSnapshot {
+                    selected_backend: CaptureBackend::Ebpf,
+                    plan_mode: CapturePlanMode::Live,
+                    provider_runtime_mode: RuntimeMode::Degraded,
+                    evidence_mode: CaptureEvidenceMode::BestEffort,
+                    evidence_reason: Some("eBPF provider is best-effort".to_string()),
+                    reason: Some("kernel observer is best-effort".to_string()),
+                    open_failures: Vec::new(),
+                    provider: Some(CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(
+                        capture::EbpfProcessObservationLinkOwnershipSnapshot::owned_by_programs([
+                            capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
+                                "connect_enter",
+                                "syscalls",
+                                "sys_enter_connect",
+                                1,
+                            ),
+                            capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
+                                "connect_exit",
+                                "syscalls",
+                                "sys_exit_connect",
+                                1,
+                            ),
+                        ]),
+                    )),
+                }),
+                ..RuntimeStatusInput::default()
+            },
+        );
+
+        let metrics = render_prometheus_metrics(&snapshot);
+
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_link_ownership_metrics_available 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_link_ownership_mode{mode=\"available\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_link_ownership_mode{mode=\"unavailable\"} 0\n"
+        ));
+        assert!(metrics.contains("traffic_probe_ebpf_process_observation_owned_links 2\n"));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_program_owned_links{program_name=\"connect_enter\",category=\"syscalls\",tracepoint=\"sys_enter_connect\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_program_owned_links{program_name=\"connect_exit\",category=\"syscalls\",tracepoint=\"sys_exit_connect\"} 1\n"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn render_prometheus_metrics_hides_ebpf_link_ownership_when_provider_details_are_absent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
+            Vec::new(),
+        )?;
+        let snapshot = build_status_snapshot_with_runtime(
+            &plan,
+            SpoolStatusInput::available(
+                PathBuf::from("/tmp/traffic-probe-spool"),
+                SpoolSnapshot {
+                    last_ingress_sequence: 0,
+                    last_export_sequence: 0,
+                },
+                BTreeMap::new(),
+            ),
+            RuntimeStatusInput {
+                capture: Some(CaptureProviderRuntimeSnapshot {
+                    selected_backend: CaptureBackend::Libpcap,
+                    plan_mode: CapturePlanMode::Live,
+                    provider_runtime_mode: RuntimeMode::Available,
+                    evidence_mode: CaptureEvidenceMode::BestEffort,
+                    evidence_reason: Some("libpcap stream assembly is best-effort".to_string()),
+                    reason: None,
+                    open_failures: Vec::new(),
+                    provider: None,
+                }),
+                ..RuntimeStatusInput::default()
+            },
+        );
+
+        let metrics = render_prometheus_metrics(&snapshot);
+
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_link_ownership_metrics_available 0\n"
+        ));
+        assert!(!metrics.contains("traffic_probe_ebpf_process_observation_owned_links"));
+        assert!(!metrics.contains("traffic_probe_ebpf_process_observation_program_owned_links"));
+        Ok(())
+    }
+
+    #[test]
+    fn render_prometheus_metrics_reports_unavailable_ebpf_link_ownership_when_unreported()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
+            Vec::new(),
+        )?;
+        let snapshot = build_status_snapshot_with_runtime(
+            &plan,
+            SpoolStatusInput::available(
+                PathBuf::from("/tmp/traffic-probe-spool"),
+                SpoolSnapshot {
+                    last_ingress_sequence: 0,
+                    last_export_sequence: 0,
+                },
+                BTreeMap::new(),
+            ),
+            RuntimeStatusInput {
+                capture: Some(CaptureProviderRuntimeSnapshot {
+                    selected_backend: CaptureBackend::Ebpf,
+                    plan_mode: CapturePlanMode::Live,
+                    provider_runtime_mode: RuntimeMode::Degraded,
+                    evidence_mode: CaptureEvidenceMode::BestEffort,
+                    evidence_reason: Some("eBPF provider is best-effort".to_string()),
+                    reason: Some("kernel observer is best-effort".to_string()),
+                    open_failures: Vec::new(),
+                    provider: Some(
+                        CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(
+                            capture::EbpfProcessObservationLinkOwnershipSnapshot::unreported(),
+                        ),
+                    ),
+                }),
+                ..RuntimeStatusInput::default()
+            },
+        );
+
+        let metrics = render_prometheus_metrics(&snapshot);
+
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_link_ownership_metrics_available 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_link_ownership_mode{mode=\"available\"} 0\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_link_ownership_mode{mode=\"unavailable\"} 1\n"
+        ));
+        assert!(metrics.contains("traffic_probe_ebpf_process_observation_owned_links 0\n"));
+        assert!(!metrics.contains("traffic_probe_ebpf_process_observation_program_owned_links{"));
         Ok(())
     }
 

@@ -354,6 +354,9 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
   - 已实现：eBPF process observation provider 成功打开后，online capture status 的 `capture.provider` 报告
     `ebpf_process_observation` provider details；其中 `link_ownership` 按 program、tracepoint category/name 和 link count
     报告 userspace loader 已提交并持有的 tracepoint links。
+  - 已实现：Prometheus 暴露同一 link ownership fact，包括 metrics availability、ownership mode、总 owned link count
+    和 per-program owned link count；这些指标只表达 userspace-held committed link handles，不表达 per-link kernel firing
+    liveness。
   - 已实现：pipeline runtime metrics 记录 capture loss event 与 lost event 总数；若在线 status 输入包含非零
     capture loss，agent health 降级并在 reason 中报告对应计数。
   - 边界：capability 和 evidence mode 仍是 degraded/best-effort。
@@ -1322,6 +1325,23 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 - policy runtime error 会作为 `policy_runtime_error` audit event 写入 export queue。
 - policy runtime error 带 `policy_version` 和 typed `event_type`。
 - policy runtime error 不阻止同一原始事件上的其它 policy 继续运行。
+
+#### Process eBPF Link Ownership Metrics
+
+- `traffic_probe_ebpf_process_observation_link_ownership_metrics_available` 表示当前 status snapshot
+  是否包含 process eBPF provider 的 link ownership 数值投影。
+- `traffic_probe_ebpf_process_observation_link_ownership_mode{mode="available|degraded|unavailable"}`
+  是 `capture.provider.link_ownership.mode` 的 one-hot gauge。
+- `traffic_probe_ebpf_process_observation_owned_links` 表示当前 userspace attach session 持有的 committed
+  tracepoint link handle 总数。
+- `traffic_probe_ebpf_process_observation_program_owned_links{program_name,category,tracepoint}` 按固定 eBPF
+  program inventory 暴露每个 program 持有的 committed tracepoint link handle 数。
+- 当 selected provider 不是 process eBPF，或 runtime status 没有 provider details 时，只暴露
+  `traffic_probe_ebpf_process_observation_link_ownership_metrics_available 0`，不伪造 link count。
+- 当 provider details 存在但 link ownership 未上报时，metrics availability 为 `1`，
+  mode 为 `unavailable`，owned link count 为 `0`。
+- 这些指标只表达 userspace-held committed link handles，不表达 per-link kernel firing liveness，
+  也不证明强 socket-object lifetime。
 
 #### Event provenance
 
@@ -4124,6 +4144,7 @@ Status snapshot：
 - snapshot 包含 capture status。
 - 在线 capture status 对 backend-specific runtime facts 使用 `capture.provider`；process eBPF provider 通过该字段暴露
   tracepoint link ownership。
+- Prometheus 对 process eBPF provider 暴露同一 tracepoint link ownership 数值投影，但不把该投影视为 kernel liveness。
 - snapshot 包含 policy status。
 - snapshot 包含 enforcement status。
 - snapshot 包含 TLS plaintext/material status。
@@ -5701,6 +5722,10 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
   `traffic_probe_capture_input_events_total{class="capture|output_loss"}`、
   `traffic_probe_capture_input_lost_events_total`、capture input last-signal one-hot gauge、
   last-signal sequence 和 last-signal observed Unix time。
+- Prometheus 测试覆盖 `traffic_probe_ebpf_process_observation_link_ownership_metrics_available`、
+  `traffic_probe_ebpf_process_observation_link_ownership_mode`、
+  `traffic_probe_ebpf_process_observation_owned_links` 和
+  `traffic_probe_ebpf_process_observation_program_owned_links`。
 - Prometheus 测试覆盖 `traffic_probe_pipeline_event_envelopes_total{class="all|degraded|gap"}`。
 
 #### Metrics 边界
