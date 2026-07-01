@@ -97,7 +97,22 @@ Every policy input has these fields:
 | `event.degraded` | `true` when evidence is known to be incomplete. |
 | `event.direction` | `inbound`, `outbound`, or `nil` when the event is not directional. |
 | `event.enforcement_evidence.kind` | `destructive_allowed` or `observation_only`. |
+| `event.enforcement_evidence.reason` | Present for `observation_only`; values are listed below. |
+| `event.enforcement_evidence.detail` | Optional human-readable detail for `observation_only`. |
 | `event.kind.type` | Event-specific kind discriminator. |
+
+Observation-only reasons:
+
+| Reason | Trigger | Scope | Policy guidance |
+| --- | --- | --- | --- |
+| `ebpf_syscall_payload_snapshot` | eBPF syscall payload bytes or byte-range gaps from bounded syscall sampling. | Flow-carried until the flow is closed or removed. | Treat payload as best-effort. Destructive enforcement is rejected. |
+| `ebpf_unresolved_flow` | eBPF observed a socket action but could not resolve it to a strong flow identity. | Event-local. | Use for audit and telemetry, not connection enforcement. |
+| `ebpf_process_lifecycle_boundary` | Process exit or exec invalidated fd-table continuity for active payload-tracked flows. | Flow-carried until the flow is closed or removed. | Treat later parser output on that flow as observation-only. |
+| `provider_state_boundary` | Provider userspace state was displaced, such as tracked-flow capacity eviction. | Event-local terminal flow boundary. | Treat as a payload continuity break that does not depend on a later close. |
+| `provider_capture_loss` | The capture provider reported lost observations that may affect active tracked flows. | Flow-carried fan-out gap; provider-level capture loss is audit/export output and is not delivered to Lua. | Assume bytes, lifecycle, or parser state may be incomplete. |
+
+`event.enforcement_evidence.detail` is diagnostic text. Policies must not parse
+it as a stable API.
 
 `event.flow` carries process and socket attribution:
 

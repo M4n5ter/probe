@@ -97,6 +97,10 @@ impl DescriptorLeaseKey {
         self.fd_generation
     }
 
+    pub(super) const fn has_same_allow_map_key(self, other: Self) -> bool {
+        self.tgid == other.tgid && self.fd == other.fd
+    }
+
     pub(super) fn is_in_close_range(
         self,
         close_range: &EbpfCloseRangeTracepointObservation,

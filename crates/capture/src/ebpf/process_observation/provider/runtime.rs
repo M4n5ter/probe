@@ -20,7 +20,8 @@ use super::super::{
     observation_source::{EbpfObservationSource, ProbeObservationSource},
     payload_authorization::SocketPayloadSampleAuthorization,
     payload_bridge::{
-        output_loss_gap_events, process_lifecycle_gap_events, read_events, write_events,
+        output_loss_gap_events, process_lifecycle_gap_events, read_events,
+        tracked_flow_displacement_gap_events, write_events,
     },
     payload_direction::PayloadDirections,
     tracked_flow::{TrackedEbpfFlow, TrackedEbpfFlows},
@@ -227,7 +228,10 @@ impl EbpfProcessObservationProvider {
         flow_start: &PendingEbpfFlowStart,
         event: &CaptureEvent,
     ) -> Result<(), CaptureError> {
-        if let CaptureEvent::ConnectionOpened { flow, .. } = &event {
+        if let CaptureEvent::ConnectionOpened {
+            timestamp, flow, ..
+        } = &event
+        {
             let Some(lease) = flow_start.descriptor_lease() else {
                 return Ok(());
             };
@@ -237,14 +241,31 @@ impl EbpfProcessObservationProvider {
                 self.deep_observe_selector.as_ref(),
             );
             let payload_directions = authorization
+                .as_ref()
                 .map(|authorization| authorization.payload_directions())
                 .unwrap_or_else(PayloadDirections::empty);
             if let Some(authorization) = authorization {
                 self.observations
                     .allow_socket_payload_sample(authorization)?;
             }
-            self.tracked_flows
-                .insert_flow(lease, flow.clone(), payload_directions);
+            if let Some(displacement) =
+                self.tracked_flows
+                    .insert_flow(lease, flow.clone(), payload_directions)
+            {
+                let displaced_key = displacement.key();
+                let retained_payload_allowance = self
+                    .tracked_flows
+                    .has_payload_allowance_for_allow_map_key(displaced_key);
+                if displacement.should_revoke_allow_map_key(retained_payload_allowance) {
+                    self.observations
+                        .revoke_socket_payload_sample(displaced_key)?;
+                }
+                self.pending_events
+                    .extend(tracked_flow_displacement_gap_events(
+                        displacement,
+                        *timestamp,
+                    ));
+            }
         }
         Ok(())
     }
@@ -363,7 +384,7 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider emits result-gated connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded multi-iovec prefix syscall argument samples, outbound available sendfile family kernel-transfer byte-count gaps, inbound single-buffer and bounded multi-iovec prefix syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, TGID-level process exit/exec cancellation of pending flow resolution plus lifecycle boundary gaps for active payload-tracked flows, output ring-buffer failure conversion to degraded capture_loss events, and conservative unknown-offset gap fan-out to active tracked payload flows; payload beyond the bounded multi-iovec scan/sample or fixed verifier-friendly append slots, kernel-transfer payload bytes, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
+            "eBPF provider emits result-gated connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded multi-iovec prefix syscall argument samples, outbound available sendfile family kernel-transfer byte-count gaps, inbound single-buffer and bounded multi-iovec prefix syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, TGID-level process exit/exec cancellation of pending flow resolution plus lifecycle boundary gaps for active payload-tracked flows, userspace tracked-flow displacement as event-local terminal provider-state boundary gaps, output ring-buffer failure conversion to degraded capture_loss events, and conservative unknown-offset gap fan-out to active tracked payload flows; payload beyond the bounded multi-iovec scan/sample or fixed verifier-friendly append slots, kernel-transfer payload bytes, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
         )]
     }
 
@@ -374,9 +395,12 @@ impl CaptureProvider for EbpfProcessObservationProvider {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::{
+        net::Ipv4Addr,
+        sync::{Arc, Mutex},
+    };
 
-    use crate::CaptureProviderKind;
+    use crate::{CaptureProviderKind, EnforcementEvidencePropagation};
 
     use probe_core::{
         Direction, ObservationOnlyReason, ProcessContext, ProcessIdentity, ProcessSelector,
@@ -387,10 +411,10 @@ mod tests {
         EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
         EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
         EbpfResolvedSocketFlow, EbpfSocketEndpoint, EbpfSocketFlowLookup,
-        EbpfSocketReadObservation,
+        EbpfSocketReadObservation, EbpfSocketWriteObservation,
     };
 
-    use super::super::super::EbpfProcessLifecycleKind;
+    use super::super::super::{EbpfProcessLifecycleKind, descriptor_lease::DescriptorLeaseKey};
 
     use super::*;
 
@@ -429,6 +453,11 @@ mod tests {
             self.output_loss = OutputLossTracker::new(interval);
             self
         }
+
+        fn with_max_tracked_flows_for_test(mut self, max_tracked_flows: usize) -> Self {
+            self.tracked_flows = TrackedEbpfFlows::bounded(max_tracked_flows);
+            self
+        }
     }
 
     struct VecObservationSource {
@@ -444,6 +473,44 @@ mod tests {
             &mut self,
             _authorization: SocketPayloadSampleAuthorization,
         ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+    }
+
+    struct RecordingObservationSource {
+        observations: VecDeque<EbpfProcessObservation>,
+        allowed: Arc<Mutex<Vec<DescriptorLeaseKey>>>,
+        revoked: Arc<Mutex<Vec<DescriptorLeaseKey>>>,
+    }
+
+    impl EbpfObservationSource for RecordingObservationSource {
+        fn next_observation(&mut self) -> Result<Option<EbpfProcessObservation>, CaptureError> {
+            Ok(self.observations.pop_front())
+        }
+
+        fn allow_socket_payload_sample(
+            &mut self,
+            authorization: SocketPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            self.allowed.lock().expect("allowed lock poisoned").push(
+                DescriptorLeaseKey::from_observed(
+                    authorization.tgid(),
+                    authorization.fd(),
+                    authorization.fd_generation(),
+                )
+                .expect("authorization carries a valid descriptor lease"),
+            );
+            Ok(())
+        }
+
+        fn revoke_socket_payload_sample(
+            &mut self,
+            key: DescriptorLeaseKey,
+        ) -> Result<(), CaptureError> {
+            self.revoked
+                .lock()
+                .expect("revoked lock poisoned")
+                .push(key);
             Ok(())
         }
     }
@@ -777,6 +844,195 @@ mod tests {
         let (_, closed) = expect_connection_closed(&mut provider)?;
         assert_eq!(closed.id, second_flow_id);
         assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn tracked_flow_capacity_eviction_emits_provider_state_boundary_gaps() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let selector =
+            deep_observe_selector([40_007, 40_008], [Direction::Inbound, Direction::Outbound])?;
+        let observations = [
+            connect_observation(process.clone(), 7, remote),
+            EbpfProcessObservation::Write(EbpfSocketWriteObservation {
+                process: process.clone(),
+                fd: 7,
+                fd_generation: 10,
+                original_len: 5,
+                buffer: b"GET /".to_vec(),
+                truncated: false,
+                read_failed: false,
+                kernel_transfer: false,
+            }),
+            connect_observation(process.clone(), 8, remote),
+            close_observation(process, 7),
+        ];
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            fd_distinct_resolver(local),
+            Some(selector),
+        )
+        .with_max_tracked_flows_for_test(1);
+
+        let (_, first_opened) = expect_connection_opened(&mut provider)?;
+        let bytes = expect_bytes(&mut provider)?;
+        assert_eq!(bytes.flow.id, first_opened.id);
+        assert_eq!(bytes.stream_offset, 0);
+        assert_eq!(bytes.bytes.as_ref(), b"GET /");
+
+        let (second_timestamp, second_opened) = expect_connection_opened(&mut provider)?;
+        assert_ne!(second_opened.id, first_opened.id);
+
+        let first_gap = expect_gap(&mut provider)?;
+        let second_gap = expect_gap(&mut provider)?;
+        let gaps = [first_gap, second_gap];
+        assert!(
+            gaps.iter()
+                .all(|gap| gap.timestamp == second_timestamp && gap.flow.id == first_opened.id)
+        );
+        assert!(gaps.iter().all(|gap| gap.gap.next_offset.is_none()));
+        assert!(gaps.iter().all(|gap| {
+            gap.gap
+                .reason
+                .contains("tracked-flow capacity was exceeded")
+        }));
+        assert!(gaps.iter().all(|gap| gap.enforcement_evidence
+            == probe_core::EnforcementEvidence::observation_only_with_detail(
+                ObservationOnlyReason::ProviderStateBoundary,
+                gap.gap.reason.clone()
+            )));
+        assert!(gaps.iter().all(|gap| {
+            gap.enforcement_evidence_propagation == EnforcementEvidencePropagation::Event
+        }));
+        assert!(gaps.iter().any(|gap| {
+            gap.gap.direction == Direction::Outbound && gap.gap.expected_offset == 5
+        }));
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.gap.direction == Direction::Inbound && gap.gap.expected_offset == 0)
+        );
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn tracked_flow_capacity_eviction_revokes_displaced_payload_allowance() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let selector =
+            deep_observe_selector([40_007, 40_008], [Direction::Inbound, Direction::Outbound])?;
+        let observations = [
+            connect_observation(process.clone(), 7, remote),
+            connect_observation(process, 8, remote),
+        ];
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = RecordingObservationSource {
+            observations: observations.into_iter().collect(),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            fd_distinct_resolver(local),
+            Some(selector),
+        )
+        .with_max_tracked_flows_for_test(1);
+
+        expect_connection_opened(&mut provider)?;
+        expect_connection_opened(&mut provider)?;
+
+        let first_key =
+            DescriptorLeaseKey::from_observed(100, 7, 10).expect("valid test descriptor key");
+        let second_key =
+            DescriptorLeaseKey::from_observed(100, 8, 10).expect("valid test descriptor key");
+        assert_eq!(
+            allowed.lock().expect("allowed lock poisoned").as_slice(),
+            &[first_key, second_key]
+        );
+        assert_eq!(
+            revoked.lock().expect("revoked lock poisoned").as_slice(),
+            &[first_key]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn same_fd_replacement_keeps_new_payload_allowance() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let selector = deep_observe_selector([40_007], [Direction::Inbound, Direction::Outbound])?;
+        let observations = [
+            connect_observation_with_lease(process.clone(), 7, remote, 9, 10),
+            connect_observation_with_lease(process, 7, remote, 9, 11),
+        ];
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = RecordingObservationSource {
+            observations: observations.into_iter().collect(),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            fd_distinct_resolver(local),
+            Some(selector),
+        )
+        .with_max_tracked_flows_for_test(1);
+
+        expect_connection_opened(&mut provider)?;
+        expect_connection_opened(&mut provider)?;
+
+        let first_key =
+            DescriptorLeaseKey::from_observed(100, 7, 10).expect("valid test descriptor key");
+        let second_key =
+            DescriptorLeaseKey::from_observed(100, 7, 11).expect("valid test descriptor key");
+        assert_eq!(
+            allowed.lock().expect("allowed lock poisoned").as_slice(),
+            &[first_key, second_key]
+        );
+        assert!(revoked.lock().expect("revoked lock poisoned").is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn retained_same_fd_generation_prevents_stale_allowance_revoke() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let selector = deep_observe_selector([40_007], [Direction::Inbound, Direction::Outbound])?;
+        let observations = [
+            connect_observation_with_lease(process.clone(), 7, remote, 9, 10),
+            connect_observation_with_lease(process.clone(), 7, remote, 9, 11),
+            connect_observation(process, 8, remote),
+        ];
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = RecordingObservationSource {
+            observations: observations.into_iter().collect(),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            fd_distinct_resolver(local),
+            Some(selector),
+        )
+        .with_max_tracked_flows_for_test(2);
+
+        expect_connection_opened(&mut provider)?;
+        expect_connection_opened(&mut provider)?;
+        expect_connection_opened(&mut provider)?;
+
+        let first_key =
+            DescriptorLeaseKey::from_observed(100, 7, 10).expect("valid test descriptor key");
+        let second_key =
+            DescriptorLeaseKey::from_observed(100, 7, 11).expect("valid test descriptor key");
+        assert_eq!(
+            allowed.lock().expect("allowed lock poisoned").as_slice(),
+            &[first_key, second_key]
+        );
+        assert!(revoked.lock().expect("revoked lock poisoned").is_empty());
         Ok(())
     }
 

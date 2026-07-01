@@ -181,6 +181,7 @@ pub enum ObservationOnlyReason {
     EbpfSyscallPayloadSnapshot,
     EbpfUnresolvedFlow,
     EbpfProcessLifecycleBoundary,
+    ProviderStateBoundary,
     ProviderCaptureLoss,
 }
 
@@ -230,6 +231,9 @@ impl ObservationOnlyReason {
             Self::EbpfProcessLifecycleBoundary => {
                 "eBPF process lifecycle boundary invalidated payload observation continuity"
             }
+            Self::ProviderStateBoundary => {
+                "capture provider userspace state boundary invalidated payload observation continuity"
+            }
             Self::ProviderCaptureLoss => {
                 "capture provider reported lost observations; destructive enforcement cannot rely on this event"
             }
@@ -241,6 +245,7 @@ impl ObservationOnlyReason {
             Self::EbpfSyscallPayloadSnapshot => "ebpf_syscall_payload_snapshot",
             Self::EbpfUnresolvedFlow => "ebpf_unresolved_flow",
             Self::EbpfProcessLifecycleBoundary => "ebpf_process_lifecycle_boundary",
+            Self::ProviderStateBoundary => "provider_state_boundary",
             Self::ProviderCaptureLoss => "provider_capture_loss",
         }
     }

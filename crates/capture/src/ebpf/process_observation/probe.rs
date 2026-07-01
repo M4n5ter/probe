@@ -6,7 +6,7 @@ use std::{
 
 use aya::{
     Ebpf, EbpfError,
-    maps::{HashMap as AyaHashMap, MapData, PerCpuArray, RingBuf},
+    maps::{HashMap as AyaHashMap, MapData, MapError, PerCpuArray, RingBuf},
     programs::{ProgramError, TracePoint},
 };
 use ebpf_abi::{
@@ -32,7 +32,7 @@ use super::{
     EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
     EbpfProcessLifecycleKind, EbpfProcessLifecycleObservation, EbpfProcessObservation,
     EbpfSocketEndpoint, EbpfSocketReadObservation, EbpfSocketWriteObservation,
-    payload_authorization::SocketPayloadSampleAuthorization,
+    descriptor_lease::DescriptorLeaseKey, payload_authorization::SocketPayloadSampleAuthorization,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -390,6 +390,20 @@ impl EbpfProcessObservationProbe {
                 name: EBPF_ALLOWED_SOCKET_FDS_MAP_NAME,
                 source,
             })
+    }
+
+    pub(super) fn revoke_socket_payload_sample(
+        &mut self,
+        key: DescriptorLeaseKey,
+    ) -> Result<(), EbpfProcessObservationProbeError> {
+        let key = EbpfSocketFdKey::new(key.tgid(), key.fd()).to_bpfel_bytes();
+        match self.allowed_socket_fds.remove(&key) {
+            Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
+            Err(source) => Err(EbpfProcessObservationProbeError::Map {
+                name: EBPF_ALLOWED_SOCKET_FDS_MAP_NAME,
+                source,
+            }),
+        }
     }
 
     pub fn process_output_loss_count(&mut self) -> Result<u64, EbpfProcessObservationProbeError> {

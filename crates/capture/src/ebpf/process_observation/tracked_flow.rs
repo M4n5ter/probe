@@ -1,6 +1,6 @@
 use probe_core::{Direction, FlowContext};
 
-use crate::bounded_recency::BoundedRecencyMap;
+use crate::bounded_recency::{BoundedInsertDisplacement, BoundedRecencyMap};
 
 use super::{
     EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfSocketReadObservation,
@@ -20,6 +20,21 @@ pub(super) struct TrackedEbpfFlow {
     payload_directions: PayloadDirections,
 }
 
+pub(super) enum TrackedEbpfFlowDisplacement {
+    Replaced {
+        key: DescriptorLeaseKey,
+        tracked: TrackedEbpfFlow,
+    },
+    Evicted {
+        key: DescriptorLeaseKey,
+        tracked: TrackedEbpfFlow,
+    },
+    Dropped {
+        key: DescriptorLeaseKey,
+        tracked: TrackedEbpfFlow,
+    },
+}
+
 impl TrackedEbpfFlows {
     pub(super) fn bounded(max_tracked_flows: usize) -> Self {
         Self {
@@ -32,8 +47,8 @@ impl TrackedEbpfFlows {
         lease: DescriptorLease,
         flow: FlowContext,
         payload_directions: PayloadDirections,
-    ) {
-        self.insert(lease.key(), flow, payload_directions);
+    ) -> Option<TrackedEbpfFlowDisplacement> {
+        self.insert(lease.key(), flow, payload_directions)
     }
 
     pub(super) fn remove_close(
@@ -79,6 +94,16 @@ impl TrackedEbpfFlows {
             .filter(|tracked| !tracked.payload_directions.is_empty())
     }
 
+    pub(super) fn has_payload_allowance_for_allow_map_key(&self, key: DescriptorLeaseKey) -> bool {
+        self.by_lease.keys().any(|tracked_key| {
+            tracked_key.has_same_allow_map_key(key)
+                && self
+                    .by_lease
+                    .get(tracked_key)
+                    .is_some_and(TrackedEbpfFlow::has_payload_allowance)
+        })
+    }
+
     pub(super) fn get_write_mut(
         &mut self,
         write: &EbpfSocketWriteObservation,
@@ -98,16 +123,16 @@ impl TrackedEbpfFlows {
         key: DescriptorLeaseKey,
         flow: FlowContext,
         payload_directions: PayloadDirections,
-    ) {
-        self.by_lease.insert(
-            key,
-            TrackedEbpfFlow {
-                flow,
-                inbound_stream_offset: 0,
-                outbound_stream_offset: 0,
-                payload_directions,
-            },
-        );
+    ) -> Option<TrackedEbpfFlowDisplacement> {
+        let tracked = TrackedEbpfFlow {
+            flow,
+            inbound_stream_offset: 0,
+            outbound_stream_offset: 0,
+            payload_directions,
+        };
+        self.by_lease
+            .insert_displacing(key, tracked)
+            .map(TrackedEbpfFlowDisplacement::from_bounded)
     }
 
     fn remove(&mut self, key: DescriptorLeaseKey) -> Option<TrackedEbpfFlow> {
@@ -131,9 +156,76 @@ impl TrackedEbpfFlows {
     }
 }
 
+impl TrackedEbpfFlowDisplacement {
+    fn from_bounded(
+        displacement: BoundedInsertDisplacement<DescriptorLeaseKey, TrackedEbpfFlow>,
+    ) -> Self {
+        match displacement {
+            BoundedInsertDisplacement::Replaced {
+                key,
+                value: tracked,
+            } => Self::Replaced { key, tracked },
+            BoundedInsertDisplacement::Evicted {
+                key,
+                value: tracked,
+            } => Self::Evicted { key, tracked },
+            BoundedInsertDisplacement::Dropped {
+                key,
+                value: tracked,
+            } => Self::Dropped { key, tracked },
+        }
+    }
+
+    pub(super) fn key(&self) -> DescriptorLeaseKey {
+        match self {
+            Self::Replaced { key, .. } | Self::Evicted { key, .. } | Self::Dropped { key, .. } => {
+                *key
+            }
+        }
+    }
+
+    pub(super) fn into_tracked_flow(self) -> TrackedEbpfFlow {
+        match self {
+            Self::Replaced { tracked, .. }
+            | Self::Evicted { tracked, .. }
+            | Self::Dropped { tracked, .. } => tracked,
+        }
+    }
+
+    pub(super) fn reason(&self) -> &'static str {
+        match self {
+            Self::Replaced { .. } => {
+                "eBPF process observation replaced an existing descriptor lease with a newer flow observation; affected bytes and next stream offset are unknown"
+            }
+            Self::Evicted { .. } => {
+                "eBPF process observation userspace flow tracker evicted this flow because tracked-flow capacity was exceeded; affected bytes and next stream offset are unknown"
+            }
+            Self::Dropped { .. } => {
+                "eBPF process observation could not track this flow because tracked-flow capacity is zero; affected bytes and next stream offset are unknown"
+            }
+        }
+    }
+
+    pub(super) fn should_revoke_allow_map_key(&self, retained_payload_allowance: bool) -> bool {
+        self.tracked_flow().has_payload_allowance() && !retained_payload_allowance
+    }
+
+    fn tracked_flow(&self) -> &TrackedEbpfFlow {
+        match self {
+            Self::Replaced { tracked, .. }
+            | Self::Evicted { tracked, .. }
+            | Self::Dropped { tracked, .. } => tracked,
+        }
+    }
+}
+
 impl TrackedEbpfFlow {
     fn allows_payload(&self, direction: Direction) -> bool {
         self.payload_directions.allows(direction)
+    }
+
+    fn has_payload_allowance(&self) -> bool {
+        !self.payload_directions.is_empty()
     }
 
     pub(super) fn payload_directions(&self) -> PayloadDirections {
@@ -260,10 +352,14 @@ mod tests {
     #[test]
     fn tracked_flows_do_not_refresh_descriptor_on_unallowed_payload_direction() {
         let mut tracked = TrackedEbpfFlows::bounded(2);
-        tracked.insert_flow(
-            descriptor_lease(100, 7, 1),
-            flow("fd-7"),
-            PayloadDirections::from_directions([Direction::Outbound]),
+        assert!(
+            tracked
+                .insert_flow(
+                    descriptor_lease(100, 7, 1),
+                    flow("fd-7"),
+                    PayloadDirections::from_directions([Direction::Outbound]),
+                )
+                .is_none()
         );
         insert_flow_for_descriptor(&mut tracked, 8, flow("fd-8"));
 
@@ -429,7 +525,7 @@ mod tests {
         fd_generation: u64,
         flow: FlowContext,
     ) {
-        tracked.insert_flow(
+        let _ = tracked.insert_flow(
             descriptor_lease(tgid, fd, fd_generation),
             flow,
             PayloadDirections::from_directions([Direction::Outbound, Direction::Inbound]),

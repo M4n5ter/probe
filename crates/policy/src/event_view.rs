@@ -568,6 +568,7 @@ fn observation_only_reason_name(reason: ObservationOnlyReason) -> &'static str {
         ObservationOnlyReason::EbpfSyscallPayloadSnapshot => "ebpf_syscall_payload_snapshot",
         ObservationOnlyReason::EbpfUnresolvedFlow => "ebpf_unresolved_flow",
         ObservationOnlyReason::EbpfProcessLifecycleBoundary => "ebpf_process_lifecycle_boundary",
+        ObservationOnlyReason::ProviderStateBoundary => "provider_state_boundary",
         ObservationOnlyReason::ProviderCaptureLoss => "provider_capture_loss",
     }
 }

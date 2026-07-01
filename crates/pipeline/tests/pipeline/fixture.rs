@@ -125,6 +125,29 @@ pub(super) fn event_local_observation_only_ebpf_unresolved_gap(flow: FlowContext
     })
 }
 
+pub(super) fn event_local_provider_state_boundary_gap(flow: FlowContext) -> CaptureEvent {
+    let reason = "test provider state boundary gap";
+    CaptureEvent::Gap(capture::CapturedGap {
+        timestamp: Timestamp {
+            monotonic_ns: 1,
+            wall_time_unix_ns: 1,
+        },
+        flow,
+        origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
+        enforcement_evidence: EnforcementEvidence::observation_only_with_detail(
+            ObservationOnlyReason::ProviderStateBoundary,
+            reason,
+        ),
+        enforcement_evidence_propagation: capture::EnforcementEvidencePropagation::Event,
+        gap: Gap {
+            direction: Direction::Outbound,
+            expected_offset: 5,
+            next_offset: None,
+            reason: reason.to_string(),
+        },
+    })
+}
+
 pub(super) fn capture_loss(lost_events: u64) -> CaptureEvent {
     let reason = format!("test capture lost {lost_events} event(s)");
     CaptureEvent::Loss(capture::CapturedLoss {

@@ -17,9 +17,9 @@ use tempfile::tempdir;
 
 use super::fixture::{
     SequenceProvider, connection_closed, demo_flow_with_ports,
-    event_local_observation_only_ebpf_unresolved_gap, exported_envelopes,
-    flow_carried_observation_only_ebpf_syscall_gap, flow_carried_provider_capture_loss_gap,
-    observation_only_ebpf_syscall_bytes_with_direction,
+    event_local_observation_only_ebpf_unresolved_gap, event_local_provider_state_boundary_gap,
+    exported_envelopes, flow_carried_observation_only_ebpf_syscall_gap,
+    flow_carried_provider_capture_loss_gap, observation_only_ebpf_syscall_bytes_with_direction,
 };
 
 #[test]
@@ -241,6 +241,56 @@ fn event_local_observation_only_gap_does_not_block_parser_cursor_without_close()
         )
     }));
     assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 1);
+    Ok(())
+}
+
+#[test]
+fn provider_state_boundary_gap_does_not_block_parser_cursor_without_close()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    run_without_policy(
+        &spool,
+        vec![event_local_provider_state_boundary_gap(
+            demo_flow_with_ports(50_000, 80, 46),
+        )],
+    )?;
+
+    let envelopes = exported_envelopes(&spool)?;
+    assert!(envelopes.iter().any(|envelope| {
+        matches!(
+            envelope.kind(),
+            EventKind::Gap(gap)
+                if gap.reason.contains("provider state boundary")
+                    && envelope
+                        .enforcement_evidence()
+                        .destructive_enforcement_rejection_reason()
+                        .is_some_and(|reason| reason.contains("userspace state boundary"))
+        )
+    }));
+    assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 1);
+    Ok(())
+}
+
+#[test]
+fn provider_state_boundary_gap_releases_prior_flow_carried_evidence_without_close()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let flow = demo_flow_with_ports(50_000, 80, 47);
+    run_without_policy(
+        &spool,
+        vec![
+            observation_only_ebpf_syscall_bytes_with_direction(
+                flow.clone(),
+                Direction::Outbound,
+                b"GET / HTTP/1.1\r\n",
+            ),
+            event_local_provider_state_boundary_gap(flow),
+        ],
+    )?;
+
+    assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 2);
     Ok(())
 }
 

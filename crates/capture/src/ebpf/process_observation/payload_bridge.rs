@@ -8,7 +8,7 @@ use crate::{CaptureEvent, CapturedBytes, CapturedGap, EnforcementEvidencePropaga
 
 use super::{
     EbpfProcessLifecycleKind, EbpfSocketReadObservation, EbpfSocketWriteObservation,
-    tracked_flow::{TrackedEbpfFlow, TrackedEbpfFlows},
+    tracked_flow::{TrackedEbpfFlow, TrackedEbpfFlowDisplacement, TrackedEbpfFlows},
 };
 
 const EBPF_WRITE_ARGUMENT_SAMPLE_REASON: &str = "eBPF outbound syscall sample is an argument snapshot captured before the kernel copies bytes; contents are best-effort and may differ from bytes actually sent";
@@ -114,6 +114,27 @@ pub(super) fn process_lifecycle_gap_events(
                         kind,
                     )
                 })
+        })
+        .collect()
+}
+
+pub(super) fn tracked_flow_displacement_gap_events(
+    displacement: TrackedEbpfFlowDisplacement,
+    timestamp: Timestamp,
+) -> Vec<CaptureEvent> {
+    let reason = displacement.reason().to_string();
+    let tracked = displacement.into_tracked_flow();
+    tracked
+        .payload_directions()
+        .directions()
+        .map(|direction| {
+            ebpf_provider_state_boundary_gap(
+                timestamp,
+                tracked.flow.clone(),
+                direction,
+                stream_offset(&tracked, direction),
+                reason.clone(),
+            )
         })
         .collect()
 }
@@ -228,22 +249,15 @@ fn ebpf_payload_gap(
     next_offset: Option<u64>,
     reason: String,
 ) -> CaptureEvent {
-    let enforcement_evidence = EnforcementEvidence::observation_only_with_detail(
-        ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
-        reason.clone(),
-    );
-    CaptureEvent::Gap(CapturedGap {
+    ebpf_observation_only_gap(ObservationOnlyGap {
         timestamp,
         flow,
-        origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
-        enforcement_evidence,
-        enforcement_evidence_propagation: EnforcementEvidencePropagation::Flow,
-        gap: Gap {
-            direction,
-            expected_offset,
-            next_offset,
-            reason,
-        },
+        direction,
+        expected_offset,
+        next_offset,
+        reason,
+        observation_reason: ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
+        propagation: EnforcementEvidencePropagation::Flow,
     })
 }
 
@@ -257,22 +271,15 @@ fn ebpf_output_loss_gap(
     let reason = format!(
         "eBPF process observation output ring buffer lost {lost_events} event(s) while this flow is currently tracked; affected flow, time, bytes, and next stream offset are unknown"
     );
-    let enforcement_evidence = EnforcementEvidence::observation_only_with_detail(
-        ObservationOnlyReason::ProviderCaptureLoss,
-        reason.clone(),
-    );
-    CaptureEvent::Gap(CapturedGap {
+    ebpf_observation_only_gap(ObservationOnlyGap {
         timestamp,
         flow,
-        origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
-        enforcement_evidence,
-        enforcement_evidence_propagation: EnforcementEvidencePropagation::Flow,
-        gap: Gap {
-            direction,
-            expected_offset,
-            next_offset: None,
-            reason,
-        },
+        direction,
+        expected_offset,
+        next_offset: None,
+        reason,
+        observation_reason: ObservationOnlyReason::ProviderCaptureLoss,
+        propagation: EnforcementEvidencePropagation::Flow,
     })
 }
 
@@ -288,21 +295,64 @@ fn ebpf_process_lifecycle_gap(
         "eBPF process lifecycle boundary ({}) invalidated fd-table epoch for TGID {tgid}; affected bytes and next stream offset are unknown",
         kind.boundary_description()
     );
-    let enforcement_evidence = EnforcementEvidence::observation_only_with_detail(
-        ObservationOnlyReason::EbpfProcessLifecycleBoundary,
-        reason.clone(),
-    );
-    CaptureEvent::Gap(CapturedGap {
+    ebpf_observation_only_gap(ObservationOnlyGap {
         timestamp,
         flow,
+        direction,
+        expected_offset,
+        next_offset: None,
+        reason,
+        observation_reason: ObservationOnlyReason::EbpfProcessLifecycleBoundary,
+        propagation: EnforcementEvidencePropagation::Flow,
+    })
+}
+
+fn ebpf_provider_state_boundary_gap(
+    timestamp: Timestamp,
+    flow: FlowContext,
+    direction: Direction,
+    expected_offset: u64,
+    reason: String,
+) -> CaptureEvent {
+    ebpf_observation_only_gap(ObservationOnlyGap {
+        timestamp,
+        flow,
+        direction,
+        expected_offset,
+        next_offset: None,
+        reason,
+        observation_reason: ObservationOnlyReason::ProviderStateBoundary,
+        propagation: EnforcementEvidencePropagation::Event,
+    })
+}
+
+struct ObservationOnlyGap {
+    timestamp: Timestamp,
+    flow: FlowContext,
+    direction: Direction,
+    expected_offset: u64,
+    next_offset: Option<u64>,
+    reason: String,
+    observation_reason: ObservationOnlyReason,
+    propagation: EnforcementEvidencePropagation,
+}
+
+fn ebpf_observation_only_gap(gap: ObservationOnlyGap) -> CaptureEvent {
+    let enforcement_evidence = EnforcementEvidence::observation_only_with_detail(
+        gap.observation_reason,
+        gap.reason.clone(),
+    );
+    CaptureEvent::Gap(CapturedGap {
+        timestamp: gap.timestamp,
+        flow: gap.flow,
         origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
         enforcement_evidence,
-        enforcement_evidence_propagation: EnforcementEvidencePropagation::Flow,
+        enforcement_evidence_propagation: gap.propagation,
         gap: Gap {
-            direction,
-            expected_offset,
-            next_offset: None,
-            reason,
+            direction: gap.direction,
+            expected_offset: gap.expected_offset,
+            next_offset: gap.next_offset,
+            reason: gap.reason,
         },
     })
 }
@@ -611,6 +661,53 @@ mod tests {
         assert_eq!(bytes.stream_offset, 5);
     }
 
+    #[test]
+    fn displacement_gaps_preserve_offsets_for_authorized_payload_directions() {
+        let mut tracked = tracked_flow_with_capacity(7, 1);
+        let _ = write_events(
+            &mut tracked,
+            &write_observation(7, 5, b"GET /", false, false),
+            timestamp(1),
+        );
+        let displacement = tracked
+            .insert_flow(
+                DescriptorLease::new(100, 8, 1, 10).expect("test descriptor lease should be valid"),
+                flow("flow-8"),
+                PayloadDirections::from_directions([Direction::Outbound, Direction::Inbound]),
+            )
+            .expect("bounded tracker should evict the first flow");
+
+        let events = tracked_flow_displacement_gap_events(displacement, timestamp(2));
+
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| matches!(
+            event,
+            CaptureEvent::Gap(gap)
+                if gap.origin.source() == CaptureSource::EbpfSyscall
+                    && gap.enforcement_evidence
+                        == EnforcementEvidence::observation_only_with_detail(
+                            ObservationOnlyReason::ProviderStateBoundary,
+                            gap.gap.reason.clone()
+                        )
+                    && gap.enforcement_evidence_propagation
+                        == EnforcementEvidencePropagation::Event
+                    && gap.gap.next_offset.is_none()
+                    && gap.gap.reason.contains("tracked-flow capacity was exceeded")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CaptureEvent::Gap(gap)
+                if gap.gap.direction == Direction::Outbound
+                    && gap.gap.expected_offset == 5
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CaptureEvent::Gap(gap)
+                if gap.gap.direction == Direction::Inbound
+                    && gap.gap.expected_offset == 0
+        )));
+    }
+
     fn tracked_flow(fd: i32) -> TrackedEbpfFlows {
         tracked_flow_with_directions(
             fd,
@@ -622,11 +719,32 @@ mod tests {
         fd: i32,
         payload_directions: PayloadDirections,
     ) -> TrackedEbpfFlows {
-        let mut tracked = TrackedEbpfFlows::bounded(8);
-        tracked.insert_flow(
-            DescriptorLease::new(100, fd, 1, 10).expect("test descriptor lease should be valid"),
-            flow(&format!("flow-{fd}")),
-            payload_directions,
+        tracked_flow_with_capacity_and_directions(fd, 8, payload_directions)
+    }
+
+    fn tracked_flow_with_capacity(fd: i32, capacity: usize) -> TrackedEbpfFlows {
+        tracked_flow_with_capacity_and_directions(
+            fd,
+            capacity,
+            PayloadDirections::from_directions([Direction::Outbound, Direction::Inbound]),
+        )
+    }
+
+    fn tracked_flow_with_capacity_and_directions(
+        fd: i32,
+        capacity: usize,
+        payload_directions: PayloadDirections,
+    ) -> TrackedEbpfFlows {
+        let mut tracked = TrackedEbpfFlows::bounded(capacity);
+        assert!(
+            tracked
+                .insert_flow(
+                    DescriptorLease::new(100, fd, 1, 10)
+                        .expect("test descriptor lease should be valid"),
+                    flow(&format!("flow-{fd}")),
+                    payload_directions,
+                )
+                .is_none()
         );
         tracked
     }

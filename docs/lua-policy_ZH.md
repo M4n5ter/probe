@@ -87,7 +87,21 @@ policy alert、verdict、runtime error、enforcement decision、capture loss 和
 | `event.degraded` | 证据已知不完整时为 `true`。 |
 | `event.direction` | `inbound`、`outbound`，或无方向事件的 `nil`。 |
 | `event.enforcement_evidence.kind` | `destructive_allowed` 或 `observation_only`。 |
+| `event.enforcement_evidence.reason` | `observation_only` 时存在；取值见下方列表。 |
+| `event.enforcement_evidence.detail` | `observation_only` 的可选可读细节。 |
 | `event.kind.type` | 事件专属 kind discriminator。 |
+
+Observation-only reason 取值：
+
+| Reason | 触发条件 | 作用范围 | 策略建议 |
+| --- | --- | --- | --- |
+| `ebpf_syscall_payload_snapshot` | eBPF syscall bounded sampling 产生 payload bytes 或 byte-range gap。 | Flow-carried，直到 flow close 或被移除。 | 将 payload 视为 best-effort；破坏性 enforcement 会被拒绝。 |
+| `ebpf_unresolved_flow` | eBPF 观察到 socket action，但无法解析到强 flow identity。 | Event-local。 | 只用于审计和遥测，不用于 connection enforcement。 |
+| `ebpf_process_lifecycle_boundary` | process exit 或 exec 使 active payload-tracked flow 的 fd-table continuity 失效。 | Flow-carried，直到 flow close 或被移除。 | 将该 flow 后续 parser output 视为 observation-only。 |
+| `provider_state_boundary` | provider userspace state 被置换，例如 tracked-flow capacity eviction。 | Event-local terminal flow boundary。 | 将其视为不依赖后续 close 的 payload continuity break。 |
+| `provider_capture_loss` | capture provider 报告可能影响 active tracked flows 的 lost observations。 | Flow-carried fan-out gap；provider-level capture loss 是 audit/export output，不会交给 Lua。 | 假设 bytes、lifecycle 或 parser state 可能不完整。 |
+
+`event.enforcement_evidence.detail` 是诊断文本。策略不得把它解析为稳定 API。
 
 `event.flow` 携带进程与 socket 归因：
 

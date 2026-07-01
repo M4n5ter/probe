@@ -9,7 +9,7 @@ use std::{
 };
 
 use capture::{
-    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CapturedBytes,
+    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CapturedBytes, CapturedGap,
     EnforcementEvidencePropagation,
 };
 use enforcement::{EnforcementPlanRequest, EnforcementPlanner};
@@ -189,9 +189,20 @@ fn enforcement_evidence_priority(evidence: &EnforcementEvidence) -> u8 {
             ObservationOnlyReason::EbpfSyscallPayloadSnapshot => 1,
             ObservationOnlyReason::EbpfUnresolvedFlow => 2,
             ObservationOnlyReason::EbpfProcessLifecycleBoundary => 3,
-            ObservationOnlyReason::ProviderCaptureLoss => 4,
+            ObservationOnlyReason::ProviderStateBoundary => 4,
+            ObservationOnlyReason::ProviderCaptureLoss => 5,
         },
     }
+}
+
+fn is_terminal_provider_state_boundary_gap(gap: &CapturedGap) -> bool {
+    matches!(
+        &gap.enforcement_evidence,
+        EnforcementEvidence::ObservationOnly {
+            reason: ObservationOnlyReason::ProviderStateBoundary,
+            ..
+        }
+    )
 }
 
 #[derive(Clone)]
@@ -484,14 +495,17 @@ where
                 self.process_captured_bytes(chunk, summary, &mut emissions)?;
             }
             CaptureEvent::Gap(gap) => {
+                let flow_id = gap.flow.id.clone();
+                let terminal_provider_state_boundary =
+                    is_terminal_provider_state_boundary_gap(&gap);
                 let enforcement_evidence = self.flow_enforcement_evidence.effective_for_event(
-                    &gap.flow.id,
+                    &flow_id,
                     &gap.enforcement_evidence,
                     gap.enforcement_evidence_propagation,
                 );
                 let parser_events = self
                     .parser_factory
-                    .parser_for_flow(&gap.flow.id)
+                    .parser_for_flow(&flow_id)
                     .ingest(ParserInput::Gap {
                         direction: gap.gap.direction,
                         expected_offset: gap.gap.expected_offset,
@@ -511,6 +525,10 @@ where
                     let written =
                         self.append_envelope_and_policy_outcomes(envelope, &mut emissions)?;
                     add_export_events_to_summary(summary, written);
+                }
+                if terminal_provider_state_boundary {
+                    self.parser_factory.remove_flow(&flow_id);
+                    self.flow_enforcement_evidence.release(&flow_id);
                 }
             }
             CaptureEvent::Loss(loss) => {

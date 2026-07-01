@@ -10,6 +10,13 @@ pub(crate) struct BoundedRecencyMap<K, V> {
     max_entries: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoundedInsertDisplacement<K, V> {
+    Replaced { key: K, value: V },
+    Evicted { key: K, value: V },
+    Dropped { key: K, value: V },
+}
+
 impl<K, V> BoundedRecencyMap<K, V>
 where
     K: Clone + Eq + Hash,
@@ -23,16 +30,29 @@ where
     }
 
     pub(crate) fn insert(&mut self, key: K, value: V) {
+        let _ = self.insert_displacing(key, value);
+    }
+
+    pub(crate) fn insert_displacing(
+        &mut self,
+        key: K,
+        value: V,
+    ) -> Option<BoundedInsertDisplacement<K, V>> {
         if self.max_entries == 0 {
-            return;
+            return Some(BoundedInsertDisplacement::Dropped { key, value });
         }
         if self.entries.contains_key(&key) {
             self.recency_order.retain(|tracked_key| tracked_key != &key);
+            self.recency_order.push_back(key.clone());
+            self.entries
+                .insert(key.clone(), value)
+                .map(|value| BoundedInsertDisplacement::Replaced { key, value })
         } else {
-            self.evict_until_available();
+            let evicted = self.evict_until_available();
+            self.recency_order.push_back(key.clone());
+            self.entries.insert(key, value);
+            evicted.map(|(key, value)| BoundedInsertDisplacement::Evicted { key, value })
         }
-        self.recency_order.push_back(key.clone());
-        self.entries.insert(key, value);
     }
 
     pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
@@ -73,15 +93,16 @@ where
             .filter_map(|key| self.entries.get(key))
     }
 
-    fn evict_until_available(&mut self) {
+    fn evict_until_available(&mut self) -> Option<(K, V)> {
         while self.entries.len() >= self.max_entries {
             let Some(evicted) = self.recency_order.pop_front() else {
                 self.entries.clear();
-                break;
+                return None;
             };
-            if self.entries.remove(&evicted).is_some() {
-                break;
+            if let Some(value) = self.entries.remove(&evicted) {
+                return Some((evicted, value));
             }
         }
+        None
     }
 }

@@ -1,7 +1,7 @@
 use crate::CaptureError;
 
 use super::{
-    EbpfProcessObservation, EbpfProcessObservationProbe,
+    EbpfProcessObservation, EbpfProcessObservationProbe, descriptor_lease::DescriptorLeaseKey,
     payload_authorization::SocketPayloadSampleAuthorization,
 };
 
@@ -12,6 +12,13 @@ pub(super) trait EbpfObservationSource {
         &mut self,
         authorization: SocketPayloadSampleAuthorization,
     ) -> Result<(), CaptureError>;
+
+    fn revoke_socket_payload_sample(
+        &mut self,
+        _key: DescriptorLeaseKey,
+    ) -> Result<(), CaptureError> {
+        Ok(())
+    }
 
     fn process_output_loss_count(&mut self) -> Result<u64, CaptureError> {
         Ok(0)
@@ -35,6 +42,15 @@ impl EbpfObservationSource for ProbeObservationSource {
     ) -> Result<(), CaptureError> {
         self.probe
             .allow_socket_payload_sample(authorization)
+            .map_err(|error| CaptureError::provider("ebpf", error.to_string()))
+    }
+
+    fn revoke_socket_payload_sample(
+        &mut self,
+        key: DescriptorLeaseKey,
+    ) -> Result<(), CaptureError> {
+        self.probe
+            .revoke_socket_payload_sample(key)
             .map_err(|error| CaptureError::provider("ebpf", error.to_string()))
     }
 
