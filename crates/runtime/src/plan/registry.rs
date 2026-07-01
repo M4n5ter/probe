@@ -153,7 +153,7 @@ fn default_platform_capabilities(
         CapabilityState::available(CapabilityKind::WebSocketFrame),
         CapabilityState::degraded(
             CapabilityKind::WebSocketMessage,
-            "WebSocket parser emits complete text/binary message metadata up to 16 MiB for non-extension payloads; oversized messages keep frame metadata and omit websocket_message, while extension-compressed payloads and full message storage are not supported",
+            "WebSocket parser emits complete text/binary message payloads up to 16 MiB for non-extension payloads; oversized messages keep frame metadata and omit websocket_message, while extension-compressed payloads are not supported",
         ),
         CapabilityState::degraded(
             CapabilityKind::PolicyRuntime,

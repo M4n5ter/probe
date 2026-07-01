@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64 = "0.22"
 blake3 = "1.8.5"
 bytes = { version = "1.11.1", features = ["serde"] }
 globset = "0.4.18"

@@ -9,7 +9,7 @@ use super::{
 use crate::e2e::{
     harness::e2e_error,
     plaintext_assertions::has_header,
-    websocket_expectations::{FRAME_PAYLOAD_FINGERPRINT, FRAME_PAYLOAD_LEN},
+    websocket_expectations::{FRAME_PAYLOAD, FRAME_PAYLOAD_FINGERPRINT, FRAME_PAYLOAD_LEN},
 };
 
 pub(super) fn assert_expected_websocket_bridge_export(
@@ -100,6 +100,7 @@ fn matches_websocket_text_message(kind: &EventKind, response_direction: Directio
                 && message.final_frame_sequence == 1
                 && matches!(message.opcode, WebSocketMessageOpcode::Text)
                 && message.payload_len == FRAME_PAYLOAD_LEN
+                && message.payload.as_ref() == FRAME_PAYLOAD
                 && message.payload_fingerprint.as_slice()
                     == FRAME_PAYLOAD_FINGERPRINT.as_slice()
     )

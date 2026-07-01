@@ -21,8 +21,8 @@ use super::{
     },
     plaintext_assertions::has_header,
     websocket_expectations::{
-        FRAME_PAYLOAD_BYTES, FRAME_PAYLOAD_FINGERPRINT, FRAME_PAYLOAD_LEN, REQUEST_TARGET,
-        RFC_SAMPLE_WEBSOCKET_ACCEPT, SUBPROTOCOL,
+        FRAME_PAYLOAD, FRAME_PAYLOAD_BYTES, FRAME_PAYLOAD_FINGERPRINT, FRAME_PAYLOAD_LEN,
+        REQUEST_TARGET, RFC_SAMPLE_WEBSOCKET_ACCEPT, SUBPROTOCOL,
     },
 };
 
@@ -34,7 +34,7 @@ const POLICY_VERSION: &str = "e2e";
 const EXPECTED_POLICY_VERSION: &str = "libpcap-websocket-e2e-policy@e2e";
 const HANDOFF_ALERT: &str = "libpcap websocket handoff /chat chat";
 const FRAME_ALERT: &str = "libpcap websocket frame text 2";
-const MESSAGE_ALERT: &str = "libpcap websocket message text 2";
+const MESSAGE_ALERT: &str = "libpcap websocket message text hi";
 
 pub(crate) fn run() -> ExitCode {
     match run_inner() {
@@ -150,7 +150,7 @@ end
 
 function on_websocket_message(event)
   return probe.emit_alert(
-    "libpcap websocket message " .. event.kind.opcode.kind .. " " .. tostring(event.kind.payload_len)
+    "libpcap websocket message " .. event.kind.opcode.kind .. " " .. event.kind.payload_text
   )
 end
 "#,
@@ -302,6 +302,7 @@ fn assert_websocket_exports(envelopes: &[EventEnvelope]) -> Result<(), Box<dyn s
                     && message.final_frame_sequence == 1
                     && matches!(message.opcode, WebSocketMessageOpcode::Text)
                     && message.payload_len == FRAME_PAYLOAD_LEN
+                    && message.payload.as_ref() == FRAME_PAYLOAD
                     && message.payload_fingerprint.as_slice()
                         == FRAME_PAYLOAD_FINGERPRINT.as_slice()
         )

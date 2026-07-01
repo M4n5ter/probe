@@ -107,6 +107,7 @@ end
                 EventKind::WebSocketMessage(message)
                     if message.direction == Direction::Inbound
                         && message.payload_len == 2
+                        && message.payload.as_ref() == b"hi"
                         && message.message_sequence == 1
                         && message.first_frame_sequence == 1
                         && message.final_frame_sequence == 1

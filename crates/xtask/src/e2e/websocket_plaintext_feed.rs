@@ -28,7 +28,7 @@ const POLICY_ID: &str = "e2e-websocket-policy";
 const POLICY_VERSION: &str = "e2e";
 const HANDOFF_ALERT: &str = "websocket handoff /chat chat";
 const FRAME_ALERT: &str = "websocket frame text 2";
-const MESSAGE_ALERT: &str = "websocket message text 2";
+const MESSAGE_ALERT: &str = "websocket message text hi";
 
 pub(crate) fn run() -> ExitCode {
     match run_inner() {
@@ -156,7 +156,7 @@ end
 
 function on_websocket_message(event)
   return probe.emit_alert(
-    "websocket message " .. event.kind.opcode.kind .. " " .. tostring(event.kind.payload_len)
+    "websocket message " .. event.kind.opcode.kind .. " " .. event.kind.payload_text
   )
 end
 "#,
@@ -281,6 +281,7 @@ fn assert_websocket_exports(
                         && message.final_frame_sequence == 1
                         && matches!(message.opcode, WebSocketMessageOpcode::Text)
                         && message.payload_len == FRAME_PAYLOAD_LEN
+                        && message.payload.as_ref() == FRAME_PAYLOAD
                         && message.payload_fingerprint.as_slice()
                             == FRAME_PAYLOAD_FINGERPRINT.as_slice()
             )

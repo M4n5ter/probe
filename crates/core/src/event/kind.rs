@@ -1,5 +1,6 @@
 use std::{fmt, str::FromStr};
 
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -274,6 +275,8 @@ pub struct WebSocketMessage {
     pub final_frame_sequence: u64,
     pub opcode: WebSocketMessageOpcode,
     pub payload_len: u64,
+    #[serde(with = "base64_bytes")]
+    pub payload: Bytes,
     pub payload_fingerprint: Vec<u8>,
 }
 
@@ -294,6 +297,32 @@ pub enum WebSocketOpcode {
     Ping,
     Pong,
     Other { code: u8 },
+}
+
+mod base64_bytes {
+    use bytes::Bytes;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::STANDARD;
+    use base64::Engine;
+
+    pub(super) fn serialize<S>(bytes: &Bytes, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Bytes, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD
+            .decode(encoded)
+            .map(Bytes::from)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -581,7 +610,8 @@ mod tests {
     }
 
     #[test]
-    fn websocket_message_wire_type_matches_stable_event_name() {
+    fn websocket_message_wire_type_matches_stable_event_name()
+    -> Result<(), Box<dyn std::error::Error>> {
         let kind = EventKind::WebSocketMessage(WebSocketMessage {
             direction: Direction::Inbound,
             stream_sequence: 1,
@@ -590,6 +620,7 @@ mod tests {
             final_frame_sequence: 4,
             opcode: WebSocketMessageOpcode::Text,
             payload_len: 5,
+            payload: Bytes::from_static(b"hello"),
             payload_fingerprint: vec![1, 2, 3],
         });
         let value = serde_json::to_value(&kind).expect("event kind must serialize");
@@ -598,6 +629,11 @@ mod tests {
         assert_eq!(kind.name(), EventType::WebSocketMessage.as_str());
         assert_eq!(value["type"], EventType::WebSocketMessage.as_str());
         assert_eq!(value["opcode"]["kind"], "text");
+        assert_eq!(value["payload"], "aGVsbG8=");
+
+        let parsed = serde_json::from_value::<EventKind>(value)?;
+        assert_eq!(parsed, kind);
+        Ok(())
     }
 
     #[test]
@@ -739,6 +775,7 @@ mod tests {
                 final_frame_sequence: 1,
                 opcode: WebSocketMessageOpcode::Text,
                 payload_len: 5,
+                payload: Bytes::from_static(b"hello"),
                 payload_fingerprint: vec![1, 2, 3],
             }),
             EventKind::OpaqueStream(OpaqueStream {

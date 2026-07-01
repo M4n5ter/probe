@@ -280,6 +280,9 @@ How Lua policy should be written:
   a global Lua function in `main.lua`.
 - Each hook receives one typed `event` table. Common metadata is on `event`;
   protocol fields are on `event.kind`.
+- WebSocket text messages up to 64 KiB expose `event.kind.payload_text`;
+  larger text messages and binary messages expose length and fingerprint
+  without expanding payload bytes into a Lua table.
 - A hook may return `nil`, one outcome, or an array of outcomes.
 - `probe.emit_alert(message)` creates audit telemetry.
 - `probe.verdict { ... }` requests a protective action. It becomes destructive
@@ -322,8 +325,20 @@ function on_http_request_headers(event)
 end
 
 function on_websocket_message(event)
-  if event.kind.opcode.kind == "text" and event.kind.payload_len > 65536 then
+  if event.kind.opcode.kind ~= "text" then
+    return nil
+  end
+
+  if event.kind.payload_len > 65536 then
     return probe.emit_alert("large websocket text message")
+  end
+
+  if event.kind.payload_text == nil then
+    return nil
+  end
+
+  if string.find(event.kind.payload_text, "token=", 1, true) then
+    return probe.emit_alert("websocket message contains token material")
   end
 end
 ```

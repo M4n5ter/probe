@@ -256,6 +256,9 @@ Lua policy 写法：
   `main.lua` 中实现为同名全局 Lua 函数。
 - 每个 hook 接收一个 typed `event` table。通用 metadata 在 `event` 上，
   协议字段在 `event.kind` 上。
+- 64 KiB 以内的 WebSocket text message 暴露 `event.kind.payload_text`；
+  更大的 text message 和 binary message 暴露 length 与 fingerprint，
+  不会把 payload bytes 展开成 Lua table。
 - hook 可以返回 `nil`、一个 outcome，或 outcome 数组。
 - `probe.emit_alert(message)` 产生审计 telemetry。
 - `probe.verdict { ... }` 请求防护动作。只有 enforcement mode、selector、
@@ -297,8 +300,20 @@ function on_http_request_headers(event)
 end
 
 function on_websocket_message(event)
-  if event.kind.opcode.kind == "text" and event.kind.payload_len > 65536 then
+  if event.kind.opcode.kind ~= "text" then
+    return nil
+  end
+
+  if event.kind.payload_len > 65536 then
     return probe.emit_alert("large websocket text message")
+  end
+
+  if event.kind.payload_text == nil then
+    return nil
+  end
+
+  if string.find(event.kind.payload_text, "token=", 1, true) then
+    return probe.emit_alert("websocket message contains token material")
   end
 end
 ```

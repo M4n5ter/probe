@@ -541,6 +541,7 @@ mod tests {
               elseif kind.type == "websocket_message" then
                 return kind.opcode.kind .. ":" ..
                   tostring(kind.payload_len) .. ":" ..
+                  kind.payload_text .. ":" ..
                   tostring(kind.first_frame_sequence) .. "-" ..
                   tostring(kind.final_frame_sequence)
               elseif kind.type == "opaque_stream" then
@@ -698,6 +699,7 @@ mod tests {
                 event.kind.type .. " " ..
                 event.kind.opcode.kind .. " " ..
                 tostring(event.kind.payload_len) .. " " ..
+                event.kind.payload_text .. " " ..
                 tostring(event.kind.first_frame_sequence) .. "-" ..
                 tostring(event.kind.final_frame_sequence)
               )
@@ -709,7 +711,69 @@ mod tests {
         let outcomes = runtime.handle_event(primary_hook_for_event(&event), &event)?;
 
         assert!(
-            matches!(outcomes.first(), Some(PolicyOutcome::Alert(alert)) if alert.message == "websocket_message text 5 1-2")
+            matches!(outcomes.first(), Some(PolicyOutcome::Alert(alert)) if alert.message == "websocket_message text 5 hello 1-2")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lua_policy_does_not_expand_binary_websocket_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "websocket-binary-message".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::WebSocketMessage],
+            },
+            r#"
+            function on_websocket_message(event)
+              return probe.emit_alert(
+                tostring(event.kind.payload == nil) .. " " ..
+                tostring(event.kind.payload_text == nil) .. " " ..
+                event.kind.opcode.kind .. " " ..
+                tostring(event.kind.payload_len)
+              )
+            end
+            "#,
+        )?;
+
+        let event =
+            websocket_message_event_with_payload(WebSocketMessageOpcode::Binary, vec![0, 255]);
+        let outcomes = runtime.handle_event(primary_hook_for_event(&event), &event)?;
+
+        assert!(
+            matches!(outcomes.first(), Some(PolicyOutcome::Alert(alert)) if alert.message == "true true binary 2")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lua_policy_omits_large_websocket_payload_text_before_hook()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = PolicyRuntime::from_source(
+            PolicyManifest {
+                id: "websocket-large-text-message".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::WebSocketMessage],
+            },
+            r#"
+            function on_websocket_message(event)
+              if event.kind.payload_text == nil and event.kind.payload_len > 65536 then
+                return probe.emit_alert("large text omitted " .. tostring(event.kind.payload_len))
+              end
+              return probe.emit_alert("unexpected payload text")
+            end
+            "#,
+        )?;
+
+        let event = websocket_message_event_with_payload(
+            WebSocketMessageOpcode::Text,
+            vec![b'a'; 64 * 1024 + 1],
+        );
+        let outcomes = runtime.handle_event(primary_hook_for_event(&event), &event)?;
+
+        assert!(
+            matches!(outcomes.first(), Some(PolicyOutcome::Alert(alert)) if alert.message == "large text omitted 65537")
         );
         Ok(())
     }
@@ -1017,7 +1081,7 @@ mod tests {
             ),
             (
                 websocket_message_event(),
-                "websocket_message 50000->80 text:5:1-2",
+                "websocket_message 50000->80 text:5:hello:1-2",
             ),
             (
                 demo_event_with_kind(EventKind::OpaqueStream(OpaqueStream {
@@ -1130,14 +1194,24 @@ mod tests {
     }
 
     fn websocket_message_event() -> EventEnvelope {
+        websocket_message_event_with_payload(WebSocketMessageOpcode::Text, b"hello".to_vec())
+    }
+
+    fn websocket_message_event_with_payload(
+        opcode: WebSocketMessageOpcode,
+        payload: Vec<u8>,
+    ) -> EventEnvelope {
+        let payload_len =
+            u64::try_from(payload.len()).expect("test payload length should fit into u64");
         demo_event_with_kind(EventKind::WebSocketMessage(WebSocketMessage {
             direction: Direction::Inbound,
             stream_sequence: 1,
             message_sequence: 1,
             first_frame_sequence: 1,
             final_frame_sequence: 2,
-            opcode: WebSocketMessageOpcode::Text,
-            payload_len: 5,
+            opcode,
+            payload_len,
+            payload: payload.into(),
             payload_fingerprint: vec![1, 2, 3],
         }))
     }

@@ -54,7 +54,7 @@ capabilities are removed: `require`, `io`, `os`, `package`, `debug`, `ffi`,
 | `on_sse_event` | Server-Sent Events semantic event. |
 | `on_websocket_handoff` | HTTP Upgrade handoff into WebSocket mode. |
 | `on_websocket_frame` | Individual WebSocket frame metadata. |
-| `on_websocket_message` | Reassembled bounded WebSocket message metadata. |
+| `on_websocket_message` | Reassembled bounded WebSocket message. |
 | `on_opaque_stream` | Bytes that could not be parsed as a supported protocol. |
 | `on_gap` | Parser or provider gap. |
 | `on_protocol_error` | Protocol parse error. |
@@ -147,6 +147,7 @@ WebSocket message fields:
 - `final_frame_sequence`
 - `opcode`
 - `payload_len`
+- `payload_text` for complete UTF-8 text payloads up to 64 KiB
 - `payload_fingerprint`
 
 `headers` is a 1-indexed array of two-element arrays:
@@ -161,7 +162,10 @@ the opcode kind is `text` or `binary`.
 
 `data` fields are bounded byte arrays or strings depending on event kind. Byte
 arrays and fingerprints are 1-indexed arrays of integer byte values, and
-fingerprints are not plaintext payload retention.
+fingerprints are not plaintext payload retention. WebSocket message payload
+bytes are retained in exported events, but Lua does not receive a raw `payload`
+byte array; text messages larger than 64 KiB and binary messages should be
+handled through `payload_len`, `payload_fingerprint`, and `opcode`.
 
 ## Outcomes
 
@@ -258,12 +262,21 @@ function on_sse_event(event)
 end
 ```
 
-Inspect WebSocket message metadata:
+Inspect WebSocket text messages:
 
 ```lua
 function on_websocket_message(event)
-  if event.kind.opcode.kind == "text" and event.kind.payload_len > 65536 then
+  if event.kind.opcode.kind ~= "text" then
+    return nil
+  end
+
+  if event.kind.payload_len > 65536 then
     return probe.emit_alert("large text websocket message")
+  end
+
+  if event.kind.payload_text ~= nil and
+      string.find(event.kind.payload_text, "token=", 1, true) then
+    return probe.emit_alert("websocket message contains token material")
   end
 end
 ```

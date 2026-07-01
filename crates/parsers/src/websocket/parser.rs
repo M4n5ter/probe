@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use probe_core::{
     Direction, EventKind, ProtocolError, WebSocketFrame, WebSocketMessage, WebSocketMessageOpcode,
     WebSocketOpcode,
@@ -441,18 +441,9 @@ impl WebSocketMessageAggregator {
         let Some(PendingWebSocketMessage::Aggregating(message)) = self.pending.as_mut() else {
             return;
         };
-        let payload_len =
-            u64::try_from(payload.len()).expect("payload slice length should fit into u64");
-        let Some(next_payload_len) = message.payload_len.checked_add(payload_len) else {
+        if !message.append_payload(payload, mask_key, payload_offset) {
             self.skip();
-            return;
-        };
-        if next_payload_len > MAX_WEBSOCKET_MESSAGE_PAYLOAD_BYTES {
-            self.skip();
-            return;
         }
-        update_payload_hash(&mut message.hasher, payload, mask_key, payload_offset);
-        message.payload_len = next_payload_len;
     }
 
     fn on_frame_complete(
@@ -468,6 +459,8 @@ impl WebSocketMessageAggregator {
         let PendingWebSocketMessage::Aggregating(message) = message else {
             return None;
         };
+        let payload_fingerprint = message.payload_fingerprint();
+        let payload = Bytes::from(message.payload);
         self.sequence = self.sequence.saturating_add(1);
         Some(WebSocketMessage {
             direction,
@@ -477,7 +470,8 @@ impl WebSocketMessageAggregator {
             final_frame_sequence: frame.frame_sequence,
             opcode: message.opcode,
             payload_len: message.payload_len,
-            payload_fingerprint: message.payload_fingerprint(),
+            payload,
+            payload_fingerprint,
         })
     }
 
@@ -498,6 +492,7 @@ impl PendingWebSocketMessage {
             opcode,
             first_frame_sequence,
             payload_len: 0,
+            payload: Vec::new(),
             hasher: blake3::Hasher::new(),
         }))
     }
@@ -512,11 +507,37 @@ struct AggregatingWebSocketMessage {
     opcode: WebSocketMessageOpcode,
     first_frame_sequence: u64,
     payload_len: u64,
+    payload: Vec<u8>,
     hasher: blake3::Hasher,
 }
 
 impl AggregatingWebSocketMessage {
-    fn payload_fingerprint(self) -> Vec<u8> {
+    fn append_payload(
+        &mut self,
+        payload: &[u8],
+        mask_key: Option<[u8; 4]>,
+        payload_offset: u64,
+    ) -> bool {
+        let payload_len =
+            u64::try_from(payload.len()).expect("payload slice length should fit into u64");
+        let Some(next_payload_len) = self.payload_len.checked_add(payload_len) else {
+            return false;
+        };
+        if next_payload_len > MAX_WEBSOCKET_MESSAGE_PAYLOAD_BYTES {
+            return false;
+        }
+        update_payload_hash_and_collect(
+            &mut self.hasher,
+            payload,
+            mask_key,
+            payload_offset,
+            &mut self.payload,
+        );
+        self.payload_len = next_payload_len;
+        true
+    }
+
+    fn payload_fingerprint(&self) -> Vec<u8> {
         self.hasher.finalize().as_bytes()[..16].to_vec()
     }
 }
@@ -642,6 +663,30 @@ fn update_payload_hash(
     mask_key: Option<[u8; 4]>,
     payload_offset: u64,
 ) {
+    visit_unmasked_payload_chunks(payload, mask_key, payload_offset, |chunk| {
+        hasher.update(chunk);
+    });
+}
+
+fn update_payload_hash_and_collect(
+    hasher: &mut blake3::Hasher,
+    payload: &[u8],
+    mask_key: Option<[u8; 4]>,
+    payload_offset: u64,
+    output: &mut Vec<u8>,
+) {
+    visit_unmasked_payload_chunks(payload, mask_key, payload_offset, |chunk| {
+        hasher.update(chunk);
+        output.extend_from_slice(chunk);
+    });
+}
+
+fn visit_unmasked_payload_chunks(
+    payload: &[u8],
+    mask_key: Option<[u8; 4]>,
+    payload_offset: u64,
+    mut visit: impl FnMut(&[u8]),
+) {
     match mask_key {
         Some(mask_key) => {
             let mut scratch = [0u8; MASK_HASH_SCRATCH_BYTES];
@@ -650,12 +695,12 @@ fn update_payload_hash(
                 for (index, byte) in chunk.iter().enumerate() {
                     scratch[index] = *byte ^ mask_key[(offset + index) % mask_key.len()];
                 }
-                hasher.update(&scratch[..chunk.len()]);
+                visit(&scratch[..chunk.len()]);
                 offset = offset.saturating_add(chunk.len());
             }
         }
         None => {
-            hasher.update(payload);
+            visit(payload);
         }
     };
 }
@@ -699,6 +744,7 @@ mod tests {
                     && message.final_frame_sequence == 1
                     && message.opcode == WebSocketMessageOpcode::Text
                     && message.payload_len == 5
+                    && message.payload == Bytes::from_static(b"hello")
                     && message.payload_fingerprint == payload_fingerprint(b"hello", None)
         ));
         assert!(parser.is_checkpoint_safe());
@@ -723,6 +769,12 @@ mod tests {
             EventKind::WebSocketFrame(frame)
                 if frame.masked
                     && frame.payload_fingerprint == payload_fingerprint(b"hello", None)
+        ));
+        assert!(matches!(
+            &events[1],
+            EventKind::WebSocketMessage(message)
+                if message.payload == Bytes::from_static(b"hello")
+                    && message.payload_fingerprint == payload_fingerprint(b"hello", None)
         ));
     }
 
@@ -805,6 +857,7 @@ mod tests {
                     && message.final_frame_sequence == 2
                     && message.opcode == WebSocketMessageOpcode::Text
                     && message.payload_len == 5
+                    && message.payload == Bytes::from_static(b"hello")
                     && message.payload_fingerprint == payload_fingerprint(b"hello", None)
         ));
         assert!(parser.is_checkpoint_safe());

@@ -7,6 +7,8 @@ use probe_core::{
 };
 use serde::Serialize;
 
+const MAX_POLICY_WEBSOCKET_PAYLOAD_TEXT_BYTES: usize = 64 * 1024;
+
 pub(crate) struct PolicyEventViewBuildError {
     pub(crate) event_type: EventType,
 }
@@ -399,11 +401,14 @@ struct PolicyWebSocketMessageView<'a> {
     final_frame_sequence: u64,
     opcode: PolicyWebSocketMessageOpcodeView,
     payload_len: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_text: Option<&'a str>,
     payload_fingerprint: &'a [u8],
 }
 
 impl<'a> PolicyWebSocketMessageView<'a> {
     fn from_message(message: &'a WebSocketMessage) -> Self {
+        let payload_text = policy_websocket_payload_text(message);
         Self {
             direction: direction_name(message.direction),
             stream_sequence: message.stream_sequence,
@@ -412,9 +417,19 @@ impl<'a> PolicyWebSocketMessageView<'a> {
             final_frame_sequence: message.final_frame_sequence,
             opcode: PolicyWebSocketMessageOpcodeView::from_opcode(message.opcode),
             payload_len: message.payload_len,
+            payload_text,
             payload_fingerprint: &message.payload_fingerprint,
         }
     }
+}
+
+fn policy_websocket_payload_text(message: &WebSocketMessage) -> Option<&str> {
+    if message.opcode != WebSocketMessageOpcode::Text
+        || message.payload.len() > MAX_POLICY_WEBSOCKET_PAYLOAD_TEXT_BYTES
+    {
+        return None;
+    }
+    std::str::from_utf8(&message.payload).ok()
 }
 
 #[derive(Serialize)]
