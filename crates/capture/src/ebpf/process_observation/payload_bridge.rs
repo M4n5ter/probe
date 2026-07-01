@@ -31,8 +31,10 @@ pub(super) fn write_events(
             buffer: write.buffer.as_slice(),
             truncated: write.truncated,
             read_failed: write.read_failed,
+            kernel_transfer: write.kernel_transfer,
             base_reason: EBPF_WRITE_ARGUMENT_SAMPLE_REASON,
             read_failed_reason: "eBPF outbound syscall argument sample could not read userspace payload buffer",
+            kernel_transfer_reason: "eBPF outbound kernel-transfer syscall moved bytes without a userspace payload buffer; payload content is unavailable",
             empty_reason: "eBPF outbound syscall sample did not contain captured payload bytes",
             truncated_prefix: "eBPF outbound syscall sample truncated payload",
         },
@@ -56,8 +58,10 @@ pub(super) fn read_events(
             buffer: read.buffer.as_slice(),
             truncated: read.truncated,
             read_failed: read.read_failed,
+            kernel_transfer: false,
             base_reason: EBPF_READ_RESULT_SAMPLE_REASON,
             read_failed_reason: "eBPF inbound syscall result sample could not read userspace payload buffer",
+            kernel_transfer_reason: "",
             empty_reason: "eBPF inbound syscall sample did not contain captured payload bytes",
             truncated_prefix: "eBPF inbound syscall sample truncated payload",
         },
@@ -121,8 +125,10 @@ struct PayloadSample<'a> {
     buffer: &'a [u8],
     truncated: bool,
     read_failed: bool,
+    kernel_transfer: bool,
     base_reason: &'static str,
     read_failed_reason: &'static str,
+    kernel_transfer_reason: &'static str,
     empty_reason: &'static str,
     truncated_prefix: &'static str,
 }
@@ -139,6 +145,17 @@ fn payload_events(tracked: &mut TrackedEbpfFlow, sample: PayloadSample<'_>) -> V
             start,
             Some(end),
             sample.read_failed_reason.to_string(),
+        )];
+    }
+    if sample.kernel_transfer {
+        set_stream_offset(tracked, sample.direction, end);
+        return vec![ebpf_payload_gap(
+            sample.timestamp,
+            tracked.flow.clone(),
+            sample.direction,
+            start,
+            Some(end),
+            sample.kernel_transfer_reason.to_string(),
         )];
     }
     let captured_len = sample.buffer.len() as u64;
@@ -470,6 +487,39 @@ mod tests {
     }
 
     #[test]
+    fn payload_bridge_emits_gap_for_kernel_transfer_write() {
+        let mut tracked = tracked_flow(7);
+        let events = write_events(
+            &mut tracked,
+            &write_observation_with_kernel_transfer(7, 9),
+            timestamp(1),
+        );
+
+        let [CaptureEvent::Gap(gap)] = events.as_slice() else {
+            panic!("expected a single kernel-transfer gap event: {events:?}");
+        };
+        assert_eq!(gap.gap.direction, Direction::Outbound);
+        assert_eq!(gap.gap.expected_offset, 0);
+        assert_eq!(gap.gap.next_offset, Some(9));
+        assert!(gap.gap.reason.contains("kernel-transfer syscall"));
+        assert!(
+            gap.gap
+                .reason
+                .contains("without a userspace payload buffer")
+        );
+
+        let next = write_events(
+            &mut tracked,
+            &write_observation(7, 1, b"x", false, false),
+            timestamp(2),
+        );
+        let [CaptureEvent::Bytes(bytes)] = next.as_slice() else {
+            panic!("expected write bytes after kernel-transfer gap: {next:?}");
+        };
+        assert_eq!(bytes.stream_offset, 9);
+    }
+
+    #[test]
     fn payload_bridge_emits_gap_for_truncated_empty_payload() {
         let mut tracked = tracked_flow(7);
         let events = write_events(
@@ -596,6 +646,23 @@ mod tests {
             buffer: payload.to_vec(),
             truncated,
             read_failed,
+            kernel_transfer: false,
+        }
+    }
+
+    fn write_observation_with_kernel_transfer(
+        fd: i32,
+        original_len: u32,
+    ) -> EbpfSocketWriteObservation {
+        EbpfSocketWriteObservation {
+            process: observed_process(),
+            fd,
+            fd_generation: 10,
+            original_len,
+            buffer: Vec::new(),
+            truncated: false,
+            read_failed: false,
+            kernel_transfer: true,
         }
     }
 

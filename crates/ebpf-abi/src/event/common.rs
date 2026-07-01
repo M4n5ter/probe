@@ -1,5 +1,5 @@
 pub const EBPF_MAGIC: u32 = 0x4252_5054;
-pub const EBPF_ABI_REVISION: u16 = 13;
+pub const EBPF_ABI_REVISION: u16 = 14;
 pub const EBPF_RING_BUFFER_BYTES: u32 = 256 * 1024;
 pub const EBPF_EVENT_HEADER_BYTES: usize = core::mem::size_of::<EbpfEventHeader>();
 
@@ -109,6 +109,8 @@ pub enum EbpfEventDecodeError {
     InvalidSocketWriteOriginalLength { captured: u16, original: u32 },
     InvalidSocketWriteIncompleteSample { captured: u16, original: u32 },
     InvalidSocketWriteReadFailure { captured: u16 },
+    InvalidSocketWriteKernelTransferFlags { flags: u16 },
+    InvalidSocketWriteKernelTransferPayload { captured: u16 },
     InvalidSocketReadCapturedLength { captured: u16, capacity: usize },
     InvalidSocketReadOriginalLength { captured: u16, original: u32 },
     InvalidSocketReadIncompleteSample { captured: u16, original: u32 },

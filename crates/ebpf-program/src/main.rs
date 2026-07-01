@@ -39,8 +39,9 @@ use read::{
     readv_source_from_tracepoint, recvmsg_source_from_tracepoint,
 };
 use write::{
-    capture_write_sample_from_source, pending_write_metadata, sendmsg_source_from_tracepoint,
-    trim_write_sample_to_result, write_source_from_tracepoint, writev_source_from_tracepoint,
+    capture_kernel_transfer_write_gap, capture_write_sample_from_source, pending_write_metadata,
+    sendfile_out_fd_from_tracepoint, sendmsg_source_from_tracepoint, trim_write_sample_to_result,
+    write_source_from_tracepoint, writev_source_from_tracepoint,
 };
 
 const FCNTL_CMD_OFFSET: usize = 24;
@@ -228,6 +229,30 @@ pub fn traffic_probe_sys_enter_sendmsg(ctx: TracePointContext) -> u32 {
 
 #[tracepoint(name = "sys_exit_sendmsg", category = "syscalls")]
 pub fn traffic_probe_sys_exit_sendmsg(ctx: TracePointContext) -> u32 {
+    emit_write_sample(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_enter_sendfile", category = "syscalls")]
+pub fn traffic_probe_sys_enter_sendfile(ctx: TracePointContext) -> u32 {
+    record_sendfile_attempt(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_exit_sendfile", category = "syscalls")]
+pub fn traffic_probe_sys_exit_sendfile(ctx: TracePointContext) -> u32 {
+    emit_write_sample(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_enter_sendfile64", category = "syscalls")]
+pub fn traffic_probe_sys_enter_sendfile64(ctx: TracePointContext) -> u32 {
+    record_sendfile_attempt(ctx);
+    0
+}
+
+#[tracepoint(name = "sys_exit_sendfile64", category = "syscalls")]
+pub fn traffic_probe_sys_exit_sendfile64(ctx: TracePointContext) -> u32 {
     emit_write_sample(ctx);
     0
 }
@@ -432,6 +457,13 @@ fn record_sendmsg_attempt(ctx: TracePointContext) {
     record_write_payload_attempt(source);
 }
 
+fn record_sendfile_attempt(ctx: TracePointContext) {
+    let Some(fd) = sendfile_out_fd_from_tracepoint(&ctx) else {
+        return;
+    };
+    record_kernel_transfer_write_gap(fd);
+}
+
 fn record_write_payload_attempt(source: payload::PayloadAttemptSource) {
     let Some(lease) = allowed_socket_payload_lease(source.fd, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE)
     else {
@@ -443,6 +475,19 @@ fn record_write_payload_attempt(source: payload::PayloadAttemptSource) {
     if capture_write_sample_from_source(source, pending).is_none() {
         return;
     }
+    pending.fd_generation = lease.fd_generation;
+    let key = bpf_get_current_pid_tgid();
+    let _ = TRAFFIC_PROBE_PENDING_WRITES.insert(&key, pending, 0);
+}
+
+fn record_kernel_transfer_write_gap(fd: i32) {
+    let Some(lease) = allowed_socket_payload_lease(fd, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE) else {
+        return;
+    };
+    let Some(pending) = pending_write_scratch() else {
+        return;
+    };
+    capture_kernel_transfer_write_gap(fd, pending);
     pending.fd_generation = lease.fd_generation;
     let key = bpf_get_current_pid_tgid();
     let _ = TRAFFIC_PROBE_PENDING_WRITES.insert(&key, pending, 0);

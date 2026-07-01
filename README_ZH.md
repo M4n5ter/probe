@@ -165,6 +165,9 @@ cargo run -p xtask --locked -- ebpf-build
   eBPF 不可用或未配置时的 live packet capture；需要 root 或 CAP_NET_RAW。
 - `ebpf`：
   kernel-assisted process-aware observation；需要 root/bpffs 和已构建 eBPF object。
+  深度观测受 selector gate 约束；syscall payload bytes 是 degraded evidence，
+  当前内核暴露的 `sendfile(2)`/`sendfile64(2)` tracepoint variant 输出
+  byte-count gap，不输出 payload bytes。
 - libssl uprobe：
   针对选定 libssl 进程的 best-effort TLS plaintext sidecar；需要
   root/bpffs、已构建 eBPF object 和显式 selector。

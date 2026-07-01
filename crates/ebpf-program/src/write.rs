@@ -1,7 +1,8 @@
 use aya_ebpf::programs::TracePointContext;
 use ebpf_abi::{
-    EBPF_SOCKET_WRITE_READ_FAILED, EBPF_SOCKET_WRITE_SAMPLE_BYTES, EBPF_SOCKET_WRITE_TRUNCATED,
-    EbpfPendingSocketWriteSample, EbpfSocketWriteMetadata,
+    EBPF_SOCKET_WRITE_KERNEL_TRANSFER, EBPF_SOCKET_WRITE_READ_FAILED,
+    EBPF_SOCKET_WRITE_SAMPLE_BYTES, EBPF_SOCKET_WRITE_TRUNCATED, EbpfPendingSocketWriteSample,
+    EbpfSocketWriteMetadata,
 };
 
 use super::payload::{
@@ -10,6 +11,8 @@ use super::payload::{
     payload_read_flag_bits, payload_sample_plan_from_source, read_payload_prefix_from_plan,
     single_buffer_payload_source_from_tracepoint, syscall_result_from_tracepoint,
 };
+
+const SENDFILE_OUT_FD_OFFSET: usize = 16;
 
 pub(crate) fn write_source_from_tracepoint(
     ctx: &TracePointContext,
@@ -29,6 +32,11 @@ pub(crate) fn sendmsg_source_from_tracepoint(
     msghdr_payload_source_from_tracepoint(ctx)
 }
 
+pub(crate) fn sendfile_out_fd_from_tracepoint(ctx: &TracePointContext) -> Option<i32> {
+    let fd = unsafe { ctx.read_at::<u64>(SENDFILE_OUT_FD_OFFSET) }.ok()? as i32;
+    (fd >= 0).then_some(fd)
+}
+
 pub(crate) fn capture_write_sample_from_source(
     source: PayloadAttemptSource,
     pending: &mut EbpfPendingSocketWriteSample,
@@ -36,6 +44,13 @@ pub(crate) fn capture_write_sample_from_source(
     let plan = payload_sample_plan_from_source(source)?;
     capture_write_sample_from_plan(plan, pending);
     Some(())
+}
+
+pub(crate) fn capture_kernel_transfer_write_gap(
+    fd: i32,
+    pending: &mut EbpfPendingSocketWriteSample,
+) {
+    reset_pending_write_sample(pending, fd, 0, 0, EBPF_SOCKET_WRITE_KERNEL_TRANSFER);
 }
 
 fn capture_write_sample_from_plan(
@@ -74,7 +89,7 @@ fn trim_write_sample_to_returned_len(
     if returned_len <= 0 {
         return None;
     }
-    let read_failed = pending.flags & EBPF_SOCKET_WRITE_READ_FAILED != 0;
+    let payload_kind = pending_write_payload_kind(pending);
     let previous = pending_write_metadata(pending);
     let written_len = if previous.original_len == 0 {
         returned_len as u64
@@ -87,21 +102,42 @@ fn trim_write_sample_to_returned_len(
     }
     let mut flags = 0;
     pending.original_len = original_len;
-    if read_failed {
-        clear_pending_payload(pending);
-        flags |= EBPF_SOCKET_WRITE_READ_FAILED;
-    } else {
-        pending.captured_len =
-            core::cmp::min(u32::from(previous.captured_len), original_len) as u16;
-    }
-    let current = pending_write_metadata(pending);
-    if flags & EBPF_SOCKET_WRITE_READ_FAILED == 0
-        && u32::from(current.captured_len) < current.original_len
-    {
-        flags |= EBPF_SOCKET_WRITE_TRUNCATED;
+    match payload_kind {
+        PendingWritePayloadKind::Captured => {
+            pending.captured_len =
+                core::cmp::min(u32::from(previous.captured_len), original_len) as u16;
+            if u32::from(pending.captured_len) < pending.original_len {
+                flags |= EBPF_SOCKET_WRITE_TRUNCATED;
+            }
+        }
+        PendingWritePayloadKind::ReadFailed => {
+            clear_pending_payload(pending);
+            flags |= EBPF_SOCKET_WRITE_READ_FAILED;
+        }
+        PendingWritePayloadKind::KernelTransfer => {
+            clear_pending_payload(pending);
+            flags |= EBPF_SOCKET_WRITE_KERNEL_TRANSFER;
+        }
     }
     pending.flags = flags;
     Some(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingWritePayloadKind {
+    Captured,
+    ReadFailed,
+    KernelTransfer,
+}
+
+fn pending_write_payload_kind(pending: &EbpfPendingSocketWriteSample) -> PendingWritePayloadKind {
+    if pending.flags & EBPF_SOCKET_WRITE_KERNEL_TRANSFER != 0 {
+        return PendingWritePayloadKind::KernelTransfer;
+    }
+    if pending.flags & EBPF_SOCKET_WRITE_READ_FAILED != 0 {
+        return PendingWritePayloadKind::ReadFailed;
+    }
+    PendingWritePayloadKind::Captured
 }
 
 pub(crate) fn pending_write_metadata(
@@ -139,7 +175,8 @@ fn clear_pending_payload(pending: &mut EbpfPendingSocketWriteSample) {
 #[cfg(test)]
 mod tests {
     use ebpf_abi::{
-        EBPF_SOCKET_WRITE_READ_FAILED, EBPF_SOCKET_WRITE_SAMPLE_BYTES, EBPF_SOCKET_WRITE_TRUNCATED,
+        EBPF_SOCKET_WRITE_KERNEL_TRANSFER, EBPF_SOCKET_WRITE_READ_FAILED,
+        EBPF_SOCKET_WRITE_SAMPLE_BYTES, EBPF_SOCKET_WRITE_TRUNCATED,
     };
 
     use super::*;
@@ -189,6 +226,18 @@ mod tests {
         assert_eq!(pending.original_len, 9);
         assert_eq!(pending.captured_len, 0);
         assert_eq!(pending.flags, EBPF_SOCKET_WRITE_TRUNCATED);
+    }
+
+    #[test]
+    fn trim_write_sample_preserves_kernel_transfer_gap_without_payload() {
+        let mut pending = pending_write(0, b"", EBPF_SOCKET_WRITE_KERNEL_TRANSFER);
+
+        trim_write_sample_to_returned_len(&mut pending, 9).expect("positive write finalizes");
+
+        assert_eq!(pending.original_len, 9);
+        assert_eq!(pending.captured_len, 0);
+        assert!(pending.buffer.iter().all(|byte| *byte == 0));
+        assert_eq!(pending.flags, EBPF_SOCKET_WRITE_KERNEL_TRANSFER);
     }
 
     #[test]

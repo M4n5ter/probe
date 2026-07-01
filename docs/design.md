@@ -56,6 +56,9 @@ eBPF / procfs 现状：
   TGID-level process exit/exec lifecycle。
 - `capture.deep_observe_selector` 可按方向授权 outbound `write(2)` / `sendto(2)` / `writev(2)` / `sendmsg(2)` 的
   single-buffer 或 bounded first-readable-iovec syscall argument sample。
+- 同一 selector 授权且内核暴露 tracepoint member 的 outbound `sendfile(2)`/`sendfile64(2)` 会输出
+  kernel-transfer byte-count `Gap`；
+  该路径不产生 payload bytes。
 - 同一 selector 授权 inbound `read(2)` / `recvfrom(2)` / `readv(2)` / `recvmsg(2)` 的 single-buffer 或
   bounded first-readable-iovec syscall result sample。
 - 内核只在 userspace allow map 的 fd-table epoch、active fd generation 与 read/write direction mask 同时匹配时读取 payload。
@@ -330,6 +333,8 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
     fd-table epoch 和 fd generation，避免旧授权在 fd 复用后继续采样。
   - 已实现：bounded outbound `write(2)` / `sendto(2)` / `writev(2)` / `sendmsg(2)` argument sample 到 always-degraded
     `CapturedBytes`/`Gap` bridge。
+  - 已实现：当前内核暴露的 outbound `sendfile(2)`/`sendfile64(2)` tracepoint variant 的 kernel-transfer
+    byte-count gap 到 always-degraded `Gap` bridge。
   - 已实现：bounded inbound `read(2)` / `recvfrom(2)` / `readv(2)` / `recvmsg(2)` result sample 到 always-degraded
     `CapturedBytes`/`Gap` bridge。
   - 已实现：payload bridge 和 close bridge 按 descriptor generation 匹配 tracked flow，避免同一 TGID+fd 复用时把
@@ -1359,8 +1364,8 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
   是 `capture.provider.link_ownership.mode` 的 one-hot gauge。
 - `traffic_probe_ebpf_process_observation_owned_links` 表示当前 userspace attach session 持有的 committed
   tracepoint link handle 总数。
-- `traffic_probe_ebpf_process_observation_program_owned_links{program_name,category,tracepoint}` 按固定 eBPF
-  program inventory 暴露每个 program 持有的 committed tracepoint link handle 数。
+- `traffic_probe_ebpf_process_observation_program_owned_links{program_name,category,tracepoint}` 按当前已 attach 的
+  process eBPF program 暴露每个 program 持有的 committed tracepoint link handle 数。
 - 当 selected provider 不是 process eBPF，或 runtime status 没有 provider details 时，只暴露
   `traffic_probe_ebpf_process_observation_link_ownership_metrics_available 0`，不伪造 link count。
 - 当 provider details 存在但 link ownership 未上报时，metrics availability 为 `1`，
@@ -1689,14 +1694,15 @@ BTF 或 eBPF 主程序不可用时：
   - 仍缺 precise flow-specific lost-event reconstruction 和完整 kernel/socket-path capture 验收。
 - Shared ABI
   - `ebpf-abi` 定义 ringbuf envelope、公共 header decoder、ABI revision、process observation records 和 TLS plaintext sample records。
-  - bounded sample record 必须表达 original length、captured length、truncated/read-failed flags 和 gap 语义。
+- bounded sample record 必须表达 original length、captured length、truncated/read-failed flags 和 gap 语义。
+- outbound kernel-transfer records 必须表达 byte-count gap，不把无 userspace buffer 的路径伪装成 payload sample。
   - process records 携带 fd-table epoch 和 descriptor generation；payload allowance 同时校验两者。
   - process lifecycle records 只携带公共 process metadata 和 command，具体语义由 typed event kind 表达。
   - 仍缺 kernel-side socket cookie、precise flow-specific lost-event record 和 unbounded scatter/gather collector。
 - Kernel object
   - `ebpf-program` 生成独立 process observation artifact 和 TLS plaintext artifact。
   - process artifact 已覆盖 connect enter/exit、accept/close/close_range、process exit/exec、fd-table epoch、per-fd
-    descriptor generation、bounded outbound/inbound syscall samples 和 process output loss counter。
+    descriptor generation、bounded outbound/inbound syscall samples、available sendfile family kernel-transfer gap 和 process output loss counter。
   - TLS artifact 已覆盖 libssl plaintext uprobe producer、TLS state maps、stream offset 和 TLS output loss counter。
   - 仍缺 kernel socket-object lifetime、payload continuation、完整 kernel traffic capture 和 precise flow-specific lost-event reconstruction。
 - Userspace loader/provider
@@ -1764,6 +1770,8 @@ eBPF deep observe 当前能输出 bounded syscall sample，但它的语义必须
 采样能力：
 
 - outbound 支持 single-buffer 与 bounded first-readable-iovec syscall argument sample。
+- outbound `sendfile(2)`/`sendfile64(2)` 支持当前内核暴露 tracepoint member 的 byte-count gap；payload bytes 不可用。
+- sendfile family tracepoint member 必须按 enter/exit pair 成对 attach；pair 完整缺失时跳过该 variant，pair 不完整时 fail fast。
 - inbound 支持 single-buffer 与 bounded first-readable-iovec syscall result sample。
 - selector-authorized flow 上的样本会进入 `CapturedBytes`/`Gap`。
 - 这些 bytes 永远标记为 degraded。
@@ -1805,12 +1813,15 @@ fd 与 socket identity 边界：
 outbound syscall 采样语义：
 
 - 当前覆盖 `write(2)`、`sendto(2)`、`writev(2)` 和 `sendmsg(2)`。
+- `sendfile(2)`/`sendfile64(2)` 没有 userspace payload buffer；provider 对已 attach 的 family member 只输出
+  byte-count kernel-transfer `Gap`，并通过 `expected_offset` 和 `next_offset` 表达不可见的字节范围。
 - enter tracepoint 在 allow gate 后立即持久化 single-buffer 或 bounded first-readable-iovec snapshot。
 - exit tracepoint 只读取 syscall 返回值并校准最终长度。
 - partial write/send 返回长度短于已捕获长度时，captured prefix 会 clamp 到实际返回长度。
 - 未实际写入的尾部 bytes 不会被带出内核。
 - enter-time snapshot 可能在内核真正 copy 前被同进程其它线程修改。
-- 因此 outbound snapshot 只能作为 best-effort argument evidence，不能作为强阻断或审计的唯一字节事实源。
+- 因此 outbound snapshot 或 kernel-transfer byte-count gap 只能作为 best-effort evidence，
+  不能作为强阻断或审计的唯一字节事实源。
 
 inbound syscall 采样语义：
 
@@ -2238,7 +2249,7 @@ TLS output loss：
 `xtask check-ebpf` 的 strict artifact 验证：
 
 - process artifact 必须包含 12 个 process map。
-- process artifact 必须包含 30 个 tracepoint program。
+- process artifact 必须包含 34 个 tracepoint program。
 - process artifact 不得夹带 TLS maps/programs。
 - TLS artifact 必须包含 `TRAFFIC_PROBE_EVENTS`、TLS call/fd/offset/state-epoch/scratch/output-loss maps。
 - TLS artifact 必须包含 13 个 uprobe/uretprobe program。
@@ -3336,11 +3347,11 @@ flowchart LR
 - eBPF object 路径放在 `[capture.ebpf] object_path` 下。这个字段作为 `aya-obj` object preflight 输入；process observation runtime 使用
   strict process artifact contract，校验 ringbuf、allow map、fd-table epoch map、fd generation map、pending connect、pending accept、
   pending write/read、pending write scratch、process write/read event scratch 和 process output loss counter map shape，校验 connect enter/exit、
-  accept/accept4、close、close_range、process exit/exec、descriptor lease lifecycle、single-buffer/bounded first-readable-iovec
+  accept/accept4、close、close_range、process exit/exec、descriptor lease lifecycle、single-buffer/bounded first-readable-iovec/available sendfile family
   payload tracepoint sections，并拒绝夹带 TLS maps/programs 的混装
   object。高层用户态 `aya` process observation loader、connect/accept observation 到单个 `ConnectionOpened` `CaptureEvent` 的纯转换
   bridge、`capture.deep_observe_selector` 按方向授权的 outbound single-buffer/bounded first-readable-iovec syscall argument
-  sample 和 inbound single-buffer/bounded first-readable-iovec syscall result sample 到 always-degraded
+  sample、outbound available sendfile family kernel-transfer byte-count gap 和 inbound single-buffer/bounded first-readable-iovec syscall result sample 到 always-degraded
   `CapturedBytes`/`Gap` 的 payload bridge、descriptor-generation close/close_range 到 best-effort `ConnectionClosed`
   lifecycle event、TGID-level process exit/exec 到 lifecycle boundary `Gap`、unresolved connect/accept 到 degraded `Gap`
   的 provider path，以及 output ringbuf failure counter 到 degraded `capture_loss`
@@ -4656,9 +4667,10 @@ xtask agent E2E harness：
   - 断言 libpcap degraded ingress bytes、HTTP request parser output 和 configured policy alert。
 - `xtask e2e-ebpf-process-loopback`
   - root/bpffs 环境下先拒绝 stale process artifact。
-  - 用 fixture 的 `read-write`、`send-recv`、`readv-writev` 与 `sendmsg-recvmsg` 四种模式覆盖 client-side connect flow。
+  - 用 fixture 的 `read-write`、`send-recv`、`readv-writev`、`sendmsg-recvmsg` 与 `sendfile` 五种模式覆盖 client-side connect flow。
   - 覆盖 server-side accept/accept4 flow。
   - 覆盖 selector-authorized outbound single-buffer/bounded first-readable-iovec syscall argument sample。
+  - 覆盖 selector-authorized outbound available sendfile family kernel-transfer byte-count gap。
   - 覆盖 selector-authorized inbound single-buffer/bounded first-readable-iovec syscall result sample。
   - 覆盖双方向 HTTP/1 request/response parser、policy alert 和 durable spool readback。
   - `send-recv` 模式验证 `sendto(2)` / `recvfrom(2)` tracepoint path。
@@ -5114,6 +5126,7 @@ provider loss/gap 的路径。TLS plaintext 不证明 unbounded resync。
 - 使用 `--io-mode send-recv` 跑完整 agent loopback。
 - 使用 `--io-mode readv-writev` 跑完整 agent loopback。
 - 使用 `--io-mode sendmsg-recvmsg` 跑完整 agent loopback。
+- 使用 `--io-mode sendfile` 跑完整 agent loopback。
 - fixture 使用 `--connect-write-delay-ms 2000`。
 - 该延迟给 client-side connect flow 完成 procfs 归因与 allow-map 授权窗口。
 - fixture 使用 plain HTTP-only 的 `--accept-read-delay-ms 2000`。
@@ -5125,6 +5138,7 @@ provider loss/gap 的路径。TLS plaintext 不证明 unbounded resync。
 - 验证 `sendto(2)` / `recvfrom(2)`。
 - 验证带 zero-length leading iovec 和 split payload 的 bounded first-readable-iovec `writev(2)` / `readv(2)`。
 - 验证带 zero-length leading iovec 和 split payload 的 bounded first-readable-iovec `sendmsg(2)` / `recvmsg(2)`。
+- 验证当前内核暴露的 `sendfile(2)`/`sendfile64(2)` outbound kernel-transfer byte-count gap 和 inbound HTTP 解析。
 
 #### `e2e-ebpf-process-loopback` assertions
 
@@ -5132,11 +5146,13 @@ provider loss/gap 的路径。TLS plaintext 不证明 unbounded resync。
 - 断言 `provider = ebpf`。
 - 断言 client/server connection opened/closed。
 - 断言 selector-authorized degraded outbound single-buffer/bounded first-readable-iovec sample。
+- 断言 selector-authorized outbound available sendfile family kernel-transfer gap。
 - 断言 selector-authorized degraded inbound single-buffer/bounded first-readable-iovec sample。
 - 断言 observation-only enforcement evidence。
 - 断言 fixture 进程归因。
 - 断言双方向 HTTP request headers。
 - 断言双方向 HTTP response headers。
+- 在 sendfile 模式中，outbound payload bytes 不可用，断言 inbound HTTP request/response 语义和 outbound gap。
 - 断言 `ebpf-e2e-policy@e2e` policy alert。
 - 断言无 policy runtime error。
 
@@ -5359,7 +5375,7 @@ provider loss/gap 的路径。TLS plaintext 不证明 unbounded resync。
 #### Object contract
 
 - `ebpf-object` 单元测试使用从 ABI spec 派生的 process/TLS ELF fixture。
-- 测试验证 process 的 12 个 map + 30 个 tracepoint program。
+- 测试验证 process 的 12 个 map + 34 个 tracepoint program。
 - 测试验证 TLS plaintext 的 7 个 map + 13 个 uprobe/uretprobe program。
 - 这些 artifact 可被 `aya-obj` inventory 解析并满足 contract。
 - `xtask check-ebpf` 已验证真实 `ebpf-program` process artifact 满足 strict contract。

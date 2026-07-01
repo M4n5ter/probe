@@ -72,6 +72,18 @@ pub const EBPF_SENDMSG_ENTER_TRACEPOINT_NAME: &str = "sys_enter_sendmsg";
 pub const EBPF_SENDMSG_EXIT_PROGRAM_NAME: &str = "traffic_probe_sys_exit_sendmsg";
 pub const EBPF_SENDMSG_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
 pub const EBPF_SENDMSG_EXIT_TRACEPOINT_NAME: &str = "sys_exit_sendmsg";
+pub const EBPF_SENDFILE_ENTER_PROGRAM_NAME: &str = "traffic_probe_sys_enter_sendfile";
+pub const EBPF_SENDFILE_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_SENDFILE_ENTER_TRACEPOINT_NAME: &str = "sys_enter_sendfile";
+pub const EBPF_SENDFILE_EXIT_PROGRAM_NAME: &str = "traffic_probe_sys_exit_sendfile";
+pub const EBPF_SENDFILE_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_SENDFILE_EXIT_TRACEPOINT_NAME: &str = "sys_exit_sendfile";
+pub const EBPF_SENDFILE64_ENTER_PROGRAM_NAME: &str = "traffic_probe_sys_enter_sendfile64";
+pub const EBPF_SENDFILE64_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_SENDFILE64_ENTER_TRACEPOINT_NAME: &str = "sys_enter_sendfile64";
+pub const EBPF_SENDFILE64_EXIT_PROGRAM_NAME: &str = "traffic_probe_sys_exit_sendfile64";
+pub const EBPF_SENDFILE64_EXIT_TRACEPOINT_CATEGORY: &str = "syscalls";
+pub const EBPF_SENDFILE64_EXIT_TRACEPOINT_NAME: &str = "sys_exit_sendfile64";
 pub const EBPF_READ_ENTER_PROGRAM_NAME: &str = "traffic_probe_sys_enter_read";
 pub const EBPF_READ_ENTER_TRACEPOINT_CATEGORY: &str = "syscalls";
 pub const EBPF_READ_ENTER_TRACEPOINT_NAME: &str = "sys_enter_read";
@@ -154,7 +166,7 @@ pub const EBPF_PROCESS_OUTPUT_LOSS_VALUE_BYTES: u32 = core::mem::size_of::<u64>(
 pub const EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN: u32 = 1 << 0;
 pub const EBPF_PENDING_SOCKET_READ_SOURCE_IOVEC: u32 = 1 << 1;
 
-pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 30] = [
+pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 34] = [
     EbpfProcessTracepointSpec {
         role: EbpfProcessTracepointRole::ConnectEnter,
         program_name: EBPF_CONNECT_ENTER_PROGRAM_NAME,
@@ -286,6 +298,30 @@ pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 30] = [
         program_name: EBPF_SENDMSG_EXIT_PROGRAM_NAME,
         category: EBPF_SENDMSG_EXIT_TRACEPOINT_CATEGORY,
         tracepoint_name: EBPF_SENDMSG_EXIT_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::SendfileEnter,
+        program_name: EBPF_SENDFILE_ENTER_PROGRAM_NAME,
+        category: EBPF_SENDFILE_ENTER_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_SENDFILE_ENTER_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::SendfileExit,
+        program_name: EBPF_SENDFILE_EXIT_PROGRAM_NAME,
+        category: EBPF_SENDFILE_EXIT_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_SENDFILE_EXIT_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::Sendfile64Enter,
+        program_name: EBPF_SENDFILE64_ENTER_PROGRAM_NAME,
+        category: EBPF_SENDFILE64_ENTER_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_SENDFILE64_ENTER_TRACEPOINT_NAME,
+    },
+    EbpfProcessTracepointSpec {
+        role: EbpfProcessTracepointRole::Sendfile64Exit,
+        program_name: EBPF_SENDFILE64_EXIT_PROGRAM_NAME,
+        category: EBPF_SENDFILE64_EXIT_TRACEPOINT_CATEGORY,
+        tracepoint_name: EBPF_SENDFILE64_EXIT_TRACEPOINT_NAME,
     },
     EbpfProcessTracepointSpec {
         role: EbpfProcessTracepointRole::ReadEnter,
@@ -493,6 +529,10 @@ pub enum EbpfProcessTracepointRole {
     SendtoExit,
     SendmsgEnter,
     SendmsgExit,
+    SendfileEnter,
+    SendfileExit,
+    Sendfile64Enter,
+    Sendfile64Exit,
     ReadEnter,
     ReadExit,
     ReadvEnter,
@@ -504,6 +544,13 @@ pub enum EbpfProcessTracepointRole {
 }
 
 impl EbpfProcessTracepointRole {
+    pub const fn has_optional_attach(self) -> bool {
+        matches!(
+            self,
+            Self::SendfileEnter | Self::SendfileExit | Self::Sendfile64Enter | Self::Sendfile64Exit
+        )
+    }
+
     pub fn spec(self) -> &'static EbpfProcessTracepointSpec {
         EBPF_PROCESS_TRACEPOINT_SPECS
             .iter()
@@ -754,7 +801,7 @@ mod tests {
 
     #[test]
     fn process_tracepoint_specs_are_complete() {
-        assert_eq!(EBPF_PROCESS_TRACEPOINT_SPECS.len(), 30);
+        assert_eq!(EBPF_PROCESS_TRACEPOINT_SPECS.len(), 34);
         assert_unique(EBPF_PROCESS_TRACEPOINT_SPECS.map(|spec| spec.program_name));
         assert_unique(EBPF_PROCESS_TRACEPOINT_SPECS.map(|spec| spec.tracepoint_name));
 
@@ -765,6 +812,15 @@ mod tests {
                 std::format!("tracepoint/{}/{}", spec.category, spec.tracepoint_name)
             );
         }
+    }
+
+    #[test]
+    fn sendfile_family_tracepoints_are_optional_kernel_variants() {
+        assert!(EbpfProcessTracepointRole::SendfileEnter.has_optional_attach());
+        assert!(EbpfProcessTracepointRole::SendfileExit.has_optional_attach());
+        assert!(EbpfProcessTracepointRole::Sendfile64Enter.has_optional_attach());
+        assert!(EbpfProcessTracepointRole::Sendfile64Exit.has_optional_attach());
+        assert!(!EbpfProcessTracepointRole::WriteEnter.has_optional_attach());
     }
 
     #[test]

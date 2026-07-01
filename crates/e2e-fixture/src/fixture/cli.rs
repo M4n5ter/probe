@@ -39,7 +39,7 @@ Options:
   --websocket-connections N    (product-loopback only)
   --frame-payload-bytes N      (websocket-loopback and product-loopback)
   --write-chunks N
-  --io-mode read-write|send-recv|readv-writev|sendmsg-recvmsg  (http1-loopback and product-loopback plain HTTP)
+  --io-mode read-write|send-recv|readv-writev|sendmsg-recvmsg|sendfile  (http1-loopback and product-loopback plain HTTP)
   --connect-write-delay-ms N
   --accept-read-delay-ms N       (http1-loopback and product-loopback plain HTTP)
   --post-exchange-delay-ms N
@@ -310,7 +310,7 @@ fn parse_product_loopback(
             "--io-mode" => {
                 http_io_mode = Some(Http1IoMode::parse(&value).ok_or_else(|| {
                     FixtureError::usage(format!(
-                        "invalid value for {option}: {value}; expected read-write, send-recv, readv-writev, or sendmsg-recvmsg\n\n{USAGE}"
+                        "invalid value for {option}: {value}; expected read-write, send-recv, readv-writev, sendmsg-recvmsg, or sendfile\n\n{USAGE}"
                     ))
                 })?);
             }
@@ -474,7 +474,7 @@ fn parse_http_loopback_args(
                 reject_plain_http_option(plain_http_options, &option)?;
                 io_mode = Some(Http1IoMode::parse(&value).ok_or_else(|| {
                     FixtureError::usage(format!(
-                        "invalid value for {option}: {value}; expected read-write, send-recv, readv-writev, or sendmsg-recvmsg\n\n{USAGE}"
+                        "invalid value for {option}: {value}; expected read-write, send-recv, readv-writev, sendmsg-recvmsg, or sendfile\n\n{USAGE}"
                     ))
                 })?);
             }
@@ -671,9 +671,11 @@ mod tests {
         let readv = parse_http1_loopback(["--io-mode".to_string(), "readv-writev".to_string()])?;
         let sendmsg =
             parse_http1_loopback(["--io-mode".to_string(), "sendmsg-recvmsg".to_string()])?;
+        let sendfile = parse_http1_loopback(["--io-mode".to_string(), "sendfile".to_string()])?;
 
         assert_eq!(readv.io_mode, Http1IoMode::ReadvWritev);
         assert_eq!(sendmsg.io_mode, Http1IoMode::SendmsgRecvmsg);
+        assert_eq!(sendfile.io_mode, Http1IoMode::Sendfile);
         Ok(())
     }
 

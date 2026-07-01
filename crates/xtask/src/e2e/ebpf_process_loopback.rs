@@ -39,6 +39,7 @@ const CONNECT_WRITE_DELAY_MS: u64 = 2_000;
 const ACCEPT_READ_DELAY_MS: u64 = 2_000;
 const MIN_CAPTURE_EVENTS_FOR_HTTP_EXCHANGE: u64 = 8;
 const MIN_EXPORT_EVENTS_FOR_HTTP_EXCHANGE: u64 = 14;
+const MIN_SENDFILE_EXPORT_EVENTS_FOR_HTTP_EXCHANGE: u64 = 8;
 
 pub(crate) fn run() -> ExitCode {
     match run_inner() {
@@ -59,6 +60,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         Http1FixtureIoMode::SendRecv,
         Http1FixtureIoMode::ReadvWritev,
         Http1FixtureIoMode::SendmsgRecvmsg,
+        Http1FixtureIoMode::Sendfile,
     ] {
         let root = create_temp_root(io_mode_temp_name(io_mode))?;
         match run_at(&root, &ebpf_object_path, io_mode) {
@@ -82,6 +84,7 @@ fn io_mode_temp_name(io_mode: Http1FixtureIoMode) -> &'static str {
         Http1FixtureIoMode::SendRecv => "ebpf-process-loopback-send-recv",
         Http1FixtureIoMode::ReadvWritev => "ebpf-process-loopback-readv-writev",
         Http1FixtureIoMode::SendmsgRecvmsg => "ebpf-process-loopback-sendmsg-recvmsg",
+        Http1FixtureIoMode::Sendfile => "ebpf-process-loopback-sendfile",
     }
 }
 
@@ -132,7 +135,7 @@ fn run_at(
             &admin_socket_path,
             expected_policy_alert_messages().len() as u64,
             MIN_CAPTURE_EVENTS_FOR_HTTP_EXCHANGE,
-            MIN_EXPORT_EVENTS_FOR_HTTP_EXCHANGE,
+            min_export_events_for_io_mode(io_mode),
         ),
         Err(_) => Ok(()),
     };
@@ -145,6 +148,10 @@ fn run_at(
     merge_run_results(fixture_result, progress_result, agent_result, spool_result)?;
 
     Ok(())
+}
+
+fn min_export_events_for_io_mode(io_mode: Http1FixtureIoMode) -> u64 {
+    expectations_for_io_mode(io_mode).min_export_events
 }
 
 fn fixture_config() -> PlainHttp1LoopbackFixtureConfig {
@@ -245,12 +252,13 @@ fn assert_spool_outputs(
     listen_port: u16,
     io_mode: Http1FixtureIoMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let expectations = expectations_for_io_mode(io_mode);
     let spool = FjallSpool::open(spool_path)?;
     let ingress = spool.read_ingress_batch_after(0, 256)?;
     if ingress.is_empty() {
         return Err(e2e_error("expected eBPF ingress records, got none").into());
     }
-    assert_ebpf_ingress(&ingress, listen_port, io_mode)?;
+    assert_ebpf_ingress(&ingress, listen_port, expectations)?;
 
     let envelopes = spool
         .read_export_batch(E2E_EXPORT_CURSOR_OWNER, 512)?
@@ -259,9 +267,10 @@ fn assert_spool_outputs(
         .collect::<Result<Vec<_>, _>>()?;
     assert_no_policy_runtime_errors(&envelopes)?;
     assert_expected_lifecycle_exports(&envelopes, listen_port)?;
-    assert_expected_requests(&envelopes)?;
-    assert_expected_responses(&envelopes)?;
-    assert_expected_body_chunks(&envelopes, listen_port)?;
+    assert_expected_requests(&envelopes, expectations)?;
+    assert_expected_responses(&envelopes, expectations)?;
+    assert_expected_body_chunks(&envelopes, listen_port, expectations)?;
+    assert_expected_kernel_transfer_gap_exports(&envelopes, listen_port, expectations)?;
     assert_expected_policy_alerts(&envelopes)?;
 
     println!(
@@ -275,7 +284,7 @@ fn assert_spool_outputs(
 fn assert_ebpf_ingress(
     events: &[StoredEvent],
     listen_port: u16,
-    io_mode: Http1FixtureIoMode,
+    expectations: IoModeExpectations,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let capture_events = events
         .iter()
@@ -297,19 +306,26 @@ fn assert_ebpf_ingress(
             .into());
         }
         for direction in [Direction::Outbound, Direction::Inbound] {
+            let payload_evidence = expectations.payload_evidence(direction);
             if capture_events.iter().any(|event| {
-                is_expected_degraded_payload_event(event, listen_port, side, direction)
+                is_expected_payload_evidence_event(
+                    event,
+                    listen_port,
+                    side,
+                    direction,
+                    payload_evidence,
+                )
             }) {
                 continue;
             }
             return Err(e2e_error(format!(
-                "missing selector-authorized eBPF {side:?} {direction:?} syscall payload sample; observed {}",
+                "missing selector-authorized eBPF {side:?} {direction:?} syscall payload evidence; observed {}",
                 ingress_summary(&capture_events, listen_port)
             ))
             .into());
         }
     }
-    assert_expected_vector_gaps(&capture_events, listen_port, io_mode)?;
+    assert_expected_vector_gaps(&capture_events, listen_port, expectations)?;
 
     Ok(())
 }
@@ -317,11 +333,10 @@ fn assert_ebpf_ingress(
 fn assert_expected_vector_gaps(
     events: &[CaptureEvent],
     listen_port: u16,
-    io_mode: Http1FixtureIoMode,
+    expectations: IoModeExpectations,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match io_mode {
-        Http1FixtureIoMode::ReadvWritev | Http1FixtureIoMode::SendmsgRecvmsg => {}
-        Http1FixtureIoMode::ReadWrite | Http1FixtureIoMode::SendRecv => return Ok(()),
+    if !expectations.expect_vector_gaps {
+        return Ok(());
     }
 
     for (side, direction) in [
@@ -341,6 +356,56 @@ fn assert_expected_vector_gaps(
         .into());
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IoModeExpectations {
+    min_export_events: u64,
+    outbound_payload_evidence: ExpectedPayloadEvidence,
+    expect_vector_gaps: bool,
+}
+
+impl IoModeExpectations {
+    const fn payload_evidence(self, direction: Direction) -> ExpectedPayloadEvidence {
+        match direction {
+            Direction::Outbound => self.outbound_payload_evidence,
+            Direction::Inbound => ExpectedPayloadEvidence::Bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedPayloadEvidence {
+    Bytes,
+    KernelTransferGap,
+}
+
+impl ExpectedPayloadEvidence {
+    const fn is_bytes(self) -> bool {
+        matches!(self, Self::Bytes)
+    }
+}
+
+const fn expectations_for_io_mode(io_mode: Http1FixtureIoMode) -> IoModeExpectations {
+    match io_mode {
+        Http1FixtureIoMode::ReadWrite | Http1FixtureIoMode::SendRecv => IoModeExpectations {
+            min_export_events: MIN_EXPORT_EVENTS_FOR_HTTP_EXCHANGE,
+            outbound_payload_evidence: ExpectedPayloadEvidence::Bytes,
+            expect_vector_gaps: false,
+        },
+        Http1FixtureIoMode::ReadvWritev | Http1FixtureIoMode::SendmsgRecvmsg => {
+            IoModeExpectations {
+                min_export_events: MIN_EXPORT_EVENTS_FOR_HTTP_EXCHANGE,
+                outbound_payload_evidence: ExpectedPayloadEvidence::Bytes,
+                expect_vector_gaps: true,
+            }
+        }
+        Http1FixtureIoMode::Sendfile => IoModeExpectations {
+            min_export_events: MIN_SENDFILE_EXPORT_EVENTS_FOR_HTTP_EXCHANGE,
+            outbound_payload_evidence: ExpectedPayloadEvidence::KernelTransferGap,
+            expect_vector_gaps: false,
+        },
+    }
 }
 
 fn ingress_summary(events: &[CaptureEvent], listen_port: u16) -> String {
@@ -488,6 +553,23 @@ fn is_expected_degraded_payload_event(
         )
 }
 
+fn is_expected_payload_evidence_event(
+    event: &CaptureEvent,
+    listen_port: u16,
+    side: FlowSide,
+    direction: Direction,
+    evidence: ExpectedPayloadEvidence,
+) -> bool {
+    match evidence {
+        ExpectedPayloadEvidence::Bytes => {
+            is_expected_degraded_payload_event(event, listen_port, side, direction)
+        }
+        ExpectedPayloadEvidence::KernelTransferGap => {
+            is_expected_kernel_transfer_gap_event(event, listen_port, side, direction)
+        }
+    }
+}
+
 fn is_expected_gap_event(
     event: &CaptureEvent,
     listen_port: u16,
@@ -504,6 +586,33 @@ fn is_expected_gap_event(
         && gap.flow.attribution_confidence > 0
         && is_fixture_process(&gap.flow.process)
         && gap.gap.reason.contains("syscall sample truncated payload")
+}
+
+fn is_expected_kernel_transfer_gap_event(
+    event: &CaptureEvent,
+    listen_port: u16,
+    side: FlowSide,
+    direction: Direction,
+) -> bool {
+    let CaptureEvent::Gap(gap) = event else {
+        return false;
+    };
+    gap.origin.source() == CaptureSource::EbpfSyscall
+        && gap.origin.provider() == CaptureProviderKind::Ebpf
+        && gap.gap.direction == direction
+        && matches_expected_side(gap.flow.local.port, gap.flow.remote.port, listen_port, side)
+        && gap.flow.attribution_confidence > 0
+        && is_fixture_process(&gap.flow.process)
+        && gap.gap.expected_offset == 0
+        && gap
+            .gap
+            .next_offset
+            .is_some_and(|next_offset| next_offset > gap.gap.expected_offset)
+        && gap.gap.reason.contains("kernel-transfer syscall")
+        && gap
+            .gap
+            .reason
+            .contains("without a userspace payload buffer")
 }
 
 fn matches_expected_side(
@@ -573,8 +682,16 @@ fn is_expected_lifecycle_envelope(
         && envelope.kind() == &expected_kind
 }
 
-fn assert_expected_requests(envelopes: &[EventEnvelope]) -> Result<(), Box<dyn std::error::Error>> {
-    assert_expected_request_direction(envelopes, Direction::Outbound)?;
+fn assert_expected_requests(
+    envelopes: &[EventEnvelope],
+    expectations: IoModeExpectations,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if expectations
+        .payload_evidence(Direction::Outbound)
+        .is_bytes()
+    {
+        assert_expected_request_direction(envelopes, Direction::Outbound)?;
+    }
     assert_expected_request_direction(envelopes, Direction::Inbound)
 }
 
@@ -618,14 +735,22 @@ fn assert_expected_request_direction(
 
 fn assert_expected_responses(
     envelopes: &[EventEnvelope],
+    expectations: IoModeExpectations,
 ) -> Result<(), Box<dyn std::error::Error>> {
     assert_expected_response_direction(envelopes, Direction::Inbound)?;
-    assert_expected_response_direction(envelopes, Direction::Outbound)
+    if expectations
+        .payload_evidence(Direction::Outbound)
+        .is_bytes()
+    {
+        assert_expected_response_direction(envelopes, Direction::Outbound)?;
+    }
+    Ok(())
 }
 
 fn assert_expected_body_chunks(
     envelopes: &[EventEnvelope],
     listen_port: u16,
+    expectations: IoModeExpectations,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (side, direction) in [
         (FlowSide::Client, Direction::Outbound),
@@ -633,6 +758,9 @@ fn assert_expected_body_chunks(
         (FlowSide::Server, Direction::Outbound),
         (FlowSide::Client, Direction::Inbound),
     ] {
+        if !expectations.payload_evidence(direction).is_bytes() {
+            continue;
+        }
         if envelopes
             .iter()
             .any(|envelope| is_expected_body_chunk_envelope(envelope, listen_port, side, direction))
@@ -645,6 +773,66 @@ fn assert_expected_body_chunks(
         .into());
     }
     Ok(())
+}
+
+fn assert_expected_kernel_transfer_gap_exports(
+    envelopes: &[EventEnvelope],
+    listen_port: u16,
+    expectations: IoModeExpectations,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for side in [FlowSide::Client, FlowSide::Server] {
+        for direction in [Direction::Outbound, Direction::Inbound] {
+            if expectations.payload_evidence(direction)
+                != ExpectedPayloadEvidence::KernelTransferGap
+            {
+                continue;
+            }
+            if envelopes.iter().any(|envelope| {
+                is_expected_kernel_transfer_gap_envelope(envelope, listen_port, side, direction)
+            }) {
+                continue;
+            }
+            return Err(e2e_error(format!(
+                "missing eBPF {side:?} {direction:?} kernel-transfer gap export event for fixture flow"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn is_expected_kernel_transfer_gap_envelope(
+    envelope: &EventEnvelope,
+    listen_port: u16,
+    side: FlowSide,
+    direction: Direction,
+) -> bool {
+    let EventKind::Gap(gap) = envelope.kind() else {
+        return false;
+    };
+    let Some(flow) = envelope.flow() else {
+        return false;
+    };
+    envelope.origin().source() == CaptureSource::EbpfSyscall
+        && envelope.origin().provider() == CaptureProviderKind::Ebpf
+        && envelope.degraded()
+        && matches!(
+            &envelope.enforcement_evidence(),
+            EnforcementEvidence::ObservationOnly {
+                reason: ObservationOnlyReason::EbpfSyscallPayloadSnapshot,
+                ..
+            }
+        )
+        && gap.direction == direction
+        && gap.expected_offset == 0
+        && gap
+            .next_offset
+            .is_some_and(|next_offset| next_offset > gap.expected_offset)
+        && gap.reason.contains("kernel-transfer syscall")
+        && gap.reason.contains("without a userspace payload buffer")
+        && matches_expected_side(flow.local.port, flow.remote.port, listen_port, side)
+        && flow.attribution_confidence > 0
+        && is_fixture_process(&flow.process)
 }
 
 fn is_expected_body_chunk_envelope(

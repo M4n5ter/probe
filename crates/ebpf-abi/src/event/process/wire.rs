@@ -46,6 +46,7 @@ pub const EBPF_ACCEPT_SOCKADDR_READ_FAILED: u16 = EBPF_SOCKET_FLOW_SOCKADDR_READ
 pub const EBPF_ACCEPT_UNSUPPORTED_ADDRESS_FAMILY: u16 = EBPF_SOCKET_FLOW_UNSUPPORTED_ADDRESS_FAMILY;
 pub const EBPF_SOCKET_WRITE_TRUNCATED: u16 = 1 << 0;
 pub const EBPF_SOCKET_WRITE_READ_FAILED: u16 = 1 << 1;
+pub const EBPF_SOCKET_WRITE_KERNEL_TRANSFER: u16 = 1 << 2;
 pub const EBPF_SOCKET_READ_TRUNCATED: u16 = 1 << 0;
 pub const EBPF_SOCKET_READ_READ_FAILED: u16 = 1 << 1;
 pub const EBPF_ADDRESS_FAMILY_UNSPEC: u16 = 0;
@@ -1185,6 +1186,7 @@ fn validate_socket_write_sample(event: EbpfProcessProbeEvent) -> Result<(), Ebpf
     let Some(sample) = event.socket_write_sample() else {
         return Ok(());
     };
+    let flags = event.header.flags;
     let captured = usize::from(sample.captured_len);
     if captured > EBPF_SOCKET_WRITE_SAMPLE_BYTES {
         return Err(EbpfEventDecodeError::InvalidSocketWriteCapturedLength {
@@ -1199,7 +1201,11 @@ fn validate_socket_write_sample(event: EbpfProcessProbeEvent) -> Result<(), Ebpf
         });
     }
     if u32::from(sample.captured_len) < sample.original_len
-        && event.header.flags & (EBPF_SOCKET_WRITE_TRUNCATED | EBPF_SOCKET_WRITE_READ_FAILED) == 0
+        && event.header.flags
+            & (EBPF_SOCKET_WRITE_TRUNCATED
+                | EBPF_SOCKET_WRITE_READ_FAILED
+                | EBPF_SOCKET_WRITE_KERNEL_TRANSFER)
+            == 0
     {
         return Err(EbpfEventDecodeError::InvalidSocketWriteIncompleteSample {
             captured: sample.captured_len,
@@ -1210,6 +1216,18 @@ fn validate_socket_write_sample(event: EbpfProcessProbeEvent) -> Result<(), Ebpf
         return Err(EbpfEventDecodeError::InvalidSocketWriteReadFailure {
             captured: sample.captured_len,
         });
+    }
+    if flags & EBPF_SOCKET_WRITE_KERNEL_TRANSFER != 0
+        && flags & (EBPF_SOCKET_WRITE_TRUNCATED | EBPF_SOCKET_WRITE_READ_FAILED) != 0
+    {
+        return Err(EbpfEventDecodeError::InvalidSocketWriteKernelTransferFlags { flags });
+    }
+    if flags & EBPF_SOCKET_WRITE_KERNEL_TRANSFER != 0 && sample.captured_len > 0 {
+        return Err(
+            EbpfEventDecodeError::InvalidSocketWriteKernelTransferPayload {
+                captured: sample.captured_len,
+            },
+        );
     }
     Ok(())
 }
@@ -1848,6 +1866,31 @@ mod tests {
         assert_eq!(
             error,
             EbpfEventDecodeError::InvalidSocketWriteReadFailure { captured: 1 }
+        );
+
+        let error = match decode_process_probe_event(&encode_process_probe_event(
+            &sample_write_event(5, 1, EBPF_SOCKET_WRITE_KERNEL_TRANSFER),
+        )) {
+            Ok(_) => panic!("kernel-transfer gap must not carry captured userspace bytes"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            EbpfEventDecodeError::InvalidSocketWriteKernelTransferPayload { captured: 1 }
+        );
+
+        let flags = EBPF_SOCKET_WRITE_KERNEL_TRANSFER | EBPF_SOCKET_WRITE_TRUNCATED;
+        let error = match decode_process_probe_event(&encode_process_probe_event(
+            &sample_write_event(5, 0, flags),
+        )) {
+            Ok(_) => panic!("kernel-transfer gap must not also be a truncated userspace sample"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            EbpfEventDecodeError::InvalidSocketWriteKernelTransferFlags { flags }
         );
     }
 

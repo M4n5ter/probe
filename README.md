@@ -180,7 +180,9 @@ configuration:
   or CAP_NET_RAW.
 - `ebpf`:
   kernel-assisted process-aware observation. It needs root/bpffs and a built
-  eBPF object.
+  eBPF object. Deep observation is selector-gated; syscall payload bytes are
+  degraded evidence, and available `sendfile(2)`/`sendfile64(2)` tracepoint
+  variants produce byte-count gaps rather than payload bytes.
 - libssl uprobe:
   best-effort TLS plaintext sidecar for selected libssl processes. It needs
   root/bpffs, a built eBPF object, and an explicit selector.

@@ -1,11 +1,15 @@
 use std::{
     error::Error,
-    fmt, io,
-    io::{IoSlice, IoSliceMut},
+    fmt,
+    fs::{self, File, OpenOptions},
+    io,
+    io::{IoSlice, IoSliceMut, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use super::{
@@ -18,6 +22,7 @@ use super::{
 
 const SCENARIO: &str = "http1-loopback";
 const VECTOR_FIRST_PAYLOAD_SLICE_BYTES: usize = 192;
+static SENDFILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Http1LoopbackConfig {
@@ -34,6 +39,7 @@ pub(crate) enum Http1IoMode {
     SendRecv,
     ReadvWritev,
     SendmsgRecvmsg,
+    Sendfile,
 }
 
 impl Http1IoMode {
@@ -43,6 +49,7 @@ impl Http1IoMode {
             Self::SendRecv => "send-recv",
             Self::ReadvWritev => "readv-writev",
             Self::SendmsgRecvmsg => "sendmsg-recvmsg",
+            Self::Sendfile => "sendfile",
         }
     }
 
@@ -52,6 +59,7 @@ impl Http1IoMode {
             "send-recv" => Some(Self::SendRecv),
             "readv-writev" => Some(Self::ReadvWritev),
             "sendmsg-recvmsg" => Some(Self::SendmsgRecvmsg),
+            "sendfile" => Some(Self::Sendfile),
             _ => None,
         }
     }
@@ -307,6 +315,7 @@ fn write_chunk(stream: &TcpStream, chunk: &[u8], io_mode: Http1IoMode) -> io::Re
             )
             .map_err(Into::into)
         }
+        Http1IoMode::Sendfile => write_chunk_with_sendfile(stream, chunk),
     }
 }
 
@@ -325,6 +334,7 @@ fn read_to_end(stream: &TcpStream, io_mode: Http1IoMode) -> io::Result<Vec<u8>> 
 fn read_chunk(stream: &TcpStream, buffer: &mut [u8], io_mode: Http1IoMode) -> io::Result<usize> {
     match io_mode {
         Http1IoMode::ReadWrite => rustix::io::read(stream, buffer).map_err(io::Error::from),
+        Http1IoMode::Sendfile => rustix::io::read(stream, buffer).map_err(io::Error::from),
         Http1IoMode::ReadvWritev => {
             let mut empty = [];
             let mut slices = vector_read_slices(&mut empty, buffer);
@@ -350,6 +360,54 @@ fn read_chunk(stream: &TcpStream, buffer: &mut [u8], io_mode: Http1IoMode) -> io
             Ok(received.bytes)
         }
     }
+}
+
+fn write_chunk_with_sendfile(stream: &TcpStream, chunk: &[u8]) -> io::Result<usize> {
+    let (path, mut file) = create_sendfile_temp_file()?;
+    let result = (|| {
+        file.write_all(chunk)?;
+        file.flush()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut offset = 0;
+        rustix::fs::sendfile(stream, &file, Some(&mut offset), chunk.len()).map_err(io::Error::from)
+    })();
+    let remove_result = fs::remove_file(&path);
+    match (result, remove_result) {
+        (Ok(written), Ok(())) => Ok(written),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn create_sendfile_temp_file() -> io::Result<(PathBuf, File)> {
+    for _ in 0..16 {
+        let path = sendfile_temp_path();
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "failed to allocate unique sendfile fixture temp path",
+    ))
+}
+
+fn sendfile_temp_path() -> PathBuf {
+    let sequence = SENDFILE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    std::env::temp_dir().join(format!(
+        "traffic-probe-e2e-sendfile-{}-{timestamp}-{sequence}",
+        std::process::id(),
+    ))
 }
 
 fn vector_write_slices(chunk: &[u8]) -> [IoSlice<'_>; 3] {
@@ -512,6 +570,26 @@ mod tests {
         })?;
 
         assert_eq!(report.io_mode, Http1IoMode::SendRecv);
+        assert_eq!(report.client_bytes_written, report.server_bytes_read);
+        assert_eq!(report.client_bytes_read, report.server_bytes_written);
+        Ok(())
+    }
+
+    #[test]
+    fn http1_loopback_runs_with_sendfile_syscall() -> Result<(), Box<dyn Error>> {
+        let report = run_http1_loopback(Http1LoopbackConfig {
+            traffic: HttpTrafficConfig {
+                requests: 1,
+                request_body_bytes: 64,
+                response_body_bytes: 32,
+                write_chunks: 2,
+            },
+            run: LoopbackRunOptions::default(),
+            io_mode: Http1IoMode::Sendfile,
+            accept_read_delay_ms: 0,
+        })?;
+
+        assert_eq!(report.io_mode, Http1IoMode::Sendfile);
         assert_eq!(report.client_bytes_written, report.server_bytes_read);
         assert_eq!(report.client_bytes_read, report.server_bytes_written);
         Ok(())

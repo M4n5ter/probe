@@ -61,6 +61,7 @@ pub(crate) enum Http1FixtureIoMode {
     SendRecv,
     ReadvWritev,
     SendmsgRecvmsg,
+    Sendfile,
 }
 
 impl Http1FixtureIoMode {
@@ -70,6 +71,7 @@ impl Http1FixtureIoMode {
             Self::SendRecv => "send-recv",
             Self::ReadvWritev => "readv-writev",
             Self::SendmsgRecvmsg => "sendmsg-recvmsg",
+            Self::Sendfile => "sendfile",
         }
     }
 }

@@ -117,6 +117,7 @@ pub struct EbpfSocketWriteObservation {
     pub buffer: Vec<u8>,
     pub truncated: bool,
     pub read_failed: bool,
+    pub kernel_transfer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

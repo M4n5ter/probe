@@ -492,6 +492,7 @@ mod tests {
             buffer: b"hello".to_vec(),
             truncated: false,
             read_failed: false,
+            kernel_transfer: false,
         }
     }
 

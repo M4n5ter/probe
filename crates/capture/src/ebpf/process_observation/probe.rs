@@ -1,4 +1,5 @@
 use std::{
+    fs, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
 };
@@ -13,10 +14,11 @@ use ebpf_abi::{
     EBPF_EVENTS_MAP_NAME, EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME, EBPF_PROCESS_TRACEPOINT_SPECS,
     EBPF_SOCKET_FLOW_REMOTE_ENDPOINT_VALID, EBPF_SOCKET_FLOW_SOCKADDR_READ_FAILED,
     EBPF_SOCKET_FLOW_UNSUPPORTED_ADDRESS_FAMILY, EBPF_SOCKET_READ_READ_FAILED,
-    EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_WRITE_READ_FAILED, EBPF_SOCKET_WRITE_TRUNCATED,
-    EbpfAcceptObservation, EbpfCloseRangeObservation, EbpfConnectObservation, EbpfEventDecodeError,
-    EbpfProcessProbeEvent, EbpfProcessTracepointSpec, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
-    EbpfSocketReadSample, EbpfSocketWriteSample, decode_process_probe_event,
+    EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_WRITE_KERNEL_TRANSFER, EBPF_SOCKET_WRITE_READ_FAILED,
+    EBPF_SOCKET_WRITE_TRUNCATED, EbpfAcceptObservation, EbpfCloseRangeObservation,
+    EbpfConnectObservation, EbpfEventDecodeError, EbpfProcessProbeEvent, EbpfProcessTracepointRole,
+    EbpfProcessTracepointSpec, EbpfSocketFdKey, EbpfSocketPayloadAllowance, EbpfSocketReadSample,
+    EbpfSocketWriteSample, decode_process_probe_event,
 };
 use ebpf_object::{
     EbpfObjectProbe, EbpfObjectProbeConfig, EbpfObjectProbeReport, EbpfPreflightedObject,
@@ -61,6 +63,21 @@ pub enum EbpfProcessObservationProbeError {
         name: &'static str,
         action: &'static str,
         source: ProgramError,
+    },
+    #[error("failed to inspect eBPF tracepoint {category}/{tracepoint_name}: {source}")]
+    TracepointProbe {
+        category: &'static str,
+        tracepoint_name: &'static str,
+        source: io::Error,
+    },
+    #[error(
+        "optional eBPF tracepoint pair is incomplete: {present_category}/{present_tracepoint_name} exists but {missing_category}/{missing_tracepoint_name} is missing"
+    )]
+    IncompleteOptionalTracepointPair {
+        present_category: &'static str,
+        present_tracepoint_name: &'static str,
+        missing_category: &'static str,
+        missing_tracepoint_name: &'static str,
     },
     #[error("eBPF object is missing map {name}")]
     MissingMap { name: &'static str },
@@ -201,8 +218,14 @@ impl EbpfProcessObservationProbe {
             .map_err(|source| EbpfProcessObservationProbeError::Load { source })?;
         let mut attached_tracepoints = Vec::new();
         for spec in EBPF_PROCESS_TRACEPOINT_SPECS {
+            if spec.role.has_optional_attach() {
+                continue;
+            }
             load_and_attach_tracepoint(&mut ebpf, spec)?;
             attached_tracepoints.push(spec);
+        }
+        for pair in OPTIONAL_TRACEPOINT_PAIRS {
+            attached_tracepoints.extend(load_and_attach_optional_tracepoint_pair(&mut ebpf, pair)?);
         }
         let events = open_events_ringbuf(&mut ebpf)?;
         let allowed_socket_fds = open_socket_allow_map(&mut ebpf)?;
@@ -270,6 +293,51 @@ type SocketAllowMap = AyaHashMap<
 >;
 type OutputLossMap = PerCpuArray<MapData, u64>;
 
+const OPTIONAL_TRACEPOINT_PAIRS: [OptionalTracepointPair; 2] = [
+    OptionalTracepointPair {
+        enter: EbpfProcessTracepointRole::SendfileEnter,
+        exit: EbpfProcessTracepointRole::SendfileExit,
+    },
+    OptionalTracepointPair {
+        enter: EbpfProcessTracepointRole::Sendfile64Enter,
+        exit: EbpfProcessTracepointRole::Sendfile64Exit,
+    },
+];
+
+#[derive(Clone, Copy)]
+struct OptionalTracepointPair {
+    enter: EbpfProcessTracepointRole,
+    exit: EbpfProcessTracepointRole,
+}
+
+impl OptionalTracepointPair {
+    fn specs(
+        self,
+    ) -> (
+        &'static EbpfProcessTracepointSpec,
+        &'static EbpfProcessTracepointSpec,
+    ) {
+        (self.enter.spec(), self.exit.spec())
+    }
+}
+
+fn load_and_attach_optional_tracepoint_pair(
+    ebpf: &mut Ebpf,
+    pair: OptionalTracepointPair,
+) -> Result<Vec<EbpfProcessTracepointSpec>, EbpfProcessObservationProbeError> {
+    let (enter, exit) = pair.specs();
+    match (tracepoint_exists(enter)?, tracepoint_exists(exit)?) {
+        (true, true) => {
+            load_and_attach_tracepoint(ebpf, *enter)?;
+            load_and_attach_tracepoint(ebpf, *exit)?;
+            Ok(vec![*enter, *exit])
+        }
+        (false, false) => Ok(Vec::new()),
+        (true, false) => Err(incomplete_optional_tracepoint_pair(*enter, *exit)),
+        (false, true) => Err(incomplete_optional_tracepoint_pair(*exit, *enter)),
+    }
+}
+
 fn load_and_attach_tracepoint(
     ebpf: &mut Ebpf,
     spec: EbpfProcessTracepointSpec,
@@ -301,6 +369,42 @@ fn load_and_attach_tracepoint(
             source,
         })?;
     Ok(())
+}
+
+fn tracepoint_exists(
+    spec: &EbpfProcessTracepointSpec,
+) -> Result<bool, EbpfProcessObservationProbeError> {
+    for tracefs in ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"] {
+        let path = PathBuf::from(tracefs)
+            .join("events")
+            .join(spec.category)
+            .join(spec.tracepoint_name)
+            .join("id");
+        match fs::metadata(&path) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(EbpfProcessObservationProbeError::TracepointProbe {
+                    category: spec.category,
+                    tracepoint_name: spec.tracepoint_name,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn incomplete_optional_tracepoint_pair(
+    present: EbpfProcessTracepointSpec,
+    missing: EbpfProcessTracepointSpec,
+) -> EbpfProcessObservationProbeError {
+    EbpfProcessObservationProbeError::IncompleteOptionalTracepointPair {
+        present_category: present.category,
+        present_tracepoint_name: present.tracepoint_name,
+        missing_category: missing.category,
+        missing_tracepoint_name: missing.tracepoint_name,
+    }
 }
 
 fn open_events_ringbuf(
@@ -427,6 +531,7 @@ fn process_observation_from_event(
                 buffer: sample.buffer[..usize::from(sample.captured_len)].to_vec(),
                 truncated: event.flags() & EBPF_SOCKET_WRITE_TRUNCATED != 0,
                 read_failed: event.flags() & EBPF_SOCKET_WRITE_READ_FAILED != 0,
+                kernel_transfer: event.flags() & EBPF_SOCKET_WRITE_KERNEL_TRANSFER != 0,
             }))
         }
         Some(ebpf_abi::EbpfEventKind::SocketReadSampled) => {
@@ -567,7 +672,8 @@ mod tests {
     use ebpf_abi::{
         EBPF_ACCEPT_REMOTE_ENDPOINT_VALID, EBPF_ADDRESS_FAMILY_INET, EBPF_ADDRESS_FAMILY_INET6,
         EBPF_CONNECT_REMOTE_ENDPOINT_VALID, EBPF_CONNECT_SOCKADDR_READ_FAILED,
-        EBPF_SOCKET_READ_SAMPLE_BYTES, EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_WRITE_SAMPLE_BYTES,
+        EBPF_SOCKET_READ_SAMPLE_BYTES, EBPF_SOCKET_READ_TRUNCATED,
+        EBPF_SOCKET_WRITE_KERNEL_TRANSFER, EBPF_SOCKET_WRITE_SAMPLE_BYTES,
         EBPF_SOCKET_WRITE_TRUNCATED, EbpfAcceptObservation, EbpfCloseObservation,
         EbpfCloseRangeObservation, EbpfConnectObservation, EbpfProcessProbeEvent,
         EbpfSocketReadSample, EbpfSocketWriteSample,
@@ -808,6 +914,7 @@ mod tests {
                 assert_eq!(write.buffer, b"GET /");
                 assert!(write.truncated);
                 assert!(!write.read_failed);
+                assert!(!write.kernel_transfer);
             }
             observation => panic!("unexpected observation: {observation:?}"),
         }
@@ -872,6 +979,37 @@ mod tests {
                 assert!(write.buffer.is_empty());
                 assert!(write.truncated);
                 assert!(!write.read_failed);
+                assert!(!write.kernel_transfer);
+            }
+            observation => panic!("unexpected observation: {observation:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn process_observation_decodes_kernel_transfer_socket_write_gap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let event = EbpfProcessProbeEvent::socket_write_sampled(
+            11,
+            22,
+            33,
+            44,
+            nul_padded_command("curl"),
+            EbpfSocketWriteSample::new(7, 10, 10, 0, [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES]),
+            EBPF_SOCKET_WRITE_KERNEL_TRANSFER,
+        );
+
+        let observation =
+            decode_process_observation(&ebpf_abi::encode_process_probe_event(&event))?;
+        match observation {
+            EbpfProcessObservation::Write(write) => {
+                assert_eq!(write.fd, 7);
+                assert_eq!(write.fd_generation, 10);
+                assert_eq!(write.original_len, 10);
+                assert!(write.buffer.is_empty());
+                assert!(!write.truncated);
+                assert!(!write.read_failed);
+                assert!(write.kernel_transfer);
             }
             observation => panic!("unexpected observation: {observation:?}"),
         }
