@@ -34,6 +34,10 @@ use policy_hook::{MitmPolicyHookServer, assert_policy_hook_requests};
 use transparent_tls::exercise_product_proxy_transparent_tls_path;
 
 use super::{
+    agent_admin::{
+        wait_for_agent_enforcement_decision_count_at_least,
+        wait_for_agent_l7_mitm_proxy_hook_execution_count_at_least, wait_for_agent_policy_progress,
+    },
     harness::{
         ChildSupervisor, UnixSocketReadySignal, create_temp_root, e2e_error,
         ensure_e2e_packages_built, reexec_current_case_in_fresh_network_namespace,
@@ -41,11 +45,8 @@ use super::{
     },
     loopback::{
         LabeledRunResult, RunResult, merge_labeled_run_results, spawn_agent,
-        spawn_http1_loopback_fixture, start_http1_loopback_fixture,
-        wait_for_agent_enforcement_decision_count_at_least,
-        wait_for_agent_l7_mitm_proxy_hook_execution_count_at_least, wait_for_agent_policy_progress,
-        wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
-        wait_for_http1_loopback_fixture_ready,
+        spawn_http1_loopback_fixture, start_http1_loopback_fixture, wait_for_agent_ready,
+        wait_for_http1_loopback_fixture_exit, wait_for_http1_loopback_fixture_ready,
     },
 };
 

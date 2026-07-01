@@ -8,8 +8,9 @@ use probe_core::{CaptureSource, Direction, EventEnvelope, EventKind};
 use storage::{FjallSpool, StoredEvent};
 
 use super::{
+    agent_admin::assert_no_policy_runtime_errors,
     harness::{decode_capture_event, decode_envelope, e2e_error},
-    loopback::{assert_no_policy_runtime_errors, is_fixture_process},
+    loopback::is_fixture_process,
 };
 
 const E2E_EXPORT_CURSOR_OWNER: &str = "e2e-tls-plaintext";

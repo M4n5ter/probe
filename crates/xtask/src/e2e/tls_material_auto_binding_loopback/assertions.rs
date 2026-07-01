@@ -5,8 +5,8 @@ use probe_core::{CaptureProviderKind, CaptureSource, Direction, EventEnvelope, E
 use storage::{FjallSpool, StoredEvent};
 
 use super::super::{
+    agent_admin::assert_no_policy_runtime_errors,
     harness::{decode_capture_event, decode_envelope, e2e_error},
-    loopback::assert_no_policy_runtime_errors,
 };
 use super::{
     POLICY_ID, POLICY_VERSION,

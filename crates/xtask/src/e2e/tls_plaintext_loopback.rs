@@ -9,6 +9,7 @@ use probe_config::{AgentConfig, CaptureSelection, PolicyConfig};
 use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
 
 use super::{
+    agent_admin::wait_for_agent_policy_progress,
     harness::{
         ChildSupervisor, UnixSocketReadySignal, create_temp_root, e2e_error,
         ensure_e2e_packages_built, stop_running_child,
@@ -16,7 +17,7 @@ use super::{
     loopback::{
         Http1LoopbackFixtureConfig, RunResult, merge_labeled_run_results, merge_run_results,
         spawn_agent, spawn_tls_http1_loopback_fixture, start_http1_loopback_fixture,
-        wait_for_agent_policy_progress, wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
+        wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
         wait_for_http1_loopback_fixture_ready,
     },
     tls_plaintext_assertions::{

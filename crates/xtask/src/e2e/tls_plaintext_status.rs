@@ -8,7 +8,7 @@ use std::{
 
 use serde_json::json;
 
-use super::{harness::e2e_error, loopback::send_admin_request};
+use super::{agent_admin::send_admin_request, harness::e2e_error};
 
 const TLS_ATTACH_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const TLS_TARGET_LIFECYCLE_READY_TIMEOUT: Duration = Duration::from_secs(8);

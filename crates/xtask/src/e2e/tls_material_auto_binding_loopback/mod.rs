@@ -11,14 +11,14 @@ use std::{
 use probe_config::{AgentConfig, CaptureSelection, PolicyConfig};
 
 use super::{
+    agent_admin::{
+        send_admin_request, wait_for_agent_pipeline_progress, wait_for_agent_policy_progress,
+    },
     harness::{
         ChildSupervisor, UnixSocketReadySignal, create_temp_root, e2e_error,
         ensure_e2e_packages_built, stop_running_child,
     },
-    loopback::{
-        merge_labeled_run_results, send_admin_request, spawn_agent,
-        wait_for_agent_pipeline_progress, wait_for_agent_policy_progress, wait_for_agent_ready,
-    },
+    loopback::{merge_labeled_run_results, spawn_agent, wait_for_agent_ready},
 };
 
 mod assertions;

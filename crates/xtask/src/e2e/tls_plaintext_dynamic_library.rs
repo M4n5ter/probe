@@ -11,16 +11,14 @@ use probe_config::{AgentConfig, CaptureSelection, PolicyConfig};
 use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
 
 use super::{
+    agent_admin::wait_for_agent_policy_progress,
     harness::{
         ChildSupervisor, UnixSocketReadySignal, create_temp_root, debug_binary, e2e_error,
         ensure_e2e_packages_built, publish_atomic_file, run_in_own_process_group,
         stop_running_child, trusted_system_command, wait_for_child_exit,
         wait_for_file_or_child_exit,
     },
-    loopback::{
-        merge_labeled_run_results, spawn_agent, wait_for_agent_policy_progress,
-        wait_for_agent_ready,
-    },
+    loopback::{merge_labeled_run_results, spawn_agent, wait_for_agent_ready},
     tls_plaintext_assertions::{TlsPlaintextExpectations, assert_spool_outputs_for_pid},
     tls_plaintext_status::{
         TlsPlaintextAttachStatus, wait_for_tls_plaintext_active_target_path_after_sequence,

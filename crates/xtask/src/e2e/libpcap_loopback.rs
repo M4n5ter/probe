@@ -6,14 +6,14 @@ use probe_core::{CaptureProviderKind, CaptureSource, Direction, EventEnvelope, E
 use storage::{FjallSpool, StoredEvent};
 
 use super::{
+    agent_admin::{assert_no_policy_runtime_errors, wait_for_agent_policy_progress},
     harness::{
         ChildSupervisor, UnixSocketReadySignal, create_temp_root, decode_capture_event,
         decode_envelope, e2e_error, ensure_e2e_packages_built, stop_running_child,
     },
     loopback::{
-        Http1LoopbackFixtureConfig, PlainHttp1LoopbackFixtureConfig,
-        assert_no_policy_runtime_errors, merge_run_results, spawn_agent,
-        spawn_http1_loopback_fixture, start_http1_loopback_fixture, wait_for_agent_policy_progress,
+        Http1LoopbackFixtureConfig, PlainHttp1LoopbackFixtureConfig, merge_run_results,
+        spawn_agent, spawn_http1_loopback_fixture, start_http1_loopback_fixture,
         wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
         wait_for_http1_loopback_fixture_ready,
     },

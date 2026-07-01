@@ -5,17 +5,18 @@ use probe_core::{CaptureProviderKind, CaptureSource, EventKind, FlowContext};
 use storage::FjallSpool;
 
 use super::{
+    agent_admin::{
+        assert_no_policy_runtime_errors, send_admin_request,
+        wait_for_agent_policy_alert_count_above, wait_for_agent_policy_alert_count_at_least,
+    },
     harness::{
         ChildSupervisor, UnixSocketReadySignal, create_temp_root, decode_envelope, e2e_error,
         ensure_e2e_packages_built, stop_running_child,
     },
     loopback::{
-        Http1LoopbackFixtureConfig, PlainHttp1LoopbackFixtureConfig,
-        assert_no_policy_runtime_errors, send_admin_request, spawn_agent,
-        spawn_http1_loopback_fixture, start_http1_loopback_fixture,
-        wait_for_agent_policy_alert_count_above, wait_for_agent_policy_alert_count_at_least,
-        wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
-        wait_for_http1_loopback_fixture_ready,
+        Http1LoopbackFixtureConfig, PlainHttp1LoopbackFixtureConfig, spawn_agent,
+        spawn_http1_loopback_fixture, start_http1_loopback_fixture, wait_for_agent_ready,
+        wait_for_http1_loopback_fixture_exit, wait_for_http1_loopback_fixture_ready,
     },
 };
 

@@ -9,7 +9,7 @@ use exporter::CompressionCodec;
 use probe_core::{EventEnvelope, EventKind};
 
 use super::super::{
-    harness::e2e_error, loopback::send_admin_request, webhook_receiver::ReceivedBatch,
+    agent_admin::send_admin_request, harness::e2e_error, webhook_receiver::ReceivedBatch,
 };
 use super::commands::{ip_output, ip_route_table_output, nft_command, nft_output};
 use super::fixtures::{ExternalProxyReport, ProxyFixtureReport, UpstreamReport};

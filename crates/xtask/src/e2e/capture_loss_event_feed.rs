@@ -1,10 +1,4 @@
-use std::{
-    fs,
-    path::Path,
-    process::{Child, ExitCode},
-    thread,
-    time::{Duration, Instant},
-};
+use std::{fs, path::Path, process::ExitCode};
 
 use capture::{CaptureEvent, CaptureProviderKind, CapturedLoss};
 use probe_config::{AgentConfig, CaptureSelection};
@@ -15,11 +9,14 @@ use probe_core::{
 use storage::FjallSpool;
 
 use super::{
+    agent_admin::{
+        assert_agent_capture_loss_prometheus_metrics, wait_for_agent_capture_loss_metrics_at_least,
+    },
     harness::{
         ChildSupervisor, UnixSocketReadySignal, create_temp_root, decode_capture_event,
         decode_envelope, e2e_error, ensure_e2e_packages_built, stop_running_child,
     },
-    loopback::{send_admin_request, spawn_agent, wait_for_agent_ready},
+    loopback::{spawn_agent, wait_for_agent_ready},
 };
 
 const AGENT_ID: &str = "e2e-capture-loss-event-feed-agent";
@@ -27,8 +24,6 @@ const CONFIG_VERSION: &str = "e2e-capture-loss-event-feed";
 const E2E_EXPORT_CURSOR_OWNER: &str = "e2e-capture-loss";
 const LOST_EVENTS: u64 = 11;
 const LOSS_REASON: &str = "deterministic provider loss fixture";
-const METRICS_TIMEOUT: Duration = Duration::from_secs(10);
-const METRICS_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(crate) fn run() -> ExitCode {
     match run_inner() {
@@ -71,8 +66,19 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut ready_signal = UnixSocketReadySignal::bind(agent_ready_socket_path)?;
     let mut agent = supervisor.watch(spawn_agent(&config_path, &ready_signal)?, "agent");
     wait_for_agent_ready(agent.child_mut(), &mut ready_signal)?;
-    let metrics = wait_for_capture_loss_metrics(agent.child_mut(), &admin_socket_path)?;
-    assert_prometheus_metrics(&admin_socket_path)?;
+    let metrics = wait_for_agent_capture_loss_metrics_at_least(
+        agent.child_mut(),
+        &admin_socket_path,
+        1,
+        LOST_EVENTS,
+        "deterministic provider loss",
+    )?;
+    assert_agent_capture_loss_prometheus_metrics(
+        &admin_socket_path,
+        1,
+        LOST_EVENTS,
+        "deterministic provider loss",
+    )?;
     stop_running_child(agent.child_mut(), "agent")?;
     agent.unwatch();
     assert_spool_outputs(&spool_path)?;
@@ -134,99 +140,6 @@ fn loss_timestamp() -> Timestamp {
         monotonic_ns: 1,
         wall_time_unix_ns: 2,
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CaptureLossMetrics {
-    events: u64,
-    lost_events: u64,
-}
-
-fn wait_for_capture_loss_metrics(
-    agent: &mut Child,
-    admin_socket_path: &Path,
-) -> Result<CaptureLossMetrics, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + METRICS_TIMEOUT;
-    let mut last_metrics = None;
-    loop {
-        match read_capture_loss_metrics(admin_socket_path) {
-            Ok(metrics) if metrics.events == 1 && metrics.lost_events == LOST_EVENTS => {
-                return Ok(metrics);
-            }
-            Ok(metrics) => last_metrics = Some(metrics),
-            Err(error) => {
-                if let Some(status) = agent.try_wait()? {
-                    return Err(e2e_error(format!(
-                        "agent exited with {status} before capture loss metrics were available: {error}"
-                    ))
-                    .into());
-                }
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(e2e_error(format!(
-                "timed out waiting for capture loss metrics; last metrics {last_metrics:?}"
-            ))
-            .into());
-        }
-        thread::sleep(METRICS_INTERVAL);
-    }
-}
-
-fn read_capture_loss_metrics(
-    admin_socket_path: &Path,
-) -> Result<CaptureLossMetrics, Box<dyn std::error::Error>> {
-    let response = send_admin_request(
-        admin_socket_path,
-        serde_json::json!({ "command": "metrics" }),
-    )?;
-    let capture_loss = &response["metrics"]["pipeline"]["capture_loss"];
-    let events = capture_loss["events"].as_u64().ok_or_else(|| {
-        e2e_error(format!(
-            "admin metrics response omitted capture loss event count: {response}"
-        ))
-    })?;
-    let lost_events = capture_loss["lost_events"].as_u64().ok_or_else(|| {
-        e2e_error(format!(
-            "admin metrics response omitted capture lost event count: {response}"
-        ))
-    })?;
-    Ok(CaptureLossMetrics {
-        events,
-        lost_events,
-    })
-}
-
-fn assert_prometheus_metrics(admin_socket_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let response = send_admin_request(
-        admin_socket_path,
-        serde_json::json!({ "command": "prometheus_metrics" }),
-    )?;
-    if response["kind"] != serde_json::json!("prometheus_metrics") {
-        return Err(e2e_error(format!(
-            "unexpected prometheus metrics response: {response}"
-        ))
-        .into());
-    }
-    let metrics = response["metrics"].as_str().ok_or_else(|| {
-        e2e_error(format!(
-            "prometheus metrics response omitted text: {response}"
-        ))
-    })?;
-    if !metrics.contains("traffic_probe_pipeline_capture_loss_events_total 1\n") {
-        return Err(e2e_error(format!(
-            "prometheus metrics omitted capture loss event counter: {metrics}"
-        ))
-        .into());
-    }
-    let lost_events = format!("traffic_probe_pipeline_capture_lost_events_total {LOST_EVENTS}\n");
-    if !metrics.contains(&lost_events) {
-        return Err(e2e_error(format!(
-            "prometheus metrics omitted capture lost event counter: {metrics}"
-        ))
-        .into());
-    }
-    Ok(())
 }
 
 fn assert_spool_outputs(spool_path: &Path) -> Result<(), Box<dyn std::error::Error>> {

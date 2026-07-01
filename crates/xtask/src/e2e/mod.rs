@@ -1,5 +1,6 @@
 mod admin_enforcement_reload;
 mod admin_policy_reload;
+mod agent_admin;
 mod capture_loss_event_feed;
 mod ebpf_process_loopback;
 mod ebpf_process_output_loss;

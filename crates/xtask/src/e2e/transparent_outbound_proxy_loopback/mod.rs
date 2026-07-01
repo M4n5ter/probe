@@ -7,12 +7,13 @@ mod flow_classified;
 use std::{env, fs, net::Ipv4Addr, path::Path, process::ExitCode, time::Duration};
 
 use super::{
+    agent_admin::send_admin_request,
     harness::{
         ChildSupervisor, HttpSourceServer, UnixSocketReadySignal, e2e_error,
         ensure_e2e_packages_built, reexec_current_case_in_fresh_network_namespace,
         run_with_temp_root, stop_running_child, verify_fresh_network_namespace,
     },
-    loopback::{send_admin_request, spawn_agent, wait_for_agent_ready},
+    loopback::{spawn_agent, wait_for_agent_ready},
     webhook_receiver::WebhookBatchReceiver,
 };
 use assertions::{

@@ -36,8 +36,8 @@ use super::{
     websocket_assertions::assert_expected_websocket_bridge_export,
 };
 use crate::e2e::{
+    agent_admin::{assert_no_policy_runtime_errors, send_admin_request},
     harness::{decode_capture_event, decode_envelope, e2e_error},
-    loopback::{assert_no_policy_runtime_errors, send_admin_request},
 };
 
 const HEALTH_TRANSITION_TIMEOUT: Duration = Duration::from_secs(5);

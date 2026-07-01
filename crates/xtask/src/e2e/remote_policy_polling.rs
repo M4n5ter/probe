@@ -17,14 +17,14 @@ use probe_core::{
 use storage::FjallSpool;
 
 use super::{
+    agent_admin::{
+        wait_for_agent_policy_alert_count_above, wait_for_agent_policy_alert_count_at_least,
+    },
     harness::{
         ChildSupervisor, HttpSourceServer, UnixSocketReadySignal, create_temp_root,
         decode_envelope, e2e_error, ensure_e2e_packages_built, stop_running_child,
     },
-    loopback::{
-        spawn_agent, wait_for_agent_policy_alert_count_above,
-        wait_for_agent_policy_alert_count_at_least, wait_for_agent_ready,
-    },
+    loopback::{spawn_agent, wait_for_agent_ready},
 };
 
 const AGENT_ID: &str = "e2e-remote-policy-polling-agent";
