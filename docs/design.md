@@ -29,7 +29,8 @@ libpcap/procfs 等 fallback 路径，并明确标注能力降级。
 - 加密流量 best effort 明文探测：默认优先通过非 MITM 路线获取 TLS 明文或会话材料；同时必须提供显式启用、按 selector 生效的
   MITM 路径，覆盖需要代理解密和主动防护的场景。
 - 可扩展协议解析：首要支持 HTTP/1.x 和 SSE，后续自然扩展 WebSocket、HTTP/2、HTTP/3 等协议。
-- 策略驱动的检测与防护：首个可用闭环先支持观测、告警和 dry-run verdict，后续接入真实拦截执行。
+- 策略驱动的检测与防护：观测、告警、dry-run verdict、显式连接级执行、透明拦截和 MITM policy hook
+  共享同一 selector 与审计边界。
 
 本文档是架构事实源，同时记录当前实现状态。当前稳定方向是：
 
@@ -45,6 +46,7 @@ libpcap/procfs 等 fallback 路径，并明确标注能力降级。
 - HTTP/1.x、SSE、WebSocket frame metadata 和 16 MiB 有界 message metadata 已可解析。
 - Lua policy 可产生 alert/verdict。
 - Fjall ingress/export lanes、webhook/file exporter、status/admin/metrics 已可持续运行和观测。
+- Storage retention 由统一 worker 维护 ingress/export lifecycle，并保留 per-sink cursor 与可退休前缀边界。
 - 在线 capture input activity 与 pipeline metrics 可观测 input poll 活性、capture read、ingress/export 进展、
   policy/enforcement 输出和 provider-level capture loss。
 
@@ -83,11 +85,14 @@ TLS plaintext / session secret 现状：
 - 已透传 record 不回溯重写；material 后到且当前 chunk 不在 TLS record 边界时仍保持 best-effort raw 透传。
 - 绑定 stream 的 ciphertext suppression 独立于 decryptor active stream 状态，terminal decrypt gap 后仍继续抑制该方向后续密文。
 
-已有骨架但仍需推进：
+已接入并由 capability gate 约束的防护能力：
 
-- Linux socket destroy enforcement backend 已有可验证骨架。
-- selector-projected transparent interception rule lifecycle 已有可验证骨架。
-- storage retention 已有可验证骨架。
+- Linux socket destroy enforcement backend 已接入显式 capability gate、procfs owner 复核、active self-test 和 audit output；
+  真实 destructive path 只有在 active self-test 证明当前 namespace/kernel 支持 socket destroy 时才可执行。
+- selector-projected transparent interception 已覆盖入站 TPROXY、出站透明代理、process-scoped setup proof、
+  owner-scoped outbound path 和 managed/external proxy lifecycle。
+- Product MITM proxy 已覆盖显式 TLS material、operator-managed trust contract/material refs、upstream route/DNS discovery、
+  HTTP policy hook、入站/出站透明 HTTPS 和 WebSocket tunnel path；它不自动修改客户端 trust store。
 
 当前明确缺口：
 
@@ -144,16 +149,16 @@ flowchart LR
 
 ## 4. 当前目标范围
 
-当前硬目标是完成观测闭环：
+当前目标范围以 Linux host 观测闭环为基础，并覆盖显式防护、外发和管理面验证：
 
 1. Host Agent 在 Linux 上运行。
 2. 通过 selector 命中目标进程或服务。
 3. eBPF/socket-first 路径采集连接和明文 HTTP/1.x 字节流。
 4. HTTP/1.x parser 输出 request、response、body chunk、SSE 语义事件。
-5. Lua 策略消费标准化事件，产生 alert 或 dry-run typed verdict。
+5. Lua 策略消费标准化事件，产生 alert 或 typed verdict。
 6. 事件进入 Fjall-backed durable spool。
 7. HTTP(S) webhook batch exporter 将事件发送到测试 receiver。
-8. agent 暴露 capability matrix、metrics、health、degraded/gap counters。
+8. agent 暴露 capability matrix、metrics、health、degraded/gap counters 和 admin reload surface。
 
 额外证明点：
 
@@ -163,7 +168,11 @@ flowchart LR
   归因；libpcap provider 可报告 available capability，但 capture evidence/events/health 会表达 best-effort 降级。
 - enforcement demo：Lua 策略返回 `deny`、`reset`、`quarantine` 等 typed verdict；默认 `audit_only`/`dry_run` 只记录 requested action、
   effective action、planner outcome 和 audit event，显式 `enforcement.backend = "linux_socket_destroy"` 可在 root 下对 selector
-  命中的现有 TCP socket 做 procfs owner 复核后，通过固定系统路径 `ss -K` 执行销毁。
+  命中的现有 TCP socket 做 procfs owner 复核，并且只在 active self-test 证明当前环境支持时通过固定系统路径
+  `ss -K` 执行销毁。
+- transparent/MITM demo：显式 selector、nftables/TPROXY 或 OUTPUT redirect、managed/external proxy、product MITM proxy、
+  operator-managed trust contract/material refs、policy hook 和 durable audit 组合成可验证的入站/出站防护路径；
+  客户端 trust store 仍由 operator 管理。
 
 当前明确不做：
 
