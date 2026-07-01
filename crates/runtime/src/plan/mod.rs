@@ -41,6 +41,7 @@ pub use interception_scope::{
     TransparentInterceptionProjectedHostRuleScopePlan,
     TransparentInterceptionProjectedPortScopePlan,
     TransparentInterceptionProjectedRemoteAddressScopePlan,
+    TransparentInterceptionProjectedSocketCgroupScopePlan,
 };
 pub use probe_config::RemoteEnforcementPolicyBodyLimitBytes;
 pub use registry::{PlatformProbeResults, ProviderRegistry, default_l7_mitm_unavailable_reason};

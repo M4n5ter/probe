@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, net::IpAddr};
 
-use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
+use probe_core::{CgroupPath, Direction, ProcessSelector, Selector, TrafficSelector};
 
 use super::model::{TransparentInterceptionHostRuleCompaction, process_selector_has_constraints};
 use super::{
@@ -9,7 +9,8 @@ use super::{
     TransparentInterceptionPortScope, TransparentInterceptionProcessScope,
     TransparentInterceptionProcessScopeExpression, TransparentInterceptionRemoteAddressScope,
     TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan,
-    TransparentInterceptionSetupProjectionError, TransparentInterceptionSocketOwnerScope,
+    TransparentInterceptionSetupProjectionError, TransparentInterceptionSocketCgroupScope,
+    TransparentInterceptionSocketOwnerScope,
 };
 
 const PROCESS_CLASSIFIER_REASON: &str = "selector contains process constraints that require a process classifier such as cgroup/owner marking or proxy-side process classification before host rules can be safely narrowed";
@@ -82,6 +83,7 @@ enum SetupClassifierRequirement {
 struct ProjectableLocalSetupTerm {
     traffic: TrafficSelector,
     socket_owners: TransparentInterceptionSocketOwnerScope,
+    socket_cgroups: TransparentInterceptionSocketCgroupScope,
 }
 
 impl ProjectableLocalSetupTerm {
@@ -97,9 +99,15 @@ impl ProjectableLocalSetupTerm {
         else {
             return Ok(None);
         };
+        let Some(socket_cgroups) =
+            intersect_socket_cgroup_scopes(self.socket_cgroups, other.socket_cgroups)
+        else {
+            return Ok(None);
+        };
         Ok(Some(Self {
             traffic,
             socket_owners,
+            socket_cgroups,
         }))
     }
 
@@ -110,6 +118,7 @@ impl ProjectableLocalSetupTerm {
         Self {
             traffic: scope.to_traffic_selector(direction),
             socket_owners: scope.socket_owners().clone(),
+            socket_cgroups: scope.socket_cgroups().clone(),
         }
     }
 }
@@ -217,6 +226,7 @@ struct CanonicalProcessSelector {
     cmdline_regexes: BTreeSet<String>,
     systemd_services: BTreeSet<String>,
     container_ids: BTreeSet<String>,
+    cgroup_paths: BTreeSet<CgroupPath>,
 }
 
 impl CanonicalProcessScopeExpression {
@@ -246,6 +256,14 @@ impl CanonicalProcessSelector {
             cmdline_regexes: process.cmdline_regexes.iter().cloned().collect(),
             systemd_services: process.systemd_services.iter().cloned().collect(),
             container_ids: process.container_ids.iter().cloned().collect(),
+            cgroup_paths: process
+                .cgroup_paths
+                .iter()
+                .map(|path| {
+                    CgroupPath::parse(path)
+                        .expect("process cgroup paths should be validated before canonicalization")
+                })
+                .collect(),
         }
     }
 }
@@ -268,11 +286,13 @@ fn analyze_selector(
     match selector {
         Selector::Match { term } => {
             validate_traffic_selector(&term.traffic, direction)?;
-            let process_projection = process_setup_projection(&term.process, direction);
+            validate_process_selector(&term.process)?;
+            let process_projection = process_setup_projection(&term.process, direction)?;
             Ok(SelectorSetupAnalysis {
                 host_terms: ProjectableHostTerms::single(ProjectableLocalSetupTerm {
                     traffic: term.traffic.clone(),
                     socket_owners: process_projection.socket_owners,
+                    socket_cgroups: process_projection.socket_cgroups,
                 }),
                 classifier: process_projection.classifier,
             })
@@ -286,6 +306,19 @@ fn analyze_selector(
             REF_FLOW_CLASSIFIER_REASON.to_string(),
         )),
     }
+}
+
+fn validate_process_selector(
+    process: &ProcessSelector,
+) -> Result<(), TransparentInterceptionSetupProjectionError> {
+    for path in &process.cgroup_paths {
+        CgroupPath::parse(path).map_err(|reason| {
+            TransparentInterceptionSetupProjectionError::Unsupported {
+                reason: format!("invalid cgroup path {path:?}: {reason}"),
+            }
+        })?;
+    }
+    Ok(())
 }
 
 fn analyze_any_selector(
@@ -646,35 +679,51 @@ fn flow_classifier_analysis(reason: String) -> SelectorSetupAnalysis {
 
 struct ProcessSetupProjection {
     socket_owners: TransparentInterceptionSocketOwnerScope,
+    socket_cgroups: TransparentInterceptionSocketCgroupScope,
     classifier: Option<SetupClassifierRequirement>,
 }
 
 fn process_setup_projection(
     process: &ProcessSelector,
     direction: TransparentInterceptionSetupDirection,
-) -> ProcessSetupProjection {
+) -> Result<ProcessSetupProjection, TransparentInterceptionSetupProjectionError> {
     if !process_selector_has_constraints(process) {
-        return ProcessSetupProjection {
+        return Ok(ProcessSetupProjection {
             socket_owners: TransparentInterceptionSocketOwnerScope::any(),
+            socket_cgroups: TransparentInterceptionSocketCgroupScope::any(),
             classifier: None,
-        };
+        });
     }
 
     let socket_owners = socket_owner_scope_for_process(process, direction);
-    if process_selector_has_only_socket_owner_constraints(process, direction) {
-        return ProcessSetupProjection {
+    let socket_cgroups = socket_cgroup_scope_for_process(process, direction)?;
+    if process_selector_has_only_socket_constraints(process, direction) {
+        return Ok(ProcessSetupProjection {
             socket_owners,
+            socket_cgroups,
             classifier: None,
-        };
+        });
     }
 
-    ProcessSetupProjection {
+    Ok(ProcessSetupProjection {
         socket_owners,
+        socket_cgroups,
         classifier: Some(SetupClassifierRequirement::Process {
             expression: TransparentInterceptionProcessScopeExpression::Match {
                 process: process.clone(),
             },
         }),
+    })
+}
+
+fn socket_cgroup_scope_for_process(
+    process: &ProcessSelector,
+    direction: TransparentInterceptionSetupDirection,
+) -> Result<TransparentInterceptionSocketCgroupScope, TransparentInterceptionSetupProjectionError> {
+    if direction == TransparentInterceptionSetupDirection::Outbound {
+        TransparentInterceptionSocketCgroupScope::new(process.cgroup_paths.clone())
+    } else {
+        Ok(TransparentInterceptionSocketCgroupScope::any())
     }
 }
 
@@ -689,23 +738,24 @@ fn socket_owner_scope_for_process(
     }
 }
 
-fn process_selector_has_only_socket_owner_constraints(
+fn process_selector_has_only_socket_constraints(
     process: &ProcessSelector,
     direction: TransparentInterceptionSetupDirection,
 ) -> bool {
     direction == TransparentInterceptionSetupDirection::Outbound
-        && process_selector_has_socket_owner_constraints(process)
-        && !process_selector_has_constraints(&process_without_socket_owner_constraints(process))
+        && process_selector_has_socket_constraints(process)
+        && !process_selector_has_constraints(&process_without_socket_constraints(process))
 }
 
-fn process_selector_has_socket_owner_constraints(process: &ProcessSelector) -> bool {
-    !process.uids.is_empty() || !process.gids.is_empty()
+fn process_selector_has_socket_constraints(process: &ProcessSelector) -> bool {
+    !process.uids.is_empty() || !process.gids.is_empty() || !process.cgroup_paths.is_empty()
 }
 
-fn process_without_socket_owner_constraints(process: &ProcessSelector) -> ProcessSelector {
+fn process_without_socket_constraints(process: &ProcessSelector) -> ProcessSelector {
     let mut residual = process.clone();
     residual.uids.clear();
     residual.gids.clear();
+    residual.cgroup_paths.clear();
     residual
 }
 
@@ -784,11 +834,12 @@ fn host_rule_scope_from_term(
     direction: TransparentInterceptionSetupDirection,
 ) -> Result<TransparentInterceptionHostRuleScope, TransparentInterceptionSetupProjectionError> {
     validate_direction_projection(&term.traffic, direction)?;
-    TransparentInterceptionHostRuleScope::with_socket_owners(
+    TransparentInterceptionHostRuleScope::with_socket_scope(
         TransparentInterceptionPortScope::from_values(term.traffic.local_ports),
         TransparentInterceptionPortScope::from_values(term.traffic.remote_ports),
         parse_remote_addresses(&term.traffic.remote_addresses)?,
         term.socket_owners,
+        term.socket_cgroups,
     )
 }
 
@@ -894,6 +945,40 @@ fn projectable_terms_from_intermediate_terms(
         scopes.push(scope);
     }
     projectable_terms_from_scopes_without_limit(scopes, direction)
+}
+
+fn intersect_socket_cgroup_scopes(
+    left: TransparentInterceptionSocketCgroupScope,
+    right: TransparentInterceptionSocketCgroupScope,
+) -> Option<TransparentInterceptionSocketCgroupScope> {
+    let paths = intersect_cgroup_paths(left.path_values(), right.path_values())?;
+    Some(
+        TransparentInterceptionSocketCgroupScope::new(
+            paths.into_iter().map(CgroupPath::into_string).collect(),
+        )
+        .expect("intersected cgroup paths should stay normalized and valid"),
+    )
+}
+
+fn intersect_cgroup_paths(left: &[CgroupPath], right: &[CgroupPath]) -> Option<Vec<CgroupPath>> {
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => Some(Vec::new()),
+        (true, false) => Some(right.to_vec()),
+        (false, true) => Some(left.to_vec()),
+        (false, false) => {
+            let mut values = Vec::new();
+            for left_path in left {
+                for right_path in right {
+                    if let Some(path) = left_path.narrowest_overlap(right_path)
+                        && !values.contains(&path)
+                    {
+                        values.push(path);
+                    }
+                }
+            }
+            (!values.is_empty()).then_some(values)
+        }
+    }
 }
 
 fn intersect_traffic_selectors(
@@ -1100,6 +1185,21 @@ mod tests {
     }
 
     #[test]
+    fn projects_outbound_socket_cgroup_host_rule_scope() {
+        let scope = outbound_scope_for(Selector::term(
+            process_cgroups(&["/system.slice/demo.service"]),
+            outbound_remote_port_addresses(443, &["203.0.113.10"]),
+        ))
+        .expect("pure cgroup-scoped outbound selector should project");
+
+        assert_eq!(scope.remote_ports().values(), &[443]);
+        assert_eq!(
+            scope.socket_cgroups().paths().collect::<Vec<_>>(),
+            vec!["system.slice/demo.service"]
+        );
+    }
+
+    #[test]
     fn outbound_non_owner_process_constraints_still_require_classifier() {
         let plan = outbound_plan_for(Selector::term(
             ProcessSelector {
@@ -1121,6 +1221,32 @@ mod tests {
         assert_eq!(host_scope.remote_ports().values(), &[443]);
         assert_eq!(host_scope.socket_owners().uids(), &[1000]);
         assert!(host_scope.socket_owners().gids().is_empty());
+    }
+
+    #[test]
+    fn outbound_mixed_cgroup_process_constraints_require_classifier_with_cgroup_boundary() {
+        let plan = outbound_plan_for(Selector::term(
+            ProcessSelector {
+                cgroup_paths: strings(&["system.slice/demo.service"]),
+                names: strings(&["curl"]),
+                ..ProcessSelector::default()
+            },
+            outbound_remote_port_addresses(443, &["203.0.113.10"]),
+        ))
+        .expect("mixed cgroup/name selector should remain typed");
+
+        let TransparentInterceptionSetupPlan::RequiresProcessClassifier {
+            host_rule_boundary, ..
+        } = plan
+        else {
+            panic!("mixed cgroup/name selector should require classifier");
+        };
+        let host_scope = single_boundary_scope(&host_rule_boundary);
+        assert_eq!(host_scope.remote_ports().values(), &[443]);
+        assert_eq!(
+            host_scope.socket_cgroups().paths().collect::<Vec<_>>(),
+            vec!["system.slice/demo.service"]
+        );
     }
 
     #[test]
@@ -1495,6 +1621,52 @@ mod tests {
             &[8443, 9443]
         );
         assert_eq!(process_scope_names(&process_scope), ["curl", "nginx"]);
+    }
+
+    #[test]
+    fn same_process_any_selector_normalizes_cgroup_paths_for_process_equivalence() {
+        let plan = plan_for(Selector::Any {
+            selectors: vec![
+                Selector::term(
+                    process_names_cgroups(&["curl"], &["/system.slice/demo.service"]),
+                    local_port(8443),
+                ),
+                Selector::term(
+                    process_names_cgroups(&["curl"], &["system.slice/demo.service"]),
+                    local_port(9443),
+                ),
+            ],
+        })
+        .expect("same canonical cgroup path should produce a process classifier plan");
+
+        let TransparentInterceptionSetupPlan::RequiresProcessClassifier {
+            host_rule_boundary,
+            process_scope,
+            ..
+        } = plan
+        else {
+            panic!("same-process any selector should require process classifier");
+        };
+        assert_eq!(
+            single_boundary_scope(&host_rule_boundary)
+                .local_ports()
+                .values(),
+            &[8443, 9443]
+        );
+        assert_eq!(process_scope_names(&process_scope), ["curl"]);
+    }
+
+    #[test]
+    fn invalid_cgroup_path_fails_before_inbound_process_classifier_canonicalization() {
+        let error = plan_for(Selector::Any {
+            selectors: vec![
+                Selector::term(process_names_cgroups(&["curl"], &["/"]), local_port(8443)),
+                Selector::term(process_names_cgroups(&["curl"], &["/"]), local_port(9443)),
+            ],
+        })
+        .expect_err("invalid cgroup paths should fail before classifier canonicalization");
+
+        assert!(error.to_string().contains("invalid cgroup path"));
     }
 
     #[test]
@@ -2151,6 +2323,21 @@ mod tests {
         ProcessSelector {
             uids: uids.to_vec(),
             gids: gids.to_vec(),
+            ..ProcessSelector::default()
+        }
+    }
+
+    fn process_cgroups(paths: &[&str]) -> ProcessSelector {
+        ProcessSelector {
+            cgroup_paths: strings(paths),
+            ..ProcessSelector::default()
+        }
+    }
+
+    fn process_names_cgroups(names: &[&str], paths: &[&str]) -> ProcessSelector {
+        ProcessSelector {
+            names: strings(names),
+            cgroup_paths: strings(paths),
             ..ProcessSelector::default()
         }
     }

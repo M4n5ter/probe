@@ -1,4 +1,5 @@
 mod capability;
+mod cgroup;
 mod event;
 mod identity;
 mod procfs;
@@ -14,6 +15,7 @@ pub const DEFAULT_POLICY_RUNTIME_ERROR_DISABLE_THRESHOLD: u64 = 3;
 pub use capability::{
     CapabilityKind, CapabilityMatrix, CapabilityRequirement, CapabilityState, RuntimeMode,
 };
+pub use cgroup::{CgroupPath, CgroupPathError};
 pub use event::{
     BodyChunk, CaptureLoss, CaptureOrigin, CaptureProviderKind, CaptureSource, Direction,
     DomainEvent, EnforcementEvidence, EventEmission, EventEnvelope, EventId, EventKind,

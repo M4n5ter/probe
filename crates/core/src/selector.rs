@@ -8,7 +8,7 @@ use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{Direction, EventEnvelope, FlowContext, ProcessContext};
+use crate::{CgroupPath, Direction, EventEnvelope, FlowContext, ProcessContext};
 
 const MAX_RESOLVED_SELECTOR_NODES: usize = 4_096;
 const MAX_SELECTOR_REF_RESOLUTION_DEPTH: usize = 64;
@@ -21,6 +21,8 @@ pub enum SelectorError {
     InvalidRegex(String),
     #[error("invalid remote address: {0}")]
     InvalidRemoteAddress(String),
+    #[error("invalid cgroup path: {0}")]
+    InvalidCgroupPath(String),
     #[error("unknown named selector: {0}")]
     UnknownNamedSelector(String),
     #[error("recursive named selector reference: {0}")]
@@ -155,6 +157,8 @@ pub struct ProcessSelector {
     pub systemd_services: Vec<String>,
     #[serde(default)]
     pub container_ids: Vec<String>,
+    #[serde(default)]
+    pub cgroup_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -426,6 +430,7 @@ struct CompiledSelectorTerm {
     exe_path_globs: Option<GlobSet>,
     cmdline_regexes: Option<RegexSet>,
     remote_addresses: Option<BTreeSet<IpAddr>>,
+    cgroup_path_prefixes: Option<BTreeSet<CgroupPath>>,
 }
 
 impl CompiledSelectorTerm {
@@ -433,11 +438,13 @@ impl CompiledSelectorTerm {
         let exe_path_globs = compile_globs(&term.process.exe_path_globs)?;
         let cmdline_regexes = compile_regexes(&term.process.cmdline_regexes)?;
         let remote_addresses = compile_remote_addresses(&term.traffic.remote_addresses)?;
+        let cgroup_path_prefixes = compile_cgroup_paths(&term.process.cgroup_paths)?;
         Ok(Self {
             term,
             exe_path_globs,
             cmdline_regexes,
             remote_addresses,
+            cgroup_path_prefixes,
         })
     }
 
@@ -476,6 +483,10 @@ impl CompiledSelectorTerm {
                 match_optional_string_list(
                     &spec.container_ids,
                     process.identity.container_id.as_ref(),
+                ),
+                match_cgroup_path_prefixes(
+                    self.cgroup_path_prefixes.as_ref(),
+                    process.identity.cgroup.as_deref(),
                 ),
                 match_globs(
                     self.exe_path_globs.as_ref(),
@@ -636,6 +647,34 @@ fn compile_remote_addresses(
         .map(Some)
 }
 
+fn compile_cgroup_paths(paths: &[String]) -> Result<Option<BTreeSet<CgroupPath>>, SelectorError> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let paths = paths
+        .iter()
+        .map(|path| {
+            CgroupPath::parse(path)
+                .map_err(|error| SelectorError::InvalidCgroupPath(format!("{path}: {error}")))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    Ok(Some(paths))
+}
+
+fn match_cgroup_path_prefixes(
+    prefixes: Option<&BTreeSet<CgroupPath>>,
+    path: Option<&str>,
+) -> Option<bool> {
+    let Some(prefixes) = prefixes else {
+        return Some(true);
+    };
+    let path = path?;
+    let Ok(path) = CgroupPath::parse(path) else {
+        return None;
+    };
+    Some(prefixes.iter().any(|prefix| prefix.contains(&path)))
+}
+
 fn match_remote_address(addresses: Option<&BTreeSet<IpAddr>>, flow_address: &str) -> bool {
     match addresses {
         None => true,
@@ -729,6 +768,32 @@ mod tests {
         let flow = demo_flow();
         assert!(selector.matches_flow_without_direction(&flow));
         assert!(!other_uid.matches_flow_without_direction(&flow));
+        Ok(())
+    }
+
+    #[test]
+    fn selector_matches_cgroup_path_prefixes() -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector {
+                cgroup_paths: vec!["system.slice/demo.service".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+        .compile()?;
+        let other = Selector::term(
+            ProcessSelector {
+                cgroup_paths: vec!["system.slice/other.service".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+        .compile()?;
+        let mut flow = demo_flow();
+        flow.process.identity.cgroup = Some("/system.slice/demo.service/workers".to_string());
+
+        assert!(selector.matches_flow_without_direction(&flow));
+        assert!(!other.matches_flow_without_direction(&flow));
         Ok(())
     }
 
@@ -1226,7 +1291,7 @@ mod tests {
             cmdline_hash: "hash".to_string(),
             uid: 1000,
             gid: 1000,
-            cgroup: None,
+            cgroup: Some("/system.slice/demo.service".to_string()),
             systemd_service: Some("demo.service".to_string()),
             container_id: None,
             runtime_hint: None,
@@ -1356,6 +1421,13 @@ mod tests {
             Selector::term(
                 ProcessSelector {
                     container_ids: vec!["container-a".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+            Selector::term(
+                ProcessSelector {
+                    cgroup_paths: vec!["system.slice/demo.service".to_string()],
                     ..ProcessSelector::default()
                 },
                 TrafficSelector::default(),

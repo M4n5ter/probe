@@ -7,5 +7,6 @@ pub use setup_projection::{
     TransparentInterceptionProcessScopeExpression, TransparentInterceptionRemoteAddressScope,
     TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan,
     TransparentInterceptionSetupProjectionError, TransparentInterceptionSetupSelectorSources,
-    TransparentInterceptionSetupSelectors, TransparentInterceptionSocketOwnerScope,
+    TransparentInterceptionSetupSelectors, TransparentInterceptionSocketCgroupScope,
+    TransparentInterceptionSocketOwnerScope,
 };

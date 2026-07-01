@@ -1,6 +1,7 @@
 mod analysis;
 mod model;
 mod selectors;
+mod socket_scope;
 
 pub use model::{
     TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
@@ -8,8 +9,11 @@ pub use model::{
     TransparentInterceptionPortScope, TransparentInterceptionProcessScope,
     TransparentInterceptionProcessScopeExpression, TransparentInterceptionRemoteAddressScope,
     TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan,
-    TransparentInterceptionSetupProjectionError, TransparentInterceptionSocketOwnerScope,
+    TransparentInterceptionSetupProjectionError,
 };
 pub use selectors::{
     TransparentInterceptionSetupSelectorSources, TransparentInterceptionSetupSelectors,
+};
+pub use socket_scope::{
+    TransparentInterceptionSocketCgroupScope, TransparentInterceptionSocketOwnerScope,
 };

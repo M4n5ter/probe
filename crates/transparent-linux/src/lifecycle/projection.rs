@@ -1,6 +1,7 @@
 use interception::{
     TransparentInterceptionHostRuleScope, TransparentInterceptionPortScope,
-    TransparentInterceptionRemoteAddressScope, TransparentInterceptionSocketOwnerScope,
+    TransparentInterceptionRemoteAddressScope, TransparentInterceptionSocketCgroupScope,
+    TransparentInterceptionSocketOwnerScope,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,13 +16,21 @@ impl NftSelectorProjection {
 
     pub(super) fn inbound_tproxy(scope: TransparentInterceptionHostRuleScope) -> Self {
         let traffic_projection = NftTrafficProjection::inbound_tproxy(&scope);
-        let rules = rules_for_remote_addresses(traffic_projection, scope.remote_addresses());
+        let rules = rules_for_scope(
+            traffic_projection,
+            scope.remote_addresses(),
+            scope.socket_cgroups(),
+        );
         Self { rules }
     }
 
     pub(super) fn outbound_redirect(scope: TransparentInterceptionHostRuleScope) -> Self {
         let traffic_projection = NftTrafficProjection::outbound_redirect(&scope);
-        let rules = rules_for_remote_addresses(traffic_projection, scope.remote_addresses());
+        let rules = rules_for_scope(
+            traffic_projection,
+            scope.remote_addresses(),
+            scope.socket_cgroups(),
+        );
         Self { rules }
     }
 }
@@ -59,11 +68,17 @@ impl NftTrafficProjection {
         }
     }
 
-    fn rule(&self, family: NftFamily, remote_addresses: Option<Vec<String>>) -> NftRule {
+    fn rule(
+        &self,
+        family: NftFamily,
+        remote_addresses: Option<Vec<String>>,
+        socket_cgroup: Option<NftSocketCgroupMatch>,
+    ) -> NftRule {
         NftRule {
             family,
             traffic: self.clone(),
             remote_addresses,
+            socket_cgroup,
         }
     }
 }
@@ -73,6 +88,36 @@ pub(super) struct NftRule {
     family: NftFamily,
     traffic: NftTrafficProjection,
     remote_addresses: Option<Vec<String>>,
+    socket_cgroup: Option<NftSocketCgroupMatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NftRemoteAddressMatch {
+    family: NftFamily,
+    addresses: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NftSocketCgroupMatch {
+    level: usize,
+    path: String,
+}
+
+impl NftSocketCgroupMatch {
+    fn from_path(path: &str) -> Self {
+        Self {
+            level: path.split('/').count(),
+            path: path.to_string(),
+        }
+    }
+
+    fn match_expression(&self) -> String {
+        format!(
+            "socket cgroupv2 level {} {}",
+            self.level,
+            nft_string_literal(&self.path)
+        )
+    }
 }
 
 impl NftRule {
@@ -84,6 +129,9 @@ impl NftRule {
         let mut clauses = vec!["meta l4proto tcp".to_string()];
         clauses.push(format!("meta nfproto {}", self.family.nfproto_name()));
         clauses.extend(socket_owner_match_expressions(&self.traffic.socket_owners));
+        if let Some(socket_cgroup) = &self.socket_cgroup {
+            clauses.push(socket_cgroup.match_expression());
+        }
         if let Some(ports) = self.traffic.local_ports.only_values() {
             clauses.push(port_match(self.traffic.local_port_field, ports));
         }
@@ -162,22 +210,64 @@ fn string_values<T: ToString>(values: &[T]) -> Vec<String> {
     values.iter().map(ToString::to_string).collect()
 }
 
-fn rules_for_remote_addresses(
+fn rules_for_scope(
     traffic_projection: NftTrafficProjection,
     addresses: &TransparentInterceptionRemoteAddressScope,
+    cgroups: &TransparentInterceptionSocketCgroupScope,
 ) -> Vec<NftRule> {
-    let mut rules = Vec::new();
+    let remote_addresses = nft_remote_address_matches(addresses);
+    let cgroups = nft_socket_cgroup_matches(cgroups);
+    remote_addresses
+        .into_iter()
+        .flat_map(|address| {
+            let traffic_projection = traffic_projection.clone();
+            cgroups.iter().cloned().map(move |cgroup| {
+                traffic_projection.rule(address.family, address.addresses.clone(), cgroup)
+            })
+        })
+        .collect()
+}
+
+fn nft_remote_address_matches(
+    addresses: &TransparentInterceptionRemoteAddressScope,
+) -> Vec<NftRemoteAddressMatch> {
+    let mut matches = Vec::new();
     if addresses.ipv4_any() {
-        rules.push(traffic_projection.rule(NftFamily::Ipv4, None));
+        matches.push(NftRemoteAddressMatch {
+            family: NftFamily::Ipv4,
+            addresses: None,
+        });
     } else if !addresses.ipv4().is_empty() {
-        rules.push(traffic_projection.rule(NftFamily::Ipv4, Some(string_values(addresses.ipv4()))));
+        matches.push(NftRemoteAddressMatch {
+            family: NftFamily::Ipv4,
+            addresses: Some(string_values(addresses.ipv4())),
+        });
     }
     if addresses.ipv6_any() {
-        rules.push(traffic_projection.rule(NftFamily::Ipv6, None));
+        matches.push(NftRemoteAddressMatch {
+            family: NftFamily::Ipv6,
+            addresses: None,
+        });
     } else if !addresses.ipv6().is_empty() {
-        rules.push(traffic_projection.rule(NftFamily::Ipv6, Some(string_values(addresses.ipv6()))));
+        matches.push(NftRemoteAddressMatch {
+            family: NftFamily::Ipv6,
+            addresses: Some(string_values(addresses.ipv6())),
+        });
     }
-    rules
+    matches
+}
+
+fn nft_socket_cgroup_matches(
+    cgroups: &TransparentInterceptionSocketCgroupScope,
+) -> Vec<Option<NftSocketCgroupMatch>> {
+    if cgroups.is_any() {
+        vec![None]
+    } else {
+        cgroups
+            .paths()
+            .map(|path| Some(NftSocketCgroupMatch::from_path(path)))
+            .collect()
+    }
 }
 
 fn nft_set_or_value<T>(values: &[T]) -> String
@@ -198,13 +288,18 @@ where
     }
 }
 
+fn nft_string_literal(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use interception::{
         TransparentInterceptionPortScope, TransparentInterceptionRemoteAddressScope,
-        TransparentInterceptionSocketOwnerScope,
+        TransparentInterceptionSocketCgroupScope, TransparentInterceptionSocketOwnerScope,
     };
 
     use super::*;
@@ -302,6 +397,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn outbound_host_rule_scope_renders_socket_cgroup_matches() {
+        let expressions = NftSelectorProjection::outbound_redirect(outbound_cgroup_scope())
+            .into_rules()
+            .into_iter()
+            .map(|rule| rule.match_expression())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            expressions,
+            vec![
+                "meta l4proto tcp meta nfproto ipv4 socket cgroupv2 level 2 \"system.slice/demo.service\" tcp dport 443 ip daddr 203.0.113.10",
+                "meta l4proto tcp meta nfproto ipv4 socket cgroupv2 level 4 \"user.slice/user-1000.slice/app.slice/curl.scope\" tcp dport 443 ip daddr 203.0.113.10",
+            ]
+        );
+    }
+
     fn match_expressions(scope: TransparentInterceptionHostRuleScope) -> Vec<String> {
         NftSelectorProjection::inbound_tproxy(scope)
             .into_rules()
@@ -359,5 +471,23 @@ mod tests {
             TransparentInterceptionSocketOwnerScope::new(vec![1000, 1001], vec![2000]),
         )
         .expect("test scope should contain outbound owner host-rule constraints")
+    }
+
+    fn outbound_cgroup_scope() -> TransparentInterceptionHostRuleScope {
+        TransparentInterceptionHostRuleScope::with_socket_scope(
+            TransparentInterceptionPortScope::any(),
+            TransparentInterceptionPortScope::only(vec![443]),
+            TransparentInterceptionRemoteAddressScope::new(
+                vec![Ipv4Addr::new(203, 0, 113, 10)],
+                Vec::new(),
+            ),
+            TransparentInterceptionSocketOwnerScope::any(),
+            TransparentInterceptionSocketCgroupScope::new(vec![
+                "system.slice/demo.service".to_string(),
+                "user.slice/user-1000.slice/app.slice/curl.scope".to_string(),
+            ])
+            .expect("test cgroup paths should be valid"),
+        )
+        .expect("test scope should contain outbound cgroup host-rule constraints")
     }
 }

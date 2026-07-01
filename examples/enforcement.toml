@@ -12,6 +12,7 @@ exe_path_globs = ["/usr/bin/curl"]
 cmdline_regexes = []
 systemd_services = []
 container_ids = []
+cgroup_paths = []
 
 [selectors.curl_https.term.traffic]
 local_ports = []

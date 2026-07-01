@@ -660,6 +660,7 @@ exe_path_globs = ["/usr/bin/curl"]
 cmdline_regexes = []
 systemd_services = []
 container_ids = []
+cgroup_paths = []
 
 [tls.plaintext.instrumentation.selector.term.traffic]
 local_ports = []
@@ -710,6 +711,7 @@ exe_path_globs = ["/usr/bin/curl"]
 cmdline_regexes = []
 systemd_services = []
 container_ids = []
+cgroup_paths = []
 
 [selector.term.traffic]
 local_ports = []
@@ -747,6 +749,7 @@ exe_path_globs = []
 cmdline_regexes = []
 systemd_services = []
 container_ids = []
+cgroup_paths = []
 
 [selectors.managed_https.term.traffic]
 remote_ports = [443]
@@ -766,6 +769,14 @@ Selector list fields default to empty lists when omitted. Empty process or
 traffic dimensions mean "do not constrain this dimension"; they are not parse
 errors.
 
+`cgroup_paths` are cgroup v2 path prefixes relative to `/sys/fs/cgroup`;
+leading `/` is accepted. A selector path matches that cgroup and its
+descendants. Outbound transparent interception can project UID/GID-only and
+cgroup-path-only process selectors into nft socket rules before proxy relay.
+The nft `socket cgroupv2` rule is a static install-time boundary: the cgroup
+path must exist when nft validates the ruleset, and recreated cgroups need a
+ruleset refresh or a dynamic classifier/lifecycle watcher.
+
 Selectors combine process and traffic dimensions:
 
 ```toml
@@ -779,6 +790,7 @@ exe_path_globs = ["/usr/bin/curl"]
 cmdline_regexes = []
 systemd_services = []
 container_ids = []
+cgroup_paths = []
 
 [enforcement.interception.selector.term.traffic]
 local_ports = []
@@ -822,6 +834,7 @@ exe_path_globs = []
 cmdline_regexes = []
 systemd_services = []
 container_ids = []
+cgroup_paths = []
 
 [enforcement.interception.selector.term.traffic]
 local_ports = [443]

@@ -6,7 +6,8 @@ use interception::{
     TransparentInterceptionProcessScope, TransparentInterceptionProcessScopeExpression,
     TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan,
     TransparentInterceptionSetupProjectionError, TransparentInterceptionSetupSelectorSources,
-    TransparentInterceptionSetupSelectors, TransparentInterceptionSocketOwnerScope,
+    TransparentInterceptionSetupSelectors, TransparentInterceptionSocketCgroupScope,
+    TransparentInterceptionSocketOwnerScope,
 };
 use probe_config::{TransparentInterceptionDirectionConfig, TransparentInterceptionStrategyConfig};
 use probe_core::{ProcessSelector, ResolvedSelector, Selector};
@@ -49,6 +50,7 @@ pub struct TransparentInterceptionProjectedHostRuleScopePlan {
     pub remote_ports: TransparentInterceptionProjectedPortScopePlan,
     pub remote_addresses: TransparentInterceptionProjectedRemoteAddressScopePlan,
     pub socket_owners: TransparentInterceptionProjectedSocketOwnerScopePlan,
+    pub socket_cgroups: TransparentInterceptionProjectedSocketCgroupScopePlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +70,11 @@ pub struct TransparentInterceptionProjectedRemoteAddressScopePlan {
 pub struct TransparentInterceptionProjectedSocketOwnerScopePlan {
     pub uids: Vec<u32>,
     pub gids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransparentInterceptionProjectedSocketCgroupScopePlan {
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +230,9 @@ impl TransparentInterceptionProjectedHostRuleScopePlan {
             socket_owners: TransparentInterceptionProjectedSocketOwnerScopePlan::from_scope(
                 scope.socket_owners(),
             ),
+            socket_cgroups: TransparentInterceptionProjectedSocketCgroupScopePlan::from_scope(
+                scope.socket_cgroups(),
+            ),
         }
     }
 }
@@ -232,6 +242,14 @@ impl TransparentInterceptionProjectedSocketOwnerScopePlan {
         Self {
             uids: scope.uids().to_vec(),
             gids: scope.gids().to_vec(),
+        }
+    }
+}
+
+impl TransparentInterceptionProjectedSocketCgroupScopePlan {
+    fn from_scope(scope: &TransparentInterceptionSocketCgroupScope) -> Self {
+        Self {
+            paths: scope.paths().map(str::to_string).collect(),
         }
     }
 }

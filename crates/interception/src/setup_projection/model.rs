@@ -3,6 +3,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
 use thiserror::Error;
 
+use super::socket_scope::{
+    TransparentInterceptionSocketCgroupScope, TransparentInterceptionSocketOwnerScope,
+};
+
 const MAX_HOST_RULE_SCOPES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,6 +15,7 @@ pub struct TransparentInterceptionHostRuleScope {
     remote_ports: TransparentInterceptionPortScope,
     remote_addresses: TransparentInterceptionRemoteAddressScope,
     socket_owners: TransparentInterceptionSocketOwnerScope,
+    socket_cgroups: TransparentInterceptionSocketCgroupScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,12 +97,6 @@ enum TransparentInterceptionRemoteAddressFamilyScope {
     Only { ipv4: bool, ipv6: bool },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TransparentInterceptionSocketOwnerScope {
-    uids: Vec<u32>,
-    gids: Vec<u32>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TransparentInterceptionSetupProjectionError {
     #[error("transparent interception requires an explicit selector for setup-time rules")]
@@ -128,10 +127,27 @@ impl TransparentInterceptionHostRuleScope {
         remote_addresses: TransparentInterceptionRemoteAddressScope,
         socket_owners: TransparentInterceptionSocketOwnerScope,
     ) -> Result<Self, TransparentInterceptionSetupProjectionError> {
+        Self::with_socket_scope(
+            local_ports,
+            remote_ports,
+            remote_addresses,
+            socket_owners,
+            TransparentInterceptionSocketCgroupScope::any(),
+        )
+    }
+
+    pub fn with_socket_scope(
+        local_ports: TransparentInterceptionPortScope,
+        remote_ports: TransparentInterceptionPortScope,
+        remote_addresses: TransparentInterceptionRemoteAddressScope,
+        socket_owners: TransparentInterceptionSocketOwnerScope,
+        socket_cgroups: TransparentInterceptionSocketCgroupScope,
+    ) -> Result<Self, TransparentInterceptionSetupProjectionError> {
         if local_ports.is_any()
             && remote_ports.is_any()
             && remote_addresses.is_any()
             && socket_owners.is_any()
+            && socket_cgroups.is_any()
         {
             return Err(TransparentInterceptionSetupProjectionError::UnconstrainedSelector);
         }
@@ -140,6 +156,7 @@ impl TransparentInterceptionHostRuleScope {
             remote_ports,
             remote_addresses,
             socket_owners,
+            socket_cgroups,
         })
     }
 
@@ -159,6 +176,10 @@ impl TransparentInterceptionHostRuleScope {
         &self.socket_owners
     }
 
+    pub fn socket_cgroups(&self) -> &TransparentInterceptionSocketCgroupScope {
+        &self.socket_cgroups
+    }
+
     pub(crate) fn to_traffic_selector(
         &self,
         direction: TransparentInterceptionSetupDirection,
@@ -174,12 +195,13 @@ impl TransparentInterceptionHostRuleScope {
     pub(crate) fn union_without_expansion(scopes: &[Self]) -> Option<Self> {
         if scopes.is_empty()
             || !all_socket_owner_scopes_equivalent(scopes)
+            || !all_socket_cgroup_scopes_equivalent(scopes)
             || host_rule_scope_varying_dimensions(scopes) > 1
         {
             return None;
         }
         Some(
-            Self::with_socket_owners(
+            Self::with_socket_scope(
                 union_port_scopes(scopes.iter().map(Self::local_ports)),
                 union_port_scopes(scopes.iter().map(Self::remote_ports)),
                 union_remote_address_scopes(scopes.iter().map(Self::remote_addresses)),
@@ -187,6 +209,11 @@ impl TransparentInterceptionHostRuleScope {
                     .first()
                     .expect("scope set should be non-empty")
                     .socket_owners
+                    .clone(),
+                scopes
+                    .first()
+                    .expect("scope set should be non-empty")
+                    .socket_cgroups
                     .clone(),
             )
             .expect("union of constrained host-rule scopes should remain constrained"),
@@ -198,6 +225,7 @@ impl TransparentInterceptionHostRuleScope {
             && self.remote_ports.equivalent_to(&other.remote_ports)
             && self.remote_addresses.equivalent_to(&other.remote_addresses)
             && self.socket_owners.equivalent_to(&other.socket_owners)
+            && self.socket_cgroups.equivalent_to(&other.socket_cgroups)
     }
 
     fn contains_scope(&self, other: &Self) -> bool {
@@ -207,6 +235,7 @@ impl TransparentInterceptionHostRuleScope {
                 .remote_addresses
                 .contains_scope(&other.remote_addresses)
             && self.socket_owners.contains_scope(&other.socket_owners)
+            && self.socket_cgroups.contains_scope(&other.socket_cgroups)
     }
 }
 
@@ -564,37 +593,6 @@ impl Default for TransparentInterceptionRemoteAddressScope {
     }
 }
 
-impl TransparentInterceptionSocketOwnerScope {
-    pub fn any() -> Self {
-        Self::default()
-    }
-
-    pub fn new(uids: Vec<u32>, gids: Vec<u32>) -> Self {
-        Self { uids, gids }
-    }
-
-    pub fn is_any(&self) -> bool {
-        self.uids.is_empty() && self.gids.is_empty()
-    }
-
-    pub fn uids(&self) -> &[u32] {
-        &self.uids
-    }
-
-    pub fn gids(&self) -> &[u32] {
-        &self.gids
-    }
-
-    fn equivalent_to(&self, other: &Self) -> bool {
-        same_values(&self.uids, &other.uids) && same_values(&self.gids, &other.gids)
-    }
-
-    fn contains_scope(&self, other: &Self) -> bool {
-        owner_values_contain(&self.uids, &other.uids)
-            && owner_values_contain(&self.gids, &other.gids)
-    }
-}
-
 pub(crate) fn process_selector_has_constraints(process: &ProcessSelector) -> bool {
     !process.pids.is_empty()
         || !process.uids.is_empty()
@@ -604,6 +602,7 @@ pub(crate) fn process_selector_has_constraints(process: &ProcessSelector) -> boo
         || !process.cmdline_regexes.is_empty()
         || !process.systemd_services.is_empty()
         || !process.container_ids.is_empty()
+        || !process.cgroup_paths.is_empty()
 }
 
 fn host_rule_scope_varying_dimensions(scopes: &[TransparentInterceptionHostRuleScope]) -> u8 {
@@ -626,6 +625,12 @@ fn host_rule_scope_varying_dimensions(scopes: &[TransparentInterceptionHostRuleS
 fn all_socket_owner_scopes_equivalent(scopes: &[TransparentInterceptionHostRuleScope]) -> bool {
     all_equivalent_by(scopes, |left, right| {
         left.socket_owners.equivalent_to(&right.socket_owners)
+    })
+}
+
+fn all_socket_cgroup_scopes_equivalent(scopes: &[TransparentInterceptionHostRuleScope]) -> bool {
+    all_equivalent_by(scopes, |left, right| {
+        left.socket_cgroups.equivalent_to(&right.socket_cgroups)
     })
 }
 
@@ -718,10 +723,6 @@ fn collect_unique_explicit_ports<'a>(
         push_unique_all(&mut ports, scope_ports);
     }
     Some(ports)
-}
-
-fn owner_values_contain(left: &[u32], right: &[u32]) -> bool {
-    left.is_empty() || (!right.is_empty() && right.iter().all(|value| left.contains(value)))
 }
 
 fn remote_family_scope_contains<T>(
