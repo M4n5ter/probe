@@ -615,6 +615,9 @@ practical Lua patterns are documented in [docs/lua-policy.md](docs/lua-policy.md
 TLS material references are shared by exporters, TLS decrypt hints, and MITM:
 
 ```toml
+[tls.material_store.filesystem]
+allowed_roots = ["/etc/probe/certs", "/var/lib/probe/tls"]
+
 [[tls.materials]]
 id = "collector-ca"
 kind = "trust_anchor"
@@ -641,9 +644,18 @@ kind = "mitm_upstream_trust_anchor"
 path = "/etc/probe/certs/upstream-ca.pem"
 ```
 
-TLS material files must be owned by the agent effective uid, must be regular
-files, must be owner-readable, and must not grant group or other permissions.
+TLS material files must be owned by the effective uid of the process that reads
+them, must be regular files, must be owner-readable, and must not grant group or
+other permissions.
 Use `0600` for writable private material and `0400` for read-only material.
+When `allowed_roots` is non-empty, every TLS material path must be absolute and
+must resolve beneath one configured root. The Linux store opens material through
+`openat2` with beneath and no-symlink resolution flags, so `..` traversal and
+symlink escapes fail closed. An empty root list keeps the filesystem store
+unrestricted apart from the file type, size, ownership, and permission checks.
+When the agent launches the first-party MITM proxy, the same roots are passed to
+that proxy, and the proxy applies the same file type, size, ownership, and
+permission checks for TLS termination and upstream trust material loading.
 
 Best-effort libssl plaintext instrumentation is explicit. Configure a selector
 to avoid broad attachment:

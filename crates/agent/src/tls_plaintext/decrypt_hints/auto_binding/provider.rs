@@ -20,11 +20,8 @@ pub(crate) fn build_tls_session_secret_auto_binding_with_runtime(
     plan: &RuntimePlan,
     runtime_state: Option<&TlsDecryptHintRuntimeState>,
 ) -> Result<TlsSessionSecretAutoBindingBuild, TlsDecryptHintError> {
-    build_tls_session_secret_auto_binding_with_store_and_runtime(
-        plan,
-        FilesystemTlsMaterialStore,
-        runtime_state,
-    )
+    let file_store = FilesystemTlsMaterialStore::from_plan(&plan.tls_material_store);
+    build_tls_session_secret_auto_binding_with_store_and_runtime(plan, file_store, runtime_state)
 }
 
 #[cfg(test)]

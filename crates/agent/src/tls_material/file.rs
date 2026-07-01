@@ -1,57 +1,99 @@
-use std::{
-    fs::Metadata,
-    os::unix::fs::{MetadataExt, PermissionsExt},
-    path::Path,
-};
+use std::path::Path;
 
 use probe_io::{
-    BoundedFileError, BoundedFileErrorKind, inspect_bounded_regular_file, open_bounded_regular_file,
+    AllowedFileRoots, BoundedFileError, BoundedFileErrorKind, BoundedRegularFile,
+    OwnerPrivateFileError, RootedBoundedFileError, inspect_bounded_regular_file,
+    open_bounded_regular_file_under_roots, validate_owner_private_file,
 };
-use rustix::process::geteuid;
+use runtime::TlsMaterialStorePlan;
 
 use super::{TlsMaterialFileStore, TlsMaterialFileStoreError};
 
 pub(crate) const MAX_TLS_MATERIAL_BYTES: u64 = 1024 * 1024;
-const INSECURE_TLS_MATERIAL_PERMISSION_BITS: u32 = 0o077;
-const REQUIRED_OWNER_READ_BIT: u32 = 0o400;
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct FilesystemTlsMaterialStore;
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FilesystemTlsMaterialStore {
+    allowed_roots: AllowedFileRoots,
+}
+
+impl FilesystemTlsMaterialStore {
+    pub(crate) fn from_plan(plan: &TlsMaterialStorePlan) -> Self {
+        Self {
+            allowed_roots: AllowedFileRoots::new(plan.allowed_roots().to_vec())
+                .expect("runtime plan TLS material roots must be validated"),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_allowed_roots(allowed_roots: Vec<std::path::PathBuf>) -> Self {
+        Self {
+            allowed_roots: AllowedFileRoots::new(allowed_roots)
+                .expect("test TLS material roots must be valid"),
+        }
+    }
+
+    fn open_tls_material(
+        &self,
+        path: &Path,
+    ) -> Result<BoundedRegularFile, TlsMaterialFileStoreError> {
+        open_bounded_regular_file_under_roots(path, &self.allowed_roots, MAX_TLS_MATERIAL_BYTES)
+            .map_err(rooted_tls_material_file_store_error)
+    }
+}
 
 impl TlsMaterialFileStore for FilesystemTlsMaterialStore {
     fn inspect_tls_material(&self, path: &Path) -> Result<(), TlsMaterialFileStoreError> {
-        let metadata = inspect_bounded_regular_file(path, MAX_TLS_MATERIAL_BYTES)
-            .map_err(tls_material_file_store_error)?;
-        validate_tls_material_permissions(&metadata)
+        if self.allowed_roots.is_empty() {
+            let metadata = inspect_bounded_regular_file(path, MAX_TLS_MATERIAL_BYTES)
+                .map_err(tls_material_file_store_error)?;
+            return validate_owner_private_file(&metadata).map_err(owner_private_file_error);
+        }
+        let file = self.open_tls_material(path)?;
+        validate_owner_private_file(file.metadata()).map_err(owner_private_file_error)
     }
 
     fn read_tls_material(&self, path: &Path) -> Result<Vec<u8>, TlsMaterialFileStoreError> {
-        let file = open_bounded_regular_file(path, MAX_TLS_MATERIAL_BYTES)
-            .map_err(tls_material_file_store_error)?;
-        validate_tls_material_permissions(file.metadata())?;
+        let file = self.open_tls_material(path)?;
+        validate_owner_private_file(file.metadata()).map_err(owner_private_file_error)?;
         file.read()
             .map(|read| read.into_bytes())
             .map_err(tls_material_file_store_error)
     }
 }
 
-fn validate_tls_material_permissions(metadata: &Metadata) -> Result<(), TlsMaterialFileStoreError> {
-    let mode = metadata.permissions().mode() & 0o777;
-    let effective_uid = geteuid().as_raw();
-    let owner_uid = metadata.uid();
-    if owner_uid != effective_uid {
-        return Err(TlsMaterialFileStoreError::OwnerMismatch {
+fn owner_private_file_error(error: OwnerPrivateFileError) -> TlsMaterialFileStoreError {
+    match error {
+        OwnerPrivateFileError::OwnerMismatch {
             owner_uid,
             effective_uid,
-        });
+        } => TlsMaterialFileStoreError::OwnerMismatch {
+            owner_uid,
+            effective_uid,
+        },
+        OwnerPrivateFileError::OwnerUnreadable { mode } => {
+            TlsMaterialFileStoreError::OwnerUnreadable { mode }
+        }
+        OwnerPrivateFileError::InsecurePermissions { mode } => {
+            TlsMaterialFileStoreError::InsecurePermissions { mode }
+        }
     }
-    if mode & REQUIRED_OWNER_READ_BIT == 0 {
-        return Err(TlsMaterialFileStoreError::OwnerUnreadable { mode });
+}
+
+fn rooted_tls_material_file_store_error(
+    error: RootedBoundedFileError,
+) -> TlsMaterialFileStoreError {
+    match error {
+        RootedBoundedFileError::Bounded(error) => tls_material_file_store_error(error),
+        RootedBoundedFileError::RelativePathDisallowed { .. } => {
+            TlsMaterialFileStoreError::RelativePathDisallowed
+        }
+        RootedBoundedFileError::OutsideAllowedRoots { .. } => {
+            TlsMaterialFileStoreError::PathOutsideAllowedRoots
+        }
+        RootedBoundedFileError::OpenRoot { root, source, .. } => {
+            TlsMaterialFileStoreError::OpenAllowedRoot { root, source }
+        }
     }
-    if mode & INSECURE_TLS_MATERIAL_PERMISSION_BITS != 0 {
-        return Err(TlsMaterialFileStoreError::InsecurePermissions { mode });
-    }
-    Ok(())
 }
 
 fn tls_material_file_store_error(error: BoundedFileError) -> TlsMaterialFileStoreError {
@@ -93,11 +135,9 @@ mod tests {
         fs::write(&path, b"material")?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
-        FilesystemTlsMaterialStore.inspect_tls_material(&path)?;
-        assert_eq!(
-            FilesystemTlsMaterialStore.read_tls_material(&path)?,
-            b"material"
-        );
+        let store = FilesystemTlsMaterialStore::default();
+        store.inspect_tls_material(&path)?;
+        assert_eq!(store.read_tls_material(&path)?, b"material");
         Ok(())
     }
 
@@ -109,7 +149,8 @@ mod tests {
         fs::write(&path, b"material")?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640))?;
 
-        let error = FilesystemTlsMaterialStore
+        let store = FilesystemTlsMaterialStore::default();
+        let error = store
             .inspect_tls_material(&path)
             .expect_err("group-readable material must be rejected");
 
@@ -118,7 +159,7 @@ mod tests {
             TlsMaterialFileStoreError::InsecurePermissions { mode } if mode == 0o640
         ));
 
-        let error = FilesystemTlsMaterialStore
+        let error = store
             .read_tls_material(&path)
             .expect_err("group-readable material must not be read");
 
@@ -137,7 +178,8 @@ mod tests {
         fs::write(&path, b"material")?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o200))?;
 
-        let error = FilesystemTlsMaterialStore
+        let store = FilesystemTlsMaterialStore::default();
+        let error = store
             .inspect_tls_material(&path)
             .expect_err("owner-unreadable material must be rejected");
 
@@ -145,6 +187,68 @@ mod tests {
             error,
             TlsMaterialFileStoreError::OwnerUnreadable { mode } if mode == 0o200
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn filesystem_store_accepts_material_beneath_allowed_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("materials");
+        fs::create_dir(&root)?;
+        let path = root.join("material.pem");
+        fs::write(&path, b"material")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let store = FilesystemTlsMaterialStore::with_allowed_roots(vec![root]);
+
+        store.inspect_tls_material(&path)?;
+        assert_eq!(store.read_tls_material(&path)?, b"material");
+        Ok(())
+    }
+
+    #[test]
+    fn filesystem_store_rejects_material_outside_allowed_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("materials");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root)?;
+        fs::create_dir(&outside)?;
+        let path = outside.join("material.pem");
+        fs::write(&path, b"material")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let store = FilesystemTlsMaterialStore::with_allowed_roots(vec![root]);
+
+        let error = store
+            .read_tls_material(&path)
+            .expect_err("material outside allowed roots must be rejected");
+
+        assert!(matches!(
+            error,
+            TlsMaterialFileStoreError::PathOutsideAllowedRoots
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn filesystem_store_rejects_symlink_escape_beneath_allowed_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("materials");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root)?;
+        fs::create_dir(&outside)?;
+        let path = outside.join("material.pem");
+        fs::write(&path, b"material")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        std::os::unix::fs::symlink(&outside, root.join("escape"))?;
+        let store = FilesystemTlsMaterialStore::with_allowed_roots(vec![root.clone()]);
+
+        let error = store
+            .read_tls_material(&root.join("escape").join("material.pem"))
+            .expect_err("symlink escape under allowed root must be rejected");
+
+        assert!(matches!(error, TlsMaterialFileStoreError::Open { .. }));
         Ok(())
     }
 }

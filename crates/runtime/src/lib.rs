@@ -9,7 +9,7 @@ pub use plan::{
     ExportTlsMaterialPlan, ExportWorkerPlan, FileExportSinkPlan, IngressRetentionPlan,
     PlatformProbeResults, ProviderRegistry, RemoteEnforcementPolicyBodyLimitBytes,
     RequiredCapabilityPlan, RuntimeError, RuntimePlan, StoragePlan, StorageRetentionPlan,
-    TlsDecryptHintPlan, TlsMaterialPlan, TlsPlaintextCapabilityPlan,
+    TlsDecryptHintPlan, TlsMaterialPlan, TlsMaterialStorePlan, TlsPlaintextCapabilityPlan,
     TlsPlaintextInstrumentationPlan, TlsPlaintextMaterialPlan, TlsPlaintextPlan, TlsPlan,
     TransparentInterceptionClassificationPlan, TransparentInterceptionExecutionPlan,
     TransparentInterceptionFlowClassifierScopePlan, TransparentInterceptionInboundTproxyPlan,

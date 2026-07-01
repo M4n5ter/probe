@@ -81,7 +81,8 @@ pub(crate) enum TlsCheckError {
 }
 
 pub(in crate::check) fn check_tls(plan: &RuntimePlan) -> Result<TlsCheckSnapshot, TlsCheckError> {
-    check_tls_with_file_store(plan, &FilesystemTlsMaterialStore)
+    let file_store = FilesystemTlsMaterialStore::from_plan(&plan.tls_material_store);
+    check_tls_with_file_store(plan, &file_store)
 }
 
 fn check_tls_with_file_store(
@@ -496,6 +497,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-missing-live-keylog")?;
         let mut config = AgentConfig::default();
+        config.tls.material_store.filesystem.allowed_roots = vec![temp.clone()];
         config.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-keys".to_string()];
         config.tls.materials.push(TlsMaterialConfig {
             id: Some("ssl-keys".to_string()),
@@ -524,6 +526,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("check-missing-live-session-secret")?;
         let mut config = AgentConfig::default();
+        config.tls.material_store.filesystem.allowed_roots = vec![temp.clone()];
         config.tls.plaintext.decrypt_hints.session_secret_refs =
             vec!["session-secrets".to_string()];
         config.tls.materials.push(TlsMaterialConfig {

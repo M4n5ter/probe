@@ -2387,7 +2387,7 @@ TLS 材料分为两类，不能混用：
   合法消费者是 `status` metadata check、显式 `check` 内容校验，以及 TLS 1.3 keylog/session-secret live auto-binding。
   它们不影响 exporter TLS trust，不自动启用 uprobe，也不代表可以解密缺少 ServerHello/record sequence 的 TLS 流量。
 
-当前实现中，`tls.materials` 是 material registry，不是全局 exporter TLS 开关，也不是“导入后自动解密”的开关。planned webhook exporter 通过
+`tls.materials` 是 material registry，不是全局 exporter TLS 开关，也不是“导入后自动解密”的开关。planned webhook exporter 通过
 `exporters[].tls.trust_anchor_refs`、`exporters[].tls.client_certificate_refs` 和
 `exporters[].tls.client_private_key_ref` 显式引用 material id；runtime plan 会把这些 refs 解析成带 `id`、`kind` 和 `path` 的 exporter
 TLS material plan，而不是只保留裸路径。被引用的 `trust_anchor` 会作为额外 root certificates merge 进该 exporter 的 hyper-rustls client，
@@ -3911,13 +3911,16 @@ Filesystem backend contract：
 
 - material 必须是 non-symlink regular file。
 - material 大小不得超过 TLS material 上限。
-- material owner uid 必须等于 agent effective uid；agent 以 root 运行时即要求 root-owned。
+- material owner uid 必须等于读取该 material 的进程 effective uid；agent 或 standalone MITM proxy 以 root 运行时即要求 root-owned。
 - material 必须设置 owner read bit。
 - material 不能包含 group/other permission bits；`0600` 是推荐写入形态，`0400` 也满足只读材料的读取契约。
 
-crate-local `TlsMaterialFileStore` trait 是 TLS material 的统一文件边界。`status` 的 metadata-only source check、`check`
-的 plaintext material 内容核验、planned webhook exporter 的 trust/client identity material 读取，都通过同一个 store 处理。
-路径 hardening、权限校验和文件 backend 行为不会分散到 exporter/check/status 各自实现。
+crate-local `TlsMaterialFileStore` trait 是 TLS material 的统一文件边界：
+
+- `status` source check 通过该 store 判断 material 是否可用，但不读取 secret bytes。
+- `check` 通过该 store 读取 plaintext material，并做内容核验。
+- planned webhook exporter 通过该 store 读取 trust/client identity material。
+- 路径 hardening、权限校验和 filesystem backend 行为由 store 统一承担，不分散到 exporter、check 或 status。
 
 Filesystem material backend 覆盖：
 
@@ -3931,22 +3934,55 @@ Filesystem material backend 覆盖：
 - MITM leaf certificate/private key 必须成对出现。
 - MITM strategy 至少需要 CA pair 或 leaf pair。
 
-runtime plan 为每个 exporter 保留 resolved material 的 `id`、`kind` 和 `path`，供 status、exporter drain 和 file store 共享同一语义。
-runtime plan 也会把 `interception.mitm` refs 解析成 typed material plan，并保留 backend readiness probe、plaintext bridge 与 policy hook，
-供 status/check/report 表达 MITM backend contract。
+Runtime plan contract：
 
-filesystem store fail closed：缺失、symlink、目录、非 regular file、超过大小上限、owner 不匹配、owner 不可读或 group/other
-可访问的 material 都不可用。活跃 webhook exporter 引用的 TLS material source 不可用时，会把对应 exporter 和 health 标为
-unavailable，并在原因中带上 material id/kind/path。planned webhook exporter 在实际 drain 时先确认该 sink 有待发送 batch，
-再按 per-sink refs 通过同一 file store 边界读取 trust anchor/client identity PEM 并构造 hyper-rustls transport；读取或
-PEM 解析失败会让对应 drain 失败，空队列不会读取 secret bytes。
+- `RuntimePlan.tls_material_store` 是 TLS material filesystem root policy 的唯一运行时契约。
+- exporter TLS refs 解析为带 `id`、`kind` 和 `path` 的 typed material plan。
+- export plan、TLS plaintext plan 和 MITM plan 不复制 root whitelist。
+- 在线 status、check、decrypt hint auto-binding、exporter drain 和 worker 使用相同的 root whitelist。
+- `interception.mitm` refs 解析为 typed material plan。
+- MITM backend readiness probe、plaintext bridge 与 policy hook 进入 runtime plan，供 status、check 和 report 表达 MITM backend contract。
 
-TLS material read path 先打开 bounded non-symlink regular file，再基于打开后的 fd metadata 校验 TLS material owner 与 permission
-policy；只有校验通过后才读取 secret bytes。metadata-only status check 只用于报告可用性，不承担活跃读取安全边界。
+Filesystem store failure model：
 
-路径白名单、热加载和非 filesystem secret backend 尚未实现。接入 Vault/KMS/TPM 前，应先把 config/runtime material source
-从单一 `path` 提升为 typed source enum，再引入高一层的 secret material store 负责分发不同 source backend。不能把非文件
-backend 直接套在当前 `Path` contract 上。
+- 缺失、symlink、目录、非 regular file、超过大小上限、owner 不匹配、owner 不可读或 group/other 可访问的 material 都不可用。
+- 活跃 webhook exporter 引用的 TLS material source 不可用时，对应 exporter 和 health 为 `unavailable`。
+- exporter unavailable reason 带 material id、kind 和 path，便于 operator 定位配置或权限问题。
+- planned webhook exporter 在实际 drain 时先确认该 sink 有待发送 batch。
+- 空队列不会读取 secret bytes。
+- 有待发送 batch 时，drain 按 per-sink refs 读取 trust anchor/client identity PEM，并构造 hyper-rustls transport。
+- 读取或 PEM 解析失败会让对应 drain 失败。
+
+Filesystem root whitelist：
+
+- `tls.material_store.filesystem.allowed_roots = []` 表示不启用路径白名单。
+- `allowed_roots` 非空时，所有 TLS material path 必须是绝对路径。
+- material path 必须位于某个配置 root 下。
+- allowed root 不能是 `/`，也不能包含 parent directory component。
+- `probe_io::AllowedFileRoots` 是 root policy 的代码所有者；config validation、standalone `product_proxy` CLI 和 root-aware bounded open 复用同一组规则。
+- agent 使用 root directory fd 和 Linux `openat2` 打开 material。
+- `openat2` 使用 `RESOLVE_BENEATH`、`RESOLVE_NO_MAGICLINKS` 和 `RESOLVE_NO_SYMLINKS`。
+- `..` traversal、magic link 和 symlink escape fail closed。
+- whitelist 不使用字符串前缀匹配，避免把路径约束退化成全盘访问。
+- first-party `product_proxy` backend 通过 CLI 接收同一组 roots。
+- `product_proxy` 独立校验 CLI roots：必须是非 `/` 的绝对路径、不能包含 parent directory component、不能重复。
+- `product_proxy` 对 TLS termination 和 upstream trust material 使用同一 root-aware bounded reader。
+- generic `external`/`managed_process` backend 是 operator-owned 程序。
+- agent 校验这些 backend 的 material refs 和配置路径，但不能替代 backend 执行内部文件打开语义。
+
+Read ordering：
+
+- TLS material read path 先打开 bounded non-symlink regular file。
+- 读取前基于打开后的 fd metadata 校验 TLS material owner 与 permission policy。
+- 只有权限校验通过后才读取 secret bytes。
+- metadata-only status check 只用于报告可用性，不承担活跃读取安全边界。
+
+未覆盖边界：
+
+- TLS material 热加载尚未实现。
+- 非 filesystem secret backend 尚未实现。
+- 接入 Vault、KMS 或 TPM 前，应先把 config/runtime material source 从单一 `path` 提升为 typed source enum。
+- 非文件 backend 应由高一层 secret material store 分发，不能直接套在当前 `Path` contract 上。
 
 敏感材料包括：
 
@@ -4459,11 +4495,12 @@ TLS status：
 
 TLS material status：
 
-- status 对配置的 TLS material registry 做 metadata-only source check。
+- status 对配置的 TLS material registry 做 source check，但不读取 secret bytes。
 - metadata-only check 判断路径是否存在。
 - metadata-only check 判断路径不是 symlink。
 - metadata-only check 判断路径是 regular file。
 - metadata-only check 判断文件不超过当前大小上限。
+- filesystem root whitelist 非空时，source check 通过同一 file store 约束路径解析，拒绝 root 外路径、`..` traversal 和 symlink escape。
 - material 标记为 `trust_or_identity` 或 `decrypt_hint`。
 - offline status 不读取、不解析、不验证证书/私钥/keylog/session secret 内容。
 - offline status 不把证书/私钥误称为通用 TLS 解密能力。

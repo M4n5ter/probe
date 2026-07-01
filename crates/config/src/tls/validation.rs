@@ -1,4 +1,9 @@
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::Path,
+};
+
+use probe_io::{AllowedFileRootViolation, AllowedFileRootViolationKind, AllowedFileRoots};
 
 use crate::{
     CaptureConfig, CaptureSelection, ConfigViolation, MAX_TLS_DECRYPT_HINT_REFRESH_INTERVAL_MS,
@@ -65,6 +70,9 @@ pub(crate) fn validate_material_ref(
 }
 
 fn validate_tls_materials(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
+    validate_tls_material_store(tls, violations);
+    let allowed_roots = &tls.material_store.filesystem.allowed_roots;
+    let allowed_root_policy = AllowedFileRoots::new(allowed_roots.clone()).ok();
     let mut ids = HashSet::new();
     for (index, material) in tls.materials.iter().enumerate() {
         if let Some(id) = &material.id {
@@ -85,7 +93,72 @@ fn validate_tls_materials(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>
                 field: format!("tls.materials[{index}].path"),
                 reason: "TLS material path cannot be empty".to_string(),
             });
+        } else if !allowed_roots.is_empty()
+            && let Some(allowed_root_policy) = &allowed_root_policy
+        {
+            validate_tls_material_path_under_allowed_roots(
+                index,
+                &material.path,
+                allowed_root_policy,
+                violations,
+            );
         }
+    }
+}
+
+fn validate_tls_material_store(tls: &TlsConfig, violations: &mut Vec<ConfigViolation>) {
+    for violation in AllowedFileRoots::validate_paths(&tls.material_store.filesystem.allowed_roots)
+    {
+        violations.push(ConfigViolation {
+            field: format!(
+                "tls.material_store.filesystem.allowed_roots[{}]",
+                violation.index
+            ),
+            reason: tls_material_root_violation_reason(&violation),
+        });
+    }
+}
+
+fn tls_material_root_violation_reason(violation: &AllowedFileRootViolation) -> String {
+    match violation.kind {
+        AllowedFileRootViolationKind::Empty => {
+            "TLS material filesystem root cannot be empty".to_string()
+        }
+        AllowedFileRootViolationKind::Relative => {
+            "TLS material filesystem root must be absolute".to_string()
+        }
+        AllowedFileRootViolationKind::RootDirectory => {
+            "TLS material filesystem root cannot be /".to_string()
+        }
+        AllowedFileRootViolationKind::ParentComponent => {
+            "TLS material filesystem root cannot contain parent directory components".to_string()
+        }
+        AllowedFileRootViolationKind::Duplicate => {
+            "TLS material filesystem roots must be unique".to_string()
+        }
+    }
+}
+
+fn validate_tls_material_path_under_allowed_roots(
+    index: usize,
+    path: &Path,
+    allowed_roots: &AllowedFileRoots,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    let field = format!("tls.materials[{index}].path");
+    if !path.is_absolute() {
+        violations.push(ConfigViolation {
+            field,
+            reason: "TLS material path must be absolute when filesystem roots are configured"
+                .to_string(),
+        });
+        return;
+    }
+    if !allowed_roots.contains(path) {
+        violations.push(ConfigViolation {
+            field,
+            reason: "TLS material path must be inside one configured filesystem root".to_string(),
+        });
     }
 }
 

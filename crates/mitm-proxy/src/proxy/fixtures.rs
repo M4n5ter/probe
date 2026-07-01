@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
     thread,
@@ -93,8 +94,8 @@ pub(super) fn write_test_certificate_for_name(
     let certified_key = rcgen::generate_simple_self_signed([server_name.to_string()])?;
     let certificate_path = root.join(format!("{prefix}.pem"));
     let private_key_path = root.join(format!("{prefix}.key"));
-    fs::write(&certificate_path, certified_key.cert.pem())?;
-    fs::write(&private_key_path, certified_key.signing_key.serialize_pem())?;
+    write_private_file(&certificate_path, certified_key.cert.pem())?;
+    write_private_file(&private_key_path, certified_key.signing_key.serialize_pem())?;
     Ok((
         certificate_path,
         private_key_path,
@@ -116,13 +117,19 @@ pub(super) fn write_test_ca(
     let certificate = params.self_signed(&signing_key)?;
     let certificate_path = root.join("mitm-ca.pem");
     let private_key_path = root.join("mitm-ca.key");
-    fs::write(&certificate_path, certificate.pem())?;
-    fs::write(&private_key_path, signing_key.serialize_pem())?;
+    write_private_file(&certificate_path, certificate.pem())?;
+    write_private_file(&private_key_path, signing_key.serialize_pem())?;
     Ok((
         certificate_path,
         private_key_path,
         certificate.der().clone(),
     ))
+}
+
+fn write_private_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), Box<dyn Error>> {
+    fs::write(path, contents)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 pub(super) fn tls_client_stream(

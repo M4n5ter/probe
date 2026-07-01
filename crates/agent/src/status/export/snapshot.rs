@@ -12,6 +12,7 @@ use crate::export::{
     ExportDrainFailureReason, ExportSinkWorkerRuntimeMode, ExportSinkWorkerRuntimeSnapshot,
     ExportWorkerRuntimeSnapshot,
 };
+use crate::tls_material::FilesystemTlsMaterialStore;
 
 use super::super::{
     spool::SpoolStatusSnapshot,
@@ -83,6 +84,7 @@ pub(in crate::status) fn exporter_statuses_with_runtime(
     cursors: &BTreeMap<String, u64>,
     runtime: Option<&ExportWorkerRuntimeSnapshot>,
 ) -> Vec<ExporterStatusSnapshot> {
+    let file_store = FilesystemTlsMaterialStore::from_plan(&plan.tls_material_store);
     plan.export
         .sinks
         .iter()
@@ -101,7 +103,7 @@ pub(in crate::status) fn exporter_statuses_with_runtime(
             let lag = cursor
                 .zip(export_last_sequence)
                 .and_then(|(cursor, last)| (cursor <= last).then(|| last - cursor));
-            let target = exporter_target_status(sink);
+            let target = exporter_target_status(sink, &file_store);
             let (mode, reason) = exporter_mode(plan, spool, &target, cursor_invariant_error);
 
             ExporterStatusSnapshot {
@@ -188,10 +190,13 @@ struct ExporterTargetStatus {
     reason: Option<String>,
 }
 
-fn exporter_target_status(sink: &ExportSinkPlan) -> ExporterTargetStatus {
+fn exporter_target_status(
+    sink: &ExportSinkPlan,
+    file_store: &FilesystemTlsMaterialStore,
+) -> ExporterTargetStatus {
     match sink {
         ExportSinkPlan::Webhook(sink) => {
-            let tls = exporter_tls_status(&sink.tls);
+            let tls = exporter_tls_status(&sink.tls, file_store);
             let mode = tls.mode;
             let reason = (tls.mode == RuntimeMode::Unavailable).then(|| {
                 tls.reason
@@ -233,14 +238,17 @@ fn file_exporter_target_mode(path: &PathBuf) -> (RuntimeMode, Option<String>) {
     }
 }
 
-fn exporter_tls_status(tls: &ExportSinkTlsPlan) -> ExporterTlsStatusSnapshot {
+fn exporter_tls_status(
+    tls: &ExportSinkTlsPlan,
+    file_store: &FilesystemTlsMaterialStore,
+) -> ExporterTlsStatusSnapshot {
     for material in tls
         .trust_anchors
         .iter()
         .chain(&tls.client_certificates)
         .chain(tls.client_private_key.iter())
     {
-        let source = tls::material_source_status(&material.path);
+        let source = tls::material_source_status(&material.path, file_store);
         if source.mode == RuntimeMode::Unavailable {
             return ExporterTlsStatusSnapshot {
                 mode: RuntimeMode::Unavailable,

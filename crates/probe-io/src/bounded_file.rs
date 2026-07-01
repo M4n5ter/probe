@@ -1,11 +1,14 @@
 use std::{
     fs::{self, File, Metadata},
     io::Read,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
-use rustix::fs::{Mode, OFlags, open};
+use rustix::fs::{Mode, OFlags, ResolveFlags, open, openat2};
 use thiserror::Error;
+
+use crate::AllowedFileRoots;
 
 #[derive(Debug, Error)]
 pub enum BoundedFileError {
@@ -50,6 +53,32 @@ pub enum BoundedFileErrorKind {
     Directory,
     NotRegular,
     TooLarge,
+}
+
+#[derive(Debug, Error)]
+pub enum RootedBoundedFileError {
+    #[error(transparent)]
+    Bounded(#[from] BoundedFileError),
+    #[error("bounded file path must be absolute when filesystem roots are configured: {path}")]
+    RelativePathDisallowed { path: PathBuf },
+    #[error("bounded file path is outside configured filesystem roots: {path}")]
+    OutsideAllowedRoots { path: PathBuf },
+    #[error("failed to open bounded file root {root} for {path}: {source}")]
+    OpenRoot {
+        path: PathBuf,
+        root: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum OwnerPrivateFileError {
+    #[error("file owner uid {owner_uid} does not match effective uid {effective_uid}")]
+    OwnerMismatch { owner_uid: u32, effective_uid: u32 },
+    #[error("file owner read bit is not set; permissions are {mode:o}")]
+    OwnerUnreadable { mode: u32 },
+    #[error("file has group/other permissions {mode:o}")]
+    InsecurePermissions { mode: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +227,27 @@ pub struct BoundedRegularFile {
 }
 
 impl BoundedRegularFile {
+    fn from_opened(
+        path: impl Into<PathBuf>,
+        limit: u64,
+        file: File,
+    ) -> Result<Self, BoundedFileError> {
+        let path = path.into();
+        let metadata = file
+            .metadata()
+            .map_err(|source| BoundedFileError::Inspect {
+                path: path.clone(),
+                source,
+            })?;
+        validate_regular_file(&path, limit, &metadata)?;
+        Ok(Self {
+            path,
+            limit,
+            file,
+            metadata,
+        })
+    }
+
     pub fn metadata(&self) -> &Metadata {
         &self.metadata
     }
@@ -249,6 +299,27 @@ pub fn read_bounded_regular_file(
     open_bounded_regular_file(path, limit)?.read()
 }
 
+pub fn open_bounded_regular_file_under_roots(
+    path: &Path,
+    allowed_roots: &AllowedFileRoots,
+    limit: u64,
+) -> Result<BoundedRegularFile, RootedBoundedFileError> {
+    if allowed_roots.is_empty() {
+        return open_bounded_regular_file(path, limit).map_err(RootedBoundedFileError::from);
+    }
+    if !path.is_absolute() {
+        return Err(RootedBoundedFileError::RelativePathDisallowed {
+            path: path.to_path_buf(),
+        });
+    }
+    let (root, relative) = allowed_roots.root_for(path).ok_or_else(|| {
+        RootedBoundedFileError::OutsideAllowedRoots {
+            path: path.to_path_buf(),
+        }
+    })?;
+    open_bounded_regular_file_under_root(path, root, relative, limit)
+}
+
 pub fn read_bounded_regular_file_to_string(
     path: &Path,
     limit: u64,
@@ -275,19 +346,47 @@ pub fn open_bounded_regular_file(
         source: source.into(),
     })?;
     let file = File::from(fd);
-    let metadata = file
-        .metadata()
-        .map_err(|source| BoundedFileError::Inspect {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    validate_regular_file(path, limit, &metadata)?;
-    Ok(BoundedRegularFile {
+    BoundedRegularFile::from_opened(path.to_path_buf(), limit, file)
+}
+
+fn open_bounded_regular_file_under_root(
+    path: &Path,
+    root: &Path,
+    relative: &Path,
+    limit: u64,
+) -> Result<BoundedRegularFile, RootedBoundedFileError> {
+    let root_fd = open(
+        root,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|source| RootedBoundedFileError::OpenRoot {
         path: path.to_path_buf(),
-        limit,
-        file,
-        metadata,
-    })
+        root: root.to_path_buf(),
+        source: source.into(),
+    })?;
+    let file_fd = openat2(
+        &root_fd,
+        relative,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
+    )
+    .map_err(|source| {
+        let source = std::io::Error::from(source);
+        if source.kind() == std::io::ErrorKind::NotFound {
+            RootedBoundedFileError::Bounded(BoundedFileError::NotFound {
+                path: path.to_path_buf(),
+            })
+        } else {
+            RootedBoundedFileError::Bounded(BoundedFileError::Open {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    })?;
+    BoundedRegularFile::from_opened(path.to_path_buf(), limit, File::from(file_fd))
+        .map_err(RootedBoundedFileError::from)
 }
 
 fn read_limited_bytes(path: &Path, limit: u64, file: File) -> Result<Vec<u8>, BoundedFileError> {
@@ -376,6 +475,25 @@ fn validate_read_size(path: &Path, limit: u64, size: u64) -> Result<(), BoundedF
     }
 }
 
+pub fn validate_owner_private_file(metadata: &Metadata) -> Result<(), OwnerPrivateFileError> {
+    let mode = metadata.permissions().mode() & 0o777;
+    let effective_uid = rustix::process::geteuid().as_raw();
+    let owner_uid = metadata.uid();
+    if owner_uid != effective_uid {
+        return Err(OwnerPrivateFileError::OwnerMismatch {
+            owner_uid,
+            effective_uid,
+        });
+    }
+    if mode & 0o400 == 0 {
+        return Err(OwnerPrivateFileError::OwnerUnreadable { mode });
+    }
+    if mode & 0o077 != 0 {
+        return Err(OwnerPrivateFileError::InsecurePermissions { mode });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -439,6 +557,25 @@ mod tests {
             read_bounded_regular_file(&link, 64).expect_err("symlinked file must be rejected");
 
         assert_eq!(error.kind(), BoundedFileErrorKind::Symlink);
+        Ok(())
+    }
+
+    #[test]
+    fn root_bounded_open_preserves_missing_target_error() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+        let missing = root.join("missing.pem");
+
+        let roots = AllowedFileRoots::new(vec![root])?;
+        let error = open_bounded_regular_file_under_roots(&missing, &roots, 64)
+            .expect_err("missing target under allowed root must stay NotFound");
+
+        assert!(matches!(
+            error,
+            RootedBoundedFileError::Bounded(BoundedFileError::NotFound { .. })
+        ));
         Ok(())
     }
 }

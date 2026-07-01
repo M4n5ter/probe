@@ -35,8 +35,8 @@ use super::{
     enforcement_policy_source::EnforcementPolicySourcePlan,
     interception_scope::TransparentInterceptionLocalSetupProjectionPlan,
     tls::{
-        TlsMaterialPlan, mitm_tls_material_from_ref, mitm_tls_materials_by_id,
-        mitm_tls_materials_from_refs,
+        TlsMaterialPlan, TlsMaterialStorePlan, mitm_tls_material_from_ref,
+        mitm_tls_materials_by_id, mitm_tls_materials_from_refs,
     },
 };
 
@@ -52,7 +52,11 @@ pub struct EnforcementPlan {
 }
 
 impl EnforcementPlan {
-    pub(super) fn resolve(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
+    pub(super) fn resolve(
+        config: &AgentConfig,
+        capabilities: &CapabilityMatrix,
+        tls_material_store: &TlsMaterialStorePlan,
+    ) -> Self {
         Self {
             mode: config.enforcement.mode,
             execution_surface: selected_execution_surface(config),
@@ -61,7 +65,11 @@ impl EnforcementPlan {
                 capabilities,
             ),
             connection: EnforcementConnectionPlan::from_config(config, capabilities),
-            interception: EnforcementInterceptionPlan::from_config(config, capabilities),
+            interception: EnforcementInterceptionPlan::from_config(
+                config,
+                capabilities,
+                tls_material_store,
+            ),
             config_selector_configured: config.enforcement.selector.is_some(),
             policy_source: EnforcementPolicySourcePlan::from_config(
                 &config.enforcement.policy.source,
@@ -144,7 +152,11 @@ pub struct EnforcementInterceptionPlan {
 }
 
 impl EnforcementInterceptionPlan {
-    fn from_config(config: &AgentConfig, capabilities: &CapabilityMatrix) -> Self {
+    fn from_config(
+        config: &AgentConfig,
+        capabilities: &CapabilityMatrix,
+        tls_material_store: &TlsMaterialStorePlan,
+    ) -> Self {
         let intent = config
             .enforcement
             .interception
@@ -154,7 +166,8 @@ impl EnforcementInterceptionPlan {
         let nftables = TransparentInterceptionNftablesPlan::reserved();
         let execution =
             TransparentInterceptionExecutionPlan::from_intent_with_nftables(&intent, &nftables);
-        let mitm = TransparentInterceptionMitmPlan::from_config(config, &nftables);
+        let mitm =
+            TransparentInterceptionMitmPlan::from_config(config, &nftables, tls_material_store);
         Self {
             strategy,
             proxy: TransparentInterceptionProxyPlan::from_intent(&intent),
@@ -364,19 +377,26 @@ impl TransparentInterceptionMitmPlan {
         config
             .validate_l7_mitm_contract()
             .map_err(config_validation_error)?;
+        let tls_material_store = TlsMaterialStorePlan::resolve(config);
         Ok(Self::from_validated_config(
             config,
             &TransparentInterceptionNftablesPlan::reserved(),
+            &tls_material_store,
         ))
     }
 
-    fn from_config(config: &AgentConfig, nftables: &TransparentInterceptionNftablesPlan) -> Self {
-        Self::from_validated_config(config, nftables)
+    fn from_config(
+        config: &AgentConfig,
+        nftables: &TransparentInterceptionNftablesPlan,
+        tls_material_store: &TlsMaterialStorePlan,
+    ) -> Self {
+        Self::from_validated_config(config, nftables, tls_material_store)
     }
 
     fn from_validated_config(
         config: &AgentConfig,
         nftables: &TransparentInterceptionNftablesPlan,
+        tls_material_store: &TlsMaterialStorePlan,
     ) -> Self {
         let mitm = &config.enforcement.interception.mitm;
         let materials_by_id = mitm_tls_materials_by_id(&config.tls.materials);
@@ -447,6 +467,7 @@ impl TransparentInterceptionMitmPlan {
             leaf_certificate_chain: &leaf_certificate_chain,
             leaf_private_key: leaf_private_key.as_ref(),
             upstream_trust_anchors: &upstream_trust_anchors,
+            tls_material_store,
         };
         let backend =
             TransparentInterceptionMitmBackendPlan::from_intent(backend_intent, backend_context);
@@ -522,6 +543,7 @@ struct MitmBackendPlanningContext<'a> {
     leaf_certificate_chain: &'a [TlsMaterialPlan],
     leaf_private_key: Option<&'a TlsMaterialPlan>,
     upstream_trust_anchors: &'a [TlsMaterialPlan],
+    tls_material_store: &'a TlsMaterialStorePlan,
 }
 
 impl<'a> MitmBackendPlanningContext<'a> {
@@ -536,6 +558,7 @@ impl<'a> MitmBackendPlanningContext<'a> {
             policy_hook: self.policy_hook,
             tls_termination_source: self.tls_termination_source(),
             upstream_trust_anchors: self.upstream_trust_anchors,
+            tls_material_store: self.tls_material_store,
         }
     }
 
@@ -722,6 +745,7 @@ struct ProductProxyCliBuilder<'a> {
     policy_hook: &'a TransparentInterceptionMitmPolicyHookPlan,
     tls_termination_source: ProductProxyTlsTerminationSource<'a>,
     upstream_trust_anchors: &'a [TlsMaterialPlan],
+    tls_material_store: &'a TlsMaterialStorePlan,
 }
 
 enum ProductProxyTlsTerminationSource<'a> {
@@ -800,6 +824,12 @@ impl ProductProxyCliBuilder<'_> {
                 endpoint.path_and_query.clone(),
                 "--action-timeout-ms".to_string(),
                 timeout_ms.to_string(),
+            ]);
+        }
+        for root in self.tls_material_store.allowed_roots() {
+            args.extend([
+                "--tls-material-root".to_string(),
+                root.display().to_string(),
             ]);
         }
         match self.tls_termination_source {
@@ -1352,13 +1382,21 @@ mod tests {
 
     use super::*;
 
+    fn resolve_enforcement_plan(
+        config: &AgentConfig,
+        capabilities: &CapabilityMatrix,
+    ) -> EnforcementPlan {
+        let tls_material_store = TlsMaterialStorePlan::resolve(config);
+        EnforcementPlan::resolve(config, capabilities, &tls_material_store)
+    }
+
     #[test]
     fn dry_run_enforcement_is_a_supported_runtime_capability() {
         let mut config = AgentConfig::default();
         config.enforcement.mode = EnforcementMode::DryRun;
         let capabilities = CapabilityMatrix::new(test_platform_capabilities());
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
 
         assert_eq!(
             plan.mode_capability,
@@ -1379,7 +1417,7 @@ mod tests {
             RuntimeMode::Available,
         ));
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
 
         assert_eq!(
             plan.connection.backend,
@@ -1406,7 +1444,7 @@ mod tests {
         config.enforcement.backend = ConnectionEnforcementBackendConfig::LinuxSocketDestroy;
         let capabilities = CapabilityMatrix::new([]);
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
 
         assert_eq!(
             plan.connection.capability,
@@ -1453,7 +1491,7 @@ mod tests {
             RuntimeMode::Available,
         ));
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
 
         assert_eq!(
             plan.interception.strategy,
@@ -1542,7 +1580,7 @@ mod tests {
             RuntimeMode::Unavailable,
         ));
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
 
         assert_eq!(
             plan.interception.strategy,
@@ -1603,7 +1641,7 @@ mod tests {
             RuntimeMode::Available,
         ));
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
 
         let TransparentInterceptionLocalSetupProjectionPlan::HostRules { scopes } =
             plan.interception.local_setup_projection
@@ -1641,7 +1679,7 @@ mod tests {
             CapabilityState::unavailable(CapabilityKind::L7Mitm, "not wired"),
         ]);
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
 
         assert_eq!(
             plan.interception.strategy,
@@ -1726,7 +1764,7 @@ mod tests {
             CapabilityState::available(CapabilityKind::L7Mitm),
         ]);
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
 
         let TransparentInterceptionMitmBackendPlan::ManagedProcess {
             process,
@@ -1771,13 +1809,14 @@ mod tests {
             TransparentInterceptionStrategyConfig::InboundTproxyMitm;
         config.enforcement.interception.proxy.listen_port = Some(15002);
         configure_product_proxy_mitm_backend(&mut config);
+        config.tls.material_store.filesystem.allowed_roots = vec!["/etc/traffic-probe".into()];
         let capabilities = CapabilityMatrix::new([
             CapabilityState::available(CapabilityKind::TransparentInterception),
             CapabilityState::available(CapabilityKind::L7Mitm),
             CapabilityState::available(CapabilityKind::CaptureEventFeed),
         ]);
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
 
         let TransparentInterceptionMitmBackendPlan::ProductProxy {
             process,
@@ -1833,6 +1872,8 @@ mod tests {
                 "/mitm-policy-hook".to_string(),
                 "--action-timeout-ms".to_string(),
                 "250".to_string(),
+                "--tls-material-root".to_string(),
+                "/etc/traffic-probe".to_string(),
                 "--tls-ca-certificate".to_string(),
                 "/etc/traffic-probe/mitm-ca.pem".to_string(),
                 "--tls-ca-private-key".to_string(),
@@ -1884,7 +1925,7 @@ mod tests {
             CapabilityState::available(CapabilityKind::CaptureEventFeed),
         ]);
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
         let TransparentInterceptionMitmBackendPlan::ProductProxy { process, .. } =
             &plan.interception.mitm.backend
         else {
@@ -1932,7 +1973,7 @@ mod tests {
             CapabilityState::available(CapabilityKind::CaptureEventFeed),
         ]);
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
         let TransparentInterceptionMitmBackendPlan::ProductProxy { process, .. } =
             &plan.interception.mitm.backend
         else {
@@ -1976,7 +2017,7 @@ mod tests {
             CapabilityState::available(CapabilityKind::CaptureEventFeed),
         ]);
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
         let TransparentInterceptionMitmBackendPlan::ProductProxy {
             process,
             upstream_discovery,
@@ -2031,7 +2072,7 @@ mod tests {
             CapabilityState::available(CapabilityKind::CaptureEventFeed),
         ]);
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
         let TransparentInterceptionMitmBackendPlan::ProductProxy { process, .. } =
             &plan.interception.mitm.backend
         else {
@@ -2087,7 +2128,7 @@ mod tests {
             CapabilityState::available(CapabilityKind::CaptureEventFeed),
         ]);
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
 
         assert_eq!(
             plan.interception.capabilities,
@@ -2150,7 +2191,7 @@ mod tests {
             CapabilityState::available(CapabilityKind::L7Mitm),
         ]);
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
 
         assert_eq!(
             plan.execution_surface,
@@ -2245,7 +2286,7 @@ mod tests {
             CapabilityState::available(CapabilityKind::CaptureEventFeed),
         ]);
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
 
         assert_eq!(
             plan.interception.mitm.plaintext_bridge,
@@ -2280,7 +2321,7 @@ mod tests {
             RuntimeMode::Available,
         ));
 
-        let plan = EnforcementPlan::resolve(&config, &capabilities);
+        let plan = resolve_enforcement_plan(&config, &capabilities);
 
         assert_eq!(
             plan.interception.proxy.self_bypass,

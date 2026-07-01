@@ -41,6 +41,31 @@ path = "/var/lib/traffic-probe/session-secrets.jsonl"
 }
 
 #[test]
+fn parses_tls_material_filesystem_allowed_roots() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[tls.material_store.filesystem]
+allowed_roots = ["/etc/traffic-probe/tls", "/var/lib/traffic-probe/tls"]
+
+[[tls.materials]]
+id = "collector-ca"
+kind = "trust_anchor"
+path = "/etc/traffic-probe/tls/collector-ca.pem"
+"#,
+    )?;
+
+    assert_eq!(
+        config.tls.material_store.filesystem.allowed_roots,
+        vec![
+            std::path::PathBuf::from("/etc/traffic-probe/tls"),
+            std::path::PathBuf::from("/var/lib/traffic-probe/tls"),
+        ]
+    );
+    config.validate_basic()?;
+    Ok(())
+}
+
+#[test]
 fn rejects_tls_plaintext_provider_field() {
     let result = AgentConfig::from_toml_str(
         r#"

@@ -6,7 +6,7 @@ use exporter::{
 use probe_config::CompressionCodecName;
 use runtime::{
     ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportTlsMaterialPlan, FileExportSinkPlan,
-    WebhookExportSinkPlan,
+    TlsMaterialStorePlan, WebhookExportSinkPlan,
 };
 use storage::ExportSpool;
 
@@ -30,6 +30,7 @@ pub async fn drain_planned_sinks(
         spool,
         agent_id,
         export,
+        &TlsMaterialStorePlan::default(),
         WebhookConnectionOptions::default(),
     )
     .await
@@ -39,12 +40,14 @@ pub(crate) async fn drain_planned_sinks_with_webhook_connection(
     spool: &impl ExportSpool,
     agent_id: &str,
     export: &ExportPlan,
+    tls_material_store: &TlsMaterialStorePlan,
     webhook_connection: WebhookConnectionOptions,
 ) -> Result<(), ExportDrainError> {
     let result = drain_export_sinks_with_mode(
         spool,
         agent_id,
         &export.sinks,
+        &FilesystemTlsMaterialStore::from_plan(tls_material_store),
         SinkDrainMode::UntilEmpty,
         webhook_connection,
     )
@@ -63,10 +66,17 @@ pub async fn drain_replay_webhook(
 ) -> Result<(), ExportDrainError> {
     let target = WebhookExportTarget::replay(endpoint, codec);
     let sink = target.sink.clone();
+    let file_store = FilesystemTlsMaterialStore::default();
     with_sink_timeout(
         sink,
         SinkDrainMode::UntilEmpty.sink_timeout(),
-        drain_webhook_sink(spool, agent_id, target, SinkDrainMode::UntilEmpty),
+        drain_webhook_sink(
+            spool,
+            agent_id,
+            target,
+            SinkDrainMode::UntilEmpty,
+            &file_store,
+        ),
     )
     .await
 }
@@ -95,13 +105,21 @@ pub(super) async fn drain_export_sinks_with_mode(
     spool: &impl ExportSpool,
     agent_id: &str,
     sinks: &[ExportSinkPlan],
+    file_store: &FilesystemTlsMaterialStore,
     mode: SinkDrainMode,
     webhook_connection: WebhookConnectionOptions,
 ) -> Result<(), ExportDrainError> {
     let mut failures = Vec::new();
     for sink in sinks {
-        let result =
-            drain_export_sink_with_mode(spool, agent_id, sink, mode, webhook_connection).await;
+        let result = drain_export_sink_with_mode(
+            spool,
+            agent_id,
+            sink,
+            file_store,
+            mode,
+            webhook_connection,
+        )
+        .await;
         if let Err(error) = result {
             eprintln!("exporter sink {} failed: {error}", sink.id());
             failures.push(format!("{}: {error}", sink.id()));
@@ -134,6 +152,7 @@ pub(super) async fn drain_export_sink_with_mode(
     spool: &impl ExportSpool,
     agent_id: &str,
     sink: &ExportSinkPlan,
+    file_store: &FilesystemTlsMaterialStore,
     mode: SinkDrainMode,
     webhook_connection: WebhookConnectionOptions,
 ) -> Result<(), ExportDrainError> {
@@ -144,7 +163,7 @@ pub(super) async fn drain_export_sink_with_mode(
             with_sink_timeout(
                 sink,
                 mode.sink_timeout(),
-                drain_webhook_sink(spool, agent_id, target, mode),
+                drain_webhook_sink(spool, agent_id, target, mode, file_store),
             )
             .await
         }
@@ -231,6 +250,7 @@ async fn drain_webhook_sink(
     agent_id: &str,
     target: WebhookExportTarget,
     mode: SinkDrainMode,
+    file_store: &FilesystemTlsMaterialStore,
 ) -> Result<(), ExportDrainError> {
     let WebhookExportTarget {
         sink,
@@ -247,7 +267,7 @@ async fn drain_webhook_sink(
     let Some(first_batch) = export_batch_from_events(agent_id, &sink, codec, first_events)? else {
         return Ok(());
     };
-    let tls = webhook_tls_config_from_plan(&tls)?;
+    let tls = webhook_tls_config_from_plan(&tls, file_store)?;
     let exporter = WebhookExporter::with_connection_options(
         endpoint,
         codec,
@@ -282,8 +302,9 @@ async fn drain_file_sink(
 
 fn webhook_tls_config_from_plan(
     plan: &ExportSinkTlsPlan,
+    file_store: &impl TlsMaterialFileStore,
 ) -> Result<WebhookTlsConfig, ExportDrainError> {
-    webhook_tls_config_from_plan_with_file_store(plan, &FilesystemTlsMaterialStore)
+    webhook_tls_config_from_plan_with_file_store(plan, file_store)
 }
 
 fn webhook_tls_config_from_plan_with_file_store(
@@ -392,7 +413,8 @@ mod tests {
             )),
         };
 
-        let tls = webhook_tls_config_from_plan(&plan)?;
+        let store = FilesystemTlsMaterialStore::default();
+        let tls = webhook_tls_config_from_plan(&plan, &store)?;
 
         assert_eq!(tls.trust_anchor_pems, vec![b"ca-pem".to_vec()]);
         assert_eq!(tls.identity_pem.as_deref(), Some(&b"cert-pem\nkey-pem"[..]));
@@ -490,6 +512,45 @@ mod tests {
 
         drain_planned_sinks(&spool, "agent-1", &plan).await?;
         fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planned_webhook_drain_enforces_tls_material_allowed_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = temp_path("webhook-tls-material-roots");
+        fs::create_dir_all(&temp)?;
+        let root = temp.join("allowed");
+        let outside = temp.join("outside");
+        fs::create_dir(&root)?;
+        fs::create_dir(&outside)?;
+        let outside_material = outside.join("collector-ca.pem");
+        write_private_file(&outside_material, b"ca-pem")?;
+        let spool_temp = temp_path("webhook-tls-material-roots-spool");
+        let spool = FjallSpool::open(&spool_temp)?;
+        append_export_events(&spool, 1)?;
+        let plan = export_plan_with_trust_anchor(outside_material);
+        let tls_material_store = TlsMaterialStorePlan::FilesystemRoots {
+            allowed_roots: vec![root],
+        };
+
+        let error = drain_planned_sinks_with_webhook_connection(
+            &spool,
+            "agent-1",
+            &plan,
+            &tls_material_store,
+            WebhookConnectionOptions::default(),
+        )
+        .await
+        .expect_err("TLS material outside allowed roots must fail drain");
+
+        assert!(
+            error
+                .to_string()
+                .contains("outside configured filesystem roots")
+        );
+        fs::remove_dir_all(temp)?;
+        fs::remove_dir_all(spool_temp)?;
         Ok(())
     }
 

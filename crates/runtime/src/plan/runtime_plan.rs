@@ -9,7 +9,7 @@ use super::{
     export::ExportPlan,
     registry::ProviderRegistry,
     storage::StoragePlan,
-    tls::TlsPlan,
+    tls::{TlsMaterialStorePlan, TlsPlan},
     validation::{validate_runtime_config, validate_static_runtime_config_fields},
 };
 
@@ -18,6 +18,7 @@ pub struct RuntimePlan {
     pub config: AgentConfig,
     pub capabilities: CapabilityMatrix,
     pub capture: CapturePlan,
+    pub tls_material_store: TlsMaterialStorePlan,
     pub tls: TlsPlan,
     pub storage: StoragePlan,
     pub export: ExportPlan,
@@ -30,14 +31,16 @@ impl RuntimePlan {
         validate_runtime_config(&config, registry)?;
         let capabilities = registry.capability_matrix();
         let capture = CapturePlan::resolve(&config, registry);
+        let tls_material_store = TlsMaterialStorePlan::resolve(&config);
         let tls = TlsPlan::resolve(&config, &capabilities);
         let storage = StoragePlan::resolve(&config);
         let export = ExportPlan::resolve(&config);
-        let enforcement = EnforcementPlan::resolve(&config, &capabilities);
+        let enforcement = EnforcementPlan::resolve(&config, &capabilities, &tls_material_store);
         Ok(Self {
             config,
             capabilities,
             capture,
+            tls_material_store,
             tls,
             storage,
             export,

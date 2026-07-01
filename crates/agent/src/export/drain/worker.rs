@@ -8,7 +8,9 @@ use std::{
 };
 
 use exporter::WebhookConnectionOptions;
-use runtime::{ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportWorkerPlan};
+use runtime::{
+    ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportWorkerPlan, TlsMaterialStorePlan,
+};
 use serde::Serialize;
 use storage::ExportSpool;
 use tokio::sync::Notify;
@@ -19,6 +21,7 @@ use super::{
     mode::SinkDrainMode,
     target::{drain_export_sink_with_mode, finish_export_sink_drain},
 };
+use crate::tls_material::FilesystemTlsMaterialStore;
 
 const EXPORT_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -40,6 +43,7 @@ pub struct ExportWorkerConfig {
     sink_timeout: Duration,
     failure_backoff: ExportWorkerBackoffPolicy,
     webhook_connection: WebhookConnectionOptions,
+    tls_material_store: FilesystemTlsMaterialStore,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +118,7 @@ impl ExportWorkerConfig {
         sink_timeout: Duration,
         failure_backoff: ExportWorkerBackoffPolicy,
         webhook_connection: WebhookConnectionOptions,
+        tls_material_store: FilesystemTlsMaterialStore,
     ) -> Self {
         Self {
             agent_id,
@@ -122,6 +127,7 @@ impl ExportWorkerConfig {
             sink_timeout,
             failure_backoff,
             webhook_connection,
+            tls_material_store,
         }
     }
 
@@ -130,6 +136,7 @@ impl ExportWorkerConfig {
         Self::from_plans_with_webhook_connection(
             agent_id,
             export,
+            &TlsMaterialStorePlan::default(),
             WebhookConnectionOptions::default(),
         )
     }
@@ -137,6 +144,7 @@ impl ExportWorkerConfig {
     pub(crate) fn from_plans_with_webhook_connection(
         agent_id: String,
         export: &ExportPlan,
+        tls_material_store: &TlsMaterialStorePlan,
         webhook_connection: WebhookConnectionOptions,
     ) -> Option<Self> {
         match &export.worker {
@@ -153,6 +161,7 @@ impl ExportWorkerConfig {
                 Duration::from_millis(*sink_timeout_ms),
                 ExportWorkerBackoffPolicy::from(*failure_backoff),
                 webhook_connection,
+                FilesystemTlsMaterialStore::from_plan(tls_material_store),
             )),
         }
     }
@@ -348,6 +357,7 @@ async fn drain_export_sinks_once(
             spool,
             &config.agent_id,
             sink,
+            &config.tls_material_store,
             mode,
             config.webhook_connection,
         )

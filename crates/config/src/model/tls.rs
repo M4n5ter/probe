@@ -20,6 +20,7 @@ fn default_tls_decrypt_hint_refresh_interval_ms() -> u64 {
 #[serde(default, deny_unknown_fields)]
 pub struct TlsConfig {
     pub plaintext: PlaintextTlsConfig,
+    pub material_store: TlsMaterialStoreConfig,
     pub materials: Vec<TlsMaterialConfig>,
 }
 
@@ -68,6 +69,18 @@ impl Default for TlsPlaintextDecryptHintConfig {
             refresh_interval_ms: DEFAULT_TLS_DECRYPT_HINT_REFRESH_INTERVAL_MS,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsMaterialStoreConfig {
+    pub filesystem: FilesystemTlsMaterialStoreConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilesystemTlsMaterialStoreConfig {
+    pub allowed_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

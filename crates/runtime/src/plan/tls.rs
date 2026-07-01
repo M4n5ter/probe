@@ -17,6 +17,34 @@ impl TlsPlan {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TlsMaterialStorePlan {
+    #[default]
+    Unrestricted,
+    FilesystemRoots {
+        allowed_roots: Vec<PathBuf>,
+    },
+}
+
+impl TlsMaterialStorePlan {
+    pub(super) fn resolve(config: &AgentConfig) -> Self {
+        let allowed_roots = config.tls.material_store.filesystem.allowed_roots.clone();
+        if allowed_roots.is_empty() {
+            Self::Unrestricted
+        } else {
+            Self::FilesystemRoots { allowed_roots }
+        }
+    }
+
+    pub fn allowed_roots(&self) -> &[PathBuf] {
+        match self {
+            Self::Unrestricted => &[],
+            Self::FilesystemRoots { allowed_roots } => allowed_roots,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsPlaintextPlan {
     pub instrumentation: TlsPlaintextInstrumentationPlan,
@@ -256,6 +284,33 @@ mod tests {
         );
         assert!(plan.plaintext.decrypt_hints.key_logs.is_empty());
         assert!(plan.plaintext.decrypt_hints.session_secrets.is_empty());
+    }
+
+    #[test]
+    fn tls_material_store_plan_resolves_filesystem_roots() {
+        let mut config = AgentConfig::default();
+        config.tls.material_store.filesystem.allowed_roots = vec!["/etc/traffic-probe/tls".into()];
+
+        let plan = TlsMaterialStorePlan::resolve(&config);
+
+        assert_eq!(
+            plan,
+            TlsMaterialStorePlan::FilesystemRoots {
+                allowed_roots: vec![PathBuf::from("/etc/traffic-probe/tls")]
+            }
+        );
+        assert_eq!(
+            plan.allowed_roots(),
+            &[PathBuf::from("/etc/traffic-probe/tls")]
+        );
+    }
+
+    #[test]
+    fn tls_material_store_plan_defaults_to_unrestricted() {
+        let plan = TlsMaterialStorePlan::resolve(&AgentConfig::default());
+
+        assert_eq!(plan, TlsMaterialStorePlan::Unrestricted);
+        assert!(plan.allowed_roots().is_empty());
     }
 
     #[test]

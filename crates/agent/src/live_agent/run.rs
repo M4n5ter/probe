@@ -241,6 +241,7 @@ pub(crate) async fn run_live_agent(
         spool.as_ref(),
         &plan.config.agent_id,
         &plan.export,
+        &plan.tls_material_store,
         webhook_connection,
     )
     .await;
@@ -548,6 +549,7 @@ fn export_worker_config_from_plan(
     ExportWorkerConfig::from_plans_with_webhook_connection(
         plan.config.agent_id.clone(),
         &plan.export,
+        &plan.tls_material_store,
         webhook_connection,
     )
 }

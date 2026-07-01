@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 probe-core = { path = "../core" }
+probe-io = { path = "../probe-io" }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 toml = "1.1.2"

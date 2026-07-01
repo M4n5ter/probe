@@ -90,8 +90,15 @@ pub(in crate::status) fn tls_status(
     runtime: Option<TlsPlaintextRuntimeSnapshot>,
     decrypt_hint_runtime: Option<TlsDecryptHintRuntimeSnapshot>,
 ) -> TlsStatusSnapshot {
+    let file_store = FilesystemTlsMaterialStore::from_plan(&plan.tls_material_store);
     TlsStatusSnapshot {
-        plaintext: plaintext_status(plan, capabilities, runtime, decrypt_hint_runtime),
+        plaintext: plaintext_status(
+            plan,
+            capabilities,
+            runtime,
+            decrypt_hint_runtime,
+            &file_store,
+        ),
         materials: plan
             .config
             .tls
@@ -101,7 +108,7 @@ pub(in crate::status) fn tls_status(
                 kind: material.kind,
                 path: material.path.clone(),
                 purpose: material_purpose(material.kind),
-                source: material_source_status(&material.path),
+                source: material_source_status(&material.path, &file_store),
             })
             .collect(),
     }
@@ -112,6 +119,7 @@ fn plaintext_status(
     capabilities: &CapabilityMatrix,
     runtime: Option<TlsPlaintextRuntimeSnapshot>,
     decrypt_hint_runtime: Option<TlsDecryptHintRuntimeSnapshot>,
+    file_store: &impl TlsMaterialFileStore,
 ) -> TlsPlaintextStatusSnapshot {
     let plaintext = &plan.tls.plaintext;
     let instrumentation = &plaintext.instrumentation;
@@ -137,8 +145,11 @@ fn plaintext_status(
             runtime,
         },
         decrypt_hints: TlsDecryptHintStatusSnapshot {
-            key_logs: plaintext_material_statuses(&plaintext.decrypt_hints.key_logs),
-            session_secrets: plaintext_material_statuses(&plaintext.decrypt_hints.session_secrets),
+            key_logs: plaintext_material_statuses(&plaintext.decrypt_hints.key_logs, file_store),
+            session_secrets: plaintext_material_statuses(
+                &plaintext.decrypt_hints.session_secrets,
+                file_store,
+            ),
             runtime: decrypt_hint_runtime,
         },
     }
@@ -146,6 +157,7 @@ fn plaintext_status(
 
 fn plaintext_material_statuses(
     materials: &[TlsPlaintextMaterialPlan],
+    file_store: &impl TlsMaterialFileStore,
 ) -> Vec<TlsPlaintextMaterialStatusSnapshot> {
     materials
         .iter()
@@ -153,7 +165,7 @@ fn plaintext_material_statuses(
             id: material.id.clone(),
             kind: material.kind,
             path: material.path.clone(),
-            source: material_source_status(&material.path),
+            source: material_source_status(&material.path, file_store),
         })
         .collect()
 }
@@ -174,9 +186,11 @@ fn material_purpose(kind: TlsMaterialKind) -> TlsMaterialPurpose {
     }
 }
 
-pub(in crate::status) fn material_source_status(path: &Path) -> TlsMaterialSourceStatusSnapshot {
-    let (mode, reason) = inspect_material_source(path, &FilesystemTlsMaterialStore);
-
+pub(in crate::status) fn material_source_status(
+    path: &Path,
+    file_store: &impl TlsMaterialFileStore,
+) -> TlsMaterialSourceStatusSnapshot {
+    let (mode, reason) = inspect_material_source(path, file_store);
     TlsMaterialSourceStatusSnapshot {
         check: TlsMaterialSourceCheck::MetadataOnly,
         mode,

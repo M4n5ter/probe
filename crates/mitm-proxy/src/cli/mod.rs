@@ -7,6 +7,7 @@ use std::{
 
 use clap::Parser;
 use probe_core::{ApplicationProtocol, ApplicationProtocolPolicy, Direction};
+use probe_io::AllowedFileRoots;
 
 use crate::{
     MitmProxyError,
@@ -57,6 +58,8 @@ pub struct Cli {
     pub tls_ca_certificate: Option<PathBuf>,
     #[arg(long)]
     pub tls_ca_private_key: Option<PathBuf>,
+    #[arg(long = "tls-material-root")]
+    pub tls_material_roots: Vec<PathBuf>,
     #[arg(long, default_value_t = TargetRecovery::AcceptedLocal)]
     pub target_recovery: TargetRecovery,
     #[arg(long, default_value_t = RequestDirection::Outbound)]
@@ -115,12 +118,15 @@ impl TryFrom<Cli> for MitmProxyConfig {
                 "policy_hook_path must be an absolute path".to_string(),
             ));
         }
+        let tls_material_roots = AllowedFileRoots::new(value.tls_material_roots.clone())
+            .map_err(|error| MitmProxyError::InvalidConfig(error.to_string()))?;
         let tls = tls_termination_config(
             value.tls_certificate_chain,
             value.tls_private_key,
             value.tls_ca_certificate,
             value.tls_ca_private_key,
-        )?;
+        )?
+        .map(|tls| tls.with_material_roots(tls_material_roots.clone()));
         if !value.upstream_tls
             && (!value.upstream_trust_anchor.is_empty() || value.upstream_server_name.is_some())
         {
@@ -131,6 +137,7 @@ impl TryFrom<Cli> for MitmProxyConfig {
         }
         let upstream_tls = value.upstream_tls.then(|| {
             UpstreamTlsConfig::new(value.upstream_trust_anchor, value.upstream_server_name)
+                .with_material_roots(tls_material_roots)
         });
         if !value.upstream_dns_discovery
             && (value.upstream_dns_default_port.is_some()
@@ -357,6 +364,67 @@ mod tests {
             vec![Path::new("/tmp/upstream-ca.pem").to_path_buf()]
         );
         assert_eq!(upstream_tls.server_name.as_deref(), Some("upstream.test"));
+    }
+
+    #[test]
+    fn tls_material_roots_are_attached_to_tls_configs() {
+        let roots = vec![
+            Path::new("/etc/probe/certs").to_path_buf(),
+            Path::new("/var/lib/probe/tls").to_path_buf(),
+        ];
+        let config = MitmProxyConfig::try_from(Cli {
+            upstream_tls: true,
+            upstream_trust_anchor: vec![Path::new("/etc/probe/certs/upstream.pem").to_path_buf()],
+            tls_certificate_chain: Some(Path::new("/etc/probe/certs/leaf.pem").to_path_buf()),
+            tls_private_key: Some(Path::new("/etc/probe/certs/leaf.key").to_path_buf()),
+            tls_material_roots: roots.clone(),
+            ..minimal_cli()
+        })
+        .expect("TLS material roots should parse");
+
+        let TlsTerminationConfig::Static(tls) = config
+            .tls
+            .expect("TLS termination config should be present")
+        else {
+            panic!("static TLS termination should be preserved");
+        };
+        assert_eq!(tls.material_roots.as_slice(), roots.as_slice());
+        assert_eq!(
+            config
+                .upstream_tls
+                .expect("upstream TLS config should be present")
+                .material_roots
+                .as_slice(),
+            tls.material_roots.as_slice()
+        );
+    }
+
+    #[test]
+    fn tls_material_roots_must_be_safe_absolute_roots() {
+        for root in [
+            Path::new("relative").to_path_buf(),
+            Path::new("/").to_path_buf(),
+            Path::new("/etc/probe/../tls").to_path_buf(),
+        ] {
+            let error = MitmProxyConfig::try_from(Cli {
+                tls_material_roots: vec![root],
+                ..minimal_cli()
+            })
+            .expect_err("invalid TLS material root must be rejected");
+
+            assert!(matches!(error, MitmProxyError::InvalidConfig(_)));
+        }
+
+        let error = MitmProxyConfig::try_from(Cli {
+            tls_material_roots: vec![
+                Path::new("/etc/probe/tls").to_path_buf(),
+                Path::new("/etc/probe/tls").to_path_buf(),
+            ],
+            ..minimal_cli()
+        })
+        .expect_err("duplicate TLS material roots must be rejected");
+
+        assert!(matches!(error, MitmProxyError::InvalidConfig(_)));
     }
 
     #[test]
@@ -595,6 +663,7 @@ mod tests {
             tls_private_key: None,
             tls_ca_certificate: None,
             tls_ca_private_key: None,
+            tls_material_roots: Vec::new(),
             target_recovery: TargetRecovery::AcceptedLocal,
             request_direction: RequestDirection::Outbound,
             policy_hook_listen: None,

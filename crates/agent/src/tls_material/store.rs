@@ -1,9 +1,18 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub(crate) enum TlsMaterialFileStoreError {
+    #[error("TLS material path must be absolute when filesystem roots are configured")]
+    RelativePathDisallowed,
+    #[error("TLS material path is outside configured filesystem roots")]
+    PathOutsideAllowedRoots,
+    #[error("failed to open TLS material filesystem root {root}: {source}")]
+    OpenAllowedRoot {
+        root: PathBuf,
+        source: std::io::Error,
+    },
     #[error("TLS material path does not exist")]
     NotFound,
     #[error("failed to inspect TLS material: {source}")]

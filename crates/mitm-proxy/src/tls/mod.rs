@@ -1,13 +1,16 @@
 use std::{
     collections::{HashMap, VecDeque},
-    fs::File,
-    io::BufReader,
+    io::{BufReader, Cursor},
     net::TcpStream,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 use probe_core::{ApplicationProtocol, ApplicationProtocolPolicy};
+use probe_io::{
+    AllowedFileRoots, BoundedFileError, OwnerPrivateFileError, RootedBoundedFileError,
+    open_bounded_regular_file_under_roots, validate_owner_private_file,
+};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, Issuer, KeyPair};
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
@@ -22,6 +25,7 @@ use crate::{MitmProxyError, authority::UpstreamAuthorityCandidates, error::io_er
 pub(crate) type TlsClientStream = StreamOwned<ClientConnection, TcpStream>;
 pub(crate) type TlsServerStream = StreamOwned<ServerConnection, TcpStream>;
 const DYNAMIC_CERT_CACHE_CAPACITY: usize = 1024;
+const MAX_TLS_MATERIAL_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TlsTerminationConfig {
@@ -34,6 +38,7 @@ impl TlsTerminationConfig {
         Self::Static(TlsStaticTerminationConfig {
             certificate_chain,
             private_key,
+            material_roots: AllowedFileRoots::default(),
         })
     }
 
@@ -41,7 +46,16 @@ impl TlsTerminationConfig {
         Self::DynamicCa(TlsDynamicCaTerminationConfig {
             certificate_chain,
             private_key,
+            material_roots: AllowedFileRoots::default(),
         })
+    }
+
+    pub fn with_material_roots(mut self, material_roots: AllowedFileRoots) -> Self {
+        match &mut self {
+            Self::Static(config) => config.material_roots = material_roots,
+            Self::DynamicCa(config) => config.material_roots = material_roots,
+        }
+        self
     }
 }
 
@@ -49,18 +63,21 @@ impl TlsTerminationConfig {
 pub struct TlsStaticTerminationConfig {
     pub certificate_chain: PathBuf,
     pub private_key: PathBuf,
+    pub material_roots: AllowedFileRoots,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TlsDynamicCaTerminationConfig {
     pub certificate_chain: PathBuf,
     pub private_key: PathBuf,
+    pub material_roots: AllowedFileRoots,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UpstreamTlsConfig {
     pub trust_anchors: Vec<PathBuf>,
     pub server_name: Option<String>,
+    pub material_roots: AllowedFileRoots,
 }
 
 impl UpstreamTlsConfig {
@@ -68,7 +85,13 @@ impl UpstreamTlsConfig {
         Self {
             trust_anchors,
             server_name,
+            material_roots: AllowedFileRoots::default(),
         }
+    }
+
+    pub fn with_material_roots(mut self, material_roots: AllowedFileRoots) -> Self {
+        self.material_roots = material_roots;
+        self
     }
 }
 
@@ -89,8 +112,9 @@ impl TlsTerminator {
             .with_no_client_auth();
         let server_config = match config {
             TlsTerminationConfig::Static(config) => {
-                let certificate_chain = load_certificate_chain(&config.certificate_chain)?;
-                let private_key = load_private_key(&config.private_key)?;
+                let certificate_chain =
+                    load_certificate_chain(&config.certificate_chain, &config.material_roots)?;
+                let private_key = load_private_key(&config.private_key, &config.material_roots)?;
                 let resolver = StaticCertResolver::new(
                     certificate_chain,
                     private_key,
@@ -189,7 +213,8 @@ impl DynamicCaCertResolver {
         crypto_provider: Arc<CryptoProvider>,
         application_protocols: ApplicationProtocolPolicy,
     ) -> Result<Self, MitmProxyError> {
-        let certificate_chain = load_certificate_chain(&config.certificate_chain)?;
+        let certificate_chain =
+            load_certificate_chain(&config.certificate_chain, &config.material_roots)?;
         let issuer_certificate = certificate_chain
             .first()
             .ok_or_else(|| {
@@ -200,8 +225,13 @@ impl DynamicCaCertResolver {
             })?
             .clone();
         validate_ca_certificate(&issuer_certificate, &config.certificate_chain)?;
-        validate_ca_key_pair(&issuer_certificate, &config.private_key, &crypto_provider)?;
-        let signing_key = load_rcgen_key_pair(&config.private_key)?;
+        validate_ca_key_pair(
+            &issuer_certificate,
+            &config.private_key,
+            &config.material_roots,
+            &crypto_provider,
+        )?;
+        let signing_key = load_rcgen_key_pair(&config.private_key, &config.material_roots)?;
         let issuer = Issuer::from_ca_cert_der(&issuer_certificate, signing_key)
             .map_err(rcgen_error("parse MITM proxy dynamic TLS CA certificate"))?;
         Ok(Self {
@@ -300,7 +330,7 @@ impl TlsUpstreamConnector {
         config: &UpstreamTlsConfig,
         application_protocols: &ApplicationProtocolPolicy,
     ) -> Result<Self, MitmProxyError> {
-        let roots = load_upstream_roots(&config.trust_anchors)?;
+        let roots = load_upstream_roots(&config.trust_anchors, &config.material_roots)?;
         let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut client_config = ClientConfig::builder_with_provider(crypto_provider)
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
@@ -409,12 +439,16 @@ fn missing_tls_alpn_supported(application_protocols: &ApplicationProtocolPolicy)
         .contains(&ApplicationProtocol::Http1)
 }
 
-fn load_upstream_roots(paths: &[PathBuf]) -> Result<RootCertStore, MitmProxyError> {
+fn load_upstream_roots(
+    paths: &[PathBuf],
+    material_roots: &AllowedFileRoots,
+) -> Result<RootCertStore, MitmProxyError> {
     let mut roots = RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     roots.add_parsable_certificates(native.certs);
     for path in paths {
-        let (added, ignored) = roots.add_parsable_certificates(load_certificate_chain(path)?);
+        let (added, ignored) =
+            roots.add_parsable_certificates(load_certificate_chain(path, material_roots)?);
         if added == 0 || ignored > 0 {
             return Err(MitmProxyError::Tls(format!(
                 "upstream TLS trust anchor {} contained {added} usable certificate(s) and {ignored} unusable certificate(s)",
@@ -431,8 +465,15 @@ fn load_upstream_roots(paths: &[PathBuf]) -> Result<RootCertStore, MitmProxyErro
     Ok(roots)
 }
 
-fn load_certificate_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, MitmProxyError> {
-    let mut reader = pem_reader(path, "open MITM proxy TLS certificate chain")?;
+fn load_certificate_chain(
+    path: &Path,
+    material_roots: &AllowedFileRoots,
+) -> Result<Vec<CertificateDer<'static>>, MitmProxyError> {
+    let mut reader = pem_reader(
+        path,
+        material_roots,
+        "open MITM proxy TLS certificate chain",
+    )?;
     let certificates = rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(io_error("parse MITM proxy TLS certificate chain"))?;
@@ -445,8 +486,11 @@ fn load_certificate_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, M
     Ok(certificates)
 }
 
-fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, MitmProxyError> {
-    let mut reader = pem_reader(path, "open MITM proxy TLS private key")?;
+fn load_private_key(
+    path: &Path,
+    material_roots: &AllowedFileRoots,
+) -> Result<PrivateKeyDer<'static>, MitmProxyError> {
+    let mut reader = pem_reader(path, material_roots, "open MITM proxy TLS private key")?;
     rustls_pemfile::private_key(&mut reader)
         .map_err(io_error("parse MITM proxy TLS private key"))?
         .ok_or_else(|| {
@@ -507,23 +551,65 @@ fn validate_ca_certificate(
 fn validate_ca_key_pair(
     certificate: &CertificateDer<'static>,
     private_key_path: &Path,
+    material_roots: &AllowedFileRoots,
     crypto_provider: &CryptoProvider,
 ) -> Result<(), MitmProxyError> {
-    let private_key = load_private_key(private_key_path)?;
+    let private_key = load_private_key(private_key_path, material_roots)?;
     CertifiedKey::from_der(vec![certificate.clone()], private_key, crypto_provider)
         .map(|_| ())
         .map_err(tls_error("validate MITM proxy dynamic TLS CA key pair"))
 }
 
-fn load_rcgen_key_pair(path: &Path) -> Result<KeyPair, MitmProxyError> {
-    let private_key = load_private_key(path)?;
+fn load_rcgen_key_pair(
+    path: &Path,
+    material_roots: &AllowedFileRoots,
+) -> Result<KeyPair, MitmProxyError> {
+    let private_key = load_private_key(path, material_roots)?;
     KeyPair::try_from(&private_key).map_err(rcgen_error("parse MITM proxy TLS private key"))
 }
 
-fn pem_reader(path: &Path, action: &'static str) -> Result<BufReader<File>, MitmProxyError> {
-    File::open(path)
-        .map(BufReader::new)
-        .map_err(io_error(action))
+fn pem_reader(
+    path: &Path,
+    material_roots: &AllowedFileRoots,
+    action: &'static str,
+) -> Result<BufReader<Cursor<Vec<u8>>>, MitmProxyError> {
+    let file = open_bounded_regular_file_under_roots(path, material_roots, MAX_TLS_MATERIAL_BYTES)
+        .map_err(rooted_bounded_file_error(action))?;
+    validate_owner_private_file(file.metadata()).map_err(owner_private_file_error(action))?;
+    let bytes = file
+        .read()
+        .map(|read| read.into_bytes())
+        .map_err(bounded_file_error(action))?;
+    Ok(BufReader::new(Cursor::new(bytes)))
+}
+
+fn owner_private_file_error(
+    action: &'static str,
+) -> impl FnOnce(OwnerPrivateFileError) -> MitmProxyError {
+    move |error| match error {
+        OwnerPrivateFileError::OwnerMismatch {
+            owner_uid,
+            effective_uid,
+        } => MitmProxyError::Tls(format!(
+            "{action}: TLS material owner uid {owner_uid} does not match MITM proxy effective uid {effective_uid}"
+        )),
+        OwnerPrivateFileError::OwnerUnreadable { mode } => MitmProxyError::Tls(format!(
+            "{action}: TLS material owner read bit is not set; permissions are {mode:o}"
+        )),
+        OwnerPrivateFileError::InsecurePermissions { mode } => MitmProxyError::Tls(format!(
+            "{action}: TLS material has group/other permissions {mode:o}"
+        )),
+    }
+}
+
+fn rooted_bounded_file_error(
+    action: &'static str,
+) -> impl FnOnce(RootedBoundedFileError) -> MitmProxyError {
+    move |error| MitmProxyError::Tls(format!("{action}: {error}"))
+}
+
+fn bounded_file_error(action: &'static str) -> impl FnOnce(BoundedFileError) -> MitmProxyError {
+    move |error| MitmProxyError::Tls(format!("{action}: {error}"))
 }
 
 fn tls_error(action: &'static str) -> impl FnOnce(rustls::Error) -> MitmProxyError {
@@ -542,6 +628,7 @@ fn x509_error<E: std::fmt::Display>(action: &'static str) -> impl FnOnce(E) -> M
 mod tests {
     use std::{
         fs,
+        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
     };
 
@@ -556,7 +643,7 @@ mod tests {
     {
         let root = tempdir()?;
         let empty_anchor = root.path().join("empty.pem");
-        fs::write(&empty_anchor, "")?;
+        write_private_file(&empty_anchor, "")?;
         let config = UpstreamTlsConfig::new(vec![empty_anchor], None);
 
         let error =
@@ -570,6 +657,36 @@ mod tests {
             error
                 .to_string()
                 .contains("did not contain any certificates"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_tls_rejects_trust_anchor_outside_material_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let allowed = root.path().join("allowed");
+        let outside = root.path().join("outside");
+        fs::create_dir(&allowed)?;
+        fs::create_dir(&outside)?;
+        let trust_anchor = outside.join("upstream.pem");
+        write_private_file(&trust_anchor, "")?;
+        let material_roots = AllowedFileRoots::new(vec![allowed])?;
+        let config =
+            UpstreamTlsConfig::new(vec![trust_anchor], None).with_material_roots(material_roots);
+
+        let error =
+            match TlsUpstreamConnector::from_config(&config, &ApplicationProtocolPolicy::default())
+            {
+                Ok(_) => return Err("trust anchor outside material roots should fail".into()),
+                Err(error) => error,
+            };
+
+        assert!(
+            error
+                .to_string()
+                .contains("outside configured filesystem roots"),
             "{error}"
         );
         Ok(())
@@ -631,8 +748,8 @@ mod tests {
         let certified_key = rcgen::generate_simple_self_signed(["localhost".to_string()])?;
         let certificate_path = root.path().join("leaf.pem");
         let private_key_path = root.path().join("leaf.key");
-        fs::write(&certificate_path, certified_key.cert.pem())?;
-        fs::write(&private_key_path, certified_key.signing_key.serialize_pem())?;
+        write_private_file(&certificate_path, certified_key.cert.pem())?;
+        write_private_file(&private_key_path, certified_key.signing_key.serialize_pem())?;
         let config = TlsTerminationConfig::from_ca(certificate_path, private_key_path);
 
         let error = match TlsTerminator::from_config(&config, &ApplicationProtocolPolicy::default())
@@ -685,8 +802,17 @@ mod tests {
         let certificate = params.self_signed(&signing_key)?;
         let certificate_path = root.join(format!("{name}-ca.pem"));
         let private_key_path = root.join(format!("{name}-ca.key"));
-        fs::write(&certificate_path, certificate.pem())?;
-        fs::write(&private_key_path, signing_key.serialize_pem())?;
+        write_private_file(&certificate_path, certificate.pem())?;
+        write_private_file(&private_key_path, signing_key.serialize_pem())?;
         Ok((certificate_path, private_key_path))
+    }
+
+    fn write_private_file(
+        path: &Path,
+        contents: impl AsRef<[u8]>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        fs::write(path, contents)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
     }
 }
