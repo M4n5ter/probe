@@ -628,9 +628,7 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             value["enforcement"]["interception"]["classification"]["flow_classifier"]["reason"],
-            json!(
-                "transparent flow classifier backend is not configured; not/ref transparent interception selectors and any selectors with classifier-only or unconstrained setup branches require flow-aware classification before rule installation"
-            )
+            json!(default_transparent_flow_classifier_reason())
         );
         assert_eq!(
             plan_capability(&value, "transparent_process_classifier")["mode"],
@@ -648,9 +646,7 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             plan_capability(&value, "transparent_flow_classifier")["reason"],
-            json!(
-                "transparent flow classifier backend is not configured; not/ref transparent interception selectors and any selectors with classifier-only or unconstrained setup branches require flow-aware classification before rule installation"
-            )
+            json!(default_transparent_flow_classifier_reason())
         );
         assert_eq!(
             value["enforcement"]["interception"]["capabilities"],
@@ -1142,6 +1138,12 @@ protective_actions = ["alert"]
 
     fn runtime_plan(config: AgentConfig) -> Result<RuntimePlan, runtime::RuntimeError> {
         RuntimePlan::build(config, &runtime_registry(Vec::new()))
+    }
+
+    fn default_transparent_flow_classifier_reason() -> String {
+        PlatformProbeResults::default_transparent_flow_classifier()
+            .reason
+            .expect("default transparent flow classifier should report a reason")
     }
 
     fn build_test_runtime_composition(

@@ -820,9 +820,7 @@ protective_actions = ["alert"]
         );
         assert_eq!(
             value["interception"]["classification"]["flow_classifier"]["reason"],
-            json!(
-                "transparent flow classifier backend is not configured; not/ref transparent interception selectors and any selectors with classifier-only or unconstrained setup branches require flow-aware classification before rule installation"
-            )
+            json!(default_transparent_flow_classifier_reason())
         );
         assert_eq!(
             value["interception"]["capabilities"][0]["capability"],
@@ -1207,6 +1205,12 @@ protective_actions = ["alert"]
             .iter()
             .find(|state| state["capability"] == json!(capability))
             .unwrap_or_else(|| panic!("missing interception capability {capability}"))
+    }
+
+    fn default_transparent_flow_classifier_reason() -> String {
+        runtime::PlatformProbeResults::default_transparent_flow_classifier()
+            .reason
+            .expect("default transparent flow classifier should report a reason")
     }
 
     fn build_test_runtime_composition(

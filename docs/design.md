@@ -853,8 +853,8 @@ TLS 明文与协议能力：
     会继续生成 host rules，不再因为 `ref` 形态本身落到 flow classifier。
   - 已实现：执行入口消费 `ResolvedSelector`。直接绕过 validation/setup composition 传入低层 projection 的 raw `ref`
     不会生成 host rules。
-  - 已实现：`not`、无法保持 process/host branch 相关性的 `any`，以及无法由同一 host boundary 或同一
-    process scope 证明的 classifier-only / unconstrained `any` setup requirement 会落到该 capability。
+  - 已实现：`not`、无法保持 process/host branch 相关性的 `any`，以及其它无法在 setup-time rules
+    中证明 branch 相关性的 `any` setup requirement 会落到该 capability。
   - 边界：还没有 flow-aware classifier。缺失或循环 ref 会在配置/manifest validation 阶段 fail closed；
     绕过 registry 直接传入 setup projection 的 raw ref 不会安装规则。
   - 边界：`any` 在所有分支都不依赖 process/flow classifier、每个分支都有可投影 host scope 时，会投影为有限 host-rule set。

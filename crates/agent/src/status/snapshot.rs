@@ -377,9 +377,7 @@ mod tests {
         );
         assert_eq!(
             status_capability(&value, "transparent_flow_classifier")["reason"],
-            json!(
-                "transparent flow classifier backend is not configured; not/ref transparent interception selectors and any selectors with classifier-only or unconstrained setup branches require flow-aware classification before rule installation"
-            )
+            json!(default_transparent_flow_classifier_reason())
         );
         Ok(())
     }
@@ -1278,6 +1276,12 @@ hooks = ["on_http_request_headers"]
 
     fn runtime_plan_with_exporter() -> Result<RuntimePlan, runtime::RuntimeError> {
         runtime_plan(PathBuf::from("/tmp/traffic-probe-spool"), Vec::new())
+    }
+
+    fn default_transparent_flow_classifier_reason() -> String {
+        runtime::PlatformProbeResults::default_transparent_flow_classifier()
+            .reason
+            .expect("default transparent flow classifier should report a reason")
     }
 
     fn runtime_plan_with_managed_transparent_proxy() -> Result<RuntimePlan, runtime::RuntimeError> {

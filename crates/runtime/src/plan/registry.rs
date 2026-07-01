@@ -16,6 +16,7 @@ const DEFAULT_L7_MITM_UNAVAILABLE_REASON: &str = concat!(
     "and HTTP/2+ ALPN dispatch/routing, strong original attribution, automatic client ",
     "trust store installation, and non-HTTP transparent allow-path matrices remain unavailable"
 );
+const DEFAULT_TRANSPARENT_FLOW_CLASSIFIER_REASON: &str = "transparent flow classifier backend is not configured; not/ref transparent interception selectors and any selector branches that cannot preserve host/process correlation in setup-time rules require flow-aware classification before rule installation";
 
 pub fn default_l7_mitm_unavailable_reason() -> &'static str {
     DEFAULT_L7_MITM_UNAVAILABLE_REASON
@@ -62,7 +63,7 @@ impl PlatformProbeResults {
     pub fn default_transparent_flow_classifier() -> CapabilityState {
         CapabilityState::unavailable(
             CapabilityKind::TransparentFlowClassifier,
-            "transparent flow classifier backend is not configured; not/ref transparent interception selectors and any selectors with classifier-only or unconstrained setup branches require flow-aware classification before rule installation",
+            DEFAULT_TRANSPARENT_FLOW_CLASSIFIER_REASON,
         )
     }
 }
@@ -312,6 +313,19 @@ mod tests {
         assert!(reason.contains("default whole-machine transparent MITM is rejected"));
         assert!(reason.contains("product proxy downstream and upstream TLS relay"));
         assert!(reason.contains("upstream TLS relay"));
+    }
+
+    #[test]
+    fn transparent_flow_classifier_reason_describes_correlation_boundary() {
+        let state = PlatformProbeResults::default_transparent_flow_classifier();
+
+        assert_eq!(state.mode, RuntimeMode::Unavailable);
+        let reason = state
+            .reason
+            .expect("transparent flow classifier should explain why it is unavailable");
+        assert!(reason.contains("cannot preserve host/process correlation"));
+        assert!(!reason.contains("classifier-only"));
+        assert!(!reason.contains("unconstrained setup"));
     }
 
     fn capture_provider(
