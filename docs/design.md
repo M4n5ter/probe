@@ -4738,7 +4738,9 @@ benchmark 参数：
 
 ### 验证矩阵
 
-可执行 case、顺序和 profile 归属以 `xtask e2e-suite --list` 与 `xtask e2e-suite --list-profiles` 为准。本文档只维护稳定的能力覆盖矩阵：
+可执行 case、顺序和 profile 归属以 `xtask e2e-suite --list` 与 `xtask e2e-suite --list-profiles` 为准。本文档只维护稳定的能力覆盖矩阵。
+`xtask e2e-suite --inventory-json` 从同一个 suite registry 输出机器可读 inventory。CI、发布检查和文档生成应消费该
+JSON，而不是维护第二份 case/profile 清单。
 
 | 验证面 | 代表入口 | 权限 | 证明内容 | 不证明 |
 | --- | --- | --- | --- | --- |

@@ -886,6 +886,7 @@ E2E profile 按 capability claim 组织：
 ```bash
 cargo run -p xtask --locked -- e2e-suite --list
 cargo run -p xtask --locked -- e2e-suite --list-profiles
+cargo run -p xtask --locked -- e2e-suite --inventory-json
 ```
 
 运行非特权 baseline：

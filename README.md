@@ -938,6 +938,7 @@ List cases and profiles:
 ```bash
 cargo run -p xtask --locked -- e2e-suite --list
 cargo run -p xtask --locked -- e2e-suite --list-profiles
+cargo run -p xtask --locked -- e2e-suite --inventory-json
 ```
 
 Run the non-privileged baseline:

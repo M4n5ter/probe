@@ -32,6 +32,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             print_profiles();
             ExitCode::SUCCESS
         }
+        SuiteAction::InventoryJson => print_inventory_json(),
         SuiteAction::Run(selection) => {
             let selected = match registry::select_cases(&selection) {
                 Ok(selected) => selected,
@@ -64,6 +65,7 @@ enum SuiteAction {
     Help,
     ListCases,
     ListProfiles,
+    InventoryJson,
     Run(SuiteSelection),
 }
 
@@ -75,6 +77,9 @@ impl SuiteAction {
             Some("--list") => standalone_action(args, "--list", Self::ListCases),
             Some("--list-profiles") => {
                 standalone_action(args, "--list-profiles", Self::ListProfiles)
+            }
+            Some("--inventory-json") => {
+                standalone_action(args, "--inventory-json", Self::InventoryJson)
             }
             Some(_) => SuiteSelection::parse(args).map(Self::Run),
         }
@@ -155,6 +160,12 @@ impl SuiteSelection {
                 "--list-profiles" => {
                     return Err(
                         "--list-profiles cannot be combined with other e2e-suite arguments"
+                            .to_string(),
+                    );
+                }
+                "--inventory-json" => {
+                    return Err(
+                        "--inventory-json cannot be combined with other e2e-suite arguments"
                             .to_string(),
                     );
                 }
@@ -280,9 +291,24 @@ fn print_profiles() {
     }
 }
 
+fn print_inventory_json() -> ExitCode {
+    let inventory = match registry::inventory() {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&inventory).expect("e2e inventory JSON should serialize")
+    );
+    ExitCode::SUCCESS
+}
+
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -p xtask -- e2e-suite [--list | --list-profiles | --profile <name> | --include-privileged | --only-privileged | --case <name> ...]"
+        "usage: cargo run -p xtask -- e2e-suite [--list | --list-profiles | --inventory-json | --profile <name> | --include-privileged | --only-privileged | --case <name> ...]"
     );
 }
 
@@ -485,5 +511,22 @@ mod tests {
             SuiteAction::parse(&args).expect("list profile action"),
             SuiteAction::ListProfiles
         );
+    }
+
+    #[test]
+    fn parses_inventory_json_as_action() {
+        let args = ["--inventory-json".to_string()];
+
+        assert_eq!(
+            SuiteAction::parse(&args).expect("inventory JSON action"),
+            SuiteAction::InventoryJson
+        );
+    }
+
+    #[test]
+    fn rejects_inventory_json_with_run_selection() {
+        let error = parse_error(&["--inventory-json", "--profile", "baseline"]);
+
+        assert!(error.contains("--inventory-json cannot be combined"));
     }
 }

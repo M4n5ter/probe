@@ -1,5 +1,7 @@
 use std::{collections::BTreeSet, process::ExitCode};
 
+use serde::Serialize;
+
 use super::super::{
     E2eOutcome,
     admin_enforcement_reload::run as run_admin_enforcement_reload,
@@ -92,6 +94,15 @@ impl E2eRequirement {
             Self::RootCapNetRaw => "root/CAP_NET_RAW",
             Self::RootBpffs => "root/bpffs",
             Self::RootNetAdmin => "root/net-admin",
+        }
+    }
+
+    pub(super) fn id(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::RootCapNetRaw => "root_cap_net_raw",
+            Self::RootBpffs => "root_bpffs",
+            Self::RootNetAdmin => "root_net_admin",
         }
     }
 }
@@ -626,6 +637,88 @@ pub(super) fn profile_listings() -> Result<Vec<E2eProfileListing>, String> {
         .collect()
 }
 
+pub(super) fn inventory() -> Result<E2eInventory, String> {
+    Ok(E2eInventory {
+        schema_version: 1,
+        cases: E2E_CASES.iter().map(E2eInventoryCase::from_case).collect(),
+        profiles: profile_inventory_rows()?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct E2eInventory {
+    pub(super) schema_version: u16,
+    pub(super) cases: Vec<E2eInventoryCase>,
+    pub(super) profiles: Vec<E2eProfileInventoryRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct E2eInventoryCase {
+    pub(super) name: &'static str,
+    pub(super) requirement: E2eInventoryRequirement,
+}
+
+impl E2eInventoryCase {
+    fn from_case(case: &E2eCase) -> Self {
+        Self {
+            name: case.name,
+            requirement: E2eInventoryRequirement::from_requirement(case.requirement),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(super) struct E2eInventoryRequirement {
+    pub(super) id: &'static str,
+    pub(super) label: &'static str,
+    pub(super) privileged: bool,
+}
+
+impl E2eInventoryRequirement {
+    fn from_requirement(requirement: E2eRequirement) -> Self {
+        Self {
+            id: requirement.id(),
+            label: requirement.label(),
+            privileged: requirement.is_privileged(),
+        }
+    }
+}
+
+fn profile_inventory_rows() -> Result<Vec<E2eProfileInventoryRow>, String> {
+    E2E_PROFILES
+        .iter()
+        .map(|profile| {
+            let cases = select_profile_cases(profile.id)?;
+            Ok(E2eProfileInventoryRow {
+                name: profile.name,
+                description: profile.description,
+                include_in_product: profile.include_in_product,
+                requirements: requirement_ids(&cases),
+                cases: cases.iter().map(|case| case.name).collect(),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct E2eProfileInventoryRow {
+    pub(super) name: &'static str,
+    pub(super) description: &'static str,
+    pub(super) include_in_product: bool,
+    pub(super) requirements: Vec<&'static str>,
+    pub(super) cases: Vec<&'static str>,
+}
+
+fn requirement_ids(cases: &[&E2eCase]) -> Vec<&'static str> {
+    cases
+        .iter()
+        .map(|case| case.requirement)
+        .collect::<BTreeSet<_>>()
+        .iter()
+        .map(|requirement| requirement.id())
+        .collect()
+}
+
 fn requirement_summary(cases: &[&E2eCase]) -> String {
     let requirements = cases
         .iter()
@@ -905,5 +998,68 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(listings, expected);
+    }
+
+    #[test]
+    fn inventory_rows_are_derived_from_profile_selection() {
+        let inventory = inventory().expect("inventory should build from registry");
+        let product = inventory
+            .profiles
+            .iter()
+            .find(|row| row.name == "product")
+            .expect("product profile should be included");
+
+        assert_eq!(inventory.schema_version, 1);
+        assert_eq!(inventory.cases.len(), E2E_CASES.len());
+        assert!(!product.include_in_product);
+        assert_eq!(
+            product.requirements,
+            ["user", "root_cap_net_raw", "root_bpffs", "root_net_admin"]
+        );
+        assert_eq!(
+            inventory
+                .cases
+                .iter()
+                .find(|case| case.name == "e2e-replay")
+                .expect("replay case should be in inventory")
+                .requirement,
+            E2eInventoryRequirement {
+                id: "user",
+                label: "user",
+                privileged: false,
+            }
+        );
+        assert_eq!(
+            product.cases,
+            select_profile_cases(E2eProfileId::Product)
+                .expect("product profile should resolve")
+                .iter()
+                .map(|case| case.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn inventory_serializes_public_schema() {
+        let value =
+            serde_json::to_value(inventory().expect("inventory should build from registry"))
+                .expect("inventory should serialize");
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["cases"][0]["name"], "e2e-replay");
+        assert_eq!(value["cases"][0]["requirement"]["id"], "user");
+        assert_eq!(value["cases"][0]["requirement"]["label"], "user");
+        assert_eq!(value["cases"][0]["requirement"]["privileged"], false);
+        let product = value["profiles"]
+            .as_array()
+            .expect("profiles should be an array")
+            .iter()
+            .find(|profile| profile["name"] == "product")
+            .expect("product profile should serialize");
+        assert_eq!(product["include_in_product"], false);
+        assert_eq!(
+            product["requirements"],
+            serde_json::json!(["user", "root_cap_net_raw", "root_bpffs", "root_net_admin"])
+        );
     }
 }
