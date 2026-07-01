@@ -12,7 +12,7 @@ use runtime::RuntimePlan;
 use storage::FjallSpool;
 use tokio::{
     io::AsyncWriteExt,
-    net::{UnixListener, UnixStream},
+    net::{TcpListener, UnixListener, UnixStream},
     sync::Notify,
     task::JoinSet,
 };
@@ -21,7 +21,7 @@ use pipeline::{PipelinePolicySet, PipelineRuntimeMetrics};
 
 use super::{
     protocol::{AdminRequest, AdminResponse, enforcement_policy_reload_source, read_admin_request},
-    socket::{AdminError, AdminServerConfig, bind_admin_socket},
+    socket::{AdminError, AdminServerConfig, bind_admin_socket, bind_prometheus_listener},
 };
 use crate::capture_provider::CaptureProviderRuntimeState;
 use crate::configured_enforcement::EnforcementRuntimeState;
@@ -57,6 +57,8 @@ pub struct AdminRuntimeState {
 
 pub struct AdminServerHandle {
     socket_path: PathBuf,
+    #[cfg(test)]
+    prometheus_listen_addr: Option<std::net::SocketAddr>,
     stop_requested: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
     task: tokio::task::JoinHandle<()>,
@@ -69,14 +71,29 @@ pub fn spawn_admin_server(
     runtime_state: AdminRuntimeState,
 ) -> Result<AdminServerHandle, AdminError> {
     let listener = bind_admin_socket(&config.socket_path)?;
+    let prometheus_listener = match config.prometheus {
+        Some(prometheus) => match bind_prometheus_listener(prometheus) {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                let _ = fs::remove_file(&config.socket_path);
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+    #[cfg(test)]
+    let prometheus_listen_addr = prometheus_listener
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok());
     let stop_requested = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(Notify::new());
     let task_stop_requested = Arc::clone(&stop_requested);
     let task_shutdown = Arc::clone(&shutdown);
     let runtime_state = Arc::new(runtime_state);
     let task = tokio::spawn(async move {
-        accept_admin_connections(
+        run_admin_surfaces(
             listener,
+            prometheus_listener,
             plan,
             spool,
             runtime_state,
@@ -88,6 +105,8 @@ pub fn spawn_admin_server(
 
     Ok(AdminServerHandle {
         socket_path: config.socket_path,
+        #[cfg(test)]
+        prometheus_listen_addr,
         stop_requested,
         shutdown,
         task,
@@ -95,9 +114,14 @@ pub fn spawn_admin_server(
 }
 
 impl AdminServerHandle {
+    #[cfg(test)]
+    pub fn prometheus_listen_addr(&self) -> Option<std::net::SocketAddr> {
+        self.prometheus_listen_addr
+    }
+
     pub async fn stop(mut self) {
         self.stop_requested.store(true, Ordering::Relaxed);
-        self.shutdown.notify_one();
+        self.shutdown.notify_waiters();
         match tokio::time::timeout(ADMIN_SERVER_SHUTDOWN_TIMEOUT, &mut self.task).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) if !error.is_cancelled() => {
@@ -120,6 +144,43 @@ impl AdminServerHandle {
                 "failed to remove admin socket {}: {error}",
                 self.socket_path.display()
             );
+        }
+    }
+}
+
+async fn run_admin_surfaces(
+    listener: UnixListener,
+    prometheus_listener: Option<TcpListener>,
+    plan: Arc<RuntimePlan>,
+    spool: Arc<FjallSpool>,
+    runtime_state: Arc<AdminRuntimeState>,
+    stop_requested: Arc<AtomicBool>,
+    shutdown: Arc<Notify>,
+) {
+    let mut surfaces = JoinSet::new();
+    surfaces.spawn(accept_admin_connections(
+        listener,
+        Arc::clone(&plan),
+        Arc::clone(&spool),
+        Arc::clone(&runtime_state),
+        Arc::clone(&stop_requested),
+        Arc::clone(&shutdown),
+    ));
+    if let Some(prometheus_listener) = prometheus_listener {
+        surfaces.spawn(super::prometheus::accept_connections(
+            prometheus_listener,
+            plan,
+            spool,
+            runtime_state,
+            stop_requested,
+            shutdown,
+        ));
+    }
+    while let Some(result) = surfaces.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            eprintln!("admin surface task failed: {error}");
         }
     }
 }
@@ -273,7 +334,7 @@ async fn handle_admin_request(
     }
 }
 
-fn build_admin_status_snapshot(
+pub(super) fn build_admin_status_snapshot(
     plan: &RuntimePlan,
     spool: &FjallSpool,
     runtime_state: &AdminRuntimeState,
@@ -369,9 +430,7 @@ mod tests {
         let server = spawn_admin_server(
             Arc::clone(&plan),
             Arc::clone(&spool),
-            AdminServerConfig {
-                socket_path: socket_path.clone(),
-            },
+            AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState::default(),
         )?;
 
@@ -427,9 +486,7 @@ mod tests {
         let server = spawn_admin_server(
             Arc::clone(&plan),
             Arc::clone(&spool),
-            AdminServerConfig {
-                socket_path: socket_path.clone(),
-            },
+            AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState {
                 pipeline: Some(pipeline_metrics),
                 l7_mitm: Some(l7_mitm_runtime),
@@ -561,9 +618,7 @@ mod tests {
         let server = spawn_admin_server(
             Arc::clone(&plan),
             Arc::clone(&spool),
-            AdminServerConfig {
-                socket_path: socket_path.clone(),
-            },
+            AdminServerConfig::unix_socket(socket_path.clone()),
             runtime_state,
         )?;
 
@@ -621,9 +676,7 @@ mod tests {
         let server = spawn_admin_server(
             Arc::clone(&plan),
             Arc::clone(&spool),
-            AdminServerConfig {
-                socket_path: socket_path.clone(),
-            },
+            AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState {
                 enforcement: Some(runtime_state),
                 ..AdminRuntimeState::default()
@@ -694,9 +747,7 @@ mod tests {
         let server = spawn_admin_server(
             Arc::clone(&plan),
             Arc::clone(&spool),
-            AdminServerConfig {
-                socket_path: socket_path.clone(),
-            },
+            AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState::default(),
         )?;
         let mut stream = UnixStream::connect(&socket_path).await?;

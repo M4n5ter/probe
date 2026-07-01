@@ -11,7 +11,10 @@ use runtime::{RuntimePlan, validate_static_runtime_config};
 use storage::FjallSpool;
 
 use crate::{
-    admin::{AdminRuntimeState, AdminServerConfig, AdminServerHandle, spawn_admin_server},
+    admin::{
+        AdminRuntimeState, AdminServerConfig, AdminServerHandle, PrometheusListenerConfig,
+        spawn_admin_server,
+    },
     capture_provider::{
         CaptureProviderPreflight, CaptureProviderRuntimeState, build_capture_provider,
     },
@@ -554,8 +557,15 @@ fn storage_retention_worker_config_from_plan(
 }
 
 fn admin_server_config_from_plan(plan: &RuntimePlan) -> Option<AdminServerConfig> {
-    plan.config.admin.enabled.then(|| AdminServerConfig {
-        socket_path: plan.config.admin.socket_path.clone(),
+    plan.config.admin.enabled.then(|| {
+        let config = AdminServerConfig::unix_socket(plan.config.admin.socket_path.clone());
+        if plan.config.admin.prometheus.enabled {
+            config.with_prometheus(PrometheusListenerConfig {
+                listen_addr: plan.config.admin.prometheus.listen_addr,
+            })
+        } else {
+            config
+        }
     })
 }
 

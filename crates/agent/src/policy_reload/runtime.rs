@@ -161,9 +161,7 @@ mod tests {
         let server = spawn_admin_server(
             Arc::clone(&plan),
             Arc::clone(&spool),
-            AdminServerConfig {
-                socket_path: socket_path.clone(),
-            },
+            AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState {
                 policy_set: policy_set.clone(),
                 ..AdminRuntimeState::default()
@@ -215,9 +213,7 @@ mod tests {
         let server = spawn_admin_server(
             Arc::clone(&plan),
             Arc::clone(&spool),
-            AdminServerConfig {
-                socket_path: socket_path.clone(),
-            },
+            AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState {
                 policy_set: policy_set.clone(),
                 ..AdminRuntimeState::default()

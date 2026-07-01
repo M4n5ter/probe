@@ -119,6 +119,8 @@ Common requirements:
 - `libpcap` development headers and `pkg-config` for the default agent build;
 - root or matching Linux capabilities for live capture, eBPF, socket destroy,
   transparent interception, or MITM tests;
+- `iproute2` with `ss` when enabling
+  `enforcement.backend = "linux_socket_destroy"`;
 - nightly Rust with `rust-src` and `bpf-linker` only when building eBPF
   artifacts.
 
@@ -703,8 +705,10 @@ directions = ["outbound"]
 remote_addresses = []
 ```
 
-Linux socket destroy closes existing TCP sockets only. It is not pre-connect
-deny, UDP blocking, or payload-level blocking.
+Linux socket destroy closes existing TCP sockets only. It uses `ss -K` from
+`iproute2`, discovered at trusted system paths and verified by an active
+loopback self-test before the capability is reported as available. It is not
+pre-connect deny, UDP blocking, or payload-level blocking.
 
 Transparent MITM is a separate strategy. It requires root/net-admin,
 operator-managed client trust, certificate material refs, proxy listener
@@ -790,11 +794,16 @@ Enable the admin socket when online reloads are needed:
 [admin]
 enabled = true
 socket_path = "/run/traffic-probe/admin.sock"
+
+[admin.prometheus]
+enabled = true
+listen_addr = "127.0.0.1:9464"
 ```
 
 Admin reloads validate new policy or enforcement state before swapping runtime
-state. Local watching and remote polling are opt-in. Use local triggers for
-local sources:
+state. The Prometheus listener is read-only, loopback-only, and serves only
+`GET /metrics`; control commands stay on the private Unix socket. Local watching
+and remote polling are opt-in. Use local triggers for local sources:
 
 ```toml
 [policy_reload]

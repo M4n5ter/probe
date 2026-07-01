@@ -1,5 +1,6 @@
 use std::{
     fs,
+    net::{SocketAddr, TcpListener as StdTcpListener},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::UnixStream as StdUnixStream,
@@ -8,7 +9,7 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio::net::UnixListener;
+use tokio::net::{TcpListener, UnixListener};
 
 pub(super) const ADMIN_SOCKET_MODE: u32 = 0o600;
 const ROOT_UID: u32 = 0;
@@ -35,11 +36,38 @@ pub enum AdminError {
         path: String,
         source: std::io::Error,
     },
+    #[error("prometheus metrics listener {listen_addr} is unsafe: {reason}")]
+    UnsafePrometheusListenAddr { listen_addr: String, reason: String },
+    #[error("failed to bind prometheus metrics listener {listen_addr}: {source}")]
+    PrometheusBind {
+        listen_addr: String,
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminServerConfig {
     pub socket_path: PathBuf,
+    pub prometheus: Option<PrometheusListenerConfig>,
+}
+
+impl AdminServerConfig {
+    pub fn unix_socket(socket_path: PathBuf) -> Self {
+        Self {
+            socket_path,
+            prometheus: None,
+        }
+    }
+
+    pub fn with_prometheus(mut self, prometheus: PrometheusListenerConfig) -> Self {
+        self.prometheus = Some(prometheus);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrometheusListenerConfig {
+    pub listen_addr: SocketAddr,
 }
 
 pub(super) fn bind_admin_socket(path: &Path) -> Result<UnixListener, AdminError> {
@@ -59,6 +87,32 @@ pub(super) fn bind_admin_socket(path: &Path) -> Result<UnixListener, AdminError>
         return Err(error);
     }
     Ok(listener)
+}
+
+pub(super) fn bind_prometheus_listener(
+    config: PrometheusListenerConfig,
+) -> Result<TcpListener, AdminError> {
+    if !config.listen_addr.ip().is_loopback() {
+        return Err(AdminError::UnsafePrometheusListenAddr {
+            listen_addr: config.listen_addr.to_string(),
+            reason: "listener must bind to a loopback address".to_string(),
+        });
+    }
+    let listener =
+        StdTcpListener::bind(config.listen_addr).map_err(|source| AdminError::PrometheusBind {
+            listen_addr: config.listen_addr.to_string(),
+            source,
+        })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| AdminError::PrometheusBind {
+            listen_addr: config.listen_addr.to_string(),
+            source,
+        })?;
+    TcpListener::from_std(listener).map_err(|source| AdminError::PrometheusBind {
+        listen_addr: config.listen_addr.to_string(),
+        source,
+    })
 }
 
 fn set_private_admin_socket_permissions(path: &Path) -> Result<(), AdminError> {

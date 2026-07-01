@@ -5,8 +5,9 @@ mod validation;
 
 pub use error::{ConfigError, ConfigValidationError, ConfigViolation};
 pub use model::{
-    AdminConfig, AgentConfig, CaptureBackend, CaptureConfig, CaptureEventFeedCaptureConfig,
-    CaptureSelection, CompressionCodecName, ConnectionEnforcementBackendConfig,
+    AdminConfig, AdminPrometheusConfig, AgentConfig, CaptureBackend, CaptureConfig,
+    CaptureEventFeedCaptureConfig, CaptureSelection, CompressionCodecName,
+    ConnectionEnforcementBackendConfig, DEFAULT_ADMIN_PROMETHEUS_LISTEN_ADDR,
     DEFAULT_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS,
     DEFAULT_ENFORCEMENT_POLICY_RELOAD_WATCH_DEBOUNCE_MS, DEFAULT_EXPORT_BATCHES_PER_SINK_PER_TICK,
     DEFAULT_EXPORT_FAILURE_BACKOFF_INITIAL_MS, DEFAULT_EXPORT_FAILURE_BACKOFF_MAX_MS,

@@ -102,6 +102,10 @@ path = "/etc/traffic-probe/enforcement.toml"
 [admin]
 enabled = true
 socket_path = "/run/traffic-probe/admin.sock"
+
+[admin.prometheus]
+enabled = true
+listen_addr = "127.0.0.1:9464"
 "#,
     )?;
 
@@ -175,6 +179,11 @@ socket_path = "/run/traffic-probe/admin.sock"
     assert_eq!(
         config.admin.socket_path,
         PathBuf::from("/run/traffic-probe/admin.sock")
+    );
+    assert!(config.admin.prometheus.enabled);
+    assert_eq!(
+        config.admin.prometheus.listen_addr,
+        "127.0.0.1:9464".parse()?
     );
     Ok(())
 }

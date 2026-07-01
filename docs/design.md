@@ -681,6 +681,9 @@ TLS 明文与协议能力：
   - 已实现：固定系统路径 `ss -K` TCP socket destroy backend、启动期 loopback socket destroy self-test、执行前 procfs socket owner
     复核和 status/backend reporting。
   - 已实现：active self-test 同时要求 `ss -K` 报告 destroyed socket row，且真实 loopback probe connection 被中断。
+  - 依赖：该 backend 复用 `iproute2` 的 `ss -K`。已评估的 Rust netlink crate 只提供 sock_diag packet/socket
+    building blocks，不提供等价的 TCP socket destroy 高层契约；任何 native netlink 替代 backend 都必须保留同样的
+    capability probe、procfs owner 复核、ACK/error 处理和 active self-test 语义。
   - 边界：默认 `backend = "none"` 不要求 connection capability。
   - 边界：probe 确认 Linux、受信系统路径中的 `ss -K` 入口、root 执行上下文、procfs socket attribution 入口，
     以及当前 namespace/kernel 对本机 loopback TCP socket destroy 的可观察执行语义。
@@ -4252,6 +4255,17 @@ Online admin snapshot：
 - Prometheus adapter 不引入第二份 metrics 事实源。
 - Prometheus labels 不包含 endpoint、路径或 failure reason。
 
+Prometheus listener：
+
+- `[admin.prometheus] enabled = true` 会启动只读 loopback HTTP listener。
+- listener 只接受 `GET /metrics`。
+- 其它 path 返回 `404`，非 `GET` 方法返回 `405`。
+- listener 复用同一在线 snapshot 和 text renderer。
+- TCP listener 不暴露 status、reload 或其它控制命令。
+- 配置校验要求 `admin.enabled = true`。
+- 配置校验要求 `listen_addr` 是 loopback address。
+- 配置校验要求 `listen_addr` 使用非零 port。
+
 Admin reload：
 
 - `reload_policies` 只重载当前配置中的 enabled policy bundles。
@@ -4288,10 +4302,8 @@ Enforcement reload watcher：
 
 - 主配置 reload。
 - debug dump。
-- 可选 localhost Prometheus listener。
 - 后续主配置 reload 和 debug dump 应复用同一 status snapshot 构建器。
 - 后续主配置 reload 和 debug dump 必须承担运行中 agent 的在线状态查询语义。
-- 当前 Prometheus 导出面是 admin socket adapter。
 
 能力：
 
@@ -4305,7 +4317,8 @@ Enforcement reload watcher：
 - future debug dump。
 - exporter status。
 
-默认不监听 TCP，降低攻击面。Prometheus metrics 当前通过 admin socket adapter 导出；可选 localhost listener 后续只应作为同一 text renderer 的监听器外壳。
+默认不监听 TCP，降低攻击面。Prometheus metrics 可通过 admin socket adapter 获取，也可通过显式启用的 loopback-only HTTP listener 被
+scrape；两者共享同一 text renderer。
 
 日志与追踪：
 

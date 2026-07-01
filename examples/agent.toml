@@ -179,6 +179,9 @@ refresh_interval_ms = 1000
 # Use "dry_run" to exercise planner decisions, and "enforce" only with an
 # explicit backend, selector, policy source, and operational approval.
 mode = "audit_only"
+# backend = "linux_socket_destroy" requires root, procfs socket attribution, and
+# iproute2 `ss` at a trusted system path. The agent runs an active loopback
+# destroy self-test before reporting the capability as available.
 backend = "none"
 
 [enforcement.policy.source]
@@ -271,3 +274,9 @@ mode = "none"
 [admin]
 enabled = false
 socket_path = "/run/traffic-probe/admin.sock"
+
+[admin.prometheus]
+# Read-only Prometheus scrape endpoint. It is loopback-only by validation and
+# exposes only GET /metrics; control commands remain on the private Unix socket.
+enabled = false
+listen_addr = "127.0.0.1:9464"

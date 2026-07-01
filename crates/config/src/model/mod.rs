@@ -7,7 +7,7 @@ mod policy;
 mod storage;
 mod tls;
 
-pub use admin::AdminConfig;
+pub use admin::{AdminConfig, AdminPrometheusConfig, DEFAULT_ADMIN_PROMETHEUS_LISTEN_ADDR};
 pub use agent::AgentConfig;
 pub use capture::{
     CaptureBackend, CaptureConfig, CaptureEventFeedCaptureConfig, CaptureSelection,

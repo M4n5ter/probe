@@ -109,6 +109,8 @@ cargo run -p xtask --locked -- e2e-suite --profile baseline
 - 支持 edition 2024 的 stable Rust；
 - 默认 agent build 需要 `libpcap` development headers 和 `pkg-config`；
 - live capture、eBPF、socket destroy、transparent interception 或 MITM 测试需要 root 或对应 Linux capability；
+- 启用 `enforcement.backend = "linux_socket_destroy"` 时需要带 `ss` 的
+  `iproute2`；
 - 只有构建 eBPF artifact 时才需要带 `rust-src` 的 nightly Rust 和 `bpf-linker`。
 
 运行 MITM E2E 时构建 first-party MITM proxy 和 fixture：
@@ -665,8 +667,9 @@ directions = ["outbound"]
 remote_addresses = []
 ```
 
-Linux socket destroy 只关闭已存在的 TCP socket。它不是 pre-connect deny、UDP blocking，
-也不是 payload-level blocking。
+Linux socket destroy 只关闭已存在的 TCP socket。它使用 `iproute2` 提供的
+`ss -K`，agent 只接受受信系统路径中的命令，并在 capability 可用前执行 active loopback
+self-test。它不是 pre-connect deny、UDP blocking，也不是 payload-level blocking。
 
 Transparent MITM 是独立 strategy。它需要 root/net-admin、operator-managed client trust、
 certificate material refs、proxy listener 设置、backend readiness、plaintext bridge 配置和
@@ -750,10 +753,15 @@ closed。
 [admin]
 enabled = true
 socket_path = "/run/traffic-probe/admin.sock"
+
+[admin.prometheus]
+enabled = true
+listen_addr = "127.0.0.1:9464"
 ```
 
-admin reload 会先校验新 policy 或 enforcement state，再替换 runtime state。本地 watcher 和
-remote polling 都需要显式开启。本地 source 使用本地触发器：
+admin reload 会先校验新 policy 或 enforcement state，再替换 runtime state。Prometheus
+listener 是只读、loopback-only 的 `GET /metrics` surface；控制命令仍留在私有 Unix socket。
+本地 watcher 和 remote polling 都需要显式开启。本地 source 使用本地触发器：
 
 ```toml
 [policy_reload]
