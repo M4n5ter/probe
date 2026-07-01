@@ -18,6 +18,21 @@ pub(crate) struct RuntimeComposition {
     transparent_interception: TransparentInterceptionRuntime,
 }
 
+pub(crate) struct RuntimeCompositionBuildError {
+    error: runtime::RuntimeError,
+    capabilities: CapabilityMatrix,
+}
+
+impl RuntimeCompositionBuildError {
+    pub(crate) fn into_error(self) -> AgentError {
+        AgentError::Runtime(self.error)
+    }
+
+    pub(crate) fn into_parts(self) -> (runtime::RuntimeError, CapabilityMatrix) {
+        (self.error, self.capabilities)
+    }
+}
+
 impl RuntimeComposition {
     pub(crate) fn into_plan(self) -> RuntimePlan {
         self.plan
@@ -49,6 +64,13 @@ impl RuntimeComposition {
 pub(crate) fn build_runtime_composition(
     config: AgentConfig,
 ) -> Result<RuntimeComposition, AgentError> {
+    build_runtime_composition_with_diagnostics(config)
+        .map_err(RuntimeCompositionBuildError::into_error)
+}
+
+pub(crate) fn build_runtime_composition_with_diagnostics(
+    config: AgentConfig,
+) -> Result<RuntimeComposition, RuntimeCompositionBuildError> {
     let (connection_enforcement, l7_mitm, transparent_interception) =
         execution_runtimes_for_config(&config);
     let registry = provider_registry_for_runtimes(
@@ -72,8 +94,13 @@ fn build_runtime_composition_from_registry(
     l7_mitm: L7MitmRuntime,
     transparent_interception: TransparentInterceptionRuntime,
     registry: ProviderRegistry,
-) -> Result<RuntimeComposition, AgentError> {
-    let plan = RuntimePlan::build(config, &registry).map_err(AgentError::Runtime)?;
+) -> Result<RuntimeComposition, RuntimeCompositionBuildError> {
+    let capabilities = registry.capability_matrix();
+    let plan =
+        RuntimePlan::build(config, &registry).map_err(|error| RuntimeCompositionBuildError {
+            error,
+            capabilities,
+        })?;
     Ok(RuntimeComposition {
         plan,
         connection_enforcement,
@@ -98,6 +125,7 @@ pub(crate) fn build_runtime_composition_for_test(
         transparent_interception,
         registry,
     )
+    .map_err(RuntimeCompositionBuildError::into_error)
 }
 
 pub(crate) fn capability_matrix_for_config(config: &AgentConfig) -> CapabilityMatrix {

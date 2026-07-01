@@ -693,9 +693,11 @@ TLS 明文与协议能力：
   - 已实现：固定系统路径 `ss -K` TCP socket destroy backend、启动期 loopback socket destroy self-test、执行前 procfs socket owner
     复核和 status/backend reporting。
   - 已实现：active self-test 同时要求 `ss -K` 报告 destroyed socket row，且真实 loopback probe connection 被中断。
-  - 依赖：该 backend 复用 `iproute2` 的 `ss -K`。已评估的 Rust netlink crate 只提供 sock_diag packet/socket
-    building blocks，不提供等价的 TCP socket destroy 高层契约；任何 native netlink 替代 backend 都必须保留同样的
-    capability probe、procfs owner 复核、ACK/error 处理和 active self-test 语义。
+  - 依赖：该 backend 复用 `iproute2` 的 `ss -K`。Rust netlink 生态中已经存在可表达
+    `SOCK_DESTROY` 的底层 building blocks，也存在提供 TCP socket destroy API 的候选 crate；
+    但这不是可直接替换命令的 dependency swap。native netlink backend 必须完整承担精确 flow 查询、
+    procfs owner 复核、ACK/error 分类、capability probe、active self-test 和 destructive E2E 验证后，
+    才能替代当前命令 backend。
   - 边界：默认 `backend = "none"` 不要求 connection capability。
   - 边界：probe 确认 Linux、受信系统路径中的 `ss -K` 入口、root 执行上下文、procfs socket attribution 入口，
     以及当前 namespace/kernel 对本机 loopback TCP socket destroy 的可观察执行语义。
@@ -4126,6 +4128,7 @@ Status snapshot：
 - `health` 表示当前 active capture/spool/exporter 状态。
 - `health` 纳入 policy/enforcement policy 的已知阻断、source unavailable 或 metadata-only 未验证状态。
 - 无效 enforcement 配置在 snapshot 前由 `RuntimePlan` fail closed。
+- 这类配置应使用 `check` 获取结构化 `invalid_config` 诊断；`status` 不输出伪可用 snapshot。
 - capability matrix 和 capability metrics 保持独立，避免把路线图缺口伪装成当前运行故障。
 
 Exporter status：
@@ -4598,9 +4601,10 @@ benchmark 参数：
 - `run`：启动 agent；默认持续运行，`--max-events` 用于对 live provider 做有界采集。`--max-events` 是硬 capture event 数上限，不保证读到 flow close 边界，
   也不替代完整 close/flush 行为验收。
 - `check`：校验配置、resolved runtime plan、TLS plaintext material 内容、enforcement composition 和启用的 policy bundle，输出 JSON check
-  report；缺少可执行 enforcement backend、TLS plaintext material 格式非法或 policy 加载/编译失败时 fail closed。`check` 与 `run` 共用中性的
-  configured policy/enforcement composition helper，避免诊断入口和生产路径各自解释配置。policy snapshot 中的 `registered_hooks` 表示 runtime
-  注册的支持 hook，不表示 Lua source 中实际定义的函数集合。
+  report；RuntimePlan validation 失败时输出 `invalid_config` JSON report，其中包含 validation violations 和同一配置下的 capability
+  matrix，然后以非零状态退出。缺少可执行 enforcement backend、TLS plaintext material 格式非法或 policy 加载/编译失败时 fail closed。
+  `check` 与 `run` 共用中性的 configured policy/enforcement composition helper，避免诊断入口和生产路径各自解释配置。policy snapshot 中的
+  `registered_hooks` 表示 runtime 注册的支持 hook，不表示 Lua source 中实际定义的函数集合。
 - `status`：输出 runtime/admin/metrics snapshot。
 - `replay`：用 pcap/spool 样本跑 parser/policy/exporter。
 - `capabilities`：输出 capability matrix；可选 `--config` 时按配置中的 provider-specific 输入做能力探测，否则使用默认配置。
@@ -5428,6 +5432,7 @@ random、cipher suite 与 validity window。
 
 #### agent check 覆盖
 
+- RuntimePlan validation failure 输出 `invalid_config` report，保留 validation violations 和 capability matrix，并保持非零退出。
 - 显式 key log refs 与 `session_secret_file` refs 通过 typed store 解析为 secret-free summary。
 - keylog-only live auto-binding material 被 `check` 接受。
 - 缺失 live keylog 以 pending/not_found 进入 report。

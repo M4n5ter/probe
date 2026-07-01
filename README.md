@@ -853,9 +853,11 @@ agent run --config ./agent.toml
 agent replay --input ./traffic.http --spool ./spool --policy ./policy.lua
 ```
 
-`capabilities`, `check`, and `status` return JSON for automation. `run` starts
-the configured agent. `replay` sends one byte stream through the same parser,
-policy, spool, and optional webhook path without live-capture privileges.
+`capabilities`, `check`, and `status` return JSON for automation. When runtime
+validation fails, `check` prints an `invalid_config` JSON report with violations
+and the capability matrix, then exits non-zero. `run` starts the configured
+agent. `replay` sends one byte stream through the same parser, policy, spool,
+and optional webhook path without live-capture privileges.
 
 ## Verification
 

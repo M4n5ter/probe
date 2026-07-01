@@ -809,9 +809,10 @@ agent run --config ./agent.toml
 agent replay --input ./traffic.http --spool ./spool --policy ./policy.lua
 ```
 
-`capabilities`、`check` 和 `status` 返回适合自动化消费的 JSON。`run` 启动配置化 agent。
-`replay` 将单个 byte stream 接入同一 parser、policy、spool 和可选 webhook path，不需要
-live-capture 权限。
+`capabilities`、`check` 和 `status` 返回适合自动化消费的 JSON。runtime validation 失败时，
+`check` 会输出包含 violations 和 capability matrix 的 `invalid_config` JSON report，然后以非零状态退出。
+`run` 启动配置化 agent。`replay` 将单个 byte stream 接入同一 parser、policy、spool 和可选
+webhook path，不需要 live-capture 权限。
 
 ## 验证
 

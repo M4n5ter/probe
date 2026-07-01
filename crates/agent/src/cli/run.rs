@@ -11,7 +11,7 @@ use exporter::CompressionCodec;
 use parsers::Http1ParserFactory;
 use pipeline::{CapturePipeline, PipelinePolicy};
 use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
-use probe_config::AgentConfig;
+use probe_config::{AgentConfig, ConfigValidationError};
 use probe_core::{
     AddressPort, Direction, EnforcementMode, FlowContext, FlowIdentity, ProcessContext,
     ProcessIdentity, Timestamp, TransportProtocol,
@@ -19,11 +19,14 @@ use probe_core::{
 use storage::FjallSpool;
 
 use crate::{
-    check::build_check_report,
+    check::{build_check_report, build_invalid_config_report},
     error::AgentError,
     export::drain_replay_webhook,
     live_agent::{ReadinessSignal, RunOptions, run_live_agent},
-    runtime_composition::{build_runtime_composition, capability_matrix_for_config},
+    runtime_composition::{
+        build_runtime_composition, build_runtime_composition_with_diagnostics,
+        capability_matrix_for_config,
+    },
     status::{build_status_snapshot, collect_spool_status},
 };
 
@@ -151,10 +154,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             run_live_agent(agent_config, run_options_from_env(max_events)?).await?;
         }
         Command::Check { config } => {
-            let runtime = read_runtime_composition(&config)?;
-            let (plan, enforcement_backend) = runtime.into_enforcement_parts();
-            let report = build_check_report(plan, enforcement_backend).await?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            run_check_command(&config).await?;
         }
         Command::Capabilities { config } => {
             let config = match config {
@@ -226,6 +226,64 @@ fn read_runtime_composition(
 ) -> Result<crate::runtime_composition::RuntimeComposition, AgentError> {
     let config = read_config(path)?;
     build_runtime_composition(config)
+}
+
+async fn run_check_command(path: &PathBuf) -> Result<(), AgentError> {
+    let config = read_config(path)?;
+    emit_check_command_output(build_check_command_output(config).await?)
+}
+
+enum CheckCommandOutput {
+    Success {
+        stdout: String,
+    },
+    InvalidConfig {
+        stdout: String,
+        validation: ConfigValidationError,
+    },
+}
+
+impl CheckCommandOutput {
+    fn stdout(&self) -> &str {
+        match self {
+            Self::Success { stdout } | Self::InvalidConfig { stdout, .. } => stdout,
+        }
+    }
+}
+
+fn emit_check_command_output(output: CheckCommandOutput) -> Result<(), AgentError> {
+    println!("{}", output.stdout());
+    match output {
+        CheckCommandOutput::Success { .. } => Ok(()),
+        CheckCommandOutput::InvalidConfig { validation, .. } => Err(AgentError::Runtime(
+            runtime::RuntimeError::Validation(validation),
+        )),
+    }
+}
+
+async fn build_check_command_output(config: AgentConfig) -> Result<CheckCommandOutput, AgentError> {
+    match build_runtime_composition_with_diagnostics(config) {
+        Ok(runtime) => {
+            let (plan, enforcement_backend) = runtime.into_enforcement_parts();
+            let report = build_check_report(plan, enforcement_backend).await?;
+            Ok(CheckCommandOutput::Success {
+                stdout: serde_json::to_string_pretty(&report)?,
+            })
+        }
+        Err(error) => {
+            let (error, capabilities) = error.into_parts();
+            match error {
+                runtime::RuntimeError::Validation(validation) => {
+                    let report = build_invalid_config_report(&validation, capabilities);
+                    Ok(CheckCommandOutput::InvalidConfig {
+                        stdout: serde_json::to_string_pretty(&report)?,
+                        validation,
+                    })
+                }
+                error => Err(AgentError::Runtime(error)),
+            }
+        }
+    }
 }
 
 fn read_config_or_default(path: Option<&PathBuf>) -> Result<AgentConfig, AgentError> {
@@ -382,6 +440,12 @@ mod tests {
                 config: Some(config),
                 max_events,
             },
+        }
+    }
+
+    fn check_cli(config: PathBuf) -> Cli {
+        Cli {
+            command: Command::Check { config },
         }
     }
 
@@ -676,6 +740,77 @@ protective_actions = ["alert"]
         assert!(
             !spool_path.exists(),
             "spool must not be opened before runtime validation passes"
+        );
+
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_reports_runtime_validation_failure_without_opening_spool()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("check-invalid-runtime")?;
+        let config_path = temp.join("agent.toml");
+        let enforcement_path = temp.join("enforcement.toml");
+        let spool_path = temp.join("spool");
+
+        fs::write(
+            &enforcement_path,
+            r#"
+id = "managed-apps"
+version = "test-version"
+protective_actions = ["alert"]
+"#,
+        )?;
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+        config.storage.path = spool_path.clone();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: enforcement_path,
+        };
+        fs::write(&config_path, toml::to_string(&config)?)?;
+
+        let output = build_check_command_output(config).await?;
+        let CheckCommandOutput::InvalidConfig { stdout, .. } = output else {
+            panic!("runtime validation failure must produce invalid_config output")
+        };
+        let value: serde_json::Value = serde_json::from_str(&stdout)?;
+        assert_eq!(value["kind"], "invalid_config");
+        let reason = value["validation"]["violations"][0]["reason"]
+            .as_str()
+            .expect("validation reason should be a string");
+        assert!(
+            reason.contains("enforce mode requires at least one enforcement execution surface")
+        );
+        assert!(reason.contains("connection backend"));
+        let states = value["capabilities"]["states"]
+            .as_array()
+            .expect("capability states should be an array");
+        assert!(states.iter().any(|state| {
+            state["kind"] == "connection_enforcement" && state["mode"] == "unavailable"
+        }));
+        assert!(
+            !spool_path.exists(),
+            "check output builder must not open spool before runtime validation passes"
+        );
+
+        let error = run(check_cli(config_path))
+            .await
+            .expect_err("check must fail closed when runtime validation fails");
+
+        assert!(
+            matches!(&error, AgentError::Runtime(_)),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("at least one enforcement execution surface")
+        );
+        assert!(
+            !spool_path.exists(),
+            "check must not open spool before runtime validation passes"
         );
 
         fs::remove_dir_all(temp)?;

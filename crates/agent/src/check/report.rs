@@ -7,6 +7,8 @@ use crate::{
 };
 use ::enforcement::EnforcementBackend;
 use policy::PolicyHook;
+use probe_config::ConfigValidationError;
+use probe_core::CapabilityMatrix;
 use runtime::RuntimePlan;
 use serde::Serialize;
 use thiserror::Error;
@@ -39,6 +41,30 @@ pub struct CheckReport {
     pub tls: TlsCheckSnapshot,
     pub policy: PolicyCheckSnapshot,
     pub enforcement: EnforcementCheckSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckInvalidConfigReport {
+    pub kind: CheckInvalidConfigReportKind,
+    pub validation: CheckValidationSnapshot,
+    pub capabilities: CapabilityMatrix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckInvalidConfigReportKind {
+    InvalidConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckValidationSnapshot {
+    pub violations: Vec<CheckViolationSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckViolationSnapshot {
+    pub field: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -78,6 +104,26 @@ pub async fn build_check_report(
         policy,
         enforcement,
     })
+}
+
+pub fn build_invalid_config_report(
+    error: &ConfigValidationError,
+    capabilities: CapabilityMatrix,
+) -> CheckInvalidConfigReport {
+    CheckInvalidConfigReport {
+        kind: CheckInvalidConfigReportKind::InvalidConfig,
+        validation: CheckValidationSnapshot {
+            violations: error
+                .violations()
+                .iter()
+                .map(|violation| CheckViolationSnapshot {
+                    field: violation.field.clone(),
+                    reason: violation.reason.clone(),
+                })
+                .collect(),
+        },
+        capabilities,
+    }
 }
 
 async fn check_policy(plan: &RuntimePlan) -> Result<PolicyCheckSnapshot, CheckError> {
@@ -123,15 +169,16 @@ mod tests {
     };
 
     use probe_config::{
-        AgentConfig, CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig,
-        TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
+        AgentConfig, CaptureBackend, CaptureSelection, ConfigValidationError, ConfigViolation,
+        ConnectionEnforcementBackendConfig, TlsMaterialConfig, TlsMaterialKind,
+        TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
-        Action, CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector,
-        ProtectiveActionProfile, Selector, TrafficSelector,
+        Action, CapabilityKind, CapabilityMatrix, CapabilityState, Direction, EnforcementMode,
+        ProcessSelector, ProtectiveActionProfile, Selector, TrafficSelector,
     };
     use runtime::{
         CaptureProviderBuilder, CaptureProviderDescriptor, PlatformProbeResults, ProviderRegistry,
@@ -151,6 +198,46 @@ mod tests {
 
     const MITM_BRIDGE_CAPTURE_EVENT_FEED_PATH: &str =
         "/run/traffic-probe/mitm-capture-events.jsonl";
+
+    #[test]
+    fn invalid_config_report_serializes_violations_and_capabilities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let error = ConfigValidationError::new(vec![ConfigViolation {
+            field: "enforcement.backend".to_string(),
+            reason: "linux socket destroy enforcement requires ss at a trusted system path"
+                .to_string(),
+        }]);
+        let capabilities = CapabilityMatrix::new([CapabilityState::unavailable(
+            CapabilityKind::ConnectionEnforcement,
+            "linux socket destroy enforcement requires ss at a trusted system path",
+        )]);
+
+        let report = build_invalid_config_report(&error, capabilities);
+        let value = serde_json::to_value(report)?;
+
+        assert_eq!(value["kind"], json!("invalid_config"));
+        assert_eq!(
+            value["validation"]["violations"][0]["field"],
+            json!("enforcement.backend")
+        );
+        assert_eq!(
+            value["validation"]["violations"][0]["reason"],
+            json!("linux socket destroy enforcement requires ss at a trusted system path")
+        );
+        assert_eq!(
+            value["capabilities"]["states"][0]["kind"],
+            json!("connection_enforcement")
+        );
+        assert_eq!(
+            value["capabilities"]["states"][0]["mode"],
+            json!("unavailable")
+        );
+        assert_eq!(
+            value["capabilities"]["states"][0]["reason"],
+            json!("linux socket destroy enforcement requires ss at a trusted system path")
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn check_report_loads_enabled_policy_bundle() -> Result<(), Box<dyn std::error::Error>> {
