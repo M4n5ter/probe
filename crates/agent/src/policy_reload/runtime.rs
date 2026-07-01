@@ -175,6 +175,7 @@ mod tests {
         assert_eq!(response["kind"], json!("policy_reload"));
         assert_eq!(response["loaded_count"], json!(1));
         assert_eq!(response["policies"][0]["id"], json!("guard"));
+        assert_eq!(response["active_set_updated"], json!(true));
         run_policy_request(spool.as_ref(), policy_set, "/after", 2)?;
         assert_eq!(
             policy_alert_messages(spool.as_ref())?,

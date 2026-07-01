@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
+use serde_json::Value;
 
 use crate::{
     admin::{AdminRequest, send_admin_json_request},
@@ -17,6 +18,7 @@ pub(super) enum AdminCliCommand {
         #[arg(long)]
         config: PathBuf,
     },
+    ReloadRuntimeActions,
     ReloadPolicies,
     ReloadEnforcementPolicy,
 }
@@ -34,6 +36,7 @@ pub(super) async fn run_admin_command(
             .unwrap_or("admin command returned an error");
         return Err(AgentError::AdminCommand(message.to_string()));
     }
+    let runtime_action_error = runtime_actions_error_message(&response);
     if print_prometheus
         && let Some(metrics) = response.get("metrics").and_then(|metrics| metrics.as_str())
     {
@@ -41,6 +44,9 @@ pub(super) async fn run_admin_command(
         return Ok(());
     }
     println!("{}", serde_json::to_string_pretty(&response)?);
+    if let Some(message) = runtime_action_error {
+        return Err(AgentError::AdminCommand(message));
+    }
     Ok(())
 }
 
@@ -53,9 +59,39 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
         AdminCliCommand::PlanConfigReload { config } => {
             AdminRequest::PlanConfigReload { path: config }
         }
+        AdminCliCommand::ReloadRuntimeActions => AdminRequest::ReloadRuntimeActions,
         AdminCliCommand::ReloadPolicies => AdminRequest::ReloadPolicies,
         AdminCliCommand::ReloadEnforcementPolicy => AdminRequest::ReloadEnforcementPolicy,
     }
+}
+
+fn runtime_actions_error_message(response: &Value) -> Option<String> {
+    if response.get("kind").and_then(Value::as_str) != Some("runtime_actions_reload") {
+        return None;
+    }
+    let failures = response
+        .get("actions")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(runtime_action_failure)
+        .collect::<Vec<_>>();
+    (!failures.is_empty()).then(|| format!("runtime reload action failed: {}", failures.join("; ")))
+}
+
+fn runtime_action_failure(action: &Value) -> Option<String> {
+    let outcome = action.get("outcome")?;
+    if outcome.get("result").and_then(Value::as_str) != Some("failed") {
+        return None;
+    }
+    let action_name = action
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_action");
+    let message = outcome
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("failed");
+    Some(format!("{action_name}: {message}"))
 }
 
 #[cfg(test)]
@@ -86,6 +122,10 @@ mod tests {
             }
         );
         assert_eq!(
+            admin_request(AdminCliCommand::ReloadRuntimeActions),
+            AdminRequest::ReloadRuntimeActions
+        );
+        assert_eq!(
             admin_request(AdminCliCommand::ReloadPolicies),
             AdminRequest::ReloadPolicies
         );
@@ -93,5 +133,57 @@ mod tests {
             admin_request(AdminCliCommand::ReloadEnforcementPolicy),
             AdminRequest::ReloadEnforcementPolicy
         );
+    }
+
+    #[test]
+    fn runtime_actions_error_message_reports_failed_actions() {
+        let response = serde_json::json!({
+            "kind": "runtime_actions_reload",
+            "actions": [
+                {
+                    "action": "reload_policies",
+                    "outcome": {
+                        "result": "succeeded",
+                        "loaded_count": 1,
+                        "policies": [],
+                        "active_set_updated": true
+                    }
+                },
+                {
+                    "action": "reload_enforcement_policy",
+                    "outcome": {
+                        "result": "failed",
+                        "message": "failed to reload enforcement policy: invalid manifest"
+                    }
+                }
+            ]
+        });
+
+        assert_eq!(
+            runtime_actions_error_message(&response).as_deref(),
+            Some(
+                "runtime reload action failed: reload_enforcement_policy: failed to reload enforcement policy: invalid manifest"
+            )
+        );
+    }
+
+    #[test]
+    fn runtime_actions_error_message_ignores_successful_actions() {
+        let response = serde_json::json!({
+            "kind": "runtime_actions_reload",
+            "actions": [
+                {
+                    "action": "reload_policies",
+                    "outcome": {
+                        "result": "succeeded",
+                        "loaded_count": 1,
+                        "policies": [],
+                        "active_set_updated": false
+                    }
+                }
+            ]
+        });
+
+        assert_eq!(runtime_actions_error_message(&response), None);
     }
 }

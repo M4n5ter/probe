@@ -4373,13 +4373,14 @@ Admin socket：
 - JSON-lines 协议支持 `{"command":"prometheus_metrics"}`。
 - JSON-lines 协议支持 `{"command":"debug_dump"}`。
 - JSON-lines 协议支持 `{"command":"plan_config_reload","path":"/etc/probe/agent.toml"}`。
+- JSON-lines 协议支持 `{"command":"reload_runtime_actions"}`。
 - JSON-lines 协议支持 `{"command":"reload_policies"}`。
 - JSON-lines 协议支持 `{"command":"reload_enforcement_policy"}`。
 - `debug_dump` 复用在线 status snapshot builder，并附带 admin protocol inventory 和 privacy declaration；它包含 runtime
   plan/status 字段和本地路径，但不包含 raw config 文本或 secret material 字节。
 - `agent admin --socket <path> <command>` 是该 JSON-lines 协议的一等 CLI client；`status`、`metrics`、`debug-dump`、
-  `plan-config-reload --config <path>`、`reload-policies` 和 `reload-enforcement-policy` 输出 JSON，`prometheus-metrics`
-  输出 text exposition。
+  `plan-config-reload --config <path>`、`reload-runtime-actions`、`reload-policies` 和
+  `reload-enforcement-policy` 输出 JSON，`prometheus-metrics` 输出 text exposition。
 - admin socket parent directory 必须由部署层预创建。
 - parent directory 不能是 symlink。
 - parent directory 不能允许 group/other 访问。
@@ -4428,20 +4429,26 @@ Config reload planning：
   和 admin 拆分 changed sections。
 - 每个 changed section 携带 restart reason，说明该 top-level 配置域绑定的运行时 owner。
 - 响应同时列出无需主配置热替换即可使用的 runtime actions：`reload_policies` 和 `reload_enforcement_policy`。
+- `reload_runtime_actions` 可执行 active `RuntimePlan` 下可安全在线切换的 runtime actions。
 - 该命令不替换 active config。
 - 该命令不启动、停止或重建 capture/export/TLS/admin/interception owner。
 
 Admin reload：
 
+- reload commands 只作用于 active `RuntimePlan` 已经拥有可交换 runtime owner 的资源。
+- reload commands 不重读主 TOML，不替换 active config，也不改变 capture/export/TLS/admin/interception 配置。
+- `reload_runtime_actions` 执行当前可在线切换的 runtime actions，并按 action 独立返回 `succeeded` 或 `failed` outcome。
+- 单个 action 失败不会吞掉其它 action 的成功结果。
+- CLI client 会打印完整 `runtime_actions_reload` JSON；任一 action outcome 为 `failed` 时，命令以非零状态退出。
+
+| Command | Runtime owner | Success response | Failure behavior |
+| --- | --- | --- | --- |
+| `reload_runtime_actions` | 当前可在线切换的 runtime owner 集合 | 每个 action 的独立 outcome | 返回 `runtime_actions_reload`，失败 action 进入 `failed` outcome |
+| `reload_policies` | active pipeline policy set | `loaded_count`、policy sources、`active_set_updated` | 返回 error，保留旧 active policy set |
+| `reload_enforcement_policy` | active enforcement planner/policy state | source、selector 状态、protective action profile | 返回 error，保留旧 active enforcement policy |
+
 - `reload_policies` 只重载当前配置中的 enabled policy bundles。
 - `reload_enforcement_policy` 只重载当前 `RuntimePlan` 中的 enforcement policy source。
-- enforcement reload 返回 source。
-- enforcement reload 返回 manifest selector 是否配置。
-- enforcement reload 返回 effective selector 是否配置。
-- enforcement reload 返回 protective action profile。
-- 两者都不重读主 TOML。
-- 两者都不拉取远程控制面。
-- 两者都不改变 capture/export/TLS 配置。
 - 透明接管 setup-time host rules 尚无在线 mutation owner 时，enforcement policy reload 会 fail closed。
 
 Policy reload watcher：
@@ -5810,6 +5817,11 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
   plan fail-fast。
 - enforcement source loader 测试覆盖 directory source 的 symlink manifest directory 拒绝，admin reload、watcher reload、
   `check` 和 `run` 共享该 source invariant。
+
+#### Admin reload command 覆盖
+
+- admin protocol inventory 测试覆盖 `reload_runtime_actions`、`reload_policies` 和 `reload_enforcement_policy` 的 mutating 标记。
+- admin reload runtime actions 测试覆盖 per-action outcome：policy reload 成功和 enforcement runtime state 缺失失败会在同一响应中独立呈现。
 
 #### Admin reload E2E 覆盖
 

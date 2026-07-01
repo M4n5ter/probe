@@ -3,6 +3,7 @@ mod config_reload;
 mod debug_dump;
 mod prometheus;
 mod protocol;
+mod reload;
 mod server;
 mod socket;
 

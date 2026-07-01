@@ -22,15 +22,16 @@ use pipeline::{PipelinePolicySet, PipelineRuntimeMetrics};
 use super::{
     config_reload::plan_config_reload,
     debug_dump::AdminDebugDump,
-    protocol::{AdminRequest, AdminResponse, enforcement_policy_reload_source, read_admin_request},
+    protocol::{AdminRequest, AdminResponse, read_admin_request},
+    reload::{RuntimeReloadAction, reload_action_response, reload_runtime_actions_response},
     socket::{AdminError, AdminServerConfig, bind_admin_socket, bind_prometheus_listener},
 };
 use crate::capture_provider::CaptureProviderRuntimeState;
 use crate::configured_enforcement::EnforcementRuntimeState;
-use crate::enforcement_reload::{EnforcementReloadGate, reload_enforcement_policy};
+use crate::enforcement_reload::EnforcementReloadGate;
 use crate::export::ExportWorkerRuntimeState;
 use crate::l7_mitm::L7MitmRuntimeHandle;
-use crate::policy_reload::{PolicyReloadGate, reload_policies};
+use crate::policy_reload::PolicyReloadGate;
 use crate::status::{
     AgentStatusSnapshot, EnforcementRuntimeStatusInput, PROMETHEUS_TEXT_CONTENT_TYPE,
     RuntimeStatusInput, build_status_snapshot_with_runtime, collect_running_spool_status,
@@ -275,44 +276,18 @@ async fn handle_admin_request(
 ) -> AdminResponse {
     match request {
         AdminRequest::ReloadPolicies => {
-            match reload_policies(
-                plan,
-                &runtime_state.policy_set,
-                &runtime_state.policy_reload_gate,
-            )
-            .await
-            {
-                Ok(summary) => AdminResponse::PolicyReload {
-                    loaded_count: summary.loaded_count,
-                    policies: summary.policies,
-                },
-                Err(source) => AdminResponse::Error {
-                    message: format!("failed to reload policies: {source}"),
-                },
-            }
+            reload_action_response(RuntimeReloadAction::ReloadPolicies, plan, runtime_state).await
         }
         AdminRequest::ReloadEnforcementPolicy => {
-            match reload_enforcement_policy(
+            reload_action_response(
+                RuntimeReloadAction::ReloadEnforcementPolicy,
                 plan,
-                runtime_state.enforcement.as_ref(),
-                &runtime_state.enforcement_reload_gate,
+                runtime_state,
             )
             .await
-            {
-                Ok(summary) => AdminResponse::EnforcementPolicyReload {
-                    source: enforcement_policy_reload_source(&summary.active_policy),
-                    effective_selector_configured: summary
-                        .active_policy
-                        .effective_selector_configured(),
-                    manifest_selector_configured: summary
-                        .active_policy
-                        .manifest_selector_configured(),
-                    protective_actions: summary.active_policy.protective_actions().clone(),
-                },
-                Err(source) => AdminResponse::Error {
-                    message: format!("failed to reload enforcement policy: {source}"),
-                },
-            }
+        }
+        AdminRequest::ReloadRuntimeActions => {
+            reload_runtime_actions_response(plan, runtime_state).await
         }
         AdminRequest::Status => {
             let snapshot = build_admin_status_snapshot(plan, spool, runtime_state);
@@ -527,6 +502,7 @@ mod tests {
                 { "name": "prometheus_metrics", "mutating": false },
                 { "name": "debug_dump", "mutating": false },
                 { "name": "plan_config_reload", "mutating": false },
+                { "name": "reload_runtime_actions", "mutating": true },
                 { "name": "reload_policies", "mutating": true },
                 { "name": "reload_enforcement_policy", "mutating": true },
             ])
@@ -924,6 +900,57 @@ mod tests {
         assert_eq!(
             status["snapshot"]["enforcement"]["policy"]["source"]["manifest"]["protective_actions"],
             json!(["reset"])
+        );
+
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_reload_runtime_actions_reports_each_action_independently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-runtime-actions-reload")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let plan = Arc::new(runtime_plan(spool_path)?);
+        let server = spawn_admin_server(
+            Arc::clone(&plan),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState::default(),
+        )?;
+
+        let response =
+            send_admin_request(&socket_path, json!({ "command": "reload_runtime_actions" }))
+                .await?;
+
+        assert_eq!(response["kind"], json!("runtime_actions_reload"));
+        assert_eq!(
+            response["actions"][0],
+            json!({
+                "action": "reload_policies",
+                "outcome": {
+                    "result": "succeeded",
+                    "loaded_count": 0,
+                    "policies": [],
+                    "active_set_updated": true,
+                }
+            })
+        );
+        assert_eq!(
+            response["actions"][1]["action"],
+            json!("reload_enforcement_policy")
+        );
+        assert_eq!(response["actions"][1]["outcome"]["result"], json!("failed"));
+        assert!(
+            response["actions"][1]["outcome"]["message"]
+                .as_str()
+                .is_some_and(
+                    |message| message.contains("enforcement runtime state is not available")
+                )
         );
 
         server.stop().await;

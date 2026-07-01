@@ -834,16 +834,19 @@ enabled = true
 listen_addr = "127.0.0.1:9464"
 ```
 
-admin reload 会先校验新 policy 或 enforcement state，再替换 runtime state。候选主配置也可以
-解析并做静态校验，然后报告 `no_change`、`restart_required` 或 `invalid_candidate`；
-这是规划入口，不会在线替换 capture、export、TLS、admin 或 interception owner，也不会执行
-setup-time active probes。候选配置读取要求 regular file，会拒绝 symlink 和超限文件，
-parse error 不回显 raw config line。Prometheus listener 是只读、loopback-only 的
-`GET /metrics` surface；控制命令仍留在私有 Unix socket。runtime status 和 metrics 会暴露 capture
-input activity、pipeline progress、spool/export state、policy/enforcement counters、
-TLS plaintext activity 和 proxy health。capture input activity 包含最近 signal kind、
-sequence 和 observation time，但不把该 activity 解释为 kernel link liveness。admin CLI
-会通过 Unix socket 发送同一套 JSON-lines 命令：
+admin reload 会先校验新 policy 或 enforcement state，再替换 runtime state。
+`reload-runtime-actions` 会执行 active `RuntimePlan` 下安全的 runtime action，并独立报告每个
+action 的结果，因此 enforcement reload 失败不会掩盖 policy reload 成功。CLI 会先打印完整 JSON response，
+再在任一 action outcome 为 `failed` 时以非零状态退出。候选主配置也可以解析并做静态校验，然后报告
+`no_change`、`restart_required` 或 `invalid_candidate`；这是规划入口，不会在线替换
+capture、export、TLS、admin 或 interception owner，也不会执行 setup-time active probes。候选配置读取要求
+regular file，会拒绝 symlink 和超限文件，parse error 不回显 raw config line。
+
+Prometheus listener 是只读、loopback-only 的 `GET /metrics` surface；控制命令仍留在私有 Unix
+socket。runtime status 和 metrics 会暴露 capture input activity、pipeline progress、
+spool/export state、policy/enforcement counters、TLS plaintext activity 和 proxy health。
+capture input activity 包含最近 signal kind、sequence 和 observation time，但不把该 activity 解释为
+kernel link liveness。admin CLI 会通过 Unix socket 发送同一套 JSON-lines 命令：
 
 ```bash
 cargo run -p agent -- admin \
@@ -853,6 +856,10 @@ cargo run -p agent -- admin \
 cargo run -p agent -- admin \
   --socket /run/traffic-probe/admin.sock \
   plan-config-reload --config /etc/probe/agent.toml
+
+cargo run -p agent -- admin \
+  --socket /run/traffic-probe/admin.sock \
+  reload-runtime-actions
 
 cargo run -p agent -- admin \
   --socket /run/traffic-probe/admin.sock \

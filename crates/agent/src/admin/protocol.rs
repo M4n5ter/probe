@@ -47,6 +47,7 @@ admin_requests! {
     PrometheusMetrics => ("prometheus_metrics", false),
     DebugDump => ("debug_dump", false),
     PlanConfigReload { path: PathBuf } => ("plan_config_reload", false),
+    ReloadRuntimeActions => ("reload_runtime_actions", true),
     ReloadPolicies => ("reload_policies", true),
     ReloadEnforcementPolicy => ("reload_enforcement_policy", true),
 }
@@ -70,19 +71,50 @@ pub(super) enum AdminResponse {
     ConfigReloadPlan {
         plan: Box<ConfigReloadPlanSnapshot>,
     },
-    PolicyReload {
-        loaded_count: u64,
-        policies: Vec<ConfiguredPolicySource>,
+    PolicyReload(PolicyReloadSuccess),
+    RuntimeActionsReload {
+        actions: Vec<RuntimeReloadActionResult>,
     },
-    EnforcementPolicyReload {
-        source: EnforcementPolicyReloadSource,
-        effective_selector_configured: bool,
-        manifest_selector_configured: Option<bool>,
-        protective_actions: probe_core::ProtectiveActionProfile,
-    },
+    EnforcementPolicyReload(EnforcementPolicyReloadSuccess),
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct PolicyReloadSuccess {
+    pub loaded_count: u64,
+    pub policies: Vec<ConfiguredPolicySource>,
+    pub active_set_updated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct EnforcementPolicyReloadSuccess {
+    pub source: EnforcementPolicyReloadSource,
+    pub effective_selector_configured: bool,
+    pub manifest_selector_configured: Option<bool>,
+    pub protective_actions: probe_core::ProtectiveActionProfile,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case", tag = "action", content = "outcome")]
+pub(super) enum RuntimeReloadActionResult {
+    ReloadPolicies(RuntimeReloadPolicyOutcome),
+    ReloadEnforcementPolicy(RuntimeReloadEnforcementOutcome),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case", tag = "result")]
+pub(super) enum RuntimeReloadPolicyOutcome {
+    Succeeded(PolicyReloadSuccess),
+    Failed { message: String },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case", tag = "result")]
+pub(super) enum RuntimeReloadEnforcementOutcome {
+    Succeeded(EnforcementPolicyReloadSuccess),
+    Failed { message: String },
 }
 
 #[derive(Debug, Serialize)]
