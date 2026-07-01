@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+attribution = { version = "0.1.0", path = "../attribution" }
 capture = { version = "0.1.0", path = "../capture" }
 ebpf-object = { version = "0.1.0", path = "../ebpf-object" }
 e2e-support = { version = "0.1.0", path = "../e2e-support" }

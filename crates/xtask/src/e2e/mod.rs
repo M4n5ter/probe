@@ -2,6 +2,8 @@ mod admin_enforcement_reload;
 mod admin_policy_reload;
 mod capture_loss_event_feed;
 mod ebpf_process_loopback;
+mod ebpf_process_output_loss;
+mod ebpf_procfs_resolver;
 mod enforcement_manifest;
 mod file_exporter;
 mod gap_plaintext_feed;

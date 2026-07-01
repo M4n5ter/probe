@@ -6,6 +6,7 @@ use super::super::{
     admin_policy_reload::run as run_admin_policy_reload,
     capture_loss_event_feed::run as run_capture_loss_event_feed,
     ebpf_process_loopback::run as run_ebpf_process_loopback,
+    ebpf_process_output_loss::run as run_ebpf_process_output_loss,
     file_exporter::run as run_file_exporter,
     gap_plaintext_feed::run as run_gap_plaintext_feed,
     libpcap_loopback::run as run_libpcap_loopback,
@@ -229,6 +230,11 @@ const E2E_CASES: &[E2eCase] = &[
         run: E2eCaseRun::ExitCode(run_ebpf_process_loopback),
     },
     E2eCase {
+        name: "e2e-ebpf-process-output-loss",
+        requirement: E2eRequirement::RootBpffs,
+        run: E2eCaseRun::ExitCode(run_ebpf_process_output_loss),
+    },
+    E2eCase {
         name: "e2e-tls-plaintext-provider-loopback",
         requirement: E2eRequirement::RootBpffs,
         run: E2eCaseRun::ExitCode(run_tls_plaintext_provider_loopback),
@@ -422,7 +428,10 @@ const E2E_PROFILES: &[E2eProfile] = &[
         name: "process-ebpf",
         description: "root/bpffs eBPF process observation suite",
         include_in_product: true,
-        cases: E2eProfileCases::Named(&["e2e-ebpf-process-loopback"]),
+        cases: E2eProfileCases::Named(&[
+            "e2e-ebpf-process-loopback",
+            "e2e-ebpf-process-output-loss",
+        ]),
     },
     E2eProfile {
         id: E2eProfileId::TlsPlaintext,
@@ -684,7 +693,10 @@ mod tests {
             name: "process-ebpf",
             requirements: "root/bpffs",
             description: "root/bpffs eBPF process observation suite",
-            cases: ExpectedProfileCases::Named(&["e2e-ebpf-process-loopback"]),
+            cases: ExpectedProfileCases::Named(&[
+                "e2e-ebpf-process-loopback",
+                "e2e-ebpf-process-output-loss",
+            ]),
         },
         ExpectedProfile {
             name: "tls-plaintext",
@@ -759,6 +771,7 @@ mod tests {
                 "e2e-tls-keylog-auto-binding-loopback",
                 "e2e-tls-keylog-material-refresh-auto-binding-loopback",
                 "e2e-ebpf-process-loopback",
+                "e2e-ebpf-process-output-loss",
                 "e2e-tls-plaintext-provider-loopback",
                 "e2e-tls-plaintext-loopback",
                 "e2e-tls-plaintext-dynamic-loopback",

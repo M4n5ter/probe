@@ -868,7 +868,8 @@ E2E profiles are organized around capability claims:
   polled remote policy inputs.
 - `live-core` needs root or CAP_NET_RAW and covers libpcap loopback, admin
   reload, socket destroy, and TLS key log/session-secret material.
-- `process-ebpf` needs root/bpffs and covers eBPF process observation.
+- `process-ebpf` needs root/bpffs and covers eBPF process observation plus
+  real process ring-buffer output loss.
 - `tls-plaintext` needs root/bpffs and covers the libssl plaintext provider
   and attach lifecycle.
 - `transparent-interception` needs root/net-admin and covers inbound TPROXY,

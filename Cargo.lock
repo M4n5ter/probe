@@ -3331,6 +3331,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "attribution",
  "capture",
  "e2e-support",
  "ebpf-object",
