@@ -561,13 +561,13 @@ mod tests {
     use bytes::Bytes;
 
     use crate::{
-        Action, BodyChunk, CaptureLoss, Direction, DomainEvent, EnforcementDecision,
-        EnforcementExecutionEvidence, EnforcementMode, EnforcementOutcome, EventKind, EventType,
-        Gap, HttpHeaders, L7MitmAuditEvent, L7MitmAuditPhase, L7MitmExternalBackendAudit,
-        L7MitmManagedProcessAudit, L7MitmManagedProcessBackendAudit, L7MitmReadinessProbeAudit,
-        OpaqueStream, PolicyRuntimeError, ProtocolError, ProxySideEnforcementSurface, SseEvent,
-        Verdict, VerdictScope, WebSocketFrame, WebSocketHandoff, WebSocketMessage,
-        WebSocketMessageOpcode, WebSocketOpcode,
+        Action, BodyChunk, CaptureLoss, ConnectionBackendExecutionEvidence, Direction, DomainEvent,
+        EnforcementDecision, EnforcementExecutionEvidence, EnforcementMode, EnforcementOutcome,
+        EventKind, EventType, Gap, HttpHeaders, L7MitmAuditEvent, L7MitmAuditPhase,
+        L7MitmExternalBackendAudit, L7MitmManagedProcessAudit, L7MitmManagedProcessBackendAudit,
+        L7MitmReadinessProbeAudit, OpaqueStream, PolicyRuntimeError, ProtocolError,
+        ProxySideEnforcementSurface, SseEvent, Verdict, VerdictScope, WebSocketFrame,
+        WebSocketHandoff, WebSocketMessage, WebSocketMessageOpcode, WebSocketOpcode,
     };
 
     #[test]
@@ -682,6 +682,44 @@ mod tests {
         assert_eq!(value["execution"]["surface"], "l7_mitm");
         assert_eq!(value["execution"]["executed_action"], "deny");
         assert_eq!(value["execution"]["reason"], "proxy blocked request");
+        Ok(())
+    }
+
+    #[test]
+    fn enforcement_decision_connection_backend_execution_evidence_has_stable_wire_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let kind = EventKind::EnforcementDecision(EnforcementDecision {
+            mode: EnforcementMode::Enforce,
+            outcome: EnforcementOutcome::Applied,
+            requested_action: Action::Reset,
+            effective_action: Action::Reset,
+            scope: VerdictScope::Flow,
+            selector_matched: true,
+            execution: Some(EnforcementExecutionEvidence::ConnectionBackend {
+                evidence: ConnectionBackendExecutionEvidence::LinuxSocketDestroy {
+                    destroyed_socket_count: 1,
+                    socket_inode: 123,
+                    owner_verification_confidence: 60,
+                },
+            }),
+            reason: "Linux socket destroy connection backend applied Reset".to_string(),
+        });
+
+        let value = serde_json::to_value(&kind)?;
+
+        assert_eq!(value["type"], "enforcement_decision");
+        assert_eq!(value["execution"]["kind"], "connection_backend");
+        assert_eq!(
+            value["execution"]["evidence"]["surface"],
+            "linux_socket_destroy"
+        );
+        assert_eq!(value["execution"]["evidence"]["destroyed_socket_count"], 1);
+        assert_eq!(value["execution"]["evidence"]["socket_inode"], 123);
+        assert_eq!(
+            value["execution"]["evidence"]["owner_verification_confidence"],
+            60
+        );
+        assert_eq!(serde_json::from_value::<EventKind>(value)?, kind);
         Ok(())
     }
 

@@ -6,8 +6,9 @@ use probe_config::{
     EnforcementPolicySourceConfig, PolicyConfig,
 };
 use probe_core::{
-    Action, CaptureProviderKind, CaptureSource, Direction, EnforcementMode, EnforcementOutcome,
-    EventKind, ProcessSelector, ProtectiveActionProfile, Selector, TrafficSelector, VerdictScope,
+    Action, CaptureProviderKind, CaptureSource, ConnectionBackendExecutionEvidence, Direction,
+    EnforcementExecutionEvidence, EnforcementMode, EnforcementOutcome, EventKind, ProcessSelector,
+    ProtectiveActionProfile, Selector, TrafficSelector, VerdictScope,
 };
 use storage::FjallSpool;
 
@@ -279,6 +280,18 @@ fn assert_spool_outputs(
             || !decision
                 .reason
                 .contains("netlink SOCK_DESTROY destroyed TCP socket")
+            || !matches!(
+                decision.execution.as_ref(),
+                Some(EnforcementExecutionEvidence::ConnectionBackend {
+                    evidence: ConnectionBackendExecutionEvidence::LinuxSocketDestroy {
+                        destroyed_socket_count,
+                        socket_inode,
+                        owner_verification_confidence,
+                    },
+                }) if *destroyed_socket_count > 0
+                    && *socket_inode > 0
+                    && *owner_verification_confidence > 0
+            )
         {
             return None;
         }
@@ -300,7 +313,7 @@ fn assert_spool_outputs(
                 };
                 let flow = envelope.flow()?;
                 Some(format!(
-                    "source={:?}/{:?} policy={:?} mode={:?} requested={:?} outcome={:?} effective={:?} selector_matched={} local={}:{} remote={}:{} process={} exe={} reason={}",
+                    "source={:?}/{:?} policy={:?} mode={:?} requested={:?} outcome={:?} effective={:?} selector_matched={} local={}:{} remote={}:{} process={} exe={} execution={:?} reason={}",
                     envelope.origin().source(),
                     envelope.origin().provider(),
                     envelope.policy_version(),
@@ -315,6 +328,7 @@ fn assert_spool_outputs(
                     flow.remote.port,
                     flow.process.name,
                     flow.process.identity.exe_path,
+                    decision.execution,
                     decision.reason,
                 ))
             })

@@ -742,7 +742,9 @@ remote_addresses = []
 
 Linux socket destroy 只关闭已存在的 TCP socket。它使用 `NETLINK_SOCK_DIAG`
 和 `SOCK_DESTROY`，并在 capability 可用前执行 active loopback self-test。
-它不是 pre-connect deny、UDP blocking，也不是 payload-level blocking。
+它不是 pre-connect deny、UDP blocking，也不是 payload-level blocking。成功销毁会在导出的
+`EnforcementDecision` 中写入 typed `connection_backend/linux_socket_destroy` mechanism
+evidence；顶层 `effective_action` 表达 planner 接受的策略动作。
 
 Transparent MITM 是独立 strategy。它需要 root/net-admin、operator-managed client trust、
 certificate material refs、proxy listener 设置、backend readiness、plaintext bridge 配置和

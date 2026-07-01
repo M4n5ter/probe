@@ -787,7 +787,10 @@ remote_addresses = []
 Linux socket destroy closes existing TCP sockets only. It uses
 `NETLINK_SOCK_DIAG` with `SOCK_DESTROY`, verified by an active loopback
 self-test before the capability is reported as available. It is not pre-connect
-deny, UDP blocking, or payload-level blocking.
+deny, UDP blocking, or payload-level blocking. Successful destroys emit typed
+`connection_backend/linux_socket_destroy` mechanism evidence in the exported
+`EnforcementDecision`; the top-level `effective_action` carries the policy
+action accepted by the planner.
 
 Transparent MITM is a separate strategy. It requires root/net-admin,
 operator-managed client trust, certificate material refs, proxy listener

@@ -42,9 +42,9 @@ pub use socket::{
     UpstreamRouteHost, UpstreamRouteHostPattern, socket_addr_points_to_listener,
 };
 pub use verdict::{
-    Action, EnforcementDecision, EnforcementExecutionEvidence, EnforcementMode, EnforcementOutcome,
-    ProtectiveActionError, ProtectiveActionProfile, ProxySideEnforcementSurface, Verdict,
-    VerdictScope,
+    Action, ConnectionBackendExecutionEvidence, ConnectionEnforcementSurface, EnforcementDecision,
+    EnforcementExecutionEvidence, EnforcementMode, EnforcementOutcome, ProtectiveActionError,
+    ProtectiveActionProfile, ProxySideEnforcementSurface, Verdict, VerdictScope,
 };
 pub use webhook::{
     RESERVED_WEBHOOK_HEADERS, WEBHOOK_CODEC_HEADER, WEBHOOK_CONTENT_TYPE_HEADER,

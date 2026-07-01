@@ -2,7 +2,7 @@ use enforcement::{
     EnforcementBackend, EnforcementBackendDecision, EnforcementBackendRequest,
     linux_socket_destroy::{SocketDestroy, SocketDestroyOutcome, SocketDestroyRequest},
 };
-use probe_core::TcpConnection;
+use probe_core::{ConnectionBackendExecutionEvidence, TcpConnection};
 
 use super::owner::{FlowOwnerVerification, FlowOwnerVerifier};
 
@@ -77,10 +77,18 @@ where
             }
         };
 
-        Ok(EnforcementBackendDecision::applied(format!(
+        let reason = format!(
             "netlink SOCK_DESTROY destroyed {destroyed_count} TCP socket(s) for flow {} using {:?} after procfs owner verification matched inode {} with confidence {}",
             flow.id.0, request.verdict.action, socket_inode, confidence
-        )))
+        );
+        Ok(EnforcementBackendDecision::applied_with_execution(
+            reason,
+            ConnectionBackendExecutionEvidence::LinuxSocketDestroy {
+                destroyed_socket_count: destroyed_count as u64,
+                socket_inode,
+                owner_verification_confidence: confidence,
+            },
+        ))
     }
 }
 
@@ -95,9 +103,9 @@ mod tests {
     use enforcement::{EnforcementPlanRequest, EnforcementPlanner, ScopedEnforcementPlanner};
     use probe_core::{
         Action, AddressPort, CaptureOrigin, CaptureSource, Direction, EnforcementDecision,
-        EventEnvelope, EventKind, FlowContext, FlowIdentity, OpaqueStream, ProcessContext,
-        ProcessIdentity, ProtectiveActionProfile, TcpConnection, Timestamp, TransportProtocol,
-        Verdict, VerdictScope,
+        EnforcementExecutionEvidence, EventEnvelope, EventKind, FlowContext, FlowIdentity,
+        OpaqueStream, ProcessContext, ProcessIdentity, ProtectiveActionProfile, TcpConnection,
+        Timestamp, TransportProtocol, Verdict, VerdictScope,
     };
 
     use super::*;
@@ -148,6 +156,16 @@ mod tests {
         );
         assert_eq!(decision.outcome, probe_core::EnforcementOutcome::Applied);
         assert_eq!(decision.effective_action, Action::Reset);
+        assert_eq!(
+            decision.execution,
+            Some(EnforcementExecutionEvidence::ConnectionBackend {
+                evidence: ConnectionBackendExecutionEvidence::LinuxSocketDestroy {
+                    destroyed_socket_count: 1,
+                    socket_inode: 123,
+                    owner_verification_confidence: 60,
+                }
+            })
+        );
         Ok(())
     }
 

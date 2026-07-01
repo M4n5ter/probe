@@ -133,6 +133,38 @@ impl ProxySideEnforcementSurface {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionEnforcementSurface {
+    LinuxSocketDestroy,
+}
+
+impl ConnectionEnforcementSurface {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::LinuxSocketDestroy => "Linux socket destroy connection backend",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "surface", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConnectionBackendExecutionEvidence {
+    LinuxSocketDestroy {
+        destroyed_socket_count: u64,
+        socket_inode: u64,
+        owner_verification_confidence: u8,
+    },
+}
+
+impl ConnectionBackendExecutionEvidence {
+    pub fn surface(&self) -> ConnectionEnforcementSurface {
+        match self {
+            Self::LinuxSocketDestroy { .. } => ConnectionEnforcementSurface::LinuxSocketDestroy,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EnforcementExecutionEvidence {
@@ -140,6 +172,9 @@ pub enum EnforcementExecutionEvidence {
         surface: ProxySideEnforcementSurface,
         executed_action: Action,
         reason: String,
+    },
+    ConnectionBackend {
+        evidence: ConnectionBackendExecutionEvidence,
     },
 }
 

@@ -1,6 +1,6 @@
 use probe_core::{
-    Action, EnforcementExecutionEvidence, EnforcementOutcome, EventEnvelope,
-    ProxySideEnforcementSurface, Verdict,
+    Action, ConnectionBackendExecutionEvidence, EnforcementExecutionEvidence, EnforcementOutcome,
+    EventEnvelope, ProxySideEnforcementSurface, Verdict,
 };
 
 use crate::{EnforcementError, decision::EnforcementDecisionParts};
@@ -14,6 +14,7 @@ pub struct EnforcementBackendRequest<'a> {
 pub struct EnforcementBackendDecision {
     result: EnforcementBackendResult,
     reason: String,
+    execution: Option<ConnectionBackendExecutionEvidence>,
 }
 
 impl EnforcementBackendDecision {
@@ -21,6 +22,18 @@ impl EnforcementBackendDecision {
         Self {
             result: EnforcementBackendResult::Applied,
             reason: reason.into(),
+            execution: None,
+        }
+    }
+
+    pub fn applied_with_execution(
+        reason: impl Into<String>,
+        execution: ConnectionBackendExecutionEvidence,
+    ) -> Self {
+        Self {
+            result: EnforcementBackendResult::Applied,
+            reason: reason.into(),
+            execution: Some(execution),
         }
     }
 
@@ -28,6 +41,7 @@ impl EnforcementBackendDecision {
         Self {
             result: EnforcementBackendResult::Unsupported,
             reason: reason.into(),
+            execution: None,
         }
     }
 
@@ -35,16 +49,30 @@ impl EnforcementBackendDecision {
         self,
         requested_action: Action,
     ) -> EnforcementDecisionParts {
+        let reason = self.reason;
         match self.result {
-            EnforcementBackendResult::Applied => EnforcementDecisionParts::new(
-                EnforcementOutcome::Applied,
-                requested_action,
-                self.reason,
-            ),
+            EnforcementBackendResult::Applied => {
+                if let Some(execution) = self.execution {
+                    EnforcementDecisionParts::with_execution(
+                        EnforcementOutcome::Applied,
+                        requested_action,
+                        reason,
+                        EnforcementExecutionEvidence::ConnectionBackend {
+                            evidence: execution,
+                        },
+                    )
+                } else {
+                    EnforcementDecisionParts::new(
+                        EnforcementOutcome::Applied,
+                        requested_action,
+                        reason,
+                    )
+                }
+            }
             EnforcementBackendResult::Unsupported => EnforcementDecisionParts::new(
                 EnforcementOutcome::Unsupported,
                 Action::Observe,
-                self.reason,
+                reason,
             ),
         }
     }
