@@ -22,6 +22,9 @@ const RUNTIME_MODES: [RuntimeMode; 3] = [
     RuntimeMode::Unavailable,
 ];
 
+const OPTIONAL_TRACEPOINT_PAIR_MODES: [RuntimeMode; 2] =
+    [RuntimeMode::Available, RuntimeMode::Unavailable];
+
 const TRANSPARENT_PROXY_HEALTH_PROBE_MODES: [TransparentProxyHealthProbeMode; 4] = [
     TransparentProxyHealthProbeMode::Disabled,
     TransparentProxyHealthProbeMode::Pending,
@@ -819,8 +822,10 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
         "gauge",
         "Whether eBPF process observation link ownership metrics are present in this snapshot.",
     );
-    let Some(CaptureProviderRuntimeDetailsSnapshot::EbpfProcessObservation { link_ownership }) =
-        &snapshot.capture.provider
+    let Some(CaptureProviderRuntimeDetailsSnapshot::EbpfProcessObservation {
+        link_ownership,
+        optional_tracepoint_pairs,
+    }) = &snapshot.capture.provider
     else {
         write_sample(
             output,
@@ -877,6 +882,23 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
             ],
             program.owned_link_count,
         );
+    }
+
+    write_family(
+        output,
+        "traffic_probe_ebpf_process_observation_optional_tracepoint_pair_mode",
+        "gauge",
+        "Optional eBPF process observation tracepoint pair availability as a one-hot gauge.",
+    );
+    for pair in optional_tracepoint_pairs {
+        for mode in OPTIONAL_TRACEPOINT_PAIR_MODES {
+            write_sample(
+                output,
+                "traffic_probe_ebpf_process_observation_optional_tracepoint_pair_mode",
+                &[("family", pair.family_name), ("mode", mode.wire_name())],
+                u64::from(pair.mode == mode),
+            );
+        }
     }
 }
 
@@ -1368,20 +1390,25 @@ mod tests {
                     reason: Some("kernel observer is best-effort".to_string()),
                     open_failures: Vec::new(),
                     provider: Some(CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(
-                        capture::EbpfProcessObservationLinkOwnershipSnapshot::owned_by_programs([
-                            capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
-                                "connect_enter",
-                                "syscalls",
-                                "sys_enter_connect",
-                                1,
-                            ),
-                            capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
-                                "connect_exit",
-                                "syscalls",
-                                "sys_exit_connect",
-                                1,
-                            ),
-                        ]),
+                        capture::EbpfProcessObservationProbeSnapshot::from_link_ownership_and_optional_pairs(
+                            capture::EbpfProcessObservationLinkOwnershipSnapshot::owned_by_programs([
+                                    capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
+                                        "connect_enter",
+                                        "syscalls",
+                                        "sys_enter_connect",
+                                        1,
+                                    ),
+                                    capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
+                                        "connect_exit",
+                                        "syscalls",
+                                        "sys_exit_connect",
+                                        1,
+                                    ),
+                                ]),
+                            [capture::EbpfProcessObservationOptionalTracepointPairSnapshot::kernel_missing(
+                                capture::EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS[0],
+                            )],
+                        ),
                     )),
                 }),
                 ..RuntimeStatusInput::default()
@@ -1405,6 +1432,15 @@ mod tests {
         ));
         assert!(metrics.contains(
             "traffic_probe_ebpf_process_observation_program_owned_links{program_name=\"connect_exit\",category=\"syscalls\",tracepoint=\"sys_exit_connect\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_optional_tracepoint_pair_mode{family=\"sendfile\",mode=\"available\"} 0\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_optional_tracepoint_pair_mode{family=\"sendfile\",mode=\"unavailable\"} 1\n"
+        ));
+        assert!(!metrics.contains(
+            "traffic_probe_ebpf_process_observation_optional_tracepoint_pair_mode{family=\"sendfile\",mode=\"degraded\"}"
         ));
         Ok(())
     }
@@ -1479,7 +1515,7 @@ mod tests {
                     open_failures: Vec::new(),
                     provider: Some(
                         CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(
-                            capture::EbpfProcessObservationLinkOwnershipSnapshot::unreported(),
+                            capture::EbpfProcessObservationProbeSnapshot::unreported(),
                         ),
                     ),
                 }),

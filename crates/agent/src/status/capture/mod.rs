@@ -142,20 +142,25 @@ mod tests {
             open_failures: Vec::new(),
             provider: Some(
                 crate::capture_provider::CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(
-                    capture::EbpfProcessObservationLinkOwnershipSnapshot::owned_by_programs([
-                        capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
-                            "connect_enter",
-                            "syscalls",
-                            "sys_enter_connect",
-                            1,
-                        ),
-                        capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
-                            "connect_exit",
-                            "syscalls",
-                            "sys_exit_connect",
-                            1,
-                        ),
-                    ]),
+                    capture::EbpfProcessObservationProbeSnapshot::from_link_ownership_and_optional_pairs(
+                        capture::EbpfProcessObservationLinkOwnershipSnapshot::owned_by_programs([
+                            capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
+                                "connect_enter",
+                                "syscalls",
+                                "sys_enter_connect",
+                                1,
+                            ),
+                            capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
+                                "connect_exit",
+                                "syscalls",
+                                "sys_exit_connect",
+                                1,
+                            ),
+                        ]),
+                        [capture::EbpfProcessObservationOptionalTracepointPairSnapshot::attached(
+                            capture::EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS[0],
+                        )],
+                    ),
                 ),
             ),
         };
@@ -184,6 +189,22 @@ mod tests {
         assert_eq!(
             provider["link_ownership"]["programs"][0]["tracepoint_name"],
             serde_json::json!("sys_enter_connect")
+        );
+        assert_eq!(
+            provider["optional_tracepoint_pairs"][0]["family_name"],
+            serde_json::json!("sendfile")
+        );
+        assert_eq!(
+            provider["optional_tracepoint_pairs"][0]["mode"],
+            serde_json::json!("available")
+        );
+        assert_eq!(
+            provider["optional_tracepoint_pairs"][0]["enter_tracepoint_name"],
+            serde_json::json!("sys_enter_sendfile")
+        );
+        assert_eq!(
+            provider["optional_tracepoint_pairs"][0]["exit_tracepoint_name"],
+            serde_json::json!("sys_exit_sendfile")
         );
         Ok(())
     }

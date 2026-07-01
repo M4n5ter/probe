@@ -12,9 +12,8 @@ use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider};
 
 use super::super::{
     EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation,
-    EbpfProcessLifecycleObservation, EbpfProcessObservation,
-    EbpfProcessObservationLinkOwnershipSnapshot, EbpfProcessObservationProbe,
-    EbpfProcessObservationProbeConfig, EbpfSocketFlowResolver,
+    EbpfProcessLifecycleObservation, EbpfProcessObservation, EbpfProcessObservationProbe,
+    EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeSnapshot, EbpfSocketFlowResolver,
     bridge::output_loss_event,
     clock::EbpfObservationClock,
     flow_start::{PendingEbpfFlowResolution, PendingEbpfFlowStart},
@@ -44,7 +43,7 @@ pub struct EbpfProcessObservationProvider {
     pending_flows: VecDeque<PendingEbpfFlowResolution>,
     pending_events: VecDeque<CaptureEvent>,
     output_loss: OutputLossTracker,
-    link_ownership: EbpfProcessObservationLinkOwnershipSnapshot,
+    probe_snapshot: EbpfProcessObservationProbeSnapshot,
 }
 
 impl EbpfProcessObservationProvider {
@@ -55,7 +54,7 @@ impl EbpfProcessObservationProvider {
     ) -> Result<Self, CaptureError> {
         let probe = EbpfProcessObservationProbe::load(config)
             .map_err(|error| CaptureError::provider("ebpf", error.to_string()))?;
-        let link_ownership = probe.link_ownership();
+        let probe_snapshot = probe.probe_snapshot();
         Ok(Self {
             observations: Box::new(ProbeObservationSource { probe }),
             resolver,
@@ -68,12 +67,12 @@ impl EbpfProcessObservationProvider {
             pending_flows: VecDeque::new(),
             pending_events: VecDeque::new(),
             output_loss: OutputLossTracker::default(),
-            link_ownership,
+            probe_snapshot,
         })
     }
 
-    pub fn link_ownership(&self) -> EbpfProcessObservationLinkOwnershipSnapshot {
-        self.link_ownership.clone()
+    pub fn probe_snapshot(&self) -> EbpfProcessObservationProbeSnapshot {
+        self.probe_snapshot.clone()
     }
 
     fn poll_event(&mut self) -> Result<CapturePoll, CaptureError> {
@@ -422,7 +421,7 @@ mod tests {
                 pending_flows: VecDeque::new(),
                 pending_events: VecDeque::new(),
                 output_loss: OutputLossTracker::default(),
-                link_ownership: EbpfProcessObservationLinkOwnershipSnapshot::unreported(),
+                probe_snapshot: EbpfProcessObservationProbeSnapshot::unreported(),
             }
         }
 

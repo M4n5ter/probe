@@ -42,7 +42,7 @@ pub(super) fn build_ebpf_capture_provider(
         deep_observe_selector,
     )?;
     let provider_details = Some(
-        CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(provider.link_ownership()),
+        CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(provider.probe_snapshot()),
     );
     Ok(OpenedLiveCaptureBackend {
         provider: Box::new(provider) as Box<dyn CaptureProvider>,

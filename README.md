@@ -182,7 +182,8 @@ configuration:
   kernel-assisted process-aware observation. It needs root/bpffs and a built
   eBPF object. Deep observation is selector-gated; syscall payload bytes are
   degraded evidence, and available `sendfile(2)`/`sendfile64(2)` tracepoint
-  variants produce byte-count gaps rather than payload bytes.
+  variants produce byte-count gaps rather than payload bytes. Runtime status
+  reports which optional syscall variants the running kernel exposes.
 - libssl uprobe:
   best-effort TLS plaintext sidecar for selected libssl processes. It needs
   root/bpffs, a built eBPF object, and an explicit selector.
@@ -903,7 +904,9 @@ and metrics include capture input activity, pipeline progress, spool/export
 state, policy/enforcement counters, TLS plaintext activity, and proxy health.
 Capture input activity includes the latest signal kind, sequence, and
 observation time without treating that activity as kernel link liveness. The
-admin CLI sends the same JSON-lines commands over the Unix socket:
+eBPF provider status separately reports held tracepoint links and optional
+kernel tracepoint-pair availability, such as `sendfile` or `sendfile64`.
+The admin CLI sends the same JSON-lines commands over the Unix socket:
 
 ```bash
 cargo run -p agent -- admin \

@@ -10,14 +10,17 @@ mod replay;
 mod tls;
 
 pub use ebpf::{
-    EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
-    EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfHostProbe,
-    EbpfHostProbeConfig, EbpfHostProbeReport, EbpfObservedProcess, EbpfProcessObservation,
-    EbpfProcessObservationLinkOwnershipSnapshot, EbpfProcessObservationProbe,
+    EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS, EbpfAcceptTracepointObservation,
+    EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation,
+    EbpfConnectTracepointObservation, EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport,
+    EbpfObservedProcess, EbpfProcessObservation, EbpfProcessObservationLinkOwnershipSnapshot,
+    EbpfProcessObservationOptionalTracepointPairSnapshot,
+    EbpfProcessObservationOptionalTracepointPairState, EbpfProcessObservationProbe,
     EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeError,
-    EbpfProcessObservationProgramLinkOwnershipSnapshot, EbpfProcessObservationProvider,
-    EbpfResolvedSocketFlow, EbpfSocketEndpoint, EbpfSocketFlowLookup, EbpfSocketFlowResolver,
-    EbpfSocketReadObservation, EbpfSocketWriteObservation, UnprivilegedBpfStatus,
+    EbpfProcessObservationProbeSnapshot, EbpfProcessObservationProgramLinkOwnershipSnapshot,
+    EbpfProcessObservationProvider, EbpfProcessOptionalTracepointPairSpec, EbpfResolvedSocketFlow,
+    EbpfSocketEndpoint, EbpfSocketFlowLookup, EbpfSocketFlowResolver, EbpfSocketReadObservation,
+    EbpfSocketWriteObservation, UnprivilegedBpfStatus,
 };
 pub use event::{
     CaptureEvent, CapturedBytes, CapturedGap, CapturedLoss, EnforcementEvidencePropagation,

@@ -1,6 +1,10 @@
 use std::sync::{Arc, RwLock};
 
-use capture::EbpfProcessObservationLinkOwnershipSnapshot;
+use capture::{
+    EbpfProcessObservationLinkOwnershipSnapshot,
+    EbpfProcessObservationOptionalTracepointPairSnapshot,
+    EbpfProcessObservationOptionalTracepointPairState, EbpfProcessObservationProbeSnapshot,
+};
 use probe_config::CaptureBackend;
 use probe_core::RuntimeMode;
 use runtime::{CaptureEvidenceMode, CapturePlanMode};
@@ -34,6 +38,7 @@ pub(crate) struct CaptureProviderOpenFailureSnapshot {
 pub(crate) enum CaptureProviderRuntimeDetailsSnapshot {
     EbpfProcessObservation {
         link_ownership: EbpfProcessObservationLinkOwnershipRuntimeSnapshot,
+        optional_tracepoint_pairs: Vec<EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot>,
     },
 }
 
@@ -53,22 +58,38 @@ pub(crate) struct EbpfProcessObservationLinkProgramRuntimeSnapshot {
     pub(crate) owned_link_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot {
+    pub(crate) family_name: &'static str,
+    pub(crate) mode: RuntimeMode,
+    pub(crate) enter_category: &'static str,
+    pub(crate) enter_tracepoint_name: &'static str,
+    pub(crate) exit_category: &'static str,
+    pub(crate) exit_tracepoint_name: &'static str,
+    pub(crate) reason: Option<String>,
+}
+
 impl CaptureProviderRuntimeDetailsSnapshot {
-    pub(crate) fn ebpf_process_observation(
-        link_ownership: EbpfProcessObservationLinkOwnershipSnapshot,
-    ) -> Self {
+    pub(crate) fn ebpf_process_observation(probe: EbpfProcessObservationProbeSnapshot) -> Self {
+        let (link_ownership, optional_tracepoint_pairs) = probe.into_parts();
         Self::EbpfProcessObservation {
             link_ownership: EbpfProcessObservationLinkOwnershipRuntimeSnapshot::from_capture(
                 link_ownership,
             ),
+            optional_tracepoint_pairs: optional_tracepoint_pairs
+                .into_iter()
+                .map(EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot::from_capture)
+                .collect(),
         }
     }
 }
 
 impl EbpfProcessObservationLinkOwnershipRuntimeSnapshot {
     fn from_capture(link_ownership: EbpfProcessObservationLinkOwnershipSnapshot) -> Self {
+        let is_reported = link_ownership.is_reported();
         let owned_link_count = link_ownership.owned_link_count();
-        if !link_ownership.is_reported() {
+        let programs = link_ownership.into_programs();
+        if !is_reported {
             return Self {
                 mode: RuntimeMode::Unavailable,
                 owned_link_count: 0,
@@ -81,8 +102,7 @@ impl EbpfProcessObservationLinkOwnershipRuntimeSnapshot {
         Self {
             mode: RuntimeMode::Available,
             owned_link_count: owned_link_count as u64,
-            programs: link_ownership
-                .into_programs()
+            programs: programs
                 .into_iter()
                 .map(|program| EbpfProcessObservationLinkProgramRuntimeSnapshot {
                     program_name: program.program_name(),
@@ -95,6 +115,36 @@ impl EbpfProcessObservationLinkOwnershipRuntimeSnapshot {
                 "userspace process eBPF loader holds committed tracepoint links".to_string(),
             ),
         }
+    }
+}
+
+impl EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot {
+    fn from_capture(pair: EbpfProcessObservationOptionalTracepointPairSnapshot) -> Self {
+        let (mode, reason) = optional_tracepoint_pair_mode_and_reason(pair.state());
+        Self {
+            family_name: pair.family_name(),
+            mode,
+            enter_category: pair.enter_category(),
+            enter_tracepoint_name: pair.enter_tracepoint_name(),
+            exit_category: pair.exit_category(),
+            exit_tracepoint_name: pair.exit_tracepoint_name(),
+            reason: Some(reason.to_string()),
+        }
+    }
+}
+
+fn optional_tracepoint_pair_mode_and_reason(
+    state: EbpfProcessObservationOptionalTracepointPairState,
+) -> (RuntimeMode, &'static str) {
+    match state {
+        EbpfProcessObservationOptionalTracepointPairState::Attached => (
+            RuntimeMode::Available,
+            "kernel exposes both optional tracepoints and the loader attached both links",
+        ),
+        EbpfProcessObservationOptionalTracepointPairState::KernelMissing => (
+            RuntimeMode::Unavailable,
+            "kernel does not expose this optional tracepoint pair",
+        ),
     }
 }
 

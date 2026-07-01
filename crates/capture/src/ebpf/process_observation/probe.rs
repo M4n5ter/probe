@@ -11,14 +11,15 @@ use aya::{
 };
 use ebpf_abi::{
     EBPF_ADDRESS_FAMILY_INET, EBPF_ADDRESS_FAMILY_INET6, EBPF_ALLOWED_SOCKET_FDS_MAP_NAME,
-    EBPF_EVENTS_MAP_NAME, EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME, EBPF_PROCESS_TRACEPOINT_SPECS,
+    EBPF_EVENTS_MAP_NAME, EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS,
+    EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME, EBPF_PROCESS_TRACEPOINT_SPECS,
     EBPF_SOCKET_FLOW_REMOTE_ENDPOINT_VALID, EBPF_SOCKET_FLOW_SOCKADDR_READ_FAILED,
     EBPF_SOCKET_FLOW_UNSUPPORTED_ADDRESS_FAMILY, EBPF_SOCKET_READ_READ_FAILED,
     EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_WRITE_KERNEL_TRANSFER, EBPF_SOCKET_WRITE_READ_FAILED,
     EBPF_SOCKET_WRITE_TRUNCATED, EbpfAcceptObservation, EbpfCloseRangeObservation,
-    EbpfConnectObservation, EbpfEventDecodeError, EbpfProcessProbeEvent, EbpfProcessTracepointRole,
-    EbpfProcessTracepointSpec, EbpfSocketFdKey, EbpfSocketPayloadAllowance, EbpfSocketReadSample,
-    EbpfSocketWriteSample, decode_process_probe_event,
+    EbpfConnectObservation, EbpfEventDecodeError, EbpfProcessOptionalTracepointPairSpec,
+    EbpfProcessProbeEvent, EbpfProcessTracepointSpec, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
+    EbpfSocketReadSample, EbpfSocketWriteSample, decode_process_probe_event,
 };
 use ebpf_object::{
     EbpfObjectProbe, EbpfObjectProbeConfig, EbpfObjectProbeReport, EbpfPreflightedObject,
@@ -104,7 +105,13 @@ pub struct EbpfProcessObservationProbe {
     events: RingBuf<MapData>,
     allowed_socket_fds: SocketAllowMap,
     output_losses: OutputLossMap,
+    probe_snapshot: EbpfProcessObservationProbeSnapshot,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EbpfProcessObservationProbeSnapshot {
     link_ownership: EbpfProcessObservationLinkOwnershipSnapshot,
+    optional_tracepoint_pairs: Vec<EbpfProcessObservationOptionalTracepointPairSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -118,6 +125,67 @@ pub struct EbpfProcessObservationProgramLinkOwnershipSnapshot {
     category: &'static str,
     tracepoint_name: &'static str,
     owned_link_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EbpfProcessObservationOptionalTracepointPairSnapshot {
+    pair: EbpfProcessOptionalTracepointPairSpec,
+    state: EbpfProcessObservationOptionalTracepointPairState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EbpfProcessObservationOptionalTracepointPairState {
+    Attached,
+    KernelMissing,
+}
+
+impl EbpfProcessObservationProbeSnapshot {
+    pub fn unreported() -> Self {
+        Self::default()
+    }
+
+    pub fn from_attached_tracepoints_and_optional_pairs(
+        specs: impl IntoIterator<Item = EbpfProcessTracepointSpec>,
+        optional_tracepoint_pairs: impl IntoIterator<
+            Item = EbpfProcessObservationOptionalTracepointPairSnapshot,
+        >,
+    ) -> Self {
+        Self::from_link_ownership_and_optional_pairs(
+            EbpfProcessObservationLinkOwnershipSnapshot::from_attached_tracepoints(specs),
+            optional_tracepoint_pairs,
+        )
+    }
+
+    pub fn from_link_ownership_and_optional_pairs(
+        link_ownership: EbpfProcessObservationLinkOwnershipSnapshot,
+        optional_tracepoint_pairs: impl IntoIterator<
+            Item = EbpfProcessObservationOptionalTracepointPairSnapshot,
+        >,
+    ) -> Self {
+        Self {
+            link_ownership,
+            optional_tracepoint_pairs: optional_tracepoint_pairs.into_iter().collect(),
+        }
+    }
+
+    pub fn link_ownership(&self) -> &EbpfProcessObservationLinkOwnershipSnapshot {
+        &self.link_ownership
+    }
+
+    pub fn optional_tracepoint_pairs(
+        &self,
+    ) -> &[EbpfProcessObservationOptionalTracepointPairSnapshot] {
+        &self.optional_tracepoint_pairs
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        EbpfProcessObservationLinkOwnershipSnapshot,
+        Vec<EbpfProcessObservationOptionalTracepointPairSnapshot>,
+    ) {
+        (self.link_ownership, self.optional_tracepoint_pairs)
+    }
 }
 
 impl EbpfProcessObservationLinkOwnershipSnapshot {
@@ -197,6 +265,53 @@ impl EbpfProcessObservationProgramLinkOwnershipSnapshot {
     }
 }
 
+impl EbpfProcessObservationOptionalTracepointPairSnapshot {
+    pub fn attached(pair: EbpfProcessOptionalTracepointPairSpec) -> Self {
+        Self::new(
+            pair,
+            EbpfProcessObservationOptionalTracepointPairState::Attached,
+        )
+    }
+
+    pub fn kernel_missing(pair: EbpfProcessOptionalTracepointPairSpec) -> Self {
+        Self::new(
+            pair,
+            EbpfProcessObservationOptionalTracepointPairState::KernelMissing,
+        )
+    }
+
+    fn new(
+        pair: EbpfProcessOptionalTracepointPairSpec,
+        state: EbpfProcessObservationOptionalTracepointPairState,
+    ) -> Self {
+        Self { pair, state }
+    }
+
+    pub fn family_name(&self) -> &'static str {
+        self.pair.family_name()
+    }
+
+    pub fn enter_category(&self) -> &'static str {
+        self.pair.enter_spec().category
+    }
+
+    pub fn enter_tracepoint_name(&self) -> &'static str {
+        self.pair.enter_spec().tracepoint_name
+    }
+
+    pub fn exit_category(&self) -> &'static str {
+        self.pair.exit_spec().category
+    }
+
+    pub fn exit_tracepoint_name(&self) -> &'static str {
+        self.pair.exit_spec().tracepoint_name
+    }
+
+    pub fn state(&self) -> EbpfProcessObservationOptionalTracepointPairState {
+        self.state
+    }
+}
+
 impl EbpfProcessObservationProbe {
     pub fn load(
         config: EbpfProcessObservationProbeConfig,
@@ -224,8 +339,11 @@ impl EbpfProcessObservationProbe {
             load_and_attach_tracepoint(&mut ebpf, spec)?;
             attached_tracepoints.push(spec);
         }
-        for pair in OPTIONAL_TRACEPOINT_PAIRS {
-            attached_tracepoints.extend(load_and_attach_optional_tracepoint_pair(&mut ebpf, pair)?);
+        let mut optional_tracepoint_pairs = Vec::new();
+        for pair in EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS {
+            let report = load_and_attach_optional_tracepoint_pair(&mut ebpf, pair)?;
+            attached_tracepoints.extend(report.attached_tracepoints);
+            optional_tracepoint_pairs.push(report.snapshot);
         }
         let events = open_events_ringbuf(&mut ebpf)?;
         let allowed_socket_fds = open_socket_allow_map(&mut ebpf)?;
@@ -235,14 +353,16 @@ impl EbpfProcessObservationProbe {
             events,
             allowed_socket_fds,
             output_losses,
-            link_ownership: EbpfProcessObservationLinkOwnershipSnapshot::from_attached_tracepoints(
-                attached_tracepoints,
-            ),
+            probe_snapshot:
+                EbpfProcessObservationProbeSnapshot::from_attached_tracepoints_and_optional_pairs(
+                    attached_tracepoints,
+                    optional_tracepoint_pairs,
+                ),
         })
     }
 
-    pub fn link_ownership(&self) -> EbpfProcessObservationLinkOwnershipSnapshot {
-        self.link_ownership.clone()
+    pub fn probe_snapshot(&self) -> EbpfProcessObservationProbeSnapshot {
+        self.probe_snapshot.clone()
     }
 
     pub fn next_observation(
@@ -293,46 +413,30 @@ type SocketAllowMap = AyaHashMap<
 >;
 type OutputLossMap = PerCpuArray<MapData, u64>;
 
-const OPTIONAL_TRACEPOINT_PAIRS: [OptionalTracepointPair; 2] = [
-    OptionalTracepointPair {
-        enter: EbpfProcessTracepointRole::SendfileEnter,
-        exit: EbpfProcessTracepointRole::SendfileExit,
-    },
-    OptionalTracepointPair {
-        enter: EbpfProcessTracepointRole::Sendfile64Enter,
-        exit: EbpfProcessTracepointRole::Sendfile64Exit,
-    },
-];
-
-#[derive(Clone, Copy)]
-struct OptionalTracepointPair {
-    enter: EbpfProcessTracepointRole,
-    exit: EbpfProcessTracepointRole,
-}
-
-impl OptionalTracepointPair {
-    fn specs(
-        self,
-    ) -> (
-        &'static EbpfProcessTracepointSpec,
-        &'static EbpfProcessTracepointSpec,
-    ) {
-        (self.enter.spec(), self.exit.spec())
-    }
+struct OptionalTracepointPairAttachReport {
+    attached_tracepoints: Vec<EbpfProcessTracepointSpec>,
+    snapshot: EbpfProcessObservationOptionalTracepointPairSnapshot,
 }
 
 fn load_and_attach_optional_tracepoint_pair(
     ebpf: &mut Ebpf,
-    pair: OptionalTracepointPair,
-) -> Result<Vec<EbpfProcessTracepointSpec>, EbpfProcessObservationProbeError> {
-    let (enter, exit) = pair.specs();
+    pair: EbpfProcessOptionalTracepointPairSpec,
+) -> Result<OptionalTracepointPairAttachReport, EbpfProcessObservationProbeError> {
+    let enter = pair.enter_spec();
+    let exit = pair.exit_spec();
     match (tracepoint_exists(enter)?, tracepoint_exists(exit)?) {
         (true, true) => {
             load_and_attach_tracepoint(ebpf, *enter)?;
             load_and_attach_tracepoint(ebpf, *exit)?;
-            Ok(vec![*enter, *exit])
+            Ok(OptionalTracepointPairAttachReport {
+                attached_tracepoints: vec![*enter, *exit],
+                snapshot: EbpfProcessObservationOptionalTracepointPairSnapshot::attached(pair),
+            })
         }
-        (false, false) => Ok(Vec::new()),
+        (false, false) => Ok(OptionalTracepointPairAttachReport {
+            attached_tracepoints: Vec::new(),
+            snapshot: EbpfProcessObservationOptionalTracepointPairSnapshot::kernel_missing(pair),
+        }),
         (true, false) => Err(incomplete_optional_tracepoint_pair(*enter, *exit)),
         (false, true) => Err(incomplete_optional_tracepoint_pair(*exit, *enter)),
     }

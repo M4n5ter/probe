@@ -373,6 +373,19 @@ pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 34] = [
     },
 ];
 
+pub const EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS: [EbpfProcessOptionalTracepointPairSpec; 2] = [
+    EbpfProcessOptionalTracepointPairSpec {
+        family_name: "sendfile",
+        enter: EbpfProcessTracepointRole::SendfileEnter,
+        exit: EbpfProcessTracepointRole::SendfileExit,
+    },
+    EbpfProcessOptionalTracepointPairSpec {
+        family_name: "sendfile64",
+        enter: EbpfProcessTracepointRole::Sendfile64Enter,
+        exit: EbpfProcessTracepointRole::Sendfile64Exit,
+    },
+];
+
 pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 12] = [
     EbpfMapSpec {
         name: EBPF_EVENTS_MAP_NAME,
@@ -490,6 +503,39 @@ impl EbpfProcessTracepointSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfProcessOptionalTracepointPairSpec {
+    family_name: &'static str,
+    enter: EbpfProcessTracepointRole,
+    exit: EbpfProcessTracepointRole,
+}
+
+impl EbpfProcessOptionalTracepointPairSpec {
+    pub fn family_name(self) -> &'static str {
+        self.family_name
+    }
+
+    pub fn enter_role(self) -> EbpfProcessTracepointRole {
+        self.enter
+    }
+
+    pub fn exit_role(self) -> EbpfProcessTracepointRole {
+        self.exit
+    }
+
+    pub fn enter_spec(self) -> &'static EbpfProcessTracepointSpec {
+        self.enter.spec()
+    }
+
+    pub fn exit_spec(self) -> &'static EbpfProcessTracepointSpec {
+        self.exit.spec()
+    }
+
+    pub fn contains_role(self, role: EbpfProcessTracepointRole) -> bool {
+        self.enter == role || self.exit == role
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EbpfTracepointSectionName {
     category: &'static str,
     tracepoint_name: &'static str,
@@ -544,11 +590,14 @@ pub enum EbpfProcessTracepointRole {
 }
 
 impl EbpfProcessTracepointRole {
-    pub const fn has_optional_attach(self) -> bool {
-        matches!(
-            self,
-            Self::SendfileEnter | Self::SendfileExit | Self::Sendfile64Enter | Self::Sendfile64Exit
-        )
+    pub fn has_optional_attach(self) -> bool {
+        self.optional_pair_spec().is_some()
+    }
+
+    pub fn optional_pair_spec(self) -> Option<EbpfProcessOptionalTracepointPairSpec> {
+        EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS
+            .into_iter()
+            .find(|pair| pair.contains_role(self))
     }
 
     pub fn spec(self) -> &'static EbpfProcessTracepointSpec {
@@ -816,10 +865,28 @@ mod tests {
 
     #[test]
     fn sendfile_family_tracepoints_are_optional_kernel_variants() {
-        assert!(EbpfProcessTracepointRole::SendfileEnter.has_optional_attach());
-        assert!(EbpfProcessTracepointRole::SendfileExit.has_optional_attach());
-        assert!(EbpfProcessTracepointRole::Sendfile64Enter.has_optional_attach());
-        assert!(EbpfProcessTracepointRole::Sendfile64Exit.has_optional_attach());
+        assert_eq!(EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS.len(), 2);
+        assert_unique(EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS.map(|pair| pair.family_name()));
+
+        let mut optional_roles = BTreeSet::new();
+        for pair in EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS {
+            assert!(optional_roles.insert(pair.enter_role()));
+            assert!(optional_roles.insert(pair.exit_role()));
+            assert_eq!(pair.enter_role().spec(), pair.enter_spec());
+            assert_eq!(pair.exit_role().spec(), pair.exit_spec());
+            assert!(pair.enter_role().has_optional_attach());
+            assert!(pair.exit_role().has_optional_attach());
+        }
+
+        assert_eq!(
+            optional_roles,
+            BTreeSet::from([
+                EbpfProcessTracepointRole::SendfileEnter,
+                EbpfProcessTracepointRole::SendfileExit,
+                EbpfProcessTracepointRole::Sendfile64Enter,
+                EbpfProcessTracepointRole::Sendfile64Exit,
+            ])
+        );
         assert!(!EbpfProcessTracepointRole::WriteEnter.has_optional_attach());
     }
 
