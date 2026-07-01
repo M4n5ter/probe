@@ -167,10 +167,13 @@ mod tests {
             .expect("recorded runtime should expose capture input activity");
         assert_eq!(activity.polls.total, 1);
         assert_eq!(activity.polls.progress, 1);
-        assert_eq!(
+        assert!(matches!(
             activity.last_signal,
-            Some(CaptureInputSignalRuntimeSnapshot::Progress { sequence: 1 })
-        );
+            Some(CaptureInputSignalRuntimeSnapshot::Progress {
+                sequence: 1,
+                observed_unix_ns
+            }) if observed_unix_ns > 0
+        ));
         assert_eq!(
             runtime
                 .snapshot()

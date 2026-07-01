@@ -76,6 +76,7 @@ pub struct CaptureInputPollMetricsSnapshot {
 pub struct CaptureInputSignalMetricsSnapshot {
     pub kind: &'static str,
     pub sequence: u64,
+    pub observed_unix_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -195,6 +196,7 @@ fn capture_input_metrics(
             .map(|signal| CaptureInputSignalMetricsSnapshot {
                 kind: signal.kind(),
                 sequence: signal.sequence(),
+                observed_unix_ns: signal.observed_unix_ns(),
             }),
     }
 }

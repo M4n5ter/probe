@@ -546,7 +546,10 @@ mod tests {
                 capture_events: 1,
                 output_loss_events: 1,
                 lost_events: 3,
-                last_signal: Some(CaptureInputSignalRuntimeSnapshot::Idle { sequence: 4 }),
+                last_signal: Some(CaptureInputSignalRuntimeSnapshot::Idle {
+                    sequence: 4,
+                    observed_unix_ns: 99,
+                }),
             }),
             ..RuntimeStatusInput::default()
         };
@@ -566,6 +569,10 @@ mod tests {
         assert_eq!(
             value["metrics"]["capture_input"]["last_signal"]["kind"],
             json!("idle")
+        );
+        assert_eq!(
+            value["metrics"]["capture_input"]["last_signal"]["observed_unix_ns"],
+            json!(99)
         );
         Ok(())
     }

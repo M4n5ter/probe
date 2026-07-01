@@ -693,11 +693,10 @@ TLS 明文与协议能力：
   - 已实现：固定系统路径 `ss -K` TCP socket destroy backend、启动期 loopback socket destroy self-test、执行前 procfs socket owner
     复核和 status/backend reporting。
   - 已实现：active self-test 同时要求 `ss -K` 报告 destroyed socket row，且真实 loopback probe connection 被中断。
-  - 依赖：该 backend 复用 `iproute2` 的 `ss -K`。Rust netlink 生态中已经存在可表达
-    `SOCK_DESTROY` 的底层 building blocks，也存在提供 TCP socket destroy API 的候选 crate；
-    但这不是可直接替换命令的 dependency swap。native netlink backend 必须完整承担精确 flow 查询、
-    procfs owner 复核、ACK/error 分类、capability probe、active self-test 和 destructive E2E 验证后，
-    才能替代当前命令 backend。
+  - 依赖：该 backend 复用 `iproute2` 的 `ss -K`。Rust netlink 生态中已有可表达
+    `SOCK_DESTROY` 的底层 building blocks，但没有成熟的一等 TCP socket destroy API
+    可以直接替换当前命令依赖。native netlink backend 必须完整承担精确 flow 查询、procfs owner 复核、
+    ACK/error 分类、capability probe、active self-test 和 destructive E2E 验证后，才能替代当前命令 backend。
   - 边界：默认 `backend = "none"` 不要求 connection capability。
   - 边界：probe 确认 Linux、受信系统路径中的 `ss -K` 入口、root 执行上下文、procfs socket attribution 入口，
     以及当前 namespace/kernel 对本机 loopback TCP socket destroy 的可观察执行语义。
@@ -1293,12 +1292,14 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 - `capture.input_activity` 是 pipeline input provider 的在线 activity snapshot。该 input provider 是 live primary backend
   加上 TLS decrypt-hint wrapper、TLS plaintext sidecar feed 和 MITM plaintext bridge feed 后，pipeline 实际消费的 capture source。
 - `metrics.capture_input` 是同一 runtime fact 的 metrics 投影，只保留 poll outcome、非 loss capture event、output loss event、
-  provider-reported lost event 和 last signal kind/sequence。
+  provider-reported lost event 和 last signal kind/sequence/observed timestamp。
 - `traffic_probe_capture_input_polls_total{outcome="event|progress|idle|finished"}` 暴露 capture input poll activity。
 - `traffic_probe_capture_input_events_total{class="capture|output_loss"}` 区分非 loss capture event 与 input-level loss event。
 - `traffic_probe_capture_input_lost_events_total` 暴露 input provider 报告的 lost event 总数。
 - `traffic_probe_capture_input_last_signal{kind="event|output_loss|progress|idle|finished"}` 以 one-hot gauge 表达最近一次 input
   signal。
+- `traffic_probe_capture_input_last_signal_sequence{kind="..."}` 暴露最近一次 input signal sequence。
+- `traffic_probe_capture_input_last_signal_unix_time_ns{kind="..."}` 暴露 agent 观察到最近一次 input signal 的 Unix ns 时间。
 - capture input activity 不证明 eBPF per-link kernel liveness，也不证明强 socket-object lifetime。
 - offline/unknown 时 `capture.input_activity` 和 `metrics.capture_input` 保持 `null`。
 
@@ -5698,7 +5699,8 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 - Prometheus 测试覆盖 `traffic_probe_pipeline_capture_polls_total{outcome="event|progress|idle|finished"}`。
 - Prometheus 测试覆盖 `traffic_probe_capture_input_polls_total{outcome="event|progress|idle|finished"}`、
   `traffic_probe_capture_input_events_total{class="capture|output_loss"}`、
-  `traffic_probe_capture_input_lost_events_total` 和 capture input last-signal one-hot gauge。
+  `traffic_probe_capture_input_lost_events_total`、capture input last-signal one-hot gauge、
+  last-signal sequence 和 last-signal observed Unix time。
 - Prometheus 测试覆盖 `traffic_probe_pipeline_event_envelopes_total{class="all|degraded|gap"}`。
 
 #### Metrics 边界

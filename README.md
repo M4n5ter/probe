@@ -805,8 +805,10 @@ state. The Prometheus listener is read-only, loopback-only, and serves only
 `GET /metrics`; control commands stay on the private Unix socket. Runtime
 status and metrics include capture input activity, pipeline
 progress, spool/export state, policy/enforcement counters, TLS plaintext
-activity, and proxy health. Local watching and remote polling are opt-in. Use
-local triggers for local sources:
+activity, and proxy health. Capture input activity includes the latest signal
+kind, sequence, and observation time without treating that activity as kernel
+link liveness. Local watching and remote polling are opt-in. Use local triggers
+for local sources:
 
 ```toml
 [policy_reload]

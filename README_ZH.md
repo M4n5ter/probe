@@ -762,8 +762,9 @@ listen_addr = "127.0.0.1:9464"
 admin reload 会先校验新 policy 或 enforcement state，再替换 runtime state。Prometheus
 listener 是只读、loopback-only 的 `GET /metrics` surface；控制命令仍留在私有 Unix socket。
 runtime status 和 metrics 会暴露 capture input activity、pipeline progress、
-spool/export state、policy/enforcement counters、TLS plaintext activity 和 proxy health。本地
-watcher 和 remote polling 都需要显式开启。本地 source 使用本地触发器：
+spool/export state、policy/enforcement counters、TLS plaintext activity 和 proxy health。capture
+input activity 包含最近 signal kind、sequence 和 observation time，但不把该 activity 解释为
+kernel link liveness。本地 watcher 和 remote polling 都需要显式开启。本地 source 使用本地触发器：
 
 ```toml
 [policy_reload]

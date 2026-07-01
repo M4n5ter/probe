@@ -905,6 +905,33 @@ fn write_capture_input(output: &mut String, snapshot: &AgentStatusSnapshot) {
             ),
         );
     }
+    let Some(last_signal) = &activity.last_signal else {
+        return;
+    };
+    write_family(
+        output,
+        "traffic_probe_capture_input_last_signal_sequence",
+        "gauge",
+        "Latest capture input activity signal sequence.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_capture_input_last_signal_sequence",
+        &[("kind", last_signal.kind)],
+        last_signal.sequence,
+    );
+    write_family(
+        output,
+        "traffic_probe_capture_input_last_signal_unix_time_ns",
+        "gauge",
+        "Unix timestamp when the latest capture input activity signal was observed, in nanoseconds.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_capture_input_last_signal_unix_time_ns",
+        &[("kind", last_signal.kind)],
+        last_signal.observed_unix_ns,
+    );
 }
 
 fn write_family(output: &mut String, name: &str, metric_type: &str, help: &str) {
@@ -1279,6 +1306,7 @@ mod tests {
                     lost_events: 3,
                     last_signal: Some(CaptureInputSignalRuntimeSnapshot::OutputLoss {
                         sequence: 4,
+                        observed_unix_ns: 101,
                         source: probe_core::CaptureSource::EbpfSyscall,
                         provider: probe_core::CaptureProviderKind::Ebpf,
                         event_wall_time_unix_ns: 99,
@@ -1311,6 +1339,12 @@ mod tests {
             metrics.contains("traffic_probe_capture_input_last_signal{kind=\"output_loss\"} 1\n")
         );
         assert!(metrics.contains("traffic_probe_capture_input_last_signal{kind=\"event\"} 0\n"));
+        assert!(metrics.contains(
+            "traffic_probe_capture_input_last_signal_sequence{kind=\"output_loss\"} 4\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_capture_input_last_signal_unix_time_ns{kind=\"output_loss\"} 101\n"
+        ));
         Ok(())
     }
 

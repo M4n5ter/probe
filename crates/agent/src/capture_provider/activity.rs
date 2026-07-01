@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, RwLock,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use capture::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider};
@@ -30,12 +33,14 @@ pub(crate) struct CaptureInputPollActivityRuntimeSnapshot {
 pub(crate) enum CaptureInputSignalRuntimeSnapshot {
     Event {
         sequence: u64,
+        observed_unix_ns: u64,
         source: CaptureSource,
         provider: CaptureProviderKind,
         event_wall_time_unix_ns: i64,
     },
     OutputLoss {
         sequence: u64,
+        observed_unix_ns: u64,
         source: CaptureSource,
         provider: CaptureProviderKind,
         event_wall_time_unix_ns: i64,
@@ -43,12 +48,15 @@ pub(crate) enum CaptureInputSignalRuntimeSnapshot {
     },
     Progress {
         sequence: u64,
+        observed_unix_ns: u64,
     },
     Idle {
         sequence: u64,
+        observed_unix_ns: u64,
     },
     Finished {
         sequence: u64,
+        observed_unix_ns: u64,
     },
 }
 
@@ -70,9 +78,29 @@ impl CaptureInputSignalRuntimeSnapshot {
         match self {
             Self::Event { sequence, .. }
             | Self::OutputLoss { sequence, .. }
-            | Self::Progress { sequence }
-            | Self::Idle { sequence }
-            | Self::Finished { sequence } => *sequence,
+            | Self::Progress { sequence, .. }
+            | Self::Idle { sequence, .. }
+            | Self::Finished { sequence, .. } => *sequence,
+        }
+    }
+
+    pub(crate) fn observed_unix_ns(&self) -> u64 {
+        match self {
+            Self::Event {
+                observed_unix_ns, ..
+            }
+            | Self::OutputLoss {
+                observed_unix_ns, ..
+            }
+            | Self::Progress {
+                observed_unix_ns, ..
+            }
+            | Self::Idle {
+                observed_unix_ns, ..
+            }
+            | Self::Finished {
+                observed_unix_ns, ..
+            } => *observed_unix_ns,
         }
     }
 }
@@ -113,23 +141,36 @@ impl CaptureInputActivityRuntimeState {
     }
 
     pub(crate) fn record_poll(&self, poll: &CapturePoll) {
+        self.record_poll_at(poll, current_unix_time_ns());
+    }
+
+    fn record_poll_at(&self, poll: &CapturePoll, observed_unix_ns: u64) {
         let sequence = self.inner.sequence.increment();
         let signal = match poll {
             CapturePoll::Event(event) => {
                 self.inner.poll_events.increment();
-                self.record_event(event, sequence)
+                self.record_event(event, sequence, observed_unix_ns)
             }
             CapturePoll::Progress => {
                 self.inner.poll_progress.increment();
-                CaptureInputSignalRuntimeSnapshot::Progress { sequence }
+                CaptureInputSignalRuntimeSnapshot::Progress {
+                    sequence,
+                    observed_unix_ns,
+                }
             }
             CapturePoll::Idle => {
                 self.inner.poll_idle.increment();
-                CaptureInputSignalRuntimeSnapshot::Idle { sequence }
+                CaptureInputSignalRuntimeSnapshot::Idle {
+                    sequence,
+                    observed_unix_ns,
+                }
             }
             CapturePoll::Finished => {
                 self.inner.poll_finished.increment();
-                CaptureInputSignalRuntimeSnapshot::Finished { sequence }
+                CaptureInputSignalRuntimeSnapshot::Finished {
+                    sequence,
+                    observed_unix_ns,
+                }
             }
         };
         *self
@@ -170,6 +211,7 @@ impl CaptureInputActivityRuntimeState {
         &self,
         event: &CaptureEvent,
         sequence: u64,
+        observed_unix_ns: u64,
     ) -> CaptureInputSignalRuntimeSnapshot {
         match event {
             CaptureEvent::Loss(loss) => {
@@ -177,6 +219,7 @@ impl CaptureInputActivityRuntimeState {
                 self.inner.lost_events.add(loss.loss.lost_events);
                 CaptureInputSignalRuntimeSnapshot::OutputLoss {
                     sequence,
+                    observed_unix_ns,
                     source: loss.origin.source(),
                     provider: loss.origin.provider(),
                     event_wall_time_unix_ns: loss.timestamp.wall_time_unix_ns,
@@ -185,12 +228,14 @@ impl CaptureInputActivityRuntimeState {
             }
             CaptureEvent::Bytes(bytes) => self.event_signal(
                 sequence,
+                observed_unix_ns,
                 bytes.origin.source(),
                 bytes.origin.provider(),
                 bytes.timestamp.wall_time_unix_ns,
             ),
             CaptureEvent::Gap(gap) => self.event_signal(
                 sequence,
+                observed_unix_ns,
                 gap.origin.source(),
                 gap.origin.provider(),
                 gap.timestamp.wall_time_unix_ns,
@@ -202,6 +247,7 @@ impl CaptureInputActivityRuntimeState {
                 timestamp, origin, ..
             } => self.event_signal(
                 sequence,
+                observed_unix_ns,
                 origin.source(),
                 origin.provider(),
                 timestamp.wall_time_unix_ns,
@@ -212,6 +258,7 @@ impl CaptureInputActivityRuntimeState {
     fn event_signal(
         &self,
         sequence: u64,
+        observed_unix_ns: u64,
         source: CaptureSource,
         provider: CaptureProviderKind,
         event_wall_time_unix_ns: i64,
@@ -219,11 +266,20 @@ impl CaptureInputActivityRuntimeState {
         self.inner.capture_events.increment();
         CaptureInputSignalRuntimeSnapshot::Event {
             sequence,
+            observed_unix_ns,
             source,
             provider,
             event_wall_time_unix_ns,
         }
     }
+}
+
+fn current_unix_time_ns() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
 pub(crate) struct ActivityObservedCaptureInput {
@@ -340,10 +396,13 @@ mod tests {
         assert_eq!(snapshot.capture_events, 1);
         assert_eq!(snapshot.output_loss_events, 1);
         assert_eq!(snapshot.lost_events, 3);
-        assert_eq!(
+        assert!(matches!(
             snapshot.last_signal,
-            Some(CaptureInputSignalRuntimeSnapshot::Finished { sequence: 5 })
-        );
+            Some(CaptureInputSignalRuntimeSnapshot::Finished {
+                sequence: 5,
+                observed_unix_ns
+            }) if observed_unix_ns > 0
+        ));
         Ok(())
     }
 
@@ -351,12 +410,21 @@ mod tests {
     fn observed_input_activity_saturates_loss_counters() {
         let activity = CaptureInputActivityRuntimeState::default();
 
-        activity.record_poll(&CapturePoll::event(capture_loss(u64::MAX)));
-        activity.record_poll(&CapturePoll::event(capture_loss(1)));
+        activity.record_poll_at(&CapturePoll::event(capture_loss(u64::MAX)), 100);
+        activity.record_poll_at(&CapturePoll::event(capture_loss(1)), 200);
 
         let snapshot = activity.snapshot();
         assert_eq!(snapshot.output_loss_events, 2);
         assert_eq!(snapshot.lost_events, u64::MAX);
+        assert!(matches!(
+            snapshot.last_signal,
+            Some(CaptureInputSignalRuntimeSnapshot::OutputLoss {
+                sequence: 2,
+                observed_unix_ns: 200,
+                lost_events: 1,
+                ..
+            })
+        ));
     }
 
     struct FakeProvider {
