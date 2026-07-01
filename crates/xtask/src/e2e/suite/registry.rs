@@ -4,7 +4,10 @@ use serde::Serialize;
 
 use super::super::{
     E2eOutcome,
-    admin_enforcement_reload::run as run_admin_enforcement_reload,
+    admin_enforcement_reload::{
+        run as run_admin_enforcement_reload,
+        run_runtime_actions as run_admin_runtime_actions_reload,
+    },
     admin_policy_reload::run as run_admin_policy_reload,
     capture_loss_event_feed::run as run_capture_loss_event_feed,
     ebpf_process_loopback::run as run_ebpf_process_loopback,
@@ -232,6 +235,11 @@ const E2E_CASES: &[E2eCase] = &[
         run: E2eCaseRun::ExitCode(run_admin_enforcement_reload),
     },
     E2eCase {
+        name: "e2e-admin-runtime-actions-reload",
+        requirement: E2eRequirement::RootCapNetRaw,
+        run: E2eCaseRun::ExitCode(run_admin_runtime_actions_reload),
+    },
+    E2eCase {
         name: "e2e-linux-socket-destroy-enforcement",
         requirement: E2eRequirement::RootCapNetRaw,
         run: E2eCaseRun::Outcome(run_linux_socket_destroy_enforcement),
@@ -433,6 +441,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-libpcap-websocket-loopback",
             "e2e-admin-policy-reload",
             "e2e-admin-enforcement-reload",
+            "e2e-admin-runtime-actions-reload",
             "e2e-linux-socket-destroy-enforcement",
             "e2e-tls-session-secret-auto-binding-loopback",
             "e2e-tls-session-secret-material-refresh-auto-binding-loopback",
@@ -782,6 +791,7 @@ mod tests {
                 "e2e-libpcap-websocket-loopback",
                 "e2e-admin-policy-reload",
                 "e2e-admin-enforcement-reload",
+                "e2e-admin-runtime-actions-reload",
                 "e2e-linux-socket-destroy-enforcement",
                 "e2e-tls-session-secret-auto-binding-loopback",
                 "e2e-tls-session-secret-material-refresh-auto-binding-loopback",
@@ -866,6 +876,7 @@ mod tests {
                 "e2e-libpcap-websocket-loopback",
                 "e2e-admin-policy-reload",
                 "e2e-admin-enforcement-reload",
+                "e2e-admin-runtime-actions-reload",
                 "e2e-linux-socket-destroy-enforcement",
                 "e2e-tls-session-secret-auto-binding-loopback",
                 "e2e-tls-session-secret-material-refresh-auto-binding-loopback",

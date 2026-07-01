@@ -935,7 +935,7 @@ E2E profile 按 capability claim 组织：
 
 - `baseline` 以普通用户运行，覆盖 replay、plaintext feed、gap/loss event、
   HTTP/SSE/WebSocket、webhook/file export，以及一次性和后台 polling remote policy input。
-- `live-core` 需要 root 或 CAP_NET_RAW，覆盖 libpcap loopback、admin reload、
+- `live-core` 需要 root 或 CAP_NET_RAW，覆盖 libpcap loopback、单项和组合 admin reload、
   socket destroy 和 TLS key log/session-secret material。
 - `process-ebpf` 需要 root/bpffs，覆盖 eBPF process observation 和真实 process
   ring-buffer output loss。

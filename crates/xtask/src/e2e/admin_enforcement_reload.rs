@@ -29,8 +29,9 @@ use super::{
 const E2E_EXPORT_CURSOR_OWNER: &str = "e2e-admin-enforcement-reload";
 const INTERFACE: &str = "any";
 const POLICY_ID: &str = "e2e-admin-enforcement-policy";
-const POLICY_VERSION: &str = "e2e";
-const EXPECTED_POLICY_VERSION: &str = "e2e-admin-enforcement-policy@e2e";
+const STATIC_POLICY_VERSION: &str = "e2e";
+const OLD_POLICY_VERSION: &str = "old";
+const NEW_POLICY_VERSION: &str = "new";
 const MANIFEST_ID: &str = "e2e-admin-enforcement";
 const OLD_MANIFEST_VERSION: &str = "old";
 const NEW_MANIFEST_VERSION: &str = "new";
@@ -41,23 +42,81 @@ const RESPONSE_BODY_BYTES: usize = 16;
 const WRITE_CHUNKS: usize = 2;
 const POLICY_REASON_PREFIX: &str = "admin enforcement reload";
 
+type ReloadResponseAssertion = fn(&serde_json::Value) -> Result<(), Box<dyn std::error::Error>>;
+
+#[derive(Debug, Clone, Copy)]
+struct AdminReloadCase {
+    temp_root_name: &'static str,
+    label: &'static str,
+    agent_id: &'static str,
+    config_version: &'static str,
+    initial_policy_version: &'static str,
+    reloaded_policy_version: Option<&'static str>,
+    reload_command: &'static str,
+    assert_reload_response: ReloadResponseAssertion,
+}
+
+const ENFORCEMENT_RELOAD_CASE: AdminReloadCase = AdminReloadCase {
+    temp_root_name: "admin-enforcement-reload",
+    label: "e2e admin enforcement reload",
+    agent_id: "e2e-admin-enforcement-reload-agent",
+    config_version: "e2e-admin-enforcement-reload",
+    initial_policy_version: STATIC_POLICY_VERSION,
+    reloaded_policy_version: None,
+    reload_command: "reload_enforcement_policy",
+    assert_reload_response: assert_enforcement_reload_response,
+};
+
+const RUNTIME_ACTIONS_RELOAD_CASE: AdminReloadCase = AdminReloadCase {
+    temp_root_name: "admin-runtime-actions-reload",
+    label: "e2e admin runtime actions reload",
+    agent_id: "e2e-admin-runtime-actions-reload-agent",
+    config_version: "e2e-admin-runtime-actions-reload",
+    initial_policy_version: OLD_POLICY_VERSION,
+    reloaded_policy_version: Some(NEW_POLICY_VERSION),
+    reload_command: "reload_runtime_actions",
+    assert_reload_response: assert_runtime_actions_reload_response,
+};
+
+impl AdminReloadCase {
+    fn expected_reloaded_policy_version(self) -> &'static str {
+        self.reloaded_policy_version
+            .unwrap_or(self.initial_policy_version)
+    }
+
+    fn assert_response(
+        self,
+        response: &serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        (self.assert_reload_response)(response)
+    }
+}
+
 pub(crate) fn run() -> ExitCode {
-    match run_inner() {
+    run_case(ENFORCEMENT_RELOAD_CASE)
+}
+
+pub(crate) fn run_runtime_actions() -> ExitCode {
+    run_case(RUNTIME_ACTIONS_RELOAD_CASE)
+}
+
+fn run_case(case: AdminReloadCase) -> ExitCode {
+    match run_inner(case) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("e2e admin enforcement reload failed: {error}");
+            eprintln!("{} failed: {error}", case.label);
             ExitCode::FAILURE
         }
     }
 }
 
-fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
+fn run_inner(case: AdminReloadCase) -> Result<(), Box<dyn std::error::Error>> {
     ensure_e2e_packages_built(["agent", "e2e-fixture"])?;
-    let root = create_temp_root("admin-enforcement-reload")?;
-    match run_at(&root) {
+    let root = create_temp_root(case.temp_root_name)?;
+    match run_at(&root, case) {
         Ok(()) => {
             fs::remove_dir_all(&root)?;
-            println!("e2e admin enforcement reload passed");
+            println!("{} passed", case.label);
             Ok(())
         }
         Err(error) => {
@@ -67,7 +126,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn run_at(root: &Path, case: AdminReloadCase) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(root)?;
     let first_ready_path = root.join("first-fixture.ready");
     let first_start_path = root.join("first-fixture.start");
@@ -104,6 +163,7 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     write_policy_bundle(
         &policy_path,
+        case.initial_policy_version,
         first_ready.listen_port,
         second_ready.listen_port,
     )?;
@@ -120,6 +180,7 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
         &spool_path,
         &admin_socket_path,
         [first_ready.listen_port, second_ready.listen_port],
+        case,
     )?;
 
     let mut ready_signal = UnixSocketReadySignal::bind(agent_ready_socket_path)?;
@@ -135,15 +196,23 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
         1,
     )?;
 
+    if let Some(policy_version) = case.reloaded_policy_version {
+        write_policy_bundle(
+            &policy_path,
+            policy_version,
+            first_ready.listen_port,
+            second_ready.listen_port,
+        )?;
+    }
     write_enforcement_manifest(
         &enforcement_manifest_path,
         NEW_MANIFEST_VERSION,
         second_ready.listen_port,
         Action::Reset,
     )?;
-    assert_enforcement_reload_response(&send_admin_request(
+    case.assert_response(&send_admin_request(
         &admin_socket_path,
-        serde_json::json!({ "command": "reload_enforcement_policy" }),
+        serde_json::json!({ "command": case.reload_command }),
     )?)?;
 
     start_http1_loopback_fixture(&second_start_path, &second_ready.start_nonce)?;
@@ -160,6 +229,7 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     assert_spool_outputs(
         &spool_path,
         [first_ready.listen_port, second_ready.listen_port],
+        case,
     )?;
     Ok(())
 }
@@ -181,6 +251,7 @@ fn fixture_config(requests: usize) -> PlainHttp1LoopbackFixtureConfig {
 
 fn write_policy_bundle(
     path: &Path,
+    version: &str,
     first_listen_port: u16,
     second_listen_port: u16,
 ) -> Result<(), std::io::Error> {
@@ -190,7 +261,7 @@ fn write_policy_bundle(
         format!(
             r#"
 id = "{POLICY_ID}"
-version = "{POLICY_VERSION}"
+version = "{version}"
 hooks = ["on_http_request_headers"]
 "#
         ),
@@ -258,10 +329,11 @@ fn write_agent_config(
     spool_path: &Path,
     admin_socket_path: &Path,
     listen_ports: [u16; 2],
+    case: AdminReloadCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = AgentConfig {
-        agent_id: "e2e-admin-enforcement-reload-agent".to_string(),
-        config_version: "e2e-admin-enforcement-reload".to_string(),
+        agent_id: case.agent_id.to_string(),
+        config_version: case.config_version.to_string(),
         ..AgentConfig::default()
     };
     config.capture.selection = CaptureSelection::Libpcap;
@@ -295,26 +367,90 @@ fn write_agent_config(
 fn assert_enforcement_reload_response(
     response: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if response["kind"] == serde_json::json!("enforcement_policy_reload")
-        && response["source"]["manifest"]["id"] == serde_json::json!(MANIFEST_ID)
-        && response["source"]["manifest"]["version"] == serde_json::json!(NEW_MANIFEST_VERSION)
-        && response["source"]["manifest"]["selector_configured"] == serde_json::json!(true)
-        && response["effective_selector_configured"] == serde_json::json!(true)
-        && response["manifest_selector_configured"] == serde_json::json!(true)
-        && response["protective_actions"] == serde_json::json!(["reset"])
-    {
-        Ok(())
-    } else {
-        Err(e2e_error(format!(
-            "unexpected enforcement reload response: {response}"
+    if response["kind"] != serde_json::json!("enforcement_policy_reload") {
+        return Err(e2e_error(format!(
+            "unexpected enforcement reload response kind: {response}"
         ))
-        .into())
+        .into());
     }
+    assert_enforcement_reload_payload(response, "enforcement reload response")
+}
+
+fn assert_runtime_actions_reload_response(
+    response: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if response["kind"] != serde_json::json!("runtime_actions_reload") {
+        return Err(e2e_error(format!(
+            "unexpected runtime actions reload response kind: {response}"
+        ))
+        .into());
+    }
+    let policy = runtime_action_outcome(response, "reload_policies")?;
+    let enforcement = runtime_action_outcome(response, "reload_enforcement_policy")?;
+    assert_policy_reload_success(policy, "runtime actions policy outcome")?;
+    if enforcement["result"] != serde_json::json!("succeeded") {
+        return Err(e2e_error(format!(
+            "unexpected runtime actions enforcement outcome result: {enforcement}"
+        ))
+        .into());
+    }
+    assert_enforcement_reload_payload(enforcement, "runtime actions enforcement outcome")
+}
+
+fn assert_policy_reload_success(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if value["result"] == serde_json::json!("succeeded")
+        && value["loaded_count"] == serde_json::json!(1)
+        && value["policies"][0]["id"] == serde_json::json!(POLICY_ID)
+        && value["active_set_updated"] == serde_json::json!(true)
+    {
+        return Ok(());
+    }
+    Err(e2e_error(format!("unexpected {context}: {value}")).into())
+}
+
+fn assert_enforcement_reload_payload(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if value["source"]["manifest"]["id"] == serde_json::json!(MANIFEST_ID)
+        && value["source"]["manifest"]["version"] == serde_json::json!(NEW_MANIFEST_VERSION)
+        && value["source"]["manifest"]["selector_configured"] == serde_json::json!(true)
+        && value["effective_selector_configured"] == serde_json::json!(true)
+        && value["manifest_selector_configured"] == serde_json::json!(true)
+        && value["protective_actions"] == serde_json::json!(["reset"])
+    {
+        return Ok(());
+    }
+    Err(e2e_error(format!("unexpected {context}: {value}")).into())
+}
+
+fn runtime_action_outcome<'a>(
+    response: &'a serde_json::Value,
+    action_name: &str,
+) -> Result<&'a serde_json::Value, Box<dyn std::error::Error>> {
+    response["actions"]
+        .as_array()
+        .and_then(|actions| {
+            actions
+                .iter()
+                .find(|action| action["action"] == serde_json::json!(action_name))
+        })
+        .map(|action| &action["outcome"])
+        .ok_or_else(|| {
+            e2e_error(format!(
+                "runtime actions reload response omitted {action_name}: {response}"
+            ))
+            .into()
+        })
 }
 
 fn assert_spool_outputs(
     spool_path: &Path,
     listen_ports: [u16; 2],
+    case: AdminReloadCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let spool = FjallSpool::open(spool_path)?;
     let envelopes = spool
@@ -326,7 +462,7 @@ fn assert_spool_outputs(
 
     let mut observed = collect_enforcement_decision_facts(&envelopes, listen_ports)?;
     observed.sort();
-    let mut expected = expected_enforcement_decision_facts(listen_ports);
+    let mut expected = expected_enforcement_decision_facts(listen_ports, case);
     expected.sort();
     if observed != expected {
         return Err(e2e_error(format!(
@@ -336,7 +472,8 @@ fn assert_spool_outputs(
     }
 
     println!(
-        "e2e admin enforcement reload observed {} export records and {} enforcement decisions",
+        "{} observed {} export records and {} enforcement decisions",
+        case.label,
         envelopes.len(),
         observed.len()
     );
@@ -363,9 +500,12 @@ fn collect_enforcement_decision_facts(
         let EventKind::EnforcementDecision(decision) = envelope.kind() else {
             continue;
         };
+        let Some(policy_version) = envelope.policy_version() else {
+            continue;
+        };
         if envelope.origin().source() != CaptureSource::Libpcap
             || envelope.origin().provider() != CaptureProviderKind::Libpcap
-            || envelope.policy_version() != Some(EXPECTED_POLICY_VERSION)
+            || !policy_version.starts_with(&format!("{POLICY_ID}@"))
             || decision.mode != EnforcementMode::DryRun
             || decision.scope != VerdictScope::Request
             || !decision.reason.contains(POLICY_REASON_PREFIX)
@@ -388,7 +528,7 @@ fn collect_enforcement_decision_facts(
             ))
         })?;
         facts.push(EnforcementDecisionFact {
-            policy_version: envelope.policy_version().unwrap_or_default().to_string(),
+            policy_version: policy_version.to_string(),
             listen_port,
             requested_action: action_name(decision.requested_action),
             outcome: outcome_name(decision.outcome),
@@ -400,10 +540,13 @@ fn collect_enforcement_decision_facts(
     Ok(facts)
 }
 
-fn expected_enforcement_decision_facts(listen_ports: [u16; 2]) -> Vec<EnforcementDecisionFact> {
+fn expected_enforcement_decision_facts(
+    listen_ports: [u16; 2],
+    case: AdminReloadCase,
+) -> Vec<EnforcementDecisionFact> {
     vec![
         EnforcementDecisionFact {
-            policy_version: EXPECTED_POLICY_VERSION.to_string(),
+            policy_version: format!("{POLICY_ID}@{}", case.initial_policy_version),
             listen_port: listen_ports[0],
             requested_action: "deny",
             outcome: "dry_run",
@@ -412,7 +555,7 @@ fn expected_enforcement_decision_facts(listen_ports: [u16; 2]) -> Vec<Enforcemen
             reason: format!("{POLICY_REASON_PREFIX} /traffic-probe-e2e/0"),
         },
         EnforcementDecisionFact {
-            policy_version: EXPECTED_POLICY_VERSION.to_string(),
+            policy_version: format!("{POLICY_ID}@{}", case.expected_reloaded_policy_version()),
             listen_port: listen_ports[1],
             requested_action: "reset",
             outcome: "dry_run",

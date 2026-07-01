@@ -994,8 +994,9 @@ E2E profiles are organized around capability claims:
 - `baseline` runs as a normal user and covers replay, plaintext feed,
   gap/loss events, HTTP/SSE/WebSocket, webhook/file export, and one-shot plus
   polled remote policy inputs.
-- `live-core` needs root or CAP_NET_RAW and covers libpcap loopback, admin
-  reload, socket destroy, and TLS key log/session-secret material.
+- `live-core` needs root or CAP_NET_RAW and covers libpcap loopback, single and
+  composite admin reload, socket destroy, and TLS key log/session-secret
+  material.
 - `process-ebpf` needs root/bpffs and covers eBPF process observation plus
   real process ring-buffer output loss.
 - `tls-plaintext` needs root/bpffs and covers the libssl plaintext provider
