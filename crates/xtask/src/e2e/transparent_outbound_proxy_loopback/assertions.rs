@@ -14,8 +14,8 @@ use super::super::{
 use super::commands::{ip_output, ip_route_table_output, nft_command, nft_output};
 use super::fixtures::{ExternalProxyReport, ProxyFixtureReport, UpstreamReport};
 use super::{
-    CLIENT_PAYLOAD, LOOPBACK_ADDR, OUTBOUND_BYPASS_MARK, OutboundProxyE2eCase,
-    OutboundProxyE2eMode, PROXY_PORT, SERVER_RESPONSE, TPROXY_MARK, TPROXY_ROUTE_TABLE,
+    CLIENT_PAYLOAD, LOOPBACK_ADDR, OUTBOUND_BYPASS_MARK, OutboundProxyE2eCase, OutboundProxyMode,
+    OutboundProxyScenario, PROXY_PORT, SERVER_RESPONSE, TPROXY_MARK, TPROXY_ROUTE_TABLE,
 };
 
 const METRICS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -24,25 +24,15 @@ const METRICS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) fn assert_proxy_relay_metrics(
     agent: &mut Child,
     admin_socket_path: &Path,
-    mode: OutboundProxyE2eMode,
+    case: OutboundProxyE2eCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match mode {
-        OutboundProxyE2eMode::ManagedRelay | OutboundProxyE2eMode::OwnerScopedManagedRelay => {
-            wait_for_proxy_relay_metrics(
-                agent,
-                admin_socket_path,
-                ExpectedProxyRelayMetrics {
-                    accepted_relays: 1,
-                    upstream_connect_successes: 1,
-                },
-            )
+    match case.proxy_mode {
+        OutboundProxyMode::ManagedRelay => {
+            wait_for_proxy_relay_metrics(agent, admin_socket_path, expected_relay_metrics(case))
         }
-        OutboundProxyE2eMode::ExternalProxy => {
+        OutboundProxyMode::ExternalProxy => {
             let metrics = read_proxy_relay_metrics(admin_socket_path)?;
-            let expected = ExpectedProxyRelayMetrics {
-                accepted_relays: 0,
-                upstream_connect_successes: 0,
-            };
+            let expected = expected_relay_metrics(case);
             if metrics.matches_expected(expected) {
                 Ok(())
             } else {
@@ -55,6 +45,34 @@ pub(super) fn assert_proxy_relay_metrics(
     }
 }
 
+fn expected_relay_metrics(case: OutboundProxyE2eCase) -> ExpectedProxyRelayMetrics {
+    match (case.proxy_mode, case.scenario) {
+        (OutboundProxyMode::ManagedRelay, OutboundProxyScenario::FlowClassified) => {
+            ExpectedProxyRelayMetrics {
+                accepted_relays: 1,
+                rejected_relays: 1,
+                relay_failures: 0,
+                upstream_connect_successes: 1,
+                upstream_connect_failures: 0,
+            }
+        }
+        (OutboundProxyMode::ManagedRelay, _) => ExpectedProxyRelayMetrics {
+            accepted_relays: 1,
+            rejected_relays: 0,
+            relay_failures: 0,
+            upstream_connect_successes: 1,
+            upstream_connect_failures: 0,
+        },
+        (OutboundProxyMode::ExternalProxy, _) => ExpectedProxyRelayMetrics {
+            accepted_relays: 0,
+            rejected_relays: 0,
+            relay_failures: 0,
+            upstream_connect_successes: 0,
+            upstream_connect_failures: 0,
+        },
+    }
+}
+
 fn wait_for_proxy_relay_metrics(
     agent: &mut Child,
     admin_socket_path: &Path,
@@ -64,7 +82,7 @@ fn wait_for_proxy_relay_metrics(
     loop {
         match read_proxy_relay_metrics(admin_socket_path) {
             Ok(metrics) if metrics.matches_expected(expected) => return Ok(()),
-            Ok(metrics) if metrics.has_failure() => {
+            Ok(metrics) if metrics.has_unexpected_failure(expected) => {
                 return Err(e2e_error(format!(
                     "transparent proxy reported relay failure metrics: {metrics:?}"
                 ))
@@ -96,7 +114,10 @@ fn wait_for_proxy_relay_metrics(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExpectedProxyRelayMetrics {
     accepted_relays: u64,
+    rejected_relays: u64,
+    relay_failures: u64,
     upstream_connect_successes: u64,
+    upstream_connect_failures: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,15 +133,20 @@ struct ProxyRelayMetrics {
 impl ProxyRelayMetrics {
     fn matches_expected(self, expected: ExpectedProxyRelayMetrics) -> bool {
         self.accepted_relays == expected.accepted_relays
+            && self.rejected_relays == expected.rejected_relays
+            && self.relay_failures == expected.relay_failures
             && self.upstream_connect_successes == expected.upstream_connect_successes
-            && !self.has_failure()
+            && self.upstream_connect_failures == expected.upstream_connect_failures
+            && self.listener_failures == 0
     }
 
-    fn has_failure(self) -> bool {
-        self.rejected_relays > 0
-            || self.relay_failures > 0
+    fn has_unexpected_failure(self, expected: ExpectedProxyRelayMetrics) -> bool {
+        self.accepted_relays > expected.accepted_relays
+            || self.rejected_relays > expected.rejected_relays
+            || self.relay_failures > expected.relay_failures
+            || self.upstream_connect_successes > expected.upstream_connect_successes
             || self.listener_failures > 0
-            || self.upstream_connect_failures > 0
+            || self.upstream_connect_failures > expected.upstream_connect_failures
     }
 }
 
@@ -157,7 +183,7 @@ fn metric_u64(
 
 pub(super) fn assert_outbound_redirect_table_installed(
     remote_ports: &[u16],
-    mode: OutboundProxyE2eMode,
+    case: OutboundProxyE2eCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listing = nft_output(["list", "table", "inet", "traffic_probe"])?;
     let mut expected_snippets = vec![
@@ -168,7 +194,7 @@ pub(super) fn assert_outbound_redirect_table_installed(
         format!("redirect to :{PROXY_PORT}"),
         expected_tcp_dport_snippet(remote_ports)?,
     ];
-    if mode == OutboundProxyE2eMode::OwnerScopedManagedRelay {
+    if case.scenario == OutboundProxyScenario::OwnerScoped {
         expected_snippets.push(format!("meta skuid {}", super::OWNER_SCOPED_CLIENT_UID));
         expected_snippets.push(format!("meta skgid {}", super::OWNER_SCOPED_CLIENT_GID));
     }

@@ -57,6 +57,7 @@ use super::super::{
     transparent_outbound_proxy_loopback::{
         run as run_transparent_outbound_proxy_loopback,
         run_external as run_transparent_outbound_external_proxy_loopback,
+        run_flow_classified as run_transparent_outbound_flow_classifier_loopback,
         run_owner_scoped as run_transparent_outbound_owner_proxy_loopback,
         run_remote_policy_bundle as run_transparent_outbound_remote_policy_bundle_loopback,
     },
@@ -356,6 +357,11 @@ const E2E_CASES: &[E2eCase] = &[
         run: E2eCaseRun::ExitCode(run_transparent_outbound_remote_policy_bundle_loopback),
     },
     E2eCase {
+        name: "e2e-transparent-outbound-flow-classifier-loopback",
+        requirement: E2eRequirement::RootNetAdmin,
+        run: E2eCaseRun::ExitCode(run_transparent_outbound_flow_classifier_loopback),
+    },
+    E2eCase {
         name: "e2e-mitm-plaintext-bridge-live-sidecar",
         requirement: E2eRequirement::RootNetAdmin,
         run: E2eCaseRun::ExitCode(run_mitm_plaintext_bridge_live_sidecar),
@@ -494,6 +500,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-transparent-outbound-external-proxy-loopback",
             "e2e-transparent-outbound-owner-proxy-loopback",
             "e2e-transparent-outbound-remote-policy-bundle-loopback",
+            "e2e-transparent-outbound-flow-classifier-loopback",
             "e2e-mitm-plaintext-bridge-live-sidecar",
             "e2e-mitm-policy-hook-plaintext-bridge-live-sidecar",
             "e2e-managed-mitm-plaintext-bridge-live-sidecar",
@@ -842,6 +849,7 @@ mod tests {
                 "e2e-transparent-outbound-external-proxy-loopback",
                 "e2e-transparent-outbound-owner-proxy-loopback",
                 "e2e-transparent-outbound-remote-policy-bundle-loopback",
+                "e2e-transparent-outbound-flow-classifier-loopback",
                 "e2e-mitm-plaintext-bridge-live-sidecar",
                 "e2e-mitm-policy-hook-plaintext-bridge-live-sidecar",
                 "e2e-managed-mitm-plaintext-bridge-live-sidecar",
@@ -907,6 +915,7 @@ mod tests {
                 "e2e-transparent-outbound-external-proxy-loopback",
                 "e2e-transparent-outbound-owner-proxy-loopback",
                 "e2e-transparent-outbound-remote-policy-bundle-loopback",
+                "e2e-transparent-outbound-flow-classifier-loopback",
                 "e2e-mitm-plaintext-bridge-live-sidecar",
                 "e2e-mitm-policy-hook-plaintext-bridge-live-sidecar",
                 "e2e-managed-mitm-plaintext-bridge-live-sidecar",

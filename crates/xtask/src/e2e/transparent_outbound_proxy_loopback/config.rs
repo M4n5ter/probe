@@ -11,7 +11,11 @@ use probe_core::{
     TrafficSelector,
 };
 
-use super::{LOOPBACK_ADDR, OutboundProxyE2eCase, OutboundProxyE2eMode, PROXY_PORT, UPSTREAM_PORT};
+use super::FLOW_CLASSIFIER_REJECTED_PORT;
+use super::{
+    LOOPBACK_ADDR, OutboundProxyE2eCase, OutboundProxyMode, OutboundProxyScenario, PROXY_PORT,
+    UPSTREAM_PORT,
+};
 
 const COLLECTOR_SINK: &str = "collector";
 const POLICY_ID: &str = "outbound-proxy-e2e-policy";
@@ -31,7 +35,7 @@ pub(super) struct AgentConfigInputs<'a> {
     pub(super) enforcement_manifest_path: &'a Path,
     pub(super) policy_source: PolicySourceFixture<'a>,
     pub(super) webhook_endpoint: String,
-    pub(super) remote_ports: &'a [u16],
+    pub(super) redirect_ports: &'a [u16],
     pub(super) case: OutboundProxyE2eCase,
 }
 
@@ -45,8 +49,7 @@ pub(super) fn write_agent_config(
     };
     config.capture.selection = CaptureSelection::Libpcap;
     config.capture.libpcap.interface = Some("lo".to_string());
-    config.capture.libpcap.bpf_filter =
-        format!("tcp and (port {UPSTREAM_PORT} or port {PROXY_PORT})");
+    config.capture.libpcap.bpf_filter = capture_bpf_filter(inputs.case);
     config.capture.libpcap.read_timeout_ms = 100;
     config.storage.path = inputs.spool_path.to_path_buf();
     config.export.worker.enabled = true;
@@ -95,15 +98,7 @@ pub(super) fn write_agent_config(
         ..PolicyConfig::default()
     });
     config.enforcement.mode = EnforcementMode::Enforce;
-    let selector = Selector::term(
-        process_selector(inputs.case.proxy_mode),
-        TrafficSelector {
-            remote_ports: inputs.remote_ports.to_vec(),
-            directions: vec![Direction::Outbound],
-            remote_addresses: vec![LOOPBACK_ADDR.to_string()],
-            ..TrafficSelector::default()
-        },
-    );
+    let selector = interception_selector(inputs.case, inputs.redirect_ports);
     super::super::enforcement_manifest::write_enforcement_policy_manifest(
         inputs.enforcement_manifest_path,
         &EnforcementPolicyManifest {
@@ -120,14 +115,12 @@ pub(super) fn write_agent_config(
     config.enforcement.interception.strategy =
         TransparentInterceptionStrategyConfig::OutboundTransparentProxy;
     config.enforcement.interception.proxy = match inputs.case.proxy_mode {
-        OutboundProxyE2eMode::ManagedRelay | OutboundProxyE2eMode::OwnerScopedManagedRelay => {
-            TransparentInterceptionProxyConfig {
-                mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
-                listen_port: Some(PROXY_PORT),
-                ..TransparentInterceptionProxyConfig::default()
-            }
-        }
-        OutboundProxyE2eMode::ExternalProxy => TransparentInterceptionProxyConfig {
+        OutboundProxyMode::ManagedRelay => TransparentInterceptionProxyConfig {
+            mode: TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+            listen_port: Some(PROXY_PORT),
+            ..TransparentInterceptionProxyConfig::default()
+        },
+        OutboundProxyMode::ExternalProxy => TransparentInterceptionProxyConfig {
             mode: TransparentInterceptionProxyModeConfig::External,
             self_bypass:
                 probe_config::TransparentInterceptionProxySelfBypassConfig::UsesReservedMark,
@@ -140,14 +133,79 @@ pub(super) fn write_agent_config(
     Ok(())
 }
 
+fn capture_bpf_filter(case: OutboundProxyE2eCase) -> String {
+    let mut ports = capture_ports(case);
+    ports.push(PROXY_PORT);
+    ports.sort_unstable();
+    ports.dedup();
+    format!(
+        "tcp and ({})",
+        ports
+            .into_iter()
+            .map(|port| format!("port {port}"))
+            .collect::<Vec<_>>()
+            .join(" or ")
+    )
+}
+
+fn capture_ports(case: OutboundProxyE2eCase) -> Vec<u16> {
+    if case.is_flow_classified() {
+        vec![UPSTREAM_PORT, FLOW_CLASSIFIER_REJECTED_PORT]
+    } else {
+        vec![UPSTREAM_PORT]
+    }
+}
+
+fn interception_selector(case: OutboundProxyE2eCase, remote_ports: &[u16]) -> Selector {
+    match case.scenario {
+        OutboundProxyScenario::FlowClassified => flow_classified_selector(),
+        _ => Selector::term(
+            process_selector(case.scenario),
+            outbound_traffic_selector(remote_ports.to_vec()),
+        ),
+    }
+}
+
+fn flow_classified_selector() -> Selector {
+    Selector::Any {
+        selectors: vec![
+            Selector::term(
+                process_name_selector("xtask"),
+                outbound_traffic_selector(vec![UPSTREAM_PORT]),
+            ),
+            Selector::term(
+                process_name_selector("not-xtask"),
+                outbound_traffic_selector(vec![FLOW_CLASSIFIER_REJECTED_PORT]),
+            ),
+        ],
+    }
+}
+
+fn outbound_traffic_selector(remote_ports: Vec<u16>) -> TrafficSelector {
+    TrafficSelector {
+        remote_ports,
+        directions: vec![Direction::Outbound],
+        remote_addresses: vec![LOOPBACK_ADDR.to_string()],
+        ..TrafficSelector::default()
+    }
+}
+
+fn process_name_selector(name: &str) -> ProcessSelector {
+    ProcessSelector {
+        names: vec![name.to_string()],
+        ..ProcessSelector::default()
+    }
+}
+
 pub(super) fn redirected_remote_ports(
-    mode: OutboundProxyE2eMode,
+    case: OutboundProxyE2eCase,
     webhook_port: u16,
     policy_source: &PolicySourceFixture<'_>,
 ) -> Vec<u16> {
-    match mode {
-        OutboundProxyE2eMode::OwnerScopedManagedRelay => vec![UPSTREAM_PORT],
-        OutboundProxyE2eMode::ManagedRelay | OutboundProxyE2eMode::ExternalProxy => {
+    match case.scenario {
+        OutboundProxyScenario::OwnerScoped => vec![UPSTREAM_PORT],
+        OutboundProxyScenario::FlowClassified => vec![UPSTREAM_PORT, FLOW_CLASSIFIER_REJECTED_PORT],
+        OutboundProxyScenario::Standard => {
             let mut ports = vec![UPSTREAM_PORT, webhook_port];
             if let PolicySourceFixture::RemoteBundle { listen_port, .. } = policy_source {
                 ports.push(*listen_port);
@@ -157,14 +215,14 @@ pub(super) fn redirected_remote_ports(
     }
 }
 
-fn process_selector(mode: OutboundProxyE2eMode) -> ProcessSelector {
-    match mode {
-        OutboundProxyE2eMode::OwnerScopedManagedRelay => ProcessSelector {
+fn process_selector(scenario: OutboundProxyScenario) -> ProcessSelector {
+    match scenario {
+        OutboundProxyScenario::OwnerScoped => ProcessSelector {
             uids: vec![super::OWNER_SCOPED_CLIENT_UID],
             gids: vec![super::OWNER_SCOPED_CLIENT_GID],
             ..ProcessSelector::default()
         },
-        OutboundProxyE2eMode::ManagedRelay | OutboundProxyE2eMode::ExternalProxy => {
+        OutboundProxyScenario::Standard | OutboundProxyScenario::FlowClassified => {
             ProcessSelector::default()
         }
     }

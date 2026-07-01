@@ -13,7 +13,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use super::super::harness::e2e_error;
 use super::commands::nc_command;
 use super::{
-    CLIENT_PAYLOAD, CLIENT_TIMEOUT, LOOPBACK_ADDR, OUTBOUND_BYPASS_MARK, OutboundProxyE2eMode,
+    CLIENT_PAYLOAD, CLIENT_TIMEOUT, LOOPBACK_ADDR, OUTBOUND_BYPASS_MARK, OutboundProxyMode,
     PROXY_PORT, SERVER_ACCEPT_TIMEOUT, SERVER_RESPONSE, UPSTREAM_PORT,
 };
 
@@ -58,12 +58,10 @@ pub(super) enum ProxyFixture {
 }
 
 impl ProxyFixture {
-    pub(super) fn spawn(mode: OutboundProxyE2eMode) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(super) fn spawn(mode: OutboundProxyMode) -> Result<Self, Box<dyn std::error::Error>> {
         match mode {
-            OutboundProxyE2eMode::ManagedRelay | OutboundProxyE2eMode::OwnerScopedManagedRelay => {
-                Ok(Self::ManagedRelay)
-            }
-            OutboundProxyE2eMode::ExternalProxy => {
+            OutboundProxyMode::ManagedRelay => Ok(Self::ManagedRelay),
+            OutboundProxyMode::ExternalProxy => {
                 ExternalProxyServer::spawn().map(Self::ExternalProxy)
             }
         }
@@ -246,6 +244,16 @@ pub(super) fn run_client(
         ))
         .into())
     }
+}
+
+pub(super) fn run_current_process_client(port: u16) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect((LOOPBACK_ADDR, port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream.write_all(CLIENT_PAYLOAD)?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    Ok(response)
 }
 
 fn wait_with_timeout(
