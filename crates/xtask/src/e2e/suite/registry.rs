@@ -46,6 +46,7 @@ use super::super::{
         run as run_tls_plaintext_loopback, run_dynamic as run_tls_plaintext_dynamic_loopback,
         run_target_lifecycle as run_tls_plaintext_target_lifecycle_loopback,
     },
+    tls_plaintext_output_loss::run as run_tls_plaintext_output_loss,
     tls_plaintext_provider_loopback::run as run_tls_plaintext_provider_loopback,
     transparent_linux_outbound_redirect_artifact::run as run_transparent_linux_outbound_redirect_artifact,
     transparent_outbound_proxy_loopback::{
@@ -238,6 +239,11 @@ const E2E_CASES: &[E2eCase] = &[
         name: "e2e-tls-plaintext-provider-loopback",
         requirement: E2eRequirement::RootBpffs,
         run: E2eCaseRun::ExitCode(run_tls_plaintext_provider_loopback),
+    },
+    E2eCase {
+        name: "e2e-tls-plaintext-output-loss",
+        requirement: E2eRequirement::RootBpffs,
+        run: E2eCaseRun::ExitCode(run_tls_plaintext_output_loss),
     },
     E2eCase {
         name: "e2e-tls-plaintext-loopback",
@@ -440,6 +446,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
         include_in_product: true,
         cases: E2eProfileCases::Named(&[
             "e2e-tls-plaintext-provider-loopback",
+            "e2e-tls-plaintext-output-loss",
             "e2e-tls-plaintext-loopback",
             "e2e-tls-plaintext-dynamic-loopback",
             "e2e-tls-plaintext-target-lifecycle-loopback",
@@ -704,6 +711,7 @@ mod tests {
             description: "root/bpffs libssl plaintext instrumentation lifecycle suite",
             cases: ExpectedProfileCases::Named(&[
                 "e2e-tls-plaintext-provider-loopback",
+                "e2e-tls-plaintext-output-loss",
                 "e2e-tls-plaintext-loopback",
                 "e2e-tls-plaintext-dynamic-loopback",
                 "e2e-tls-plaintext-target-lifecycle-loopback",
@@ -773,6 +781,7 @@ mod tests {
                 "e2e-ebpf-process-loopback",
                 "e2e-ebpf-process-output-loss",
                 "e2e-tls-plaintext-provider-loopback",
+                "e2e-tls-plaintext-output-loss",
                 "e2e-tls-plaintext-loopback",
                 "e2e-tls-plaintext-dynamic-loopback",
                 "e2e-tls-plaintext-target-lifecycle-loopback",

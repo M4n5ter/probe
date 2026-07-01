@@ -822,8 +822,10 @@ E2E profile 按 capability claim 组织：
   HTTP/SSE/WebSocket、webhook/file export，以及一次性和后台 polling remote policy input。
 - `live-core` 需要 root 或 CAP_NET_RAW，覆盖 libpcap loopback、admin reload、
   socket destroy 和 TLS key log/session-secret material。
-- `process-ebpf` 需要 root/bpffs，覆盖 eBPF process observation。
-- `tls-plaintext` 需要 root/bpffs，覆盖 libssl plaintext provider 和 attach lifecycle。
+- `process-ebpf` 需要 root/bpffs，覆盖 eBPF process observation 和真实 process
+  ring-buffer output loss。
+- `tls-plaintext` 需要 root/bpffs，覆盖 libssl plaintext provider、attach lifecycle
+  和真实 TLS plaintext ring-buffer output loss。
 - `transparent-interception` 需要 root/net-admin，覆盖 inbound TPROXY、outbound proxy、
   MITM plaintext bridge、policy hook 和 product proxy HTTPS/WebSocket path。
 - `linux-artifacts` 需要 root/net-admin，覆盖 Linux transparent interception artifact

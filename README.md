@@ -871,7 +871,7 @@ E2E profiles are organized around capability claims:
 - `process-ebpf` needs root/bpffs and covers eBPF process observation plus
   real process ring-buffer output loss.
 - `tls-plaintext` needs root/bpffs and covers the libssl plaintext provider
-  and attach lifecycle.
+  attach lifecycle, and real TLS plaintext ring-buffer output loss.
 - `transparent-interception` needs root/net-admin and covers inbound TPROXY,
   outbound proxy, MITM plaintext bridge, policy hook, and product proxy
   HTTPS/WebSocket paths.
