@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt,
     str::FromStr,
     sync::{
@@ -17,6 +18,8 @@ use crate::event_view::PolicyEventView;
 const DEFAULT_INSTRUCTION_BUDGET: u64 = 100_000;
 const DEFAULT_MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const INSTRUCTION_HOOK_INTERVAL: u32 = 1_000;
+const POLICY_MODULE_CACHE_REGISTRY_KEY: &str = "probe_policy_module_cache";
+const POLICY_MODULE_LOADING_REGISTRY_KEY: &str = "probe_policy_module_loading";
 pub const POLICY_HOOKS: &[PolicyHook] = &[
     PolicyHook::ConnectionOpened,
     PolicyHook::ConnectionClosed,
@@ -140,6 +143,8 @@ pub struct UnknownPolicyHook {
 pub enum PolicyError {
     #[error("failed to initialize Lua policy: {0}")]
     Init(#[from] mlua::Error),
+    #[error("policy bundle defines module {module} more than once")]
+    DuplicateModule { module: String },
     #[error(
         "policy manifest declares hook {hook}, but source does not define a Lua function with that name"
     )]
@@ -156,6 +161,12 @@ pub struct PolicyManifest {
     pub id: String,
     pub version: String,
     pub hooks: Vec<PolicyHook>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyModule {
+    pub name: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,14 +200,22 @@ pub struct PolicyRuntime {
 
 impl PolicyRuntime {
     pub fn from_source(manifest: PolicyManifest, source: &str) -> Result<Self, PolicyError> {
-        Self::from_source_with_limits(manifest, source, PolicyLimits::default())
+        Self::from_bundle_with_limits(manifest, source, Vec::new(), PolicyLimits::default())
     }
 
     pub fn from_source_with_required_hooks(
         manifest: PolicyManifest,
         source: &str,
     ) -> Result<Self, PolicyError> {
-        let runtime = Self::from_source(manifest, source)?;
+        Self::from_bundle_with_required_hooks(manifest, source, Vec::new())
+    }
+
+    pub fn from_bundle_with_required_hooks(
+        manifest: PolicyManifest,
+        source: &str,
+        modules: Vec<PolicyModule>,
+    ) -> Result<Self, PolicyError> {
+        let runtime = Self::from_bundle(manifest, source, modules)?;
         runtime.validate_manifest_hooks()?;
         Ok(runtime)
     }
@@ -206,12 +225,31 @@ impl PolicyRuntime {
         source: &str,
         limits: PolicyLimits,
     ) -> Result<Self, PolicyError> {
+        Self::from_bundle_with_limits(manifest, source, Vec::new(), limits)
+    }
+
+    pub fn from_bundle(
+        manifest: PolicyManifest,
+        source: &str,
+        modules: Vec<PolicyModule>,
+    ) -> Result<Self, PolicyError> {
+        Self::from_bundle_with_limits(manifest, source, modules, PolicyLimits::default())
+    }
+
+    pub fn from_bundle_with_limits(
+        manifest: PolicyManifest,
+        source: &str,
+        modules: Vec<PolicyModule>,
+        limits: PolicyLimits,
+    ) -> Result<Self, PolicyError> {
+        let modules = build_module_registry(modules)?;
         let lua = Lua::new_with(policy_stdlibs(), LuaOptions::default())?;
         lua.set_memory_limit(limits.memory_limit_bytes)?;
         let instruction_budget = Arc::new(AtomicU64::new(limits.instruction_budget));
         install_instruction_budget(&lua, Arc::clone(&instruction_budget))?;
         install_probe_api(&lua)?;
         remove_host_capabilities(&lua)?;
+        install_bundle_module_loader(&lua, modules)?;
         instruction_budget.store(limits.instruction_budget, Ordering::Relaxed);
         lua.load(source).set_name(&manifest.id).exec()?;
         Ok(Self {
@@ -264,6 +302,23 @@ impl PolicyRuntime {
         }
         Ok(())
     }
+}
+
+fn build_module_registry(
+    modules: Vec<PolicyModule>,
+) -> Result<Arc<HashMap<String, String>>, PolicyError> {
+    let mut registry = HashMap::with_capacity(modules.len());
+    for module in modules {
+        if registry
+            .insert(module.name.clone(), module.source)
+            .is_some()
+        {
+            return Err(PolicyError::DuplicateModule {
+                module: module.name,
+            });
+        }
+    }
+    Ok(Arc::new(registry))
 }
 
 fn policy_stdlibs() -> StdLib {
@@ -339,6 +394,58 @@ fn remove_host_capabilities(lua: &Lua) -> Result<(), mlua::Error> {
     Ok(())
 }
 
+fn install_bundle_module_loader(
+    lua: &Lua,
+    modules: Arc<HashMap<String, String>>,
+) -> Result<(), mlua::Error> {
+    let cache = lua.create_table()?;
+    lua.set_named_registry_value(POLICY_MODULE_CACHE_REGISTRY_KEY, cache)?;
+    let loading = lua.create_table()?;
+    lua.set_named_registry_value(POLICY_MODULE_LOADING_REGISTRY_KEY, loading)?;
+    let require = lua.create_function(move |lua, module: String| {
+        let Some(source) = modules.get(&module) else {
+            return Err(mlua::Error::RuntimeError(format!(
+                "Lua policy module is not declared in this bundle: {module}"
+            )));
+        };
+
+        let cache: Table = lua.named_registry_value(POLICY_MODULE_CACHE_REGISTRY_KEY)?;
+        let cached = cache.get::<Value>(module.as_str())?;
+        if !matches!(cached, Value::Nil) {
+            return Ok(cached);
+        }
+
+        let loading: Table = lua.named_registry_value(POLICY_MODULE_LOADING_REGISTRY_KEY)?;
+        if loading.get::<bool>(module.as_str()).unwrap_or(false) {
+            return Err(mlua::Error::RuntimeError(format!(
+                "Lua policy module require cycle detected: {module}"
+            )));
+        }
+        loading.set(module.as_str(), true)?;
+        let loaded = match lua
+            .load(source.as_str())
+            .set_name(format!("@policy-module:{module}"))
+            .eval::<Value>()
+        {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                loading.set(module.as_str(), Value::Nil)?;
+                return Err(error);
+            }
+        };
+        loading.set(module.as_str(), Value::Nil)?;
+        let module_value = if matches!(loaded, Value::Nil) {
+            Value::Boolean(true)
+        } else {
+            loaded
+        };
+        cache.set(module.as_str(), module_value.clone())?;
+        Ok(module_value)
+    })?;
+    lua.globals().set("require", require)?;
+    Ok(())
+}
+
 fn value_to_outcomes(lua: &Lua, value: Value) -> Result<Vec<PolicyOutcome>, PolicyError> {
     match value {
         Value::Nil => Ok(Vec::new()),
@@ -388,8 +495,8 @@ mod tests {
     };
 
     use crate::{
-        POLICY_HOOKS, PolicyError, PolicyHook, PolicyLimits, PolicyManifest, PolicyOutcome,
-        PolicyRuntime, hook_for_event,
+        POLICY_HOOKS, PolicyError, PolicyHook, PolicyLimits, PolicyManifest, PolicyModule,
+        PolicyOutcome, PolicyRuntime, hook_for_event,
     };
 
     #[test]
@@ -797,6 +904,163 @@ mod tests {
         let result = runtime.handle_event(primary_hook_for_event(&event), &event);
         assert!(result.is_err());
         Ok(())
+    }
+
+    #[test]
+    fn lua_policy_can_require_declared_bundle_module() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = PolicyRuntime::from_bundle_with_required_hooks(
+            PolicyManifest {
+                id: "modules".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::HttpRequestHeaders],
+            },
+            r#"
+            local matcher = require("guard.matcher")
+
+            function on_http_request_headers(event)
+              if matcher.matches(event.kind.target) then
+                return probe.emit_alert("module matched " .. event.kind.target)
+              end
+              return nil
+            end
+            "#,
+            vec![PolicyModule {
+                name: "guard.matcher".to_string(),
+                source: r#"
+                local M = {}
+
+                function M.matches(target)
+                  return target == "/chat"
+                end
+
+                return M
+                "#
+                .to_string(),
+            }],
+        )?;
+
+        let event = demo_event();
+        let outcomes = runtime.handle_event(primary_hook_for_event(&event), &event)?;
+
+        assert!(
+            matches!(outcomes.first(), Some(PolicyOutcome::Alert(alert)) if alert.message == "module matched /chat")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lua_policy_rejects_undeclared_bundle_module() -> Result<(), Box<dyn std::error::Error>> {
+        let result = PolicyRuntime::from_bundle_with_required_hooks(
+            PolicyManifest {
+                id: "missing-module".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::HttpRequestHeaders],
+            },
+            r#"
+            local matcher = require("guard.matcher")
+
+            function on_http_request_headers(_)
+              return matcher
+            end
+            "#,
+            Vec::new(),
+        );
+
+        assert!(matches!(result, Err(PolicyError::Init(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn lua_policy_rejects_duplicate_bundle_module_names() {
+        let result = PolicyRuntime::from_bundle(
+            PolicyManifest {
+                id: "duplicate-module".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::HttpRequestHeaders],
+            },
+            "function on_http_request_headers(_) return nil end",
+            vec![
+                PolicyModule {
+                    name: "guard.matcher".to_string(),
+                    source: "return {}".to_string(),
+                },
+                PolicyModule {
+                    name: "guard.matcher".to_string(),
+                    source: "return {}".to_string(),
+                },
+            ],
+        );
+
+        assert!(matches!(
+            result,
+            Err(PolicyError::DuplicateModule { module }) if module == "guard.matcher"
+        ));
+    }
+
+    #[test]
+    fn lua_policy_does_not_cache_failed_bundle_module_load()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = PolicyRuntime::from_bundle_with_required_hooks(
+            PolicyManifest {
+                id: "failed-module".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::HttpRequestHeaders],
+            },
+            r#"
+            function on_http_request_headers(_)
+              local broken = require("guard.broken")
+              return probe.emit_alert(tostring(broken))
+            end
+            "#,
+            vec![PolicyModule {
+                name: "guard.broken".to_string(),
+                source: r#"error("broken module")"#.to_string(),
+            }],
+        )?;
+
+        let event = demo_event();
+
+        assert!(
+            runtime
+                .handle_event(primary_hook_for_event(&event), &event)
+                .is_err()
+        );
+        assert!(
+            runtime
+                .handle_event(primary_hook_for_event(&event), &event)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lua_policy_rejects_bundle_module_require_cycle() {
+        let result = PolicyRuntime::from_bundle_with_required_hooks(
+            PolicyManifest {
+                id: "module-cycle".to_string(),
+                version: "1.0.0".to_string(),
+                hooks: vec![PolicyHook::HttpRequestHeaders],
+            },
+            r#"
+            local a = require("guard.a")
+
+            function on_http_request_headers(_)
+              return probe.emit_alert(tostring(a))
+            end
+            "#,
+            vec![
+                PolicyModule {
+                    name: "guard.a".to_string(),
+                    source: r#"return require("guard.b")"#.to_string(),
+                },
+                PolicyModule {
+                    name: "guard.b".to_string(),
+                    source: r#"return require("guard.a")"#.to_string(),
+                },
+            ],
+        );
+
+        assert!(matches!(result, Err(PolicyError::Init(_))));
     }
 
     #[test]

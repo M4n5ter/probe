@@ -6,16 +6,21 @@ kernel objects. It receives a stable Lua table derived from the event model.
 
 ## Bundle Layout
 
-A local bundle is a directory containing `manifest.toml` and `main.lua`:
+A local bundle is a directory containing `manifest.toml`, `main.lua`, and
+optional bundle-local Lua modules:
 
 ```text
 policy/
   manifest.toml
   main.lua
+  modules/
+    guard/
+      matcher.lua
 ```
 
 `manifest.toml` declares the bundle identity and the hooks that Probe should
-call:
+call. If the policy uses bundle-local modules, each module name must be listed
+explicitly:
 
 ```toml
 id = "http-guard"
@@ -25,11 +30,17 @@ hooks = [
   "on_http_response_headers",
   "on_websocket_message",
 ]
+modules = ["guard.matcher"]
 ```
 
 Every hook named in the manifest must be implemented as a global Lua function
 with the same name. `agent check` validates this before the policy becomes
 active.
+
+Bundle-local modules are loaded with `require("guard.matcher")`. Module names
+must be dotted Lua identifiers and map to `modules/guard/matcher.lua` in local
+bundles. Undeclared modules, duplicate module names, symlinked module files, and
+oversized module sources are rejected. A bundle may declare up to 64 modules.
 
 ## Runtime Model
 
@@ -38,9 +49,11 @@ an array of outcomes. Hooks should be deterministic and bounded. Probe resets
 the instruction budget for each hook invocation and records runtime failures as
 policy runtime error events.
 
-Allowed Lua standard libraries are `table`, `string`, `math`, and `bit`. Host
-capabilities are removed: `require`, `io`, `os`, `package`, `debug`, `ffi`,
-`jit`, `dofile`, `loadfile`, `load`, and `collectgarbage` are unavailable.
+Allowed Lua standard libraries are `table`, `string`, `math`, and `bit`.
+`require` is replaced by a bundle-local module loader that can load only modules
+declared by the bundle manifest. Host capabilities are removed: `io`, `os`,
+`package`, `debug`, `ffi`, `jit`, `dofile`, `loadfile`, `load`, and
+`collectgarbage` are unavailable.
 
 ## Hook Names
 
@@ -325,8 +338,9 @@ local testing. Credentials in URLs are rejected.
 
 The endpoint response body is one TOML document. The `source` field carries the
 Lua source that would otherwise be stored in `main.lua`; the `[manifest]` table
-uses the same schema as a local `manifest.toml`. Unknown top-level or manifest
-fields are rejected.
+uses the same schema as a local `manifest.toml`. Bundle-local modules are carried
+as `[[modules]]` entries with `name` and `source`. Unknown top-level, manifest,
+or module fields are rejected.
 
 `runtime_error_disable_threshold` is evaluated per policy. A Lua runtime error
 advances the consecutive error counter after its `policy_runtime_error` audit
@@ -337,8 +351,10 @@ Use `0` to keep exporting errors without automatic disablement.
 
 ```toml
 source = '''
+local format = require("guard.format")
+
 function on_http_request_headers(event)
-  return probe.emit_alert("HTTP " .. event.kind.method .. " " .. event.kind.target)
+  return probe.emit_alert(format.alert(event))
 end
 '''
 
@@ -346,6 +362,19 @@ end
 id = "http-guard"
 version = "2026-06-30"
 hooks = ["on_http_request_headers"]
+modules = ["guard.format"]
+
+[[modules]]
+name = "guard.format"
+source = '''
+local M = {}
+
+function M.alert(event)
+  return "HTTP " .. event.kind.method .. " " .. event.kind.target
+end
+
+return M
+'''
 ```
 
 Validate before running:

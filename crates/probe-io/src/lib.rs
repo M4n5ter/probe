@@ -5,9 +5,10 @@ mod tcp;
 pub use bounded_file::{
     BoundedFileError, BoundedFileErrorKind, BoundedFileErrorParts, BoundedFileSizeLimit,
     BoundedRegularFile, BoundedRegularFileRead, OwnerPrivateFileError, RootedBoundedFileError,
-    check_bounded_regular_file, inspect_bounded_regular_file, open_bounded_regular_file,
-    open_bounded_regular_file_under_roots, read_bounded_regular_file,
-    read_bounded_regular_file_to_string, validate_owner_private_file,
+    check_bounded_regular_file, check_bounded_regular_file_under_root,
+    inspect_bounded_regular_file, open_bounded_regular_file, open_bounded_regular_file_under_roots,
+    read_bounded_regular_file, read_bounded_regular_file_to_string,
+    read_bounded_regular_file_to_string_under_root, validate_owner_private_file,
 };
 pub use file_roots::{
     AllowedFileRootViolation, AllowedFileRootViolationKind, AllowedFileRoots, AllowedFileRootsError,

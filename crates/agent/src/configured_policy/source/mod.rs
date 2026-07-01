@@ -1,3 +1,4 @@
+mod bundle;
 mod loader;
 
 pub(crate) use loader::{

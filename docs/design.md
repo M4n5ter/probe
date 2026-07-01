@@ -181,7 +181,7 @@ flowchart LR
 
 当前明确不做：
 
-- 不做无 selector、无能力门控、无审计边界的默认全机 MITM；显式 MITM 是目标能力。
+- 不做无 selector、无能力门控、无审计边界的默认全机 MITM；显式 MITM 是受控能力。
 - 不默认启用真实连接阻断；必须显式选择 enforcement backend。
 - 不承诺 Go `crypto/tls`、rustls、Java TLS 的明文覆盖。
 - WebSocket `websocket_message` payload 上限为 16 MiB；超限 message 保留 frame metadata
@@ -1556,7 +1556,7 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 
 - configured policy 使用 `policies[].source` 作为显式 source contract。
 - enabled policy id 必须唯一。
-- manifest 支持 `id`、`version` 和 typed `hooks`。
+- manifest 支持 `id`、`version`、typed `hooks` 和显式 `modules`。
 - manifest id 必须与配置中的 policy id 一致。
 - 多个 enabled bundle 会按配置顺序进入同一 pipeline。
 - 每个 bundle 应用自己的 selector。
@@ -1571,13 +1571,14 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 
 | Source kind | 配置形态 | 加载语义 |
 | --- | --- | --- |
-| `local_directory` | `path` 指向 policy bundle directory。 | 读取 `manifest.toml` 和 `main.lua`；拒绝 symlink entry；`main.lua` capped read 为 1 MiB。 |
-| `remote_bundle` | `endpoint` 加可选 `max_body_bytes`。 | 对 endpoint 做一次 bounded GET；response body 是单个 TOML document。 |
+| `local_directory` | `path` 指向 policy bundle directory。 | 读取 `manifest.toml`、`main.lua` 和 manifest 声明的 `modules/*.lua`；拒绝 symlink entry；每个 executable Lua source capped read 为 1 MiB。 |
+| `remote_bundle` | `endpoint` 加可选 `max_body_bytes`。 | 对 endpoint 做一次 bounded GET；response body 是单个 TOML document，可携带 manifest 声明的 `[[modules]]` source。 |
 
 remote bundle 不是 tar/zip/package archive；agent 不解包远程目录，也不从 response 中解释路径。
-这个约束避免 path traversal、归档格式差异和 bundle-local module 语义提前泄漏。
-`max_body_bytes` 约束 response body；document 包含 `source` 字符串和 `[manifest]`。
-解析出的 `source` capped read 语义等同 1 MiB `main.lua`。
+这个约束避免 path traversal 和归档格式差异。
+`max_body_bytes` 约束 response body；document 包含 `source` 字符串、`[manifest]` 和可选
+`[[modules]]`。解析出的 `source` 与每个 module `source` capped read 语义等同 1 MiB
+本地 Lua source。
 
 #### External enforcement manifest
 
@@ -2648,7 +2649,7 @@ LuaJIT FFI：
 - 使用 `mlua` + LuaJIT。
 - 只加载受限标准库：table、string、math、bit。
 - 显式移除 `ffi`、`io`、`os`、`package`、`debug`、`jit`、`dofile`、`loadfile`、`load`、`collectgarbage`。
-- `require` 被替换为固定错误函数，不允许访问系统 Lua 路径。
+- `require` 被替换为 bundle-local loader，只能加载 manifest 声明的 module，不允许访问系统 Lua 路径。
 - runtime 同时设置 instruction budget 和 memory limit；instruction budget 防死循环，memory limit 防少量指令的大分配 OOM。
 - configured policy loader 接受 typed `policies[].source`；单个 Lua 文件只作为 `replay --policy` 的本地调试入口，不进入配置化 policy source。
 
@@ -2661,20 +2662,22 @@ Source contract：
 
 | Source kind | Source 形态 | Source 边界 |
 | --- | --- | --- |
-| `local_directory` | 目录内包含 `manifest.toml` 和 `main.lua`。 | 拒绝 symlink entry；`main.lua` 受 executable source size limit 约束。 |
-| `remote_bundle` | HTTP response body 是单个 TOML document。 | 执行一次 bounded GET；不解包 archive，不解释远程路径，不支持 bundle-local module。 |
+| `local_directory` | 目录内包含 `manifest.toml`、`main.lua` 和可选 `modules/`。 | 拒绝 symlink entry；`main.lua` 与每个 manifest 声明的 module source 受 executable source size limit 约束。 |
+| `remote_bundle` | HTTP response body 是单个 TOML document。 | 执行一次 bounded GET；不解包 archive，不解释远程路径；`[[modules]]` 必须与 manifest 声明精确匹配。 |
 
 remote bundle document 形态：
 
 `local_directory` 通过 no-follow open、handle metadata 和 capped read 读取 source entry，
 避免把目录外文件纳入策略源。
 `remote_bundle` response body 受 `max_body_bytes` 约束；解析出的 `source`
-继续受 executable source size limit 约束。
+和每个 module `source` 继续受 executable source size limit 约束。
 
 ```toml
 source = '''
+local format = require("guard.format")
+
 function on_http_request_headers(event)
-  return probe.emit_alert("observed " .. event.kind.target)
+  return probe.emit_alert(format.alert(event))
 end
 '''
 
@@ -2682,6 +2685,19 @@ end
 id = "guard"
 version = "2026.06"
 hooks = ["on_http_request_headers"]
+modules = ["guard.format"]
+
+[[modules]]
+name = "guard.format"
+source = '''
+local M = {}
+
+function M.alert(event)
+  return "observed " .. event.kind.target
+end
+
+return M
+'''
 ```
 
 Manifest contract：
@@ -2691,28 +2707,40 @@ Manifest contract：
 | `id` | policy 身份。 | 必须与 runtime config 中的 `policies[].id` 一致。 |
 | `version` | policy 版本。 | 进入 `policy_version`，用于 alert/verdict/enforcement audit event。 |
 | `hooks` | Lua callback 列表。 | 使用 typed policy hook enum；callback name 见下方。 |
+| `modules` | bundle-local Lua module name 列表。 | 每个 name 必须是 dotted Lua identifier；最多 64 个；本地映射到 `modules/<segments>.lua`，远端必须有同名 `[[modules]]` source。 |
 
 Manifest hook names：
 
+- `on_connection_opened`
+- `on_connection_closed`
 - `on_http_request_headers`
+- `on_http_response_headers`
+- `on_http_body_chunk`
+- `on_sse_event`
 - `on_websocket_handoff`
 - `on_websocket_frame`
 - `on_websocket_message`
+- `on_opaque_stream`
+- `on_gap`
+- `on_protocol_error`
 
 未知 manifest 字段会 fail closed。selector、required/preferred capabilities、state budget、resource limits、delivery metadata、
-checksum/signature 和 bundle-local `lib/` 都是目标能力，未实现前不能被 manifest 静默接受。
+checksum/signature 和非 manifest 声明的 bundle-local `lib/` 都是目标能力，未实现前不能被 manifest 静默接受。
 
 加载流程：
 
 1. 读取 source。
 2. 校验 manifest。
-3. 在独立 Lua VM 中编译 Lua source。
-4. 校验 manifest 声明的每个 hook 都在 Lua VM 中定义为函数。
-5. 通过后原子切换 active policy set。
-6. 失败时不切换当前 active policy set。
+3. 读取并校验 manifest 声明的 bundle-local modules。
+4. 在独立 Lua VM 中安装受限 module loader 并编译 Lua source。
+5. 校验 manifest 声明的每个 hook 都在 Lua VM 中定义为函数。
+6. 通过后原子切换 active policy set。
+7. 失败时不切换当前 active policy set。
 
-不允许从系统 Lua 路径 require 模块。这样可以保证策略可复现、可审计、可回滚。
-`main.lua` 和 remote `source` 复用同一 executable source size limit、sandbox、instruction budget 和 memory limit。
+`require` 只能加载 manifest 声明的 bundle-local module；不允许从系统 Lua 路径 require 模块。
+这样可以保证策略可复现、可审计、可回滚。
+`main.lua`、remote `source` 和 bundle-local module source 复用同一 executable source size limit、sandbox、
+instruction budget 和 memory limit。
 在线 admin `reload_policies` 会重新读取当前配置引用的 enabled sources，在独立 Lua VM 中加载并校验所有 manifest hooks，
 通过后原子替换 active set，失败时保留旧 active set。本地 policy bundle watcher 使用同一 validate-then-swap contract；
 watcher 由本地 bundle 文件事件触发，但执行的是全量 enabled policy source reload；任意 enabled remote source 拉取失败都会阻止本次 swap。
@@ -6589,7 +6617,7 @@ special-use allowance，证明 DNS discovery 进入入站/出站透明 HTTPS all
   进程归因和 TLS 明文弱，不适合进程级探针主线。
 - proxy-first 作为唯一主采集路径：拒绝。
   侵入性高，会让采集主线被代理生命周期和证书分发牵引。
-  显式 MITM backend 仍是目标能力，但不替代 eBPF/libpcap/ plaintext provider 主线。
+  显式 MITM backend 是独立能力，但不替代 eBPF/libpcap/plaintext provider 主线。
 - 全 Tokio 热路径：拒绝。
   高吞吐字节流和 parser/policy 热路径不应被 async 调度污染。
 - 默认启用真实连接级阻断：推迟。
@@ -6671,7 +6699,7 @@ P2 不允许默认全机 MITM；plaintext bridge hardening 属于显式 MITM bac
 | 策略语言 | mlua + LuaJIT | 第 15 节 |
 | policy runtime execution engine | 当前执行引擎使用 `mlua` + LuaJIT；不暴露独立 JIT availability probe/status/metric | 第 15 节 |
 | policy runtime FFI boundary | 当前执行引擎的 FFI 默认禁用 | 第 15 节 |
-| Policy Bundle | `local_directory` 使用 `manifest.toml + main.lua`；`remote_bundle` 使用单 TOML document；bundle-local modules 是目标能力 | 第 16 节 |
+| Policy Bundle | `local_directory` 使用 `manifest.toml + main.lua + manifest-declared modules`；`remote_bundle` 使用单 TOML document 和 manifest-declared `[[modules]]` | 第 16 节 |
 | 策略 Hook | 分阶段 Hook，selector 先预过滤 | 第 17 节 |
 | policy state | 有界状态 API，跨 worker eventually consistent | 第 17 节 |
 | policy bundle reload | 在线 admin 手动 reload、本地 bundle watcher 或 remote bundle poller 触发 enabled sources 的新 VM 校验后原子切换 | 第 17、28 节 |

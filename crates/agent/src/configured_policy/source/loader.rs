@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use policy::{PolicyHook, PolicyManifest};
+use policy::PolicyManifest;
 use probe_config::{
     DEFAULT_REMOTE_POLICY_BUNDLE_BODY_LIMIT_BYTES, PolicyConfig, PolicySourceConfig,
     RemotePolicyBundleBodyLimitBytes, RemotePolicyBundleBodyLimitError,
@@ -14,13 +14,18 @@ use probe_http::HttpConnectionOptions;
 use serde::{Deserialize, Serialize};
 
 use probe_io::{
-    BoundedFileError, BoundedFileErrorKind, check_bounded_regular_file,
-    read_bounded_regular_file_to_string,
+    BoundedFileError, BoundedFileErrorKind, RootedBoundedFileError,
+    check_bounded_regular_file_under_root as probe_io_check_bounded_regular_file_under_root,
+    read_bounded_regular_file_to_string_under_root as probe_io_read_bounded_regular_file_to_string_under_root,
 };
 
 use crate::remote_source::{RemoteTextFetchConfig, RemoteTextFetchError, fetch_remote_text};
 
 use super::super::ConfiguredPolicyError;
+use super::bundle::{
+    DeclaredModules, PolicyBundleManifest, PolicyBundleManifestError, RemotePolicyModuleError,
+    RemotePolicyModuleSource, ValidPolicyBundleManifest,
+};
 
 pub const MAX_POLICY_SOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_POLICY_MANIFEST_BYTES: u64 = 64 * 1024;
@@ -42,12 +47,14 @@ pub struct PolicySourceInspection {
 pub struct PolicyManifestMetadata {
     pub id: String,
     pub version: String,
+    pub module_count: u64,
 }
 
 pub struct LoadedPolicySource {
     pub source: PolicySourceSnapshot,
     pub manifest: PolicyManifest,
     pub main: String,
+    pub modules: Vec<policy::PolicyModule>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,8 +140,9 @@ pub fn inspect_policy_source(
                         path: path.to_path_buf(),
                     },
                     manifest: Some(PolicyManifestMetadata {
-                        id: manifest.id,
-                        version: manifest.version,
+                        id: manifest.id().to_string(),
+                        version: manifest.version().to_string(),
+                        module_count: manifest.module_count() as u64,
                     }),
                     reason: None,
                 },
@@ -164,27 +172,40 @@ fn read_policy_bundle_directory(
     expected_id: &str,
 ) -> Result<LoadedPolicySource, PolicySourceValidationError> {
     ensure_policy_bundle_directory(root)?;
-    let manifest = read_policy_manifest(&manifest_path(root))
+    let manifest = read_policy_manifest(root)
         .and_then(|manifest| validate_policy_manifest(manifest, expected_id))?;
-    let main = read_regular_policy_file(&main_path(root), MAX_POLICY_SOURCE_BYTES, "source")?;
+    let modules = read_policy_modules(root, manifest.modules())?;
+    let main = read_regular_policy_file_under_root(
+        root,
+        Path::new(BUNDLE_MAIN_FILE),
+        MAX_POLICY_SOURCE_BYTES,
+        "source",
+    )?;
 
     Ok(LoadedPolicySource {
         source: PolicySourceSnapshot::LocalDirectory {
             path: root.to_path_buf(),
         },
-        manifest,
+        manifest: manifest.into_policy(),
         main,
+        modules,
     })
 }
 
 fn inspect_policy_bundle_directory(
     root: &Path,
     expected_id: &str,
-) -> Result<PolicyManifest, PolicySourceValidationError> {
+) -> Result<ValidPolicyBundleManifest, PolicySourceValidationError> {
     ensure_policy_bundle_directory(root)?;
-    let manifest = read_policy_manifest(&manifest_path(root))?;
+    let manifest = read_policy_manifest(root)?;
     let manifest = validate_policy_manifest(manifest, expected_id)?;
-    check_regular_policy_file(&main_path(root), MAX_POLICY_SOURCE_BYTES, "source")?;
+    check_policy_modules(root, manifest.modules())?;
+    check_regular_policy_file_under_root(
+        root,
+        Path::new(BUNDLE_MAIN_FILE),
+        MAX_POLICY_SOURCE_BYTES,
+        "source",
+    )?;
     Ok(manifest)
 }
 
@@ -253,13 +274,27 @@ async fn read_remote_policy_bundle(
     })?;
     validate_remote_policy_source_size(endpoint, &bundle.source)?;
     let manifest = validate_policy_manifest(bundle.manifest, expected_id)?;
+    let modules = manifest
+        .modules()
+        .resolve_remote_sources(
+            bundle
+                .modules
+                .into_iter()
+                .map(|module| RemotePolicyModuleSource {
+                    name: module.name,
+                    source: module.source,
+                }),
+            MAX_POLICY_SOURCE_BYTES,
+        )
+        .map_err(|source| remote_policy_module_error(endpoint, source))?;
     Ok(LoadedPolicySource {
         source: PolicySourceSnapshot::RemoteBundle {
             endpoint: endpoint.to_string(),
             max_body_bytes,
         },
-        manifest,
+        manifest: manifest.into_policy(),
         main: bundle.source,
+        modules,
     })
 }
 
@@ -287,73 +322,168 @@ fn remote_body_limit(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RemotePolicyBundleDocument {
-    manifest: PolicyManifest,
+    manifest: PolicyBundleManifest,
+    source: String,
+    #[serde(default)]
+    modules: Vec<RemotePolicyBundleModuleDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemotePolicyBundleModuleDocument {
+    name: String,
     source: String,
 }
 
-fn read_policy_manifest(path: &Path) -> Result<PolicyManifest, PolicySourceValidationError> {
-    let content = read_regular_policy_file(path, MAX_POLICY_MANIFEST_BYTES, "manifest")?;
+fn read_policy_manifest(root: &Path) -> Result<PolicyBundleManifest, PolicySourceValidationError> {
+    let content = read_regular_policy_file_under_root(
+        root,
+        Path::new(BUNDLE_MANIFEST_FILE),
+        MAX_POLICY_MANIFEST_BYTES,
+        "manifest",
+    )?;
 
-    toml::from_str::<PolicyManifest>(&content).map_err(|source| {
+    toml::from_str::<PolicyBundleManifest>(&content).map_err(|source| {
         PolicySourceValidationError::ManifestToml {
-            path: path.to_path_buf(),
+            path: root.join(BUNDLE_MANIFEST_FILE),
             source,
         }
     })
 }
 
 fn validate_policy_manifest(
-    manifest: PolicyManifest,
+    manifest: PolicyBundleManifest,
     expected_id: &str,
-) -> Result<PolicyManifest, PolicySourceValidationError> {
-    if manifest.id.trim().is_empty() {
-        return Err(PolicySourceValidationError::InvalidManifest {
-            reason: "policy id cannot be empty".to_string(),
-        });
-    }
-    if manifest.version.trim().is_empty() {
-        return Err(PolicySourceValidationError::InvalidManifest {
-            reason: "policy version cannot be empty".to_string(),
-        });
-    }
-    if manifest.id != expected_id {
-        return Err(PolicySourceValidationError::ManifestIdMismatch {
-            expected: expected_id.to_string(),
-            actual: manifest.id,
-        });
-    }
-    if manifest.hooks.is_empty() {
-        return Err(PolicySourceValidationError::InvalidManifest {
-            reason: "policy manifest must register at least one hook".to_string(),
-        });
-    }
-    let mut seen = Vec::<PolicyHook>::new();
-    for hook in &manifest.hooks {
-        if seen.contains(hook) {
-            return Err(PolicySourceValidationError::InvalidManifest {
-                reason: format!("policy hook {hook} is registered more than once"),
-            });
-        }
-        seen.push(*hook);
-    }
-    Ok(manifest)
+) -> Result<ValidPolicyBundleManifest, PolicySourceValidationError> {
+    manifest
+        .validate(expected_id)
+        .map_err(policy_bundle_manifest_error)
 }
 
-fn read_regular_policy_file(
-    path: &Path,
+fn read_policy_modules(
+    root: &Path,
+    modules: &DeclaredModules,
+) -> Result<Vec<policy::PolicyModule>, PolicySourceValidationError> {
+    modules
+        .iter()
+        .map(|name| {
+            let relative_path = name.relative_path();
+            read_regular_policy_file_under_root(
+                root,
+                &relative_path,
+                MAX_POLICY_SOURCE_BYTES,
+                "module",
+            )
+            .map(|source| policy::PolicyModule {
+                name: name.as_str().to_string(),
+                source,
+            })
+        })
+        .collect()
+}
+
+fn check_policy_modules(
+    root: &Path,
+    modules: &DeclaredModules,
+) -> Result<(), PolicySourceValidationError> {
+    for name in modules.iter() {
+        check_regular_policy_file_under_root(
+            root,
+            &name.relative_path(),
+            MAX_POLICY_SOURCE_BYTES,
+            "module",
+        )?;
+    }
+    Ok(())
+}
+
+fn policy_bundle_manifest_error(error: PolicyBundleManifestError) -> PolicySourceValidationError {
+    match error {
+        PolicyBundleManifestError::IdMismatch { expected, actual } => {
+            PolicySourceValidationError::ManifestIdMismatch { expected, actual }
+        }
+        error => PolicySourceValidationError::InvalidManifest {
+            reason: error.to_string(),
+        },
+    }
+}
+
+fn remote_policy_module_error(
+    endpoint: &str,
+    error: RemotePolicyModuleError,
+) -> PolicySourceValidationError {
+    match error {
+        RemotePolicyModuleError::NotDeclared { module } => {
+            PolicySourceValidationError::RemoteModuleNotDeclared {
+                endpoint: endpoint.to_string(),
+                module,
+            }
+        }
+        RemotePolicyModuleError::Duplicate { module } => {
+            PolicySourceValidationError::RemoteModuleDuplicate {
+                endpoint: endpoint.to_string(),
+                module,
+            }
+        }
+        RemotePolicyModuleError::Missing { module } => {
+            PolicySourceValidationError::RemoteModuleMissing {
+                endpoint: endpoint.to_string(),
+                module,
+            }
+        }
+        RemotePolicyModuleError::TooLarge {
+            module,
+            size,
+            limit,
+        } => PolicySourceValidationError::RemoteModuleTooLarge {
+            endpoint: endpoint.to_string(),
+            module,
+            size,
+            limit,
+        },
+    }
+}
+
+fn read_regular_policy_file_under_root(
+    root: &Path,
+    relative: &Path,
     limit: u64,
     kind: &'static str,
 ) -> Result<String, PolicySourceValidationError> {
-    read_bounded_regular_file_to_string(path, limit)
-        .map_err(|error| policy_source_file_error(error, kind))
+    probe_io_read_bounded_regular_file_to_string_under_root(root, relative, limit)
+        .map_err(|error| rooted_policy_source_file_error(error, kind))
 }
 
-fn check_regular_policy_file(
-    path: &Path,
+fn check_regular_policy_file_under_root(
+    root: &Path,
+    relative: &Path,
     limit: u64,
     kind: &'static str,
 ) -> Result<(), PolicySourceValidationError> {
-    check_bounded_regular_file(path, limit).map_err(|error| policy_source_file_error(error, kind))
+    probe_io_check_bounded_regular_file_under_root(root, relative, limit)
+        .map_err(|error| rooted_policy_source_file_error(error, kind))
+}
+
+fn rooted_policy_source_file_error(
+    error: RootedBoundedFileError,
+    kind: &'static str,
+) -> PolicySourceValidationError {
+    match error {
+        RootedBoundedFileError::Bounded(error) => policy_source_file_error(error, kind),
+        RootedBoundedFileError::OpenRoot { root, source, .. } => {
+            PolicySourceValidationError::Inspect { path: root, source }
+        }
+        RootedBoundedFileError::RelativePathDisallowed { path }
+        | RootedBoundedFileError::OutsideAllowedRoots { path } => {
+            PolicySourceValidationError::Open {
+                path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "policy source path is outside the policy bundle root",
+                ),
+            }
+        }
+    }
 }
 
 fn policy_source_file_error(
@@ -439,14 +569,6 @@ fn reject_symlink(path: &Path) -> Result<(), PolicySourceValidationError> {
     Ok(())
 }
 
-fn manifest_path(root: &Path) -> PathBuf {
-    root.join(BUNDLE_MANIFEST_FILE)
-}
-
-fn main_path(root: &Path) -> PathBuf {
-    root.join(BUNDLE_MAIN_FILE)
-}
-
 enum PolicySourceValidationError {
     NotFound {
         path: PathBuf,
@@ -496,6 +618,24 @@ enum PolicySourceValidationError {
     },
     RemoteSourceTooLarge {
         endpoint: String,
+        size: u64,
+        limit: u64,
+    },
+    RemoteModuleNotDeclared {
+        endpoint: String,
+        module: String,
+    },
+    RemoteModuleDuplicate {
+        endpoint: String,
+        module: String,
+    },
+    RemoteModuleMissing {
+        endpoint: String,
+        module: String,
+    },
+    RemoteModuleTooLarge {
+        endpoint: String,
+        module: String,
         size: u64,
         limit: u64,
     },
@@ -575,6 +715,23 @@ impl PolicySourceValidationError {
                     "remote policy bundle source {endpoint} is {size} bytes, exceeding the {limit} byte limit"
                 )
             }
+            Self::RemoteModuleNotDeclared { endpoint, module } => format!(
+                "remote policy bundle {endpoint} includes module {module}, but manifest does not declare it"
+            ),
+            Self::RemoteModuleDuplicate { endpoint, module } => {
+                format!("remote policy bundle {endpoint} includes module {module} more than once")
+            }
+            Self::RemoteModuleMissing { endpoint, module } => format!(
+                "remote policy bundle {endpoint} declares module {module}, but does not include its source"
+            ),
+            Self::RemoteModuleTooLarge {
+                endpoint,
+                module,
+                size,
+                limit,
+            } => format!(
+                "remote policy bundle module {module} from {endpoint} is {size} bytes, exceeding the {limit} byte limit"
+            ),
             Self::InvalidManifest { reason } => format!("invalid policy bundle manifest: {reason}"),
             Self::ManifestIdMismatch { expected, actual } => format!(
                 "policy bundle manifest id {actual} does not match configured policy id {expected}"

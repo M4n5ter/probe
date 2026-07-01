@@ -248,7 +248,7 @@ mod tests {
             .read_tls_material(&root.join("escape").join("material.pem"))
             .expect_err("symlink escape under allowed root must be rejected");
 
-        assert!(matches!(error, TlsMaterialFileStoreError::Open { .. }));
+        assert!(matches!(error, TlsMaterialFileStoreError::Symlink));
         Ok(())
     }
 }

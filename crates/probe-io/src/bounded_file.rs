@@ -320,6 +320,40 @@ pub fn open_bounded_regular_file_under_roots(
     open_bounded_regular_file_under_root(path, root, relative, limit)
 }
 
+pub fn check_bounded_regular_file_under_root(
+    root: &Path,
+    relative: &Path,
+    limit: u64,
+) -> Result<(), RootedBoundedFileError> {
+    reject_absolute_root_relative_path(relative)?;
+    open_bounded_regular_file_under_root(&root.join(relative), root, relative, limit).map(|_| ())
+}
+
+pub fn read_bounded_regular_file_to_string_under_root(
+    root: &Path,
+    relative: &Path,
+    limit: u64,
+) -> Result<String, RootedBoundedFileError> {
+    reject_absolute_root_relative_path(relative)?;
+    let path = root.join(relative);
+    let read = open_bounded_regular_file_under_root(&path, root, relative, limit)?.read()?;
+    String::from_utf8(read.into_bytes()).map_err(|source| {
+        RootedBoundedFileError::Bounded(BoundedFileError::Read {
+            path,
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+        })
+    })
+}
+
+fn reject_absolute_root_relative_path(relative: &Path) -> Result<(), RootedBoundedFileError> {
+    if relative.is_absolute() {
+        return Err(RootedBoundedFileError::RelativePathDisallowed {
+            path: relative.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
 pub fn read_bounded_regular_file_to_string(
     path: &Path,
     limit: u64,
@@ -373,17 +407,21 @@ fn open_bounded_regular_file_under_root(
         ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     )
     .map_err(|source| {
-        let source = std::io::Error::from(source);
-        if source.kind() == std::io::ErrorKind::NotFound {
-            RootedBoundedFileError::Bounded(BoundedFileError::NotFound {
+        if source == rustix::io::Errno::LOOP {
+            return RootedBoundedFileError::Bounded(BoundedFileError::Symlink {
                 path: path.to_path_buf(),
-            })
-        } else {
-            RootedBoundedFileError::Bounded(BoundedFileError::Open {
-                path: path.to_path_buf(),
-                source,
-            })
+            });
         }
+        if source == rustix::io::Errno::NOENT {
+            return RootedBoundedFileError::Bounded(BoundedFileError::NotFound {
+                path: path.to_path_buf(),
+            });
+        }
+        let source = std::io::Error::from(source);
+        RootedBoundedFileError::Bounded(BoundedFileError::Open {
+            path: path.to_path_buf(),
+            source,
+        })
     })?;
     BoundedRegularFile::from_opened(path.to_path_buf(), limit, File::from(file_fd))
         .map_err(RootedBoundedFileError::from)
@@ -557,6 +595,52 @@ mod tests {
             read_bounded_regular_file(&link, 64).expect_err("symlinked file must be rejected");
 
         assert_eq!(error.kind(), BoundedFileErrorKind::Symlink);
+        Ok(())
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn root_bounded_reader_rejects_intermediate_symlink() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        let external = temp.path().join("external");
+        fs::create_dir_all(&root)?;
+        fs::create_dir_all(external.join("guard"))?;
+        fs::write(external.join("guard").join("matcher.lua"), b"return {}")?;
+        symlink(external.join("guard"), root.join("guard"))?;
+
+        let error = read_bounded_regular_file_to_string_under_root(
+            &root,
+            Path::new("guard/matcher.lua"),
+            64,
+        )
+        .expect_err("root-bound reader must reject intermediate symlinks");
+
+        assert!(matches!(
+            error,
+            RootedBoundedFileError::Bounded(BoundedFileError::Symlink { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn root_bounded_reader_rejects_absolute_relative_path() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let root = temp.path().join("root");
+        fs::create_dir(&root)?;
+
+        let error =
+            read_bounded_regular_file_to_string_under_root(&root, Path::new("/etc/passwd"), 64)
+                .expect_err("root-bound reader must reject absolute relative paths");
+
+        assert!(matches!(
+            error,
+            RootedBoundedFileError::RelativePathDisallowed { .. }
+        ));
         Ok(())
     }
 

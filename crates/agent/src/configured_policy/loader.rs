@@ -86,6 +86,7 @@ pub struct ConfiguredPolicyContent {
     source: super::source::PolicySourceSnapshot,
     manifest: policy::PolicyManifest,
     main: String,
+    modules: Vec<policy::PolicyModule>,
 }
 
 pub fn configured_policy_selection(config: &AgentConfig) -> ConfiguredPolicySelection {
@@ -167,13 +168,18 @@ async fn read_configured_policy(
         source: source.source.clone(),
         manifest: source.manifest.clone(),
         main: source.main.clone(),
+        modules: source.modules.clone(),
     };
-    let runtime = PolicyRuntime::from_source_with_required_hooks(source.manifest, &source.main)
-        .map_err(|source| ConfiguredPolicyError::PolicyLoad {
-            id: policy.id.clone(),
-            source_ref: source_ref.clone(),
-            source,
-        })?;
+    let runtime = PolicyRuntime::from_bundle_with_required_hooks(
+        source.manifest,
+        &source.main,
+        source.modules,
+    )
+    .map_err(|source| ConfiguredPolicyError::PolicyLoad {
+        id: policy.id.clone(),
+        source_ref: source_ref.clone(),
+        source,
+    })?;
 
     Ok(LoadedConfiguredPolicy {
         runtime,
@@ -230,6 +236,25 @@ mod tests {
     };
 
     const OVERSIZED_TEST_FILE_BYTES: u64 = 10 * 1024 * 1024;
+    const MODULE_POLICY_SOURCE: &str = r#"
+local matcher = require("guard.matcher")
+
+function on_http_request_headers(event)
+  if matcher.matches(event.kind.target) then
+    return probe.emit_alert("module " .. event.kind.target)
+  end
+  return nil
+end
+"#;
+    const MATCHER_MODULE_SOURCE: &str = r#"
+local M = {}
+
+function M.matches(target)
+  return target == "/scoped"
+end
+
+return M
+"#;
 
     #[tokio::test]
     async fn load_configured_policies_rejects_incomplete_bundle_source()
@@ -292,6 +317,35 @@ end
     }
 
     #[tokio::test]
+    async fn load_configured_policies_loads_bundle_local_modules()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("configured-policy-bundle-modules")?;
+        let policy_path = temp.join("guard.bundle");
+        write_policy_bundle_with_modules(
+            &policy_path,
+            "guard",
+            "module-test",
+            &["on_http_request_headers"],
+            MODULE_POLICY_SOURCE,
+            &[("guard.matcher", MATCHER_MODULE_SOURCE)],
+        )?;
+        let config = config_with_policy(&policy_path)?;
+
+        let loaded = load_configured_policies(&config).await?;
+
+        assert_eq!(
+            policy_alert_versions(
+                &temp.join("module-spool"),
+                loaded,
+                flow_with_remote_port(80)
+            )?,
+            vec!["guard@module-test"]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn load_configured_policies_fetches_remote_bundle_document()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("configured-policy-remote-bundle")?;
@@ -335,6 +389,76 @@ end
             vec!["guard@remote-test"]
         );
         fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_configured_policies_fetches_remote_bundle_modules()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("configured-policy-remote-bundle-modules")?;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/policies/guard"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                remote_policy_bundle_document_with_modules(
+                    "guard",
+                    "remote-module-test",
+                    MODULE_POLICY_SOURCE,
+                    &[("guard.matcher", MATCHER_MODULE_SOURCE)],
+                ),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = config_with_remote_policy(format!("{}/policies/guard", server.uri()), None);
+
+        let loaded = load_configured_policies(&config).await?;
+
+        assert_eq!(
+            policy_alert_versions(
+                &temp.join("remote-module-spool"),
+                loaded,
+                flow_with_remote_port(80)
+            )?,
+            vec!["guard@remote-module-test"]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_configured_policies_rejects_undeclared_remote_module()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/policies/guard"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+source = "function on_http_request_headers(_) return nil end"
+
+[manifest]
+id = "guard"
+version = "remote-module-test"
+hooks = ["on_http_request_headers"]
+
+[[modules]]
+name = "guard.unlisted"
+source = "return {}"
+"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = config_with_remote_policy(format!("{}/policies/guard", server.uri()), None);
+
+        let Err(error) = load_configured_policies(&config).await else {
+            panic!("undeclared remote module must fail");
+        };
+
+        assert!(
+            matches!(error, ConfiguredPolicyError::InvalidPolicySource { ref reason, .. } if reason.contains("does not declare")),
+            "unexpected error: {error}"
+        );
         Ok(())
     }
 
@@ -504,6 +628,45 @@ end
 
         assert!(
             matches!(error, ConfiguredPolicyError::InvalidPolicySource { reason, .. } if reason.contains("must not be a symlink"))
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_configured_policies_rejects_symlinked_module_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("configured-policy-bundle-module-dir-symlink")?;
+        let policy_path = temp.join("guard.bundle");
+        let external_module_dir = temp.join("external-modules").join("guard");
+        write_policy_bundle(
+            &policy_path,
+            "guard",
+            "bundle-test",
+            &["on_http_request_headers"],
+            MODULE_POLICY_SOURCE,
+        )?;
+        replace_manifest_modules(&policy_path, &["guard.matcher"])?;
+        fs::create_dir_all(&external_module_dir)?;
+        fs::write(
+            external_module_dir.join("matcher.lua"),
+            MATCHER_MODULE_SOURCE,
+        )?;
+        fs::create_dir_all(policy_path.join("modules"))?;
+        std::os::unix::fs::symlink(
+            &external_module_dir,
+            policy_path.join("modules").join("guard"),
+        )?;
+        let config = config_with_policy(&policy_path)?;
+
+        let Err(error) = load_configured_policies(&config).await else {
+            panic!("bundle module directory symlink must fail configured policy loading");
+        };
+
+        assert!(
+            matches!(error, ConfiguredPolicyError::InvalidPolicySource { ref reason, .. } if reason.contains("must not be a symlink")),
+            "unexpected error: {error}"
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -793,6 +956,43 @@ hooks = ["on_http_request_headers"]
         )
     }
 
+    fn remote_policy_bundle_document_with_modules(
+        id: &str,
+        version: &str,
+        source: &str,
+        modules: &[(&str, &str)],
+    ) -> String {
+        let module_names = modules
+            .iter()
+            .map(|(name, _)| format!(r#""{name}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let module_documents = modules
+            .iter()
+            .map(|(name, source)| {
+                format!(
+                    r#"
+[[modules]]
+name = "{name}"
+source = {source:?}
+"#
+                )
+            })
+            .collect::<String>();
+        format!(
+            r#"
+source = {source:?}
+
+[manifest]
+id = "{id}"
+version = "{version}"
+hooks = ["on_http_request_headers"]
+modules = [{module_names}]
+{module_documents}
+"#
+        )
+    }
+
     fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {
         let path = std::env::temp_dir().join(format!(
             "{name}-{}",
@@ -833,5 +1033,74 @@ hooks = [{hooks}]
         )?;
         fs::write(path.join("main.lua"), source)?;
         Ok(())
+    }
+
+    fn replace_manifest_modules(path: &Path, modules: &[&str]) -> Result<(), std::io::Error> {
+        let module_names = modules
+            .iter()
+            .map(|name| format!(r#""{name}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        fs::write(
+            path.join("manifest.toml"),
+            format!(
+                r#"
+id = "guard"
+version = "bundle-test"
+hooks = ["on_http_request_headers"]
+modules = [{module_names}]
+"#
+            ),
+        )
+    }
+
+    fn write_policy_bundle_with_modules(
+        path: &Path,
+        id: &str,
+        version: &str,
+        hooks: &[&str],
+        source: &str,
+        modules: &[(&str, &str)],
+    ) -> Result<(), std::io::Error> {
+        fs::create_dir_all(path)?;
+        let hooks = hooks
+            .iter()
+            .map(|hook| format!(r#""{hook}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let module_names = modules
+            .iter()
+            .map(|(name, _)| format!(r#""{name}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        fs::write(
+            path.join("manifest.toml"),
+            format!(
+                r#"
+id = "{id}"
+version = "{version}"
+hooks = [{hooks}]
+modules = [{module_names}]
+"#
+            ),
+        )?;
+        fs::write(path.join("main.lua"), source)?;
+        for (name, source) in modules {
+            let module_path = module_path(path, name);
+            if let Some(parent) = module_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(module_path, source)?;
+        }
+        Ok(())
+    }
+
+    fn module_path(root: &Path, name: &str) -> PathBuf {
+        let mut path = root.join("modules");
+        for segment in name.split('.') {
+            path.push(segment);
+        }
+        path.set_extension("lua");
+        path
     }
 }

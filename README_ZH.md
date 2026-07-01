@@ -269,7 +269,8 @@ Lua policy 写法：
 - `probe.verdict { ... }` 请求防护动作。只有 enforcement mode、selector、
   backend 和 policy 都允许时，它才会变成 destructive action。
 - sandbox 会限制 policy 代码边界。可用标准库是 `table`、`string`、`math` 和 `bit`；
-  `io`、`os`、`require`、`debug`、`ffi`、`loadfile` 等 host API 不可用。
+  `require` 只能加载声明过的 bundle-local module；`io`、`os`、`debug`、`ffi`、`loadfile`
+  等 host API 不可用。
 - `runtime_error_disable_threshold` 是单个 policy 的阈值。Lua runtime error
   的 `policy_runtime_error` audit event 写入 export queue 后，连续错误计数才会推进。
   hook 成功执行会清零计数，selector miss 不改变计数。达到阈值后，agent 只禁用该
@@ -550,11 +551,11 @@ file sink 会创建私有 `0600` 文件，并拒绝不安全的父目录。
 
 ### Policy
 
-`agent run` 使用 policy bundle。本地 bundle 是包含 `manifest.toml` 和 `main.lua` 的目录；
-第一套接入章节已经给出完整例子。
+`agent run` 使用 policy bundle。本地 bundle 是包含 `manifest.toml`、`main.lua` 和可选声明式
+bundle-local module 的目录；第一套接入章节已经给出完整例子。
 
 远程 policy bundle 在配置中声明为 bounded TOML document；response schema 和示例见
-[docs/lua-policy_ZH.md](docs/lua-policy_ZH.md)：
+[docs/lua-policy_ZH.md](docs/lua-policy_ZH.md)，其中也包含 module 格式：
 
 ```toml
 [[policies]]

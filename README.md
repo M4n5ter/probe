@@ -292,8 +292,8 @@ How Lua policy should be written:
 - `probe.verdict { ... }` requests a protective action. It becomes destructive
   only when enforcement mode, selector, backend, and policy allow it.
 - The sandbox keeps policy code bounded. `table`, `string`, `math`, and `bit`
-  are available; host APIs such as `io`, `os`, `require`, `debug`, `ffi`, and
-  `loadfile` are unavailable.
+  are available; `require` can load only declared bundle-local modules; host
+  APIs such as `io`, `os`, `debug`, `ffi`, and `loadfile` are unavailable.
 - `runtime_error_disable_threshold` is per policy. A Lua runtime error advances
   the consecutive error counter after its `policy_runtime_error` audit event is
   written to the export queue. A successful hook execution resets the counter;
@@ -587,10 +587,12 @@ HTTP surfaces are in [docs/http-endpoints.md](docs/http-endpoints.md).
 ### Policy
 
 `agent run` uses policy bundles: a local bundle is a directory with
-`manifest.toml` and `main.lua`, as shown in the first integration section.
+`manifest.toml`, `main.lua`, and optional declared bundle-local modules, as
+shown in the first integration section.
 
 Remote policy bundles are configured as bounded TOML documents; the response
-schema and example are in [docs/lua-policy.md](docs/lua-policy.md):
+schema, module format, and example are in
+[docs/lua-policy.md](docs/lua-policy.md):
 
 ```toml
 [[policies]]
