@@ -10,9 +10,9 @@ use crate::{
 
 const ADMIN_REQUEST_MAX_BYTES: usize = 4 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "command")]
-pub(super) enum AdminRequest {
+pub(crate) enum AdminRequest {
     Status,
     Metrics,
     PrometheusMetrics,

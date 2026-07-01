@@ -4354,11 +4354,13 @@ Admin socket：
 
 - `run` 可按 `[admin] enabled = true` 启动 owner-constrained private Unix socket server。
 - socket 文件权限设置为 `0600`。
-- 当前 JSON-lines 协议支持 `{"command":"status"}`。
-- 当前 JSON-lines 协议支持 `{"command":"metrics"}`。
-- 当前 JSON-lines 协议支持 `{"command":"prometheus_metrics"}`。
-- 当前 JSON-lines 协议支持 `{"command":"reload_policies"}`。
-- 当前 JSON-lines 协议支持 `{"command":"reload_enforcement_policy"}`。
+- JSON-lines 协议支持 `{"command":"status"}`。
+- JSON-lines 协议支持 `{"command":"metrics"}`。
+- JSON-lines 协议支持 `{"command":"prometheus_metrics"}`。
+- JSON-lines 协议支持 `{"command":"reload_policies"}`。
+- JSON-lines 协议支持 `{"command":"reload_enforcement_policy"}`。
+- `agent admin --socket <path> <command>` 是该 JSON-lines 协议的一等 CLI client；`status`、`metrics`、
+  `reload-policies` 和 `reload-enforcement-policy` 输出 JSON，`prometheus-metrics` 输出 text exposition。
 - admin socket parent directory 必须由部署层预创建。
 - parent directory 不能是 symlink。
 - parent directory 不能允许 group/other 访问。
@@ -4719,6 +4721,8 @@ benchmark 参数：
   `check` 与 `run` 共用中性的 configured policy/enforcement composition helper，避免诊断入口和生产路径各自解释配置。policy snapshot 中的
   `registered_hooks` 表示 runtime 注册的支持 hook，不表示 Lua source 中实际定义的函数集合。
 - `status`：输出 runtime/admin/metrics snapshot。
+- `admin`：连接在线 admin Unix socket，执行 `status`、`metrics`、`prometheus-metrics`、`reload-policies` 或
+  `reload-enforcement-policy`。
 - `replay`：用 pcap/spool 样本跑 parser/policy/exporter。
 - `capabilities`：输出 capability matrix；可选 `--config` 时按配置中的 provider-specific 输入做能力探测，否则使用默认配置。
 

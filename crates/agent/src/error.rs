@@ -71,6 +71,10 @@ pub(crate) enum AgentError {
     EnforcementReloadPoller(#[from] EnforcementReloadError),
     #[error("admin error: {0}")]
     Admin(#[from] crate::admin::AdminError),
+    #[error("admin client error: {0}")]
+    AdminClient(#[from] crate::admin::AdminClientError),
+    #[error("admin command failed: {0}")]
+    AdminCommand(String),
     #[error("{0}")]
     Check(#[source] Box<CheckError>),
     #[error("unsupported run config: {0}")]

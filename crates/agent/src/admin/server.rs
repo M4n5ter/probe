@@ -449,6 +449,16 @@ mod tests {
             json!(1)
         );
         assert_eq!(response["snapshot"]["exporters"][0]["cursor"], json!(0));
+
+        let client_response =
+            crate::admin::send_admin_json_request(&socket_path, crate::admin::AdminRequest::Status)
+                .await?;
+
+        assert_eq!(client_response["kind"], json!("status"));
+        assert_eq!(
+            client_response["snapshot"]["spool"]["export_last_sequence"],
+            json!(1)
+        );
         server.stop().await;
         assert!(!socket_path.exists());
         drop(spool);

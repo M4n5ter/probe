@@ -886,8 +886,25 @@ status and metrics include capture input activity, pipeline
 progress, spool/export state, policy/enforcement counters, TLS plaintext
 activity, and proxy health. Capture input activity includes the latest signal
 kind, sequence, and observation time without treating that activity as kernel
-link liveness. Local watching and remote polling are opt-in. Use local triggers
-for local sources:
+link liveness. The admin CLI sends the same JSON-lines commands over the Unix
+socket:
+
+```bash
+cargo run -p agent -- admin \
+  --socket /run/traffic-probe/admin.sock \
+  status
+
+cargo run -p agent -- admin \
+  --socket /run/traffic-probe/admin.sock \
+  reload-policies
+
+cargo run -p agent -- admin \
+  --socket /run/traffic-probe/admin.sock \
+  prometheus-metrics
+```
+
+Local watching and remote polling are opt-in. Use local triggers for local
+sources:
 
 ```toml
 [policy_reload]

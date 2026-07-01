@@ -30,8 +30,11 @@ use crate::{
     status::{build_status_snapshot, collect_spool_status},
 };
 
+use super::admin::{AdminCliCommand, run_admin_command};
+
 const REPLAY_POLICY_SOURCE_BYTES: u64 = 1024 * 1024;
 const READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_READY_SOCKET";
+const DEFAULT_ADMIN_SOCKET_PATH: &str = "/run/traffic-probe/admin.sock";
 
 #[derive(Debug, Parser)]
 #[command(name = "traffic-probe")]
@@ -60,6 +63,12 @@ enum Command {
     Status {
         #[arg(long)]
         config: PathBuf,
+    },
+    Admin {
+        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET_PATH)]
+        socket: PathBuf,
+        #[command(subcommand)]
+        command: AdminCliCommand,
     },
     Replay {
         #[arg(long)]
@@ -169,6 +178,9 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let spool_status = collect_spool_status(&plan);
             let snapshot = build_status_snapshot(&plan, spool_status);
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
+        Command::Admin { socket, command } => {
+            run_admin_command(&socket, command).await?;
         }
         Command::Replay {
             input,
