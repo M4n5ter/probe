@@ -250,6 +250,7 @@ impl ProcessScopeMatcher {
 enum ProcessScopeMatcherExpression {
     Match(CompiledSelector),
     All(Vec<ProcessScopeMatcherExpression>),
+    Any(Vec<ProcessScopeMatcherExpression>),
 }
 
 impl ProcessScopeMatcherExpression {
@@ -272,6 +273,11 @@ impl ProcessScopeMatcherExpression {
                 .map(Self::compile)
                 .collect::<Result<Vec<_>, _>>()
                 .map(Self::All),
+            TransparentInterceptionProcessScopeExpression::Any { expressions } => expressions
+                .iter()
+                .map(Self::compile)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Self::Any),
         }
     }
 
@@ -283,6 +289,9 @@ impl ProcessScopeMatcherExpression {
             Self::All(expressions) => expressions
                 .iter()
                 .all(|expression| expression.matches(process)),
+            Self::Any(expressions) => expressions
+                .iter()
+                .any(|expression| expression.matches(process)),
         }
     }
 }
@@ -387,6 +396,45 @@ mod tests {
             process_scope(ProcessSelector {
                 names: vec!["demo-listener".to_string()],
                 ..ProcessSelector::default()
+            })?,
+            &CapabilityState::degraded(CapabilityKind::TransparentProcessClassifier, "procfs"),
+        )?;
+
+        assert_eq!(result, scope);
+        Ok(())
+    }
+
+    #[test]
+    fn process_classifier_allows_host_rules_for_any_matching_listener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[tcp_line(0, "0100007F:20FB", "00000000:0000", "0A", 424_242)])?;
+        proc.write_process_with_socket(321, "api-listener", 424_242)?;
+        let mut classifier = TransparentInterceptionProcessClassifier::with_resolver(
+            ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path()),
+        );
+        let scope = host_scope(8443);
+
+        let result = classifier.executable_host_rule_scope(
+            "needs process classifier".to_string(),
+            TransparentInterceptionHostRuleBoundary::HostRules(scope.clone()),
+            process_scope_from_selector(Selector::Any {
+                selectors: vec![
+                    Selector::term(
+                        ProcessSelector {
+                            names: vec!["worker-listener".to_string()],
+                            ..ProcessSelector::default()
+                        },
+                        inbound_local_port(8443),
+                    ),
+                    Selector::term(
+                        ProcessSelector {
+                            names: vec!["api-listener".to_string()],
+                            ..ProcessSelector::default()
+                        },
+                        inbound_local_port(8443),
+                    ),
+                ],
             })?,
             &CapabilityState::degraded(CapabilityKind::TransparentProcessClassifier, "procfs"),
         )?;
@@ -709,6 +757,14 @@ mod tests {
             );
         };
         scope
+    }
+
+    fn inbound_local_port(local_port: u16) -> TrafficSelector {
+        TrafficSelector {
+            local_ports: vec![local_port],
+            directions: vec![Direction::Inbound],
+            ..TrafficSelector::default()
+        }
     }
 
     fn resolved_process_selector(local_ports: Vec<u16>) -> ResolvedSelector {

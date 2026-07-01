@@ -27,6 +27,7 @@ pub struct TransparentInterceptionProcessScope {
 pub enum TransparentInterceptionProcessScopeExpression {
     Match { process: ProcessSelector },
     All { expressions: Vec<Self> },
+    Any { expressions: Vec<Self> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +212,13 @@ impl TransparentInterceptionHostRuleScope {
         )
     }
 
+    fn equivalent_to(&self, other: &Self) -> bool {
+        self.local_ports.equivalent_to(&other.local_ports)
+            && self.remote_ports.equivalent_to(&other.remote_ports)
+            && self.remote_addresses.equivalent_to(&other.remote_addresses)
+            && self.socket_owners.equivalent_to(&other.socket_owners)
+    }
+
     fn contains_scope(&self, other: &Self) -> bool {
         self.local_ports.contains_scope(&other.local_ports)
             && self.remote_ports.contains_scope(&other.remote_ports)
@@ -247,6 +255,14 @@ impl TransparentInterceptionHostRuleSet {
 
     pub fn explicit_local_ports(&self) -> Option<Vec<u16>> {
         collect_unique_explicit_ports(self.scopes.iter().map(|scope| scope.local_ports()))
+    }
+
+    pub(crate) fn equivalent_to(&self, other: &Self) -> bool {
+        self.scopes.len() == other.scopes.len()
+            && self
+                .scopes
+                .iter()
+                .all(|left| other.scopes.iter().any(|right| left.equivalent_to(right)))
     }
 
     fn canonicalize(
@@ -302,6 +318,9 @@ impl TransparentInterceptionProcessScopeExpression {
         match self {
             Self::Match { process } => process_selector_has_constraints(process),
             Self::All { expressions } => {
+                !expressions.is_empty() && expressions.iter().all(Self::has_process_constraints)
+            }
+            Self::Any { expressions } => {
                 !expressions.is_empty() && expressions.iter().all(Self::has_process_constraints)
             }
         }
@@ -678,7 +697,9 @@ fn collapse_covered_host_rule_scopes(
         .enumerate()
         .filter_map(|(candidate_index, candidate)| {
             let covered = scopes.iter().enumerate().any(|(cover_index, cover)| {
-                cover_index != candidate_index && cover.contains_scope(candidate)
+                cover_index != candidate_index
+                    && cover.contains_scope(candidate)
+                    && (!candidate.contains_scope(cover) || cover_index < candidate_index)
             });
             (!covered).then(|| candidate.clone())
         })
@@ -756,6 +777,30 @@ mod tests {
         };
         assert_eq!(scope.local_ports().values(), &[8443]);
         assert!(scope.remote_addresses().is_any());
+    }
+
+    #[test]
+    fn host_rule_set_keeps_one_semantic_duplicate_scope() {
+        let first = TransparentInterceptionHostRuleScope::new(
+            TransparentInterceptionPortScope::only(vec![8443, 9443]),
+            TransparentInterceptionPortScope::any(),
+            TransparentInterceptionRemoteAddressScope::any(),
+        )
+        .expect("local ports should form host rules");
+        let second = TransparentInterceptionHostRuleScope::new(
+            TransparentInterceptionPortScope::only(vec![9443, 8443]),
+            TransparentInterceptionPortScope::any(),
+            TransparentInterceptionRemoteAddressScope::any(),
+        )
+        .expect("local ports should form host rules");
+
+        let rules = TransparentInterceptionHostRuleSet::new(vec![first, second])
+            .expect("semantic duplicate scopes should still form host rules");
+
+        let [scope] = rules.scopes() else {
+            panic!("semantic duplicate scopes should collapse to one scope");
+        };
+        assert!(same_values(scope.local_ports().values(), &[8443, 9443]));
     }
 
     #[test]

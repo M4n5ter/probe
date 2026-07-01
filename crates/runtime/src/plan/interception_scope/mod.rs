@@ -85,6 +85,9 @@ pub enum TransparentInterceptionProcessScopeExpressionPlan {
     All {
         expressions: Vec<TransparentInterceptionProcessScopeExpressionPlan>,
     },
+    Any {
+        expressions: Vec<TransparentInterceptionProcessScopeExpressionPlan>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +291,9 @@ impl TransparentInterceptionProcessScopeExpressionPlan {
                 process: process.clone(),
             },
             TransparentInterceptionProcessScopeExpression::All { expressions } => Self::All {
+                expressions: expressions.iter().map(Self::from_expression).collect(),
+            },
+            TransparentInterceptionProcessScopeExpression::Any { expressions } => Self::Any {
                 expressions: expressions.iter().map(Self::from_expression).collect(),
             },
         }
@@ -499,6 +505,58 @@ mod tests {
             [Ipv4Addr::new(203, 0, 113, 10)]
         );
         assert_eq!(process_scope_names(&process_scope), ["curl"]);
+    }
+
+    #[test]
+    fn process_scoped_any_reports_typed_process_classifier_scope() {
+        let scope = scope_for(
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+            Selector::Any {
+                selectors: vec![
+                    Selector::term(
+                        ProcessSelector {
+                            names: vec!["curl".to_string()],
+                            ..ProcessSelector::default()
+                        },
+                        TrafficSelector {
+                            local_ports: vec![8443],
+                            directions: vec![Direction::Inbound],
+                            ..TrafficSelector::default()
+                        },
+                    ),
+                    Selector::term(
+                        ProcessSelector {
+                            names: vec!["nginx".to_string()],
+                            ..ProcessSelector::default()
+                        },
+                        TrafficSelector {
+                            local_ports: vec![8443],
+                            directions: vec![Direction::Inbound],
+                            ..TrafficSelector::default()
+                        },
+                    ),
+                ],
+            },
+        );
+
+        let TransparentInterceptionLocalSetupProjectionPlan::RequiresProcessClassifier {
+            host_rule_boundary,
+            process_scope,
+            ..
+        } = scope
+        else {
+            panic!("same-boundary process any selector should require process classifier");
+        };
+        let TransparentInterceptionProjectedHostRuleBoundaryPlan::HostRules { scopes } =
+            host_rule_boundary
+        else {
+            panic!("process any selector should preserve host-rule boundary");
+        };
+        assert_eq!(
+            single_scope(&scopes).local_ports,
+            TransparentInterceptionProjectedPortScopePlan::Only { ports: vec![8443] }
+        );
+        assert_eq!(process_scope_any_names(&process_scope), ["curl", "nginx"]);
     }
 
     #[test]
@@ -754,6 +812,25 @@ mod tests {
             panic!("test process scope should be a match expression");
         };
         process.names.iter().map(String::as_str).collect()
+    }
+
+    fn process_scope_any_names(scope: &TransparentInterceptionProcessScopePlan) -> Vec<&str> {
+        let TransparentInterceptionProcessScopeExpressionPlan::Any { expressions } =
+            &scope.expression
+        else {
+            panic!("test process scope should be an any expression");
+        };
+        expressions
+            .iter()
+            .flat_map(|expression| {
+                let TransparentInterceptionProcessScopeExpressionPlan::Match { process } =
+                    expression
+                else {
+                    panic!("test process scope any child should be a match expression");
+                };
+                process.names.iter().map(String::as_str)
+            })
+            .collect()
     }
 
     fn single_scope(

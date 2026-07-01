@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::{collections::BTreeSet, net::IpAddr};
 
 use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
 
@@ -13,7 +13,7 @@ use super::{
 };
 
 const PROCESS_CLASSIFIER_REASON: &str = "selector contains process constraints that require a process classifier such as cgroup/owner marking or proxy-side process classification before host rules can be safely narrowed";
-const ANY_FLOW_CLASSIFIER_REASON: &str = "any selectors that contain classifier-only or unconstrained branches require a flow-aware classifier";
+const ANY_FLOW_CLASSIFIER_REASON: &str = "any selector branches that cannot preserve host/process correlation in setup-time rules require a flow-aware classifier";
 const NOT_FLOW_CLASSIFIER_REASON: &str = "not selectors require a flow-aware classifier and cannot be projected to setup-time host rules";
 const REF_FLOW_CLASSIFIER_REASON: &str = "named selector refs require registry-backed classifier resolution before transparent interception setup";
 
@@ -105,6 +105,114 @@ impl ProjectableLocalSetupTerm {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnyBranchHostBoundary {
+    Unconstrained,
+    Finite(TransparentInterceptionHostRuleSet),
+}
+
+impl AnyBranchHostBoundary {
+    fn from_terms(
+        host_terms: &[ProjectableLocalSetupTerm],
+        direction: TransparentInterceptionSetupDirection,
+    ) -> Result<Self, TransparentInterceptionSetupProjectionError> {
+        let mut scopes = Vec::new();
+        for term in host_terms {
+            let Some(scope) = optional_host_rule_scope_for_any_branch(term.clone(), direction)?
+            else {
+                return Ok(Self::Unconstrained);
+            };
+            scopes.push(scope);
+        }
+        Ok(TransparentInterceptionHostRuleSet::compacting(scopes)?
+            .map_or(Self::Unconstrained, Self::Finite))
+    }
+
+    fn equivalent_to(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unconstrained, Self::Unconstrained) => true,
+            (Self::Finite(left), Self::Finite(right)) => left.equivalent_to(right),
+            _ => false,
+        }
+    }
+
+    fn into_projectable_terms(
+        self,
+        direction: TransparentInterceptionSetupDirection,
+    ) -> Vec<ProjectableLocalSetupTerm> {
+        match self {
+            Self::Unconstrained => vec![ProjectableLocalSetupTerm::default()],
+            Self::Finite(rules) => rules
+                .scopes()
+                .iter()
+                .cloned()
+                .map(|scope| ProjectableLocalSetupTerm::from_scope(scope, direction))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CanonicalProcessScopeExpression {
+    Match(CanonicalProcessSelector),
+    All(Vec<Self>),
+    Any(Vec<Self>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalProcessSelector {
+    pids: BTreeSet<u32>,
+    uids: BTreeSet<u32>,
+    gids: BTreeSet<u32>,
+    names: BTreeSet<String>,
+    exe_path_globs: BTreeSet<String>,
+    cmdline_regexes: BTreeSet<String>,
+    systemd_services: BTreeSet<String>,
+    container_ids: BTreeSet<String>,
+}
+
+impl CanonicalProcessScopeExpression {
+    fn from_expression(expression: &TransparentInterceptionProcessScopeExpression) -> Self {
+        match expression {
+            TransparentInterceptionProcessScopeExpression::Match { process } => {
+                Self::Match(CanonicalProcessSelector::from_selector(process))
+            }
+            TransparentInterceptionProcessScopeExpression::All { expressions } => {
+                Self::All(canonical_process_expression_set(expressions))
+            }
+            TransparentInterceptionProcessScopeExpression::Any { expressions } => {
+                Self::Any(canonical_process_expression_set(expressions))
+            }
+        }
+    }
+}
+
+impl CanonicalProcessSelector {
+    fn from_selector(process: &ProcessSelector) -> Self {
+        Self {
+            pids: process.pids.iter().copied().collect(),
+            uids: process.uids.iter().copied().collect(),
+            gids: process.gids.iter().copied().collect(),
+            names: process.names.iter().cloned().collect(),
+            exe_path_globs: process.exe_path_globs.iter().cloned().collect(),
+            cmdline_regexes: process.cmdline_regexes.iter().cloned().collect(),
+            systemd_services: process.systemd_services.iter().cloned().collect(),
+            container_ids: process.container_ids.iter().cloned().collect(),
+        }
+    }
+}
+
+fn canonical_process_expression_set(
+    expressions: &[TransparentInterceptionProcessScopeExpression],
+) -> Vec<CanonicalProcessScopeExpression> {
+    expressions
+        .iter()
+        .map(CanonicalProcessScopeExpression::from_expression)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn analyze_selector(
     selector: &Selector,
     direction: TransparentInterceptionSetupDirection,
@@ -151,9 +259,12 @@ fn analyze_any_selector(
             host_terms,
             classifier: None,
         }),
-        None => Ok(flow_classifier_analysis(
-            ANY_FLOW_CLASSIFIER_REASON.to_string(),
-        )),
+        None => match project_any_selector_process_classifier(&analyses, direction)? {
+            Some(analysis) => Ok(analysis),
+            None => Ok(flow_classifier_analysis(
+                ANY_FLOW_CLASSIFIER_REASON.to_string(),
+            )),
+        },
     }
 }
 
@@ -227,6 +338,109 @@ fn project_any_selector_host_term(
                 .collect()
         }),
     )
+}
+
+fn project_any_selector_process_classifier(
+    analyses: &[SelectorSetupAnalysis],
+    direction: TransparentInterceptionSetupDirection,
+) -> Result<Option<SelectorSetupAnalysis>, TransparentInterceptionSetupProjectionError> {
+    let mut process_expressions = Vec::new();
+    let mut host_boundaries = Vec::new();
+    for analysis in analyses {
+        let Some(SetupClassifierRequirement::Process { expression }) = &analysis.classifier else {
+            return Ok(None);
+        };
+        process_expressions.push(expression.clone());
+        host_boundaries.push(AnyBranchHostBoundary::from_terms(
+            &analysis.host_terms,
+            direction,
+        )?);
+    }
+
+    if all_host_boundaries_equivalent(&host_boundaries) {
+        return Ok(Some(SelectorSetupAnalysis {
+            host_terms: host_boundaries
+                .into_iter()
+                .next()
+                .map_or_else(Vec::new, |boundary| {
+                    boundary.into_projectable_terms(direction)
+                }),
+            classifier: Some(SetupClassifierRequirement::Process {
+                expression: process_any_expression(process_expressions),
+            }),
+        }));
+    }
+
+    if all_process_expressions_equivalent(&process_expressions) {
+        let host_terms = union_any_branch_host_boundaries(host_boundaries, direction)?;
+        return Ok(Some(SelectorSetupAnalysis {
+            host_terms,
+            classifier: Some(SetupClassifierRequirement::Process {
+                expression: process_expressions
+                    .into_iter()
+                    .next()
+                    .expect("process expressions should be non-empty"),
+            }),
+        }));
+    }
+
+    Ok(None)
+}
+
+fn all_host_boundaries_equivalent(host_boundaries: &[AnyBranchHostBoundary]) -> bool {
+    let Some(first) = host_boundaries.first() else {
+        return false;
+    };
+    host_boundaries
+        .iter()
+        .all(|boundary| boundary.equivalent_to(first))
+}
+
+fn all_process_expressions_equivalent(
+    expressions: &[TransparentInterceptionProcessScopeExpression],
+) -> bool {
+    let Some(first) = expressions.first() else {
+        return false;
+    };
+    let first = CanonicalProcessScopeExpression::from_expression(first);
+    expressions
+        .iter()
+        .all(|expression| CanonicalProcessScopeExpression::from_expression(expression) == first)
+}
+
+fn union_any_branch_host_boundaries(
+    host_boundaries: Vec<AnyBranchHostBoundary>,
+    direction: TransparentInterceptionSetupDirection,
+) -> Result<Vec<ProjectableLocalSetupTerm>, TransparentInterceptionSetupProjectionError> {
+    let mut scopes = Vec::new();
+    for boundary in host_boundaries {
+        match boundary {
+            AnyBranchHostBoundary::Unconstrained => {
+                return Ok(vec![ProjectableLocalSetupTerm::default()]);
+            }
+            AnyBranchHostBoundary::Finite(rules) => scopes.extend(rules.scopes().iter().cloned()),
+        }
+    }
+    Ok(
+        TransparentInterceptionHostRuleSet::compacting(scopes)?.map_or_else(Vec::new, |rules| {
+            rules
+                .scopes()
+                .iter()
+                .cloned()
+                .map(|scope| ProjectableLocalSetupTerm::from_scope(scope, direction))
+                .collect()
+        }),
+    )
+}
+
+fn process_any_expression(
+    expressions: Vec<TransparentInterceptionProcessScopeExpression>,
+) -> TransparentInterceptionProcessScopeExpression {
+    match expressions.as_slice() {
+        [expression] => expression.clone(),
+        [first, ..] if all_process_expressions_equivalent(&expressions) => first.clone(),
+        _ => TransparentInterceptionProcessScopeExpression::Any { expressions },
+    }
 }
 
 fn optional_host_rule_scope_for_any_branch(
@@ -928,7 +1142,146 @@ mod tests {
     }
 
     #[test]
-    fn process_scoped_any_selector_reports_flow_classifier_requirement() {
+    fn process_scoped_any_selector_with_same_host_boundary_requires_process_classifier() {
+        let plan = plan_for(Selector::Any {
+            selectors: vec![
+                Selector::term(process_names(&["curl"]), local_port(8443)),
+                Selector::term(process_names(&["nginx"]), local_port(8443)),
+            ],
+        })
+        .expect("same-boundary process-scoped any selector should produce a setup plan");
+
+        let TransparentInterceptionSetupPlan::RequiresProcessClassifier {
+            host_rule_boundary,
+            process_scope,
+            ..
+        } = plan
+        else {
+            panic!("same-boundary process-scoped any selector should require process classifier");
+        };
+        assert_eq!(
+            single_boundary_scope(&host_rule_boundary)
+                .local_ports()
+                .values(),
+            &[8443]
+        );
+        assert_eq!(
+            process_scope_candidate_names(&process_scope),
+            ["curl", "nginx"]
+        );
+    }
+
+    #[test]
+    fn process_scoped_any_selector_uses_order_insensitive_host_boundary_equivalence() {
+        let plan = plan_for(Selector::Any {
+            selectors: vec![
+                Selector::term(process_names(&["curl"]), local_ports(&[8443, 9443])),
+                Selector::term(process_names(&["nginx"]), local_ports(&[9443, 8443])),
+            ],
+        })
+        .expect("same host boundary with reordered ports should produce a setup plan");
+
+        let TransparentInterceptionSetupPlan::RequiresProcessClassifier {
+            host_rule_boundary,
+            process_scope,
+            ..
+        } = plan
+        else {
+            panic!("same-boundary process-scoped any selector should require process classifier");
+        };
+        assert!(same_u16_values(
+            single_boundary_scope(&host_rule_boundary)
+                .local_ports()
+                .values(),
+            &[8443, 9443]
+        ));
+        assert_eq!(
+            process_scope_candidate_names(&process_scope),
+            ["curl", "nginx"]
+        );
+    }
+
+    #[test]
+    fn same_process_any_selector_with_different_host_boundaries_requires_process_classifier() {
+        let plan = plan_for(Selector::Any {
+            selectors: vec![
+                Selector::term(process_names(&["curl"]), local_port(8443)),
+                Selector::term(process_names(&["curl"]), local_port(9443)),
+            ],
+        })
+        .expect("same-process any selector should produce a setup plan");
+
+        let TransparentInterceptionSetupPlan::RequiresProcessClassifier {
+            host_rule_boundary,
+            process_scope,
+            ..
+        } = plan
+        else {
+            panic!("same-process any selector should require process classifier");
+        };
+        assert_eq!(
+            single_boundary_scope(&host_rule_boundary)
+                .local_ports()
+                .values(),
+            &[8443, 9443]
+        );
+        assert_eq!(process_scope_names(&process_scope), ["curl"]);
+    }
+
+    #[test]
+    fn same_process_any_selector_uses_order_insensitive_process_equivalence() {
+        let plan = plan_for(Selector::Any {
+            selectors: vec![
+                Selector::term(process_names(&["curl", "nginx"]), local_port(8443)),
+                Selector::term(process_names(&["nginx", "curl"]), local_port(9443)),
+            ],
+        })
+        .expect("same process scope with reordered names should produce a setup plan");
+
+        let TransparentInterceptionSetupPlan::RequiresProcessClassifier {
+            host_rule_boundary,
+            process_scope,
+            ..
+        } = plan
+        else {
+            panic!("same-process any selector should require process classifier");
+        };
+        assert_eq!(
+            single_boundary_scope(&host_rule_boundary)
+                .local_ports()
+                .values(),
+            &[8443, 9443]
+        );
+        assert_eq!(process_scope_names(&process_scope), ["curl", "nginx"]);
+    }
+
+    #[test]
+    fn same_process_any_selector_with_process_only_branch_drops_host_boundary() {
+        let plan = plan_for(Selector::Any {
+            selectors: vec![
+                Selector::term(process_names(&["curl"]), inbound_traffic()),
+                Selector::term(process_names(&["curl"]), local_port(8443)),
+            ],
+        })
+        .expect("process-only branch should dominate the finite host boundary");
+
+        let TransparentInterceptionSetupPlan::RequiresProcessClassifier {
+            host_rule_boundary,
+            process_scope,
+            ..
+        } = plan
+        else {
+            panic!("same-process any selector should require process classifier");
+        };
+        assert!(matches!(
+            host_rule_boundary,
+            TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary
+        ));
+        assert_eq!(process_scope_names(&process_scope), ["curl"]);
+    }
+
+    #[test]
+    fn process_scoped_any_selector_with_correlated_host_boundaries_requires_flow_classifier() {
         let plan = plan_for(Selector::Any {
             selectors: vec![
                 Selector::term(process_names(&["curl"]), local_port(8443)),
@@ -1226,6 +1579,13 @@ mod tests {
         }
     }
 
+    fn local_ports(ports: &[u16]) -> TrafficSelector {
+        TrafficSelector {
+            local_ports: ports.to_vec(),
+            ..TrafficSelector::default()
+        }
+    }
+
     fn inbound_traffic() -> TrafficSelector {
         TrafficSelector {
             directions: vec![Direction::Inbound],
@@ -1302,11 +1662,37 @@ mod tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    fn same_u16_values(left: &[u16], right: &[u16]) -> bool {
+        left.iter().all(|value| right.contains(value))
+            && right.iter().all(|value| left.contains(value))
+    }
+
     fn process_scope_names(scope: &TransparentInterceptionProcessScope) -> Vec<&str> {
         let TransparentInterceptionProcessScopeExpression::Match { process } = scope.expression()
         else {
             panic!("test process scope should be a match expression");
         };
         process.names.iter().map(String::as_str).collect()
+    }
+
+    fn process_scope_candidate_names(scope: &TransparentInterceptionProcessScope) -> Vec<&str> {
+        process_expression_candidate_names(scope.expression())
+    }
+
+    fn process_expression_candidate_names(
+        expression: &TransparentInterceptionProcessScopeExpression,
+    ) -> Vec<&str> {
+        match expression {
+            TransparentInterceptionProcessScopeExpression::Match { process } => {
+                process.names.iter().map(String::as_str).collect()
+            }
+            TransparentInterceptionProcessScopeExpression::Any { expressions } => expressions
+                .iter()
+                .flat_map(process_expression_candidate_names)
+                .collect(),
+            TransparentInterceptionProcessScopeExpression::All { .. } => {
+                panic!("test process scope should be an OR of process name candidates")
+            }
+        }
     }
 }

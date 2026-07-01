@@ -832,6 +832,11 @@ TLS 明文与协议能力：
     任何未归因 listener、同端口混合 holder 或没有匹配 listener 都 fail closed。
     派生规则按 listener 可覆盖的 rule family 分组；IPv4-only listener 不会被扩宽为 IPv6 rule，
     IPv6 wildcard listener 按 dual-family 处理以避免隐藏漏拦截。
+  - 已实现：`any` selector 中可由 setup-time process classifier 安全证明的形态会保留在 process
+    classifier 平面，而不降级到 flow classifier。支持两类保守形态：
+    同一 host boundary 下的多个 process branch，以及同一 process scope 下的多个 host-rule branch。
+    若 process branch 与 host boundary 同时变化，projection 仍要求 flow-aware classifier，避免把
+    `(process A, port X) OR (process B, port Y)` 错扩成 `(process A OR B) AND (port X OR Y)`。
   - 验收：`e2e-transparent-tproxy-process-loopback` 用真实 netns/veth/nft/policy-routing/managed relay 路径验证 mismatch selector
     fail closed 和 matching selector setup-time proof。
   - 验收：`e2e-transparent-tproxy-process-derived-loopback` 验证 process-only selector 的派生 host rules、managed relay 转发、
@@ -848,7 +853,8 @@ TLS 明文与协议能力：
     会继续生成 host rules，不再因为 `ref` 形态本身落到 flow classifier。
   - 已实现：执行入口消费 `ResolvedSelector`。直接绕过 validation/setup composition 传入低层 projection 的 raw `ref`
     不会生成 host rules。
-  - 已实现：`not` 以及包含 classifier-only 或 unconstrained 分支的 `any` setup requirement 会落到该 capability。
+  - 已实现：`not`、无法保持 process/host branch 相关性的 `any`，以及无法由同一 host boundary 或同一
+    process scope 证明的 classifier-only / unconstrained `any` setup requirement 会落到该 capability。
   - 边界：还没有 flow-aware classifier。缺失或循环 ref 会在配置/manifest validation 阶段 fail closed；
     绕过 registry 直接传入 setup projection 的 raw ref 不会安装规则。
   - 边界：`any` 在所有分支都不依赖 process/flow classifier、每个分支都有可投影 host scope 时，会投影为有限 host-rule set。
@@ -3179,9 +3185,10 @@ RuntimePlan 的 `local_setup_projection` 只根据本地配置可见的主 `enfo
 - `requires_flow_classifier`
   - Payload：transparent-interception-owned classifier selector view 和 `host_rule_boundary`。
   - 当前语义：fail closed。
-  - 需要 classifier 的情况：`not`、named ref，以及包含 classifier-only 或 unconstrained 分支的 `any`。
-    这类输入需要 flow-aware classifier 或 registry-backed resolution。
-  - 例外：纯 host-rule `any` 会保留为有限 `scopes[]`，必要时生成多个 disjoint nft rules。
+  - 需要 classifier 的情况：`not`、named ref，以及无法由同一 host boundary 或同一 process scope 保持 branch
+    相关性的 `any`。这类输入需要 flow-aware classifier 或 registry-backed resolution。
+  - 例外：纯 host-rule `any` 会保留为有限 `scopes[]`，必要时生成多个 disjoint nft rules；可由同一
+    host boundary 或同一 process scope 证明的 process-scoped `any` 会保留为 process classifier requirement。
 - `unsupported`
   - Payload：无法作为 setup plan 的原因。
   - 当前语义：fail closed。
