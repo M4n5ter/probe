@@ -560,6 +560,63 @@ mod tests {
     }
 
     #[test]
+    fn correlated_process_any_reports_flow_classifier_host_boundary() {
+        let scope = scope_for(
+            TransparentInterceptionStrategyConfig::InboundTproxy,
+            Selector::Any {
+                selectors: vec![
+                    Selector::term(
+                        ProcessSelector {
+                            names: vec!["curl".to_string()],
+                            ..ProcessSelector::default()
+                        },
+                        TrafficSelector {
+                            local_ports: vec![8443],
+                            directions: vec![Direction::Inbound],
+                            ..TrafficSelector::default()
+                        },
+                    ),
+                    Selector::term(
+                        ProcessSelector {
+                            names: vec!["nginx".to_string()],
+                            ..ProcessSelector::default()
+                        },
+                        TrafficSelector {
+                            local_ports: vec![9443],
+                            directions: vec![Direction::Inbound],
+                            ..TrafficSelector::default()
+                        },
+                    ),
+                ],
+            },
+        );
+
+        let TransparentInterceptionLocalSetupProjectionPlan::RequiresFlowClassifier {
+            host_rule_boundary,
+            flow_scope,
+            ..
+        } = scope
+        else {
+            panic!("correlated process any selector should require flow classifier");
+        };
+        let TransparentInterceptionProjectedHostRuleBoundaryPlan::HostRules { scopes } =
+            host_rule_boundary
+        else {
+            panic!("flow classifier should preserve the finite host-rule superset");
+        };
+        assert_eq!(
+            single_scope(&scopes).local_ports,
+            TransparentInterceptionProjectedPortScopePlan::Only {
+                ports: vec![8443, 9443]
+            }
+        );
+        assert!(matches!(
+            flow_scope.selector,
+            TransparentInterceptionClassifierSelectorPlan::Any { .. }
+        ));
+    }
+
+    #[test]
     fn any_selector_projects_single_host_rule_dimension() {
         let scope = scope_for(
             TransparentInterceptionStrategyConfig::InboundTproxy,

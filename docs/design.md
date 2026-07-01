@@ -855,6 +855,10 @@ TLS 明文与协议能力：
     不会生成 host rules。
   - 已实现：`not`、无法保持 process/host branch 相关性的 `any`，以及其它无法在 setup-time rules
     中证明 branch 相关性的 `any` setup requirement 会落到该 capability。
+  - 已实现：当 flow classifier requirement 的分支仍有有限 host-rule 入口，且合并后的 setup-time
+    superset 可安装时，projection 会保留该有限 `host_rule_boundary` 作为安全 superset；任一分支没有可安装
+    host boundary、合并后的 finite superset 超过规则上限，或中间 host-term 候选集合超过 analysis budget
+    时，使用 `no_host_rule_boundary`。
   - 边界：还没有 flow-aware classifier。缺失或循环 ref 会在配置/manifest validation 阶段 fail closed；
     绕过 registry 直接传入 setup projection 的 raw ref 不会安装规则。
   - 边界：`any` 在所有分支都不依赖 process/flow classifier、每个分支都有可投影 host scope 时，会投影为有限 host-rule set。
@@ -3185,6 +3189,10 @@ RuntimePlan 的 `local_setup_projection` 只根据本地配置可见的主 `enfo
 - `requires_flow_classifier`
   - Payload：transparent-interception-owned classifier selector view 和 `host_rule_boundary`。
   - 当前语义：fail closed。
+  - Boundary：`host_rule_boundary` 是 setup-time host rules 能安装的安全 superset；flow classifier
+    backend 负责在该 superset 内保持 process/host branch 相关性。没有有限 superset、finite
+    superset 超过规则上限，或 projection 的中间 host-term 候选集合超过 analysis budget 时使用
+    `no_host_rule_boundary`，执行层不得安装全机宽规则。
   - 需要 classifier 的情况：`not`、named ref，以及无法由同一 host boundary 或同一 process scope 保持 branch
     相关性的 `any`。这类输入需要 flow-aware classifier 或 registry-backed resolution。
   - 例外：纯 host-rule `any` 会保留为有限 `scopes[]`，必要时生成多个 disjoint nft rules；可由同一

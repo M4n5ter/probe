@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, net::IpAddr};
 
 use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
 
-use super::model::process_selector_has_constraints;
+use super::model::{TransparentInterceptionHostRuleCompaction, process_selector_has_constraints};
 use super::{
     TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
     TransparentInterceptionHostRuleScope, TransparentInterceptionHostRuleSet,
@@ -16,6 +16,10 @@ const PROCESS_CLASSIFIER_REASON: &str = "selector contains process constraints t
 const ANY_FLOW_CLASSIFIER_REASON: &str = "any selector branches that cannot preserve host/process correlation in setup-time rules require a flow-aware classifier";
 const NOT_FLOW_CLASSIFIER_REASON: &str = "not selectors require a flow-aware classifier and cannot be projected to setup-time host rules";
 const REF_FLOW_CLASSIFIER_REASON: &str = "named selector refs require registry-backed classifier resolution before transparent interception setup";
+const MAX_ANALYSIS_HOST_TERMS: usize = 4096;
+const MAX_ANALYSIS_HOST_TERM_INTERSECTIONS: usize = 65_536;
+const ANALYSIS_HOST_TERMS_TOO_LARGE_REASON: &str =
+    "transparent interception selector expands beyond the analysis host-term budget";
 
 impl TransparentInterceptionSetupPlan {
     pub fn from_selector(
@@ -26,22 +30,27 @@ impl TransparentInterceptionSetupPlan {
             return Err(TransparentInterceptionSetupProjectionError::MissingSelector);
         };
         let analysis = analyze_selector(selector, direction)?;
-        let host_rule_boundary = host_rule_boundary_from_terms(analysis.host_terms, direction)?;
+        let SelectorSetupAnalysis {
+            host_terms,
+            classifier,
+        } = analysis;
 
-        match analysis.classifier {
+        match classifier {
             Some(SetupClassifierRequirement::Flow { reason }) => Ok(Self::RequiresFlowClassifier {
-                host_rule_boundary,
+                host_rule_boundary: host_rule_boundary_from_terms_best_effort(
+                    host_terms, direction,
+                )?,
                 flow_scope: TransparentInterceptionFlowClassifierScope::from_selector(selector),
                 reason,
             }),
             Some(SetupClassifierRequirement::Process { expression }) => {
                 Ok(Self::RequiresProcessClassifier {
-                    host_rule_boundary,
+                    host_rule_boundary: host_rule_boundary_from_terms(host_terms, direction)?,
                     process_scope: TransparentInterceptionProcessScope::new(expression)?,
                     reason: PROCESS_CLASSIFIER_REASON.to_string(),
                 })
             }
-            None => match host_rule_boundary {
+            None => match host_rule_boundary_from_terms(host_terms, direction)? {
                 TransparentInterceptionHostRuleBoundary::HostRules(rules) => {
                     Ok(Self::HostRules(rules))
                 }
@@ -55,7 +64,7 @@ impl TransparentInterceptionSetupPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SelectorSetupAnalysis {
-    host_terms: Vec<ProjectableLocalSetupTerm>,
+    host_terms: ProjectableHostTerms,
     classifier: Option<SetupClassifierRequirement>,
 }
 
@@ -106,13 +115,50 @@ impl ProjectableLocalSetupTerm {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectableHostTerms {
+    Terms(Vec<ProjectableLocalSetupTerm>),
+    TooLarge,
+}
+
+impl ProjectableHostTerms {
+    fn empty() -> Self {
+        Self::Terms(Vec::new())
+    }
+
+    fn single(term: ProjectableLocalSetupTerm) -> Self {
+        Self::Terms(vec![term])
+    }
+
+    fn budgeted(terms: Vec<ProjectableLocalSetupTerm>) -> Self {
+        if terms.len() > MAX_ANALYSIS_HOST_TERMS {
+            Self::TooLarge
+        } else {
+            Self::Terms(terms)
+        }
+    }
+
+    fn terms(&self) -> Option<&[ProjectableLocalSetupTerm]> {
+        match self {
+            Self::Terms(terms) => Some(terms),
+            Self::TooLarge => None,
+        }
+    }
+}
+
+enum AnyHostProjection {
+    Projected(ProjectableHostTerms),
+    NeedsClassifierFallback,
+    HostTermsTooLarge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AnyBranchHostBoundary {
     Unconstrained,
     Finite(TransparentInterceptionHostRuleSet),
 }
 
 impl AnyBranchHostBoundary {
-    fn from_terms(
+    fn from_terms_best_effort(
         host_terms: &[ProjectableLocalSetupTerm],
         direction: TransparentInterceptionSetupDirection,
     ) -> Result<Self, TransparentInterceptionSetupProjectionError> {
@@ -124,8 +170,10 @@ impl AnyBranchHostBoundary {
             };
             scopes.push(scope);
         }
-        Ok(TransparentInterceptionHostRuleSet::compacting(scopes)?
-            .map_or(Self::Unconstrained, Self::Finite))
+        Ok(
+            TransparentInterceptionHostRuleSet::compacting_best_effort(scopes)
+                .map_or(Self::Unconstrained, Self::Finite),
+        )
     }
 
     fn equivalent_to(&self, other: &Self) -> bool {
@@ -222,10 +270,10 @@ fn analyze_selector(
             validate_traffic_selector(&term.traffic, direction)?;
             let process_projection = process_setup_projection(&term.process, direction);
             Ok(SelectorSetupAnalysis {
-                host_terms: vec![ProjectableLocalSetupTerm {
+                host_terms: ProjectableHostTerms::single(ProjectableLocalSetupTerm {
                     traffic: term.traffic.clone(),
                     socket_owners: process_projection.socket_owners,
-                }],
+                }),
                 classifier: process_projection.classifier,
             })
         }
@@ -255,16 +303,27 @@ fn analyze_any_selector(
         .map(|selector| analyze_selector(selector, direction))
         .collect::<Result<Vec<_>, _>>()?;
     match project_any_selector_host_term(&analyses, direction)? {
-        Some(host_terms) => Ok(SelectorSetupAnalysis {
+        AnyHostProjection::Projected(host_terms) => Ok(SelectorSetupAnalysis {
             host_terms,
             classifier: None,
         }),
-        None => match project_any_selector_process_classifier(&analyses, direction)? {
-            Some(analysis) => Ok(analysis),
-            None => Ok(flow_classifier_analysis(
-                ANY_FLOW_CLASSIFIER_REASON.to_string(),
-            )),
-        },
+        AnyHostProjection::HostTermsTooLarge => Ok(SelectorSetupAnalysis {
+            host_terms: ProjectableHostTerms::TooLarge,
+            classifier: None,
+        }),
+        AnyHostProjection::NeedsClassifierFallback => {
+            match project_any_selector_process_classifier(&analyses, direction)? {
+                Some(analysis) => Ok(analysis),
+                None => Ok(SelectorSetupAnalysis {
+                    host_terms: union_any_selector_flow_classifier_host_terms(
+                        &analyses, direction,
+                    )?,
+                    classifier: Some(SetupClassifierRequirement::Flow {
+                        reason: ANY_FLOW_CLASSIFIER_REASON.to_string(),
+                    }),
+                }),
+            }
+        }
     }
 }
 
@@ -278,13 +337,13 @@ fn analyze_all_selector(
         });
     }
 
-    let mut host_terms = Vec::new();
+    let mut host_terms = ProjectableHostTerms::empty();
     let mut process_expressions = Vec::new();
     let mut flow_reason = None;
 
     for selector in selectors {
         let analysis = analyze_selector(selector, direction)?;
-        host_terms = intersect_projectable_term_sets(host_terms, analysis.host_terms)?;
+        host_terms = intersect_projectable_term_sets(host_terms, analysis.host_terms, direction)?;
         match analysis.classifier {
             Some(SetupClassifierRequirement::Flow { reason }) => {
                 flow_reason.get_or_insert(reason);
@@ -310,34 +369,46 @@ fn analyze_all_selector(
 fn project_any_selector_host_term(
     analyses: &[SelectorSetupAnalysis],
     direction: TransparentInterceptionSetupDirection,
-) -> Result<Option<Vec<ProjectableLocalSetupTerm>>, TransparentInterceptionSetupProjectionError> {
+) -> Result<AnyHostProjection, TransparentInterceptionSetupProjectionError> {
     if analyses
         .iter()
-        .any(|analysis| analysis.classifier.is_some() || analysis.host_terms.is_empty())
+        .any(|analysis| analysis.classifier.is_some())
     {
-        return Ok(None);
+        return Ok(AnyHostProjection::NeedsClassifierFallback);
+    }
+    if analyses
+        .iter()
+        .any(|analysis| matches!(analysis.host_terms, ProjectableHostTerms::TooLarge))
+    {
+        return Ok(AnyHostProjection::HostTermsTooLarge);
     }
 
     let mut scopes = Vec::new();
     for analysis in analyses {
-        for term in &analysis.host_terms {
+        let terms = analysis
+            .host_terms
+            .terms()
+            .expect("host-only any projection already rejected oversized host terms");
+        if terms.is_empty() {
+            continue;
+        }
+        for term in terms {
             let Some(scope) = optional_host_rule_scope_for_any_branch(term.clone(), direction)?
             else {
-                return Ok(None);
+                return Ok(AnyHostProjection::Projected(ProjectableHostTerms::single(
+                    ProjectableLocalSetupTerm::default(),
+                )));
             };
             scopes.push(scope);
+            match compact_scopes_within_analysis_budget(scopes) {
+                ScopeBudgetCompaction::WithinBudget(compacted) => scopes = compacted,
+                ScopeBudgetCompaction::TooLarge => {
+                    return Ok(AnyHostProjection::HostTermsTooLarge);
+                }
+            }
         }
     }
-    Ok(
-        TransparentInterceptionHostRuleSet::compacting(scopes)?.map(|rules| {
-            rules
-                .scopes()
-                .iter()
-                .cloned()
-                .map(|scope| ProjectableLocalSetupTerm::from_scope(scope, direction))
-                .collect()
-        }),
-    )
+    projectable_terms_from_scopes_without_limit(scopes, direction).map(AnyHostProjection::Projected)
 }
 
 fn project_any_selector_process_classifier(
@@ -351,20 +422,25 @@ fn project_any_selector_process_classifier(
             return Ok(None);
         };
         process_expressions.push(expression.clone());
-        host_boundaries.push(AnyBranchHostBoundary::from_terms(
-            &analysis.host_terms,
-            direction,
-        )?);
+        let Some(host_terms) = analysis.host_terms.terms() else {
+            return Ok(None);
+        };
+        let Some(host_boundary) = process_classifier_host_boundary(host_terms, direction)? else {
+            return Ok(None);
+        };
+        host_boundaries.push(host_boundary);
     }
 
     if all_host_boundaries_equivalent(&host_boundaries) {
         return Ok(Some(SelectorSetupAnalysis {
-            host_terms: host_boundaries
-                .into_iter()
-                .next()
-                .map_or_else(Vec::new, |boundary| {
-                    boundary.into_projectable_terms(direction)
-                }),
+            host_terms: ProjectableHostTerms::budgeted(
+                host_boundaries
+                    .into_iter()
+                    .next()
+                    .map_or_else(Vec::new, |boundary| {
+                        boundary.into_projectable_terms(direction)
+                    }),
+            ),
             classifier: Some(SetupClassifierRequirement::Process {
                 expression: process_any_expression(process_expressions),
             }),
@@ -372,9 +448,13 @@ fn project_any_selector_process_classifier(
     }
 
     if all_process_expressions_equivalent(&process_expressions) {
-        let host_terms = union_any_branch_host_boundaries(host_boundaries, direction)?;
+        let Some(host_terms) =
+            union_any_branch_host_boundaries_for_process_classifier(host_boundaries, direction)?
+        else {
+            return Ok(None);
+        };
         return Ok(Some(SelectorSetupAnalysis {
-            host_terms,
+            host_terms: ProjectableHostTerms::budgeted(host_terms),
             classifier: Some(SetupClassifierRequirement::Process {
                 expression: process_expressions
                     .into_iter()
@@ -385,6 +465,29 @@ fn project_any_selector_process_classifier(
     }
 
     Ok(None)
+}
+
+fn process_classifier_host_boundary(
+    host_terms: &[ProjectableLocalSetupTerm],
+    direction: TransparentInterceptionSetupDirection,
+) -> Result<Option<AnyBranchHostBoundary>, TransparentInterceptionSetupProjectionError> {
+    let mut scopes = Vec::new();
+    for term in host_terms {
+        let Some(scope) = optional_host_rule_scope_for_any_branch(term.clone(), direction)? else {
+            return Ok(Some(AnyBranchHostBoundary::Unconstrained));
+        };
+        scopes.push(scope);
+    }
+
+    match TransparentInterceptionHostRuleSet::compacting_outcome(scopes) {
+        TransparentInterceptionHostRuleCompaction::Empty => {
+            Ok(Some(AnyBranchHostBoundary::Unconstrained))
+        }
+        TransparentInterceptionHostRuleCompaction::Installable(rules) => {
+            Ok(Some(AnyBranchHostBoundary::Finite(rules)))
+        }
+        TransparentInterceptionHostRuleCompaction::TooLarge { .. } => Ok(None),
+    }
 }
 
 fn all_host_boundaries_equivalent(host_boundaries: &[AnyBranchHostBoundary]) -> bool {
@@ -408,7 +511,34 @@ fn all_process_expressions_equivalent(
         .all(|expression| CanonicalProcessScopeExpression::from_expression(expression) == first)
 }
 
-fn union_any_branch_host_boundaries(
+fn union_any_branch_host_boundaries_for_process_classifier(
+    host_boundaries: Vec<AnyBranchHostBoundary>,
+    direction: TransparentInterceptionSetupDirection,
+) -> Result<Option<Vec<ProjectableLocalSetupTerm>>, TransparentInterceptionSetupProjectionError> {
+    let mut scopes = Vec::new();
+    for boundary in host_boundaries {
+        match boundary {
+            AnyBranchHostBoundary::Unconstrained => {
+                return Ok(Some(vec![ProjectableLocalSetupTerm::default()]));
+            }
+            AnyBranchHostBoundary::Finite(rules) => scopes.extend(rules.scopes().iter().cloned()),
+        }
+    }
+    match TransparentInterceptionHostRuleSet::compacting_outcome(scopes) {
+        TransparentInterceptionHostRuleCompaction::Empty => Ok(Some(Vec::new())),
+        TransparentInterceptionHostRuleCompaction::Installable(rules) => Ok(Some(
+            rules
+                .scopes()
+                .iter()
+                .cloned()
+                .map(|scope| ProjectableLocalSetupTerm::from_scope(scope, direction))
+                .collect(),
+        )),
+        TransparentInterceptionHostRuleCompaction::TooLarge { .. } => Ok(None),
+    }
+}
+
+fn union_any_branch_host_boundaries_best_effort(
     host_boundaries: Vec<AnyBranchHostBoundary>,
     direction: TransparentInterceptionSetupDirection,
 ) -> Result<Vec<ProjectableLocalSetupTerm>, TransparentInterceptionSetupProjectionError> {
@@ -422,15 +552,35 @@ fn union_any_branch_host_boundaries(
         }
     }
     Ok(
-        TransparentInterceptionHostRuleSet::compacting(scopes)?.map_or_else(Vec::new, |rules| {
-            rules
-                .scopes()
-                .iter()
-                .cloned()
-                .map(|scope| ProjectableLocalSetupTerm::from_scope(scope, direction))
-                .collect()
-        }),
+        TransparentInterceptionHostRuleSet::compacting_best_effort(scopes).map_or_else(
+            Vec::new,
+            |rules| {
+                rules
+                    .scopes()
+                    .iter()
+                    .cloned()
+                    .map(|scope| ProjectableLocalSetupTerm::from_scope(scope, direction))
+                    .collect()
+            },
+        ),
     )
+}
+
+fn union_any_selector_flow_classifier_host_terms(
+    analyses: &[SelectorSetupAnalysis],
+    direction: TransparentInterceptionSetupDirection,
+) -> Result<ProjectableHostTerms, TransparentInterceptionSetupProjectionError> {
+    let mut host_boundaries = Vec::new();
+    for analysis in analyses {
+        let Some(host_terms) = analysis.host_terms.terms() else {
+            return Ok(ProjectableHostTerms::TooLarge);
+        };
+        host_boundaries.push(AnyBranchHostBoundary::from_terms_best_effort(
+            host_terms, direction,
+        )?);
+    }
+    union_any_branch_host_boundaries_best_effort(host_boundaries, direction)
+        .map(ProjectableHostTerms::budgeted)
 }
 
 fn process_any_expression(
@@ -455,9 +605,41 @@ fn optional_host_rule_scope_for_any_branch(
     }
 }
 
+fn projectable_terms_from_scopes_without_limit(
+    scopes: Vec<TransparentInterceptionHostRuleScope>,
+    direction: TransparentInterceptionSetupDirection,
+) -> Result<ProjectableHostTerms, TransparentInterceptionSetupProjectionError> {
+    let scopes = TransparentInterceptionHostRuleSet::compact_scopes_without_limit(scopes);
+    Ok(ProjectableHostTerms::budgeted(
+        scopes
+            .into_iter()
+            .map(|scope| ProjectableLocalSetupTerm::from_scope(scope, direction))
+            .collect(),
+    ))
+}
+
+enum ScopeBudgetCompaction {
+    WithinBudget(Vec<TransparentInterceptionHostRuleScope>),
+    TooLarge,
+}
+
+fn compact_scopes_within_analysis_budget(
+    scopes: Vec<TransparentInterceptionHostRuleScope>,
+) -> ScopeBudgetCompaction {
+    if scopes.len() <= MAX_ANALYSIS_HOST_TERMS {
+        return ScopeBudgetCompaction::WithinBudget(scopes);
+    }
+    let compacted = TransparentInterceptionHostRuleSet::compact_scopes_without_limit(scopes);
+    if compacted.len() > MAX_ANALYSIS_HOST_TERMS {
+        ScopeBudgetCompaction::TooLarge
+    } else {
+        ScopeBudgetCompaction::WithinBudget(compacted)
+    }
+}
+
 fn flow_classifier_analysis(reason: String) -> SelectorSetupAnalysis {
     SelectorSetupAnalysis {
-        host_terms: Vec::new(),
+        host_terms: ProjectableHostTerms::empty(),
         classifier: Some(SetupClassifierRequirement::Flow { reason }),
     }
 }
@@ -542,9 +724,14 @@ fn process_classifier_requirement_from_expressions(
 }
 
 fn host_rule_boundary_from_terms(
-    terms: Vec<ProjectableLocalSetupTerm>,
+    terms: ProjectableHostTerms,
     direction: TransparentInterceptionSetupDirection,
 ) -> Result<TransparentInterceptionHostRuleBoundary, TransparentInterceptionSetupProjectionError> {
+    let ProjectableHostTerms::Terms(terms) = terms else {
+        return Err(TransparentInterceptionSetupProjectionError::Unsupported {
+            reason: ANALYSIS_HOST_TERMS_TOO_LARGE_REASON.to_string(),
+        });
+    };
     if terms.is_empty() {
         return Ok(TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary);
     }
@@ -559,6 +746,33 @@ fn host_rule_boundary_from_terms(
     }
     Ok(
         TransparentInterceptionHostRuleSet::compacting(scopes)?.map_or(
+            TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary,
+            TransparentInterceptionHostRuleBoundary::HostRules,
+        ),
+    )
+}
+
+fn host_rule_boundary_from_terms_best_effort(
+    terms: ProjectableHostTerms,
+    direction: TransparentInterceptionSetupDirection,
+) -> Result<TransparentInterceptionHostRuleBoundary, TransparentInterceptionSetupProjectionError> {
+    let ProjectableHostTerms::Terms(terms) = terms else {
+        return Ok(TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary);
+    };
+    if terms.is_empty() {
+        return Ok(TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary);
+    }
+
+    let mut scopes = Vec::new();
+    for term in terms {
+        match host_rule_scope_from_term(term, direction) {
+            Ok(scope) => scopes.push(scope),
+            Err(TransparentInterceptionSetupProjectionError::UnconstrainedSelector) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(
+        TransparentInterceptionHostRuleSet::compacting_best_effort(scopes).map_or(
             TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary,
             TransparentInterceptionHostRuleBoundary::HostRules,
         ),
@@ -626,21 +840,34 @@ fn validate_traffic_selector(
 }
 
 fn intersect_projectable_term_sets(
-    current: Vec<ProjectableLocalSetupTerm>,
-    next: Vec<ProjectableLocalSetupTerm>,
-) -> Result<Vec<ProjectableLocalSetupTerm>, TransparentInterceptionSetupProjectionError> {
+    current: ProjectableHostTerms,
+    next: ProjectableHostTerms,
+    direction: TransparentInterceptionSetupDirection,
+) -> Result<ProjectableHostTerms, TransparentInterceptionSetupProjectionError> {
+    let (ProjectableHostTerms::Terms(current), ProjectableHostTerms::Terms(next)) = (current, next)
+    else {
+        return Ok(ProjectableHostTerms::TooLarge);
+    };
     if next.is_empty() {
-        return Ok(current);
+        return Ok(ProjectableHostTerms::Terms(current));
     }
     if current.is_empty() {
-        return Ok(next);
+        return Ok(ProjectableHostTerms::Terms(next));
     }
 
     let mut terms = Vec::new();
+    let mut comparisons = 0usize;
     for current in current {
         for next in &next {
+            comparisons += 1;
+            if comparisons > MAX_ANALYSIS_HOST_TERM_INTERSECTIONS {
+                return Ok(ProjectableHostTerms::TooLarge);
+            }
             if let Some(term) = current.clone().intersect(next.clone())? {
                 terms.push(term);
+                if terms.len() > MAX_ANALYSIS_HOST_TERMS {
+                    return Ok(ProjectableHostTerms::TooLarge);
+                }
             }
         }
     }
@@ -649,8 +876,24 @@ fn intersect_projectable_term_sets(
             reason: "selector intersections do not overlap".to_string(),
         })
     } else {
-        Ok(terms)
+        projectable_terms_from_intermediate_terms(terms, direction)
     }
+}
+
+fn projectable_terms_from_intermediate_terms(
+    terms: Vec<ProjectableLocalSetupTerm>,
+    direction: TransparentInterceptionSetupDirection,
+) -> Result<ProjectableHostTerms, TransparentInterceptionSetupProjectionError> {
+    let mut scopes = Vec::new();
+    for term in terms {
+        let Some(scope) = optional_host_rule_scope_for_any_branch(term, direction)? else {
+            return Ok(ProjectableHostTerms::single(
+                ProjectableLocalSetupTerm::default(),
+            ));
+        };
+        scopes.push(scope);
+    }
+    projectable_terms_from_scopes_without_limit(scopes, direction)
 }
 
 fn intersect_traffic_selectors(
@@ -1290,13 +1533,229 @@ mod tests {
         })
         .expect("process-scoped any selector should produce a classifier setup plan");
 
-        let TransparentInterceptionSetupPlan::RequiresFlowClassifier { flow_scope, .. } = plan
+        let TransparentInterceptionSetupPlan::RequiresFlowClassifier {
+            host_rule_boundary,
+            flow_scope,
+            ..
+        } = plan
         else {
             panic!("process-scoped any selector should require a flow classifier");
         };
+        assert_eq!(
+            single_boundary_scope(&host_rule_boundary)
+                .local_ports()
+                .values(),
+            &[8443, 9443]
+        );
         assert!(matches!(
             flow_scope.selector(),
             TransparentInterceptionClassifierSelector::Any { .. }
+        ));
+    }
+
+    #[test]
+    fn flow_classifier_any_selector_drops_host_boundary_when_any_branch_is_unconstrained() {
+        let plan = plan_for(Selector::Any {
+            selectors: vec![
+                Selector::term(process_names(&["curl"]), inbound_traffic()),
+                Selector::term(process_names(&["nginx"]), local_port(9443)),
+            ],
+        })
+        .expect("process-only branch should produce a classifier setup plan");
+
+        let TransparentInterceptionSetupPlan::RequiresFlowClassifier {
+            host_rule_boundary, ..
+        } = plan
+        else {
+            panic!("unconstrained process-scoped any selector should require flow classifier");
+        };
+        assert!(matches!(
+            host_rule_boundary,
+            TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary
+        ));
+    }
+
+    #[test]
+    fn flow_classifier_any_selector_drops_host_boundary_when_superset_exceeds_rule_limit() {
+        let plan = plan_for(Selector::Any {
+            selectors: oversized_correlated_process_selectors(),
+        })
+        .expect("oversized flow-classifier host boundary should not hide classifier need");
+
+        let TransparentInterceptionSetupPlan::RequiresFlowClassifier {
+            host_rule_boundary, ..
+        } = plan
+        else {
+            panic!("oversized correlated any selector should require flow classifier");
+        };
+        assert!(matches!(
+            host_rule_boundary,
+            TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary
+        ));
+    }
+
+    #[test]
+    fn host_rule_any_selector_exceeding_rule_limit_is_unsupported_without_classifier() {
+        let error = plan_for(Selector::Any {
+            selectors: oversized_disjoint_host_selectors(),
+        })
+        .expect_err("oversized host-only any selector cannot be installed as host rules");
+
+        assert!(matches!(
+            error,
+            TransparentInterceptionSetupProjectionError::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn all_can_narrow_nested_oversized_host_any_before_install_limit() {
+        let plan = plan_for(Selector::All {
+            selectors: vec![
+                Selector::Any {
+                    selectors: oversized_disjoint_host_selectors(),
+                },
+                term(local_port_addresses(10042, &["198.51.0.42"])),
+            ],
+        })
+        .expect("narrowed nested any selector should remain installable");
+
+        let TransparentInterceptionSetupPlan::HostRules(rules) = plan else {
+            panic!("narrowed nested host-rule any selector should install host rules");
+        };
+        let scope = single_scope(&rules);
+        assert_eq!(scope.local_ports().values(), &[10042]);
+        assert_eq!(
+            scope.remote_addresses().ipv4(),
+            &[Ipv4Addr::new(198, 51, 0, 42)]
+        );
+    }
+
+    #[test]
+    fn flow_classifier_with_nested_oversized_host_any_keeps_classifier_need() {
+        let plan = plan_for(Selector::Any {
+            selectors: vec![
+                Selector::Any {
+                    selectors: oversized_disjoint_host_selectors(),
+                },
+                Selector::term(process_names(&["curl"]), local_port(8443)),
+            ],
+        })
+        .expect("nested oversized host boundary should not hide classifier need");
+
+        let TransparentInterceptionSetupPlan::RequiresFlowClassifier {
+            host_rule_boundary, ..
+        } = plan
+        else {
+            panic!("correlated nested any selector should require flow classifier");
+        };
+        assert!(matches!(
+            host_rule_boundary,
+            TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary
+        ));
+    }
+
+    #[test]
+    fn host_rule_candidate_overflow_is_unsupported_without_classifier() {
+        let error = plan_for(candidate_exploding_all_selector())
+            .expect_err("candidate overflow cannot be installed as host rules");
+
+        assert!(matches!(
+            error,
+            TransparentInterceptionSetupProjectionError::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn flow_classifier_with_nested_candidate_overflow_keeps_classifier_need() {
+        let plan = plan_for(Selector::Any {
+            selectors: vec![
+                candidate_exploding_all_selector(),
+                Selector::term(process_names(&["curl"]), local_port(8443)),
+            ],
+        })
+        .expect("nested candidate overflow should not hide classifier need");
+
+        let TransparentInterceptionSetupPlan::RequiresFlowClassifier {
+            host_rule_boundary, ..
+        } = plan
+        else {
+            panic!("nested candidate overflow should require flow classifier");
+        };
+        assert!(matches!(
+            host_rule_boundary,
+            TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary
+        ));
+    }
+
+    #[test]
+    fn process_any_with_oversized_branch_falls_back_to_flow_classifier() {
+        let plan = plan_for(Selector::Any {
+            selectors: vec![
+                Selector::All {
+                    selectors: vec![
+                        Selector::term(process_names(&["curl"]), TrafficSelector::default()),
+                        Selector::Any {
+                            selectors: oversized_disjoint_host_selectors(),
+                        },
+                    ],
+                },
+                Selector::term(process_names(&["nginx"]), local_port(8443)),
+            ],
+        })
+        .expect("oversized process branch should not hide flow classifier need");
+
+        let TransparentInterceptionSetupPlan::RequiresFlowClassifier {
+            host_rule_boundary, ..
+        } = plan
+        else {
+            panic!("oversized process any should require flow classifier");
+        };
+        assert!(matches!(
+            host_rule_boundary,
+            TransparentInterceptionHostRuleBoundary::NoHostRuleBoundary
+        ));
+    }
+
+    #[test]
+    fn host_rule_any_with_oversized_child_is_unsupported_without_classifier() {
+        let error = plan_for(Selector::Any {
+            selectors: vec![candidate_exploding_all_selector(), term(local_port(8443))],
+        })
+        .expect_err("pure host-rule any must not become a flow classifier requirement");
+
+        assert!(matches!(
+            error,
+            TransparentInterceptionSetupProjectionError::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn host_rule_any_union_candidate_overflow_is_unsupported_without_classifier() {
+        let selectors = (0..17)
+            .map(|group| Selector::Any {
+                selectors: disjoint_host_selectors(257, group * 257),
+            })
+            .collect();
+
+        let error = plan_for(Selector::Any { selectors })
+            .expect_err("pure host-rule any union overflow must not become classifier fallback");
+
+        assert!(matches!(
+            error,
+            TransparentInterceptionSetupProjectionError::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn host_rule_any_with_unconstrained_branch_remains_unconstrained() {
+        let error = plan_for(Selector::Any {
+            selectors: vec![term(TrafficSelector::default()), term(local_port(8443))],
+        })
+        .expect_err("unconstrained host-only any branch should dominate");
+
+        assert!(matches!(
+            error,
+            TransparentInterceptionSetupProjectionError::UnconstrainedSelector
         ));
     }
 
@@ -1633,6 +2092,48 @@ mod tests {
         TrafficSelector {
             directions: vec![Direction::Outbound],
             ..remote_port_addresses(port, addresses)
+        }
+    }
+
+    fn oversized_disjoint_host_selectors() -> Vec<Selector> {
+        disjoint_host_selectors(257, 0)
+    }
+
+    fn disjoint_host_selectors(count: usize, offset: usize) -> Vec<Selector> {
+        (0..count)
+            .map(|index| term(disjoint_traffic(index + offset)))
+            .collect()
+    }
+
+    fn oversized_correlated_process_selectors() -> Vec<Selector> {
+        (0..257)
+            .map(|index| {
+                Selector::term(
+                    process_names(&[if index % 2 == 0 { "curl" } else { "nginx" }]),
+                    disjoint_traffic(index),
+                )
+            })
+            .collect()
+    }
+
+    fn candidate_exploding_all_selector() -> Selector {
+        Selector::All {
+            selectors: vec![
+                Selector::Any {
+                    selectors: oversized_disjoint_host_selectors(),
+                },
+                Selector::Any {
+                    selectors: oversized_disjoint_host_selectors(),
+                },
+            ],
+        }
+    }
+
+    fn disjoint_traffic(index: usize) -> TrafficSelector {
+        TrafficSelector {
+            local_ports: vec![10000 + index as u16],
+            remote_addresses: vec![format!("198.51.{}.{}", index / 256, index % 256)],
+            ..TrafficSelector::default()
         }
     }
 

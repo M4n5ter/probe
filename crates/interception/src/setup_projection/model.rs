@@ -18,6 +18,12 @@ pub struct TransparentInterceptionHostRuleSet {
     scopes: Vec<TransparentInterceptionHostRuleScope>,
 }
 
+pub(crate) enum TransparentInterceptionHostRuleCompaction {
+    Empty,
+    Installable(TransparentInterceptionHostRuleSet),
+    TooLarge { expanded: usize, limit: usize },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentInterceptionProcessScope {
     expression: TransparentInterceptionProcessScopeExpression,
@@ -246,7 +252,45 @@ impl TransparentInterceptionHostRuleSet {
     pub fn compacting(
         scopes: Vec<TransparentInterceptionHostRuleScope>,
     ) -> Result<Option<Self>, TransparentInterceptionSetupProjectionError> {
-        Self::canonicalize(scopes)
+        match Self::compacting_outcome(scopes) {
+            TransparentInterceptionHostRuleCompaction::Empty => Ok(None),
+            TransparentInterceptionHostRuleCompaction::Installable(rules) => Ok(Some(rules)),
+            TransparentInterceptionHostRuleCompaction::TooLarge { expanded, limit } => {
+                Err(Self::too_large_error(expanded, limit))
+            }
+        }
+    }
+
+    pub(crate) fn compacting_best_effort(
+        scopes: Vec<TransparentInterceptionHostRuleScope>,
+    ) -> Option<Self> {
+        match Self::compacting_outcome(scopes) {
+            TransparentInterceptionHostRuleCompaction::Installable(rules) => Some(rules),
+            TransparentInterceptionHostRuleCompaction::Empty
+            | TransparentInterceptionHostRuleCompaction::TooLarge { .. } => None,
+        }
+    }
+
+    pub(crate) fn compacting_outcome(
+        scopes: Vec<TransparentInterceptionHostRuleScope>,
+    ) -> TransparentInterceptionHostRuleCompaction {
+        let scopes = Self::compact_scopes_without_limit(scopes);
+        if scopes.is_empty() {
+            TransparentInterceptionHostRuleCompaction::Empty
+        } else if scopes.len() > MAX_HOST_RULE_SCOPES {
+            TransparentInterceptionHostRuleCompaction::TooLarge {
+                expanded: scopes.len(),
+                limit: MAX_HOST_RULE_SCOPES,
+            }
+        } else {
+            TransparentInterceptionHostRuleCompaction::Installable(Self { scopes })
+        }
+    }
+
+    pub(crate) fn compact_scopes_without_limit(
+        scopes: Vec<TransparentInterceptionHostRuleScope>,
+    ) -> Vec<TransparentInterceptionHostRuleScope> {
+        compact_host_rule_scopes(scopes)
     }
 
     pub fn scopes(&self) -> &[TransparentInterceptionHostRuleScope] {
@@ -268,21 +312,24 @@ impl TransparentInterceptionHostRuleSet {
     fn canonicalize(
         scopes: Vec<TransparentInterceptionHostRuleScope>,
     ) -> Result<Option<Self>, TransparentInterceptionSetupProjectionError> {
-        if scopes.is_empty() {
-            return Ok(None);
+        match Self::compacting_outcome(scopes) {
+            TransparentInterceptionHostRuleCompaction::Empty => Ok(None),
+            TransparentInterceptionHostRuleCompaction::Installable(rules) => Ok(Some(rules)),
+            TransparentInterceptionHostRuleCompaction::TooLarge { expanded, limit } => {
+                Err(Self::too_large_error(expanded, limit))
+            }
         }
-        let scopes = compact_host_rule_scopes(scopes);
-        if scopes.len() > MAX_HOST_RULE_SCOPES {
-            return Err(TransparentInterceptionSetupProjectionError::Unsupported {
-                reason: format!(
-                    "transparent interception selector expands to {} host rules, exceeding the maximum of {}",
-                    scopes.len(),
-                    MAX_HOST_RULE_SCOPES
-                ),
-            });
-        }
+    }
 
-        Ok(Some(Self { scopes }))
+    fn too_large_error(
+        expanded: usize,
+        limit: usize,
+    ) -> TransparentInterceptionSetupProjectionError {
+        TransparentInterceptionSetupProjectionError::Unsupported {
+            reason: format!(
+                "transparent interception selector expands to {expanded} host rules, exceeding the maximum of {limit}"
+            ),
+        }
     }
 }
 
