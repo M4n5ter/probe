@@ -21,7 +21,7 @@ use super::{
     loopback::{
         Http1LoopbackFixtureConfig, PlainHttp1LoopbackFixtureConfig,
         assert_no_policy_runtime_errors, spawn_agent, spawn_http1_loopback_fixture,
-        start_http1_loopback_fixture, wait_for_agent_enforcement_decision_count_at_least,
+        start_http1_loopback_fixture, wait_for_agent_linux_socket_destroy_execution_count_at_least,
         wait_for_agent_ready, wait_for_http1_loopback_fixture_ready,
     },
 };
@@ -126,7 +126,11 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     wait_for_agent_ready(agent.child_mut(), &mut ready_signal)?;
 
     start_http1_loopback_fixture(&fixture_start_path, &fixture_ready.start_nonce)?;
-    wait_for_agent_enforcement_decision_count_at_least(agent.child_mut(), &admin_socket_path, 1)?;
+    wait_for_agent_linux_socket_destroy_execution_count_at_least(
+        agent.child_mut(),
+        &admin_socket_path,
+        1,
+    )?;
     let fixture_status =
         wait_for_child_status(fixture.child_mut(), Duration::from_secs(20), "fixture")?;
     fixture.unwatch();

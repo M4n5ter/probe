@@ -777,7 +777,11 @@ where
                 let Some(decision) = self.evaluate_enforcement_decision(envelope, &verdict) else {
                     return Ok(written);
                 };
-                let decision_outcome = decision.outcome;
+                let decision_metric =
+                    crate::runtime_metrics::EnforcementDecisionMetric::from_decision_parts(
+                        decision.outcome,
+                        decision.execution.as_ref(),
+                    );
                 let decision_written = self.append_policy_event(
                     envelope,
                     policy_version,
@@ -788,7 +792,7 @@ where
                 )?;
                 written += u64::from(decision_written);
                 if decision_written && let Some(metrics) = &self.runtime_metrics {
-                    metrics.record_enforcement_decision(decision_outcome);
+                    metrics.record_enforcement_decision(decision_metric);
                 }
                 Ok(written)
             }

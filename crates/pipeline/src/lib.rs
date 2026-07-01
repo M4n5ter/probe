@@ -11,6 +11,9 @@ pub use pipeline::{
 pub use policy_runtime::{PipelinePolicyRuntimeErrorSnapshot, PipelinePolicyRuntimeSnapshot};
 pub use runtime_metrics::{
     CaptureLossRuntimeMetricsSnapshot, CapturePollRuntimeMetricsSnapshot,
+    ConnectionBackendExecutionRuntimeMetricsSnapshot, EnforcementExecutionRuntimeMetricsSnapshot,
+    EnforcementExecutionRuntimeSurface, EnforcementExecutionRuntimeSurfaceCount,
     EnforcementRuntimeMetricsSnapshot, EventRuntimeMetricsSnapshot, PipelineRuntimeMetrics,
     PipelineRuntimeMetricsSnapshot, PolicyRuntimeMetricsSnapshot,
+    ProxySideHookExecutionRuntimeMetricsSnapshot,
 };

@@ -355,6 +355,34 @@ pub(crate) fn wait_for_agent_enforcement_decision_count_above(
     )
 }
 
+pub(crate) fn wait_for_agent_linux_socket_destroy_execution_count_at_least(
+    agent: &mut Child,
+    admin_socket_path: &Path,
+    expected: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    wait_for_agent_counter_until(
+        agent,
+        admin_socket_path,
+        AgentProgressCounter::LinuxSocketDestroyExecutions,
+        format!("linux_socket_destroy_executions>={expected}"),
+        |value| value >= expected,
+    )
+}
+
+pub(crate) fn wait_for_agent_l7_mitm_proxy_hook_execution_count_at_least(
+    agent: &mut Child,
+    admin_socket_path: &Path,
+    expected: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    wait_for_agent_counter_until(
+        agent,
+        admin_socket_path,
+        AgentProgressCounter::L7MitmProxyHookExecutions,
+        format!("l7_mitm_proxy_hook_executions>={expected}"),
+        |value| value >= expected,
+    )
+}
+
 pub(crate) fn wait_for_agent_pipeline_progress(
     agent: &mut Child,
     admin_socket_path: &Path,
@@ -641,6 +669,8 @@ impl AgentProgressMetrics {
 enum AgentProgressCounter {
     PolicyAlerts,
     EnforcementDecisions,
+    LinuxSocketDestroyExecutions,
+    L7MitmProxyHookExecutions,
 }
 
 impl AgentProgressCounter {
@@ -659,6 +689,26 @@ impl AgentProgressCounter {
                 Ok(enforcement["decisions"].as_u64().ok_or_else(|| {
                     e2e_error(format!(
                         "admin metrics response omitted enforcement decision count: {response}"
+                    ))
+                })?)
+            }
+            Self::LinuxSocketDestroyExecutions => {
+                let connection_backend = &response["metrics"]["pipeline"]["enforcement"]["execution"]
+                    ["connection_backend"];
+                Ok(connection_backend["linux_socket_destroy"]
+                    .as_u64()
+                    .ok_or_else(|| {
+                        e2e_error(format!(
+                            "admin metrics response omitted linux socket destroy execution count: {response}"
+                        ))
+                    })?)
+            }
+            Self::L7MitmProxyHookExecutions => {
+                let proxy_side_hook =
+                    &response["metrics"]["pipeline"]["enforcement"]["execution"]["proxy_side_hook"];
+                Ok(proxy_side_hook["l7_mitm"].as_u64().ok_or_else(|| {
+                    e2e_error(format!(
+                        "admin metrics response omitted L7 MITM proxy hook execution count: {response}"
                     ))
                 })?)
             }

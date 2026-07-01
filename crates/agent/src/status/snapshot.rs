@@ -449,6 +449,7 @@ mod tests {
                     failed: 0,
                     delegated: 0,
                     applied: 0,
+                    execution: pipeline::EnforcementExecutionRuntimeMetricsSnapshot::default(),
                 },
             }),
             ..RuntimeStatusInput::default()
@@ -506,6 +507,10 @@ mod tests {
         assert_eq!(
             value["metrics"]["pipeline"]["enforcement"]["dry_run"],
             json!(1)
+        );
+        assert_eq!(
+            value["metrics"]["pipeline"]["enforcement"]["execution"]["connection_backend"]["linux_socket_destroy"],
+            json!(0)
         );
         assert_eq!(
             value["exporters"][0]["runtime"]["mode"],

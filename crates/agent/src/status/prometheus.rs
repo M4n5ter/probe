@@ -813,6 +813,24 @@ fn write_pipeline(output: &mut String, snapshot: &AgentStatusSnapshot) {
         &[("outcome", "applied")],
         metrics.enforcement.applied,
     );
+
+    write_family(
+        output,
+        "traffic_probe_pipeline_enforcement_execution_total",
+        "counter",
+        "Enforcement decisions by execution kind and surface.",
+    );
+    for sample in metrics.enforcement.execution.surface_counts() {
+        write_sample(
+            output,
+            "traffic_probe_pipeline_enforcement_execution_total",
+            &[
+                ("kind", sample.surface.kind_label()),
+                ("surface", sample.surface.surface_label()),
+            ],
+            sample.count,
+        );
+    }
 }
 
 fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
@@ -1739,6 +1757,18 @@ mod tests {
                         failed: 1,
                         delegated: 1,
                         applied: 1,
+                        execution: pipeline::EnforcementExecutionRuntimeMetricsSnapshot {
+                            connection_backend:
+                                pipeline::ConnectionBackendExecutionRuntimeMetricsSnapshot {
+                                    decisions: 1,
+                                    linux_socket_destroy: 1,
+                                },
+                            proxy_side_hook:
+                                pipeline::ProxySideHookExecutionRuntimeMetricsSnapshot {
+                                    decisions: 1,
+                                    l7_mitm: 1,
+                                },
+                        },
                     },
                     ..PipelineRuntimeMetricsSnapshot::default()
                 }),
@@ -1762,6 +1792,12 @@ mod tests {
                 "traffic_probe_pipeline_enforcement_decisions_total{{outcome=\"{outcome}\"}} 1\n"
             )));
         }
+        assert!(metrics.contains(
+            "traffic_probe_pipeline_enforcement_execution_total{kind=\"connection_backend\",surface=\"linux_socket_destroy\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_pipeline_enforcement_execution_total{kind=\"proxy_side_hook\",surface=\"l7_mitm\"} 1\n"
+        ));
         Ok(())
     }
 }

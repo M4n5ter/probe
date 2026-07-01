@@ -42,7 +42,8 @@ use super::{
     loopback::{
         LabeledRunResult, RunResult, merge_labeled_run_results, spawn_agent,
         spawn_http1_loopback_fixture, start_http1_loopback_fixture,
-        wait_for_agent_enforcement_decision_count_at_least, wait_for_agent_policy_progress,
+        wait_for_agent_enforcement_decision_count_at_least,
+        wait_for_agent_l7_mitm_proxy_hook_execution_count_at_least, wait_for_agent_policy_progress,
         wait_for_agent_ready, wait_for_http1_loopback_fixture_exit,
         wait_for_http1_loopback_fixture_ready,
     },
@@ -290,6 +291,28 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
             }
         },
     );
+    let policy_hook_metrics = run_after_success(
+        [
+            &agent_ready,
+            &backend_status,
+            &outbound_redirect,
+            &backend_data_plane,
+            &bridge_progress,
+            &policy_hook_decision,
+        ],
+        || {
+            if case.spec().policy_hook.expects_delegated_decision() {
+                wait_for_agent_l7_mitm_proxy_hook_execution_count_at_least(
+                    agent.child_mut(),
+                    &admin_socket_path,
+                    1,
+                )
+                .map(|_| ())
+            } else {
+                Ok(())
+            }
+        },
+    );
     let fixture_result = if all_succeeded([
         &agent_ready,
         &backend_status,
@@ -312,6 +335,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
             &outbound_redirect,
             &bridge_progress,
             &policy_hook_decision,
+            &policy_hook_metrics,
             &agent_result,
         ],
         || assert_policy_hook_requests(case, policy_hook_server.as_ref()),
@@ -323,6 +347,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
             &outbound_redirect,
             &bridge_progress,
             &policy_hook_decision,
+            &policy_hook_metrics,
             &agent_result,
         ],
         || assert_backend_owned_policy_hook_execution(case, &mitm_backend),
@@ -339,6 +364,7 @@ fn run_at(root: &Path, case: MitmBridgeCase) -> Result<(), Box<dyn std::error::E
         bridge_progress,
         health_transition,
         policy_hook_decision,
+        policy_hook_metrics,
         policy_hook_requests,
         backend_policy_hook_execution,
         agent: agent_result,
@@ -396,6 +422,7 @@ struct MitmBridgePhases {
     bridge_progress: RunResult,
     health_transition: RunResult,
     policy_hook_decision: RunResult,
+    policy_hook_metrics: RunResult,
     policy_hook_requests: RunResult,
     backend_policy_hook_execution: RunResult,
     agent: RunResult,
@@ -416,6 +443,7 @@ impl MitmBridgePhases {
             &self.bridge_progress,
             &self.health_transition,
             &self.policy_hook_decision,
+            &self.policy_hook_metrics,
             &self.policy_hook_requests,
             &self.backend_policy_hook_execution,
             &self.agent,
@@ -423,7 +451,7 @@ impl MitmBridgePhases {
         ])
     }
 
-    fn into_labeled_results(self, spool: RunResult) -> [LabeledRunResult; 16] {
+    fn into_labeled_results(self, spool: RunResult) -> [LabeledRunResult; 17] {
         [
             ("fixture", self.fixture),
             ("agent readiness", self.agent_ready),
@@ -436,6 +464,10 @@ impl MitmBridgePhases {
             ("agent MITM bridge policy progress", self.bridge_progress),
             ("L7 MITM backend health transition", self.health_transition),
             ("MITM policy hook decision", self.policy_hook_decision),
+            (
+                "MITM policy hook execution metrics",
+                self.policy_hook_metrics,
+            ),
             ("MITM policy hook requests", self.policy_hook_requests),
             (
                 "backend-owned MITM policy hook execution",

@@ -793,7 +793,10 @@ self-test before the capability is reported as available. It is not pre-connect
 deny, UDP blocking, or payload-level blocking. Successful destroys emit typed
 `connection_backend/linux_socket_destroy` mechanism evidence in the exported
 `EnforcementDecision`; the top-level `effective_action` carries the policy
-action accepted by the planner.
+action accepted by the planner. Admin metrics expose
+`metrics.pipeline.enforcement.execution.connection_backend.linux_socket_destroy`
+so operators can distinguish decision outcomes from the backend surface that
+actually ran.
 
 Transparent MITM is a separate strategy. It requires root/net-admin,
 operator-managed client trust, certificate material refs, proxy listener
@@ -902,6 +905,10 @@ The Prometheus listener is read-only, loopback-only, and serves only
 `GET /metrics`; control commands stay on the private Unix socket. Runtime status
 and metrics include capture input activity, pipeline progress, spool/export
 state, policy/enforcement counters, TLS plaintext activity, and proxy health.
+Enforcement metrics include outcome counters and execution-surface counters for
+Linux socket destroy and L7 MITM proxy hooks. Prometheus exposes the same facts
+through `traffic_probe_pipeline_enforcement_decisions_total` and
+`traffic_probe_pipeline_enforcement_execution_total`.
 Capture input activity includes the latest signal kind, sequence, and
 observation time without treating that activity as kernel link liveness. The
 eBPF provider status separately reports held tracepoint links and optional

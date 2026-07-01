@@ -4,8 +4,18 @@ use std::sync::{
 };
 
 use capture::CapturePoll;
-use probe_core::{EnforcementOutcome, EventEnvelope, EventKind};
+use probe_core::{
+    ConnectionEnforcementSurface, EnforcementExecutionEvidence, EnforcementOutcome, EventEnvelope,
+    EventKind, ProxySideEnforcementSurface,
+};
 use serde::Serialize;
+
+const ENFORCEMENT_EXECUTION_RUNTIME_SURFACE_COUNT: usize = 2;
+const ENFORCEMENT_EXECUTION_RUNTIME_SURFACES: [EnforcementExecutionRuntimeSurface;
+    ENFORCEMENT_EXECUTION_RUNTIME_SURFACE_COUNT] = [
+    EnforcementExecutionRuntimeSurface::ConnectionBackendLinuxSocketDestroy,
+    EnforcementExecutionRuntimeSurface::ProxySideHookL7Mitm,
+];
 
 #[derive(Debug, Clone, Default)]
 pub struct PipelineRuntimeMetrics {
@@ -41,6 +51,7 @@ struct PipelineRuntimeMetricsInner {
     enforcement_failed: AtomicCounter,
     enforcement_delegated: AtomicCounter,
     enforcement_applied: AtomicCounter,
+    enforcement_execution_surfaces: [AtomicCounter; ENFORCEMENT_EXECUTION_RUNTIME_SURFACE_COUNT],
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -100,6 +111,132 @@ pub struct EnforcementRuntimeMetricsSnapshot {
     pub failed: u64,
     pub delegated: u64,
     pub applied: u64,
+    pub execution: EnforcementExecutionRuntimeMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct EnforcementExecutionRuntimeMetricsSnapshot {
+    pub connection_backend: ConnectionBackendExecutionRuntimeMetricsSnapshot,
+    pub proxy_side_hook: ProxySideHookExecutionRuntimeMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ConnectionBackendExecutionRuntimeMetricsSnapshot {
+    pub decisions: u64,
+    pub linux_socket_destroy: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ProxySideHookExecutionRuntimeMetricsSnapshot {
+    pub decisions: u64,
+    pub l7_mitm: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnforcementExecutionRuntimeSurfaceCount {
+    pub surface: EnforcementExecutionRuntimeSurface,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnforcementExecutionRuntimeSurface {
+    ConnectionBackendLinuxSocketDestroy,
+    ProxySideHookL7Mitm,
+}
+
+impl EnforcementExecutionRuntimeSurface {
+    pub fn kind_label(self) -> &'static str {
+        match self {
+            Self::ConnectionBackendLinuxSocketDestroy => "connection_backend",
+            Self::ProxySideHookL7Mitm => "proxy_side_hook",
+        }
+    }
+
+    pub fn surface_label(self) -> &'static str {
+        match self {
+            Self::ConnectionBackendLinuxSocketDestroy => "linux_socket_destroy",
+            Self::ProxySideHookL7Mitm => "l7_mitm",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::ConnectionBackendLinuxSocketDestroy => 0,
+            Self::ProxySideHookL7Mitm => 1,
+        }
+    }
+
+    fn count(self, snapshot: EnforcementExecutionRuntimeMetricsSnapshot) -> u64 {
+        match self {
+            Self::ConnectionBackendLinuxSocketDestroy => {
+                snapshot.connection_backend.linux_socket_destroy
+            }
+            Self::ProxySideHookL7Mitm => snapshot.proxy_side_hook.l7_mitm,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EnforcementDecisionMetric {
+    outcome: EnforcementOutcome,
+    execution_surface: Option<EnforcementExecutionRuntimeSurface>,
+}
+
+impl EnforcementDecisionMetric {
+    pub(crate) fn from_decision_parts(
+        outcome: EnforcementOutcome,
+        execution: Option<&EnforcementExecutionEvidence>,
+    ) -> Self {
+        Self {
+            outcome,
+            execution_surface: execution.map(EnforcementExecutionRuntimeSurface::from_evidence),
+        }
+    }
+}
+
+impl EnforcementExecutionRuntimeMetricsSnapshot {
+    pub fn surface_counts(
+        &self,
+    ) -> impl Iterator<Item = EnforcementExecutionRuntimeSurfaceCount> + '_ {
+        ENFORCEMENT_EXECUTION_RUNTIME_SURFACES
+            .into_iter()
+            .map(|surface| EnforcementExecutionRuntimeSurfaceCount {
+                surface,
+                count: surface.count(*self),
+            })
+    }
+
+    fn add_surface_count(&mut self, surface: EnforcementExecutionRuntimeSurface, count: u64) {
+        match surface {
+            EnforcementExecutionRuntimeSurface::ConnectionBackendLinuxSocketDestroy => {
+                self.connection_backend.decisions =
+                    self.connection_backend.decisions.saturating_add(count);
+                self.connection_backend.linux_socket_destroy = count;
+            }
+            EnforcementExecutionRuntimeSurface::ProxySideHookL7Mitm => {
+                self.proxy_side_hook.decisions =
+                    self.proxy_side_hook.decisions.saturating_add(count);
+                self.proxy_side_hook.l7_mitm = count;
+            }
+        }
+    }
+}
+
+impl EnforcementExecutionRuntimeSurface {
+    fn from_evidence(execution: &EnforcementExecutionEvidence) -> Self {
+        match execution {
+            EnforcementExecutionEvidence::ConnectionBackend { evidence } => {
+                match evidence.surface() {
+                    ConnectionEnforcementSurface::LinuxSocketDestroy => {
+                        Self::ConnectionBackendLinuxSocketDestroy
+                    }
+                }
+            }
+            EnforcementExecutionEvidence::ProxySideHook { surface, .. } => match surface {
+                ProxySideEnforcementSurface::L7Mitm => Self::ProxySideHookL7Mitm,
+            },
+        }
+    }
 }
 
 impl PipelineRuntimeMetrics {
@@ -181,7 +318,19 @@ impl PipelineRuntimeMetrics {
             failed,
             delegated,
             applied,
+            execution: self.enforcement_execution_snapshot(),
         }
+    }
+
+    fn enforcement_execution_snapshot(&self) -> EnforcementExecutionRuntimeMetricsSnapshot {
+        let mut snapshot = EnforcementExecutionRuntimeMetricsSnapshot::default();
+        for surface in ENFORCEMENT_EXECUTION_RUNTIME_SURFACES {
+            snapshot.add_surface_count(
+                surface,
+                self.inner.enforcement_execution_surfaces[surface.index()].load(),
+            );
+        }
+        snapshot
     }
 
     pub(crate) fn record_capture_poll(&self, poll: &CapturePoll) {
@@ -248,8 +397,11 @@ impl PipelineRuntimeMetrics {
         self.inner.policy_disabled.increment();
     }
 
-    pub(crate) fn record_enforcement_decision(&self, outcome: EnforcementOutcome) {
-        match outcome {
+    pub(crate) fn record_enforcement_decision(&self, metric: EnforcementDecisionMetric) {
+        if let Some(surface) = metric.execution_surface {
+            self.inner.enforcement_execution_surfaces[surface.index()].increment();
+        }
+        match metric.outcome {
             EnforcementOutcome::Disabled => self.inner.enforcement_disabled.increment(),
             EnforcementOutcome::AuditOnly => self.inner.enforcement_audit_only.increment(),
             EnforcementOutcome::DryRun => self.inner.enforcement_dry_run.increment(),
@@ -313,14 +465,14 @@ mod tests {
     fn enforcement_decisions_sum_all_recorded_outcomes() {
         let metrics = PipelineRuntimeMetrics::default();
 
-        metrics.record_enforcement_decision(EnforcementOutcome::Disabled);
-        metrics.record_enforcement_decision(EnforcementOutcome::AuditOnly);
-        metrics.record_enforcement_decision(EnforcementOutcome::DryRun);
-        metrics.record_enforcement_decision(EnforcementOutcome::SelectorMiss);
-        metrics.record_enforcement_decision(EnforcementOutcome::Unsupported);
-        metrics.record_enforcement_decision(EnforcementOutcome::Failed);
-        metrics.record_enforcement_decision(EnforcementOutcome::Delegated);
-        metrics.record_enforcement_decision(EnforcementOutcome::Applied);
+        metrics.record_enforcement_decision(metric(EnforcementOutcome::Disabled, None));
+        metrics.record_enforcement_decision(metric(EnforcementOutcome::AuditOnly, None));
+        metrics.record_enforcement_decision(metric(EnforcementOutcome::DryRun, None));
+        metrics.record_enforcement_decision(metric(EnforcementOutcome::SelectorMiss, None));
+        metrics.record_enforcement_decision(metric(EnforcementOutcome::Unsupported, None));
+        metrics.record_enforcement_decision(metric(EnforcementOutcome::Failed, None));
+        metrics.record_enforcement_decision(metric(EnforcementOutcome::Delegated, None));
+        metrics.record_enforcement_decision(metric(EnforcementOutcome::Applied, None));
 
         let enforcement = metrics.snapshot().enforcement;
 
@@ -336,6 +488,35 @@ mod tests {
                 + enforcement.applied
         );
         assert_eq!(enforcement.decisions, 8);
+    }
+
+    #[test]
+    fn enforcement_execution_metrics_count_backend_and_hook_surfaces() {
+        let metrics = PipelineRuntimeMetrics::default();
+
+        metrics.record_enforcement_decision(metric(
+            EnforcementOutcome::Applied,
+            Some(EnforcementExecutionRuntimeSurface::ConnectionBackendLinuxSocketDestroy),
+        ));
+        metrics.record_enforcement_decision(metric(
+            EnforcementOutcome::Delegated,
+            Some(EnforcementExecutionRuntimeSurface::ProxySideHookL7Mitm),
+        ));
+
+        let enforcement = metrics.snapshot().enforcement;
+
+        assert_eq!(enforcement.applied, 1);
+        assert_eq!(enforcement.delegated, 1);
+        assert_eq!(enforcement.execution.connection_backend.decisions, 1);
+        assert_eq!(
+            enforcement
+                .execution
+                .connection_backend
+                .linux_socket_destroy,
+            1
+        );
+        assert_eq!(enforcement.execution.proxy_side_hook.decisions, 1);
+        assert_eq!(enforcement.execution.proxy_side_hook.l7_mitm, 1);
     }
 
     #[test]
@@ -364,5 +545,15 @@ mod tests {
                 reason: "test loss".to_string(),
             },
         })
+    }
+
+    fn metric(
+        outcome: EnforcementOutcome,
+        execution_surface: Option<EnforcementExecutionRuntimeSurface>,
+    ) -> EnforcementDecisionMetric {
+        EnforcementDecisionMetric {
+            outcome,
+            execution_surface,
+        }
     }
 }
