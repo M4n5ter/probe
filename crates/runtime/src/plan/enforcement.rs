@@ -1130,13 +1130,17 @@ pub enum EnforcementCapabilityPlan {
     Required {
         capability: CapabilityKind,
         mode: RuntimeMode,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequiredCapabilityPlan {
     pub capability: CapabilityKind,
     pub mode: RuntimeMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl RequiredCapabilityPlan {
@@ -1144,9 +1148,11 @@ impl RequiredCapabilityPlan {
         requirement: EnforcementCapabilityRequirement,
         capabilities: &CapabilityMatrix,
     ) -> Self {
+        let state = required_capability_state(requirement, capabilities);
         Self {
             capability: requirement.capability,
-            mode: capabilities.mode(requirement.capability),
+            mode: state.mode,
+            reason: state.reason,
         }
     }
 }
@@ -1223,10 +1229,7 @@ impl EnforcementCapabilityPlan {
 
     fn from_mode(mode: EnforcementMode, capabilities: &CapabilityMatrix) -> Self {
         Self::requirement_for_mode(mode).map_or(Self::NotRequired, |requirement| {
-            Self::required(
-                requirement.capability,
-                capabilities.mode(requirement.capability),
-            )
+            Self::required(requirement, capabilities)
         })
     }
 
@@ -1239,10 +1242,7 @@ impl EnforcementCapabilityPlan {
             return Self::NotRequired;
         }
         Self::requirement_for_connection_backend(backend).map_or(Self::NotRequired, |requirement| {
-            Self::required(
-                requirement.capability,
-                capabilities.mode(requirement.capability),
-            )
+            Self::required(requirement, capabilities)
         })
     }
 
@@ -1256,8 +1256,41 @@ impl EnforcementCapabilityPlan {
             .collect()
     }
 
-    fn required(capability: CapabilityKind, mode: RuntimeMode) -> Self {
-        Self::Required { capability, mode }
+    fn required(
+        requirement: EnforcementCapabilityRequirement,
+        capabilities: &CapabilityMatrix,
+    ) -> Self {
+        let state = required_capability_state(requirement, capabilities);
+        Self::Required {
+            capability: requirement.capability,
+            mode: state.mode,
+            reason: state.reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequiredCapabilityState {
+    mode: RuntimeMode,
+    reason: Option<String>,
+}
+
+fn required_capability_state(
+    requirement: EnforcementCapabilityRequirement,
+    capabilities: &CapabilityMatrix,
+) -> RequiredCapabilityState {
+    let Some(state) = capabilities.reported_state(requirement.capability) else {
+        return RequiredCapabilityState {
+            mode: RuntimeMode::Unavailable,
+            reason: Some(requirement.unavailable_reason.to_string()),
+        };
+    };
+    RequiredCapabilityState {
+        mode: state.mode,
+        reason: state.reason.clone().or_else(|| {
+            (state.mode == RuntimeMode::Unavailable)
+                .then(|| requirement.unavailable_reason.to_string())
+        }),
     }
 }
 
@@ -1307,6 +1340,7 @@ mod tests {
             EnforcementCapabilityPlan::Required {
                 capability: CapabilityKind::DryRunEnforcement,
                 mode: RuntimeMode::Available,
+                reason: None,
             }
         );
     }
@@ -1335,6 +1369,29 @@ mod tests {
             EnforcementCapabilityPlan::Required {
                 capability: CapabilityKind::ConnectionEnforcement,
                 mode: RuntimeMode::Available,
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn enforcement_plan_uses_requirement_reason_for_missing_connection_capability() {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.backend = ConnectionEnforcementBackendConfig::LinuxSocketDestroy;
+        let capabilities = CapabilityMatrix::new([]);
+
+        let plan = EnforcementPlan::resolve(&config, &capabilities);
+
+        assert_eq!(
+            plan.connection.capability,
+            EnforcementCapabilityPlan::Required {
+                capability: CapabilityKind::ConnectionEnforcement,
+                mode: RuntimeMode::Unavailable,
+                reason: Some(
+                    "connection-level enforcement backend is not available in this build/runtime"
+                        .to_string()
+                ),
             }
         );
     }
@@ -1426,6 +1483,7 @@ mod tests {
             vec![RequiredCapabilityPlan {
                 capability: CapabilityKind::TransparentInterception,
                 mode: RuntimeMode::Available,
+                reason: None,
             }]
         );
         assert_eq!(
@@ -1474,6 +1532,7 @@ mod tests {
             vec![RequiredCapabilityPlan {
                 capability: CapabilityKind::TransparentInterception,
                 mode: RuntimeMode::Unavailable,
+                reason: Some("unavailable".to_string()),
             }]
         );
         assert_eq!(
@@ -1536,10 +1595,12 @@ mod tests {
                 RequiredCapabilityPlan {
                     capability: CapabilityKind::TransparentInterception,
                     mode: RuntimeMode::Available,
+                    reason: None,
                 },
                 RequiredCapabilityPlan {
                     capability: CapabilityKind::L7Mitm,
                     mode: RuntimeMode::Unavailable,
+                    reason: Some("not wired".to_string()),
                 },
             ]
         );
@@ -1968,14 +2029,17 @@ mod tests {
                 RequiredCapabilityPlan {
                     capability: CapabilityKind::TransparentInterception,
                     mode: RuntimeMode::Available,
+                    reason: None,
                 },
                 RequiredCapabilityPlan {
                     capability: CapabilityKind::L7Mitm,
                     mode: RuntimeMode::Available,
+                    reason: None,
                 },
                 RequiredCapabilityPlan {
                     capability: CapabilityKind::CaptureEventFeed,
                     mode: RuntimeMode::Available,
+                    reason: None,
                 },
             ]
         );

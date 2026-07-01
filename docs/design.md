@@ -686,6 +686,9 @@ TLS 明文与协议能力：
 - `connection_enforcement`
   - Runtime status：只有显式配置并通过 probe 时 available。
   - 已实现：`EnforcementBackend` trait、planner delegation boundary、`RuntimePlan.enforcement.connection.capability`。
+  - 已实现：required capability model 携带 `capability`、`mode` 和可选 `reason`，并与 runtime validation 使用同一原因来源。
+    缺少 `ss`、root、procfs attribution 或 active self-test 失败时，公共 run/check/status 会在 RuntimePlan validation
+    阶段 fail closed；诊断原因通过 validation error 和 capability matrix 暴露，不会被成功态 status 伪装成可执行能力。
   - 已实现：显式 `enforcement.backend = "linux_socket_destroy"`。
   - 已实现：固定系统路径 `ss -K` TCP socket destroy backend、启动期 loopback socket destroy self-test、执行前 procfs socket owner
     复核和 status/backend reporting。
@@ -2929,6 +2932,7 @@ RuntimePlan/check/status 表达：
 - proxy self-bypass。
 - proxy port。
 - proxy bypass mark。
+- successful plan 中 required capability 的 `capability`、`mode` 和可选 `reason`。
 
 activation 前的 plan 约束：
 
@@ -6087,7 +6091,7 @@ conservative unknown-offset `Gap` fan-out。provider loss 信号必须进入 dur
 - `enforcement.interception.strategy` 可表达 `inbound_tproxy`、`outbound_transparent_proxy`、`inbound_tproxy_mitm` 与
   `outbound_transparent_mitm`。
 - runtime plan/status/check 报告 proxy mode/self-bypass/listen port、独立 selector、`local_setup_projection`、interception capability requirements、
-  process/flow classifier capability 和 agent-owned proxy runtime snapshot。
+  successful plan 中的 required capability reason、process/flow classifier capability 和 agent-owned proxy runtime snapshot。
 - `inbound_tproxy` 有 executable Linux lifecycle。
 - 可选 `managed_tcp_relay` 由 agent 管理 plain TCP relay。
 - 入站 process-only selector 可在 setup-time 从当前匹配 listener 派生 host rules；未归因、混合 holder 或 listener 变化仍按边界处理。

@@ -57,13 +57,15 @@ pub enum EnforcementStatusMode {
     Enforce,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum EnforcementCapabilityStatusSnapshot {
     NotRequired,
     Required {
         capability: CapabilityKind,
         mode: RuntimeMode,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 }
 
@@ -182,12 +184,15 @@ fn enforcement_capability_status(
 ) -> EnforcementCapabilityStatusSnapshot {
     match capability {
         EnforcementCapabilityPlan::NotRequired => EnforcementCapabilityStatusSnapshot::NotRequired,
-        EnforcementCapabilityPlan::Required { capability, mode } => {
-            EnforcementCapabilityStatusSnapshot::Required {
-                capability: *capability,
-                mode: *mode,
-            }
-        }
+        EnforcementCapabilityPlan::Required {
+            capability,
+            mode,
+            reason,
+        } => EnforcementCapabilityStatusSnapshot::Required {
+            capability: *capability,
+            mode: *mode,
+            reason: reason.clone(),
+        },
     }
 }
 
@@ -586,6 +591,7 @@ protective_actions = ["alert"]
             EnforcementCapabilityStatusSnapshot::Required {
                 capability: CapabilityKind::DryRunEnforcement,
                 mode: RuntimeMode::Available,
+                reason: None,
             }
         );
         Ok(())
@@ -619,6 +625,7 @@ protective_actions = ["alert"]
             EnforcementCapabilityStatusSnapshot::Required {
                 capability: CapabilityKind::ConnectionEnforcement,
                 mode: RuntimeMode::Available,
+                reason: None,
             }
         );
         let value = serde_json::to_value(&status)?;
@@ -719,6 +726,7 @@ protective_actions = ["alert"]
             vec![RequiredCapabilityPlan {
                 capability: CapabilityKind::TransparentInterception,
                 mode: RuntimeMode::Available,
+                reason: None,
             }]
         );
         assert_eq!(
@@ -972,6 +980,7 @@ protective_actions = ["alert"]
             vec![RequiredCapabilityPlan {
                 capability: CapabilityKind::TransparentInterception,
                 mode: RuntimeMode::Available,
+                reason: None,
             }]
         );
         assert_eq!(
