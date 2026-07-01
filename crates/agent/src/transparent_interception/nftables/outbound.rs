@@ -1,5 +1,4 @@
 use ::runtime::TransparentInterceptionOutboundProxyPlan;
-use interception::TransparentInterceptionHostRuleSet;
 use transparent_linux::{
     OutboundRedirectLifecyclePlan, TransparentLinuxResources, cleanup_all_policy_route_operations,
 };
@@ -14,7 +13,8 @@ use super::{
     owner_lock::{NftablesOwnerLock, NftablesOwnerLockGuard, SystemNftablesOwnerLock},
 };
 use crate::transparent_interception::{
-    TransparentInterceptionError, TransparentInterceptionIpFamily,
+    TransparentInterceptionActivationScope, TransparentInterceptionError,
+    TransparentInterceptionIpFamily,
     proxy::{
         TransparentProxyGuard, TransparentProxyRuntime, prepare_outbound_proxy_lifecycle,
         start_proxy_lifecycle,
@@ -68,8 +68,9 @@ impl NftablesOutboundTransparentProxy {
 
     pub(in crate::transparent_interception) fn activate(
         mut self,
-        setup_scope: TransparentInterceptionHostRuleSet,
+        activation_scope: TransparentInterceptionActivationScope,
     ) -> Result<NftablesOutboundTransparentProxyGuard, TransparentInterceptionError> {
+        let (setup_scope, flow_classifier) = activation_scope.into_parts();
         let plan = outbound_lifecycle_plan(&self.outbound_plan, setup_scope)?;
         let proxy_plan = prepare_outbound_proxy_lifecycle(
             &self.outbound_plan,
@@ -78,6 +79,7 @@ impl NftablesOutboundTransparentProxy {
                 .map(TransparentInterceptionIpFamily::from)
                 .collect(),
             plan.proxy_bypass_mark(),
+            flow_classifier,
             local_address_inventory(self.host_routing.clone()),
         )?;
         let setup_script = plan.setup_nft_script();
@@ -162,7 +164,7 @@ impl Drop for NftablesOutboundTransparentProxyGuard {
 
 fn outbound_lifecycle_plan(
     outbound_plan: &TransparentInterceptionOutboundProxyPlan,
-    setup_scope: TransparentInterceptionHostRuleSet,
+    setup_scope: interception::TransparentInterceptionHostRuleSet,
 ) -> Result<OutboundRedirectLifecyclePlan, TransparentInterceptionError> {
     OutboundRedirectLifecyclePlan::from_spec_and_rule_set(
         outbound_plan.outbound_redirect_artifact().clone(),
@@ -186,7 +188,10 @@ mod tests {
     use ::runtime::{
         TransparentInterceptionExecutionPlan, TransparentInterceptionOutboundProxyPlan,
     };
-    use interception::{TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan};
+    use interception::{
+        TransparentInterceptionHostRuleSet, TransparentInterceptionSetupDirection,
+        TransparentInterceptionSetupPlan,
+    };
     use probe_config::{
         EnforcementInterceptionConfig, TransparentInterceptionProxyConfig,
         TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig,
@@ -211,7 +216,9 @@ mod tests {
             proxy_runtime,
         );
 
-        let error = match lifecycle.activate(setup_scope()) {
+        let error = match lifecycle.activate(TransparentInterceptionActivationScope::host_rules(
+            setup_scope(),
+        )) {
             Ok(_) => panic!("failed nft check must reject activation"),
             Err(error) => error,
         };

@@ -3,8 +3,7 @@ use enforcement::{
     ScopedEnforcementPlanner, SetupTimeEnforcementSurface,
 };
 use interception::{
-    TransparentInterceptionHostRuleSet, TransparentInterceptionSetupSelectorSources,
-    TransparentInterceptionSetupSelectors,
+    TransparentInterceptionSetupSelectorSources, TransparentInterceptionSetupSelectors,
 };
 use probe_core::{
     EnforcementMode, ProtectiveActionProfile, ResolvedSelector, Selector, SelectorRegistry,
@@ -16,7 +15,8 @@ use runtime::{
 use thiserror::Error;
 
 use crate::transparent_interception::{
-    TransparentInterceptionError, TransparentInterceptionProcessClassifier,
+    TransparentInterceptionActivationScope, TransparentInterceptionError,
+    TransparentInterceptionProcessClassifier,
 };
 
 use super::source::{
@@ -104,7 +104,7 @@ pub struct ConfiguredEnforcement {
     pub mode: EnforcementMode,
     pub config_selector_configured: bool,
     pub active_policy: ActiveEnforcementPolicy,
-    pub transparent_interception_setup_scope: Option<TransparentInterceptionHostRuleSet>,
+    pub transparent_interception_setup_scope: Option<TransparentInterceptionActivationScope>,
 }
 
 pub struct ConfiguredEnforcementCheck {

@@ -8,7 +8,8 @@ use super::{
     owner_lock::{NftablesOwnerLock, NftablesOwnerLockGuard, SystemNftablesOwnerLock},
 };
 use crate::transparent_interception::{
-    TransparentInterceptionError, TransparentInterceptionIpFamily,
+    TransparentInterceptionActivationScope, TransparentInterceptionError,
+    TransparentInterceptionIpFamily,
     proxy::{
         TransparentProxyGuard, TransparentProxyRuntime, prepare_proxy_lifecycle,
         start_proxy_lifecycle,
@@ -17,6 +18,7 @@ use crate::transparent_interception::{
 #[cfg(test)]
 use ::runtime::TransparentInterceptionExecutionPlan;
 use ::runtime::TransparentInterceptionInboundTproxyPlan;
+#[cfg(test)]
 use interception::TransparentInterceptionHostRuleSet;
 #[cfg(test)]
 use interception::{TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan};
@@ -100,8 +102,9 @@ impl NftablesTransparentInterception {
 
     pub(in crate::transparent_interception) fn activate(
         mut self,
-        setup_scope: TransparentInterceptionHostRuleSet,
+        activation_scope: TransparentInterceptionActivationScope,
     ) -> Result<NftablesTransparentInterceptionGuard, TransparentInterceptionError> {
+        let (setup_scope, flow_classifier) = activation_scope.into_parts();
         let plan = InboundTproxyLifecyclePlan::from_spec_and_rule_set(
             InboundTproxyArtifactSpec::new(
                 ::runtime::TransparentInterceptionNftablesPlan::reserved(),
@@ -117,6 +120,7 @@ impl NftablesTransparentInterception {
                 .map(TransparentInterceptionIpFamily::from)
                 .collect(),
             plan.proxy_bypass_mark(),
+            flow_classifier,
             local_address_inventory(self.host_routing.clone()),
         )?;
         let setup_script = plan.setup_nft_script();
@@ -264,7 +268,9 @@ mod tests {
             nft.clone(),
             host_routing.clone(),
         )
-        .activate(setup_scope(&selector))?;
+        .activate(TransparentInterceptionActivationScope::host_rules(
+            setup_scope(&selector),
+        ))?;
         guard.deactivate()?;
 
         let nft_scripts = nft.scripts();
@@ -320,7 +326,9 @@ mod tests {
             nft.clone(),
             host_routing.clone(),
         )
-        .activate(setup_scope(&selector))?;
+        .activate(TransparentInterceptionActivationScope::host_rules(
+            setup_scope(&selector),
+        ))?;
         drop(guard);
 
         let nft_scripts = nft.scripts();
@@ -348,8 +356,9 @@ mod tests {
             nft.clone(),
             host_routing,
         )
-        .activate(setup_scope(&setup_selector()))
-        {
+        .activate(TransparentInterceptionActivationScope::host_rules(
+            setup_scope(&setup_selector()),
+        )) {
             Ok(_) => panic!("failed nft setup must fail activation"),
             Err(error) => error,
         };
@@ -372,8 +381,9 @@ mod tests {
             nft.clone(),
             host_routing.clone(),
         )
-        .activate(setup_scope(&setup_selector()))
-        {
+        .activate(TransparentInterceptionActivationScope::host_rules(
+            setup_scope(&setup_selector()),
+        )) {
             Ok(_) => panic!("failed nft check must fail activation"),
             Err(error) => error,
         };
@@ -412,7 +422,9 @@ mod tests {
             runtime,
         );
 
-        let guard = lifecycle.activate(setup_scope(&setup_selector()))?;
+        let guard = lifecycle.activate(TransparentInterceptionActivationScope::host_rules(
+            setup_scope(&setup_selector()),
+        ))?;
         wait_for_health_probe_success(&handle)?;
         guard.deactivate()?;
 
@@ -439,8 +451,9 @@ mod tests {
             nft.clone(),
             host_routing.clone(),
         )
-        .activate(setup_scope(&setup_selector()))
-        {
+        .activate(TransparentInterceptionActivationScope::host_rules(
+            setup_scope(&setup_selector()),
+        )) {
             Ok(_) => panic!("local relay listener health probe target must fail activation"),
             Err(error) => error,
         };
@@ -470,7 +483,9 @@ mod tests {
             nft,
             host_routing.clone(),
         )
-        .activate(setup_scope(&selector))?;
+        .activate(TransparentInterceptionActivationScope::host_rules(
+            setup_scope(&selector),
+        ))?;
         guard.deactivate()?;
 
         let operations = host_routing.operations();

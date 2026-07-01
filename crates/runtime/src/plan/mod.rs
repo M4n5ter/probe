@@ -34,7 +34,6 @@ pub use export::{
     ExportWorkerPlan, FileExportSinkPlan, WebhookExportSinkPlan,
 };
 pub use interception_scope::{
-    TransparentInterceptionClassifierSelectorPlan, TransparentInterceptionClassifierTermPlan,
     TransparentInterceptionFlowClassifierScopePlan,
     TransparentInterceptionLocalSetupProjectionPlan,
     TransparentInterceptionProcessScopeExpressionPlan, TransparentInterceptionProcessScopePlan,

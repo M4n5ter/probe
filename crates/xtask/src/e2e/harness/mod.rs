@@ -15,8 +15,8 @@ pub(crate) use netns::{
     reexec_current_case_in_fresh_network_namespace, verify_fresh_network_namespace,
 };
 pub(crate) use process::{
-    ChildSupervisor, UnixSocketReadySignal, run_in_own_process_group, stop_running_child,
-    wait_for_child_exit, wait_for_child_status, wait_for_file_or_child_exit,
+    ChildGuard, ChildSupervisor, UnixSocketReadySignal, run_in_own_process_group,
+    stop_running_child, wait_for_child_exit, wait_for_child_status, wait_for_file_or_child_exit,
     wait_for_ready_signal_or_child_exit,
 };
 pub(crate) use temp::{

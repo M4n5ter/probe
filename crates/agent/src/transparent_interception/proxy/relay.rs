@@ -21,7 +21,9 @@ use super::{
 };
 use crate::{
     tcp_health::tcp_connect_failure_reason, transparent_interception::TransparentInterceptionError,
+    transparent_interception::TransparentInterceptionFlowClassifier,
 };
+use probe_core::Direction;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -44,11 +46,17 @@ pub(super) fn spawn_relay(
             slot,
             runtime.clone(),
         ) {
-            if error.counts_as_relay_failure() {
-                runtime.record_relay_failure();
-                eprintln!("managed transparent proxy relay failed: {error}");
-            } else {
-                eprintln!("managed transparent proxy upstream connect failed: {error}");
+            match error {
+                RelayConnectionError::Rejected(error) => {
+                    eprintln!("managed transparent proxy rejected connection: {error}");
+                }
+                RelayConnectionError::UpstreamConnect(error) => {
+                    eprintln!("managed transparent proxy upstream connect failed: {error}");
+                }
+                RelayConnectionError::Relay(error) => {
+                    runtime.record_relay_failure();
+                    eprintln!("managed transparent proxy relay failed: {error}");
+                }
             }
         }
     })
@@ -76,6 +84,15 @@ fn relay_connection(
             "refusing transparent proxy self-relay for peer {peer} target {target}"
         ))));
     }
+    if let Some(classifier) = &plan.flow_classifier
+        && let Err(reason) = classifier.classify_proxy_flow(peer, target, plan.direction)
+    {
+        runtime.record_rejected_relay();
+        let _ = TcpStream::from(accepted).shutdown(Shutdown::Both);
+        return Err(RelayConnectionError::rejected(proxy_error(format!(
+            "transparent flow classifier rejected peer {peer} target {target}: {reason}"
+        ))));
+    }
     let downstream = TcpStream::from(accepted);
     downstream
         .set_nodelay(true)
@@ -91,6 +108,7 @@ fn relay_connection(
         .register(&downstream, &upstream)
         .map_err(proxy_io_error("register active transparent relay"))
         .map_err(RelayConnectionError::relay)?;
+    runtime.record_accepted_relay();
     if shutdown_requested.load(Ordering::SeqCst) {
         shutdown_streams(&downstream, &upstream);
     }
@@ -102,10 +120,16 @@ pub(super) struct TransparentProxyRelayPlan {
     target_recovery: TransparentProxyTargetRecovery,
     self_relay_guard: TransparentProxySelfRelayGuard,
     upstream_connect: TransparentProxyUpstreamConnectPlan,
+    direction: Direction,
+    flow_classifier: Option<TransparentInterceptionFlowClassifier>,
 }
 
 impl TransparentProxyRelayPlan {
-    pub(super) fn inbound_tproxy(listen_port: u16, proxy_bypass_mark: NonZeroU32) -> Self {
+    pub(super) fn inbound_tproxy(
+        listen_port: u16,
+        proxy_bypass_mark: NonZeroU32,
+        flow_classifier: Option<TransparentInterceptionFlowClassifier>,
+    ) -> Self {
         Self {
             target_recovery: TransparentProxyTargetRecovery::TproxyLocalAddress,
             self_relay_guard: TransparentProxySelfRelayGuard::RejectSamePort { listen_port },
@@ -113,12 +137,15 @@ impl TransparentProxyRelayPlan {
                 CONNECT_TIMEOUT,
                 Some(probe_io::TcpSocketMark::new(proxy_bypass_mark)),
             ),
+            direction: Direction::Inbound,
+            flow_classifier,
         }
     }
 
     pub(super) fn outbound_redirect(
         listen_port: u16,
         proxy_bypass_mark: NonZeroU32,
+        flow_classifier: Option<TransparentInterceptionFlowClassifier>,
         local_addresses: Arc<[IpAddr]>,
     ) -> Self {
         Self {
@@ -131,6 +158,8 @@ impl TransparentProxyRelayPlan {
                 CONNECT_TIMEOUT,
                 Some(probe_io::TcpSocketMark::new(proxy_bypass_mark)),
             ),
+            direction: Direction::Outbound,
+            flow_classifier,
         }
     }
 }
@@ -185,11 +214,16 @@ fn normalized_ip_address(address: IpAddr) -> IpAddr {
 
 #[derive(Debug)]
 enum RelayConnectionError {
+    Rejected(TransparentInterceptionError),
     UpstreamConnect(TransparentInterceptionError),
     Relay(TransparentInterceptionError),
 }
 
 impl RelayConnectionError {
+    fn rejected(error: TransparentInterceptionError) -> Self {
+        Self::Rejected(error)
+    }
+
     fn upstream_connect(error: TransparentInterceptionError) -> Self {
         Self::UpstreamConnect(error)
     }
@@ -197,19 +231,12 @@ impl RelayConnectionError {
     fn relay(error: TransparentInterceptionError) -> Self {
         Self::Relay(error)
     }
-
-    fn counts_as_relay_failure(&self) -> bool {
-        match self {
-            Self::UpstreamConnect(_) => false,
-            Self::Relay(_) => true,
-        }
-    }
 }
 
 impl fmt::Display for RelayConnectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UpstreamConnect(error) | Self::Relay(error) => {
+            Self::Rejected(error) | Self::UpstreamConnect(error) | Self::Relay(error) => {
                 fmt::Display::fmt(error, formatter)
             }
         }
@@ -409,7 +436,7 @@ mod tests {
     #[test]
     fn inbound_tproxy_upstream_connect_uses_proxy_bypass_mark() {
         let mark = proxy_bypass_mark();
-        let plan = TransparentProxyRelayPlan::inbound_tproxy(15001, mark);
+        let plan = TransparentProxyRelayPlan::inbound_tproxy(15001, mark, None);
 
         assert_eq!(
             plan.upstream_connect.proxy_bypass_mark(),
@@ -530,6 +557,8 @@ mod tests {
             target_recovery: TransparentProxyTargetRecovery::TproxyLocalAddress,
             self_relay_guard: TransparentProxySelfRelayGuard::RejectSamePort { listen_port },
             upstream_connect: TransparentProxyUpstreamConnectPlan::new(CONNECT_TIMEOUT, None),
+            direction: Direction::Inbound,
+            flow_classifier: None,
         }
     }
 }

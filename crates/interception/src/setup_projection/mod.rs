@@ -3,7 +3,6 @@ mod model;
 mod selectors;
 
 pub use model::{
-    TransparentInterceptionClassifierSelector, TransparentInterceptionClassifierTerm,
     TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
     TransparentInterceptionHostRuleScope, TransparentInterceptionHostRuleSet,
     TransparentInterceptionPortScope, TransparentInterceptionProcessScope,

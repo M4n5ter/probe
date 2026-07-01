@@ -1,7 +1,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use interception::{
-    TransparentInterceptionClassifierSelector, TransparentInterceptionClassifierTerm,
     TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
     TransparentInterceptionHostRuleScope, TransparentInterceptionHostRuleSet,
     TransparentInterceptionProcessScope, TransparentInterceptionProcessScopeExpression,
@@ -10,7 +9,7 @@ use interception::{
     TransparentInterceptionSetupSelectors, TransparentInterceptionSocketOwnerScope,
 };
 use probe_config::{TransparentInterceptionDirectionConfig, TransparentInterceptionStrategyConfig};
-use probe_core::{ProcessSelector, ResolvedSelector, TrafficSelector};
+use probe_core::{ProcessSelector, ResolvedSelector, Selector};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,33 +91,7 @@ pub enum TransparentInterceptionProcessScopeExpressionPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransparentInterceptionFlowClassifierScopePlan {
-    pub selector: TransparentInterceptionClassifierSelectorPlan,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "op")]
-pub enum TransparentInterceptionClassifierSelectorPlan {
-    Match {
-        term: Box<TransparentInterceptionClassifierTermPlan>,
-    },
-    All {
-        selectors: Vec<TransparentInterceptionClassifierSelectorPlan>,
-    },
-    Any {
-        selectors: Vec<TransparentInterceptionClassifierSelectorPlan>,
-    },
-    Not {
-        selector: Box<TransparentInterceptionClassifierSelectorPlan>,
-    },
-    Ref {
-        name: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransparentInterceptionClassifierTermPlan {
-    pub process: ProcessSelector,
-    pub traffic: TrafficSelector,
+    pub selector: Selector,
 }
 
 impl TransparentInterceptionLocalSetupProjectionPlan {
@@ -303,40 +276,7 @@ impl TransparentInterceptionProcessScopeExpressionPlan {
 impl TransparentInterceptionFlowClassifierScopePlan {
     fn from_scope(scope: &TransparentInterceptionFlowClassifierScope) -> Self {
         Self {
-            selector: TransparentInterceptionClassifierSelectorPlan::from_selector(
-                scope.selector(),
-            ),
-        }
-    }
-}
-
-impl TransparentInterceptionClassifierSelectorPlan {
-    fn from_selector(selector: &TransparentInterceptionClassifierSelector) -> Self {
-        match selector {
-            TransparentInterceptionClassifierSelector::Match { term } => Self::Match {
-                term: Box::new(TransparentInterceptionClassifierTermPlan::from_term(term)),
-            },
-            TransparentInterceptionClassifierSelector::All { selectors } => Self::All {
-                selectors: selectors.iter().map(Self::from_selector).collect(),
-            },
-            TransparentInterceptionClassifierSelector::Any { selectors } => Self::Any {
-                selectors: selectors.iter().map(Self::from_selector).collect(),
-            },
-            TransparentInterceptionClassifierSelector::Not { selector } => Self::Not {
-                selector: Box::new(Self::from_selector(selector)),
-            },
-            TransparentInterceptionClassifierSelector::Ref { name } => {
-                Self::Ref { name: name.clone() }
-            }
-        }
-    }
-}
-
-impl TransparentInterceptionClassifierTermPlan {
-    fn from_term(term: &TransparentInterceptionClassifierTerm) -> Self {
-        Self {
-            process: term.process.clone(),
-            traffic: term.traffic.clone(),
+            selector: scope.selector().clone(),
         }
     }
 }
@@ -610,10 +550,7 @@ mod tests {
                 ports: vec![8443, 9443]
             }
         );
-        assert!(matches!(
-            flow_scope.selector,
-            TransparentInterceptionClassifierSelectorPlan::Any { .. }
-        ));
+        assert!(matches!(flow_scope.selector, Selector::Any { .. }));
     }
 
     #[test]

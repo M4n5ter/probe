@@ -9,24 +9,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{
+use crate::e2e::{
+    enforcement_manifest,
     harness::{
-        ChildSupervisor, UnixSocketReadySignal, create_temp_root, debug_binary, e2e_error,
-        ensure_e2e_packages_built, reexec_current_case_in_fresh_network_namespace,
-        run_in_own_process_group, stop_running_child, trusted_system_command,
-        verify_fresh_network_namespace,
+        ChildGuard, ChildSupervisor, create_temp_root, e2e_error, ensure_e2e_packages_built,
+        reexec_current_case_in_fresh_network_namespace, run_in_own_process_group,
+        stop_running_child, trusted_system_command, verify_fresh_network_namespace,
     },
-    loopback::{spawn_agent, wait_for_agent_ready},
 };
 use probe_config::{
     AgentConfig, CaptureSelection, EnforcementPolicyManifest, EnforcementPolicySourceConfig,
     TransparentInterceptionProxyConfig, TransparentInterceptionProxyModeConfig,
     TransparentInterceptionStrategyConfig,
 };
-use probe_core::{
-    Action, Direction, EnforcementMode, ProcessSelector, ProtectiveActionProfile, Selector,
-    TrafficSelector,
-};
+use probe_core::{Action, EnforcementMode, ProcessSelector, ProtectiveActionProfile, Selector};
 use signal_hook::{
     consts::signal::{SIGINT, SIGTERM},
     iterator::Signals,
@@ -34,18 +30,17 @@ use signal_hook::{
 
 const IN_NETNS_ENV: &str = "TRAFFIC_PROBE_E2E_TRANSPARENT_TPROXY_NETNS";
 const CLIENT_OWNER_ENV: &str = "TRAFFIC_PROBE_E2E_TRANSPARENT_TPROXY_CLIENT_OWNER";
-const HOST_IFACE: &str = "tprobe0h";
+pub(super) const HOST_IFACE: &str = "tprobe0h";
 const CLIENT_IFACE: &str = "tprobe0c";
-const HOST_ADDR: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 1);
-const CLIENT_ADDR: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 2);
-const PROXY_PORT: u16 = 15001;
+pub(super) const HOST_ADDR: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 1);
+pub(super) const CLIENT_ADDR: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 2);
+pub(super) const PROXY_PORT: u16 = 15001;
 const TPROXY_MARK: &str = "0x54500101";
 const TPROXY_ROUTE_TABLE: &str = "45100";
 const ENFORCEMENT_MANIFEST_ID: &str = "e2e-transparent-tproxy-enforcement";
 const ENFORCEMENT_MANIFEST_VERSION: &str = "e2e";
-const PROCESS_SCOPED_LISTENER_NAME: &str = "xtask";
-const MISMATCHING_PROCESS_SCOPED_LISTENER_NAME: &str = "not-xtask";
-const UPSTREAM_SCENARIOS: [UpstreamScenario; 2] = [
+pub(super) const PROCESS_SCOPED_LISTENER_NAME: &str = "xtask";
+pub(super) const UPSTREAM_SCENARIOS: [UpstreamScenario; 2] = [
     UpstreamScenario {
         port: 18080,
         client_payload: b"GET /transparent-tproxy-e2e-a HTTP/1.1\r\nHost: tproxy-a.test\r\n\r\n",
@@ -60,122 +55,41 @@ const UPSTREAM_SCENARIOS: [UpstreamScenario; 2] = [
 const CLIENT_NAMESPACE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
-const AGENT_FAIL_CLOSED_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const REJECTED_UPSTREAM_ACCEPT_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct UpstreamScenario {
-    port: u16,
-    client_payload: &'static [u8],
-    server_response: &'static [u8],
+pub(super) struct UpstreamScenario {
+    pub(super) port: u16,
+    pub(super) client_payload: &'static [u8],
+    pub(super) server_response: &'static [u8],
 }
 
-pub(crate) fn run() -> ExitCode {
-    run_mode(TproxyE2eMode::HostRules)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TransparentTproxyCase {
+    pub(super) case_name: &'static str,
+    pub(super) agent_id: &'static str,
+    pub(super) config_version: &'static str,
+    pub(super) temp_root: &'static str,
+    pub(super) label: &'static str,
 }
 
-pub(crate) fn run_process_scoped() -> ExitCode {
-    run_mode(TproxyE2eMode::ProcessScoped)
-}
-
-pub(crate) fn run_process_derived() -> ExitCode {
-    run_mode(TproxyE2eMode::ProcessDerived)
-}
-
-fn run_mode(mode: TproxyE2eMode) -> ExitCode {
-    match run_outer(mode) {
+pub(super) fn run_transparent_tproxy_case(
+    case: TransparentTproxyCase,
+    run_at: impl FnOnce(&Path) -> Result<(), Box<dyn std::error::Error>>,
+) -> ExitCode {
+    match run_outer(case, run_at) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{} failed: {error}", mode.label());
+            eprintln!("{} failed: {error}", case.label);
             ExitCode::FAILURE
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TproxyE2eMode {
-    HostRules,
-    ProcessScoped,
-    ProcessDerived,
-}
-
-impl TproxyE2eMode {
-    fn case_name(self) -> &'static str {
-        match self {
-            Self::HostRules => "e2e-transparent-tproxy-loopback",
-            Self::ProcessScoped => "e2e-transparent-tproxy-process-loopback",
-            Self::ProcessDerived => "e2e-transparent-tproxy-process-derived-loopback",
-        }
-    }
-
-    fn agent_id(self) -> &'static str {
-        match self {
-            Self::HostRules => "e2e-transparent-tproxy-agent",
-            Self::ProcessScoped => "e2e-transparent-tproxy-process-agent",
-            Self::ProcessDerived => "e2e-transparent-tproxy-process-derived-agent",
-        }
-    }
-
-    fn config_version(self) -> &'static str {
-        self.case_name()
-    }
-
-    fn temp_root(self) -> &'static str {
-        match self {
-            Self::HostRules => "transparent-tproxy-loopback",
-            Self::ProcessScoped => "transparent-tproxy-process-loopback",
-            Self::ProcessDerived => "tproxy-process-derived",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::HostRules => "e2e transparent TPROXY loopback",
-            Self::ProcessScoped => "e2e transparent TPROXY process-scoped loopback",
-            Self::ProcessDerived => "e2e transparent TPROXY process-derived listener loopback",
-        }
-    }
-
-    fn process_selector(self) -> ProcessSelector {
-        match self {
-            Self::HostRules => ProcessSelector::default(),
-            Self::ProcessScoped | Self::ProcessDerived => {
-                process_name_selector(PROCESS_SCOPED_LISTENER_NAME)
-            }
-        }
-    }
-
-    fn traffic_selector(self) -> TrafficSelector {
-        let mut traffic = TrafficSelector {
-            directions: vec![Direction::Inbound],
-            ..TrafficSelector::default()
-        };
-        match self {
-            Self::HostRules | Self::ProcessScoped => {
-                traffic.local_ports = UPSTREAM_SCENARIOS
-                    .iter()
-                    .map(|scenario| scenario.port)
-                    .collect();
-                traffic.remote_addresses = vec![CLIENT_ADDR.to_string()];
-            }
-            Self::ProcessDerived => {}
-        }
-        traffic
-    }
-
-    fn requires_fail_closed_probe(self) -> bool {
-        matches!(self, Self::ProcessScoped | Self::ProcessDerived)
-    }
-
-    fn mismatched_process_failure(self) -> &'static str {
-        match self {
-            Self::HostRules => "",
-            Self::ProcessScoped => "does not match the process selector",
-            Self::ProcessDerived => "no attributed TCP listeners matching the process selector",
-        }
-    }
-}
-
-fn run_outer(mode: TproxyE2eMode) -> Result<(), Box<dyn std::error::Error>> {
+fn run_outer(
+    case: TransparentTproxyCase,
+    run_at: impl FnOnce(&Path) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if env::var_os(CLIENT_OWNER_ENV).is_some() {
         require_root()?;
         return run_client_namespace_owner();
@@ -183,24 +97,27 @@ fn run_outer(mode: TproxyE2eMode) -> Result<(), Box<dyn std::error::Error>> {
     if env::var_os(IN_NETNS_ENV).is_some() {
         require_root()?;
         verify_fresh_network_namespace(IN_NETNS_ENV)?;
-        run_inner(mode)
+        run_inner(case, run_at)
     } else {
         ensure_e2e_packages_built(["agent"])?;
         require_root()?;
         reexec_current_case_in_fresh_network_namespace(
             IN_NETNS_ENV,
-            mode.case_name(),
+            case.case_name,
             "network-namespace transparent TPROXY e2e",
         )
     }
 }
 
-fn run_inner(mode: TproxyE2eMode) -> Result<(), Box<dyn std::error::Error>> {
-    let root = create_temp_root(mode.temp_root())?;
-    match run_at(&root, mode) {
+fn run_inner(
+    case: TransparentTproxyCase,
+    run_at: impl FnOnce(&Path) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = create_temp_root(case.temp_root)?;
+    match run_at(&root) {
         Ok(()) => {
             std::fs::remove_dir_all(&root)?;
-            println!("{} passed", mode.label());
+            println!("{} passed", case.label);
             Ok(())
         }
         Err(error) => {
@@ -210,112 +127,16 @@ fn run_inner(mode: TproxyE2eMode) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn run_at(root: &Path, mode: TproxyE2eMode) -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = root.join("agent.toml");
-    let enforcement_manifest_path = root.join("enforcement.toml");
-    let spool_path = root.join("spool");
-    let ready_socket_path = root.join("agent.ready.sock");
-
-    write_agent_config(
-        &config_path,
-        &spool_path,
-        &enforcement_manifest_path,
-        mode,
-        mode.process_selector(),
-    )?;
-    let supervisor = ChildSupervisor::new()?;
-    let mut client_namespace =
-        supervisor.watch(spawn_client_namespace_owner(mode)?, "client namespace");
-    let client_pid = client_namespace.child_mut().id();
-    wait_for_client_namespace_ready(client_namespace.child_mut())?;
-    let _network = IsolatedNetwork::setup(client_pid)?;
-    if mode.requires_fail_closed_probe() {
-        assert_mismatched_process_selector_fails_closed(root, &supervisor, mode)?;
-    }
-    let upstreams = UPSTREAM_SCENARIOS
-        .iter()
-        .copied()
-        .map(UpstreamServer::spawn)
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut ready_signal = UnixSocketReadySignal::bind(ready_socket_path)?;
-    let mut agent = supervisor.watch(spawn_agent(&config_path, &ready_signal)?, "agent");
-    wait_for_agent_ready(agent.child_mut(), &mut ready_signal)?;
-
-    let client_responses = UPSTREAM_SCENARIOS
-        .iter()
-        .map(|scenario| run_client(client_pid, scenario))
-        .collect::<Vec<_>>();
-    let upstream_reports = upstreams
-        .into_iter()
-        .map(UpstreamServer::join)
-        .collect::<Vec<_>>();
-    let agent_result = stop_running_child(agent.child_mut(), "agent");
-    agent.unwatch();
-    let client_namespace_result =
-        stop_running_child(client_namespace.child_mut(), "client namespace");
-    client_namespace.unwatch();
-    let cleanup_result = assert_transparent_interception_cleanup();
-
-    merge_run_results(
-        client_responses,
-        upstream_reports,
-        agent_result,
-        client_namespace_result,
-        cleanup_result,
-    )
-}
-
-fn assert_mismatched_process_selector_fails_closed(
-    root: &Path,
-    supervisor: &ChildSupervisor,
-    mode: TproxyE2eMode,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = root.join("mismatch.toml");
-    let enforcement_manifest_path = root.join("mismatch-enforcement.toml");
-    let spool_path = root.join("spool-mismatch");
-    let ready_socket_path = root.join("mismatch.sock");
-    write_agent_config(
-        &config_path,
-        &spool_path,
-        &enforcement_manifest_path,
-        mode,
-        process_name_selector(MISMATCHING_PROCESS_SCOPED_LISTENER_NAME),
-    )?;
-    let listeners = bind_listener_probe_ports()?;
-    let mut ready_signal = UnixSocketReadySignal::bind(ready_socket_path)?;
-    let mut agent = supervisor.watch(
-        spawn_agent_for_expected_failure(&config_path, &ready_signal)?,
-        "mismatched process agent",
-    );
-    assert_agent_fails_before_ready(
-        agent.child_mut(),
-        &mut ready_signal,
-        mode.mismatched_process_failure(),
-    )?;
-    agent.unwatch();
-    drop(listeners);
-    assert_transparent_interception_cleanup()?;
-    Ok(())
-}
-
-fn bind_listener_probe_ports() -> Result<Vec<TcpListener>, Box<dyn std::error::Error>> {
-    UPSTREAM_SCENARIOS
-        .iter()
-        .map(|scenario| TcpListener::bind((HOST_ADDR, scenario.port)))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-fn write_agent_config(
+pub(super) fn write_agent_config(
     path: &Path,
     spool_path: &Path,
     enforcement_manifest_path: &Path,
-    mode: TproxyE2eMode,
-    process_selector: ProcessSelector,
+    case: TransparentTproxyCase,
+    selector: Selector,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = AgentConfig {
-        agent_id: mode.agent_id().to_string(),
-        config_version: mode.config_version().to_string(),
+        agent_id: case.agent_id.to_string(),
+        config_version: case.config_version.to_string(),
         ..AgentConfig::default()
     };
     config.capture.selection = CaptureSelection::Libpcap;
@@ -330,8 +151,7 @@ fn write_agent_config(
     config.storage.path = spool_path.to_path_buf();
     config.export.worker.enabled = false;
     config.enforcement.mode = EnforcementMode::Enforce;
-    let selector = Selector::term(process_selector, mode.traffic_selector());
-    super::enforcement_manifest::write_enforcement_policy_manifest(
+    enforcement_manifest::write_enforcement_policy_manifest(
         enforcement_manifest_path,
         &EnforcementPolicyManifest {
             id: ENFORCEMENT_MANIFEST_ID.to_string(),
@@ -355,88 +175,20 @@ fn write_agent_config(
     Ok(())
 }
 
-fn process_name_selector(name: &str) -> ProcessSelector {
+pub(super) fn process_name_selector(name: &str) -> ProcessSelector {
     ProcessSelector {
         names: vec![name.to_string()],
         ..ProcessSelector::default()
     }
 }
 
-fn spawn_agent_for_expected_failure(
-    config_path: &Path,
-    ready_signal: &UnixSocketReadySignal,
-) -> Result<Child, Box<dyn std::error::Error>> {
-    let mut command = Command::new(debug_binary("agent")?);
-    let child = run_in_own_process_group(&mut command)
-        .args(["run", "--config"])
-        .arg(config_path)
-        .env(super::loopback::AGENT_READY_SOCKET_ENV, ready_signal.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    Ok(child)
-}
-
-fn assert_agent_fails_before_ready(
-    child: &mut Child,
-    ready_signal: &mut UnixSocketReadySignal,
-    expected_stderr: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| e2e_error("expected failure agent stderr pipe is missing"))?;
-    ready_signal.listener_mut().set_nonblocking(true)?;
-    let deadline = Instant::now() + AGENT_FAIL_CLOSED_TIMEOUT;
-    let status = loop {
-        match ready_signal.listener_mut().accept() {
-            Ok(_) => {
-                return Err(e2e_error(
-                    "mismatched process-scoped transparent TPROXY agent unexpectedly became ready",
-                )
-                .into());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error.into()),
-        }
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            return Err(e2e_error(format!(
-                "mismatched process-scoped transparent TPROXY agent did not fail within {}ms",
-                AGENT_FAIL_CLOSED_TIMEOUT.as_millis()
-            ))
-            .into());
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
-    let mut stderr_text = String::new();
-    stderr.read_to_string(&mut stderr_text)?;
-    if status.success() {
-        return Err(e2e_error(format!(
-            "mismatched process-scoped transparent TPROXY agent exited successfully; stderr: {stderr_text}"
-        ))
-        .into());
-    }
-    if !stderr_text.contains(expected_stderr) {
-        return Err(e2e_error(format!(
-            "mismatched process-scoped transparent TPROXY agent failed for the wrong reason; expected stderr to contain {expected_stderr:?}, got {stderr_text:?}"
-        ))
-        .into());
-    }
-    Ok(())
-}
-
-fn spawn_client_namespace_owner(mode: TproxyE2eMode) -> Result<Child, Box<dyn std::error::Error>> {
+fn spawn_client_namespace_owner(case_name: &str) -> Result<Child, Box<dyn std::error::Error>> {
     let mut command = Command::new(unshare_command()?);
     let child = run_in_own_process_group(&mut command)
         .arg("-n")
         .arg("--")
         .arg(env::current_exe()?)
-        .arg(mode.case_name())
+        .arg(case_name)
         .env(CLIENT_OWNER_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -450,6 +202,39 @@ fn run_client_namespace_owner() -> Result<(), Box<dyn std::error::Error>> {
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
     let _ = signals.forever().next();
     Ok(())
+}
+
+pub(super) struct IsolatedClientNamespace {
+    guard: ChildGuard,
+    _network: IsolatedNetwork,
+}
+
+impl IsolatedClientNamespace {
+    pub(super) fn start(
+        supervisor: &ChildSupervisor,
+        case: TransparentTproxyCase,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut guard = supervisor.watch(
+            spawn_client_namespace_owner(case.case_name)?,
+            "client namespace",
+        );
+        wait_for_client_namespace_ready(guard.child_mut())?;
+        let network = IsolatedNetwork::setup(guard.child_mut().id())?;
+        Ok(Self {
+            guard,
+            _network: network,
+        })
+    }
+
+    pub(super) fn pid(&mut self) -> u32 {
+        self.guard.child_mut().id()
+    }
+
+    pub(super) fn stop(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let result = stop_running_child(self.guard.child_mut(), "client namespace");
+        self.guard.unwatch();
+        result
+    }
 }
 
 fn wait_for_client_namespace_ready(child: &mut Child) -> Result<(), Box<dyn std::error::Error>> {
@@ -522,13 +307,13 @@ impl Drop for IsolatedNetwork {
     }
 }
 
-struct UpstreamServer {
+pub(super) struct UpstreamServer {
     report: mpsc::Receiver<Result<UpstreamReport, String>>,
     thread: thread::JoinHandle<()>,
 }
 
 impl UpstreamServer {
-    fn spawn(scenario: UpstreamScenario) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(super) fn spawn(scenario: UpstreamScenario) -> Result<Self, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind((HOST_ADDR, scenario.port))?;
         listener.set_nonblocking(true)?;
         let (sender, report) = mpsc::channel();
@@ -539,7 +324,7 @@ impl UpstreamServer {
         Ok(Self { report, thread })
     }
 
-    fn join(self) -> Result<UpstreamReport, Box<dyn std::error::Error>> {
+    pub(super) fn join(self) -> Result<UpstreamReport, Box<dyn std::error::Error>> {
         let result = self
             .report
             .recv_timeout(SERVER_ACCEPT_TIMEOUT + Duration::from_secs(1))
@@ -552,10 +337,10 @@ impl UpstreamServer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct UpstreamReport {
-    port: u16,
-    peer_addr: SocketAddr,
-    request: Vec<u8>,
+pub(super) struct UpstreamReport {
+    pub(super) port: u16,
+    pub(super) peer_addr: SocketAddr,
+    pub(super) request: Vec<u8>,
 }
 
 fn run_upstream_server(
@@ -589,10 +374,27 @@ fn run_upstream_server(
     })
 }
 
-fn run_client(
+pub(super) fn run_client(
     client_pid: u32,
     scenario: &UpstreamScenario,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let output = run_client_output(client_pid, scenario)?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(e2e_error(format!(
+            "client nc failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into())
+    }
+}
+
+pub(super) fn run_client_output(
+    client_pid: u32,
+    scenario: &UpstreamScenario,
+) -> Result<std::process::Output, Box<dyn std::error::Error>> {
     let host = HOST_ADDR.to_string();
     let port = scenario.port.to_string();
     let mut child = Command::new(nsenter_command()?)
@@ -608,20 +410,10 @@ fn run_client(
         .take()
         .ok_or_else(|| e2e_error("failed to open nc stdin"))?
         .write_all(scenario.client_payload)?;
-    let output = wait_with_timeout(child, CLIENT_TIMEOUT)?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(e2e_error(format!(
-            "client nc failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ))
-        .into())
-    }
+    wait_with_timeout(child, CLIENT_TIMEOUT)
 }
 
-fn assert_upstream_observed_relayed_request(
+pub(super) fn assert_upstream_observed_relayed_request(
     report: &UpstreamReport,
     scenario: &UpstreamScenario,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -654,7 +446,7 @@ fn assert_upstream_observed_relayed_request(
     Ok(())
 }
 
-fn assert_client_received_server_response(
+pub(super) fn assert_client_received_server_response(
     response: &[u8],
     scenario: &UpstreamScenario,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -670,13 +462,13 @@ fn assert_client_received_server_response(
     }
 }
 
-fn assert_transparent_interception_cleanup() -> Result<(), Box<dyn std::error::Error>> {
+pub(super) fn assert_transparent_interception_cleanup() -> Result<(), Box<dyn std::error::Error>> {
     assert_tproxy_table_removed()?;
     assert_policy_routing_removed()?;
     Ok(())
 }
 
-fn merge_run_results(
+pub(super) fn merge_run_results(
     client_responses: Vec<Result<Vec<u8>, Box<dyn std::error::Error>>>,
     upstream_reports: Vec<Result<UpstreamReport, Box<dyn std::error::Error>>>,
     agent_result: Result<(), Box<dyn std::error::Error>>,
@@ -739,7 +531,7 @@ fn record_result_count(label: &'static str, actual: usize, errors: &mut Vec<Stri
     }
 }
 
-fn collect_result<T>(
+pub(super) fn collect_result<T>(
     label: impl Into<String>,
     result: Result<T, Box<dyn std::error::Error>>,
     errors: &mut Vec<String>,
@@ -754,7 +546,7 @@ fn collect_result<T>(
     }
 }
 
-fn record_result(
+pub(super) fn record_result(
     label: impl Into<String>,
     result: Result<(), Box<dyn std::error::Error>>,
     errors: &mut Vec<String>,

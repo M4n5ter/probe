@@ -105,7 +105,6 @@ fn listener_loop(
         match listener.accept() {
             Ok((accepted, peer)) => match relay_registry.try_acquire_slot() {
                 Some(slot) => {
-                    runtime.record_accepted_relay();
                     relay_threads.push(spawn_relay(
                         accepted,
                         peer,

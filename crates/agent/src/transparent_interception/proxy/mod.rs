@@ -25,7 +25,10 @@ use self::{
     listener::{ManagedTransparentProxyListener, start_listeners},
     registry::RelayRegistry,
 };
-use super::{TransparentInterceptionError, TransparentInterceptionIpFamily};
+use super::{
+    TransparentInterceptionError, TransparentInterceptionFlowClassifier,
+    TransparentInterceptionIpFamily,
+};
 
 pub(super) type LocalAddressInventory =
     Arc<dyn Fn() -> Result<Vec<IpAddr>, TransparentInterceptionError> + Send + Sync>;
@@ -73,9 +76,10 @@ pub(in crate::transparent_interception) fn prepare_proxy_lifecycle(
     inbound_plan: &TransparentInterceptionInboundTproxyPlan,
     families: Vec<TransparentInterceptionIpFamily>,
     proxy_bypass_mark: NonZeroU32,
+    flow_classifier: Option<TransparentInterceptionFlowClassifier>,
     load_local_addresses: LocalAddressInventory,
 ) -> Result<TransparentProxyLifecyclePlan, TransparentInterceptionError> {
-    let proxy = prepare_proxy_plan(inbound_plan, families, proxy_bypass_mark)?;
+    let proxy = prepare_proxy_plan(inbound_plan, families, proxy_bypass_mark, flow_classifier)?;
     let health_probe = prepare_health_probe(
         inbound_plan.health_probe(),
         proxy.managed(),
@@ -91,6 +95,7 @@ pub(in crate::transparent_interception) fn prepare_outbound_proxy_lifecycle(
     outbound_plan: &TransparentInterceptionOutboundProxyPlan,
     families: Vec<TransparentInterceptionIpFamily>,
     proxy_bypass_mark: NonZeroU32,
+    flow_classifier: Option<TransparentInterceptionFlowClassifier>,
     load_local_addresses: LocalAddressInventory,
 ) -> Result<TransparentProxyLifecyclePlan, TransparentInterceptionError> {
     let proxy = if outbound_plan.requires_managed_proxy() {
@@ -98,9 +103,15 @@ pub(in crate::transparent_interception) fn prepare_outbound_proxy_lifecycle(
             outbound_plan,
             families,
             proxy_bypass_mark,
+            flow_classifier,
             load_local_addresses,
         )?)
     } else {
+        if flow_classifier.is_some() {
+            return Err(TransparentInterceptionError::Setup(
+                "transparent flow classifier requires managed TCP relay proxy mode".to_string(),
+            ));
+        }
         TransparentProxyLifecycleProxyPlan::External
     };
     Ok(TransparentProxyLifecyclePlan {
@@ -145,8 +156,14 @@ fn prepare_proxy_plan(
     inbound_plan: &TransparentInterceptionInboundTproxyPlan,
     families: Vec<TransparentInterceptionIpFamily>,
     proxy_bypass_mark: NonZeroU32,
+    flow_classifier: Option<TransparentInterceptionFlowClassifier>,
 ) -> Result<TransparentProxyLifecycleProxyPlan, TransparentInterceptionError> {
     let TransparentInterceptionProxyModeConfig::ManagedTcpRelay = inbound_plan.proxy_mode() else {
+        if flow_classifier.is_some() {
+            return Err(TransparentInterceptionError::Setup(
+                "transparent flow classifier requires managed TCP relay proxy mode".to_string(),
+            ));
+        }
         return Ok(TransparentProxyLifecycleProxyPlan::External);
     };
     if families.is_empty() {
@@ -161,6 +178,7 @@ fn prepare_proxy_plan(
             relay_plan: relay::TransparentProxyRelayPlan::inbound_tproxy(
                 inbound_plan.listen_port().get(),
                 proxy_bypass_mark,
+                flow_classifier,
             ),
         },
     ))
@@ -170,6 +188,7 @@ fn prepare_outbound_managed_proxy(
     outbound_plan: &TransparentInterceptionOutboundProxyPlan,
     families: Vec<TransparentInterceptionIpFamily>,
     proxy_bypass_mark: NonZeroU32,
+    flow_classifier: Option<TransparentInterceptionFlowClassifier>,
     load_local_addresses: LocalAddressInventory,
 ) -> Result<ManagedTransparentProxyPlan, TransparentInterceptionError> {
     if families.is_empty() {
@@ -185,6 +204,7 @@ fn prepare_outbound_managed_proxy(
         relay_plan: relay::TransparentProxyRelayPlan::outbound_redirect(
             listen_port,
             proxy_bypass_mark,
+            flow_classifier,
             Arc::from(local_addresses),
         ),
     })
@@ -323,6 +343,7 @@ mod tests {
             &inbound_plan,
             Vec::new(),
             proxy_bypass_mark(),
+            None,
             Arc::new(|| Ok(Vec::new())),
         )
         .expect("external mode without health probe should be prepared");
@@ -360,6 +381,7 @@ mod tests {
             &outbound_plan,
             vec![TransparentInterceptionIpFamily::Ipv4],
             outbound_plan.outbound_redirect_artifact().proxy_bypass_mark,
+            None,
             Arc::new(|| Ok(Vec::new())),
         )
         .expect("external outbound mode should be prepared");
@@ -394,6 +416,7 @@ mod tests {
             &inbound_plan,
             Vec::new(),
             proxy_bypass_mark(),
+            None,
             Arc::new(|| Ok(Vec::new())),
         ) {
             Ok(_) => panic!("managed relay should require at least one listener family"),

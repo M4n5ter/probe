@@ -2,13 +2,56 @@ use interception::TransparentInterceptionHostRuleSet;
 use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
 
 use super::{
-    TransparentInterceptionError,
+    TransparentInterceptionError, TransparentInterceptionFlowClassifier,
     nftables::{
         NftablesOutboundTransparentProxy, NftablesOutboundTransparentProxyGuard,
         NftablesTransparentInterception, NftablesTransparentInterceptionGuard,
     },
     proxy::{TransparentProxyRuntime, TransparentProxyRuntimeHandle},
 };
+
+#[derive(Debug)]
+pub(crate) struct TransparentInterceptionActivationScope {
+    setup_rules: TransparentInterceptionHostRuleSet,
+    flow_classifier: Option<TransparentInterceptionFlowClassifier>,
+}
+
+impl TransparentInterceptionActivationScope {
+    pub(crate) fn host_rules(setup_rules: TransparentInterceptionHostRuleSet) -> Self {
+        Self {
+            setup_rules,
+            flow_classifier: None,
+        }
+    }
+
+    pub(crate) fn with_flow_classifier(
+        setup_rules: TransparentInterceptionHostRuleSet,
+        flow_classifier: TransparentInterceptionFlowClassifier,
+    ) -> Self {
+        Self {
+            setup_rules,
+            flow_classifier: Some(flow_classifier),
+        }
+    }
+
+    pub(crate) fn setup_rules(&self) -> &TransparentInterceptionHostRuleSet {
+        &self.setup_rules
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_flow_classifier(&self) -> bool {
+        self.flow_classifier.is_some()
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        TransparentInterceptionHostRuleSet,
+        Option<TransparentInterceptionFlowClassifier>,
+    ) {
+        (self.setup_rules, self.flow_classifier)
+    }
+}
 
 pub(crate) struct TransparentInterceptionRuntime {
     capability: CapabilityState,
@@ -19,7 +62,7 @@ pub(crate) struct TransparentInterceptionRuntime {
 pub(super) trait TransparentInterceptionLifecycle: Send {
     fn activate(
         self: Box<Self>,
-        setup_scope: TransparentInterceptionHostRuleSet,
+        activation_scope: TransparentInterceptionActivationScope,
     ) -> Result<Box<dyn TransparentInterceptionGuardLifecycle>, TransparentInterceptionError>;
 }
 
@@ -38,17 +81,17 @@ impl TransparentInterceptionRuntime {
 
     pub(crate) fn activate(
         self,
-        setup_scope: Option<TransparentInterceptionHostRuleSet>,
+        activation_scope: Option<TransparentInterceptionActivationScope>,
     ) -> Result<Option<TransparentInterceptionGuard>, TransparentInterceptionError> {
         self.activation
             .map(|activation| {
-                let setup_scope = setup_scope.ok_or_else(|| {
+                let activation_scope = activation_scope.ok_or_else(|| {
                     TransparentInterceptionError::Nftables(
                         "transparent interception setup scope is missing".to_string(),
                     )
                 })?;
                 activation
-                    .activate(setup_scope)
+                    .activate(activation_scope)
                     .map(TransparentInterceptionGuard::new)
             })
             .transpose()
@@ -102,9 +145,9 @@ impl TransparentInterceptionGuard {
 impl TransparentInterceptionLifecycle for NftablesTransparentInterception {
     fn activate(
         self: Box<Self>,
-        setup_scope: TransparentInterceptionHostRuleSet,
+        activation_scope: TransparentInterceptionActivationScope,
     ) -> Result<Box<dyn TransparentInterceptionGuardLifecycle>, TransparentInterceptionError> {
-        NftablesTransparentInterception::activate(*self, setup_scope)
+        NftablesTransparentInterception::activate(*self, activation_scope)
             .map(|guard| Box::new(guard) as Box<dyn TransparentInterceptionGuardLifecycle>)
     }
 }
@@ -112,9 +155,9 @@ impl TransparentInterceptionLifecycle for NftablesTransparentInterception {
 impl TransparentInterceptionLifecycle for NftablesOutboundTransparentProxy {
     fn activate(
         self: Box<Self>,
-        setup_scope: TransparentInterceptionHostRuleSet,
+        activation_scope: TransparentInterceptionActivationScope,
     ) -> Result<Box<dyn TransparentInterceptionGuardLifecycle>, TransparentInterceptionError> {
-        NftablesOutboundTransparentProxy::activate(*self, setup_scope)
+        NftablesOutboundTransparentProxy::activate(*self, activation_scope)
             .map(|guard| Box::new(guard) as Box<dyn TransparentInterceptionGuardLifecycle>)
     }
 }

@@ -423,6 +423,7 @@ mod tests {
             relay_plan: crate::transparent_interception::proxy::relay::TransparentProxyRelayPlan::inbound_tproxy(
                 15001,
                 proxy_bypass_mark(),
+                None,
             ),
         }
     }

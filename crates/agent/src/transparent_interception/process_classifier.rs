@@ -692,7 +692,9 @@ mod tests {
         .expect("inbound TPROXY setup should produce host rules");
 
         assert_eq!(
-            single_scope(&scope).local_ports().only_values(),
+            single_scope(scope.setup_rules())
+                .local_ports()
+                .only_values(),
             Some(&[8443][..])
         );
         Ok(())

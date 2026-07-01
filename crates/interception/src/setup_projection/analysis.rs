@@ -1057,7 +1057,6 @@ fn format_ip_addresses(addresses: Vec<IpAddr>) -> Vec<String> {
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use super::super::TransparentInterceptionClassifierSelector;
     use super::*;
 
     #[test]
@@ -1547,10 +1546,7 @@ mod tests {
                 .values(),
             &[8443, 9443]
         );
-        assert!(matches!(
-            flow_scope.selector(),
-            TransparentInterceptionClassifierSelector::Any { .. }
-        ));
+        assert!(matches!(flow_scope.selector(), Selector::Any { .. }));
     }
 
     #[test]

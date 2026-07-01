@@ -1,4 +1,5 @@
 mod error;
+mod flow_classifier;
 mod ip_family;
 mod nftables;
 mod process_classifier;
@@ -10,14 +11,15 @@ use ::runtime::{
     TransparentInterceptionOutboundProxyPlan,
 };
 use interception::{
-    TransparentInterceptionHostRuleSet, TransparentInterceptionSetupDirection,
-    TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError,
-    TransparentInterceptionSetupSelectors,
+    TransparentInterceptionFlowClassifierScope, TransparentInterceptionHostRuleBoundary,
+    TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan,
+    TransparentInterceptionSetupProjectionError, TransparentInterceptionSetupSelectors,
 };
-use probe_config::TransparentInterceptionStrategyConfig;
+use probe_config::{TransparentInterceptionProxyModeConfig, TransparentInterceptionStrategyConfig};
 use probe_core::{CapabilityState, RuntimeMode};
 
 pub(crate) use error::TransparentInterceptionError;
+pub(crate) use flow_classifier::TransparentInterceptionFlowClassifier;
 pub(crate) use ip_family::TransparentInterceptionIpFamily;
 pub(crate) use process_classifier::TransparentInterceptionProcessClassifier;
 use proxy::TransparentProxyRuntime;
@@ -25,7 +27,10 @@ pub(crate) use proxy::{
     TransparentProxyHealthProbeMode, TransparentProxyRuntimeHandle, TransparentProxyRuntimeMode,
     TransparentProxyRuntimeSnapshot,
 };
-pub(crate) use runtime::{TransparentInterceptionGuard, TransparentInterceptionRuntime};
+pub(crate) use runtime::{
+    TransparentInterceptionActivationScope, TransparentInterceptionGuard,
+    TransparentInterceptionRuntime,
+};
 
 const MISSING_LOCAL_SETUP_SELECTOR: &str =
     "transparent interception requires an explicit local selector for setup-time rules";
@@ -61,7 +66,7 @@ pub(crate) fn effective_setup_scope(
     classification: &TransparentInterceptionClassificationPlan,
     process_classifier: &mut TransparentInterceptionProcessClassifier,
     selectors: TransparentInterceptionSetupSelectors,
-) -> Result<Option<TransparentInterceptionHostRuleSet>, TransparentInterceptionError> {
+) -> Result<Option<TransparentInterceptionActivationScope>, TransparentInterceptionError> {
     if execution_plan.strategy() == TransparentInterceptionStrategyConfig::None {
         return Ok(None);
     }
@@ -81,7 +86,8 @@ pub(crate) fn effective_setup_scope(
             )
         }
         TransparentInterceptionExecutionPlan::OutboundTransparentProxy(outbound_plan) => {
-            validate_outbound_redirect_setup_scope(outbound_plan, selectors).map(Some)
+            validate_outbound_redirect_setup_scope(outbound_plan, classification, selectors)
+                .map(Some)
         }
     }
 }
@@ -91,7 +97,7 @@ fn inbound_tproxy_effective_setup_scope(
     classification: &TransparentInterceptionClassificationPlan,
     process_classifier: &mut TransparentInterceptionProcessClassifier,
     selectors: TransparentInterceptionSetupSelectors,
-) -> Result<Option<TransparentInterceptionHostRuleSet>, TransparentInterceptionError> {
+) -> Result<Option<TransparentInterceptionActivationScope>, TransparentInterceptionError> {
     validate_local_setup_plan(
         selectors.local_setup_plan(TransparentInterceptionSetupDirection::Inbound),
     )?;
@@ -99,30 +105,46 @@ fn inbound_tproxy_effective_setup_scope(
         selectors.final_setup_plan(TransparentInterceptionSetupDirection::Inbound),
         classification,
         process_classifier,
+        inbound_plan.proxy_mode(),
     )?;
-    nftables::validate_inbound_tproxy_setup_scope(inbound_plan, &scope)?;
+    nftables::validate_inbound_tproxy_setup_scope(inbound_plan, scope.setup_rules())?;
     Ok(Some(scope))
 }
 
 fn validate_outbound_redirect_setup_scope(
     outbound_plan: &TransparentInterceptionOutboundProxyPlan,
+    classification: &TransparentInterceptionClassificationPlan,
     selectors: TransparentInterceptionSetupSelectors,
-) -> Result<TransparentInterceptionHostRuleSet, TransparentInterceptionError> {
+) -> Result<TransparentInterceptionActivationScope, TransparentInterceptionError> {
     validate_local_setup_plan(
         selectors.local_setup_plan(TransparentInterceptionSetupDirection::Outbound),
     )?;
     match selectors.final_setup_plan(TransparentInterceptionSetupDirection::Outbound) {
         Ok(TransparentInterceptionSetupPlan::HostRules(rules)) => {
             nftables::validate_outbound_redirect_setup_scope(outbound_plan, &rules)?;
-            Ok(rules)
+            Ok(TransparentInterceptionActivationScope::host_rules(rules))
         }
-        Ok(
-            TransparentInterceptionSetupPlan::RequiresProcessClassifier { reason, .. }
-            | TransparentInterceptionSetupPlan::RequiresFlowClassifier { reason, .. },
-        ) => Err(TransparentInterceptionError::Setup(format!(
-            "{reason}; {}",
-            outbound_transparent_proxy_classifier_unavailable()
-        ))),
+        Ok(TransparentInterceptionSetupPlan::RequiresProcessClassifier { reason, .. }) => {
+            Err(TransparentInterceptionError::Setup(format!(
+                "{reason}; {}",
+                outbound_transparent_proxy_classifier_unavailable()
+            )))
+        }
+        Ok(TransparentInterceptionSetupPlan::RequiresFlowClassifier {
+            host_rule_boundary,
+            flow_scope,
+            reason,
+        }) => flow_classifier_activation_scope(
+            reason,
+            host_rule_boundary,
+            flow_scope,
+            classification,
+            outbound_plan.proxy_mode(),
+        )
+        .and_then(|scope| {
+            nftables::validate_outbound_redirect_setup_scope(outbound_plan, scope.setup_rules())?;
+            Ok(scope)
+        }),
         Err(error) => Err(TransparentInterceptionError::Setup(error.to_string())),
     }
 }
@@ -147,24 +169,65 @@ fn executable_host_rule_scope(
     plan: Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError>,
     classification: &TransparentInterceptionClassificationPlan,
     process_classifier: &mut TransparentInterceptionProcessClassifier,
-) -> Result<TransparentInterceptionHostRuleSet, TransparentInterceptionError> {
+    proxy_mode: TransparentInterceptionProxyModeConfig,
+) -> Result<TransparentInterceptionActivationScope, TransparentInterceptionError> {
     match plan {
-        Ok(TransparentInterceptionSetupPlan::HostRules(rules)) => Ok(rules),
+        Ok(TransparentInterceptionSetupPlan::HostRules(rules)) => {
+            Ok(TransparentInterceptionActivationScope::host_rules(rules))
+        }
         Ok(TransparentInterceptionSetupPlan::RequiresProcessClassifier {
             host_rule_boundary,
             process_scope,
             reason,
-        }) => process_classifier.executable_host_rule_scope(
+        }) => process_classifier
+            .executable_host_rule_scope(
+                reason,
+                host_rule_boundary,
+                process_scope,
+                &classification.process_classifier,
+            )
+            .map(TransparentInterceptionActivationScope::host_rules),
+        Ok(TransparentInterceptionSetupPlan::RequiresFlowClassifier {
             reason,
             host_rule_boundary,
-            process_scope,
-            &classification.process_classifier,
-        ),
-        Ok(TransparentInterceptionSetupPlan::RequiresFlowClassifier { reason, .. }) => Err(
-            classifier_setup_error(reason, "flow classifier", &classification.flow_classifier),
+            flow_scope,
+        }) => flow_classifier_activation_scope(
+            reason,
+            host_rule_boundary,
+            flow_scope,
+            classification,
+            proxy_mode,
         ),
         Err(error) => Err(TransparentInterceptionError::Setup(error.to_string())),
     }
+}
+
+fn flow_classifier_activation_scope(
+    reason: String,
+    host_rule_boundary: TransparentInterceptionHostRuleBoundary,
+    flow_scope: TransparentInterceptionFlowClassifierScope,
+    classification: &TransparentInterceptionClassificationPlan,
+    proxy_mode: TransparentInterceptionProxyModeConfig,
+) -> Result<TransparentInterceptionActivationScope, TransparentInterceptionError> {
+    if classification.flow_classifier.mode == RuntimeMode::Unavailable {
+        return Err(classifier_setup_error(
+            reason,
+            "flow classifier",
+            &classification.flow_classifier,
+        ));
+    }
+    if proxy_mode != TransparentInterceptionProxyModeConfig::ManagedTcpRelay {
+        return Err(TransparentInterceptionError::Setup(format!(
+            "{reason}; transparent flow classifier requires managed TCP relay proxy mode"
+        )));
+    }
+    let TransparentInterceptionHostRuleBoundary::HostRules(setup_rules) = host_rule_boundary else {
+        return Err(TransparentInterceptionError::Setup(format!(
+            "{reason}; transparent flow classifier requires a finite host-rule boundary before rule installation"
+        )));
+    };
+    let flow_classifier = TransparentInterceptionFlowClassifier::from_scope(flow_scope)?;
+    Ok(TransparentInterceptionActivationScope::with_flow_classifier(setup_rules, flow_classifier))
 }
 
 fn classifier_setup_error(
@@ -356,6 +419,96 @@ mod tests {
         assert!(!message.contains("target recovery"));
     }
 
+    #[test]
+    fn flow_classifier_setup_scope_preserves_host_boundary_for_managed_proxy() {
+        let config = EnforcementInterceptionConfig {
+            strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
+            selector: None,
+            proxy: TransparentInterceptionProxyConfig {
+                mode: probe_config::TransparentInterceptionProxyModeConfig::ManagedTcpRelay,
+                listen_port: Some(15001),
+                ..TransparentInterceptionProxyConfig::default()
+            },
+            ..EnforcementInterceptionConfig::default()
+        };
+        let selector = correlated_process_any_selector(Direction::Inbound);
+        let selectors = setup_selectors(&selector, &config);
+        let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
+            .expect("test transparent interception config should be valid");
+
+        let scope = effective_setup_scope(
+            &execution_plan,
+            &degraded_flow_classifier(),
+            &mut TransparentInterceptionProcessClassifier::new(),
+            selectors,
+        )
+        .expect("flow-classified setup should be executable")
+        .expect("inbound TPROXY setup should produce activation scope");
+
+        assert!(scope.has_flow_classifier());
+        assert_eq!(
+            scope.setup_rules().explicit_local_ports(),
+            Some(vec![8443, 9443])
+        );
+    }
+
+    #[test]
+    fn flow_classifier_setup_scope_rejects_external_proxy() {
+        let config = EnforcementInterceptionConfig {
+            strategy: TransparentInterceptionStrategyConfig::InboundTproxy,
+            selector: None,
+            proxy: TransparentInterceptionProxyConfig {
+                mode: probe_config::TransparentInterceptionProxyModeConfig::External,
+                listen_port: Some(15001),
+                ..TransparentInterceptionProxyConfig::default()
+            },
+            ..EnforcementInterceptionConfig::default()
+        };
+        let selector = correlated_process_any_selector(Direction::Inbound);
+        let selectors = setup_selectors(&selector, &config);
+        let execution_plan = TransparentInterceptionExecutionPlan::try_from_config(&config)
+            .expect("test transparent interception config should be valid");
+
+        let error = effective_setup_scope(
+            &execution_plan,
+            &degraded_flow_classifier(),
+            &mut TransparentInterceptionProcessClassifier::new(),
+            selectors,
+        )
+        .expect_err("external proxy cannot execute proxy-side flow classifier");
+
+        assert!(error.to_string().contains("requires managed TCP relay"));
+    }
+
+    fn correlated_process_any_selector(direction: Direction) -> Selector {
+        Selector::Any {
+            selectors: vec![
+                Selector::term(
+                    ProcessSelector {
+                        names: vec!["curl".to_string()],
+                        ..ProcessSelector::default()
+                    },
+                    TrafficSelector {
+                        local_ports: vec![8443],
+                        directions: vec![direction],
+                        ..TrafficSelector::default()
+                    },
+                ),
+                Selector::term(
+                    ProcessSelector {
+                        names: vec!["wget".to_string()],
+                        ..ProcessSelector::default()
+                    },
+                    TrafficSelector {
+                        local_ports: vec![9443],
+                        directions: vec![direction],
+                        ..TrafficSelector::default()
+                    },
+                ),
+            ],
+        }
+    }
+
     fn outbound_transparent_proxy_config() -> EnforcementInterceptionConfig {
         EnforcementInterceptionConfig {
             strategy: TransparentInterceptionStrategyConfig::OutboundTransparentProxy,
@@ -396,6 +549,19 @@ mod tests {
             flow_classifier: CapabilityState::unavailable(
                 CapabilityKind::TransparentFlowClassifier,
                 "not built",
+            ),
+        }
+    }
+
+    fn degraded_flow_classifier() -> TransparentInterceptionClassificationPlan {
+        TransparentInterceptionClassificationPlan {
+            process_classifier: CapabilityState::unavailable(
+                CapabilityKind::TransparentProcessClassifier,
+                "not built",
+            ),
+            flow_classifier: CapabilityState::degraded(
+                CapabilityKind::TransparentFlowClassifier,
+                "procfs flow classification",
             ),
         }
     }

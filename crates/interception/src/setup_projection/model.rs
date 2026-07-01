@@ -38,32 +38,7 @@ pub enum TransparentInterceptionProcessScopeExpression {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentInterceptionFlowClassifierScope {
-    selector: TransparentInterceptionClassifierSelector,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransparentInterceptionClassifierSelector {
-    Match {
-        term: Box<TransparentInterceptionClassifierTerm>,
-    },
-    All {
-        selectors: Vec<Self>,
-    },
-    Any {
-        selectors: Vec<Self>,
-    },
-    Not {
-        selector: Box<Self>,
-    },
-    Ref {
-        name: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransparentInterceptionClassifierTerm {
-    pub process: ProcessSelector,
-    pub traffic: TrafficSelector,
+    selector: Selector,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,35 +352,16 @@ impl TransparentInterceptionProcessScopeExpression {
 impl TransparentInterceptionFlowClassifierScope {
     pub(crate) fn from_selector(selector: &Selector) -> Self {
         Self {
-            selector: TransparentInterceptionClassifierSelector::from_selector(selector),
+            selector: selector.clone(),
         }
     }
 
-    pub fn selector(&self) -> &TransparentInterceptionClassifierSelector {
+    pub fn selector(&self) -> &Selector {
         &self.selector
     }
-}
 
-impl TransparentInterceptionClassifierSelector {
-    fn from_selector(selector: &Selector) -> Self {
-        match selector {
-            Selector::Match { term } => Self::Match {
-                term: Box::new(TransparentInterceptionClassifierTerm {
-                    process: term.process.clone(),
-                    traffic: term.traffic.clone(),
-                }),
-            },
-            Selector::All { selectors } => Self::All {
-                selectors: selectors.iter().map(Self::from_selector).collect(),
-            },
-            Selector::Any { selectors } => Self::Any {
-                selectors: selectors.iter().map(Self::from_selector).collect(),
-            },
-            Selector::Not { selector } => Self::Not {
-                selector: Box::new(Self::from_selector(selector)),
-            },
-            Selector::Ref { name } => Self::Ref { name: name.clone() },
-        }
+    pub fn into_selector(self) -> Selector {
+        self.selector
     }
 }
 
