@@ -355,6 +355,7 @@ pub(super) fn build_admin_status_snapshot(
                 .export_worker
                 .as_ref()
                 .map(ExportWorkerRuntimeState::snapshot),
+            policy: Some(runtime_state.policy_set.runtime_snapshot()),
             pipeline: runtime_state
                 .pipeline
                 .as_ref()

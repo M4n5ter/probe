@@ -255,6 +255,7 @@ headers = { x_probe_node = "edge-a" }
 [[policies]]
 id = "http-guard"
 enabled = true
+runtime_error_disable_threshold = 3
 
 [policies.source]
 kind = "local_directory"
@@ -290,6 +291,13 @@ How Lua policy should be written:
 - The sandbox keeps policy code bounded. `table`, `string`, `math`, and `bit`
   are available; host APIs such as `io`, `os`, `require`, `debug`, `ffi`, and
   `loadfile` are unavailable.
+- `runtime_error_disable_threshold` is per policy. A Lua runtime error advances
+  the consecutive error counter after its `policy_runtime_error` audit event is
+  written to the export queue. A successful hook execution resets the counter;
+  selector misses do not affect it. When the threshold is reached, the agent
+  disables only that policy and online admin status reports the disabled policy
+  and reason. Set the threshold to `0` to keep auditing errors without automatic
+  disablement.
 
 Lua source:
 
@@ -585,6 +593,7 @@ schema and example are in [docs/lua-policy.md](docs/lua-policy.md):
 [[policies]]
 id = "http-alert"
 enabled = true
+runtime_error_disable_threshold = 3
 
 [policies.source]
 kind = "remote_bundle"

@@ -231,6 +231,7 @@ headers = { x_probe_node = "edge-a" }
 [[policies]]
 id = "http-guard"
 enabled = true
+runtime_error_disable_threshold = 3
 
 [policies.source]
 kind = "local_directory"
@@ -265,6 +266,10 @@ Lua policy 写法：
   backend 和 policy 都允许时，它才会变成 destructive action。
 - sandbox 会限制 policy 代码边界。可用标准库是 `table`、`string`、`math` 和 `bit`；
   `io`、`os`、`require`、`debug`、`ffi`、`loadfile` 等 host API 不可用。
+- `runtime_error_disable_threshold` 是单个 policy 的阈值。Lua runtime error
+  的 `policy_runtime_error` audit event 写入 export queue 后，连续错误计数才会推进。
+  hook 成功执行会清零计数，selector miss 不改变计数。达到阈值后，agent 只禁用该
+  policy，在线 admin status 会报告被禁用的 policy 和原因。设置为 `0` 可持续审计错误但不自动禁用。
 
 Lua source：
 
@@ -551,6 +556,7 @@ file sink 会创建私有 `0600` 文件，并拒绝不安全的父目录。
 [[policies]]
 id = "http-alert"
 enabled = true
+runtime_error_disable_threshold = 3
 
 [policies.source]
 kind = "remote_bundle"

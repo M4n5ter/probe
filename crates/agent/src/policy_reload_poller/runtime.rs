@@ -269,6 +269,7 @@ mod tests {
                 },
                 enabled: true,
                 selector: None,
+                ..PolicyConfig::default()
             }],
             policy_reload: PolicyReloadConfig {
                 poll_remote_bundles: true,

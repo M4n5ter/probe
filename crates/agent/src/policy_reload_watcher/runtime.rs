@@ -299,6 +299,7 @@ mod tests {
                     },
                     enabled: true,
                     selector: None,
+                    ..PolicyConfig::default()
                 },
                 PolicyConfig {
                     id: "local-disabled".to_string(),
@@ -307,6 +308,7 @@ mod tests {
                     },
                     enabled: false,
                     selector: None,
+                    ..PolicyConfig::default()
                 },
                 PolicyConfig {
                     id: "remote".to_string(),
@@ -316,6 +318,7 @@ mod tests {
                     },
                     enabled: true,
                     selector: None,
+                    ..PolicyConfig::default()
                 },
                 PolicyConfig {
                     id: "local-a-copy".to_string(),
@@ -324,6 +327,7 @@ mod tests {
                     },
                     enabled: true,
                     selector: None,
+                    ..PolicyConfig::default()
                 },
             ],
             ..AgentConfig::default()
@@ -378,6 +382,7 @@ mod tests {
             },
             enabled: true,
             selector: None,
+            ..PolicyConfig::default()
         });
         let plan = Arc::new(runtime_plan_from_config(config.clone())?);
         let policy_set = load_configured_pipeline_policies_with_context(
@@ -428,6 +433,7 @@ mod tests {
             },
             enabled: true,
             selector: None,
+            ..PolicyConfig::default()
         });
         let plan = Arc::new(runtime_plan_from_config(config.clone())?);
         let policy_set = load_configured_pipeline_policies_with_context(
@@ -474,6 +480,7 @@ mod tests {
             },
             enabled: true,
             selector: None,
+            ..PolicyConfig::default()
         });
         let plan = Arc::new(runtime_plan_from_config(config)?);
 

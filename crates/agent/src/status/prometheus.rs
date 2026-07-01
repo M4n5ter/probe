@@ -749,6 +749,12 @@ fn write_pipeline(output: &mut String, snapshot: &AgentStatusSnapshot) {
         &[("kind", "error")],
         metrics.policy.errors,
     );
+    write_sample(
+        output,
+        "traffic_probe_pipeline_policy_events_total",
+        &[("kind", "disabled")],
+        metrics.policy.disabled,
+    );
 
     write_family(
         output,
@@ -1620,7 +1626,14 @@ mod tests {
                         events: 2,
                         lost_events: 17,
                     },
-                    policy: PolicyRuntimeMetricsSnapshot::default(),
+                    policy: PolicyRuntimeMetricsSnapshot {
+                        evaluations: 4,
+                        selector_misses: 1,
+                        alerts: 1,
+                        verdicts: 1,
+                        errors: 3,
+                        disabled: 1,
+                    },
                     enforcement: EnforcementRuntimeMetricsSnapshot::default(),
                 }),
                 ..RuntimeStatusInput::default()
@@ -1654,6 +1667,9 @@ mod tests {
         );
         assert!(
             metrics.contains("traffic_probe_pipeline_event_envelopes_total{class=\"gap\"} 1\n")
+        );
+        assert!(
+            metrics.contains("traffic_probe_pipeline_policy_events_total{kind=\"disabled\"} 1\n")
         );
         Ok(())
     }

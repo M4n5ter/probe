@@ -28,6 +28,39 @@ max_body_bytes = 33554432
 }
 
 #[test]
+fn policy_runtime_error_disable_threshold_defaults_and_parses()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[[policies]]
+id = "default-threshold"
+enabled = true
+
+[policies.source]
+kind = "local_directory"
+path = "/tmp/default.bundle"
+
+[[policies]]
+id = "disabled-threshold"
+enabled = true
+runtime_error_disable_threshold = 0
+
+[policies.source]
+kind = "local_directory"
+path = "/tmp/disabled.bundle"
+"#,
+    )?;
+
+    assert_eq!(
+        config.policies[0].runtime_error_disable_threshold,
+        DEFAULT_POLICY_RUNTIME_ERROR_DISABLE_THRESHOLD
+    );
+    assert_eq!(config.policies[1].runtime_error_disable_threshold, 0);
+    config.validate_basic()?;
+    Ok(())
+}
+
+#[test]
 fn validation_rejects_duplicate_policy_ids() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig::from_toml_str(
         r#"

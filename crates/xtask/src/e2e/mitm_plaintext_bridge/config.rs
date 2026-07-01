@@ -89,6 +89,7 @@ pub(super) fn write_agent_config(
         },
         enabled: true,
         selector: None,
+        ..PolicyConfig::default()
     });
     config.enforcement.mode = EnforcementMode::Enforce;
     if let Some(path) = inputs.enforcement_manifest_path {

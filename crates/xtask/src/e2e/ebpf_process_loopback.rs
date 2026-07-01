@@ -234,6 +234,7 @@ fn write_agent_config(
         },
         enabled: true,
         selector: None,
+        ..PolicyConfig::default()
     });
     fs::write(path, toml::to_string(&config)?)?;
     Ok(())

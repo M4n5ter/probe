@@ -1,5 +1,6 @@
 use std::{fmt, path::PathBuf};
 
+pub use probe_core::DEFAULT_POLICY_RUNTIME_ERROR_DISABLE_THRESHOLD;
 use probe_core::Selector;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -11,7 +12,6 @@ pub const MAX_POLICY_RELOAD_WATCH_DEBOUNCE_MS: u64 = 60_000;
 pub const DEFAULT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS: u64 = 60_000;
 pub const MIN_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS: u64 = 50;
 pub const MAX_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS: u64 = 3_600_000;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct RemotePolicyBundleBodyLimitBytes(u64);
@@ -110,6 +110,7 @@ pub struct PolicyConfig {
     pub source: PolicySourceConfig,
     pub enabled: bool,
     pub selector: Option<Selector>,
+    pub runtime_error_disable_threshold: u64,
 }
 
 impl Default for PolicyConfig {
@@ -119,6 +120,7 @@ impl Default for PolicyConfig {
             source: PolicySourceConfig::default(),
             enabled: true,
             selector: None,
+            runtime_error_disable_threshold: DEFAULT_POLICY_RUNTIME_ERROR_DISABLE_THRESHOLD,
         }
     }
 }

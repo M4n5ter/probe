@@ -48,6 +48,7 @@ pub struct ConfiguredPolicySource {
     pub id: String,
     pub source: super::source::PolicySourceSnapshot,
     pub selector_configured: bool,
+    pub runtime_error_disable_threshold: u64,
 }
 
 pub struct LoadedConfiguredPolicy {
@@ -59,7 +60,11 @@ pub struct LoadedConfiguredPolicy {
 
 impl LoadedConfiguredPolicy {
     pub fn into_pipeline_policy(self) -> PipelinePolicy {
-        PipelinePolicy::new(self.runtime, self.selector)
+        PipelinePolicy::with_runtime_error_disable_threshold(
+            self.runtime,
+            self.selector,
+            self.source.runtime_error_disable_threshold,
+        )
     }
 }
 
@@ -176,6 +181,7 @@ async fn read_configured_policy(
             id: policy.id.clone(),
             source: source.source,
             selector_configured: policy.selector.is_some(),
+            runtime_error_disable_threshold: policy.runtime_error_disable_threshold,
         },
         content,
         selector,
@@ -187,6 +193,7 @@ fn configured_policy_source(policy: &PolicyConfig) -> ConfiguredPolicySource {
         id: policy.id.clone(),
         source: super::source::PolicySourceSnapshot::from(&policy.source),
         selector_configured: policy.selector.is_some(),
+        runtime_error_disable_threshold: policy.runtime_error_disable_threshold,
     }
 }
 
@@ -612,6 +619,7 @@ end
             source: probe_config::PolicySourceConfig::LocalDirectory { path: second_path },
             enabled: true,
             selector: None,
+            ..PolicyConfig::default()
         });
 
         let loaded = load_configured_policies(&config).await?;
@@ -636,6 +644,7 @@ end
             source: probe_config::PolicySourceConfig::LocalDirectory { path: second_path },
             enabled: true,
             selector: None,
+            ..PolicyConfig::default()
         });
 
         let selection = configured_policy_selection(&config);
@@ -766,6 +775,7 @@ codec = "none"
             },
             enabled: true,
             selector: None,
+            ..PolicyConfig::default()
         });
         config
     }

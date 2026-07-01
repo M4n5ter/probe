@@ -5,7 +5,7 @@ use enforcement::{
     ScopedEnforcementPlanner,
 };
 use parsers::Http1ParserFactory;
-use pipeline::{CapturePipeline, PipelinePolicy, PipelineRuntimeMetrics};
+use pipeline::{CapturePipeline, PipelinePolicy, PipelinePolicySet, PipelineRuntimeMetrics};
 use policy::{PolicyHook, PolicyManifest, PolicyRuntime};
 use probe_core::{
     Action, EnforcementMode, EnforcementOutcome, EventEmission, EventKind, EventType,
@@ -567,20 +567,17 @@ end
     )?;
     let metrics = PipelineRuntimeMetrics::default();
     let mut parser_factory = Http1ParserFactory::default();
+    let policy_set = PipelinePolicySet::new(vec![
+        PipelinePolicy::unscoped(policy),
+        PipelinePolicy::unscoped(later),
+    ]);
     let mut provider = SequenceProvider::new(vec![captured_bytes(
         demo_flow_with_ports(50_000, 80, 33),
         b"GET /bad-metric HTTP/1.1\r\nHost: test\r\n\r\n",
     )]);
-    let mut pipeline = CapturePipeline::new(
-        &spool,
-        &mut parser_factory,
-        vec![
-            PipelinePolicy::unscoped(policy),
-            PipelinePolicy::unscoped(later),
-        ],
-        "test",
-    )
-    .with_runtime_metrics(metrics.clone());
+    let mut pipeline =
+        CapturePipeline::new(&spool, &mut parser_factory, policy_set.clone(), "test")
+            .with_runtime_metrics(metrics.clone());
 
     let error = pipeline
         .run_provider(&mut provider)
@@ -593,6 +590,157 @@ end
     let metrics = metrics.snapshot();
     assert_eq!(metrics.policy.evaluations, 1);
     assert_eq!(metrics.policy.errors, 0);
+    let policy_runtime = policy_set.runtime_snapshot();
+    assert_eq!(policy_runtime[0].runtime_errors.consecutive_errors, 0);
+    assert_eq!(policy_runtime[0].runtime_errors.disabled_reason, None);
+    Ok(())
+}
+
+#[test]
+fn policy_runtime_errors_disable_policy_after_consecutive_threshold()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let policy = PolicyRuntime::from_source(
+        PolicyManifest {
+            id: "flaky-policy".to_string(),
+            version: "one".to_string(),
+            hooks: vec![PolicyHook::HttpRequestHeaders],
+        },
+        r#"
+function on_http_request_headers(event)
+  if event.kind.target == "/ok" then
+    return probe.emit_alert("ok reset")
+  end
+  return "not a policy outcome"
+end
+"#,
+    )?;
+    let metrics = PipelineRuntimeMetrics::default();
+    let mut parser_factory = Http1ParserFactory::default();
+    let policy_set =
+        PipelinePolicySet::new(vec![PipelinePolicy::with_runtime_error_disable_threshold(
+            policy, None, 2,
+        )]);
+    let mut provider = SequenceProvider::new(vec![
+        captured_bytes(
+            demo_flow_with_ports(50_001, 80, 41),
+            b"GET /bad-1 HTTP/1.1\r\nHost: test\r\n\r\n",
+        ),
+        captured_bytes(
+            demo_flow_with_ports(50_002, 80, 42),
+            b"GET /ok HTTP/1.1\r\nHost: test\r\n\r\n",
+        ),
+        captured_bytes(
+            demo_flow_with_ports(50_003, 80, 43),
+            b"GET /bad-2 HTTP/1.1\r\nHost: test\r\n\r\n",
+        ),
+        captured_bytes(
+            demo_flow_with_ports(50_004, 80, 44),
+            b"GET /bad-3 HTTP/1.1\r\nHost: test\r\n\r\n",
+        ),
+        captured_bytes(
+            demo_flow_with_ports(50_005, 80, 45),
+            b"GET /bad-4 HTTP/1.1\r\nHost: test\r\n\r\n",
+        ),
+    ]);
+    let mut pipeline =
+        CapturePipeline::new(&spool, &mut parser_factory, policy_set.clone(), "test")
+            .with_runtime_metrics(metrics.clone());
+
+    pipeline.run_provider(&mut provider)?;
+
+    let envelopes = exported_envelopes(&spool)?;
+    let runtime_errors = envelopes
+        .iter()
+        .filter_map(|envelope| match envelope.kind() {
+            EventKind::PolicyRuntimeError(error) => Some(error),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(runtime_errors.len(), 3);
+    assert!(
+        !runtime_errors[0].reason.contains("policy disabled"),
+        "{}",
+        runtime_errors[0].reason
+    );
+    assert!(
+        runtime_errors[2]
+            .reason
+            .contains("policy disabled after 2 consecutive runtime errors"),
+        "{}",
+        runtime_errors[2].reason
+    );
+    assert!(envelopes.iter().any(|envelope| {
+        matches!(envelope.kind(), EventKind::PolicyAlert(alert) if alert.message == "ok reset")
+    }));
+    let metrics = metrics.snapshot();
+    assert_eq!(metrics.policy.evaluations, 4);
+    assert_eq!(metrics.policy.alerts, 1);
+    assert_eq!(metrics.policy.errors, 3);
+    assert_eq!(metrics.policy.disabled, 1);
+    let policy_runtime = policy_set.runtime_snapshot();
+    assert_eq!(policy_runtime.len(), 1);
+    assert_eq!(policy_runtime[0].policy_version, "flaky-policy@one");
+    assert_eq!(policy_runtime[0].runtime_errors.disable_threshold, 2);
+    assert_eq!(policy_runtime[0].runtime_errors.consecutive_errors, 2);
+    assert!(
+        policy_runtime[0]
+            .runtime_errors
+            .disabled_reason
+            .as_deref()
+            .is_some_and(
+                |reason| reason.contains("policy disabled after 2 consecutive runtime errors")
+            )
+    );
+    Ok(())
+}
+
+#[test]
+fn zero_policy_runtime_error_threshold_keeps_policy_active()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let policy = invalid_outcome_policy("always-invalid")?;
+    let metrics = PipelineRuntimeMetrics::default();
+    let mut parser_factory = Http1ParserFactory::default();
+    let policy_set =
+        PipelinePolicySet::new(vec![PipelinePolicy::with_runtime_error_disable_threshold(
+            policy, None, 0,
+        )]);
+    let mut provider = SequenceProvider::new(vec![
+        captured_bytes(
+            demo_flow_with_ports(50_011, 80, 51),
+            b"GET /bad-1 HTTP/1.1\r\nHost: test\r\n\r\n",
+        ),
+        captured_bytes(
+            demo_flow_with_ports(50_012, 80, 52),
+            b"GET /bad-2 HTTP/1.1\r\nHost: test\r\n\r\n",
+        ),
+        captured_bytes(
+            demo_flow_with_ports(50_013, 80, 53),
+            b"GET /bad-3 HTTP/1.1\r\nHost: test\r\n\r\n",
+        ),
+    ]);
+    let mut pipeline =
+        CapturePipeline::new(&spool, &mut parser_factory, policy_set.clone(), "test")
+            .with_runtime_metrics(metrics.clone());
+
+    pipeline.run_provider(&mut provider)?;
+
+    let runtime_error_count = exported_envelopes(&spool)?
+        .iter()
+        .filter(|envelope| matches!(envelope.kind(), EventKind::PolicyRuntimeError(_)))
+        .count();
+    assert_eq!(runtime_error_count, 3);
+    let metrics = metrics.snapshot();
+    assert_eq!(metrics.policy.evaluations, 3);
+    assert_eq!(metrics.policy.errors, 3);
+    assert_eq!(metrics.policy.disabled, 0);
+    let policy_runtime = policy_set.runtime_snapshot();
+    assert_eq!(policy_runtime[0].runtime_errors.disable_threshold, 0);
+    assert_eq!(policy_runtime[0].runtime_errors.consecutive_errors, 3);
+    assert_eq!(policy_runtime[0].runtime_errors.disabled_reason, None);
     Ok(())
 }
 
@@ -667,6 +815,21 @@ end
     assert_eq!(metrics.enforcement.decisions, 1);
     assert_eq!(metrics.enforcement.failed, 1);
     Ok(())
+}
+
+fn invalid_outcome_policy(id: &str) -> Result<PolicyRuntime, policy::PolicyError> {
+    PolicyRuntime::from_source(
+        PolicyManifest {
+            id: id.to_string(),
+            version: "one".to_string(),
+            hooks: vec![PolicyHook::HttpRequestHeaders],
+        },
+        r#"
+function on_http_request_headers(_)
+  return "not a policy outcome"
+end
+"#,
+    )
 }
 
 struct FailingBackend;

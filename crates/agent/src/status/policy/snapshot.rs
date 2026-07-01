@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+
 use crate::configured_policy::{
     ConfiguredPolicySource, PolicySourceSnapshot, configured_policy_selection,
     inspect_policy_source,
 };
+use pipeline::PipelinePolicyRuntimeSnapshot;
 use probe_core::RuntimeMode;
 use runtime::RuntimePlan;
 use serde::Serialize;
@@ -19,7 +22,9 @@ pub struct PolicyStatusSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum PolicyStatusMode {
     Inactive,
+    Available,
     MetadataOnly,
+    Degraded,
     Unavailable,
 }
 
@@ -28,8 +33,25 @@ pub struct PolicyBundleStatusSnapshot {
     pub id: String,
     pub source: PolicySourceSnapshot,
     pub selector_configured: bool,
+    pub runtime_error_disable_threshold: u64,
     pub policy_version: Option<String>,
+    pub runtime: Option<PolicyBundleRuntimeStatusSnapshot>,
     pub inspection: PolicySourceStatusSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyBundleRuntimeStatusSnapshot {
+    pub policy_version: String,
+    pub selector_configured: bool,
+    pub runtime_errors: PolicyRuntimeErrorStatusSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyRuntimeErrorStatusSnapshot {
+    pub disable_threshold: u64,
+    pub consecutive_errors: u64,
+    pub disabled: bool,
+    pub disabled_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -45,7 +67,15 @@ pub enum PolicySourceCheck {
     MetadataOnly,
 }
 
-pub(in crate::status) fn policy_status(plan: &RuntimePlan) -> PolicyStatusSnapshot {
+#[cfg(test)]
+fn policy_status(plan: &RuntimePlan) -> PolicyStatusSnapshot {
+    policy_status_with_runtime(plan, None)
+}
+
+pub(in crate::status) fn policy_status_with_runtime(
+    plan: &RuntimePlan,
+    runtime: Option<&[PipelinePolicyRuntimeSnapshot]>,
+) -> PolicyStatusSnapshot {
     let selection = configured_policy_selection(&plan.config);
     let enabled_count = selection.enabled.len() as u64;
     if selection.enabled.is_empty() {
@@ -58,12 +88,20 @@ pub(in crate::status) fn policy_status(plan: &RuntimePlan) -> PolicyStatusSnapsh
         };
     }
 
+    let runtime_by_id = runtime
+        .into_iter()
+        .flat_map(|snapshots| snapshots.iter())
+        .map(|snapshot| (snapshot.id.as_str(), snapshot))
+        .collect::<HashMap<_, _>>();
     let active = selection
         .enabled
         .into_iter()
         .map(|policy| {
             let source = policy_source_status(&policy.source, &policy.id);
-            policy_bundle_status(policy, source)
+            let runtime = runtime_by_id
+                .get(policy.id.as_str())
+                .map(|snapshot| policy_bundle_runtime_status(snapshot));
+            policy_bundle_status(policy, source, runtime)
         })
         .collect::<Vec<_>>();
     let unavailable_reasons = source_reasons(
@@ -76,16 +114,29 @@ pub(in crate::status) fn policy_status(plan: &RuntimePlan) -> PolicyStatusSnapsh
         RuntimeMode::Degraded,
         "policy source metadata is degraded",
     );
-    let (mode, reason) = if unavailable_reasons.is_empty() {
-        (
-            PolicyStatusMode::MetadataOnly,
-            Some(metadata_only_reason(degraded_reasons)),
+    let missing_runtime_reasons = if runtime.is_some() {
+        active
+            .iter()
+            .filter(|policy| policy.runtime.is_none())
+            .map(|policy| format!("{}: policy runtime snapshot is missing", policy.id))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let disabled_runtime_reasons = if runtime.is_some() {
+        active.iter().filter_map(disabled_runtime_reason).collect()
+    } else {
+        Vec::new()
+    };
+    let (mode, reason) = if runtime.is_some() {
+        runtime_policy_mode(
+            unavailable_reasons,
+            degraded_reasons,
+            missing_runtime_reasons,
+            disabled_runtime_reasons,
         )
     } else {
-        (
-            PolicyStatusMode::Unavailable,
-            Some(unavailable_reasons.join("; ")),
-        )
+        metadata_policy_mode(unavailable_reasons, degraded_reasons)
     };
 
     PolicyStatusSnapshot {
@@ -115,6 +166,59 @@ fn source_reasons(
         .collect()
 }
 
+fn disabled_runtime_reason(policy: &PolicyBundleStatusSnapshot) -> Option<String> {
+    let runtime = policy.runtime.as_ref()?;
+    if !runtime.runtime_errors.disabled {
+        return None;
+    }
+    let reason = runtime
+        .runtime_errors
+        .disabled_reason
+        .as_deref()
+        .unwrap_or("policy runtime is disabled");
+    Some(format!("{}: {reason}", policy.id))
+}
+
+fn metadata_policy_mode(
+    unavailable_reasons: Vec<String>,
+    degraded_reasons: Vec<String>,
+) -> (PolicyStatusMode, Option<String>) {
+    if unavailable_reasons.is_empty() {
+        (
+            PolicyStatusMode::MetadataOnly,
+            Some(metadata_only_reason(degraded_reasons)),
+        )
+    } else {
+        (
+            PolicyStatusMode::Unavailable,
+            Some(unavailable_reasons.join("; ")),
+        )
+    }
+}
+
+fn runtime_policy_mode(
+    unavailable_reasons: Vec<String>,
+    degraded_reasons: Vec<String>,
+    missing_runtime_reasons: Vec<String>,
+    disabled_runtime_reasons: Vec<String>,
+) -> (PolicyStatusMode, Option<String>) {
+    if !missing_runtime_reasons.is_empty() {
+        return (
+            PolicyStatusMode::Unavailable,
+            Some(missing_runtime_reasons.join("; ")),
+        );
+    }
+
+    let mut degraded = unavailable_reasons;
+    degraded.extend(degraded_reasons);
+    degraded.extend(disabled_runtime_reasons);
+    if degraded.is_empty() {
+        (PolicyStatusMode::Available, None)
+    } else {
+        (PolicyStatusMode::Degraded, Some(degraded.join("; ")))
+    }
+}
+
 fn metadata_only_reason(degraded_reasons: Vec<String>) -> String {
     let base = "policy source metadata is available, but offline status does not load or execute policy source";
     if degraded_reasons.is_empty() {
@@ -127,13 +231,31 @@ fn metadata_only_reason(degraded_reasons: Vec<String>) -> String {
 fn policy_bundle_status(
     policy: ConfiguredPolicySource,
     source: PolicySourceStatus,
+    runtime: Option<PolicyBundleRuntimeStatusSnapshot>,
 ) -> PolicyBundleStatusSnapshot {
     PolicyBundleStatusSnapshot {
         id: policy.id,
         source: policy.source,
         selector_configured: policy.selector_configured,
+        runtime_error_disable_threshold: policy.runtime_error_disable_threshold,
         policy_version: source.policy_version,
+        runtime,
         inspection: source.snapshot,
+    }
+}
+
+fn policy_bundle_runtime_status(
+    runtime: &PipelinePolicyRuntimeSnapshot,
+) -> PolicyBundleRuntimeStatusSnapshot {
+    PolicyBundleRuntimeStatusSnapshot {
+        policy_version: runtime.policy_version.clone(),
+        selector_configured: runtime.selector_configured,
+        runtime_errors: PolicyRuntimeErrorStatusSnapshot {
+            disable_threshold: runtime.runtime_errors.disable_threshold,
+            consecutive_errors: runtime.runtime_errors.consecutive_errors,
+            disabled: runtime.runtime_errors.disabled_reason.is_some(),
+            disabled_reason: runtime.runtime_errors.disabled_reason.clone(),
+        },
     }
 }
 
@@ -162,6 +284,7 @@ fn policy_source_status(source: &PolicySourceSnapshot, expected_id: &str) -> Pol
 mod tests {
     use std::fs;
 
+    use pipeline::{PipelinePolicyRuntimeErrorSnapshot, PipelinePolicyRuntimeSnapshot};
     use probe_config::{PolicyConfig, PolicySourceConfig};
     use probe_core::{RuntimeMode, Selector};
     use serde_json::json;
@@ -184,6 +307,7 @@ mod tests {
             source: local_source(policy_path.clone()),
             enabled: true,
             selector: Some(Selector::default()),
+            ..PolicyConfig::default()
         }];
         let plan = runtime_plan_from_config(config, Vec::new())?;
 
@@ -228,6 +352,7 @@ hooks = ["on_http_request_headers"]
             source: local_source(policy_path.clone()),
             enabled: true,
             selector: Some(Selector::default()),
+            ..PolicyConfig::default()
         }];
         let plan = runtime_plan_from_config(config, Vec::new())?;
 
@@ -241,6 +366,10 @@ hooks = ["on_http_request_headers"]
             PolicySourceSnapshot::LocalDirectory { path: policy_path }
         );
         assert!(active_bundle.selector_configured);
+        assert_eq!(
+            active_bundle.runtime_error_disable_threshold,
+            probe_config::DEFAULT_POLICY_RUNTIME_ERROR_DISABLE_THRESHOLD
+        );
         assert_eq!(
             active_bundle.policy_version.as_deref(),
             Some("guard@bundle-test")
@@ -261,6 +390,62 @@ hooks = ["on_http_request_headers"]
     }
 
     #[test]
+    fn policy_status_merges_runtime_error_state() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-policy-runtime")?;
+        let policy_path = temp.join("guard.bundle");
+        write_policy_bundle(&policy_path, "guard")?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.policies = vec![PolicyConfig {
+            id: "guard".to_string(),
+            source: local_source(policy_path),
+            enabled: true,
+            selector: Some(Selector::default()),
+            ..PolicyConfig::default()
+        }];
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+        let runtime = [PipelinePolicyRuntimeSnapshot {
+            id: "guard".to_string(),
+            version: "live".to_string(),
+            policy_version: "guard@live".to_string(),
+            selector_configured: true,
+            runtime_errors: PipelinePolicyRuntimeErrorSnapshot {
+                disable_threshold: 2,
+                consecutive_errors: 2,
+                disabled_reason: Some(
+                    "invalid outcome; policy disabled after 2 consecutive runtime errors"
+                        .to_string(),
+                ),
+            },
+        }];
+
+        let status = policy_status_with_runtime(&plan, Some(&runtime));
+
+        assert_eq!(status.mode, PolicyStatusMode::Degraded);
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("policy disabled after 2 consecutive"))
+        );
+        let active_bundle = status.active.first().expect("active bundle");
+        let runtime = active_bundle.runtime.as_ref().expect("runtime status");
+        assert_eq!(runtime.policy_version, "guard@live");
+        assert!(runtime.selector_configured);
+        assert_eq!(runtime.runtime_errors.disable_threshold, 2);
+        assert_eq!(runtime.runtime_errors.consecutive_errors, 2);
+        assert!(runtime.runtime_errors.disabled);
+        assert!(
+            runtime
+                .runtime_errors
+                .disabled_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("policy disabled after 2 consecutive"))
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
     fn policy_status_reports_multiple_metadata_only_bundles()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("status-multiple-policy-bundles")?;
@@ -275,12 +460,14 @@ hooks = ["on_http_request_headers"]
                 source: local_source(first_path.clone()),
                 enabled: true,
                 selector: Some(Selector::default()),
+                ..PolicyConfig::default()
             },
             PolicyConfig {
                 id: "second".to_string(),
                 source: local_source(second_path.clone()),
                 enabled: true,
                 selector: None,
+                ..PolicyConfig::default()
             },
         ];
         let plan = runtime_plan_from_config(config, Vec::new())?;
@@ -332,6 +519,7 @@ hooks = ["on_http_request_headers"]
             source: local_source(missing_policy),
             enabled: true,
             selector: None,
+            ..PolicyConfig::default()
         }];
         let plan = runtime_plan_from_config(config, Vec::new())?;
 
@@ -370,6 +558,7 @@ hooks = ["on_http_request_headers"]
             source: local_source(policy_path),
             enabled: true,
             selector: None,
+            ..PolicyConfig::default()
         }];
         let plan = runtime_plan_from_config(config, Vec::new())?;
 
@@ -399,6 +588,7 @@ hooks = ["on_http_request_headers"]
             },
             enabled: true,
             selector: None,
+            ..PolicyConfig::default()
         }];
         let plan = runtime_plan_from_config(config, Vec::new())?;
 

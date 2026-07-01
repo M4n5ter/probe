@@ -88,6 +88,7 @@ pub struct LoadedPolicySnapshot {
     pub version: String,
     pub source: PolicySourceSnapshot,
     pub selector_configured: bool,
+    pub runtime_error_disable_threshold: u64,
     pub registered_hooks: Vec<PolicyHook>,
 }
 
@@ -157,6 +158,7 @@ fn loaded_policy_snapshot(policy: &LoadedConfiguredPolicy) -> LoadedPolicySnapsh
         version: manifest.version.clone(),
         source: policy.source.source.clone(),
         selector_configured: policy.source.selector_configured,
+        runtime_error_disable_threshold: policy.source.runtime_error_disable_threshold,
         registered_hooks: manifest.hooks.clone(),
     }
 }
@@ -299,6 +301,7 @@ mod tests {
             },
             enabled: true,
             selector: Some(Selector::default()),
+            ..probe_config::PolicyConfig::default()
         });
         let plan = runtime_plan(config)?;
 
@@ -550,6 +553,10 @@ protective_actions = ["alert"]
         assert_eq!(
             value["policy"]["active"][0]["selector_configured"],
             json!(false)
+        );
+        assert_eq!(
+            value["policy"]["active"][0]["runtime_error_disable_threshold"],
+            json!(probe_config::DEFAULT_POLICY_RUNTIME_ERROR_DISABLE_THRESHOLD)
         );
         assert!(value["policy"]["active"][0].get("hooks").is_none());
         assert!(

@@ -115,9 +115,12 @@ fn exporter_reason(exporter: &ExporterStatusSnapshot) -> String {
 
 fn policy_health_contribution(policy: &PolicyStatusSnapshot) -> HealthContribution {
     match policy.mode {
-        PolicyStatusMode::Inactive => HealthContribution::available(),
+        PolicyStatusMode::Inactive | PolicyStatusMode::Available => HealthContribution::available(),
         PolicyStatusMode::MetadataOnly => {
             HealthContribution::degraded(policy_reason(policy, "policy status is metadata-only"))
+        }
+        PolicyStatusMode::Degraded => {
+            HealthContribution::degraded(policy_reason(policy, "policy status is degraded"))
         }
         PolicyStatusMode::Unavailable => {
             HealthContribution::unavailable(policy_reason(policy, "policy is unavailable"))

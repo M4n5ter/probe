@@ -32,6 +32,7 @@ struct PipelineRuntimeMetricsInner {
     policy_alerts: AtomicCounter,
     policy_verdicts: AtomicCounter,
     policy_errors: AtomicCounter,
+    policy_disabled: AtomicCounter,
     enforcement_disabled: AtomicCounter,
     enforcement_audit_only: AtomicCounter,
     enforcement_dry_run: AtomicCounter,
@@ -85,6 +86,7 @@ pub struct PolicyRuntimeMetricsSnapshot {
     pub alerts: u64,
     pub verdicts: u64,
     pub errors: u64,
+    pub disabled: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -127,6 +129,7 @@ impl PipelineRuntimeMetrics {
                 alerts: self.inner.policy_alerts.load(),
                 verdicts: self.inner.policy_verdicts.load(),
                 errors: self.inner.policy_errors.load(),
+                disabled: self.inner.policy_disabled.load(),
             },
             enforcement,
         }
@@ -239,6 +242,10 @@ impl PipelineRuntimeMetrics {
 
     pub(crate) fn record_policy_error(&self) {
         self.inner.policy_errors.increment();
+    }
+
+    pub(crate) fn record_policy_disabled(&self) {
+        self.inner.policy_disabled.increment();
     }
 
     pub(crate) fn record_enforcement_decision(&self, outcome: EnforcementOutcome) {

@@ -1322,8 +1322,8 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 
 - `PipelineRuntimeMetrics` 是 pipeline 运行态计数的 owner。
 - pipeline metrics 覆盖 provider poll outcome、capture read、ingress journal/recovery/processed、export event writes、已持久化
-  event envelope 分类、policy evaluation/selector miss、persisted policy alert/verdict/error 和 persisted enforcement decision
-  outcome counters。
+  event envelope 分类、policy evaluation/selector miss、persisted policy alert/verdict/error、policy disabled skip 和 persisted
+  enforcement decision outcome counters。
 - `metrics.pipeline.capture_polls.total` 是 `events + progress + idle + finished` 的饱和求和。
 - `metrics.pipeline.capture_polls.events` 统计 `CapturePoll::Event`。
 - `metrics.pipeline.capture_polls.progress` 统计 provider 主动报告进展但尚未产出 capture event 的 poll。
@@ -1339,6 +1339,12 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 - policy runtime error 会作为 `policy_runtime_error` audit event 写入 export queue。
 - policy runtime error 带 `policy_version` 和 typed `event_type`。
 - policy runtime error 不阻止同一原始事件上的其它 policy 继续运行。
+- 单个 policy 的 Lua runtime error audit event 成功写入 export queue 后，会推进该 policy 的连续错误计数。
+- 单个 policy 连续错误计数达到 `runtime_error_disable_threshold` 后会被该 `PipelinePolicy` 禁用；禁用只影响该 policy，
+  不影响其它 active policy。成功执行会清空该 policy 的连续错误计数；selector miss 不改变计数。
+- 触发禁用的 `policy_runtime_error` reason 会包含阈值信息；后续命中该 policy 的事件不会执行 Lua，并通过
+  `metrics.pipeline.policy.disabled` 与 Prometheus `traffic_probe_pipeline_policy_events_total{kind="disabled"}` 计数。
+- 在线 admin status 会在对应 active policy 的 runtime 状态中报告 policy version、阈值、连续错误计数和 disabled reason。
 
 #### Process eBPF Link Ownership Metrics
 
@@ -1466,9 +1472,11 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 - manifest id 必须与配置中的 policy id 一致。
 - 多个 enabled bundle 会按配置顺序进入同一 pipeline。
 - 每个 bundle 应用自己的 selector。
+- 每个 bundle 有独立的 `runtime_error_disable_threshold`；默认 `3`，`0` 表示只审计 runtime error 而不自动禁用。
 - 每个 bundle 产出带 `policy_version` 的 alert/verdict/enforcement audit event。
 - `check` 和 `run` 会显式加载 source、校验 manifest、编译 Lua 并验证声明 hook。
-- `status` 只做 source metadata/manifest 可见性检查，不执行 Lua。
+- offline `status` 只做 source metadata/manifest 可见性检查，不执行 Lua，并报告配置的 runtime error disable threshold。
+- online admin status 会叠加运行中 policy runtime state，报告连续 runtime error 计数和 disabled reason。
 - remote policy bundle source 在 offline `status` 中不发网络请求，只报告 endpoint 和 body budget metadata。
 - `replay --policy` 仍可直接读取单个 Lua 文件作为本地调试入口。
 - `replay --policy` 不参与 configured policy source 抽象。
@@ -4242,7 +4250,7 @@ Spool status：
 
 Policy status：
 
-- policy status 当前只做 metadata-only source check。
+- offline policy status 只做 metadata-only source check。
 - 报告 configured/enabled count。
 - 报告 active policies 的 id/source/selector 是否配置。
 - 报告 metadata-derived `policy_version`。
@@ -4252,6 +4260,13 @@ Policy status：
 - 启用 policy 且 source metadata 可见时，offline status 标记 `policy.mode = metadata_only`。
 - metadata-only policy 会让 health degraded。
 - offline status 不宣称 policy runtime 已可用。
+- 在线 admin status 会合并运行中 policy set 的 runtime 状态，并在所有 enabled policy 都有 runtime snapshot 时标记
+  `policy.mode = available`。
+- 在线 policy runtime 可用但 source metadata/reload surface 不可用时，`policy.mode = degraded`；这不否认当前已加载
+  policy 正在运行。
+- 在线 policy runtime 已因连续 runtime error 阈值禁用任一 configured policy 时，`policy.mode = degraded`，health reason
+  包含被禁用的 policy 和 disabled reason。
+- 在线 admin status 的 runtime 状态用于定位被 runtime error 阈值禁用的具体 policy。
 - 原因是 `PolicyRuntime` 加载阶段会执行 Lua chunk。
 - offline status 不能变成隐式执行外部策略的入口。
 - 显式 `check` 会加载并编译所有 enabled policy。
@@ -4443,9 +4458,9 @@ metrics 必须覆盖：
 
 - capture events。
 - parser events。
-- policy execution count/error/latency；当前已覆盖 evaluation、selector miss，以及新持久化的 alert、verdict 和 runtime error audit
-  counters。
-- enforcement decision count 与 outcome counters；当前已覆盖新持久化的 disabled、audit_only、dry_run、selector_miss、unsupported、failed
+- policy execution count/error/latency；metrics 区分 evaluation、selector miss、disabled skip、persisted alert、persisted verdict 和
+  persisted runtime error audit counters。
+- enforcement decision count 与 outcome counters；metrics 区分 persisted disabled、audit_only、dry_run、selector_miss、unsupported、failed
   和 applied decision audit counters。
 - spool write/read/ack。
 - exporter retry/ack/failure。
@@ -4646,8 +4661,9 @@ policy 错误：
 
 - 限定到该 policy 或该事件处理。
 - agent 继续运行。
-- 输出 policy error metric 和 audit event。
-- 当前已实现单事件隔离、`policy_runtime_error` audit event 和 runtime error counter；按错误阈值自动禁用 policy 仍未实现。
+- 成功持久化的 Lua runtime error 输出 `policy_runtime_error` audit event 和 policy error metric。
+- 连续 runtime error 计数按单个 policy 隔离，并在对应 audit event 写入 export queue 后推进。
+- 达到阈值后只禁用触发阈值的 policy；其它 policy 和采集主线继续运行。
 
 exporter 错误：
 
@@ -5728,7 +5744,7 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 
 - pipeline 集成测试覆盖 capture read、ingress journal/process、export writes 与 summary 对齐。
 - pipeline 集成测试覆盖 provider poll outcome counters，并区分 event、progress、idle 和 finished。
-- policy selector miss 和 evaluation 表示实际执行。
+- policy selector miss、disabled skip 和 evaluation 表示实际执行面尝试。
 - policy alert/verdict/runtime error 表示对应 audit/export event 新写入。
 - enforcement decision outcome 表示对应 audit/export event 新写入。
 - 重复 recovery dedup 不会重复增加 persisted output counters。

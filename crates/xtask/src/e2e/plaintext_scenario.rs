@@ -85,6 +85,7 @@ impl PlaintextFeedCase {
             source: policy_source,
             enabled: true,
             selector: None,
+            ..PolicyConfig::default()
         });
         config
     }

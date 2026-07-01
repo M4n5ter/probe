@@ -16,15 +16,19 @@ use enforcement::{EnforcementPlanRequest, EnforcementPlanner};
 use parsers::{ParserInput, ProtocolParserFactory};
 use policy::{PolicyHook, PolicyOutcome, PolicyRuntime, hook_for_event};
 use probe_core::{
-    CompiledSelector, EnforcementDecision, EnforcementEvidence, EventEnvelope, EventKind,
-    EventProvenance, FlowIdentity, ObservationOnlyReason, PolicyEmissionStage, PolicyRuntimeError,
-    SpoolPayloadSchema, Timestamp, Verdict,
+    CompiledSelector, DEFAULT_POLICY_RUNTIME_ERROR_DISABLE_THRESHOLD, EnforcementDecision,
+    EnforcementEvidence, EventEnvelope, EventKind, EventProvenance, FlowIdentity,
+    ObservationOnlyReason, PolicyEmissionStage, PolicyRuntimeError, SpoolPayloadSchema, Timestamp,
+    Verdict,
 };
 use storage::{DurableSpool, IngressCursorOwner, SpoolPayload};
 use thiserror::Error;
 
 use crate::{
     export_event_writer::{ExportEventWriteError, ExportEventWriter},
+    policy_runtime::{
+        PersistedRuntimeErrorPlan, PipelinePolicyRuntimeSnapshot, PolicyRuntimeErrorState,
+    },
     runtime_metrics::PipelineRuntimeMetrics,
 };
 
@@ -194,13 +198,27 @@ fn enforcement_evidence_priority(evidence: &EnforcementEvidence) -> u8 {
 pub struct PipelinePolicy {
     runtime: Arc<Mutex<PolicyRuntime>>,
     selector: Option<Arc<CompiledSelector>>,
+    runtime_errors: Arc<Mutex<PolicyRuntimeErrorState>>,
 }
 
 impl PipelinePolicy {
     pub fn new(runtime: PolicyRuntime, selector: Option<CompiledSelector>) -> Self {
+        Self::with_runtime_error_disable_threshold(
+            runtime,
+            selector,
+            DEFAULT_POLICY_RUNTIME_ERROR_DISABLE_THRESHOLD,
+        )
+    }
+
+    pub fn with_runtime_error_disable_threshold(
+        runtime: PolicyRuntime,
+        selector: Option<CompiledSelector>,
+        disable_threshold: u64,
+    ) -> Self {
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
             selector: selector.map(Arc::new),
+            runtime_errors: Arc::new(Mutex::new(PolicyRuntimeErrorState::new(disable_threshold))),
         }
     }
 
@@ -212,6 +230,60 @@ impl PipelinePolicy {
         self.selector
             .as_ref()
             .is_none_or(|selector| selector.matches_event(envelope))
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.runtime_errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_disabled()
+    }
+
+    fn with_persisted_runtime_error<F>(
+        &self,
+        reason: &str,
+        persist: F,
+    ) -> Result<u64, PipelineError>
+    where
+        F: FnOnce(&PersistedRuntimeErrorPlan) -> Result<u64, PipelineError>,
+    {
+        let mut runtime_errors = self
+            .runtime_errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let plan = runtime_errors.planned_persisted_error(reason);
+        let written = persist(&plan)?;
+        if written > 0 {
+            runtime_errors.commit_persisted_error(plan);
+        }
+        Ok(written)
+    }
+
+    fn record_runtime_success(&self) {
+        self.runtime_errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_success();
+    }
+
+    pub fn runtime_snapshot(&self) -> PipelinePolicyRuntimeSnapshot {
+        let runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let manifest = runtime.manifest();
+        let runtime_errors = self
+            .runtime_errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot();
+        PipelinePolicyRuntimeSnapshot {
+            id: manifest.id.clone(),
+            version: manifest.version.clone(),
+            policy_version: format!("{}@{}", manifest.id, manifest.version),
+            selector_configured: self.selector.is_some(),
+            runtime_errors,
+        }
     }
 }
 
@@ -246,6 +318,13 @@ impl PipelinePolicySet {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    pub fn runtime_snapshot(&self) -> Vec<PipelinePolicyRuntimeSnapshot> {
+        self.snapshot()
+            .iter()
+            .map(PipelinePolicy::runtime_snapshot)
+            .collect()
     }
 }
 
@@ -581,7 +660,8 @@ where
             for (policy_index, policy) in active_policies.iter().enumerate() {
                 let evaluation =
                     evaluate_policy(policy, &envelope, hook, self.runtime_metrics.as_ref());
-                written += self.append_policy_evaluation(&envelope, policy_index, evaluation)?;
+                written +=
+                    self.append_policy_evaluation(&envelope, policy_index, policy, evaluation)?;
             }
         }
         Ok(written)
@@ -591,21 +671,25 @@ where
         &mut self,
         envelope: &EventEnvelope,
         policy_index: usize,
+        policy: &PipelinePolicy,
         evaluation: PolicyEvaluation,
     ) -> Result<u64, PipelineError> {
         let policy_index = policy_index as u64;
         match evaluation {
             PolicyEvaluation::SelectorMiss => Ok(0),
+            PolicyEvaluation::Disabled => Ok(0),
             PolicyEvaluation::RuntimeError {
                 policy_version,
                 reason,
             } => {
-                let written = self.append_policy_runtime_error(
-                    envelope,
-                    &policy_version,
-                    policy_index,
-                    reason,
-                )?;
+                let written = policy.with_persisted_runtime_error(&reason, |plan| {
+                    self.append_policy_runtime_error(
+                        envelope,
+                        &policy_version,
+                        policy_index,
+                        plan.event_reason.clone(),
+                    )
+                })?;
                 if written > 0
                     && let Some(metrics) = &self.runtime_metrics
                 {
@@ -750,6 +834,7 @@ where
 
 enum PolicyEvaluation {
     SelectorMiss,
+    Disabled,
     RuntimeError {
         policy_version: String,
         reason: String,
@@ -772,6 +857,12 @@ fn evaluate_policy(
         }
         return PolicyEvaluation::SelectorMiss;
     }
+    if policy.is_disabled() {
+        if let Some(metrics) = metrics {
+            metrics.record_policy_disabled();
+        }
+        return PolicyEvaluation::Disabled;
+    }
 
     let runtime = policy
         .runtime
@@ -783,14 +874,20 @@ fn evaluate_policy(
     }
 
     match runtime.handle_event(hook, envelope) {
-        Ok(outcomes) => PolicyEvaluation::Outcomes {
-            policy_version,
-            outcomes,
-        },
-        Err(source) => PolicyEvaluation::RuntimeError {
-            policy_version,
-            reason: source.to_string(),
-        },
+        Ok(outcomes) => {
+            policy.record_runtime_success();
+            PolicyEvaluation::Outcomes {
+                policy_version,
+                outcomes,
+            }
+        }
+        Err(source) => {
+            let reason = source.to_string();
+            PolicyEvaluation::RuntimeError {
+                policy_version,
+                reason,
+            }
+        }
     }
 }
 

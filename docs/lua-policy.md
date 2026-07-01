@@ -299,6 +299,7 @@ Reference a local bundle from the agent config:
 [[policies]]
 id = "http-guard"
 enabled = true
+runtime_error_disable_threshold = 3
 
 [policies.source]
 kind = "local_directory"
@@ -311,6 +312,7 @@ Reference a remote bundle:
 [[policies]]
 id = "http-guard"
 enabled = true
+runtime_error_disable_threshold = 3
 
 [policies.source]
 kind = "remote_bundle"
@@ -325,6 +327,13 @@ The endpoint response body is one TOML document. The `source` field carries the
 Lua source that would otherwise be stored in `main.lua`; the `[manifest]` table
 uses the same schema as a local `manifest.toml`. Unknown top-level or manifest
 fields are rejected.
+
+`runtime_error_disable_threshold` is evaluated per policy. A Lua runtime error
+advances the consecutive error counter after its `policy_runtime_error` audit
+event is written to the export queue. A successful hook execution resets the
+counter; selector misses do not affect it. Reaching the threshold disables only
+that policy, and online admin status reports the disabled policy and reason.
+Use `0` to keep exporting errors without automatic disablement.
 
 ```toml
 source = '''

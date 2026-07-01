@@ -92,6 +92,7 @@ pub(super) fn write_agent_config(
         },
         enabled: true,
         selector: None,
+        ..PolicyConfig::default()
     });
     config.enforcement.mode = EnforcementMode::Enforce;
     let selector = Selector::term(

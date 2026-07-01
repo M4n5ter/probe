@@ -290,6 +290,7 @@ end
 [[policies]]
 id = "http-guard"
 enabled = true
+runtime_error_disable_threshold = 3
 
 [policies.source]
 kind = "local_directory"
@@ -302,6 +303,7 @@ path = "/etc/probe/policies/http-guard"
 [[policies]]
 id = "http-guard"
 enabled = true
+runtime_error_disable_threshold = 3
 
 [policies.source]
 kind = "remote_bundle"
@@ -314,6 +316,11 @@ remote policy endpoint 必须使用 HTTPS；本地测试用 loopback HTTP 例外
 endpoint response body 是一个 TOML document。`source` 字段携带原本会放在
 `main.lua` 中的 Lua source；`[manifest]` 表使用与本地 `manifest.toml` 相同的 schema。
 未知的顶层字段或 manifest 字段会被拒绝。
+
+`runtime_error_disable_threshold` 按单个 policy 生效。Lua runtime error 的
+`policy_runtime_error` audit event 写入 export queue 后，连续错误计数才会推进。
+hook 成功执行会清零计数，selector miss 不改变计数。达到阈值后只禁用该 policy，
+在线 admin status 会报告被禁用的 policy 和原因。设置为 `0` 可持续导出错误但不自动禁用。
 
 ```toml
 source = '''

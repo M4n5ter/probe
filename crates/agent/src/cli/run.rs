@@ -535,6 +535,7 @@ protective_actions = ["alert"]
             },
             enabled: true,
             selector: None,
+            ..PolicyConfig::default()
         });
         fs::write(&config_path, toml::to_string(&config)?)?;
 
@@ -605,6 +606,7 @@ end
                 },
                 enabled: true,
                 selector: None,
+                ..PolicyConfig::default()
             },
             PolicyConfig {
                 id: "second".to_string(),
@@ -613,6 +615,7 @@ end
                 },
                 enabled: true,
                 selector: None,
+                ..PolicyConfig::default()
             },
         ];
         fs::write(&config_path, toml::to_string(&config)?)?;
@@ -668,6 +671,7 @@ protective_actions = ["deny"]
             },
             enabled: true,
             selector: None,
+            ..PolicyConfig::default()
         });
         fs::write(&config_path, toml::to_string(&config)?)?;
 
@@ -906,6 +910,7 @@ end
             source: probe_config::PolicySourceConfig::LocalDirectory { path: policy_path },
             enabled: true,
             selector: None,
+            ..PolicyConfig::default()
         });
         fs::write(&config_path, toml::to_string(&config)?)?;
 

@@ -739,6 +739,7 @@ fn write_agent_config(
         },
         enabled: true,
         selector: None,
+        ..PolicyConfig::default()
     });
     fs::write(&paths.config, toml::to_string(&config)?)?;
     Ok(())

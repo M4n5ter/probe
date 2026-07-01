@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pipeline::PipelineRuntimeMetricsSnapshot;
+use pipeline::{PipelinePolicyRuntimeSnapshot, PipelineRuntimeMetricsSnapshot};
 use probe_core::{CapabilityMatrix, RuntimeMode};
 use runtime::RuntimePlan;
 use serde::Serialize;
@@ -23,7 +23,7 @@ use super::{
     },
     health::health_snapshot,
     metrics::{MetricsSnapshot, MetricsSnapshotInput, metrics_snapshot},
-    policy::{PolicyStatusSnapshot, policy_status},
+    policy::{PolicyStatusSnapshot, policy_status_with_runtime},
     spool::{SpoolStatusInput, SpoolStatusSnapshot},
     tls::{TlsStatusSnapshot, tls_status},
 };
@@ -57,6 +57,7 @@ pub struct RuntimeStatusInput {
     pub capture_input: Option<crate::capture_provider::CaptureInputActivityRuntimeSnapshot>,
     pub enforcement: EnforcementRuntimeStatusInput,
     pub export_worker: Option<ExportWorkerRuntimeSnapshot>,
+    pub policy: Option<Vec<PipelinePolicyRuntimeSnapshot>>,
     pub pipeline: Option<PipelineRuntimeMetricsSnapshot>,
     pub tls_decrypt_hints: Option<TlsDecryptHintRuntimeSnapshot>,
     pub tls_plaintext: Option<TlsPlaintextRuntimeSnapshot>,
@@ -114,7 +115,7 @@ fn build_status_snapshot_at_with_runtime(
         export_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_export_sequence),
     };
     let capture = capture_status(plan, runtime.capture.clone(), runtime.capture_input.clone());
-    let policy = policy_status(plan);
+    let policy = policy_status_with_runtime(plan, runtime.policy.as_deref());
     let transparent_proxy = runtime.transparent_proxy.clone();
     let l7_mitm = runtime.l7_mitm.clone();
     let enforcement = match &runtime.enforcement {
@@ -206,10 +207,11 @@ mod tests {
     use super::super::plan_fixture::{
         config_with_storage_path, runtime_plan_from_config, test_dir,
     };
+    use super::super::policy::PolicyStatusMode;
     use super::*;
     use probe_config::{
         CaptureBackend, CaptureSelection, EnforcementPolicyManifest, EnforcementPolicySourceConfig,
-        TlsMaterialConfig, TlsMaterialKind,
+        PolicyConfig, PolicySourceConfig, TlsMaterialConfig, TlsMaterialKind,
     };
     use probe_core::{
         Action, CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector,
@@ -437,6 +439,7 @@ mod tests {
                     alerts: 1,
                     verdicts: 1,
                     errors: 0,
+                    disabled: 0,
                 },
                 enforcement: pipeline::EnforcementRuntimeMetricsSnapshot {
                     decisions: 1,
@@ -510,6 +513,110 @@ mod tests {
             value["exporters"][0]["runtime"]["mode"],
             json!("backing_off")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn online_policy_runtime_status_keeps_health_available()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-policy-runtime-health")?;
+        let policy_path = temp.join("guard.bundle");
+        fs::create_dir_all(&policy_path)?;
+        fs::write(
+            policy_path.join("manifest.toml"),
+            r#"
+id = "guard"
+version = "bundle-test"
+hooks = ["on_http_request_headers"]
+"#,
+        )?;
+        fs::write(
+            policy_path.join("main.lua"),
+            "function on_http_request_headers(_) return nil end",
+        )?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.policies = vec![PolicyConfig {
+            id: "guard".to_string(),
+            source: PolicySourceConfig::LocalDirectory { path: policy_path },
+            enabled: true,
+            selector: Some(Selector::default()),
+            ..PolicyConfig::default()
+        }];
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+        let spool = SpoolStatusInput::available(
+            temp.join("spool"),
+            SpoolSnapshot {
+                last_ingress_sequence: 0,
+                last_export_sequence: 0,
+            },
+            BTreeMap::new(),
+        );
+        let runtime = RuntimeStatusInput {
+            policy: Some(vec![pipeline::PipelinePolicyRuntimeSnapshot {
+                id: "guard".to_string(),
+                version: "bundle-test".to_string(),
+                policy_version: "guard@bundle-test".to_string(),
+                selector_configured: true,
+                runtime_errors: pipeline::PipelinePolicyRuntimeErrorSnapshot {
+                    disable_threshold: 3,
+                    consecutive_errors: 0,
+                    disabled_reason: None,
+                },
+            }]),
+            ..RuntimeStatusInput::default()
+        };
+
+        let snapshot = build_status_snapshot_at_with_runtime(&plan, spool, 42, runtime);
+
+        assert_eq!(snapshot.policy.mode, PolicyStatusMode::Available);
+        assert_eq!(snapshot.policy.reason, None);
+        assert_eq!(snapshot.health.mode, RuntimeMode::Available);
+        assert!(
+            snapshot
+                .health
+                .reasons
+                .iter()
+                .all(|reason| !reason.contains("metadata-only"))
+        );
+
+        let spool = SpoolStatusInput::available(
+            temp.join("spool"),
+            SpoolSnapshot {
+                last_ingress_sequence: 0,
+                last_export_sequence: 0,
+            },
+            BTreeMap::new(),
+        );
+        let runtime = RuntimeStatusInput {
+            policy: Some(vec![pipeline::PipelinePolicyRuntimeSnapshot {
+                id: "guard".to_string(),
+                version: "bundle-test".to_string(),
+                policy_version: "guard@bundle-test".to_string(),
+                selector_configured: true,
+                runtime_errors: pipeline::PipelinePolicyRuntimeErrorSnapshot {
+                    disable_threshold: 3,
+                    consecutive_errors: 3,
+                    disabled_reason: Some(
+                        "invalid outcome; policy disabled after 3 consecutive runtime errors"
+                            .to_string(),
+                    ),
+                },
+            }]),
+            ..RuntimeStatusInput::default()
+        };
+
+        let snapshot = build_status_snapshot_at_with_runtime(&plan, spool, 43, runtime);
+
+        assert_eq!(snapshot.policy.mode, PolicyStatusMode::Degraded);
+        assert_eq!(snapshot.health.mode, RuntimeMode::Degraded);
+        assert!(
+            snapshot
+                .health
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("policy disabled after 3 consecutive"))
+        );
+        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
