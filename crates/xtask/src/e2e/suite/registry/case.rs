@@ -34,6 +34,7 @@ use crate::e2e::{
         run_product_proxy_transparent_https_websocket as run_product_mitm_proxy_transparent_https_websocket,
     },
     plaintext_feed::run as run_plaintext_feed,
+    product_mitm_proxy_local::run as run_product_mitm_proxy_local,
     remote_enforcement_policy::run as run_remote_enforcement_policy,
     remote_policy_bundle::run as run_remote_policy_bundle,
     remote_policy_polling::run as run_remote_policy_polling,
@@ -239,6 +240,18 @@ pub(super) const E2E_CASES: &[E2eCase] = &[
             E2eCapability::AdminTail,
         ],
         run: E2eCaseRun::ExitCode(run_local_validation),
+    },
+    E2eCase {
+        name: "e2e-product-mitm-proxy-local",
+        requirement: E2eRequirement::User,
+        capabilities: &[
+            E2eCapability::CaptureEventFeed,
+            E2eCapability::HttpParsing,
+            E2eCapability::DurableSpoolExport,
+            E2eCapability::MitmPlaintextBridge,
+            E2eCapability::ProductMitmHttps,
+        ],
+        run: E2eCaseRun::ExitCode(run_product_mitm_proxy_local),
     },
     E2eCase {
         name: "e2e-websocket-plaintext-feed",

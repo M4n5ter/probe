@@ -20,6 +20,7 @@ mod plaintext_assertions;
 mod plaintext_export_batches;
 mod plaintext_feed;
 mod plaintext_scenario;
+mod product_mitm_proxy_local;
 mod remote_enforcement_policy;
 mod remote_policy_bundle;
 mod remote_policy_polling;

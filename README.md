@@ -1186,7 +1186,8 @@ E2E profiles are organized around capability claims:
 
 - `baseline` runs as a normal user and covers local validation, replay,
   plaintext feed, gap/loss events, HTTP/SSE/WebSocket, webhook/file/Unix HTTP
-  export, and one-shot plus polled remote policy inputs.
+  export, one-shot plus polled remote policy inputs, and first-party product
+  MITM proxy plaintext/TLS feed ingestion without transparent host rules.
 - `live-core` needs root or CAP_NET_RAW and covers libpcap loopback, single and
   composite admin reload, socket destroy, and TLS key log/session-secret
   material.
