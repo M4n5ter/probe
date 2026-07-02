@@ -136,6 +136,21 @@ impl Serialize for ExporterConfig {
                 state.serialize_field("worker", &self.worker)?;
                 state.end()
             }
+            ExporterTransportConfig::UnixHttp {
+                socket_path,
+                endpoint,
+                headers,
+            } => {
+                let mut state = serializer.serialize_struct("ExporterConfig", 7)?;
+                state.serialize_field("id", &self.id)?;
+                state.serialize_field("transport", &ExporterTransportKind::UnixHttp)?;
+                state.serialize_field("socket_path", socket_path)?;
+                state.serialize_field("endpoint", endpoint)?;
+                state.serialize_field("codec", &self.codec)?;
+                state.serialize_field("headers", headers)?;
+                state.serialize_field("worker", &self.worker)?;
+                state.end()
+            }
         }
     }
 }
@@ -151,6 +166,11 @@ impl<'de> Deserialize<'de> for ExporterConfig {
                 if wire.path.is_some() {
                     return Err(de::Error::custom(
                         "field `path` is only valid for file exporters",
+                    ));
+                }
+                if wire.socket_path.is_some() {
+                    return Err(de::Error::custom(
+                        "field `socket_path` is only valid for unix_http exporters",
                     ));
                 }
                 ExporterTransportConfig::Webhook {
@@ -175,8 +195,30 @@ impl<'de> Deserialize<'de> for ExporterConfig {
                         "field `tls` is only valid for webhook exporters",
                     ));
                 }
+                if wire.socket_path.is_some() {
+                    return Err(de::Error::custom(
+                        "field `socket_path` is only valid for unix_http exporters",
+                    ));
+                }
                 ExporterTransportConfig::File {
                     path: wire.path.unwrap_or_default(),
+                }
+            }
+            ExporterTransportKind::UnixHttp => {
+                if wire.path.is_some() {
+                    return Err(de::Error::custom(
+                        "field `path` is only valid for file exporters",
+                    ));
+                }
+                if wire.tls.is_some() {
+                    return Err(de::Error::custom(
+                        "field `tls` is only valid for webhook exporters",
+                    ));
+                }
+                ExporterTransportConfig::UnixHttp {
+                    socket_path: wire.socket_path.unwrap_or_default(),
+                    endpoint: wire.endpoint.unwrap_or_default(),
+                    headers: wire.headers.unwrap_or_default(),
                 }
             }
         };
@@ -199,6 +241,7 @@ struct ExporterWireConfig {
     headers: Option<BTreeMap<String, String>>,
     tls: Option<ExporterTlsConfig>,
     path: Option<PathBuf>,
+    socket_path: Option<PathBuf>,
     codec: CompressionCodecName,
     worker: ExporterWorkerConfig,
 }
@@ -212,6 +255,7 @@ impl Default for ExporterWireConfig {
             headers: None,
             tls: None,
             path: None,
+            socket_path: None,
             codec: CompressionCodecName::default(),
             worker: ExporterWorkerConfig::default(),
         }
@@ -224,6 +268,7 @@ enum ExporterTransportKind {
     #[default]
     Webhook,
     File,
+    UnixHttp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +280,11 @@ pub enum ExporterTransportConfig {
     },
     File {
         path: PathBuf,
+    },
+    UnixHttp {
+        socket_path: PathBuf,
+        endpoint: String,
+        headers: BTreeMap<String, String>,
     },
 }
 

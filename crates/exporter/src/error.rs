@@ -72,6 +72,23 @@ pub enum ExportError {
     Zstd(std::io::Error),
     #[error("http transport failed: {reason}")]
     HttpTransport { reason: String },
+    #[error("unix HTTP transport failed: {reason}")]
+    UnixHttpTransport { reason: String },
+    #[error("unix HTTP socket path cannot be empty")]
+    UnixHttpSocketPathEmpty,
+    #[error("unix HTTP socket path must be absolute: {path}")]
+    UnixHttpSocketPathRelative { path: PathBuf },
+    #[error("unix HTTP socket path is unavailable: {path}: {source}")]
+    UnixHttpSocketUnavailable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("unix HTTP socket path is a symlink: {path}")]
+    UnixHttpSocketSymlink { path: PathBuf },
+    #[error("unix HTTP socket path is not a socket: {path}")]
+    UnixHttpSocketNotSocket { path: PathBuf },
+    #[error("invalid unix HTTP endpoint {endpoint}: {reason}")]
+    InvalidUnixHttpEndpoint { endpoint: String, reason: String },
     #[error("invalid webhook TLS material: {reason}")]
     InvalidWebhookTlsMaterial { reason: String },
     #[error("invalid ack response body: {source}")]

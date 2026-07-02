@@ -36,8 +36,8 @@ checks.
   use key log/session-secret material, libssl uprobe plaintext
   instrumentation, explicit plaintext bridges, or scoped MITM.
 - Export events:
-  use webhook or file sinks with `none`, `zstd`, `gzip`, or `deflate`
-  compression.
+  use webhook, Unix HTTP sidecar, or file sinks with `none`, `zstd`, `gzip`,
+  or `deflate` compression.
 - Apply policy:
   use local or remote Lua policy bundles for typed events and verdicts.
 - Protect selected applications:
@@ -564,7 +564,15 @@ id = "primary-webhook"
 transport = "webhook"
 endpoint = "https://collector.example/probe/batches"
 codec = "zstd"
-headers = { x_probe_node = "probe-local" }
+headers = { "x-probe-node" = "probe-local" }
+
+[[exporters]]
+id = "local-sidecar"
+transport = "unix_http"
+socket_path = "/run/probe/collector.sock"
+endpoint = "/probe/batches"
+codec = "zstd"
+headers = { "x-probe-node" = "probe-local" }
 ```
 
 Each export batch is bounded by both record count and stored payload bytes:
@@ -574,7 +582,9 @@ is still sent alone so the sink cursor can keep moving.
 Supported codecs are `none`, `zstd`, `gzip`, and `deflate`; `zstd` is the
 default. Webhook sinks can reference trust anchors and client identities from
 `[[tls.materials]]`. File sinks create private `0600` files and reject unsafe
-parent directories.
+parent directories. Unix HTTP sinks send the same protobuf batch and ACK
+protocol over a local Unix domain socket, which is useful for a server-local
+collector sidecar without opening a TCP listener.
 
 #### Webhook Receiver Setup
 
@@ -1036,8 +1046,8 @@ and optional webhook path without live-capture privileges.
 E2E profiles are organized around capability claims:
 
 - `baseline` runs as a normal user and covers replay, plaintext feed,
-  gap/loss events, HTTP/SSE/WebSocket, webhook/file export, and one-shot plus
-  polled remote policy inputs.
+  gap/loss events, HTTP/SSE/WebSocket, webhook/file/Unix HTTP export, and
+  one-shot plus polled remote policy inputs.
 - `live-core` needs root or CAP_NET_RAW and covers libpcap loopback, single and
   composite admin reload, socket destroy, and TLS key log/session-secret
   material.

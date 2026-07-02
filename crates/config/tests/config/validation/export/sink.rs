@@ -166,3 +166,73 @@ path = ""
     );
     Ok(())
 }
+
+#[test]
+fn validation_rejects_invalid_unix_http_exporter_target() -> Result<(), Box<dyn std::error::Error>>
+{
+    let config = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "local-sidecar"
+transport = "unix_http"
+socket_path = "collector.sock"
+endpoint = "batches"
+"#,
+    )?;
+
+    let error = config
+        .validate_basic()
+        .expect_err("invalid unix_http exporter target must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("unix_http exporter socket_path must be absolute")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("unix_http endpoint must be an absolute path")
+    );
+    Ok(())
+}
+
+#[test]
+fn parsing_rejects_transport_specific_exporter_fields() -> Result<(), Box<dyn std::error::Error>> {
+    let file_with_endpoint = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "local-file"
+transport = "file"
+path = "/tmp/probe-export.jsonl"
+endpoint = "/batches"
+"#,
+    );
+    assert!(file_with_endpoint.is_err());
+
+    let unix_http_with_tls = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "local-sidecar"
+transport = "unix_http"
+socket_path = "/run/probe/collector.sock"
+endpoint = "/batches"
+
+[exporters.tls]
+trust_anchor_refs = ["collector-ca"]
+"#,
+    );
+    assert!(unix_http_with_tls.is_err());
+
+    let webhook_with_socket_path = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "webhook"
+transport = "webhook"
+endpoint = "https://collector.example/batches"
+socket_path = "/run/probe/collector.sock"
+"#,
+    );
+    assert!(webhook_with_socket_path.is_err());
+    Ok(())
+}

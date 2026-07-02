@@ -26,6 +26,6 @@ pub use plan::{
     TransparentInterceptionProjectedRemoteAddressScopePlan,
     TransparentInterceptionProjectedSocketCgroupScopePlan,
     TransparentInterceptionProxyHealthProbePlan, TransparentInterceptionProxyPlan,
-    TransparentInterceptionProxyPlanError, WebhookExportSinkPlan,
+    TransparentInterceptionProxyPlanError, UnixHttpExportSinkPlan, WebhookExportSinkPlan,
     default_l7_mitm_unavailable_reason, validate_static_runtime_config,
 };

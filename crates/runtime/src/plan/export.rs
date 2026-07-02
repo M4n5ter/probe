@@ -49,6 +49,21 @@ impl ExportPlan {
                         ),
                     })
                 }
+                ExporterTransportConfig::UnixHttp {
+                    socket_path,
+                    endpoint,
+                    headers,
+                } => ExportSinkPlan::UnixHttp(UnixHttpExportSinkPlan {
+                    id: exporter.id.clone(),
+                    socket_path: socket_path.clone(),
+                    endpoint: endpoint.clone(),
+                    codec: exporter.codec,
+                    headers: headers.clone(),
+                    worker: ExportSinkWorkerPlan::from_config(
+                        exporter.worker.batches_per_tick,
+                        default_sink_batches_per_tick,
+                    ),
+                }),
             })
             .collect::<Vec<_>>();
         let worker = match (config.export.worker.enabled, sinks.is_empty()) {
@@ -142,6 +157,7 @@ impl From<ExportFailureBackoffConfig> for ExportFailureBackoffPlan {
 pub enum ExportSinkPlan {
     Webhook(WebhookExportSinkPlan),
     File(FileExportSinkPlan),
+    UnixHttp(UnixHttpExportSinkPlan),
 }
 
 impl ExportSinkPlan {
@@ -149,6 +165,7 @@ impl ExportSinkPlan {
         match self {
             Self::Webhook(sink) => &sink.id,
             Self::File(sink) => &sink.id,
+            Self::UnixHttp(sink) => &sink.id,
         }
     }
 
@@ -156,6 +173,7 @@ impl ExportSinkPlan {
         match self {
             Self::Webhook(sink) => &sink.worker,
             Self::File(sink) => &sink.worker,
+            Self::UnixHttp(sink) => &sink.worker,
         }
     }
 }
@@ -169,6 +187,12 @@ impl From<WebhookExportSinkPlan> for ExportSinkPlan {
 impl From<FileExportSinkPlan> for ExportSinkPlan {
     fn from(value: FileExportSinkPlan) -> Self {
         Self::File(value)
+    }
+}
+
+impl From<UnixHttpExportSinkPlan> for ExportSinkPlan {
+    fn from(value: UnixHttpExportSinkPlan) -> Self {
+        Self::UnixHttp(value)
     }
 }
 
@@ -187,6 +211,16 @@ pub struct FileExportSinkPlan {
     pub id: String,
     pub path: PathBuf,
     pub codec: CompressionCodecName,
+    pub worker: ExportSinkWorkerPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnixHttpExportSinkPlan {
+    pub id: String,
+    pub socket_path: PathBuf,
+    pub endpoint: String,
+    pub codec: CompressionCodecName,
+    pub headers: BTreeMap<String, String>,
     pub worker: ExportSinkWorkerPlan,
 }
 
@@ -246,7 +280,7 @@ impl ExportSinkTlsPlan {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     use probe_config::{
         ExporterConfig, ExporterTransportConfig, ExporterWorkerConfig, TlsMaterialConfig,
@@ -394,6 +428,42 @@ mod tests {
                 worker: ExportSinkWorkerPlan {
                     batches_per_tick_override: Some(4),
                     effective_batches_per_tick: NonZeroU64::new(4).expect("positive batch quota"),
+                },
+            })]
+        );
+    }
+
+    #[test]
+    fn export_plan_builds_unix_http_sink() {
+        let config = AgentConfig {
+            exporters: vec![ExporterConfig {
+                id: "local-sidecar".to_string(),
+                transport: ExporterTransportConfig::UnixHttp {
+                    socket_path: PathBuf::from("/run/probe/collector.sock"),
+                    endpoint: "/probe/batches".to_string(),
+                    headers: BTreeMap::from([("x-probe-node".to_string(), "node-a".to_string())]),
+                },
+                codec: CompressionCodecName::Deflate,
+                worker: ExporterWorkerConfig {
+                    batches_per_tick: Some(5),
+                },
+            }],
+            ..AgentConfig::default()
+        };
+
+        let plan = ExportPlan::resolve(&config);
+
+        assert_eq!(
+            plan.sinks,
+            vec![ExportSinkPlan::UnixHttp(UnixHttpExportSinkPlan {
+                id: "local-sidecar".to_string(),
+                socket_path: PathBuf::from("/run/probe/collector.sock"),
+                endpoint: "/probe/batches".to_string(),
+                codec: CompressionCodecName::Deflate,
+                headers: BTreeMap::from([("x-probe-node".to_string(), "node-a".to_string())]),
+                worker: ExportSinkWorkerPlan {
+                    batches_per_tick_override: Some(5),
+                    effective_batches_per_tick: NonZeroU64::new(5).expect("positive batch quota"),
                 },
             })]
         );

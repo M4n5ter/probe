@@ -138,6 +138,11 @@ define_e2e_capabilities! {
         label: "file export",
         category: StorageExport,
     },
+    UnixHttpExport => {
+        id: "unix_http_export",
+        label: "Unix HTTP export",
+        category: StorageExport,
+    },
     LuaPolicyBundle => {
         id: "lua_policy_bundle",
         label: "Lua policy bundle",

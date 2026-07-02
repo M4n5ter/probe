@@ -36,6 +36,7 @@ mod tls_plaintext_status;
 mod transparent_linux_outbound_redirect_artifact;
 mod transparent_outbound_proxy_loopback;
 mod transparent_tproxy_loopback;
+mod unix_http_exporter;
 mod webhook_exporter;
 mod webhook_receiver;
 mod websocket_expectations;

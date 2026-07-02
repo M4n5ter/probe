@@ -43,6 +43,7 @@ pub struct ExporterStatusSnapshot {
 pub enum ExporterTargetStatusSnapshot {
     Webhook(WebhookExporterTargetStatusSnapshot),
     File(FileExporterTargetStatusSnapshot),
+    UnixHttp(UnixHttpExporterTargetStatusSnapshot),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -55,6 +56,13 @@ pub struct WebhookExporterTargetStatusSnapshot {
 pub struct FileExporterTargetStatusSnapshot {
     pub codec: CompressionCodecName,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnixHttpExporterTargetStatusSnapshot {
+    pub codec: CompressionCodecName,
+    pub socket_path: PathBuf,
+    pub endpoint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -225,6 +233,20 @@ fn exporter_target_status(
                 reason,
             }
         }
+        ExportSinkPlan::UnixHttp(sink) => {
+            let (mode, reason) = unix_http_exporter_target_mode(&sink.socket_path);
+            ExporterTargetStatus {
+                snapshot: ExporterTargetStatusSnapshot::UnixHttp(
+                    UnixHttpExporterTargetStatusSnapshot {
+                        codec: sink.codec,
+                        socket_path: sink.socket_path.clone(),
+                        endpoint: sink.endpoint.clone(),
+                    },
+                ),
+                mode,
+                reason,
+            }
+        }
     }
 }
 
@@ -234,6 +256,16 @@ fn file_exporter_target_mode(path: &PathBuf) -> (RuntimeMode, Option<String>) {
         Err(error) => (
             RuntimeMode::Unavailable,
             Some(format!("file exporter target is unavailable: {error}")),
+        ),
+    }
+}
+
+fn unix_http_exporter_target_mode(path: &PathBuf) -> (RuntimeMode, Option<String>) {
+    match exporter::UnixHttpExporter::preflight_socket_path(path) {
+        Ok(()) => (RuntimeMode::Available, None),
+        Err(error) => (
+            RuntimeMode::Unavailable,
+            Some(format!("unix_http exporter target is unavailable: {error}")),
         ),
     }
 }
@@ -289,7 +321,12 @@ fn exporter_tls_reason(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::PathBuf};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+        path::PathBuf,
+    };
 
     use probe_config::{CompressionCodecName, ExporterTransportConfig};
     use probe_core::RuntimeMode;
@@ -368,6 +405,73 @@ mod tests {
                 .expect("target status should serialize to an object")
                 .contains_key("tls")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn exporter_status_reports_unix_http_target() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-unix-http-exporter-target")?;
+        let socket_path = temp.join("collector.sock");
+        let _listener = UnixListener::bind(&socket_path)?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.exporters[0].transport = ExporterTransportConfig::UnixHttp {
+            socket_path: socket_path.clone(),
+            endpoint: "/probe/batches".to_string(),
+            headers: BTreeMap::new(),
+        };
+        config.exporters[0].codec = CompressionCodecName::Deflate;
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+        let spool = available_spool_status(0, 0);
+
+        let exporters = exporter_statuses_with_runtime(
+            &plan,
+            &spool,
+            &BTreeMap::from([("primary".to_string(), 0)]),
+            None,
+        );
+
+        assert_eq!(exporters[0].mode, RuntimeMode::Available);
+        let target = serde_json::to_value(&exporters[0].target)?;
+        assert_eq!(target["transport"], json!("unix_http"));
+        assert_eq!(target["codec"], json!("deflate"));
+        assert_eq!(
+            target["socket_path"],
+            json!(socket_path.display().to_string())
+        );
+        assert_eq!(target["endpoint"], json!("/probe/batches"));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exporter_status_marks_missing_unix_http_socket_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-missing-unix-http-exporter-target")?;
+        let socket_path = temp.join("collector.sock");
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.exporters[0].transport = ExporterTransportConfig::UnixHttp {
+            socket_path,
+            endpoint: "/probe/batches".to_string(),
+            headers: BTreeMap::new(),
+        };
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+        let spool = available_spool_status(0, 0);
+
+        let exporters = exporter_statuses_with_runtime(
+            &plan,
+            &spool,
+            &BTreeMap::from([("primary".to_string(), 0)]),
+            None,
+        );
+
+        assert_eq!(exporters[0].mode, RuntimeMode::Unavailable);
+        assert!(
+            exporters[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unix HTTP socket path is unavailable"))
+        );
+        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
@@ -674,7 +778,9 @@ mod tests {
     fn webhook_target(exporter: &ExporterStatusSnapshot) -> &WebhookExporterTargetStatusSnapshot {
         match &exporter.target {
             ExporterTargetStatusSnapshot::Webhook(target) => target,
-            ExporterTargetStatusSnapshot::File(_) => panic!("expected webhook target"),
+            ExporterTargetStatusSnapshot::File(_) | ExporterTargetStatusSnapshot::UnixHttp(_) => {
+                panic!("expected webhook target")
+            }
         }
     }
 

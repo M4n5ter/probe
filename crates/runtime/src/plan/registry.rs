@@ -170,6 +170,8 @@ fn default_platform_capabilities(
         ),
         CapabilityState::available(CapabilityKind::ExportQueue),
         CapabilityState::available(CapabilityKind::WebhookExporter),
+        CapabilityState::available(CapabilityKind::FileExporter),
+        CapabilityState::available(CapabilityKind::UnixHttpExporter),
         CapabilityState::available(CapabilityKind::DryRunEnforcement),
         connection_enforcement_capability,
         transparent_interception_capability,

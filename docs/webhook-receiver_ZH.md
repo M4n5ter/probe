@@ -1,14 +1,19 @@
-# Webhook Receiver 参考
+# Export Batch Receiver 参考
 
-Probe webhook exporter 会把 durable export batch 发送到 HTTP endpoint。传输语义是
-at-least-once：receiver 必须把 `batch_id` 或 `idempotency-key` 当作幂等键，并且只在 durable
-ingestion 完成后提交 cursor。
+Probe webhook 和 Unix HTTP exporter 会把 durable export batch 发送到 HTTP receiver。
+传输语义是 at-least-once：receiver 必须把 `batch_id` 或 `idempotency-key` 当作幂等键，
+并且只在 durable ingestion 完成后提交 cursor。
 
 ## Endpoint 规则
 
 webhook exporter 使用 `exporters.<id>.endpoint`。它必须是带 host 的 absolute
 `http://` 或 `https://` URL，URL credentials 会被拒绝。配置 TLS material refs 时必须使用
 `https://`。
+
+Unix HTTP exporter 使用 `exporters.<id>.socket_path` 和 `exporters.<id>.endpoint`。
+socket path 必须是 absolute path，并且 active sink 需要它指向已存在的 Unix domain socket。
+endpoint 是带可选 query 的 HTTP path，例如 `/probe/batches?tenant=local`；它不是网络 URL，
+也不使用 exporter TLS material。
 
 其它 HTTP endpoint 字段有不同安全规则。endpoint matrix 见
 [http-endpoints_ZH.md](http-endpoints_ZH.md)。
@@ -113,13 +118,15 @@ at-least-once，所以 receiver 重启、超时或网络失败后收到重复 ba
 
 ## Exporter 配置示例
 
+基于 TCP/TLS 的 webhook：
+
 ```toml
 [[exporters]]
 id = "primary-webhook"
 transport = "webhook"
 endpoint = "https://collector.example/probe/batches"
 codec = "zstd"
-headers = { x_probe_node = "probe-local" }
+headers = { "x-probe-node" = "probe-local" }
 
 [exporters.tls]
 trust_anchor_refs = ["collector-ca"]
@@ -128,3 +135,15 @@ client_private_key_ref = "collector-client-key"
 ```
 
 TLS refs 指向 `[[tls.materials]]` 条目。配置 exporter TLS material 时，endpoint 必须使用 HTTPS。
+
+发送到本地 sidecar 的 Unix HTTP：
+
+```toml
+[[exporters]]
+id = "local-sidecar"
+transport = "unix_http"
+socket_path = "/run/probe/collector.sock"
+endpoint = "/probe/batches"
+codec = "zstd"
+headers = { "x-probe-node" = "probe-local" }
+```

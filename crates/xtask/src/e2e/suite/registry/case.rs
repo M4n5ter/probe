@@ -69,6 +69,7 @@ use crate::e2e::{
         run_process_derived as run_transparent_tproxy_process_derived_loopback,
         run_process_scoped as run_transparent_tproxy_process_loopback,
     },
+    unix_http_exporter::run as run_unix_http_exporter,
     webhook_exporter::run as run_webhook_exporter,
     websocket_plaintext_feed::run as run_websocket_plaintext_feed,
 };
@@ -213,6 +214,15 @@ pub(super) const E2E_CASES: &[E2eCase] = &[
         requirement: E2eRequirement::User,
         capabilities: &[E2eCapability::DurableSpoolExport, E2eCapability::FileExport],
         run: E2eCaseRun::ExitCode(run_file_exporter),
+    },
+    E2eCase {
+        name: "e2e-unix-http-exporter",
+        requirement: E2eRequirement::User,
+        capabilities: &[
+            E2eCapability::DurableSpoolExport,
+            E2eCapability::UnixHttpExport,
+        ],
+        run: E2eCaseRun::ExitCode(run_unix_http_exporter),
     },
     E2eCase {
         name: "e2e-remote-enforcement-policy",

@@ -95,10 +95,20 @@ multiplier = 2
 # See docs/webhook-receiver.md for receiver ACK and protobuf contracts.
 # endpoint = "https://collector.example/probe/batches"
 # codec = "zstd"
-# headers = { x_probe_node = "probe-local" }
+# headers = { "x-probe-node" = "probe-local" }
 #
 # [exporters.tls]
 # trust_anchor_refs = ["collector-ca"]
+#
+# [[exporters]]
+# id = "local-sidecar"
+# transport = "unix_http"
+# Unix HTTP uses the same protobuf batch and ACK contract as webhook, but sends
+# HTTP/1.1 over a local Unix domain socket to a server-local collector sidecar.
+# socket_path = "/run/probe/collector.sock"
+# endpoint = "/probe/batches"
+# codec = "zstd"
+# headers = { "x-probe-node" = "probe-local" }
 
 # [[policies]]
 # id = "http-guard"

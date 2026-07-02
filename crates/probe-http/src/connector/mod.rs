@@ -3,6 +3,7 @@ use std::{
     io,
     net::{SocketAddr, TcpStream as StdTcpStream},
     num::NonZeroU32,
+    path::PathBuf,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -12,7 +13,7 @@ use http::Uri;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::rt::TokioIo;
 use probe_io::{TcpConnectOptions, TcpSocketMark, connect_tcp};
-use tokio::net::{TcpStream, lookup_host};
+use tokio::net::{TcpStream, UnixStream, lookup_host};
 use tower_service::Service;
 
 pub const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -81,6 +82,32 @@ impl Service<Uri> for TcpHttpConnector {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let connection = self.connection;
         Box::pin(async move { connect_uri(uri, connection).await.map(TokioIo::new) })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UnixHttpConnector {
+    path: PathBuf,
+}
+
+impl UnixHttpConnector {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl Service<Uri> for UnixHttpConnector {
+    type Response = TokioIo<UnixStream>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _uri: Uri) -> Self::Future {
+        let path = self.path.clone();
+        Box::pin(async move { UnixStream::connect(path).await.map(TokioIo::new) })
     }
 }
 

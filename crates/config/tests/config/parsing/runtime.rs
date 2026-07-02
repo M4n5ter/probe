@@ -213,6 +213,34 @@ codec = "gzip"
 }
 
 #[test]
+fn parses_unix_http_exporter_transport() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AgentConfig::from_toml_str(
+        r#"
+[[exporters]]
+id = "local-sidecar"
+transport = "unix_http"
+socket_path = "/run/probe/collector.sock"
+endpoint = "/probe/batches?tenant=local"
+codec = "deflate"
+headers = { "x-probe-node" = "node-a" }
+"#,
+    )?;
+
+    assert_eq!(config.exporters[0].id, "local-sidecar");
+    assert_eq!(config.exporters[0].codec, CompressionCodecName::Deflate);
+    assert_eq!(
+        config.exporters[0].transport,
+        ExporterTransportConfig::UnixHttp {
+            socket_path: PathBuf::from("/run/probe/collector.sock"),
+            endpoint: "/probe/batches?tenant=local".to_string(),
+            headers: BTreeMap::from([("x-probe-node".to_string(), "node-a".to_string())]),
+        }
+    );
+    config.validate_basic()?;
+    Ok(())
+}
+
+#[test]
 fn exporter_config_serializes_to_parseable_flat_toml() -> Result<(), Box<dyn std::error::Error>> {
     let config = AgentConfig {
         exporters: vec![
@@ -240,6 +268,16 @@ fn exporter_config_serializes_to_parseable_flat_toml() -> Result<(), Box<dyn std
                 codec: CompressionCodecName::None,
                 worker: ExporterWorkerConfig::default(),
             },
+            ExporterConfig {
+                id: "local-sidecar".to_string(),
+                transport: ExporterTransportConfig::UnixHttp {
+                    socket_path: PathBuf::from("/run/probe/collector.sock"),
+                    endpoint: "/probe/batches".to_string(),
+                    headers: BTreeMap::from([("x-probe-node".to_string(), "node-a".to_string())]),
+                },
+                codec: CompressionCodecName::Deflate,
+                worker: ExporterWorkerConfig::default(),
+            },
         ],
         tls: TlsConfig {
             materials: vec![TlsMaterialConfig {
@@ -257,6 +295,9 @@ fn exporter_config_serializes_to_parseable_flat_toml() -> Result<(), Box<dyn std
     assert!(rendered.contains("endpoint = \"https://collector.example/batches\""));
     assert!(rendered.contains("transport = \"file\""));
     assert!(rendered.contains("path = \"/tmp/traffic-probe-export.jsonl\""));
+    assert!(rendered.contains("transport = \"unix_http\""));
+    assert!(rendered.contains("socket_path = \"/run/probe/collector.sock\""));
+    assert!(rendered.contains("endpoint = \"/probe/batches\""));
 
     let roundtrip = AgentConfig::from_toml_str(&rendered)?;
 

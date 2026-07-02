@@ -31,7 +31,7 @@ pub use enforcement_policy_source::{EnforcementPolicySourceKind, EnforcementPoli
 pub use error::RuntimeError;
 pub use export::{
     ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
-    ExportWorkerPlan, FileExportSinkPlan, WebhookExportSinkPlan,
+    ExportWorkerPlan, FileExportSinkPlan, UnixHttpExportSinkPlan, WebhookExportSinkPlan,
 };
 pub use interception_scope::{
     TransparentInterceptionFlowClassifierScopePlan,

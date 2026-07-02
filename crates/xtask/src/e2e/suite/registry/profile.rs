@@ -52,6 +52,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-websocket-plaintext-feed",
             "e2e-webhook-exporter",
             "e2e-file-exporter",
+            "e2e-unix-http-exporter",
             "e2e-remote-enforcement-policy",
             "e2e-remote-policy-bundle",
             "e2e-remote-policy-polling",

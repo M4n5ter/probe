@@ -1,12 +1,13 @@
 use std::{future::Future, time::Duration};
 
 use exporter::{
-    CompressionCodec, FileExporter, WebhookConnectionOptions, WebhookExporter, WebhookTlsConfig,
+    CompressionCodec, FileExporter, UnixHttpExporter, WebhookConnectionOptions, WebhookExporter,
+    WebhookTlsConfig,
 };
 use probe_config::CompressionCodecName;
 use runtime::{
     ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportTlsMaterialPlan, FileExportSinkPlan,
-    TlsMaterialStorePlan, WebhookExportSinkPlan,
+    TlsMaterialStorePlan, UnixHttpExportSinkPlan, WebhookExportSinkPlan,
 };
 use storage::ExportSpool;
 
@@ -177,6 +178,16 @@ pub(super) async fn drain_export_sink_with_mode(
             )
             .await
         }
+        ExportSinkPlan::UnixHttp(sink) => {
+            let target = unix_http_export_target_from_plan_sink(sink);
+            let sink = target.sink.clone();
+            with_sink_timeout(
+                sink,
+                mode.sink_timeout(),
+                drain_unix_http_sink(spool, agent_id, target, mode),
+            )
+            .await
+        }
     }
 }
 
@@ -233,6 +244,29 @@ fn file_export_target_from_plan_sink(sink: &FileExportSinkPlan) -> FileExportTar
         sink: sink.id.clone(),
         path: sink.path.clone(),
         codec: compression_codec_from_config(sink.codec),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnixHttpExportTarget {
+    sink: String,
+    socket_path: std::path::PathBuf,
+    endpoint: String,
+    codec: CompressionCodec,
+    headers: Vec<(String, String)>,
+}
+
+fn unix_http_export_target_from_plan_sink(sink: &UnixHttpExportSinkPlan) -> UnixHttpExportTarget {
+    UnixHttpExportTarget {
+        sink: sink.id.clone(),
+        socket_path: sink.socket_path.clone(),
+        endpoint: sink.endpoint.clone(),
+        codec: compression_codec_from_config(sink.codec),
+        headers: sink
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
     }
 }
 
@@ -295,6 +329,32 @@ async fn drain_file_sink(
         return Ok(());
     };
     let exporter = FileExporter::new(path, codec);
+    drain_export_sink_from_batch(spool, agent_id, &sink, codec, mode, &exporter, first_batch)
+        .await
+        .map(|_| ())
+}
+
+async fn drain_unix_http_sink(
+    spool: &impl ExportSpool,
+    agent_id: &str,
+    target: UnixHttpExportTarget,
+    mode: SinkDrainMode,
+) -> Result<(), ExportDrainError> {
+    let UnixHttpExportTarget {
+        sink,
+        socket_path,
+        endpoint,
+        codec,
+        headers,
+    } = target;
+    let first_events = spool.read_export_batch(&sink, EXPORT_BATCH_LIMIT)?;
+    if first_events.is_empty() {
+        return Ok(());
+    }
+    let Some(first_batch) = export_batch_from_events(agent_id, &sink, codec, first_events)? else {
+        return Ok(());
+    };
+    let exporter = UnixHttpExporter::with_headers(socket_path, endpoint, codec, headers)?;
     drain_export_sink_from_batch(spool, agent_id, &sink, codec, mode, &exporter, first_batch)
         .await
         .map(|_| ())

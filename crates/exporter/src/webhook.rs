@@ -68,7 +68,7 @@ impl WebhookExporter {
         Self::with_transport(endpoint, codec, headers, transport)
     }
 
-    fn with_transport(
+    pub(crate) fn with_transport(
         endpoint: impl Into<String>,
         codec: CompressionCodec,
         headers: impl IntoIterator<Item = (String, String)>,
@@ -86,12 +86,12 @@ impl WebhookExporter {
 pub type WebhookConnectionOptions = HttpConnectionOptions;
 
 #[async_trait]
-trait WebhookTransport: fmt::Debug + Send + Sync {
+pub(crate) trait WebhookTransport: fmt::Debug + Send + Sync {
     async fn send(&self, request: WebhookRequest) -> Result<WebhookResponse, ExportError>;
 }
 
 #[derive(Debug, Clone)]
-struct WebhookRequest {
+pub(crate) struct WebhookRequest {
     endpoint: String,
     codec: CompressionCodec,
     batch_id: String,
@@ -100,14 +100,14 @@ struct WebhookRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WebhookResponse {
+pub(crate) struct WebhookResponse {
     success: bool,
     failure_reason: String,
     body: String,
 }
 
 #[derive(Clone)]
-struct HyperWebhookTransport<C = ProbeHttpsConnector> {
+pub(crate) struct HyperWebhookTransport<C = ProbeHttpsConnector> {
     client: Client<C, Full<Bytes>>,
 }
 
@@ -132,7 +132,7 @@ where
     C::Future: Send + Unpin + 'static,
     C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    fn from_connector(connector: C) -> Self {
+    pub(crate) fn from_connector(connector: C) -> Self {
         let client = Client::builder(TokioExecutor::new()).build(connector);
         Self { client }
     }

@@ -10,6 +10,7 @@ name = "probe_config"
 path = "src/lib.rs"
 
 [dependencies]
+http = "1.4"
 probe-core = { path = "../core" }
 probe-io = { path = "../probe-io" }
 serde = { version = "1.0.228", features = ["derive"] }

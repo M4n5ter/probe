@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
+use http::uri::PathAndQuery;
+
 use crate::{
     ConfigViolation, ExporterConfig, ExporterTransportConfig, TlsConfig, TlsMaterialKind,
     validation::export::{headers, tls},
@@ -76,6 +78,87 @@ fn validate_transport(
                 });
             }
         }
+        ExporterTransportConfig::UnixHttp {
+            socket_path,
+            endpoint,
+            headers: configured_headers,
+        } => {
+            for (name, value) in configured_headers {
+                headers::validate_header(exporter, name, value, violations);
+            }
+            validate_unix_http_socket_path(exporter, socket_path, violations);
+            validate_unix_http_endpoint(exporter, endpoint, violations);
+        }
+    }
+}
+
+fn validate_unix_http_socket_path(
+    exporter: &ExporterConfig,
+    path: &std::path::Path,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    let field = format!("exporters.{}.socket_path", exporter.id);
+    if path.as_os_str().is_empty() {
+        violations.push(ConfigViolation {
+            field,
+            reason: "unix_http exporter socket_path cannot be empty".to_string(),
+        });
+        return;
+    }
+    if !path.is_absolute() {
+        violations.push(ConfigViolation {
+            field,
+            reason: "unix_http exporter socket_path must be absolute".to_string(),
+        });
+    }
+}
+
+fn validate_unix_http_endpoint(
+    exporter: &ExporterConfig,
+    endpoint: &str,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    let field = format!("exporters.{}.endpoint", exporter.id);
+    if endpoint.trim().is_empty() {
+        violations.push(ConfigViolation {
+            field,
+            reason: "unix_http endpoint cannot be empty".to_string(),
+        });
+        return;
+    }
+    if !endpoint.starts_with('/') {
+        violations.push(ConfigViolation {
+            field,
+            reason: "unix_http endpoint must be an absolute path with optional query".to_string(),
+        });
+        return;
+    }
+    if endpoint.starts_with("//") {
+        violations.push(ConfigViolation {
+            field,
+            reason: "unix_http endpoint must not start with //".to_string(),
+        });
+        return;
+    }
+    if endpoint.contains('#') {
+        violations.push(ConfigViolation {
+            field,
+            reason: "unix_http endpoint must not contain a fragment".to_string(),
+        });
+        return;
+    }
+    if endpoint.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
+        violations.push(ConfigViolation {
+            field,
+            reason: "unix_http endpoint must not contain control characters or spaces".to_string(),
+        });
+        return;
+    }
+    if let Err(error) = endpoint.parse::<PathAndQuery>() {
+        violations.push(ConfigViolation {
+            field,
+            reason: format!("unix_http endpoint must be a valid HTTP path and query: {error}"),
+        });
     }
 }
 

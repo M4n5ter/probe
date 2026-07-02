@@ -1,7 +1,10 @@
 use std::{
     collections::BTreeMap,
+    fs,
     io::{ErrorKind, Read, Write},
     net::{TcpListener, TcpStream},
+    os::unix::net::{UnixListener, UnixStream},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -16,12 +19,16 @@ use proto::BatchEnvelope;
 const REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(3);
 const BATCH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-pub(crate) struct WebhookBatchReceiver {
-    endpoint: String,
-    listen_port: u16,
+struct BatchReceiverCore {
     stop_requested: Arc<AtomicBool>,
     batches: Arc<Mutex<Vec<ReceivedBatch>>>,
     handle: Option<thread::JoinHandle<Result<(), String>>>,
+}
+
+pub(crate) struct WebhookBatchReceiver {
+    endpoint: String,
+    listen_port: u16,
+    core: BatchReceiverCore,
 }
 
 impl WebhookBatchReceiver {
@@ -30,46 +37,13 @@ impl WebhookBatchReceiver {
         listener.set_nonblocking(true)?;
         let listen_addr = listener.local_addr()?;
         let endpoint = format!("http://{listen_addr}/batches");
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let stop_requested_for_thread = Arc::clone(&stop_requested);
-        let batches = Arc::new(Mutex::new(Vec::new()));
-        let batches_for_thread = Arc::clone(&batches);
-        let handle = thread::spawn(move || {
-            while !stop_requested_for_thread.load(Ordering::Relaxed) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(accepted) => accepted,
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    Err(error) => return Err(error.to_string()),
-                };
-                stream
-                    .set_read_timeout(Some(REQUEST_IO_TIMEOUT))
-                    .map_err(|error| error.to_string())?;
-                stream
-                    .set_write_timeout(Some(REQUEST_IO_TIMEOUT))
-                    .map_err(|error| error.to_string())?;
-                let request = read_http_request(&mut stream)?;
-                let received = decode_received_batch(&request)?;
-                let response = accepted_response(&received.batch);
-                stream
-                    .write_all(response.as_bytes())
-                    .map_err(|error| error.to_string())?;
-                batches_for_thread
-                    .lock()
-                    .map_err(|_| "batch lock poisoned".to_string())?
-                    .push(received);
-            }
-            Ok(())
-        });
+        let core =
+            BatchReceiverCore::spawn("/batches".to_string(), move || accept_tcp_stream(&listener));
 
         Ok(Self {
             endpoint,
             listen_port: listen_addr.port(),
-            stop_requested,
-            batches,
-            handle: Some(handle),
+            core,
         })
     }
 
@@ -86,34 +60,16 @@ impl WebhookBatchReceiver {
         expected: usize,
         timeout: Duration,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let observed = self
-                .batches
-                .lock()
-                .map_err(|_| "batch lock poisoned")?
-                .len();
-            if observed >= expected {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "webhook receiver observed {observed} batch(es), expected at least {expected}"
-                )
-                .into());
-            }
-            thread::sleep(BATCH_POLL_INTERVAL);
-        }
+        self.core
+            .wait_for_batches(expected, timeout)
+            .map_err(Into::into)
     }
 
     pub(crate) fn join(mut self) -> Result<Vec<ReceivedBatch>, Box<dyn std::error::Error>> {
-        self.stop_and_join()
-            .map_err(|error| format!("webhook receiver failed: {error}"))?;
         let batches = self
-            .batches
-            .lock()
-            .map_err(|_| "batch lock poisoned")?
-            .clone();
+            .core
+            .join()
+            .map_err(|error| format!("webhook receiver failed: {error}"))?;
         if batches.is_empty() {
             Err("webhook receiver captured no batches".into())
         } else {
@@ -122,13 +78,7 @@ impl WebhookBatchReceiver {
     }
 
     fn stop_and_join(&mut self) -> Result<(), String> {
-        self.stop_requested.store(true, Ordering::Relaxed);
-        let Some(handle) = self.handle.take() else {
-            return Ok(());
-        };
-        handle
-            .join()
-            .map_err(|_| "webhook receiver thread panicked".to_string())?
+        self.core.stop_and_join("webhook receiver")
     }
 }
 
@@ -136,6 +86,67 @@ impl Drop for WebhookBatchReceiver {
     fn drop(&mut self) {
         if let Err(error) = self.stop_and_join() {
             eprintln!("webhook receiver cleanup failed: {error}");
+        }
+    }
+}
+
+pub(crate) struct UnixHttpBatchReceiver {
+    socket_path: PathBuf,
+    core: BatchReceiverCore,
+}
+
+impl UnixHttpBatchReceiver {
+    pub(crate) fn spawn(
+        socket_path: PathBuf,
+        expected_target: impl Into<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if socket_path.exists() {
+            fs::remove_file(&socket_path)?;
+        }
+        let listener = UnixListener::bind(&socket_path)?;
+        listener.set_nonblocking(true)?;
+        let core = BatchReceiverCore::spawn(expected_target.into(), move || {
+            accept_unix_stream(&listener)
+        });
+
+        Ok(Self { socket_path, core })
+    }
+
+    pub(crate) fn socket_path(&self) -> PathBuf {
+        self.socket_path.clone()
+    }
+
+    pub(crate) fn join(mut self) -> Result<Vec<ReceivedBatch>, Box<dyn std::error::Error>> {
+        let batches = self
+            .stop_and_join()
+            .map_err(|error| format!("unix HTTP receiver failed: {error}"))?;
+        if batches.is_empty() {
+            Err("unix HTTP receiver captured no batches".into())
+        } else {
+            Ok(batches)
+        }
+    }
+
+    fn stop_and_join(&mut self) -> Result<Vec<ReceivedBatch>, String> {
+        let result = self.core.join();
+        match fs::remove_file(&self.socket_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        result
+    }
+}
+
+impl Drop for UnixHttpBatchReceiver {
+    fn drop(&mut self) {
+        if let Err(error) = self.core.stop_and_join("unix HTTP receiver") {
+            eprintln!("unix HTTP receiver cleanup failed: {error}");
+        }
+        if let Err(error) = fs::remove_file(&self.socket_path)
+            && error.kind() != ErrorKind::NotFound
+        {
+            eprintln!("unix HTTP receiver socket cleanup failed: {error}");
         }
     }
 }
@@ -154,7 +165,133 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
+impl BatchReceiverCore {
+    fn spawn<S, A>(expected_target: String, mut accept: A) -> Self
+    where
+        S: Read + Write + Send + 'static,
+        A: FnMut() -> Result<Option<S>, String> + Send + 'static,
+    {
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let stop_requested_for_thread = Arc::clone(&stop_requested);
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let batches_for_thread = Arc::clone(&batches);
+        let handle = thread::spawn(move || {
+            while !stop_requested_for_thread.load(Ordering::Relaxed) {
+                let Some(mut stream) = accept()? else {
+                    continue;
+                };
+                let received = handle_batch_stream(&mut stream, &expected_target)?;
+                batches_for_thread
+                    .lock()
+                    .map_err(|_| "batch lock poisoned".to_string())?
+                    .push(received);
+            }
+            Ok(())
+        });
+        Self {
+            stop_requested,
+            batches,
+            handle: Some(handle),
+        }
+    }
+
+    fn wait_for_batches(&self, expected: usize, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let observed = self
+                .batches
+                .lock()
+                .map_err(|_| "batch lock poisoned".to_string())?
+                .len();
+            if observed >= expected {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "export batch receiver observed {observed} batch(es), expected at least {expected}"
+                ));
+            }
+            thread::sleep(BATCH_POLL_INTERVAL);
+        }
+    }
+
+    fn join(&mut self) -> Result<Vec<ReceivedBatch>, String> {
+        self.stop_and_join("export batch receiver")?;
+        self.batches
+            .lock()
+            .map_err(|_| "batch lock poisoned".to_string())
+            .map(|batches| batches.clone())
+    }
+
+    fn stop_and_join(&mut self, label: &str) -> Result<(), String> {
+        self.stop_requested.store(true, Ordering::Relaxed);
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        handle
+            .join()
+            .map_err(|_| format!("{label} thread panicked"))?
+    }
+}
+
+fn accept_tcp_stream(listener: &TcpListener) -> Result<Option<TcpStream>, String> {
+    let (stream, _) = match listener.accept() {
+        Ok(accepted) => accepted,
+        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+            thread::sleep(Duration::from_millis(5));
+            return Ok(None);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    configure_tcp_stream(stream).map(Some)
+}
+
+fn configure_tcp_stream(stream: TcpStream) -> Result<TcpStream, String> {
+    stream
+        .set_read_timeout(Some(REQUEST_IO_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(REQUEST_IO_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    Ok(stream)
+}
+
+fn accept_unix_stream(listener: &UnixListener) -> Result<Option<UnixStream>, String> {
+    let (stream, _) = match listener.accept() {
+        Ok(accepted) => accepted,
+        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+            thread::sleep(Duration::from_millis(5));
+            return Ok(None);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    configure_unix_stream(stream).map(Some)
+}
+
+fn configure_unix_stream(stream: UnixStream) -> Result<UnixStream, String> {
+    stream
+        .set_read_timeout(Some(REQUEST_IO_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(REQUEST_IO_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    Ok(stream)
+}
+
+fn handle_batch_stream<S>(stream: &mut S, expected_target: &str) -> Result<ReceivedBatch, String>
+where
+    S: Read + Write,
+{
+    let request = read_http_request(stream)?;
+    let received = decode_received_batch(&request, expected_target)?;
+    let response = accepted_response(&received.batch);
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| error.to_string())?;
+    Ok(received)
+}
+
+fn read_http_request(stream: &mut impl Read) -> Result<HttpRequest, String> {
     let mut bytes = Vec::new();
     let header_end = loop {
         let mut buffer = [0; 1024];
@@ -195,11 +332,14 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     })
 }
 
-fn decode_received_batch(request: &HttpRequest) -> Result<ReceivedBatch, String> {
-    if request.method != "POST" || request.target != "/batches" {
+fn decode_received_batch(
+    request: &HttpRequest,
+    expected_target: &str,
+) -> Result<ReceivedBatch, String> {
+    if request.method != "POST" || request.target != expected_target {
         return Err(format!(
-            "webhook request used unexpected target {} {}",
-            request.method, request.target
+            "export batch request used unexpected target {} {}, expected POST {expected_target}",
+            request.method, request.target,
         ));
     }
     if required_header(request, "content-type")? != "application/x-protobuf" {

@@ -1981,6 +1981,7 @@ dependencies = [
 name = "probe-config"
 version = "0.1.0"
 dependencies = [
+ "http",
  "probe-core",
  "probe-io",
  "serde",

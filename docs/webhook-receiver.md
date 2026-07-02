@@ -1,7 +1,7 @@
-# Webhook Receiver Reference
+# Export Batch Receiver Reference
 
-Probe webhook exporters deliver durable export batches to an HTTP endpoint. The
-transport is at-least-once: receivers must treat `batch_id` or
+Probe webhook and Unix HTTP exporters deliver durable export batches to an HTTP
+receiver. The transport is at-least-once: receivers must treat `batch_id` or
 `idempotency-key` as the idempotency key and commit by cursor only after durable
 ingestion.
 
@@ -10,6 +10,12 @@ ingestion.
 Webhook exporters use `exporters.<id>.endpoint`. It must be an absolute
 `http://` or `https://` URL with a host, and URL credentials are rejected. TLS
 material refs require `https://`.
+
+Unix HTTP exporters use `exporters.<id>.socket_path` plus
+`exporters.<id>.endpoint`. The socket path must be absolute and point to an
+existing Unix domain socket when the sink is active. The endpoint is an HTTP
+path with optional query, for example `/probe/batches?tenant=local`; it is not a
+network URL and does not use exporter TLS material.
 
 Other HTTP endpoint fields have different security rules. The endpoint matrix is
 documented in [http-endpoints.md](http-endpoints.md).
@@ -120,13 +126,15 @@ normal after receiver restarts, timeout, or network failure.
 
 ## Example Exporter Config
 
+Webhook over TCP/TLS:
+
 ```toml
 [[exporters]]
 id = "primary-webhook"
 transport = "webhook"
 endpoint = "https://collector.example/probe/batches"
 codec = "zstd"
-headers = { x_probe_node = "probe-local" }
+headers = { "x-probe-node" = "probe-local" }
 
 [exporters.tls]
 trust_anchor_refs = ["collector-ca"]
@@ -136,3 +144,15 @@ client_private_key_ref = "collector-client-key"
 
 TLS refs point to `[[tls.materials]]` entries. When exporter TLS material is
 configured, the endpoint must be HTTPS.
+
+Unix HTTP to a local sidecar:
+
+```toml
+[[exporters]]
+id = "local-sidecar"
+transport = "unix_http"
+socket_path = "/run/probe/collector.sock"
+endpoint = "/probe/batches"
+codec = "zstd"
+headers = { "x-probe-node" = "probe-local" }
+```

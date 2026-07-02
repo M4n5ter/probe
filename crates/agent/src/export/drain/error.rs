@@ -39,6 +39,7 @@ pub enum ExportDrainFailureReason {
     CompressionError,
     FileTransportError,
     HttpTransportError,
+    UnixHttpTransportError,
     InvalidExporterHeader,
     ReservedExporterHeader,
     EmptyTlsTrustAnchorBundle,
@@ -94,6 +95,15 @@ fn export_error_failure_reason(error: &exporter::ExportError) -> ExportDrainFail
             ExportDrainFailureReason::CompressionError
         }
         exporter::ExportError::HttpTransport { .. } => ExportDrainFailureReason::HttpTransportError,
+        exporter::ExportError::UnixHttpTransport { .. }
+        | exporter::ExportError::UnixHttpSocketPathEmpty
+        | exporter::ExportError::UnixHttpSocketPathRelative { .. }
+        | exporter::ExportError::UnixHttpSocketUnavailable { .. }
+        | exporter::ExportError::UnixHttpSocketSymlink { .. }
+        | exporter::ExportError::UnixHttpSocketNotSocket { .. }
+        | exporter::ExportError::InvalidUnixHttpEndpoint { .. } => {
+            ExportDrainFailureReason::UnixHttpTransportError
+        }
         exporter::ExportError::InvalidHeaderName { .. }
         | exporter::ExportError::InvalidHeaderValue { .. } => {
             ExportDrainFailureReason::InvalidExporterHeader
@@ -161,6 +171,19 @@ mod tests {
         assert_eq!(
             error.runtime_failure_reason(),
             ExportDrainFailureReason::InvalidWebhookTlsMaterial
+        );
+    }
+
+    #[test]
+    fn runtime_failure_reason_distinguishes_unix_http_transport_errors() {
+        let error = ExportDrainError::Export(exporter::ExportError::UnixHttpSocketUnavailable {
+            path: PathBuf::from("/run/probe/collector.sock"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+        });
+
+        assert_eq!(
+            error.runtime_failure_reason(),
+            ExportDrainFailureReason::UnixHttpTransportError
         );
     }
 }
