@@ -75,6 +75,8 @@ pub(crate) enum AgentError {
     AdminClient(#[from] crate::admin::AdminClientError),
     #[error("admin command failed: {0}")]
     AdminCommand(String),
+    #[error("TUI error: {0}")]
+    Tui(#[from] crate::tui::TuiError),
     #[error("{0}")]
     Check(#[source] Box<CheckError>),
     #[error("unsupported run config: {0}")]

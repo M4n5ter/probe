@@ -1,0 +1,230 @@
+use std::path::PathBuf;
+
+use attribution::{ProcessAttributor, ProcfsAttributor};
+use probe_core::ProcessContext;
+use probe_core::{ProcessSelector, Selector, TrafficSelector};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessEntry {
+    pub(crate) pid: u32,
+    pub(crate) name: String,
+    pub(crate) exe_path: Option<PathBuf>,
+    pub(crate) argv_count: usize,
+}
+
+impl ProcessEntry {
+    pub(crate) fn selector(&self) -> Option<Selector> {
+        self.exe_path
+            .as_ref()
+            .and_then(|path| path.to_str())
+            .map(|exe_path| {
+                Selector::term(
+                    ProcessSelector {
+                        exe_path_globs: vec![exe_path.to_string()],
+                        ..ProcessSelector::default()
+                    },
+                    TrafficSelector::default(),
+                )
+            })
+    }
+
+    pub(crate) fn selector_status(&self) -> &'static str {
+        if self.selector().is_some() {
+            "exe selector"
+        } else {
+            "no safe selector"
+        }
+    }
+
+    pub(crate) fn detail(&self) -> String {
+        let exe = self
+            .exe_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        format!("{exe} | {} argv entries hidden", self.argv_count)
+    }
+
+    fn from_process(process: ProcessContext) -> Self {
+        Self {
+            pid: process.identity.pid,
+            name: process.name,
+            exe_path: (!process.identity.exe_path.is_empty())
+                .then(|| PathBuf::from(process.identity.exe_path)),
+            argv_count: process.cmdline.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProcessCatalog {
+    entries: Vec<ProcessEntry>,
+    diagnostics: Vec<String>,
+}
+
+impl ProcessCatalog {
+    pub(crate) fn from_proc() -> Self {
+        Self::from_attributor(&ProcfsAttributor::new())
+    }
+
+    fn from_attributor(attributor: &ProcfsAttributor) -> Self {
+        let pids = match attributor.process_ids() {
+            Ok(pids) => pids,
+            Err(error) => {
+                return Self {
+                    entries: Vec::new(),
+                    diagnostics: vec![format!("procfs process scan failed: {error}")],
+                };
+            }
+        };
+        let mut entries = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut failed_processes = 0usize;
+        for pid in pids {
+            match attributor.identify_if_present(pid) {
+                Ok(Some(process)) => entries.push(ProcessEntry::from_process(process)),
+                Ok(None) => {}
+                Err(error) => {
+                    failed_processes += 1;
+                    if diagnostics.len() < 3 {
+                        diagnostics.push(format!("procfs process {pid} failed: {error}"));
+                    }
+                }
+            }
+        }
+        if failed_processes > diagnostics.len() {
+            diagnostics.push(format!(
+                "skipped {} additional process entries due to procfs read errors",
+                failed_processes - diagnostics.len()
+            ));
+        }
+        entries.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.pid.cmp(&right.pid))
+        });
+        Self {
+            entries,
+            diagnostics,
+        }
+    }
+
+    pub(crate) fn entries(&self) -> &[ProcessEntry] {
+        &self.entries
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: impl IntoIterator<Item = ProcessEntry>) -> Self {
+        Self {
+            entries: entries.into_iter().collect(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn diagnostic_summary(&self) -> Option<String> {
+        if self.diagnostics.is_empty() {
+            None
+        } else {
+            Some(self.diagnostics.join("; "))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, os::unix::fs::symlink};
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn process_catalog_reuses_procfs_attributor_without_external_commands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let proc_root = temp.path().join("proc");
+        let boot_id_path = proc_root.join("boot_id");
+        let process = proc_root.join("42");
+        fs::create_dir_all(&process)?;
+        fs::write(&boot_id_path, "boot-test\n")?;
+        fs::write(
+            process.join("stat"),
+            "42 (curl) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 99 21\n",
+        )?;
+        fs::write(
+            process.join("status"),
+            "Name:\tcurl\nTgid:\t42\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n",
+        )?;
+        fs::write(process.join("cmdline"), b"curl\0https://example.com\0")?;
+        fs::write(process.join("cgroup"), "0::/system.slice/curl.service\n")?;
+        symlink("/usr/bin/curl", process.join("exe"))?;
+
+        let attributor = ProcfsAttributor::with_paths(&proc_root, &boot_id_path);
+        let catalog = ProcessCatalog::from_attributor(&attributor);
+
+        assert_eq!(catalog.entries().len(), 1);
+        assert_eq!(catalog.entries()[0].pid, 42);
+        assert_eq!(catalog.entries()[0].name, "curl");
+        assert_eq!(catalog.entries()[0].argv_count, 2);
+        assert_eq!(
+            catalog.entries()[0].exe_path,
+            Some(PathBuf::from("/usr/bin/curl"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_entry_selector_prefers_executable_path_when_available() {
+        let entry = ProcessEntry {
+            pid: 7,
+            name: "curl".to_string(),
+            exe_path: Some(PathBuf::from("/usr/bin/curl")),
+            argv_count: 0,
+        };
+
+        let Some(selector) = entry.selector() else {
+            panic!("executable path should produce a safe selector");
+        };
+
+        let Selector::Match { term } = selector else {
+            panic!("process entry should create a match selector");
+        };
+        assert_eq!(term.process.exe_path_globs, ["/usr/bin/curl".to_string()]);
+        assert!(term.process.names.is_empty());
+    }
+
+    #[test]
+    fn process_entry_without_executable_path_does_not_broaden_to_process_name() {
+        let entry = ProcessEntry {
+            pid: 7,
+            name: "python".to_string(),
+            exe_path: None,
+            argv_count: 1,
+        };
+
+        assert_eq!(entry.selector(), None);
+        assert_eq!(entry.selector_status(), "no safe selector");
+        assert_eq!(entry.detail(), "- | 1 argv entries hidden");
+    }
+
+    #[test]
+    fn process_catalog_reports_global_procfs_scan_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        let proc_root = temp.path().join("missing-proc");
+        let boot_id_path = temp.path().join("boot_id");
+        let attributor = ProcfsAttributor::with_paths(&proc_root, &boot_id_path);
+
+        let catalog = ProcessCatalog::from_attributor(&attributor);
+
+        assert!(catalog.entries().is_empty());
+        assert!(
+            catalog
+                .diagnostic_summary()
+                .is_some_and(|summary| summary.contains("procfs process scan failed"))
+        );
+    }
+}

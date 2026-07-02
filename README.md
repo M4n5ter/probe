@@ -215,6 +215,31 @@ cargo run -p agent --locked -- status --config ./agent.toml
 side-effect-light status snapshot; it reports metadata for local policy bundles
 but does not execute them.
 
+### Server-Local TUI
+
+Use the TUI when operating directly on a Linux host:
+
+```bash
+cargo run -p agent --locked -- tui --config ./agent.toml
+```
+
+The TUI is a config workbench for common server operations. It reads `/proc`
+through the same procfs attribution model used by the agent, shows readable
+processes, and treats keyboard and mouse as equal input paths over the same
+actions. Process scopes are written only when the process has a readable
+executable path; argv is not retained by the TUI model, and the process table
+shows only a redacted argv count. Save takes an advisory lock, refuses stale
+files, validates the rendered config, and uses an atomic same-directory write.
+The config path must be a direct file path; symlink paths are rejected so save
+never replaces a link with a regular file.
+
+The workbench can edit capture backend selection, export worker state, exporter
+compression codec, enforcement mode/backend, transparent interception strategy,
+TLS plaintext hook enablement, and process-scoped selectors for capture,
+enforcement, interception, and TLS plaintext. Policy Lua source, large MITM
+backend contracts, TLS material files, and collector-specific payload formats
+should still be edited in the config and policy files.
+
 ### Minimal Policy And Webhook Wiring
 
 Use this section when wiring the first real integration. A deployable setup

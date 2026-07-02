@@ -31,6 +31,7 @@ mod tcp_health;
 mod tls_material;
 mod tls_plaintext;
 mod transparent_interception;
+mod tui;
 
 #[tokio::main]
 async fn main() {

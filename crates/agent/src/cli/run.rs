@@ -28,6 +28,7 @@ use crate::{
         capability_matrix_for_config,
     },
     status::{build_status_snapshot, collect_spool_status},
+    tui::{TuiOptions, run_tui},
 };
 
 use super::admin::{AdminCliCommand, run_admin_command};
@@ -61,6 +62,10 @@ enum Command {
         config: Option<PathBuf>,
     },
     Status {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    Tui {
         #[arg(long)]
         config: PathBuf,
     },
@@ -178,6 +183,9 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let spool_status = collect_spool_status(&plan);
             let snapshot = build_status_snapshot(&plan, spool_status);
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
+        Command::Tui { config } => {
+            run_tui(TuiOptions { config })?;
         }
         Command::Admin { socket, command } => {
             run_admin_command(&socket, command).await?;
