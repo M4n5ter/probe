@@ -220,7 +220,7 @@ mod tests {
 
     use crate::{
         CaptureEvent, CapturedBytes, EbpfProcessObservationRuntimeDiagnostics,
-        EbpfProcessObservationTracepointFiring,
+        EbpfProcessObservationTracepointDiagnostics, EbpfProcessObservationTracepointFiring,
     };
 
     use super::*;
@@ -378,9 +378,10 @@ mod tests {
             .runtime_diagnostics()
             .into_ebpf_process_observation()
             .expect("multiplexer should expose active provider diagnostics");
-        let firings = diagnostics
-            .tracepoint_firings
-            .expect("tracepoint firing diagnostics should be available");
+        let tracepoints = diagnostics
+            .tracepoints
+            .expect("tracepoint diagnostics should be available");
+        let firings = tracepoints.firings;
         assert_eq!(firings.len(), 1);
         assert_eq!(firings[0].program_name, "connect_enter");
         assert_eq!(firings[0].category, "syscalls");
@@ -549,12 +550,18 @@ mod tests {
         fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
             CaptureProviderRuntimeDiagnostics::from_ebpf_process_observation(
                 EbpfProcessObservationRuntimeDiagnostics {
-                    tracepoint_firings: Ok(vec![EbpfProcessObservationTracepointFiring {
-                        program_name: "connect_enter",
-                        category: "syscalls",
-                        tracepoint_name: "sys_enter_connect",
-                        firing_count: 3,
-                    }]),
+                    tracepoints: Ok(EbpfProcessObservationTracepointDiagnostics {
+                        firings: vec![EbpfProcessObservationTracepointFiring {
+                            program_name: "connect_enter",
+                            category: "syscalls",
+                            tracepoint_name: "sys_enter_connect",
+                            firing_count: 3,
+                        }],
+                        active_liveness: Err(
+                            "active liveness diagnostics are not emitted by this test provider"
+                                .to_string(),
+                        ),
+                    }),
                 },
             )
         }

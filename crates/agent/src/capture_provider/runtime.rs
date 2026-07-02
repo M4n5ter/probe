@@ -2,10 +2,12 @@ use std::sync::{Arc, RwLock};
 
 use capture::{
     CaptureError, CapturePoll, CaptureProvider, CaptureProviderRuntimeDiagnostics,
+    EbpfProcessObservationActiveTracepointLiveness,
+    EbpfProcessObservationActiveTracepointLivenessState,
     EbpfProcessObservationLinkOwnershipSnapshot,
     EbpfProcessObservationOptionalTracepointPairSnapshot,
     EbpfProcessObservationOptionalTracepointPairState, EbpfProcessObservationProbeSnapshot,
-    EbpfProcessObservationRuntimeDiagnostics, EbpfProcessObservationTracepointFiring,
+    EbpfProcessObservationTracepointDiagnostics, EbpfProcessObservationTracepointFiring,
 };
 use probe_config::CaptureBackend;
 use probe_core::{CaptureProviderKind, RuntimeMode};
@@ -41,6 +43,7 @@ pub(crate) enum CaptureProviderRuntimeDetailsSnapshot {
     EbpfProcessObservation {
         link_ownership: EbpfProcessObservationLinkOwnershipRuntimeSnapshot,
         tracepoint_firings: EbpfProcessObservationTracepointFiringRuntimeSnapshot,
+        tracepoint_liveness: EbpfProcessObservationTracepointLivenessRuntimeSnapshot,
         kernel_liveness: EbpfProcessObservationKernelLivenessRuntimeSnapshot,
         optional_tracepoint_pairs: Vec<EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot>,
     },
@@ -79,6 +82,36 @@ pub(crate) struct EbpfProcessObservationTracepointFiringProgramRuntimeSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct EbpfProcessObservationTracepointLivenessRuntimeSnapshot {
+    pub(crate) diagnostics_available: bool,
+    pub(crate) mode: RuntimeMode,
+    pub(crate) advanced_program_count: u64,
+    pub(crate) not_advanced_program_count: u64,
+    pub(crate) unsupported_program_count: u64,
+    pub(crate) programs: Vec<EbpfProcessObservationTracepointLivenessProgramRuntimeSnapshot>,
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct EbpfProcessObservationTracepointLivenessProgramRuntimeSnapshot {
+    pub(crate) program_name: &'static str,
+    pub(crate) category: &'static str,
+    pub(crate) tracepoint_name: &'static str,
+    pub(crate) state: EbpfProcessObservationTracepointLivenessProgramState,
+    pub(crate) before_firing_count: u64,
+    pub(crate) after_firing_count: u64,
+    pub(crate) reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EbpfProcessObservationTracepointLivenessProgramState {
+    Advanced,
+    NotAdvanced,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct EbpfProcessObservationKernelLivenessRuntimeSnapshot {
     pub(crate) mode: RuntimeMode,
     pub(crate) reason: String,
@@ -100,15 +133,19 @@ impl CaptureProviderRuntimeDetailsSnapshot {
         let (link_ownership, optional_tracepoint_pairs) = probe.into_parts();
         let tracepoint_firings =
             EbpfProcessObservationTracepointFiringRuntimeSnapshot::not_reported();
+        let tracepoint_liveness =
+            EbpfProcessObservationTracepointLivenessRuntimeSnapshot::not_reported();
         let kernel_liveness = EbpfProcessObservationKernelLivenessRuntimeSnapshot::from_capture(
             &link_ownership,
             &tracepoint_firings,
+            &tracepoint_liveness,
         );
         Self::EbpfProcessObservation {
             link_ownership: EbpfProcessObservationLinkOwnershipRuntimeSnapshot::from_capture(
                 link_ownership,
             ),
             tracepoint_firings,
+            tracepoint_liveness,
             kernel_liveness,
             optional_tracepoint_pairs: optional_tracepoint_pairs
                 .into_iter()
@@ -124,9 +161,14 @@ impl CaptureProviderRuntimeDetailsSnapshot {
         match &mut self {
             Self::EbpfProcessObservation {
                 tracepoint_firings,
+                tracepoint_liveness,
                 kernel_liveness,
                 ..
-            } => kernel_liveness.apply_input_activity(tracepoint_firings, input_activity),
+            } => kernel_liveness.apply_input_activity(
+                tracepoint_firings,
+                tracepoint_liveness,
+                input_activity,
+            ),
         }
         self
     }
@@ -138,14 +180,18 @@ impl CaptureProviderRuntimeDetailsSnapshot {
         let Self::EbpfProcessObservation {
             link_ownership,
             tracepoint_firings,
+            tracepoint_liveness,
             kernel_liveness,
             ..
         } = self;
-        *tracepoint_firings =
-            EbpfProcessObservationTracepointFiringRuntimeSnapshot::from_diagnostics(diagnostics);
+        let (updated_tracepoint_firings, updated_tracepoint_liveness) =
+            tracepoint_runtime_snapshots_from_diagnostics(diagnostics.tracepoints);
+        *tracepoint_firings = updated_tracepoint_firings;
+        *tracepoint_liveness = updated_tracepoint_liveness;
         *kernel_liveness = EbpfProcessObservationKernelLivenessRuntimeSnapshot::from_runtime(
             link_ownership,
             tracepoint_firings,
+            tracepoint_liveness,
         );
     }
 }
@@ -154,17 +200,30 @@ impl EbpfProcessObservationKernelLivenessRuntimeSnapshot {
     fn from_capture(
         link_ownership: &EbpfProcessObservationLinkOwnershipSnapshot,
         tracepoint_firings: &EbpfProcessObservationTracepointFiringRuntimeSnapshot,
+        tracepoint_liveness: &EbpfProcessObservationTracepointLivenessRuntimeSnapshot,
     ) -> Self {
         let link_ownership = EbpfProcessObservationLinkOwnershipRuntimeSnapshot::from_capture(
             link_ownership.clone(),
         );
-        Self::from_runtime(&link_ownership, tracepoint_firings)
+        Self::from_runtime(&link_ownership, tracepoint_firings, tracepoint_liveness)
     }
 
     fn from_runtime(
         link_ownership: &EbpfProcessObservationLinkOwnershipRuntimeSnapshot,
         tracepoint_firings: &EbpfProcessObservationTracepointFiringRuntimeSnapshot,
+        tracepoint_liveness: &EbpfProcessObservationTracepointLivenessRuntimeSnapshot,
     ) -> Self {
+        if tracepoint_liveness.advanced_program_count > 0 {
+            return Self {
+                mode: tracepoint_liveness.mode,
+                reason: format!(
+                    "safe active process eBPF tracepoint liveness probe advanced {} tracepoint program(s), left {} supported program(s) not advanced, and marked {} program(s) outside the safe active probe set; this proves runtime kernel activity for the probed handlers, but not complete per-link coverage or strong socket-object lifetime",
+                    tracepoint_liveness.advanced_program_count,
+                    tracepoint_liveness.not_advanced_program_count,
+                    tracepoint_liveness.unsupported_program_count,
+                ),
+            };
+        }
         if tracepoint_firings.total_firing_count > 0 {
             let firing_program_count = tracepoint_firings
                 .programs
@@ -179,8 +238,12 @@ impl EbpfProcessObservationKernelLivenessRuntimeSnapshot {
                 ),
             };
         }
-        let reason = if link_ownership.owned_link_count > 0 {
-            "process eBPF tracepoint link ownership does not prove kernel-side firing; active per-link liveness probing is not implemented"
+        let reason = if link_ownership.owned_link_count > 0
+            && tracepoint_liveness.diagnostics_available
+        {
+            "process eBPF tracepoint link ownership does not prove kernel-side firing; safe active tracepoint liveness did not advance any supported handler"
+        } else if link_ownership.owned_link_count > 0 {
+            "process eBPF tracepoint link ownership does not prove kernel-side firing; safe active tracepoint liveness diagnostics are unavailable"
         } else {
             "process eBPF kernel liveness cannot be evaluated without committed tracepoint link ownership"
         };
@@ -193,9 +256,12 @@ impl EbpfProcessObservationKernelLivenessRuntimeSnapshot {
     fn apply_input_activity(
         &mut self,
         tracepoint_firings: &EbpfProcessObservationTracepointFiringRuntimeSnapshot,
+        tracepoint_liveness: &EbpfProcessObservationTracepointLivenessRuntimeSnapshot,
         input_activity: Option<&CaptureInputActivityRuntimeSnapshot>,
     ) {
-        if tracepoint_firings.total_firing_count > 0 {
+        if tracepoint_liveness.advanced_program_count > 0
+            || tracepoint_firings.total_firing_count > 0
+        {
             return;
         }
         let Some(activity) = input_activity
@@ -220,18 +286,6 @@ impl EbpfProcessObservationTracepointFiringRuntimeSnapshot {
             reason: Some(
                 "process eBPF tracepoint firing diagnostics have not been observed".to_string(),
             ),
-        }
-    }
-
-    fn from_diagnostics(diagnostics: EbpfProcessObservationRuntimeDiagnostics) -> Self {
-        match diagnostics.tracepoint_firings {
-            Ok(firings) => Self::from_firings(firings),
-            Err(reason) => Self {
-                mode: RuntimeMode::Unavailable,
-                total_firing_count: 0,
-                programs: Vec::new(),
-                reason: Some(reason),
-            },
         }
     }
 
@@ -260,6 +314,169 @@ impl EbpfProcessObservationTracepointFiringRuntimeSnapshot {
                     .to_string(),
             ),
         }
+    }
+}
+
+fn tracepoint_runtime_snapshots_from_diagnostics(
+    diagnostics: Result<EbpfProcessObservationTracepointDiagnostics, String>,
+) -> (
+    EbpfProcessObservationTracepointFiringRuntimeSnapshot,
+    EbpfProcessObservationTracepointLivenessRuntimeSnapshot,
+) {
+    match diagnostics {
+        Ok(diagnostics) => (
+            EbpfProcessObservationTracepointFiringRuntimeSnapshot::from_firings(
+                diagnostics.firings,
+            ),
+            EbpfProcessObservationTracepointLivenessRuntimeSnapshot::from_diagnostics(
+                diagnostics.active_liveness,
+            ),
+        ),
+        Err(reason) => (
+            EbpfProcessObservationTracepointFiringRuntimeSnapshot {
+                mode: RuntimeMode::Unavailable,
+                total_firing_count: 0,
+                programs: Vec::new(),
+                reason: Some(reason.clone()),
+            },
+            EbpfProcessObservationTracepointLivenessRuntimeSnapshot {
+                diagnostics_available: false,
+                mode: RuntimeMode::Unavailable,
+                advanced_program_count: 0,
+                not_advanced_program_count: 0,
+                unsupported_program_count: 0,
+                programs: Vec::new(),
+                reason: Some(format!(
+                    "process eBPF active tracepoint liveness diagnostics require readable tracepoint firing counters: {reason}"
+                )),
+            },
+        ),
+    }
+}
+
+impl EbpfProcessObservationTracepointLivenessRuntimeSnapshot {
+    fn not_reported() -> Self {
+        Self {
+            diagnostics_available: false,
+            mode: RuntimeMode::Unavailable,
+            advanced_program_count: 0,
+            not_advanced_program_count: 0,
+            unsupported_program_count: 0,
+            programs: Vec::new(),
+            reason: Some(
+                "process eBPF active tracepoint liveness diagnostics have not been observed"
+                    .to_string(),
+            ),
+        }
+    }
+
+    fn from_diagnostics(
+        diagnostics: Result<EbpfProcessObservationActiveTracepointLiveness, String>,
+    ) -> Self {
+        match diagnostics {
+            Ok(liveness) => Self::from_liveness(liveness),
+            Err(reason) => Self {
+                diagnostics_available: false,
+                mode: RuntimeMode::Unavailable,
+                advanced_program_count: 0,
+                not_advanced_program_count: 0,
+                unsupported_program_count: 0,
+                programs: Vec::new(),
+                reason: Some(reason),
+            },
+        }
+    }
+
+    fn from_liveness(liveness: EbpfProcessObservationActiveTracepointLiveness) -> Self {
+        let programs = liveness
+            .programs
+            .into_iter()
+            .map(
+                |program| EbpfProcessObservationTracepointLivenessProgramRuntimeSnapshot {
+                    program_name: program.program_name,
+                    category: program.category,
+                    tracepoint_name: program.tracepoint_name,
+                    state: program.state.into(),
+                    before_firing_count: program.before_firing_count,
+                    after_firing_count: program.after_firing_count,
+                    reason: program.reason,
+                },
+            )
+            .collect::<Vec<_>>();
+        let advanced_program_count = count_liveness_programs(
+            &programs,
+            EbpfProcessObservationTracepointLivenessProgramState::Advanced,
+        );
+        let not_advanced_program_count = count_liveness_programs(
+            &programs,
+            EbpfProcessObservationTracepointLivenessProgramState::NotAdvanced,
+        );
+        let unsupported_program_count = count_liveness_programs(
+            &programs,
+            EbpfProcessObservationTracepointLivenessProgramState::Unsupported,
+        );
+        let mode = if advanced_program_count > 0 {
+            RuntimeMode::Degraded
+        } else {
+            RuntimeMode::Unavailable
+        };
+        Self {
+            diagnostics_available: true,
+            mode,
+            advanced_program_count,
+            not_advanced_program_count,
+            unsupported_program_count,
+            programs,
+            reason: Some(liveness_reason(
+                mode,
+                advanced_program_count,
+                not_advanced_program_count,
+                unsupported_program_count,
+            )),
+        }
+    }
+}
+
+impl From<EbpfProcessObservationActiveTracepointLivenessState>
+    for EbpfProcessObservationTracepointLivenessProgramState
+{
+    fn from(state: EbpfProcessObservationActiveTracepointLivenessState) -> Self {
+        match state {
+            EbpfProcessObservationActiveTracepointLivenessState::Advanced => Self::Advanced,
+            EbpfProcessObservationActiveTracepointLivenessState::NotAdvanced => Self::NotAdvanced,
+            EbpfProcessObservationActiveTracepointLivenessState::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
+fn count_liveness_programs(
+    programs: &[EbpfProcessObservationTracepointLivenessProgramRuntimeSnapshot],
+    state: EbpfProcessObservationTracepointLivenessProgramState,
+) -> u64 {
+    programs
+        .iter()
+        .filter(|program| program.state == state)
+        .count()
+        .try_into()
+        .expect("tracepoint liveness program count should fit in u64")
+}
+
+fn liveness_reason(
+    mode: RuntimeMode,
+    advanced_program_count: u64,
+    not_advanced_program_count: u64,
+    unsupported_program_count: u64,
+) -> String {
+    match mode {
+        RuntimeMode::Available => format!(
+            "safe active process eBPF tracepoint liveness probe advanced all {advanced_program_count} tracepoint program(s)"
+        ),
+        RuntimeMode::Degraded => format!(
+            "safe active process eBPF tracepoint liveness probe advanced {advanced_program_count} tracepoint program(s), left {not_advanced_program_count} supported program(s) not advanced, and marked {unsupported_program_count} program(s) outside the safe active probe set"
+        ),
+        RuntimeMode::Unavailable => format!(
+            "safe active process eBPF tracepoint liveness probe did not advance any supported tracepoint program; {not_advanced_program_count} supported program(s) did not advance and {unsupported_program_count} program(s) are outside the safe active probe set"
+        ),
     }
 }
 
@@ -423,7 +640,11 @@ impl CaptureProvider for RuntimeObservedCaptureInput {
 mod tests {
     use capture::{
         CaptureError, CapturePoll, CaptureProvider, CaptureProviderRuntimeDiagnostics,
-        EbpfProcessObservationRuntimeDiagnostics, EbpfProcessObservationTracepointFiring,
+        EbpfProcessObservationActiveTracepointLiveness,
+        EbpfProcessObservationActiveTracepointLivenessProgram,
+        EbpfProcessObservationActiveTracepointLivenessState,
+        EbpfProcessObservationRuntimeDiagnostics, EbpfProcessObservationTracepointDiagnostics,
+        EbpfProcessObservationTracepointFiring,
     };
 
     use super::*;
@@ -496,6 +717,7 @@ mod tests {
             .expect("runtime snapshot should be recorded");
         let Some(CaptureProviderRuntimeDetailsSnapshot::EbpfProcessObservation {
             tracepoint_firings,
+            tracepoint_liveness,
             kernel_liveness,
             ..
         }) = snapshot.provider
@@ -510,11 +732,15 @@ mod tests {
             tracepoint_firings.programs[0].tracepoint_name,
             "sys_enter_connect"
         );
+        assert_eq!(tracepoint_liveness.mode, RuntimeMode::Degraded);
+        assert!(tracepoint_liveness.diagnostics_available);
+        assert_eq!(tracepoint_liveness.advanced_program_count, 1);
+        assert_eq!(tracepoint_liveness.programs[0].program_name, "write_enter");
         assert_eq!(kernel_liveness.mode, RuntimeMode::Degraded);
         assert!(
             kernel_liveness
                 .reason
-                .contains("tracepoint handler firing counters")
+                .contains("safe active process eBPF tracepoint liveness probe")
         );
         Ok(())
     }
@@ -553,12 +779,26 @@ mod tests {
         fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
             CaptureProviderRuntimeDiagnostics::from_ebpf_process_observation(
                 EbpfProcessObservationRuntimeDiagnostics {
-                    tracepoint_firings: Ok(vec![EbpfProcessObservationTracepointFiring {
-                        program_name: "connect_enter",
-                        category: "syscalls",
-                        tracepoint_name: "sys_enter_connect",
-                        firing_count: 3,
-                    }]),
+                    tracepoints: Ok(EbpfProcessObservationTracepointDiagnostics {
+                        firings: vec![EbpfProcessObservationTracepointFiring {
+                            program_name: "connect_enter",
+                            category: "syscalls",
+                            tracepoint_name: "sys_enter_connect",
+                            firing_count: 3,
+                        }],
+                        active_liveness: Ok(EbpfProcessObservationActiveTracepointLiveness {
+                            programs: vec![EbpfProcessObservationActiveTracepointLivenessProgram {
+                                program_name: "write_enter",
+                                category: "syscalls",
+                                tracepoint_name: "sys_enter_write",
+                                state:
+                                    EbpfProcessObservationActiveTracepointLivenessState::Advanced,
+                                before_firing_count: 10,
+                                after_firing_count: 11,
+                                reason: "safe active syscall probe advanced this tracepoint firing counter",
+                            }],
+                        }),
+                    }),
                 },
             )
         }

@@ -843,6 +843,7 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
     let Some(CaptureProviderRuntimeDetailsSnapshot::EbpfProcessObservation {
         link_ownership,
         tracepoint_firings,
+        tracepoint_liveness,
         kernel_liveness,
         optional_tracepoint_pairs,
     }) = &snapshot.capture.provider
@@ -874,6 +875,18 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
         write_sample(
             output,
             "traffic_probe_ebpf_process_observation_tracepoint_firing_metrics_available",
+            &[],
+            0,
+        );
+        write_family(
+            output,
+            "traffic_probe_ebpf_process_observation_tracepoint_liveness_metrics_available",
+            "gauge",
+            "Whether eBPF process observation active tracepoint liveness metrics are present in this snapshot.",
+        );
+        write_sample(
+            output,
+            "traffic_probe_ebpf_process_observation_tracepoint_liveness_metrics_available",
             &[],
             0,
         );
@@ -964,6 +977,54 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
             "traffic_probe_ebpf_process_observation_tracepoint_firings_total",
             &[],
             tracepoint_firings.total_firing_count,
+        );
+    }
+
+    write_family(
+        output,
+        "traffic_probe_ebpf_process_observation_tracepoint_liveness_metrics_available",
+        "gauge",
+        "Whether eBPF process observation active tracepoint liveness metrics are present in this snapshot.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_ebpf_process_observation_tracepoint_liveness_metrics_available",
+        &[],
+        u64::from(tracepoint_liveness.diagnostics_available),
+    );
+    if tracepoint_liveness.diagnostics_available {
+        write_one_hot_enum(
+            output,
+            "traffic_probe_ebpf_process_observation_tracepoint_liveness_mode",
+            "Safe active process eBPF tracepoint liveness probe mode as a one-hot gauge.",
+            "mode",
+            &RUNTIME_MODES,
+            tracepoint_liveness.mode,
+            RuntimeMode::wire_name,
+        );
+        write_family(
+            output,
+            "traffic_probe_ebpf_process_observation_tracepoint_liveness_programs",
+            "gauge",
+            "Process eBPF tracepoint programs grouped by safe active liveness probe state.",
+        );
+        write_sample(
+            output,
+            "traffic_probe_ebpf_process_observation_tracepoint_liveness_programs",
+            &[("state", "advanced")],
+            tracepoint_liveness.advanced_program_count,
+        );
+        write_sample(
+            output,
+            "traffic_probe_ebpf_process_observation_tracepoint_liveness_programs",
+            &[("state", "not_advanced")],
+            tracepoint_liveness.not_advanced_program_count,
+        );
+        write_sample(
+            output,
+            "traffic_probe_ebpf_process_observation_tracepoint_liveness_programs",
+            &[("state", "unsupported")],
+            tracepoint_liveness.unsupported_program_count,
         );
     }
 
@@ -1250,7 +1311,11 @@ mod tests {
 
     use capture::{
         CaptureError, CapturePoll, CaptureProvider, CaptureProviderRuntimeDiagnostics,
-        EbpfProcessObservationRuntimeDiagnostics, EbpfProcessObservationTracepointFiring,
+        EbpfProcessObservationActiveTracepointLiveness,
+        EbpfProcessObservationActiveTracepointLivenessProgram,
+        EbpfProcessObservationActiveTracepointLivenessState,
+        EbpfProcessObservationRuntimeDiagnostics, EbpfProcessObservationTracepointDiagnostics,
+        EbpfProcessObservationTracepointFiring,
     };
     use probe_core::CapabilityState;
 
@@ -1646,6 +1711,16 @@ mod tests {
         assert!(metrics.contains(
             "traffic_probe_ebpf_process_observation_tracepoint_firing_mode{mode=\"unavailable\"} 1\n"
         ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_tracepoint_liveness_metrics_available 0\n"
+        ));
+        assert!(
+            !metrics.contains("traffic_probe_ebpf_process_observation_tracepoint_liveness_mode{")
+        );
+        assert!(
+            !metrics
+                .contains("traffic_probe_ebpf_process_observation_tracepoint_liveness_programs")
+        );
         assert!(
             !metrics.contains("traffic_probe_ebpf_process_observation_tracepoint_firings_total")
         );
@@ -1733,14 +1808,46 @@ mod tests {
             provider["kernel_liveness"]["mode"],
             serde_json::json!("degraded")
         );
+        assert_eq!(
+            provider["tracepoint_liveness"]["mode"],
+            serde_json::json!("degraded")
+        );
+        assert_eq!(
+            provider["tracepoint_liveness"]["diagnostics_available"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            provider["tracepoint_liveness"]["advanced_program_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            provider["tracepoint_liveness"]["not_advanced_program_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            provider["tracepoint_liveness"]["unsupported_program_count"],
+            serde_json::json!(1)
+        );
 
         let metrics = render_prometheus_metrics(&snapshot);
         assert!(metrics.contains(
             "traffic_probe_ebpf_process_observation_tracepoint_firing_mode{mode=\"available\"} 1\n"
         ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_tracepoint_liveness_mode{mode=\"degraded\"} 1\n"
+        ));
         assert!(
             metrics.contains("traffic_probe_ebpf_process_observation_tracepoint_firings_total 3\n")
         );
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_tracepoint_liveness_programs{state=\"advanced\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_tracepoint_liveness_programs{state=\"not_advanced\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_tracepoint_liveness_programs{state=\"unsupported\"} 1\n"
+        ));
         assert!(metrics.contains(
             "traffic_probe_ebpf_process_observation_program_tracepoint_firings_total{program_name=\"connect_enter\",category=\"syscalls\",tracepoint=\"sys_enter_connect\"} 3\n"
         ));
@@ -1789,6 +1896,9 @@ mod tests {
         ));
         assert!(metrics.contains(
             "traffic_probe_ebpf_process_observation_tracepoint_firing_metrics_available 0\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_tracepoint_liveness_metrics_available 0\n"
         ));
         assert!(!metrics.contains("traffic_probe_ebpf_process_observation_kernel_liveness_mode{"));
         assert!(!metrics.contains("traffic_probe_ebpf_process_observation_owned_links"));
@@ -2153,12 +2263,45 @@ mod tests {
         fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
             CaptureProviderRuntimeDiagnostics::from_ebpf_process_observation(
                 EbpfProcessObservationRuntimeDiagnostics {
-                    tracepoint_firings: Ok(vec![EbpfProcessObservationTracepointFiring {
-                        program_name: "connect_enter",
-                        category: "syscalls",
-                        tracepoint_name: "sys_enter_connect",
-                        firing_count: 3,
-                    }]),
+                    tracepoints: Ok(EbpfProcessObservationTracepointDiagnostics {
+                        firings: vec![EbpfProcessObservationTracepointFiring {
+                            program_name: "connect_enter",
+                            category: "syscalls",
+                            tracepoint_name: "sys_enter_connect",
+                            firing_count: 3,
+                        }],
+                        active_liveness: Ok(EbpfProcessObservationActiveTracepointLiveness {
+                        programs: vec![
+                            EbpfProcessObservationActiveTracepointLivenessProgram {
+                                program_name: "write_enter",
+                                category: "syscalls",
+                                tracepoint_name: "sys_enter_write",
+                                state: EbpfProcessObservationActiveTracepointLivenessState::Advanced,
+                                before_firing_count: 8,
+                                after_firing_count: 9,
+                                reason: "safe active syscall probe advanced this tracepoint firing counter",
+                            },
+                            EbpfProcessObservationActiveTracepointLivenessProgram {
+                                program_name: "read_enter",
+                                category: "syscalls",
+                                tracepoint_name: "sys_enter_read",
+                                state: EbpfProcessObservationActiveTracepointLivenessState::NotAdvanced,
+                                before_firing_count: 5,
+                                after_firing_count: 5,
+                                reason: "safe active syscall probe ran but this tracepoint firing counter did not advance",
+                            },
+                            EbpfProcessObservationActiveTracepointLivenessProgram {
+                                program_name: "connect_enter",
+                                category: "syscalls",
+                                tracepoint_name: "sys_enter_connect",
+                                state: EbpfProcessObservationActiveTracepointLivenessState::Unsupported,
+                                before_firing_count: 3,
+                                after_firing_count: 3,
+                                reason: "this tracepoint is outside the current safe active syscall probe set",
+                            },
+                        ],
+                        }),
+                    }),
                 },
             )
         }

@@ -10,13 +10,17 @@ use probe_core::{
 use crate::output_loss::OutputLossTracker;
 use crate::{
     CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderRuntimeDiagnostics,
-    EbpfProcessObservationRuntimeDiagnostics,
+    EbpfProcessObservationActiveTracepointLiveness, EbpfProcessObservationRuntimeDiagnostics,
+    EbpfProcessObservationTracepointDiagnostics, EbpfProcessObservationTracepointFiring,
 };
 
 use super::super::{
     EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation,
     EbpfProcessLifecycleObservation, EbpfProcessObservation, EbpfProcessObservationProbe,
     EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeSnapshot, EbpfSocketFlowResolver,
+    active_liveness::{
+        active_tracepoint_liveness_from_firings, trigger_safe_active_tracepoint_liveness_probe,
+    },
     bridge::output_loss_event,
     clock::EbpfObservationClock,
     flow_start::{PendingEbpfFlowResolution, PendingEbpfFlowStart},
@@ -378,6 +382,7 @@ struct EbpfProcessObservationRuntimeDiagnosticsCache {
     refresh_interval: Duration,
     last_refresh: Option<Instant>,
     snapshot: EbpfProcessObservationRuntimeDiagnostics,
+    active_liveness: Option<EbpfProcessObservationActiveTracepointLiveness>,
 }
 
 impl Default for EbpfProcessObservationRuntimeDiagnosticsCache {
@@ -386,10 +391,11 @@ impl Default for EbpfProcessObservationRuntimeDiagnosticsCache {
             refresh_interval: DEFAULT_RUNTIME_DIAGNOSTICS_REFRESH_INTERVAL,
             last_refresh: None,
             snapshot: EbpfProcessObservationRuntimeDiagnostics {
-                tracepoint_firings: Err(
-                    "process tracepoint firing diagnostics have not been read yet".to_string(),
+                tracepoints: Err(
+                    "process tracepoint diagnostics have not been read yet".to_string()
                 ),
             },
+            active_liveness: None,
         }
     }
 }
@@ -408,20 +414,86 @@ impl EbpfProcessObservationRuntimeDiagnosticsCache {
         }
         self.last_refresh = Some(now);
         self.snapshot = match observations.process_tracepoint_firings() {
-            Ok(Some(tracepoint_firings)) => EbpfProcessObservationRuntimeDiagnostics {
-                tracepoint_firings: Ok(tracepoint_firings),
-            },
+            Ok(Some(tracepoint_firings)) => {
+                self.snapshot_from_available_tracepoint_firings(observations, tracepoint_firings)
+            }
             Ok(None) => EbpfProcessObservationRuntimeDiagnostics {
-                tracepoint_firings: Err(
+                tracepoints: Err(
                     "process tracepoint firing diagnostics are not available for this observation source"
                         .to_string(),
                 ),
             },
             Err(error) => EbpfProcessObservationRuntimeDiagnostics {
-                tracepoint_firings: Err(error.to_string()),
+                tracepoints: Err(error.to_string()),
             },
         };
         self.snapshot.clone()
+    }
+
+    fn snapshot_from_available_tracepoint_firings(
+        &mut self,
+        observations: &mut dyn EbpfObservationSource,
+        before_firings: Vec<EbpfProcessObservationTracepointFiring>,
+    ) -> EbpfProcessObservationRuntimeDiagnostics {
+        let Some(active_liveness) = &self.active_liveness else {
+            let (tracepoint_firings, active_liveness) =
+                run_active_liveness_probe(observations, before_firings);
+            if let Ok(active_liveness) = &active_liveness {
+                self.active_liveness = Some(active_liveness.clone());
+            }
+            return EbpfProcessObservationRuntimeDiagnostics {
+                tracepoints: Ok(EbpfProcessObservationTracepointDiagnostics {
+                    firings: tracepoint_firings,
+                    active_liveness,
+                }),
+            };
+        };
+        EbpfProcessObservationRuntimeDiagnostics {
+            tracepoints: Ok(EbpfProcessObservationTracepointDiagnostics {
+                firings: before_firings,
+                active_liveness: Ok(active_liveness.clone()),
+            }),
+        }
+    }
+}
+
+fn run_active_liveness_probe(
+    observations: &mut dyn EbpfObservationSource,
+    before_firings: Vec<EbpfProcessObservationTracepointFiring>,
+) -> (
+    Vec<EbpfProcessObservationTracepointFiring>,
+    Result<EbpfProcessObservationActiveTracepointLiveness, String>,
+) {
+    let _probe_guard = match trigger_safe_active_tracepoint_liveness_probe() {
+        Ok(probe_guard) => probe_guard,
+        Err(error) => {
+            return (
+                before_firings,
+                Err(format!(
+                    "safe active process eBPF tracepoint liveness probe failed: {error}"
+                )),
+            );
+        }
+    };
+    match observations.process_tracepoint_firings() {
+        Ok(Some(after_firings)) => {
+            let active_liveness =
+                active_tracepoint_liveness_from_firings(&before_firings, &after_firings);
+            (after_firings, Ok(active_liveness))
+        }
+        Ok(None) => (
+            before_firings,
+            Err(
+                "process tracepoint firing diagnostics became unavailable after active liveness probe"
+                    .to_string(),
+            ),
+        ),
+        Err(error) => (
+            before_firings,
+            Err(format!(
+                "process tracepoint firing diagnostics failed after active liveness probe: {error}"
+            )),
+        ),
     }
 }
 
@@ -441,7 +513,7 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider emits result-gated connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded multi-iovec prefix syscall argument samples, outbound available sendfile family kernel-transfer byte-count gaps, inbound single-buffer and bounded multi-iovec prefix syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, TGID-level process exit/exec cancellation of pending flow resolution plus lifecycle boundary gaps for active payload-tracked flows, userspace tracked-flow displacement as event-local terminal provider-state boundary gaps, output ring-buffer failure conversion to degraded capture_loss events, conservative unknown-offset gap fan-out to active tracked payload flows, and per-tracepoint kernel firing counters; payload beyond the bounded multi-iovec scan/sample or fixed verifier-friendly append slots, kernel-transfer payload bytes, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
+            "eBPF provider emits result-gated connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded multi-iovec prefix syscall argument samples, outbound available sendfile family kernel-transfer byte-count gaps, inbound single-buffer and bounded multi-iovec prefix syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, TGID-level process exit/exec cancellation of pending flow resolution plus lifecycle boundary gaps for active payload-tracked flows, userspace tracked-flow displacement as event-local terminal provider-state boundary gaps, output ring-buffer failure conversion to degraded capture_loss events, conservative unknown-offset gap fan-out to active tracked payload flows, per-tracepoint kernel firing counters, and safe active pipe read/write tracepoint liveness diagnostics; payload beyond the bounded multi-iovec scan/sample or fixed verifier-friendly append slots, kernel-transfer payload bytes, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
         )]
     }
 
@@ -465,9 +537,13 @@ mod tests {
     };
 
     use crate::{
-        CaptureProviderKind, EbpfProcessObservationTracepointFiring, EnforcementEvidencePropagation,
+        CaptureProviderKind, EbpfProcessObservationActiveTracepointLiveness,
+        EbpfProcessObservationActiveTracepointLivenessProgram,
+        EbpfProcessObservationActiveTracepointLivenessState,
+        EbpfProcessObservationTracepointFiring, EnforcementEvidencePropagation,
     };
 
+    use ebpf_abi::EbpfProcessTracepointRole;
     use probe_core::{
         Direction, ObservationOnlyReason, ProcessContext, ProcessIdentity, ProcessSelector,
         Selector, TcpConnection, TcpEndpoint, TrafficSelector,
@@ -1425,9 +1501,10 @@ mod tests {
             .into_ebpf_process_observation()
             .expect("expected eBPF process observation diagnostics");
 
-        let firings = diagnostics
-            .tracepoint_firings
-            .expect("tracepoint firing diagnostics should be available");
+        let tracepoints = diagnostics
+            .tracepoints
+            .expect("tracepoint diagnostics should be available");
+        let firings = tracepoints.firings;
         assert_eq!(firings.len(), 2);
         assert_eq!(firings[0].program_name, "connect_enter");
         assert_eq!(firings[0].category, "syscalls");
@@ -1437,6 +1514,53 @@ mod tests {
         assert_eq!(firings[1].category, "syscalls");
         assert_eq!(firings[1].tracepoint_name, "sys_exit_connect");
         assert_eq!(firings[1].firing_count, 1);
+    }
+
+    #[test]
+    fn runtime_diagnostics_reports_active_tracepoint_liveness() {
+        let source = QueuedTracepointFiringObservationSource {
+            firings: VecDeque::from([
+                vec![tracepoint_firing(EbpfProcessTracepointRole::WriteEnter, 10)],
+                vec![tracepoint_firing(EbpfProcessTracepointRole::WriteEnter, 11)],
+            ]),
+        };
+        let resolver = Box::new(StaticResolver { resolved: None });
+        let mut provider =
+            EbpfProcessObservationProvider::from_source_for_test(source, resolver, None)
+                .with_runtime_diagnostics_refresh_interval_for_test(Duration::ZERO);
+
+        let diagnostics = provider
+            .runtime_diagnostics()
+            .into_ebpf_process_observation()
+            .expect("expected eBPF process observation diagnostics");
+
+        let tracepoints = diagnostics
+            .tracepoints
+            .expect("tracepoint diagnostics should be available");
+        let firings = &tracepoints.firings;
+        assert_eq!(
+            firings[0].program_name,
+            EbpfProcessTracepointRole::WriteEnter.spec().program_name
+        );
+        assert_eq!(firings[0].firing_count, 11);
+
+        let liveness = tracepoints
+            .active_liveness
+            .expect("active tracepoint liveness should be available");
+        let write_enter = active_liveness_program(&liveness, EbpfProcessTracepointRole::WriteEnter);
+        assert_eq!(
+            write_enter.state,
+            EbpfProcessObservationActiveTracepointLivenessState::Advanced
+        );
+        assert_eq!(write_enter.before_firing_count, 10);
+        assert_eq!(write_enter.after_firing_count, 11);
+
+        let connect_enter =
+            active_liveness_program(&liveness, EbpfProcessTracepointRole::ConnectEnter);
+        assert_eq!(
+            connect_enter.state,
+            EbpfProcessObservationActiveTracepointLivenessState::Unsupported
+        );
     }
 
     #[test]
@@ -1654,6 +1778,58 @@ mod tests {
             &mut self,
         ) -> Result<Option<Vec<EbpfProcessObservationTracepointFiring>>, CaptureError> {
             Ok(Some(self.firings.clone()))
+        }
+    }
+
+    struct QueuedTracepointFiringObservationSource {
+        firings: VecDeque<Vec<EbpfProcessObservationTracepointFiring>>,
+    }
+
+    impl EbpfObservationSource for QueuedTracepointFiringObservationSource {
+        fn next_observation(&mut self) -> Result<Option<EbpfProcessObservation>, CaptureError> {
+            Ok(None)
+        }
+
+        fn allow_socket_payload_sample(
+            &mut self,
+            _authorization: SocketPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn process_tracepoint_firings(
+            &mut self,
+        ) -> Result<Option<Vec<EbpfProcessObservationTracepointFiring>>, CaptureError> {
+            Ok(Some(self.firings.pop_front().unwrap_or_default()))
+        }
+    }
+
+    fn active_liveness_program(
+        liveness: &EbpfProcessObservationActiveTracepointLiveness,
+        role: EbpfProcessTracepointRole,
+    ) -> &EbpfProcessObservationActiveTracepointLivenessProgram {
+        let spec = role.spec();
+        liveness
+            .programs
+            .iter()
+            .find(|program| {
+                program.program_name == spec.program_name
+                    && program.category == spec.category
+                    && program.tracepoint_name == spec.tracepoint_name
+            })
+            .expect("role should have active liveness diagnostics")
+    }
+
+    fn tracepoint_firing(
+        role: EbpfProcessTracepointRole,
+        firing_count: u64,
+    ) -> EbpfProcessObservationTracepointFiring {
+        let spec = role.spec();
+        EbpfProcessObservationTracepointFiring {
+            program_name: spec.program_name,
+            category: spec.category,
+            tracepoint_name: spec.tracepoint_name,
+            firing_count,
         }
     }
 

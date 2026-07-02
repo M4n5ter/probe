@@ -70,6 +70,10 @@ eBPF / procfs 现状：
   `FlowIdentity` 和 `FlowContext`。
 - procfs 路径不能解决 fd 已关闭后 userspace 才解析的时序竞争。
 - process eBPF object 和 TLS plaintext artifact 都会把 output ringbuf 写失败转换为 degraded `capture_loss` export event。
+- process eBPF runtime diagnostics 会读取 per-tracepoint firing counters，并执行一次 safe active liveness probe。
+  该 probe 只触发本进程内不会修改 fd-table epoch 的 pipe `write`、`writev`、`read` 和 `readv` enter/exit 子集；
+  网络连接、`send*`、`recv*`、`sendfile`、fd-table-mutating `close`/`dup*`/`fcntl`、process lifecycle 和
+  `close_range` 不被该 probe 主动触发。
 - process eBPF provider 会把 output loss delta 保守投影到 active tracked payload flows；
   TLS plaintext provider 会把 output loss delta 保守投影到 previous output-loss checkpoint 之后观察到的 plaintext flows。
   二者都表达为 `next_offset = None` 的 flow-level `Gap`。
@@ -366,8 +370,13 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
     报告 userspace loader 已提交并持有的 tracepoint links。
   - 已实现：process eBPF artifact 暴露 per-tracepoint kernel firing counters；online capture status 的
     `capture.provider.tracepoint_firings` 报告 counter read mode、total firing count 和 per-program firing count。
+  - 已实现：process eBPF runtime diagnostics 会在首次可读取 firing counters 时运行一次 safe active tracepoint
+    liveness probe。`capture.provider.tracepoint_liveness` 按 program 报告 `advanced`、`not_advanced` 或
+    `unsupported`，并记录 probe 前后的 firing counter。当前主动覆盖集合是本进程可安全触发的
+    pipe `write`、`writev`、`read` 和 `readv` tracepoint 子集。
   - 已实现：`capture.provider.kernel_liveness` 是独立于 `link_ownership` 的 process eBPF kernel firing proof 状态。
-    读到非零 tracepoint firing counter 时 mode 为 `degraded`，reason 报告 total firing count 和触发过的 program 数；
+    active liveness probe 推进任意 supported tracepoint 时 mode 为 `degraded`，reason 报告 advanced/not_advanced/unsupported
+    program 数；读到非零 tracepoint firing counter 时同样为 `degraded`，reason 报告 total firing count 和触发过的 program 数；
     尚未读到 firing counter 但观察到 eBPF capture event 或 output-loss event 时也为 `degraded`，
     reason 会报告 eBPF provider 的 capture/output-loss/lost event 计数。该字段证明运行期有 process eBPF
     handler firing 或 provider output 到达 userspace，但不证明完整 per-link coverage、完整 socket stream 或强 socket-object lifetime。
@@ -376,10 +385,10 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
     pair 完整缺失时为 `unavailable`，只存在一侧时 loader fail closed。
   - 已实现：Prometheus 暴露同一 link ownership fact，包括 metrics availability、ownership mode、总 owned link count
     per-program owned link count，以及按 syscall family 聚合的 optional tracepoint pair mode。Prometheus 同时暴露
-    tracepoint firing counter availability、mode、total firing count、per-program firing count，以及 `kernel_liveness`
-    metrics availability 和 one-hot mode。这些指标区分 userspace-held committed link handles、启动时 kernel
-    tracepoint-pair probe result、handler firing counter 和 provider output activity。完整 enter/exit tracepoint tuple
-    留在 runtime status JSON 中用于诊断。
+    tracepoint firing counter availability、mode、total firing count、per-program firing count、active tracepoint liveness
+    availability/mode/state counts，以及 `kernel_liveness` metrics availability 和 one-hot mode。这些指标区分
+    userspace-held committed link handles、启动时 kernel tracepoint-pair probe result、handler firing counter、
+    safe active liveness probe result 和 provider output activity。完整 enter/exit tracepoint tuple 留在 runtime status JSON 中用于诊断。
   - 已实现：pipeline runtime metrics 记录 capture loss event 与 lost event 总数；若在线 status 输入包含非零
     capture loss，agent health 降级并在 reason 中报告对应计数。
   - 边界：capability 和 evidence mode 仍是 degraded/best-effort。
@@ -393,8 +402,11 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
     这些信号不补全未跟踪、已从 bounded userspace tracker 移出或丢失事件的 socket lifecycle。
   - 边界：process eBPF `link_ownership` 只证明 loader 成功提交并仍持有 tracepoint link handles。
     `tracepoint_firings` 只证明已读到的 counter 值，不证明每个 attached link 都已触发。
-    `kernel_liveness.mode = degraded` 表示运行期已观察到 tracepoint handler firing counter 或 eBPF provider output，
-    不证明完整 per-link firing coverage，也不证明任意 socket-object lifetime。未观察到 firing counter 或 provider output 时，
+    `tracepoint_liveness` 证明 safe active probe 覆盖集合内的 handler 是否被本进程触发，不证明 `connect`、`accept`、
+    `send*`、`recv*`、`sendfile`、fd-table-mutating lifecycle、process lifecycle、`close_range`
+    或任意目标 workload 的 per-link coverage。
+    `kernel_liveness.mode = degraded` 表示运行期已观察到 active tracepoint liveness、tracepoint handler firing counter
+    或 eBPF provider output，不证明完整 per-link firing coverage，也不证明任意 socket-object lifetime。未观察到上述证据时，
     `kernel_liveness.mode = unavailable`。
   - 边界：optional tracepoint pair availability 是启动时 tracefs probe 和 attach 结果，不代表该 syscall
     在目标 workload 中实际发生；缺失的 optional pair 只表示对应 syscall family 不会产生 kernel-transfer
@@ -1446,8 +1458,8 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 - `traffic_probe_ebpf_process_observation_program_owned_links{program_name,category,tracepoint}` 按当前已 attach 的
   process eBPF program 暴露每个 program 持有的 committed tracepoint link handle 数。
 - 当 selected provider 不是 process eBPF，或 runtime status 没有 provider details 时，link ownership、
-  tracepoint firing 和 kernel liveness 三类 eBPF process observation metrics availability 均为 `0`；
-  不输出 owned link count、tracepoint firing counter 或 mode sample。
+  tracepoint firing、tracepoint liveness 和 kernel liveness 四类 eBPF process observation metrics availability 均为 `0`；
+  不输出 owned link count、tracepoint firing counter、tracepoint liveness state count 或 mode sample。
 - 当 provider details 存在但 link ownership 未上报时，metrics availability 为 `1`，
   mode 为 `unavailable`，owned link count 为 `0`。
 - `traffic_probe_ebpf_process_observation_tracepoint_firing_metrics_available` 表示当前 status snapshot
@@ -1459,14 +1471,24 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
   process eBPF tracepoint handler firing 总数；counter 读取失败或暂不可用时不输出 `0` 样本。
 - `traffic_probe_ebpf_process_observation_program_tracepoint_firings_total{program_name,category,tracepoint}`
   同样只在 tracepoint firing diagnostics 可用时按 program 暴露 handler firing counter。
+- `traffic_probe_ebpf_process_observation_tracepoint_liveness_metrics_available` 表示当前 status snapshot
+  是否包含成功读取的 process eBPF safe active tracepoint liveness 数值投影。provider details 存在但 active liveness
+  失败或尚未上报时该值为 `0`，并且不输出 liveness mode 或 state count 样本。
+- `traffic_probe_ebpf_process_observation_tracepoint_liveness_mode{mode="available|degraded|unavailable"}`
+  是 `capture.provider.tracepoint_liveness.mode` 的 one-hot gauge。当前 safe active probe 只证明一组本进程可安全触发的
+  syscall tracepoint，因此存在 advanced program 时也只表达 degraded proof；成功运行但没有 supported program advance
+  时为 `unavailable`，state counts 仍可用于区分真实零进展与诊断缺失。
+- `traffic_probe_ebpf_process_observation_tracepoint_liveness_programs{state="advanced|not_advanced|unsupported"}`
+  按 active liveness state 聚合 process eBPF tracepoint program 数。`unsupported` 表示该 tracepoint 不在当前 safe
+  active probe 覆盖集合内，而不是 attach 失败。
 - `traffic_probe_ebpf_process_observation_kernel_liveness_metrics_available` 表示当前 status snapshot
   是否包含 process eBPF provider 的 kernel liveness 数值投影。
 - `traffic_probe_ebpf_process_observation_kernel_liveness_mode{mode="available|degraded|unavailable"}`
   是 `capture.provider.kernel_liveness.mode` 的 one-hot gauge。未观察到 firing counter 或 eBPF provider output 时为
-  `unavailable`；读到非零 firing counter、观察到 eBPF capture event 或 output-loss event 后为 `degraded`。
+  `unavailable`；active liveness probe 推进、读到非零 firing counter、观察到 eBPF capture event 或 output-loss event 后为 `degraded`。
 - 这些指标只表达 userspace-held committed link handles、启动时 tracepoint-pair availability、handler firing counter、
-  provider-level eBPF output 是否被观察到，以及 kernel liveness 证明是否存在；它们不证明完整 per-link coverage
-  或强 socket-object lifetime。
+  safe active liveness probe result、provider-level eBPF output 是否被观察到，以及 kernel liveness 证明是否存在；
+  它们不证明完整 per-link coverage 或强 socket-object lifetime。
 
 #### Event provenance
 
@@ -1972,8 +1994,10 @@ loss 与 fallback 边界：
 - runtime open failure 会记录到 status `capture.open_failures`。
 - process eBPF open 成功时，online status `capture.provider.kind = "ebpf_process_observation"`，
   `capture.provider.link_ownership` 报告 loader 已提交并持有的 tracepoint links，
-  `capture.provider.tracepoint_firings` 报告 per-tracepoint firing counters。
-- process eBPF `link_ownership` 和 `tracepoint_firings` 不证明完整 per-link coverage，也不证明强 socket-object lifetime。
+  `capture.provider.tracepoint_firings` 报告 per-tracepoint firing counters，
+  `capture.provider.tracepoint_liveness` 报告 safe active probe 覆盖集合内的 counter advancement。
+- process eBPF `link_ownership`、`tracepoint_firings` 和 `tracepoint_liveness`
+  不证明完整 per-link coverage，也不证明强 socket-object lifetime。
 - agent composition root 只探测一次 procfs socket attribution，并把同一份 `CapabilityState` 同时用于 eBPF descriptor 和 capability matrix，避免二者分叉。
 
 其中 `close_range` 的生命周期处理是“双层保守”：kernel 侧总是提升 TGID epoch 让旧 payload allow fail closed；
@@ -4438,11 +4462,13 @@ Status snapshot：
 - snapshot 包含 health。
 - snapshot 包含 capture status。
 - 在线 capture status 对 backend-specific runtime facts 使用 `capture.provider`；process eBPF provider 通过该字段暴露
-  tracepoint link ownership、tracepoint firing counters、kernel liveness proof status 和 optional tracepoint pair availability。
+  tracepoint link ownership、tracepoint firing counters、safe active tracepoint liveness、kernel liveness proof status
+  和 optional tracepoint pair availability。
 - Prometheus 对 process eBPF provider 暴露同一 tracepoint link ownership、tracepoint firing availability/mode、
-  成功读取时的 tracepoint firing counters 与 kernel liveness 数值投影。未观察到 firing counter 或 eBPF provider
-  output 时不会把 link ownership 伪装成 kernel liveness；counter 读取失败时不输出 `0` counter 样本；观察到
-  firing counter 或 provider output 后也只表达 degraded proof，不表达完整 per-link firing coverage。
+  成功读取时的 tracepoint firing counters、safe active tracepoint liveness state counts 与 kernel liveness 数值投影。
+  未观察到 active liveness、firing counter 或 eBPF provider output 时不会把 link ownership 伪装成 kernel liveness；
+  counter 读取失败时不输出 `0` counter 样本；观察到 active liveness、firing counter 或 provider output 后也只表达
+  degraded proof，不表达完整 per-link firing coverage。
 - snapshot 包含 policy status。
 - snapshot 包含 enforcement status。
 - snapshot 包含 TLS plaintext/material status。
@@ -5519,6 +5545,9 @@ provider loss/gap 的路径。TLS plaintext 不证明 unbounded resync。
 - 该入口使用 `readv-writev` fixture mode。
 - 该入口使用 `sendmsg-recvmsg` fixture mode。
 - 覆盖真实 Aya load/attach。
+- 覆盖 runtime diagnostics 对 per-tracepoint firing counters 的读取。
+- capture/runtime/status/Prometheus tests 覆盖 safe active tracepoint liveness 的状态投影：
+  `advanced`、`not_advanced` 和 `unsupported` state count 都必须可见。
 - 覆盖 process tracepoint ringbuf。
 - 覆盖 procfs fd attribution。
 - 覆盖 connect flow。
@@ -5577,6 +5606,8 @@ provider loss/gap 的路径。TLS plaintext 不证明 unbounded resync。
 - precise flow-specific lost-event reconstruction。
 
 该验收仍保持 eBPF provider 为 degraded：它证明“可观测并可解析”，不把这些观察提升为强 payload 或强 lifecycle 证明。
+safe active tracepoint liveness 只证明本进程安全 syscall probe 覆盖集合内的 handler 可推进 counter；
+它不证明每个 attached link 都覆盖目标 workload，也不证明 socket-object lifetime。
 
 ### Libssl plaintext 验证
 
@@ -6103,6 +6134,13 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
   `traffic_probe_ebpf_process_observation_link_ownership_mode`、
   `traffic_probe_ebpf_process_observation_owned_links` 和
   `traffic_probe_ebpf_process_observation_program_owned_links`。
+- Prometheus 测试覆盖 `traffic_probe_ebpf_process_observation_tracepoint_firing_metrics_available`、
+  `traffic_probe_ebpf_process_observation_tracepoint_firing_mode`、
+  `traffic_probe_ebpf_process_observation_tracepoint_firings_total`、
+  `traffic_probe_ebpf_process_observation_program_tracepoint_firings_total`、
+  `traffic_probe_ebpf_process_observation_tracepoint_liveness_metrics_available`、
+  `traffic_probe_ebpf_process_observation_tracepoint_liveness_mode` 和
+  `traffic_probe_ebpf_process_observation_tracepoint_liveness_programs`。
 - Prometheus 测试覆盖 `traffic_probe_pipeline_event_envelopes_total{class="all|degraded|gap"}`。
 - Prometheus 测试覆盖 `traffic_probe_pipeline_enforcement_decisions_total{outcome="..."}` 和
   `traffic_probe_pipeline_enforcement_execution_total{kind="connection_backend",surface="linux_socket_destroy"}`、

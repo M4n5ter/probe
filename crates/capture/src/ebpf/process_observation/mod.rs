@@ -1,3 +1,4 @@
+mod active_liveness;
 mod bridge;
 mod clock;
 mod descriptor_lease;
@@ -28,6 +29,9 @@ pub use types::{
     EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
     EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
     EbpfProcessLifecycleKind, EbpfProcessLifecycleObservation, EbpfProcessObservation,
-    EbpfProcessObservationRuntimeDiagnostics, EbpfProcessObservationTracepointFiring,
+    EbpfProcessObservationActiveTracepointLiveness,
+    EbpfProcessObservationActiveTracepointLivenessProgram,
+    EbpfProcessObservationActiveTracepointLivenessState, EbpfProcessObservationRuntimeDiagnostics,
+    EbpfProcessObservationTracepointDiagnostics, EbpfProcessObservationTracepointFiring,
     EbpfSocketEndpoint, EbpfSocketReadObservation, EbpfSocketWriteObservation,
 };

@@ -16,7 +16,13 @@ pub enum EbpfProcessObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EbpfProcessObservationRuntimeDiagnostics {
-    pub tracepoint_firings: Result<Vec<EbpfProcessObservationTracepointFiring>, String>,
+    pub tracepoints: Result<EbpfProcessObservationTracepointDiagnostics, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EbpfProcessObservationTracepointDiagnostics {
+    pub firings: Vec<EbpfProcessObservationTracepointFiring>,
+    pub active_liveness: Result<EbpfProcessObservationActiveTracepointLiveness, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +42,29 @@ impl EbpfProcessObservationTracepointFiring {
             firing_count,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EbpfProcessObservationActiveTracepointLiveness {
+    pub programs: Vec<EbpfProcessObservationActiveTracepointLivenessProgram>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfProcessObservationActiveTracepointLivenessProgram {
+    pub program_name: &'static str,
+    pub category: &'static str,
+    pub tracepoint_name: &'static str,
+    pub state: EbpfProcessObservationActiveTracepointLivenessState,
+    pub before_firing_count: u64,
+    pub after_firing_count: u64,
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EbpfProcessObservationActiveTracepointLivenessState {
+    Advanced,
+    NotAdvanced,
+    Unsupported,
 }
 
 impl EbpfProcessObservation {
