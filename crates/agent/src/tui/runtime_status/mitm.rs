@@ -1,10 +1,14 @@
-use probe_config::TransparentInterceptionStrategyConfig;
+use std::path::PathBuf;
+
+use probe_config::{TlsMaterialKind, TransparentInterceptionStrategyConfig};
 use probe_core::{CapabilityKind, RuntimeMode};
 use runtime::{
-    RequiredCapabilityPlan, TransparentInterceptionMitmBackendPlan,
+    RequiredCapabilityPlan, TlsMaterialPlan, TransparentInterceptionMitmBackendPlan,
     TransparentInterceptionMitmBackendReadinessProbePlan,
     TransparentInterceptionMitmClientTrustPlan, TransparentInterceptionMitmPlaintextBridgePlan,
+    TransparentInterceptionMitmPlan,
 };
+use serde::Deserialize;
 
 use crate::{
     l7_mitm::{L7MitmPlaintextBridgeMode, L7MitmRuntimeSnapshot},
@@ -27,61 +31,49 @@ pub(super) struct MitmDiagnostics {
     capabilities: Vec<RequiredCapabilityPlan>,
     runtime_l7_mitm: Option<L7MitmRuntimeSnapshot>,
     runtime_proxy: Option<TransparentProxyRuntimeSnapshot>,
+    trust_materials: MitmTrustMaterialDiagnostics,
 }
 
 impl MitmDiagnostics {
-    pub(super) fn from_enforcement(enforcement: EnforcementStatusSnapshot) -> Option<Self> {
+    pub(super) fn from_enforcement(
+        enforcement: EnforcementStatusSnapshot,
+        tls_materials: Option<&MitmTlsMaterialDiagnostics>,
+    ) -> Option<Self> {
         let interception = enforcement.interception;
-        let mitm = interception.mitm;
+        let TransparentInterceptionMitmPlan {
+            backend,
+            client_trust,
+            plaintext_bridge,
+            ca_certificate,
+            ca_private_key,
+            leaf_certificate_chain,
+            leaf_private_key,
+            ..
+        } = interception.mitm;
+        let trust_materials = MitmTrustMaterialDiagnostics::from_materials(
+            ca_certificate,
+            ca_private_key,
+            leaf_certificate_chain,
+            leaf_private_key,
+            tls_materials,
+        );
         let diagnostics = Self {
             enforcement_status: enforcement.status,
             strategy: interception.strategy,
             selector_configured: interception.selector_configured,
-            backend: mitm.backend,
-            client_trust: mitm.client_trust,
-            plaintext_bridge: mitm.plaintext_bridge,
+            backend,
+            client_trust,
+            plaintext_bridge,
             capabilities: interception.capabilities,
             runtime_l7_mitm: interception.runtime_l7_mitm,
             runtime_proxy: interception.runtime_proxy,
+            trust_materials,
         };
         diagnostics.is_relevant().then_some(diagnostics)
     }
 
     pub(super) fn next_step(&self) -> String {
-        if !self.selector_configured {
-            return "MITM path is configured but has no scoped interception selector".to_string();
-        }
-        if let Some(capability) = self.first_unavailable_capability() {
-            return format!(
-                "MITM path is blocked by {}: {}",
-                capability_kind_name(capability.capability),
-                capability
-                    .reason
-                    .as_deref()
-                    .unwrap_or("required capability is unavailable")
-            );
-        }
-        if self
-            .runtime_l7_mitm
-            .as_ref()
-            .is_some_and(l7_mitm_runtime_is_unhealthy)
-        {
-            return self
-                .runtime_l7_mitm
-                .as_ref()
-                .and_then(l7_mitm_runtime_unhealthy_reason)
-                .map(|reason| format!("MITM backend is unhealthy: {reason}"))
-                .unwrap_or_else(|| "MITM backend is unhealthy".to_string());
-        }
-        if matches!(
-            self.plaintext_bridge,
-            TransparentInterceptionMitmPlaintextBridgePlan::Disabled
-        ) {
-            return format!(
-                "MITM path needs a plaintext bridge to feed captured {MITM_PLAINTEXT_COVERAGE} into traffic events"
-            );
-        }
-        mitm_client_trust_next_step(&self.client_trust)
+        self.data_path_diagnosis().next_action
     }
 
     pub(super) fn detail_lines(&self) -> Vec<String> {
@@ -112,12 +104,10 @@ impl MitmDiagnostics {
                 "client trust: {}",
                 mitm_client_trust_name(&self.client_trust)
             ),
-            format!(
-                "tls trust action: {}",
-                mitm_client_trust_action(&self.client_trust)
-            ),
+            format!("tls trust action: {}", self.client_trust_action()),
             self.plaintext_bridge_line(),
         ];
+        lines.extend(self.trust_materials.detail_lines());
         lines.extend(self.mitm_visibility_lines());
         if !self.capabilities.is_empty() {
             lines.push("required capabilities:".to_string());
@@ -165,48 +155,124 @@ impl MitmDiagnostics {
     }
 
     fn mitm_visibility_lines(&self) -> Vec<String> {
+        let diagnosis = self.data_path_diagnosis();
+        vec![
+            diagnosis.path_labels,
+            diagnosis.plain_http,
+            diagnosis.tls_http,
+        ]
+    }
+
+    fn data_path_diagnosis(&self) -> MitmDataPathDiagnosis {
+        if !self.selector_configured {
+            return MitmDataPathDiagnosis::disabled(
+                "path labels: disabled until scoped MITM interception selector is configured",
+                "plain HTTP: unavailable until scoped MITM interception selector is configured",
+                "TLS-decrypted HTTP: unavailable until scoped MITM interception selector is configured",
+                "MITM path is configured but has no scoped interception selector",
+            );
+        }
+
+        if let Some(capability) = self.first_unavailable_capability() {
+            let reason = capability
+                .reason
+                .as_deref()
+                .unwrap_or("required capability is unavailable");
+            let blocker = format!(
+                "MITM path is blocked by {}: {reason}",
+                capability_kind_name(capability.capability)
+            );
+            return MitmDataPathDiagnosis::disabled(
+                format!("path labels: disabled because {blocker}"),
+                format!("plain HTTP: blocked because {blocker}"),
+                format!("TLS-decrypted HTTP: blocked because {blocker}"),
+                blocker,
+            );
+        }
+
         match self.plaintext_bridge {
-            TransparentInterceptionMitmPlaintextBridgePlan::Disabled => vec![
-                "path labels: disabled until MITM plaintext bridge feeds traffic events"
-                    .to_string(),
-                "plain HTTP: unavailable until MITM plaintext bridge is enabled".to_string(),
-                "TLS-decrypted HTTP: unavailable until MITM plaintext bridge is enabled"
-                    .to_string(),
-            ],
+            TransparentInterceptionMitmPlaintextBridgePlan::Disabled => {
+                MitmDataPathDiagnosis::disabled(
+                    "path labels: disabled until MITM plaintext bridge feeds traffic events",
+                    "plain HTTP: unavailable until MITM plaintext bridge is enabled",
+                    "TLS-decrypted HTTP: unavailable until MITM plaintext bridge is enabled",
+                    format!(
+                        "MITM path needs a plaintext bridge to feed captured {MITM_PLAINTEXT_COVERAGE} into traffic events"
+                    ),
+                )
+            }
             TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed { .. } => {
                 if let Some(reason) = self.runtime_plaintext_bridge_disabled_reason() {
-                    return vec![
-                        format!(
-                            "path labels: {MITM_HTTP_PATH_LABEL}=plain HTTP, {MITM_TLS_PATH_LABEL}=TLS-decrypted HTTP"
-                        ),
+                    return MitmDataPathDiagnosis::labeled(
                         format!(
                             "plain HTTP: blocked because MITM plaintext bridge runtime is disabled: {reason}"
                         ),
                         format!(
                             "TLS-decrypted HTTP: blocked because MITM plaintext bridge runtime is disabled: {reason}"
                         ),
-                    ];
+                        format!("MITM backend is unhealthy: {reason}"),
+                    );
                 }
+
+                if let Some(reason) = self.runtime_backend_unhealthy_reason() {
+                    return MitmDataPathDiagnosis::labeled(
+                        format!("plain HTTP: blocked because MITM backend is unhealthy: {reason}"),
+                        format!(
+                            "TLS-decrypted HTTP: blocked because MITM backend is unhealthy: {reason}"
+                        ),
+                        format!("MITM backend is unhealthy: {reason}"),
+                    );
+                }
+
+                let plain_http = format!(
+                    "plain HTTP: visible as {MITM_HTTP_PATH_LABEL} without TLS client trust"
+                );
                 let tls_line = match self.client_trust {
                     TransparentInterceptionMitmClientTrustPlan::Disabled => {
                         "TLS-decrypted HTTP: blocked until MITM client trust is configured"
                             .to_string()
                     }
-                    TransparentInterceptionMitmClientTrustPlan::OperatorManaged => format!(
-                        "TLS-decrypted HTTP: visible as {MITM_TLS_PATH_LABEL} after {MITM_TLS_TRUST_ACTION}"
-                    ),
+                    TransparentInterceptionMitmClientTrustPlan::OperatorManaged => {
+                        self.operator_managed_tls_line()
+                    }
                 };
-                vec![
-                    format!(
-                        "path labels: {MITM_HTTP_PATH_LABEL}=plain HTTP, {MITM_TLS_PATH_LABEL}=TLS-decrypted HTTP"
-                    ),
-                    format!(
-                        "plain HTTP: visible as {MITM_HTTP_PATH_LABEL} without TLS client trust"
-                    ),
-                    tls_line,
-                ]
+                MitmDataPathDiagnosis::labeled(plain_http, tls_line, self.tls_next_action())
             }
         }
+    }
+
+    fn operator_managed_tls_line(&self) -> String {
+        if let Some(blocker) = self.trust_materials.first_unavailable_summary() {
+            return format!("TLS-decrypted HTTP: blocked because {blocker}");
+        }
+        if let Some(unknown) = self.trust_materials.first_unknown_summary() {
+            return format!("TLS-decrypted HTTP: unknown because {unknown}");
+        }
+        format!(
+            "TLS-decrypted HTTP: visible as {MITM_TLS_PATH_LABEL} after {}",
+            self.client_trust_action()
+        )
+    }
+
+    fn tls_next_action(&self) -> String {
+        match self.client_trust {
+            TransparentInterceptionMitmClientTrustPlan::Disabled => {
+                mitm_client_trust_next_step(self.client_trust_action())
+            }
+            TransparentInterceptionMitmClientTrustPlan::OperatorManaged => {
+                if let Some(blocker) = self.trust_materials.first_unavailable_summary() {
+                    return format!("MITM TLS material needs attention: {blocker}");
+                }
+                if let Some(unknown) = self.trust_materials.first_unknown_summary() {
+                    return format!("MITM TLS material status is unknown: {unknown}");
+                }
+                mitm_client_trust_next_step(self.client_trust_action())
+            }
+        }
+    }
+
+    fn client_trust_action(&self) -> String {
+        mitm_client_trust_action(&self.client_trust, &self.trust_materials)
     }
 
     fn runtime_plaintext_bridge_disabled_reason(&self) -> Option<&str> {
@@ -220,11 +286,376 @@ impl MitmDiagnostics {
         )
     }
 
+    fn runtime_backend_unhealthy_reason(&self) -> Option<&str> {
+        let runtime = self.runtime_l7_mitm.as_ref()?;
+        (runtime.backend_health.mode == TcpHealthMode::Unhealthy).then_some(
+            runtime
+                .backend_health
+                .last_failure_reason
+                .as_deref()
+                .unwrap_or("health probe is unhealthy"),
+        )
+    }
+
     fn first_unavailable_capability(&self) -> Option<&RequiredCapabilityPlan> {
         self.capabilities
             .iter()
             .find(|capability| capability.mode == RuntimeMode::Unavailable)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MitmDataPathDiagnosis {
+    path_labels: String,
+    plain_http: String,
+    tls_http: String,
+    next_action: String,
+}
+
+impl MitmDataPathDiagnosis {
+    fn disabled(
+        path_labels: impl Into<String>,
+        plain_http: impl Into<String>,
+        tls_http: impl Into<String>,
+        next_action: impl Into<String>,
+    ) -> Self {
+        Self {
+            path_labels: path_labels.into(),
+            plain_http: plain_http.into(),
+            tls_http: tls_http.into(),
+            next_action: next_action.into(),
+        }
+    }
+
+    fn labeled(
+        plain_http: impl Into<String>,
+        tls_http: impl Into<String>,
+        next_action: impl Into<String>,
+    ) -> Self {
+        Self {
+            path_labels: format!(
+                "path labels: {MITM_HTTP_PATH_LABEL}=plain HTTP, {MITM_TLS_PATH_LABEL}=TLS-decrypted HTTP"
+            ),
+            plain_http: plain_http.into(),
+            tls_http: tls_http.into(),
+            next_action: next_action.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MitmTlsMaterialDiagnostics {
+    materials: Vec<MitmTlsMaterialSource>,
+}
+
+impl MitmTlsMaterialDiagnostics {
+    pub(super) fn from_tls_status(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        let status = serde_json::from_value::<TlsStatusWire>(value)?;
+        Ok(Self {
+            materials: status
+                .materials
+                .into_iter()
+                .map(|material| MitmTlsMaterialSource {
+                    kind: material.kind,
+                    path: material.path,
+                    mode: material.source.mode,
+                    reason: material.source.reason,
+                })
+                .collect(),
+        })
+    }
+
+    fn source_for(&self, material: &TlsMaterialPlan) -> Option<MitmTlsMaterialSourceStatus> {
+        self.materials
+            .iter()
+            .find(|source| source.kind == material.kind && source.path == material.path)
+            .map(|source| MitmTlsMaterialSourceStatus::Known {
+                mode: source.mode,
+                reason: source.reason.clone(),
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MitmTrustMaterialDiagnostics {
+    termination_source: MitmTlsTerminationSource,
+}
+
+impl MitmTrustMaterialDiagnostics {
+    fn from_materials(
+        ca_certificate: Option<TlsMaterialPlan>,
+        ca_private_key: Option<TlsMaterialPlan>,
+        leaf_certificate_chain: Vec<TlsMaterialPlan>,
+        leaf_private_key: Option<TlsMaterialPlan>,
+        tls_materials: Option<&MitmTlsMaterialDiagnostics>,
+    ) -> Self {
+        let ca_pair = ca_certificate
+            .zip(ca_private_key)
+            .map(|(certificate, private_key)| {
+                (
+                    MitmTrustMaterial::new("MITM CA certificate", certificate, tls_materials),
+                    MitmTrustMaterial::new("MITM CA private key", private_key, tls_materials),
+                )
+            });
+        let leaf_pair = (!leaf_certificate_chain.is_empty())
+            .then_some(leaf_certificate_chain)
+            .zip(leaf_private_key)
+            .map(|(certificate_chain, private_key)| {
+                (
+                    leaf_certificate_chain_materials(certificate_chain, tls_materials),
+                    MitmTrustMaterial::new("MITM leaf private key", private_key, tls_materials),
+                )
+            });
+        let termination_source = match (ca_pair, leaf_pair) {
+            (
+                Some((ca_certificate, ca_private_key)),
+                Some((leaf_certificate_chain, leaf_private_key)),
+            ) => MitmTlsTerminationSource::CaAndLeaf {
+                ca_certificate,
+                ca_private_key,
+                leaf_certificate_chain,
+                leaf_private_key,
+            },
+            (Some((certificate, private_key)), None) => MitmTlsTerminationSource::DynamicCa {
+                certificate,
+                private_key,
+            },
+            (None, Some((certificate_chain, private_key))) => {
+                MitmTlsTerminationSource::StaticLeaf {
+                    certificate_chain,
+                    private_key,
+                }
+            }
+            _ => MitmTlsTerminationSource::NotConfigured,
+        };
+        Self { termination_source }
+    }
+
+    fn client_trust_action(&self) -> &'static str {
+        match &self.termination_source {
+            MitmTlsTerminationSource::DynamicCa { .. } => MITM_TLS_TRUST_ACTION,
+            MitmTlsTerminationSource::CaAndLeaf { .. } => {
+                "install the generated MITM CA and trust the configured MITM leaf certificate chain or issuing CA to see TLS-decrypted HTTP"
+            }
+            MitmTlsTerminationSource::StaticLeaf { .. } => {
+                "trust the configured MITM leaf certificate chain or issuing CA to see TLS-decrypted HTTP"
+            }
+            MitmTlsTerminationSource::NotConfigured => {
+                "configure MITM TLS termination material before expecting TLS-decrypted HTTP"
+            }
+        }
+    }
+
+    fn detail_lines(&self) -> Vec<String> {
+        match &self.termination_source {
+            MitmTlsTerminationSource::DynamicCa {
+                certificate,
+                private_key,
+            } => vec![
+                mitm_trust_material_line(certificate),
+                mitm_trust_material_line(private_key),
+            ],
+            MitmTlsTerminationSource::CaAndLeaf {
+                ca_certificate,
+                ca_private_key,
+                leaf_certificate_chain,
+                leaf_private_key,
+            } => [ca_certificate, ca_private_key]
+                .into_iter()
+                .chain(leaf_certificate_chain.iter())
+                .chain(std::iter::once(leaf_private_key))
+                .map(mitm_trust_material_line)
+                .collect(),
+            MitmTlsTerminationSource::StaticLeaf {
+                certificate_chain,
+                private_key,
+            } => certificate_chain
+                .iter()
+                .chain(std::iter::once(private_key))
+                .map(mitm_trust_material_line)
+                .collect(),
+            MitmTlsTerminationSource::NotConfigured => {
+                vec!["mitm TLS termination material: not configured".to_string()]
+            }
+        }
+    }
+
+    fn first_unavailable_summary(&self) -> Option<String> {
+        self.termination_materials()
+            .into_iter()
+            .find_map(mitm_trust_material_unavailable_summary)
+    }
+
+    fn first_unknown_summary(&self) -> Option<String> {
+        self.termination_materials()
+            .into_iter()
+            .find_map(mitm_trust_material_unknown_summary)
+            .or_else(|| {
+                matches!(
+                    &self.termination_source,
+                    MitmTlsTerminationSource::NotConfigured
+                )
+                .then_some("MITM TLS termination material is not configured".to_string())
+            })
+    }
+
+    fn termination_materials(&self) -> Vec<&MitmTrustMaterial> {
+        match &self.termination_source {
+            MitmTlsTerminationSource::DynamicCa {
+                certificate,
+                private_key,
+            } => vec![certificate, private_key],
+            MitmTlsTerminationSource::CaAndLeaf {
+                ca_certificate,
+                ca_private_key,
+                leaf_certificate_chain,
+                leaf_private_key,
+            } => vec![ca_certificate, ca_private_key]
+                .into_iter()
+                .chain(leaf_certificate_chain.iter())
+                .chain(std::iter::once(leaf_private_key))
+                .collect(),
+            MitmTlsTerminationSource::StaticLeaf {
+                certificate_chain,
+                private_key,
+            } => certificate_chain
+                .iter()
+                .chain(std::iter::once(private_key))
+                .collect(),
+            MitmTlsTerminationSource::NotConfigured => Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MitmTrustMaterial {
+    label: String,
+    material: TlsMaterialPlan,
+    source: MitmTlsMaterialSourceStatus,
+}
+
+impl MitmTrustMaterial {
+    fn new(
+        label: impl Into<String>,
+        material: TlsMaterialPlan,
+        tls_materials: Option<&MitmTlsMaterialDiagnostics>,
+    ) -> Self {
+        let source = tls_materials
+            .and_then(|tls_materials| tls_materials.source_for(&material))
+            .unwrap_or(MitmTlsMaterialSourceStatus::Unknown);
+        Self {
+            label: label.into(),
+            material,
+            source,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MitmTlsTerminationSource {
+    DynamicCa {
+        certificate: MitmTrustMaterial,
+        private_key: MitmTrustMaterial,
+    },
+    CaAndLeaf {
+        ca_certificate: MitmTrustMaterial,
+        ca_private_key: MitmTrustMaterial,
+        leaf_certificate_chain: Vec<MitmTrustMaterial>,
+        leaf_private_key: MitmTrustMaterial,
+    },
+    StaticLeaf {
+        certificate_chain: Vec<MitmTrustMaterial>,
+        private_key: MitmTrustMaterial,
+    },
+    NotConfigured,
+}
+
+fn leaf_certificate_chain_materials(
+    certificate_chain: Vec<TlsMaterialPlan>,
+    tls_materials: Option<&MitmTlsMaterialDiagnostics>,
+) -> Vec<MitmTrustMaterial> {
+    certificate_chain
+        .into_iter()
+        .enumerate()
+        .map(|(index, material)| {
+            MitmTrustMaterial::new(
+                format!("MITM leaf certificate chain[{index}]"),
+                material,
+                tls_materials,
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MitmTlsMaterialSource {
+    kind: TlsMaterialKind,
+    path: PathBuf,
+    mode: RuntimeMode,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MitmTlsMaterialSourceStatus {
+    Known {
+        mode: RuntimeMode,
+        reason: Option<String>,
+    },
+    Unknown,
+}
+
+#[derive(Deserialize)]
+struct TlsStatusWire {
+    #[serde(default)]
+    materials: Vec<TlsMaterialStatusWire>,
+}
+
+#[derive(Deserialize)]
+struct TlsMaterialStatusWire {
+    kind: TlsMaterialKind,
+    path: PathBuf,
+    source: TlsMaterialSourceWire,
+}
+
+#[derive(Deserialize)]
+struct TlsMaterialSourceWire {
+    mode: RuntimeMode,
+    reason: Option<String>,
+}
+
+fn mitm_trust_material_line(material: &MitmTrustMaterial) -> String {
+    let mut line = format!("{}: {}", material.label, material.material.path.display());
+    match &material.source {
+        MitmTlsMaterialSourceStatus::Known { mode, reason } => {
+            line.push_str(&format!(" source={}", runtime_mode_name(*mode)));
+            if let Some(reason) = reason {
+                line.push_str(&format!(" reason={reason}"));
+            }
+        }
+        MitmTlsMaterialSourceStatus::Unknown => line.push_str(" source=unknown"),
+    }
+    line
+}
+
+fn mitm_trust_material_unavailable_summary(material: &MitmTrustMaterial) -> Option<String> {
+    match &material.source {
+        MitmTlsMaterialSourceStatus::Known {
+            mode: RuntimeMode::Unavailable,
+            reason,
+        } => {
+            let mut summary = format!("{} source is unavailable", material.label);
+            if let Some(reason) = reason {
+                summary.push_str(&format!(": {reason}"));
+            }
+            Some(summary)
+        }
+        MitmTlsMaterialSourceStatus::Known { .. } | MitmTlsMaterialSourceStatus::Unknown => None,
+    }
+}
+
+fn mitm_trust_material_unknown_summary(material: &MitmTrustMaterial) -> Option<String> {
+    matches!(material.source, MitmTlsMaterialSourceStatus::Unknown)
+        .then(|| format!("{} source status is unknown", material.label))
 }
 
 fn required_capability_detail_line(capability: &RequiredCapabilityPlan) -> String {
@@ -237,19 +668,6 @@ fn required_capability_detail_line(capability: &RequiredCapabilityPlan) -> Strin
         line.push_str(&format!(" reason={reason}"));
     }
     line
-}
-
-fn l7_mitm_runtime_is_unhealthy(runtime: &L7MitmRuntimeSnapshot) -> bool {
-    runtime.backend_health.mode == TcpHealthMode::Unhealthy
-        || runtime.plaintext_bridge.mode == L7MitmPlaintextBridgeMode::DisabledAfterError
-}
-
-fn l7_mitm_runtime_unhealthy_reason(runtime: &L7MitmRuntimeSnapshot) -> Option<&str> {
-    runtime
-        .backend_health
-        .last_failure_reason
-        .as_deref()
-        .or(runtime.plaintext_bridge.disable_reason.as_deref())
 }
 
 fn l7_mitm_runtime_detail_lines(runtime: &L7MitmRuntimeSnapshot) -> Vec<String> {
@@ -378,22 +796,20 @@ fn mitm_client_trust_name(
     }
 }
 
-fn mitm_client_trust_next_step(
-    client_trust: &TransparentInterceptionMitmClientTrustPlan,
-) -> String {
-    format!(
-        "MITM TLS trust needs attention: {}",
-        mitm_client_trust_action(client_trust)
-    )
+fn mitm_client_trust_next_step(action: String) -> String {
+    format!("MITM TLS trust needs attention: {action}")
 }
 
-fn mitm_client_trust_action(client_trust: &TransparentInterceptionMitmClientTrustPlan) -> String {
+fn mitm_client_trust_action(
+    client_trust: &TransparentInterceptionMitmClientTrustPlan,
+    trust_materials: &MitmTrustMaterialDiagnostics,
+) -> String {
     match client_trust {
         TransparentInterceptionMitmClientTrustPlan::Disabled => {
             "configure MITM client trust before expecting TLS-decrypted HTTP".to_string()
         }
         TransparentInterceptionMitmClientTrustPlan::OperatorManaged => {
-            MITM_TLS_TRUST_ACTION.to_string()
+            trust_materials.client_trust_action().to_string()
         }
     }
 }

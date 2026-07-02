@@ -15,7 +15,10 @@ use crate::{
     },
 };
 
-use self::{capture::CaptureDiagnostics, mitm::MitmDiagnostics};
+use self::{
+    capture::CaptureDiagnostics,
+    mitm::{MitmDiagnostics, MitmTlsMaterialDiagnostics},
+};
 
 const STATUS_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -129,10 +132,11 @@ fn parse_traffic_runtime_diagnostics_response(
                 .ok_or(RuntimeStatusClientError::MissingCapture)?;
             let capture = serde_json::from_value::<CaptureStatusSnapshot>(capture)
                 .map_err(RuntimeStatusClientError::Json)?;
+            let tls = snapshot.get("tls").cloned();
             let mitm = snapshot
                 .get("enforcement")
                 .cloned()
-                .map(parse_mitm_diagnostics)
+                .map(|enforcement| parse_mitm_diagnostics(enforcement, tls))
                 .transpose()?
                 .flatten();
             Ok(TrafficRuntimeDiagnostics {
@@ -155,10 +159,18 @@ fn parse_traffic_runtime_diagnostics_response(
 
 fn parse_mitm_diagnostics(
     enforcement: Value,
+    tls: Option<Value>,
 ) -> Result<Option<MitmDiagnostics>, RuntimeStatusClientError> {
     let enforcement = serde_json::from_value::<EnforcementStatusSnapshot>(enforcement)
         .map_err(RuntimeStatusClientError::Json)?;
-    Ok(MitmDiagnostics::from_enforcement(enforcement))
+    let tls_materials = tls
+        .map(MitmTlsMaterialDiagnostics::from_tls_status)
+        .transpose()
+        .map_err(RuntimeStatusClientError::Json)?;
+    Ok(MitmDiagnostics::from_enforcement(
+        enforcement,
+        tls_materials.as_ref(),
+    ))
 }
 
 #[cfg(test)]
@@ -196,6 +208,19 @@ mod tests {
             },
         },
     };
+
+    const MITM_CA_CERTIFICATE_PATH: &str = "/etc/traffic-probe/mitm-ca.pem";
+    const MITM_CA_PRIVATE_KEY_PATH: &str = "/etc/traffic-probe/mitm-ca.key";
+    const MITM_LEAF_CERTIFICATE_PATH: &str = "/etc/traffic-probe/mitm-leaf.pem";
+    const MITM_LEAF_PRIVATE_KEY_PATH: &str = "/etc/traffic-probe/mitm-leaf.key";
+
+    fn assert_detail_line(lines: &[String], expected: impl AsRef<str>) {
+        let expected = expected.as_ref();
+        assert!(
+            lines.iter().any(|line| line == expected),
+            "missing detail line: {expected}"
+        );
+    }
 
     #[test]
     fn traffic_diagnostics_summarize_unavailable_capture_and_missing_mitm()
@@ -270,7 +295,8 @@ mod tests {
                     "candidates": [],
                     "open_failures": []
                 },
-                "enforcement": configured_mitm_enforcement_status_json()?
+                "enforcement": configured_mitm_enforcement_status_json()?,
+                "tls": mitm_tls_material_status_json("available", None, "available", None)
             }
         });
 
@@ -317,6 +343,14 @@ mod tests {
                 .iter()
                 .any(|line| line == &format!("tls trust action: {MITM_TLS_TRUST_ACTION}"))
         );
+        assert_detail_line(
+            &lines,
+            format!("MITM CA certificate: {MITM_CA_CERTIFICATE_PATH} source=available"),
+        );
+        assert_detail_line(
+            &lines,
+            format!("MITM CA private key: {MITM_CA_PRIVATE_KEY_PATH} source=available"),
+        );
         let expected_next_action =
             format!("next action: MITM TLS trust needs attention: {MITM_TLS_TRUST_ACTION}");
         assert!(lines.iter().any(|line| line == &expected_next_action));
@@ -324,6 +358,197 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line.contains("l7 mitm backend health: healthy"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_report_unavailable_mitm_tls_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": mitm_bridge_capture_status_json(),
+                "enforcement": configured_mitm_enforcement_status_json()?,
+                "tls": mitm_tls_material_status_json(
+                    "unavailable",
+                    Some("permission denied"),
+                    "available",
+                    None,
+                )
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+        let lines = diagnostics.detail_lines();
+
+        assert_detail_line(
+            &lines,
+            format!(
+                "MITM CA certificate: {MITM_CA_CERTIFICATE_PATH} source=unavailable reason=permission denied"
+            ),
+        );
+        assert_detail_line(
+            &lines,
+            format!("plain HTTP: visible as {MITM_HTTP_PATH_LABEL} without TLS client trust"),
+        );
+        assert_detail_line(
+            &lines,
+            "TLS-decrypted HTTP: blocked because MITM CA certificate source is unavailable: permission denied",
+        );
+        assert_detail_line(
+            &lines,
+            "next action: MITM TLS material needs attention: MITM CA certificate source is unavailable: permission denied",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_report_unavailable_static_leaf_mitm_tls_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": mitm_bridge_capture_status_json(),
+                "enforcement": configured_static_leaf_mitm_enforcement_status_json()?,
+                "tls": mitm_static_leaf_tls_material_status_json(
+                    "unavailable",
+                    Some("leaf certificate is missing"),
+                    "available",
+                    None,
+                )
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+        let lines = diagnostics.detail_lines();
+
+        assert_detail_line(
+            &lines,
+            format!(
+                "MITM leaf certificate chain[0]: {MITM_LEAF_CERTIFICATE_PATH} source=unavailable reason=leaf certificate is missing"
+            ),
+        );
+        assert_detail_line(
+            &lines,
+            "tls trust action: trust the configured MITM leaf certificate chain or issuing CA to see TLS-decrypted HTTP",
+        );
+        assert_detail_line(
+            &lines,
+            "TLS-decrypted HTTP: blocked because MITM leaf certificate chain[0] source is unavailable: leaf certificate is missing",
+        );
+        assert_detail_line(
+            &lines,
+            "next action: MITM TLS material needs attention: MITM leaf certificate chain[0] source is unavailable: leaf certificate is missing",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_report_unavailable_ca_and_leaf_mitm_tls_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": mitm_bridge_capture_status_json(),
+                "enforcement": configured_ca_and_leaf_mitm_enforcement_status_json()?,
+                "tls": mitm_ca_and_leaf_tls_material_status_json(
+                    "unavailable",
+                    Some("leaf certificate is missing"),
+                    "available",
+                    None,
+                )
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+        let lines = diagnostics.detail_lines();
+
+        assert_detail_line(
+            &lines,
+            format!("MITM CA certificate: {MITM_CA_CERTIFICATE_PATH} source=available"),
+        );
+        assert_detail_line(
+            &lines,
+            format!(
+                "MITM leaf certificate chain[0]: {MITM_LEAF_CERTIFICATE_PATH} source=unavailable reason=leaf certificate is missing"
+            ),
+        );
+        assert_detail_line(
+            &lines,
+            "tls trust action: install the generated MITM CA and trust the configured MITM leaf certificate chain or issuing CA to see TLS-decrypted HTTP",
+        );
+        assert_detail_line(
+            &lines,
+            "TLS-decrypted HTTP: blocked because MITM leaf certificate chain[0] source is unavailable: leaf certificate is missing",
+        );
+        assert_detail_line(
+            &lines,
+            "next action: MITM TLS material needs attention: MITM leaf certificate chain[0] source is unavailable: leaf certificate is missing",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_allow_degraded_mitm_tls_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": mitm_bridge_capture_status_json(),
+                "enforcement": configured_mitm_enforcement_status_json()?,
+                "tls": mitm_tls_material_status_json(
+                    "degraded",
+                    Some("metadata check is partial"),
+                    "available",
+                    None,
+                )
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+        let lines = diagnostics.detail_lines();
+
+        assert_detail_line(
+            &lines,
+            format!(
+                "MITM CA certificate: {MITM_CA_CERTIFICATE_PATH} source=degraded reason=metadata check is partial"
+            ),
+        );
+        assert_detail_line(
+            &lines,
+            format!(
+                "TLS-decrypted HTTP: visible as {MITM_TLS_PATH_LABEL} after {MITM_TLS_TRUST_ACTION}"
+            ),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_report_unknown_mitm_tls_material_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": mitm_bridge_capture_status_json(),
+                "enforcement": configured_mitm_enforcement_status_json()?
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+        let lines = diagnostics.detail_lines();
+
+        assert_detail_line(
+            &lines,
+            format!("MITM CA certificate: {MITM_CA_CERTIFICATE_PATH} source=unknown"),
+        );
+        assert_detail_line(
+            &lines,
+            "TLS-decrypted HTTP: unknown because MITM CA certificate source status is unknown",
+        );
+        assert_detail_line(
+            &lines,
+            "next action: MITM TLS material status is unknown: MITM CA certificate source status is unknown",
         );
         Ok(())
     }
@@ -613,6 +838,34 @@ mod tests {
     }
 
     fn configured_mitm_enforcement_status_json() -> Result<Value, Box<dyn std::error::Error>> {
+        configured_mitm_enforcement_status_json_with_material(MitmMaterialFixture::DynamicCa)
+    }
+
+    fn configured_static_leaf_mitm_enforcement_status_json()
+    -> Result<Value, Box<dyn std::error::Error>> {
+        configured_mitm_enforcement_status_json_with_material(MitmMaterialFixture::StaticLeaf)
+    }
+
+    fn configured_ca_and_leaf_mitm_enforcement_status_json()
+    -> Result<Value, Box<dyn std::error::Error>> {
+        configured_mitm_enforcement_status_json_with_material(MitmMaterialFixture::CaAndLeaf)
+    }
+
+    fn mitm_bridge_capture_status_json() -> Value {
+        json!({
+            "selection": "auto",
+            "selected_backend": "capture_event_feed",
+            "selected_input_source": "mitm_plaintext_bridge",
+            "mode": "capture_event_feed",
+            "reason": null,
+            "candidates": [],
+            "open_failures": []
+        })
+    }
+
+    fn configured_mitm_enforcement_status_json_with_material(
+        material: MitmMaterialFixture,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
         let bridge_path = "/home/user/.local/state/traffic-probe/mitm/feed.jsonl";
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Auto;
@@ -632,8 +885,36 @@ mod tests {
         config.enforcement.interception.mitm.plaintext_bridge.mode =
             TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
         config.enforcement.interception.mitm.plaintext_bridge.path = Some(bridge_path.into());
-        config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
-        config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+        match material {
+            MitmMaterialFixture::DynamicCa => {
+                config.enforcement.interception.mitm.ca_certificate_ref =
+                    Some("mitm-ca".to_string());
+                config.enforcement.interception.mitm.ca_private_key_ref =
+                    Some("mitm-ca-key".to_string());
+            }
+            MitmMaterialFixture::StaticLeaf => {
+                config
+                    .enforcement
+                    .interception
+                    .mitm
+                    .leaf_certificate_chain_refs = vec!["mitm-leaf".to_string()];
+                config.enforcement.interception.mitm.leaf_private_key_ref =
+                    Some("mitm-leaf-key".to_string());
+            }
+            MitmMaterialFixture::CaAndLeaf => {
+                config.enforcement.interception.mitm.ca_certificate_ref =
+                    Some("mitm-ca".to_string());
+                config.enforcement.interception.mitm.ca_private_key_ref =
+                    Some("mitm-ca-key".to_string());
+                config
+                    .enforcement
+                    .interception
+                    .mitm
+                    .leaf_certificate_chain_refs = vec!["mitm-leaf".to_string()];
+                config.enforcement.interception.mitm.leaf_private_key_ref =
+                    Some("mitm-leaf-key".to_string());
+            }
+        }
         config.enforcement.interception.selector = Some(Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
@@ -645,18 +926,7 @@ mod tests {
         config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
             path: "/tmp/traffic-probe-enforcement.toml".into(),
         };
-        config.tls.materials = vec![
-            TlsMaterialConfig {
-                id: Some("mitm-ca".to_string()),
-                kind: TlsMaterialKind::MitmCaCertificate,
-                path: "/etc/traffic-probe/mitm-ca.pem".into(),
-            },
-            TlsMaterialConfig {
-                id: Some("mitm-ca-key".to_string()),
-                kind: TlsMaterialKind::MitmCaPrivateKey,
-                path: "/etc/traffic-probe/mitm-ca.key".into(),
-            },
-        ];
+        config.tls.materials = material.tls_materials();
         let plan = RuntimePlan::build(
             config,
             &ProviderRegistry::new(
@@ -697,7 +967,7 @@ mod tests {
             },
             client_trust: L7MitmClientTrustSnapshot {
                 mode: L7MitmClientTrustMode::OperatorManaged,
-                material: L7MitmClientTrustMaterialMode::CaCertificateAuthority,
+                material: material.client_trust_material_mode(),
                 reason: Some("operator managed".to_string()),
             },
             plaintext_bridge: L7MitmPlaintextBridgeSnapshot {
@@ -708,5 +978,146 @@ mod tests {
         Ok(serde_json::to_value(
             enforcement_status_with_transparent_proxy_for_test(&plan, Some(l7_mitm), None),
         )?)
+    }
+
+    fn mitm_tls_material_status_json(
+        certificate_mode: &str,
+        certificate_reason: Option<&str>,
+        private_key_mode: &str,
+        private_key_reason: Option<&str>,
+    ) -> Value {
+        json!({
+            "materials": [
+                {
+                    "kind": "mitm_ca_certificate",
+                    "path": MITM_CA_CERTIFICATE_PATH,
+                    "purpose": "mitm",
+                    "source": {
+                        "check": "metadata_only",
+                        "mode": certificate_mode,
+                        "reason": certificate_reason
+                    }
+                },
+                {
+                    "kind": "mitm_ca_private_key",
+                    "path": MITM_CA_PRIVATE_KEY_PATH,
+                    "purpose": "mitm",
+                    "source": {
+                        "check": "metadata_only",
+                        "mode": private_key_mode,
+                        "reason": private_key_reason
+                    }
+                }
+            ]
+        })
+    }
+
+    fn mitm_static_leaf_tls_material_status_json(
+        certificate_mode: &str,
+        certificate_reason: Option<&str>,
+        private_key_mode: &str,
+        private_key_reason: Option<&str>,
+    ) -> Value {
+        json!({
+            "materials": [
+                {
+                    "kind": "mitm_leaf_certificate",
+                    "path": MITM_LEAF_CERTIFICATE_PATH,
+                    "purpose": "mitm",
+                    "source": {
+                        "check": "metadata_only",
+                        "mode": certificate_mode,
+                        "reason": certificate_reason
+                    }
+                },
+                {
+                    "kind": "mitm_leaf_private_key",
+                    "path": MITM_LEAF_PRIVATE_KEY_PATH,
+                    "purpose": "mitm",
+                    "source": {
+                        "check": "metadata_only",
+                        "mode": private_key_mode,
+                        "reason": private_key_reason
+                    }
+                }
+            ]
+        })
+    }
+
+    fn mitm_ca_and_leaf_tls_material_status_json(
+        leaf_certificate_mode: &str,
+        leaf_certificate_reason: Option<&str>,
+        leaf_private_key_mode: &str,
+        leaf_private_key_reason: Option<&str>,
+    ) -> Value {
+        let mut status = mitm_tls_material_status_json("available", None, "available", None);
+        let leaf_status = mitm_static_leaf_tls_material_status_json(
+            leaf_certificate_mode,
+            leaf_certificate_reason,
+            leaf_private_key_mode,
+            leaf_private_key_reason,
+        );
+        status["materials"]
+            .as_array_mut()
+            .expect("materials should be an array")
+            .extend(
+                leaf_status["materials"]
+                    .as_array()
+                    .expect("leaf materials should be an array")
+                    .iter()
+                    .cloned(),
+            );
+        status
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum MitmMaterialFixture {
+        DynamicCa,
+        StaticLeaf,
+        CaAndLeaf,
+    }
+
+    impl MitmMaterialFixture {
+        fn tls_materials(self) -> Vec<TlsMaterialConfig> {
+            match self {
+                Self::DynamicCa => vec![
+                    TlsMaterialConfig {
+                        id: Some("mitm-ca".to_string()),
+                        kind: TlsMaterialKind::MitmCaCertificate,
+                        path: MITM_CA_CERTIFICATE_PATH.into(),
+                    },
+                    TlsMaterialConfig {
+                        id: Some("mitm-ca-key".to_string()),
+                        kind: TlsMaterialKind::MitmCaPrivateKey,
+                        path: MITM_CA_PRIVATE_KEY_PATH.into(),
+                    },
+                ],
+                Self::StaticLeaf => vec![
+                    TlsMaterialConfig {
+                        id: Some("mitm-leaf".to_string()),
+                        kind: TlsMaterialKind::MitmLeafCertificate,
+                        path: MITM_LEAF_CERTIFICATE_PATH.into(),
+                    },
+                    TlsMaterialConfig {
+                        id: Some("mitm-leaf-key".to_string()),
+                        kind: TlsMaterialKind::MitmLeafPrivateKey,
+                        path: MITM_LEAF_PRIVATE_KEY_PATH.into(),
+                    },
+                ],
+                Self::CaAndLeaf => {
+                    let mut materials = Self::DynamicCa.tls_materials();
+                    materials.extend(Self::StaticLeaf.tls_materials());
+                    materials
+                }
+            }
+        }
+
+        fn client_trust_material_mode(self) -> L7MitmClientTrustMaterialMode {
+            match self {
+                Self::DynamicCa => L7MitmClientTrustMaterialMode::CaCertificateAuthority,
+                Self::StaticLeaf => L7MitmClientTrustMaterialMode::LeafCertificateChain,
+                Self::CaAndLeaf => L7MitmClientTrustMaterialMode::CaAndLeafCertificateChain,
+            }
+        }
     }
 }
