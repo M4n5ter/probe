@@ -1,31 +1,39 @@
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 use attribution::{ProcessAttributor, ProcfsAttributor};
 use probe_core::ProcessContext;
 use probe_core::{ProcessSelector, Selector, TrafficSelector};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ProcessEntry {
     pub(crate) pid: u32,
     pub(crate) name: String,
     pub(crate) exe_path: Option<PathBuf>,
-    pub(crate) argv_count: usize,
+    pub(crate) argv: Vec<String>,
+}
+
+impl fmt::Debug for ProcessEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessEntry")
+            .field("pid", &self.pid)
+            .field("name", &self.name)
+            .field("exe_path", &self.exe_path)
+            .field("argv_len", &self.argv.len())
+            .finish()
+    }
 }
 
 impl ProcessEntry {
-    pub(crate) fn selector(&self) -> Option<Selector> {
+    pub(crate) fn selector_key(&self) -> Option<String> {
         self.exe_path
             .as_ref()
             .and_then(|path| path.to_str())
-            .map(|exe_path| {
-                Selector::term(
-                    ProcessSelector {
-                        exe_path_globs: vec![exe_path.to_string()],
-                        ..ProcessSelector::default()
-                    },
-                    TrafficSelector::default(),
-                )
-            })
+            .map(str::to_string)
+    }
+
+    pub(crate) fn selector(&self) -> Option<Selector> {
+        self.selector_key().map(selector_for_exe_path)
     }
 
     pub(crate) fn selector_status(&self) -> &'static str {
@@ -36,13 +44,22 @@ impl ProcessEntry {
         }
     }
 
-    pub(crate) fn detail(&self) -> String {
-        let exe = self
-            .exe_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "-".to_string());
-        format!("{exe} | {} argv entries hidden", self.argv_count)
+    pub(crate) fn argv_summary(&self, max_chars: usize) -> String {
+        if self.argv.is_empty() {
+            return "-".to_string();
+        }
+        truncate_chars(&escaped_argv(&self.argv), max_chars)
+    }
+
+    pub(crate) fn argv_detail_lines(&self) -> Vec<String> {
+        if self.argv.is_empty() {
+            return vec!["argv: -".to_string()];
+        }
+        self.argv
+            .iter()
+            .enumerate()
+            .map(|(index, value)| format!("argv[{index}]: {}", escape_text(value)))
+            .collect()
     }
 
     pub(crate) fn matches_query(&self, query: &str) -> bool {
@@ -62,6 +79,10 @@ impl ProcessEntry {
                         .contains(&query)
                 })
                 .unwrap_or(false)
+            || self
+                .argv
+                .iter()
+                .any(|arg| arg.to_ascii_lowercase().contains(&query))
     }
 
     fn from_process(process: ProcessContext) -> Self {
@@ -70,9 +91,47 @@ impl ProcessEntry {
             name: process.name,
             exe_path: (!process.identity.exe_path.is_empty())
                 .then(|| PathBuf::from(process.identity.exe_path)),
-            argv_count: process.cmdline.len(),
+            argv: process.cmdline,
         }
     }
+}
+
+fn escaped_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| escape_text(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn escape_text(value: &str) -> String {
+    let mut output = String::new();
+    for character in value.chars() {
+        for escaped in character.escape_default() {
+            output.push(escaped);
+        }
+    }
+    output
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let prefix = value
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    format!("{prefix}...")
+}
+
+pub(crate) fn selector_for_exe_path(exe_path: String) -> Selector {
+    Selector::term(
+        ProcessSelector {
+            exe_path_globs: vec![exe_path],
+            ..ProcessSelector::default()
+        },
+        TrafficSelector::default(),
+    )
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -188,7 +247,11 @@ mod tests {
         assert_eq!(catalog.entries().len(), 1);
         assert_eq!(catalog.entries()[0].pid, 42);
         assert_eq!(catalog.entries()[0].name, "curl");
-        assert_eq!(catalog.entries()[0].argv_count, 2);
+        assert_eq!(catalog.entries()[0].argv.len(), 2);
+        assert_eq!(
+            catalog.entries()[0].argv,
+            ["curl".to_string(), "https://example.com".to_string()]
+        );
         assert_eq!(
             catalog.entries()[0].exe_path,
             Some(PathBuf::from("/usr/bin/curl"))
@@ -202,7 +265,7 @@ mod tests {
             pid: 7,
             name: "curl".to_string(),
             exe_path: Some(PathBuf::from("/usr/bin/curl")),
-            argv_count: 0,
+            argv: Vec::new(),
         };
 
         let Some(selector) = entry.selector() else {
@@ -222,12 +285,37 @@ mod tests {
             pid: 7,
             name: "python".to_string(),
             exe_path: None,
-            argv_count: 1,
+            argv: vec!["python".to_string()],
         };
 
         assert_eq!(entry.selector(), None);
         assert_eq!(entry.selector_status(), "no safe selector");
-        assert_eq!(entry.detail(), "- | 1 argv entries hidden");
+        assert_eq!(entry.argv_summary(96), "python");
+    }
+
+    #[test]
+    fn process_entry_search_and_detail_include_argv() {
+        let entry = ProcessEntry {
+            pid: 7,
+            name: "python".to_string(),
+            exe_path: Some(PathBuf::from("/usr/bin/python")),
+            argv: vec![
+                "python".to_string(),
+                "-m".to_string(),
+                "http.server".to_string(),
+            ],
+        };
+
+        assert!(entry.matches_query("http.server"));
+        assert_eq!(
+            entry.argv_detail_lines(),
+            [
+                "argv[0]: python".to_string(),
+                "argv[1]: -m".to_string(),
+                "argv[2]: http.server".to_string()
+            ]
+        );
+        assert!(!format!("{entry:?}").contains("http.server"));
     }
 
     #[test]

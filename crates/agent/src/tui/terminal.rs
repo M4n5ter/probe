@@ -251,6 +251,7 @@ fn key_to_action(key: KeyEvent, editing_text: bool) -> Option<TuiAction> {
         (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => Some(TuiAction::Quit),
         (KeyCode::Char('/'), _) => Some(TuiAction::StartProcessSearch),
         (KeyCode::Char('f'), KeyModifiers::CONTROL) => Some(TuiAction::StartProcessSearch),
+        (KeyCode::Char('w'), _) => Some(TuiAction::ToggleProcessMonitor),
         (KeyCode::Tab, _) => Some(TuiAction::NextTab),
         (KeyCode::BackTab, _) => Some(TuiAction::PreviousTab),
         (KeyCode::Up, _) => Some(TuiAction::MoveUp),
@@ -283,6 +284,11 @@ fn mouse_to_action(hit_map: &HitMap, mouse: MouseEvent) -> Option<TuiAction> {
         MouseEventKind::Down(MouseButton::Left) => {
             hit_map.hit(mouse.column, mouse.row).map(TuiAction::Click)
         }
+        MouseEventKind::Moved => Some(TuiAction::Hover {
+            target: hit_map.hit(mouse.column, mouse.row),
+            column: mouse.column,
+            row: mouse.row,
+        }),
         MouseEventKind::ScrollUp => Some(TuiAction::MoveUp),
         MouseEventKind::ScrollDown => Some(TuiAction::MoveDown),
         _ => None,

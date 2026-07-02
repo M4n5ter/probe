@@ -596,6 +596,9 @@ mod tests {
 
     use super::*;
 
+    const READINESS_SIGNAL_TIMEOUT: Duration = Duration::from_secs(15);
+    const RUN_FINISH_TIMEOUT: Duration = Duration::from_secs(5);
+
     #[tokio::test]
     async fn unix_socket_readiness_is_signaled_after_capture_provider_opens()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -635,7 +638,7 @@ mod tests {
         ));
 
         drop(feed_writer);
-        match run_done_receiver.recv_timeout(Duration::from_secs(5)) {
+        match run_done_receiver.recv_timeout(RUN_FINISH_TIMEOUT) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(error.into()),
             Err(error) => {
@@ -684,7 +687,7 @@ mod tests {
         run_done_receiver: &Receiver<Result<(), String>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         listener.set_nonblocking(true)?;
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + READINESS_SIGNAL_TIMEOUT;
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {

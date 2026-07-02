@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::processes::ProcessCatalog;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6,6 +8,7 @@ pub(crate) struct ProcessViewState {
     scroll: usize,
     filter: String,
     visible_rows: usize,
+    monitored_exe_paths: BTreeSet<String>,
 }
 
 impl Default for ProcessViewState {
@@ -15,6 +18,7 @@ impl Default for ProcessViewState {
             scroll: 0,
             filter: String::new(),
             visible_rows: 12,
+            monitored_exe_paths: BTreeSet::new(),
         }
     }
 }
@@ -30,6 +34,32 @@ impl ProcessViewState {
 
     pub(crate) fn filter(&self) -> &str {
         &self.filter
+    }
+
+    pub(crate) fn monitored_exe_paths(&self) -> &BTreeSet<String> {
+        &self.monitored_exe_paths
+    }
+
+    pub(crate) fn monitored_process_count(&self, catalog: &ProcessCatalog) -> usize {
+        catalog
+            .entries()
+            .iter()
+            .filter(|process| self.monitors_process(process.selector_key().as_deref()))
+            .count()
+    }
+
+    pub(crate) fn monitors_process(&self, selector_key: Option<&str>) -> bool {
+        selector_key.is_some_and(|key| self.monitored_exe_paths.contains(key))
+    }
+
+    pub(crate) fn reconcile_monitors(&mut self, catalog: &ProcessCatalog) {
+        let live_keys = catalog
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.selector_key())
+            .collect::<BTreeSet<_>>();
+        self.monitored_exe_paths
+            .retain(|key| live_keys.contains(key));
     }
 
     pub(crate) fn set_viewport_rows(&mut self, rows: usize, catalog: &ProcessCatalog) {
@@ -58,6 +88,35 @@ impl ProcessViewState {
             self.selected_index = Some(index);
             self.keep_selected_visible(catalog);
         }
+    }
+
+    pub(crate) fn set_single_monitor(&mut self, index: usize, catalog: &ProcessCatalog) -> bool {
+        let Some(key) = catalog
+            .entries()
+            .get(index)
+            .and_then(|entry| entry.selector_key())
+        else {
+            return false;
+        };
+        self.monitored_exe_paths.clear();
+        self.monitored_exe_paths.insert(key);
+        self.select(index, catalog);
+        true
+    }
+
+    pub(crate) fn toggle_monitor(&mut self, index: usize, catalog: &ProcessCatalog) -> bool {
+        let Some(key) = catalog
+            .entries()
+            .get(index)
+            .and_then(|entry| entry.selector_key())
+        else {
+            return false;
+        };
+        if !self.monitored_exe_paths.remove(&key) {
+            self.monitored_exe_paths.insert(key);
+        }
+        self.select(index, catalog);
+        true
     }
 
     pub(crate) fn move_selection(&mut self, delta: isize, catalog: &ProcessCatalog) {

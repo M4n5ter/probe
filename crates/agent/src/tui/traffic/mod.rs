@@ -46,6 +46,10 @@ impl TrafficState {
         self.selected_index
     }
 
+    pub(crate) fn selected_row(&self) -> Option<&TrafficTableRow> {
+        self.rows.get(self.selected_index)
+    }
+
     pub(crate) fn scroll(&self) -> usize {
         self.scroll
     }

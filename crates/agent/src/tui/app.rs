@@ -8,7 +8,7 @@ use super::fields::{
 };
 use super::hit::HitTarget;
 use super::process_view::ProcessViewState;
-use super::processes::ProcessCatalog;
+use super::processes::{ProcessCatalog, selector_for_exe_path};
 use super::runtime_attachment::RuntimeAttachment;
 use super::traffic::TrafficState;
 
@@ -81,6 +81,12 @@ pub(crate) enum TuiAction {
     TextSubmit,
     TextCancel,
     StartProcessSearch,
+    ToggleProcessMonitor,
+    Hover {
+        target: Option<HitTarget>,
+        column: u16,
+        row: u16,
+    },
     Click(HitTarget),
     Save,
     Reload,
@@ -171,12 +177,23 @@ pub(crate) struct TuiApp {
     process_view: ProcessViewState,
     traffic: TrafficState,
     traffic_visible_rows: usize,
+    traffic_detail_open: bool,
+    traffic_detail_scroll: usize,
     runtime_attachment: RuntimeAttachment,
     dirty: bool,
     should_quit: bool,
     status: StatusMessage,
     processes: ProcessCatalog,
     text_edit: Option<TextEditSession>,
+    hovered_target: Option<HitTarget>,
+    hovered_process_argv: Option<ProcessArgvHover>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessArgvHover {
+    pub(crate) index: usize,
+    pub(crate) column: u16,
+    pub(crate) row: u16,
 }
 
 impl TuiApp {
@@ -194,12 +211,16 @@ impl TuiApp {
             process_view: ProcessViewState::default(),
             traffic: TrafficState::default(),
             traffic_visible_rows: 12,
+            traffic_detail_open: false,
+            traffic_detail_scroll: 0,
             runtime_attachment: RuntimeAttachment::default(),
             dirty: false,
             should_quit: false,
             status,
             processes,
             text_edit: None,
+            hovered_target: None,
+            hovered_process_argv: None,
         }
     }
 
@@ -253,6 +274,41 @@ impl TuiApp {
         &self.traffic
     }
 
+    pub(crate) fn traffic_detail_open(&self) -> bool {
+        self.traffic_detail_open
+    }
+
+    pub(crate) fn traffic_detail_scroll(&self) -> usize {
+        self.traffic_detail_scroll
+    }
+
+    pub(crate) fn traffic_filter_label(&self) -> String {
+        let monitored = self.process_view.monitored_process_count(&self.processes);
+        if monitored > 0 {
+            return format!("{monitored} watched processes");
+        }
+        self.selected_process_name()
+            .map(|name| format!("focused process: {name}"))
+            .unwrap_or_else(|| "no process selected".to_string())
+    }
+
+    pub(crate) fn process_is_monitored(&self, index: usize) -> bool {
+        self.processes
+            .entries()
+            .get(index)
+            .and_then(|process| process.selector_key())
+            .as_deref()
+            .is_some_and(|key| self.process_view.monitors_process(Some(key)))
+    }
+
+    pub(crate) fn hovered_process_argv(&self) -> Option<ProcessArgvHover> {
+        self.hovered_process_argv
+    }
+
+    pub(crate) fn is_hovered(&self, target: HitTarget) -> bool {
+        self.hovered_target == Some(target)
+    }
+
     pub(crate) fn status(&self) -> &StatusMessage {
         &self.status
     }
@@ -297,6 +353,9 @@ impl TuiApp {
         if self.text_edit.is_some() {
             return self.handle_text_edit_action(action);
         }
+        if self.traffic_detail_open {
+            return self.handle_traffic_detail_action(action);
+        }
         match action {
             TuiAction::NextTab => self.select_tab(self.active_tab.next()),
             TuiAction::PreviousTab => self.select_tab(self.active_tab.previous()),
@@ -309,6 +368,12 @@ impl TuiApp {
             | TuiAction::TextSubmit
             | TuiAction::TextCancel => {}
             TuiAction::StartProcessSearch => self.begin_process_search(),
+            TuiAction::ToggleProcessMonitor => self.toggle_selected_process_monitor(),
+            TuiAction::Hover {
+                target,
+                column,
+                row,
+            } => self.handle_hover(target, column, row),
             TuiAction::Click(target) => return self.handle_click(target),
             TuiAction::Save => {
                 return Some(TuiEffect::SaveConfig);
@@ -346,8 +411,13 @@ impl TuiApp {
         self.config = config;
         self.processes = processes;
         self.traffic = TrafficState::default();
+        self.traffic_detail_open = false;
+        self.traffic_detail_scroll = 0;
         self.text_edit = None;
+        self.hovered_target = None;
+        self.hovered_process_argv = None;
         self.dirty = false;
+        self.process_view.reconcile_monitors(&self.processes);
         self.status = StatusMessage::info("Reloaded config and process list");
         self.clamp_selection();
     }
@@ -379,8 +449,12 @@ impl TuiApp {
                 return self.activate_control(control, 1);
             }
             HitTarget::TextEditSubmit | HitTarget::TextEditCancel => {}
-            HitTarget::Process(index) => self.select_process(index),
+            HitTarget::Process(index) | HitTarget::ProcessArgv(index) => self.select_process(index),
+            HitTarget::ProcessMonitor(index) => self.toggle_process_monitor(index),
+            HitTarget::TrafficProcess(index) => self.watch_process_from_traffic(index),
             HitTarget::TrafficRow(index) => self.select_traffic_row(index),
+            HitTarget::TrafficDetailPanel | HitTarget::TextEditPanel => {}
+            HitTarget::TrafficDetailClose => self.close_traffic_detail(),
             HitTarget::Save => {
                 return Some(TuiEffect::SaveConfig);
             }
@@ -390,6 +464,14 @@ impl TuiApp {
             HitTarget::Quit => self.should_quit = true,
         }
         None
+    }
+
+    fn handle_hover(&mut self, target: Option<HitTarget>, column: u16, row: u16) {
+        self.hovered_target = target;
+        self.hovered_process_argv = match target {
+            Some(HitTarget::ProcessArgv(index)) => Some(ProcessArgvHover { index, column, row }),
+            _ => None,
+        };
     }
 
     fn select_tab(&mut self, tab: TuiTab) {
@@ -423,6 +505,41 @@ impl TuiApp {
         self.active_tab = TuiTab::Processes;
     }
 
+    fn toggle_process_monitor(&mut self, index: usize) {
+        if self.process_view.toggle_monitor(index, &self.processes) {
+            self.traffic = TrafficState::default();
+            self.traffic_detail_open = false;
+            self.traffic_detail_scroll = 0;
+            self.status = StatusMessage::info(self.traffic_filter_label());
+        } else {
+            self.status = StatusMessage::warning(
+                "Selected process has no readable executable path; traffic filter was not changed",
+            );
+        }
+    }
+
+    fn toggle_selected_process_monitor(&mut self) {
+        let Some(index) = self.process_view.selected_index() else {
+            self.status = StatusMessage::warning("No selected process");
+            return;
+        };
+        self.toggle_process_monitor(index);
+    }
+
+    fn watch_process_from_traffic(&mut self, index: usize) {
+        if self.process_view.set_single_monitor(index, &self.processes) {
+            self.traffic = TrafficState::default();
+            self.traffic_detail_open = false;
+            self.traffic_detail_scroll = 0;
+            self.active_tab = TuiTab::Traffic;
+            self.status = StatusMessage::info(self.traffic_filter_label());
+        } else {
+            self.status = StatusMessage::warning(
+                "Selected process has no readable executable path; traffic filter was not changed",
+            );
+        }
+    }
+
     fn move_selection(&mut self, delta: isize) {
         if self.active_tab == TuiTab::Processes {
             self.move_process(delta);
@@ -451,7 +568,7 @@ impl TuiApp {
             self.status = StatusMessage::warning(self.traffic.status().text.clone());
             return;
         };
-        let selector = match self.selected_process_selector() {
+        let selector = match self.traffic_filter_selector() {
             Some(selector) => selector,
             None if self.processes.entries().is_empty() => {
                 let message = "No readable process is selected; traffic filter was not changed";
@@ -485,9 +602,18 @@ impl TuiApp {
     fn select_traffic_row(&mut self, index: usize) {
         self.active_tab = TuiTab::Traffic;
         self.traffic.select_row(index, self.traffic_visible_rows);
+        self.open_traffic_detail();
     }
 
     fn adjust_selected(&mut self, direction: isize) -> Option<TuiEffect> {
+        if direction > 0 && self.active_tab == TuiTab::Traffic {
+            self.open_traffic_detail();
+            return None;
+        }
+        if direction > 0 && self.active_tab == TuiTab::Processes {
+            self.toggle_selected_process_monitor();
+            return None;
+        }
         let field = match self.selected_focus_target()? {
             FocusTarget::Field(field) => field,
             FocusTarget::Control(control) => return self.activate_control(control, direction),
@@ -537,6 +663,7 @@ impl TuiApp {
             return;
         };
         let label = field.label().to_string();
+        self.clear_hover();
         self.text_edit = Some(TextEditSession {
             target: TextEditTarget::Field(field),
             label: label.clone(),
@@ -548,6 +675,7 @@ impl TuiApp {
 
     fn begin_process_search(&mut self) {
         self.select_tab(TuiTab::Processes);
+        self.clear_hover();
         self.text_edit = Some(TextEditSession {
             target: TextEditTarget::ProcessSearch,
             label: "Process search".to_string(),
@@ -589,8 +717,14 @@ impl TuiApp {
             }
             TuiAction::TextCancel | TuiAction::Click(HitTarget::TextEditCancel) => {
                 self.text_edit = None;
+                self.clear_hover();
                 self.status = StatusMessage::info("Edit canceled");
             }
+            TuiAction::Hover {
+                target,
+                column,
+                row,
+            } => self.handle_hover(target, column, row),
             _ => {}
         }
         None
@@ -600,6 +734,7 @@ impl TuiApp {
         let Some(edit) = self.text_edit.take() else {
             return;
         };
+        self.clear_hover();
         match edit.target {
             TextEditTarget::Field(field) => {
                 match apply_text_field(&mut self.config, field, edit.buffer) {
@@ -632,6 +767,65 @@ impl TuiApp {
             .entries()
             .get(self.process_view.selected_index()?)
             .and_then(|process| process.selector())
+    }
+
+    fn traffic_filter_selector(&self) -> Option<probe_core::Selector> {
+        let selectors = self
+            .process_view
+            .monitored_exe_paths()
+            .iter()
+            .cloned()
+            .map(selector_for_exe_path)
+            .collect::<Vec<_>>();
+        match selectors.len() {
+            0 => self.selected_process_selector(),
+            1 => selectors.into_iter().next(),
+            _ => Some(probe_core::Selector::Any { selectors }),
+        }
+    }
+
+    fn open_traffic_detail(&mut self) {
+        if self.traffic.selected_row().is_some() {
+            self.clear_hover();
+            self.traffic_detail_open = true;
+            self.traffic_detail_scroll = 0;
+        }
+    }
+
+    fn close_traffic_detail(&mut self) {
+        self.traffic_detail_open = false;
+        self.traffic_detail_scroll = 0;
+        self.status = StatusMessage::info("Traffic detail closed");
+    }
+
+    fn handle_traffic_detail_action(&mut self, action: TuiAction) -> Option<TuiEffect> {
+        match action {
+            TuiAction::MoveUp => {
+                self.traffic_detail_scroll = self.traffic_detail_scroll.saturating_sub(1);
+            }
+            TuiAction::MoveDown => {
+                self.traffic_detail_scroll = self.traffic_detail_scroll.saturating_add(1);
+            }
+            TuiAction::TextCancel
+            | TuiAction::Quit
+            | TuiAction::Click(HitTarget::TrafficDetailClose) => self.close_traffic_detail(),
+            TuiAction::Hover {
+                target,
+                column,
+                row,
+            } => self.handle_hover(target, column, row),
+            TuiAction::Click(HitTarget::TrafficRow(index)) => {
+                self.traffic.select_row(index, self.traffic_visible_rows);
+                self.traffic_detail_scroll = 0;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn clear_hover(&mut self) {
+        self.hovered_target = None;
+        self.hovered_process_argv = None;
     }
 
     fn process_selector_warning(&self) -> StatusMessage {
@@ -745,7 +939,7 @@ mod tests {
                 pid: 42,
                 name: "python".to_string(),
                 exe_path: None,
-                argv_count: 1,
+                argv: vec!["python".to_string()],
             }]),
         );
         app.select_tab(TuiTab::Capture);
@@ -803,6 +997,93 @@ mod tests {
         assert!(app.filtered_process_indices().is_empty());
         assert_eq!(app.selected_process_index(), None);
         assert!(app.selected_process_selector().is_none());
+    }
+
+    #[test]
+    fn process_watch_set_builds_multi_process_traffic_selector() {
+        let mut app = multi_process_app();
+
+        app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(0)));
+        app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(1)));
+
+        assert!(app.process_is_monitored(0));
+        assert!(app.process_is_monitored(1));
+        assert_eq!(app.traffic_filter_label(), "2 watched processes");
+        let Some(probe_core::Selector::Any { selectors }) = app.traffic_filter_selector() else {
+            panic!("multiple watched processes should use any selector");
+        };
+        assert_eq!(selectors.len(), 2);
+    }
+
+    #[test]
+    fn config_reload_prunes_watched_processes_that_are_no_longer_visible() {
+        let mut app = multi_process_app();
+        app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(0)));
+        app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(1)));
+
+        app.replace_config(
+            app.config().clone(),
+            ProcessCatalog::from_entries([process(9, "python", "/usr/bin/python3")]),
+        );
+
+        assert!(!app.process_is_monitored(0));
+        assert_eq!(app.traffic_filter_label(), "focused process: python");
+        let Some(probe_core::Selector::Match { term }) = app.traffic_filter_selector() else {
+            panic!("traffic selector should fall back to the focused process");
+        };
+        assert_eq!(
+            term.process.exe_path_globs,
+            ["/usr/bin/python3".to_string()]
+        );
+    }
+
+    #[test]
+    fn process_argv_hover_tracks_mouse_position_and_target() {
+        let mut app = test_app();
+
+        app.handle_action(TuiAction::Hover {
+            target: Some(HitTarget::ProcessArgv(0)),
+            column: 40,
+            row: 9,
+        });
+
+        assert_eq!(
+            app.hovered_process_argv(),
+            Some(ProcessArgvHover {
+                index: 0,
+                column: 40,
+                row: 9
+            })
+        );
+        assert!(app.is_hovered(HitTarget::ProcessArgv(0)));
+
+        app.handle_action(TuiAction::Hover {
+            target: None,
+            column: 0,
+            row: 0,
+        });
+
+        assert_eq!(app.hovered_process_argv(), None);
+    }
+
+    #[test]
+    fn opening_text_edit_clears_stale_process_argv_hover() {
+        let mut app = test_app();
+        app.handle_action(TuiAction::Hover {
+            target: Some(HitTarget::ProcessArgv(0)),
+            column: 40,
+            row: 9,
+        });
+
+        app.handle_action(TuiAction::StartProcessSearch);
+        app.handle_action(TuiAction::Hover {
+            target: Some(HitTarget::TextEditSubmit),
+            column: 7,
+            row: 14,
+        });
+
+        assert_eq!(app.hovered_process_argv(), None);
+        assert!(app.is_hovered(HitTarget::TextEditSubmit));
     }
 
     #[tokio::test]
@@ -975,7 +1256,7 @@ mod tests {
                 pid: 42,
                 name: "curl".to_string(),
                 exe_path: Some(PathBuf::from("/usr/bin/curl")),
-                argv_count: 1,
+                argv: vec!["curl".to_string()],
             }]),
         )
     }
@@ -999,7 +1280,7 @@ mod tests {
             pid,
             name: name.to_string(),
             exe_path: Some(PathBuf::from(exe_path)),
-            argv_count: 1,
+            argv: vec![name.to_string()],
         }
     }
 
