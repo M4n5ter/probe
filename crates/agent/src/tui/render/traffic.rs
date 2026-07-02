@@ -385,6 +385,7 @@ fn render_traffic_events(
                 Cell::from(marker),
                 Cell::from(event.sequence.to_string()),
                 Cell::from(event.process.clone()),
+                Cell::from(event.capture_path),
                 Cell::from(event.event_type.clone()),
                 Cell::from(event.direction.clone()),
                 Cell::from(event.endpoint.clone()),
@@ -420,15 +421,19 @@ fn render_traffic_events(
             [
                 Constraint::Length(2),
                 Constraint::Length(8),
+                Constraint::Length(20),
+                Constraint::Length(12),
                 Constraint::Length(22),
-                Constraint::Length(24),
                 Constraint::Length(5),
-                Constraint::Length(24),
+                Constraint::Length(22),
                 Constraint::Min(20),
             ],
         )
         .header(
-            Row::new(["", "Seq", "Process", "Event", "Dir", "Remote", "Summary"]).style(
+            Row::new([
+                "", "Seq", "Process", "Path", "Event", "Dir", "Remote", "Summary",
+            ])
+            .style(
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),

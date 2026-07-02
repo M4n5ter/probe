@@ -22,8 +22,34 @@ pub enum CaptureSource {
 }
 
 impl CaptureSource {
+    pub const ALL: [Self; 9] = [
+        Self::EbpfSyscall,
+        Self::Libpcap,
+        Self::LibsslUprobe,
+        Self::TlsSessionSecret,
+        Self::ExternalPlaintextFeed,
+        Self::L7MitmPlaintext,
+        Self::L7MitmControlPlane,
+        Self::Replay,
+        Self::Mock,
+    ];
+
     pub fn is_live_host_observation(self) -> bool {
         matches!(self, Self::EbpfSyscall | Self::Libpcap | Self::LibsslUprobe)
+    }
+
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::EbpfSyscall => "ebpf_syscall",
+            Self::Libpcap => "libpcap",
+            Self::LibsslUprobe => "libssl_uprobe",
+            Self::TlsSessionSecret => "tls_session_secret",
+            Self::ExternalPlaintextFeed => "external_plaintext_feed",
+            Self::L7MitmPlaintext => "l7_mitm_plaintext",
+            Self::L7MitmControlPlane => "l7_mitm_control_plane",
+            Self::Replay => "replay",
+            Self::Mock => "mock",
+        }
     }
 
     pub const fn provider_kind(self) -> CaptureProviderKind {
@@ -167,6 +193,14 @@ mod tests {
     fn capture_provider_kind_round_trips_wire_name() -> Result<(), Box<dyn std::error::Error>> {
         for provider in CaptureProviderKind::ALL {
             assert_eq!(serde_json::to_value(provider)?, provider.wire_name());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn capture_source_round_trips_wire_name() -> Result<(), Box<dyn std::error::Error>> {
+        for source in CaptureSource::ALL {
+            assert_eq!(serde_json::to_value(source)?, source.wire_name());
         }
         Ok(())
     }

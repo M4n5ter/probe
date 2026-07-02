@@ -1,6 +1,6 @@
 use std::fmt;
 
-use probe_core::{Direction, EventEnvelope, EventKind};
+use probe_core::{CaptureOrigin, CaptureSource, Direction, EventEnvelope, EventKind};
 
 use crate::admin::{EventTailBudgetSnapshot, EventTailOmission, EventTailRecord};
 
@@ -8,6 +8,7 @@ use crate::admin::{EventTailBudgetSnapshot, EventTailOmission, EventTailRecord};
 pub(crate) struct TrafficRow {
     pub(crate) sequence: u64,
     pub(crate) process: String,
+    pub(crate) capture_path: &'static str,
     pub(crate) event_type: String,
     pub(crate) direction: String,
     pub(crate) endpoint: String,
@@ -30,6 +31,7 @@ impl TrafficRow {
         Self {
             sequence: omission.sequence,
             process: "tail".to_string(),
+            capture_path: "tail",
             event_type: "tail omission".to_string(),
             direction: "-".to_string(),
             endpoint: "-".to_string(),
@@ -66,6 +68,7 @@ impl TrafficRow {
             process: flow
                 .map(|flow| format!("{} ({})", flow.process.name, flow.process.identity.pid))
                 .unwrap_or_else(|| "provider".to_string()),
+            capture_path: capture_path_short_label(event.origin()),
             event_type: event.kind().event_type().as_str().to_string(),
             direction: event
                 .kind()
@@ -98,7 +101,7 @@ struct TrafficOmissionRow {
 fn event_preview_lines(row: &TrafficRow, event: &EventEnvelope, max_lines: usize) -> Vec<String> {
     let mut lines = vec![
         format!("Sequence: {}", row.sequence),
-        format!("Event type: {}", row.event_type),
+        format!("Event type: {} via {}", row.event_type, row.capture_path),
         format!("Direction: {}", row.direction),
         format!("Remote: {}", row.endpoint),
         format!("Summary: {}", row.summary),
@@ -138,11 +141,40 @@ impl fmt::Debug for TrafficRow {
             .debug_struct("TrafficRow")
             .field("sequence", &self.sequence)
             .field("process", &self.process)
+            .field("capture_path", &self.capture_path)
             .field("event_type", &self.event_type)
             .field("direction", &self.direction)
             .field("endpoint", &self.endpoint)
             .field("summary", &self.summary)
             .finish_non_exhaustive()
+    }
+}
+
+fn capture_path_short_label(origin: CaptureOrigin) -> &'static str {
+    match origin.source() {
+        CaptureSource::EbpfSyscall => "ebpf",
+        CaptureSource::Libpcap => "libpcap",
+        CaptureSource::LibsslUprobe => "tls-uprobe",
+        CaptureSource::TlsSessionSecret => "tls-secret",
+        CaptureSource::ExternalPlaintextFeed => "plaintext",
+        CaptureSource::L7MitmPlaintext => "mitm-data",
+        CaptureSource::L7MitmControlPlane => "mitm-ctrl",
+        CaptureSource::Replay => "replay",
+        CaptureSource::Mock => "mock",
+    }
+}
+
+fn capture_path_detail_label(origin: CaptureOrigin) -> &'static str {
+    match origin.source() {
+        CaptureSource::EbpfSyscall => "eBPF syscall capture",
+        CaptureSource::Libpcap => "libpcap passive capture",
+        CaptureSource::LibsslUprobe => "TLS plaintext uprobe",
+        CaptureSource::TlsSessionSecret => "TLS session secret decryption",
+        CaptureSource::ExternalPlaintextFeed => "external plaintext feed",
+        CaptureSource::L7MitmPlaintext => "MITM plaintext bridge",
+        CaptureSource::L7MitmControlPlane => "MITM control plane",
+        CaptureSource::Replay => "replay",
+        CaptureSource::Mock => "mock",
     }
 }
 
@@ -417,7 +449,15 @@ fn event_detail_lines(sequence: u64, event: &EventEnvelope) -> Vec<String> {
         format!("Event id: {}", event.id().as_str()),
         format!("Event type: {}", event.kind().event_type()),
         format!("Timestamp ns: {}", event.timestamp().wall_time_unix_ns),
-        format!("Origin: {:?}", event.origin()),
+        format!(
+            "Capture path: {}",
+            capture_path_detail_label(event.origin())
+        ),
+        format!(
+            "Origin: source={} provider={}",
+            event.origin().source().wire_name(),
+            event.origin().provider().wire_name()
+        ),
         format!("Config version: {}", event.config_version()),
         format!("Degraded: {}", event.degraded()),
     ];
@@ -553,12 +593,58 @@ mod tests {
 
         assert_eq!(row.sequence, 7);
         assert_eq!(row.process, "curl (42)");
+        assert_eq!(row.capture_path, "replay");
         assert_eq!(row.summary, "GET /health");
         assert!(!format!("{row:?}").contains("--secret-token"));
         assert!(
             row.detail_lines()
                 .iter()
                 .any(|line| line == "Executable: /usr/bin/curl")
+        );
+    }
+
+    #[test]
+    fn traffic_row_surfaces_capture_path_in_list_preview_and_detail() {
+        let event = EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            flow_with_raw_argv(),
+            CaptureOrigin::from_source(CaptureSource::L7MitmPlaintext),
+            "test",
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some("/mitm".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        );
+
+        let row = TrafficRow::from_event(7, event);
+
+        assert_eq!(row.capture_path, "mitm-data");
+        let compact_preview = row.preview_lines(3);
+        assert!(
+            compact_preview
+                .iter()
+                .any(|line| line == "Event type: http_request_headers via mitm-data"),
+            "compact preview should preserve the capture path: {compact_preview:?}"
+        );
+        assert!(
+            row.detail_lines()
+                .iter()
+                .any(|line| line == "Capture path: MITM plaintext bridge")
+        );
+        let expected_origin = "Origin: source=l7_mitm_plaintext provider=interception";
+        assert!(
+            row.detail_lines()
+                .iter()
+                .any(|line| line == expected_origin)
         );
     }
 
