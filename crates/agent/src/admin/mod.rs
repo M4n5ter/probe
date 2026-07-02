@@ -14,7 +14,8 @@ pub(crate) use client::{
 #[cfg(test)]
 pub(crate) use event_tail::EventTailOmissionReason;
 pub(crate) use event_tail::{
-    EventTailBudgetSnapshot, EventTailOmission, EventTailRecord, EventTailSnapshot,
+    EventDetailSnapshot, EventDetailTooLargeSnapshot, EventTailBudgetSnapshot, EventTailOmission,
+    EventTailRecord, EventTailSnapshot,
 };
 pub(crate) use protocol::AdminRequest;
 pub(crate) use server::{AdminRuntimeState, AdminServerHandle, spawn_admin_server};

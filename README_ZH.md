@@ -238,7 +238,8 @@ collector-specific payload format 仍应在配置和 policy 文件中维护。
 当配置中的 admin socket 已启用且 live agent 正在运行时，Traffic tab 会通过在线
 admin surface tail 已解析的 export event。它优先使用选中进程的 executable-path
 selector；如果选中进程没有可读 executable path，流量过滤会 fail closed，不会退回展示无关的全机流量。
-TUI 的事件表只保留展示摘要，不保留进程 raw argv。
+TUI 的事件表只保留展示摘要，不保留进程 raw argv。bounded tail row 需要完整 payload
+详情时，详情弹窗会通过 admin surface 在后台加载仍被保留的事件。
 同一 Traffic tab 也提供 `Watch`、`Out MITM` 和 `In MITM` 操作，选中进程后即可配置
 passive traffic scope 或 product-proxy MITM，不需要切换到单独的配置页面。出站 MITM
 quick action 默认使用 80 和 443 端口，让普通明文 HTTP 和 TLS 解密后 HTTP 进入同一条
@@ -987,6 +988,10 @@ cargo run -p agent -- admin \
 
 cargo run -p agent -- admin \
   --socket /run/traffic-probe/admin.sock \
+  event-detail --sequence 42
+
+cargo run -p agent -- admin \
+  --socket /run/traffic-probe/admin.sock \
   debug-dump
 ```
 
@@ -994,6 +999,10 @@ cargo run -p agent -- admin \
 event envelope，并只推进响应中的 `next_after_sequence`；它不会 ack exporter sink cursor。
 它只能读取仍被 `storage.retention.export` 保留的 records。超出 byte budget 的大事件会以
 omission metadata 表达，而不是无界展开到响应中。
+`event-detail --sequence <n>` 是单条事件检查接口。它按 sequence 读取仍被保留的一个
+export event；TUI 在 bounded tail row 需要完整 payload 详情时使用该接口。它会在单响应
+detail budget 内返回完整事件；超过该预算的记录返回 `event_detail_too_large` metadata，
+不会返回截断 payload。
 `debug-dump` 复用在线 status snapshot，并附带 admin protocol metadata。它包含
 runtime plan/status 字段和本地路径，但不包含 raw config 文本或 secret material 字节。
 

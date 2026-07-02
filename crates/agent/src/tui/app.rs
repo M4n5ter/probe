@@ -19,7 +19,7 @@ use super::runtime_attachment::RuntimeAttachment;
 use super::runtime_status::{
     local_traffic_runtime_diagnostics, request_traffic_runtime_diagnostics,
 };
-use super::traffic::TrafficState;
+use super::traffic::{TrafficDetailLoadRequest, TrafficDetailLoadResult, TrafficState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TuiTab {
@@ -114,6 +114,7 @@ pub(crate) enum TuiEffect {
     SaveConfig { saved_status: StatusMessage },
     ReloadConfig,
     ReloadRuntimeActions,
+    LoadTrafficDetail { sequence: u64 },
 }
 
 impl TuiEffect {
@@ -240,6 +241,7 @@ pub(crate) struct TuiApp {
     selected_field_index: usize,
     process_view: ProcessViewState,
     traffic: TrafficState,
+    traffic_detail_request_id: u64,
     traffic_visible_rows: usize,
     traffic_popup: Option<TrafficPopupState>,
     runtime_attachment: RuntimeAttachment,
@@ -274,6 +276,7 @@ impl TuiApp {
             selected_field_index: 0,
             process_view: ProcessViewState::default(),
             traffic: TrafficState::default(),
+            traffic_detail_request_id: 0,
             traffic_visible_rows: 12,
             traffic_popup: None,
             runtime_attachment: RuntimeAttachment::default(),
@@ -355,8 +358,7 @@ impl TuiApp {
             lines: match state.kind {
                 TrafficPopup::RowDetail => self
                     .traffic
-                    .selected_row()
-                    .map(|row| row.detail_lines())
+                    .selected_detail_lines()
                     .unwrap_or_else(|| vec!["No selected traffic row".to_string()]),
                 TrafficPopup::Diagnostics => self.data_path_diagnostics.detail_lines(),
             },
@@ -427,6 +429,7 @@ impl TuiApp {
     pub(crate) fn attach_agent(&mut self, attachment: RuntimeAttachment) {
         let status = attachment.status_text();
         self.runtime_attachment = attachment;
+        self.invalidate_traffic_detail_requests();
         self.refresh_local_runtime_diagnostics();
         self.status = StatusMessage::info(status);
     }
@@ -434,6 +437,7 @@ impl TuiApp {
     pub(crate) fn detach_agent(&mut self, message: impl Into<String>) {
         let message = message.into();
         self.runtime_attachment = RuntimeAttachment::lost(message.clone());
+        self.invalidate_traffic_detail_requests();
         self.status = StatusMessage::error(message);
         self.refresh_local_runtime_diagnostics();
     }
@@ -546,7 +550,7 @@ impl TuiApp {
             HitTarget::Process(index) | HitTarget::ProcessArgv(index) => self.select_process(index),
             HitTarget::ProcessMonitor(index) => self.toggle_process_monitor(index),
             HitTarget::TrafficProcess(index) => self.watch_process_from_traffic(index),
-            HitTarget::TrafficRow(index) => self.select_traffic_row(index),
+            HitTarget::TrafficRow(index) => return self.select_traffic_row(index),
             HitTarget::TrafficPopupPanel | HitTarget::TextEditPanel => {}
             HitTarget::TrafficPopupClose => self.close_traffic_popup(),
             HitTarget::Save => {
@@ -728,21 +732,72 @@ impl TuiApp {
         }
     }
 
+    pub(crate) fn begin_traffic_detail_load(
+        &mut self,
+        sequence: u64,
+    ) -> Option<TrafficDetailLoadRequest> {
+        let Some(socket_path) = self
+            .runtime_attachment
+            .active_socket_path()
+            .map(PathBuf::from)
+        else {
+            let message = format!(
+                "Cannot load full event detail {sequence}: {}",
+                self.runtime_agent_status()
+            );
+            self.traffic.mark_detail_failed(sequence, message.clone());
+            self.status = StatusMessage::warning(message);
+            return None;
+        };
+        let request_id = self.next_traffic_detail_request_id();
+        self.traffic.mark_detail_loading(sequence, request_id);
+        self.status = StatusMessage::info(self.traffic.status().text.clone());
+        Some(TrafficDetailLoadRequest {
+            socket_path,
+            sequence,
+            request_id,
+        })
+    }
+
+    pub(crate) fn apply_traffic_detail_result(&mut self, result: TrafficDetailLoadResult) {
+        if !self.traffic.apply_detail_load_result(result) {
+            return;
+        }
+        match self.traffic.status().kind {
+            super::traffic::TrafficStatusKind::Error
+            | super::traffic::TrafficStatusKind::Warning => {
+                self.status = StatusMessage::warning(self.traffic.status().text.clone());
+            }
+            super::traffic::TrafficStatusKind::Idle | super::traffic::TrafficStatusKind::Active => {
+                self.status = StatusMessage::info(self.traffic.status().text.clone());
+            }
+        }
+    }
+
+    fn next_traffic_detail_request_id(&mut self) -> u64 {
+        self.traffic_detail_request_id = self.traffic_detail_request_id.wrapping_add(1);
+        self.traffic_detail_request_id
+    }
+
+    fn invalidate_traffic_detail_requests(&mut self) {
+        self.traffic_detail_request_id = self.traffic_detail_request_id.wrapping_add(1);
+        self.traffic.clear_detail_state();
+    }
+
     fn move_traffic(&mut self, delta: isize) {
         self.traffic
             .move_selection(delta, self.traffic_visible_rows);
     }
 
-    fn select_traffic_row(&mut self, index: usize) {
+    fn select_traffic_row(&mut self, index: usize) -> Option<TuiEffect> {
         self.active_tab = TuiTab::Traffic;
         self.traffic.select_row(index, self.traffic_visible_rows);
-        self.open_traffic_detail();
+        self.open_traffic_detail()
     }
 
     fn adjust_selected(&mut self, direction: isize) -> Option<TuiEffect> {
         if direction > 0 && self.active_tab == TuiTab::Traffic {
-            self.open_traffic_detail();
-            return None;
+            return self.open_traffic_detail();
         }
         if direction > 0 && self.active_tab == TuiTab::Processes {
             self.toggle_selected_process_monitor();
@@ -998,10 +1053,13 @@ impl TuiApp {
         }
     }
 
-    fn open_traffic_detail(&mut self) {
+    fn open_traffic_detail(&mut self) -> Option<TuiEffect> {
         if self.traffic.selected_row().is_some() {
             self.open_traffic_popup(TrafficPopup::RowDetail);
         }
+        self.traffic
+            .selected_detail_fetch_sequence()
+            .map(|sequence| TuiEffect::LoadTrafficDetail { sequence })
     }
 
     fn open_traffic_diagnostics(&mut self) {
@@ -1047,7 +1105,7 @@ impl TuiApp {
             } => self.handle_hover(target, column, row),
             TuiAction::Click(HitTarget::TrafficRow(index)) => {
                 self.traffic.select_row(index, self.traffic_visible_rows);
-                self.open_traffic_popup(TrafficPopup::RowDetail);
+                return self.open_traffic_detail();
             }
             _ => {}
         }

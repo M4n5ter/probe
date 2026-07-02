@@ -23,6 +23,10 @@ pub(super) enum AdminCliCommand {
         #[arg(long)]
         process_exe_glob: Option<String>,
     },
+    EventDetail {
+        #[arg(long)]
+        sequence: u64,
+    },
     PlanConfigReload {
         #[arg(long)]
         config: PathBuf,
@@ -74,6 +78,7 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
             limit,
             selector: process_exe_glob.map(process_exe_selector),
         },
+        AdminCliCommand::EventDetail { sequence } => AdminRequest::EventDetail { sequence },
         AdminCliCommand::PlanConfigReload { config } => {
             AdminRequest::PlanConfigReload { path: config }
         }
@@ -154,6 +159,10 @@ mod tests {
                 limit: 10,
                 selector: Some(process_exe_selector("/usr/bin/curl".to_string())),
             }
+        );
+        assert_eq!(
+            admin_request(AdminCliCommand::EventDetail { sequence: 7 }),
+            AdminRequest::EventDetail { sequence: 7 }
         );
         assert_eq!(
             admin_request(AdminCliCommand::PlanConfigReload {

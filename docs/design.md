@@ -321,6 +321,11 @@ Operator TUI 能力事实：
   过滤，并返回 `next_after_sequence`；该响应 cursor 不会 ack 任何 exporter sink cursor。
   响应同时受单事件 payload budget 和总响应 payload budget 约束；超限事件通过 omission metadata 表达，不在响应中展开。
   当请求带 selector 且某条超限事件无法解码验证 selector 时，该事件不返回 omission metadata，只推进扫描 cursor。
+- `event_detail` 是 non-mutating admin command。它按 export sequence 读取仍被 retention 保留的一条
+  `EventEnvelope`，不推进 exporter sink cursor，也不受 `tail_events` 列表响应 budget 约束。
+  该命令仍受单响应详情预算约束：预算内返回完整事件；超过预算返回 `event_detail_too_large`
+  metadata，避免把巨大 retained record 序列化成单条 admin 响应。Traffic detail popup 在 tail row
+  为 omission 时通过后台任务使用该命令补齐详情，并在等待、too-large 或失败时保留 tail budget 诊断。
 - Runtime tab 通过 admin Unix socket 调用 `reload_runtime_actions`。该动作只执行 active `RuntimePlan`
   中可安全在线切换的 runtime owners：policy bundle reload 和 external enforcement manifest reload。
   响应按 action 独立展示成功或失败；它不替换运行中的主 agent config，也不改变 exporter sink cursor。
@@ -4753,6 +4758,9 @@ Admin socket：
 - JSON-lines 协议支持 `{"command":"metrics"}`。
 - JSON-lines 协议支持 `{"command":"prometheus_metrics"}`。
 - JSON-lines 协议支持 `{"command":"debug_dump"}`。
+- JSON-lines 协议支持 `{"command":"tail_events","after_sequence":0,"limit":50,"selector":null}`。
+- JSON-lines 协议支持 `{"command":"event_detail","sequence":42}`；响应 kind 为 `event_detail`、
+  `event_detail_too_large` 或 `error`。
 - JSON-lines 协议支持 `{"command":"plan_config_reload","path":"/etc/probe/agent.toml"}`。
 - JSON-lines 协议支持 `{"command":"reload_runtime_actions"}`。
 - JSON-lines 协议支持 `{"command":"reload_policies"}`。
@@ -4760,7 +4768,7 @@ Admin socket：
 - `debug_dump` 复用在线 status snapshot builder，并附带 admin protocol inventory 和 privacy declaration；它包含 runtime
   plan/status 字段和本地路径，但不包含 raw config 文本或 secret material 字节。
 - `agent admin --socket <path> <command>` 是该 JSON-lines 协议的一等 CLI client；`status`、`metrics`、`debug-dump`、
-  `plan-config-reload --config <path>`、`reload-runtime-actions`、`reload-policies` 和
+  `tail-events`、`event-detail --sequence <n>`、`plan-config-reload --config <path>`、`reload-runtime-actions`、`reload-policies` 和
   `reload-enforcement-policy` 输出 JSON，`prometheus-metrics` 输出 text exposition。
 - `agent admin <command>` 不带 `--socket` 时使用 `PROBE_HOME/run/admin.sock`。
 - admin socket parent directory 必须存在；显式服务级路径由部署层预创建。
@@ -6267,10 +6275,13 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 
 #### Admin command 覆盖
 
-- admin protocol inventory 测试覆盖 `tail_events` 的 non-mutating 标记，以及 `reload_runtime_actions`、
+- admin protocol inventory 测试覆盖 `tail_events` 和 `event_detail` 的 non-mutating 标记，以及 `reload_runtime_actions`、
   `reload_policies` 和 `reload_enforcement_policy` 的 mutating 标记。
 - admin tail event 测试覆盖 typed admin client 经 Unix socket 读取 durable export event tail、selector 过滤、
   `next_after_sequence` 推进和 exporter sink cursor 不被 ack。
+- admin event detail 测试覆盖 typed admin client 经 Unix socket 按 sequence 读取单条 durable export event、
+  missing sequence 错误、单响应预算 too-large metadata，以及 detail path 不 ack exporter sink cursor；
+  event tail 测试覆盖超出列表预算但仍在 detail 预算内的单条事件可通过 detail path 读取。
 - admin reload runtime actions 测试覆盖 per-action outcome：policy reload 成功和 enforcement runtime state 缺失失败会在同一响应中独立呈现。
 - xtask registry 将 `e2e-admin-runtime-actions-reload` 纳入 `live-core` profile。
 

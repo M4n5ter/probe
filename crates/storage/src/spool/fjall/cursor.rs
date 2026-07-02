@@ -74,6 +74,10 @@ impl FjallSpool {
         self.read_batch_from_lane_after(SpoolLane::Export, sequence, limit)
     }
 
+    pub fn read_export_record(&self, sequence: u64) -> Result<Option<StoredEvent>, StorageError> {
+        self.read_record_from_lane(SpoolLane::Export, sequence)
+    }
+
     pub fn ack_export(&self, sink: &str, sequence: u64) -> Result<(), StorageError> {
         self.ack_lane(SpoolLane::Export, sink, sequence)
     }
@@ -221,6 +225,25 @@ impl FjallSpool {
         }
 
         Ok(events)
+    }
+
+    fn read_record_from_lane(
+        &self,
+        lane: SpoolLane,
+        sequence: u64,
+    ) -> Result<Option<StoredEvent>, StorageError> {
+        if sequence == 0 || sequence > *self.lock_last_sequence(lane)? {
+            return Ok(None);
+        }
+        let Some(value) = self.queue(lane).get(sequence_key(sequence))? else {
+            return Ok(None);
+        };
+        let record = decode_spool_record(value.as_ref())?;
+        Ok(Some(StoredEvent {
+            sequence,
+            stored_at_unix_ns: record.stored_at_unix_ns,
+            payload: record.payload,
+        }))
     }
 
     fn ack_lane(&self, lane: SpoolLane, consumer: &str, sequence: u64) -> Result<(), StorageError> {

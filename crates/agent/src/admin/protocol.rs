@@ -51,6 +51,9 @@ admin_requests! {
         limit: usize,
         selector: Option<probe_core::Selector>,
     } => ("tail_events", false),
+    EventDetail {
+        sequence: u64,
+    } => ("event_detail", false),
     PlanConfigReload { path: PathBuf } => ("plan_config_reload", false),
     ReloadRuntimeActions => ("reload_runtime_actions", true),
     ReloadPolicies => ("reload_policies", true),
@@ -75,6 +78,12 @@ pub(super) enum AdminResponse {
     },
     EventTail {
         tail: Box<super::event_tail::EventTailSnapshot>,
+    },
+    EventDetail {
+        detail: Box<super::event_tail::EventDetailSnapshot>,
+    },
+    EventDetailTooLarge {
+        detail: Box<super::event_tail::EventDetailTooLargeSnapshot>,
     },
     ConfigReloadPlan {
         plan: Box<ConfigReloadPlanSnapshot>,

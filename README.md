@@ -279,7 +279,9 @@ The Traffic tab tails parsed export events from the active agent admin surface.
 It uses the selected process executable-path selector when available; if the
 selected process has no readable executable path, traffic filtering fails closed
 instead of showing unrelated host traffic. The TUI keeps only display summaries
-for the event table and does not retain raw process argv.
+for the event table and does not retain raw process argv. When a bounded tail
+row needs full payload detail, the detail popup loads the retained event through
+the admin surface in the background.
 The same tab also exposes `Watch`, `Out MITM`, and `In MITM` actions so a
 selected process can be scoped for passive traffic or product-proxy MITM without
 switching to a separate configuration screen. The outbound MITM quick action
@@ -1127,6 +1129,10 @@ cargo run -p agent -- admin \
 
 cargo run -p agent -- admin \
   --socket /run/traffic-probe/admin.sock \
+  event-detail --sequence 42
+
+cargo run -p agent -- admin \
+  --socket /run/traffic-probe/admin.sock \
   debug-dump
 ```
 
@@ -1136,6 +1142,11 @@ cursor (`next_after_sequence`); it does not acknowledge exporter sink cursors.
 It can only read records still retained by `storage.retention.export`. Large
 records are omitted with explicit omission metadata rather than expanded without
 a byte budget.
+`event-detail --sequence <n>` is the single-record companion for inspection. It
+reads one retained export event by sequence and is what the TUI uses when a
+bounded tail row needs full payload detail. It returns the complete event within
+the single-response detail budget; records beyond that budget return
+`event_detail_too_large` metadata instead of a truncated payload.
 `debug-dump` reuses the online status snapshot and adds admin protocol metadata.
 It includes runtime plan/status fields and local paths, but not raw config text
 or secret material bytes.

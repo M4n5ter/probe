@@ -24,6 +24,7 @@ use super::{
     processes::ProcessCatalog,
     render::draw,
     runtime_actions::request_runtime_actions_reload,
+    traffic::{TrafficDetailLoadResult, load_traffic_detail},
 };
 
 const TRAFFIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -57,8 +58,12 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
             .checked_sub(TRAFFIC_REFRESH_INTERVAL)
             .unwrap_or_else(Instant::now);
         let mut last_agent_poll = Instant::now();
+        let mut pending_traffic_detail: Option<PendingTrafficDetail> = None;
 
         loop {
+            if let Some(result) = take_finished_traffic_detail(&mut pending_traffic_detail).await {
+                app.apply_traffic_detail_result(result);
+            }
             if last_agent_poll.elapsed() >= TRAFFIC_REFRESH_INTERVAL {
                 let agent_exit = match supervisor.as_mut() {
                     Some(running) => match running.poll_exit().await {
@@ -128,8 +133,23 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                         Err(error) => app.mark_save_failed(error.to_string()),
                     },
                     TuiEffect::ReloadRuntimeActions => reload_runtime_actions(&mut app).await,
+                    TuiEffect::LoadTrafficDetail { sequence } => {
+                        if let Some(request) = app.begin_traffic_detail_load(sequence) {
+                            if let Some(pending) = pending_traffic_detail.take() {
+                                pending.task.abort();
+                            }
+                            pending_traffic_detail = Some(PendingTrafficDetail {
+                                sequence: request.sequence,
+                                request_id: request.request_id,
+                                task: tokio::spawn(load_traffic_detail(request)),
+                            });
+                        }
+                    }
                 }
             }
+        }
+        if let Some(pending) = pending_traffic_detail {
+            pending.task.abort();
         }
 
         Ok(())
@@ -139,6 +159,32 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
         supervisor.stop().await;
     }
     result
+}
+
+struct PendingTrafficDetail {
+    sequence: u64,
+    request_id: u64,
+    task: tokio::task::JoinHandle<TrafficDetailLoadResult>,
+}
+
+async fn take_finished_traffic_detail(
+    pending: &mut Option<PendingTrafficDetail>,
+) -> Option<TrafficDetailLoadResult> {
+    if !pending
+        .as_ref()
+        .is_some_and(|pending| pending.task.is_finished())
+    {
+        return None;
+    }
+    let pending = pending.take().expect("pending detail task was checked");
+    match pending.task.await {
+        Ok(result) => Some(result),
+        Err(error) => Some(TrafficDetailLoadResult::failed(
+            pending.sequence,
+            pending.request_id,
+            format!("traffic detail task failed: {error}"),
+        )),
+    }
 }
 
 async fn reconcile_saved_runtime(
@@ -787,6 +833,31 @@ mod tests {
                 .contains("captures plain HTTP and TLS-decrypted HTTP")
         );
         assert!(app.status().text.contains("restart failed"));
+    }
+
+    #[tokio::test]
+    async fn finished_traffic_detail_task_is_reaped_without_blocking() {
+        let mut pending = Some(PendingTrafficDetail {
+            sequence: 7,
+            request_id: 11,
+            task: tokio::spawn(async { TrafficDetailLoadResult::failed(7, 11, "detail failed") }),
+        });
+        for _ in 0..10 {
+            if pending
+                .as_ref()
+                .is_some_and(|pending| pending.task.is_finished())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let result = take_finished_traffic_detail(&mut pending)
+            .await
+            .expect("finished task should be reaped");
+
+        assert_eq!(result.sequence, 7);
+        assert!(pending.is_none());
     }
 
     fn first_hit_coordinate(

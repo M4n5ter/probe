@@ -7,6 +7,7 @@ const MAX_TAIL_LIMIT: usize = 256;
 const MAX_TAIL_SCAN: usize = 2_048;
 const MAX_TAIL_EVENT_PAYLOAD_BYTES: usize = 512 * 1024;
 const MAX_TAIL_RESPONSE_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_EVENT_DETAIL_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const SELECTOR_SCAN_MULTIPLIER: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +34,24 @@ pub(crate) struct EventTailRecord {
     pub sequence: u64,
     pub stored_at_unix_ns: u64,
     pub event: EventEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EventDetailSnapshot {
+    pub sequence: u64,
+    pub stored_at_unix_ns: u64,
+    pub payload_schema: String,
+    pub payload_bytes: usize,
+    pub event: EventEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EventDetailTooLargeSnapshot {
+    pub sequence: u64,
+    pub stored_at_unix_ns: u64,
+    pub payload_schema: String,
+    pub payload_bytes: usize,
+    pub max_payload_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +165,34 @@ pub(super) fn read_event_tail(
     })
 }
 
+pub(super) fn read_event_detail(
+    spool: &FjallSpool,
+    sequence: u64,
+) -> Result<EventDetailSnapshot, EventTailError> {
+    let stored = spool
+        .read_export_record(sequence)?
+        .ok_or(EventTailError::EventNotFound { sequence })?;
+    let payload_schema = stored.payload.schema().to_string();
+    let payload_bytes = stored.payload.bytes().len();
+    if payload_bytes > MAX_EVENT_DETAIL_PAYLOAD_BYTES {
+        return Err(EventTailError::EventDetailTooLarge {
+            sequence: stored.sequence,
+            stored_at_unix_ns: stored.stored_at_unix_ns,
+            payload_schema,
+            payload_bytes,
+            max_payload_bytes: MAX_EVENT_DETAIL_PAYLOAD_BYTES,
+        });
+    }
+    let record = decode_tail_record(stored)?;
+    Ok(EventDetailSnapshot {
+        sequence: record.sequence,
+        stored_at_unix_ns: record.stored_at_unix_ns,
+        payload_schema,
+        payload_bytes,
+        event: record.event,
+    })
+}
+
 fn normalize_limit(limit: usize) -> usize {
     limit.clamp(1, MAX_TAIL_LIMIT)
 }
@@ -193,6 +240,18 @@ pub(super) enum EventTailError {
     Selector(probe_core::SelectorError),
     #[error("storage error: {0}")]
     Storage(#[from] storage::StorageError),
+    #[error("export event sequence {sequence} was not found")]
+    EventNotFound { sequence: u64 },
+    #[error(
+        "export event sequence {sequence} payload has {payload_bytes} bytes, exceeding event_detail limit {max_payload_bytes} bytes"
+    )]
+    EventDetailTooLarge {
+        sequence: u64,
+        stored_at_unix_ns: u64,
+        payload_schema: String,
+        payload_bytes: usize,
+        max_payload_bytes: usize,
+    },
     #[error(
         "unexpected export payload schema at sequence {sequence}: expected {expected}, got {actual}"
     )]
@@ -203,6 +262,27 @@ pub(super) enum EventTailError {
     },
     #[error("failed to decode event envelope: {0}")]
     EventJson(#[from] serde_json::Error),
+}
+
+impl EventTailError {
+    pub(super) fn event_detail_too_large_snapshot(&self) -> Option<EventDetailTooLargeSnapshot> {
+        match self {
+            Self::EventDetailTooLarge {
+                sequence,
+                stored_at_unix_ns,
+                payload_schema,
+                payload_bytes,
+                max_payload_bytes,
+            } => Some(EventDetailTooLargeSnapshot {
+                sequence: *sequence,
+                stored_at_unix_ns: *stored_at_unix_ns,
+                payload_schema: payload_schema.clone(),
+                payload_bytes: *payload_bytes,
+                max_payload_bytes: *max_payload_bytes,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +414,57 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn event_detail_reads_single_event_ignored_by_tail_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        let event = large_body_event_for_exe("/usr/bin/curl", MAX_TAIL_EVENT_PAYLOAD_BYTES);
+        ExportEventWriter::new(&spool).append_occurrence(&event)?;
+
+        let tail = read_event_tail(
+            &spool,
+            EventTailRequest {
+                after_sequence: 0,
+                limit: 16,
+                selector: None,
+            },
+        )?;
+        assert!(tail.events.is_empty());
+        assert_eq!(tail.omissions.len(), 1);
+
+        let detail = read_event_detail(&spool, 1)?;
+
+        assert_eq!(detail.sequence, 1);
+        assert!(detail.payload_bytes > MAX_TAIL_EVENT_PAYLOAD_BYTES);
+        assert_eq!(detail.event, event);
+        assert_eq!(spool.export_cursor("primary")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn event_detail_reports_retained_event_too_large_for_single_response()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        let stored = spool.append_export(SpoolPayload::new(
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
+            vec![b' '; MAX_EVENT_DETAIL_PAYLOAD_BYTES + 1],
+        ))?;
+
+        let error =
+            read_event_detail(&spool, stored.sequence).expect_err("detail should be capped");
+        let snapshot = error
+            .event_detail_too_large_snapshot()
+            .expect("too large error should expose structured metadata");
+
+        assert_eq!(snapshot.sequence, stored.sequence);
+        assert_eq!(snapshot.payload_bytes, MAX_EVENT_DETAIL_PAYLOAD_BYTES + 1);
+        assert_eq!(snapshot.max_payload_bytes, MAX_EVENT_DETAIL_PAYLOAD_BYTES);
+        assert_eq!(spool.export_cursor("primary")?, 0);
+        Ok(())
+    }
+
     fn exe_selector(exe_path: &str) -> Selector {
         Selector::Match {
             term: Box::new(SelectorTerm {
@@ -364,6 +495,25 @@ mod tests {
                 reason: None,
                 version: "HTTP/1.1".to_string(),
                 headers: Vec::new(),
+            }),
+        )
+    }
+
+    fn large_body_event_for_exe(exe_path: &str, min_body_len: usize) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            flow_for_exe(exe_path),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::HttpBodyChunk(probe_core::BodyChunk {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                offset: 0,
+                data: vec![b'a'; min_body_len].into(),
+                end_stream: true,
             }),
         )
     }

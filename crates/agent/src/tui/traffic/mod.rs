@@ -1,19 +1,59 @@
 mod client;
 mod rows;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use probe_core::Selector;
 
-use self::{client::request_tail_events, rows::TrafficRow};
+use self::{
+    client::{request_event_detail, request_tail_events},
+    rows::TrafficRow,
+};
 use crate::{
-    admin::{AdminClientError, EventTailOmission, EventTailSnapshot},
+    admin::{AdminClientError, EventDetailSnapshot, EventTailOmission, EventTailSnapshot},
     tui::runtime_status::CaptureDiagnosticMessage,
 };
 
 pub(crate) use rows::TrafficRow as TrafficTableRow;
 
 const MAX_ROWS: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrafficDetailLoadRequest {
+    pub(crate) socket_path: PathBuf,
+    pub(crate) sequence: u64,
+    pub(crate) request_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrafficDetailLoadResult {
+    pub(crate) sequence: u64,
+    request_id: u64,
+    result: Result<EventDetailSnapshot, String>,
+}
+
+impl TrafficDetailLoadResult {
+    pub(crate) fn failed(sequence: u64, request_id: u64, message: impl Into<String>) -> Self {
+        Self {
+            sequence,
+            request_id,
+            result: Err(message.into()),
+        }
+    }
+}
+
+pub(crate) async fn load_traffic_detail(
+    request: TrafficDetailLoadRequest,
+) -> TrafficDetailLoadResult {
+    let result = request_event_detail(&request.socket_path, request.sequence)
+        .await
+        .map_err(|error| error.to_string());
+    TrafficDetailLoadResult {
+        sequence: request.sequence,
+        request_id: request.request_id,
+        result,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrafficState {
@@ -24,6 +64,7 @@ pub(crate) struct TrafficState {
     scroll: usize,
     status: TrafficStatus,
     last_export_sequence: u64,
+    detail_state: TrafficDetailState,
 }
 
 impl Default for TrafficState {
@@ -36,6 +77,7 @@ impl Default for TrafficState {
             scroll: 0,
             status: TrafficStatus::idle("Traffic view uses the running admin socket"),
             last_export_sequence: 0,
+            detail_state: TrafficDetailState::Idle,
         }
     }
 }
@@ -51,6 +93,47 @@ impl TrafficState {
 
     pub(crate) fn selected_row(&self) -> Option<&TrafficTableRow> {
         self.rows.get(self.selected_index)
+    }
+
+    pub(crate) fn selected_detail_lines(&self) -> Option<Vec<String>> {
+        let row = self.selected_row()?;
+        let mut lines = row.detail_lines();
+        match (&self.detail_state, row.detail_fetch_sequence()) {
+            (
+                TrafficDetailState::Loaded {
+                    sequence,
+                    row: detail,
+                },
+                Some(row_sequence),
+            ) if *sequence == row_sequence => return Some(detail.detail_lines()),
+            (TrafficDetailState::Loading { sequence, .. }, Some(row_sequence))
+                if *sequence == row_sequence =>
+            {
+                lines.push("Full event detail: loading from admin event_detail".to_string());
+            }
+            (TrafficDetailState::Failed { sequence, message }, Some(row_sequence))
+                if *sequence == row_sequence =>
+            {
+                lines.push("Full event detail fetch failed".to_string());
+                lines.push(format!("Reason: {message}"));
+            }
+            _ => {}
+        }
+        Some(lines)
+    }
+
+    pub(crate) fn selected_detail_fetch_sequence(&self) -> Option<u64> {
+        let row = self.selected_row()?;
+        let sequence = row.detail_fetch_sequence()?;
+        match &self.detail_state {
+            TrafficDetailState::Loading {
+                sequence: loading, ..
+            }
+            | TrafficDetailState::Loaded {
+                sequence: loading, ..
+            } if *loading == sequence => None,
+            _ => Some(sequence),
+        }
     }
 
     pub(crate) fn scroll(&self) -> usize {
@@ -91,7 +174,41 @@ impl TrafficState {
         }
     }
 
+    pub(crate) fn mark_detail_loading(&mut self, sequence: u64, request_id: u64) {
+        self.detail_state = TrafficDetailState::Loading {
+            sequence,
+            request_id,
+        };
+        self.status = TrafficStatus::active(format!("Loading full event detail {sequence}"));
+    }
+
+    pub(crate) fn mark_detail_failed(&mut self, sequence: u64, message: impl Into<String>) {
+        self.mark_detail_error(sequence, message.into());
+    }
+
+    pub(crate) fn apply_detail_load_result(&mut self, result: TrafficDetailLoadResult) -> bool {
+        if !matches!(
+            self.detail_state,
+            TrafficDetailState::Loading {
+                sequence,
+                request_id
+            } if sequence == result.sequence && request_id == result.request_id
+        ) {
+            return false;
+        }
+        match result.result {
+            Ok(detail) => self.apply_detail(detail),
+            Err(message) => self.mark_detail_error(result.sequence, message),
+        }
+        true
+    }
+
+    pub(crate) fn clear_detail_state(&mut self) {
+        self.detail_state = TrafficDetailState::Idle;
+    }
+
     pub(crate) fn mark_admin_unavailable(&mut self, message: impl Into<String>) {
+        self.clear_detail_state();
         self.status = TrafficStatus::error(message);
     }
 
@@ -116,6 +233,7 @@ impl TrafficState {
         self.rows.clear();
         self.selected_index = 0;
         self.scroll = 0;
+        self.clear_detail_state();
         self.status = TrafficStatus::error(message);
     }
 
@@ -141,6 +259,7 @@ impl TrafficState {
         self.rows.clear();
         self.selected_index = 0;
         self.scroll = 0;
+        self.detail_state = TrafficDetailState::Idle;
         self.status = TrafficStatus::idle("Traffic filter changed");
     }
 
@@ -158,6 +277,21 @@ impl TrafficState {
         }
         self.clamp_selection();
         self.status = status;
+    }
+
+    fn apply_detail(&mut self, detail: EventDetailSnapshot) {
+        let row = TrafficRow::from_detail(detail);
+        self.status = TrafficStatus::active(format!("Loaded full event detail {}", row.sequence));
+        self.detail_state = TrafficDetailState::Loaded {
+            sequence: row.sequence,
+            row: Box::new(row),
+        };
+    }
+
+    fn mark_detail_error(&mut self, sequence: u64, message: String) {
+        self.detail_state = TrafficDetailState::Failed { sequence, message };
+        self.status =
+            TrafficStatus::warning(format!("Failed to load full event detail {sequence}"));
     }
 
     fn clamp_selection(&mut self) {
@@ -182,6 +316,14 @@ impl TrafficState {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrafficDetailState {
+    Idle,
+    Loading { sequence: u64, request_id: u64 },
+    Loaded { sequence: u64, row: Box<TrafficRow> },
+    Failed { sequence: u64, message: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,12 +450,19 @@ fn traffic_refresh_error_message(error: &client::TrafficClientError) -> String {
 #[cfg(test)]
 mod tests {
     use probe_config::{CaptureBackend, CaptureSelection};
-    use probe_core::{RuntimeMode, SpoolPayloadSchema};
+    use probe_core::{
+        AddressPort, BodyChunk, CaptureOrigin, CaptureSource, EventEnvelope, EventKind,
+        FlowContext, FlowIdentity, ProcessContext, ProcessIdentity, RuntimeMode,
+        SpoolPayloadSchema, Timestamp, TransportProtocol,
+    };
     use runtime::{CaptureEvidenceMode, CaptureInputSource, CapturePlanMode};
 
     use super::*;
     use crate::{
-        admin::{EventTailBudgetSnapshot, EventTailOmissionReason, EventTailSnapshot},
+        admin::{
+            EventDetailSnapshot, EventTailBudgetSnapshot, EventTailOmissionReason,
+            EventTailSnapshot,
+        },
         status::{
             CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
         },
@@ -391,6 +540,142 @@ mod tests {
         assert!(details.iter().any(|line| {
             line == "Payload schema: traffic.probe.event_envelope.subject_origin.json"
         }));
+    }
+
+    #[test]
+    fn omitted_tail_row_can_be_replaced_by_full_event_detail() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+
+        assert_eq!(traffic.selected_detail_fetch_sequence(), Some(2));
+        traffic.mark_detail_loading(2, 11);
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("selected detail")
+                .iter()
+                .any(|line| line == "Full event detail: loading from admin event_detail")
+        );
+
+        let payload = "large response body ".repeat(128);
+        traffic.apply_detail_load_result(TrafficDetailLoadResult {
+            sequence: 2,
+            request_id: 11,
+            result: Ok(EventDetailSnapshot {
+                sequence: 2,
+                stored_at_unix_ns: 99,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: payload.len(),
+                event: body_event(payload.as_bytes()),
+            }),
+        });
+
+        assert_eq!(traffic.selected_detail_fetch_sequence(), None);
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("selected detail")
+                .iter()
+                .any(|line| line == &format!("Body payload: {payload}"))
+        );
+    }
+
+    #[test]
+    fn omitted_tail_row_detail_reports_fetch_errors() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+
+        traffic.mark_detail_loading(2, 11);
+        traffic.apply_detail_load_result(TrafficDetailLoadResult::failed(
+            2,
+            11,
+            "admin socket is unavailable",
+        ));
+
+        let lines = traffic
+            .selected_detail_lines()
+            .expect("selected detail should remain visible");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Full event detail fetch failed")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Reason: admin socket is unavailable")
+        );
+    }
+
+    #[test]
+    fn stale_detail_result_does_not_override_current_request() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+        traffic.mark_detail_loading(2, 11);
+        traffic.mark_detail_loading(2, 12);
+
+        let stale_payload = b"stale detail";
+        assert!(!traffic.apply_detail_load_result(TrafficDetailLoadResult {
+            sequence: 2,
+            request_id: 11,
+            result: Ok(EventDetailSnapshot {
+                sequence: 2,
+                stored_at_unix_ns: 99,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: stale_payload.len(),
+                event: body_event(stale_payload),
+            }),
+        }));
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("selected detail")
+                .iter()
+                .any(|line| line == "Full event detail: loading from admin event_detail")
+        );
+
+        let current_payload = b"current detail";
+        assert!(traffic.apply_detail_load_result(TrafficDetailLoadResult {
+            sequence: 2,
+            request_id: 12,
+            result: Ok(EventDetailSnapshot {
+                sequence: 2,
+                stored_at_unix_ns: 99,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: current_payload.len(),
+                event: body_event(current_payload),
+            }),
+        }));
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("selected detail")
+                .iter()
+                .any(|line| line == "Body payload: current detail")
+        );
+    }
+
+    #[test]
+    fn stale_detail_result_after_filter_unavailable_is_ignored() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+        traffic.mark_detail_loading(2, 11);
+
+        traffic.mark_filter_unavailable("Selected process has no readable executable path");
+
+        assert!(!traffic.apply_detail_load_result(TrafficDetailLoadResult {
+            sequence: 2,
+            request_id: 11,
+            result: Ok(EventDetailSnapshot {
+                sequence: 2,
+                stored_at_unix_ns: 99,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: 0,
+                event: body_event(b"stale detail"),
+            }),
+        }));
+        assert!(traffic.selected_detail_lines().is_none());
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
     }
 
     fn fallback_capture_snapshot() -> CaptureStatusSnapshot {
@@ -477,6 +762,71 @@ mod tests {
                 payload_bytes: 4096,
                 reason: EventTailOmissionReason::ResponseBudgetExceeded,
             }],
+        }
+    }
+
+    fn body_event(body: &[u8]) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            test_flow(),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::HttpBodyChunk(BodyChunk {
+                direction: probe_core::Direction::Outbound,
+                stream_sequence: 1,
+                offset: 0,
+                data: body.to_vec().into(),
+                end_stream: true,
+            }),
+        )
+    }
+
+    fn test_flow() -> FlowContext {
+        let process = ProcessContext {
+            identity: ProcessIdentity {
+                pid: 42,
+                tgid: 42,
+                start_time_ticks: 7,
+                boot_id: "boot".to_string(),
+                exe_path: "/usr/bin/curl".to_string(),
+                cmdline_hash: "hash".to_string(),
+                uid: 1000,
+                gid: 1000,
+                cgroup: None,
+                systemd_service: None,
+                container_id: None,
+                runtime_hint: None,
+            },
+            name: "curl".to_string(),
+            cmdline: vec!["curl".to_string()],
+        };
+        let local = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 50_000,
+        };
+        let remote = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 80,
+        };
+        FlowContext {
+            id: FlowIdentity::stable(
+                &process.identity,
+                &local,
+                &remote,
+                TransportProtocol::Tcp,
+                1,
+                None,
+            ),
+            process,
+            local,
+            remote,
+            protocol: TransportProtocol::Tcp,
+            start_monotonic_ns: 1,
+            socket_cookie: None,
+            attribution_confidence: 100,
         }
     }
 }

@@ -5,7 +5,7 @@ use probe_core::{
 };
 
 use crate::{
-    admin::{EventTailBudgetSnapshot, EventTailOmission, EventTailRecord},
+    admin::{EventDetailSnapshot, EventTailBudgetSnapshot, EventTailOmission, EventTailRecord},
     tui::copy::{MITM_HTTP_PATH_LABEL, MITM_TLS_PATH_LABEL},
 };
 
@@ -24,6 +24,10 @@ pub(crate) struct TrafficRow {
 impl TrafficRow {
     pub(super) fn from_record(record: EventTailRecord) -> Self {
         Self::from_event(record.sequence, record.event)
+    }
+
+    pub(super) fn from_detail(detail: EventDetailSnapshot) -> Self {
+        Self::from_event(detail.sequence, detail.event)
     }
 
     pub(super) fn from_omission(
@@ -63,6 +67,10 @@ impl TrafficRow {
                 omission_preview_lines(self.sequence, omission, max_lines)
             }
         }
+    }
+
+    pub(crate) fn detail_fetch_sequence(&self) -> Option<u64> {
+        matches!(self.payload, TrafficRowPayload::Omission(_)).then_some(self.sequence)
     }
 
     fn from_event(sequence: u64, event: EventEnvelope) -> Self {
