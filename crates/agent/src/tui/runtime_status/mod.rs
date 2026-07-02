@@ -190,7 +190,7 @@ mod tests {
         tcp_health::TcpHealthMode,
         tui::{
             controls::ControlId,
-            copy::{MITM_PLAINTEXT_COVERAGE, MITM_QUICK_SETUP_APPLY},
+            copy::{MITM_PLAINTEXT_COVERAGE, MITM_QUICK_SETUP_APPLY, MITM_TLS_TRUST_ACTION},
         },
     };
 
@@ -292,8 +292,53 @@ mod tests {
         assert!(
             lines
                 .iter()
+                .any(|line| line == &format!("coverage: {MITM_PLAINTEXT_COVERAGE}"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == &format!("tls trust action: {MITM_TLS_TRUST_ACTION}"))
+        );
+        let expected_next_action =
+            format!("next action: MITM TLS trust needs attention: {MITM_TLS_TRUST_ACTION}");
+        assert!(lines.iter().any(|line| line == &expected_next_action));
+        assert!(
+            lines
+                .iter()
                 .any(|line| line.contains("l7 mitm backend health: healthy"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_next_step_reports_disabled_mitm_client_trust()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut enforcement = configured_mitm_enforcement_status_json()?;
+        enforcement["interception"]["mitm"]["client_trust"] = json!({ "mode": "disabled" });
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": null,
+                    "mode": "unavailable",
+                    "reason": "no passive provider is available",
+                    "candidates": [],
+                    "open_failures": []
+                },
+                "enforcement": enforcement
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+        let lines = diagnostics.detail_lines();
+
+        assert!(lines.iter().any(|line| {
+            line == "tls trust action: configure MITM client trust before expecting TLS-decrypted HTTP"
+        }));
+        assert!(lines.iter().any(|line| {
+            line == "next action: MITM TLS trust needs attention: configure MITM client trust before expecting TLS-decrypted HTTP"
+        }));
         Ok(())
     }
 

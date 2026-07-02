@@ -11,7 +11,7 @@ use crate::{
     status::{EnforcementStatusMode, EnforcementStatusSnapshot},
     tcp_health::{TcpHealthMode, TcpHealthSnapshot},
     transparent_interception::{TransparentProxyRuntimeMode, TransparentProxyRuntimeSnapshot},
-    tui::copy::MITM_PLAINTEXT_COVERAGE,
+    tui::copy::{MITM_PLAINTEXT_COVERAGE, MITM_TLS_TRUST_ACTION},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,8 +79,7 @@ impl MitmDiagnostics {
                 "MITM path needs a plaintext bridge to feed captured {MITM_PLAINTEXT_COVERAGE} into traffic events"
             );
         }
-        "MITM path is configured; inspect backend health, client trust, and plaintext bridge status"
-            .to_string()
+        mitm_client_trust_next_step(&self.client_trust)
     }
 
     pub(super) fn detail_lines(&self) -> Vec<String> {
@@ -99,6 +98,7 @@ impl MitmDiagnostics {
                     "missing"
                 }
             ),
+            format!("coverage: {MITM_PLAINTEXT_COVERAGE}"),
             format!(
                 "backend: {}{}",
                 mitm_backend_name(&self.backend),
@@ -109,6 +109,10 @@ impl MitmDiagnostics {
             format!(
                 "client trust: {}",
                 mitm_client_trust_name(&self.client_trust)
+            ),
+            format!(
+                "tls trust action: {}",
+                mitm_client_trust_action(&self.client_trust)
             ),
             self.plaintext_bridge_line(),
         ];
@@ -312,6 +316,26 @@ fn mitm_client_trust_name(
     match client_trust {
         TransparentInterceptionMitmClientTrustPlan::Disabled => "disabled",
         TransparentInterceptionMitmClientTrustPlan::OperatorManaged => "operator_managed",
+    }
+}
+
+fn mitm_client_trust_next_step(
+    client_trust: &TransparentInterceptionMitmClientTrustPlan,
+) -> String {
+    format!(
+        "MITM TLS trust needs attention: {}",
+        mitm_client_trust_action(client_trust)
+    )
+}
+
+fn mitm_client_trust_action(client_trust: &TransparentInterceptionMitmClientTrustPlan) -> String {
+    match client_trust {
+        TransparentInterceptionMitmClientTrustPlan::Disabled => {
+            "configure MITM client trust before expecting TLS-decrypted HTTP".to_string()
+        }
+        TransparentInterceptionMitmClientTrustPlan::OperatorManaged => {
+            MITM_TLS_TRUST_ACTION.to_string()
+        }
     }
 }
 

@@ -102,14 +102,19 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
             };
             if let Some(effect) = app.handle_action(action) {
                 match effect {
-                    TuiEffect::SaveConfig => {
+                    TuiEffect::SaveConfig { saved_status } => {
                         let should_reconcile_runtime = app.dirty() || supervisor.as_ref().is_none();
                         match save_config(app.config_path(), &loaded.source, app.config()) {
                             Ok(source) => {
                                 loaded.source = source;
-                                app.mark_saved();
+                                app.mark_saved(saved_status.clone());
                                 if should_reconcile_runtime {
-                                    reconcile_saved_runtime(&mut supervisor, &mut app).await;
+                                    reconcile_saved_runtime(
+                                        &mut supervisor,
+                                        &mut app,
+                                        &saved_status,
+                                    )
+                                    .await;
                                 }
                             }
                             Err(error) => app.mark_save_failed(error.to_string()),
@@ -136,46 +141,105 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
     result
 }
 
-async fn reconcile_saved_runtime(supervisor: &mut Option<TuiAgentSupervisor>, app: &mut TuiApp) {
+async fn reconcile_saved_runtime(
+    supervisor: &mut Option<TuiAgentSupervisor>,
+    app: &mut TuiApp,
+    saved_status: &super::app::StatusMessage,
+) {
     let config = app.config().clone();
     match supervisor.take() {
         Some(running) if running.is_managed() => match running.restart(&config).await {
             Ok(next) => {
                 app.attach_agent(next.attachment(&config));
-                app.mark_info(format!(
-                    "Saved config and restarted TUI managed agent; {}",
-                    app.runtime_agent_status()
-                ));
+                mark_saved_runtime_success(
+                    app,
+                    saved_status,
+                    format!(
+                        "restarted TUI managed agent; {}",
+                        app.runtime_agent_status()
+                    ),
+                );
                 *supervisor = Some(next);
             }
             Err(error) => {
-                app.detach_agent(format!(
-                    "Saved config but failed to restart TUI managed agent: {error}"
-                ));
+                detach_saved_runtime_error(
+                    app,
+                    saved_status,
+                    format!("failed to restart TUI managed agent: {error}"),
+                );
             }
         },
         Some(running) => {
-            app.mark_warning(
-                "Saved config; restart the attached agent to apply capture and MITM runtime resources",
+            mark_saved_runtime_warning(
+                app,
+                saved_status,
+                "restart the attached agent to apply capture and MITM runtime resources",
             );
             *supervisor = Some(running);
         }
         None => match TuiAgentSupervisor::attach_or_spawn(&config).await {
             Ok(next) => {
                 app.attach_agent(next.attachment(&config));
-                app.mark_info(format!(
-                    "Saved config and attached TUI agent; {}",
-                    app.runtime_agent_status()
-                ));
+                mark_saved_runtime_success(
+                    app,
+                    saved_status,
+                    format!("attached TUI agent; {}", app.runtime_agent_status()),
+                );
                 *supervisor = Some(next);
             }
             Err(error) => {
-                app.mark_error(format!(
-                    "Saved config but TUI agent is still unavailable: {error}"
-                ));
+                mark_saved_runtime_error(
+                    app,
+                    saved_status,
+                    format!("TUI agent is still unavailable: {error}"),
+                );
             }
         },
     }
+}
+
+fn mark_saved_runtime_success(
+    app: &mut TuiApp,
+    saved_status: &super::app::StatusMessage,
+    suffix: impl AsRef<str>,
+) {
+    let text = saved_runtime_status_text(saved_status, suffix);
+    match saved_status.kind {
+        super::app::StatusKind::Warning => app.mark_warning(text),
+        super::app::StatusKind::Error => app.mark_error(text),
+        _ => app.mark_info(text),
+    }
+}
+
+fn mark_saved_runtime_warning(
+    app: &mut TuiApp,
+    saved_status: &super::app::StatusMessage,
+    suffix: impl AsRef<str>,
+) {
+    app.mark_warning(saved_runtime_status_text(saved_status, suffix));
+}
+
+fn mark_saved_runtime_error(
+    app: &mut TuiApp,
+    saved_status: &super::app::StatusMessage,
+    suffix: impl AsRef<str>,
+) {
+    app.mark_error(saved_runtime_status_text(saved_status, suffix));
+}
+
+fn detach_saved_runtime_error(
+    app: &mut TuiApp,
+    saved_status: &super::app::StatusMessage,
+    suffix: impl AsRef<str>,
+) {
+    app.detach_agent(saved_runtime_status_text(saved_status, suffix));
+}
+
+fn saved_runtime_status_text(
+    saved_status: &super::app::StatusMessage,
+    suffix: impl AsRef<str>,
+) -> String {
+    format!("{}; {}", saved_status.text, suffix.as_ref())
 }
 
 async fn reload_runtime_actions(app: &mut TuiApp) {
@@ -372,7 +436,7 @@ mod tests {
 
     use super::{
         super::{
-            app::{TuiAction, TuiApp, TuiTab},
+            app::{StatusKind, StatusMessage, TuiAction, TuiApp, TuiTab},
             hit::{HitArea, HitMap, HitTarget, ScrollTarget},
             processes::{ProcessCatalog, ProcessEntry},
             render::draw,
@@ -645,6 +709,84 @@ mod tests {
 
         assert_eq!(resolve_config_path(Some(explicit.clone())), explicit);
         assert_eq!(resolve_config_path(None), default_config_path());
+    }
+
+    #[test]
+    fn saved_runtime_success_preserves_warning_severity() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let status = StatusMessage::warning(
+            "Outbound MITM configured, but MITM proxy executable is missing",
+        );
+
+        mark_saved_runtime_success(&mut app, &status, "restarted TUI managed agent");
+
+        assert_eq!(app.status().kind, StatusKind::Warning);
+        assert!(
+            app.status()
+                .text
+                .contains("MITM proxy executable is missing")
+        );
+        assert!(app.status().text.contains("restarted TUI managed agent"));
+    }
+
+    #[test]
+    fn saved_runtime_error_preserves_operation_context() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let status = StatusMessage::saved(
+            "Outbound MITM configured; captures plain HTTP and TLS-decrypted HTTP",
+        );
+
+        mark_saved_runtime_error(
+            &mut app,
+            &status,
+            "TUI agent is still unavailable: startup failed",
+        );
+
+        assert_eq!(app.status().kind, StatusKind::Error);
+        assert!(
+            app.status()
+                .text
+                .contains("captures plain HTTP and TLS-decrypted HTTP")
+        );
+        assert!(app.status().text.contains("startup failed"));
+    }
+
+    #[test]
+    fn saved_runtime_detach_error_preserves_operation_context() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let status = StatusMessage::saved(
+            "Outbound MITM configured; captures plain HTTP and TLS-decrypted HTTP",
+        );
+
+        detach_saved_runtime_error(
+            &mut app,
+            &status,
+            "failed to restart TUI managed agent: restart failed",
+        );
+
+        assert_eq!(app.status().kind, StatusKind::Error);
+        assert!(
+            app.status()
+                .text
+                .contains("captures plain HTTP and TLS-decrypted HTTP")
+        );
+        assert!(
+            app.runtime_agent_status()
+                .contains("captures plain HTTP and TLS-decrypted HTTP")
+        );
+        assert!(app.status().text.contains("restart failed"));
     }
 
     fn first_hit_coordinate(

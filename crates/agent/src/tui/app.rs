@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use probe_config::AgentConfig;
 
 use super::controls::{ControlId, FocusTarget, focus_targets_for_tab};
+use super::copy::{MITM_PLAINTEXT_COVERAGE, MITM_TLS_TRUST_ACTION};
 use super::fields::{
     FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
 };
@@ -105,11 +106,23 @@ pub(crate) enum TuiAction {
     Quit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TuiEffect {
-    SaveConfig,
+    SaveConfig { saved_status: StatusMessage },
     ReloadConfig,
     ReloadRuntimeActions,
+}
+
+impl TuiEffect {
+    fn save_config() -> Self {
+        Self::SaveConfig {
+            saved_status: StatusMessage::saved("Saved config"),
+        }
+    }
+
+    fn save_config_with_status(saved_status: StatusMessage) -> Self {
+        Self::SaveConfig { saved_status }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,7 +457,7 @@ impl TuiApp {
             } => self.handle_hover(target, column, row),
             TuiAction::Click(target) => return self.handle_click(target),
             TuiAction::Save => {
-                return Some(TuiEffect::SaveConfig);
+                return Some(TuiEffect::save_config());
             }
             TuiAction::Reload => {
                 return Some(TuiEffect::ReloadConfig);
@@ -454,9 +467,9 @@ impl TuiApp {
         None
     }
 
-    pub(crate) fn mark_saved(&mut self) {
+    pub(crate) fn mark_saved(&mut self, saved_status: StatusMessage) {
         self.dirty = false;
-        self.status = StatusMessage::saved("Saved config");
+        self.status = saved_status;
     }
 
     pub(crate) fn mark_info(&mut self, message: impl Into<String>) {
@@ -520,7 +533,7 @@ impl TuiApp {
             HitTarget::TrafficPopupPanel | HitTarget::TextEditPanel => {}
             HitTarget::TrafficPopupClose => self.close_traffic_popup(),
             HitTarget::Save => {
-                return Some(TuiEffect::SaveConfig);
+                return Some(TuiEffect::save_config());
             }
             HitTarget::Reload => {
                 return Some(TuiEffect::ReloadConfig);
@@ -757,13 +770,10 @@ impl TuiApp {
                 warnings,
             } => {
                 self.dirty = true;
-                self.status = if let Some(warning) = warnings.first() {
-                    StatusMessage::warning(mitm_quick_setup_warning_message(warning))
-                } else {
-                    StatusMessage::info(self.mitm_quick_setup_success_message(direction))
-                };
+                let saved_status = self.mitm_quick_setup_saved_status(direction, &warnings);
+                self.status = saved_status.clone();
                 self.clamp_selection();
-                Some(TuiEffect::SaveConfig)
+                Some(TuiEffect::save_config_with_status(saved_status))
             }
             MitmQuickSetupOutcome::Rejected(warning) => {
                 self.status = StatusMessage::warning(mitm_quick_setup_warning_message(&warning));
@@ -912,6 +922,24 @@ impl TuiApp {
             );
         }
         direction.status_message().to_string()
+    }
+
+    fn mitm_quick_setup_saved_status(
+        &self,
+        direction: MitmQuickSetupDirection,
+        warnings: &[MitmQuickSetupWarning],
+    ) -> StatusMessage {
+        let summary = self.mitm_quick_setup_success_message(direction);
+        let data_path_action = ControlId::OpenTrafficDiagnostics.traffic_action_label();
+        if let Some(warning) = warnings.first() {
+            return StatusMessage::warning(format!(
+                "{summary}; {}; open {data_path_action} after fixing it",
+                mitm_quick_setup_warning_message(warning)
+            ));
+        }
+        StatusMessage::saved(format!(
+            "{summary}; captures {MITM_PLAINTEXT_COVERAGE}; {MITM_TLS_TRUST_ACTION}; open {data_path_action}"
+        ))
     }
 
     fn traffic_filter_selector(&self) -> Option<probe_core::Selector> {
@@ -1221,7 +1249,15 @@ mod tests {
             ControlId::ConfigureInboundMitm,
         )));
 
-        assert_eq!(effect, Some(TuiEffect::SaveConfig));
+        let saved_status = expect_save_status(effect);
+        assert_eq!(saved_status.kind, StatusKind::Saved);
+        assert!(saved_status.text.contains(MITM_PLAINTEXT_COVERAGE));
+        assert!(saved_status.text.contains(MITM_TLS_TRUST_ACTION));
+        assert!(
+            saved_status
+                .text
+                .contains(ControlId::OpenTrafficDiagnostics.traffic_action_label())
+        );
         assert!(app.dirty());
         assert!(app.config.enforcement.interception.selector.is_some());
         assert_eq!(
@@ -1246,7 +1282,9 @@ mod tests {
             ControlId::ConfigureOutboundMitm,
         )));
 
-        assert_eq!(effect, Some(TuiEffect::SaveConfig));
+        let saved_status = expect_save_status(effect);
+        assert_eq!(saved_status.kind, StatusKind::Saved);
+        assert!(saved_status.text.contains(MITM_PLAINTEXT_COVERAGE));
         assert!(app.dirty());
         assert_eq!(
             app.config.enforcement.interception.strategy,
@@ -1279,8 +1317,12 @@ mod tests {
             ControlId::ConfigureOutboundMitm,
         )));
 
-        assert_eq!(keyboard_effect, Some(TuiEffect::SaveConfig));
-        assert_eq!(mouse_effect, Some(TuiEffect::SaveConfig));
+        let keyboard_saved_status = expect_save_status(keyboard_effect);
+        let mouse_saved_status = expect_save_status(mouse_effect);
+        assert_eq!(keyboard_saved_status.kind, StatusKind::Saved);
+        assert_eq!(mouse_saved_status.kind, StatusKind::Saved);
+        assert!(keyboard_saved_status.text.contains(MITM_PLAINTEXT_COVERAGE));
+        assert!(mouse_saved_status.text.contains(MITM_PLAINTEXT_COVERAGE));
         assert_eq!(
             keyboard_app.config.enforcement.interception.strategy,
             probe_config::TransparentInterceptionStrategyConfig::OutboundTransparentMitm
@@ -1670,6 +1712,16 @@ mod tests {
         for character in text.chars() {
             app.handle_action(TuiAction::TextInput(character));
         }
+    }
+
+    fn expect_save_status(effect: Option<TuiEffect>) -> StatusMessage {
+        let Some(TuiEffect::SaveConfig {
+            saved_status: status,
+        }) = effect
+        else {
+            panic!("expected save effect with status");
+        };
+        status
     }
 
     fn assert_outbound_mitm_cgroup_selector(app: &TuiApp, expected_cgroup: &str) {
