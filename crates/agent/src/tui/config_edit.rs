@@ -313,6 +313,18 @@ fn render_preserving_config(
         value(config.export.worker.enabled),
     );
     sync_exporter_codecs(&mut document, &config.exporters);
+    set_optional_u64(
+        &mut document,
+        &["storage", "retention", "ingress"],
+        "max_records",
+        config.storage.retention.ingress.max_records,
+    )?;
+    set_optional_u64(
+        &mut document,
+        &["storage", "retention", "export"],
+        "max_records",
+        config.storage.retention.export.max_records,
+    )?;
     set_value(
         &mut document,
         &["enforcement"],
@@ -400,6 +412,31 @@ fn set_optional_selector(
         }
         None => {
             table.remove(key);
+        }
+    }
+    Ok(())
+}
+
+fn set_optional_u64(
+    document: &mut DocumentMut,
+    table_path: &[&str],
+    key: &str,
+    records: Option<u64>,
+) -> Result<(), TuiError> {
+    match records {
+        Some(records) => {
+            let records = i64::try_from(records).map_err(|_| {
+                TuiError::UnsupportedTomlShape(format!(
+                    "{key} value {records} does not fit a TOML integer"
+                ))
+            })?;
+            let table = table_at_path(document, table_path);
+            set_table_item(table, key, value(records));
+        }
+        None => {
+            if let Some(table) = table_at_existing_path_mut(document, table_path) {
+                table.remove(key);
+            }
         }
     }
     Ok(())
@@ -538,6 +575,18 @@ fn table_at_path<'a>(document: &'a mut DocumentMut, path: &[&str]) -> &'a mut Ta
     table
 }
 
+fn table_at_existing_path_mut<'a>(
+    document: &'a mut DocumentMut,
+    path: &[&str],
+) -> Option<&'a mut Table> {
+    let mut table = document.as_table_mut();
+    for key in path {
+        let item = table.get_mut(key)?;
+        table = item.as_table_mut()?;
+    }
+    Some(table)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -576,12 +625,20 @@ codec = "zstd"
 
 [export.worker]
 enabled = true
+
+[storage.retention.ingress]
+max_records = 10000
+
+[storage.retention.export]
+max_records = 10000
 "#;
         let mut config = AgentConfig::from_toml_str(source)?;
         config.agent_id = "probe-a".to_string();
         config.capture.selection = CaptureSelection::Libpcap;
         config.export.worker.enabled = false;
         config.exporters[0].codec = CompressionCodecName::Gzip;
+        config.storage.retention.ingress.max_records = Some(100_000);
+        config.storage.retention.export.max_records = Some(1_000_000);
 
         let rendered = render_preserving_config(source, &config, Path::new("/tmp/agent.toml"))?;
 
@@ -590,7 +647,75 @@ enabled = true
         assert!(rendered.contains("selection = \"libpcap\""));
         assert!(rendered.contains("enabled = false"));
         assert!(rendered.contains("codec = \"gzip\""));
+        assert!(rendered.contains("[storage.retention.ingress]"));
+        assert!(rendered.contains("[storage.retention.export]"));
+        assert!(rendered.contains("max_records = 100000"));
+        assert!(rendered.contains("max_records = 1000000"));
         AgentConfig::from_toml_str(&rendered)?.validate_basic()?;
+        Ok(())
+    }
+
+    #[test]
+    fn save_does_not_create_empty_storage_retention_tables_for_absent_record_limits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("agent.toml");
+        let source = r#"
+agent_id = "probe"
+config_version = "local"
+
+[[exporters]]
+id = "default"
+transport = "file"
+path = "/tmp/events.jsonl"
+codec = "zstd"
+"#;
+        fs::write(&path, source)?;
+        let mut config = AgentConfig::from_toml_str(source)?;
+        config.agent_id = "probe-edited".to_string();
+
+        let rendered = save_config(&path, source, &config)?;
+        let reloaded = AgentConfig::from_toml_str(&rendered)?;
+
+        assert!(!rendered.contains("[storage.retention.ingress]"));
+        assert!(!rendered.contains("[storage.retention.export]"));
+        assert_eq!(reloaded.storage.retention.ingress.max_records, None);
+        assert_eq!(reloaded.storage.retention.export.max_records, None);
+        Ok(())
+    }
+
+    #[test]
+    fn save_removes_storage_record_limit_keys_when_disabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("agent.toml");
+        let source = r#"
+agent_id = "probe"
+config_version = "local"
+
+[[exporters]]
+id = "default"
+transport = "file"
+path = "/tmp/events.jsonl"
+codec = "zstd"
+
+[storage.retention.ingress]
+max_records = 10000
+
+[storage.retention.export]
+max_records = 10000
+"#;
+        fs::write(&path, source)?;
+        let mut config = AgentConfig::from_toml_str(source)?;
+        config.storage.retention.ingress.max_records = None;
+        config.storage.retention.export.max_records = None;
+
+        let rendered = save_config(&path, source, &config)?;
+        let reloaded = AgentConfig::from_toml_str(&rendered)?;
+
+        assert!(!rendered.contains("max_records"));
+        assert_eq!(reloaded.storage.retention.ingress.max_records, None);
+        assert_eq!(reloaded.storage.retention.export.max_records, None);
         Ok(())
     }
 

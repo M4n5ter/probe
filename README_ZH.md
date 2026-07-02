@@ -210,17 +210,19 @@ cargo run -p agent --locked -- tui --config ./agent.toml
 ```
 
 TUI 是面向常见服务器操作的配置工作台。它通过 agent 共用的 procfs attribution
-模型读取 `/proc`，展示可读进程，并把键盘和鼠标作为同级输入路径映射到同一组
-action。只有进程具备可读 executable path 时才会写入 process scope；进程表默认
-只展示隐藏后的 argv count，TUI model 不保留 raw argv。保存会获取 advisory lock，
-拒绝已被外部修改的配置文件，校验渲染后的配置，并使用同目录原子写入。
-配置路径必须是 direct file path；symlink path 会被拒绝，避免保存时把链接替换成普通文件。
+模型读取 `/proc`，展示可读进程。键盘和鼠标是同级交互方式：常见 action 只建模
+一次，并同时通过 key binding 和 rendered hit target 暴露。只有进程具备可读
+executable path 时才会写入 process scope；进程表默认只展示隐藏后的 argv count，
+TUI model 不保留 raw argv。保存会获取 advisory lock，拒绝已被外部修改的配置文件，
+校验渲染后的配置，并使用同目录原子写入。配置路径必须是 direct file path；
+symlink path 会被拒绝，避免保存时把链接替换成普通文件。
 
 工作台可编辑 capture backend selection、export worker state、exporter compression
-codec、enforcement mode/backend、transparent interception strategy、TLS plaintext
-hook enablement，以及 capture、enforcement、interception、TLS plaintext 的进程级
-selector。Policy Lua source、大型 MITM backend contract、TLS material 文件和
-collector-specific payload format 仍应在配置和 policy 文件中维护。
+codec、storage retention record limits、enforcement mode/backend、transparent
+interception strategy、TLS plaintext hook enablement，以及 capture、enforcement、
+interception、TLS plaintext 的进程级 selector。Policy Lua source、大型 MITM
+backend contract、TLS material 文件和 collector-specific payload format 仍应在配置和
+policy 文件中维护。
 
 当配置中的 admin socket 已启用且 live agent 正在运行时，Traffic tab 会通过在线
 admin surface tail 已解析的 export event。它优先使用选中进程的 executable-path

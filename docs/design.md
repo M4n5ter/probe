@@ -267,7 +267,8 @@ Operator TUI 能力事实：
   共用同一份 `AgentConfig` 模型。
 - TUI 使用 ratatui 0.30 与 crossterm 0.29；crossterm major 版本显式对齐，避免 raw mode、事件队列和类型不兼容。
 - 交互模型以 `TuiAction` 为边界。键盘事件和鼠标事件是同级输入路径，二者都翻译为同一组 action。
-  新增可交互控件时，必须同时定义键盘路径和可命中的 hit target；确实不适合鼠标命中的控件需要在状态机层说明理由。
+  这是 TUI 设计不变量，不是渲染层的补充能力：新增可交互控件时，必须先定义 action contract，
+  再同时定义键盘路径和可命中的 hit target。确实不适合鼠标命中的控件需要在状态机层说明理由。
   渲染层输出 hit map，tab、字段行、进程行和控制按钮都通过 hit target 驱动鼠标交互。
 - TUI 通过 `ProcfsAttributor` 生成 process catalog，不依赖 `ps`、`ss` 或发行版额外命令。
   进程选择只写入 executable path selector；无法读取 executable path 时 fail-closed，
@@ -282,8 +283,9 @@ Operator TUI 能力事实：
   响应同时受单事件 payload budget 和总响应 payload budget 约束；超限事件通过 omission metadata 表达，不在响应中展开。
   当请求带 selector 且某条超限事件无法解码验证 selector 时，该事件不返回 omission metadata，只推进扫描 cursor。
 - TUI-managed 字段包括 capture backend selection、export worker enablement、exporter codec、
-  enforcement mode/backend、transparent interception strategy、TLS plaintext hook enablement，以及
-  capture、enforcement、transparent interception、TLS plaintext 的 process-scoped selector。
+  storage retention record limits、enforcement mode/backend、transparent interception strategy、
+  TLS plaintext hook enablement，以及 capture、enforcement、transparent interception、TLS plaintext 的
+  process-scoped selector。
 - 保存路径优先用 `toml_edit` 定点更新 TUI-managed 字段，保留用户配置中的非相关内容和注释。
   配置路径必须是 direct file path；symlink config path 会被拒绝，避免读取目标文件后把 symlink
   路径替换成普通文件。
@@ -293,7 +295,7 @@ Operator TUI 能力事实：
 - TUI 不接管大型 Lua policy source、remote bundle payload、TLS material 文件、collector-specific payload format
   或完整 MITM backend contract。它可以把常见 selector 和运行面开关转成配置，但复杂策略仍由配置文件、policy bundle
   和专门文档表达。
-- TUI 验证路径分三层：状态机单测覆盖 action、config mutation、键鼠 action 等价和 process selector fail-closed；
+- TUI 验证路径分三层：状态机单测覆盖 action、config mutation、storage retention mutation、键鼠 action 等价和 process selector fail-closed；
   ratatui `TestBackend` 覆盖主要画面和 hit map；保存器单测覆盖 format-preserving update、selector TOML contract、
   stale file rejection、unsupported TOML shape rejection、static validation fail-closed、atomic save、mode preservation、
   lock file mode、symlink rejection、editable field persistence contract 和 load path。

@@ -14,17 +14,19 @@ pub(crate) enum TuiTab {
     Capture,
     Processes,
     Export,
+    Storage,
     Enforcement,
     Tls,
 }
 
 impl TuiTab {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Overview,
         Self::Traffic,
         Self::Capture,
         Self::Processes,
         Self::Export,
+        Self::Storage,
         Self::Enforcement,
         Self::Tls,
     ];
@@ -36,6 +38,7 @@ impl TuiTab {
             Self::Capture => "Capture",
             Self::Processes => "Processes",
             Self::Export => "Export",
+            Self::Storage => "Storage",
             Self::Enforcement => "Enforcement",
             Self::Tls => "TLS",
         }
@@ -578,6 +581,30 @@ mod tests {
         assert_eq!(app.config.capture.selection, CaptureSelection::Ebpf);
         app.handle_action(TuiAction::PreviousValue);
         assert_eq!(app.config.capture.selection, CaptureSelection::Auto);
+    }
+
+    #[test]
+    fn storage_retention_fields_share_keyboard_and_mouse_action_path() {
+        let mut keyboard_app = test_app();
+        keyboard_app.select_tab(TuiTab::Storage);
+        keyboard_app.handle_action(TuiAction::NextValue);
+
+        let mut mouse_app = test_app();
+        mouse_app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Storage)));
+        mouse_app.handle_action(TuiAction::Click(HitTarget::Field(
+            FieldId::IngressRetentionMaxRecords,
+        )));
+
+        assert_eq!(
+            keyboard_app.config.storage.retention.ingress.max_records,
+            Some(10_000)
+        );
+        assert_eq!(
+            keyboard_app.config.storage.retention.ingress.max_records,
+            mouse_app.config.storage.retention.ingress.max_records
+        );
+        assert!(keyboard_app.dirty());
+        assert!(mouse_app.dirty());
     }
 
     fn test_app() -> TuiApp {

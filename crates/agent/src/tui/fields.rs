@@ -18,6 +18,8 @@ pub(crate) enum FieldId {
     CaptureDeepObserveProcess,
     ExportWorkerEnabled,
     ExporterCodec(usize),
+    IngressRetentionMaxRecords,
+    ExportRetentionMaxRecords,
     EnforcementMode,
     ConnectionBackend,
     InterceptionStrategy,
@@ -34,6 +36,8 @@ impl FieldId {
             Self::CaptureDeepObserveProcess => "Observe selected process",
             Self::ExportWorkerEnabled => "Export worker",
             Self::ExporterCodec(_) => "Exporter codec",
+            Self::IngressRetentionMaxRecords => "Ingress record limit",
+            Self::ExportRetentionMaxRecords => "Export record limit",
             Self::EnforcementMode => "Enforcement mode",
             Self::ConnectionBackend => "Connection backend",
             Self::InterceptionStrategy => "Transparent interception",
@@ -48,6 +52,8 @@ impl FieldId {
         match self {
             Self::CaptureSelection
             | Self::ExporterCodec(_)
+            | Self::IngressRetentionMaxRecords
+            | Self::ExportRetentionMaxRecords
             | Self::EnforcementMode
             | Self::ConnectionBackend
             | Self::InterceptionStrategy => "cycle value",
@@ -85,6 +91,10 @@ pub(crate) fn fields_for_tab(tab: TuiTab, config: &AgentConfig) -> Vec<FieldId> 
             );
             fields
         }
+        TuiTab::Storage => vec![
+            FieldId::IngressRetentionMaxRecords,
+            FieldId::ExportRetentionMaxRecords,
+        ],
         TuiTab::Enforcement => vec![
             FieldId::EnforcementMode,
             FieldId::ConnectionBackend,
@@ -123,6 +133,12 @@ pub(crate) fn field_value(
                 )
             })
             .unwrap_or_else(|| "missing exporter".to_string()),
+        FieldId::IngressRetentionMaxRecords => {
+            retention_records_state(config.storage.retention.ingress.max_records)
+        }
+        FieldId::ExportRetentionMaxRecords => {
+            retention_records_state(config.storage.retention.export.max_records)
+        }
         FieldId::EnforcementMode => enforcement_mode_name(config.enforcement.mode).to_string(),
         FieldId::ConnectionBackend => {
             connection_backend_name(config.enforcement.backend).to_string()
@@ -172,6 +188,16 @@ pub(crate) fn apply_field(
             };
             exporter.codec = cycle_codec(exporter.codec, direction);
             FieldApplyOutcome::Changed("Exporter codec changed")
+        }
+        FieldId::IngressRetentionMaxRecords => {
+            config.storage.retention.ingress.max_records =
+                cycle_retention_records(config.storage.retention.ingress.max_records, direction);
+            FieldApplyOutcome::Changed("Ingress record limit changed")
+        }
+        FieldId::ExportRetentionMaxRecords => {
+            config.storage.retention.export.max_records =
+                cycle_retention_records(config.storage.retention.export.max_records, direction);
+            FieldApplyOutcome::Changed("Export record limit changed")
         }
         FieldId::EnforcementMode => {
             config.enforcement.mode = cycle_enforcement_mode(config.enforcement.mode, direction);
@@ -231,6 +257,13 @@ fn bool_state(value: bool) -> String {
     }
 }
 
+fn retention_records_state(value: Option<u64>) -> String {
+    match value {
+        Some(records) => format!("{records} records"),
+        None => "no record limit".to_string(),
+    }
+}
+
 fn selector_state(has_selector: bool, process: Option<&str>) -> String {
     match (has_selector, process) {
         (true, Some(process)) => format!("configured; selected process: {process}"),
@@ -274,6 +307,40 @@ fn cycle_codec(value: CompressionCodecName, direction: isize) -> CompressionCode
         VALUES.len(),
         direction,
     )]
+}
+
+fn cycle_retention_records(value: Option<u64>, direction: isize) -> Option<u64> {
+    const VALUES: [Option<u64>; 5] = [
+        None,
+        Some(10_000),
+        Some(100_000),
+        Some(1_000_000),
+        Some(10_000_000),
+    ];
+    let index = VALUES
+        .iter()
+        .position(|item| *item == value)
+        .unwrap_or_else(|| nearest_retention_index(value, direction, &VALUES));
+    VALUES[cycle_index(index, VALUES.len(), direction)]
+}
+
+fn nearest_retention_index(value: Option<u64>, direction: isize, values: &[Option<u64>]) -> usize {
+    let Some(records) = value else {
+        return 0;
+    };
+    if direction >= 0 {
+        values
+            .iter()
+            .position(|candidate| candidate.is_some_and(|candidate| candidate > records))
+            .map_or(values.len().saturating_sub(1), |index| {
+                index.saturating_sub(1)
+            })
+    } else {
+        values
+            .iter()
+            .position(|candidate| candidate.is_some_and(|candidate| candidate >= records))
+            .unwrap_or(0)
+    }
 }
 
 fn cycle_enforcement_mode(value: EnforcementMode, direction: isize) -> EnforcementMode {
@@ -332,4 +399,18 @@ fn cycle_index(index: usize, len: usize, direction: isize) -> usize {
         return 0;
     }
     (index as isize + direction).rem_euclid(len as isize) as usize
+}
+
+#[cfg(test)]
+#[test]
+fn retention_record_cycle_handles_unbounded_presets_and_custom_values() {
+    assert_eq!(cycle_retention_records(None, 1), Some(10_000));
+    assert_eq!(cycle_retention_records(Some(10_000), -1), None);
+    assert_eq!(cycle_retention_records(Some(50_000), 1), Some(100_000));
+    assert_eq!(cycle_retention_records(Some(50_000), -1), Some(10_000));
+    assert_eq!(cycle_retention_records(Some(20_000_000), 1), None);
+    assert_eq!(
+        cycle_retention_records(Some(20_000_000), -1),
+        Some(10_000_000)
+    );
 }
