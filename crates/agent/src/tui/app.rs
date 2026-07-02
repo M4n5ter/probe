@@ -1214,6 +1214,22 @@ mod tests {
     }
 
     #[test]
+    fn lost_agent_attachment_does_not_expose_stale_admin_socket() {
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::managed(
+            PathBuf::from("/tmp/stale-admin.sock"),
+            Some(42),
+            PathBuf::from("/tmp/stale-agent.log"),
+        ));
+
+        app.detach_agent("TUI managed agent unavailable");
+
+        assert!(app.active_admin_socket_path().is_none());
+        assert_eq!(app.runtime_agent_status(), "TUI managed agent unavailable");
+        assert_eq!(app.status().kind, StatusKind::Error);
+    }
+
+    #[test]
     fn capture_backend_cycles_through_live_and_feed_backends() {
         let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),

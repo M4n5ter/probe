@@ -64,6 +64,22 @@ impl TuiAgentSupervisor {
         }
     }
 
+    pub(crate) fn is_managed(&self) -> bool {
+        matches!(self.mode, TuiAgentMode::Managed(_))
+    }
+
+    pub(crate) async fn restart(self, config: &AgentConfig) -> Result<Self, TuiError> {
+        match self.mode {
+            TuiAgentMode::Existing => Ok(Self {
+                mode: TuiAgentMode::Existing,
+            }),
+            TuiAgentMode::Managed(agent) => {
+                stop_managed_agent(*agent).await;
+                spawn_managed_agent(config).await
+            }
+        }
+    }
+
     pub(crate) async fn poll_exit(&mut self) -> Result<Option<String>, TuiError> {
         let TuiAgentMode::Managed(agent) = &mut self.mode else {
             return Ok(None);
@@ -81,27 +97,30 @@ impl TuiAgentSupervisor {
     }
 
     pub(crate) async fn stop(self) {
-        let TuiAgentMode::Managed(mut agent) = self.mode else {
-            return;
-        };
-        terminate_child(&mut agent.child).await;
-        if let Err(error) = fs::remove_file(&agent.runtime_config_path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!(
-                "failed to remove TUI runtime config {}: {error}",
-                agent.runtime_config_path.display()
-            );
+        if let TuiAgentMode::Managed(agent) = self.mode {
+            stop_managed_agent(*agent).await;
         }
-        if let Err(error) = fs::remove_dir(&agent.runtime_dir)
-            && error.kind() != std::io::ErrorKind::NotFound
-            && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
-        {
-            eprintln!(
-                "failed to remove TUI runtime directory {}: {error}",
-                agent.runtime_dir.display()
-            );
-        }
+    }
+}
+
+async fn stop_managed_agent(mut agent: ManagedAgent) {
+    terminate_child(&mut agent.child).await;
+    if let Err(error) = fs::remove_file(&agent.runtime_config_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "failed to remove TUI runtime config {}: {error}",
+            agent.runtime_config_path.display()
+        );
+    }
+    if let Err(error) = fs::remove_dir(&agent.runtime_dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+        && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
+    {
+        eprintln!(
+            "failed to remove TUI runtime directory {}: {error}",
+            agent.runtime_dir.display()
+        );
     }
 }
 

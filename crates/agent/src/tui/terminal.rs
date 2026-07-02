@@ -99,10 +99,14 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
             if let Some(effect) = app.handle_action(action) {
                 match effect {
                     TuiEffect::SaveConfig => {
+                        let should_reconcile_runtime = app.dirty() || supervisor.as_ref().is_none();
                         match save_config(app.config_path(), &loaded.source, app.config()) {
                             Ok(source) => {
                                 loaded.source = source;
                                 app.mark_saved();
+                                if should_reconcile_runtime {
+                                    reconcile_saved_runtime(&mut supervisor, &mut app).await;
+                                }
                             }
                             Err(error) => app.mark_save_failed(error.to_string()),
                         }
@@ -126,6 +130,48 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
         supervisor.stop().await;
     }
     result
+}
+
+async fn reconcile_saved_runtime(supervisor: &mut Option<TuiAgentSupervisor>, app: &mut TuiApp) {
+    let config = app.config().clone();
+    match supervisor.take() {
+        Some(running) if running.is_managed() => match running.restart(&config).await {
+            Ok(next) => {
+                app.attach_agent(next.attachment(&config));
+                app.mark_info(format!(
+                    "Saved config and restarted TUI managed agent; {}",
+                    app.runtime_agent_status()
+                ));
+                *supervisor = Some(next);
+            }
+            Err(error) => {
+                app.detach_agent(format!(
+                    "Saved config but failed to restart TUI managed agent: {error}"
+                ));
+            }
+        },
+        Some(running) => {
+            app.mark_warning(
+                "Saved config; restart the attached agent to apply capture and MITM runtime resources",
+            );
+            *supervisor = Some(running);
+        }
+        None => match TuiAgentSupervisor::attach_or_spawn(&config).await {
+            Ok(next) => {
+                app.attach_agent(next.attachment(&config));
+                app.mark_info(format!(
+                    "Saved config and attached TUI agent; {}",
+                    app.runtime_agent_status()
+                ));
+                *supervisor = Some(next);
+            }
+            Err(error) => {
+                app.mark_error(format!(
+                    "Saved config but TUI agent is still unavailable: {error}"
+                ));
+            }
+        },
+    }
 }
 
 async fn reload_runtime_actions(app: &mut TuiApp) {
