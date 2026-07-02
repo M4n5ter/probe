@@ -12,8 +12,9 @@ use std::{
 
 use capture::CaptureEvent;
 use probe_core::{
-    Action, ApplicationProtocolPolicy, CaptureOrigin, CaptureSource, Direction, EventEnvelope,
-    EventKind, FlowContext, HttpHeaders, Timestamp, Verdict, VerdictScope,
+    Action, ApplicationProtocolPolicy, CaptureOrigin, CaptureSource, CaptureTrafficSecurity,
+    Direction, EventEnvelope, EventKind, FlowContext, HttpHeaders, Timestamp, Verdict,
+    VerdictScope,
 };
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, StreamOwned,
@@ -247,6 +248,26 @@ pub(super) fn feed_has_bytes(
         if let CaptureEvent::Bytes(bytes) = event
             && bytes.direction == direction
             && bytes.bytes.as_ref() == expected
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(super) fn feed_has_bytes_with_traffic_security(
+    feed_path: &PathBuf,
+    direction: Direction,
+    expected: &[u8],
+    traffic_security: CaptureTrafficSecurity,
+) -> Result<bool, Box<dyn Error>> {
+    let content = fs::read_to_string(feed_path)?;
+    for line in complete_feed_lines(&content) {
+        let event = serde_json::from_str::<CaptureEvent>(line)?;
+        if let CaptureEvent::Bytes(bytes) = event
+            && bytes.direction == direction
+            && bytes.bytes.as_ref() == expected
+            && bytes.origin.traffic_security() == traffic_security
         {
             return Ok(true);
         }

@@ -22,14 +22,16 @@ use std::{
 };
 
 use clap::ValueEnum;
-use probe_core::{ApplicationProtocolPolicy, Direction, socket_addr_points_to_listener};
+use probe_core::{
+    ApplicationProtocolPolicy, CaptureTrafficSecurity, Direction, socket_addr_points_to_listener,
+};
 use socket2::Socket;
 
 use crate::{
     MitmProxyError,
     authority::ObservedAuthority,
     error::io_error,
-    feed::{CaptureEventFeedWriter, FlowOffsets},
+    feed::{CaptureEventFeedWriter, CaptureFlowWriter},
     flow::{FlowFactory, FlowRegistry, PendingActionKey, ProxyAction},
     http::{
         HttpMessage, HttpResponseRelay, empty_response_bytes, read_http_message,
@@ -199,6 +201,16 @@ struct DownstreamConnectionContext {
     tls_server_name: Option<String>,
 }
 
+impl DownstreamConnectionContext {
+    fn traffic_security(&self) -> CaptureTrafficSecurity {
+        if self.uses_tls {
+            CaptureTrafficSecurity::TlsDecrypted
+        } else {
+            CaptureTrafficSecurity::Cleartext
+        }
+    }
+}
+
 fn validate_config(config: &MitmProxyConfig) -> Result<(), MitmProxyError> {
     if !config.listen.ip().is_loopback() {
         return Err(MitmProxyError::InvalidConfig(format!(
@@ -309,12 +321,11 @@ fn handle_http_connection(
         return Ok(());
     };
     let flow = state.flow_factory.flow(context.peer, context.target);
-    let mut offsets = FlowOffsets::default();
-    state.feed.connection_opened(&flow)?;
+    let mut capture = state.feed.open_flow(flow, context.traffic_security())?;
 
     let mut request_sequence = 0_u64;
     let mut next_request = Some(first_request);
-    let result = loop {
+    let result: Result<(), MitmProxyError> = loop {
         let request = match next_request.take() {
             Some(request) => request,
             None => match read_http_message(&mut downstream, state.config.max_request_bytes) {
@@ -332,8 +343,7 @@ fn handle_http_connection(
                 sequence: request_sequence,
             },
             &state,
-            &flow,
-            &mut offsets,
+            &mut capture,
         ) {
             Ok(disposition) => disposition,
             Err(error) => break Err(error),
@@ -344,7 +354,7 @@ fn handle_http_connection(
     };
 
     let finish_result = downstream.finish();
-    let close_result = state.feed.connection_closed(flow);
+    let close_result = capture.close();
     result.and(finish_result).and(close_result)
 }
 
@@ -353,23 +363,16 @@ fn handle_http_request(
     context: &DownstreamConnectionContext,
     request: SequencedHttpRequest,
     state: &ProxyState,
-    flow: &probe_core::FlowContext,
-    offsets: &mut FlowOffsets,
+    capture: &mut CaptureFlowWriter<'_>,
 ) -> Result<DownstreamDisposition, MitmProxyError> {
     let registration = state.config.policy_hook_listen.map(|_| {
         state.registry.register(PendingActionKey::request(
-            flow.id.clone(),
+            capture.flow().id.clone(),
             state.config.request_direction,
             request.sequence,
         ))
     });
-    let request_offset = offsets.record(state.config.request_direction, request.message.raw.len());
-    state.feed.bytes(
-        flow,
-        state.config.request_direction,
-        request_offset,
-        &request.message.raw,
-    )?;
+    capture.bytes(state.config.request_direction, &request.message.raw)?;
 
     let action = match registration {
         Some(registration) => registration.recv_timeout(state.config.action_timeout),
@@ -377,12 +380,10 @@ fn handle_http_request(
     };
     match action {
         Some(ProxyAction::Deny { reason }) => {
-            write_deny_response(downstream, state, flow, offsets, reason)?;
+            write_deny_response(downstream, state, capture, reason)?;
             Ok(DownstreamDisposition::Close)
         }
-        None => {
-            forward_or_gateway_response(downstream, context, request.message, state, flow, offsets)
-        }
+        None => forward_or_gateway_response(downstream, context, request.message, state, capture),
     }
 }
 
@@ -435,38 +436,35 @@ fn linux_original_destination(downstream: &TcpStream) -> Result<SocketAddr, Mitm
 fn write_deny_response(
     downstream: &mut impl Write,
     state: &ProxyState,
-    flow: &probe_core::FlowContext,
-    offsets: &mut FlowOffsets,
+    capture: &mut CaptureFlowWriter<'_>,
     reason: Option<String>,
 ) -> Result<(), MitmProxyError> {
     let body = reason.unwrap_or_else(|| "request denied by local policy".to_string());
     let response = simple_response_bytes(403, body.as_bytes(), "text/plain");
-    write_generated_response(downstream, state, flow, offsets, &response)
+    write_generated_response(downstream, state, capture, &response)
 }
 
 fn write_generated_empty_response(
     downstream: &mut impl Write,
     state: &ProxyState,
-    flow: &probe_core::FlowContext,
-    offsets: &mut FlowOffsets,
+    capture: &mut CaptureFlowWriter<'_>,
     status: u16,
 ) -> Result<(), MitmProxyError> {
     let response = empty_response_bytes(status);
-    write_generated_response(downstream, state, flow, offsets, &response)
+    write_generated_response(downstream, state, capture, &response)
 }
 
 fn write_generated_response(
     downstream: &mut impl Write,
     state: &ProxyState,
-    flow: &probe_core::FlowContext,
-    offsets: &mut FlowOffsets,
+    capture: &mut CaptureFlowWriter<'_>,
     response: &[u8],
 ) -> Result<(), MitmProxyError> {
     let direction = response_direction(state.config.request_direction);
-    let mut emitter =
-        DownstreamResponseEmitter::new(downstream, &state.feed, flow, offsets, direction);
-    emitter.emit(response)?;
-    emitter.flush("flush MITM proxy generated response")
+    write_downstream_bytes(downstream, capture, direction, response)?;
+    downstream
+        .flush()
+        .map_err(io_error("flush MITM proxy generated response"))
 }
 
 fn forward_or_gateway_response(
@@ -474,8 +472,7 @@ fn forward_or_gateway_response(
     context: &DownstreamConnectionContext,
     request: HttpMessage,
     state: &ProxyState,
-    flow: &probe_core::FlowContext,
-    offsets: &mut FlowOffsets,
+    capture: &mut CaptureFlowWriter<'_>,
 ) -> Result<DownstreamDisposition, MitmProxyError> {
     let config = &state.config;
     let request_keep_alive = request.explicit_keep_alive();
@@ -489,7 +486,7 @@ fn forward_or_gateway_response(
     ) {
         Ok(authority) => authority,
         Err(_) => {
-            return write_generated_empty_response(downstream, state, flow, offsets, 502)
+            return write_generated_empty_response(downstream, state, capture, 502)
                 .map(|()| DownstreamDisposition::Close);
         }
     };
@@ -501,7 +498,7 @@ fn forward_or_gateway_response(
     ) {
         Ok(targets) => targets,
         Err(_) => {
-            return write_generated_empty_response(downstream, state, flow, offsets, 502)
+            return write_generated_empty_response(downstream, state, capture, 502)
                 .map(|()| DownstreamDisposition::Close);
         }
     };
@@ -509,7 +506,7 @@ fn forward_or_gateway_response(
         .iter()
         .all(|target| socket_addr_points_to_listener(*target, config.listen))
     {
-        return write_generated_empty_response(downstream, state, flow, offsets, 200)
+        return write_generated_empty_response(downstream, state, capture, 200)
             .map(|()| DownstreamDisposition::Close);
     }
     match state.upstream.connect_first(
@@ -534,9 +531,7 @@ fn forward_or_gateway_response(
                 &mut upstream,
                 &request,
                 downstream,
-                &state.feed,
-                flow,
-                offsets,
+                capture,
                 response_direction(config.request_direction),
             )?;
             downstream
@@ -547,9 +542,7 @@ fn forward_or_gateway_response(
                     relay_upgraded_tunnel(
                         downstream,
                         &mut upstream,
-                        &state.feed,
-                        flow,
-                        offsets,
+                        capture,
                         config.request_direction,
                         &request.prefetched_tunnel_bytes,
                     )?;
@@ -564,7 +557,7 @@ fn forward_or_gateway_response(
                 ),
             }
         }
-        Ok(None) | Err(_) => write_generated_empty_response(downstream, state, flow, offsets, 502)
+        Ok(None) | Err(_) => write_generated_empty_response(downstream, state, capture, 502)
             .map(|()| DownstreamDisposition::Close),
     }
 }
@@ -588,51 +581,24 @@ fn relay_response(
     upstream: &mut impl Read,
     request: &HttpMessage,
     downstream: &mut impl Write,
-    feed: &CaptureEventFeedWriter,
-    flow: &probe_core::FlowContext,
-    offsets: &mut FlowOffsets,
+    capture: &mut CaptureFlowWriter<'_>,
     direction: Direction,
 ) -> Result<HttpResponseRelay, MitmProxyError> {
-    let mut emitter = DownstreamResponseEmitter::new(downstream, feed, flow, offsets, direction);
-    relay_http_response(upstream, request, |bytes| emitter.emit(bytes))
+    relay_http_response(upstream, request, |bytes| {
+        write_downstream_bytes(downstream, capture, direction, bytes)
+    })
 }
 
-struct DownstreamResponseEmitter<'a, W: Write + ?Sized> {
-    downstream: &'a mut W,
-    feed: &'a CaptureEventFeedWriter,
-    flow: &'a probe_core::FlowContext,
-    offsets: &'a mut FlowOffsets,
+fn write_downstream_bytes(
+    downstream: &mut (impl Write + ?Sized),
+    capture: &mut CaptureFlowWriter<'_>,
     direction: Direction,
-}
-
-impl<'a, W: Write + ?Sized> DownstreamResponseEmitter<'a, W> {
-    fn new(
-        downstream: &'a mut W,
-        feed: &'a CaptureEventFeedWriter,
-        flow: &'a probe_core::FlowContext,
-        offsets: &'a mut FlowOffsets,
-        direction: Direction,
-    ) -> Self {
-        Self {
-            downstream,
-            feed,
-            flow,
-            offsets,
-            direction,
-        }
-    }
-
-    fn emit(&mut self, bytes: &[u8]) -> Result<(), MitmProxyError> {
-        let offset = self.offsets.record(self.direction, bytes.len());
-        self.feed.bytes(self.flow, self.direction, offset, bytes)?;
-        self.downstream
-            .write_all(bytes)
-            .map_err(io_error("write MITM proxy downstream response"))
-    }
-
-    fn flush(&mut self, context: &'static str) -> Result<(), MitmProxyError> {
-        self.downstream.flush().map_err(io_error(context))
-    }
+    bytes: &[u8],
+) -> Result<(), MitmProxyError> {
+    capture.bytes(direction, bytes)?;
+    downstream
+        .write_all(bytes)
+        .map_err(io_error("write MITM proxy downstream response"))
 }
 
 fn response_direction(request_direction: Direction) -> Direction {
@@ -1620,15 +1586,17 @@ mod tests {
             String::from_utf8_lossy(&tls_response),
             "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ntls-auto"
         );
-        assert!(feed_has_bytes(
+        assert!(feed_has_bytes_with_traffic_security(
             &feed_path,
             Direction::Outbound,
-            plain_request
+            plain_request,
+            CaptureTrafficSecurity::Cleartext
         )?);
-        assert!(feed_has_bytes(
+        assert!(feed_has_bytes_with_traffic_security(
             &feed_path,
             Direction::Outbound,
-            tls_request
+            tls_request,
+            CaptureTrafficSecurity::TlsDecrypted
         )?);
         let inbound = feed_direction_bytes(&feed_path, Direction::Inbound)?;
         assert!(bytes_contain(

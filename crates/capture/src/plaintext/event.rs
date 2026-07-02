@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use probe_core::{
-    CaptureOrigin, CaptureSource, Direction, EnforcementEvidence, FlowContext, Gap, Timestamp,
+    CaptureOrigin, CaptureSource, CaptureTrafficSecurity, Direction, EnforcementEvidence,
+    FlowContext, Gap, Timestamp,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{CaptureEvent, CapturedBytes, CapturedGap};
 
@@ -23,6 +24,15 @@ impl PlaintextSource {
             Self::TlsSessionSecret => CaptureSource::TlsSessionSecret,
             Self::L7MitmPlaintext => CaptureSource::L7MitmPlaintext,
         }
+    }
+
+    fn default_traffic_security(self) -> CaptureTrafficSecurity {
+        self.capture_source().default_traffic_security()
+    }
+
+    fn allows_traffic_security(self, traffic_security: CaptureTrafficSecurity) -> bool {
+        self.capture_source()
+            .allows_traffic_security(traffic_security)
     }
 }
 
@@ -99,16 +109,21 @@ impl PlaintextGap {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PlaintextEvent {
     pub source: PlaintextSource,
+    pub traffic_security: CaptureTrafficSecurity,
     #[serde(flatten)]
     pub kind: PlaintextEventKind,
 }
 
 impl PlaintextEvent {
     pub fn new(source: PlaintextSource, kind: PlaintextEventKind) -> Self {
-        Self { source, kind }
+        Self {
+            source,
+            traffic_security: source.default_traffic_security(),
+            kind,
+        }
     }
 
     pub fn bytes(source: PlaintextSource, chunk: PlaintextChunk) -> Self {
@@ -126,6 +141,48 @@ impl PlaintextEvent {
     pub fn connection_closed(source: PlaintextSource, connection: PlaintextConnection) -> Self {
         Self::new(source, PlaintextEventKind::ConnectionClosed(connection))
     }
+
+    pub fn with_traffic_security(mut self, traffic_security: CaptureTrafficSecurity) -> Self {
+        assert!(
+            self.source.allows_traffic_security(traffic_security),
+            "plaintext source {:?} cannot carry traffic security {:?}",
+            self.source,
+            traffic_security
+        );
+        self.traffic_security = traffic_security;
+        self
+    }
+}
+
+impl<'de> Deserialize<'de> for PlaintextEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let parts = PlaintextEventParts::deserialize(deserializer)?;
+        let traffic_security = parts
+            .traffic_security
+            .unwrap_or_else(|| parts.source.default_traffic_security());
+        if !parts.source.allows_traffic_security(traffic_security) {
+            return Err(serde::de::Error::custom(format!(
+                "plaintext source {:?} cannot carry traffic security {:?}",
+                parts.source, traffic_security
+            )));
+        }
+        Ok(Self {
+            source: parts.source,
+            traffic_security,
+            kind: parts.kind,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct PlaintextEventParts {
+    source: PlaintextSource,
+    traffic_security: Option<CaptureTrafficSecurity>,
+    #[serde(flatten)]
+    kind: PlaintextEventKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,11 +197,13 @@ pub enum PlaintextEventKind {
 impl From<PlaintextEvent> for CaptureEvent {
     fn from(value: PlaintextEvent) -> Self {
         let source = value.source.capture_source();
+        let origin =
+            CaptureOrigin::from_source(source).with_traffic_security(value.traffic_security);
         match value.kind {
             PlaintextEventKind::Bytes(chunk) => CaptureEvent::Bytes(CapturedBytes {
                 timestamp: chunk.timestamp,
                 flow: chunk.flow,
-                origin: CaptureOrigin::from_source(source),
+                origin,
                 direction: chunk.direction,
                 stream_offset: chunk.stream_offset,
                 bytes: chunk.bytes,
@@ -157,7 +216,7 @@ impl From<PlaintextEvent> for CaptureEvent {
             PlaintextEventKind::Gap(gap) => CaptureEvent::Gap(CapturedGap {
                 timestamp: gap.timestamp,
                 flow: gap.flow,
-                origin: CaptureOrigin::from_source(source),
+                origin,
                 enforcement_evidence: EnforcementEvidence::default(),
                 enforcement_evidence_propagation: crate::EnforcementEvidencePropagation::Event,
                 gap: gap.gap,
@@ -165,12 +224,12 @@ impl From<PlaintextEvent> for CaptureEvent {
             PlaintextEventKind::ConnectionOpened(connection) => CaptureEvent::ConnectionOpened {
                 timestamp: connection.timestamp,
                 flow: connection.flow,
-                origin: CaptureOrigin::from_source(source),
+                origin,
             },
             PlaintextEventKind::ConnectionClosed(connection) => CaptureEvent::ConnectionClosed {
                 timestamp: connection.timestamp,
                 flow: connection.flow,
-                origin: CaptureOrigin::from_source(source),
+                origin,
             },
         }
     }
@@ -212,6 +271,10 @@ mod tests {
         assert_eq!(bytes.flow, flow);
         assert_eq!(bytes.origin.source(), CaptureSource::ExternalPlaintextFeed);
         assert_eq!(bytes.origin.provider(), CaptureProviderKind::Plaintext);
+        assert_eq!(
+            bytes.origin.traffic_security(),
+            CaptureTrafficSecurity::Unknown
+        );
         assert_eq!(bytes.direction, Direction::Outbound);
         assert_eq!(bytes.stream_offset, 5);
         assert_eq!(bytes.bytes.as_ref(), b"GET / HTTP/1.1\r\n\r\n");
@@ -241,6 +304,53 @@ mod tests {
 
         assert_eq!(value["type"], "bytes");
         assert_eq!(value["source"], "external_plaintext_feed");
+        assert_eq!(value["traffic_security"], "unknown");
+    }
+
+    #[test]
+    fn plaintext_event_defaults_missing_traffic_security_from_source() {
+        let event = PlaintextEvent::connection_opened(
+            PlaintextSource::LibsslUprobe,
+            PlaintextConnection::new(
+                Timestamp {
+                    monotonic_ns: 1,
+                    wall_time_unix_ns: 1,
+                },
+                demo_flow(),
+            ),
+        );
+        let mut value = serde_json::to_value(event).expect("serialize plaintext event");
+        value
+            .as_object_mut()
+            .expect("plaintext event object")
+            .remove("traffic_security");
+
+        let decoded =
+            serde_json::from_value::<PlaintextEvent>(value).expect("deserialize legacy event");
+        assert_eq!(
+            decoded.traffic_security,
+            CaptureTrafficSecurity::TlsDecrypted
+        );
+    }
+
+    #[test]
+    fn plaintext_event_rejects_invalid_traffic_security_for_source() {
+        let event = PlaintextEvent::connection_opened(
+            PlaintextSource::LibsslUprobe,
+            PlaintextConnection::new(
+                Timestamp {
+                    monotonic_ns: 1,
+                    wall_time_unix_ns: 1,
+                },
+                demo_flow(),
+            ),
+        );
+        let mut value = serde_json::to_value(event).expect("serialize plaintext event");
+        value["traffic_security"] = serde_json::json!("cleartext");
+
+        let result = serde_json::from_value::<PlaintextEvent>(value);
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -278,6 +388,33 @@ mod tests {
             assert_eq!(bytes.origin.source(), capture_source);
             assert_eq!(bytes.origin.provider(), provider_kind);
         }
+    }
+
+    #[test]
+    fn plaintext_event_can_override_capture_traffic_security() {
+        let event = PlaintextEvent::bytes(
+            PlaintextSource::L7MitmPlaintext,
+            PlaintextChunk::new(
+                Timestamp {
+                    monotonic_ns: 1,
+                    wall_time_unix_ns: 1,
+                },
+                demo_flow(),
+                Direction::Outbound,
+                b"GET / HTTP/1.1\r\n\r\n",
+            ),
+        )
+        .with_traffic_security(CaptureTrafficSecurity::TlsDecrypted);
+
+        let CaptureEvent::Bytes(bytes) = CaptureEvent::from(event) else {
+            panic!("expected plaintext bytes");
+        };
+
+        assert_eq!(bytes.origin.source(), CaptureSource::L7MitmPlaintext);
+        assert_eq!(
+            bytes.origin.traffic_security(),
+            CaptureTrafficSecurity::TlsDecrypted
+        );
     }
 
     fn demo_flow() -> FlowContext {

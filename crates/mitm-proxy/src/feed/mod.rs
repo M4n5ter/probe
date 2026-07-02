@@ -8,7 +8,7 @@ use std::{
 };
 
 use capture::{CaptureEvent, PlaintextChunk, PlaintextConnection, PlaintextEvent, PlaintextSource};
-use probe_core::{Direction, FlowContext, Timestamp};
+use probe_core::{CaptureTrafficSecurity, Direction, FlowContext, Timestamp};
 use rustix::fs::OFlags;
 
 use crate::{MitmProxyError, error::io_error};
@@ -29,20 +29,40 @@ impl CaptureEventFeedWriter {
         })
     }
 
-    pub(crate) fn connection_opened(&self, flow: &FlowContext) -> Result<(), MitmProxyError> {
+    pub(crate) fn open_flow(
+        &self,
+        flow: FlowContext,
+        traffic_security: CaptureTrafficSecurity,
+    ) -> Result<CaptureFlowWriter<'_>, MitmProxyError> {
+        self.connection_opened(&flow, traffic_security)?;
+        Ok(CaptureFlowWriter {
+            feed: self,
+            flow,
+            offsets: FlowOffsets::default(),
+            traffic_security,
+        })
+    }
+
+    fn connection_opened(
+        &self,
+        flow: &FlowContext,
+        traffic_security: CaptureTrafficSecurity,
+    ) -> Result<(), MitmProxyError> {
         self.write_event(connection(
             PlaintextEvent::connection_opened,
             self.timestamp(),
             flow.clone(),
+            traffic_security,
         ))
     }
 
-    pub(crate) fn bytes(
+    fn bytes(
         &self,
         flow: &FlowContext,
         direction: Direction,
         stream_offset: u64,
         bytes: &[u8],
+        traffic_security: CaptureTrafficSecurity,
     ) -> Result<(), MitmProxyError> {
         self.write_event(
             PlaintextEvent::bytes(
@@ -50,15 +70,21 @@ impl CaptureEventFeedWriter {
                 PlaintextChunk::new(self.timestamp(), flow.clone(), direction, bytes)
                     .with_stream_offset(stream_offset),
             )
+            .with_traffic_security(traffic_security)
             .into(),
         )
     }
 
-    pub(crate) fn connection_closed(&self, flow: FlowContext) -> Result<(), MitmProxyError> {
+    fn connection_closed(
+        &self,
+        flow: FlowContext,
+        traffic_security: CaptureTrafficSecurity,
+    ) -> Result<(), MitmProxyError> {
         self.write_event(connection(
             PlaintextEvent::connection_closed,
             self.timestamp(),
             flow,
+            traffic_security,
         ))
     }
 
@@ -83,6 +109,34 @@ impl CaptureEventFeedWriter {
             monotonic_ns: u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             wall_time_unix_ns,
         }
+    }
+}
+
+pub(crate) struct CaptureFlowWriter<'a> {
+    feed: &'a CaptureEventFeedWriter,
+    flow: FlowContext,
+    offsets: FlowOffsets,
+    traffic_security: CaptureTrafficSecurity,
+}
+
+impl CaptureFlowWriter<'_> {
+    pub(crate) fn flow(&self) -> &FlowContext {
+        &self.flow
+    }
+
+    pub(crate) fn bytes(
+        &mut self,
+        direction: Direction,
+        bytes: &[u8],
+    ) -> Result<(), MitmProxyError> {
+        let offset = self.offsets.record(direction, bytes.len());
+        self.feed
+            .bytes(&self.flow, direction, offset, bytes, self.traffic_security)
+    }
+
+    pub(crate) fn close(self) -> Result<(), MitmProxyError> {
+        self.feed
+            .connection_closed(self.flow, self.traffic_security)
     }
 }
 
@@ -140,7 +194,7 @@ fn ensure_feed_parent_directory(path: &Path) -> Result<(), MitmProxyError> {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct FlowOffsets {
+struct FlowOffsets {
     inbound: u64,
     outbound: u64,
 }
@@ -161,11 +215,13 @@ fn connection(
     kind: fn(PlaintextSource, PlaintextConnection) -> PlaintextEvent,
     timestamp: Timestamp,
     flow: FlowContext,
+    traffic_security: CaptureTrafficSecurity,
 ) -> CaptureEvent {
     kind(
         PlaintextSource::L7MitmPlaintext,
         PlaintextConnection::new(timestamp, flow),
     )
+    .with_traffic_security(traffic_security)
     .into()
 }
 

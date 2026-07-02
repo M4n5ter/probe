@@ -220,7 +220,7 @@ pub enum Tls13SessionSecretFlowDecryptError {
 }
 
 fn degrade_plaintext_event(
-    event: PlaintextEvent,
+    mut event: PlaintextEvent,
     reason: Option<&str>,
     degraded: bool,
 ) -> PlaintextEvent {
@@ -228,15 +228,12 @@ fn degrade_plaintext_event(
         return event;
     }
     let reason = reason.unwrap_or("upstream ciphertext capture is degraded");
-    match event.kind {
-        PlaintextEventKind::Bytes(chunk) => PlaintextEvent::bytes(
-            event.source,
-            chunk.with_degradation(format!(
-                "TLS session-secret ciphertext capture degraded: {reason}"
-            )),
-        ),
-        kind => PlaintextEvent::new(event.source, kind),
+    if let PlaintextEventKind::Bytes(chunk) = event.kind {
+        event.kind = PlaintextEventKind::Bytes(chunk.with_degradation(format!(
+            "TLS session-secret ciphertext capture degraded: {reason}"
+        )));
     }
+    event
 }
 
 #[cfg(test)]

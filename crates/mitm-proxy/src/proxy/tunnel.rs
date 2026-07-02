@@ -4,13 +4,11 @@ use std::{
     time::Duration,
 };
 
-use probe_core::{Direction, FlowContext};
+use probe_core::Direction;
 
-use crate::{
-    MitmProxyError,
-    error::io_error,
-    feed::{CaptureEventFeedWriter, FlowOffsets},
-};
+use crate::{MitmProxyError, error::io_error};
+
+use crate::feed::CaptureFlowWriter;
 
 use super::{downstream::DownstreamStream, response_direction, upstream::UpstreamConnection};
 
@@ -20,9 +18,7 @@ const TUNNEL_POLL_TIMEOUT: Duration = Duration::from_millis(20);
 pub(super) fn relay_upgraded_tunnel(
     downstream: &mut DownstreamStream,
     upstream: &mut UpstreamConnection,
-    feed: &CaptureEventFeedWriter,
-    flow: &FlowContext,
-    offsets: &mut FlowOffsets,
+    capture: &mut CaptureFlowWriter<'_>,
     request_direction: Direction,
     initial_downstream_bytes: &[u8],
 ) -> Result<(), MitmProxyError> {
@@ -30,11 +26,6 @@ pub(super) fn relay_upgraded_tunnel(
     upstream.set_read_timeout(Some(TUNNEL_POLL_TIMEOUT))?;
 
     let response_direction = response_direction(request_direction);
-    let mut context = TunnelRelay {
-        feed,
-        flow,
-        offsets,
-    };
     let downstream_leg = TunnelLeg {
         direction: request_direction,
         read_action: "read MITM proxy upgraded downstream bytes",
@@ -45,12 +36,7 @@ pub(super) fn relay_upgraded_tunnel(
         read_action: "read MITM proxy upgraded upstream bytes",
         write_action: "write MITM proxy upgraded downstream bytes",
     };
-    forward_bytes(
-        upstream,
-        &mut context,
-        downstream_leg,
-        initial_downstream_bytes,
-    )?;
+    forward_bytes(upstream, capture, downstream_leg, initial_downstream_bytes)?;
     let mut downstream_buffer = [0_u8; TUNNEL_BUFFER_BYTES];
     let mut upstream_buffer = [0_u8; TUNNEL_BUFFER_BYTES];
     let mut downstream_state = LegState::Open;
@@ -61,7 +47,7 @@ pub(super) fn relay_upgraded_tunnel(
             relay_once(
                 downstream,
                 upstream,
-                &mut context,
+                capture,
                 downstream_leg,
                 &mut downstream_buffer,
             )?
@@ -77,7 +63,7 @@ pub(super) fn relay_upgraded_tunnel(
             relay_once(
                 upstream,
                 downstream,
-                &mut context,
+                capture,
                 upstream_leg,
                 &mut upstream_buffer,
             )?
@@ -114,12 +100,6 @@ enum TunnelProgress {
     Closed,
 }
 
-struct TunnelRelay<'a> {
-    feed: &'a CaptureEventFeedWriter,
-    flow: &'a FlowContext,
-    offsets: &'a mut FlowOffsets,
-}
-
 #[derive(Clone, Copy)]
 struct TunnelLeg {
     direction: Direction,
@@ -130,7 +110,7 @@ struct TunnelLeg {
 fn relay_once(
     source: &mut impl Read,
     destination: &mut impl Write,
-    context: &mut TunnelRelay<'_>,
+    capture: &mut CaptureFlowWriter<'_>,
     leg: TunnelLeg,
     buffer: &mut [u8],
 ) -> Result<TunnelProgress, MitmProxyError> {
@@ -141,23 +121,20 @@ fn relay_once(
         Err(error) => return Err(io_error(leg.read_action)(error)),
     };
     let bytes = &buffer[..read];
-    forward_bytes(destination, context, leg, bytes)?;
+    forward_bytes(destination, capture, leg, bytes)?;
     Ok(TunnelProgress::Data)
 }
 
 fn forward_bytes(
     destination: &mut impl Write,
-    context: &mut TunnelRelay<'_>,
+    capture: &mut CaptureFlowWriter<'_>,
     leg: TunnelLeg,
     bytes: &[u8],
 ) -> Result<(), MitmProxyError> {
     if bytes.is_empty() {
         return Ok(());
     }
-    let offset = context.offsets.record(leg.direction, bytes.len());
-    context
-        .feed
-        .bytes(context.flow, leg.direction, offset, bytes)?;
+    capture.bytes(leg.direction, bytes)?;
     destination
         .write_all(bytes)
         .map_err(io_error(leg.write_action))?;

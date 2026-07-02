@@ -13,4 +13,6 @@ pub use kind::{
     ProtocolError, SseEvent, UnknownEventType, WebSocketFrame, WebSocketHandoff, WebSocketMessage,
     WebSocketMessageOpcode, WebSocketOpcode,
 };
-pub use origin::{CaptureOrigin, CaptureProviderKind, CaptureSource, Direction, Timestamp};
+pub use origin::{
+    CaptureOrigin, CaptureProviderKind, CaptureSource, CaptureTrafficSecurity, Direction, Timestamp,
+};

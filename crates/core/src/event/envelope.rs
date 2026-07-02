@@ -607,10 +607,10 @@ fn kind_is_policy_emission(kind: &EventKind) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Action, AddressPort, CaptureLoss, CaptureOrigin, CaptureSource, Direction, DomainEvent,
-        EnforcementEvidence, EventEnvelope, EventKind, EventProvenance, FlowContext, FlowIdentity,
-        HttpHeaders, ObservationOnlyReason, ProcessContext, ProcessIdentity, Timestamp,
-        TransportProtocol,
+        Action, AddressPort, CaptureLoss, CaptureOrigin, CaptureSource, CaptureTrafficSecurity,
+        Direction, DomainEvent, EnforcementEvidence, EventEnvelope, EventKind, EventProvenance,
+        FlowContext, FlowIdentity, HttpHeaders, ObservationOnlyReason, ProcessContext,
+        ProcessIdentity, Timestamp, TransportProtocol,
     };
 
     #[test]
@@ -627,6 +627,22 @@ mod tests {
         let mock = request_event(CaptureSource::Mock, "/same");
 
         assert_ne!(replay.id, mock.id);
+    }
+
+    #[test]
+    fn event_id_changes_when_capture_traffic_security_changes() {
+        let cleartext = request_event_with_origin(
+            CaptureOrigin::from_source(CaptureSource::L7MitmPlaintext)
+                .with_traffic_security(CaptureTrafficSecurity::Cleartext),
+            "/same",
+        );
+        let tls_decrypted = request_event_with_origin(
+            CaptureOrigin::from_source(CaptureSource::L7MitmPlaintext)
+                .with_traffic_security(CaptureTrafficSecurity::TlsDecrypted),
+            "/same",
+        );
+
+        assert_ne!(cleartext.id, tls_decrypted.id);
     }
 
     #[test]

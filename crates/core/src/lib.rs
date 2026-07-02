@@ -17,13 +17,14 @@ pub use capability::{
 };
 pub use cgroup::{CgroupPath, CgroupPathError};
 pub use event::{
-    BodyChunk, CaptureLoss, CaptureOrigin, CaptureProviderKind, CaptureSource, Direction,
-    DomainEvent, EnforcementEvidence, EventEmission, EventEnvelope, EventId, EventKind,
-    EventProvenance, EventSubject, EventType, Gap, HttpHeaders, L7MitmAuditEvent, L7MitmAuditPhase,
-    L7MitmExternalBackendAudit, L7MitmManagedProcessAudit, L7MitmManagedProcessBackendAudit,
-    L7MitmReadinessProbeAudit, ObservationOnlyReason, OpaqueStream, PolicyEmissionStage,
-    PolicyRuntimeError, ProtocolError, SseEvent, Timestamp, UnknownEventType, WebSocketFrame,
-    WebSocketHandoff, WebSocketMessage, WebSocketMessageOpcode, WebSocketOpcode,
+    BodyChunk, CaptureLoss, CaptureOrigin, CaptureProviderKind, CaptureSource,
+    CaptureTrafficSecurity, Direction, DomainEvent, EnforcementEvidence, EventEmission,
+    EventEnvelope, EventId, EventKind, EventProvenance, EventSubject, EventType, Gap, HttpHeaders,
+    L7MitmAuditEvent, L7MitmAuditPhase, L7MitmExternalBackendAudit, L7MitmManagedProcessAudit,
+    L7MitmManagedProcessBackendAudit, L7MitmReadinessProbeAudit, ObservationOnlyReason,
+    OpaqueStream, PolicyEmissionStage, PolicyRuntimeError, ProtocolError, SseEvent, Timestamp,
+    UnknownEventType, WebSocketFrame, WebSocketHandoff, WebSocketMessage, WebSocketMessageOpcode,
+    WebSocketOpcode,
 };
 pub use identity::{
     AddressPort, FlowContext, FlowIdentity, ProcessContext, ProcessGeneration, ProcessIdentity,

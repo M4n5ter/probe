@@ -1,6 +1,8 @@
 use std::fmt;
 
-use probe_core::{CaptureOrigin, CaptureSource, Direction, EventEnvelope, EventKind};
+use probe_core::{
+    CaptureOrigin, CaptureSource, CaptureTrafficSecurity, Direction, EventEnvelope, EventKind,
+};
 
 use crate::admin::{EventTailBudgetSnapshot, EventTailOmission, EventTailRecord};
 
@@ -152,6 +154,21 @@ impl fmt::Debug for TrafficRow {
 
 fn capture_path_short_label(origin: CaptureOrigin) -> &'static str {
     match origin.source() {
+        CaptureSource::L7MitmPlaintext => mitm_capture_path_short_label(origin.traffic_security()),
+        source => capture_source_short_label(source),
+    }
+}
+
+fn mitm_capture_path_short_label(traffic_security: CaptureTrafficSecurity) -> &'static str {
+    match traffic_security {
+        CaptureTrafficSecurity::Unknown => "mitm-data",
+        CaptureTrafficSecurity::Cleartext => "mitm-http",
+        CaptureTrafficSecurity::TlsDecrypted => "mitm-tls",
+    }
+}
+
+fn capture_source_short_label(source: CaptureSource) -> &'static str {
+    match source {
         CaptureSource::EbpfSyscall => "ebpf",
         CaptureSource::Libpcap => "libpcap",
         CaptureSource::LibsslUprobe => "tls-uprobe",
@@ -166,6 +183,21 @@ fn capture_path_short_label(origin: CaptureOrigin) -> &'static str {
 
 fn capture_path_detail_label(origin: CaptureOrigin) -> &'static str {
     match origin.source() {
+        CaptureSource::L7MitmPlaintext => mitm_capture_path_detail_label(origin.traffic_security()),
+        source => capture_source_detail_label(source),
+    }
+}
+
+fn mitm_capture_path_detail_label(traffic_security: CaptureTrafficSecurity) -> &'static str {
+    match traffic_security {
+        CaptureTrafficSecurity::Unknown => "MITM plaintext bridge",
+        CaptureTrafficSecurity::Cleartext => "MITM plaintext bridge (plain HTTP)",
+        CaptureTrafficSecurity::TlsDecrypted => "MITM plaintext bridge (TLS-decrypted HTTP)",
+    }
+}
+
+fn capture_source_detail_label(source: CaptureSource) -> &'static str {
+    match source {
         CaptureSource::EbpfSyscall => "eBPF syscall capture",
         CaptureSource::Libpcap => "libpcap passive capture",
         CaptureSource::LibsslUprobe => "TLS plaintext uprobe",
@@ -454,9 +486,10 @@ fn event_detail_lines(sequence: u64, event: &EventEnvelope) -> Vec<String> {
             capture_path_detail_label(event.origin())
         ),
         format!(
-            "Origin: source={} provider={}",
+            "Origin: source={} provider={} traffic_security={}",
             event.origin().source().wire_name(),
-            event.origin().provider().wire_name()
+            event.origin().provider().wire_name(),
+            event.origin().traffic_security().wire_name()
         ),
         format!("Config version: {}", event.config_version()),
         format!("Degraded: {}", event.degraded()),
@@ -605,46 +638,41 @@ mod tests {
 
     #[test]
     fn traffic_row_surfaces_capture_path_in_list_preview_and_detail() {
-        let event = EventEnvelope::from_flow(
-            Timestamp {
-                monotonic_ns: 1,
-                wall_time_unix_ns: 1,
-            },
-            flow_with_raw_argv(),
-            CaptureOrigin::from_source(CaptureSource::L7MitmPlaintext),
-            "test",
-            EventKind::HttpRequestHeaders(HttpHeaders {
-                direction: Direction::Outbound,
-                stream_sequence: 1,
-                method: Some("GET".to_string()),
-                target: Some("/mitm".to_string()),
-                status: None,
-                reason: None,
-                version: "HTTP/1.1".to_string(),
-                headers: Vec::new(),
-            }),
-        );
-
+        let event = mitm_request_event(CaptureTrafficSecurity::TlsDecrypted, "/mitm");
         let row = TrafficRow::from_event(7, event);
 
-        assert_eq!(row.capture_path, "mitm-data");
+        assert_eq!(row.capture_path, "mitm-tls");
         let compact_preview = row.preview_lines(3);
         assert!(
             compact_preview
                 .iter()
-                .any(|line| line == "Event type: http_request_headers via mitm-data"),
+                .any(|line| line == "Event type: http_request_headers via mitm-tls"),
             "compact preview should preserve the capture path: {compact_preview:?}"
         );
         assert!(
             row.detail_lines()
                 .iter()
-                .any(|line| line == "Capture path: MITM plaintext bridge")
+                .any(|line| line == "Capture path: MITM plaintext bridge (TLS-decrypted HTTP)")
         );
-        let expected_origin = "Origin: source=l7_mitm_plaintext provider=interception";
+        let expected_origin =
+            "Origin: source=l7_mitm_plaintext provider=interception traffic_security=tls_decrypted";
         assert!(
             row.detail_lines()
                 .iter()
                 .any(|line| line == expected_origin)
+        );
+    }
+
+    #[test]
+    fn traffic_row_distinguishes_mitm_plain_http_capture_path() {
+        let event = mitm_request_event(CaptureTrafficSecurity::Cleartext, "/plain");
+        let row = TrafficRow::from_event(7, event);
+
+        assert_eq!(row.capture_path, "mitm-http");
+        assert!(
+            row.detail_lines()
+                .iter()
+                .any(|line| line == "Capture path: MITM plaintext bridge (plain HTTP)")
         );
     }
 
@@ -765,5 +793,28 @@ mod tests {
             socket_cookie: None,
             attribution_confidence: 100,
         }
+    }
+
+    fn mitm_request_event(traffic_security: CaptureTrafficSecurity, target: &str) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            flow_with_raw_argv(),
+            CaptureOrigin::from_source(CaptureSource::L7MitmPlaintext)
+                .with_traffic_security(traffic_security),
+            "test",
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some(target.to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        )
     }
 }
