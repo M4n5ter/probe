@@ -1,7 +1,7 @@
 use std::{fmt, path::PathBuf};
 
 use attribution::{ProcessAttributor, ProcfsAttributor};
-use probe_core::ProcessContext;
+use probe_core::{CgroupPath, ProcessContext};
 use probe_core::{ProcessSelector, Selector, TrafficSelector};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -10,6 +10,51 @@ pub(crate) struct ProcessEntry {
     pub(crate) name: String,
     pub(crate) exe_path: Option<PathBuf>,
     pub(crate) argv: Vec<String>,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) cgroup_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProcessOutboundInterceptionScope {
+    Cgroup { path: String },
+    Uid { uid: u32 },
+    Unavailable,
+}
+
+impl ProcessOutboundInterceptionScope {
+    pub(crate) fn selector(&self) -> Option<Selector> {
+        match self {
+            Self::Cgroup { path } => Some(selector_for_cgroup_path(path.clone())),
+            Self::Uid { uid } => Some(selector_for_uid(*uid)),
+            Self::Unavailable => None,
+        }
+    }
+
+    pub(crate) fn table_label(&self) -> &'static str {
+        match self {
+            Self::Cgroup { .. } => "cgroup",
+            Self::Uid { .. } => "uid",
+            Self::Unavailable => "-",
+        }
+    }
+
+    pub(crate) fn detail_label(&self) -> Option<String> {
+        match self {
+            Self::Cgroup { path } => Some(format!("cgroup {path}")),
+            Self::Uid { uid } => Some(format!("uid {uid}")),
+            Self::Unavailable => None,
+        }
+    }
+
+    pub(crate) fn unavailable_reason(&self, process_name: &str) -> Option<String> {
+        match self {
+            Self::Unavailable => Some(format!(
+                "Selected process {process_name} runs as root and has no usable cgroup path; outbound MITM would be too broad"
+            )),
+            Self::Cgroup { .. } | Self::Uid { .. } => None,
+        }
+    }
 }
 
 impl fmt::Debug for ProcessEntry {
@@ -19,6 +64,9 @@ impl fmt::Debug for ProcessEntry {
             .field("pid", &self.pid)
             .field("name", &self.name)
             .field("exe_path", &self.exe_path)
+            .field("uid", &self.uid)
+            .field("gid", &self.gid)
+            .field("cgroup_path", &self.cgroup_path)
             .field("argv_len", &self.argv.len())
             .finish()
     }
@@ -36,12 +84,45 @@ impl ProcessEntry {
         self.selector_key().map(selector_for_exe_path)
     }
 
-    pub(crate) fn selector_status(&self) -> &'static str {
+    pub(crate) fn outbound_interception_process_selector(&self) -> Option<Selector> {
+        self.outbound_interception_scope().selector()
+    }
+
+    pub(crate) fn capture_scope_label(&self) -> &'static str {
         if self.selector().is_some() {
-            "exe selector"
+            "exe"
         } else {
-            "no safe selector"
+            "-"
         }
+    }
+
+    pub(crate) fn mitm_scope_label(&self) -> &'static str {
+        self.outbound_interception_scope().table_label()
+    }
+
+    pub(crate) fn outbound_interception_scope_label(&self) -> Option<String> {
+        self.outbound_interception_scope().detail_label()
+    }
+
+    pub(crate) fn outbound_interception_unavailable_reason(&self) -> String {
+        self.outbound_interception_scope()
+            .unavailable_reason(&self.name)
+            .unwrap_or_else(|| {
+                format!(
+                    "Selected process {} has no usable outbound MITM scope",
+                    self.name
+                )
+            })
+    }
+
+    pub(crate) fn outbound_interception_scope(&self) -> ProcessOutboundInterceptionScope {
+        if let Some(path) = self.normalized_cgroup_path() {
+            return ProcessOutboundInterceptionScope::Cgroup { path };
+        }
+        if self.uid != 0 {
+            return ProcessOutboundInterceptionScope::Uid { uid: self.uid };
+        }
+        ProcessOutboundInterceptionScope::Unavailable
     }
 
     pub(crate) fn argv_summary(&self, max_chars: usize) -> String {
@@ -92,7 +173,17 @@ impl ProcessEntry {
             exe_path: (!process.identity.exe_path.is_empty())
                 .then(|| PathBuf::from(process.identity.exe_path)),
             argv: process.cmdline,
+            uid: process.identity.uid,
+            gid: process.identity.gid,
+            cgroup_path: process.identity.cgroup,
         }
+    }
+
+    fn normalized_cgroup_path(&self) -> Option<String> {
+        self.cgroup_path
+            .as_deref()
+            .and_then(|path| CgroupPath::parse(path).ok())
+            .map(CgroupPath::into_string)
     }
 }
 
@@ -128,6 +219,26 @@ pub(crate) fn selector_for_exe_path(exe_path: String) -> Selector {
     Selector::term(
         ProcessSelector {
             exe_path_globs: vec![exe_path],
+            ..ProcessSelector::default()
+        },
+        TrafficSelector::default(),
+    )
+}
+
+fn selector_for_cgroup_path(cgroup_path: String) -> Selector {
+    Selector::term(
+        ProcessSelector {
+            cgroup_paths: vec![cgroup_path],
+            ..ProcessSelector::default()
+        },
+        TrafficSelector::default(),
+    )
+}
+
+fn selector_for_uid(uid: u32) -> Selector {
+    Selector::term(
+        ProcessSelector {
+            uids: vec![uid],
             ..ProcessSelector::default()
         },
         TrafficSelector::default(),
@@ -256,6 +367,12 @@ mod tests {
             catalog.entries()[0].exe_path,
             Some(PathBuf::from("/usr/bin/curl"))
         );
+        assert_eq!(catalog.entries()[0].uid, 1000);
+        assert_eq!(catalog.entries()[0].gid, 1000);
+        assert_eq!(
+            catalog.entries()[0].cgroup_path.as_deref(),
+            Some("/system.slice/curl.service")
+        );
         Ok(())
     }
 
@@ -266,6 +383,9 @@ mod tests {
             name: "curl".to_string(),
             exe_path: Some(PathBuf::from("/usr/bin/curl")),
             argv: Vec::new(),
+            uid: 1000,
+            gid: 1000,
+            cgroup_path: None,
         };
 
         let Some(selector) = entry.selector() else {
@@ -280,17 +400,97 @@ mod tests {
     }
 
     #[test]
-    fn process_entry_without_executable_path_does_not_broaden_to_process_name() {
+    fn process_entry_without_executable_path_does_not_broaden_capture_to_process_name() {
         let entry = ProcessEntry {
             pid: 7,
             name: "python".to_string(),
             exe_path: None,
             argv: vec!["python".to_string()],
+            uid: 1000,
+            gid: 1000,
+            cgroup_path: None,
         };
 
         assert_eq!(entry.selector(), None);
-        assert_eq!(entry.selector_status(), "no safe selector");
+        assert_eq!(entry.capture_scope_label(), "-");
+        assert_eq!(entry.mitm_scope_label(), "uid");
         assert_eq!(entry.argv_summary(96), "python");
+    }
+
+    #[test]
+    fn outbound_interception_process_selector_prefers_cgroup_scope() {
+        let entry = ProcessEntry {
+            pid: 7,
+            name: "curl".to_string(),
+            exe_path: Some(PathBuf::from("/usr/bin/curl")),
+            argv: Vec::new(),
+            uid: 1000,
+            gid: 1000,
+            cgroup_path: Some("/system.slice/curl.service".to_string()),
+        };
+
+        let Some(Selector::Match { term }) = entry.outbound_interception_process_selector() else {
+            panic!("cgroup process should produce an outbound interception selector");
+        };
+
+        assert_eq!(term.process.cgroup_paths, ["system.slice/curl.service"]);
+        assert!(term.process.uids.is_empty());
+        assert!(term.traffic.remote_ports.is_empty());
+        assert_eq!(entry.capture_scope_label(), "exe");
+        assert_eq!(entry.mitm_scope_label(), "cgroup");
+        assert_eq!(
+            entry.outbound_interception_scope_label().as_deref(),
+            Some("cgroup system.slice/curl.service")
+        );
+    }
+
+    #[test]
+    fn outbound_interception_process_selector_uses_non_root_uid_without_cgroup_scope() {
+        let entry = ProcessEntry {
+            pid: 7,
+            name: "curl".to_string(),
+            exe_path: Some(PathBuf::from("/usr/bin/curl")),
+            argv: Vec::new(),
+            uid: 1000,
+            gid: 1000,
+            cgroup_path: None,
+        };
+
+        let Some(Selector::Match { term }) = entry.outbound_interception_process_selector() else {
+            panic!("non-root process should produce an owner selector");
+        };
+
+        assert_eq!(term.process.uids, [1000]);
+        assert!(term.process.gids.is_empty());
+        assert!(term.traffic.remote_ports.is_empty());
+        assert_eq!(entry.capture_scope_label(), "exe");
+        assert_eq!(entry.mitm_scope_label(), "uid");
+        assert_eq!(
+            entry.outbound_interception_scope_label().as_deref(),
+            Some("uid 1000")
+        );
+    }
+
+    #[test]
+    fn outbound_interception_process_selector_rejects_root_process_without_cgroup_scope() {
+        let entry = ProcessEntry {
+            pid: 7,
+            name: "root-daemon".to_string(),
+            exe_path: Some(PathBuf::from("/usr/bin/root-daemon")),
+            argv: Vec::new(),
+            uid: 0,
+            gid: 0,
+            cgroup_path: Some("/".to_string()),
+        };
+
+        assert_eq!(entry.outbound_interception_process_selector(), None);
+        assert_eq!(entry.capture_scope_label(), "exe");
+        assert_eq!(entry.mitm_scope_label(), "-");
+        assert!(
+            entry
+                .outbound_interception_unavailable_reason()
+                .contains("would be too broad")
+        );
     }
 
     #[test]
@@ -304,6 +504,9 @@ mod tests {
                 "-m".to_string(),
                 "http.server".to_string(),
             ],
+            uid: 1000,
+            gid: 1000,
+            cgroup_path: None,
         };
 
         assert!(entry.matches_query("http.server"));

@@ -296,7 +296,8 @@ fn render_processes(frame: &mut Frame<'_>, area: Rect, app: &mut TuiApp, hits: &
                 Cell::from(watched),
                 Cell::from(process.pid.to_string()),
                 Cell::from(process.name.clone()),
-                Cell::from(process.selector_status()),
+                Cell::from(process.capture_scope_label()),
+                Cell::from(process.mitm_scope_label()),
                 Cell::from(truncate(&exe, 48)),
                 Cell::from(argv),
             ]);
@@ -348,15 +349,26 @@ fn render_processes(frame: &mut Frame<'_>, area: Rect, app: &mut TuiApp, hits: &
             [
                 Constraint::Length(2),
                 Constraint::Length(4),
+                Constraint::Length(7),
+                Constraint::Length(20),
                 Constraint::Length(8),
-                Constraint::Length(24),
-                Constraint::Length(16),
-                Constraint::Length(48),
+                Constraint::Length(7),
+                Constraint::Length(42),
                 Constraint::Min(24),
             ],
         )
         .header(
-            Row::new(["", "Watch", "PID", "Name", "Selector", "Executable", "Argv"]).style(
+            Row::new([
+                "",
+                "Watch",
+                "PID",
+                "Name",
+                "Capture",
+                "MITM",
+                "Executable",
+                "Argv",
+            ])
+            .style(
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -739,12 +751,20 @@ mod tests {
                     name: "curl".to_string(),
                     exe_path: Some(PathBuf::from("/usr/bin/curl")),
                     argv: vec!["curl".to_string()],
+                    uid: 1000,
+                    gid: 1000,
+                    cgroup_path: Some(
+                        "user.slice/user-1000.slice/app.slice/curl.scope".to_string(),
+                    ),
                 },
                 ProcessEntry {
                     pid: 43,
                     name: "nginx".to_string(),
                     exe_path: Some(PathBuf::from("/usr/sbin/nginx")),
                     argv: vec!["nginx".to_string()],
+                    uid: 0,
+                    gid: 0,
+                    cgroup_path: Some("system.slice/nginx.service".to_string()),
                 },
             ]),
         );
@@ -805,6 +825,9 @@ mod tests {
                 name: "curl".to_string(),
                 exe_path: Some(PathBuf::from("/usr/bin/curl")),
                 argv: vec!["curl".to_string(), "https://example.com".to_string()],
+                uid: 1000,
+                gid: 1000,
+                cgroup_path: Some("user.slice/user-1000.slice/app.slice/curl.scope".to_string()),
             }]),
         )
     }

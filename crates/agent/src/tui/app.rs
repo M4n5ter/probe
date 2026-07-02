@@ -8,10 +8,11 @@ use super::fields::{
 };
 use super::hit::HitTarget;
 use super::mitm_setup::{
-    MitmQuickSetupDirection, MitmQuickSetupOutcome, MitmQuickSetupWarning, apply_mitm_quick_setup,
+    DEFAULT_OUTBOUND_MITM_REMOTE_PORTS, MitmQuickSetupDirection, MitmQuickSetupOutcome,
+    MitmQuickSetupWarning, apply_mitm_quick_setup,
 };
 use super::process_view::ProcessViewState;
-use super::processes::{ProcessCatalog, selector_for_exe_path};
+use super::processes::{ProcessCatalog, ProcessEntry, selector_for_exe_path};
 use super::runtime_attachment::RuntimeAttachment;
 use super::runtime_status::request_traffic_runtime_diagnostics;
 use super::traffic::TrafficState;
@@ -446,10 +447,7 @@ impl TuiApp {
     }
 
     pub(crate) fn selected_process_name(&self) -> Option<&str> {
-        self.processes
-            .entries()
-            .get(self.process_view.selected_index()?)
-            .map(|process| process.name.as_str())
+        self.selected_process().map(|process| process.name.as_str())
     }
 
     fn handle_click(&mut self, target: HitTarget) -> Option<TuiEffect> {
@@ -689,7 +687,7 @@ impl TuiApp {
     }
 
     fn apply_mitm_quick_setup(&mut self, direction: MitmQuickSetupDirection) -> Option<TuiEffect> {
-        let selected_process_selector = self.selected_process_selector();
+        let selected_process_selector = self.selected_mitm_process_selector(direction);
         match apply_mitm_quick_setup(&mut self.config, direction, selected_process_selector) {
             MitmQuickSetupOutcome::Changed {
                 direction,
@@ -699,7 +697,7 @@ impl TuiApp {
                 self.status = if let Some(warning) = warnings.first() {
                     StatusMessage::warning(mitm_quick_setup_warning_message(warning))
                 } else {
-                    StatusMessage::info(direction.status_message())
+                    StatusMessage::info(self.mitm_quick_setup_success_message(direction))
                 };
                 self.clamp_selection();
                 Some(TuiEffect::SaveConfig)
@@ -709,7 +707,7 @@ impl TuiApp {
                 None
             }
             MitmQuickSetupOutcome::MissingProcessSelector => {
-                self.status = self.process_selector_warning();
+                self.status = self.mitm_selector_warning(direction);
                 None
             }
         }
@@ -820,10 +818,37 @@ impl TuiApp {
     }
 
     fn selected_process_selector(&self) -> Option<probe_core::Selector> {
+        self.selected_process().and_then(ProcessEntry::selector)
+    }
+
+    fn selected_process(&self) -> Option<&ProcessEntry> {
         self.processes
             .entries()
             .get(self.process_view.selected_index()?)
-            .and_then(|process| process.selector())
+    }
+
+    fn selected_mitm_process_selector(
+        &self,
+        direction: MitmQuickSetupDirection,
+    ) -> Option<probe_core::Selector> {
+        let process = self.selected_process()?;
+        match direction {
+            MitmQuickSetupDirection::Inbound => process.selector(),
+            MitmQuickSetupDirection::Outbound => process.outbound_interception_process_selector(),
+        }
+    }
+
+    fn mitm_quick_setup_success_message(&self, direction: MitmQuickSetupDirection) -> String {
+        if direction == MitmQuickSetupDirection::Outbound
+            && let Some(process) = self.selected_process()
+            && let Some(scope) = process.outbound_interception_scope_label()
+        {
+            return format!(
+                "Outbound MITM configured for {scope} on remote ports {}",
+                default_outbound_mitm_remote_ports_label()
+            );
+        }
+        direction.status_message().to_string()
     }
 
     fn traffic_filter_selector(&self) -> Option<probe_core::Selector> {
@@ -900,6 +925,17 @@ impl TuiApp {
         StatusMessage::warning(message)
     }
 
+    fn mitm_selector_warning(&self, direction: MitmQuickSetupDirection) -> StatusMessage {
+        if direction == MitmQuickSetupDirection::Outbound {
+            let message = self
+                .selected_process()
+                .map(|process| process.outbound_interception_unavailable_reason())
+                .unwrap_or_else(|| "No selected process".to_string());
+            return StatusMessage::warning(message);
+        }
+        self.process_selector_warning()
+    }
+
     pub(crate) fn mark_dirty(&mut self, message: impl Into<String>) {
         self.dirty = true;
         self.status = StatusMessage::info(message);
@@ -921,6 +957,14 @@ fn initial_status(processes: &ProcessCatalog) -> StatusMessage {
         (false, Some(diagnostic)) => StatusMessage::warning(diagnostic),
         (false, None) => StatusMessage::info("Ready"),
     }
+}
+
+fn default_outbound_mitm_remote_ports_label() -> String {
+    DEFAULT_OUTBOUND_MITM_REMOTE_PORTS
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn offset_index(index: usize, len: usize, delta: isize) -> usize {
@@ -997,6 +1041,9 @@ mod tests {
                 name: "python".to_string(),
                 exe_path: None,
                 argv: vec!["python".to_string()],
+                uid: 1000,
+                gid: 1000,
+                cgroup_path: None,
             }]),
         );
         app.select_tab(TuiTab::Capture);
@@ -1082,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_mitm_setup_rejects_exe_only_process_selector() {
+    fn outbound_mitm_setup_uses_selected_process_cgroup_scope() {
         let mut app = multi_process_app();
         app.select_tab(TuiTab::Processes);
         app.handle_action(TuiAction::Click(HitTarget::Process(1)));
@@ -1092,17 +1139,49 @@ mod tests {
             ControlId::ConfigureOutboundMitm,
         )));
 
-        assert_eq!(effect, None);
-        assert!(!app.dirty());
+        assert_eq!(effect, Some(TuiEffect::SaveConfig));
+        assert!(app.dirty());
         assert_eq!(
             app.config.enforcement.interception.strategy,
-            probe_config::TransparentInterceptionStrategyConfig::None
+            probe_config::TransparentInterceptionStrategyConfig::OutboundTransparentMitm
         );
-        assert!(
-            app.status()
-                .text
-                .starts_with("Outbound MITM cannot use the selected process scope yet")
+        let Some(probe_core::Selector::Match { term }) =
+            app.config.enforcement.interception.selector.as_ref()
+        else {
+            panic!("outbound MITM selector should be a match selector");
+        };
+        assert_eq!(term.process.cgroup_paths, ["system.slice/nginx.service"]);
+        assert_eq!(
+            term.traffic.remote_ports,
+            DEFAULT_OUTBOUND_MITM_REMOTE_PORTS
         );
+        assert_eq!(term.traffic.directions, [probe_core::Direction::Outbound]);
+    }
+
+    #[test]
+    fn outbound_mitm_setup_rejects_root_process_without_cgroup_scope() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::from_entries([ProcessEntry {
+                pid: 42,
+                name: "root-daemon".to_string(),
+                exe_path: Some(PathBuf::from("/usr/bin/root-daemon")),
+                argv: vec!["root-daemon".to_string()],
+                uid: 0,
+                gid: 0,
+                cgroup_path: Some("/".to_string()),
+            }]),
+        );
+        app.select_tab(TuiTab::Enforcement);
+        let effect = app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::ConfigureOutboundMitm,
+        )));
+
+        assert_eq!(effect, None);
+        assert!(!app.dirty());
+        assert_eq!(app.status().kind, StatusKind::Warning);
+        assert!(app.status().text.contains("would be too broad"));
     }
 
     #[test]
@@ -1379,6 +1458,9 @@ mod tests {
                 name: "curl".to_string(),
                 exe_path: Some(PathBuf::from("/usr/bin/curl")),
                 argv: vec!["curl".to_string()],
+                uid: 1000,
+                gid: 1000,
+                cgroup_path: Some("user.slice/user-1000.slice/app.slice/curl.scope".to_string()),
             }]),
         )
     }
@@ -1403,6 +1485,9 @@ mod tests {
             name: name.to_string(),
             exe_path: Some(PathBuf::from(exe_path)),
             argv: vec![name.to_string()],
+            uid: 1000,
+            gid: 1000,
+            cgroup_path: Some(format!("system.slice/{name}.service")),
         }
     }
 

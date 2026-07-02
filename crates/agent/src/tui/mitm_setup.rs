@@ -17,12 +17,13 @@ use probe_config::{
     TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
     TransparentInterceptionStrategyConfig,
 };
-use probe_core::{EnforcementMode, Selector};
+use probe_core::{Direction, EnforcementMode, ProcessSelector, Selector, TrafficSelector};
 
 use super::local_profile::LocalMitmProfile;
 
 pub(super) const MITM_CA_CERTIFICATE_ID: &str = "mitm-ca";
 pub(super) const MITM_CA_PRIVATE_KEY_ID: &str = "mitm-ca-key";
+pub(super) const DEFAULT_OUTBOUND_MITM_REMOTE_PORTS: [u16; 2] = [80, 443];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MitmQuickSetupDirection {
@@ -68,6 +69,7 @@ pub(crate) fn apply_mitm_quick_setup_with_profile(
     let Some(selector) = selected_process_selector else {
         return MitmQuickSetupOutcome::MissingProcessSelector;
     };
+    let selector = direction.scoped_selector(selector);
     if direction == MitmQuickSetupDirection::Outbound
         && let Some(reason) = outbound_process_selector_projection_blocker(&selector)
     {
@@ -127,6 +129,13 @@ fn quick_setup_warnings(profile: &LocalMitmProfile) -> Vec<MitmQuickSetupWarning
 }
 
 impl MitmQuickSetupDirection {
+    fn scoped_selector(self, selector: Selector) -> Selector {
+        match self {
+            Self::Outbound => selector_with_default_outbound_mitm_traffic(selector),
+            Self::Inbound => selector,
+        }
+    }
+
     fn strategy(self) -> TransparentInterceptionStrategyConfig {
         match self {
             Self::Outbound => TransparentInterceptionStrategyConfig::OutboundTransparentMitm,
@@ -147,6 +156,42 @@ impl MitmQuickSetupDirection {
             Self::Inbound => "Inbound MITM capture configured for selected process",
         }
     }
+}
+
+fn selector_with_default_outbound_mitm_traffic(selector: Selector) -> Selector {
+    match selector {
+        Selector::Match { mut term } => {
+            add_default_outbound_mitm_traffic(&mut term.traffic);
+            Selector::Match { term }
+        }
+        Selector::All { mut selectors } => {
+            selectors.push(default_outbound_mitm_traffic_selector());
+            Selector::All { selectors }
+        }
+        selector => Selector::All {
+            selectors: vec![selector, default_outbound_mitm_traffic_selector()],
+        },
+    }
+}
+
+fn add_default_outbound_mitm_traffic(traffic: &mut TrafficSelector) {
+    if traffic.remote_ports.is_empty() {
+        traffic.remote_ports = DEFAULT_OUTBOUND_MITM_REMOTE_PORTS.to_vec();
+    }
+    if traffic.directions.is_empty() {
+        traffic.directions = vec![Direction::Outbound];
+    }
+}
+
+fn default_outbound_mitm_traffic_selector() -> Selector {
+    Selector::term(
+        ProcessSelector::default(),
+        TrafficSelector {
+            remote_ports: DEFAULT_OUTBOUND_MITM_REMOTE_PORTS.to_vec(),
+            directions: vec![Direction::Outbound],
+            ..TrafficSelector::default()
+        },
+    )
 }
 
 fn ensure_default_enforcement_policy_source(config: &mut AgentConfig, profile: &LocalMitmProfile) {
@@ -271,7 +316,7 @@ mod tests {
         let outcome = apply_mitm_quick_setup_with_profile(
             &mut config,
             MitmQuickSetupDirection::Outbound,
-            Some(selector.clone()),
+            Some(selector),
             &profile,
         );
 
@@ -295,7 +340,10 @@ mod tests {
             config.enforcement.backend,
             ConnectionEnforcementBackendConfig::None
         );
-        assert_eq!(config.enforcement.selector, Some(selector.clone()));
+        assert_eq!(
+            config.enforcement.selector,
+            config.enforcement.interception.selector
+        );
         assert_eq!(
             config.enforcement.interception.strategy,
             TransparentInterceptionStrategyConfig::OutboundTransparentMitm
@@ -304,7 +352,15 @@ mod tests {
             config.enforcement.interception.proxy.self_bypass,
             TransparentInterceptionProxySelfBypassConfig::UsesReservedMark
         );
-        assert_eq!(config.enforcement.interception.selector, Some(selector));
+        assert_outbound_mitm_uid_selector(
+            config
+                .enforcement
+                .interception
+                .selector
+                .as_ref()
+                .expect("outbound MITM selector should be configured"),
+            1000,
+        );
         assert!(
             config
                 .tls
@@ -478,6 +534,18 @@ mod tests {
             },
             probe_core::TrafficSelector::default(),
         )
+    }
+
+    fn assert_outbound_mitm_uid_selector(selector: &Selector, uid: u32) {
+        let Selector::Match { term } = selector else {
+            panic!("outbound MITM selector should be a match selector");
+        };
+        assert_eq!(term.process.uids, [uid]);
+        assert_eq!(
+            term.traffic.remote_ports,
+            DEFAULT_OUTBOUND_MITM_REMOTE_PORTS
+        );
+        assert_eq!(term.traffic.directions, [Direction::Outbound]);
     }
 
     fn make_executable(path: &std::path::Path) {
