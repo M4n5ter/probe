@@ -22,6 +22,7 @@ use pipeline::{PipelinePolicySet, PipelineRuntimeMetrics};
 use super::{
     config_reload::plan_config_reload,
     debug_dump::AdminDebugDump,
+    event_tail::{EventTailRequest, read_event_tail},
     protocol::{AdminRequest, AdminResponse, read_admin_request},
     reload::{RuntimeReloadAction, reload_action_response, reload_runtime_actions_response},
     socket::{AdminError, AdminServerConfig, bind_admin_socket, bind_prometheus_listener},
@@ -314,6 +315,25 @@ async fn handle_admin_request(
                 dump: Box::new(AdminDebugDump::new(snapshot)),
             }
         }
+        AdminRequest::TailEvents {
+            after_sequence,
+            limit,
+            selector,
+        } => match read_event_tail(
+            spool,
+            EventTailRequest {
+                after_sequence,
+                limit,
+                selector,
+            },
+        ) {
+            Ok(tail) => AdminResponse::EventTail {
+                tail: Box::new(tail),
+            },
+            Err(error) => AdminResponse::Error {
+                message: error.to_string(),
+            },
+        },
         AdminRequest::PlanConfigReload { path } => plan_config_reload_response(plan, path).await,
     }
 }
@@ -388,7 +408,7 @@ mod tests {
     use capture::ReplayProvider;
     use enforcement::{EnforcementPlanRequest, EnforcementPlanner, ScopedEnforcementPlanner};
     use parsers::Http1ParserFactory;
-    use pipeline::{CapturePipeline, PipelineRuntimeMetrics};
+    use pipeline::{CapturePipeline, ExportEventWriter, PipelineRuntimeMetrics};
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicyManifest,
         EnforcementPolicySourceConfig, ExporterConfig, LiveCaptureBackend,
@@ -464,6 +484,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_tail_events_filters_export_events_without_advancing_sink_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-tail-events")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        ExportEventWriter::new(spool.as_ref()).append_occurrence(&request_event(80))?;
+        ExportEventWriter::new(spool.as_ref()).append_occurrence(&request_event(8080))?;
+        let plan = Arc::new(runtime_plan(spool_path)?);
+        let server = spawn_admin_server(
+            Arc::clone(&plan),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState::default(),
+        )?;
+
+        let response = crate::admin::send_admin_json_request(
+            &socket_path,
+            crate::admin::AdminRequest::TailEvents {
+                after_sequence: 0,
+                limit: 10,
+                selector: Some(Selector::term(
+                    ProcessSelector::default(),
+                    TrafficSelector {
+                        remote_ports: vec![8080],
+                        directions: vec![Direction::Outbound],
+                        ..TrafficSelector::default()
+                    },
+                )),
+            },
+        )
+        .await?;
+
+        assert_eq!(response["kind"], json!("event_tail"));
+        assert_eq!(response["tail"]["scanned"], json!(2));
+        assert_eq!(response["tail"]["next_after_sequence"], json!(2));
+        let events = response["tail"]["events"]
+            .as_array()
+            .ok_or_else(|| std::io::Error::other("tail events should be an array"))?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            response["tail"]["events"][0]["event"]["kind"]["target"],
+            json!("/")
+        );
+        assert_eq!(
+            response["tail"]["events"][0]["event"]["subject"]["flow"]["remote"]["port"],
+            json!(8080)
+        );
+        assert_eq!(spool.export_cursor("primary")?, 0);
+
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn admin_debug_dump_returns_status_protocol_and_privacy_contract()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("admin-debug-dump")?;
@@ -501,6 +578,7 @@ mod tests {
                 { "name": "metrics", "mutating": false },
                 { "name": "prometheus_metrics", "mutating": false },
                 { "name": "debug_dump", "mutating": false },
+                { "name": "tail_events", "mutating": false },
                 { "name": "plan_config_reload", "mutating": false },
                 { "name": "reload_runtime_actions", "mutating": true },
                 { "name": "reload_policies", "mutating": true },

@@ -7,6 +7,7 @@ pub(crate) enum HitTarget {
     Tab(TuiTab),
     Field(FieldId),
     Process(usize),
+    TrafficRow(usize),
     Save,
     Reload,
     Quit,

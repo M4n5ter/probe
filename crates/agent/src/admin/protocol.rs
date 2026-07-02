@@ -46,6 +46,11 @@ admin_requests! {
     Metrics => ("metrics", false),
     PrometheusMetrics => ("prometheus_metrics", false),
     DebugDump => ("debug_dump", false),
+    TailEvents {
+        after_sequence: u64,
+        limit: usize,
+        selector: Option<probe_core::Selector>,
+    } => ("tail_events", false),
     PlanConfigReload { path: PathBuf } => ("plan_config_reload", false),
     ReloadRuntimeActions => ("reload_runtime_actions", true),
     ReloadPolicies => ("reload_policies", true),
@@ -67,6 +72,9 @@ pub(super) enum AdminResponse {
     },
     DebugDump {
         dump: Box<AdminDebugDump>,
+    },
+    EventTail {
+        tail: Box<super::event_tail::EventTailSnapshot>,
     },
     ConfigReloadPlan {
         plan: Box<ConfigReloadPlanSnapshot>,

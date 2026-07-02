@@ -5,10 +5,12 @@ use probe_config::AgentConfig;
 use super::fields::{FieldApplyOutcome, FieldId, apply_field, field_value, fields_for_tab};
 use super::hit::HitTarget;
 use super::processes::ProcessCatalog;
+use super::traffic::TrafficState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TuiTab {
     Overview,
+    Traffic,
     Capture,
     Processes,
     Export,
@@ -17,8 +19,9 @@ pub(crate) enum TuiTab {
 }
 
 impl TuiTab {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Overview,
+        Self::Traffic,
         Self::Capture,
         Self::Processes,
         Self::Export,
@@ -29,6 +32,7 @@ impl TuiTab {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Overview => "Overview",
+            Self::Traffic => "Traffic",
             Self::Capture => "Capture",
             Self::Processes => "Processes",
             Self::Export => "Export",
@@ -125,6 +129,7 @@ pub(crate) struct TuiApp {
     selected_field_index: usize,
     selected_process_index: usize,
     process_scroll: usize,
+    traffic: TrafficState,
     dirty: bool,
     should_quit: bool,
     status: StatusMessage,
@@ -145,6 +150,7 @@ impl TuiApp {
             selected_field_index: 0,
             selected_process_index: 0,
             process_scroll: 0,
+            traffic: TrafficState::default(),
             dirty: false,
             should_quit: false,
             status,
@@ -180,6 +186,10 @@ impl TuiApp {
 
     pub(crate) fn processes(&self) -> &ProcessCatalog {
         &self.processes
+    }
+
+    pub(crate) fn traffic(&self) -> &TrafficState {
+        &self.traffic
     }
 
     pub(crate) fn status(&self) -> &StatusMessage {
@@ -232,6 +242,7 @@ impl TuiApp {
     pub(crate) fn replace_config(&mut self, config: AgentConfig, processes: ProcessCatalog) {
         self.config = config;
         self.processes = processes;
+        self.traffic = TrafficState::default();
         self.dirty = false;
         self.status = StatusMessage::info("Reloaded config and process list");
         self.clamp_selection();
@@ -260,6 +271,7 @@ impl TuiApp {
                 self.adjust_selected(1);
             }
             HitTarget::Process(index) => self.select_process(index),
+            HitTarget::TrafficRow(index) => self.select_traffic_row(index),
             HitTarget::Save => {
                 return ActionOutcome {
                     save_requested: true,
@@ -306,6 +318,10 @@ impl TuiApp {
             self.move_process(delta);
             return;
         }
+        if self.active_tab == TuiTab::Traffic {
+            self.move_traffic(delta);
+            return;
+        }
         let fields = self.fields_for_active_tab();
         if fields.is_empty() {
             return;
@@ -320,6 +336,49 @@ impl TuiApp {
         }
         self.selected_process_index = offset_index(self.selected_process_index, len, delta);
         self.keep_process_visible(1);
+    }
+
+    pub(crate) async fn refresh_traffic(&mut self) {
+        if !self.config.admin.enabled {
+            self.traffic.mark_admin_disabled();
+            self.status = StatusMessage::warning("Enable admin to view live traffic in the TUI");
+            return;
+        }
+        let selector = match self.selected_process_selector() {
+            Some(selector) => selector,
+            None if self.processes.entries().is_empty() => {
+                let message = "No readable process is selected; traffic filter was not changed";
+                self.traffic.mark_filter_unavailable(message);
+                self.status = StatusMessage::warning(message);
+                return;
+            }
+            None => {
+                let message = "Selected process has no readable executable path; traffic filter was not changed";
+                self.traffic.mark_filter_unavailable(message);
+                self.status = StatusMessage::warning(message);
+                return;
+            }
+        };
+        self.traffic
+            .refresh(&self.config.admin.socket_path, selector)
+            .await;
+        match self.traffic.status().kind {
+            super::traffic::TrafficStatusKind::Error => {
+                self.status = StatusMessage::warning(self.traffic.status().text.clone());
+            }
+            super::traffic::TrafficStatusKind::Idle | super::traffic::TrafficStatusKind::Active => {
+                self.status = StatusMessage::info(self.traffic.status().text.clone());
+            }
+        }
+    }
+
+    fn move_traffic(&mut self, delta: isize) {
+        self.traffic.move_selection(delta, 1);
+    }
+
+    fn select_traffic_row(&mut self, index: usize) {
+        self.active_tab = TuiTab::Traffic;
+        self.traffic.select_row(index, 1);
     }
 
     fn adjust_selected(&mut self, direction: isize) {
@@ -480,6 +539,28 @@ mod tests {
         assert!(app.config.capture.deep_observe_selector.is_none());
         assert_eq!(app.status().kind, StatusKind::Warning);
         assert!(!app.dirty());
+    }
+
+    #[tokio::test]
+    async fn traffic_view_fails_closed_when_no_process_selector_is_available() {
+        let mut config = AgentConfig::default();
+        config.admin.enabled = true;
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            config,
+            ProcessCatalog::default(),
+        );
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
+
+        app.refresh_traffic().await;
+
+        assert!(app.traffic().rows().is_empty());
+        assert_eq!(app.status().kind, StatusKind::Warning);
+        assert!(
+            app.status()
+                .text
+                .contains("No readable process is selected")
+        );
     }
 
     #[test]

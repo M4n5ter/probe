@@ -1,7 +1,7 @@
 use std::{
     io::{self, Stdout},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -15,19 +15,21 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use super::{
-    app::{TuiAction, TuiApp},
+    app::{TuiAction, TuiApp, TuiTab},
     config_edit::{TuiError, load_config, save_config},
     hit::HitMap,
     processes::ProcessCatalog,
     render::draw,
 };
 
+const TRAFFIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TuiOptions {
     pub(crate) config: PathBuf,
 }
 
-pub(crate) fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
+pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
     let mut loaded = load_config(&options.config)?;
     let mut app = TuiApp::new(
         options.config.clone(),
@@ -35,8 +37,17 @@ pub(crate) fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
         ProcessCatalog::from_proc(),
     );
     let mut terminal = TerminalSession::enter()?;
+    let mut last_traffic_refresh = Instant::now()
+        .checked_sub(TRAFFIC_REFRESH_INTERVAL)
+        .unwrap_or_else(Instant::now);
 
     loop {
+        if app.active_tab() == TuiTab::Traffic
+            && last_traffic_refresh.elapsed() >= TRAFFIC_REFRESH_INTERVAL
+        {
+            app.refresh_traffic().await;
+            last_traffic_refresh = Instant::now();
+        }
         let hit_map = terminal.draw(&app)?;
         if app.should_quit() {
             break;

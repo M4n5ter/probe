@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
+use probe_core::{ProcessSelector, Selector, SelectorTerm, TrafficSelector};
 use serde_json::Value;
 
 use crate::{
@@ -14,6 +15,14 @@ pub(super) enum AdminCliCommand {
     Metrics,
     PrometheusMetrics,
     DebugDump,
+    TailEvents {
+        #[arg(long, default_value_t = 0)]
+        after_sequence: u64,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        process_exe_glob: Option<String>,
+    },
     PlanConfigReload {
         #[arg(long)]
         config: PathBuf,
@@ -56,12 +65,33 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
         AdminCliCommand::Metrics => AdminRequest::Metrics,
         AdminCliCommand::PrometheusMetrics => AdminRequest::PrometheusMetrics,
         AdminCliCommand::DebugDump => AdminRequest::DebugDump,
+        AdminCliCommand::TailEvents {
+            after_sequence,
+            limit,
+            process_exe_glob,
+        } => AdminRequest::TailEvents {
+            after_sequence,
+            limit,
+            selector: process_exe_glob.map(process_exe_selector),
+        },
         AdminCliCommand::PlanConfigReload { config } => {
             AdminRequest::PlanConfigReload { path: config }
         }
         AdminCliCommand::ReloadRuntimeActions => AdminRequest::ReloadRuntimeActions,
         AdminCliCommand::ReloadPolicies => AdminRequest::ReloadPolicies,
         AdminCliCommand::ReloadEnforcementPolicy => AdminRequest::ReloadEnforcementPolicy,
+    }
+}
+
+fn process_exe_selector(exe_path_glob: String) -> Selector {
+    Selector::Match {
+        term: Box::new(SelectorTerm {
+            process: ProcessSelector {
+                exe_path_globs: vec![exe_path_glob],
+                ..ProcessSelector::default()
+            },
+            traffic: TrafficSelector::default(),
+        }),
     }
 }
 
@@ -112,6 +142,18 @@ mod tests {
         assert_eq!(
             admin_request(AdminCliCommand::DebugDump),
             AdminRequest::DebugDump
+        );
+        assert_eq!(
+            admin_request(AdminCliCommand::TailEvents {
+                after_sequence: 7,
+                limit: 10,
+                process_exe_glob: Some("/usr/bin/curl".to_string()),
+            }),
+            AdminRequest::TailEvents {
+                after_sequence: 7,
+                limit: 10,
+                selector: Some(process_exe_selector("/usr/bin/curl".to_string())),
+            }
         );
         assert_eq!(
             admin_request(AdminCliCommand::PlanConfigReload {

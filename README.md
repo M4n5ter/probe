@@ -240,6 +240,13 @@ enforcement, interception, and TLS plaintext. Policy Lua source, large MITM
 backend contracts, TLS material files, and collector-specific payload formats
 should still be edited in the config and policy files.
 
+When the configured admin socket is enabled and the live agent is running, the
+Traffic tab tails parsed export events from the online admin surface. It uses
+the selected process executable-path selector when available; if the selected
+process has no readable executable path, traffic filtering fails closed instead
+of showing unrelated host traffic. The TUI keeps only display summaries for the
+event table and does not retain raw process argv.
+
 ### Minimal Policy And Webhook Wiring
 
 Use this section when wiring the first real integration. A deployable setup
@@ -1005,9 +1012,19 @@ cargo run -p agent -- admin \
 
 cargo run -p agent -- admin \
   --socket /run/traffic-probe/admin.sock \
+  tail-events --after-sequence 0 --limit 50 \
+  --process-exe-glob /usr/bin/curl
+
+cargo run -p agent -- admin \
+  --socket /run/traffic-probe/admin.sock \
   debug-dump
 ```
 
+`tail-events` is a bounded, non-mutating view over the durable export queue. It
+returns complete event envelopes for automation and advances only the response
+cursor (`next_after_sequence`); it does not acknowledge exporter sink cursors.
+Large records are omitted with explicit omission metadata rather than expanded
+without a byte budget.
 `debug-dump` reuses the online status snapshot and adds admin protocol metadata.
 It includes runtime plan/status fields and local paths, but not raw config text
 or secret material bytes.

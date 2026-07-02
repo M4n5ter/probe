@@ -66,6 +66,14 @@ impl FjallSpool {
         self.read_batch_from_lane(SpoolLane::Export, sink, limit)
     }
 
+    pub fn read_export_batch_after(
+        &self,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StorageError> {
+        self.read_batch_from_lane_after(SpoolLane::Export, sequence, limit)
+    }
+
     pub fn ack_export(&self, sink: &str, sequence: u64) -> Result<(), StorageError> {
         self.ack_lane(SpoolLane::Export, sink, sequence)
     }
@@ -506,6 +514,31 @@ mod tests {
             vec![2, 3]
         );
         assert_eq!(spool.ingress_cursor(TEST_INGRESS_CURSOR_OWNER)?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn read_export_batch_after_scans_without_advancing_sink_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        spool.append_export(test_payload(b"one"))?;
+        spool.append_export(test_payload(b"two"))?;
+        spool.ack_export("tail", 1)?;
+
+        let replay = spool.read_export_batch_after(0, 10)?;
+        let suffix = spool.read_export_batch_after(1, 10)?;
+
+        assert_eq!(
+            replay
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].payload.bytes(), b"two");
+        assert_eq!(spool.export_cursor("tail")?, 1);
         Ok(())
     }
 

@@ -69,7 +69,7 @@ pub(crate) enum FieldApplyOutcome {
 
 pub(crate) fn fields_for_tab(tab: TuiTab, config: &AgentConfig) -> Vec<FieldId> {
     match tab {
-        TuiTab::Overview | TuiTab::Processes => Vec::new(),
+        TuiTab::Overview | TuiTab::Traffic | TuiTab::Processes => Vec::new(),
         TuiTab::Capture => vec![
             FieldId::CaptureSelection,
             FieldId::CaptureDeepObserveProcess,

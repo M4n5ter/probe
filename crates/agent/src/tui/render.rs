@@ -9,9 +9,11 @@ use ratatui::{
 use super::{
     app::{StatusKind, TuiApp, TuiTab},
     hit::{HitArea, HitMap, HitTarget},
+    traffic::TrafficStatusKind,
 };
 
 const PROCESS_VISIBLE_DETAIL_WIDTH: usize = 96;
+const TRAFFIC_SUMMARY_WIDTH: usize = 96;
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &TuiApp) -> HitMap {
     let area = frame.area();
@@ -29,6 +31,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &TuiApp) -> HitMap {
     render_tabs(frame, tabs, app, &mut hits);
     match app.active_tab() {
         TuiTab::Overview => render_overview(frame, body, app),
+        TuiTab::Traffic => render_traffic(frame, body, app, &mut hits),
         TuiTab::Processes => render_processes(frame, body, app, &mut hits),
         _ => render_fields(frame, body, app, &mut hits),
     }
@@ -280,6 +283,95 @@ fn render_processes(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut 
     );
 }
 
+fn render_traffic(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec<HitArea>) {
+    let [status_area, table_area] =
+        Layout::vertical([Constraint::Length(2), Constraint::Min(4)]).areas(area);
+    let traffic = app.traffic();
+    let visible_rows = table_area.height.saturating_sub(3) as usize;
+    let start = traffic
+        .scroll()
+        .min(traffic.rows().len().saturating_sub(visible_rows));
+    let end = start.saturating_add(visible_rows).min(traffic.rows().len());
+    let rows = traffic.rows()[start..end]
+        .iter()
+        .enumerate()
+        .map(|(visible_index, event)| {
+            let absolute_index = start + visible_index;
+            let marker = if absolute_index == traffic.selected_index() {
+                ">"
+            } else {
+                " "
+            };
+            let row = Row::new([
+                Cell::from(marker),
+                Cell::from(event.sequence.to_string()),
+                Cell::from(event.process.clone()),
+                Cell::from(event.event_type.clone()),
+                Cell::from(event.direction.clone()),
+                Cell::from(event.endpoint.clone()),
+                Cell::from(truncate(&event.summary, TRAFFIC_SUMMARY_WIDTH)),
+            ]);
+            if absolute_index == traffic.selected_index() {
+                row.style(Style::default().fg(Color::Black).bg(Color::LightBlue))
+            } else {
+                row
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let row_start = table_area.y + 3;
+    for visible_index in 0..end.saturating_sub(start) {
+        hits.push(HitArea::new(
+            Rect::new(
+                area.x + 1,
+                row_start + visible_index as u16,
+                area.width.saturating_sub(2),
+                1,
+            ),
+            HitTarget::TrafficRow(start + visible_index),
+        ));
+    }
+
+    let title = format!(
+        "Traffic  tail={} last_export={}",
+        traffic.rows().len(),
+        traffic.last_export_sequence()
+    );
+    let status = Line::from(vec![
+        Span::styled(
+            traffic.status().text.clone(),
+            Style::default().fg(traffic_status_color(traffic.status().kind)),
+        ),
+        Span::raw("   "),
+        Span::styled("filter", Style::default().fg(Color::Gray)),
+        Span::raw(": selected process executable path when readable"),
+    ]);
+    frame.render_widget(Paragraph::new(status), status_area);
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(2),
+                Constraint::Length(8),
+                Constraint::Length(22),
+                Constraint::Length(24),
+                Constraint::Length(5),
+                Constraint::Length(24),
+                Constraint::Min(20),
+            ],
+        )
+        .header(
+            Row::new(["", "Seq", "Process", "Event", "Dir", "Remote", "Summary"]).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .block(Block::bordered().title(title)),
+        table_area,
+    );
+}
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let status_style = Style::default().fg(status_color(app.status().kind));
     let text = Line::from(vec![
@@ -316,6 +408,14 @@ fn render_button(
         ),
         area,
     );
+}
+
+fn traffic_status_color(kind: TrafficStatusKind) -> Color {
+    match kind {
+        TrafficStatusKind::Idle => Color::Gray,
+        TrafficStatusKind::Active => Color::Green,
+        TrafficStatusKind::Error => Color::Yellow,
+    }
 }
 
 fn status_color(kind: StatusKind) -> Color {
@@ -380,7 +480,7 @@ mod tests {
             hit_map = draw(frame, &app);
         })?;
 
-        assert_eq!(hit_map.hit(13, 4), Some(HitTarget::Tab(TuiTab::Capture)));
+        assert_eq!(hit_map.hit(23, 4), Some(HitTarget::Tab(TuiTab::Capture)));
         assert_eq!(hit_map.hit(2, 9), Some(HitTarget::Process(0)));
         Ok(())
     }

@@ -22,7 +22,7 @@ pub(crate) async fn send_admin_json_request(
     send_admin_json_request_with_timeout(socket_path, request, ADMIN_CLIENT_TIMEOUT).await
 }
 
-async fn send_admin_json_request_with_timeout(
+pub(crate) async fn send_admin_json_request_with_timeout(
     socket_path: &Path,
     request: AdminRequest,
     timeout: Duration,

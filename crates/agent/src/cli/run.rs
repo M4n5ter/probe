@@ -185,7 +185,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
         Command::Tui { config } => {
-            run_tui(TuiOptions { config })?;
+            run_tui(TuiOptions { config }).await?;
         }
         Command::Admin { socket, command } => {
             run_admin_command(&socket, command).await?;
