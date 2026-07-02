@@ -7,7 +7,7 @@ use std::{
 use probe_config::{
     AgentConfig, EnforcementPolicyConfig, EnforcementPolicyReloadConfig,
     EnforcementPolicySourceConfig, ExporterConfig, ExporterTlsConfig, ExporterTransportConfig,
-    TlsMaterialConfig, TransparentInterceptionProxyConfig,
+    LiveCaptureBackend, TlsMaterialConfig, TransparentInterceptionProxyConfig,
 };
 use probe_core::{Direction, Selector, SelectorTerm};
 use serde::Serialize;
@@ -18,6 +18,7 @@ use super::{
     wire::{
         capture_selection_name, compression_codec_name, connection_backend_name,
         enforcement_mode_name, exporter_transport_name, interception_strategy_name,
+        live_capture_backend_name,
     },
 };
 
@@ -42,6 +43,14 @@ pub(super) fn render_preserving_config(
         &["capture"],
         "selection",
         value(capture_selection_name(config.capture.selection)),
+    );
+    set_value(
+        &mut document,
+        &["capture"],
+        "fallback_backends",
+        value(array_live_capture_backends(
+            &config.capture.fallback_backends,
+        )),
     );
     set_optional_selector(
         &mut document,
@@ -559,6 +568,14 @@ fn array_directions(values: &[Direction]) -> Array {
             Direction::Inbound => "inbound",
             Direction::Outbound => "outbound",
         });
+    }
+    array
+}
+
+fn array_live_capture_backends(values: &[LiveCaptureBackend]) -> Array {
+    let mut array = Array::new();
+    for value in values {
+        array.push(live_capture_backend_name(*value));
     }
     array
 }

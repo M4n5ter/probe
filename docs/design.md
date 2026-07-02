@@ -315,7 +315,8 @@ Operator TUI 能力事实：
   与鼠标点击进入同一 typed action path。`Watch` 仅改变 traffic selector；MITM quick actions 会为选中进程写入 scoped
   product-proxy MITM、client trust、plaintext bridge 和 policy hook contract。出站 quick action 默认约束
   `remote_ports = [80, 443]`，让普通明文 HTTP 和 TLS 解密后 HTTP 进入同一条 plaintext bridge；保存后由
-  TUI-managed agent restart 应用。
+  TUI-managed agent restart 应用。MITM quick actions 同时保证 `capture.selection = "auto"` 的 live fallback
+  backend 列表有效：空列表会恢复为 `ebpf, libpcap`，重复项会去重并保留用户顺序。
   当没有 active admin socket 时，Traffic tab fail-closed 并显示 agent runtime 不可用状态。
 - `tail_events` 是 non-mutating admin command。它读取 `after_sequence` 之后的 export records，按可选 selector
   过滤，并返回 `next_after_sequence`；该响应 cursor 不会 ack 任何 exporter sink cursor。

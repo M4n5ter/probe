@@ -1,6 +1,6 @@
 use probe_config::{
     CaptureSelection, CompressionCodecName, ConnectionEnforcementBackendConfig,
-    ExporterTransportConfig, TransparentInterceptionStrategyConfig,
+    ExporterTransportConfig, LiveCaptureBackend, TransparentInterceptionStrategyConfig,
 };
 use probe_core::EnforcementMode;
 
@@ -12,6 +12,13 @@ pub(crate) fn capture_selection_name(value: CaptureSelection) -> &'static str {
         CaptureSelection::PlaintextFeed => "plaintext_feed",
         CaptureSelection::CaptureEventFeed => "capture_event_feed",
         CaptureSelection::Replay => "replay",
+    }
+}
+
+pub(crate) fn live_capture_backend_name(value: LiveCaptureBackend) -> &'static str {
+    match value {
+        LiveCaptureBackend::Ebpf => "ebpf",
+        LiveCaptureBackend::Libpcap => "libpcap",
     }
 }
 

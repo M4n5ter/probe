@@ -393,7 +393,7 @@ mod tests {
 
     use probe_config::{
         AgentConfig, CaptureSelection, CompressionCodecName, ExporterConfig,
-        ExporterTransportConfig, TransparentInterceptionStrategyConfig,
+        ExporterTransportConfig, LiveCaptureBackend, TransparentInterceptionStrategyConfig,
     };
     use probe_core::{EnforcementMode, ProcessSelector, Selector, TrafficSelector};
     use tempfile::TempDir;
@@ -901,6 +901,70 @@ exporters = [{ id = "default", transport = "file", path = "/tmp/events.jsonl", c
     }
 
     #[test]
+    fn mitm_quick_setup_persists_repaired_empty_capture_fallbacks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("agent.toml");
+        let source =
+            mitm_quick_setup_source_with_capture_fallbacks("libpcap", "fallback_backends = []");
+        fs::write(&path, &source)?;
+        let mut config = AgentConfig::from_toml_str(&source)?;
+        let profile = LocalProbeProfile::with_root(temp.path());
+
+        apply_mitm_quick_setup_with_profile(
+            &mut config,
+            MitmQuickSetupDirection::Inbound,
+            Some(exe_selector("/usr/bin/curl")),
+            &profile.mitm,
+        );
+
+        let rendered = save_config_with_local_profile(&path, &source, &config, &profile)?;
+        let reloaded = AgentConfig::from_toml_str(&rendered)?;
+
+        assert!(rendered.contains("selection = \"auto\""));
+        assert!(rendered.contains("fallback_backends = [\"ebpf\", \"libpcap\"]"));
+        assert_eq!(
+            reloaded.capture.fallback_backends,
+            vec![LiveCaptureBackend::Ebpf, LiveCaptureBackend::Libpcap]
+        );
+        assert_eq!(reloaded, config);
+        Ok(())
+    }
+
+    #[test]
+    fn mitm_quick_setup_persists_deduplicated_capture_fallbacks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("agent.toml");
+        let source = mitm_quick_setup_source_with_capture_fallbacks(
+            "libpcap",
+            "fallback_backends = [\"libpcap\", \"libpcap\", \"ebpf\"]",
+        );
+        fs::write(&path, &source)?;
+        let mut config = AgentConfig::from_toml_str(&source)?;
+        let profile = LocalProbeProfile::with_root(temp.path());
+
+        apply_mitm_quick_setup_with_profile(
+            &mut config,
+            MitmQuickSetupDirection::Inbound,
+            Some(exe_selector("/usr/bin/curl")),
+            &profile.mitm,
+        );
+
+        let rendered = save_config_with_local_profile(&path, &source, &config, &profile)?;
+        let reloaded = AgentConfig::from_toml_str(&rendered)?;
+
+        assert!(rendered.contains("selection = \"auto\""));
+        assert!(rendered.contains("fallback_backends = [\"libpcap\", \"ebpf\"]"));
+        assert_eq!(
+            reloaded.capture.fallback_backends,
+            vec![LiveCaptureBackend::Libpcap, LiveCaptureBackend::Ebpf]
+        );
+        assert_eq!(reloaded, config);
+        Ok(())
+    }
+
+    #[test]
     fn exporter_target_text_fields_persist_through_save_and_reload()
     -> Result<(), Box<dyn std::error::Error>> {
         let cases = [
@@ -1083,6 +1147,28 @@ transport = "file"
 path = "/tmp/events.jsonl"
 codec = "zstd"
 "#
+    }
+
+    fn mitm_quick_setup_source_with_capture_fallbacks(
+        selection: &str,
+        fallback_line: &str,
+    ) -> String {
+        format!(
+            r#"
+agent_id = "probe"
+config_version = "local"
+
+[capture]
+selection = "{selection}"
+{fallback_line}
+
+[[exporters]]
+id = "default"
+transport = "file"
+path = "/tmp/events.jsonl"
+codec = "zstd"
+"#
+        )
     }
 
     fn exe_selector(path: &str) -> Selector {

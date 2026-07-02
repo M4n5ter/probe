@@ -6,7 +6,7 @@ use interception::{
 };
 use probe_config::{
     AgentConfig, CaptureSelection, ConnectionEnforcementBackendConfig,
-    EnforcementPolicySourceConfig, TlsMaterialConfig, TlsMaterialKind,
+    EnforcementPolicySourceConfig, LiveCaptureBackend, TlsMaterialConfig, TlsMaterialKind,
     TransparentInterceptionMitmBackendConfig,
     TransparentInterceptionMitmBackendReadinessProbeConfig,
     TransparentInterceptionMitmClientTrustModeConfig,
@@ -84,7 +84,7 @@ pub(crate) fn apply_mitm_quick_setup_with_profile(
         );
     }
 
-    config.capture.selection = CaptureSelection::Auto;
+    configure_mitm_capture_selection(config);
     config.enforcement.mode = EnforcementMode::Enforce;
     config.enforcement.backend = ConnectionEnforcementBackendConfig::None;
     config.enforcement.selector = Some(selector.clone());
@@ -103,6 +103,20 @@ pub(crate) fn apply_mitm_quick_setup_with_profile(
         direction,
         warnings,
     }
+}
+
+fn configure_mitm_capture_selection(config: &mut AgentConfig) {
+    config.capture.selection = CaptureSelection::Auto;
+    let mut normalized = Vec::new();
+    for backend in config.capture.fallback_backends.iter().copied() {
+        if !normalized.contains(&backend) {
+            normalized.push(backend);
+        }
+    }
+    if normalized.is_empty() {
+        normalized = vec![LiveCaptureBackend::Ebpf, LiveCaptureBackend::Libpcap];
+    }
+    config.capture.fallback_backends = normalized;
 }
 
 fn outbound_process_selector_projection_blocker(selector: &Selector) -> Option<String> {
@@ -338,6 +352,10 @@ mod tests {
             }
         );
         assert_eq!(config.capture.selection, CaptureSelection::Auto);
+        assert_eq!(
+            config.capture.fallback_backends,
+            vec![LiveCaptureBackend::Ebpf, LiveCaptureBackend::Libpcap]
+        );
         assert_eq!(config.enforcement.mode, EnforcementMode::Enforce);
         assert!(matches!(
             config.enforcement.policy.source,
@@ -378,6 +396,65 @@ mod tests {
                 .contains(&profile.tls_root)
         );
         assert_product_mitm_defaults(&config, &profile);
+    }
+
+    #[test]
+    fn mitm_quick_setup_repairs_invalid_auto_capture_fallbacks() {
+        let temp = TempDir::new().expect("temp dir");
+        let profile = LocalMitmProfile::with_root(temp.path());
+        let mut config = AgentConfig::default();
+        config.capture.fallback_backends.clear();
+
+        let outcome = apply_mitm_quick_setup_with_profile(
+            &mut config,
+            MitmQuickSetupDirection::Inbound,
+            Some(Selector::default()),
+            &profile,
+        );
+
+        assert!(matches!(
+            outcome,
+            MitmQuickSetupOutcome::Changed {
+                direction: MitmQuickSetupDirection::Inbound,
+                ..
+            }
+        ));
+        assert_eq!(config.capture.selection, CaptureSelection::Auto);
+        assert_eq!(
+            config.capture.fallback_backends,
+            vec![LiveCaptureBackend::Ebpf, LiveCaptureBackend::Libpcap]
+        );
+    }
+
+    #[test]
+    fn mitm_quick_setup_deduplicates_capture_fallbacks_without_reordering() {
+        let temp = TempDir::new().expect("temp dir");
+        let profile = LocalMitmProfile::with_root(temp.path());
+        let mut config = AgentConfig::default();
+        config.capture.fallback_backends = vec![
+            LiveCaptureBackend::Libpcap,
+            LiveCaptureBackend::Libpcap,
+            LiveCaptureBackend::Ebpf,
+        ];
+
+        let outcome = apply_mitm_quick_setup_with_profile(
+            &mut config,
+            MitmQuickSetupDirection::Inbound,
+            Some(Selector::default()),
+            &profile,
+        );
+
+        assert!(matches!(
+            outcome,
+            MitmQuickSetupOutcome::Changed {
+                direction: MitmQuickSetupDirection::Inbound,
+                ..
+            }
+        ));
+        assert_eq!(
+            config.capture.fallback_backends,
+            vec![LiveCaptureBackend::Libpcap, LiveCaptureBackend::Ebpf]
+        );
     }
 
     #[test]
