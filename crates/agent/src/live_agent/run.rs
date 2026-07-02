@@ -14,6 +14,7 @@ use crate::{
         AdminRuntimeState, AdminServerConfig, AdminServerHandle, PrometheusListenerConfig,
         spawn_admin_server,
     },
+    artifacts::hydrate_tls_uprobe_object_path,
     capture_provider::{
         CaptureProviderPreflight, CaptureProviderRuntimeState, build_capture_provider,
     },
@@ -68,13 +69,14 @@ pub(crate) enum ReadinessSignal {
 }
 
 pub(crate) async fn run_live_agent(
-    agent_config: AgentConfig,
+    mut agent_config: AgentConfig,
     options: RunOptions,
 ) -> Result<(), AgentError> {
     let RunOptions {
         max_events,
         readiness,
     } = options;
+    require_runtime_artifacts(&mut agent_config)?;
     validate_static_runtime_config(&agent_config)?;
     let runtime = build_runtime_composition(agent_config)?;
     let (plan, enforcement_backend, l7_mitm, transparent_interception) = runtime.into_run_parts();
@@ -259,6 +261,11 @@ pub(crate) async fn run_live_agent(
         summary.pipeline.ingress_records_recovered,
         summary.durable_export_events_written
     );
+    Ok(())
+}
+
+fn require_runtime_artifacts(config: &mut AgentConfig) -> Result<(), AgentError> {
+    let _ = hydrate_tls_uprobe_object_path(config)?;
     Ok(())
 }
 

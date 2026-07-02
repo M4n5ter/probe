@@ -549,6 +549,17 @@ fn render_preserving_config(
         "enabled",
         value(config.tls.plaintext.instrumentation.enabled),
     );
+    set_optional_path(
+        &mut document,
+        &["tls", "plaintext", "instrumentation"],
+        "libssl_uprobe_object_path",
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path
+            .as_deref(),
+    );
     set_optional_selector(
         &mut document,
         &["tls", "plaintext", "instrumentation"],
@@ -738,6 +749,23 @@ fn set_optional_u64(
         }
     }
     Ok(())
+}
+
+fn set_optional_path(
+    document: &mut DocumentMut,
+    table_path: &[&str],
+    key: &str,
+    path: Option<&Path>,
+) {
+    let table = table_at_path(document, table_path);
+    match path {
+        Some(path) if !path.as_os_str().is_empty() => {
+            set_table_item(table, key, value(path.display().to_string()));
+        }
+        _ => {
+            table.remove(key);
+        }
+    }
 }
 
 fn selector_item(selector: &Selector) -> Result<Item, TuiError> {
@@ -1463,6 +1491,37 @@ exporters = [{ id = "default", transport = "file", path = "/tmp/events.jsonl", c
     }
 
     #[test]
+    fn save_tls_enable_keeps_embedded_object_out_of_durable_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("agent.toml");
+        let source = field_persistence_base_source();
+        fs::write(&path, source)?;
+        let mut config = AgentConfig::from_toml_str(source)?;
+
+        let outcome = apply_field(&mut config, FieldId::TlsPlaintextEnabled, 1, None);
+
+        assert_eq!(
+            outcome,
+            FieldApplyOutcome::Changed("TLS plaintext hooks toggled")
+        );
+        let rendered = save_config(&path, source, &config)?;
+        assert!(rendered.contains("enabled = true"));
+        assert!(!rendered.contains("libssl_uprobe_object_path"));
+        let reloaded = AgentConfig::from_toml_str(&rendered)?;
+        assert!(reloaded.tls.plaintext.instrumentation.enabled);
+        assert!(
+            reloaded
+                .tls
+                .plaintext
+                .instrumentation
+                .libssl_uprobe_object_path
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn exporter_target_text_fields_persist_through_save_and_reload()
     -> Result<(), Box<dyn std::error::Error>> {
         let cases = [
@@ -1635,6 +1694,9 @@ socket_path = "/tmp/tui-admin.sock"
             FieldId::ExporterFilePath(_) => "/tmp/tui-events.jsonl".to_string(),
             FieldId::ExporterUnixSocketPath(_) => "/tmp/tui-export.sock".to_string(),
             FieldId::ExporterUnixHttpEndpoint(_) => "/events".to_string(),
+            FieldId::TlsPlaintextObjectPath => {
+                "/var/lib/traffic-probe/artifacts/ebpf/custom-tls-plaintext.bpf.o".to_string()
+            }
             _ => String::new(),
         }
     }

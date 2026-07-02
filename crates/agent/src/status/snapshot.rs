@@ -1003,7 +1003,8 @@ hooks = ["on_http_request_headers"]
             .tls
             .plaintext
             .instrumentation
-            .libssl_uprobe_object_path = Some("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o".into());
+            .libssl_uprobe_object_path =
+            Some("/var/lib/traffic-probe/artifacts/ebpf/custom-tls-plaintext.bpf.o".into());
         config.tls.plaintext.instrumentation.reconcile_interval_ms = 2_500;
         let plan = runtime_plan_from_config(
             config,
@@ -1075,7 +1076,8 @@ hooks = ["on_http_request_headers"]
             .tls
             .plaintext
             .instrumentation
-            .libssl_uprobe_object_path = Some("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o".into());
+            .libssl_uprobe_object_path =
+            Some("/var/lib/traffic-probe/artifacts/ebpf/custom-tls-plaintext.bpf.o".into());
         let plan = runtime_plan_from_config(
             config,
             vec![CapabilityState::degraded(

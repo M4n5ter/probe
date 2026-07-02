@@ -1,4 +1,5 @@
 mod admin;
+mod artifacts;
 mod capture_event_feed;
 mod capture_provider;
 mod capture_registry;

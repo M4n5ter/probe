@@ -27,6 +27,8 @@ pub(crate) enum AgentError {
     ReplayPolicyFile(#[from] probe_io::BoundedFileError),
     #[error("config error: {0}")]
     Config(#[from] probe_config::ConfigError),
+    #[error("artifact error: {0}")]
+    Artifact(#[from] crate::artifacts::ArtifactError),
     #[error("runtime error: {0}")]
     Runtime(#[from] runtime::RuntimeError),
     #[error("failed to serialize JSON: {0}")]

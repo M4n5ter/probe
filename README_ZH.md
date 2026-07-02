@@ -49,6 +49,13 @@ Debian 或 Ubuntu 主机上，先安装默认 build 需要的原生依赖：
 sudo apt-get install -y libpcap-dev pkg-config
 ```
 
+安装默认 agent build 会用到的 eBPF build toolchain：
+
+```bash
+rustup toolchain install nightly --component rust-src
+cargo install bpf-linker
+```
+
 构建主 binary：
 
 ```bash
@@ -116,7 +123,8 @@ cargo run -p xtask --locked -- e2e-suite --profile baseline
 - 默认 agent build 需要 `libpcap` development headers 和 `pkg-config`；
 - live capture、eBPF、socket destroy、transparent interception 或 MITM 测试需要 root 或对应 Linux capability；
 - 运行 Linux transparent interception 时需要 `nftables` package；
-- 只有构建 eBPF artifact 时才需要带 `rust-src` 的 nightly Rust 和 `bpf-linker`。
+- 需要带 `rust-src` 的 nightly Rust 和 `bpf-linker`；agent build 默认会嵌入
+  first-party TLS uprobe object。
 
 常见 `nft` 安装命令：
 
@@ -151,11 +159,12 @@ cargo install bpf-linker
 cargo run -p xtask --locked -- ebpf-build
 ```
 
-构建后，在 agent 配置中设置生成的 object path：
+构建后，在 agent 配置中设置生成的 process-observation object path：
 
-- process observation：`capture.ebpf.object_path`；
-- libssl plaintext instrumentation：
-  `tls.plaintext.instrumentation.libssl_uprobe_object_path`。
+- process observation：`capture.ebpf.object_path`。
+
+agent build 默认会嵌入 first-party TLS uprobe object。只有使用自定义或外部管理的
+TLS uprobe object 时，才设置 `tls.plaintext.instrumentation.libssl_uprobe_object_path`。
 
 ## 选择运行模式
 
@@ -177,7 +186,7 @@ cargo run -p xtask --locked -- ebpf-build
   optional syscall variant。
 - libssl uprobe：
   针对选定 libssl 进程的 best-effort TLS plaintext sidecar；需要
-  root/bpffs、已构建 eBPF object 和显式 selector。
+  root/bpffs、内嵌或显式配置的 TLS uprobe object，以及显式 selector。
 - Transparent interception：
   对 scoped inbound/outbound traffic 做 steering；需要 root/net-admin 和显式 selector。
 - Product MITM proxy：
@@ -250,6 +259,20 @@ export PROBE_HOME="/var/lib/traffic-probe"
 
 TOML 中显式写出的 path 会按字面值使用，不做环境变量展开。受限环境里没有可用用户 home 时，
 Probe 会退回 `/var/lib/traffic-probe`。
+
+卸载 Probe 应当足够直接：先停止正在运行的 service，再按安装方式删除 binary 或 package，最后删除
+Probe 生成的本地状态树：
+
+```bash
+# 默认用户级状态。
+rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/traffic-probe"
+
+# PROBE_HOME 设为机器级服务状态目录时。
+sudo rm -rf /var/lib/traffic-probe
+```
+
+如果部署使用了自定义 `PROBE_HOME`，删除那个目录即可。外部 config、policy、certificate 和
+systemd unit path 归 operator 所有，应按部署自己的安装布局清理。
 
 ```text
 /etc/probe/agent.toml
@@ -670,12 +693,14 @@ kind = "mitm_upstream_trust_anchor"
 path = "/etc/probe/certs/upstream-ca.pem"
 ```
 
-best-effort libssl plaintext instrumentation 必须显式开启。应配置 selector，避免过宽 attachment：
+best-effort libssl plaintext instrumentation 必须显式开启。agent build 默认嵌入 first-party TLS
+uprobe object。hooks 启用且未配置 override path 时，agent 会把该 object 物化到
+`PROBE_HOME/artifacts/ebpf/` 下，并使用内容寻址生成的路径。应配置 selector，避免过宽
+attachment：
 
 ```toml
 [tls.plaintext.instrumentation]
 enabled = true
-libssl_uprobe_object_path = "/opt/probe/ebpf-tls-plaintext"
 reconcile_interval_ms = 1000
 
 [tls.plaintext.instrumentation.selector]
@@ -695,6 +720,9 @@ remote_ports = [443]
 directions = ["outbound"]
 remote_addresses = []
 ```
+
+`libssl_uprobe_object_path` 是自定义 eBPF artifact 的高级 override。常规安装应让生成资产保留在
+`PROBE_HOME` 下，这样卸载时可以删除一个状态树。
 
 ### Enforcement 与 MITM
 

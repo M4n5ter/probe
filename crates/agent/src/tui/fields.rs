@@ -39,6 +39,7 @@ pub(crate) enum FieldId {
     EnforcementProcessScope,
     InterceptionProcessScope,
     TlsPlaintextEnabled,
+    TlsPlaintextObjectPath,
     TlsPlaintextProcessScope,
 }
 
@@ -66,6 +67,7 @@ impl FieldId {
             Self::EnforcementProcessScope => "Enforce selected process",
             Self::InterceptionProcessScope => "Intercept selected process",
             Self::TlsPlaintextEnabled => "TLS plaintext hooks",
+            Self::TlsPlaintextObjectPath => "TLS uprobe object",
             Self::TlsPlaintextProcessScope => "TLS selected process",
         }
     }
@@ -86,7 +88,8 @@ impl FieldId {
             | Self::ExporterFilePath(_)
             | Self::ExporterUnixSocketPath(_)
             | Self::ExporterUnixHttpEndpoint(_)
-            | Self::AdminSocketPath => "edit text",
+            | Self::AdminSocketPath
+            | Self::TlsPlaintextObjectPath => "edit text",
             Self::AddDefaultExporter => "add exporter",
             Self::CaptureDeepObserveProcess
             | Self::EnforcementProcessScope
@@ -141,6 +144,7 @@ pub(crate) fn fields_for_tab(tab: TuiTab, config: &AgentConfig) -> Vec<FieldId> 
         ],
         TuiTab::Tls => vec![
             FieldId::TlsPlaintextEnabled,
+            FieldId::TlsPlaintextObjectPath,
             FieldId::TlsPlaintextProcessScope,
         ],
     }
@@ -254,6 +258,14 @@ pub(crate) fn field_value(
             selected_process_name,
         ),
         FieldId::TlsPlaintextEnabled => bool_state(config.tls.plaintext.instrumentation.enabled),
+        FieldId::TlsPlaintextObjectPath => tls_uprobe_object_state(
+            config
+                .tls
+                .plaintext
+                .instrumentation
+                .libssl_uprobe_object_path
+                .as_ref(),
+        ),
         FieldId::TlsPlaintextProcessScope => selector_state(
             config.tls.plaintext.instrumentation.selector.is_some(),
             selected_process_name,
@@ -327,7 +339,8 @@ pub(crate) fn apply_field(
         FieldId::ExporterWebhookEndpoint(_)
         | FieldId::ExporterFilePath(_)
         | FieldId::ExporterUnixSocketPath(_)
-        | FieldId::ExporterUnixHttpEndpoint(_) => FieldApplyOutcome::Unchanged,
+        | FieldId::ExporterUnixHttpEndpoint(_)
+        | FieldId::TlsPlaintextObjectPath => FieldApplyOutcome::Unchanged,
         FieldId::IngressRetentionMaxRecords => {
             config.storage.retention.ingress.max_records =
                 cycle_retention_records(config.storage.retention.ingress.max_records, direction);
@@ -364,13 +377,12 @@ pub(crate) fn apply_field(
             })
         }
         FieldId::TlsPlaintextEnabled => {
-            let enabled = &mut config.tls.plaintext.instrumentation.enabled;
-            *enabled = !*enabled;
+            config.tls.plaintext.instrumentation.enabled =
+                !config.tls.plaintext.instrumentation.enabled;
             FieldApplyOutcome::Changed("TLS plaintext hooks toggled")
         }
         FieldId::TlsPlaintextProcessScope => {
             apply_process_selector(selected_process_selector, |selector| {
-                config.tls.plaintext.instrumentation.enabled = true;
                 config.tls.plaintext.instrumentation.selector = Some(selector);
                 "TLS plaintext process selector updated"
             })
@@ -419,6 +431,16 @@ pub(crate) fn editable_text_value(config: &AgentConfig, field: FieldId) -> Optio
                 })
         }
         FieldId::AdminSocketPath => Some(config.admin.socket_path.display().to_string()),
+        FieldId::TlsPlaintextObjectPath => Some(
+            config
+                .tls
+                .plaintext
+                .instrumentation
+                .libssl_uprobe_object_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        ),
         _ => None,
     }
 }
@@ -474,6 +496,18 @@ pub(crate) fn apply_text_field(
         FieldId::AdminSocketPath => {
             config.admin.socket_path = PathBuf::from(value);
             FieldApplyOutcome::Changed("Admin socket path changed")
+        }
+        FieldId::TlsPlaintextObjectPath => {
+            config
+                .tls
+                .plaintext
+                .instrumentation
+                .libssl_uprobe_object_path = if value.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(value))
+            };
+            FieldApplyOutcome::Changed("TLS uprobe object path changed")
         }
         _ => FieldApplyOutcome::Unchanged,
     }
@@ -564,6 +598,15 @@ fn selector_state(has_selector: bool, process: Option<&str>) -> String {
         (true, None) => "configured".to_string(),
         (false, Some(process)) => format!("not configured; selected process: {process}"),
         (false, None) => "not configured".to_string(),
+    }
+}
+
+fn tls_uprobe_object_state(path: Option<&PathBuf>) -> String {
+    match path {
+        Some(path) if !path.as_os_str().is_empty() => {
+            format!("operator override -> {}", path.display())
+        }
+        _ => "embedded default -> PROBE_HOME/artifacts/ebpf".to_string(),
     }
 }
 
@@ -760,4 +803,84 @@ fn disabling_admin_also_disables_prometheus_listener() {
     assert_eq!(outcome, FieldApplyOutcome::Changed("Admin socket toggled"));
     assert!(!config.admin.enabled);
     assert!(!config.admin.prometheus.enabled);
+}
+
+#[cfg(test)]
+#[test]
+fn enabling_tls_plaintext_keeps_default_artifact_as_runtime_detail() {
+    let mut config = AgentConfig::default();
+
+    let outcome = apply_field(&mut config, FieldId::TlsPlaintextEnabled, 1, None);
+
+    assert_eq!(
+        outcome,
+        FieldApplyOutcome::Changed("TLS plaintext hooks toggled")
+    );
+    assert!(config.tls.plaintext.instrumentation.enabled);
+    assert!(
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path
+            .is_none()
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn tls_process_scope_does_not_enable_plaintext_hooks() {
+    let mut config = AgentConfig::default();
+
+    let outcome = apply_field(
+        &mut config,
+        FieldId::TlsPlaintextProcessScope,
+        1,
+        Some(Selector::default()),
+    );
+
+    assert_eq!(
+        outcome,
+        FieldApplyOutcome::Changed("TLS plaintext process selector updated")
+    );
+    assert!(!config.tls.plaintext.instrumentation.enabled);
+    assert!(config.tls.plaintext.instrumentation.selector.is_some());
+}
+
+#[cfg(test)]
+#[test]
+fn tls_uprobe_object_path_text_field_updates_and_clears_path() {
+    let mut config = AgentConfig::default();
+
+    let outcome = apply_text_field(
+        &mut config,
+        FieldId::TlsPlaintextObjectPath,
+        "/var/lib/traffic-probe/artifacts/ebpf/custom-tls-plaintext.bpf.o".to_string(),
+    );
+
+    assert_eq!(
+        outcome,
+        FieldApplyOutcome::Changed("TLS uprobe object path changed")
+    );
+    assert_eq!(
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path,
+        Some(PathBuf::from(
+            "/var/lib/traffic-probe/artifacts/ebpf/custom-tls-plaintext.bpf.o"
+        ))
+    );
+
+    apply_text_field(&mut config, FieldId::TlsPlaintextObjectPath, String::new());
+
+    assert!(
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path
+            .is_none()
+    );
 }

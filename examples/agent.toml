@@ -142,10 +142,13 @@ multiplier = 2
 # remote_poll_interval_ms = 60000
 
 [tls.plaintext.instrumentation]
-# libssl uprobe plaintext requires eBPF host prerequisites, an eBPF TLS object,
-# and a selector that scopes the instrumentation target.
+# libssl uprobe plaintext requires eBPF host prerequisites and a selector that
+# scopes the instrumentation target. The first-party TLS uprobe object is
+# embedded in the agent binary by default and is materialized under
+# PROBE_HOME/artifacts/ebpf when hooks are enabled.
 enabled = false
-# libssl_uprobe_object_path = "/opt/probe/ebpf-tls-plaintext"
+# Set this only when using a custom or externally managed TLS uprobe object.
+# libssl_uprobe_object_path = "/var/lib/traffic-probe/artifacts/ebpf/custom-tls-plaintext.bpf.o"
 reconcile_interval_ms = 1000
 
 [tls.plaintext.decrypt_hints]

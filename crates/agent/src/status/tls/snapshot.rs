@@ -295,7 +295,8 @@ mod tests {
             .tls
             .plaintext
             .instrumentation
-            .libssl_uprobe_object_path = Some("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o".into());
+            .libssl_uprobe_object_path =
+            Some("/var/lib/traffic-probe/artifacts/ebpf/custom-tls-plaintext.bpf.o".into());
         config.tls.plaintext.instrumentation.reconcile_interval_ms = 2_500;
         let plan = runtime_plan_from_config(
             config,
@@ -309,7 +310,7 @@ mod tests {
         assert!(instrumentation.selector_configured);
         assert_eq!(
             instrumentation.libssl_uprobe_object_path,
-            Some("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o".into())
+            Some("/var/lib/traffic-probe/artifacts/ebpf/custom-tls-plaintext.bpf.o".into())
         );
         assert_eq!(instrumentation.reconcile_interval_ms, 2_500);
         assert_eq!(
@@ -332,7 +333,7 @@ mod tests {
         );
         assert_eq!(
             value["plaintext"]["instrumentation"]["libssl_uprobe_object_path"],
-            json!("/opt/traffic-probe/ebpf-tls-plaintext.bpf.o")
+            json!("/var/lib/traffic-probe/artifacts/ebpf/custom-tls-plaintext.bpf.o")
         );
         assert_eq!(
             value["plaintext"]["instrumentation"]["reconcile_interval_ms"],

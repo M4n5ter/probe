@@ -19,6 +19,7 @@ use probe_core::{
 use storage::FjallSpool;
 
 use crate::{
+    artifacts::hydrate_tls_uprobe_object_path,
     check::{build_check_report, build_invalid_config_report},
     error::AgentError,
     export::drain_replay_webhook,
@@ -173,10 +174,10 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             run_check_command(&config).await?;
         }
         Command::Capabilities { config } => {
-            let config = match config {
+            let config = prepare_runtime_config(match config {
                 Some(path) => read_config(&path)?,
                 None => AgentConfig::default(),
-            };
+            })?;
             let matrix = capability_matrix_for_config(&config);
             println!("{}", serde_json::to_string_pretty(&matrix)?);
         }
@@ -251,7 +252,7 @@ fn parse_ready_socket(value: OsString) -> Result<PathBuf, AgentError> {
 fn read_runtime_composition(
     path: &PathBuf,
 ) -> Result<crate::runtime_composition::RuntimeComposition, AgentError> {
-    let config = read_config(path)?;
+    let config = prepare_runtime_config(read_config(path)?)?;
     build_runtime_composition(config)
 }
 
@@ -289,6 +290,7 @@ fn emit_check_command_output(output: CheckCommandOutput) -> Result<(), AgentErro
 }
 
 async fn build_check_command_output(config: AgentConfig) -> Result<CheckCommandOutput, AgentError> {
+    let config = prepare_runtime_config(config)?;
     match build_runtime_composition_with_diagnostics(config) {
         Ok(runtime) => {
             let (plan, enforcement_backend) = runtime.into_enforcement_parts();
@@ -311,6 +313,11 @@ async fn build_check_command_output(config: AgentConfig) -> Result<CheckCommandO
             }
         }
     }
+}
+
+fn prepare_runtime_config(mut config: AgentConfig) -> Result<AgentConfig, AgentError> {
+    let _ = hydrate_tls_uprobe_object_path(&mut config)?;
+    Ok(config)
 }
 
 fn read_config_or_default(path: Option<&PathBuf>) -> Result<AgentConfig, AgentError> {

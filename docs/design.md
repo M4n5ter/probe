@@ -219,6 +219,8 @@ flowchart LR
 - 受限环境里没有可用用户 home 时，默认路径退回 `/var/lib/traffic-probe`。
 - 配置默认值和 TUI 生成的本地文件路径必须优先从 `PROBE_HOME` 派生，例如 spool、
   file exporter、TLS material、policy bundle 和 MITM plaintext feed 的默认落点。
+- agent 生成的 runtime socket、spool、export output、TUI runtime overlay 和内置 artifact materialization
+  都应默认落在 `PROBE_HOME` 下，使卸载体验可以收敛为停止进程并删除单个 state tree。
 - 显式 TOML path 按字面值使用，不执行 shell-style 环境变量展开；operator 需要移动 state root 时，
   应在生成配置或使用 TUI 编辑配置前设置 `PROBE_HOME`。
 - runtime socket 这类短生命周期对象默认使用 `PROBE_HOME/run`。机器级服务部署可以通过显式配置放在
@@ -1284,6 +1286,9 @@ Spool lanes：
 
 - TLS plaintext 当前通过 `tls.plaintext.instrumentation.enabled` 启用 libssl uprobe instrumentation。
 - TLS plaintext 不暴露单值 provider 字段。
+- agent build 默认把第一方 TLS uprobe artifact 嵌入 agent binary；当 instrumentation 启用且未配置 override
+  path 时，agent 会把内置 artifact 物化到 `PROBE_HOME/artifacts/ebpf/` 下的 content-addressed 文件。
+- `tls.plaintext.instrumentation.libssl_uprobe_object_path` 是高级 override，不是普通用户首次启用路径。
 - enforcement policy source 支持未配置、文件、目录 manifest 和 remote endpoint。
 - configured policy source 支持本地 bundle directory 和 remote bundle endpoint。
 - remote endpoint 必须使用 HTTPS。
@@ -3640,7 +3645,9 @@ flowchart LR
 TLS plaintext uprobe 配置与运行语义：
 
 - `[tls.plaintext.instrumentation] libssl_uprobe_object_path`
-  - TLS plaintext uprobe object 路径放在这里，不复用 `[capture.ebpf] object_path`。
+  - TLS plaintext uprobe object override 路径放在这里，不复用 `[capture.ebpf] object_path`。
+  - 普通发行路径由默认内嵌的 agent artifact 自动物化到 `PROBE_HOME/artifacts/ebpf/`，文件名由内容哈希派生。
+  - 默认落在 `PROBE_HOME` 下，保证 spool、socket、运行态文件和生成 artifact 共享同一可清理状态树。
   - TLS artifact 必须满足 strict TLS plaintext artifact contract。
   - process artifact 必须满足 strict process observation artifact contract。
   - 两个 artifact 不能混装。
