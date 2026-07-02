@@ -23,6 +23,7 @@ use super::{
     },
     backend::{L7MitmBackendHealthProbe, backend_health_probe, connect_tcp},
     listener_owner::require_listener_owned_by_process_group,
+    output::{ManagedProcessOutput, ManagedProcessOutputHandle},
     state::L7MitmRuntimeHandle,
 };
 use crate::{
@@ -162,10 +163,12 @@ fn managed_process(
         &readiness_probe,
         Some(managed_process.process_group),
     );
+    let readiness_output = managed_process.output.handle();
     if let Err(error) = wait_for_managed_process_readiness(
         &managed_process.child,
         managed_process.process_group,
         &readiness_probe,
+        &readiness_output,
         &runtime,
         shutdown_requested,
     ) {
@@ -186,6 +189,7 @@ fn managed_process(
     }
 
     let child = Arc::clone(&managed_process.child);
+    let health_output = managed_process.output.handle();
     let process_group = managed_process.process_group;
     let target = readiness_probe.target;
     let health_context = L7MitmAuditContext::ManagedProcess(audit_context.clone());
@@ -194,7 +198,14 @@ fn managed_process(
     let health_probe = start_tcp_health_probe(
         Some(readiness_probe.into_plan()),
         health_observer,
-        move || ensure_managed_process_owns_readiness_listener(&child, process_group, target),
+        move || {
+            ensure_managed_process_owns_readiness_listener(
+                &child,
+                process_group,
+                target,
+                &health_output,
+            )
+        },
         "L7 MITM managed backend health probe thread panicked",
     );
     Ok(L7MitmBackendLifecycleGuard {
@@ -234,6 +245,7 @@ fn append_cleanup_error(error: String, cleanup_result: Result<(), String>) -> St
 struct L7MitmManagedProcessGuard {
     child: Arc<Mutex<Child>>,
     process_group: Pid,
+    output: ManagedProcessOutput,
     cleanup_complete: bool,
 }
 
@@ -243,22 +255,24 @@ impl L7MitmManagedProcessGuard {
         command
             .args(&process.args)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .process_group(0);
         if let Some(working_dir) = &process.working_dir {
             command.current_dir(working_dir);
         }
-        let child = command.spawn().map_err(|error| {
+        let mut child = command.spawn().map_err(|error| {
             format!(
                 "failed to spawn managed L7 MITM backend {}: {error}",
                 process.program.display()
             )
         })?;
+        let output = ManagedProcessOutput::drain(child.stdout.take(), child.stderr.take());
         let process_group = Pid::from_child(&child);
         Ok(Self {
             child: Arc::new(Mutex::new(child)),
             process_group,
+            output,
             cleanup_complete: false,
         })
     }
@@ -282,26 +296,30 @@ impl L7MitmManagedProcessGuard {
     fn stop_for_shutdown(&mut self) -> Result<(), String> {
         let mut child = lock_managed_child(&self.child)?;
         if let Some(status) = poll_managed_child(&mut child)? {
+            let reason = managed_backend_exited_before_shutdown(status, &self.output.handle());
             let cleanup_result =
                 terminate_process_group_allow_missing(self.process_group, Signal::KILL);
+            self.output.join_finished();
             return match cleanup_result {
-                Ok(()) => Err(format!(
-                    "managed L7 MITM backend exited before agent shutdown: {status}"
-                )),
-                Err(cleanup_error) => Err(format!(
-                    "managed L7 MITM backend exited before agent shutdown: {status}; cleanup failed: {cleanup_error}"
-                )),
+                Ok(()) => Err(reason),
+                Err(cleanup_error) => Err(format!("{reason}; cleanup failed: {cleanup_error}")),
             };
         }
 
         terminate_process_group_allow_missing(self.process_group, Signal::TERM)?;
         match wait_for_managed_process_exit(&mut child, MANAGED_BACKEND_STOP_TIMEOUT)? {
-            Some(_status) => Ok(()),
+            Some(_status) => {
+                let cleanup_result =
+                    terminate_process_group_allow_missing(self.process_group, Signal::KILL);
+                self.output.join_finished();
+                cleanup_result
+            }
             None => {
                 terminate_process_group_allow_missing(self.process_group, Signal::KILL)?;
                 child
                     .wait()
                     .map_err(|error| format!("failed to reap managed L7 MITM backend: {error}"))?;
+                self.output.join_finished();
                 Ok(())
             }
         }
@@ -316,6 +334,7 @@ impl L7MitmManagedProcessGuard {
                 .wait()
                 .map_err(|error| format!("failed to reap managed L7 MITM backend: {error}"))?;
         }
+        self.output.join_finished();
         Ok(())
     }
 }
@@ -333,6 +352,7 @@ fn wait_for_managed_process_readiness(
     child: &Arc<Mutex<Child>>,
     process_group: Pid,
     readiness_probe: &L7MitmBackendHealthProbe,
+    output: &ManagedProcessOutputHandle,
     runtime: &L7MitmRuntimeHandle,
     shutdown_requested: &shutdown::ShutdownFlag,
 ) -> Result<(), String> {
@@ -347,6 +367,7 @@ fn wait_for_managed_process_readiness(
             child,
             process_group,
             readiness_probe.target,
+            output,
         ) {
             last_failure = error;
             runtime.record_backend_health_failure(last_failure.clone());
@@ -390,10 +411,13 @@ fn sleep_until_next_readiness_attempt(
     Ok(())
 }
 
-fn ensure_managed_process_is_running(child: &Arc<Mutex<Child>>) -> Result<(), String> {
+fn ensure_managed_process_is_running(
+    child: &Arc<Mutex<Child>>,
+    output: &ManagedProcessOutputHandle,
+) -> Result<(), String> {
     let mut child = lock_managed_child(child)?;
     match poll_managed_child(&mut child)? {
-        Some(status) => Err(format!("managed L7 MITM backend exited: {status}")),
+        Some(status) => Err(managed_backend_exited(status, output)),
         None => Ok(()),
     }
 }
@@ -402,9 +426,32 @@ fn ensure_managed_process_owns_readiness_listener(
     child: &Arc<Mutex<Child>>,
     process_group: Pid,
     target: std::net::SocketAddr,
+    output: &ManagedProcessOutputHandle,
 ) -> Result<(), String> {
-    ensure_managed_process_is_running(child)?;
+    ensure_managed_process_is_running(child, output)?;
     require_listener_owned_by_process_group(target, process_group)
+}
+
+fn managed_backend_exited(status: ExitStatus, output: &ManagedProcessOutputHandle) -> String {
+    append_output_context(format!("managed L7 MITM backend exited: {status}"), output)
+}
+
+fn managed_backend_exited_before_shutdown(
+    status: ExitStatus,
+    output: &ManagedProcessOutputHandle,
+) -> String {
+    append_output_context(
+        format!("managed L7 MITM backend exited before agent shutdown: {status}"),
+        output,
+    )
+}
+
+fn append_output_context(mut message: String, output: &ManagedProcessOutputHandle) -> String {
+    if let Some(summary) = output.exit_context() {
+        message.push_str("; ");
+        message.push_str(&summary);
+    }
+    message
 }
 
 fn poll_managed_child(child: &mut Child) -> Result<Option<ExitStatus>, String> {
@@ -568,6 +615,38 @@ mod tests {
     }
 
     #[test]
+    fn managed_process_start_failure_reports_redacted_backend_output() {
+        let mut config = managed_mitm_config(
+            "127.0.0.1:15002",
+            Path::new("/bin/sh"),
+            [
+                "-c".to_string(),
+                "echo mitm backend bootstrap failed >&2; exit 1".to_string(),
+            ],
+        );
+        let readiness_probe = managed_backend_readiness(&mut config);
+        readiness_probe.interval_ms = 100;
+        readiness_probe.timeout_ms = 10;
+        readiness_probe.failure_threshold = 3;
+
+        let runtime = resolve_with_probe(&config, |_target, _timeout| {
+            panic!("managed backend readiness must run after the process is spawned")
+        });
+        let shutdown = crate::shutdown::new_flag();
+        let error = match start_configured_backend_lifecycle(&runtime, &config, &shutdown) {
+            Ok(_) => panic!("exited managed backend must not start"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("stderr produced"), "{error}");
+        assert!(
+            error.contains("content omitted because managed backend output may contain decrypted traffic or secrets"),
+            "{error}"
+        );
+        assert!(!error.contains("mitm backend bootstrap failed"), "{error}");
+    }
+
+    #[test]
     fn managed_process_ready_audit_failure_cleans_backend_process()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture_dir = tempdir()?;
@@ -643,6 +722,48 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("cancelled by shutdown request"), "{error}");
+    }
+
+    #[test]
+    fn managed_process_shutdown_cleans_descendant_holding_output_pipe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture_dir = tempdir()?;
+        let backend_fixture = compile_managed_mitm_backend_fixture(fixture_dir.path())?;
+        let target = closed_loopback_target()?;
+        let dir = tempdir()?;
+        let pid_file = dir.path().join("descendant.pid");
+        let command = format!(
+            "{} {} & echo $! > {}; exec {} {}",
+            shell_quote("/bin/sleep"),
+            shell_quote("30"),
+            shell_quote(&pid_file.display().to_string()),
+            shell_quote(&backend_fixture.display().to_string()),
+            shell_quote(&target.to_string())
+        );
+        let shell = fs::canonicalize("/bin/sh")?;
+        let mut config =
+            managed_mitm_config(target.to_string(), &shell, ["-c".to_string(), command]);
+        let readiness_probe = managed_backend_readiness(&mut config);
+        readiness_probe.interval_ms = 100;
+        readiness_probe.timeout_ms = 10;
+        readiness_probe.failure_threshold = 20;
+
+        let runtime = resolve_with_probe(&config, |_target, _timeout| {
+            panic!("managed backend readiness must run after the process is spawned")
+        });
+        let shutdown = crate::shutdown::new_flag();
+        let guard = start_configured_backend_lifecycle(&runtime, &config, &shutdown)?
+            .expect("managed backend lifecycle should start");
+
+        let descendant_pid = fs::read_to_string(&pid_file)?
+            .trim()
+            .parse::<u32>()
+            .expect("descendant pid should parse");
+        guard.stop()?;
+        wait_until(Duration::from_secs(2), || {
+            !PathBuf::from(format!("/proc/{descendant_pid}")).exists()
+        })?;
+        Ok(())
     }
 
     #[test]

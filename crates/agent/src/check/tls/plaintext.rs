@@ -137,7 +137,7 @@ fn check_key_log_material(
     mode: KeyLogCheckMode,
     file_store: &impl TlsMaterialFileStore,
 ) -> Result<TlsPlaintextMaterialCheckSnapshot, TlsCheckError> {
-    let bytes = match file_store.read_tls_material(&material.path) {
+    let bytes = match file_store.read_tls_material(material.kind, &material.path) {
         Ok(bytes) => bytes,
         Err(TlsMaterialFileStoreError::NotFound) if mode == KeyLogCheckMode::LiveTail => {
             return Ok(pending_check_snapshot(
@@ -200,7 +200,7 @@ fn check_session_secret_material(
     mode: SessionSecretCheckMode,
     file_store: &impl TlsMaterialFileStore,
 ) -> Result<TlsPlaintextMaterialCheckSnapshot, TlsCheckError> {
-    let bytes = match file_store.read_tls_material(&material.path) {
+    let bytes = match file_store.read_tls_material(material.kind, &material.path) {
         Ok(bytes) => bytes,
         Err(TlsMaterialFileStoreError::NotFound)
             if mode == SessionSecretCheckMode::LiveAutoBinding =>

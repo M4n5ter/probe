@@ -8,8 +8,9 @@ use std::{
 
 use probe_core::{ApplicationProtocol, ApplicationProtocolPolicy};
 use probe_io::{
-    AllowedFileRoots, BoundedFileError, OwnerPrivateFileError, RootedBoundedFileError,
-    open_bounded_regular_file_under_roots, validate_owner_private_file,
+    AllowedFileRoots, BoundedFileError, OwnerPrivateFileError, PublicReadableFileError,
+    RootedBoundedFileError, open_bounded_regular_file_under_roots, validate_owner_private_file,
+    validate_public_readable_file,
 };
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, Issuer, KeyPair};
 use rustls::{
@@ -469,14 +470,60 @@ fn load_certificate_chain(
     path: &Path,
     material_roots: &AllowedFileRoots,
 ) -> Result<Vec<CertificateDer<'static>>, MitmProxyError> {
-    let mut reader = pem_reader(
+    let mut reader = public_pem_reader(
         path,
         material_roots,
         "open MITM proxy TLS certificate chain",
     )?;
-    let certificates = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(io_error("parse MITM proxy TLS certificate chain"))?;
+    let mut certificates = Vec::new();
+    while let Some(item) = rustls_pemfile::read_one(&mut reader)
+        .map_err(io_error("parse MITM proxy TLS certificate chain"))?
+    {
+        match item {
+            rustls_pemfile::Item::X509Certificate(certificate) => certificates.push(certificate),
+            rustls_pemfile::Item::Pkcs1Key(_) => {
+                return Err(public_certificate_chain_contains_private_key(
+                    path,
+                    "RSA PRIVATE KEY",
+                ));
+            }
+            rustls_pemfile::Item::Pkcs8Key(_) => {
+                return Err(public_certificate_chain_contains_private_key(
+                    path,
+                    "PRIVATE KEY",
+                ));
+            }
+            rustls_pemfile::Item::Sec1Key(_) => {
+                return Err(public_certificate_chain_contains_private_key(
+                    path,
+                    "EC PRIVATE KEY",
+                ));
+            }
+            rustls_pemfile::Item::SubjectPublicKeyInfo(_) => {
+                return Err(public_certificate_chain_contains_unsupported_item(
+                    path,
+                    "PUBLIC KEY",
+                ));
+            }
+            rustls_pemfile::Item::Crl(_) => {
+                return Err(public_certificate_chain_contains_unsupported_item(
+                    path, "X509 CRL",
+                ));
+            }
+            rustls_pemfile::Item::Csr(_) => {
+                return Err(public_certificate_chain_contains_unsupported_item(
+                    path,
+                    "CERTIFICATE REQUEST",
+                ));
+            }
+            _ => {
+                return Err(public_certificate_chain_contains_unsupported_item(
+                    path,
+                    "unknown PEM section",
+                ));
+            }
+        }
+    }
     if certificates.is_empty() {
         return Err(MitmProxyError::Tls(format!(
             "TLS certificate chain {} did not contain any certificates",
@@ -486,11 +533,25 @@ fn load_certificate_chain(
     Ok(certificates)
 }
 
+fn public_certificate_chain_contains_private_key(path: &Path, item: &str) -> MitmProxyError {
+    MitmProxyError::Tls(format!(
+        "public TLS certificate chain {} must not contain {item} PEM sections",
+        path.display()
+    ))
+}
+
+fn public_certificate_chain_contains_unsupported_item(path: &Path, item: &str) -> MitmProxyError {
+    MitmProxyError::Tls(format!(
+        "TLS certificate chain {} must contain only CERTIFICATE PEM sections; found {item}",
+        path.display()
+    ))
+}
+
 fn load_private_key(
     path: &Path,
     material_roots: &AllowedFileRoots,
 ) -> Result<PrivateKeyDer<'static>, MitmProxyError> {
-    let mut reader = pem_reader(path, material_roots, "open MITM proxy TLS private key")?;
+    let mut reader = private_pem_reader(path, material_roots, "open MITM proxy TLS private key")?;
     rustls_pemfile::private_key(&mut reader)
         .map_err(io_error("parse MITM proxy TLS private key"))?
         .ok_or_else(|| {
@@ -568,7 +629,20 @@ fn load_rcgen_key_pair(
     KeyPair::try_from(&private_key).map_err(rcgen_error("parse MITM proxy TLS private key"))
 }
 
-fn pem_reader(
+fn public_pem_reader(
+    path: &Path,
+    material_roots: &AllowedFileRoots,
+    action: &'static str,
+) -> Result<BufReader<Cursor<Vec<u8>>>, MitmProxyError> {
+    let file = open_bounded_regular_file_under_roots(path, material_roots, MAX_TLS_MATERIAL_BYTES)
+        .map_err(rooted_bounded_file_error(action))?;
+    validate_public_readable_file(file.metadata()).map_err(public_readable_file_error(action))?;
+    let bytes = read_open_pem_bytes(file, action)?;
+    validate_public_certificate_chain_pem_labels(path, &bytes)?;
+    Ok(BufReader::new(Cursor::new(bytes)))
+}
+
+fn private_pem_reader(
     path: &Path,
     material_roots: &AllowedFileRoots,
     action: &'static str,
@@ -576,11 +650,52 @@ fn pem_reader(
     let file = open_bounded_regular_file_under_roots(path, material_roots, MAX_TLS_MATERIAL_BYTES)
         .map_err(rooted_bounded_file_error(action))?;
     validate_owner_private_file(file.metadata()).map_err(owner_private_file_error(action))?;
-    let bytes = file
-        .read()
+    Ok(BufReader::new(Cursor::new(read_open_pem_bytes(
+        file, action,
+    )?)))
+}
+
+fn read_open_pem_bytes(
+    file: probe_io::BoundedRegularFile,
+    action: &'static str,
+) -> Result<Vec<u8>, MitmProxyError> {
+    file.read()
         .map(|read| read.into_bytes())
-        .map_err(bounded_file_error(action))?;
-    Ok(BufReader::new(Cursor::new(bytes)))
+        .map_err(bounded_file_error(action))
+}
+
+fn validate_public_certificate_chain_pem_labels(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), MitmProxyError> {
+    let contents = std::str::from_utf8(bytes).map_err(|error| {
+        MitmProxyError::Tls(format!(
+            "TLS certificate chain {} is not valid PEM text: {error}",
+            path.display()
+        ))
+    })?;
+    for line in contents.lines().map(normalize_pem_boundary_line) {
+        let Some(label) = line
+            .strip_prefix("-----BEGIN ")
+            .and_then(|line| line.strip_suffix("-----"))
+        else {
+            continue;
+        };
+        if label == "CERTIFICATE" {
+            continue;
+        }
+        if label.contains("PRIVATE KEY") {
+            return Err(public_certificate_chain_contains_private_key(path, label));
+        }
+        return Err(public_certificate_chain_contains_unsupported_item(
+            path, label,
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_pem_boundary_line(line: &str) -> &str {
+    line.trim_end_matches(' ')
 }
 
 fn owner_private_file_error(
@@ -598,6 +713,19 @@ fn owner_private_file_error(
         )),
         OwnerPrivateFileError::InsecurePermissions { mode } => MitmProxyError::Tls(format!(
             "{action}: TLS material has group/other permissions {mode:o}"
+        )),
+    }
+}
+
+fn public_readable_file_error(
+    action: &'static str,
+) -> impl FnOnce(PublicReadableFileError) -> MitmProxyError {
+    move |error| match error {
+        PublicReadableFileError::Unreadable { mode } => MitmProxyError::Tls(format!(
+            "{action}: TLS material has no read permission bits set; permissions are {mode:o}"
+        )),
+        PublicReadableFileError::WritableByGroupOrOthers { mode } => MitmProxyError::Tls(format!(
+            "{action}: TLS material is writable by group/other users; permissions are {mode:o}"
         )),
     }
 }
@@ -693,6 +821,148 @@ mod tests {
     }
 
     #[test]
+    fn upstream_tls_accepts_public_trust_anchor() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let (trust_anchor, _private_key) = write_test_ca(root.path(), "upstream")?;
+        fs::set_permissions(&trust_anchor, fs::Permissions::from_mode(0o644))?;
+        let config = UpstreamTlsConfig::new(vec![trust_anchor], None);
+
+        TlsUpstreamConnector::from_config(&config, &ApplicationProtocolPolicy::default())?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_tls_rejects_writable_public_trust_anchor() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempdir()?;
+        let (trust_anchor, _private_key) = write_test_ca(root.path(), "upstream")?;
+        fs::set_permissions(&trust_anchor, fs::Permissions::from_mode(0o666))?;
+        let config = UpstreamTlsConfig::new(vec![trust_anchor], None);
+
+        let error =
+            match TlsUpstreamConnector::from_config(&config, &ApplicationProtocolPolicy::default())
+            {
+                Ok(_) => return Err("writable trust anchor must be rejected".into()),
+                Err(error) => error,
+            };
+
+        assert!(
+            error.to_string().contains("writable by group/other users"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_tls_rejects_unreadable_public_trust_anchor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let (trust_anchor, _private_key) = write_test_ca(root.path(), "upstream")?;
+        fs::set_permissions(&trust_anchor, fs::Permissions::from_mode(0o200))?;
+        let config = UpstreamTlsConfig::new(vec![trust_anchor], None);
+
+        let error =
+            match TlsUpstreamConnector::from_config(&config, &ApplicationProtocolPolicy::default())
+            {
+                Ok(_) => return Err("unreadable trust anchor must be rejected".into()),
+                Err(error) => error,
+            };
+
+        assert!(
+            error.to_string().contains("failed to open")
+                || error.to_string().contains("no read permission bits"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_tls_rejects_public_trust_anchor_with_private_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let (trust_anchor, private_key) = write_test_ca(root.path(), "upstream")?;
+        append_private_key_to_public_pem(&trust_anchor, &private_key)?;
+        fs::set_permissions(&trust_anchor, fs::Permissions::from_mode(0o644))?;
+        let config = UpstreamTlsConfig::new(vec![trust_anchor], None);
+
+        let error =
+            match TlsUpstreamConnector::from_config(&config, &ApplicationProtocolPolicy::default())
+            {
+                Ok(_) => return Err("public trust anchor with private key must be rejected".into()),
+                Err(error) => error,
+            };
+
+        assert!(
+            error.to_string().contains("must not contain")
+                && error.to_string().contains("PRIVATE KEY"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_tls_rejects_public_trust_anchor_with_unrecognized_private_key_label()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let (trust_anchor, _private_key) = write_test_ca(root.path(), "upstream")?;
+        append_pem_section(&trust_anchor, "ENCRYPTED PRIVATE KEY", "AAAA")?;
+        fs::set_permissions(&trust_anchor, fs::Permissions::from_mode(0o644))?;
+        let config = UpstreamTlsConfig::new(vec![trust_anchor], None);
+
+        let error =
+            match TlsUpstreamConnector::from_config(&config, &ApplicationProtocolPolicy::default())
+            {
+                Ok(_) => {
+                    return Err(
+                        "public trust anchor with encrypted private key must be rejected".into(),
+                    );
+                }
+                Err(error) => error,
+            };
+
+        assert!(
+            error.to_string().contains("must not contain")
+                && error.to_string().contains("ENCRYPTED PRIVATE KEY"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_tls_rejects_public_trust_anchor_with_trailing_space_private_key_label()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let (trust_anchor, _private_key) = write_test_ca(root.path(), "upstream")?;
+        append_pem_section_with_begin_trailing_space(
+            &trust_anchor,
+            "ENCRYPTED PRIVATE KEY",
+            "AAAA",
+        )?;
+        fs::set_permissions(&trust_anchor, fs::Permissions::from_mode(0o644))?;
+        let config = UpstreamTlsConfig::new(vec![trust_anchor], None);
+
+        let error =
+            match TlsUpstreamConnector::from_config(&config, &ApplicationProtocolPolicy::default())
+            {
+                Ok(_) => {
+                    return Err(
+                        "public trust anchor with trailing-space private key label must be rejected"
+                            .into(),
+                    );
+                }
+                Err(error) => error,
+            };
+
+        assert!(
+            error.to_string().contains("must not contain")
+                && error.to_string().contains("ENCRYPTED PRIVATE KEY"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn upstream_tls_server_name_uses_downstream_sni_without_http_host()
     -> Result<(), Box<dyn std::error::Error>> {
         let server_name =
@@ -767,6 +1037,110 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_ca_accepts_public_certificate() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let (certificate_path, private_key_path) = write_test_ca(root.path(), "mitm")?;
+        fs::set_permissions(&certificate_path, fs::Permissions::from_mode(0o644))?;
+        let config = TlsTerminationConfig::from_ca(certificate_path, private_key_path);
+
+        TlsTerminator::from_config(&config, &ApplicationProtocolPolicy::default())?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_ca_rejects_writable_public_certificate() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let (certificate_path, private_key_path) = write_test_ca(root.path(), "mitm")?;
+        fs::set_permissions(&certificate_path, fs::Permissions::from_mode(0o666))?;
+        let config = TlsTerminationConfig::from_ca(certificate_path, private_key_path);
+
+        let error = match TlsTerminator::from_config(&config, &ApplicationProtocolPolicy::default())
+        {
+            Ok(_) => return Err("writable MITM CA certificate must be rejected".into()),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("writable by group/other users"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_ca_rejects_unreadable_public_certificate() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempdir()?;
+        let (certificate_path, private_key_path) = write_test_ca(root.path(), "mitm")?;
+        fs::set_permissions(&certificate_path, fs::Permissions::from_mode(0o200))?;
+        let config = TlsTerminationConfig::from_ca(certificate_path, private_key_path);
+
+        let error = match TlsTerminator::from_config(&config, &ApplicationProtocolPolicy::default())
+        {
+            Ok(_) => return Err("unreadable MITM CA certificate must be rejected".into()),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("failed to open")
+                || error.to_string().contains("no read permission bits"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_ca_rejects_public_certificate_with_private_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let (certificate_path, private_key_path) = write_test_ca(root.path(), "mitm")?;
+        append_private_key_to_public_pem(&certificate_path, &private_key_path)?;
+        fs::set_permissions(&certificate_path, fs::Permissions::from_mode(0o644))?;
+        let config = TlsTerminationConfig::from_ca(certificate_path, private_key_path);
+
+        let error = match TlsTerminator::from_config(&config, &ApplicationProtocolPolicy::default())
+        {
+            Ok(_) => {
+                return Err("public MITM CA certificate with private key must be rejected".into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("must not contain")
+                && error.to_string().contains("PRIVATE KEY"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_ca_rejects_public_certificate_with_unknown_pem_section()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let (certificate_path, private_key_path) = write_test_ca(root.path(), "mitm")?;
+        append_pem_section(&certificate_path, "FOO", "AAAA")?;
+        fs::set_permissions(&certificate_path, fs::Permissions::from_mode(0o644))?;
+        let config = TlsTerminationConfig::from_ca(certificate_path, private_key_path);
+
+        let error = match TlsTerminator::from_config(&config, &ApplicationProtocolPolicy::default())
+        {
+            Ok(_) => {
+                return Err("public MITM CA certificate with unknown PEM must be rejected".into());
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("must contain only CERTIFICATE")
+                && error.to_string().contains("FOO"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn dynamic_ca_rejects_mismatched_ca_private_key() -> Result<(), Box<dyn std::error::Error>> {
         let root = tempdir()?;
         let (certificate_path, _first_key_path) = write_test_ca(root.path(), "first")?;
@@ -805,6 +1179,43 @@ mod tests {
         write_private_file(&certificate_path, certificate.pem())?;
         write_private_file(&private_key_path, signing_key.serialize_pem())?;
         Ok((certificate_path, private_key_path))
+    }
+
+    fn append_private_key_to_public_pem(
+        public_pem: &Path,
+        private_key: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut contents = fs::read_to_string(public_pem)?;
+        contents.push('\n');
+        contents.push_str(&fs::read_to_string(private_key)?);
+        fs::write(public_pem, contents)?;
+        Ok(())
+    }
+
+    fn append_pem_section(
+        path: &Path,
+        label: &str,
+        body: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut contents = fs::read_to_string(path)?;
+        contents.push_str(&format!(
+            "\n-----BEGIN {label}-----\n{body}\n-----END {label}-----\n"
+        ));
+        fs::write(path, contents)?;
+        Ok(())
+    }
+
+    fn append_pem_section_with_begin_trailing_space(
+        path: &Path,
+        label: &str,
+        body: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut contents = fs::read_to_string(path)?;
+        contents.push_str(&format!(
+            "\n-----BEGIN {label}----- \n{body}\n-----END {label}-----\n"
+        ));
+        fs::write(path, contents)?;
+        Ok(())
     }
 
     fn write_private_file(

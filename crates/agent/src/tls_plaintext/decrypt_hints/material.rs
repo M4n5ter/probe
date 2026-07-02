@@ -111,7 +111,7 @@ fn read_tls_material_if_available(
     file_store: &(impl TlsMaterialFileStore + ?Sized),
 ) -> Result<Option<Vec<u8>>, TlsDecryptHintError> {
     let material_plan = material.plan();
-    let bytes = match file_store.read_tls_material(&material_plan.path) {
+    let bytes = match file_store.read_tls_material(material_plan.kind, &material_plan.path) {
         Ok(bytes) => bytes,
         Err(TlsMaterialFileStoreError::NotFound) => return Ok(None),
         Err(source) => {
@@ -527,7 +527,7 @@ mod tests {
             &path,
             br#"{"protocol":"tls13","secret_kind":"client_application_traffic_secret","client_random":"0000000000000000000000000000000000000000000000000000000000000000","secret":"not-a-secret"}"#.to_vec(),
         );
-        let bytes = store.read_tls_material(&path)?;
+        let bytes = store.read_tls_material(TlsMaterialKind::SessionSecretFile, &path)?;
 
         let error = decode_tls_session_secret_material(&material_plans[0], &bytes)
             .expect_err("invalid configured session secret material must fail");
@@ -563,14 +563,22 @@ mod tests {
     }
 
     impl TlsMaterialFileStore for MemoryTlsMaterialStore {
-        fn inspect_tls_material(&self, path: &Path) -> Result<(), TlsMaterialFileStoreError> {
+        fn inspect_tls_material(
+            &self,
+            _kind: TlsMaterialKind,
+            path: &Path,
+        ) -> Result<(), TlsMaterialFileStoreError> {
             self.files
                 .contains_key(path)
                 .then_some(())
                 .ok_or(TlsMaterialFileStoreError::NotFound)
         }
 
-        fn read_tls_material(&self, path: &Path) -> Result<Vec<u8>, TlsMaterialFileStoreError> {
+        fn read_tls_material(
+            &self,
+            _kind: TlsMaterialKind,
+            path: &Path,
+        ) -> Result<Vec<u8>, TlsMaterialFileStoreError> {
             self.files
                 .get(path)
                 .cloned()

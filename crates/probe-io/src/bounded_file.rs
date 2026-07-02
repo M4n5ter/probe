@@ -81,6 +81,14 @@ pub enum OwnerPrivateFileError {
     InsecurePermissions { mode: u32 },
 }
 
+#[derive(Debug, Error)]
+pub enum PublicReadableFileError {
+    #[error("file has no read permission bits set; permissions are {mode:o}")]
+    Unreadable { mode: u32 },
+    #[error("file is writable by group/other users; permissions are {mode:o}")]
+    WritableByGroupOrOthers { mode: u32 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundedFileSizeLimit {
     pub size: u64,
@@ -532,9 +540,20 @@ pub fn validate_owner_private_file(metadata: &Metadata) -> Result<(), OwnerPriva
     Ok(())
 }
 
+pub fn validate_public_readable_file(metadata: &Metadata) -> Result<(), PublicReadableFileError> {
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o444 == 0 {
+        return Err(PublicReadableFileError::Unreadable { mode });
+    }
+    if mode & 0o022 != 0 {
+        return Err(PublicReadableFileError::WritableByGroupOrOthers { mode });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, os::unix::fs::PermissionsExt};
 
     use tempfile::tempdir;
 
@@ -659,6 +678,42 @@ mod tests {
         assert!(matches!(
             error,
             RootedBoundedFileError::Bounded(BoundedFileError::NotFound { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn public_readable_validation_rejects_missing_read_bits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let path = temp.path().join("public.pem");
+        fs::write(&path, b"certificate")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o200))?;
+
+        let error = validate_public_readable_file(&fs::metadata(&path)?)
+            .expect_err("public material must have at least one read bit");
+
+        assert!(matches!(
+            error,
+            PublicReadableFileError::Unreadable { mode } if mode == 0o200
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn public_readable_validation_rejects_group_or_other_writable_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let path = temp.path().join("public.pem");
+        fs::write(&path, b"certificate")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
+
+        let error = validate_public_readable_file(&fs::metadata(&path)?)
+            .expect_err("public material must not be writable by group or others");
+
+        assert!(matches!(
+            error,
+            PublicReadableFileError::WritableByGroupOrOthers { mode } if mode == 0o666
         ));
         Ok(())
     }

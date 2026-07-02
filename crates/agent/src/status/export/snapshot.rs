@@ -280,7 +280,7 @@ fn exporter_tls_status(
         .chain(&tls.client_certificates)
         .chain(tls.client_private_key.iter())
     {
-        let source = tls::material_source_status(&material.path, file_store);
+        let source = tls::material_source_status(material.kind, &material.path, file_store);
         if source.mode == RuntimeMode::Unavailable {
             return ExporterTlsStatusSnapshot {
                 mode: RuntimeMode::Unavailable,

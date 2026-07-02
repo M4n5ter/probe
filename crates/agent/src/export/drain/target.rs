@@ -386,7 +386,7 @@ fn read_tls_material_for_export(
     file_store: &impl TlsMaterialFileStore,
 ) -> Result<Vec<u8>, ExportDrainError> {
     file_store
-        .read_tls_material(&material.path)
+        .read_tls_material(material.kind, &material.path)
         .map_err(|source| ExportDrainError::TlsMaterial {
             id: material.id.clone(),
             kind: material.kind,

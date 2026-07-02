@@ -2,6 +2,7 @@ mod audit;
 mod backend;
 mod lifecycle;
 mod listener_owner;
+mod output;
 mod policy_hook;
 mod state;
 

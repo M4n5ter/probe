@@ -448,14 +448,22 @@ mod tests {
     }
 
     impl TlsMaterialFileStore for MemoryTlsMaterialStore {
-        fn inspect_tls_material(&self, path: &Path) -> Result<(), TlsMaterialFileStoreError> {
+        fn inspect_tls_material(
+            &self,
+            _kind: TlsMaterialKind,
+            path: &Path,
+        ) -> Result<(), TlsMaterialFileStoreError> {
             self.files
                 .contains_key(path)
                 .then_some(())
                 .ok_or(TlsMaterialFileStoreError::NotFound)
         }
 
-        fn read_tls_material(&self, path: &Path) -> Result<Vec<u8>, TlsMaterialFileStoreError> {
+        fn read_tls_material(
+            &self,
+            _kind: TlsMaterialKind,
+            path: &Path,
+        ) -> Result<Vec<u8>, TlsMaterialFileStoreError> {
             self.files
                 .get(path)
                 .cloned()
@@ -486,7 +494,11 @@ mod tests {
     }
 
     impl TlsMaterialFileStore for ScriptedTlsMaterialStore {
-        fn inspect_tls_material(&self, path: &Path) -> Result<(), TlsMaterialFileStoreError> {
+        fn inspect_tls_material(
+            &self,
+            _kind: TlsMaterialKind,
+            path: &Path,
+        ) -> Result<(), TlsMaterialFileStoreError> {
             self.reads
                 .lock()
                 .expect("scripted material store lock should not be poisoned")
@@ -495,7 +507,11 @@ mod tests {
                 .ok_or(TlsMaterialFileStoreError::NotFound)
         }
 
-        fn read_tls_material(&self, path: &Path) -> Result<Vec<u8>, TlsMaterialFileStoreError> {
+        fn read_tls_material(
+            &self,
+            _kind: TlsMaterialKind,
+            path: &Path,
+        ) -> Result<Vec<u8>, TlsMaterialFileStoreError> {
             let mut reads = self
                 .reads
                 .lock()

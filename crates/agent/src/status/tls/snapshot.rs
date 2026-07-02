@@ -108,7 +108,7 @@ pub(in crate::status) fn tls_status(
                 kind: material.kind,
                 path: material.path.clone(),
                 purpose: material_purpose(material.kind),
-                source: material_source_status(&material.path, &file_store),
+                source: material_source_status(material.kind, &material.path, &file_store),
             })
             .collect(),
     }
@@ -165,7 +165,7 @@ fn plaintext_material_statuses(
             id: material.id.clone(),
             kind: material.kind,
             path: material.path.clone(),
-            source: material_source_status(&material.path, file_store),
+            source: material_source_status(material.kind, &material.path, file_store),
         })
         .collect()
 }
@@ -187,10 +187,11 @@ fn material_purpose(kind: TlsMaterialKind) -> TlsMaterialPurpose {
 }
 
 pub(in crate::status) fn material_source_status(
+    kind: TlsMaterialKind,
     path: &Path,
     file_store: &impl TlsMaterialFileStore,
 ) -> TlsMaterialSourceStatusSnapshot {
-    let (mode, reason) = inspect_material_source(path, file_store);
+    let (mode, reason) = inspect_material_source(kind, path, file_store);
     TlsMaterialSourceStatusSnapshot {
         check: TlsMaterialSourceCheck::MetadataOnly,
         mode,
@@ -199,10 +200,11 @@ pub(in crate::status) fn material_source_status(
 }
 
 fn inspect_material_source(
+    kind: TlsMaterialKind,
     path: &Path,
     file_store: &impl TlsMaterialFileStore,
 ) -> (RuntimeMode, Option<String>) {
-    match file_store.inspect_tls_material(path) {
+    match file_store.inspect_tls_material(kind, path) {
         Ok(()) => (RuntimeMode::Available, None),
         Err(error) => (RuntimeMode::Unavailable, Some(error.to_string())),
     }
@@ -255,9 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn tls_status_reports_insecure_material_as_unavailable()
+    fn tls_status_reports_group_readable_public_material_as_available()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("status-tls-insecure-material")?;
+        let temp = test_dir("status-tls-public-material")?;
         let material_path = temp.join("ca.pem");
         fs::write(&material_path, b"test trust anchor")?;
         fs::set_permissions(&material_path, fs::Permissions::from_mode(0o644))?;
@@ -265,6 +267,54 @@ mod tests {
         config.tls.materials = vec![probe_config::TlsMaterialConfig {
             id: Some("collector-ca".to_string()),
             kind: probe_config::TlsMaterialKind::TrustAnchor,
+            path: material_path.clone(),
+        }];
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+
+        let status = tls_status(&plan, &plan.capabilities, None, None);
+
+        let material = &status.materials[0];
+        assert_eq!(material.source.mode, RuntimeMode::Available);
+        assert_eq!(material.source.reason, None);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tls_status_reports_unreadable_public_material_as_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-tls-unreadable-public-material")?;
+        let material_path = temp.join("ca.pem");
+        fs::write(&material_path, b"test trust anchor")?;
+        fs::set_permissions(&material_path, fs::Permissions::from_mode(0o200))?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.tls.materials = vec![probe_config::TlsMaterialConfig {
+            id: Some("collector-ca".to_string()),
+            kind: probe_config::TlsMaterialKind::TrustAnchor,
+            path: material_path.clone(),
+        }];
+        let plan = runtime_plan_from_config(config, Vec::new())?;
+
+        let status = tls_status(&plan, &plan.capabilities, None, None);
+
+        let material = &status.materials[0];
+        assert_eq!(material.source.mode, RuntimeMode::Unavailable);
+        assert!(material.source.reason.is_some());
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tls_status_reports_insecure_material_as_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("status-tls-insecure-material")?;
+        let material_path = temp.join("client.key");
+        fs::write(&material_path, b"test private key")?;
+        fs::set_permissions(&material_path, fs::Permissions::from_mode(0o644))?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.tls.materials = vec![probe_config::TlsMaterialConfig {
+            id: Some("client-key".to_string()),
+            kind: probe_config::TlsMaterialKind::ClientPrivateKey,
             path: material_path.clone(),
         }];
         let plan = runtime_plan_from_config(config, Vec::new())?;

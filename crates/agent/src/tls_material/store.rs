@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use probe_config::TlsMaterialKind;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -35,12 +36,33 @@ pub(crate) enum TlsMaterialFileStoreError {
     OwnerMismatch { owner_uid: u32, effective_uid: u32 },
     #[error("TLS material owner read bit is not set; permissions are {mode:o}")]
     OwnerUnreadable { mode: u32 },
+    #[error("TLS material has no read permission bits set; permissions are {mode:o}")]
+    Unreadable { mode: u32 },
     #[error("TLS material has group/other permissions {mode:o}")]
     InsecurePermissions { mode: u32 },
 }
 
 pub(crate) trait TlsMaterialFileStore: Send {
-    fn inspect_tls_material(&self, path: &Path) -> Result<(), TlsMaterialFileStoreError>;
+    fn inspect_tls_material(
+        &self,
+        kind: TlsMaterialKind,
+        path: &Path,
+    ) -> Result<(), TlsMaterialFileStoreError>;
 
-    fn read_tls_material(&self, path: &Path) -> Result<Vec<u8>, TlsMaterialFileStoreError>;
+    fn read_tls_material(
+        &self,
+        kind: TlsMaterialKind,
+        path: &Path,
+    ) -> Result<Vec<u8>, TlsMaterialFileStoreError>;
+}
+
+pub(crate) fn tls_material_requires_private_file(kind: TlsMaterialKind) -> bool {
+    matches!(
+        kind,
+        TlsMaterialKind::ClientPrivateKey
+            | TlsMaterialKind::KeyLogFile
+            | TlsMaterialKind::SessionSecretFile
+            | TlsMaterialKind::MitmCaPrivateKey
+            | TlsMaterialKind::MitmLeafPrivateKey
+    )
 }
