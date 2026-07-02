@@ -5,6 +5,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use super::paths::default_admin_socket_path;
+
 pub const DEFAULT_ADMIN_PROMETHEUS_LISTEN_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9464);
 
@@ -20,7 +22,7 @@ impl Default for AdminConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            socket_path: PathBuf::from("/run/traffic-probe/admin.sock"),
+            socket_path: default_admin_socket_path(),
             prometheus: AdminPrometheusConfig::default(),
         }
     }

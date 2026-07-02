@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 use probe_config::{
     AgentConfig, CaptureSelection, CompressionCodecName, ConnectionEnforcementBackendConfig,
     ExporterConfig, ExporterTransportConfig, ExporterWorkerConfig,
-    TransparentInterceptionStrategyConfig, default_export_file_path,
+    TransparentInterceptionStrategyConfig, default_admin_socket_path, default_export_file_path,
     default_export_unix_http_socket_path,
 };
 use probe_core::{EnforcementMode, Selector};
@@ -20,6 +20,9 @@ use super::{
 pub(crate) enum FieldId {
     CaptureSelection,
     CaptureDeepObserveProcess,
+    AdminEnabled,
+    AdminSocketPath,
+    AdminPrometheusEnabled,
     ExportWorkerEnabled,
     AddDefaultExporter,
     ExporterTransport(usize),
@@ -44,6 +47,9 @@ impl FieldId {
         match self {
             Self::CaptureSelection => "Capture backend",
             Self::CaptureDeepObserveProcess => "Observe selected process",
+            Self::AdminEnabled => "Admin socket",
+            Self::AdminSocketPath => "Admin socket path",
+            Self::AdminPrometheusEnabled => "Prometheus listener",
             Self::ExportWorkerEnabled => "Export worker",
             Self::AddDefaultExporter => "Add exporter",
             Self::ExporterTransport(_) => "Exporter transport",
@@ -75,10 +81,12 @@ impl FieldId {
             | Self::ConnectionBackend
             | Self::InterceptionStrategy => "cycle value",
             Self::ExportWorkerEnabled | Self::TlsPlaintextEnabled => "toggle",
+            Self::AdminEnabled | Self::AdminPrometheusEnabled => "toggle",
             Self::ExporterWebhookEndpoint(_)
             | Self::ExporterFilePath(_)
             | Self::ExporterUnixSocketPath(_)
-            | Self::ExporterUnixHttpEndpoint(_) => "edit text",
+            | Self::ExporterUnixHttpEndpoint(_)
+            | Self::AdminSocketPath => "edit text",
             Self::AddDefaultExporter => "add exporter",
             Self::CaptureDeepObserveProcess
             | Self::EnforcementProcessScope
@@ -97,7 +105,12 @@ pub(crate) enum FieldApplyOutcome {
 
 pub(crate) fn fields_for_tab(tab: TuiTab, config: &AgentConfig) -> Vec<FieldId> {
     match tab {
-        TuiTab::Overview | TuiTab::Traffic | TuiTab::Processes | TuiTab::Runtime => Vec::new(),
+        TuiTab::Overview | TuiTab::Traffic | TuiTab::Processes => Vec::new(),
+        TuiTab::Runtime => vec![
+            FieldId::AdminEnabled,
+            FieldId::AdminSocketPath,
+            FieldId::AdminPrometheusEnabled,
+        ],
         TuiTab::Capture => vec![
             FieldId::CaptureSelection,
             FieldId::CaptureDeepObserveProcess,
@@ -144,6 +157,9 @@ pub(crate) fn field_value(
             config.capture.deep_observe_selector.is_some(),
             selected_process_name,
         ),
+        FieldId::AdminEnabled => bool_state(config.admin.enabled),
+        FieldId::AdminSocketPath => config.admin.socket_path.display().to_string(),
+        FieldId::AdminPrometheusEnabled => bool_state(config.admin.prometheus.enabled),
         FieldId::ExportWorkerEnabled => bool_state(config.export.worker.enabled),
         FieldId::AddDefaultExporter => {
             format!(
@@ -261,6 +277,27 @@ pub(crate) fn apply_field(
                 config.capture.deep_observe_selector = Some(selector);
                 "Capture process selector updated"
             })
+        }
+        FieldId::AdminEnabled => {
+            config.admin.enabled = !config.admin.enabled;
+            if !config.admin.enabled {
+                config.admin.prometheus.enabled = false;
+            }
+            if config.admin.enabled && config.admin.socket_path.as_os_str().is_empty() {
+                config.admin.socket_path = default_admin_socket_path();
+            }
+            FieldApplyOutcome::Changed("Admin socket toggled")
+        }
+        FieldId::AdminSocketPath => FieldApplyOutcome::Unchanged,
+        FieldId::AdminPrometheusEnabled => {
+            config.admin.prometheus.enabled = !config.admin.prometheus.enabled;
+            if config.admin.prometheus.enabled {
+                config.admin.enabled = true;
+                if config.admin.socket_path.as_os_str().is_empty() {
+                    config.admin.socket_path = default_admin_socket_path();
+                }
+            }
+            FieldApplyOutcome::Changed("Prometheus listener toggled")
         }
         FieldId::ExportWorkerEnabled => {
             config.export.worker.enabled = !config.export.worker.enabled;
@@ -381,6 +418,7 @@ pub(crate) fn editable_text_value(config: &AgentConfig, field: FieldId) -> Optio
                     _ => None,
                 })
         }
+        FieldId::AdminSocketPath => Some(config.admin.socket_path.display().to_string()),
         _ => None,
     }
 }
@@ -432,6 +470,10 @@ pub(crate) fn apply_text_field(
             };
             *endpoint = value;
             FieldApplyOutcome::Changed("Unix HTTP endpoint changed")
+        }
+        FieldId::AdminSocketPath => {
+            config.admin.socket_path = PathBuf::from(value);
+            FieldApplyOutcome::Changed("Admin socket path changed")
         }
         _ => FieldApplyOutcome::Unchanged,
     }
@@ -704,4 +746,18 @@ fn retention_record_cycle_handles_unbounded_presets_and_custom_values() {
         cycle_retention_records(Some(20_000_000), -1),
         Some(10_000_000)
     );
+}
+
+#[cfg(test)]
+#[test]
+fn disabling_admin_also_disables_prometheus_listener() {
+    let mut config = AgentConfig::default();
+    config.admin.enabled = true;
+    config.admin.prometheus.enabled = true;
+
+    let outcome = apply_field(&mut config, FieldId::AdminEnabled, 1, None);
+
+    assert_eq!(outcome, FieldApplyOutcome::Changed("Admin socket toggled"));
+    assert!(!config.admin.enabled);
+    assert!(!config.admin.prometheus.enabled);
 }

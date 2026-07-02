@@ -221,8 +221,8 @@ flowchart LR
   file exporter、TLS material、policy bundle 和 MITM plaintext feed 的默认落点。
 - 显式 TOML path 按字面值使用，不执行 shell-style 环境变量展开；operator 需要移动 state root 时，
   应在生成配置或使用 TUI 编辑配置前设置 `PROBE_HOME`。
-- runtime socket 这类短生命周期对象可以继续由显式配置放在 `/run` 或 operator 指定位置；
-  若 TUI 自动生成本地 socket path，应使用 `PROBE_HOME/run`，避免隐式依赖发行版目录存在。
+- runtime socket 这类短生命周期对象默认使用 `PROBE_HOME/run`。机器级服务部署可以通过显式配置放在
+  `/run` 或 operator 指定位置，避免把本地 workbench 默认和 system service layout 混在一起。
 
 权限模型：
 
@@ -279,7 +279,8 @@ Operator TUI 能力事实：
 
 - agent binary 暴露 `agent tui [--config <path>]`，与 `run`、`check`、`status`
   共用同一份 `AgentConfig` 模型。不传 `--config` 时，TUI 使用
-  `PROBE_HOME/config/agent.toml`；文件不存在会创建一份最小安全配置。
+  `PROBE_HOME/config/agent.toml`；文件不存在会创建一份最小安全配置，其中 admin socket path
+  指向 `PROBE_HOME/run/admin.sock` 但默认不启用 admin。
 - TUI 使用 ratatui 0.30 与 crossterm 0.29；crossterm major 版本显式对齐，避免 raw mode、事件队列和类型不兼容。
 - 交互模型以 `TuiAction` 为边界。键盘事件和鼠标事件是同级输入路径，二者都翻译为同一组 action。
   这是 TUI 设计不变量，不是渲染层的补充能力：新增可交互控件时，必须先定义 action contract，
@@ -295,6 +296,7 @@ Operator TUI 能力事实：
   该路径返回完整 `EventEnvelope` 给 admin client，但 TUI 只保留事件表展示摘要，不在 TUI model 中保留 raw argv。
   当选中进程有 readable executable path 时，Traffic tab 使用同一 selector model 过滤事件；选中进程无法形成 executable-path
   selector 时 fail-closed，不退回全机流量。
+  当 admin socket disabled 时，Traffic tab 提供同一 action model 下的键盘和鼠标 `Enable admin` 入口。
 - `tail_events` 是 non-mutating admin command。它读取 `after_sequence` 之后的 export records，按可选 selector
   过滤，并返回 `next_after_sequence`；该响应 cursor 不会 ack 任何 exporter sink cursor。
   响应同时受单事件 payload budget 和总响应 payload budget 约束；超限事件通过 omission metadata 表达，不在响应中展开。
@@ -302,9 +304,11 @@ Operator TUI 能力事实：
 - Runtime tab 通过 admin Unix socket 调用 `reload_runtime_actions`。该动作只执行 active `RuntimePlan`
   中可安全在线切换的 runtime owners：policy bundle reload 和 external enforcement manifest reload。
   响应按 action 独立展示成功或失败；它不替换运行中的主 agent config，也不改变 exporter sink cursor。
+  Runtime tab 同时提供 admin socket enablement、socket path 和 Prometheus listener enablement 的配置字段。
 - TUI-managed 字段包括 capture backend selection、export worker enablement、default exporter creation、
   exporter transport、webhook endpoint、file path、Unix HTTP socket path、exporter codec、
-  storage retention record limits、enforcement mode/backend、transparent interception strategy、
+  storage retention record limits、admin socket enablement/path、Prometheus listener enablement、
+  enforcement mode/backend、transparent interception strategy、
   TLS plaintext hook enablement，以及 capture、enforcement、transparent interception、TLS plaintext 的
   process-scoped selector。
 - 保存路径优先用 `toml_edit` 定点更新 TUI-managed 字段，保留用户配置中的非相关内容和注释。
@@ -4697,7 +4701,8 @@ Admin socket：
 - `agent admin --socket <path> <command>` 是该 JSON-lines 协议的一等 CLI client；`status`、`metrics`、`debug-dump`、
   `plan-config-reload --config <path>`、`reload-runtime-actions`、`reload-policies` 和
   `reload-enforcement-policy` 输出 JSON，`prometheus-metrics` 输出 text exposition。
-- admin socket parent directory 必须由部署层预创建。
+- `agent admin <command>` 不带 `--socket` 时使用 `PROBE_HOME/run/admin.sock`。
+- admin socket parent directory 必须存在；TUI 生成的默认 `PROBE_HOME/run` 目录会在保存配置时创建，服务级显式路径由部署层预创建。
 - parent directory 不能是 symlink。
 - parent directory 不能允许 group/other 访问。
 - parent owner 必须是 root 或当前 euid。

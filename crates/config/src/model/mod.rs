@@ -86,9 +86,9 @@ pub use export::{
     ExporterTransportConfig, ExporterWorkerConfig,
 };
 pub use paths::{
-    DEFAULT_PROBE_HOME_STATE_DIR, FALLBACK_PROBE_HOME, PROBE_HOME_ENV, default_config_path,
-    default_export_file_path, default_export_unix_http_socket_path, default_storage_path,
-    probe_home, probe_home_path,
+    DEFAULT_PROBE_HOME_STATE_DIR, FALLBACK_PROBE_HOME, PROBE_HOME_ENV, default_admin_socket_path,
+    default_config_path, default_export_file_path, default_export_unix_http_socket_path,
+    default_storage_path, probe_home, probe_home_path,
 };
 pub use policy::{
     DEFAULT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS, DEFAULT_POLICY_RELOAD_WATCH_DEBOUNCE_MS,

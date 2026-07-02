@@ -11,7 +11,7 @@ use exporter::CompressionCodec;
 use parsers::Http1ParserFactory;
 use pipeline::{CapturePipeline, PipelinePolicy};
 use policy::{POLICY_HOOKS, PolicyManifest, PolicyRuntime};
-use probe_config::{AgentConfig, ConfigValidationError};
+use probe_config::{AgentConfig, ConfigValidationError, default_admin_socket_path};
 use probe_core::{
     AddressPort, Direction, EnforcementMode, FlowContext, FlowIdentity, ProcessContext,
     ProcessIdentity, Timestamp, TransportProtocol,
@@ -35,8 +35,6 @@ use super::admin::{AdminCliCommand, run_admin_command};
 
 const REPLAY_POLICY_SOURCE_BYTES: u64 = 1024 * 1024;
 const READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_READY_SOCKET";
-const DEFAULT_ADMIN_SOCKET_PATH: &str = "/run/traffic-probe/admin.sock";
-
 #[derive(Debug, Parser)]
 #[command(name = "traffic-probe")]
 #[command(about = "Process-level traffic probe agent")]
@@ -70,8 +68,12 @@ enum Command {
         config: Option<PathBuf>,
     },
     Admin {
-        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET_PATH)]
-        socket: PathBuf,
+        #[arg(
+            long,
+            value_name = "SOCKET",
+            help = "Admin Unix socket path; defaults to PROBE_HOME/run/admin.sock"
+        )]
+        socket: Option<PathBuf>,
         #[command(subcommand)]
         command: AdminCliCommand,
     },
@@ -188,6 +190,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             run_tui(TuiOptions { config }).await?;
         }
         Command::Admin { socket, command } => {
+            let socket = resolve_admin_socket(socket);
             run_admin_command(&socket, command).await?;
         }
         Command::Replay {
@@ -214,6 +217,10 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
         }
     }
     Ok(())
+}
+
+fn resolve_admin_socket(socket: Option<PathBuf>) -> PathBuf {
+    socket.unwrap_or_else(default_admin_socket_path)
 }
 
 fn run_options_from_env(max_events: Option<u64>) -> Result<RunOptions, AgentError> {
@@ -474,6 +481,19 @@ mod tests {
         let cli = Cli::try_parse_from(["traffic-probe", "tui"]).expect("TUI config is optional");
 
         assert!(matches!(cli.command, Command::Tui { config: None }));
+    }
+
+    #[test]
+    fn admin_cli_uses_runtime_default_socket_when_omitted() {
+        let cli = Cli::try_parse_from(["traffic-probe", "admin", "status"])
+            .expect("admin socket is optional");
+
+        let Command::Admin { socket, command } = cli.command else {
+            panic!("expected admin command");
+        };
+
+        assert!(matches!(command, AdminCliCommand::Status));
+        assert_eq!(resolve_admin_socket(socket), default_admin_socket_path());
     }
 
     #[test]

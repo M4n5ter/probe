@@ -244,30 +244,34 @@ link with a regular file.
 The workbench can add a default exporter, switch exporter transport, edit
 webhook endpoints, file paths, Unix HTTP socket paths, exporter compression,
 export worker state, storage retention record limits, capture backend selection,
-enforcement mode/backend, transparent interception strategy, TLS plaintext hook
-enablement, and process-scoped selectors for capture, enforcement,
+admin socket enablement and path, Prometheus listener enablement, enforcement
+mode/backend, transparent interception strategy, TLS plaintext hook enablement,
+and process-scoped selectors for capture, enforcement,
 interception, and TLS plaintext. Policy Lua source, large MITM backend
 contracts, TLS material files, exporter headers/TLS material refs, and
 collector-specific payload formats should still be edited in the config and
 policy files.
 
 Without `--config`, the TUI uses `PROBE_HOME/config/agent.toml` and creates a
-minimal safe config if the file does not exist. Pass `--config ./agent.toml`
-when editing an explicit file.
+minimal safe config if the file does not exist. The generated admin socket path
+is `PROBE_HOME/run/admin.sock`. Pass `--config ./agent.toml` when editing an
+explicit file.
 
 When the configured admin socket is enabled and the live agent is running, the
 Traffic tab tails parsed export events from the online admin surface. It uses
 the selected process executable-path selector when available; if the selected
 process has no readable executable path, traffic filtering fails closed instead
 of showing unrelated host traffic. The TUI keeps only display summaries for the
-event table and does not retain raw process argv.
+event table and does not retain raw process argv. If admin is disabled, the
+Traffic tab exposes an `Enable admin` action through both keyboard and mouse.
 
 The Runtime tab can call the online admin `reload_runtime_actions` command. It
 reloads the runtime owners that are explicitly safe to update online, currently
 policy bundles and the external enforcement manifest, and reports partial
 failures per action. It does not replace the active main agent config; use it
 after saving policy or enforcement inputs that are already referenced by the
-running config.
+running config. The same tab also edits the admin socket settings needed by
+Traffic and runtime actions.
 
 ### Minimal Policy And Webhook Wiring
 
@@ -1026,7 +1030,10 @@ observation time without treating that activity as kernel link liveness. The
 eBPF provider status separately reports held tracepoint links, explicit kernel
 liveness proof status, and optional kernel tracepoint-pair availability, such as
 `sendfile` or `sendfile64`.
-The admin CLI sends the same JSON-lines commands over the Unix socket:
+The admin CLI sends the same JSON-lines commands over the Unix socket. When
+`--socket` is omitted, it uses `PROBE_HOME/run/admin.sock`. Service
+deployments that configure `/run/traffic-probe/admin.sock` should pass that
+path explicitly.
 
 ```bash
 cargo run -p agent -- admin \

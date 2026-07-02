@@ -1,18 +1,18 @@
 use ratatui::layout::Rect;
 
-use super::{app::TuiTab, fields::FieldId};
+use super::{app::TuiTab, controls::ControlId, fields::FieldId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HitTarget {
     Tab(TuiTab),
     Field(FieldId),
+    Control(ControlId),
     Process(usize),
     TrafficRow(usize),
     TextEditSubmit,
     TextEditCancel,
     Save,
     Reload,
-    ReloadRuntimeActions,
     Quit,
 }
 

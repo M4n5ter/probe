@@ -54,6 +54,10 @@ pub fn default_export_unix_http_socket_path() -> PathBuf {
     probe_home_path("run/export.sock")
 }
 
+pub fn default_admin_socket_path() -> PathBuf {
+    probe_home_path("run/admin.sock")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

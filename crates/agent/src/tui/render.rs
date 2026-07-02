@@ -8,6 +8,7 @@ use ratatui::{
 
 use super::{
     app::{StatusKind, TextEditSession, TuiApp, TuiTab},
+    controls::{ControlId, FocusTarget},
     hit::{HitArea, HitMap, HitTarget},
     traffic::TrafficStatusKind,
 };
@@ -33,7 +34,6 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &TuiApp) -> HitMap {
         TuiTab::Overview => render_overview(frame, body, app),
         TuiTab::Traffic => render_traffic(frame, body, app, &mut hits),
         TuiTab::Processes => render_processes(frame, body, app, &mut hits),
-        TuiTab::Runtime => render_runtime(frame, body, app, &mut hits),
         _ => render_fields(frame, body, app, &mut hits),
     }
     render_footer(frame, footer, app);
@@ -161,59 +161,21 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     );
 }
 
-fn render_runtime(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec<HitArea>) {
-    let admin_state = if app.config().admin.enabled {
-        format!("enabled at {}", app.config().admin.socket_path.display())
-    } else {
-        "disabled".to_string()
-    };
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("Admin: ", Style::default().fg(Color::Gray)),
-            Span::raw(admin_state),
-        ]),
-        Line::from(vec![
-            Span::styled("Runtime actions: ", Style::default().fg(Color::Gray)),
-            Span::raw("policy bundles, enforcement manifest"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Status: ",
-                Style::default().fg(status_color(app.status().kind)),
-            ),
-            Span::raw(app.status().text.clone()),
-        ]),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::bordered().title("Runtime"))
-            .wrap(Wrap { trim: true }),
-        area,
-    );
-    render_button(
-        frame,
-        hits,
-        Rect::new(area.x + 2, area.y + 5, 18, 1),
-        "Reload actions",
-        HitTarget::ReloadRuntimeActions,
-    );
-}
-
 fn render_fields(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec<HitArea>) {
-    let fields = app.fields_for_active_tab();
-    let selected = app.selected_field();
-    let rows = fields
+    let targets = app.focus_targets_for_active_tab();
+    let selected = app.selected_focus_target();
+    let rows = targets
         .iter()
         .enumerate()
-        .map(|(index, field)| {
-            let marker = if Some(*field) == selected { ">" } else { " " };
+        .map(|(index, target)| {
+            let marker = if Some(*target) == selected { ">" } else { " " };
             let row = Row::new([
                 Cell::from(marker),
-                Cell::from(field.label()),
-                Cell::from(app.field_value(*field)),
-                Cell::from(field.action_hint()),
+                Cell::from(target.label()),
+                Cell::from(app.focus_target_value(*target)),
+                Cell::from(target.action_hint()),
             ]);
-            if Some(*field) == selected {
+            if Some(*target) == selected {
                 row.style(Style::default().fg(Color::Black).bg(Color::LightCyan))
             } else if index % 2 == 0 {
                 row.style(Style::default().fg(Color::White))
@@ -224,7 +186,7 @@ fn render_fields(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec
         .collect::<Vec<_>>();
 
     let row_start = area.y + 3;
-    for (index, field) in fields.iter().enumerate() {
+    for (index, target) in targets.iter().enumerate() {
         hits.push(HitArea::new(
             Rect::new(
                 area.x + 1,
@@ -232,7 +194,7 @@ fn render_fields(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec
                 area.width.saturating_sub(2),
                 1,
             ),
-            HitTarget::Field(*field),
+            hit_target_for_focus(*target),
         ));
     }
 
@@ -254,6 +216,13 @@ fn render_fields(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec
             .block(Block::bordered().title(app.active_tab().label())),
         area,
     );
+}
+
+fn hit_target_for_focus(target: FocusTarget) -> HitTarget {
+    match target {
+        FocusTarget::Field(field) => HitTarget::Field(field),
+        FocusTarget::Control(control) => HitTarget::Control(control),
+    }
 }
 
 fn render_processes(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec<HitArea>) {
@@ -388,7 +357,33 @@ fn render_traffic(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Ve
         Span::styled("filter", Style::default().fg(Color::Gray)),
         Span::raw(": selected process executable path when readable"),
     ]);
-    frame.render_widget(Paragraph::new(status), status_area);
+    if let Some(control) = traffic_status_control(app) {
+        let button_width = control.label().len() as u16 + 2;
+        let button = Rect::new(
+            status_area
+                .x
+                .saturating_add(status_area.width.saturating_sub(button_width + 1)),
+            status_area.y,
+            button_width,
+            1,
+        );
+        let text_area = Rect::new(
+            status_area.x,
+            status_area.y,
+            status_area.width.saturating_sub(button_width + 2),
+            status_area.height,
+        );
+        frame.render_widget(Paragraph::new(status), text_area);
+        render_button(
+            frame,
+            hits,
+            button,
+            control.label(),
+            HitTarget::Control(control),
+        );
+    } else {
+        frame.render_widget(Paragraph::new(status), status_area);
+    }
     frame.render_widget(
         Table::new(
             rows,
@@ -412,6 +407,15 @@ fn render_traffic(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Ve
         .block(Block::bordered().title(title)),
         table_area,
     );
+}
+
+fn traffic_status_control(app: &TuiApp) -> Option<ControlId> {
+    app.focus_targets_for_active_tab()
+        .into_iter()
+        .find_map(|target| match target {
+            FocusTarget::Control(ControlId::EnableAdmin) => Some(ControlId::EnableAdmin),
+            FocusTarget::Field(_) | FocusTarget::Control(_) => None,
+        })
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -529,6 +533,7 @@ mod tests {
     use super::{
         super::{
             app::{TuiAction, TuiApp},
+            controls::ControlId,
             fields::FieldId,
             processes::{ProcessCatalog, ProcessEntry},
         },
@@ -616,8 +621,33 @@ mod tests {
 
         let output = terminal.backend().to_string();
         assert!(output.contains("Runtime"));
-        assert!(output.contains("[Reload actions]"));
-        assert_eq!(hit_map.hit(4, 11), Some(HitTarget::ReloadRuntimeActions));
+        assert!(output.contains("Admin socket"));
+        assert!(output.contains("Reload runtime actions"));
+        assert_eq!(
+            hit_map.hit(2, 12),
+            Some(HitTarget::Control(ControlId::ReloadRuntimeActions))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn render_traffic_disabled_state_registers_enable_admin_hit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = test_app();
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24))?;
+        let mut hit_map = HitMap::default();
+
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &app);
+        })?;
+
+        let output = terminal.backend().to_string();
+        assert!(output.contains("[Enable admin]"));
+        assert_eq!(
+            hit_map.hit(86, 6),
+            Some(HitTarget::Control(ControlId::EnableAdmin))
+        );
         Ok(())
     }
 

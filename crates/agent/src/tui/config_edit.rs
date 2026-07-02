@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use probe_config::{
     AgentConfig, ConfigError, ExporterConfig, ExporterTlsConfig, ExporterTransportConfig,
-    default_export_file_path, default_storage_path,
+    default_admin_socket_path, default_export_file_path, default_storage_path,
 };
 use probe_core::{Direction, Selector, SelectorTerm};
 use rustix::{
@@ -142,6 +142,13 @@ fn minimal_config_source() -> String {
     set_value(&mut document, &["export", "worker"], "enabled", value(true));
     set_value(&mut document, &["enforcement"], "mode", value("audit_only"));
     set_value(&mut document, &["enforcement"], "backend", value("none"));
+    set_value(&mut document, &["admin"], "enabled", value(false));
+    set_value(
+        &mut document,
+        &["admin"],
+        "socket_path",
+        value(default_admin_socket_path().display().to_string()),
+    );
     document.to_string()
 }
 
@@ -149,6 +156,22 @@ pub(crate) fn save_config(
     path: &Path,
     original_source: &str,
     config: &AgentConfig,
+) -> Result<String, TuiError> {
+    save_config_with_default_paths(
+        path,
+        original_source,
+        config,
+        &default_export_file_path(),
+        &default_admin_socket_path(),
+    )
+}
+
+fn save_config_with_default_paths(
+    path: &Path,
+    original_source: &str,
+    config: &AgentConfig,
+    default_export_file: &Path,
+    default_admin_socket: &Path,
 ) -> Result<String, TuiError> {
     reject_symlink_config_path(path)?;
     let _lock = ConfigSaveLock::acquire(path)?;
@@ -168,7 +191,7 @@ pub(crate) fn save_config(
     }
     runtime::validate_static_runtime_config(&roundtrip)?;
     roundtrip.validate_l7_mitm_contract()?;
-    ensure_generated_local_paths(&roundtrip)?;
+    ensure_generated_local_paths(&roundtrip, default_export_file, default_admin_socket)?;
     atomic_write(path, rendered.as_bytes())?;
     Ok(rendered)
 }
@@ -353,8 +376,13 @@ fn sync_directory(path: &Path) -> Result<(), TuiError> {
         })
 }
 
-fn ensure_generated_local_paths(config: &AgentConfig) -> Result<(), TuiError> {
-    ensure_generated_file_export_dirs(config, &default_export_file_path())
+fn ensure_generated_local_paths(
+    config: &AgentConfig,
+    default_export_file: &Path,
+    default_admin_socket: &Path,
+) -> Result<(), TuiError> {
+    ensure_generated_file_export_dirs(config, default_export_file)?;
+    ensure_generated_admin_socket_dir(config, default_admin_socket)
 }
 
 fn ensure_generated_file_export_dirs(
@@ -371,6 +399,19 @@ fn ensure_generated_file_export_dirs(
         return Ok(());
     }
     let Some(parent) = default_export_file.parent() else {
+        return Ok(());
+    };
+    ensure_private_directory(parent)
+}
+
+fn ensure_generated_admin_socket_dir(
+    config: &AgentConfig,
+    default_admin_socket: &Path,
+) -> Result<(), TuiError> {
+    if !config.admin.enabled || config.admin.socket_path != default_admin_socket {
+        return Ok(());
+    }
+    let Some(parent) = default_admin_socket.parent() else {
         return Ok(());
     };
     ensure_private_directory(parent)
@@ -493,6 +534,30 @@ fn render_preserving_config(
         "selector",
         config.tls.plaintext.instrumentation.selector.as_ref(),
     )?;
+    set_value(
+        &mut document,
+        &["admin"],
+        "enabled",
+        value(config.admin.enabled),
+    );
+    set_value(
+        &mut document,
+        &["admin"],
+        "socket_path",
+        value(config.admin.socket_path.display().to_string()),
+    );
+    set_value(
+        &mut document,
+        &["admin", "prometheus"],
+        "enabled",
+        value(config.admin.prometheus.enabled),
+    );
+    set_value(
+        &mut document,
+        &["admin", "prometheus"],
+        "listen_addr",
+        value(config.admin.prometheus.listen_addr.to_string()),
+    );
     Ok(document.to_string())
 }
 
@@ -865,6 +930,8 @@ max_records = 10000
         assert!(rendered.contains("selection = \"libpcap\""));
         assert!(rendered.contains("enabled = false"));
         assert!(rendered.contains("codec = \"gzip\""));
+        assert!(rendered.contains("[admin]"));
+        assert!(rendered.contains("socket_path = "));
         assert!(rendered.contains("[storage.retention.ingress]"));
         assert!(rendered.contains("[storage.retention.export]"));
         assert!(rendered.contains("max_records = 100000"));
@@ -1098,6 +1165,48 @@ config_version = "local"
             0o700
         );
         FileExporter::preflight_path(&export_file)?;
+        Ok(())
+    }
+
+    #[test]
+    fn save_creates_generated_default_admin_socket_parent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("agent.toml");
+        let socket_path = temp.path().join("run").join("admin.sock");
+        let source = format!(
+            r#"
+agent_id = "probe"
+config_version = "local"
+
+[admin]
+enabled = false
+socket_path = "{}"
+"#,
+            socket_path.display()
+        );
+        fs::write(&path, &source)?;
+        let mut config = AgentConfig::from_toml_str(&source)?;
+        config.admin.enabled = true;
+
+        let rendered = save_config_with_default_paths(
+            &path,
+            &source,
+            &config,
+            &temp.path().join("export").join("events.jsonl"),
+            &socket_path,
+        )?;
+        let reloaded = AgentConfig::from_toml_str(&rendered)?;
+
+        assert!(socket_path.parent().expect("admin socket parent").is_dir());
+        assert_eq!(
+            fs::metadata(socket_path.parent().expect("admin socket parent"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(reloaded.admin.enabled);
         Ok(())
     }
 
@@ -1436,6 +1545,9 @@ codec = "zstd"
         assert_eq!(loaded.config.storage.path, default_storage_path());
         assert!(loaded.config.exporters.is_empty());
         assert_eq!(loaded.config.enforcement.mode, EnforcementMode::AuditOnly);
+        assert!(!loaded.config.admin.enabled);
+        assert_eq!(loaded.config.admin.socket_path, default_admin_socket_path());
+        assert!(loaded.source.contains("[admin]"));
         assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
         loaded.config.validate_basic()?;
         Ok(())
@@ -1479,11 +1591,25 @@ kind = "file"
 path = "/tmp/enforcement-policy.toml"
 "#;
         }
+        if matches!(
+            field,
+            FieldId::AdminEnabled | FieldId::AdminSocketPath | FieldId::AdminPrometheusEnabled
+        ) {
+            return r#"
+agent_id = "probe"
+config_version = "local"
+
+[admin]
+enabled = false
+socket_path = "/tmp/tui-admin.sock"
+"#;
+        }
         field_persistence_base_source()
     }
 
     fn field_persistence_text_value(field: FieldId) -> String {
         match field {
+            FieldId::AdminSocketPath => "/tmp/tui-admin-edited.sock".to_string(),
             FieldId::ExporterWebhookEndpoint(_) => "http://127.0.0.1:18080/events".to_string(),
             FieldId::ExporterFilePath(_) => "/tmp/tui-events.jsonl".to_string(),
             FieldId::ExporterUnixSocketPath(_) => "/tmp/tui-export.sock".to_string(),

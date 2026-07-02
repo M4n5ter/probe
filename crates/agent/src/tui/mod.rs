@@ -1,5 +1,6 @@
 mod app;
 mod config_edit;
+mod controls;
 mod fields;
 mod hit;
 mod processes;

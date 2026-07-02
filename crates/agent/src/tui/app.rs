@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use probe_config::AgentConfig;
 
+use super::controls::{ControlId, FocusTarget, focus_targets_for_tab};
 use super::fields::{
-    FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value, field_value,
-    fields_for_tab,
+    FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
 };
 use super::hit::HitTarget;
 use super::processes::ProcessCatalog;
@@ -204,8 +204,8 @@ impl TuiApp {
         self.active_tab
     }
 
-    pub(crate) fn selected_field(&self) -> Option<FieldId> {
-        self.fields_for_active_tab()
+    pub(crate) fn selected_focus_target(&self) -> Option<FocusTarget> {
+        self.focus_targets_for_active_tab()
             .get(self.selected_field_index)
             .copied()
     }
@@ -304,12 +304,12 @@ impl TuiApp {
         self.clamp_selection();
     }
 
-    pub(crate) fn fields_for_active_tab(&self) -> Vec<FieldId> {
-        fields_for_tab(self.active_tab, &self.config)
+    pub(crate) fn focus_targets_for_active_tab(&self) -> Vec<FocusTarget> {
+        focus_targets_for_tab(self.active_tab, &self.config)
     }
 
-    pub(crate) fn field_value(&self, field: FieldId) -> String {
-        field_value(&self.config, field, self.selected_process_name())
+    pub(crate) fn focus_target_value(&self, target: FocusTarget) -> String {
+        target.value(&self.config, self.selected_process_name())
     }
 
     pub(crate) fn selected_process_name(&self) -> Option<&str> {
@@ -326,6 +326,10 @@ impl TuiApp {
                 self.select_field(field);
                 return self.adjust_selected(1);
             }
+            HitTarget::Control(control) => {
+                self.select_control(control);
+                return self.activate_control(control, 1);
+            }
             HitTarget::TextEditSubmit | HitTarget::TextEditCancel => {}
             HitTarget::Process(index) => self.select_process(index),
             HitTarget::TrafficRow(index) => self.select_traffic_row(index),
@@ -335,7 +339,6 @@ impl TuiApp {
             HitTarget::Reload => {
                 return Some(TuiEffect::ReloadConfig);
             }
-            HitTarget::ReloadRuntimeActions => return Some(TuiEffect::ReloadRuntimeActions),
             HitTarget::Quit => self.should_quit = true,
         }
         None
@@ -349,9 +352,19 @@ impl TuiApp {
 
     fn select_field(&mut self, field: FieldId) {
         if let Some(index) = self
-            .fields_for_active_tab()
+            .focus_targets_for_active_tab()
             .iter()
-            .position(|candidate| *candidate == field)
+            .position(|candidate| *candidate == FocusTarget::Field(field))
+        {
+            self.selected_field_index = index;
+        }
+    }
+
+    fn select_control(&mut self, control: ControlId) {
+        if let Some(index) = self
+            .focus_targets_for_active_tab()
+            .iter()
+            .position(|candidate| *candidate == FocusTarget::Control(control))
         {
             self.selected_field_index = index;
         }
@@ -370,15 +383,15 @@ impl TuiApp {
             self.move_process(delta);
             return;
         }
-        if self.active_tab == TuiTab::Traffic {
+        if self.active_tab == TuiTab::Traffic && self.focus_targets_for_active_tab().is_empty() {
             self.move_traffic(delta);
             return;
         }
-        let fields = self.fields_for_active_tab();
-        if fields.is_empty() {
+        let targets = self.focus_targets_for_active_tab();
+        if targets.is_empty() {
             return;
         }
-        self.selected_field_index = offset_index(self.selected_field_index, fields.len(), delta);
+        self.selected_field_index = offset_index(self.selected_field_index, targets.len(), delta);
     }
 
     fn move_process(&mut self, delta: isize) {
@@ -434,10 +447,10 @@ impl TuiApp {
     }
 
     fn adjust_selected(&mut self, direction: isize) -> Option<TuiEffect> {
-        if self.active_tab == TuiTab::Runtime {
-            return (direction > 0).then_some(TuiEffect::ReloadRuntimeActions);
-        }
-        let field = self.selected_field()?;
+        let field = match self.selected_focus_target()? {
+            FocusTarget::Field(field) => field,
+            FocusTarget::Control(control) => return self.activate_control(control, direction),
+        };
         if editable_text_value(&self.config, field).is_some() {
             self.begin_text_edit(field);
             return None;
@@ -459,6 +472,29 @@ impl TuiApp {
             FieldApplyOutcome::Unchanged => {}
         }
         None
+    }
+
+    fn activate_control(&mut self, control: ControlId, direction: isize) -> Option<TuiEffect> {
+        if direction <= 0 {
+            return None;
+        }
+        match control {
+            ControlId::EnableAdmin => {
+                self.enable_admin();
+                None
+            }
+            ControlId::ReloadRuntimeActions => Some(TuiEffect::ReloadRuntimeActions),
+        }
+    }
+
+    fn enable_admin(&mut self) {
+        if self.config.admin.enabled {
+            return;
+        }
+        match apply_field(&mut self.config, FieldId::AdminEnabled, 1, None) {
+            FieldApplyOutcome::Changed(message) => self.mark_dirty(message),
+            FieldApplyOutcome::MissingProcessSelector | FieldApplyOutcome::Unchanged => {}
+        }
     }
 
     fn begin_text_edit(&mut self, field: FieldId) {
@@ -566,9 +602,9 @@ impl TuiApp {
     }
 
     fn clamp_selection(&mut self) {
-        let fields = self.fields_for_active_tab();
-        if self.selected_field_index >= fields.len() {
-            self.selected_field_index = fields.len().saturating_sub(1);
+        let targets = self.focus_targets_for_active_tab();
+        if self.selected_field_index >= targets.len() {
+            self.selected_field_index = targets.len().saturating_sub(1);
         }
         let process_count = self.processes.entries().len();
         if self.selected_process_index >= process_count {
@@ -604,7 +640,10 @@ mod tests {
     };
 
     use super::{
-        super::processes::{ProcessCatalog, ProcessEntry},
+        super::{
+            controls::{ControlId, FocusTarget},
+            processes::{ProcessCatalog, ProcessEntry},
+        },
         *,
     };
 
@@ -697,7 +736,10 @@ mod tests {
             AgentConfig::default(),
             ProcessCatalog::default(),
         );
-        assert_eq!(app.field_value(FieldId::CaptureSelection), "auto");
+        assert_eq!(
+            app.focus_target_value(FocusTarget::Field(FieldId::CaptureSelection)),
+            "auto"
+        );
         app.select_tab(TuiTab::Capture);
 
         app.handle_action(TuiAction::NextValue);
@@ -735,19 +777,39 @@ mod tests {
     fn runtime_reload_action_shares_keyboard_and_mouse_action_path() {
         let mut keyboard_app = test_app();
         keyboard_app.select_tab(TuiTab::Runtime);
+        keyboard_app.handle_action(TuiAction::MoveDown);
+        keyboard_app.handle_action(TuiAction::MoveDown);
+        keyboard_app.handle_action(TuiAction::MoveDown);
         let keyboard_effect = keyboard_app.handle_action(TuiAction::NextValue);
         let left_effect = keyboard_app.handle_action(TuiAction::PreviousValue);
 
         let mut mouse_app = test_app();
         mouse_app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Runtime)));
-        let mouse_effect =
-            mouse_app.handle_action(TuiAction::Click(HitTarget::ReloadRuntimeActions));
+        let mouse_effect = mouse_app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::ReloadRuntimeActions,
+        )));
 
         assert_eq!(keyboard_effect, Some(TuiEffect::ReloadRuntimeActions));
         assert_eq!(mouse_effect, Some(TuiEffect::ReloadRuntimeActions));
         assert_eq!(left_effect, None);
         assert!(!keyboard_app.dirty());
         assert!(!mouse_app.dirty());
+    }
+
+    #[test]
+    fn traffic_admin_enable_shares_keyboard_and_mouse_action_path() {
+        let mut keyboard_app = test_app();
+        keyboard_app.select_tab(TuiTab::Traffic);
+        keyboard_app.handle_action(TuiAction::NextValue);
+
+        let mut mouse_app = test_app();
+        mouse_app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
+        mouse_app.handle_action(TuiAction::Click(HitTarget::Control(ControlId::EnableAdmin)));
+
+        assert!(keyboard_app.config.admin.enabled);
+        assert_eq!(keyboard_app.config.admin, mouse_app.config.admin);
+        assert!(keyboard_app.dirty());
+        assert!(mouse_app.dirty());
     }
 
     #[test]

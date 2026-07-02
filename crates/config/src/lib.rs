@@ -87,6 +87,7 @@ pub use model::{
     TransparentInterceptionProxyIntent, TransparentInterceptionProxyIntentViolation,
     TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
     TransparentInterceptionStrategyConfig, TransparentInterceptionStrategyDescriptor,
-    default_config_path, default_export_file_path, default_export_unix_http_socket_path,
-    default_storage_path, has_enabled_remote_policy_bundle_source, probe_home, probe_home_path,
+    default_admin_socket_path, default_config_path, default_export_file_path,
+    default_export_unix_http_socket_path, default_storage_path,
+    has_enabled_remote_policy_bundle_source, probe_home, probe_home_path,
 };
