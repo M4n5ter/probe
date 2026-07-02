@@ -1,10 +1,10 @@
 use serde::Serialize;
 
+#[cfg(test)]
+use super::case::E2eRequirementMetadata;
 use super::{
-    capability::{
-        E2eCapabilityInventoryRow, capability_ids, inventory_rows as capability_inventory_rows,
-    },
-    case::{E2eCase, E2eRequirement, cases},
+    capability::{E2eCapabilityInventoryRow, inventory_rows as capability_inventory_rows},
+    case::{E2eCaseMetadata, cases},
     profile::{capability_ids_for_cases, profiles, requirement_ids, select_profile_cases},
 };
 
@@ -14,7 +14,7 @@ pub(in crate::e2e::suite) fn inventory() -> Result<E2eInventory, String> {
     Ok(E2eInventory {
         schema_version: E2E_INVENTORY_SCHEMA_VERSION,
         capabilities: capability_inventory_rows(),
-        cases: cases().iter().map(E2eInventoryCase::from_case).collect(),
+        cases: cases().iter().map(E2eCaseMetadata::from_case).collect(),
         profiles: profile_inventory_rows()?,
     })
 }
@@ -23,42 +23,8 @@ pub(in crate::e2e::suite) fn inventory() -> Result<E2eInventory, String> {
 pub(in crate::e2e::suite) struct E2eInventory {
     pub(super) schema_version: u16,
     pub(super) capabilities: Vec<E2eCapabilityInventoryRow>,
-    pub(super) cases: Vec<E2eInventoryCase>,
+    pub(super) cases: Vec<E2eCaseMetadata>,
     pub(super) profiles: Vec<E2eProfileInventoryRow>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(super) struct E2eInventoryCase {
-    pub(super) name: &'static str,
-    pub(super) requirement: E2eInventoryRequirement,
-    pub(super) capabilities: Vec<&'static str>,
-}
-
-impl E2eInventoryCase {
-    fn from_case(case: &E2eCase) -> Self {
-        Self {
-            name: case.name,
-            requirement: E2eInventoryRequirement::from_requirement(case.requirement),
-            capabilities: capability_ids(case.capabilities),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub(super) struct E2eInventoryRequirement {
-    pub(super) id: &'static str,
-    pub(super) label: &'static str,
-    pub(super) privileged: bool,
-}
-
-impl E2eInventoryRequirement {
-    fn from_requirement(requirement: E2eRequirement) -> Self {
-        Self {
-            id: requirement.id(),
-            label: requirement.label(),
-            privileged: requirement.is_privileged(),
-        }
-    }
 }
 
 fn profile_inventory_rows() -> Result<Vec<E2eProfileInventoryRow>, String> {
@@ -124,7 +90,7 @@ mod tests {
                 .find(|case| case.name == "e2e-replay")
                 .expect("replay case should be in inventory")
                 .requirement,
-            E2eInventoryRequirement {
+            E2eRequirementMetadata {
                 id: "user",
                 label: "user",
                 privileged: false,

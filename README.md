@@ -111,7 +111,8 @@ cargo run -p xtask --locked -- validate-local
 Run the non-privileged E2E baseline:
 
 ```bash
-cargo run -p xtask --locked -- e2e-suite --profile baseline
+cargo run -p xtask --locked -- e2e-suite --profile baseline \
+  --report-json target/probe-e2e/baseline.json
 ```
 
 For real collector or policy rollout, start with [Minimal Policy And Webhook Wiring](#minimal-policy-and-webhook-wiring).
@@ -1158,6 +1159,22 @@ cargo run -p xtask --locked -- e2e-suite --inventory-json
 union, description, and expanded case list. `--inventory-json` exposes schema
 version 2 from the same registry: capability catalog entries include category
 metadata, and per-case plus per-profile coverage are derived from one source.
+Use `--report-json <path>` on a suite run to persist the actual run result,
+including each selected case, status, duration, requirement, and capability IDs.
+The run report is schema version 1 and has this stable shape:
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | Report schema version. |
+| `selection` | Requested suite selection, including `kind`, optional `profile`, and explicit case names for `cases` selections. |
+| `summary` | Suite status, total case count, status counters, and `duration_ms`. |
+| `cases[]` | Case metadata from the registry plus run `status`, `duration_ms`, and optional `skip_reason`. |
+
+`selection.kind` is `default_profile`, `include_privileged`,
+`only_privileged`, `cases`, or `profile`. Suite status is `passed`,
+`completed_with_skips`, or `failed`. Case status is `passed`, `skipped`,
+`failed`, or `not_run`; `skip_reason` appears only for skipped cases. Durations
+are integer milliseconds.
 
 Run the single-machine validation path:
 
@@ -1168,7 +1185,8 @@ cargo run -p xtask --locked -- validate-local
 Run the non-privileged baseline:
 
 ```bash
-cargo run -p xtask --locked -- e2e-suite --profile baseline
+cargo run -p xtask --locked -- e2e-suite --profile baseline \
+  --report-json target/probe-e2e/baseline.json
 ```
 
 Run privileged profiles in an isolated development environment:

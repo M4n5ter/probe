@@ -5143,6 +5143,22 @@ benchmark 参数：
 本文档只维护稳定的能力覆盖解释，不维护第二份 case/profile 清单。
 `--inventory-json` 从同一个 suite registry 输出 schema version 2、带 category metadata 的
 capability catalog、per-case coverage 和 per-profile coverage。CI、发布检查和文档生成应消费该 JSON。
+`e2e-suite` 运行命令可带 `--report-json <path>` 输出 schema version 1 的运行报告。
+该报告证明一次实际验收运行，不替代静态 inventory。
+
+运行报告契约：
+
+| 字段 | 语义 |
+| --- | --- |
+| `schema_version` | 固定为运行报告 schema version。 |
+| `selection` | 请求的 suite selection，包括 `kind`、可选 `profile`，以及显式 case selection 的 `cases`。 |
+| `summary` | suite status、case 总数、各 status 计数和 `duration_ms`。 |
+| `cases[]` | 来自 registry 的 case metadata，加上运行 `status`、`duration_ms` 和可选 `skip_reason`。 |
+
+`selection.kind` 取值为 `default_profile`、`include_privileged`、`only_privileged`、
+`cases`、`profile`。Suite status 取值为 `passed`、`completed_with_skips`、`failed`。Case status 取值为
+`passed`、`skipped`、`failed`、`not_run`；`skip_reason` 只在 skipped case 出现。
+`duration_ms` 为整数毫秒。
 
 | 验证面 | 代表入口 | 权限 | 证明内容 | 不证明 |
 | --- | --- | --- | --- | --- |
@@ -6270,6 +6286,9 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
   - 列出命名验证 profile、权限需求、profile capability coverage 和展开后的 case 列表。
 - `cargo run -p xtask --locked -- e2e-suite --profile <name>`
   - 运行一个命名 profile。
+- `cargo run -p xtask --locked -- e2e-suite --profile <name> --report-json <path>`
+  - 运行 profile 并输出机器可读验收报告。
+  - 失败时报告会记录失败 case，并把尚未执行的后续 case 标记为 `not_run`。
 - `cargo run -p xtask --locked -- e2e-suite --case <name>`
   - 定向运行一个或多个 case。
   - case 名称与原 `e2e-*` 命令一致。

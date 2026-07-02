@@ -1,6 +1,8 @@
 use std::process::ExitCode;
 
-use super::capability::{E2eCapability, capability_summary};
+use serde::Serialize;
+
+use super::capability::{E2eCapability, capability_ids, capability_summary};
 use crate::e2e::{
     E2eOutcome,
     admin_enforcement_reload::{
@@ -97,7 +99,7 @@ impl E2eRequirement {
         }
     }
 
-    pub(super) fn id(self) -> &'static str {
+    pub(in crate::e2e::suite) fn id(self) -> &'static str {
         match self {
             Self::User => "user",
             Self::RootCapNetRaw => "root_cap_net_raw",
@@ -118,6 +120,40 @@ pub(in crate::e2e::suite) struct E2eCase {
 impl E2eCase {
     pub(in crate::e2e::suite) fn capability_summary(&self) -> String {
         capability_summary(self.capabilities)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(in crate::e2e::suite) struct E2eCaseMetadata {
+    pub(in crate::e2e::suite) name: &'static str,
+    pub(in crate::e2e::suite) requirement: E2eRequirementMetadata,
+    pub(in crate::e2e::suite) capabilities: Vec<&'static str>,
+}
+
+impl E2eCaseMetadata {
+    pub(in crate::e2e::suite) fn from_case(case: &E2eCase) -> Self {
+        Self {
+            name: case.name,
+            requirement: E2eRequirementMetadata::from_requirement(case.requirement),
+            capabilities: capability_ids(case.capabilities),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(in crate::e2e::suite) struct E2eRequirementMetadata {
+    pub(in crate::e2e::suite) id: &'static str,
+    pub(in crate::e2e::suite) label: &'static str,
+    pub(in crate::e2e::suite) privileged: bool,
+}
+
+impl E2eRequirementMetadata {
+    fn from_requirement(requirement: E2eRequirement) -> Self {
+        Self {
+            id: requirement.id(),
+            label: requirement.label(),
+            privileged: requirement.is_privileged(),
+        }
     }
 }
 

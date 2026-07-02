@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use serde::Serialize;
+
 use super::case::{E2E_CASES, E2eCase, case_by_name};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +23,9 @@ pub(in crate::e2e::suite) enum E2eProfileId {
     LinuxArtifacts,
     Product,
 }
+
+const DEFAULT_PROFILE_ID: E2eProfileId = E2eProfileId::Baseline;
+const INCLUDE_PRIVILEGED_PROFILE_ID: E2eProfileId = E2eProfileId::Product;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct E2eProfile {
@@ -158,8 +163,8 @@ pub(in crate::e2e::suite) fn select_cases(
     selection: &SuiteSelection,
 ) -> Result<Vec<&'static E2eCase>, String> {
     match selection {
-        SuiteSelection::Default => select_profile_cases(E2eProfileId::Baseline),
-        SuiteSelection::IncludePrivileged => select_profile_cases(E2eProfileId::Product),
+        SuiteSelection::Default => select_profile_cases(DEFAULT_PROFILE_ID),
+        SuiteSelection::IncludePrivileged => select_profile_cases(INCLUDE_PRIVILEGED_PROFILE_ID),
         SuiteSelection::OnlyPrivileged => Ok(E2E_CASES
             .iter()
             .filter(|case| case.requirement.is_privileged())
@@ -179,12 +184,77 @@ pub(in crate::e2e::suite) fn select_cases(
     }
 }
 
+pub(in crate::e2e::suite) fn describe_selection(
+    selection: &SuiteSelection,
+) -> SuiteSelectionDescriptor {
+    match selection {
+        SuiteSelection::Default => SuiteSelectionDescriptor::profile(
+            SuiteSelectionKind::DefaultProfile,
+            DEFAULT_PROFILE_ID,
+        ),
+        SuiteSelection::IncludePrivileged => SuiteSelectionDescriptor::profile(
+            SuiteSelectionKind::IncludePrivileged,
+            INCLUDE_PRIVILEGED_PROFILE_ID,
+        ),
+        SuiteSelection::OnlyPrivileged => SuiteSelectionDescriptor {
+            kind: SuiteSelectionKind::OnlyPrivileged,
+            profile: None,
+            cases: Vec::new(),
+        },
+        SuiteSelection::Cases(cases) => SuiteSelectionDescriptor {
+            kind: SuiteSelectionKind::Cases,
+            profile: None,
+            cases: cases.iter().cloned().collect(),
+        },
+        SuiteSelection::Profile(profile_id) => {
+            SuiteSelectionDescriptor::profile(SuiteSelectionKind::Profile, *profile_id)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(in crate::e2e::suite) struct SuiteSelectionDescriptor {
+    kind: SuiteSelectionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cases: Vec<String>,
+}
+
+impl SuiteSelectionDescriptor {
+    fn profile(kind: SuiteSelectionKind, profile_id: E2eProfileId) -> Self {
+        Self {
+            kind,
+            profile: Some(profile_name(profile_id)),
+            cases: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SuiteSelectionKind {
+    DefaultProfile,
+    IncludePrivileged,
+    OnlyPrivileged,
+    Cases,
+    Profile,
+}
+
 pub(in crate::e2e::suite) fn profile_id_by_name(name: &str) -> Result<E2eProfileId, String> {
     E2E_PROFILES
         .iter()
         .find(|profile| profile.name == name)
         .map(|profile| profile.id)
         .ok_or_else(|| format!("unknown e2e profile `{name}`"))
+}
+
+pub(in crate::e2e::suite) fn profile_name(profile_id: E2eProfileId) -> &'static str {
+    E2E_PROFILES
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .map(|profile| profile.name)
+        .expect("profile id must be registered")
 }
 
 pub(super) fn select_profile_cases(

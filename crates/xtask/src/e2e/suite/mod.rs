@@ -1,13 +1,16 @@
 use std::{
     collections::BTreeSet,
+    path::{Path, PathBuf},
     process::ExitCode,
     time::{Duration, Instant},
 };
 
 mod registry;
+mod report;
 
 use super::E2eOutcome;
 use registry::{E2eCase, SuiteSelection};
+use report::{E2eCaseRunReport, E2eSuiteRunReport, write_report};
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
     let action = match SuiteAction::parse(args) {
@@ -33,8 +36,8 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         SuiteAction::InventoryJson => print_inventory_json(),
-        SuiteAction::Run(selection) => {
-            let selected = match registry::select_cases(&selection) {
+        SuiteAction::Run(request) => {
+            let selected = match registry::select_cases(&request.selection) {
                 Ok(selected) => selected,
                 Err(error) => {
                     eprintln!("{error}");
@@ -42,7 +45,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
                 }
             };
 
-            run_cases(selected)
+            run_cases(selected, &request)
         }
     }
 }
@@ -57,7 +60,7 @@ pub(crate) fn run_case_by_name(name: &str, args: &[String]) -> Option<ExitCode> 
         eprintln!("e2e case `{name}` does not accept arguments");
         return Some(ExitCode::FAILURE);
     }
-    Some(run_cases(vec![case]))
+    Some(run_cases(vec![case], &SuiteRunRequest::default()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,13 +69,28 @@ enum SuiteAction {
     ListCases,
     ListProfiles,
     InventoryJson,
-    Run(SuiteSelection),
+    Run(SuiteRunRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SuiteRunRequest {
+    selection: SuiteSelection,
+    report_json: Option<PathBuf>,
+}
+
+impl SuiteRunRequest {
+    fn default() -> Self {
+        Self {
+            selection: SuiteSelection::Default,
+            report_json: None,
+        }
+    }
 }
 
 impl SuiteAction {
     fn parse(args: &[String]) -> Result<Self, String> {
         match args.first().map(String::as_str) {
-            None => Ok(Self::Run(SuiteSelection::Default)),
+            None => Ok(Self::Run(SuiteRunRequest::default())),
             Some("-h" | "--help") => standalone_action(args, "-h/--help", Self::Help),
             Some("--list") => standalone_action(args, "--list", Self::ListCases),
             Some("--list-profiles") => {
@@ -81,20 +99,20 @@ impl SuiteAction {
             Some("--inventory-json") => {
                 standalone_action(args, "--inventory-json", Self::InventoryJson)
             }
-            Some(_) => SuiteSelection::parse(args).map(Self::Run),
+            Some(_) => SuiteRunRequest::parse(args).map(Self::Run),
         }
     }
 }
 
-impl SuiteSelection {
+impl SuiteRunRequest {
     fn parse(args: &[String]) -> Result<Self, String> {
-        let mut selection = Self::Default;
+        let mut request = Self::default();
         let mut index = 0;
         while index < args.len() {
             match args[index].as_str() {
                 "--include-privileged" => {
-                    selection = match selection {
-                        Self::Default => Self::IncludePrivileged,
+                    request.selection = match request.selection {
+                        SuiteSelection::Default => SuiteSelection::IncludePrivileged,
                         _ => {
                             return Err(
                                 "--include-privileged cannot be combined with --profile, --case, or --only-privileged"
@@ -104,8 +122,8 @@ impl SuiteSelection {
                     };
                 }
                 "--only-privileged" => {
-                    selection = match selection {
-                        Self::Default => Self::OnlyPrivileged,
+                    request.selection = match request.selection {
+                        SuiteSelection::Default => SuiteSelection::OnlyPrivileged,
                         _ => {
                             return Err(
                                 "--only-privileged cannot be combined with --profile, --case, or --include-privileged"
@@ -116,8 +134,10 @@ impl SuiteSelection {
                 }
                 "--profile" => {
                     let name = option_value(args, index, "--profile", "an e2e profile name")?;
-                    selection = match selection {
-                        Self::Default => Self::Profile(registry::profile_id_by_name(name)?),
+                    request.selection = match request.selection {
+                        SuiteSelection::Default => {
+                            SuiteSelection::Profile(registry::profile_id_by_name(name)?)
+                        }
                         _ => {
                             return Err(
                                 "--profile cannot be combined with --case, --include-privileged, or --only-privileged"
@@ -129,13 +149,13 @@ impl SuiteSelection {
                 }
                 "--case" => {
                     let name = option_value(args, index, "--case", "an e2e case name")?;
-                    match &mut selection {
-                        Self::Default => {
+                    match &mut request.selection {
+                        SuiteSelection::Default => {
                             let mut names = BTreeSet::new();
                             names.insert(name.to_string());
-                            selection = Self::Cases(names);
+                            request.selection = SuiteSelection::Cases(names);
                         }
-                        Self::Cases(names) => {
+                        SuiteSelection::Cases(names) => {
                             names.insert(name.to_string());
                         }
                         _ => {
@@ -145,6 +165,14 @@ impl SuiteSelection {
                             );
                         }
                     }
+                    index += 1;
+                }
+                "--report-json" => {
+                    let path = option_value(args, index, "--report-json", "a report path")?;
+                    if request.report_json.is_some() {
+                        return Err("--report-json cannot be specified more than once".to_string());
+                    }
+                    request.report_json = Some(PathBuf::from(path));
                     index += 1;
                 }
                 "-h" | "--help" => {
@@ -174,7 +202,7 @@ impl SuiteSelection {
             index += 1;
         }
 
-        Ok(selection)
+        Ok(request)
     }
 }
 
@@ -207,7 +235,7 @@ fn standalone_action(
     }
 }
 
-fn run_cases(cases: Vec<&'static E2eCase>) -> ExitCode {
+fn run_cases(cases: Vec<&'static E2eCase>, request: &SuiteRunRequest) -> ExitCode {
     if cases.is_empty() {
         eprintln!("e2e suite selected no cases");
         return ExitCode::FAILURE;
@@ -217,6 +245,7 @@ fn run_cases(cases: Vec<&'static E2eCase>) -> ExitCode {
     let started_at = Instant::now();
     let mut passed = 0_usize;
     let mut skipped = 0_usize;
+    let mut case_reports = Vec::new();
     for (index, case) in cases.iter().enumerate() {
         println!(
             "[{}/{}] {} ({})",
@@ -228,49 +257,85 @@ fn run_cases(cases: Vec<&'static E2eCase>) -> ExitCode {
         let case_started_at = Instant::now();
         match case.run.run() {
             E2eOutcome::Passed => {
+                let elapsed = case_started_at.elapsed();
                 passed += 1;
                 println!(
                     "[{}/{}] {} passed in {}",
                     index + 1,
                     cases.len(),
                     case.name,
-                    format_duration(case_started_at.elapsed())
+                    format_duration(elapsed)
                 );
+                case_reports.push(E2eCaseRunReport::passed(case, elapsed));
             }
             E2eOutcome::Skipped(reason) => {
+                let elapsed = case_started_at.elapsed();
                 skipped += 1;
                 println!(
                     "[{}/{}] {} skipped in {}: {}",
                     index + 1,
                     cases.len(),
                     case.name,
-                    format_duration(case_started_at.elapsed()),
+                    format_duration(elapsed),
                     reason
                 );
+                case_reports.push(E2eCaseRunReport::skipped(case, elapsed, reason));
             }
             E2eOutcome::Failed => {
+                let elapsed = case_started_at.elapsed();
                 eprintln!(
                     "e2e suite failed at {} after {}",
                     case.name,
-                    format_duration(case_started_at.elapsed())
+                    format_duration(elapsed)
                 );
-                return ExitCode::FAILURE;
+                case_reports.push(E2eCaseRunReport::failed(case, elapsed));
+                for not_run in cases.iter().skip(index + 1) {
+                    case_reports.push(E2eCaseRunReport::not_run(not_run));
+                }
+                let report =
+                    E2eSuiteRunReport::new(&request.selection, case_reports, started_at.elapsed());
+                return finish_run(request.report_json.as_deref(), report, ExitCode::FAILURE);
             }
         }
     }
 
+    let elapsed = started_at.elapsed();
     if skipped == 0 {
         println!(
             "e2e suite passed: {passed} passed in {}",
-            format_duration(started_at.elapsed())
+            format_duration(elapsed)
         );
     } else {
         println!(
             "e2e suite completed with skips: {passed} passed, {skipped} skipped in {}",
-            format_duration(started_at.elapsed())
+            format_duration(elapsed)
         );
     }
-    ExitCode::SUCCESS
+    let report = E2eSuiteRunReport::new(&request.selection, case_reports, elapsed);
+    finish_run(request.report_json.as_deref(), report, ExitCode::SUCCESS)
+}
+
+fn finish_run(
+    report_path: Option<&Path>,
+    report: E2eSuiteRunReport,
+    exit_code: ExitCode,
+) -> ExitCode {
+    let Some(path) = report_path else {
+        return exit_code;
+    };
+    match write_report(path, &report) {
+        Ok(()) => {
+            println!("wrote e2e suite report {}", path.display());
+            exit_code
+        }
+        Err(error) => {
+            eprintln!(
+                "failed to write e2e suite report {}: {error}",
+                path.display()
+            );
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn print_cases() {
@@ -314,7 +379,7 @@ fn print_inventory_json() -> ExitCode {
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -p xtask -- e2e-suite [--list | --list-profiles | --inventory-json | --profile <name> | --include-privileged | --only-privileged | --case <name> ...]"
+        "usage: cargo run -p xtask -- e2e-suite [--list | --list-profiles | --inventory-json | [--profile <name> | --include-privileged | --only-privileged | --case <name> ...] [--report-json <path>]]"
     );
 }
 
@@ -328,15 +393,19 @@ fn format_duration(duration: Duration) -> String {
 mod tests {
     use super::*;
 
-    fn parse_selection(args: &[&str]) -> SuiteSelection {
+    fn parse_run(args: &[&str]) -> SuiteRunRequest {
         let args = args
             .iter()
             .map(|arg| (*arg).to_string())
             .collect::<Vec<_>>();
         match SuiteAction::parse(&args).expect("suite action should parse") {
-            SuiteAction::Run(selection) => selection,
+            SuiteAction::Run(request) => request,
             action => panic!("expected run action, got {action:?}"),
         }
+    }
+
+    fn parse_selection(args: &[&str]) -> SuiteSelection {
+        parse_run(args).selection
     }
 
     fn parse_error(args: &[&str]) -> String {
@@ -472,6 +541,53 @@ mod tests {
         let error = parse_error(&["--profile", "baseline", "--profile", "live-core"]);
 
         assert!(error.contains("--profile cannot be combined"));
+    }
+
+    #[test]
+    fn parses_report_json_with_profile_selection() {
+        let request = parse_run(&[
+            "--profile",
+            "baseline",
+            "--report-json",
+            "target/e2e/baseline.json",
+        ]);
+
+        assert_eq!(
+            request.selection,
+            SuiteSelection::Profile(
+                registry::profile_id_by_name("baseline").expect("baseline profile should exist")
+            )
+        );
+        assert_eq!(
+            request.report_json,
+            Some(PathBuf::from("target/e2e/baseline.json"))
+        );
+    }
+
+    #[test]
+    fn parses_report_json_before_case_selection() {
+        let request = parse_run(&[
+            "--report-json",
+            "target/e2e/cases.json",
+            "--case",
+            "e2e-plaintext-feed",
+        ]);
+
+        assert_eq!(
+            request.report_json,
+            Some(PathBuf::from("target/e2e/cases.json"))
+        );
+        assert_eq!(
+            selected_names(&request.selection),
+            vec!["e2e-plaintext-feed"]
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_report_json() {
+        let error = parse_error(&["--report-json", "a.json", "--report-json", "b.json"]);
+
+        assert!(error.contains("--report-json cannot be specified more than once"));
     }
 
     #[test]
