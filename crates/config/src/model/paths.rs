@@ -58,6 +58,26 @@ pub fn default_admin_socket_path() -> PathBuf {
     probe_home_path("run/admin.sock")
 }
 
+pub fn default_enforcement_policy_path() -> PathBuf {
+    probe_home_path("policy/enforcement.toml")
+}
+
+pub fn default_mitm_plaintext_bridge_path() -> PathBuf {
+    probe_home_path("mitm/feed.jsonl")
+}
+
+pub fn default_mitm_tls_root() -> PathBuf {
+    probe_home_path("tls")
+}
+
+pub fn default_mitm_ca_certificate_path() -> PathBuf {
+    default_mitm_tls_root().join("mitm-ca.pem")
+}
+
+pub fn default_mitm_ca_private_key_path() -> PathBuf {
+    default_mitm_tls_root().join("mitm-ca.key")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

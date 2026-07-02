@@ -367,6 +367,7 @@ mod tests {
         let capture = CaptureStatusSnapshot {
             selection: CaptureSelection::Auto,
             selected_backend: Some(CaptureBackend::Ebpf),
+            selected_input_source: None,
             provider_runtime_mode: Some(RuntimeMode::Available),
             mode: CapturePlanMode::Live,
             reason: None,
@@ -389,6 +390,7 @@ mod tests {
         let capture = CaptureStatusSnapshot {
             selection: CaptureSelection::Auto,
             selected_backend: Some(CaptureBackend::Libpcap),
+            selected_input_source: None,
             provider_runtime_mode: Some(RuntimeMode::Available),
             mode: CapturePlanMode::Live,
             reason: None,

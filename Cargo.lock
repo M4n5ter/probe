@@ -36,6 +36,7 @@ dependencies = [
  "probe-io",
  "proto",
  "ratatui",
+ "rcgen",
  "rtnetlink",
  "runtime",
  "rustix",

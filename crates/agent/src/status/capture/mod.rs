@@ -1,6 +1,6 @@
 use probe_config::{CaptureBackend, CaptureSelection};
 use probe_core::RuntimeMode;
-use runtime::{CaptureEvidenceMode, CapturePlanMode, RuntimePlan};
+use runtime::{CaptureEvidenceMode, CaptureInputSource, CapturePlanMode, RuntimePlan};
 use serde::{Deserialize, Serialize};
 
 use crate::capture_provider::{
@@ -12,6 +12,8 @@ use crate::capture_provider::{
 pub struct CaptureStatusSnapshot {
     pub selection: CaptureSelection,
     pub selected_backend: Option<CaptureBackend>,
+    #[serde(default)]
+    pub selected_input_source: Option<CaptureInputSource>,
     pub provider_runtime_mode: Option<RuntimeMode>,
     pub mode: CapturePlanMode,
     pub reason: Option<String>,
@@ -56,6 +58,7 @@ pub(in crate::status) fn capture_status(
             CaptureStatusSnapshot {
                 selection: plan.capture.selection,
                 selected_backend: Some(runtime.selected_backend),
+                selected_input_source: Some(runtime.selected_input_source),
                 provider_runtime_mode: Some(runtime.provider_runtime_mode),
                 mode: runtime.plan_mode,
                 reason: runtime.reason,
@@ -77,6 +80,7 @@ pub(in crate::status) fn capture_status(
         None => CaptureStatusSnapshot {
             selection: plan.capture.selection,
             selected_backend: plan.capture.selected_backend,
+            selected_input_source: plan.capture.selected_input_source,
             provider_runtime_mode: plan.capture.selected_provider_runtime_mode,
             mode: plan.capture.mode,
             reason: plan.capture.reason.clone(),
@@ -147,6 +151,7 @@ mod tests {
         let plan = auto_plan_with_degraded_ebpf_and_available_libpcap()?;
         let runtime = CaptureProviderRuntimeSnapshot {
             selected_backend: CaptureBackend::Libpcap,
+            selected_input_source: CaptureInputSource::LiveHost,
             plan_mode: CapturePlanMode::Live,
             provider_runtime_mode: RuntimeMode::Available,
             evidence_mode: CaptureEvidenceMode::BestEffort,
@@ -178,6 +183,7 @@ mod tests {
         let plan = auto_plan_with_degraded_ebpf_and_available_libpcap()?;
         let runtime = CaptureProviderRuntimeSnapshot {
             selected_backend: CaptureBackend::Ebpf,
+            selected_input_source: CaptureInputSource::LiveHost,
             plan_mode: CapturePlanMode::Live,
             provider_runtime_mode: RuntimeMode::Degraded,
             evidence_mode: CaptureEvidenceMode::BestEffort,
@@ -251,6 +257,7 @@ mod tests {
         let plan = auto_plan_with_degraded_ebpf_and_available_libpcap()?;
         let runtime = CaptureProviderRuntimeSnapshot {
             selected_backend: CaptureBackend::Ebpf,
+            selected_input_source: CaptureInputSource::LiveHost,
             plan_mode: CapturePlanMode::Live,
             provider_runtime_mode: RuntimeMode::Degraded,
             evidence_mode: CaptureEvidenceMode::BestEffort,

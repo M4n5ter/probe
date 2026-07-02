@@ -6,7 +6,7 @@ use thiserror::Error;
 use probe_config::TransparentInterceptionStrategyConfig;
 use probe_core::{CapabilityKind, RuntimeMode};
 use runtime::{
-    RequiredCapabilityPlan, TransparentInterceptionMitmBackendPlan,
+    CaptureInputSource, RequiredCapabilityPlan, TransparentInterceptionMitmBackendPlan,
     TransparentInterceptionMitmBackendReadinessProbePlan,
     TransparentInterceptionMitmClientTrustPlan, TransparentInterceptionMitmPlaintextBridgePlan,
 };
@@ -142,6 +142,9 @@ impl TrafficRuntimeDiagnostics {
     }
 
     fn selected_backend_label(&self) -> &'static str {
+        if self.capture.selected_input_source == Some(CaptureInputSource::MitmPlaintextBridge) {
+            return "MITM plaintext bridge";
+        }
         self.capture
             .selected_backend
             .map(capture_backend_name)
@@ -777,6 +780,94 @@ mod tests {
             Some(CaptureDiagnosticMessage::Warning(
                 "Capture using libpcap; ebpf failed: permission denied".to_string()
             ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_label_mitm_bridge_capture_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "capture_event_feed",
+                    "selected_input_source": "mitm_plaintext_bridge",
+                    "mode": "capture_event_feed",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": [
+                        {
+                            "backend": "ebpf",
+                            "reason": "object path is not configured"
+                        },
+                        {
+                            "backend": "libpcap",
+                            "reason": "libpcap is not installed"
+                        }
+                    ]
+                },
+                "enforcement": configured_mitm_enforcement_status_json()?
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(false),
+            Some(CaptureDiagnosticMessage::Warning(
+                "Capture using MITM plaintext bridge; ebpf failed: object path is not configured"
+                    .to_string()
+            ))
+        );
+        assert!(
+            diagnostics
+                .detail_lines()
+                .iter()
+                .any(|line| line == "selected: MITM plaintext bridge")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_do_not_label_generic_feed_as_mitm()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "capture_event_feed",
+                    "selected_input_source": "configured_capture_event_feed",
+                    "mode": "capture_event_feed",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": [
+                        {
+                            "backend": "ebpf",
+                            "reason": "object path is not configured"
+                        }
+                    ]
+                },
+                "enforcement": configured_mitm_enforcement_status_json()?
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(false),
+            Some(CaptureDiagnosticMessage::Warning(
+                "Capture using capture_event_feed; ebpf failed: object path is not configured"
+                    .to_string()
+            ))
+        );
+        assert!(
+            diagnostics
+                .detail_lines()
+                .iter()
+                .any(|line| line == "selected: capture_event_feed")
         );
         Ok(())
     }

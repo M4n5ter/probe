@@ -12,7 +12,7 @@ use rustix::process::{Pid, Signal, kill_process};
 use tokio::{process::Command, time::Instant};
 
 use super::{
-    config_edit::{TuiError, ensure_private_directory},
+    config_edit::TuiError, generated_resources::ensure_private_directory,
     runtime_attachment::RuntimeAttachment,
 };
 use crate::admin::{AdminRequest, send_admin_json_request_with_timeout};

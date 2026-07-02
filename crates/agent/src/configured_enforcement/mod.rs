@@ -11,5 +11,5 @@ pub(crate) use runtime::{EnforcementRuntimeState, RuntimeEnforcementPlanner};
 pub(crate) use source::{
     EnforcementPolicySourceInspection, EnforcementPolicySourceLoadContext,
     LoadedEnforcementPolicySource, LoadedEnforcementPolicySourceSnapshot,
-    inspect_enforcement_policy_source,
+    inspect_enforcement_policy_source, validate_enforcement_policy_manifest,
 };

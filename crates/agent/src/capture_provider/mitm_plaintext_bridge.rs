@@ -3,8 +3,8 @@ use std::{fs::File, io::BufReader};
 use capture::{CaptureMultiplexer, CaptureProvider, MultiplexedProvider};
 use probe_config::CaptureBackend;
 use runtime::{
-    CaptureProviderDescriptor, RuntimePlan, TransparentInterceptionMitmBackendPlan,
-    TransparentInterceptionMitmPlaintextBridgePlan,
+    CaptureInputSource, CaptureProviderDescriptor, RuntimePlan,
+    TransparentInterceptionMitmBackendPlan, TransparentInterceptionMitmPlaintextBridgePlan,
 };
 
 use crate::{
@@ -112,6 +112,7 @@ pub(super) fn build_mitm_capture_event_feed_provider_after_live_failures(
         provider,
         runtime: CaptureProviderRuntimeSnapshot {
             selected_backend: CaptureBackend::CaptureEventFeed,
+            selected_input_source: CaptureInputSource::MitmPlaintextBridge,
             plan_mode: descriptor.plan_mode(),
             provider_runtime_mode: descriptor.runtime_mode,
             evidence_mode: descriptor.evidence_mode,
@@ -417,6 +418,10 @@ mod tests {
         assert_eq!(
             built_provider.runtime.selected_backend,
             CaptureBackend::CaptureEventFeed
+        );
+        assert_eq!(
+            built_provider.runtime.selected_input_source,
+            CaptureInputSource::MitmPlaintextBridge
         );
         assert_loss_reason(provider.next()?, "mitm primary");
         assert_eq!(

@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Seek},
     path::Path,
 };
 
@@ -48,7 +48,7 @@ pub struct JsonLinesPlaintextFeedProvider<R> {
 
 impl<R> JsonLinesPlaintextFeedProvider<R>
 where
-    R: BufRead,
+    R: BufRead + Seek,
 {
     fn new(reader: R, path: impl Into<String>) -> Self {
         Self {
@@ -76,7 +76,7 @@ where
 
 impl<R> CaptureProvider for JsonLinesPlaintextFeedProvider<R>
 where
-    R: BufRead,
+    R: BufRead + Seek,
 {
     fn name(&self) -> &'static str {
         PROVIDER_NAME

@@ -87,7 +87,9 @@ pub use export::{
 };
 pub use paths::{
     DEFAULT_PROBE_HOME_STATE_DIR, FALLBACK_PROBE_HOME, PROBE_HOME_ENV, default_admin_socket_path,
-    default_config_path, default_export_file_path, default_export_unix_http_socket_path,
+    default_config_path, default_enforcement_policy_path, default_export_file_path,
+    default_export_unix_http_socket_path, default_mitm_ca_certificate_path,
+    default_mitm_ca_private_key_path, default_mitm_plaintext_bridge_path, default_mitm_tls_root,
     default_storage_path, probe_home, probe_home_path,
 };
 pub use policy::{

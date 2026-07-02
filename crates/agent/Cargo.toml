@@ -46,6 +46,7 @@ crossterm = "0.29"
 ratatui = { version = "0.30", default-features = false, features = ["std", "crossterm_0_29"] }
 toml_edit = { version = "0.25", features = ["serde"] }
 blake3 = "1.8.5"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 [lints]
 workspace = true

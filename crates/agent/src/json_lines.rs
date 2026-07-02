@@ -1,4 +1,4 @@
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Seek, SeekFrom};
 
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -24,12 +24,20 @@ pub(crate) struct JsonLinesReader<R> {
     max_line_bytes: usize,
     line_number: usize,
     line_buffer: Vec<u8>,
+    line_start_offset: u64,
+    last_complete_line: Option<RecordedLine>,
     poisoned: bool,
+}
+
+#[derive(Debug)]
+struct RecordedLine {
+    start_offset: u64,
+    bytes: Vec<u8>,
 }
 
 impl<R> JsonLinesReader<R>
 where
-    R: BufRead,
+    R: BufRead + Seek,
 {
     pub(crate) fn new(
         reader: R,
@@ -44,6 +52,8 @@ where
             max_line_bytes,
             line_number: 0,
             line_buffer: Vec::new(),
+            line_start_offset: 0,
+            last_complete_line: None,
             poisoned: false,
         }
     }
@@ -59,6 +69,17 @@ where
                     source_name: self.source_name.clone(),
                     line: self.line_number.saturating_add(1),
                 });
+            }
+            if eof == JsonLinesEof::Follow {
+                if self.rewind_if_buffered_line_changed()? {
+                    continue;
+                }
+                if self.line_buffer.is_empty() {
+                    self.line_start_offset = self
+                        .reader
+                        .stream_position()
+                        .map_err(|source| self.seek_error(source))?;
+                }
             }
             let line = match read_bounded_line(
                 &mut self.reader,
@@ -79,6 +100,9 @@ where
                 }
             };
             if line.bytes_read == 0 {
+                if eof == JsonLinesEof::Follow && self.rewind_if_past_end()? {
+                    continue;
+                }
                 return Ok(match eof {
                     JsonLinesEof::Finish => JsonLinesRead::Finished,
                     JsonLinesEof::Follow => JsonLinesRead::Idle,
@@ -88,6 +112,9 @@ where
                 return Ok(JsonLinesRead::Idle);
             }
             self.line_number = self.line_number.saturating_add(1);
+            if eof == JsonLinesEof::Follow {
+                self.record_complete_line();
+            }
             if self.line_buffer.iter().all(u8::is_ascii_whitespace) {
                 self.line_buffer.clear();
                 continue;
@@ -112,6 +139,133 @@ where
     #[cfg(test)]
     pub(crate) fn input_mut(&mut self) -> &mut R {
         &mut self.reader
+    }
+
+    fn rewind_if_past_end(&mut self) -> Result<bool, JsonLinesError> {
+        let current = self
+            .reader
+            .stream_position()
+            .map_err(|source| self.seek_error(source))?;
+        let end = self
+            .reader
+            .seek(SeekFrom::End(0))
+            .map_err(|source| self.seek_error(source))?;
+        if current > end {
+            self.reader
+                .seek(SeekFrom::Start(0))
+                .map_err(|source| self.seek_error(source))?;
+            self.line_number = 0;
+            self.line_buffer.clear();
+            self.line_start_offset = 0;
+            self.last_complete_line = None;
+            return Ok(true);
+        }
+        self.reader
+            .seek(SeekFrom::Start(current))
+            .map_err(|source| self.seek_error(source))?;
+        Ok(false)
+    }
+
+    fn rewind_if_buffered_line_changed(&mut self) -> Result<bool, JsonLinesError> {
+        if self.line_buffer.is_empty() {
+            return self.rewind_if_last_complete_line_changed();
+        }
+        let current = self
+            .reader
+            .stream_position()
+            .map_err(|source| self.seek_error(source))?;
+        if current
+            > self
+                .reader
+                .seek(SeekFrom::End(0))
+                .map_err(|source| self.seek_error(source))?
+            || current.saturating_sub(self.line_start_offset)
+                != u64::try_from(self.line_buffer.len()).unwrap_or(u64::MAX)
+        {
+            return self.rewind_after_buffered_line_change();
+        }
+
+        self.reader
+            .seek(SeekFrom::Start(self.line_start_offset))
+            .map_err(|source| self.seek_error(source))?;
+        let mut observed = vec![0; self.line_buffer.len()];
+        let read_result = self.reader.read_exact(&mut observed);
+        self.reader
+            .seek(SeekFrom::Start(current))
+            .map_err(|source| self.seek_error(source))?;
+        match read_result {
+            Ok(()) if observed == self.line_buffer => Ok(false),
+            Ok(()) => self.rewind_after_buffered_line_change(),
+            Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => {
+                self.rewind_after_buffered_line_change()
+            }
+            Err(source) => Err(self.seek_error(source)),
+        }
+    }
+
+    fn rewind_after_buffered_line_change(&mut self) -> Result<bool, JsonLinesError> {
+        self.reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|source| self.seek_error(source))?;
+        self.line_number = 0;
+        self.line_buffer.clear();
+        self.line_start_offset = 0;
+        self.last_complete_line = None;
+        Ok(true)
+    }
+
+    fn rewind_if_last_complete_line_changed(&mut self) -> Result<bool, JsonLinesError> {
+        let Some(recorded) = &self.last_complete_line else {
+            return Ok(false);
+        };
+        let start_offset = recorded.start_offset;
+        let expected = recorded.bytes.clone();
+        let current = self
+            .reader
+            .stream_position()
+            .map_err(|source| self.seek_error(source))?;
+        let changed = self.recorded_bytes_changed(start_offset, &expected, current)?;
+        if changed {
+            return self.rewind_after_buffered_line_change();
+        }
+        Ok(false)
+    }
+
+    fn recorded_bytes_changed(
+        &mut self,
+        start_offset: u64,
+        expected: &[u8],
+        restore_offset: u64,
+    ) -> Result<bool, JsonLinesError> {
+        self.reader
+            .seek(SeekFrom::Start(start_offset))
+            .map_err(|source| self.seek_error(source))?;
+        let mut observed = vec![0; expected.len()];
+        let read_result = self.reader.read_exact(&mut observed);
+        self.reader
+            .seek(SeekFrom::Start(restore_offset))
+            .map_err(|source| self.seek_error(source))?;
+        match read_result {
+            Ok(()) => Ok(observed != expected),
+            Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => Ok(true),
+            Err(source) => Err(self.seek_error(source)),
+        }
+    }
+
+    fn record_complete_line(&mut self) {
+        self.last_complete_line = Some(RecordedLine {
+            start_offset: self.line_start_offset,
+            bytes: self.line_buffer.clone(),
+        });
+    }
+
+    fn seek_error(&self, source: io::Error) -> JsonLinesError {
+        JsonLinesError::ReadLine {
+            label: self.label,
+            source_name: self.source_name.clone(),
+            line: self.line_number.saturating_add(1),
+            source,
+        }
     }
 }
 

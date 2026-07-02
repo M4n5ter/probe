@@ -7,6 +7,9 @@ use super::fields::{
     FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
 };
 use super::hit::HitTarget;
+use super::mitm_setup::{
+    MitmQuickSetupDirection, MitmQuickSetupOutcome, MitmQuickSetupWarning, apply_mitm_quick_setup,
+};
 use super::process_view::ProcessViewState;
 use super::processes::{ProcessCatalog, selector_for_exe_path};
 use super::runtime_attachment::RuntimeAttachment;
@@ -141,6 +144,17 @@ impl StatusMessage {
         Self {
             kind: StatusKind::Error,
             text: text.into(),
+        }
+    }
+}
+
+fn mitm_quick_setup_warning_message(warning: &MitmQuickSetupWarning) -> String {
+    match warning {
+        MitmQuickSetupWarning::MissingProxyExecutable { path } => {
+            format!("MITM proxy executable is missing at {}", path.display())
+        }
+        MitmQuickSetupWarning::UnsupportedOutboundProcessSelector { reason } => {
+            format!("Outbound MITM cannot use the selected process scope yet: {reason}")
         }
     }
 }
@@ -657,6 +671,14 @@ impl TuiApp {
         }
         match control {
             ControlId::ReloadRuntimeActions => Some(TuiEffect::ReloadRuntimeActions),
+            ControlId::ConfigureOutboundMitm => {
+                self.apply_mitm_quick_setup(MitmQuickSetupDirection::Outbound);
+                None
+            }
+            ControlId::ConfigureInboundMitm => {
+                self.apply_mitm_quick_setup(MitmQuickSetupDirection::Inbound);
+                None
+            }
             ControlId::SearchProcesses => {
                 self.begin_process_search();
                 None
@@ -664,6 +686,30 @@ impl TuiApp {
             ControlId::ClearProcessSearch => {
                 self.clear_process_search();
                 None
+            }
+        }
+    }
+
+    fn apply_mitm_quick_setup(&mut self, direction: MitmQuickSetupDirection) {
+        let selected_process_selector = self.selected_process_selector();
+        match apply_mitm_quick_setup(&mut self.config, direction, selected_process_selector) {
+            MitmQuickSetupOutcome::Changed {
+                direction,
+                warnings,
+            } => {
+                self.dirty = true;
+                self.status = if let Some(warning) = warnings.first() {
+                    StatusMessage::warning(mitm_quick_setup_warning_message(warning))
+                } else {
+                    StatusMessage::info(direction.status_message())
+                };
+                self.clamp_selection();
+            }
+            MitmQuickSetupOutcome::Rejected(warning) => {
+                self.status = StatusMessage::warning(mitm_quick_setup_warning_message(&warning));
+            }
+            MitmQuickSetupOutcome::MissingProcessSelector => {
+                self.status = self.process_selector_warning();
             }
         }
     }
@@ -1007,6 +1053,53 @@ mod tests {
         assert!(app.filtered_process_indices().is_empty());
         assert_eq!(app.selected_process_index(), None);
         assert!(app.selected_process_selector().is_none());
+    }
+
+    #[test]
+    fn inbound_mitm_setup_control_uses_selected_process_selector() {
+        let mut app = multi_process_app();
+        app.select_tab(TuiTab::Processes);
+        app.handle_action(TuiAction::Click(HitTarget::Process(1)));
+
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Enforcement)));
+        app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::ConfigureInboundMitm,
+        )));
+
+        assert!(app.dirty());
+        assert!(app.config.enforcement.interception.selector.is_some());
+        assert_eq!(
+            app.config.enforcement.interception.strategy,
+            probe_config::TransparentInterceptionStrategyConfig::InboundTproxyMitm
+        );
+        assert!(
+            app.status()
+                .text
+                .starts_with("MITM proxy executable is missing at")
+        );
+    }
+
+    #[test]
+    fn outbound_mitm_setup_rejects_exe_only_process_selector() {
+        let mut app = multi_process_app();
+        app.select_tab(TuiTab::Processes);
+        app.handle_action(TuiAction::Click(HitTarget::Process(1)));
+
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Enforcement)));
+        app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::ConfigureOutboundMitm,
+        )));
+
+        assert!(!app.dirty());
+        assert_eq!(
+            app.config.enforcement.interception.strategy,
+            probe_config::TransparentInterceptionStrategyConfig::None
+        );
+        assert!(
+            app.status()
+                .text
+                .starts_with("Outbound MITM cannot use the selected process scope yet")
+        );
     }
 
     #[test]

@@ -65,6 +65,7 @@ pub(crate) fn build_capture_provider(
             provider: build_plaintext_feed_provider(plan)?,
             runtime: CaptureProviderRuntimeSnapshot {
                 selected_backend: CaptureBackend::PlaintextFeed,
+                selected_input_source: CaptureInputSource::PlaintextFeed,
                 plan_mode: plan.capture.mode,
                 provider_runtime_mode: RuntimeMode::Available,
                 evidence_mode: plan
@@ -93,6 +94,10 @@ pub(crate) fn build_capture_provider(
                 provider,
                 runtime: CaptureProviderRuntimeSnapshot {
                     selected_backend: CaptureBackend::CaptureEventFeed,
+                    selected_input_source: plan
+                        .capture
+                        .selected_input_source
+                        .unwrap_or(CaptureInputSource::ConfiguredCaptureEventFeed),
                     plan_mode: plan.capture.mode,
                     provider_runtime_mode: RuntimeMode::Available,
                     evidence_mode: plan
@@ -152,6 +157,7 @@ fn build_live_capture_provider(
         provider,
         runtime: CaptureProviderRuntimeSnapshot {
             selected_backend: descriptor.backend,
+            selected_input_source: CaptureInputSource::LiveHost,
             plan_mode: descriptor.plan_mode(),
             provider_runtime_mode: descriptor.runtime_mode,
             evidence_mode: descriptor.evidence_mode,
@@ -474,6 +480,10 @@ mod tests {
         assert_eq!(
             built_provider.runtime.selected_backend,
             CaptureBackend::CaptureEventFeed
+        );
+        assert_eq!(
+            built_provider.runtime.selected_input_source,
+            runtime::CaptureInputSource::MitmPlaintextBridge
         );
         assert_eq!(built_provider.runtime.open_failures.len(), 2);
         assert_eq!(

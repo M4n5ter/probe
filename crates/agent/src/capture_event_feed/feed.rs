@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Seek},
     path::Path,
 };
 
@@ -69,7 +69,7 @@ pub(crate) struct JsonLinesCaptureEventFeedProvider<R> {
 
 impl<R> JsonLinesCaptureEventFeedProvider<R>
 where
-    R: BufRead,
+    R: BufRead + Seek,
 {
     #[cfg(test)]
     fn new(reader: R, path: impl Into<String>, follow: bool) -> Self {
@@ -166,7 +166,7 @@ enum CaptureEventFeedReadError {
 
 impl<R> CaptureProvider for JsonLinesCaptureEventFeedProvider<R>
 where
-    R: BufRead,
+    R: BufRead + Seek,
 {
     fn name(&self) -> &'static str {
         PROVIDER_NAME
@@ -184,7 +184,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{fs, io::Cursor};
 
     use capture::{CaptureProviderKind, CapturedLoss};
     use probe_core::{
@@ -262,6 +262,71 @@ mod tests {
     }
 
     #[test]
+    fn follow_mode_rewinds_when_feed_file_is_truncated() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::NamedTempFile::new()?;
+        let path = temp.path().to_path_buf();
+        fs::write(
+            &path,
+            format!(
+                "{}{}",
+                json_line(&capture_loss_event(100))?,
+                json_line(&capture_loss_event(200))?
+            ),
+        )?;
+        let mut provider = load_capture_event_feed_provider(&path, true)?;
+
+        assert_loss(provider.poll_next()?, 100);
+        assert_loss(provider.poll_next()?, 200);
+        assert!(matches!(provider.poll_next()?, CapturePoll::Idle));
+
+        fs::write(&path, json_line(&capture_loss_event(3))?)?;
+
+        assert_loss(provider.poll_next()?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_mode_drops_buffered_partial_line_after_feed_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::NamedTempFile::new()?;
+        let path = temp.path().to_path_buf();
+        fs::write(&path, "partial")?;
+        let mut provider = load_capture_event_feed_provider(&path, true)?;
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Idle));
+
+        fs::write(&path, json_line(&capture_loss_event(3))?)?;
+
+        assert_loss(provider.poll_next()?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_mode_rewinds_after_clean_eof_feed_restart() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::NamedTempFile::new()?;
+        let path = temp.path().to_path_buf();
+        let old_generation = json_line(&capture_loss_event(100))?;
+        let new_generation = [
+            json_line(&capture_loss_event(3))?,
+            json_line(&capture_loss_event(4))?,
+            json_line(&capture_loss_event(5))?,
+        ]
+        .join("");
+        assert!(new_generation.len() > old_generation.len());
+        fs::write(&path, old_generation)?;
+        let mut provider = load_capture_event_feed_provider(&path, true)?;
+
+        assert_loss(provider.poll_next()?, 100);
+        assert!(matches!(provider.poll_next()?, CapturePoll::Idle));
+
+        fs::write(&path, new_generation)?;
+
+        assert_loss(provider.poll_next()?, 3);
+        Ok(())
+    }
+
+    #[test]
     fn rejects_unknown_capture_event_fields() -> Result<(), Box<dyn std::error::Error>> {
         let mut value = serde_json::to_value(capture_loss_event(1))?;
         value["unexpected"] = serde_json::json!(true);
@@ -335,5 +400,15 @@ mod tests {
 
     fn json_line(event: &CaptureEvent) -> Result<String, serde_json::Error> {
         serde_json::to_string(event).map(|line| format!("{line}\n"))
+    }
+
+    fn assert_loss(poll: CapturePoll, lost_events: u64) {
+        let CapturePoll::Event(event) = poll else {
+            panic!("expected capture event");
+        };
+        let CaptureEvent::Loss(loss) = *event else {
+            panic!("expected loss event");
+        };
+        assert_eq!(loss.loss.lost_events, lost_events);
     }
 }

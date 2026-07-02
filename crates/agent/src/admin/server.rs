@@ -689,6 +689,7 @@ mod tests {
         let capture_runtime = CaptureProviderRuntimeState::default();
         capture_runtime.record(crate::capture_provider::CaptureProviderRuntimeSnapshot {
             selected_backend: CaptureBackend::Replay,
+            selected_input_source: runtime::CaptureInputSource::Replay,
             plan_mode: CapturePlanMode::Replay,
             provider_runtime_mode: RuntimeMode::Available,
             evidence_mode: CaptureEvidenceMode::Nominal,

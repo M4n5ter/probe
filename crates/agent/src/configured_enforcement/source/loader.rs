@@ -418,7 +418,7 @@ async fn fetch_remote_enforcement_policy_manifest_with_timeout(
         .and_then(validate_enforcement_policy_manifest)
 }
 
-fn validate_enforcement_policy_manifest(
+pub(crate) fn validate_enforcement_policy_manifest(
     manifest: EnforcementPolicyManifest,
 ) -> Result<EnforcementPolicyManifest, EnforcementPolicySourceError> {
     if manifest.id.trim().is_empty() {

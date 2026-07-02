@@ -1,9 +1,13 @@
 mod agent;
 mod app;
 mod config_edit;
+mod config_render;
 mod controls;
 mod fields;
+mod generated_resources;
 mod hit;
+mod local_profile;
+mod mitm_setup;
 mod process_view;
 mod processes;
 mod render;

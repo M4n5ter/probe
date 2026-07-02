@@ -71,6 +71,7 @@ mod tests {
         let plan = auto_plan_with_degraded_ebpf_and_available_libpcap()?;
         let runtime = CaptureProviderRuntimeSnapshot {
             selected_backend: CaptureBackend::Libpcap,
+            selected_input_source: runtime::CaptureInputSource::LiveHost,
             plan_mode: CapturePlanMode::Live,
             provider_runtime_mode: RuntimeMode::Available,
             evidence_mode: CaptureEvidenceMode::BestEffort,

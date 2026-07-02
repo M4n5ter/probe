@@ -1623,6 +1623,7 @@ mod tests {
             RuntimeStatusInput {
                 capture: Some(CaptureProviderRuntimeSnapshot {
                     selected_backend: CaptureBackend::Ebpf,
+                    selected_input_source: runtime::CaptureInputSource::LiveHost,
                     plan_mode: CapturePlanMode::Live,
                     provider_runtime_mode: RuntimeMode::Degraded,
                     evidence_mode: CaptureEvidenceMode::BestEffort,
@@ -1757,6 +1758,7 @@ mod tests {
         let capture_runtime = CaptureProviderRuntimeState::default();
         capture_runtime.record(CaptureProviderRuntimeSnapshot {
             selected_backend: CaptureBackend::Ebpf,
+            selected_input_source: runtime::CaptureInputSource::LiveHost,
             plan_mode: CapturePlanMode::Live,
             provider_runtime_mode: RuntimeMode::Degraded,
             evidence_mode: CaptureEvidenceMode::BestEffort,
@@ -1874,6 +1876,7 @@ mod tests {
             RuntimeStatusInput {
                 capture: Some(CaptureProviderRuntimeSnapshot {
                     selected_backend: CaptureBackend::Libpcap,
+                    selected_input_source: runtime::CaptureInputSource::LiveHost,
                     plan_mode: CapturePlanMode::Live,
                     provider_runtime_mode: RuntimeMode::Available,
                     evidence_mode: CaptureEvidenceMode::BestEffort,
@@ -1931,6 +1934,7 @@ mod tests {
             RuntimeStatusInput {
                 capture: Some(CaptureProviderRuntimeSnapshot {
                     selected_backend: CaptureBackend::Ebpf,
+                    selected_input_source: runtime::CaptureInputSource::LiveHost,
                     plan_mode: CapturePlanMode::Live,
                     provider_runtime_mode: RuntimeMode::Degraded,
                     evidence_mode: CaptureEvidenceMode::BestEffort,
@@ -1998,6 +2002,7 @@ mod tests {
             RuntimeStatusInput {
                 capture: Some(CaptureProviderRuntimeSnapshot {
                     selected_backend: CaptureBackend::Ebpf,
+                    selected_input_source: runtime::CaptureInputSource::LiveHost,
                     plan_mode: CapturePlanMode::Live,
                     provider_runtime_mode: RuntimeMode::Degraded,
                     evidence_mode: CaptureEvidenceMode::BestEffort,

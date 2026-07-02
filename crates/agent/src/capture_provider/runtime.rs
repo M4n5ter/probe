@@ -11,7 +11,7 @@ use capture::{
 };
 use probe_config::CaptureBackend;
 use probe_core::{CaptureProviderKind, RuntimeMode};
-use runtime::{CaptureEvidenceMode, CapturePlanMode};
+use runtime::{CaptureEvidenceMode, CaptureInputSource, CapturePlanMode};
 use serde::Serialize;
 
 use super::activity::{
@@ -22,6 +22,7 @@ use super::activity::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CaptureProviderRuntimeSnapshot {
     pub(crate) selected_backend: CaptureBackend,
+    pub(crate) selected_input_source: CaptureInputSource,
     pub(crate) plan_mode: CapturePlanMode,
     pub(crate) provider_runtime_mode: RuntimeMode,
     pub(crate) evidence_mode: CaptureEvidenceMode,
@@ -807,6 +808,7 @@ mod tests {
     fn runtime_snapshot(selected_backend: CaptureBackend) -> CaptureProviderRuntimeSnapshot {
         CaptureProviderRuntimeSnapshot {
             selected_backend,
+            selected_input_source: runtime_input_source_for_backend(selected_backend),
             plan_mode: CapturePlanMode::Live,
             provider_runtime_mode: RuntimeMode::Available,
             evidence_mode: CaptureEvidenceMode::BestEffort,
@@ -814,6 +816,15 @@ mod tests {
             reason: None,
             open_failures: Vec::new(),
             provider: None,
+        }
+    }
+
+    fn runtime_input_source_for_backend(backend: CaptureBackend) -> CaptureInputSource {
+        match backend {
+            CaptureBackend::Ebpf | CaptureBackend::Libpcap => CaptureInputSource::LiveHost,
+            CaptureBackend::PlaintextFeed => CaptureInputSource::PlaintextFeed,
+            CaptureBackend::CaptureEventFeed => CaptureInputSource::ConfiguredCaptureEventFeed,
+            CaptureBackend::Replay => CaptureInputSource::Replay,
         }
     }
 
