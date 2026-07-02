@@ -290,7 +290,7 @@ mod tests {
         assert_eq!(traffic.status().kind, TrafficStatusKind::Warning);
         assert_eq!(
             traffic.status().text,
-            "Capture using libpcap; ebpf failed: permission denied"
+            "Capture using libpcap; passive fallback occurred (ebpf: permission denied)"
         );
     }
 
@@ -352,6 +352,7 @@ mod tests {
                     evidence_reason: Some("best-effort attribution".to_string()),
                 },
             ],
+            auto_mitm_plaintext_bridge_candidate: None,
             open_failures: vec![CaptureOpenFailureStatusSnapshot {
                 backend: CaptureBackend::Ebpf,
                 reason: "permission denied".to_string(),

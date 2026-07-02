@@ -22,6 +22,8 @@ pub struct CaptureStatusSnapshot {
     #[serde(default)]
     pub candidates: Vec<CaptureCandidateStatusSnapshot>,
     #[serde(default)]
+    pub auto_mitm_plaintext_bridge_candidate: Option<CaptureCandidateStatusSnapshot>,
+    #[serde(default)]
     pub open_failures: Vec<CaptureOpenFailureStatusSnapshot>,
     #[serde(default, skip_deserializing)]
     pub provider: Option<CaptureProviderRuntimeDetailsSnapshot>,
@@ -65,6 +67,7 @@ pub(in crate::status) fn capture_status(
                 evidence_mode: Some(runtime.evidence_mode),
                 evidence_reason: runtime.evidence_reason,
                 candidates: capture_candidates(plan),
+                auto_mitm_plaintext_bridge_candidate: auto_mitm_plaintext_bridge_candidate(plan),
                 open_failures: runtime
                     .open_failures
                     .into_iter()
@@ -87,6 +90,7 @@ pub(in crate::status) fn capture_status(
             evidence_mode: plan.capture.selected_evidence_mode,
             evidence_reason: plan.capture.evidence_reason.clone(),
             candidates: capture_candidates(plan),
+            auto_mitm_plaintext_bridge_candidate: auto_mitm_plaintext_bridge_candidate(plan),
             open_failures: Vec::new(),
             provider: None,
             input_activity: None,
@@ -94,25 +98,49 @@ pub(in crate::status) fn capture_status(
     }
 }
 
+fn auto_mitm_plaintext_bridge_candidate(
+    plan: &RuntimePlan,
+) -> Option<CaptureCandidateStatusSnapshot> {
+    plan.capture
+        .auto_mitm_plaintext_bridge_open_candidate()
+        .map(|candidate| capture_candidate_status(&candidate))
+}
+
 fn capture_candidates(plan: &RuntimePlan) -> Vec<CaptureCandidateStatusSnapshot> {
     plan.capture
         .candidates
         .iter()
-        .map(|candidate| CaptureCandidateStatusSnapshot {
-            backend: candidate.backend,
-            runtime_mode: candidate.runtime_mode,
-            capability_mode: candidate.capability_mode,
-            evidence_mode: candidate.evidence_mode,
-            reason: candidate.reason.clone(),
-            evidence_reason: candidate.evidence_reason.clone(),
-        })
+        .map(capture_candidate_status)
         .collect()
+}
+
+fn capture_candidate_status(
+    candidate: &runtime::CaptureProviderDescriptor,
+) -> CaptureCandidateStatusSnapshot {
+    CaptureCandidateStatusSnapshot {
+        backend: candidate.backend,
+        runtime_mode: candidate.runtime_mode,
+        capability_mode: candidate.capability_mode,
+        evidence_mode: candidate.evidence_mode,
+        reason: candidate.reason.clone(),
+        evidence_reason: candidate.evidence_reason.clone(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
-    use probe_core::{CapabilityKind, CapabilityState, CaptureProviderKind, RuntimeMode};
+    use probe_config::{
+        AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicySourceConfig,
+        TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
+        TransparentInterceptionMitmBackendReadinessProbeConfig,
+        TransparentInterceptionMitmClientTrustModeConfig,
+        TransparentInterceptionMitmPlaintextBridgeModeConfig,
+        TransparentInterceptionStrategyConfig,
+    };
+    use probe_core::{
+        CapabilityKind, CapabilityState, CaptureProviderKind, Direction, EnforcementMode,
+        ProcessSelector, RuntimeMode, Selector, TrafficSelector,
+    };
     use runtime::{
         CapturePlanMode, CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry,
         RuntimePlan,
@@ -174,6 +202,23 @@ mod tests {
         assert_eq!(status.reason, None);
         assert_eq!(status.open_failures.len(), 1);
         assert_eq!(status.open_failures[0].backend, CaptureBackend::Ebpf);
+        Ok(())
+    }
+
+    #[test]
+    fn capture_status_reports_auto_mitm_plaintext_bridge_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = auto_plan_with_mitm_plaintext_bridge_candidate()?;
+
+        let status = capture_status(&plan, None, None);
+
+        let candidate = status
+            .auto_mitm_plaintext_bridge_candidate
+            .expect("auto MITM plaintext bridge candidate should be reported");
+        assert_eq!(candidate.backend, CaptureBackend::CaptureEventFeed);
+        assert_eq!(candidate.runtime_mode, RuntimeMode::Available);
+        assert_eq!(candidate.capability_mode, RuntimeMode::Available);
+        assert_eq!(candidate.evidence_mode, CaptureEvidenceMode::Nominal);
         Ok(())
     }
 
@@ -365,6 +410,77 @@ mod tests {
         )
     }
 
+    fn auto_plan_with_mitm_plaintext_bridge_candidate() -> Result<RuntimePlan, runtime::RuntimeError>
+    {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Auto;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        config.enforcement.interception.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::external(
+                TransparentInterceptionMitmBackendReadinessProbeConfig {
+                    target: Some("127.0.0.1:15002".to_string()),
+                    ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
+                },
+            );
+        config.enforcement.interception.mitm.client_trust.mode =
+            TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path =
+            Some("/tmp/mitm-capture-events.jsonl".into());
+        config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
+        config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: "/tmp/traffic-probe-policy.toml".into(),
+        };
+        config.tls.materials = vec![
+            TlsMaterialConfig {
+                id: Some("mitm-ca".to_string()),
+                kind: TlsMaterialKind::MitmCaCertificate,
+                path: "/etc/traffic-probe/mitm-ca.pem".into(),
+            },
+            TlsMaterialConfig {
+                id: Some("mitm-ca-key".to_string()),
+                kind: TlsMaterialKind::MitmCaPrivateKey,
+                path: "/etc/traffic-probe/mitm-ca.key".into(),
+            },
+        ];
+
+        RuntimePlan::build(
+            config,
+            &ProviderRegistry::new(
+                vec![
+                    CaptureProviderDescriptor::unavailable(
+                        CaptureBackend::Ebpf,
+                        CaptureProviderBuilder::Unimplemented,
+                        "eBPF is unavailable",
+                    ),
+                    CaptureProviderDescriptor::unavailable(
+                        CaptureBackend::Libpcap,
+                        CaptureProviderBuilder::Unimplemented,
+                        "libpcap is unavailable",
+                    ),
+                    CaptureProviderDescriptor::available(
+                        CaptureBackend::CaptureEventFeed,
+                        CaptureProviderBuilder::CaptureEventFeed,
+                    ),
+                ],
+                transparent_mitm_bridge_capabilities(),
+            ),
+        )
+    }
+
     fn test_platform_capabilities() -> Vec<CapabilityState> {
         vec![
             CapabilityState::available(CapabilityKind::Http1),
@@ -374,6 +490,25 @@ mod tests {
             CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
             CapabilityState::available(CapabilityKind::DryRunEnforcement),
             CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
+            CapabilityState::unavailable(CapabilityKind::TransparentInterception, "not built"),
+            CapabilityState::unavailable(CapabilityKind::L7Mitm, "not built"),
+            CapabilityState::unavailable(CapabilityKind::CaptureEventFeed, "not built"),
         ]
+    }
+
+    fn transparent_mitm_bridge_capabilities() -> Vec<CapabilityState> {
+        test_platform_capabilities()
+            .into_iter()
+            .map(|state| match state.kind {
+                CapabilityKind::TransparentInterception => {
+                    CapabilityState::available(CapabilityKind::TransparentInterception)
+                }
+                CapabilityKind::L7Mitm => CapabilityState::available(CapabilityKind::L7Mitm),
+                CapabilityKind::CaptureEventFeed => {
+                    CapabilityState::available(CapabilityKind::CaptureEventFeed)
+                }
+                _ => state,
+            })
+            .collect()
     }
 }
