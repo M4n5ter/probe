@@ -11,7 +11,11 @@ mod socket;
 pub(crate) use client::{
     AdminClientError, send_admin_json_request, send_admin_json_request_with_timeout,
 };
-pub(crate) use event_tail::{EventTailRecord, EventTailSnapshot};
+#[cfg(test)]
+pub(crate) use event_tail::EventTailOmissionReason;
+pub(crate) use event_tail::{
+    EventTailBudgetSnapshot, EventTailOmission, EventTailRecord, EventTailSnapshot,
+};
 pub(crate) use protocol::AdminRequest;
 pub(crate) use server::{AdminRuntimeState, AdminServerHandle, spawn_admin_server};
 pub(crate) use socket::{AdminError, AdminServerConfig, PrometheusListenerConfig};

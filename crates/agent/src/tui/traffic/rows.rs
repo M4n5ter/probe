@@ -2,7 +2,7 @@ use std::fmt;
 
 use probe_core::{Direction, EventEnvelope, EventKind};
 
-use crate::admin::EventTailRecord;
+use crate::admin::{EventTailBudgetSnapshot, EventTailOmission, EventTailRecord};
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct TrafficRow {
@@ -12,7 +12,7 @@ pub(crate) struct TrafficRow {
     pub(crate) direction: String,
     pub(crate) endpoint: String,
     pub(crate) summary: String,
-    event: EventEnvelope,
+    payload: TrafficRowPayload,
 }
 
 impl TrafficRow {
@@ -20,29 +20,42 @@ impl TrafficRow {
         Self::from_event(record.sequence, record.event)
     }
 
+    pub(super) fn from_omission(
+        omission: EventTailOmission,
+        scanned: usize,
+        budget: EventTailBudgetSnapshot,
+    ) -> Self {
+        let reason = omission.reason.label();
+        let payload_bytes = omission.payload_bytes;
+        Self {
+            sequence: omission.sequence,
+            process: "tail".to_string(),
+            event_type: "tail omission".to_string(),
+            direction: "-".to_string(),
+            endpoint: "-".to_string(),
+            summary: format!("{reason}, payload {payload_bytes} bytes"),
+            payload: TrafficRowPayload::Omission(TrafficOmissionRow {
+                omission,
+                scanned,
+                budget,
+            }),
+        }
+    }
+
     pub(crate) fn detail_lines(&self) -> Vec<String> {
-        detail_lines(self.sequence, &self.event)
+        match &self.payload {
+            TrafficRowPayload::Event(event) => event_detail_lines(self.sequence, event),
+            TrafficRowPayload::Omission(omission) => omission_detail_lines(self.sequence, omission),
+        }
     }
 
     pub(crate) fn preview_lines(&self, max_lines: usize) -> Vec<String> {
-        let mut lines = vec![
-            format!("Sequence: {}", self.sequence),
-            format!("Event type: {}", self.event_type),
-            format!("Direction: {}", self.direction),
-            format!("Remote: {}", self.endpoint),
-            format!("Summary: {}", self.summary),
-        ];
-        if let Some(flow) = self.event.flow() {
-            lines.insert(
-                2,
-                format!(
-                    "Process: {} pid={}",
-                    flow.process.name, flow.process.identity.pid
-                ),
-            );
+        match &self.payload {
+            TrafficRowPayload::Event(event) => event_preview_lines(self, event, max_lines),
+            TrafficRowPayload::Omission(omission) => {
+                omission_preview_lines(self.sequence, omission, max_lines)
+            }
         }
-        lines.push("Open detail for full payload".to_string());
-        fit_preview_lines(lines, max_lines)
     }
 
     fn from_event(sequence: u64, event: EventEnvelope) -> Self {
@@ -64,9 +77,59 @@ impl TrafficRow {
                 .map(|flow| format!("{}:{}", flow.remote.address, flow.remote.port))
                 .unwrap_or_else(|| "-".to_string()),
             summary: event_kind.summary,
-            event,
+            payload: TrafficRowPayload::Event(Box::new(event)),
         }
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum TrafficRowPayload {
+    Event(Box<EventEnvelope>),
+    Omission(TrafficOmissionRow),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TrafficOmissionRow {
+    omission: EventTailOmission,
+    scanned: usize,
+    budget: EventTailBudgetSnapshot,
+}
+
+fn event_preview_lines(row: &TrafficRow, event: &EventEnvelope, max_lines: usize) -> Vec<String> {
+    let mut lines = vec![
+        format!("Sequence: {}", row.sequence),
+        format!("Event type: {}", row.event_type),
+        format!("Direction: {}", row.direction),
+        format!("Remote: {}", row.endpoint),
+        format!("Summary: {}", row.summary),
+    ];
+    if let Some(flow) = event.flow() {
+        lines.insert(
+            2,
+            format!(
+                "Process: {} pid={}",
+                flow.process.name, flow.process.identity.pid
+            ),
+        );
+    }
+    lines.push("Open detail for full payload".to_string());
+    fit_preview_lines(lines, max_lines)
+}
+
+fn omission_preview_lines(
+    sequence: u64,
+    row: &TrafficOmissionRow,
+    max_lines: usize,
+) -> Vec<String> {
+    let lines = vec![
+        format!("Sequence: {sequence}"),
+        "Event type: tail omission".to_string(),
+        format!("Reason: {}", row.omission.reason.label()),
+        format!("Payload bytes: {}", row.omission.payload_bytes),
+        format!("Payload schema: {}", row.omission.payload_schema),
+        "Open detail for tail budget".to_string(),
+    ];
+    fit_preview_lines(lines, max_lines)
 }
 
 impl fmt::Debug for TrafficRow {
@@ -348,7 +411,7 @@ fn fit_preview_lines(mut lines: Vec<String>, max_lines: usize) -> Vec<String> {
     lines
 }
 
-fn detail_lines(sequence: u64, event: &EventEnvelope) -> Vec<String> {
+fn event_detail_lines(sequence: u64, event: &EventEnvelope) -> Vec<String> {
     let mut lines = vec![
         format!("Sequence: {sequence}"),
         format!("Event id: {}", event.id().as_str()),
@@ -379,6 +442,33 @@ fn detail_lines(sequence: u64, event: &EventEnvelope) -> Vec<String> {
     }
     lines.extend(event_kind_display(event.kind(), true).details);
     lines
+}
+
+fn omission_detail_lines(sequence: u64, row: &TrafficOmissionRow) -> Vec<String> {
+    vec![
+        format!("Sequence: {sequence}"),
+        "Event type: tail omission".to_string(),
+        format!("Stored at unix ns: {}", row.omission.stored_at_unix_ns),
+        format!("Reason: {}", row.omission.reason.label()),
+        format!("Payload bytes: {}", row.omission.payload_bytes),
+        format!("Payload schema: {}", row.omission.payload_schema),
+        "Tail diagnostics".to_string(),
+        format!("scanned records: {}", row.scanned),
+        format!(
+            "response budget: {}/{} bytes{}",
+            row.budget.included_payload_bytes,
+            row.budget.max_response_payload_bytes,
+            if row.budget.truncated {
+                " (truncated)"
+            } else {
+                ""
+            }
+        ),
+        format!(
+            "per-event payload limit: {} bytes",
+            row.budget.max_event_payload_bytes
+        ),
+    ]
 }
 
 fn hex_preview(bytes: &[u8]) -> String {

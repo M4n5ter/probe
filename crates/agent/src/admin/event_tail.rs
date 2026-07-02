@@ -59,6 +59,15 @@ pub(crate) enum EventTailOmissionReason {
     ResponseBudgetExceeded,
 }
 
+impl EventTailOmissionReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::EventTooLarge => "event too large",
+            Self::ResponseBudgetExceeded => "response budget exceeded",
+        }
+    }
+}
+
 pub(super) fn read_event_tail(
     spool: &FjallSpool,
     request: EventTailRequest,

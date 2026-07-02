@@ -7,7 +7,7 @@ use probe_core::Selector;
 
 use self::{client::request_tail_events, rows::TrafficRow};
 use crate::{
-    admin::{AdminClientError, EventTailSnapshot},
+    admin::{AdminClientError, EventTailOmission, EventTailSnapshot},
     tui::runtime_status::{CaptureDiagnosticMessage, TrafficRuntimeDiagnostics},
 };
 
@@ -77,6 +77,12 @@ impl TrafficState {
                     "Capture diagnostics will appear here after the first refresh".to_string(),
                 ]
             })
+    }
+
+    pub(crate) fn detail_preview_lines(&self, max_lines: usize) -> Vec<String> {
+        self.selected_row()
+            .map(|row| row.preview_lines(max_lines.max(1)))
+            .unwrap_or_else(|| self.diagnostic_lines())
     }
 
     pub(crate) async fn refresh(&mut self, socket_path: &Path, selector: Selector) {
@@ -151,9 +157,8 @@ impl TrafficState {
         self.after_sequence = snapshot.next_after_sequence;
         self.last_export_sequence = snapshot.last_export_sequence;
         let received = snapshot.events.len();
-        let omitted = snapshot.omissions.len();
-        self.rows
-            .extend(snapshot.events.into_iter().map(TrafficRow::from_record));
+        let status = traffic_status_for_snapshot(received, &snapshot.omissions, snapshot.scanned);
+        self.rows.extend(traffic_rows_for_snapshot(snapshot));
         if self.rows.len() > MAX_ROWS {
             let drop_count = self.rows.len() - MAX_ROWS;
             self.rows.drain(0..drop_count);
@@ -161,7 +166,7 @@ impl TrafficState {
             self.scroll = self.scroll.saturating_sub(drop_count);
         }
         self.clamp_selection();
-        self.status = traffic_status_for_snapshot(received, omitted, snapshot.scanned);
+        self.status = status;
     }
 
     fn clamp_selection(&mut self) {
@@ -232,15 +237,59 @@ impl TrafficStatus {
     }
 }
 
-fn traffic_status_for_snapshot(received: usize, omitted: usize, scanned: usize) -> TrafficStatus {
-    if omitted > 0 {
-        TrafficStatus::error(format!(
-            "Received {received} events; omitted {omitted} oversized events"
-        ))
+fn traffic_status_for_snapshot(
+    received: usize,
+    omissions: &[EventTailOmission],
+    scanned: usize,
+) -> TrafficStatus {
+    if let Some(reason) = omission_summary(omissions) {
+        TrafficStatus::error(format!("Received {received} events; {reason}"))
     } else if received == 0 {
         TrafficStatus::idle(format!("No new matching events; scanned {scanned} records"))
     } else {
         TrafficStatus::active(format!("Received {received} matching events"))
+    }
+}
+
+fn traffic_rows_for_snapshot(snapshot: EventTailSnapshot) -> Vec<TrafficRow> {
+    let EventTailSnapshot {
+        scanned,
+        budget,
+        events,
+        omissions,
+        ..
+    } = snapshot;
+    let mut rows = events
+        .into_iter()
+        .map(TrafficRow::from_record)
+        .chain(
+            omissions
+                .into_iter()
+                .map(|omission| TrafficRow::from_omission(omission, scanned, budget.clone())),
+        )
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.sequence);
+    rows
+}
+
+fn omission_summary(omissions: &[EventTailOmission]) -> Option<String> {
+    let first = omissions.first()?;
+    let suffix = match omissions.len() {
+        1 => String::new(),
+        extra => format!(" and {} more", extra - 1),
+    };
+    Some(format!(
+        "omitted {}: {}{}",
+        event_count_label(omissions.len()),
+        first.reason.label(),
+        suffix
+    ))
+}
+
+fn event_count_label(count: usize) -> String {
+    match count {
+        1 => "1 event".to_string(),
+        count => format!("{count} events"),
     }
 }
 
@@ -268,11 +317,12 @@ fn traffic_refresh_error_message(error: &client::TrafficClientError) -> String {
 #[cfg(test)]
 mod tests {
     use probe_config::{CaptureBackend, CaptureSelection};
-    use probe_core::RuntimeMode;
+    use probe_core::{RuntimeMode, SpoolPayloadSchema};
     use runtime::{CaptureEvidenceMode, CaptureInputSource, CapturePlanMode};
 
     use super::*;
     use crate::{
+        admin::{EventTailBudgetSnapshot, EventTailOmissionReason, EventTailSnapshot},
         status::{
             CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
         },
@@ -347,6 +397,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tail_omissions_are_visible_as_selectable_traffic_rows() {
+        let mut traffic = TrafficState::default();
+
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
+        assert_eq!(
+            traffic.status().text,
+            "Received 0 events; omitted 1 event: response budget exceeded"
+        );
+        assert_eq!(traffic.rows().len(), 1);
+        let row = traffic.selected_row().expect("omission row is selected");
+        assert_eq!(row.event_type, "tail omission");
+        assert_eq!(row.summary, "response budget exceeded, payload 4096 bytes");
+        assert!(
+            traffic
+                .detail_preview_lines(8)
+                .iter()
+                .any(|line| line == "Reason: response budget exceeded")
+        );
+        let details = row.detail_lines();
+        assert!(details.iter().any(|line| line == "Tail diagnostics"));
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "response budget: 128/256 bytes (truncated)")
+        );
+        assert!(details.iter().any(|line| {
+            line == "Payload schema: traffic.probe.event_envelope.subject_origin.json"
+        }));
+    }
+
     fn fallback_capture_snapshot() -> CaptureStatusSnapshot {
         CaptureStatusSnapshot {
             selection: CaptureSelection::Auto,
@@ -407,6 +490,30 @@ mod tests {
             open_failures: Vec::new(),
             provider: None,
             input_activity: None,
+        }
+    }
+
+    fn tail_snapshot_with_response_budget_omission() -> EventTailSnapshot {
+        EventTailSnapshot {
+            after_sequence: 0,
+            next_after_sequence: 2,
+            last_export_sequence: 2,
+            limit: 64,
+            scanned: 2,
+            budget: EventTailBudgetSnapshot {
+                max_event_payload_bytes: 512,
+                max_response_payload_bytes: 256,
+                included_payload_bytes: 128,
+                truncated: true,
+            },
+            events: Vec::new(),
+            omissions: vec![EventTailOmission {
+                sequence: 2,
+                stored_at_unix_ns: 200,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: 4096,
+                reason: EventTailOmissionReason::ResponseBudgetExceeded,
+            }],
         }
     }
 }

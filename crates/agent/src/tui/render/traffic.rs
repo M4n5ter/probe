@@ -69,7 +69,7 @@ pub(super) fn render_traffic_detail_popup(
         .traffic()
         .selected_row()
         .map(|row| detail_lines_for_popup(row.detail_lines()))
-        .unwrap_or_else(|| vec![Line::from("No selected event")]);
+        .unwrap_or_else(|| vec![Line::from("No selected traffic row")]);
     let scroll = app
         .traffic_detail_scroll()
         .min(lines.len().saturating_sub(1));
@@ -442,18 +442,13 @@ fn render_traffic_events(
 }
 
 fn render_traffic_detail_preview(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let lines = app
-        .traffic()
-        .selected_row()
-        .map(|row| {
-            preview_lines_for_render(
-                row.preview_lines(area.height.saturating_sub(2).max(1) as usize),
-            )
-        })
-        .unwrap_or_else(|| preview_lines_for_render(app.traffic().diagnostic_lines()));
+    let lines = preview_lines_for_render(
+        app.traffic()
+            .detail_preview_lines(area.height.saturating_sub(2).max(1) as usize),
+    );
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::bordered().title("Selected Event"))
+            .block(Block::bordered().title("Selected Traffic"))
             .wrap(Wrap { trim: false }),
         area,
     );
