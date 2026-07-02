@@ -7,35 +7,32 @@ use super::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlId {
-    EnableAdmin,
     ReloadRuntimeActions,
+    SearchProcesses,
+    ClearProcessSearch,
 }
 
 impl ControlId {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::EnableAdmin => "Enable admin",
             Self::ReloadRuntimeActions => "Reload runtime actions",
+            Self::SearchProcesses => "Search",
+            Self::ClearProcessSearch => "Clear",
         }
     }
 
     pub(crate) fn action_hint(self) -> &'static str {
         match self {
-            Self::EnableAdmin => "enable",
             Self::ReloadRuntimeActions => "run action",
+            Self::SearchProcesses => "search",
+            Self::ClearProcessSearch => "clear",
         }
     }
 
-    pub(crate) fn value(self, config: &AgentConfig) -> String {
+    pub(crate) fn value(self, _config: &AgentConfig) -> String {
         match self {
-            Self::EnableAdmin => "disabled; save config before starting agent".to_string(),
-            Self::ReloadRuntimeActions => {
-                if config.admin.enabled {
-                    "available through online admin".to_string()
-                } else {
-                    "requires admin socket".to_string()
-                }
-            }
+            Self::ReloadRuntimeActions => "uses active TUI runtime".to_string(),
+            Self::SearchProcesses | Self::ClearProcessSearch => String::new(),
         }
     }
 }
@@ -73,17 +70,12 @@ pub(crate) fn focus_targets_for_tab(tab: TuiTab, config: &AgentConfig) -> Vec<Fo
     fields_for_tab(tab, config)
         .into_iter()
         .map(FocusTarget::Field)
-        .chain(
-            controls_for_tab(tab, config)
-                .into_iter()
-                .map(FocusTarget::Control),
-        )
+        .chain(controls_for_tab(tab).into_iter().map(FocusTarget::Control))
         .collect()
 }
 
-fn controls_for_tab(tab: TuiTab, config: &AgentConfig) -> Vec<ControlId> {
+fn controls_for_tab(tab: TuiTab) -> Vec<ControlId> {
     match tab {
-        TuiTab::Traffic if !config.admin.enabled => vec![ControlId::EnableAdmin],
         TuiTab::Runtime => vec![ControlId::ReloadRuntimeActions],
         _ => Vec::new(),
     }

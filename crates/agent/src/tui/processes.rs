@@ -45,6 +45,25 @@ impl ProcessEntry {
         format!("{exe} | {} argv entries hidden", self.argv_count)
     }
 
+    pub(crate) fn matches_query(&self, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        let query = query.to_ascii_lowercase();
+        self.pid.to_string().contains(&query)
+            || self.name.to_ascii_lowercase().contains(&query)
+            || self
+                .exe_path
+                .as_ref()
+                .map(|path| {
+                    path.display()
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains(&query)
+                })
+                .unwrap_or(false)
+    }
+
     fn from_process(process: ProcessContext) -> Self {
         Self {
             pid: process.identity.pid,

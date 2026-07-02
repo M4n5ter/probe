@@ -236,10 +236,12 @@ processes. Keyboard and mouse are equal interaction modes: every common action
 is modeled once and exposed through both key bindings and rendered hit targets.
 Process scopes are written only when the process has a readable executable path;
 argv is not retained by the TUI model, and the process table shows only a
-redacted argv count. Save takes an advisory lock, refuses stale files, validates
-the rendered config, and uses an atomic same-directory write. The config path
-must be a direct file path; symlink paths are rejected so save never replaces a
-link with a regular file.
+redacted argv count. The Processes tab supports keyboard and mouse browsing plus
+process search. Use `/`, `Ctrl-F`, or `[Search]` to filter by PID, process
+name, or executable path; `[Clear]` removes the filter. Save takes an advisory
+lock, refuses stale files, validates the rendered config, and uses an atomic
+same-directory write. The config path must be a direct file path; symlink paths
+are rejected so save never replaces a link with a regular file.
 
 The workbench can add a default exporter, switch exporter transport, edit
 webhook endpoints, file paths, Unix HTTP socket paths, exporter compression,
@@ -254,24 +256,31 @@ policy files.
 
 Without `--config`, the TUI uses `PROBE_HOME/config/agent.toml` and creates a
 minimal safe config if the file does not exist. The generated admin socket path
-is `PROBE_HOME/run/admin.sock`. Pass `--config ./agent.toml` when editing an
-explicit file.
+is `PROBE_HOME/run/admin.sock`, but the generated config keeps admin disabled.
+Pass `--config ./agent.toml` when editing an explicit file.
 
-When the configured admin socket is enabled and the live agent is running, the
-Traffic tab tails parsed export events from the online admin surface. It uses
-the selected process executable-path selector when available; if the selected
-process has no readable executable path, traffic filtering fails closed instead
-of showing unrelated host traffic. The TUI keeps only display summaries for the
-event table and does not retain raw process argv. If admin is disabled, the
-Traffic tab exposes an `Enable admin` action through both keyboard and mouse.
+On startup, the TUI probes the configured admin socket. If a running agent
+responds, the TUI reuses it. Otherwise, the TUI starts a managed local agent
+from the same binary and stops that child process when the TUI exits. The
+managed child uses a TUI-owned runtime overlay under `PROBE_HOME/run/tui/`;
+that overlay enables a private admin socket and writes stdout/stderr to
+`agent.log`. The user's config is not mutated just because the TUI needs a
+runtime admin socket. If managed startup fails, the TUI error includes the log
+path and a short tail so the real agent startup error is visible.
+
+The Traffic tab tails parsed export events from the active agent admin surface.
+It uses the selected process executable-path selector when available; if the
+selected process has no readable executable path, traffic filtering fails closed
+instead of showing unrelated host traffic. The TUI keeps only display summaries
+for the event table and does not retain raw process argv.
 
 The Runtime tab can call the online admin `reload_runtime_actions` command. It
 reloads the runtime owners that are explicitly safe to update online, currently
 policy bundles and the external enforcement manifest, and reports partial
 failures per action. It does not replace the active main agent config; use it
 after saving policy or enforcement inputs that are already referenced by the
-running config. The same tab also edits the admin socket settings needed by
-Traffic and runtime actions.
+running config. The same tab edits admin socket settings for future runs; the
+current TUI session keeps using the active socket it attached to at startup.
 
 ### Minimal Policy And Webhook Wiring
 

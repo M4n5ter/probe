@@ -6,7 +6,7 @@ use std::path::Path;
 use probe_core::Selector;
 
 use self::{client::request_tail_events, rows::TrafficRow};
-use crate::admin::EventTailSnapshot;
+use crate::admin::{AdminClientError, EventTailSnapshot};
 
 pub(crate) use rows::TrafficRow as TrafficTableRow;
 
@@ -67,15 +67,13 @@ impl TrafficState {
         match request_tail_events(socket_path, self.after_sequence, selector).await {
             Ok(snapshot) => self.apply_snapshot(snapshot),
             Err(error) => {
-                self.status = TrafficStatus::error(error.to_string());
+                self.status = TrafficStatus::error(traffic_refresh_error_message(&error));
             }
         }
     }
 
-    pub(crate) fn mark_admin_disabled(&mut self) {
-        self.status = TrafficStatus::error(
-            "Admin socket is disabled in config; enable admin to view traffic",
-        );
+    pub(crate) fn mark_admin_unavailable(&mut self, message: impl Into<String>) {
+        self.status = TrafficStatus::error(message);
     }
 
     pub(crate) fn mark_filter_unavailable(&mut self, message: impl Into<String>) {
@@ -203,4 +201,21 @@ fn traffic_status_for_snapshot(received: usize, omitted: usize, scanned: usize) 
 
 fn selector_key(selector: &Selector) -> String {
     serde_json::to_string(selector).unwrap_or_else(|_| format!("{selector:?}"))
+}
+
+fn traffic_refresh_error_message(error: &client::TrafficClientError) -> String {
+    match error {
+        client::TrafficClientError::AdminClient(AdminClientError::Connect { path, source })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            format!(
+                "No running agent is listening on admin socket {}; restart the TUI agent or check the configured socket",
+                path.display()
+            )
+        }
+        _ => error.to_string(),
+    }
 }

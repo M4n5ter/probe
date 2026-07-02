@@ -40,6 +40,8 @@ pub(crate) enum TuiError {
     },
     #[error("failed to serialize editable TOML: {0}")]
     SerializeToml(#[from] toml_edit::ser::Error),
+    #[error("failed to serialize TUI runtime config: {0}")]
+    SerializeRuntimeConfig(#[from] toml::ser::Error),
     #[error("config error: {0}")]
     Config(#[from] ConfigError),
     #[error("runtime config error: {0}")]
@@ -59,6 +61,25 @@ pub(crate) enum TuiError {
     },
     #[error("terminal error: {0}")]
     Terminal(#[from] std::io::Error),
+    #[error("failed to {action}: {source}")]
+    AgentSupervisor {
+        action: &'static str,
+        source: std::io::Error,
+    },
+    #[error("TUI managed agent exited during startup: {status}; log {log_path}; tail: {log_tail}")]
+    ManagedAgentExited {
+        status: std::process::ExitStatus,
+        log_path: PathBuf,
+        log_tail: String,
+    },
+    #[error(
+        "timed out waiting for TUI managed agent admin socket {socket_path}; log {log_path}; tail: {log_tail}"
+    )]
+    ManagedAgentStartupTimeout {
+        socket_path: String,
+        log_path: PathBuf,
+        log_tail: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -417,7 +438,7 @@ fn ensure_generated_admin_socket_dir(
     ensure_private_directory(parent)
 }
 
-fn ensure_private_directory(path: &Path) -> Result<(), TuiError> {
+pub(crate) fn ensure_private_directory(path: &Path) -> Result<(), TuiError> {
     fs::create_dir_all(path).map_err(|source| TuiError::WriteConfig {
         path: path.display().to_string(),
         source,

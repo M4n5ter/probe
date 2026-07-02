@@ -17,6 +17,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use probe_config::default_config_path;
 
 use super::{
+    agent::TuiAgentSupervisor,
     app::{TuiAction, TuiApp, TuiEffect, TuiTab},
     config_edit::{TuiError, load_config, load_or_create_config, save_config},
     hit::HitMap,
@@ -35,61 +36,104 @@ pub(crate) struct TuiOptions {
 pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
     let config_path = resolve_config_path(options.config);
     let mut loaded = load_or_create_config(&config_path)?;
-    let mut app = TuiApp::new(config_path, loaded.config, ProcessCatalog::from_proc());
-    let mut terminal = TerminalSession::enter()?;
-    let mut last_traffic_refresh = Instant::now()
-        .checked_sub(TRAFFIC_REFRESH_INTERVAL)
-        .unwrap_or_else(Instant::now);
+    let mut app = TuiApp::new(
+        config_path,
+        loaded.config.clone(),
+        ProcessCatalog::from_proc(),
+    );
+    let mut supervisor = match TuiAgentSupervisor::attach_or_spawn(app.config()).await {
+        Ok(supervisor) => {
+            app.attach_agent(supervisor.attachment(app.config()));
+            Some(supervisor)
+        }
+        Err(error) => {
+            app.mark_error(format!("TUI agent unavailable: {error}"));
+            None
+        }
+    };
+    let result = async {
+        let mut terminal = TerminalSession::enter()?;
+        let mut last_traffic_refresh = Instant::now()
+            .checked_sub(TRAFFIC_REFRESH_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        let mut last_agent_poll = Instant::now();
 
-    loop {
-        if app.active_tab() == TuiTab::Traffic
-            && last_traffic_refresh.elapsed() >= TRAFFIC_REFRESH_INTERVAL
-        {
-            app.refresh_traffic().await;
-            last_traffic_refresh = Instant::now();
-        }
-        let hit_map = terminal.draw(&app)?;
-        if app.should_quit() {
-            break;
-        }
-        if !event::poll(Duration::from_millis(250))? {
-            continue;
-        }
-        let Some(action) = event_to_action(&hit_map, event::read()?, app.is_editing_text()) else {
-            continue;
-        };
-        if let Some(effect) = app.handle_action(action) {
-            match effect {
-                TuiEffect::SaveConfig => {
-                    match save_config(app.config_path(), &loaded.source, app.config()) {
-                        Ok(source) => {
-                            loaded.source = source;
-                            app.mark_saved();
+        loop {
+            if last_agent_poll.elapsed() >= TRAFFIC_REFRESH_INTERVAL {
+                let agent_exit = match supervisor.as_mut() {
+                    Some(running) => match running.poll_exit().await {
+                        Ok(Some(message)) => Some(message),
+                        Ok(None) => None,
+                        Err(error) => {
+                            app.mark_error(error.to_string());
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                if let Some(message) = agent_exit {
+                    if let Some(supervisor) = supervisor.take() {
+                        supervisor.stop().await;
+                    }
+                    app.detach_agent(message);
+                }
+                last_agent_poll = Instant::now();
+            }
+            if app.active_tab() == TuiTab::Traffic
+                && last_traffic_refresh.elapsed() >= TRAFFIC_REFRESH_INTERVAL
+            {
+                app.refresh_traffic().await;
+                last_traffic_refresh = Instant::now();
+            }
+            let hit_map = terminal.draw(&mut app)?;
+            if app.should_quit() {
+                break;
+            }
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
+            let Some(action) = event_to_action(&hit_map, event::read()?, app.is_editing_text())
+            else {
+                continue;
+            };
+            if let Some(effect) = app.handle_action(action) {
+                match effect {
+                    TuiEffect::SaveConfig => {
+                        match save_config(app.config_path(), &loaded.source, app.config()) {
+                            Ok(source) => {
+                                loaded.source = source;
+                                app.mark_saved();
+                            }
+                            Err(error) => app.mark_save_failed(error.to_string()),
+                        }
+                    }
+                    TuiEffect::ReloadConfig => match load_config(app.config_path()) {
+                        Ok(next) => {
+                            loaded = next;
+                            app.replace_config(loaded.config.clone(), ProcessCatalog::from_proc());
                         }
                         Err(error) => app.mark_save_failed(error.to_string()),
-                    }
+                    },
+                    TuiEffect::ReloadRuntimeActions => reload_runtime_actions(&mut app).await,
                 }
-                TuiEffect::ReloadConfig => match load_config(app.config_path()) {
-                    Ok(next) => {
-                        loaded = next;
-                        app.replace_config(loaded.config.clone(), ProcessCatalog::from_proc());
-                    }
-                    Err(error) => app.mark_save_failed(error.to_string()),
-                },
-                TuiEffect::ReloadRuntimeActions => reload_runtime_actions(&mut app).await,
             }
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
+    .await;
+    if let Some(supervisor) = supervisor {
+        supervisor.stop().await;
+    }
+    result
 }
 
 async fn reload_runtime_actions(app: &mut TuiApp) {
-    if !app.config().admin.enabled {
-        app.mark_warning("Enable admin to reload runtime actions from the TUI");
+    let Some(socket_path) = app.active_admin_socket_path().map(PathBuf::from) else {
+        app.mark_warning("No active agent admin socket is attached to this TUI session");
         return;
-    }
-    match request_runtime_actions_reload(&app.config().admin.socket_path).await {
+    };
+    match request_runtime_actions_reload(&socket_path).await {
         Ok(summary) if summary.has_failures() => app.mark_warning(summary.status_text()),
         Ok(summary) => app.mark_info(summary.status_text()),
         Err(error) => app.mark_error(error.to_string()),
@@ -119,7 +163,7 @@ impl TerminalSession {
         Ok(Self { terminal })
     }
 
-    fn draw(&mut self, app: &TuiApp) -> Result<HitMap, TuiError> {
+    fn draw(&mut self, app: &mut TuiApp) -> Result<HitMap, TuiError> {
         let mut hit_map = HitMap::default();
         self.terminal.draw(|frame| {
             hit_map = draw(frame, app);
@@ -205,6 +249,8 @@ fn key_to_action(key: KeyEvent, editing_text: bool) -> Option<TuiAction> {
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => Some(TuiAction::Save),
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => Some(TuiAction::Reload),
         (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => Some(TuiAction::Quit),
+        (KeyCode::Char('/'), _) => Some(TuiAction::StartProcessSearch),
+        (KeyCode::Char('f'), KeyModifiers::CONTROL) => Some(TuiAction::StartProcessSearch),
         (KeyCode::Tab, _) => Some(TuiAction::NextTab),
         (KeyCode::BackTab, _) => Some(TuiAction::PreviousTab),
         (KeyCode::Up, _) => Some(TuiAction::MoveUp),
@@ -271,6 +317,17 @@ mod tests {
         assert_eq!(
             key_to_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
             Some(TuiAction::NextValue)
+        );
+        assert_eq!(
+            key_to_action(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE), false),
+            Some(TuiAction::StartProcessSearch)
+        );
+        assert_eq!(
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                false
+            ),
+            Some(TuiAction::StartProcessSearch)
         );
     }
 

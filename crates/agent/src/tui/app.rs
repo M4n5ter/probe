@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use probe_config::AgentConfig;
 
@@ -7,7 +7,9 @@ use super::fields::{
     FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
 };
 use super::hit::HitTarget;
+use super::process_view::ProcessViewState;
 use super::processes::ProcessCatalog;
+use super::runtime_attachment::RuntimeAttachment;
 use super::traffic::TrafficState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +80,7 @@ pub(crate) enum TuiAction {
     TextBackspace,
     TextSubmit,
     TextCancel,
+    StartProcessSearch,
     Click(HitTarget),
     Save,
     Reload,
@@ -137,7 +140,7 @@ impl StatusMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TextEditSession {
-    field: FieldId,
+    target: TextEditTarget,
     label: String,
     buffer: String,
     replace_on_input: bool,
@@ -153,15 +156,22 @@ impl TextEditSession {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextEditTarget {
+    Field(FieldId),
+    ProcessSearch,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TuiApp {
     config_path: PathBuf,
     config: AgentConfig,
     active_tab: TuiTab,
     selected_field_index: usize,
-    selected_process_index: usize,
-    process_scroll: usize,
+    process_view: ProcessViewState,
     traffic: TrafficState,
+    traffic_visible_rows: usize,
+    runtime_attachment: RuntimeAttachment,
     dirty: bool,
     should_quit: bool,
     status: StatusMessage,
@@ -181,9 +191,10 @@ impl TuiApp {
             config,
             active_tab: TuiTab::Overview,
             selected_field_index: 0,
-            selected_process_index: 0,
-            process_scroll: 0,
+            process_view: ProcessViewState::default(),
             traffic: TrafficState::default(),
+            traffic_visible_rows: 12,
+            runtime_attachment: RuntimeAttachment::default(),
             dirty: false,
             should_quit: false,
             status,
@@ -210,12 +221,28 @@ impl TuiApp {
             .copied()
     }
 
-    pub(crate) fn selected_process_index(&self) -> usize {
-        self.selected_process_index
+    pub(crate) fn selected_process_index(&self) -> Option<usize> {
+        self.process_view.selected_index()
     }
 
     pub(crate) fn process_scroll(&self) -> usize {
-        self.process_scroll
+        self.process_view.scroll()
+    }
+
+    pub(crate) fn process_filter(&self) -> &str {
+        self.process_view.filter()
+    }
+
+    pub(crate) fn filtered_process_indices(&self) -> Vec<usize> {
+        self.process_view.filtered_indices(&self.processes)
+    }
+
+    pub(crate) fn set_process_viewport_rows(&mut self, rows: usize) {
+        self.process_view.set_viewport_rows(rows, &self.processes);
+    }
+
+    pub(crate) fn set_traffic_viewport_rows(&mut self, rows: usize) {
+        self.traffic_visible_rows = rows.max(1);
     }
 
     pub(crate) fn processes(&self) -> &ProcessCatalog {
@@ -242,8 +269,28 @@ impl TuiApp {
         self.text_edit.as_ref()
     }
 
+    pub(crate) fn runtime_agent_status(&self) -> String {
+        self.runtime_attachment.status_text()
+    }
+
+    pub(crate) fn active_admin_socket_path(&self) -> Option<&Path> {
+        self.runtime_attachment.active_socket_path()
+    }
+
     pub(crate) fn is_editing_text(&self) -> bool {
         self.text_edit.is_some()
+    }
+
+    pub(crate) fn attach_agent(&mut self, attachment: RuntimeAttachment) {
+        let status = attachment.status_text();
+        self.runtime_attachment = attachment;
+        self.status = StatusMessage::info(status);
+    }
+
+    pub(crate) fn detach_agent(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.runtime_attachment = RuntimeAttachment::lost(message.clone());
+        self.status = StatusMessage::error(message);
     }
 
     pub(crate) fn handle_action(&mut self, action: TuiAction) -> Option<TuiEffect> {
@@ -261,6 +308,7 @@ impl TuiApp {
             | TuiAction::TextBackspace
             | TuiAction::TextSubmit
             | TuiAction::TextCancel => {}
+            TuiAction::StartProcessSearch => self.begin_process_search(),
             TuiAction::Click(target) => return self.handle_click(target),
             TuiAction::Save => {
                 return Some(TuiEffect::SaveConfig);
@@ -315,7 +363,7 @@ impl TuiApp {
     pub(crate) fn selected_process_name(&self) -> Option<&str> {
         self.processes
             .entries()
-            .get(self.selected_process_index)
+            .get(self.process_view.selected_index()?)
             .map(|process| process.name.as_str())
     }
 
@@ -371,11 +419,8 @@ impl TuiApp {
     }
 
     fn select_process(&mut self, index: usize) {
-        if index < self.processes.entries().len() {
-            self.selected_process_index = index;
-            self.active_tab = TuiTab::Processes;
-            self.keep_process_visible(1);
-        }
+        self.process_view.select(index, &self.processes);
+        self.active_tab = TuiTab::Processes;
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -395,20 +440,17 @@ impl TuiApp {
     }
 
     fn move_process(&mut self, delta: isize) {
-        let len = self.processes.entries().len();
-        if len == 0 {
-            return;
-        }
-        self.selected_process_index = offset_index(self.selected_process_index, len, delta);
-        self.keep_process_visible(1);
+        self.process_view.move_selection(delta, &self.processes);
     }
 
     pub(crate) async fn refresh_traffic(&mut self) {
-        if !self.config.admin.enabled {
-            self.traffic.mark_admin_disabled();
-            self.status = StatusMessage::warning("Enable admin to view live traffic in the TUI");
+        let Some(socket_path) = self.runtime_attachment.active_socket_path() else {
+            self.traffic.mark_admin_unavailable(
+                "No active agent admin socket is attached to this TUI session",
+            );
+            self.status = StatusMessage::warning(self.traffic.status().text.clone());
             return;
-        }
+        };
         let selector = match self.selected_process_selector() {
             Some(selector) => selector,
             None if self.processes.entries().is_empty() => {
@@ -424,9 +466,7 @@ impl TuiApp {
                 return;
             }
         };
-        self.traffic
-            .refresh(&self.config.admin.socket_path, selector)
-            .await;
+        self.traffic.refresh(socket_path, selector).await;
         match self.traffic.status().kind {
             super::traffic::TrafficStatusKind::Error => {
                 self.status = StatusMessage::warning(self.traffic.status().text.clone());
@@ -438,12 +478,13 @@ impl TuiApp {
     }
 
     fn move_traffic(&mut self, delta: isize) {
-        self.traffic.move_selection(delta, 1);
+        self.traffic
+            .move_selection(delta, self.traffic_visible_rows);
     }
 
     fn select_traffic_row(&mut self, index: usize) {
         self.active_tab = TuiTab::Traffic;
-        self.traffic.select_row(index, 1);
+        self.traffic.select_row(index, self.traffic_visible_rows);
     }
 
     fn adjust_selected(&mut self, direction: isize) -> Option<TuiEffect> {
@@ -479,21 +520,15 @@ impl TuiApp {
             return None;
         }
         match control {
-            ControlId::EnableAdmin => {
-                self.enable_admin();
+            ControlId::ReloadRuntimeActions => Some(TuiEffect::ReloadRuntimeActions),
+            ControlId::SearchProcesses => {
+                self.begin_process_search();
                 None
             }
-            ControlId::ReloadRuntimeActions => Some(TuiEffect::ReloadRuntimeActions),
-        }
-    }
-
-    fn enable_admin(&mut self) {
-        if self.config.admin.enabled {
-            return;
-        }
-        match apply_field(&mut self.config, FieldId::AdminEnabled, 1, None) {
-            FieldApplyOutcome::Changed(message) => self.mark_dirty(message),
-            FieldApplyOutcome::MissingProcessSelector | FieldApplyOutcome::Unchanged => {}
+            ControlId::ClearProcessSearch => {
+                self.clear_process_search();
+                None
+            }
         }
     }
 
@@ -503,12 +538,29 @@ impl TuiApp {
         };
         let label = field.label().to_string();
         self.text_edit = Some(TextEditSession {
-            field,
+            target: TextEditTarget::Field(field),
             label: label.clone(),
             buffer: value,
             replace_on_input: true,
         });
         self.status = StatusMessage::info(format!("Editing {label}"));
+    }
+
+    fn begin_process_search(&mut self) {
+        self.select_tab(TuiTab::Processes);
+        self.text_edit = Some(TextEditSession {
+            target: TextEditTarget::ProcessSearch,
+            label: "Process search".to_string(),
+            buffer: self.process_view.filter().to_string(),
+            replace_on_input: self.process_view.filter().is_empty(),
+        });
+        self.status = StatusMessage::info("Editing process search");
+    }
+
+    fn clear_process_search(&mut self) {
+        if self.process_view.clear_filter(&self.processes) {
+            self.status = StatusMessage::info("Process search cleared");
+        }
     }
 
     fn handle_text_edit_action(&mut self, action: TuiAction) -> Option<TuiEffect> {
@@ -548,30 +600,45 @@ impl TuiApp {
         let Some(edit) = self.text_edit.take() else {
             return;
         };
-        match apply_text_field(&mut self.config, edit.field, edit.buffer) {
-            FieldApplyOutcome::Changed(message) => {
-                self.mark_dirty(message);
-                self.clamp_selection();
+        match edit.target {
+            TextEditTarget::Field(field) => {
+                match apply_text_field(&mut self.config, field, edit.buffer) {
+                    FieldApplyOutcome::Changed(message) => {
+                        self.mark_dirty(message);
+                        self.clamp_selection();
+                    }
+                    FieldApplyOutcome::MissingProcessSelector => {
+                        self.status = self.process_selector_warning();
+                    }
+                    FieldApplyOutcome::Unchanged => {}
+                }
             }
-            FieldApplyOutcome::MissingProcessSelector => {
-                self.status = self.process_selector_warning();
-            }
-            FieldApplyOutcome::Unchanged => {}
+            TextEditTarget::ProcessSearch => self.apply_process_search(edit.buffer),
+        }
+    }
+
+    fn apply_process_search(&mut self, query: String) {
+        self.process_view.set_filter(query, &self.processes);
+        if self.process_view.filter().is_empty() {
+            self.status = StatusMessage::info("Process search cleared");
+        } else {
+            let count = self.filtered_process_indices().len();
+            self.status = StatusMessage::info(format!("Process search matched {count} entries"));
         }
     }
 
     fn selected_process_selector(&self) -> Option<probe_core::Selector> {
         self.processes
             .entries()
-            .get(self.selected_process_index)
+            .get(self.process_view.selected_index()?)
             .and_then(|process| process.selector())
     }
 
     fn process_selector_warning(&self) -> StatusMessage {
         let message = self
-            .processes
-            .entries()
-            .get(self.selected_process_index)
+            .process_view
+            .selected_index()
+            .and_then(|index| self.processes.entries().get(index))
             .map(|process| {
                 format!(
                     "Selected process {} has no readable executable path; selector was not changed",
@@ -582,21 +649,7 @@ impl TuiApp {
         StatusMessage::warning(message)
     }
 
-    fn keep_process_visible(&mut self, visible_rows: usize) {
-        if self.selected_process_index < self.process_scroll {
-            self.process_scroll = self.selected_process_index;
-        }
-        if visible_rows > 0 {
-            let end = self.process_scroll.saturating_add(visible_rows);
-            if self.selected_process_index >= end {
-                self.process_scroll = self
-                    .selected_process_index
-                    .saturating_sub(visible_rows.saturating_sub(1));
-            }
-        }
-    }
-
-    fn mark_dirty(&mut self, message: impl Into<String>) {
+    pub(crate) fn mark_dirty(&mut self, message: impl Into<String>) {
         self.dirty = true;
         self.status = StatusMessage::info(message);
     }
@@ -606,10 +659,7 @@ impl TuiApp {
         if self.selected_field_index >= targets.len() {
             self.selected_field_index = targets.len().saturating_sub(1);
         }
-        let process_count = self.processes.entries().len();
-        if self.selected_process_index >= process_count {
-            self.selected_process_index = process_count.saturating_sub(1);
-        }
+        self.process_view.clamp(&self.processes);
     }
 }
 
@@ -643,6 +693,7 @@ mod tests {
         super::{
             controls::{ControlId, FocusTarget},
             processes::{ProcessCatalog, ProcessEntry},
+            runtime_attachment::RuntimeAttachment,
         },
         *,
     };
@@ -707,15 +758,64 @@ mod tests {
         assert!(!app.dirty());
     }
 
+    #[test]
+    fn process_navigation_keeps_context_above_selected_row() {
+        let mut app = multi_process_app();
+        app.select_tab(TuiTab::Processes);
+        app.set_process_viewport_rows(3);
+
+        app.handle_action(TuiAction::MoveDown);
+        app.handle_action(TuiAction::MoveDown);
+        app.handle_action(TuiAction::MoveDown);
+
+        assert_eq!(app.selected_process_index(), Some(3));
+        assert_eq!(app.process_scroll(), 1);
+    }
+
+    #[test]
+    fn process_search_filters_selection_and_can_be_cleared_by_control() {
+        let mut app = multi_process_app();
+
+        app.handle_action(TuiAction::StartProcessSearch);
+        input_text(&mut app, "nginx");
+        app.handle_action(TuiAction::TextSubmit);
+
+        assert_eq!(app.process_filter(), "nginx");
+        assert_eq!(app.filtered_process_indices(), vec![1]);
+        assert_eq!(app.selected_process_index(), Some(1));
+
+        app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::ClearProcessSearch,
+        )));
+
+        assert!(app.process_filter().is_empty());
+        assert_eq!(app.filtered_process_indices().len(), 5);
+    }
+
+    #[test]
+    fn process_search_with_no_matches_clears_selected_process() {
+        let mut app = multi_process_app();
+
+        app.handle_action(TuiAction::StartProcessSearch);
+        input_text(&mut app, "does-not-exist");
+        app.handle_action(TuiAction::TextSubmit);
+
+        assert!(app.filtered_process_indices().is_empty());
+        assert_eq!(app.selected_process_index(), None);
+        assert!(app.selected_process_selector().is_none());
+    }
+
     #[tokio::test]
     async fn traffic_view_fails_closed_when_no_process_selector_is_available() {
-        let mut config = AgentConfig::default();
-        config.admin.enabled = true;
+        let config = AgentConfig::default();
         let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
             config,
             ProcessCatalog::default(),
         );
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/missing-admin.sock",
+        )));
         app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
 
         app.refresh_traffic().await;
@@ -794,22 +894,6 @@ mod tests {
         assert_eq!(left_effect, None);
         assert!(!keyboard_app.dirty());
         assert!(!mouse_app.dirty());
-    }
-
-    #[test]
-    fn traffic_admin_enable_shares_keyboard_and_mouse_action_path() {
-        let mut keyboard_app = test_app();
-        keyboard_app.select_tab(TuiTab::Traffic);
-        keyboard_app.handle_action(TuiAction::NextValue);
-
-        let mut mouse_app = test_app();
-        mouse_app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
-        mouse_app.handle_action(TuiAction::Click(HitTarget::Control(ControlId::EnableAdmin)));
-
-        assert!(keyboard_app.config.admin.enabled);
-        assert_eq!(keyboard_app.config.admin, mouse_app.config.admin);
-        assert!(keyboard_app.dirty());
-        assert!(mouse_app.dirty());
     }
 
     #[test]
@@ -894,6 +978,29 @@ mod tests {
                 argv_count: 1,
             }]),
         )
+    }
+
+    fn multi_process_app() -> TuiApp {
+        TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::from_entries([
+                process(1, "curl", "/usr/bin/curl"),
+                process(2, "nginx", "/usr/sbin/nginx"),
+                process(3, "postgres", "/usr/bin/postgres"),
+                process(4, "redis", "/usr/bin/redis-server"),
+                process(5, "python", "/usr/bin/python3"),
+            ]),
+        )
+    }
+
+    fn process(pid: u32, name: &str, exe_path: &str) -> ProcessEntry {
+        ProcessEntry {
+            pid,
+            name: name.to_string(),
+            exe_path: Some(PathBuf::from(exe_path)),
+            argv_count: 1,
+        }
     }
 
     fn export_app(transport: ExporterTransportConfig) -> TuiApp {
