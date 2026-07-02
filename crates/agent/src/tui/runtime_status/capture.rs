@@ -110,8 +110,19 @@ impl CaptureDiagnostics {
             || self.snapshot.mode == CapturePlanMode::Unavailable
     }
 
+    pub(super) fn using_live_host(&self) -> bool {
+        self.snapshot.selected_input_source == Some(CaptureInputSource::LiveHost)
+            || (self.snapshot.selected_input_source.is_none()
+                && self.snapshot.selected_backend.is_some_and(live_backend))
+    }
+
     fn using_mitm_plaintext_bridge(&self) -> bool {
         self.snapshot.selected_input_source == Some(CaptureInputSource::MitmPlaintextBridge)
+    }
+
+    pub(super) fn live_host_status_prefix(&self) -> Option<String> {
+        self.using_live_host()
+            .then(|| format!("Capture {} active", self.selected_backend_label()))
     }
 
     fn selected_backend_label(&self) -> &'static str {

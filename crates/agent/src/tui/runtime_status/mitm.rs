@@ -20,6 +20,11 @@ use crate::{
     },
 };
 
+use super::{
+    CaptureDiagnosticMessage,
+    mitm_data_path::{MitmDataPathDiagnosis, MitmDataPathMessageKind, MitmPathStatus},
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MitmDiagnostics {
     enforcement_status: EnforcementStatusMode,
@@ -73,7 +78,7 @@ impl MitmDiagnostics {
     }
 
     pub(super) fn next_step(&self) -> String {
-        self.data_path_diagnosis().next_action
+        self.data_path_diagnosis().next_action().to_string()
     }
 
     pub(super) fn detail_lines(&self) -> Vec<String> {
@@ -127,6 +132,49 @@ impl MitmDiagnostics {
         lines
     }
 
+    pub(super) fn live_side_channel_status_message(
+        &self,
+        traffic_empty: bool,
+    ) -> Option<CaptureDiagnosticMessage> {
+        let runtime = self.runtime_l7_mitm.as_ref()?;
+        match runtime.plaintext_bridge.mode {
+            L7MitmPlaintextBridgeMode::Active => self.active_bridge_status_message(traffic_empty),
+            L7MitmPlaintextBridgeMode::Configured | L7MitmPlaintextBridgeMode::Ready => {
+                Some(CaptureDiagnosticMessage::Warning(format!(
+                    "MITM bridge is not active yet: {}",
+                    bridge_activation_action(runtime.plaintext_bridge.mode)
+                )))
+            }
+            L7MitmPlaintextBridgeMode::DisabledAfterError => {
+                Some(CaptureDiagnosticMessage::Warning(format!(
+                    "MITM bridge disabled: {}",
+                    runtime
+                        .plaintext_bridge
+                        .disable_reason
+                        .as_deref()
+                        .unwrap_or("disabled after runtime error")
+                )))
+            }
+            L7MitmPlaintextBridgeMode::NotConfigured => None,
+        }
+    }
+
+    fn active_bridge_status_message(
+        &self,
+        traffic_empty: bool,
+    ) -> Option<CaptureDiagnosticMessage> {
+        let diagnosis = self.data_path_diagnosis();
+        match diagnosis.status_message_kind() {
+            MitmDataPathMessageKind::Info if traffic_empty => Some(CaptureDiagnosticMessage::Info(
+                format!("{}; no matching events yet", diagnosis.status_summary()),
+            )),
+            MitmDataPathMessageKind::Info => None,
+            MitmDataPathMessageKind::Warning => Some(CaptureDiagnosticMessage::Warning(
+                diagnosis.status_summary().to_string(),
+            )),
+        }
+    }
+
     fn is_relevant(&self) -> bool {
         self.strategy.is_mitm()
             || !matches!(
@@ -155,12 +203,7 @@ impl MitmDiagnostics {
     }
 
     fn mitm_visibility_lines(&self) -> Vec<String> {
-        let diagnosis = self.data_path_diagnosis();
-        vec![
-            diagnosis.path_labels,
-            diagnosis.plain_http,
-            diagnosis.tls_http,
-        ]
+        self.data_path_diagnosis().visibility_lines()
     }
 
     fn data_path_diagnosis(&self) -> MitmDataPathDiagnosis {
@@ -169,6 +212,8 @@ impl MitmDiagnostics {
                 "path labels: disabled until scoped MITM interception selector is configured",
                 "plain HTTP: unavailable until scoped MITM interception selector is configured",
                 "TLS-decrypted HTTP: unavailable until scoped MITM interception selector is configured",
+                MitmPathStatus::Unavailable,
+                MitmPathStatus::Unavailable,
                 "MITM path is configured but has no scoped interception selector",
             );
         }
@@ -186,6 +231,8 @@ impl MitmDiagnostics {
                 format!("path labels: disabled because {blocker}"),
                 format!("plain HTTP: blocked because {blocker}"),
                 format!("TLS-decrypted HTTP: blocked because {blocker}"),
+                MitmPathStatus::Blocked,
+                MitmPathStatus::Blocked,
                 blocker,
             );
         }
@@ -196,6 +243,8 @@ impl MitmDiagnostics {
                     "path labels: disabled until MITM plaintext bridge feeds traffic events",
                     "plain HTTP: unavailable until MITM plaintext bridge is enabled",
                     "TLS-decrypted HTTP: unavailable until MITM plaintext bridge is enabled",
+                    MitmPathStatus::Unavailable,
+                    MitmPathStatus::Unavailable,
                     format!(
                         "MITM path needs a plaintext bridge to feed captured {MITM_PLAINTEXT_COVERAGE} into traffic events"
                     ),
@@ -210,6 +259,8 @@ impl MitmDiagnostics {
                         format!(
                             "TLS-decrypted HTTP: blocked because MITM plaintext bridge runtime is disabled: {reason}"
                         ),
+                        MitmPathStatus::Blocked,
+                        MitmPathStatus::Blocked,
                         format!("MITM backend is unhealthy: {reason}"),
                     );
                 }
@@ -220,6 +271,8 @@ impl MitmDiagnostics {
                         format!(
                             "TLS-decrypted HTTP: blocked because MITM backend is unhealthy: {reason}"
                         ),
+                        MitmPathStatus::Blocked,
+                        MitmPathStatus::Blocked,
                         format!("MITM backend is unhealthy: {reason}"),
                     );
                 }
@@ -227,30 +280,46 @@ impl MitmDiagnostics {
                 let plain_http = format!(
                     "plain HTTP: visible as {MITM_HTTP_PATH_LABEL} without TLS client trust"
                 );
-                let tls_line = match self.client_trust {
-                    TransparentInterceptionMitmClientTrustPlan::Disabled => {
+                let (tls_line, tls_status) = match self.client_trust {
+                    TransparentInterceptionMitmClientTrustPlan::Disabled => (
                         "TLS-decrypted HTTP: blocked until MITM client trust is configured"
-                            .to_string()
-                    }
+                            .to_string(),
+                        MitmPathStatus::Blocked,
+                    ),
                     TransparentInterceptionMitmClientTrustPlan::OperatorManaged => {
-                        self.operator_managed_tls_line()
+                        self.operator_managed_tls_status()
                     }
                 };
-                MitmDataPathDiagnosis::labeled(plain_http, tls_line, self.tls_next_action())
+                MitmDataPathDiagnosis::labeled(
+                    plain_http,
+                    tls_line,
+                    MitmPathStatus::Ready,
+                    tls_status,
+                    self.tls_next_action(),
+                )
             }
         }
     }
 
-    fn operator_managed_tls_line(&self) -> String {
+    fn operator_managed_tls_status(&self) -> (String, MitmPathStatus) {
         if let Some(blocker) = self.trust_materials.first_unavailable_summary() {
-            return format!("TLS-decrypted HTTP: blocked because {blocker}");
+            return (
+                format!("TLS-decrypted HTTP: blocked because {blocker}"),
+                MitmPathStatus::Blocked,
+            );
         }
         if let Some(unknown) = self.trust_materials.first_unknown_summary() {
-            return format!("TLS-decrypted HTTP: unknown because {unknown}");
+            return (
+                format!("TLS-decrypted HTTP: unknown because {unknown}"),
+                MitmPathStatus::Unknown,
+            );
         }
-        format!(
-            "TLS-decrypted HTTP: visible as {MITM_TLS_PATH_LABEL} after {}",
-            self.client_trust_action()
+        (
+            format!(
+                "TLS-decrypted HTTP: visible as {MITM_TLS_PATH_LABEL} after {}",
+                self.client_trust_action()
+            ),
+            MitmPathStatus::Ready,
         )
     }
 
@@ -301,45 +370,6 @@ impl MitmDiagnostics {
         self.capabilities
             .iter()
             .find(|capability| capability.mode == RuntimeMode::Unavailable)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MitmDataPathDiagnosis {
-    path_labels: String,
-    plain_http: String,
-    tls_http: String,
-    next_action: String,
-}
-
-impl MitmDataPathDiagnosis {
-    fn disabled(
-        path_labels: impl Into<String>,
-        plain_http: impl Into<String>,
-        tls_http: impl Into<String>,
-        next_action: impl Into<String>,
-    ) -> Self {
-        Self {
-            path_labels: path_labels.into(),
-            plain_http: plain_http.into(),
-            tls_http: tls_http.into(),
-            next_action: next_action.into(),
-        }
-    }
-
-    fn labeled(
-        plain_http: impl Into<String>,
-        tls_http: impl Into<String>,
-        next_action: impl Into<String>,
-    ) -> Self {
-        Self {
-            path_labels: format!(
-                "path labels: {MITM_HTTP_PATH_LABEL}=plain HTTP, {MITM_TLS_PATH_LABEL}=TLS-decrypted HTTP"
-            ),
-            plain_http: plain_http.into(),
-            tls_http: tls_http.into(),
-            next_action: next_action.into(),
-        }
     }
 }
 
@@ -811,6 +841,22 @@ fn mitm_client_trust_action(
         TransparentInterceptionMitmClientTrustPlan::OperatorManaged => {
             trust_materials.client_trust_action().to_string()
         }
+    }
+}
+
+fn bridge_activation_action(mode: L7MitmPlaintextBridgeMode) -> &'static str {
+    match mode {
+        L7MitmPlaintextBridgeMode::Configured => {
+            "waiting for MITM backend readiness and capture provider preflight to open the plaintext bridge"
+        }
+        L7MitmPlaintextBridgeMode::Ready => {
+            "waiting for capture provider activation to read the MITM plaintext bridge"
+        }
+        L7MitmPlaintextBridgeMode::Active => "MITM plaintext bridge is active",
+        L7MitmPlaintextBridgeMode::DisabledAfterError => {
+            "fix the MITM plaintext bridge runtime error"
+        }
+        L7MitmPlaintextBridgeMode::NotConfigured => "configure the MITM plaintext bridge",
     }
 }
 

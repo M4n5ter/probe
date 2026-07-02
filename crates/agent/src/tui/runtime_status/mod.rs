@@ -5,6 +5,7 @@ use thiserror::Error;
 
 mod capture;
 mod mitm;
+mod mitm_data_path;
 
 use crate::{
     admin::{AdminClientError, AdminRequest, send_admin_json_request_with_timeout},
@@ -49,8 +50,21 @@ impl TrafficRuntimeDiagnostics {
 
     pub(crate) fn status_message(&self, traffic_empty: bool) -> Option<CaptureDiagnosticMessage> {
         let mitm_next_step = self.mitm_next_step();
-        self.capture
-            .status_message(traffic_empty, mitm_next_step.as_str())
+        let capture_message = self
+            .capture
+            .status_message(traffic_empty, mitm_next_step.as_str());
+        let mitm_message = self.live_mitm_side_channel_status_message(traffic_empty);
+        if matches!(capture_message, Some(CaptureDiagnosticMessage::Info(_)))
+            && mitm_message.is_some()
+        {
+            let prefix = self
+                .capture
+                .live_host_status_prefix()
+                .map(|prefix| format!("{prefix}; "))
+                .unwrap_or_default();
+            return mitm_message.map(|message| message.with_prefix(prefix));
+        }
+        combine_diagnostic_messages(capture_message, mitm_message)
     }
 
     pub(crate) fn detail_lines(&self) -> Vec<String> {
@@ -80,6 +94,33 @@ impl TrafficRuntimeDiagnostics {
             .as_ref()
             .map_or_else(missing_mitm_next_step, MitmDiagnostics::next_step)
     }
+
+    fn live_mitm_side_channel_status_message(
+        &self,
+        traffic_empty: bool,
+    ) -> Option<CaptureDiagnosticMessage> {
+        if !self.capture.using_live_host() {
+            return None;
+        }
+        self.mitm
+            .as_ref()
+            .and_then(|mitm| mitm.live_side_channel_status_message(traffic_empty))
+    }
+}
+
+fn combine_diagnostic_messages(
+    primary: Option<CaptureDiagnosticMessage>,
+    secondary: Option<CaptureDiagnosticMessage>,
+) -> Option<CaptureDiagnosticMessage> {
+    match (primary, secondary) {
+        (None, None) => None,
+        (Some(message), None) | (None, Some(message)) => Some(message),
+        (Some(primary), Some(secondary)) => {
+            let kind = primary.max_kind(&secondary);
+            let text = format!("{}; {}", primary.into_text(), secondary.into_text());
+            Some(CaptureDiagnosticMessage::from_kind(kind, text))
+        }
+    }
 }
 
 fn missing_mitm_next_step() -> String {
@@ -102,6 +143,46 @@ pub(crate) enum CaptureDiagnosticMessage {
     Info(String),
     Warning(String),
     Error(String),
+}
+
+impl CaptureDiagnosticMessage {
+    fn from_kind(kind: CaptureDiagnosticMessageKind, text: String) -> Self {
+        match kind {
+            CaptureDiagnosticMessageKind::Info => Self::Info(text),
+            CaptureDiagnosticMessageKind::Warning => Self::Warning(text),
+            CaptureDiagnosticMessageKind::Error => Self::Error(text),
+        }
+    }
+
+    fn max_kind(&self, other: &Self) -> CaptureDiagnosticMessageKind {
+        self.kind().max(other.kind())
+    }
+
+    fn kind(&self) -> CaptureDiagnosticMessageKind {
+        match self {
+            Self::Info(_) => CaptureDiagnosticMessageKind::Info,
+            Self::Warning(_) => CaptureDiagnosticMessageKind::Warning,
+            Self::Error(_) => CaptureDiagnosticMessageKind::Error,
+        }
+    }
+
+    fn into_text(self) -> String {
+        match self {
+            Self::Info(text) | Self::Warning(text) | Self::Error(text) => text,
+        }
+    }
+
+    fn with_prefix(self, prefix: String) -> Self {
+        let kind = self.kind();
+        Self::from_kind(kind, format!("{prefix}{}", self.into_text()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CaptureDiagnosticMessageKind {
+    Info,
+    Warning,
+    Error,
 }
 
 #[derive(Debug, Error)]
@@ -358,6 +439,127 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line.contains("l7 mitm backend health: healthy"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_report_live_capture_with_active_mitm_bridge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": [],
+                    "auto_mitm_plaintext_bridge_candidate": {
+                        "backend": "capture_event_feed",
+                        "runtime_mode": "available",
+                        "capability_mode": "available",
+                        "evidence_mode": "nominal",
+                        "reason": null,
+                        "evidence_reason": null
+                    }
+                },
+                "enforcement": configured_mitm_enforcement_status_json()?,
+                "tls": mitm_tls_material_status_json("available", None, "available", None)
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(true),
+            Some(CaptureDiagnosticMessage::Info(
+                "Capture ebpf active; MITM bridge ready for plain HTTP and TLS-decrypted HTTP after client trust; no matching events yet"
+                    .to_string()
+            ))
+        );
+        assert_eq!(diagnostics.status_message(false), None);
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_warn_when_active_mitm_bridge_data_path_is_blocked()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut enforcement = configured_mitm_enforcement_status_json()?;
+        enforcement["interception"]["runtime_l7_mitm"]["backend_health"]["mode"] =
+            json!("unhealthy");
+        enforcement["interception"]["runtime_l7_mitm"]["backend_health"]["last_failure_reason"] =
+            json!("readiness probe failed");
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": []
+                },
+                "enforcement": enforcement,
+                "tls": mitm_tls_material_status_json("available", None, "available", None)
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(false),
+            Some(CaptureDiagnosticMessage::Warning(
+                "MITM bridge data path is blocked".to_string()
+            ))
+        );
+        assert_eq!(
+            diagnostics.status_message(true),
+            Some(CaptureDiagnosticMessage::Warning(
+                "Capture ebpf active; MITM bridge data path is blocked".to_string()
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_report_bridge_runtime_action_before_activation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut enforcement = configured_mitm_enforcement_status_json()?;
+        enforcement["interception"]["runtime_l7_mitm"]["plaintext_bridge"]["mode"] = json!("ready");
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "libpcap",
+                    "selected_input_source": "live_host",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": []
+                },
+                "enforcement": enforcement
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+        let message = diagnostics.status_message(false);
+
+        assert_eq!(
+            message,
+            Some(CaptureDiagnosticMessage::Warning(
+                "MITM bridge is not active yet: waiting for capture provider activation to read the MITM plaintext bridge"
+                    .to_string()
+            ))
+        );
+        assert!(
+            !format!("{message:?}").contains("TLS trust"),
+            "bridge activation status must not reuse TLS trust next action"
         );
         Ok(())
     }
@@ -635,6 +837,47 @@ mod tests {
             lines.iter().any(|line| {
                 line == "next action: MITM backend is unhealthy: feed writer closed"
             })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_warn_when_live_capture_has_disabled_mitm_bridge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut enforcement = configured_mitm_enforcement_status_json()?;
+        enforcement["interception"]["runtime_l7_mitm"]["plaintext_bridge"]["mode"] =
+            json!("disabled_after_error");
+        enforcement["interception"]["runtime_l7_mitm"]["plaintext_bridge"]["disable_reason"] =
+            json!("feed writer closed");
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "libpcap",
+                    "selected_input_source": "live_host",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": [
+                        {
+                            "backend": "ebpf",
+                            "reason": "permission denied"
+                        }
+                    ]
+                },
+                "enforcement": enforcement
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(false),
+            Some(CaptureDiagnosticMessage::Warning(
+                "Capture using libpcap; passive fallback occurred (ebpf: permission denied); MITM bridge disabled: feed writer closed"
+                    .to_string()
+            ))
         );
         Ok(())
     }
