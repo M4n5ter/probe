@@ -35,6 +35,14 @@ impl ControlId {
         }
     }
 
+    pub(crate) fn traffic_action_label(self) -> &'static str {
+        match self {
+            Self::ConfigureOutboundMitm => "Out MITM",
+            Self::ConfigureInboundMitm => "In MITM",
+            _ => self.label(),
+        }
+    }
+
     pub(crate) fn value(self, _config: &AgentConfig) -> String {
         match self {
             Self::ReloadRuntimeActions => "uses active TUI runtime".to_string(),

@@ -9,7 +9,10 @@ mod mitm;
 use crate::{
     admin::{AdminClientError, AdminRequest, send_admin_json_request_with_timeout},
     status::{CaptureStatusSnapshot, EnforcementStatusSnapshot},
-    tui::copy::MITM_PLAINTEXT_COVERAGE,
+    tui::{
+        controls::ControlId,
+        copy::{MITM_PLAINTEXT_COVERAGE, MITM_QUICK_SETUP_APPLY},
+    },
 };
 
 use self::{capture::CaptureDiagnostics, mitm::MitmDiagnostics};
@@ -59,9 +62,10 @@ impl TrafficRuntimeDiagnostics {
                 vec![
                     "MITM diagnostics".to_string(),
                     "strategy: disabled".to_string(),
-                    format!(
-                        "next action: configure transparent MITM with plaintext bridge when passive capture is unavailable or when {MITM_PLAINTEXT_COVERAGE} visibility is needed"
-                    ),
+                    format!("coverage: {MITM_PLAINTEXT_COVERAGE}"),
+                    format!("quick setup: {}", missing_mitm_quick_setup_action()),
+                    format!("apply: {MITM_QUICK_SETUP_APPLY}"),
+                    format!("next action: {}", missing_mitm_next_step()),
                 ]
             },
             MitmDiagnostics::detail_lines,
@@ -69,15 +73,25 @@ impl TrafficRuntimeDiagnostics {
     }
 
     fn mitm_next_step(&self) -> String {
-        self.mitm.as_ref().map_or_else(
-            || {
-                format!(
-                    "configure transparent MITM with plaintext bridge to capture {MITM_PLAINTEXT_COVERAGE} when passive capture is unavailable"
-                )
-            },
-            MitmDiagnostics::next_step,
-        )
+        self.mitm
+            .as_ref()
+            .map_or_else(missing_mitm_next_step, MitmDiagnostics::next_step)
     }
+}
+
+fn missing_mitm_next_step() -> String {
+    format!(
+        "configure MITM fallback for {MITM_PLAINTEXT_COVERAGE}: {}",
+        missing_mitm_quick_setup_action()
+    )
+}
+
+fn missing_mitm_quick_setup_action() -> String {
+    format!(
+        "select a process in Traffic, then use {} for outbound clients or {} for server listeners",
+        ControlId::ConfigureOutboundMitm.traffic_action_label(),
+        ControlId::ConfigureInboundMitm.traffic_action_label()
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,7 +188,10 @@ mod tests {
         },
         status::enforcement_status_with_transparent_proxy_for_test,
         tcp_health::TcpHealthMode,
-        tui::copy::MITM_PLAINTEXT_COVERAGE,
+        tui::{
+            controls::ControlId,
+            copy::{MITM_PLAINTEXT_COVERAGE, MITM_QUICK_SETUP_APPLY},
+        },
     };
 
     #[test]
@@ -214,14 +231,25 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(true),
             Some(CaptureDiagnosticMessage::Error(format!(
-                "Capture unavailable: ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available; configure transparent MITM with plaintext bridge to capture {MITM_PLAINTEXT_COVERAGE} when passive capture is unavailable"
+                "Capture unavailable: ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available; configure MITM fallback for {MITM_PLAINTEXT_COVERAGE}: {}",
+                missing_mitm_quick_setup_action()
             )))
         );
+        let lines = diagnostics.detail_lines();
+        assert!(lines.iter().any(|line| line == "strategy: disabled"));
+        assert!(lines.iter().any(|line| {
+            line.contains(ControlId::ConfigureOutboundMitm.traffic_action_label())
+                && line.contains(ControlId::ConfigureInboundMitm.traffic_action_label())
+        }));
         assert!(
-            diagnostics
-                .detail_lines()
+            lines
                 .iter()
-                .any(|line| line == "strategy: disabled")
+                .any(|line| line == &format!("quick setup: {}", missing_mitm_quick_setup_action()))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == &format!("apply: {MITM_QUICK_SETUP_APPLY}"))
         );
         Ok(())
     }

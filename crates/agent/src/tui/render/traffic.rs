@@ -210,7 +210,7 @@ fn render_traffic_action_bar(
         frame,
         hits,
         action_area(area, x, y),
-        "Out MITM",
+        ControlId::ConfigureOutboundMitm.traffic_action_label(),
         HitTarget::Control(ControlId::ConfigureOutboundMitm),
         app.is_hovered(HitTarget::Control(ControlId::ConfigureOutboundMitm)),
     )
@@ -219,7 +219,7 @@ fn render_traffic_action_bar(
         frame,
         hits,
         action_area(area, x, y),
-        "In MITM",
+        ControlId::ConfigureInboundMitm.traffic_action_label(),
         HitTarget::Control(ControlId::ConfigureInboundMitm),
         app.is_hovered(HitTarget::Control(ControlId::ConfigureInboundMitm)),
     );
