@@ -2,6 +2,7 @@ use probe_config::AgentConfig;
 
 use super::{
     app::TuiTab,
+    copy::MITM_PLAINTEXT_COVERAGE,
     fields::{FieldId, field_value, fields_for_tab},
 };
 
@@ -38,10 +39,10 @@ impl ControlId {
         match self {
             Self::ReloadRuntimeActions => "uses active TUI runtime".to_string(),
             Self::ConfigureOutboundMitm => {
-                "process-scoped TLS/plain HTTP capture via product proxy".to_string()
+                format!("process-scoped {MITM_PLAINTEXT_COVERAGE} via product proxy")
             }
             Self::ConfigureInboundMitm => {
-                "process-scoped server traffic capture via product proxy".to_string()
+                format!("process-scoped server {MITM_PLAINTEXT_COVERAGE} via product proxy")
             }
             Self::SearchProcesses | Self::ClearProcessSearch => String::new(),
         }

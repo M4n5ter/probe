@@ -269,14 +269,14 @@ fn traffic_refresh_error_message(error: &client::TrafficClientError) -> String {
 mod tests {
     use probe_config::{CaptureBackend, CaptureSelection};
     use probe_core::RuntimeMode;
-    use runtime::{CaptureEvidenceMode, CapturePlanMode};
+    use runtime::{CaptureEvidenceMode, CaptureInputSource, CapturePlanMode};
 
     use super::*;
     use crate::{
         status::{
             CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
         },
-        tui::runtime_status::TrafficRuntimeDiagnostics,
+        tui::{copy::MITM_PLAINTEXT_COVERAGE, runtime_status::TrafficRuntimeDiagnostics},
     };
 
     #[test]
@@ -305,6 +305,29 @@ mod tests {
 
         assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
         assert_eq!(traffic.status().text, "tail_events failed");
+    }
+
+    #[test]
+    fn diagnostics_explain_active_mitm_plaintext_bridge_coverage() {
+        let mut traffic = TrafficState::default();
+
+        traffic.set_runtime_diagnostics(TrafficRuntimeDiagnostics::from_capture_snapshot(
+            active_mitm_bridge_capture_snapshot(),
+        ));
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Idle);
+        assert_eq!(
+            traffic.status().text,
+            format!(
+                "MITM plaintext bridge active for {MITM_PLAINTEXT_COVERAGE}; no matching events yet"
+            )
+        );
+        assert!(
+            traffic
+                .diagnostic_lines()
+                .iter()
+                .any(|line| line == &format!("coverage: {MITM_PLAINTEXT_COVERAGE}"))
+        );
     }
 
     #[test]
@@ -357,6 +380,31 @@ mod tests {
                 backend: CaptureBackend::Ebpf,
                 reason: "permission denied".to_string(),
             }],
+            provider: None,
+            input_activity: None,
+        }
+    }
+
+    fn active_mitm_bridge_capture_snapshot() -> CaptureStatusSnapshot {
+        CaptureStatusSnapshot {
+            selection: CaptureSelection::Auto,
+            selected_backend: Some(CaptureBackend::CaptureEventFeed),
+            selected_input_source: Some(CaptureInputSource::MitmPlaintextBridge),
+            provider_runtime_mode: Some(RuntimeMode::Available),
+            mode: CapturePlanMode::CaptureEventFeed,
+            reason: None,
+            evidence_mode: Some(CaptureEvidenceMode::Nominal),
+            evidence_reason: None,
+            candidates: vec![CaptureCandidateStatusSnapshot {
+                backend: CaptureBackend::CaptureEventFeed,
+                runtime_mode: RuntimeMode::Available,
+                capability_mode: RuntimeMode::Available,
+                evidence_mode: CaptureEvidenceMode::Nominal,
+                reason: None,
+                evidence_reason: None,
+            }],
+            auto_mitm_plaintext_bridge_candidate: None,
+            open_failures: Vec::new(),
             provider: None,
             input_activity: None,
         }

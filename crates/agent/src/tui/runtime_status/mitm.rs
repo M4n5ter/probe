@@ -11,6 +11,7 @@ use crate::{
     status::{EnforcementStatusMode, EnforcementStatusSnapshot},
     tcp_health::{TcpHealthMode, TcpHealthSnapshot},
     transparent_interception::{TransparentProxyRuntimeMode, TransparentProxyRuntimeSnapshot},
+    tui::copy::MITM_PLAINTEXT_COVERAGE,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +75,9 @@ impl MitmDiagnostics {
             self.plaintext_bridge,
             TransparentInterceptionMitmPlaintextBridgePlan::Disabled
         ) {
-            return "MITM path needs a plaintext bridge to feed captured HTTP/TLS plaintext into traffic events".to_string();
+            return format!(
+                "MITM path needs a plaintext bridge to feed captured {MITM_PLAINTEXT_COVERAGE} into traffic events"
+            );
         }
         "MITM path is configured; inspect backend health, client trust, and plaintext bridge status"
             .to_string()

@@ -313,7 +313,9 @@ Operator TUI 能力事实：
   selector 时 fail-closed，不退回全机流量。
   Traffic tab 的 action bar 将 `[Watch]`、`[Out MITM]` 和 `[In MITM]` 放在事件浏览入口；键盘 `w`、`o`、`i`
   与鼠标点击进入同一 typed action path。`Watch` 仅改变 traffic selector；MITM quick actions 会为选中进程写入 scoped
-  product-proxy MITM、client trust、plaintext bridge 和 policy hook contract，保存后由 TUI-managed agent restart 应用。
+  product-proxy MITM、client trust、plaintext bridge 和 policy hook contract。出站 quick action 默认约束
+  `remote_ports = [80, 443]`，让普通明文 HTTP 和 TLS 解密后 HTTP 进入同一条 plaintext bridge；保存后由
+  TUI-managed agent restart 应用。
   当没有 active admin socket 时，Traffic tab fail-closed 并显示 agent runtime 不可用状态。
 - `tail_events` 是 non-mutating admin command。它读取 `after_sequence` 之后的 export records，按可选 selector
   过滤，并返回 `next_after_sequence`；该响应 cursor 不会 ack 任何 exporter sink cursor。
@@ -505,8 +507,8 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
   - fallback 语义：当配置了 MITM plaintext bridge 且 `capture.selection = "auto"` 时，status 在
     `capture.auto_mitm_plaintext_bridge_candidate` 暴露可用的 capture-event feed fallback candidate。passive live provider 在
     plan-time 均不可用或运行期全部 open 失败后，实际运行输入源通过
-    `capture.selected_input_source = "mitm_plaintext_bridge"` 标识。MITM plaintext bridge 为普通明文流量和 TLS 解密后的流量提供同一条
-    capture-event feed 输入路径。
+    `capture.selected_input_source = "mitm_plaintext_bridge"` 标识。MITM plaintext bridge 为普通明文 HTTP 和
+    TLS 解密后 HTTP 提供同一条 capture-event feed 输入路径。
 
 归因能力：
 
@@ -609,7 +611,8 @@ TLS 明文与协议能力：
     fixture 才会写入 action report、返回 delegated deny，并向下游连接返回代理侧 deny response。
   - 可选 `plaintext_bridge.mode = "capture_event_feed"` 使用 JSON-lines `CaptureEvent` feed 作为 MITM plaintext bridge；
     bridge 可以作为 live capture sidecar 进入同一 parser/policy/spool/export pipeline，也可以在
-    `capture.selection = "auto"` 且 eBPF/libpcap 不可用时作为 `capture_event_feed` traffic input。
+    `capture.selection = "auto"` 且 eBPF/libpcap 不可用时作为普通明文 HTTP 与 TLS 解密后 HTTP 的
+    `capture_event_feed` traffic input。
     bridge 写入的 flow 事件使用 `source = l7_mitm_plaintext` 与 `provider = interception`，
     因此可与 generic external plaintext feed 在 provenance、policy view 和审计中区分。
     runtime bridge mode 依次表达 `configured`、`ready`、`active` 和 `disabled_after_error`：

@@ -5,7 +5,7 @@ use crate::{
     status::{
         CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
     },
-    tui::wire::capture_selection_name,
+    tui::{copy::MITM_PLAINTEXT_COVERAGE, wire::capture_selection_name},
 };
 
 use super::CaptureDiagnosticMessage;
@@ -28,17 +28,19 @@ impl CaptureDiagnostics {
         if self.using_mitm_plaintext_bridge() {
             if let Some(summary) = self.open_failure_summary() {
                 return Some(CaptureDiagnosticMessage::Warning(format!(
-                    "Passive capture failed ({summary}); using MITM plaintext bridge"
+                    "Passive capture failed ({summary}); using MITM plaintext bridge for {MITM_PLAINTEXT_COVERAGE}"
                 )));
             }
             if let Some(summary) = self.passive_unavailable_summary() {
                 return Some(CaptureDiagnosticMessage::Warning(format!(
-                    "Passive capture unavailable ({summary}); using MITM plaintext bridge"
+                    "Passive capture unavailable ({summary}); using MITM plaintext bridge for {MITM_PLAINTEXT_COVERAGE}"
                 )));
             }
             return traffic_empty.then(|| {
                 CaptureDiagnosticMessage::Info(
-                    "MITM plaintext bridge active; no matching events yet".to_string(),
+                    format!(
+                        "MITM plaintext bridge active for {MITM_PLAINTEXT_COVERAGE}; no matching events yet"
+                    ),
                 )
             });
         }
@@ -73,6 +75,9 @@ impl CaptureDiagnostics {
             format!("selected: {}", self.selected_backend_label()),
             format!("mode: {}", capture_plan_mode_name(self.snapshot.mode)),
         ];
+        if self.using_mitm_plaintext_bridge() {
+            lines.push(format!("coverage: {MITM_PLAINTEXT_COVERAGE}"));
+        }
         if let Some(reason) = &self.snapshot.reason {
             lines.push(format!("reason: {reason}"));
         }

@@ -9,6 +9,7 @@ mod mitm;
 use crate::{
     admin::{AdminClientError, AdminRequest, send_admin_json_request_with_timeout},
     status::{CaptureStatusSnapshot, EnforcementStatusSnapshot},
+    tui::copy::MITM_PLAINTEXT_COVERAGE,
 };
 
 use self::{capture::CaptureDiagnostics, mitm::MitmDiagnostics};
@@ -58,7 +59,9 @@ impl TrafficRuntimeDiagnostics {
                 vec![
                     "MITM diagnostics".to_string(),
                     "strategy: disabled".to_string(),
-                    "next action: configure transparent MITM with plaintext bridge when passive capture is unavailable or when full HTTP/TLS content visibility is needed".to_string(),
+                    format!(
+                        "next action: configure transparent MITM with plaintext bridge when passive capture is unavailable or when {MITM_PLAINTEXT_COVERAGE} visibility is needed"
+                    ),
                 ]
             },
             MitmDiagnostics::detail_lines,
@@ -68,8 +71,9 @@ impl TrafficRuntimeDiagnostics {
     fn mitm_next_step(&self) -> String {
         self.mitm.as_ref().map_or_else(
             || {
-                "configure transparent MITM with plaintext bridge to capture HTTP and TLS plaintext when passive capture is unavailable"
-                    .to_string()
+                format!(
+                    "configure transparent MITM with plaintext bridge to capture {MITM_PLAINTEXT_COVERAGE} when passive capture is unavailable"
+                )
             },
             MitmDiagnostics::next_step,
         )
@@ -170,6 +174,7 @@ mod tests {
         },
         status::enforcement_status_with_transparent_proxy_for_test,
         tcp_health::TcpHealthMode,
+        tui::copy::MITM_PLAINTEXT_COVERAGE,
     };
 
     #[test]
@@ -208,10 +213,9 @@ mod tests {
 
         assert_eq!(
             diagnostics.status_message(true),
-            Some(CaptureDiagnosticMessage::Error(
-                "Capture unavailable: ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available; configure transparent MITM with plaintext bridge to capture HTTP and TLS plaintext when passive capture is unavailable"
-                    .to_string()
-            ))
+            Some(CaptureDiagnosticMessage::Error(format!(
+                "Capture unavailable: ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available; configure transparent MITM with plaintext bridge to capture {MITM_PLAINTEXT_COVERAGE} when passive capture is unavailable"
+            )))
         );
         assert!(
             diagnostics
@@ -338,16 +342,21 @@ mod tests {
 
         assert_eq!(
             diagnostics.status_message(false),
-            Some(CaptureDiagnosticMessage::Warning(
-                "Passive capture failed (ebpf: object path is not configured; libpcap: libpcap is not installed); using MITM plaintext bridge"
-                    .to_string()
-            ))
+            Some(CaptureDiagnosticMessage::Warning(format!(
+                "Passive capture failed (ebpf: object path is not configured; libpcap: libpcap is not installed); using MITM plaintext bridge for {MITM_PLAINTEXT_COVERAGE}"
+            )))
         );
         assert!(
             diagnostics
                 .detail_lines()
                 .iter()
                 .any(|line| line == "selected: MITM plaintext bridge")
+        );
+        assert!(
+            diagnostics
+                .detail_lines()
+                .iter()
+                .any(|line| line == &format!("coverage: {MITM_PLAINTEXT_COVERAGE}"))
         );
         assert!(diagnostics.detail_lines().iter().any(|line| {
             line == "auto MITM plaintext bridge fallback: capture_event_feed: runtime=available, capability=available, evidence=nominal"
@@ -409,10 +418,9 @@ mod tests {
 
         assert_eq!(
             diagnostics.status_message(true),
-            Some(CaptureDiagnosticMessage::Warning(
-                "Passive capture unavailable (ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available); using MITM plaintext bridge"
-                    .to_string()
-            ))
+            Some(CaptureDiagnosticMessage::Warning(format!(
+                "Passive capture unavailable (ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available); using MITM plaintext bridge for {MITM_PLAINTEXT_COVERAGE}"
+            )))
         );
         Ok(())
     }
