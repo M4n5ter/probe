@@ -107,6 +107,36 @@ impl TrafficRuntimeDiagnostics {
         lines
     }
 
+    pub(crate) fn running_status_text(&self, traffic_empty: bool) -> String {
+        self.status_message(traffic_empty)
+            .map(CaptureDiagnosticMessage::into_text)
+            .unwrap_or_else(|| "data path ready".to_string())
+    }
+
+    pub(crate) fn local_status_text(&self) -> String {
+        self.capture
+            .local_status_message(self.mitm_next_step().as_str())
+            .map(CaptureDiagnosticMessage::into_text)
+            .unwrap_or_else(|| {
+                "local config is valid; run or attach an agent to confirm live traffic".to_string()
+            })
+    }
+
+    pub(crate) fn capture_overview_line(&self) -> String {
+        self.capture.overview_line()
+    }
+
+    pub(crate) fn mitm_overview_line(&self) -> String {
+        self.mitm.as_ref().map_or_else(
+            || {
+                format!(
+                    "not configured; {MITM_PROXY_FALLBACK_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
+                )
+            },
+            MitmDiagnostics::overview_line,
+        )
+    }
+
     fn mitm_detail_lines(&self) -> Vec<String> {
         self.mitm.as_ref().map_or_else(
             || {
@@ -123,7 +153,7 @@ impl TrafficRuntimeDiagnostics {
         )
     }
 
-    fn mitm_next_step(&self) -> String {
+    pub(crate) fn mitm_next_step(&self) -> String {
         self.mitm
             .as_ref()
             .map_or_else(missing_mitm_next_step, MitmDiagnostics::next_step)
@@ -1084,6 +1114,39 @@ mod tests {
         assert!(diagnostics.detail_lines().iter().any(|line| {
             line == "auto reliable MITM proxy fallback candidate: capture_event_feed: runtime=available, capability=available, evidence=nominal"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn local_status_text_does_not_claim_mitm_bridge_is_running()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "capture_event_feed",
+                    "selected_input_source": "mitm_plaintext_bridge",
+                    "mode": "capture_event_feed",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": []
+                }
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert!(diagnostics.running_status_text(true).contains("active"));
+        let local = diagnostics.local_status_text();
+        assert!(
+            local.contains("local config uses"),
+            "local status should describe readiness projection: {local}"
+        );
+        assert!(
+            !local.contains("active") && !local.contains("no matching events yet"),
+            "local status must not use running-agent wording: {local}"
+        );
         Ok(())
     }
 

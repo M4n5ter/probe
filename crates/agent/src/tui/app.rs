@@ -4,6 +4,7 @@ use probe_config::AgentConfig;
 
 use super::controls::{ControlId, FocusTarget, focus_targets_for_tab};
 use super::copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL, MITM_TLS_TRUST_ACTION};
+use super::data_path::{DataPathDiagnosticsView, DataPathOverviewLine};
 use super::fields::{
     FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
 };
@@ -242,6 +243,7 @@ pub(crate) struct TuiApp {
     traffic_visible_rows: usize,
     traffic_popup: Option<TrafficPopupState>,
     runtime_attachment: RuntimeAttachment,
+    data_path_diagnostics: DataPathDiagnosticsView,
     dirty: bool,
     should_quit: bool,
     status: StatusMessage,
@@ -265,7 +267,7 @@ impl TuiApp {
         processes: ProcessCatalog,
     ) -> Self {
         let status = initial_status(&processes);
-        Self {
+        let mut app = Self {
             config_path,
             config,
             active_tab: TuiTab::Overview,
@@ -275,6 +277,9 @@ impl TuiApp {
             traffic_visible_rows: 12,
             traffic_popup: None,
             runtime_attachment: RuntimeAttachment::default(),
+            data_path_diagnostics: DataPathDiagnosticsView::unavailable(
+                "local config diagnostics have not been evaluated yet",
+            ),
             dirty: false,
             should_quit: false,
             status,
@@ -282,7 +287,9 @@ impl TuiApp {
             text_edit: None,
             hovered_target: None,
             hovered_process_argv: None,
-        }
+        };
+        app.refresh_local_runtime_diagnostics();
+        app
     }
 
     pub(crate) fn config_path(&self) -> &PathBuf {
@@ -351,7 +358,7 @@ impl TuiApp {
                     .selected_row()
                     .map(|row| row.detail_lines())
                     .unwrap_or_else(|| vec!["No selected traffic row".to_string()]),
-                TrafficPopup::Diagnostics => self.traffic.data_path_diagnostic_lines(),
+                TrafficPopup::Diagnostics => self.data_path_diagnostics.detail_lines(),
             },
             scroll: state.scroll,
         })
@@ -404,6 +411,11 @@ impl TuiApp {
         self.runtime_attachment.status_text()
     }
 
+    pub(crate) fn overview_data_path_lines(&self) -> Vec<DataPathOverviewLine> {
+        self.data_path_diagnostics
+            .overview_lines(self.traffic.rows().is_empty())
+    }
+
     pub(crate) fn active_admin_socket_path(&self) -> Option<&Path> {
         self.runtime_attachment.active_socket_path()
     }
@@ -415,6 +427,7 @@ impl TuiApp {
     pub(crate) fn attach_agent(&mut self, attachment: RuntimeAttachment) {
         let status = attachment.status_text();
         self.runtime_attachment = attachment;
+        self.refresh_local_runtime_diagnostics();
         self.status = StatusMessage::info(status);
     }
 
@@ -422,6 +435,7 @@ impl TuiApp {
         let message = message.into();
         self.runtime_attachment = RuntimeAttachment::lost(message.clone());
         self.status = StatusMessage::error(message);
+        self.refresh_local_runtime_diagnostics();
     }
 
     pub(crate) fn handle_action(&mut self, action: TuiAction) -> Option<TuiEffect> {
@@ -494,6 +508,7 @@ impl TuiApp {
         self.config = config;
         self.processes = processes;
         self.traffic = TrafficState::default();
+        self.refresh_local_runtime_diagnostics();
         self.clear_traffic_popup();
         self.text_edit = None;
         self.hovered_target = None;
@@ -657,14 +672,8 @@ impl TuiApp {
                 "No active agent admin socket is attached; {}",
                 self.runtime_agent_status()
             );
-            match local_traffic_runtime_diagnostics(self.config.clone()) {
-                Ok(diagnostics) => self
-                    .traffic
-                    .mark_admin_unavailable_with_diagnostics(message, diagnostics),
-                Err(error) => self
-                    .traffic
-                    .mark_admin_unavailable(format!("{message}; {error}")),
-            }
+            self.refresh_local_runtime_diagnostics();
+            self.traffic.mark_admin_unavailable(message);
             self.status = StatusMessage::warning(self.traffic.status().text.clone());
             return;
         };
@@ -684,16 +693,37 @@ impl TuiApp {
             }
         };
         self.traffic.refresh(&socket_path, selector).await;
-        if let Ok(diagnostics) = request_traffic_runtime_diagnostics(&socket_path).await {
-            self.traffic.set_runtime_diagnostics(diagnostics);
-        }
+        let diagnostics_error = match request_traffic_runtime_diagnostics(&socket_path).await {
+            Ok(diagnostics) => {
+                let message = diagnostics.status_message(self.traffic.rows().is_empty());
+                self.data_path_diagnostics =
+                    DataPathDiagnosticsView::from_running_agent(diagnostics);
+                self.traffic.apply_runtime_diagnostic_message(message);
+                None
+            }
+            Err(error) => {
+                let message = format!("running agent status unavailable: {error}");
+                self.refresh_local_runtime_diagnostics_with_reason(message.clone());
+                Some(message)
+            }
+        };
+        let diagnostics_failed = diagnostics_error.is_some();
+        let traffic_status_text = diagnostics_error.map_or_else(
+            || self.traffic.status().text.clone(),
+            |error| format!("{}; {error}", self.traffic.status().text),
+        );
         match self.traffic.status().kind {
             super::traffic::TrafficStatusKind::Error
             | super::traffic::TrafficStatusKind::Warning => {
-                self.status = StatusMessage::warning(self.traffic.status().text.clone());
+                self.status = StatusMessage::warning(traffic_status_text);
+            }
+            super::traffic::TrafficStatusKind::Idle | super::traffic::TrafficStatusKind::Active
+                if diagnostics_failed =>
+            {
+                self.status = StatusMessage::warning(traffic_status_text);
             }
             super::traffic::TrafficStatusKind::Idle | super::traffic::TrafficStatusKind::Active => {
-                self.status = StatusMessage::info(self.traffic.status().text.clone());
+                self.status = StatusMessage::info(traffic_status_text);
             }
         }
     }
@@ -780,6 +810,7 @@ impl TuiApp {
                 warnings,
             } => {
                 self.dirty = true;
+                self.refresh_local_runtime_diagnostics();
                 let saved_status = self.mitm_quick_setup_saved_status(direction, &warnings);
                 self.status = saved_status.clone();
                 self.clamp_selection();
@@ -1063,7 +1094,35 @@ impl TuiApp {
 
     pub(crate) fn mark_dirty(&mut self, message: impl Into<String>) {
         self.dirty = true;
+        self.refresh_local_runtime_diagnostics();
         self.status = StatusMessage::info(message);
+    }
+
+    fn refresh_local_runtime_diagnostics(&mut self) {
+        match local_traffic_runtime_diagnostics(self.config.clone()) {
+            Ok(diagnostics) => {
+                self.data_path_diagnostics =
+                    DataPathDiagnosticsView::from_local_config(diagnostics);
+            }
+            Err(error) => {
+                self.data_path_diagnostics =
+                    DataPathDiagnosticsView::unavailable(error.to_string());
+            }
+        }
+    }
+
+    fn refresh_local_runtime_diagnostics_with_reason(&mut self, reason: String) {
+        match local_traffic_runtime_diagnostics(self.config.clone()) {
+            Ok(diagnostics) => {
+                self.data_path_diagnostics =
+                    DataPathDiagnosticsView::from_local_config_with_reason(diagnostics, reason);
+            }
+            Err(error) => {
+                self.data_path_diagnostics = DataPathDiagnosticsView::unavailable(format!(
+                    "{reason}; local config diagnostics unavailable: {error}"
+                ));
+            }
+        }
     }
 
     fn clamp_selection(&mut self) {
@@ -1348,6 +1407,37 @@ mod tests {
     }
 
     #[test]
+    fn overview_data_path_summary_updates_after_mitm_quick_setup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut config = AgentConfig::default();
+        config.storage.path = temp.path().join("spool");
+        let mut app = multi_process_app_with_config(config);
+        let initial = overview_value(&app, "MITM");
+        assert!(
+            initial.contains("not configured"),
+            "unexpected initial MITM summary: {initial}"
+        );
+
+        app.select_tab(TuiTab::Traffic);
+        app.handle_action(TuiAction::Click(HitTarget::TrafficProcess(1)));
+        let effect = app.handle_action(TuiAction::ConfigureOutboundMitm);
+
+        let saved_status = expect_save_status(effect);
+        assert_eq!(saved_status.kind, StatusKind::Saved);
+        let updated = overview_value(&app, "MITM");
+        assert!(
+            !updated.contains("not configured"),
+            "MITM summary should reflect quick setup immediately: {updated}"
+        );
+        assert!(
+            !overview_value(&app, "Data path source").contains("running agent"),
+            "overview must not report running agent diagnostics before admin refresh"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn traffic_data_path_popup_uses_diagnostic_copy_without_row_prompt() {
         let mut app = test_app();
         app.select_tab(TuiTab::Traffic);
@@ -1362,7 +1452,14 @@ mod tests {
             popup
                 .lines
                 .iter()
-                .any(|line| line.contains("Capture diagnostics will appear"))
+                .any(|line| line == "Data path source: local config")
+        );
+        assert!(popup.lines.iter().any(|line| line == "Capture diagnostics"));
+        assert!(
+            popup
+                .lines
+                .iter()
+                .any(|line| line.contains(MITM_PLAINTEXT_COVERAGE))
         );
         assert!(
             !popup
@@ -1680,12 +1777,11 @@ mod tests {
         assert_eq!(app.status().kind, StatusKind::Warning);
         assert!(app.status().text.contains("No active agent admin socket"));
         assert!(app.status().text.contains("No agent runtime attached"));
-        assert!(
-            app.traffic()
-                .data_path_diagnostic_lines()
-                .iter()
-                .any(|line| line == "selected: replay")
-        );
+        app.open_traffic_diagnostics();
+        let popup = app
+            .traffic_popup_view()
+            .expect("data path popup should be open");
+        assert!(popup.lines.iter().any(|line| line == "selected: replay"));
     }
 
     fn test_app() -> TuiApp {
@@ -1705,9 +1801,13 @@ mod tests {
     }
 
     fn multi_process_app() -> TuiApp {
+        multi_process_app_with_config(AgentConfig::default())
+    }
+
+    fn multi_process_app_with_config(config: AgentConfig) -> TuiApp {
         TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
-            AgentConfig::default(),
+            config,
             ProcessCatalog::from_entries([
                 process(1, "curl", "/usr/bin/curl"),
                 process(2, "nginx", "/usr/sbin/nginx"),
@@ -1757,6 +1857,13 @@ mod tests {
             panic!("expected save effect with status");
         };
         status
+    }
+
+    fn overview_value(app: &TuiApp, label: &str) -> String {
+        app.overview_data_path_lines()
+            .into_iter()
+            .find_map(|line| (line.label == label).then_some(line.value))
+            .unwrap_or_else(|| panic!("overview should include {label}"))
     }
 
     fn assert_outbound_mitm_cgroup_selector(app: &TuiApp, expected_cgroup: &str) {

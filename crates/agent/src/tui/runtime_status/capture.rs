@@ -68,6 +68,41 @@ impl CaptureDiagnostics {
         })
     }
 
+    pub(super) fn local_status_message(
+        &self,
+        mitm_next_step: &str,
+    ) -> Option<CaptureDiagnosticMessage> {
+        if self.using_mitm_plaintext_bridge() {
+            if let Some(summary) = self.open_failure_summary() {
+                return Some(CaptureDiagnosticMessage::Warning(format!(
+                    "Passive capture would fail ({summary}); local config uses {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
+                )));
+            }
+            if let Some(summary) = self.passive_unavailable_summary() {
+                return Some(CaptureDiagnosticMessage::Warning(format!(
+                    "Passive capture is unavailable ({summary}); local config uses {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
+                )));
+            }
+            return Some(CaptureDiagnosticMessage::Info(format!(
+                "local config uses {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
+            )));
+        }
+        if self.unavailable() {
+            return Some(CaptureDiagnosticMessage::Error(format!(
+                "Capture unavailable from local config: {}; {}",
+                self.failure_summary(),
+                mitm_next_step
+            )));
+        }
+        if let Some(summary) = self.open_failure_summary() {
+            return Some(CaptureDiagnosticMessage::Warning(format!(
+                "Local config selects {}; passive fallback would occur ({summary})",
+                self.selected_backend_label()
+            )));
+        }
+        None
+    }
+
     pub(super) fn detail_lines(&self) -> Vec<String> {
         let mut lines = vec![
             "Capture diagnostics".to_string(),
@@ -112,6 +147,28 @@ impl CaptureDiagnostics {
             lines.extend(self.snapshot.open_failures.iter().map(open_failure_detail));
         }
         lines
+    }
+
+    pub(super) fn overview_line(&self) -> String {
+        if self.using_mitm_plaintext_bridge() {
+            return format!(
+                "{} selected for {}",
+                self.selected_backend_label(),
+                MITM_PLAINTEXT_COVERAGE
+            );
+        }
+        if self.unavailable() {
+            return format!("unavailable: {}", self.failure_summary());
+        }
+        let mut line = format!(
+            "{} selected, mode={}",
+            self.selected_backend_label(),
+            capture_plan_mode_name(self.snapshot.mode)
+        );
+        if let Some(summary) = self.open_failure_summary() {
+            line.push_str(&format!(", fallback/open failure={summary}"));
+        }
+        line
     }
 
     fn unavailable(&self) -> bool {

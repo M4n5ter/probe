@@ -146,45 +146,48 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec<H
 
 fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let config = app.config();
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("Agent: ", Style::default().fg(Color::Gray)),
-            Span::raw(config.agent_id.clone()),
-        ]),
-        Line::from(vec![
-            Span::styled("Capture: ", Style::default().fg(Color::Gray)),
-            Span::raw(format!("{:?}", config.capture.selection)),
-        ]),
-        Line::from(vec![
-            Span::styled("Exporters: ", Style::default().fg(Color::Gray)),
-            Span::raw(config.exporters.len().to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled("Policies: ", Style::default().fg(Color::Gray)),
-            Span::raw(config.policies.len().to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled("Processes readable: ", Style::default().fg(Color::Gray)),
-            Span::raw(app.processes().entries().len().to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled("Runtime: ", Style::default().fg(Color::Gray)),
-            Span::raw(app.runtime_agent_status()),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Status: ",
-                Style::default().fg(status_color(app.status().kind)),
+    let mut lines = vec![
+        overview_line("Agent", config.agent_id.clone(), Color::Gray),
+        overview_line("Runtime", app.runtime_agent_status(), Color::Gray),
+        overview_line(
+            "Config",
+            format!(
+                "capture={:?}, exporters={}, policies={}, processes={}",
+                config.capture.selection,
+                config.exporters.len(),
+                config.policies.len(),
+                app.processes().entries().len()
             ),
-            Span::raw(app.status().text.clone()),
-        ]),
+            Color::Gray,
+        ),
+        Line::from(""),
     ];
+    lines.extend(
+        app.overview_data_path_lines()
+            .into_iter()
+            .map(|line| overview_line(line.label, line.value, Color::Cyan)),
+    );
+    lines.extend([
+        Line::from(""),
+        overview_line(
+            "Status",
+            app.status().text.clone(),
+            status_color(app.status().kind),
+        ),
+    ]);
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::bordered().title("Overview"))
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn overview_line(label: &str, value: impl Into<String>, label_color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), Style::default().fg(label_color)),
+        Span::raw(value.into()),
+    ])
 }
 
 fn render_fields(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec<HitArea>) {
@@ -614,7 +617,12 @@ mod tests {
         let output = terminal.backend().to_string();
         assert!(output.contains("Probe TUI"));
         assert!(output.contains("Overview"));
-        assert!(output.contains("Processes readable"));
+        assert!(output.contains("Config"));
+        assert!(output.contains("processes=1"));
+        assert!(output.contains("Data path source"));
+        assert!(output.contains("Data path"));
+        assert!(output.contains("MITM"));
+        assert!(output.contains("Next"));
         Ok(())
     }
 
@@ -910,8 +918,8 @@ mod tests {
 
         let output = terminal.backend().to_string();
         assert!(output.contains("Data Path Diagnostics"));
-        assert!(output.contains("Capture diagnostics will appear here after the first refresh"));
-        assert!(output.contains("reliable MITM proxy fallback can capture"));
+        assert!(output.contains("Data path source: local config"));
+        assert!(output.contains("Capture diagnostics"));
         assert!(hit_exists(
             &hit_map,
             Some(HitTarget::TrafficPopupClose),

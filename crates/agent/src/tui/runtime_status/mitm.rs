@@ -132,6 +132,10 @@ impl MitmDiagnostics {
         lines
     }
 
+    pub(super) fn overview_line(&self) -> String {
+        self.data_path_diagnosis().status_summary().to_string()
+    }
+
     pub(super) fn live_side_channel_status_message(
         &self,
         traffic_empty: bool,

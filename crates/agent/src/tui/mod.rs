@@ -4,6 +4,7 @@ mod config_edit;
 mod config_render;
 mod controls;
 mod copy;
+mod data_path;
 mod fields;
 mod generated_resources;
 mod hit;

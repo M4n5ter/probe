@@ -8,12 +8,7 @@ use probe_core::Selector;
 use self::{client::request_tail_events, rows::TrafficRow};
 use crate::{
     admin::{AdminClientError, EventTailOmission, EventTailSnapshot},
-    tui::{
-        copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL},
-        runtime_status::{
-            CaptureDiagnosticMessage, TrafficRuntimeDiagnostics, missing_mitm_quick_setup_action,
-        },
-    },
+    tui::runtime_status::CaptureDiagnosticMessage,
 };
 
 pub(crate) use rows::TrafficRow as TrafficTableRow;
@@ -29,7 +24,6 @@ pub(crate) struct TrafficState {
     scroll: usize,
     status: TrafficStatus,
     last_export_sequence: u64,
-    runtime_diagnostics: Option<TrafficRuntimeDiagnostics>,
 }
 
 impl Default for TrafficState {
@@ -42,7 +36,6 @@ impl Default for TrafficState {
             scroll: 0,
             status: TrafficStatus::idle("Traffic view uses the running admin socket"),
             last_export_sequence: 0,
-            runtime_diagnostics: None,
         }
     }
 }
@@ -74,24 +67,8 @@ impl TrafficState {
 
     pub(crate) fn diagnostic_lines(&self) -> Vec<String> {
         let mut lines = vec!["Select a traffic row to inspect details".to_string()];
-        lines.extend(self.data_path_diagnostic_lines());
+        lines.push("Open Data Path diagnostics for capture and MITM readiness".to_string());
         lines
-    }
-
-    pub(crate) fn data_path_diagnostic_lines(&self) -> Vec<String> {
-        self.runtime_diagnostics
-            .as_ref()
-            .map(TrafficRuntimeDiagnostics::detail_lines)
-            .unwrap_or_else(|| {
-                vec![
-                    "Capture diagnostics will appear here after the first refresh".to_string(),
-                    format!(
-                        "{MITM_PROXY_FALLBACK_LABEL} can capture {MITM_PLAINTEXT_COVERAGE} when eBPF and libpcap are unavailable"
-                    ),
-                    "Traffic rows separate passive capture, plain HTTP, and TLS-decrypted HTTP after runtime diagnostics are available".to_string(),
-                    format!("MITM setup: {}", missing_mitm_quick_setup_action()),
-                ]
-            })
     }
 
     pub(crate) fn detail_preview_lines(&self, max_lines: usize) -> Vec<String> {
@@ -115,29 +92,15 @@ impl TrafficState {
     }
 
     pub(crate) fn mark_admin_unavailable(&mut self, message: impl Into<String>) {
-        self.runtime_diagnostics = None;
         self.status = TrafficStatus::error(message);
     }
 
-    pub(crate) fn mark_admin_unavailable_with_diagnostics(
+    pub(crate) fn apply_runtime_diagnostic_message(
         &mut self,
-        message: impl Into<String>,
-        diagnostics: TrafficRuntimeDiagnostics,
+        message: Option<CaptureDiagnosticMessage>,
     ) {
-        let message = message.into();
-        let diagnostic_message = diagnostics
-            .status_message(self.rows.is_empty())
-            .and_then(capture_diagnostic_warning_or_error_text);
-        self.runtime_diagnostics = Some(diagnostics);
-        self.status = TrafficStatus::error(match diagnostic_message {
-            Some(diagnostic_message) => format!("{message}; {diagnostic_message}"),
-            None => message,
-        });
-    }
-
-    pub(crate) fn set_runtime_diagnostics(&mut self, diagnostics: TrafficRuntimeDiagnostics) {
         if self.status.kind != TrafficStatusKind::Error
-            && let Some(message) = diagnostics.status_message(self.rows.is_empty())
+            && let Some(message) = message
         {
             self.status = match message {
                 CaptureDiagnosticMessage::Info(message) => TrafficStatus::idle(message),
@@ -145,7 +108,6 @@ impl TrafficState {
                 CaptureDiagnosticMessage::Error(message) => TrafficStatus::error(message),
             };
         }
-        self.runtime_diagnostics = Some(diagnostics);
     }
 
     pub(crate) fn mark_filter_unavailable(&mut self, message: impl Into<String>) {
@@ -154,7 +116,6 @@ impl TrafficState {
         self.rows.clear();
         self.selected_index = 0;
         self.scroll = 0;
-        self.runtime_diagnostics = None;
         self.status = TrafficStatus::error(message);
     }
 
@@ -180,7 +141,6 @@ impl TrafficState {
         self.rows.clear();
         self.selected_index = 0;
         self.scroll = 0;
-        self.runtime_diagnostics = None;
         self.status = TrafficStatus::idle("Traffic filter changed");
     }
 
@@ -220,15 +180,6 @@ impl TrafficState {
                     .selected_index
                     .saturating_sub(visible_rows.saturating_sub(1));
             }
-        }
-    }
-}
-
-fn capture_diagnostic_warning_or_error_text(message: CaptureDiagnosticMessage) -> Option<String> {
-    match message {
-        CaptureDiagnosticMessage::Info(_) => None,
-        CaptureDiagnosticMessage::Warning(message) | CaptureDiagnosticMessage::Error(message) => {
-            Some(message)
         }
     }
 }
@@ -366,19 +317,16 @@ mod tests {
         status::{
             CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
         },
-        tui::{
-            copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL},
-            runtime_status::TrafficRuntimeDiagnostics,
-        },
+        tui::runtime_status::TrafficRuntimeDiagnostics,
     };
 
     #[test]
     fn diagnostics_preserve_warning_severity() {
         let mut traffic = TrafficState::default();
 
-        traffic.set_runtime_diagnostics(TrafficRuntimeDiagnostics::from_capture_snapshot(
-            fallback_capture_snapshot(),
-        ));
+        let diagnostics =
+            TrafficRuntimeDiagnostics::from_capture_snapshot(fallback_capture_snapshot());
+        traffic.apply_runtime_diagnostic_message(diagnostics.status_message(true));
 
         assert_eq!(traffic.status().kind, TrafficStatusKind::Warning);
         assert_eq!(
@@ -392,91 +340,24 @@ mod tests {
         let mut traffic = TrafficState::default();
         traffic.mark_admin_unavailable("tail_events failed");
 
-        traffic.set_runtime_diagnostics(TrafficRuntimeDiagnostics::from_capture_snapshot(
-            fallback_capture_snapshot(),
-        ));
+        let diagnostics =
+            TrafficRuntimeDiagnostics::from_capture_snapshot(fallback_capture_snapshot());
+        traffic.apply_runtime_diagnostic_message(diagnostics.status_message(true));
 
         assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
         assert_eq!(traffic.status().text, "tail_events failed");
-    }
-
-    #[test]
-    fn admin_unavailable_can_keep_local_data_path_diagnostics() {
-        let mut traffic = TrafficState::default();
-
-        traffic.mark_admin_unavailable_with_diagnostics(
-            "tail_events failed",
-            TrafficRuntimeDiagnostics::from_capture_snapshot(fallback_capture_snapshot()),
-        );
-
-        assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
-        assert!(traffic.status().text.contains("tail_events failed"));
-        assert!(traffic.status().text.contains("passive fallback occurred"));
-        assert!(
-            traffic
-                .data_path_diagnostic_lines()
-                .iter()
-                .any(|line| line == "provider candidates:")
-        );
-    }
-
-    #[test]
-    fn admin_unavailable_suppresses_plan_only_info_status() {
-        let mut traffic = TrafficState::default();
-
-        traffic.mark_admin_unavailable_with_diagnostics(
-            "tail_events failed",
-            TrafficRuntimeDiagnostics::from_capture_snapshot(active_mitm_bridge_capture_snapshot()),
-        );
-
-        assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
-        assert_eq!(traffic.status().text, "tail_events failed");
-        assert!(
-            traffic
-                .data_path_diagnostic_lines()
-                .iter()
-                .any(|line| line == &format!("coverage: {MITM_PLAINTEXT_COVERAGE}"))
-        );
     }
 
     #[test]
     fn diagnostics_explain_active_mitm_plaintext_bridge_coverage() {
         let mut traffic = TrafficState::default();
 
-        traffic.set_runtime_diagnostics(TrafficRuntimeDiagnostics::from_capture_snapshot(
-            active_mitm_bridge_capture_snapshot(),
-        ));
+        let diagnostics =
+            TrafficRuntimeDiagnostics::from_capture_snapshot(active_mitm_bridge_capture_snapshot());
+        traffic.apply_runtime_diagnostic_message(diagnostics.status_message(true));
 
         assert_eq!(traffic.status().kind, TrafficStatusKind::Idle);
-        assert_eq!(
-            traffic.status().text,
-            format!(
-                "{MITM_PROXY_FALLBACK_LABEL} active for {MITM_PLAINTEXT_COVERAGE}; no matching events yet"
-            )
-        );
-        assert!(
-            traffic
-                .diagnostic_lines()
-                .iter()
-                .any(|line| line == &format!("coverage: {MITM_PLAINTEXT_COVERAGE}"))
-        );
-    }
-
-    #[test]
-    fn filter_failure_clears_stale_diagnostics() {
-        let mut traffic = TrafficState::default();
-        traffic.set_runtime_diagnostics(TrafficRuntimeDiagnostics::from_capture_snapshot(
-            fallback_capture_snapshot(),
-        ));
-
-        traffic.mark_filter_unavailable("missing process selector");
-
-        assert!(
-            traffic
-                .diagnostic_lines()
-                .iter()
-                .any(|line| line.contains("after the first refresh"))
-        );
+        assert_eq!(traffic.status().text, diagnostics.running_status_text(true));
     }
 
     #[test]
