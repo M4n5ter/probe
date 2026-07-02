@@ -261,6 +261,13 @@ process has no readable executable path, traffic filtering fails closed instead
 of showing unrelated host traffic. The TUI keeps only display summaries for the
 event table and does not retain raw process argv.
 
+The Runtime tab can call the online admin `reload_runtime_actions` command. It
+reloads the runtime owners that are explicitly safe to update online, currently
+policy bundles and the external enforcement manifest, and reports partial
+failures per action. It does not replace the active main agent config; use it
+after saving policy or enforcement inputs that are already referenced by the
+running config.
+
 ### Minimal Policy And Webhook Wiring
 
 Use this section when wiring the first real integration. A deployable setup

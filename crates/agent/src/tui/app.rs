@@ -16,6 +16,7 @@ pub(crate) enum TuiTab {
     Traffic,
     Capture,
     Processes,
+    Runtime,
     Export,
     Storage,
     Enforcement,
@@ -23,11 +24,12 @@ pub(crate) enum TuiTab {
 }
 
 impl TuiTab {
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Overview,
         Self::Traffic,
         Self::Capture,
         Self::Processes,
+        Self::Runtime,
         Self::Export,
         Self::Storage,
         Self::Enforcement,
@@ -40,6 +42,7 @@ impl TuiTab {
             Self::Traffic => "Traffic",
             Self::Capture => "Capture",
             Self::Processes => "Processes",
+            Self::Runtime => "Runtime",
             Self::Export => "Export",
             Self::Storage => "Storage",
             Self::Enforcement => "Enforcement",
@@ -81,10 +84,11 @@ pub(crate) enum TuiAction {
     Quit,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ActionOutcome {
-    pub(crate) save_requested: bool,
-    pub(crate) reload_requested: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TuiEffect {
+    SaveConfig,
+    ReloadConfig,
+    ReloadRuntimeActions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,7 +246,7 @@ impl TuiApp {
         self.text_edit.is_some()
     }
 
-    pub(crate) fn handle_action(&mut self, action: TuiAction) -> ActionOutcome {
+    pub(crate) fn handle_action(&mut self, action: TuiAction) -> Option<TuiEffect> {
         if self.text_edit.is_some() {
             return self.handle_text_edit_action(action);
         }
@@ -251,28 +255,22 @@ impl TuiApp {
             TuiAction::PreviousTab => self.select_tab(self.active_tab.previous()),
             TuiAction::MoveUp => self.move_selection(-1),
             TuiAction::MoveDown => self.move_selection(1),
-            TuiAction::NextValue => self.adjust_selected(1),
-            TuiAction::PreviousValue => self.adjust_selected(-1),
+            TuiAction::NextValue => return self.adjust_selected(1),
+            TuiAction::PreviousValue => return self.adjust_selected(-1),
             TuiAction::TextInput(_)
             | TuiAction::TextBackspace
             | TuiAction::TextSubmit
             | TuiAction::TextCancel => {}
             TuiAction::Click(target) => return self.handle_click(target),
             TuiAction::Save => {
-                return ActionOutcome {
-                    save_requested: true,
-                    reload_requested: false,
-                };
+                return Some(TuiEffect::SaveConfig);
             }
             TuiAction::Reload => {
-                return ActionOutcome {
-                    save_requested: false,
-                    reload_requested: true,
-                };
+                return Some(TuiEffect::ReloadConfig);
             }
             TuiAction::Quit => self.should_quit = true,
         }
-        ActionOutcome::default()
+        None
     }
 
     pub(crate) fn mark_saved(&mut self) {
@@ -280,8 +278,20 @@ impl TuiApp {
         self.status = StatusMessage::saved("Saved config");
     }
 
-    pub(crate) fn mark_save_failed(&mut self, message: impl Into<String>) {
+    pub(crate) fn mark_info(&mut self, message: impl Into<String>) {
+        self.status = StatusMessage::info(message);
+    }
+
+    pub(crate) fn mark_warning(&mut self, message: impl Into<String>) {
+        self.status = StatusMessage::warning(message);
+    }
+
+    pub(crate) fn mark_error(&mut self, message: impl Into<String>) {
         self.status = StatusMessage::error(message);
+    }
+
+    pub(crate) fn mark_save_failed(&mut self, message: impl Into<String>) {
+        self.mark_error(message);
     }
 
     pub(crate) fn replace_config(&mut self, config: AgentConfig, processes: ProcessCatalog) {
@@ -309,31 +319,26 @@ impl TuiApp {
             .map(|process| process.name.as_str())
     }
 
-    fn handle_click(&mut self, target: HitTarget) -> ActionOutcome {
+    fn handle_click(&mut self, target: HitTarget) -> Option<TuiEffect> {
         match target {
             HitTarget::Tab(tab) => self.select_tab(tab),
             HitTarget::Field(field) => {
                 self.select_field(field);
-                self.adjust_selected(1);
+                return self.adjust_selected(1);
             }
             HitTarget::TextEditSubmit | HitTarget::TextEditCancel => {}
             HitTarget::Process(index) => self.select_process(index),
             HitTarget::TrafficRow(index) => self.select_traffic_row(index),
             HitTarget::Save => {
-                return ActionOutcome {
-                    save_requested: true,
-                    reload_requested: false,
-                };
+                return Some(TuiEffect::SaveConfig);
             }
             HitTarget::Reload => {
-                return ActionOutcome {
-                    save_requested: false,
-                    reload_requested: true,
-                };
+                return Some(TuiEffect::ReloadConfig);
             }
+            HitTarget::ReloadRuntimeActions => return Some(TuiEffect::ReloadRuntimeActions),
             HitTarget::Quit => self.should_quit = true,
         }
-        ActionOutcome::default()
+        None
     }
 
     fn select_tab(&mut self, tab: TuiTab) {
@@ -428,13 +433,14 @@ impl TuiApp {
         self.traffic.select_row(index, 1);
     }
 
-    fn adjust_selected(&mut self, direction: isize) {
-        let Some(field) = self.selected_field() else {
-            return;
-        };
+    fn adjust_selected(&mut self, direction: isize) -> Option<TuiEffect> {
+        if self.active_tab == TuiTab::Runtime {
+            return (direction > 0).then_some(TuiEffect::ReloadRuntimeActions);
+        }
+        let field = self.selected_field()?;
         if editable_text_value(&self.config, field).is_some() {
             self.begin_text_edit(field);
-            return;
+            return None;
         }
         let selected_process_selector = self.selected_process_selector();
         match apply_field(
@@ -452,6 +458,7 @@ impl TuiApp {
             }
             FieldApplyOutcome::Unchanged => {}
         }
+        None
     }
 
     fn begin_text_edit(&mut self, field: FieldId) {
@@ -468,7 +475,7 @@ impl TuiApp {
         self.status = StatusMessage::info(format!("Editing {label}"));
     }
 
-    fn handle_text_edit_action(&mut self, action: TuiAction) -> ActionOutcome {
+    fn handle_text_edit_action(&mut self, action: TuiAction) -> Option<TuiEffect> {
         match action {
             TuiAction::TextInput(character) => {
                 if let Some(edit) = &mut self.text_edit {
@@ -498,7 +505,7 @@ impl TuiApp {
             }
             _ => {}
         }
-        ActionOutcome::default()
+        None
     }
 
     fn submit_text_edit(&mut self) {
@@ -722,6 +729,25 @@ mod tests {
         );
         assert!(keyboard_app.dirty());
         assert!(mouse_app.dirty());
+    }
+
+    #[test]
+    fn runtime_reload_action_shares_keyboard_and_mouse_action_path() {
+        let mut keyboard_app = test_app();
+        keyboard_app.select_tab(TuiTab::Runtime);
+        let keyboard_effect = keyboard_app.handle_action(TuiAction::NextValue);
+        let left_effect = keyboard_app.handle_action(TuiAction::PreviousValue);
+
+        let mut mouse_app = test_app();
+        mouse_app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Runtime)));
+        let mouse_effect =
+            mouse_app.handle_action(TuiAction::Click(HitTarget::ReloadRuntimeActions));
+
+        assert_eq!(keyboard_effect, Some(TuiEffect::ReloadRuntimeActions));
+        assert_eq!(mouse_effect, Some(TuiEffect::ReloadRuntimeActions));
+        assert_eq!(left_effect, None);
+        assert!(!keyboard_app.dirty());
+        assert!(!mouse_app.dirty());
     }
 
     #[test]

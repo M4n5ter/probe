@@ -299,6 +299,9 @@ Operator TUI 能力事实：
   过滤，并返回 `next_after_sequence`；该响应 cursor 不会 ack 任何 exporter sink cursor。
   响应同时受单事件 payload budget 和总响应 payload budget 约束；超限事件通过 omission metadata 表达，不在响应中展开。
   当请求带 selector 且某条超限事件无法解码验证 selector 时，该事件不返回 omission metadata，只推进扫描 cursor。
+- Runtime tab 通过 admin Unix socket 调用 `reload_runtime_actions`。该动作只执行 active `RuntimePlan`
+  中可安全在线切换的 runtime owners：policy bundle reload 和 external enforcement manifest reload。
+  响应按 action 独立展示成功或失败；它不替换运行中的主 agent config，也不改变 exporter sink cursor。
 - TUI-managed 字段包括 capture backend selection、export worker enablement、default exporter creation、
   exporter transport、webhook endpoint、file path、Unix HTTP socket path、exporter codec、
   storage retention record limits、enforcement mode/backend、transparent interception strategy、

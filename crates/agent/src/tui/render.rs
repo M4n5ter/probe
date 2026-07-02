@@ -33,6 +33,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &TuiApp) -> HitMap {
         TuiTab::Overview => render_overview(frame, body, app),
         TuiTab::Traffic => render_traffic(frame, body, app, &mut hits),
         TuiTab::Processes => render_processes(frame, body, app, &mut hits),
+        TuiTab::Runtime => render_runtime(frame, body, app, &mut hits),
         _ => render_fields(frame, body, app, &mut hits),
     }
     render_footer(frame, footer, app);
@@ -157,6 +158,44 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .block(Block::bordered().title("Overview"))
             .wrap(Wrap { trim: true }),
         area,
+    );
+}
+
+fn render_runtime(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec<HitArea>) {
+    let admin_state = if app.config().admin.enabled {
+        format!("enabled at {}", app.config().admin.socket_path.display())
+    } else {
+        "disabled".to_string()
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Admin: ", Style::default().fg(Color::Gray)),
+            Span::raw(admin_state),
+        ]),
+        Line::from(vec![
+            Span::styled("Runtime actions: ", Style::default().fg(Color::Gray)),
+            Span::raw("policy bundles, enforcement manifest"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Status: ",
+                Style::default().fg(status_color(app.status().kind)),
+            ),
+            Span::raw(app.status().text.clone()),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title("Runtime"))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+    render_button(
+        frame,
+        hits,
+        Rect::new(area.x + 2, area.y + 5, 18, 1),
+        "Reload actions",
+        HitTarget::ReloadRuntimeActions,
     );
 }
 
@@ -561,6 +600,24 @@ mod tests {
         assert!(output.contains("Value: /tmp/events.jsonl"));
         assert_eq!(hit_map.hit(7, 14), Some(HitTarget::TextEditSubmit));
         assert_eq!(hit_map.hit(18, 14), Some(HitTarget::TextEditCancel));
+        Ok(())
+    }
+
+    #[test]
+    fn render_runtime_registers_reload_action_hit() -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = test_app();
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Runtime)));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24))?;
+        let mut hit_map = HitMap::default();
+
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &app);
+        })?;
+
+        let output = terminal.backend().to_string();
+        assert!(output.contains("Runtime"));
+        assert!(output.contains("[Reload actions]"));
+        assert_eq!(hit_map.hit(4, 11), Some(HitTarget::ReloadRuntimeActions));
         Ok(())
     }
 

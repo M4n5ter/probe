@@ -17,11 +17,12 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use probe_config::default_config_path;
 
 use super::{
-    app::{TuiAction, TuiApp, TuiTab},
+    app::{TuiAction, TuiApp, TuiEffect, TuiTab},
     config_edit::{TuiError, load_config, load_or_create_config, save_config},
     hit::HitMap,
     processes::ProcessCatalog,
     render::draw,
+    runtime_actions::request_runtime_actions_reload,
 };
 
 const TRAFFIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -57,28 +58,42 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
         let Some(action) = event_to_action(&hit_map, event::read()?, app.is_editing_text()) else {
             continue;
         };
-        let outcome = app.handle_action(action);
-        if outcome.save_requested {
-            match save_config(app.config_path(), &loaded.source, app.config()) {
-                Ok(source) => {
-                    loaded.source = source;
-                    app.mark_saved();
+        if let Some(effect) = app.handle_action(action) {
+            match effect {
+                TuiEffect::SaveConfig => {
+                    match save_config(app.config_path(), &loaded.source, app.config()) {
+                        Ok(source) => {
+                            loaded.source = source;
+                            app.mark_saved();
+                        }
+                        Err(error) => app.mark_save_failed(error.to_string()),
+                    }
                 }
-                Err(error) => app.mark_save_failed(error.to_string()),
-            }
-        }
-        if outcome.reload_requested {
-            match load_config(app.config_path()) {
-                Ok(next) => {
-                    loaded = next;
-                    app.replace_config(loaded.config.clone(), ProcessCatalog::from_proc());
-                }
-                Err(error) => app.mark_save_failed(error.to_string()),
+                TuiEffect::ReloadConfig => match load_config(app.config_path()) {
+                    Ok(next) => {
+                        loaded = next;
+                        app.replace_config(loaded.config.clone(), ProcessCatalog::from_proc());
+                    }
+                    Err(error) => app.mark_save_failed(error.to_string()),
+                },
+                TuiEffect::ReloadRuntimeActions => reload_runtime_actions(&mut app).await,
             }
         }
     }
 
     Ok(())
+}
+
+async fn reload_runtime_actions(app: &mut TuiApp) {
+    if !app.config().admin.enabled {
+        app.mark_warning("Enable admin to reload runtime actions from the TUI");
+        return;
+    }
+    match request_runtime_actions_reload(&app.config().admin.socket_path).await {
+        Ok(summary) if summary.has_failures() => app.mark_warning(summary.status_text()),
+        Ok(summary) => app.mark_info(summary.status_text()),
+        Err(error) => app.mark_error(error.to_string()),
+    }
 }
 
 fn resolve_config_path(config: Option<PathBuf>) -> PathBuf {
