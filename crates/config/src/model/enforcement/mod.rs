@@ -45,6 +45,8 @@ pub use mitm::{
     TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig,
     TransparentInterceptionMitmProductProxyUpstreamRouteConfig,
     TransparentInterceptionMitmProductProxyUpstreamRouteIntent,
+    TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig,
+    TransparentInterceptionMitmProductProxyUpstreamTlsModeIntent,
 };
 pub use policy::{
     DEFAULT_ENFORCEMENT_POLICY_RELOAD_REMOTE_POLL_INTERVAL_MS,

@@ -56,6 +56,7 @@ pub struct MitmProxyConfig {
     pub upstream: Option<SocketAddr>,
     pub upstream_routes: UpstreamTargetRoutes,
     pub upstream_discovery: UpstreamDiscovery,
+    pub upstream_tls_mode: UpstreamTlsMode,
     pub upstream_tls: Option<UpstreamTlsConfig>,
     pub upstream_socket_mark: Option<NonZeroU32>,
     pub tls: Option<TlsTerminationConfig>,
@@ -69,7 +70,10 @@ pub struct MitmProxyConfig {
     pub action_timeout: Duration,
 }
 
-pub use self::route::{UpstreamDiscovery, UpstreamTargetRoute, UpstreamTargetRoutes};
+pub use self::{
+    route::{UpstreamDiscovery, UpstreamTargetRoute, UpstreamTargetRoutes},
+    upstream::UpstreamTlsMode,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum TargetRecovery {
@@ -108,6 +112,7 @@ impl MitmProxyGuard {
             &config.application_protocols,
         )?;
         let upstream = UpstreamConnector::from_config(
+            config.upstream_tls_mode,
             config.upstream_tls.as_ref(),
             config.upstream_socket_mark,
             &config.application_protocols,
@@ -185,6 +190,13 @@ enum DownstreamDisposition {
 struct SequencedHttpRequest {
     message: HttpMessage,
     sequence: u64,
+}
+
+struct DownstreamConnectionContext {
+    peer: SocketAddr,
+    target: SocketAddr,
+    uses_tls: bool,
+    tls_server_name: Option<String>,
 }
 
 fn validate_config(config: &MitmProxyConfig) -> Result<(), MitmProxyError> {
@@ -278,28 +290,25 @@ fn handle_data_connection(
         .map_err(io_error("read MITM proxy downstream peer address"))?;
     let target = recover_target(&downstream, &state.config)?;
     let downstream = state.downstream.accept(downstream)?;
-    let downstream_tls_server_name = downstream.tls_server_name().map(str::to_string);
-    handle_http_connection(
-        downstream,
+    let context = DownstreamConnectionContext {
         peer,
         target,
-        downstream_tls_server_name.as_deref(),
-        state,
-    )
+        uses_tls: downstream.uses_tls(),
+        tls_server_name: downstream.tls_server_name().map(str::to_string),
+    };
+    handle_http_connection(downstream, context, state)
 }
 
 fn handle_http_connection(
     mut downstream: DownstreamStream,
-    peer: SocketAddr,
-    target: SocketAddr,
-    downstream_tls_server_name: Option<&str>,
+    context: DownstreamConnectionContext,
     state: Arc<ProxyState>,
 ) -> Result<(), MitmProxyError> {
     let Some(first_request) = read_http_message(&mut downstream, state.config.max_request_bytes)?
     else {
         return Ok(());
     };
-    let flow = state.flow_factory.flow(peer, target);
+    let flow = state.flow_factory.flow(context.peer, context.target);
     let mut offsets = FlowOffsets::default();
     state.feed.connection_opened(&flow)?;
 
@@ -317,8 +326,7 @@ fn handle_http_connection(
         request_sequence = request_sequence.saturating_add(1);
         let disposition = match handle_http_request(
             &mut downstream,
-            target,
-            downstream_tls_server_name,
+            &context,
             SequencedHttpRequest {
                 message: request,
                 sequence: request_sequence,
@@ -342,8 +350,7 @@ fn handle_http_connection(
 
 fn handle_http_request(
     downstream: &mut DownstreamStream,
-    target: SocketAddr,
-    downstream_tls_server_name: Option<&str>,
+    context: &DownstreamConnectionContext,
     request: SequencedHttpRequest,
     state: &ProxyState,
     flow: &probe_core::FlowContext,
@@ -373,15 +380,9 @@ fn handle_http_request(
             write_deny_response(downstream, state, flow, offsets, reason)?;
             Ok(DownstreamDisposition::Close)
         }
-        None => forward_or_gateway_response(
-            downstream,
-            target,
-            downstream_tls_server_name,
-            request.message,
-            state,
-            flow,
-            offsets,
-        ),
+        None => {
+            forward_or_gateway_response(downstream, context, request.message, state, flow, offsets)
+        }
     }
 }
 
@@ -470,8 +471,7 @@ fn write_generated_response(
 
 fn forward_or_gateway_response(
     downstream: &mut DownstreamStream,
-    target: SocketAddr,
-    downstream_tls_server_name: Option<&str>,
+    context: &DownstreamConnectionContext,
     request: HttpMessage,
     state: &ProxyState,
     flow: &probe_core::FlowContext,
@@ -480,10 +480,11 @@ fn forward_or_gateway_response(
     let config = &state.config;
     let request_keep_alive = request.explicit_keep_alive();
     let has_prefetched_tunnel_bytes = !request.prefetched_tunnel_bytes.is_empty();
+    let use_upstream_tls = state.upstream.uses_tls_for_downstream(context.uses_tls);
     let authority = match observed_authority_for_request(
         config,
-        &state.upstream,
-        downstream_tls_server_name,
+        use_upstream_tls,
+        context.tls_server_name.as_deref(),
         &request,
     ) {
         Ok(authority) => authority,
@@ -493,7 +494,7 @@ fn forward_or_gateway_response(
         }
     };
     let targets = match upstream_targets_for_request(
-        target,
+        context.target,
         authority,
         &config.upstream_routes,
         config.upstream_discovery,
@@ -517,6 +518,7 @@ fn forward_or_gateway_response(
             .filter(|target| !socket_addr_points_to_listener(*target, config.listen)),
         authority,
         config.io_timeout,
+        use_upstream_tls,
     ) {
         Ok(Some(mut upstream)) => {
             upstream
@@ -569,7 +571,7 @@ fn forward_or_gateway_response(
 
 fn observed_authority_for_request<'a>(
     config: &MitmProxyConfig,
-    upstream: &UpstreamConnector,
+    use_upstream_tls: bool,
     downstream_tls_server_name: Option<&'a str>,
     request: &'a HttpMessage,
 ) -> Result<ObservedAuthority<'a>, MitmProxyError> {
@@ -578,7 +580,7 @@ fn observed_authority_for_request<'a>(
         request,
         !config.upstream_routes.is_empty()
             || config.upstream_discovery.is_enabled()
-            || upstream.uses_tls(),
+            || use_upstream_tls,
     )
 }
 
@@ -1532,13 +1534,18 @@ mod tests {
         let unreachable = unreachable_listener.local_addr()?;
         assert_ne!(unreachable, upstream);
         drop(unreachable_listener);
-        let connector =
-            UpstreamConnector::from_config(None, None, &ApplicationProtocolPolicy::default())?;
+        let connector = UpstreamConnector::from_config(
+            UpstreamTlsMode::Never,
+            None,
+            None,
+            &ApplicationProtocolPolicy::default(),
+        )?;
         let mut connection = connector
             .connect_first(
                 [unreachable, upstream],
                 ObservedAuthority::from_parts(None, None),
                 Duration::from_millis(200),
+                false,
             )?
             .expect("second candidate should connect");
 
@@ -1551,6 +1558,87 @@ mod tests {
             String::from_utf8_lossy(&response),
             "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnext"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn tls_capable_listener_handles_plaintext_and_tls_downstream_with_auto_upstream_tls()
+    -> Result<(), Box<dyn Error>> {
+        let root = tempdir()?;
+        let feed_path = root.path().join("mitm-feed.jsonl");
+        let (certificate_chain, private_key, trusted_certificate) =
+            write_test_certificate_for_name(root.path(), "shared", "tls-upstream.example")?;
+        let plain_upstream =
+            upstream_server(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nplain-auto")?;
+        let tls_upstream = tls_upstream_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ntls-auto",
+            certificate_chain.clone(),
+            private_key.clone(),
+        )?;
+        let data_listener = bound_loopback_listener()?;
+        let listen = data_listener.local_addr()?;
+        let mut config = test_config(
+            listen,
+            &feed_path,
+            None,
+            Some(TlsTerminationConfig::new(
+                certificate_chain.clone(),
+                private_key,
+            )),
+            None,
+            Duration::from_secs(2),
+        );
+        config.upstream_tls_mode = UpstreamTlsMode::Auto;
+        config.upstream_tls = Some(UpstreamTlsConfig::new(vec![certificate_chain], None));
+        config.upstream_routes = UpstreamTargetRoutes::from_routes([
+            UpstreamTargetRoute::new("plain.example", plain_upstream)?,
+            UpstreamTargetRoute::new("tls-upstream.example", tls_upstream)?,
+        ])?;
+        let guard = start_test_proxy(config, data_listener, None)?;
+
+        let plain_request = b"GET /plain-auto HTTP/1.1\r\nHost: plain.example\r\n\r\n";
+        let mut plain_stream = TcpStream::connect(listen)?;
+        plain_stream.write_all(plain_request)?;
+        plain_stream.shutdown(Shutdown::Write)?;
+        let mut plain_response = Vec::new();
+        plain_stream.read_to_end(&mut plain_response)?;
+
+        let tls_request = b"GET /tls-auto HTTP/1.1\r\nHost: tls-upstream.example\r\n\r\n";
+        let mut tls_stream =
+            tls_client_stream_with_name(listen, trusted_certificate, "tls-upstream.example")?;
+        tls_stream.write_all(tls_request)?;
+        tls_stream.flush()?;
+        let mut tls_response = Vec::new();
+        tls_stream.read_to_end(&mut tls_response)?;
+        guard.stop()?;
+
+        assert_eq!(
+            String::from_utf8_lossy(&plain_response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nplain-auto"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&tls_response),
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ntls-auto"
+        );
+        assert!(feed_has_bytes(
+            &feed_path,
+            Direction::Outbound,
+            plain_request
+        )?);
+        assert!(feed_has_bytes(
+            &feed_path,
+            Direction::Outbound,
+            tls_request
+        )?);
+        let inbound = feed_direction_bytes(&feed_path, Direction::Inbound)?;
+        assert!(bytes_contain(
+            &inbound,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nplain-auto"
+        ));
+        assert!(bytes_contain(
+            &inbound,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ntls-auto"
+        ));
         Ok(())
     }
 
@@ -1776,6 +1864,7 @@ mod tests {
             None,
             Duration::from_secs(2),
         );
+        config.upstream_tls_mode = UpstreamTlsMode::Always;
         config.upstream_tls = Some(UpstreamTlsConfig::new(
             vec![upstream_certificate_chain],
             None,
@@ -1835,6 +1924,7 @@ mod tests {
             None,
             Duration::from_secs(2),
         );
+        config.upstream_tls_mode = UpstreamTlsMode::Always;
         config.upstream_tls = Some(UpstreamTlsConfig::new(vec![certificate_chain], None));
         let guard = start_test_proxy(config, data_listener, None)?;
 
@@ -1889,6 +1979,7 @@ mod tests {
             None,
             Duration::from_secs(2),
         );
+        config.upstream_tls_mode = UpstreamTlsMode::Always;
         config.upstream_tls = Some(UpstreamTlsConfig::new(vec![certificate_chain], None));
         let guard = start_test_proxy(config, data_listener, None)?;
 
@@ -1943,6 +2034,7 @@ mod tests {
             None,
             Duration::from_secs(2),
         );
+        config.upstream_tls_mode = UpstreamTlsMode::Always;
         config.upstream_tls = Some(UpstreamTlsConfig::new(
             vec![upstream_certificate_chain],
             None,
@@ -1998,6 +2090,7 @@ mod tests {
             Duration::from_secs(2),
         );
         config.io_timeout = Duration::from_secs(5);
+        config.upstream_tls_mode = UpstreamTlsMode::Always;
         config.upstream_tls = Some(UpstreamTlsConfig::new(vec![certificate_chain], None));
         let guard = start_test_proxy(config, data_listener, None)?;
 
@@ -2056,5 +2149,11 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => Ok(response),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 }

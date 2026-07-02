@@ -19,12 +19,13 @@ use rustls::{
 };
 use storage::FjallSpool;
 
-use super::harness::HttpSourceServer;
 use super::harness::{
-    ChildSupervisor, debug_binary, decode_capture_event, decode_envelope, e2e_error,
-    ensure_e2e_packages_built, run_agent_with_max_events, run_in_own_process_group,
-    run_with_temp_root, wait_for_file_or_child_exit,
+    ChildSupervisor, HttpSourceServer, TlsHttpSourceServer, TlsServerMaterial, debug_binary,
+    decode_capture_event, decode_envelope, e2e_error, ensure_e2e_packages_built,
+    run_agent_with_max_events, run_in_own_process_group, run_with_temp_root,
+    wait_for_file_or_child_exit, write_tls_server_material,
 };
+use super::plaintext_assertions::has_header;
 
 const AGENT_ID: &str = "e2e-product-mitm-proxy-local-agent";
 const CONFIG_VERSION: &str = "e2e-product-mitm-proxy-local";
@@ -32,8 +33,17 @@ const E2E_EXPORT_CURSOR_OWNER: &str = "e2e-product-mitm-proxy-local";
 const HOST: &str = "product-mitm-local.e2e.test";
 const PLAIN_TARGET: &str = "/product-mitm-local/plain";
 const TLS_TARGET: &str = "/product-mitm-local/tls";
+const AUTO_PLAIN_HOST: &str = "plain.product-mitm-local.e2e.test";
+const AUTO_TLS_HOST: &str = "tls.product-mitm-local.e2e.test";
+const AUTO_PLAIN_TARGET: &str = "/product-mitm-local/auto/plain";
+const AUTO_TLS_TARGET: &str = "/product-mitm-local/auto/tls";
 const PLAIN_BODY: &str = "plain product MITM local response";
 const TLS_BODY: &str = "tls product MITM local response";
+const TEXT_PLAIN_CONTENT_TYPE: &str = "text/plain";
+const AUTO_PLAINTEXT_CONTENT_TYPE: &str = "text/probe-auto-plain";
+const AUTO_TLS_CONTENT_TYPE: &str = "text/probe-auto-tls";
+const AUTO_PLAIN_BODY: &str = "auto plaintext product MITM response";
+const AUTO_TLS_BODY: &str = "auto tls product MITM response";
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -52,6 +62,14 @@ struct MitmCaMaterial {
     certificate_path: PathBuf,
     private_key_path: PathBuf,
     certificate_der: CertificateDer<'static>,
+}
+
+#[derive(Clone, Copy)]
+struct HttpExpectation {
+    label: &'static str,
+    target: &'static str,
+    response_content_type: &'static str,
+    body: &'static str,
 }
 
 type ByteChunk<'a> = (u64, &'a [u8]);
@@ -80,9 +98,15 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(root)?;
     let plaintext = run_scenario(root, DownstreamMode::Plaintext)?;
     let tls = run_scenario(root, DownstreamMode::Tls)?;
+    let auto = run_auto_upstream_tls_scenario(root)?;
     println!(
-        "e2e product MITM proxy local observed plaintext feed={} export={} and tls feed={} export={}",
-        plaintext.feed_events, plaintext.export_events, tls.feed_events, tls.export_events
+        "e2e product MITM proxy local observed plaintext feed={} export={}, tls feed={} export={}, auto mixed feed={} export={}",
+        plaintext.feed_events,
+        plaintext.export_events,
+        tls.feed_events,
+        tls.export_events,
+        auto.feed_events,
+        auto.export_events
     );
     Ok(())
 }
@@ -98,7 +122,11 @@ fn run_scenario(
     let spool_path = scenario_root.join("spool");
     let pid_file = scenario_root.join("mitm-proxy.pid");
 
-    let upstream = HttpSourceServer::spawn(mode.target(), "text/plain", mode.body().to_string())?;
+    let upstream = HttpSourceServer::spawn(
+        mode.target(),
+        TEXT_PLAIN_CONTENT_TYPE,
+        mode.body().to_string(),
+    )?;
     let proxy_listen = SocketAddr::from((Ipv4Addr::LOCALHOST, unused_loopback_port()?));
     let mitm_ca = matches!(mode, DownstreamMode::Tls)
         .then(|| write_mitm_ca(&scenario_root))
@@ -144,6 +172,102 @@ fn run_scenario(
     })
 }
 
+fn run_auto_upstream_tls_scenario(
+    root: &Path,
+) -> Result<ScenarioOutput, Box<dyn std::error::Error>> {
+    let scenario_root = root.join("auto-upstream-tls");
+    fs::create_dir_all(&scenario_root)?;
+    let feed_path = scenario_root.join("mitm-feed.jsonl");
+    let config_path = scenario_root.join("agent.toml");
+    let spool_path = scenario_root.join("spool");
+    let pid_file = scenario_root.join("mitm-proxy.pid");
+
+    let plain = HttpSourceServer::spawn(
+        AUTO_PLAIN_TARGET,
+        AUTO_PLAINTEXT_CONTENT_TYPE,
+        AUTO_PLAIN_BODY.to_string(),
+    )?;
+    let tls_material = write_tls_server_material(&scenario_root, AUTO_TLS_HOST)?;
+    let tls = TlsHttpSourceServer::spawn(
+        AUTO_TLS_TARGET,
+        AUTO_TLS_CONTENT_TYPE,
+        AUTO_TLS_BODY,
+        &tls_material,
+    )?;
+    let proxy_listen = SocketAddr::from((Ipv4Addr::LOCALHOST, unused_loopback_port()?));
+    let mitm_ca = write_mitm_ca(&scenario_root)?;
+
+    let supervisor = ChildSupervisor::new()?;
+    let mut proxy = supervisor.watch(
+        spawn_auto_product_proxy(
+            proxy_listen,
+            &feed_path,
+            &pid_file,
+            &mitm_ca,
+            &tls_material,
+            plain.listen_port(),
+            tls.listen_port(),
+        )?,
+        "product MITM proxy",
+    );
+    wait_for_file_or_child_exit(
+        proxy.child_mut(),
+        &pid_file,
+        READY_TIMEOUT,
+        "product MITM proxy pid",
+    )?;
+
+    let plain_response = send_plaintext_request(
+        proxy_listen,
+        &http_request_with_host(AUTO_PLAIN_TARGET, AUTO_PLAIN_HOST),
+    )?;
+    assert_http_response_bytes("auto plaintext", &plain_response, AUTO_PLAIN_BODY)?;
+    let tls_response = send_tls_request_with_host(
+        proxy_listen,
+        mitm_ca.certificate_der.clone(),
+        AUTO_TLS_HOST,
+        &http_request_with_host(AUTO_TLS_TARGET, AUTO_TLS_HOST),
+    )?;
+    assert_http_response_bytes("auto TLS", &tls_response, AUTO_TLS_BODY)?;
+
+    if plain.finish()? != 1 {
+        return Err(
+            e2e_error("auto plaintext upstream did not observe exactly one request").into(),
+        );
+    }
+    tls.finish()?;
+    drop(proxy);
+
+    let feed_events = read_feed_events(&feed_path)?;
+    let expectations = [
+        HttpExpectation {
+            label: "auto plaintext",
+            target: AUTO_PLAIN_TARGET,
+            response_content_type: AUTO_PLAINTEXT_CONTENT_TYPE,
+            body: AUTO_PLAIN_BODY,
+        },
+        HttpExpectation {
+            label: "auto TLS",
+            target: AUTO_TLS_TARGET,
+            response_content_type: AUTO_TLS_CONTENT_TYPE,
+            body: AUTO_TLS_BODY,
+        },
+    ];
+    assert_proxy_feed_expectations(&feed_events, &expectations)?;
+    write_agent_config(&config_path, &feed_path, &spool_path)?;
+    run_agent_with_max_events(&config_path, feed_events.len())?;
+    let export_events = assert_agent_spool_expectations(
+        "auto mixed",
+        &spool_path,
+        feed_events.len(),
+        &expectations,
+    )?;
+    Ok(ScenarioOutput {
+        feed_events: feed_events.len(),
+        export_events,
+    })
+}
+
 fn spawn_product_proxy(
     listen: SocketAddr,
     upstream_port: u16,
@@ -180,6 +304,50 @@ fn spawn_product_proxy(
                     .expect("MITM CA material has a parent"),
             );
     }
+    Ok(command.spawn()?)
+}
+
+fn spawn_auto_product_proxy(
+    listen: SocketAddr,
+    feed_path: &Path,
+    pid_file: &Path,
+    mitm_ca: &MitmCaMaterial,
+    upstream_tls: &TlsServerMaterial,
+    plain_upstream_port: u16,
+    tls_upstream_port: u16,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    let mut command = Command::new(debug_binary("traffic-probe-mitm-proxy")?);
+    let command = run_in_own_process_group(&mut command)
+        .arg("--listen")
+        .arg(listen.to_string())
+        .arg("--feed")
+        .arg(feed_path)
+        .arg("--pid-file")
+        .arg(pid_file)
+        .arg("--request-direction")
+        .arg("outbound")
+        .arg("--upstream-tls-mode")
+        .arg("auto")
+        .arg("--upstream-route")
+        .arg(format!("{AUTO_PLAIN_HOST}=127.0.0.1:{plain_upstream_port}"))
+        .arg("--upstream-route")
+        .arg(format!("{AUTO_TLS_HOST}=127.0.0.1:{tls_upstream_port}"))
+        .arg("--tls-ca-certificate")
+        .arg(&mitm_ca.certificate_path)
+        .arg("--tls-ca-private-key")
+        .arg(&mitm_ca.private_key_path)
+        .arg("--tls-material-root")
+        .arg(
+            mitm_ca
+                .certificate_path
+                .parent()
+                .expect("MITM CA material has a parent"),
+        )
+        .arg("--upstream-trust-anchor")
+        .arg(&upstream_tls.certificate_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
     Ok(command.spawn()?)
 }
 
@@ -221,7 +389,16 @@ fn send_tls_request(
     trusted_certificate: CertificateDer<'static>,
     request: &[u8],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut stream = tls_client_stream(proxy_listen, trusted_certificate)?;
+    send_tls_request_with_host(proxy_listen, trusted_certificate, HOST, request)
+}
+
+fn send_tls_request_with_host(
+    proxy_listen: SocketAddr,
+    trusted_certificate: CertificateDer<'static>,
+    server_name: &str,
+    request: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut stream = tls_client_stream(proxy_listen, trusted_certificate, server_name)?;
     stream.write_all(request)?;
     stream.flush()?;
     let mut response = Vec::new();
@@ -232,6 +409,7 @@ fn send_tls_request(
 fn tls_client_stream(
     proxy_listen: SocketAddr,
     trusted_certificate: CertificateDer<'static>,
+    server_name: &str,
 ) -> Result<StreamOwned<ClientConnection, TcpStream>, Box<dyn std::error::Error>> {
     let mut roots = RootCertStore::empty();
     roots.add(trusted_certificate)?;
@@ -240,7 +418,7 @@ fn tls_client_stream(
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let server_name = ServerName::try_from(HOST.to_string())?;
+    let server_name = ServerName::try_from(server_name.to_string())?;
     let connection = ClientConnection::new(Arc::new(config), server_name)?;
     let stream = TcpStream::connect(proxy_listen)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -271,27 +449,43 @@ fn assert_proxy_feed(
     mode: DownstreamMode,
     events: &[CaptureEvent],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    assert_proxy_feed_expectations(events, &[mode.expectation()])
+}
+
+fn assert_proxy_feed_expectations(
+    events: &[CaptureEvent],
+    expectations: &[HttpExpectation],
+) -> Result<(), Box<dyn std::error::Error>> {
     if events.len() < 4 {
         return Err(e2e_error(format!(
-            "{} MITM proxy feed contained only {} event(s)",
-            mode.label(),
+            "MITM proxy feed contained only {} event(s)",
             events.len()
         ))
         .into());
     }
-    if !l7_mitm_plaintext_stream_contains(events, Direction::Outbound, mode.target().as_bytes()) {
-        return Err(e2e_error(format!(
-            "{} MITM proxy feed is missing outbound request plaintext",
-            mode.label()
-        ))
-        .into());
-    }
-    if !l7_mitm_plaintext_stream_contains(events, Direction::Inbound, mode.body().as_bytes()) {
-        return Err(e2e_error(format!(
-            "{} MITM proxy feed is missing inbound response plaintext",
-            mode.label()
-        ))
-        .into());
+    for expectation in expectations {
+        if !l7_mitm_plaintext_stream_contains(
+            events,
+            Direction::Outbound,
+            expectation.target.as_bytes(),
+        ) {
+            return Err(e2e_error(format!(
+                "{} MITM proxy feed is missing outbound request plaintext",
+                expectation.label
+            ))
+            .into());
+        }
+        if !l7_mitm_plaintext_stream_contains(
+            events,
+            Direction::Inbound,
+            expectation.body.as_bytes(),
+        ) {
+            return Err(e2e_error(format!(
+                "{} MITM proxy feed is missing inbound response plaintext",
+                expectation.label
+            ))
+            .into());
+        }
     }
     Ok(())
 }
@@ -301,12 +495,25 @@ fn assert_agent_spool(
     spool_path: &Path,
     expected_ingress_events: usize,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    assert_agent_spool_expectations(
+        mode.label(),
+        spool_path,
+        expected_ingress_events,
+        &[mode.expectation()],
+    )
+}
+
+fn assert_agent_spool_expectations(
+    label: &str,
+    spool_path: &Path,
+    expected_ingress_events: usize,
+    expectations: &[HttpExpectation],
+) -> Result<usize, Box<dyn std::error::Error>> {
     let spool = FjallSpool::open(spool_path)?;
     let ingress = spool.read_ingress_batch_after(0, 128)?;
     if ingress.len() != expected_ingress_events {
         return Err(e2e_error(format!(
-            "{} agent stored {} ingress record(s), expected {expected_ingress_events}",
-            mode.label(),
+            "{label} agent stored {} ingress record(s), expected {expected_ingress_events}",
             ingress.len()
         ))
         .into());
@@ -315,28 +522,28 @@ fn assert_agent_spool(
         .iter()
         .map(decode_capture_event)
         .collect::<Result<Vec<_>, _>>()?;
-    assert_proxy_feed(mode, &ingress_events)?;
+    assert_proxy_feed_expectations(&ingress_events, expectations)?;
 
     let envelopes = spool
         .read_export_batch(E2E_EXPORT_CURSOR_OWNER, 128)?
         .iter()
         .map(decode_envelope)
         .collect::<Result<Vec<_>, _>>()?;
-    assert_parsed_http(mode, &envelopes)?;
+    assert_parsed_http_expectations(label, &envelopes, expectations)?;
     Ok(envelopes.len())
 }
 
-fn assert_parsed_http(
-    mode: DownstreamMode,
+fn assert_parsed_http_expectations(
+    label: &str,
     envelopes: &[EventEnvelope],
+    expectations: &[HttpExpectation],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !envelopes
         .iter()
         .all(|envelope| is_l7_mitm_origin(envelope.origin().source(), envelope.origin().provider()))
     {
         return Err(e2e_error(format!(
-            "{} agent export contained non-MITM plaintext origin",
-            mode.label()
+            "{label} agent export contained non-MITM plaintext origin"
         ))
         .into());
     }
@@ -344,24 +551,30 @@ fn assert_parsed_http(
         .iter()
         .any(|envelope| matches!(envelope.kind(), EventKind::ProtocolError(_)))
     {
-        return Err(e2e_error(format!(
-            "{} agent export contained protocol error",
-            mode.label()
-        ))
-        .into());
+        return Err(e2e_error(format!("{label} agent export contained protocol error")).into());
     }
+    for expectation in expectations {
+        assert_parsed_http_expectation(envelopes, *expectation)?;
+    }
+    Ok(())
+}
+
+fn assert_parsed_http_expectation(
+    envelopes: &[EventEnvelope],
+    expectation: HttpExpectation,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !envelopes.iter().any(|envelope| {
         matches!(
             envelope.kind(),
             EventKind::HttpRequestHeaders(headers)
                 if headers.direction == Direction::Outbound
                     && headers.method.as_deref() == Some("GET")
-                    && headers.target.as_deref() == Some(mode.target())
+                    && headers.target.as_deref() == Some(expectation.target)
         )
     }) {
         return Err(e2e_error(format!(
             "{} agent export is missing parsed HTTP request headers",
-            mode.label()
+            expectation.label
         ))
         .into());
     }
@@ -371,18 +584,23 @@ fn assert_parsed_http(
             EventKind::HttpResponseHeaders(headers)
                 if headers.direction == Direction::Inbound
                     && headers.status == Some(200)
+                    && has_header(
+                        &headers.headers,
+                        "content-type",
+                        expectation.response_content_type
+                    )
         )
     }) {
         return Err(e2e_error(format!(
             "{} agent export is missing parsed HTTP response headers",
-            mode.label()
+            expectation.label
         ))
         .into());
     }
-    if !http_body_stream_contains(envelopes, Direction::Inbound, mode.body().as_bytes()) {
+    if !http_body_stream_contains(envelopes, Direction::Inbound, expectation.body.as_bytes()) {
         return Err(e2e_error(format!(
             "{} agent export is missing parsed HTTP response body",
-            mode.label()
+            expectation.label
         ))
         .into());
     }
@@ -533,19 +751,27 @@ fn assert_http_response(
     mode: DownstreamMode,
     response: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    assert_http_response_bytes(mode.label(), response, mode.body())
+}
+
+fn assert_http_response_bytes(
+    label: &str,
+    response: &[u8],
+    body: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let response = String::from_utf8_lossy(response);
-    if response.starts_with("HTTP/1.1 200 OK") && response.contains(mode.body()) {
+    if response.starts_with("HTTP/1.1 200 OK") && response.contains(body) {
         return Ok(());
     }
-    Err(e2e_error(format!(
-        "{} proxy response mismatch: {response:?}",
-        mode.label()
-    ))
-    .into())
+    Err(e2e_error(format!("{label} proxy response mismatch: {response:?}")).into())
 }
 
 fn http_request(target: &str) -> Vec<u8> {
-    format!("GET {target} HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n").into_bytes()
+    http_request_with_host(target, HOST)
+}
+
+fn http_request_with_host(target: &str, host: &str) -> Vec<u8> {
+    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").into_bytes()
 }
 
 fn unused_loopback_port() -> Result<u16, Box<dyn std::error::Error>> {
@@ -590,6 +816,15 @@ impl DownstreamMode {
         match self {
             Self::Plaintext => PLAIN_BODY,
             Self::Tls => TLS_BODY,
+        }
+    }
+
+    fn expectation(self) -> HttpExpectation {
+        HttpExpectation {
+            label: self.label(),
+            target: self.target(),
+            response_content_type: TEXT_PLAIN_CONTENT_TYPE,
+            body: self.body(),
         }
     }
 }

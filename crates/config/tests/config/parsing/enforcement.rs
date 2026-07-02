@@ -328,6 +328,7 @@ target = "127.0.0.1:15002"
 
 	[enforcement.interception.mitm.backend.process]
 	application_protocols = ["http1"]
+	upstream_tls_mode = "always"
 
 	[enforcement.interception.mitm.backend.process.launcher]
 	mode = "external_binary"
@@ -380,6 +381,10 @@ path = "/etc/traffic-probe/mitm-leaf.key"
     assert_eq!(
         process.application_protocols,
         Some(vec![ApplicationProtocol::Http1])
+    );
+    assert_eq!(
+        process.upstream_tls_mode,
+        TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig::Always
     );
     assert_eq!(
         process.upstream_discovery.mode,

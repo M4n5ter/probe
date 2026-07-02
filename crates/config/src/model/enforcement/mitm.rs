@@ -209,6 +209,7 @@ impl TransparentInterceptionMitmManagedProcessConfig {
 pub struct TransparentInterceptionMitmProductProxyConfig {
     pub launcher: TransparentInterceptionMitmProductProxyLauncherConfig,
     pub application_protocols: Option<Vec<ApplicationProtocol>>,
+    pub upstream_tls_mode: TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig,
     pub upstream_discovery: TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig,
     pub upstream_routes: Vec<TransparentInterceptionMitmProductProxyUpstreamRouteConfig>,
 }
@@ -217,9 +218,20 @@ impl TransparentInterceptionMitmProductProxyConfig {
     pub fn is_configured(&self) -> bool {
         self.launcher.is_configured()
             || self.application_protocols.is_some()
+            || self.upstream_tls_mode
+                != TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig::Auto
             || self.upstream_discovery.is_configured()
             || !self.upstream_routes.is_empty()
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig {
+    Never,
+    #[default]
+    Auto,
+    Always,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +392,7 @@ pub struct TransparentInterceptionMitmManagedProcessIntent {
 pub struct TransparentInterceptionMitmProductProxyIntent {
     pub launcher: TransparentInterceptionMitmProductProxyLauncherIntent,
     pub application_protocols: ApplicationProtocolPolicy,
+    pub upstream_tls_mode: TransparentInterceptionMitmProductProxyUpstreamTlsModeIntent,
     pub upstream_discovery: TransparentInterceptionMitmProductProxyUpstreamDiscoveryIntent,
     pub upstream_routes: Vec<TransparentInterceptionMitmProductProxyUpstreamRouteIntent>,
 }
@@ -403,6 +416,13 @@ pub enum TransparentInterceptionMitmProductProxyUpstreamDiscoveryIntent {
         default_port: Option<NonZeroU16>,
         allow_special_use_addresses: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransparentInterceptionMitmProductProxyUpstreamTlsModeIntent {
+    Never,
+    Auto,
+    Always,
 }
 
 pub type TransparentInterceptionMitmProductProxyUpstreamRouteIntent = UpstreamRoute;
@@ -649,9 +669,22 @@ fn validate_mitm_product_proxy_process(
     Some(TransparentInterceptionMitmProductProxyIntent {
         launcher,
         application_protocols,
+        upstream_tls_mode: process.upstream_tls_mode.into(),
         upstream_discovery,
         upstream_routes,
     })
+}
+
+impl From<TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig>
+    for TransparentInterceptionMitmProductProxyUpstreamTlsModeIntent
+{
+    fn from(value: TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig) -> Self {
+        match value {
+            TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig::Never => Self::Never,
+            TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig::Auto => Self::Auto,
+            TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig::Always => Self::Always,
+        }
+    }
 }
 
 fn validate_mitm_product_proxy_launcher(

@@ -5,6 +5,7 @@ use crate::{
     TransparentInterceptionIntentViolation, TransparentInterceptionMitmBackendConfig,
     TransparentInterceptionMitmConfig, TransparentInterceptionMitmPlaintextBridgeModeConfig,
     TransparentInterceptionMitmPolicyHookModeConfig,
+    TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig,
 };
 
 pub(super) fn validate(
@@ -141,12 +142,10 @@ fn validate_product_proxy_contract(
     mitm: &TransparentInterceptionMitmConfig,
     violations: &mut Vec<ConfigViolation>,
 ) {
-    if !matches!(
-        mitm.backend,
-        TransparentInterceptionMitmBackendConfig::ProductProxy { .. }
-    ) {
+    let TransparentInterceptionMitmBackendConfig::ProductProxy { process, .. } = &mitm.backend
+    else {
         return;
-    }
+    };
 
     if mitm.plaintext_bridge.mode
         != TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed
@@ -183,6 +182,15 @@ fn validate_product_proxy_contract(
         violations.push(ConfigViolation {
             field: "enforcement.interception.mitm.leaf_certificate_chain_refs".to_string(),
             reason: "product MITM proxy backend requires exactly one TLS termination source: a CA certificate/private key pair for dynamic SNI certificates or one leaf certificate/private key pair for static TLS termination".to_string(),
+        });
+    }
+    if process.upstream_tls_mode
+        == TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig::Never
+        && !mitm.upstream_trust_anchor_refs.is_empty()
+    {
+        violations.push(ConfigViolation {
+            field: "enforcement.interception.mitm.upstream_trust_anchor_refs".to_string(),
+            reason: "product MITM proxy upstream trust anchors require backend.process.upstream_tls_mode = \"auto\" or \"always\"".to_string(),
         });
     }
 }
@@ -822,6 +830,30 @@ mod tests {
     }
 
     #[test]
+    fn product_proxy_rejects_upstream_trust_anchors_when_upstream_tls_is_disabled() {
+        let mut violations = Vec::new();
+        let mut interception = product_proxy_interception();
+        interception.mitm.upstream_trust_anchor_refs = vec!["upstream-ca".to_string()];
+        let TransparentInterceptionMitmBackendConfig::ProductProxy { process, .. } =
+            &mut interception.mitm.backend
+        else {
+            panic!("test fixture should use product proxy");
+        };
+        process.upstream_tls_mode =
+            crate::TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig::Never;
+
+        validate(
+            &interception,
+            &tls_config_with_mitm_leaf_and_upstream_ca(),
+            &mut violations,
+        );
+
+        assert!(violations.iter().any(|violation| violation.field
+            == "enforcement.interception.mitm.upstream_trust_anchor_refs"
+            && violation.reason.contains("upstream_tls_mode")));
+    }
+
+    #[test]
     fn product_proxy_rejects_dangling_upstream_dns_default_port() {
         let mut violations = Vec::new();
         let mut interception = product_proxy_interception();
@@ -1011,6 +1043,8 @@ mod tests {
                                 working_dir: Some("/run/traffic-probe".into()),
                             },
                         application_protocols: None,
+                        upstream_tls_mode:
+                            crate::TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig::Auto,
                         upstream_discovery:
                             crate::TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig::default(),
                         upstream_routes: Vec::new(),
@@ -1078,6 +1112,16 @@ mod tests {
         config
             .materials
             .extend(tls_config_with_mitm_leaf().materials);
+        config
+    }
+
+    fn tls_config_with_mitm_leaf_and_upstream_ca() -> TlsConfig {
+        let mut config = tls_config_with_mitm_leaf();
+        config.materials.push(TlsMaterialConfig {
+            id: Some("upstream-ca".to_string()),
+            kind: TlsMaterialKind::MitmUpstreamTrustAnchor,
+            path: "/etc/traffic-probe/upstream-ca.pem".into(),
+        });
         config
     }
 }

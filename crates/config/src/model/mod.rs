@@ -72,6 +72,8 @@ pub use enforcement::{
     TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig,
     TransparentInterceptionMitmProductProxyUpstreamRouteConfig,
     TransparentInterceptionMitmProductProxyUpstreamRouteIntent,
+    TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig,
+    TransparentInterceptionMitmProductProxyUpstreamTlsModeIntent,
     TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent, TransparentInterceptionProxyConfig,
     TransparentInterceptionProxyHealthProbeConfig, TransparentInterceptionProxyHealthProbeIntent,

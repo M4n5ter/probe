@@ -13,6 +13,7 @@ pub use cli::Cli;
 pub use error::MitmProxyError;
 pub use proxy::{
     MitmProxyConfig, MitmProxyGuard, TargetRecovery, UpstreamTargetRoute, UpstreamTargetRoutes,
+    UpstreamTlsMode,
 };
 pub use tls::{TlsTerminationConfig, UpstreamTlsConfig};
 

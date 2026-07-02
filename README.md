@@ -1019,6 +1019,9 @@ mode = "operator_managed"
 [enforcement.interception.mitm.backend]
 mode = "product_proxy"
 
+[enforcement.interception.mitm.backend.process]
+upstream_tls_mode = "auto"
+
 [enforcement.interception.mitm.backend.process.launcher]
 mode = "external_binary"
 program = "/usr/local/bin/traffic-probe-mitm-proxy"
@@ -1043,6 +1046,9 @@ endpoint = "http://127.0.0.1:15002/mitm-policy-hook"
 The first-party product proxy supports exact and suffix-wildcard upstream
 routes. Opt-in DNS discovery can be used as a fallback and rejects IANA
 special-purpose/special-use addresses by default unless explicitly allowed.
+`upstream_tls_mode = "auto"` re-encrypts TLS downstream connections upstream
+and keeps plaintext downstream connections plaintext; use `never` for TLS
+termination to plaintext upstreams and `always` for forced upstream TLS.
 CA-backed dynamic certificate mode requires downstream clients to send DNS SNI.
 Host/SNI mismatches fail closed. Use `launcher.mode = "embedded_agent"` with
 `program = "/usr/local/bin/traffic-probe"` when the proxy should run from the

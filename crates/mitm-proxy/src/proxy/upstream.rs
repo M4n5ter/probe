@@ -17,21 +17,45 @@ use crate::{
 
 const MAX_UPSTREAM_CONNECT_CANDIDATES: usize = 8;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UpstreamTlsMode {
+    #[default]
+    Never,
+    Auto,
+    Always,
+}
+
 pub(crate) struct UpstreamConnector {
+    mode: UpstreamTlsMode,
     tls: Option<TlsUpstreamConnector>,
     socket_mark: Option<TcpSocketMark>,
 }
 
 impl UpstreamConnector {
     pub(crate) fn from_config(
+        mode: UpstreamTlsMode,
         config: Option<&UpstreamTlsConfig>,
         socket_mark: Option<NonZeroU32>,
         application_protocols: &ApplicationProtocolPolicy,
     ) -> Result<Self, MitmProxyError> {
-        let tls = config
-            .map(|config| TlsUpstreamConnector::from_config(config, application_protocols))
-            .transpose()?;
+        let tls = match (mode, config) {
+            (UpstreamTlsMode::Never, None) => None,
+            (UpstreamTlsMode::Never, Some(_)) => {
+                return Err(MitmProxyError::InvalidConfig(
+                    "upstream TLS config requires upstream_tls_mode = auto or always".to_string(),
+                ));
+            }
+            (UpstreamTlsMode::Auto | UpstreamTlsMode::Always, Some(config)) => Some(
+                TlsUpstreamConnector::from_config(config, application_protocols)?,
+            ),
+            (UpstreamTlsMode::Auto | UpstreamTlsMode::Always, None) => {
+                return Err(MitmProxyError::InvalidConfig(
+                    "upstream TLS mode requires upstream TLS config".to_string(),
+                ));
+            }
+        };
         Ok(Self {
+            mode,
             tls,
             socket_mark: socket_mark.map(TcpSocketMark::new),
         })
@@ -42,6 +66,7 @@ impl UpstreamConnector {
         target: SocketAddr,
         authority: ObservedAuthority<'_>,
         timeout: Duration,
+        use_tls: bool,
     ) -> Result<UpstreamConnection, MitmProxyError> {
         let mut options = TcpConnectOptions::new(timeout);
         if let Some(mark) = self.socket_mark {
@@ -50,13 +75,18 @@ impl UpstreamConnector {
         let stream =
             connect_tcp(target, options).map_err(io_error("connect MITM proxy upstream"))?;
         configure_stream(&stream, timeout)?;
-        match &self.tls {
-            Some(tls) => tls
+        if use_tls {
+            let tls = self.tls.as_ref().ok_or_else(|| {
+                MitmProxyError::InvalidConfig(
+                    "upstream TLS was selected without a TLS connector".to_string(),
+                )
+            })?;
+            return tls
                 .connect(stream, authority.candidates())
                 .map(Box::new)
-                .map(UpstreamConnection::Tls),
-            None => Ok(UpstreamConnection::Plain(stream)),
+                .map(UpstreamConnection::Tls);
         }
+        Ok(UpstreamConnection::Plain(stream))
     }
 
     pub(crate) fn connect_first(
@@ -64,6 +94,7 @@ impl UpstreamConnector {
         targets: impl IntoIterator<Item = SocketAddr>,
         authority: ObservedAuthority<'_>,
         timeout: Duration,
+        use_tls: bool,
     ) -> Result<Option<UpstreamConnection>, MitmProxyError> {
         let mut last_error = None;
         let deadline = Instant::now()
@@ -74,7 +105,7 @@ impl UpstreamConnector {
             if remaining == Duration::ZERO {
                 break;
             }
-            match self.connect(target, authority, remaining) {
+            match self.connect(target, authority, remaining, use_tls) {
                 Ok(connection) => return Ok(Some(connection)),
                 Err(error) => last_error = Some(error),
             }
@@ -85,8 +116,12 @@ impl UpstreamConnector {
         }
     }
 
-    pub(crate) fn uses_tls(&self) -> bool {
-        self.tls.is_some()
+    pub(crate) fn uses_tls_for_downstream(&self, downstream_uses_tls: bool) -> bool {
+        match self.mode {
+            UpstreamTlsMode::Never => false,
+            UpstreamTlsMode::Auto => downstream_uses_tls,
+            UpstreamTlsMode::Always => true,
+        }
     }
 }
 

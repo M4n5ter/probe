@@ -134,6 +134,8 @@ pub(super) fn write_agent_config(
             TransparentInterceptionMitmProductProxyConfig {
                 launcher: probe_config::TransparentInterceptionMitmProductProxyLauncherConfig::external_binary(program.clone()),
                 application_protocols: None,
+                upstream_tls_mode:
+                    probe_config::TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig::Auto,
                 upstream_discovery: product_proxy_upstream_discovery_config(upstream),
                 upstream_routes: product_proxy_upstream_route_config(upstream),
             },

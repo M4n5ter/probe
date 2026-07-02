@@ -12,6 +12,9 @@ use crate::{
 };
 use probe_core::ApplicationProtocolPolicy;
 
+const TLS_HANDSHAKE_RECORD_TYPE: u8 = 0x16;
+const TLS_RECORD_VERSION_MAJOR: u8 = 0x03;
+
 pub(super) struct DownstreamAcceptor {
     tls: Option<Arc<TlsTerminator>>,
 }
@@ -30,11 +33,25 @@ impl DownstreamAcceptor {
     }
 
     pub(super) fn accept(&self, stream: TcpStream) -> Result<DownstreamStream, MitmProxyError> {
-        match &self.tls {
-            Some(tls) => tls.accept(stream).map(Box::new).map(DownstreamStream::Tls),
-            None => Ok(DownstreamStream::Plain(stream)),
+        let Some(tls) = &self.tls else {
+            return Ok(DownstreamStream::Plain(stream));
+        };
+        if stream_starts_with_tls_handshake(&stream)? {
+            return tls.accept(stream).map(Box::new).map(DownstreamStream::Tls);
         }
+        Ok(DownstreamStream::Plain(stream))
     }
+}
+
+fn stream_starts_with_tls_handshake(stream: &TcpStream) -> Result<bool, MitmProxyError> {
+    let mut prefix = [0_u8; 2];
+    let read = stream
+        .peek(&mut prefix)
+        .map_err(io_error("peek MITM proxy downstream protocol"))?;
+    Ok(matches!(
+        prefix[..read],
+        [TLS_HANDSHAKE_RECORD_TYPE] | [TLS_HANDSHAKE_RECORD_TYPE, TLS_RECORD_VERSION_MAJOR]
+    ))
 }
 
 pub(super) enum DownstreamStream {
@@ -43,6 +60,10 @@ pub(super) enum DownstreamStream {
 }
 
 impl DownstreamStream {
+    pub(super) fn uses_tls(&self) -> bool {
+        matches!(self, Self::Tls(_))
+    }
+
     pub(super) fn tls_server_name(&self) -> Option<&str> {
         match self {
             Self::Plain(_) => None,

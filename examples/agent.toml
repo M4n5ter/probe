@@ -233,12 +233,14 @@ strategy = "none"
 # ca_certificate_ref = "mitm-ca"
 # ca_private_key_ref = "mitm-ca-key"
 # CA-backed product proxy TLS termination requires downstream clients to send
-# DNS SNI. The product proxy also uses that SNI as the upstream TLS server name
-# when upstream TLS is enabled, unless upstream_server_name is pinned. Explicit
-# upstream routes can map reconciled SNI/HTTP Host values to upstream IP socket
-# targets. Route hosts accept exact DNS names or "*.suffix" wildcard patterns;
-# wildcard routes match child and nested names, not the apex. Or use a fixed
-# leaf certificate instead of the CA pair:
+# DNS SNI. upstream_tls_mode controls whether the proxy re-encrypts upstream:
+# "auto" mirrors downstream TLS, "never" terminates to plaintext upstream, and
+# "always" forces upstream TLS. When upstream TLS is used, downstream SNI is the
+# default upstream TLS server name unless the proxy is launched with a pinned
+# upstream server name. Explicit upstream routes can map reconciled SNI/HTTP
+# Host values to upstream IP socket targets. Route hosts accept exact DNS names
+# or "*.suffix" wildcard patterns; wildcard routes match child and nested names,
+# not the apex. Or use a fixed leaf certificate instead of the CA pair:
 # leaf_certificate_chain_refs = ["mitm-leaf"]
 # leaf_private_key_ref = "mitm-leaf-key"
 # upstream_trust_anchor_refs = ["upstream-ca"]
@@ -252,11 +254,15 @@ mode = "disabled"
 # For the first-party product proxy, set mode = "product_proxy" and configure
 # readiness_probe.target to the proxy listen endpoint. RuntimePlan derives the
 # proxy's --listen, --feed, --target-recovery, --policy-hook-*, --tls-*,
-# --upstream-tls, --upstream-trust-anchor, and outbound --upstream-socket-mark
-# arguments from typed MITM config instead of treating raw process args as
-# material ownership.
+# --upstream-tls-mode, --upstream-trust-anchor, and outbound
+# --upstream-socket-mark arguments from typed MITM config instead of treating
+# raw process args as material ownership.
 #
 # [enforcement.interception.mitm.backend.process]
+# upstream_tls_mode = "auto"
+#
+# [enforcement.interception.mitm.backend.process.launcher]
+# mode = "external_binary"
 # program = "/usr/local/bin/traffic-probe-mitm-proxy"
 # working_dir = "/run/traffic-probe"
 #

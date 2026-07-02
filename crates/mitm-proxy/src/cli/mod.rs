@@ -14,7 +14,7 @@ use crate::{
     MitmProxyError,
     proxy::{
         MitmProxyConfig, TargetRecovery, UpstreamDiscovery, UpstreamTargetRoute,
-        UpstreamTargetRoutes,
+        UpstreamTargetRoutes, UpstreamTlsMode,
     },
     tls::{TlsTerminationConfig, UpstreamTlsConfig},
 };
@@ -42,8 +42,8 @@ pub struct Cli {
     pub upstream_dns_default_port: Option<NonZeroU16>,
     #[arg(long)]
     pub upstream_dns_allow_special_use_addresses: bool,
-    #[arg(long)]
-    pub upstream_tls: bool,
+    #[arg(long, value_enum, default_value_t = UpstreamTlsModeArg::Never)]
+    pub upstream_tls_mode: UpstreamTlsModeArg,
     #[arg(long)]
     pub upstream_trust_anchor: Vec<PathBuf>,
     #[arg(long)]
@@ -139,15 +139,15 @@ impl TryFrom<Cli> for MitmProxyConfig {
             value.tls_ca_private_key,
         )?
         .map(|tls| tls.with_material_roots(tls_material_roots.clone()));
-        if !value.upstream_tls
+        if value.upstream_tls_mode == UpstreamTlsModeArg::Never
             && (!value.upstream_trust_anchor.is_empty() || value.upstream_server_name.is_some())
         {
             return Err(MitmProxyError::InvalidConfig(
-                "upstream TLS trust anchors and server name require upstream_tls = true"
+                "upstream TLS trust anchors and server name require upstream_tls_mode = auto or always"
                     .to_string(),
             ));
         }
-        let upstream_tls = value.upstream_tls.then(|| {
+        let upstream_tls = (value.upstream_tls_mode != UpstreamTlsModeArg::Never).then(|| {
             UpstreamTlsConfig::new(value.upstream_trust_anchor, value.upstream_server_name)
                 .with_material_roots(tls_material_roots)
         });
@@ -189,6 +189,7 @@ impl TryFrom<Cli> for MitmProxyConfig {
             upstream: value.upstream,
             upstream_routes,
             upstream_discovery,
+            upstream_tls_mode: value.upstream_tls_mode.into(),
             upstream_tls,
             upstream_socket_mark: value.upstream_socket_mark,
             tls,
@@ -201,6 +202,24 @@ impl TryFrom<Cli> for MitmProxyConfig {
             io_timeout: Duration::from_millis(value.io_timeout_ms),
             action_timeout: Duration::from_millis(value.action_timeout_ms),
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum UpstreamTlsModeArg {
+    #[default]
+    Never,
+    Auto,
+    Always,
+}
+
+impl From<UpstreamTlsModeArg> for UpstreamTlsMode {
+    fn from(value: UpstreamTlsModeArg) -> Self {
+        match value {
+            UpstreamTlsModeArg::Never => Self::Never,
+            UpstreamTlsModeArg::Auto => Self::Auto,
+            UpstreamTlsModeArg::Always => Self::Always,
+        }
     }
 }
 
@@ -361,7 +380,7 @@ mod tests {
     #[test]
     fn upstream_tls_builds_connector_config() {
         let config = MitmProxyConfig::try_from(Cli {
-            upstream_tls: true,
+            upstream_tls_mode: UpstreamTlsModeArg::Always,
             upstream_trust_anchor: vec![Path::new("/tmp/upstream-ca.pem").to_path_buf()],
             upstream_server_name: Some("upstream.test".to_string()),
             ..minimal_cli()
@@ -385,7 +404,7 @@ mod tests {
             Path::new("/var/lib/traffic-probe/tls").to_path_buf(),
         ];
         let config = MitmProxyConfig::try_from(Cli {
-            upstream_tls: true,
+            upstream_tls_mode: UpstreamTlsModeArg::Auto,
             upstream_trust_anchor: vec![Path::new("/etc/probe/certs/upstream.pem").to_path_buf()],
             tls_certificate_chain: Some(Path::new("/etc/probe/certs/leaf.pem").to_path_buf()),
             tls_private_key: Some(Path::new("/etc/probe/certs/leaf.key").to_path_buf()),
@@ -476,7 +495,8 @@ mod tests {
             "linux-original-destination",
             "--request-direction",
             "outbound",
-            "--upstream-tls",
+            "--upstream-tls-mode",
+            "auto",
             "--tls-material-root",
             "/tmp/probe/tls",
             "--tls-ca-certificate",
@@ -702,7 +722,7 @@ mod tests {
             upstream_dns_discovery: false,
             upstream_dns_default_port: None,
             upstream_dns_allow_special_use_addresses: false,
-            upstream_tls: false,
+            upstream_tls_mode: UpstreamTlsModeArg::Never,
             upstream_trust_anchor: Vec::new(),
             upstream_server_name: None,
             upstream_socket_mark: None,

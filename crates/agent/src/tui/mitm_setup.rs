@@ -14,6 +14,7 @@ use probe_config::{
     TransparentInterceptionMitmPolicyHookConfig, TransparentInterceptionMitmPolicyHookModeConfig,
     TransparentInterceptionMitmProductProxyConfig,
     TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig,
+    TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig,
     TransparentInterceptionProxyModeConfig, TransparentInterceptionProxySelfBypassConfig,
     TransparentInterceptionStrategyConfig,
 };
@@ -218,6 +219,7 @@ fn configure_product_mitm_proxy(config: &mut AgentConfig, profile: &LocalMitmPro
     let process = TransparentInterceptionMitmProductProxyConfig {
         launcher: profile.proxy_launcher.clone(),
         application_protocols: None,
+        upstream_tls_mode: TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig::Auto,
         upstream_discovery: TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig::default(
         ),
         upstream_routes: Vec::new(),

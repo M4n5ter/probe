@@ -19,6 +19,7 @@ use probe_config::{
     TransparentInterceptionMitmProductProxyLauncherIntent,
     TransparentInterceptionMitmProductProxyUpstreamDiscoveryIntent,
     TransparentInterceptionMitmProductProxyUpstreamRouteIntent,
+    TransparentInterceptionMitmProductProxyUpstreamTlsModeIntent,
     TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
     TransparentInterceptionOutboundProxySelfBypassIntent,
     TransparentInterceptionProxyHealthProbeIntent, TransparentInterceptionProxyIntent,
@@ -624,6 +625,7 @@ pub enum TransparentInterceptionMitmBackendPlan {
     ProductProxy {
         process: TransparentInterceptionMitmManagedProcessPlan,
         application_protocols: ApplicationProtocolPolicy,
+        upstream_tls_mode: ProductProxyUpstreamTlsModePlan,
         upstream_discovery: ProductProxyUpstreamDiscoveryPlan,
         readiness_probe: TransparentInterceptionMitmBackendReadinessProbePlan,
     },
@@ -662,6 +664,8 @@ impl TransparentInterceptionMitmBackendPlan {
                         readiness_probe,
                     );
                 let application_protocols = process.application_protocols.clone();
+                let upstream_tls_mode =
+                    ProductProxyUpstreamTlsModePlan::from_intent(process.upstream_tls_mode);
                 let upstream_discovery =
                     ProductProxyUpstreamDiscoveryPlan::from_intent(process.upstream_discovery);
                 let cli_builder = context.product_proxy_cli_builder(&readiness_probe);
@@ -669,9 +673,11 @@ impl TransparentInterceptionMitmBackendPlan {
                     process: TransparentInterceptionMitmManagedProcessPlan::from_product_proxy(
                         process,
                         cli_builder,
+                        upstream_tls_mode,
                         upstream_discovery,
                     ),
                     application_protocols,
+                    upstream_tls_mode,
                     upstream_discovery,
                     readiness_probe,
                 }
@@ -699,12 +705,14 @@ impl TransparentInterceptionMitmManagedProcessPlan {
     fn from_product_proxy(
         intent: TransparentInterceptionMitmProductProxyIntent,
         cli_builder: ProductProxyCliBuilder<'_>,
+        upstream_tls_mode: ProductProxyUpstreamTlsModePlan,
         upstream_discovery: ProductProxyUpstreamDiscoveryPlan,
     ) -> Self {
         let (program, working_dir, mut args) =
             product_proxy_launcher_process_parts(intent.launcher);
         args.extend(cli_builder.args(
             &intent.application_protocols,
+            upstream_tls_mode,
             upstream_discovery,
             &intent.upstream_routes,
         ));
@@ -732,6 +740,32 @@ fn product_proxy_launcher_process_parts(
             working_dir,
             vec![EMBEDDED_PRODUCT_PROXY_COMMAND.to_string()],
         ),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductProxyUpstreamTlsModePlan {
+    Never,
+    Auto,
+    Always,
+}
+
+impl ProductProxyUpstreamTlsModePlan {
+    fn from_intent(intent: TransparentInterceptionMitmProductProxyUpstreamTlsModeIntent) -> Self {
+        match intent {
+            TransparentInterceptionMitmProductProxyUpstreamTlsModeIntent::Never => Self::Never,
+            TransparentInterceptionMitmProductProxyUpstreamTlsModeIntent::Auto => Self::Auto,
+            TransparentInterceptionMitmProductProxyUpstreamTlsModeIntent::Always => Self::Always,
+        }
+    }
+
+    fn cli_value(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Auto => "auto",
+            Self::Always => "always",
+        }
     }
 }
 
@@ -787,6 +821,7 @@ impl ProductProxyCliBuilder<'_> {
     fn args(
         &self,
         application_protocols: &ApplicationProtocolPolicy,
+        upstream_tls_mode: ProductProxyUpstreamTlsModePlan,
         upstream_discovery: ProductProxyUpstreamDiscoveryPlan,
         upstream_routes: &[TransparentInterceptionMitmProductProxyUpstreamRouteIntent],
     ) -> Vec<String> {
@@ -802,7 +837,8 @@ impl ProductProxyCliBuilder<'_> {
             self.interception.target_recovery.cli_value().to_string(),
             "--request-direction".to_string(),
             direction_cli_value(self.interception.request_direction).to_string(),
-            "--upstream-tls".to_string(),
+            "--upstream-tls-mode".to_string(),
+            upstream_tls_mode.cli_value().to_string(),
         ];
         for protocol in application_protocols.protocols() {
             args.extend(["--alpn".to_string(), protocol.alpn_name().to_string()]);
@@ -1845,6 +1881,7 @@ mod tests {
         let TransparentInterceptionMitmBackendPlan::ProductProxy {
             process,
             application_protocols,
+            upstream_tls_mode,
             upstream_discovery,
             readiness_probe,
         } = &plan.interception.mitm.backend
@@ -1871,6 +1908,7 @@ mod tests {
             application_protocols.protocols(),
             [probe_core::ApplicationProtocol::Http1]
         );
+        assert_eq!(upstream_tls_mode, &ProductProxyUpstreamTlsModePlan::Auto);
         assert_eq!(
             upstream_discovery,
             &ProductProxyUpstreamDiscoveryPlan::Disabled
@@ -1886,7 +1924,8 @@ mod tests {
                 "accepted-local".to_string(),
                 "--request-direction".to_string(),
                 "inbound".to_string(),
-                "--upstream-tls".to_string(),
+                "--upstream-tls-mode".to_string(),
+                "auto".to_string(),
                 "--alpn".to_string(),
                 "http/1.1".to_string(),
                 "--transparent-listen".to_string(),
@@ -2128,6 +2167,50 @@ mod tests {
                 .args
                 .contains(&"--upstream-dns-allow-special-use-addresses".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn product_proxy_mitm_backend_synthesizes_upstream_tls_mode_args()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_product_proxy_mitm_backend(&mut config);
+        let TransparentInterceptionMitmBackendConfig::ProductProxy { process, .. } =
+            &mut config.enforcement.interception.mitm.backend
+        else {
+            panic!("test fixture should use product proxy");
+        };
+        process.upstream_tls_mode =
+            probe_config::TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig::Never;
+        let capabilities = CapabilityMatrix::new([
+            CapabilityState::available(CapabilityKind::TransparentInterception),
+            CapabilityState::available(CapabilityKind::L7Mitm),
+            CapabilityState::available(CapabilityKind::CaptureEventFeed),
+        ]);
+
+        let plan = resolve_enforcement_plan(&config, &capabilities);
+        let TransparentInterceptionMitmBackendPlan::ProductProxy {
+            process,
+            upstream_tls_mode,
+            ..
+        } = &plan.interception.mitm.backend
+        else {
+            panic!(
+                "product MITM proxy plan should be preserved: {:?}",
+                plan.interception.mitm.backend
+            );
+        };
+
+        assert_eq!(upstream_tls_mode, &ProductProxyUpstreamTlsModePlan::Never);
+        assert!(args_contain_pair(
+            &process.args,
+            "--upstream-tls-mode",
+            "never"
+        ));
         Ok(())
     }
 
@@ -2535,6 +2618,8 @@ mod tests {
                     working_dir: Some("/run/traffic-probe".into()),
                 },
             application_protocols: None,
+            upstream_tls_mode:
+                probe_config::TransparentInterceptionMitmProductProxyUpstreamTlsModeConfig::Auto,
             upstream_discovery:
                 probe_config::TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig::default(),
             upstream_routes: Vec::new(),

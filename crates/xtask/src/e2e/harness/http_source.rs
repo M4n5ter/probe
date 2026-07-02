@@ -1,12 +1,20 @@
 use std::{
-    io::{ErrorKind, Read, Write},
+    fs,
+    io::{BufReader, ErrorKind, Read, Write},
     net::{TcpListener, TcpStream},
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    thread,
-    time::Duration,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+
+use rustls::{
+    ServerConfig, ServerConnection, StreamOwned,
+    pki_types::{CertificateDer, PrivateKeyDer},
 };
 
 const REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(3);
@@ -139,7 +147,141 @@ impl Drop for HttpSourceServer {
     }
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<(String, String), String> {
+pub(crate) struct TlsServerMaterial {
+    pub(crate) certificate_path: PathBuf,
+    private_key_path: PathBuf,
+}
+
+pub(crate) struct TlsHttpSourceServer {
+    listen_port: u16,
+    thread: Option<JoinHandle<Result<(), String>>>,
+}
+
+impl TlsHttpSourceServer {
+    pub(crate) fn spawn(
+        target: &'static str,
+        content_type: &'static str,
+        body: &'static str,
+        material: &TlsServerMaterial,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = Arc::new(tls_http_source_config(material)?);
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let listen_port = listener.local_addr()?.port();
+        let body = body.to_string();
+        let thread = thread::spawn(move || {
+            serve_tls_http_source(listener, config, target, content_type, &body)
+        });
+        Ok(Self {
+            listen_port,
+            thread: Some(thread),
+        })
+    }
+
+    pub(crate) fn listen_port(&self) -> u16 {
+        self.listen_port
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        match self
+            .thread
+            .take()
+            .ok_or_else(|| super::e2e_error("TLS HTTP source server already finished"))?
+            .join()
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                Err(super::e2e_error(format!("TLS HTTP source server failed: {error}")).into())
+            }
+            Err(_) => Err(super::e2e_error("TLS HTTP source server panicked").into()),
+        }
+    }
+}
+
+impl Drop for TlsHttpSourceServer {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take()
+            && let Err(error) = thread.join()
+        {
+            eprintln!("TLS HTTP source server cleanup failed: {error:?}");
+        }
+    }
+}
+
+pub(crate) fn write_tls_server_material(
+    root: &Path,
+    server_name: &str,
+) -> Result<TlsServerMaterial, Box<dyn std::error::Error>> {
+    let certified_key = rcgen::generate_simple_self_signed([server_name.to_string()])?;
+    let certificate_path = root.join("upstream-server.pem");
+    let private_key_path = root.join("upstream-server.key");
+    write_private_file(&certificate_path, certified_key.cert.pem())?;
+    write_private_file(&private_key_path, certified_key.signing_key.serialize_pem())?;
+    Ok(TlsServerMaterial {
+        certificate_path,
+        private_key_path,
+    })
+}
+
+fn tls_http_source_config(
+    material: &TlsServerMaterial,
+) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let certificate_chain = load_certificate_chain(&material.certificate_path)?;
+    let private_key = load_private_key(&material.private_key_path)?;
+    let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    Ok(ServerConfig::builder_with_provider(crypto_provider)
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
+        .with_no_client_auth()
+        .with_single_cert(certificate_chain, private_key)?)
+}
+
+fn serve_tls_http_source(
+    listener: TcpListener,
+    config: Arc<ServerConfig>,
+    expected_target: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<(), String> {
+    let stream = accept_tls_http_source_connection(listener)?;
+    stream
+        .set_read_timeout(Some(REQUEST_IO_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(REQUEST_IO_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    let connection = ServerConnection::new(config).map_err(|error| error.to_string())?;
+    let mut stream = StreamOwned::new(connection, stream);
+    let (method, target) = read_http_request(&mut stream)?;
+    if method != "GET" || target != expected_target {
+        return Err(format!(
+            "unexpected TLS HTTP source request {method} {target}"
+        ));
+    }
+    stream
+        .write_all(http_response(content_type, body).as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|error| error.to_string())
+}
+
+fn accept_tls_http_source_connection(listener: TcpListener) -> Result<TcpStream, String> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + REQUEST_IO_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return Ok(stream),
+            Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                return Err("timed out waiting for TLS HTTP source connection".to_string());
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+fn read_http_request(stream: &mut impl Read) -> Result<(String, String), String> {
     let mut bytes = Vec::new();
     loop {
         let mut buffer = [0; 1024];
@@ -186,4 +328,39 @@ fn http_response(content_type: &str, body: &str) -> String {
 
 fn header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn load_certificate_chain(
+    path: &Path,
+) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error>> {
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    let certificates = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    if certificates.is_empty() {
+        return Err(super::e2e_error(format!(
+            "TLS HTTP source certificate chain {} was empty",
+            path.display()
+        ))
+        .into());
+    }
+    Ok(certificates)
+}
+
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| {
+        super::e2e_error(format!(
+            "TLS HTTP source private key {} was empty",
+            path.display()
+        ))
+        .into()
+    })
+}
+
+fn write_private_file(
+    path: &Path,
+    contents: impl AsRef<[u8]>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::write(path, contents)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }

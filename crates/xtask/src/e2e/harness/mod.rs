@@ -10,7 +10,9 @@ pub(crate) use build::{
     workspace_root,
 };
 pub(crate) use codec::{decode_capture_event, decode_envelope};
-pub(crate) use http_source::HttpSourceServer;
+pub(crate) use http_source::{
+    HttpSourceServer, TlsHttpSourceServer, TlsServerMaterial, write_tls_server_material,
+};
 pub(crate) use netns::{
     reexec_current_case_in_fresh_network_namespace,
     reexec_current_case_in_fresh_network_namespace_with_env, verify_fresh_network_namespace,

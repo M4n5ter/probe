@@ -51,6 +51,7 @@ pub(super) fn test_config(
         upstream,
         upstream_routes: UpstreamTargetRoutes::default(),
         upstream_discovery: UpstreamDiscovery::Disabled,
+        upstream_tls_mode: super::UpstreamTlsMode::Never,
         upstream_tls: None,
         upstream_socket_mark: None,
         tls,

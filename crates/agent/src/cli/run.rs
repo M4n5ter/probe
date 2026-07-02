@@ -538,7 +538,8 @@ mod tests {
             "linux-original-destination",
             "--request-direction",
             "outbound",
-            "--upstream-tls",
+            "--upstream-tls-mode",
+            "auto",
             "--tls-material-root",
             "/tmp/probe/tls",
             "--tls-ca-certificate",
@@ -560,6 +561,7 @@ mod tests {
             mitm_proxy::TargetRecovery::LinuxOriginalDestination
         );
         assert_eq!(config.request_direction, Direction::Outbound);
+        assert_eq!(config.upstream_tls_mode, mitm_proxy::UpstreamTlsMode::Auto);
         assert!(config.upstream_tls.is_some());
         assert!(matches!(
             config.tls,
