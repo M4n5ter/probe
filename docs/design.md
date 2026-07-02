@@ -311,6 +311,9 @@ Operator TUI 能力事实：
   该路径返回完整 `EventEnvelope` 给 admin client，但 TUI 只保留事件表展示摘要，不在 TUI model 中保留 raw argv。
   当选中进程有 readable executable path 时，Traffic tab 使用同一 selector model 过滤事件；选中进程无法形成 executable-path
   selector 时 fail-closed，不退回全机流量。
+  Traffic tab 的 action bar 将 `[Watch]`、`[Out MITM]` 和 `[In MITM]` 放在事件浏览入口；键盘 `w`、`o`、`i`
+  与鼠标点击进入同一 typed action path。`Watch` 仅改变 traffic selector；MITM quick actions 会为选中进程写入 scoped
+  product-proxy MITM、client trust、plaintext bridge 和 policy hook contract，保存后由 TUI-managed agent restart 应用。
   当没有 active admin socket 时，Traffic tab fail-closed 并显示 agent runtime 不可用状态。
 - `tail_events` 是 non-mutating admin command。它读取 `after_sequence` 之后的 export records，按可选 selector
   过滤，并返回 `next_after_sequence`；该响应 cursor 不会 ack 任何 exporter sink cursor。

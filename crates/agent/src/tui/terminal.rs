@@ -92,8 +92,12 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
             if !event::poll(Duration::from_millis(250))? {
                 continue;
             }
-            let Some(action) = event_to_action(&hit_map, event::read()?, app.is_editing_text())
-            else {
+            let Some(action) = event_to_action(
+                &hit_map,
+                event::read()?,
+                app.is_editing_text(),
+                app.active_tab(),
+            ) else {
                 continue;
             };
             if let Some(effect) = app.handle_action(action) {
@@ -275,16 +279,21 @@ impl Drop for ScreenGuard {
     }
 }
 
-fn event_to_action(hit_map: &HitMap, event: Event, editing_text: bool) -> Option<TuiAction> {
+fn event_to_action(
+    hit_map: &HitMap,
+    event: Event,
+    editing_text: bool,
+    active_tab: TuiTab,
+) -> Option<TuiAction> {
     match event {
-        Event::Key(key) => key_to_action(key, editing_text),
+        Event::Key(key) => key_to_action(key, editing_text, active_tab),
         Event::Mouse(mouse) => mouse_to_action(hit_map, mouse),
         Event::Resize(_, _) => None,
         Event::FocusGained | Event::FocusLost | Event::Paste(_) => None,
     }
 }
 
-fn key_to_action(key: KeyEvent, editing_text: bool) -> Option<TuiAction> {
+fn key_to_action(key: KeyEvent, editing_text: bool, active_tab: TuiTab) -> Option<TuiAction> {
     if key.kind != KeyEventKind::Press {
         return None;
     }
@@ -298,6 +307,12 @@ fn key_to_action(key: KeyEvent, editing_text: bool) -> Option<TuiAction> {
         (KeyCode::Char('/'), _) => Some(TuiAction::StartProcessSearch),
         (KeyCode::Char('f'), KeyModifiers::CONTROL) => Some(TuiAction::StartProcessSearch),
         (KeyCode::Char('w'), _) => Some(TuiAction::ToggleProcessMonitor),
+        (KeyCode::Char('o'), _) if active_tab == TuiTab::Traffic => {
+            Some(TuiAction::ConfigureOutboundMitm)
+        }
+        (KeyCode::Char('i'), _) if active_tab == TuiTab::Traffic => {
+            Some(TuiAction::ConfigureInboundMitm)
+        }
         (KeyCode::Tab, _) => Some(TuiAction::NextTab),
         (KeyCode::BackTab, _) => Some(TuiAction::PreviousTab),
         (KeyCode::Up, _) => Some(TuiAction::MoveUp),
@@ -358,26 +373,64 @@ mod tests {
         assert_eq!(
             key_to_action(
                 KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-                false
+                false,
+                TuiTab::Overview
             ),
             Some(TuiAction::Save)
         );
         assert_eq!(
-            key_to_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), false),
+            key_to_action(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                false,
+                TuiTab::Overview
+            ),
             Some(TuiAction::NextTab)
         );
         assert_eq!(
-            key_to_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
+            key_to_action(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                false,
+                TuiTab::Overview
+            ),
             Some(TuiAction::NextValue)
         );
         assert_eq!(
-            key_to_action(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE), false),
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                false,
+                TuiTab::Overview
+            ),
             Some(TuiAction::StartProcessSearch)
         );
         assert_eq!(
             key_to_action(
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+                false,
+                TuiTab::Traffic
+            ),
+            Some(TuiAction::ConfigureOutboundMitm)
+        );
+        assert_eq!(
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+                false,
+                TuiTab::Traffic
+            ),
+            Some(TuiAction::ConfigureInboundMitm)
+        );
+        assert_eq!(
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+                false,
+                TuiTab::Overview
+            ),
+            None
+        );
+        assert_eq!(
+            key_to_action(
                 KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
-                false
+                false,
+                TuiTab::Overview
             ),
             Some(TuiAction::StartProcessSearch)
         );
@@ -386,26 +439,43 @@ mod tests {
     #[test]
     fn text_editing_keys_feed_text_instead_of_global_shortcuts() {
         assert_eq!(
-            key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), true),
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                true,
+                TuiTab::Overview
+            ),
             Some(TuiAction::TextInput('q'))
         );
         assert_eq!(
             key_to_action(
                 KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-                true
+                true,
+                TuiTab::Overview
             ),
             None
         );
         assert_eq!(
-            key_to_action(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), true),
+            key_to_action(
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                true,
+                TuiTab::Overview
+            ),
             Some(TuiAction::TextBackspace)
         );
         assert_eq!(
-            key_to_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), true),
+            key_to_action(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                true,
+                TuiTab::Overview
+            ),
             Some(TuiAction::TextCancel)
         );
         assert_eq!(
-            key_to_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), true),
+            key_to_action(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                true,
+                TuiTab::Overview
+            ),
             Some(TuiAction::TextSubmit)
         );
     }

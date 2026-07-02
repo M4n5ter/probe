@@ -87,6 +87,8 @@ pub(crate) enum TuiAction {
     TextCancel,
     StartProcessSearch,
     ToggleProcessMonitor,
+    ConfigureOutboundMitm,
+    ConfigureInboundMitm,
     Hover {
         target: Option<HitTarget>,
         column: u16,
@@ -385,6 +387,12 @@ impl TuiApp {
             | TuiAction::TextCancel => {}
             TuiAction::StartProcessSearch => self.begin_process_search(),
             TuiAction::ToggleProcessMonitor => self.toggle_selected_process_monitor(),
+            TuiAction::ConfigureOutboundMitm => {
+                return self.apply_mitm_quick_setup(MitmQuickSetupDirection::Outbound);
+            }
+            TuiAction::ConfigureInboundMitm => {
+                return self.apply_mitm_quick_setup(MitmQuickSetupDirection::Inbound);
+            }
             TuiAction::Hover {
                 target,
                 column,
@@ -1159,6 +1167,36 @@ mod tests {
     }
 
     #[test]
+    fn traffic_tab_mitm_actions_use_selected_process() {
+        let mut keyboard_app = multi_process_app();
+        keyboard_app.select_tab(TuiTab::Traffic);
+        keyboard_app.handle_action(TuiAction::Click(HitTarget::TrafficProcess(1)));
+        let keyboard_effect = keyboard_app.handle_action(TuiAction::ConfigureOutboundMitm);
+
+        let mut mouse_app = multi_process_app();
+        mouse_app.select_tab(TuiTab::Traffic);
+        mouse_app.handle_action(TuiAction::Click(HitTarget::TrafficProcess(1)));
+        let mouse_effect = mouse_app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::ConfigureOutboundMitm,
+        )));
+
+        assert_eq!(keyboard_effect, Some(TuiEffect::SaveConfig));
+        assert_eq!(mouse_effect, Some(TuiEffect::SaveConfig));
+        assert_eq!(
+            keyboard_app.config.enforcement.interception.strategy,
+            probe_config::TransparentInterceptionStrategyConfig::OutboundTransparentMitm
+        );
+        assert_eq!(
+            keyboard_app.config.enforcement.interception.strategy,
+            mouse_app.config.enforcement.interception.strategy
+        );
+        assert_outbound_mitm_cgroup_selector(&keyboard_app, "system.slice/nginx.service");
+        assert_outbound_mitm_cgroup_selector(&mouse_app, "system.slice/nginx.service");
+        assert!(keyboard_app.dirty());
+        assert!(mouse_app.dirty());
+    }
+
+    #[test]
     fn outbound_mitm_setup_rejects_root_process_without_cgroup_scope() {
         let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
@@ -1508,5 +1546,15 @@ mod tests {
         for character in text.chars() {
             app.handle_action(TuiAction::TextInput(character));
         }
+    }
+
+    fn assert_outbound_mitm_cgroup_selector(app: &TuiApp, expected_cgroup: &str) {
+        let Some(probe_core::Selector::Match { term }) =
+            app.config.enforcement.interception.selector.as_ref()
+        else {
+            panic!("outbound MITM selector should be a match selector");
+        };
+        assert_eq!(term.process.cgroup_paths, [expected_cgroup.to_string()]);
+        assert_eq!(term.traffic.directions, [probe_core::Direction::Outbound]);
     }
 }

@@ -280,6 +280,9 @@ It uses the selected process executable-path selector when available; if the
 selected process has no readable executable path, traffic filtering fails closed
 instead of showing unrelated host traffic. The TUI keeps only display summaries
 for the event table and does not retain raw process argv.
+The same tab also exposes `Watch`, `Out MITM`, and `In MITM` actions so a
+selected process can be scoped for passive traffic or product-proxy MITM without
+switching to a separate configuration screen.
 
 The Runtime tab can call the online admin `reload_runtime_actions` command. It
 reloads the runtime owners that are explicitly safe to update online, currently

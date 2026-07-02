@@ -239,6 +239,8 @@ collector-specific payload format 仍应在配置和 policy 文件中维护。
 admin surface tail 已解析的 export event。它优先使用选中进程的 executable-path
 selector；如果选中进程没有可读 executable path，流量过滤会 fail closed，不会退回展示无关的全机流量。
 TUI 的事件表只保留展示摘要，不保留进程 raw argv。
+同一 Traffic tab 也提供 `Watch`、`Out MITM` 和 `In MITM` 操作，选中进程后即可配置
+passive traffic scope 或 product-proxy MITM，不需要切换到单独的配置页面。
 
 ### 最小 Policy 与 Webhook 接线
 

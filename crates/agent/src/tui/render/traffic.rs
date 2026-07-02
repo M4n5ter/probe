@@ -11,6 +11,7 @@ use ratatui::{
 
 use crate::tui::{
     app::{ProcessArgvHover, TuiApp},
+    controls::ControlId,
     hit::{HitArea, HitTarget},
     traffic::TrafficStatusKind,
 };
@@ -38,7 +39,7 @@ pub(super) fn render_traffic(
     let [table_area, detail_area] =
         Layout::vertical([Constraint::Min(6), Constraint::Length(detail_height)]).areas(right_area);
 
-    render_traffic_status(frame, status_area, app);
+    render_traffic_status(frame, status_area, app, hits);
     render_traffic_process_picker(frame, process_area, app, hits);
     render_traffic_events(frame, table_area, app, hits);
     render_traffic_detail_preview(frame, detail_area, app);
@@ -152,7 +153,7 @@ pub(super) fn render_process_argv_hover(
     );
 }
 
-fn render_traffic_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+fn render_traffic_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec<HitArea>) {
     let traffic = app.traffic();
     let status = Line::from(vec![
         Span::styled(
@@ -169,7 +170,81 @@ fn render_traffic_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Span::styled("last export ", Style::default().fg(Color::Gray)),
         Span::raw(traffic.last_export_sequence().to_string()),
     ]);
-    frame.render_widget(Paragraph::new(status), area);
+    let status_area = Rect::new(area.x, area.y, area.width, 1);
+    frame.render_widget(Paragraph::new(status), status_area);
+    render_traffic_action_bar(frame, area, app, hits);
+}
+
+fn render_traffic_action_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    hits: &mut Vec<HitArea>,
+) {
+    if area.height < 2 {
+        return;
+    }
+    let mut x = area.x;
+    let y = area.y + 1;
+    if let Some(index) = app
+        .selected_process_index()
+        .filter(|index| app.processes().entries().get(*index).is_some())
+    {
+        let target = HitTarget::ProcessMonitor(index);
+        let label = if app.process_is_monitored(index) {
+            "Unwatch"
+        } else {
+            "Watch"
+        };
+        x = render_action_button(
+            frame,
+            hits,
+            action_area(area, x, y),
+            label,
+            target,
+            app.is_hovered(target),
+        )
+        .unwrap_or(x);
+    }
+    x = render_action_button(
+        frame,
+        hits,
+        action_area(area, x, y),
+        "Out MITM",
+        HitTarget::Control(ControlId::ConfigureOutboundMitm),
+        app.is_hovered(HitTarget::Control(ControlId::ConfigureOutboundMitm)),
+    )
+    .unwrap_or(x);
+    let _ = render_action_button(
+        frame,
+        hits,
+        action_area(area, x, y),
+        "In MITM",
+        HitTarget::Control(ControlId::ConfigureInboundMitm),
+        app.is_hovered(HitTarget::Control(ControlId::ConfigureInboundMitm)),
+    );
+}
+
+fn render_action_button(
+    frame: &mut Frame<'_>,
+    hits: &mut Vec<HitArea>,
+    available: Rect,
+    label: &'static str,
+    target: HitTarget,
+    hovered: bool,
+) -> Option<u16> {
+    let width = label.len() as u16 + 2;
+    if width > available.width {
+        return None;
+    }
+    let area = Rect::new(available.x, available.y, width, 1);
+    super::render_button(frame, hits, area, label, target, hovered);
+    Some(available.x.saturating_add(width + 1))
+}
+
+fn action_area(area: Rect, x: u16, y: u16) -> Rect {
+    let right = area.x.saturating_add(area.width);
+    Rect::new(x, y, right.saturating_sub(x), 1)
 }
 
 fn render_traffic_process_picker(

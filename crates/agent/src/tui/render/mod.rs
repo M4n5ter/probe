@@ -437,7 +437,7 @@ fn render_process_search(
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let status_style = Style::default().fg(status_color(app.status().kind));
-    let text = Line::from(vec![
+    let mut spans = vec![
         Span::styled(app.status().text.clone(), status_style),
         Span::raw("   "),
         Span::styled("Tab/Shift-Tab", Style::default().fg(Color::Gray)),
@@ -448,11 +448,20 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Span::raw(" edit/open  "),
         Span::styled("w", Style::default().fg(Color::Gray)),
         Span::raw(" watch  "),
+    ];
+    if app.active_tab() == TuiTab::Traffic {
+        spans.extend([
+            Span::styled("o/i", Style::default().fg(Color::Gray)),
+            Span::raw(" mitm  "),
+        ]);
+    }
+    spans.extend([
         Span::styled("Ctrl-S", Style::default().fg(Color::Gray)),
         Span::raw(" save  "),
         Span::styled("q", Style::default().fg(Color::Gray)),
         Span::raw(" quit"),
     ]);
+    let text = Line::from(spans);
     frame.render_widget(Paragraph::new(text), area);
 }
 
@@ -807,6 +816,43 @@ mod tests {
 
         let output = terminal.backend().to_string();
         assert!(!output.contains("[Enable admin]"));
+        Ok(())
+    }
+
+    #[test]
+    fn render_traffic_registers_capture_and_mitm_action_hits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = test_app();
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24))?;
+        let mut hit_map = HitMap::default();
+
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &mut app);
+        })?;
+
+        let output = terminal.backend().to_string();
+        assert!(output.contains("[Watch]"));
+        assert!(output.contains("[Out MITM]"));
+        assert!(output.contains("[In MITM]"));
+        assert!(hit_exists(
+            &hit_map,
+            Some(HitTarget::ProcessMonitor(0)),
+            100,
+            24
+        ));
+        assert!(hit_exists(
+            &hit_map,
+            Some(HitTarget::Control(ControlId::ConfigureOutboundMitm)),
+            100,
+            24
+        ));
+        assert!(hit_exists(
+            &hit_map,
+            Some(HitTarget::Control(ControlId::ConfigureInboundMitm)),
+            100,
+            24
+        ));
         Ok(())
     }
 
