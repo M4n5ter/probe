@@ -4,7 +4,10 @@ use probe_core::{
     CaptureOrigin, CaptureSource, CaptureTrafficSecurity, Direction, EventEnvelope, EventKind,
 };
 
-use crate::admin::{EventTailBudgetSnapshot, EventTailOmission, EventTailRecord};
+use crate::{
+    admin::{EventTailBudgetSnapshot, EventTailOmission, EventTailRecord},
+    tui::copy::{MITM_HTTP_PATH_LABEL, MITM_TLS_PATH_LABEL},
+};
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct TrafficRow {
@@ -162,8 +165,8 @@ fn capture_path_short_label(origin: CaptureOrigin) -> &'static str {
 fn mitm_capture_path_short_label(traffic_security: CaptureTrafficSecurity) -> &'static str {
     match traffic_security {
         CaptureTrafficSecurity::Unknown => "mitm-data",
-        CaptureTrafficSecurity::Cleartext => "mitm-http",
-        CaptureTrafficSecurity::TlsDecrypted => "mitm-tls",
+        CaptureTrafficSecurity::Cleartext => MITM_HTTP_PATH_LABEL,
+        CaptureTrafficSecurity::TlsDecrypted => MITM_TLS_PATH_LABEL,
     }
 }
 

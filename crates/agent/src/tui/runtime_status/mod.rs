@@ -190,7 +190,10 @@ mod tests {
         tcp_health::TcpHealthMode,
         tui::{
             controls::ControlId,
-            copy::{MITM_PLAINTEXT_COVERAGE, MITM_QUICK_SETUP_APPLY, MITM_TLS_TRUST_ACTION},
+            copy::{
+                MITM_HTTP_PATH_LABEL, MITM_PLAINTEXT_COVERAGE, MITM_QUICK_SETUP_APPLY,
+                MITM_TLS_PATH_LABEL, MITM_TLS_TRUST_ACTION,
+            },
         },
     };
 
@@ -289,6 +292,21 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("plaintext bridge: capture_event_feed"))
         );
+        assert!(lines.iter().any(|line| {
+            line == &format!(
+                "path labels: {MITM_HTTP_PATH_LABEL}=plain HTTP, {MITM_TLS_PATH_LABEL}=TLS-decrypted HTTP"
+            )
+        }));
+        assert!(lines.iter().any(|line| {
+            line == &format!(
+                "plain HTTP: visible as {MITM_HTTP_PATH_LABEL} without TLS client trust"
+            )
+        }));
+        assert!(lines.iter().any(|line| {
+            line == &format!(
+                "TLS-decrypted HTTP: visible as {MITM_TLS_PATH_LABEL} after {MITM_TLS_TRUST_ACTION}"
+            )
+        }));
         assert!(
             lines
                 .iter()
@@ -337,8 +355,62 @@ mod tests {
             line == "tls trust action: configure MITM client trust before expecting TLS-decrypted HTTP"
         }));
         assert!(lines.iter().any(|line| {
+            line == "TLS-decrypted HTTP: blocked until MITM client trust is configured"
+        }));
+        assert!(lines.iter().any(|line| {
             line == "next action: MITM TLS trust needs attention: configure MITM client trust before expecting TLS-decrypted HTTP"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_report_disabled_mitm_bridge_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut enforcement = configured_mitm_enforcement_status_json()?;
+        enforcement["interception"]["runtime_l7_mitm"]["plaintext_bridge"]["mode"] =
+            json!("disabled_after_error");
+        enforcement["interception"]["runtime_l7_mitm"]["plaintext_bridge"]["disable_reason"] =
+            json!("feed writer closed");
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "capture_event_feed",
+                    "selected_input_source": "mitm_plaintext_bridge",
+                    "mode": "capture_event_feed",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": []
+                },
+                "enforcement": enforcement
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+        let lines = diagnostics.detail_lines();
+
+        assert!(lines.iter().any(|line| {
+            line == &format!(
+                "path labels: {MITM_HTTP_PATH_LABEL}=plain HTTP, {MITM_TLS_PATH_LABEL}=TLS-decrypted HTTP"
+            )
+        }));
+        assert!(lines.iter().any(|line| {
+            line == "plain HTTP: blocked because MITM plaintext bridge runtime is disabled: feed writer closed"
+        }));
+        assert!(lines.iter().any(|line| {
+            line == "TLS-decrypted HTTP: blocked because MITM plaintext bridge runtime is disabled: feed writer closed"
+        }));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "l7 mitm plaintext bridge runtime: disabled_after_error")
+        );
+        assert!(
+            lines.iter().any(|line| {
+                line == "next action: MITM backend is unhealthy: feed writer closed"
+            })
+        );
         Ok(())
     }
 

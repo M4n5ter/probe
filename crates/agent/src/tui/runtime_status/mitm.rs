@@ -11,7 +11,9 @@ use crate::{
     status::{EnforcementStatusMode, EnforcementStatusSnapshot},
     tcp_health::{TcpHealthMode, TcpHealthSnapshot},
     transparent_interception::{TransparentProxyRuntimeMode, TransparentProxyRuntimeSnapshot},
-    tui::copy::{MITM_PLAINTEXT_COVERAGE, MITM_TLS_TRUST_ACTION},
+    tui::copy::{
+        MITM_HTTP_PATH_LABEL, MITM_PLAINTEXT_COVERAGE, MITM_TLS_PATH_LABEL, MITM_TLS_TRUST_ACTION,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +118,7 @@ impl MitmDiagnostics {
             ),
             self.plaintext_bridge_line(),
         ];
+        lines.extend(self.mitm_visibility_lines());
         if !self.capabilities.is_empty() {
             lines.push("required capabilities:".to_string());
             lines.extend(
@@ -159,6 +162,62 @@ impl MitmDiagnostics {
             line.push_str(&format!(" follow={follow}"));
         }
         line
+    }
+
+    fn mitm_visibility_lines(&self) -> Vec<String> {
+        match self.plaintext_bridge {
+            TransparentInterceptionMitmPlaintextBridgePlan::Disabled => vec![
+                "path labels: disabled until MITM plaintext bridge feeds traffic events"
+                    .to_string(),
+                "plain HTTP: unavailable until MITM plaintext bridge is enabled".to_string(),
+                "TLS-decrypted HTTP: unavailable until MITM plaintext bridge is enabled"
+                    .to_string(),
+            ],
+            TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed { .. } => {
+                if let Some(reason) = self.runtime_plaintext_bridge_disabled_reason() {
+                    return vec![
+                        format!(
+                            "path labels: {MITM_HTTP_PATH_LABEL}=plain HTTP, {MITM_TLS_PATH_LABEL}=TLS-decrypted HTTP"
+                        ),
+                        format!(
+                            "plain HTTP: blocked because MITM plaintext bridge runtime is disabled: {reason}"
+                        ),
+                        format!(
+                            "TLS-decrypted HTTP: blocked because MITM plaintext bridge runtime is disabled: {reason}"
+                        ),
+                    ];
+                }
+                let tls_line = match self.client_trust {
+                    TransparentInterceptionMitmClientTrustPlan::Disabled => {
+                        "TLS-decrypted HTTP: blocked until MITM client trust is configured"
+                            .to_string()
+                    }
+                    TransparentInterceptionMitmClientTrustPlan::OperatorManaged => format!(
+                        "TLS-decrypted HTTP: visible as {MITM_TLS_PATH_LABEL} after {MITM_TLS_TRUST_ACTION}"
+                    ),
+                };
+                vec![
+                    format!(
+                        "path labels: {MITM_HTTP_PATH_LABEL}=plain HTTP, {MITM_TLS_PATH_LABEL}=TLS-decrypted HTTP"
+                    ),
+                    format!(
+                        "plain HTTP: visible as {MITM_HTTP_PATH_LABEL} without TLS client trust"
+                    ),
+                    tls_line,
+                ]
+            }
+        }
+    }
+
+    fn runtime_plaintext_bridge_disabled_reason(&self) -> Option<&str> {
+        let runtime = self.runtime_l7_mitm.as_ref()?;
+        (runtime.plaintext_bridge.mode == L7MitmPlaintextBridgeMode::DisabledAfterError).then_some(
+            runtime
+                .plaintext_bridge
+                .disable_reason
+                .as_deref()
+                .unwrap_or("disabled after runtime error"),
+        )
     }
 
     fn first_unavailable_capability(&self) -> Option<&RequiredCapabilityPlan> {
