@@ -719,7 +719,7 @@ mod tests {
             ProcessCatalog::default(),
         );
         let status = StatusMessage::warning(
-            "Outbound MITM configured, but MITM proxy executable is missing",
+            "Outbound reliable MITM proxy fallback configured, but MITM proxy executable is missing",
         );
 
         mark_saved_runtime_success(&mut app, &status, "restarted TUI managed agent");
@@ -741,7 +741,7 @@ mod tests {
             ProcessCatalog::default(),
         );
         let status = StatusMessage::saved(
-            "Outbound MITM configured; captures plain HTTP and TLS-decrypted HTTP",
+            "Outbound reliable MITM proxy fallback configured; captures plain HTTP and TLS-decrypted HTTP",
         );
 
         mark_saved_runtime_error(
@@ -767,7 +767,7 @@ mod tests {
             ProcessCatalog::default(),
         );
         let status = StatusMessage::saved(
-            "Outbound MITM configured; captures plain HTTP and TLS-decrypted HTTP",
+            "Outbound reliable MITM proxy fallback configured; captures plain HTTP and TLS-decrypted HTTP",
         );
 
         detach_saved_runtime_error(

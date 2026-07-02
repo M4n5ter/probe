@@ -9,7 +9,7 @@ use self::{client::request_tail_events, rows::TrafficRow};
 use crate::{
     admin::{AdminClientError, EventTailOmission, EventTailSnapshot},
     tui::{
-        copy::MITM_PLAINTEXT_COVERAGE,
+        copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL},
         runtime_status::{
             CaptureDiagnosticMessage, TrafficRuntimeDiagnostics, missing_mitm_quick_setup_action,
         },
@@ -86,8 +86,9 @@ impl TrafficState {
                 vec![
                     "Capture diagnostics will appear here after the first refresh".to_string(),
                     format!(
-                        "MITM fallback can capture {MITM_PLAINTEXT_COVERAGE} when passive capture is unavailable"
+                        "{MITM_PROXY_FALLBACK_LABEL} can capture {MITM_PLAINTEXT_COVERAGE} when eBPF and libpcap are unavailable"
                     ),
+                    "Traffic rows separate passive capture, plain HTTP, and TLS-decrypted HTTP after runtime diagnostics are available".to_string(),
                     format!("MITM setup: {}", missing_mitm_quick_setup_action()),
                 ]
             })
@@ -340,7 +341,10 @@ mod tests {
         status::{
             CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
         },
-        tui::{copy::MITM_PLAINTEXT_COVERAGE, runtime_status::TrafficRuntimeDiagnostics},
+        tui::{
+            copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL},
+            runtime_status::TrafficRuntimeDiagnostics,
+        },
     };
 
     #[test]
@@ -383,7 +387,7 @@ mod tests {
         assert_eq!(
             traffic.status().text,
             format!(
-                "MITM plaintext bridge active for {MITM_PLAINTEXT_COVERAGE}; no matching events yet"
+                "{MITM_PROXY_FALLBACK_LABEL} active for {MITM_PLAINTEXT_COVERAGE}; no matching events yet"
             )
         );
         assert!(

@@ -141,13 +141,13 @@ impl MitmDiagnostics {
             L7MitmPlaintextBridgeMode::Active => self.active_bridge_status_message(traffic_empty),
             L7MitmPlaintextBridgeMode::Configured | L7MitmPlaintextBridgeMode::Ready => {
                 Some(CaptureDiagnosticMessage::Warning(format!(
-                    "MITM bridge is not active yet: {}",
+                    "MITM proxy path is not active yet: {}",
                     bridge_activation_action(runtime.plaintext_bridge.mode)
                 )))
             }
             L7MitmPlaintextBridgeMode::DisabledAfterError => {
                 Some(CaptureDiagnosticMessage::Warning(format!(
-                    "MITM bridge disabled: {}",
+                    "MITM proxy event feed disabled: {}",
                     runtime
                         .plaintext_bridge
                         .disable_reason
@@ -190,7 +190,7 @@ impl MitmDiagnostics {
 
     fn plaintext_bridge_line(&self) -> String {
         let mut line = format!(
-            "plaintext bridge: {}",
+            "MITM proxy event feed: {}",
             mitm_plaintext_bridge_name(&self.plaintext_bridge)
         );
         if let Some(path) = mitm_plaintext_bridge_path(&self.plaintext_bridge) {
@@ -240,13 +240,13 @@ impl MitmDiagnostics {
         match self.plaintext_bridge {
             TransparentInterceptionMitmPlaintextBridgePlan::Disabled => {
                 MitmDataPathDiagnosis::disabled(
-                    "path labels: disabled until MITM plaintext bridge feeds traffic events",
-                    "plain HTTP: unavailable until MITM plaintext bridge is enabled",
-                    "TLS-decrypted HTTP: unavailable until MITM plaintext bridge is enabled",
+                    "path labels: disabled until the MITM proxy event feed is enabled",
+                    "plain HTTP: unavailable until the MITM proxy event feed is enabled",
+                    "TLS-decrypted HTTP: unavailable until the MITM proxy event feed is enabled",
                     MitmPathStatus::Unavailable,
                     MitmPathStatus::Unavailable,
                     format!(
-                        "MITM path needs a plaintext bridge to feed captured {MITM_PLAINTEXT_COVERAGE} into traffic events"
+                        "MITM path needs an event feed to publish captured {MITM_PLAINTEXT_COVERAGE} into traffic events"
                     ),
                 )
             }
@@ -254,10 +254,10 @@ impl MitmDiagnostics {
                 if let Some(reason) = self.runtime_plaintext_bridge_disabled_reason() {
                     return MitmDataPathDiagnosis::labeled(
                         format!(
-                            "plain HTTP: blocked because MITM plaintext bridge runtime is disabled: {reason}"
+                            "plain HTTP: blocked because MITM proxy event feed runtime is disabled: {reason}"
                         ),
                         format!(
-                            "TLS-decrypted HTTP: blocked because MITM plaintext bridge runtime is disabled: {reason}"
+                            "TLS-decrypted HTTP: blocked because MITM proxy event feed runtime is disabled: {reason}"
                         ),
                         MitmPathStatus::Blocked,
                         MitmPathStatus::Blocked,
@@ -715,7 +715,7 @@ fn l7_mitm_runtime_detail_lines(runtime: &L7MitmRuntimeSnapshot) -> Vec<String> 
             runtime.client_trust.material.wire_name()
         ),
         format!(
-            "l7 mitm plaintext bridge runtime: {}",
+            "l7 mitm proxy event feed runtime: {}",
             runtime.plaintext_bridge.mode.wire_name()
         ),
     ];
@@ -723,7 +723,7 @@ fn l7_mitm_runtime_detail_lines(runtime: &L7MitmRuntimeSnapshot) -> Vec<String> 
         lines.push(format!("l7 mitm backend failure: {reason}"));
     }
     if let Some(reason) = &runtime.plaintext_bridge.disable_reason {
-        lines.push(format!("l7 mitm bridge disabled: {reason}"));
+        lines.push(format!("l7 mitm proxy event feed disabled: {reason}"));
     }
     lines
 }
@@ -847,16 +847,16 @@ fn mitm_client_trust_action(
 fn bridge_activation_action(mode: L7MitmPlaintextBridgeMode) -> &'static str {
     match mode {
         L7MitmPlaintextBridgeMode::Configured => {
-            "waiting for MITM backend readiness and capture provider preflight to open the plaintext bridge"
+            "waiting for MITM backend readiness and capture provider preflight to open the proxy event feed"
         }
         L7MitmPlaintextBridgeMode::Ready => {
-            "waiting for capture provider activation to read the MITM plaintext bridge"
+            "waiting for capture provider activation to read the MITM proxy event feed"
         }
-        L7MitmPlaintextBridgeMode::Active => "MITM plaintext bridge is active",
+        L7MitmPlaintextBridgeMode::Active => "MITM proxy event feed is active",
         L7MitmPlaintextBridgeMode::DisabledAfterError => {
-            "fix the MITM plaintext bridge runtime error"
+            "fix the MITM proxy event feed runtime error"
         }
-        L7MitmPlaintextBridgeMode::NotConfigured => "configure the MITM plaintext bridge",
+        L7MitmPlaintextBridgeMode::NotConfigured => "configure the MITM proxy event feed",
     }
 }
 

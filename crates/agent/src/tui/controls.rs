@@ -2,7 +2,11 @@ use probe_config::AgentConfig;
 
 use super::{
     app::TuiTab,
-    copy::MITM_PLAINTEXT_COVERAGE,
+    copy::{
+        INBOUND_MITM_PROXY_FALLBACK_SETUP_LABEL, MITM_IN_ACTION_LABEL, MITM_OUT_ACTION_LABEL,
+        MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL,
+        OUTBOUND_MITM_PROXY_FALLBACK_SETUP_LABEL,
+    },
     fields::{FieldId, field_value, fields_for_tab},
 };
 
@@ -21,8 +25,8 @@ impl ControlId {
         match self {
             Self::ReloadRuntimeActions => "Reload runtime actions",
             Self::OpenTrafficDiagnostics => "Show data path",
-            Self::ConfigureOutboundMitm => "Setup outbound MITM",
-            Self::ConfigureInboundMitm => "Setup inbound MITM",
+            Self::ConfigureOutboundMitm => OUTBOUND_MITM_PROXY_FALLBACK_SETUP_LABEL,
+            Self::ConfigureInboundMitm => INBOUND_MITM_PROXY_FALLBACK_SETUP_LABEL,
             Self::SearchProcesses => "Search",
             Self::ClearProcessSearch => "Clear",
         }
@@ -41,8 +45,8 @@ impl ControlId {
     pub(crate) fn traffic_action_label(self) -> &'static str {
         match self {
             Self::OpenTrafficDiagnostics => "Data Path",
-            Self::ConfigureOutboundMitm => "Out MITM",
-            Self::ConfigureInboundMitm => "In MITM",
+            Self::ConfigureOutboundMitm => MITM_OUT_ACTION_LABEL,
+            Self::ConfigureInboundMitm => MITM_IN_ACTION_LABEL,
             _ => self.label(),
         }
     }
@@ -52,10 +56,12 @@ impl ControlId {
             Self::ReloadRuntimeActions => "uses active TUI runtime".to_string(),
             Self::OpenTrafficDiagnostics => "capture and MITM runtime diagnostics".to_string(),
             Self::ConfigureOutboundMitm => {
-                format!("process-scoped {MITM_PLAINTEXT_COVERAGE} via product proxy")
+                format!("process-scoped {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}")
             }
             Self::ConfigureInboundMitm => {
-                format!("process-scoped server {MITM_PLAINTEXT_COVERAGE} via product proxy")
+                format!(
+                    "process-scoped server {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
+                )
             }
             Self::SearchProcesses | Self::ClearProcessSearch => String::new(),
         }

@@ -20,7 +20,12 @@ use probe_config::{
 };
 use probe_core::{Direction, EnforcementMode, ProcessSelector, Selector, TrafficSelector};
 
-use super::local_profile::LocalMitmProfile;
+use super::{
+    copy::{
+        INBOUND_MITM_PROXY_FALLBACK_CONFIGURED_LABEL, OUTBOUND_MITM_PROXY_FALLBACK_CONFIGURED_LABEL,
+    },
+    local_profile::LocalMitmProfile,
+};
 
 pub(super) const MITM_CA_CERTIFICATE_ID: &str = "mitm-ca";
 pub(super) const MITM_CA_PRIVATE_KEY_ID: &str = "mitm-ca-key";
@@ -155,8 +160,8 @@ impl MitmQuickSetupDirection {
 
     pub(crate) fn status_message(self) -> &'static str {
         match self {
-            Self::Outbound => "Outbound MITM capture configured for selected process",
-            Self::Inbound => "Inbound MITM capture configured for selected process",
+            Self::Outbound => OUTBOUND_MITM_PROXY_FALLBACK_CONFIGURED_LABEL,
+            Self::Inbound => INBOUND_MITM_PROXY_FALLBACK_CONFIGURED_LABEL,
         }
     }
 }

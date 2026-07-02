@@ -193,9 +193,9 @@ fn capture_path_detail_label(origin: CaptureOrigin) -> &'static str {
 
 fn mitm_capture_path_detail_label(traffic_security: CaptureTrafficSecurity) -> &'static str {
     match traffic_security {
-        CaptureTrafficSecurity::Unknown => "MITM plaintext bridge",
-        CaptureTrafficSecurity::Cleartext => "MITM plaintext bridge (plain HTTP)",
-        CaptureTrafficSecurity::TlsDecrypted => "MITM plaintext bridge (TLS-decrypted HTTP)",
+        CaptureTrafficSecurity::Unknown => "MITM proxy path",
+        CaptureTrafficSecurity::Cleartext => "MITM proxy path (plain HTTP)",
+        CaptureTrafficSecurity::TlsDecrypted => "MITM proxy path (TLS-decrypted HTTP)",
     }
 }
 
@@ -206,7 +206,7 @@ fn capture_source_detail_label(source: CaptureSource) -> &'static str {
         CaptureSource::LibsslUprobe => "TLS plaintext uprobe",
         CaptureSource::TlsSessionSecret => "TLS session secret decryption",
         CaptureSource::ExternalPlaintextFeed => "external plaintext feed",
-        CaptureSource::L7MitmPlaintext => "MITM plaintext bridge",
+        CaptureSource::L7MitmPlaintext => "MITM proxy path",
         CaptureSource::L7MitmControlPlane => "MITM control plane",
         CaptureSource::Replay => "replay",
         CaptureSource::Mock => "mock",
@@ -655,7 +655,7 @@ mod tests {
         assert!(
             row.detail_lines()
                 .iter()
-                .any(|line| line == "Capture path: MITM plaintext bridge (TLS-decrypted HTTP)")
+                .any(|line| line == "Capture path: MITM proxy path (TLS-decrypted HTTP)")
         );
         let expected_origin =
             "Origin: source=l7_mitm_plaintext provider=interception traffic_security=tls_decrypted";
@@ -675,7 +675,7 @@ mod tests {
         assert!(
             row.detail_lines()
                 .iter()
-                .any(|line| line == "Capture path: MITM plaintext bridge (plain HTTP)")
+                .any(|line| line == "Capture path: MITM proxy path (plain HTTP)")
         );
     }
 

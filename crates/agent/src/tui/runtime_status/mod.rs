@@ -12,7 +12,7 @@ use crate::{
     status::{CaptureStatusSnapshot, EnforcementStatusSnapshot},
     tui::{
         controls::ControlId,
-        copy::{MITM_PLAINTEXT_COVERAGE, MITM_QUICK_SETUP_APPLY},
+        copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL, MITM_QUICK_SETUP_APPLY},
     },
 };
 
@@ -125,7 +125,7 @@ fn combine_diagnostic_messages(
 
 fn missing_mitm_next_step() -> String {
     format!(
-        "configure MITM fallback for {MITM_PLAINTEXT_COVERAGE}: {}",
+        "configure {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}: {}",
         missing_mitm_quick_setup_action()
     )
 }
@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(true),
             Some(CaptureDiagnosticMessage::Error(format!(
-                "Capture unavailable: ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available; configure MITM fallback for {MITM_PLAINTEXT_COVERAGE}: {}",
+                "Capture unavailable: ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available; configure reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}: {}",
                 missing_mitm_quick_setup_action()
             )))
         );
@@ -397,7 +397,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("plaintext bridge: capture_event_feed"))
+                .any(|line| line.contains("MITM proxy event feed: capture_event_feed"))
         );
         assert!(lines.iter().any(|line| {
             line == &format!(
@@ -476,7 +476,7 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(true),
             Some(CaptureDiagnosticMessage::Info(
-                "Capture ebpf active; MITM bridge ready for plain HTTP and TLS-decrypted HTTP after client trust; no matching events yet"
+                "Capture ebpf active; MITM proxy path ready for plain HTTP and TLS-decrypted HTTP after client trust; no matching events yet"
                     .to_string()
             ))
         );
@@ -514,13 +514,13 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(false),
             Some(CaptureDiagnosticMessage::Warning(
-                "MITM bridge data path is blocked".to_string()
+                "MITM proxy data path is blocked".to_string()
             ))
         );
         assert_eq!(
             diagnostics.status_message(true),
             Some(CaptureDiagnosticMessage::Warning(
-                "Capture ebpf active; MITM bridge data path is blocked".to_string()
+                "Capture ebpf active; MITM proxy data path is blocked".to_string()
             ))
         );
         Ok(())
@@ -553,7 +553,7 @@ mod tests {
         assert_eq!(
             message,
             Some(CaptureDiagnosticMessage::Warning(
-                "MITM bridge is not active yet: waiting for capture provider activation to read the MITM plaintext bridge"
+                "MITM proxy path is not active yet: waiting for capture provider activation to read the MITM proxy event feed"
                     .to_string()
             ))
         );
@@ -823,15 +823,15 @@ mod tests {
             )
         }));
         assert!(lines.iter().any(|line| {
-            line == "plain HTTP: blocked because MITM plaintext bridge runtime is disabled: feed writer closed"
+            line == "plain HTTP: blocked because MITM proxy event feed runtime is disabled: feed writer closed"
         }));
         assert!(lines.iter().any(|line| {
-            line == "TLS-decrypted HTTP: blocked because MITM plaintext bridge runtime is disabled: feed writer closed"
+            line == "TLS-decrypted HTTP: blocked because MITM proxy event feed runtime is disabled: feed writer closed"
         }));
         assert!(
             lines
                 .iter()
-                .any(|line| line == "l7 mitm plaintext bridge runtime: disabled_after_error")
+                .any(|line| line == "l7 mitm proxy event feed runtime: disabled_after_error")
         );
         assert!(
             lines.iter().any(|line| {
@@ -875,7 +875,7 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(false),
             Some(CaptureDiagnosticMessage::Warning(
-                "Capture using libpcap; passive fallback occurred (ebpf: permission denied); MITM bridge disabled: feed writer closed"
+                "Capture using libpcap; passive fallback occurred (ebpf: permission denied); MITM proxy event feed disabled: feed writer closed"
                     .to_string()
             ))
         );
@@ -956,14 +956,20 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(false),
             Some(CaptureDiagnosticMessage::Warning(format!(
-                "Passive capture failed (ebpf: object path is not configured; libpcap: libpcap is not installed); using MITM plaintext bridge for {MITM_PLAINTEXT_COVERAGE}"
+                "Passive capture failed (ebpf: object path is not configured; libpcap: libpcap is not installed); using reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}"
             )))
         );
         assert!(
             diagnostics
                 .detail_lines()
                 .iter()
-                .any(|line| line == "selected: MITM plaintext bridge")
+                .any(|line| line == "selected: reliable MITM proxy fallback")
+        );
+        assert!(
+            diagnostics
+                .detail_lines()
+                .iter()
+                .any(|line| line == "provider backend: capture_event_feed")
         );
         assert!(
             diagnostics
@@ -972,7 +978,7 @@ mod tests {
                 .any(|line| line == &format!("coverage: {MITM_PLAINTEXT_COVERAGE}"))
         );
         assert!(diagnostics.detail_lines().iter().any(|line| {
-            line == "auto MITM plaintext bridge fallback: capture_event_feed: runtime=available, capability=available, evidence=nominal"
+            line == "auto reliable MITM proxy fallback candidate: capture_event_feed: runtime=available, capability=available, evidence=nominal"
         }));
         Ok(())
     }
@@ -1032,7 +1038,7 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(true),
             Some(CaptureDiagnosticMessage::Warning(format!(
-                "Passive capture unavailable (ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available); using MITM plaintext bridge for {MITM_PLAINTEXT_COVERAGE}"
+                "Passive capture unavailable (ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available); using reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}"
             )))
         );
         Ok(())

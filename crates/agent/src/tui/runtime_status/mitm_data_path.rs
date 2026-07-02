@@ -55,24 +55,24 @@ impl MitmDataPathDiagnosis {
     pub(super) fn status_summary(&self) -> &'static str {
         match (self.plain_http_status, self.tls_http_status) {
             (MitmPathStatus::Ready, MitmPathStatus::Ready) => {
-                "MITM bridge ready for plain HTTP and TLS-decrypted HTTP after client trust"
+                "MITM proxy path ready for plain HTTP and TLS-decrypted HTTP after client trust"
             }
             (MitmPathStatus::Ready, MitmPathStatus::Blocked) => {
-                "MITM bridge ready for plain HTTP; TLS-decrypted HTTP is blocked"
+                "MITM proxy path ready for plain HTTP; TLS-decrypted HTTP is blocked"
             }
             (MitmPathStatus::Ready, MitmPathStatus::Unknown) => {
-                "MITM bridge ready for plain HTTP; TLS-decrypted HTTP status is unknown"
+                "MITM proxy path ready for plain HTTP; TLS-decrypted HTTP status is unknown"
             }
             (MitmPathStatus::Ready, MitmPathStatus::Unavailable) => {
-                "MITM bridge ready for plain HTTP; TLS-decrypted HTTP is unavailable"
+                "MITM proxy path ready for plain HTTP; TLS-decrypted HTTP is unavailable"
             }
             (MitmPathStatus::Blocked, _) | (_, MitmPathStatus::Blocked) => {
-                "MITM bridge data path is blocked"
+                "MITM proxy data path is blocked"
             }
             (MitmPathStatus::Unknown, _) | (_, MitmPathStatus::Unknown) => {
-                "MITM bridge data path status is unknown"
+                "MITM proxy data path status is unknown"
             }
-            (MitmPathStatus::Unavailable, _) => "MITM bridge data path is unavailable",
+            (MitmPathStatus::Unavailable, _) => "MITM proxy data path is unavailable",
         }
     }
 

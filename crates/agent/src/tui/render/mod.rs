@@ -852,8 +852,8 @@ mod tests {
         let output = terminal.backend().to_string();
         assert!(output.contains("[Data Path]"));
         assert!(output.contains("[Watch]"));
-        assert!(output.contains("[Out MITM]"));
-        assert!(output.contains("[In MITM]"));
+        assert!(output.contains("[MITM Out]"));
+        assert!(output.contains("[MITM In]"));
         assert!(scroll_target_exists(
             &hit_map,
             Some(ScrollTarget::TrafficProcessList),
@@ -911,7 +911,7 @@ mod tests {
         let output = terminal.backend().to_string();
         assert!(output.contains("Data Path Diagnostics"));
         assert!(output.contains("Capture diagnostics will appear here after the first refresh"));
-        assert!(output.contains("MITM fallback can capture"));
+        assert!(output.contains("reliable MITM proxy fallback can capture"));
         assert!(hit_exists(
             &hit_map,
             Some(HitTarget::TrafficPopupClose),

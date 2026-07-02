@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use probe_config::AgentConfig;
 
 use super::controls::{ControlId, FocusTarget, focus_targets_for_tab};
-use super::copy::{MITM_PLAINTEXT_COVERAGE, MITM_TLS_TRUST_ACTION};
+use super::copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL, MITM_TLS_TRUST_ACTION};
 use super::fields::{
     FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
 };
@@ -917,7 +917,7 @@ impl TuiApp {
             && let Some(scope) = process.outbound_interception_scope_label()
         {
             return format!(
-                "Outbound MITM configured for {scope} on remote ports {}",
+                "Outbound {MITM_PROXY_FALLBACK_LABEL} configured for {scope} on remote ports {}",
                 default_outbound_mitm_remote_ports_label()
             );
         }
@@ -1265,9 +1265,9 @@ mod tests {
             probe_config::TransparentInterceptionStrategyConfig::InboundTproxyMitm
         );
         assert!(
-            app.status()
-                .text
-                .starts_with("Inbound MITM capture configured for selected process")
+            app.status().text.starts_with(
+                "Inbound reliable MITM proxy fallback configured for selected process"
+            )
         );
     }
 

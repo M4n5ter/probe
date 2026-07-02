@@ -5,7 +5,10 @@ use crate::{
     status::{
         CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
     },
-    tui::{copy::MITM_PLAINTEXT_COVERAGE, wire::capture_selection_name},
+    tui::{
+        copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL},
+        wire::capture_selection_name,
+    },
 };
 
 use super::CaptureDiagnosticMessage;
@@ -28,18 +31,18 @@ impl CaptureDiagnostics {
         if self.using_mitm_plaintext_bridge() {
             if let Some(summary) = self.open_failure_summary() {
                 return Some(CaptureDiagnosticMessage::Warning(format!(
-                    "Passive capture failed ({summary}); using MITM plaintext bridge for {MITM_PLAINTEXT_COVERAGE}"
+                    "Passive capture failed ({summary}); using {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
                 )));
             }
             if let Some(summary) = self.passive_unavailable_summary() {
                 return Some(CaptureDiagnosticMessage::Warning(format!(
-                    "Passive capture unavailable ({summary}); using MITM plaintext bridge for {MITM_PLAINTEXT_COVERAGE}"
+                    "Passive capture unavailable ({summary}); using {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
                 )));
             }
             return traffic_empty.then(|| {
                 CaptureDiagnosticMessage::Info(
                     format!(
-                        "MITM plaintext bridge active for {MITM_PLAINTEXT_COVERAGE}; no matching events yet"
+                        "{MITM_PROXY_FALLBACK_LABEL} active for {MITM_PLAINTEXT_COVERAGE}; no matching events yet"
                     ),
                 )
             });
@@ -76,6 +79,12 @@ impl CaptureDiagnostics {
             format!("mode: {}", capture_plan_mode_name(self.snapshot.mode)),
         ];
         if self.using_mitm_plaintext_bridge() {
+            if let Some(backend) = self.snapshot.selected_backend {
+                lines.push(format!(
+                    "provider backend: {}",
+                    capture_backend_name(backend)
+                ));
+            }
             lines.push(format!("coverage: {MITM_PLAINTEXT_COVERAGE}"));
         }
         if let Some(reason) = &self.snapshot.reason {
@@ -93,7 +102,7 @@ impl CaptureDiagnostics {
         }
         if let Some(candidate) = &self.snapshot.auto_mitm_plaintext_bridge_candidate {
             lines.push(format!(
-                "auto MITM plaintext bridge fallback: {}: {}",
+                "auto {MITM_PROXY_FALLBACK_LABEL} candidate: {}: {}",
                 capture_backend_name(candidate.backend),
                 capture_candidate_details(candidate).join(", ")
             ));
@@ -127,7 +136,7 @@ impl CaptureDiagnostics {
 
     fn selected_backend_label(&self) -> &'static str {
         if self.using_mitm_plaintext_bridge() {
-            return "MITM plaintext bridge";
+            return MITM_PROXY_FALLBACK_LABEL;
         }
         self.snapshot
             .selected_backend
