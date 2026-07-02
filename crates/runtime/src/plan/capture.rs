@@ -1,4 +1,7 @@
-use probe_config::{AgentConfig, CaptureBackend, CaptureSelection, LiveCaptureBackend};
+use probe_config::{
+    AgentConfig, CaptureBackend, CaptureSelection, LiveCaptureBackend,
+    TransparentInterceptionMitmPlaintextBridgeIntent,
+};
 use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
 use serde::{Deserialize, Serialize};
 
@@ -9,17 +12,20 @@ pub struct CapturePlan {
     pub selection: CaptureSelection,
     pub fallback_backends: Vec<LiveCaptureBackend>,
     pub selected_backend: Option<CaptureBackend>,
+    pub selected_input_source: Option<CaptureInputSource>,
     pub selected_provider: Option<CaptureProviderDescriptor>,
     pub selected_provider_runtime_mode: Option<RuntimeMode>,
     pub selected_evidence_mode: Option<CaptureEvidenceMode>,
     pub evidence_reason: Option<String>,
     pub mode: CapturePlanMode,
     pub candidates: Vec<CaptureProviderDescriptor>,
+    pub auto_mitm_plaintext_bridge_candidate: Option<CaptureProviderDescriptor>,
     pub reason: Option<String>,
 }
 
 impl CapturePlan {
     pub(super) fn resolve(config: &AgentConfig, registry: &ProviderRegistry) -> Self {
+        let mitm_plaintext_bridge_configured = mitm_capture_event_feed_is_configured(config);
         let candidates = capture_candidates(config)
             .into_iter()
             .map(|backend| registry.capture_provider(backend))
@@ -30,17 +36,38 @@ impl CapturePlan {
             .find(|candidate| candidate.openable())
             .cloned();
         let selected_backend = selected_provider.as_ref().map(|provider| provider.backend);
+        let selected_input_source = selected_provider.as_ref().map(|provider| {
+            capture_input_source(
+                config.capture.selection,
+                provider.backend,
+                mitm_plaintext_bridge_configured,
+            )
+        });
         let mode = selected_provider
             .as_ref()
             .map_or(CapturePlanMode::Unavailable, |provider| {
                 provider.plan_mode()
             });
         let reason = capture_plan_reason(config.capture.selection, selected_backend);
+        let auto_mitm_plaintext_bridge_candidate = (config.capture.selection
+            == CaptureSelection::Auto
+            && mitm_plaintext_bridge_configured)
+            .then(|| {
+                candidates
+                    .iter()
+                    .find(|candidate| {
+                        candidate.backend == CaptureBackend::CaptureEventFeed
+                            && candidate.openable()
+                    })
+                    .cloned()
+            })
+            .flatten();
 
         Self {
             selection: config.capture.selection,
             fallback_backends: config.capture.fallback_backends.clone(),
             selected_backend,
+            selected_input_source,
             selected_provider_runtime_mode: selected_provider
                 .as_ref()
                 .map(|provider| provider.runtime_mode),
@@ -53,6 +80,7 @@ impl CapturePlan {
             selected_provider,
             mode,
             candidates,
+            auto_mitm_plaintext_bridge_candidate,
             reason,
         }
     }
@@ -73,6 +101,20 @@ impl CapturePlan {
             | CaptureSelection::Replay => Vec::new(),
         }
     }
+
+    pub fn auto_mitm_plaintext_bridge_open_candidate(&self) -> Option<CaptureProviderDescriptor> {
+        self.auto_mitm_plaintext_bridge_candidate.clone()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureInputSource {
+    LiveHost,
+    PlaintextFeed,
+    ConfiguredCaptureEventFeed,
+    MitmPlaintextBridge,
+    Replay,
 }
 
 fn capture_plan_reason(
@@ -266,7 +308,42 @@ impl CaptureProviderBuilder {
 }
 
 fn capture_candidates(config: &AgentConfig) -> Vec<CaptureBackend> {
-    config.capture.candidate_backends()
+    let mut candidates = config.capture.candidate_backends();
+    if config.capture.selection == CaptureSelection::Auto
+        && mitm_capture_event_feed_is_configured(config)
+        && !candidates.contains(&CaptureBackend::CaptureEventFeed)
+    {
+        candidates.push(CaptureBackend::CaptureEventFeed);
+    }
+    candidates
+}
+
+fn mitm_capture_event_feed_is_configured(config: &AgentConfig) -> bool {
+    matches!(
+        config
+            .enforcement
+            .interception
+            .mitm_plaintext_bridge_intent(),
+        Ok(TransparentInterceptionMitmPlaintextBridgeIntent::CaptureEventFeed { .. })
+    )
+}
+
+fn capture_input_source(
+    selection: CaptureSelection,
+    backend: CaptureBackend,
+    mitm_plaintext_bridge_configured: bool,
+) -> CaptureInputSource {
+    match backend {
+        CaptureBackend::Ebpf | CaptureBackend::Libpcap => CaptureInputSource::LiveHost,
+        CaptureBackend::PlaintextFeed => CaptureInputSource::PlaintextFeed,
+        CaptureBackend::CaptureEventFeed
+            if selection == CaptureSelection::Auto && mitm_plaintext_bridge_configured =>
+        {
+            CaptureInputSource::MitmPlaintextBridge
+        }
+        CaptureBackend::CaptureEventFeed => CaptureInputSource::ConfiguredCaptureEventFeed,
+        CaptureBackend::Replay => CaptureInputSource::Replay,
+    }
 }
 
 fn capture_backend_capability(backend: CaptureBackend) -> CapabilityKind {
@@ -290,7 +367,11 @@ fn capture_backend_plan_mode(backend: CaptureBackend) -> CapturePlanMode {
 
 #[cfg(test)]
 mod tests {
-    use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
+    use probe_config::{
+        AgentConfig, CaptureBackend, CaptureSelection,
+        TransparentInterceptionMitmPlaintextBridgeModeConfig,
+        TransparentInterceptionStrategyConfig,
+    };
     use probe_core::{CapabilityKind, CapabilityState, RuntimeMode};
 
     use crate::plan::registry::ProviderRegistry;
@@ -363,6 +444,68 @@ mod tests {
                 .as_ref()
                 .map(|provider| provider.builder),
             Some(CaptureProviderBuilder::Libpcap)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auto_selection_uses_mitm_capture_event_feed_after_passive_capture_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![
+                CaptureProviderDescriptor::unavailable(
+                    CaptureBackend::Ebpf,
+                    CaptureProviderBuilder::Unimplemented,
+                    "eBPF is unavailable",
+                ),
+                CaptureProviderDescriptor::unavailable(
+                    CaptureBackend::Libpcap,
+                    CaptureProviderBuilder::Unimplemented,
+                    "libpcap is unavailable",
+                ),
+                capture_provider(
+                    CaptureBackend::CaptureEventFeed,
+                    CaptureProviderBuilder::CaptureEventFeed,
+                    RuntimeMode::Available,
+                ),
+            ],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path =
+            Some("/tmp/mitm-capture-events.jsonl".into());
+
+        let plan = CapturePlan::resolve(&config, &registry);
+
+        assert_eq!(plan.mode, CapturePlanMode::CaptureEventFeed);
+        assert_eq!(
+            plan.selected_input_source,
+            Some(CaptureInputSource::MitmPlaintextBridge)
+        );
+        assert_eq!(
+            plan.selected_backend,
+            Some(CaptureBackend::CaptureEventFeed)
+        );
+        assert_eq!(
+            plan.auto_mitm_plaintext_bridge_open_candidate()
+                .as_ref()
+                .map(|candidate| candidate.backend),
+            Some(CaptureBackend::CaptureEventFeed)
+        );
+        assert_eq!(
+            plan.candidates
+                .iter()
+                .map(|candidate| candidate.backend)
+                .collect::<Vec<_>>(),
+            vec![
+                CaptureBackend::Ebpf,
+                CaptureBackend::Libpcap,
+                CaptureBackend::CaptureEventFeed,
+            ]
         );
         Ok(())
     }
@@ -508,6 +651,10 @@ mod tests {
         let plan = CapturePlan::resolve(&config, &registry);
 
         assert_eq!(plan.mode, CapturePlanMode::CaptureEventFeed);
+        assert_eq!(
+            plan.selected_input_source,
+            Some(CaptureInputSource::ConfiguredCaptureEventFeed)
+        );
         assert_eq!(
             plan.selected_backend,
             Some(CaptureBackend::CaptureEventFeed)

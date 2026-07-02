@@ -1,22 +1,20 @@
-use std::{fs::File, io::BufReader};
-
 use capture::{CaptureMultiplexer, CaptureProvider, LibpcapProvider, MultiplexedProvider};
 use probe_config::{CaptureBackend, CaptureSelection};
 use probe_core::RuntimeMode;
-use runtime::{
-    CaptureProviderDescriptor, RuntimeError, RuntimePlan, TransparentInterceptionMitmBackendPlan,
-    TransparentInterceptionMitmPlaintextBridgePlan,
-};
+use runtime::{CaptureInputSource, CaptureProviderDescriptor, RuntimeError, RuntimePlan};
 
 use super::{
-    OpenedLiveCaptureBackend, ebpf::build_ebpf_capture_provider,
+    OpenedLiveCaptureBackend,
+    ebpf::build_ebpf_capture_provider,
+    mitm_plaintext_bridge::{
+        MitmPlaintextBridgePreflight, build_mitm_capture_event_feed_provider,
+        build_mitm_capture_event_feed_provider_after_live_failures as build_mitm_capture_event_feed_provider_with_failures,
+        preflight_mitm_plaintext_bridge_provider, with_mitm_plaintext_bridge_provider,
+    },
     procfs_resolver::procfs_tcp_process_resolver_for_plan,
 };
 use crate::{
-    capture_event_feed::{
-        JsonLinesCaptureEventFeedProvider, load_capture_event_feed_provider,
-        load_l7_mitm_capture_event_feed_provider,
-    },
+    capture_event_feed::load_capture_event_feed_provider,
     capture_provider::{CaptureProviderOpenFailureSnapshot, CaptureProviderRuntimeSnapshot},
     capture_registry::libpcap_config_from_agent,
     error::AgentError,
@@ -29,17 +27,9 @@ use crate::{
     },
 };
 
-type CaptureEventFeedProvider = JsonLinesCaptureEventFeedProvider<BufReader<File>>;
-
 pub(crate) struct CaptureProviderPreflight {
     session_secret_auto_binding: TlsSessionSecretAutoBindingBuild,
     mitm_plaintext_bridge: MitmPlaintextBridgePreflight,
-}
-
-enum MitmPlaintextBridgePreflight {
-    NotConfigured,
-    Open(CaptureEventFeedProvider),
-    DeferredUntilBackendReady,
 }
 
 pub(crate) struct BuiltCaptureProvider {
@@ -87,22 +77,35 @@ pub(crate) fn build_capture_provider(
                 provider: None,
             },
         }),
-        Some(CaptureBackend::CaptureEventFeed) => Ok(BuiltCaptureProvider {
-            provider: build_capture_event_feed_provider(plan)?,
-            runtime: CaptureProviderRuntimeSnapshot {
-                selected_backend: CaptureBackend::CaptureEventFeed,
-                plan_mode: plan.capture.mode,
-                provider_runtime_mode: RuntimeMode::Available,
-                evidence_mode: plan
-                    .capture
-                    .selected_evidence_mode
-                    .unwrap_or(runtime::CaptureEvidenceMode::Nominal),
-                evidence_reason: plan.capture.evidence_reason.clone(),
-                reason: None,
-                open_failures: Vec::new(),
-                provider: None,
-            },
-        }),
+        Some(CaptureBackend::CaptureEventFeed) => {
+            let provider = if plan.capture.selected_input_source
+                == Some(CaptureInputSource::MitmPlaintextBridge)
+            {
+                build_mitm_capture_event_feed_provider(
+                    plan,
+                    l7_mitm_runtime,
+                    preflight.mitm_plaintext_bridge,
+                )?
+            } else {
+                build_capture_event_feed_provider(plan)?
+            };
+            Ok(BuiltCaptureProvider {
+                provider,
+                runtime: CaptureProviderRuntimeSnapshot {
+                    selected_backend: CaptureBackend::CaptureEventFeed,
+                    plan_mode: plan.capture.mode,
+                    provider_runtime_mode: RuntimeMode::Available,
+                    evidence_mode: plan
+                        .capture
+                        .selected_evidence_mode
+                        .unwrap_or(runtime::CaptureEvidenceMode::Nominal),
+                    evidence_reason: plan.capture.evidence_reason.clone(),
+                    reason: None,
+                    open_failures: Vec::new(),
+                    provider: None,
+                },
+            })
+        }
         _ => build_live_capture_provider(
             plan,
             tls_plaintext_runtime,
@@ -121,7 +124,17 @@ fn build_live_capture_provider(
     mitm_plaintext_bridge: MitmPlaintextBridgePreflight,
 ) -> Result<BuiltCaptureProvider, AgentError> {
     plan.require_live_capture()?;
-    let outcome = build_live_primary_with_fallback(plan)?;
+    let outcome = match try_build_live_primary_with_fallback(plan)? {
+        LiveCaptureOpenAttempt::Open(outcome) => outcome,
+        LiveCaptureOpenAttempt::Failed(open_failures) => {
+            return build_mitm_capture_event_feed_provider_after_live_failures(
+                plan,
+                l7_mitm_runtime,
+                mitm_plaintext_bridge,
+                open_failures,
+            );
+        }
+    };
     let descriptor = outcome.descriptor;
     let OpenedLiveCaptureBackend {
         provider: primary,
@@ -133,7 +146,7 @@ fn build_live_capture_provider(
         plan,
         provider,
         l7_mitm_runtime,
-        mitm_plaintext_bridge.into_provider(plan, l7_mitm_runtime)?,
+        mitm_plaintext_bridge,
     )?;
     Ok(BuiltCaptureProvider {
         provider,
@@ -150,10 +163,10 @@ fn build_live_capture_provider(
     })
 }
 
-fn build_live_primary_with_fallback(
+fn try_build_live_primary_with_fallback(
     plan: &RuntimePlan,
-) -> Result<LiveCaptureOpenOutcome<OpenedLiveCaptureBackend>, AgentError> {
-    open_live_backend_with_fallback(plan, |backend| build_live_capture_backend(plan, backend))
+) -> Result<LiveCaptureOpenAttempt<OpenedLiveCaptureBackend>, AgentError> {
+    try_open_live_backend_with_fallback(plan, |backend| build_live_capture_backend(plan, backend))
 }
 
 #[derive(Debug)]
@@ -163,20 +176,37 @@ struct LiveCaptureOpenOutcome<T> {
     open_failures: Vec<CaptureProviderOpenFailureSnapshot>,
 }
 
+#[derive(Debug)]
+enum LiveCaptureOpenAttempt<T> {
+    Open(LiveCaptureOpenOutcome<T>),
+    Failed(Vec<CaptureProviderOpenFailureSnapshot>),
+}
+
+#[cfg(test)]
 fn open_live_backend_with_fallback<T>(
     plan: &RuntimePlan,
-    mut open_backend: impl FnMut(CaptureBackend) -> Result<T, AgentError>,
+    open_backend: impl FnMut(CaptureBackend) -> Result<T, AgentError>,
 ) -> Result<LiveCaptureOpenOutcome<T>, AgentError> {
+    match try_open_live_backend_with_fallback(plan, open_backend)? {
+        LiveCaptureOpenAttempt::Open(outcome) => Ok(outcome),
+        LiveCaptureOpenAttempt::Failed(failures) => Err(no_live_capture_error(plan, failures)),
+    }
+}
+
+fn try_open_live_backend_with_fallback<T>(
+    plan: &RuntimePlan,
+    mut open_backend: impl FnMut(CaptureBackend) -> Result<T, AgentError>,
+) -> Result<LiveCaptureOpenAttempt<T>, AgentError> {
     let mut failures = Vec::new();
     for descriptor in plan.capture.live_provider_open_candidates() {
         let backend = descriptor.backend;
         match open_backend(backend) {
             Ok(provider) => {
-                return Ok(LiveCaptureOpenOutcome {
+                return Ok(LiveCaptureOpenAttempt::Open(LiveCaptureOpenOutcome {
                     provider,
                     descriptor,
                     open_failures: failures,
-                });
+                }));
             }
             Err(error) if plan.config.capture.selection == CaptureSelection::Auto => {
                 failures.push(CaptureProviderOpenFailureSnapshot {
@@ -187,9 +217,16 @@ fn open_live_backend_with_fallback<T>(
             Err(error) => return Err(error),
         }
     }
-    Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
+    Ok(LiveCaptureOpenAttempt::Failed(failures))
+}
+
+fn no_live_capture_error(
+    plan: &RuntimePlan,
+    failures: Vec<CaptureProviderOpenFailureSnapshot>,
+) -> AgentError {
+    AgentError::Runtime(RuntimeError::NoLiveCapture {
         reason: live_capture_failure_reason(plan, failures),
-    }))
+    })
 }
 
 fn build_live_capture_backend(
@@ -265,86 +302,27 @@ fn with_tls_plaintext_provider(
     }
 }
 
-fn with_mitm_plaintext_bridge_provider(
-    plan: &RuntimePlan,
-    primary: Box<dyn CaptureProvider>,
-    l7_mitm_runtime: &L7MitmRuntimeHandle,
-    mitm_plaintext_bridge: Option<CaptureEventFeedProvider>,
-) -> Result<Box<dyn CaptureProvider>, AgentError> {
-    match &plan.enforcement.interception.mitm.plaintext_bridge {
-        TransparentInterceptionMitmPlaintextBridgePlan::Disabled => Ok(primary),
-        TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed { .. } => {
-            let bridge = mitm_plaintext_bridge.ok_or_else(|| {
-                AgentError::L7MitmRuntime(
-                    "configured MITM plaintext bridge was not opened during capture preflight"
-                        .to_string(),
-                )
-            })?;
-            let runtime = l7_mitm_runtime.clone();
-            let bridge = MultiplexedProvider::best_effort_with_disable_handler(
-                Box::new(bridge),
-                move |reason| runtime.record_plaintext_bridge_disabled(reason),
-            );
-            l7_mitm_runtime.record_plaintext_bridge_active();
-            Ok(Box::new(CaptureMultiplexer::from_providers([
-                MultiplexedProvider::required(primary),
-                bridge,
-            ])))
-        }
-    }
-}
-
-fn preflight_mitm_plaintext_bridge_provider(
+fn build_mitm_capture_event_feed_provider_after_live_failures(
     plan: &RuntimePlan,
     l7_mitm_runtime: &L7MitmRuntimeHandle,
-) -> Result<MitmPlaintextBridgePreflight, AgentError> {
-    match &plan.enforcement.interception.mitm.plaintext_bridge {
-        TransparentInterceptionMitmPlaintextBridgePlan::Disabled => {
-            Ok(MitmPlaintextBridgePreflight::NotConfigured)
-        }
-        TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed { path, follow } => {
-            if matches!(
-                plan.enforcement.interception.mitm.backend,
-                TransparentInterceptionMitmBackendPlan::ManagedProcess { .. }
-                    | TransparentInterceptionMitmBackendPlan::ProductProxy { .. }
-            ) {
-                return Ok(MitmPlaintextBridgePreflight::DeferredUntilBackendReady);
-            }
-            let provider = load_l7_mitm_capture_event_feed_provider(path, *follow)?;
-            l7_mitm_runtime.record_plaintext_bridge_ready();
-            Ok(MitmPlaintextBridgePreflight::Open(provider))
-        }
-    }
-}
-
-impl MitmPlaintextBridgePreflight {
-    fn into_provider(
-        self,
-        plan: &RuntimePlan,
-        l7_mitm_runtime: &L7MitmRuntimeHandle,
-    ) -> Result<Option<CaptureEventFeedProvider>, AgentError> {
-        match self {
-            Self::NotConfigured => Ok(None),
-            Self::Open(provider) => Ok(Some(provider)),
-            Self::DeferredUntilBackendReady => {
-                open_deferred_mitm_plaintext_bridge_provider(plan, l7_mitm_runtime)
-            }
-        }
-    }
-}
-
-fn open_deferred_mitm_plaintext_bridge_provider(
-    plan: &RuntimePlan,
-    l7_mitm_runtime: &L7MitmRuntimeHandle,
-) -> Result<Option<CaptureEventFeedProvider>, AgentError> {
-    let TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed { path, follow } =
-        &plan.enforcement.interception.mitm.plaintext_bridge
-    else {
-        return Ok(None);
-    };
-    let provider = load_l7_mitm_capture_event_feed_provider(path, *follow)?;
-    l7_mitm_runtime.record_plaintext_bridge_ready();
-    Ok(Some(provider))
+    preflight: MitmPlaintextBridgePreflight,
+    open_failures: Vec<CaptureProviderOpenFailureSnapshot>,
+) -> Result<BuiltCaptureProvider, AgentError> {
+    let descriptor = plan
+        .capture
+        .auto_mitm_plaintext_bridge_open_candidate()
+        .ok_or_else(|| no_live_capture_error(plan, open_failures.clone()))?;
+    let built_provider = build_mitm_capture_event_feed_provider_with_failures(
+        plan,
+        l7_mitm_runtime,
+        preflight,
+        descriptor,
+        open_failures,
+    )?;
+    Ok(BuiltCaptureProvider {
+        provider: built_provider.provider,
+        runtime: built_provider.runtime,
+    })
 }
 
 fn build_plaintext_feed_provider(
@@ -381,26 +359,26 @@ fn build_capture_event_feed_provider(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, fs, io::Write, path::PathBuf};
+    use std::{fs, path::PathBuf};
 
-    use capture::{CaptureError, CaptureEvent, CapturePoll, CapturedLoss};
+    use capture::{CaptureEvent, CapturedLoss};
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicySourceConfig,
         TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
-        TransparentInterceptionMitmManagedProcessConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
         CapabilityKind, CapabilityState, CaptureLoss, CaptureOrigin, CaptureSource, Direction,
-        EnforcementEvidence, EnforcementMode, ProcessSelector, RuntimeMode, Selector, Timestamp,
+        EnforcementEvidence, EnforcementMode, ProcessSelector, Selector, Timestamp,
         TrafficSelector,
     };
     use runtime::{
         CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
+        TransparentInterceptionMitmPlaintextBridgePlan,
     };
-    use tempfile::{NamedTempFile, tempdir};
+    use tempfile::NamedTempFile;
 
     use crate::l7_mitm::{
         L7MitmBackendHealthSnapshot, L7MitmPlaintextBridgeMode, L7MitmPlaintextBridgeSnapshot,
@@ -461,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn mitm_plaintext_bridge_fans_capture_event_feed_into_live_provider()
+    fn auto_live_open_failures_fall_back_to_mitm_plaintext_bridge()
     -> Result<(), Box<dyn std::error::Error>> {
         let bridge_file = NamedTempFile::new()?;
         let bridge_path = bridge_file.path().to_path_buf();
@@ -469,209 +447,48 @@ mod tests {
             &bridge_path,
             format!(
                 "{}\n",
-                serde_json::to_string(&mitm_loss_event("mitm bridge"))?
+                serde_json::to_string(&mitm_loss_event("mitm after live failures"))?
             ),
         )?;
-        let mut plan = plan_with_mitm_plaintext_bridge(bridge_path.clone())?;
+        let mut plan = auto_plan_with_live_and_mitm_plaintext_bridge(bridge_path)?;
         set_mitm_plaintext_bridge_follow(&mut plan, false);
-        let primary = Box::new(VecProvider::new([loss_event("primary")]));
+        let attempt = try_open_live_backend_with_fallback(&plan, |backend| {
+            Err::<OpenedLiveCaptureBackend, _>(AgentError::Runtime(RuntimeError::NoLiveCapture {
+                reason: format!("{backend:?} open failed"),
+            }))
+        })?;
+        let LiveCaptureOpenAttempt::Failed(open_failures) = attempt else {
+            panic!("live providers should fail during the test");
+        };
         let l7_mitm_runtime = configured_l7_mitm_runtime();
-        let bridge = opened_mitm_plaintext_bridge(&plan, &l7_mitm_runtime)?;
+        let preflight = CaptureProviderPreflight::build(&plan, None, &l7_mitm_runtime)?;
+
+        let built_provider = build_mitm_capture_event_feed_provider_after_live_failures(
+            &plan,
+            &l7_mitm_runtime,
+            preflight.mitm_plaintext_bridge,
+            open_failures,
+        )?;
+        let mut provider = built_provider.provider;
+
         assert_eq!(
-            l7_mitm_runtime.snapshot().plaintext_bridge.mode,
-            L7MitmPlaintextBridgeMode::Ready
+            built_provider.runtime.selected_backend,
+            CaptureBackend::CaptureEventFeed
         );
-        fs::remove_file(&bridge_path)?;
-
-        let mut provider =
-            with_mitm_plaintext_bridge_provider(&plan, primary, &l7_mitm_runtime, Some(bridge))?;
-
-        assert_loss_reason(provider.next()?, "primary");
-        assert_loss_reason(provider.next()?, "mitm bridge");
+        assert_eq!(built_provider.runtime.open_failures.len(), 2);
+        assert_eq!(
+            built_provider.runtime.open_failures[0].backend,
+            CaptureBackend::Ebpf
+        );
+        assert_eq!(
+            built_provider.runtime.open_failures[1].backend,
+            CaptureBackend::Libpcap
+        );
+        assert_loss_reason(provider.next()?, "mitm after live failures");
         assert_eq!(
             l7_mitm_runtime.snapshot().plaintext_bridge.mode,
             L7MitmPlaintextBridgeMode::Active
         );
-        assert!(provider.next()?.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn mitm_plaintext_bridge_rejects_non_mitm_origin() -> Result<(), Box<dyn std::error::Error>> {
-        let bridge_file = NamedTempFile::new()?;
-        let bridge_path = bridge_file.path().to_path_buf();
-        fs::write(
-            &bridge_path,
-            format!(
-                "{}\n",
-                serde_json::to_string(&loss_event("wrong bridge source"))?
-            ),
-        )?;
-        let mut plan = plan_with_mitm_plaintext_bridge(bridge_path)?;
-        set_mitm_plaintext_bridge_follow(&mut plan, false);
-        let primary = Box::new(VecProvider::new([
-            loss_event("primary before bridge error"),
-            loss_event("primary after bridge error"),
-        ]));
-        let l7_mitm_runtime = configured_l7_mitm_runtime();
-        let bridge = opened_mitm_plaintext_bridge(&plan, &l7_mitm_runtime)?;
-
-        let mut provider =
-            with_mitm_plaintext_bridge_provider(&plan, primary, &l7_mitm_runtime, Some(bridge))?;
-
-        assert_loss_reason(provider.next()?, "primary before bridge error");
-        assert_loss_reason(provider.next()?, "primary after bridge error");
-        let bridge = l7_mitm_runtime.snapshot().plaintext_bridge;
-        assert_eq!(bridge.mode, L7MitmPlaintextBridgeMode::DisabledAfterError);
-        assert!(
-            bridge
-                .disable_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("requires source L7MitmPlaintext")),
-            "{bridge:?}"
-        );
-        assert!(provider.next()?.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn mitm_plaintext_bridge_read_error_does_not_stop_primary_live_provider()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let bridge_file = NamedTempFile::new()?;
-        let bridge_path = bridge_file.path().to_path_buf();
-        fs::write(&bridge_path, "not-json\n")?;
-        let mut plan = plan_with_mitm_plaintext_bridge(bridge_path)?;
-        set_mitm_plaintext_bridge_follow(&mut plan, false);
-        let primary = Box::new(VecProvider::new([
-            loss_event("primary before bridge error"),
-            loss_event("primary after bridge error"),
-        ]));
-        let l7_mitm_runtime = configured_l7_mitm_runtime();
-        let bridge = opened_mitm_plaintext_bridge(&plan, &l7_mitm_runtime)?;
-
-        let mut provider =
-            with_mitm_plaintext_bridge_provider(&plan, primary, &l7_mitm_runtime, Some(bridge))?;
-
-        assert_loss_reason(provider.next()?, "primary before bridge error");
-        assert_loss_reason(provider.next()?, "primary after bridge error");
-        let bridge = l7_mitm_runtime.snapshot().plaintext_bridge;
-        assert_eq!(bridge.mode, L7MitmPlaintextBridgeMode::DisabledAfterError);
-        assert!(
-            bridge
-                .disable_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("best-effort capture provider"))
-        );
-        let bridge_capability = provider_capability(&*provider, CapabilityKind::CaptureEventFeed);
-        assert_eq!(bridge_capability.mode, RuntimeMode::Unavailable);
-        let reason = bridge_capability
-            .reason
-            .as_deref()
-            .expect("disabled bridge should report a reason");
-        assert!(reason.contains("best-effort capture provider capture_event_feed_jsonl disabled"));
-        assert!(reason.contains("capture provider capture_event_feed_jsonl failed"));
-        assert!(provider.next()?.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn mitm_plaintext_bridge_defaults_to_follow_live_feed() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let bridge_file = NamedTempFile::new()?;
-        let bridge_path = bridge_file.path().to_path_buf();
-        let mut plan = plan_with_mitm_plaintext_bridge(bridge_path.clone())?;
-        let TransparentInterceptionMitmPlaintextBridgePlan::CaptureEventFeed { follow, .. } =
-            &mut plan.enforcement.interception.mitm.plaintext_bridge
-        else {
-            panic!("expected capture-event MITM bridge plan");
-        };
-        assert!(*follow);
-        let primary = Box::new(VecProvider::new([]));
-        let l7_mitm_runtime = configured_l7_mitm_runtime();
-        let bridge = opened_mitm_plaintext_bridge(&plan, &l7_mitm_runtime)?;
-
-        let mut provider =
-            with_mitm_plaintext_bridge_provider(&plan, primary, &l7_mitm_runtime, Some(bridge))?;
-
-        assert!(matches!(provider.poll_next()?, CapturePoll::Idle));
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&bridge_path)?
-            .write_all(
-                format!(
-                    "{}\n",
-                    serde_json::to_string(&mitm_loss_event("late mitm"))?
-                )
-                .as_bytes(),
-            )?;
-        assert_loss_reason(provider.next()?, "late mitm");
-        Ok(())
-    }
-
-    #[test]
-    fn mitm_plaintext_bridge_missing_file_fails_during_capture_preflight()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let tempdir = tempdir()?;
-        let bridge_path = tempdir
-            .path()
-            .join("missing-mitm-bridge-capture-events.jsonl");
-        let plan = plan_with_mitm_plaintext_bridge(bridge_path.clone())?;
-
-        let l7_mitm_runtime = configured_l7_mitm_runtime();
-        let error = match CaptureProviderPreflight::build(&plan, None, &l7_mitm_runtime) {
-            Ok(_) => panic!("missing MITM plaintext bridge feed must fail closed"),
-            Err(error) => error,
-        };
-
-        assert!(
-            error
-                .to_string()
-                .contains("failed to open capture event feed")
-        );
-        assert!(
-            error
-                .to_string()
-                .contains(&bridge_path.display().to_string())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn managed_mitm_plaintext_bridge_is_deferred_until_backend_readiness()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let tempdir = tempdir()?;
-        let bridge_path = tempdir
-            .path()
-            .join("managed-mitm-bridge-capture-events.jsonl");
-        let plan = plan_with_managed_mitm_plaintext_bridge(bridge_path.clone())?;
-
-        let l7_mitm_runtime = configured_l7_mitm_runtime();
-        let preflight = preflight_mitm_plaintext_bridge_provider(&plan, &l7_mitm_runtime)?;
-
-        assert!(matches!(
-            preflight,
-            MitmPlaintextBridgePreflight::DeferredUntilBackendReady
-        ));
-        assert_eq!(
-            l7_mitm_runtime.snapshot().plaintext_bridge.mode,
-            L7MitmPlaintextBridgeMode::Configured
-        );
-
-        fs::write(
-            &bridge_path,
-            format!(
-                "{}\n",
-                serde_json::to_string(&mitm_loss_event("managed mitm"))?
-            ),
-        )?;
-        let bridge = preflight
-            .into_provider(&plan, &l7_mitm_runtime)?
-            .expect("managed backend should open bridge after readiness");
-        assert_eq!(
-            l7_mitm_runtime.snapshot().plaintext_bridge.mode,
-            L7MitmPlaintextBridgeMode::Ready
-        );
-        drop(bridge);
         Ok(())
     }
 
@@ -684,23 +501,6 @@ mod tests {
             panic!("expected capture-event MITM bridge plan");
         };
         *planned_follow = follow;
-    }
-
-    fn opened_mitm_plaintext_bridge(
-        plan: &RuntimePlan,
-        l7_mitm_runtime: &L7MitmRuntimeHandle,
-    ) -> Result<CaptureEventFeedProvider, AgentError> {
-        match preflight_mitm_plaintext_bridge_provider(plan, l7_mitm_runtime)? {
-            MitmPlaintextBridgePreflight::Open(provider) => Ok(provider),
-            MitmPlaintextBridgePreflight::NotConfigured => Err(AgentError::UnsupportedRunConfig(
-                "expected configured MITM plaintext bridge".to_string(),
-            )),
-            MitmPlaintextBridgePreflight::DeferredUntilBackendReady => {
-                Err(AgentError::UnsupportedRunConfig(
-                    "expected external MITM plaintext bridge to open during preflight".to_string(),
-                ))
-            }
-        }
     }
 
     fn configured_l7_mitm_runtime() -> L7MitmRuntimeHandle {
@@ -739,11 +539,33 @@ mod tests {
         )
     }
 
-    fn plan_with_mitm_plaintext_bridge(
+    fn auto_plan_with_live_and_mitm_plaintext_bridge(
         bridge_path: PathBuf,
     ) -> Result<RuntimePlan, runtime::RuntimeError> {
+        RuntimePlan::build(
+            external_mitm_plaintext_bridge_config(bridge_path),
+            &ProviderRegistry::new(
+                vec![
+                    CaptureProviderDescriptor::available(
+                        CaptureBackend::Ebpf,
+                        CaptureProviderBuilder::Ebpf,
+                    ),
+                    CaptureProviderDescriptor::available(
+                        CaptureBackend::Libpcap,
+                        CaptureProviderBuilder::Libpcap,
+                    ),
+                    CaptureProviderDescriptor::available(
+                        CaptureBackend::CaptureEventFeed,
+                        CaptureProviderBuilder::CaptureEventFeed,
+                    ),
+                ],
+                mitm_bridge_platform_capabilities(),
+            ),
+        )
+    }
+
+    fn external_mitm_plaintext_bridge_config(bridge_path: PathBuf) -> AgentConfig {
         let mut config = AgentConfig::default();
-        config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
             TransparentInterceptionStrategyConfig::InboundTproxyMitm;
@@ -785,90 +607,7 @@ mod tests {
                 path: "/etc/traffic-probe/mitm-ca.key".into(),
             },
         ];
-        RuntimePlan::build(
-            config,
-            &ProviderRegistry::new(
-                vec![
-                    CaptureProviderDescriptor::available(
-                        CaptureBackend::Libpcap,
-                        CaptureProviderBuilder::Libpcap,
-                    ),
-                    CaptureProviderDescriptor::available(
-                        CaptureBackend::CaptureEventFeed,
-                        CaptureProviderBuilder::CaptureEventFeed,
-                    ),
-                ],
-                mitm_bridge_platform_capabilities(),
-            ),
-        )
-    }
-
-    fn plan_with_managed_mitm_plaintext_bridge(
-        bridge_path: PathBuf,
-    ) -> Result<RuntimePlan, runtime::RuntimeError> {
-        let mut config = AgentConfig::default();
-        config.capture.selection = CaptureSelection::Libpcap;
-        config.enforcement.mode = EnforcementMode::Enforce;
-        config.enforcement.interception.strategy =
-            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
-        config.enforcement.interception.proxy.listen_port = Some(15002);
-        let readiness_probe = TransparentInterceptionMitmBackendReadinessProbeConfig {
-            target: Some("127.0.0.1:15002".to_string()),
-            ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
-        };
-        let process = TransparentInterceptionMitmManagedProcessConfig {
-            program: Some("/bin/true".into()),
-            args: Vec::new(),
-            working_dir: None,
-        };
-        config.enforcement.interception.mitm.backend =
-            TransparentInterceptionMitmBackendConfig::managed_process(readiness_probe, process);
-        config.enforcement.interception.mitm.plaintext_bridge.mode =
-            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
-        config.enforcement.interception.mitm.plaintext_bridge.path = Some(bridge_path);
-        config.enforcement.interception.mitm.client_trust.mode =
-            probe_config::TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged;
-        config.enforcement.interception.mitm.ca_certificate_ref = Some("mitm-ca".to_string());
-        config.enforcement.interception.mitm.ca_private_key_ref = Some("mitm-ca-key".to_string());
-        config.enforcement.interception.selector = Some(Selector::term(
-            ProcessSelector::default(),
-            TrafficSelector {
-                local_ports: vec![8443],
-                directions: vec![Direction::Inbound],
-                ..TrafficSelector::default()
-            },
-        ));
-        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
-            path: "/tmp/traffic-probe-enforcement.toml".into(),
-        };
-        config.tls.materials = vec![
-            TlsMaterialConfig {
-                id: Some("mitm-ca".to_string()),
-                kind: TlsMaterialKind::MitmCaCertificate,
-                path: "/etc/traffic-probe/mitm-ca.pem".into(),
-            },
-            TlsMaterialConfig {
-                id: Some("mitm-ca-key".to_string()),
-                kind: TlsMaterialKind::MitmCaPrivateKey,
-                path: "/etc/traffic-probe/mitm-ca.key".into(),
-            },
-        ];
-        RuntimePlan::build(
-            config,
-            &ProviderRegistry::new(
-                vec![
-                    CaptureProviderDescriptor::available(
-                        CaptureBackend::Libpcap,
-                        CaptureProviderBuilder::Libpcap,
-                    ),
-                    CaptureProviderDescriptor::available(
-                        CaptureBackend::CaptureEventFeed,
-                        CaptureProviderBuilder::CaptureEventFeed,
-                    ),
-                ],
-                mitm_bridge_platform_capabilities(),
-            ),
-        )
+        config
     }
 
     fn test_platform_capabilities() -> Vec<CapabilityState> {
@@ -890,40 +629,6 @@ mod tests {
         ));
         capabilities.push(CapabilityState::available(CapabilityKind::L7Mitm));
         capabilities
-    }
-
-    struct VecProvider {
-        events: VecDeque<CaptureEvent>,
-    }
-
-    impl VecProvider {
-        fn new(events: impl IntoIterator<Item = CaptureEvent>) -> Self {
-            Self {
-                events: events.into_iter().collect(),
-            }
-        }
-    }
-
-    impl CaptureProvider for VecProvider {
-        fn name(&self) -> &'static str {
-            "test_primary"
-        }
-
-        fn capabilities(&self) -> Vec<CapabilityState> {
-            Vec::new()
-        }
-
-        fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
-            Ok(self
-                .events
-                .pop_front()
-                .map(CapturePoll::event)
-                .unwrap_or(CapturePoll::Finished))
-        }
-    }
-
-    fn loss_event(reason: &str) -> CaptureEvent {
-        loss_event_with_source(reason, CaptureSource::ExternalPlaintextFeed)
     }
 
     fn mitm_loss_event(reason: &str) -> CaptureEvent {
@@ -950,16 +655,5 @@ mod tests {
             panic!("expected capture loss event, got {event:?}");
         };
         assert_eq!(loss.loss.reason, reason);
-    }
-
-    fn provider_capability(
-        provider: &dyn CaptureProvider,
-        kind: CapabilityKind,
-    ) -> CapabilityState {
-        provider
-            .capabilities()
-            .into_iter()
-            .find(|capability| capability.kind == kind)
-            .unwrap_or_else(|| panic!("missing provider capability {kind:?}"))
     }
 }

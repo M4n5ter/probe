@@ -1,10 +1,13 @@
-use probe_config::{AgentConfig, ConfigViolation};
+use probe_config::{
+    AgentConfig, ConfigViolation, TransparentInterceptionMitmPlaintextBridgeIntent,
+};
 use probe_core::{CapabilityKind, EnforcementMode};
 
 use crate::plan::{
-    capture::{CapturePlan, CapturePlanMode},
+    capture::{CaptureInputSource, CapturePlan, CapturePlanMode},
     enforcement::{
-        EnforcementCapabilityPlan, EnforcementCapabilityRequirement, configured_execution_surfaces,
+        EnforcementCapabilityPlan, EnforcementCapabilityRequirement, EnforcementExecutionSurface,
+        configured_execution_surfaces,
     },
     registry::ProviderRegistry,
 };
@@ -87,7 +90,9 @@ pub(super) fn validate_capture_constraints(
     }
 
     let capture = CapturePlan::resolve(config, registry);
-    if capture.mode != CapturePlanMode::Live {
+    if capture.mode != CapturePlanMode::Live
+        && !mitm_capture_event_feed_satisfies_enforcement(config, &capture)
+    {
         violations.push(ConfigViolation {
             field: "enforcement.mode".to_string(),
             reason: format!(
@@ -96,6 +101,26 @@ pub(super) fn validate_capture_constraints(
             ),
         });
     }
+}
+
+fn mitm_capture_event_feed_satisfies_enforcement(
+    config: &AgentConfig,
+    capture: &CapturePlan,
+) -> bool {
+    capture.selected_input_source == Some(CaptureInputSource::MitmPlaintextBridge)
+        && matches!(
+            configured_execution_surfaces(config).as_slice(),
+            [EnforcementExecutionSurface::TransparentInterceptionSetup]
+                | [EnforcementExecutionSurface::L7MitmProxyHook]
+        )
+        && config.enforcement.interception.strategy.is_mitm()
+        && matches!(
+            config
+                .enforcement
+                .interception
+                .mitm_plaintext_bridge_intent(),
+            Ok(TransparentInterceptionMitmPlaintextBridgeIntent::CaptureEventFeed { .. })
+        )
 }
 
 fn enforcement_capability_checks(config: &AgentConfig) -> Vec<EnforcementCapabilityCheck> {
@@ -544,6 +569,64 @@ mod tests {
     }
 
     #[test]
+    fn mitm_plaintext_bridge_can_supply_capture_event_feed_without_live_capture() {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::CaptureEventFeed,
+                CaptureProviderBuilder::CaptureEventFeed,
+                RuntimeMode::Available,
+            )],
+            transparent_mitm_bridge_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        enable_transparent_interception(
+            &mut config,
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm,
+        );
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_external_mitm_backend(&mut config);
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path =
+            Some("/run/traffic-probe/mitm-capture-events.jsonl".into());
+
+        validate_runtime_config(&config, &registry)
+            .expect("MITM capture-event bridge should satisfy traffic input without live capture");
+    }
+
+    #[test]
+    fn explicit_generic_capture_event_feed_does_not_satisfy_mitm_enforcement() {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::CaptureEventFeed,
+                CaptureProviderBuilder::CaptureEventFeed,
+                RuntimeMode::Available,
+            )],
+            transparent_mitm_bridge_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::CaptureEventFeed;
+        config.capture.capture_event_feed.path =
+            Some("/run/traffic-probe/generic-capture-events.jsonl".into());
+        config.enforcement.mode = EnforcementMode::Enforce;
+        enable_transparent_interception(
+            &mut config,
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm,
+        );
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_external_mitm_backend(&mut config);
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path =
+            Some("/run/traffic-probe/mitm-capture-events.jsonl".into());
+
+        let error = validation_error(config, &registry);
+
+        assert_violation(&error, "enforcement.mode", "requires live host capture");
+    }
+
+    #[test]
     fn transparent_interception_can_be_the_only_enforce_execution_surface() {
         let registry = ProviderRegistry::new(
             vec![live_capture_provider()],
@@ -885,6 +968,19 @@ mod tests {
                 } else {
                     state
                 }
+            })
+            .collect()
+    }
+
+    fn transparent_mitm_bridge_capabilities() -> Vec<CapabilityState> {
+        test_platform_capabilities()
+            .into_iter()
+            .map(|state| match state.kind {
+                CapabilityKind::TransparentInterception => {
+                    CapabilityState::available(CapabilityKind::TransparentInterception)
+                }
+                CapabilityKind::L7Mitm => CapabilityState::available(CapabilityKind::L7Mitm),
+                _ => state,
             })
             .collect()
     }

@@ -1,6 +1,7 @@
 mod activity;
 mod ebpf;
 mod factory;
+mod mitm_plaintext_bridge;
 mod procfs_resolver;
 mod runtime;
 

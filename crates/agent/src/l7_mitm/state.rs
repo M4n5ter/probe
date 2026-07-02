@@ -22,14 +22,14 @@ impl L7MitmRuntime {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct L7MitmRuntimeSnapshot {
     pub backend_health: L7MitmBackendHealthSnapshot,
     pub client_trust: L7MitmClientTrustSnapshot,
     pub plaintext_bridge: L7MitmPlaintextBridgeSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct L7MitmClientTrustSnapshot {
     pub mode: L7MitmClientTrustMode,
     pub material: L7MitmClientTrustMaterialMode,
@@ -92,7 +92,7 @@ impl L7MitmClientTrustMaterialMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct L7MitmPlaintextBridgeSnapshot {
     pub mode: L7MitmPlaintextBridgeMode,
     pub disable_reason: Option<String>,

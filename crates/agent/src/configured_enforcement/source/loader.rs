@@ -9,7 +9,7 @@ use probe_config::EnforcementPolicyManifest;
 use probe_core::ResolvedSelector;
 use probe_http::HttpConnectionOptions;
 use runtime::{EnforcementPolicySourceKind, EnforcementPolicySourcePlan};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use probe_io::{BoundedFileError, BoundedFileErrorKind, read_bounded_regular_file_to_string};
@@ -83,7 +83,7 @@ fn resolved_manifest_selector(manifest: &EnforcementPolicyManifest) -> Option<Re
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum LoadedEnforcementPolicySourceSnapshot {
     Local {

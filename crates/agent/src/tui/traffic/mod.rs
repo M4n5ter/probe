@@ -8,7 +8,7 @@ use probe_core::Selector;
 use self::{client::request_tail_events, rows::TrafficRow};
 use crate::{
     admin::{AdminClientError, EventTailSnapshot},
-    tui::runtime_status::{CaptureDiagnosticMessage, CaptureDiagnostics},
+    tui::runtime_status::{CaptureDiagnosticMessage, TrafficRuntimeDiagnostics},
 };
 
 pub(crate) use rows::TrafficRow as TrafficTableRow;
@@ -24,7 +24,7 @@ pub(crate) struct TrafficState {
     scroll: usize,
     status: TrafficStatus,
     last_export_sequence: u64,
-    capture_diagnostics: Option<CaptureDiagnostics>,
+    runtime_diagnostics: Option<TrafficRuntimeDiagnostics>,
 }
 
 impl Default for TrafficState {
@@ -37,7 +37,7 @@ impl Default for TrafficState {
             scroll: 0,
             status: TrafficStatus::idle("Traffic view uses the running admin socket"),
             last_export_sequence: 0,
-            capture_diagnostics: None,
+            runtime_diagnostics: None,
         }
     }
 }
@@ -68,9 +68,9 @@ impl TrafficState {
     }
 
     pub(crate) fn diagnostic_lines(&self) -> Vec<String> {
-        self.capture_diagnostics
+        self.runtime_diagnostics
             .as_ref()
-            .map(CaptureDiagnostics::detail_lines)
+            .map(TrafficRuntimeDiagnostics::detail_lines)
             .unwrap_or_else(|| {
                 vec![
                     "Select a traffic row to inspect details".to_string(),
@@ -94,11 +94,11 @@ impl TrafficState {
     }
 
     pub(crate) fn mark_admin_unavailable(&mut self, message: impl Into<String>) {
-        self.capture_diagnostics = None;
+        self.runtime_diagnostics = None;
         self.status = TrafficStatus::error(message);
     }
 
-    pub(crate) fn set_capture_diagnostics(&mut self, diagnostics: CaptureDiagnostics) {
+    pub(crate) fn set_runtime_diagnostics(&mut self, diagnostics: TrafficRuntimeDiagnostics) {
         if self.status.kind != TrafficStatusKind::Error
             && let Some(message) = diagnostics.status_message(self.rows.is_empty())
         {
@@ -108,7 +108,7 @@ impl TrafficState {
                 CaptureDiagnosticMessage::Error(message) => TrafficStatus::error(message),
             };
         }
-        self.capture_diagnostics = Some(diagnostics);
+        self.runtime_diagnostics = Some(diagnostics);
     }
 
     pub(crate) fn mark_filter_unavailable(&mut self, message: impl Into<String>) {
@@ -117,7 +117,7 @@ impl TrafficState {
         self.rows.clear();
         self.selected_index = 0;
         self.scroll = 0;
-        self.capture_diagnostics = None;
+        self.runtime_diagnostics = None;
         self.status = TrafficStatus::error(message);
     }
 
@@ -143,7 +143,7 @@ impl TrafficState {
         self.rows.clear();
         self.selected_index = 0;
         self.scroll = 0;
-        self.capture_diagnostics = None;
+        self.runtime_diagnostics = None;
         self.status = TrafficStatus::idle("Traffic filter changed");
     }
 
@@ -276,14 +276,14 @@ mod tests {
         status::{
             CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
         },
-        tui::runtime_status::CaptureDiagnostics,
+        tui::runtime_status::TrafficRuntimeDiagnostics,
     };
 
     #[test]
     fn diagnostics_preserve_warning_severity() {
         let mut traffic = TrafficState::default();
 
-        traffic.set_capture_diagnostics(CaptureDiagnostics::from_capture_snapshot(
+        traffic.set_runtime_diagnostics(TrafficRuntimeDiagnostics::from_capture_snapshot(
             fallback_capture_snapshot(),
         ));
 
@@ -299,7 +299,7 @@ mod tests {
         let mut traffic = TrafficState::default();
         traffic.mark_admin_unavailable("tail_events failed");
 
-        traffic.set_capture_diagnostics(CaptureDiagnostics::from_capture_snapshot(
+        traffic.set_runtime_diagnostics(TrafficRuntimeDiagnostics::from_capture_snapshot(
             fallback_capture_snapshot(),
         ));
 
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn filter_failure_clears_stale_diagnostics() {
         let mut traffic = TrafficState::default();
-        traffic.set_capture_diagnostics(CaptureDiagnostics::from_capture_snapshot(
+        traffic.set_runtime_diagnostics(TrafficRuntimeDiagnostics::from_capture_snapshot(
             fallback_capture_snapshot(),
         ));
 

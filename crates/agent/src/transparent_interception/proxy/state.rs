@@ -4,7 +4,7 @@ use ::runtime::{
     TransparentInterceptionExecutionPlan, TransparentInterceptionProxyHealthProbePlan,
 };
 use probe_config::TransparentInterceptionProxyModeConfig;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::transparent_interception::TransparentInterceptionIpFamily;
 
@@ -13,7 +13,7 @@ pub(crate) use crate::tcp_health::{
     TcpHealthSnapshot as TransparentProxyHealthProbeSnapshot,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TransparentProxyRuntimeSnapshot {
     pub mode: TransparentProxyRuntimeMode,
     pub listener_families: Vec<TransparentInterceptionIpFamily>,
@@ -26,7 +26,7 @@ pub(crate) struct TransparentProxyRuntimeSnapshot {
     pub listener_failures: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TransparentProxyRuntimeMode {
     Disabled,
@@ -39,6 +39,18 @@ pub(crate) enum TransparentProxyRuntimeMode {
 }
 
 impl TransparentProxyRuntimeMode {
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::External => "external",
+            Self::Configured => "configured",
+            Self::Running => "running",
+            Self::Degraded => "degraded",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+
     fn from_proxy_mode(mode: TransparentInterceptionProxyModeConfig) -> Self {
         match mode {
             TransparentInterceptionProxyModeConfig::External => Self::External,
@@ -47,7 +59,7 @@ impl TransparentProxyRuntimeMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TransparentProxyConnectMetricsSnapshot {
     pub connect_successes: u64,
     pub connect_failures: u64,

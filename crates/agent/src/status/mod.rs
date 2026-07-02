@@ -15,6 +15,7 @@ mod tls;
 pub(crate) use capture::CaptureStatusSnapshot;
 #[cfg(test)]
 pub(crate) use capture::{CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot};
+pub(crate) use enforcement::{EnforcementStatusMode, EnforcementStatusSnapshot};
 pub(crate) use metrics::MetricsSnapshot;
 pub(crate) use prometheus::{PROMETHEUS_TEXT_CONTENT_TYPE, render_prometheus_metrics};
 pub(crate) use snapshot::{
@@ -22,3 +23,12 @@ pub(crate) use snapshot::{
     build_status_snapshot_with_runtime,
 };
 pub(crate) use spool::{collect_running_spool_status, collect_spool_status};
+
+#[cfg(test)]
+pub(crate) fn enforcement_status_with_transparent_proxy_for_test(
+    plan: &runtime::RuntimePlan,
+    l7_mitm: Option<crate::l7_mitm::L7MitmRuntimeSnapshot>,
+    transparent_proxy: Option<crate::transparent_interception::TransparentProxyRuntimeSnapshot>,
+) -> EnforcementStatusSnapshot {
+    enforcement::enforcement_status_with_transparent_proxy(plan, l7_mitm, transparent_proxy)
+}

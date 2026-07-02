@@ -101,7 +101,7 @@ TLS plaintext / session secret 现状：
 - selector-projected transparent interception 已覆盖入站 TPROXY、出站透明代理、process-scoped setup proof、
   owner-scoped outbound path、finite-boundary outbound flow classifier 和 managed/external proxy lifecycle。
 - Product MITM proxy 已覆盖显式 TLS material、operator-managed trust contract/material refs、upstream route/DNS discovery、
-  HTTP policy hook、入站/出站透明 HTTPS 和 WebSocket tunnel path；它不自动修改客户端 trust store。
+  plain HTTP downstream、HTTP policy hook、入站/出站透明 HTTPS 和 WebSocket tunnel path；它不自动修改客户端 trust store。
 
 当前明确缺口：
 
@@ -600,12 +600,14 @@ TLS 明文与协议能力：
     只有该 backend 已接收对应 HTTP request bytes 并生成 plaintext bridge flow 时，
     fixture 才会写入 action report、返回 delegated deny，并向下游连接返回代理侧 deny response。
   - 可选 `plaintext_bridge.mode = "capture_event_feed"` 使用 JSON-lines `CaptureEvent` feed 作为 MITM plaintext bridge；
-    bridge 作为 live capture sidecar 进入同一 parser/policy/spool/export pipeline，不替代主 live capture provider。
+    bridge 可以作为 live capture sidecar 进入同一 parser/policy/spool/export pipeline，也可以在
+    `capture.selection = "auto"` 且 eBPF/libpcap 不可用时作为 `capture_event_feed` traffic input。
     bridge 写入的 flow 事件使用 `source = l7_mitm_plaintext` 与 `provider = interception`，
     因此可与 generic external plaintext feed 在 provenance、policy view 和审计中区分。
     runtime bridge mode 依次表达 `configured`、`ready`、`active` 和 `disabled_after_error`：
-    `ready` 表示 feed 已打开，`active` 表示 provider 已挂入 live capture mux。
-    bridge 运行中读取失败会按 best-effort sidecar 语义禁用，并写入 L7 MITM runtime status 和 health reason；
+    `ready` 表示 feed 已打开，`active` 表示 provider 已进入 capture pipeline。
+    bridge 作为 sidecar 时，运行中读取失败会按 best-effort sidecar 语义禁用，并写入 L7 MITM runtime status 和 health reason；
+    bridge 作为 primary traffic input 时，读取失败按 selected provider 错误处理；
     metrics 暴露 plaintext bridge mode，避免把错误字符串变成高基数标签。
     这避免主 live capture 被拖垮，也避免显式 MITM bridge 失败被静默隐藏。
   - MITM material refs 必须指向 `tls.materials` 中匹配 kind 的 material；重复 refs、缺半边 pair 或在非 MITM strategy 下配置 MITM material 都会 fail closed。
@@ -3082,8 +3084,9 @@ L7 MITM HTTP JSON adapter 要求代理返回 `delegated` 时携带与 `requested
 
 无 backend 的 planner 构造器不会接受 `enforce`，只有显式注入 `EnforcementBackend` 的构造路径才能进入真实 enforce planner；`enforcement.mode =
 "enforce"` 会要求至少配置一个执行面，可选执行面是显式 connection backend、transparent interception setup-time surface 或
-L7 MITM proxy hook。`enforce` 还要求 resolved capture plan 为 live host capture；`replay` 和 `plaintext_feed`
-即使能产生策略 verdict，也不能和真实 enforcement 组合成可运行计划。配置
+L7 MITM proxy hook。connection enforcement 需要 live host capture；透明 MITM 如果配置了
+`capture_event_feed` plaintext bridge，可以由该 bridge 提供 traffic event source。`replay` 和
+`plaintext_feed` 即使能产生策略 verdict，也不能和真实 enforcement 组合成可运行计划。配置
 `enforcement.backend = "linux_socket_destroy"` 后，agent composition root 会一次性 resolve 出 connection enforcement runtime，
 registry 使用同一份 capability，`run`/`check` 使用同一份 backend factory，避免 plan validation 和 executable backend construction 分叉。
 
@@ -3519,9 +3522,10 @@ audit 语义后再接入。
   effective action 是 `observe`，输出 `selector_miss`，说明 verdict 不在当前防护范围内。
 - verdict action 不在 protection profile 中：
   effective action 是 `observe`，输出 `unsupported`，不能静默当作已防护。
-- `enforce` 且 capture plan 不是 live host capture：
+- `enforce` 且 capture plan 既不是 live host capture，也不是显式 MITM `capture_event_feed`
+  plaintext bridge：
   无运行态，`RuntimePlan` 构建阶段 fail closed。
-  replay/plaintext feed 可以产出 verdict，但不能伪装成可执行 connection enforcement。
+  replay/plaintext feed 可以产出 verdict，但不能伪装成可执行 connection enforcement 或透明拦截数据面。
 - `enforce` 且触发事件携带 observation-only enforcement evidence：
   effective action 是 `observe`。
   pipeline 保留策略 verdict audit；`ScopedEnforcementPlanner` 在调用真实 per-flow backend 前返回 `unsupported`。
@@ -3539,9 +3543,10 @@ audit 语义后再接入。
 - 多个 planner execution surface 同时配置：
   无运行态。在 composite execution backend 实现前，`RuntimePlan` validation fail closed，
   不能让 status/check/run 对组合语义各自解释。
-- 透明拦截 strategy 启用但不是 `enforce` 或不是 live host capture：
+- 透明拦截 strategy 启用但不是 `enforce`，或者 capture plan 不是该 strategy 支持的 traffic input：
   无运行态，`RuntimePlan` validation fail closed。
-  透明拦截不能在 audit/dry-run/replay/plaintext feed 中伪装成可执行拦截。
+  非 MITM 透明拦截需要 live host capture；MITM 透明拦截可以使用配置好的 `capture_event_feed`
+  plaintext bridge。透明拦截不能在 audit/dry-run/replay/plaintext feed 中伪装成可执行拦截。
 - 透明拦截 strategy 启用但 `transparent_interception` capability 不可用：
   无运行态，`RuntimePlan` validation fail closed。
   典型原因是缺少 root、可信 `nft` 或 RTNETLINK host routing 能力。
@@ -3838,7 +3843,8 @@ transparent interception strategy：
 - 要求 `interception.mitm.client_trust.mode = "operator_managed"`。
 - 要求 MITM CA pair 或 leaf certificate pair。
 - 要求 `enforcement.mode = "enforce"`。
-- 要求 live host capture。
+- 要求 live host capture，或要求配置 `capture_event_feed` plaintext bridge 并让 Auto capture
+  在被动候选不可用时选中该 bridge。
 - 不能与 connection backend 同时启用，直到真实 composite execution backend 存在。
 
 `outbound_transparent_mitm`：
@@ -3854,7 +3860,8 @@ transparent interception strategy：
 - 要求 MITM CA pair 或 leaf certificate pair。
 - `managed_tcp_relay` 会被配置校验拒绝。
 - 要求 `enforcement.mode = "enforce"`。
-- 要求 live host capture。
+- 要求 live host capture，或要求配置 `capture_event_feed` plaintext bridge 并让 Auto capture
+  在被动候选不可用时选中该 bridge。
 - 不能与 connection backend 同时启用，直到真实 composite execution backend 存在。
 
 outbound proxy mode：
@@ -3918,11 +3925,15 @@ MITM backend contract：
   generic `external_plaintext_feed` 只表示独立外部明文 feed，不代表显式 MITM 数据面。
 - `interception.mitm.plaintext_bridge.path` 在 capture-event bridge 模式下必填。
 - `interception.mitm.plaintext_bridge.follow` 控制 bridge provider 是否在 EOF 后继续等待追加事件；默认 `true`，因为 MITM
-  bridge 是 live capture sidecar。显式 `false` 只适合有限 JSONL feed。
-- bridge provider 是 live capture sidecar：主 capture backend 仍必须是 eBPF/libpcap live host capture，用于透明拦截和 host observation。
+  bridge 是 live traffic source。显式 `false` 只适合有限 JSONL feed。
+- bridge provider 有两种运行形态：
+  - live primary 已可用时，bridge 作为 best-effort sidecar 纳入 capture mux；
+  - `capture.selection = "auto"` 且被动 live candidates 不可用时，已配置的 MITM bridge 作为
+    `capture_event_feed` traffic input 候选。
 - bridge 文件打开失败 fail closed。
-  provider 挂入 live capture mux 后，runtime mode 从 `ready` 变为 `active`。
-  运行中读取错误按 best-effort sidecar disable，不拖垮主 live capture。
+  provider 进入 capture pipeline 后，runtime mode 从 `ready` 变为 `active`。
+  作为 sidecar 运行时，读取错误按 best-effort sidecar disable，不拖垮主 live capture；
+  作为 primary traffic input 运行时，读取错误按 selected provider 错误处理。
   运行中 disable reason 进入 L7 MITM runtime status 和 agent health degraded reason；
   metrics 暴露 plaintext bridge mode，避免把错误字符串变成高基数标签。
 - `interception.mitm.policy_hook.mode = "http_json"` 表示 agent 通过本机 HTTP JSON endpoint 把每流量保护动作委托给 MITM proxy。
@@ -4001,7 +4012,9 @@ runtime plan 阶段：
 - 只做 capability validation。
 - 只做 enforce/capture constraint validation。
 - `enforce` 必须配置唯一执行面。
-- `enforce` 必须搭配 live host capture。
+- connection enforcement 和非 MITM 透明拦截必须搭配 live host capture。
+- MITM 透明拦截可以搭配 live host capture，也可以搭配已配置的 `capture_event_feed`
+  plaintext bridge。
 - `enforce` 不能搭配 `replay` 或 `plaintext_feed`。
 - plan 阶段不打开 manifest 文件。
 - plan 阶段不发网络请求。
@@ -4072,9 +4085,11 @@ run side-effect ordering：
 - setup preflight 覆盖 `key_log_refs` / `session_secret_refs` live auto-binding material 读取。
 - setup preflight 覆盖 material 解析、auto-binding view 构建、lookup-unique 检测和 live-consumable 校验。
 - external MITM plaintext bridge feed 在 setup preflight 阶段打开，并把打开的 bridge provider 交给 build 阶段复用。
-- managed MITM plaintext bridge feed 允许由 managed backend 在启动后创建；agent 在 managed backend readiness 成功后、
+- managed/product MITM plaintext bridge feed 允许由 backend 在启动后创建；agent 在 backend readiness 成功后、
   transparent interception activation 前打开 feed。
-- live provider 构造先于 transparent interception activation；provider 构造失败不会安装 nftables/TPROXY host rules。
+- capture provider 构造先于 transparent interception activation；provider 构造失败不会安装 nftables/TPROXY host rules。
+  当 Auto capture 选中 MITM bridge 作为 `capture_event_feed` traffic input 时，provider 构造复用同一套
+  deferred bridge 机制。
 - transparent interception activation 成功后再发出 readiness signal 并进入 capture pipeline。
 - 这个顺序避免 TLS material、external bridge feed 或 managed bridge feed 错误时仍短暂安装 nftables/TPROXY host rules。
 

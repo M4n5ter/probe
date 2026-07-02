@@ -11,7 +11,7 @@ mod tls;
 mod validation;
 
 pub use capture::{
-    CaptureEvidenceMode, CapturePlan, CapturePlanMode, CaptureProviderBuilder,
+    CaptureEvidenceMode, CaptureInputSource, CapturePlan, CapturePlanMode, CaptureProviderBuilder,
     CaptureProviderDescriptor,
 };
 pub use enforcement::{

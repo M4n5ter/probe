@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -42,7 +42,7 @@ impl TcpHealthProbePlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TcpHealthMode {
     Disabled,
@@ -62,7 +62,7 @@ impl TcpHealthMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TcpHealthSnapshot {
     pub mode: TcpHealthMode,
     pub check_successes: u64,

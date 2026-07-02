@@ -12,9 +12,9 @@ use runtime::{
     TransparentInterceptionMitmPlan, TransparentInterceptionNftablesPlan,
     TransparentInterceptionOutboundRedirectPlan, TransparentInterceptionProxyPlan,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementStatusSnapshot {
     pub configured_mode: EnforcementMode,
     pub status: EnforcementStatusMode,
@@ -27,13 +27,13 @@ pub struct EnforcementStatusSnapshot {
     pub mode_capability: EnforcementCapabilityStatusSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementConnectionStatusSnapshot {
     pub backend: ConnectionEnforcementBackendConfig,
     pub capability: EnforcementCapabilityStatusSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementInterceptionStatusSnapshot {
     pub strategy: TransparentInterceptionStrategyConfig,
     pub proxy: TransparentInterceptionProxyPlan,
@@ -48,7 +48,7 @@ pub struct EnforcementInterceptionStatusSnapshot {
     pub runtime_proxy: Option<TransparentProxyRuntimeSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnforcementStatusMode {
     Disabled,
@@ -57,7 +57,7 @@ pub enum EnforcementStatusMode {
     Enforce,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum EnforcementCapabilityStatusSnapshot {
     NotRequired,
@@ -69,12 +69,12 @@ pub enum EnforcementCapabilityStatusSnapshot {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPolicyStatusSnapshot {
     pub source: EnforcementPolicySourceStatusSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "mode")]
 pub enum EnforcementPolicySourceStatusSnapshot {
     NotConfigured,
@@ -96,7 +96,7 @@ pub enum EnforcementPolicySourceStatusSnapshot {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPolicyManifestStatusSnapshot {
     pub id: String,
     pub version: String,

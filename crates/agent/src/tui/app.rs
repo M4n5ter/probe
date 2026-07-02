@@ -10,7 +10,7 @@ use super::hit::HitTarget;
 use super::process_view::ProcessViewState;
 use super::processes::{ProcessCatalog, selector_for_exe_path};
 use super::runtime_attachment::RuntimeAttachment;
-use super::runtime_status::request_capture_diagnostics;
+use super::runtime_status::request_traffic_runtime_diagnostics;
 use super::traffic::TrafficState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -590,8 +590,8 @@ impl TuiApp {
             }
         };
         self.traffic.refresh(&socket_path, selector).await;
-        if let Ok(diagnostics) = request_capture_diagnostics(&socket_path).await {
-            self.traffic.set_capture_diagnostics(diagnostics);
+        if let Ok(diagnostics) = request_traffic_runtime_diagnostics(&socket_path).await {
+            self.traffic.set_runtime_diagnostics(diagnostics);
         }
         match self.traffic.status().kind {
             super::traffic::TrafficStatusKind::Error

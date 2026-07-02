@@ -1,7 +1,7 @@
 mod plan;
 
 pub use plan::{
-    CaptureEvidenceMode, CapturePlan, CapturePlanMode, CaptureProviderBuilder,
+    CaptureEvidenceMode, CaptureInputSource, CapturePlan, CapturePlanMode, CaptureProviderBuilder,
     CaptureProviderDescriptor, EnforcementCapabilityPlan, EnforcementConnectionPlan,
     EnforcementExecutionSurface, EnforcementInterceptionPlan, EnforcementPlan,
     EnforcementPolicySourceKind, EnforcementPolicySourcePlan, ExportFailureBackoffPlan, ExportPlan,

@@ -738,8 +738,9 @@ backend = "none"
 backend、selector、policy source 并完成运维审批后，才应使用 `enforce`。
 
 当被动 eBPF/libpcap capture 不可用时，transparent proxy 或 MITM 可以为 scoped traffic
-提供可靠的 HTTP/TLS 内容路径。它是显式 data-plane strategy，不是静默 fallback：需要流量改道、
-operator-managed trust 和已配置的 MITM backend。
+提供可靠的普通明文 HTTP 和 TLS 解密后 HTTP 内容路径。这是显式 data-plane strategy：必须配置流量改道、
+operator-managed trust、MITM backend 和 `capture_event_feed` plaintext bridge。配置该 bridge 后，
+`capture.selection = "auto"` 可以在被动 capture 候选失败后使用 MITM feed。
 
 Lua policy 产生 event-level alert 和 verdict request。Enforcement policy manifest 是独立
 control input，用来定义允许应用哪些 protective action，以及可选的 process/traffic selector：

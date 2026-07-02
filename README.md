@@ -829,9 +829,12 @@ backend. Use `enforce` only with an explicit backend, selector, policy source,
 and operational approval.
 
 When passive eBPF/libpcap capture is unavailable, transparent proxy or MITM can
-provide a reliable HTTP/TLS content path for scoped traffic. It is an explicit
-data-plane strategy, not a silent fallback: it requires traffic steering,
-operator-managed trust, and a configured MITM backend.
+provide a reliable plain HTTP and TLS-decrypted HTTP content path for scoped
+traffic. This is an explicit data-plane strategy: traffic steering,
+operator-managed trust, a MITM backend, and a `capture_event_feed` plaintext
+bridge must be configured. With that bridge configured,
+`capture.selection = "auto"` can use the MITM feed after passive capture
+candidates fail.
 
 Lua policies emit event-level alerts and verdict requests. Enforcement policy
 manifests are a separate control input that defines which protective actions may
