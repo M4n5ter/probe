@@ -8,7 +8,12 @@ use probe_core::Selector;
 use self::{client::request_tail_events, rows::TrafficRow};
 use crate::{
     admin::{AdminClientError, EventTailOmission, EventTailSnapshot},
-    tui::runtime_status::{CaptureDiagnosticMessage, TrafficRuntimeDiagnostics},
+    tui::{
+        copy::MITM_PLAINTEXT_COVERAGE,
+        runtime_status::{
+            CaptureDiagnosticMessage, TrafficRuntimeDiagnostics, missing_mitm_quick_setup_action,
+        },
+    },
 };
 
 pub(crate) use rows::TrafficRow as TrafficTableRow;
@@ -75,6 +80,10 @@ impl TrafficState {
                 vec![
                     "Select a traffic row to inspect details".to_string(),
                     "Capture diagnostics will appear here after the first refresh".to_string(),
+                    format!(
+                        "MITM fallback can capture {MITM_PLAINTEXT_COVERAGE} when passive capture is unavailable"
+                    ),
+                    format!("MITM setup: {}", missing_mitm_quick_setup_action()),
                 ]
             })
     }

@@ -23,14 +23,34 @@ pub(crate) enum HitTarget {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScrollTarget {
+    ProcessList,
+    TrafficProcessList,
+    TrafficEvents,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HitArea {
     rect: Rect,
-    target: HitTarget,
+    target: Option<HitTarget>,
+    scroll_target: Option<ScrollTarget>,
 }
 
 impl HitArea {
     pub(crate) fn new(rect: Rect, target: HitTarget) -> Self {
-        Self { rect, target }
+        Self {
+            rect,
+            target: Some(target),
+            scroll_target: None,
+        }
+    }
+
+    pub(crate) fn scroll(rect: Rect, target: ScrollTarget) -> Self {
+        Self {
+            rect,
+            target: None,
+            scroll_target: Some(target),
+        }
     }
 }
 
@@ -48,8 +68,16 @@ impl HitMap {
         self.areas
             .iter()
             .rev()
-            .find(|area| contains(area.rect, column, row))
-            .map(|area| area.target)
+            .filter(|area| contains(area.rect, column, row))
+            .find_map(|area| area.target)
+    }
+
+    pub(crate) fn scroll_target(&self, column: u16, row: u16) -> Option<ScrollTarget> {
+        self.areas
+            .iter()
+            .rev()
+            .filter(|area| contains(area.rect, column, row))
+            .find_map(|area| area.scroll_target)
     }
 }
 

@@ -86,7 +86,7 @@ fn missing_mitm_next_step() -> String {
     )
 }
 
-fn missing_mitm_quick_setup_action() -> String {
+pub(crate) fn missing_mitm_quick_setup_action() -> String {
     format!(
         "select a process in Traffic, then use {} for outbound clients or {} for server listeners",
         ControlId::ConfigureOutboundMitm.traffic_action_label(),

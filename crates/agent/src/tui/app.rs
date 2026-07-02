@@ -6,7 +6,7 @@ use super::controls::{ControlId, FocusTarget, focus_targets_for_tab};
 use super::fields::{
     FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
 };
-use super::hit::HitTarget;
+use super::hit::{HitTarget, ScrollTarget};
 use super::mitm_setup::{
     DEFAULT_OUTBOUND_MITM_REMOTE_PORTS, MitmQuickSetupDirection, MitmQuickSetupOutcome,
     MitmQuickSetupWarning, apply_mitm_quick_setup,
@@ -89,6 +89,10 @@ pub(crate) enum TuiAction {
     ToggleProcessMonitor,
     ConfigureOutboundMitm,
     ConfigureInboundMitm,
+    Scroll {
+        delta: isize,
+        target: Option<ScrollTarget>,
+    },
     Hover {
         target: Option<HitTarget>,
         column: u16,
@@ -379,6 +383,7 @@ impl TuiApp {
             TuiAction::PreviousTab => self.select_tab(self.active_tab.previous()),
             TuiAction::MoveUp => self.move_selection(-1),
             TuiAction::MoveDown => self.move_selection(1),
+            TuiAction::Scroll { delta, target } => self.scroll_target(delta, target),
             TuiAction::NextValue => return self.adjust_selected(1),
             TuiAction::PreviousValue => return self.adjust_selected(-1),
             TuiAction::TextInput(_)
@@ -575,6 +580,16 @@ impl TuiApp {
             return;
         }
         self.selected_field_index = offset_index(self.selected_field_index, targets.len(), delta);
+    }
+
+    fn scroll_target(&mut self, delta: isize, target: Option<ScrollTarget>) {
+        if target_scrolls_processes(self.active_tab, target) {
+            self.move_process(delta);
+        } else if target_scrolls_traffic_events(self.active_tab, target) {
+            self.move_traffic(delta);
+        } else {
+            self.move_selection(delta);
+        }
     }
 
     fn move_process(&mut self, delta: isize) {
@@ -896,6 +911,9 @@ impl TuiApp {
             TuiAction::MoveDown => {
                 self.traffic_detail_scroll = self.traffic_detail_scroll.saturating_add(1);
             }
+            TuiAction::Scroll { delta, .. } => {
+                self.traffic_detail_scroll = apply_scroll_delta(self.traffic_detail_scroll, delta);
+            }
             TuiAction::TextCancel
             | TuiAction::Quit
             | TuiAction::Click(HitTarget::TrafficDetailClose) => self.close_traffic_detail(),
@@ -981,6 +999,26 @@ fn offset_index(index: usize, len: usize, delta: isize) -> usize {
     }
     let raw = index as isize + delta;
     raw.clamp(0, len.saturating_sub(1) as isize) as usize
+}
+
+fn apply_scroll_delta(position: usize, delta: isize) -> usize {
+    if delta < 0 {
+        position.saturating_sub(delta.unsigned_abs())
+    } else {
+        position.saturating_add(delta as usize)
+    }
+}
+
+fn target_scrolls_processes(active_tab: TuiTab, target: Option<ScrollTarget>) -> bool {
+    match active_tab {
+        TuiTab::Processes => target == Some(ScrollTarget::ProcessList),
+        TuiTab::Traffic => target == Some(ScrollTarget::TrafficProcessList),
+        _ => false,
+    }
+}
+
+fn target_scrolls_traffic_events(active_tab: TuiTab, target: Option<ScrollTarget>) -> bool {
+    active_tab == TuiTab::Traffic && target == Some(ScrollTarget::TrafficEvents)
 }
 
 #[cfg(test)]

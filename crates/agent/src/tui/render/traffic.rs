@@ -12,7 +12,7 @@ use ratatui::{
 use crate::tui::{
     app::{ProcessArgvHover, TuiApp},
     controls::ControlId,
-    hit::{HitArea, HitTarget},
+    hit::{HitArea, HitTarget, ScrollTarget},
     traffic::TrafficStatusKind,
 };
 
@@ -253,6 +253,7 @@ fn render_traffic_process_picker(
     app: &mut TuiApp,
     hits: &mut Vec<HitArea>,
 ) {
+    hits.push(HitArea::scroll(area, ScrollTarget::TrafficProcessList));
     let visible_rows = area.height.saturating_sub(3) as usize;
     app.set_process_viewport_rows(visible_rows);
     let entries = app.processes().entries();
@@ -356,6 +357,7 @@ fn render_traffic_events(
     app: &mut TuiApp,
     hits: &mut Vec<HitArea>,
 ) {
+    hits.push(HitArea::scroll(area, ScrollTarget::TrafficEvents));
     let visible_rows = area.height.saturating_sub(3) as usize;
     app.set_traffic_viewport_rows(visible_rows);
     let traffic = app.traffic();

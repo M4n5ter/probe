@@ -350,20 +350,29 @@ fn mouse_to_action(hit_map: &HitMap, mouse: MouseEvent) -> Option<TuiAction> {
             column: mouse.column,
             row: mouse.row,
         }),
-        MouseEventKind::ScrollUp => Some(TuiAction::MoveUp),
-        MouseEventKind::ScrollDown => Some(TuiAction::MoveDown),
+        MouseEventKind::ScrollUp => Some(TuiAction::Scroll {
+            delta: -1,
+            target: hit_map.scroll_target(mouse.column, mouse.row),
+        }),
+        MouseEventKind::ScrollDown => Some(TuiAction::Scroll {
+            delta: 1,
+            target: hit_map.scroll_target(mouse.column, mouse.row),
+        }),
         _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use ratatui::layout::Rect;
+    use probe_config::AgentConfig;
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     use super::{
         super::{
-            app::TuiTab,
-            hit::{HitArea, HitMap, HitTarget},
+            app::{TuiAction, TuiApp, TuiTab},
+            hit::{HitArea, HitMap, HitTarget, ScrollTarget},
+            processes::{ProcessCatalog, ProcessEntry},
+            render::draw,
         },
         *,
     };
@@ -504,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_wheel_has_keyboard_equivalent_selection_actions() {
+    fn mouse_wheel_keeps_the_pointer_target() {
         let hit_map = HitMap::default();
 
         assert_eq!(
@@ -517,7 +526,10 @@ mod tests {
                     modifiers: KeyModifiers::NONE,
                 },
             ),
-            Some(TuiAction::MoveUp)
+            Some(TuiAction::Scroll {
+                delta: -1,
+                target: None
+            })
         );
         assert_eq!(
             mouse_to_action(
@@ -529,8 +541,83 @@ mod tests {
                     modifiers: KeyModifiers::NONE,
                 },
             ),
-            Some(TuiAction::MoveDown)
+            Some(TuiAction::Scroll {
+                delta: 1,
+                target: None
+            })
         );
+    }
+
+    #[test]
+    fn mouse_wheel_targets_the_hovered_panel() {
+        let hit_map = HitMap::new(vec![HitArea::scroll(
+            Rect::new(2, 3, 10, 1),
+            ScrollTarget::TrafficEvents,
+        )]);
+
+        let action = mouse_to_action(
+            &hit_map,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 4,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(
+            action,
+            Some(TuiAction::Scroll {
+                delta: 1,
+                target: Some(ScrollTarget::TrafficEvents)
+            })
+        );
+    }
+
+    #[test]
+    fn traffic_watch_button_scroll_does_not_move_process_picker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = traffic_test_app();
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
+        let mut terminal = Terminal::new(TestBackend::new(120, 30))?;
+        let mut hit_map = HitMap::default();
+
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &mut app);
+        })?;
+
+        let watch_button = first_hit_coordinate(&hit_map, HitTarget::ProcessMonitor(0), 120, 30)
+            .expect("traffic watch action should be clickable");
+        assert_eq!(hit_map.scroll_target(watch_button.0, watch_button.1), None);
+        let action = mouse_to_action(
+            &hit_map,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: watch_button.0,
+                row: watch_button.1,
+                modifiers: KeyModifiers::NONE,
+            },
+        )
+        .expect("watch button scroll should produce an action");
+        app.handle_action(action);
+        assert_eq!(app.selected_process_index(), Some(0));
+
+        let picker = first_scroll_coordinate(&hit_map, ScrollTarget::TrafficProcessList, 120, 30)
+            .expect("traffic process picker should be scrollable");
+        let action = mouse_to_action(
+            &hit_map,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: picker.0,
+                row: picker.1,
+                modifiers: KeyModifiers::NONE,
+            },
+        )
+        .expect("picker scroll should produce an action");
+        app.handle_action(action);
+
+        assert_eq!(app.selected_process_index(), Some(1));
+        Ok(())
     }
 
     #[test]
@@ -539,5 +626,54 @@ mod tests {
 
         assert_eq!(resolve_config_path(Some(explicit.clone())), explicit);
         assert_eq!(resolve_config_path(None), default_config_path());
+    }
+
+    fn first_hit_coordinate(
+        hit_map: &HitMap,
+        target: HitTarget,
+        width: u16,
+        height: u16,
+    ) -> Option<(u16, u16)> {
+        (0..height).find_map(|row| {
+            (0..width)
+                .find(|column| hit_map.hit(*column, row) == Some(target))
+                .map(|column| (column, row))
+        })
+    }
+
+    fn first_scroll_coordinate(
+        hit_map: &HitMap,
+        target: ScrollTarget,
+        width: u16,
+        height: u16,
+    ) -> Option<(u16, u16)> {
+        (0..height).find_map(|row| {
+            (0..width)
+                .find(|column| hit_map.scroll_target(*column, row) == Some(target))
+                .map(|column| (column, row))
+        })
+    }
+
+    fn traffic_test_app() -> TuiApp {
+        TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::from_entries([
+                process(42, "curl", "/usr/bin/curl"),
+                process(43, "nginx", "/usr/sbin/nginx"),
+            ]),
+        )
+    }
+
+    fn process(pid: u32, name: &str, exe_path: &str) -> ProcessEntry {
+        ProcessEntry {
+            pid,
+            name: name.to_string(),
+            exe_path: Some(PathBuf::from(exe_path)),
+            argv: vec![name.to_string()],
+            uid: 1000,
+            gid: 1000,
+            cgroup_path: Some(format!("system.slice/{name}.service")),
+        }
     }
 }

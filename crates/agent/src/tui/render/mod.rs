@@ -13,7 +13,7 @@ mod traffic;
 use super::{
     app::{StatusKind, TextEditSession, TuiApp, TuiTab},
     controls::{ControlId, FocusTarget},
-    hit::{HitArea, HitMap, HitTarget},
+    hit::{HitArea, HitMap, HitTarget, ScrollTarget},
 };
 
 const PROCESS_VISIBLE_DETAIL_WIDTH: usize = 96;
@@ -257,6 +257,7 @@ fn hit_target_for_focus(target: FocusTarget) -> HitTarget {
 fn render_processes(frame: &mut Frame<'_>, area: Rect, app: &mut TuiApp, hits: &mut Vec<HitArea>) {
     let [search_area, table_area] =
         Layout::vertical([Constraint::Length(2), Constraint::Min(4)]).areas(area);
+    hits.push(HitArea::scroll(table_area, ScrollTarget::ProcessList));
     let visible_rows = table_area.height.saturating_sub(3) as usize;
     app.set_process_viewport_rows(visible_rows);
     let entries = app.processes().entries();
@@ -631,6 +632,12 @@ mod tests {
         assert!(output.contains("filter"));
         assert!(output.contains("matches"));
         assert_eq!(hit_map.hit(23, 4), Some(HitTarget::Tab(TuiTab::Capture)));
+        assert!(scroll_target_exists(
+            &hit_map,
+            Some(ScrollTarget::ProcessList),
+            100,
+            24
+        ));
         assert!(hit_exists(&hit_map, Some(HitTarget::Process(0)), 100, 24));
         assert!(hit_exists(
             &hit_map,
@@ -647,6 +654,15 @@ mod tests {
 
     fn hit_exists(hit_map: &HitMap, target: Option<HitTarget>, width: u16, height: u16) -> bool {
         (0..height).any(|row| (0..width).any(|column| hit_map.hit(column, row) == target))
+    }
+
+    fn scroll_target_exists(
+        hit_map: &HitMap,
+        target: Option<ScrollTarget>,
+        width: u16,
+        height: u16,
+    ) -> bool {
+        (0..height).any(|row| (0..width).any(|column| hit_map.scroll_target(column, row) == target))
     }
 
     fn first_hit_coordinate(
@@ -835,6 +851,18 @@ mod tests {
         assert!(output.contains("[Watch]"));
         assert!(output.contains("[Out MITM]"));
         assert!(output.contains("[In MITM]"));
+        assert!(scroll_target_exists(
+            &hit_map,
+            Some(ScrollTarget::TrafficProcessList),
+            100,
+            24
+        ));
+        assert!(scroll_target_exists(
+            &hit_map,
+            Some(ScrollTarget::TrafficEvents),
+            100,
+            24
+        ));
         assert!(hit_exists(
             &hit_map,
             Some(HitTarget::ProcessMonitor(0)),
