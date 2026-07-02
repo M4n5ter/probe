@@ -21,6 +21,41 @@ pub fn default_provider_registry(
     l7_mitm_capability: CapabilityState,
     transparent_interception_capability: CapabilityState,
 ) -> ProviderRegistry {
+    provider_registry_with_capture_descriptors(
+        config,
+        connection_enforcement_capability,
+        l7_mitm_capability,
+        transparent_interception_capability,
+        default_capture_provider_descriptors,
+    )
+}
+
+pub fn diagnostic_provider_registry(
+    config: &AgentConfig,
+    connection_enforcement_capability: CapabilityState,
+    l7_mitm_capability: CapabilityState,
+    transparent_interception_capability: CapabilityState,
+) -> ProviderRegistry {
+    provider_registry_with_capture_descriptors(
+        config,
+        connection_enforcement_capability,
+        l7_mitm_capability,
+        transparent_interception_capability,
+        diagnostic_capture_provider_descriptors,
+    )
+}
+
+fn provider_registry_with_capture_descriptors(
+    config: &AgentConfig,
+    connection_enforcement_capability: CapabilityState,
+    l7_mitm_capability: CapabilityState,
+    transparent_interception_capability: CapabilityState,
+    capture_provider_descriptors: impl FnOnce(
+        &AgentConfig,
+        EbpfHostProbeReport,
+        CapabilityState,
+    ) -> Vec<CaptureProviderDescriptor>,
+) -> ProviderRegistry {
     let ebpf_host = EbpfHostProbe::probe(&EbpfHostProbeConfig::default());
     let procfs_socket_resolver = attribution::ProcfsSocketResolver::new();
     let procfs_socket_capabilities = procfs_socket_resolver.capabilities();
@@ -32,7 +67,7 @@ pub fn default_provider_registry(
         TransparentInterceptionFlowClassifier::capability_from_resolver(&procfs_socket_resolver);
     let libssl_uprobe = libssl_uprobe::capability(config, &ebpf_host, &procfs_socket_attribution);
     ProviderRegistry::with_platform_probes(
-        default_capture_provider_descriptors(config, ebpf_host, procfs_socket_attribution),
+        capture_provider_descriptors(config, ebpf_host, procfs_socket_attribution),
         PlatformProbeResults {
             procfs_socket: procfs_socket_capabilities,
             connection_enforcement: connection_enforcement_capability,
@@ -57,10 +92,37 @@ pub fn libpcap_config_from_agent(config: &AgentConfig) -> LibpcapConfig {
     }
 }
 
+fn diagnostic_capture_provider_descriptors(
+    config: &AgentConfig,
+    ebpf_host: EbpfHostProbeReport,
+    procfs_socket_attribution: CapabilityState,
+) -> Vec<CaptureProviderDescriptor> {
+    capture_provider_descriptors(
+        config,
+        ebpf_host,
+        procfs_socket_attribution,
+        libpcap_diagnostic_provider_descriptor(),
+    )
+}
+
 fn default_capture_provider_descriptors(
     config: &AgentConfig,
     ebpf_host: EbpfHostProbeReport,
     procfs_socket_attribution: CapabilityState,
+) -> Vec<CaptureProviderDescriptor> {
+    capture_provider_descriptors(
+        config,
+        ebpf_host,
+        procfs_socket_attribution,
+        libpcap_provider_descriptor(&libpcap_config_from_agent(config)),
+    )
+}
+
+fn capture_provider_descriptors(
+    config: &AgentConfig,
+    ebpf_host: EbpfHostProbeReport,
+    procfs_socket_attribution: CapabilityState,
+    libpcap: CaptureProviderDescriptor,
 ) -> Vec<CaptureProviderDescriptor> {
     vec![
         CaptureProviderDescriptor::available(
@@ -80,8 +142,16 @@ fn default_capture_provider_descriptors(
             CaptureBackend::CaptureEventFeed,
             CaptureProviderBuilder::CaptureEventFeed,
         ),
-        libpcap_provider_descriptor(&libpcap_config_from_agent(config)),
+        libpcap,
     ]
+}
+
+fn libpcap_diagnostic_provider_descriptor() -> CaptureProviderDescriptor {
+    CaptureProviderDescriptor::unavailable(
+        CaptureBackend::Libpcap,
+        CaptureProviderBuilder::Libpcap,
+        "libpcap availability is verified by the running agent; TUI local diagnostics do not open capture devices",
+    )
 }
 
 fn ebpf_provider_descriptor(
@@ -426,6 +496,34 @@ mod tests {
         assert_eq!(
             capabilities.mode(CapabilityKind::TransparentInterception),
             RuntimeMode::Unavailable
+        );
+    }
+
+    #[test]
+    fn diagnostic_registry_does_not_open_libpcap_during_local_status_projection() {
+        let registry = diagnostic_provider_registry(
+            &AgentConfig::default(),
+            CapabilityState::unavailable(
+                CapabilityKind::ConnectionEnforcement,
+                "connection-level enforcement backend is not configured",
+            ),
+            CapabilityState::unavailable(CapabilityKind::L7Mitm, "not configured"),
+            CapabilityState::unavailable(
+                CapabilityKind::TransparentInterception,
+                "transparent interception backend is not configured",
+            ),
+        );
+
+        let libpcap = registry.capture_provider(CaptureBackend::Libpcap);
+
+        assert_eq!(libpcap.builder, CaptureProviderBuilder::Libpcap);
+        assert_eq!(libpcap.runtime_mode, RuntimeMode::Unavailable);
+        assert_eq!(libpcap.capability_mode, RuntimeMode::Unavailable);
+        assert!(
+            libpcap
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("do not open capture devices"))
         );
     }
 

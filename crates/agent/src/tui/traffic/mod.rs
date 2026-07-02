@@ -119,6 +119,22 @@ impl TrafficState {
         self.status = TrafficStatus::error(message);
     }
 
+    pub(crate) fn mark_admin_unavailable_with_diagnostics(
+        &mut self,
+        message: impl Into<String>,
+        diagnostics: TrafficRuntimeDiagnostics,
+    ) {
+        let message = message.into();
+        let diagnostic_message = diagnostics
+            .status_message(self.rows.is_empty())
+            .and_then(capture_diagnostic_warning_or_error_text);
+        self.runtime_diagnostics = Some(diagnostics);
+        self.status = TrafficStatus::error(match diagnostic_message {
+            Some(diagnostic_message) => format!("{message}; {diagnostic_message}"),
+            None => message,
+        });
+    }
+
     pub(crate) fn set_runtime_diagnostics(&mut self, diagnostics: TrafficRuntimeDiagnostics) {
         if self.status.kind != TrafficStatusKind::Error
             && let Some(message) = diagnostics.status_message(self.rows.is_empty())
@@ -204,6 +220,15 @@ impl TrafficState {
                     .selected_index
                     .saturating_sub(visible_rows.saturating_sub(1));
             }
+        }
+    }
+}
+
+fn capture_diagnostic_warning_or_error_text(message: CaptureDiagnosticMessage) -> Option<String> {
+    match message {
+        CaptureDiagnosticMessage::Info(_) => None,
+        CaptureDiagnosticMessage::Warning(message) | CaptureDiagnosticMessage::Error(message) => {
+            Some(message)
         }
     }
 }
@@ -373,6 +398,45 @@ mod tests {
 
         assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
         assert_eq!(traffic.status().text, "tail_events failed");
+    }
+
+    #[test]
+    fn admin_unavailable_can_keep_local_data_path_diagnostics() {
+        let mut traffic = TrafficState::default();
+
+        traffic.mark_admin_unavailable_with_diagnostics(
+            "tail_events failed",
+            TrafficRuntimeDiagnostics::from_capture_snapshot(fallback_capture_snapshot()),
+        );
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
+        assert!(traffic.status().text.contains("tail_events failed"));
+        assert!(traffic.status().text.contains("passive fallback occurred"));
+        assert!(
+            traffic
+                .data_path_diagnostic_lines()
+                .iter()
+                .any(|line| line == "provider candidates:")
+        );
+    }
+
+    #[test]
+    fn admin_unavailable_suppresses_plan_only_info_status() {
+        let mut traffic = TrafficState::default();
+
+        traffic.mark_admin_unavailable_with_diagnostics(
+            "tail_events failed",
+            TrafficRuntimeDiagnostics::from_capture_snapshot(active_mitm_bridge_capture_snapshot()),
+        );
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
+        assert_eq!(traffic.status().text, "tail_events failed");
+        assert!(
+            traffic
+                .data_path_diagnostic_lines()
+                .iter()
+                .any(|line| line == &format!("coverage: {MITM_PLAINTEXT_COVERAGE}"))
+        );
     }
 
     #[test]

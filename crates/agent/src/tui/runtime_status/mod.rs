@@ -1,5 +1,6 @@
 use std::{path::Path, time::Duration};
 
+use probe_config::AgentConfig;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -9,7 +10,12 @@ mod mitm_data_path;
 
 use crate::{
     admin::{AdminClientError, AdminRequest, send_admin_json_request_with_timeout},
-    status::{CaptureStatusSnapshot, EnforcementStatusSnapshot},
+    artifacts::project_runtime_artifact_paths,
+    runtime_composition::build_runtime_diagnostic_composition,
+    status::{
+        AgentStatusSnapshot, CaptureStatusSnapshot, EnforcementStatusSnapshot,
+        build_status_snapshot, collect_spool_status,
+    },
     tui::{
         controls::ControlId,
         copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL, MITM_QUICK_SETUP_APPLY},
@@ -33,6 +39,18 @@ pub(crate) async fn request_traffic_runtime_diagnostics(
     parse_traffic_runtime_diagnostics_response(&response)
 }
 
+pub(crate) fn local_traffic_runtime_diagnostics(
+    mut config: AgentConfig,
+) -> Result<TrafficRuntimeDiagnostics, LocalRuntimeStatusError> {
+    project_runtime_artifact_paths(&mut config);
+    let composition = build_runtime_diagnostic_composition(config)
+        .map_err(|error| LocalRuntimeStatusError::Runtime(error.into_parts().0))?;
+    let plan = composition.into_plan();
+    let snapshot = build_status_snapshot(&plan, collect_spool_status(&plan));
+    TrafficRuntimeDiagnostics::from_status_snapshot(snapshot)
+        .map_err(LocalRuntimeStatusError::Status)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrafficRuntimeDiagnostics {
     capture: CaptureDiagnostics,
@@ -46,6 +64,22 @@ impl TrafficRuntimeDiagnostics {
             capture: CaptureDiagnostics::new(capture),
             mitm: None,
         }
+    }
+
+    pub(crate) fn from_status_snapshot(
+        snapshot: AgentStatusSnapshot,
+    ) -> Result<Self, RuntimeStatusClientError> {
+        let AgentStatusSnapshot {
+            capture,
+            enforcement,
+            tls,
+            ..
+        } = snapshot;
+        let tls_materials = MitmTlsMaterialDiagnostics::from_tls_status_snapshot(tls);
+        Ok(Self {
+            capture: CaptureDiagnostics::new(capture),
+            mitm: MitmDiagnostics::from_enforcement(enforcement, Some(&tls_materials)),
+        })
     }
 
     pub(crate) fn status_message(&self, traffic_empty: bool) -> Option<CaptureDiagnosticMessage> {
@@ -199,6 +233,14 @@ pub(crate) enum RuntimeStatusClientError {
     Json(serde_json::Error),
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum LocalRuntimeStatusError {
+    #[error("local runtime plan error: {0}")]
+    Runtime(runtime::RuntimeError),
+    #[error("local runtime status error: {0}")]
+    Status(RuntimeStatusClientError),
+}
+
 fn parse_traffic_runtime_diagnostics_response(
     response: &Value,
 ) -> Result<TrafficRuntimeDiagnostics, RuntimeStatusClientError> {
@@ -279,7 +321,10 @@ mod tests {
             L7MitmClientTrustSnapshot, L7MitmPlaintextBridgeMode, L7MitmPlaintextBridgeSnapshot,
             L7MitmRuntimeSnapshot,
         },
-        status::enforcement_status_with_transparent_proxy_for_test,
+        status::{
+            build_status_snapshot, collect_spool_status,
+            enforcement_status_with_transparent_proxy_for_test,
+        },
         tcp_health::TcpHealthMode,
         tui::{
             controls::ControlId,
@@ -360,6 +405,65 @@ mod tests {
                 .iter()
                 .any(|line| line == &format!("apply: {MITM_QUICK_SETUP_APPLY}"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn local_status_snapshot_diagnostics_keep_passive_failures_and_mitm_action()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut config = AgentConfig::default();
+        config.storage.path = temp.path().join("spool");
+        let plan = RuntimePlan::build(
+            config,
+            &ProviderRegistry::new(
+                vec![
+                    CaptureProviderDescriptor::unavailable(
+                        probe_config::CaptureBackend::Ebpf,
+                        CaptureProviderBuilder::Ebpf,
+                        "capture.ebpf.object_path is not configured",
+                    ),
+                    CaptureProviderDescriptor::unavailable(
+                        probe_config::CaptureBackend::Libpcap,
+                        CaptureProviderBuilder::Libpcap,
+                        "libpcap is not available",
+                    ),
+                ],
+                test_platform_capabilities(),
+            ),
+        )?;
+        let snapshot = build_status_snapshot(&plan, collect_spool_status(&plan));
+
+        let diagnostics = TrafficRuntimeDiagnostics::from_status_snapshot(snapshot)?;
+
+        assert_eq!(
+            diagnostics.status_message(true),
+            Some(CaptureDiagnosticMessage::Error(format!(
+                "Capture unavailable: ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available; configure reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}: {}",
+                missing_mitm_quick_setup_action()
+            )))
+        );
+        assert!(diagnostics.detail_lines().iter().any(|line| {
+            line == &format!("quick setup: {}", missing_mitm_quick_setup_action())
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn local_runtime_diagnostics_entry_uses_runtime_status_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+        config.storage.path = temp.path().join("spool");
+
+        let diagnostics = local_traffic_runtime_diagnostics(config)?;
+
+        let lines = diagnostics.detail_lines();
+        assert!(lines.iter().any(|line| line == "selected: replay"));
+        assert!(lines.iter().any(|line| {
+            line == &format!("quick setup: {}", missing_mitm_quick_setup_action())
+        }));
         Ok(())
     }
 
@@ -1317,6 +1421,29 @@ mod tests {
                     .cloned(),
             );
         status
+    }
+
+    fn test_platform_capabilities() -> Vec<CapabilityState> {
+        vec![
+            CapabilityState::available(CapabilityKind::Http1),
+            CapabilityState::available(CapabilityKind::Sse),
+            CapabilityState::available(CapabilityKind::WebSocketHandoff),
+            CapabilityState::available(CapabilityKind::WebSocketFrame),
+            CapabilityState::available(CapabilityKind::CaptureEventFeed),
+            CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not configured"),
+            CapabilityState::available(CapabilityKind::DryRunEnforcement),
+            CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not configured"),
+            CapabilityState::unavailable(CapabilityKind::TransparentInterception, "not configured"),
+            CapabilityState::unavailable(
+                CapabilityKind::TransparentProcessClassifier,
+                "not configured",
+            ),
+            CapabilityState::unavailable(
+                CapabilityKind::TransparentFlowClassifier,
+                "not configured",
+            ),
+            CapabilityState::unavailable(CapabilityKind::L7Mitm, "not configured"),
+        ]
     }
 
     #[derive(Debug, Clone, Copy)]

@@ -4,7 +4,7 @@ use probe_core::CapabilityMatrix;
 use runtime::{ProviderRegistry, RuntimePlan, TransparentInterceptionExecutionPlan};
 
 use crate::{
-    capture_registry::default_provider_registry,
+    capture_registry::{default_provider_registry, diagnostic_provider_registry},
     connection_enforcement::{self, ConnectionEnforcementRuntime},
     error::AgentError,
     l7_mitm::{self, L7MitmRuntime},
@@ -74,6 +74,26 @@ pub(crate) fn build_runtime_composition_with_diagnostics(
     let (connection_enforcement, l7_mitm, transparent_interception) =
         execution_runtimes_for_config(&config);
     let registry = provider_registry_for_runtimes(
+        &config,
+        &connection_enforcement,
+        &l7_mitm,
+        &transparent_interception,
+    );
+    build_runtime_composition_from_registry(
+        config,
+        connection_enforcement,
+        l7_mitm,
+        transparent_interception,
+        registry,
+    )
+}
+
+pub(crate) fn build_runtime_diagnostic_composition(
+    config: AgentConfig,
+) -> Result<RuntimeComposition, RuntimeCompositionBuildError> {
+    let (connection_enforcement, l7_mitm, transparent_interception) =
+        execution_runtimes_for_config(&config);
+    let registry = diagnostic_provider_registry_for_runtimes(
         &config,
         &connection_enforcement,
         &l7_mitm,
@@ -167,6 +187,20 @@ fn provider_registry_for_runtimes(
     transparent_interception: &TransparentInterceptionRuntime,
 ) -> ProviderRegistry {
     default_provider_registry(
+        config,
+        connection_enforcement.capability(),
+        l7_mitm.capability(),
+        transparent_interception.capability(),
+    )
+}
+
+fn diagnostic_provider_registry_for_runtimes(
+    config: &AgentConfig,
+    connection_enforcement: &ConnectionEnforcementRuntime,
+    l7_mitm: &L7MitmRuntime,
+    transparent_interception: &TransparentInterceptionRuntime,
+) -> ProviderRegistry {
+    diagnostic_provider_registry(
         config,
         connection_enforcement.capability(),
         l7_mitm.capability(),

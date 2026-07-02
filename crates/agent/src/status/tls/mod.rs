@@ -1,5 +1,4 @@
 mod snapshot;
 
-pub(super) use snapshot::{
-    TlsMaterialSourceStatusSnapshot, TlsStatusSnapshot, material_source_status, tls_status,
-};
+pub(crate) use snapshot::TlsStatusSnapshot;
+pub(super) use snapshot::{TlsMaterialSourceStatusSnapshot, material_source_status, tls_status};

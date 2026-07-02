@@ -15,7 +15,9 @@ use super::mitm_setup::{
 use super::process_view::ProcessViewState;
 use super::processes::{ProcessCatalog, ProcessEntry, selector_for_exe_path};
 use super::runtime_attachment::RuntimeAttachment;
-use super::runtime_status::request_traffic_runtime_diagnostics;
+use super::runtime_status::{
+    local_traffic_runtime_diagnostics, request_traffic_runtime_diagnostics,
+};
 use super::traffic::TrafficState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -651,10 +653,18 @@ impl TuiApp {
             .active_socket_path()
             .map(PathBuf::from)
         else {
-            self.traffic.mark_admin_unavailable(format!(
+            let message = format!(
                 "No active agent admin socket is attached; {}",
                 self.runtime_agent_status()
-            ));
+            );
+            match local_traffic_runtime_diagnostics(self.config.clone()) {
+                Ok(diagnostics) => self
+                    .traffic
+                    .mark_admin_unavailable_with_diagnostics(message, diagnostics),
+                Err(error) => self
+                    .traffic
+                    .mark_admin_unavailable(format!("{message}; {error}")),
+            }
             self.status = StatusMessage::warning(self.traffic.status().text.clone());
             return;
         };
@@ -1651,6 +1661,31 @@ mod tests {
         };
         assert_eq!(path, &default_export_file_path());
         assert!(app.dirty());
+    }
+
+    #[tokio::test]
+    async fn traffic_refresh_without_admin_socket_keeps_local_data_path_diagnostics() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+        config.storage.path = temp.path().join("spool");
+        let mut app = TuiApp::new(
+            temp.path().join("agent.toml"),
+            config,
+            ProcessCatalog::default(),
+        );
+
+        app.refresh_traffic().await;
+
+        assert_eq!(app.status().kind, StatusKind::Warning);
+        assert!(app.status().text.contains("No active agent admin socket"));
+        assert!(app.status().text.contains("No agent runtime attached"));
+        assert!(
+            app.traffic()
+                .data_path_diagnostic_lines()
+                .iter()
+                .any(|line| line == "selected: replay")
+        );
     }
 
     fn test_app() -> TuiApp {

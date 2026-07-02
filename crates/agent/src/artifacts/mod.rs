@@ -45,6 +45,11 @@ pub(crate) fn hydrate_runtime_artifact_paths(
     Ok(())
 }
 
+pub(crate) fn project_runtime_artifact_paths(config: &mut AgentConfig) {
+    project_process_observation_object_path(config);
+    project_tls_uprobe_object_path(config);
+}
+
 pub(crate) fn normalize_embedded_artifact_paths_for_comparison(config: &mut AgentConfig) {
     normalize_path_if_embedded(
         &mut config.capture.ebpf.object_path,
@@ -127,6 +132,47 @@ fn materialize_embedded_ebpf_object_in(
 
     write_artifact_atomically(&directory, &path, bytes)?;
     Ok(path)
+}
+
+fn project_process_observation_object_path(config: &mut AgentConfig) {
+    project_process_observation_object_path_in(config, default_ebpf_artifact_directory());
+}
+
+fn project_process_observation_object_path_in(config: &mut AgentConfig, directory: PathBuf) {
+    if !config.capture.may_use_backend(CaptureBackend::Ebpf) {
+        return;
+    }
+    if config
+        .capture
+        .ebpf
+        .object_path
+        .as_ref()
+        .is_some_and(|path| !path.as_os_str().is_empty())
+    {
+        return;
+    }
+    config.capture.ebpf.object_path =
+        Some(directory.join(EbpfObjectArtifact::ProcessObservation.file_name()));
+}
+
+fn project_tls_uprobe_object_path(config: &mut AgentConfig) {
+    project_tls_uprobe_object_path_in(config, default_ebpf_artifact_directory());
+}
+
+fn project_tls_uprobe_object_path_in(config: &mut AgentConfig, directory: PathBuf) {
+    let instrumentation = &mut config.tls.plaintext.instrumentation;
+    if !instrumentation.enabled {
+        return;
+    }
+    if instrumentation
+        .libssl_uprobe_object_path
+        .as_ref()
+        .is_some_and(|path| !path.as_os_str().is_empty())
+    {
+        return;
+    }
+    instrumentation.libssl_uprobe_object_path =
+        Some(directory.join(EbpfObjectArtifact::TlsPlaintext.file_name()));
 }
 
 fn normalize_path_if_embedded(path: &mut Option<PathBuf>, artifact: EbpfObjectArtifact) {
@@ -319,6 +365,31 @@ fn process_observation_hydration_materializes_default_object() -> Result<(), Art
 
 #[cfg(test)]
 #[test]
+fn process_observation_projection_sets_path_without_materializing_object() {
+    let (temp, directory) = temp_artifact_directory();
+    let mut config = AgentConfig::default();
+
+    project_process_observation_object_path_in(&mut config, directory.clone());
+
+    let path = config
+        .capture
+        .ebpf
+        .object_path
+        .as_ref()
+        .expect("process observation object path should be projected");
+    assert!(path.starts_with(&directory));
+    assert!(!directory.exists());
+    assert!(
+        temp.path()
+            .read_dir()
+            .expect("temp dir should be readable")
+            .next()
+            .is_none()
+    );
+}
+
+#[cfg(test)]
+#[test]
 fn process_observation_hydration_ignores_non_ebpf_capture_selection() -> Result<(), ArtifactError> {
     let (_temp, directory) = temp_artifact_directory();
     let mut config = AgentConfig::default();
@@ -442,6 +513,33 @@ fn tls_uprobe_hydration_keeps_explicit_object_path() -> Result<(), ArtifactError
         Some(path)
     );
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn tls_uprobe_projection_sets_path_without_materializing_object() {
+    let (temp, directory) = temp_artifact_directory();
+    let mut config = AgentConfig::default();
+    config.tls.plaintext.instrumentation.enabled = true;
+
+    project_tls_uprobe_object_path_in(&mut config, directory.clone());
+
+    let path = config
+        .tls
+        .plaintext
+        .instrumentation
+        .libssl_uprobe_object_path
+        .as_ref()
+        .expect("TLS uprobe object path should be projected");
+    assert!(path.starts_with(&directory));
+    assert!(!directory.exists());
+    assert!(
+        temp.path()
+            .read_dir()
+            .expect("temp dir should be readable")
+            .next()
+            .is_none()
+    );
 }
 
 #[cfg(test)]

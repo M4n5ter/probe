@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::{
     l7_mitm::{L7MitmPlaintextBridgeMode, L7MitmRuntimeSnapshot},
-    status::{EnforcementStatusMode, EnforcementStatusSnapshot},
+    status::{EnforcementStatusMode, EnforcementStatusSnapshot, TlsStatusSnapshot},
     tcp_health::{TcpHealthMode, TcpHealthSnapshot},
     transparent_interception::{TransparentProxyRuntimeMode, TransparentProxyRuntimeSnapshot},
     tui::copy::{
@@ -379,6 +379,21 @@ pub(super) struct MitmTlsMaterialDiagnostics {
 }
 
 impl MitmTlsMaterialDiagnostics {
+    pub(super) fn from_tls_status_snapshot(status: TlsStatusSnapshot) -> Self {
+        Self {
+            materials: status
+                .materials
+                .into_iter()
+                .map(|material| MitmTlsMaterialSource {
+                    kind: material.kind,
+                    path: material.path,
+                    mode: material.source.mode,
+                    reason: material.source.reason,
+                })
+                .collect(),
+        }
+    }
+
     pub(super) fn from_tls_status(value: serde_json::Value) -> Result<Self, serde_json::Error> {
         let status = serde_json::from_value::<TlsStatusWire>(value)?;
         Ok(Self {

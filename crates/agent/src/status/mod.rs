@@ -23,6 +23,7 @@ pub(crate) use snapshot::{
     build_status_snapshot_with_runtime,
 };
 pub(crate) use spool::{collect_running_spool_status, collect_spool_status};
+pub(crate) use tls::TlsStatusSnapshot;
 
 #[cfg(test)]
 pub(crate) fn enforcement_status_with_transparent_proxy_for_test(
