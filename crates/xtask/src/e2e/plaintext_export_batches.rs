@@ -1,6 +1,6 @@
-use std::{collections::BTreeSet, path::Path};
+use std::{collections::BTreeSet, fs, os::unix::fs::PermissionsExt, path::Path};
 
-use exporter::CompressionCodec;
+use exporter::{CompressionCodec, FileBatchRecord, FileBatchRecordKind};
 use probe_config::CompressionCodecName;
 use probe_core::{
     CaptureProviderKind, CaptureSource, EventEnvelope, EventKind, SpoolPayloadSchema,
@@ -27,6 +27,163 @@ pub(crate) fn expected_batch_id(
     last_sequence: u64,
 ) -> String {
     format!("{agent_id}:{sink_id}:{first_sequence}-{last_sequence}")
+}
+
+pub(crate) fn assert_file_export_batch_records(
+    path: &Path,
+    agent_id: &str,
+    sink_id: &str,
+    codec: CompressionCodec,
+    label: &str,
+) -> Result<(Vec<FileBatchRecord>, Vec<BatchEnvelope>), Box<dyn std::error::Error>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(e2e_error(format!("{label} created {} as a symlink", path.display())).into());
+    }
+    if !metadata.file_type().is_file() {
+        return Err(e2e_error(format!(
+            "{label} created {} as a non-regular file",
+            path.display()
+        ))
+        .into());
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        return Err(e2e_error(format!(
+            "{label} created {} with mode {mode:o}, expected 600",
+            path.display()
+        ))
+        .into());
+    }
+    let records = read_file_records(path, label)?;
+    let batches = decode_and_assert_file_records(&records, agent_id, sink_id, codec, label)?;
+    Ok((records, batches))
+}
+
+fn read_file_records(
+    path: &Path,
+    label: &str,
+) -> Result<Vec<FileBatchRecord>, Box<dyn std::error::Error>> {
+    let contents = fs::read_to_string(path)?;
+    if contents.is_empty() {
+        return Err(e2e_error(format!("{label} wrote no records")).into());
+    }
+    if !contents.ends_with('\n') {
+        return Err(e2e_error(format!("{label} record file did not end with a newline")).into());
+    }
+    contents
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            serde_json::from_str::<FileBatchRecord>(line).map_err(|source| {
+                e2e_error(format!(
+                    "{label} record line {} was invalid JSON: {source}",
+                    index + 1
+                ))
+                .into()
+            })
+        })
+        .collect()
+}
+
+fn decode_and_assert_file_records(
+    records: &[FileBatchRecord],
+    agent_id: &str,
+    sink_id: &str,
+    codec: CompressionCodec,
+    label: &str,
+) -> Result<Vec<BatchEnvelope>, Box<dyn std::error::Error>> {
+    records
+        .iter()
+        .map(|record| {
+            if record.kind != FileBatchRecordKind::ProtobufBatch {
+                return Err(e2e_error(format!(
+                    "{label} record {} had unexpected kind {:?}",
+                    record.batch_id, record.kind
+                ))
+                .into());
+            }
+            if record.agent_id != agent_id {
+                return Err(e2e_error(format!(
+                    "{label} record {} carried unexpected agent id {}",
+                    record.batch_id, record.agent_id
+                ))
+                .into());
+            }
+            if record.codec != codec {
+                return Err(e2e_error(format!(
+                    "{label} record {} used codec {:?}, expected {:?}",
+                    record.batch_id, record.codec, codec
+                ))
+                .into());
+            }
+            let payload = record.decode_payload()?;
+            let batch = BatchEnvelope::decode_from_slice(&payload)?;
+            assert_file_record_matches_batch(record, &batch, agent_id, sink_id, codec, label)?;
+            Ok(batch)
+        })
+        .collect()
+}
+
+fn assert_file_record_matches_batch(
+    record: &FileBatchRecord,
+    batch: &BatchEnvelope,
+    agent_id: &str,
+    sink_id: &str,
+    codec: CompressionCodec,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if batch.codec != codec.wire_name() {
+        return Err(e2e_error(format!(
+            "{label} batch {} carried codec {}, expected {}",
+            batch.batch_id,
+            batch.codec,
+            codec.wire_name()
+        ))
+        .into());
+    }
+    if batch.batch_id != record.batch_id {
+        return Err(e2e_error(format!(
+            "{label} record id {} did not match decoded batch id {}",
+            record.batch_id, batch.batch_id
+        ))
+        .into());
+    }
+    if batch.events.len() != record.event_count {
+        return Err(e2e_error(format!(
+            "{label} record {} declared {} events, decoded {}",
+            record.batch_id,
+            record.event_count,
+            batch.events.len()
+        ))
+        .into());
+    }
+    let Some(first_sequence) = batch.events.first().map(|event| event.sequence) else {
+        return Err(e2e_error(format!(
+            "{label} record {} decoded to an empty batch",
+            record.batch_id
+        ))
+        .into());
+    };
+    let last_sequence = batch
+        .events
+        .last()
+        .map(|event| event.sequence)
+        .expect("non-empty batch has a last event");
+    let expected_batch_id = expected_batch_id(agent_id, sink_id, first_sequence, last_sequence);
+    if (
+        record.first_sequence,
+        record.last_sequence,
+        record.batch_id.as_str(),
+    ) != (first_sequence, last_sequence, expected_batch_id.as_str())
+    {
+        return Err(e2e_error(format!(
+            "{label} record {} metadata did not match decoded batch range {first_sequence}-{last_sequence}",
+            record.batch_id
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) fn assert_batch_sequence_contract(

@@ -93,6 +93,12 @@ cargo run -p agent --locked -- replay \
   --agent-id probe-replay-demo
 ```
 
+运行不需要特权的单机验证路径：
+
+```bash
+cargo run -p xtask --locked -- validate-local
+```
+
 运行非特权 E2E baseline：
 
 ```bash
@@ -521,16 +527,20 @@ live run 和 exporter cursor 需要 Fjall spool：
 path = "/var/lib/traffic-probe/spool"
 
 [storage.retention.ingress]
+max_records = 100000
 sweep_interval_ms = 1000
 prune_batch_limit = 1024
 
 [storage.retention.export]
+max_records = 100000
 sweep_interval_ms = 1000
 prune_batch_limit = 1024
 ```
 
 ingress recovery 会在打开新 capture provider 前 replay 已持久化的 capture event。
 active parser state 不会序列化，因此 recovery 是保守能力，并在 capability model 中报告为 degraded。
+exporter ACK 只推进 per-sink cursor；export queue 的物理删除由
+`storage.retention.export` 控制。
 
 ### Export
 
@@ -924,7 +934,8 @@ cargo run -p agent -- admin \
 
 `tail-events` 是 durable export queue 上的有界、非 mutating view。它面向自动化返回完整
 event envelope，并只推进响应中的 `next_after_sequence`；它不会 ack exporter sink cursor。
-超出 byte budget 的大事件会以 omission metadata 表达，而不是无界展开到响应中。
+它只能读取仍被 `storage.retention.export` 保留的 records。超出 byte budget 的大事件会以
+omission metadata 表达，而不是无界展开到响应中。
 `debug-dump` 复用在线 status snapshot，并附带 admin protocol metadata。它包含
 runtime plan/status 字段和本地路径，但不包含 raw config 文本或 secret material 字节。
 
@@ -983,8 +994,9 @@ webhook path，不需要 live-capture 权限。
 
 E2E profile 按 capability claim 组织：
 
-- `baseline` 以普通用户运行，覆盖 replay、plaintext feed、gap/loss event、
-  HTTP/SSE/WebSocket、webhook/file/Unix HTTP export，以及一次性和后台 polling remote policy input。
+- `baseline` 以普通用户运行，覆盖 local validation、replay、plaintext feed、gap/loss event、
+  HTTP/SSE/WebSocket、webhook/file/Unix HTTP export，以及一次性和后台 polling remote
+  policy input。
 - `live-core` 需要 root 或 CAP_NET_RAW，覆盖 libpcap loopback、单项和组合 admin reload、
   socket destroy 和 TLS key log/session-secret material。
 - `process-ebpf` 需要 root/bpffs，覆盖 eBPF process observation 和真实 process
@@ -1009,6 +1021,12 @@ cargo run -p xtask --locked -- e2e-suite --inventory-json
 输出每个 profile 的权限集合、capability 并集、说明和展开后的 case 列表。
 `--inventory-json` 从同一个 registry 输出 schema version 2：capability
 catalog 带 category metadata，case coverage 和 profile coverage 都从单一事实源派生。
+
+运行单机验证路径：
+
+```bash
+cargo run -p xtask --locked -- validate-local
+```
 
 运行非特权 baseline：
 

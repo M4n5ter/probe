@@ -3,8 +3,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use capture::{CaptureEvent, PlaintextChunk, PlaintextConnection, PlaintextEvent, PlaintextSource};
 use probe_config::{AgentConfig, CaptureSelection, PolicyConfig, PolicySourceConfig};
-use probe_core::{CaptureProviderKind, CaptureSource, Direction, EventEnvelope};
+use probe_core::{
+    AddressPort, CaptureProviderKind, CaptureSource, Direction, EventEnvelope, FlowContext,
+    FlowIdentity, Gap, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+};
 
 pub(crate) const PLAINTEXT_FEED_EVENT_COUNT: usize = 3;
 pub(crate) const PLAINTEXT_FEED_EXPORT_EVENT_COUNT: usize = 4;
@@ -44,7 +48,8 @@ impl PlaintextFeedCase {
         &self,
         records: impl IntoIterator<Item = PlaintextFeedRecord>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let connection = self.connection_json();
+        let flow = self.flow_context();
+        let connection = connection_json(self.connection_id, &flow);
         let mut content = String::new();
         for (index, record) in records.into_iter().enumerate() {
             let monotonic_ns = u64::try_from(index)
@@ -55,6 +60,23 @@ impl PlaintextFeedCase {
             content.push('\n');
         }
         Ok(content)
+    }
+
+    pub(crate) fn capture_events(
+        &self,
+        records: impl IntoIterator<Item = PlaintextFeedRecord>,
+    ) -> Vec<CaptureEvent> {
+        let flow = self.flow_context();
+        records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| {
+                let monotonic_ns = u64::try_from(index)
+                    .unwrap_or(u64::MAX - 1)
+                    .saturating_add(1);
+                self.capture_event(flow.clone(), monotonic_ns, record)
+            })
+            .collect()
     }
 
     pub(crate) fn agent_config_with_policy(
@@ -104,6 +126,10 @@ impl PlaintextFeedCase {
 
     pub(crate) fn expected_flow_id(&self) -> String {
         format!("external_plaintext_feed:{}", self.connection_id)
+    }
+
+    pub(crate) fn process_exe_path(&self) -> &'static str {
+        self.flow.process.exe_path
     }
 
     pub(crate) fn matches_export_flow(&self, envelope: &EventEnvelope) -> bool {
@@ -160,34 +186,91 @@ impl PlaintextFeedCase {
         }
     }
 
-    fn connection_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "connection_id": self.connection_id,
-            "local": {
-                "address": "127.0.0.1",
-                "port": self.flow.local_port,
+    fn capture_event(
+        &self,
+        flow: FlowContext,
+        monotonic_ns: u64,
+        record: PlaintextFeedRecord,
+    ) -> CaptureEvent {
+        let timestamp = feed_event_timestamp(monotonic_ns);
+        match record {
+            PlaintextFeedRecord::ConnectionOpened => PlaintextEvent::connection_opened(
+                PlaintextSource::ExternalPlaintextFeed,
+                PlaintextConnection::new(timestamp, flow),
+            )
+            .into(),
+            PlaintextFeedRecord::Bytes {
+                direction,
+                stream_offset,
+                bytes,
+            } => PlaintextEvent::bytes(
+                PlaintextSource::ExternalPlaintextFeed,
+                PlaintextChunk::new(timestamp, flow, direction, bytes)
+                    .with_stream_offset(stream_offset),
+            )
+            .into(),
+            PlaintextFeedRecord::Gap {
+                direction,
+                expected_offset,
+                next_offset,
+                reason,
+            } => PlaintextEvent::gap(
+                PlaintextSource::ExternalPlaintextFeed,
+                capture::PlaintextGap::new(
+                    timestamp,
+                    flow,
+                    Gap {
+                        direction,
+                        expected_offset,
+                        next_offset,
+                        reason: reason.to_string(),
+                    },
+                ),
+            )
+            .into(),
+            PlaintextFeedRecord::ConnectionClosed => PlaintextEvent::connection_closed(
+                PlaintextSource::ExternalPlaintextFeed,
+                PlaintextConnection::new(timestamp, flow),
+            )
+            .into(),
+        }
+    }
+
+    fn flow_context(&self) -> FlowContext {
+        let process = ProcessContext {
+            identity: ProcessIdentity {
+                pid: self.flow.process.pid,
+                tgid: self.flow.process.pid,
+                start_time_ticks: self.flow.process.start_time_ticks,
+                boot_id: "boot".to_string(),
+                exe_path: self.flow.process.exe_path.to_string(),
+                cmdline_hash: self.flow.process.cmdline_hash.to_string(),
+                uid: 1000,
+                gid: 1000,
+                cgroup: None,
+                systemd_service: None,
+                container_id: None,
+                runtime_hint: None,
             },
-            "remote": {
-                "address": "127.0.0.1",
-                "port": self.flow.remote_port,
+            name: self.flow.process.name.to_string(),
+            cmdline: vec![self.flow.process.name.to_string()],
+        };
+        FlowContext {
+            id: FlowIdentity(self.expected_flow_id()),
+            process,
+            local: AddressPort {
+                address: "127.0.0.1".to_string(),
+                port: self.flow.local_port,
             },
-            "protocol": "tcp",
-            "start_monotonic_ns": 1,
-            "socket_cookie": self.flow.socket_cookie,
-            "attribution_confidence": 100,
-            "process": {
-                "pid": self.flow.process.pid,
-                "tgid": self.flow.process.pid,
-                "start_time_ticks": self.flow.process.start_time_ticks,
-                "boot_id": "boot",
-                "exe_path": self.flow.process.exe_path,
-                "cmdline_hash": self.flow.process.cmdline_hash,
-                "uid": 1000,
-                "gid": 1000,
-                "name": self.flow.process.name,
-                "cmdline": [self.flow.process.name],
+            remote: AddressPort {
+                address: "127.0.0.1".to_string(),
+                port: self.flow.remote_port,
             },
-        })
+            protocol: TransportProtocol::Tcp,
+            start_monotonic_ns: 1,
+            socket_cookie: Some(self.flow.socket_cookie),
+            attribution_confidence: 100,
+        }
     }
 }
 
@@ -325,6 +408,18 @@ end
 
     pub(crate) fn expected_policy_version(&self) -> String {
         format!("{}@{}", self.policy_id, self.policy_version)
+    }
+
+    pub(crate) fn capture_events(&self) -> Vec<CaptureEvent> {
+        self.feed.capture_events([
+            PlaintextFeedRecord::connection_opened(),
+            PlaintextFeedRecord::bytes(Direction::Outbound, 0, self.request_bytes()),
+            PlaintextFeedRecord::connection_closed(),
+        ])
+    }
+
+    pub(crate) fn process_exe_path(&self) -> &'static str {
+        self.feed.process_exe_path()
     }
 }
 
@@ -496,9 +591,116 @@ impl PlaintextPolicy {
     }
 }
 
-fn feed_timestamp(monotonic_ns: u64) -> serde_json::Value {
+fn connection_json(connection_id: &str, flow: &FlowContext) -> serde_json::Value {
     serde_json::json!({
-        "monotonic_ns": monotonic_ns,
-        "wall_time_unix_ns": i64::try_from(monotonic_ns).unwrap_or(i64::MAX),
+        "connection_id": connection_id,
+        "local": {
+            "address": &flow.local.address,
+            "port": flow.local.port,
+        },
+        "remote": {
+            "address": &flow.remote.address,
+            "port": flow.remote.port,
+        },
+        "protocol": "tcp",
+        "start_monotonic_ns": flow.start_monotonic_ns,
+        "socket_cookie": flow.socket_cookie,
+        "attribution_confidence": flow.attribution_confidence,
+        "process": {
+            "pid": flow.process.identity.pid,
+            "tgid": flow.process.identity.tgid,
+            "start_time_ticks": flow.process.identity.start_time_ticks,
+            "boot_id": &flow.process.identity.boot_id,
+            "exe_path": &flow.process.identity.exe_path,
+            "cmdline_hash": &flow.process.identity.cmdline_hash,
+            "uid": flow.process.identity.uid,
+            "gid": flow.process.identity.gid,
+            "name": &flow.process.name,
+            "cmdline": &flow.process.cmdline,
+        },
     })
+}
+
+fn feed_timestamp(monotonic_ns: u64) -> serde_json::Value {
+    let timestamp = feed_event_timestamp(monotonic_ns);
+    serde_json::json!({
+        "monotonic_ns": timestamp.monotonic_ns,
+        "wall_time_unix_ns": timestamp.wall_time_unix_ns,
+    })
+}
+
+fn feed_event_timestamp(monotonic_ns: u64) -> Timestamp {
+    Timestamp {
+        monotonic_ns,
+        wall_time_unix_ns: i64::try_from(monotonic_ns).unwrap_or(i64::MAX),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_events_render_plaintext_feed_capture_event_contract() {
+        let scenario = PlaintextFeedScenario::new(
+            PlaintextScenarioIds::new(
+                "test-agent",
+                "test-config",
+                "test-policy",
+                "test-policy-version",
+                "test-conn",
+            ),
+            PlaintextHttpRequest::get("/test", "test.example"),
+            PlaintextPolicy::alerting("observed "),
+        );
+
+        let events = scenario.capture_events();
+
+        assert_eq!(events.len(), PLAINTEXT_FEED_EVENT_COUNT);
+        let CaptureEvent::ConnectionOpened {
+            timestamp,
+            flow,
+            origin,
+        } = &events[0]
+        else {
+            panic!("first default plaintext event should open the connection");
+        };
+        assert_eq!(timestamp.monotonic_ns, 1);
+        assert_eq!(timestamp.wall_time_unix_ns, 1);
+        assert_eq!(origin.source(), CaptureSource::ExternalPlaintextFeed);
+        assert_eq!(origin.provider(), CaptureProviderKind::Plaintext);
+        assert_eq!(flow.id.0, scenario.expected_flow_id());
+        assert_eq!(flow.process.identity.exe_path, scenario.process_exe_path());
+
+        let CaptureEvent::Bytes(bytes) = &events[1] else {
+            panic!("second default plaintext event should carry request bytes");
+        };
+        assert_eq!(bytes.timestamp.monotonic_ns, 2);
+        assert_eq!(bytes.timestamp.wall_time_unix_ns, 2);
+        assert_eq!(bytes.origin.source(), CaptureSource::ExternalPlaintextFeed);
+        assert_eq!(bytes.origin.provider(), CaptureProviderKind::Plaintext);
+        assert_eq!(bytes.direction, Direction::Outbound);
+        assert_eq!(bytes.stream_offset, 0);
+        assert_eq!(bytes.bytes.as_ref(), scenario.request_bytes().as_slice());
+        assert_eq!(bytes.flow.id.0, scenario.expected_flow_id());
+        assert_eq!(
+            bytes.flow.process.identity.exe_path,
+            scenario.process_exe_path()
+        );
+
+        let CaptureEvent::ConnectionClosed {
+            timestamp,
+            flow,
+            origin,
+        } = &events[2]
+        else {
+            panic!("third default plaintext event should close the connection");
+        };
+        assert_eq!(timestamp.monotonic_ns, 3);
+        assert_eq!(timestamp.wall_time_unix_ns, 3);
+        assert_eq!(origin.source(), CaptureSource::ExternalPlaintextFeed);
+        assert_eq!(origin.provider(), CaptureProviderKind::Plaintext);
+        assert_eq!(flow.id.0, scenario.expected_flow_id());
+        assert_eq!(flow.process.identity.exe_path, scenario.process_exe_path());
+    }
 }

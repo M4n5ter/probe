@@ -75,6 +75,7 @@ const COMMANDS: &[XtaskCommand] = &[
     XtaskCommand::new("check-all", run_check_all),
     XtaskCommand::new("check-ebpf", ebpf::run_check),
     XtaskCommand::new("ebpf-build", ebpf::run_build),
+    XtaskCommand::new("validate-local", e2e::run_local_validation),
     XtaskCommand::with_args("e2e-suite", e2e::run_suite),
 ];
 

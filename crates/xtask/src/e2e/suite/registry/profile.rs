@@ -49,6 +49,7 @@ const E2E_PROFILES: &[E2eProfile] = &[
             "e2e-sse-plaintext-feed",
             "e2e-gap-plaintext-feed",
             "e2e-capture-loss-event-feed",
+            "e2e-local-validation",
             "e2e-websocket-plaintext-feed",
             "e2e-webhook-exporter",
             "e2e-file-exporter",

@@ -12,6 +12,7 @@ mod harness;
 mod libpcap_loopback;
 mod libpcap_websocket_loopback;
 mod linux_socket_destroy_enforcement;
+mod local_validation;
 mod loopback;
 mod mitm_plaintext_bridge;
 mod outcome;
@@ -42,5 +43,6 @@ mod webhook_receiver;
 mod websocket_expectations;
 mod websocket_plaintext_feed;
 
+pub(crate) use local_validation::run as run_local_validation;
 pub(crate) use outcome::E2eOutcome;
 pub(crate) use suite::{case_names, run as run_suite, run_case_by_name};

@@ -16,10 +16,8 @@ use storage::ExportSpool;
 use tokio::sync::Notify;
 
 use super::{
-    ExportDrainError, ExportDrainFailureReason,
-    cleanup::prune_export_acknowledged_prefix_for_sinks,
-    mode::SinkDrainMode,
-    target::{drain_export_sink_with_mode, finish_export_sink_drain},
+    ExportDrainError, ExportDrainFailureReason, mode::SinkDrainMode,
+    target::drain_export_sink_with_mode,
 };
 use crate::tls_material::FilesystemTlsMaterialStore;
 
@@ -373,17 +371,13 @@ async fn drain_export_sinks_once(
             }
         }
     }
-    let drain_result = if failures.is_empty() {
+    if failures.is_empty() {
         Ok(())
     } else {
         Err(ExportDrainError::MultipleSinksFailed {
             failures: failures.join("; "),
         })
-    };
-    finish_export_sink_drain(
-        drain_result,
-        prune_export_acknowledged_prefix_for_sinks(spool, &config.sinks),
-    )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -566,7 +560,14 @@ mod tests {
             request_header(&requests[1], "idempotency-key"),
             Some(export_batch_id("agent-1", "worker", 2, 2))
         );
-        assert!(spool.read_export_batch("late", 10)?.is_empty());
+        assert_eq!(
+            spool
+                .read_export_batch("late", 10)?
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         fs::remove_dir_all(temp)?;
         Ok(())
     }

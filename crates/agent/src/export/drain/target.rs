@@ -14,7 +14,6 @@ use storage::ExportSpool;
 use super::{
     ExportDrainError,
     batch::{EXPORT_BATCH_LIMIT, drain_export_sink_from_batch, export_batch_from_events},
-    cleanup::prune_export_acknowledged_prefix_for_sinks,
     mode::{SinkDrainMode, duration_millis},
 };
 use crate::tls_material::{FilesystemTlsMaterialStore, TlsMaterialFileStore};
@@ -44,7 +43,7 @@ pub(crate) async fn drain_planned_sinks_with_webhook_connection(
     tls_material_store: &TlsMaterialStorePlan,
     webhook_connection: WebhookConnectionOptions,
 ) -> Result<(), ExportDrainError> {
-    let result = drain_export_sinks_with_mode(
+    drain_export_sinks_with_mode(
         spool,
         agent_id,
         &export.sinks,
@@ -52,11 +51,7 @@ pub(crate) async fn drain_planned_sinks_with_webhook_connection(
         SinkDrainMode::UntilEmpty,
         webhook_connection,
     )
-    .await;
-    finish_export_sink_drain(
-        result,
-        prune_export_acknowledged_prefix_for_sinks(spool, &export.sinks),
-    )
+    .await
 }
 
 pub async fn drain_replay_webhook(
@@ -132,20 +127,6 @@ pub(super) async fn drain_export_sinks_with_mode(
         Err(ExportDrainError::MultipleSinksFailed {
             failures: failures.join("; "),
         })
-    }
-}
-
-pub(super) fn finish_export_sink_drain(
-    drain_result: Result<(), ExportDrainError>,
-    cleanup_result: Result<(), ExportDrainError>,
-) -> Result<(), ExportDrainError> {
-    match (drain_result, cleanup_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(drain_error), Ok(())) => Err(drain_error),
-        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(drain_error), Err(cleanup_error)) => Err(ExportDrainError::MultipleSinksFailed {
-            failures: format!("{drain_error}; export queue cleanup: {cleanup_error}"),
-        }),
     }
 }
 
@@ -787,7 +768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_tail_drain_ignores_worker_batch_quota_and_runs_bounded_cleanup()
+    async fn planned_tail_drain_ignores_worker_batch_quota_without_pruning_queue()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = temp_path("planned-tail-drain");
         let spool = FjallSpool::open(&temp)?;
@@ -823,7 +804,7 @@ mod tests {
                 .iter()
                 .map(|event| event.sequence)
                 .collect::<Vec<_>>(),
-            vec![event_count]
+            (1..=10).collect::<Vec<_>>()
         );
         let requests = server.join_requests()?;
         assert_eq!(requests.len(), 2);

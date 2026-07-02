@@ -102,6 +102,12 @@ cargo run -p agent --locked -- replay \
   --agent-id probe-replay-demo
 ```
 
+Run the single-machine validation path without special privileges:
+
+```bash
+cargo run -p xtask --locked -- validate-local
+```
+
 Run the non-privileged E2E baseline:
 
 ```bash
@@ -559,10 +565,12 @@ Live runs and exporter cursors need a Fjall spool:
 path = "/var/lib/traffic-probe/spool"
 
 [storage.retention.ingress]
+max_records = 100000
 sweep_interval_ms = 1000
 prune_batch_limit = 1024
 
 [storage.retention.export]
+max_records = 100000
 sweep_interval_ms = 1000
 prune_batch_limit = 1024
 ```
@@ -570,6 +578,8 @@ prune_batch_limit = 1024
 Ingress recovery replays persisted capture events before opening a new capture
 provider. Active parser state is not serialized, so recovery is conservative and
 reported as degraded in the capability model.
+Exporter ACKs advance per-sink cursors only; physical export queue deletion is
+controlled by `storage.retention.export`.
 
 ### Export
 
@@ -1023,8 +1033,9 @@ cargo run -p agent -- admin \
 `tail-events` is a bounded, non-mutating view over the durable export queue. It
 returns complete event envelopes for automation and advances only the response
 cursor (`next_after_sequence`); it does not acknowledge exporter sink cursors.
-Large records are omitted with explicit omission metadata rather than expanded
-without a byte budget.
+It can only read records still retained by `storage.retention.export`. Large
+records are omitted with explicit omission metadata rather than expanded without
+a byte budget.
 `debug-dump` reuses the online status snapshot and adds admin protocol metadata.
 It includes runtime plan/status fields and local paths, but not raw config text
 or secret material bytes.
@@ -1087,9 +1098,9 @@ and optional webhook path without live-capture privileges.
 
 E2E profiles are organized around capability claims:
 
-- `baseline` runs as a normal user and covers replay, plaintext feed,
-  gap/loss events, HTTP/SSE/WebSocket, webhook/file/Unix HTTP export, and
-  one-shot plus polled remote policy inputs.
+- `baseline` runs as a normal user and covers local validation, replay,
+  plaintext feed, gap/loss events, HTTP/SSE/WebSocket, webhook/file/Unix HTTP
+  export, and one-shot plus polled remote policy inputs.
 - `live-core` needs root or CAP_NET_RAW and covers libpcap loopback, single and
   composite admin reload, socket destroy, and TLS key log/session-secret
   material.
@@ -1119,6 +1130,12 @@ cargo run -p xtask --locked -- e2e-suite --inventory-json
 union, description, and expanded case list. `--inventory-json` exposes schema
 version 2 from the same registry: capability catalog entries include category
 metadata, and per-case plus per-profile coverage are derived from one source.
+
+Run the single-machine validation path:
+
+```bash
+cargo run -p xtask --locked -- validate-local
+```
 
 Run the non-privileged baseline:
 

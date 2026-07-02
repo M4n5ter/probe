@@ -98,6 +98,11 @@ define_e2e_capabilities! {
         label: "plaintext feed",
         category: CaptureInput,
     },
+    CaptureEventFeed => {
+        id: "capture_event_feed",
+        label: "capture event feed",
+        category: CaptureInput,
+    },
     CaptureLossEvent => {
         id: "capture_loss_event",
         label: "capture loss event",
@@ -171,6 +176,11 @@ define_e2e_capabilities! {
     AdminReload => {
         id: "admin_reload",
         label: "admin reload",
+        category: Admin,
+    },
+    AdminTail => {
+        id: "admin_tail",
+        label: "admin event tail",
         category: Admin,
     },
     SocketDestroyEnforcement => {

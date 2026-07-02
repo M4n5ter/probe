@@ -53,16 +53,16 @@ read_timeout_ms = 1000
 path = "/var/lib/traffic-probe/spool"
 
 [storage.retention.ingress]
-# Retention limits are optional. Leave unset for unbounded retention and rely
-# on external disk management.
+# The example uses bounded local retention so a long-running development agent
+# does not grow the local spool forever. Tune these limits for production.
 # max_age_ms = 86400000
-# max_records = 1000000
+max_records = 100000
 sweep_interval_ms = 1000
 prune_batch_limit = 1024
 
 [storage.retention.export]
 # max_age_ms = 86400000
-# max_records = 1000000
+max_records = 100000
 sweep_interval_ms = 1000
 prune_batch_limit = 1024
 

@@ -1,5 +1,4 @@
 mod batch;
-mod cleanup;
 mod error;
 mod mode;
 #[cfg(test)]

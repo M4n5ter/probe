@@ -16,6 +16,7 @@ use crate::e2e::{
     libpcap_loopback::run as run_libpcap_loopback,
     libpcap_websocket_loopback::run as run_libpcap_websocket_loopback,
     linux_socket_destroy_enforcement::run as run_linux_socket_destroy_enforcement,
+    local_validation::run as run_local_validation,
     mitm_plaintext_bridge::{
         run as run_mitm_plaintext_bridge_live_sidecar,
         run_managed as run_managed_mitm_plaintext_bridge_live_sidecar,
@@ -184,10 +185,24 @@ pub(super) const E2E_CASES: &[E2eCase] = &[
         name: "e2e-capture-loss-event-feed",
         requirement: E2eRequirement::User,
         capabilities: &[
+            E2eCapability::CaptureEventFeed,
             E2eCapability::CaptureLossEvent,
             E2eCapability::DurableSpoolExport,
         ],
         run: E2eCaseRun::ExitCode(run_capture_loss_event_feed),
+    },
+    E2eCase {
+        name: "e2e-local-validation",
+        requirement: E2eRequirement::User,
+        capabilities: &[
+            E2eCapability::CaptureEventFeed,
+            E2eCapability::HttpParsing,
+            E2eCapability::LuaPolicyBundle,
+            E2eCapability::DurableSpoolExport,
+            E2eCapability::FileExport,
+            E2eCapability::AdminTail,
+        ],
+        run: E2eCaseRun::ExitCode(run_local_validation),
     },
     E2eCase {
         name: "e2e-websocket-plaintext-feed",
