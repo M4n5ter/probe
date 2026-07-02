@@ -954,13 +954,18 @@ E2E profile 按 capability claim 组织：
   acceptance。
 - `product` 组合 user、live、eBPF、TLS、interception、MITM 和 Linux artifact suite。
 
-列出 case 和 profile：
+列出 case、profile 和机器可读覆盖信息：
 
 ```bash
 cargo run -p xtask --locked -- e2e-suite --list
 cargo run -p xtask --locked -- e2e-suite --list-profiles
 cargo run -p xtask --locked -- e2e-suite --inventory-json
 ```
+
+`--list` 输出每个 case 的权限需求和 capability ID。`--list-profiles`
+输出每个 profile 的权限集合、capability 并集、说明和展开后的 case 列表。
+`--inventory-json` 从同一个 registry 输出 schema version 2：capability
+catalog 带 category metadata，case coverage 和 profile coverage 都从单一事实源派生。
 
 运行非特权 baseline：
 

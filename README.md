@@ -1054,13 +1054,19 @@ E2E profiles are organized around capability claims:
 - `product` combines the user, live, eBPF, TLS, interception, MITM, and Linux
   artifact suites.
 
-List cases and profiles:
+List cases, profiles, and machine-readable coverage:
 
 ```bash
 cargo run -p xtask --locked -- e2e-suite --list
 cargo run -p xtask --locked -- e2e-suite --list-profiles
 cargo run -p xtask --locked -- e2e-suite --inventory-json
 ```
+
+`--list` prints each case with its privilege requirement and capability IDs.
+`--list-profiles` prints each profile with its requirement set, capability
+union, description, and expanded case list. `--inventory-json` exposes schema
+version 2 from the same registry: capability catalog entries include category
+metadata, and per-case plus per-profile coverage are derived from one source.
 
 Run the non-privileged baseline:
 

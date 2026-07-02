@@ -275,16 +275,22 @@ fn run_cases(cases: Vec<&'static E2eCase>) -> ExitCode {
 
 fn print_cases() {
     for case in registry::cases() {
-        println!("{}\t{}", case.name, case.requirement.label());
+        println!(
+            "{}\t{}\t{}",
+            case.name,
+            case.requirement.label(),
+            case.capability_summary()
+        );
     }
 }
 
 fn print_profiles() {
     for listing in registry::profile_listings().expect("profile registry is valid") {
         println!(
-            "{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}",
             listing.name,
             listing.requirements,
+            listing.capabilities,
             listing.description,
             listing.case_names.join(",")
         );

@@ -5067,9 +5067,11 @@ benchmark 参数：
 
 ### 验证矩阵
 
-可执行 case、顺序和 profile 归属以 `xtask e2e-suite --list` 与 `xtask e2e-suite --list-profiles` 为准。本文档只维护稳定的能力覆盖矩阵。
-`xtask e2e-suite --inventory-json` 从同一个 suite registry 输出机器可读 inventory。CI、发布检查和文档生成应消费该
-JSON，而不是维护第二份 case/profile 清单。
+可执行 case、顺序、profile 归属和 capability coverage 以 `xtask e2e-suite --list`、
+`xtask e2e-suite --list-profiles` 与 `xtask e2e-suite --inventory-json` 为准。
+本文档只维护稳定的能力覆盖解释，不维护第二份 case/profile 清单。
+`--inventory-json` 从同一个 suite registry 输出 schema version 2、带 category metadata 的
+capability catalog、per-case coverage 和 per-profile coverage。CI、发布检查和文档生成应消费该 JSON。
 
 | 验证面 | 代表入口 | 权限 | 证明内容 | 不证明 |
 | --- | --- | --- | --- | --- |
@@ -6173,9 +6175,9 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
     SSE streaming response、WebSocket handoff/frame、webhook/file exporter、remote policy bundle
     一次性加载、remote policy bundle polling 和 remote enforcement manifest。
 - `cargo run -p xtask --locked -- e2e-suite --list`
-  - 列出全部 case 及其 host capability requirement。
+  - 列出全部 case、host capability requirement 和 case capability coverage。
 - `cargo run -p xtask --locked -- e2e-suite --list-profiles`
-  - 列出命名验证 profile、权限需求和展开后的 case 列表。
+  - 列出命名验证 profile、权限需求、profile capability coverage 和展开后的 case 列表。
 - `cargo run -p xtask --locked -- e2e-suite --profile <name>`
   - 运行一个命名 profile。
 - `cargo run -p xtask --locked -- e2e-suite --case <name>`
