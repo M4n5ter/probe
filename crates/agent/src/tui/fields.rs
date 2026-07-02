@@ -1,6 +1,10 @@
+use std::{collections::BTreeMap, path::PathBuf};
+
 use probe_config::{
     AgentConfig, CaptureSelection, CompressionCodecName, ConnectionEnforcementBackendConfig,
-    TransparentInterceptionStrategyConfig,
+    ExporterConfig, ExporterTransportConfig, ExporterWorkerConfig,
+    TransparentInterceptionStrategyConfig, default_export_file_path,
+    default_export_unix_http_socket_path,
 };
 use probe_core::{EnforcementMode, Selector};
 
@@ -17,7 +21,13 @@ pub(crate) enum FieldId {
     CaptureSelection,
     CaptureDeepObserveProcess,
     ExportWorkerEnabled,
+    AddDefaultExporter,
+    ExporterTransport(usize),
     ExporterCodec(usize),
+    ExporterWebhookEndpoint(usize),
+    ExporterFilePath(usize),
+    ExporterUnixSocketPath(usize),
+    ExporterUnixHttpEndpoint(usize),
     IngressRetentionMaxRecords,
     ExportRetentionMaxRecords,
     EnforcementMode,
@@ -35,7 +45,13 @@ impl FieldId {
             Self::CaptureSelection => "Capture backend",
             Self::CaptureDeepObserveProcess => "Observe selected process",
             Self::ExportWorkerEnabled => "Export worker",
+            Self::AddDefaultExporter => "Add exporter",
+            Self::ExporterTransport(_) => "Exporter transport",
             Self::ExporterCodec(_) => "Exporter codec",
+            Self::ExporterWebhookEndpoint(_) => "Webhook endpoint",
+            Self::ExporterFilePath(_) => "File path",
+            Self::ExporterUnixSocketPath(_) => "Unix socket path",
+            Self::ExporterUnixHttpEndpoint(_) => "Unix HTTP endpoint",
             Self::IngressRetentionMaxRecords => "Ingress record limit",
             Self::ExportRetentionMaxRecords => "Export record limit",
             Self::EnforcementMode => "Enforcement mode",
@@ -51,6 +67,7 @@ impl FieldId {
     pub(crate) fn action_hint(self) -> &'static str {
         match self {
             Self::CaptureSelection
+            | Self::ExporterTransport(_)
             | Self::ExporterCodec(_)
             | Self::IngressRetentionMaxRecords
             | Self::ExportRetentionMaxRecords
@@ -58,6 +75,11 @@ impl FieldId {
             | Self::ConnectionBackend
             | Self::InterceptionStrategy => "cycle value",
             Self::ExportWorkerEnabled | Self::TlsPlaintextEnabled => "toggle",
+            Self::ExporterWebhookEndpoint(_)
+            | Self::ExporterFilePath(_)
+            | Self::ExporterUnixSocketPath(_)
+            | Self::ExporterUnixHttpEndpoint(_) => "edit text",
+            Self::AddDefaultExporter => "add exporter",
             Self::CaptureDeepObserveProcess
             | Self::EnforcementProcessScope
             | Self::InterceptionProcessScope
@@ -82,13 +104,15 @@ pub(crate) fn fields_for_tab(tab: TuiTab, config: &AgentConfig) -> Vec<FieldId> 
         ],
         TuiTab::Export => {
             let mut fields = vec![FieldId::ExportWorkerEnabled];
-            fields.extend(
-                config
-                    .exporters
-                    .iter()
-                    .enumerate()
-                    .map(|(index, _)| FieldId::ExporterCodec(index)),
-            );
+            if config.exporters.is_empty() {
+                fields.push(FieldId::AddDefaultExporter);
+                return fields;
+            }
+            for (index, exporter) in config.exporters.iter().enumerate() {
+                fields.push(FieldId::ExporterTransport(index));
+                fields.extend(exporter_target_fields(index, &exporter.transport));
+                fields.push(FieldId::ExporterCodec(index));
+            }
             fields
         }
         TuiTab::Storage => vec![
@@ -121,6 +145,24 @@ pub(crate) fn field_value(
             selected_process_name,
         ),
         FieldId::ExportWorkerEnabled => bool_state(config.export.worker.enabled),
+        FieldId::AddDefaultExporter => {
+            format!(
+                "{} -> file {}",
+                DEFAULT_EXPORTER_ID,
+                default_export_file_path().display()
+            )
+        }
+        FieldId::ExporterTransport(index) => config
+            .exporters
+            .get(index)
+            .map(|exporter| {
+                format!(
+                    "{} -> {}",
+                    exporter.id,
+                    exporter_transport_name(&exporter.transport)
+                )
+            })
+            .unwrap_or_else(|| "missing exporter".to_string()),
         FieldId::ExporterCodec(index) => config
             .exporters
             .get(index)
@@ -133,6 +175,48 @@ pub(crate) fn field_value(
                 )
             })
             .unwrap_or_else(|| "missing exporter".to_string()),
+        FieldId::ExporterWebhookEndpoint(index) => config
+            .exporters
+            .get(index)
+            .and_then(|exporter| match &exporter.transport {
+                ExporterTransportConfig::Webhook { endpoint, .. } => {
+                    Some(exporter_text_state(&exporter.id, endpoint))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "missing webhook exporter".to_string()),
+        FieldId::ExporterFilePath(index) => config
+            .exporters
+            .get(index)
+            .and_then(|exporter| match &exporter.transport {
+                ExporterTransportConfig::File { path } => Some(exporter_text_state(
+                    &exporter.id,
+                    &path.display().to_string(),
+                )),
+                _ => None,
+            })
+            .unwrap_or_else(|| "missing file exporter".to_string()),
+        FieldId::ExporterUnixSocketPath(index) => config
+            .exporters
+            .get(index)
+            .and_then(|exporter| match &exporter.transport {
+                ExporterTransportConfig::UnixHttp { socket_path, .. } => Some(exporter_text_state(
+                    &exporter.id,
+                    &socket_path.display().to_string(),
+                )),
+                _ => None,
+            })
+            .unwrap_or_else(|| "missing unix_http exporter".to_string()),
+        FieldId::ExporterUnixHttpEndpoint(index) => config
+            .exporters
+            .get(index)
+            .and_then(|exporter| match &exporter.transport {
+                ExporterTransportConfig::UnixHttp { endpoint, .. } => {
+                    Some(exporter_text_state(&exporter.id, endpoint))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "missing unix_http exporter".to_string()),
         FieldId::IngressRetentionMaxRecords => {
             retention_records_state(config.storage.retention.ingress.max_records)
         }
@@ -182,6 +266,20 @@ pub(crate) fn apply_field(
             config.export.worker.enabled = !config.export.worker.enabled;
             FieldApplyOutcome::Changed("Export worker toggled")
         }
+        FieldId::AddDefaultExporter => {
+            if !config.exporters.is_empty() {
+                return FieldApplyOutcome::Unchanged;
+            }
+            config.exporters.push(default_exporter());
+            FieldApplyOutcome::Changed("Default exporter added")
+        }
+        FieldId::ExporterTransport(index) => {
+            let Some(exporter) = config.exporters.get_mut(index) else {
+                return FieldApplyOutcome::Unchanged;
+            };
+            exporter.transport = cycle_exporter_transport(&exporter.transport, direction);
+            FieldApplyOutcome::Changed("Exporter transport changed")
+        }
         FieldId::ExporterCodec(index) => {
             let Some(exporter) = config.exporters.get_mut(index) else {
                 return FieldApplyOutcome::Unchanged;
@@ -189,6 +287,10 @@ pub(crate) fn apply_field(
             exporter.codec = cycle_codec(exporter.codec, direction);
             FieldApplyOutcome::Changed("Exporter codec changed")
         }
+        FieldId::ExporterWebhookEndpoint(_)
+        | FieldId::ExporterFilePath(_)
+        | FieldId::ExporterUnixSocketPath(_)
+        | FieldId::ExporterUnixHttpEndpoint(_) => FieldApplyOutcome::Unchanged,
         FieldId::IngressRetentionMaxRecords => {
             config.storage.retention.ingress.max_records =
                 cycle_retention_records(config.storage.retention.ingress.max_records, direction);
@@ -239,6 +341,102 @@ pub(crate) fn apply_field(
     }
 }
 
+pub(crate) fn editable_text_value(config: &AgentConfig, field: FieldId) -> Option<String> {
+    match field {
+        FieldId::ExporterWebhookEndpoint(index) => {
+            config
+                .exporters
+                .get(index)
+                .and_then(|exporter| match &exporter.transport {
+                    ExporterTransportConfig::Webhook { endpoint, .. } => Some(endpoint.clone()),
+                    _ => None,
+                })
+        }
+        FieldId::ExporterFilePath(index) => {
+            config
+                .exporters
+                .get(index)
+                .and_then(|exporter| match &exporter.transport {
+                    ExporterTransportConfig::File { path } => Some(path.display().to_string()),
+                    _ => None,
+                })
+        }
+        FieldId::ExporterUnixSocketPath(index) => {
+            config
+                .exporters
+                .get(index)
+                .and_then(|exporter| match &exporter.transport {
+                    ExporterTransportConfig::UnixHttp { socket_path, .. } => {
+                        Some(socket_path.display().to_string())
+                    }
+                    _ => None,
+                })
+        }
+        FieldId::ExporterUnixHttpEndpoint(index) => {
+            config
+                .exporters
+                .get(index)
+                .and_then(|exporter| match &exporter.transport {
+                    ExporterTransportConfig::UnixHttp { endpoint, .. } => Some(endpoint.clone()),
+                    _ => None,
+                })
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn apply_text_field(
+    config: &mut AgentConfig,
+    field: FieldId,
+    value: String,
+) -> FieldApplyOutcome {
+    let value = value.trim().to_string();
+    match field {
+        FieldId::ExporterWebhookEndpoint(index) => {
+            let Some(exporter) = config.exporters.get_mut(index) else {
+                return FieldApplyOutcome::Unchanged;
+            };
+            let ExporterTransportConfig::Webhook { endpoint, .. } = &mut exporter.transport else {
+                return FieldApplyOutcome::Unchanged;
+            };
+            *endpoint = value;
+            FieldApplyOutcome::Changed("Webhook endpoint changed")
+        }
+        FieldId::ExporterFilePath(index) => {
+            let Some(exporter) = config.exporters.get_mut(index) else {
+                return FieldApplyOutcome::Unchanged;
+            };
+            let ExporterTransportConfig::File { path } = &mut exporter.transport else {
+                return FieldApplyOutcome::Unchanged;
+            };
+            *path = PathBuf::from(value);
+            FieldApplyOutcome::Changed("File exporter path changed")
+        }
+        FieldId::ExporterUnixSocketPath(index) => {
+            let Some(exporter) = config.exporters.get_mut(index) else {
+                return FieldApplyOutcome::Unchanged;
+            };
+            let ExporterTransportConfig::UnixHttp { socket_path, .. } = &mut exporter.transport
+            else {
+                return FieldApplyOutcome::Unchanged;
+            };
+            *socket_path = PathBuf::from(value);
+            FieldApplyOutcome::Changed("Unix HTTP socket path changed")
+        }
+        FieldId::ExporterUnixHttpEndpoint(index) => {
+            let Some(exporter) = config.exporters.get_mut(index) else {
+                return FieldApplyOutcome::Unchanged;
+            };
+            let ExporterTransportConfig::UnixHttp { endpoint, .. } = &mut exporter.transport else {
+                return FieldApplyOutcome::Unchanged;
+            };
+            *endpoint = value;
+            FieldApplyOutcome::Changed("Unix HTTP endpoint changed")
+        }
+        _ => FieldApplyOutcome::Unchanged,
+    }
+}
+
 fn apply_process_selector(
     selector: Option<Selector>,
     apply: impl FnOnce(Selector) -> &'static str,
@@ -257,10 +455,64 @@ fn bool_state(value: bool) -> String {
     }
 }
 
+fn exporter_target_fields(index: usize, transport: &ExporterTransportConfig) -> Vec<FieldId> {
+    match transport {
+        ExporterTransportConfig::Webhook { .. } => vec![FieldId::ExporterWebhookEndpoint(index)],
+        ExporterTransportConfig::File { .. } => vec![FieldId::ExporterFilePath(index)],
+        ExporterTransportConfig::UnixHttp { .. } => vec![
+            FieldId::ExporterUnixSocketPath(index),
+            FieldId::ExporterUnixHttpEndpoint(index),
+        ],
+    }
+}
+
+fn exporter_text_state(exporter_id: &str, value: &str) -> String {
+    if value.is_empty() {
+        format!("{exporter_id} -> not configured")
+    } else {
+        format!("{exporter_id} -> {value}")
+    }
+}
+
 fn retention_records_state(value: Option<u64>) -> String {
     match value {
         Some(records) => format!("{records} records"),
         None => "no record limit".to_string(),
+    }
+}
+
+const DEFAULT_EXPORTER_ID: &str = "default";
+const DEFAULT_WEBHOOK_ENDPOINT: &str = "http://127.0.0.1:8080/events";
+const DEFAULT_UNIX_HTTP_ENDPOINT: &str = "/events";
+
+fn default_exporter() -> ExporterConfig {
+    ExporterConfig {
+        id: DEFAULT_EXPORTER_ID.to_string(),
+        transport: default_file_transport(),
+        codec: CompressionCodecName::Zstd,
+        worker: ExporterWorkerConfig::default(),
+    }
+}
+
+fn default_webhook_transport() -> ExporterTransportConfig {
+    ExporterTransportConfig::Webhook {
+        endpoint: DEFAULT_WEBHOOK_ENDPOINT.to_string(),
+        headers: BTreeMap::new(),
+        tls: Default::default(),
+    }
+}
+
+fn default_file_transport() -> ExporterTransportConfig {
+    ExporterTransportConfig::File {
+        path: default_export_file_path(),
+    }
+}
+
+fn default_unix_http_transport() -> ExporterTransportConfig {
+    ExporterTransportConfig::UnixHttp {
+        socket_path: default_export_unix_http_socket_path(),
+        endpoint: DEFAULT_UNIX_HTTP_ENDPOINT.to_string(),
+        headers: BTreeMap::new(),
     }
 }
 
@@ -307,6 +559,45 @@ fn cycle_codec(value: CompressionCodecName, direction: isize) -> CompressionCode
         VALUES.len(),
         direction,
     )]
+}
+
+fn cycle_exporter_transport(
+    value: &ExporterTransportConfig,
+    direction: isize,
+) -> ExporterTransportConfig {
+    const VALUES: [ExporterTransportKind; 3] = [
+        ExporterTransportKind::Webhook,
+        ExporterTransportKind::File,
+        ExporterTransportKind::UnixHttp,
+    ];
+    let current = exporter_transport_kind(value);
+    match VALUES[cycle_index(
+        VALUES
+            .iter()
+            .position(|item| *item == current)
+            .unwrap_or_default(),
+        VALUES.len(),
+        direction,
+    )] {
+        ExporterTransportKind::Webhook => default_webhook_transport(),
+        ExporterTransportKind::File => default_file_transport(),
+        ExporterTransportKind::UnixHttp => default_unix_http_transport(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExporterTransportKind {
+    Webhook,
+    File,
+    UnixHttp,
+}
+
+fn exporter_transport_kind(value: &ExporterTransportConfig) -> ExporterTransportKind {
+    match value {
+        ExporterTransportConfig::Webhook { .. } => ExporterTransportKind::Webhook,
+        ExporterTransportConfig::File { .. } => ExporterTransportKind::File,
+        ExporterTransportConfig::UnixHttp { .. } => ExporterTransportKind::UnixHttp,
+    }
 }
 
 fn cycle_retention_records(value: Option<u64>, direction: isize) -> Option<u64> {

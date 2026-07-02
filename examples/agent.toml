@@ -14,6 +14,12 @@
 agent_id = "probe-local"
 config_version = "example"
 
+# Config defaults and TUI-generated local paths use PROBE_HOME. By default it
+# follows the user state directory: $XDG_STATE_HOME/traffic-probe or
+# $HOME/.local/state/traffic-probe. Set PROBE_HOME=/var/lib/traffic-probe for a
+# machine-level service layout. Explicit TOML paths below are used as written
+# and are not shell-expanded.
+
 [capture]
 # "auto" tries the configured live fallback backends in order.
 # For non-privileged JSONL input, use "plaintext_feed" or "capture_event_feed"
@@ -39,12 +45,12 @@ read_timeout_ms = 1000
 
 [capture.plaintext_feed]
 # Non-privileged JSONL plaintext input for development or controlled bridges.
-# path = "/var/lib/probe/plaintext-feed.jsonl"
+# path = "/var/lib/traffic-probe/plaintext-feed.jsonl"
 
 [capture.capture_event_feed]
 # Typed CaptureEvent JSONL input. follow=true keeps the agent online and waits
 # for appended records.
-# path = "/var/lib/probe/capture-events.jsonl"
+# path = "/var/lib/traffic-probe/capture-events.jsonl"
 # follow = true
 
 [storage]
@@ -85,7 +91,7 @@ multiplier = 2
 # [[exporters]]
 # id = "local-file"
 # transport = "file"
-# path = "/var/lib/probe/export.jsonl"
+# path = "/var/lib/traffic-probe/export/events.jsonl"
 # codec = "zstd"
 #
 # [[exporters]]
@@ -105,7 +111,7 @@ multiplier = 2
 # transport = "unix_http"
 # Unix HTTP uses the same protobuf batch and ACK contract as webhook, but sends
 # HTTP/1.1 over a local Unix domain socket to a server-local collector sidecar.
-# socket_path = "/run/probe/collector.sock"
+# socket_path = "/var/lib/traffic-probe/run/collector.sock"
 # endpoint = "/probe/batches"
 # codec = "zstd"
 # headers = { "x-probe-node" = "probe-local" }
@@ -157,7 +163,7 @@ refresh_interval_ms = 1000
 # [[tls.materials]]
 # id = "browser-keylog"
 # kind = "key_log_file"
-# path = "/var/lib/probe/tls/browser.keys"
+# path = "/var/lib/traffic-probe/tls/browser.keys"
 #
 # [[tls.materials]]
 # id = "mitm-ca"
@@ -271,7 +277,7 @@ mode = "none"
 mode = "none"
 # Product proxy mode requires:
 # mode = "capture_event_feed"
-# path = "/var/lib/probe/mitm-feed.jsonl"
+# path = "/var/lib/traffic-probe/mitm/feed.jsonl"
 # follow = true
 
 [enforcement.interception.mitm.policy_hook]

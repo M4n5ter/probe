@@ -142,7 +142,7 @@ TLS refs 指向 `[[tls.materials]]` 条目。配置 exporter TLS material 时，
 [[exporters]]
 id = "local-sidecar"
 transport = "unix_http"
-socket_path = "/run/probe/collector.sock"
+socket_path = "/var/lib/traffic-probe/run/collector.sock"
 endpoint = "/probe/batches"
 codec = "zstd"
 headers = { "x-probe-node" = "probe-local" }

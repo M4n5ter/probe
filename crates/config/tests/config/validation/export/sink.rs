@@ -204,7 +204,7 @@ fn parsing_rejects_transport_specific_exporter_fields() -> Result<(), Box<dyn st
 [[exporters]]
 id = "local-file"
 transport = "file"
-path = "/tmp/probe-export.jsonl"
+path = "/tmp/traffic-probe-export.jsonl"
 endpoint = "/batches"
 "#,
     );
@@ -215,7 +215,7 @@ endpoint = "/batches"
 [[exporters]]
 id = "local-sidecar"
 transport = "unix_http"
-socket_path = "/run/probe/collector.sock"
+socket_path = "/var/lib/traffic-probe/run/collector.sock"
 endpoint = "/batches"
 
 [exporters.tls]
@@ -230,7 +230,7 @@ trust_anchor_refs = ["collector-ca"]
 id = "webhook"
 transport = "webhook"
 endpoint = "https://collector.example/batches"
-socket_path = "/run/probe/collector.sock"
+socket_path = "/var/lib/traffic-probe/run/collector.sock"
 "#,
     );
     assert!(webhook_with_socket_path.is_err());

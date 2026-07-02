@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::paths::default_storage_path;
+
 pub const DEFAULT_INGRESS_RETENTION_PRUNE_BATCH_LIMIT: u64 = 1024;
 pub const DEFAULT_INGRESS_RETENTION_SWEEP_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_EXPORT_RETENTION_PRUNE_BATCH_LIMIT: u64 = 1024;
@@ -33,7 +35,7 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            path: PathBuf::from("/var/lib/traffic-probe/spool"),
+            path: default_storage_path(),
             retention: StorageRetentionConfig::default(),
         }
     }

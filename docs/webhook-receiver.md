@@ -151,7 +151,7 @@ Unix HTTP to a local sidecar:
 [[exporters]]
 id = "local-sidecar"
 transport = "unix_http"
-socket_path = "/run/probe/collector.sock"
+socket_path = "/var/lib/traffic-probe/run/collector.sock"
 endpoint = "/probe/batches"
 codec = "zstd"
 headers = { "x-probe-node" = "probe-local" }

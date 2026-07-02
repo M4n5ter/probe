@@ -219,7 +219,7 @@ fn parses_unix_http_exporter_transport() -> Result<(), Box<dyn std::error::Error
 [[exporters]]
 id = "local-sidecar"
 transport = "unix_http"
-socket_path = "/run/probe/collector.sock"
+socket_path = "/var/lib/traffic-probe/run/collector.sock"
 endpoint = "/probe/batches?tenant=local"
 codec = "deflate"
 headers = { "x-probe-node" = "node-a" }
@@ -231,7 +231,7 @@ headers = { "x-probe-node" = "node-a" }
     assert_eq!(
         config.exporters[0].transport,
         ExporterTransportConfig::UnixHttp {
-            socket_path: PathBuf::from("/run/probe/collector.sock"),
+            socket_path: PathBuf::from("/var/lib/traffic-probe/run/collector.sock"),
             endpoint: "/probe/batches?tenant=local".to_string(),
             headers: BTreeMap::from([("x-probe-node".to_string(), "node-a".to_string())]),
         }
@@ -271,7 +271,7 @@ fn exporter_config_serializes_to_parseable_flat_toml() -> Result<(), Box<dyn std
             ExporterConfig {
                 id: "local-sidecar".to_string(),
                 transport: ExporterTransportConfig::UnixHttp {
-                    socket_path: PathBuf::from("/run/probe/collector.sock"),
+                    socket_path: PathBuf::from("/var/lib/traffic-probe/run/collector.sock"),
                     endpoint: "/probe/batches".to_string(),
                     headers: BTreeMap::from([("x-probe-node".to_string(), "node-a".to_string())]),
                 },
@@ -296,7 +296,7 @@ fn exporter_config_serializes_to_parseable_flat_toml() -> Result<(), Box<dyn std
     assert!(rendered.contains("transport = \"file\""));
     assert!(rendered.contains("path = \"/tmp/traffic-probe-export.jsonl\""));
     assert!(rendered.contains("transport = \"unix_http\""));
-    assert!(rendered.contains("socket_path = \"/run/probe/collector.sock\""));
+    assert!(rendered.contains("socket_path = \"/var/lib/traffic-probe/run/collector.sock\""));
     assert!(rendered.contains("endpoint = \"/probe/batches\""));
 
     let roundtrip = AgentConfig::from_toml_str(&rendered)?;

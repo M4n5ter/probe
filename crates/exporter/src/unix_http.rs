@@ -140,7 +140,7 @@ mod tests {
             "/bad path",
         ] {
             let result = UnixHttpExporter::with_headers(
-                "/tmp/probe-export.sock",
+                "/tmp/traffic-probe-export.sock",
                 endpoint,
                 CompressionCodec::None,
                 [],

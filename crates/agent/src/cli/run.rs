@@ -67,7 +67,7 @@ enum Command {
     },
     Tui {
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
     },
     Admin {
         #[arg(long, default_value = DEFAULT_ADMIN_SOCKET_PATH)]
@@ -467,6 +467,13 @@ mod tests {
         Cli {
             command: Command::Check { config },
         }
+    }
+
+    #[test]
+    fn tui_cli_accepts_missing_config_path() {
+        let cli = Cli::try_parse_from(["traffic-probe", "tui"]).expect("TUI config is optional");
+
+        assert!(matches!(cli.command, Command::Tui { config: None }));
     }
 
     #[test]

@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use probe_config::AgentConfig;
 
-use super::fields::{FieldApplyOutcome, FieldId, apply_field, field_value, fields_for_tab};
+use super::fields::{
+    FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value, field_value,
+    fields_for_tab,
+};
 use super::hit::HitTarget;
 use super::processes::ProcessCatalog;
 use super::traffic::TrafficState;
@@ -68,6 +71,10 @@ pub(crate) enum TuiAction {
     MoveDown,
     PreviousValue,
     NextValue,
+    TextInput(char),
+    TextBackspace,
+    TextSubmit,
+    TextCancel,
     Click(HitTarget),
     Save,
     Reload,
@@ -124,6 +131,24 @@ impl StatusMessage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TextEditSession {
+    field: FieldId,
+    label: String,
+    buffer: String,
+    replace_on_input: bool,
+}
+
+impl TextEditSession {
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn buffer(&self) -> &str {
+        &self.buffer
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TuiApp {
     config_path: PathBuf,
@@ -137,6 +162,7 @@ pub(crate) struct TuiApp {
     should_quit: bool,
     status: StatusMessage,
     processes: ProcessCatalog,
+    text_edit: Option<TextEditSession>,
 }
 
 impl TuiApp {
@@ -158,6 +184,7 @@ impl TuiApp {
             should_quit: false,
             status,
             processes,
+            text_edit: None,
         }
     }
 
@@ -207,7 +234,18 @@ impl TuiApp {
         self.should_quit
     }
 
+    pub(crate) fn text_edit(&self) -> Option<&TextEditSession> {
+        self.text_edit.as_ref()
+    }
+
+    pub(crate) fn is_editing_text(&self) -> bool {
+        self.text_edit.is_some()
+    }
+
     pub(crate) fn handle_action(&mut self, action: TuiAction) -> ActionOutcome {
+        if self.text_edit.is_some() {
+            return self.handle_text_edit_action(action);
+        }
         match action {
             TuiAction::NextTab => self.select_tab(self.active_tab.next()),
             TuiAction::PreviousTab => self.select_tab(self.active_tab.previous()),
@@ -215,6 +253,10 @@ impl TuiApp {
             TuiAction::MoveDown => self.move_selection(1),
             TuiAction::NextValue => self.adjust_selected(1),
             TuiAction::PreviousValue => self.adjust_selected(-1),
+            TuiAction::TextInput(_)
+            | TuiAction::TextBackspace
+            | TuiAction::TextSubmit
+            | TuiAction::TextCancel => {}
             TuiAction::Click(target) => return self.handle_click(target),
             TuiAction::Save => {
                 return ActionOutcome {
@@ -246,6 +288,7 @@ impl TuiApp {
         self.config = config;
         self.processes = processes;
         self.traffic = TrafficState::default();
+        self.text_edit = None;
         self.dirty = false;
         self.status = StatusMessage::info("Reloaded config and process list");
         self.clamp_selection();
@@ -273,6 +316,7 @@ impl TuiApp {
                 self.select_field(field);
                 self.adjust_selected(1);
             }
+            HitTarget::TextEditSubmit | HitTarget::TextEditCancel => {}
             HitTarget::Process(index) => self.select_process(index),
             HitTarget::TrafficRow(index) => self.select_traffic_row(index),
             HitTarget::Save => {
@@ -388,6 +432,10 @@ impl TuiApp {
         let Some(field) = self.selected_field() else {
             return;
         };
+        if editable_text_value(&self.config, field).is_some() {
+            self.begin_text_edit(field);
+            return;
+        }
         let selected_process_selector = self.selected_process_selector();
         match apply_field(
             &mut self.config,
@@ -395,7 +443,73 @@ impl TuiApp {
             direction,
             selected_process_selector,
         ) {
-            FieldApplyOutcome::Changed(message) => self.mark_dirty(message),
+            FieldApplyOutcome::Changed(message) => {
+                self.mark_dirty(message);
+                self.clamp_selection();
+            }
+            FieldApplyOutcome::MissingProcessSelector => {
+                self.status = self.process_selector_warning();
+            }
+            FieldApplyOutcome::Unchanged => {}
+        }
+    }
+
+    fn begin_text_edit(&mut self, field: FieldId) {
+        let Some(value) = editable_text_value(&self.config, field) else {
+            return;
+        };
+        let label = field.label().to_string();
+        self.text_edit = Some(TextEditSession {
+            field,
+            label: label.clone(),
+            buffer: value,
+            replace_on_input: true,
+        });
+        self.status = StatusMessage::info(format!("Editing {label}"));
+    }
+
+    fn handle_text_edit_action(&mut self, action: TuiAction) -> ActionOutcome {
+        match action {
+            TuiAction::TextInput(character) => {
+                if let Some(edit) = &mut self.text_edit {
+                    if edit.replace_on_input {
+                        edit.buffer.clear();
+                        edit.replace_on_input = false;
+                    }
+                    edit.buffer.push(character);
+                }
+            }
+            TuiAction::TextBackspace => {
+                if let Some(edit) = &mut self.text_edit {
+                    if edit.replace_on_input {
+                        edit.buffer.clear();
+                        edit.replace_on_input = false;
+                    } else {
+                        edit.buffer.pop();
+                    }
+                }
+            }
+            TuiAction::TextSubmit | TuiAction::Click(HitTarget::TextEditSubmit) => {
+                self.submit_text_edit();
+            }
+            TuiAction::TextCancel | TuiAction::Click(HitTarget::TextEditCancel) => {
+                self.text_edit = None;
+                self.status = StatusMessage::info("Edit canceled");
+            }
+            _ => {}
+        }
+        ActionOutcome::default()
+    }
+
+    fn submit_text_edit(&mut self) {
+        let Some(edit) = self.text_edit.take() else {
+            return;
+        };
+        match apply_text_field(&mut self.config, edit.field, edit.buffer) {
+            FieldApplyOutcome::Changed(message) => {
+                self.mark_dirty(message);
+                self.clamp_selection();
+            }
             FieldApplyOutcome::MissingProcessSelector => {
                 self.status = self.process_selector_warning();
             }
@@ -477,7 +591,10 @@ fn offset_index(index: usize, len: usize, delta: isize) -> usize {
 mod tests {
     use std::path::PathBuf;
 
-    use probe_config::{AgentConfig, CaptureSelection};
+    use probe_config::{
+        AgentConfig, CaptureSelection, ExporterConfig, ExporterTransportConfig,
+        default_export_file_path,
+    };
 
     use super::{
         super::processes::{ProcessCatalog, ProcessEntry},
@@ -607,6 +724,77 @@ mod tests {
         assert!(mouse_app.dirty());
     }
 
+    #[test]
+    fn exporter_target_text_edit_shares_keyboard_and_mouse_action_path() {
+        let mut keyboard_app = export_app(ExporterTransportConfig::File {
+            path: PathBuf::new(),
+        });
+        keyboard_app.select_tab(TuiTab::Export);
+        keyboard_app.select_field(FieldId::ExporterFilePath(0));
+        keyboard_app.handle_action(TuiAction::NextValue);
+        input_text(&mut keyboard_app, "/tmp/probe-keyboard.jsonl");
+        keyboard_app.handle_action(TuiAction::TextSubmit);
+
+        let mut mouse_app = export_app(ExporterTransportConfig::File {
+            path: PathBuf::new(),
+        });
+        mouse_app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Export)));
+        mouse_app.handle_action(TuiAction::Click(HitTarget::Field(
+            FieldId::ExporterFilePath(0),
+        )));
+        input_text(&mut mouse_app, "/tmp/probe-keyboard.jsonl");
+        mouse_app.handle_action(TuiAction::Click(HitTarget::TextEditSubmit));
+
+        let ExporterTransportConfig::File { path } = &keyboard_app.config.exporters[0].transport
+        else {
+            panic!("keyboard edit should keep file transport");
+        };
+        assert_eq!(path, &PathBuf::from("/tmp/probe-keyboard.jsonl"));
+        assert_eq!(
+            keyboard_app.config.exporters[0].transport,
+            mouse_app.config.exporters[0].transport
+        );
+        assert!(keyboard_app.dirty());
+        assert!(mouse_app.dirty());
+    }
+
+    #[test]
+    fn text_edit_replaces_existing_value_on_first_input() {
+        let mut app = export_app(ExporterTransportConfig::Webhook {
+            endpoint: "http://127.0.0.1:8080/old".to_string(),
+            headers: Default::default(),
+            tls: Default::default(),
+        });
+        app.select_tab(TuiTab::Export);
+        app.select_field(FieldId::ExporterWebhookEndpoint(0));
+        app.handle_action(TuiAction::NextValue);
+
+        input_text(&mut app, "http://127.0.0.1:8080/new");
+        app.handle_action(TuiAction::TextSubmit);
+
+        let ExporterTransportConfig::Webhook { endpoint, .. } = &app.config.exporters[0].transport
+        else {
+            panic!("text edit should keep webhook transport");
+        };
+        assert_eq!(endpoint, "http://127.0.0.1:8080/new");
+    }
+
+    #[test]
+    fn export_tab_can_add_default_exporter_without_manual_toml() {
+        let mut app = test_app();
+        app.select_tab(TuiTab::Export);
+        app.handle_action(TuiAction::Click(HitTarget::Field(
+            FieldId::AddDefaultExporter,
+        )));
+
+        assert_eq!(app.config.exporters.len(), 1);
+        let ExporterTransportConfig::File { path } = &app.config.exporters[0].transport else {
+            panic!("default exporter should use file transport");
+        };
+        assert_eq!(path, &default_export_file_path());
+        assert!(app.dirty());
+    }
+
     fn test_app() -> TuiApp {
         TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
@@ -618,5 +806,24 @@ mod tests {
                 argv_count: 1,
             }]),
         )
+    }
+
+    fn export_app(transport: ExporterTransportConfig) -> TuiApp {
+        let mut config = AgentConfig::default();
+        config.exporters.push(ExporterConfig {
+            transport,
+            ..ExporterConfig::default()
+        });
+        TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            config,
+            ProcessCatalog::default(),
+        )
+    }
+
+    fn input_text(app: &mut TuiApp, text: &str) {
+        for character in text.chars() {
+            app.handle_action(TuiAction::TextInput(character));
+        }
     }
 }

@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn runtime_failure_reason_distinguishes_unix_http_transport_errors() {
         let error = ExportDrainError::Export(exporter::ExportError::UnixHttpSocketUnavailable {
-            path: PathBuf::from("/run/probe/collector.sock"),
+            path: PathBuf::from("/var/lib/traffic-probe/run/collector.sock"),
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
         });
 

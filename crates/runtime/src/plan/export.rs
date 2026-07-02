@@ -407,7 +407,7 @@ mod tests {
             exporters: vec![ExporterConfig {
                 id: "local-file".to_string(),
                 transport: ExporterTransportConfig::File {
-                    path: PathBuf::from("/var/lib/traffic-probe/export.jsonl"),
+                    path: PathBuf::from("/var/lib/traffic-probe/export/events.jsonl"),
                 },
                 codec: CompressionCodecName::Gzip,
                 worker: ExporterWorkerConfig {
@@ -423,7 +423,7 @@ mod tests {
             plan.sinks,
             vec![ExportSinkPlan::File(FileExportSinkPlan {
                 id: "local-file".to_string(),
-                path: PathBuf::from("/var/lib/traffic-probe/export.jsonl"),
+                path: PathBuf::from("/var/lib/traffic-probe/export/events.jsonl"),
                 codec: CompressionCodecName::Gzip,
                 worker: ExportSinkWorkerPlan {
                     batches_per_tick_override: Some(4),
@@ -439,7 +439,7 @@ mod tests {
             exporters: vec![ExporterConfig {
                 id: "local-sidecar".to_string(),
                 transport: ExporterTransportConfig::UnixHttp {
-                    socket_path: PathBuf::from("/run/probe/collector.sock"),
+                    socket_path: PathBuf::from("/var/lib/traffic-probe/run/collector.sock"),
                     endpoint: "/probe/batches".to_string(),
                     headers: BTreeMap::from([("x-probe-node".to_string(), "node-a".to_string())]),
                 },
@@ -457,7 +457,7 @@ mod tests {
             plan.sinks,
             vec![ExportSinkPlan::UnixHttp(UnixHttpExportSinkPlan {
                 id: "local-sidecar".to_string(),
-                socket_path: PathBuf::from("/run/probe/collector.sock"),
+                socket_path: PathBuf::from("/var/lib/traffic-probe/run/collector.sock"),
                 endpoint: "/probe/batches".to_string(),
                 codec: CompressionCodecName::Deflate,
                 headers: BTreeMap::from([("x-probe-node".to_string(), "node-a".to_string())]),

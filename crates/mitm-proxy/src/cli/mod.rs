@@ -370,7 +370,7 @@ mod tests {
     fn tls_material_roots_are_attached_to_tls_configs() {
         let roots = vec![
             Path::new("/etc/probe/certs").to_path_buf(),
-            Path::new("/var/lib/probe/tls").to_path_buf(),
+            Path::new("/var/lib/traffic-probe/tls").to_path_buf(),
         ];
         let config = MitmProxyConfig::try_from(Cli {
             upstream_tls: true,

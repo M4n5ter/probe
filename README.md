@@ -226,7 +226,7 @@ but does not execute them.
 Use the TUI when operating directly on a Linux host:
 
 ```bash
-cargo run -p agent --locked -- tui --config ./agent.toml
+cargo run -p agent --locked -- tui
 ```
 
 The TUI is a config workbench for common server operations. It reads `/proc`
@@ -240,13 +240,19 @@ the rendered config, and uses an atomic same-directory write. The config path
 must be a direct file path; symlink paths are rejected so save never replaces a
 link with a regular file.
 
-The workbench can edit capture backend selection, export worker state, exporter
-compression codec, storage retention record limits, enforcement mode/backend,
-transparent interception strategy, TLS plaintext hook enablement, and
-process-scoped selectors for capture, enforcement, interception, and TLS
-plaintext. Policy Lua source, large MITM backend contracts, TLS material files,
-and collector-specific payload formats should still be edited in the config and
+The workbench can add a default exporter, switch exporter transport, edit
+webhook endpoints, file paths, Unix HTTP socket paths, exporter compression,
+export worker state, storage retention record limits, capture backend selection,
+enforcement mode/backend, transparent interception strategy, TLS plaintext hook
+enablement, and process-scoped selectors for capture, enforcement,
+interception, and TLS plaintext. Policy Lua source, large MITM backend
+contracts, TLS material files, exporter headers/TLS material refs, and
+collector-specific payload formats should still be edited in the config and
 policy files.
+
+Without `--config`, the TUI uses `PROBE_HOME/config/agent.toml` and creates a
+minimal safe config if the file does not exist. Pass `--config ./agent.toml`
+when editing an explicit file.
 
 When the configured admin socket is enabled and the live agent is running, the
 Traffic tab tails parsed export events from the online admin surface. It uses
@@ -262,6 +268,19 @@ must state four contracts explicitly: where events come from, where durable
 state is stored, which Lua hooks inspect typed events, and how the collector
 acknowledges export batches. Probe does not infer these contracts from endpoint
 names or policy filenames.
+
+`PROBE_HOME` is the local state root used by config defaults and TUI-generated
+paths. By default it follows the user state directory:
+`$XDG_STATE_HOME/traffic-probe`, or `$HOME/.local/state/traffic-probe` when
+`XDG_STATE_HOME` is not set. Set it explicitly before creating or editing a
+config when local state should live elsewhere:
+
+```bash
+export PROBE_HOME="/var/lib/traffic-probe"
+```
+
+Explicit TOML paths are used as written and are not expanded. In a restricted
+environment with no usable user home, Probe falls back to `/var/lib/traffic-probe`.
 
 ```text
 /etc/probe/agent.toml
@@ -280,10 +299,10 @@ Agent config:
 selection = "plaintext_feed"
 
 [capture.plaintext_feed]
-path = "/var/lib/probe/plaintext-feed.jsonl"
+path = "/var/lib/traffic-probe/plaintext-feed.jsonl"
 
 [storage]
-path = "/var/lib/probe/spool"
+path = "/var/lib/traffic-probe/spool"
 
 [export.worker]
 enabled = true
@@ -504,7 +523,7 @@ Plaintext feed mode is deterministic and does not require live capture:
 selection = "plaintext_feed"
 
 [capture.plaintext_feed]
-path = "/var/lib/probe/plaintext-feed.jsonl"
+path = "/var/lib/traffic-probe/plaintext-feed.jsonl"
 ```
 
 The plaintext feed is JSON Lines: one event per line. Each event repeats the
@@ -554,7 +573,7 @@ records:
 selection = "capture_event_feed"
 
 [capture.capture_event_feed]
-path = "/var/lib/probe/capture-events.jsonl"
+path = "/var/lib/traffic-probe/capture-events.jsonl"
 follow = true
 ```
 
@@ -600,7 +619,7 @@ sink_timeout_ms = 10000
 [[exporters]]
 id = "local-file"
 transport = "file"
-path = "/var/lib/probe/export.jsonl"
+path = "/var/lib/traffic-probe/export/events.jsonl"
 codec = "zstd"
 
 [[exporters]]
@@ -613,7 +632,7 @@ headers = { "x-probe-node" = "probe-local" }
 [[exporters]]
 id = "local-sidecar"
 transport = "unix_http"
-socket_path = "/run/probe/collector.sock"
+socket_path = "/var/lib/traffic-probe/run/collector.sock"
 endpoint = "/probe/batches"
 codec = "zstd"
 headers = { "x-probe-node" = "probe-local" }
@@ -672,7 +691,7 @@ TLS material references are shared by exporters, TLS decrypt hints, and MITM:
 
 ```toml
 [tls.material_store.filesystem]
-allowed_roots = ["/etc/probe/certs", "/var/lib/probe/tls"]
+allowed_roots = ["/etc/probe/certs", "/var/lib/traffic-probe/tls"]
 
 [[tls.materials]]
 id = "collector-ca"
@@ -682,7 +701,7 @@ path = "/etc/probe/certs/collector-ca.pem"
 [[tls.materials]]
 id = "browser-keylog"
 kind = "key_log_file"
-path = "/var/lib/probe/tls/browser.keys"
+path = "/var/lib/traffic-probe/tls/browser.keys"
 
 [[tls.materials]]
 id = "mitm-ca"
@@ -945,7 +964,7 @@ target = "127.0.0.1:15001"
 
 [enforcement.interception.mitm.plaintext_bridge]
 mode = "capture_event_feed"
-path = "/var/lib/probe/mitm-feed.jsonl"
+path = "/var/lib/traffic-probe/mitm/feed.jsonl"
 follow = true
 
 [enforcement.interception.mitm.policy_hook]

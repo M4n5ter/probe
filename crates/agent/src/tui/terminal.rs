@@ -14,9 +14,11 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
+use probe_config::default_config_path;
+
 use super::{
     app::{TuiAction, TuiApp, TuiTab},
-    config_edit::{TuiError, load_config, save_config},
+    config_edit::{TuiError, load_config, load_or_create_config, save_config},
     hit::HitMap,
     processes::ProcessCatalog,
     render::draw,
@@ -26,16 +28,13 @@ const TRAFFIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TuiOptions {
-    pub(crate) config: PathBuf,
+    pub(crate) config: Option<PathBuf>,
 }
 
 pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
-    let mut loaded = load_config(&options.config)?;
-    let mut app = TuiApp::new(
-        options.config.clone(),
-        loaded.config,
-        ProcessCatalog::from_proc(),
-    );
+    let config_path = resolve_config_path(options.config);
+    let mut loaded = load_or_create_config(&config_path)?;
+    let mut app = TuiApp::new(config_path, loaded.config, ProcessCatalog::from_proc());
     let mut terminal = TerminalSession::enter()?;
     let mut last_traffic_refresh = Instant::now()
         .checked_sub(TRAFFIC_REFRESH_INTERVAL)
@@ -55,7 +54,7 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
-        let Some(action) = event_to_action(&hit_map, event::read()?) else {
+        let Some(action) = event_to_action(&hit_map, event::read()?, app.is_editing_text()) else {
             continue;
         };
         let outcome = app.handle_action(action);
@@ -80,6 +79,10 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
     }
 
     Ok(())
+}
+
+fn resolve_config_path(config: Option<PathBuf>) -> PathBuf {
+    config.unwrap_or_else(default_config_path)
 }
 
 struct TerminalSession {
@@ -167,18 +170,21 @@ impl Drop for ScreenGuard {
     }
 }
 
-fn event_to_action(hit_map: &HitMap, event: Event) -> Option<TuiAction> {
+fn event_to_action(hit_map: &HitMap, event: Event, editing_text: bool) -> Option<TuiAction> {
     match event {
-        Event::Key(key) => key_to_action(key),
+        Event::Key(key) => key_to_action(key, editing_text),
         Event::Mouse(mouse) => mouse_to_action(hit_map, mouse),
         Event::Resize(_, _) => None,
         Event::FocusGained | Event::FocusLost | Event::Paste(_) => None,
     }
 }
 
-fn key_to_action(key: KeyEvent) -> Option<TuiAction> {
+fn key_to_action(key: KeyEvent, editing_text: bool) -> Option<TuiAction> {
     if key.kind != KeyEventKind::Press {
         return None;
+    }
+    if editing_text {
+        return text_key_to_action(key);
     }
     match (key.code, key.modifiers) {
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => Some(TuiAction::Save),
@@ -191,6 +197,21 @@ fn key_to_action(key: KeyEvent) -> Option<TuiAction> {
         (KeyCode::Left, _) => Some(TuiAction::PreviousValue),
         (KeyCode::Right, _) | (KeyCode::Enter, _) | (KeyCode::Char(' '), _) => {
             Some(TuiAction::NextValue)
+        }
+        _ => None,
+    }
+}
+
+fn text_key_to_action(key: KeyEvent) -> Option<TuiAction> {
+    match key.code {
+        KeyCode::Enter => Some(TuiAction::TextSubmit),
+        KeyCode::Esc => Some(TuiAction::TextCancel),
+        KeyCode::Backspace => Some(TuiAction::TextBackspace),
+        KeyCode::Char(character)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Some(TuiAction::TextInput(character))
         }
         _ => None,
     }
@@ -222,16 +243,46 @@ mod tests {
     #[test]
     fn key_events_translate_to_tui_actions() {
         assert_eq!(
-            key_to_action(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                false
+            ),
             Some(TuiAction::Save)
         );
         assert_eq!(
-            key_to_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            key_to_action(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), false),
             Some(TuiAction::NextTab)
         );
         assert_eq!(
-            key_to_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            key_to_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
             Some(TuiAction::NextValue)
+        );
+    }
+
+    #[test]
+    fn text_editing_keys_feed_text_instead_of_global_shortcuts() {
+        assert_eq!(
+            key_to_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), true),
+            Some(TuiAction::TextInput('q'))
+        );
+        assert_eq!(
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            key_to_action(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), true),
+            Some(TuiAction::TextBackspace)
+        );
+        assert_eq!(
+            key_to_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), true),
+            Some(TuiAction::TextCancel)
+        );
+        assert_eq!(
+            key_to_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), true),
+            Some(TuiAction::TextSubmit)
         );
     }
 
@@ -286,5 +337,13 @@ mod tests {
             ),
             Some(TuiAction::MoveDown)
         );
+    }
+
+    #[test]
+    fn tui_config_path_defaults_to_probe_home_config_file() {
+        let explicit = PathBuf::from("/tmp/explicit-agent.toml");
+
+        assert_eq!(resolve_config_path(Some(explicit.clone())), explicit);
+        assert_eq!(resolve_config_path(None), default_config_path());
     }
 }

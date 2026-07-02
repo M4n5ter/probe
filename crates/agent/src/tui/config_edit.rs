@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, Metadata, OpenOptions},
     io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -6,18 +7,23 @@ use std::{
     str::FromStr,
 };
 
-use probe_config::{AgentConfig, ConfigError, ExporterConfig};
+use serde::Serialize;
+
+use probe_config::{
+    AgentConfig, ConfigError, ExporterConfig, ExporterTlsConfig, ExporterTransportConfig,
+    default_export_file_path, default_storage_path,
+};
 use probe_core::{Direction, Selector, SelectorTerm};
 use rustix::{
     fs::{FlockOperation, Gid, Mode, OFlags, Uid, fchmod, fchown, flock},
     process::geteuid,
 };
 use thiserror::Error;
-use toml_edit::{Array, DocumentMut, Item, Table, value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
 
 use super::wire::{
     capture_selection_name, compression_codec_name, connection_backend_name, enforcement_mode_name,
-    interception_strategy_name,
+    exporter_transport_name, interception_strategy_name,
 };
 
 #[derive(Debug, Error)]
@@ -71,6 +77,74 @@ pub(crate) fn load_config(path: &Path) -> Result<LoadedTuiConfig, TuiError> {
     Ok(LoadedTuiConfig { source, config })
 }
 
+pub(crate) fn load_or_create_config(path: &Path) -> Result<LoadedTuiConfig, TuiError> {
+    match load_config(path) {
+        Ok(loaded) => Ok(loaded),
+        Err(TuiError::ReadConfig { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            create_minimal_config(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn create_minimal_config(path: &Path) -> Result<LoadedTuiConfig, TuiError> {
+    let source = minimal_config_source();
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| TuiError::WriteConfig {
+        path: parent.display().to_string(),
+        source,
+    })?;
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(OFlags::NOFOLLOW.bits() as i32)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return load_config(path);
+        }
+        Err(source) => {
+            return Err(TuiError::WriteConfig {
+                path: path.display().to_string(),
+                source,
+            });
+        }
+    };
+    file.write_all(source.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|source| TuiError::WriteConfig {
+            path: path.display().to_string(),
+            source,
+        })?;
+    sync_directory(parent)?;
+    let config = AgentConfig::from_toml_str(&source)?;
+    Ok(LoadedTuiConfig { source, config })
+}
+
+fn minimal_config_source() -> String {
+    let mut document = DocumentMut::new();
+    set_root_value(&mut document, "agent_id", value("traffic-probe"));
+    set_root_value(&mut document, "config_version", value("local"));
+    set_value(&mut document, &["capture"], "selection", value("auto"));
+    set_value(
+        &mut document,
+        &["storage"],
+        "path",
+        value(default_storage_path().display().to_string()),
+    );
+    set_value(&mut document, &["export", "worker"], "enabled", value(true));
+    set_value(&mut document, &["enforcement"], "mode", value("audit_only"));
+    set_value(&mut document, &["enforcement"], "backend", value("none"));
+    document.to_string()
+}
+
 pub(crate) fn save_config(
     path: &Path,
     original_source: &str,
@@ -94,6 +168,7 @@ pub(crate) fn save_config(
     }
     runtime::validate_static_runtime_config(&roundtrip)?;
     roundtrip.validate_l7_mitm_contract()?;
+    ensure_generated_local_paths(&roundtrip)?;
     atomic_write(path, rendered.as_bytes())?;
     Ok(rendered)
 }
@@ -278,6 +353,55 @@ fn sync_directory(path: &Path) -> Result<(), TuiError> {
         })
 }
 
+fn ensure_generated_local_paths(config: &AgentConfig) -> Result<(), TuiError> {
+    ensure_generated_file_export_dirs(config, &default_export_file_path())
+}
+
+fn ensure_generated_file_export_dirs(
+    config: &AgentConfig,
+    default_export_file: &Path,
+) -> Result<(), TuiError> {
+    let needs_default_export_dir = config.exporters.iter().any(|exporter| {
+        matches!(
+            &exporter.transport,
+            ExporterTransportConfig::File { path } if path == default_export_file
+        )
+    });
+    if !needs_default_export_dir {
+        return Ok(());
+    }
+    let Some(parent) = default_export_file.parent() else {
+        return Ok(());
+    };
+    ensure_private_directory(parent)
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), TuiError> {
+    fs::create_dir_all(path).map_err(|source| TuiError::WriteConfig {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let metadata = fs::symlink_metadata(path).map_err(|source| TuiError::WriteConfig {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(TuiError::WriteConfig {
+            path: path.display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "generated path must be a real directory",
+            ),
+        });
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+        TuiError::WriteConfig {
+            path: path.display().to_string(),
+            source,
+        }
+    })
+}
+
 fn render_preserving_config(
     original_source: &str,
     config: &AgentConfig,
@@ -312,7 +436,7 @@ fn render_preserving_config(
         "enabled",
         value(config.export.worker.enabled),
     );
-    sync_exporter_codecs(&mut document, &config.exporters);
+    sync_exporters(&mut document, &config.exporters)?;
     set_optional_u64(
         &mut document,
         &["storage", "retention", "ingress"],
@@ -372,23 +496,111 @@ fn render_preserving_config(
     Ok(document.to_string())
 }
 
-fn sync_exporter_codecs(document: &mut DocumentMut, exporters: &[ExporterConfig]) {
-    let Some(exporters_item) = document.as_table_mut().get_mut("exporters") else {
-        return;
+fn sync_exporters(
+    document: &mut DocumentMut,
+    exporters: &[ExporterConfig],
+) -> Result<(), TuiError> {
+    if exporters.is_empty() {
+        return Ok(());
     };
-    let Some(array) = exporters_item.as_array_of_tables_mut() else {
-        return;
+    let Some(array) = exporters_array_mut(document) else {
+        return Ok(());
     };
     for (index, exporter) in exporters.iter().enumerate() {
+        if index >= array.len() {
+            array.push(Table::new());
+        }
         let Some(table) = array.get_mut(index) else {
             continue;
         };
-        set_table_item(
-            table,
-            "codec",
-            value(compression_codec_name(exporter.codec)),
-        );
+        sync_exporter_table(table, exporter)?;
     }
+    Ok(())
+}
+
+fn exporters_array_mut(document: &mut DocumentMut) -> Option<&mut ArrayOfTables> {
+    let root = document.as_table_mut();
+    if !root.contains_key("exporters") {
+        root.insert("exporters", Item::ArrayOfTables(ArrayOfTables::new()));
+    }
+    root.get_mut("exporters")?.as_array_of_tables_mut()
+}
+
+fn sync_exporter_table(table: &mut Table, exporter: &ExporterConfig) -> Result<(), TuiError> {
+    set_table_item(table, "id", value(&exporter.id));
+    set_table_item(
+        table,
+        "transport",
+        value(exporter_transport_name(&exporter.transport)),
+    );
+    set_table_item(
+        table,
+        "codec",
+        value(compression_codec_name(exporter.codec)),
+    );
+    match &exporter.transport {
+        ExporterTransportConfig::Webhook {
+            endpoint,
+            headers,
+            tls,
+        } => {
+            set_table_item(table, "endpoint", value(endpoint));
+            sync_exporter_headers(table, headers)?;
+            sync_exporter_tls(table, tls)?;
+            table.remove("path");
+            table.remove("socket_path");
+        }
+        ExporterTransportConfig::File { path } => {
+            set_table_item(table, "path", value(path.display().to_string()));
+            table.remove("endpoint");
+            table.remove("headers");
+            table.remove("tls");
+            table.remove("socket_path");
+        }
+        ExporterTransportConfig::UnixHttp {
+            socket_path,
+            endpoint,
+            headers,
+        } => {
+            set_table_item(
+                table,
+                "socket_path",
+                value(socket_path.display().to_string()),
+            );
+            set_table_item(table, "endpoint", value(endpoint));
+            sync_exporter_headers(table, headers)?;
+            table.remove("path");
+            table.remove("tls");
+        }
+    }
+    Ok(())
+}
+
+fn sync_exporter_headers(
+    table: &mut Table,
+    headers: &BTreeMap<String, String>,
+) -> Result<(), TuiError> {
+    if headers.is_empty() {
+        table.remove("headers");
+    } else {
+        set_table_item(table, "headers", serialized_table_item(headers)?);
+    }
+    Ok(())
+}
+
+fn sync_exporter_tls(table: &mut Table, tls: &ExporterTlsConfig) -> Result<(), TuiError> {
+    if tls == &ExporterTlsConfig::default() {
+        table.remove("tls");
+    } else {
+        set_table_item(table, "tls", serialized_table_item(tls)?);
+    }
+    Ok(())
+}
+
+fn serialized_table_item<T: Serialize>(value: &T) -> Result<Item, TuiError> {
+    Ok(Item::Table(
+        toml_edit::ser::to_document(value)?.into_table(),
+    ))
 }
 
 fn set_root_value(document: &mut DocumentMut, key: &str, item: Item) {
@@ -590,19 +802,25 @@ fn table_at_existing_path_mut<'a>(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fs,
         os::unix::fs::{PermissionsExt, symlink},
     };
 
+    use exporter::FileExporter;
     use probe_config::{
-        AgentConfig, CaptureSelection, CompressionCodecName, TransparentInterceptionStrategyConfig,
+        AgentConfig, CaptureSelection, CompressionCodecName, ExporterConfig, ExporterTlsConfig,
+        TransparentInterceptionStrategyConfig,
     };
     use probe_core::{EnforcementMode, ProcessSelector, Selector, TrafficSelector};
     use tempfile::TempDir;
 
     use super::super::{
         app::TuiTab,
-        fields::{FieldApplyOutcome, FieldId, apply_field, fields_for_tab},
+        fields::{
+            FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
+            fields_for_tab,
+        },
     };
     use super::*;
 
@@ -716,6 +934,170 @@ max_records = 10000
         assert!(!rendered.contains("max_records"));
         assert_eq!(reloaded.storage.retention.ingress.max_records, None);
         assert_eq!(reloaded.storage.retention.export.max_records, None);
+        Ok(())
+    }
+
+    #[test]
+    fn save_updates_exporter_transport_target_and_removes_stale_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("agent.toml");
+        let source = r#"
+agent_id = "probe"
+config_version = "local"
+
+[[exporters]]
+id = "default"
+transport = "file"
+path = "/tmp/old.jsonl"
+codec = "zstd"
+"#;
+        fs::write(&path, source)?;
+        let mut config = AgentConfig::from_toml_str(source)?;
+        config.exporters[0].transport = ExporterTransportConfig::Webhook {
+            endpoint: "http://127.0.0.1:18080/events".to_string(),
+            headers: Default::default(),
+            tls: Default::default(),
+        };
+
+        let rendered = save_config(&path, source, &config)?;
+        let reloaded = AgentConfig::from_toml_str(&rendered)?;
+
+        assert!(rendered.contains("transport = \"webhook\""));
+        assert!(rendered.contains("endpoint = \"http://127.0.0.1:18080/events\""));
+        assert!(!rendered.contains("path = \"/tmp/old.jsonl\""));
+        assert_eq!(reloaded, config);
+        Ok(())
+    }
+
+    #[test]
+    fn save_removes_stale_exporter_headers_and_tls_when_transport_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("agent.toml");
+        let source = r#"
+agent_id = "probe"
+config_version = "local"
+
+[[exporters]]
+id = "default"
+transport = "webhook"
+endpoint = "https://collector.example/batches"
+headers = { "x-probe-node" = "node-a" }
+codec = "zstd"
+
+[exporters.tls]
+trust_anchor_refs = ["collector-ca"]
+"#;
+        fs::write(&path, source)?;
+        let mut config = AgentConfig::from_toml_str(source)?;
+        config.exporters[0].transport = ExporterTransportConfig::UnixHttp {
+            socket_path: PathBuf::from("/tmp/probe-sidecar.sock"),
+            endpoint: "/batches".to_string(),
+            headers: BTreeMap::new(),
+        };
+
+        let rendered = save_config(&path, source, &config)?;
+        let reloaded = AgentConfig::from_toml_str(&rendered)?;
+
+        assert!(rendered.contains("transport = \"unix_http\""));
+        assert!(rendered.contains("socket_path = \"/tmp/probe-sidecar.sock\""));
+        assert!(!rendered.contains("x-probe-node"));
+        assert!(!rendered.contains("[exporters.tls]"));
+        assert_eq!(reloaded, config);
+        Ok(())
+    }
+
+    #[test]
+    fn save_writes_non_empty_exporter_headers_and_tls() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("agent.toml");
+        let source = r#"
+agent_id = "probe"
+config_version = "local"
+
+[[exporters]]
+id = "default"
+transport = "file"
+path = "/tmp/old.jsonl"
+codec = "zstd"
+"#;
+        fs::write(&path, source)?;
+        let mut config = AgentConfig::from_toml_str(source)?;
+        config.exporters[0].transport = ExporterTransportConfig::Webhook {
+            endpoint: "https://collector.example/batches".to_string(),
+            headers: BTreeMap::from([("x-probe-node".to_string(), "node-a".to_string())]),
+            tls: ExporterTlsConfig {
+                trust_anchor_refs: vec!["collector-ca".to_string()],
+                client_certificate_refs: vec!["client-cert".to_string()],
+                client_private_key_ref: Some("client-key".to_string()),
+            },
+        };
+
+        let rendered = render_preserving_config(source, &config, &path)?;
+        let reloaded = AgentConfig::from_toml_str(&rendered)?;
+
+        assert!(rendered.contains("[exporters.headers]"));
+        assert!(rendered.contains("x-probe-node = \"node-a\""));
+        assert!(rendered.contains("[exporters.tls]"));
+        assert!(rendered.contains("trust_anchor_refs = [\"collector-ca\"]"));
+        assert_eq!(reloaded, config);
+        Ok(())
+    }
+
+    #[test]
+    fn save_creates_exporter_table_when_tui_adds_default_exporter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("agent.toml");
+        let source = r#"
+agent_id = "probe"
+config_version = "local"
+"#;
+        fs::write(&path, source)?;
+        let mut config = AgentConfig::from_toml_str(source)?;
+        let export_path = temp.path().join("events.jsonl");
+        config.exporters.push(ExporterConfig {
+            transport: ExporterTransportConfig::File {
+                path: export_path.clone(),
+            },
+            ..ExporterConfig::default()
+        });
+
+        let rendered = save_config(&path, source, &config)?;
+        let reloaded = AgentConfig::from_toml_str(&rendered)?;
+
+        assert!(rendered.contains("[[exporters]]"));
+        assert!(rendered.contains("transport = \"file\""));
+        assert!(rendered.contains(&format!("path = \"{}\"", export_path.display())));
+        assert_eq!(reloaded, config);
+        Ok(())
+    }
+
+    #[test]
+    fn generated_default_file_exporter_parent_is_created_before_save()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        let export_file = temp.path().join("export").join("events.jsonl");
+        let mut config = AgentConfig::default();
+        config.exporters.push(ExporterConfig {
+            transport: ExporterTransportConfig::File {
+                path: export_file.clone(),
+            },
+            ..ExporterConfig::default()
+        });
+
+        ensure_generated_file_export_dirs(&config, &export_file)?;
+
+        assert!(export_file.parent().expect("export parent").is_dir());
+        assert_eq!(
+            fs::metadata(export_file.parent().expect("export parent"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        FileExporter::preflight_path(&export_file)?;
         Ok(())
     }
 
@@ -936,7 +1318,87 @@ exporters = [{ id = "default", transport = "file", path = "/tmp/events.jsonl", c
             let mut config = AgentConfig::from_toml_str(source)?;
             prepare_field_persistence_config(field, &mut config);
 
-            let outcome = apply_field(&mut config, field, 1, Some(exe_selector("/usr/bin/curl")));
+            let outcome = if editable_text_value(&config, field).is_some() {
+                apply_text_field(&mut config, field, field_persistence_text_value(field))
+            } else {
+                apply_field(&mut config, field, 1, Some(exe_selector("/usr/bin/curl")))
+            };
+            assert_ne!(outcome, FieldApplyOutcome::Unchanged, "field {field:?}");
+            let rendered = save_config(&path, source, &config)?;
+            let reloaded = AgentConfig::from_toml_str(&rendered)?;
+
+            assert_eq!(reloaded, config, "field {field:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exporter_target_text_fields_persist_through_save_and_reload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (
+                FieldId::ExporterWebhookEndpoint(0),
+                r#"
+agent_id = "probe"
+config_version = "local"
+
+[[exporters]]
+id = "default"
+transport = "webhook"
+endpoint = "http://127.0.0.1:8080/events"
+codec = "zstd"
+"#,
+            ),
+            (
+                FieldId::ExporterFilePath(0),
+                r#"
+agent_id = "probe"
+config_version = "local"
+
+[[exporters]]
+id = "default"
+transport = "file"
+path = "/tmp/events.jsonl"
+codec = "zstd"
+"#,
+            ),
+            (
+                FieldId::ExporterUnixSocketPath(0),
+                r#"
+agent_id = "probe"
+config_version = "local"
+
+[[exporters]]
+id = "default"
+transport = "unix_http"
+socket_path = "/tmp/probe-export.sock"
+endpoint = "/events"
+codec = "zstd"
+"#,
+            ),
+            (
+                FieldId::ExporterUnixHttpEndpoint(0),
+                r#"
+agent_id = "probe"
+config_version = "local"
+
+[[exporters]]
+id = "default"
+transport = "unix_http"
+socket_path = "/tmp/probe-export.sock"
+endpoint = "/events"
+codec = "zstd"
+"#,
+            ),
+        ];
+
+        for (field, source) in cases {
+            let temp = TempDir::new()?;
+            let path = temp.path().join("agent.toml");
+            fs::write(&path, source)?;
+            let mut config = AgentConfig::from_toml_str(source)?;
+
+            let outcome = apply_text_field(&mut config, field, field_persistence_text_value(field));
             assert_ne!(outcome, FieldApplyOutcome::Unchanged, "field {field:?}");
             let rendered = save_config(&path, source, &config)?;
             let reloaded = AgentConfig::from_toml_str(&rendered)?;
@@ -957,6 +1419,25 @@ exporters = [{ id = "default", transport = "file", path = "/tmp/events.jsonl", c
 
         assert_eq!(loaded.source, source);
         assert_eq!(loaded.config.agent_id, "probe");
+        Ok(())
+    }
+
+    #[test]
+    fn load_or_create_config_creates_minimal_safe_config() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("nested").join("agent.toml");
+
+        let loaded = load_or_create_config(&path)?;
+
+        assert_eq!(fs::read_to_string(&path)?, loaded.source);
+        assert_eq!(loaded.config.agent_id, "traffic-probe");
+        assert_eq!(loaded.config.capture.selection, CaptureSelection::Auto);
+        assert_eq!(loaded.config.storage.path, default_storage_path());
+        assert!(loaded.config.exporters.is_empty());
+        assert_eq!(loaded.config.enforcement.mode, EnforcementMode::AuditOnly);
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        loaded.config.validate_basic()?;
         Ok(())
     }
 
@@ -999,6 +1480,16 @@ path = "/tmp/enforcement-policy.toml"
 "#;
         }
         field_persistence_base_source()
+    }
+
+    fn field_persistence_text_value(field: FieldId) -> String {
+        match field {
+            FieldId::ExporterWebhookEndpoint(_) => "http://127.0.0.1:18080/events".to_string(),
+            FieldId::ExporterFilePath(_) => "/tmp/tui-events.jsonl".to_string(),
+            FieldId::ExporterUnixSocketPath(_) => "/tmp/tui-export.sock".to_string(),
+            FieldId::ExporterUnixHttpEndpoint(_) => "/events".to_string(),
+            _ => String::new(),
+        }
     }
 
     fn field_persistence_base_source() -> &'static str {

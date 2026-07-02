@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::{
-    app::{StatusKind, TuiApp, TuiTab},
+    app::{StatusKind, TextEditSession, TuiApp, TuiTab},
     hit::{HitArea, HitMap, HitTarget},
     traffic::TrafficStatusKind,
 };
@@ -36,6 +36,9 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &TuiApp) -> HitMap {
         _ => render_fields(frame, body, app, &mut hits),
     }
     render_footer(frame, footer, app);
+    if let Some(edit) = app.text_edit() {
+        render_text_edit(frame, area, edit, &mut hits);
+    }
     HitMap::new(hits)
 }
 
@@ -391,6 +394,46 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(Paragraph::new(text), area);
 }
 
+fn render_text_edit(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    edit: &TextEditSession,
+    hits: &mut Vec<HitArea>,
+) {
+    let available_width = area.width.saturating_sub(2).max(1);
+    let width = available_width.min(92).max(available_width.min(40));
+    let available_height = area.height.saturating_sub(2).max(1);
+    let height = available_height.min(8).max(available_height.min(6));
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let modal = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, modal);
+
+    let input_width = width.saturating_sub(6) as usize;
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Field: ", Style::default().fg(Color::Gray)),
+            Span::raw(edit.label().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Value: ", Style::default().fg(Color::Gray)),
+            Span::raw(truncate(edit.buffer(), input_width)),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title("Edit"))
+            .wrap(Wrap { trim: false }),
+        modal,
+    );
+
+    let button_y = modal.y + modal.height.saturating_sub(2);
+    let apply = Rect::new(modal.x + 2, button_y, 9, 1);
+    let cancel = Rect::new(modal.x + 13, button_y, 10, 1);
+    render_button(frame, hits, apply, "Apply", HitTarget::TextEditSubmit);
+    render_button(frame, hits, cancel, "Cancel", HitTarget::TextEditCancel);
+}
+
 fn render_button(
     frame: &mut Frame<'_>,
     hits: &mut Vec<HitArea>,
@@ -441,12 +484,13 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use probe_config::AgentConfig;
+    use probe_config::{AgentConfig, ExporterConfig, ExporterTransportConfig};
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{
         super::{
             app::{TuiAction, TuiApp},
+            fields::FieldId,
             processes::{ProcessCatalog, ProcessEntry},
         },
         *,
@@ -482,6 +526,41 @@ mod tests {
 
         assert_eq!(hit_map.hit(23, 4), Some(HitTarget::Tab(TuiTab::Capture)));
         assert_eq!(hit_map.hit(2, 9), Some(HitTarget::Process(0)));
+        Ok(())
+    }
+
+    #[test]
+    fn render_text_edit_modal_registers_apply_and_cancel_hits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.exporters.push(ExporterConfig {
+            transport: ExporterTransportConfig::File {
+                path: PathBuf::from("/tmp/events.jsonl"),
+            },
+            ..ExporterConfig::default()
+        });
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            config,
+            ProcessCatalog::default(),
+        );
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Export)));
+        app.handle_action(TuiAction::Click(HitTarget::Field(
+            FieldId::ExporterFilePath(0),
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24))?;
+        let mut hit_map = HitMap::default();
+
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &app);
+        })?;
+
+        let output = terminal.backend().to_string();
+        assert!(output.contains("Edit"));
+        assert!(output.contains("Field: File path"));
+        assert!(output.contains("Value: /tmp/events.jsonl"));
+        assert_eq!(hit_map.hit(7, 14), Some(HitTarget::TextEditSubmit));
+        assert_eq!(hit_map.hit(18, 14), Some(HitTarget::TextEditCancel));
         Ok(())
     }
 

@@ -8,6 +8,8 @@ pub(crate) enum HitTarget {
     Field(FieldId),
     Process(usize),
     TrafficRow(usize),
+    TextEditSubmit,
+    TextEditCancel,
     Save,
     Reload,
     Quit,
