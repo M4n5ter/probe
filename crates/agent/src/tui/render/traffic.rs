@@ -375,7 +375,7 @@ fn render_traffic_detail_preview(frame: &mut Frame<'_>, area: Rect, app: &TuiApp
                 row.preview_lines(area.height.saturating_sub(2).max(1) as usize),
             )
         })
-        .unwrap_or_else(|| vec![Line::from("Select a traffic row to inspect details")]);
+        .unwrap_or_else(|| preview_lines_for_render(app.traffic().diagnostic_lines()));
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::bordered().title("Selected Event"))
@@ -421,6 +421,7 @@ fn traffic_status_color(kind: TrafficStatusKind) -> Color {
     match kind {
         TrafficStatusKind::Idle => Color::Gray,
         TrafficStatusKind::Active => Color::Green,
+        TrafficStatusKind::Warning => Color::Yellow,
         TrafficStatusKind::Error => Color::Yellow,
     }
 }

@@ -10,6 +10,7 @@ use super::hit::HitTarget;
 use super::process_view::ProcessViewState;
 use super::processes::{ProcessCatalog, selector_for_exe_path};
 use super::runtime_attachment::RuntimeAttachment;
+use super::runtime_status::request_capture_diagnostics;
 use super::traffic::TrafficState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,10 +562,15 @@ impl TuiApp {
     }
 
     pub(crate) async fn refresh_traffic(&mut self) {
-        let Some(socket_path) = self.runtime_attachment.active_socket_path() else {
-            self.traffic.mark_admin_unavailable(
-                "No active agent admin socket is attached to this TUI session",
-            );
+        let Some(socket_path) = self
+            .runtime_attachment
+            .active_socket_path()
+            .map(PathBuf::from)
+        else {
+            self.traffic.mark_admin_unavailable(format!(
+                "No active agent admin socket is attached; {}",
+                self.runtime_agent_status()
+            ));
             self.status = StatusMessage::warning(self.traffic.status().text.clone());
             return;
         };
@@ -583,9 +589,13 @@ impl TuiApp {
                 return;
             }
         };
-        self.traffic.refresh(socket_path, selector).await;
+        self.traffic.refresh(&socket_path, selector).await;
+        if let Ok(diagnostics) = request_capture_diagnostics(&socket_path).await {
+            self.traffic.set_capture_diagnostics(diagnostics);
+        }
         match self.traffic.status().kind {
-            super::traffic::TrafficStatusKind::Error => {
+            super::traffic::TrafficStatusKind::Error
+            | super::traffic::TrafficStatusKind::Warning => {
                 self.status = StatusMessage::warning(self.traffic.status().text.clone());
             }
             super::traffic::TrafficStatusKind::Idle | super::traffic::TrafficStatusKind::Active => {

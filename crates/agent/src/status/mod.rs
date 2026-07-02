@@ -12,6 +12,9 @@ mod snapshot;
 mod spool;
 mod tls;
 
+pub(crate) use capture::CaptureStatusSnapshot;
+#[cfg(test)]
+pub(crate) use capture::{CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot};
 pub(crate) use metrics::MetricsSnapshot;
 pub(crate) use prometheus::{PROMETHEUS_TEXT_CONTENT_TYPE, render_prometheus_metrics};
 pub(crate) use snapshot::{

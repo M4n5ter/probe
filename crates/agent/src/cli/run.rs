@@ -19,7 +19,7 @@ use probe_core::{
 use storage::FjallSpool;
 
 use crate::{
-    artifacts::hydrate_tls_uprobe_object_path,
+    artifacts::hydrate_runtime_artifact_paths,
     check::{build_check_report, build_invalid_config_report},
     error::AgentError,
     export::drain_replay_webhook,
@@ -316,7 +316,7 @@ async fn build_check_command_output(config: AgentConfig) -> Result<CheckCommandO
 }
 
 fn prepare_runtime_config(mut config: AgentConfig) -> Result<AgentConfig, AgentError> {
-    let _ = hydrate_tls_uprobe_object_path(&mut config)?;
+    hydrate_runtime_artifact_paths(&mut config)?;
     Ok(config)
 }
 

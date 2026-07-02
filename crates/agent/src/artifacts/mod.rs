@@ -5,13 +5,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use probe_config::{AgentConfig, probe_home_path};
+use ebpf_object::EbpfObjectArtifact;
+#[cfg(test)]
+use probe_config::CaptureSelection;
+use probe_config::{AgentConfig, CaptureBackend, probe_home_path};
 use rustix::fs::OFlags;
 use thiserror::Error;
 
+const PROCESS_OBSERVATION_OBJECT_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ebpf-process-observation"));
 const TLS_UPROBE_OBJECT_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/ebpf-tls-plaintext"));
-const TLS_UPROBE_OBJECT_HASH_BYTES: usize = 16;
+const EBPF_OBJECT_HASH_BYTES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ArtifactHydration {
@@ -32,8 +37,66 @@ pub(crate) enum ArtifactError {
     InvalidDirectory(PathBuf),
 }
 
+pub(crate) fn hydrate_runtime_artifact_paths(
+    config: &mut AgentConfig,
+) -> Result<(), ArtifactError> {
+    let _ = hydrate_process_observation_object_path(config)?;
+    let _ = hydrate_tls_uprobe_object_path(config)?;
+    Ok(())
+}
+
+pub(crate) fn normalize_embedded_artifact_paths_for_comparison(config: &mut AgentConfig) {
+    normalize_path_if_embedded(
+        &mut config.capture.ebpf.object_path,
+        EbpfObjectArtifact::ProcessObservation,
+    );
+    normalize_path_if_embedded(
+        &mut config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path,
+        EbpfObjectArtifact::TlsPlaintext,
+    );
+}
+
+pub(crate) fn hydrate_process_observation_object_path(
+    config: &mut AgentConfig,
+) -> Result<ArtifactHydration, ArtifactError> {
+    hydrate_process_observation_object_path_in(config, default_ebpf_artifact_directory())
+}
+
 pub(crate) fn hydrate_tls_uprobe_object_path(
     config: &mut AgentConfig,
+) -> Result<ArtifactHydration, ArtifactError> {
+    hydrate_tls_uprobe_object_path_in(config, default_ebpf_artifact_directory())
+}
+
+fn hydrate_process_observation_object_path_in(
+    config: &mut AgentConfig,
+    directory: PathBuf,
+) -> Result<ArtifactHydration, ArtifactError> {
+    if !config.capture.may_use_backend(CaptureBackend::Ebpf) {
+        return Ok(ArtifactHydration::NotNeeded);
+    }
+    if config
+        .capture
+        .ebpf
+        .object_path
+        .as_ref()
+        .is_some_and(|path| !path.as_os_str().is_empty())
+    {
+        return Ok(ArtifactHydration::AlreadyConfigured);
+    }
+    let path =
+        materialize_embedded_ebpf_object_in(directory, EbpfObjectArtifact::ProcessObservation)?;
+    config.capture.ebpf.object_path = Some(path);
+    Ok(ArtifactHydration::Materialized)
+}
+
+fn hydrate_tls_uprobe_object_path_in(
+    config: &mut AgentConfig,
+    directory: PathBuf,
 ) -> Result<ArtifactHydration, ArtifactError> {
     let instrumentation = &mut config.tls.plaintext.instrumentation;
     if !instrumentation.enabled {
@@ -46,27 +109,74 @@ pub(crate) fn hydrate_tls_uprobe_object_path(
     {
         return Ok(ArtifactHydration::AlreadyConfigured);
     }
-    let path = materialize_embedded_tls_uprobe_object()?;
+    let path = materialize_embedded_ebpf_object_in(directory, EbpfObjectArtifact::TlsPlaintext)?;
     instrumentation.libssl_uprobe_object_path = Some(path);
     Ok(ArtifactHydration::Materialized)
 }
 
-pub(crate) fn materialize_embedded_tls_uprobe_object() -> Result<PathBuf, ArtifactError> {
-    let directory = probe_home_path(PathBuf::from("artifacts").join("ebpf"));
+fn materialize_embedded_ebpf_object_in(
+    directory: PathBuf,
+    artifact: EbpfObjectArtifact,
+) -> Result<PathBuf, ArtifactError> {
     ensure_private_directory(&directory)?;
-    let path = directory.join(tls_uprobe_object_file_name());
-    if artifact_file_matches(&path, TLS_UPROBE_OBJECT_BYTES)? {
+    let bytes = artifact.bytes();
+    let path = directory.join(artifact.file_name());
+    if artifact_file_matches(&path, bytes)? {
         return Ok(path);
     }
 
-    write_artifact_atomically(&directory, &path, TLS_UPROBE_OBJECT_BYTES)?;
+    write_artifact_atomically(&directory, &path, bytes)?;
     Ok(path)
 }
 
-fn tls_uprobe_object_file_name() -> String {
-    let hash = blake3::hash(TLS_UPROBE_OBJECT_BYTES).to_hex().to_string();
-    let prefix = &hash[..TLS_UPROBE_OBJECT_HASH_BYTES];
-    format!("tls-plaintext-{prefix}.bpf.o")
+fn normalize_path_if_embedded(path: &mut Option<PathBuf>, artifact: EbpfObjectArtifact) {
+    if path
+        .as_ref()
+        .is_some_and(|path| path == &embedded_ebpf_object_path(artifact))
+    {
+        *path = None;
+    }
+}
+
+fn embedded_ebpf_object_path(artifact: EbpfObjectArtifact) -> PathBuf {
+    default_ebpf_artifact_directory().join(artifact.file_name())
+}
+
+#[cfg(test)]
+pub(crate) fn embedded_process_observation_object_path_for_test() -> PathBuf {
+    embedded_ebpf_object_path(EbpfObjectArtifact::ProcessObservation)
+}
+
+fn default_ebpf_artifact_directory() -> PathBuf {
+    probe_home_path(PathBuf::from("artifacts").join("ebpf"))
+}
+
+trait EmbeddedEbpfObjectExt {
+    fn bytes(self) -> &'static [u8];
+    fn file_name(self) -> String;
+    fn file_prefix(self) -> &'static str;
+}
+
+impl EmbeddedEbpfObjectExt for EbpfObjectArtifact {
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::ProcessObservation => PROCESS_OBSERVATION_OBJECT_BYTES,
+            Self::TlsPlaintext => TLS_UPROBE_OBJECT_BYTES,
+        }
+    }
+
+    fn file_name(self) -> String {
+        let hash = blake3::hash(self.bytes()).to_hex().to_string();
+        let prefix = &hash[..EBPF_OBJECT_HASH_BYTES];
+        format!("{}-{prefix}.bpf.o", self.file_prefix())
+    }
+
+    fn file_prefix(self) -> &'static str {
+        match self {
+            Self::ProcessObservation => "process-observation",
+            Self::TlsPlaintext => "tls-plaintext",
+        }
+    }
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), ArtifactError> {
@@ -100,21 +210,21 @@ fn write_artifact_atomically(
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("tls-plaintext.bpf.o");
+        .unwrap_or("embedded-ebpf-object.bpf.o");
     let temp_path = directory.join(format!(".{file_name}.{}.tmp", std::process::id()));
     let write_result = create_private_file(&temp_path)
         .and_then(|mut file| {
             file.write_all(bytes)
                 .and_then(|()| file.sync_all())
                 .map_err(|source| ArtifactError::Io {
-                    action: "write embedded TLS uprobe object",
+                    action: "write embedded eBPF object",
                     path: temp_path.clone(),
                     source,
                 })
         })
         .and_then(|()| {
             fs::rename(&temp_path, path).map_err(|source| ArtifactError::Io {
-                action: "install embedded TLS uprobe object",
+                action: "install embedded eBPF object",
                 path: path.to_path_buf(),
                 source,
             })
@@ -132,7 +242,7 @@ fn artifact_file_matches(path: &Path, bytes: &[u8]) -> Result<bool, ArtifactErro
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(source) => {
             return Err(ArtifactError::Io {
-                action: "inspect embedded TLS uprobe object",
+                action: "inspect embedded eBPF object",
                 path: path.to_path_buf(),
                 source,
             });
@@ -140,7 +250,7 @@ fn artifact_file_matches(path: &Path, bytes: &[u8]) -> Result<bool, ArtifactErro
     };
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(ArtifactError::Io {
-            action: "inspect embedded TLS uprobe object",
+            action: "inspect embedded eBPF object",
             path: path.to_path_buf(),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -151,7 +261,7 @@ fn artifact_file_matches(path: &Path, bytes: &[u8]) -> Result<bool, ArtifactErro
     fs::read(path)
         .map(|existing| existing == bytes)
         .map_err(|source| ArtifactError::Io {
-            action: "read embedded TLS uprobe object",
+            action: "read embedded eBPF object",
             path: path.to_path_buf(),
             source,
         })
@@ -166,7 +276,7 @@ fn create_private_file(path: &Path) -> Result<File, ArtifactError> {
         .custom_flags(OFlags::NOFOLLOW.bits() as i32)
         .open(path)
         .map_err(|source| ArtifactError::Io {
-            action: "create embedded TLS uprobe object",
+            action: "create embedded eBPF object",
             path: path.to_path_buf(),
             source,
         })
@@ -180,6 +290,113 @@ fn sync_directory(path: &Path) -> Result<(), ArtifactError> {
             path: path.to_path_buf(),
             source,
         })
+}
+
+#[cfg(test)]
+#[test]
+fn process_observation_hydration_materializes_default_object() -> Result<(), ArtifactError> {
+    let (_temp, directory) = temp_artifact_directory();
+    let mut config = AgentConfig::default();
+
+    let outcome = hydrate_process_observation_object_path_in(&mut config, directory.clone())?;
+
+    assert_eq!(outcome, ArtifactHydration::Materialized);
+    let path = config
+        .capture
+        .ebpf
+        .object_path
+        .as_ref()
+        .expect("process observation object path should be configured");
+    assert!(path.starts_with(&directory));
+    assert!(
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.starts_with("process-observation-"))
+    );
+    assert_eq!(read_artifact(path)?, PROCESS_OBSERVATION_OBJECT_BYTES);
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn process_observation_hydration_ignores_non_ebpf_capture_selection() -> Result<(), ArtifactError> {
+    let (_temp, directory) = temp_artifact_directory();
+    let mut config = AgentConfig::default();
+    config.capture.selection = CaptureSelection::Libpcap;
+
+    let outcome = hydrate_process_observation_object_path_in(&mut config, directory)?;
+
+    assert_eq!(outcome, ArtifactHydration::NotNeeded);
+    assert!(config.capture.ebpf.object_path.is_none());
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn process_observation_hydration_keeps_explicit_object_path() -> Result<(), ArtifactError> {
+    let (_temp, directory) = temp_artifact_directory();
+    let mut config = AgentConfig::default();
+    let path = PathBuf::from("/var/lib/traffic-probe/artifacts/ebpf/custom-process.bpf.o");
+    config.capture.ebpf.object_path = Some(path.clone());
+
+    let outcome = hydrate_process_observation_object_path_in(&mut config, directory)?;
+
+    assert_eq!(outcome, ArtifactHydration::AlreadyConfigured);
+    assert_eq!(config.capture.ebpf.object_path, Some(path));
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn embedded_artifact_normalization_ignores_generated_runtime_paths() {
+    let mut config = AgentConfig::default();
+    config.capture.ebpf.object_path = Some(embedded_ebpf_object_path(
+        EbpfObjectArtifact::ProcessObservation,
+    ));
+    config
+        .tls
+        .plaintext
+        .instrumentation
+        .libssl_uprobe_object_path =
+        Some(embedded_ebpf_object_path(EbpfObjectArtifact::TlsPlaintext));
+
+    normalize_embedded_artifact_paths_for_comparison(&mut config);
+
+    assert!(config.capture.ebpf.object_path.is_none());
+    assert!(
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path
+            .is_none()
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn embedded_artifact_normalization_keeps_custom_paths() {
+    let mut config = AgentConfig::default();
+    let process_path = PathBuf::from("/opt/probe/custom-process.bpf.o");
+    let tls_path = PathBuf::from("/opt/probe/custom-tls.bpf.o");
+    config.capture.ebpf.object_path = Some(process_path.clone());
+    config
+        .tls
+        .plaintext
+        .instrumentation
+        .libssl_uprobe_object_path = Some(tls_path.clone());
+
+    normalize_embedded_artifact_paths_for_comparison(&mut config);
+
+    assert_eq!(config.capture.ebpf.object_path, Some(process_path));
+    assert_eq!(
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path,
+        Some(tls_path)
+    );
 }
 
 #[cfg(test)]
@@ -225,4 +442,20 @@ fn tls_uprobe_hydration_keeps_explicit_object_path() -> Result<(), ArtifactError
         Some(path)
     );
     Ok(())
+}
+
+#[cfg(test)]
+fn temp_artifact_directory() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let directory = temp.path().join("artifacts/ebpf");
+    (temp, directory)
+}
+
+#[cfg(test)]
+fn read_artifact(path: &Path) -> Result<Vec<u8>, ArtifactError> {
+    fs::read(path).map_err(|source| ArtifactError::Io {
+        action: "read materialized eBPF object",
+        path: path.to_path_buf(),
+        source,
+    })
 }

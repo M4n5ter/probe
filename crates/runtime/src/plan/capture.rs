@@ -266,16 +266,7 @@ impl CaptureProviderBuilder {
 }
 
 fn capture_candidates(config: &AgentConfig) -> Vec<CaptureBackend> {
-    match config.capture.selection.explicit_backend() {
-        None => config
-            .capture
-            .fallback_backends
-            .iter()
-            .copied()
-            .map(CaptureBackend::from)
-            .collect(),
-        Some(backend) => vec![backend],
-    }
+    config.capture.candidate_backends()
 }
 
 fn capture_backend_capability(backend: CaptureBackend) -> CapabilityKind {

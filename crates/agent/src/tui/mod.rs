@@ -9,6 +9,7 @@ mod processes;
 mod render;
 mod runtime_actions;
 mod runtime_attachment;
+mod runtime_status;
 mod terminal;
 mod traffic;
 mod wire;

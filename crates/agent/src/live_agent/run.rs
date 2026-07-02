@@ -14,7 +14,7 @@ use crate::{
         AdminRuntimeState, AdminServerConfig, AdminServerHandle, PrometheusListenerConfig,
         spawn_admin_server,
     },
-    artifacts::hydrate_tls_uprobe_object_path,
+    artifacts::hydrate_runtime_artifact_paths,
     capture_provider::{
         CaptureProviderPreflight, CaptureProviderRuntimeState, build_capture_provider,
     },
@@ -265,7 +265,7 @@ pub(crate) async fn run_live_agent(
 }
 
 fn require_runtime_artifacts(config: &mut AgentConfig) -> Result<(), AgentError> {
-    let _ = hydrate_tls_uprobe_object_path(config)?;
+    hydrate_runtime_artifact_paths(config)?;
     Ok(())
 }
 

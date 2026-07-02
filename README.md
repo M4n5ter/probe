@@ -134,8 +134,8 @@ Common requirements:
 - root or matching Linux capabilities for live capture, eBPF, socket destroy,
   transparent interception, or MITM tests;
 - `nftables` package when running Linux transparent interception;
-- nightly Rust with `rust-src` and `bpf-linker`; the agent embeds the
-  first-party TLS uprobe object by default during build.
+- nightly Rust with `rust-src` and `bpf-linker`; the agent embeds first-party
+  process-observation and TLS uprobe objects by default during build.
 
 Common `nft` installation commands:
 
@@ -163,7 +163,7 @@ Build the first-party MITM proxy and fixture when running MITM E2E cases:
 cargo build -p agent -p e2e-fixture -p mitm-proxy -p xtask --locked
 ```
 
-Build eBPF artifacts:
+Build eBPF artifacts when developing or validating custom eBPF objects:
 
 ```bash
 rustup toolchain install nightly --component rust-src
@@ -171,14 +171,11 @@ cargo install bpf-linker
 cargo run -p xtask --locked -- ebpf-build
 ```
 
-After building eBPF artifacts, set the generated process-observation object
-path in the agent configuration:
-
-- process observation: `capture.ebpf.object_path`.
-
-The agent embeds the first-party TLS uprobe object by default when it is built.
-Set `tls.plaintext.instrumentation.libssl_uprobe_object_path` only when using a
-custom or externally managed TLS uprobe object.
+The agent embeds the first-party process-observation and TLS uprobe objects by
+default when it is built. At runtime it materializes the required embedded
+objects under `PROBE_HOME/artifacts/ebpf`. Set `capture.ebpf.object_path` or
+`tls.plaintext.instrumentation.libssl_uprobe_object_path` only when using a
+custom or externally managed eBPF object.
 
 ## Choose A Run Mode
 
@@ -552,7 +549,9 @@ selection = "auto"
 fallback_backends = ["ebpf", "libpcap"]
 
 [capture.ebpf]
-object_path = "target/ebpf/bpfel-unknown-none/release/ebpf-program"
+# Optional override for a custom process-observation object. Normal runs use
+# the embedded object materialized under PROBE_HOME/artifacts/ebpf.
+# object_path = "/opt/traffic-probe/ebpf-process-observation.bpf.o"
 
 [capture.libpcap]
 interface = "any"
@@ -780,8 +779,9 @@ that proxy, and the proxy applies the same file type, size, ownership, and
 permission checks for TLS termination and upstream trust material loading.
 
 Best-effort libssl plaintext instrumentation is explicit. Agent builds embed
-the first-party TLS uprobe object by default. When hooks are enabled and no
-override path is configured, the agent materializes that object under
+the first-party TLS uprobe object by default, alongside the process-observation
+object used by eBPF capture. When hooks are enabled and no override path is
+configured, the agent materializes the TLS object under
 `PROBE_HOME/artifacts/ebpf/` and uses the generated content-addressed path.
 Configure a selector to avoid broad attachment:
 
@@ -809,9 +809,10 @@ directions = ["outbound"]
 remote_addresses = []
 ```
 
-`libssl_uprobe_object_path` is an advanced override for custom eBPF artifacts.
-Normal installations should keep generated assets under `PROBE_HOME` so
-uninstalling the probe can remove a single state tree.
+`capture.ebpf.object_path` and `libssl_uprobe_object_path` are advanced
+overrides for custom eBPF artifacts. Normal installations should keep generated
+assets under `PROBE_HOME` so uninstalling the probe can remove a single state
+tree.
 
 ### Enforcement And MITM
 
@@ -826,6 +827,11 @@ backend = "none"
 Use `dry_run` to exercise planner decisions without applying a destructive
 backend. Use `enforce` only with an explicit backend, selector, policy source,
 and operational approval.
+
+When passive eBPF/libpcap capture is unavailable, transparent proxy or MITM can
+provide a reliable HTTP/TLS content path for scoped traffic. It is an explicit
+data-plane strategy, not a silent fallback: it requires traffic steering,
+operator-managed trust, and a configured MITM backend.
 
 Lua policies emit event-level alerts and verdict requests. Enforcement policy
 manifests are a separate control input that defines which protective actions may

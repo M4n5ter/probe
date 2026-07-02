@@ -28,10 +28,10 @@ selection = "auto"
 fallback_backends = ["ebpf", "libpcap"]
 
 [capture.ebpf]
-# eBPF process observation requires an explicit built object path.
-# Build it with `cargo run -p xtask --locked -- ebpf-build`, then point this
-# field at the generated object or at the installed object path for production.
-# object_path = "target/ebpf/bpfel-unknown-none/release/ebpf-program"
+# The first-party process observation object is embedded in the agent binary
+# and materialized under PROBE_HOME/artifacts/ebpf when eBPF capture is needed.
+# Set object_path only when testing or deploying a custom object.
+# object_path = "/opt/traffic-probe/ebpf-process-observation.bpf.o"
 
 [capture.libpcap]
 # Leave interface unset to let libpcap choose a default device. Use "any" or

@@ -6,48 +6,84 @@ use std::{
 
 use ebpf_object::{EbpfObjectArtifact, EbpfObjectProbe};
 
+const PROCESS_OBSERVATION_SOURCE_ENV: &str = "PROBE_PROCESS_OBSERVATION_OBJECT_SOURCE";
 const TLS_UPROBE_SOURCE_ENV: &str = "PROBE_TLS_UPROBE_OBJECT_SOURCE";
+const OUT_PROCESS_OBSERVATION_OBJECT: &str = "ebpf-process-observation";
 const OUT_TLS_UPROBE_OBJECT: &str = "ebpf-tls-plaintext";
 const BPF_TARGET: &str = "bpfel-unknown-none";
 const BPF_LINKER: &str = "bpf-linker";
 const EBPF_TARGET_DIR: &str = "target/ebpf";
+const EBPF_PROCESS_OBSERVATION_OBJECT: &str = "bpfel-unknown-none/release/ebpf-program";
 const EBPF_TLS_UPROBE_OBJECT: &str = "bpfel-unknown-none/release/ebpf-tls-plaintext";
 
 fn main() {
+    println!("cargo:rerun-if-env-changed={PROCESS_OBSERVATION_SOURCE_ENV}");
     println!("cargo:rerun-if-env-changed={TLS_UPROBE_SOURCE_ENV}");
     print_ebpf_rerun_inputs();
 
-    let out_path = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"))
-        .join(OUT_TLS_UPROBE_OBJECT);
-    embed_tls_uprobe_object(&tls_uprobe_source(), &out_path);
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
+    let sources = resolve_ebpf_object_sources();
+    embed_ebpf_object(
+        EbpfObjectArtifact::ProcessObservation,
+        &sources.process_observation,
+        &out_dir.join(OUT_PROCESS_OBSERVATION_OBJECT),
+    );
+    embed_ebpf_object(
+        EbpfObjectArtifact::TlsPlaintext,
+        &sources.tls_plaintext,
+        &out_dir.join(OUT_TLS_UPROBE_OBJECT),
+    );
 }
 
-fn configured_source() -> Option<PathBuf> {
-    env::var_os(TLS_UPROBE_SOURCE_ENV)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+struct EbpfObjectSources {
+    process_observation: PathBuf,
+    tls_plaintext: PathBuf,
 }
 
-fn tls_uprobe_source() -> PathBuf {
-    match configured_source() {
-        Some(source) => {
-            println!("cargo:rerun-if-changed={}", source.display());
-            source
-        }
-        None => default_tls_uprobe_source(),
+fn resolve_ebpf_object_sources() -> EbpfObjectSources {
+    let process_observation = configured_source(PROCESS_OBSERVATION_SOURCE_ENV);
+    let tls_plaintext = configured_source(TLS_UPROBE_SOURCE_ENV);
+    if process_observation.is_none() || tls_plaintext.is_none() {
+        build_first_party_ebpf_artifacts();
+    }
+    EbpfObjectSources {
+        process_observation: process_observation.unwrap_or_else(default_process_observation_source),
+        tls_plaintext: tls_plaintext.unwrap_or_else(default_tls_uprobe_source),
     }
 }
 
+fn configured_source(env_name: &str) -> Option<PathBuf> {
+    env::var_os(env_name)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let source = PathBuf::from(value);
+            println!("cargo:rerun-if-changed={}", source.display());
+            source
+        })
+}
+
+fn default_process_observation_source() -> PathBuf {
+    default_ebpf_source(default_process_observation_path(), "process observation")
+}
+
 fn default_tls_uprobe_source() -> PathBuf {
-    let path = default_tls_uprobe_path();
-    build_first_party_ebpf_artifacts();
+    default_ebpf_source(default_tls_uprobe_path(), "TLS uprobe")
+}
+
+fn default_ebpf_source(path: PathBuf, label: &str) -> PathBuf {
     if !path.exists() {
         panic!(
-            "default TLS uprobe object {} was not produced by the eBPF build",
+            "default {label} object {} was not produced by the eBPF build",
             path.display()
         );
     }
     path
+}
+
+fn default_process_observation_path() -> PathBuf {
+    repo_root()
+        .join(EBPF_TARGET_DIR)
+        .join(EBPF_PROCESS_OBSERVATION_OBJECT)
 }
 
 fn default_tls_uprobe_path() -> PathBuf {
@@ -87,7 +123,7 @@ fn build_first_party_ebpf_artifacts() {
         .status()
         .unwrap_or_else(|error| {
             panic!(
-                "failed to run first-party eBPF build for TLS uprobe embedding: {error}; install nightly rust-src and {BPF_LINKER}"
+                "failed to run first-party eBPF build for embedded objects: {error}; install nightly rust-src and {BPF_LINKER}"
             )
         });
     if !status.success() {
@@ -97,19 +133,20 @@ fn build_first_party_ebpf_artifacts() {
     }
 }
 
-fn embed_tls_uprobe_object(source: &Path, out_path: &Path) {
+fn embed_ebpf_object(artifact: EbpfObjectArtifact, source: &Path, out_path: &Path) {
     let preflight =
-        EbpfObjectProbe::preflight(&EbpfObjectArtifact::TlsPlaintext.probe_config(source))
-            .unwrap_or_else(|report| {
-                panic!(
-                    "failed to embed TLS uprobe object {}: {}",
-                    source.display(),
-                    report.summary()
-                )
-            });
+        EbpfObjectProbe::preflight(&artifact.probe_config(source)).unwrap_or_else(|report| {
+            panic!(
+                "failed to embed {} eBPF object {}: {}",
+                artifact.label(),
+                source.display(),
+                report.summary()
+            )
+        });
     fs::write(out_path, preflight.bytes()).unwrap_or_else(|error| {
         panic!(
-            "failed to write embedded TLS uprobe object {}: {error}",
+            "failed to write embedded {} eBPF object {}: {error}",
+            artifact.label(),
             out_path.display()
         )
     });

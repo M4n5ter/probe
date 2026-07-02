@@ -6,7 +6,10 @@ use std::path::Path;
 use probe_core::Selector;
 
 use self::{client::request_tail_events, rows::TrafficRow};
-use crate::admin::{AdminClientError, EventTailSnapshot};
+use crate::{
+    admin::{AdminClientError, EventTailSnapshot},
+    tui::runtime_status::{CaptureDiagnosticMessage, CaptureDiagnostics},
+};
 
 pub(crate) use rows::TrafficRow as TrafficTableRow;
 
@@ -21,6 +24,7 @@ pub(crate) struct TrafficState {
     scroll: usize,
     status: TrafficStatus,
     last_export_sequence: u64,
+    capture_diagnostics: Option<CaptureDiagnostics>,
 }
 
 impl Default for TrafficState {
@@ -33,6 +37,7 @@ impl Default for TrafficState {
             scroll: 0,
             status: TrafficStatus::idle("Traffic view uses the running admin socket"),
             last_export_sequence: 0,
+            capture_diagnostics: None,
         }
     }
 }
@@ -62,6 +67,18 @@ impl TrafficState {
         self.last_export_sequence
     }
 
+    pub(crate) fn diagnostic_lines(&self) -> Vec<String> {
+        self.capture_diagnostics
+            .as_ref()
+            .map(CaptureDiagnostics::detail_lines)
+            .unwrap_or_else(|| {
+                vec![
+                    "Select a traffic row to inspect details".to_string(),
+                    "Capture diagnostics will appear here after the first refresh".to_string(),
+                ]
+            })
+    }
+
     pub(crate) async fn refresh(&mut self, socket_path: &Path, selector: Selector) {
         let selector_key = selector_key(&selector);
         if Some(selector_key.clone()) != self.selector_key {
@@ -77,7 +94,21 @@ impl TrafficState {
     }
 
     pub(crate) fn mark_admin_unavailable(&mut self, message: impl Into<String>) {
+        self.capture_diagnostics = None;
         self.status = TrafficStatus::error(message);
+    }
+
+    pub(crate) fn set_capture_diagnostics(&mut self, diagnostics: CaptureDiagnostics) {
+        if self.status.kind != TrafficStatusKind::Error
+            && let Some(message) = diagnostics.status_message(self.rows.is_empty())
+        {
+            self.status = match message {
+                CaptureDiagnosticMessage::Info(message) => TrafficStatus::idle(message),
+                CaptureDiagnosticMessage::Warning(message) => TrafficStatus::warning(message),
+                CaptureDiagnosticMessage::Error(message) => TrafficStatus::error(message),
+            };
+        }
+        self.capture_diagnostics = Some(diagnostics);
     }
 
     pub(crate) fn mark_filter_unavailable(&mut self, message: impl Into<String>) {
@@ -86,6 +117,7 @@ impl TrafficState {
         self.rows.clear();
         self.selected_index = 0;
         self.scroll = 0;
+        self.capture_diagnostics = None;
         self.status = TrafficStatus::error(message);
     }
 
@@ -111,6 +143,7 @@ impl TrafficState {
         self.rows.clear();
         self.selected_index = 0;
         self.scroll = 0;
+        self.capture_diagnostics = None;
         self.status = TrafficStatus::idle("Traffic filter changed");
     }
 
@@ -159,6 +192,7 @@ impl TrafficState {
 pub(crate) enum TrafficStatusKind {
     Idle,
     Active,
+    Warning,
     Error,
 }
 
@@ -179,6 +213,13 @@ impl TrafficStatus {
     fn active(text: impl Into<String>) -> Self {
         Self {
             kind: TrafficStatusKind::Active,
+            text: text.into(),
+        }
+    }
+
+    fn warning(text: impl Into<String>) -> Self {
+        Self {
+            kind: TrafficStatusKind::Warning,
             text: text.into(),
         }
     }
@@ -221,5 +262,101 @@ fn traffic_refresh_error_message(error: &client::TrafficClientError) -> String {
             )
         }
         _ => error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use probe_config::{CaptureBackend, CaptureSelection};
+    use probe_core::RuntimeMode;
+    use runtime::{CaptureEvidenceMode, CapturePlanMode};
+
+    use super::*;
+    use crate::{
+        status::{
+            CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
+        },
+        tui::runtime_status::CaptureDiagnostics,
+    };
+
+    #[test]
+    fn diagnostics_preserve_warning_severity() {
+        let mut traffic = TrafficState::default();
+
+        traffic.set_capture_diagnostics(CaptureDiagnostics::from_capture_snapshot(
+            fallback_capture_snapshot(),
+        ));
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Warning);
+        assert_eq!(
+            traffic.status().text,
+            "Capture using libpcap; ebpf failed: permission denied"
+        );
+    }
+
+    #[test]
+    fn diagnostics_do_not_overwrite_existing_refresh_error() {
+        let mut traffic = TrafficState::default();
+        traffic.mark_admin_unavailable("tail_events failed");
+
+        traffic.set_capture_diagnostics(CaptureDiagnostics::from_capture_snapshot(
+            fallback_capture_snapshot(),
+        ));
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
+        assert_eq!(traffic.status().text, "tail_events failed");
+    }
+
+    #[test]
+    fn filter_failure_clears_stale_diagnostics() {
+        let mut traffic = TrafficState::default();
+        traffic.set_capture_diagnostics(CaptureDiagnostics::from_capture_snapshot(
+            fallback_capture_snapshot(),
+        ));
+
+        traffic.mark_filter_unavailable("missing process selector");
+
+        assert!(
+            traffic
+                .diagnostic_lines()
+                .iter()
+                .any(|line| line.contains("after the first refresh"))
+        );
+    }
+
+    fn fallback_capture_snapshot() -> CaptureStatusSnapshot {
+        CaptureStatusSnapshot {
+            selection: CaptureSelection::Auto,
+            selected_backend: Some(CaptureBackend::Libpcap),
+            provider_runtime_mode: Some(RuntimeMode::Available),
+            mode: CapturePlanMode::Live,
+            reason: None,
+            evidence_mode: Some(CaptureEvidenceMode::BestEffort),
+            evidence_reason: Some("libpcap stream assembly is best-effort".to_string()),
+            candidates: vec![
+                CaptureCandidateStatusSnapshot {
+                    backend: CaptureBackend::Ebpf,
+                    runtime_mode: RuntimeMode::Unavailable,
+                    capability_mode: RuntimeMode::Unavailable,
+                    evidence_mode: CaptureEvidenceMode::Nominal,
+                    reason: Some("permission denied".to_string()),
+                    evidence_reason: None,
+                },
+                CaptureCandidateStatusSnapshot {
+                    backend: CaptureBackend::Libpcap,
+                    runtime_mode: RuntimeMode::Available,
+                    capability_mode: RuntimeMode::Degraded,
+                    evidence_mode: CaptureEvidenceMode::BestEffort,
+                    reason: None,
+                    evidence_reason: Some("best-effort attribution".to_string()),
+                },
+            ],
+            open_failures: vec![CaptureOpenFailureStatusSnapshot {
+                backend: CaptureBackend::Ebpf,
+                reason: "permission denied".to_string(),
+            }],
+            provider: None,
+            input_activity: None,
+        }
     }
 }

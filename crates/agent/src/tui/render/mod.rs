@@ -628,6 +628,19 @@ mod tests {
         (0..height).any(|row| (0..width).any(|column| hit_map.hit(column, row) == target))
     }
 
+    fn first_hit_coordinate(
+        hit_map: &HitMap,
+        target: HitTarget,
+        width: u16,
+        height: u16,
+    ) -> Option<(u16, u16)> {
+        (0..height).find_map(|row| {
+            (0..width)
+                .find(|column| hit_map.hit(*column, row) == Some(target))
+                .map(|column| (column, row))
+        })
+    }
+
     #[test]
     fn render_text_edit_modal_registers_apply_and_cancel_hits()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -682,6 +695,81 @@ mod tests {
         assert_eq!(
             hit_map.hit(2, 11),
             Some(HitTarget::Control(ControlId::ReloadRuntimeActions))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn render_tabs_show_hover_background() -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = test_app();
+        app.handle_action(TuiAction::Hover {
+            target: Some(HitTarget::Tab(TuiTab::Traffic)),
+            column: 13,
+            row: 4,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 24))?;
+        let mut hit_map = HitMap::default();
+
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &mut app);
+        })?;
+        let (column, row) =
+            first_hit_coordinate(&hit_map, HitTarget::Tab(TuiTab::Traffic), 100, 24)
+                .expect("traffic tab should be clickable");
+
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((column, row))
+                .map(|cell| cell.style().bg),
+            Some(Some(Color::Gray))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn render_process_rows_show_hover_background() -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::from_entries([
+                ProcessEntry {
+                    pid: 42,
+                    name: "curl".to_string(),
+                    exe_path: Some(PathBuf::from("/usr/bin/curl")),
+                    argv: vec!["curl".to_string()],
+                },
+                ProcessEntry {
+                    pid: 43,
+                    name: "nginx".to_string(),
+                    exe_path: Some(PathBuf::from("/usr/sbin/nginx")),
+                    argv: vec!["nginx".to_string()],
+                },
+            ]),
+        );
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Processes)));
+        app.handle_action(TuiAction::Hover {
+            target: Some(HitTarget::ProcessArgv(1)),
+            column: 60,
+            row: 11,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 24))?;
+        let mut hit_map = HitMap::default();
+
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &mut app);
+        })?;
+        let (column, row) = first_hit_coordinate(&hit_map, HitTarget::ProcessArgv(1), 100, 24)
+            .expect("process argv should be hoverable");
+
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((column, row))
+                .map(|cell| cell.style().bg),
+            Some(Some(Color::Gray))
         );
         Ok(())
     }

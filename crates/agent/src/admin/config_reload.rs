@@ -4,6 +4,8 @@ use probe_config::{AgentConfig, ConfigError};
 use runtime::validate_static_runtime_config;
 use serde::Serialize;
 
+use crate::artifacts::normalize_embedded_artifact_paths_for_comparison;
+
 const MAX_CANDIDATE_CONFIG_BYTES: u64 = 1024 * 1024;
 
 const CONFIG_RELOAD_SECTIONS: [ConfigReloadSectionSpec; 10] = [
@@ -146,7 +148,11 @@ pub(super) fn plan_config_reload(
             );
         }
     };
-    let changed_sections = changed_sections(current, &candidate);
+    let mut comparable_current = current.clone();
+    let mut comparable_candidate = candidate.clone();
+    normalize_embedded_artifact_paths_for_comparison(&mut comparable_current);
+    normalize_embedded_artifact_paths_for_comparison(&mut comparable_candidate);
+    let changed_sections = changed_sections(&comparable_current, &comparable_candidate);
     let decision = if changed_sections.is_empty() {
         ConfigReloadDecision::NoChange
     } else {
@@ -288,6 +294,26 @@ mod tests {
                 ConfigReloadRuntimeAction::ReloadEnforcementPolicy,
             ]
         );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_ignores_runtime_generated_process_observation_object_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-generated-object-path")?;
+        let mut candidate = base_config(temp.join("spool"));
+        candidate.capture.selection = CaptureSelection::Auto;
+        let mut current = candidate.clone();
+        current.capture.ebpf.object_path =
+            Some(crate::artifacts::embedded_process_observation_object_path_for_test());
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current, &candidate_path);
+
+        assert!(matches!(plan.decision, ConfigReloadDecision::NoChange));
+        assert!(plan.changed_sections.is_empty());
         fs::remove_dir_all(temp)?;
         Ok(())
     }

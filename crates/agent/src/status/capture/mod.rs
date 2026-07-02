@@ -1,14 +1,14 @@
 use probe_config::{CaptureBackend, CaptureSelection};
 use probe_core::RuntimeMode;
 use runtime::{CaptureEvidenceMode, CapturePlanMode, RuntimePlan};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::capture_provider::{
     CaptureInputActivityRuntimeSnapshot, CaptureProviderRuntimeDetailsSnapshot,
     CaptureProviderRuntimeSnapshot,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureStatusSnapshot {
     pub selection: CaptureSelection,
     pub selected_backend: Option<CaptureBackend>,
@@ -17,12 +17,27 @@ pub struct CaptureStatusSnapshot {
     pub reason: Option<String>,
     pub evidence_mode: Option<CaptureEvidenceMode>,
     pub evidence_reason: Option<String>,
+    #[serde(default)]
+    pub candidates: Vec<CaptureCandidateStatusSnapshot>,
+    #[serde(default)]
     pub open_failures: Vec<CaptureOpenFailureStatusSnapshot>,
+    #[serde(default, skip_deserializing)]
     pub provider: Option<CaptureProviderRuntimeDetailsSnapshot>,
+    #[serde(default, skip_deserializing)]
     pub input_activity: Option<CaptureInputActivityRuntimeSnapshot>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureCandidateStatusSnapshot {
+    pub backend: CaptureBackend,
+    pub runtime_mode: RuntimeMode,
+    pub capability_mode: RuntimeMode,
+    pub evidence_mode: CaptureEvidenceMode,
+    pub reason: Option<String>,
+    pub evidence_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureOpenFailureStatusSnapshot {
     pub backend: CaptureBackend,
     pub reason: String,
@@ -46,6 +61,7 @@ pub(in crate::status) fn capture_status(
                 reason: runtime.reason,
                 evidence_mode: Some(runtime.evidence_mode),
                 evidence_reason: runtime.evidence_reason,
+                candidates: capture_candidates(plan),
                 open_failures: runtime
                     .open_failures
                     .into_iter()
@@ -66,11 +82,27 @@ pub(in crate::status) fn capture_status(
             reason: plan.capture.reason.clone(),
             evidence_mode: plan.capture.selected_evidence_mode,
             evidence_reason: plan.capture.evidence_reason.clone(),
+            candidates: capture_candidates(plan),
             open_failures: Vec::new(),
             provider: None,
             input_activity: None,
         },
     }
+}
+
+fn capture_candidates(plan: &RuntimePlan) -> Vec<CaptureCandidateStatusSnapshot> {
+    plan.capture
+        .candidates
+        .iter()
+        .map(|candidate| CaptureCandidateStatusSnapshot {
+            backend: candidate.backend,
+            runtime_mode: candidate.runtime_mode,
+            capability_mode: candidate.capability_mode,
+            evidence_mode: candidate.evidence_mode,
+            reason: candidate.reason.clone(),
+            evidence_reason: candidate.evidence_reason.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -102,6 +134,9 @@ mod tests {
             status.evidence_reason.as_deref(),
             Some("eBPF provider is best-effort")
         );
+        assert_eq!(status.candidates.len(), 2);
+        assert_eq!(status.candidates[0].backend, CaptureBackend::Ebpf);
+        assert_eq!(status.candidates[1].backend, CaptureBackend::Libpcap);
         assert_eq!(status.reason, None);
         Ok(())
     }

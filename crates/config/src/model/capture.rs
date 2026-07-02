@@ -29,6 +29,24 @@ impl Default for CaptureConfig {
     }
 }
 
+impl CaptureConfig {
+    pub fn candidate_backends(&self) -> Vec<CaptureBackend> {
+        match self.selection.explicit_backend() {
+            None => self
+                .fallback_backends
+                .iter()
+                .copied()
+                .map(CaptureBackend::from)
+                .collect(),
+            Some(backend) => vec![backend],
+        }
+    }
+
+    pub fn may_use_backend(&self, backend: CaptureBackend) -> bool {
+        self.candidate_backends().contains(&backend)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct EbpfCaptureConfig {
