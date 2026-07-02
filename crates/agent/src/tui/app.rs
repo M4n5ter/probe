@@ -672,12 +672,10 @@ impl TuiApp {
         match control {
             ControlId::ReloadRuntimeActions => Some(TuiEffect::ReloadRuntimeActions),
             ControlId::ConfigureOutboundMitm => {
-                self.apply_mitm_quick_setup(MitmQuickSetupDirection::Outbound);
-                None
+                self.apply_mitm_quick_setup(MitmQuickSetupDirection::Outbound)
             }
             ControlId::ConfigureInboundMitm => {
-                self.apply_mitm_quick_setup(MitmQuickSetupDirection::Inbound);
-                None
+                self.apply_mitm_quick_setup(MitmQuickSetupDirection::Inbound)
             }
             ControlId::SearchProcesses => {
                 self.begin_process_search();
@@ -690,7 +688,7 @@ impl TuiApp {
         }
     }
 
-    fn apply_mitm_quick_setup(&mut self, direction: MitmQuickSetupDirection) {
+    fn apply_mitm_quick_setup(&mut self, direction: MitmQuickSetupDirection) -> Option<TuiEffect> {
         let selected_process_selector = self.selected_process_selector();
         match apply_mitm_quick_setup(&mut self.config, direction, selected_process_selector) {
             MitmQuickSetupOutcome::Changed {
@@ -704,12 +702,15 @@ impl TuiApp {
                     StatusMessage::info(direction.status_message())
                 };
                 self.clamp_selection();
+                Some(TuiEffect::SaveConfig)
             }
             MitmQuickSetupOutcome::Rejected(warning) => {
                 self.status = StatusMessage::warning(mitm_quick_setup_warning_message(&warning));
+                None
             }
             MitmQuickSetupOutcome::MissingProcessSelector => {
                 self.status = self.process_selector_warning();
+                None
             }
         }
     }
@@ -1062,10 +1063,11 @@ mod tests {
         app.handle_action(TuiAction::Click(HitTarget::Process(1)));
 
         app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Enforcement)));
-        app.handle_action(TuiAction::Click(HitTarget::Control(
+        let effect = app.handle_action(TuiAction::Click(HitTarget::Control(
             ControlId::ConfigureInboundMitm,
         )));
 
+        assert_eq!(effect, Some(TuiEffect::SaveConfig));
         assert!(app.dirty());
         assert!(app.config.enforcement.interception.selector.is_some());
         assert_eq!(
@@ -1086,10 +1088,11 @@ mod tests {
         app.handle_action(TuiAction::Click(HitTarget::Process(1)));
 
         app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Enforcement)));
-        app.handle_action(TuiAction::Click(HitTarget::Control(
+        let effect = app.handle_action(TuiAction::Click(HitTarget::Control(
             ControlId::ConfigureOutboundMitm,
         )));
 
+        assert_eq!(effect, None);
         assert!(!app.dirty());
         assert_eq!(
             app.config.enforcement.interception.strategy,
