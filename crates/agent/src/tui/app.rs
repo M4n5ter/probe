@@ -1124,7 +1124,7 @@ mod tests {
         assert!(
             app.status()
                 .text
-                .starts_with("MITM proxy executable is missing at")
+                .starts_with("Inbound MITM capture configured for selected process")
         );
     }
 

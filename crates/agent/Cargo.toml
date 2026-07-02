@@ -13,6 +13,7 @@ ebpf-object = { path = "../ebpf-object" }
 enforcement = { path = "../enforcement" }
 exporter = { path = "../exporter" }
 interception = { path = "../interception" }
+mitm-proxy = { path = "../mitm-proxy" }
 parsers = { path = "../parsers" }
 pipeline = { path = "../pipeline" }
 policy = { path = "../policy" }

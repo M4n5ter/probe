@@ -870,7 +870,11 @@ exporters = [{ id = "default", transport = "file", path = "/tmp/events.jsonl", c
             MitmQuickSetupOutcome::Changed {
                 direction: MitmQuickSetupDirection::Inbound,
                 warnings: vec![MitmQuickSetupWarning::MissingProxyExecutable {
-                    path: profile.mitm.proxy_program.clone(),
+                    path: profile
+                        .mitm
+                        .proxy_program()
+                        .expect("test profile should configure a proxy program")
+                        .to_path_buf(),
                 }],
             }
         );

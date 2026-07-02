@@ -1,5 +1,5 @@
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -16,6 +16,7 @@ use probe_core::{
     AddressPort, Direction, EnforcementMode, FlowContext, FlowIdentity, ProcessContext,
     ProcessIdentity, Timestamp, TransportProtocol,
 };
+use runtime::EMBEDDED_PRODUCT_PROXY_COMMAND;
 use storage::FjallSpool;
 
 use crate::{
@@ -36,6 +37,7 @@ use super::admin::{AdminCliCommand, run_admin_command};
 
 const REPLAY_POLICY_SOURCE_BYTES: u64 = 1024 * 1024;
 const READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_READY_SOCKET";
+
 #[derive(Debug, Parser)]
 #[command(name = "traffic-probe")]
 #[command(about = "Process-level traffic probe agent")]
@@ -161,7 +163,26 @@ struct ReplayCommand {
 }
 
 pub(crate) async fn run_from_env() -> Result<(), AgentError> {
-    run(Cli::parse()).await
+    let mut args = std::env::args_os().collect::<Vec<_>>();
+    if args.is_empty() {
+        args.push(OsString::from("traffic-probe"));
+    }
+    if let Some(proxy_args) = product_proxy_cli_args_from_agent_args(&args) {
+        mitm_proxy::run_cli_from(proxy_args)?;
+        return Ok(());
+    }
+    run(Cli::parse_from(args)).await
+}
+
+fn product_proxy_cli_args_from_agent_args(args: &[OsString]) -> Option<Vec<OsString>> {
+    if args.get(1).map(OsString::as_os_str) != Some(OsStr::new(EMBEDDED_PRODUCT_PROXY_COMMAND)) {
+        return None;
+    }
+    Some(
+        std::iter::once(OsString::from("traffic-probe-mitm-proxy"))
+            .chain(args.iter().skip(2).cloned())
+            .collect(),
+    )
 }
 
 async fn run(cli: Cli) -> Result<(), AgentError> {
@@ -501,6 +522,50 @@ mod tests {
 
         assert!(matches!(command, AdminCliCommand::Status));
         assert_eq!(resolve_admin_socket(socket), default_admin_socket_path());
+    }
+
+    #[test]
+    fn internal_product_proxy_dispatch_reuses_mitm_proxy_cli_parser()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let agent_args = [
+            "traffic-probe",
+            EMBEDDED_PRODUCT_PROXY_COMMAND,
+            "--listen",
+            "127.0.0.1:15002",
+            "--feed",
+            "/tmp/probe/mitm/feed.jsonl",
+            "--target-recovery",
+            "linux-original-destination",
+            "--request-direction",
+            "outbound",
+            "--upstream-tls",
+            "--tls-material-root",
+            "/tmp/probe/tls",
+            "--tls-ca-certificate",
+            "/tmp/probe/tls/mitm-ca.pem",
+            "--tls-ca-private-key",
+            "/tmp/probe/tls/mitm-ca.key",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+
+        let proxy_args = product_proxy_cli_args_from_agent_args(&agent_args)
+            .expect("internal command should dispatch to product proxy");
+        let config = mitm_proxy::config_from_cli_args(proxy_args)?;
+
+        assert_eq!(config.listen, "127.0.0.1:15002".parse()?);
+        assert_eq!(
+            config.target_recovery,
+            mitm_proxy::TargetRecovery::LinuxOriginalDestination
+        );
+        assert_eq!(config.request_direction, Direction::Outbound);
+        assert!(config.upstream_tls.is_some());
+        assert!(matches!(
+            config.tls,
+            Some(mitm_proxy::TlsTerminationConfig::DynamicCa(_))
+        ));
+        Ok(())
     }
 
     #[test]

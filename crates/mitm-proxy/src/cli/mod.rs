@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     net::SocketAddr,
     num::{NonZeroU16, NonZeroU32},
     path::PathBuf,
@@ -20,6 +21,7 @@ use crate::{
 
 #[derive(Debug, Parser)]
 #[command(name = "traffic-probe-mitm-proxy")]
+#[command(version)]
 #[command(about = "Selector-scoped L7 MITM proxy data plane for traffic-probe")]
 pub struct Cli {
     #[arg(long)]
@@ -102,6 +104,16 @@ impl From<RequestDirection> for Direction {
 
 pub(crate) fn parse() -> Result<MitmProxyConfig, MitmProxyError> {
     Cli::parse().try_into()
+}
+
+pub(crate) fn parse_from<I, T>(args: I) -> Result<MitmProxyConfig, MitmProxyError>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    Cli::try_parse_from(args)
+        .map_err(|error| MitmProxyError::InvalidConfig(error.to_string()))?
+        .try_into()
 }
 
 impl TryFrom<Cli> for MitmProxyConfig {
@@ -449,6 +461,42 @@ mod tests {
             config.application_protocols.protocols(),
             [ApplicationProtocol::Http1]
         );
+    }
+
+    #[test]
+    fn parse_from_accepts_agent_forwarded_product_proxy_args()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = parse_from([
+            "traffic-probe-mitm-proxy",
+            "--listen",
+            "127.0.0.1:15002",
+            "--feed",
+            "/tmp/probe/mitm/feed.jsonl",
+            "--target-recovery",
+            "linux-original-destination",
+            "--request-direction",
+            "outbound",
+            "--upstream-tls",
+            "--tls-material-root",
+            "/tmp/probe/tls",
+            "--tls-ca-certificate",
+            "/tmp/probe/tls/mitm-ca.pem",
+            "--tls-ca-private-key",
+            "/tmp/probe/tls/mitm-ca.key",
+        ])?;
+
+        assert_eq!(config.listen, "127.0.0.1:15002".parse()?);
+        assert_eq!(
+            config.target_recovery,
+            TargetRecovery::LinuxOriginalDestination
+        );
+        assert_eq!(config.request_direction, Direction::Outbound);
+        assert!(config.upstream_tls.is_some());
+        assert!(matches!(
+            config.tls,
+            Some(TlsTerminationConfig::DynamicCa(_))
+        ));
+        Ok(())
     }
 
     #[test]

@@ -207,8 +207,7 @@ impl TransparentInterceptionMitmManagedProcessConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TransparentInterceptionMitmProductProxyConfig {
-    pub program: Option<PathBuf>,
-    pub working_dir: Option<PathBuf>,
+    pub launcher: TransparentInterceptionMitmProductProxyLauncherConfig,
     pub application_protocols: Option<Vec<ApplicationProtocol>>,
     pub upstream_discovery: TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig,
     pub upstream_routes: Vec<TransparentInterceptionMitmProductProxyUpstreamRouteConfig>,
@@ -216,11 +215,45 @@ pub struct TransparentInterceptionMitmProductProxyConfig {
 
 impl TransparentInterceptionMitmProductProxyConfig {
     pub fn is_configured(&self) -> bool {
-        self.program.is_some()
-            || self.working_dir.is_some()
+        self.launcher.is_configured()
             || self.application_protocols.is_some()
             || self.upstream_discovery.is_configured()
             || !self.upstream_routes.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TransparentInterceptionMitmProductProxyLauncherConfig {
+    #[default]
+    None,
+    ExternalBinary {
+        program: Option<PathBuf>,
+        working_dir: Option<PathBuf>,
+    },
+    EmbeddedAgent {
+        program: Option<PathBuf>,
+        working_dir: Option<PathBuf>,
+    },
+}
+
+impl TransparentInterceptionMitmProductProxyLauncherConfig {
+    pub fn external_binary(program: PathBuf) -> Self {
+        Self::ExternalBinary {
+            program: Some(program),
+            working_dir: None,
+        }
+    }
+
+    pub fn embedded_agent(program: PathBuf) -> Self {
+        Self::EmbeddedAgent {
+            program: Some(program),
+            working_dir: None,
+        }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !matches!(self, Self::None)
     }
 }
 
@@ -345,11 +378,22 @@ pub struct TransparentInterceptionMitmManagedProcessIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentInterceptionMitmProductProxyIntent {
-    pub program: PathBuf,
-    pub working_dir: Option<PathBuf>,
+    pub launcher: TransparentInterceptionMitmProductProxyLauncherIntent,
     pub application_protocols: ApplicationProtocolPolicy,
     pub upstream_discovery: TransparentInterceptionMitmProductProxyUpstreamDiscoveryIntent,
     pub upstream_routes: Vec<TransparentInterceptionMitmProductProxyUpstreamRouteIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransparentInterceptionMitmProductProxyLauncherIntent {
+    ExternalBinary {
+        program: PathBuf,
+        working_dir: Option<PathBuf>,
+    },
+    EmbeddedAgent {
+        program: PathBuf,
+        working_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,18 +633,7 @@ fn validate_mitm_product_proxy_process(
     process: &TransparentInterceptionMitmProductProxyConfig,
     violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
 ) -> Option<TransparentInterceptionMitmProductProxyIntent> {
-    let program = validate_mitm_process_program(
-        &process.program,
-        "enforcement.interception.mitm.backend.process.program",
-        "product MITM proxy",
-        violations,
-    )?;
-    validate_mitm_process_working_dir(
-        &process.working_dir,
-        "enforcement.interception.mitm.backend.process.working_dir",
-        "product MITM proxy",
-        violations,
-    );
+    let launcher = validate_mitm_product_proxy_launcher(&process.launcher, violations)?;
     let upstream_routes = validate_mitm_product_proxy_upstream_routes(
         &process.upstream_routes,
         "enforcement.interception.mitm.backend.process.upstream_routes",
@@ -614,12 +647,72 @@ fn validate_mitm_product_proxy_process(
     let upstream_discovery =
         validate_mitm_product_proxy_upstream_discovery(&process.upstream_discovery, violations)?;
     Some(TransparentInterceptionMitmProductProxyIntent {
-        program,
-        working_dir: process.working_dir.clone(),
+        launcher,
         application_protocols,
         upstream_discovery,
         upstream_routes,
     })
+}
+
+fn validate_mitm_product_proxy_launcher(
+    launcher: &TransparentInterceptionMitmProductProxyLauncherConfig,
+    violations: &mut Vec<TransparentInterceptionMitmIntentViolation>,
+) -> Option<TransparentInterceptionMitmProductProxyLauncherIntent> {
+    match launcher {
+        TransparentInterceptionMitmProductProxyLauncherConfig::None => {
+            violations.push(intent_violation(
+                "enforcement.interception.mitm.backend.process.launcher.mode",
+                "product MITM proxy requires launcher.mode = \"external_binary\" or \"embedded_agent\"",
+            ));
+            None
+        }
+        TransparentInterceptionMitmProductProxyLauncherConfig::ExternalBinary {
+            program,
+            working_dir,
+        } => {
+            let program = validate_mitm_process_program(
+                program,
+                "enforcement.interception.mitm.backend.process.launcher.program",
+                "product MITM proxy external binary launcher",
+                violations,
+            )?;
+            validate_mitm_process_working_dir(
+                working_dir,
+                "enforcement.interception.mitm.backend.process.launcher.working_dir",
+                "product MITM proxy external binary launcher",
+                violations,
+            );
+            Some(
+                TransparentInterceptionMitmProductProxyLauncherIntent::ExternalBinary {
+                    program,
+                    working_dir: working_dir.clone(),
+                },
+            )
+        }
+        TransparentInterceptionMitmProductProxyLauncherConfig::EmbeddedAgent {
+            program,
+            working_dir,
+        } => {
+            let program = validate_mitm_process_program(
+                program,
+                "enforcement.interception.mitm.backend.process.launcher.program",
+                "product MITM proxy embedded agent launcher",
+                violations,
+            )?;
+            validate_mitm_process_working_dir(
+                working_dir,
+                "enforcement.interception.mitm.backend.process.launcher.working_dir",
+                "product MITM proxy embedded agent launcher",
+                violations,
+            );
+            Some(
+                TransparentInterceptionMitmProductProxyLauncherIntent::EmbeddedAgent {
+                    program,
+                    working_dir: working_dir.clone(),
+                },
+            )
+        }
+    }
 }
 
 fn validate_mitm_product_proxy_application_protocols(

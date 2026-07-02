@@ -897,7 +897,8 @@ mode = "operator_managed"
 [enforcement.interception.mitm.backend]
 mode = "product_proxy"
 
-[enforcement.interception.mitm.backend.process]
+[enforcement.interception.mitm.backend.process.launcher]
+mode = "external_binary"
 program = "/usr/local/bin/traffic-probe-mitm-proxy"
 
 [[enforcement.interception.mitm.backend.process.upstream_routes]]
@@ -920,7 +921,9 @@ endpoint = "http://127.0.0.1:15002/mitm-policy-hook"
 first-party product proxy 支持 exact 和 suffix-wildcard upstream route。opt-in DNS discovery
 可作为 fallback；默认拒绝 IANA special-purpose/special-use address，除非显式允许。
 CA-backed dynamic certificate mode 要求下游 client 发送 DNS SNI。Host/SNI mismatch 会 fail
-closed。
+closed。若希望 proxy 从同一个 agent binary 启动，使用 `launcher.mode = "embedded_agent"`，
+并将 `program` 指向 `/usr/local/bin/traffic-probe`；独立 `traffic-probe-mitm-proxy` binary
+使用 `external_binary`。
 
 ### Admin 与 Status
 

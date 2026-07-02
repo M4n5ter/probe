@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use probe_config::{
-    default_admin_socket_path, default_enforcement_policy_path, default_export_file_path,
-    default_mitm_ca_certificate_path, default_mitm_ca_private_key_path,
-    default_mitm_plaintext_bridge_path, default_mitm_tls_root,
+    TransparentInterceptionMitmProductProxyLauncherConfig, default_admin_socket_path,
+    default_enforcement_policy_path, default_export_file_path, default_mitm_ca_certificate_path,
+    default_mitm_ca_private_key_path, default_mitm_plaintext_bridge_path, default_mitm_tls_root,
 };
 
 pub(super) const DEFAULT_MITM_PROXY_LISTEN_PORT: u16 = 15002;
@@ -21,7 +21,7 @@ pub(super) struct LocalProbeProfile {
 pub(super) struct LocalMitmProfile {
     pub(super) proxy_listen_port: u16,
     pub(super) policy_hook_port: u16,
-    pub(super) proxy_program: PathBuf,
+    pub(super) proxy_launcher: TransparentInterceptionMitmProductProxyLauncherConfig,
     pub(super) enforcement_policy_file: PathBuf,
     pub(super) plaintext_feed: PathBuf,
     pub(super) tls_root: PathBuf,
@@ -44,7 +44,7 @@ impl Default for LocalMitmProfile {
         Self {
             proxy_listen_port: DEFAULT_MITM_PROXY_LISTEN_PORT,
             policy_hook_port: DEFAULT_MITM_POLICY_HOOK_PORT,
-            proxy_program: default_mitm_proxy_program(),
+            proxy_launcher: default_mitm_proxy_launcher(),
             enforcement_policy_file: default_enforcement_policy_path(),
             plaintext_feed: default_mitm_plaintext_bridge_path(),
             tls_root: default_mitm_tls_root(),
@@ -69,7 +69,9 @@ impl LocalMitmProfile {
     #[cfg(test)]
     pub(super) fn with_root(root: &Path) -> Self {
         Self {
-            proxy_program: root.join("bin").join(MITM_PROXY_BINARY_NAME),
+            proxy_launcher: TransparentInterceptionMitmProductProxyLauncherConfig::external_binary(
+                root.join("bin").join(MITM_PROXY_BINARY_NAME),
+            ),
             enforcement_policy_file: root.join("policy").join("enforcement.toml"),
             plaintext_feed: root.join("mitm").join("feed.jsonl"),
             tls_root: root.join("tls"),
@@ -91,22 +93,40 @@ impl LocalMitmProfile {
     }
 
     pub(super) fn proxy_program_is_executable(&self) -> bool {
-        is_executable_file(&self.proxy_program)
+        self.proxy_program().is_some_and(is_executable_file)
+    }
+
+    pub(super) fn proxy_program(&self) -> Option<&Path> {
+        match &self.proxy_launcher {
+            TransparentInterceptionMitmProductProxyLauncherConfig::ExternalBinary {
+                program,
+                ..
+            }
+            | TransparentInterceptionMitmProductProxyLauncherConfig::EmbeddedAgent {
+                program,
+                ..
+            } => program.as_deref(),
+            TransparentInterceptionMitmProductProxyLauncherConfig::None => None,
+        }
     }
 }
 
-fn default_mitm_proxy_program() -> PathBuf {
+fn default_mitm_proxy_launcher() -> TransparentInterceptionMitmProductProxyLauncherConfig {
+    if let Ok(program) = std::env::current_exe() {
+        return TransparentInterceptionMitmProductProxyLauncherConfig::embedded_agent(program);
+    }
     let sibling = std::env::current_exe().ok().and_then(|path| {
         path.parent()
             .map(|parent| parent.join(MITM_PROXY_BINARY_NAME))
     });
     let system = PathBuf::from("/usr/local/bin").join(MITM_PROXY_BINARY_NAME);
-    sibling
+    let program = sibling
         .clone()
         .filter(|path| is_executable_file(path))
         .or_else(|| is_executable_file(&system).then_some(system.clone()))
         .or(sibling)
-        .unwrap_or(system)
+        .unwrap_or(system);
+    TransparentInterceptionMitmProductProxyLauncherConfig::external_binary(program)
 }
 
 fn is_executable_file(path: &Path) -> bool {

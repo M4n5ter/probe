@@ -1005,8 +1005,11 @@ mod tests {
                         ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
                     },
                     crate::TransparentInterceptionMitmProductProxyConfig {
-                        program: Some("/usr/local/bin/traffic-probe-mitm-proxy".into()),
-                        working_dir: Some("/run/traffic-probe".into()),
+                        launcher:
+                            crate::TransparentInterceptionMitmProductProxyLauncherConfig::ExternalBinary {
+                                program: Some("/usr/local/bin/traffic-probe-mitm-proxy".into()),
+                                working_dir: Some("/run/traffic-probe".into()),
+                            },
                         application_protocols: None,
                         upstream_discovery:
                             crate::TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig::default(),

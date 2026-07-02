@@ -1014,7 +1014,8 @@ mode = "operator_managed"
 [enforcement.interception.mitm.backend]
 mode = "product_proxy"
 
-[enforcement.interception.mitm.backend.process]
+[enforcement.interception.mitm.backend.process.launcher]
+mode = "external_binary"
 program = "/usr/local/bin/traffic-probe-mitm-proxy"
 
 [[enforcement.interception.mitm.backend.process.upstream_routes]]
@@ -1038,7 +1039,9 @@ The first-party product proxy supports exact and suffix-wildcard upstream
 routes. Opt-in DNS discovery can be used as a fallback and rejects IANA
 special-purpose/special-use addresses by default unless explicitly allowed.
 CA-backed dynamic certificate mode requires downstream clients to send DNS SNI.
-Host/SNI mismatches fail closed.
+Host/SNI mismatches fail closed. Use `launcher.mode = "embedded_agent"` with
+`program = "/usr/local/bin/traffic-probe"` when the proxy should run from the
+same agent binary instead of a standalone `traffic-probe-mitm-proxy` binary.
 
 ### Admin And Status
 

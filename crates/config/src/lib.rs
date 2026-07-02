@@ -76,6 +76,8 @@ pub use model::{
     TransparentInterceptionMitmPolicyHookEndpointIntent,
     TransparentInterceptionMitmPolicyHookIntent, TransparentInterceptionMitmPolicyHookModeConfig,
     TransparentInterceptionMitmProductProxyConfig, TransparentInterceptionMitmProductProxyIntent,
+    TransparentInterceptionMitmProductProxyLauncherConfig,
+    TransparentInterceptionMitmProductProxyLauncherIntent,
     TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig,
     TransparentInterceptionMitmProductProxyUpstreamDiscoveryIntent,
     TransparentInterceptionMitmProductProxyUpstreamDiscoveryModeConfig,

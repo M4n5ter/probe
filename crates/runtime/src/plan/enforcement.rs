@@ -16,6 +16,7 @@ use probe_config::{
     TransparentInterceptionMitmPolicyHookEndpointIntent,
     TransparentInterceptionMitmPolicyHookIntent, TransparentInterceptionMitmPolicyHookModeConfig,
     TransparentInterceptionMitmProductProxyIntent,
+    TransparentInterceptionMitmProductProxyLauncherIntent,
     TransparentInterceptionMitmProductProxyUpstreamDiscoveryIntent,
     TransparentInterceptionMitmProductProxyUpstreamRouteIntent,
     TransparentInterceptionOutboundProxyIntent, TransparentInterceptionOutboundProxyModeIntent,
@@ -39,6 +40,8 @@ use super::{
         mitm_tls_materials_by_id, mitm_tls_materials_from_refs,
     },
 };
+
+pub const EMBEDDED_PRODUCT_PROXY_COMMAND: &str = "internal-product-proxy";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnforcementPlan {
@@ -698,16 +701,37 @@ impl TransparentInterceptionMitmManagedProcessPlan {
         cli_builder: ProductProxyCliBuilder<'_>,
         upstream_discovery: ProductProxyUpstreamDiscoveryPlan,
     ) -> Self {
-        let args = cli_builder.args(
+        let (program, working_dir, mut args) =
+            product_proxy_launcher_process_parts(intent.launcher);
+        args.extend(cli_builder.args(
             &intent.application_protocols,
             upstream_discovery,
             &intent.upstream_routes,
-        );
+        ));
         Self {
-            program: intent.program,
+            program,
             args,
-            working_dir: intent.working_dir,
+            working_dir,
         }
+    }
+}
+
+fn product_proxy_launcher_process_parts(
+    launcher: TransparentInterceptionMitmProductProxyLauncherIntent,
+) -> (PathBuf, Option<PathBuf>, Vec<String>) {
+    match launcher {
+        TransparentInterceptionMitmProductProxyLauncherIntent::ExternalBinary {
+            program,
+            working_dir,
+        } => (program, working_dir, Vec::new()),
+        TransparentInterceptionMitmProductProxyLauncherIntent::EmbeddedAgent {
+            program,
+            working_dir,
+        } => (
+            program,
+            working_dir,
+            vec![EMBEDDED_PRODUCT_PROXY_COMMAND.to_string()],
+        ),
     }
 }
 
@@ -1890,6 +1914,58 @@ mod tests {
     }
 
     #[test]
+    fn embedded_agent_product_proxy_mitm_backend_uses_internal_proxy_command()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxyMitm;
+        config.enforcement.interception.proxy.listen_port = Some(15002);
+        configure_product_proxy_mitm_backend(&mut config);
+        let TransparentInterceptionMitmBackendConfig::ProductProxy { process, .. } =
+            &mut config.enforcement.interception.mitm.backend
+        else {
+            panic!("expected product proxy config");
+        };
+        process.launcher =
+            probe_config::TransparentInterceptionMitmProductProxyLauncherConfig::EmbeddedAgent {
+                program: Some("/usr/local/bin/traffic-probe".into()),
+                working_dir: Some("/run/traffic-probe".into()),
+            };
+        let capabilities = CapabilityMatrix::new([
+            CapabilityState::available(CapabilityKind::TransparentInterception),
+            CapabilityState::available(CapabilityKind::L7Mitm),
+            CapabilityState::available(CapabilityKind::CaptureEventFeed),
+        ]);
+
+        let plan = resolve_enforcement_plan(&config, &capabilities);
+
+        let TransparentInterceptionMitmBackendPlan::ProductProxy { process, .. } =
+            &plan.interception.mitm.backend
+        else {
+            panic!("product MITM proxy plan should be preserved");
+        };
+        assert_eq!(
+            process.args.first().map(String::as_str),
+            Some(EMBEDDED_PRODUCT_PROXY_COMMAND)
+        );
+        assert_eq!(
+            process.program,
+            PathBuf::from("/usr/local/bin/traffic-probe")
+        );
+        assert_eq!(
+            process.working_dir,
+            Some(PathBuf::from("/run/traffic-probe"))
+        );
+        assert!(args_contain_pair(
+            &process.args,
+            "--listen",
+            "127.0.0.1:15002"
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn product_proxy_mitm_backend_synthesizes_static_leaf_tls_args()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut config = AgentConfig::default();
@@ -2453,8 +2529,11 @@ mod tests {
             ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
         };
         let process = TransparentInterceptionMitmProductProxyConfig {
-            program: Some("/usr/local/bin/traffic-probe-mitm-proxy".into()),
-            working_dir: Some("/run/traffic-probe".into()),
+            launcher:
+                probe_config::TransparentInterceptionMitmProductProxyLauncherConfig::ExternalBinary {
+                    program: Some("/usr/local/bin/traffic-probe-mitm-proxy".into()),
+                    working_dir: Some("/run/traffic-probe".into()),
+                },
             application_protocols: None,
             upstream_discovery:
                 probe_config::TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig::default(),

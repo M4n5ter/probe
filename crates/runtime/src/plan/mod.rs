@@ -15,11 +15,11 @@ pub use capture::{
     CaptureProviderDescriptor,
 };
 pub use enforcement::{
-    EnforcementCapabilityPlan, EnforcementConnectionPlan, EnforcementExecutionSurface,
-    EnforcementInterceptionPlan, EnforcementPlan, RequiredCapabilityPlan,
-    TransparentInterceptionClassificationPlan, TransparentInterceptionExecutionPlan,
-    TransparentInterceptionInboundTproxyPlan, TransparentInterceptionMitmBackendPlan,
-    TransparentInterceptionMitmBackendReadinessProbePlan,
+    EMBEDDED_PRODUCT_PROXY_COMMAND, EnforcementCapabilityPlan, EnforcementConnectionPlan,
+    EnforcementExecutionSurface, EnforcementInterceptionPlan, EnforcementPlan,
+    RequiredCapabilityPlan, TransparentInterceptionClassificationPlan,
+    TransparentInterceptionExecutionPlan, TransparentInterceptionInboundTproxyPlan,
+    TransparentInterceptionMitmBackendPlan, TransparentInterceptionMitmBackendReadinessProbePlan,
     TransparentInterceptionMitmClientTrustPlan, TransparentInterceptionMitmManagedProcessPlan,
     TransparentInterceptionMitmPlaintextBridgePlan, TransparentInterceptionMitmPlan,
     TransparentInterceptionMitmPolicyHookEndpointPlan, TransparentInterceptionMitmPolicyHookPlan,

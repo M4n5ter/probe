@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use interception::{
     TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan,
@@ -122,9 +122,11 @@ fn quick_setup_warnings(profile: &LocalMitmProfile) -> Vec<MitmQuickSetupWarning
     if profile.proxy_program_is_executable() {
         Vec::new()
     } else {
-        vec![MitmQuickSetupWarning::MissingProxyExecutable {
-            path: profile.proxy_program.clone(),
-        }]
+        let path = profile
+            .proxy_program()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("<unconfigured>"));
+        vec![MitmQuickSetupWarning::MissingProxyExecutable { path }]
     }
 }
 
@@ -214,8 +216,7 @@ fn configure_product_mitm_proxy(config: &mut AgentConfig, profile: &LocalMitmPro
         ..TransparentInterceptionMitmBackendReadinessProbeConfig::default()
     };
     let process = TransparentInterceptionMitmProductProxyConfig {
-        program: Some(profile.proxy_program.clone()),
-        working_dir: None,
+        launcher: profile.proxy_launcher.clone(),
         application_protocols: None,
         upstream_discovery: TransparentInterceptionMitmProductProxyUpstreamDiscoveryConfig::default(
         ),
@@ -325,7 +326,7 @@ mod tests {
             MitmQuickSetupOutcome::Changed {
                 direction: MitmQuickSetupDirection::Outbound,
                 warnings: vec![MitmQuickSetupWarning::MissingProxyExecutable {
-                    path: profile.proxy_program.clone(),
+                    path: profile_proxy_program(&profile),
                 }],
             }
         );
@@ -421,7 +422,7 @@ mod tests {
                 warnings,
                 ..
             } if warnings == vec![MitmQuickSetupWarning::MissingProxyExecutable {
-                path: profile.proxy_program.clone(),
+                path: profile_proxy_program(&profile),
             }]
         ));
         assert_eq!(
@@ -439,10 +440,11 @@ mod tests {
     fn mitm_quick_setup_reports_available_proxy_program() {
         let temp = TempDir::new().expect("temp dir");
         let profile = LocalMitmProfile::with_root(temp.path());
-        std::fs::create_dir_all(profile.proxy_program.parent().expect("proxy parent"))
+        let proxy_program = profile_proxy_program(&profile);
+        std::fs::create_dir_all(proxy_program.parent().expect("proxy parent"))
             .expect("create proxy parent");
-        std::fs::write(&profile.proxy_program, b"proxy").expect("create proxy binary placeholder");
-        make_executable(&profile.proxy_program);
+        std::fs::write(&proxy_program, b"proxy").expect("create proxy binary placeholder");
+        make_executable(&proxy_program);
         let mut config = AgentConfig::default();
 
         let outcome = apply_mitm_quick_setup_with_profile(
@@ -480,6 +482,12 @@ mod tests {
             config.enforcement.interception.mitm.backend,
             TransparentInterceptionMitmBackendConfig::ProductProxy { .. }
         ));
+        let TransparentInterceptionMitmBackendConfig::ProductProxy { process, .. } =
+            &config.enforcement.interception.mitm.backend
+        else {
+            panic!("expected product proxy backend");
+        };
+        assert_eq!(process.launcher, profile.proxy_launcher);
         assert_eq!(
             config.enforcement.interception.mitm.client_trust.mode,
             TransparentInterceptionMitmClientTrustModeConfig::OperatorManaged
@@ -546,6 +554,13 @@ mod tests {
             DEFAULT_OUTBOUND_MITM_REMOTE_PORTS
         );
         assert_eq!(term.traffic.directions, [Direction::Outbound]);
+    }
+
+    fn profile_proxy_program(profile: &LocalMitmProfile) -> PathBuf {
+        profile
+            .proxy_program()
+            .expect("test profile should configure proxy program")
+            .to_path_buf()
     }
 
     fn make_executable(path: &std::path::Path) {

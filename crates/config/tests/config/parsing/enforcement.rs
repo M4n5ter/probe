@@ -327,9 +327,12 @@ mode = "product_proxy"
 target = "127.0.0.1:15002"
 
 	[enforcement.interception.mitm.backend.process]
+	application_protocols = ["http1"]
+
+	[enforcement.interception.mitm.backend.process.launcher]
+	mode = "external_binary"
 	program = "/usr/local/bin/traffic-probe-mitm-proxy"
 	working_dir = "/run/traffic-probe"
-	application_protocols = ["http1"]
 
 	[enforcement.interception.mitm.backend.process.upstream_discovery]
 	mode = "dns"
@@ -357,14 +360,21 @@ path = "/etc/traffic-probe/mitm-leaf.key"
     else {
         panic!("expected product-proxy MITM backend");
     };
+    let TransparentInterceptionMitmProductProxyLauncherConfig::ExternalBinary {
+        program,
+        working_dir,
+    } = &process.launcher
+    else {
+        panic!("expected external binary launcher");
+    };
     assert_eq!(
-        process.program.as_deref(),
+        program.as_deref(),
         Some(std::path::Path::new(
             "/usr/local/bin/traffic-probe-mitm-proxy"
         ))
     );
     assert_eq!(
-        process.working_dir.as_deref(),
+        working_dir.as_deref(),
         Some(std::path::Path::new("/run/traffic-probe"))
     );
     assert_eq!(

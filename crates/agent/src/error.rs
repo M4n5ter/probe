@@ -65,6 +65,8 @@ pub(crate) enum AgentError {
     TlsDecryptHints(#[from] TlsDecryptHintError),
     #[error("L7 MITM runtime error: {0}")]
     L7MitmRuntime(String),
+    #[error("MITM proxy error: {0}")]
+    MitmProxy(#[from] mitm_proxy::MitmProxyError),
     #[error("policy reload watcher error: {0}")]
     PolicyReloadWatcher(#[from] PolicyReloadWatcherError),
     #[error("enforcement policy reload watcher error: {0}")]

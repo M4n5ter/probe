@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+
 mod authority;
 mod cli;
 mod error;
@@ -16,4 +18,20 @@ pub use tls::{TlsTerminationConfig, UpstreamTlsConfig};
 
 pub fn run_cli() -> Result<(), MitmProxyError> {
     proxy::run_forever(cli::parse()?)
+}
+
+pub fn config_from_cli_args<I, T>(args: I) -> Result<MitmProxyConfig, MitmProxyError>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    cli::parse_from(args)
+}
+
+pub fn run_cli_from<I, T>(args: I) -> Result<(), MitmProxyError>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    proxy::run_forever(config_from_cli_args(args)?)
 }

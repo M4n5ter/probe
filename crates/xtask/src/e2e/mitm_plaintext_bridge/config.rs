@@ -132,8 +132,7 @@ pub(super) fn write_agent_config(
         } => TransparentInterceptionMitmBackendConfig::product_proxy(
             mitm_readiness_probe(target.clone()),
             TransparentInterceptionMitmProductProxyConfig {
-                program: Some(program.clone()),
-                working_dir: None,
+                launcher: probe_config::TransparentInterceptionMitmProductProxyLauncherConfig::external_binary(program.clone()),
                 application_protocols: None,
                 upstream_discovery: product_proxy_upstream_discovery_config(upstream),
                 upstream_routes: product_proxy_upstream_route_config(upstream),
