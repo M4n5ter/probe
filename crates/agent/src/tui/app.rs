@@ -87,6 +87,7 @@ pub(crate) enum TuiAction {
     TextCancel,
     StartProcessSearch,
     ToggleProcessMonitor,
+    OpenTrafficDiagnostics,
     ConfigureOutboundMitm,
     ConfigureInboundMitm,
     Scroll {
@@ -190,6 +191,31 @@ enum TextEditTarget {
     ProcessSearch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrafficPopup {
+    RowDetail,
+    Diagnostics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrafficPopupState {
+    kind: TrafficPopup,
+    scroll: usize,
+}
+
+impl TrafficPopupState {
+    fn new(kind: TrafficPopup) -> Self {
+        Self { kind, scroll: 0 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrafficPopupView {
+    pub(crate) title: &'static str,
+    pub(crate) lines: Vec<String>,
+    pub(crate) scroll: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TuiApp {
     config_path: PathBuf,
@@ -199,8 +225,7 @@ pub(crate) struct TuiApp {
     process_view: ProcessViewState,
     traffic: TrafficState,
     traffic_visible_rows: usize,
-    traffic_detail_open: bool,
-    traffic_detail_scroll: usize,
+    traffic_popup: Option<TrafficPopupState>,
     runtime_attachment: RuntimeAttachment,
     dirty: bool,
     should_quit: bool,
@@ -233,8 +258,7 @@ impl TuiApp {
             process_view: ProcessViewState::default(),
             traffic: TrafficState::default(),
             traffic_visible_rows: 12,
-            traffic_detail_open: false,
-            traffic_detail_scroll: 0,
+            traffic_popup: None,
             runtime_attachment: RuntimeAttachment::default(),
             dirty: false,
             should_quit: false,
@@ -296,12 +320,26 @@ impl TuiApp {
         &self.traffic
     }
 
-    pub(crate) fn traffic_detail_open(&self) -> bool {
-        self.traffic_detail_open
+    pub(crate) fn traffic_popup_open(&self) -> bool {
+        self.traffic_popup.is_some()
     }
 
-    pub(crate) fn traffic_detail_scroll(&self) -> usize {
-        self.traffic_detail_scroll
+    pub(crate) fn traffic_popup_view(&self) -> Option<TrafficPopupView> {
+        self.traffic_popup.map(|state| TrafficPopupView {
+            title: match state.kind {
+                TrafficPopup::RowDetail => "Traffic Detail",
+                TrafficPopup::Diagnostics => "Data Path Diagnostics",
+            },
+            lines: match state.kind {
+                TrafficPopup::RowDetail => self
+                    .traffic
+                    .selected_row()
+                    .map(|row| row.detail_lines())
+                    .unwrap_or_else(|| vec!["No selected traffic row".to_string()]),
+                TrafficPopup::Diagnostics => self.traffic.data_path_diagnostic_lines(),
+            },
+            scroll: state.scroll,
+        })
     }
 
     pub(crate) fn traffic_filter_label(&self) -> String {
@@ -375,8 +413,8 @@ impl TuiApp {
         if self.text_edit.is_some() {
             return self.handle_text_edit_action(action);
         }
-        if self.traffic_detail_open {
-            return self.handle_traffic_detail_action(action);
+        if self.traffic_popup.is_some() {
+            return self.handle_traffic_popup_action(action);
         }
         match action {
             TuiAction::NextTab => self.select_tab(self.active_tab.next()),
@@ -392,6 +430,7 @@ impl TuiApp {
             | TuiAction::TextCancel => {}
             TuiAction::StartProcessSearch => self.begin_process_search(),
             TuiAction::ToggleProcessMonitor => self.toggle_selected_process_monitor(),
+            TuiAction::OpenTrafficDiagnostics => self.open_traffic_diagnostics(),
             TuiAction::ConfigureOutboundMitm => {
                 return self.apply_mitm_quick_setup(MitmQuickSetupDirection::Outbound);
             }
@@ -440,8 +479,7 @@ impl TuiApp {
         self.config = config;
         self.processes = processes;
         self.traffic = TrafficState::default();
-        self.traffic_detail_open = false;
-        self.traffic_detail_scroll = 0;
+        self.clear_traffic_popup();
         self.text_edit = None;
         self.hovered_target = None;
         self.hovered_process_argv = None;
@@ -479,8 +517,8 @@ impl TuiApp {
             HitTarget::ProcessMonitor(index) => self.toggle_process_monitor(index),
             HitTarget::TrafficProcess(index) => self.watch_process_from_traffic(index),
             HitTarget::TrafficRow(index) => self.select_traffic_row(index),
-            HitTarget::TrafficDetailPanel | HitTarget::TextEditPanel => {}
-            HitTarget::TrafficDetailClose => self.close_traffic_detail(),
+            HitTarget::TrafficPopupPanel | HitTarget::TextEditPanel => {}
+            HitTarget::TrafficPopupClose => self.close_traffic_popup(),
             HitTarget::Save => {
                 return Some(TuiEffect::SaveConfig);
             }
@@ -534,8 +572,7 @@ impl TuiApp {
     fn toggle_process_monitor(&mut self, index: usize) {
         if self.process_view.toggle_monitor(index, &self.processes) {
             self.traffic = TrafficState::default();
-            self.traffic_detail_open = false;
-            self.traffic_detail_scroll = 0;
+            self.clear_traffic_popup();
             self.status = StatusMessage::info(self.traffic_filter_label());
         } else {
             self.status = StatusMessage::warning(
@@ -555,8 +592,7 @@ impl TuiApp {
     fn watch_process_from_traffic(&mut self, index: usize) {
         if self.process_view.set_single_monitor(index, &self.processes) {
             self.traffic = TrafficState::default();
-            self.traffic_detail_open = false;
-            self.traffic_detail_scroll = 0;
+            self.clear_traffic_popup();
             self.active_tab = TuiTab::Traffic;
             self.status = StatusMessage::info(self.traffic_filter_label());
         } else {
@@ -692,6 +728,10 @@ impl TuiApp {
         }
         match control {
             ControlId::ReloadRuntimeActions => Some(TuiEffect::ReloadRuntimeActions),
+            ControlId::OpenTrafficDiagnostics => {
+                self.open_traffic_diagnostics();
+                None
+            }
             ControlId::ConfigureOutboundMitm => {
                 self.apply_mitm_quick_setup(MitmQuickSetupDirection::Outbound)
             }
@@ -891,32 +931,46 @@ impl TuiApp {
 
     fn open_traffic_detail(&mut self) {
         if self.traffic.selected_row().is_some() {
-            self.clear_hover();
-            self.traffic_detail_open = true;
-            self.traffic_detail_scroll = 0;
+            self.open_traffic_popup(TrafficPopup::RowDetail);
         }
     }
 
-    fn close_traffic_detail(&mut self) {
-        self.traffic_detail_open = false;
-        self.traffic_detail_scroll = 0;
-        self.status = StatusMessage::info("Traffic detail closed");
+    fn open_traffic_diagnostics(&mut self) {
+        self.open_traffic_popup(TrafficPopup::Diagnostics);
     }
 
-    fn handle_traffic_detail_action(&mut self, action: TuiAction) -> Option<TuiEffect> {
+    fn open_traffic_popup(&mut self, kind: TrafficPopup) {
+        self.clear_hover();
+        self.traffic_popup = Some(TrafficPopupState::new(kind));
+    }
+
+    fn close_traffic_popup(&mut self) {
+        let status = match self.traffic_popup.map(|popup| popup.kind) {
+            Some(TrafficPopup::Diagnostics) => "Data path diagnostics closed",
+            _ => "Traffic detail closed",
+        };
+        self.clear_traffic_popup();
+        self.status = StatusMessage::info(status);
+    }
+
+    fn clear_traffic_popup(&mut self) {
+        self.traffic_popup = None;
+    }
+
+    fn handle_traffic_popup_action(&mut self, action: TuiAction) -> Option<TuiEffect> {
         match action {
             TuiAction::MoveUp => {
-                self.traffic_detail_scroll = self.traffic_detail_scroll.saturating_sub(1);
+                self.scroll_open_traffic_popup(-1);
             }
             TuiAction::MoveDown => {
-                self.traffic_detail_scroll = self.traffic_detail_scroll.saturating_add(1);
+                self.scroll_open_traffic_popup(1);
             }
             TuiAction::Scroll { delta, .. } => {
-                self.traffic_detail_scroll = apply_scroll_delta(self.traffic_detail_scroll, delta);
+                self.scroll_open_traffic_popup(delta);
             }
             TuiAction::TextCancel
             | TuiAction::Quit
-            | TuiAction::Click(HitTarget::TrafficDetailClose) => self.close_traffic_detail(),
+            | TuiAction::Click(HitTarget::TrafficPopupClose) => self.close_traffic_popup(),
             TuiAction::Hover {
                 target,
                 column,
@@ -924,11 +978,18 @@ impl TuiApp {
             } => self.handle_hover(target, column, row),
             TuiAction::Click(HitTarget::TrafficRow(index)) => {
                 self.traffic.select_row(index, self.traffic_visible_rows);
-                self.traffic_detail_scroll = 0;
+                self.open_traffic_popup(TrafficPopup::RowDetail);
             }
             _ => {}
         }
         None
+    }
+
+    fn scroll_open_traffic_popup(&mut self, delta: isize) {
+        let Some(popup) = &mut self.traffic_popup else {
+            return;
+        };
+        popup.scroll = apply_scroll_delta(popup.scroll, delta);
     }
 
     fn clear_hover(&mut self) {
@@ -1232,6 +1293,31 @@ mod tests {
         assert_outbound_mitm_cgroup_selector(&mouse_app, "system.slice/nginx.service");
         assert!(keyboard_app.dirty());
         assert!(mouse_app.dirty());
+    }
+
+    #[test]
+    fn traffic_data_path_popup_uses_diagnostic_copy_without_row_prompt() {
+        let mut app = test_app();
+        app.select_tab(TuiTab::Traffic);
+
+        app.handle_action(TuiAction::OpenTrafficDiagnostics);
+
+        let popup = app
+            .traffic_popup_view()
+            .expect("data path popup should be open");
+        assert_eq!(popup.title, "Data Path Diagnostics");
+        assert!(
+            popup
+                .lines
+                .iter()
+                .any(|line| line.contains("Capture diagnostics will appear"))
+        );
+        assert!(
+            !popup
+                .lines
+                .iter()
+                .any(|line| line.contains("Select a traffic row"))
+        );
     }
 
     #[test]

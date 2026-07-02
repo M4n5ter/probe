@@ -9,6 +9,7 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlId {
     ReloadRuntimeActions,
+    OpenTrafficDiagnostics,
     ConfigureOutboundMitm,
     ConfigureInboundMitm,
     SearchProcesses,
@@ -19,6 +20,7 @@ impl ControlId {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::ReloadRuntimeActions => "Reload runtime actions",
+            Self::OpenTrafficDiagnostics => "Show data path",
             Self::ConfigureOutboundMitm => "Setup outbound MITM",
             Self::ConfigureInboundMitm => "Setup inbound MITM",
             Self::SearchProcesses => "Search",
@@ -29,6 +31,7 @@ impl ControlId {
     pub(crate) fn action_hint(self) -> &'static str {
         match self {
             Self::ReloadRuntimeActions => "run action",
+            Self::OpenTrafficDiagnostics => "open diagnostics",
             Self::ConfigureOutboundMitm | Self::ConfigureInboundMitm => "apply selected process",
             Self::SearchProcesses => "search",
             Self::ClearProcessSearch => "clear",
@@ -37,6 +40,7 @@ impl ControlId {
 
     pub(crate) fn traffic_action_label(self) -> &'static str {
         match self {
+            Self::OpenTrafficDiagnostics => "Data Path",
             Self::ConfigureOutboundMitm => "Out MITM",
             Self::ConfigureInboundMitm => "In MITM",
             _ => self.label(),
@@ -46,6 +50,7 @@ impl ControlId {
     pub(crate) fn value(self, _config: &AgentConfig) -> String {
         match self {
             Self::ReloadRuntimeActions => "uses active TUI runtime".to_string(),
+            Self::OpenTrafficDiagnostics => "capture and MITM runtime diagnostics".to_string(),
             Self::ConfigureOutboundMitm => {
                 format!("process-scoped {MITM_PLAINTEXT_COVERAGE} via product proxy")
             }

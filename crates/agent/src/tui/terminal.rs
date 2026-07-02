@@ -307,6 +307,9 @@ fn key_to_action(key: KeyEvent, editing_text: bool, active_tab: TuiTab) -> Optio
         (KeyCode::Char('/'), _) => Some(TuiAction::StartProcessSearch),
         (KeyCode::Char('f'), KeyModifiers::CONTROL) => Some(TuiAction::StartProcessSearch),
         (KeyCode::Char('w'), _) => Some(TuiAction::ToggleProcessMonitor),
+        (KeyCode::Char('d'), _) if active_tab == TuiTab::Traffic => {
+            Some(TuiAction::OpenTrafficDiagnostics)
+        }
         (KeyCode::Char('o'), _) if active_tab == TuiTab::Traffic => {
             Some(TuiAction::ConfigureOutboundMitm)
         }
@@ -426,6 +429,22 @@ mod tests {
                 TuiTab::Traffic
             ),
             Some(TuiAction::ConfigureInboundMitm)
+        );
+        assert_eq!(
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                false,
+                TuiTab::Traffic
+            ),
+            Some(TuiAction::OpenTrafficDiagnostics)
+        );
+        assert_eq!(
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                false,
+                TuiTab::Overview
+            ),
+            None
         );
         assert_eq!(
             key_to_action(

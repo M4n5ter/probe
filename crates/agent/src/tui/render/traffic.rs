@@ -45,7 +45,7 @@ pub(super) fn render_traffic(
     render_traffic_detail_preview(frame, detail_area, app);
 }
 
-pub(super) fn render_traffic_detail_popup(
+pub(super) fn render_traffic_popup(
     frame: &mut Frame<'_>,
     area: Rect,
     app: &TuiApp,
@@ -58,21 +58,18 @@ pub(super) fn render_traffic_detail_popup(
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let modal = Rect::new(x, y, width, height);
-    hits.push(HitArea::new(area, HitTarget::TrafficDetailPanel));
+    hits.push(HitArea::new(area, HitTarget::TrafficPopupPanel));
     frame.render_widget(Clear, modal);
 
+    let Some(popup) = app.traffic_popup_view() else {
+        return;
+    };
     let block = Block::bordered()
-        .title("Traffic Detail")
+        .title(popup.title)
         .shadow(Shadow::dark_shade().offset(Offset::new(2, 1)));
     let inner = block.inner(modal);
-    let lines = app
-        .traffic()
-        .selected_row()
-        .map(|row| detail_lines_for_popup(row.detail_lines()))
-        .unwrap_or_else(|| vec![Line::from("No selected traffic row")]);
-    let scroll = app
-        .traffic_detail_scroll()
-        .min(lines.len().saturating_sub(1));
+    let lines = popup_lines_for_render(popup.lines);
+    let scroll = popup.scroll.min(lines.len().saturating_sub(1));
     frame.render_widget(
         Paragraph::new(lines.clone())
             .block(block)
@@ -93,8 +90,8 @@ pub(super) fn render_traffic_detail_popup(
         hits,
         close,
         "Close",
-        HitTarget::TrafficDetailClose,
-        app.is_hovered(HitTarget::TrafficDetailClose),
+        HitTarget::TrafficPopupClose,
+        app.is_hovered(HitTarget::TrafficPopupClose),
     );
 }
 
@@ -186,6 +183,15 @@ fn render_traffic_action_bar(
     }
     let mut x = area.x;
     let y = area.y + 1;
+    x = render_action_button(
+        frame,
+        hits,
+        action_area(area, x, y),
+        ControlId::OpenTrafficDiagnostics.traffic_action_label(),
+        HitTarget::Control(ControlId::OpenTrafficDiagnostics),
+        app.is_hovered(HitTarget::Control(ControlId::OpenTrafficDiagnostics)),
+    )
+    .unwrap_or(x);
     if let Some(index) = app
         .selected_process_index()
         .filter(|index| app.processes().entries().get(*index).is_some())
@@ -460,7 +466,7 @@ fn preview_lines_for_render(lines: Vec<String>) -> Vec<Line<'static>> {
     lines.into_iter().map(Line::from).collect()
 }
 
-fn detail_lines_for_popup(details: Vec<String>) -> Vec<Line<'static>> {
+fn popup_lines_for_render(details: Vec<String>) -> Vec<Line<'static>> {
     details
         .iter()
         .flat_map(|line| [Line::from(line.clone()), Line::from("")])

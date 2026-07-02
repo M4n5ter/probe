@@ -49,8 +49,8 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut TuiApp) -> HitMap {
             &mut hits,
         );
     }
-    if app.traffic_detail_open() {
-        traffic::render_traffic_detail_popup(frame, area, app, &mut hits);
+    if app.traffic_popup_open() {
+        traffic::render_traffic_popup(frame, area, app, &mut hits);
     }
     if let Some(hover) = app.hovered_process_argv() {
         traffic::render_process_argv_hover(frame, area, app, hover);
@@ -452,6 +452,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     ];
     if app.active_tab() == TuiTab::Traffic {
         spans.extend([
+            Span::styled("d", Style::default().fg(Color::Gray)),
+            Span::raw(" data path  "),
             Span::styled("o/i", Style::default().fg(Color::Gray)),
             Span::raw(" mitm  "),
         ]);
@@ -848,6 +850,7 @@ mod tests {
         })?;
 
         let output = terminal.backend().to_string();
+        assert!(output.contains("[Data Path]"));
         assert!(output.contains("[Watch]"));
         assert!(output.contains("[Out MITM]"));
         assert!(output.contains("[In MITM]"));
@@ -871,6 +874,12 @@ mod tests {
         ));
         assert!(hit_exists(
             &hit_map,
+            Some(HitTarget::Control(ControlId::OpenTrafficDiagnostics)),
+            100,
+            24
+        ));
+        assert!(hit_exists(
+            &hit_map,
             Some(HitTarget::Control(ControlId::ConfigureOutboundMitm)),
             100,
             24
@@ -880,6 +889,34 @@ mod tests {
             Some(HitTarget::Control(ControlId::ConfigureInboundMitm)),
             100,
             24
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn render_traffic_data_path_popup_without_selected_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = test_app();
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
+        app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::OpenTrafficDiagnostics,
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(110, 28))?;
+        let mut hit_map = HitMap::default();
+
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &mut app);
+        })?;
+
+        let output = terminal.backend().to_string();
+        assert!(output.contains("Data Path Diagnostics"));
+        assert!(output.contains("Capture diagnostics will appear here after the first refresh"));
+        assert!(output.contains("MITM fallback can capture"));
+        assert!(hit_exists(
+            &hit_map,
+            Some(HitTarget::TrafficPopupClose),
+            110,
+            28
         ));
         Ok(())
     }

@@ -73,12 +73,17 @@ impl TrafficState {
     }
 
     pub(crate) fn diagnostic_lines(&self) -> Vec<String> {
+        let mut lines = vec!["Select a traffic row to inspect details".to_string()];
+        lines.extend(self.data_path_diagnostic_lines());
+        lines
+    }
+
+    pub(crate) fn data_path_diagnostic_lines(&self) -> Vec<String> {
         self.runtime_diagnostics
             .as_ref()
             .map(TrafficRuntimeDiagnostics::detail_lines)
             .unwrap_or_else(|| {
                 vec![
-                    "Select a traffic row to inspect details".to_string(),
                     "Capture diagnostics will appear here after the first refresh".to_string(),
                     format!(
                         "MITM fallback can capture {MITM_PLAINTEXT_COVERAGE} when passive capture is unavailable"
