@@ -110,6 +110,10 @@ impl CaptureProvider for Tls13SessionSecretDecryptingProvider {
             self.inner.as_mut(),
         )
     }
+
+    fn runtime_diagnostics(&mut self) -> crate::CaptureProviderRuntimeDiagnostics {
+        self.inner.runtime_diagnostics()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

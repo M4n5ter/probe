@@ -166,6 +166,11 @@ mod tests {
         );
         assert_eq!(provider["link_ownership"]["owned_link_count"], 2);
         assert_eq!(
+            provider["tracepoint_firings"]["mode"],
+            serde_json::json!("unavailable")
+        );
+        assert_eq!(provider["tracepoint_firings"]["total_firing_count"], 0);
+        assert_eq!(
             provider["kernel_liveness"]["mode"],
             serde_json::json!("unavailable")
         );

@@ -13,7 +13,8 @@ pub use process_observation::{
     EbpfProcessObservationOptionalTracepointPairState, EbpfProcessObservationProbe,
     EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeError,
     EbpfProcessObservationProbeSnapshot, EbpfProcessObservationProgramLinkOwnershipSnapshot,
-    EbpfProcessObservationProvider, EbpfResolvedSocketFlow, EbpfSocketEndpoint,
+    EbpfProcessObservationProvider, EbpfProcessObservationRuntimeDiagnostics,
+    EbpfProcessObservationTracepointFiring, EbpfResolvedSocketFlow, EbpfSocketEndpoint,
     EbpfSocketFlowLookup, EbpfSocketFlowResolver, EbpfSocketReadObservation,
     EbpfSocketWriteObservation,
 };

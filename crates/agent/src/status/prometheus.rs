@@ -842,6 +842,7 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
     );
     let Some(CaptureProviderRuntimeDetailsSnapshot::EbpfProcessObservation {
         link_ownership,
+        tracepoint_firings,
         kernel_liveness,
         optional_tracepoint_pairs,
     }) = &snapshot.capture.provider
@@ -861,6 +862,18 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
         write_sample(
             output,
             "traffic_probe_ebpf_process_observation_kernel_liveness_metrics_available",
+            &[],
+            0,
+        );
+        write_family(
+            output,
+            "traffic_probe_ebpf_process_observation_tracepoint_firing_metrics_available",
+            "gauge",
+            "Whether eBPF process observation tracepoint firing metrics are present in this snapshot.",
+        );
+        write_sample(
+            output,
+            "traffic_probe_ebpf_process_observation_tracepoint_firing_metrics_available",
             &[],
             0,
         );
@@ -920,6 +933,42 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
 
     write_family(
         output,
+        "traffic_probe_ebpf_process_observation_tracepoint_firing_metrics_available",
+        "gauge",
+        "Whether eBPF process observation tracepoint firing metrics are present in this snapshot.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_ebpf_process_observation_tracepoint_firing_metrics_available",
+        &[],
+        1,
+    );
+    write_one_hot_enum(
+        output,
+        "traffic_probe_ebpf_process_observation_tracepoint_firing_mode",
+        "Process eBPF tracepoint firing counter availability as a one-hot gauge.",
+        "mode",
+        &RUNTIME_MODES,
+        tracepoint_firings.mode,
+        RuntimeMode::wire_name,
+    );
+    if tracepoint_firings.mode == RuntimeMode::Available {
+        write_family(
+            output,
+            "traffic_probe_ebpf_process_observation_tracepoint_firings_total",
+            "counter",
+            "Kernel-side process eBPF tracepoint handler firings observed through provider counters.",
+        );
+        write_sample(
+            output,
+            "traffic_probe_ebpf_process_observation_tracepoint_firings_total",
+            &[],
+            tracepoint_firings.total_firing_count,
+        );
+    }
+
+    write_family(
+        output,
         "traffic_probe_ebpf_process_observation_program_owned_links",
         "gauge",
         "Userspace-held committed eBPF process observation tracepoint link handles by program.",
@@ -935,6 +984,27 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
             ],
             program.owned_link_count,
         );
+    }
+
+    if tracepoint_firings.mode == RuntimeMode::Available {
+        write_family(
+            output,
+            "traffic_probe_ebpf_process_observation_program_tracepoint_firings_total",
+            "counter",
+            "Kernel-side process eBPF tracepoint handler firings by program.",
+        );
+        for program in &tracepoint_firings.programs {
+            write_sample(
+                output,
+                "traffic_probe_ebpf_process_observation_program_tracepoint_firings_total",
+                &[
+                    ("program_name", program.program_name),
+                    ("category", program.category),
+                    ("tracepoint", program.tracepoint_name),
+                ],
+                program.firing_count,
+            );
+        }
     }
 
     write_family(
@@ -1178,6 +1248,12 @@ mod tests {
     };
     use storage::SpoolSnapshot;
 
+    use capture::{
+        CaptureError, CapturePoll, CaptureProvider, CaptureProviderRuntimeDiagnostics,
+        EbpfProcessObservationRuntimeDiagnostics, EbpfProcessObservationTracepointFiring,
+    };
+    use probe_core::CapabilityState;
+
     use super::super::{
         RuntimeStatusInput, build_status_snapshot, build_status_snapshot_with_runtime,
         plan_fixture::{config_with_storage_path, runtime_plan_from_config},
@@ -1188,6 +1264,7 @@ mod tests {
         CaptureInputActivityRuntimeSnapshot, CaptureInputPollActivityRuntimeSnapshot,
         CaptureInputProviderActivityRuntimeSnapshot, CaptureInputSignalRuntimeSnapshot,
         CaptureProviderRuntimeDetailsSnapshot, CaptureProviderRuntimeSnapshot,
+        CaptureProviderRuntimeState,
     };
     use crate::l7_mitm::{
         L7MitmBackendHealthMode, L7MitmBackendHealthSnapshot, L7MitmClientTrustSnapshot,
@@ -1564,6 +1641,20 @@ mod tests {
             "traffic_probe_ebpf_process_observation_kernel_liveness_mode{mode=\"unavailable\"} 0\n"
         ));
         assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_tracepoint_firing_metrics_available 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_tracepoint_firing_mode{mode=\"unavailable\"} 1\n"
+        ));
+        assert!(
+            !metrics.contains("traffic_probe_ebpf_process_observation_tracepoint_firings_total")
+        );
+        assert!(
+            !metrics.contains(
+                "traffic_probe_ebpf_process_observation_program_tracepoint_firings_total"
+            )
+        );
+        assert!(metrics.contains(
             "traffic_probe_ebpf_process_observation_program_owned_links{program_name=\"connect_enter\",category=\"syscalls\",tracepoint=\"sys_enter_connect\"} 1\n"
         ));
         assert!(metrics.contains(
@@ -1577,6 +1668,81 @@ mod tests {
         ));
         assert!(!metrics.contains(
             "traffic_probe_ebpf_process_observation_optional_tracepoint_pair_mode{family=\"sendfile\",mode=\"degraded\"}"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn render_prometheus_metrics_includes_available_ebpf_tracepoint_firings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
+            Vec::new(),
+        )?;
+        let capture_runtime = CaptureProviderRuntimeState::default();
+        capture_runtime.record(CaptureProviderRuntimeSnapshot {
+            selected_backend: CaptureBackend::Ebpf,
+            plan_mode: CapturePlanMode::Live,
+            provider_runtime_mode: RuntimeMode::Degraded,
+            evidence_mode: CaptureEvidenceMode::BestEffort,
+            evidence_reason: Some("eBPF provider is best-effort".to_string()),
+            reason: Some("kernel observer is best-effort".to_string()),
+            open_failures: Vec::new(),
+            provider: Some(CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(
+                capture::EbpfProcessObservationProbeSnapshot::from_link_ownership_and_optional_pairs(
+                    capture::EbpfProcessObservationLinkOwnershipSnapshot::owned_by_programs([
+                        capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
+                            "connect_enter",
+                            "syscalls",
+                            "sys_enter_connect",
+                            1,
+                        ),
+                    ]),
+                    [],
+                ),
+            )),
+        });
+        let mut provider =
+            capture_runtime.observe_capture_input(Box::new(TracepointFiringDiagnosticProvider));
+        assert_eq!(provider.poll_next()?, CapturePoll::Progress);
+
+        let snapshot = build_status_snapshot_with_runtime(
+            &plan,
+            SpoolStatusInput::available(
+                PathBuf::from("/tmp/traffic-probe-spool"),
+                SpoolSnapshot {
+                    last_ingress_sequence: 0,
+                    last_export_sequence: 0,
+                },
+                BTreeMap::new(),
+            ),
+            RuntimeStatusInput {
+                capture: capture_runtime.snapshot(),
+                capture_input: capture_runtime.input_activity_snapshot(),
+                ..RuntimeStatusInput::default()
+            },
+        );
+
+        let provider = serde_json::to_value(&snapshot.capture.provider)?;
+        assert_eq!(
+            provider["tracepoint_firings"]["mode"],
+            serde_json::json!("available")
+        );
+        assert_eq!(provider["tracepoint_firings"]["total_firing_count"], 3);
+        assert_eq!(
+            provider["kernel_liveness"]["mode"],
+            serde_json::json!("degraded")
+        );
+
+        let metrics = render_prometheus_metrics(&snapshot);
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_tracepoint_firing_mode{mode=\"available\"} 1\n"
+        ));
+        assert!(
+            metrics.contains("traffic_probe_ebpf_process_observation_tracepoint_firings_total 3\n")
+        );
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_program_tracepoint_firings_total{program_name=\"connect_enter\",category=\"syscalls\",tracepoint=\"sys_enter_connect\"} 3\n"
         ));
         Ok(())
     }
@@ -1621,9 +1787,17 @@ mod tests {
         assert!(metrics.contains(
             "traffic_probe_ebpf_process_observation_kernel_liveness_metrics_available 0\n"
         ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_tracepoint_firing_metrics_available 0\n"
+        ));
         assert!(!metrics.contains("traffic_probe_ebpf_process_observation_kernel_liveness_mode{"));
         assert!(!metrics.contains("traffic_probe_ebpf_process_observation_owned_links"));
         assert!(!metrics.contains("traffic_probe_ebpf_process_observation_program_owned_links"));
+        assert!(
+            !metrics.contains(
+                "traffic_probe_ebpf_process_observation_program_tracepoint_firings_total"
+            )
+        );
         Ok(())
     }
 
@@ -1681,6 +1855,15 @@ mod tests {
         assert!(metrics.contains(
             "traffic_probe_ebpf_process_observation_kernel_liveness_mode{mode=\"unavailable\"} 1\n"
         ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_tracepoint_firing_metrics_available 1\n"
+        ));
+        assert!(metrics.contains(
+            "traffic_probe_ebpf_process_observation_tracepoint_firing_mode{mode=\"unavailable\"} 1\n"
+        ));
+        assert!(
+            !metrics.contains("traffic_probe_ebpf_process_observation_tracepoint_firings_total")
+        );
         assert!(!metrics.contains("traffic_probe_ebpf_process_observation_program_owned_links{"));
         Ok(())
     }
@@ -1950,5 +2133,34 @@ mod tests {
             "traffic_probe_pipeline_enforcement_execution_total{kind=\"proxy_side_hook\",surface=\"l7_mitm\"} 1\n"
         ));
         Ok(())
+    }
+
+    struct TracepointFiringDiagnosticProvider;
+
+    impl CaptureProvider for TracepointFiringDiagnosticProvider {
+        fn name(&self) -> &'static str {
+            "tracepoint-firing-diagnostic"
+        }
+
+        fn capabilities(&self) -> Vec<CapabilityState> {
+            Vec::new()
+        }
+
+        fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(CapturePoll::Progress)
+        }
+
+        fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
+            CaptureProviderRuntimeDiagnostics::from_ebpf_process_observation(
+                EbpfProcessObservationRuntimeDiagnostics {
+                    tracepoint_firings: Ok(vec![EbpfProcessObservationTracepointFiring {
+                        program_name: "connect_enter",
+                        category: "syscalls",
+                        tracepoint_name: "sys_enter_connect",
+                        firing_count: 3,
+                    }]),
+                },
+            )
+        }
     }
 }

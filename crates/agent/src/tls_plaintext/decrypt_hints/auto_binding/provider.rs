@@ -136,6 +136,10 @@ impl CaptureProvider for TlsSessionSecretRefreshingAutoBindingProvider {
         self.refresh_if_due()?;
         self.provider.poll_next()
     }
+
+    fn runtime_diagnostics(&mut self) -> capture::CaptureProviderRuntimeDiagnostics {
+        self.provider.runtime_diagnostics()
+    }
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+use ebpf_abi::EbpfProcessTracepointSpec;
 use probe_core::TcpEndpoint;
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +12,30 @@ pub enum EbpfProcessObservation {
     ProcessLifecycle(EbpfProcessLifecycleObservation),
     Write(EbpfSocketWriteObservation),
     Read(EbpfSocketReadObservation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EbpfProcessObservationRuntimeDiagnostics {
+    pub tracepoint_firings: Result<Vec<EbpfProcessObservationTracepointFiring>, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfProcessObservationTracepointFiring {
+    pub program_name: &'static str,
+    pub category: &'static str,
+    pub tracepoint_name: &'static str,
+    pub firing_count: u64,
+}
+
+impl EbpfProcessObservationTracepointFiring {
+    pub(crate) fn from_tracepoint_spec(spec: EbpfProcessTracepointSpec, firing_count: u64) -> Self {
+        Self {
+            program_name: spec.program_name,
+            category: spec.category,
+            tracepoint_name: spec.tracepoint_name,
+            firing_count,
+        }
+    }
 }
 
 impl EbpfProcessObservation {

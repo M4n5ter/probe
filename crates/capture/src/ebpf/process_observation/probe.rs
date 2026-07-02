@@ -12,14 +12,15 @@ use aya::{
 use ebpf_abi::{
     EBPF_ADDRESS_FAMILY_INET, EBPF_ADDRESS_FAMILY_INET6, EBPF_ALLOWED_SOCKET_FDS_MAP_NAME,
     EBPF_EVENTS_MAP_NAME, EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS,
-    EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME, EBPF_PROCESS_TRACEPOINT_SPECS,
-    EBPF_SOCKET_FLOW_REMOTE_ENDPOINT_VALID, EBPF_SOCKET_FLOW_SOCKADDR_READ_FAILED,
-    EBPF_SOCKET_FLOW_UNSUPPORTED_ADDRESS_FAMILY, EBPF_SOCKET_READ_READ_FAILED,
-    EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_WRITE_KERNEL_TRANSFER, EBPF_SOCKET_WRITE_READ_FAILED,
-    EBPF_SOCKET_WRITE_TRUNCATED, EbpfAcceptObservation, EbpfCloseRangeObservation,
-    EbpfConnectObservation, EbpfEventDecodeError, EbpfProcessOptionalTracepointPairSpec,
-    EbpfProcessProbeEvent, EbpfProcessTracepointSpec, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
-    EbpfSocketReadSample, EbpfSocketWriteSample, decode_process_probe_event,
+    EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME, EBPF_PROCESS_TRACEPOINT_FIRINGS_MAP_NAME,
+    EBPF_PROCESS_TRACEPOINT_SPECS, EBPF_SOCKET_FLOW_REMOTE_ENDPOINT_VALID,
+    EBPF_SOCKET_FLOW_SOCKADDR_READ_FAILED, EBPF_SOCKET_FLOW_UNSUPPORTED_ADDRESS_FAMILY,
+    EBPF_SOCKET_READ_READ_FAILED, EBPF_SOCKET_READ_TRUNCATED, EBPF_SOCKET_WRITE_KERNEL_TRANSFER,
+    EBPF_SOCKET_WRITE_READ_FAILED, EBPF_SOCKET_WRITE_TRUNCATED, EbpfAcceptObservation,
+    EbpfCloseRangeObservation, EbpfConnectObservation, EbpfEventDecodeError,
+    EbpfProcessOptionalTracepointPairSpec, EbpfProcessProbeEvent, EbpfProcessTracepointSpec,
+    EbpfSocketFdKey, EbpfSocketPayloadAllowance, EbpfSocketReadSample, EbpfSocketWriteSample,
+    decode_process_probe_event,
 };
 use ebpf_object::{
     EbpfObjectProbe, EbpfObjectProbeConfig, EbpfObjectProbeReport, EbpfPreflightedObject,
@@ -31,8 +32,9 @@ use super::{
     EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
     EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
     EbpfProcessLifecycleKind, EbpfProcessLifecycleObservation, EbpfProcessObservation,
-    EbpfSocketEndpoint, EbpfSocketReadObservation, EbpfSocketWriteObservation,
-    descriptor_lease::DescriptorLeaseKey, payload_authorization::SocketPayloadSampleAuthorization,
+    EbpfProcessObservationTracepointFiring, EbpfSocketEndpoint, EbpfSocketReadObservation,
+    EbpfSocketWriteObservation, descriptor_lease::DescriptorLeaseKey,
+    payload_authorization::SocketPayloadSampleAuthorization,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +107,7 @@ pub struct EbpfProcessObservationProbe {
     events: RingBuf<MapData>,
     allowed_socket_fds: SocketAllowMap,
     output_losses: OutputLossMap,
+    tracepoint_firings: TracepointFiringMap,
     probe_snapshot: EbpfProcessObservationProbeSnapshot,
 }
 
@@ -348,11 +351,13 @@ impl EbpfProcessObservationProbe {
         let events = open_events_ringbuf(&mut ebpf)?;
         let allowed_socket_fds = open_socket_allow_map(&mut ebpf)?;
         let output_losses = open_output_loss_map(&mut ebpf)?;
+        let tracepoint_firings = open_tracepoint_firing_map(&mut ebpf)?;
         Ok(Self {
             _ebpf: ebpf,
             events,
             allowed_socket_fds,
             output_losses,
+            tracepoint_firings,
             probe_snapshot:
                 EbpfProcessObservationProbeSnapshot::from_attached_tracepoints_and_optional_pairs(
                     attached_tracepoints,
@@ -418,6 +423,33 @@ impl EbpfProcessObservationProbe {
             .copied()
             .fold(0u64, |total, value| total.saturating_add(value)))
     }
+
+    pub fn process_tracepoint_firings(
+        &mut self,
+    ) -> Result<Vec<EbpfProcessObservationTracepointFiring>, EbpfProcessObservationProbeError> {
+        EBPF_PROCESS_TRACEPOINT_SPECS
+            .into_iter()
+            .map(|spec| {
+                let values = self
+                    .tracepoint_firings
+                    .get(&spec.role.counter_index(), 0)
+                    .map_err(|source| EbpfProcessObservationProbeError::Map {
+                        name: EBPF_PROCESS_TRACEPOINT_FIRINGS_MAP_NAME,
+                        source,
+                    })?;
+                let firing_count = values
+                    .iter()
+                    .copied()
+                    .fold(0u64, |total, value| total.saturating_add(value));
+                Ok(
+                    EbpfProcessObservationTracepointFiring::from_tracepoint_spec(
+                        spec,
+                        firing_count,
+                    ),
+                )
+            })
+            .collect()
+    }
 }
 
 type SocketAllowMap = AyaHashMap<
@@ -426,6 +458,7 @@ type SocketAllowMap = AyaHashMap<
     [u8; core::mem::size_of::<EbpfSocketPayloadAllowance>()],
 >;
 type OutputLossMap = PerCpuArray<MapData, u64>;
+type TracepointFiringMap = PerCpuArray<MapData, u64>;
 
 struct OptionalTracepointPairAttachReport {
     attached_tracepoints: Vec<EbpfProcessTracepointSpec>,
@@ -563,6 +596,20 @@ fn open_output_loss_map(
     )?;
     OutputLossMap::try_from(map).map_err(|source| EbpfProcessObservationProbeError::Map {
         name: EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME,
+        source,
+    })
+}
+
+fn open_tracepoint_firing_map(
+    ebpf: &mut Ebpf,
+) -> Result<TracepointFiringMap, EbpfProcessObservationProbeError> {
+    let map = ebpf
+        .take_map(EBPF_PROCESS_TRACEPOINT_FIRINGS_MAP_NAME)
+        .ok_or(EbpfProcessObservationProbeError::MissingMap {
+            name: EBPF_PROCESS_TRACEPOINT_FIRINGS_MAP_NAME,
+        })?;
+    TracepointFiringMap::try_from(map).map_err(|source| EbpfProcessObservationProbeError::Map {
+        name: EBPF_PROCESS_TRACEPOINT_FIRINGS_MAP_NAME,
         source,
     })
 }

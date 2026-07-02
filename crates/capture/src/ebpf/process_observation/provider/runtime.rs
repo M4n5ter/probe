@@ -8,7 +8,10 @@ use probe_core::{
 };
 
 use crate::output_loss::OutputLossTracker;
-use crate::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider};
+use crate::{
+    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderRuntimeDiagnostics,
+    EbpfProcessObservationRuntimeDiagnostics,
+};
 
 use super::super::{
     EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation,
@@ -29,6 +32,7 @@ use super::super::{
 
 const DEFAULT_RESOLUTION_RETRIES: u32 = 20;
 const DEFAULT_RESOLUTION_RETRY_SLEEP: Duration = Duration::from_millis(5);
+const DEFAULT_RUNTIME_DIAGNOSTICS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TRACKED_EBPF_FLOWS: usize = 8192;
 const MAX_PENDING_EBPF_FLOW_RESOLUTIONS: usize = 8192;
 
@@ -45,6 +49,7 @@ pub struct EbpfProcessObservationProvider {
     pending_events: VecDeque<CaptureEvent>,
     output_loss: OutputLossTracker,
     probe_snapshot: EbpfProcessObservationProbeSnapshot,
+    runtime_diagnostics: EbpfProcessObservationRuntimeDiagnosticsCache,
 }
 
 impl EbpfProcessObservationProvider {
@@ -69,6 +74,7 @@ impl EbpfProcessObservationProvider {
             pending_events: VecDeque::new(),
             output_loss: OutputLossTracker::default(),
             probe_snapshot,
+            runtime_diagnostics: EbpfProcessObservationRuntimeDiagnosticsCache::default(),
         })
     }
 
@@ -368,6 +374,57 @@ impl EbpfProcessObservationProvider {
     }
 }
 
+struct EbpfProcessObservationRuntimeDiagnosticsCache {
+    refresh_interval: Duration,
+    last_refresh: Option<Instant>,
+    snapshot: EbpfProcessObservationRuntimeDiagnostics,
+}
+
+impl Default for EbpfProcessObservationRuntimeDiagnosticsCache {
+    fn default() -> Self {
+        Self {
+            refresh_interval: DEFAULT_RUNTIME_DIAGNOSTICS_REFRESH_INTERVAL,
+            last_refresh: None,
+            snapshot: EbpfProcessObservationRuntimeDiagnostics {
+                tracepoint_firings: Err(
+                    "process tracepoint firing diagnostics have not been read yet".to_string(),
+                ),
+            },
+        }
+    }
+}
+
+impl EbpfProcessObservationRuntimeDiagnosticsCache {
+    fn snapshot(
+        &mut self,
+        observations: &mut dyn EbpfObservationSource,
+    ) -> EbpfProcessObservationRuntimeDiagnostics {
+        let now = Instant::now();
+        if self
+            .last_refresh
+            .is_some_and(|last_refresh| now.duration_since(last_refresh) < self.refresh_interval)
+        {
+            return self.snapshot.clone();
+        }
+        self.last_refresh = Some(now);
+        self.snapshot = match observations.process_tracepoint_firings() {
+            Ok(Some(tracepoint_firings)) => EbpfProcessObservationRuntimeDiagnostics {
+                tracepoint_firings: Ok(tracepoint_firings),
+            },
+            Ok(None) => EbpfProcessObservationRuntimeDiagnostics {
+                tracepoint_firings: Err(
+                    "process tracepoint firing diagnostics are not available for this observation source"
+                        .to_string(),
+                ),
+            },
+            Err(error) => EbpfProcessObservationRuntimeDiagnostics {
+                tracepoint_firings: Err(error.to_string()),
+            },
+        };
+        self.snapshot.clone()
+    }
+}
+
 fn connection_closed_event(timestamp: Timestamp, flow: FlowContext) -> CaptureEvent {
     CaptureEvent::ConnectionClosed {
         timestamp,
@@ -384,12 +441,19 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider emits result-gated connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded multi-iovec prefix syscall argument samples, outbound available sendfile family kernel-transfer byte-count gaps, inbound single-buffer and bounded multi-iovec prefix syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, TGID-level process exit/exec cancellation of pending flow resolution plus lifecycle boundary gaps for active payload-tracked flows, userspace tracked-flow displacement as event-local terminal provider-state boundary gaps, output ring-buffer failure conversion to degraded capture_loss events, and conservative unknown-offset gap fan-out to active tracked payload flows; payload beyond the bounded multi-iovec scan/sample or fixed verifier-friendly append slots, kernel-transfer payload bytes, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
+            "eBPF provider emits result-gated connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded multi-iovec prefix syscall argument samples, outbound available sendfile family kernel-transfer byte-count gaps, inbound single-buffer and bounded multi-iovec prefix syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, TGID-level process exit/exec cancellation of pending flow resolution plus lifecycle boundary gaps for active payload-tracked flows, userspace tracked-flow displacement as event-local terminal provider-state boundary gaps, output ring-buffer failure conversion to degraded capture_loss events, conservative unknown-offset gap fan-out to active tracked payload flows, and per-tracepoint kernel firing counters; payload beyond the bounded multi-iovec scan/sample or fixed verifier-friendly append slots, kernel-transfer payload bytes, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
         )]
     }
 
     fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
         self.poll_event()
+    }
+
+    fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
+        CaptureProviderRuntimeDiagnostics::from_ebpf_process_observation(
+            self.runtime_diagnostics
+                .snapshot(self.observations.as_mut()),
+        )
     }
 }
 
@@ -400,7 +464,9 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use crate::{CaptureProviderKind, EnforcementEvidencePropagation};
+    use crate::{
+        CaptureProviderKind, EbpfProcessObservationTracepointFiring, EnforcementEvidencePropagation,
+    };
 
     use probe_core::{
         Direction, ObservationOnlyReason, ProcessContext, ProcessIdentity, ProcessSelector,
@@ -446,11 +512,20 @@ mod tests {
                 pending_events: VecDeque::new(),
                 output_loss: OutputLossTracker::default(),
                 probe_snapshot: EbpfProcessObservationProbeSnapshot::unreported(),
+                runtime_diagnostics: EbpfProcessObservationRuntimeDiagnosticsCache::default(),
             }
         }
 
         fn with_output_loss_check_interval_for_test(mut self, interval: u32) -> Self {
             self.output_loss = OutputLossTracker::new(interval);
+            self
+        }
+
+        fn with_runtime_diagnostics_refresh_interval_for_test(
+            mut self,
+            refresh_interval: Duration,
+        ) -> Self {
+            self.runtime_diagnostics.refresh_interval = refresh_interval;
             self
         }
 
@@ -1323,6 +1398,48 @@ mod tests {
     }
 
     #[test]
+    fn runtime_diagnostics_reads_tracepoint_firing_counts() {
+        let source = TracepointFiringObservationSource {
+            firings: vec![
+                EbpfProcessObservationTracepointFiring {
+                    program_name: "connect_enter",
+                    category: "syscalls",
+                    tracepoint_name: "sys_enter_connect",
+                    firing_count: 2,
+                },
+                EbpfProcessObservationTracepointFiring {
+                    program_name: "connect_exit",
+                    category: "syscalls",
+                    tracepoint_name: "sys_exit_connect",
+                    firing_count: 1,
+                },
+            ],
+        };
+        let resolver = Box::new(StaticResolver { resolved: None });
+        let mut provider =
+            EbpfProcessObservationProvider::from_source_for_test(source, resolver, None)
+                .with_runtime_diagnostics_refresh_interval_for_test(Duration::ZERO);
+
+        let diagnostics = provider
+            .runtime_diagnostics()
+            .into_ebpf_process_observation()
+            .expect("expected eBPF process observation diagnostics");
+
+        let firings = diagnostics
+            .tracepoint_firings
+            .expect("tracepoint firing diagnostics should be available");
+        assert_eq!(firings.len(), 2);
+        assert_eq!(firings[0].program_name, "connect_enter");
+        assert_eq!(firings[0].category, "syscalls");
+        assert_eq!(firings[0].tracepoint_name, "sys_enter_connect");
+        assert_eq!(firings[0].firing_count, 2);
+        assert_eq!(firings[1].program_name, "connect_exit");
+        assert_eq!(firings[1].category, "syscalls");
+        assert_eq!(firings[1].tracepoint_name, "sys_exit_connect");
+        assert_eq!(firings[1].firing_count, 1);
+    }
+
+    #[test]
     fn output_loss_fans_out_unknown_gaps_to_active_payload_flows() -> TestResult {
         let (local, remote) = outbound_loopback();
         let process = observed_process(101, 100);
@@ -1514,6 +1631,29 @@ mod tests {
 
         fn process_output_loss_count(&mut self) -> Result<u64, CaptureError> {
             Ok(self.counts.pop_front().unwrap_or(5))
+        }
+    }
+
+    struct TracepointFiringObservationSource {
+        firings: Vec<EbpfProcessObservationTracepointFiring>,
+    }
+
+    impl EbpfObservationSource for TracepointFiringObservationSource {
+        fn next_observation(&mut self) -> Result<Option<EbpfProcessObservation>, CaptureError> {
+            Ok(None)
+        }
+
+        fn allow_socket_payload_sample(
+            &mut self,
+            _authorization: SocketPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn process_tracepoint_firings(
+            &mut self,
+        ) -> Result<Option<Vec<EbpfProcessObservationTracepointFiring>>, CaptureError> {
+            Ok(Some(self.firings.clone()))
         }
     }
 

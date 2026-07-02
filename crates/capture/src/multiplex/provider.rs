@@ -1,6 +1,6 @@
 use probe_core::CapabilityState;
 
-use crate::{CaptureError, CapturePoll, CaptureProvider};
+use crate::{CaptureError, CapturePoll, CaptureProvider, CaptureProviderRuntimeDiagnostics};
 
 type DisableHandler = Box<dyn Fn(&str)>;
 
@@ -75,6 +75,16 @@ impl CaptureProvider for CaptureMultiplexer {
 
     fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
         self.poll_round()
+    }
+
+    fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
+        self.providers.iter_mut().fold(
+            CaptureProviderRuntimeDiagnostics::default(),
+            |mut diagnostics, provider| {
+                diagnostics.merge(provider.runtime_diagnostics());
+                diagnostics
+            },
+        )
     }
 }
 
@@ -165,6 +175,13 @@ impl MultiplexedProvider {
         }
     }
 
+    fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
+        let MultiplexedProviderState::Active { provider } = &mut self.state else {
+            return CaptureProviderRuntimeDiagnostics::default();
+        };
+        provider.runtime_diagnostics()
+    }
+
     fn take_state(&mut self) -> MultiplexedProviderState {
         std::mem::replace(
             &mut self.state,
@@ -201,7 +218,10 @@ mod tests {
         ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
     };
 
-    use crate::{CaptureEvent, CapturedBytes};
+    use crate::{
+        CaptureEvent, CapturedBytes, EbpfProcessObservationRuntimeDiagnostics,
+        EbpfProcessObservationTracepointFiring,
+    };
 
     use super::*;
 
@@ -347,6 +367,27 @@ mod tests {
         assert!(error.to_string().contains("boom"));
     }
 
+    #[test]
+    fn multiplexer_merges_active_provider_runtime_diagnostics() {
+        let mut provider = CaptureMultiplexer::new([
+            Box::new(VecProvider::new([])) as Box<dyn CaptureProvider>,
+            Box::new(DiagnosticProvider),
+        ]);
+
+        let diagnostics = provider
+            .runtime_diagnostics()
+            .into_ebpf_process_observation()
+            .expect("multiplexer should expose active provider diagnostics");
+        let firings = diagnostics
+            .tracepoint_firings
+            .expect("tracepoint firing diagnostics should be available");
+        assert_eq!(firings.len(), 1);
+        assert_eq!(firings[0].program_name, "connect_enter");
+        assert_eq!(firings[0].category, "syscalls");
+        assert_eq!(firings[0].tracepoint_name, "sys_enter_connect");
+        assert_eq!(firings[0].firing_count, 3);
+    }
+
     fn assert_bytes_payload(event: Option<CaptureEvent>, expected: &[u8]) {
         match event.expect("expected capture event") {
             CaptureEvent::Bytes(bytes) => {
@@ -487,6 +528,35 @@ mod tests {
     impl Drop for DropNotifyErrorProvider {
         fn drop(&mut self) {
             self.dropped.set(true);
+        }
+    }
+
+    struct DiagnosticProvider;
+
+    impl CaptureProvider for DiagnosticProvider {
+        fn name(&self) -> &'static str {
+            "diagnostic"
+        }
+
+        fn capabilities(&self) -> Vec<CapabilityState> {
+            Vec::new()
+        }
+
+        fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(CapturePoll::Progress)
+        }
+
+        fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
+            CaptureProviderRuntimeDiagnostics::from_ebpf_process_observation(
+                EbpfProcessObservationRuntimeDiagnostics {
+                    tracepoint_firings: Ok(vec![EbpfProcessObservationTracepointFiring {
+                        program_name: "connect_enter",
+                        category: "syscalls",
+                        tracepoint_name: "sys_enter_connect",
+                        firing_count: 3,
+                    }]),
+                },
+            )
         }
     }
 

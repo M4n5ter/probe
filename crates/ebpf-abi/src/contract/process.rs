@@ -163,6 +163,12 @@ pub const EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME: &str = "TRAFFIC_PROBE_PROCESS_OUT
 pub const EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES: u32 = 1;
 pub const EBPF_PROCESS_OUTPUT_LOSS_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
 pub const EBPF_PROCESS_OUTPUT_LOSS_VALUE_BYTES: u32 = core::mem::size_of::<u64>() as u32;
+pub const EBPF_PROCESS_TRACEPOINT_FIRINGS_MAP_NAME: &str =
+    "TRAFFIC_PROBE_PROCESS_TRACEPOINT_FIRINGS";
+pub const EBPF_PROCESS_TRACEPOINT_FIRINGS_MAX_ENTRIES: u32 =
+    EBPF_PROCESS_TRACEPOINT_SPECS.len() as u32;
+pub const EBPF_PROCESS_TRACEPOINT_FIRING_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
+pub const EBPF_PROCESS_TRACEPOINT_FIRING_VALUE_BYTES: u32 = core::mem::size_of::<u64>() as u32;
 pub const EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN: u32 = 1 << 0;
 pub const EBPF_PENDING_SOCKET_READ_SOURCE_IOVEC: u32 = 1 << 1;
 
@@ -386,7 +392,7 @@ pub const EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS: [EbpfProcessOptionalTrace
     },
 ];
 
-pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 12] = [
+pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 13] = [
     EbpfMapSpec {
         name: EBPF_EVENTS_MAP_NAME,
         kind: EbpfMapKind::Ringbuf,
@@ -483,6 +489,14 @@ pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 12] = [
         max_entries: EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES,
         map_flags: 0,
     },
+    EbpfMapSpec {
+        name: EBPF_PROCESS_TRACEPOINT_FIRINGS_MAP_NAME,
+        kind: EbpfMapKind::PerCpuArray,
+        key_size: EBPF_PROCESS_TRACEPOINT_FIRING_KEY_BYTES,
+        value_size: EBPF_PROCESS_TRACEPOINT_FIRING_VALUE_BYTES,
+        max_entries: EBPF_PROCESS_TRACEPOINT_FIRINGS_MAX_ENTRIES,
+        map_flags: 0,
+    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,6 +565,7 @@ impl fmt::Display for EbpfTracepointSectionName {
     }
 }
 
+#[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EbpfProcessTracepointRole {
     ConnectEnter,
@@ -590,6 +605,10 @@ pub enum EbpfProcessTracepointRole {
 }
 
 impl EbpfProcessTracepointRole {
+    pub const fn counter_index(self) -> u32 {
+        self as u32
+    }
+
     pub fn has_optional_attach(self) -> bool {
         self.optional_pair_spec().is_some()
     }
@@ -733,7 +752,7 @@ mod tests {
 
     #[test]
     fn process_map_specs_are_unique_and_layout_complete() {
-        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 12);
+        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 13);
         assert_unique(EBPF_PROCESS_MAP_SPECS.map(|spec| spec.name));
 
         let allow_map = process_map(EBPF_ALLOWED_SOCKET_FDS_MAP_NAME);
@@ -808,6 +827,18 @@ mod tests {
             EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES
         );
 
+        let tracepoint_firings = process_map(EBPF_PROCESS_TRACEPOINT_FIRINGS_MAP_NAME);
+        assert_eq!(tracepoint_firings.kind, EbpfMapKind::PerCpuArray);
+        assert_eq!(
+            tracepoint_firings.key_size,
+            EBPF_PROCESS_TRACEPOINT_FIRING_KEY_BYTES
+        );
+        assert_eq!(tracepoint_firings.value_size, size_of::<u64>() as u32);
+        assert_eq!(
+            tracepoint_firings.max_entries,
+            EBPF_PROCESS_TRACEPOINT_FIRINGS_MAX_ENTRIES
+        );
+
         assert_eq!(
             EbpfSocketFdKey::new(0x0102_0304, -2).to_bpfel_bytes(),
             [0x04, 0x03, 0x02, 0x01, 0xfe, 0xff, 0xff, 0xff]
@@ -855,6 +886,13 @@ mod tests {
         assert_unique(EBPF_PROCESS_TRACEPOINT_SPECS.map(|spec| spec.tracepoint_name));
 
         for spec in EBPF_PROCESS_TRACEPOINT_SPECS {
+            assert_eq!(
+                spec.role.counter_index(),
+                EBPF_PROCESS_TRACEPOINT_SPECS
+                    .iter()
+                    .position(|candidate| candidate.role == spec.role)
+                    .expect("role should be present") as u32
+            );
             assert_eq!(spec.role.spec(), &spec);
             assert_eq!(
                 spec.section_name().to_string(),

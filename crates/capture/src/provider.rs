@@ -4,6 +4,7 @@ pub use probe_core::CaptureProviderKind;
 use probe_core::{CapabilityState, ProcessContext, TcpConnection};
 use thiserror::Error;
 
+use crate::ebpf::EbpfProcessObservationRuntimeDiagnostics;
 use crate::event::CaptureEvent;
 
 const DEFAULT_IDLE_SLEEP: Duration = Duration::from_millis(10);
@@ -44,6 +45,10 @@ pub trait CaptureProvider {
 
     fn poll_next(&mut self) -> Result<CapturePoll, CaptureError>;
 
+    fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
+        CaptureProviderRuntimeDiagnostics::default()
+    }
+
     fn next(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
         loop {
             match self.poll_next()? {
@@ -53,6 +58,31 @@ pub trait CaptureProvider {
                 CapturePoll::Finished => return Ok(None),
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaptureProviderRuntimeDiagnostics {
+    ebpf_process_observation: Option<EbpfProcessObservationRuntimeDiagnostics>,
+}
+
+impl CaptureProviderRuntimeDiagnostics {
+    pub fn from_ebpf_process_observation(
+        diagnostics: EbpfProcessObservationRuntimeDiagnostics,
+    ) -> Self {
+        Self {
+            ebpf_process_observation: Some(diagnostics),
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        if self.ebpf_process_observation.is_none() {
+            self.ebpf_process_observation = other.ebpf_process_observation;
+        }
+    }
+
+    pub fn into_ebpf_process_observation(self) -> Option<EbpfProcessObservationRuntimeDiagnostics> {
+        self.ebpf_process_observation
     }
 }
 

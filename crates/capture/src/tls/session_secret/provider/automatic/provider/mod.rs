@@ -103,6 +103,10 @@ impl CaptureProvider for Tls13SessionSecretAutoBindingProvider {
             other => Ok(other),
         }
     }
+
+    fn runtime_diagnostics(&mut self) -> crate::CaptureProviderRuntimeDiagnostics {
+        self.inner.runtime_diagnostics()
+    }
 }
 
 #[cfg(test)]

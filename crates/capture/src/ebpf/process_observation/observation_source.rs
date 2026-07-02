@@ -1,4 +1,4 @@
-use crate::CaptureError;
+use crate::{CaptureError, EbpfProcessObservationTracepointFiring};
 
 use super::{
     EbpfProcessObservation, EbpfProcessObservationProbe, descriptor_lease::DescriptorLeaseKey,
@@ -22,6 +22,12 @@ pub(super) trait EbpfObservationSource {
 
     fn process_output_loss_count(&mut self) -> Result<u64, CaptureError> {
         Ok(0)
+    }
+
+    fn process_tracepoint_firings(
+        &mut self,
+    ) -> Result<Option<Vec<EbpfProcessObservationTracepointFiring>>, CaptureError> {
+        Ok(None)
     }
 }
 
@@ -57,6 +63,15 @@ impl EbpfObservationSource for ProbeObservationSource {
     fn process_output_loss_count(&mut self) -> Result<u64, CaptureError> {
         self.probe
             .process_output_loss_count()
+            .map_err(|error| CaptureError::provider("ebpf", error.to_string()))
+    }
+
+    fn process_tracepoint_firings(
+        &mut self,
+    ) -> Result<Option<Vec<EbpfProcessObservationTracepointFiring>>, CaptureError> {
+        self.probe
+            .process_tracepoint_firings()
+            .map(Some)
             .map_err(|error| CaptureError::provider("ebpf", error.to_string()))
     }
 }

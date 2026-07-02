@@ -18,9 +18,10 @@ pub use ebpf::{
     EbpfProcessObservationOptionalTracepointPairState, EbpfProcessObservationProbe,
     EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeError,
     EbpfProcessObservationProbeSnapshot, EbpfProcessObservationProgramLinkOwnershipSnapshot,
-    EbpfProcessObservationProvider, EbpfProcessOptionalTracepointPairSpec, EbpfResolvedSocketFlow,
-    EbpfSocketEndpoint, EbpfSocketFlowLookup, EbpfSocketFlowResolver, EbpfSocketReadObservation,
-    EbpfSocketWriteObservation, UnprivilegedBpfStatus,
+    EbpfProcessObservationProvider, EbpfProcessObservationRuntimeDiagnostics,
+    EbpfProcessObservationTracepointFiring, EbpfProcessOptionalTracepointPairSpec,
+    EbpfResolvedSocketFlow, EbpfSocketEndpoint, EbpfSocketFlowLookup, EbpfSocketFlowResolver,
+    EbpfSocketReadObservation, EbpfSocketWriteObservation, UnprivilegedBpfStatus,
 };
 pub use event::{
     CaptureEvent, CapturedBytes, CapturedGap, CapturedLoss, EnforcementEvidencePropagation,
@@ -32,8 +33,8 @@ pub use plaintext::{
     PlaintextEventProvider, PlaintextEventProviderError, PlaintextGap, PlaintextSource,
 };
 pub use provider::{
-    CaptureError, CapturePoll, CaptureProvider, CaptureProviderKind, ProcessResolver,
-    ResolvedProcess,
+    CaptureError, CapturePoll, CaptureProvider, CaptureProviderKind,
+    CaptureProviderRuntimeDiagnostics, ProcessResolver, ResolvedProcess,
 };
 pub use replay::ReplayProvider;
 pub use tls::{

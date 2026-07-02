@@ -28,5 +28,6 @@ pub use types::{
     EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
     EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
     EbpfProcessLifecycleKind, EbpfProcessLifecycleObservation, EbpfProcessObservation,
+    EbpfProcessObservationRuntimeDiagnostics, EbpfProcessObservationTracepointFiring,
     EbpfSocketEndpoint, EbpfSocketReadObservation, EbpfSocketWriteObservation,
 };

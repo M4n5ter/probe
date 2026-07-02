@@ -22,13 +22,14 @@ use ebpf_abi::{
     EBPF_PENDING_READS_MAX_ENTRIES, EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES,
     EBPF_PENDING_WRITES_MAX_ENTRIES, EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES,
     EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES, EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES,
-    EBPF_RING_BUFFER_BYTES, EBPF_SOCKET_FD_GENERATIONS_MAX_ENTRIES, EBPF_SOCKET_PAYLOAD_ALLOW_READ,
+    EBPF_PROCESS_TRACEPOINT_FIRINGS_MAX_ENTRIES, EBPF_RING_BUFFER_BYTES,
+    EBPF_SOCKET_FD_GENERATIONS_MAX_ENTRIES, EBPF_SOCKET_PAYLOAD_ALLOW_READ,
     EBPF_SOCKET_PAYLOAD_ALLOW_WRITE, EbpfAcceptTracepointRecord, EbpfCloseObservation,
     EbpfCloseRangeTracepointRecord, EbpfCloseTracepointRecord, EbpfConnectTracepointRecord,
     EbpfPendingSocketAcceptAttempt, EbpfPendingSocketConnectAttempt, EbpfPendingSocketReadAttempt,
     EbpfPendingSocketWriteSample, EbpfProcessLifecycleRecord, EbpfProcessProbeMetadata,
-    EbpfSocketFdKey, EbpfSocketPayloadAllowance, EbpfSocketReadSampleRecord,
-    EbpfSocketWriteSampleRecord,
+    EbpfProcessTracepointRole, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
+    EbpfSocketReadSampleRecord, EbpfSocketWriteSampleRecord,
 };
 
 use accept::{accept_attempt_from_tracepoint, accept_observation_from_result};
@@ -95,68 +96,83 @@ static TRAFFIC_PROBE_PROCESS_READ_EVENT_SCRATCH: PerCpuArray<EbpfSocketReadSampl
 static TRAFFIC_PROBE_PROCESS_OUTPUT_LOSSES: PerCpuArray<u64> =
     PerCpuArray::with_max_entries(EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES, 0);
 
+#[map(name = "TRAFFIC_PROBE_PROCESS_TRACEPOINT_FIRINGS")]
+static TRAFFIC_PROBE_PROCESS_TRACEPOINT_FIRINGS: PerCpuArray<u64> =
+    PerCpuArray::with_max_entries(EBPF_PROCESS_TRACEPOINT_FIRINGS_MAX_ENTRIES, 0);
+
 #[tracepoint(name = "sys_enter_connect", category = "syscalls")]
 pub fn traffic_probe_sys_enter_connect(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::ConnectEnter);
     record_connect_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_connect", category = "syscalls")]
 pub fn traffic_probe_sys_exit_connect(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::ConnectExit);
     emit_connect_observation(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_accept", category = "syscalls")]
 pub fn traffic_probe_sys_enter_accept(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::AcceptEnter);
     record_accept_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_accept", category = "syscalls")]
 pub fn traffic_probe_sys_exit_accept(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::AcceptExit);
     emit_accept_observation(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_accept4", category = "syscalls")]
 pub fn traffic_probe_sys_enter_accept4(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::Accept4Enter);
     record_accept_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_accept4", category = "syscalls")]
 pub fn traffic_probe_sys_exit_accept4(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::Accept4Exit);
     emit_accept_observation(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_close", category = "syscalls")]
 pub fn traffic_probe_sys_enter_close(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::CloseEnter);
     emit_close_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_dup", category = "syscalls")]
 pub fn traffic_probe_sys_enter_dup(_ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::DupEnter);
     invalidate_current_fd_table();
     0
 }
 
 #[tracepoint(name = "sys_enter_dup2", category = "syscalls")]
 pub fn traffic_probe_sys_enter_dup2(_ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::Dup2Enter);
     invalidate_current_fd_table();
     0
 }
 
 #[tracepoint(name = "sys_enter_dup3", category = "syscalls")]
 pub fn traffic_probe_sys_enter_dup3(_ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::Dup3Enter);
     invalidate_current_fd_table();
     0
 }
 
 #[tracepoint(name = "sys_enter_fcntl", category = "syscalls")]
 pub fn traffic_probe_sys_enter_fcntl(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::FcntlEnter);
     if fcntl_may_create_fd(&ctx) {
         invalidate_current_fd_table();
     }
@@ -165,12 +181,14 @@ pub fn traffic_probe_sys_enter_fcntl(ctx: TracePointContext) -> u32 {
 
 #[tracepoint(name = "sys_enter_close_range", category = "syscalls")]
 pub fn traffic_probe_sys_enter_close_range(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::CloseRangeEnter);
     emit_close_range_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sched_process_exit", category = "sched")]
 pub fn traffic_probe_sched_process_exit(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::ProcessExit);
     if current_pid() == current_tgid() {
         invalidate_current_fd_table();
         emit_process_exit(ctx);
@@ -180,6 +198,7 @@ pub fn traffic_probe_sched_process_exit(ctx: TracePointContext) -> u32 {
 
 #[tracepoint(name = "sched_process_exec", category = "sched")]
 pub fn traffic_probe_sched_process_exec(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::ProcessExec);
     invalidate_current_fd_table();
     emit_process_exec(ctx);
     0
@@ -187,120 +206,140 @@ pub fn traffic_probe_sched_process_exec(ctx: TracePointContext) -> u32 {
 
 #[tracepoint(name = "sys_enter_write", category = "syscalls")]
 pub fn traffic_probe_sys_enter_write(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::WriteEnter);
     record_write_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_write", category = "syscalls")]
 pub fn traffic_probe_sys_exit_write(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::WriteExit);
     emit_write_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_sendto", category = "syscalls")]
 pub fn traffic_probe_sys_enter_sendto(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::SendtoEnter);
     record_write_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_sendto", category = "syscalls")]
 pub fn traffic_probe_sys_exit_sendto(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::SendtoExit);
     emit_write_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_writev", category = "syscalls")]
 pub fn traffic_probe_sys_enter_writev(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::WritevEnter);
     record_writev_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_writev", category = "syscalls")]
 pub fn traffic_probe_sys_exit_writev(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::WritevExit);
     emit_write_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_sendmsg", category = "syscalls")]
 pub fn traffic_probe_sys_enter_sendmsg(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::SendmsgEnter);
     record_sendmsg_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_sendmsg", category = "syscalls")]
 pub fn traffic_probe_sys_exit_sendmsg(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::SendmsgExit);
     emit_write_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_sendfile", category = "syscalls")]
 pub fn traffic_probe_sys_enter_sendfile(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::SendfileEnter);
     record_sendfile_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_sendfile", category = "syscalls")]
 pub fn traffic_probe_sys_exit_sendfile(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::SendfileExit);
     emit_write_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_sendfile64", category = "syscalls")]
 pub fn traffic_probe_sys_enter_sendfile64(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::Sendfile64Enter);
     record_sendfile_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_sendfile64", category = "syscalls")]
 pub fn traffic_probe_sys_exit_sendfile64(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::Sendfile64Exit);
     emit_write_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_read", category = "syscalls")]
 pub fn traffic_probe_sys_enter_read(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::ReadEnter);
     record_read_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_read", category = "syscalls")]
 pub fn traffic_probe_sys_exit_read(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::ReadExit);
     emit_read_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_recvfrom", category = "syscalls")]
 pub fn traffic_probe_sys_enter_recvfrom(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::RecvfromEnter);
     record_read_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_recvfrom", category = "syscalls")]
 pub fn traffic_probe_sys_exit_recvfrom(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::RecvfromExit);
     emit_read_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_readv", category = "syscalls")]
 pub fn traffic_probe_sys_enter_readv(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::ReadvEnter);
     record_readv_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_readv", category = "syscalls")]
 pub fn traffic_probe_sys_exit_readv(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::ReadvExit);
     emit_read_sample(ctx);
     0
 }
 
 #[tracepoint(name = "sys_enter_recvmsg", category = "syscalls")]
 pub fn traffic_probe_sys_enter_recvmsg(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::RecvmsgEnter);
     record_recvmsg_attempt(ctx);
     0
 }
 
 #[tracepoint(name = "sys_exit_recvmsg", category = "syscalls")]
 pub fn traffic_probe_sys_exit_recvmsg(ctx: TracePointContext) -> u32 {
+    record_tracepoint_firing(EbpfProcessTracepointRole::RecvmsgExit);
     emit_read_sample(ctx);
     0
 }
@@ -596,6 +635,16 @@ fn record_process_output_loss() {
     };
     unsafe {
         *losses = (*losses).saturating_add(1);
+    }
+}
+
+fn record_tracepoint_firing(role: EbpfProcessTracepointRole) {
+    let Some(firings) = TRAFFIC_PROBE_PROCESS_TRACEPOINT_FIRINGS.get_ptr_mut(role.counter_index())
+    else {
+        return;
+    };
+    unsafe {
+        *firings = (*firings).saturating_add(1);
     }
 }
 

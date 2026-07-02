@@ -6,7 +6,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use capture::{CaptureError, CaptureEvent, CapturePoll, CaptureProvider};
+use capture::{
+    CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderRuntimeDiagnostics,
+};
 use probe_core::{CapabilityState, CaptureProviderKind, CaptureSource};
 use serde::Serialize;
 
@@ -330,6 +332,10 @@ impl CaptureProvider for ActivityObservedCaptureInput {
         let poll = self.inner.poll_next()?;
         self.activity.record_poll(&poll);
         Ok(poll)
+    }
+
+    fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
+        self.inner.runtime_diagnostics()
     }
 }
 
