@@ -49,6 +49,7 @@ pub struct AgentStatusSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TrafficStatusProjection {
+    pub runtime_generation: Option<RuntimeGenerationSnapshot>,
     pub capture: CaptureStatusSnapshot,
     pub enforcement: EnforcementStatusSnapshot,
     pub tls: TlsStatusSnapshot,
@@ -99,6 +100,7 @@ pub fn build_status_snapshot_with_runtime(
 pub fn build_traffic_status_projection(plan: &RuntimePlan) -> TrafficStatusProjection {
     let capabilities = capabilities_with_runtime(plan, None, None);
     TrafficStatusProjection {
+        runtime_generation: None,
         capture: capture_status(plan, None, None),
         enforcement: enforcement_status_with_transparent_proxy(plan, None, None),
         tls: tls_status(plan, &capabilities, None, None),
@@ -132,6 +134,7 @@ pub fn build_traffic_status_projection_with_runtime(
         runtime.tls_decrypt_hints,
     );
     TrafficStatusProjection {
+        runtime_generation: runtime.runtime_generation,
         capture,
         enforcement,
         tls,

@@ -314,6 +314,9 @@ Operator TUI 能力事实：
   viewport offset，移动选中项时保留上下文行，而不是把选中行固定到列表顶部。
 - Traffic tab 通过 admin Unix socket 调用 `tail_events`，从 durable export queue 读取 bounded event tail。
   该路径返回完整 `EventEnvelope` 给 admin client，但 TUI 只保留事件表展示摘要，不在 TUI model 中保留 raw argv。
+  每轮刷新先读取 `traffic_status` projection，该 projection 同时包含 capture、enforcement、TLS 和
+  `runtime_generation`，因此 data-path generation pending、applying 和 failed outcome 会直接进入
+  Traffic 状态行与 Data Path 详情。
   当选中进程有 readable executable path 时，Traffic tab 使用同一 selector model 过滤事件；选中进程无法形成 executable-path
   selector 时 fail-closed，不退回全机流量。
   Traffic tab 有三个观察层级：HTTP exchange、WebSocket session 和 raw event。HTTP exchange
@@ -351,9 +354,10 @@ Operator TUI 能力事实：
   registry 变更，包括被 `enforcement.selector` 引用的条目变更，仍需要重启，直到 selector ownership
   具备独立 lifecycle owner。
   对 capture、process observation、config version、TLS plaintext instrumentation 和 TLS decrypt-hint material
-  变更，admin response 会返回带 `request_id` 的 `request_runtime_generation` queued action；TUI 使用该 id
-  轮询 `status.runtime_generation`，直到显示 applied、failed 或 still-pending outcome。
-  在线 apply 失败、已排队 generation 失败或仍 pending 时，旧 running agent 继续保留；generation
+  变更，admin response 会返回带 `request_id` 的 `request_runtime_generation` queued action；TUI 保存动作展示
+  queued request 并保持交互可用，generation outcome 通过 admin `status.runtime_generation` 和 TUI
+  Traffic/Data Path diagnostics 使用的 `traffic_status.runtime_generation` projection 展示。
+  在线 apply 失败、generation 仍 pending 或后续 generation 失败时，旧 running agent 继续保留；generation
   request 无法入队表示保存的候选配置尚未进入 live data path，TUI-managed agent 可以重启以收敛到保存配置，
   attached external agent 会提示显式重启或重试。planning 明确要求 setup-time rebuild 的 storage path、
   TLS material registry/source changes、admin、interception 或 watcher topology 变更仍进入重启提示。

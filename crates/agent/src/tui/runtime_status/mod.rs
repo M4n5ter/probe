@@ -14,6 +14,10 @@ use crate::{
     admin::{AdminClientError, AdminRequest, send_admin_json_request_with_timeout},
     artifacts::project_runtime_artifact_paths,
     runtime_composition::build_runtime_diagnostic_composition,
+    runtime_generation::{
+        RuntimeGenerationReloadRequestSnapshot, RuntimeGenerationReloadResultSnapshot,
+        RuntimeGenerationSnapshot,
+    },
     status::{
         CaptureStatusSnapshot, EnforcementStatusSnapshot, TrafficStatusProjection,
         build_traffic_status_projection,
@@ -58,6 +62,7 @@ pub(crate) fn local_traffic_runtime_diagnostics(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrafficRuntimeDiagnostics {
+    runtime_generation: Option<RuntimeGenerationSnapshot>,
     capture: CaptureDiagnostics,
     mitm: Option<MitmDiagnostics>,
 }
@@ -66,6 +71,7 @@ impl TrafficRuntimeDiagnostics {
     #[cfg(test)]
     pub(crate) fn from_capture_snapshot(capture: CaptureStatusSnapshot) -> Self {
         Self {
+            runtime_generation: None,
             capture: CaptureDiagnostics::new(capture),
             mitm: None,
         }
@@ -76,6 +82,7 @@ impl TrafficRuntimeDiagnostics {
         snapshot: AgentStatusSnapshot,
     ) -> Result<Self, RuntimeStatusClientError> {
         let AgentStatusSnapshot {
+            runtime_generation,
             capture,
             enforcement,
             tls,
@@ -83,6 +90,7 @@ impl TrafficRuntimeDiagnostics {
         } = snapshot;
         let tls_materials = MitmTlsMaterialDiagnostics::from_tls_status_snapshot(tls);
         Ok(Self {
+            runtime_generation: Some(runtime_generation),
             capture: CaptureDiagnostics::new(capture),
             mitm: MitmDiagnostics::from_enforcement(enforcement, Some(&tls_materials)),
         })
@@ -92,12 +100,14 @@ impl TrafficRuntimeDiagnostics {
         projection: TrafficStatusProjection,
     ) -> Result<Self, RuntimeStatusClientError> {
         let TrafficStatusProjection {
+            runtime_generation,
             capture,
             enforcement,
             tls,
         } = projection;
         let tls_materials = MitmTlsMaterialDiagnostics::from_tls_status_snapshot(tls);
         Ok(Self {
+            runtime_generation,
             capture: CaptureDiagnostics::new(capture),
             mitm: MitmDiagnostics::from_enforcement(enforcement, Some(&tls_materials)),
         })
@@ -105,14 +115,18 @@ impl TrafficRuntimeDiagnostics {
 
     pub(crate) fn status_message(&self, traffic_empty: bool) -> Option<CaptureDiagnosticMessage> {
         let mitm_next_step = self.mitm_next_step();
+        let generation_message = self.runtime_generation_status_message();
         if self.capture.using_mitm_plaintext_bridge() {
-            return self.mitm_bridge_status_message(traffic_empty, mitm_next_step.as_str());
+            return combine_diagnostic_messages(
+                generation_message,
+                self.mitm_bridge_status_message(traffic_empty, mitm_next_step.as_str()),
+            );
         }
         let capture_message = self
             .capture
             .status_message(traffic_empty, mitm_next_step.as_str());
         let mitm_message = self.mitm_data_path_status_message(traffic_empty);
-        if self.capture.using_live_host()
+        let data_path_message = if self.capture.using_live_host()
             && matches!(capture_message, Some(CaptureDiagnosticMessage::Info(_)))
             && mitm_message.is_some()
         {
@@ -121,9 +135,11 @@ impl TrafficRuntimeDiagnostics {
                 .live_host_status_prefix()
                 .map(|prefix| format!("{prefix}; "))
                 .unwrap_or_default();
-            return mitm_message.map(|message| message.with_prefix(prefix));
-        }
-        combine_diagnostic_messages(capture_message, mitm_message)
+            mitm_message.map(|message| message.with_prefix(prefix))
+        } else {
+            combine_diagnostic_messages(capture_message, mitm_message)
+        };
+        combine_diagnostic_messages(generation_message, data_path_message)
     }
 
     pub(crate) fn tail_attribution_mode(&self) -> crate::admin::EventTailAttributionMode {
@@ -146,7 +162,8 @@ impl TrafficRuntimeDiagnostics {
     }
 
     pub(crate) fn detail_lines(&self) -> Vec<String> {
-        let mut lines = self.capture.detail_lines();
+        let mut lines = self.runtime_generation_detail_lines();
+        lines.extend(self.capture.detail_lines());
         lines.extend(self.mitm_detail_lines());
         lines
     }
@@ -217,6 +234,111 @@ impl TrafficRuntimeDiagnostics {
             .as_ref()
             .and_then(|mitm| mitm.live_side_channel_status_message(traffic_empty))
     }
+
+    fn runtime_generation_status_message(&self) -> Option<CaptureDiagnosticMessage> {
+        let runtime_generation = self.runtime_generation.as_ref()?;
+        if let Some(pending) = &runtime_generation.pending {
+            return Some(CaptureDiagnosticMessage::Info(format!(
+                "Runtime generation request {} is queued for {}; active generation {} ({}) remains in use",
+                pending.request_id,
+                candidate_config_version_label(pending.candidate_config_version.as_deref()),
+                runtime_generation.active.generation,
+                runtime_generation.active.config_version,
+            )));
+        }
+        if let Some(applying) = &runtime_generation.applying {
+            let request = &applying.request;
+            return Some(CaptureDiagnosticMessage::Info(format!(
+                "Runtime generation request {} is applying for {}; active generation {} ({}) remains in use until swap completes",
+                request.request_id,
+                candidate_config_version_label(request.candidate_config_version.as_deref()),
+                runtime_generation.active.generation,
+                runtime_generation.active.config_version,
+            )));
+        }
+        let Some(outcome) = &runtime_generation.last_outcome else {
+            return None;
+        };
+        match &outcome.result {
+            RuntimeGenerationReloadResultSnapshot::Applied { .. } => None,
+            RuntimeGenerationReloadResultSnapshot::Failed { message } => {
+                Some(CaptureDiagnosticMessage::Warning(format!(
+                    "Runtime generation request {} failed; active generation {} ({}) remains in use: {message}",
+                    outcome.request_id,
+                    runtime_generation.active.generation,
+                    runtime_generation.active.config_version,
+                )))
+            }
+        }
+    }
+
+    fn runtime_generation_detail_lines(&self) -> Vec<String> {
+        let Some(snapshot) = &self.runtime_generation else {
+            return Vec::new();
+        };
+        let mut lines = vec![
+            "Runtime generation".to_string(),
+            format!(
+                "active: generation {} ({})",
+                snapshot.active.generation, snapshot.active.config_version
+            ),
+            format!(
+                "capture safe points: {}{}",
+                snapshot.capture_control.safe_points,
+                snapshot
+                    .capture_control
+                    .last_safe_point_unix_ns
+                    .map(|timestamp| format!(", last={timestamp}"))
+                    .unwrap_or_default()
+            ),
+        ];
+        match (
+            &snapshot.pending,
+            &snapshot.applying,
+            &snapshot.last_outcome,
+        ) {
+            (Some(pending), _, _) => lines.push(format!(
+                "pending: {}",
+                runtime_generation_request_line(pending)
+            )),
+            (_, Some(applying), _) => lines.push(format!(
+                "applying: {}",
+                runtime_generation_request_line(&applying.request)
+            )),
+            (_, _, Some(outcome)) => match &outcome.result {
+                RuntimeGenerationReloadResultSnapshot::Applied {
+                    generation,
+                    config_version,
+                } => lines.push(format!(
+                    "last outcome: request {} applied as generation {} ({})",
+                    outcome.request_id, generation, config_version
+                )),
+                RuntimeGenerationReloadResultSnapshot::Failed { message } => lines.push(format!(
+                    "last outcome: request {} failed: {message}",
+                    outcome.request_id
+                )),
+            },
+            _ => lines.push("state: no pending generation reload".to_string()),
+        }
+        lines
+    }
+}
+
+fn runtime_generation_request_line(request: &RuntimeGenerationReloadRequestSnapshot) -> String {
+    format!(
+        "request {} for {}, sections={}",
+        request.request_id,
+        candidate_config_version_label(request.candidate_config_version.as_deref()),
+        if request.changed_sections.is_empty() {
+            "<none>".to_string()
+        } else {
+            request.changed_sections.join(", ")
+        }
+    )
+}
+
+fn candidate_config_version_label(config_version: Option<&str>) -> &str {
+    config_version.unwrap_or("<unknown config_version>")
 }
 
 fn combine_diagnostic_messages(
@@ -352,6 +474,13 @@ fn parse_traffic_runtime_diagnostics_response(
             let projection = response
                 .get("projection")
                 .ok_or(RuntimeStatusClientError::MissingCapture)?;
+            let runtime_generation = projection
+                .get("runtime_generation")
+                .filter(|value| !value.is_null())
+                .cloned()
+                .map(serde_json::from_value::<RuntimeGenerationSnapshot>)
+                .transpose()
+                .map_err(RuntimeStatusClientError::Json)?;
             let capture = projection
                 .get("capture")
                 .cloned()
@@ -368,6 +497,7 @@ fn parse_traffic_runtime_diagnostics_response(
                 .transpose()?
                 .flatten();
             Ok(TrafficRuntimeDiagnostics {
+                runtime_generation,
                 capture: CaptureDiagnostics::from_admin_status(
                     capture,
                     provider_reported,
@@ -618,6 +748,12 @@ mod tests {
 
         let lines = diagnostics.detail_lines();
         assert!(lines.iter().any(|line| line == "selected: replay"));
+        assert!(
+            !lines.iter().any(
+                |line| line == "Runtime generation" || line.starts_with("active: generation 0")
+            ),
+            "local config diagnostics must not invent live runtime generation state: {lines:?}"
+        );
         assert!(lines.iter().any(|line| {
             line == &format!("configuration: {}", missing_mitm_configuration_action())
         }));
@@ -743,6 +879,112 @@ mod tests {
             ))
         );
         assert_eq!(diagnostics.status_message(false), None);
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_surface_pending_runtime_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "traffic_status",
+            "projection": {
+                "runtime_generation": {
+                    "active": { "generation": 1, "config_version": "current" },
+                    "pending": {
+                        "request_id": 7,
+                        "candidate_path": "/tmp/agent.toml",
+                        "current_config_version": "current",
+                        "candidate_config_version": "candidate",
+                        "changed_sections": ["capture", "observations"],
+                        "requested_unix_ns": 10
+                    },
+                    "applying": null,
+                    "last_outcome": null,
+                    "capture_control": {
+                        "safe_points": 3,
+                        "last_safe_point_unix_ns": 20
+                    }
+                },
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": []
+                }
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(true),
+            Some(CaptureDiagnosticMessage::Info(
+                "Runtime generation request 7 is queued for candidate; active generation 1 (current) remains in use; Capture ebpf active; no matching events yet"
+                    .to_string()
+            ))
+        );
+        let lines = diagnostics.detail_lines();
+        assert_detail_line(&lines, "active: generation 1 (current)");
+        assert_detail_line(&lines, "capture safe points: 3, last=20");
+        assert_detail_line(
+            &lines,
+            "pending: request 7 for candidate, sections=capture, observations",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_warn_for_failed_runtime_generation_with_active_traffic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "traffic_status",
+            "projection": {
+                "runtime_generation": {
+                    "active": { "generation": 1, "config_version": "current" },
+                    "pending": null,
+                    "applying": null,
+                    "last_outcome": {
+                        "request_id": 8,
+                        "completed_unix_ns": 30,
+                        "result": {
+                            "result": "failed",
+                            "message": "candidate capture provider failed to open"
+                        }
+                    },
+                    "capture_control": {
+                        "safe_points": 4,
+                        "last_safe_point_unix_ns": 40
+                    }
+                },
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": []
+                }
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(false),
+            Some(CaptureDiagnosticMessage::Warning(
+                "Runtime generation request 8 failed; active generation 1 (current) remains in use: candidate capture provider failed to open"
+                    .to_string()
+            ))
+        );
+        let lines = diagnostics.detail_lines();
+        assert_detail_line(
+            &lines,
+            "last outcome: request 8 failed: candidate capture provider failed to open",
+        );
         Ok(())
     }
 

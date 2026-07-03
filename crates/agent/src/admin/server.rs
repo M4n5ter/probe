@@ -1081,6 +1081,17 @@ mod tests {
             status["snapshot"]["runtime_generation"]["pending"]["changed_sections"],
             json!(["capture"])
         );
+        let traffic_status =
+            send_admin_request(&socket_path, json!({ "command": "traffic_status" })).await?;
+        assert_eq!(traffic_status["kind"], json!("traffic_status"));
+        assert_eq!(
+            traffic_status["projection"]["runtime_generation"]["pending"]["request_id"],
+            json!(1)
+        );
+        assert_eq!(
+            traffic_status["projection"]["runtime_generation"]["pending"]["changed_sections"],
+            json!(["capture"])
+        );
 
         server.stop().await;
         drop(spool);

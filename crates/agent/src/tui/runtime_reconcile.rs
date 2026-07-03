@@ -8,10 +8,6 @@ use super::{
     config_reload::{ConfigReloadApplyDisposition, request_config_reload_apply},
     runtime_actions::request_runtime_actions_reload,
     runtime_attachment::RuntimeAttachment,
-    runtime_generation_status::{
-        RuntimeGenerationStatusError, RuntimeGenerationWaitOutcome,
-        wait_for_runtime_generation_outcome,
-    },
 };
 
 pub(super) struct QueuedRuntimeReconcile {
@@ -205,18 +201,11 @@ async fn runtime_apply_plan_note(
         match request_config_reload_apply(socket_path, config_path).await {
             Ok(summary) => {
                 let disposition = summary.disposition();
-                let mut note = RuntimeApplyPlanNote {
+                RuntimeApplyPlanNote {
                     follow_up: runtime_apply_follow_up(&disposition),
                     status_kind: runtime_apply_status_kind(&disposition),
                     text: summary.status_text(),
-                };
-                if let ConfigReloadApplyDisposition::QueuedGeneration { request_id } = disposition {
-                    note = note.with_runtime_generation_outcome(
-                        request_id,
-                        wait_for_runtime_generation_outcome(socket_path, request_id).await,
-                    );
                 }
-                note
             }
             Err(error) => RuntimeApplyPlanNote {
                 follow_up: RuntimeApplyFollowUp::RestartToApply,
@@ -378,43 +367,6 @@ fn runtime_apply_follow_up(disposition: &ConfigReloadApplyDisposition) -> Runtim
         | ConfigReloadApplyDisposition::QueuedGeneration { .. }
         | ConfigReloadApplyDisposition::Rejected
         | ConfigReloadApplyDisposition::OnlineApplyFailed => RuntimeApplyFollowUp::KeepRunning,
-    }
-}
-
-impl RuntimeApplyPlanNote {
-    fn with_runtime_generation_outcome(
-        mut self,
-        request_id: u64,
-        outcome: Result<RuntimeGenerationWaitOutcome, RuntimeGenerationStatusError>,
-    ) -> Self {
-        let suffix = match outcome {
-            Ok(RuntimeGenerationWaitOutcome::Applied {
-                generation,
-                config_version,
-            }) => {
-                self.status_kind = StatusKind::Info;
-                format!(
-                    "runtime generation request {request_id} applied as generation {generation} ({config_version})"
-                )
-            }
-            Ok(RuntimeGenerationWaitOutcome::Failed { message }) => {
-                self.status_kind = StatusKind::Error;
-                format!("runtime generation request {request_id} failed: {message}")
-            }
-            Ok(RuntimeGenerationWaitOutcome::StillPending) => {
-                self.status_kind = StatusKind::Warning;
-                format!(
-                    "runtime generation request {request_id} is still pending; old generation remains active"
-                )
-            }
-            Err(error) => {
-                self.status_kind = StatusKind::Warning;
-                format!("runtime generation request {request_id} status unavailable: {error}")
-            }
-        };
-        self.follow_up = RuntimeApplyFollowUp::KeepRunning;
-        self.text = format!("{}; {suffix}", self.text);
-        self
     }
 }
 
@@ -666,35 +618,14 @@ mod tests {
     }
 
     #[test]
-    fn saved_runtime_reconcile_reports_generation_failure_without_restart() {
-        let mut app = TuiApp::new(
-            PathBuf::from("/tmp/agent.toml"),
-            AgentConfig::default(),
-            ProcessCatalog::default(),
-        );
-        let result = RuntimeReconcileResult {
-            supervisor: None,
-            completion: RuntimeReconcileCompletion::SavedRuntimeKept {
-                saved_status: StatusMessage::saved("Saved capture config"),
-                plan_note: RuntimeApplyPlanNote {
-                    text: "runtime generation request 7 failed: provider open failed".to_string(),
-                    follow_up: RuntimeApplyFollowUp::KeepRunning,
-                    status_kind: StatusKind::Error,
-                },
-            },
-        };
-        let mut supervisor = None;
+    fn queued_runtime_generation_maps_to_non_restart_info_disposition() {
+        let disposition = ConfigReloadApplyDisposition::QueuedGeneration { request_id: 7 };
 
-        apply_runtime_reconcile_result(&mut supervisor, &mut app, result);
-
-        assert_eq!(app.status().kind, StatusKind::Error);
-        assert!(app.status().text.contains("Saved capture config"));
-        assert!(
-            app.status()
-                .text
-                .contains("runtime generation request 7 failed")
+        assert_eq!(
+            runtime_apply_follow_up(&disposition),
+            RuntimeApplyFollowUp::KeepRunning
         );
-        assert!(!app.status().text.contains("restart"));
+        assert_eq!(runtime_apply_status_kind(&disposition), StatusKind::Info);
     }
 
     #[tokio::test]

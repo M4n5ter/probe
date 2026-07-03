@@ -17,7 +17,6 @@ mod processes;
 mod render;
 mod runtime_actions;
 mod runtime_attachment;
-mod runtime_generation_status;
 mod runtime_reconcile;
 mod runtime_status;
 mod terminal;

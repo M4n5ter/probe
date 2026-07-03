@@ -1150,10 +1150,13 @@ active plan on each retention sweep.
 Data-path rebuild verdicts can queue a `request_runtime_generation` action with
 a request id and appear as a pending runtime generation in status; the live agent
 consumes queued requests at capture safe points and records a runtime generation
-outcome. Capture, observation, config version, TLS plaintext instrumentation,
-and TLS decrypt-hint material changes rebuild a candidate capture generation,
-swap it into the live loop, update runtime status, and replace the shared active
-plan only after the candidate opens. Mixed online/data-path changes remain
+outcome. The TUI save path returns after the request is queued and keeps the
+session usable; Traffic/Data Path diagnostics surface pending, applying, and
+failed generation states from `traffic_status.runtime_generation`. Capture,
+observation, config version, TLS plaintext instrumentation, and TLS decrypt-hint
+material changes rebuild a candidate capture generation, swap it into the live
+loop, update runtime status, and replace the shared active plan only after the
+candidate opens. Mixed online/data-path changes remain
 `restart_required` until a transactional generation owner can apply the whole
 candidate without partial commits. If a generation request cannot be queued, the
 old runtime stays active; a TUI-managed agent can restart to converge on the
