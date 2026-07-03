@@ -75,6 +75,10 @@ impl TuiTab {
     fn previous(self) -> Self {
         Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
     }
+
+    fn keeps_process_search_in_place(self) -> bool {
+        matches!(self, Self::Processes | Self::Traffic)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -903,7 +907,9 @@ impl TuiApp {
     }
 
     fn begin_process_search(&mut self) {
-        self.select_tab(TuiTab::Processes);
+        if !self.active_tab.keeps_process_search_in_place() {
+            self.select_tab(TuiTab::Processes);
+        }
         self.clear_hover();
         self.text_edit = Some(TextEditSession {
             target: TextEditTarget::ProcessSearch,
@@ -1355,6 +1361,23 @@ mod tests {
 
         assert!(app.process_filter().is_empty());
         assert_eq!(app.filtered_process_indices().len(), 5);
+    }
+
+    #[test]
+    fn traffic_process_search_keeps_the_user_on_traffic() {
+        let mut app = multi_process_app();
+        app.select_tab(TuiTab::Traffic);
+
+        app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::SearchProcesses,
+        )));
+        input_text(&mut app, "nginx");
+        app.handle_action(TuiAction::Click(HitTarget::TextEditSubmit));
+
+        assert_eq!(app.active_tab(), TuiTab::Traffic);
+        assert_eq!(app.process_filter(), "nginx");
+        assert_eq!(app.filtered_process_indices(), vec![1]);
+        assert_eq!(app.selected_process_index(), Some(1));
     }
 
     #[test]

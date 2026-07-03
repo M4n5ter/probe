@@ -4,8 +4,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Cell, Clear, HighlightSpacing, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, Shadow, Table, TableState, Wrap,
+        Block, Cell, Clear, HighlightSpacing, Paragraph, Row, Shadow, Table, TableState, Wrap,
     },
 };
 
@@ -44,7 +43,7 @@ pub(super) fn render_traffic(
         Layout::vertical([Constraint::Min(6), Constraint::Length(detail_height)]).areas(right_area);
 
     render_traffic_status(frame, status_area, app, hits);
-    render_traffic_process_picker(frame, process_area, app, hits);
+    super::process_picker::render_traffic_process_picker(frame, process_area, app, hits);
     render_traffic_events(frame, table_area, app, hits);
     render_traffic_detail_preview(frame, detail_area, app);
 }
@@ -81,7 +80,7 @@ pub(super) fn render_traffic_popup(
             .scroll((scroll as u16, 0)),
         modal,
     );
-    render_vertical_scrollbar(frame, modal, lines.len(), scroll, inner.height as usize);
+    super::render_vertical_scrollbar(frame, modal, lines.len(), scroll, inner.height as usize);
 
     let close = Rect::new(
         modal.x.saturating_add(modal.width.saturating_sub(10)),
@@ -303,110 +302,6 @@ fn truncate_to_width(value: &str, max_width: usize) -> String {
     super::truncate(value, max_width - 3)
 }
 
-fn render_traffic_process_picker(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &mut TuiApp,
-    hits: &mut Vec<HitArea>,
-) {
-    hits.push(HitArea::scroll(area, ScrollTarget::TrafficProcessList));
-    let visible_rows = area.height.saturating_sub(3) as usize;
-    app.set_process_viewport_rows(visible_rows);
-    let entries = app.processes().entries();
-    let filtered_indices = app.filtered_process_indices();
-    let start = app
-        .process_scroll()
-        .min(filtered_indices.len().saturating_sub(visible_rows));
-    let end = start
-        .saturating_add(visible_rows)
-        .min(filtered_indices.len());
-    let rows = filtered_indices[start..end]
-        .iter()
-        .map(|absolute_index| {
-            let absolute_index = *absolute_index;
-            let process = &entries[absolute_index];
-            let marker = if Some(absolute_index) == app.selected_process_index() {
-                ">"
-            } else {
-                " "
-            };
-            let watched = if app.process_is_monitored(absolute_index) {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            let hovered = app.is_hovered(HitTarget::TrafficProcess(absolute_index))
-                || app.is_hovered(HitTarget::ProcessMonitor(absolute_index));
-            let row = Row::new([
-                Cell::from(marker),
-                Cell::from(watched),
-                Cell::from(process.pid.to_string()),
-                Cell::from(process.name.clone()),
-            ]);
-            if hovered {
-                row.style(Style::default().fg(Color::Black).bg(Color::Gray))
-            } else {
-                row
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let row_start = super::table_data_row_start(area);
-    for visible_index in 0..end.saturating_sub(start) {
-        let absolute_index = filtered_indices[start + visible_index];
-        hits.push(HitArea::new(
-            Rect::new(
-                area.x + 1,
-                row_start + visible_index as u16,
-                area.width.saturating_sub(2),
-                1,
-            ),
-            HitTarget::TrafficProcess(absolute_index),
-        ));
-        hits.push(HitArea::new(
-            Rect::new(area.x + 3, row_start + visible_index as u16, 3, 1),
-            HitTarget::ProcessMonitor(absolute_index),
-        ));
-    }
-
-    let selected_visible = app.selected_process_index().and_then(|selected| {
-        filtered_indices[start..end]
-            .iter()
-            .position(|index| *index == selected)
-    });
-    let mut state = TableState::new().with_selected(selected_visible);
-    frame.render_stateful_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(2),
-                Constraint::Length(4),
-                Constraint::Length(7),
-                Constraint::Min(10),
-            ],
-        )
-        .header(
-            Row::new(["", "Use", "PID", "Process"]).style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .highlight_spacing(HighlightSpacing::Always)
-        .row_highlight_style(Style::default().fg(Color::Black).bg(Color::LightGreen))
-        .block(Block::bordered().title("Processes")),
-        area,
-        &mut state,
-    );
-    render_vertical_scrollbar(
-        frame,
-        area,
-        filtered_indices.len(),
-        app.process_scroll(),
-        visible_rows,
-    );
-}
-
 fn render_traffic_events(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -495,7 +390,7 @@ fn render_traffic_events(
         area,
         &mut state,
     );
-    render_vertical_scrollbar(
+    super::render_vertical_scrollbar(
         frame,
         area,
         traffic.rows().len(),
@@ -526,28 +421,6 @@ fn popup_lines_for_render(details: Vec<String>) -> Vec<Line<'static>> {
         .iter()
         .flat_map(|line| [Line::from(line.clone()), Line::from("")])
         .collect()
-}
-
-fn render_vertical_scrollbar(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    content_len: usize,
-    position: usize,
-    viewport_len: usize,
-) {
-    if content_len <= viewport_len || area.height < 3 {
-        return;
-    }
-    let mut state = ScrollbarState::new(content_len)
-        .position(position)
-        .viewport_content_length(viewport_len);
-    frame.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .thumb_style(Style::default().fg(Color::Cyan))
-            .track_style(Style::default().fg(Color::DarkGray)),
-        area,
-        &mut state,
-    );
 }
 
 fn traffic_status_color(kind: TrafficStatusKind) -> Color {

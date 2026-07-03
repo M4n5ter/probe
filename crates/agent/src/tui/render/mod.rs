@@ -4,19 +4,19 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap,
+        Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Table, Wrap,
     },
 };
 
+mod process_picker;
 mod traffic;
 
 use super::{
     app::{StatusKind, TextEditSession, TuiApp, TuiTab},
-    controls::{ControlId, FocusTarget},
-    hit::{HitArea, HitMap, HitTarget, ScrollTarget},
+    controls::FocusTarget,
+    hit::{HitArea, HitMap, HitTarget},
 };
-
-const PROCESS_VISIBLE_DETAIL_WIDTH: usize = 96;
 
 pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut TuiApp) -> HitMap {
     let area = frame.area();
@@ -35,7 +35,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut TuiApp) -> HitMap {
     match app.active_tab() {
         TuiTab::Overview => render_overview(frame, body, app),
         TuiTab::Traffic => traffic::render_traffic(frame, body, app, &mut hits),
-        TuiTab::Processes => render_processes(frame, body, app, &mut hits),
+        TuiTab::Processes => process_picker::render_processes(frame, body, app, &mut hits),
         _ => render_fields(frame, body, app, &mut hits),
     }
     render_footer(frame, footer, app);
@@ -257,188 +257,6 @@ fn hit_target_for_focus(target: FocusTarget) -> HitTarget {
     }
 }
 
-fn render_processes(frame: &mut Frame<'_>, area: Rect, app: &mut TuiApp, hits: &mut Vec<HitArea>) {
-    let [search_area, table_area] =
-        Layout::vertical([Constraint::Length(2), Constraint::Min(4)]).areas(area);
-    hits.push(HitArea::scroll(table_area, ScrollTarget::ProcessList));
-    let visible_rows = table_area.height.saturating_sub(3) as usize;
-    app.set_process_viewport_rows(visible_rows);
-    let entries = app.processes().entries();
-    let filtered_indices = app.filtered_process_indices();
-    let start = app
-        .process_scroll()
-        .min(filtered_indices.len().saturating_sub(visible_rows));
-    let end = start
-        .saturating_add(visible_rows)
-        .min(filtered_indices.len());
-    let rows = filtered_indices[start..end]
-        .iter()
-        .map(|absolute_index| {
-            let absolute_index = *absolute_index;
-            let process = &entries[absolute_index];
-            let marker = if Some(absolute_index) == app.selected_process_index() {
-                ">"
-            } else {
-                " "
-            };
-            let watched = if app.process_is_monitored(absolute_index) {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            let hovered = app.is_hovered(HitTarget::Process(absolute_index))
-                || app.is_hovered(HitTarget::ProcessArgv(absolute_index))
-                || app.is_hovered(HitTarget::ProcessMonitor(absolute_index));
-            let exe = process
-                .exe_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "-".to_string());
-            let argv = process.argv_summary(PROCESS_VISIBLE_DETAIL_WIDTH);
-            let row = Row::new([
-                Cell::from(marker),
-                Cell::from(watched),
-                Cell::from(process.pid.to_string()),
-                Cell::from(process.name.clone()),
-                Cell::from(process.capture_scope_label()),
-                Cell::from(process.mitm_scope_label()),
-                Cell::from(truncate(&exe, 48)),
-                Cell::from(argv),
-            ]);
-            if hovered {
-                row.style(Style::default().fg(Color::Black).bg(Color::Gray))
-            } else {
-                row
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let row_start = table_data_row_start(table_area);
-    for visible_index in 0..end.saturating_sub(start) {
-        let absolute_index = filtered_indices[start + visible_index];
-        hits.push(HitArea::new(
-            Rect::new(
-                table_area.x + 1,
-                row_start + visible_index as u16,
-                table_area.width.saturating_sub(2),
-                1,
-            ),
-            HitTarget::Process(absolute_index),
-        ));
-        hits.push(HitArea::new(
-            Rect::new(table_area.x + 3, row_start + visible_index as u16, 3, 1),
-            HitTarget::ProcessMonitor(absolute_index),
-        ));
-        hits.push(HitArea::new(
-            Rect::new(
-                table_area.x.saturating_add(table_area.width / 2),
-                row_start + visible_index as u16,
-                table_area.width / 2,
-                1,
-            ),
-            HitTarget::ProcessArgv(absolute_index),
-        ));
-    }
-
-    render_process_search(frame, search_area, app, hits, filtered_indices.len());
-    let selected_visible = app.selected_process_index().and_then(|selected| {
-        filtered_indices[start..end]
-            .iter()
-            .position(|index| *index == selected)
-    });
-    let mut state = TableState::new().with_selected(selected_visible);
-    frame.render_stateful_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(2),
-                Constraint::Length(4),
-                Constraint::Length(7),
-                Constraint::Length(20),
-                Constraint::Length(8),
-                Constraint::Length(7),
-                Constraint::Length(42),
-                Constraint::Min(24),
-            ],
-        )
-        .header(
-            Row::new([
-                "",
-                "Watch",
-                "PID",
-                "Name",
-                "Capture",
-                "MITM",
-                "Executable",
-                "Argv",
-            ])
-            .style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .highlight_spacing(HighlightSpacing::Always)
-        .row_highlight_style(Style::default().fg(Color::Black).bg(Color::LightGreen))
-        .block(Block::bordered().title("Processes")),
-        table_area,
-        &mut state,
-    );
-}
-
-fn render_process_search(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &TuiApp,
-    hits: &mut Vec<HitArea>,
-    match_count: usize,
-) {
-    let search = Rect::new(area.x, area.y, 10, 1);
-    render_button(
-        frame,
-        hits,
-        search,
-        "Search",
-        HitTarget::Control(ControlId::SearchProcesses),
-        app.is_hovered(HitTarget::Control(ControlId::SearchProcesses)),
-    );
-    let clear = Rect::new(area.x.saturating_add(11), area.y, 8, 1);
-    if !app.process_filter().is_empty() {
-        render_button(
-            frame,
-            hits,
-            clear,
-            "Clear",
-            HitTarget::Control(ControlId::ClearProcessSearch),
-            app.is_hovered(HitTarget::Control(ControlId::ClearProcessSearch)),
-        );
-    }
-    let text_x = if app.process_filter().is_empty() {
-        area.x.saturating_add(11)
-    } else {
-        area.x.saturating_add(20)
-    };
-    let text_area = Rect::new(
-        text_x,
-        area.y,
-        area.width.saturating_sub(text_x.saturating_sub(area.x)),
-        area.height,
-    );
-    let filter = if app.process_filter().is_empty() {
-        "<none>".to_string()
-    } else {
-        app.process_filter().to_string()
-    };
-    let line = Line::from(vec![
-        Span::styled("filter ", Style::default().fg(Color::Gray)),
-        Span::raw(filter),
-        Span::raw("   "),
-        Span::styled("matches ", Style::default().fg(Color::Gray)),
-        Span::raw(format!("{match_count}/{}", app.processes().entries().len())),
-    ]);
-    frame.render_widget(Paragraph::new(line), text_area);
-}
-
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let status_style = Style::default().fg(status_color(app.status().kind));
     let mut spans = vec![
@@ -569,6 +387,28 @@ fn table_data_row_start(area: Rect) -> u16 {
     area.y.saturating_add(2)
 }
 
+fn render_vertical_scrollbar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    content_len: usize,
+    position: usize,
+    viewport_len: usize,
+) {
+    if content_len <= viewport_len || area.height < 3 {
+        return;
+    }
+    let mut state = ScrollbarState::new(content_len)
+        .position(position)
+        .viewport_content_length(viewport_len);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .thumb_style(Style::default().fg(Color::Cyan))
+            .track_style(Style::default().fg(Color::DarkGray)),
+        area,
+        &mut state,
+    );
+}
+
 fn status_color(kind: StatusKind) -> Color {
     match kind {
         StatusKind::Info => Color::Cyan,
@@ -600,6 +440,7 @@ mod tests {
             app::{TuiAction, TuiApp},
             controls::ControlId,
             fields::FieldId,
+            hit::ScrollTarget,
             processes::{ProcessCatalog, ProcessEntry},
         },
         *,
@@ -859,6 +700,7 @@ mod tests {
 
         let output = terminal.backend().to_string();
         assert!(output.contains("[Data Path]"));
+        assert!(output.contains("[Search]"));
         assert!(output.contains("[Watch]"));
         assert!(output.contains("[MITM Out]"));
         assert!(output.contains("[MITM In]"));
@@ -886,6 +728,12 @@ mod tests {
         ));
         assert!(hit_exists(
             &hit_map,
+            Some(HitTarget::Control(ControlId::SearchProcesses)),
+            100,
+            24
+        ));
+        assert!(hit_exists(
+            &hit_map,
             Some(HitTarget::Control(ControlId::OpenTrafficDiagnostics)),
             100,
             24
@@ -902,6 +750,69 @@ mod tests {
             100,
             24
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_process_search_hits_filter_in_place() -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = test_app();
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24))?;
+        let mut hit_map = HitMap::default();
+
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &mut app);
+        })?;
+        let (search_column, search_row) = first_hit_coordinate(
+            &hit_map,
+            HitTarget::Control(ControlId::SearchProcesses),
+            100,
+            24,
+        )
+        .expect("traffic search should be clickable");
+        assert_eq!(
+            hit_map.scroll_target(search_column, search_row),
+            Some(ScrollTarget::TrafficProcessList)
+        );
+
+        app.handle_action(TuiAction::Click(
+            hit_map
+                .hit(search_column, search_row)
+                .expect("traffic search hit"),
+        ));
+        for character in "curl".chars() {
+            app.handle_action(TuiAction::TextInput(character));
+        }
+        app.handle_action(TuiAction::TextSubmit);
+
+        assert_eq!(app.active_tab(), TuiTab::Traffic);
+        assert_eq!(app.process_filter(), "curl");
+
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &mut app);
+        })?;
+        let output = terminal.backend().to_string();
+        assert!(output.contains("[Clear]"));
+        let (clear_column, clear_row) = first_hit_coordinate(
+            &hit_map,
+            HitTarget::Control(ControlId::ClearProcessSearch),
+            100,
+            24,
+        )
+        .expect("traffic clear should be clickable");
+        assert_eq!(
+            hit_map.scroll_target(clear_column, clear_row),
+            Some(ScrollTarget::TrafficProcessList)
+        );
+
+        app.handle_action(TuiAction::Click(
+            hit_map
+                .hit(clear_column, clear_row)
+                .expect("traffic clear hit"),
+        ));
+
+        assert_eq!(app.active_tab(), TuiTab::Traffic);
+        assert!(app.process_filter().is_empty());
         Ok(())
     }
 
