@@ -1,12 +1,14 @@
 mod client;
+mod filter;
 mod rows;
 
 use std::path::{Path, PathBuf};
 
-use probe_core::{EventType, Selector};
+use probe_core::Selector;
 
 use self::{
     client::{request_event_detail, request_tail_events},
+    filter::TrafficEventFilter,
     rows::TrafficRow,
 };
 use crate::{
@@ -87,7 +89,7 @@ impl Default for TrafficState {
             status: TrafficStatus::idle("Traffic view uses the running admin socket"),
             last_export_sequence: 0,
             detail_state: TrafficDetailState::Idle,
-            event_filter: TrafficEventFilter::Http,
+            event_filter: TrafficEventFilter::Application,
         }
     }
 }
@@ -187,7 +189,7 @@ impl TrafficState {
         if Some(selector_key.clone()) != self.selector_key {
             self.reset_for_selector(selector_key);
         }
-        let event_types = self.event_filter.event_types();
+        let event_types = self.event_filter.event_type_filter().to_admin_event_types();
 
         if self.anchor_to_latest {
             match request_tail_events(socket_path, u64::MAX, selector.clone(), &event_types).await {
@@ -374,39 +376,6 @@ impl TrafficState {
                     .selected_index
                     .saturating_sub(visible_rows.saturating_sub(1));
             }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TrafficEventFilter {
-    Http,
-    All,
-}
-
-impl TrafficEventFilter {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Http => "HTTP",
-            Self::All => "All",
-        }
-    }
-
-    fn event_types(self) -> Vec<EventType> {
-        match self {
-            Self::Http => vec![
-                EventType::HttpRequestHeaders,
-                EventType::HttpResponseHeaders,
-                EventType::HttpBodyChunk,
-            ],
-            Self::All => Vec::new(),
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Http => Self::All,
-            Self::All => Self::Http,
         }
     }
 }
@@ -628,19 +597,22 @@ mod tests {
     }
 
     #[test]
-    fn event_filter_defaults_to_http_and_cycles_with_tail_reset() {
+    fn event_filter_defaults_to_parsed_application_events_and_cycles_with_tail_reset() {
         let mut traffic = TrafficState::default();
         traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
 
-        assert_eq!(traffic.event_filter_label(), "HTTP");
+        assert_eq!(traffic.event_filter_label(), "Parsed");
         assert!(!traffic.rows().is_empty());
 
         traffic.cycle_event_filter();
 
-        assert_eq!(traffic.event_filter_label(), "All");
+        assert_eq!(traffic.event_filter_label(), "HTTP");
         assert!(traffic.rows().is_empty());
         assert!(traffic.anchor_to_latest);
-        assert_eq!(traffic.status().text, "Traffic event filter changed to All");
+        assert_eq!(
+            traffic.status().text,
+            "Traffic event filter changed to HTTP"
+        );
     }
 
     #[test]

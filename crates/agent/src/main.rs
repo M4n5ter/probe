@@ -13,6 +13,7 @@ mod enforcement_reload;
 mod enforcement_reload_poller;
 mod enforcement_reload_watcher;
 mod error;
+mod event_type_groups;
 mod export;
 mod json_lines;
 mod l7_mitm;

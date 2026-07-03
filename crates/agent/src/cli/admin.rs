@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::{
     admin::{AdminRequest, send_admin_json_request},
     error::AgentError,
+    event_type_groups,
 };
 
 #[derive(Debug, Clone, Subcommand)]
@@ -97,19 +98,11 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
 
 fn tail_event_types(http: bool, mut event_types: Vec<EventType>) -> Vec<EventType> {
     if http {
-        event_types.extend(http_event_types());
+        event_types.extend(event_type_groups::http());
     }
     event_types.sort_by_key(|event_type| event_type.as_str());
     event_types.dedup();
     event_types
-}
-
-fn http_event_types() -> [EventType; 3] {
-    [
-        EventType::HttpRequestHeaders,
-        EventType::HttpResponseHeaders,
-        EventType::HttpBodyChunk,
-    ]
 }
 
 fn process_exe_selector(exe_path_glob: String) -> Selector {
@@ -189,6 +182,7 @@ mod tests {
                     EventType::HttpBodyChunk,
                     EventType::HttpRequestHeaders,
                     EventType::HttpResponseHeaders,
+                    EventType::SseEvent,
                 ],
             }
         );
