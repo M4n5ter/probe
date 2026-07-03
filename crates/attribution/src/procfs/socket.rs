@@ -772,23 +772,12 @@ fn filter_listener_lookup_by_endpoint(
     observed: TcpEndpoint,
     snapshot: &ProcfsSocketSnapshot,
 ) -> TcpListenerProcessLookup {
-    let mut exact = Vec::new();
-    let mut namespace_wildcard = Vec::new();
-    let mut unmatched_wildcard = Vec::new();
-    for listener in lookup.listeners {
-        match listener_endpoint_match(&listener, observed, snapshot) {
-            ListenerEndpointMatch::Exact => exact.push(listener),
-            ListenerEndpointMatch::NamespaceWildcard => namespace_wildcard.push(listener),
-            ListenerEndpointMatch::UnmatchedWildcard => unmatched_wildcard.push(listener),
-            ListenerEndpointMatch::NoMatch => {}
-        }
-    }
-    let listeners = if !exact.is_empty() {
-        exact
-    } else if !namespace_wildcard.is_empty() {
-        namespace_wildcard
+    let (rank, listeners) = best_ranked_listener_matches(lookup.listeners, observed, snapshot);
+    let listeners = if rank.is_some_and(ListenerEndpointMatchRank::requires_unique_logical_listener)
+    {
+        unique_logical_listener(listeners)
     } else {
-        unique_listener(unmatched_wildcard)
+        listeners
     };
     TcpListenerProcessLookup {
         listeners,
@@ -796,35 +785,84 @@ fn filter_listener_lookup_by_endpoint(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListenerEndpointMatch {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ListenerEndpointMatchRank {
+    CrossFamilyWildcard,
+    SameFamilyWildcard,
+    CrossFamilyNamespaceWildcard,
+    SameFamilyNamespaceWildcard,
     Exact,
-    NamespaceWildcard,
-    UnmatchedWildcard,
-    NoMatch,
 }
 
-fn listener_endpoint_match(
+impl ListenerEndpointMatchRank {
+    fn requires_unique_logical_listener(self) -> bool {
+        matches!(self, Self::SameFamilyWildcard | Self::CrossFamilyWildcard)
+    }
+}
+
+fn best_ranked_listener_matches(
+    listeners: Vec<TcpListenerProcessContext>,
+    observed: TcpEndpoint,
+    snapshot: &ProcfsSocketSnapshot,
+) -> (
+    Option<ListenerEndpointMatchRank>,
+    Vec<TcpListenerProcessContext>,
+) {
+    let mut best_rank = None;
+    let mut best_listeners = Vec::new();
+    for listener in listeners {
+        let Some(rank) = listener_endpoint_match_rank(&listener, observed, snapshot) else {
+            continue;
+        };
+        if best_rank.is_none_or(|best| rank > best) {
+            best_rank = Some(rank);
+            best_listeners.clear();
+        }
+        if best_rank == Some(rank) {
+            best_listeners.push(listener);
+        }
+    }
+    (best_rank, best_listeners)
+}
+
+fn listener_endpoint_match_rank(
     listener: &TcpListenerProcessContext,
     observed: TcpEndpoint,
     snapshot: &ProcfsSocketSnapshot,
-) -> ListenerEndpointMatch {
+) -> Option<ListenerEndpointMatchRank> {
     if listener.observed.local.port != observed.port {
-        return ListenerEndpointMatch::NoMatch;
+        return None;
     }
     if listener.observed.local.address == observed.address {
-        return ListenerEndpointMatch::Exact;
+        return Some(ListenerEndpointMatchRank::Exact);
     }
     if !listener.observed.local.address.is_unspecified()
         || !listener_wildcard_matches_observed_family(listener, observed)
     {
-        return ListenerEndpointMatch::NoMatch;
+        return None;
     }
+    let same_family = listener_wildcard_same_family(listener, observed);
     if listener_namespace_contains_address(listener, observed.address, snapshot) {
-        ListenerEndpointMatch::NamespaceWildcard
+        if same_family {
+            Some(ListenerEndpointMatchRank::SameFamilyNamespaceWildcard)
+        } else {
+            Some(ListenerEndpointMatchRank::CrossFamilyNamespaceWildcard)
+        }
+    } else if same_family {
+        Some(ListenerEndpointMatchRank::SameFamilyWildcard)
     } else {
-        ListenerEndpointMatch::UnmatchedWildcard
+        Some(ListenerEndpointMatchRank::CrossFamilyWildcard)
     }
+}
+
+fn listener_wildcard_same_family(
+    listener: &TcpListenerProcessContext,
+    observed: TcpEndpoint,
+) -> bool {
+    endpoint_uses_family(listener.observed.local, ProcfsTcpTableFamily::Ipv4)
+        && endpoint_uses_family(observed, ProcfsTcpTableFamily::Ipv4)
+        || endpoint_uses_family(listener.observed.local, ProcfsTcpTableFamily::Ipv6)
+            && endpoint_uses_family(observed, ProcfsTcpTableFamily::Ipv6)
 }
 
 fn listener_wildcard_matches_observed_family(
@@ -840,10 +878,20 @@ fn listener_wildcard_matches_observed_family(
     false
 }
 
-fn unique_listener(listeners: Vec<TcpListenerProcessContext>) -> Vec<TcpListenerProcessContext> {
-    match listeners.as_slice() {
-        [_] => listeners,
-        _ => Vec::new(),
+fn unique_logical_listener(
+    listeners: Vec<TcpListenerProcessContext>,
+) -> Vec<TcpListenerProcessContext> {
+    let mut identities = Vec::new();
+    for listener in &listeners {
+        let identity = (listener.observed.local, listener.observed.socket_inode);
+        if !identities.contains(&identity) {
+            identities.push(identity);
+        }
+    }
+    if identities.len() == 1 {
+        listeners
+    } else {
+        Vec::new()
     }
 }
 
@@ -1104,6 +1152,49 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_listener_lookup_preserves_namespace_wildcard_socket_holders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[])?;
+        proc.write_process_with_socket(321, "first-worker", 424_242)?;
+        proc.write_process_tcp_table(
+            321,
+            "net:[4026532661]",
+            &[
+                tcp_line(0, "00000000:1F90", "00000000:0000", "0A", 424_242),
+                tcp_line(1, "030013AC:1F90", "010013AC:C001", "01", 111_111),
+            ],
+        )?;
+        proc.write_process_with_socket(654, "second-worker", 424_242)?;
+        proc.write_process_tcp_table(
+            654,
+            "net:[4026532661]",
+            &[tcp_line(0, "00000000:1F90", "00000000:0000", "0A", 424_242)],
+        )?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners_by_local_endpoint(TcpEndpoint::new(
+            "172.19.0.3".parse()?,
+            8080,
+        ))?;
+
+        let mut pids = lookup
+            .listeners
+            .iter()
+            .map(|listener| listener.owner.process.identity.pid)
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![321, 654]);
+        assert!(
+            lookup
+                .listeners
+                .iter()
+                .all(|listener| listener.observed.socket_inode == 424_242)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn endpoint_listener_lookup_merges_namespace_for_host_table_listener()
     -> Result<(), Box<dyn std::error::Error>> {
         let proc = FakeProc::new()?;
@@ -1130,6 +1221,36 @@ mod tests {
         assert_eq!(listener.owner.process.identity.pid, 321);
         assert_eq!(listener.owner.process.name, "host-api");
         assert_eq!(listener.observed.socket_inode, 424_242);
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_listener_lookup_uses_unique_wildcard_socket_with_multiple_holders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[tcp_line(0, "00000000:1F90", "00000000:0000", "0A", 424_242)])?;
+        proc.write_process_with_socket(321, "first-worker", 424_242)?;
+        proc.write_process_with_socket(654, "second-worker", 424_242)?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners_by_local_endpoint(TcpEndpoint::new(
+            "172.19.0.3".parse()?,
+            8080,
+        ))?;
+
+        let mut pids = lookup
+            .listeners
+            .iter()
+            .map(|listener| listener.owner.process.identity.pid)
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![321, 654]);
+        assert!(
+            lookup
+                .listeners
+                .iter()
+                .all(|listener| listener.observed.socket_inode == 424_242)
+        );
         Ok(())
     }
 
@@ -1180,6 +1301,36 @@ mod tests {
         };
         assert_eq!(listener.owner.process.identity.pid, 321);
         assert_eq!(listener.owner.process.name, "dual-stack-api");
+        assert_eq!(listener.observed.socket_inode, 424_242);
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_listener_lookup_prefers_same_family_wildcard_for_ipv4_endpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[tcp_line(0, "00000000:1F90", "00000000:0000", "0A", 424_242)])?;
+        proc.write_tcp6_table(&[tcp_line(
+            0,
+            "00000000000000000000000000000000:1F90",
+            "00000000000000000000000000000000:0000",
+            "0A",
+            535_353,
+        )])?;
+        proc.write_process_with_socket(321, "ipv4-api", 424_242)?;
+        proc.write_process_with_socket(654, "ipv6-api", 535_353)?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners_by_local_endpoint(TcpEndpoint::new(
+            "172.19.0.3".parse()?,
+            8080,
+        ))?;
+
+        let [listener] = lookup.listeners.as_slice() else {
+            panic!("expected IPv4 wildcard listener preference: {lookup:?}");
+        };
+        assert_eq!(listener.owner.process.identity.pid, 321);
+        assert_eq!(listener.owner.process.name, "ipv4-api");
         assert_eq!(listener.observed.socket_inode, 424_242);
         Ok(())
     }
@@ -1250,6 +1401,62 @@ mod tests {
         assert_eq!(listener.observed.process.name, "docker-proxy");
         assert_eq!(listener.observed.socket_inode, 909_090);
         assert_eq!(listener.observed.local.port, 8081);
+        assert_eq!(listener.owner.process.identity.pid, 321);
+        assert_eq!(listener.owner.process.name, "sssa-backend");
+        assert_eq!(listener.owner.confidence, DOCKER_PROXY_TARGET_CONFIDENCE);
+        Ok(())
+    }
+
+    #[test]
+    fn docker_proxy_listener_resolution_handles_dual_stack_host_publish()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[tcp_line(0, "00000000:1F91", "00000000:0000", "0A", 909_090)])?;
+        proc.write_tcp6_table(&[tcp_line(
+            0,
+            "00000000000000000000000000000000:1F91",
+            "00000000000000000000000000000000:0000",
+            "0A",
+            909_091,
+        )])?;
+        let proxy_cmdline = [
+            "/usr/bin/docker-proxy",
+            "-proto",
+            "tcp",
+            "-host-ip",
+            "0.0.0.0",
+            "-host-port",
+            "8081",
+            "-container-ip",
+            "172.19.0.3",
+            "-container-port",
+            "8080",
+            "-use-listen-fd",
+        ];
+        proc.write_process_with_socket_and_cmdline(123, "docker-proxy", 909_090, &proxy_cmdline)?;
+        proc.write_process_with_socket_and_cmdline(124, "docker-proxy", 909_091, &proxy_cmdline)?;
+        proc.write_process_with_socket(321, "sssa-backend", 424_242)?;
+        proc.write_process_tcp_table(
+            321,
+            "net:[4026532661]",
+            &[
+                tcp_line(0, "00000000:1F90", "00000000:0000", "0A", 424_242),
+                tcp_line(1, "030013AC:1F90", "010013AC:C001", "01", 111_111),
+            ],
+        )?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners_by_local_endpoint(TcpEndpoint::new(
+            "10.10.0.170".parse()?,
+            8081,
+        ))?;
+
+        let [listener] = lookup.listeners.as_slice() else {
+            panic!("expected docker-proxy target listener: {lookup:?}");
+        };
+        assert_eq!(listener.observed.process.identity.pid, 123);
+        assert_eq!(listener.observed.process.name, "docker-proxy");
+        assert_eq!(listener.observed.socket_inode, 909_090);
         assert_eq!(listener.owner.process.identity.pid, 321);
         assert_eq!(listener.owner.process.name, "sssa-backend");
         assert_eq!(listener.owner.confidence, DOCKER_PROXY_TARGET_CONFIDENCE);
